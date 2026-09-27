@@ -26,7 +26,6 @@ from cutlass.cute.runtime import make_fake_stream, make_fake_tensor
 from cutlass.experimental import primitives as prims
 from cutlass.experimental.primitives import nvvm_wrapper as prims_nvvm
 from cutlass.utils import blackwell_helpers as cutlass_blackwell
-from cutlass.utils import hopper_helpers as cutlass_hopper
 from cutlass.utils.layout import LayoutEnum as CutlassLayout
 from cutlass.utils import blockscaled_layout as cutlass_blockscaled
 from cutlass.experimental.cuda.tensor_map import (
@@ -58,8 +57,26 @@ THREADS = 128
 CAKE_TARGET_ARCH = 'sm_90a'
 CAKE_SMEM_BYTES = 50304
 
+def _cake_ldparam_b32(addr, ptx_type):
+    return cutlass.Int32(cutlass_llvm.inline_asm(
+        cutlass.Int32.mlir_type,
+        [cutlass.Uint64(addr).ir_value()],
+        '{ .reg .u64 %pa; cvta.to.param::entry.u64 %pa, $1; ld.param::entry.' + ptx_type + ' $0, [%pa]; }', '=r,l',
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
+    ))
+
+def _cake_ldparam_b64(addr, ptx_type):
+    return cutlass.Uint64(cutlass_llvm.inline_asm(
+        cutlass.Uint64.mlir_type,
+        [cutlass.Uint64(addr).ir_value()],
+        '{ .reg .u64 %pa; cvta.to.param::entry.u64 %pa, $1; ld.param::entry.' + ptx_type + ' $0, [%pa]; }', '=l,l',
+        has_side_effects=False, is_align_stack=False,
+        asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
+    ))
+
 @cute.kernel
-def kernel_vsa_sm90_bf16_small_k1s(Q: cutlass.GridConstant[TensorMap], K: cutlass.GridConstant[TensorMap], Vt: cutlass.GridConstant[TensorMap], O: cute.Pointer, plan: cute.Pointer, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, scale_log2: cutlass.Float32, Wo: cute.Pointer, Ws: cute.Pointer, Wc: cute.Pointer):
+def kernel_vsa_sm90_bf16_small_k1s(Q: cutlass.GridConstant[TensorMap], K: cutlass.GridConstant[TensorMap], Vt: cutlass.GridConstant[TensorMap], plan__slot_0: cutlass.Uint64, plan__slot_1: cutlass.Uint64, plan__slot_2: cutlass.Uint64, plan__slot_3: cutlass.Uint64, plan__slot_4: cutlass.Uint64, plan__slot_5: cutlass.Uint64, plan__slot_6: cutlass.Uint64, plan__slot_7: cutlass.Uint64, plan__slot_8: cutlass.Uint64, plan__slot_9: cutlass.Uint64, plan__slot_10: cutlass.Uint64, plan__slot_11: cutlass.Uint64, plan__slot_12: cutlass.Uint64, plan__slot_13: cutlass.Uint64, plan__slot_14: cutlass.Uint64, plan__slot_15: cutlass.Uint64, plan__slot_16: cutlass.Uint64, plan__slot_17: cutlass.Uint64, plan__slot_18: cutlass.Uint64, plan__slot_19: cutlass.Uint64, plan__slot_20: cutlass.Uint64, plan__slot_21: cutlass.Uint64, plan__slot_22: cutlass.Uint64, plan__slot_23: cutlass.Uint64, plan__slot_24: cutlass.Uint64, plan__slot_25: cutlass.Uint64, plan__slot_26: cutlass.Uint64, plan__slot_27: cutlass.Uint64, plan__slot_28: cutlass.Uint64, plan__slot_29: cutlass.Uint64, plan__slot_30: cutlass.Uint64, plan__slot_31: cutlass.Uint64, plan__slot_32: cutlass.Uint64, plan__slot_33: cutlass.Uint64, plan__slot_34: cutlass.Uint64, plan__slot_35: cutlass.Uint64, plan__slot_36: cutlass.Uint64, plan__slot_37: cutlass.Uint64, plan__slot_38: cutlass.Uint64, plan__slot_39: cutlass.Uint64, plan__slot_40: cutlass.Uint64, plan__slot_41: cutlass.Uint64, plan__slot_42: cutlass.Uint64, plan__slot_43: cutlass.Uint64, plan__slot_44: cutlass.Uint64, plan__slot_45: cutlass.Uint64, plan__slot_46: cutlass.Uint64, plan__slot_47: cutlass.Uint64, plan__slot_48: cutlass.Uint64, plan__slot_49: cutlass.Uint64, plan__slot_50: cutlass.Uint64, plan__slot_51: cutlass.Uint64, plan__slot_52: cutlass.Uint64, plan__slot_53: cutlass.Uint64, plan__slot_54: cutlass.Uint64, plan__slot_55: cutlass.Uint64, plan__slot_56: cutlass.Uint64, plan__slot_57: cutlass.Uint64, plan__slot_58: cutlass.Uint64, plan__slot_59: cutlass.Uint64, plan__slot_60: cutlass.Uint64, plan__slot_61: cutlass.Uint64, plan__slot_62: cutlass.Uint64, plan__slot_63: cutlass.Uint64, plan__slot_64: cutlass.Uint64, plan__slot_65: cutlass.Uint64, plan__slot_66: cutlass.Uint64, plan__slot_67: cutlass.Uint64, plan__slot_68: cutlass.Uint64, plan__slot_69: cutlass.Uint64, plan__slot_70: cutlass.Uint64, plan__slot_71: cutlass.Uint64, plan__slot_72: cutlass.Uint64, plan__slot_73: cutlass.Uint64, plan__slot_74: cutlass.Uint64, plan__slot_75: cutlass.Uint64, plan__slot_76: cutlass.Uint64, plan__slot_77: cutlass.Uint64, plan__slot_78: cutlass.Uint64, plan__slot_79: cutlass.Uint64, plan__slot_80: cutlass.Uint64, plan__slot_81: cutlass.Uint64, plan__slot_82: cutlass.Uint64, plan__slot_83: cutlass.Uint64, plan__slot_84: cutlass.Uint64, plan__slot_85: cutlass.Uint64, plan__slot_86: cutlass.Uint64, plan__slot_87: cutlass.Uint64, plan__slot_88: cutlass.Uint64, plan__slot_89: cutlass.Uint64, plan__slot_90: cutlass.Uint64, plan__slot_91: cutlass.Uint64, plan__slot_92: cutlass.Uint64, plan__slot_93: cutlass.Uint64, plan__slot_94: cutlass.Uint64, plan__slot_95: cutlass.Uint64, plan__slot_96: cutlass.Uint64, plan__slot_97: cutlass.Uint64, plan__slot_98: cutlass.Uint64, plan__slot_99: cutlass.Uint64, plan__slot_100: cutlass.Uint64, plan__slot_101: cutlass.Uint64, plan__slot_102: cutlass.Uint64, plan__slot_103: cutlass.Uint64, plan__slot_104: cutlass.Uint64, plan__slot_105: cutlass.Uint64, plan__slot_106: cutlass.Uint64, plan__slot_107: cutlass.Uint64, plan__slot_108: cutlass.Uint64, plan__slot_109: cutlass.Uint64, plan__slot_110: cutlass.Uint64, plan__slot_111: cutlass.Uint64, plan__slot_112: cutlass.Uint64, plan__slot_113: cutlass.Uint64, plan__slot_114: cutlass.Uint64, plan__slot_115: cutlass.Uint64, plan__slot_116: cutlass.Uint64, plan__slot_117: cutlass.Uint64, plan__slot_118: cutlass.Uint64, plan__slot_119: cutlass.Uint64, plan__slot_120: cutlass.Uint64, plan__slot_121: cutlass.Uint64, plan__slot_122: cutlass.Uint64, plan__slot_123: cutlass.Uint64, plan__slot_124: cutlass.Uint64, plan__slot_125: cutlass.Uint64, plan__slot_126: cutlass.Uint64, plan__slot_127: cutlass.Uint64, plan__slot_128: cutlass.Uint64, plan__slot_129: cutlass.Uint64, plan__slot_130: cutlass.Uint64, plan__slot_131: cutlass.Uint64, plan__slot_132: cutlass.Uint64, plan__slot_133: cutlass.Uint64, plan__slot_134: cutlass.Uint64, plan__slot_135: cutlass.Uint64, plan__slot_136: cutlass.Uint64, plan__slot_137: cutlass.Uint64, plan__slot_138: cutlass.Uint64, plan__slot_139: cutlass.Uint64, plan__slot_140: cutlass.Uint64, plan__slot_141: cutlass.Uint64, plan__slot_142: cutlass.Uint64, plan__slot_143: cutlass.Uint64, plan__slot_144: cutlass.Uint64, plan__slot_145: cutlass.Uint64, plan__slot_146: cutlass.Uint64, plan__slot_147: cutlass.Uint64, plan__slot_148: cutlass.Uint64, plan__slot_149: cutlass.Uint64, plan__slot_150: cutlass.Uint64, plan__slot_151: cutlass.Uint64, plan__slot_152: cutlass.Uint64, plan__slot_153: cutlass.Uint64, plan__slot_154: cutlass.Uint64, plan__slot_155: cutlass.Uint64, plan__slot_156: cutlass.Uint64, plan__slot_157: cutlass.Uint64, plan__slot_158: cutlass.Uint64, plan__slot_159: cutlass.Uint64, plan__slot_160: cutlass.Uint64, plan__slot_161: cutlass.Uint64, plan__slot_162: cutlass.Uint64, plan__slot_163: cutlass.Uint64, plan__slot_164: cutlass.Uint64, plan__slot_165: cutlass.Uint64, plan__slot_166: cutlass.Uint64, plan__slot_167: cutlass.Uint64, plan__slot_168: cutlass.Uint64, plan__slot_169: cutlass.Uint64, plan__slot_170: cutlass.Uint64, plan__slot_171: cutlass.Uint64, plan__slot_172: cutlass.Uint64, plan__slot_173: cutlass.Uint64, plan__slot_174: cutlass.Uint64, plan__slot_175: cutlass.Uint64, plan__slot_176: cutlass.Uint64, plan__slot_177: cutlass.Uint64, plan__slot_178: cutlass.Uint64, plan__slot_179: cutlass.Uint64, plan__slot_180: cutlass.Uint64, plan__slot_181: cutlass.Uint64, plan__slot_182: cutlass.Uint64, plan__slot_183: cutlass.Uint64, plan__slot_184: cutlass.Uint64, plan__slot_185: cutlass.Uint64, plan__slot_186: cutlass.Uint64, plan__slot_187: cutlass.Uint64, plan__slot_188: cutlass.Uint64, plan__slot_189: cutlass.Uint64, plan__slot_190: cutlass.Uint64, plan__slot_191: cutlass.Uint64, plan__slot_192: cutlass.Uint64, plan__slot_193: cutlass.Uint64, plan__slot_194: cutlass.Uint64, plan__slot_195: cutlass.Uint64, plan__slot_196: cutlass.Uint64, plan__slot_197: cutlass.Uint64, plan__slot_198: cutlass.Uint64, plan__slot_199: cutlass.Uint64, plan__slot_200: cutlass.Uint64, plan__slot_201: cutlass.Uint64, plan__slot_202: cutlass.Uint64, plan__slot_203: cutlass.Uint64, plan__slot_204: cutlass.Uint64, plan__slot_205: cutlass.Uint64, plan__slot_206: cutlass.Uint64, plan__slot_207: cutlass.Uint64, plan__slot_208: cutlass.Uint64, plan__slot_209: cutlass.Uint64, plan__slot_210: cutlass.Uint64, plan__slot_211: cutlass.Uint64, plan__slot_212: cutlass.Uint64, plan__slot_213: cutlass.Uint64, plan__slot_214: cutlass.Uint64, plan__slot_215: cutlass.Uint64, plan__slot_216: cutlass.Uint64, plan__slot_217: cutlass.Uint64, plan__slot_218: cutlass.Uint64, plan__slot_219: cutlass.Uint64, plan__slot_220: cutlass.Uint64, plan__slot_221: cutlass.Uint64, plan__slot_222: cutlass.Uint64, plan__slot_223: cutlass.Uint64, plan__slot_224: cutlass.Uint64, plan__slot_225: cutlass.Uint64, plan__slot_226: cutlass.Uint64, plan__slot_227: cutlass.Uint64, plan__slot_228: cutlass.Uint64, plan__slot_229: cutlass.Uint64, plan__slot_230: cutlass.Uint64, plan__slot_231: cutlass.Uint64, plan__slot_232: cutlass.Uint64, plan__slot_233: cutlass.Uint64, plan__slot_234: cutlass.Uint64, plan__slot_235: cutlass.Uint64, plan__slot_236: cutlass.Uint64, plan__slot_237: cutlass.Uint64, plan__slot_238: cutlass.Uint64, plan__slot_239: cutlass.Uint64, plan__slot_240: cutlass.Uint64, plan__slot_241: cutlass.Uint64, plan__slot_242: cutlass.Uint64, plan__slot_243: cutlass.Uint64, plan__slot_244: cutlass.Uint64, plan__slot_245: cutlass.Uint64, plan__slot_246: cutlass.Uint64, plan__slot_247: cutlass.Uint64, plan__slot_248: cutlass.Uint64, plan__slot_249: cutlass.Uint64, plan__slot_250: cutlass.Uint64, plan__slot_251: cutlass.Uint64, plan__slot_252: cutlass.Uint64, plan__slot_253: cutlass.Uint64, plan__slot_254: cutlass.Uint64, plan__slot_255: cutlass.Uint64, plan__slot_256: cutlass.Uint64, plan__slot_257: cutlass.Uint64, plan__slot_258: cutlass.Uint64, plan__slot_259: cutlass.Uint64, plan__slot_260: cutlass.Uint64, plan__slot_261: cutlass.Uint64, plan__slot_262: cutlass.Uint64, plan__slot_263: cutlass.Uint64, plan__slot_264: cutlass.Uint64, plan__slot_265: cutlass.Uint64, plan__slot_266: cutlass.Uint64, plan__slot_267: cutlass.Uint64, plan__slot_268: cutlass.Uint64, plan__slot_269: cutlass.Uint64, plan__slot_270: cutlass.Uint64, plan__slot_271: cutlass.Uint64, plan__slot_272: cutlass.Uint64, plan__slot_273: cutlass.Uint64, plan__slot_274: cutlass.Uint64, plan__slot_275: cutlass.Uint64, plan__slot_276: cutlass.Uint64, plan__slot_277: cutlass.Uint64, plan__slot_278: cutlass.Uint64, plan__slot_279: cutlass.Uint64, plan__slot_280: cutlass.Uint64, plan__slot_281: cutlass.Uint64, plan__slot_282: cutlass.Uint64, plan__slot_283: cutlass.Uint64, plan__slot_284: cutlass.Uint64, plan__slot_285: cutlass.Uint64, plan__slot_286: cutlass.Uint64, plan__slot_287: cutlass.Uint64, plan__slot_288: cutlass.Uint64, plan__slot_289: cutlass.Uint64, plan__slot_290: cutlass.Uint64, plan__slot_291: cutlass.Uint64, plan__slot_292: cutlass.Uint64, plan__slot_293: cutlass.Uint64, plan__slot_294: cutlass.Uint64, plan__slot_295: cutlass.Uint64, plan__slot_296: cutlass.Uint64, plan__slot_297: cutlass.Uint64, plan__slot_298: cutlass.Uint64, plan__slot_299: cutlass.Uint64, plan__slot_300: cutlass.Uint64, plan__slot_301: cutlass.Uint64, plan__slot_302: cutlass.Uint64, plan__slot_303: cutlass.Uint64, plan__slot_304: cutlass.Uint64, plan__slot_305: cutlass.Uint64, plan__slot_306: cutlass.Uint64, plan__slot_307: cutlass.Uint64, plan__slot_308: cutlass.Uint64, plan__slot_309: cutlass.Uint64, plan__slot_310: cutlass.Uint64, plan__slot_311: cutlass.Uint64, plan__slot_312: cutlass.Uint64, plan__slot_313: cutlass.Uint64, plan__slot_314: cutlass.Uint64, plan__slot_315: cutlass.Uint64, plan__slot_316: cutlass.Uint64, plan__slot_317: cutlass.Uint64, plan__slot_318: cutlass.Uint64, plan__slot_319: cutlass.Uint64, plan__slot_320: cutlass.Uint64, plan__slot_321: cutlass.Uint64, plan__slot_322: cutlass.Uint64, plan__slot_323: cutlass.Uint64, plan__slot_324: cutlass.Uint64, plan__slot_325: cutlass.Uint64, plan__slot_326: cutlass.Uint64, plan__slot_327: cutlass.Uint64, plan__slot_328: cutlass.Uint64, plan__slot_329: cutlass.Uint64, plan__slot_330: cutlass.Uint64, plan__slot_331: cutlass.Uint64, plan__slot_332: cutlass.Uint64, plan__slot_333: cutlass.Uint64, plan__slot_334: cutlass.Uint64, plan__slot_335: cutlass.Uint64, plan__slot_336: cutlass.Uint64, plan__slot_337: cutlass.Uint64, plan__slot_338: cutlass.Uint64, plan__slot_339: cutlass.Uint64, plan__slot_340: cutlass.Uint64, plan__slot_341: cutlass.Uint64, plan__slot_342: cutlass.Uint64, plan__slot_343: cutlass.Uint64, plan__slot_344: cutlass.Uint64, plan__slot_345: cutlass.Uint64, plan__slot_346: cutlass.Uint64, plan__slot_347: cutlass.Uint64, plan__slot_348: cutlass.Uint64, plan__slot_349: cutlass.Uint64, plan__slot_350: cutlass.Uint64, plan__slot_351: cutlass.Uint64, plan__slot_352: cutlass.Uint64, plan__slot_353: cutlass.Uint64, plan__slot_354: cutlass.Uint64, plan__slot_355: cutlass.Uint64, plan__slot_356: cutlass.Uint64, plan__slot_357: cutlass.Uint64, plan__slot_358: cutlass.Uint64, plan__slot_359: cutlass.Uint64, plan__slot_360: cutlass.Uint64, plan__slot_361: cutlass.Uint64, plan__slot_362: cutlass.Uint64, plan__slot_363: cutlass.Uint64, plan__slot_364: cutlass.Uint64, plan__slot_365: cutlass.Uint64, plan__slot_366: cutlass.Uint64, plan__slot_367: cutlass.Uint64, plan__slot_368: cutlass.Uint64, plan__slot_369: cutlass.Uint64, plan__slot_370: cutlass.Uint64, plan__slot_371: cutlass.Uint64, plan__slot_372: cutlass.Uint64, plan__slot_373: cutlass.Uint64, plan__slot_374: cutlass.Uint64, plan__slot_375: cutlass.Uint64, plan__slot_376: cutlass.Uint64, plan__slot_377: cutlass.Uint64, plan__slot_378: cutlass.Uint64, plan__slot_379: cutlass.Uint64, plan__slot_380: cutlass.Uint64, plan__slot_381: cutlass.Uint64, plan__slot_382: cutlass.Uint64, plan__slot_383: cutlass.Uint64, plan__slot_384: cutlass.Uint64, plan__slot_385: cutlass.Uint64, plan__slot_386: cutlass.Uint64, plan__slot_387: cutlass.Uint64, plan__slot_388: cutlass.Uint64, plan__slot_389: cutlass.Uint64, plan__slot_390: cutlass.Uint64, plan__slot_391: cutlass.Uint64, plan__slot_392: cutlass.Uint64, plan__slot_393: cutlass.Uint64, plan__slot_394: cutlass.Uint64, plan__slot_395: cutlass.Uint64, plan__slot_396: cutlass.Uint64, plan__slot_397: cutlass.Uint64, plan__slot_398: cutlass.Uint64, plan__slot_399: cutlass.Uint64, plan__slot_400: cutlass.Uint64, plan__slot_401: cutlass.Uint64, plan__slot_402: cutlass.Uint64, plan__slot_403: cutlass.Uint64, plan__slot_404: cutlass.Uint64, plan__slot_405: cutlass.Uint64, plan__slot_406: cutlass.Uint64, plan__slot_407: cutlass.Uint64, plan__slot_408: cutlass.Uint64, plan__slot_409: cutlass.Uint64, plan__slot_410: cutlass.Uint64, plan__slot_411: cutlass.Uint64, plan__slot_412: cutlass.Uint64, plan__slot_413: cutlass.Uint64, plan__slot_414: cutlass.Uint64, plan__slot_415: cutlass.Uint64, plan__slot_416: cutlass.Uint64, plan__slot_417: cutlass.Uint64, plan__slot_418: cutlass.Uint64, plan__slot_419: cutlass.Uint64, plan__slot_420: cutlass.Uint64, plan__slot_421: cutlass.Uint64, plan__slot_422: cutlass.Uint64, plan__slot_423: cutlass.Uint64, plan__slot_424: cutlass.Uint64, plan__slot_425: cutlass.Uint64, plan__slot_426: cutlass.Uint64, plan__slot_427: cutlass.Uint64, plan__slot_428: cutlass.Uint64, plan__slot_429: cutlass.Uint64, plan__slot_430: cutlass.Uint64, plan__slot_431: cutlass.Uint64, plan__slot_432: cutlass.Uint64, plan__slot_433: cutlass.Uint64, plan__slot_434: cutlass.Uint64, plan__slot_435: cutlass.Uint64, plan__slot_436: cutlass.Uint64, plan__slot_437: cutlass.Uint64, O: cute.Pointer, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, scale_log2: cutlass.Float32, Wo: cute.Pointer, Ws: cute.Pointer, Wc: cute.Pointer):
     tid = cutlass.Int32(cute.arch.thread_idx()[0])
     warp = cutlass.Int32(cute.arch.warp_idx())
     lane = cutlass.Int32(cute.arch.lane_idx())
@@ -74,6 +91,8 @@ def kernel_vsa_sm90_bf16_small_k1s(Q: cutlass.GridConstant[TensorMap], K: cutlas
     _Wo = cute.make_tensor(Wo, _flat_layout)
     _Ws = cute.make_tensor(Ws, _flat_layout)
     _Wc = cute.make_tensor(Wc, _flat_layout)
+    _cake_param_slots_base = cutlass.Uint64(Vt.get_ptr().toint()) + 128
+    _plan__base = _cake_param_slots_base + 0
     flag = cute.recast_ptr(smem_raw + 50176, swizzle_=cute.make_swizzle(4, 3, 3), dtype=cutlass.Int32)
     _flag = cute.make_tensor(flag, _flat_layout)
     flag_addr = smem + 50176
@@ -116,9 +135,9 @@ def kernel_vsa_sm90_bf16_small_k1s(Q: cutlass.GridConstant[TensorMap], K: cutlas
     item = cutlass.Int32(bid)
     mb = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(seqlen_q).ir_value(), cutlass.Int32(64).ir_value())))
     plan_base = cutlass.Int32((item * 3))
-    meta = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[plan_base])
+    meta = cutlass.Int32(cutlass.Int16(_cake_ldparam_b32(_plan__base + (plan_base) * 2, 's16')))
     cnt = cutlass.Int32((meta & 15))
-    tile = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[(plan_base + 1)])
+    tile = cutlass.Int32(cutlass.Int16(_cake_ldparam_b32(_plan__base + ((plan_base + 1)) * 2, 's16')))
     blk_base = cutlass.Int32((plan_base + 2))
     head = cutlass.Int32(cutlass.Int32(cutlass_arith.divsi(cutlass.Int32(tile).ir_value(), cutlass.Int32(mb).ir_value())))
     qb = cutlass.Int32((tile - (head * mb)))
@@ -127,7 +146,7 @@ def kernel_vsa_sm90_bf16_small_k1s(Q: cutlass.GridConstant[TensorMap], K: cutlas
     if (warp == 0):
         if prims.elect_sync():
             blk_pre = cute.make_rmem_tensor((1,), cutlass.Int32)
-            blk_pre[0] = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[blk_base])
+            blk_pre[0] = cutlass.Int32(cutlass.Int16(_cake_ldparam_b32(_plan__base + (blk_base) * 2, 's16')))
             cute.arch.mbarrier_arrive_and_expect_tx(q_full_addr, 16384)
             prims.cp_async_bulk_tensor_shared_cta_global(
                 cute.make_ptr(cutlass.Uint8, cutlass.Uint32(q_smem_addr), mem_space=cute.AddressSpace.smem, assumed_align=16),
@@ -184,182 +203,622 @@ def kernel_vsa_sm90_bf16_small_k1s(Q: cutlass.GridConstant[TensorMap], K: cutlas
             pass
         _phase_k_full0_0[0] ^= cutlass.Uint32(1)
         cute.nvgpu.warpgroup.fence()
-        _wgmma_0 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.K,
-            cutlass.Float32, (1, 1, 1), (64, 64),
-            cute.nvgpu.warpgroup.OperandSource.SMEM,
+        _wgmma_0_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 32)
+        _wgmma_0 = cutlass_llvm.inline_asm(
+            _wgmma_0_ty,
+            [
+                cutlass.Float32(d_qk[(0) + 0]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 1]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 2]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 3]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 4]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 5]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 6]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 7]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 8]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 9]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 10]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 11]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 12]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 13]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 14]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 15]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 16]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 17]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 18]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 19]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 20]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 21]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 22]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 23]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 24]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 25]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 26]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 27]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 28]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 29]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 30]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 31]).ir_value(),
+                cutlass.Uint64(_wgmma_b_0_1).ir_value(),
+                cutlass.Uint64(_wgmma_a_0_0).ir_value(),
+            ],
+            asm_string='{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31}, $65, $64, 0, 1, 1, 0, 0;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,l,l,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_0_thr = _wgmma_0.get_slice(tid)
-        _wgmma_0_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64(_wgmma_b_0_1) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_0_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_0_b_ptr = cute.recast_ptr(_wgmma_0_b_ptr, swizzle_=_wgmma_0_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_0_b = cute.make_tensor(_wgmma_0_b_ptr, _wgmma_0_b_layout.outer)
-        _wgmma_0_b_part = _wgmma_0_thr.partition_B(_wgmma_0_b)
-        _wgmma_0_b_frag = _wgmma_0.make_fragment_B(_wgmma_0_b_part)
-        _wgmma_0_a_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64(_wgmma_a_0_0) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_0_a_layout = cutlass_hopper.make_smem_layout_a(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_0_a_ptr = cute.recast_ptr(_wgmma_0_a_ptr, swizzle_=_wgmma_0_a_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_0_a = cute.make_tensor(_wgmma_0_a_ptr, _wgmma_0_a_layout.outer)
-        _wgmma_0_a_part = _wgmma_0_thr.partition_A(_wgmma_0_a)
-        _wgmma_0_a_frag = _wgmma_0.make_fragment_A(_wgmma_0_a_part)
-        _wgmma_0_d = cute.make_tensor(d_qk.iterator + (0), _wgmma_0.partition_shape_C((64, 64)))
-        _wgmma_0.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, False)
-        cute.gemm(_wgmma_0, _wgmma_0_d, _wgmma_0_a_frag[None, None, 0, 0], _wgmma_0_b_frag[None, None, 0, 0], _wgmma_0_d)
-        _wgmma_1 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.K,
-            cutlass.Float32, (1, 1, 1), (64, 64),
-            cute.nvgpu.warpgroup.OperandSource.SMEM,
+        d_qk[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[0]))
+        d_qk[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[1]))
+        d_qk[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[2]))
+        d_qk[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[3]))
+        d_qk[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[4]))
+        d_qk[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[5]))
+        d_qk[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[6]))
+        d_qk[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[7]))
+        d_qk[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[8]))
+        d_qk[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[9]))
+        d_qk[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[10]))
+        d_qk[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[11]))
+        d_qk[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[12]))
+        d_qk[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[13]))
+        d_qk[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[14]))
+        d_qk[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[15]))
+        d_qk[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[16]))
+        d_qk[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[17]))
+        d_qk[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[18]))
+        d_qk[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[19]))
+        d_qk[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[20]))
+        d_qk[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[21]))
+        d_qk[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[22]))
+        d_qk[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[23]))
+        d_qk[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[24]))
+        d_qk[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[25]))
+        d_qk[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[26]))
+        d_qk[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[27]))
+        d_qk[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[28]))
+        d_qk[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[29]))
+        d_qk[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[30]))
+        d_qk[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_0, position=[31]))
+        _wgmma_1_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 32)
+        _wgmma_1 = cutlass_llvm.inline_asm(
+            _wgmma_1_ty,
+            [
+                cutlass.Float32(d_qk[(0) + 0]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 1]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 2]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 3]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 4]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 5]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 6]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 7]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 8]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 9]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 10]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 11]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 12]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 13]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 14]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 15]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 16]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 17]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 18]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 19]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 20]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 21]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 22]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 23]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 24]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 25]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 26]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 27]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 28]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 29]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 30]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 31]).ir_value(),
+                cutlass.Uint64((_wgmma_b_0_1 + 2)).ir_value(),
+                cutlass.Uint64((_wgmma_a_0_0 + 2)).ir_value(),
+            ],
+            asm_string='{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31}, $65, $64, 1, 1, 1, 0, 0;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,l,l,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_1_thr = _wgmma_1.get_slice(tid)
-        _wgmma_1_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_b_0_1 + 2)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_1_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_1_b_ptr = cute.recast_ptr(_wgmma_1_b_ptr, swizzle_=_wgmma_1_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_1_b = cute.make_tensor(_wgmma_1_b_ptr, _wgmma_1_b_layout.outer)
-        _wgmma_1_b_part = _wgmma_1_thr.partition_B(_wgmma_1_b)
-        _wgmma_1_b_frag = _wgmma_1.make_fragment_B(_wgmma_1_b_part)
-        _wgmma_1_a_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_a_0_0 + 2)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_1_a_layout = cutlass_hopper.make_smem_layout_a(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_1_a_ptr = cute.recast_ptr(_wgmma_1_a_ptr, swizzle_=_wgmma_1_a_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_1_a = cute.make_tensor(_wgmma_1_a_ptr, _wgmma_1_a_layout.outer)
-        _wgmma_1_a_part = _wgmma_1_thr.partition_A(_wgmma_1_a)
-        _wgmma_1_a_frag = _wgmma_1.make_fragment_A(_wgmma_1_a_part)
-        _wgmma_1_d = cute.make_tensor(d_qk.iterator + (0), _wgmma_1.partition_shape_C((64, 64)))
-        _wgmma_1.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-        cute.gemm(_wgmma_1, _wgmma_1_d, _wgmma_1_a_frag[None, None, 0, 0], _wgmma_1_b_frag[None, None, 0, 0], _wgmma_1_d)
-        _wgmma_2 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.K,
-            cutlass.Float32, (1, 1, 1), (64, 64),
-            cute.nvgpu.warpgroup.OperandSource.SMEM,
+        d_qk[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[0]))
+        d_qk[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[1]))
+        d_qk[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[2]))
+        d_qk[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[3]))
+        d_qk[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[4]))
+        d_qk[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[5]))
+        d_qk[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[6]))
+        d_qk[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[7]))
+        d_qk[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[8]))
+        d_qk[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[9]))
+        d_qk[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[10]))
+        d_qk[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[11]))
+        d_qk[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[12]))
+        d_qk[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[13]))
+        d_qk[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[14]))
+        d_qk[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[15]))
+        d_qk[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[16]))
+        d_qk[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[17]))
+        d_qk[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[18]))
+        d_qk[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[19]))
+        d_qk[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[20]))
+        d_qk[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[21]))
+        d_qk[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[22]))
+        d_qk[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[23]))
+        d_qk[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[24]))
+        d_qk[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[25]))
+        d_qk[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[26]))
+        d_qk[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[27]))
+        d_qk[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[28]))
+        d_qk[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[29]))
+        d_qk[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[30]))
+        d_qk[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_1, position=[31]))
+        _wgmma_2_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 32)
+        _wgmma_2 = cutlass_llvm.inline_asm(
+            _wgmma_2_ty,
+            [
+                cutlass.Float32(d_qk[(0) + 0]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 1]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 2]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 3]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 4]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 5]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 6]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 7]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 8]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 9]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 10]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 11]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 12]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 13]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 14]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 15]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 16]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 17]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 18]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 19]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 20]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 21]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 22]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 23]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 24]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 25]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 26]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 27]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 28]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 29]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 30]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 31]).ir_value(),
+                cutlass.Uint64((_wgmma_b_0_1 + 4)).ir_value(),
+                cutlass.Uint64((_wgmma_a_0_0 + 4)).ir_value(),
+            ],
+            asm_string='{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31}, $65, $64, 1, 1, 1, 0, 0;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,l,l,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_2_thr = _wgmma_2.get_slice(tid)
-        _wgmma_2_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_b_0_1 + 4)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_2_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_2_b_ptr = cute.recast_ptr(_wgmma_2_b_ptr, swizzle_=_wgmma_2_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_2_b = cute.make_tensor(_wgmma_2_b_ptr, _wgmma_2_b_layout.outer)
-        _wgmma_2_b_part = _wgmma_2_thr.partition_B(_wgmma_2_b)
-        _wgmma_2_b_frag = _wgmma_2.make_fragment_B(_wgmma_2_b_part)
-        _wgmma_2_a_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_a_0_0 + 4)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_2_a_layout = cutlass_hopper.make_smem_layout_a(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_2_a_ptr = cute.recast_ptr(_wgmma_2_a_ptr, swizzle_=_wgmma_2_a_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_2_a = cute.make_tensor(_wgmma_2_a_ptr, _wgmma_2_a_layout.outer)
-        _wgmma_2_a_part = _wgmma_2_thr.partition_A(_wgmma_2_a)
-        _wgmma_2_a_frag = _wgmma_2.make_fragment_A(_wgmma_2_a_part)
-        _wgmma_2_d = cute.make_tensor(d_qk.iterator + (0), _wgmma_2.partition_shape_C((64, 64)))
-        _wgmma_2.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-        cute.gemm(_wgmma_2, _wgmma_2_d, _wgmma_2_a_frag[None, None, 0, 0], _wgmma_2_b_frag[None, None, 0, 0], _wgmma_2_d)
-        _wgmma_3 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.K,
-            cutlass.Float32, (1, 1, 1), (64, 64),
-            cute.nvgpu.warpgroup.OperandSource.SMEM,
+        d_qk[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[0]))
+        d_qk[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[1]))
+        d_qk[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[2]))
+        d_qk[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[3]))
+        d_qk[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[4]))
+        d_qk[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[5]))
+        d_qk[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[6]))
+        d_qk[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[7]))
+        d_qk[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[8]))
+        d_qk[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[9]))
+        d_qk[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[10]))
+        d_qk[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[11]))
+        d_qk[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[12]))
+        d_qk[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[13]))
+        d_qk[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[14]))
+        d_qk[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[15]))
+        d_qk[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[16]))
+        d_qk[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[17]))
+        d_qk[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[18]))
+        d_qk[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[19]))
+        d_qk[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[20]))
+        d_qk[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[21]))
+        d_qk[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[22]))
+        d_qk[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[23]))
+        d_qk[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[24]))
+        d_qk[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[25]))
+        d_qk[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[26]))
+        d_qk[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[27]))
+        d_qk[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[28]))
+        d_qk[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[29]))
+        d_qk[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[30]))
+        d_qk[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_2, position=[31]))
+        _wgmma_3_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 32)
+        _wgmma_3 = cutlass_llvm.inline_asm(
+            _wgmma_3_ty,
+            [
+                cutlass.Float32(d_qk[(0) + 0]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 1]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 2]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 3]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 4]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 5]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 6]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 7]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 8]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 9]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 10]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 11]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 12]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 13]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 14]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 15]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 16]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 17]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 18]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 19]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 20]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 21]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 22]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 23]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 24]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 25]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 26]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 27]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 28]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 29]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 30]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 31]).ir_value(),
+                cutlass.Uint64((_wgmma_b_0_1 + 6)).ir_value(),
+                cutlass.Uint64((_wgmma_a_0_0 + 6)).ir_value(),
+            ],
+            asm_string='{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31}, $65, $64, 1, 1, 1, 0, 0;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,l,l,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_3_thr = _wgmma_3.get_slice(tid)
-        _wgmma_3_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_b_0_1 + 6)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_3_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_3_b_ptr = cute.recast_ptr(_wgmma_3_b_ptr, swizzle_=_wgmma_3_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_3_b = cute.make_tensor(_wgmma_3_b_ptr, _wgmma_3_b_layout.outer)
-        _wgmma_3_b_part = _wgmma_3_thr.partition_B(_wgmma_3_b)
-        _wgmma_3_b_frag = _wgmma_3.make_fragment_B(_wgmma_3_b_part)
-        _wgmma_3_a_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_a_0_0 + 6)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_3_a_layout = cutlass_hopper.make_smem_layout_a(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_3_a_ptr = cute.recast_ptr(_wgmma_3_a_ptr, swizzle_=_wgmma_3_a_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_3_a = cute.make_tensor(_wgmma_3_a_ptr, _wgmma_3_a_layout.outer)
-        _wgmma_3_a_part = _wgmma_3_thr.partition_A(_wgmma_3_a)
-        _wgmma_3_a_frag = _wgmma_3.make_fragment_A(_wgmma_3_a_part)
-        _wgmma_3_d = cute.make_tensor(d_qk.iterator + (0), _wgmma_3.partition_shape_C((64, 64)))
-        _wgmma_3.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-        cute.gemm(_wgmma_3, _wgmma_3_d, _wgmma_3_a_frag[None, None, 0, 0], _wgmma_3_b_frag[None, None, 0, 0], _wgmma_3_d)
-        _wgmma_4 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.K,
-            cutlass.Float32, (1, 1, 1), (64, 64),
-            cute.nvgpu.warpgroup.OperandSource.SMEM,
+        d_qk[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[0]))
+        d_qk[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[1]))
+        d_qk[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[2]))
+        d_qk[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[3]))
+        d_qk[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[4]))
+        d_qk[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[5]))
+        d_qk[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[6]))
+        d_qk[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[7]))
+        d_qk[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[8]))
+        d_qk[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[9]))
+        d_qk[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[10]))
+        d_qk[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[11]))
+        d_qk[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[12]))
+        d_qk[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[13]))
+        d_qk[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[14]))
+        d_qk[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[15]))
+        d_qk[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[16]))
+        d_qk[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[17]))
+        d_qk[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[18]))
+        d_qk[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[19]))
+        d_qk[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[20]))
+        d_qk[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[21]))
+        d_qk[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[22]))
+        d_qk[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[23]))
+        d_qk[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[24]))
+        d_qk[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[25]))
+        d_qk[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[26]))
+        d_qk[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[27]))
+        d_qk[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[28]))
+        d_qk[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[29]))
+        d_qk[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[30]))
+        d_qk[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_3, position=[31]))
+        _wgmma_4_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 32)
+        _wgmma_4 = cutlass_llvm.inline_asm(
+            _wgmma_4_ty,
+            [
+                cutlass.Float32(d_qk[(0) + 0]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 1]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 2]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 3]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 4]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 5]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 6]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 7]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 8]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 9]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 10]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 11]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 12]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 13]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 14]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 15]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 16]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 17]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 18]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 19]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 20]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 21]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 22]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 23]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 24]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 25]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 26]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 27]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 28]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 29]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 30]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 31]).ir_value(),
+                cutlass.Uint64(_wgmma_b_0_3).ir_value(),
+                cutlass.Uint64(_wgmma_a_0_2).ir_value(),
+            ],
+            asm_string='{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31}, $65, $64, 1, 1, 1, 0, 0;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,l,l,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_4_thr = _wgmma_4.get_slice(tid)
-        _wgmma_4_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64(_wgmma_b_0_3) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_4_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_4_b_ptr = cute.recast_ptr(_wgmma_4_b_ptr, swizzle_=_wgmma_4_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_4_b = cute.make_tensor(_wgmma_4_b_ptr, _wgmma_4_b_layout.outer)
-        _wgmma_4_b_part = _wgmma_4_thr.partition_B(_wgmma_4_b)
-        _wgmma_4_b_frag = _wgmma_4.make_fragment_B(_wgmma_4_b_part)
-        _wgmma_4_a_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64(_wgmma_a_0_2) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_4_a_layout = cutlass_hopper.make_smem_layout_a(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_4_a_ptr = cute.recast_ptr(_wgmma_4_a_ptr, swizzle_=_wgmma_4_a_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_4_a = cute.make_tensor(_wgmma_4_a_ptr, _wgmma_4_a_layout.outer)
-        _wgmma_4_a_part = _wgmma_4_thr.partition_A(_wgmma_4_a)
-        _wgmma_4_a_frag = _wgmma_4.make_fragment_A(_wgmma_4_a_part)
-        _wgmma_4_d = cute.make_tensor(d_qk.iterator + (0), _wgmma_4.partition_shape_C((64, 64)))
-        _wgmma_4.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-        cute.gemm(_wgmma_4, _wgmma_4_d, _wgmma_4_a_frag[None, None, 0, 0], _wgmma_4_b_frag[None, None, 0, 0], _wgmma_4_d)
-        _wgmma_5 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.K,
-            cutlass.Float32, (1, 1, 1), (64, 64),
-            cute.nvgpu.warpgroup.OperandSource.SMEM,
+        d_qk[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[0]))
+        d_qk[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[1]))
+        d_qk[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[2]))
+        d_qk[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[3]))
+        d_qk[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[4]))
+        d_qk[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[5]))
+        d_qk[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[6]))
+        d_qk[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[7]))
+        d_qk[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[8]))
+        d_qk[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[9]))
+        d_qk[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[10]))
+        d_qk[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[11]))
+        d_qk[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[12]))
+        d_qk[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[13]))
+        d_qk[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[14]))
+        d_qk[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[15]))
+        d_qk[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[16]))
+        d_qk[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[17]))
+        d_qk[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[18]))
+        d_qk[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[19]))
+        d_qk[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[20]))
+        d_qk[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[21]))
+        d_qk[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[22]))
+        d_qk[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[23]))
+        d_qk[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[24]))
+        d_qk[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[25]))
+        d_qk[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[26]))
+        d_qk[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[27]))
+        d_qk[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[28]))
+        d_qk[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[29]))
+        d_qk[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[30]))
+        d_qk[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_4, position=[31]))
+        _wgmma_5_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 32)
+        _wgmma_5 = cutlass_llvm.inline_asm(
+            _wgmma_5_ty,
+            [
+                cutlass.Float32(d_qk[(0) + 0]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 1]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 2]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 3]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 4]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 5]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 6]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 7]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 8]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 9]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 10]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 11]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 12]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 13]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 14]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 15]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 16]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 17]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 18]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 19]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 20]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 21]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 22]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 23]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 24]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 25]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 26]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 27]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 28]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 29]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 30]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 31]).ir_value(),
+                cutlass.Uint64((_wgmma_b_0_3 + 2)).ir_value(),
+                cutlass.Uint64((_wgmma_a_0_2 + 2)).ir_value(),
+            ],
+            asm_string='{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31}, $65, $64, 1, 1, 1, 0, 0;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,l,l,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_5_thr = _wgmma_5.get_slice(tid)
-        _wgmma_5_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_b_0_3 + 2)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_5_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_5_b_ptr = cute.recast_ptr(_wgmma_5_b_ptr, swizzle_=_wgmma_5_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_5_b = cute.make_tensor(_wgmma_5_b_ptr, _wgmma_5_b_layout.outer)
-        _wgmma_5_b_part = _wgmma_5_thr.partition_B(_wgmma_5_b)
-        _wgmma_5_b_frag = _wgmma_5.make_fragment_B(_wgmma_5_b_part)
-        _wgmma_5_a_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_a_0_2 + 2)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_5_a_layout = cutlass_hopper.make_smem_layout_a(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_5_a_ptr = cute.recast_ptr(_wgmma_5_a_ptr, swizzle_=_wgmma_5_a_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_5_a = cute.make_tensor(_wgmma_5_a_ptr, _wgmma_5_a_layout.outer)
-        _wgmma_5_a_part = _wgmma_5_thr.partition_A(_wgmma_5_a)
-        _wgmma_5_a_frag = _wgmma_5.make_fragment_A(_wgmma_5_a_part)
-        _wgmma_5_d = cute.make_tensor(d_qk.iterator + (0), _wgmma_5.partition_shape_C((64, 64)))
-        _wgmma_5.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-        cute.gemm(_wgmma_5, _wgmma_5_d, _wgmma_5_a_frag[None, None, 0, 0], _wgmma_5_b_frag[None, None, 0, 0], _wgmma_5_d)
-        _wgmma_6 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.K,
-            cutlass.Float32, (1, 1, 1), (64, 64),
-            cute.nvgpu.warpgroup.OperandSource.SMEM,
+        d_qk[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[0]))
+        d_qk[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[1]))
+        d_qk[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[2]))
+        d_qk[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[3]))
+        d_qk[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[4]))
+        d_qk[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[5]))
+        d_qk[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[6]))
+        d_qk[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[7]))
+        d_qk[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[8]))
+        d_qk[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[9]))
+        d_qk[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[10]))
+        d_qk[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[11]))
+        d_qk[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[12]))
+        d_qk[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[13]))
+        d_qk[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[14]))
+        d_qk[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[15]))
+        d_qk[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[16]))
+        d_qk[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[17]))
+        d_qk[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[18]))
+        d_qk[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[19]))
+        d_qk[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[20]))
+        d_qk[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[21]))
+        d_qk[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[22]))
+        d_qk[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[23]))
+        d_qk[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[24]))
+        d_qk[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[25]))
+        d_qk[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[26]))
+        d_qk[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[27]))
+        d_qk[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[28]))
+        d_qk[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[29]))
+        d_qk[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[30]))
+        d_qk[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_5, position=[31]))
+        _wgmma_6_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 32)
+        _wgmma_6 = cutlass_llvm.inline_asm(
+            _wgmma_6_ty,
+            [
+                cutlass.Float32(d_qk[(0) + 0]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 1]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 2]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 3]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 4]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 5]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 6]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 7]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 8]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 9]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 10]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 11]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 12]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 13]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 14]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 15]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 16]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 17]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 18]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 19]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 20]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 21]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 22]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 23]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 24]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 25]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 26]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 27]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 28]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 29]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 30]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 31]).ir_value(),
+                cutlass.Uint64((_wgmma_b_0_3 + 4)).ir_value(),
+                cutlass.Uint64((_wgmma_a_0_2 + 4)).ir_value(),
+            ],
+            asm_string='{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31}, $65, $64, 1, 1, 1, 0, 0;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,l,l,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_6_thr = _wgmma_6.get_slice(tid)
-        _wgmma_6_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_b_0_3 + 4)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_6_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_6_b_ptr = cute.recast_ptr(_wgmma_6_b_ptr, swizzle_=_wgmma_6_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_6_b = cute.make_tensor(_wgmma_6_b_ptr, _wgmma_6_b_layout.outer)
-        _wgmma_6_b_part = _wgmma_6_thr.partition_B(_wgmma_6_b)
-        _wgmma_6_b_frag = _wgmma_6.make_fragment_B(_wgmma_6_b_part)
-        _wgmma_6_a_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_a_0_2 + 4)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_6_a_layout = cutlass_hopper.make_smem_layout_a(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_6_a_ptr = cute.recast_ptr(_wgmma_6_a_ptr, swizzle_=_wgmma_6_a_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_6_a = cute.make_tensor(_wgmma_6_a_ptr, _wgmma_6_a_layout.outer)
-        _wgmma_6_a_part = _wgmma_6_thr.partition_A(_wgmma_6_a)
-        _wgmma_6_a_frag = _wgmma_6.make_fragment_A(_wgmma_6_a_part)
-        _wgmma_6_d = cute.make_tensor(d_qk.iterator + (0), _wgmma_6.partition_shape_C((64, 64)))
-        _wgmma_6.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-        cute.gemm(_wgmma_6, _wgmma_6_d, _wgmma_6_a_frag[None, None, 0, 0], _wgmma_6_b_frag[None, None, 0, 0], _wgmma_6_d)
-        _wgmma_7 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.K,
-            cutlass.Float32, (1, 1, 1), (64, 64),
-            cute.nvgpu.warpgroup.OperandSource.SMEM,
+        d_qk[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[0]))
+        d_qk[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[1]))
+        d_qk[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[2]))
+        d_qk[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[3]))
+        d_qk[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[4]))
+        d_qk[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[5]))
+        d_qk[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[6]))
+        d_qk[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[7]))
+        d_qk[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[8]))
+        d_qk[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[9]))
+        d_qk[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[10]))
+        d_qk[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[11]))
+        d_qk[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[12]))
+        d_qk[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[13]))
+        d_qk[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[14]))
+        d_qk[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[15]))
+        d_qk[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[16]))
+        d_qk[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[17]))
+        d_qk[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[18]))
+        d_qk[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[19]))
+        d_qk[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[20]))
+        d_qk[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[21]))
+        d_qk[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[22]))
+        d_qk[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[23]))
+        d_qk[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[24]))
+        d_qk[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[25]))
+        d_qk[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[26]))
+        d_qk[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[27]))
+        d_qk[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[28]))
+        d_qk[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[29]))
+        d_qk[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[30]))
+        d_qk[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_6, position=[31]))
+        _wgmma_7_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 32)
+        _wgmma_7 = cutlass_llvm.inline_asm(
+            _wgmma_7_ty,
+            [
+                cutlass.Float32(d_qk[(0) + 0]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 1]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 2]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 3]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 4]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 5]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 6]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 7]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 8]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 9]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 10]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 11]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 12]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 13]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 14]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 15]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 16]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 17]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 18]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 19]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 20]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 21]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 22]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 23]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 24]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 25]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 26]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 27]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 28]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 29]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 30]).ir_value(),
+                cutlass.Float32(d_qk[(0) + 31]).ir_value(),
+                cutlass.Uint64((_wgmma_b_0_3 + 6)).ir_value(),
+                cutlass.Uint64((_wgmma_a_0_2 + 6)).ir_value(),
+            ],
+            asm_string='{\nwgmma.mma_async.sync.aligned.m64n64k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31}, $65, $64, 1, 1, 1, 0, 0;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,l,l,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_7_thr = _wgmma_7.get_slice(tid)
-        _wgmma_7_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_b_0_3 + 6)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_7_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_7_b_ptr = cute.recast_ptr(_wgmma_7_b_ptr, swizzle_=_wgmma_7_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_7_b = cute.make_tensor(_wgmma_7_b_ptr, _wgmma_7_b_layout.outer)
-        _wgmma_7_b_part = _wgmma_7_thr.partition_B(_wgmma_7_b)
-        _wgmma_7_b_frag = _wgmma_7.make_fragment_B(_wgmma_7_b_part)
-        _wgmma_7_a_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_a_0_2 + 6)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_7_a_layout = cutlass_hopper.make_smem_layout_a(CutlassLayout.ROW_MAJOR, (64, 64, 64), cutlass.BFloat16, 1)
-        _wgmma_7_a_ptr = cute.recast_ptr(_wgmma_7_a_ptr, swizzle_=_wgmma_7_a_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_7_a = cute.make_tensor(_wgmma_7_a_ptr, _wgmma_7_a_layout.outer)
-        _wgmma_7_a_part = _wgmma_7_thr.partition_A(_wgmma_7_a)
-        _wgmma_7_a_frag = _wgmma_7.make_fragment_A(_wgmma_7_a_part)
-        _wgmma_7_d = cute.make_tensor(d_qk.iterator + (0), _wgmma_7.partition_shape_C((64, 64)))
-        _wgmma_7.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, True)
-        cute.gemm(_wgmma_7, _wgmma_7_d, _wgmma_7_a_frag[None, None, 0, 0], _wgmma_7_b_frag[None, None, 0, 0], _wgmma_7_d)
+        d_qk[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[0]))
+        d_qk[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[1]))
+        d_qk[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[2]))
+        d_qk[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[3]))
+        d_qk[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[4]))
+        d_qk[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[5]))
+        d_qk[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[6]))
+        d_qk[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[7]))
+        d_qk[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[8]))
+        d_qk[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[9]))
+        d_qk[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[10]))
+        d_qk[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[11]))
+        d_qk[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[12]))
+        d_qk[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[13]))
+        d_qk[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[14]))
+        d_qk[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[15]))
+        d_qk[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[16]))
+        d_qk[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[17]))
+        d_qk[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[18]))
+        d_qk[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[19]))
+        d_qk[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[20]))
+        d_qk[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[21]))
+        d_qk[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[22]))
+        d_qk[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[23]))
+        d_qk[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[24]))
+        d_qk[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[25]))
+        d_qk[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[26]))
+        d_qk[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[27]))
+        d_qk[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[28]))
+        d_qk[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[29]))
+        d_qk[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[30]))
+        d_qk[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_7, position=[31]))
         cute.nvgpu.warpgroup.commit_group()
         cute.nvgpu.warpgroup.wait_group(0)
         d_qk[0] = cutlass.Float32((d_qk[0] * scale_log2))
@@ -590,78 +1049,586 @@ def kernel_vsa_sm90_bf16_small_k1s(Q: cutlass.GridConstant[TensorMap], K: cutlas
             pass
         _phase_v_full0_0[0] ^= cutlass.Uint32(1)
         cute.nvgpu.warpgroup.fence()
-        _wgmma_8 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.MN,
-            cutlass.Float32, (1, 1, 1), (64, 128),
-            cute.nvgpu.warpgroup.OperandSource.RMEM,
+        _wgmma_8_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 64)
+        _wgmma_8 = cutlass_llvm.inline_asm(
+            _wgmma_8_ty,
+            [
+                cutlass.Float32(d_o[(0) + 0]).ir_value(),
+                cutlass.Float32(d_o[(0) + 1]).ir_value(),
+                cutlass.Float32(d_o[(0) + 2]).ir_value(),
+                cutlass.Float32(d_o[(0) + 3]).ir_value(),
+                cutlass.Float32(d_o[(0) + 4]).ir_value(),
+                cutlass.Float32(d_o[(0) + 5]).ir_value(),
+                cutlass.Float32(d_o[(0) + 6]).ir_value(),
+                cutlass.Float32(d_o[(0) + 7]).ir_value(),
+                cutlass.Float32(d_o[(0) + 8]).ir_value(),
+                cutlass.Float32(d_o[(0) + 9]).ir_value(),
+                cutlass.Float32(d_o[(0) + 10]).ir_value(),
+                cutlass.Float32(d_o[(0) + 11]).ir_value(),
+                cutlass.Float32(d_o[(0) + 12]).ir_value(),
+                cutlass.Float32(d_o[(0) + 13]).ir_value(),
+                cutlass.Float32(d_o[(0) + 14]).ir_value(),
+                cutlass.Float32(d_o[(0) + 15]).ir_value(),
+                cutlass.Float32(d_o[(0) + 16]).ir_value(),
+                cutlass.Float32(d_o[(0) + 17]).ir_value(),
+                cutlass.Float32(d_o[(0) + 18]).ir_value(),
+                cutlass.Float32(d_o[(0) + 19]).ir_value(),
+                cutlass.Float32(d_o[(0) + 20]).ir_value(),
+                cutlass.Float32(d_o[(0) + 21]).ir_value(),
+                cutlass.Float32(d_o[(0) + 22]).ir_value(),
+                cutlass.Float32(d_o[(0) + 23]).ir_value(),
+                cutlass.Float32(d_o[(0) + 24]).ir_value(),
+                cutlass.Float32(d_o[(0) + 25]).ir_value(),
+                cutlass.Float32(d_o[(0) + 26]).ir_value(),
+                cutlass.Float32(d_o[(0) + 27]).ir_value(),
+                cutlass.Float32(d_o[(0) + 28]).ir_value(),
+                cutlass.Float32(d_o[(0) + 29]).ir_value(),
+                cutlass.Float32(d_o[(0) + 30]).ir_value(),
+                cutlass.Float32(d_o[(0) + 31]).ir_value(),
+                cutlass.Float32(d_o[(0) + 32]).ir_value(),
+                cutlass.Float32(d_o[(0) + 33]).ir_value(),
+                cutlass.Float32(d_o[(0) + 34]).ir_value(),
+                cutlass.Float32(d_o[(0) + 35]).ir_value(),
+                cutlass.Float32(d_o[(0) + 36]).ir_value(),
+                cutlass.Float32(d_o[(0) + 37]).ir_value(),
+                cutlass.Float32(d_o[(0) + 38]).ir_value(),
+                cutlass.Float32(d_o[(0) + 39]).ir_value(),
+                cutlass.Float32(d_o[(0) + 40]).ir_value(),
+                cutlass.Float32(d_o[(0) + 41]).ir_value(),
+                cutlass.Float32(d_o[(0) + 42]).ir_value(),
+                cutlass.Float32(d_o[(0) + 43]).ir_value(),
+                cutlass.Float32(d_o[(0) + 44]).ir_value(),
+                cutlass.Float32(d_o[(0) + 45]).ir_value(),
+                cutlass.Float32(d_o[(0) + 46]).ir_value(),
+                cutlass.Float32(d_o[(0) + 47]).ir_value(),
+                cutlass.Float32(d_o[(0) + 48]).ir_value(),
+                cutlass.Float32(d_o[(0) + 49]).ir_value(),
+                cutlass.Float32(d_o[(0) + 50]).ir_value(),
+                cutlass.Float32(d_o[(0) + 51]).ir_value(),
+                cutlass.Float32(d_o[(0) + 52]).ir_value(),
+                cutlass.Float32(d_o[(0) + 53]).ir_value(),
+                cutlass.Float32(d_o[(0) + 54]).ir_value(),
+                cutlass.Float32(d_o[(0) + 55]).ir_value(),
+                cutlass.Float32(d_o[(0) + 56]).ir_value(),
+                cutlass.Float32(d_o[(0) + 57]).ir_value(),
+                cutlass.Float32(d_o[(0) + 58]).ir_value(),
+                cutlass.Float32(d_o[(0) + 59]).ir_value(),
+                cutlass.Float32(d_o[(0) + 60]).ir_value(),
+                cutlass.Float32(d_o[(0) + 61]).ir_value(),
+                cutlass.Float32(d_o[(0) + 62]).ir_value(),
+                cutlass.Float32(d_o[(0) + 63]).ir_value(),
+                cutlass.Uint64(_wgmma_b_0_4).ir_value(),
+                cutlass.Uint32(p_bf16[(0) + 0]).ir_value(),
+                cutlass.Uint32(p_bf16[(0) + 1]).ir_value(),
+                cutlass.Uint32(p_bf16[(0) + 2]).ir_value(),
+                cutlass.Uint32(p_bf16[(0) + 3]).ir_value(),
+                cutlass_arith.extui(cutlass.Int32.mlir_type, cutlass.Boolean((False) != 0).ir_value()),
+            ],
+            asm_string='{\n.reg .pred p;\nsetp.ne.b32 p, $133, 0;\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63}, {$129, $130, $131, $132}, $128, p, 1, 1, 1;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,l,r,r,r,r,r,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_8_thr = _wgmma_8.get_slice(tid)
-        _wgmma_8_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64(_wgmma_b_0_4) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_8_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.COL_MAJOR, (64, 128, 64), cutlass.BFloat16, 1)
-        _wgmma_8_b_ptr = cute.recast_ptr(_wgmma_8_b_ptr, swizzle_=_wgmma_8_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_8_b = cute.make_tensor(_wgmma_8_b_ptr, _wgmma_8_b_layout.outer)
-        _wgmma_8_b_part = _wgmma_8_thr.partition_B(_wgmma_8_b)
-        _wgmma_8_b_frag = _wgmma_8.make_fragment_B(_wgmma_8_b_part)
-        _wgmma_8_a_ptr = cute.recast_ptr(p_bf16.iterator + (0), dtype=cutlass.BFloat16)
-        _wgmma_8_a_frag = cute.make_tensor(_wgmma_8_a_ptr, _wgmma_8.partition_shape_A((64, 16)))
-        _wgmma_8_d = cute.make_tensor(d_o.iterator + (0), _wgmma_8.partition_shape_C((64, 128)))
-        _wgmma_8.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean((False) != 0))
-        cute.gemm(_wgmma_8, _wgmma_8_d, _wgmma_8_a_frag[None, None, 0], _wgmma_8_b_frag[None, None, 0, 0], _wgmma_8_d)
-        _wgmma_9 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.MN,
-            cutlass.Float32, (1, 1, 1), (64, 128),
-            cute.nvgpu.warpgroup.OperandSource.RMEM,
+        d_o[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[0]))
+        d_o[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[1]))
+        d_o[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[2]))
+        d_o[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[3]))
+        d_o[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[4]))
+        d_o[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[5]))
+        d_o[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[6]))
+        d_o[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[7]))
+        d_o[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[8]))
+        d_o[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[9]))
+        d_o[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[10]))
+        d_o[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[11]))
+        d_o[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[12]))
+        d_o[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[13]))
+        d_o[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[14]))
+        d_o[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[15]))
+        d_o[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[16]))
+        d_o[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[17]))
+        d_o[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[18]))
+        d_o[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[19]))
+        d_o[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[20]))
+        d_o[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[21]))
+        d_o[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[22]))
+        d_o[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[23]))
+        d_o[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[24]))
+        d_o[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[25]))
+        d_o[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[26]))
+        d_o[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[27]))
+        d_o[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[28]))
+        d_o[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[29]))
+        d_o[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[30]))
+        d_o[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[31]))
+        d_o[(0) + 32] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[32]))
+        d_o[(0) + 33] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[33]))
+        d_o[(0) + 34] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[34]))
+        d_o[(0) + 35] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[35]))
+        d_o[(0) + 36] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[36]))
+        d_o[(0) + 37] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[37]))
+        d_o[(0) + 38] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[38]))
+        d_o[(0) + 39] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[39]))
+        d_o[(0) + 40] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[40]))
+        d_o[(0) + 41] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[41]))
+        d_o[(0) + 42] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[42]))
+        d_o[(0) + 43] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[43]))
+        d_o[(0) + 44] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[44]))
+        d_o[(0) + 45] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[45]))
+        d_o[(0) + 46] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[46]))
+        d_o[(0) + 47] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[47]))
+        d_o[(0) + 48] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[48]))
+        d_o[(0) + 49] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[49]))
+        d_o[(0) + 50] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[50]))
+        d_o[(0) + 51] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[51]))
+        d_o[(0) + 52] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[52]))
+        d_o[(0) + 53] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[53]))
+        d_o[(0) + 54] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[54]))
+        d_o[(0) + 55] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[55]))
+        d_o[(0) + 56] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[56]))
+        d_o[(0) + 57] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[57]))
+        d_o[(0) + 58] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[58]))
+        d_o[(0) + 59] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[59]))
+        d_o[(0) + 60] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[60]))
+        d_o[(0) + 61] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[61]))
+        d_o[(0) + 62] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[62]))
+        d_o[(0) + 63] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_8, position=[63]))
+        _wgmma_9_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 64)
+        _wgmma_9 = cutlass_llvm.inline_asm(
+            _wgmma_9_ty,
+            [
+                cutlass.Float32(d_o[(0) + 0]).ir_value(),
+                cutlass.Float32(d_o[(0) + 1]).ir_value(),
+                cutlass.Float32(d_o[(0) + 2]).ir_value(),
+                cutlass.Float32(d_o[(0) + 3]).ir_value(),
+                cutlass.Float32(d_o[(0) + 4]).ir_value(),
+                cutlass.Float32(d_o[(0) + 5]).ir_value(),
+                cutlass.Float32(d_o[(0) + 6]).ir_value(),
+                cutlass.Float32(d_o[(0) + 7]).ir_value(),
+                cutlass.Float32(d_o[(0) + 8]).ir_value(),
+                cutlass.Float32(d_o[(0) + 9]).ir_value(),
+                cutlass.Float32(d_o[(0) + 10]).ir_value(),
+                cutlass.Float32(d_o[(0) + 11]).ir_value(),
+                cutlass.Float32(d_o[(0) + 12]).ir_value(),
+                cutlass.Float32(d_o[(0) + 13]).ir_value(),
+                cutlass.Float32(d_o[(0) + 14]).ir_value(),
+                cutlass.Float32(d_o[(0) + 15]).ir_value(),
+                cutlass.Float32(d_o[(0) + 16]).ir_value(),
+                cutlass.Float32(d_o[(0) + 17]).ir_value(),
+                cutlass.Float32(d_o[(0) + 18]).ir_value(),
+                cutlass.Float32(d_o[(0) + 19]).ir_value(),
+                cutlass.Float32(d_o[(0) + 20]).ir_value(),
+                cutlass.Float32(d_o[(0) + 21]).ir_value(),
+                cutlass.Float32(d_o[(0) + 22]).ir_value(),
+                cutlass.Float32(d_o[(0) + 23]).ir_value(),
+                cutlass.Float32(d_o[(0) + 24]).ir_value(),
+                cutlass.Float32(d_o[(0) + 25]).ir_value(),
+                cutlass.Float32(d_o[(0) + 26]).ir_value(),
+                cutlass.Float32(d_o[(0) + 27]).ir_value(),
+                cutlass.Float32(d_o[(0) + 28]).ir_value(),
+                cutlass.Float32(d_o[(0) + 29]).ir_value(),
+                cutlass.Float32(d_o[(0) + 30]).ir_value(),
+                cutlass.Float32(d_o[(0) + 31]).ir_value(),
+                cutlass.Float32(d_o[(0) + 32]).ir_value(),
+                cutlass.Float32(d_o[(0) + 33]).ir_value(),
+                cutlass.Float32(d_o[(0) + 34]).ir_value(),
+                cutlass.Float32(d_o[(0) + 35]).ir_value(),
+                cutlass.Float32(d_o[(0) + 36]).ir_value(),
+                cutlass.Float32(d_o[(0) + 37]).ir_value(),
+                cutlass.Float32(d_o[(0) + 38]).ir_value(),
+                cutlass.Float32(d_o[(0) + 39]).ir_value(),
+                cutlass.Float32(d_o[(0) + 40]).ir_value(),
+                cutlass.Float32(d_o[(0) + 41]).ir_value(),
+                cutlass.Float32(d_o[(0) + 42]).ir_value(),
+                cutlass.Float32(d_o[(0) + 43]).ir_value(),
+                cutlass.Float32(d_o[(0) + 44]).ir_value(),
+                cutlass.Float32(d_o[(0) + 45]).ir_value(),
+                cutlass.Float32(d_o[(0) + 46]).ir_value(),
+                cutlass.Float32(d_o[(0) + 47]).ir_value(),
+                cutlass.Float32(d_o[(0) + 48]).ir_value(),
+                cutlass.Float32(d_o[(0) + 49]).ir_value(),
+                cutlass.Float32(d_o[(0) + 50]).ir_value(),
+                cutlass.Float32(d_o[(0) + 51]).ir_value(),
+                cutlass.Float32(d_o[(0) + 52]).ir_value(),
+                cutlass.Float32(d_o[(0) + 53]).ir_value(),
+                cutlass.Float32(d_o[(0) + 54]).ir_value(),
+                cutlass.Float32(d_o[(0) + 55]).ir_value(),
+                cutlass.Float32(d_o[(0) + 56]).ir_value(),
+                cutlass.Float32(d_o[(0) + 57]).ir_value(),
+                cutlass.Float32(d_o[(0) + 58]).ir_value(),
+                cutlass.Float32(d_o[(0) + 59]).ir_value(),
+                cutlass.Float32(d_o[(0) + 60]).ir_value(),
+                cutlass.Float32(d_o[(0) + 61]).ir_value(),
+                cutlass.Float32(d_o[(0) + 62]).ir_value(),
+                cutlass.Float32(d_o[(0) + 63]).ir_value(),
+                cutlass.Uint64((_wgmma_b_0_4 + 128)).ir_value(),
+                cutlass.Uint32(p_bf16[(4) + 0]).ir_value(),
+                cutlass.Uint32(p_bf16[(4) + 1]).ir_value(),
+                cutlass.Uint32(p_bf16[(4) + 2]).ir_value(),
+                cutlass.Uint32(p_bf16[(4) + 3]).ir_value(),
+                cutlass_arith.extui(cutlass.Int32.mlir_type, cutlass.Boolean((True) != 0).ir_value()),
+            ],
+            asm_string='{\n.reg .pred p;\nsetp.ne.b32 p, $133, 0;\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63}, {$129, $130, $131, $132}, $128, p, 1, 1, 1;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,l,r,r,r,r,r,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_9_thr = _wgmma_9.get_slice(tid)
-        _wgmma_9_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_b_0_4 + 128)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_9_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.COL_MAJOR, (64, 128, 64), cutlass.BFloat16, 1)
-        _wgmma_9_b_ptr = cute.recast_ptr(_wgmma_9_b_ptr, swizzle_=_wgmma_9_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_9_b = cute.make_tensor(_wgmma_9_b_ptr, _wgmma_9_b_layout.outer)
-        _wgmma_9_b_part = _wgmma_9_thr.partition_B(_wgmma_9_b)
-        _wgmma_9_b_frag = _wgmma_9.make_fragment_B(_wgmma_9_b_part)
-        _wgmma_9_a_ptr = cute.recast_ptr(p_bf16.iterator + (4), dtype=cutlass.BFloat16)
-        _wgmma_9_a_frag = cute.make_tensor(_wgmma_9_a_ptr, _wgmma_9.partition_shape_A((64, 16)))
-        _wgmma_9_d = cute.make_tensor(d_o.iterator + (0), _wgmma_9.partition_shape_C((64, 128)))
-        _wgmma_9.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean((True) != 0))
-        cute.gemm(_wgmma_9, _wgmma_9_d, _wgmma_9_a_frag[None, None, 0], _wgmma_9_b_frag[None, None, 0, 0], _wgmma_9_d)
-        _wgmma_10 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.MN,
-            cutlass.Float32, (1, 1, 1), (64, 128),
-            cute.nvgpu.warpgroup.OperandSource.RMEM,
+        d_o[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[0]))
+        d_o[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[1]))
+        d_o[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[2]))
+        d_o[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[3]))
+        d_o[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[4]))
+        d_o[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[5]))
+        d_o[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[6]))
+        d_o[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[7]))
+        d_o[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[8]))
+        d_o[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[9]))
+        d_o[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[10]))
+        d_o[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[11]))
+        d_o[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[12]))
+        d_o[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[13]))
+        d_o[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[14]))
+        d_o[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[15]))
+        d_o[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[16]))
+        d_o[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[17]))
+        d_o[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[18]))
+        d_o[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[19]))
+        d_o[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[20]))
+        d_o[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[21]))
+        d_o[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[22]))
+        d_o[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[23]))
+        d_o[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[24]))
+        d_o[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[25]))
+        d_o[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[26]))
+        d_o[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[27]))
+        d_o[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[28]))
+        d_o[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[29]))
+        d_o[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[30]))
+        d_o[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[31]))
+        d_o[(0) + 32] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[32]))
+        d_o[(0) + 33] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[33]))
+        d_o[(0) + 34] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[34]))
+        d_o[(0) + 35] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[35]))
+        d_o[(0) + 36] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[36]))
+        d_o[(0) + 37] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[37]))
+        d_o[(0) + 38] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[38]))
+        d_o[(0) + 39] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[39]))
+        d_o[(0) + 40] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[40]))
+        d_o[(0) + 41] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[41]))
+        d_o[(0) + 42] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[42]))
+        d_o[(0) + 43] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[43]))
+        d_o[(0) + 44] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[44]))
+        d_o[(0) + 45] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[45]))
+        d_o[(0) + 46] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[46]))
+        d_o[(0) + 47] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[47]))
+        d_o[(0) + 48] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[48]))
+        d_o[(0) + 49] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[49]))
+        d_o[(0) + 50] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[50]))
+        d_o[(0) + 51] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[51]))
+        d_o[(0) + 52] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[52]))
+        d_o[(0) + 53] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[53]))
+        d_o[(0) + 54] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[54]))
+        d_o[(0) + 55] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[55]))
+        d_o[(0) + 56] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[56]))
+        d_o[(0) + 57] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[57]))
+        d_o[(0) + 58] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[58]))
+        d_o[(0) + 59] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[59]))
+        d_o[(0) + 60] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[60]))
+        d_o[(0) + 61] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[61]))
+        d_o[(0) + 62] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[62]))
+        d_o[(0) + 63] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_9, position=[63]))
+        _wgmma_10_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 64)
+        _wgmma_10 = cutlass_llvm.inline_asm(
+            _wgmma_10_ty,
+            [
+                cutlass.Float32(d_o[(0) + 0]).ir_value(),
+                cutlass.Float32(d_o[(0) + 1]).ir_value(),
+                cutlass.Float32(d_o[(0) + 2]).ir_value(),
+                cutlass.Float32(d_o[(0) + 3]).ir_value(),
+                cutlass.Float32(d_o[(0) + 4]).ir_value(),
+                cutlass.Float32(d_o[(0) + 5]).ir_value(),
+                cutlass.Float32(d_o[(0) + 6]).ir_value(),
+                cutlass.Float32(d_o[(0) + 7]).ir_value(),
+                cutlass.Float32(d_o[(0) + 8]).ir_value(),
+                cutlass.Float32(d_o[(0) + 9]).ir_value(),
+                cutlass.Float32(d_o[(0) + 10]).ir_value(),
+                cutlass.Float32(d_o[(0) + 11]).ir_value(),
+                cutlass.Float32(d_o[(0) + 12]).ir_value(),
+                cutlass.Float32(d_o[(0) + 13]).ir_value(),
+                cutlass.Float32(d_o[(0) + 14]).ir_value(),
+                cutlass.Float32(d_o[(0) + 15]).ir_value(),
+                cutlass.Float32(d_o[(0) + 16]).ir_value(),
+                cutlass.Float32(d_o[(0) + 17]).ir_value(),
+                cutlass.Float32(d_o[(0) + 18]).ir_value(),
+                cutlass.Float32(d_o[(0) + 19]).ir_value(),
+                cutlass.Float32(d_o[(0) + 20]).ir_value(),
+                cutlass.Float32(d_o[(0) + 21]).ir_value(),
+                cutlass.Float32(d_o[(0) + 22]).ir_value(),
+                cutlass.Float32(d_o[(0) + 23]).ir_value(),
+                cutlass.Float32(d_o[(0) + 24]).ir_value(),
+                cutlass.Float32(d_o[(0) + 25]).ir_value(),
+                cutlass.Float32(d_o[(0) + 26]).ir_value(),
+                cutlass.Float32(d_o[(0) + 27]).ir_value(),
+                cutlass.Float32(d_o[(0) + 28]).ir_value(),
+                cutlass.Float32(d_o[(0) + 29]).ir_value(),
+                cutlass.Float32(d_o[(0) + 30]).ir_value(),
+                cutlass.Float32(d_o[(0) + 31]).ir_value(),
+                cutlass.Float32(d_o[(0) + 32]).ir_value(),
+                cutlass.Float32(d_o[(0) + 33]).ir_value(),
+                cutlass.Float32(d_o[(0) + 34]).ir_value(),
+                cutlass.Float32(d_o[(0) + 35]).ir_value(),
+                cutlass.Float32(d_o[(0) + 36]).ir_value(),
+                cutlass.Float32(d_o[(0) + 37]).ir_value(),
+                cutlass.Float32(d_o[(0) + 38]).ir_value(),
+                cutlass.Float32(d_o[(0) + 39]).ir_value(),
+                cutlass.Float32(d_o[(0) + 40]).ir_value(),
+                cutlass.Float32(d_o[(0) + 41]).ir_value(),
+                cutlass.Float32(d_o[(0) + 42]).ir_value(),
+                cutlass.Float32(d_o[(0) + 43]).ir_value(),
+                cutlass.Float32(d_o[(0) + 44]).ir_value(),
+                cutlass.Float32(d_o[(0) + 45]).ir_value(),
+                cutlass.Float32(d_o[(0) + 46]).ir_value(),
+                cutlass.Float32(d_o[(0) + 47]).ir_value(),
+                cutlass.Float32(d_o[(0) + 48]).ir_value(),
+                cutlass.Float32(d_o[(0) + 49]).ir_value(),
+                cutlass.Float32(d_o[(0) + 50]).ir_value(),
+                cutlass.Float32(d_o[(0) + 51]).ir_value(),
+                cutlass.Float32(d_o[(0) + 52]).ir_value(),
+                cutlass.Float32(d_o[(0) + 53]).ir_value(),
+                cutlass.Float32(d_o[(0) + 54]).ir_value(),
+                cutlass.Float32(d_o[(0) + 55]).ir_value(),
+                cutlass.Float32(d_o[(0) + 56]).ir_value(),
+                cutlass.Float32(d_o[(0) + 57]).ir_value(),
+                cutlass.Float32(d_o[(0) + 58]).ir_value(),
+                cutlass.Float32(d_o[(0) + 59]).ir_value(),
+                cutlass.Float32(d_o[(0) + 60]).ir_value(),
+                cutlass.Float32(d_o[(0) + 61]).ir_value(),
+                cutlass.Float32(d_o[(0) + 62]).ir_value(),
+                cutlass.Float32(d_o[(0) + 63]).ir_value(),
+                cutlass.Uint64((_wgmma_b_0_4 + 256)).ir_value(),
+                cutlass.Uint32(p_bf16[(8) + 0]).ir_value(),
+                cutlass.Uint32(p_bf16[(8) + 1]).ir_value(),
+                cutlass.Uint32(p_bf16[(8) + 2]).ir_value(),
+                cutlass.Uint32(p_bf16[(8) + 3]).ir_value(),
+                cutlass_arith.extui(cutlass.Int32.mlir_type, cutlass.Boolean((True) != 0).ir_value()),
+            ],
+            asm_string='{\n.reg .pred p;\nsetp.ne.b32 p, $133, 0;\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63}, {$129, $130, $131, $132}, $128, p, 1, 1, 1;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,l,r,r,r,r,r,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_10_thr = _wgmma_10.get_slice(tid)
-        _wgmma_10_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_b_0_4 + 256)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_10_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.COL_MAJOR, (64, 128, 64), cutlass.BFloat16, 1)
-        _wgmma_10_b_ptr = cute.recast_ptr(_wgmma_10_b_ptr, swizzle_=_wgmma_10_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_10_b = cute.make_tensor(_wgmma_10_b_ptr, _wgmma_10_b_layout.outer)
-        _wgmma_10_b_part = _wgmma_10_thr.partition_B(_wgmma_10_b)
-        _wgmma_10_b_frag = _wgmma_10.make_fragment_B(_wgmma_10_b_part)
-        _wgmma_10_a_ptr = cute.recast_ptr(p_bf16.iterator + (8), dtype=cutlass.BFloat16)
-        _wgmma_10_a_frag = cute.make_tensor(_wgmma_10_a_ptr, _wgmma_10.partition_shape_A((64, 16)))
-        _wgmma_10_d = cute.make_tensor(d_o.iterator + (0), _wgmma_10.partition_shape_C((64, 128)))
-        _wgmma_10.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean((True) != 0))
-        cute.gemm(_wgmma_10, _wgmma_10_d, _wgmma_10_a_frag[None, None, 0], _wgmma_10_b_frag[None, None, 0, 0], _wgmma_10_d)
-        _wgmma_11 = cutlass_hopper.make_trivial_tiled_mma(
-            cutlass.BFloat16, cutlass.BFloat16,
-            cute.nvgpu.OperandMajorMode.K, cute.nvgpu.OperandMajorMode.MN,
-            cutlass.Float32, (1, 1, 1), (64, 128),
-            cute.nvgpu.warpgroup.OperandSource.RMEM,
+        d_o[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[0]))
+        d_o[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[1]))
+        d_o[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[2]))
+        d_o[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[3]))
+        d_o[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[4]))
+        d_o[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[5]))
+        d_o[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[6]))
+        d_o[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[7]))
+        d_o[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[8]))
+        d_o[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[9]))
+        d_o[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[10]))
+        d_o[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[11]))
+        d_o[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[12]))
+        d_o[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[13]))
+        d_o[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[14]))
+        d_o[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[15]))
+        d_o[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[16]))
+        d_o[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[17]))
+        d_o[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[18]))
+        d_o[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[19]))
+        d_o[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[20]))
+        d_o[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[21]))
+        d_o[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[22]))
+        d_o[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[23]))
+        d_o[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[24]))
+        d_o[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[25]))
+        d_o[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[26]))
+        d_o[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[27]))
+        d_o[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[28]))
+        d_o[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[29]))
+        d_o[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[30]))
+        d_o[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[31]))
+        d_o[(0) + 32] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[32]))
+        d_o[(0) + 33] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[33]))
+        d_o[(0) + 34] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[34]))
+        d_o[(0) + 35] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[35]))
+        d_o[(0) + 36] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[36]))
+        d_o[(0) + 37] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[37]))
+        d_o[(0) + 38] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[38]))
+        d_o[(0) + 39] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[39]))
+        d_o[(0) + 40] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[40]))
+        d_o[(0) + 41] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[41]))
+        d_o[(0) + 42] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[42]))
+        d_o[(0) + 43] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[43]))
+        d_o[(0) + 44] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[44]))
+        d_o[(0) + 45] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[45]))
+        d_o[(0) + 46] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[46]))
+        d_o[(0) + 47] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[47]))
+        d_o[(0) + 48] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[48]))
+        d_o[(0) + 49] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[49]))
+        d_o[(0) + 50] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[50]))
+        d_o[(0) + 51] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[51]))
+        d_o[(0) + 52] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[52]))
+        d_o[(0) + 53] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[53]))
+        d_o[(0) + 54] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[54]))
+        d_o[(0) + 55] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[55]))
+        d_o[(0) + 56] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[56]))
+        d_o[(0) + 57] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[57]))
+        d_o[(0) + 58] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[58]))
+        d_o[(0) + 59] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[59]))
+        d_o[(0) + 60] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[60]))
+        d_o[(0) + 61] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[61]))
+        d_o[(0) + 62] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[62]))
+        d_o[(0) + 63] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_10, position=[63]))
+        _wgmma_11_ty = cutlass_llvm.StructType.get_literal([cutlass.Float32.mlir_type] * 64)
+        _wgmma_11 = cutlass_llvm.inline_asm(
+            _wgmma_11_ty,
+            [
+                cutlass.Float32(d_o[(0) + 0]).ir_value(),
+                cutlass.Float32(d_o[(0) + 1]).ir_value(),
+                cutlass.Float32(d_o[(0) + 2]).ir_value(),
+                cutlass.Float32(d_o[(0) + 3]).ir_value(),
+                cutlass.Float32(d_o[(0) + 4]).ir_value(),
+                cutlass.Float32(d_o[(0) + 5]).ir_value(),
+                cutlass.Float32(d_o[(0) + 6]).ir_value(),
+                cutlass.Float32(d_o[(0) + 7]).ir_value(),
+                cutlass.Float32(d_o[(0) + 8]).ir_value(),
+                cutlass.Float32(d_o[(0) + 9]).ir_value(),
+                cutlass.Float32(d_o[(0) + 10]).ir_value(),
+                cutlass.Float32(d_o[(0) + 11]).ir_value(),
+                cutlass.Float32(d_o[(0) + 12]).ir_value(),
+                cutlass.Float32(d_o[(0) + 13]).ir_value(),
+                cutlass.Float32(d_o[(0) + 14]).ir_value(),
+                cutlass.Float32(d_o[(0) + 15]).ir_value(),
+                cutlass.Float32(d_o[(0) + 16]).ir_value(),
+                cutlass.Float32(d_o[(0) + 17]).ir_value(),
+                cutlass.Float32(d_o[(0) + 18]).ir_value(),
+                cutlass.Float32(d_o[(0) + 19]).ir_value(),
+                cutlass.Float32(d_o[(0) + 20]).ir_value(),
+                cutlass.Float32(d_o[(0) + 21]).ir_value(),
+                cutlass.Float32(d_o[(0) + 22]).ir_value(),
+                cutlass.Float32(d_o[(0) + 23]).ir_value(),
+                cutlass.Float32(d_o[(0) + 24]).ir_value(),
+                cutlass.Float32(d_o[(0) + 25]).ir_value(),
+                cutlass.Float32(d_o[(0) + 26]).ir_value(),
+                cutlass.Float32(d_o[(0) + 27]).ir_value(),
+                cutlass.Float32(d_o[(0) + 28]).ir_value(),
+                cutlass.Float32(d_o[(0) + 29]).ir_value(),
+                cutlass.Float32(d_o[(0) + 30]).ir_value(),
+                cutlass.Float32(d_o[(0) + 31]).ir_value(),
+                cutlass.Float32(d_o[(0) + 32]).ir_value(),
+                cutlass.Float32(d_o[(0) + 33]).ir_value(),
+                cutlass.Float32(d_o[(0) + 34]).ir_value(),
+                cutlass.Float32(d_o[(0) + 35]).ir_value(),
+                cutlass.Float32(d_o[(0) + 36]).ir_value(),
+                cutlass.Float32(d_o[(0) + 37]).ir_value(),
+                cutlass.Float32(d_o[(0) + 38]).ir_value(),
+                cutlass.Float32(d_o[(0) + 39]).ir_value(),
+                cutlass.Float32(d_o[(0) + 40]).ir_value(),
+                cutlass.Float32(d_o[(0) + 41]).ir_value(),
+                cutlass.Float32(d_o[(0) + 42]).ir_value(),
+                cutlass.Float32(d_o[(0) + 43]).ir_value(),
+                cutlass.Float32(d_o[(0) + 44]).ir_value(),
+                cutlass.Float32(d_o[(0) + 45]).ir_value(),
+                cutlass.Float32(d_o[(0) + 46]).ir_value(),
+                cutlass.Float32(d_o[(0) + 47]).ir_value(),
+                cutlass.Float32(d_o[(0) + 48]).ir_value(),
+                cutlass.Float32(d_o[(0) + 49]).ir_value(),
+                cutlass.Float32(d_o[(0) + 50]).ir_value(),
+                cutlass.Float32(d_o[(0) + 51]).ir_value(),
+                cutlass.Float32(d_o[(0) + 52]).ir_value(),
+                cutlass.Float32(d_o[(0) + 53]).ir_value(),
+                cutlass.Float32(d_o[(0) + 54]).ir_value(),
+                cutlass.Float32(d_o[(0) + 55]).ir_value(),
+                cutlass.Float32(d_o[(0) + 56]).ir_value(),
+                cutlass.Float32(d_o[(0) + 57]).ir_value(),
+                cutlass.Float32(d_o[(0) + 58]).ir_value(),
+                cutlass.Float32(d_o[(0) + 59]).ir_value(),
+                cutlass.Float32(d_o[(0) + 60]).ir_value(),
+                cutlass.Float32(d_o[(0) + 61]).ir_value(),
+                cutlass.Float32(d_o[(0) + 62]).ir_value(),
+                cutlass.Float32(d_o[(0) + 63]).ir_value(),
+                cutlass.Uint64((_wgmma_b_0_4 + 384)).ir_value(),
+                cutlass.Uint32(p_bf16[(12) + 0]).ir_value(),
+                cutlass.Uint32(p_bf16[(12) + 1]).ir_value(),
+                cutlass.Uint32(p_bf16[(12) + 2]).ir_value(),
+                cutlass.Uint32(p_bf16[(12) + 3]).ir_value(),
+                cutlass_arith.extui(cutlass.Int32.mlir_type, cutlass.Boolean((True) != 0).ir_value()),
+            ],
+            asm_string='{\n.reg .pred p;\nsetp.ne.b32 p, $133, 0;\nwgmma.mma_async.sync.aligned.m64n128k16.f32.bf16.bf16 {$0, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47, $48, $49, $50, $51, $52, $53, $54, $55, $56, $57, $58, $59, $60, $61, $62, $63}, {$129, $130, $131, $132}, $128, p, 1, 1, 1;\n}\n',
+            constraints='=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,=f,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,l,r,r,r,r,r,~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
         )
-        _wgmma_11_thr = _wgmma_11.get_slice(tid)
-        _wgmma_11_b_ptr = cute.make_ptr(cutlass.BFloat16, cutlass.Uint32((cutlass.Uint64((_wgmma_b_0_4 + 384)) & cutlass.Uint64(0x3FFF)) << 4), mem_space=cute.AddressSpace.smem, assumed_align=16)
-        _wgmma_11_b_layout = cutlass_hopper.make_smem_layout_b(CutlassLayout.COL_MAJOR, (64, 128, 64), cutlass.BFloat16, 1)
-        _wgmma_11_b_ptr = cute.recast_ptr(_wgmma_11_b_ptr, swizzle_=_wgmma_11_b_layout.inner, dtype=cutlass.BFloat16)
-        _wgmma_11_b = cute.make_tensor(_wgmma_11_b_ptr, _wgmma_11_b_layout.outer)
-        _wgmma_11_b_part = _wgmma_11_thr.partition_B(_wgmma_11_b)
-        _wgmma_11_b_frag = _wgmma_11.make_fragment_B(_wgmma_11_b_part)
-        _wgmma_11_a_ptr = cute.recast_ptr(p_bf16.iterator + (12), dtype=cutlass.BFloat16)
-        _wgmma_11_a_frag = cute.make_tensor(_wgmma_11_a_ptr, _wgmma_11.partition_shape_A((64, 16)))
-        _wgmma_11_d = cute.make_tensor(d_o.iterator + (0), _wgmma_11.partition_shape_C((64, 128)))
-        _wgmma_11.set(cute.nvgpu.warpgroup.Field.ACCUMULATE, cutlass.Boolean((True) != 0))
-        cute.gemm(_wgmma_11, _wgmma_11_d, _wgmma_11_a_frag[None, None, 0], _wgmma_11_b_frag[None, None, 0, 0], _wgmma_11_d)
+        d_o[(0) + 0] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[0]))
+        d_o[(0) + 1] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[1]))
+        d_o[(0) + 2] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[2]))
+        d_o[(0) + 3] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[3]))
+        d_o[(0) + 4] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[4]))
+        d_o[(0) + 5] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[5]))
+        d_o[(0) + 6] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[6]))
+        d_o[(0) + 7] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[7]))
+        d_o[(0) + 8] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[8]))
+        d_o[(0) + 9] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[9]))
+        d_o[(0) + 10] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[10]))
+        d_o[(0) + 11] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[11]))
+        d_o[(0) + 12] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[12]))
+        d_o[(0) + 13] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[13]))
+        d_o[(0) + 14] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[14]))
+        d_o[(0) + 15] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[15]))
+        d_o[(0) + 16] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[16]))
+        d_o[(0) + 17] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[17]))
+        d_o[(0) + 18] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[18]))
+        d_o[(0) + 19] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[19]))
+        d_o[(0) + 20] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[20]))
+        d_o[(0) + 21] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[21]))
+        d_o[(0) + 22] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[22]))
+        d_o[(0) + 23] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[23]))
+        d_o[(0) + 24] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[24]))
+        d_o[(0) + 25] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[25]))
+        d_o[(0) + 26] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[26]))
+        d_o[(0) + 27] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[27]))
+        d_o[(0) + 28] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[28]))
+        d_o[(0) + 29] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[29]))
+        d_o[(0) + 30] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[30]))
+        d_o[(0) + 31] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[31]))
+        d_o[(0) + 32] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[32]))
+        d_o[(0) + 33] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[33]))
+        d_o[(0) + 34] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[34]))
+        d_o[(0) + 35] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[35]))
+        d_o[(0) + 36] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[36]))
+        d_o[(0) + 37] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[37]))
+        d_o[(0) + 38] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[38]))
+        d_o[(0) + 39] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[39]))
+        d_o[(0) + 40] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[40]))
+        d_o[(0) + 41] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[41]))
+        d_o[(0) + 42] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[42]))
+        d_o[(0) + 43] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[43]))
+        d_o[(0) + 44] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[44]))
+        d_o[(0) + 45] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[45]))
+        d_o[(0) + 46] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[46]))
+        d_o[(0) + 47] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[47]))
+        d_o[(0) + 48] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[48]))
+        d_o[(0) + 49] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[49]))
+        d_o[(0) + 50] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[50]))
+        d_o[(0) + 51] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[51]))
+        d_o[(0) + 52] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[52]))
+        d_o[(0) + 53] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[53]))
+        d_o[(0) + 54] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[54]))
+        d_o[(0) + 55] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[55]))
+        d_o[(0) + 56] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[56]))
+        d_o[(0) + 57] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[57]))
+        d_o[(0) + 58] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[58]))
+        d_o[(0) + 59] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[59]))
+        d_o[(0) + 60] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[60]))
+        d_o[(0) + 61] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[61]))
+        d_o[(0) + 62] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[62]))
+        d_o[(0) + 63] = cutlass.Float32(cutlass_llvm.extractvalue(cutlass.Float32.mlir_type, _wgmma_11, position=[63]))
         cute.nvgpu.warpgroup.commit_group()
         cute.nvgpu.warpgroup.wait_group(0)
     _shfl_xor_4 = cute.arch.shuffle_sync_bfly(row_sum0[0], 2, mask=0xFFFFFFFF, mask_and_clamp=31)
@@ -1395,9 +2362,29 @@ def kernel_vsa_sm90_bf16_small_k1s(Q: cutlass.GridConstant[TensorMap], K: cutlas
         _gmem_store_raw_51 = cutlass.Vector.from_elements([cutlass.Uint32(o_vec[0]), cutlass.Uint32(o_vec[1]), cutlass.Uint32(o_vec[2]), cutlass.Uint32(o_vec[3])], cutlass.Uint32)
         prims.store_ext(_gmem_store_raw_51.ir_value(), O + o_off_7)
     cute.arch.sync_threads()
+    if _cake_ldparam_b64(_plan__base + 0, 'u64') != cutlass.Uint64(plan__slot_0):
+        cutlass_llvm.inline_asm(
+            res=None,
+            operands_=[],
+            asm_string='trap;',
+            constraints='~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
+        )
+    if _cake_ldparam_b64(_plan__base + 3496, 'u64') != cutlass.Uint64(plan__slot_437):
+        cutlass_llvm.inline_asm(
+            res=None,
+            operands_=[],
+            asm_string='trap;',
+            constraints='~{memory}',
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=cutlass_llvm.AsmDialect.AD_ATT,
+        )
 
 @cute.jit
-def launch_vsa_sm90_bf16_small_k1s(Q: cute.Tensor, _cake_tma_Q_dim_0: cutlass.Int64, _cake_tma_Q_dim_1: cutlass.Int64, _cake_tma_Q_dim_2: cutlass.Int64, _cake_tma_Q_stride16_0: cutlass.Int64, _cake_tma_Q_stride16_1: cutlass.Int64, K: cute.Tensor, _cake_tma_K_dim_0: cutlass.Int64, _cake_tma_K_dim_1: cutlass.Int64, _cake_tma_K_dim_2: cutlass.Int64, _cake_tma_K_stride16_0: cutlass.Int64, _cake_tma_K_stride16_1: cutlass.Int64, Vt: cute.Tensor, _cake_tma_Vt_dim_0: cutlass.Int64, _cake_tma_Vt_dim_1: cutlass.Int64, _cake_tma_Vt_dim_2: cutlass.Int64, _cake_tma_Vt_dim_3: cutlass.Int64, _cake_tma_Vt_stride16_0: cutlass.Int64, _cake_tma_Vt_stride16_1: cutlass.Int64, _cake_tma_Vt_stride16_2: cutlass.Int64, O: cute.Tensor, plan: cute.Tensor, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, scale_log2: cutlass.Float32, Wo: cute.Tensor, Ws: cute.Tensor, Wc: cute.Tensor, grid_x: cutlass.Int32, grid_y: cutlass.Int32, grid_z: cutlass.Int32, stream: cuda.CUstream):
+def launch_vsa_sm90_bf16_small_k1s(Q: cute.Tensor, _cake_tma_Q_dim_0: cutlass.Int64, _cake_tma_Q_dim_1: cutlass.Int64, _cake_tma_Q_dim_2: cutlass.Int64, _cake_tma_Q_stride16_0: cutlass.Int64, _cake_tma_Q_stride16_1: cutlass.Int64, K: cute.Tensor, _cake_tma_K_dim_0: cutlass.Int64, _cake_tma_K_dim_1: cutlass.Int64, _cake_tma_K_dim_2: cutlass.Int64, _cake_tma_K_stride16_0: cutlass.Int64, _cake_tma_K_stride16_1: cutlass.Int64, Vt: cute.Tensor, _cake_tma_Vt_dim_0: cutlass.Int64, _cake_tma_Vt_dim_1: cutlass.Int64, _cake_tma_Vt_dim_2: cutlass.Int64, _cake_tma_Vt_dim_3: cutlass.Int64, _cake_tma_Vt_stride16_0: cutlass.Int64, _cake_tma_Vt_stride16_1: cutlass.Int64, _cake_tma_Vt_stride16_2: cutlass.Int64, O: cute.Tensor, plan__slot_0: cutlass.Uint64, plan__slot_1: cutlass.Uint64, plan__slot_2: cutlass.Uint64, plan__slot_3: cutlass.Uint64, plan__slot_4: cutlass.Uint64, plan__slot_5: cutlass.Uint64, plan__slot_6: cutlass.Uint64, plan__slot_7: cutlass.Uint64, plan__slot_8: cutlass.Uint64, plan__slot_9: cutlass.Uint64, plan__slot_10: cutlass.Uint64, plan__slot_11: cutlass.Uint64, plan__slot_12: cutlass.Uint64, plan__slot_13: cutlass.Uint64, plan__slot_14: cutlass.Uint64, plan__slot_15: cutlass.Uint64, plan__slot_16: cutlass.Uint64, plan__slot_17: cutlass.Uint64, plan__slot_18: cutlass.Uint64, plan__slot_19: cutlass.Uint64, plan__slot_20: cutlass.Uint64, plan__slot_21: cutlass.Uint64, plan__slot_22: cutlass.Uint64, plan__slot_23: cutlass.Uint64, plan__slot_24: cutlass.Uint64, plan__slot_25: cutlass.Uint64, plan__slot_26: cutlass.Uint64, plan__slot_27: cutlass.Uint64, plan__slot_28: cutlass.Uint64, plan__slot_29: cutlass.Uint64, plan__slot_30: cutlass.Uint64, plan__slot_31: cutlass.Uint64, plan__slot_32: cutlass.Uint64, plan__slot_33: cutlass.Uint64, plan__slot_34: cutlass.Uint64, plan__slot_35: cutlass.Uint64, plan__slot_36: cutlass.Uint64, plan__slot_37: cutlass.Uint64, plan__slot_38: cutlass.Uint64, plan__slot_39: cutlass.Uint64, plan__slot_40: cutlass.Uint64, plan__slot_41: cutlass.Uint64, plan__slot_42: cutlass.Uint64, plan__slot_43: cutlass.Uint64, plan__slot_44: cutlass.Uint64, plan__slot_45: cutlass.Uint64, plan__slot_46: cutlass.Uint64, plan__slot_47: cutlass.Uint64, plan__slot_48: cutlass.Uint64, plan__slot_49: cutlass.Uint64, plan__slot_50: cutlass.Uint64, plan__slot_51: cutlass.Uint64, plan__slot_52: cutlass.Uint64, plan__slot_53: cutlass.Uint64, plan__slot_54: cutlass.Uint64, plan__slot_55: cutlass.Uint64, plan__slot_56: cutlass.Uint64, plan__slot_57: cutlass.Uint64, plan__slot_58: cutlass.Uint64, plan__slot_59: cutlass.Uint64, plan__slot_60: cutlass.Uint64, plan__slot_61: cutlass.Uint64, plan__slot_62: cutlass.Uint64, plan__slot_63: cutlass.Uint64, plan__slot_64: cutlass.Uint64, plan__slot_65: cutlass.Uint64, plan__slot_66: cutlass.Uint64, plan__slot_67: cutlass.Uint64, plan__slot_68: cutlass.Uint64, plan__slot_69: cutlass.Uint64, plan__slot_70: cutlass.Uint64, plan__slot_71: cutlass.Uint64, plan__slot_72: cutlass.Uint64, plan__slot_73: cutlass.Uint64, plan__slot_74: cutlass.Uint64, plan__slot_75: cutlass.Uint64, plan__slot_76: cutlass.Uint64, plan__slot_77: cutlass.Uint64, plan__slot_78: cutlass.Uint64, plan__slot_79: cutlass.Uint64, plan__slot_80: cutlass.Uint64, plan__slot_81: cutlass.Uint64, plan__slot_82: cutlass.Uint64, plan__slot_83: cutlass.Uint64, plan__slot_84: cutlass.Uint64, plan__slot_85: cutlass.Uint64, plan__slot_86: cutlass.Uint64, plan__slot_87: cutlass.Uint64, plan__slot_88: cutlass.Uint64, plan__slot_89: cutlass.Uint64, plan__slot_90: cutlass.Uint64, plan__slot_91: cutlass.Uint64, plan__slot_92: cutlass.Uint64, plan__slot_93: cutlass.Uint64, plan__slot_94: cutlass.Uint64, plan__slot_95: cutlass.Uint64, plan__slot_96: cutlass.Uint64, plan__slot_97: cutlass.Uint64, plan__slot_98: cutlass.Uint64, plan__slot_99: cutlass.Uint64, plan__slot_100: cutlass.Uint64, plan__slot_101: cutlass.Uint64, plan__slot_102: cutlass.Uint64, plan__slot_103: cutlass.Uint64, plan__slot_104: cutlass.Uint64, plan__slot_105: cutlass.Uint64, plan__slot_106: cutlass.Uint64, plan__slot_107: cutlass.Uint64, plan__slot_108: cutlass.Uint64, plan__slot_109: cutlass.Uint64, plan__slot_110: cutlass.Uint64, plan__slot_111: cutlass.Uint64, plan__slot_112: cutlass.Uint64, plan__slot_113: cutlass.Uint64, plan__slot_114: cutlass.Uint64, plan__slot_115: cutlass.Uint64, plan__slot_116: cutlass.Uint64, plan__slot_117: cutlass.Uint64, plan__slot_118: cutlass.Uint64, plan__slot_119: cutlass.Uint64, plan__slot_120: cutlass.Uint64, plan__slot_121: cutlass.Uint64, plan__slot_122: cutlass.Uint64, plan__slot_123: cutlass.Uint64, plan__slot_124: cutlass.Uint64, plan__slot_125: cutlass.Uint64, plan__slot_126: cutlass.Uint64, plan__slot_127: cutlass.Uint64, plan__slot_128: cutlass.Uint64, plan__slot_129: cutlass.Uint64, plan__slot_130: cutlass.Uint64, plan__slot_131: cutlass.Uint64, plan__slot_132: cutlass.Uint64, plan__slot_133: cutlass.Uint64, plan__slot_134: cutlass.Uint64, plan__slot_135: cutlass.Uint64, plan__slot_136: cutlass.Uint64, plan__slot_137: cutlass.Uint64, plan__slot_138: cutlass.Uint64, plan__slot_139: cutlass.Uint64, plan__slot_140: cutlass.Uint64, plan__slot_141: cutlass.Uint64, plan__slot_142: cutlass.Uint64, plan__slot_143: cutlass.Uint64, plan__slot_144: cutlass.Uint64, plan__slot_145: cutlass.Uint64, plan__slot_146: cutlass.Uint64, plan__slot_147: cutlass.Uint64, plan__slot_148: cutlass.Uint64, plan__slot_149: cutlass.Uint64, plan__slot_150: cutlass.Uint64, plan__slot_151: cutlass.Uint64, plan__slot_152: cutlass.Uint64, plan__slot_153: cutlass.Uint64, plan__slot_154: cutlass.Uint64, plan__slot_155: cutlass.Uint64, plan__slot_156: cutlass.Uint64, plan__slot_157: cutlass.Uint64, plan__slot_158: cutlass.Uint64, plan__slot_159: cutlass.Uint64, plan__slot_160: cutlass.Uint64, plan__slot_161: cutlass.Uint64, plan__slot_162: cutlass.Uint64, plan__slot_163: cutlass.Uint64, plan__slot_164: cutlass.Uint64, plan__slot_165: cutlass.Uint64, plan__slot_166: cutlass.Uint64, plan__slot_167: cutlass.Uint64, plan__slot_168: cutlass.Uint64, plan__slot_169: cutlass.Uint64, plan__slot_170: cutlass.Uint64, plan__slot_171: cutlass.Uint64, plan__slot_172: cutlass.Uint64, plan__slot_173: cutlass.Uint64, plan__slot_174: cutlass.Uint64, plan__slot_175: cutlass.Uint64, plan__slot_176: cutlass.Uint64, plan__slot_177: cutlass.Uint64, plan__slot_178: cutlass.Uint64, plan__slot_179: cutlass.Uint64, plan__slot_180: cutlass.Uint64, plan__slot_181: cutlass.Uint64, plan__slot_182: cutlass.Uint64, plan__slot_183: cutlass.Uint64, plan__slot_184: cutlass.Uint64, plan__slot_185: cutlass.Uint64, plan__slot_186: cutlass.Uint64, plan__slot_187: cutlass.Uint64, plan__slot_188: cutlass.Uint64, plan__slot_189: cutlass.Uint64, plan__slot_190: cutlass.Uint64, plan__slot_191: cutlass.Uint64, plan__slot_192: cutlass.Uint64, plan__slot_193: cutlass.Uint64, plan__slot_194: cutlass.Uint64, plan__slot_195: cutlass.Uint64, plan__slot_196: cutlass.Uint64, plan__slot_197: cutlass.Uint64, plan__slot_198: cutlass.Uint64, plan__slot_199: cutlass.Uint64, plan__slot_200: cutlass.Uint64, plan__slot_201: cutlass.Uint64, plan__slot_202: cutlass.Uint64, plan__slot_203: cutlass.Uint64, plan__slot_204: cutlass.Uint64, plan__slot_205: cutlass.Uint64, plan__slot_206: cutlass.Uint64, plan__slot_207: cutlass.Uint64, plan__slot_208: cutlass.Uint64, plan__slot_209: cutlass.Uint64, plan__slot_210: cutlass.Uint64, plan__slot_211: cutlass.Uint64, plan__slot_212: cutlass.Uint64, plan__slot_213: cutlass.Uint64, plan__slot_214: cutlass.Uint64, plan__slot_215: cutlass.Uint64, plan__slot_216: cutlass.Uint64, plan__slot_217: cutlass.Uint64, plan__slot_218: cutlass.Uint64, plan__slot_219: cutlass.Uint64, plan__slot_220: cutlass.Uint64, plan__slot_221: cutlass.Uint64, plan__slot_222: cutlass.Uint64, plan__slot_223: cutlass.Uint64, plan__slot_224: cutlass.Uint64, plan__slot_225: cutlass.Uint64, plan__slot_226: cutlass.Uint64, plan__slot_227: cutlass.Uint64, plan__slot_228: cutlass.Uint64, plan__slot_229: cutlass.Uint64, plan__slot_230: cutlass.Uint64, plan__slot_231: cutlass.Uint64, plan__slot_232: cutlass.Uint64, plan__slot_233: cutlass.Uint64, plan__slot_234: cutlass.Uint64, plan__slot_235: cutlass.Uint64, plan__slot_236: cutlass.Uint64, plan__slot_237: cutlass.Uint64, plan__slot_238: cutlass.Uint64, plan__slot_239: cutlass.Uint64, plan__slot_240: cutlass.Uint64, plan__slot_241: cutlass.Uint64, plan__slot_242: cutlass.Uint64, plan__slot_243: cutlass.Uint64, plan__slot_244: cutlass.Uint64, plan__slot_245: cutlass.Uint64, plan__slot_246: cutlass.Uint64, plan__slot_247: cutlass.Uint64, plan__slot_248: cutlass.Uint64, plan__slot_249: cutlass.Uint64, plan__slot_250: cutlass.Uint64, plan__slot_251: cutlass.Uint64, plan__slot_252: cutlass.Uint64, plan__slot_253: cutlass.Uint64, plan__slot_254: cutlass.Uint64, plan__slot_255: cutlass.Uint64, plan__slot_256: cutlass.Uint64, plan__slot_257: cutlass.Uint64, plan__slot_258: cutlass.Uint64, plan__slot_259: cutlass.Uint64, plan__slot_260: cutlass.Uint64, plan__slot_261: cutlass.Uint64, plan__slot_262: cutlass.Uint64, plan__slot_263: cutlass.Uint64, plan__slot_264: cutlass.Uint64, plan__slot_265: cutlass.Uint64, plan__slot_266: cutlass.Uint64, plan__slot_267: cutlass.Uint64, plan__slot_268: cutlass.Uint64, plan__slot_269: cutlass.Uint64, plan__slot_270: cutlass.Uint64, plan__slot_271: cutlass.Uint64, plan__slot_272: cutlass.Uint64, plan__slot_273: cutlass.Uint64, plan__slot_274: cutlass.Uint64, plan__slot_275: cutlass.Uint64, plan__slot_276: cutlass.Uint64, plan__slot_277: cutlass.Uint64, plan__slot_278: cutlass.Uint64, plan__slot_279: cutlass.Uint64, plan__slot_280: cutlass.Uint64, plan__slot_281: cutlass.Uint64, plan__slot_282: cutlass.Uint64, plan__slot_283: cutlass.Uint64, plan__slot_284: cutlass.Uint64, plan__slot_285: cutlass.Uint64, plan__slot_286: cutlass.Uint64, plan__slot_287: cutlass.Uint64, plan__slot_288: cutlass.Uint64, plan__slot_289: cutlass.Uint64, plan__slot_290: cutlass.Uint64, plan__slot_291: cutlass.Uint64, plan__slot_292: cutlass.Uint64, plan__slot_293: cutlass.Uint64, plan__slot_294: cutlass.Uint64, plan__slot_295: cutlass.Uint64, plan__slot_296: cutlass.Uint64, plan__slot_297: cutlass.Uint64, plan__slot_298: cutlass.Uint64, plan__slot_299: cutlass.Uint64, plan__slot_300: cutlass.Uint64, plan__slot_301: cutlass.Uint64, plan__slot_302: cutlass.Uint64, plan__slot_303: cutlass.Uint64, plan__slot_304: cutlass.Uint64, plan__slot_305: cutlass.Uint64, plan__slot_306: cutlass.Uint64, plan__slot_307: cutlass.Uint64, plan__slot_308: cutlass.Uint64, plan__slot_309: cutlass.Uint64, plan__slot_310: cutlass.Uint64, plan__slot_311: cutlass.Uint64, plan__slot_312: cutlass.Uint64, plan__slot_313: cutlass.Uint64, plan__slot_314: cutlass.Uint64, plan__slot_315: cutlass.Uint64, plan__slot_316: cutlass.Uint64, plan__slot_317: cutlass.Uint64, plan__slot_318: cutlass.Uint64, plan__slot_319: cutlass.Uint64, plan__slot_320: cutlass.Uint64, plan__slot_321: cutlass.Uint64, plan__slot_322: cutlass.Uint64, plan__slot_323: cutlass.Uint64, plan__slot_324: cutlass.Uint64, plan__slot_325: cutlass.Uint64, plan__slot_326: cutlass.Uint64, plan__slot_327: cutlass.Uint64, plan__slot_328: cutlass.Uint64, plan__slot_329: cutlass.Uint64, plan__slot_330: cutlass.Uint64, plan__slot_331: cutlass.Uint64, plan__slot_332: cutlass.Uint64, plan__slot_333: cutlass.Uint64, plan__slot_334: cutlass.Uint64, plan__slot_335: cutlass.Uint64, plan__slot_336: cutlass.Uint64, plan__slot_337: cutlass.Uint64, plan__slot_338: cutlass.Uint64, plan__slot_339: cutlass.Uint64, plan__slot_340: cutlass.Uint64, plan__slot_341: cutlass.Uint64, plan__slot_342: cutlass.Uint64, plan__slot_343: cutlass.Uint64, plan__slot_344: cutlass.Uint64, plan__slot_345: cutlass.Uint64, plan__slot_346: cutlass.Uint64, plan__slot_347: cutlass.Uint64, plan__slot_348: cutlass.Uint64, plan__slot_349: cutlass.Uint64, plan__slot_350: cutlass.Uint64, plan__slot_351: cutlass.Uint64, plan__slot_352: cutlass.Uint64, plan__slot_353: cutlass.Uint64, plan__slot_354: cutlass.Uint64, plan__slot_355: cutlass.Uint64, plan__slot_356: cutlass.Uint64, plan__slot_357: cutlass.Uint64, plan__slot_358: cutlass.Uint64, plan__slot_359: cutlass.Uint64, plan__slot_360: cutlass.Uint64, plan__slot_361: cutlass.Uint64, plan__slot_362: cutlass.Uint64, plan__slot_363: cutlass.Uint64, plan__slot_364: cutlass.Uint64, plan__slot_365: cutlass.Uint64, plan__slot_366: cutlass.Uint64, plan__slot_367: cutlass.Uint64, plan__slot_368: cutlass.Uint64, plan__slot_369: cutlass.Uint64, plan__slot_370: cutlass.Uint64, plan__slot_371: cutlass.Uint64, plan__slot_372: cutlass.Uint64, plan__slot_373: cutlass.Uint64, plan__slot_374: cutlass.Uint64, plan__slot_375: cutlass.Uint64, plan__slot_376: cutlass.Uint64, plan__slot_377: cutlass.Uint64, plan__slot_378: cutlass.Uint64, plan__slot_379: cutlass.Uint64, plan__slot_380: cutlass.Uint64, plan__slot_381: cutlass.Uint64, plan__slot_382: cutlass.Uint64, plan__slot_383: cutlass.Uint64, plan__slot_384: cutlass.Uint64, plan__slot_385: cutlass.Uint64, plan__slot_386: cutlass.Uint64, plan__slot_387: cutlass.Uint64, plan__slot_388: cutlass.Uint64, plan__slot_389: cutlass.Uint64, plan__slot_390: cutlass.Uint64, plan__slot_391: cutlass.Uint64, plan__slot_392: cutlass.Uint64, plan__slot_393: cutlass.Uint64, plan__slot_394: cutlass.Uint64, plan__slot_395: cutlass.Uint64, plan__slot_396: cutlass.Uint64, plan__slot_397: cutlass.Uint64, plan__slot_398: cutlass.Uint64, plan__slot_399: cutlass.Uint64, plan__slot_400: cutlass.Uint64, plan__slot_401: cutlass.Uint64, plan__slot_402: cutlass.Uint64, plan__slot_403: cutlass.Uint64, plan__slot_404: cutlass.Uint64, plan__slot_405: cutlass.Uint64, plan__slot_406: cutlass.Uint64, plan__slot_407: cutlass.Uint64, plan__slot_408: cutlass.Uint64, plan__slot_409: cutlass.Uint64, plan__slot_410: cutlass.Uint64, plan__slot_411: cutlass.Uint64, plan__slot_412: cutlass.Uint64, plan__slot_413: cutlass.Uint64, plan__slot_414: cutlass.Uint64, plan__slot_415: cutlass.Uint64, plan__slot_416: cutlass.Uint64, plan__slot_417: cutlass.Uint64, plan__slot_418: cutlass.Uint64, plan__slot_419: cutlass.Uint64, plan__slot_420: cutlass.Uint64, plan__slot_421: cutlass.Uint64, plan__slot_422: cutlass.Uint64, plan__slot_423: cutlass.Uint64, plan__slot_424: cutlass.Uint64, plan__slot_425: cutlass.Uint64, plan__slot_426: cutlass.Uint64, plan__slot_427: cutlass.Uint64, plan__slot_428: cutlass.Uint64, plan__slot_429: cutlass.Uint64, plan__slot_430: cutlass.Uint64, plan__slot_431: cutlass.Uint64, plan__slot_432: cutlass.Uint64, plan__slot_433: cutlass.Uint64, plan__slot_434: cutlass.Uint64, plan__slot_435: cutlass.Uint64, plan__slot_436: cutlass.Uint64, plan__slot_437: cutlass.Uint64, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, scale_log2: cutlass.Float32, Wo: cute.Tensor, Ws: cute.Tensor, Wc: cute.Tensor, grid_x: cutlass.Int32, grid_y: cutlass.Int32, grid_z: cutlass.Int32, stream: cuda.CUstream):
     _tma_Q = create_tensor_map_tiled(
         Q.iterator.toint(),
         cutlass.BFloat16,
@@ -1428,7 +2415,7 @@ def launch_vsa_sm90_bf16_small_k1s(Q: cute.Tensor, _cake_tma_Q_dim_0: cutlass.In
         l2_promotion=TensorMapL2Promotion.none,
         oob_fill=TensorMapFloatOOBFill.none,
     )
-    kernel_vsa_sm90_bf16_small_k1s(_tma_Q, _tma_K, _tma_Vt, O.iterator, plan.iterator, seqlen_q, seqlen_k, scale_log2, Wo.iterator, Ws.iterator, Wc.iterator).launch(
+    kernel_vsa_sm90_bf16_small_k1s(_tma_Q, _tma_K, _tma_Vt, plan__slot_0, plan__slot_1, plan__slot_2, plan__slot_3, plan__slot_4, plan__slot_5, plan__slot_6, plan__slot_7, plan__slot_8, plan__slot_9, plan__slot_10, plan__slot_11, plan__slot_12, plan__slot_13, plan__slot_14, plan__slot_15, plan__slot_16, plan__slot_17, plan__slot_18, plan__slot_19, plan__slot_20, plan__slot_21, plan__slot_22, plan__slot_23, plan__slot_24, plan__slot_25, plan__slot_26, plan__slot_27, plan__slot_28, plan__slot_29, plan__slot_30, plan__slot_31, plan__slot_32, plan__slot_33, plan__slot_34, plan__slot_35, plan__slot_36, plan__slot_37, plan__slot_38, plan__slot_39, plan__slot_40, plan__slot_41, plan__slot_42, plan__slot_43, plan__slot_44, plan__slot_45, plan__slot_46, plan__slot_47, plan__slot_48, plan__slot_49, plan__slot_50, plan__slot_51, plan__slot_52, plan__slot_53, plan__slot_54, plan__slot_55, plan__slot_56, plan__slot_57, plan__slot_58, plan__slot_59, plan__slot_60, plan__slot_61, plan__slot_62, plan__slot_63, plan__slot_64, plan__slot_65, plan__slot_66, plan__slot_67, plan__slot_68, plan__slot_69, plan__slot_70, plan__slot_71, plan__slot_72, plan__slot_73, plan__slot_74, plan__slot_75, plan__slot_76, plan__slot_77, plan__slot_78, plan__slot_79, plan__slot_80, plan__slot_81, plan__slot_82, plan__slot_83, plan__slot_84, plan__slot_85, plan__slot_86, plan__slot_87, plan__slot_88, plan__slot_89, plan__slot_90, plan__slot_91, plan__slot_92, plan__slot_93, plan__slot_94, plan__slot_95, plan__slot_96, plan__slot_97, plan__slot_98, plan__slot_99, plan__slot_100, plan__slot_101, plan__slot_102, plan__slot_103, plan__slot_104, plan__slot_105, plan__slot_106, plan__slot_107, plan__slot_108, plan__slot_109, plan__slot_110, plan__slot_111, plan__slot_112, plan__slot_113, plan__slot_114, plan__slot_115, plan__slot_116, plan__slot_117, plan__slot_118, plan__slot_119, plan__slot_120, plan__slot_121, plan__slot_122, plan__slot_123, plan__slot_124, plan__slot_125, plan__slot_126, plan__slot_127, plan__slot_128, plan__slot_129, plan__slot_130, plan__slot_131, plan__slot_132, plan__slot_133, plan__slot_134, plan__slot_135, plan__slot_136, plan__slot_137, plan__slot_138, plan__slot_139, plan__slot_140, plan__slot_141, plan__slot_142, plan__slot_143, plan__slot_144, plan__slot_145, plan__slot_146, plan__slot_147, plan__slot_148, plan__slot_149, plan__slot_150, plan__slot_151, plan__slot_152, plan__slot_153, plan__slot_154, plan__slot_155, plan__slot_156, plan__slot_157, plan__slot_158, plan__slot_159, plan__slot_160, plan__slot_161, plan__slot_162, plan__slot_163, plan__slot_164, plan__slot_165, plan__slot_166, plan__slot_167, plan__slot_168, plan__slot_169, plan__slot_170, plan__slot_171, plan__slot_172, plan__slot_173, plan__slot_174, plan__slot_175, plan__slot_176, plan__slot_177, plan__slot_178, plan__slot_179, plan__slot_180, plan__slot_181, plan__slot_182, plan__slot_183, plan__slot_184, plan__slot_185, plan__slot_186, plan__slot_187, plan__slot_188, plan__slot_189, plan__slot_190, plan__slot_191, plan__slot_192, plan__slot_193, plan__slot_194, plan__slot_195, plan__slot_196, plan__slot_197, plan__slot_198, plan__slot_199, plan__slot_200, plan__slot_201, plan__slot_202, plan__slot_203, plan__slot_204, plan__slot_205, plan__slot_206, plan__slot_207, plan__slot_208, plan__slot_209, plan__slot_210, plan__slot_211, plan__slot_212, plan__slot_213, plan__slot_214, plan__slot_215, plan__slot_216, plan__slot_217, plan__slot_218, plan__slot_219, plan__slot_220, plan__slot_221, plan__slot_222, plan__slot_223, plan__slot_224, plan__slot_225, plan__slot_226, plan__slot_227, plan__slot_228, plan__slot_229, plan__slot_230, plan__slot_231, plan__slot_232, plan__slot_233, plan__slot_234, plan__slot_235, plan__slot_236, plan__slot_237, plan__slot_238, plan__slot_239, plan__slot_240, plan__slot_241, plan__slot_242, plan__slot_243, plan__slot_244, plan__slot_245, plan__slot_246, plan__slot_247, plan__slot_248, plan__slot_249, plan__slot_250, plan__slot_251, plan__slot_252, plan__slot_253, plan__slot_254, plan__slot_255, plan__slot_256, plan__slot_257, plan__slot_258, plan__slot_259, plan__slot_260, plan__slot_261, plan__slot_262, plan__slot_263, plan__slot_264, plan__slot_265, plan__slot_266, plan__slot_267, plan__slot_268, plan__slot_269, plan__slot_270, plan__slot_271, plan__slot_272, plan__slot_273, plan__slot_274, plan__slot_275, plan__slot_276, plan__slot_277, plan__slot_278, plan__slot_279, plan__slot_280, plan__slot_281, plan__slot_282, plan__slot_283, plan__slot_284, plan__slot_285, plan__slot_286, plan__slot_287, plan__slot_288, plan__slot_289, plan__slot_290, plan__slot_291, plan__slot_292, plan__slot_293, plan__slot_294, plan__slot_295, plan__slot_296, plan__slot_297, plan__slot_298, plan__slot_299, plan__slot_300, plan__slot_301, plan__slot_302, plan__slot_303, plan__slot_304, plan__slot_305, plan__slot_306, plan__slot_307, plan__slot_308, plan__slot_309, plan__slot_310, plan__slot_311, plan__slot_312, plan__slot_313, plan__slot_314, plan__slot_315, plan__slot_316, plan__slot_317, plan__slot_318, plan__slot_319, plan__slot_320, plan__slot_321, plan__slot_322, plan__slot_323, plan__slot_324, plan__slot_325, plan__slot_326, plan__slot_327, plan__slot_328, plan__slot_329, plan__slot_330, plan__slot_331, plan__slot_332, plan__slot_333, plan__slot_334, plan__slot_335, plan__slot_336, plan__slot_337, plan__slot_338, plan__slot_339, plan__slot_340, plan__slot_341, plan__slot_342, plan__slot_343, plan__slot_344, plan__slot_345, plan__slot_346, plan__slot_347, plan__slot_348, plan__slot_349, plan__slot_350, plan__slot_351, plan__slot_352, plan__slot_353, plan__slot_354, plan__slot_355, plan__slot_356, plan__slot_357, plan__slot_358, plan__slot_359, plan__slot_360, plan__slot_361, plan__slot_362, plan__slot_363, plan__slot_364, plan__slot_365, plan__slot_366, plan__slot_367, plan__slot_368, plan__slot_369, plan__slot_370, plan__slot_371, plan__slot_372, plan__slot_373, plan__slot_374, plan__slot_375, plan__slot_376, plan__slot_377, plan__slot_378, plan__slot_379, plan__slot_380, plan__slot_381, plan__slot_382, plan__slot_383, plan__slot_384, plan__slot_385, plan__slot_386, plan__slot_387, plan__slot_388, plan__slot_389, plan__slot_390, plan__slot_391, plan__slot_392, plan__slot_393, plan__slot_394, plan__slot_395, plan__slot_396, plan__slot_397, plan__slot_398, plan__slot_399, plan__slot_400, plan__slot_401, plan__slot_402, plan__slot_403, plan__slot_404, plan__slot_405, plan__slot_406, plan__slot_407, plan__slot_408, plan__slot_409, plan__slot_410, plan__slot_411, plan__slot_412, plan__slot_413, plan__slot_414, plan__slot_415, plan__slot_416, plan__slot_417, plan__slot_418, plan__slot_419, plan__slot_420, plan__slot_421, plan__slot_422, plan__slot_423, plan__slot_424, plan__slot_425, plan__slot_426, plan__slot_427, plan__slot_428, plan__slot_429, plan__slot_430, plan__slot_431, plan__slot_432, plan__slot_433, plan__slot_434, plan__slot_435, plan__slot_436, plan__slot_437, O.iterator, seqlen_q, seqlen_k, scale_log2, Wo.iterator, Ws.iterator, Wc.iterator).launch(
         grid=(grid_x, grid_y, grid_z),
         block=(128, 1, 1),
         smem=50304,
@@ -1459,7 +2446,444 @@ def compile_program():
         cutlass.Int64(0),
         cutlass.Int64(0),
         make_fake_tensor(cutlass.BFloat16, (cute.sym_int64(symbol='O'),), (1,), assumed_align=16),
-        make_fake_tensor(cutlass.Int16, (cute.sym_int64(symbol='plan'),), (1,), assumed_align=2),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
+        cutlass.Uint64(0),
         cutlass.Int32(0),
         cutlass.Int32(0),
         cutlass.Float32(0),

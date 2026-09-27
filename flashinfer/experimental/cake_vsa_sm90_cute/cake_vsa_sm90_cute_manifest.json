@@ -35,7 +35,7 @@
           "meta"
         ],
         [
-          "buffer",
+          "slots",
           "hdr"
         ],
         [
@@ -84,10 +84,12 @@
       "dynamic_smem_bytes": 232064,
       "entry": "launch_vsa_sm90_bf16_fwd",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "hdr": {
           "dtype": "i16",
-          "length": 1728
+          "length": 1728,
+          "slots": 432
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/attention.py",
@@ -97,8 +99,8 @@
         "seqlen_q": "int32",
         "tile_stride": "int32"
       },
-      "source_bytes": 253525,
-      "source_sha256": "35e3ef3417c36ad6302903c70e47ffaa5cd7d1e7b0dde6452a6866f7ac1c0987",
+      "source_bytes": 708437,
+      "source_sha256": "fb5132f2d4fb588122612093fc3540562dde43685b4fe7f279ec61dc5d8e0766",
       "stage": "attention",
       "symbol": "vsa_sm90_bf16_fwd",
       "template": "vsa_sm90_bf16_fwd",
@@ -324,7 +326,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -361,10 +363,12 @@
       "dynamic_smem_bytes": 50176,
       "entry": "launch_vsa_sm90_bf16_small_k1",
       "min_blocks": 4,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k1.py",
@@ -373,8 +377,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 82010,
-      "source_sha256": "0da0c8b3221b6f6cecd2745f8a743cf0c78ed5a14d4188812e6aa8903330bd6b",
+      "source_bytes": 214315,
+      "source_sha256": "95eaacac5c98d5663cf61fdd9a623d9f206cf6c41321dbbcd44a5d719fac2703",
       "stage": "small_k1",
       "symbol": "vsa_sm90_bf16_small_k1",
       "template": "vsa_sm90_bf16_small_k1",
@@ -600,7 +604,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -637,10 +641,12 @@
       "dynamic_smem_bytes": 116736,
       "entry": "launch_vsa_sm90_bf16_small_k3",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k3.py",
@@ -649,8 +655,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 204257,
-      "source_sha256": "0b6159217af6bb739c4a8487f153a3c4a1badb0a2c5f44154dbe8fd9e70a7d65",
+      "source_bytes": 505268,
+      "source_sha256": "b1279b5c447558d145d0f6d99ee7908b08175b670661abc9ab8793c8834f1ac2",
       "stage": "small_k3",
       "symbol": "vsa_sm90_bf16_small_k3",
       "template": "vsa_sm90_bf16_small_k3",
@@ -876,7 +882,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -913,10 +919,12 @@
       "dynamic_smem_bytes": 149504,
       "entry": "launch_vsa_sm90_bf16_small_k4",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k4.py",
@@ -925,8 +933,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 250755,
-      "source_sha256": "de599bca2d48d749a15aa5182a7e7bc5f978572520893cfd58ff8653126d0c48",
+      "source_bytes": 636119,
+      "source_sha256": "00c18c281041125577e86de421d45ce597470b21910eab7ec83588663e1041a3",
       "stage": "small_k4",
       "symbol": "vsa_sm90_bf16_small_k4",
       "template": "vsa_sm90_bf16_small_k4",
@@ -1152,7 +1160,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -1189,10 +1197,12 @@
       "dynamic_smem_bytes": 215040,
       "entry": "launch_vsa_sm90_bf16_small_k6",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k6.py",
@@ -1201,8 +1211,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 343805,
-      "source_sha256": "d2be5c134f1b8a9417de6b2ae69cfea4cd0e42fc2da85dac29ed8268d1624a14",
+      "source_bytes": 897875,
+      "source_sha256": "bdb6a33a1c70d47dabc4d1d1f3e37b41d1f6ae4a2d932693d19aa675261b1353",
       "stage": "small_k6",
       "symbol": "vsa_sm90_bf16_small_k6",
       "template": "vsa_sm90_bf16_small_k6",
@@ -1428,7 +1438,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -1477,10 +1487,12 @@
       "dynamic_smem_bytes": 50304,
       "entry": "launch_vsa_sm90_bf16_small_k1s",
       "min_blocks": 4,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k1s.py",
@@ -1489,8 +1501,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 114868,
-      "source_sha256": "6e1bf070107d404f81921f18175adb6ed35f1c46114b421b1de79de24f357473",
+      "source_bytes": 247196,
+      "source_sha256": "40187e53cc59e0ccd66d065363fb5df002ea41b712a315c24ee307bed45a0a43",
       "stage": "small_k1s",
       "symbol": "vsa_sm90_bf16_small_k1s",
       "template": "vsa_sm90_bf16_small_k1s",
@@ -1716,7 +1728,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -1765,10 +1777,12 @@
       "dynamic_smem_bytes": 116864,
       "entry": "launch_vsa_sm90_bf16_small_k3s",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k3s.py",
@@ -1777,8 +1791,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 236426,
-      "source_sha256": "5f48c4a3a462b4853cff748fc47382322912783c30b14e6d2cece60ddc78d1d0",
+      "source_bytes": 537460,
+      "source_sha256": "148b148755ef2fae2ae3d4bf27c74f2e9eb1ae0f0e8f1bf39376218e821d2cc0",
       "stage": "small_k3s",
       "symbol": "vsa_sm90_bf16_small_k3s",
       "template": "vsa_sm90_bf16_small_k3s",
@@ -2004,7 +2018,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -2053,10 +2067,12 @@
       "dynamic_smem_bytes": 149632,
       "entry": "launch_vsa_sm90_bf16_small_k4s",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k4s.py",
@@ -2065,8 +2081,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 282924,
-      "source_sha256": "86c02a2948d4d99700149d390737509561f55a3f20890a1f204994d8399f4e90",
+      "source_bytes": 668311,
+      "source_sha256": "4be30caca2bed8583af5d65728de74af8dc54cae39259f63a677ce5d43024761",
       "stage": "small_k4s",
       "symbol": "vsa_sm90_bf16_small_k4s",
       "template": "vsa_sm90_bf16_small_k4s",
@@ -2292,7 +2308,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -2341,10 +2357,12 @@
       "dynamic_smem_bytes": 215168,
       "entry": "launch_vsa_sm90_bf16_small_k6s",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k6s.py",
@@ -2353,8 +2371,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 375998,
-      "source_sha256": "adc92d0da2cfdc455008b304c366a281a6e4db9ca3d073fec0ae13ad3dc67c9d",
+      "source_bytes": 930091,
+      "source_sha256": "4753efe93145d709f5bce92112f7d4b03abad4afa57e2be1b4a4cf79a30ca6de",
       "stage": "small_k6s",
       "symbol": "vsa_sm90_bf16_small_k6s",
       "template": "vsa_sm90_bf16_small_k6s",
@@ -2580,7 +2598,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -2617,10 +2635,12 @@
       "dynamic_smem_bytes": 111616,
       "entry": "launch_vsa_sm90_bf16_small_k2c4",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k2c4.py",
@@ -2629,8 +2649,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 207490,
-      "source_sha256": "4cc826f77bb2a8d5e9d5a1929270d431f7a765f9d62660c52cd1ea780b2c15f0",
+      "source_bytes": 424171,
+      "source_sha256": "a0c7266f4903f5931246fbcd581b143941152afcbbb7d0b84d4b413f7bbee0fa",
       "stage": "small_k2c4",
       "symbol": "vsa_sm90_bf16_small_k2c4",
       "template": "vsa_sm90_bf16_small_k2c4",
@@ -2856,7 +2876,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -2893,10 +2913,12 @@
       "dynamic_smem_bytes": 151552,
       "entry": "launch_vsa_sm90_bf16_small_k3c3",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k3c3.py",
@@ -2905,8 +2927,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 283677,
-      "source_sha256": "f6df28cec0fe11d8f1e09b16b2d8c7797b329767cc4252999137236574ceb020",
+      "source_bytes": 584749,
+      "source_sha256": "ccfe9f6189284bc32d6d4a460884740618e876b3099433e3a9783fe8c3d56d31",
       "stage": "small_k3c3",
       "symbol": "vsa_sm90_bf16_small_k3c3",
       "template": "vsa_sm90_bf16_small_k3c3",
@@ -3132,7 +3154,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -3169,10 +3191,12 @@
       "dynamic_smem_bytes": 162816,
       "entry": "launch_vsa_sm90_bf16_small_k3c6",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k3c6.py",
@@ -3181,8 +3205,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 273464,
-      "source_sha256": "78f0f0d2640a710ca055425df5024f7e814550fff2bb751730c7d20e93137f77",
+      "source_bytes": 574498,
+      "source_sha256": "3e20323e11ec729b3fa3512fe699562c94c6bcd4d3cc83ace99a6e05c875d143",
       "stage": "small_k3c6",
       "symbol": "vsa_sm90_bf16_small_k3c6",
       "template": "vsa_sm90_bf16_small_k3c6",
@@ -3408,7 +3432,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -3445,10 +3469,12 @@
       "dynamic_smem_bytes": 166912,
       "entry": "launch_vsa_sm90_bf16_small_k4c2",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k4c2.py",
@@ -3457,8 +3483,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 310549,
-      "source_sha256": "7570e62fb82d7445b60d50d55fc846f52e6010c71e58385143226f8c096fd466",
+      "source_bytes": 695936,
+      "source_sha256": "9c659bd9917557753cc902f8a90278cad18b768d79fc47ddcec8833bf22cdfa9",
       "stage": "small_k4c2",
       "symbol": "vsa_sm90_bf16_small_k4c2",
       "template": "vsa_sm90_bf16_small_k4c2",
@@ -3684,7 +3710,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -3721,10 +3747,12 @@
       "dynamic_smem_bytes": 177152,
       "entry": "launch_vsa_sm90_bf16_small_k4c4",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k4c4.py",
@@ -3733,8 +3761,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 300464,
-      "source_sha256": "1e97b30ad773296dfd1fccd1977aeb4d8ffce980f1d4d75c33465235b1b288cd",
+      "source_bytes": 685851,
+      "source_sha256": "32dfdec24f20fb2c1c488acc2624181c1e2daf1590a9d1f732ab22b636850f86",
       "stage": "small_k4c4",
       "symbol": "vsa_sm90_bf16_small_k4c4",
       "template": "vsa_sm90_bf16_small_k4c4",
@@ -3960,7 +3988,7 @@
           "O"
         ],
         [
-          "buffer",
+          "slots",
           "plan"
         ],
         [
@@ -3997,10 +4025,12 @@
       "dynamic_smem_bytes": 232448,
       "entry": "launch_vsa_sm90_bf16_small_k6c2",
       "min_blocks": 1,
-      "param_array_device_buffers": {
+      "param_array_device_buffers": {},
+      "param_array_scalar_slots": {
         "plan": {
           "dtype": "i16",
-          "length": 1750
+          "length": 1750,
+          "slots": 438
         }
       },
       "path": "flashinfer/experimental/cake_vsa_sm90_cute/small_k6c2.py",
@@ -4009,8 +4039,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 403604,
-      "source_sha256": "f4e1e98afa0244f27c05be006a78e6b9fb6c2e8de1ac12385d806a08e1809d26",
+      "source_bytes": 957697,
+      "source_sha256": "a33df15f8643874ba887cdabde5ac5e5f53b989f186e658cbe72ea5ea2762cb4",
       "stage": "small_k6c2",
       "symbol": "vsa_sm90_bf16_small_k6c2",
       "template": "vsa_sm90_bf16_small_k6c2",
