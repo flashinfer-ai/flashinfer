@@ -11172,13 +11172,16 @@ def _fp8_blockscale_sm90_input_scale(
             f"input_scale shape mismatch. Expected ({m}, {k_blocks}) "
             f"(per-token, 1x128 blocks), got {tuple(input_scale.shape)}{hint}"
         )
+    # The kernel's TMA descriptor spans aligned_m rows in every K block, so the
+    # padded rows must be inside the tensor's storage as well.
     aligned_m = (m + 3) // 4 * 4
-    if (m == 1 or input_scale.stride(0) == 1) and (
-        k_blocks == 1 or input_scale.stride(1) == aligned_m
+    storage_numel = input_scale.untyped_storage().nbytes() // input_scale.element_size()
+    if (
+        (m == 1 or input_scale.stride(0) == 1)
+        and (k_blocks == 1 or input_scale.stride(1) == aligned_m)
+        and input_scale.storage_offset() + k_blocks * aligned_m <= storage_numel
     ):
         return input_scale
-    # Allocate the padded rows too: the kernel's TMA descriptor spans aligned_m
-    # rows in every K block.
     aligned = torch.empty(
         k_blocks * aligned_m, dtype=input_scale.dtype, device=input_scale.device
     ).as_strided((m, k_blocks), (1, aligned_m))

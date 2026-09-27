@@ -371,6 +371,7 @@ def _input_scale_in_layout(scale, layout):
         (7, 192, 1024),  # M % 4 != 0, N % 128 != 0
         (32, 256, 4096),  # M == K // 128
         (130, 1024, 1024),
+        (7, 256, 128),  # K // 128 == 1, M % 4 != 0
     ],
 )
 @pytest.mark.parametrize(
@@ -479,6 +480,31 @@ def test_fp8_blockscale_gemm_unsupported_scale_layouts(m, n, k):
         fp8_blockscale_gemm_sm90(
             input_fp8, weight_fp8, input_scale.to(torch.bfloat16), weight_scale
         )
+
+
+@pytest.mark.parametrize("m,k_blocks", [(7, 1), (1, 4), (7, 3), (8, 2)])
+def test_fp8_blockscale_gemm_input_scale_padded_storage(m, k_blocks):
+    """Input scales used without a copy must have storage for the padded rows.
+
+    The kernel's TMA load reads ceil(M / 4) * 4 rows in every K block.
+    """
+    from flashinfer.gemm.gemm_base import _fp8_blockscale_sm90_input_scale
+
+    aligned_m = (m + 3) // 4 * 4
+    scale = torch.rand(m, k_blocks, device="cuda") + 0.5
+    padded = torch.zeros(k_blocks, aligned_m, device="cuda")
+    padded[:, :m] = scale.T
+    for layout in [scale.contiguous(), scale.T.contiguous().T, padded.T[:m]]:
+        out = _fp8_blockscale_sm90_input_scale(layout, m, k_blocks)
+        assert torch.equal(out, scale)
+        assert out.stride(0) == 1 or m == 1
+        assert out.stride(1) == aligned_m or k_blocks == 1
+        storage_numel = out.untyped_storage().nbytes() // out.element_size()
+        assert out.storage_offset() + k_blocks * aligned_m <= storage_numel
+    # Already padded: used as is.
+    assert _fp8_blockscale_sm90_input_scale(padded.T[:m], m, k_blocks).data_ptr() == (
+        padded.data_ptr()
+    )
 
 
 def test_fp8_blockscale_gemm_output_buffer():
