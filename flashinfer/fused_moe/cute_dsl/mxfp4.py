@@ -1161,12 +1161,13 @@ class Mxfp4MoESwapAbPlan:
                 pdl_trigger_after_wait=pdl and self._dep_prefetch,
                 weight_l2_hint=w._swap_weight_l2_hint(num_tokens),
                 _prepared_launches=launches,
-                cluster_split_k=SWAP_GEMM1_CLUSTER_SPLIT
-                and self._dep_prefetch
-                # Only a rank with remote experts can see a single active
-                # local group (top_k routes per token all land locally
-                # otherwise), so the cluster launch pays off only there.
-                and w.num_local_experts < w.num_experts,
+                # Every rank: a rank with remote experts sees single-group
+                # launches (the single-wave split) and, with the remainder-only
+                # split, the all-local shard's multi-wave decode launches split
+                # their last partial wave too (B300 TP8 T=2 balanced / hot
+                # 0.947 / 0.932, T=4 hot 0.973, T=8 / 16 balanced 0.978 /
+                # 0.992; the unsplit rows pay the cluster image, <= 1 %).
+                cluster_split_k=SWAP_GEMM1_CLUSTER_SPLIT and self._dep_prefetch,
                 **{
                     "num_non_exiting_tiles": b["out_num_non_exiting_tiles"],
                     **gemm1_lists,
