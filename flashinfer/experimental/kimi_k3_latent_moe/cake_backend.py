@@ -360,7 +360,7 @@ BLOCK_K = 64
 FRONT_R_TILES = (NUM_EXPERTS + BLOCK_N - 1) // BLOCK_N  # 4
 FRONT_L_TILES = LATENT // BLOCK_N  # 14
 TAIL_N_TILES = HIDDEN // BLOCK_N  # 28
-TAIL_EPI_WARPS = 8  # epilogue warps of the prefill tail GEMM (fused norm: one latent row per warp)
+TAIL_EPI_WARPS = 8  # prefill tail GEMM epilogue warps (fused norm: one latent row each)
 GROUP_M = 16
 NORM_THREADS = 128
 NORM_ROWS_PER_CTA = NORM_THREADS // 32
@@ -523,7 +523,7 @@ FUSED_MIN_K2_ITERS = 48
 
 def fused_norm_fits(M: int, gemm_ctas: int, sm_count: int) -> bool:
     """Single-wave grids whose epilogue warps can own every latent row (one row per warp)."""
-    return gemm_ctas <= sm_count and M <= TAIL_EPI_WARPS * gemm_ctas
+    return gemm_ctas <= sm_count and TAIL_EPI_WARPS * gemm_ctas >= M
 
 
 def use_fused_norm(M: int, gemm_ctas: int, sm_count: int, k2_iters: int) -> bool:
