@@ -278,16 +278,24 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
         a, b, a_scale, b_scale, m_indices, validate_indices=True
     )
     m = sum(group_counts)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    # validate_indices=True hands the routing to the routing-aware rule: large rows whose odd-tail units exceed the
+    # SMs the pair grid leaves free take the GEMM + (wide) act route instead of the fused route
+    expected_route = select_route(
+        m, n2, sm_count=sm_count, group_blocks=routing_blocks(group_counts)
+    )
+    assert prepared.route == expected_route
+    assert prepared.num_kernels == 2  # GEMM + act kernel, or pair kernel + PDL tail kernel
     if m < SMALL_M_MAX:
         assert prepared.route == ACT_ROUTE
-        assert prepared.num_kernels == 2
+    if prepared.route in ACT_ROUTES:
         assert prepared.gemm_backend == small_m_gemm_backend(m, n2, k)
         assert prepared.gemm_backend == (
             GEMM_BACKEND_CAKE if (m % 128 and k >= 1024) else GEMM_BACKEND_CUTE
         )
+        assert prepared.tail_grid is None
     else:
         assert prepared.route == FUSED_ROUTE
-        assert prepared.num_kernels == 2  # pair kernel + PDL tail kernel
         assert prepared.gemm_backend is None
         assert prepared.tail_grid is not None and 1 <= prepared.tail_grid[0]
     out_q, out_s = prepared.launch()
