@@ -88,12 +88,13 @@ _DEFAULT_SM_COUNT = 148
 _PREFERRED_MIN_EPT = 16
 # Stage-1 cost model: a register-resident wave costs _RESIDENT_BASE_US + _RESIDENT_PER_EPT_US per
 # register entry; a streaming wave costs _STREAM_WAVE_BASE_US plus _STREAM_CHUNK_US per 512 x
-# 16-entry chunk each CTA walks.  Re-fitted for the round-3 stage-1 kernels on the B200 per-variant
-# sweep (16 (vocab, batch) cells, zero regret against the measured-best variant; the same constants
-# were the zero-regret joint fit on Rubin R200); they only rank the frozen variants.
+# 16-entry chunk each CTA walks.  Re-fitted for the round-4 stage-1 kernels (streaming template with a
+# gathered candidate list, (8, 16) streaming variant) on the B200 per-variant sweep (25 (vocab, batch)
+# cells, zero regret against the measured-best variant; only the streaming wave base changed from the
+# round-3 fit); they only rank the frozen variants.
 _RESIDENT_BASE_US = 2.0
 _RESIDENT_PER_EPT_US = 0.1
-_STREAM_WAVE_BASE_US = 6.0
+_STREAM_WAVE_BASE_US = 4.0
 _STREAM_CHUNK_US = 0.4
 
 _WORKSPACES: dict[
@@ -123,6 +124,11 @@ def _stage23_variants() -> list[tuple[int, int]]:
 
 def _slab() -> int:
     return int(load_manifest()["slab_entries"])
+
+
+def _fused_tail_kcap() -> int:
+    """Largest top-k whose stage 2/3 runs inside the stage-1 kernel (one launch)."""
+    return int(load_manifest()["fused_tail_kcap"])
 
 
 @functools.cache
@@ -398,6 +404,8 @@ def top_k_top_p_sampling_from_probs(
     renorm = renorm_out if renorm_out is not None else vals
     module = load_cake_sampling_module()
     stream = torch.cuda.current_stream(device=probs.device).cuda_stream
+    # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch).
+    fused = kmax <= _fused_tail_kcap()
     module.radix_topk(
         probs,
         k_arr,
@@ -409,8 +417,19 @@ def top_k_top_p_sampling_from_probs(
         cluster,
         ept,
         1 if stream_variant else 0,
+        p_arr,
+        p_scalar,
+        p_kind,
+        out,
+        renorm,
+        int(philox_seed) & 0xFFFFFFFFFFFFFFFF,
+        int(philox_offset) & 0xFFFFFFFFFFFFFFFF,
+        1 if renorm_out is not None else 0,
+        1 if fused else 0,
         stream,
     )
+    if fused:
+        return out
     module.sparse_topp_sample(
         vals,
         idxs,
@@ -506,6 +525,15 @@ def top_k_probs_to_slab(
         cluster,
         ept,
         1 if stream_variant else 0,
+        vals,  # stage-2/3 tensors: unused with fuse_tail == 0
+        1.0,
+        _TOPP_SCALAR,
+        cnt,
+        vals,
+        0,
+        0,
+        0,
+        0,
         stream,
     )
     return vals, idxs, cnt

@@ -43,6 +43,7 @@ _MANIFEST_KEYS = {
     "buckets",
     "codegen_arch",
     "compile_flags",
+    "fused_tail_kcap",
     "kernel_count",
     "kernel_symbols",
     "min_compute_capability",
@@ -215,6 +216,7 @@ def _binding_source(manifest: dict[str, Any]) -> str:
 #define CAKE_SAMPLING_MIN_MAJOR {min_major}
 #define CAKE_SAMPLING_MIN_MINOR {min_minor}
 #define CAKE_SAMPLING_SLAB {manifest["slab_entries"]}
+#define CAKE_SAMPLING_FUSED_TAIL_KCAP {manifest["fused_tail_kcap"]}
 #define CAKE_SAMPLING_STAGE1_TABLE(X) {stage1}
 #define CAKE_SAMPLING_STAGE23_TABLE(X) {stage23}
 #include "{_BINDING_HEADER}"

@@ -21,6 +21,7 @@
 //   CAKE_SAMPLING_MIN_MAJOR / CAKE_SAMPLING_MIN_MINOR   oldest compute capability the frozen body
 //                                                      supports (manifest min_compute_capability)
 //   CAKE_SAMPLING_SLAB          slab row stride (entries per row of the top-k slab)
+//   CAKE_SAMPLING_FUSED_TAIL_KCAP largest top-k whose stage 2/3 runs inside the stage-1 kernel
 //   CAKE_SAMPLING_STAGE1_TABLE(X)  X(symbol, cluster, ept, stream, threads, smem_bytes) ...
 //   CAKE_SAMPLING_STAGE23_TABLE(X) X(symbol, threads, items, smem_bytes) ...
 // and then includes this header.  Every table entry is taken verbatim from manifest.json.
@@ -32,6 +33,9 @@
 #endif
 #ifndef CAKE_SAMPLING_STAGE23_TABLE
 #error "CAKE_SAMPLING_STAGE23_TABLE must list the frozen stage-2/3 variants"
+#endif
+#ifndef CAKE_SAMPLING_FUSED_TAIL_KCAP
+#error "CAKE_SAMPLING_FUSED_TAIL_KCAP must give the fused stage-2/3 top-k capacity"
 #endif
 #ifndef CAKE_SAMPLING_SLAB
 #error "CAKE_SAMPLING_SLAB must give the slab row stride"
@@ -55,6 +59,7 @@ namespace flashinfer {
 namespace cake_sampling {
 
 constexpr int64_t kSlab = CAKE_SAMPLING_SLAB;
+constexpr int64_t kFusedTailKCap = CAKE_SAMPLING_FUSED_TAIL_KCAP;
 constexpr int32_t kTopKScalar = 1;
 constexpr int32_t kTopKPerRow = 2;
 constexpr int32_t kTopPScalar = 1;
@@ -132,6 +137,15 @@ inline void EnsureSmemAttribute(const void* kernel, int32_t smem_bytes) {
   }
 }
 
+// Clusters of more than 8 CTAs are a non-portable cluster size: the kernel's compile-time
+//   __cluster_dims__ is only honoured once the function opts in.
+inline void EnsureClusterAttribute(const void* kernel, int32_t cluster) {
+  if (cluster > 8) {
+    CheckCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
+              "cudaFuncSetAttribute(NonPortableClusterSizeAllowed)");
+  }
+}
+
 inline void CheckSlab(const TensorView& vals, const TensorView& idx, const TensorView& count,
                       int64_t rows) {
   CHECK_CUDA(vals);
@@ -156,9 +170,18 @@ inline void CheckSlab(const TensorView& vals, const TensorView& idx, const Tenso
 //   topk_arr   int32 [batch] (only read when topk_kind == kTopKPerRow; pass any int32 CUDA tensor
 //   otherwise) cluster/ept/stream_variant select the frozen variant; a register-resident variant
 //   (stream_variant == 0) needs cluster * ept * threads >= vocab, a streaming one covers any vocab.
+//   Fused tail: with fuse_tail != 0 every row whose k <= CAKE_SAMPLING_FUSED_TAIL_KCAP runs stage 2/3
+//   (top-p, sample, sorted write-back, renorm; same semantics and outputs as SparseTopPSample) inside
+//   this kernel, so the host must not launch SparseTopPSample afterwards; the stage-2/3 arguments
+//   (topp_arr / topp_scalar / topp_kind / out_samples / out_renorm / seed / offset / emit_renorm) are
+//   only read then.  Rows with k above the fused capacity are left to SparseTopPSample, so the host
+//   sets fuse_tail only when the largest top-k of the batch fits.  With fuse_tail == 0 pass any valid
+//   CUDA tensors for the stage-2/3 tensors (they are never dereferenced).
 void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64_t topk_kind,
                TensorView out_vals, TensorView out_idx, TensorView out_count, int64_t cluster,
-               int64_t ept, int64_t stream_variant, int64_t cuda_stream) {
+               int64_t ept, int64_t stream_variant, TensorView topp_arr, double topp_scalar,
+               int64_t topp_kind, TensorView out_samples, TensorView out_renorm, int64_t seed,
+               int64_t offset, int64_t emit_renorm, int64_t fuse_tail, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(probs);
   const int32_t device_id = probs.device().device_id;
@@ -194,8 +217,38 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept
       << " does not cover vocab=" << vocab;
+  CHECK_CUDA(topp_arr);
+  CHECK_CUDA(out_samples);
+  CHECK_CUDA(out_renorm);
+  if (fuse_tail != 0) {
+    TVM_FFI_ICHECK(topk_kind == kTopKPerRow || topk_scalar <= kFusedTailKCap)
+        << "fuse_tail needs top_k <= " << kFusedTailKCap;
+    CHECK_INPUT_TYPE(topp_arr, dl_float32);
+    TVM_FFI_ICHECK(topp_kind == kTopPScalar || topp_kind == kTopPPerRow) << "invalid topp_kind";
+    if (topp_kind == kTopPPerRow) {
+      CHECK_DEVICE(probs, topp_arr);
+      TVM_FFI_ICHECK(topp_arr.ndim() == 1 && topp_arr.size(0) >= batch)
+          << "topp_arr must have shape [batch]";
+    } else {
+      TVM_FFI_ICHECK(topp_scalar > 0.0 && topp_scalar <= 1.0) << "top_p must be in (0, 1]";
+    }
+    CHECK_INPUT_TYPE(out_samples, dl_int32);
+    CHECK_DEVICE(probs, out_samples);
+    CHECK_CONTIGUOUS(out_samples);
+    TVM_FFI_ICHECK(out_samples.ndim() == 1 && out_samples.size(0) >= batch)
+        << "out_samples must have shape [>= batch]";
+    CHECK_INPUT_TYPE(out_renorm, dl_float32);
+    if (emit_renorm != 0) {
+      CHECK_DEVICE(probs, out_renorm);
+      CHECK_CONTIGUOUS(out_renorm);
+      TVM_FFI_ICHECK(out_renorm.ndim() == 2 && out_renorm.size(0) >= batch &&
+                     out_renorm.size(1) == kSlab)
+          << "out_renorm must have shape [>= batch, " << kSlab << "]";
+    }
+  }
   if (batch == 0) return;
   EnsureSmemAttribute(v->kernel, v->smem_bytes);
+  EnsureClusterAttribute(v->kernel, v->cluster);
 
   float* probs_ptr = static_cast<float*>(probs.data_ptr());
   int* topk_ptr = static_cast<int*>(topk_arr.data_ptr());
@@ -205,8 +258,23 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   int vocab_i = static_cast<int>(vocab);
   int topk_i = static_cast<int>(topk_scalar);
   int kind_i = static_cast<int>(topk_kind);
-  void* args[] = {&probs_ptr, &topk_ptr, &vals_ptr, &idx_ptr,
-                  &count_ptr, &vocab_i,  &topk_i,   &kind_i};
+  float* topp_ptr = static_cast<float*>(topp_arr.data_ptr());
+  int* samples_ptr = static_cast<int*>(out_samples.data_ptr());
+  float* renorm_ptr = static_cast<float*>(out_renorm.data_ptr());
+  float topp_f = static_cast<float>(topp_scalar);
+  int pkind_i = static_cast<int>(topp_kind);
+  const uint64_t seed_u = static_cast<uint64_t>(seed);
+  const uint64_t offset_u = static_cast<uint64_t>(offset);
+  unsigned int seed_lo = static_cast<unsigned int>(seed_u & 0xFFFFFFFFu);
+  unsigned int seed_hi = static_cast<unsigned int>(seed_u >> 32);
+  unsigned int offset_lo = static_cast<unsigned int>(offset_u & 0xFFFFFFFFu);
+  unsigned int offset_hi = static_cast<unsigned int>(offset_u >> 32);
+  int renorm_i = emit_renorm != 0 ? 1 : 0;
+  int fuse_i = fuse_tail != 0 ? 1 : 0;
+  // Argument order = the frozen kernel signature (see the generated source).
+  void* args[] = {&probs_ptr, &topk_ptr,  &vals_ptr,   &idx_ptr,    &count_ptr, &vocab_i,  &topk_i,
+                  &kind_i,    &topp_ptr,  &samples_ptr, &renorm_ptr, &topp_f,    &pkind_i,  &seed_lo,
+                  &seed_hi,   &offset_lo, &offset_hi,  &renorm_i,   &fuse_i};
 
   cudaLaunchConfig_t config = {};
   config.gridDim = dim3(static_cast<uint32_t>(batch * v->cluster), 1, 1);

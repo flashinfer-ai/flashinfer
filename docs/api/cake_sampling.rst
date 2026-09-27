@@ -8,7 +8,7 @@ probabilities for Hopper and newer GPUs (compute capability 9.x, 10.x, 11.x and 
 measured on H100 (9.0), B200 (10.0), B300 / GB300 (10.3) and Rubin R200 (10.7); 11.x and 12.x are
 compile targets that have not been run on hardware.  It fuses the three stages of
 :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` with
-``filter_apply_order="top_k_first"`` into two kernels per call:
+``filter_apply_order="top_k_first"`` into at most two kernels per call:
 
 1. a thread-block-cluster radix select that writes the exact per-row top-k slab: one 11-bit
    cluster pass reduces the 2048-bucket histograms through distributed shared memory, the
@@ -20,7 +20,9 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    composite-key bitonic network (registers, warp shuffles and a cross-warp shared-memory
    exchange), keeps the shortest prefix whose exclusive mass is below ``top_p`` times the top-k
    mass, renormalizes, and draws one token per row by inverse CDF from
-   ``curand_init(seed, row, offset)``.
+   ``curand_init(seed, row, offset)``.  For ``top_k_max <= 64`` (``fused_tail_kcap`` in the
+   manifest) this stage runs inside the stage-1 kernel on one warp of the cluster's first CTA,
+   so the call is a single launch; the outputs are bitwise identical to the two-launch form.
 
 Semantics (support, tie-breaking toward the lower vocabulary index, Philox stream advancement
 through the generator) follow the ``top_k_first`` route with two extra guarantees:
@@ -44,8 +46,10 @@ non-contiguous rows, or a device outside the build targets.  The build targets a
 hosts without a GPU; otherwise the capabilities of the visible devices) restricted to the
 supported majors 9-12; a device whose architecture is not among them takes the ``top_k_first``
 route instead of failing at launch.  Large
-``batch * vocab`` launches run on the streaming stage-1 variants (a cluster of 1-4 CTAs walks the
-row in register chunks), so there is no size-based fallback.  :func:`cake_sampling_route` reports the decision without launching.
+``batch * vocab`` launches run on the streaming stage-1 variants (a cluster of 1-8 CTAs walks the
+row in register chunks, samples one 11-bit pass to bound the candidate range, filters the row into
+a per-CTA candidate list and finishes on a gathered copy of that list with local passes), so
+there is no size-based fallback.  :func:`cake_sampling_route` reports the decision without launching.
 
 The checked-in source product lives in ``csrc/cake_sampling/generated/`` as one translation
 unit plus a manifest that records every frozen variant's launch resources; FlashInfer verifies

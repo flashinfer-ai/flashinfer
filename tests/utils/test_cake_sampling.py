@@ -284,6 +284,15 @@ def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True) -> Run:
             cluster,
             ept,
             stream_variant,
+            p_args[0],
+            p_args[1],
+            p_args[2],
+            out,
+            renorm,
+            seed,
+            offset,
+            1,
+            0,  # explicit two-launch form: the fused tail is exercised by the pipeline route
             stream,
         )
         module.sparse_topp_sample(
@@ -1092,6 +1101,56 @@ def test_adv_bitwise_across_launch_graph_and_every_variant():
             base.renorm[:, :k].view(np.uint32),
         )
         assert np.array_equal(ws[1][:, :k].cpu().numpy(), base.idx[:, :k])
+
+
+def test_fused_tail_matches_two_launch_form():
+    """k <= fused_tail_kcap runs stage 2/3 inside the stage-1 kernel; outputs are bitwise identical to
+    the explicit two-launch form for every stage-1 variant, per-row p, renorm and adversarial rows."""
+    _require_supported_device()
+    man = load_manifest()
+    kcap = int(man["fused_tail_kcap"])
+    assert kcap >= 1
+    for vocab, batch in ((32768, 5), (128256, 3), (262144, 2)):
+        probs = _probs(batch, vocab, seed=41 + vocab % 97)
+        pn = probs.cpu().numpy()
+        pn[0, (np.arange(300) * 13) % vocab] = np.float32(2**-11)  # ties across the k boundary
+        pn[1, [7, 4096]] = np.inf
+        probs.copy_(torch.tensor(pn, device="cuda"))
+        p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
+        k_row = torch.tensor(
+            [max(1, (kcap * (i + 1)) // batch) for i in range(batch)],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        s1 = [
+            (v["cluster"], v["ept"], bool(v.get("stream", 0)))
+            for v in man["stage1"]
+            if 512 * v["cluster"] * v["ept"] >= vocab or v.get("stream", 0)
+        ]
+        assert s1
+        for k, p in ((kcap, 0.9), (max(1, kcap // 4), p_row), (k_row, 0.75), (1, 1.0)):
+            kmax = k if isinstance(k, int) else int(k.max().item())
+            assert kmax <= kcap
+            for pdl in (True, False):
+                fused, _ = _run_and_check(probs, k, p, 0xC0DE, 3, pdl=pdl)
+                for v1 in s1:
+                    two = _run(probs, k, p, 0xC0DE, 3, variant=(v1, (32, 2)), pdl=pdl)
+                    assert np.array_equal(two.samples, fused.samples), (vocab, k, v1, pdl)
+                    assert np.array_equal(two.count, fused.count), (vocab, k, v1)
+                    for r in range(batch):
+                        kr = int(k if isinstance(k, int) else k[r])
+                        assert np.array_equal(two.idx[r, :kr], fused.idx[r, :kr]), (vocab, k, v1, r)
+                        assert np.array_equal(
+                            two.vals[r, :kr].view(np.uint32), fused.vals[r, :kr].view(np.uint32)
+                        ), (vocab, k, v1, r)
+                        assert np.array_equal(
+                            two.renorm[r, :kr].view(np.uint32),
+                            fused.renorm[r, :kr].view(np.uint32),
+                        ), (vocab, k, v1, r)
+    # The boundary: kcap fuses, kcap + 1 takes the two-launch path; both check against the reference.
+    probs = _probs(2, 32768, seed=5)
+    _run_and_check(probs, kcap, 0.9, 1, 2)
+    _run_and_check(probs, kcap + 1, 0.9, 1, 2)
 
 
 def test_adv_stage1_slab_is_deterministic_and_exact():
