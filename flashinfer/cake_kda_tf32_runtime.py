@@ -5612,12 +5612,17 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 write_rows=0,
             )
         fp32_pool = self._external_state_is_fp32
+        # A pool sliced out of a larger buffer is not contiguous as a whole
+        # (slot stride > slot size); the kernel indexes it by slot stride from
+        # its data pointer, so hand the shim a pointer carrier (as the main
+        # kernel's indexed initial-state pool already does).
+        pool = _ffi_raw_pointer_carrier(self._final_pool)
         return dict(
-            final_state=self._final_pool if fp32_pool else self._final_compact,
+            final_state=pool if fp32_pool else self._final_compact,
             write_final_state=1 if fp32_pool else 2,
             final_indices=self._state_indices,
             final_slot_stride=int(self._final_pool.stride(0)),
-            final_state_bf16=self._carry_hi if fp32_pool else self._final_pool,
+            final_state_bf16=self._carry_hi if fp32_pool else pool,
             rows=self._checkpoint_output
             if self._checkpoint_in_place
             else self._apply_dummy_rows,
