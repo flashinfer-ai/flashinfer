@@ -992,7 +992,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(768, 1) void
-kernel_deepgemm_mega_mhc_sm103a_2430cbf9034b07d9333f(const __grid_constant__ CUtensorMap residual_map, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap fn_map, const __grid_constant__ CUtensorMap post_map, const __grid_constant__ CUtensorMap comb_map, const __grid_constant__ CUtensorMap prev_map, const __grid_constant__ CUtensorMap new_residual_map, const __grid_constant__ CUtensorMap y_map, float* __restrict__ mix_scales, float* __restrict__ mix_bases, float* __restrict__ new_prev_mix, float* __restrict__ new_post_mix, float* __restrict__ new_comb_res_mix, __nv_bfloat16* __restrict__ rmsnorm_weight, __nv_bfloat16* __restrict__ new_residual, __nv_bfloat16* __restrict__ y_bf16, uint8_t* __restrict__ y_fp8, unsigned int* __restrict__ y_primary_sf, unsigned int* __restrict__ y_shared_sf, float* __restrict__ scratch, unsigned long long* __restrict__ split_barriers, unsigned long long* __restrict__ launch_epochs, unsigned int num_tokens, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, unsigned int num_sinkhorn_iters, float rmsnorm_eps, float rmsnorm_scale, unsigned long long primary_sf_stride_token, unsigned long long primary_sf_stride_word, unsigned long long shared_sf_stride_word)
+kernel_deepgemm_mega_mhc_sm103a_c865c6a83a14cbbb9085(const __grid_constant__ CUtensorMap residual_map, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap fn_map, const __grid_constant__ CUtensorMap post_map, const __grid_constant__ CUtensorMap comb_map, const __grid_constant__ CUtensorMap prev_map, const __grid_constant__ CUtensorMap new_residual_map, const __grid_constant__ CUtensorMap y_map, float* __restrict__ mix_scales, float* __restrict__ mix_bases, float* __restrict__ new_prev_mix, float* __restrict__ new_post_mix, float* __restrict__ new_comb_res_mix, __nv_bfloat16* __restrict__ rmsnorm_weight, __nv_bfloat16* __restrict__ new_residual, __nv_bfloat16* __restrict__ y_bf16, uint8_t* __restrict__ y_fp8, unsigned int* __restrict__ y_primary_sf, unsigned int* __restrict__ y_shared_sf, float* __restrict__ scratch, unsigned long long* __restrict__ split_barriers, unsigned long long* __restrict__ launch_epochs, unsigned int num_tokens, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, unsigned int num_sinkhorn_iters, float rmsnorm_eps, float rmsnorm_scale, unsigned long long primary_sf_stride_token, unsigned long long primary_sf_stride_word, unsigned long long shared_sf_stride_word)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1896,6 +1896,20 @@ kernel_deepgemm_mega_mhc_sm103a_2430cbf9034b07d9333f(const __grid_constant__ CUt
     if (warp >= 20 && warp <= 23) {
         { // norm_main
             asm volatile("griddepcontrol.wait;" ::: "memory");
+            if (num_tokens < 64) {
+                #pragma unroll 1
+                for (int sector = warp % 4 * 32 + lane; sector < 320; sector += 128) {
+                    float touched_w = reinterpret_cast<volatile float*>(rmsnorm_weight)[sector * 8];
+                }
+                if (warp % 4 == 0) {
+                    if (lane < 3) {
+                        float touched_b = reinterpret_cast<volatile float*>(mix_bases)[lane * 8];
+                    }
+                    if (lane == 3) {
+                        float touched_s = reinterpret_cast<volatile float*>(mix_scales)[0];
+                    }
+                }
+            }
         }
     }
 

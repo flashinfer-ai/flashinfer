@@ -53,7 +53,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_CACHED_COUNTS_OFF 223744
 #define SMEM_CACHED_COUNTS_STAGE_BYTES 1536
 #define SMEM_CACHED_COUNTS_STRIDE 1536
-#define SMEM_TOTAL 225280
+#define SMEM_TOUCH_SINK_OFF 225280
+#define SMEM_TOUCH_SINK_STAGE_BYTES 128
+#define SMEM_TOUCH_SINK_STRIDE 128
+#define SMEM_TOTAL 225408
 
 #include <math_constants.h>
 
@@ -355,7 +358,7 @@ __device__ __forceinline__ void tmem_ld_x8_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_deepgemm_mega_gate_sm100a_37fdd59de1f521cb19b8(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride)
+kernel_deepgemm_mega_gate_sm103a_d6606f9343e626530add(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -386,6 +389,8 @@ kernel_deepgemm_mega_gate_sm100a_37fdd59de1f521cb19b8(const __grid_constant__ CU
     const int metadata_addr = smem + 222208;
     int* cached_counts = reinterpret_cast<int*>(smem_raw + 223744);
     const int cached_counts_addr = smem + 223744;
+    int* touch_sink = reinterpret_cast<int*>(smem_raw + 225280);
+    const int touch_sink_addr = smem + 225280;
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&X))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
 
@@ -581,7 +586,14 @@ kernel_deepgemm_mega_gate_sm100a_37fdd59de1f521cb19b8(const __grid_constant__ CU
     }
     // ---- Role: idle ----
     if (warp == 2) {
-        // idle — no tasks assigned
+        { // idle_main
+            int touched_sum = 0;
+            #pragma unroll 16
+            for (int sector = lane * 8; sector < 384 * map_width; sector += 256) {
+                touched_sum = touched_sum + physical_map[sector];
+            }
+            touch_sink[lane] = touched_sum;
+        }
     }
     // ---- Role: cache ----
     if (warp == 3) {

@@ -53,7 +53,10 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_CACHED_COUNTS_OFF 223744
 #define SMEM_CACHED_COUNTS_STAGE_BYTES 1536
 #define SMEM_CACHED_COUNTS_STRIDE 1536
-#define SMEM_TOTAL 225280
+#define SMEM_TOUCH_SINK_OFF 225280
+#define SMEM_TOUCH_SINK_STAGE_BYTES 128
+#define SMEM_TOUCH_SINK_STRIDE 128
+#define SMEM_TOTAL 225408
 
 #include <math_constants.h>
 
@@ -355,7 +358,7 @@ __device__ __forceinline__ void tmem_ld_x8_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride)
+kernel_deepgemm_mega_gate_sm100a_aef8a05a07a8126111b6(const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap W, float* __restrict__ bias, float* __restrict__ image_bias, uint8_t* __restrict__ image_mask, uint8_t* __restrict__ mask, int* __restrict__ physical_map, int* __restrict__ logical_count, long long* __restrict__ topk_idx, long long* __restrict__ unmapped_idx, float* __restrict__ topk_weights, float* __restrict__ scratch, unsigned long long* __restrict__ score_barriers, uint8_t* __restrict__ fixed_mask, uint8_t* __restrict__ random_mask, int num_tokens, int num_shared, int map_width, unsigned int ep_rank, float routed_scale, long long unmapped_stride)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -386,6 +389,8 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
     const int metadata_addr = smem + 222208;
     int* cached_counts = reinterpret_cast<int*>(smem_raw + 223744);
     const int cached_counts_addr = smem + 223744;
+    int* touch_sink = reinterpret_cast<int*>(smem_raw + 225280);
+    const int touch_sink_addr = smem + 225280;
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&X))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&W))) : "memory"); }
 
@@ -485,18 +490,18 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
     if (warp == 0) {
         { // load_main
             unsigned int ls = 0;
-            int logical = bid % 3;
+            int logical = bid % 24;
             int expert_group = logical % 3;
             int split = logical / 3;
             unsigned int _phase_empty = 1;
             if (elect_sync()) {
                 #pragma unroll 1
-                for (int tile = bid / 3; tile < 1; tile += 8) {
+                for (int tile = bid / 24; tile < 1; tile += 6) {
                     int effective_n = ((tile == 0) ? 16 : 16);
                     #pragma unroll 4
-                    for (int kb = 0; kb < 80; kb++) {
+                    for (int kb = 0; kb < 10; kb++) {
                         mbarrier_wait(empty_addr + (ls) * 8, _phase_empty);
-                        int ko = split * 80 * 64 + kb * 64;
+                        int ko = split * 10 * 64 + kb * 64;
                         asm volatile(
                             "cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes.L2::cache_hint"
                             " [%0], [%1, {%2, %3, %4}], [%5], %6;"
@@ -520,11 +525,11 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
             unsigned int _phase_full = 0;
             if (cta_rank == 0) {
                 #pragma unroll 1
-                for (int tile_1 = bid / 3; tile_1 < 1; tile_1 += 8) {
+                for (int tile_1 = bid / 24; tile_1 < 1; tile_1 += 6) {
                     mbarrier_wait(tmem_empty_addr + (me) * 8, _phase_tmem_empty);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     #pragma unroll 1
-                    for (int kb_1 = 0; kb_1 < 80; kb_1++) {
+                    for (int kb_1 = 0; kb_1 < 10; kb_1++) {
                         mbarrier_wait(full_addr + (ms) * 8, _phase_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int init = ((kb_1 == 0) ? 1 : 0);
@@ -565,7 +570,7 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
                     "}\n"
                     :: "r"(_mma_a_lo_0), "r"(_mma_b_lo_0), "r"((tmem_accum + (me * 16))), "r"(((init) ? 0 : 1)));
                         __syncwarp();
-                        if (kb_1 == 79) {
+                        if (kb_1 == 9) {
                             elect_commit(tmem_full_addr + (me) * 8);
                         }
                         __syncwarp();
@@ -581,7 +586,14 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
     }
     // ---- Role: idle ----
     if (warp == 2) {
-        // idle — no tasks assigned
+        { // idle_main
+            int touched_sum = 0;
+            #pragma unroll 16
+            for (int sector = lane * 8; sector < 384 * map_width; sector += 256) {
+                touched_sum = touched_sum + physical_map[sector];
+            }
+            touch_sink[lane] = touched_sum;
+        }
     }
     // ---- Role: cache ----
     if (warp == 3) {
@@ -602,7 +614,7 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
         { // gate_main
             unsigned int ge = 0;
             int gw = warp - 4;
-            int logical_1 = bid % 3;
+            int logical_1 = bid % 24;
             int expert_group_1 = logical_1 % 3;
             int split_1 = logical_1 / 3;
             uint64_t _grid_id_0;
@@ -611,9 +623,9 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
             mbarrier_wait(metadata_ready_addr, 0);
             unsigned int _phase_tmem_full = 0;
             #pragma unroll 1
-            for (int tile_2 = bid / 3; tile_2 < 1; tile_2 += 8) {
+            for (int tile_2 = bid / 24; tile_2 < 1; tile_2 += 6) {
                 int effective_n_1 = ((tile_2 == 0) ? 16 : 16);
-                int _min_0 = ((16) < ((tile_2 + 1) * 16) ? (16) : ((tile_2 + 1) * 16));
+                int _min_0 = ((3) < ((tile_2 + 1) * 16) ? (3) : ((tile_2 + 1) * 16));
                 int valid_tokens = _min_0 - tile_2 * 16;
                 if (gw == 7 && lane == 31) {
                     if (logical_1 == 0) {
@@ -623,7 +635,7 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
                         unsigned long long _acquire_observed;
                         do {
                         asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_acquire_observed) : "l"((reinterpret_cast<unsigned long long*>(score_barriers) + (tile_2 * 16))) : "memory");
-                        } while (static_cast<unsigned long long>(_acquire_observed - static_cast<unsigned long long>(epoch)) >= static_cast<unsigned long long>(3));
+                        } while (static_cast<unsigned long long>(_acquire_observed - static_cast<unsigned long long>(epoch)) >= static_cast<unsigned long long>(24));
                         }
                     }
                 }
@@ -644,15 +656,7 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
                     #pragma unroll
                     for (int item = 0; item < 8; item++) {
                         float stored = _tmem_load_0[item];
-                        float result = stored;
-                        float _exp_0 = expf(stored);
-                        float _log1p_0 = log1pf(_exp_0);
-                        float softplus = _log1p_0;
-                        float _sqrt_0;
-                        asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_0) : "f"(((stored > 20.0f) ? stored : softplus)));
-                        result = _sqrt_0;
-                        stored = result;
-                        scratch[((tile_2 + split_1) * 16 + token_base + col + item) * 384 + expert_1] = stored;
+                        scratch[((tile_2 * 8 + split_1) * 16 + token_base + col + item) * 384 + expert_1] = stored;
                     }
                 }
                 asm volatile("bar.sync 8, 256;" ::: "memory");
@@ -670,12 +674,12 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
                     unsigned long long _acquire_observed;
                     do {
                     asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_acquire_observed) : "l"((reinterpret_cast<unsigned long long*>(score_barriers) + (tile_2 * 16))) : "memory");
-                    } while (static_cast<unsigned long long>(_acquire_observed - static_cast<unsigned long long>(epoch + 3)) >= static_cast<unsigned long long>(1));
+                    } while (static_cast<unsigned long long>(_acquire_observed - static_cast<unsigned long long>(epoch + 24)) >= static_cast<unsigned long long>(1));
                     }
                 }
                 asm volatile("bar.sync 8, 256;" ::: "memory");
                 #pragma unroll 1
-                for (int token_local = gw * 3 + logical_1; token_local < valid_tokens; token_local += 24) {
+                for (int token_local = gw * 24 + logical_1; token_local < valid_tokens; token_local += 192) {
                     int token = tile_2 * 16 + token_local;
                     int handled = 0;
                     if (handled == 0) {
@@ -688,35 +692,69 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
                             int expert_base = (unsigned int)(wave_1 * 128) + lane * 4;
                             float _vec_load_0[4];
                             {
-                                float4 _v4 = *reinterpret_cast<const float4*>(scratch + ((tile_2 * 16 + token_local) * 384 + expert_base) + 0);
+                                float4 _v4 = *reinterpret_cast<const float4*>(scratch + ((tile_2 * 8 * 16 + token_local) * 384 + expert_base) + 0);
                                 _vec_load_0[0 + 0] = _v4.x;
                                 _vec_load_0[0 + 1] = _v4.y;
                                 _vec_load_0[0 + 2] = _v4.z;
                                 _vec_load_0[0 + 3] = _v4.w;
                             }
                             #pragma unroll
-                            for (int value = 0; value < 4; value++) {
-                                rankings[wave_1 * 4 + value] = _vec_load_0[value];
+                            for (int sp = 1; sp < 8; sp++) {
+                                float _vec_load_1[4];
+                                {
+                                    float4 _v4 = *reinterpret_cast<const float4*>(scratch + (((tile_2 * 8 + sp) * 16 + token_local) * 384 + expert_base) + 0);
+                                    _vec_load_1[0 + 0] = _v4.x;
+                                    _vec_load_1[0 + 1] = _v4.y;
+                                    _vec_load_1[0 + 2] = _v4.z;
+                                    _vec_load_1[0 + 3] = _v4.w;
+                                }
+                                #pragma unroll
+                                for (int value = 0; value < 4; value++) {
+                                    _vec_load_0[value] = _vec_load_0[value] + _vec_load_1[value];
+                                }
+                            }
+                            #pragma unroll
+                            for (int value_1 = 0; value_1 < 4; value_1++) {
+                                rankings[wave_1 * 4 + value_1] = _vec_load_0[value_1];
                             }
                         }
                         #pragma unroll
                         for (int wave_2 = 0; wave_2 < 3; wave_2++) {
+                            float exponentials[4];
+                            float softplus_values[4];
                             #pragma unroll
-                            for (int value_1 = 0; value_1 < 4; value_1++) {
-                                int expert_id = (unsigned int)(wave_2 * 128) + lane * 4 + (unsigned int)value_1;
-                                float raw = rankings[wave_2 * 4 + value_1];
-                                unbiased_values[wave_2 * 4 + value_1] = raw;
+                            for (int value_2 = 0; value_2 < 4; value_2++) {
+                                float _exp_0 = expf(rankings[wave_2 * 4 + value_2]);
+                                exponentials[value_2] = _exp_0;
+                            }
+                            #pragma unroll
+                            for (int value_3 = 0; value_3 < 4; value_3++) {
+                                float _log1p_0 = log1pf(exponentials[value_3]);
+                                softplus_values[value_3] = _log1p_0;
+                            }
+                            #pragma unroll
+                            for (int value_4 = 0; value_4 < 4; value_4++) {
+                                float raw_score = rankings[wave_2 * 4 + value_4];
+                                float _sqrt_0;
+                                asm volatile("sqrt.rn.f32 %0, %1;" : "=f"(_sqrt_0) : "f"(((raw_score > 20.0f) ? raw_score : softplus_values[value_4])));
+                                rankings[wave_2 * 4 + value_4] = _sqrt_0;
+                            }
+                            #pragma unroll
+                            for (int value_5 = 0; value_5 < 4; value_5++) {
+                                int expert_id = (unsigned int)(wave_2 * 128) + lane * 4 + (unsigned int)value_5;
+                                float raw = rankings[wave_2 * 4 + value_5];
+                                unbiased_values[wave_2 * 4 + value_5] = raw;
                                 float ranking_bias = 0.0f;
                                 ranking_bias = metadata[expert_id];
-                                rankings[wave_2 * 4 + value_1] = ((expert_id < 384) ? raw + ranking_bias : -CUDART_INF_F);
+                                rankings[wave_2 * 4 + value_5] = ((expert_id < 384) ? raw + ranking_bias : -CUDART_INF_F);
                             }
                         }
                         #pragma unroll
                         for (int wave_3 = 0; wave_3 < 3; wave_3++) {
                             int local_indices[4];
                             #pragma unroll
-                            for (int value_2 = 0; value_2 < 4; value_2++) {
-                                local_indices[value_2] = value_2;
+                            for (int value_6 = 0; value_6 < 4; value_6++) {
+                                local_indices[value_6] = value_6;
                             }
                             if (rankings[wave_3 * 4 + 1] > rankings[wave_3 * 4] || rankings[wave_3 * 4 + 1] == rankings[wave_3 * 4] && local_indices[1] < local_indices[0]) {
                                 float saved_score = rankings[wave_3 * 4];
@@ -791,8 +829,15 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
                             }
                         }
                         float selected_score = 0.0f;
-                        if (lane < 6) {
-                            selected_score = scratch[(tile_2 * 16 + token_local) * 384 + selected];
+                        int selected_value = ((selected >= 0) ? selected / 128 * 4 + selected % 4 : -1);
+                        int source_lane = ((selected >= 0) ? selected % 128 / 4 : 0);
+                        #pragma unroll
+                        for (int vi = 0; vi < 12; vi++) {
+                            float _shfl_0;
+                            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"(unbiased_values[vi]), "r"(source_lane));
+                            if (selected_value == vi) {
+                                selected_score = _shfl_0;
+                            }
                         }
                         int chosen = selected;
                         if (lane >= 6 && lane < (unsigned int)(6 + num_shared)) {
@@ -817,16 +862,15 @@ kernel_deepgemm_mega_gate_sm103a_c448ff0855dabf7cad6a(const __grid_constant__ CU
                                 total = total + _shfl_xor_0;
                             }
                         }
-                        float result_1 = selected_score;
+                        float result = selected_score;
                         if (lane < 6) {
-                            result_1 = selected_score / (total + 1e-20f) * routed_scale;
-                            unmapped_idx[(long long)token * unmapped_stride + (long long)lane] = chosen;
+                            result = selected_score / (total + 1e-20f) * routed_scale;
                         } else if (lane < (unsigned int)(6 + num_shared)) {
-                            result_1 = 1.0f;
+                            result = 1.0f;
                         }
                         if (lane < (unsigned int)(6 + num_shared)) {
                             topk_idx[(unsigned int)(token * (6 + num_shared)) + lane] = (long long)physical;
-                            topk_weights[(unsigned int)(token * (6 + num_shared)) + lane] = result_1;
+                            topk_weights[(unsigned int)(token * (6 + num_shared)) + lane] = result;
                         }
                     }
                 }

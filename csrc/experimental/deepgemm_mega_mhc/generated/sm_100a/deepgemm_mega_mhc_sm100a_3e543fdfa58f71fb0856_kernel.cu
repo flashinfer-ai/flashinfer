@@ -992,7 +992,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(768, 1) void
-kernel_deepgemm_mega_mhc_sm100a_6ceb81f3c89904324184(const __grid_constant__ CUtensorMap residual_map, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap fn_map, const __grid_constant__ CUtensorMap post_map, const __grid_constant__ CUtensorMap comb_map, const __grid_constant__ CUtensorMap prev_map, const __grid_constant__ CUtensorMap new_residual_map, const __grid_constant__ CUtensorMap y_map, float* __restrict__ mix_scales, float* __restrict__ mix_bases, float* __restrict__ new_prev_mix, float* __restrict__ new_post_mix, float* __restrict__ new_comb_res_mix, __nv_bfloat16* __restrict__ rmsnorm_weight, __nv_bfloat16* __restrict__ new_residual, __nv_bfloat16* __restrict__ y_bf16, uint8_t* __restrict__ y_fp8, unsigned int* __restrict__ y_primary_sf, unsigned int* __restrict__ y_shared_sf, float* __restrict__ scratch, unsigned long long* __restrict__ split_barriers, unsigned long long* __restrict__ launch_epochs, unsigned int num_tokens, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, unsigned int num_sinkhorn_iters, float rmsnorm_eps, float rmsnorm_scale, unsigned long long primary_sf_stride_token, unsigned long long primary_sf_stride_word, unsigned long long shared_sf_stride_word)
+kernel_deepgemm_mega_mhc_sm100a_3e543fdfa58f71fb0856(const __grid_constant__ CUtensorMap residual_map, const __grid_constant__ CUtensorMap x_map, const __grid_constant__ CUtensorMap fn_map, const __grid_constant__ CUtensorMap post_map, const __grid_constant__ CUtensorMap comb_map, const __grid_constant__ CUtensorMap prev_map, const __grid_constant__ CUtensorMap new_residual_map, const __grid_constant__ CUtensorMap y_map, float* __restrict__ mix_scales, float* __restrict__ mix_bases, float* __restrict__ new_prev_mix, float* __restrict__ new_post_mix, float* __restrict__ new_comb_res_mix, __nv_bfloat16* __restrict__ rmsnorm_weight, __nv_bfloat16* __restrict__ new_residual, __nv_bfloat16* __restrict__ y_bf16, uint8_t* __restrict__ y_fp8, unsigned int* __restrict__ y_primary_sf, unsigned int* __restrict__ y_shared_sf, float* __restrict__ scratch, unsigned long long* __restrict__ split_barriers, unsigned long long* __restrict__ launch_epochs, unsigned int num_tokens, float hc_norm_eps, float hc_pre_eps, float hc_post_scale, float sinkhorn_eps, unsigned int num_sinkhorn_iters, float rmsnorm_eps, float rmsnorm_scale, unsigned long long primary_sf_stride_token, unsigned long long primary_sf_stride_word, unsigned long long shared_sf_stride_word)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1896,6 +1896,20 @@ kernel_deepgemm_mega_mhc_sm100a_6ceb81f3c89904324184(const __grid_constant__ CUt
     if (warp >= 20 && warp <= 23) {
         { // norm_main
             asm volatile("griddepcontrol.wait;" ::: "memory");
+            if (num_tokens < 64) {
+                #pragma unroll 1
+                for (int sector = warp % 4 * 32 + lane; sector < 320; sector += 128) {
+                    float touched_w = reinterpret_cast<volatile float*>(rmsnorm_weight)[sector * 8];
+                }
+                if (warp % 4 == 0) {
+                    if (lane < 3) {
+                        float touched_b = reinterpret_cast<volatile float*>(mix_bases)[lane * 8];
+                    }
+                    if (lane == 3) {
+                        float touched_s = reinterpret_cast<volatile float*>(mix_scales)[0];
+                    }
+                }
+            }
         }
     }
 
@@ -2003,10 +2017,6 @@ kernel_deepgemm_mega_mhc_sm100a_6ceb81f3c89904324184(const __grid_constant__ CUt
                     asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_1) : "f"(scale), "r"(0));
                     float _shfl_2;
                     asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_2) : "f"(scale), "r"(1));
-                    unsigned int first_sf_idx = token_1 % 224;
-                    unsigned int shared_row0 = token_1 / 224 * 256 + (first_sf_idx & 4294967168) + (first_sf_idx & 31) * 4 + (first_sf_idx >> 5 & 3);
-                    unsigned int second_sf_idx = (token_1 + 1) % 224;
-                    unsigned int shared_row1 = (token_1 + 1) / 224 * 256 + (second_sf_idx & 4294967168) + (second_sf_idx & 31) * 4 + (second_sf_idx >> 5 & 3);
                     #pragma unroll 1
                     for (int pack = begin; pack < end; pack++) {
                         unsigned int future_pack[12];
@@ -2161,8 +2171,6 @@ kernel_deepgemm_mega_mhc_sm100a_6ceb81f3c89904324184(const __grid_constant__ CUt
                             if (lane_in_warp % 16 == 0) {
                                 unsigned int word_idx = (unsigned int)(pack * 2) + lane_in_warp / 16;
                                 y_primary_sf[(unsigned long long)token_1 * primary_sf_stride_token + (unsigned long long)word_idx * primary_sf_stride_word] = word_5;
-                                unsigned int shared_row = shared_row0;
-                                y_shared_sf[(unsigned long long)word_idx * shared_sf_stride_word + (unsigned long long)shared_row] = word_5;
                             }
                         }
                         if (token_1 + 1 < num_tokens) {
@@ -2208,8 +2216,6 @@ kernel_deepgemm_mega_mhc_sm100a_6ceb81f3c89904324184(const __grid_constant__ CUt
                                 if (lane_in_warp % 16 == 0) {
                                     unsigned int word_idx_1 = (unsigned int)(pack * 2) + lane_in_warp / 16;
                                     y_primary_sf[(unsigned long long)(token_1 + 1) * primary_sf_stride_token + (unsigned long long)word_idx_1 * primary_sf_stride_word] = word_7;
-                                    unsigned int shared_row_1 = shared_row1;
-                                    y_shared_sf[(unsigned long long)word_idx_1 * shared_sf_stride_word + (unsigned long long)shared_row_1] = word_7;
                                 }
                             }
                         }
