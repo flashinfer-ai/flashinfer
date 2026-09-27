@@ -16,6 +16,8 @@ limitations under the License.
 
 import math
 
+import re
+
 import pytest
 import torch
 
@@ -252,6 +254,44 @@ def test_decode_config_rules(arch):
             assert cfg.fused and num_k_iters == 1 and cfg.split == 1 and cfg.tok <= 64
             assert -(-cfg.total_work // cfg.grid) <= cb.DEC_RES_SLOTS
         assert cfg.kernel_key.startswith(f"decode:t{cfg.tok}_p{cfg.module_stages}")
+        # Round-3 fused knobs: a decoupled ring only for fused, non-resident rows; narrow units divide evenly.
+        if entry.get("xb_stages"):
+            assert (
+                cfg.fused
+                and not cfg.resident
+                and 1 <= cfg.xb_stages <= cb.DEC_XB_MAX_STAGES
+            )
+            assert f"_r{cfg.xb_stages}" in cfg.kernel_key
+        else:
+            assert cfg.xb_stages == 0 and not re.search(r"_r\d", cfg.kernel_key)
+        assert cfg.qlanes in (4, 8, 16)
+        assert (2 * cfg.tok) % (cb.DEC_QUANT_WARPS * (32 // cfg.qlanes)) == 0
+        if not (cfg.fused and not cfg.resident) or "qlanes" not in entry:
+            assert cfg.qlanes == 16 and "_q" not in cfg.kernel_key
+        else:
+            assert cfg.qlanes >= entry["qlanes"]
+        assert cfg.kernel_key.endswith(f"_q{cfg.qlanes}") == (cfg.qlanes != 16)
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_decode_config_round3_fused_rows(arch):
+    # N = 128, K = 7168 (tp8 f_a / b_proj, tp1 f_a): the fused rows that carry the decoupled BF16 ring and narrow units.
+    cfg = decode_config(4096, 1, 28, arch, SM_COUNT)
+    assert (cfg.tok, cfg.stages, cfg.xb_stages, cfg.qlanes) == (32, 3, 5, 4)
+    assert cfg.kernel_key == "decode:t32_p3_fused_r5_q4"
+    cfg = decode_config(16384, 1, 28, arch, SM_COUNT)
+    assert (cfg.tok, cfg.split, cfg.stages, cfg.xb_stages, cfg.qlanes) == (
+        64,
+        4,
+        2,
+        3,
+        4,
+    )
+    assert cfg.kernel_key == "decode:t64_p2_fused_r3_q4"
+    # 16-token tiles cannot keep eight 4-lane groups busy per stage: the table's 4 lanes widen to 8, coupled staging.
+    cfg = decode_config(256, 1, 28, arch, SM_COUNT)
+    assert (cfg.tok, cfg.xb_stages, cfg.qlanes) == (16, 0, 8)
+    assert cfg.kernel_key == "decode:t16_p4_fused_q8"
 
 
 def test_decode_module_stage_clamp():
@@ -263,6 +303,10 @@ def test_decode_module_stage_clamp():
     assert decode_module_stages(64, 4, True, True) == 4
     # Host rule for the same instance: the staged-BF16 stage size admits two stages -> a p2 module.
     assert decode_module_stages(64, 2, True, True) == 2
+    # Decoupled ring: the ring bytes leave the pool before the stage clamp (t32: 3 x 42 KB + 5 x 16 KB; t64: 2 x 50 KB + 3 x 32 KB).
+    assert decode_module_stages(32, 3, True, False, 5) == 3
+    assert decode_module_stages(64, 2, True, False, 3) == 2
+    assert decode_module_stages(64, 3, True, False, 3) == 2
 
 
 @pytest.mark.parametrize("arch", ARCHES)
