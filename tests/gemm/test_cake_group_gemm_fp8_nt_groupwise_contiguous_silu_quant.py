@@ -285,7 +285,9 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
         m, n2, sm_count=sm_count, group_blocks=routing_blocks(group_counts)
     )
     assert prepared.route == expected_route
-    assert prepared.num_kernels == 2  # GEMM + act kernel, or pair kernel + PDL tail kernel
+    assert (
+        prepared.num_kernels == 2
+    )  # GEMM + act kernel, or pair kernel + PDL tail kernel
     if m < SMALL_M_MAX:
         assert prepared.route == ACT_ROUTE
     if prepared.route in ACT_ROUTES:
@@ -297,7 +299,7 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
     else:
         assert prepared.route == FUSED_ROUTE
         assert prepared.gemm_backend is None
-        assert prepared.tail_grid is not None and 1 <= prepared.tail_grid[0]
+        assert prepared.tail_grid is not None and prepared.tail_grid[0] >= 1
     out_q, out_s = prepared.launch()
     torch.cuda.synchronize()
     g, u, act = _reference_activation(
@@ -378,7 +380,9 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     unvalidated = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         a, b, a_scale, b_scale, m_indices
     )
-    assert (unvalidated.route, unvalidated.grid) == launch_plan(m, n2, sm_count=sm_count)
+    assert (unvalidated.route, unvalidated.grid) == launch_plan(
+        m, n2, sm_count=sm_count
+    )
     if route == FUSED_ROUTE:
         assert grid[0] % 2 == 0 and grid[0] <= 128
         tail = tail_launch_grid(m, n2, sm_count=sm_count)
@@ -411,24 +415,51 @@ def test_routing_blocks_and_fused_tile_counts():
         routing_blocks([128, -1])
     with pytest.raises(ValueError):
         select_route(4096, 2048, sm_count=148, group_blocks=(1, 1))
-    assert select_route(1024, 2048, sm_count=148, group_blocks=routing_blocks([128] * 8)) == ACT_ROUTE
+    assert (
+        select_route(1024, 2048, sm_count=148, group_blocks=routing_blocks([128] * 8))
+        == ACT_ROUTE
+    )
     assert select_route(4096, 2048, sm_count=148) == FUSED_ROUTE
     # measured B200 rule: odd-tail units beyond the 20 SMs the 128-CTA pair grid leaves free -> GEMM + act
     wide = dict(sm_count=148)
-    assert select_route(4096, 2048, group_blocks=routing_blocks([256] * 16), **wide) == FUSED_ROUTE
-    two_odd = routing_blocks([128, 384] + [256] * 14)  # 16 odd-tail units <= 20 free SMs
+    assert (
+        select_route(4096, 2048, group_blocks=routing_blocks([256] * 16), **wide)
+        == FUSED_ROUTE
+    )
+    two_odd = routing_blocks(
+        [128, 384] + [256] * 14
+    )  # 16 odd-tail units <= 20 free SMs
     assert select_route(4096, 2048, group_blocks=two_odd, **wide) == FUSED_ROUTE
     # diverted wide rows take the wide act kernel (>= ACT_WIDE_MIN_ITEMS items)
-    assert select_route(4096, 2048, group_blocks=routing_blocks([384] * 8 + [128] * 8), **wide) == ACT_WIDE_ROUTE
-    assert select_route(4096, 2048, group_blocks=blocks, **wide) == ACT_WIDE_ROUTE  # random_aligned: 64 units
-    assert select_route(2048, 2048, group_blocks=routing_blocks([128] * 16), **wide) == ACT_WIDE_ROUTE
+    assert (
+        select_route(
+            4096, 2048, group_blocks=routing_blocks([384] * 8 + [128] * 8), **wide
+        )
+        == ACT_WIDE_ROUTE
+    )
+    assert (
+        select_route(4096, 2048, group_blocks=blocks, **wide) == ACT_WIDE_ROUTE
+    )  # random_aligned: 64 units
+    assert (
+        select_route(2048, 2048, group_blocks=routing_blocks([128] * 16), **wide)
+        == ACT_WIDE_ROUTE
+    )
     assert act_items(2048, 2048) == ACT_WIDE_MIN_ITEMS
     # a diverted problem below the item threshold keeps the one-warp-per-group act kernel
-    assert select_route(2048, 256, group_blocks=routing_blocks([128] * 16), **wide) == ACT_ROUTE
+    assert (
+        select_route(2048, 256, group_blocks=routing_blocks([128] * 16), **wide)
+        == ACT_ROUTE
+    )
     # grids of the two act routes on the wide random_aligned row
     _, wide_grid = launch_plan(4096, 2048, group_blocks=blocks, **wide)
-    assert wide_grid == (1480, 1, 1)  # ceil(32768 / 16) = 2048 warps-of-four capped at 10 CTAs x 148 SMs
-    _, small_grid = launch_plan(1024, 2048, group_blocks=routing_blocks([128] * 8), **wide)
+    assert wide_grid == (
+        1480,
+        1,
+        1,
+    )  # ceil(32768 / 16) = 2048 warps-of-four capped at 10 CTAs x 148 SMs
+    _, small_grid = launch_plan(
+        1024, 2048, group_blocks=routing_blocks([128] * 8), **wide
+    )
     assert small_grid == (2048, 1, 1)  # 8192 items, one warp each, four per CTA
 
 

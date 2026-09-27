@@ -219,9 +219,7 @@ def select_route(
     pair_ctas = (min(sm_count, CTA_CAP) // cluster_ctas) * cluster_ctas
     _, odd_units = fused_tile_counts(n2, group_blocks)
     return (
-        FUSED_ROUTE
-        if odd_units <= sm_count - pair_ctas
-        else _diverted_act_route(m, n2)
+        FUSED_ROUTE if odd_units <= sm_count - pair_ctas else _diverted_act_route(m, n2)
     )
 
 
@@ -324,7 +322,7 @@ def _validate_indices(m_indices: torch.Tensor, groups: int) -> tuple[int, ...]:
                 "m_indices must place every internal expert boundary at a multiple "
                 "of 128 rows (only the final expert may end in a partial block)"
             )
-    block_experts = indices[:: ROW_BLOCK]
+    block_experts = indices[::ROW_BLOCK]
     return tuple(
         int(v) for v in torch.bincount(block_experts, minlength=groups).tolist()
     )
@@ -572,7 +570,9 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
             raise RuntimeError(
                 f"generated program {stage_module_name} of route {route!r} unexpectedly needs TMA descriptor storage"
             )
-        grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), stage_grids[stage], strict=True))
+        grid_by_axis = dict(
+            zip(("grid_x", "grid_y", "grid_z"), stage_grids[stage], strict=True)
+        )
         arguments = []
         for kind, name in record["arg_plan"]:
             if kind == "grid":
