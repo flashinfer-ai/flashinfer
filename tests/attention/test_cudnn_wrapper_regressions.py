@@ -333,9 +333,27 @@ def test_paged_prefill_default_scale_layout_lse(layout, lse_base, explicit_metad
     last = last - 2
     if explicit_metadata:
         metadata["seq_lens"].sub_(2)
-    w.plan(
-        qo, ip, ix, last, 8, 2, 128, 16, causal=True, q_data_type=q.dtype, **metadata
-    )
+    # Explicit GPU lengths and host-known bounds need no device readback.
+    # Keep the real captured replay below as the metadata-lifetime check.
+    previous_sync_mode = torch.cuda.get_sync_debug_mode()
+    if explicit_metadata:
+        torch.cuda.set_sync_debug_mode("error")
+    try:
+        w.plan(
+            qo,
+            ip,
+            ix,
+            last,
+            8,
+            2,
+            128,
+            16,
+            causal=True,
+            q_data_type=q.dtype,
+            **metadata,
+        )
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync_mode)
     assert w._seq_lens_kv.data_ptr() == lengths_ptr
     out.fill_(torch.nan)
     lse.fill_(torch.nan)
