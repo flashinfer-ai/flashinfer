@@ -1237,7 +1237,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int max_q_len, int batch_size)
+kernel_cake_dsv4_7143d4b7c1fa900e3e5e(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_kv, const __grid_constant__ CUtensorMap tmap_compressed_kv, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int num_query_tokens, int sparse_topk, int has_sinks, int total_work_items, int max_q_len, int batch_size)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1696,13 +1696,6 @@ kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q
                                 mbarrier_wait(index_full_addr + (load_k_index_stage) * 8, _phase_index_full);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                             }
-                            int group = lane & 15;
-                            int feature_chunk = load_warp_rank * 2 + (lane >> 4);
-                            int group_offset = (tile & 1) * 128 + k_cta_offset + group * 4;
-                            int raw_rows[4];
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[(0) + 3]))
-                                : "r"(smem_sparse_indices_addr + load_k_index_stage * 1024 + (unsigned int)(group_offset * 4)));
                             mbarrier_wait(k_empty_addr + (load_k_stage) * 8, _phase_k_empty);
                             if (load_warp_rank == 0) {
                                 if (elect_sync()) {
@@ -1711,11 +1704,50 @@ kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q
                                         :: "r"((k_full_addr + (load_k_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(32768)) : "memory");
                                 }
                             }
-                            int k_dst = smem_k_full_addr + load_k_stage * 32768 + (unsigned int)(feature_chunk * 8192);
-                            if (first_tile_1 + tile == 0) {
-                                tma_gather4_gmem2smem_mc_cta2(k_dst + group * 512, (&tmap_swa_kv), feature_chunk * 128, ((raw_rows[0] >= 0) ? raw_rows[0] : 0), ((raw_rows[1] >= 0) ? raw_rows[1] : 0), ((raw_rows[2] >= 0) ? raw_rows[2] : 0), ((raw_rows[3] >= 0) ? raw_rows[3] : 0), ((k_full_addr + (load_k_stage) * 8) & 0xFEFFFFFF), 1 << bid % 2);
-                            } else {
-                                tma_gather4_gmem2smem_mc_cta2(k_dst + group * 512, (&tmap_compressed_kv), feature_chunk * 128, ((raw_rows[0] >= 0) ? raw_rows[0] : 0), ((raw_rows[1] >= 0) ? raw_rows[1] : 0), ((raw_rows[2] >= 0) ? raw_rows[2] : 0), ((raw_rows[3] >= 0) ? raw_rows[3] : 0), ((k_full_addr + (load_k_stage) * 8) & 0xFEFFFFFF), 1 << bid % 2);
+                            if (elect_sync()) {
+                                int k_dummy_row = 0;
+                                int k_dummy_rows[4];
+                                {
+                                    int k_first_rows[4];
+                                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                        : "=r"(*reinterpret_cast<uint32_t*>(&k_first_rows[0])), "=r"(*reinterpret_cast<uint32_t*>(&k_first_rows[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&k_first_rows[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&k_first_rows[(0) + 3]))
+                                        : "r"(smem_sparse_indices_addr + load_k_index_stage * 1024 + (unsigned int)((tile & 1) * 128 * 4)));
+                                    int _max_2 = ((k_first_rows[0]) > (0) ? (k_first_rows[0]) : (0));
+                                    k_dummy_row = _max_2;
+                                }
+                                if (first_tile_1 + tile == 0) {
+                                    #pragma unroll
+                                    for (int group_local = 0; group_local < 8; group_local++) {
+                                        int group = load_warp_rank * 8 + group_local;
+                                        int group_offset = (tile & 1) * 128 + k_cta_offset + group * 4;
+                                        int raw_rows[4];
+                                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                            : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows[(0) + 3]))
+                                            : "r"(smem_sparse_indices_addr + load_k_index_stage * 1024 + (unsigned int)(group_offset * 4)));
+                                        #pragma unroll
+                                        for (int feature_part = 0; feature_part < 4; feature_part++) {
+                                            int feature_chunk = feature_part;
+                                            int k_dst = smem_k_full_addr + load_k_stage * 32768 + (unsigned int)(feature_chunk * 8192);
+                                            tma_gather4_gmem2smem_mc_cta2(k_dst + group * 512, (&tmap_swa_kv), feature_chunk * 128, ((raw_rows[0] >= 0) ? raw_rows[0] : k_dummy_row), ((raw_rows[1] >= 0) ? raw_rows[1] : k_dummy_row), ((raw_rows[2] >= 0) ? raw_rows[2] : k_dummy_row), ((raw_rows[3] >= 0) ? raw_rows[3] : k_dummy_row), ((k_full_addr + (load_k_stage) * 8) & 0xFEFFFFFF), 1 << bid % 2);
+                                        }
+                                    }
+                                } else {
+                                    #pragma unroll
+                                    for (int group_local_1 = 0; group_local_1 < 8; group_local_1++) {
+                                        int group_1 = load_warp_rank * 8 + group_local_1;
+                                        int group_offset_1 = (tile & 1) * 128 + k_cta_offset + group_1 * 4;
+                                        int raw_rows_1[4];
+                                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                            : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[(0) + 3]))
+                                            : "r"(smem_sparse_indices_addr + load_k_index_stage * 1024 + (unsigned int)(group_offset_1 * 4)));
+                                        #pragma unroll
+                                        for (int feature_part_1 = 0; feature_part_1 < 4; feature_part_1++) {
+                                            int feature_chunk_1 = feature_part_1;
+                                            int k_dst_1 = smem_k_full_addr + load_k_stage * 32768 + (unsigned int)(feature_chunk_1 * 8192);
+                                            tma_gather4_gmem2smem_mc_cta2(k_dst_1 + group_1 * 512, (&tmap_compressed_kv), feature_chunk_1 * 128, ((raw_rows_1[0] >= 0) ? raw_rows_1[0] : k_dummy_row), ((raw_rows_1[1] >= 0) ? raw_rows_1[1] : k_dummy_row), ((raw_rows_1[2] >= 0) ? raw_rows_1[2] : k_dummy_row), ((raw_rows_1[3] >= 0) ? raw_rows_1[3] : k_dummy_row), ((k_full_addr + (load_k_stage) * 8) & 0xFEFFFFFF), 1 << bid % 2);
+                                        }
+                                    }
+                                }
                             }
                             load_k_stage += 1;
                             if (load_k_stage == 2) { load_k_stage = 0; _phase_k_empty ^= 1; }
@@ -1734,14 +1766,6 @@ kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q
                                 mbarrier_wait(index_full_addr + (load_v_index_stage) * 8, _phase_index_full_1);
                                 asm volatile("tcgen05.fence::after_thread_sync;");
                             }
-                            int v_dst = smem_v_full_addr + load_v_stage * 32768 + (unsigned int)(v_warp_rank * 16384);
-                            int v_col = bid % 2 * 256 + v_warp_rank * 128;
-                            int group_1 = lane;
-                            int group_offset_1 = (tile_1 & 1) * 128 + group_1 * 4;
-                            int raw_rows_1[4];
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_1[(0) + 3]))
-                                : "r"(smem_sparse_indices_addr + load_v_index_stage * 1024 + (unsigned int)(group_offset_1 * 4)));
                             int v_empty_phase = load_v_tile_cursor >> 1 & 1 ^ 1;
                             uint32_t _mbar_token_0 = mbarrier_try_wait(v_empty_addr + (load_v_stage) * 8, v_empty_phase);
                             mbarrier_wait_token(v_empty_addr + (load_v_stage) * 8, v_empty_phase, _mbar_token_0);
@@ -1752,10 +1776,50 @@ kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q
                                         :: "r"((v_full_addr + (load_v_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(65536)) : "memory");
                                 }
                             }
-                            if (first_tile_1 + tile_1 == 0) {
-                                tma_gather4_gmem2smem_mc_cta2(v_dst + group_1 * 512, (&tmap_swa_kv), v_col, ((raw_rows_1[0] >= 0) ? raw_rows_1[0] : 0), ((raw_rows_1[1] >= 0) ? raw_rows_1[1] : 0), ((raw_rows_1[2] >= 0) ? raw_rows_1[2] : 0), ((raw_rows_1[3] >= 0) ? raw_rows_1[3] : 0), ((v_full_addr + (load_v_stage) * 8) & 0xFEFFFFFF), 1 << bid % 2);
-                            } else {
-                                tma_gather4_gmem2smem_mc_cta2(v_dst + group_1 * 512, (&tmap_compressed_kv), v_col, ((raw_rows_1[0] >= 0) ? raw_rows_1[0] : 0), ((raw_rows_1[1] >= 0) ? raw_rows_1[1] : 0), ((raw_rows_1[2] >= 0) ? raw_rows_1[2] : 0), ((raw_rows_1[3] >= 0) ? raw_rows_1[3] : 0), ((v_full_addr + (load_v_stage) * 8) & 0xFEFFFFFF), 1 << bid % 2);
+                            if (elect_sync()) {
+                                int v_dummy_row = 0;
+                                int v_dummy_rows[4];
+                                {
+                                    int v_first_rows[4];
+                                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                        : "=r"(*reinterpret_cast<uint32_t*>(&v_first_rows[0])), "=r"(*reinterpret_cast<uint32_t*>(&v_first_rows[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&v_first_rows[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&v_first_rows[(0) + 3]))
+                                        : "r"(smem_sparse_indices_addr + load_v_index_stage * 1024 + (unsigned int)((tile_1 & 1) * 128 * 4)));
+                                    int _max_3 = ((v_first_rows[0]) > (0) ? (v_first_rows[0]) : (0));
+                                    v_dummy_row = _max_3;
+                                }
+                                if (first_tile_1 + tile_1 == 0) {
+                                    #pragma unroll
+                                    for (int v_group_local = 0; v_group_local < 16; v_group_local++) {
+                                        int group_2 = v_warp_rank * 16 + v_group_local;
+                                        int group_offset_2 = (tile_1 & 1) * 128 + group_2 * 4;
+                                        int raw_rows_2[4];
+                                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                            : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_2[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_2[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_2[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_2[(0) + 3]))
+                                            : "r"(smem_sparse_indices_addr + load_v_index_stage * 1024 + (unsigned int)(group_offset_2 * 4)));
+                                        #pragma unroll
+                                        for (int v_feature = 0; v_feature < 2; v_feature++) {
+                                            int v_dst = smem_v_full_addr + load_v_stage * 32768 + (unsigned int)(v_feature * 16384);
+                                            int v_col = bid % 2 * 256 + v_feature * 128;
+                                            tma_gather4_gmem2smem_mc_cta2(v_dst + group_2 * 512, (&tmap_swa_kv), v_col, ((raw_rows_2[0] >= 0) ? raw_rows_2[0] : v_dummy_row), ((raw_rows_2[1] >= 0) ? raw_rows_2[1] : v_dummy_row), ((raw_rows_2[2] >= 0) ? raw_rows_2[2] : v_dummy_row), ((raw_rows_2[3] >= 0) ? raw_rows_2[3] : v_dummy_row), ((v_full_addr + (load_v_stage) * 8) & 0xFEFFFFFF), 1 << bid % 2);
+                                        }
+                                    }
+                                } else {
+                                    #pragma unroll
+                                    for (int v_group_local_1 = 0; v_group_local_1 < 16; v_group_local_1++) {
+                                        int group_3 = v_warp_rank * 16 + v_group_local_1;
+                                        int group_offset_3 = (tile_1 & 1) * 128 + group_3 * 4;
+                                        int raw_rows_3[4];
+                                        asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                            : "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_3[0])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_3[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_3[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&raw_rows_3[(0) + 3]))
+                                            : "r"(smem_sparse_indices_addr + load_v_index_stage * 1024 + (unsigned int)(group_offset_3 * 4)));
+                                        #pragma unroll
+                                        for (int v_feature_1 = 0; v_feature_1 < 2; v_feature_1++) {
+                                            int v_dst_1 = smem_v_full_addr + load_v_stage * 32768 + (unsigned int)(v_feature_1 * 16384);
+                                            int v_col_1 = bid % 2 * 256 + v_feature_1 * 128;
+                                            tma_gather4_gmem2smem_mc_cta2(v_dst_1 + group_3 * 512, (&tmap_compressed_kv), v_col_1, ((raw_rows_3[0] >= 0) ? raw_rows_3[0] : v_dummy_row), ((raw_rows_3[1] >= 0) ? raw_rows_3[1] : v_dummy_row), ((raw_rows_3[2] >= 0) ? raw_rows_3[2] : v_dummy_row), ((raw_rows_3[3] >= 0) ? raw_rows_3[3] : v_dummy_row), ((v_full_addr + (load_v_stage) * 8) & 0xFEFFFFFF), 1 << bid % 2);
+                                        }
+                                    }
+                                }
                             }
                             load_v_stage += 1;
                             if (load_v_stage == 2) { load_v_stage = 0; }
@@ -1870,8 +1934,8 @@ kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q
                 int source_work_valid_2 = source_work_z_2 * (unsigned int)max_q_len + (source_work_x_2 >> 1) < (unsigned int)num_query_tokens;
                 int mapped_query_idx_2 = source_work_z_2 * (unsigned int)max_q_len + (source_work_x_2 >> 1);
                 if (source_work_valid_2 != 0) {
-                    int _max_3 = ((sparse_topk_lens[mapped_query_idx_2] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_2] + sparse_topk_lens_offset) : (0));
-                    int _min_3 = ((_max_3) < (sparse_topk) ? (_max_3) : (sparse_topk));
+                    int _max_5 = ((sparse_topk_lens[mapped_query_idx_2] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_2] + sparse_topk_lens_offset) : (0));
+                    int _min_3 = ((_max_5) < (sparse_topk) ? (_max_5) : (sparse_topk));
                     int active_topk_2 = _min_3;
                     {
                         all_num_kv_tiles_2 = (active_topk_2 + 128 - 1) / 128;
@@ -2088,12 +2152,12 @@ kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q
                             #error "Max3 requires PTX three-input max.f32 support on sm_100+"
                             #endif
                             asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_29) : "f"(_max3_24), "f"(_max3_25), "f"(_max3_26));
-                            float _max_4 = max_noftz(_max3_27, sv_split[63]);
+                            float _max_6 = max_noftz(_max3_27, sv_split[63]);
                             float _max3_30;
                             #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
                             #error "Max3 requires PTX three-input max.f32 support on sm_100+"
                             #endif
-                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_30) : "f"(_max3_28), "f"(_max3_29), "f"(_max_4));
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_30) : "f"(_max3_28), "f"(_max3_29), "f"(_max_6));
                             score_tile_max = _max3_30;
                         } else if (valid_sparse_cols != 0) {
                             asm volatile(
@@ -2249,13 +2313,16 @@ kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q
                                 "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
                                 "}"
                                 :: "r"(s_empty_addr + phase * 8), "r"(0) : "memory");
-                            float _max_5 = max_noftz(new_max, score_tile_max);
-                            new_max = _max_5;
+                            float _max_7 = max_noftz(new_max, score_tile_max);
+                            new_max = _max_7;
                             mbarrier_wait(split_pv_p_empty_addr + (phase) * 8, s_wait_phase ^ 1);
                             smem_softmax_warp_pair_exchange[phase * 128 + stats_row] = new_max;
                             asm volatile("barrier.sync %0, 64;" :: "r"(2 + warp % 2) : "memory");
-                            float _max_6 = max_noftz(new_max, smem_softmax_warp_pair_exchange[phase * 128 + (stats_row ^ 64)]);
-                            new_max = _max_6;
+                            float _max_8 = max_noftz(new_max, smem_softmax_warp_pair_exchange[phase * 128 + (stats_row ^ 64)]);
+                            new_max = _max_8;
+                            if (row_max_val > -CAKE_INF && (new_max - row_max_val) * softmax_scale_log2 <= 8.0f) {
+                                new_max = row_max_val;
+                            }
                         }
                         float _fma_0 = __fmaf_rn(row_max_val, softmax_scale_log2, (-new_max) * softmax_scale_log2);
                         float delta = _fma_0;
@@ -2666,8 +2733,8 @@ kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q
                 int mapped_query_idx_3 = source_work_z_3 * (unsigned int)max_q_len + (source_work_x_3 >> 1);
                 if (source_work_valid_3 != 0) {
                     {
-                        int _max_9 = ((sparse_topk_lens[mapped_query_idx_3] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_3] + sparse_topk_lens_offset) : (0));
-                        int _min_4 = ((_max_9) < (sparse_topk) ? (_max_9) : (sparse_topk));
+                        int _max_11 = ((sparse_topk_lens[mapped_query_idx_3] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_3] + sparse_topk_lens_offset) : (0));
+                        int _min_4 = ((_max_11) < (sparse_topk) ? (_max_11) : (sparse_topk));
                         int active_topk_3 = _min_4;
                         all_num_kv_tiles_3 = (active_topk_3 + 128 - 1) / 128;
                     }
@@ -2915,8 +2982,8 @@ kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q
                 int mapped_query_idx_4 = source_work_z_4 * (unsigned int)max_q_len + (source_work_x_4 >> 1);
                 if (source_work_valid_4 != 0) {
                     {
-                        int _max_2 = ((sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) : (0));
-                        int _min_2 = ((_max_2) < (sparse_topk) ? (_max_2) : (sparse_topk));
+                        int _max_4 = ((sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[mapped_query_idx_4] + sparse_topk_lens_offset) : (0));
+                        int _min_2 = ((_max_4) < (sparse_topk) ? (_max_4) : (sparse_topk));
                         int active_topk_4 = _min_2;
                         all_num_kv_tiles_4 = (active_topk_4 + 128 - 1) / 128;
                     }
@@ -3482,8 +3549,8 @@ kernel_cake_dsv4_47672f4f788af6361ad2(const __grid_constant__ CUtensorMap tmap_q
                 int pv_valid = source_work_z_5 * (unsigned int)max_q_len + (source_work_x_5 >> 1) < (unsigned int)num_query_tokens;
                 if (pv_valid != 0) {
                     int pv_query = source_work_z_5 * (unsigned int)max_q_len + (source_work_x_5 >> 1);
-                    int _max_10 = ((sparse_topk_lens[pv_query] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[pv_query] + sparse_topk_lens_offset) : (0));
-                    int _min_5 = ((_max_10) < (sparse_topk) ? (_max_10) : (sparse_topk));
+                    int _max_12 = ((sparse_topk_lens[pv_query] + sparse_topk_lens_offset) > (0) ? (sparse_topk_lens[pv_query] + sparse_topk_lens_offset) : (0));
+                    int _min_5 = ((_max_12) < (sparse_topk) ? (_max_12) : (sparse_topk));
                     int pv_active = _min_5;
                     int pv_tiles = (pv_active + 128 - 1) / 128;
                     int pv_first = 1;

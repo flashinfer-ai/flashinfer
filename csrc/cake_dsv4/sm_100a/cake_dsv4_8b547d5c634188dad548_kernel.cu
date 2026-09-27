@@ -1194,7 +1194,7 @@ __device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_dsv4_fe4fe30fb580f9145f28(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_k, const __grid_constant__ CUtensorMap tmap_compressed_k, const __grid_constant__ CUtensorMap tmap_swa_v, const __grid_constant__ CUtensorMap tmap_compressed_v, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int num_query_tokens, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int has_sinks, int total_work_items)
+kernel_cake_dsv4_8b547d5c634188dad548(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_swa_k, const __grid_constant__ CUtensorMap tmap_compressed_k, const __grid_constant__ CUtensorMap tmap_swa_v, const __grid_constant__ CUtensorMap tmap_compressed_v, __nv_bfloat16* __restrict__ O, float* __restrict__ partial_lse, int* __restrict__ swa_indices, int* __restrict__ compressed_indices, int* __restrict__ sparse_topk_lens, float* __restrict__ sinks, float* __restrict__ bmm1_scale, float* __restrict__ bmm2_scale, int num_heads, int num_query_tokens, int swa_index_stride, int compressed_index_stride, int sparse_topk_lens_offset, int sparse_topk, int has_sinks, int total_work_items)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1957,24 +1957,39 @@ kernel_cake_dsv4_fe4fe30fb580f9145f28(const __grid_constant__ CUtensorMap tmap_q
                                 : "r"(o_base_1 + c_1));
                             int gmem_base = output_offset + logical_slice * 64 + c_1;
                             #pragma unroll
-                            for (int j = 0; j < 32; j += 8) {
+                            for (int j = 0; j < 32; j += 16) {
                                 {
                                     const float2 _prescale2_1 = {inv_sum * output_scale, inv_sum * output_scale};
                                     #if __CUDA_ARCH__ >= 1000
                                     #pragma unroll
-                                    for (int _ps = 0; _ps < 4; _ps++)
+                                    for (int _ps = 0; _ps < 8; _ps++)
                                         mul_f32x2_inplace(&reinterpret_cast<float2*>(&_tmem_load_2[j])[_ps], _prescale2_1);
                                     #else
                                     #pragma unroll
-                                    for (int _ps = 0; _ps < 8; _ps++)
+                                    for (int _ps = 0; _ps < 16; _ps++)
                                         _tmem_load_2[j + _ps] *= inv_sum * output_scale;
                                     #endif
-                                    __nv_bfloat162 _pk[4];
-                                    _pk[0] = __floats2bfloat162_rn(_tmem_load_2[j + 0], _tmem_load_2[j + 1]);
-                                    _pk[1] = __floats2bfloat162_rn(_tmem_load_2[j + 2], _tmem_load_2[j + 3]);
-                                    _pk[2] = __floats2bfloat162_rn(_tmem_load_2[j + 4], _tmem_load_2[j + 5]);
-                                    _pk[3] = __floats2bfloat162_rn(_tmem_load_2[j + 6], _tmem_load_2[j + 7]);
-                                    *reinterpret_cast<uint4*>(&((__nv_bfloat16*)(O + (gmem_base + j)))[0]) = *reinterpret_cast<uint4*>(&_pk[0]);
+                                    {
+                                        __nv_bfloat162 _pk0 = __floats2bfloat162_rn(_tmem_load_2[j + 0], _tmem_load_2[j + 1]);
+                                        unsigned _pk_u0 = *reinterpret_cast<unsigned*>(&_pk0);
+                                        __nv_bfloat162 _pk1 = __floats2bfloat162_rn(_tmem_load_2[j + 2], _tmem_load_2[j + 3]);
+                                        unsigned _pk_u1 = *reinterpret_cast<unsigned*>(&_pk1);
+                                        __nv_bfloat162 _pk2 = __floats2bfloat162_rn(_tmem_load_2[j + 4], _tmem_load_2[j + 5]);
+                                        unsigned _pk_u2 = *reinterpret_cast<unsigned*>(&_pk2);
+                                        __nv_bfloat162 _pk3 = __floats2bfloat162_rn(_tmem_load_2[j + 6], _tmem_load_2[j + 7]);
+                                        unsigned _pk_u3 = *reinterpret_cast<unsigned*>(&_pk3);
+                                        __nv_bfloat162 _pk4 = __floats2bfloat162_rn(_tmem_load_2[j + 8], _tmem_load_2[j + 9]);
+                                        unsigned _pk_u4 = *reinterpret_cast<unsigned*>(&_pk4);
+                                        __nv_bfloat162 _pk5 = __floats2bfloat162_rn(_tmem_load_2[j + 10], _tmem_load_2[j + 11]);
+                                        unsigned _pk_u5 = *reinterpret_cast<unsigned*>(&_pk5);
+                                        __nv_bfloat162 _pk6 = __floats2bfloat162_rn(_tmem_load_2[j + 12], _tmem_load_2[j + 13]);
+                                        unsigned _pk_u6 = *reinterpret_cast<unsigned*>(&_pk6);
+                                        __nv_bfloat162 _pk7 = __floats2bfloat162_rn(_tmem_load_2[j + 14], _tmem_load_2[j + 15]);
+                                        unsigned _pk_u7 = *reinterpret_cast<unsigned*>(&_pk7);
+                                        asm volatile(
+                                            "st.global.v8.b32 [%0], {%1, %2, %3, %4, %5, %6, %7, %8};"
+                                            :: "l"((void*)(&((__nv_bfloat16*)(O + (gmem_base + j)))[0])), "r"(_pk_u0), "r"(_pk_u1), "r"(_pk_u2), "r"(_pk_u3), "r"(_pk_u4), "r"(_pk_u5), "r"(_pk_u6), "r"(_pk_u7) : "memory");
+                                    }
                                 }
                             }
                         }
