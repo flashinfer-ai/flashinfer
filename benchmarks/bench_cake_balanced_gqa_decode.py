@@ -18,11 +18,15 @@ Ragged and uniform decode batches (eight query heads per KV head, head
 dimension 128, 16-token pages) timed with CUPTI and a cold L2 between
 iterations, against ``trtllm_batch_decode_with_kv_cache(backend="trtllm-gen")``
 on the same tensors (``--with-trtllm``).  The AgentX rows reproduce the ragged
-KV pattern of flashinfer-ai/flashinfer#4832.
+KV pattern of flashinfer-ai/flashinfer#4832.  ``--production`` also times the
+production ``backend="cake"`` route (``cake_batch_decode_with_kv_cache`` with a
+caller-provided zero-initialized counter buffer, eager and CUDA-graph replay);
+with ``--with-trtllm`` the trtllm-gen arm then receives the same buffer, so
+neither arm pays a per-call zero-fill on the stream.
 
 Usage::
 
-    python benchmarks/bench_cake_balanced_gqa_decode.py [--with-trtllm] [--rows agentx_b16 ...]
+    python benchmarks/bench_cake_balanced_gqa_decode.py [--with-trtllm] [--production] [--rows agentx_b16 ...]
 """
 
 import argparse
@@ -31,6 +35,10 @@ import math
 
 import torch
 
+from flashinfer.cake_fmha import (
+    cake_batch_decode_with_kv_cache,
+    cake_fmha_balanced_counter_bytes,
+)
 from flashinfer.decode import (
     prepare_balanced_batch_decode_with_kv_cache,
     trtllm_batch_decode_with_kv_cache,
@@ -42,6 +50,10 @@ from flashinfer.experimental.balanced_gqa_decode.cake_backend import (
     balanced_gqa_decode_workspace_size,
 )
 from flashinfer.testing import bench_gpu_time_with_cupti
+from flashinfer.utils import (
+    get_device_sm_count,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
+)
 
 AGENTX = [
     8193,
@@ -131,8 +143,10 @@ def _bytes(seq_lens, num_kv_heads, q_len):
     return kv + 2 * q
 
 
-def _median_ms(fn):
-    times = bench_gpu_time_with_cupti(fn, cold_l2_cache=True)
+def _median_ms(fn, use_cuda_graph=False):
+    times = bench_gpu_time_with_cupti(
+        fn, cold_l2_cache=True, use_cuda_graph=use_cuda_graph
+    )
     times = sorted(times)
     return float(times[len(times) // 2])
 
@@ -141,6 +155,11 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rows", nargs="*", default=list(ROWS))
     parser.add_argument("--with-trtllm", action="store_true")
+    parser.add_argument(
+        "--production",
+        action="store_true",
+        help="also time the production backend='cake' route (eager + graph replay)",
+    )
     parser.add_argument("--json", default=None)
     args = parser.parse_args()
     device = torch.device("cuda", 0)
@@ -148,12 +167,22 @@ def main():
         balanced_gqa_decode_workspace_size(device), dtype=torch.uint8, device=device
     )
     trtllm_workspace = torch.zeros(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    cake_workspace = (
+        torch.zeros(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+        if args.production
+        else None
+    )
+    sm_count = get_device_sm_count(device)
     sm_scale = HEAD_DIM**-0.5
     results = []
     print(f"{torch.cuda.get_device_name(device)}, {len(args.rows)} rows")
     header = f"{'row':<30}{'balanced ms':>13}{'TFLOP/s':>9}{'GB/s':>8}"
+    if args.production:
+        header += f"{'cake ms':>10}{'cake graph':>11}"
     if args.with_trtllm:
         header += f"{'trtllm-gen ms':>15}{'speedup':>9}"
+        if args.production:
+            header += f"{'cake spd':>9}"
     print(header)
     for name in args.rows:
         seq_lens, num_kv_heads, q_len = ROWS[name]
@@ -183,8 +212,54 @@ def main():
             gbps=_bytes(seq_lens, num_kv_heads, q_len) / ms / 1e6,
         )
         line = f"{name:<30}{ms:>13.4f}{row['tflops']:>9.1f}{row['gbps']:>8.0f}"
-        if args.with_trtllm:
+        kv_cache = None
+        counter_buffer = None
+        if args.production or args.with_trtllm:
             kv_cache = torch.stack([k_cache, v_cache], dim=1).contiguous()
+        if args.production:
+            # One zero-initialized buffer for both production arms: the
+            # kernels reset their counters in-kernel, so it is reused as is.
+            counter_buffer = torch.zeros(
+                max(
+                    get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                        len(seq_lens), GROUP_RATIO * num_kv_heads, sm_count
+                    ),
+                    cake_fmha_balanced_counter_bytes(sm_count, q_len),
+                ),
+                dtype=torch.uint8,
+                device=device,
+            )
+            production_out = torch.empty_like(query)
+
+            def _production():
+                cake_batch_decode_with_kv_cache(
+                    query,
+                    kv_cache,
+                    cake_workspace,
+                    block_tables,
+                    seq_lens_dev,
+                    max(seq_lens),
+                    bmm1_scale=sm_scale,
+                    bmm2_scale=1.0,
+                    out=production_out,
+                    kv_layout="HND",
+                    q_len_per_req=q_len,
+                    multi_ctas_kv_counter_buffer=counter_buffer,
+                )
+
+            _production()
+            torch.cuda.synchronize()
+            production_ms = _median_ms(_production)
+            production_graph_ms = _median_ms(_production, use_cuda_graph=True)
+            row.update(
+                production_ms=production_ms,
+                production_graph_ms=production_graph_ms,
+                max_abs_diff_production_vs_balanced=(
+                    (production_out.float() - out.float()).abs().max().item()
+                ),
+            )
+            line += f"{production_ms:>10.4f}{production_graph_ms:>11.4f}"
+        if args.with_trtllm:
             trtllm_out = torch.empty_like(query)
 
             def _trtllm():
@@ -200,6 +275,7 @@ def main():
                     out=trtllm_out,
                     backend="trtllm-gen",
                     q_len_per_req=q_len,
+                    multi_ctas_kv_counter_buffer=counter_buffer,
                 )
 
             _trtllm()
@@ -212,6 +288,12 @@ def main():
                 max_abs_diff_vs_trtllm=max_diff,
             )
             line += f"{trtllm_ms:>15.4f}{trtllm_ms / ms:>9.3f}"
+            if args.production:
+                row["production_speedup"] = trtllm_ms / row["production_ms"]
+                row["max_abs_diff_production_vs_trtllm"] = (
+                    (production_out.float() - trtllm_out.float()).abs().max().item()
+                )
+                line += f"{row['production_speedup']:>9.3f}"
         print(line)
         results.append(row)
         torch.cuda.empty_cache()
@@ -227,6 +309,12 @@ def main():
         print(
             f"geomean speedup vs trtllm-gen: {math.exp(sum(map(math.log, speedups)) / len(speedups)):.3f}"
         )
+        if args.production:
+            prod = [r["production_speedup"] for r in results]
+            print(
+                f"geomean production backend='cake' speedup vs trtllm-gen: "
+                f"{math.exp(sum(map(math.log, prod)) / len(prod)):.3f}"
+            )
 
 
 if __name__ == "__main__":
