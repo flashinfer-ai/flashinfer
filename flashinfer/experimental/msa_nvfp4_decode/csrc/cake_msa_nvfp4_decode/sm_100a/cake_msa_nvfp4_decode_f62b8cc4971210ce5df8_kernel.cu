@@ -104,6 +104,19 @@ __device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count
 }
 
 
+__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
+    uint32_t token;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, P1;\n\t"
+        "}\n"
+        : "=r"(token)
+        : "r"(mbar_addr), "r"(phase) : "memory");
+    return token;
+}
+
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
     uint32_t token;
     asm volatile(
@@ -335,7 +348,7 @@ __device__ __forceinline__ void fence_async_shared() {
 extern "C" {
 
 __global__ __launch_bounds__(128, 1) __cluster_dims__(8,1,1) void
-kernel_cake_msa_nvfp4_decode_4ccf4bb3f41cf8a00195(__nv_bfloat16* __restrict__ Q, uint8_t* __restrict__ K, uint8_t* __restrict__ K_scale, uint8_t* __restrict__ V, uint8_t* __restrict__ V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages, int k_page_stride, int k_head_stride, int ks_page_stride, int ks_head_stride, int v_page_stride, int v_head_stride, int vs_page_stride, int vs_head_stride)
+kernel_cake_msa_nvfp4_decode_f62b8cc4971210ce5df8(__nv_bfloat16* __restrict__ Q, uint8_t* __restrict__ K, uint8_t* __restrict__ K_scale, uint8_t* __restrict__ V, uint8_t* __restrict__ V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages, int k_page_stride, int k_head_stride, int ks_page_stride, int ks_head_stride, int v_page_stride, int v_head_stride, int vs_page_stride, int vs_head_stride)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -343,7 +356,8 @@ kernel_cake_msa_nvfp4_decode_4ccf4bb3f41cf8a00195(__nv_bfloat16* __restrict__ Q,
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
 
     const int mbar_base = smem;
     #define part_ready_addr (mbar_base + 0)
@@ -626,37 +640,31 @@ kernel_cake_msa_nvfp4_decode_4ccf4bb3f41cf8a00195(__nv_bfloat16* __restrict__ Q,
         long long vs_off = phys64 * (long long)vs_page_stride + (long long)(ph_head * vs_head_stride);
         if (active != 0) {
             {
-                const uint4* _ivptr_0 = reinterpret_cast<const uint4*>(K + k_off + (long long)(((tok0 + lane_1 % 8) * 4 + lane_1 / 8) * 16));
-                uint4 _ivld_0;
-                _ivld_0 = *_ivptr_0;
-                raw_k[0 + 0] = _ivld_0.x;
-                raw_k[0 + 1] = _ivld_0.y;
-                raw_k[0 + 2] = _ivld_0.z;
-                raw_k[0 + 3] = _ivld_0.w;
+                uint4 _uv4_0 = *reinterpret_cast<const uint4*>(K + k_off + (long long)(((tok0 + lane_1 % 8) * 4 + lane_1 / 8) * 16));
+                raw_k[0 + 0] = _uv4_0.x;
+                raw_k[0 + 1] = _uv4_0.y;
+                raw_k[0 + 2] = _uv4_0.z;
+                raw_k[0 + 3] = _uv4_0.w;
             }
             {
                 sw_k[0] = *reinterpret_cast<const int*>(K_scale + ks_off + (long long)((tok0 + lane_1 % 8) * 8 + lane_1 / 8 / 2 * 4));
             }
             {
-                const uint4* _ivptr_1 = reinterpret_cast<const uint4*>(K + k_off + (long long)(((tok0 + (8 + lane_1 % 8)) * 4 + lane_1 / 8) * 16));
-                uint4 _ivld_1;
-                _ivld_1 = *_ivptr_1;
-                raw_k[4 + 0] = _ivld_1.x;
-                raw_k[4 + 1] = _ivld_1.y;
-                raw_k[4 + 2] = _ivld_1.z;
-                raw_k[4 + 3] = _ivld_1.w;
+                uint4 _uv4_1 = *reinterpret_cast<const uint4*>(K + k_off + (long long)(((tok0 + (8 + lane_1 % 8)) * 4 + lane_1 / 8) * 16));
+                raw_k[4 + 0] = _uv4_1.x;
+                raw_k[4 + 1] = _uv4_1.y;
+                raw_k[4 + 2] = _uv4_1.z;
+                raw_k[4 + 3] = _uv4_1.w;
             }
             {
                 sw_k[1] = *reinterpret_cast<const int*>(K_scale + ks_off + (long long)((tok0 + (8 + lane_1 % 8)) * 8 + lane_1 / 8 / 2 * 4));
             }
             {
-                const uint4* _ivptr_2 = reinterpret_cast<const uint4*>(V + v_off + (long long)(((tok0 + lane_1 % 8) * 4 + lane_1 / 8) * 16));
-                uint4 _ivld_2;
-                _ivld_2 = *_ivptr_2;
-                raw_v[0 + 0] = _ivld_2.x;
-                raw_v[0 + 1] = _ivld_2.y;
-                raw_v[0 + 2] = _ivld_2.z;
-                raw_v[0 + 3] = _ivld_2.w;
+                uint4 _uv4_2 = *reinterpret_cast<const uint4*>(V + v_off + (long long)(((tok0 + lane_1 % 8) * 4 + lane_1 / 8) * 16));
+                raw_v[0 + 0] = _uv4_2.x;
+                raw_v[0 + 1] = _uv4_2.y;
+                raw_v[0 + 2] = _uv4_2.z;
+                raw_v[0 + 3] = _uv4_2.w;
             }
             {
                 const int2* _ivptr_3 = reinterpret_cast<const int2*>(V_scale + vs_off + (long long)(((tok0 + lane_1 % 8) / 4 * 4 + lane_1 / 8) * 8));
@@ -666,13 +674,11 @@ kernel_cake_msa_nvfp4_decode_4ccf4bb3f41cf8a00195(__nv_bfloat16* __restrict__ Q,
                 sw_v[0 + 1] = _ivld_3.y;
             }
             {
-                const uint4* _ivptr_4 = reinterpret_cast<const uint4*>(V + v_off + (long long)(((tok0 + (8 + lane_1 % 8)) * 4 + lane_1 / 8) * 16));
-                uint4 _ivld_4;
-                _ivld_4 = *_ivptr_4;
-                raw_v[4 + 0] = _ivld_4.x;
-                raw_v[4 + 1] = _ivld_4.y;
-                raw_v[4 + 2] = _ivld_4.z;
-                raw_v[4 + 3] = _ivld_4.w;
+                uint4 _uv4_4 = *reinterpret_cast<const uint4*>(V + v_off + (long long)(((tok0 + (8 + lane_1 % 8)) * 4 + lane_1 / 8) * 16));
+                raw_v[4 + 0] = _uv4_4.x;
+                raw_v[4 + 1] = _uv4_4.y;
+                raw_v[4 + 2] = _uv4_4.z;
+                raw_v[4 + 3] = _uv4_4.w;
             }
             {
                 const int2* _ivptr_5 = reinterpret_cast<const int2*>(V_scale + vs_off + (long long)(((tok0 + (8 + lane_1 % 8)) / 4 * 4 + lane_1 / 8) * 8));

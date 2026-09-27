@@ -126,6 +126,19 @@ __device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count
 }
 
 
+__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
+    uint32_t token;
+    asm volatile(
+        "{\n\t"
+        ".reg .pred P1;\n\t"
+        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
+        "selp.u32 %0, 1, 0, P1;\n\t"
+        "}\n"
+        : "=r"(token)
+        : "r"(mbar_addr), "r"(phase) : "memory");
+    return token;
+}
+
 __device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
     uint32_t token;
     asm volatile(
@@ -579,6 +592,7 @@ __device__ __forceinline__ float2 mul_f32x2_noftz(float2 a, float2 b) {
     return r;
 }
 
+
 // ex2_emulation_f32x2 defined in softmax_frag_exp2_cast helper (or standalone)
 
 __device__ __forceinline__ float2 add_f32x2_rn_noftz(float2 a, float2 b) {
@@ -1028,7 +1042,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) __cluster_dims__(4,1,1) void
-kernel_cake_msa_nvfp4_decode_f996a9dd751808dedee4(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
+kernel_cake_msa_nvfp4_decode_22cdb6a3cdd3ffc233f9(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap K_scale, const __grid_constant__ CUtensorMap V, const __grid_constant__ CUtensorMap V_scale, __nv_bfloat16* __restrict__ O, float* __restrict__ msa_lse, float* __restrict__ partial_O, float* __restrict__ partial_M, float* __restrict__ partial_D, int* __restrict__ split_completion, int* __restrict__ kv_indices, int* __restrict__ kv_indptr, int* __restrict__ task_kind, int* __restrict__ task_request, int* __restrict__ task_kv_head, int total_q, int seqlen_q, int num_q_heads, int num_kv_heads, float softmax_scale_log2, float output_scale, int msa_max_pages)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1433,6 +1447,10 @@ kernel_cake_msa_nvfp4_decode_f996a9dd751808dedee4(const __grid_constant__ CUtens
                 if (npairs > 0) {
                     mbarrier_wait(pv_done_addr + (npairs - 1) * 8, item_par);
                     asm volatile("tcgen05.fence::after_thread_sync;");
+                }
+                #pragma unroll
+                for (int s8 = 0; s8 < 8; s8++) {
+                    mbarrier_wait(pv_done_addr + (s8) * 8, item_par);
                 }
                 float o_epi[16];
                 #pragma unroll
