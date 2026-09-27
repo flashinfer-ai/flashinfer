@@ -147,3 +147,40 @@ bitwise reproducible. Kernel time at this scale (10-170 us) also depends on
 the kernel that ran immediately before it -- for this kernel and for the
 CuTe-DSL baseline alike -- so the published comparisons measure each kernel
 back-to-back with a cold L2 before every sample.
+
+## Where the time goes (second optimisation round, 2026-09)
+
+A second optimisation round on the shipped kernel attributed its remaining gap
+to the roofline on B200 and GB300 and adopted no change; this section records
+the result so that the host plan's choices stay traceable.
+
+* Roofline: every one of the 24 benchmark rows sits at 14-57 % of the HBM /
+  dense-tensor roofline on both GPUs (tightest row `fp8_h128_w8_b16_q1_s32k`:
+  2.8 us roofline against 18.6 / 20.1 us measured). The rows are bound by fixed
+  costs, not by bandwidth or tensor throughput.
+* Fixed costs of the tightest row (GB300 / B200, cold L2): Q and the first K
+  tile are issued at 1.2-1.3 us and land at 3.4-3.5 us (page-table and TLB
+  misses on a flushed L2); the first QK MMA runs at 3.9 / 4.4 us; the epilogue
+  costs 1.5-1.7 us per unit; the in-kernel merge finishes 0.6 us after the last
+  partial; 2.4-3.2 us separate the last store from the kernel end, of which a
+  trivial kernel's launch + exit floor is 1.25-1.30 us and the rest is the
+  cluster / tensor-memory teardown (nothing runs after the last store).
+* Rejected with measurements (both GPUs, same-tree A/B): issuing the extra
+  clusters' Q / K loads before the unit token (-5 / -6 % on
+  `fp8_h128_w8_b16_q1_s32k`: the load warp blocks in the TMA issue queue and
+  delays the token), hoisting the partition pass's loads to kernel entry
+  (-1 %), a two-round pipelined O epilogue (GB300 within noise, B200 FP8 rows
+  -1..-4 %), and an in-kernel last-arriver merge in place of the reduce kernel
+  (-4..-9 % on every split row: one cluster folds every partial of an item
+  through one SM pair's L2 path while the reduce kernel spreads an item over
+  eight CTAs and overlaps with the main kernel through PDL).
+* Host plan: `unit_min` 2 / 4 / 8 is neutral. Smaller static units gain 4-13 %
+  on the ragged-query `mtp3` benchmark rows (`h96_w8_b32_mtp3_s32k`,
+  `h48_w4_b32_mtp3_s32k`) because a request with fewer than `max_q_len` query
+  tokens leaves its second 128-row tile empty, so about a third of the items
+  carry no work and more clusters are free at launch. With uniform query
+  lengths (`benchmarks/bench_cake_mla_varq_dcp_decode.py --q-pattern uniform`,
+  the regime in which every request carries the same number of draft tokens)
+  the same static units lose 5-9 %, and the plan cannot tell the two cases
+  apart from host-known scalars (`cum_seq_lens_q` stays on the device). The
+  shipped rule keeps the uniform-query optimum.
