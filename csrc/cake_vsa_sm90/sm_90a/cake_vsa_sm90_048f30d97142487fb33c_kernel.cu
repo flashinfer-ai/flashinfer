@@ -365,7 +365,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(128, 4) void
-kernel_cake_vsa_sm90_63e1e59f8bc87361a0f1(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2)
+kernel_cake_vsa_sm90_048f30d97142487fb33c(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -382,6 +382,8 @@ kernel_cake_vsa_sm90_63e1e59f8bc87361a0f1(const __grid_constant__ CUtensorMap Q,
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // Kernel setup ops
     __nv_bfloat16* q_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
@@ -413,12 +415,15 @@ kernel_cake_vsa_sm90_63e1e59f8bc87361a0f1(const __grid_constant__ CUtensorMap Q,
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Q))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&K))) : "memory"); }
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Vt))) : "memory"); }
-    int tile = bid;
+    int item = bid;
     int mb = seqlen_q / 64;
+    int plan_base = item * 2;
+    int meta = plan[plan_base];
+    int cnt = meta;
+    int tile = item;
+    int blk_base = plan_base + 1;
     int head = tile / mb;
     int qb = tile - head * mb;
-    int plan_base = tile * 2;
-    int cnt = plan[plan_base];
     int q_row = head * seqlen_q + qb * 64;
     int kv_base = head * seqlen_k;
     if (warp == 0) {
@@ -426,7 +431,7 @@ kernel_cake_vsa_sm90_63e1e59f8bc87361a0f1(const __grid_constant__ CUtensorMap Q,
             mbarrier_arrive_expect_tx(q_full_addr, 16384);
             tma_3d_gmem2smem(q_smem_addr, (&Q), 0, q_row, 0, q_full_addr);
             if (cnt > 0) {
-                int blk = plan[plan_base + 1];
+                int blk = plan[blk_base];
                 int blk_row = kv_base + blk * 64;
                 mbarrier_arrive_expect_tx(k_full0_addr, 16384);
                 tma_3d_gmem2smem(k_smem_addr, (&K), 0, blk_row, 0, k_full0_addr);
@@ -753,6 +758,7 @@ kernel_cake_vsa_sm90_63e1e59f8bc87361a0f1(const __grid_constant__ CUtensorMap Q,
     row_sum1 += _shfl_xor_6;
     float _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, row_sum1, 1);
     row_sum1 += _shfl_xor_7;
+    int qj = lane & 3;
     float _rcp_0 = approx_rcp(row_sum0);
     float _rcp_1 = approx_rcp(row_sum1);
     d_o[0] = d_o[0] * _rcp_0;
@@ -819,7 +825,6 @@ kernel_cake_vsa_sm90_63e1e59f8bc87361a0f1(const __grid_constant__ CUtensorMap Q,
     d_o[59] = d_o[59] * _rcp_1;
     d_o[62] = d_o[62] * _rcp_1;
     d_o[63] = d_o[63] * _rcp_1;
-    int qj = lane & 3;
     int qj1 = qj & 1;
     int qj2 = qj & 2;
     unsigned int o_vec[4];

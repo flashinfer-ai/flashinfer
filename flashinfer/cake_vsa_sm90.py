@@ -25,10 +25,16 @@ positional encoding / logits soft cap.
 Two kernels serve the contract.  Small problems (at most 6 selected KV blocks
 per query block, a grid that fits one wave, a plan that fits the kernel
 parameter budget; :func:`small_route`) run the *small-selection* kernel: one
-128-thread CTA per query block whose plan (``[count, blk...]`` int16 halfwords,
-:func:`plan_small`) travels in the launch parameters, so no metadata upload
-and no dependent global load precede the K/V loads.  Everything else runs the
-persistent kernel: the plan (:func:`plan_vsa_sm90`) is uploaded once as a
+128-thread CTA per query block whose plan (``[meta, qtile, blk...]`` int16
+halfwords, :func:`plan_small`) travels in the launch parameters, so no metadata
+upload and no dependent global load precede the K/V loads.  Grids too small for
+the persistent kernel's two warpgroups per CTA (``2 * tiles <= SMs``) take the
+kernel's *split-KV* variant: a query block's selection is sliced across
+``ceil(count / KMAX)`` CTAs (``meta = count | split << 4 | nsplit << 10``);
+each slice publishes its FP32 accumulator and row statistics to a plan-owned
+workspace and the last-arriving CTA merges them in slice order and resets the
+arrival counter (:func:`split_kmax` picks the variant).  Everything else runs
+the persistent kernel: the plan (:func:`plan_vsa_sm90`) is uploaded once as a
 per-CTA list of *tiles* (``grid = min(tiles, SMs)``).  A tile is either one
 64-row query block whose KV list alternates between the two consumer
 warpgroups (``split``) or two query blocks of one head that share the KV ring
@@ -84,6 +90,21 @@ SMALL_OCCUPANCY = {
     6: 1,
 }  # CTAs per SM on H100 (49/113/145/209 KB SMEM)
 PLAN_HALFWORDS = 1750  # int16 elements of the by-value plan parameter (3500 B)
+PLAN_META_UNSPLIT = 1  # unsplit rows: [count, blk...] per query block
+PLAN_META_SPLIT = 2  # split rows: [meta, qtile, blk...] per item
+MAX_NSPLIT = 31  # nsplit field of ``meta`` (bits 10..14 keep the int16 sign clear)
+SMALL_ITEM_ELEMS = BLOCK * HEAD_DIM  # BF16 partial accumulator per split item
+SMALL_STATS_FLOATS = 2 * BLOCK  # (max, sum) per row per split item
+# Split-KV cost model (relative units): one KV block through the single
+# warpgroup chain vs. one extra slice merged by the last CTA (fitted on H100,
+# CAKE-671).  Same constants as the Cake planner (``vsa_sm90_small``).
+SPLIT_BLOCK_COST = 1.0
+SPLIT_MERGE_COST = 0.8
+
+
+def plan_meta(split: bool) -> int:
+    """Halfwords before the block ids in one plan row of the given kernel family."""
+    return PLAN_META_SPLIT if split else PLAN_META_UNSPLIT
 
 
 def small_kmax_for(capacity: int) -> int:
@@ -96,28 +117,85 @@ def small_kmax_for(capacity: int) -> int:
     )
 
 
-def small_route(block_mask: torch.Tensor, *, sms: int) -> Optional[int]:
-    """KMAX of the small kernel when the problem should take the small route, else ``None``.
+def split_kmax(counts: list[int], *, sms: Optional[int] = None) -> int:
+    """KMAX of the split-KV variant for the per-query-block selection ``counts``.
 
-    Rule: every query block selects at most ``SMALL_KMAX_VARIANTS[-1]`` KV blocks,
-    the whole grid fits one wave of the chosen variant (``tiles <= occupancy *
-    SMs``) and the plan fits the by-value parameter (``tiles * (kmax + 1) <=
-    PLAN_HALFWORDS``); everything larger goes to the persistent pair/split kernel.
+    Variants whose item count fits one wave (when ``sms`` is given) and whose
+    plan fits the parameter bank are ranked by ``kmax * SPLIT_BLOCK_COST +
+    (max_nsplit - 1) * SPLIT_MERGE_COST``; the cheapest wins (largest kmax on
+    ties).  Raises when no variant fits.  Mirrors ``vsa_sm90_small.split_kmax``.
+    """
+    best = None
+    for kmax in SMALL_KMAX_VARIANTS:
+        nsplits = [max(1, -(-c // kmax)) for c in counts]
+        items = sum(nsplits)
+        if (
+            max(nsplits) > MAX_NSPLIT
+            or items * (kmax + PLAN_META_SPLIT) > PLAN_HALFWORDS
+        ):
+            continue
+        if sms is not None and items > SMALL_OCCUPANCY[kmax] * sms:
+            continue
+        cost = kmax * SPLIT_BLOCK_COST + (max(nsplits) - 1) * SPLIT_MERGE_COST
+        if best is None or cost <= best[0]:
+            best = (cost, kmax)
+    if best is None:
+        raise ValueError("no split-KV variant fits this selection in one wave")
+    return best[1]
+
+
+def small_route(block_mask: torch.Tensor, *, sms: int) -> Optional[tuple[int, bool]]:
+    """``(kmax, split)`` when the problem should take a small-kernel route, else ``None``.
+
+    Unsplit rule: every query block selects at most ``SMALL_KMAX_VARIANTS[-1]``
+    KV blocks, the whole grid fits one wave of the chosen variant (``tiles <=
+    occupancy * SMs``) and the plan fits the by-value parameter.  Split rule
+    (tried when the unsplit rule fails): the grid is too small for the
+    persistent kernel's two consumer warpgroups per CTA (``2 * tiles <= SMs``)
+    and :func:`split_kmax` finds a one-wave variant.  Everything larger goes to
+    the persistent pair/split kernel.  Mirrors ``vsa_sm90_small.small_route``.
     """
     mask = block_mask.to("cpu", torch.bool)
     h, mb, _nb = mask.shape
-    capacity = int(mask.sum(dim=-1).max())
-    if capacity > SMALL_KMAX_VARIANTS[-1]:
-        return None
-    kmax = small_kmax_for(capacity)
-    if h * mb > SMALL_OCCUPANCY[kmax] * sms or h * mb * (kmax + 1) > PLAN_HALFWORDS:
-        return None
-    return kmax
+    counts = mask.sum(dim=-1).reshape(-1).tolist()
+    capacity = max(counts)
+    tiles = h * mb
+    if capacity <= SMALL_KMAX_VARIANTS[-1]:
+        kmax = small_kmax_for(capacity)
+        if (
+            tiles <= SMALL_OCCUPANCY[kmax] * sms
+            and tiles * (kmax + PLAN_META_UNSPLIT) <= PLAN_HALFWORDS
+        ):
+            return kmax, False
+    if 2 * tiles <= sms:
+        try:
+            return split_kmax(counts, sms=sms), True
+        except ValueError:
+            return None
+    return None
 
 
-def plan_small(block_mask: torch.Tensor, *, kmax: Optional[int] = None) -> dict:
-    """Per-tile plan rows ``[count, blk0, ...]`` as int16 halfwords (``kmax + 1`` per tile).
+def _balanced_chunks(ids: list[int], nsplit: int) -> list[list[int]]:
+    """Split ``ids`` into ``nsplit`` contiguous chunks whose sizes differ by at most one."""
+    n = len(ids)
+    base, extra = divmod(n, nsplit)
+    out, pos = [], 0
+    for j in range(nsplit):
+        size = base + (1 if j < extra else 0)
+        out.append(ids[pos : pos + size])
+        pos += size
+    return out
 
+
+def plan_small(
+    block_mask: torch.Tensor, *, kmax: Optional[int] = None, split: bool = False
+) -> dict:
+    """Plan rows as int16 halfwords: ``[count, blk...]`` per tile (unsplit) or ``[meta, qtile, blk...]`` per item (split).
+
+    Without ``split`` every query block is one item (``nsplit = 1``) and
+    ``kmax`` must hold the largest selection.  With ``split`` a query block
+    whose selection exceeds ``kmax`` becomes ``ceil(count / kmax)`` items of
+    nearly equal size, merged on the device by the last-arriving CTA.
     Returns the CPU int16 ``plan`` of exactly ``PLAN_HALFWORDS`` elements (the
     by-value kernel parameter, ``-1`` padded), or raises when the problem does
     not fit.  Byte-identical to the Cake planner (``vsa_sm90_small.plan_small``).
@@ -132,23 +210,48 @@ def plan_small(block_mask: torch.Tensor, *, kmax: Optional[int] = None) -> dict:
     if bool((counts == 0).any()):
         raise ValueError("every query block must select at least one KV block")
     capacity = int(counts.max())
-    kmax = small_kmax_for(capacity) if kmax is None else int(kmax)
-    if kmax not in SMALL_KMAX_VARIANTS or kmax < capacity:
+    flat_counts = counts.reshape(-1).tolist()
+    if kmax is None:
+        kmax = small_kmax_for(capacity) if not split else split_kmax(flat_counts)
+    kmax = int(kmax)
+    if kmax not in SMALL_KMAX_VARIANTS:
+        raise ValueError(
+            f"kmax={kmax} is not a compiled small-kernel variant {SMALL_KMAX_VARIANTS}"
+        )
+    if not split and kmax < capacity:
         raise ValueError(f"kmax={kmax} cannot hold {capacity} blocks per tile")
     tiles = h * mb
-    stride = kmax + 1
-    if tiles * stride > PLAN_HALFWORDS:
+    if tiles > 32767:
+        raise ValueError("query-block ids must fit int16")
+    meta_halfwords = plan_meta(split)
+    stride = kmax + meta_halfwords
+    nsplits = [max(1, -(-c // kmax)) for c in flat_counts]
+    if max(nsplits) > MAX_NSPLIT:
         raise ValueError(
-            f"{tiles} tiles x {stride} halfwords exceed the {PLAN_HALFWORDS}-halfword plan parameter"
+            f"a query block needs {max(nsplits)} slices; the plan encodes at most {MAX_NSPLIT}"
         )
-    order = torch.argsort(~mask, dim=-1, stable=True)[..., :capacity]
-    valid = torch.arange(capacity) < counts.unsqueeze(-1)
-    ids = torch.where(valid, order, -1).to(torch.int16)
-    rows = torch.full((tiles, stride), -1, dtype=torch.int16)
-    rows[:, 0] = counts.reshape(-1).to(torch.int16)
-    rows[:, 1 : 1 + capacity] = ids.reshape(tiles, capacity)
+    num_items = sum(nsplits)
+    if num_items * stride > PLAN_HALFWORDS:
+        raise ValueError(
+            f"{num_items} items x {stride} halfwords exceed the {PLAN_HALFWORDS}-halfword plan parameter"
+        )
+    order = torch.argsort(~mask, dim=-1, stable=True).reshape(tiles, nb)
+    rows = torch.full((num_items, stride), -1, dtype=torch.int16)
+    item = 0
+    for tile in range(tiles):
+        ids = order[tile, : flat_counts[tile]].tolist()
+        for j, chunk in enumerate(_balanced_chunks(ids, nsplits[tile])):
+            if split:
+                rows[item, 0] = len(chunk) | (j << 4) | (nsplits[tile] << 10)
+                rows[item, 1] = tile
+            else:
+                rows[item, 0] = len(chunk)
+            rows[item, meta_halfwords : meta_halfwords + len(chunk)] = torch.tensor(
+                chunk, dtype=torch.int16
+            )
+            item += 1
     plan = torch.full((PLAN_HALFWORDS,), -1, dtype=torch.int16)
-    plan[: tiles * stride] = rows.reshape(-1)
+    plan[: num_items * stride] = rows.reshape(-1)
     return {
         "plan": plan,
         "H": h,
@@ -157,12 +260,12 @@ def plan_small(block_mask: torch.Tensor, *, kmax: Optional[int] = None) -> dict:
         "capacity": capacity,
         "kmax": kmax,
         "num_tiles": tiles,
+        "num_items": num_items,
+        "max_nsplit": max(nsplits),
+        "split": max(nsplits) > 1,
+        "stride": stride,
+        "meta_halfwords": meta_halfwords,
     }
-
-
-# ---------------------------------------------------------------------------
-# Host planner (port of loom/examples/weave/vsa_sm90_bf16.py::plan_vsa_sm90)
-# ---------------------------------------------------------------------------
 
 
 def _order_union_rounds(a: list[int], b: list[int]) -> tuple[list[int], list[int]]:
@@ -577,7 +680,7 @@ class CakeVsaSm90Plan:
         non_blocking: bool = True,
         route: Optional[str] = None,
     ):
-        """``route`` ``None`` applies :func:`small_route`; ``"small"`` / ``"persistent"`` force one kernel."""
+        """``route`` ``None`` applies :func:`small_route`; ``"small"`` / ``"smallsplit"`` / ``"persistent"`` force one kernel."""
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("cake (SM90) requires a CUDA device")
@@ -612,27 +715,62 @@ class CakeVsaSm90Plan:
         self.scale_log2 = scale * LOG2E
         props = torch.cuda.get_device_properties(self.device)
         sms = int(props.multi_processor_count)
-        if route not in (None, "small", "persistent"):
+        if route not in (None, "small", "smallsplit", "persistent"):
             raise ValueError(
-                f"unknown route {route!r}; expected None, 'small' or 'persistent'"
+                f"unknown route {route!r}; expected None, 'small', 'smallsplit' or 'persistent'"
             )
-        small_kmax = small_route(block_mask_map, sms=sms) if route is None else None
-        if route == "small":
-            small_kmax = small_kmax_for(int(block_mask_map.to("cpu").sum(dim=-1).max()))
+        small: Optional[tuple[int, bool]] = None
+        if route is None:
+            small = small_route(block_mask_map, sms=sms)
+        elif route == "small":
+            small = (
+                small_kmax_for(int(block_mask_map.to("cpu").sum(dim=-1).max())),
+                False,
+            )
+        elif route == "smallsplit":
+            counts = block_mask_map.to("cpu").sum(dim=-1).reshape(-1).tolist()
+            small = (split_kmax(counts), True)
         self.captured = False
-        self.small_kmax: Optional[int] = small_kmax
-        if small_kmax is not None:
-            plan = plan_small(block_mask_map, kmax=small_kmax)
-            self.mode = "small"
+        self.small_kmax: Optional[int] = None if small is None else small[0]
+        self.small_split = False
+        if small is not None:
+            plan = plan_small(block_mask_map, kmax=small[0], split=small[1])
+            self.small_split = bool(plan["split"])
+            self.mode = "smallsplit" if self.small_split else "small"
             self.num_tiles = plan["num_tiles"]
-            self.num_ctas = plan["num_tiles"]
+            self.num_items = plan["num_items"]
+            self.num_ctas = plan["num_items"]
             self.tile_stride = 0
             self.num_heads = plan["H"]
             self.qo_len = plan["MB"] * BLOCK
             self.kv_len = plan["NB"] * BLOCK
             # The plan is a launch parameter (CPU int16): nothing is uploaded,
-            # so there is no stream dependency and a captured graph replays it.
+            # so an unsplit plan has no stream dependency and a captured graph
+            # replays it.  A split plan owns device workspace whose arrival
+            # counters must be zero before the first run (``ready``); the
+            # kernel leaves them zero, so replays need no host reset.  One run
+            # per plan may be in flight at a time.
             self.plan_param = plan["plan"].contiguous()
+            if self.small_split:
+                with torch.cuda.device(self.device):
+                    self.partial_o = torch.empty(
+                        (self.num_items * SMALL_ITEM_ELEMS,),
+                        dtype=torch.bfloat16,
+                        device=self.device,
+                    )
+                    self.partial_stats = torch.empty(
+                        (self.num_items * SMALL_STATS_FLOATS,),
+                        dtype=torch.float32,
+                        device=self.device,
+                    )
+                    self.counters = torch.zeros(
+                        (self.num_tiles,), dtype=torch.int32, device=self.device
+                    )
+                    # The rendered binding takes ``u32`` arrival counters; keep the
+                    # int32 storage (uint32 lacks most reductions) and pass a view.
+                    self.counters_u32 = self.counters.view(torch.uint32)
+                    self.ready = torch.cuda.Event(external=True)
+                    self.ready.record(torch.cuda.current_stream(self.device))
             return
         plan = plan_vsa_sm90(block_mask_map, sms=sms)
         self.mode = plan["mode"]
@@ -725,22 +863,26 @@ class CakeVsaSm90Plan:
 
         from .jit.cake_vsa_sm90 import load_cake_vsa_sm90_module
 
-        stage = "attention" if self.small_kmax is None else f"small_k{self.small_kmax}"
+        if self.small_kmax is None:
+            stage = "attention"
+        else:
+            stage = f"small_k{self.small_kmax}{'s' if self.small_split else ''}"
         module, _record = load_cake_vsa_sm90_module(stage)
         with torch.cuda.device(self.device):
             stream = torch.cuda.current_stream(self.device)
             if torch.cuda.is_current_stream_capturing():
                 self.captured = True
-            if self.small_kmax is None:
-                # The plan may have been built on another stream: an event wait
-                # enqueues the dependency without a CPU synchronization.
+            if self.small_kmax is None or self.small_split:
+                # The plan (or the split workspace) may have been built on
+                # another stream: an event wait enqueues the dependency without
+                # a CPU synchronization.
                 stream.wait_event(self.ready)
             aligned_q = self._aligned(q)
             aligned_k = self._aligned(k)
             aligned_v = self._aligned(v)
             target = result if result.data_ptr() % 16 == 0 else torch.empty_like(result)
             with tvm_ffi.use_torch_stream():
-                if self.small_kmax is not None:
+                if self.small_split:
                     module.run(
                         aligned_q,
                         aligned_k,
@@ -750,7 +892,24 @@ class CakeVsaSm90Plan:
                         int(self.qo_len),
                         int(self.kv_len),
                         float(self.scale_log2),
-                        int(self.num_tiles),
+                        self.partial_o,
+                        self.partial_stats,
+                        self.counters_u32,
+                        int(self.num_items),
+                        1,
+                        1,
+                    )
+                elif self.small_kmax is not None:
+                    module.run(
+                        aligned_q,
+                        aligned_k,
+                        aligned_v,
+                        target,
+                        self.plan_param,
+                        int(self.qo_len),
+                        int(self.kv_len),
+                        float(self.scale_log2),
+                        int(self.num_items),
                         1,
                         1,
                     )
@@ -793,4 +952,5 @@ __all__ = [
     "plan_small",
     "plan_vsa_sm90",
     "small_route",
+    "split_kmax",
 ]
