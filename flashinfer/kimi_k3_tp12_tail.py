@@ -104,11 +104,13 @@ def prepare_kimi_k3_tp12_tail(
         out    = BF16(latent @ up_weight.T + sum_r shared_partial_r)  [M, 7168]
 
     in three launches per rank: a Lamport all-reduce of ``routed_partial`` fused
-    with the norm (one-shot for ``M <= 16``, two-shot above), cuBLAS on this
-    rank's contiguous 640- or 512-row slice of ``up_weight``
-    (``7168 = 8 x 640 + 4 x 512``), and a column reduce-scatter of
-    ``shared_partial`` fused with the add of the slice, one BF16 rounding and the
-    multicast all-gather of ``out``.  ``out`` is bitwise identical on every rank.
+    with the norm (one-shot for ``M <= 16``, two-shot above), the up-projection
+    of this rank's contiguous 640- or 512-row slice of ``up_weight``
+    (``7168 = 8 x 640 + 4 x 512``; the generated weight-streaming kernel for
+    ``M <= 4``, cuBLAS above), and a column reduce-scatter of ``shared_partial``
+    fused with the add of the slice, one BF16 rounding and the multicast
+    all-gather of ``out`` (one CTA per token below 256 tokens, a persistent
+    token pipeline above).  ``out`` is bitwise identical on every rank.
     Every rank must prepare and launch the same ``M``.
 
     Parameters

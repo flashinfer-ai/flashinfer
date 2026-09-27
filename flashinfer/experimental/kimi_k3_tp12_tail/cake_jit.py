@@ -43,7 +43,18 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # * ``k3:<grouped|pinned>``  the column reduce-scatter of the shared partial,
 #   fused add of this rank's up-projection slice, one BF16 rounding and the
 #   multicast all-gather of the output row, with the same poll schedule
-#   selection by ``M``.
+#   selection by ``M``, one CTA per token and column half (``4 < M < 256``,
+#   grouped poll schedule only);
+# * ``k3_persist:<grouped|pinned>``  the same K3 on a persistent grid of
+#   ``min(M, SM count)`` CTAs per column half, each walking its tokens as a
+#   three-stage pipeline (scatter ``t``, owner reduce + multicast ``t - P``,
+#   gather ``t - 2P``) so the fabric hops of consecutive tokens overlap
+#   (``M >= 256``; identical buffers, flags and numerics);
+# * ``k2_stream:n<640|512>``  the SIMT weight-streaming up-projection slice
+#   GEMM (fp32 output) that replaces cuBLAS for ``M <= 4``; one module per
+#   column width of the rank partition;
+# * ``k3_f32:grouped``  the fp32-add form of K3 that consumes the K2-stream
+#   slice (``M <= 4``).
 #
 # Every module is an exact-architecture program launched with programmatic
 # dependent launch.  Both literals are populated verbatim by the
@@ -1148,7 +1159,12 @@ def required_kernel_keys() -> tuple[str, ...]:
     return (
         *(f"k1_oneshot:r{rank}" for rank in range(WORLD_SIZE)),
         *(f"k1_twoshot:{schedule}" for schedule in POLL_SCHEDULES),
-        *(f"k3:{schedule}" for schedule in POLL_SCHEDULES),
+        # the one-CTA-per-token K3 only below 256 tokens (grouped); K3-P owns every M >= 256
+        "k3:grouped",
+        *(f"k3_persist:{schedule}" for schedule in POLL_SCHEDULES),
+        "k2_stream:n640",
+        "k2_stream:n512",
+        "k3_f32:grouped",
     )
 
 
