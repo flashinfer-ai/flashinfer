@@ -43,6 +43,55 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 
 from .dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
 
+
+def _per_token_fragment_plan(shape, stride, token_axis):
+    """Static analysis of a t2r fragment of the identity tensor over C.
+
+    ``shape``/``stride`` are the (hierarchical, static) layout of the
+    per-thread fragment; strides are ``ScaledBasis`` values ``k@axis`` or 0.
+    Returns ``(offsets, distinct)``: for every fragment element (in the
+    colexicographic order the fragment is indexed with) its token-axis
+    offset relative to element 0, and the sorted distinct offsets. Returns
+    ``None`` when the layout is not fully static, so the caller falls back
+    to one load per element.
+    """
+    leaves = []
+
+    def walk(sh, st):
+        if isinstance(sh, (tuple, list)):
+            if not isinstance(st, (tuple, list)) or len(sh) != len(st):
+                return False
+            return all(walk(a, b) for a, b in zip(sh, st, strict=True))
+        if not isinstance(sh, int):
+            return False
+        mode = getattr(st, "mode", None)
+        value = getattr(st, "value", st)
+        if mode is None:
+            if not isinstance(value, int) or value != 0:
+                return sh == 1 or value == 0
+            leaves.append((sh, 0))
+            return True
+        if not isinstance(value, int):
+            return False
+        leaves.append((sh, value if list(mode)[0] == token_axis else 0))
+        return True
+
+    if not walk(shape, stride):
+        return None
+    offsets = []
+    total = 1
+    for extent, _ in leaves:
+        total *= extent
+    for i in range(total):
+        rem = i
+        off = 0
+        for extent, scale in leaves:
+            off += (rem % extent) * scale
+            rem //= extent
+        offsets.append(off)
+    return offsets, sorted(set(offsets))
+
+
 from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_wait
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 
@@ -1261,6 +1310,24 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                     if cutlass.const_expr(self.per_token_alpha == "m")
                     else mC_mnl.shape[1]
                 )
+                token_axis = 0 if self.per_token_alpha == "m" else 1
+                # Static plan: which fragment elements share a token, and
+                # whether the token is constant across the epilogue subtiles.
+                _frag_layout = tTR_cC_partitioned.layout
+                _frag_shape = _frag_layout.shape
+                _frag_stride = _frag_layout.stride
+                alpha_plan = _per_token_fragment_plan(
+                    tuple(_frag_shape[0:3]), tuple(_frag_stride[0:3]), token_axis
+                )
+                _subtile_plan = _per_token_fragment_plan(
+                    tuple(_frag_shape[3:5]), tuple(_frag_stride[3:5]), token_axis
+                )
+                alpha_token_per_tile = (
+                    alpha_plan is not None
+                    and len(alpha_plan[1]) == 1
+                    and _subtile_plan is not None
+                    and _subtile_plan[1] == [0]
+                )
 
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
@@ -1329,6 +1396,13 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                         )
                     ]
                     tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
+                    if cutlass.const_expr(alpha_token_per_tile):
+                        # Every element this thread holds in this tile has
+                        # the same token: one clamped load per tile, applied
+                        # through the scalar alpha multiply below.
+                        tile_token = tTR_cC[(0, 0, 0, 0)][token_axis]
+                        tile_token = cutlass.min(tile_token, alpha_extent - 1)
+                        alpha_value = alpha[tile_token].to(cutlass.Float32)
 
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
@@ -1388,23 +1462,31 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                     #
                     # Fold the per-token scale into the accumulators
                     #
-                    if cutlass.const_expr(self.per_token_alpha is not None):
-                        # The t2r value mode is strided across both M and N, so
-                        # every element needs its own coordinate -- there is no
-                        # sub-mode to hoist the alpha load out of.
+                    if cutlass.const_expr(
+                        self.per_token_alpha is not None and not alpha_token_per_tile
+                    ):
                         tTR_cC_subtile = tTR_cC[(None, None, None, real_subtile_idx)]
-                        for i in cutlass.range_constexpr(cute.size(tTR_cC_subtile)):
-                            coord = tTR_cC_subtile[i]
-                            token = (
-                                coord[0]
-                                if cutlass.const_expr(self.per_token_alpha == "m")
-                                else coord[1]
-                            )
-                            # Elements past the token extent are dropped by the
-                            # TMA store, so clamping the index just avoids
-                            # reading alpha out of bounds.
-                            token = cutlass.min(token, alpha_extent - 1)
-                            tTR_rAcc[i] = tTR_rAcc[i] * alpha[token].to(cutlass.Float32)
+                        if cutlass.const_expr(alpha_plan is not None):
+                            # The fragment's token offsets are static: load
+                            # each distinct token once per subtile (clamped so
+                            # the rows past the token extent, which the TMA
+                            # store drops, never read alpha out of bounds).
+                            offsets, distinct = alpha_plan
+                            token0 = tTR_cC_subtile[0][token_axis]
+                            loaded = {}
+                            for d in distinct:
+                                tok = cutlass.min(token0 + d, alpha_extent - 1)
+                                loaded[d] = alpha[tok].to(cutlass.Float32)
+                            for i in cutlass.range_constexpr(len(offsets)):
+                                tTR_rAcc[i] = tTR_rAcc[i] * loaded[offsets[i]]
+                        else:
+                            for i in cutlass.range_constexpr(cute.size(tTR_cC_subtile)):
+                                coord = tTR_cC_subtile[i]
+                                token = coord[token_axis]
+                                token = cutlass.min(token, alpha_extent - 1)
+                                tTR_rAcc[i] = tTR_rAcc[i] * alpha[token].to(
+                                    cutlass.Float32
+                                )
 
                     #
                     # Convert to C type
