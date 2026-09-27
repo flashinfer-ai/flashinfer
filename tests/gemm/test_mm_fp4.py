@@ -14,6 +14,7 @@ from flashinfer import (
     mxfp4_quantize,
 )
 from flashinfer.utils import (
+    BackendSupportedError,
     get_compute_capability,
     is_sm12x_supported,
     version_at_least,
@@ -320,6 +321,144 @@ def test_mm_fp4_cute_dsl_misaligned_n_raises():
             block_size=16,
             use_8x4_sf_layout=False,
             backend="cute-dsl",
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+
+def _skip_unless_per_token_alpha_gpu():
+    major, minor = get_compute_capability(torch.device("cuda"))
+    if (major, minor) not in [(10, 0), (10, 3)]:
+        pytest.skip("per-token alpha needs the cute-dsl FP4 GEMM (SM100/SM103).")
+
+
+# m is swept in full because the per-row indexing is what varies with it; n and
+# k only change the tile schedule, so they are kept to the minimum that still
+# exercises both a single- and a multi-tile N.
+@pytest.mark.parametrize("m", [4, 17, 48, 128, 257])
+@pytest.mark.parametrize("n", [256, 512])
+@pytest.mark.parametrize("k", [256])
+@pytest.mark.parametrize("res_dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("backend", ["cute-dsl", "auto"])
+@pytest.mark.parametrize("auto_tuning", [False, True])
+def test_mm_fp4_per_token_alpha(m, n, k, res_dtype, backend, auto_tuning):
+    """A per-token alpha must scale each output row by its own dequant scale."""
+    _skip_unless_per_token_alpha_gpu()
+
+    torch.manual_seed(0)
+    a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    # alpha = 1 / (g_in * g_w) undoes both NVFP4 global encode scales
+    # ((448 * 6) / absmax) in a @ b.T; it is what a scalar-alpha call uses.
+    scalar_alpha = alpha.float().reshape(1)
+
+    # In production the per-token alpha is the dynamic per-row scale that
+    # nvfp4_quantize(..., per_token_activation=True) returns, times the weight
+    # scale. Here it is the scalar alpha times a synthetic per-row factor in
+    # [0.25, 1.25) that differs on every row, so an epilogue that reads alpha
+    # at the wrong coordinate cannot pass.
+    row = 0.25 + torch.arange(m, device="cuda", dtype=torch.float32) / m
+    per_token_alpha = (scalar_alpha * row).contiguous()
+
+    out = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    out_scalar = torch.empty([m, n], device="cuda", dtype=res_dtype)
+    with autotune(auto_tuning):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            per_token_alpha,
+            res_dtype,
+            out,
+            block_size=16,
+            backend=backend,
+            use_nvfp4=True,
+            skip_check=False,
+        )
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            scalar_alpha,
+            res_dtype,
+            out_scalar,
+            block_size=16,
+            backend=backend,
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+    reference = torch.mm(a, b.T).float() * row[:, None]
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.float().reshape(-1), dim=0)
+    assert cos_sim > 0.97
+
+    # Both calls accumulate the same products, so the per-token result must be
+    # the scalar-alpha result scaled row by row. Cosine similarity stays high
+    # even when the epilogue reads alpha at the wrong coordinate; this does not.
+    torch.testing.assert_close(
+        out.float(),
+        out_scalar.float() * row[:, None],
+        rtol=2e-2,
+        atol=2e-2 * out_scalar.float().abs().max().item(),
+    )
+
+
+@pytest.mark.parametrize(
+    "backend", ["cutlass", "cudnn", "trtllm", "b12x", "cutedsl_low_latency"]
+)
+def test_mm_fp4_per_token_alpha_rejected_by_other_backends(backend):
+    """A backend without a per-row epilogue would apply alpha[0] to every row;
+    the implementation must refuse the call instead of running it."""
+    if get_compute_capability(torch.device("cuda"))[0] < 10:
+        pytest.skip("nvfp4_quantize needs SM100+.")
+    m, n, k = 16, 256, 256
+    torch.manual_seed(0)
+    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    per_token_alpha = alpha.float().reshape(1).expand(m).contiguous()
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(
+        (ValueError, BackendSupportedError),
+        match="per-token alpha|does not support backend",
+    ):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            per_token_alpha,
+            torch.bfloat16,
+            out,
+            block_size=16,
+            backend=backend,
+            use_nvfp4=True,
+            skip_check=False,
+        )
+
+
+def test_mm_fp4_per_token_alpha_auto_misaligned_n_raises():
+    """backend="auto" with a per-token alpha must go through the cute-dsl
+    requirement function like any other backend: n % 8 != 0 is refused before
+    the runner is built (it used to reach the runner and crash with a
+    TypeError once no tactic was valid)."""
+    if get_compute_capability(torch.device("cuda"))[0] != 10:
+        pytest.skip("cute_dsl backend only supports SM100/SM103 GPUs.")
+    m, n, k = 16, 130, 128  # n % 8 == 2
+    torch.manual_seed(0)
+    _, _, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    per_token_alpha = alpha.float().reshape(1).expand(m).contiguous()
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(BackendSupportedError, match="No suitable auto backends"):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            per_token_alpha,
+            torch.bfloat16,
+            out,
+            block_size=16,
+            backend="auto",
             use_nvfp4=True,
             skip_check=False,
         )

@@ -83,15 +83,31 @@ _RUNTIME_CONFIG_ABI: tuple[tuple[str, str, str], ...] = (
     ("parameter", "lower_bound_log2", "float32_scalar"),
     ("parameter", "norm_eps", "float32_scalar"),
 )
+_ROWS_ABI: tuple[tuple[str, str, str], ...] = (("parameter", "rows", "int32"),)
 CAKE_FUSED_KDA_DECODE_ABIS: dict[str, tuple[tuple[str, str, str], ...]] = {
+    # One CTA per (head, row) grid cell.
     "standard": _COMMON_BUFFER_ABI + _COMMON_SCALAR_ABI + _RUNTIME_CONFIG_ABI,
+    # The frozen owner-chain kernel receives one row per launch; the binding
+    # walks the rows sequentially so repeated slots observe every mutation.
     "repeated_safe": (
-        _COMMON_BUFFER_ABI
-        + _COMMON_SCALAR_ABI
-        + (("parameter", "rows", "int32"),)
-        + _RUNTIME_CONFIG_ABI
+        _COMMON_BUFFER_ABI + _COMMON_SCALAR_ABI + _ROWS_ABI + _RUNTIME_CONFIG_ABI
+    ),
+    # One persistent launch receives every row and walks the (row, head) work
+    # items with a grid-stride loop; the binding sizes the grid from the
+    # launching device's resident-CTA capacity instead of the item count.
+    "persistent_rows": (
+        _COMMON_BUFFER_ABI + _COMMON_SCALAR_ABI + _ROWS_ABI + _RUNTIME_CONFIG_ABI
     ),
 }
+_ROWS_ABI_KINDS = frozenset({"repeated_safe", "persistent_rows"})
+_HEADS: tuple[int, ...] = (8, 12, 24, 32, 48, 96)
+# H=8 positive-unique FP32 rows served by the two-CTA cluster split.  Mirrors
+# the Cake launcher's CLUSTER2_H8_MAX_ROWS (measured on B200 and B300).
+_H8_CLUSTER2_MAX_ROWS = 9
+# H=8 positive-unique FP32 rows above the cluster band that still fit one CTA
+# per SM: the 128-register wide512 instance (``__launch_bounds__(512, 1)``).
+# Mirrors the Cake launcher's WIDE512_REGCAP128_H8_MAX_ROWS.
+_H8_WIDE512_REGCAP128_MAX_ROWS = 18
 _ARG_PLAN_SHA256 = {
     name: hashlib.sha256(
         json.dumps(arguments, separators=(",", ":")).encode()
@@ -129,6 +145,12 @@ class CakeFusedKDADecodeVariant:
     threads: int
     dynamic_smem_bytes: int
     eligibility: tuple[CakeFusedKDADecodeEligibility, ...]
+    # CTAs per (row, head) work item along grid.x.  1 for every single-CTA
+    # schedule; 2 for the two-CTA cluster split, whose frozen kernel carries
+    # compile-time ``__cluster_dims__(2,1,1)`` and reads its value tile from
+    # ``%cluster_ctarank``.  The binding multiplies grid.x by this value and
+    # launches with the matching cluster-dimension attribute.
+    cluster_x: int = 1
 
 
 # Target-owned static registration. There is deliberately no runtime generated
@@ -149,6 +171,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["repeated_positive"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -240,6 +277,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["repeated_positive"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 1,
                 "maximum_rows": None,
@@ -329,6 +381,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["repeated_positive"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -420,6 +487,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": None,
+                "state_indices_modes": ["repeated_positive"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 1,
                 "maximum_rows": None,
@@ -496,11 +578,197 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
             },
         ),
     },
+    # Persistent BF16 streaming family (Kimi-K3 TP12, H=8, rows >= 64): one
+    # 256-thread CTA walks a grid-strided (row, head) item sequence with a
+    # two-slot cp.async SMEM ring; the binding sizes the grid from the
+    # launching device's resident-CTA capacity (three CTAs per SM).
+    {
+        "name": "stream_bf16_wide_slot_offsets",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_stream_bf16_wide_slot_offsets.cu",
+        "source_sha256": "dc52f1b0a07da176c772bc1750c74b553815e63c18bd35c53898251d162e9ab6",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_stream_bf16_wide_slot_offsets",
+        "abi_kind": "persistent_rows",
+        "state_dtype": "bfloat16",
+        "slot_offset_bits": 64,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 256,
+        "dynamic_smem_bytes": 70272,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 64,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "stream_bf16",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_stream_bf16.cu",
+        "source_sha256": "31898c42e27634ac78de9ec2aa67aa0c13c91ec0f70a9e68da560a1af776f0b9",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_stream_bf16",
+        "abi_kind": "persistent_rows",
+        "state_dtype": "bfloat16",
+        "slot_offset_bits": 32,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 256,
+        "dynamic_smem_bytes": 70272,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 64,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "wide512_regcap128_positive_f32_wide_slot_offsets",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_wide512_regcap128_positive_f32_wide_slot_offsets.cu",
+        "source_sha256": "2d5e7391636b25a641c3593992ad34fa088e28406b65267509747eae2cdedf8d",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_wide512_regcap128_positive_f32_wide_slot_offsets",
+        "abi_kind": "standard",
+        "state_dtype": "float32",
+        "slot_offset_bits": 64,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 512,
+        "dynamic_smem_bytes": 3712,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": _H8_CLUSTER2_MAX_ROWS + 1,
+                "maximum_rows": _H8_WIDE512_REGCAP128_MAX_ROWS,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "wide512_regcap128_positive_f32",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_wide512_regcap128_positive_f32.cu",
+        "source_sha256": "be3960e7bd04638bc337773be2189e81cd2ffc0498e7f2d6a78a12d9498bf9c7",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_wide512_regcap128_positive_f32",
+        "abi_kind": "standard",
+        "state_dtype": "float32",
+        "slot_offset_bits": 32,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 512,
+        "dynamic_smem_bytes": 3712,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": _H8_CLUSTER2_MAX_ROWS + 1,
+                "maximum_rows": _H8_WIDE512_REGCAP128_MAX_ROWS,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "cluster2_wide_positive_f32_wide_slot_offsets",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_cluster2_wide_positive_f32_wide_slot_offsets.cu",
+        "source_sha256": "cfc2f17f6b9d96cf01da9a6bde79f2367c103a27f7364adb9493235f642b2755",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_cluster2_wide_positive_f32_wide_slot_offsets",
+        "abi_kind": "standard",
+        "state_dtype": "float32",
+        "slot_offset_bits": 64,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 512,
+        "dynamic_smem_bytes": 9344,
+        "cluster_x": 2,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": _H8_CLUSTER2_MAX_ROWS,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
+    {
+        "name": "cluster2_wide_positive_f32",
+        "target": "sm100a",
+        "body": "cake_fused_kda_decode_cluster2_wide_positive_f32.cu",
+        "source_sha256": "31124cf16c7c81d561c018905bbd3ab2405cbaa2db3b7397dce01b67e4e861d4",
+        "kernel_symbol": "kernel_cake_fused_kda_decode_cluster2_wide_positive_f32",
+        "abi_kind": "standard",
+        "state_dtype": "float32",
+        "slot_offset_bits": 32,
+        "extra_cuda_cflags": ("--use_fast_math",),
+        "threads": 512,
+        "dynamic_smem_bytes": 9344,
+        "cluster_x": 2,
+        "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": _H8_CLUSTER2_MAX_ROWS,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+        ),
+    },
     {
         "name": "wide512_positive_f32_wide_slot_offsets",
         "target": "sm100a",
         "body": "cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets.cu",
-        "source_sha256": "30c935b217f9b0816ae08e39670bc9eeaefa8236fbd6d0939da0483ab5583a81",
+        "source_sha256": "96f1219411508c037bb49360e37741a2752068513425e10fcbb2c53c69df27e1",
         "kernel_symbol": "kernel_cake_fused_kda_decode_wide512_positive_f32_wide_slot_offsets",
         "abi_kind": "standard",
         "state_dtype": "float32",
@@ -509,6 +777,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 512,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 37,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 56,
+                "maximum_rows": 76,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -590,7 +888,7 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "name": "wide512_positive_f32",
         "target": "sm100a",
         "body": "cake_fused_kda_decode_wide512_positive_f32.cu",
-        "source_sha256": "8007333b792d6326013fbbad4b5e03d43a1102e0679e5163632228e7caf32813",
+        "source_sha256": "5bd65e9e730b4b89351826b22379ed1b5cdbcf6e4e0263c303bbd1246021c9b5",
         "kernel_symbol": "kernel_cake_fused_kda_decode_wide512_positive_f32",
         "abi_kind": "standard",
         "state_dtype": "float32",
@@ -599,6 +897,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 512,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 37,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 56,
+                "maximum_rows": 76,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -690,6 +1018,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 18,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 1,
                 "maximum_rows": 12,
@@ -779,6 +1122,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 512,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 18,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -870,6 +1228,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 18,
+                "state_indices_modes": ["positive_unique", "unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 1,
                 "maximum_rows": 12,
@@ -959,6 +1332,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 512,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 1,
+                "maximum_rows": 18,
+                "state_indices_modes": ["positive_unique", "unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 1,
@@ -1290,6 +1678,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 36480,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 38,
+                "maximum_rows": 55,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 25,
                 "maximum_rows": 37,
@@ -1379,6 +1782,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 36480,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 38,
+                "maximum_rows": 55,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 25,
@@ -1470,6 +1888,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 36480,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 19,
+                "maximum_rows": 63,
+                "state_indices_modes": ["positive_unique", "unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 25,
                 "maximum_rows": 37,
@@ -1559,6 +1992,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 36480,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 19,
+                "maximum_rows": 63,
+                "state_indices_modes": ["positive_unique", "unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 25,
@@ -2010,6 +2458,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 28288,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 38,
+                "maximum_rows": 55,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 77,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 99,
                 "maximum_rows": None,
@@ -2085,6 +2563,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 28288,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 38,
+                "maximum_rows": 55,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 77,
+                "maximum_rows": None,
+                "state_indices_modes": ["positive_unique"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 99,
                 "maximum_rows": None,
@@ -2159,6 +2667,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 28288,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 148,
+                "maximum_rows": None,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 99,
@@ -2250,6 +2773,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 28288,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 148,
+                "maximum_rows": None,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 99,
                 "maximum_rows": None,
@@ -2340,6 +2878,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 20096,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 148,
+                "maximum_rows": None,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 99,
                 "maximum_rows": None,
@@ -2429,6 +2982,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 20096,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 148,
+                "maximum_rows": None,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 99,
@@ -2880,6 +3448,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 19,
+                "maximum_rows": 37,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 56,
+                "maximum_rows": 147,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 13,
                 "maximum_rows": 24,
@@ -3074,6 +3672,36 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 19,
+                "maximum_rows": 37,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
+                "heads": [8],
+                "minimum_rows": 56,
+                "maximum_rows": 147,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 13,
@@ -3270,6 +3898,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "dynamic_smem_bytes": 3712,
         "eligibility": (
             {
+                "heads": [8],
+                "minimum_rows": 64,
+                "maximum_rows": 147,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
+            {
                 "heads": [12],
                 "minimum_rows": 13,
                 "maximum_rows": 24,
@@ -3434,6 +4077,21 @@ _VARIANT_SPECS: tuple[dict[str, Any], ...] = (
         "threads": 256,
         "dynamic_smem_bytes": 3712,
         "eligibility": (
+            {
+                "heads": [8],
+                "minimum_rows": 64,
+                "maximum_rows": 147,
+                "state_indices_modes": ["unique_or_null"],
+                "lower_bound_values": "any",
+                "norm_eps_values": "any",
+                "strides": {
+                    "x_row_stride": None,
+                    "conv_slot_stride": None,
+                    "beta_row_stride": None,
+                    "state_slot_stride": None,
+                    "output_gate_row_stride": None,
+                },
+            },
             {
                 "heads": [12],
                 "minimum_rows": 13,
@@ -3725,6 +4383,15 @@ def get_cake_fused_kda_decode_variants(
             # Preserve three resident CTAs when NVCC allocates more registers
             # than the source compiler for these wide-offset schedules.
             extra_cuda_cflags += ("-Xptxas=--minnctapersm=3",)
+        cluster_x = int(item.get("cluster_x", 1))
+        if cluster_x not in (1, 2):
+            raise ValueError(
+                f"unsupported Cake fused KDA cluster_x for {name}: {cluster_x}"
+            )
+        if cluster_x != 1 and item["abi_kind"] != "standard":
+            raise ValueError(
+                f"Cake fused KDA cluster variant {name} must use the standard launch ABI"
+            )
         eligibility = []
         for rule in item["eligibility"]:
             eligibility.append(
@@ -3752,6 +4419,7 @@ def get_cake_fused_kda_decode_variants(
                 threads=item["threads"],
                 dynamic_smem_bytes=item["dynamic_smem_bytes"],
                 eligibility=tuple(eligibility),
+                cluster_x=cluster_x,
             )
         )
     return tuple(result)
@@ -3779,6 +4447,7 @@ def _variant_build_identity_payload(
         "extra_cuda_cflags": variant.extra_cuda_cflags,
         "threads": variant.threads,
         "dynamic_smem_bytes": variant.dynamic_smem_bytes,
+        "cluster_x": variant.cluster_x,
         "eligibility": [
             {
                 "heads": rule.heads,
@@ -3861,6 +4530,25 @@ def _positive_f32_variants(num_heads: int, num_rows: int) -> tuple[str, ...]:
     """Choose positive-unique FP32 schedules by resident-CTA wave capacity."""
 
     sm_count = 148
+    if num_heads == 8:
+        # Measured H=8 bands (B200 and B300 route matrices, 2026-09-25): while
+        # SMs are idle the two-CTA cluster split halves each item's recurrence
+        # chain (rows <= _H8_CLUSTER2_MAX_ROWS), the 128-register wide512
+        # instance serves rows up to _H8_WIDE512_REGCAP128_MAX_ROWS; the staged compact family
+        # loses 5-16 % to high-work for rows 38..55, the vector-four producer
+        # loses to the spread producer, and the nearly empty third high-work
+        # wave makes wide512 the better route for rows 56..76.  Beyond that
+        # the rotating high-work pipeline is at least as fast everywhere.
+        if num_rows <= _H8_CLUSTER2_MAX_ROWS:
+            return ("cluster2_wide_positive_f32",)
+        if num_rows <= _H8_WIDE512_REGCAP128_MAX_ROWS:
+            # One CTA per SM either way; the 128-register cap keeps more
+            # scattered slot loads in flight (B200 2026-09-25: 4-7 % on
+            # random 8192-slot pools, within noise on compact pools).
+            return ("wide512_regcap128_positive_f32",)
+        if num_rows <= 37 or 56 <= num_rows <= 76:
+            return ("wide512_positive_f32",)
+        return ("high_work_positive_f32",)
     work_items = num_heads * num_rows
     if 2 * sm_count < work_items <= 3 * sm_count:
         return ("compact_async_pr_eval_h96_f32", "compact_async_positive_f32")
@@ -3912,7 +4600,7 @@ def select_cake_fused_kda_decode_variant(
 
     if target not in _TARGETS:
         raise ValueError(f"unsupported Cake fused KDA target: {target}")
-    if num_heads not in (12, 24, 32, 48, 96):
+    if num_heads not in _HEADS:
         raise ValueError(f"unsupported Cake fused KDA head count: {num_heads}")
     if num_rows <= 0 or num_slots <= 0:
         raise ValueError("Cake fused KDA rows and slots must be positive")
@@ -4036,7 +4724,7 @@ def _kernel_declaration(variant: CakeFusedKDADecodeVariant) -> str:
         "int output_gate_row_stride",
         "int H",
     ]
-    if variant.abi_kind == "repeated_safe":
+    if variant.abi_kind in _ROWS_ABI_KINDS:
         arguments.append("int rows")
     arguments.extend(
         ["int use_lower_bound", "float lower_bound_log2", "float norm_eps"]
@@ -4049,7 +4737,8 @@ def _kernel_declaration(variant: CakeFusedKDADecodeVariant) -> str:
 
 
 def _render_binding(variant: CakeFusedKDADecodeVariant) -> str:
-    has_rows = int(variant.abi_kind == "repeated_safe")
+    has_rows = int(variant.abi_kind in _ROWS_ABI_KINDS)
+    persistent_grid = int(variant.abi_kind == "persistent_rows")
     state_is_bfloat16 = int(variant.state_dtype == "bfloat16")
     return f"""\
 /*
@@ -4076,7 +4765,9 @@ def _render_binding(variant: CakeFusedKDADecodeVariant) -> str:
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_THREADS {variant.threads}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_SMEM_BYTES {variant.dynamic_smem_bytes}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS {has_rows}
+#define FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID {persistent_grid}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 {state_is_bfloat16}
+#define FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X {variant.cluster_x}
 #define FLASHINFER_CAKE_FUSED_KDA_DECODE_ARG_PLAN_SHA256 "{_ARG_PLAN_SHA256[variant.abi_kind]}"
 
 #include "{_BINDING_HEADER}"

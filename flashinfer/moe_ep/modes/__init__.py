@@ -6,7 +6,7 @@ from ..backends.split.kernel.identity import IdentityConfig
 from ..core.kernel import SplitKernelContext, kernel_requires_weights, run_split_kernel
 from .config import MegaConfig, SplitConfig
 from .mega_layer import MoEEpMegaLayer, MoEEpMegaWorkspace
-from .split_layer import MoEEpSplitLayer
+from .split_layer import MoEEpSplitGraphState, MoEEpSplitLayer
 
 __all__ = [
     "FusedMoeKernelConfig",
@@ -14,6 +14,7 @@ __all__ = [
     "MegaConfig",
     "MoEEpMegaLayer",
     "MoEEpMegaWorkspace",
+    "MoEEpSplitGraphState",
     "MoEEpSplitLayer",
     "NCCLEPConfig",
     "NcclEpConfig",

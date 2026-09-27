@@ -201,6 +201,9 @@ def _mega_problem(
         num_experts=num_experts,
         topk=topk,
         gate_up_clamp=gate_up_clamp,
+        activation="swiglu",
+        situ_beta=None,
+        situ_linear_beta=None,
         fast_math=fast_math,
         hidden_states=hidden_states,
         topk_weights=topk_weights,
@@ -245,6 +248,9 @@ def _reference_nvfp4_mega_moe_staged(
         gate_up_clamp=problem["gate_up_clamp"],
         swiglu_alpha=problem.get("swiglu_alpha"),
         swiglu_beta=problem.get("swiglu_beta"),
+        activation=problem["activation"],
+        situ_beta=problem["situ_beta"],
+        situ_linear_beta=problem["situ_linear_beta"],
         combine_dtype=combine_dtype,
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
@@ -381,6 +387,9 @@ def _megakernel_config(problem: dict, *, epilogue_via_config: bool, **config_ext
         intermediate_size=problem["intermediate"],
         top_k=problem["topk"],
         gate_up_clamp=problem["gate_up_clamp"],
+        activation=problem.get("activation", "swiglu"),
+        situ_beta=problem.get("situ_beta"),
+        situ_linear_beta=problem.get("situ_linear_beta"),
         fast_math=problem["fast_math"],
         swiglu_alpha=problem.get("swiglu_alpha"),
         swiglu_beta=problem.get("swiglu_beta"),
@@ -973,6 +982,7 @@ def _run_mega_torch_oracle(
     combine_dtype: str = "bf16",
     swiglu_alpha: float | None = None,
     swiglu_beta: float | None = None,
+    activation: str = "swiglu",
 ):
     """Real-EP kernel launch vs a pure-torch oracle on the GLOBAL expert set.
 
@@ -1028,6 +1038,13 @@ def _run_mega_torch_oracle(
     bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
     ensure_moe_ep_cuda_device(bootstrap)
     problem = _mega_problem(rank, world_size)
+    if activation == "situ":
+        problem.update(
+            gate_up_clamp=None,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
     num_local = problem["num_experts"] // world_size
     if swiglu_alpha is not None:
         problem["hidden_states"].mul_(0.1)
@@ -1074,6 +1091,9 @@ def _run_mega_torch_oracle(
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            activation=problem["activation"],
+            situ_beta=problem["situ_beta"],
+            situ_linear_beta=problem["situ_linear_beta"],
             combine_dtype=combine_dtype,
             fc1_alpha=problem["fc1_alpha"],
             fc2_alpha=problem["fc2_alpha"],
@@ -1155,6 +1175,9 @@ def _run_mega_torch_oracle(
                 hidden=problem["hidden"],
                 intermediate=problem["intermediate"],
                 gate_up_clamp=problem["gate_up_clamp"],
+                activation=problem["activation"],
+                situ_beta=problem["situ_beta"],
+                situ_linear_beta=problem["situ_linear_beta"],
                 term_transform=term_transform,
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
@@ -1207,16 +1230,17 @@ def _run_mega_torch_oracle(
 @pytest.mark.gpu_4
 @pytest.mark.arch_blackwell
 @pytest.mark.parametrize(
-    "in_kernel_fc2_reduce,combine_dtype",
+    "in_kernel_fc2_reduce,combine_dtype,activation",
     [
-        (False, "bf16"),
-        (True, "bf16"),
-        (False, "nvfp4"),
-        (False, "mxfp8"),
+        (False, "bf16", "swiglu"),
+        (True, "bf16", "swiglu"),
+        (False, "nvfp4", "swiglu"),
+        (False, "mxfp8", "swiglu"),
+        (False, "bf16", "situ"),
     ],
 )
 def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
-    in_kernel_fc2_reduce, combine_dtype
+    in_kernel_fc2_reduce, combine_dtype, activation
 ):
     """Real cross-rank EP kernel vs pure-torch global math (see helper doc)."""
     _require_cuda()
@@ -1229,10 +1253,12 @@ def test_moe_ep_nvfp4_cutedsl_mega_multirank_torch_oracle(
         world_size,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         combine_dtype=combine_dtype,
+        activation=activation,
     )
     print(
         f"rank {rank}: sm100_nvfp4_nvfp4_bf16_cutedsl mega kernel (ikr={in_kernel_fc2_reduce}, "
-        f"combine={combine_dtype}) matches the multi-rank torch oracle"
+        f"combine={combine_dtype}, activation={activation}) matches the "
+        "multi-rank torch oracle"
     )
 
 
@@ -1365,6 +1391,33 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
         combine_dtype="nvfp4",
     )
     assert create_mega_kernel(cfg_q).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+
+
+def test_nvfp4_cutedsl_config_validates_situ():
+    from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
+
+    cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=3072,
+        top_k=16,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
+    assert cfg.activation == "situ"
+    with pytest.raises(ValueError, match="requires situ_beta"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=3072,
+            top_k=16,
+            activation="situ",
+        )
+    with pytest.raises(ValueError, match="not supported with SiTU"):
+        Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=3072,
+            top_k=16,
+            activation="situ",
+            situ_beta=4.0,
+            gate_up_clamp=10.0,
+        )
 
 
 def test_nvfp4_shim_config_rejects_invalid_ikr_combos():

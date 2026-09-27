@@ -1,17 +1,19 @@
 # kernel_src — vendored kernel snapshots
 
 Each snapshot lives under `sm<arch>/<tree_name>/`, such as
-`sm100/cutedsl_megamoe` or `sm90/pull_style_cutedsl_megakernel`. Its
-`VENDOR.md` records the upstream revision; `SKILL.md` describes how to
-update it. Backends under `backends/mega/kernel/sm<arch>/<dtype-style>/`
-wrap these kernels.
+`sm100/cutedsl_megamoe` or `sm107/next_cutedsl_megamoe`. Its `VENDOR.md`
+records the upstream revision; `SKILL.md` describes how to update it.
+Backends under `backends/mega/kernel/sm<arch>/<dtype-style>/` wrap these kernels.
 
 ## The one rule: `src/` is verbatim
 
-The `src/` tree of every drop is a byte-for-byte copy of its upstream commit.
+The `src/` tree of every drop is a byte-for-byte copy of its upstream source
+or pinned upstream exporter output, as specified in that drop's `VENDOR.md`.
+For exported drops, record the exporter revision, selected entry points and
+transformations, and compare against a regenerated export.
 **Do not edit it — not for bugs, and not for style.** That explicitly includes
 docstrings, comments, formatting, lint appeasement, type annotations, and
-import sorting. `diff -r` against the upstream drop must come back clean;
+import sorting. `diff -r` against the declared upstream drop/export must be clean;
 every local byte of drift makes the next re-sync harder and hides real
 divergence.
 

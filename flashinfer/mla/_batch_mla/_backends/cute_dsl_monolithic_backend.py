@@ -21,10 +21,11 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
 
     _backend_name = "cute-dsl-monolithic"
     _supports_lse = True
+    _supports_variable_q = True
     _plan_capabilities = MLAPlanCapabilities(
         backend_name="cute-dsl-monolithic",
         lse_modes=frozenset({"none", "basee"}),
-        kv_layouts=frozenset({"combined"}),
+        kv_layouts=frozenset({"combined", "adjacent-split"}),
         output_scales=frozenset({"none"}),
         scale_modes=frozenset({"default", "bmm-scalar"}),
         requires_packed_query=True,
@@ -45,6 +46,9 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
         head_dim_ckv: int,
         head_dim_kpe: int,
         resolved_is_var_seq: bool,
+        is_var_q: bool,
+        total_q: int,
+        max_seq_len: int,
         use_sinks: bool,
         enable_pdl: bool,
     ) -> tuple[Any, Any, torch.Tensor, int, int]:
@@ -60,6 +64,10 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
             raise _CuteDslKernelUnsupportedError(str(error)) from error
 
         try:
+            _, num_q_tiles, _ = implementation.compute_q_tile_layout(num_heads, q_len)
+            implementation._validate_nonpersistent_grid_y(
+                batch_size, num_q_tiles, not resolved_is_var_seq
+            )
             implementation._check_can_implement(
                 torch_dtype=q_data_type,
                 torch_out_dtype=out_dtype,
@@ -81,7 +89,22 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
             num_heads,
             head_dim_ckv,
             implementation.get_num_sm(device),
+            max_seq_len=max_seq_len,
+            occupancy_q_tiles=(
+                max(1, min(total_q, batch_size * ((q_len * num_heads + 127) // 128)))
+                if is_var_q
+                else None
+            ),
         )
+        if workspace_size:
+            # The reducer launches one grid-Y slot per query, independently
+            # of the main kernel's flattened query/head tile count.
+            try:
+                implementation._validate_nonpersistent_grid_y(1, q_len, False)
+            except ValueError as error:
+                raise _CuteDslKernelUnsupportedError(
+                    f"split-KV reducer: {error}"
+                ) from error
         compiled_kernel = implementation._get_compiled_mla_kernel(
             q_data_type,
             out_dtype,
@@ -92,7 +115,7 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
             q_len,
             not resolved_is_var_seq,
             resolved_is_var_seq,
-            False,
+            is_var_q,
             False,
             is_workspace_size_zero=workspace_size == 0,
             enable_pdl=enable_pdl,
@@ -112,7 +135,7 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
             raise ValueError("cute-dsl-monolithic does not support sinks.")
         monolithic_launch_args = (
             *launch_args[:10],
-            None,
+            self._execution_state.cum_seq_lens_q,
             None,
             self._execution_state.Int32(0),
             launch_args[10],

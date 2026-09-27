@@ -246,12 +246,17 @@ def generate_ninja_build_for_op(
     extra_include_dirs: Optional[List[Path]],
     needs_device_linking: bool = False,
     embedded_cubins: Optional[Mapping[str, Path]] = None,
+    extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None,
 ) -> str:
     cuda_home = get_cuda_path()
     common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
     cflags = build_cflags(common_cflags, extra_cflags)
     cuda_cflags = build_cuda_cflags(common_cflags, extra_cuda_cflags)
     cuda_arch_flags = [flag for flag in cuda_cflags if flag.startswith("-gencode=")]
+    cuda_cflags_by_source = {
+        Path(source).resolve(): build_cuda_cflags(common_cflags, flags)
+        for source, flags in (extra_cuda_cflags_by_source or {}).items()
+    }
 
     ldflags = [
         "-shared",
@@ -345,6 +350,11 @@ def generate_ninja_build_for_op(
         obj = str((output_dir / obj_name).resolve())
         objects.append(obj)
         lines.append(f"build {obj}: {cmd} {source.resolve()}")
+        if source.resolve() in cuda_cflags_by_source:
+            lines.append(
+                "  cuda_cflags = "
+                + join_multiline(cuda_cflags_by_source[source.resolve()])
+            )
 
     if embedded_cubins:
         if not objects:
@@ -386,7 +396,12 @@ def _get_num_workers() -> Optional[int]:
     return None
 
 
-def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
+def run_ninja(
+    workdir: Path,
+    ninja_file: Path,
+    verbose: bool,
+    max_jobs: Optional[int] = None,
+) -> None:
     workdir.mkdir(parents=True, exist_ok=True)
     command = [
         "ninja",
@@ -396,7 +411,7 @@ def run_ninja(workdir: Path, ninja_file: Path, verbose: bool) -> None:
         "-f",
         str(ninja_file.resolve()),
     ]
-    num_workers = _get_num_workers()
+    num_workers = max_jobs if max_jobs is not None else _get_num_workers()
     if num_workers is not None:
         command += ["-j", str(num_workers)]
 
