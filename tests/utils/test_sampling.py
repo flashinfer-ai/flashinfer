@@ -725,6 +725,142 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         ]
 
 
+@pytest.mark.parametrize(
+    "batch_size,vocab_size",
+    [(1, 8192), (20, 32000), (3, 50257), (7, 151936), (2, 262144)],
+)
+@pytest.mark.parametrize("mode", ["top_p", "top_k", "joint"])
+def test_split_row_rejection_sampling(batch_size, vocab_size, mode):
+    # Small batches with vocabularies of 8192 or more take the split-row (thread block
+    # cluster) kernels on SM90; these shapes cover cluster sizes 2, 4 and 8, an odd vocabulary
+    # (scalar staging), per-row thresholds, a row whose leading chunks have no mass, and k = 1.
+    torch.manual_seed(42)
+    eps = 1e-4
+    logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
+    logits[0, : vocab_size // 2] = -float("inf")
+    probs = torch.softmax(logits, dim=-1)
+    top_k = torch.randint(1, 1000, (batch_size,), dtype=torch.int32, device="cuda:0")
+    top_k[-1] = 1
+    top_p = torch.rand(batch_size, device="cuda:0") * 0.9 + 0.05
+
+    sorted_prob, order = torch.sort(probs, descending=False)
+    cdf = torch.cumsum(sorted_prob, dim=-1)
+    mask_top_p = torch.zeros_like(probs, dtype=torch.int32)
+    mask_top_p.scatter_add_(1, order, (cdf > (1 - top_p.unsqueeze(-1)) - eps).int())
+    pivot = sorted_prob.flip(-1).gather(1, (top_k.long() - 1).unsqueeze(-1))
+    mask_top_k = (probs >= pivot).int()
+    mask = {
+        "top_p": mask_top_p,
+        "top_k": mask_top_k,
+        "joint": torch.minimum(mask_top_p, mask_top_k),
+    }[mode]
+
+    def sample(offset, indices=None, per_row=True):
+        k, p = (top_k, top_p) if per_row else (int(top_k[0]), float(top_p[0]))
+        if mode == "top_p":
+            return flashinfer.sampling.top_p_sampling_from_probs(
+                probs, p, indices, seed=1234, offset=offset, return_valid=True
+            )
+        if mode == "top_k":
+            return flashinfer.sampling.top_k_sampling_from_probs(
+                probs, k, indices, seed=1234, offset=offset, return_valid=True
+            )
+        return flashinfer.sampling.top_k_top_p_sampling_from_probs(
+            probs,
+            k,
+            p,
+            indices,
+            filter_apply_order="joint",
+            seed=1234,
+            offset=offset,
+            return_valid=True,
+        )
+
+    rows = torch.arange(batch_size, device="cuda:0")
+    for offset in range(0, 200, 4):
+        samples, valid = sample(offset)
+        assert torch.all(valid)
+        assert torch.all(mask[rows, samples] == 1)
+        # Same seed and offset give the same samples.
+        assert torch.equal(sample(offset)[0], samples)
+
+    # Outputs mapped to rows through indices, with scalar thresholds (the row-0 mask).
+    indices = torch.tensor([0, batch_size - 1, 0], dtype=torch.int32, device="cuda:0")
+    if mode == "top_p":
+        mask_row0 = mask_top_p[0]
+    elif mode == "top_k":
+        mask_row0 = mask_top_k[0]
+    else:
+        mask_row0 = torch.minimum(mask_top_p[0], mask_top_k[0])
+    for offset in range(0, 40, 4):
+        samples, valid = sample(offset, indices, per_row=False)
+        assert torch.all(valid)
+        assert mask_row0[samples[0]] == 1 and mask_row0[samples[2]] == 1
+        assert 0 <= samples[1] < vocab_size
+
+
+@pytest.mark.parametrize(
+    "batch_size,vocab_size", [(256, 8192), (32, 32000), (256, 151936)]
+)
+@pytest.mark.parametrize("mode", ["top_p", "top_k", "joint"])
+def test_split_row_rejection_sampling_freq(batch_size, vocab_size, mode):
+    # The split-row kernels (cluster sizes 2, 4 and 8 for these shapes on SM90) partition each
+    # row into per-CTA chunks and per-warp segments. Put the probability mass on a sparse set
+    # that includes both sides of every such boundary for cluster sizes 2, 4 and 8, and compare
+    # the sample frequencies with the renormalized distribution.
+    torch.manual_seed(42)
+    num_warps = 8
+    support = {0, vocab_size - 1}
+    for cluster_size in [2, 4, 8]:
+        chunk = (-(-vocab_size // cluster_size) + 3) // 4 * 4
+        seg = (-(-chunk // num_warps) + 3) // 4 * 4
+        for start in range(0, vocab_size, chunk):
+            for b in [start + w * seg for w in range(num_warps)]:
+                support.update(i for i in [b - 1, b] if 0 <= i < vocab_size)
+    support.update(torch.randint(0, vocab_size, (32,)).tolist())
+    support = torch.tensor(sorted(support), device="cuda:0")
+    probs_row = torch.zeros(vocab_size, device="cuda:0")
+    probs_row[support] = torch.rand(len(support), device="cuda:0") + 0.1
+    probs_row /= probs_row.sum()
+    probs = probs_row.repeat(batch_size, 1)
+
+    k, p = len(support) // 2, 0.7
+    sorted_prob, order = torch.sort(probs_row)
+    mask_top_p = torch.zeros(vocab_size, dtype=torch.bool, device="cuda:0")
+    mask_top_p[order] = torch.cumsum(sorted_prob, 0) > 1 - p
+    mask_top_k = probs_row >= sorted_prob[-k]
+    mask = {
+        "top_p": mask_top_p,
+        "top_k": mask_top_k,
+        "joint": mask_top_p & mask_top_k,
+    }[mode]
+    expected = torch.where(mask, probs_row, 0.0)
+    expected /= expected.sum()
+
+    generator = torch.Generator(device="cuda:0").manual_seed(0)
+    counter = torch.zeros(vocab_size, dtype=torch.int32, device="cuda:0")
+    num_calls = 51200 // batch_size
+    for _ in range(num_calls):
+        if mode == "top_p":
+            samples = flashinfer.sampling.top_p_sampling_from_probs(
+                probs, p, generator=generator
+            )
+        elif mode == "top_k":
+            samples = flashinfer.sampling.top_k_sampling_from_probs(
+                probs, k, generator=generator
+            )
+        else:
+            samples = flashinfer.sampling.top_k_top_p_sampling_from_probs(
+                probs, k, p, filter_apply_order="joint", generator=generator
+            )
+        counter.scatter_add_(0, samples.long(), torch.ones_like(samples))
+    num_draws = num_calls * batch_size
+    freq = counter.float() / num_draws
+    assert torch.all(counter[~mask] == 0)
+    tol = 6 * torch.sqrt(expected * (1 - expected) / num_draws) + 1e-6
+    assert torch.all((freq - expected).abs() <= tol), (freq - expected).abs().max()
+
+
 @parametrize_product(
     {
         "batch_size": [1, 99, 989],
