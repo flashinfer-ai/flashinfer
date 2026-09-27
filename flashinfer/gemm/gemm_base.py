@@ -8833,6 +8833,11 @@ def mm_fp4(
             "per-token alpha is only implemented by the 'cute-dsl' backend "
             f"(SM100/SM103), got backends {list(backends)}."
         )
+    if per_token_alpha:
+        # Validation accepts any shape with m elements, e.g. (1, m). The tuning
+        # constraint below ties alpha's dim 0 to the profiled M, so hand the
+        # tuner a 1-D view or profiling would allocate (profiled_m, m).
+        alpha = alpha.reshape(-1)
 
     tuner = AutoTuner.get()
     if per_token_alpha:
