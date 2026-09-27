@@ -581,9 +581,6 @@ def gen_all_modules(
 ) -> List[JitSpec]:
     jit_specs: List[JitSpec] = []
     jit_specs.append(gen_spdlog_module())
-    # The route kernels are plain CUDA and build everywhere; without this an
-    # install with JIT disabled has no artifact to load.
-    jit_specs.append(gen_sparse_route_module())
     has_bgmv_moe = sm_capabilities.get("bgmv_moe", False)
     has_sm80 = sm_capabilities.get("sm80", False)
     has_sm90 = sm_capabilities.get("sm90", False)
@@ -984,16 +981,6 @@ def gen_all_modules(
             (has_sm90, has_sm100, has_sm103, has_sm107, has_sm110, has_sm120, has_sm121)
         ):
             jit_specs.append(gen_cake_sampling_module())
-        # The scorer multiplies with m16n8k16, so it is only built where that
-        # exists; without it here an AOT-only install has no artifact to load.
-        # has_sm80 means "an 8.x target is in the build", which is narrower than
-        # what the kernel needs: every 9.x/10.x/12.x target has m16n8k16 too.
-        from .jit.core import current_compilation_context
-
-        if any(
-            major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
-        ):
-            jit_specs.append(gen_sparse_scores_module())
         # Fused RMSNorm+SiLU: pre-compile all LUT configs (SM100+ only)
         if has_sm100:
             for C in _SUPPORTED_C:

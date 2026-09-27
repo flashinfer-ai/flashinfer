@@ -19,10 +19,12 @@ QSA_MODULES = {"qsa_output_gate", "sparse_route", "sparse_scores"}
 
 
 def _collect(monkeypatch, target_archs, add_misc):
-    """Which module names ``gen_all_modules`` asks for, as a set.
+    """Which module names ``gen_all_modules`` asks for, as a set, and the names
+    of the specs it returns, as a list.
 
     A set rather than a list: what matters is that the three are there or none
-    of them is, not the order the builder happens to append them in.
+    of them is, not the order the builder happens to append them in. The
+    returned list is what gets built.
     """
     from flashinfer import aot
     from flashinfer.jit import core as jit_core
@@ -48,7 +50,7 @@ def _collect(monkeypatch, target_archs, add_misc):
         aot, "gen_cudnn_fmha_module", lambda: SimpleNamespace(name="cudnn")
     )
 
-    aot.gen_all_modules(
+    specs = aot.gen_all_modules(
         [],
         [],
         [],
@@ -65,7 +67,7 @@ def _collect(monkeypatch, target_archs, add_misc):
         add_misc,
         False,  # add_xqa
     )
-    return names
+    return names, [spec.name for spec in specs]
 
 
 @pytest.mark.parametrize(
@@ -92,5 +94,7 @@ def _collect(monkeypatch, target_archs, add_misc):
 def test_the_qsa_modules_go_in_together_or_not_at_all(
     monkeypatch, target_archs, add_misc, expected
 ) -> None:
-    names = _collect(monkeypatch, target_archs, add_misc)
+    names, built = _collect(monkeypatch, target_archs, add_misc)
     assert names == (QSA_MODULES if expected else set())
+    for name in QSA_MODULES:
+        assert built.count(name) == (1 if expected else 0), name
