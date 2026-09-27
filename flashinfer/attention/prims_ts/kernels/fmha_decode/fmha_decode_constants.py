@@ -90,8 +90,8 @@ MAX_WARP_GROUPS = 6
 
 # Grouped sparse routes keep one membership byte per selected page in a table
 # separate from the plain Int32 locators. Four bytes share one Int32 word. Q1 does
-# not consume membership; Q2/Q4/Q5 use the packed table for their per-query
-# softmax mask. A byte keeps Q5 aligned with Q64/Hq12 and leaves room for Q6--Q8.
+# not consume membership; Q2--Q8 use the packed table for their per-query
+# softmax mask. A byte supports all eight query positions without changing the ABI.
 Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS = 8
 Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_MASK = (
     1 << Q_TOKEN_KV_BLOCK_SPARSE_PAGE_MEMBERSHIP_BITS

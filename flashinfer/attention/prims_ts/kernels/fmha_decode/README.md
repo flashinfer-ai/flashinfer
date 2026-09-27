@@ -7,24 +7,30 @@ packed variable-length queries over a paged K/V cache.
 
 The public API describes attention semantics and cache metadata. Tile shapes
 and launch policy are selected internally for the problem and GPU. Fixed-Q
-plans may use direct, persistent, or split-KV execution. Packed-Q and
-sliding-window plans remain nonsplit, but may use direct or CLC-persistent
-execution. There is no public scheduler or tuning knob and no fallback to
-another attention backend.
+and packed-Q plans may use direct, persistent, or split-KV execution according
+to the caller's split permission. Sliding-window plans remain nonsplit, but
+may use direct or CLC-persistent execution. There is no public scheduler or
+tuning knob and no fallback to another attention backend.
 
 For eligible nonsplit grids with more than one resident wave, cluster launch
-control (CLC) assigns work to resident CTAs. Underfilled fixed-Q grids may
+control (CLC) assigns work to resident CTAs. Underfilled fixed- or packed-Q grids may
 instead split the K/V sequence and reduce partial outputs; other grids use the
 direct static launch.
 
 QToken-KvBlock-Sparse-Attention metadata uses one CUDA C++ CTA per route. Q1 maps its selected logical
-blocks and causal tail directly through the dense page table. Q2/Q4/Q5 sort at
+blocks and causal tail directly through the dense page table. Q2--Q8 sort at
 most ``group_size * (block_topk + 1)`` tagged selected/tail candidates in
 shared memory, unique equal logical IDs while OR-reducing query-membership
 bits, and map only the compact union. Work and temporary storage therefore do
 not scale with the configured model length or global cache capacity. Plain
 Int32 locators and packed membership words remain separate outputs; membership
 bits are never fused into a locator.
+
+Attention caches a grouped membership row in SMEM only when the complete
+resource layout, including barriers, fits the compilation budget. Larger rows
+stay in the existing immutable metadata buffer; Softmax reads packed words for
+the current KV tile directly from GMEM. This does not change query grouping or
+the caller's split-KV permission.
 
 The combined QToken-KvBlock-Sparse-Attention metadata+attention API uses programmatic dependent launch
 (PDL) for its final metadata-to-attention handoff. QToken-KvBlock-Sparse-Attention metadata producers
@@ -58,10 +64,9 @@ Import these entry points from `flashinfer.attention.prims_ts`:
 | API | Use |
 | --- | --- |
 | `BatchDecodePagedTSWrapper` | Reusable static `plan()` with plan- or run-owned K/V lengths. |
-| `batch_decode_with_paged_kv_cache` | One-shot convenience interface. |
+| `batch_decode_with_paged_kv_cache` | One-shot interface with optional caller scratch, explicit bounds, and trusted capture-safe execution. |
 | `get_prims_ts_batch_decode_workspace_size` | Size caller-owned scratch for the standalone launch. |
 | `prepare_prims_ts_batch_decode_with_kv_cache` | Validate and compile a standalone launch once for a lightweight graph-safe `run()`. |
-| `prims_ts_batch_decode_with_kv_cache` | Standalone launch with caller-owned scratch and explicit `seq_lens`. |
 
 Trace a planned stateful wrapper with `flashinfer.fi_trace(wrapper.run, ...)`.
 The unbound `wrapper.run.fi_trace(...)` form is rejected because it cannot
@@ -114,14 +119,15 @@ supported. Rows may have padding between them; each row must be contiguous.
 | Fixed Q length | Any positive integer representable by the metadata and tensor extents |
 | Packed Q | Positive per-request lengths no greater than a positive static maximum |
 | Head mapping | MHA/GQA; `Hq` must be divisible by `Hkv`, with `1 <= Hq/Hkv <= 128`. Qualified fixed-Q FP8 D64/D128/D256 page-32 profiles use grouped Swaps Q8/Q16/Q32 through ratio 32, Keeps Q64 through ratio 64, and Keeps Q128 through ratio 128. |
-| Q/K/V dtype | Q and K/V must match: `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
+| Q/K dtype | Matching `torch.float16`, `torch.bfloat16`, or `torch.float8_e4m3fn` |
+| V dtype | Equal to Q/K, or `torch.float8_e4m3fn` with `torch.bfloat16` Q/K (`v_data_type`; defaults to `k_data_type`) |
 | Output dtype | `torch.float16` for `torch.float16` input; `torch.bfloat16` for `torch.bfloat16` input; `torch.float16` or `torch.float8_e4m3fn` for `torch.float8_e4m3fn` input |
-| K/V layout | HND paged cache, combined or separate K/V tensors |
-| Page size | 4, 16, 32, 64, or 128 tokens |
+| K/V layout | HND paged cache, combined or separate K/V tensors; a V dtype that differs from K requires separate tensors |
+| Page size | 4, 8, 16, 32, 64, or 128 tokens; a logical fragment must divide the physical cache page |
 | Maximum K/V length | `2,147,483,392` (`INT32_MAX - 255`), reserving the padded endpoint of a 256-token K/V tile |
 | Mask | Dense or bottom-right causal |
 | Sliding window | Causal left window; `window_left=-1` disables it and non-negative values include the current token |
-| Scheduling | Automatic direct or CLC-persistent launch; eligible underfilled fixed-Q grids may use split-KV. Packed-Q and sliding-window grids remain nonsplit. No public tuning knob. |
+| Scheduling | Automatic direct or CLC-persistent launch; `split_kv=True` permits eligible underfilled fixed/packed-Q grids to split. False disables splitting. Automatic sliding-window splits remain unqualified. |
 | Accumulation | FP32 QK/PV and softmax state |
 
 Current accuracy and performance signoff is on SM100a/B200. SM103a/B300 is
@@ -154,7 +160,8 @@ have padded storage.
   in signed `int32`. This also bounds every packed `total_q * Hq` extent.
 - Combined K/V cache: `[num_pages, 2, Hkv, page_size, D]`.
 - Separate K/V cache: a `(K, V)` tuple whose members are
-  `[num_pages, Hkv, page_size, D]`.
+  `[num_pages, Hkv, page_size, D]`. This is the only form that can carry a
+  `torch.float8_e4m3fn` V next to `torch.bfloat16` K.
 - Wrapper, standalone, and one-shot metadata use contiguous logical K/V
   lengths plus `block_tables[B, C]`. Wrapper lengths are either copied into
   plan-owned CUDA storage or supplied to each run; the other APIs always take
@@ -193,9 +200,10 @@ Q + paged K/V
 
 Eligible nonsplit work that exceeds one resident SM wave uses CLC-persistent
 scheduling. A scheduler warp discovers each schedule token once and broadcasts it to
-the worker tasks. Underfilled fixed-Q grids may instead split the K/V sequence
-and reduce partial outputs. Packed-Q and sliding-window work remains nonsplit:
-it uses CLC above one resident wave and the direct static path otherwise.
+the worker tasks. Underfilled fixed- or packed-Q grids may instead split the
+K/V sequence when the caller permits it with `split_kv=True`. False disables
+splitting independently of Q layout. Automatic sliding-window splitting
+remains unqualified; nonsplit work uses the same CLC/direct selection.
 
 Fixed-table page IDs and packed-Q offsets are per-run bindings and are loaded
 on every run and graph replay. K/V lengths come from exactly one source. A
@@ -220,7 +228,7 @@ import torch
 from flashinfer.attention.prims_ts import (
     BatchDecodePagedTSWrapper,
     get_prims_ts_batch_decode_workspace_size,
-    prims_ts_batch_decode_with_kv_cache,
+    batch_decode_with_paged_kv_cache,
 )
 
 device = "cuda"
@@ -256,7 +264,8 @@ wrapper.plan(
     max_seq_len_q=1,
     packed_query=False,
     q_data_type=q.dtype,
-    kv_data_type=kv.dtype,
+    k_data_type=kv.dtype,
+    v_data_type=kv.dtype,
     o_data_type=q.dtype,
     mask_type="causal",
     # Optional fixed lengths enable a plan-owned specialization.
@@ -278,13 +287,13 @@ workspace_bytes = get_prims_ts_batch_decode_workspace_size(
     device=q.device,
 )
 workspace = torch.zeros(workspace_bytes, device=device, dtype=torch.int8)
-standalone_out = prims_ts_batch_decode_with_kv_cache(
+standalone_out = batch_decode_with_paged_kv_cache(
     q,
     kv,
-    workspace,
     block_tables,
     seq_lens,
-    max_seq_len,
+    workspace_buffer=workspace,
+    max_kv_len=max_seq_len,
     mask_type="causal",
 )
 assert standalone_out.shape == q.shape
@@ -308,7 +317,8 @@ unsupported and unchecked in both modes. Do not mutate
 run-owned metadata concurrently with a launch or replay that reads it.
 
 For the standalone workflow, call
-`get_prims_ts_batch_decode_workspace_size()` with the same shape, dtype, mask,
+`get_prims_ts_batch_decode_workspace_size()` with the same shape, Q/K/V and
+output dtype, mask,
 window, and Q-layout arguments as the launch. Allocate at least that many
 bytes as a contiguous, 32-byte-aligned CUDA `torch.int8` or `torch.uint8`
 tensor. Zero it before first use and re-zero it whenever any workspace-layout
@@ -337,7 +347,8 @@ plan-owned length storage and requires graph recapture.
 - Only HND paged K/V is supported; contiguous K/V and NHD caches are outside
   this API.
 - Attention sinks and custom masks are not exposed.
-- Q, K, and V cannot use mixed dtypes.
+- Q and K must share one dtype; the only mixed combination is
+  `torch.bfloat16` Q/K with `torch.float8_e4m3fn` V.
 - Effective K/V lengths must be positive and no greater than the static plan
   bound.
 - Packed offsets are run-time wrapper inputs. Default wrapper validation checks

@@ -113,6 +113,9 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         epi_flag_batch: Optional[Tuple[int, int]] = (1, 1),
         gate_up_clamp: Optional[float] = None,
         generate_c: bool = False,
+        # Tail-split pair tasks (see MoEFusedFc12SchedulerParams); needs GEMM
+        # cluster_shape_mn == (1, 2).
+        tail_split_pairs: bool = False,
     ) -> None:
         # generate_c (training forward): the FC1 epilogue also writes the raw
         # pre-SwiGLU gate+up accumulator to the caller's ``fc1_c`` tensor
@@ -213,6 +216,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         if self.fc1_store_offload:
             self.fc1_early_done_publish = False
         self.epi_flag_batch = epi_flag_batch
+        self.tail_split_pairs = bool(tail_split_pairs)
         self.gate_up_clamp = (
             abs(gate_up_clamp) if gate_up_clamp is not None else None
         )
@@ -367,6 +371,13 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             raise ValueError(
                 "Hopper FP8 swap-AB cluster_shape_mn must be one of "
                 f"{supported_cluster_shapes}, got {(cm, cn)}."
+            )
+
+        # Tail-split pair tasks need 2 CTAs along N (tokens) and 1 along M.
+        if self.tail_split_pairs and (cm, cn) != (1, 2):
+            raise ValueError(
+                "tail_split_pairs requires GEMM cluster_shape_mn == (1, 2) "
+                f"(2 CTAs along the token axis), got {(cm, cn)}."
             )
 
         # Cluster peers share A/B tiles through TMA multicast while issuing
@@ -1029,6 +1040,32 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             )
         )
 
+        # Non-multicast weight atoms (None unless tail_split_pairs).
+        tma_atom_fc1_weight_single = None
+        tma_tensor_fc1_weight_single = None
+        tma_atom_fc2_weight_single = None
+        tma_tensor_fc2_weight_single = None
+        if cutlass.const_expr(self.tail_split_pairs):
+            a_single_op = cpasync.CopyBulkTensorTileG2SOp()
+            tma_atom_fc1_weight_single, tma_tensor_fc1_weight_single = (
+                cpasync.make_tiled_tma_atom(
+                    a_single_op,
+                    fc1_weight_gemm,
+                    a_smem_layout,
+                    cute.slice_(self.mma_tiler, (None, 0, None)),
+                    num_multicast=1,
+                )
+            )
+            tma_atom_fc2_weight_single, tma_tensor_fc2_weight_single = (
+                cpasync.make_tiled_tma_atom(
+                    a_single_op,
+                    fc2_weight_gemm,
+                    a_smem_layout,
+                    cute.slice_(self.mma_tiler, (None, 0, None)),
+                    num_multicast=1,
+                )
+            )
+
         # ── Scheduler params + grid + launch ──
         #
         # ``expert_cnt`` / ``intermediate_gateup`` / ``hidden_dim`` are
@@ -1084,6 +1121,7 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             is_swap_ab=True,
             expert_token_prefix_sum=offs,
             expert_token_sizes=expert_token_sizes,
+            tail_split_pairs=self.tail_split_pairs,
         )
         grid = sched_params.get_grid_shape(max_active_clusters)
 
@@ -1135,6 +1173,12 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
             self.activation_sf_smem_layout_staged,
             self.c_smem_layout_staged,
             token_comm_args,
+            # Non-multicast weight atoms for tail-split pair tasks
+            # (all None when ``tail_split_pairs`` is off)
+            tma_atom_fc1_weight_single,
+            tma_tensor_fc1_weight_single,
+            tma_atom_fc2_weight_single,
+            tma_tensor_fc2_weight_single,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1194,6 +1238,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         activation_sf_smem_layout_staged: cute.Layout,
         c_smem_layout_staged: Union[cute.Layout, cute.ComposedLayout],
         token_comm_args=None,
+        # Non-multicast weight atoms (None unless tail_split_pairs).
+        tma_atom_fc1_weight_single: Optional[cute.CopyAtom] = None,
+        tma_tensor_fc1_weight_single: Optional[cute.Tensor] = None,
+        tma_atom_fc2_weight_single: Optional[cute.CopyAtom] = None,
+        tma_tensor_fc2_weight_single: Optional[cute.Tensor] = None,
     ):
         """Device kernel for fused fc1+fc2 swap-AB FP8 grouped GEMM.
 
@@ -1263,6 +1312,11 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
         )
         a_cta_coord = cluster_coord_mnk[1]
         b_cta_coord = cluster_coord_mnk[0]
+        # Single-CTA TMA-A partition for tail-split pair tasks.
+        if cutlass.const_expr(self.tail_split_pairs):
+            a_single_cta_layout = cute.make_layout(1)
+            a_single_cta_coord = 0
+            a_single_mcast_mask = 0
         # Activation-scale box follows B's multicast split only when its per-CTA
         # sub-box stays 128 B aligned; otherwise each CTA issues the full box.
         sf_cta_layout = b_cta_layout if self.is_sf_mcast else cute.make_layout(1)
@@ -1590,98 +1644,282 @@ class Sm90SwapABSwigluFp8Fc12Kernel(_Sm90Fp8Fc12KernelBase):
                     if _iket_tma_a_active:
                         iket.range_push(self._iket_fc1_weight_load_range)
                     k_tile_cnt = k_tile_cnt_fc1
-                    real_a, desc_ptr_a = ext.get_gmem_tensor(
-                        "a", tma_tensor_fc1_weight, work_tile_info,
-                    )
-                    if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
-                        output_scale_block_base = (
-                            work_tile_info.tile_m_idx
-                            * cutlass.Int32(self.wgmma_warpgroup_count)
-                        )
-                        ab_producer, weight_sf_producer = (
-                            self._tma_load_a_with_weight_sf_task_tile(
-                                tma_atom=tma_atom_fc1_weight,
-                                real_a=real_a,
-                                desc_ptr_a=desc_ptr_a,
-                                sA=sA,
-                                weight_sf_gemm=fc1_weight_sf_gemm,
-                                smem_weight_sf=sWeightSf,
-                                ab_producer=ab_producer,
-                                weight_sf_producer=weight_sf_producer,
-                                work_tile_info=work_tile_info,
-                                tile_m_idx=work_tile_info.tile_m_idx,
-                                output_scale_block_base=output_scale_block_base,
-                                k_tile_cnt=k_tile_cnt_fc1,
-                                tidx=tidx,
-                                tma_cta_coord=a_cta_coord,
-                                tma_cta_layout=a_cta_layout,
-                                mcast_mask=a_mcast_mask,
-                                _iket_active=_iket_tma_a_active,
+                    if cutlass.const_expr(self.tail_split_pairs):
+                        if work_tile_info.is_tail_split:
+                            # Tail-split pair: own weight tile, no multicast.
+                            real_a, desc_ptr_a = ext.get_gmem_tensor(
+                                "a", tma_tensor_fc1_weight_single,
+                                work_tile_info,
                             )
-                        )
+                            if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                                output_scale_block_base = (
+                                    work_tile_info.tile_m_idx
+                                    * cutlass.Int32(self.wgmma_warpgroup_count)
+                                )
+                                ab_producer, weight_sf_producer = (
+                                    self._tma_load_a_with_weight_sf_task_tile(
+                                        tma_atom=tma_atom_fc1_weight_single,
+                                        real_a=real_a,
+                                        desc_ptr_a=desc_ptr_a,
+                                        sA=sA,
+                                        weight_sf_gemm=fc1_weight_sf_gemm,
+                                        smem_weight_sf=sWeightSf,
+                                        ab_producer=ab_producer,
+                                        weight_sf_producer=weight_sf_producer,
+                                        work_tile_info=work_tile_info,
+                                        tile_m_idx=work_tile_info.tile_m_idx,
+                                        output_scale_block_base=output_scale_block_base,
+                                        k_tile_cnt=k_tile_cnt_fc1,
+                                        tidx=tidx,
+                                        tma_cta_coord=a_single_cta_coord,
+                                        tma_cta_layout=a_single_cta_layout,
+                                        mcast_mask=a_single_mcast_mask,
+                                        _iket_active=_iket_tma_a_active,
+                                    )
+                                )
+                            else:
+                                ab_producer = self._tma_load_a_task_tile(
+                                    tma_atom_fc1_weight_single,
+                                    real_a,
+                                    desc_ptr_a,
+                                    sA,
+                                    ab_producer,
+                                    work_tile_info.tile_m_idx,
+                                    k_tile_cnt_fc1,
+                                    a_single_cta_coord,
+                                    a_single_cta_layout,
+                                    a_single_mcast_mask,
+                                    _iket_tma_a_active,
+                                )
+                        else:
+                            real_a, desc_ptr_a = ext.get_gmem_tensor(
+                                "a", tma_tensor_fc1_weight, work_tile_info,
+                            )
+                            if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                                output_scale_block_base = (
+                                    work_tile_info.tile_m_idx
+                                    * cutlass.Int32(self.wgmma_warpgroup_count)
+                                )
+                                ab_producer, weight_sf_producer = (
+                                    self._tma_load_a_with_weight_sf_task_tile(
+                                        tma_atom=tma_atom_fc1_weight,
+                                        real_a=real_a,
+                                        desc_ptr_a=desc_ptr_a,
+                                        sA=sA,
+                                        weight_sf_gemm=fc1_weight_sf_gemm,
+                                        smem_weight_sf=sWeightSf,
+                                        ab_producer=ab_producer,
+                                        weight_sf_producer=weight_sf_producer,
+                                        work_tile_info=work_tile_info,
+                                        tile_m_idx=work_tile_info.tile_m_idx,
+                                        output_scale_block_base=output_scale_block_base,
+                                        k_tile_cnt=k_tile_cnt_fc1,
+                                        tidx=tidx,
+                                        tma_cta_coord=a_cta_coord,
+                                        tma_cta_layout=a_cta_layout,
+                                        mcast_mask=a_mcast_mask,
+                                        _iket_active=_iket_tma_a_active,
+                                    )
+                                )
+                            else:
+                                ab_producer = self._tma_load_a_task_tile(
+                                    tma_atom_fc1_weight,
+                                    real_a,
+                                    desc_ptr_a,
+                                    sA,
+                                    ab_producer,
+                                    work_tile_info.tile_m_idx,
+                                    k_tile_cnt_fc1,
+                                    a_cta_coord,
+                                    a_cta_layout,
+                                    a_mcast_mask,
+                                    _iket_tma_a_active,
+                                )
                     else:
-                        ab_producer = self._tma_load_a_task_tile(
-                            tma_atom_fc1_weight,
-                            real_a,
-                            desc_ptr_a,
-                            sA,
-                            ab_producer,
-                            work_tile_info.tile_m_idx,
-                            k_tile_cnt_fc1,
-                            a_cta_coord,
-                            a_cta_layout,
-                            a_mcast_mask,
-                            _iket_tma_a_active,
+                        real_a, desc_ptr_a = ext.get_gmem_tensor(
+                            "a", tma_tensor_fc1_weight, work_tile_info,
                         )
+                        if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                            output_scale_block_base = (
+                                work_tile_info.tile_m_idx
+                                * cutlass.Int32(self.wgmma_warpgroup_count)
+                            )
+                            ab_producer, weight_sf_producer = (
+                                self._tma_load_a_with_weight_sf_task_tile(
+                                    tma_atom=tma_atom_fc1_weight,
+                                    real_a=real_a,
+                                    desc_ptr_a=desc_ptr_a,
+                                    sA=sA,
+                                    weight_sf_gemm=fc1_weight_sf_gemm,
+                                    smem_weight_sf=sWeightSf,
+                                    ab_producer=ab_producer,
+                                    weight_sf_producer=weight_sf_producer,
+                                    work_tile_info=work_tile_info,
+                                    tile_m_idx=work_tile_info.tile_m_idx,
+                                    output_scale_block_base=output_scale_block_base,
+                                    k_tile_cnt=k_tile_cnt_fc1,
+                                    tidx=tidx,
+                                    tma_cta_coord=a_cta_coord,
+                                    tma_cta_layout=a_cta_layout,
+                                    mcast_mask=a_mcast_mask,
+                                    _iket_active=_iket_tma_a_active,
+                                )
+                            )
+                        else:
+                            ab_producer = self._tma_load_a_task_tile(
+                                tma_atom_fc1_weight,
+                                real_a,
+                                desc_ptr_a,
+                                sA,
+                                ab_producer,
+                                work_tile_info.tile_m_idx,
+                                k_tile_cnt_fc1,
+                                a_cta_coord,
+                                a_cta_layout,
+                                a_mcast_mask,
+                                _iket_tma_a_active,
+                            )
                 else:
                     # Covers descriptor lookup and weight TMA issue. Blockwise
                     # mode additionally stages weight scales with cp.async.
                     if _iket_tma_a_active:
                         iket.range_push(self._iket_fc2_weight_load_range)
                     k_tile_cnt = k_tile_cnt_fc2
-                    real_a, desc_ptr_a = ext.get_gmem_tensor(
-                        "a", tma_tensor_fc2_weight, work_tile_info,
-                    )
-                    if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
-                        output_scale_block_base = (
-                            work_tile_info.tile_m_idx
-                            * cutlass.Int32(self.wgmma_warpgroup_count)
-                        )
-                        ab_producer, weight_sf_producer = (
-                            self._tma_load_a_with_weight_sf_task_tile(
-                                tma_atom=tma_atom_fc2_weight,
-                                real_a=real_a,
-                                desc_ptr_a=desc_ptr_a,
-                                sA=sA,
-                                weight_sf_gemm=fc2_weight_sf_gemm,
-                                smem_weight_sf=sWeightSf,
-                                ab_producer=ab_producer,
-                                weight_sf_producer=weight_sf_producer,
-                                work_tile_info=work_tile_info,
-                                tile_m_idx=work_tile_info.tile_m_idx,
-                                output_scale_block_base=output_scale_block_base,
-                                k_tile_cnt=k_tile_cnt_fc2,
-                                tidx=tidx,
-                                tma_cta_coord=a_cta_coord,
-                                tma_cta_layout=a_cta_layout,
-                                mcast_mask=a_mcast_mask,
-                                _iket_active=_iket_tma_a_active,
+                    if cutlass.const_expr(self.tail_split_pairs):
+                        if work_tile_info.is_tail_split:
+                            # Tail-split pair: own weight tile, no multicast.
+                            real_a, desc_ptr_a = ext.get_gmem_tensor(
+                                "a", tma_tensor_fc2_weight_single,
+                                work_tile_info,
                             )
-                        )
+                            if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                                output_scale_block_base = (
+                                    work_tile_info.tile_m_idx
+                                    * cutlass.Int32(self.wgmma_warpgroup_count)
+                                )
+                                ab_producer, weight_sf_producer = (
+                                    self._tma_load_a_with_weight_sf_task_tile(
+                                        tma_atom=tma_atom_fc2_weight_single,
+                                        real_a=real_a,
+                                        desc_ptr_a=desc_ptr_a,
+                                        sA=sA,
+                                        weight_sf_gemm=fc2_weight_sf_gemm,
+                                        smem_weight_sf=sWeightSf,
+                                        ab_producer=ab_producer,
+                                        weight_sf_producer=weight_sf_producer,
+                                        work_tile_info=work_tile_info,
+                                        tile_m_idx=work_tile_info.tile_m_idx,
+                                        output_scale_block_base=output_scale_block_base,
+                                        k_tile_cnt=k_tile_cnt_fc2,
+                                        tidx=tidx,
+                                        tma_cta_coord=a_single_cta_coord,
+                                        tma_cta_layout=a_single_cta_layout,
+                                        mcast_mask=a_single_mcast_mask,
+                                        _iket_active=_iket_tma_a_active,
+                                    )
+                                )
+                            else:
+                                ab_producer = self._tma_load_a_task_tile(
+                                    tma_atom_fc2_weight_single,
+                                    real_a,
+                                    desc_ptr_a,
+                                    sA,
+                                    ab_producer,
+                                    work_tile_info.tile_m_idx,
+                                    k_tile_cnt_fc2,
+                                    a_single_cta_coord,
+                                    a_single_cta_layout,
+                                    a_single_mcast_mask,
+                                    _iket_tma_a_active,
+                                )
+                        else:
+                            real_a, desc_ptr_a = ext.get_gmem_tensor(
+                                "a", tma_tensor_fc2_weight, work_tile_info,
+                            )
+                            if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                                output_scale_block_base = (
+                                    work_tile_info.tile_m_idx
+                                    * cutlass.Int32(self.wgmma_warpgroup_count)
+                                )
+                                ab_producer, weight_sf_producer = (
+                                    self._tma_load_a_with_weight_sf_task_tile(
+                                        tma_atom=tma_atom_fc2_weight,
+                                        real_a=real_a,
+                                        desc_ptr_a=desc_ptr_a,
+                                        sA=sA,
+                                        weight_sf_gemm=fc2_weight_sf_gemm,
+                                        smem_weight_sf=sWeightSf,
+                                        ab_producer=ab_producer,
+                                        weight_sf_producer=weight_sf_producer,
+                                        work_tile_info=work_tile_info,
+                                        tile_m_idx=work_tile_info.tile_m_idx,
+                                        output_scale_block_base=output_scale_block_base,
+                                        k_tile_cnt=k_tile_cnt_fc2,
+                                        tidx=tidx,
+                                        tma_cta_coord=a_cta_coord,
+                                        tma_cta_layout=a_cta_layout,
+                                        mcast_mask=a_mcast_mask,
+                                        _iket_active=_iket_tma_a_active,
+                                    )
+                                )
+                            else:
+                                ab_producer = self._tma_load_a_task_tile(
+                                    tma_atom_fc2_weight,
+                                    real_a,
+                                    desc_ptr_a,
+                                    sA,
+                                    ab_producer,
+                                    work_tile_info.tile_m_idx,
+                                    k_tile_cnt_fc2,
+                                    a_cta_coord,
+                                    a_cta_layout,
+                                    a_mcast_mask,
+                                    _iket_tma_a_active,
+                                )
                     else:
-                        ab_producer = self._tma_load_a_task_tile(
-                            tma_atom_fc2_weight,
-                            real_a,
-                            desc_ptr_a,
-                            sA,
-                            ab_producer,
-                            work_tile_info.tile_m_idx,
-                            k_tile_cnt_fc2,
-                            a_cta_coord,
-                            a_cta_layout,
-                            a_mcast_mask,
-                            _iket_tma_a_active,
+                        real_a, desc_ptr_a = ext.get_gmem_tensor(
+                            "a", tma_tensor_fc2_weight, work_tile_info,
                         )
+                        if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                            output_scale_block_base = (
+                                work_tile_info.tile_m_idx
+                                * cutlass.Int32(self.wgmma_warpgroup_count)
+                            )
+                            ab_producer, weight_sf_producer = (
+                                self._tma_load_a_with_weight_sf_task_tile(
+                                    tma_atom=tma_atom_fc2_weight,
+                                    real_a=real_a,
+                                    desc_ptr_a=desc_ptr_a,
+                                    sA=sA,
+                                    weight_sf_gemm=fc2_weight_sf_gemm,
+                                    smem_weight_sf=sWeightSf,
+                                    ab_producer=ab_producer,
+                                    weight_sf_producer=weight_sf_producer,
+                                    work_tile_info=work_tile_info,
+                                    tile_m_idx=work_tile_info.tile_m_idx,
+                                    output_scale_block_base=output_scale_block_base,
+                                    k_tile_cnt=k_tile_cnt_fc2,
+                                    tidx=tidx,
+                                    tma_cta_coord=a_cta_coord,
+                                    tma_cta_layout=a_cta_layout,
+                                    mcast_mask=a_mcast_mask,
+                                    _iket_active=_iket_tma_a_active,
+                                )
+                            )
+                        else:
+                            ab_producer = self._tma_load_a_task_tile(
+                                tma_atom_fc2_weight,
+                                real_a,
+                                desc_ptr_a,
+                                sA,
+                                ab_producer,
+                                work_tile_info.tile_m_idx,
+                                k_tile_cnt_fc2,
+                                a_cta_coord,
+                                a_cta_layout,
+                                a_mcast_mask,
+                                _iket_tma_a_active,
+                            )
 
                 if _iket_tma_a_active:
                     iket.range_pop()

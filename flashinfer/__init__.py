@@ -38,6 +38,7 @@ from .gated_act_mxfp8 import (
 from .attention import BatchAttention as BatchAttention
 from .attention import (
     BatchAttentionWithAttentionSinkWrapper as BatchAttentionWithAttentionSinkWrapper,
+    BatchPrefillWithCausalBidirectionalRangesWrapper as BatchPrefillWithCausalBidirectionalRangesWrapper,
 )
 from .autotune_cache import MeasurementPolicy as MeasurementPolicy
 from .autotune_cache import autotune_v2 as autotune_v2
@@ -62,6 +63,9 @@ from .cake_fmha import (
     cake_batch_decode_with_kv_cache as cake_batch_decode_with_kv_cache,
 )
 from .cake_fmha import cake_fmha_manifest as cake_fmha_manifest
+from .cake_sampling import (
+    top_k_top_p_sampling_from_probs as cake_top_k_top_p_sampling_from_probs,
+)
 from .cake_fmha import (
     CakeFmhaRequestOrderedDecodePlan as CakeFmhaRequestOrderedDecodePlan,
 )
@@ -77,6 +81,13 @@ from .decode import (
 from .decode import (
     fast_decode_plan as fast_decode_plan,
 )
+from .decode import (
+    launch_sm110_gqa_decode_prepared as launch_sm110_gqa_decode_prepared,
+)
+from .decode import (
+    prepare_balanced_batch_decode_with_kv_cache as prepare_balanced_batch_decode_with_kv_cache,
+)
+from .decode import prepare_sm110_gqa_decode as prepare_sm110_gqa_decode
 from .decode import cudnn_batch_decode_with_kv_cache as cudnn_batch_decode_with_kv_cache
 from .decode import single_decode_with_kv_cache as single_decode_with_kv_cache
 from .decode import sm110_gqa_decode as sm110_gqa_decode
@@ -119,6 +130,8 @@ from .attn_scores import fp8_paged_mqa_logits as fp8_paged_mqa_logits
 from .attn_scores import precompile_paged_mqa_logits as precompile_paged_mqa_logits
 from .fused_moe import (
     cutlass_fused_moe,
+    cudnn_frost_grouped_gemm1_swiglu,
+    cudnn_frost_grouped_gemm1_swiglu_workspace_size,
     reorder_rows_for_gated_act_gemm,
     trtllm_bf16_moe,
     trtllm_bf16_routed_moe,
@@ -213,7 +226,10 @@ from .kda import RecurrentKDAPrefillWrapper as RecurrentKDAPrefillWrapper
 from .kda import recurrent_kda as recurrent_kda
 from .kda_decode import fused_kda_decode as fused_kda_decode
 from .kda_decode import packed_kda_decode as packed_kda_decode
+from .kda_decode import packed_fused_kda_decode
 from .cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention as MiniMaxH3Mxfp8PreAttention
+from .cake_minimax_h3 import MiniMaxH3Nvfp4PreAttention as MiniMaxH3Nvfp4PreAttention
+from .cake_minimax_h3 import MiniMaxH3QkvQuantizePack as MiniMaxH3QkvQuantizePack
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops
@@ -402,3 +418,10 @@ def _log_import_version() -> None:
 
 _log_import_version()
 del _log_import_version
+
+from .kda_prefill import prepare_tf32_kda_prefill as prepare_tf32_kda_prefill
+from .kda_prefill import prepare_bf16_kda_prefill as prepare_bf16_kda_prefill
+from .kda_prefill import KDAPrefillPlanCache as KDAPrefillPlanCache
+from .kda_prefill import (
+    kda_prefill_supports_fp32_checkpoints as kda_prefill_supports_fp32_checkpoints,
+)

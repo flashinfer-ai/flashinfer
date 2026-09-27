@@ -351,6 +351,39 @@ def get_cake_moe_allreduce_module(device_index: int):
     return load(device_index)
 
 
+def register_cake_moe_allreduce_workspace_pointers(
+    workspace_tensor: torch.Tensor, workspace_pointers: List[int]
+) -> None:
+    """Retain the host-known pointer table behind an all-reduce workspace tensor."""
+    from ..jit.cake_trtllm_moe_allreduce_union import register_workspace_pointers
+
+    register_workspace_pointers(workspace_tensor, workspace_pointers)
+
+
+def _cake_moe_allreduce_union_applies(
+    *,
+    world_size: int,
+    device_index: int,
+    moe_allreduce_out: Optional[torch.Tensor],
+) -> bool:
+    """Select the verified SM100 world-size-4 source export of the Cake union.
+
+    The union export covers exactly the routes it validated: four ranks,
+    SM100, hidden_dim 7168, FP16/BF16, residual + norm outputs and the
+    all-reduce output. Every other Cake configuration stays on the legacy
+    isolated source bundle.
+    """
+    from ..jit.cake_trtllm_moe_allreduce_union import WORLD_SIZE, route_applies
+
+    if world_size != WORLD_SIZE or moe_allreduce_out is None:
+        return False
+    return route_applies(
+        world_size=world_size,
+        device_capability=tuple(torch.cuda.get_device_capability(device_index)),
+        emit_moe_allreduce=True,
+    )
+
+
 _symm_workspace_refs: dict[int, list[object]] = {}
 
 
@@ -598,6 +631,10 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     workspace_tensor = torch.tensor(
         workspace, dtype=torch.int64, device=torch.device("cuda")
     )
+    # The SM100 world-size-4 Cake MoE all-reduce route binds the control and
+    # per-rank payload addresses of this table as raw pointers; keep the
+    # host-known values so no launch ever reads the table back from the device.
+    register_cake_moe_allreduce_workspace_pointers(workspace_tensor, workspace)
 
     if use_symm_dev_mem:
         torch.cuda.synchronize()
@@ -1091,7 +1128,13 @@ def trtllm_moe_allreduce_fusion(
       and 8, hidden_dim=7168, token payloads within the existing Lamport
       ``MAX_COMM_SIZE`` byte limit, and residual plus norm outputs. It does not
       support quantization. ``weight_bias`` remains a runtime value; ``None`` is
-      passed to the kernel as 0.0.
+      passed to the kernel as 0.0. On SM100 with ``world_size=4`` and an
+      ``moe_allreduce_out`` tensor, ``"cake"`` runs the verified source export
+      of the Cake all-reduce union (``flashinfer.jit.cake_trtllm_moe_allreduce_union``);
+      the route binds the workspace pointer table the way
+      ``trtllm_create_ipc_workspace_for_all_reduce_fusion`` registers it and
+      needs no device readback. Every other Cake configuration keeps the
+      isolated source bundle.
     """
 
     _check_cake_moe_allreduce_backend(backend)
@@ -1124,6 +1167,37 @@ def trtllm_moe_allreduce_fusion(
             quant_out=quant_out,
             scale_out=scale_out,
         )
+        if _cake_moe_allreduce_union_applies(
+            world_size=world_size,
+            device_index=device_index,
+            moe_allreduce_out=moe_allreduce_out,
+        ):
+            from ..jit.cake_trtllm_moe_allreduce_union import (
+                run_cake_moe_allreduce_union,
+            )
+
+            run_cake_moe_allreduce_union(
+                backend="cake",
+                world_size=world_size,
+                world_rank=world_rank,
+                token_num=token_num,
+                hidden_dim=hidden_dim,
+                workspace_ptrs=workspace_ptrs,
+                launch_with_pdl=launch_with_pdl,
+                residual_in=residual_in,
+                rms_gamma=rms_gamma,
+                rms_eps=rms_eps,
+                scale_factor=scale_factor,
+                moe_reduction_device_num_experts=moe_reduction_device_num_experts,
+                moe_reduction_scale_input=moe_reduction_scale_input,
+                moe_reduction_active_experts_token_input=moe_reduction_active_experts_token_input,
+                moe_reduction_token_input=moe_reduction_token_input,
+                moe_allreduce_out=moe_allreduce_out,
+                residual_out=residual_out,
+                norm_out=norm_out,
+                weight_bias=weight_bias,
+            )
+            return
         get_cake_moe_allreduce_module(device_index).run_reduction(
             world_size,
             world_rank,

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 
 End-to-end tests for the SM90 CuTe-DSL fused MoE:
-moe_sort + GEMM1 (gather+SwiGLU) + GEMM2 (fused finalize).
+moe_sort + GEMM1 (gather + fused activation) + GEMM2 (fused finalize).
 """
 
 import pytest
@@ -149,13 +149,30 @@ def make_random_topk(num_experts, num_tokens, top_k, device="cuda"):
     return ids, scales
 
 
-def ref_moe(x, ids, scales, w_gate_up, w2):
-    """Float32 reference MoE forward."""
+def ref_activation(xe, w1_e, activation=None, out_dtype=torch.bfloat16):
+    """Float32 GEMM1 + activation of one expert, rounded to ``out_dtype`` (the
+    kernel's intermediate dtype). ``w1_e`` is the model's ``[gate; up]`` pack
+    for gated activations, ``[I, hidden]`` for ReLU2; ``activation`` is a typed
+    ``ActivationConfig`` (default SwiGLU)."""
+    from tests.moe.utils import compute_reference_activation
+    from flashinfer.fused_moe import SwiGLU
+
+    activation = activation or SwiGLU()
+    if activation.is_gated:
+        inter = w1_e.shape[0] // 2
+        values = torch.cat((xe @ w1_e[inter:].T, xe @ w1_e[:inter].T), dim=-1)
+    else:
+        inter = w1_e.shape[0]
+        values = xe @ w1_e.T
+    return compute_reference_activation(values, activation, inter, out_dtype).float()
+
+
+def ref_moe(x, ids, scales, w_gate_up, w2, activation=None):
+    """Float32 reference MoE forward (``activation``: typed
+    ``ActivationConfig``; default SwiGLU)."""
     num_tokens, hidden = x.shape
-    inter = w_gate_up.shape[1] // 2
     xf = x.float()
-    w_gate = w_gate_up[:, :inter].float()
-    w_up = w_gate_up[:, inter:].float()
+    w1f = w_gate_up.float()
     w2f = w2.float()
     out = torch.zeros(num_tokens, hidden, device=x.device, dtype=torch.float32)
     for kk in range(ids.shape[1]):
@@ -163,9 +180,9 @@ def ref_moe(x, ids, scales, w_gate_up, w2):
         s = scales[:, kk].unsqueeze(1)
         for e in torch.unique(e_ids).tolist():
             m = e_ids == e
-            xe = xf[m]
-            act = torch.nn.functional.silu(xe @ w_gate[e].T) * (xe @ w_up[e].T)
-            out[m] += s[m] * (act @ w2f[e].T)
+            out[m] += s[m] * (
+                ref_activation(xf[m], w1f[e], activation, x.dtype) @ w2f[e].T
+            )
     return out
 
 
@@ -875,13 +892,15 @@ def test_cute_dsl_bf16_moe_bad_inputs():
             permuted_m=128,
             tile_shape_mn=(128, 128),
         )
-    # N not a multiple of tile_n (partial N tile would write out of bounds).
-    w1_192 = torch.randn(e, 192, k, device="cuda", dtype=torch.bfloat16)
+    # Gated N must hold whole 32-column up/gate pairs (2I % 64 == 0); a
+    # partial last N tile (192 with a 128-wide tile) is fine.
+    w1_160 = torch.randn(e, 160, k, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="cannot implement"):
-        sm90_contiguous_gather_grouped_gemm_act_fusion(x, w1_192, *args, **kw)
-    # K not a multiple of the 64-element K tile.
-    x_k = torch.randn(t, 96, device="cuda", dtype=torch.bfloat16)
-    w1_k = torch.randn(e, 128, 96, device="cuda", dtype=torch.bfloat16)
+        sm90_contiguous_gather_grouped_gemm_act_fusion(x, w1_160, *args, **kw)
+    # K not a multiple of the 16-byte gather chunk (8 elements); a partial
+    # 64-element K tile itself is allowed.
+    x_k = torch.randn(t, 100, device="cuda", dtype=torch.bfloat16)
+    w1_k = torch.randn(e, 128, 100, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="cannot implement"):
         sm90_contiguous_gather_grouped_gemm_act_fusion(x_k, w1_k, *args, **kw)
 
@@ -889,22 +908,23 @@ def test_cute_dsl_bf16_moe_bad_inputs():
 @cute_dsl_available
 @sm90_required
 def test_cute_dsl_bf16_moe_gemm2_bad_inputs():
-    """GEMM2 wrapper rejects partial N tiles before any kernel launch."""
+    """GEMM2 wrapper rejects output rows that are not a multiple of 16 B before
+    any kernel launch."""
     from flashinfer.fused_moe.cute_dsl.sm90_contiguous_grouped_gemm_finalize_fusion import (
         sm90_contiguous_grouped_gemm_finalize_fusion,
     )
 
     num_tokens, topk, k, e = 16, 1, 64, 2
     a = torch.randn(128, k, device="cuda", dtype=torch.bfloat16)
-    w2 = torch.randn(e, 192, k, device="cuda", dtype=torch.bfloat16)
+    w2 = torch.randn(e, 196, k, device="cuda", dtype=torch.bfloat16)
     scales = torch.rand(num_tokens, topk, device="cuda", dtype=torch.float32)
-    out = torch.zeros(num_tokens, 192, device="cuda", dtype=torch.bfloat16)
+    out = torch.zeros(num_tokens, 196, device="cuda", dtype=torch.bfloat16)
 
     def i32(n):
         return torch.zeros(n, device="cuda", dtype=torch.int32)
 
-    # n=192 is not a multiple of tile_n=128: the finalize scatter copies a
-    # full tile_n-wide row, so a partial N tile would write out of bounds.
+    # n=196: output rows must be a multiple of 16 B (the scatter is a bulk
+    # copy); a partial N tile itself is allowed.
     with pytest.raises(ValueError, match="cannot implement"):
         sm90_contiguous_grouped_gemm_finalize_fusion(
             a,
@@ -936,3 +956,561 @@ def test_sm90_moe_rejects_malformed_tactic_structure(tactic):
 
     with pytest.raises(ValueError, match="tactic must be"):
         _extract_tactic_params(tactic)
+
+
+@cute_dsl_available
+@pytest.mark.parametrize(
+    "tactic",
+    [
+        (128, ((64, 64), 1), ((128, 64), (1, 1), False)),
+        (64, ((64, 128), 1), ((128, 128), (1, 1), False)),
+    ],
+)
+def test_sm90_moe_rejects_mismatched_row_tiles(tactic):
+    """Both GEMM row tiles must be moe_sort's tile: the per-tile expert and
+    row-limit maps are written for that tile."""
+    from flashinfer.fused_moe.cute_dsl.sm90_tuner import _extract_tactic_params
+
+    with pytest.raises(ValueError, match="M tiles must equal tile_size"):
+        _extract_tactic_params(tactic)
+
+
+def _moe_activation_cases():
+    """Non-default activation configs exercised end to end."""
+    from flashinfer.fused_moe import GeGLUTanh, ReLU2, SiTU, SwiGLU
+
+    return [
+        pytest.param(SwiGLU(alpha=1.702, beta=1.0, limit=7.0), id="swiglu_oai"),
+        pytest.param(SiTU(gate_scale=4.0, linear_scale=25.0), id="situ"),
+        pytest.param(GeGLUTanh(), id="geglu_tanh"),
+        pytest.param(ReLU2(), id="relu2"),
+    ]
+
+
+def _make_activation_case(
+    activation,
+    hidden,
+    inter,
+    num_experts,
+    num_tokens,
+    top_k,
+    seed,
+    dtype=torch.bfloat16,
+):
+    """Inputs for one activation: the kernel's w1 (interleaved for gated
+    activations, plain for ReLU2) plus the model-layout pack for the reference."""
+    from flashinfer.fused_moe.cute_dsl.sm90_contiguous_gather_grouped_gemm_act_fusion import (
+        interleave_up_gate_sm90,
+    )
+
+    torch.manual_seed(seed)
+    gated = activation.is_gated
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype) / (hidden**0.25)
+    w1_model = torch.randn(
+        num_experts, (2 if gated else 1) * inter, hidden, device="cuda", dtype=dtype
+    ) / (hidden**0.25)
+    w1 = interleave_up_gate_sm90(w1_model) if gated else w1_model
+    w2 = torch.randn(num_experts, hidden, inter, device="cuda", dtype=dtype) / (
+        inter**0.25
+    )
+    ids, scales = make_random_topk(num_experts, num_tokens, top_k)
+    return x, ids, scales, w1, w1_model, w2
+
+
+@cute_dsl_available
+@sm90_required
+@pytest.mark.parametrize("activation", _moe_activation_cases())
+@pytest.mark.parametrize("num_tokens", [5, 640])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cute_dsl_bf16_moe_activation_types(activation, num_tokens, dtype):
+    """Each fused GEMM1 activation matches the shared float32 reference end
+    to end on the fixed default tactic, in bf16 and fp16."""
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    hidden, inter, num_experts, top_k = 1024, 256, 32, 4
+    x, ids, scales, w1, w1_model, w2 = _make_activation_case(
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=21, dtype=dtype
+    )
+    out = cute_dsl_fused_moe_bf16(
+        x,
+        ids,
+        scales,
+        w1,
+        w2,
+        num_experts=num_experts,
+        top_k=top_k,
+        **_cute_dsl_activation_kwargs(activation),
+    )
+    ref = ref_moe(x, ids, scales, w1_model, w2, activation)
+    torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+
+@cute_dsl_available
+@sm90_required
+@pytest.mark.parametrize("activation", _moe_activation_cases())
+@pytest.mark.parametrize(
+    "tactic",
+    [
+        (64, ((64, 64), 1), ((64, 64), (1, 1), False)),
+        (128, ((128, 128), 8), ((128, 128), (1, 1), True)),
+    ],
+    ids=["m64_n64", "m128_n128_swz8_rasterM"],
+)
+def test_cute_dsl_bf16_moe_activation_explicit_tactics(activation, tactic):
+    """Every activation is correct on tactics other than the default: a 64-row
+    tile with 64-wide N tiles, and 128x128 tiles with GEMM1 walk swizzle and
+    M-major GEMM2 raster."""
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    hidden, inter, num_experts, top_k, num_tokens = 1024, 256, 32, 4, 333
+    x, ids, scales, w1, w1_model, w2 = _make_activation_case(
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=24
+    )
+    out = cute_dsl_fused_moe_bf16(
+        x,
+        ids,
+        scales,
+        w1,
+        w2,
+        num_experts=num_experts,
+        top_k=top_k,
+        tactic=tactic,
+        **_cute_dsl_activation_kwargs(activation),
+    )
+    ref = ref_moe(x, ids, scales, w1_model, w2, activation)
+    torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+
+@cute_dsl_available
+@sm90_required
+def test_cute_dsl_bf16_moe_activation_switching_reuses_kernels():
+    """Alternating activations on identical shapes: each call uses its own
+    GEMM1 specialization (no cross-activation result contamination) and a
+    second round compiles nothing new."""
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer.fused_moe.cute_dsl import (
+        sm90_contiguous_gather_grouped_gemm_act_fusion as gather,
+    )
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    hidden, inter, num_experts, top_k, num_tokens = 1024, 256, 32, 4, 257
+    cases = []
+    for seed, param in enumerate(_moe_activation_cases(), start=30):
+        activation = param.values[0]
+        x, ids, scales, w1, w1_model, w2 = _make_activation_case(
+            activation, hidden, inter, num_experts, num_tokens, top_k, seed=seed
+        )
+        cases.append(
+            (
+                activation,
+                x,
+                ids,
+                scales,
+                w1,
+                w2,
+                ref_moe(x, ids, scales, w1_model, w2, activation),
+            )
+        )
+
+    def run_all():
+        for activation, x, ids, scales, w1, w2, ref in cases:
+            out = cute_dsl_fused_moe_bf16(
+                x,
+                ids,
+                scales,
+                w1,
+                w2,
+                num_experts=num_experts,
+                top_k=top_k,
+                **_cute_dsl_activation_kwargs(activation),
+            )
+            torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+    run_all()
+    compiled = len(gather._gather_kernel_cache)
+    run_all()
+    assert len(gather._gather_kernel_cache) == compiled
+
+
+@cute_dsl_available
+@sm90_required
+@pytest.mark.parametrize("activation", _moe_activation_cases())
+def test_cute_dsl_bf16_moe_activation_cuda_graph_replay(activation):
+    """Non-default activations capture into a CUDA graph and a replay with
+    fresh activations and routing matches the reference."""
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    hidden, inter, num_experts, top_k, num_tokens = 1024, 256, 32, 4, 200
+    act = _cute_dsl_activation_kwargs(activation)
+    x_st, ids_st, scales_st, w1, w1_model, w2 = _make_activation_case(
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=40
+    )
+    out_st = torch.empty(num_tokens, hidden, device="cuda", dtype=x_st.dtype)
+
+    def run():
+        return cute_dsl_fused_moe_bf16(
+            x_st,
+            ids_st,
+            scales_st,
+            w1,
+            w2,
+            num_experts=num_experts,
+            top_k=top_k,
+            moe_output=out_st,
+            **act,
+        )
+
+    for _ in range(3):
+        run()
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        run()
+
+    x_new, ids_new, scales_new, _, _, _ = _make_activation_case(
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=41
+    )
+    x_st.copy_(x_new)
+    ids_st.copy_(ids_new)
+    scales_st.copy_(scales_new)
+    g.replay()
+    torch.cuda.synchronize()
+    ref = ref_moe(x_new, ids_new, scales_new, w1_model, w2, activation)
+    torch.testing.assert_close(out_st.float(), ref, atol=3e-1, rtol=5e-2)
+
+
+@cute_dsl_available
+@sm90_required
+@pytest.mark.parametrize("hidden", [1032, 2072])
+@pytest.mark.parametrize(
+    "use_fused_finalize", [True, False], ids=["fused", "deterministic"]
+)
+@pytest.mark.parametrize(
+    "tactic",
+    [None, (64, ((64, 64), 1), ((64, 64), (1, 1), False))],
+    ids=["default", "m64_n64"],
+)
+def test_cute_dsl_bf16_moe_hidden_not_multiple_of_64(
+    hidden, use_fused_finalize, tactic
+):
+    """Hidden sizes that leave a partial last GEMM1 K tile and a partial last
+    GEMM2 N tile run end to end and match the reference."""
+    from flashinfer.fused_moe import SwiGLU
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    inter, num_experts, top_k, num_tokens = 256, 32, 4, 321
+    x, ids, scales, w1, w1_model, w2 = _make_activation_case(
+        SwiGLU(), hidden, inter, num_experts, num_tokens, top_k, seed=44
+    )
+    out = cute_dsl_fused_moe_bf16(
+        x,
+        ids,
+        scales,
+        w1,
+        w2,
+        num_experts=num_experts,
+        top_k=top_k,
+        use_fused_finalize=use_fused_finalize,
+        tactic=tactic,
+    )
+    ref = ref_moe(x, ids, scales, w1_model, w2)
+    torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+
+@cute_dsl_available
+@sm90_required
+@pytest.mark.parametrize("inter", [72, 200])
+@pytest.mark.parametrize(
+    "tactic",
+    [None, (64, ((64, 64), 1), ((64, 64), (1, 1), False))],
+    ids=["default", "m64_n64"],
+)
+def test_cute_dsl_bf16_moe_relu2_partial_n_tile(inter, tactic):
+    """ReLU2 intermediate sizes that leave a partial last GEMM1 N tile (and a
+    partial GEMM2 K tile) run end to end and match the reference."""
+    from flashinfer.fused_moe import ReLU2
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    activation = ReLU2()
+    hidden, num_experts, top_k, num_tokens = 1024, 32, 4, 321
+    x, ids, scales, w1, w1_model, w2 = _make_activation_case(
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=45
+    )
+    out = cute_dsl_fused_moe_bf16(
+        x,
+        ids,
+        scales,
+        w1,
+        w2,
+        num_experts=num_experts,
+        top_k=top_k,
+        tactic=tactic,
+        **_cute_dsl_activation_kwargs(activation),
+    )
+    ref = ref_moe(x, ids, scales, w1_model, w2, activation)
+    torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+
+@cute_dsl_available
+@sm90_required
+@pytest.mark.parametrize("gemm1_tile_n", [128, 256])
+def test_cute_dsl_bf16_moe_gated_partial_n_tile(gemm1_tile_n):
+    """Gated GEMM1 with 2I = 192 on a 128- or 256-wide N tile: the last tile is
+    partial, TMA zero-fills the missing w1 rows and clips the store."""
+    from flashinfer.fused_moe import SwiGLU
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    hidden, inter, num_experts, top_k, num_tokens = 1024, 96, 32, 4, 321
+    x, ids, scales, w1, w1_model, w2 = _make_activation_case(
+        SwiGLU(), hidden, inter, num_experts, num_tokens, top_k, seed=46
+    )
+    tactic = (128, ((128, gemm1_tile_n), 1), ((128, 128), (1, 1), False))
+    out = cute_dsl_fused_moe_bf16(
+        x, ids, scales, w1, w2, num_experts=num_experts, top_k=top_k, tactic=tactic
+    )
+    ref = ref_moe(x, ids, scales, w1_model, w2)
+    torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+
+@cute_dsl_available
+def test_sm90_moe_tactic_enumeration_follows_gating():
+    """For ReLU2 with I not a multiple of 64 the tuner enumerates GEMM1 tiles
+    over a partial last N tile; every candidate passes the non-gated rule."""
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import _moe_core_impl
+    from flashinfer.fused_moe.cute_dsl.sm90_tuner import (
+        CuteDslFusedMoESm90Runner,
+        is_valid_tactic,
+    )
+    from flashinfer.tllm_enums import ActivationType
+
+    num_experts, top_k, hidden, inter, num_tokens = 8, 2, 1024, 72, 64
+    runner = CuteDslFusedMoESm90Runner(
+        _moe_core_impl,
+        num_experts,
+        top_k,
+        num_experts,
+        activation_type=ActivationType.Relu2.value,
+    )
+    x = torch.empty(num_tokens, hidden, dtype=torch.bfloat16)
+    w1 = torch.empty(num_experts, inter, hidden, dtype=torch.bfloat16)
+    w2 = torch.empty(num_experts, hidden, inter, dtype=torch.bfloat16)
+    tactics = runner.get_valid_tactics([x, None, None, w1, w2], profile=None)
+    assert tactics[0] == -1 and len(tactics) > 1
+    common = dict(
+        dtype=torch.bfloat16,
+        num_tokens=num_tokens,
+        hidden_size=hidden,
+        top_k=top_k,
+        num_local_experts=num_experts,
+    )
+    for tactic in tactics[1:]:
+        assert is_valid_tactic(tactic, intermediate_size=inter, gated=False, **common)
+    assert any(tactic[1][0][1] > inter for tactic in tactics[1:])
+
+
+@cute_dsl_available
+@sm90_required
+def test_cute_dsl_bf16_moe_relu2_partial_n_autotune():
+    """Autotuning ReLU2 at I = 72 profiles the partial-N-tile candidates and
+    the winner matches the reference."""
+    from flashinfer import autotune
+    from flashinfer.fused_moe import ReLU2
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import cute_dsl_fused_moe_bf16
+
+    activation = ReLU2()
+    hidden, inter, num_experts, top_k, num_tokens = 1024, 72, 16, 2, 300
+    x, ids, scales, w1, w1_model, w2 = _make_activation_case(
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=47
+    )
+    with autotune(True):
+        out = cute_dsl_fused_moe_bf16(
+            x,
+            ids,
+            scales,
+            w1,
+            w2,
+            num_experts=num_experts,
+            top_k=top_k,
+            **_cute_dsl_activation_kwargs(activation),
+        )
+    ref = ref_moe(x, ids, scales, w1_model, w2, activation)
+    torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+
+@cute_dsl_available
+@sm90_required
+def test_cute_dsl_bf16_moe_relu2_autotune_and_wrapper():
+    """The non-gated activation goes through the tuner (GEMM1 N = I, no
+    interleave) and the wrapper class carries the activation configuration."""
+    from flashinfer.fused_moe.runners import _cute_dsl_activation_kwargs
+    from flashinfer import autotune
+    from flashinfer.fused_moe import ReLU2
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import (
+        CuteDslBf16MoEWrapper,
+        cute_dsl_fused_moe_bf16,
+    )
+
+    activation = ReLU2()
+    act = _cute_dsl_activation_kwargs(activation)
+    hidden, inter, num_experts, top_k, num_tokens = 1024, 192, 16, 2, 300
+    x, ids, scales, w1, w1_model, w2 = _make_activation_case(
+        activation, hidden, inter, num_experts, num_tokens, top_k, seed=22
+    )
+    assert w1.shape == (num_experts, inter, hidden)
+    ref = ref_moe(x, ids, scales, w1_model, w2, activation)
+
+    with autotune(True):
+        tuned = cute_dsl_fused_moe_bf16(
+            x, ids, scales, w1, w2, num_experts=num_experts, top_k=top_k, **act
+        )
+    torch.testing.assert_close(tuned.float(), ref, atol=3e-1, rtol=5e-2)
+
+    moe = CuteDslBf16MoEWrapper(
+        num_experts=num_experts,
+        top_k=top_k,
+        hidden_size=hidden,
+        intermediate_size=inter,
+        **act,
+    )
+    out = moe.run(x, ids, scales, w1, w2)
+    torch.testing.assert_close(out.float(), ref, atol=3e-1, rtol=5e-2)
+
+    # A gated-shaped w1 ([E, 2I, H]) with the non-gated activation makes GEMM1's
+    # output 2I wide, which GEMM2's [E, H, I] weights cannot consume.
+    w1_gated_shape = torch.cat((w1, w1), dim=1)
+    with pytest.raises(ValueError, match="does not match"):
+        cute_dsl_fused_moe_bf16(
+            x,
+            ids,
+            scales,
+            w1_gated_shape,
+            w2,
+            num_experts=num_experts,
+            top_k=top_k,
+            tactic=(128, ((128, 64), 1), ((128, 64), (1, 1), False)),
+            **act,
+        )
+
+
+@cute_dsl_available
+def test_sm90_moe_runner_rejects_bad_activation_config():
+    """Unsupported activation types, bad SwiGLU constants and inconsistent SiTU
+    parameters fail at runner construction (before any kernel work), checked in
+    that order."""
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import _moe_core_impl
+    from flashinfer.fused_moe.cute_dsl.sm90_tuner import CuteDslFusedMoESm90Runner
+    from flashinfer.tllm_enums import ActivationType
+
+    def make(**kwargs):
+        return CuteDslFusedMoESm90Runner(_moe_core_impl, 4, 2, 4, **kwargs)
+
+    for bad in (ActivationType.Geglu, ActivationType.Silu, ActivationType.Gelu):
+        with pytest.raises(ValueError, match="Unsupported activation_type"):
+            make(activation_type=bad.value)
+    for bad_alpha in (float("nan"), float("inf"), 1e39):
+        with pytest.raises(ValueError, match="swiglu_alpha must be finite"):
+            make(swiglu_alpha=bad_alpha)
+    with pytest.raises(ValueError, match="swiglu_beta must be finite"):
+        make(swiglu_beta=float("-inf"))
+    for bad_limit in (0.0, -1.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="swiglu_limit must be positive"):
+            make(swiglu_limit=bad_limit)
+    with pytest.raises(ValueError, match="requires situ_beta"):
+        make(situ_linear_beta=25.0)
+    with pytest.raises(ValueError, match="require ActivationType.Swiglu"):
+        make(activation_type=ActivationType.GegluTanh.value, situ_beta=4.0)
+    with pytest.raises(ValueError, match="positive and finite"):
+        make(situ_beta=-1.0)
+    # Positive finite in f64 but 0.0 / inf after fp32 rounding.
+    for bad_scale in (1e-50, 1e39):
+        with pytest.raises(ValueError, match="situ_beta must be positive"):
+            make(situ_beta=bad_scale)
+        with pytest.raises(ValueError, match="situ_linear_beta must be positive"):
+            make(situ_beta=4.0, situ_linear_beta=bad_scale)
+    with pytest.raises(ValueError, match="swiglu_limit must be positive"):
+        make(swiglu_limit=0.0, situ_beta=-1.0)
+    assert make(activation_type=ActivationType.Relu2.value).gated is False
+    assert make().gated is True
+
+
+@cute_dsl_available
+def test_sm90_moe_activation_config_separates_cache_keys():
+    """Activation type and constants are part of the tuner cache key and the
+    runner hash: a persisted winner never serves a different activation."""
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import _moe_core_impl
+    from flashinfer.fused_moe.cute_dsl.sm90_tuner import CuteDslFusedMoESm90Runner
+    from flashinfer.tllm_enums import ActivationType
+
+    inputs = [torch.empty((4, 64), dtype=torch.bfloat16)]
+    configs = [
+        {},
+        dict(activation_type=ActivationType.GegluTanh.value),
+        dict(activation_type=ActivationType.Relu2.value),
+        dict(swiglu_alpha=1.702, swiglu_beta=1.0, swiglu_limit=7.0),
+        dict(swiglu_limit=7.0),
+        dict(situ_beta=4.0),
+        dict(situ_beta=4.0, situ_linear_beta=25.0),
+    ]
+    runners = [
+        CuteDslFusedMoESm90Runner(_moe_core_impl, 4, 2, 4, **cfg) for cfg in configs
+    ]
+    keys = {r.get_cache_key_extras(inputs) for r in runners}
+    hashes = {hash(r) for r in runners}
+    assert len(keys) == len(configs)
+    assert len(hashes) == len(configs)
+
+    # The autotuner op name carries the activation family (SiTU named as such).
+    from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import _sm90_moe_autotune_op_name
+
+    assert _sm90_moe_autotune_op_name(ActivationType.Swiglu.value) == (
+        "CuteDslFusedMoE::run_moe_sm90::Swiglu"
+    )
+    assert _sm90_moe_autotune_op_name(ActivationType.GegluTanh.value).endswith(
+        "::GegluTanh"
+    )
+    assert _sm90_moe_autotune_op_name(ActivationType.Relu2.value).endswith("::Relu2")
+    assert _sm90_moe_autotune_op_name(
+        ActivationType.Swiglu.value, situ_beta=4.0
+    ).endswith("::Situ")
+
+
+@cute_dsl_available
+def test_sm90_moe_non_gated_tactic_legality():
+    """GEMM1's N is 2I for gated activations (whole 32-column up/gate pairs,
+    so I % 32) and I for Relu2 (16-byte C rows, so I % 8); a partial last N
+    tile is legal for any tile width."""
+    from flashinfer.fused_moe.cute_dsl.sm90_tuner import (
+        DEFAULT_SM90_MOE_TACTIC,
+        is_valid_tactic,
+    )
+
+    common = dict(
+        dtype=torch.bfloat16,
+        num_tokens=64,
+        hidden_size=1024,
+        top_k=2,
+        num_local_experts=8,
+    )
+    assert is_valid_tactic(DEFAULT_SM90_MOE_TACTIC, intermediate_size=96, **common)
+    assert is_valid_tactic(
+        DEFAULT_SM90_MOE_TACTIC, intermediate_size=96, gated=False, **common
+    )
+    # Non-gated: I = 72 gives 16-byte rows (partial N tile), I = 100 does not.
+    assert is_valid_tactic(
+        DEFAULT_SM90_MOE_TACTIC, intermediate_size=72, gated=False, **common
+    )
+    assert not is_valid_tactic(
+        DEFAULT_SM90_MOE_TACTIC, intermediate_size=100, gated=False, **common
+    )
+    # Gated: I = 40 breaks the 32-column up/gate pairing (2I = 80).
+    assert not is_valid_tactic(DEFAULT_SM90_MOE_TACTIC, intermediate_size=40, **common)
+    # A 256-wide N tile over a narrower N is a partial tile, legal either way.
+    wide = (128, ((128, 256), 1), ((128, 64), (1, 1), False))
+    assert is_valid_tactic(wide, intermediate_size=128, **common)
+    assert is_valid_tactic(wide, intermediate_size=128, gated=False, **common)
+    assert is_valid_tactic(wide, intermediate_size=256, gated=False, **common)

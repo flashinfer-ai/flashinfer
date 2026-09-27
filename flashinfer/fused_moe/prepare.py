@@ -932,10 +932,23 @@ def prepare_trtllm_fp8_block_activations(
 
 
 def _fp8_per_tensor_scale(
-    scale: Union[float, torch.Tensor], *, name: str, device: torch.device
+    scale: Union[float, torch.Tensor],
+    *,
+    name: str,
+    device: torch.device,
+    validate: bool = True,
 ) -> torch.Tensor:
+    """Return ``scale`` as a 0-dim float32 tensor on ``device``.
+
+    ``validate=False`` skips the finite / positive checks, which read the value
+    back to the host. Weight preparation always validates; activation
+    preparation passes ``validate=False`` for a scale that is already a device
+    tensor, so the per-step path launches no sync and can be graph-captured.
+    """
     value = torch.as_tensor(scale, dtype=torch.float32, device=device)
-    if value.numel() != 1 or not bool(torch.isfinite(value).all()) or value.item() <= 0:
+    if value.numel() != 1:
+        raise ValueError(f"{name} must be one FP32 value, got {scale!r}.")
+    if validate and (not bool(torch.isfinite(value).all()) or value.item() <= 0):
         raise ValueError(
             f"{name} must be one finite positive FP32 value, got {scale!r}."
         )
@@ -1065,7 +1078,13 @@ def prepare_trtllm_fp8_per_tensor_activations(
     *,
     hidden_states_scale_global: Union[float, torch.Tensor],
 ) -> Tuple[torch.Tensor, None]:
-    """Quantize ``[M, H]`` BF16 activations with one calibrated E4M3 scale."""
+    """Quantize ``[M, H]`` BF16 activations with one calibrated E4M3 scale.
+
+    A ``hidden_states_scale_global`` that is already a CUDA tensor (the value
+    ``prepare_weights`` validated and stored in the view) is used as-is, so
+    this is a pure device op that can run under CUDA graph capture. A Python
+    float or CPU tensor is validated and copied to the device.
+    """
     if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
         raise ValueError(
             "prepare_trtllm_fp8_per_tensor_activations expects a 2D BF16 tensor, "
@@ -1076,6 +1095,10 @@ def prepare_trtllm_fp8_per_tensor_activations(
         hidden_states_scale_global,
         name="hidden_states_scale_global",
         device=hidden_states_bf16.device,
+        validate=not (
+            isinstance(hidden_states_scale_global, torch.Tensor)
+            and hidden_states_scale_global.is_cuda
+        ),
     )
     fp8_max = torch.finfo(torch.float8_e4m3fn).max
     quantized = (hidden_states_bf16.float() * scale).clamp(-fp8_max, fp8_max)
@@ -1660,6 +1683,74 @@ def prepare_cutile_mxfp4_weights(
     }
 
 
+def prepare_cutile_fp8_weights(
+    w1_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    block_scaled: bool,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Prepare checkpoint E4M3 weights without requantizing or expanding them.
+
+    Per-tensor scales are FP32, one per expert GEMM (shape ``[E]``).
+    MXFP8 scales are E8M0 bytes in logical ``[E, N, K/32]`` order.
+    Both A16 and A8 consume the same prepared tensors on every supported GPU.
+    Canonical gated GEMM1 rows arrive as ``[up, gate]`` and are prepared in the
+    kernel-consumed ``[gate, up]`` order.
+    """
+    from .api import _CUTILE_SUPPORTED_ACTIVATIONS
+
+    activation_type = ActivationType(activation_type)
+    if activation_type not in _CUTILE_SUPPORTED_ACTIVATIONS:
+        raise ValueError(f"unsupported cuTile FP8 activation {activation_type!r}.")
+    if (
+        min(hidden_size, intermediate_size) <= 0
+        or hidden_size % 32
+        or intermediate_size % 32
+    ):
+        raise ValueError(
+            "cuTile FP8 requires positive hidden/intermediate sizes divisible by 32."
+        )
+    if device is None:
+        device = w1_fp8.device
+    device = torch.device(device)
+    rows = intermediate_size * (2 if activation_type.is_gated else 1)
+    result = {}
+    for name, weight, scale, n, k in (
+        ("w1", w1_fp8, w1_scale, rows, hidden_size),
+        ("w2", w2_fp8, w2_scale, hidden_size, intermediate_size),
+    ):
+        if weight.dtype != torch.float8_e4m3fn:
+            raise TypeError("cuTile FP8 weights must use torch.float8_e4m3fn.")
+        if tuple(weight.shape) != (num_local_experts, n, k):
+            raise ValueError(f"{name} must have shape {(num_local_experts, n, k)}.")
+        shape = (
+            (num_local_experts, n, k // 32) if block_scaled else (num_local_experts,)
+        )
+        if tuple(scale.shape) != shape:
+            raise ValueError(f"{name}_scale must have shape {shape}.")
+        dtype = torch.float8_e8m0fnu if block_scaled else torch.float32
+        if scale.dtype not in ((dtype, torch.uint8) if block_scaled else (dtype,)):
+            raise TypeError(f"{name}_scale must use {dtype}.")
+        weight = weight.to(device).contiguous()
+        scale = scale.to(device).contiguous().view(dtype)
+        if name == "w1" and activation_type.is_gated:
+            up, gate = weight.view(torch.uint8).chunk(2, dim=1)
+            weight = torch.cat((gate, up), dim=1).view(torch.float8_e4m3fn)
+            if block_scaled:
+                up, gate = scale.view(torch.uint8).chunk(2, dim=1)
+                scale = torch.cat((gate, up), dim=1).view(dtype)
+        result[name] = weight
+        result[f"{name}_scale"] = scale
+    return result
+
+
 def prepare_cutile_bf16_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
@@ -1823,6 +1914,10 @@ def prepare_cutlass_w4a16_weights(
 
 
 _NVFP4_SF_VEC_SIZE = 16
+# MinKDimAlignmentNVFP4 of the CUTLASS expand kernel: the row stride of the
+# linear activation block scale is padded to hidden_size / 16 rounded up to
+# this alignment / 16, so hidden_size itself must be a multiple of it.
+_CUTLASS_NVFP4_HIDDEN_ALIGNMENT = 64
 _NVFP4_SF_SWIZZLE_ROWS = 128
 
 
@@ -1864,13 +1959,20 @@ def prepare_cutlass_nvfp4_weights(
             "prepare_cutlass_nvfp4_weights expects BF16 weights, got "
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
         )
-    if (
-        hidden_size % _NVFP4_SF_VEC_SIZE != 0
-        or intermediate_size % _NVFP4_SF_VEC_SIZE != 0
-    ):
+    # The expand kernel reads the canonical linear input_sf with a row stride
+    # padded to MinKDimAlignmentNVFP4 (64), so a compact [M, H / 16] pack is
+    # only correct for H % 64 == 0. GEMM2's input is quantized in-kernel, so
+    # I only needs the 16-element block. Reject here, at load time, rather
+    # than on the first forward.
+    if hidden_size % _CUTLASS_NVFP4_HIDDEN_ALIGNMENT != 0:
         raise ValueError(
-            "Cutlass NVFP4 requires hidden_size and intermediate_size "
-            f"divisible by {_NVFP4_SF_VEC_SIZE}."
+            "Cutlass NVFP4 requires hidden_size divisible by "
+            f"{_CUTLASS_NVFP4_HIDDEN_ALIGNMENT}, got {hidden_size}."
+        )
+    if intermediate_size % _NVFP4_SF_VEC_SIZE != 0:
+        raise ValueError(
+            "Cutlass NVFP4 requires intermediate_size divisible by "
+            f"{_NVFP4_SF_VEC_SIZE}, got {intermediate_size}."
         )
     activation = _normalize_activation(activation)
     gemm1_rows = _gemm1_rows(intermediate_size, activation)
@@ -1970,29 +2072,12 @@ def _require_canonical_cutlass_bf16_weights(
     return w1_bf16.to(device).contiguous(), w2_bf16.to(device).contiguous(), device
 
 
-def prepare_cutlass_fp8_per_tensor_activations(
-    hidden_states_bf16: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Quantize ``[M, H]`` BF16 activations to E4M3 plus a scalar dequant scale."""
-    if hidden_states_bf16.dtype != torch.bfloat16 or hidden_states_bf16.dim() != 2:
-        raise ValueError(
-            "prepare_cutlass_fp8_per_tensor_activations expects a 2D BF16 tensor, "
-            f"got shape={tuple(hidden_states_bf16.shape)}, "
-            f"dtype={hidden_states_bf16.dtype}."
-        )
-    fp8_max = torch.finfo(torch.float8_e4m3fn).max
-    amax = hidden_states_bf16.float().abs().amax()
-    dequant = torch.where(
-        amax > 0, amax / fp8_max, torch.ones_like(amax, dtype=torch.float32)
-    ).to(torch.float32)
-    quantized = (hidden_states_bf16.float() / dequant).clamp(-fp8_max, fp8_max)
-    return quantized.to(torch.float8_e4m3fn), dequant.reshape(())
-
-
 def prepare_cutlass_fp8_per_tensor_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
     *,
+    hidden_states_scale_global: Union[float, torch.Tensor],
+    intermediate_scale_global: Union[float, torch.Tensor],
     num_local_experts: int,
     hidden_size: int,
     intermediate_size: int,
@@ -2001,9 +2086,23 @@ def prepare_cutlass_fp8_per_tensor_weights(
 ) -> Dict[str, torch.Tensor]:
     """Build the unshuffled per-tensor FP8 view for ``CutlassFp8PerTensorRunner``.
 
-    Each expert uses one E4M3 multiplier. The returned ``fc1_dequant`` /
-    ``fc2_dequant`` tensors are the CUTLASS dequant scales (``amax / fp8_max``),
-    not TRTLLM's inverted calibration multipliers.
+    Each expert uses one E4M3 multiplier. ``hidden_states_scale_global`` and
+    ``intermediate_scale_global`` are the same static calibration
+    *multipliers* the TRTLLM per-tensor view carries (``q = x * scale``);
+    activations are quantized with the former by
+    ``prepare_trtllm_fp8_per_tensor_activations`` and carry no pack scale, and
+    GEMM1 output is requantized with the latter before GEMM2.
+
+    The flat CUTLASS ``quant_scales`` ABI is folded here, once at load time:
+    ``fc1_dequant_scale = fc1_dequant / hidden_states_scale_global`` (``[E]``),
+    ``fc2_act_quant_scale = intermediate_scale_global`` (0-dim),
+    ``fc2_dequant_scale = fc2_dequant / intermediate_scale_global`` (``[E]``),
+    ``fc1_act_dequant_scale = 1 / hidden_states_scale_global`` (0-dim). The
+    runner passes these four through unchanged. ``fc1_dequant`` /
+    ``fc2_dequant`` (per-expert weight dequant, ``amax / fp8_max``) and the two
+    global multipliers are kept as calibration metadata for callers preparing
+    activations or building a reference; the runner ignores them. To
+    re-calibrate, call this function again.
     """
     w1_bf16, w2_bf16, device = _require_canonical_cutlass_bf16_weights(
         w1_bf16,
@@ -2017,11 +2116,29 @@ def prepare_cutlass_fp8_per_tensor_weights(
     )
     w1_q, w1_mult = _quantize_fp8_per_expert(w1_bf16)
     w2_q, w2_mult = _quantize_fp8_per_expert(w2_bf16)
+    act_scale = _fp8_per_tensor_scale(
+        hidden_states_scale_global, name="hidden_states_scale_global", device=device
+    )
+    inter_scale = _fp8_per_tensor_scale(
+        intermediate_scale_global, name="intermediate_scale_global", device=device
+    )
+    fc1_dequant = (1.0 / w1_mult).contiguous()
+    fc2_dequant = (1.0 / w2_mult).contiguous()
     return {
         "fc1_expert_weights": w1_q,
         "fc2_expert_weights": w2_q,
-        "fc1_dequant": (1.0 / w1_mult).contiguous(),
-        "fc2_dequant": (1.0 / w2_mult).contiguous(),
+        # Flat quant_scales ABI, in slot order.
+        "fc1_dequant_scale": (fc1_dequant / act_scale).contiguous(),
+        "fc2_act_quant_scale": inter_scale.clone(),
+        "fc2_dequant_scale": (fc2_dequant / inter_scale).contiguous(),
+        "fc1_act_dequant_scale": act_scale.reciprocal(),
+        # Calibration metadata; the runner ignores these keys.
+        "fc1_dequant": fc1_dequant,
+        "fc2_dequant": fc2_dequant,
+        # Copies, so the view never aliases a caller tensor that may be written
+        # in place after preparation.
+        "hidden_states_scale_global": act_scale.clone(),
+        "intermediate_scale_global": inter_scale.clone(),
     }
 
 

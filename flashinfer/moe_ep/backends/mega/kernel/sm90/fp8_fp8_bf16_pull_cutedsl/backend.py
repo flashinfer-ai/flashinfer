@@ -176,7 +176,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             load_balance_mode=k.load_balance_mode,
             gate_up_clamp=_resolve_gate_up_clamp(k),
             activation_clamp=k.activation_clamp,
-            in_kernel_fc2_reduce=k.in_kernel_fc2_reduce,
+            in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             token_back_by_dispatch=k.token_back_by_dispatch,
             token_back_mode=k.token_back_mode,
             dedup_dispatch=k.dedup_dispatch,
@@ -188,6 +188,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             fc1_early_done_publish=k.fc1_early_done_publish,
             fold_producer_warps=k.fold_producer_warps,
             generate_c=k.generate_c,
+            tail_split_pairs=k.tail_split_pairs,
         )
 
     def validate_forward(
@@ -367,7 +368,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             k.cluster_shape_mnk,
             k.load_balance_mode,
             _resolve_gate_up_clamp(k),
-            k.in_kernel_fc2_reduce,
+            k.enable_in_kernel_fc2_reduce,
             k.token_back_by_dispatch,
             k.token_back_mode,
             k.dedup_dispatch,
@@ -379,5 +380,6 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             k.fc1_early_done_publish,
             k.fold_producer_warps,
             k.generate_c,
+            k.tail_split_pairs,
             knobs_pool_key(k.knobs),
         )

@@ -1,10 +1,16 @@
 # moe_ep Design
 
+`flashinfer.moe_ep` implements expert-parallel MoE layers, communication
+backends, and fused kernels.
+
 > For build/test/how-to-extend instructions, see the
 > [moe_ep runbook](./moe_ep_runbook.md).
 > For the CuTeDSL mega backends' tuning surface, measured performance, and
 > benchmark methodology, see
-> [kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+> [kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md)
+> (SM100) and
+> [kernel_src/sm107/next_cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/TUNING.md)
+> (SM107).
 
 Expert-Parallel MoE with two execution modes:
 
@@ -105,13 +111,15 @@ flowchart TD
     F --> M
 ```
 
-The knobs split into two classes (`kernel_src/cutedsl_megamoe/shim/tuner.py`):
+The knobs split into two classes (`kernel_src/sm100/cutedsl_megamoe/shim/tuner.py`):
 
 - **correctness knobs** change a code path or the output and must be kept at
-  the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
-  `token_back_mode`, `load_balance_mode`, `non_ubulk_fc2_store`, and
-  `in_kernel_fc2_reduce` (ikr — makes the accumulation order
-  nondeterministic; pin `False` for bit-reproducibility);
+the validated value: `mma_tiler_mnk`, `cluster_shape_mnk`,
+`token_back_mode`, `load_balance_mode`, `non_ubulk_fc2_store`, and
+`in_kernel_fc2_reduce` (ikr — makes the accumulation order
+nondeterministic); the knobs may select it, but only when the config sets
+`enable_in_kernel_fc2_reduce=True`, so leaving `enable_in_kernel_fc2_reduce`
+at `False` keeps the session bit-reproducible.
 - **perf knobs** are output-neutral and free to sweep: `group_hint`,
   `flag_batch`, `epi_flag_batch`.
 
@@ -121,7 +129,7 @@ compilable combinations.
 
 ### Detailed example: `sm100_nvfp4_nvfp4_bf16_cutedsl`
 
-**1. Default (`knobs=None`).** The session resolves the knob cache first;
+**1. Default (**`knobs=None`**).** The session resolves the knob cache first;
 on a miss it falls back to four measured token-count profiles keyed on the
 compile-time buffer capacity (`max_tokens_per_rank * world`):
 
@@ -132,7 +140,9 @@ compile-time buffer capacity (`max_tokens_per_rank * world`):
 | 1024–2047 | mid-large: 256-wide N tile, `standalone_warps` |
 | ≥ 2048 | large throughput: `flag_batch=8`, `reuse_dispatch_warps` |
 
-**2. Pinned (`knobs=dict`).** E.g. a winner from the kernel team's tester
+`in_kernel_fc2_reduce` defaults to the value of `enable_in_kernel_fc2_reduce`
+
+**2. Pinned (**`knobs=dict`**).** E.g. a winner from the kernel team's tester
 sweep:
 
 ```python
@@ -146,7 +156,7 @@ Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
 )
 ```
 
-**3. Online (`knobs="auto"`).** At the first `compute()` every rank runs the
+**3. Online (**`knobs="auto"`**).** At the first `compute()` every rank runs the
 same ~24-candidate sweep (`nvfp4_candidates()`: tile {256×128, 256×256} ×
 `flag_batch` {4, 8} × three `token_back_mode` values × ikr {off, on}, over a
 fixed base of `cluster (2,1,1)`, `group_hint 512`, `epi_flag_batch (2,4)`,
@@ -176,7 +186,7 @@ candidates are excluded from the CLI sweep unless
 `--allow-nondeterministic` is passed.
 
 Measured results, methodology, and the full knob reference live in
-[kernel_src/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+[kernel_src/sm100/cutedsl_megamoe/TUNING.md](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
 
 ## Layout
 
@@ -186,9 +196,10 @@ moe_ep/
   core/comm, core/kernel, core/runtime, core/validation, core/bootstrap_utils.py
   backends/split/comm/{nccl_ep,nixl_ep}
   backends/split/kernel/{identity,fused_moe}
-  backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
+  backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,bf16_mxfp8_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
-  kernel_src/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
+  backends/mega/kernel/sm107/{mxfp8_mxfp8_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl}
+  kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_bf16_glu, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by the sm100 cutedsl backends
     shim/                      ← thin adapters over src/ (_paths, comm, bf16, nvfp4, mxfp8, kernel_helpers, correctness, autotune, tuner)
@@ -201,6 +212,10 @@ moe_ep/
   kernel_src/sm90/push_style_megamoe/  ← Hopper push-style FP8 (raw CUDA, JIT-compiled)
     src/{a2a,fp8_gemm}/        ← VERBATIM drop from flashinfer PR #4069 (.cu/.cuh)
     shim/, __init__.py, VENDOR.md  ← shim is part of the upstream PR here (vendored with it)
+  kernel_src/sm107/next_cutedsl_megamoe/  ← Rubin block-scaled inference
+    src/sources/               ← verbatim upstream exporter output; see VENDOR.md
+    shim/, __init__.py          ← FlashInfer adapters and public package API
+    VENDOR.md, SKILL.md, TUNING.md  ← provenance, update procedure, and measurements
   modes/{split_layer,mega_layer,config}.py
 ```
 
@@ -395,19 +410,23 @@ See the [runbook's mega-kernel walkthrough](./moe_ep_runbook.md#adding-a-new-meg
 
 See the [runbook's build & test section](./moe_ep_runbook.md#build--test-environment) for the container setup and per-target requirements.
 
-`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|multirank|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|smoke|ft|all]`:
+`tests/moe_ep/run_tests.sh [unit|oracle|oracle_sm90|oracle_sm107|qualify_sm107|multirank|sm90_push|split_path_correctness_{bf16,nvfp4,ht}|mega|mega_sm90|mega_sm107|smoke|ft|all]`:
 
 - **unit** — host-only pytest (mocks + single-GPU; no multirank)
 - **oracle** — single-GPU torch-oracle correctness for every SM100 compute path (see **Torch oracles** below)
 - **oracle_sm90** — single-GPU (Hopper) torch oracle for the sm90_fp8_fp8_bf16_pull_cutedsl mega kernel
+- **oracle_sm107** — single-GPU (Rubin) torch oracle and boundary tests for NVFP4, MXFP8 E4M3, and MXFP8 E5M2
+- **qualify_sm107** — strict Rubin host, single-GPU, and multirank qualification, rejecting skipped/empty tests and OOMs; see the [qualification runbook](moe_ep_sm107_qualification.md)
 - **multirank** — 4-GPU split path: `test_moe_ep_layer_multirank.py` + `test_split_kernels.py` over NCCL-EP (and NIXL-EP when built)
 - **split_path_correctness_{bf16,nvfp4,ht}** — 4-GPU split-path numerics (LL EXPERT_MAJOR + RANK_MAJOR / NVFP4 / HT FLAT) vs a single-process `MoELayer` reference (Blackwell)
 - **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity **and multi-rank torch oracles**, plus single-rank preprocess/kernel-vs-reference checks (`MEGA_NO_DIST=1`) (Blackwell, sm_100+)
 - **mega_sm90** — 4-GPU (Hopper) sm90_fp8_fp8_bf16_pull_cutedsl mega parity + multi-rank torch oracle; own torchrun process (the SM90/SM100 kernel trees share top-level module names and are mutually exclusive per process)
+- **mega_sm107** — Rubin MoEEpLayer vs multirank torch oracle for all three formats, with idle ranks and pooled-layer graph replay; `NPROC_MULTIRANK=2`, `4`, or `8` (default 4), own torchrun process
+- **sm90_push** — 2-GPU (Hopper) sm90_fp8_fp8_bf16_push_cuda kernel + backend; own torchrun process
 - **smoke** — NCCL-EP smoke script (and NIXL-EP when built)
 - **ft** — 4-GPU fault-tolerance (stalled-rank pytest half + dead-rank smoke half)
 
-`all` runs the eight Blackwell-relevant sections (everything above except the two `*_sm90` targets, which need Hopper).
+`all` runs the eight Blackwell-relevant sections (everything above except the Hopper-only targets — `oracle_sm90`, `mega_sm90`, `sm90_push` — and the Rubin-only `*_sm107` targets).
 
 Multirank/smoke/correctness need the NCCL-EP build (see **Build / availability** — `docker/install/build_flashinfer_ep_pytorch.sh`); mega additionally needs Blackwell, deep_gemm, triton.
 
