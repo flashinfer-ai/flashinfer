@@ -88,6 +88,15 @@ def _require_program():
         pytest.skip("generated NVFP4 MSA decode program not registered for this device")
 
 
+def _require_existing_route():
+    """The peer checks below need the existing ``msa_ops`` NVFP4 route on this
+    device. That route is gated by its own capability map, separately from the
+    generated programs of the ``cake`` backend, so a device the backend serves
+    may still be one the route declines."""
+    if upstream._target_for(torch.device("cuda")) is None:
+        pytest.skip("the existing NVFP4 route is not enabled on this device")
+
+
 # ---------------------------------------------------------------------------
 # Host layer (CPU)
 # ---------------------------------------------------------------------------
@@ -563,6 +572,7 @@ def test_matches_the_existing_nvfp4_route(seq_lens, num_kv_heads):
     existing route is checked at its own peer tolerance.
     """
     _require_program()
+    _require_existing_route()
     inputs, runner, _ = _run_and_check(seq_lens, num_kv_heads, seed=41)
     route_out = torch.empty_like(inputs["q"])
     msa_sparse_decode_attention(
@@ -583,6 +593,7 @@ def test_serves_a_geometry_the_existing_route_declines():
     """Eight query heads per KV head is outside the route's allowlist; the
     generated program serves it from the same pages."""
     _require_program()
+    _require_existing_route()
     inputs, _, _ = _run_and_check([4096] * 3, 1, group_size=8, seed=43)
     with pytest.raises(NotImplementedError):
         msa_sparse_decode_attention(
