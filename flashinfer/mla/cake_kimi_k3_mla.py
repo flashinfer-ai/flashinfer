@@ -157,14 +157,21 @@ def plan_wide_work(
     base = full_waves * (tiles + wave_cost_tiles)
     cost_one = base + wave(tiles, tail)
     best_s, best_cost = 1, cost_one
-    for s in range(2, max(2, min(max_splits, tiles // max(1, min_tiles_per_split))) + 1):
+    for s in range(
+        2, max(2, min(max_splits, tiles // max(1, min_tiles_per_split))) + 1
+    ):
         chunk = -(-tiles // s)
         if chunk < min_tiles_per_split:
             break
         chunks = tail * s
         waves = -(-chunks // pairs)
         last = chunks - (waves - 1) * pairs
-        cost = base + (waves - 1) * (chunk + wave_cost_tiles) + wave(chunk, last) + 0.05 * chunks
+        cost = (
+            base
+            + (waves - 1) * (chunk + wave_cost_tiles)
+            + wave(chunk, last)
+            + 0.05 * chunks
+        )
         if cost < best_cost:
             best_s, best_cost = s, cost
     if best_s > 1 and best_cost <= cost_one * (1.0 - WIDE_TAIL_MIN_GAIN):
@@ -329,7 +336,10 @@ class KimiK3MlaFp8PagedAttention:
             self.m_tiles = (rows_per_request + WIDE_TILE_Q - 1) // WIDE_TILE_Q
             # Full waves of SM pairs run unsplit items; only the tail items (if any) take num_split clusters.
             self.n_full_items, self.num_split = plan_wide_work(
-                self.batch * self.m_tiles, int(max_seq_len), sm_count, forced_split=num_split
+                self.batch * self.m_tiles,
+                int(max_seq_len),
+                sm_count,
+                forced_split=num_split,
             )
         else:
             self.rt = swapped_rt(rows_per_request)
@@ -429,7 +439,9 @@ class KimiK3MlaFp8PagedAttention:
         )
         if self.wide:
             # Unsplit items store the caller's O directly; the flat grid decodes items from these two scalars.
-            main_values.update(O=self.o_rows, m_tiles=self.m_tiles, n_full_items=self.n_full_items)
+            main_values.update(
+                O=self.o_rows, m_tiles=self.m_tiles, n_full_items=self.n_full_items
+            )
         self._main_args = _bound_args(self._main, main_values, self.grid_main)
         self._reduce_args = None
         if self.num_split > 1:
