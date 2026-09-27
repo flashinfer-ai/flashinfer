@@ -19,7 +19,8 @@ packed token stream ``[T, 56, 128]`` with ``int32`` ``cu_seqlens`` segment bound
 ``flashinfer.diffusion_ops.minimax_h3_sm120_varlen_attention_nvfp4`` (experimental) follows the
 SageAttention3 FP4 recipe: Q / K / V and the probabilities are NVFP4 (E2M1 + UE4M3 block scales)
 and both the scores and the value product run block-scaled ``mma.sync kind::mxf4nvf4`` (FP32
-softmax, per-segment K mean and per-128-row Q block mean removal), in three PDL-chained launches.  This
+softmax, per-segment K mean and per-128-row Q block mean removal), in two or three PDL-chained launches
+(the statistics + quantizer pre-processing is one fused launch for the plans routed to it).  This
 script times that operator against the shipped FP8 operator
 (``minimax_h3_sm120_varlen_attention_fp8``) and the FlashInfer BF16 ragged routes (``fa2``,
 ``cudnn`` and ``auto``) with ``bench_gpu_time`` (CUPTI, cold L2), reports the error of every

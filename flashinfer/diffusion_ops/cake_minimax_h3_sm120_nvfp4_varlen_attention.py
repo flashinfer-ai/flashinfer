@@ -70,6 +70,7 @@ def workspace_bytes_nvfp4(tokens: int, num_heads: int, num_segments: int) -> int
     num_tiles = _ceil_div(tokens, _BLOCK_M) + max(1, num_segments)
     partials = num_tiles * num_heads * MINIMAX_H3_HEAD_DIM
     counters = max(1, num_segments) * num_heads
+    barrier = 4  # grid-barrier word of the fused pre-processing launch
     return (
         q4
         + k4
@@ -78,7 +79,7 @@ def workspace_bytes_nvfp4(tokens: int, num_heads: int, num_segments: int) -> int
         + v_sf
         + vt4
         + qm
-        + 4 * (q_mean + mean_k + partials + counters)
+        + 4 * (q_mean + mean_k + partials + counters + barrier)
     )
 
 
@@ -199,6 +200,7 @@ def _zero_workspace(
         "mean_k",
         "partials",
         "counters",
+        "barrier",
     ),
 )
 def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
@@ -223,6 +225,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
     mean_k: torch.Tensor,
     partials: torch.Tensor,
     counters: torch.Tensor,
+    barrier: torch.Tensor,
     num_segments: int,
     num_tiles: int,
     num_qtiles: int,
@@ -252,6 +255,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
         mean_k,
         partials,
         counters,
+        barrier,
         num_segments,
         num_tiles,
         num_qtiles,
@@ -284,6 +288,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_fake(
     mean_k: torch.Tensor,
     partials: torch.Tensor,
     counters: torch.Tensor,
+    barrier: torch.Tensor,
     num_segments: int,
     num_tiles: int,
     num_qtiles: int,
@@ -401,6 +406,7 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     counters = _zero_workspace(
         index, "counters", max(1, plan.num_segments) * heads, torch.uint32
     )
+    barrier = _zero_workspace(index, "barrier", 4, torch.uint32)
     _minimax_h3_sm120_varlen_attention_nvfp4_impl(
         q,
         k,
@@ -423,6 +429,7 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
         mean_k,
         partials,
         counters,
+        barrier,
         plan.num_segments,
         num_stats_tiles,
         plan.num_tiles,
