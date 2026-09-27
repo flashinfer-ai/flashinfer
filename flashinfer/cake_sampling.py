@@ -86,15 +86,15 @@ _WAVE_CTAS_BY_SM_COUNT: dict[int, dict[int, int]] = {
 }
 _DEFAULT_SM_COUNT = 148
 _PREFERRED_MIN_EPT = 16
-# Stage-1 cost model (fitted on B200 stage-1 CUPTI microseconds, k = 50, 49 (vocab, batch)
-# cells): a register-resident wave costs _RESIDENT_BASE_US + _RESIDENT_PER_EPT_US per register
-# entry; a streaming wave costs _STREAM_WAVE_BASE_US plus _STREAM_CHUNK_US per 512 x 16-entry
-# chunk each CTA walks.  The constants minimise the dispatcher's regret against the measured
-# best variant per cell (0.07 summed relative regret); they only rank the frozen variants.
-_RESIDENT_BASE_US = 3.0
-_RESIDENT_PER_EPT_US = 0.2
-_STREAM_WAVE_BASE_US = 8.0
-_STREAM_CHUNK_US = 0.8
+# Stage-1 cost model: a register-resident wave costs _RESIDENT_BASE_US + _RESIDENT_PER_EPT_US per
+# register entry; a streaming wave costs _STREAM_WAVE_BASE_US plus _STREAM_CHUNK_US per 512 x
+# 16-entry chunk each CTA walks.  Re-fitted for the round-3 stage-1 kernels on the B200 per-variant
+# sweep (16 (vocab, batch) cells, zero regret against the measured-best variant; the same constants
+# were the zero-regret joint fit on Rubin R200); they only rank the frozen variants.
+_RESIDENT_BASE_US = 2.0
+_RESIDENT_PER_EPT_US = 0.1
+_STREAM_WAVE_BASE_US = 6.0
+_STREAM_CHUNK_US = 0.4
 
 _WORKSPACES: dict[
     tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
