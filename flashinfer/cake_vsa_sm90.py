@@ -827,8 +827,20 @@ class CakeVsaSm90Plan:
         kv_data_type: Optional[torch.dtype] = None,
         non_blocking: bool = True,
         route: Optional[str] = None,
+        engine: str = "cuda",
     ):
-        """``route`` ``None`` applies :func:`small_route`; ``"small"`` / ``"smallsplit"`` / ``"smallcluster"`` / ``"persistent"`` force one kernel."""
+        """``route`` ``None`` applies :func:`small_route`; ``"small"`` / ``"smallsplit"`` / ``"smallcluster"`` / ``"persistent"`` force one kernel.
+
+        ``engine`` selects the kernel build: ``"cuda"`` (generated CUDA C++,
+        ``backend="cake"``) or ``"cute"`` (the same kernels rendered as CuTe DSL
+        modules, ``backend="cake_cute"``; see
+        :mod:`flashinfer.experimental.cake_vsa_sm90_cute`).  Plans, routes and
+        launch geometry are identical; the CuTe build reads the by-value plan
+        parameters from a device buffer uploaded once per plan.
+        """
+        if engine not in ("cuda", "cute"):
+            raise ValueError(f"unknown engine {engine!r}; expected 'cuda' or 'cute'")
+        self.engine = engine
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("cake (SM90) requires a CUDA device")
@@ -914,6 +926,20 @@ class CakeVsaSm90Plan:
             # (``ready``); the kernel leaves them zero, so replays need no host
             # reset.  One run per split plan may be in flight at a time.
             self.plan_param = plan["plan"].contiguous()
+            if self.engine == "cute":
+                # The CuTe DSL build reads the plan from a device buffer: upload
+                # it once here and record the event every run waits on.
+                with torch.cuda.device(self.device):
+                    host_plan = self.plan_param
+                    if non_blocking:
+                        host_plan = host_plan.pin_memory()
+                    self.plan_param_device = host_plan.to(
+                        self.device, non_blocking=non_blocking
+                    )
+                    self._host_plan = host_plan
+                    if not self.small_split:
+                        self.ready = torch.cuda.Event(external=True)
+                        self.ready.record(torch.cuda.current_stream(self.device))
             if self.small_split:
                 with torch.cuda.device(self.device):
                     self.partial_o = torch.empty(
@@ -950,6 +976,12 @@ class CakeVsaSm90Plan:
             self.meta = host_meta.to(self.device, non_blocking=non_blocking)
             # By-value kernel parameter: stays on the host.
             self.hdr = plan["hdr"].contiguous()
+            if self.engine == "cute":
+                host_hdr = self.hdr
+                if non_blocking:
+                    host_hdr = host_hdr.pin_memory()
+                self.hdr_device = host_hdr.to(self.device, non_blocking=non_blocking)
+                self._host_hdr = host_hdr
             # The kernel's debug/timeline buffers are inert in the exported
             # build; they only have to exist on the device.
             self.dbg = torch.zeros((64,), dtype=torch.int32, device=self.device)
@@ -1024,22 +1056,26 @@ class CakeVsaSm90Plan:
                 if begin < tensor_end and tensor_begin < end:
                     raise ValueError("out must not overlap Q/K/V storage")
 
-        import tvm_ffi
-
-        from .jit.cake_vsa_sm90 import load_cake_vsa_sm90_module
-
         if self.small_kmax is None:
             stage = "attention"
         elif self.small_cluster:
             stage = f"small_k{self.small_kmax}c{self.small_cluster}"
         else:
             stage = f"small_k{self.small_kmax}{'s' if self.small_split else ''}"
-        module, _record = load_cake_vsa_sm90_module(stage)
+        if self.engine == "cute":
+            from .experimental.cake_vsa_sm90_cute import load_stage
+
+            cute_stage = load_stage(stage)
+            module = None
+        else:
+            from .jit.cake_vsa_sm90 import load_cake_vsa_sm90_module
+
+            module, _record = load_cake_vsa_sm90_module(stage)
         with torch.cuda.device(self.device):
             stream = torch.cuda.current_stream(self.device)
             if torch.cuda.is_current_stream_capturing():
                 self.captured = True
-            if self.small_kmax is None or self.small_split:
+            if self.small_kmax is None or self.small_split or self.engine == "cute":
                 # The plan (or the split workspace) may have been built on
                 # another stream: an event wait enqueues the dependency without
                 # a CPU synchronization.
@@ -1048,59 +1084,94 @@ class CakeVsaSm90Plan:
             aligned_k = self._aligned(k)
             aligned_v = self._aligned(v)
             target = result if result.data_ptr() % 16 == 0 else torch.empty_like(result)
-            with tvm_ffi.use_torch_stream():
-                if self.small_split:
-                    module.run(
-                        aligned_q,
-                        aligned_k,
-                        aligned_v,
-                        target,
-                        self.plan_param,
-                        int(self.qo_len),
-                        int(self.kv_len),
-                        float(self.scale_log2),
-                        self.partial_o,
-                        self.partial_stats,
-                        self.counters_u32,
-                        int(self.num_items),
-                        1,
-                        1,
-                    )
-                elif self.small_kmax is not None:
-                    module.run(
-                        aligned_q,
-                        aligned_k,
-                        aligned_v,
-                        target,
-                        self.plan_param,
-                        int(self.qo_len),
-                        int(self.kv_len),
-                        float(self.scale_log2),
-                        int(self.num_items),
-                        1,
-                        1,
-                    )
-                else:
-                    module.run(
-                        aligned_q,
-                        aligned_k,
-                        aligned_v,
-                        target,
-                        self.meta,
-                        self.hdr,
-                        int(self.tile_stride),
-                        int(self.qo_len),
-                        int(self.kv_len),
-                        float(self.scale_log2),
-                        self.dbg,
-                        self.tl,
-                        int(self.num_ctas),
-                        1,
-                        1,
-                    )
+            if self.engine == "cute":
+                self._run_cute(cute_stage, aligned_q, aligned_k, aligned_v, target)
+            else:
+                self._run_cuda(module, aligned_q, aligned_k, aligned_v, target)
             if target is not result:
                 result.copy_(target)
         return result
+
+    def _run_cute(self, cute_stage, aligned_q, aligned_k, aligned_v, target) -> None:
+        """Launch the CuTe DSL build with the same plan rows and grid as the CUDA build."""
+        bindings = {
+            "Q": aligned_q,
+            "K": aligned_k,
+            "Vt": aligned_v,
+            "O": target,
+            "seqlen_q": int(self.qo_len),
+            "seqlen_k": int(self.kv_len),
+            "scale_log2": float(self.scale_log2),
+        }
+        if self.small_kmax is not None:
+            bindings["plan"] = self.plan_param_device
+            if self.small_split:
+                bindings["Wo"] = self.partial_o
+                bindings["Ws"] = self.partial_stats
+                bindings["Wc"] = self.counters_u32
+            grid = (int(self.num_items), 1, 1)
+        else:
+            bindings["meta"] = self.meta
+            bindings["hdr"] = self.hdr_device
+            bindings["tile_stride"] = int(self.tile_stride)
+            bindings["dbg"] = self.dbg
+            bindings["tl"] = self.tl
+            grid = (int(self.num_ctas), 1, 1)
+        cute_stage.run(bindings, grid)
+
+    def _run_cuda(self, module, aligned_q, aligned_k, aligned_v, target) -> None:
+        import tvm_ffi
+
+        with tvm_ffi.use_torch_stream():
+            if self.small_split:
+                module.run(
+                    aligned_q,
+                    aligned_k,
+                    aligned_v,
+                    target,
+                    self.plan_param,
+                    int(self.qo_len),
+                    int(self.kv_len),
+                    float(self.scale_log2),
+                    self.partial_o,
+                    self.partial_stats,
+                    self.counters_u32,
+                    int(self.num_items),
+                    1,
+                    1,
+                )
+            elif self.small_kmax is not None:
+                module.run(
+                    aligned_q,
+                    aligned_k,
+                    aligned_v,
+                    target,
+                    self.plan_param,
+                    int(self.qo_len),
+                    int(self.kv_len),
+                    float(self.scale_log2),
+                    int(self.num_items),
+                    1,
+                    1,
+                )
+            else:
+                module.run(
+                    aligned_q,
+                    aligned_k,
+                    aligned_v,
+                    target,
+                    self.meta,
+                    self.hdr,
+                    int(self.tile_stride),
+                    int(self.qo_len),
+                    int(self.kv_len),
+                    float(self.scale_log2),
+                    self.dbg,
+                    self.tl,
+                    int(self.num_ctas),
+                    1,
+                    1,
+                )
 
 
 def create_plan(device, *args, **kwargs) -> CakeVsaSm90Plan:
