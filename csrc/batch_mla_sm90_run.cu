@@ -39,10 +39,11 @@ static void BatchMLAPagedAttentionSM90RunImpl(
   // ckv_cache: [num_pages, page_size, head_dim_ckv]
   // kpe_cache: [num_pages, page_size, head_dim_kpe]
   MLAPlanInfo plan_info;
-  TVM_FFI_ICHECK_EQ(plan_info_vec.size(), 20)
-      << "SM90 MLA plan info must contain 18 offsets, batch offsets, and the planned batch size";
-  const int64_t batch_q_indptr_offset = plan_info_vec[18];
-  const int64_t plan_batch_size = plan_info_vec[19];
+  TVM_FFI_ICHECK(plan_info_vec.size() == 18 || plan_info_vec.size() == 20)
+      << "SM90 MLA plan info must contain 18 offsets, with optional batch metadata";
+  const bool has_batch_metadata = plan_info_vec.size() == 20;
+  const int64_t batch_q_indptr_offset = has_batch_metadata ? plan_info_vec[18] : 0;
+  const int64_t plan_batch_size = has_batch_metadata ? plan_info_vec[19] : 0;
   std::vector<int64_t> plan_info_values(plan_info_vec.begin(), plan_info_vec.end());
   plan_info_values.resize(18);
   plan_info.FromVector(plan_info_values);
@@ -76,6 +77,8 @@ static void BatchMLAPagedAttentionSM90RunImpl(
         params.kpe = static_cast<DTypeKV*>(kpe_cache.data_ptr());
 
         if (maybe_kv_len.has_value()) {
+          TVM_FFI_ICHECK(has_batch_metadata)
+              << "device KV lengths require planned batch metadata";
           TVM_FFI_ICHECK(maybe_qo_indptr.has_value())
               << "qo_indptr is required when kv_len is provided";
           const TensorView& qo_indptr = maybe_qo_indptr.value();
