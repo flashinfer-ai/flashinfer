@@ -36,7 +36,7 @@ workspace and the last-arriving CTA merges them in slice order and resets the
 arrival counter (:func:`split_kmax` picks the variant).  Uniform sliced
 selections take the kernel's *cluster* variant instead when its modelled cost
 is lower (:func:`cluster_variant_for`): the ``csize`` slices of a query block
-form one thread-block cluster, every CTA publishes its BF16 partial and row
+form one thread-block cluster, every CTA publishes its FP32 partial and row
 statistics into its own shared memory and, after one cluster barrier, each
 rank merges one 32-column set through distributed shared memory (no
 workspace, no atomics; padded slices carry ``count = 0``).  Everything else runs
@@ -99,7 +99,7 @@ PLAN_HALFWORDS = 1750  # int16 elements of the by-value plan parameter (3500 B)
 PLAN_META_UNSPLIT = 1  # unsplit rows: [count, blk...] per query block
 PLAN_META_SPLIT = 2  # split rows: [meta, qtile, blk...] per item
 MAX_NSPLIT = 31  # nsplit field of ``meta`` (bits 10..14 keep the int16 sign clear)
-SMALL_ITEM_ELEMS = BLOCK * HEAD_DIM  # BF16 partial accumulator per split item
+SMALL_ITEM_ELEMS = BLOCK * HEAD_DIM  # FP32 partial accumulator per split item
 SMALL_STATS_FLOATS = 2 * BLOCK  # (max, sum) per row per split item
 # Split-KV cost model (relative units): one KV block through the single
 # warpgroup chain vs. one extra slice merged by the last CTA (fitted on H100,
@@ -109,7 +109,14 @@ SPLIT_MERGE_COST = 0.8
 # Cluster / DSM-merge route (port of the Cake cluster variants, CAKE-682):
 # (kmax, cluster size) variants, SMs per GPC assumed for one-wave placement,
 # and the cost model (merged rank, padded slot) in the same block units.
-CLUSTER_VARIANTS = ((2, 4), (3, 3), (3, 6), (4, 2), (4, 4), (6, 2), (6, 3))
+CLUSTER_VARIANTS = (
+    (2, 4),
+    (3, 3),
+    (3, 6),
+    (4, 2),
+    (4, 4),
+    (6, 2),
+)  # (6, 3): receive buffers exceed the 227 KB SMEM
 CLUSTER_GPC_SMS = 16
 CLUSTER_MERGE_COST = 0.3
 CLUSTER_PAD_COST = 0.15
@@ -876,7 +883,7 @@ class CakeVsaSm90Plan:
                 with torch.cuda.device(self.device):
                     self.partial_o = torch.empty(
                         (self.num_items * SMALL_ITEM_ELEMS,),
-                        dtype=torch.bfloat16,
+                        dtype=torch.float32,
                         device=self.device,
                     )
                     self.partial_stats = torch.empty(

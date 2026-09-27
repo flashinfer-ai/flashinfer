@@ -57,7 +57,6 @@ STAGES = (
     "small_k4c2",
     "small_k4c4",
     "small_k6c2",
-    "small_k6c3",
 )
 
 

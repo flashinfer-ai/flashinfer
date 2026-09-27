@@ -435,21 +435,30 @@ def _wrapper(mask, backend="cake", scale=None):
     return wrapper
 
 
-def _inputs(h, mb, nb):
+def _inputs(h, mb, nb, seed=7):
+    """Deterministic BF16 Q/K/V (HND) for the kernel-vs-reference checks."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
     return tuple(
-        torch.randn((h, length * 64, 128), device="cuda", dtype=torch.bfloat16)
+        torch.randn(
+            (h, length * 64, 128), device="cuda", dtype=torch.bfloat16, generator=g
+        )
         for length in (mb, nb, nb)
     )
 
 
 def _reference(q, k, v, mask, scale):
-    """Independent FP32 reference: masked dense softmax attention per head."""
+    """Independent FP32 reference: masked dense softmax attention per head.
+
+    Returned unrounded (FP32): the BF16 kernel output is compared against the
+    exact value, so the check bounds the kernel's own rounding (at most half a
+    BF16 ulp plus the FP32 accumulation difference) instead of asking two
+    independently rounded BF16 results to agree, which any two implementations
+    fail by one ulp (0.03125 for |o| in [4, 8)) on a fraction of the elements.
+    """
     scores = torch.einsum("hmd,hnd->hmn", q.float(), k.float()) * float(scale)
     dense = mask.to(q.device).repeat_interleave(64, dim=1).repeat_interleave(64, dim=2)
     scores.masked_fill_(~dense, float("-inf"))
-    return torch.einsum("hmn,hnd->hmd", torch.softmax(scores, dim=-1), v.float()).to(
-        q.dtype
-    )
+    return torch.einsum("hmn,hnd->hmd", torch.softmax(scores, dim=-1), v.float())
 
 
 @requires_hopper
@@ -615,7 +624,10 @@ def test_cluster_plan_stream_and_graph_lifetime():
     q.normal_()
     graph.replay()
     torch.testing.assert_close(
-        out.view_as(q), _reference(q, k, v, mask, 128**-0.5), atol=0.01, rtol=0.01
+        out.view_as(q).float(),
+        _reference(q, k, v, mask, 128**-0.5),
+        atol=0.01,
+        rtol=0.01,
     )
 
 
@@ -645,7 +657,10 @@ def test_split_plan_stream_and_graph_lifetime():
     q.normal_()
     graph.replay()
     torch.testing.assert_close(
-        out.view_as(q), _reference(q, k, v, mask, 128**-0.5), atol=0.01, rtol=0.01
+        out.view_as(q).float(),
+        _reference(q, k, v, mask, 128**-0.5),
+        atol=0.01,
+        rtol=0.01,
     )
 
 
@@ -705,7 +720,7 @@ def test_held_out_shapes_against_fp32_reference(h, mb, nb, capacity, ragged, sca
     actual = wrapper.run(q, k, v)
     expected = _reference(q, k, v, mask, 128**-0.5 if scale is None else scale)
     assert bool(torch.isfinite(actual).all())
-    torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
+    torch.testing.assert_close(actual.float(), expected, atol=0.01, rtol=0.01)
     assert float((actual.float() - expected.float()).abs().max()) <= 0.03
 
 
@@ -750,7 +765,7 @@ def test_signed_and_tiny_scales_against_math(scale):
     actual = _wrapper(mask, scale=scale).run(q, k, v)
     expected = _reference(q, k, v, mask, scale)
     assert bool(torch.isfinite(actual).all())
-    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(actual.float(), expected, atol=0.02, rtol=0.02)
 
 
 @requires_hopper
@@ -859,7 +874,10 @@ def test_plan_stream_and_graph_lifetime():
     q.normal_()
     graph.replay()
     torch.testing.assert_close(
-        out.view_as(q), _reference(q, k, v, mask, 128**-0.5), atol=0.01, rtol=0.01
+        out.view_as(q).float(),
+        _reference(q, k, v, mask, 128**-0.5),
+        atol=0.01,
+        rtol=0.01,
     )
     with warnings.catch_warnings():
         # The capture is abandoned before any launch; torch warns about the empty graph.
