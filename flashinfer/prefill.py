@@ -2006,6 +2006,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         jit_args: Optional[List[Any]] = None,
         jit_kwargs: Optional[Dict[str, Any]] = None,
         variant_owns_mask: bool = False,
+        max_total_num_rows: Optional[int] = None,
     ) -> None:
         r"""Constructor of :class:`BatchPrefillWithPagedKVCacheWrapper`.
 
@@ -2087,7 +2088,20 @@ class BatchPrefillWithPagedKVCacheWrapper:
             :attr:`MaskMode.CUSTOM`), and incompatible with ``prefix_len_ptr``
             (multi-item scoring), which selects a different mask mode.
             Defaults to ``False``.
+
+        max_total_num_rows : Optional[int]
+            Maximum total number of query tokens across requests in CUDA graph mode.
+            Declaring this capacity lets a later :meth:`plan` accept more query tokens
+            than the first call while retaining the same metadata buffers. If omitted,
+            the first :meth:`plan` fixes the capacity. Only valid with
+            ``use_cuda_graph=True``. Every plan must stay within this capacity;
+            each captured graph still requires compatible query/output buffers.
         """
+        if max_total_num_rows is not None:
+            if not use_cuda_graph:
+                raise ValueError("max_total_num_rows requires use_cuda_graph=True")
+            if not isinstance(max_total_num_rows, int) or max_total_num_rows < 0:
+                raise ValueError("max_total_num_rows must be a nonnegative integer")
         _check_workspace_buffer_alignment(
             float_workspace_buffer, "float_workspace_buffer"
         )
@@ -2193,7 +2207,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._paged_kv_last_page_len_buf = paged_kv_last_page_len_buf
         self._custom_mask_buf = custom_mask_buf
         self._mask_indptr_buf = mask_indptr_buf
-        self._max_total_num_rows: Optional[int] = None
+        self._max_total_num_rows: Optional[int] = max_total_num_rows
         self._backend = backend
         self._plan_info = None
         self._cached_module = None

@@ -760,3 +760,70 @@ def test_attention_handles_follow_device_and_thread():
                 lambda: decode_handle(torch.cuda.current_stream(0))
             ).result()
             assert other != first
+
+
+@pytest.mark.parametrize("backend", ["cudnn", "fa2"])
+@pytest.mark.parametrize("declared_capacity", [None, 128])
+def test_paged_graph_query_capacity_grows_and_replays(backend, declared_capacity):
+    """A short first plan must not consume an explicitly larger graph capacity."""
+    if backend == "cudnn" and not prefill.CUDNN_AVAILABLE:
+        pytest.skip("requires cuDNN graph support")
+    device = "cuda"
+    q = torch.randn(128, 8, 128, device=device, dtype=torch.bfloat16)
+    k = torch.randn(8, 16, 2, 128, device=device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    out = torch.empty_like(q)
+    ip = torch.tensor([0, 8], dtype=torch.int32)
+    ix = torch.arange(8, device=device, dtype=torch.int32)
+    last = torch.tensor([16], dtype=torch.int32)
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device=device),
+        backend=backend,
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty(2, device=device, dtype=torch.int32),
+        paged_kv_indptr_buf=torch.empty(2, device=device, dtype=torch.int32),
+        paged_kv_indices_buf=torch.empty_like(ix),
+        paged_kv_last_page_len_buf=torch.empty(1, device=device, dtype=torch.int32),
+        **(
+            {"max_total_num_rows": declared_capacity}
+            if declared_capacity is not None
+            else {}
+        ),
+    )
+
+    def plan(length):
+        qo = torch.tensor([0, length], dtype=torch.int32)
+        w.plan(qo, ip, ix, last, 8, 2, 128, 16, causal=True, q_data_type=q.dtype)
+        return qo
+
+    def check(length, qo):
+        ref, _ = _reference(
+            q[:length], k, v, qo, ip, ix, last, causal=True, scale=128**-0.5
+        )
+        torch.testing.assert_close(out[:length].float(), ref, atol=0.015, rtol=0.015)
+
+    small_qo = plan(64)
+    w.run(q[:64], (k, v), out=out[:64])
+    check(64, small_qo)
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            w.run(q[:64], (k, v), out=out[:64])
+        if declared_capacity is None:
+            with pytest.raises(ValueError, match="cannot exceed"):
+                plan(128)
+        else:
+            large_qo = plan(128)
+            w.run(q, (k, v), out=out)
+            check(128, large_qo)
+            with pytest.raises(ValueError, match="cannot exceed"):
+                plan(129)
+        small_qo = plan(64)
+        q.mul_(0.5)
+        v.mul_(0.75)
+        out.fill_(torch.nan)
+        graph.replay()
+        check(64, small_qo)
+        assert torch.isnan(out[64:]).all()
+    finally:
+        graph.reset()
