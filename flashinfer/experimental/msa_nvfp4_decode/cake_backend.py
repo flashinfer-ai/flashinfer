@@ -13,7 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake backend: NVFP4 paged-KV MiniMax Sparse Attention decode (SM100/SM103).
+Cake backend: NVFP4 paged-KV MiniMax Sparse Attention decode (SM100/SM103/SM107).
 
 One persistent launch of the generated program serves a whole decode step over
 the planar NVFP4 page pool described in
