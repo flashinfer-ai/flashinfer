@@ -543,6 +543,11 @@ def test_per_request_tensors_and_routes():
     assert pick(16, 262144, sm_count=148) == (4, 16, True)
     assert pick(64, 262144, sm_count=148)[2]
     assert pick(128, 151936, sm_count=148)[2]
+    # Round 3 (stage-1 v6 candidate path) made the register-resident (8, 48) variant the fastest for
+    # small batches of 151936: 15.3 vs 19.9 us streaming on B200 (re-fitted constants, zero regret).
+    assert pick(1, 151936, sm_count=148) == (8, 48, False)
+    assert pick(8, 151936, sm_count=148) == (8, 48, False)
+    assert pick(16, 151936, sm_count=148) == (4, 16, True)
     # H100 wave table (132 SMs): 128 cluster-4 CTAs are two waves there, so B = 32 rows of a
     # large vocabulary stream with clusters of 2 and B = 32 rows of 32768 stay register-resident
     # on the 2-CTA variant; small batches and B >= 64 pick the same variants as on B200.

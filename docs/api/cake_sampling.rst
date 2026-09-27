@@ -10,11 +10,17 @@ compile targets that have not been run on hardware.  It fuses the three stages o
 :func:`flashinfer.sampling.top_k_top_p_sampling_from_probs` with
 ``filter_apply_order="top_k_first"`` into two kernels per call:
 
-1. a thread-block-cluster radix select that writes the exact per-row top-k slab, reducing
-   the 2048-bucket histograms across the cluster through distributed shared memory; and
-2. a programmatic-dependent-launch sparse top-p kernel that sorts the slab prefix, keeps the
-   shortest prefix whose exclusive mass is below ``top_p`` times the top-k mass, renormalizes,
-   and draws one token per row by inverse CDF from ``curand_init(seed, row, offset)``.
+1. a thread-block-cluster radix select that writes the exact per-row top-k slab: one 11-bit
+   cluster pass reduces the 2048-bucket histograms through distributed shared memory, the
+   entries of the selected bucket (at most 2048 cluster-wide) are gathered into every CTA as
+   64-bit ``(key, ~index)`` composites and the remaining key bits and boundary ties are resolved
+   with local passes (rows whose bucket overflows that capacity take the exact three-pass
+   cluster path); and
+2. a programmatic-dependent-launch sparse top-p kernel that sorts the slab prefix with one
+   composite-key bitonic network (registers, warp shuffles and a cross-warp shared-memory
+   exchange), keeps the shortest prefix whose exclusive mass is below ``top_p`` times the top-k
+   mass, renormalizes, and draws one token per row by inverse CDF from
+   ``curand_init(seed, row, offset)``.
 
 Semantics (support, tie-breaking toward the lower vocabulary index, Philox stream advancement
 through the generator) follow the ``top_k_first`` route with two extra guarantees:
