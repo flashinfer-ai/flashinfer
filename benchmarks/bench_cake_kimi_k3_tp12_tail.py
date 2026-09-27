@@ -107,14 +107,18 @@ def graph_capture(run):
     return graph.replay, graph
 
 
-def rank_max_median_us(fn, *, warmup: int, iters: int) -> tuple[float, float]:
+def rank_max_median_us(fn, *, warmup: int, iters: int) -> tuple[float, list[float]]:
+    """Median GPU time of ``fn`` on this rank, gathered from every rank: (max over ranks, per-rank list)."""
     times = bench_gpu_time_with_cupti(
         fn, dry_run_iters=warmup, repeat_iters=iters, cold_l2_cache=True
     )
-    local = statistics.median(times) * 1e3
-    t = torch.tensor([local], dtype=torch.float64, device="cuda")
-    dist.all_reduce(t, op=dist.ReduceOp.MAX)
-    return float(t.item()), local
+    local = torch.tensor(
+        [statistics.median(times) * 1e3], dtype=torch.float64, device="cuda"
+    )
+    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size())]
+    dist.all_gather(gathered, local)
+    per_rank = [float(t.item()) for t in gathered]
+    return max(per_rank), per_rank
 
 
 def main() -> int:
@@ -157,16 +161,16 @@ def main() -> int:
             max_abs = float((fused_out.float() - stock_out.float()).abs().max().item())
             arms = {"stock_graph": stock_replay, "fused_graph": fused_replay}
             samples: dict[str, list[float]] = {name: [] for name in arms}
-            local_samples: dict[str, list[float]] = {name: [] for name in arms}
+            per_rank_samples: dict[str, list[list[float]]] = {name: [] for name in arms}
             for g in range(args.groups):
                 order = list(arms) if g % 2 == 0 else list(reversed(arms))
                 for name in order:
                     dist.barrier()
-                    rank_max, local_med = rank_max_median_us(
+                    rank_max, per_rank = rank_max_median_us(
                         arms[name], warmup=args.warmup, iters=args.iters
                     )
                     samples[name].append(rank_max)
-                    local_samples[name].append(local_med)
+                    per_rank_samples[name].append(per_rank)
             stock_us = statistics.median(samples["stock_graph"])
             fused_us = statistics.median(samples["fused_graph"])
             row = dict(
@@ -176,8 +180,13 @@ def main() -> int:
                 speedup=stock_us / fused_us,
                 max_abs_diff_vs_stock=max_abs,
                 kernels=list(runner.kernel_keys),
-                rank_local_us={
-                    name: statistics.median(v) for name, v in local_samples.items()
+                # per-rank medians over the groups (the row time is the maximum over ranks)
+                per_rank_us={
+                    name: [
+                        statistics.median(group[r] for group in groups)
+                        for r in range(world)
+                    ]
+                    for name, groups in per_rank_samples.items()
                 },
             )
             rows.append(row)
@@ -187,7 +196,7 @@ def main() -> int:
                     f"speedup {row['speedup']:.2f}x  max|diff| {max_abs:.4f}  {runner.kernel_keys}",
                     flush=True,
                 )
-            del stock_graph, fused_graph
+            del arms, stock_replay, fused_replay, stock_graph, fused_graph
         dist.barrier()
     finally:
         torch.cuda.synchronize()
@@ -208,7 +217,17 @@ def main() -> int:
                 f,
                 indent=1,
             )
-    dist.destroy_process_group()
+    dist.barrier()
+    torch.cuda.synchronize()
+    # The NCCL collectives captured into the stock-chain CUDA graphs leave their work objects
+    # pending in the process group, and ``destroy_process_group()`` then waits for them without
+    # end (torch 2.13 / CUDA 13.3 on GB200 and GB300).  Every rank is past the final barrier and
+    # the table is written, so abort the communicators instead of waiting on them.
+    abort = getattr(dist.distributed_c10d, "_abort_process_group", None)
+    if abort is not None:
+        abort()
+    else:
+        dist.destroy_process_group()
     return 0
 
 
