@@ -1239,6 +1239,29 @@ def test_registered_arg_plans_use_known_names(arch):
     assert unknown == []
 
 
+_PUBLIC_COMPILE_FLAGS = {
+    "-std=c++17",
+    "--use_fast_math",
+    "-Xptxas=--register-usage-level=10",
+}
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+def test_registered_compile_flags_are_public(arch):
+    """Exported programs must build with public nvcc/ptxas options only.
+
+    The FP8/H128 persistent prefill variants additionally pin the ptxas
+    register-usage level: without it ptxas re-orders the softmax exp2/convert
+    chains across the P-publication fence and the exported build runs 3-5 %
+    slower than the source build on the 16-tile prefill shapes.
+    """
+    for variant, spec in _ARCH_REGISTRATIONS[arch]["variants"].items():
+        flags = set(spec["compile_flags"])
+        assert flags <= _PUBLIC_COMPILE_FLAGS, (variant, sorted(flags))
+        if variant.startswith("fp8_h128_prefill_source_persistent"):
+            assert "-Xptxas=--register-usage-level=10" in flags, variant
+
+
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_program_signatures_use_known_names(arch):
     unknown = []
