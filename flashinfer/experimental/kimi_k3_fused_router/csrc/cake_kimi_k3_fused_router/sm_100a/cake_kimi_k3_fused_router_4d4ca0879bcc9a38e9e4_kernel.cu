@@ -81,12 +81,12 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_PLAN_OFFSETS_STAGE_BYTES 3584
 #define SMEM_PLAN_OFFSETS_STRIDE 3584
 #define SMEM_OWN_BITMAP_OFF 8192
-#define SMEM_OWN_BITMAP_STAGE_BYTES 1792
-#define SMEM_OWN_BITMAP_STRIDE 1792
-#define SMEM_OWN_ROUTES_OFF 9984
-#define SMEM_OWN_ROUTES_STAGE_BYTES 7168
-#define SMEM_OWN_ROUTES_STRIDE 7168
-#define SMEM_TOTAL 17152
+#define SMEM_OWN_BITMAP_STAGE_BYTES 224
+#define SMEM_OWN_BITMAP_STRIDE 224
+#define SMEM_OWN_ROUTES_OFF 8416
+#define SMEM_OWN_ROUTES_STAGE_BYTES 896
+#define SMEM_OWN_ROUTES_STRIDE 896
+#define SMEM_TOTAL 9344
 #define THREADS 224
 #define BLOCK_M 16
 #define NUM_EXPERTS 896
@@ -101,9 +101,9 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define GATHER_LOADS 5
 #define GATHER_PASS_PAIRS 4480
 #define OWNER_STRIDE 1
-#define BITMAP_STRIDE 64
-#define ROUTE_STRIDE 256
-#define WORD_PASSES 2
+#define BITMAP_STRIDE 8
+#define ROUTE_STRIDE 32
+#define WORD_PASSES 1
 #define BLOCK_MASK (BLOCK_M - 1)
 #define BLOCK_SHIFT (3 + (BLOCK_M >> 4))
 
@@ -142,7 +142,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(224, 3) void
-kernel_cake_kimi_k3_fused_router_602efd15f39203a75b7e(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+kernel_cake_kimi_k3_fused_router_4d4ca0879bcc9a38e9e4(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -179,8 +179,8 @@ kernel_cake_kimi_k3_fused_router_602efd15f39203a75b7e(float* __restrict__ logits
     const int plan_offsets_addr = smem + 3584;
     unsigned int* own_bitmap = reinterpret_cast<unsigned int*>(smem_raw + 8192);
     const int own_bitmap_addr = smem + 8192;
-    unsigned int* own_routes = reinterpret_cast<unsigned int*>(smem_raw + 9984);
-    const int own_routes_addr = smem + 9984;
+    unsigned int* own_routes = reinterpret_cast<unsigned int*>(smem_raw + 8416);
+    const int own_routes_addr = smem + 8416;
 
     // === Task calls (dependency order) ===
     int global_thread = bid * THREADS + tid;

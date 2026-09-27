@@ -71,24 +71,24 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_WINNER_SCORES_OFF 1184
 #define SMEM_WINNER_SCORES_STAGE_BYTES 64
 #define SMEM_WINNER_SCORES_STRIDE 64
-#define SMEM_ROW_BITS_OFF 1280
-#define SMEM_ROW_BITS_STAGE_BYTES 3584
-#define SMEM_ROW_BITS_STRIDE 3584
-#define SMEM_ROUTE_SLOTS_OFF 4864
-#define SMEM_ROUTE_SLOTS_STAGE_BYTES 3584
-#define SMEM_ROUTE_SLOTS_STRIDE 3584
-#define SMEM_OFFSETS_OFF 12032
-#define SMEM_OFFSETS_STAGE_BYTES 3588
-#define SMEM_OFFSETS_STRIDE 3588
-#define SMEM_SELECTED_IDS_OFF 15680
-#define SMEM_SELECTED_IDS_STAGE_BYTES 64
-#define SMEM_SELECTED_IDS_STRIDE 64
-#define SMEM_WARP_TOTALS_OFF 16768
-#define SMEM_WARP_TOTALS_STAGE_BYTES 28
-#define SMEM_WARP_TOTALS_STRIDE 28
-#define SMEM_TOTAL 16896
+#define SMEM_PHASE2_WARP_SUMS_OFF 7168
+#define SMEM_PHASE2_WARP_SUMS_STAGE_BYTES 28
+#define SMEM_PHASE2_WARP_SUMS_STRIDE 28
+#define SMEM_PLAN_COUNTS_OFF 0
+#define SMEM_PLAN_COUNTS_STAGE_BYTES 3584
+#define SMEM_PLAN_COUNTS_STRIDE 3584
+#define SMEM_PLAN_OFFSETS_OFF 3584
+#define SMEM_PLAN_OFFSETS_STAGE_BYTES 3584
+#define SMEM_PLAN_OFFSETS_STRIDE 3584
+#define SMEM_PLAN_IDS_OFF 8192
+#define SMEM_PLAN_IDS_STAGE_BYTES 32768
+#define SMEM_PLAN_IDS_STRIDE 32768
+#define SMEM_PLAN_BITMAP_OFF 16384
+#define SMEM_PLAN_BITMAP_STAGE_BYTES 14336
+#define SMEM_PLAN_BITMAP_STRIDE 14336
+#define SMEM_TOTAL 40960
 #define THREADS 224
-#define BLOCK_M 16
+#define BLOCK_M 8
 #define NUM_EXPERTS 896
 #define TOP_K 16
 #define ITEMS_PER_THREAD 4
@@ -97,12 +97,16 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define RADIX_SCAN_THREADS 32
 #define RADIX_BINS_PER_LANE 8
 #define MAX_BLOCK_M 16
-#define ROWS 1
-#define ROUTE_WORDS 1
+#define OWNER_CTAS 128
+#define GATHER_LOADS 16
+#define GATHER_PASS_PAIRS 3584
+#define EMIT_SUBCHUNKS 4
+#define EMIT_CHUNK_PAIRS 128
 #define BLOCK_MASK (BLOCK_M - 1)
 #define BLOCK_SHIFT (3 + (BLOCK_M >> 4))
 
 #include <math_constants.h>
+#include <cooperative_groups.h>
 
 __device__ __forceinline__ uint32_t elect_sync() {
     uint32_t pred = 0;
@@ -135,8 +139,8 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(224) void
-kernel_cake_kimi_k3_fused_router_a56ddeaca4d13ba0b3d2(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+__global__ __launch_bounds__(224, 3) void
+kernel_cake_kimi_k3_fused_router_9bd0bd54242c39406484(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -164,26 +168,20 @@ kernel_cake_kimi_k3_fused_router_a56ddeaca4d13ba0b3d2(float* __restrict__ logits
     const int winner_ids_addr = smem + 1120;
     float* winner_scores = reinterpret_cast<float*>(smem_raw + 1184);
     const int winner_scores_addr = smem + 1184;
-    unsigned int* row_bits = reinterpret_cast<unsigned int*>(smem_raw + 1280);
-    const int row_bits_addr = smem + 1280;
-    unsigned int* route_slots = reinterpret_cast<unsigned int*>(smem_raw + 4864);
-    const int route_slots_addr = smem + 4864;
-    int* offsets = reinterpret_cast<int*>(smem_raw + 12032);
-    const int offsets_addr = smem + 12032;
-    int* selected_ids = reinterpret_cast<int*>(smem_raw + 15680);
-    const int selected_ids_addr = smem + 15680;
-    int* warp_totals = reinterpret_cast<int*>(smem_raw + 16768);
-    const int warp_totals_addr = smem + 16768;
+    int* phase2_warp_sums = reinterpret_cast<int*>(smem_raw + 7168);
+    const int phase2_warp_sums_addr = smem + 7168;
+    int* plan_counts = reinterpret_cast<int*>(smem_raw + 0);
+    const int plan_counts_addr = smem + 0;
+    int* plan_offsets = reinterpret_cast<int*>(smem_raw + 3584);
+    const int plan_offsets_addr = smem + 3584;
+    int* plan_ids = reinterpret_cast<int*>(smem_raw + 8192);
+    const int plan_ids_addr = smem + 8192;
+    unsigned int* plan_bitmap = reinterpret_cast<unsigned int*>(smem_raw + 16384);
+    const int plan_bitmap_addr = smem + 16384;
 
     // === Task calls (dependency order) ===
-    #pragma unroll 1
-    for (int clear_word = tid; clear_word < NUM_EXPERTS + NUM_EXPERTS * ROUTE_WORDS; clear_word += THREADS) {
-        if (clear_word < NUM_EXPERTS) {
-            row_bits[clear_word] = (unsigned int)0;
-        } else {
-            route_slots[clear_word - NUM_EXPERTS] = (unsigned int)0;
-        }
-    }
+    int global_thread = bid * THREADS + tid;
+    int grid_threads = num_bids * THREADS;
     if (warp == 0) {
         if (elect_sync()) {
             #pragma unroll
@@ -192,6 +190,10 @@ kernel_cake_kimi_k3_fused_router_a56ddeaca4d13ba0b3d2(float* __restrict__ logits
                 winner_scores[winner_init] = 0.0f;
             }
         }
+    }
+    #pragma unroll
+    for (int bitmap_clear = 0; bitmap_clear < 16; bitmap_clear++) {
+        plan_bitmap[bitmap_clear * THREADS + tid] = (unsigned int)0;
     }
     __syncthreads();
     int expert_base = tid * ITEMS_PER_THREAD;
@@ -479,127 +481,165 @@ kernel_cake_kimi_k3_fused_router_a56ddeaca4d13ba0b3d2(float* __restrict__ logits
             asm volatile("div.full.f32 %0, %1, %2;" : "=f"(_fdiv_full_1) : "f"(winner_scores[tid]), "f"(selected_norm));
             topk_weights[output_index] = _fdiv_full_1;
             topk_ids[output_index] = selected_id;
-            selected_ids[token * TOP_K + tid] = selected_id;
         }
         __syncthreads();
     }
-    __syncthreads();
-    #pragma unroll 1
-    for (int pair_slot = tid; pair_slot < ROWS * TOP_K; pair_slot += THREADS) {
-        int gathered_id = selected_ids[pair_slot];
-        int gathered_row = pair_slot >> 4;
-        atomicAdd(&row_bits[gathered_id], (unsigned int)1 << (unsigned int)gathered_row);
-        atomicAdd(&route_slots[gathered_id * ROUTE_WORDS + (gathered_row >> 3)], (unsigned int)(pair_slot & 15) << (unsigned int)((gathered_row & 7) * 4));
+    cooperative_groups::this_grid().sync();
+    int owner_ctas = num_bids;
+    if (owner_ctas > OWNER_CTAS) {
+        owner_ctas = OWNER_CTAS;
     }
-    __syncthreads();
-    int expert_scan_base = warp * 32 * ITEMS_PER_THREAD + lane * ITEMS_PER_THREAD;
-    int lane_prefixes[ITEMS_PER_THREAD];
-    int lane_total = 0;
-    #pragma unroll
-    for (int count_slot = 0; count_slot < ITEMS_PER_THREAD; count_slot++) {
-        int count_expert = expert_scan_base + count_slot;
-        int _popc_0 = __popc(row_bits[count_expert]);
-        int count_value = _popc_0;
-        if (cta_rank == 0) {
-            expert_counts[count_expert] = count_value;
-            expert_scatter_offsets[count_expert] = count_value;
-        }
-        lane_prefixes[count_slot] = lane_total;
-        lane_total += count_value + BLOCK_MASK & ~BLOCK_MASK;
-    }
-    int warp_inclusive = lane_total;
-    int _shfl_up_15 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 1, 32);
-    int scan_peer_4 = _shfl_up_15;
-    if (lane >= 1) {
-        warp_inclusive += scan_peer_4;
-    }
-    int _shfl_up_16 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 2, 32);
-    int scan_peer_0_1 = _shfl_up_16;
-    if (lane >= 2) {
-        warp_inclusive += scan_peer_0_1;
-    }
-    int _shfl_up_17 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 4, 32);
-    int scan_peer_1_1 = _shfl_up_17;
-    if (lane >= 4) {
-        warp_inclusive += scan_peer_1_1;
-    }
-    int _shfl_up_18 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 8, 32);
-    int scan_peer_2_1 = _shfl_up_18;
-    if (lane >= 8) {
-        warp_inclusive += scan_peer_2_1;
-    }
-    int _shfl_up_19 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 16, 32);
-    int scan_peer_3_1 = _shfl_up_19;
-    if (lane >= 16) {
-        warp_inclusive += scan_peer_3_1;
-    }
-    if (lane == 31) {
-        warp_totals[warp] = warp_inclusive;
-    }
-    __syncthreads();
-    int warp_prefix_lane0 = 0;
-    if (lane == 0) {
-        #pragma unroll
-        for (int prior_warp = 0; prior_warp < NUM_WARPS; prior_warp++) {
-            if (prior_warp < warp) {
-                warp_prefix_lane0 += warp_totals[prior_warp];
-            }
-        }
-    }
-    int _shfl_2 = __shfl_sync(0xFFFFFFFF, warp_prefix_lane0, 0);
-    int warp_prefix = _shfl_2;
-    int lane_prefix = warp_prefix + warp_inclusive - lane_total;
-    #pragma unroll
-    for (int offset_slot = 0; offset_slot < ITEMS_PER_THREAD; offset_slot++) {
-        int offset_expert = expert_scan_base + offset_slot;
-        int offset_value = lane_prefix + lane_prefixes[offset_slot];
-        offsets[offset_expert] = offset_value;
-        if (cta_rank == 0) {
-            expert_offsets[offset_expert] = offset_value;
-        }
-    }
-    if (tid == THREADS - 1) {
-        int padded_total = warp_prefix + warp_inclusive;
-        offsets[NUM_EXPERTS] = padded_total;
-        if (cta_rank == 0) {
-            expert_offsets[NUM_EXPERTS] = padded_total;
-            num_tokens_post_padded[0] = padded_total;
-        }
-    }
-    __syncthreads();
-    int total_pairs = M * TOP_K;
-    #pragma unroll 1
-    for (int local_pair = warp; local_pair < TOP_K; local_pair += NUM_WARPS) {
-        int owner_pair = cta_rank * TOP_K + local_pair;
-        int owner_expert = selected_ids[owner_pair];
-        unsigned int owner_bits = row_bits[owner_expert];
-        int owner_row = cta_rank;
-        unsigned int owner_lower = ((unsigned int)1 << (unsigned int)owner_row) - 1;
-        if ((owner_bits & owner_lower) == 0) {
-            int _popc_1 = __popc(owner_bits);
-            int owner_count = _popc_1;
-            int owner_start = offsets[owner_expert];
-            if (lane < ROWS) {
-                unsigned int emit_bit = (unsigned int)1 << (unsigned int)lane;
-                if ((owner_bits & emit_bit) != 0) {
-                    int _popc_2 = __popc(owner_bits & emit_bit - 1);
-                    int emit_rank = _popc_2;
-                    unsigned int packed_slots = route_slots[owner_expert * ROUTE_WORDS + (lane >> 3)];
-                    int emit_slot = (int)(packed_slots >> (unsigned int)((lane & 7) * 4) & 15);
-                    int grouped = owner_start + emit_rank;
-                    sorted_token_ids[grouped] = lane * TOP_K + emit_slot;
-                    if ((emit_rank & BLOCK_MASK) == 0) {
-                        expert_ids[grouped >> BLOCK_SHIFT] = owner_expert;
-                    }
+    if (owner_ctas > bid) {
+        int total_pairs = M * TOP_K;
+        #pragma unroll 1
+        for (int gather_base = 0; gather_base < total_pairs; gather_base += GATHER_PASS_PAIRS) {
+            int gathered[GATHER_LOADS];
+            #pragma unroll
+            for (int gather_slot = 0; gather_slot < GATHER_LOADS; gather_slot++) {
+                gathered[gather_slot] = -1;
+                int gather_pair = gather_base + gather_slot * THREADS + tid;
+                if (gather_pair < total_pairs) {
+                    gathered[gather_slot] = topk_ids[gather_pair];
                 }
             }
-            int padded_count = owner_count + BLOCK_MASK & ~BLOCK_MASK;
-            if (lane < padded_count - owner_count) {
-                sorted_token_ids[owner_start + owner_count + lane] = total_pairs;
+            #pragma unroll
+            for (int store_slot = 0; store_slot < GATHER_LOADS; store_slot++) {
+                int store_id = gathered[store_slot];
+                if (store_id >= 0) {
+                    int store_pair = gather_base + store_slot * THREADS + tid;
+                    int store_token = store_pair >> 4;
+                    plan_ids[store_pair] = store_id;
+                    atomicAdd(&plan_bitmap[store_id * 4 + (store_token >> 5)], (unsigned int)1 << (unsigned int)(store_token & 31));
+                }
+            }
+        }
+        __syncthreads();
+        int expert_scan_base = warp * 32 * ITEMS_PER_THREAD + lane * ITEMS_PER_THREAD;
+        int lane_prefixes[ITEMS_PER_THREAD];
+        int lane_total = 0;
+        #pragma unroll
+        for (int expert_slot_scan = 0; expert_slot_scan < ITEMS_PER_THREAD; expert_slot_scan++) {
+            int expert_scan = expert_scan_base + expert_slot_scan;
+            int count_scan = 0;
+            #pragma unroll
+            for (int count_word = 0; count_word < 4; count_word++) {
+                unsigned int count_bits = plan_bitmap[expert_scan * 4 + count_word];
+                int _popc_0 = __popc(count_bits);
+                count_scan += _popc_0;
+            }
+            if (bid == 0) {
+                expert_counts[expert_scan] = count_scan;
+                expert_scatter_offsets[expert_scan] = count_scan;
+            }
+            lane_prefixes[expert_slot_scan] = lane_total;
+            int padded_count_scan = count_scan + BLOCK_MASK & ~BLOCK_MASK;
+            lane_total += padded_count_scan;
+        }
+        int warp_inclusive = lane_total;
+        int _shfl_up_15 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 1, 32);
+        int phase2_scan_peer = _shfl_up_15;
+        if (lane >= 1) {
+            warp_inclusive += phase2_scan_peer;
+        }
+        int _shfl_up_16 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 2, 32);
+        int phase2_scan_peer_0 = _shfl_up_16;
+        if (lane >= 2) {
+            warp_inclusive += phase2_scan_peer_0;
+        }
+        int _shfl_up_17 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 4, 32);
+        int phase2_scan_peer_1 = _shfl_up_17;
+        if (lane >= 4) {
+            warp_inclusive += phase2_scan_peer_1;
+        }
+        int _shfl_up_18 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 8, 32);
+        int phase2_scan_peer_2 = _shfl_up_18;
+        if (lane >= 8) {
+            warp_inclusive += phase2_scan_peer_2;
+        }
+        int _shfl_up_19 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 16, 32);
+        int phase2_scan_peer_3 = _shfl_up_19;
+        if (lane >= 16) {
+            warp_inclusive += phase2_scan_peer_3;
+        }
+        if (lane == 31) {
+            phase2_warp_sums[warp] = warp_inclusive;
+        }
+        __syncthreads();
+        int phase2_warp_prefix_lane0 = 0;
+        if (lane == 0) {
+            #pragma unroll
+            for (int prior_scan_warp = 0; prior_scan_warp < NUM_WARPS; prior_scan_warp++) {
+                if (prior_scan_warp < warp) {
+                    phase2_warp_prefix_lane0 += phase2_warp_sums[prior_scan_warp];
+                }
+            }
+        }
+        int _shfl_2 = __shfl_sync(0xFFFFFFFF, phase2_warp_prefix_lane0, 0);
+        int phase2_warp_prefix = _shfl_2;
+        int lane_prefix = phase2_warp_prefix + warp_inclusive - lane_total;
+        #pragma unroll
+        for (int expert_slot_store = 0; expert_slot_store < ITEMS_PER_THREAD; expert_slot_store++) {
+            int expert_store = expert_scan_base + expert_slot_store;
+            int offset_store = lane_prefix + lane_prefixes[expert_slot_store];
+            plan_offsets[expert_store] = offset_store;
+            if (bid == 0) {
+                expert_offsets[expert_store] = offset_store;
+            }
+        }
+        if (bid == 0) {
+            if (tid == THREADS - 1) {
+                int padded_total = phase2_warp_prefix + warp_inclusive;
+                expert_offsets[NUM_EXPERTS] = padded_total;
+                num_tokens_post_padded[0] = padded_total;
+            }
+        }
+        __syncthreads();
+        #pragma unroll 1
+        for (int emit_token = bid; emit_token < M; emit_token += num_bids) {
+            if (tid < TOP_K) {
+                int emit_pair = emit_token * TOP_K + tid;
+                int emit_expert = plan_ids[emit_pair];
+                int emit_base = plan_offsets[emit_expert];
+                int emit_word = emit_token >> 5;
+                unsigned int emit_below = ((unsigned int)1 << (unsigned int)(emit_token & 31)) - 1;
+                int emit_rank = 0;
+                #pragma unroll
+                for (int rank_word = 0; rank_word < 4; rank_word++) {
+                    unsigned int rank_bits = plan_bitmap[emit_expert * 4 + rank_word];
+                    if (emit_word > rank_word) {
+                        int _popc_1 = __popc(rank_bits);
+                        emit_rank += _popc_1;
+                    }
+                    if (emit_word == rank_word) {
+                        int _popc_2 = __popc(rank_bits & emit_below);
+                        emit_rank += _popc_2;
+                    }
+                }
+                sorted_token_ids[emit_base + emit_rank] = emit_pair;
+            }
+        }
+        int pair_sentinel = total_pairs;
+        #pragma unroll 1
+        for (int own_expert = bid * NUM_WARPS + warp; own_expert < NUM_EXPERTS; own_expert += owner_ctas * NUM_WARPS) {
+            int own_count = 0;
+            #pragma unroll
+            for (int own_word = 0; own_word < 4; own_word++) {
+                unsigned int own_bits = plan_bitmap[own_expert * 4 + own_word];
+                int _popc_3 = __popc(own_bits);
+                own_count += _popc_3;
+            }
+            int own_base = plan_offsets[own_expert];
+            int own_padded = own_count + BLOCK_MASK & ~BLOCK_MASK;
+            #pragma unroll 1
+            for (int pad_slot = own_count + lane; pad_slot < own_padded; pad_slot += 32) {
+                sorted_token_ids[own_base + pad_slot] = pair_sentinel;
+            }
+            #pragma unroll 1
+            for (int block_slot = lane; block_slot < own_padded >> BLOCK_SHIFT; block_slot += 32) {
+                expert_ids[(own_base >> BLOCK_SHIFT) + block_slot] = own_expert;
             }
         }
     }
-    __syncthreads();
 }
 
 } // extern "C"

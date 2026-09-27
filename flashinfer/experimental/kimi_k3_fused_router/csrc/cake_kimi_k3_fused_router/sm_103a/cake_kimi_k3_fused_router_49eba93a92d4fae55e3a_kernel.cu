@@ -83,9 +83,6 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SELECTED_IDS_OFF 15680
 #define SMEM_SELECTED_IDS_STAGE_BYTES 64
 #define SMEM_SELECTED_IDS_STRIDE 64
-#define SMEM_WARP_TOTALS_OFF 16768
-#define SMEM_WARP_TOTALS_STAGE_BYTES 28
-#define SMEM_WARP_TOTALS_STRIDE 28
 #define SMEM_TOTAL 16896
 #define THREADS 224
 #define BLOCK_M 8
@@ -136,7 +133,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(224) void
-kernel_cake_kimi_k3_fused_router_265956a33db4fefe7cc5(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+kernel_cake_kimi_k3_fused_router_49eba93a92d4fae55e3a(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -144,8 +141,7 @@ kernel_cake_kimi_k3_fused_router_265956a33db4fefe7cc5(float* __restrict__ logits
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
-    smem = make_warp_uniform(smem);
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -173,17 +169,11 @@ kernel_cake_kimi_k3_fused_router_265956a33db4fefe7cc5(float* __restrict__ logits
     const int offsets_addr = smem + 12032;
     int* selected_ids = reinterpret_cast<int*>(smem_raw + 15680);
     const int selected_ids_addr = smem + 15680;
-    int* warp_totals = reinterpret_cast<int*>(smem_raw + 16768);
-    const int warp_totals_addr = smem + 16768;
 
     // === Task calls (dependency order) ===
     #pragma unroll 1
-    for (int clear_word = tid; clear_word < NUM_EXPERTS + NUM_EXPERTS * ROUTE_WORDS; clear_word += THREADS) {
-        if (clear_word < NUM_EXPERTS) {
-            row_bits[clear_word] = (unsigned int)0;
-        } else {
-            route_slots[clear_word - NUM_EXPERTS] = (unsigned int)0;
-        }
+    for (int clear_word = tid; clear_word < NUM_EXPERTS; clear_word += THREADS) {
+        row_bits[clear_word] = (unsigned int)0;
     }
     if (warp == 0) {
         if (elect_sync()) {
@@ -484,13 +474,12 @@ kernel_cake_kimi_k3_fused_router_265956a33db4fefe7cc5(float* __restrict__ logits
         }
         __syncthreads();
     }
-    __syncthreads();
     #pragma unroll 1
     for (int pair_slot = tid; pair_slot < ROWS * TOP_K; pair_slot += THREADS) {
         int gathered_id = selected_ids[pair_slot];
         int gathered_row = pair_slot >> 4;
         atomicAdd(&row_bits[gathered_id], (unsigned int)1 << (unsigned int)gathered_row);
-        atomicAdd(&route_slots[gathered_id * ROUTE_WORDS + (gathered_row >> 3)], (unsigned int)(pair_slot & 15) << (unsigned int)((gathered_row & 7) * 4));
+        route_slots[gathered_id * ROUTE_WORDS + (gathered_row >> 3)] = (unsigned int)(pair_slot & 15) << (unsigned int)((gathered_row & 7) * 4);
     }
     __syncthreads();
     int expert_scan_base = warp * 32 * ITEMS_PER_THREAD + lane * ITEMS_PER_THREAD;
@@ -508,48 +497,22 @@ kernel_cake_kimi_k3_fused_router_265956a33db4fefe7cc5(float* __restrict__ logits
         lane_prefixes[count_slot] = lane_total;
         lane_total += count_value + BLOCK_MASK & ~BLOCK_MASK;
     }
-    int warp_inclusive = lane_total;
-    int _shfl_up_15 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 1, 32);
-    int scan_peer_4 = _shfl_up_15;
-    if (lane >= 1) {
-        warp_inclusive += scan_peer_4;
-    }
-    int _shfl_up_16 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 2, 32);
-    int scan_peer_0_1 = _shfl_up_16;
-    if (lane >= 2) {
-        warp_inclusive += scan_peer_0_1;
-    }
-    int _shfl_up_17 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 4, 32);
-    int scan_peer_1_1 = _shfl_up_17;
-    if (lane >= 4) {
-        warp_inclusive += scan_peer_1_1;
-    }
-    int _shfl_up_18 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 8, 32);
-    int scan_peer_2_1 = _shfl_up_18;
-    if (lane >= 8) {
-        warp_inclusive += scan_peer_2_1;
-    }
-    int _shfl_up_19 = __shfl_up_sync(0xFFFFFFFF, warp_inclusive, 16, 32);
-    int scan_peer_3_1 = _shfl_up_19;
-    if (lane >= 16) {
-        warp_inclusive += scan_peer_3_1;
-    }
-    if (lane == 31) {
-        warp_totals[warp] = warp_inclusive;
-    }
-    __syncthreads();
-    int warp_prefix_lane0 = 0;
-    if (lane == 0) {
-        #pragma unroll
-        for (int prior_warp = 0; prior_warp < NUM_WARPS; prior_warp++) {
-            if (prior_warp < warp) {
-                warp_prefix_lane0 += warp_totals[prior_warp];
-            }
+    int distinct_below = 0;
+    #pragma unroll
+    for (int cmp_pair = 0; cmp_pair < ROWS * TOP_K; cmp_pair++) {
+        int cmp_id = selected_ids[cmp_pair];
+        unsigned int cmp_lower = ((unsigned int)1 << (unsigned int)(cmp_pair >> 4)) - 1;
+        unsigned int cmp_bits = row_bits[cmp_id];
+        int cmp_hit = 0;
+        if (cmp_id < expert_scan_base) {
+            cmp_hit = 1;
         }
+        if ((cmp_bits & cmp_lower) != 0) {
+            cmp_hit = 0;
+        }
+        distinct_below += cmp_hit;
     }
-    int _shfl_2 = __shfl_sync(0xFFFFFFFF, warp_prefix_lane0, 0);
-    int warp_prefix = _shfl_2;
-    int lane_prefix = warp_prefix + warp_inclusive - lane_total;
+    int lane_prefix = distinct_below * BLOCK_M;
     #pragma unroll
     for (int offset_slot = 0; offset_slot < ITEMS_PER_THREAD; offset_slot++) {
         int offset_expert = expert_scan_base + offset_slot;
@@ -560,7 +523,7 @@ kernel_cake_kimi_k3_fused_router_265956a33db4fefe7cc5(float* __restrict__ logits
         }
     }
     if (tid == THREADS - 1) {
-        int padded_total = warp_prefix + warp_inclusive;
+        int padded_total = lane_prefix + lane_total;
         offsets[NUM_EXPERTS] = padded_total;
         if (cta_rank == 0) {
             expert_offsets[NUM_EXPERTS] = padded_total;
@@ -600,7 +563,6 @@ kernel_cake_kimi_k3_fused_router_265956a33db4fefe7cc5(float* __restrict__ logits
             }
         }
     }
-    __syncthreads();
 }
 
 } // extern "C"
