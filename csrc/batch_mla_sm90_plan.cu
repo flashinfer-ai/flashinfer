@@ -52,5 +52,8 @@ Tuple<Array<int64_t>, int64_t> BatchMLAPagedAttentionSM90Plan(
   TVM_FFI_ICHECK(status == cudaSuccess)
       << "Failed to plan MLA, error: " << cudaGetErrorString(status);
 
-  return Tuple<Array<int64_t>, int64_t>(Array(plan_info.ToVector()), staged_int_workspace_bytes);
+  auto plan_info_vec = plan_info.ToVector();
+  plan_info_vec.push_back(plan_info.batch_q_indptr_offset);
+  plan_info_vec.push_back(batch_size);
+  return Tuple<Array<int64_t>, int64_t>(Array(plan_info_vec), staged_int_workspace_bytes);
 }
