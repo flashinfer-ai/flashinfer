@@ -10,9 +10,9 @@ FP8 E4M3).  Both routes reproduce the chain's rounding points exactly:
 ``g = BF16(gate)``, ``u = BF16(up)``, ``h = BF16(silu(g) * u)``,
 ``scale = max(absmax_128(h), eps) / 448``, ``q = E4M3(clamp(h / scale, -448, 448))``.
 
-* ``M >= SMALL_M_MAX`` (2048 rows): one persistent fused kernel keeps the
-  GEMM's ordered FP32 K-block accumulation in tensor memory and applies
-  SwiGLU + quantization in its epilogue.  The BF16 intermediate, the
+* ``M >= SMALL_M_MAX`` (2048 rows): two persistent fused kernels keep the
+  GEMM's ordered FP32 K-block accumulation in tensor memory and apply
+  SwiGLU + quantization in their epilogue.  The BF16 intermediate, the
   activation launch and the quantization launch disappear.
 * ``M < SMALL_M_MAX``: the fused kernel's one-SM-per-tile epilogue does not
   amortize on a few tiles, so the prepared launch runs the FlashInfer grouped
@@ -24,10 +24,14 @@ Routing contract (the same as the CuTe-DSL contiguous grouped GEMM): rows are
 sorted by expert through ``m_indices``; every *internal* expert boundary is a
 multiple of 128 rows (``moe_align_block_size`` with block 128), only the final
 expert may end in a partial block, empty experts are allowed, and
-``M <= 8192``.  Consecutive same-expert 128-row blocks form 256-row cluster
-tiles (two CTAs, ``cta_group::2``); the odd tail block of an expert is a
-single-CTA 128-row tile (``cta_group::1``) scheduled after the pair tiles, so
-no dummy block is computed on non-uniform routings.
+``M <= 8192``.  The pair kernel processes consecutive same-expert 128-row
+blocks as 256-row cluster tiles (two CTAs, ``cta_group::2``); the tail kernel
+processes the odd tail block of every odd-count expert as single-CTA 128-row
+tiles (``cta_group::1``), so no dummy block is computed on non-uniform
+routings.  The tail kernel is launched with the programmatic-dependent-launch
+attribute right after the pair kernel (which signals its dependents at start),
+so its CTAs fill the SMs the pair grid leaves free or retires from; it reads
+only the operator's inputs.
 
 Descriptor storage for the pointer TMA ABI (fused route, and the Cake GEMM of
 the small-M route) is private to each prepared launch: the first ``launch()``
@@ -50,7 +54,7 @@ from ..jit.gemm.cake_grouped_fp8_fused_silu_quant import (
     SUPPORTED_COMPUTE_CAPABILITIES,
     generated_program_available,
     load_cake_grouped_fp8_fused_silu_quant_module,
-    select_module,
+    select_stage_module,
 )
 from .cake_grouped_fp8_gemm import prepare_group_gemm_fp8_nt_groupwise_contiguous
 
@@ -64,9 +68,15 @@ CTA_CAP = 128
 QUANT_EPS = 1e-10
 FP8_E4M3_MAX = 448.0
 
-# Route names double as the generated-program template names.
+# Route names double as the generated-program template names of their first kernel.
 FUSED_ROUTE = "fused_cg2_ab7_pairsched_solotail_kg4"
 ACT_ROUTE = "gemm_then_silu_mul_group_quant_fp8"
+# Generated kernel stages per route in launch order; the fused route's tail kernel has its own template geometry.
+FUSED_PAIR_STAGE = "pair"
+FUSED_TAIL_STAGE = "tail"
+ACT_STAGE = "main"
+ROUTE_STAGES = {FUSED_ROUTE: (FUSED_PAIR_STAGE, FUSED_TAIL_STAGE), ACT_ROUTE: (ACT_STAGE,)}
+TAIL_GEOMETRY_KEY = f"{FUSED_ROUTE}_{FUSED_TAIL_STAGE}"
 # Rows below this take ACT_ROUTE (measured B200 crossover of the fused kernel against grouped GEMM + the fused
 # activation kernel; every problem with at most 9 row blocks lost to the chain in the fused kernel).
 SMALL_M_MAX = 2048
@@ -145,6 +155,21 @@ def launch_plan(m: int, n2: int, *, sm_count: int) -> tuple[str, tuple[int, int,
     return route, (clusters * cluster_ctas, 1, 1)
 
 
+def tail_launch_grid(m: int, n2: int, *, sm_count: int) -> tuple[int, int, int]:
+    """Grid of the fused route's tail kernel for ``A[M, K]`` and ``B[G, 2H, K]`` on ``sm_count`` SMs.
+
+    One single-CTA 128-row tile per odd-tail block and N256 tile; the host
+    never reads the routing, so the grid is one CTA per SM up to the unit
+    upper bound (every block an odd tail) and the CTAs grid-stride over the
+    actual units.  A routing without odd tails runs an empty grid, overlapped
+    with the pair kernel by programmatic dependent launch.
+    """
+    if sm_count <= 0:
+        raise ValueError("sm_count must be positive")
+    tile_m, tile_n, _ = route_geometry(TAIL_GEOMETRY_KEY)
+    return (max(1, min(math.ceil(m / tile_m) * (n2 // tile_n), sm_count)), 1, 1)
+
+
 def _require_tensor(
     tensor: Any,
     name: str,
@@ -196,11 +221,14 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
 
     Tensor storage, shapes and dtypes are bound at preparation; tensor
     *contents* may change between launches.  ``launch()`` submits exactly
-    ``num_kernels`` kernels (one for the fused route, two for the small-M
-    route: the grouped GEMM into the private BF16 workspace, then the
-    generated activation kernel) on PyTorch's current stream for the bound
+    ``num_kernels`` kernels (two for the fused route: the pair kernel, then
+    the tail kernel with the programmatic-dependent-launch attribute; two for
+    the small-M route: the grouped GEMM into the private BF16 workspace, then
+    the generated activation kernel) on PyTorch's current stream for the bound
     device and returns ``(out_q, out_s)``.  The first launch initializes
     private TMA descriptor storage and must run outside CUDA Graph capture.
+    ``grid`` is the grid of the route's first generated kernel;
+    ``stage_grids`` holds every generated kernel's grid by stage name.
     """
 
     route: str
@@ -209,9 +237,10 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
     out_q: torch.Tensor
     out_s: torch.Tensor
     gemm_backend: Optional[str]
-    _entry: Callable[..., Any]
-    _arguments: tuple[Any, ...]
-    _descriptor_storage: Optional[torch.Tensor]
+    stage_module_names: dict[str, str]
+    stage_grids: dict[str, tuple[int, int, int]]
+    _entries: tuple[tuple[Callable[..., Any], tuple[Any, ...]], ...]
+    _descriptor_storages: tuple[torch.Tensor, ...]
     _gemm: Optional[Callable[[], Any]]
     _gemm_out: Optional[torch.Tensor]
 
@@ -220,19 +249,25 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
             if self._gemm is not None:
                 self._gemm()
             with tvm_ffi.use_torch_stream():
-                self._entry(*self._arguments)
+                for entry, arguments in self._entries:
+                    entry(*arguments)
         return self.out_q, self.out_s
 
     __call__ = launch
 
     @property
     def num_ctas(self) -> int:
-        """CTAs of the generated kernel (the fused kernel or the activation kernel)."""
+        """CTAs of the route's first generated kernel (the pair kernel or the activation kernel)."""
         return int(self.grid[0])
 
     @property
+    def tail_grid(self) -> Optional[tuple[int, int, int]]:
+        """Grid of the fused route's tail kernel (``None`` on the small-M route)."""
+        return self.stage_grids.get(FUSED_TAIL_STAGE)
+
+    @property
     def num_kernels(self) -> int:
-        return 1 if self._gemm is None else 2
+        return len(self._entries) + (0 if self._gemm is None else 1)
 
 
 def is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available(
@@ -361,15 +396,17 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
 
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     route, grid = launch_plan(m, n2, sm_count=sm_count)
-    module_name = select_module(arch, route)
-    record = MODULES[module_name]
-    module = load_cake_grouped_fp8_fused_silu_quant_module(module_name)
-    entry = getattr(module, record["ffi_entry"])
+    stage_grids: dict[str, tuple[int, int, int]] = {ROUTE_STAGES[route][0]: grid}
+    if route == FUSED_ROUTE:
+        stage_grids[FUSED_TAIL_STAGE] = tail_launch_grid(m, n2, sm_count=sm_count)
+    stage_module_names = {
+        stage: select_stage_module(arch, route, stage) for stage in ROUTE_STAGES[route]
+    }
+    module_name = stage_module_names[ROUTE_STAGES[route][0]]
 
     gemm_backend: Optional[str] = None
     gemm: Optional[Callable[[], Any]] = None
     gemm_out: Optional[torch.Tensor] = None
-    descriptor_storage: Optional[torch.Tensor] = None
     if route == FUSED_ROUTE:
         bindings: dict[str, Any] = {
             "A": a.view(torch.uint8),
@@ -384,10 +421,6 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
             "K": k,
             "G": groups,
         }
-        workspace_bytes = int(record["tma_workspace_bytes"])
-        descriptor_storage = torch.empty(
-            max(workspace_bytes, 128), dtype=torch.uint8, device=device
-        )
     else:
         gemm_backend = small_m_gemm_backend(m, n2, k)
         gemm_out = torch.empty((m, n2), dtype=torch.bfloat16, device=device)
@@ -404,27 +437,43 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
                 )
 
         bindings = {"y": gemm_out, "out_q": out_q, "out_s": out_s, "M": m, "H": h}
-        if int(record["tma_workspace_bytes"]):
-            raise RuntimeError(
-                f"generated program {module_name} of route {route!r} unexpectedly needs TMA descriptor storage"
+
+    entries = []
+    descriptor_storages = []
+    for stage in ROUTE_STAGES[route]:
+        stage_module_name = stage_module_names[stage]
+        record = MODULES[stage_module_name]
+        module = load_cake_grouped_fp8_fused_silu_quant_module(stage_module_name)
+        entry = getattr(module, record["ffi_entry"])
+        descriptor_storage: Optional[torch.Tensor] = None
+        workspace_bytes = int(record["tma_workspace_bytes"])
+        if route == FUSED_ROUTE:
+            descriptor_storage = torch.empty(
+                max(workspace_bytes, 128), dtype=torch.uint8, device=device
             )
-    grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
-    arguments = []
-    for kind, name in record["arg_plan"]:
-        if kind == "grid":
-            arguments.append(grid_by_axis[name])
-        elif kind == "workspace":
-            if descriptor_storage is None:
+            descriptor_storages.append(descriptor_storage)
+        elif workspace_bytes:
+            raise RuntimeError(
+                f"generated program {stage_module_name} of route {route!r} unexpectedly needs TMA descriptor storage"
+            )
+        grid_by_axis = dict(zip(("grid_x", "grid_y", "grid_z"), stage_grids[stage], strict=True))
+        arguments = []
+        for kind, name in record["arg_plan"]:
+            if kind == "grid":
+                arguments.append(grid_by_axis[name])
+            elif kind == "workspace":
+                if descriptor_storage is None:
+                    raise RuntimeError(
+                        f"generated program {stage_module_name} binds descriptor storage this host plan does not own"
+                    )
+                arguments.append(descriptor_storage)
+            elif name in bindings:
+                arguments.append(bindings[name])
+            else:
                 raise RuntimeError(
-                    f"generated program {module_name} binds descriptor storage this host plan does not own"
+                    f"generated program {stage_module_name} binds {name!r}, which this host plan does not declare"
                 )
-            arguments.append(descriptor_storage)
-        elif name in bindings:
-            arguments.append(bindings[name])
-        else:
-            raise RuntimeError(
-                f"generated program {module_name} binds {name!r}, which this host plan does not declare"
-            )
+        entries.append((entry, tuple(arguments)))
     return PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant(
         route=route,
         module_name=module_name,
@@ -432,9 +481,10 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         out_q=out_q,
         out_s=out_s,
         gemm_backend=gemm_backend,
-        _entry=entry,
-        _arguments=tuple(arguments),
-        _descriptor_storage=descriptor_storage,
+        stage_module_names=stage_module_names,
+        stage_grids=stage_grids,
+        _entries=tuple(entries),
+        _descriptor_storages=tuple(descriptor_storages),
         _gemm=gemm,
         _gemm_out=gemm_out,
     )
@@ -451,4 +501,5 @@ __all__ = [
     "launch_plan",
     "prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant",
     "small_m_gemm_backend",
+    "tail_launch_grid",
 ]

@@ -2,12 +2,14 @@
 # SPDX-License-Identifier: Apache-2.0
 """JIT registration of the generated Blackwell fused grouped FP8 gate_up GEMM + SwiGLU + FP8 quantization programs.
 
-One record per exported physical program (one generated kernel route on one
-architecture).  Each record names its generated translation units under
-``csrc/cake_grouped_fp8_fused_silu_quant``, the exact compile flags of the source build,
-the tvm-ffi entry, the positional argument plan and the caller-owned TMA
-descriptor storage size.  ``MODULES`` and ``ROUTE_GEOMETRY`` are populated
-verbatim by the generated-program export; do not edit them by hand.
+One record per exported physical program (one generated kernel stage of one
+route on one architecture; the fused route launches a pair kernel and a tail
+kernel, the small-M route one activation kernel).  Each record names its
+generated translation units under ``csrc/cake_grouped_fp8_fused_silu_quant``,
+the exact compile flags of the source build, the tvm-ffi entry, the positional
+argument plan and the caller-owned TMA descriptor storage size.  ``MODULES``
+and ``ROUTE_GEOMETRY`` are populated verbatim by the generated-program export;
+do not edit them by hand.
 """
 
 from __future__ import annotations
@@ -183,15 +185,39 @@ def generated_program_available(device) -> bool:
     return arch is not None and any(r["arch"] == arch for r in MODULES.values())
 
 
-def select_module(arch: str, route: str) -> str:
-    """Return the registered module name for one ``(arch, route)`` pair."""
+def select_stage_module(arch: str, route: str, stage: str) -> str:
+    """Return the registered module name of one generated kernel stage of ``route`` on ``arch``."""
     for name, record in MODULES.items():
-        if record["arch"] == arch and record["route"] == route:
+        if (
+            record["arch"] == arch
+            and record["route"] == route
+            and record.get("stage", "main") == stage
+        ):
             return name
     raise NotImplementedError(
         f"no generated fused grouped FP8 gate_up+SwiGLU+quant program is registered for "
-        f"route {route!r} on {arch}"
+        f"route {route!r} stage {stage!r} on {arch}"
     )
+
+
+def select_module(arch: str, route: str) -> str:
+    """Return the registered module name of the first generated kernel of ``route`` on ``arch``."""
+    stages = [
+        record.get("stage", "main")
+        for record in MODULES.values()
+        if record["arch"] == arch and record["route"] == route
+    ]
+    if not stages:
+        raise NotImplementedError(
+            f"no generated fused grouped FP8 gate_up+SwiGLU+quant program is registered for "
+            f"route {route!r} on {arch}"
+        )
+    first = min(stages, key=lambda stage: STAGE_ORDER.get(stage, len(STAGE_ORDER)))
+    return select_stage_module(arch, route, first)
+
+
+# Launch order of the generated kernel stages (records without a stage are single-kernel routes).
+STAGE_ORDER = {"main": 0, "pair": 0, "tail": 1}
 
 
 @functools.cache
@@ -229,4 +255,6 @@ __all__ = [
     "generated_program_available",
     "load_cake_grouped_fp8_fused_silu_quant_module",
     "select_module",
+    "select_stage_module",
+    "STAGE_ORDER",
 ]

@@ -19,6 +19,7 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available,
     launch_plan,
     small_m_gemm_backend,
+    tail_launch_grid,
 )
 from flashinfer.quantization import per_token_group_quant_8bit
 
@@ -279,8 +280,9 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
         )
     else:
         assert prepared.route == FUSED_ROUTE
-        assert prepared.num_kernels == 1
+        assert prepared.num_kernels == 2  # pair kernel + PDL tail kernel
         assert prepared.gemm_backend is None
+        assert prepared.tail_grid is not None and 1 <= prepared.tail_grid[0]
     out_q, out_s = prepared.launch()
     torch.cuda.synchronize()
     g, u, act = _reference_activation(
@@ -342,7 +344,11 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     assert (prepared.route, prepared.grid) == (route, grid)
     if route == FUSED_ROUTE:
         assert grid[0] % 2 == 0 and grid[0] <= 128
+        tail = tail_launch_grid(m, n2, sm_count=sm_count)
+        assert prepared.tail_grid == tail and 1 <= tail[0] <= sm_count
+        assert set(prepared.stage_grids) == {"pair", "tail"}
     else:
+        assert prepared.tail_grid is None
         items = m * (n2 // 2 // GROUP_SIZE)
         assert 1 <= grid[0] <= max(1, -(-items // 4))
         assert grid[0] <= 16 * sm_count
