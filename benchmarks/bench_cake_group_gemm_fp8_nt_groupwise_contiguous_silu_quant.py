@@ -38,6 +38,13 @@ SHAPES = [
         4096,
     ),
     ("wide_ep32_gate_up_all_odd", [384] * 8 + [128] * 8, 2048, 4096),
+    ("wide_ep32_gate_up_all_one_block", [128] * 16, 2048, 4096),
+    (
+        "wide_ep32_gate_up_mixed_tail",
+        [640, 128, 384, 0, 896, 128, 384, 256, 128, 0, 384, 128, 256, 128, 128, 128],
+        2048,
+        4096,
+    ),
     # small-M route (grouped GEMM + generated SwiGLU/group-quant kernel): aligned and partial-tail routings
     ("one_pair", [256], 512, 1024),
     ("odd_blocks_with_empty", [384, 128, 0, 640], 512, 512),

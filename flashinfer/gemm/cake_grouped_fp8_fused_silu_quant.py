@@ -24,8 +24,10 @@ Routing contract (the same as the CuTe-DSL contiguous grouped GEMM): rows are
 sorted by expert through ``m_indices``; every *internal* expert boundary is a
 multiple of 128 rows (``moe_align_block_size`` with block 128), only the final
 expert may end in a partial block, empty experts are allowed, and
-``M <= 8192``.  Each kernel tile is a pair of consecutive same-expert 128-row
-blocks; an expert with an odd block count computes one dummy block.
+``M <= 8192``.  Consecutive same-expert 128-row blocks form 256-row cluster
+tiles (two CTAs, ``cta_group::2``); the odd tail block of an expert is a
+single-CTA 128-row tile (``cta_group::1``) scheduled after the pair tiles, so
+no dummy block is computed on non-uniform routings.
 
 Descriptor storage for the pointer TMA ABI (fused route, and the Cake GEMM of
 the small-M route) is private to each prepared launch: the first ``launch()``
@@ -63,7 +65,7 @@ QUANT_EPS = 1e-10
 FP8_E4M3_MAX = 448.0
 
 # Route names double as the generated-program template names.
-FUSED_ROUTE = "fused_cg2_ab7_pairsched_kg4"
+FUSED_ROUTE = "fused_cg2_ab7_pairsched_solotail_kg4"
 ACT_ROUTE = "gemm_then_silu_mul_group_quant_fp8"
 # Rows below this take ACT_ROUTE (measured B200 crossover of the fused kernel against grouped GEMM + the fused
 # activation kernel; every problem with at most 9 row blocks lost to the chain in the fused kernel).

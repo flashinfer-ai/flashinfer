@@ -242,6 +242,16 @@ ROUTING_CASES = [
         [384] * 8 + [128] * 8, 2048, 4096, False, id="wide_ep32_gate_up_all_odd"
     ),
     pytest.param([512] * 16, 2048, 4096, False, id="m8192_max"),
+    # odd-tail coverage: every expert one block (all odd tails, M = 2048 route boundary) and a mixed routing with
+    # twelve odd-block experts plus two empty experts
+    pytest.param([128] * 16, 2048, 4096, False, id="wide_ep32_gate_up_all_one_block"),
+    pytest.param(
+        [640, 128, 384, 0, 896, 128, 384, 256, 128, 0, 384, 128, 256, 128, 128, 128],
+        2048,
+        4096,
+        True,
+        id="wide_ep32_gate_up_mixed_tail",
+    ),
 ]
 
 
