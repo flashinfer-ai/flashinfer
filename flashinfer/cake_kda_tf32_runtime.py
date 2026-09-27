@@ -6073,6 +6073,12 @@ AFFINE_REBIND_ATTRIBUTES = (
     "_checkpoint_start",
     "_out_tail",
 )
+# Composite attributes that the apply-route kernels (pair-map producer and
+# fused apply) address through prepared TMA descriptors of CALLER storage:
+# the output tail (``out_tma``) and, for in-place checkpoint rows, the caller's
+# checkpoint buffer (``rows_tma``).  When a plan-cache rebind moves one of
+# them the composite must re-encode those descriptors before its next launch.
+APPLY_ROUTE_DESCRIPTOR_ATTRIBUTES = ("_out_tail", "_checkpoint_output")
 
 
 def _rebind_owner(impl, container_name: str):
@@ -6390,6 +6396,23 @@ def _apply_rebind_specs(
                 owner, _ = _rebind_owner(impl, spec.container)
                 if owner not in stale_owners:
                     stale_owners.append(owner)
+        elif (
+            spec.container == "attributes"
+            and spec.key in APPLY_ROUTE_DESCRIPTOR_ATTRIBUTES
+        ):
+            # The apply-route kernels hold prepared TMA descriptors of these
+            # caller tensors (see _apply_bindings / _pairmap_bindings); a moved
+            # source means the descriptors still address the previous call's
+            # storage, so mark them for re-encoding in the launch stream.
+            moved = (
+                spec.input_name in changed
+                if changed is not None
+                else container[spec.key].data_ptr() != replacement.data_ptr()
+            )
+            if moved and getattr(impl, "_apply_route", False):
+                if spec.key == "_out_tail" or impl._checkpoint_in_place:
+                    tma_moved = True
+                    impl._apply_descriptors_stale = True
         container[spec.key] = replacement
     for address in address_specs:
         touched.add(address.container)
