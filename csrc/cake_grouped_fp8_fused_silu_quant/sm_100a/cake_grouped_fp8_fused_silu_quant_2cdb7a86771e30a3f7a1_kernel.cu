@@ -1010,7 +1010,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap const* A, CakeTensorMap const* B, uint8_t* __restrict__ out_q, float* __restrict__ out_s, float* __restrict__ a_scale, float* __restrict__ b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
+kernel_cake_grouped_fp8_fused_silu_quant_2cdb7a86771e30a3f7a1(CakeTensorMap const* A, CakeTensorMap const* B, uint8_t* __restrict__ out_q, float* __restrict__ out_s, float* __restrict__ a_scale, float* __restrict__ b_scale, int* __restrict__ m_indices, int M, int N, int K, int G)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1177,7 +1177,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                     local_i = -1;
                 }
                 local_i += 1;
-                if ((local_i & 1) == 0) {
+                if ((local_i & 1) == 1) {
                     if (lane == (pairs_total & 31)) {
                         if (pairs_total < 32) {
                             pair_lo = kb;
@@ -1203,6 +1203,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                 if (pair_id >= 32) {
                     b0 = b0_hi;
                 }
+                b0 = b0 - 1;
                 int _shfl_36 = __shfl_sync(0xFFFFFFFF, g_blk_lo, b0 & 31);
                 int group = _shfl_36;
                 int _shfl_37 = __shfl_sync(0xFFFFFFFF, g_blk_hi, b0 & 31);
@@ -1255,6 +1256,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                 if (next_pair >= 32) {
                     nb0 = nb0_hi;
                 }
+                nb0 = nb0 - 1;
                 int _shfl_42 = __shfl_sync(0xFFFFFFFF, g_blk_lo, nb0 & 31);
                 int next_group = _shfl_42;
                 int _shfl_43 = __shfl_sync(0xFFFFFFFF, g_blk_hi, nb0 & 31);
@@ -1918,7 +1920,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                         local_i_1 = -1;
                     }
                     local_i_1 += 1;
-                    if ((local_i_1 & 1) == 0) {
+                    if ((local_i_1 & 1) == 1) {
                         if (lane == (pairs_total_1 & 31)) {
                             if (pairs_total_1 < 32) {
                                 pair_lo_1 = kb_1;
@@ -1942,6 +1944,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                     if (pair_id_1 >= 32) {
                         b0_1 = b0_hi_1;
                     }
+                    b0_1 = b0_1 - 1;
                     int _shfl_28 = __shfl_sync(0xFFFFFFFF, g_blk_lo_1, b0_1 & 31);
                     int group_1 = _shfl_28;
                     int _shfl_29 = __shfl_sync(0xFFFFFFFF, g_blk_hi_1, b0_1 & 31);
@@ -2084,6 +2087,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
     // ---- Role: tma_role ----
     if (warp == 9) {
         { // tma_role_main
+            asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
             unsigned int ab_stage_1 = 0;
             int m_tiles_2 = (M - 1) / 256 + 1;
             int n_tiles_2 = N / 256;
@@ -2116,7 +2120,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                     local_i_2 = -1;
                 }
                 local_i_2 += 1;
-                if ((local_i_2 & 1) == 0) {
+                if ((local_i_2 & 1) == 1) {
                     if (lane == (pairs_total_2 & 31)) {
                         if (pairs_total_2 < 32) {
                             pair_lo_2 = kb_2;
@@ -2141,6 +2145,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                 if (pair_id_2 >= 32) {
                     b0_2 = b0_hi_2;
                 }
+                b0_2 = b0_2 - 1;
                 int _shfl_4 = __shfl_sync(0xFFFFFFFF, g_blk_lo_2, b0_2 & 31);
                 int group_2 = _shfl_4;
                 int _shfl_5 = __shfl_sync(0xFFFFFFFF, g_blk_hi_2, b0_2 & 31);
@@ -2239,7 +2244,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                     local_i_3 = -1;
                 }
                 local_i_3 += 1;
-                if ((local_i_3 & 1) == 0) {
+                if ((local_i_3 & 1) == 1) {
                     if (lane == (pairs_total_3 & 31)) {
                         if (pairs_total_3 < 32) {
                             pair_lo_3 = kb_3;
@@ -2264,6 +2269,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                 if (pair_id_3 >= 32) {
                     b0_3 = b0_hi_3;
                 }
+                b0_3 = b0_3 - 1;
                 int _shfl_20 = __shfl_sync(0xFFFFFFFF, g_blk_lo_3, b0_3 & 31);
                 int group_3 = _shfl_20;
                 int _shfl_21 = __shfl_sync(0xFFFFFFFF, g_blk_hi_3, b0_3 & 31);
@@ -2368,7 +2374,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                     local_i_4 = -1;
                 }
                 local_i_4 += 1;
-                if ((local_i_4 & 1) == 0) {
+                if ((local_i_4 & 1) == 1) {
                     if (lane == (pairs_total_4 & 31)) {
                         if (pairs_total_4 < 32) {
                             pair_lo_4 = kb_4;
@@ -2393,6 +2399,7 @@ kernel_cake_grouped_fp8_fused_silu_quant_c5c857d1d7fd38445fd2(CakeTensorMap cons
                 if (pair_id_4 >= 32) {
                     b0_4 = b0_hi_4;
                 }
+                b0_4 = b0_4 - 1;
                 int _shfl_12 = __shfl_sync(0xFFFFFFFF, g_blk_lo_4, b0_4 & 31);
                 int group_b = _shfl_12;
                 int _shfl_13 = __shfl_sync(0xFFFFFFFF, g_blk_hi_4, b0_4 & 31);

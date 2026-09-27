@@ -624,7 +624,7 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_grouped_fp8_fused_silu_quant_3976a874cc916684c6b0(const __nv_bfloat16* __restrict__ y, uint8_t* __restrict__ out_q, float* __restrict__ out_s, int M, int H)
+kernel_cake_grouped_fp8_fused_silu_quant_0ea2266c93766fea306d(const __nv_bfloat16* __restrict__ y, uint8_t* __restrict__ out_q, float* __restrict__ out_s, int M, int H)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -633,6 +633,8 @@ kernel_cake_grouped_fp8_fused_silu_quant_3976a874cc916684c6b0(const __nv_bfloat1
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
 
     // === Task calls (dependency order) ===
     int groups_per_row = H / 128;
