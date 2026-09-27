@@ -86,16 +86,31 @@ _WAVE_CTAS_BY_SM_COUNT: dict[int, dict[int, int]] = {
 }
 _DEFAULT_SM_COUNT = 148
 _PREFERRED_MIN_EPT = 16
-# Stage-1 cost model: a register-resident wave costs _RESIDENT_BASE_US + _RESIDENT_PER_EPT_US per
-# register entry; a streaming wave costs _STREAM_WAVE_BASE_US plus _STREAM_CHUNK_US per 512 x
-# 16-entry chunk each CTA walks.  Re-fitted for the round-4 stage-1 kernels (streaming template with a
-# gathered candidate list, (8, 16) streaming variant) on the B200 per-variant sweep (25 (vocab, batch)
-# cells, zero regret against the measured-best variant; only the streaming wave base changed from the
-# round-3 fit); they only rank the frozen variants.
-_RESIDENT_BASE_US = 2.0
-_RESIDENT_PER_EPT_US = 0.1
-_STREAM_WAVE_BASE_US = 4.0
-_STREAM_CHUNK_US = 0.4
+# Stage-1 cost model, per wave table (same keys as _WAVE_CTAS_BY_SM_COUNT).  A register-resident wave
+# costs resident_base_us + resident_per_ept_us per register entry; a streaming wave costs
+# stream_wave_base_us plus stream_chunk_us per 512 x 16-entry chunk each CTA walks plus
+# stream_cluster_cta_us per CTA beyond the first in the cluster; both forms add launch_cta_us per
+# launched CTA normalised by the single-CTA wave capacity.  Re-fitted for the round-4 stage-1 kernels
+# (streaming template with a gathered candidate list, (8, 16) streaming variant) on per-variant sweeps
+# of B200 + B300 (148), H100 (132) and R200 (212), 25 (vocab, batch) cells each: zero regret against the
+# measured-best variant on every cell of every table (one shared constant set cannot do that: the
+# (8, 32) resident beats the (8, 16) stream at V = 128256, B <= 8 on H100 and up to B = 16 on R200 while
+# the stream wins on B200).  A launch whose largest top-k exceeds _STAGE1_LARGE_K (the fused-tail cap)
+# adds stream_large_k_us per streaming wave: the streaming template then takes its per-bucket list path,
+# which is slower than the register-resident candidate path at the same shape (k = 1000 sweeps: (8, 32)
+# beats the (8, 16) stream at V = 128256, B <= 8 on every architecture; the (8, 48) resident beats the
+# stream at V = 151936 on H100 and R200 but not on B200 / B300, hence the smaller term for 148).  The
+# constants only rank the frozen variants.
+_STAGE1_LARGE_K = 64
+_STAGE1_COST_BY_SM_COUNT: dict[
+    int, tuple[float, float, float, float, float, float, float]
+] = {
+    # (resident_base_us, resident_per_ept_us, stream_wave_base_us, stream_chunk_us,
+    #  stream_cluster_cta_us, launch_cta_us, stream_large_k_us)
+    148: (2.0, 0.1, 4.0, 0.4, 0.0, 0.0, 1.0),
+    132: (2.0, 0.1, 4.0, 0.4, 0.1, 1.5, 2.0),
+    212: (1.5, 0.1, 4.0, 0.4, 0.0, 0.0, 2.0),
+}
 
 _WORKSPACES: dict[
     tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -143,9 +158,18 @@ def _smem_optin(device_index: int) -> int:
     )
 
 
+def _nearest_table(sm_count: int) -> int:
+    return min(_WAVE_CTAS_BY_SM_COUNT, key=lambda n: (abs(n - sm_count), -n))
+
+
 def _wave_ctas(sm_count: int) -> dict[int, int]:
-    nearest = min(_WAVE_CTAS_BY_SM_COUNT, key=lambda n: (abs(n - sm_count), -n))
-    return _WAVE_CTAS_BY_SM_COUNT[nearest]
+    return _WAVE_CTAS_BY_SM_COUNT[_nearest_table(sm_count)]
+
+
+def _stage1_cost(
+    sm_count: int,
+) -> tuple[float, float, float, float, float, float, float]:
+    return _STAGE1_COST_BY_SM_COUNT[_nearest_table(sm_count)]
 
 
 def choose_stage1(
@@ -153,17 +177,20 @@ def choose_stage1(
     vocab: int,
     sm_count: Optional[int] = None,
     smem_limit: Optional[int] = None,
+    top_k_max: Optional[int] = None,
 ) -> tuple[int, int, bool]:
-    """``(cluster, ept, stream)`` for ``batch`` rows of ``vocab`` entries.
+    """``(cluster, ept, stream)`` for ``batch`` rows of ``vocab`` entries (largest top-k ``top_k_max``).
 
     Register-resident candidates: fewest waves, then a register chunk of at least 16 entries,
     then the larger cluster.  That resident choice is compared with every streaming variant
-    through the fitted cost model (resident ``waves * (_RESIDENT_BASE_US + _RESIDENT_PER_EPT_US *
-    ept)`` against streaming ``waves * (_STREAM_WAVE_BASE_US + _STREAM_CHUNK_US * chunks)``); the
-    resident variant wins ties and streaming ties prefer the smaller cluster.  The wave table is
-    selected by ``sm_count`` (the current device's SM count when omitted; B200 148, H100 132 and
-    Rubin R200 212 are measured), the cost constants were fitted on B200 and rank the frozen variants on every
-    device.  Variants needing more dynamic shared memory than ``smem_limit`` (the current
+    through the fitted cost model of the device's wave table (``_STAGE1_COST_BY_SM_COUNT``:
+    resident ``waves * (base + per_ept * ept)`` against streaming ``waves * (base + chunk *
+    chunks + cluster_cta * (cluster - 1))``, both plus ``launch_cta * ctas / wave_ctas[1]``); the
+    resident variant wins ties and streaming ties prefer the smaller cluster.  The wave table and
+    its constants are selected by ``sm_count`` (the current device's SM count when omitted; B200
+    148, H100 132 and Rubin R200 212 are measured, other counts use the nearest).  ``top_k_max``
+    above ``_STAGE1_LARGE_K`` adds the table's large-k streaming term (None ranks as a small
+    top-k).  Variants needing more dynamic shared memory than ``smem_limit`` (the current
     device's opt-in limit when omitted) are not candidates."""
     if sm_count is None:
         sm_count = (
@@ -174,6 +201,18 @@ def choose_stage1(
     if smem_limit is None and torch.cuda.is_available():
         smem_limit = _smem_optin(torch.cuda.current_device())
     wave_ctas = _wave_ctas(int(sm_count))
+    (
+        resident_base,
+        resident_per_ept,
+        stream_base,
+        stream_chunk,
+        stream_cluster_cta,
+        launch_cta,
+        stream_large_k,
+    ) = _stage1_cost(int(sm_count))
+    large_k = (
+        stream_large_k if top_k_max is not None and top_k_max > _STAGE1_LARGE_K else 0.0
+    )
     variants = _stage1_variants(smem_limit)
     epts = sorted({e for _, e, st in variants if not st})
     available = {(c, e) for c, e, st in variants if not st}
@@ -206,15 +245,23 @@ def choose_stage1(
             raise ValueError(f"vocab={vocab} exceeds the frozen stage-1 capacity")
         return resident[0], resident[1], False
 
+    def launch_cost(c: int) -> float:
+        return launch_cta * batch * c / wave_ctas[1]
+
     def stream_cost(ce: tuple[int, int]) -> float:
         chunks = math.ceil(vocab / (ce[0] * _THREADS * ce[1]))
-        return waves(ce[0]) * (_STREAM_WAVE_BASE_US + _STREAM_CHUNK_US * chunks)
+        return waves(ce[0]) * (
+            stream_base
+            + stream_chunk * chunks
+            + stream_cluster_cta * (ce[0] - 1)
+            + large_k
+        ) + launch_cost(ce[0])
 
     best = min(streaming, key=lambda ce: (stream_cost(ce), ce[0]))
     if resident is not None:
         resident_cost = waves(resident[0]) * (
-            _RESIDENT_BASE_US + _RESIDENT_PER_EPT_US * resident[1]
-        )
+            resident_base + resident_per_ept * resident[1]
+        ) + launch_cost(resident[0])
         if resident_cost <= stream_cost(best):
             return resident[0], resident[1], False
     return best[0], best[1], True
@@ -257,7 +304,7 @@ def cake_sampling_route(
     if kmax > _slab():
         return "fallback:top_k_gt_slab"
     try:
-        choose_stage1(batch, vocab)
+        choose_stage1(batch, vocab, top_k_max=kmax)
     except ValueError:
         return "fallback:vocab_too_large"
     return "pipeline"
@@ -379,7 +426,7 @@ def top_k_top_p_sampling_from_probs(
         if isinstance(top_k, int)
         else (int(top_k_max) if top_k_max is not None else int(top_k.max().item()))
     )
-    cluster, ept, stream_variant = choose_stage1(batch, vocab)
+    cluster, ept, stream_variant = choose_stage1(batch, vocab, top_k_max=kmax)
     threads, items = choose_stage23(kmax)
     slab = _slab()
     vals, idxs, cnt = (
@@ -493,7 +540,12 @@ def top_k_probs_to_slab(
         raise ValueError(f"frozen radix top-k cannot serve this request ({route})")
     batch, vocab = probs.shape
     slab = _slab()
-    cluster, ept, stream_variant = choose_stage1(batch, vocab)
+    kmax = (
+        top_k
+        if isinstance(top_k, int)
+        else (int(top_k_max) if top_k_max is not None else int(top_k.max().item()))
+    )
+    cluster, ept, stream_variant = choose_stage1(batch, vocab, top_k_max=kmax)
     vals = (
         out_vals
         if out_vals is not None

@@ -541,41 +541,75 @@ def test_per_request_tensors_and_routes():
         "pipeline" if _device_streams() else "fallback:vocab_too_large"
     )
     # Dispatcher pins below describe the wave tables, so they use the full frozen variant set
-    # (227 KB opt-in) whatever the current device's dynamic-smem limit is.
+    # (227 KB opt-in) whatever the current device's dynamic-smem limit is.  Every pin is the
+    # measured-best variant of that cell in the round-4 per-variant sweeps (k = 50, 25 cells per
+    # table on B200, B300, H100 and R200).
     pick = functools.partial(choose_stage1, smem_limit=_FULL_SMEM_OPTIN)
-    # B200 wave table (148 SMs).
-    assert pick(1, 128256, sm_count=148) == (8, 32, False)
-    assert pick(8, 65536, sm_count=148) == (8, 16, False)
+    # Same on every table: the (8, 16) stream owns V = 151936 / 262144 at small batches (the (8, 48)
+    # resident is retired), streams of 2 / 1 own the large batches, V = 32768 small batches stay on (4, 16).
+    for sm in (148, 132, 212):
+        assert pick(1, 32768, sm_count=sm) == (4, 16, False)
+        assert pick(16, 32768, sm_count=sm) == (4, 16, False)
+        assert pick(8, 65536, sm_count=sm) == (8, 16, False)
+        assert pick(1, 151936, sm_count=sm) == (8, 16, True)
+        assert pick(8, 151936, sm_count=sm) == (8, 16, True)
+        assert pick(1, 262144, sm_count=sm) == (8, 16, True)
+        assert pick(8, 262144, sm_count=sm) == (8, 16, True)
+        assert pick(64, 128256, sm_count=sm) == (2, 16, True)
+        assert pick(64, 262144, sm_count=sm)[2]
+        assert pick(128, 32768, sm_count=sm) == (1, 16, True)
+        assert pick(128, 151936, sm_count=sm)[2]
+    # B200 / B300 wave table (148 SMs): the (8, 16) stream beats the (8, 32) resident at V = 128256,
+    # B <= 8 (12.5 vs 12.9 us) and B = 64 rows of 32768 stream on (2, 16) (11.3 vs 11.9 resident).
+    assert pick(1, 128256, sm_count=148) == (8, 16, True)
+    assert pick(8, 128256, sm_count=148) == (8, 16, True)
     assert pick(16, 128256, sm_count=148) == (4, 16, True)
     assert pick(32, 128256, sm_count=148) == (4, 16, True)
-    assert pick(64, 128256, sm_count=148) == (2, 16, True)
-    assert pick(16, 262144, sm_count=148) == (4, 16, True)
-    assert pick(64, 262144, sm_count=148)[2]
-    assert pick(128, 151936, sm_count=148)[2]
-    # Round 3 (stage-1 v6 candidate path) made the register-resident (8, 48) variant the fastest for
-    # small batches of 151936: 15.3 vs 19.9 us streaming on B200 (re-fitted constants, zero regret).
-    assert pick(1, 151936, sm_count=148) == (8, 48, False)
-    assert pick(8, 151936, sm_count=148) == (8, 48, False)
     assert pick(16, 151936, sm_count=148) == (4, 16, True)
-    # H100 wave table (132 SMs): 128 cluster-4 CTAs are two waves there, so B = 32 rows of a
-    # large vocabulary stream with clusters of 2 and B = 32 rows of 32768 stay register-resident
-    # on the 2-CTA variant; small batches and B >= 64 pick the same variants as on B200.
-    for b, v in ((1, 128256), (8, 65536), (16, 128256), (64, 128256), (16, 262144)):
-        assert pick(b, v, sm_count=132) == pick(b, v, sm_count=148)
+    assert pick(16, 262144, sm_count=148) == (4, 16, True)
+    assert pick(32, 32768, sm_count=148) == (4, 16, False)
+    assert pick(64, 32768, sm_count=148) == (2, 16, True)
+    # H100 wave table (132 SMs): the (8, 32) resident wins V = 128256, B <= 8 (13.1 vs 13.9 us); 128
+    # cluster-4 CTAs are two waves, so B = 32 large-vocabulary rows stream with clusters of 2; B = 64
+    # rows of 32768 take the 64-CTA (1, 16) launch (13.2 vs 13.8 for 128 cluster-2 CTAs); at B = 32
+    # rows of 32768 the (2, 16) stream and the (2, 32) resident tie (12.16 us).
+    assert pick(1, 128256, sm_count=132) == (8, 32, False)
+    assert pick(8, 128256, sm_count=132) == (8, 32, False)
+    assert pick(16, 128256, sm_count=132) == (4, 16, True)
     assert pick(32, 128256, sm_count=132) == (2, 16, True)
     assert pick(32, 262144, sm_count=132) == (2, 16, True)
-    assert pick(32, 32768, sm_count=132) == (2, 32, False)
-    assert pick(32, 32768, sm_count=148) == (4, 16, False)
-    # Rubin R200 wave table (212 SMs): 128 cluster-8 CTAs are one wave (22 eight-CTA clusters
-    # fit), so B = 16 rows of 128256 stay register-resident on the 8-CTA variant while B = 32
-    # (256 CTAs) streams with clusters of 4 as on B200; V = 32768 B = 32 stays on (4, 16).
+    assert pick(32, 32768, sm_count=132) == (2, 16, True)
+    assert pick(64, 32768, sm_count=132) == (1, 16, True)
+    # Rubin R200 wave table (212 SMs): 128 cluster-8 CTAs are one wave (22 eight-CTA clusters fit),
+    # so V = 128256 stays on the (8, 32) resident up to B = 16 (11.1 vs 11.2 us) and V = 151936 /
+    # 262144 on the (8, 16) stream up to B = 16; B = 32 (256 CTAs) streams with clusters of 4 as on
+    # B200; B = 64 rows of 32768 stay register-resident on (2, 32) (9.1 vs 9.3).
     assert pick(16, 128256, sm_count=212) == (8, 32, False)
     assert pick(32, 128256, sm_count=212) == (4, 16, True)
+    assert pick(16, 151936, sm_count=212) == (8, 16, True)
+    assert pick(16, 262144, sm_count=212) == (8, 16, True)
+    assert pick(32, 262144, sm_count=212) == (4, 16, True)
     assert pick(32, 32768, sm_count=212) == (4, 16, False)
     assert pick(64, 32768, sm_count=212) == (2, 32, False)
-    assert pick(128, 32768, sm_count=212) == (1, 16, True)
-    for b, v in ((1, 128256), (8, 65536), (64, 128256), (16, 262144), (64, 262144)):
-        assert pick(b, v, sm_count=212) == pick(b, v, sm_count=148)
+    # k > 64 (k = 1000 sweeps on all four architectures): the streaming template's per-bucket path
+    # loses to the register-resident candidate path, so V = 128256, B <= 8 stays on (8, 32) (B200
+    # 12.8 vs 16.5 us for the (8, 16) stream) and V = 32768, B = 64 on (2, 32) (12.7 vs 13.2).
+    for sm in (148, 132, 212):
+        assert pick(1, 128256, sm_count=sm, top_k_max=1000) == (8, 32, False)
+        assert pick(8, 128256, sm_count=sm, top_k_max=1000) == (8, 32, False)
+        assert pick(64, 32768, sm_count=sm, top_k_max=1000) == (2, 32, False)
+        assert pick(1, 262144, sm_count=sm, top_k_max=1000) == (8, 16, True)
+        assert pick(128, 32768, sm_count=sm, top_k_max=1000) == (1, 16, True)
+        assert pick(1, 128256, sm_count=sm, top_k_max=50) == pick(1, 128256, sm_count=sm)
+    assert pick(16, 128256, sm_count=148, top_k_max=1000) == (4, 16, True)
+    assert pick(16, 128256, sm_count=212, top_k_max=1000) == (8, 32, False)
+    # V = 151936 at k = 1000: B200 / B300 keep the (8, 16) stream (15.2 vs 15.6 us for the (8, 48)
+    # resident), H100 and R200 take (8, 48) (H100 15.5 vs 16.9 at B = 1; R200 14.9 vs 15.7 at B = 16).
+    assert pick(1, 151936, sm_count=148, top_k_max=1000) == (8, 16, True)
+    assert pick(1, 151936, sm_count=132, top_k_max=1000) == (8, 48, False)
+    assert pick(1, 151936, sm_count=212, top_k_max=1000) == (8, 48, False)
+    assert pick(16, 151936, sm_count=212, top_k_max=1000) == (8, 48, False)
+    assert pick(16, 151936, sm_count=132, top_k_max=1000) == (4, 16, True)
     # Other SM counts use the nearest measured table.
     assert pick(32, 128256, sm_count=152) == pick(32, 128256, sm_count=148)
     assert pick(16, 128256, sm_count=200) == pick(16, 128256, sm_count=212)

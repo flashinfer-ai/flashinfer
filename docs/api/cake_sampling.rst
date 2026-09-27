@@ -60,9 +60,11 @@ memory exceeds the device's opt-in limit are not dispatch candidates: on 12.x (9
 streaming variants drop out, so vocabularies above the register-resident capacity (196608)
 take the ``top_k_first`` route there.
 
-The stage-1 variant is chosen per call by a cost model whose single-wave CTA capacity table is
-keyed by the device's SM count (148 for B200 / B300, 132 for H100, 212 for Rubin R200; other
-devices use the nearest measured table); the cost constants were fitted on B200.
+The stage-1 variant is chosen per call by a cost model whose single-wave CTA capacity table and
+cost constants are keyed by the device's SM count (148 for B200 / B300, 132 for H100, 212 for
+Rubin R200; other devices use the nearest measured table); the constants were fitted per table on
+per-variant sweeps of all four architectures so that every measured cell picks its fastest frozen
+variant.
 
 Measured performance
 --------------------
