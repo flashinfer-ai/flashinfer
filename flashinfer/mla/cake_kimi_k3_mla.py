@@ -121,7 +121,7 @@ def plan_wide_work(
     sm_count: int,
     forced_split: Optional[int] = None,
     min_tiles_per_split: int = WIDE_MIN_TILES_PER_SPLIT,
-    max_splits: int = 32,
+    max_splits: int = MAX_SPLITS,
     wave_cost_tiles: int = WIDE_WAVE_COST_TILES,
 ) -> tuple[int, int]:
     """``(n_full_items, num_split)`` of the wide route's flat grid (mirrors Cake ``plan_wide_work``).
