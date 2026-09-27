@@ -1228,9 +1228,18 @@ the same node, and every row of the tables below is either at or under
   per SM with every SM active, 19 TB/s: 27.9 us per 148 dense tiles,
   11.1 us per 148 32-row swap groups), a per-stage latency of 0.16 us for
   the swap kernels' 9-deep ring, and -- for the finalize tiles -- the
-  reduce-add of the tile's valid rows at 3.4 TB/s, which does *not*
-  overlap the next tile's fill (EP=8 GEMM2 9.3 us per wave = 7.3 fill +
-  2.0 reduce; the shard's K=384 tile 1.57 us = 0.86 + 0.82). A CTA's
+  reduce-add of the tile's valid rows at 3.4 TB/s. Round 15 read the
+  reduce-add as an additive per-tile term (EP=8 GEMM2 9.3 us per wave =
+  7.3 fill + 2.0 reduce; the shard's K=384 tile 1.57 us = 0.86 + 0.82);
+  the round-23 per-tile ``%globaltimer`` stamps below show that on the
+  wide rank it overlaps the next tile's mainloop (the MMA warp is busy
+  94-95% of the tile period, the epilogue spends 6-8 of each 9 us
+  waiting for the accumulator) and that the rank's finalize tiles run
+  at the per-SM fill cap of their launched shape -- 128 x 192, 24
+  stages of 42496 B in 8.3-8.8 us -- while on the shard the epilogue is
+  the critical path (mainloop 0.45-0.58 us against 0.5-0.7 us of staging
+  plus 1.0-1.4 us of reduce-add per 128-row tile: 7.5-11 ns per row-wise
+  bulk reduce-add, whether or not the output fits L2). A CTA's
   first item also pays the form's chain latency measured on single-group
   launches after the routing dependency: 1.0 us (dense GEMM1 epilogue),
   1.6 us (dense GEMM2), 6.0 / 11.0 us for the 16- / 32-row swap GEMM1
@@ -1271,16 +1280,25 @@ operand and the output once written and once read (the reduce-adds of
 a token's routes hit L2); the zero-fill is charged separately.
 
 The reachable floor of a row is the smallest, over the swap-AB form at the
-planner's row tile and the dense form at the 128- and 256-row tiles (128 x
-128 and 128 x 256 GEMM tiles), of the form's route bookkeeping plus the
-two GEMMs, each taking the largest of its terms (bytes at the HBM figure,
-padded FLOPs at the MMA peak, the finalize reduction, the per-SM issue
-rate and the ring term with its chain latency), plus the zero-fill's
-excess over GEMM1 on the dense form and the two-stage finalize on the
-shard's swap form above T=16. With the round-22 revision 38 of the 56
-expert-parallel rows and 39 of the 42 MoE-TP rows sit within 1.10 x of
-their reachable floor (geometric mean candidate / reachable 1.02 and
-1.00; round 21: 40 / 39, 1.02 / 1.00; round 19: 35 / 38, 1.10 / 1.04; round 18: 35 / 36, 1.11 / 1.04; round 17: 34 / 37, 1.11 / 1.03, on other nodes); the binding term of nearly every row is the ring, i.e. the
+planner's row tile and the dense form at the 128-row tile with the GEMM2
+N tile the tactic table launches at that token count (192 up to T=16384
+and 256 above on the wide rank; 256 up to T=14336 and 192 above on the
+shard, at 42496 / 50688 / 34304 B per K-stage) and, where the dual-tile
+rule selects it (T > 7168, 256-row padding within 1.10 x of the 128-row
+padding), the 2-CTA 256 x 256 tile pair at 0.84 of the single-CTA ring
+cost (round 12: 761 vs 905 us on equal padded rows), of the form's route
+bookkeeping plus the two GEMMs, each taking the largest of its terms
+(bytes at the HBM figure, padded FLOPs at the MMA peak, the finalize
+reduction, the per-SM issue rate, the ring term with its chain latency
+and -- for GEMM2 once the T x H BF16 output exceeds the 120 MB of L2 --
+its operand bytes plus the read-modify-write of every routed row through
+HBM), plus the zero-fill's excess over GEMM1 on the dense form and the
+two-stage finalize on the shard's swap form above T=16. With the
+round-22 revision and this round-23 model 45 of the 56 expert-parallel
+rows and 38 of the 42 MoE-TP rows sit within 1.10 x of their reachable
+floor (geometric mean candidate / reachable 1.01 and 1.01; the round-22
+model, which charged every dense GEMM2 as 128 x 256 tiles and no pair
+form, gave 38 / 39, 1.02 / 1.00; round 21: 40 / 39, 1.02 / 1.00; round 19: 35 / 38, 1.10 / 1.04; round 18: 35 / 36, 1.11 / 1.04; round 17: 34 / 37, 1.11 / 1.03, on other nodes); the binding term of nearly every row is the ring, i.e. the
 kernels are bound by the operand bytes each SM keeps in flight and, on
 launches with fewer items than SMs, by one item's chain, not by HBM
 bandwidth or MMA rate. It is a lower bound of what any schedule built
@@ -1296,14 +1314,14 @@ Reachable floor, expert-parallel rank 3 (same rows and candidate as above):
    1      empty        5         22 (swap)            20       3.84        0.91            27
    1      hot          5         22 (swap)            19       3.84        0.90            27
    1      remote-dom.  5         22 (swap)            19       3.81        0.90            27
-   2      balanced     20        40 (dense128)        36       1.76        0.89            51
+   2      balanced     20        42 (swap)            36       1.76        0.86            51
    2      empty        5         22 (swap)            20       3.84        0.91            28
    2      hot          5         22 (swap)            19       3.78        0.89            28
    2      remote-dom.  10        24 (swap)            24       2.41        1.01            33
    4      balanced     41        62 (swap)            58       1.42        0.93            77
    4      empty        5         22 (swap)            19       3.80        0.90            27
    4      hot          5         22 (swap)            19       3.78        0.89            27
-   4      remote-dom.  20        40 (dense128)        36       1.75        0.88            51
+   4      remote-dom.  20        42 (swap)            36       1.75        0.86            51
    8      balanced     81        109 (swap)           99       1.22        0.91            124
    8      empty        5         22 (swap)            19       3.80        0.90            33
    8      hot          5         22 (swap)            20       3.84        0.91            34
@@ -1322,32 +1340,32 @@ Reachable floor, expert-parallel rank 3 (same rows and candidate as above):
    256    remote-dom.  569       659 (swap)           603      1.06        0.92            638
    512    balanced     571       659 (swap)           610      1.07        0.93            699
    512    empty        7         22 (swap)            28       4.20        1.27            47
-   512    hot          571       726 (dense128)       672      1.18        0.93            725
+   512    hot          571       748 (swap)           672      1.18        0.90            725
    512    remote-dom.  570       659 (swap)           607      1.06        0.92            705
    1024   balanced     574       659 (swap)           619      1.08        0.94            764
    1024   empty        8         24 (swap)            30       3.58        1.26            55
-   1024   hot          574       762 (dense128)       743      1.29        0.97            834
+   1024   hot          574       836 (swap)           743      1.29        0.89            834
    1024   remote-dom.  573       659 (swap)           613      1.07        0.93            763
-   2048   balanced     579       726 (dense128)       805      1.39        1.11            1232
+   2048   balanced     579       792 (dense128)       805      1.39        1.02            1232
    2048   empty        12        26 (swap)            44       3.78        1.65            85
-   2048   hot          580       808 (dense128)       876      1.51        1.08            1286
+   2048   hot          580       883 (dense128)       876      1.51        0.99            1286
    2048   remote-dom.  577       659 (swap)           801      1.39        1.22            1249
-   4096   balanced     589       726 (dense128)       836      1.42        1.15            1233
+   4096   balanced     589       792 (dense128)       836      1.42        1.06            1233
    4096   empty        18        35 (dense128n128)    49       2.70        1.39            112
-   4096   hot          592       916 (dense128)       988      1.67        1.08            1453
-   4096   remote-dom.  585       726 (dense128)       814      1.39        1.12            1261
-   8192   balanced     609       1406 (dense128)      1223     2.01        0.87            1154
+   4096   hot          592       1001 (dense128)      988      1.67        0.99            1453
+   4096   remote-dom.  585       792 (dense128)       814      1.39        1.03            1261
+   8192   balanced     609       1246 (dense256pair)  1223     2.01        0.98            1154
    8192   empty        31        50 (dense128n128)    68       2.20        1.35            172
-   8192   hot          830       1787 (dense128)      1524     1.84        0.85            1517
-   8192   remote-dom.  602       733 (dense128)       855      1.42        1.17            1283
-   16384  balanced     1162      2086 (dense128)      2342     2.02        1.12            2432
+   8192   hot          830       1584 (dense256pair)  1524     1.84        0.96            1517
+   8192   remote-dom.  602       792 (dense128)       855      1.42        1.08            1283
+   16384  balanced     1162      2302 (dense128)      2342     2.02        1.02            2432
    16384  empty        57        70 (dense128)        85       1.50        1.21            293
-   16384  hot          1664      2847 (dense128)      3210     1.93        1.13            3218
-   16384  remote-dom.  635       1406 (dense128)      1246     1.96        0.89            1289
-   32768  balanced     2324      3445 (dense128)      4264     1.83        1.24            4706
-   32768  empty        109       110 (dense128)       139      1.28        1.26            536
-   32768  hot          3323      4995 (dense128)      5862     1.76        1.17            6388
-   32768  remote-dom.  1162      2086 (dense128)      2309     1.99        1.11            3071
+   16384  hot          1664      3138 (dense128)      3210     1.93        1.02            3218
+   16384  remote-dom.  635       1246 (dense256pair)  1246     1.96        1.00            1289
+   32768  balanced     2324      3634 (dense128)      4264     1.83        1.17            4706
+   32768  empty        109       105 (dense256pair)   139      1.28        1.32            536
+   32768  hot          3323      5270 (dense128)      5862     1.76        1.11            6388
+   32768  remote-dom.  1162      2200 (dense128)      2309     1.99        1.05            3071
    =====  ===========  ========  ===================  =======  ==========  ==============  ======
 
 Reachable floor, MoE tensor-parallel rank 0:
@@ -1388,15 +1406,15 @@ Reachable floor, MoE tensor-parallel rank 0:
    4096   balanced  589       959 (dense128)       916      1.56        0.96            1096
    4096   empty     291       579 (dense128)       530      1.83        0.92            655
    4096   hot       589       974 (dense128)       920      1.56        0.94            1088
-   8192   balanced  609       1883 (dense128)      1689     2.77        0.90            1633
-   8192   empty     581       1124 (dense128)      1005     1.73        0.89            1214
-   8192   hot       609       1940 (dense128)      1680     2.76        0.87            1630
-   16384  balanced  1162      2806 (dense128)      3038     2.61        1.08            3325
-   16384  empty     1162      2239 (dense128)      2192     1.89        0.98            2568
+   8192   balanced  609       1727 (dense256pair)  1689     2.77        0.98            1633
+   8192   empty     581       1038 (dense256pair)  1005     1.73        0.97            1214
+   8192   hot       609       1786 (dense256pair)  1680     2.76        0.94            1630
+   16384  balanced  1162      2808 (dense128)      3038     2.61        1.08            3325
+   16384  empty     1162      2103 (dense256pair)  2192     1.89        1.04            2568
    16384  hot       1162      2948 (dense128)      2926     2.52        0.99            3287
-   32768  balanced  2324      4658 (dense128)      5609     2.41        1.20            6561
-   32768  empty     2324      4470 (dense128)      4739     2.04        1.06            5189
-   32768  hot       2324      4912 (dense128)      5313     2.29        1.08            6370
+   32768  balanced  2324      4909 (dense128)      5609     2.41        1.14            6561
+   32768  empty     2324      4197 (dense256pair)  4739     2.04        1.13            5189
+   32768  hot       2324      5043 (dense128)      5313     2.29        1.05            6370
    =====  ========  ========  ===================  =======  ==========  ==============  ======
 
 **Where the gaps come from (measured on the same node).**
@@ -2203,6 +2221,68 @@ moved, 34.7 -> 32.3 us (0.929, GEMM1 22.3 -> 19.8), although its 96
 items are not split by the rule; the cluster launch itself changes this
 row and the cause is not measured. The cluster form is now the only form
 of the decode swap GEMM1 (knob ``SWAPAB_GEMM1_CLUSTER_SPLIT``).
+
+*Round 23 (B300).* Where the dense rows' remaining 1.1-1.6 x sit,
+measured tile by tile; no code change. Splitting the round-22 rows into
+their kernels put the dense GEMM1 at 0.78-1.09 x of its ring floor on
+every T >= 2048 row and left the residual to the finalize GEMM2 (wide
+rank 1.30-1.57 x, shard 1.15-1.35 x at T >= 16384 against the round-22
+model). Per-tile ``%globaltimer`` stamps in the finalize kernel (MMA warp:
+tile start, accumulator acquired, first stage, done; epilogue: metadata,
+accumulator full, staged, reduced; graph replay, one GPU) read on the
+wide rank (128 x 192 tile, K=3072 = 24 stages of 42496 B): tile period
+9.15 / 8.70 / 9.28 us at T=2048 balanced / 16384 balanced / 4096 hot,
+mainloop 94-95 % of it, accumulator acquire 0.03 us, first-stage wait
+0.06-0.19, inter-tile gap 0.19, epilogue 6-7.7 us waiting for the
+accumulator, TMEM-to-smem 0.5-0.6, bulk reduce-add 0.64 -> 1.76 us -- i.e.
+no per-tile fixed cost: the mainloop runs at 42.5 KB per 0.35 us = 120
+GB/s per SM, the smem-fill cap, and the round-22 model was short only
+because it charged 128 x 256 tiles (3136 at T=2048) where the tactic
+table launches 128 x 192 (4256 tiles, 14 % more stage bytes). At T=32768
+the table's 128 x 256 form (three K-stages, one overlapped accumulator)
+runs 12.22 us per 1.216 MB tile = 99.5 GB/s per SM against the 128 x 192
+form's 8.8 us per 1.02 MB = 116 GB/s: 12 % fewer bytes at 15 % lower
+rate. Same-GPU A/Bs (three passes x 20 replays, FP64 relative L2
+identical): 128 x 192 with the 2-CTA K-split at T=32768 1.037 / 0.995 /
+0.981 / 1.026 (balanced / hot / remote-dominated / ``empty``) and at
+16384 1.003 / 1.009 / 0.997 / 0.972 against 3-7 % pass-to-pass drift of
+the default arm -- noise; the forced 2-CTA 256 x 256 pair (1.02 B of
+smem per output element against 1.73 for 128 x 192) 1.054-1.067 on
+balanced/hot at both T (its 1.31 x row padding at 585 rows per expert
+beats the byte saving; the routing rule's 1.10 x threshold already
+excludes it) and 0.948-0.980 on ``empty`` / remote-dominated, where it
+is already selected. On the shard (K=384) the same stamps read
+tile periods of 1.89 / 2.21 / 1.92 / 2.08 us at T=2048 / 4096 / 16384 /
+32768 balanced (128 x 256 tiles at the first two, 128 x 192 at the last
+two) with mainloops of 0.58 / 0.58 / 0.48 / 0.45 us (MMA busy 24-31 %):
+the epilogue is the critical path, 0.70 / 0.70 / 0.51 / 0.51 us of
+TMEM-to-smem staging plus 0.96 / 1.28 / 1.34 / 1.41 us of bulk
+reduce-add per tile. The reduce-add is 128 row-wise bulk operations per
+tile at 7.5 / 10 / 10.5 / 11 ns each: it costs a microsecond while the
+29 MB output of T=2048 sits in L2 and 47 % more at four times the L2
+(470 MB), so the shard's finalize tiles are bound by the per-row issue
+of the reduce-add path, not by the HBM read-modify-write alone; the
+model's HBM term below is the lower bound, and the 256-wide tile (33 %
+more bytes per row operation) above T=14336 is the lever for a code
+round. The shard's
+T=2048 rows, where the table launches 128 x 256, read 0.988 / 0.996 /
+0.971 with 128 x 192 and the 2-CTA K-split (GEMM2 318 -> 314 us) and
+0.998 / 1.005 / 0.988 without the split: a 1-3 % candidate kept for a
+round that also changes code. Closed: the GEMM2 tile shape on the rank
+at T >= 16384 (192 / 256 / 256 x 256 pair within noise or worse); the
+finalize reduce-add as an additive per-tile term on the rank (it
+overlaps the next tile's mainloop). The reachable-floor model now
+charges the launched GEMM2 tile with its stage bytes, the 2-CTA pair
+form where the routing rule selects it, and the shard's HBM
+read-modify-write; the tables above are regenerated from the round-22
+measurements under it (45 of 56 and 38 of 42 rows within 1.10 x, from
+38 / 39). Rows still above: wide rank ``empty`` T=256..32768 (decode
+chain and fill, paragraphs above), T=2048 remote-dominated 1.22 (swap
+form, 18 % above the same T=1024 row's floor at equal bytes), T=32768
+balanced / hot 1.17 / 1.11 (the 128 x 256 form's 99.5 GB/s per SM);
+shard ``empty`` T=128 / 256 1.32 / 1.47 (single-expert chain, round 15),
+T=32768 balanced / ``empty`` 1.14 / 1.13 (HBM at 84 % of the peak with the
+read-modify-write counted).
 
 *Wide rank at T=8192 and T=16384 remote-dominated.* These rows are the
 slowest against TRT-LLM Gen (0.79-0.86) and 2.0-2.4 x their floor: the
