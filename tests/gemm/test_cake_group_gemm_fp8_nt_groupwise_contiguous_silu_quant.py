@@ -260,6 +260,8 @@ ROUTING_CASES = [
         True,
         id="wide_ep32_gate_up_mixed_tail",
     ),
+    # two odd-block experts: 16 odd-tail units fit on the free SMs, so the fused route (pair + tail kernels) keeps the row
+    pytest.param([128, 384] + [256] * 14, 2048, 4096, False, id="wide_ep32_gate_up_two_odd"),
 ]
 
 
