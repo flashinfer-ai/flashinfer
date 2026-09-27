@@ -74,6 +74,7 @@ from .utils import (
     _get_cache_alibi_slopes_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
@@ -4063,6 +4064,22 @@ def trtllm_batch_decode_with_kv_cache(
             )
             return (out, lse) if return_lse else out
 
+        if backend == "cake" and multi_ctas_kv_counter_buffer is None:
+            # The Cake on-device load-balanced route keeps its self-resetting
+            # split-KV counters in this zero-initialized buffer too; size a
+            # fresh one for the larger of the two contracts.
+            from .cake_fmha import cake_fmha_balanced_counter_bytes
+
+            multi_ctas_kv_counter_buffer = torch.zeros(
+                max(
+                    get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                        batch_size, num_qo_heads, sm_count
+                    ),
+                    cake_fmha_balanced_counter_bytes(sm_count),
+                ),
+                dtype=torch.uint8,
+                device=query.device,
+            )
         multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
             multi_ctas_kv_counter_buffer,
             batch_size,
@@ -4109,6 +4126,7 @@ def trtllm_batch_decode_with_kv_cache(
                 ),
                 enable_block_sparse_attention=enable_block_sparse_attention,
                 lse=lse,
+                multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
             )
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
