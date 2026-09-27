@@ -70,10 +70,35 @@ static void BatchMLAPagedAttentionSM90RunImpl(
         params.kpe = static_cast<DTypeKV*>(kpe_cache.data_ptr());
 
         if (maybe_kv_len.has_value()) {
+          TVM_FFI_ICHECK(maybe_qo_indptr.has_value())
+              << "qo_indptr is required when kv_len is provided";
+          const TensorView& qo_indptr = maybe_qo_indptr.value();
+          const TensorView& kv_len = maybe_kv_len.value();
+          TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(qo_indptr.dtype()), int32_code)
+              << "qo_indptr must have dtype int32";
+          TVM_FFI_ICHECK_EQ(encode_dlpack_dtype(kv_len.dtype()), int32_code)
+              << "kv_len must have dtype int32";
+          TVM_FFI_ICHECK_EQ(qo_indptr.device().device_type, q_nope.device().device_type)
+              << "qo_indptr must be on the same device as q_nope";
+          TVM_FFI_ICHECK_EQ(qo_indptr.device().device_id, q_nope.device().device_id)
+              << "qo_indptr must be on the same device as q_nope";
+          TVM_FFI_ICHECK_EQ(kv_len.device().device_type, q_nope.device().device_type)
+              << "kv_len must be on the same device as q_nope";
+          TVM_FFI_ICHECK_EQ(kv_len.device().device_id, q_nope.device().device_id)
+              << "kv_len must be on the same device as q_nope";
+          TVM_FFI_ICHECK_EQ(qo_indptr.ndim(), 1) << "qo_indptr must be a 1-D tensor";
+          TVM_FFI_ICHECK_EQ(kv_len.ndim(), 1) << "kv_len must be a 1-D tensor";
+          TVM_FFI_ICHECK(qo_indptr.IsContiguous()) << "qo_indptr must be contiguous";
+          TVM_FFI_ICHECK(kv_len.IsContiguous()) << "kv_len must be contiguous";
+          TVM_FFI_ICHECK_EQ(qo_indptr.size(0), kv_len.size(0) + 1)
+              << "qo_indptr must contain one more entry than kv_len";
+          TVM_FFI_ICHECK(plan_info.num_blks_x == 0 || plan_info.num_blks_y == 0 ||
+                         kv_len.size(0) > 0)
+              << "kv_len must contain one entry for a non-empty plan";
           TVM_FFI_ICHECK(mask_mode == MaskMode::kNone);
-          params.batch_q_indptr = static_cast<IdType*>(maybe_qo_indptr.value().data_ptr());
-          params.device_kv_len = static_cast<IdType*>(maybe_kv_len.value().data_ptr());
-          params.batch_size = maybe_kv_len.value().size(0);
+          params.batch_q_indptr = static_cast<IdType*>(qo_indptr.data_ptr());
+          params.device_kv_len = static_cast<IdType*>(kv_len.data_ptr());
+          params.batch_size = kv_len.size(0);
         }
         params.q_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.q_indptr_offset);
         params.kv_indptr = GetPtrFromBaseOffset<IdType>(int_buffer_ptr, plan_info.kv_indptr_offset);
