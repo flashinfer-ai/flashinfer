@@ -492,3 +492,7 @@ if _cute_dsl_available:
         "cute_dsl_sm12x_fc2_finalize_fp8",
         "cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4",
     ]
+
+from .cake_routed_moe import prepare_fp4_block_scale_routed_moe
+
+__all__.append("prepare_fp4_block_scale_routed_moe")
