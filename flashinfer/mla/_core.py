@@ -4577,7 +4577,9 @@ def cake_mla_varq_dcp_decode(
     contents on the host.  Returns ``(out, lse)`` with ``return_lse=True``.
     ``prepare_cake_mla_varq_dcp_decode`` returns a launch-only runner for
     repeated calls with fixed bindings.  See
-    ``flashinfer/experimental/cake_mla_varq_dcp_decode/README.md``.
+    ``tests/experimental/test_cake_mla_varq_dcp_decode.py`` for the validated
+    shape set and ``benchmarks/bench_cake_mla_varq_dcp_decode.py`` for the
+    comparison against ``cute_dsl_mla_decode``.
     """
     if backend != "cake":
         raise ValueError("Cake MLA var-Q DCP decode currently supports backend='cake'")

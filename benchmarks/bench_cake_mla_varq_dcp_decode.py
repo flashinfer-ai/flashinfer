@@ -272,7 +272,8 @@ def main():
             "override every row's query-length pattern: 'uniform' gives each request "
             "q_len query tokens, 'ragged' draws 1..q_len per request (default: the "
             "row's own pattern). The host plan's static unit size is tuned for the "
-            "uniform regime; see the package README."
+            "uniform regime, in which every request carries the same number of "
+            "draft tokens; ragged rows leave part of their 128-row tiles empty."
         ),
     )
     args = parser.parse_args()
