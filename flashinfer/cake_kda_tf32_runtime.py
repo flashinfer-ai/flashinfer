@@ -1255,6 +1255,7 @@ def build_affine_apply_items(
     rows_enabled: bool,
     sm_count: int = 148,
     pairmap: bool = False,
+    owns_final: bool = True,
 ) -> list[list[int]]:
     """Work items for the apply kernel, one per (window, head, block run).
 
@@ -1277,7 +1278,7 @@ def build_affine_apply_items(
         for head in range(num_heads):
             for p_begin in range(0, blocks, per_run):
                 p_end = min(blocks, p_begin + per_run)
-                owns_final = p_end == blocks and not pairmap
+                owns_final_run = owns_final and p_end == blocks and not pairmap
                 items.append(
                     [
                         w * num_heads + head,
@@ -1288,7 +1289,7 @@ def build_affine_apply_items(
                         chunks,
                         tail_offsets[w],
                         w + 1,
-                        (w * num_heads + head) if owns_final else -1,
+                        (w * num_heads + head) if owns_final_run else -1,
                         head,
                         length,
                         1 if (rows_enabled and not pairmap) else 0,
@@ -5118,6 +5119,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 num_heads=heads,
                 rows_enabled=self._checkpoint_in_place,
                 sm_count=_device_sm_count(q.device),
+                # Kernel round 4 (lever 8b): the scan kernel stores every
+                # sequence's final state and the row-0 carries itself; no
+                # apply run evaluates S_w^in x M_final.
+                owns_final=False,
             )
             self._apply_items = torch.tensor(
                 items, dtype=torch.int32, device=q.device
@@ -5182,12 +5187,20 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._apply_dummy_dpair = torch.zeros(
                 (1, heads, HEAD_DIM), dtype=torch.float32, device=q.device
             )
-            self._apply_head_offsets = torch.arange(
-                heads, dtype=torch.int64, device=q.device
-            )
-            self._apply_row0_index = torch.empty(
-                (num_parts - 1) * heads, dtype=torch.int64, device=q.device
-            )
+            # The scan kernel scatters the final state into the caller's pool
+            # slots and stores the FP32 carry into row 0 of every tail window,
+            # so the composite has no torch epilogue on this route.
+            if self._final_pool.ndim != 4 or not self._final_pool[0].is_contiguous():
+                raise ValueError(
+                    "affine apply route requires a [slots,H,128,128] state pool with contiguous slots"
+                )
+            if (
+                self._checkpoint_in_place
+                and not self._checkpoint_output[0].is_contiguous()
+            ):
+                raise ValueError(
+                    "affine apply route requires contiguous FP32 checkpoint rows"
+                )
             # The apply kernel reduce-adds the correction into the output tail
             # itself (no correction buffer, no host add).
             self._apply_out_fused = True
@@ -5339,7 +5352,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             # The map/correction rebinds of a plan-cache hit were deferred
             # past the first chain kernel; apply them while it runs.
             flush_deferred_rebind(self)
-            if self._fused_epilogue is None:
+            if self._fused_epilogue is None and not self._apply_route:
                 # The int64 index copy is only consumed by the final-state
                 # scatter, so it follows the first chain kernel.
                 self._state_indices_long.copy_(self._state_indices)
@@ -5376,8 +5389,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 carry_lo=self._carry_lo,
                 num_heads=int(self._main_final.shape[1]),
                 part_cu_seqlens=self._part_cu_seqlens,
-                final_state=self._final_compact,
-                write_final_state=int(self._use_output_projection),
+                **self._scan_epilogue_bindings(),
             )
             if self._use_output_projection:
                 self._projection_module.launch(
@@ -5387,6 +5399,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 self._launch_apply()
             else:
                 self._correction._launch_in_stream()
+            if self._apply_route:
+                # The scan kernel wrote the final states into the pool and the
+                # row-0 carries into the checkpoint rows: no epilogue launch.
+                return
             if self._fused_epilogue is not None:
                 self._launch_fused_epilogue()
                 return
@@ -5571,25 +5587,51 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             map_final_tma=map_final,
         )
 
-    def _launch_apply(self) -> None:
-        """Fused apply kernel: S_w^in (BF16 hi/lo) x prefix maps x exported chunk operators."""
-        import torch
+    def _scan_epilogue_bindings(self) -> dict:
+        """Scan-kernel arguments of the state epilogue (kernel round 4, lever 8b).
 
-        heads = int(self._carry.shape[1])
-        if self._checkpoint_in_place:
-            rows = self._checkpoint_output
-            # Row 0 of every tail window is the state entering the window: the
-            # main window wrote its zero start, the correction adds the exact
-            # FP32 carry (the chain added its initial state the same way).
-            starts = self._part_row_starts[1 : self.num_parts]
-            torch.add(
-                starts.unsqueeze(1) * heads,
-                self._apply_head_offsets,
-                out=self._apply_row0_index.view(-1, heads),
+        On the apply route the scan scatters each sequence's final state into
+        the caller's pool slot and stores the FP32 carry entering every tail
+        window into row 0 of its checkpoint rows (the main window wrote that
+        row as zeros).  Other routes keep their epilogue; the FP32 map
+        schedule keeps its ``final_state[seq]`` output for the projection.
+        The caller tensors are read at launch time, so a plan-cache rebind
+        that moves the pool, the rows or the state indices needs no
+        descriptor refresh here.
+        """
+
+        if not self._apply_route:
+            return dict(
+                final_state=self._final_compact,
+                write_final_state=int(self._use_output_projection),
+                final_indices=self._part_cu_seqlens,
+                final_slot_stride=0,
+                final_state_bf16=self._carry_hi,
+                rows=self._main_final,
+                row_starts=self._first_parts,
+                write_rows=0,
             )
-            rows.view(-1, HEAD_DIM, HEAD_DIM).index_add_(
-                0, self._apply_row0_index, self._carry.view(-1, HEAD_DIM, HEAD_DIM)
-            )
+        fp32_pool = self._external_state_is_fp32
+        return dict(
+            final_state=self._final_pool if fp32_pool else self._final_compact,
+            write_final_state=1 if fp32_pool else 2,
+            final_indices=self._state_indices,
+            final_slot_stride=int(self._final_pool.stride(0)),
+            final_state_bf16=self._carry_hi if fp32_pool else self._final_pool,
+            rows=self._checkpoint_output
+            if self._checkpoint_in_place
+            else self._apply_dummy_rows,
+            row_starts=self._part_row_starts,
+            write_rows=int(self._checkpoint_in_place),
+        )
+
+    def _launch_apply(self) -> None:
+        """Fused apply kernel: S_w^in (BF16 hi/lo) x prefix maps x exported chunk operators.
+
+        Row 0 of every tail window (the state entering it) and the sequence
+        final states are written by the scan kernel.
+        """
+
         self._apply_module.launch(grid=self._apply_grid, **self._apply_bindings())
 
     def _apply_bindings(self) -> dict:
