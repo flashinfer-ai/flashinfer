@@ -50,6 +50,15 @@ struct CakeParamArray {
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
+#define SMEM_MSTATS_OFF 214016
+#define SMEM_MSTATS_STAGE_BYTES 512
+#define SMEM_MSTATS_STRIDE 512
+#define SMEM_PART_LO_OFF 99328
+#define SMEM_PART_LO_STAGE_BYTES 16384
+#define SMEM_PART_LO_STRIDE 16384
+#define SMEM_PART_HI_OFF 197632
+#define SMEM_PART_HI_STAGE_BYTES 16384
+#define SMEM_PART_HI_STRIDE 16384
 #define SMEM_Q_SMEM_OFF 1024
 #define SMEM_Q_SMEM_STAGE_BYTES 16384
 #define SMEM_Q_SMEM_STRIDE 16384
@@ -59,8 +68,8 @@ struct CakeParamArray {
 #define SMEM_VT_SMEM_OFF 115712
 #define SMEM_VT_SMEM_STAGE_BYTES 16384
 #define SMEM_VT_SMEM_STRIDE 16384
-#define SMEM_TOTAL 214016
-#define THREADS 128
+#define SMEM_TOTAL 214528
+#define THREADS 256
 
 #include <math_constants.h>
 
@@ -364,8 +373,8 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void
-kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2)
+__global__ __launch_bounds__(256, 1) void
+kernel_cake_vsa_sm90_efca3ce54f28fb58f8fc(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -396,6 +405,12 @@ kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q,
     const int cta_rank = 0;
 
     // Kernel setup ops
+    float* mstats = reinterpret_cast<float*>(smem_raw + 214016);
+    const int mstats_addr = smem + 214016;
+    float* part_lo = reinterpret_cast<float*>(smem_raw + 99328);
+    const int part_lo_addr = smem + 99328;
+    float* part_hi = reinterpret_cast<float*>(smem_raw + 197632);
+    const int part_hi_addr = smem + 197632;
     __nv_bfloat16* q_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q_smem_addr = smem + 1024;
     __nv_bfloat16* k_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -510,7 +525,21 @@ kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q,
             }
         }
     }
-    int m0_local = warp * 16 + lane / 4;
+    int warp_raw = warp;
+    int _shfl_0 = __shfl_sync(0xFFFFFFFF, warp_raw, 0);
+    int warp_u = _shfl_0;
+    int wg = warp_u / 4;
+    int warp_in_wg = warp_u - wg * 4;
+    int tid_wg = warp_in_wg * 32 + lane;
+    int quad = warp_in_wg * 8 + lane / 4;
+    int lim_even = 0;
+    int lim_odd = 0;
+    if (wg == 0) {
+        lim_even = cnt;
+    } else {
+        lim_odd = cnt;
+    }
+    int m0_local = warp_in_wg * 16 + lane / 4;
     int m1_local = m0_local + 8;
     float d_o[64];
     float d_qk[32];
@@ -519,6 +548,72 @@ kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q,
     float row_max1 = -CAKE_INF;
     float row_sum0 = 0.0f;
     float row_sum1 = 0.0f;
+    if (cnt <= wg) {
+        d_o[0] = 0.0f;
+        d_o[1] = 0.0f;
+        d_o[2] = 0.0f;
+        d_o[3] = 0.0f;
+        d_o[4] = 0.0f;
+        d_o[5] = 0.0f;
+        d_o[6] = 0.0f;
+        d_o[7] = 0.0f;
+        d_o[8] = 0.0f;
+        d_o[9] = 0.0f;
+        d_o[10] = 0.0f;
+        d_o[11] = 0.0f;
+        d_o[12] = 0.0f;
+        d_o[13] = 0.0f;
+        d_o[14] = 0.0f;
+        d_o[15] = 0.0f;
+        d_o[16] = 0.0f;
+        d_o[17] = 0.0f;
+        d_o[18] = 0.0f;
+        d_o[19] = 0.0f;
+        d_o[20] = 0.0f;
+        d_o[21] = 0.0f;
+        d_o[22] = 0.0f;
+        d_o[23] = 0.0f;
+        d_o[24] = 0.0f;
+        d_o[25] = 0.0f;
+        d_o[26] = 0.0f;
+        d_o[27] = 0.0f;
+        d_o[28] = 0.0f;
+        d_o[29] = 0.0f;
+        d_o[30] = 0.0f;
+        d_o[31] = 0.0f;
+        d_o[32] = 0.0f;
+        d_o[33] = 0.0f;
+        d_o[34] = 0.0f;
+        d_o[35] = 0.0f;
+        d_o[36] = 0.0f;
+        d_o[37] = 0.0f;
+        d_o[38] = 0.0f;
+        d_o[39] = 0.0f;
+        d_o[40] = 0.0f;
+        d_o[41] = 0.0f;
+        d_o[42] = 0.0f;
+        d_o[43] = 0.0f;
+        d_o[44] = 0.0f;
+        d_o[45] = 0.0f;
+        d_o[46] = 0.0f;
+        d_o[47] = 0.0f;
+        d_o[48] = 0.0f;
+        d_o[49] = 0.0f;
+        d_o[50] = 0.0f;
+        d_o[51] = 0.0f;
+        d_o[52] = 0.0f;
+        d_o[53] = 0.0f;
+        d_o[54] = 0.0f;
+        d_o[55] = 0.0f;
+        d_o[56] = 0.0f;
+        d_o[57] = 0.0f;
+        d_o[58] = 0.0f;
+        d_o[59] = 0.0f;
+        d_o[60] = 0.0f;
+        d_o[61] = 0.0f;
+        d_o[62] = 0.0f;
+        d_o[63] = 0.0f;
+    }
     unsigned int _phase_q_full_0 = 0;
     mbarrier_wait(q_full_addr, _phase_q_full_0);
     _phase_q_full_0 ^= 1;
@@ -534,7 +629,7 @@ kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q,
     unsigned int _phase_v_full0_0 = 0;
     uint64_t _wgmma_desc_4 = (((uint64_t)(((vt_smem_addr)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
     uint64_t _wgmma_b_0_4 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_4 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_4);
-    if (cnt > 0) {
+    if (lim_even > 0) {
         mbarrier_wait(k_full0_addr, _phase_k_full0_0);
         _phase_k_full0_0 ^= 1;
         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
@@ -828,7 +923,7 @@ kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q,
     unsigned int _phase_v_full1_0 = 0;
     uint64_t _wgmma_desc_7 = (((uint64_t)(((vt_smem_addr + 16384)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
     uint64_t _wgmma_b_0_7 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_7 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_7);
-    if (cnt > 1) {
+    if (lim_odd > 1) {
         mbarrier_wait(k_full1_addr, _phase_k_full1_0);
         _phase_k_full1_0 ^= 1;
         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
@@ -1194,7 +1289,7 @@ kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q,
     unsigned int _phase_v_full2_0 = 0;
     uint64_t _wgmma_desc_10 = (((uint64_t)(((vt_smem_addr + 32768)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
     uint64_t _wgmma_b_0_10 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_10 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_10);
-    if (cnt > 2) {
+    if (lim_even > 2) {
         mbarrier_wait(k_full2_addr, _phase_k_full2_0);
         _phase_k_full2_0 ^= 1;
         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
@@ -1560,7 +1655,7 @@ kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q,
     unsigned int _phase_v_full3_0 = 0;
     uint64_t _wgmma_desc_13 = (((uint64_t)(((vt_smem_addr + 49152)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
     uint64_t _wgmma_b_0_13 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_13 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_13);
-    if (cnt > 3) {
+    if (lim_odd > 3) {
         mbarrier_wait(k_full3_addr, _phase_k_full3_0);
         _phase_k_full3_0 ^= 1;
         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
@@ -1926,7 +2021,7 @@ kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q,
     unsigned int _phase_v_full4_0 = 0;
     uint64_t _wgmma_desc_16 = (((uint64_t)(((vt_smem_addr + 65536)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
     uint64_t _wgmma_b_0_16 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_16 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_16);
-    if (cnt > 4) {
+    if (lim_even > 4) {
         mbarrier_wait(k_full4_addr, _phase_k_full4_0);
         _phase_k_full4_0 ^= 1;
         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
@@ -2292,7 +2387,7 @@ kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q,
     unsigned int _phase_v_full5_0 = 0;
     uint64_t _wgmma_desc_19 = (((uint64_t)(((vt_smem_addr + 81920)) >> 4) & 0x3FFFULL) | ((uint64_t)(512) << 16) | ((uint64_t)(64) << 32) | (1ULL << 62));
     uint64_t _wgmma_b_0_19 = ((uint64_t)make_warp_uniform((uint32_t)(_wgmma_desc_19 >> 32)) << 32) | (uint64_t)make_warp_uniform((uint32_t)_wgmma_desc_19);
-    if (cnt > 5) {
+    if (lim_odd > 5) {
         mbarrier_wait(k_full5_addr, _phase_k_full5_0);
         _phase_k_full5_0 ^= 1;
         asm volatile("wgmma.fence.sync.aligned;" ::: "memory");
@@ -2659,479 +2754,706 @@ kernel_cake_vsa_sm90_dcd5625115516e866ef9(const __grid_constant__ CUtensorMap Q,
     float _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, row_sum1, 1);
     row_sum1 += _shfl_xor_27;
     int qj = lane & 3;
-    float _rcp_0 = approx_rcp(row_sum0);
-    float _rcp_1 = approx_rcp(row_sum1);
-    d_o[0] = d_o[0] * _rcp_0;
-    d_o[1] = d_o[1] * _rcp_0;
-    d_o[4] = d_o[4] * _rcp_0;
-    d_o[5] = d_o[5] * _rcp_0;
-    d_o[8] = d_o[8] * _rcp_0;
-    d_o[9] = d_o[9] * _rcp_0;
-    d_o[12] = d_o[12] * _rcp_0;
-    d_o[13] = d_o[13] * _rcp_0;
-    d_o[16] = d_o[16] * _rcp_0;
-    d_o[17] = d_o[17] * _rcp_0;
-    d_o[20] = d_o[20] * _rcp_0;
-    d_o[21] = d_o[21] * _rcp_0;
-    d_o[24] = d_o[24] * _rcp_0;
-    d_o[25] = d_o[25] * _rcp_0;
-    d_o[28] = d_o[28] * _rcp_0;
-    d_o[29] = d_o[29] * _rcp_0;
-    d_o[32] = d_o[32] * _rcp_0;
-    d_o[33] = d_o[33] * _rcp_0;
-    d_o[36] = d_o[36] * _rcp_0;
-    d_o[37] = d_o[37] * _rcp_0;
-    d_o[40] = d_o[40] * _rcp_0;
-    d_o[41] = d_o[41] * _rcp_0;
-    d_o[44] = d_o[44] * _rcp_0;
-    d_o[45] = d_o[45] * _rcp_0;
-    d_o[48] = d_o[48] * _rcp_0;
-    d_o[49] = d_o[49] * _rcp_0;
-    d_o[52] = d_o[52] * _rcp_0;
-    d_o[53] = d_o[53] * _rcp_0;
-    d_o[56] = d_o[56] * _rcp_0;
-    d_o[57] = d_o[57] * _rcp_0;
-    d_o[60] = d_o[60] * _rcp_0;
-    d_o[61] = d_o[61] * _rcp_0;
-    d_o[2] = d_o[2] * _rcp_1;
-    d_o[3] = d_o[3] * _rcp_1;
-    d_o[6] = d_o[6] * _rcp_1;
-    d_o[7] = d_o[7] * _rcp_1;
-    d_o[10] = d_o[10] * _rcp_1;
-    d_o[11] = d_o[11] * _rcp_1;
-    d_o[14] = d_o[14] * _rcp_1;
-    d_o[15] = d_o[15] * _rcp_1;
-    d_o[18] = d_o[18] * _rcp_1;
-    d_o[19] = d_o[19] * _rcp_1;
-    d_o[22] = d_o[22] * _rcp_1;
-    d_o[23] = d_o[23] * _rcp_1;
-    d_o[26] = d_o[26] * _rcp_1;
-    d_o[27] = d_o[27] * _rcp_1;
-    d_o[30] = d_o[30] * _rcp_1;
-    d_o[31] = d_o[31] * _rcp_1;
-    d_o[34] = d_o[34] * _rcp_1;
-    d_o[35] = d_o[35] * _rcp_1;
-    d_o[38] = d_o[38] * _rcp_1;
-    d_o[39] = d_o[39] * _rcp_1;
-    d_o[42] = d_o[42] * _rcp_1;
-    d_o[43] = d_o[43] * _rcp_1;
-    d_o[46] = d_o[46] * _rcp_1;
-    d_o[47] = d_o[47] * _rcp_1;
-    d_o[50] = d_o[50] * _rcp_1;
-    d_o[51] = d_o[51] * _rcp_1;
-    d_o[54] = d_o[54] * _rcp_1;
-    d_o[55] = d_o[55] * _rcp_1;
-    d_o[58] = d_o[58] * _rcp_1;
-    d_o[59] = d_o[59] * _rcp_1;
-    d_o[62] = d_o[62] * _rcp_1;
-    d_o[63] = d_o[63] * _rcp_1;
-    int qj1 = qj & 1;
-    int qj2 = qj & 2;
-    unsigned int o_vec[4];
-    unsigned int o_tmp[4];
-    int o_row_base = q_row * 128;
-    int m_local_r = ((1) ? m0_local : m1_local);
-    __nv_bfloat162 _bf16x2_96 = __float22bfloat162_rn(make_float2(d_o[0], d_o[1]));
-    o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_96)[0];
-    __nv_bfloat162 _bf16x2_97 = __float22bfloat162_rn(make_float2(d_o[4], d_o[5]));
-    o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_97)[0];
-    __nv_bfloat162 _bf16x2_98 = __float22bfloat162_rn(make_float2(d_o[8], d_o[9]));
-    o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_98)[0];
-    __nv_bfloat162 _bf16x2_99 = __float22bfloat162_rn(make_float2(d_o[12], d_o[13]));
-    o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_99)[0];
-    unsigned int _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-    o_tmp[0] = _shfl_xor_28;
-    unsigned int _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-    o_tmp[1] = _shfl_xor_29;
-    unsigned int _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-    o_tmp[2] = _shfl_xor_30;
-    unsigned int _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-    o_tmp[3] = _shfl_xor_31;
-    {
-        o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+    if (wg == 1) {
+        part_lo[tid_wg] = d_o[0];
+        part_lo[128 + tid_wg] = d_o[1];
+        part_lo[256 + tid_wg] = d_o[2];
+        part_lo[384 + tid_wg] = d_o[3];
+        part_lo[512 + tid_wg] = d_o[4];
+        part_lo[640 + tid_wg] = d_o[5];
+        part_lo[768 + tid_wg] = d_o[6];
+        part_lo[896 + tid_wg] = d_o[7];
+        part_lo[1024 + tid_wg] = d_o[8];
+        part_lo[1152 + tid_wg] = d_o[9];
+        part_lo[1280 + tid_wg] = d_o[10];
+        part_lo[1408 + tid_wg] = d_o[11];
+        part_lo[1536 + tid_wg] = d_o[12];
+        part_lo[1664 + tid_wg] = d_o[13];
+        part_lo[1792 + tid_wg] = d_o[14];
+        part_lo[1920 + tid_wg] = d_o[15];
+        part_lo[2048 + tid_wg] = d_o[16];
+        part_lo[2176 + tid_wg] = d_o[17];
+        part_lo[2304 + tid_wg] = d_o[18];
+        part_lo[2432 + tid_wg] = d_o[19];
+        part_lo[2560 + tid_wg] = d_o[20];
+        part_lo[2688 + tid_wg] = d_o[21];
+        part_lo[2816 + tid_wg] = d_o[22];
+        part_lo[2944 + tid_wg] = d_o[23];
+        part_lo[3072 + tid_wg] = d_o[24];
+        part_lo[3200 + tid_wg] = d_o[25];
+        part_lo[3328 + tid_wg] = d_o[26];
+        part_lo[3456 + tid_wg] = d_o[27];
+        part_lo[3584 + tid_wg] = d_o[28];
+        part_lo[3712 + tid_wg] = d_o[29];
+        part_lo[3840 + tid_wg] = d_o[30];
+        part_lo[3968 + tid_wg] = d_o[31];
+        part_hi[tid_wg] = d_o[32];
+        part_hi[128 + tid_wg] = d_o[33];
+        part_hi[256 + tid_wg] = d_o[34];
+        part_hi[384 + tid_wg] = d_o[35];
+        part_hi[512 + tid_wg] = d_o[36];
+        part_hi[640 + tid_wg] = d_o[37];
+        part_hi[768 + tid_wg] = d_o[38];
+        part_hi[896 + tid_wg] = d_o[39];
+        part_hi[1024 + tid_wg] = d_o[40];
+        part_hi[1152 + tid_wg] = d_o[41];
+        part_hi[1280 + tid_wg] = d_o[42];
+        part_hi[1408 + tid_wg] = d_o[43];
+        part_hi[1536 + tid_wg] = d_o[44];
+        part_hi[1664 + tid_wg] = d_o[45];
+        part_hi[1792 + tid_wg] = d_o[46];
+        part_hi[1920 + tid_wg] = d_o[47];
+        part_hi[2048 + tid_wg] = d_o[48];
+        part_hi[2176 + tid_wg] = d_o[49];
+        part_hi[2304 + tid_wg] = d_o[50];
+        part_hi[2432 + tid_wg] = d_o[51];
+        part_hi[2560 + tid_wg] = d_o[52];
+        part_hi[2688 + tid_wg] = d_o[53];
+        part_hi[2816 + tid_wg] = d_o[54];
+        part_hi[2944 + tid_wg] = d_o[55];
+        part_hi[3072 + tid_wg] = d_o[56];
+        part_hi[3200 + tid_wg] = d_o[57];
+        part_hi[3328 + tid_wg] = d_o[58];
+        part_hi[3456 + tid_wg] = d_o[59];
+        part_hi[3584 + tid_wg] = d_o[60];
+        part_hi[3712 + tid_wg] = d_o[61];
+        part_hi[3840 + tid_wg] = d_o[62];
+        part_hi[3968 + tid_wg] = d_o[63];
+        if (qj == 0) {
+            mstats[quad * 4] = row_max0;
+            mstats[quad * 4 + 1] = row_max1;
+            mstats[quad * 4 + 2] = row_sum0;
+            mstats[quad * 4 + 3] = row_sum1;
+        }
+    }
+    asm volatile("barrier.sync 8, 256;" ::: "memory");
+    if (wg == 0) {
+        float pm0 = mstats[quad * 4];
+        float pm1 = mstats[quad * 4 + 1];
+        float pl0 = mstats[quad * 4 + 2];
+        float pl1 = mstats[quad * 4 + 3];
+        float _max_228 = max_noftz(row_max0, pm0);
+        float mm0 = _max_228;
+        float _max_229 = max_noftz(row_max1, pm1);
+        float mm1 = _max_229;
+        float _exp2_204 = approx_exp2(row_max0 - mm0);
+        float a0 = ((row_max0 == -CAKE_INF) ? 0.0f : _exp2_204);
+        float _exp2_205 = approx_exp2(row_max1 - mm1);
+        float a1 = ((row_max1 == -CAKE_INF) ? 0.0f : _exp2_205);
+        float _exp2_206 = approx_exp2(pm0 - mm0);
+        float b0 = ((pm0 == -CAKE_INF) ? 0.0f : _exp2_206);
+        float _exp2_207 = approx_exp2(pm1 - mm1);
+        float b1 = ((pm1 == -CAKE_INF) ? 0.0f : _exp2_207);
+        float _fma_0 = __fmaf_rn(part_lo[tid_wg], ((0) ? b1 : b0), d_o[0] * ((0) ? a1 : a0));
+        d_o[0] = _fma_0;
+        float _fma_1 = __fmaf_rn(part_lo[128 + tid_wg], ((0) ? b1 : b0), d_o[1] * ((0) ? a1 : a0));
+        d_o[1] = _fma_1;
+        float _fma_2 = __fmaf_rn(part_lo[256 + tid_wg], ((1) ? b1 : b0), d_o[2] * ((1) ? a1 : a0));
+        d_o[2] = _fma_2;
+        float _fma_3 = __fmaf_rn(part_lo[384 + tid_wg], ((1) ? b1 : b0), d_o[3] * ((1) ? a1 : a0));
+        d_o[3] = _fma_3;
+        float _fma_4 = __fmaf_rn(part_lo[512 + tid_wg], ((0) ? b1 : b0), d_o[4] * ((0) ? a1 : a0));
+        d_o[4] = _fma_4;
+        float _fma_5 = __fmaf_rn(part_lo[640 + tid_wg], ((0) ? b1 : b0), d_o[5] * ((0) ? a1 : a0));
+        d_o[5] = _fma_5;
+        float _fma_6 = __fmaf_rn(part_lo[768 + tid_wg], ((1) ? b1 : b0), d_o[6] * ((1) ? a1 : a0));
+        d_o[6] = _fma_6;
+        float _fma_7 = __fmaf_rn(part_lo[896 + tid_wg], ((1) ? b1 : b0), d_o[7] * ((1) ? a1 : a0));
+        d_o[7] = _fma_7;
+        float _fma_8 = __fmaf_rn(part_lo[1024 + tid_wg], ((0) ? b1 : b0), d_o[8] * ((0) ? a1 : a0));
+        d_o[8] = _fma_8;
+        float _fma_9 = __fmaf_rn(part_lo[1152 + tid_wg], ((0) ? b1 : b0), d_o[9] * ((0) ? a1 : a0));
+        d_o[9] = _fma_9;
+        float _fma_10 = __fmaf_rn(part_lo[1280 + tid_wg], ((1) ? b1 : b0), d_o[10] * ((1) ? a1 : a0));
+        d_o[10] = _fma_10;
+        float _fma_11 = __fmaf_rn(part_lo[1408 + tid_wg], ((1) ? b1 : b0), d_o[11] * ((1) ? a1 : a0));
+        d_o[11] = _fma_11;
+        float _fma_12 = __fmaf_rn(part_lo[1536 + tid_wg], ((0) ? b1 : b0), d_o[12] * ((0) ? a1 : a0));
+        d_o[12] = _fma_12;
+        float _fma_13 = __fmaf_rn(part_lo[1664 + tid_wg], ((0) ? b1 : b0), d_o[13] * ((0) ? a1 : a0));
+        d_o[13] = _fma_13;
+        float _fma_14 = __fmaf_rn(part_lo[1792 + tid_wg], ((1) ? b1 : b0), d_o[14] * ((1) ? a1 : a0));
+        d_o[14] = _fma_14;
+        float _fma_15 = __fmaf_rn(part_lo[1920 + tid_wg], ((1) ? b1 : b0), d_o[15] * ((1) ? a1 : a0));
+        d_o[15] = _fma_15;
+        float _fma_16 = __fmaf_rn(part_lo[2048 + tid_wg], ((0) ? b1 : b0), d_o[16] * ((0) ? a1 : a0));
+        d_o[16] = _fma_16;
+        float _fma_17 = __fmaf_rn(part_lo[2176 + tid_wg], ((0) ? b1 : b0), d_o[17] * ((0) ? a1 : a0));
+        d_o[17] = _fma_17;
+        float _fma_18 = __fmaf_rn(part_lo[2304 + tid_wg], ((1) ? b1 : b0), d_o[18] * ((1) ? a1 : a0));
+        d_o[18] = _fma_18;
+        float _fma_19 = __fmaf_rn(part_lo[2432 + tid_wg], ((1) ? b1 : b0), d_o[19] * ((1) ? a1 : a0));
+        d_o[19] = _fma_19;
+        float _fma_20 = __fmaf_rn(part_lo[2560 + tid_wg], ((0) ? b1 : b0), d_o[20] * ((0) ? a1 : a0));
+        d_o[20] = _fma_20;
+        float _fma_21 = __fmaf_rn(part_lo[2688 + tid_wg], ((0) ? b1 : b0), d_o[21] * ((0) ? a1 : a0));
+        d_o[21] = _fma_21;
+        float _fma_22 = __fmaf_rn(part_lo[2816 + tid_wg], ((1) ? b1 : b0), d_o[22] * ((1) ? a1 : a0));
+        d_o[22] = _fma_22;
+        float _fma_23 = __fmaf_rn(part_lo[2944 + tid_wg], ((1) ? b1 : b0), d_o[23] * ((1) ? a1 : a0));
+        d_o[23] = _fma_23;
+        float _fma_24 = __fmaf_rn(part_lo[3072 + tid_wg], ((0) ? b1 : b0), d_o[24] * ((0) ? a1 : a0));
+        d_o[24] = _fma_24;
+        float _fma_25 = __fmaf_rn(part_lo[3200 + tid_wg], ((0) ? b1 : b0), d_o[25] * ((0) ? a1 : a0));
+        d_o[25] = _fma_25;
+        float _fma_26 = __fmaf_rn(part_lo[3328 + tid_wg], ((1) ? b1 : b0), d_o[26] * ((1) ? a1 : a0));
+        d_o[26] = _fma_26;
+        float _fma_27 = __fmaf_rn(part_lo[3456 + tid_wg], ((1) ? b1 : b0), d_o[27] * ((1) ? a1 : a0));
+        d_o[27] = _fma_27;
+        float _fma_28 = __fmaf_rn(part_lo[3584 + tid_wg], ((0) ? b1 : b0), d_o[28] * ((0) ? a1 : a0));
+        d_o[28] = _fma_28;
+        float _fma_29 = __fmaf_rn(part_lo[3712 + tid_wg], ((0) ? b1 : b0), d_o[29] * ((0) ? a1 : a0));
+        d_o[29] = _fma_29;
+        float _fma_30 = __fmaf_rn(part_lo[3840 + tid_wg], ((1) ? b1 : b0), d_o[30] * ((1) ? a1 : a0));
+        d_o[30] = _fma_30;
+        float _fma_31 = __fmaf_rn(part_lo[3968 + tid_wg], ((1) ? b1 : b0), d_o[31] * ((1) ? a1 : a0));
+        d_o[31] = _fma_31;
+        float _fma_32 = __fmaf_rn(part_hi[tid_wg], ((0) ? b1 : b0), d_o[32] * ((0) ? a1 : a0));
+        d_o[32] = _fma_32;
+        float _fma_33 = __fmaf_rn(part_hi[128 + tid_wg], ((0) ? b1 : b0), d_o[33] * ((0) ? a1 : a0));
+        d_o[33] = _fma_33;
+        float _fma_34 = __fmaf_rn(part_hi[256 + tid_wg], ((1) ? b1 : b0), d_o[34] * ((1) ? a1 : a0));
+        d_o[34] = _fma_34;
+        float _fma_35 = __fmaf_rn(part_hi[384 + tid_wg], ((1) ? b1 : b0), d_o[35] * ((1) ? a1 : a0));
+        d_o[35] = _fma_35;
+        float _fma_36 = __fmaf_rn(part_hi[512 + tid_wg], ((0) ? b1 : b0), d_o[36] * ((0) ? a1 : a0));
+        d_o[36] = _fma_36;
+        float _fma_37 = __fmaf_rn(part_hi[640 + tid_wg], ((0) ? b1 : b0), d_o[37] * ((0) ? a1 : a0));
+        d_o[37] = _fma_37;
+        float _fma_38 = __fmaf_rn(part_hi[768 + tid_wg], ((1) ? b1 : b0), d_o[38] * ((1) ? a1 : a0));
+        d_o[38] = _fma_38;
+        float _fma_39 = __fmaf_rn(part_hi[896 + tid_wg], ((1) ? b1 : b0), d_o[39] * ((1) ? a1 : a0));
+        d_o[39] = _fma_39;
+        float _fma_40 = __fmaf_rn(part_hi[1024 + tid_wg], ((0) ? b1 : b0), d_o[40] * ((0) ? a1 : a0));
+        d_o[40] = _fma_40;
+        float _fma_41 = __fmaf_rn(part_hi[1152 + tid_wg], ((0) ? b1 : b0), d_o[41] * ((0) ? a1 : a0));
+        d_o[41] = _fma_41;
+        float _fma_42 = __fmaf_rn(part_hi[1280 + tid_wg], ((1) ? b1 : b0), d_o[42] * ((1) ? a1 : a0));
+        d_o[42] = _fma_42;
+        float _fma_43 = __fmaf_rn(part_hi[1408 + tid_wg], ((1) ? b1 : b0), d_o[43] * ((1) ? a1 : a0));
+        d_o[43] = _fma_43;
+        float _fma_44 = __fmaf_rn(part_hi[1536 + tid_wg], ((0) ? b1 : b0), d_o[44] * ((0) ? a1 : a0));
+        d_o[44] = _fma_44;
+        float _fma_45 = __fmaf_rn(part_hi[1664 + tid_wg], ((0) ? b1 : b0), d_o[45] * ((0) ? a1 : a0));
+        d_o[45] = _fma_45;
+        float _fma_46 = __fmaf_rn(part_hi[1792 + tid_wg], ((1) ? b1 : b0), d_o[46] * ((1) ? a1 : a0));
+        d_o[46] = _fma_46;
+        float _fma_47 = __fmaf_rn(part_hi[1920 + tid_wg], ((1) ? b1 : b0), d_o[47] * ((1) ? a1 : a0));
+        d_o[47] = _fma_47;
+        float _fma_48 = __fmaf_rn(part_hi[2048 + tid_wg], ((0) ? b1 : b0), d_o[48] * ((0) ? a1 : a0));
+        d_o[48] = _fma_48;
+        float _fma_49 = __fmaf_rn(part_hi[2176 + tid_wg], ((0) ? b1 : b0), d_o[49] * ((0) ? a1 : a0));
+        d_o[49] = _fma_49;
+        float _fma_50 = __fmaf_rn(part_hi[2304 + tid_wg], ((1) ? b1 : b0), d_o[50] * ((1) ? a1 : a0));
+        d_o[50] = _fma_50;
+        float _fma_51 = __fmaf_rn(part_hi[2432 + tid_wg], ((1) ? b1 : b0), d_o[51] * ((1) ? a1 : a0));
+        d_o[51] = _fma_51;
+        float _fma_52 = __fmaf_rn(part_hi[2560 + tid_wg], ((0) ? b1 : b0), d_o[52] * ((0) ? a1 : a0));
+        d_o[52] = _fma_52;
+        float _fma_53 = __fmaf_rn(part_hi[2688 + tid_wg], ((0) ? b1 : b0), d_o[53] * ((0) ? a1 : a0));
+        d_o[53] = _fma_53;
+        float _fma_54 = __fmaf_rn(part_hi[2816 + tid_wg], ((1) ? b1 : b0), d_o[54] * ((1) ? a1 : a0));
+        d_o[54] = _fma_54;
+        float _fma_55 = __fmaf_rn(part_hi[2944 + tid_wg], ((1) ? b1 : b0), d_o[55] * ((1) ? a1 : a0));
+        d_o[55] = _fma_55;
+        float _fma_56 = __fmaf_rn(part_hi[3072 + tid_wg], ((0) ? b1 : b0), d_o[56] * ((0) ? a1 : a0));
+        d_o[56] = _fma_56;
+        float _fma_57 = __fmaf_rn(part_hi[3200 + tid_wg], ((0) ? b1 : b0), d_o[57] * ((0) ? a1 : a0));
+        d_o[57] = _fma_57;
+        float _fma_58 = __fmaf_rn(part_hi[3328 + tid_wg], ((1) ? b1 : b0), d_o[58] * ((1) ? a1 : a0));
+        d_o[58] = _fma_58;
+        float _fma_59 = __fmaf_rn(part_hi[3456 + tid_wg], ((1) ? b1 : b0), d_o[59] * ((1) ? a1 : a0));
+        d_o[59] = _fma_59;
+        float _fma_60 = __fmaf_rn(part_hi[3584 + tid_wg], ((0) ? b1 : b0), d_o[60] * ((0) ? a1 : a0));
+        d_o[60] = _fma_60;
+        float _fma_61 = __fmaf_rn(part_hi[3712 + tid_wg], ((0) ? b1 : b0), d_o[61] * ((0) ? a1 : a0));
+        d_o[61] = _fma_61;
+        float _fma_62 = __fmaf_rn(part_hi[3840 + tid_wg], ((1) ? b1 : b0), d_o[62] * ((1) ? a1 : a0));
+        d_o[62] = _fma_62;
+        float _fma_63 = __fmaf_rn(part_hi[3968 + tid_wg], ((1) ? b1 : b0), d_o[63] * ((1) ? a1 : a0));
+        d_o[63] = _fma_63;
+        float _fma_64 = __fmaf_rn(pl0, b0, row_sum0 * a0);
+        row_sum0 = _fma_64;
+        float _fma_65 = __fmaf_rn(pl1, b1, row_sum1 * a1);
+        row_sum1 = _fma_65;
+        row_max0 = mm0;
+        row_max1 = mm1;
+    }
+    if (wg == 0) {
+        float _rcp_0 = approx_rcp(row_sum0);
+        float _rcp_1 = approx_rcp(row_sum1);
+        d_o[0] = d_o[0] * _rcp_0;
+        d_o[1] = d_o[1] * _rcp_0;
+        d_o[4] = d_o[4] * _rcp_0;
+        d_o[5] = d_o[5] * _rcp_0;
+        d_o[8] = d_o[8] * _rcp_0;
+        d_o[9] = d_o[9] * _rcp_0;
+        d_o[12] = d_o[12] * _rcp_0;
+        d_o[13] = d_o[13] * _rcp_0;
+        d_o[16] = d_o[16] * _rcp_0;
+        d_o[17] = d_o[17] * _rcp_0;
+        d_o[20] = d_o[20] * _rcp_0;
+        d_o[21] = d_o[21] * _rcp_0;
+        d_o[24] = d_o[24] * _rcp_0;
+        d_o[25] = d_o[25] * _rcp_0;
+        d_o[28] = d_o[28] * _rcp_0;
+        d_o[29] = d_o[29] * _rcp_0;
+        d_o[32] = d_o[32] * _rcp_0;
+        d_o[33] = d_o[33] * _rcp_0;
+        d_o[36] = d_o[36] * _rcp_0;
+        d_o[37] = d_o[37] * _rcp_0;
+        d_o[40] = d_o[40] * _rcp_0;
+        d_o[41] = d_o[41] * _rcp_0;
+        d_o[44] = d_o[44] * _rcp_0;
+        d_o[45] = d_o[45] * _rcp_0;
+        d_o[48] = d_o[48] * _rcp_0;
+        d_o[49] = d_o[49] * _rcp_0;
+        d_o[52] = d_o[52] * _rcp_0;
+        d_o[53] = d_o[53] * _rcp_0;
+        d_o[56] = d_o[56] * _rcp_0;
+        d_o[57] = d_o[57] * _rcp_0;
+        d_o[60] = d_o[60] * _rcp_0;
+        d_o[61] = d_o[61] * _rcp_0;
+        d_o[2] = d_o[2] * _rcp_1;
+        d_o[3] = d_o[3] * _rcp_1;
+        d_o[6] = d_o[6] * _rcp_1;
+        d_o[7] = d_o[7] * _rcp_1;
+        d_o[10] = d_o[10] * _rcp_1;
+        d_o[11] = d_o[11] * _rcp_1;
+        d_o[14] = d_o[14] * _rcp_1;
+        d_o[15] = d_o[15] * _rcp_1;
+        d_o[18] = d_o[18] * _rcp_1;
+        d_o[19] = d_o[19] * _rcp_1;
+        d_o[22] = d_o[22] * _rcp_1;
+        d_o[23] = d_o[23] * _rcp_1;
+        d_o[26] = d_o[26] * _rcp_1;
+        d_o[27] = d_o[27] * _rcp_1;
+        d_o[30] = d_o[30] * _rcp_1;
+        d_o[31] = d_o[31] * _rcp_1;
+        d_o[34] = d_o[34] * _rcp_1;
+        d_o[35] = d_o[35] * _rcp_1;
+        d_o[38] = d_o[38] * _rcp_1;
+        d_o[39] = d_o[39] * _rcp_1;
+        d_o[42] = d_o[42] * _rcp_1;
+        d_o[43] = d_o[43] * _rcp_1;
+        d_o[46] = d_o[46] * _rcp_1;
+        d_o[47] = d_o[47] * _rcp_1;
+        d_o[50] = d_o[50] * _rcp_1;
+        d_o[51] = d_o[51] * _rcp_1;
+        d_o[54] = d_o[54] * _rcp_1;
+        d_o[55] = d_o[55] * _rcp_1;
+        d_o[58] = d_o[58] * _rcp_1;
+        d_o[59] = d_o[59] * _rcp_1;
+        d_o[62] = d_o[62] * _rcp_1;
+        d_o[63] = d_o[63] * _rcp_1;
+        int qj1 = qj & 1;
+        int qj2 = qj & 2;
+        unsigned int o_vec[4];
+        unsigned int o_tmp[4];
+        int o_row_base = q_row * 128;
+        int m_local_r = ((1) ? m0_local : m1_local);
+        __nv_bfloat162 _bf16x2_96 = __float22bfloat162_rn(make_float2(d_o[0], d_o[1]));
+        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_96)[0];
+        __nv_bfloat162 _bf16x2_97 = __float22bfloat162_rn(make_float2(d_o[4], d_o[5]));
+        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_97)[0];
+        __nv_bfloat162 _bf16x2_98 = __float22bfloat162_rn(make_float2(d_o[8], d_o[9]));
+        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_98)[0];
+        __nv_bfloat162 _bf16x2_99 = __float22bfloat162_rn(make_float2(d_o[12], d_o[13]));
+        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_99)[0];
+        unsigned int _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+        o_tmp[0] = _shfl_xor_28;
+        unsigned int _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+        o_tmp[1] = _shfl_xor_29;
+        unsigned int _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+        o_tmp[2] = _shfl_xor_30;
+        unsigned int _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+        o_tmp[3] = _shfl_xor_31;
+        {
+            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        unsigned int _shfl_xor_32 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+        o_tmp[0] = _shfl_xor_32;
+        unsigned int _shfl_xor_33 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+        o_tmp[1] = _shfl_xor_33;
+        unsigned int _shfl_xor_34 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+        o_tmp[2] = _shfl_xor_34;
+        unsigned int _shfl_xor_35 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+        o_tmp[3] = _shfl_xor_35;
+        {
+            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        int o_off = o_row_base + m_local_r * 128 + qj * 8;
+        reinterpret_cast<int4*>(O + o_off)[0] = reinterpret_cast<int4*>(o_vec)[0];
+        __nv_bfloat162 _bf16x2_100 = __float22bfloat162_rn(make_float2(d_o[16], d_o[17]));
+        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_100)[0];
+        __nv_bfloat162 _bf16x2_101 = __float22bfloat162_rn(make_float2(d_o[20], d_o[21]));
+        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_101)[0];
+        __nv_bfloat162 _bf16x2_102 = __float22bfloat162_rn(make_float2(d_o[24], d_o[25]));
+        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_102)[0];
+        __nv_bfloat162 _bf16x2_103 = __float22bfloat162_rn(make_float2(d_o[28], d_o[29]));
+        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_103)[0];
+        unsigned int _shfl_xor_36 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+        o_tmp[0] = _shfl_xor_36;
+        unsigned int _shfl_xor_37 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+        o_tmp[1] = _shfl_xor_37;
+        unsigned int _shfl_xor_38 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+        o_tmp[2] = _shfl_xor_38;
+        unsigned int _shfl_xor_39 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+        o_tmp[3] = _shfl_xor_39;
+        {
+            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        unsigned int _shfl_xor_40 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+        o_tmp[0] = _shfl_xor_40;
+        unsigned int _shfl_xor_41 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+        o_tmp[1] = _shfl_xor_41;
+        unsigned int _shfl_xor_42 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+        o_tmp[2] = _shfl_xor_42;
+        unsigned int _shfl_xor_43 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+        o_tmp[3] = _shfl_xor_43;
+        {
+            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        int o_off_0 = o_row_base + m_local_r * 128 + (4 + qj) * 8;
+        reinterpret_cast<int4*>(O + o_off_0)[0] = reinterpret_cast<int4*>(o_vec)[0];
+        __nv_bfloat162 _bf16x2_104 = __float22bfloat162_rn(make_float2(d_o[32], d_o[33]));
+        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_104)[0];
+        __nv_bfloat162 _bf16x2_105 = __float22bfloat162_rn(make_float2(d_o[36], d_o[37]));
+        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_105)[0];
+        __nv_bfloat162 _bf16x2_106 = __float22bfloat162_rn(make_float2(d_o[40], d_o[41]));
+        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_106)[0];
+        __nv_bfloat162 _bf16x2_107 = __float22bfloat162_rn(make_float2(d_o[44], d_o[45]));
+        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_107)[0];
+        unsigned int _shfl_xor_44 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+        o_tmp[0] = _shfl_xor_44;
+        unsigned int _shfl_xor_45 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+        o_tmp[1] = _shfl_xor_45;
+        unsigned int _shfl_xor_46 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+        o_tmp[2] = _shfl_xor_46;
+        unsigned int _shfl_xor_47 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+        o_tmp[3] = _shfl_xor_47;
+        {
+            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        unsigned int _shfl_xor_48 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+        o_tmp[0] = _shfl_xor_48;
+        unsigned int _shfl_xor_49 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+        o_tmp[1] = _shfl_xor_49;
+        unsigned int _shfl_xor_50 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+        o_tmp[2] = _shfl_xor_50;
+        unsigned int _shfl_xor_51 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+        o_tmp[3] = _shfl_xor_51;
+        {
+            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        int o_off_1 = o_row_base + m_local_r * 128 + (8 + qj) * 8;
+        reinterpret_cast<int4*>(O + o_off_1)[0] = reinterpret_cast<int4*>(o_vec)[0];
+        __nv_bfloat162 _bf16x2_108 = __float22bfloat162_rn(make_float2(d_o[48], d_o[49]));
+        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_108)[0];
+        __nv_bfloat162 _bf16x2_109 = __float22bfloat162_rn(make_float2(d_o[52], d_o[53]));
+        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_109)[0];
+        __nv_bfloat162 _bf16x2_110 = __float22bfloat162_rn(make_float2(d_o[56], d_o[57]));
+        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_110)[0];
+        __nv_bfloat162 _bf16x2_111 = __float22bfloat162_rn(make_float2(d_o[60], d_o[61]));
+        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_111)[0];
+        unsigned int _shfl_xor_52 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+        o_tmp[0] = _shfl_xor_52;
+        unsigned int _shfl_xor_53 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+        o_tmp[1] = _shfl_xor_53;
+        unsigned int _shfl_xor_54 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+        o_tmp[2] = _shfl_xor_54;
+        unsigned int _shfl_xor_55 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+        o_tmp[3] = _shfl_xor_55;
+        {
+            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        unsigned int _shfl_xor_56 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+        o_tmp[0] = _shfl_xor_56;
+        unsigned int _shfl_xor_57 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+        o_tmp[1] = _shfl_xor_57;
+        unsigned int _shfl_xor_58 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+        o_tmp[2] = _shfl_xor_58;
+        unsigned int _shfl_xor_59 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+        o_tmp[3] = _shfl_xor_59;
+        {
+            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        int o_off_2 = o_row_base + m_local_r * 128 + (12 + qj) * 8;
+        reinterpret_cast<int4*>(O + o_off_2)[0] = reinterpret_cast<int4*>(o_vec)[0];
+        int m_local_r_3 = ((0) ? m0_local : m1_local);
+        __nv_bfloat162 _bf16x2_112 = __float22bfloat162_rn(make_float2(d_o[2], d_o[3]));
+        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_112)[0];
+        __nv_bfloat162 _bf16x2_113 = __float22bfloat162_rn(make_float2(d_o[6], d_o[7]));
+        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_113)[0];
+        __nv_bfloat162 _bf16x2_114 = __float22bfloat162_rn(make_float2(d_o[10], d_o[11]));
+        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_114)[0];
+        __nv_bfloat162 _bf16x2_115 = __float22bfloat162_rn(make_float2(d_o[14], d_o[15]));
+        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_115)[0];
+        unsigned int _shfl_xor_60 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+        o_tmp[0] = _shfl_xor_60;
+        unsigned int _shfl_xor_61 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+        o_tmp[1] = _shfl_xor_61;
+        unsigned int _shfl_xor_62 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+        o_tmp[2] = _shfl_xor_62;
+        unsigned int _shfl_xor_63 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+        o_tmp[3] = _shfl_xor_63;
+        {
+            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        unsigned int _shfl_xor_64 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+        o_tmp[0] = _shfl_xor_64;
+        unsigned int _shfl_xor_65 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+        o_tmp[1] = _shfl_xor_65;
+        unsigned int _shfl_xor_66 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+        o_tmp[2] = _shfl_xor_66;
+        unsigned int _shfl_xor_67 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+        o_tmp[3] = _shfl_xor_67;
+        {
+            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        int o_off_4 = o_row_base + m_local_r_3 * 128 + qj * 8;
+        reinterpret_cast<int4*>(O + o_off_4)[0] = reinterpret_cast<int4*>(o_vec)[0];
+        __nv_bfloat162 _bf16x2_116 = __float22bfloat162_rn(make_float2(d_o[18], d_o[19]));
+        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_116)[0];
+        __nv_bfloat162 _bf16x2_117 = __float22bfloat162_rn(make_float2(d_o[22], d_o[23]));
+        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_117)[0];
+        __nv_bfloat162 _bf16x2_118 = __float22bfloat162_rn(make_float2(d_o[26], d_o[27]));
+        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_118)[0];
+        __nv_bfloat162 _bf16x2_119 = __float22bfloat162_rn(make_float2(d_o[30], d_o[31]));
+        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_119)[0];
+        unsigned int _shfl_xor_68 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+        o_tmp[0] = _shfl_xor_68;
+        unsigned int _shfl_xor_69 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+        o_tmp[1] = _shfl_xor_69;
+        unsigned int _shfl_xor_70 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+        o_tmp[2] = _shfl_xor_70;
+        unsigned int _shfl_xor_71 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+        o_tmp[3] = _shfl_xor_71;
+        {
+            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        unsigned int _shfl_xor_72 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+        o_tmp[0] = _shfl_xor_72;
+        unsigned int _shfl_xor_73 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+        o_tmp[1] = _shfl_xor_73;
+        unsigned int _shfl_xor_74 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+        o_tmp[2] = _shfl_xor_74;
+        unsigned int _shfl_xor_75 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+        o_tmp[3] = _shfl_xor_75;
+        {
+            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        int o_off_5 = o_row_base + m_local_r_3 * 128 + (4 + qj) * 8;
+        reinterpret_cast<int4*>(O + o_off_5)[0] = reinterpret_cast<int4*>(o_vec)[0];
+        __nv_bfloat162 _bf16x2_120 = __float22bfloat162_rn(make_float2(d_o[34], d_o[35]));
+        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_120)[0];
+        __nv_bfloat162 _bf16x2_121 = __float22bfloat162_rn(make_float2(d_o[38], d_o[39]));
+        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_121)[0];
+        __nv_bfloat162 _bf16x2_122 = __float22bfloat162_rn(make_float2(d_o[42], d_o[43]));
+        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_122)[0];
+        __nv_bfloat162 _bf16x2_123 = __float22bfloat162_rn(make_float2(d_o[46], d_o[47]));
+        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_123)[0];
+        unsigned int _shfl_xor_76 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+        o_tmp[0] = _shfl_xor_76;
+        unsigned int _shfl_xor_77 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+        o_tmp[1] = _shfl_xor_77;
+        unsigned int _shfl_xor_78 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+        o_tmp[2] = _shfl_xor_78;
+        unsigned int _shfl_xor_79 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+        o_tmp[3] = _shfl_xor_79;
+        {
+            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        unsigned int _shfl_xor_80 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+        o_tmp[0] = _shfl_xor_80;
+        unsigned int _shfl_xor_81 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+        o_tmp[1] = _shfl_xor_81;
+        unsigned int _shfl_xor_82 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+        o_tmp[2] = _shfl_xor_82;
+        unsigned int _shfl_xor_83 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+        o_tmp[3] = _shfl_xor_83;
+        {
+            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        int o_off_6 = o_row_base + m_local_r_3 * 128 + (8 + qj) * 8;
+        reinterpret_cast<int4*>(O + o_off_6)[0] = reinterpret_cast<int4*>(o_vec)[0];
+        __nv_bfloat162 _bf16x2_124 = __float22bfloat162_rn(make_float2(d_o[50], d_o[51]));
+        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_124)[0];
+        __nv_bfloat162 _bf16x2_125 = __float22bfloat162_rn(make_float2(d_o[54], d_o[55]));
+        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_125)[0];
+        __nv_bfloat162 _bf16x2_126 = __float22bfloat162_rn(make_float2(d_o[58], d_o[59]));
+        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_126)[0];
+        __nv_bfloat162 _bf16x2_127 = __float22bfloat162_rn(make_float2(d_o[62], d_o[63]));
+        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_127)[0];
+        unsigned int _shfl_xor_84 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+        o_tmp[0] = _shfl_xor_84;
+        unsigned int _shfl_xor_85 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+        o_tmp[1] = _shfl_xor_85;
+        unsigned int _shfl_xor_86 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+        o_tmp[2] = _shfl_xor_86;
+        unsigned int _shfl_xor_87 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+        o_tmp[3] = _shfl_xor_87;
+        {
+            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        unsigned int _shfl_xor_88 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+        o_tmp[0] = _shfl_xor_88;
+        unsigned int _shfl_xor_89 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+        o_tmp[1] = _shfl_xor_89;
+        unsigned int _shfl_xor_90 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+        o_tmp[2] = _shfl_xor_90;
+        unsigned int _shfl_xor_91 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+        o_tmp[3] = _shfl_xor_91;
+        {
+            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+        }
+        {
+            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+        }
+        {
+            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+        }
+        {
+            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+        }
+        int o_off_7 = o_row_base + m_local_r_3 * 128 + (12 + qj) * 8;
+        reinterpret_cast<int4*>(O + o_off_7)[0] = reinterpret_cast<int4*>(o_vec)[0];
     }
-    {
-        o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    unsigned int _shfl_xor_32 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-    o_tmp[0] = _shfl_xor_32;
-    unsigned int _shfl_xor_33 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-    o_tmp[1] = _shfl_xor_33;
-    unsigned int _shfl_xor_34 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-    o_tmp[2] = _shfl_xor_34;
-    unsigned int _shfl_xor_35 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-    o_tmp[3] = _shfl_xor_35;
-    {
-        o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    int o_off = o_row_base + m_local_r * 128 + qj * 8;
-    reinterpret_cast<int4*>(O + o_off)[0] = reinterpret_cast<int4*>(o_vec)[0];
-    __nv_bfloat162 _bf16x2_100 = __float22bfloat162_rn(make_float2(d_o[16], d_o[17]));
-    o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_100)[0];
-    __nv_bfloat162 _bf16x2_101 = __float22bfloat162_rn(make_float2(d_o[20], d_o[21]));
-    o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_101)[0];
-    __nv_bfloat162 _bf16x2_102 = __float22bfloat162_rn(make_float2(d_o[24], d_o[25]));
-    o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_102)[0];
-    __nv_bfloat162 _bf16x2_103 = __float22bfloat162_rn(make_float2(d_o[28], d_o[29]));
-    o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_103)[0];
-    unsigned int _shfl_xor_36 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-    o_tmp[0] = _shfl_xor_36;
-    unsigned int _shfl_xor_37 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-    o_tmp[1] = _shfl_xor_37;
-    unsigned int _shfl_xor_38 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-    o_tmp[2] = _shfl_xor_38;
-    unsigned int _shfl_xor_39 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-    o_tmp[3] = _shfl_xor_39;
-    {
-        o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    unsigned int _shfl_xor_40 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-    o_tmp[0] = _shfl_xor_40;
-    unsigned int _shfl_xor_41 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-    o_tmp[1] = _shfl_xor_41;
-    unsigned int _shfl_xor_42 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-    o_tmp[2] = _shfl_xor_42;
-    unsigned int _shfl_xor_43 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-    o_tmp[3] = _shfl_xor_43;
-    {
-        o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    int o_off_0 = o_row_base + m_local_r * 128 + (4 + qj) * 8;
-    reinterpret_cast<int4*>(O + o_off_0)[0] = reinterpret_cast<int4*>(o_vec)[0];
-    __nv_bfloat162 _bf16x2_104 = __float22bfloat162_rn(make_float2(d_o[32], d_o[33]));
-    o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_104)[0];
-    __nv_bfloat162 _bf16x2_105 = __float22bfloat162_rn(make_float2(d_o[36], d_o[37]));
-    o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_105)[0];
-    __nv_bfloat162 _bf16x2_106 = __float22bfloat162_rn(make_float2(d_o[40], d_o[41]));
-    o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_106)[0];
-    __nv_bfloat162 _bf16x2_107 = __float22bfloat162_rn(make_float2(d_o[44], d_o[45]));
-    o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_107)[0];
-    unsigned int _shfl_xor_44 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-    o_tmp[0] = _shfl_xor_44;
-    unsigned int _shfl_xor_45 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-    o_tmp[1] = _shfl_xor_45;
-    unsigned int _shfl_xor_46 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-    o_tmp[2] = _shfl_xor_46;
-    unsigned int _shfl_xor_47 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-    o_tmp[3] = _shfl_xor_47;
-    {
-        o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    unsigned int _shfl_xor_48 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-    o_tmp[0] = _shfl_xor_48;
-    unsigned int _shfl_xor_49 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-    o_tmp[1] = _shfl_xor_49;
-    unsigned int _shfl_xor_50 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-    o_tmp[2] = _shfl_xor_50;
-    unsigned int _shfl_xor_51 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-    o_tmp[3] = _shfl_xor_51;
-    {
-        o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    int o_off_1 = o_row_base + m_local_r * 128 + (8 + qj) * 8;
-    reinterpret_cast<int4*>(O + o_off_1)[0] = reinterpret_cast<int4*>(o_vec)[0];
-    __nv_bfloat162 _bf16x2_108 = __float22bfloat162_rn(make_float2(d_o[48], d_o[49]));
-    o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_108)[0];
-    __nv_bfloat162 _bf16x2_109 = __float22bfloat162_rn(make_float2(d_o[52], d_o[53]));
-    o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_109)[0];
-    __nv_bfloat162 _bf16x2_110 = __float22bfloat162_rn(make_float2(d_o[56], d_o[57]));
-    o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_110)[0];
-    __nv_bfloat162 _bf16x2_111 = __float22bfloat162_rn(make_float2(d_o[60], d_o[61]));
-    o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_111)[0];
-    unsigned int _shfl_xor_52 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-    o_tmp[0] = _shfl_xor_52;
-    unsigned int _shfl_xor_53 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-    o_tmp[1] = _shfl_xor_53;
-    unsigned int _shfl_xor_54 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-    o_tmp[2] = _shfl_xor_54;
-    unsigned int _shfl_xor_55 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-    o_tmp[3] = _shfl_xor_55;
-    {
-        o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    unsigned int _shfl_xor_56 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-    o_tmp[0] = _shfl_xor_56;
-    unsigned int _shfl_xor_57 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-    o_tmp[1] = _shfl_xor_57;
-    unsigned int _shfl_xor_58 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-    o_tmp[2] = _shfl_xor_58;
-    unsigned int _shfl_xor_59 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-    o_tmp[3] = _shfl_xor_59;
-    {
-        o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    int o_off_2 = o_row_base + m_local_r * 128 + (12 + qj) * 8;
-    reinterpret_cast<int4*>(O + o_off_2)[0] = reinterpret_cast<int4*>(o_vec)[0];
-    int m_local_r_3 = ((0) ? m0_local : m1_local);
-    __nv_bfloat162 _bf16x2_112 = __float22bfloat162_rn(make_float2(d_o[2], d_o[3]));
-    o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_112)[0];
-    __nv_bfloat162 _bf16x2_113 = __float22bfloat162_rn(make_float2(d_o[6], d_o[7]));
-    o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_113)[0];
-    __nv_bfloat162 _bf16x2_114 = __float22bfloat162_rn(make_float2(d_o[10], d_o[11]));
-    o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_114)[0];
-    __nv_bfloat162 _bf16x2_115 = __float22bfloat162_rn(make_float2(d_o[14], d_o[15]));
-    o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_115)[0];
-    unsigned int _shfl_xor_60 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-    o_tmp[0] = _shfl_xor_60;
-    unsigned int _shfl_xor_61 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-    o_tmp[1] = _shfl_xor_61;
-    unsigned int _shfl_xor_62 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-    o_tmp[2] = _shfl_xor_62;
-    unsigned int _shfl_xor_63 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-    o_tmp[3] = _shfl_xor_63;
-    {
-        o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    unsigned int _shfl_xor_64 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-    o_tmp[0] = _shfl_xor_64;
-    unsigned int _shfl_xor_65 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-    o_tmp[1] = _shfl_xor_65;
-    unsigned int _shfl_xor_66 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-    o_tmp[2] = _shfl_xor_66;
-    unsigned int _shfl_xor_67 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-    o_tmp[3] = _shfl_xor_67;
-    {
-        o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    int o_off_4 = o_row_base + m_local_r_3 * 128 + qj * 8;
-    reinterpret_cast<int4*>(O + o_off_4)[0] = reinterpret_cast<int4*>(o_vec)[0];
-    __nv_bfloat162 _bf16x2_116 = __float22bfloat162_rn(make_float2(d_o[18], d_o[19]));
-    o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_116)[0];
-    __nv_bfloat162 _bf16x2_117 = __float22bfloat162_rn(make_float2(d_o[22], d_o[23]));
-    o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_117)[0];
-    __nv_bfloat162 _bf16x2_118 = __float22bfloat162_rn(make_float2(d_o[26], d_o[27]));
-    o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_118)[0];
-    __nv_bfloat162 _bf16x2_119 = __float22bfloat162_rn(make_float2(d_o[30], d_o[31]));
-    o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_119)[0];
-    unsigned int _shfl_xor_68 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-    o_tmp[0] = _shfl_xor_68;
-    unsigned int _shfl_xor_69 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-    o_tmp[1] = _shfl_xor_69;
-    unsigned int _shfl_xor_70 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-    o_tmp[2] = _shfl_xor_70;
-    unsigned int _shfl_xor_71 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-    o_tmp[3] = _shfl_xor_71;
-    {
-        o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    unsigned int _shfl_xor_72 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-    o_tmp[0] = _shfl_xor_72;
-    unsigned int _shfl_xor_73 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-    o_tmp[1] = _shfl_xor_73;
-    unsigned int _shfl_xor_74 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-    o_tmp[2] = _shfl_xor_74;
-    unsigned int _shfl_xor_75 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-    o_tmp[3] = _shfl_xor_75;
-    {
-        o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    int o_off_5 = o_row_base + m_local_r_3 * 128 + (4 + qj) * 8;
-    reinterpret_cast<int4*>(O + o_off_5)[0] = reinterpret_cast<int4*>(o_vec)[0];
-    __nv_bfloat162 _bf16x2_120 = __float22bfloat162_rn(make_float2(d_o[34], d_o[35]));
-    o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_120)[0];
-    __nv_bfloat162 _bf16x2_121 = __float22bfloat162_rn(make_float2(d_o[38], d_o[39]));
-    o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_121)[0];
-    __nv_bfloat162 _bf16x2_122 = __float22bfloat162_rn(make_float2(d_o[42], d_o[43]));
-    o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_122)[0];
-    __nv_bfloat162 _bf16x2_123 = __float22bfloat162_rn(make_float2(d_o[46], d_o[47]));
-    o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_123)[0];
-    unsigned int _shfl_xor_76 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-    o_tmp[0] = _shfl_xor_76;
-    unsigned int _shfl_xor_77 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-    o_tmp[1] = _shfl_xor_77;
-    unsigned int _shfl_xor_78 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-    o_tmp[2] = _shfl_xor_78;
-    unsigned int _shfl_xor_79 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-    o_tmp[3] = _shfl_xor_79;
-    {
-        o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    unsigned int _shfl_xor_80 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-    o_tmp[0] = _shfl_xor_80;
-    unsigned int _shfl_xor_81 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-    o_tmp[1] = _shfl_xor_81;
-    unsigned int _shfl_xor_82 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-    o_tmp[2] = _shfl_xor_82;
-    unsigned int _shfl_xor_83 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-    o_tmp[3] = _shfl_xor_83;
-    {
-        o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    int o_off_6 = o_row_base + m_local_r_3 * 128 + (8 + qj) * 8;
-    reinterpret_cast<int4*>(O + o_off_6)[0] = reinterpret_cast<int4*>(o_vec)[0];
-    __nv_bfloat162 _bf16x2_124 = __float22bfloat162_rn(make_float2(d_o[50], d_o[51]));
-    o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_124)[0];
-    __nv_bfloat162 _bf16x2_125 = __float22bfloat162_rn(make_float2(d_o[54], d_o[55]));
-    o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_125)[0];
-    __nv_bfloat162 _bf16x2_126 = __float22bfloat162_rn(make_float2(d_o[58], d_o[59]));
-    o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_126)[0];
-    __nv_bfloat162 _bf16x2_127 = __float22bfloat162_rn(make_float2(d_o[62], d_o[63]));
-    o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_127)[0];
-    unsigned int _shfl_xor_84 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-    o_tmp[0] = _shfl_xor_84;
-    unsigned int _shfl_xor_85 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-    o_tmp[1] = _shfl_xor_85;
-    unsigned int _shfl_xor_86 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-    o_tmp[2] = _shfl_xor_86;
-    unsigned int _shfl_xor_87 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-    o_tmp[3] = _shfl_xor_87;
-    {
-        o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    unsigned int _shfl_xor_88 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-    o_tmp[0] = _shfl_xor_88;
-    unsigned int _shfl_xor_89 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-    o_tmp[1] = _shfl_xor_89;
-    unsigned int _shfl_xor_90 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-    o_tmp[2] = _shfl_xor_90;
-    unsigned int _shfl_xor_91 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-    o_tmp[3] = _shfl_xor_91;
-    {
-        o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-    }
-    {
-        o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-    }
-    {
-        o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-    }
-    {
-        o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-    }
-    int o_off_7 = o_row_base + m_local_r_3 * 128 + (12 + qj) * 8;
-    reinterpret_cast<int4*>(O + o_off_7)[0] = reinterpret_cast<int4*>(o_vec)[0];
 
     // Cleanup
     __syncthreads();

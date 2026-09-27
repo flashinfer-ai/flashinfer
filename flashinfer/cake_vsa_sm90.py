@@ -69,6 +69,14 @@ MAX_SEQ = 136
 MAX_SELECTED = 64
 TILE_FIXED_COST = 0.3
 LOAD_COST = 1.0
+# By-value first-tile header of the persistent kernel: per CTA ``[head, qb0,
+# qb1, mode, n_hdr, (blk_a, blk_b) x HDR_POS, pad]`` (int16) so the first Q
+# and ring positions are issued at CTA start, ahead of the plan row's load.
+HDR_POS = 3  # header slots (fixed kernel layout)
+HDR_ISSUE = 2  # positions the planner puts in the header (two measured best; three hurt the k12 row)
+HDR_WORDS = 12
+HDR_CTAS = 144
+HDR_HALFWORDS = HDR_CTAS * HDR_WORDS
 # Ragged plans list-schedule costlier tiles first over all heads (LPT) when
 # every head's K and V fit this many bytes of L2; larger working sets keep the
 # head-major order so the CTAs running concurrently share one head's blocks.
@@ -91,21 +99,27 @@ META_WORDS = META_OWN_OFF + NUM_CONSUMER_WGS * OWN_WORDS  # 144
 SMALL_KMAX_VARIANTS = (1, 3, 4, 6)
 SMALL_OCCUPANCY = {
     1: 4,
-    3: 2,
+    2: 1,
+    3: 1,
     4: 1,
     6: 1,
-}  # CTAs per SM on H100 (49/113/145/209 KB SMEM)
+}  # CTAs per SM on H100: KMAX 1 is one warpgroup (49 KB); KMAX > 1 run two warpgroups (256 threads)
 PLAN_HALFWORDS = 1750  # int16 elements of the by-value plan parameter (3500 B)
 PLAN_META_UNSPLIT = 1  # unsplit rows: [count, blk...] per query block
 PLAN_META_SPLIT = 2  # split rows: [meta, qtile, blk...] per item
 MAX_NSPLIT = 31  # nsplit field of ``meta`` (bits 10..14 keep the int16 sign clear)
 SMALL_ITEM_ELEMS = BLOCK * HEAD_DIM  # FP32 partial accumulator per split item
 SMALL_STATS_FLOATS = 2 * BLOCK  # (max, sum) per row per split item
-# Split-KV cost model (relative units): one KV block through the single
-# warpgroup chain vs. one extra slice merged by the last CTA (fitted on H100,
-# CAKE-671).  Same constants as the Cake planner (``vsa_sm90_small``).
+# Split-KV cost model (relative units): one KV block through the chain vs. one
+# extra slice merged by the last CTA (32 KB FP32 read + weights) plus the route's
+# fixed workspace round trip (publish, fence, arrival atomic, last-CTA re-read).
+# Same constants as the Cake planner (``vsa_sm90_small``): chain block 0.81 us,
+# slice 0.25 us, fixed 1.6 us on H100.
 SPLIT_BLOCK_COST = 1.0
-SPLIT_MERGE_COST = 0.8
+SPLIT_MERGE_COST = 0.3
+SPLIT_FIXED_COST = (
+    2.0  # route comparison only (split_kmax ranks splits among themselves)
+)
 # Cluster / DSM-merge route (port of the Cake cluster variants, CAKE-682):
 # (kmax, cluster size) variants, SMs per GPC assumed for one-wave placement,
 # and the cost model (merged rank, padded slot) in the same block units.
@@ -120,6 +134,11 @@ CLUSTER_VARIANTS = (
 CLUSTER_GPC_SMS = 16
 CLUSTER_MERGE_COST = 0.3
 CLUSTER_PAD_COST = 0.15
+
+
+def _chain_blocks(kmax: int) -> int:
+    """Blocks on the critical chain of one CTA: two warpgroups walk the even and odd blocks (KMAX > 1)."""
+    return -(-int(kmax) // 2) if int(kmax) > 1 else int(kmax)
 
 
 def plan_meta(split: bool) -> int:
@@ -141,8 +160,8 @@ def split_kmax(counts: list[int], *, sms: Optional[int] = None) -> int:
     """KMAX of the split-KV variant for the per-query-block selection ``counts``.
 
     Variants whose item count fits one wave (when ``sms`` is given) and whose
-    plan fits the parameter bank are ranked by ``kmax * SPLIT_BLOCK_COST +
-    (max_nsplit - 1) * SPLIT_MERGE_COST``; the cheapest wins (largest kmax on
+    plan fits the parameter bank are ranked by ``chain_blocks(kmax) * SPLIT_BLOCK_COST
+    + (max_nsplit - 1) * SPLIT_MERGE_COST``; the cheapest wins (largest kmax on
     ties).  Raises when no variant fits.  Mirrors ``vsa_sm90_small.split_kmax``.
     """
     best = None
@@ -156,7 +175,10 @@ def split_kmax(counts: list[int], *, sms: Optional[int] = None) -> int:
             continue
         if sms is not None and items > SMALL_OCCUPANCY[kmax] * sms:
             continue
-        cost = kmax * SPLIT_BLOCK_COST + (max(nsplits) - 1) * SPLIT_MERGE_COST
+        cost = (
+            _chain_blocks(kmax) * SPLIT_BLOCK_COST
+            + (max(nsplits) - 1) * SPLIT_MERGE_COST
+        )
         if best is None or cost <= best[0]:
             best = (cost, kmax)
     if best is None:
@@ -165,18 +187,20 @@ def split_kmax(counts: list[int], *, sms: Optional[int] = None) -> int:
 
 
 def split_cost(counts: list[int], kmax: int) -> float:
-    """Modelled cost of the split-KV variant ``kmax`` (chain + merged slices of the fullest query block)."""
+    """Modelled cost of the split-KV variant ``kmax``: fixed workspace round trip, chain, merged slices of the fullest query block."""
     return (
-        kmax * SPLIT_BLOCK_COST
+        SPLIT_FIXED_COST
+        + _chain_blocks(kmax) * SPLIT_BLOCK_COST
         + (max(-(-c // kmax) for c in counts) - 1) * SPLIT_MERGE_COST
     )
 
 
 def cluster_cost(counts: list[int], kmax: int, csize: int) -> float:
-    """Modelled cost of cluster variant ``(kmax, csize)``: chain, DSM-merged ranks and mean padded slots."""
+    """Modelled cost of cluster variant ``(kmax, csize)``: chain over the blocks one CTA actually holds, DSM-merged ranks, mean padded slots."""
     pad = kmax * csize - sum(counts) / len(counts)
+    per_cta = min(int(kmax), -(-max(counts) // int(csize)))
     return (
-        kmax * SPLIT_BLOCK_COST
+        _chain_blocks(per_cta) * SPLIT_BLOCK_COST
         + (csize - 1) * CLUSTER_MERGE_COST
         + pad * CLUSTER_PAD_COST
     )
@@ -703,6 +727,16 @@ def plan_vsa_sm90(
     lists, makespan = _assign_tiles(costs, lens, sms)
     g = len(lists)
     stride = max(len(lst) for lst in lists)
+    if g > HDR_CTAS:
+        raise ValueError(
+            f"persistent grid {g} exceeds the {HDR_CTAS}-CTA by-value header"
+        )
+    hdr = np.zeros((HDR_HALFWORDS,), dtype=np.int16)
+    for c, lst in enumerate(lists):
+        t = lst[0]
+        n_hdr = min(HDR_ISSUE, lens[t])
+        hdr[c * HDR_WORDS : c * HDR_WORDS + 5] = (*infos[t], n_hdr)
+        hdr[c * HDR_WORDS + 5 : c * HDR_WORDS + 5 + 2 * n_hdr] = seqs[t][: 2 * n_hdr]
     meta = np.zeros((g * stride, META_WORDS), dtype=np.uint32)
     for c, lst in enumerate(lists):
         for i, t in enumerate(lst):
@@ -724,6 +758,7 @@ def plan_vsa_sm90(
         meta[c * stride, META_NTILES] = len(lst)
     return {
         "meta": torch.from_numpy(meta.view(np.int32).copy()),
+        "hdr": torch.from_numpy(hdr),
         "tile_stride": stride,
         "mode": mode,
         "makespan": makespan,
@@ -913,6 +948,8 @@ class CakeVsaSm90Plan:
             if non_blocking:
                 host_meta = host_meta.pin_memory()
             self.meta = host_meta.to(self.device, non_blocking=non_blocking)
+            # By-value kernel parameter: stays on the host.
+            self.hdr = plan["hdr"].contiguous()
             # The kernel's debug/timeline buffers are inert in the exported
             # build; they only have to exist on the device.
             self.dbg = torch.zeros((64,), dtype=torch.int32, device=self.device)
@@ -1050,6 +1087,7 @@ class CakeVsaSm90Plan:
                         aligned_v,
                         target,
                         self.meta,
+                        self.hdr,
                         int(self.tile_stride),
                         int(self.qo_len),
                         int(self.kv_len),
