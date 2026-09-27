@@ -44,6 +44,7 @@ from cutlass.cute.arch import griddepcontrol_launch_dependents, griddepcontrol_w
 from cutlass.pipeline import PipelineTmaUmma, PipelineUmmaAsync
 from cutlass import Float32, Int32
 from cutlass._mlir.dialects import llvm
+from .dense_blockscaled_gemm_sm100 import _per_token_fragment_plan
 from .dense_blockscaled_gemm_sm100_common import _Sm100BlockScaledGemmCommon
 
 from cutlass.cutlass_dsl import (
@@ -215,7 +216,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         split_k_slices: int,
     ) -> bool:
         """Return whether the MXFP8 shape satisfies this kernel's K tiling."""
-        if ab_dtype.width != 8:
+        if ab_dtype.width not in (4, 8):
             return False
         tile_k = (cls.MMA_INST_BITS_K * cls.MMA_INST_TILE_K) // ab_dtype.width
         return (
@@ -230,6 +231,7 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         mma_tiler_mn: Tuple[int, int],
         split_k_slices: int,
         enable_pdl: bool = True,
+        per_token_alpha: Optional[str] = None,
     ):
         """Configure one low-M split-K tactic.
 
@@ -239,12 +241,19 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 (128, 16), and (128, 32).
             split_k_slices: Physical cluster-K size; must be 2 or 4.
             enable_pdl: Whether to enable programmatic dependent launch.
+            per_token_alpha: ``None`` for a scalar alpha, else the C extent
+                ``alpha`` holds one scale per coordinate of (``"m"`` per row,
+                ``"n"`` per column; the swap_ab callers of this kernel use
+                ``"n"``). The scale is applied by the owner CTA after the
+                FP32 cluster reduction, so the sum order is unchanged.
         """
 
+        self.per_token_alpha = per_token_alpha
         self.acc_dtype = cutlass.Float32
-        if sf_vec_size != 32:
+        if sf_vec_size not in (16, 32):
             raise ValueError(
-                f"MXFP8 split-K requires sf_vec_size=32, got {sf_vec_size}"
+                f"block-scaled split-K requires sf_vec_size=16 (NVFP4) or 32 "
+                f"(MXFP8), got {sf_vec_size}"
             )
         self.sf_vec_size = sf_vec_size
         if mma_tiler_mn not in self.SUPPORTED_MMA_TILER_MN:
@@ -654,7 +663,12 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         # Keep alpha in FP32 for precision: the accumulator is in FP32 and alpha
         # may be a very small scaling factor. Converting to c_dtype (e.g., FP16)
         # before multiplication could cause overflow when acc values are large.
-        alpha_value = alpha[0].to(cutlass.Float32)
+        if cutlass.const_expr(self.per_token_alpha is not None):
+            # Per-token mode: the scale is folded per subtile (or per tile)
+            # in the epilogue; the scalar multiply below must be the identity.
+            alpha_value = cutlass.Float32(1.0)
+        else:
+            alpha_value = alpha[0].to(cutlass.Float32)
 
         warp_idx = cute.arch.warp_idx()
         warp_idx = cute.arch.make_warp_uniform(warp_idx)
@@ -825,6 +839,17 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
         tCgSFB = thr_mma_sfb.partition_B(gSFB_nkl)
         # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
         tCgC = thr_mma.partition_C(gC_mnl)
+
+        if cutlass.const_expr(self.per_token_alpha is not None):
+            # Identity tensor over C, partitioned like tCgC, so the epilogue can
+            # recover each accumulator element's (m, n) coordinate.
+            cC_mnl = cute.local_tile(
+                cute.make_identity_tensor(mC_mnl.shape),
+                cute.slice_(self.mma_tiler, (None, None, 0)),
+                (None, None, None),
+            )
+            # (MMA, MMA_M, MMA_N, RestM, RestN, RestL)
+            tCcC = thr_mma.partition_C(cC_mnl)
 
         #
         # Partition global/shared tensor for TMA load A/B
@@ -1327,6 +1352,39 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                 )
             )
 
+            if cutlass.const_expr(self.per_token_alpha is not None):
+                # Partitioned like tCgC, so this mirrors the t2r register
+                # fragment element for element.
+                # (T2R, T2R_M, T2R_N, EPI_M, EPI_N, RestM, RestN, RestL)
+                tTR_cC_partitioned = tiled_copy_t2r.get_slice(epi_tidx).partition_D(
+                    cute.flat_divide(
+                        tCcC[((None, None), 0, 0, None, None, None)], epi_tile
+                    )
+                )
+                alpha_extent = (
+                    mC_mnl.shape[0]
+                    if cutlass.const_expr(self.per_token_alpha == "m")
+                    else mC_mnl.shape[1]
+                )
+                token_axis = 0 if self.per_token_alpha == "m" else 1
+                # Static plan: which fragment elements share a token, and
+                # whether the token is constant across the epilogue subtiles.
+                _frag_layout = tTR_cC_partitioned.layout
+                _frag_shape = _frag_layout.shape
+                _frag_stride = _frag_layout.stride
+                alpha_plan = _per_token_fragment_plan(
+                    tuple(_frag_shape[0:3]), tuple(_frag_stride[0:3]), token_axis
+                )
+                _subtile_plan = _per_token_fragment_plan(
+                    tuple(_frag_shape[3:5]), tuple(_frag_stride[3:5]), token_axis
+                )
+                alpha_token_per_tile = (
+                    alpha_plan is not None
+                    and len(alpha_plan[1]) == 1
+                    and _subtile_plan is not None
+                    and _subtile_plan[1] == [0]
+                )
+
             tTR_rC = cute.make_rmem_tensor(tTR_rAcc.shape, self.c_dtype)
             tiled_copy_r2s, tRS_rC, tRS_sC = self.epilog_smem_copy_and_partition(
                 tiled_copy_t2r, tTR_rC, epi_tidx, sC
@@ -1382,6 +1440,27 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                         0,
                     )
                 ]
+
+                if cutlass.const_expr(self.per_token_alpha is not None):
+                    # (T2R, T2R_M, T2R_N, (EPI_M, EPI_N))
+                    tTR_cC = tTR_cC_partitioned[
+                        (
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                            *mma_tile_coord_mnl,
+                        )
+                    ]
+                    tTR_cC = cute.group_modes(tTR_cC, 3, cute.rank(tTR_cC))
+                    if cutlass.const_expr(alpha_token_per_tile):
+                        # Every element this thread holds in this tile has
+                        # the same token: one clamped load per tile, applied
+                        # through the scalar alpha multiply below.
+                        tile_token = tTR_cC[(0, 0, 0, 0)][token_axis]
+                        tile_token = cutlass.min(tile_token, alpha_extent - 1)
+                        alpha_value = alpha[tile_token].to(cutlass.Float32)
 
                 if cutlass.const_expr(self.overlapping_accum):
                     acc_stage_index = acc_consumer_state.phase
@@ -1495,6 +1574,40 @@ class Sm100BlockScaledSplitKGemmKernel(_Sm100BlockScaledGemmCommon):
                                     tRS_rAcc[value_idx]
                                     + reduce_mailbox[peer_thread_base + value_idx]
                                 )
+
+                        #
+                        # Fold the per-token scale into the reduced FP32
+                        # accumulators (tRS_rAcc is a retiled view of tTR_rAcc).
+                        #
+                        if cutlass.const_expr(
+                            self.per_token_alpha is not None
+                            and not alpha_token_per_tile
+                        ):
+                            tTR_cC_subtile = tTR_cC[
+                                (None, None, None, real_subtile_idx)
+                            ]
+                            if cutlass.const_expr(alpha_plan is not None):
+                                # Static token offsets: one clamped load per
+                                # distinct token per subtile.
+                                offsets, distinct = alpha_plan
+                                token0 = tTR_cC_subtile[0][token_axis]
+                                loaded = {}
+                                for d in distinct:
+                                    tok = cutlass.min(token0 + d, alpha_extent - 1)
+                                    loaded[d] = alpha[tok].to(cutlass.Float32)
+                                for i in cutlass.range_constexpr(len(offsets)):
+                                    tTR_rAcc[i] = tTR_rAcc[i] * loaded[offsets[i]]
+                            else:
+                                for i in cutlass.range_constexpr(
+                                    cute.size(tTR_cC_subtile)
+                                ):
+                                    coord = tTR_cC_subtile[i]
+                                    token = cutlass.min(
+                                        coord[token_axis], alpha_extent - 1
+                                    )
+                                    tTR_rAcc[i] = tTR_rAcc[i] * alpha[token].to(
+                                        cutlass.Float32
+                                    )
 
                         # Apply alpha and cast only after the FP32 cluster sum.
                         acc_vec = tRS_rAcc.load()
