@@ -110,6 +110,10 @@ DEC_W_BYTES = 128 * BLOCK_K  # one 128-row weight tile x 256 K per stage
 DEC_SF_BYTES = 2048  # 2 K-sets x 512 B per operand
 DEC_SMEM_CAP = 230400  # decode SMEM pool budget
 DEC_MAX_STAGES = 4
+DEC_XB_MAX_STAGES = 8  # BF16 ring depth cap of the decoupled fused decode variant
+DEC_QUANT_WARPS = (
+    8  # quantizing warps of the fused decode instance (narrow-unit divisibility rule)
+)
 DEC_RES_SLOTS = 4  # work items per CTA the resident decode instance can hold
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 ARCHES = tuple(sorted(DECODE_TABLE))
@@ -277,15 +281,30 @@ def quant_units(M: int, k_blocks: int) -> int:
     return 1
 
 
-def decode_module_stages(tok: int, stages: int, fused: bool, resident: bool) -> int:
-    """Pipeline depth of the physical decode instance after its SMEM clamp (the Cake ``decode_ir`` rule)."""
+def decode_module_stages(
+    tok: int, stages: int, fused: bool, resident: bool, xb_stages: int = 0
+) -> int:
+    """Pipeline depth of the physical decode instance after its SMEM clamp (the Cake ``decode_ir`` rule).
+
+    ``xb_stages`` > 0 is the decoupled fused variant: the BF16 token tiles stream through their own
+    ``xb_stages``-deep ring instead of sharing the W / X stage."""
     tok_rows = max(tok, 32)
     xb_bytes = tok * 512 if (fused and not resident) else 0
+    xb_ring = bool(fused and not resident and xb_stages > 0)
     stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
-    stage_bytes = DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + xb_bytes
+    stage_bytes = (
+        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    )
+    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
     res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
     epi_bytes = min(32, tok) * 128 * 4
-    return max(1, min(stages, (DEC_SMEM_CAP - epi_bytes - res_bytes) // stage_bytes))
+    return max(
+        1,
+        min(
+            stages,
+            (DEC_SMEM_CAP - epi_bytes - res_bytes - xb_ring_bytes) // stage_bytes,
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -304,6 +323,12 @@ class DecodeConfig:
     total_work: int
     grid: int
     tok_per_cta: int
+    xb_stages: int = (
+        0  # decoupled BF16 ring depth (fused, non-resident); 0 = coupled staging
+    )
+    qlanes: int = (
+        16  # lanes per quantization unit (16 = half-warp units, 8 / 4 = narrow units)
+    )
 
     @property
     def tok_rows(self) -> int:
@@ -312,7 +337,12 @@ class DecodeConfig:
     @property
     def kernel_key(self) -> str:
         return decode_kernel_key(
-            self.tok, self.module_stages, self.fused, self.resident
+            self.tok,
+            self.module_stages,
+            self.fused,
+            self.resident,
+            self.xb_stages,
+            self.qlanes,
         )
 
 
@@ -346,11 +376,44 @@ def decode_config(
     persist = bool(entry.get("persist", True))
     split = max(1, min(split, int(num_k_iters)))
     tok_rows = max(tok, 32)
-    stage_bytes = (
-        DEC_W_BYTES + tok_rows * BLOCK_K + DEC_SF_BYTES + (tok * 512 if fused else 0)
-    )
     epi_bytes = min(32, tok) * 128 * 4
-    stages = max(2, min(DEC_MAX_STAGES, (DEC_SMEM_CAP - epi_bytes) // stage_bytes))
+    xb_bytes = tok * 512
+    stage_bytes_ring = DEC_W_BYTES + tok_rows * BLOCK_K + DEC_SF_BYTES
+    # Fused variant: the BF16 token tiles either share the W / X stage (coupled, ``xb_stages`` 0) or stream through
+    # their own ring (table key ``xb_stages`` = "auto" | N): "auto" picks the (stages, ring) split of the SMEM budget
+    # with the largest smaller depth (the W-stage round trip and the activation fetch are both depth-bound).
+    xb_mode = entry.get("xb_stages", 0) if fused else 0
+    xb_stages = 0
+    stages = 0
+    if xb_mode not in (0, "0", "", "none", None):
+        if xb_mode == "auto":
+            best = None
+            for cand_stages in range(2, DEC_MAX_STAGES + 1):
+                cand_xb = min(
+                    DEC_XB_MAX_STAGES,
+                    (DEC_SMEM_CAP - epi_bytes - cand_stages * stage_bytes_ring)
+                    // xb_bytes,
+                )
+                if cand_xb < 1:
+                    continue
+                score = (min(cand_stages, cand_xb), cand_stages)
+                if best is None or score > best[0]:
+                    best = (score, cand_stages, cand_xb)
+            if best is not None:
+                _, stages, xb_stages = best
+        else:
+            xb_stages = int(xb_mode)
+            stages = max(
+                2,
+                min(
+                    DEC_MAX_STAGES,
+                    (DEC_SMEM_CAP - epi_bytes - xb_stages * xb_bytes)
+                    // stage_bytes_ring,
+                ),
+            )
+    if xb_stages == 0:
+        stage_bytes = stage_bytes_ring + (xb_bytes if fused else 0)
+        stages = max(2, min(DEC_MAX_STAGES, (DEC_SMEM_CAP - epi_bytes) // stage_bytes))
     m_tiles = -(-M // tok)
     tiles = int(n_tiles128) * m_tiles
     total_work = tiles * split
@@ -363,6 +426,13 @@ def decode_config(
         and tok <= 64
         and -(-total_work // grid) <= DEC_RES_SLOTS
     )
+    if resident:
+        xb_stages = 0  # resident tiles are fetched once; no ring
+    # Narrow quantization units (table key ``qlanes`` 4 / 8): every lane group must own a unit each stage, so the
+    # width is doubled until the units divide evenly over the quantizing warps.
+    qlanes = int(entry.get("qlanes", 16)) if fused and not resident else 16
+    while qlanes < 16 and (2 * tok) % (DEC_QUANT_WARPS * (32 // qlanes)):
+        qlanes *= 2
     return DecodeConfig(
         tok=tok,
         split=split,
@@ -370,12 +440,14 @@ def decode_config(
         resident=resident,
         persist=persist,
         stages=stages,
-        module_stages=decode_module_stages(tok, stages, fused, resident),
+        module_stages=decode_module_stages(tok, stages, fused, resident, xb_stages),
         m_tiles=m_tiles,
         tiles=tiles,
         total_work=total_work,
         grid=grid,
         tok_per_cta=-(-tok // split),
+        xb_stages=xb_stages,
+        qlanes=qlanes,
     )
 
 
