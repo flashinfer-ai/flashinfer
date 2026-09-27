@@ -3,7 +3,7 @@
   "arches": {
     "sm_100a": {
       "programs": {
-        "deepgemm_sparse_mqa_sm100a_0ae1f67e9503793f6144_kernel": {
+        "deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd_kernel": {
           "arg_plan": [
             [
               "buffer",
@@ -66,19 +66,96 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "d0b6d8e901194f6e5c028b7230a75830e3de415da7525412a0454dd85337da54",
+          "closure_sha256": "042e53f2d35832d43809fabe398ffbb65633f55a3ad7a19b07f441c094ccdf67",
           "compile_flags": [],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm100a_0ae1f67e9503793f6144",
+          "name": "deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_0ae1f67e9503793f6144_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_0ae1f67e9503793f6144_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_sparse_mqa_sm100a_5bec1476c1166b5e80d5_kernel": {
+        "deepgemm_sparse_mqa_sm100a_57859e3bc96b6e4a8d86_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "Q"
+            ],
+            [
+              "tma_buffer",
+              "SF_Q"
+            ],
+            [
+              "tma_buffer",
+              "Weights"
+            ],
+            [
+              "tma_buffer",
+              "KV_TMA"
+            ],
+            [
+              "tma_buffer",
+              "SF_KV_TMA"
+            ],
+            [
+              "buffer",
+              "KV"
+            ],
+            [
+              "buffer",
+              "SF_KV"
+            ],
+            [
+              "buffer",
+              "Metadata"
+            ],
+            [
+              "buffer",
+              "Logits"
+            ],
+            [
+              "parameter",
+              "logits_stride"
+            ],
+            [
+              "parameter",
+              "kv_page_stride_bytes"
+            ],
+            [
+              "parameter",
+              "num_sms"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "7167e2fb3d4fae3b609249a2caa48e88916119074400ba1141c36acae9314f16",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "kind": "module",
+          "name": "deepgemm_sparse_mqa_sm100a_57859e3bc96b6e4a8d86",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_57859e3bc96b6e4a8d86_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_57859e3bc96b6e4a8d86_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_sparse_mqa_sm100a_5d5f7f3ebc576d5b2984_kernel": {
           "arg_plan": [
             [
               "buffer",
@@ -141,96 +218,19 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "91b88bf59fc186dd221683a459007af8867228f36f14f85052990d7dde996146",
+          "closure_sha256": "5c5b2efcc9b3ddd82da646ce30e9b78d0a4b47c106908de918066a5dc09d7d92",
           "compile_flags": [],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm100a_5bec1476c1166b5e80d5",
+          "name": "deepgemm_sparse_mqa_sm100a_5d5f7f3ebc576d5b2984",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_5bec1476c1166b5e80d5_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_5bec1476c1166b5e80d5_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_5d5f7f3ebc576d5b2984_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_5d5f7f3ebc576d5b2984_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_sparse_mqa_sm100a_63720497f48cecbbf301_kernel": {
-          "arg_plan": [
-            [
-              "tma_buffer",
-              "Q"
-            ],
-            [
-              "tma_buffer",
-              "SF_Q"
-            ],
-            [
-              "tma_buffer",
-              "Weights"
-            ],
-            [
-              "tma_buffer",
-              "KV_TMA"
-            ],
-            [
-              "tma_buffer",
-              "SF_KV_TMA"
-            ],
-            [
-              "buffer",
-              "KV"
-            ],
-            [
-              "buffer",
-              "SF_KV"
-            ],
-            [
-              "buffer",
-              "Metadata"
-            ],
-            [
-              "buffer",
-              "Logits"
-            ],
-            [
-              "parameter",
-              "logits_stride"
-            ],
-            [
-              "parameter",
-              "kv_page_stride_bytes"
-            ],
-            [
-              "parameter",
-              "num_sms"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "closure_sha256": "a1f7e257f0a45b3f04b06e3204d99b8d2fa428d6e0a1fb5aab0dc09ebfb243c1",
-          "compile_flags": [
-            "--use_fast_math"
-          ],
-          "ffi_entry": "run",
-          "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm100a_63720497f48cecbbf301",
-          "role": "kernel",
-          "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_63720497f48cecbbf301_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_63720497f48cecbbf301_binding.cu"
-          ],
-          "tma_workspace_bytes": 0
-        },
-        "deepgemm_sparse_mqa_sm100a_c5468096b54e02da3b54_kernel": {
+        "deepgemm_sparse_mqa_sm100a_5f1dae0267bef8433636_kernel": {
           "arg_plan": [
             [
               "buffer",
@@ -293,19 +293,19 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "c84831a2513a2082ad0a0799b62d0aa79b7a2efe7b2cc8c76d12b91ab04bbe1b",
+          "closure_sha256": "9bec1a2a61846b4bb4ef38906bc81b8cd4615c65ff3ab0e53a60558290310d84",
           "compile_flags": [],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm100a_c5468096b54e02da3b54",
+          "name": "deepgemm_sparse_mqa_sm100a_5f1dae0267bef8433636",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_c5468096b54e02da3b54_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_c5468096b54e02da3b54_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_5f1dae0267bef8433636_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_5f1dae0267bef8433636_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_sparse_mqa_sm100a_ced4ed1472418a5aaa2d_kernel": {
+        "deepgemm_sparse_mqa_sm100a_91b63aa641152eef25e8_kernel": {
           "arg_plan": [
             [
               "buffer",
@@ -368,19 +368,19 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "c6e746f97ee3f0df8ecd01bd8f6184965c6dd8b41cf652c0174f79fdd7ca0493",
+          "closure_sha256": "a458262fa0e78e3dad868e16b745f474fbc906ba394f4b91bd2b63d19996f344",
           "compile_flags": [],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm100a_ced4ed1472418a5aaa2d",
+          "name": "deepgemm_sparse_mqa_sm100a_91b63aa641152eef25e8",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_ced4ed1472418a5aaa2d_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_ced4ed1472418a5aaa2d_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_91b63aa641152eef25e8_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_91b63aa641152eef25e8_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_sparse_mqa_sm100a_d1ca7972db7b30ba6c18_kernel": {
+        "deepgemm_sparse_mqa_sm100a_b5fb5efedbfb2fac63b4_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -443,21 +443,21 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "48021086ae28a4efc415840d08b651894255a08bc4a6779fb1d755b011864f63",
+          "closure_sha256": "df1e65f3961307b278adf337e05d52cd8286a98835c8bdb562c871a4e2e375df",
           "compile_flags": [
             "--use_fast_math"
           ],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm100a_d1ca7972db7b30ba6c18",
+          "name": "deepgemm_sparse_mqa_sm100a_b5fb5efedbfb2fac63b4",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_d1ca7972db7b30ba6c18_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_d1ca7972db7b30ba6c18_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_b5fb5efedbfb2fac63b4_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_b5fb5efedbfb2fac63b4_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_sparse_mqa_sm100a_d79634e6a92c7c3b1ca3_kernel": {
+        "deepgemm_sparse_mqa_sm100a_e65471f3e2099f743ab7_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -520,21 +520,21 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "d3e51b74b10e11094cd36c9184e5bcd956423594659b79de2ee6187c9ce9e13d",
+          "closure_sha256": "1880b8c07687cfbf430f02c9186e4f63b3c27de5cb5b24685f10dc775c303855",
           "compile_flags": [
             "--use_fast_math"
           ],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm100a_d79634e6a92c7c3b1ca3",
+          "name": "deepgemm_sparse_mqa_sm100a_e65471f3e2099f743ab7",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_d79634e6a92c7c3b1ca3_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_d79634e6a92c7c3b1ca3_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_e65471f3e2099f743ab7_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_e65471f3e2099f743ab7_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_sparse_mqa_sm100a_e75bc4a968a1f3c7e773_kernel": {
+        "deepgemm_sparse_mqa_sm100a_efe1d02034705676f9ee_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -597,17 +597,17 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "0981e908339186b40f5b59a49ad368f5bd2ddc5323cebe91ea4c3c190960c528",
+          "closure_sha256": "57edd006d2aaa7652c79b7985968ec7ab4d545447a48be001b60b6c1c2aa0ee9",
           "compile_flags": [
             "--use_fast_math"
           ],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm100a_e75bc4a968a1f3c7e773",
+          "name": "deepgemm_sparse_mqa_sm100a_efe1d02034705676f9ee",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_e75bc4a968a1f3c7e773_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_e75bc4a968a1f3c7e773_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_efe1d02034705676f9ee_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_100a/deepgemm_sparse_mqa_sm100a_efe1d02034705676f9ee_binding.cu"
           ],
           "tma_workspace_bytes": 0
         }
@@ -618,11 +618,11 @@
           "stages": [
             {
               "name": "metadata",
-              "program": "deepgemm_sparse_mqa_sm100a_ced4ed1472418a5aaa2d_kernel"
+              "program": "deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd_kernel"
             },
             {
               "name": "logits",
-              "program": "deepgemm_sparse_mqa_sm100a_e75bc4a968a1f3c7e773_kernel"
+              "program": "deepgemm_sparse_mqa_sm100a_e65471f3e2099f743ab7_kernel"
             }
           ]
         },
@@ -631,11 +631,11 @@
           "stages": [
             {
               "name": "metadata",
-              "program": "deepgemm_sparse_mqa_sm100a_5bec1476c1166b5e80d5_kernel"
+              "program": "deepgemm_sparse_mqa_sm100a_91b63aa641152eef25e8_kernel"
             },
             {
               "name": "logits",
-              "program": "deepgemm_sparse_mqa_sm100a_d79634e6a92c7c3b1ca3_kernel"
+              "program": "deepgemm_sparse_mqa_sm100a_b5fb5efedbfb2fac63b4_kernel"
             }
           ]
         },
@@ -644,11 +644,11 @@
           "stages": [
             {
               "name": "metadata",
-              "program": "deepgemm_sparse_mqa_sm100a_0ae1f67e9503793f6144_kernel"
+              "program": "deepgemm_sparse_mqa_sm100a_5d5f7f3ebc576d5b2984_kernel"
             },
             {
               "name": "logits",
-              "program": "deepgemm_sparse_mqa_sm100a_d1ca7972db7b30ba6c18_kernel"
+              "program": "deepgemm_sparse_mqa_sm100a_efe1d02034705676f9ee_kernel"
             }
           ]
         },
@@ -657,11 +657,11 @@
           "stages": [
             {
               "name": "metadata",
-              "program": "deepgemm_sparse_mqa_sm100a_c5468096b54e02da3b54_kernel"
+              "program": "deepgemm_sparse_mqa_sm100a_5f1dae0267bef8433636_kernel"
             },
             {
               "name": "logits",
-              "program": "deepgemm_sparse_mqa_sm100a_63720497f48cecbbf301_kernel"
+              "program": "deepgemm_sparse_mqa_sm100a_57859e3bc96b6e4a8d86_kernel"
             }
           ]
         }
@@ -669,157 +669,7 @@
     },
     "sm_103a": {
       "programs": {
-        "deepgemm_sparse_mqa_sm103a_105fe0384c3c4fd92474_kernel": {
-          "arg_plan": [
-            [
-              "buffer",
-              "Starts"
-            ],
-            [
-              "buffer",
-              "Ends"
-            ],
-            [
-              "buffer",
-              "Context"
-            ],
-            [
-              "buffer",
-              "BlockTable"
-            ],
-            [
-              "buffer",
-              "Requests"
-            ],
-            [
-              "buffer",
-              "Sparse"
-            ],
-            [
-              "buffer",
-              "Metadata"
-            ],
-            [
-              "buffer",
-              "Workspace"
-            ],
-            [
-              "parameter",
-              "num_q_tokens"
-            ],
-            [
-              "parameter",
-              "num_kv_tokens"
-            ],
-            [
-              "parameter",
-              "block_table_stride"
-            ],
-            [
-              "parameter",
-              "num_ctas"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "closure_sha256": "4ffd8407aeff8f8fb53f0737703410ce70ce58e32048810ed6d68dd9e4abe8c1",
-          "compile_flags": [],
-          "ffi_entry": "run",
-          "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm103a_105fe0384c3c4fd92474",
-          "role": "kernel",
-          "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_105fe0384c3c4fd92474_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_105fe0384c3c4fd92474_binding.cu"
-          ],
-          "tma_workspace_bytes": 0
-        },
-        "deepgemm_sparse_mqa_sm103a_1837d46468ad76d78da2_kernel": {
-          "arg_plan": [
-            [
-              "buffer",
-              "Starts"
-            ],
-            [
-              "buffer",
-              "Ends"
-            ],
-            [
-              "buffer",
-              "Context"
-            ],
-            [
-              "buffer",
-              "BlockTable"
-            ],
-            [
-              "buffer",
-              "Requests"
-            ],
-            [
-              "buffer",
-              "Sparse"
-            ],
-            [
-              "buffer",
-              "Metadata"
-            ],
-            [
-              "buffer",
-              "Workspace"
-            ],
-            [
-              "parameter",
-              "num_q_tokens"
-            ],
-            [
-              "parameter",
-              "num_kv_tokens"
-            ],
-            [
-              "parameter",
-              "block_table_stride"
-            ],
-            [
-              "parameter",
-              "num_ctas"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "closure_sha256": "8a28a509d56cf3a8d69f9dc1bd01c1dc95aa8aa405127cfd0c1010737ab9fe71",
-          "compile_flags": [],
-          "ffi_entry": "run",
-          "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm103a_1837d46468ad76d78da2",
-          "role": "kernel",
-          "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_1837d46468ad76d78da2_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_1837d46468ad76d78da2_binding.cu"
-          ],
-          "tma_workspace_bytes": 0
-        },
-        "deepgemm_sparse_mqa_sm103a_375bab2b859dc25d8f59_kernel": {
+        "deepgemm_sparse_mqa_sm103a_103d5aa1ea4d9e94cc6a_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -882,21 +732,21 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "6874462f3d6f6b99af97cf4a76e61061dc789ba485df70d14f839c1d45061da8",
+          "closure_sha256": "314822eb2dfb10e20e62f72c7743be81c4958a7b01a7b8b8d019935671aa066e",
           "compile_flags": [
             "--use_fast_math"
           ],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm103a_375bab2b859dc25d8f59",
+          "name": "deepgemm_sparse_mqa_sm103a_103d5aa1ea4d9e94cc6a",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_375bab2b859dc25d8f59_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_375bab2b859dc25d8f59_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_103d5aa1ea4d9e94cc6a_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_103d5aa1ea4d9e94cc6a_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_sparse_mqa_sm103a_4e59da89c2496f30ddf1_kernel": {
+        "deepgemm_sparse_mqa_sm103a_1617a2b463864b4f400c_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -959,21 +809,98 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "26796d33c8aaff988bfef4c9d4db8bab2f1b980a4515bd7ed6a4c956cbd514ef",
+          "closure_sha256": "bf9c9c05082de4fb43eb3729bf8e06d65b9da05cd4b749ba0990c781c529b039",
           "compile_flags": [
             "--use_fast_math"
           ],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm103a_4e59da89c2496f30ddf1",
+          "name": "deepgemm_sparse_mqa_sm103a_1617a2b463864b4f400c",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_4e59da89c2496f30ddf1_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_4e59da89c2496f30ddf1_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_1617a2b463864b4f400c_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_1617a2b463864b4f400c_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_sparse_mqa_sm103a_75c690f1840321309c64_kernel": {
+        "deepgemm_sparse_mqa_sm103a_213a6d8df9995661b1a2_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "Q"
+            ],
+            [
+              "tma_buffer",
+              "SF_Q"
+            ],
+            [
+              "tma_buffer",
+              "Weights"
+            ],
+            [
+              "tma_buffer",
+              "KV_TMA"
+            ],
+            [
+              "tma_buffer",
+              "SF_KV_TMA"
+            ],
+            [
+              "buffer",
+              "KV"
+            ],
+            [
+              "buffer",
+              "SF_KV"
+            ],
+            [
+              "buffer",
+              "Metadata"
+            ],
+            [
+              "buffer",
+              "Logits"
+            ],
+            [
+              "parameter",
+              "logits_stride"
+            ],
+            [
+              "parameter",
+              "kv_page_stride_bytes"
+            ],
+            [
+              "parameter",
+              "num_sms"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "405c036452429e913424be4773b955fee1d2409848c7875f7aaaa1a39901a686",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "kind": "module",
+          "name": "deepgemm_sparse_mqa_sm103a_213a6d8df9995661b1a2",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_213a6d8df9995661b1a2_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_213a6d8df9995661b1a2_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_sparse_mqa_sm103a_2f488cb6840763e5f975_kernel": {
           "arg_plan": [
             [
               "buffer",
@@ -1036,173 +963,19 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "357914002bc1882667949d75c4e89c00d51b81fd11abbcb64f5ca0e64d2aaf65",
+          "closure_sha256": "93a1518b5a51b44e12f74066e671bd280aebdf998d31f315d82356e8d6d6a8b4",
           "compile_flags": [],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm103a_75c690f1840321309c64",
+          "name": "deepgemm_sparse_mqa_sm103a_2f488cb6840763e5f975",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_75c690f1840321309c64_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_75c690f1840321309c64_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_2f488cb6840763e5f975_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_2f488cb6840763e5f975_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_sparse_mqa_sm103a_a72d892c1d9eade98123_kernel": {
-          "arg_plan": [
-            [
-              "tma_buffer",
-              "Q"
-            ],
-            [
-              "tma_buffer",
-              "SF_Q"
-            ],
-            [
-              "tma_buffer",
-              "Weights"
-            ],
-            [
-              "tma_buffer",
-              "KV_TMA"
-            ],
-            [
-              "tma_buffer",
-              "SF_KV_TMA"
-            ],
-            [
-              "buffer",
-              "KV"
-            ],
-            [
-              "buffer",
-              "SF_KV"
-            ],
-            [
-              "buffer",
-              "Metadata"
-            ],
-            [
-              "buffer",
-              "Logits"
-            ],
-            [
-              "parameter",
-              "logits_stride"
-            ],
-            [
-              "parameter",
-              "kv_page_stride_bytes"
-            ],
-            [
-              "parameter",
-              "num_sms"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "closure_sha256": "a97839d372a4f0f95e8a658555d3ca48e540b5673a2f9a50d3e03b5263e58115",
-          "compile_flags": [
-            "--use_fast_math"
-          ],
-          "ffi_entry": "run",
-          "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm103a_a72d892c1d9eade98123",
-          "role": "kernel",
-          "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_a72d892c1d9eade98123_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_a72d892c1d9eade98123_binding.cu"
-          ],
-          "tma_workspace_bytes": 0
-        },
-        "deepgemm_sparse_mqa_sm103a_b388797e0542e4c68d40_kernel": {
-          "arg_plan": [
-            [
-              "tma_buffer",
-              "Q"
-            ],
-            [
-              "tma_buffer",
-              "SF_Q"
-            ],
-            [
-              "tma_buffer",
-              "Weights"
-            ],
-            [
-              "tma_buffer",
-              "KV_TMA"
-            ],
-            [
-              "tma_buffer",
-              "SF_KV_TMA"
-            ],
-            [
-              "buffer",
-              "KV"
-            ],
-            [
-              "buffer",
-              "SF_KV"
-            ],
-            [
-              "buffer",
-              "Metadata"
-            ],
-            [
-              "buffer",
-              "Logits"
-            ],
-            [
-              "parameter",
-              "logits_stride"
-            ],
-            [
-              "parameter",
-              "kv_page_stride_bytes"
-            ],
-            [
-              "parameter",
-              "num_sms"
-            ],
-            [
-              "grid",
-              "grid_x"
-            ],
-            [
-              "grid",
-              "grid_y"
-            ],
-            [
-              "grid",
-              "grid_z"
-            ]
-          ],
-          "closure_sha256": "430c94da441cac8a2b22e2c9f9a040671e5e1d22317cfa8b10fa99594b173059",
-          "compile_flags": [
-            "--use_fast_math"
-          ],
-          "ffi_entry": "run",
-          "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm103a_b388797e0542e4c68d40",
-          "role": "kernel",
-          "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_b388797e0542e4c68d40_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_b388797e0542e4c68d40_binding.cu"
-          ],
-          "tma_workspace_bytes": 0
-        },
-        "deepgemm_sparse_mqa_sm103a_ef951e376040de9873f7_kernel": {
+        "deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8_kernel": {
           "arg_plan": [
             [
               "buffer",
@@ -1265,15 +1038,242 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "195873e60c6fce3d1c5b6872f235ae7113dba2cd94431252792dcb2669c3c7c5",
+          "closure_sha256": "dda3dd5a174c13f69c1550c018a85172a4a8388d96a1a1f909bf957fa8944b70",
           "compile_flags": [],
           "ffi_entry": "run",
           "kind": "module",
-          "name": "deepgemm_sparse_mqa_sm103a_ef951e376040de9873f7",
+          "name": "deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_ef951e376040de9873f7_kernel.cu",
-            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_ef951e376040de9873f7_binding.cu"
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_sparse_mqa_sm103a_b776e54c011b92206445_kernel": {
+          "arg_plan": [
+            [
+              "buffer",
+              "Starts"
+            ],
+            [
+              "buffer",
+              "Ends"
+            ],
+            [
+              "buffer",
+              "Context"
+            ],
+            [
+              "buffer",
+              "BlockTable"
+            ],
+            [
+              "buffer",
+              "Requests"
+            ],
+            [
+              "buffer",
+              "Sparse"
+            ],
+            [
+              "buffer",
+              "Metadata"
+            ],
+            [
+              "buffer",
+              "Workspace"
+            ],
+            [
+              "parameter",
+              "num_q_tokens"
+            ],
+            [
+              "parameter",
+              "num_kv_tokens"
+            ],
+            [
+              "parameter",
+              "block_table_stride"
+            ],
+            [
+              "parameter",
+              "num_ctas"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "61b69e1d1917d44ebd8180968dd7b03871fdd55cfd2a70a57ca95d41eed4e9dd",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "kind": "module",
+          "name": "deepgemm_sparse_mqa_sm103a_b776e54c011b92206445",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_b776e54c011b92206445_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_b776e54c011b92206445_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_sparse_mqa_sm103a_bc108bb71198ceb41d19_kernel": {
+          "arg_plan": [
+            [
+              "tma_buffer",
+              "Q"
+            ],
+            [
+              "tma_buffer",
+              "SF_Q"
+            ],
+            [
+              "tma_buffer",
+              "Weights"
+            ],
+            [
+              "tma_buffer",
+              "KV_TMA"
+            ],
+            [
+              "tma_buffer",
+              "SF_KV_TMA"
+            ],
+            [
+              "buffer",
+              "KV"
+            ],
+            [
+              "buffer",
+              "SF_KV"
+            ],
+            [
+              "buffer",
+              "Metadata"
+            ],
+            [
+              "buffer",
+              "Logits"
+            ],
+            [
+              "parameter",
+              "logits_stride"
+            ],
+            [
+              "parameter",
+              "kv_page_stride_bytes"
+            ],
+            [
+              "parameter",
+              "num_sms"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "2400a6b277304d807313125e2a0006edd7fe3f54d9ee042656e4269cd5d9b3c5",
+          "compile_flags": [
+            "--use_fast_math"
+          ],
+          "ffi_entry": "run",
+          "kind": "module",
+          "name": "deepgemm_sparse_mqa_sm103a_bc108bb71198ceb41d19",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_bc108bb71198ceb41d19_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_bc108bb71198ceb41d19_binding.cu"
+          ],
+          "tma_workspace_bytes": 0
+        },
+        "deepgemm_sparse_mqa_sm103a_d0124af71399c7134714_kernel": {
+          "arg_plan": [
+            [
+              "buffer",
+              "Starts"
+            ],
+            [
+              "buffer",
+              "Ends"
+            ],
+            [
+              "buffer",
+              "Context"
+            ],
+            [
+              "buffer",
+              "BlockTable"
+            ],
+            [
+              "buffer",
+              "Requests"
+            ],
+            [
+              "buffer",
+              "Sparse"
+            ],
+            [
+              "buffer",
+              "Metadata"
+            ],
+            [
+              "buffer",
+              "Workspace"
+            ],
+            [
+              "parameter",
+              "num_q_tokens"
+            ],
+            [
+              "parameter",
+              "num_kv_tokens"
+            ],
+            [
+              "parameter",
+              "block_table_stride"
+            ],
+            [
+              "parameter",
+              "num_ctas"
+            ],
+            [
+              "grid",
+              "grid_x"
+            ],
+            [
+              "grid",
+              "grid_y"
+            ],
+            [
+              "grid",
+              "grid_z"
+            ]
+          ],
+          "closure_sha256": "d3c7606998e11f4cd1931b03f62eb9c0229c029c7bee4be39559541e8396f489",
+          "compile_flags": [],
+          "ffi_entry": "run",
+          "kind": "module",
+          "name": "deepgemm_sparse_mqa_sm103a_d0124af71399c7134714",
+          "role": "kernel",
+          "sources": [
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_d0124af71399c7134714_kernel.cu",
+            "csrc/experimental/deepgemm_sparse_mqa/generated/sm_103a/deepgemm_sparse_mqa_sm103a_d0124af71399c7134714_binding.cu"
           ],
           "tma_workspace_bytes": 0
         }
@@ -1284,11 +1284,11 @@
           "stages": [
             {
               "name": "metadata",
-              "program": "deepgemm_sparse_mqa_sm103a_75c690f1840321309c64_kernel"
+              "program": "deepgemm_sparse_mqa_sm103a_2f488cb6840763e5f975_kernel"
             },
             {
               "name": "logits",
-              "program": "deepgemm_sparse_mqa_sm103a_b388797e0542e4c68d40_kernel"
+              "program": "deepgemm_sparse_mqa_sm103a_213a6d8df9995661b1a2_kernel"
             }
           ]
         },
@@ -1297,11 +1297,11 @@
           "stages": [
             {
               "name": "metadata",
-              "program": "deepgemm_sparse_mqa_sm103a_ef951e376040de9873f7_kernel"
+              "program": "deepgemm_sparse_mqa_sm103a_b776e54c011b92206445_kernel"
             },
             {
               "name": "logits",
-              "program": "deepgemm_sparse_mqa_sm103a_4e59da89c2496f30ddf1_kernel"
+              "program": "deepgemm_sparse_mqa_sm103a_bc108bb71198ceb41d19_kernel"
             }
           ]
         },
@@ -1310,11 +1310,11 @@
           "stages": [
             {
               "name": "metadata",
-              "program": "deepgemm_sparse_mqa_sm103a_1837d46468ad76d78da2_kernel"
+              "program": "deepgemm_sparse_mqa_sm103a_d0124af71399c7134714_kernel"
             },
             {
               "name": "logits",
-              "program": "deepgemm_sparse_mqa_sm103a_a72d892c1d9eade98123_kernel"
+              "program": "deepgemm_sparse_mqa_sm103a_103d5aa1ea4d9e94cc6a_kernel"
             }
           ]
         },
@@ -1323,11 +1323,11 @@
           "stages": [
             {
               "name": "metadata",
-              "program": "deepgemm_sparse_mqa_sm103a_105fe0384c3c4fd92474_kernel"
+              "program": "deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8_kernel"
             },
             {
               "name": "logits",
-              "program": "deepgemm_sparse_mqa_sm103a_375bab2b859dc25d8f59_kernel"
+              "program": "deepgemm_sparse_mqa_sm103a_1617a2b463864b4f400c_kernel"
             }
           ]
         }
