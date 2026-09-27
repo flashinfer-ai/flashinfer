@@ -72,7 +72,7 @@ def recurrent_kda(
     disable_state_update: bool = False,
     correction_cache: Optional[torch.Tensor] = None,
     kg_cache: Optional[torch.Tensor] = None,
-    backend: Literal["auto", "cute-dsl", "cake", "small-bh", "cudnn"] = "auto",
+    backend: Literal["auto", "cute-dsl", "tirx", "cake", "small-bh", "cudnn"] = "auto",
 ) -> (
     tuple[torch.Tensor, Optional[torch.Tensor]]
     | tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
@@ -253,8 +253,14 @@ def recurrent_kda(
             must be divisible by 32, except that the SM100-family exact-N16
             frozen route also accepts multiples of 16. SGLang normally uses
             64 or a larger cache-page-aligned multiple.
-        backend (Literal["auto", "cute-dsl", "cake", "small-bh", "cudnn"]):
-            Implementation backend. ``"auto"`` selects the bundled small-BH
+        backend (Literal["auto", "cute-dsl", "tirx", "cake", "small-bh", "cudnn"]):
+            Implementation backend. ``"tirx"`` explicitly selects the optional
+            SM100/SM103 TIRx prefill kernels for contiguous BF16 inputs, D128,
+            heads divisible by eight, FP32 state, fused Q/K normalization,
+            beta sigmoid and ``lower_bound=-5.0``. Requires CUDA-enabled TVM
+            with TIRx and ``tirx_kernels.tirx_lite``. Capture requires an
+            explicit workspace and output warmed with the exact buffers.
+            ``"auto"`` selects the bundled small-BH
             CuTe DSL kernel for eligible SM100-family calls whose logical batch
             size times head count does not exceed half the device's SM count. It
             selects other architecture-appropriate CuTe DSL kernels for
@@ -287,10 +293,55 @@ def recurrent_kda(
         prefill_workspace, _kda_prefill.RecurrentKDAPrefillWorkspace
     ):
         raise TypeError("prefill_workspace must be a RecurrentKDAPrefillWorkspace")
-    if backend not in ("auto", "cute-dsl", "cake", "small-bh", "cudnn"):
+    if backend not in ("auto", "cute-dsl", "tirx", "cake", "small-bh", "cudnn"):
         raise ValueError(
-            "backend must be 'auto', 'cute-dsl', 'cake', 'small-bh', or 'cudnn', "
+            "backend must be 'auto', 'cute-dsl', 'tirx', 'cake', 'small-bh', or 'cudnn', "
             f"got {backend!r}"
+        )
+    if backend == "tirx":
+        from .kda_prefill_tirx import _run_tirx_kda
+
+        unsupported = [
+            name
+            for name, requested in (
+                ("ssm_state_indices", ssm_state_indices is not None),
+                ("num_spec_tokens", num_spec_tokens is not None),
+                ("num_accepted_tokens", num_accepted_tokens is not None),
+                ("initial_state_source", initial_state_source is not None),
+                ("initial_state_indices", initial_state_indices is not None),
+                ("seq_order", seq_order is not None),
+                ("state_checkpoints", state_checkpoints is not None),
+                ("checkpoint_cu_starts", checkpoint_cu_starts is not None),
+                ("checkpoint_state_indices", checkpoint_state_indices is not None),
+                ("checkpoint_every_n_tokens", checkpoint_every_n_tokens != 0),
+                ("disable_state_update", disable_state_update),
+                ("correction_cache", correction_cache is not None),
+                ("kg_cache", kg_cache is not None),
+            )
+            if requested
+        ]
+        if unsupported:
+            raise NotImplementedError(
+                "backend='tirx' does not support " + ", ".join(unsupported)
+            )
+        return _run_tirx_kda(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            scale=scale,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_gate_in_kernel=use_gate_in_kernel,
+            beta_is_logit=beta_is_logit,
+            lower_bound=lower_bound,
+            cu_seqlens=cu_seqlens,
+            output=output,
+            prefill_workspace=prefill_workspace,
         )
     if backend == "cudnn":
         from .cudnn import cudnn_recurrent_kda

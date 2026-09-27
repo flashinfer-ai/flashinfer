@@ -273,6 +273,10 @@ One subclass per compilation toolchain:
   - `extra_cuda_cflags`, `extra_cflags`, `extra_ldflags`: Compiler flags
 - `JitSpecCuteDsl` (flashinfer/jit/cute_dsl_core.py) caches CuTe-DSL kernels
   (see "CuTe-DSL kernels" under Module Caching below)
+- The optional TIRx KDA backend uses a private `JitSpec` in
+  `flashinfer/kda_kernels/tirx/cache.py` to cache TVM modules, with source/compiler
+  fingerprints and artifact checksums. Its TVM/TIRx dependencies are loaded only
+  by explicit `recurrent_kda(..., backend="tirx")`; see `docs/api/kda.rst`.
 
 ### JIT Directory Rules
 

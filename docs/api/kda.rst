@@ -561,3 +561,74 @@ ceiling is, and above it every call rebuilds its plan — about 7.3 ms against a
 should rotate fewer buffer sets, or call
 ``flashinfer.kda_kernels.sm120_prefill.clear_kda_prefill_sm120_caches()``,
 which releases all of it.
+
+TIRx prefill
+~~~~~~~~~~~~
+
+``recurrent_kda(..., backend="tirx")`` selects the optional TIRx KDA kernels
+adapted from `humanfia/kda-for-kda-release
+<https://github.com/humanfia/kda-for-kda-release/tree/b642859a00544f2599e7bb7edce686f637759a73/tirx>`_.
+A fixed single sequence whose length is divisible by 32 uses a BT32 front end
+and recurrent chain, with concurrent execution when the device has sufficient
+SMs. Other inputs use a fused persistent BT64 kernel with a host-built work
+list. TIRx is imported only when explicitly selecting this backend.
+
+Install CUDA-enabled TVM, the TIRx Lite frontend and a CUDA 13 toolkit with
+``nvcc`` available. The validated compiler packages are::
+
+    pip install 'apache-tvm==0.27.0' 'apache-tvm-ffi==0.1.14.post1'
+    pip install 'tirx-kernels @ git+https://github.com/mlc-ai/tirx-kernels.git@532949266f42ee23211e2dbd6d26dbe9c7a6ca3f'
+
+``tirx_kernels.tirx_lite`` must be present; the PyPI ``tirx-kernels==0.1.1``
+wheel does not include it. ``CUDA_PATH`` can select the toolkit root. Compiled
+modules are stored in FlashInfer's JIT cache and keyed by architecture,
+specialization, source and compiler versions. The shared JIT lifecycle provides
+cross-process locking and honors ``FLASHINFER_DISABLE_JIT``.
+
+The backend supports SM100/SM103 and requires:
+
+* contiguous, 16-byte-aligned BF16 Q/K/V/G ``[B,T,H,128]`` and beta ``[B,T,H]``;
+* ``B >= 1``, ``T > 1``, H divisible by eight and H no larger than the device's
+  SM count, with ``B*T < 2**21`` and ``B*T*H*128 < 2**31``;
+* contiguous FP32 ``A_log[H]`` and ``dt_bias[H*128]`` or ``dt_bias[H,128]``;
+* fused Q/K normalization, gate activation and beta sigmoid, with
+  ``use_qk_l2norm_in_kernel=True``, ``use_gate_in_kernel=True``,
+  ``beta_is_logit=True`` and ``lower_bound=-5.0``;
+* optional contiguous, 32-byte-aligned FP32 value-first state
+  ``[N,H,128,128]``, with ``N < 65536`` and ``N*H*128*128 < 2**31``;
+* fixed batches or packed ``B=1`` sequences with CUDA int32/int64
+  ``cu_seqlens[N+1]``. Offsets start at zero, end at the total token count
+  and strictly increase;
+* an optional contiguous output buffer disjoint from every input.
+
+A supplied initial state is updated in place even if
+``output_final_state=False``. Omitting it starts from zero. A returned final
+state without a supplied initial state is caller-owned in implicit eager
+mode and workspace-owned with an explicit workspace. State pools, checkpoints,
+frozen-state mode, GQA, speculative decode and strided activations are rejected.
+
+Initial and final state are FP32. The retained H64 mixed/uniform INT21 routes
+use BF16 continuation buffers; other fused routes use FP32 handoffs. Tensor
+core operands and residuals also round to BF16. Numerical validation uses the
+source INT21 contract: relative L2 error at most 3%, with each error bounded
+by ``max(0.5 * RMS(reference), 0.05 * abs(reference))``. Short cases also
+compare against an independent FP64 token recurrence.
+
+Supply ``RecurrentKDAPrefillWorkspace`` and a preallocated output for repeated
+calls with the same buffers. The first call prepares tensor maps, work lists,
+scratch and kernels. Packed offsets are read on the host in eager mode,
+including when they were changed under ``torch.inference_mode``. One plan is
+retained per workspace; changing buffers or offsets replaces it.
+The fixed route executes its first invocation sequentially to finish CUDA
+module loading before enabling producer/consumer overlap; state is updated
+once per invocation throughout.
+
+For CUDA Graph capture, warm the exact tensors and scalar arguments on the
+capture stream and synchronize first. Each workspace belongs to one stream
+and one captured call, and must outlive the graph. It cannot be reused eagerly
+or in another capture afterward. Activation, gate-parameter and state contents
+may change between replays; offsets and scalar arguments remain fixed. Flags
+are reset before each invocation. The fixed route joins its private chain
+stream back to the caller's stream, so the caller observes completion of both
+kernels. Independent persistent launches must be serialized: their producer/
+consumer schedules rely on the full grid being resident.
