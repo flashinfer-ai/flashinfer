@@ -5344,15 +5344,17 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 # scatter, so it follows the first chain kernel.
                 self._state_indices_long.copy_(self._state_indices)
             if self._apply_route and getattr(self, "_apply_descriptors_stale", False):
-                # Pair-map producer and fused apply share the apply ABI and
-                # both carry out_tma / rows_tma of caller storage; the prefix
-                # chain only addresses launch-owned buffers, so a plan-cache
-                # rebind (moved output / checkpoint rows) skips it and pays
-                # two descriptor uploads instead of three.
-                self._pairmap_module.prepare(
-                    grid=self._pairmap_grid, **self._pairmap_bindings()
-                )
                 if getattr(self, "_apply_prefix_stale", False):
+                    # Only the fused apply kernel stores through the caller's
+                    # out_tma / rows_tma (the pair-map producer runs the same
+                    # ABI in PAIRMAP mode and writes launch-owned maps only;
+                    # the prefix chain addresses launch-owned buffers), so a
+                    # plan-cache rebind re-uploads one descriptor set and the
+                    # pair-map / prefix sets re-prepare only on the capture /
+                    # full-stale path.
+                    self._pairmap_module.prepare(
+                        grid=self._pairmap_grid, **self._pairmap_bindings()
+                    )
                     self._prefix_module.prepare(
                         grid=self._prefix_grid, **self._prefix_bindings()
                     )
