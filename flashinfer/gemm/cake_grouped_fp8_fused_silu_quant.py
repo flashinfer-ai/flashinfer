@@ -19,6 +19,14 @@ FP8 E4M3).  Both routes reproduce the chain's rounding points exactly:
   GEMM into a private BF16 workspace followed by one generated elementwise
   kernel that fuses SwiGLU with the group quantization (two launches instead
   of three).  The GEMM kernel is chosen by :func:`small_m_gemm_backend`.
+* Routing-aware rule (:func:`select_route`): when the routing is known —
+  ``validate_indices=True`` derives the 128-row block count of every expert
+  from ``m_indices`` inside its synchronizing check — a large problem whose
+  odd-tail blocks (experts with an odd block count) x N256 tiles outnumber the
+  SMs the 128-CTA pair grid leaves free also takes the GEMM + act route: an
+  odd tail runs as a single-CTA tile that ingests a whole B slab and costs
+  ~1.5x a pair tile, so beyond the free SMs the CuTe GEMM (insensitive to odd
+  tails) + act is faster.  Without the routing the plan is shape-only.
 
 Routing contract (the same as the CuTe-DSL contiguous grouped GEMM): rows are
 sorted by expert through ``m_indices``; every *internal* expert boundary is a
@@ -43,7 +51,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Sequence
 
 import torch
 import tvm_ffi
@@ -128,25 +136,83 @@ def small_m_gemm_backend(m: int, n2: int, k: int) -> str:
     return GEMM_BACKEND_CUTE
 
 
-def launch_plan(m: int, n2: int, *, sm_count: int) -> tuple[str, tuple[int, int, int]]:
-    """Resolve ``(route, grid)`` for ``A[M, K]`` and ``B[G, 2H, K]`` on ``sm_count`` SMs.
+def routing_blocks(group_counts: Sequence[int]) -> tuple[int, ...]:
+    """128-row block count of every expert (``ceil(rows / 128)``)."""
+    counts = [int(c) for c in group_counts]
+    if any(c < 0 for c in counts):
+        raise ValueError("group_counts must be non-negative")
+    return tuple(-(-c // ROW_BLOCK) for c in counts)
 
-    ``M < SMALL_M_MAX`` resolves to the small-M route: one warp per
-    (row, 128-column group) item, ``ACT_WARPS_PER_CTA`` warps per CTA, at most
-    ``ACT_CTAS_PER_SM`` CTAs per SM.  Otherwise the fused kernel launches
-    complete CTA pairs; its tile upper bound counts every 128-row block as a
-    lone block, and the 128-CTA cap is the measured B200 policy of the parent
-    gate_up route (148 CTAs measured slower on every routing).
+
+def fused_tile_counts(n2: int, group_blocks: Sequence[int]) -> tuple[int, int]:
+    """``(pair_tiles, odd_tail_units)`` the fused route schedules for a routing.
+
+    Complete 128-row block pairs x N256 tiles run on the pair kernel, each
+    expert's odd tail block x N256 tiles on the tail kernel.
+    """
+    _, tile_n, _ = route_geometry(FUSED_ROUTE)
+    n_tiles = n2 // tile_n
+    blocks = [int(b) for b in group_blocks]
+    return sum(b // 2 for b in blocks) * n_tiles, sum(b % 2 for b in blocks) * n_tiles
+
+
+# Routing-aware route rule (measured on B200 at the wide_ep32 shape).  An odd
+# tail block runs on the tail kernel as a single-CTA unit that ingests the whole
+# B slab (1.5 MiB per 128 rows against a pair CTA's 1.0 MiB) and takes ~1.5x a
+# pair tile; the units that start on the SMs the 128-CTA pair grid leaves free
+# finish inside the pair phase, every further unit waits for a retiring cluster
+# and adds its full latency.  With at most that many odd-tail units the fused
+# route wins, beyond it the CuTe GEMM + act route is faster on every routing
+# measured.  ``False`` keeps the shape-only rule.
+ROUTING_AWARE_RULE = True
+
+
+def select_route(
+    m: int, n2: int, *, sm_count: int, group_blocks: Optional[Sequence[int]] = None
+) -> str:
+    """Route of a problem: ``M < SMALL_M_MAX`` takes the GEMM + act route; larger
+    problems take the fused route unless the routing is known (``group_blocks``,
+    128-row blocks per expert) and its odd-tail units outnumber the SMs the pair
+    grid leaves free.
     """
     if sm_count <= 0:
         raise ValueError("sm_count must be positive")
+    if m <= 0 or n2 <= 0:
+        raise ValueError("select_route requires positive M and 2H")
     if m < SMALL_M_MAX:
-        route = ACT_ROUTE
+        return ACT_ROUTE
+    if group_blocks is None or not ROUTING_AWARE_RULE:
+        return FUSED_ROUTE
+    if sum(int(b) for b in group_blocks) != -(-m // ROW_BLOCK):
+        raise ValueError(
+            f"group_blocks {list(group_blocks)} do not cover M={m} ({-(-m // ROW_BLOCK)} blocks)"
+        )
+    _, _, cluster_ctas = route_geometry(FUSED_ROUTE)
+    pair_ctas = (min(sm_count, CTA_CAP) // cluster_ctas) * cluster_ctas
+    _, odd_units = fused_tile_counts(n2, group_blocks)
+    return FUSED_ROUTE if odd_units <= sm_count - pair_ctas else ACT_ROUTE
+
+
+def launch_plan(
+    m: int, n2: int, *, sm_count: int, group_blocks: Optional[Sequence[int]] = None
+) -> tuple[str, tuple[int, int, int]]:
+    """Resolve ``(route, grid)`` for ``A[M, K]`` and ``B[G, 2H, K]`` on ``sm_count`` SMs.
+
+    The route follows :func:`select_route` (``group_blocks`` = 128-row blocks
+    per expert enables the routing-aware rule; ``prepare_...`` derives them
+    when ``validate_indices=True``).  The GEMM + act route launches one warp
+    per (row, 128-column group) item, ``ACT_WARPS_PER_CTA`` warps per CTA, at
+    most ``ACT_CTAS_PER_SM`` CTAs per SM.  The fused route launches complete
+    CTA pairs; its tile upper bound counts every 128-row block as a lone block,
+    and the 128-CTA cap is the measured B200 policy of the parent gate_up route
+    (148 CTAs measured slower on every routing).
+    """
+    route = select_route(m, n2, sm_count=sm_count, group_blocks=group_blocks)
+    if route == ACT_ROUTE:
         route_geometry(route)  # the registry must carry the route
         items = m * (n2 // 2 // GROUP_SIZE)
         ctas = max(1, min(-(-items // ACT_WARPS_PER_CTA), ACT_CTAS_PER_SM * sm_count))
         return route, (ctas, 1, 1)
-    route = FUSED_ROUTE
     _, tile_n, cluster_ctas = route_geometry(route)
     max_tiles = math.ceil(m / ROW_BLOCK) * (n2 // tile_n)
     clusters = min(max_tiles, min(sm_count, CTA_CAP) // cluster_ctas)
@@ -158,10 +224,10 @@ def launch_plan(m: int, n2: int, *, sm_count: int) -> tuple[str, tuple[int, int,
 def tail_launch_grid(m: int, n2: int, *, sm_count: int) -> tuple[int, int, int]:
     """Grid of the fused route's tail kernel for ``A[M, K]`` and ``B[G, 2H, K]`` on ``sm_count`` SMs.
 
-    One single-CTA 128-row tile per odd-tail block and N256 tile; the host
-    never reads the routing, so the grid is one CTA per SM up to the unit
-    upper bound (every block an odd tail) and the CTAs grid-stride over the
-    actual units.  A routing without odd tails runs an empty grid, overlapped
+    One single-CTA 128-row tile per odd-tail block and N256 tile; the grid is
+    one CTA per SM up to the unit upper bound (every block an odd tail) and the
+    CTAs grid-stride over the actual units, so the grid does not depend on the
+    routing.  A routing without odd tails runs an empty grid, overlapped
     with the pair kernel by programmatic dependent launch.
     """
     if sm_count <= 0:
@@ -194,8 +260,13 @@ def _require_tensor(
     return tensor
 
 
-def _validate_indices(m_indices: torch.Tensor, groups: int) -> None:
-    """Synchronizing check of the routing contract (sorted, in range, 128-aligned boundaries)."""
+def _validate_indices(m_indices: torch.Tensor, groups: int) -> tuple[int, ...]:
+    """Synchronizing check of the routing contract (sorted, in range, 128-aligned boundaries).
+
+    Returns the 128-row block count of every expert (the routing statistics of
+    :func:`select_route`); every block is homogeneous under the contract, so the
+    expert of a block is the index of its first row.
+    """
     indices = m_indices.to(torch.int64)
     lowest = int(indices.min())
     highest = int(indices.max())
@@ -213,6 +284,10 @@ def _validate_indices(m_indices: torch.Tensor, groups: int) -> None:
                 "m_indices must place every internal expert boundary at a multiple "
                 "of 128 rows (only the final expert may end in a partial block)"
             )
+    block_experts = indices[:: ROW_BLOCK]
+    return tuple(
+        int(v) for v in torch.bincount(block_experts, minlength=groups).tolist()
+    )
 
 
 @dataclass
@@ -391,11 +466,12 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         device=device,
         alignment=4,
     )
+    group_blocks: Optional[tuple[int, ...]] = None
     if validate_indices:
-        _validate_indices(m_indices, groups)
+        group_blocks = _validate_indices(m_indices, groups)
 
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    route, grid = launch_plan(m, n2, sm_count=sm_count)
+    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=group_blocks)
     stage_grids: dict[str, tuple[int, int, int]] = {ROUTE_STAGES[route][0]: grid}
     if route == FUSED_ROUTE:
         stage_grids[FUSED_TAIL_STAGE] = tail_launch_grid(m, n2, sm_count=sm_count)
@@ -498,8 +574,11 @@ __all__ = [
     "SMALL_M_MAX",
     "PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant",
     "is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available",
+    "fused_tile_counts",
     "launch_plan",
     "prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant",
+    "routing_blocks",
+    "select_route",
     "small_m_gemm_backend",
     "tail_launch_grid",
 ]

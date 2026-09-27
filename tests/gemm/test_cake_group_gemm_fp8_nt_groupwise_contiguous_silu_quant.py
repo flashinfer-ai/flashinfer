@@ -16,8 +16,11 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     GEMM_BACKEND_CAKE,
     GEMM_BACKEND_CUTE,
     SMALL_M_MAX,
+    fused_tile_counts,
     is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available,
     launch_plan,
+    routing_blocks,
+    select_route,
     small_m_gemm_backend,
     tail_launch_grid,
 )
@@ -327,6 +330,16 @@ def test_prepared_matches_flashinfer_chain(group_counts, n2, k, arbitrary_scales
         pytest.param([256] * 16, 2048, 4096, FUSED_ROUTE, id="fused_wide"),
         pytest.param([256] * 8, 256, 512, FUSED_ROUTE, id="fused_at_threshold"),
         pytest.param([256] * 4 + [128, 100], 512, 1024, ACT_ROUTE, id="small_m"),
+        # routing-aware rule: the expected route is whatever the measured odd-tail crossover selects
+        pytest.param(
+            [256, 0, 512, 0, 384, 640, 128, 384, 256, 0, 128, 128, 384, 384, 512, 0],
+            2048,
+            4096,
+            None,
+            id="wide_random_aligned",
+        ),
+        pytest.param([384] * 8 + [128] * 8, 2048, 4096, None, id="wide_all_odd"),
+        pytest.param([128] * 16, 2048, 4096, None, id="wide_all_one_block"),
     ],
 )
 def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
@@ -334,14 +347,26 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     a, b, a_scale, b_scale, m_indices = _make_inputs(
         group_counts, n2, k, seed=664, device=device
     )
-    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
-        a, b, a_scale, b_scale, m_indices
-    )
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     m = sum(group_counts)
-    route, grid = launch_plan(m, n2, sm_count=sm_count)
-    assert route == expected_route
+    blocks = routing_blocks(group_counts)
+    # without the routing the plan is shape-only; with it the routing-aware rule applies
+    shape_route, _ = launch_plan(m, n2, sm_count=sm_count)
+    assert shape_route == select_route(m, n2, sm_count=sm_count)
+    if expected_route is not None:
+        assert shape_route == expected_route
+    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=blocks)
+    assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks)
+    if m < SMALL_M_MAX:
+        assert route == ACT_ROUTE
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
     assert (prepared.route, prepared.grid) == (route, grid)
+    unvalidated = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices
+    )
+    assert (unvalidated.route, unvalidated.grid) == launch_plan(m, n2, sm_count=sm_count)
     if route == FUSED_ROUTE:
         assert grid[0] % 2 == 0 and grid[0] <= 128
         tail = tail_launch_grid(m, n2, sm_count=sm_count)
@@ -352,6 +377,32 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
         items = m * (n2 // 2 // GROUP_SIZE)
         assert 1 <= grid[0] <= max(1, -(-items // 4))
         assert grid[0] <= 16 * sm_count
+
+
+def test_routing_blocks_and_fused_tile_counts():
+    counts = [256, 0, 512, 0, 384, 640, 128, 384, 256, 0, 128, 128, 384, 384, 512, 0]
+    blocks = routing_blocks(counts)
+    assert blocks == (2, 0, 4, 0, 3, 5, 1, 3, 2, 0, 1, 1, 3, 3, 4, 0)
+    assert sum(blocks) == sum(counts) // 128
+    # N2 = 2048 -> eight N256 tiles: 12 complete pairs and 8 odd tail blocks
+    assert fused_tile_counts(2048, blocks) == (96, 64)
+    assert fused_tile_counts(2048, routing_blocks([256] * 16)) == (128, 0)
+    assert fused_tile_counts(2048, routing_blocks([128] * 16)) == (0, 128)
+    assert routing_blocks([100]) == (1,)  # a partial final block counts as one block
+    with pytest.raises(ValueError):
+        routing_blocks([128, -1])
+    with pytest.raises(ValueError):
+        select_route(4096, 2048, sm_count=148, group_blocks=(1, 1))
+    assert select_route(1024, 2048, sm_count=148, group_blocks=routing_blocks([128] * 8)) == ACT_ROUTE
+    assert select_route(4096, 2048, sm_count=148) == FUSED_ROUTE
+    # measured B200 rule: odd-tail units beyond the 20 SMs the 128-CTA pair grid leaves free -> GEMM + act
+    wide = dict(sm_count=148)
+    assert select_route(4096, 2048, group_blocks=routing_blocks([256] * 16), **wide) == FUSED_ROUTE
+    two_odd = routing_blocks([128, 384] + [256] * 14)  # 16 odd-tail units <= 20 free SMs
+    assert select_route(4096, 2048, group_blocks=two_odd, **wide) == FUSED_ROUTE
+    assert select_route(4096, 2048, group_blocks=routing_blocks([384] * 8 + [128] * 8), **wide) == ACT_ROUTE
+    assert select_route(4096, 2048, group_blocks=blocks, **wide) == ACT_ROUTE  # random_aligned: 64 units
+    assert select_route(2048, 2048, group_blocks=routing_blocks([128] * 16), **wide) == ACT_ROUTE
 
 
 @pytest.mark.parametrize(

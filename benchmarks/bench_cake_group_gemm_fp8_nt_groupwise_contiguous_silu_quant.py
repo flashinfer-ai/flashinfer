@@ -97,8 +97,9 @@ def main():
     for label, group_counts, n2, k in SHAPES:
         a, b, a_scale, b_scale, m_indices = make_inputs(group_counts, n2, k, device)
         m = sum(group_counts)
+        # validate_indices=True also hands the routing to the route rule (odd-tail share -> fused vs GEMM + act)
         prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
-            a, b, a_scale, b_scale, m_indices
+            a, b, a_scale, b_scale, m_indices, validate_indices=True
         )
         fused_q, fused_s = prepared.launch()
         y = torch.empty((m, n2), dtype=torch.bfloat16, device=device)
