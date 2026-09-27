@@ -509,9 +509,22 @@ def test_per_request_tensors_and_routes():
     assert choose_stage1(32, 262144, sm_count=132) == (2, 16, True)
     assert choose_stage1(32, 32768, sm_count=132) == (2, 32, False)
     assert choose_stage1(32, 32768, sm_count=148) == (4, 16, False)
+    # Rubin R200 wave table (212 SMs): 128 cluster-8 CTAs are one wave (22 eight-CTA clusters
+    # fit), so B = 16 rows of 128256 stay register-resident on the 8-CTA variant while B = 32
+    # (256 CTAs) streams with clusters of 4 as on B200; V = 32768 B = 32 stays on (4, 16).
+    assert choose_stage1(16, 128256, sm_count=212) == (8, 32, False)
+    assert choose_stage1(32, 128256, sm_count=212) == (4, 16, True)
+    assert choose_stage1(32, 32768, sm_count=212) == (4, 16, False)
+    assert choose_stage1(64, 32768, sm_count=212) == (2, 32, False)
+    assert choose_stage1(128, 32768, sm_count=212) == (1, 16, True)
+    for b, v in ((1, 128256), (8, 65536), (64, 128256), (16, 262144), (64, 262144)):
+        assert choose_stage1(b, v, sm_count=212) == choose_stage1(b, v, sm_count=148)
     # Other SM counts use the nearest measured table.
     assert choose_stage1(32, 128256, sm_count=152) == choose_stage1(
         32, 128256, sm_count=148
+    )
+    assert choose_stage1(16, 128256, sm_count=200) == choose_stage1(
+        16, 128256, sm_count=212
     )
     assert choose_stage1(32, 128256, sm_count=114) == choose_stage1(
         32, 128256, sm_count=132

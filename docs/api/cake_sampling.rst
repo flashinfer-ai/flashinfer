@@ -51,8 +51,8 @@ streaming variants drop out, so vocabularies above the register-resident capacit
 take the ``top_k_first`` route there.
 
 The stage-1 variant is chosen per call by a cost model whose single-wave CTA capacity table is
-keyed by the device's SM count (148 for B200 / B300, 132 for H100; other devices use the nearest
-measured table); the cost constants were fitted on B200.
+keyed by the device's SM count (148 for B200 / B300, 132 for H100, 212 for Rubin R200; other
+devices use the nearest measured table); the cost constants were fitted on B200.
 
 Measured performance
 --------------------
