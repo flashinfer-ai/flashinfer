@@ -43,6 +43,12 @@
     "sm_110a/sm110_xqa_tree_fp16_paged_mma_kernel.cu": {
       "sha256": "9ab2a47db873e6f05e17ce40c06296e7198020fe905a9e06981a124677ff5dd5"
     },
+    "sm_110a/sm110_xqa_tree_fp16_paged_mma_split_binding.cu": {
+      "sha256": "f155826ad30d6aead5f84fa615260b4ef02d8cc7a4df64fef140de3d796a4a18"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_mma_split_kernel.cu": {
+      "sha256": "827afd309cb292597a029b6e9fd760eee490a6ea160350b1960a6029b00ca1d1"
+    },
     "sm_110a/sm110_xqa_tree_fp8_contiguous_binding.cu": {
       "sha256": "f114800fff81ec7092824080927b505326be0472842ab159d13fc7e331a6be76"
     },
@@ -753,6 +759,116 @@
         }
       ]
     },
+    "tree_fp16_paged_mma_split": {
+      "kernel": "register_mma_split",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp16_paged_mma_split_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_mma_split_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp16_paged_mma_split",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 221312,
+      "tile_rows": 32,
+      "output_tile_columns": 512,
+      "source_cubin_sha256": "0faa0489bef782a9b9d66aed45b7e8d5ea2c77617b8278189713dd501b0b3dc6",
+      "device_parameters": [
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "q",
+          "ctype": "const __half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_sinks",
+          "ctype": "const float*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* pool; const int* page_list; const int* sequence_lengths; uint32_t max_pages;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "semaphores",
+          "ctype": "uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "scratch",
+          "ctype": "void*",
+          "kind": "pointer"
+        }
+      ],
+      "groups": 2,
+      "group_warps": 8,
+      "kv_split": 2,
+      "kv_l2_prefetch": true,
+      "merge": "in_cta_smem"
+    },
     "tree_fp8_contiguous": {
       "block": [
         256,
@@ -1195,7 +1311,7 @@
     }
   },
   "schema": "flashinfer.sm110_xqa.v1",
-  "shape_count": 11,
+  "shape_count": 12,
   "shape_denominator": [
     "tree_fp16_contiguous",
     "tree_fp16_paged",
@@ -1203,12 +1319,13 @@
     "tree_fp8_paged",
     "tree_fp16_contiguous_mma",
     "tree_fp16_paged_mma",
+    "tree_fp16_paged_mma_split",
     "tree_fp8_contiguous_mma",
     "tree_fp8_paged_mma",
     "decode_b1_c1024",
     "decode_b2_c512",
     "decode_b4_c256"
   ],
-  "shape_ledger_sha256": "c0179de0baba2503a52411dbfef1bcec53d9bc107da9336c5a6548289ffa64ea",
+  "shape_ledger_sha256": "e644edf9091922eceee831e2f69175bc89a3d751f27dadb8f1bbd60f6ad479f8",
   "validation_status": "source_only_unvalidated"
 }

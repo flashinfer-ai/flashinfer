@@ -30,6 +30,15 @@ def _package(tmp_path):
                 "nvcc_options": [],
                 **(
                     {
+                        "kernel": "register_mma_split",
+                        "tile_rows": 32,
+                        "output_tile_columns": 512,
+                        "groups": 2,
+                        "group_warps": 8,
+                        "kv_split": 2,
+                    }
+                    if name.startswith("tree_") and name.endswith("_mma_split")
+                    else {
                         "kernel": "register_mma",
                         "tile_rows": 32,
                         "output_tile_columns": 512,

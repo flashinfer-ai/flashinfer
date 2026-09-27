@@ -15,8 +15,9 @@ from ...jit.core import JitSpec, gen_jit_spec, sm110a_nvcc_flags
 
 SCHEMA = "flashinfer.sm110_xqa.v1"
 DECODE_SINGLE_PARTITION_ROUTE = "decode_fp16_contiguous_single_partition"
-TREE_KERNELS = ("tcgen05", "register_mma")
+TREE_KERNELS = ("tcgen05", "register_mma", "register_mma_split")
 MMA_ROUTE_SUFFIX = "_mma"
+SPLIT_ROUTE_SUFFIX = "_mma_split"
 ROUTE_ENTRIES = {
     "tree_fp16_contiguous": "run_tree",
     "tree_fp16_paged": "run_tree",
@@ -26,20 +27,27 @@ ROUTE_ENTRIES = {
     "tree_fp16_paged_mma": "run_tree",
     "tree_fp8_contiguous_mma": "run_tree",
     "tree_fp8_paged_mma": "run_tree",
+    "tree_fp16_paged_mma_split": "run_tree",
     "decode_fp16_contiguous": "run_decode",
     "decode_merge": "run_decode_merge",
 }
 
 
 def route_kernel(name: str, route: dict[str, Any]) -> str:
-    """Physical kernel family of a route: ``register_mma`` for the ``*_mma`` tree routes, else ``tcgen05``."""
+    """Physical kernel family of a route: ``register_mma_split`` for the ``*_mma_split`` tree
+    route, ``register_mma`` for the other ``*_mma`` tree routes, else ``tcgen05``."""
     kernel = route.get("kernel", "tcgen05")
     if kernel not in TREE_KERNELS:
         raise ValueError(f"unknown kernel family for {name}")
-    if name.startswith("tree_") and name.endswith(MMA_ROUTE_SUFFIX) != (
-        kernel == "register_mma"
-    ):
-        raise ValueError(f"route name and kernel family disagree for {name}")
+    if name.startswith("tree_"):
+        if name.endswith(SPLIT_ROUTE_SUFFIX):
+            expected = "register_mma_split"
+        elif name.endswith(MMA_ROUTE_SUFFIX):
+            expected = "register_mma"
+        else:
+            expected = "tcgen05"
+        if kernel != expected:
+            raise ValueError(f"route name and kernel family disagree for {name}")
     return kernel
 
 
@@ -124,6 +132,19 @@ def _read_manifest(source_root: Path) -> dict[str, Any]:
                 ):
                     raise ValueError(
                         f"unsupported register-MMA tree launch geometry for {name}"
+                    )
+            elif route_kernel(name, route) == "register_mma_split":
+                # Split-KV register-MMA tree route: the same 32-row Q tile per CTA, two
+                # eight-warp groups over the two KV halves with an in-CTA merge (512 threads).
+                if (
+                    rows != 32
+                    or columns != 512
+                    or route.get("groups") != 2
+                    or route.get("group_warps") != 8
+                    or route.get("kv_split") != 2
+                ):
+                    raise ValueError(
+                        f"unsupported split register-MMA tree launch geometry for {name}"
                     )
             elif (
                 rows not in (64, 128)

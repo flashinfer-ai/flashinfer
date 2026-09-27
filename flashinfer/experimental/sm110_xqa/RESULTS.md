@@ -74,3 +74,34 @@ Synchronization: separate Compute Sanitizer `synccheck` and `racecheck` invocati
 | fp8_paged | racecheck | pass_with_warnings | 13 s | ========= RACECHECK SUMMARY: 12 hazards displayed (0 errors, 12 warnings) |
 
 Physical turnaround (managed step seconds on the Thor node): patch apply 2, hook tooling and environment 8, upstream pre-commit hooks 5, JIT metadata tests 9, GPU suite 69, ledger benchmark 12 (5.4 s payload), artifact parity 127 (124.8 s payload), sanitizers 13. GPU kernel runtime is shown separately in the tables.
+
+## Split register-MMA FP16 page128 route (`kernel="register_mma_split"`, `kernel="register_mma_auto"`)
+
+`tree_fp16_paged_mma_split` wraps the same register `mma.sync` XQA schedule split over the two halves of the KV sequence: two eight-warp groups per CTA (512 threads, one 32-row Q tile over all 512 output columns, grid unchanged), each with its own K/V staging ring, merge their unnormalised partials and row statistics in shared memory before one group writes the output. It is frozen for FP16 page128 KV, the one D512 cache mode where it is faster than the `register_mma` route on both validated Thor nodes (1.06-1.08x cold-L2, 1.04-1.05x warm in the schedule harness); `register_mma_auto` selects it there and `register_mma` for the other three cache modes. Validation ran on NVIDIA Thor `sr250v3-0677` (20 SMs, CUDA 13.4, PyTorch 2.15.0a0+875d815502.nvinternal.main) in one container session.
+
+Artifact parity (frozen split schedule launcher vs the exported TVM-FFI entry, identical tensors, one process, six alternating paired rounds, 250 ms warmup, 256 CUPTI cold-L2 samples per round, gate 3%):
+
+| Shape | Frozen schedule (us) | Native export (us) | Absolute difference | Cake-first | Export-first |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tree_fp16_paged_mma_split | 34.1600 | 34.3285 | 0.493% | 1.0009 | 1.0070 |
+
+**The split row passes (difference 0.493%).**
+
+Public ledger benchmark (`benchmarks/bench_sm110_xqa.py`, one process for all 12 rows, same protocol as above):
+
+| Ledger row | Kernel family | Native latency (us) | Ratio |
+| --- | --- | ---: | ---: |
+| tree_fp16_paged | tcgen05 | 70.928 | 1 (reference row) |
+| tree_fp16_paged_mma | register_mma | 44.928 | 1.579x faster than tcgen05 |
+| tree_fp16_paged_mma_split | register_mma_split | 40.897 | 1.734x faster than tcgen05, 1.099x faster than register_mma |
+
+Correctness: JIT metadata suite 35 passed; GPU suite 109 passed (adds the FP16 page128 cache cases for `register_mma_split` and `register_mma_auto`, the auto fallback to `register_mma` on the other cache modes and the rejection of `register_mma_split` off its frozen mode). pre-commit clean.
+
+Synchronization (same protocol, hard 20 s limit, `memcheck` not run):
+
+| Route | Tool | Verdict | Wall | Summary |
+| --- | --- | --- | ---: | --- |
+| fp16_paged (split) | synccheck | pass | 8 s | ========= ERROR SUMMARY: 0 errors |
+| fp16_paged (split) | racecheck | pass_with_warnings | 19 s | ========= RACECHECK SUMMARY: 53 hazards displayed (0 errors, 53 warnings) |
+
+The racecheck warnings map to the same instruction classes as the `register_mma` routes (`LDGSTS.E.BYPASS.128` staging writes and `LDSM.16.MT88.4` fragment reads): asynchronous `cp.async` staging writes and `ldmatrix` reads of the K/V rings that are ordered by `cp.async.mbarrier.arrive` / `cp.async.wait_group` and mbarrier phases the tool does not model; no error-class hazard.
