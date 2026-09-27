@@ -658,6 +658,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         )
 
         swizzled_pad = 16 // (self.out_dtype.width // 8)
+        # Row pitch of one output staging row (elements); used to build a
+        # rank-3 single-stage view of the active buffer when num_c_stage > 1.
+        self.c_smem_row_pitch = self.cta_tile_shape_mnk[1] + swizzled_pad
         self.c_smem_layout_staged = cute.make_layout(
             (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1], self.num_c_stage),
             stride=(
@@ -2300,10 +2303,26 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             # Output staging buffer of the current tile (alternates when
             # num_c_stage == 2).
             c_stage = cutlass.Int32(0)
+            if cutlass.const_expr(self.num_c_stage > 1):
+                # Indexing the staged partition with a dynamic stage would drop
+                # the stage mode (rank 2 vs the rank-3 register fragment), so
+                # each tile re-partitions a rank-3 (M, N, 1) view of the
+                # active staging buffer instead.
+                thr_copy_r2s = tiled_copy_r2s.get_slice(epi_tidx)
+                c_stage_view_layout = cute.make_layout(
+                    (self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1], 1),
+                    stride=(self.c_smem_row_pitch, 1, 0),
+                )
             while is_valid_tile:
                 tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
                 permuted_row = tile_m_start + epi_tidx
                 is_valid_row = permuted_row < tile_info[4]
+                if cutlass.const_expr(self.num_c_stage > 1):
+                    sC_cur = cute.make_tensor(
+                        sC[(None, None, c_stage)].iterator, c_stage_view_layout
+                    )
+                    # (R2S, R2S_M, R2S_N, 1)
+                    tRS_sC_cur = thr_copy_r2s.partition_D(sC_cur)
 
                 # Read per-row finalize metadata prefetched by the meta loader
                 # warp (token_idx for scatter, combined_scale = alpha * token_scale).
@@ -2374,7 +2393,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                             cute.copy(
                                 tiled_copy_r2s,
                                 tRS_rC,
-                                tRS_sC[(None, None, real_subtile_idx, c_stage)],
+                                tRS_sC_cur[(None, None, real_subtile_idx, None)],
                             )
                         else:
                             cute.copy(
