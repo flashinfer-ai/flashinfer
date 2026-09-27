@@ -72,10 +72,10 @@
 --routine unified_moe --backends cutile --quant-variant mxfp8_w8a16 --num_tokens 8 --hidden_size 2688 --intermediate_size 1856 --num_experts 128 --top_k 6 --activation-type Relu2 --input_dtype bfloat16 --autotune --refcheck -vv --generate_repro_command --case_tag "nemotron_3.5_lightning_30b_a3b_mxfp8_w8a16"
 
 # CuteDSL NVFP4 MoE (Blackwell SM10.0/SM10.3 only; SwiGLU only)
---routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 -vv --generate_repro_command --case_tag "cute_dsl_moe_large"
---routine cute_dsl_fp4_block_scale_moe --num_tokens 256 --hidden_size 1024 --intermediate_size 512 --num_experts 256 --top_k 2 -vv --generate_repro_command --case_tag "cute_dsl_moe_small"
---routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --autotune -vv --generate_repro_command --case_tag "cute_dsl_moe_autotune"
---routine cute_dsl_fp4_block_scale_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --local_expert_offset 0 --local_num_experts 32 -vv --generate_repro_command --case_tag "cute_dsl_moe_ep8"
+--routine cute_dsl_fused_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 -vv --generate_repro_command --case_tag "cute_dsl_moe_large"
+--routine cute_dsl_fused_moe --num_tokens 256 --hidden_size 1024 --intermediate_size 512 --num_experts 256 --top_k 2 -vv --generate_repro_command --case_tag "cute_dsl_moe_small"
+--routine cute_dsl_fused_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --autotune -vv --generate_repro_command --case_tag "cute_dsl_moe_autotune"
+--routine cute_dsl_fused_moe --num_tokens 1024 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --local_expert_offset 0 --local_num_experts 32 -vv --generate_repro_command --case_tag "cute_dsl_moe_ep8"
 
 # CuteDSL BF16/FP16 MoE (Hopper SM9.0 only; --activation-type Swiglu/GegluTanh/Relu2; pre-routed top-k ids and scales; per-rank shapes for TP, --local_num_experts/--local_expert_offset for EP)
 --routine cute_dsl_bf16_moe --num_tokens 1 --hidden_size 2048 --intermediate_size 768 --num_experts 128 --top_k 8 --input_dtype bfloat16 --refcheck -vv --generate_repro_command --case_tag "cute_dsl_bf16_moe_qwen3_30b_decode"

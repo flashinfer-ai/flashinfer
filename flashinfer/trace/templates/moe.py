@@ -2475,6 +2475,8 @@ def _moe_bf16_run_experts(
     activation_type=ActivationType.Swiglu.value,
     situ_beta=None,
     situ_linear_beta=None,
+    gemm1_bias=None,
+    gemm2_bias=None,
 ):
     """Un-quantized (bf16) MoE expert computation."""
     activation_type = normalize_activation_type(activation_type)
@@ -2513,6 +2515,8 @@ def _moe_bf16_run_experts(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e = A.index_select(0, token_idx)
         G1 = A_e.matmul(W1[le].t())
+        if gemm1_bias is not None:
+            G1 = G1 + gemm1_bias[le].to(torch.float32)
         if activation_type == ActivationType.Relu2:
             act = torch.relu(G1) ** 2
         else:
@@ -2537,6 +2541,8 @@ def _moe_bf16_run_experts(
                 gate = torch.clamp(X2, max=limit)
                 act = gate * torch.sigmoid(alpha * gate) * (up + beta)
         expert_out = act.matmul(W2[le].t())
+        if gemm2_bias is not None:
+            expert_out = expert_out + gemm2_bias[le].to(torch.float32)
         w_tok = weights.index_select(0, token_idx)
         match = (topk_idx.index_select(0, token_idx) == ge).float()
         w_e = (w_tok * match).sum(dim=1)
@@ -3659,7 +3665,14 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "w1_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
-            description="Per-expert FC1 global scale.",
+            optional=True,
+            description="Optional per-expert FC1 global scale; required for W4A16.",
+        ),
+        "w1_bias": Tensor(
+            ["num_local_experts", "gemm1_out_size"],
+            dtype="float32",
+            optional=True,
+            description="Optional per-expert FC1 bias.",
         ),
         "fc2_input_scale": Tensor(
             ["one"],
@@ -3690,7 +3703,14 @@ cute_dsl_fused_moe_trace = TraceTemplate(
         "w2_alpha": Tensor(
             ["num_local_experts"],
             dtype="float32",
-            description="Per-expert FC2 global scale.",
+            optional=True,
+            description="Optional per-expert FC2 global scale; required for W4A16.",
+        ),
+        "w2_bias": Tensor(
+            ["num_local_experts", "hidden_size"],
+            dtype="float32",
+            optional=True,
+            description="Optional per-expert FC2 bias.",
         ),
         "per_token_scale": Tensor(
             ["num_tokens"],
@@ -3698,10 +3718,15 @@ cute_dsl_fused_moe_trace = TraceTemplate(
             optional=True,
             description="Optional W4A4 per-token input row scale.",
         ),
-        "quant_mode": Scalar(
+        "quant": Scalar(
             "string",
             optional=True,
-            description="Compute mode: 'w4a4', 'w4a8', or 'w4a16'.",
+            description="QuantConfig selecting the weight/activation formats.",
+        ),
+        "weight_interleave": Scalar(
+            "int32",
+            optional=True,
+            description="Physical GEMM1 up/gate weight interleave (16 or 64).",
         ),
         "num_experts": Scalar("int32", description="Total number of experts."),
         "top_k": Scalar("int32", description="Number of experts per token."),
@@ -3790,10 +3815,15 @@ _cute_dsl_wrapper_inputs["swiglu_limit"] = Scalar(
     optional=True,
     description="Set at wrapper __init__, not passed to run().",
 )
-_cute_dsl_wrapper_inputs["quant_mode"] = Scalar(
+_cute_dsl_wrapper_inputs["quant"] = Scalar(
     "string",
     optional=True,
-    description="Compute mode set at wrapper __init__, not passed to run().",
+    description="QuantConfig set at wrapper __init__, not passed to run().",
+)
+_cute_dsl_wrapper_inputs["weight_interleave"] = Scalar(
+    "int32",
+    optional=True,
+    description="Prepared-weight layout tag, optionally checked at wrapper __init__.",
 )
 _cute_dsl_wrapper_inputs["situ_beta"] = Scalar(
     "float32",
@@ -4187,32 +4217,55 @@ def _cute_dsl_fused_moe_reference(
     swiglu_alpha=DEFAULT_SWIGLU_ALPHA,
     swiglu_beta=DEFAULT_SWIGLU_BETA,
     swiglu_limit=DEFAULT_SWIGLU_LIMIT,
-    quant_mode="w4a4",
+    quant=None,
+    quant_mode=None,
+    weight_interleave=64,
     situ_beta=None,
     situ_linear_beta=None,
     per_token_scale=None,
+    w1_bias=None,
+    w2_bias=None,
     **_unused,
 ):
     """Reference for CuteDSL block-scaled MoE with alpha folded into weights."""
+    from ...fused_moe.api import QuantConfig, QuantFormat
+
+    if quant is None:
+        mode = (quant_mode or "w4a4").lower()
+        quant = QuantConfig(
+            weight=QuantFormat.MXFP4 if mode == "w4a8" else QuantFormat.NVFP4,
+            activation={"w4a8": QuantFormat.MXFP8, "w4a16": QuantFormat.BF16}.get(
+                mode, QuantFormat.NVFP4
+            ),
+        )
     E_local = w1_weight.shape[0]
     # Dequantize input and weights with alpha factors.
-    quant_mode = quant_mode.lower()
-    if quant_mode in ("nvfp4", "w4a4"):
+    if (quant.activation, quant.weight) == (
+        QuantFormat.NVFP4,
+        QuantFormat.NVFP4,
+    ):
         if x_sf is None:
-            raise ValueError("x_sf is required when quant_mode='w4a4'")
+            raise ValueError("x_sf is required for W4A4")
         hs_deq = _dequantize_fp4_tensor(x, x_sf, is_ue8m0_scales=False)
-    elif quant_mode == "w4a8":
+    elif (quant.activation, quant.weight) == (
+        QuantFormat.MXFP8,
+        QuantFormat.MXFP4,
+    ):
         if x_sf is None:
-            raise ValueError("x_sf is required when quant_mode='w4a8'")
+            raise ValueError("x_sf is required for W4A8")
         hs_deq = _dequantize_fp4_hidden_states(x, x_sf, is_weights_mxfp4=True)
-    elif quant_mode == "w4a16":
+    elif (quant.activation, quant.weight) == (
+        QuantFormat.BF16,
+        QuantFormat.NVFP4,
+    ):
         if x_sf is not None:
-            raise ValueError("x_sf must be None when quant_mode='w4a16'")
+            raise ValueError("x_sf must be None when format is w4a16")
         hs_deq = x.to(torch.float32)
     else:
-        raise ValueError(f"Unsupported quant_mode {quant_mode!r}")
-    is_mxfp4 = quant_mode == "w4a8"
-    if is_mxfp4:
+        raise ValueError(
+            f"unsupported format pair ({quant.activation!r}, {quant.weight!r})"
+        )
+    if quant.weight is QuantFormat.MXFP4:
 
         def mma_scales_to_logical(scales, rows, columns):
             groups = scales.shape[5]
@@ -4228,12 +4281,27 @@ def _cute_dsl_fused_moe_reference(
         w2_weight_sf = mma_scales_to_logical(
             w2_weight_sf, w2_weight.shape[1], w2_weight.shape[2] * 2
         )
-    W1 = _dequantize_fp4_tensor(w1_weight, w1_weight_sf, is_ue8m0_scales=is_mxfp4)
-    W2 = _dequantize_fp4_tensor(w2_weight, w2_weight_sf, is_ue8m0_scales=is_mxfp4)
+    W1 = _dequantize_fp4_tensor(
+        w1_weight, w1_weight_sf, is_ue8m0_scales=quant.weight is QuantFormat.MXFP4
+    )
+    W2 = _dequantize_fp4_tensor(
+        w2_weight, w2_weight_sf, is_ue8m0_scales=quant.weight is QuantFormat.MXFP4
+    )
+    if normalize_activation_type(activation_type).is_gated:
+        experts, rows, hidden = W1.shape
+        W1 = (
+            W1.view(
+                experts, rows // (2 * weight_interleave), 2, weight_interleave, hidden
+            )
+            .transpose(1, 2)
+            .reshape_as(W1)
+        )
     if per_token_scale is not None:
         hs_deq = hs_deq * per_token_scale.to(torch.float32).view(-1, 1)
-    W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
-    W2 = W2 * w2_alpha.to(torch.float32).view(E_local, 1, 1)
+    if w1_alpha is not None:
+        W1 = W1 * w1_alpha.to(torch.float32).view(E_local, 1, 1)
+    if w2_alpha is not None:
+        W2 = W2 * w2_alpha.to(torch.float32).view(E_local, 1, 1)
     return _moe_bf16_run_experts(
         hs_deq,
         W1,
@@ -4248,6 +4316,8 @@ def _cute_dsl_fused_moe_reference(
         gemm1_clamp_limit=swiglu_limit,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
+        gemm1_bias=w1_bias,
+        gemm2_bias=w2_bias,
     )
 
 

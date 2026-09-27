@@ -95,8 +95,8 @@ def run_moe_test(args):
         return testTrtllmFp8PerTensorScaleMoe(args)
     elif args.routine == "cutlass_fused_moe":
         return testCutlassFusedMoe(args)
-    elif args.routine == "cute_dsl_fp4_block_scale_moe":
-        return testCuteDslFp4BlockScaleMoe(args)
+    elif args.routine == "cute_dsl_fused_moe":
+        return testCuteDslFusedMoe(args)
     elif args.routine == "cute_dsl_bf16_moe":
         return testCuteDslBf16Moe(args)
     elif args.routine == "b12x_fused_moe":
@@ -237,7 +237,8 @@ def parse_moe_args(line, parser):
         default="nvfp4",
         choices=["nvfp4", "mxfp4_mxfp8", "mxfp4_bf16"],
         help=(
-            "FP4 quantization mode for trtllm_fp4_block_scale_moe: "
+            "FP4 quantization mode for trtllm_fp4_block_scale_moe and "
+            "cute_dsl_fused_moe (nvfp4 or mxfp4_mxfp8): "
             "nvfp4 (NvFP4 weights + NvFP4 hidden states, block_size=16), "
             "mxfp4_mxfp8 (MXFP4 weights + MXFP8 hidden states, block_size=32), "
             "mxfp4_bf16 (MXFP4 weights + BF16 hidden states, block_size=32). "
@@ -253,7 +254,7 @@ def parse_moe_args(line, parser):
         help=(
             "Use the functional MoE API instead of the wrapper class: "
             "cute_dsl_fused_moe vs CuteDslMoEWrapper for "
-            "cute_dsl_fp4_block_scale_moe, and b12x_fused_moe vs B12xMoEWrapper for "
+            "cute_dsl_fused_moe, and b12x_fused_moe vs B12xMoEWrapper for "
             "b12x_fused_moe. Useful for verifying that the wrapper's workspace cache "
             "eliminates per-call allocation overhead."
         ),
@@ -1385,15 +1386,19 @@ def _create_nvfp4_moe_test_data(
         "w2_weight": w2_weight,
         "w2_weight_sf": w2_weight_sf,
         "w2_alpha": w2_alpha,
+        "w1_bf16": w1_bf16,
+        "w2_bf16": w2_bf16,
     }
 
 
-def testCuteDslFp4BlockScaleMoe(args):
+def testCuteDslFusedMoe(args):
     """
-    Test cute_dsl_fp4_block_scale_moe (CuTe DSL NVFP4 MoE on SM100/SM103).
+    Test cute_dsl_fused_moe (CuTe DSL block-scaled MoE on SM100/SM103).
 
     This test:
-    1. Creates NVFP4-quantized weights and fp4-quantized inputs for CuTe DSL kernels
+    1. Creates FP4-quantized weights and quantized inputs for CuTe DSL kernels:
+       ``--fp4_mode nvfp4`` (W4A4, NVFP4 x NVFP4) or ``mxfp4_mxfp8`` (W4A8,
+       MXFP4 weights x MXFP8 activations)
     2. Runs MoE via CuteDslMoEWrapper (or cute_dsl_fused_moe when
        ``--use_functional_api`` is set). SwiGLU only.
     3. Measures performance metrics (TFLOPS, TB/sec)
@@ -1408,10 +1413,23 @@ def testCuteDslFp4BlockScaleMoe(args):
         dict: List of dictionaries containing performance results
     """
     if args.verbose >= 1:
-        print("[INFO] Running testCuteDslFp4BlockScaleMoe")
+        print("[INFO] Running testCuteDslFusedMoe")
         print(f"[INFO] FlashInfer version: {flashinfer.__version__}")
 
     from flashinfer import CuteDslMoEWrapper
+    from flashinfer.fused_moe import CuteDslConfig, QuantConfig, QuantFormat
+
+    fp4_mode = getattr(args, "fp4_mode", "nvfp4")
+    if fp4_mode == "nvfp4":
+        quant = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+    elif fp4_mode == "mxfp4_mxfp8":
+        quant = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+    else:
+        raise ValueError(
+            "cute_dsl_fused_moe supports --fp4_mode nvfp4 or "
+            f"mxfp4_mxfp8, got {fp4_mode!r}"
+        )
+    is_w4a8 = fp4_mode == "mxfp4_mxfp8"
 
     device = get_device(args)
     if args.generate_repro_command:
@@ -1448,7 +1466,7 @@ def testCuteDslFp4BlockScaleMoe(args):
     activation_type = args.activation_type
     if activation_type != ActivationType.Swiglu:
         raise ValueError(
-            f"cute_dsl_fp4_block_scale_moe only supports Swiglu activation, "
+            f"cute_dsl_fused_moe only supports Swiglu activation, "
             f"got {activation_type.name}. Use --routine b12x_fused_moe for ReLU2."
         )
 
@@ -1464,6 +1482,27 @@ def testCuteDslFp4BlockScaleMoe(args):
         backend="cute-dsl",
         is_gated=True,
     )
+    if is_w4a8:
+        # Re-quantize the same BF16 data: MXFP4 weights with UE8M0 scales and
+        # MXFP8 activations with linear (unswizzled) scales.
+        tensors.update(
+            CuteDslConfig.prepare_weights(
+                tensors["w1_bf16"],
+                tensors["w2_bf16"],
+                quant=quant,
+                num_local_experts=local_num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+            )
+        )
+        x_q, x_sf = mxfp8_quantize(
+            tensors["x_bf16"], is_sf_swizzled_layout=False, alignment=128
+        )
+        tensors["x"] = x_q
+        tensors["x_sf"] = x_sf.view(torch.uint8).reshape(
+            x_q.shape[0], x_q.shape[1] // 32
+        )
+        tensors["fc2_input_scale"] = None
 
     if args.verbose >= 2:
         print(f"[VVERBOSE] x.shape = {tensors['x'].shape}")
@@ -1491,6 +1530,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             local_expert_offset=local_expert_offset,
             moe_output=moe_output,
             enable_pdl=args.enable_pdl,
+            quant=quant,
         )
 
         # Warmup call to populate workspace cache before timed region
@@ -1518,6 +1558,7 @@ def testCuteDslFp4BlockScaleMoe(args):
             num_local_experts=local_num_experts,
             local_expert_offset=local_expert_offset,
             enable_pdl=args.enable_pdl,
+            quant=quant,
         )
         runner = moe.run
 
@@ -1577,7 +1618,9 @@ def testCuteDslFp4BlockScaleMoe(args):
         )
         backend = "cute-dsl_autotune"
         if args.verbose >= 1:
-            print(f"[INFO] Autotune warmup for CuteDSL NVFP4 MoE: {warmup_iters} iters")
+            print(
+                f"[INFO] Autotune warmup for CuteDSL {fp4_mode} MoE: {warmup_iters} iters"
+            )
         autotune_args = tuple(
             t.clone() if isinstance(t, torch.Tensor) else t for t in input_args
         )
@@ -1619,8 +1662,8 @@ def testCuteDslFp4BlockScaleMoe(args):
         median_time,
         input_dtype,
         weight_dtype,
-        input_format="nvfp4",
-        weight_format="nvfp4",
+        input_format="mxfp8" if is_w4a8 else "nvfp4",
+        weight_format="mxfp4" if is_w4a8 else "nvfp4",
         routing_logits_dtype=None,
         active_experts=num_active_experts,
         verbose=args.verbose,
@@ -1646,7 +1689,7 @@ def testCuteDslFp4BlockScaleMoe(args):
         cur_res["local_num_experts"] = local_num_experts
         cur_res["input_dtype"] = input_dtype
         cur_res["weight_dtype"] = weight_dtype
-        cur_res["fp4_mode"] = "nvfp4"
+        cur_res["fp4_mode"] = fp4_mode
         cur_res["activation_type"] = activation_type.name
         res.append(cur_res)
 
