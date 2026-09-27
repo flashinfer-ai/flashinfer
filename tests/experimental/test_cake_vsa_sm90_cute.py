@@ -190,7 +190,7 @@ def test_split_and_cluster_stages_replay_bit_exactly(stage):
 @requires_hopper
 @requires_cute
 def test_plan_built_on_another_stream():
-    """The plan upload (device plan buffer) is ordered before a run on a different stream."""
+    """A plan built on another stream runs correctly (the plan is a by-value launch argument, nothing is uploaded)."""
     h, mb, nb = 1, 16, 16
     mask = _random_mask(h, mb, nb, 4, seed=17, ragged=True, device="cuda")
     rows, cols = _descriptors(mask)
@@ -276,7 +276,7 @@ def test_planner_unreachable_k3s_stage_matches_reference():
         "K": k,
         "Vt": v,
         "O": out,
-        "plan": plan["plan"].contiguous().to("cuda"),
+        "plan": plan["plan"].contiguous(),
         "seqlen_q": mb * BLOCK,
         "seqlen_k": nb * BLOCK,
         "scale_log2": HEAD_DIM**-0.5 * LOG2E,

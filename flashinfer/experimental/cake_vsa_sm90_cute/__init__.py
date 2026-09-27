@@ -233,6 +233,8 @@ class CuteStage:
         self.cluster_dims = tuple(int(dim) for dim in self.record["cluster_dims"])
         self.dynamic_smem_bytes = int(self.record["dynamic_smem_bytes"])
         self.param_arrays: Mapping[str, Any] = self.record["param_array_device_buffers"]
+        # By-value arrays kept in the kernel parameter space as Uint64 scalars.
+        self.param_slots: Mapping[str, Any] = self.record["param_array_scalar_slots"]
         self._entry = None
 
     def _compile(self):
@@ -290,11 +292,34 @@ class CuteStage:
                     args.extend(tma_metadata(name, self.tma[name], value))
             elif kind == "scalar":
                 args.append(value)
+            elif kind == "slots":
+                args.extend(self.slot_words(name, value))
             else:
                 raise NotImplementedError(
                     f"argument kind {kind!r} is not used by this route"
                 )
         return args
+
+    def slot_words(self, name: str, value: Any) -> list:
+        """A by-value array as its little-endian Uint64 scalar arguments (payload zero padded)."""
+        spec = self.param_slots[name]
+        if not isinstance(value, torch.Tensor):
+            raise TypeError(f"{name} must be a CPU torch.Tensor")
+        if value.is_cuda or value.dtype != _TORCH_DTYPES[str(spec["dtype"])]:
+            raise TypeError(
+                f"{name} must be a CPU {spec['dtype']} tensor of {spec['length']} elements"
+            )
+        if value.numel() != int(spec["length"]):
+            raise ValueError(
+                f"{name} must be a CPU {spec['dtype']} tensor of {spec['length']} elements"
+            )
+        payload = value.contiguous().view(-1).numpy().tobytes()
+        slots = int(spec["slots"])
+        payload += b"\0" * (slots * 8 - len(payload))
+        return [
+            int.from_bytes(payload[8 * i : 8 * i + 8], "little", signed=True)
+            for i in range(slots)
+        ]
 
     def run(self, bindings: Mapping[str, Any], grid: Tuple[int, int, int]) -> None:
         """Launch on the current torch stream (graph-capturable)."""

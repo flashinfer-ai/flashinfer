@@ -970,8 +970,9 @@ class CakeVsaSm90Plan:
         ``backend="cake"``) or ``"cute"`` (the same kernels rendered as CuTe DSL
         modules, ``backend="cake_cute"``; see
         :mod:`flashinfer.experimental.cake_vsa_sm90_cute`).  Plans, routes and
-        launch geometry are identical; the CuTe build reads the by-value plan
-        parameters from a device buffer uploaded once per plan.
+        launch geometry are identical; both builds take the plan / header
+        tables by value (the CuTe build as 8-byte scalar launch arguments read
+        from the kernel parameter space).
         """
         if engine not in ("cuda", "cute"):
             raise ValueError(f"unknown engine {engine!r}; expected 'cuda' or 'cute'")
@@ -1062,21 +1063,9 @@ class CakeVsaSm90Plan:
             # whose arrival counters must be zero before the first run
             # (``ready``); the kernel leaves them zero, so replays need no host
             # reset.  One run per split plan may be in flight at a time.
+            # Both builds take the plan by value (the CuTe DSL build as 8-byte
+            # scalar launch arguments read from the kernel parameter space).
             self.plan_param = plan["plan"].contiguous()
-            if self.engine == "cute":
-                # The CuTe DSL build reads the plan from a device buffer: upload
-                # it once here and record the event every run waits on.
-                with torch.cuda.device(self.device):
-                    host_plan = self.plan_param
-                    if non_blocking:
-                        host_plan = host_plan.pin_memory()
-                    self.plan_param_device = host_plan.to(
-                        self.device, non_blocking=non_blocking
-                    )
-                    self._host_plan = host_plan
-                    if not self.small_split:
-                        self.ready = torch.cuda.Event(external=True)
-                        self.ready.record(torch.cuda.current_stream(self.device))
             if self.small_split:
                 with torch.cuda.device(self.device):
                     self.partial_o = torch.empty(
@@ -1111,14 +1100,8 @@ class CakeVsaSm90Plan:
             if non_blocking:
                 host_meta = host_meta.pin_memory()
             self.meta = host_meta.to(self.device, non_blocking=non_blocking)
-            # By-value kernel parameter: stays on the host.
+            # By-value kernel parameter in both builds: stays on the host.
             self.hdr = plan["hdr"].contiguous()
-            if self.engine == "cute":
-                host_hdr = self.hdr
-                if non_blocking:
-                    host_hdr = host_hdr.pin_memory()
-                self.hdr_device = host_hdr.to(self.device, non_blocking=non_blocking)
-                self._host_hdr = host_hdr
             # The kernel's debug/timeline buffers are inert in the exported
             # build; they only have to exist on the device.
             self.dbg = torch.zeros((64,), dtype=torch.int32, device=self.device)
@@ -1212,10 +1195,12 @@ class CakeVsaSm90Plan:
             stream = torch.cuda.current_stream(self.device)
             if torch.cuda.is_current_stream_capturing():
                 self.captured = True
-            if self.small_kmax is None or self.small_split or self.engine == "cute":
-                # The plan (or the split workspace) may have been built on
-                # another stream: an event wait enqueues the dependency without
-                # a CPU synchronization.
+            if self.small_kmax is None or self.small_split:
+                # The device meta table (persistent route) or the split
+                # workspace may have been built on another stream: an event
+                # wait enqueues the dependency without a CPU synchronization.
+                # Unsplit / cluster plans are by-value launch arguments in
+                # both builds and need no wait.
                 stream.wait_event(self.ready)
             aligned_q = self._aligned(q)
             aligned_k = self._aligned(k)
@@ -1241,7 +1226,7 @@ class CakeVsaSm90Plan:
             "scale_log2": float(self.scale_log2),
         }
         if self.small_kmax is not None:
-            bindings["plan"] = self.plan_param_device
+            bindings["plan"] = self.plan_param
             if self.small_split:
                 bindings["Wo"] = self.partial_o
                 bindings["Ws"] = self.partial_stats
@@ -1249,7 +1234,7 @@ class CakeVsaSm90Plan:
             grid = (int(self.num_items), 1, 1)
         else:
             bindings["meta"] = self.meta
-            bindings["hdr"] = self.hdr_device
+            bindings["hdr"] = self.hdr
             bindings["tile_stride"] = int(self.tile_stride)
             bindings["dbg"] = self.dbg
             bindings["tl"] = self.tl
