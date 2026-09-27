@@ -81,6 +81,7 @@ NVFP4_NAME_BASELINE = {
     "nvfp4_4over6_config": None,
     "global_scale_is_tensor": True,
     "smooth_quant": False,
+    "fold_out_scale": False,
 }
 
 SVDQUANT_NAME_BASELINE = {
@@ -134,6 +135,7 @@ def test_nvfp4_kernel_name_signature_covers_codegen_params(getter):
         ),
         pytest.param("global_scale_is_tensor", False, id="global_scale_is_tensor"),
         pytest.param("smooth_quant", True, id="smooth_quant"),
+        pytest.param("fold_out_scale", True, id="fold_out_scale"),
     ],
 )
 def test_nvfp4_kernel_name_varies_with_every_argument(param, alternate):
@@ -274,6 +276,7 @@ MM_FP4_NAME_BASELINE = {
     "use_tma_store": None,
     "enable_pdl": False,
     "out_dtype": torch.bfloat16,
+    "per_token_alpha": None,
     "batch_size": 1,
     "max_active_clusters": 74,
 }
@@ -287,6 +290,7 @@ MM_FP4_NAME_PERTURBED = {
     "use_tma_store": True,
     "enable_pdl": True,
     "out_dtype": torch.float16,
+    "per_token_alpha": "m",
     "batch_size": 2,
     "max_active_clusters": 148,
 }
@@ -302,7 +306,11 @@ def _mm_fp4_name(**kwargs):
         kwargs["use_tma_store"],
     )
     cache_key = _mm_fp4_cache_key(
-        kwargs["sf_vec_size"], tactic, kwargs["enable_pdl"], kwargs["out_dtype"]
+        kwargs["sf_vec_size"],
+        tactic,
+        kwargs["enable_pdl"],
+        kwargs["out_dtype"],
+        kwargs["per_token_alpha"],
     )
     return _blockscaled_kernel_disk_name(
         cache_key, kwargs["batch_size"], kwargs["max_active_clusters"]
