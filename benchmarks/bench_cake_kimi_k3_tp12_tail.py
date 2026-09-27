@@ -26,9 +26,11 @@ NCCL ``all_reduce(routed_partial)`` -> ``flashinfer.norm.rmsnorm`` ->
 cuBLAS ``torch.mm`` (the full replicated up-projection) ->
 NCCL ``all_reduce(shared_partial)`` -> ``torch.add``, captured in one CUDA graph.
 Fused: ``flashinfer.kimi_k3_tp12_tail`` (three launches per rank), captured in
-one CUDA graph.  Timing is CUPTI kernel activity per rank (cold L2); the row
-time is the maximum over ranks of the per-rank medians (a collective finishes
-when its slowest rank does).
+one CUDA graph.  Timing is CUPTI kernel activity per rank (cold L2);
+``bench_gpu_time_with_cupti`` gathers every iteration's span from all ranks, the
+row time is the median over iterations of the maximum over ranks (a collective
+finishes when its slowest rank does), and every rank's own median is reported
+as the rank spread.
 """
 
 from __future__ import annotations
@@ -107,18 +109,37 @@ def graph_capture(run):
     return graph.replay, graph
 
 
-def rank_max_median_us(fn, *, warmup: int, iters: int) -> tuple[float, list[float]]:
-    """Median GPU time of ``fn`` on this rank, gathered from every rank: (max over ranks, per-rank list)."""
+def _per_rank(spans) -> tuple[float, ...]:
+    """``aggregate_op`` for ``bench_gpu_time_with_cupti``: keep every rank's span of the iteration."""
+    return tuple(float(v) for v in spans)
+
+
+def measure_us(fn, *, warmup: int, iters: int, world: int) -> tuple[float, list[float]]:
+    """Time ``fn`` with CUPTI on every rank: ``(row time, every rank's own median)`` in microseconds.
+
+    ``bench_gpu_time_with_cupti`` aggregates the per-iteration spans across the
+    initialised process group (elementwise ``max`` by default, which makes every
+    rank report the same numbers); with ``_per_rank`` each iteration comes back
+    as the tuple of all ranks' spans.  The row time is the median over
+    iterations of the maximum over ranks; the per-rank medians give the spread.
+    """
     times = bench_gpu_time_with_cupti(
-        fn, dry_run_iters=warmup, repeat_iters=iters, cold_l2_cache=True
+        fn,
+        dry_run_iters=warmup,
+        repeat_iters=iters,
+        cold_l2_cache=True,
+        aggregate_op=_per_rank,
     )
-    local = torch.tensor(
-        [statistics.median(times) * 1e3], dtype=torch.float64, device="cuda"
-    )
-    gathered = [torch.empty_like(local) for _ in range(dist.get_world_size())]
-    dist.all_gather(gathered, local)
-    per_rank = [float(t.item()) for t in gathered]
-    return max(per_rank), per_rank
+    if not times or any(not isinstance(t, tuple) or len(t) != world for t in times):
+        raise RuntimeError(
+            "bench_gpu_time_with_cupti did not gather the spans of all ranks; "
+            "the benchmark needs an initialised twelve-rank process group"
+        )
+    row_us = statistics.median(max(spans) for spans in times) * 1e3
+    per_rank_us = [
+        statistics.median(spans[r] for spans in times) * 1e3 for r in range(world)
+    ]
+    return row_us, per_rank_us
 
 
 def main() -> int:
@@ -166,13 +187,24 @@ def main() -> int:
                 order = list(arms) if g % 2 == 0 else list(reversed(arms))
                 for name in order:
                     dist.barrier()
-                    rank_max, per_rank = rank_max_median_us(
-                        arms[name], warmup=args.warmup, iters=args.iters
+                    row_us, per_rank = measure_us(
+                        arms[name], warmup=args.warmup, iters=args.iters, world=world
                     )
-                    samples[name].append(rank_max)
+                    samples[name].append(row_us)
                     per_rank_samples[name].append(per_rank)
             stock_us = statistics.median(samples["stock_graph"])
             fused_us = statistics.median(samples["fused_graph"])
+            # every rank's own median (over iterations, then over the groups) and its spread
+            per_rank_us = {
+                name: [
+                    statistics.median(group[r] for group in groups)
+                    for r in range(world)
+                ]
+                for name, groups in per_rank_samples.items()
+            }
+            rank_spread_us = {
+                name: max(values) - min(values) for name, values in per_rank_us.items()
+            }
             row = dict(
                 M=M,
                 stock_us=stock_us,
@@ -180,20 +212,16 @@ def main() -> int:
                 speedup=stock_us / fused_us,
                 max_abs_diff_vs_stock=max_abs,
                 kernels=list(runner.kernel_keys),
-                # per-rank medians over the groups (the row time is the maximum over ranks)
-                per_rank_us={
-                    name: [
-                        statistics.median(group[r] for group in groups)
-                        for r in range(world)
-                    ]
-                    for name, groups in per_rank_samples.items()
-                },
+                per_rank_us=per_rank_us,
+                rank_spread_us=rank_spread_us,
             )
             rows.append(row)
             if rank == 0:
                 print(
                     f"M={M:5d}  stock {stock_us:8.1f} us  fused {fused_us:8.1f} us  "
-                    f"speedup {row['speedup']:.2f}x  max|diff| {max_abs:.4f}  {runner.kernel_keys}",
+                    f"speedup {row['speedup']:.2f}x  max|diff| {max_abs:.4f}  "
+                    f"rank spread {rank_spread_us['stock_graph']:.1f} / "
+                    f"{rank_spread_us['fused_graph']:.1f} us  {runner.kernel_keys}",
                     flush=True,
                 )
             del arms, stock_replay, fused_replay, stock_graph, fused_graph
