@@ -56,6 +56,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define TMEM_TMEM_SFX_OFFSET 40
 #define NUM_TMA_PIPE_STAGES 4
 #define NUM_MAINLOOP_PIPE_STAGES 1
+#define NUM_XB_PIPE_STAGES 4
 #define SMEM_SMEM_W_OFF 1024
 #define SMEM_SMEM_W_STAGE_BYTES 32768
 #define SMEM_SMEM_W_STRIDE 51200
@@ -1008,7 +1009,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(448) void
-kernel_cake_kimi_k3_fp8_projection_d8fbd4ef9510ad4ee009(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
+kernel_cake_kimi_k3_fp8_projection_e4f401c8686b0a1990ec(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1067,6 +1068,7 @@ kernel_cake_kimi_k3_fp8_projection_d8fbd4ef9510ad4ee009(const __grid_constant__ 
             mbarrier_init(smem + 40, 1);
             mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 56, 1);
+            // --- pipeline 'xb_pipe' ---
             // xb_full: 4 barriers, init_count=1
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
@@ -1436,7 +1438,9 @@ kernel_cake_kimi_k3_fp8_projection_d8fbd4ef9510ad4ee009(const __grid_constant__ 
             const int qwarp = warp - 6;
             const int half = lane >> 4;
             const int half_lane = lane & 15;
+            const int lane_q = lane;
             unsigned int q_stage = 0;
+            unsigned int xb_q = 0;
             unsigned int _phase_mma_done_1 = 1;
             unsigned int _phase_xb_full = 0;
             #pragma unroll 1
@@ -1452,9 +1456,9 @@ kernel_cake_kimi_k3_fp8_projection_d8fbd4ef9510ad4ee009(const __grid_constant__ 
                 #pragma unroll 1
                 for (int i_2 = 0; i_2 < k_count_3; i_2++) {
                     mbarrier_wait(mma_done_addr + (q_stage) * 8, _phase_mma_done_1);
-                    mbarrier_wait(xb_full_addr + (q_stage) * 8, _phase_xb_full);
+                    mbarrier_wait(xb_full_addr + (xb_q) * 8, _phase_xb_full);
                     unsigned int x_stage = smem_x_addr + q_stage * 51200;
-                    unsigned int xb_stage = smem_xb_addr + q_stage * 51200;
+                    unsigned int xb_stage = smem_xb_addr + xb_q * 51200;
                     unsigned int sf_stage_off = q_stage * 51200;
                     unsigned int words_all[8];
                     #pragma unroll
@@ -1608,7 +1612,9 @@ kernel_cake_kimi_k3_fp8_projection_d8fbd4ef9510ad4ee009(const __grid_constant__ 
                         mbarrier_arrive(tma_full_addr + (q_stage) * 8);
                     }
                     q_stage += 1;
-                    if (q_stage == 4) { q_stage = 0; _phase_mma_done_1 ^= 1; _phase_xb_full ^= 1; }
+                    if (q_stage == 4) { q_stage = 0; _phase_mma_done_1 ^= 1; }
+                    xb_q += 1;
+                    if (xb_q == 4) { xb_q = 0; _phase_xb_full ^= 1; }
                 }
             }
         }
