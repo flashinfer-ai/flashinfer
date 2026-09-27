@@ -397,8 +397,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)), (tiled_mma.thr_id.shape,)
         )
-        # One TMEM load of up to 32 columns per subtile, like the reference kernels.
-        self.epi_tile = (self.mma_tiler[0], min(32, self.n_tile))
+        # One TMEM load of up to 32 columns per subtile, like the reference
+        # kernels; the accumulator of one CTA spans its 128 weight rows.
+        self.epi_tile = (self.cta_tile_shape_mnk[0], min(32, self.n_tile))
 
         (
             self.num_acc_stage,
@@ -2649,6 +2650,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             if sk_do_split:
                 cute.arch.cluster_arrive_relaxed()
                 cute.arch.cluster_wait()
+        if cutlass.const_expr(self.two_cta):
+            # Neither CTA of the pair leaves while the other may still signal
+            # its barriers (multicast releases, relay / accumulator arrivals).
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
 
     # ------------------------------------------------------------------
     # Raw-pointer wrapper (compiled once per tactic, shapes are runtime)
