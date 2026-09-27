@@ -112,6 +112,20 @@ from .utils import (
 )
 
 
+def _cudnn_identity_scales(q, k, v, q_scale, k_scale, v_scale):
+    # Python unit scales carry no run-time state. Tensor scales may change after
+    # capture, and FP8 must retain its explicit scale bindings even for 1.0.
+    return (
+        q.dtype in (torch.float16, torch.bfloat16)
+        and k.dtype == q.dtype
+        and v.dtype == q.dtype
+        and all(
+            scale is None or (isinstance(scale, (float, int)) and scale == 1.0)
+            for scale in (q_scale, k_scale, v_scale)
+        )
+    )
+
+
 def _stage_lse(
     lse: Optional[torch.Tensor],
     lse_layout: str,
@@ -3610,6 +3624,11 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        if self._backend == "cudnn" and (
+            q_scale is not None or k_scale is not None or v_scale is not None
+        ):
+            if _cudnn_identity_scales(q, k_cache, v_cache, q_scale, k_scale, v_scale):
+                q_scale = k_scale = v_scale = None
         native_hn = (
             return_lse
             and lse_layout == "HN"
@@ -5261,6 +5280,11 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
+        if self._backend == "cudnn" and (
+            q_scale is not None or k_scale is not None or v_scale is not None
+        ):
+            if _cudnn_identity_scales(q, k, v, q_scale, k_scale, v_scale):
+                q_scale = k_scale = v_scale = None
         native_hn = (
             return_lse
             and lse_layout == "HN"

@@ -135,17 +135,23 @@ def _reference(q, k, v, qo, ip, ix, last, *, causal, scale, sinks=None):
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize("paged", [False, True])
 @pytest.mark.parametrize("return_lse", [False, True])
+@pytest.mark.parametrize("unit_scales", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_prefill_warm_run_does_not_rebuild_plan_metadata(
-    monkeypatch, paged, return_lse
+    monkeypatch, paged, return_lse, unit_scales, dtype
 ):
-    if not prefill._cudnn_supports_direct_seqlens(torch.bfloat16, mixed=paged):
+    if not prefill._cudnn_supports_direct_seqlens(dtype, mixed=paged):
         pytest.skip("requires direct cuDNN cumulative sequence lengths")
     q, k, v, qo, ip, ix, last = _paged_inputs()
+    q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
+    scales = dict(q_scale=1.0, k_scale=1, v_scale=1.0) if unit_scales else {}
     ws = torch.empty(128 << 20, dtype=torch.uint8, device=q.device)
     if paged:
         w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(ws, "NHD", backend="cudnn")
         plan = lambda: w.plan(qo, ip, ix, last, 8, 2, 128, 16, q_data_type=q.dtype)
-        run = lambda query, value: w.run(query, (k, value), return_lse=return_lse)
+        run = lambda query, value: w.run(
+            query, (k, value), return_lse=return_lse, **scales
+        )
         value = v
     else:
         w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(ws, backend="cudnn")
@@ -153,7 +159,9 @@ def test_prefill_warm_run_does_not_rebuild_plan_metadata(
         keys = torch.cat([k[ix[:3]].flatten(0, 1)[:33], k[ix[3:]].flatten(0, 1)[:17]])
         value = torch.cat([v[ix[:3]].flatten(0, 1)[:33], v[ix[3:]].flatten(0, 1)[:17]])
         plan = lambda: w.plan(qo, kv, 8, 2, 128, q_data_type=q.dtype)
-        run = lambda query, value: w.run(query, keys, value, return_lse=return_lse)
+        run = lambda query, value: w.run(
+            query, keys, value, return_lse=return_lse, **scales
+        )
     plan()
     run(q, value)
     prepared = w._cudnn_prepared
@@ -185,6 +193,33 @@ def test_prefill_warm_run_does_not_rebuild_plan_metadata(
             lse, stats * math.log2(math.e), atol=0.003, rtol=0.003
         )
     assert w._cudnn_prepared is prepared
+    if unit_scales:
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.graph(graph):
+                captured = run(query, value)
+            query.mul_(0.5)
+            value.mul_(0.5)
+            graph.replay()
+            out, lse = captured if return_lse else (captured, None)
+            ref, stats = _reference(
+                query,
+                k,
+                -v * 0.5,
+                qo,
+                ip,
+                ix,
+                last,
+                causal=False,
+                scale=128**-0.5,
+            )
+            torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+            if return_lse:
+                torch.testing.assert_close(
+                    lse, stats * math.log2(math.e), atol=0.003, rtol=0.003
+                )
+        finally:
+            graph.reset()
 
 
 def test_prefill_plan_snapshots_layout_and_replan_rekeys(monkeypatch):
