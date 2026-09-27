@@ -350,12 +350,18 @@ def test_registry_records_match_the_host_binding():
             tail = bool(record.get("tail", False))
             key = (record["arch"], int(record["splits"]), tail)
             expected_plan = EXPECTED_ARG_PLAN
-            assert cake_jit.select_module(record["arch"], int(record["splits"]), tail=tail) == name
+            assert (
+                cake_jit.select_module(record["arch"], int(record["splits"]), tail=tail)
+                == name
+            )
             if tail:
                 # A last-round-split program names the parts it was frozen for.
                 assert int(record["splits"]) > 1
                 capacity = record["cluster_capacity"]
-                assert capacity and all(int(sms) > 0 and int(ctas) >= int(record["splits"]) for sms, ctas in capacity.items())
+                assert capacity and all(
+                    int(sms) > 0 and int(ctas) >= int(record["splits"])
+                    for sms, ctas in capacity.items()
+                )
                 assert record in cake_jit.tail_records(record["arch"])
         else:
             assert int(record["max_pages"]) >= 1

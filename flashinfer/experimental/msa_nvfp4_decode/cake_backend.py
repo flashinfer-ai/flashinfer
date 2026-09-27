@@ -70,7 +70,11 @@ STATS_PER_SLOT = PAGE_SIZE  # partial max/sum entries per (item, split) slot
 PARTIAL_O_PER_SLOT = STATS_PER_SLOT * HEAD_DIM
 WORKSPACE_ALIGN = 256
 TMA_ALIGN = 16
-SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a", (10, 7): "sm_107a"}
+SUPPORTED_COMPUTE_CAPABILITIES = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+}
 LN2 = math.log(2.0)
 
 # Semantic argument names of the single stage, in the order the generated
@@ -178,7 +182,9 @@ def persistent_cta_capacity(device: torch.device) -> int:
     """Number of CTAs the persistent grid may hold on ``device``."""
     arch = arch_for(device)
     if arch is None:
-        raise ValueError("NVFP4 MSA decode requires compute capability 10.0, 10.3 or 10.7")
+        raise ValueError(
+            "NVFP4 MSA decode requires compute capability 10.0, 10.3 or 10.7"
+        )
     sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     return sms * ctas_per_sm(arch)
 
@@ -440,7 +446,15 @@ def bind_decode_payload(
     module = load_cake_msa_nvfp4_decode_module(module_name, "main")
     entry = getattr(module, physical["ffi_entry"])
     return MSANvfp4DecodeRunner(
-        module_name, int(splits), main_kwargs, out, lse, entry, arguments, route, bool(tail)
+        module_name,
+        int(splits),
+        main_kwargs,
+        out,
+        lse,
+        entry,
+        arguments,
+        route,
+        bool(tail),
     )
 
 
@@ -703,7 +717,9 @@ def prepare_msa_nvfp4_sparse_decode(
 
     capacity = persistent_cta_capacity(device)
     splits = split_factor(total_work_items, capacity, max_pages)
-    tail = tail_plan(arch, total_work_items, capacity, max_pages) if splits == 1 else None
+    tail = (
+        tail_plan(arch, total_work_items, capacity, max_pages) if splits == 1 else None
+    )
     if tail is not None:
         # Last-round split: every full persistent round runs whole items and
         # only the remainder items of the last round run as ``splits``-CTA
@@ -778,4 +794,6 @@ def prepare_msa_nvfp4_sparse_decode(
         grid=grid,
     )
     assert tuple(main_kwargs) == MAIN_KWARGS
-    return bind_decode_payload(arch, splits, main_kwargs, out, lse, tail=tail is not None)
+    return bind_decode_payload(
+        arch, splits, main_kwargs, out, lse, tail=tail is not None
+    )
