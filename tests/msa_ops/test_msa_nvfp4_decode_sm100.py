@@ -126,12 +126,12 @@ _E2M1 = [
 def _supported_device() -> bool:
     if not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_capability(0) in ((10, 0), (10, 3))
+    return torch.cuda.get_device_capability(0) in ((10, 0), (10, 3), (10, 7))
 
 
 sm100_only = pytest.mark.skipif(
     not _supported_device(),
-    reason="requires an MSA-capable compute capability 10.0/10.3 device",
+    reason="requires an MSA-capable compute capability 10.0/10.3/10.7 device",
 )
 
 
@@ -703,7 +703,7 @@ def test_allowlist_and_stats_agree_with_the_module_constants():
     assert sum(n.startswith("pinned_") for n in stats["kernel_instantiations"]) == 6
     assert stats["compile_cache_key"] == "(compute capability target,)"
     assert stats["precompiled"] is False
-    assert stats["supported_compute_capability"] == [(10, 0), (10, 3)]
+    assert stats["supported_compute_capability"] == [(10, 0), (10, 3), (10, 7)]
 
 
 def test_the_cuda_graph_contract_is_stated_where_a_consumer_can_read_it():

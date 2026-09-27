@@ -36,7 +36,10 @@ _HEAD_DIM = 128
 _TOPK_SELECT = 16
 _ATTENTION_TOPK = 16
 _SUPPORTED_ATTENTION_TOPK = {4, 8, 16, 32}
-_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3)}
+# Compute capability 10.7 (Rubin) is admitted for the packed-NVFP4 paged-KV
+# routes only; the dense SM100/SM103 kernels are not qualified there yet and
+# ``_select_target`` rejects it explicitly.
+_SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0), (10, 3), (10, 7)}
 _M128_Q_TILE = 256
 _M128_GQA8_Q_TILE = 32
 _M128_GQA16_Q_TILE = 16
@@ -117,6 +120,11 @@ def _select_target(device: torch.device) -> "BlackwellMSATarget":
             "the SM100/SM103 MSA backend requires compute capability 10.0 or 10.3; "
             f"got {compute_capability[0]}.{compute_capability[1]}"
         )
+    if compute_capability == (10, 7):
+        # The packed-NVFP4 paged-KV routes carry this target in their launch
+        # signatures; the dense SM100/SM103 kernels are not qualified on 10.7
+        # and _get_module raises when a caller reaches them.
+        return "sm107a"
     if compute_capability == (10, 3):
         if _cuda_version_at_least("12.9"):
             return "sm103a"
@@ -129,6 +137,12 @@ def _select_target(device: torch.device) -> "BlackwellMSATarget":
 def _get_module(variant: "BlackwellMSAVariant", target: "BlackwellMSATarget"):
     from ..jit.blackwell_msa import get_blackwell_msa_module
 
+    if target == "sm107a":
+        raise RuntimeError(
+            "the dense SM100/SM103 MSA backend is not qualified on compute "
+            "capability 10.7 (Rubin); only the packed-NVFP4 paged-KV routes are "
+            "enabled there"
+        )
     return get_blackwell_msa_module(variant, target)
 
 
@@ -2787,7 +2801,7 @@ def blackwell_msa_sparse_decode_attention(
         # that passed `out` is relying on the result landing there.
         raise NotImplementedError(
             "out= is implemented by the packed-NVFP4 paged-KV decode route on "
-            "compute capability 10.0/10.3, and that route declined this call"
+            "compute capability 10.0/10.3/10.7, and that route declined this call"
         )
     k_global_multiplier, output_scale = _validate_scale_arguments(
         q=q,

@@ -125,9 +125,9 @@ def _require_supported_gpu() -> torch.device:
 
     device = torch.device("cuda")
     capability = get_compute_capability(device)
-    minimum_cuda = {(10, 0): "12.8", (10, 3): "12.9"}.get(capability)
+    minimum_cuda = {(10, 0): "12.8", (10, 3): "12.9", (10, 7): "13.4"}.get(capability)
     if minimum_cuda is None:
-        pytest.skip("requires compute capability 10.0 or 10.3")
+        pytest.skip("requires compute capability 10.0, 10.3 or 10.7")
     cuda_version = torch.version.cuda
     if cuda_version is None:
         pytest.skip("requires a CUDA-enabled PyTorch build")
