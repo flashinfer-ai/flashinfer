@@ -111,6 +111,14 @@ def test_decode_plan_rules():
     assert decode_tail_plan(8, i_local_for_tp(8), 8)["smem_b1"]
     t16 = decode_tail_plan(16, i_local_for_tp(8), 8)
     assert t16["smem_b1"] and t16["rows_smem"] and t16["stages"] == 5
+    assert (
+        not t16["tmap_prefetch"]
+        and decode_tail_plan(8, i_local_for_tp(8), 8)["tmap_prefetch"]
+    )
+    # one ring stage fewer than the smem budget for the small-T tail (T16 keeps its 5)
+    assert decode_tail_plan(1, i_local_for_tp(8), 8)["stages"] == 8
+    assert decode_tail_plan(8, i_local_for_tp(8), 8)["stages"] == 8
+    assert decode_tail_plan(1, i_local_for_tp(1), 1)["stages"] == 10
     assert not decode_tail_plan(32, i_local_for_tp(8), 8)["smem_b1"]
     assert not decode_tail_plan(32, i_local_for_tp(1), 1)["smem_b1"]
     assert not decode_tail_plan(16, i_local_for_tp(1), 1)["rows_smem"]

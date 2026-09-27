@@ -91,6 +91,9 @@ SMEM_B1_MAX_TOKENS = 2 * EPI_WARPS
 SMEM_B1_MIN_STAGES = 6
 SMEM_B1_MAX_TOKENS_RS = 4 * EPI_WARPS
 SMEM_B1_MIN_STAGES_RS = 5
+TAIL_STAGE_TRIM_MAX_N_PAD = 8
+TAIL_STAGE_TRIM = 1
+ROWS_NO_TMAP_PREFETCH_MIN_N_PAD = 16
 #: Front stage: K depth 2 while the depth-2 ring keeps this many stages per cluster mode
 #: (1 = one CTA per tile, 2 = cluster pairs); the tail keeps depth 1 (kernel module constant).
 FRONT_KD2_MIN_STAGES = {1: 4, 2: 6}
@@ -314,6 +317,13 @@ def decode_tail_plan(
             use_rows = False
         elif use_bn:
             stages = bn_stages
+    if n_pad <= TAIL_STAGE_TRIM_MAX_N_PAD:
+        stages = max(
+            stages - TAIL_STAGE_TRIM,
+            SMEM_B1_MIN_STAGES_RS
+            if use_rows
+            else (SMEM_B1_MIN_STAGES if use_bn else 2),
+        )
     return dict(
         grid=grid,
         n_pad=n_pad,
@@ -340,7 +350,7 @@ def decode_tail_plan(
         rows_smem=bool(use_rows),
         timeline=False,
         gate_pro=GATE_PRO,
-        tmap_prefetch=True,
+        tmap_prefetch=not (use_rows and n_pad >= ROWS_NO_TMAP_PREFETCH_MIN_N_PAD),
         tiles=tiles,
         k1=k1,
         k2=k2,
