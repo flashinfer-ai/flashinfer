@@ -644,12 +644,18 @@ def _smallm_sm_count(device: torch.device) -> int:
 # On-device load-balanced split-KV BF16 decode (Cake route
 # ``decode_balanced_bf16_v1``).  The band is host metadata only: the caller's
 # KV length bound (``max_seq_len``) and the number of (request, KV head) work
-# tiles; below it the static grid-stride route keeps every tile whole.  Values
-# mirror the Cake dispatcher's per-arch ``ROUTE_BAND`` and were set from paired
+# tiles, per query-length class.  For ``q_len == 1`` the static grid-stride
+# route keeps every tile whole below the band; the packed MTP tiles
+# (``q_len`` 3..8) take the balanced kernel at every shape (1.6-11.8x faster
+# than the static route on every measured shape, B200 + GB300).  Values mirror
+# the Cake dispatcher's per-arch ``ROUTE_BAND`` and were set from paired
 # same-input cold-L2 CUPTI measurements on B200 / GB300.
-CAKE_FMHA_BALANCED_ROUTE_BAND: dict[str, tuple[int, int]] = {
-    "sm100a": (32768, 9),  # (min KV length bound, min work tiles)
-    "sm103a": (32768, 9),
+CAKE_FMHA_BALANCED_ROUTE_BAND: dict[str, dict[str, tuple[int, int]]] = {
+    "sm100a": {
+        "q1": (32768, 9),
+        "mtp": (1, 1),
+    },  # (min KV length bound, min work tiles)
+    "sm103a": {"q1": (32768, 9), "mtp": (1, 1)},
 }
 CAKE_FMHA_BALANCED_MAX_REQUESTS = 1024
 CAKE_FMHA_BALANCED_MTP_Q_LENS = (3, 4, 5, 6, 7, 8)
@@ -672,15 +678,16 @@ def _balanced_workspace_bounds(sm_count: int) -> tuple[int, int]:
 def cake_fmha_balanced_counter_bytes(sm_count: int, q_len: int = 8) -> int:
     """Zero-initialized counter bytes the balanced route needs.
 
-    Tile counters (one per split tile for the row kernel, two for the packed
-    MTP kernel) are followed by the four 16-byte-aligned queue counters.  The
-    kernel resets every counter it touched before it exits, so a buffer zeroed
-    once at allocation can be reused across launches (the trtllm-gen
+    Tile counters (one word per split tile for the row kernel; four for the
+    packed MTP kernel: arrivals, the two reduce-queue words and the two-chunk
+    published flag) are followed by the four 16-byte-aligned queue counters.
+    The kernel resets every counter it touched before it exits, so a buffer
+    zeroed once at allocation can be reused across launches (the trtllm-gen
     ``multi_ctas_kv_counter_buffer`` contract).
     """
 
     _, max_split_tiles = _balanced_workspace_bounds(sm_count)
-    counters_per_tile = 1 if q_len == 1 else 2
+    counters_per_tile = 1 if q_len == 1 else 4
     tile_bytes = max_split_tiles * counters_per_tile * 4
     return (tile_bytes + 15) // 16 * 16 + 4 * 4
 
@@ -723,10 +730,10 @@ def _balanced_route_supported(
         return False
     if batch_size > CAKE_FMHA_BALANCED_MAX_REQUESTS:
         return False
-    band = CAKE_FMHA_BALANCED_ROUTE_BAND.get(target)
-    if band is None:
+    arch_band = CAKE_FMHA_BALANCED_ROUTE_BAND.get(target)
+    if arch_band is None:
         return False
-    min_kv_len, min_work_tiles = band
+    min_kv_len, min_work_tiles = arch_band["q1" if q_len == 1 else "mtp"]
     if max_seq_len < min_kv_len or batch_size * num_kv_heads < min_work_tiles:
         return False
     if not workspace_buffer.is_contiguous():

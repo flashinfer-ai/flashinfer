@@ -3170,8 +3170,8 @@ def test_cake_fmha_balanced_decode_route_owns_long_ragged_gqa8_decode(
             q_len
         )
 
-    # Host-metadata band: below 32 K KV or below nine (request, KV head) work
-    # tiles the incumbent route keeps the batch.
+    # Host-metadata band (q_len 1 only): below 32 K KV or below nine
+    # (request, KV head) work tiles the incumbent route keeps the batch.
     short = _balanced_decode_kwargs(
         batch_size=16, q_len=1, num_kv_heads=1, seq_lens=[32767] * 16
     )
@@ -3182,6 +3182,25 @@ def test_cake_fmha_balanced_decode_route_owns_long_ragged_gqa8_decode(
     )
     few_route = cake_api.select_cake_fmha_decode_route(few["query"].device, **few)
     assert few_route is not None and few_route.component == "decode_native_bf16"
+    # The packed MTP tiles take the balanced kernel at every KV length and
+    # tile count (1.6-11.8x faster than the grid-stride route on every
+    # measured short / few-tile shape).
+    for q_len, batch_size, seq_lens in (
+        (3, 8, [4096] * 8),
+        (7, 1, [60007]),
+        (7, 4, [300, 257, 5000, 777]),
+        (8, 2, [128, 16]),
+    ):
+        mtp_small = _balanced_decode_kwargs(
+            batch_size=batch_size, q_len=q_len, num_kv_heads=1, seq_lens=seq_lens
+        )
+        mtp_small_route = cake_api.select_cake_fmha_decode_route(
+            mtp_small["query"].device, **mtp_small
+        )
+        assert (
+            mtp_small_route is not None
+            and mtp_small_route.component == "decode_balanced_bf16"
+        ), (q_len, batch_size, seq_lens)
 
     # Fail closed on every field the exported kernels do not serve.
     for mutation in (
@@ -3218,8 +3237,8 @@ def test_cake_fmha_balanced_decode_buffer_sizing_is_shape_independent() -> None:
     assert cake_api._balanced_workspace_bounds(148) == (2368, 1184)
     # q_len 1: one u32 per split tile, then four 16-byte-aligned queue counters.
     assert cake_api.cake_fmha_balanced_counter_bytes(148, 1) == 1184 * 4 + 16
-    # MTP: two counters per split tile.
-    assert cake_api.cake_fmha_balanced_counter_bytes(148, 8) == 1184 * 2 * 4 + 16
+    # MTP: four counter words per split tile (arrivals, reduce queue A/B, published flag).
+    assert cake_api.cake_fmha_balanced_counter_bytes(148, 8) == 1184 * 4 * 4 + 16
     assert cake_api.cake_fmha_balanced_counter_bytes(
         148
     ) == cake_api.cake_fmha_balanced_counter_bytes(148, 8)
