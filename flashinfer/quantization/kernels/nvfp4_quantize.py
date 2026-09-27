@@ -77,6 +77,8 @@ from ..quantization_cute_dsl_utils import (
     bfloat2x8_to_e2m1x16_packed,
     process_nvfp4_block_half,
     process_nvfp4_block_bfloat,
+    _quantize_nvfp4_from_h2x8_bfloat,
+    _quantize_nvfp4_from_h2x8_half,
     process_nvfp4_block_bfloat_smooth,
     process_nvfp4_block_fp8,
     process_nvfp4_silu_block_half,
@@ -841,14 +843,51 @@ class NVFP4QuantizeSwizzledKernel:
 
 
 _PER_TOKEN_THREADS = 128
-_PER_TOKEN_WARPS = _PER_TOKEN_THREADS // WARP_SIZE
+_PER_TOKEN_MAX_THREADS = 512
+# 8 x 32-bit words per 16-element block kept in registers between the amax
+# pass and the quantisation pass; 8 blocks = 64 registers of row data.
+_PER_TOKEN_MAX_REG_BLOCKS = 8
+# Up to this many rows the launch is latency-bound (few CTAs per SM) and a
+# wide CTA that streams the whole row in one pass wins; above it the kernel
+# is throughput-bound and narrow CTAs with more blocks per thread win.
+_PER_TOKEN_WIDE_MAX_M = 4096
+
+
+def _per_token_cta_threads(k: int, m: int) -> int:
+    """CTA width of the per-token kernel for a row of ``k`` elements at ``m`` rows."""
+    if "FLASHINFER_NVFP4_PER_TOKEN_THREADS" in os.environ:
+        return int(os.environ["FLASHINFER_NVFP4_PER_TOKEN_THREADS"])
+    return _per_token_cta_threads_default(k, m)
+
+
+@functools.lru_cache(maxsize=None)
+def _per_token_cta_threads_default(k: int, m: int) -> int:
+    num_blocks = k // NVFP4_SF_VEC_SIZE
+    if m <= _PER_TOKEN_WIDE_MAX_M:
+        threads = _PER_TOKEN_THREADS
+        while threads < _PER_TOKEN_MAX_THREADS and threads < num_blocks:
+            threads *= 2
+        return threads
+    # narrow: the smallest width that still keeps the row in registers
+    threads = _PER_TOKEN_THREADS
+    while (
+        threads < _PER_TOKEN_MAX_THREADS
+        and (num_blocks + threads - 1) // threads > _PER_TOKEN_MAX_REG_BLOCKS
+    ):
+        threads *= 2
+    return threads
 
 
 class NVFP4QuantizePerTokenKernel:
     """
-    One CTA per token row. The first pass reduces the row amax, then the
-    second pass reuses the regular NVFP4 block quantizer with that row's
-    global encode scale.
+    One CTA per token row. Every thread owns a fixed set of 16-element blocks
+    (``blocks_per_thread`` of them, chosen from K at trace time) and keeps
+    their 8 packed 32-bit words in registers: the row is read from global
+    memory once, the amax reduction and the quantisation pass both work on
+    the register copy. The CTA width grows with K (128..512 threads) so a
+    single row is streamed by as many loads in flight as the row allows.
+    Rows whose K needs more than ``_PER_TOKEN_MAX_REG_BLOCKS`` blocks per
+    thread fall back to the two-pass variant that re-reads the row.
     """
 
     def __init__(
@@ -860,6 +899,7 @@ class NVFP4QuantizePerTokenKernel:
         disable_fp4_quant_fast_math: bool = False,
         nvfp4_4over6_config: NVFP44Over6Config | None = None,
         fold_out_scale: bool = False,
+        threads: int | None = None,
     ):
         self.dtype = dtype
         self.K = K
@@ -881,6 +921,17 @@ class NVFP4QuantizePerTokenKernel:
             self.padded_sf_cols = self.num_sf_blocks_per_row
         else:
             self.padded_sf_cols = ((self.num_sf_blocks_per_row + 3) // 4) * 4
+        # CTA width (128..512): chosen by the host from K and M, see
+        # _per_token_cta_threads; the default is the latency-bound choice.
+        if threads is None:
+            threads = _per_token_cta_threads(K, 1)
+        assert threads in (128, 256, 512), threads
+        self.threads = threads
+        self.warps = threads // WARP_SIZE
+        self.blocks_per_thread = (self.num_sf_blocks_per_row + threads - 1) // threads
+        self.register_resident = self.blocks_per_thread <= _PER_TOKEN_MAX_REG_BLOCKS
+        # launch-bounds hint: keep 2048 threads/SM worth of CTAs resident
+        self.min_blocks_per_mp = max(1, _MAX_THREADS_PER_BLOCK // threads)
 
     @cute.jit
     def _compute_sf_offset(
@@ -953,9 +1004,9 @@ class NVFP4QuantizePerTokenKernel:
             mOutScale,
         ).launch(
             grid=[padded_M, 1, 1],
-            block=[_PER_TOKEN_THREADS, 1, 1],
-            max_number_threads=[_MAX_THREADS_PER_BLOCK, 1, 1],
-            min_blocks_per_mp=_BLOCKS_PER_SM,
+            block=[self.threads, 1, 1],
+            max_number_threads=[self.threads, 1, 1],
+            min_blocks_per_mp=self.min_blocks_per_mp,
             stream=stream,
             use_pdl=self.enable_pdl,
         )
@@ -981,13 +1032,14 @@ class NVFP4QuantizePerTokenKernel:
         smem = cutlass.utils.SmemAllocator()
         reduction_buffer = smem.allocate_tensor(
             Float32,
-            cute.make_layout((1, _PER_TOKEN_WARPS)),
+            cute.make_layout((1, self.warps)),
             byte_alignment=4,
         )
 
         row_idx = bidx
         num_sf_blocks_per_row = self.num_sf_blocks_per_row
         padded_sf_cols = self.padded_sf_cols
+        threads = Int32(self.threads)
         if row_idx >= M:
             # Padding row: no token owns it, but the GEMM reads whole 128x4
             # scale atoms, so its slots still have to be defined.
@@ -998,7 +1050,21 @@ class NVFP4QuantizePerTokenKernel:
                         row_idx, sf_col_idx, padded_sf_cols
                     )
                     mScales[sf_offset] = Uint8(0)
-                    sf_col_idx = sf_col_idx + Int32(_PER_TOKEN_THREADS)
+                    sf_col_idx = sf_col_idx + threads
+            if cutlass.const_expr(self.enable_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
+        elif cutlass.const_expr(self.register_resident):
+            self._quantize_row_register_resident(
+                mInput,
+                mOutput,
+                mScales,
+                mPerTokenScale,
+                mGlobalScaleInv,
+                mOutScale,
+                reduction_buffer,
+                row_idx,
+                tidx,
+            )
         else:
             # Build the row views from 64-bit byte addresses. Slicing with
             # mInput[row_idx, None] computes the row offset row_idx * K in
@@ -1045,7 +1111,7 @@ class NVFP4QuantizePerTokenKernel:
                     block_max_h2 = half2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
                     block_max = hmax_reduce_to_f32(block_max_h2)
                 local_amax = fmax_f32(local_amax, block_max)
-                sf_col_idx = sf_col_idx + Int32(_PER_TOKEN_THREADS)
+                sf_col_idx = sf_col_idx + threads
 
             warp_amax = warp_reduce(local_amax, fmax_f32)
             row_amax = block_reduce(warp_amax, fmax_f32, reduction_buffer, Float32(0.0))
@@ -1088,7 +1154,7 @@ class NVFP4QuantizePerTokenKernel:
                 out_ptr = get_ptr_as_int64(row_output, out_base)
                 st_global_u64(out_ptr, packed64)
 
-                sf_col_idx = sf_col_idx + Int32(_PER_TOKEN_THREADS)
+                sf_col_idx = sf_col_idx + threads
 
             if cutlass.const_expr(self.sf_layout != SF_LAYOUT_LINEAR):
                 sf_col_idx = num_sf_blocks_per_row + tidx
@@ -1097,10 +1163,141 @@ class NVFP4QuantizePerTokenKernel:
                         row_idx, sf_col_idx, padded_sf_cols
                     )
                     mScales[sf_offset] = Uint8(0)
-                    sf_col_idx = sf_col_idx + Int32(_PER_TOKEN_THREADS)
+                    sf_col_idx = sf_col_idx + threads
 
+            if cutlass.const_expr(self.enable_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
+
+    @cute.jit
+    def _quantize_row_register_resident(
+        self,
+        mInput: cute.Tensor,
+        mOutput: cute.Tensor,
+        mScales: cute.Tensor,
+        mPerTokenScale: cute.Tensor,
+        mGlobalScaleInv: cute.Tensor,
+        mOutScale: cute.Tensor,
+        reduction_buffer: cute.Tensor,
+        row_idx: Int32,
+        tidx: Int32,
+    ):
+        """Single gmem read of the row: blocks stay in registers between the
+        amax pass and the quantisation pass."""
+        num_sf_blocks_per_row = Int32(self.num_sf_blocks_per_row)
+        padded_sf_cols = Int32(self.padded_sf_cols)
+        threads = Int32(self.threads)
+        # 64-bit row bases (row_idx * K overflows Int32 for MoE-sized M, see
+        # the two-pass variant).
+        input_row_addr = get_ptr_as_int64(mInput, Int32(0)) + Int64(row_idx) * Int64(
+            self.K * (mInput.element_type.width // 8)
+        )
+        row_input = cute.make_tensor(
+            cute.make_ptr(
+                mInput.element_type,
+                input_row_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            ),
+            cute.make_layout((self.K,)),
+        )
+        output_row_addr = get_ptr_as_int64(mOutput, Int32(0)) + Int64(row_idx) * Int64(
+            self.K // 2
+        )
+        row_output = cute.make_tensor(
+            cute.make_ptr(
+                mOutput.element_type,
+                output_row_addr,
+                cute.AddressSpace.gmem,
+                assumed_align=8,
+            ),
+            cute.make_layout((self.K // 2,)),
+        )
+
+        # Pass 1: load every owned block once; a thread past the row's last
+        # block re-reads the last block (a real block of this row, so it does
+        # not perturb the amax) and is masked at store time.
+        words = []
+        local_amax = Float32(0.0)
+        for j in cutlass.range_constexpr(self.blocks_per_thread):
+            sf_col_idx = tidx + Int32(j * self.threads)
+            sf_col_ld = cutlass.min(sf_col_idx, num_sf_blocks_per_row - Int32(1))
+            elem_base = sf_col_ld * NVFP4_SF_VEC_SIZE
+            ptr0 = get_ptr_as_int64(row_input, elem_base)
+            ptr1 = get_ptr_as_int64(row_input, elem_base + Int32(8))
+            h0, h1, h2, h3 = ld_global_v4_u32(ptr0)
+            h4, h5, h6, h7 = ld_global_v4_u32(ptr1)
+            words.append((h0, h1, h2, h3, h4, h5, h6, h7))
+            if cutlass.const_expr(self.is_bfloat16):
+                block_max_h2 = bfloat2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
+                block_max = bfloat2_hmax_reduce_to_f32(block_max_h2)
+            else:
+                block_max_h2 = half2_max_abs_8_fn(h0, h1, h2, h3, h4, h5, h6, h7)
+                block_max = hmax_reduce_to_f32(block_max_h2)
+            local_amax = fmax_f32(local_amax, block_max)
+
+        warp_amax = warp_reduce(local_amax, fmax_f32)
+        row_amax = block_reduce(warp_amax, fmax_f32, reduction_buffer, Float32(0.0))
+        # The row is fully in registers: let the dependent grid (the GEMM)
+        # start its prologue now; its griddepcontrol_wait still waits for this
+        # grid's stores to complete and flush.
         if cutlass.const_expr(self.enable_pdl):
             cute.arch.griddepcontrol_launch_dependents()
+        global_scale_inv = Float32(mGlobalScaleInv[Int32(0)])
+        global_encode_scale, per_token_scale = self._row_scales(
+            row_amax, global_scale_inv
+        )
+        if cutlass.const_expr(self.fold_out_scale):
+            per_token_scale = per_token_scale * Float32(mOutScale[Int32(0)])
+        if tidx == Int32(0):
+            mPerTokenScale[row_idx] = per_token_scale
+
+        # Pass 2: quantise the register copy.
+        for j in cutlass.range_constexpr(self.blocks_per_thread):
+            sf_col_idx = tidx + Int32(j * self.threads)
+            h0, h1, h2, h3, h4, h5, h6, h7 = words[j]
+            if cutlass.const_expr(self.is_bfloat16):
+                scale_fp8, packed64 = _quantize_nvfp4_from_h2x8_bfloat(
+                    h0,
+                    h1,
+                    h2,
+                    h3,
+                    h4,
+                    h5,
+                    h6,
+                    h7,
+                    global_encode_scale,
+                    self.disable_fp4_quant_fast_math,
+                    self.nvfp4_4over6_config,
+                    row_amax,
+                )
+            else:
+                scale_fp8, packed64 = _quantize_nvfp4_from_h2x8_half(
+                    h0,
+                    h1,
+                    h2,
+                    h3,
+                    h4,
+                    h5,
+                    h6,
+                    h7,
+                    global_encode_scale,
+                    self.disable_fp4_quant_fast_math,
+                    self.nvfp4_4over6_config,
+                    row_amax,
+                )
+            if sf_col_idx < num_sf_blocks_per_row:
+                sf_offset = self._compute_sf_offset(row_idx, sf_col_idx, padded_sf_cols)
+                mScales[sf_offset] = scale_fp8
+                out_base = sf_col_idx * Int32(NVFP4_SF_VEC_SIZE // 2)
+                out_ptr = get_ptr_as_int64(row_output, out_base)
+                st_global_u64(out_ptr, packed64)
+
+        if cutlass.const_expr(self.sf_layout != SF_LAYOUT_LINEAR):
+            sf_col_idx = num_sf_blocks_per_row + tidx
+            while sf_col_idx < padded_sf_cols:
+                sf_offset = self._compute_sf_offset(row_idx, sf_col_idx, padded_sf_cols)
+                mScales[sf_offset] = Uint8(0)
+                sf_col_idx = sf_col_idx + threads
 
 
 # =============================================================================
@@ -1662,6 +1859,7 @@ def _nvfp4_kernel_name(
     smooth_quant: bool = False,
     pair_fp8_blocks: bool = False,
     fold_out_scale: bool = False,
+    threads: int | None = None,
 ) -> str:
     """Specialization name within the nvfp4_quantize module, encoding every
     parameter that affects codegen.
@@ -1683,6 +1881,8 @@ def _nvfp4_kernel_name(
         name += f"_4over6_{cfg.e4m3_max}_{err_mode}_{int(cfg.err_use_fast_math)}"
     if fold_out_scale:
         name += "_folded"
+    if threads is not None:
+        name += f"_t{threads}"
     return name
 
 
@@ -2116,6 +2316,7 @@ def _get_compiled_kernel_nvfp4_per_token(
     disable_fp4_quant_fast_math: bool = False,
     nvfp4_4over6_config: NVFP44Over6Config | None = None,
     fold_out_scale: bool = False,
+    threads: int | None = None,
 ) -> Callable:
     _dtype_map = {
         "float16": cutlass.Float16,
@@ -2154,6 +2355,7 @@ def _get_compiled_kernel_nvfp4_per_token(
         disable_fp4_quant_fast_math=disable_fp4_quant_fast_math,
         nvfp4_4over6_config=nvfp4_4over6_config,
         fold_out_scale=fold_out_scale,
+        threads=threads,
     )
 
     return build_and_load_cute_dsl_kernel(
@@ -2168,6 +2370,7 @@ def _get_compiled_kernel_nvfp4_per_token(
             silu_and_mul=False,
             nvfp4_4over6_config=nvfp4_4over6_config,
             fold_out_scale=fold_out_scale,
+            threads=threads,
         ),
         lambda: cute.compile(
             kernel_obj,
@@ -2969,6 +3172,7 @@ def nvfp4_quantize_per_token_cute_dsl(
         disable_fp4_quant_fast_math,
         nvfp4_4over6_config,
         fold_out_scale,
+        _per_token_cta_threads(k, m),
     )
 
     fp4_output = torch.empty(m, k // 2, dtype=torch.uint8, device=input.device)

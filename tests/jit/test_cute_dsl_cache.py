@@ -277,6 +277,7 @@ MM_FP4_NAME_BASELINE = {
     "enable_pdl": False,
     "out_dtype": torch.bfloat16,
     "per_token_alpha": None,
+    "l2_policy": None,
     "batch_size": 1,
     "max_active_clusters": 74,
 }
@@ -291,6 +292,7 @@ MM_FP4_NAME_PERTURBED = {
     "enable_pdl": True,
     "out_dtype": torch.float16,
     "per_token_alpha": "m",
+    "l2_policy": "a_ef",
     "batch_size": 2,
     "max_active_clusters": 148,
 }
@@ -311,6 +313,7 @@ def _mm_fp4_name(**kwargs):
         kwargs["enable_pdl"],
         kwargs["out_dtype"],
         kwargs["per_token_alpha"],
+        kwargs["l2_policy"],
     )
     return _blockscaled_kernel_disk_name(
         cache_key, kwargs["batch_size"], kwargs["max_active_clusters"]
