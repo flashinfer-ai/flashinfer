@@ -161,6 +161,12 @@ ATTN_MAX_SEGMENT_CLUSTERS = 1 << 16
 MODE_TWO_TILE = 2
 MODE_SPLIT_KV = 1
 SPLIT_MARGIN = 0.05
+# Round 3 (A5): the production SPLIT_KV form is the shared-O three-deep score ring
+# (``attention:ring3``) where the arch / longest-segment table selects it (Cake
+# ``kimi_k3_vision_attention.RING3_MAX_SEGMENT_TOKENS`` / ``RING3_MIN_SEGMENT_TOKENS``):
+# every SPLIT_KV row on sm_100a, segments of 576 .. 10764 tokens on sm_103a.
+RING3_MAX_SEGMENT_TOKENS: dict[str, Optional[int]] = {"sm_100a": None, "sm_103a": 10764}
+RING3_MIN_SEGMENT_TOKENS: dict[str, int] = {"sm_100a": 0, "sm_103a": 576}
 PROBE_WORDS = 64  # unused diagnostic buffer parameter of the attention kernel (PROBE_UNITS * PROBE_EVENTS)
 
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
@@ -222,10 +228,14 @@ GEMM_KWARGS = (
     "WN",
     "WS",
     "FLAGS",
+    "RT",
+    "CT",
+    "XWT",
     "M",
     "m_tiles",
     "full_tiles",
     "tail_split",
+    "pf_l2",
     "eps",
     "grid",
 )
@@ -448,6 +458,18 @@ def lpt_makespan(costs: Sequence[int], grid_clusters: int) -> tuple[int, list[in
     return max(per_cluster), slots
 
 
+def ring3_selected(arch: str, lens: Sequence[int]) -> bool:
+    """Whether the production SPLIT_KV form on ``arch`` is the shared-O ring for these segment lengths
+    (mirrors ``kimi_k3_vision_attention.ring3_selected``)."""
+    if arch not in RING3_MAX_SEGMENT_TOKENS:
+        return False
+    limit = RING3_MAX_SEGMENT_TOKENS[arch]
+    longest = max((int(n) for n in lens), default=0)
+    if longest < RING3_MIN_SEGMENT_TOKENS[arch]:
+        return False
+    return limit is None or longest <= int(limit)
+
+
 def select_tiles_per_cta(
     lens: Sequence[int], num_heads: int, grid_clusters: int
 ) -> dict[str, Any]:
@@ -479,6 +501,7 @@ class AttentionPlan:
     num_heads: int
     num_segments: int
     tiles_per_cta: int
+    ring3: bool  # SPLIT_KV rows: the shared-O ring form (``attention:ring3``) instead of ``attention:tiles1``
     grid_clusters: int
     makespan: dict[int, int]
     total_clusters: int
@@ -502,12 +525,15 @@ def build_attention_plan(
     *,
     grid_clusters: Optional[int] = None,
     tiles_per_cta: Optional[int] = None,
+    arch: Optional[str] = None,
 ) -> AttentionPlan:
     """Build the attention segment plan (tables on ``device``).
 
     ``grid_clusters`` defaults to :func:`attention_grid_clusters` of ``device``
     (which must then be a CUDA device); ``tiles_per_cta`` forces a unit layout
-    (2 = two-tile, 1 = SPLIT_KV) instead of the runtime makespan rule.
+    (2 = two-tile, 1 = SPLIT_KV) instead of the runtime makespan rule.  ``arch``
+    selects the SPLIT_KV kernel form (``ring3`` per :func:`ring3_selected`; the
+    plain form when ``None``).
     """
     cu = tuple(int(v) for v in cu_seqlens)
     if (
@@ -549,6 +575,9 @@ def build_attention_plan(
         num_heads=num_heads,
         num_segments=len(segments),
         tiles_per_cta=mode,
+        ring3=bool(
+            mode == MODE_SPLIT_KV and arch is not None and ring3_selected(arch, lens)
+        ),
         grid_clusters=grid_clusters,
         makespan=dict(selection["makespan"]),
         total_clusters=sum(
@@ -586,6 +615,12 @@ class TileConfig:
     packed: bool = False  # packed bf16x2 residual epilogue (EPI_PACKED)
     prefetch: bool = False  # residual / norm-weight rows loaded before the mainloop wait (EPI_PREFETCH)
     rope: bool = False  # RoPE cos/sin from the packed f16x2 table CS (ROPE_PACKED; norm_qkv_rope only)
+    smem_res: bool = False  # residual rows staged in SMEM before the mainloop wait (EPI_SMEM_RES; opt-in in Cake)
+    tma_epi: bool = False  # TMA-loaded residual tile, in-place BF16 output + xw tiles TMA-stored (EPI_TMA)
+    tma_onebuf: bool = False  # tma_epi with one staging tile (EPI_TMA_ONEBUF)
+    mcast: int = (
+        1  # > 1: cluster of single-CTA tiles sharing the A tile (MCAST; opt-in in Cake)
+    )
 
     @property
     def b_rows(self) -> int:
@@ -597,7 +632,7 @@ class TileConfig:
 
     @property
     def cluster_x(self) -> int:
-        return self.cta_group * self.ksplit
+        return self.cta_group * self.ksplit * self.mcast
 
 
 def _cfg(
@@ -648,6 +683,8 @@ TILE_CONFIGS: dict[str, TileConfig] = {
         _cfg("s_cs", 1, 128, 7, rope=True),
         _cfg("xs_cs", 1, 64, 9, rope=True),
         _cfg("xs_cs_pf", 1, 64, 9, rope=True, prefetch=True),
+        # Round 3: the one-buffer TMA-epilogue pair tile of the K = 1536 residual out-proj at M > 6144.
+        _cfg("m_tma1", 2, 128, 8, packed=True, tma_epi=True, tma_onebuf=True),
     )
 }
 # norm_qkv_rope: the packed f16x2 cos/sin twin of each base tile (Cake
@@ -666,7 +703,16 @@ PACKED_TWIN = {
     "xs": "xs_pf",
     "xs_k4": "xs_k4_pf",
 }
-for _name in (*ROPE_TWIN, *ROPE_TWIN.values(), *PACKED_TWIN, *PACKED_TWIN.values()):
+# Round 3 (G2): the TMA-epilogue twin of the 256 x 128 pair tile, taken by the K = 1536 residual
+# out-proj forms only (Cake ``_TMA_EPI_TWIN`` / ``_TMA_EPI_POLICY`` auto; ties ``m_p`` on the K = 4096 FC1).
+TMA_EPI_TWIN = {"m": "m_tma1"}
+for _name in (
+    *ROPE_TWIN,
+    *ROPE_TWIN.values(),
+    *PACKED_TWIN,
+    *PACKED_TWIN.values(),
+    *TMA_EPI_TWIN.values(),
+):
     assert _name in TILE_CONFIGS, _name
 
 # variant -> (N, K, pos-split pixel-row maps); ``_sq`` / ``_sqxw`` are the
@@ -692,6 +738,20 @@ SMALL_M_LIMIT = (
     1024  # M <= this -> single-CTA tiles (128 x 64 for N = 1024, 128 x 128 otherwise)
 )
 MID_M_LIMIT = 8192  # residual_fc1: 256 x 256 (8 epilogue warps) up to here, 256 x 128 pair tile above
+# Round-3 per-form tile boundaries (Cake ``kimi_k3_vision_gemm`` ``_TILE_BOUNDARY_POLICY`` = "r3").
+WO_S_E8_LIMIT = 6144  # residual_wo*: single-CTA 128 x 128 eight-warp tile (s_e8_pf) for M in (SMALL_M_LIMIT, this]
+FC1_S_E8_LIMIT = (
+    2304  # residual_fc1*: s_e8_pf for M in (SMALL_M_LIMIT, this], l_e8_pf above
+)
+QKV_XS_LIMIT = 768  # norm_qkv_rope: 128 x 64 (xs_cs_pf) up to here
+QKV_S_LIMIT = (
+    1536  # norm_qkv_rope: 128 x 128 (s_cs) for M in (QKV_XS_LIMIT, this], l_e8_cs above
+)
+NG_XS_LOW, NG_XS_HIGH = (
+    512,
+    768,
+)  # norm_gelu / gelu_erf: 128 x 64 (xs) for M in (512, 768] (and M <= TINY_M_LIMIT)
+NG_S_LIMIT = 1656  # norm_gelu / gelu_erf: 128 x 128 (s) up to here, the pair tile above
 
 
 def _rope_twin(name: str, n_total: int) -> str:
@@ -699,39 +759,63 @@ def _rope_twin(name: str, n_total: int) -> str:
     return ROPE_TWIN.get(name, name) if n_total == QKV_N else name
 
 
+def _packed_twin(name: str, tma_ok: bool = True) -> str:
+    """Residual / pos forms: the packed bf16x2 epilogue twin (Cake ``_PACKED_POLICY`` auto), or the
+    TMA-epilogue twin where the form allows it (Cake ``_TMA_EPI_POLICY`` auto, K = 1536 out-proj only)."""
+    if tma_ok and name in TMA_EPI_TWIN:
+        return TMA_EPI_TWIN[name]
+    return PACKED_TWIN.get(name, name)
+
+
 def select_tile_config(variant: str, M: int) -> TileConfig:
     """Production tile config for ``(variant, M)``; mirrors ``kimi_k3_vision_gemm.select_tile_config``
-    with its production policies (packed residual twins on, RoPE table twins on, tail twins off).
+    with its production policies (packed residual twins on, RoPE table twins on, TMA epilogue twin
+    for the out-proj on, round-3 tile boundaries, tail / SMEM-staged / multicast / L2-prefetch twins off).
 
     Small M is bound by the per-CTA operand stream, so the smallest tile wins:
     128 x 64 up to ``SMALL_M_LIMIT`` for the N = 1024 shapes and up to
     ``TINY_M_LIMIT`` for the wide ones (the 7168-wide projector GEMM prefers
     128 x 128); split-K only for the K = 4096 residual GEMM at M <= 256.
-    Large M runs the 256 x 256 pair tile; the K = 1024 norm GEMMs and
-    ``pos`` take the eight-warp epilogue, the N = 1024 residual GEMMs the
-    256 x 128 pair tile except ``residual_fc1`` up to ``MID_M_LIMIT``.
+    Round 3 re-measured every form's boundaries: the single-CTA 128 x 128
+    eight-warp tile ``s_e8_pf`` serves the residual GEMMs while the pair grid
+    underfills the machine (out-proj to ``WO_S_E8_LIMIT``, FC1 to
+    ``FC1_S_E8_LIMIT``), the out-proj pair tile is the TMA-epilogue twin
+    ``m_tma1``, and the K = 1024 norm GEMMs / projector GEMMs keep 128 x 64 to
+    768 rows and 128 x 128 to 1536 / 1656 rows before the 256-wide pair tiles.
     """
     n_total, k_total, pos_split = GEMM_VARIANTS[variant]
     cfg = TILE_CONFIGS
     if pos_split:
-        return cfg[PACKED_TWIN["xs" if M <= SMALL_M_LIMIT else "s_e8"]]
+        return cfg[_packed_twin("xs" if M <= SMALL_M_LIMIT else "s_e8", tma_ok=False)]
     if n_total == HIDDEN:  # residual_wo (K = 1536), residual_fc1 (K = 4096)
         if M <= TINY_M_LIMIT and k_total == FFN:
-            return cfg[PACKED_TWIN["xs_k4"]]
+            return cfg[_packed_twin("xs_k4")]
         if M <= SMALL_M_LIMIT:
-            return cfg[PACKED_TWIN["xs"]]
+            return cfg[_packed_twin("xs")]
+        s_e8_limit = WO_S_E8_LIMIT if k_total == QKV_HIDDEN else FC1_S_E8_LIMIT
+        if s_e8_limit >= M:
+            return cfg[_packed_twin("s_e8", tma_ok=False)]
         return cfg[
-            PACKED_TWIN["l_e8" if (k_total == FFN and M <= MID_M_LIMIT) else "m"]
+            _packed_twin(
+                "l_e8" if (k_total == FFN and M <= MID_M_LIMIT) else "m",
+                tma_ok=(k_total == QKV_HIDDEN),
+            )
         ]
     if M <= TINY_M_LIMIT:
-        base = "s" if n_total == TEXT_HIDDEN else "xs"
-    elif M <= SMALL_M_LIMIT:
-        base = "s"
-    else:
-        # The K = 1024 norm GEMMs (statistics handoff on the critical path)
-        # take the eight-warp epilogue; the projector GEMMs the four-warp pair tile.
-        base = "l_e8" if k_total == HIDDEN else "l"
-    return cfg[_rope_twin(base, n_total)]
+        return cfg[_rope_twin("s" if n_total == TEXT_HIDDEN else "xs", n_total)]
+    if n_total == QKV_N and M <= QKV_XS_LIMIT:
+        return cfg[_rope_twin("xs", n_total)]
+    if n_total == FFN and NG_XS_LOW < M <= NG_XS_HIGH:
+        return cfg["xs"]
+    if M <= SMALL_M_LIMIT:
+        return cfg[_rope_twin("s", n_total)]
+    if n_total == QKV_N and M <= QKV_S_LIMIT:
+        return cfg[_rope_twin("s", n_total)]
+    if n_total == FFN and M <= NG_S_LIMIT:
+        return cfg["s"]
+    # The K = 1024 norm GEMMs (statistics handoff on the critical path) take the
+    # eight-warp epilogue; the projector GEMMs the four-warp pair tile.
+    return cfg[_rope_twin("l_e8" if k_total == HIDDEN else "l", n_total)]
 
 
 def launch_tile_config(
@@ -782,11 +866,11 @@ def gemm_launch_geometry(
         m_tiles = (M + GEMM_BLOCK_M - 1) // GEMM_BLOCK_M
         m_tiles += m_tiles % cfg.cta_group
     n_tiles = n_total // cfg.acc_n
-    cluster_tiles = (m_tiles // cfg.cta_group) * n_tiles
+    cluster_tiles = (m_tiles // cfg.cta_group) * (n_tiles // cfg.mcast)
     if cfg.ksplit > 1:
         clusters = cluster_tiles  # non-persistent: one cluster per output tile
     else:
-        clusters = min(cluster_tiles, int(sm_count) // cfg.cta_group)
+        clusters = min(cluster_tiles, int(sm_count) // cfg.cluster_x)
     return GemmLaunchGeometry(
         (clusters * cfg.cluster_x, 1, 1), m_tiles, cluster_tiles, cluster_tiles, 1
     )
@@ -803,29 +887,55 @@ def gemm_configs_for(total_tokens: int, merged: int) -> dict[str, str]:
     return configs
 
 
-def required_kernel_keys() -> tuple[str, ...]:
-    """Every logical kernel the production plan can select (all token-count buckets)."""
+GEMM_BUCKET_COUNTS: tuple[int, ...] = (
+    1,
+    *sorted(
+        b + 1
+        for b in {
+            TINY_M_LIMIT,
+            SMALL_M_LIMIT,
+            MID_M_LIMIT,
+            WO_S_E8_LIMIT,
+            FC1_S_E8_LIMIT,
+            QKV_XS_LIMIT,
+            QKV_S_LIMIT,
+            NG_XS_LOW,
+            NG_XS_HIGH,
+            NG_S_LIMIT,
+        }
+    ),
+)
+
+
+def required_kernel_keys(arch: str) -> tuple[str, ...]:
+    """Every logical kernel the production plan can select on ``arch`` (one token count per interval
+    of the tile rule; both attention layouts; the ring3 SPLIT_KV form where the arch table selects it)."""
     keys: list[str] = []
     for variant in PRODUCTION_GEMM_VARIANTS:
-        for count in (1, TINY_M_LIMIT + 1, SMALL_M_LIMIT + 1, MID_M_LIMIT + 1):
+        for count in GEMM_BUCKET_COUNTS:
             key = gemm_kernel_key(
                 variant,
                 launch_tile_config(variant, select_tile_config(variant, count)).name,
             )
             if key not in keys:
                 keys.append(key)
-    keys.extend(
-        (
-            attention_kernel_key(MODE_TWO_TILE),
-            attention_kernel_key(MODE_SPLIT_KV),
-            MERGE_KERNEL_KEY,
-            RMSNORM_APPLY_KERNEL_KEY,
-        )
-    )
+    keys.append(attention_kernel_key(MODE_TWO_TILE))
+    ring_arch = arch in RING3_MAX_SEGMENT_TOKENS
+    if (
+        not ring_arch
+        or RING3_MIN_SEGMENT_TOKENS[arch] > 0
+        or RING3_MAX_SEGMENT_TOKENS[arch] is not None
+    ):
+        keys.append(attention_kernel_key(MODE_SPLIT_KV))
+    if ring_arch:
+        keys.append(attention_kernel_key(MODE_SPLIT_KV, ring3=True))
+    keys.extend((MERGE_KERNEL_KEY, RMSNORM_APPLY_KERNEL_KEY))
     return tuple(keys)
 
 
-REQUIRED_KERNEL_KEYS = required_kernel_keys()
+REQUIRED_KERNEL_KEYS: dict[str, tuple[str, ...]] = {
+    arch: required_kernel_keys(arch) for arch in SUPPORTED_COMPUTE_CAPABILITIES.values()
+}
 
 
 # ---------------------------------------------------------------------------
@@ -969,7 +1079,7 @@ def _arch_for(device: torch.device) -> str:
 def generated_program_available(device: torch.device) -> bool:
     """True when this checkout registers every kernel the plan can select for ``device``."""
     arch = SUPPORTED_COMPUTE_CAPABILITIES.get(torch.cuda.get_device_capability(device))
-    return arch is not None and route_available(arch, REQUIRED_KERNEL_KEYS)
+    return arch is not None and route_available(arch, REQUIRED_KERNEL_KEYS[arch])
 
 
 @dataclass(frozen=True)
@@ -1005,9 +1115,11 @@ class VisionTowerPlan:
         return self.attention.tiles_per_cta
 
 
-def attention_tma_workspace_bytes(arch: str, tiles_per_cta: int) -> int:
+def attention_tma_workspace_bytes(
+    arch: str, tiles_per_cta: int, ring3: bool = False
+) -> int:
     """Bytes of the caller-owned TMA descriptor workspace of the registered attention module (0 = by-value ABI / unregistered)."""
-    key = attention_kernel_key(tiles_per_cta)
+    key = attention_kernel_key(tiles_per_cta, ring3)
     if not route_available(arch, (key,)):
         return 0
     return int(MODULES[kernel_module_name(arch, key)].get("tma_workspace_bytes", 0))
@@ -1105,9 +1217,11 @@ def build_kimi_k3_vision_plan(
             raise ValueError(
                 f"{name} must be a contiguous fp32 [{total}, {ROPE_PAIRS}] tensor on {device}"
             )
-    attention = build_attention_plan(cu, device, HEADS, grid_clusters=grid_clusters)
+    attention = build_attention_plan(
+        cu, device, HEADS, grid_clusters=grid_clusters, arch=arch
+    )
     tma_bytes = (
-        attention_tma_workspace_bytes(arch, attention.tiles_per_cta)
+        attention_tma_workspace_bytes(arch, attention.tiles_per_cta, attention.ring3)
         if device.type == "cuda"
         else 0
     )
@@ -1263,6 +1377,7 @@ class KimiK3VisionTowerRunner:
             merged_tokens=plan.merged_tokens,
             segment_count=plan.attention.num_segments,
             tiles_per_cta=plan.attention.tiles_per_cta,
+            ring3=plan.attention.ring3,
             attention_units=plan.attention.total_tiles,
             attention_clusters=plan.attention.num_clusters,
             gemm_configs=dict(plan.gemm_configs),
@@ -1331,10 +1446,16 @@ def _gemm_launch(
         WN=WN if WN is not None else B,
         WS=ws["f32_dummy"],
         FLAGS=ws["u32_dummy"],
+        # TMA-epilogue tensor maps (residual tile in, C and xw tiles out); the register-epilogue
+        # tiles bind any 2-D bf16 tensor with a 64-multiple row length (unused), as the Cake launcher.
+        RT=(R if R is not None else C) if cfg.tma_epi else B,
+        CT=C if cfg.tma_epi else B,
+        XWT=(XW if XW is not None else C) if cfg.tma_epi else B,
         M=M,
         m_tiles=int(geometry.m_tiles),
         full_tiles=int(geometry.full_tiles),
         tail_split=int(geometry.tail_split),
+        pf_l2=0,  # operand L2 prefetch (Cake ``_L2PF_POLICY``) is off in production
         eps=float(eps),
         grid=geometry.grid,
     )
@@ -1365,7 +1486,9 @@ def _attention_launch(plan: VisionTowerPlan, layer: int) -> _Launch:
         grid=(2 * int(attn.num_clusters), 1, 1),
     )
     assert tuple(kwargs) == ATTENTION_KWARGS
-    module = kernel_module_name(plan.arch, attention_kernel_key(attn.tiles_per_cta))
+    module = kernel_module_name(
+        plan.arch, attention_kernel_key(attn.tiles_per_cta, attn.ring3)
+    )
     entry, arguments, prepare = _bind(module, kwargs)
     return _Launch("layer_attention", layer, module, kwargs, entry, arguments, prepare)
 
@@ -1598,9 +1721,11 @@ def prepare_kimi_k3_vision_tower(
         raise ValueError(
             f"pixel_values has {int(pixel_values.shape[0])} tokens, grid_thws describe {plan.total_tokens}"
         )
-    if not route_available(arch, REQUIRED_KERNEL_KEYS):
+    if not route_available(arch, REQUIRED_KERNEL_KEYS[arch]):
         missing = [
-            key for key in REQUIRED_KERNEL_KEYS if not route_available(arch, (key,))
+            key
+            for key in REQUIRED_KERNEL_KEYS[arch]
+            if not route_available(arch, (key,))
         ]
         raise NotImplementedError(
             f"The generated Kimi-K3 vision tower programs for {arch} are not registered in this "

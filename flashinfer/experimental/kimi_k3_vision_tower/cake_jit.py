@@ -39,9 +39,12 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   (``pos``, ``norm_qkv_rope``, ``residual_wo``, ``norm_gelu``,
 #   ``residual_fc1``, ``gelu_erf``, ``rmsnorm``) on the production tile
 #   configuration ``select_tile_config`` picks for the token count;
-# * ``attention:tiles2`` / ``attention:tiles1``   the packed-varlen BF16
-#   attention kernel in its two-tile and SPLIT_KV unit layouts (the host plan
-#   rule ``select_tiles_per_cta`` chooses per ``grid_thws`` batch);
+# * ``attention:tiles2`` / ``attention:tiles1`` / ``attention:ring3``   the
+#   packed-varlen BF16 attention kernel in its two-tile and SPLIT_KV unit
+#   layouts (the host plan rule ``select_tiles_per_cta`` chooses per
+#   ``grid_thws`` batch); ``ring3`` is the SPLIT_KV form with the shared-O
+#   three-deep score ring, selected per architecture and longest segment
+#   (``cake_backend.ring3_selected``);
 # * ``merge``                     final RMSNorm + 2x2 spatial / temporal-mean merge;
 # * ``rmsnorm_apply``             the post-projector RMSNorm apply pass.
 #
@@ -2033,7 +2036,15 @@ def gemm_kernel_key(variant: str, tile: str) -> str:
     return f"gemm:{variant}:{tile}"
 
 
-def attention_kernel_key(tiles_per_cta: int) -> str:
+def attention_kernel_key(tiles_per_cta: int, ring3: bool = False) -> str:
+    """``attention:tiles<n>`` for the plain layouts; ``attention:ring3`` for the production
+    SPLIT_KV form with the shared-O score ring (selected per arch / longest segment by the plan)."""
+    if ring3:
+        if int(tiles_per_cta) != 1:
+            raise ValueError(
+                "the ring3 attention form is the SPLIT_KV (one-tile) layout"
+            )
+        return "attention:ring3"
     return f"attention:tiles{int(tiles_per_cta)}"
 
 
