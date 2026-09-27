@@ -610,6 +610,9 @@ outlive the graph. Q/K/V/G, beta, gate parameters and state contents may change
 between replays, but sequence offsets and scalar arguments must stay fixed.
 Handoff flags are cleared on the launch stream before every invocation, so
 captured replays can be interleaved with independent eager calls.
+The split schedules rely on the full persistent grid being resident. Serialize
+independent split-grid invocations; overlapping them on separate CUDA streams
+is not supported.
 
 In eager mode, offset values are read on the host to prepare the schedule;
 this also detects edits made under ``torch.inference_mode``. Only the most
