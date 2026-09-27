@@ -261,7 +261,9 @@ ROUTING_CASES = [
         id="wide_ep32_gate_up_mixed_tail",
     ),
     # two odd-block experts: 16 odd-tail units fit on the free SMs, so the fused route (pair + tail kernels) keeps the row
-    pytest.param([128, 384] + [256] * 14, 2048, 4096, False, id="wide_ep32_gate_up_two_odd"),
+    pytest.param(
+        [128, 384] + [256] * 14, 2048, 4096, False, id="wide_ep32_gate_up_two_odd"
+    ),
 ]
 
 
@@ -447,9 +449,15 @@ def test_routing_blocks_and_fused_tile_counts():
         == ACT_WIDE_ROUTE
     )
     assert act_items(2048, 2048) == ACT_WIDE_MIN_ITEMS
-    # a diverted problem below the item threshold keeps the one-warp-per-group act kernel
+    # 16 odd-tail units fit on the 20 SMs the pair grid leaves free: the problem stays fused
     assert (
         select_route(2048, 256, group_blocks=routing_blocks([128] * 16), **wide)
+        == FUSED_ROUTE
+    )
+    # a diverted problem (32 units) below the item threshold keeps the one-warp-per-group act kernel
+    assert act_items(2048, 512) < ACT_WIDE_MIN_ITEMS
+    assert (
+        select_route(2048, 512, group_blocks=routing_blocks([128] * 16), **wide)
         == ACT_ROUTE
     )
     # grids of the two act routes on the wide random_aligned row
