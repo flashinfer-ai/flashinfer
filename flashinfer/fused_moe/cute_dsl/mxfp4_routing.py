@@ -310,7 +310,8 @@ class _FusedRoutePreprocess:
         self.max_routes = max_routes
         # Routes per CTA (a multiple of the thread count; the whole range
         # for a single CTA).
-        self.chunk_routes = -(-(-(-max_routes // cluster)) // threads) * threads
+        routes_per_cta = (max_routes + cluster - 1) // cluster
+        self.chunk_routes = (routes_per_cta + threads - 1) // threads * threads
         # The inverse permutation (row -> route) is staged in shared memory:
         # scattered 4-byte global stores cost one 32-byte sector each (16384
         # sectors take ~8 us through one SM's L1 at T=1024), the shared
@@ -432,7 +433,8 @@ class _FusedRoutePreprocess:
                     cutlass.Int32(FUSED_ROUTE_CLEAR_CTAS),
                 )
                 blocks = (
-                    cute.ceil_div(self.cluster + clear_ctas, self.cluster) * self.cluster
+                    cute.ceil_div(self.cluster + clear_ctas, self.cluster)
+                    * self.cluster
                 )
             else:
                 blocks = cute.ceil_div(cute.size(output), self.threads)
@@ -539,7 +541,8 @@ class _FusedRoutePreprocess:
             chunk = cutlass.Int32(num_routes)
             if cutlass.const_expr(self.cluster > 1):
                 chunk = (
-                    cute.ceil_div(num_routes, self.cluster * self.threads) * self.threads
+                    cute.ceil_div(num_routes, self.cluster * self.threads)
+                    * self.threads
                 )
             r0 = block * chunk
             r1 = cutlass.min(r0 + chunk, num_routes)

@@ -91,9 +91,9 @@ void runPostTopKPipeline(DataType const& data, void* stream) {
   // offsets path below takes 1.3 + 5.6 us at 16384 tokens, so the cluster
   // kernel is kept only up to ClusterKernelPreferredMaxNumTokens.
   constexpr int32_t ClusterKernelPreferredMaxNumTokens = 1024;
-  bool const useSingleCluster =
-      (smMajor >= 9) && (data.mNumTokens <= routingCustom::MaxNumTokensSingleCluster) &&
-      (data.mNumTokens <= ClusterKernelPreferredMaxNumTokens);
+  bool const useSingleCluster = (smMajor >= 9) &&
+                                (data.mNumTokens <= routingCustom::MaxNumTokensSingleCluster) &&
+                                (data.mNumTokens <= ClusterKernelPreferredMaxNumTokens);
 
   if (useDynBlock) {
     bool const launched = routingCustom::launchDynBlockKernel(customData, numThreadsHist, stream);
