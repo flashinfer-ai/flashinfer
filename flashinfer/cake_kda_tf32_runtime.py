@@ -5299,8 +5299,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 if sub is not None:
                     sub._descriptors_stale = True
             # The apply-route kernels hold prepared TMA descriptors of caller
-            # storage (output tail, checkpoint rows): re-prepare them too.
+            # storage (output tail, checkpoint rows): re-prepare them too,
+            # including the prefix chain whose descriptors are launch-owned.
             self._apply_descriptors_stale = bool(self._apply_route)
+            self._apply_prefix_stale = bool(self._apply_route)
             self._descriptors_stale = False
         with _ffi_stream_context(self._launch_device):
             for destination, source in self._affine_input_refreshes:
@@ -5342,12 +5344,19 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 # scatter, so it follows the first chain kernel.
                 self._state_indices_long.copy_(self._state_indices)
             if self._apply_route and getattr(self, "_apply_descriptors_stale", False):
+                # Pair-map producer and fused apply share the apply ABI and
+                # both carry out_tma / rows_tma of caller storage; the prefix
+                # chain only addresses launch-owned buffers, so a plan-cache
+                # rebind (moved output / checkpoint rows) skips it and pays
+                # two descriptor uploads instead of three.
                 self._pairmap_module.prepare(
                     grid=self._pairmap_grid, **self._pairmap_bindings()
                 )
-                self._prefix_module.prepare(
-                    grid=self._prefix_grid, **self._prefix_bindings()
-                )
+                if getattr(self, "_apply_prefix_stale", False):
+                    self._prefix_module.prepare(
+                        grid=self._prefix_grid, **self._prefix_bindings()
+                    )
+                    self._apply_prefix_stale = False
                 self._apply_module.prepare(
                     grid=self._apply_grid, **self._apply_bindings()
                 )
