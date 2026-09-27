@@ -373,8 +373,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 81935,
-      "source_sha256": "578d292586cd0b7154da56030ad95d6f0013083e4dde547b3f07302efeb6c3fb",
+      "source_bytes": 82010,
+      "source_sha256": "0da0c8b3221b6f6cecd2745f8a743cf0c78ed5a14d4188812e6aa8903330bd6b",
       "stage": "small_k1",
       "symbol": "vsa_sm90_bf16_small_k1",
       "template": "vsa_sm90_bf16_small_k1",
@@ -634,7 +634,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 116224,
+      "dynamic_smem_bytes": 116736,
       "entry": "launch_vsa_sm90_bf16_small_k3",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -649,8 +649,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 201612,
-      "source_sha256": "0a895e6056131d597dfee75d3684e185277cd4668d67ed6575c9d5fcc49e4833",
+      "source_bytes": 204257,
+      "source_sha256": "0b6159217af6bb739c4a8487f153a3c4a1badb0a2c5f44154dbe8fd9e70a7d65",
       "stage": "small_k3",
       "symbol": "vsa_sm90_bf16_small_k3",
       "template": "vsa_sm90_bf16_small_k3",
@@ -910,7 +910,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 148992,
+      "dynamic_smem_bytes": 149504,
       "entry": "launch_vsa_sm90_bf16_small_k4",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -925,8 +925,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 248104,
-      "source_sha256": "faf315d87dc1ef7d7de44c051433f0359f6886158d5d7d0a7d1002311fb44c4f",
+      "source_bytes": 250755,
+      "source_sha256": "de599bca2d48d749a15aa5182a7e7bc5f978572520893cfd58ff8653126d0c48",
       "stage": "small_k4",
       "symbol": "vsa_sm90_bf16_small_k4",
       "template": "vsa_sm90_bf16_small_k4",
@@ -1186,7 +1186,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 214528,
+      "dynamic_smem_bytes": 215040,
       "entry": "launch_vsa_sm90_bf16_small_k6",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -1201,8 +1201,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 341142,
-      "source_sha256": "339ad24977e9e6d962a783985406cc132b54994900ce8e34f1f854d8f804d032",
+      "source_bytes": 343805,
+      "source_sha256": "d2be5c134f1b8a9417de6b2ae69cfea4cd0e42fc2da85dac29ed8268d1624a14",
       "stage": "small_k6",
       "symbol": "vsa_sm90_bf16_small_k6",
       "template": "vsa_sm90_bf16_small_k6",
@@ -1489,8 +1489,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 114793,
-      "source_sha256": "deafb28632eba963f2db94774c7b355cf993ae5adc4584f00704bc5048b7e3ed",
+      "source_bytes": 114868,
+      "source_sha256": "6e1bf070107d404f81921f18175adb6ed35f1c46114b421b1de79de24f357473",
       "stage": "small_k1s",
       "symbol": "vsa_sm90_bf16_small_k1s",
       "template": "vsa_sm90_bf16_small_k1s",
@@ -1762,7 +1762,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 116352,
+      "dynamic_smem_bytes": 116864,
       "entry": "launch_vsa_sm90_bf16_small_k3s",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -1777,8 +1777,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 236049,
-      "source_sha256": "5c0efc60e47f195803b8d495ef46aefe85e5b9037d3c3e0c56f07bccc4029809",
+      "source_bytes": 236426,
+      "source_sha256": "5f48c4a3a462b4853cff748fc47382322912783c30b14e6d2cece60ddc78d1d0",
       "stage": "small_k3s",
       "symbol": "vsa_sm90_bf16_small_k3s",
       "template": "vsa_sm90_bf16_small_k3s",
@@ -2050,7 +2050,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 149120,
+      "dynamic_smem_bytes": 149632,
       "entry": "launch_vsa_sm90_bf16_small_k4s",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -2065,8 +2065,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 282541,
-      "source_sha256": "32bc2462c6013723c8b43b3a45be8a546d672a0529f67acc6c3d3dfd5fbe48d6",
+      "source_bytes": 282924,
+      "source_sha256": "86c02a2948d4d99700149d390737509561f55a3f20890a1f204994d8399f4e90",
       "stage": "small_k4s",
       "symbol": "vsa_sm90_bf16_small_k4s",
       "template": "vsa_sm90_bf16_small_k4s",
@@ -2338,7 +2338,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 214656,
+      "dynamic_smem_bytes": 215168,
       "entry": "launch_vsa_sm90_bf16_small_k6s",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -2353,8 +2353,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 375603,
-      "source_sha256": "41b405c5c11454ab53e17f8465204dfc3602924cc76f1019d667cd42d01c747d",
+      "source_bytes": 375998,
+      "source_sha256": "adc92d0da2cfdc455008b304c366a281a6e4db9ca3d073fec0ae13ad3dc67c9d",
       "stage": "small_k6s",
       "symbol": "vsa_sm90_bf16_small_k6s",
       "template": "vsa_sm90_bf16_small_k6s",
@@ -2614,7 +2614,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 111104,
+      "dynamic_smem_bytes": 111616,
       "entry": "launch_vsa_sm90_bf16_small_k2c4",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -2629,8 +2629,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 176240,
-      "source_sha256": "942596a2c1a2561d100cda45dd4c8b83a4abb26c99939dd92ea740fa6c13255a",
+      "source_bytes": 207490,
+      "source_sha256": "4cc826f77bb2a8d5e9d5a1929270d431f7a765f9d62660c52cd1ea780b2c15f0",
       "stage": "small_k2c4",
       "symbol": "vsa_sm90_bf16_small_k2c4",
       "template": "vsa_sm90_bf16_small_k2c4",
@@ -2890,7 +2890,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 151040,
+      "dynamic_smem_bytes": 151552,
       "entry": "launch_vsa_sm90_bf16_small_k3c3",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -2905,8 +2905,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 239719,
-      "source_sha256": "ae58c325509e4152d1b663a9c8b73f615705bb7577a6ceaaba8060d2c158378f",
+      "source_bytes": 283677,
+      "source_sha256": "f6df28cec0fe11d8f1e09b16b2d8c7797b329767cc4252999137236574ceb020",
       "stage": "small_k3c3",
       "symbol": "vsa_sm90_bf16_small_k3c3",
       "template": "vsa_sm90_bf16_small_k3c3",
@@ -3166,7 +3166,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 162304,
+      "dynamic_smem_bytes": 162816,
       "entry": "launch_vsa_sm90_bf16_small_k3c6",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -3181,8 +3181,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 231957,
-      "source_sha256": "c4eb19d7d25546ba9522a6875eaf2f27b392a3a8089617db01ab83b5ab49f783",
+      "source_bytes": 273464,
+      "source_sha256": "78f0f0d2640a710ca055425df5024f7e814550fff2bb751730c7d20e93137f77",
       "stage": "small_k3c6",
       "symbol": "vsa_sm90_bf16_small_k3c6",
       "template": "vsa_sm90_bf16_small_k3c6",
@@ -3442,7 +3442,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 166400,
+      "dynamic_smem_bytes": 166912,
       "entry": "launch_vsa_sm90_bf16_small_k4c2",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -3457,8 +3457,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 275186,
-      "source_sha256": "84a01879cbce2e5f9300b50201ed01d386ca5b05f96ac4bfb0bb66e41db85148",
+      "source_bytes": 310549,
+      "source_sha256": "7570e62fb82d7445b60d50d55fc846f52e6010c71e58385143226f8c096fd466",
       "stage": "small_k4c2",
       "symbol": "vsa_sm90_bf16_small_k4c2",
       "template": "vsa_sm90_bf16_small_k4c2",
@@ -3718,7 +3718,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 176640,
+      "dynamic_smem_bytes": 177152,
       "entry": "launch_vsa_sm90_bf16_small_k4c4",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -3733,8 +3733,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 269174,
-      "source_sha256": "e6fffd9a53b0a83d9911b62c67fae3f956c2f67585bf94cf5c55c1bf26e0e897",
+      "source_bytes": 300464,
+      "source_sha256": "1e97b30ad773296dfd1fccd1977aeb4d8ffce980f1d4d75c33465235b1b288cd",
       "stage": "small_k4c4",
       "symbol": "vsa_sm90_bf16_small_k4c4",
       "template": "vsa_sm90_bf16_small_k4c4",
@@ -3994,7 +3994,7 @@
         1
       ],
       "compile_factory": "compile_program",
-      "dynamic_smem_bytes": 231936,
+      "dynamic_smem_bytes": 232448,
       "entry": "launch_vsa_sm90_bf16_small_k6c2",
       "min_blocks": 1,
       "param_array_device_buffers": {
@@ -4009,8 +4009,8 @@
         "seqlen_k": "int32",
         "seqlen_q": "int32"
       },
-      "source_bytes": 368201,
-      "source_sha256": "13128209f1e095a3f785474c9d0337c41bf927efb8550de78a6c1cf9eb1d2a47",
+      "source_bytes": 403604,
+      "source_sha256": "f4e1e98afa0244f27c05be006a78e6b9fb6c2e8de1ac12385d806a08e1809d26",
       "stage": "small_k6c2",
       "symbol": "vsa_sm90_bf16_small_k6c2",
       "template": "vsa_sm90_bf16_small_k6c2",

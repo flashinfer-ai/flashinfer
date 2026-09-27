@@ -42,15 +42,18 @@ from cutlass._mlir.dialects.nvvm import TMALoadMode as DialectTMALoadMode
 
 NUM_MAIN_STAGES = 1
 SMEM_MSTATS_OFF = 148480
-SMEM_MSTATS_STAGE_BYTES = 512
-SMEM_MSTATS_STRIDE = 512
+SMEM_MSTATS_STAGE_BYTES = 1024
+SMEM_MSTATS_STRIDE = 1024
 SMEM_PART_LO_OFF = 66560
 SMEM_PART_LO_STAGE_BYTES = 16384
 SMEM_PART_LO_STRIDE = 16384
 SMEM_PART_HI_OFF = 132096
 SMEM_PART_HI_STAGE_BYTES = 16384
 SMEM_PART_HI_STRIDE = 16384
-SMEM_FLAG_OFF = 148992
+SMEM_PART_HI0_OFF = 50176
+SMEM_PART_HI0_STAGE_BYTES = 16384
+SMEM_PART_HI0_STRIDE = 16384
+SMEM_FLAG_OFF = 149504
 SMEM_FLAG_STAGE_BYTES = 16
 SMEM_FLAG_STRIDE = 16
 SMEM_Q_SMEM_OFF = 1024
@@ -62,10 +65,10 @@ SMEM_K_SMEM_STRIDE = 16384
 SMEM_VT_SMEM_OFF = 82944
 SMEM_VT_SMEM_STAGE_BYTES = 16384
 SMEM_VT_SMEM_STRIDE = 16384
-SMEM_TOTAL = 149120
+SMEM_TOTAL = 149632
 THREADS = 256
 CAKE_TARGET_ARCH = 'sm_90a'
-CAKE_SMEM_BYTES = 149120
+CAKE_SMEM_BYTES = 149632
 
 @cute.kernel
 def kernel_vsa_sm90_bf16_small_k4s(Q: cutlass.GridConstant[TensorMap], K: cutlass.GridConstant[TensorMap], Vt: cutlass.GridConstant[TensorMap], O: cute.Pointer, plan: cute.Pointer, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, scale_log2: cutlass.Float32, Wo: cute.Pointer, Ws: cute.Pointer, Wc: cute.Pointer):
@@ -92,9 +95,12 @@ def kernel_vsa_sm90_bf16_small_k4s(Q: cutlass.GridConstant[TensorMap], K: cutlas
     part_hi = cute.recast_ptr(smem_raw + 132096, swizzle_=cute.make_swizzle(4, 3, 3), dtype=cutlass.Float32)
     _part_hi = cute.make_tensor(part_hi, _flat_layout)
     part_hi_addr = smem + 132096
-    flag = cute.recast_ptr(smem_raw + 148992, swizzle_=cute.make_swizzle(4, 3, 3), dtype=cutlass.Int32)
+    part_hi0 = cute.recast_ptr(smem_raw + 50176, swizzle_=cute.make_swizzle(4, 3, 3), dtype=cutlass.Float32)
+    _part_hi0 = cute.make_tensor(part_hi0, _flat_layout)
+    part_hi0_addr = smem + 50176
+    flag = cute.recast_ptr(smem_raw + 149504, swizzle_=cute.make_swizzle(4, 3, 3), dtype=cutlass.Int32)
     _flag = cute.make_tensor(flag, _flat_layout)
-    flag_addr = smem + 148992
+    flag_addr = smem + 149504
     q_smem = cute.recast_ptr(smem_raw + 1024, swizzle_=cute.make_swizzle(4, 3, 3), dtype=cutlass.BFloat16)
     _q_smem = cute.make_tensor(q_smem, _flat_layout)
     q_smem_addr = smem + 1024
@@ -170,6 +176,11 @@ def kernel_vsa_sm90_bf16_small_k4s(Q: cutlass.GridConstant[TensorMap], K: cutlas
     kv_base = cutlass.Int32((head * seqlen_k))
     if (warp == 0):
         if prims.elect_sync():
+            blk_pre = cute.make_rmem_tensor((4,), cutlass.Int32)
+            blk_pre[0] = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[blk_base])
+            blk_pre[1] = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[(blk_base + 1)])
+            blk_pre[2] = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[(blk_base + 2)])
+            blk_pre[3] = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[(blk_base + 3)])
             cute.arch.mbarrier_arrive_and_expect_tx(q_full_addr, 16384)
             prims.cp_async_bulk_tensor_shared_cta_global(
                 cute.make_ptr(cutlass.Uint8, cutlass.Uint32(q_smem_addr), mem_space=cute.AddressSpace.smem, assumed_align=16),
@@ -179,8 +190,7 @@ def kernel_vsa_sm90_bf16_small_k4s(Q: cutlass.GridConstant[TensorMap], K: cutlas
                 mode=prims.TMALoadMode.TILE,
             )
             if (cnt > 0):
-                blk = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[blk_base])
-                blk_row = cutlass.Int32((kv_base + (blk * 64)))
+                blk_row = cutlass.Int32((kv_base + (blk_pre[0] * 64)))
                 cute.arch.mbarrier_arrive_and_expect_tx(k_full0_addr, 16384)
                 prims.cp_async_bulk_tensor_shared_cta_global(
                     cute.make_ptr(cutlass.Uint8, cutlass.Uint32(k_smem_addr), mem_space=cute.AddressSpace.smem, assumed_align=16),
@@ -198,8 +208,7 @@ def kernel_vsa_sm90_bf16_small_k4s(Q: cutlass.GridConstant[TensorMap], K: cutlas
                     mode=prims.TMALoadMode.TILE,
                 )
             if (cnt > 1):
-                blk_1 = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[(blk_base + 1)])
-                blk_row_1 = cutlass.Int32((kv_base + (blk_1 * 64)))
+                blk_row_1 = cutlass.Int32((kv_base + (blk_pre[1] * 64)))
                 cute.arch.mbarrier_arrive_and_expect_tx(k_full1_addr, 16384)
                 prims.cp_async_bulk_tensor_shared_cta_global(
                     cute.make_ptr(cutlass.Uint8, cutlass.Uint32((k_smem_addr + 16384)), mem_space=cute.AddressSpace.smem, assumed_align=16),
@@ -217,8 +226,7 @@ def kernel_vsa_sm90_bf16_small_k4s(Q: cutlass.GridConstant[TensorMap], K: cutlas
                     mode=prims.TMALoadMode.TILE,
                 )
             if (cnt > 2):
-                blk_2 = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[(blk_base + 2)])
-                blk_row_2 = cutlass.Int32((kv_base + (blk_2 * 64)))
+                blk_row_2 = cutlass.Int32((kv_base + (blk_pre[2] * 64)))
                 cute.arch.mbarrier_arrive_and_expect_tx(k_full2_addr, 16384)
                 prims.cp_async_bulk_tensor_shared_cta_global(
                     cute.make_ptr(cutlass.Uint8, cutlass.Uint32((k_smem_addr + 32768)), mem_space=cute.AddressSpace.smem, assumed_align=16),
@@ -236,8 +244,7 @@ def kernel_vsa_sm90_bf16_small_k4s(Q: cutlass.GridConstant[TensorMap], K: cutlas
                     mode=prims.TMALoadMode.TILE,
                 )
             if (cnt > 3):
-                blk_3 = cutlass.Int32(cute.make_tensor(plan, _flat_layout)[(blk_base + 3)])
-                blk_row_3 = cutlass.Int32((kv_base + (blk_3 * 64)))
+                blk_row_3 = cutlass.Int32((kv_base + (blk_pre[3] * 64)))
                 cute.arch.mbarrier_arrive_and_expect_tx(k_full3_addr, 16384)
                 prims.cp_async_bulk_tensor_shared_cta_global(
                     cute.make_ptr(cutlass.Uint8, cutlass.Uint32((k_smem_addr + 49152)), mem_space=cute.AddressSpace.smem, assumed_align=16),
@@ -3141,66 +3148,66 @@ def kernel_vsa_sm90_bf16_small_k4s(Q: cutlass.GridConstant[TensorMap], K: cutlas
             _rcp_1 = cute.math.rcp(fsum1[0], approx=True, ftz=True)
             d_o[0] = cutlass.Float32((d_o[0] * _rcp_0))
             d_o[1] = cutlass.Float32((d_o[1] * _rcp_0))
-            d_o[4] = cutlass.Float32((d_o[4] * _rcp_0))
-            d_o[5] = cutlass.Float32((d_o[5] * _rcp_0))
-            d_o[8] = cutlass.Float32((d_o[8] * _rcp_0))
-            d_o[9] = cutlass.Float32((d_o[9] * _rcp_0))
-            d_o[12] = cutlass.Float32((d_o[12] * _rcp_0))
-            d_o[13] = cutlass.Float32((d_o[13] * _rcp_0))
-            d_o[16] = cutlass.Float32((d_o[16] * _rcp_0))
-            d_o[17] = cutlass.Float32((d_o[17] * _rcp_0))
-            d_o[20] = cutlass.Float32((d_o[20] * _rcp_0))
-            d_o[21] = cutlass.Float32((d_o[21] * _rcp_0))
-            d_o[24] = cutlass.Float32((d_o[24] * _rcp_0))
-            d_o[25] = cutlass.Float32((d_o[25] * _rcp_0))
-            d_o[28] = cutlass.Float32((d_o[28] * _rcp_0))
-            d_o[29] = cutlass.Float32((d_o[29] * _rcp_0))
-            d_o[32] = cutlass.Float32((d_o[32] * _rcp_0))
-            d_o[33] = cutlass.Float32((d_o[33] * _rcp_0))
-            d_o[36] = cutlass.Float32((d_o[36] * _rcp_0))
-            d_o[37] = cutlass.Float32((d_o[37] * _rcp_0))
-            d_o[40] = cutlass.Float32((d_o[40] * _rcp_0))
-            d_o[41] = cutlass.Float32((d_o[41] * _rcp_0))
-            d_o[44] = cutlass.Float32((d_o[44] * _rcp_0))
-            d_o[45] = cutlass.Float32((d_o[45] * _rcp_0))
-            d_o[48] = cutlass.Float32((d_o[48] * _rcp_0))
-            d_o[49] = cutlass.Float32((d_o[49] * _rcp_0))
-            d_o[52] = cutlass.Float32((d_o[52] * _rcp_0))
-            d_o[53] = cutlass.Float32((d_o[53] * _rcp_0))
-            d_o[56] = cutlass.Float32((d_o[56] * _rcp_0))
-            d_o[57] = cutlass.Float32((d_o[57] * _rcp_0))
-            d_o[60] = cutlass.Float32((d_o[60] * _rcp_0))
-            d_o[61] = cutlass.Float32((d_o[61] * _rcp_0))
             d_o[2] = cutlass.Float32((d_o[2] * _rcp_1))
             d_o[3] = cutlass.Float32((d_o[3] * _rcp_1))
+            d_o[4] = cutlass.Float32((d_o[4] * _rcp_0))
+            d_o[5] = cutlass.Float32((d_o[5] * _rcp_0))
             d_o[6] = cutlass.Float32((d_o[6] * _rcp_1))
             d_o[7] = cutlass.Float32((d_o[7] * _rcp_1))
+            d_o[8] = cutlass.Float32((d_o[8] * _rcp_0))
+            d_o[9] = cutlass.Float32((d_o[9] * _rcp_0))
             d_o[10] = cutlass.Float32((d_o[10] * _rcp_1))
             d_o[11] = cutlass.Float32((d_o[11] * _rcp_1))
+            d_o[12] = cutlass.Float32((d_o[12] * _rcp_0))
+            d_o[13] = cutlass.Float32((d_o[13] * _rcp_0))
             d_o[14] = cutlass.Float32((d_o[14] * _rcp_1))
             d_o[15] = cutlass.Float32((d_o[15] * _rcp_1))
+            d_o[16] = cutlass.Float32((d_o[16] * _rcp_0))
+            d_o[17] = cutlass.Float32((d_o[17] * _rcp_0))
             d_o[18] = cutlass.Float32((d_o[18] * _rcp_1))
             d_o[19] = cutlass.Float32((d_o[19] * _rcp_1))
+            d_o[20] = cutlass.Float32((d_o[20] * _rcp_0))
+            d_o[21] = cutlass.Float32((d_o[21] * _rcp_0))
             d_o[22] = cutlass.Float32((d_o[22] * _rcp_1))
             d_o[23] = cutlass.Float32((d_o[23] * _rcp_1))
+            d_o[24] = cutlass.Float32((d_o[24] * _rcp_0))
+            d_o[25] = cutlass.Float32((d_o[25] * _rcp_0))
             d_o[26] = cutlass.Float32((d_o[26] * _rcp_1))
             d_o[27] = cutlass.Float32((d_o[27] * _rcp_1))
+            d_o[28] = cutlass.Float32((d_o[28] * _rcp_0))
+            d_o[29] = cutlass.Float32((d_o[29] * _rcp_0))
             d_o[30] = cutlass.Float32((d_o[30] * _rcp_1))
             d_o[31] = cutlass.Float32((d_o[31] * _rcp_1))
+            d_o[32] = cutlass.Float32((d_o[32] * _rcp_0))
+            d_o[33] = cutlass.Float32((d_o[33] * _rcp_0))
             d_o[34] = cutlass.Float32((d_o[34] * _rcp_1))
             d_o[35] = cutlass.Float32((d_o[35] * _rcp_1))
+            d_o[36] = cutlass.Float32((d_o[36] * _rcp_0))
+            d_o[37] = cutlass.Float32((d_o[37] * _rcp_0))
             d_o[38] = cutlass.Float32((d_o[38] * _rcp_1))
             d_o[39] = cutlass.Float32((d_o[39] * _rcp_1))
+            d_o[40] = cutlass.Float32((d_o[40] * _rcp_0))
+            d_o[41] = cutlass.Float32((d_o[41] * _rcp_0))
             d_o[42] = cutlass.Float32((d_o[42] * _rcp_1))
             d_o[43] = cutlass.Float32((d_o[43] * _rcp_1))
+            d_o[44] = cutlass.Float32((d_o[44] * _rcp_0))
+            d_o[45] = cutlass.Float32((d_o[45] * _rcp_0))
             d_o[46] = cutlass.Float32((d_o[46] * _rcp_1))
             d_o[47] = cutlass.Float32((d_o[47] * _rcp_1))
+            d_o[48] = cutlass.Float32((d_o[48] * _rcp_0))
+            d_o[49] = cutlass.Float32((d_o[49] * _rcp_0))
             d_o[50] = cutlass.Float32((d_o[50] * _rcp_1))
             d_o[51] = cutlass.Float32((d_o[51] * _rcp_1))
+            d_o[52] = cutlass.Float32((d_o[52] * _rcp_0))
+            d_o[53] = cutlass.Float32((d_o[53] * _rcp_0))
             d_o[54] = cutlass.Float32((d_o[54] * _rcp_1))
             d_o[55] = cutlass.Float32((d_o[55] * _rcp_1))
+            d_o[56] = cutlass.Float32((d_o[56] * _rcp_0))
+            d_o[57] = cutlass.Float32((d_o[57] * _rcp_0))
             d_o[58] = cutlass.Float32((d_o[58] * _rcp_1))
             d_o[59] = cutlass.Float32((d_o[59] * _rcp_1))
+            d_o[60] = cutlass.Float32((d_o[60] * _rcp_0))
+            d_o[61] = cutlass.Float32((d_o[61] * _rcp_0))
             d_o[62] = cutlass.Float32((d_o[62] * _rcp_1))
             d_o[63] = cutlass.Float32((d_o[63] * _rcp_1))
             qj1 = cutlass.Int32((qj & 1))
@@ -3527,7 +3534,7 @@ def launch_vsa_sm90_bf16_small_k4s(Q: cute.Tensor, _cake_tma_Q_dim_0: cutlass.In
     kernel_vsa_sm90_bf16_small_k4s(_tma_Q, _tma_K, _tma_Vt, O.iterator, plan.iterator, seqlen_q, seqlen_k, scale_log2, Wo.iterator, Ws.iterator, Wc.iterator).launch(
         grid=(grid_x, grid_y, grid_z),
         block=(256, 1, 1),
-        smem=149120,
+        smem=149632,
         min_blocks_per_mp=1,
         stream=stream,
     )
