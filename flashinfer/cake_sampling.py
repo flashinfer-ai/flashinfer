@@ -75,10 +75,14 @@ _TOPP_SCALAR, _TOPP_PER_ROW = 1, 2
 # wave depends on the cluster size and on the device's SM / GPC layout.  Measured single-wave CTA
 # capacity per cluster size, keyed by SM count: 148 = B200 / GB300 (B300 tracks it), 132 = H100
 # SXM (64 cluster-4 CTAs run in one wave and 128 take two, so the GPC layout bounds the capacity
-# to 112-127; 120 is used).  A device with another SM count uses the table of the nearest SM count.
+# to 112-127; 120 is used), 212 = Rubin R200 (cuOccupancyMaxActiveClusters: 106 two-CTA, 46
+# four-CTA and 22 eight-CTA clusters for the one-CTA-per-SM variants; the measured wave step of
+# the streaming variants sits between 212 and 216 CTAs for clusters of 1-2 and between 176 and
+# 192 for clusters of 4-8).  A device with another SM count uses the table of the nearest SM count.
 _WAVE_CTAS_BY_SM_COUNT: dict[int, dict[int, int]] = {
     148: {1: 148, 2: 144, 4: 128, 8: 64},
     132: {1: 132, 2: 132, 4: 120, 8: 64},
+    212: {1: 212, 2: 212, 4: 184, 8: 176},
 }
 _DEFAULT_SM_COUNT = 148
 _PREFERRED_MIN_EPT = 16
@@ -151,8 +155,8 @@ def choose_stage1(
     through the fitted cost model (resident ``waves * (_RESIDENT_BASE_US + _RESIDENT_PER_EPT_US *
     ept)`` against streaming ``waves * (_STREAM_WAVE_BASE_US + _STREAM_CHUNK_US * chunks)``); the
     resident variant wins ties and streaming ties prefer the smaller cluster.  The wave table is
-    selected by ``sm_count`` (the current device's SM count when omitted; B200 148 and H100 132
-    are measured), the cost constants were fitted on B200 and rank the frozen variants on every
+    selected by ``sm_count`` (the current device's SM count when omitted; B200 148, H100 132 and
+    Rubin R200 212 are measured), the cost constants were fitted on B200 and rank the frozen variants on every
     device.  Variants needing more dynamic shared memory than ``smem_limit`` (the current
     device's opt-in limit when omitted) are not candidates."""
     if sm_count is None:
