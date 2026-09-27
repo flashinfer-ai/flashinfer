@@ -78,12 +78,20 @@ def test_decode_plan_rules():
     assert (tp8["tiles"], tp8["grid"], tp8["cluster"], tp8["n_pad"]) == (47, 94, 2, 8)
     assert decode_front_plan(9, i_local_for_tp(8))["n_pad"] == 16
     assert decode_front_plan(128, i_local_for_tp(1))["n_pad"] == 128
+    # Front K depth 2 while its ring keeps >= 4 (one CTA per tile) / 6 (cluster pairs) stages: TP1 T <= 64, TP8 T <= 16.
     for plan in (tp1, tp8):
         assert (
-            plan["kdepth"] == 1
+            plan["kdepth"] == 2
             and 1 <= plan["stages"] <= cb.MAX_STAGES
             and not plan["fused"]
         )
+    assert decode_front_plan(64, i_local_for_tp(1))["kdepth"] == 2
+    assert decode_front_plan(128, i_local_for_tp(1))["kdepth"] == 1
+    assert decode_front_plan(16, i_local_for_tp(8))["kdepth"] == 2
+    assert decode_front_plan(32, i_local_for_tp(8))["kdepth"] == 1
+    assert decode_front_plan(32, i_local_for_tp(8))["stages"] == cb.plan_stages(
+        n_pad=32, kdepth=1, cluster=2
+    )
     # Tail: 56 output tiles -> 112 cluster-pair CTAs; the fused norm is always on.
     for tp in SUPPORTED_TP:
         for tokens in (1, 8, 16, 128):
@@ -96,12 +104,16 @@ def test_decode_plan_rules():
             )
             if plan["rows_smem"]:
                 assert plan["smem_b1"]
-    # The resident B operand with staged rows serves the smallest TP8 tails; T16 falls back to the global-y protocol.
+    # The resident B operand with staged rows serves the TP8 tails up to T16 (5 ring stages left); T32 falls back to
+    # the global-y protocol, and so does TP1 (long shared-down window).
     assert decode_tail_plan(1, i_local_for_tp(8), 8)["smem_b1"]
     assert decode_tail_plan(1, i_local_for_tp(8), 8)["rows_smem"]
     assert decode_tail_plan(8, i_local_for_tp(8), 8)["smem_b1"]
-    assert not decode_tail_plan(16, i_local_for_tp(8), 8)["smem_b1"]
+    t16 = decode_tail_plan(16, i_local_for_tp(8), 8)
+    assert t16["smem_b1"] and t16["rows_smem"] and t16["stages"] == 5
+    assert not decode_tail_plan(32, i_local_for_tp(8), 8)["smem_b1"]
     assert not decode_tail_plan(32, i_local_for_tp(1), 1)["smem_b1"]
+    assert not decode_tail_plan(16, i_local_for_tp(1), 1)["rows_smem"]
     # A second routed partial disables the staged rows (P == 1 only).
     assert not decode_tail_plan(1, i_local_for_tp(8), 8, num_partials=2)["rows_smem"]
     with pytest.raises(ValueError):
@@ -126,6 +138,13 @@ def test_split_plan_rules():
     )
     assert split_plan(56, 19, SM_COUNT, 1)["sk_tiles"] == 0
     assert split_plan(60, 152, SM_COUNT, 4)["sk_tiles"] == 0
+    # Partial reuse (2-4 pair rows per column): only a remainder wave after a full wave is split, and only
+    # when it fills at most 55 % of the clusters (TP1 T=1024: 74 whole + 38 tiles as 74 x 79 iterations).
+    rem = split_plan(112, 152, SM_COUNT, 4)
+    assert rem["full_items"] == 74 and rem["sk_tiles"] == 38
+    assert rem["sk_ipc"] == 79 and rem["num_items"] == 148
+    assert split_plan(56, 152, SM_COUNT, 2)["sk_tiles"] == 0
+    assert split_plan(140, 152, SM_COUNT, 5)["sk_tiles"] == 0
     # TP1 T=2048 (224 pair tiles on 74 resident clusters): 2 x 74 whole + one stream-K wave (module docstring).
     sk = split_plan(224, 152, SM_COUNT, 8)
     assert sk["full_items"] == 148 and sk["sk_tiles"] == 76 and sk["sk_ipc"] == 157

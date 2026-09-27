@@ -91,6 +91,9 @@ SMEM_B1_MAX_TOKENS = 2 * EPI_WARPS
 SMEM_B1_MIN_STAGES = 6
 SMEM_B1_MAX_TOKENS_RS = 4 * EPI_WARPS
 SMEM_B1_MIN_STAGES_RS = 5
+#: Front stage: K depth 2 while the depth-2 ring keeps this many stages per cluster mode
+#: (1 = one CTA per tile, 2 = cluster pairs); the tail keeps depth 1 (kernel module constant).
+FRONT_KD2_MIN_STAGES = {1: 4, 2: 6}
 TL_SLOTS = 16
 TL_MAX_GRID = 512
 DECODE_THREADS = 192
@@ -179,18 +182,32 @@ def kdepth_for(*k_chunks: int, requested: Optional[int] = None) -> int:
 
 
 def choose_config(
-    *, tiles: int, n_pad: int, k_chunks: tuple[int, ...], sm_count: int
+    stage: str, *, tiles: int, n_pad: int, k_chunks: tuple[int, ...], sm_count: int
 ) -> tuple[int, int, int, int]:
-    """``(kdepth, grid, stages, cluster)`` of the production rule (depth 1, ring takes all smem)."""
+    """``(kdepth, grid, stages, cluster)`` of the production rule: depth 1 (ring takes all smem);
+    the front stage takes depth 2 while its ring keeps ``FRONT_KD2_MIN_STAGES[cluster]`` stages."""
+    k2 = k_chunks[1] if len(k_chunks) > 1 else 0
     kd = kdepth_for(*k_chunks, requested=1)
     part = plan_partition(
         tiles=tiles,
         k1_chunks=k_chunks[0],
-        k2_chunks=k_chunks[1] if len(k_chunks) > 1 else 0,
+        k2_chunks=k2,
         kdepth=kd,
         sm_count=sm_count,
         n_pad=n_pad,
     )
+    if stage == "front" and all(k % 2 == 0 for k in k_chunks):
+        stages2 = plan_stages(n_pad=n_pad, kdepth=2, cluster=part["cluster"])
+        if stages2 >= FRONT_KD2_MIN_STAGES[part["cluster"]]:
+            part2 = plan_partition(
+                tiles=tiles,
+                k1_chunks=k_chunks[0],
+                k2_chunks=k2,
+                kdepth=2,
+                sm_count=sm_count,
+                n_pad=n_pad,
+            )
+            return 2, part2["grid"], stages2, part2["cluster"]
     return (
         kd,
         part["grid"],
@@ -214,7 +231,7 @@ def decode_front_plan(
     tiles = r_tiles + l_tiles + s_tiles
     k_chunks = HIDDEN // CHUNK_K
     kdepth, grid, stages, cluster = choose_config(
-        tiles=tiles, n_pad=n_pad, k_chunks=(k_chunks,), sm_count=sm_count
+        "front", tiles=tiles, n_pad=n_pad, k_chunks=(k_chunks,), sm_count=sm_count
     )
     return dict(
         grid=grid,
@@ -262,7 +279,7 @@ def decode_tail_plan(
         raise ValueError("K slices must be multiples of 64")
     k1, k2 = k_up // CHUNK_K, i_local // CHUNK_K
     kdepth, grid, stages, cluster = choose_config(
-        tiles=tiles, n_pad=n_pad, k_chunks=(k1, k2), sm_count=sm_count
+        "tail", tiles=tiles, n_pad=n_pad, k_chunks=(k1, k2), sm_count=sm_count
     )
     k1_macros = k1 // kdepth
     cl_u0 = (k1_macros + 1) // 2 if cluster == 2 else k1_macros
@@ -290,7 +307,9 @@ def decode_tail_plan(
             bn_stages = plan_stages(
                 n_pad=n_pad, kdepth=kdepth, cluster=cluster, extra_bytes=bn_bytes
             )
-        if use_bn and bn_stages < SMEM_B1_MIN_STAGES:
+        if use_bn and bn_stages < (
+            SMEM_B1_MIN_STAGES_RS if use_rows else SMEM_B1_MIN_STAGES
+        ):
             use_bn = False
             use_rows = False
         elif use_bn:
@@ -369,6 +388,7 @@ SK_MIN_NUM_K = 64
 SK_MIN_ITERS = 32
 SK_FIXUP_ITERS = 12
 SK_MIN_REUSE_ROWS = 8
+SK_PARTIAL_REUSE_MAX_REM_PCT = 55
 
 FRONT_KWARGS = (
     "A",
@@ -480,9 +500,18 @@ def split_plan(
         "sk_total": 0,
         "sk_tiles": 0,
     }
-    if rem == 0 or num_k < SK_MIN_NUM_K or 1 < reuse_rows < SK_MIN_REUSE_ROWS:
+    partial_reuse = 1 < reuse_rows < SK_MIN_REUSE_ROWS
+    if (
+        rem == 0
+        or num_k < SK_MIN_NUM_K
+        or (
+            partial_reuse
+            and (full == 0 or rem * 100 > SK_PARTIAL_REUSE_MAX_REM_PCT * resident)
+        )
+    ):
         return plan
-    for sk_tiles in (rem, rem + resident):
+    # Partial B-tile reuse: split only the remainder wave after a full wave (never the folded last full wave).
+    for sk_tiles in (rem,) if partial_reuse else (rem, rem + resident):
         if sk_tiles > cluster_tiles:
             continue
         full_i = cluster_tiles - sk_tiles
