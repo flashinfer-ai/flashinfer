@@ -31,10 +31,29 @@
       "small_k1s",
       "small_k3s",
       "small_k4s",
-      "small_k6s"
+      "small_k6s",
+      "small_k2c4",
+      "small_k3c3",
+      "small_k3c6",
+      "small_k4c2",
+      "small_k4c4",
+      "small_k6c2",
+      "small_k6c3"
     ]
   },
   "files": [
+    {
+      "bytes": 21192,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_0196d6afd417ae08e117_binding.cu",
+      "sha256": "522c2fe56ee29cfd7dde5e5e583d339f308390d1e22747db126559e354148e8d"
+    },
+    {
+      "bytes": 231315,
+      "kind": "device_source",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_0196d6afd417ae08e117_kernel.cu",
+      "sha256": "dd6b194f0410dcaf25d2db25325a04fd8af1077e3488327c70120f23c7efdddf"
+    },
     {
       "bytes": 20491,
       "kind": "tvm_ffi_binding",
@@ -108,6 +127,18 @@
       "sha256": "d19c6b276a57443a1d9c34957b21be0ba1163b91aee9d2592ad00df27ba09999"
     },
     {
+      "bytes": 21192,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_823d5de03c7950ba4885_binding.cu",
+      "sha256": "a247a78aabdf76e1feb85f2c27013ac7166624596f06a32d671b0503fcd025c4"
+    },
+    {
+      "bytes": 148173,
+      "kind": "device_source",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_823d5de03c7950ba4885_kernel.cu",
+      "sha256": "b3977ea4a887b165bd15db042575dcaf73e4dc8e8324886061457b6eaee753ff"
+    },
+    {
       "bytes": 21315,
       "kind": "tvm_ffi_binding",
       "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_95f7d954876dd801567c_binding.cu",
@@ -118,6 +149,42 @@
       "kind": "device_source",
       "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_95f7d954876dd801567c_kernel.cu",
       "sha256": "e9974ae3b314f9d190b84cddb4033030e29c49a43f106f83c81a8c3be762775f"
+    },
+    {
+      "bytes": 21192,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_96f59774d808a89722a5_binding.cu",
+      "sha256": "be688fd4c1a907bfdb2b371270f5ce334f0ee5d10a06798eae7a933416032097"
+    },
+    {
+      "bytes": 150990,
+      "kind": "device_source",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_96f59774d808a89722a5_kernel.cu",
+      "sha256": "5fa867aa4f92934ad4d696d600cdb3e4ca5c78c5bc9b805c8da265fbf858fb1f"
+    },
+    {
+      "bytes": 21192,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_9cfbf6c9c4ca7d4409ed_binding.cu",
+      "sha256": "16614cbd64e78a0e02796f9ef85d54af015756cc9fe90cdd9898efae500c2a20"
+    },
+    {
+      "bytes": 167624,
+      "kind": "device_source",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_9cfbf6c9c4ca7d4409ed_kernel.cu",
+      "sha256": "07ff20dd70ce2b16ea7eb555ea6d5634501fa377d9f4d211a8bac5184ad59bf3"
+    },
+    {
+      "bytes": 21192,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_a726970bbbdf528f5d03_binding.cu",
+      "sha256": "f846f1272b51c4c4757d16ee2a65eee0152b8bd5d5a01e9796d1ccae09431396"
+    },
+    {
+      "bytes": 240089,
+      "kind": "device_source",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_a726970bbbdf528f5d03_kernel.cu",
+      "sha256": "b584d1a5ac75791c9561c8999f01281f09291c665fab6637bf77384cc9cb522d"
     },
     {
       "bytes": 20493,
@@ -142,6 +209,30 @@
       "kind": "device_source",
       "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_b6069c01963ef828b12c_kernel.cu",
       "sha256": "0c7cf51bf5c2466f84c63550c768de2f19ad2703acace1b976b56dc3d30b6456"
+    },
+    {
+      "bytes": 21192,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_e23244f78f910b5eb977_binding.cu",
+      "sha256": "52da1b289af9c48d193b293a54cee5a7ba1170eccf005206c6040a623bc26fb7"
+    },
+    {
+      "bytes": 171911,
+      "kind": "device_source",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_e23244f78f910b5eb977_kernel.cu",
+      "sha256": "4f93017aa086cfd7703d92be3aef45921fe7c438e918ddb5d3c7321d04c6f0cb"
+    },
+    {
+      "bytes": 21190,
+      "kind": "tvm_ffi_binding",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_eef66cf02b30ab131111_binding.cu",
+      "sha256": "3006389ed5c113b9985e54ae0646b8348491b1188522895c4e1532e4117eb8f9"
+    },
+    {
+      "bytes": 108455,
+      "kind": "device_source",
+      "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_eef66cf02b30ab131111_kernel.cu",
+      "sha256": "55f995a26a31b09c59d40cfd87a29a980d3a22bb433a13c545510720e06f933b"
     }
   ],
   "generation_inputs": {
@@ -149,6 +240,128 @@
   },
   "library": "flashinfer",
   "modules": [
+    {
+      "arch": "sm_90a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "Vt"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "plan"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "6d12dfc25c529e48fd6ab723180585c77a84760bd2cd0f71fef5aa43c244e63c",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 231315,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_0196d6afd417ae08e117_kernel.cu",
+          "sha256": "dd6b194f0410dcaf25d2db25325a04fd8af1077e3488327c70120f23c7efdddf"
+        },
+        {
+          "bytes": 21192,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_0196d6afd417ae08e117_binding.cu",
+          "sha256": "522c2fe56ee29cfd7dde5e5e583d339f308390d1e22747db126559e354148e8d"
+        }
+      ],
+      "closure_sha256": "3e879672dbb86f8be26e7b930cc48ea6c0cace9dd08fffdd81bc9c5cc698b2f8",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_vsa_sm90_0196d6afd417ae08e117",
+      "launch": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "cluster": [
+          2,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 214016,
+        "use_pdl": false
+      },
+      "module_ident": "cake_vsa_sm90_0196d6afd417ae08e117_sm_90a",
+      "name": "cake_vsa_sm90_0196d6afd417ae08e117",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "0196d6afd417ae08e1179a9ce950276365e0cfb3ea774523926cf99b167d5a7e",
+        "stage": "small_k6c2",
+        "template": "vsa_sm90_bf16_small_k6c2"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_0196d6afd417ae08e117_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_0196d6afd417ae08e117_kernel.cu"
+      }
+    },
     {
       "arch": "sm_90a",
       "arg_plan": [
@@ -953,6 +1166,128 @@
           "scale_log2"
         ],
         [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "6d12dfc25c529e48fd6ab723180585c77a84760bd2cd0f71fef5aa43c244e63c",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 148173,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_823d5de03c7950ba4885_kernel.cu",
+          "sha256": "b3977ea4a887b165bd15db042575dcaf73e4dc8e8324886061457b6eaee753ff"
+        },
+        {
+          "bytes": 21192,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_823d5de03c7950ba4885_binding.cu",
+          "sha256": "a247a78aabdf76e1feb85f2c27013ac7166624596f06a32d671b0503fcd025c4"
+        }
+      ],
+      "closure_sha256": "9f7d8ae3e11dee21adc5bcafbad27a304a2635176abf940e2bada1ba93da2e95",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_vsa_sm90_823d5de03c7950ba4885",
+      "launch": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "cluster": [
+          6,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 115712,
+        "use_pdl": false
+      },
+      "module_ident": "cake_vsa_sm90_823d5de03c7950ba4885_sm_90a",
+      "name": "cake_vsa_sm90_823d5de03c7950ba4885",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "823d5de03c7950ba488562f2d57172fc16514c311d89a541453eed671e88afed",
+        "stage": "small_k3c6",
+        "template": "vsa_sm90_bf16_small_k3c6"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_823d5de03c7950ba4885_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_823d5de03c7950ba4885_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_90a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "Vt"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "plan"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "scale_log2"
+        ],
+        [
           "buffer",
           "Wo"
         ],
@@ -1049,6 +1384,372 @@
         "binding": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_95f7d954876dd801567c_binding.cu",
         "compile_separately": true,
         "device": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_95f7d954876dd801567c_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_90a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "Vt"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "plan"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "6d12dfc25c529e48fd6ab723180585c77a84760bd2cd0f71fef5aa43c244e63c",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 150990,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_96f59774d808a89722a5_kernel.cu",
+          "sha256": "5fa867aa4f92934ad4d696d600cdb3e4ca5c78c5bc9b805c8da265fbf858fb1f"
+        },
+        {
+          "bytes": 21192,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_96f59774d808a89722a5_binding.cu",
+          "sha256": "be688fd4c1a907bfdb2b371270f5ce334f0ee5d10a06798eae7a933416032097"
+        }
+      ],
+      "closure_sha256": "cdedaa1a2d679fdc1408db1182443c56d949999b4a9b9d97f6513db99e7bb5ee",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_vsa_sm90_96f59774d808a89722a5",
+      "launch": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "cluster": [
+          3,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 115712,
+        "use_pdl": false
+      },
+      "module_ident": "cake_vsa_sm90_96f59774d808a89722a5_sm_90a",
+      "name": "cake_vsa_sm90_96f59774d808a89722a5",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "96f59774d808a89722a5f12e482c581b89e36de7d3db9a1a152a139b32a01010",
+        "stage": "small_k3c3",
+        "template": "vsa_sm90_bf16_small_k3c3"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_96f59774d808a89722a5_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_96f59774d808a89722a5_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_90a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "Vt"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "plan"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "6d12dfc25c529e48fd6ab723180585c77a84760bd2cd0f71fef5aa43c244e63c",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 167624,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_9cfbf6c9c4ca7d4409ed_kernel.cu",
+          "sha256": "07ff20dd70ce2b16ea7eb555ea6d5634501fa377d9f4d211a8bac5184ad59bf3"
+        },
+        {
+          "bytes": 21192,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_9cfbf6c9c4ca7d4409ed_binding.cu",
+          "sha256": "16614cbd64e78a0e02796f9ef85d54af015756cc9fe90cdd9898efae500c2a20"
+        }
+      ],
+      "closure_sha256": "aaa6ba21a8fd4fa7da6281749fc6ce5710951f79589829557d98a8d267f8c0d3",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_vsa_sm90_9cfbf6c9c4ca7d4409ed",
+      "launch": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 148480,
+        "use_pdl": false
+      },
+      "module_ident": "cake_vsa_sm90_9cfbf6c9c4ca7d4409ed_sm_90a",
+      "name": "cake_vsa_sm90_9cfbf6c9c4ca7d4409ed",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "9cfbf6c9c4ca7d4409ede7a9bae784ed3ff908d4b46a8a5a0769f7706d39a66c",
+        "stage": "small_k4c4",
+        "template": "vsa_sm90_bf16_small_k4c4"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_9cfbf6c9c4ca7d4409ed_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_9cfbf6c9c4ca7d4409ed_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_90a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "Vt"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "plan"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "6d12dfc25c529e48fd6ab723180585c77a84760bd2cd0f71fef5aa43c244e63c",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 240089,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_a726970bbbdf528f5d03_kernel.cu",
+          "sha256": "b584d1a5ac75791c9561c8999f01281f09291c665fab6637bf77384cc9cb522d"
+        },
+        {
+          "bytes": 21192,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_a726970bbbdf528f5d03_binding.cu",
+          "sha256": "f846f1272b51c4c4757d16ee2a65eee0152b8bd5d5a01e9796d1ccae09431396"
+        }
+      ],
+      "closure_sha256": "f5f35cc80ddb1cb639c690b432ae22ace0a78fdb87b454b208be04cf88c0ebb3",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_vsa_sm90_a726970bbbdf528f5d03",
+      "launch": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "cluster": [
+          3,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 214016,
+        "use_pdl": false
+      },
+      "module_ident": "cake_vsa_sm90_a726970bbbdf528f5d03_sm_90a",
+      "name": "cake_vsa_sm90_a726970bbbdf528f5d03",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "a726970bbbdf528f5d03df6d2c416a831027179f6876d0543038c7b878abaecb",
+        "stage": "small_k6c3",
+        "template": "vsa_sm90_bf16_small_k6c3"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_a726970bbbdf528f5d03_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_a726970bbbdf528f5d03_kernel.cu"
       }
     },
     {
@@ -1305,6 +2006,250 @@
         "binding": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_b6069c01963ef828b12c_binding.cu",
         "compile_separately": true,
         "device": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_b6069c01963ef828b12c_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_90a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "Vt"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "plan"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "6d12dfc25c529e48fd6ab723180585c77a84760bd2cd0f71fef5aa43c244e63c",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 171911,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_e23244f78f910b5eb977_kernel.cu",
+          "sha256": "4f93017aa086cfd7703d92be3aef45921fe7c438e918ddb5d3c7321d04c6f0cb"
+        },
+        {
+          "bytes": 21192,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_e23244f78f910b5eb977_binding.cu",
+          "sha256": "52da1b289af9c48d193b293a54cee5a7ba1170eccf005206c6040a623bc26fb7"
+        }
+      ],
+      "closure_sha256": "d63481f0ff93e170d692a3264a8c011875c075ca0553addedebd17918c05c7f6",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_vsa_sm90_e23244f78f910b5eb977",
+      "launch": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "cluster": [
+          2,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 148480,
+        "use_pdl": false
+      },
+      "module_ident": "cake_vsa_sm90_e23244f78f910b5eb977_sm_90a",
+      "name": "cake_vsa_sm90_e23244f78f910b5eb977",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "e23244f78f910b5eb9774c1deb327d6ddee38f8e42afcdb0fe3a0f6da3ae19e8",
+        "stage": "small_k4c2",
+        "template": "vsa_sm90_bf16_small_k4c2"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_e23244f78f910b5eb977_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_e23244f78f910b5eb977_kernel.cu"
+      }
+    },
+    {
+      "arch": "sm_90a",
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "Vt"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "parameter",
+          "plan"
+        ],
+        [
+          "parameter",
+          "seqlen_q"
+        ],
+        [
+          "parameter",
+          "seqlen_k"
+        ],
+        [
+          "parameter",
+          "scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "arg_plan_sha256": "6d12dfc25c529e48fd6ab723180585c77a84760bd2cd0f71fef5aa43c244e63c",
+      "binding_infrastructure": {
+        "runtime": "flashinfer_tvm_ffi_utils",
+        "target_owned_headers": [
+          "tvm_ffi_utils.h"
+        ]
+      },
+      "closure": [
+        {
+          "bytes": 108455,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_eef66cf02b30ab131111_kernel.cu",
+          "sha256": "55f995a26a31b09c59d40cfd87a29a980d3a22bb433a13c545510720e06f933b"
+        },
+        {
+          "bytes": 21190,
+          "path": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_eef66cf02b30ab131111_binding.cu",
+          "sha256": "3006389ed5c113b9985e54ae0646b8348491b1188522895c4e1532e4117eb8f9"
+        }
+      ],
+      "closure_sha256": "582d7ca54717036a9381e8d7eb1db3d837bc974620323b2ca48993f7cb963f9c",
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_cake_vsa_sm90_eef66cf02b30ab131111",
+      "launch": {
+        "block": [
+          128,
+          1,
+          1
+        ],
+        "cluster": [
+          4,
+          1,
+          1
+        ],
+        "cluster_scheduling_policy": "spread",
+        "cooperative": false,
+        "dynamic_smem_bytes": 82944,
+        "use_pdl": false
+      },
+      "module_ident": "cake_vsa_sm90_eef66cf02b30ab131111_sm_90a",
+      "name": "cake_vsa_sm90_eef66cf02b30ab131111",
+      "noncontiguous_tensors": [],
+      "role": "kernel",
+      "route": {
+        "source_identity": "eef66cf02b30ab131111e056434554b5e6541e80c5c3144786061a64494bf13c",
+        "stage": "small_k2c4",
+        "template": "vsa_sm90_bf16_small_k2c4"
+      },
+      "source_build": {
+        "backend": "cuda_cpp",
+        "compile_options": [
+          "--use_fast_math"
+        ],
+        "cooperative": false,
+        "entry": "run",
+        "kind": "production_kernel_factory",
+        "physical_schedule": "resolved_final_ir",
+        "source_arch": null,
+        "source_tma_abi": "grid_constant",
+        "specializations": {},
+        "use_pdl": false,
+        "validate": false
+      },
+      "specializations": {},
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "translation_units": {
+        "binding": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_eef66cf02b30ab131111_binding.cu",
+        "compile_separately": true,
+        "device": "csrc/cake_vsa_sm90/sm_90a/cake_vsa_sm90_eef66cf02b30ab131111_kernel.cu"
       }
     }
   ],

@@ -17,7 +17,7 @@
 
 One source-only manifest lives under ``csrc/cake_vsa_sm90``
 (``cake_vsa_sm90_manifest.json``, schema ``cake.library_export.v5``): a single
-``sm_90a`` module rendered from the Cake Weave kernel ``vsa_sm90_bf16_fwd`` (BF16 HND,
+``sm_90a`` module rendered from the Cake kernel ``vsa_sm90_bf16_fwd`` (BF16 HND,
 head_dim 128, 64-token blocks) plus its tvm-ffi binding.  The Python planner that
 produces the kernel's tile metadata lives in :mod:`flashinfer.cake_vsa_sm90`.
 """
@@ -38,7 +38,9 @@ _MANIFEST_NAME = "cake_vsa_sm90_manifest.json"
 _ARCH = "sm_90a"
 # Persistent pair/split route plus the small-selection route (one CTA per query
 # block, plan in the kernel-parameter constant bank) in four KMAX variants, each
-# also as a split-KV variant (selections sliced across CTAs, last-CTA merge).
+# also as a split-KV variant (selections sliced across CTAs, last-CTA merge),
+# and the cluster variants (slices of a query block as one thread-block
+# cluster, merge through distributed shared memory).
 STAGES = (
     "attention",
     "small_k1",
@@ -49,6 +51,13 @@ STAGES = (
     "small_k3s",
     "small_k4s",
     "small_k6s",
+    "small_k2c4",
+    "small_k3c3",
+    "small_k3c6",
+    "small_k4c2",
+    "small_k4c4",
+    "small_k6c2",
+    "small_k6c3",
 )
 
 
