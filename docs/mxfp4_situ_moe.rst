@@ -2305,6 +2305,65 @@ reachable floor 45 of 56 and 37 of 42 (the shard's T=16384 balanced row
 moved from 1.08 to 1.11 with its drift). The tables of this section are
 regenerated from the merged tree's run; nothing was opened or closed.
 
+*Round 25 (B300).* The large-token rows run below the clock the floors
+were measured at; two shard tactics measured and closed. No kernel
+change. (1) Sampling the SM clock and board power at 10 Hz while the
+T=32768 rows replay for a second at a time (200 graph replays per row,
+one GPU, both layouts): every busy sample sits at the 1100 W power cap
+(``clocks_throttle_reasons.sw_power_cap`` active in every busy sample
+inside the four row windows; 96 of the 121 samples above 500 W over the
+whole run, the other 25 at the row boundaries where the 1 s power
+readout lags) and the SM clock falls from its idle 2032 MHz to 1380-1400
+MHz (10th percentile) / 1610 MHz (mean) on the shard's rows and to
+1170-1185 / 1380-1540 MHz on the wide rank's rows (board power 855-917 W
+mean, 1103 W peak, 44 C). Sweeping T=2048..16384 the same way shows the
+cap engaging within the first 100 ms sample of every dense burst from
+T=2048 up (``sw_power_cap`` active in 3 of 11 busy samples at T=2048 and
+4096, 5 of 13 at 8192, 8 of 16 at 16384), with the clock falling to
+1730-1780 MHz (shard) / 1490-1570 MHz (rank) at T=2048, 1560-1580 /
+1360-1390 at 4096, 1530-1550 / 1305-1330 at 8192 and 1335-1450 /
+1130-1260 MHz at 16384; the burst length sets the depth (the shard's
+finalize GEMM2 at T=16384 balanced reads 1298 us over 3 x 20 replays,
+1569 us over 30 and 1734 us over 200). Letting the clock recover settles
+the attribution: replaying the same rows with one second of idle before
+each of 20 replays (CUPTI, same GPU, same graph) against back-to-back
+replays, the T=32768 shard balanced / hot / ``empty`` spans read 4778 /
+4705 / 3941 against 5359 / 5364 / 4322 us (0.89 / 0.88 / 0.91; finalize
+GEMM2 alone 0.83 / 0.82 / 0.87), the rank balanced / hot rows 3554 /
+4946 against 3886 / 5742 (0.91 / 0.86; GEMM1 0.92 / 0.87, GEMM2 0.92 /
+0.84); at T=16384 the ratio is 0.95-0.99 and at T=8192 0.98-0.99.
+Against the reachable floors in the table below the recovered-clock
+spans read 0.97 / 0.94 (shard balanced / ``empty``) and 0.98 / 0.94
+(rank balanced / hot): with the clock the floors were measured at, the
+T=32768 rows sit at or under their reachable floor. The tables keep the
+sustained-replay numbers because that is the regime a serving loop runs
+in, and the trtllm-gen column is measured in the same regime. The per-SM
+smem-fill cap and the MMA rate scale with that clock while the HBM terms
+do not, so the ring-bound dense rows lose 20-45 % of their measured fill
+rate exactly where the reachable floor charges 2032 MHz: this is the
+99.5 GB/s per SM the round-23 stamps read for the 128 x 256 form at
+T=32768, the 27 % pass-to-pass spread of the T=32768 rows on one GPU
+(2405-3045 us for the same GEMM2 within three minutes) and the residual
+of the T=32768 rows above their reachable floor (rank balanced / hot
+1.17 / 1.13, shard balanced / ``empty`` 1.14 / 1.15). Those rows are
+power-bound, not schedule-bound; the microbenchmark floors (HBM copy,
+MMA peak, launch gap) run for microseconds at the full clock and cannot
+be reached by a kernel that draws the cap for milliseconds. (2) The
+256-wide finalize GEMM2 tile above T=14336 on the shard (33 % more bytes
+per row-wise bulk reduce-add, the round-23 lever): same-GPU A/B, three
+passes x 20 replays, finalize kernel 1275 / 1273 / 1270 vs 1298 / 1298 /
+1299 us at T=16384 balanced (0.98), 0.99-1.00 on hot / ``empty``, and
+inside the power-cap spread at T=32768 (2812-3029 vs 2405-3045); the
+2-CTA form of that tile is 2-21 % slower. Closed: the shard's reduce-add
+at T >= 16384 is not bound by its 128 row operations per tile (the wider
+row did not shorten it) but by the reduce path's throughput on the non-
+resident output, which is the model's read-modify-write term. (3) The
+192-wide 2-CTA GEMM2 for the shard at T <= 2048 (table today: 256-wide
+single CTA): balanced / hot 0.996-1.001, ``empty`` 0.985 / 0.984 / 0.983
+at T=512 / 1024 / 2048 in all three passes -- a 1.5 % gain on three
+rows, kept for the next code round rather than spent as a gate cycle of
+its own.
+
 *Wide rank at T=8192 and T=16384 remote-dominated.* These rows are the
 slowest against TRT-LLM Gen (0.79-0.86) and 2.0-2.4 x their floor: the
 first from tile padding (146 rows per expert, two M128 tiles), the second
