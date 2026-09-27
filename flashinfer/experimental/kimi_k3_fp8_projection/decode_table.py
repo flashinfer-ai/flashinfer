@@ -539,6 +539,22 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "resident": False,
         },
         "386,28,256": {"route": "gemm"},
+        "1,28,4096": {
+            "route": "decode",
+            "tok": 32,
+            "split": 1,
+            "fused": True,
+            "persist": True,
+            "resident": False,
+        },
+        "1,28,16384": {
+            "route": "decode",
+            "tok": 64,
+            "split": 4,
+            "fused": True,
+            "persist": True,
+            "resident": False,
+        },
     },
     "sm_103a": {
         "1,28,1": {
@@ -1050,5 +1066,21 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "resident": False,
         },
         "386,28,256": {"route": "gemm"},
+        "1,28,4096": {
+            "route": "decode",
+            "tok": 32,
+            "split": 1,
+            "fused": True,
+            "persist": True,
+            "resident": False,
+        },
+        "1,28,16384": {
+            "route": "decode",
+            "tok": 64,
+            "split": 4,
+            "fused": True,
+            "persist": True,
+            "resident": False,
+        },
     },
 }

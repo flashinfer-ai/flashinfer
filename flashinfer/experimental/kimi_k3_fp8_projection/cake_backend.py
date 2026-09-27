@@ -30,10 +30,14 @@ runs as one or two generated Cake programs on the current stream:
 * ``quant:u<units>`` -- the per-token 1x128 E4M3 quantization launch (DeepGEMM
   ``per_token_cast_to_fp8(use_ue8m0=True)`` bit-exact) writing the E4M3
   activation and its swizzled UE8M0 scale tiles into the caller-owned workspace;
-* ``gemm`` -- the persistent 2-CTA block-scaled tcgen05 GEMM (M > 256), or
+* ``gemm_tstore`` / ``gemm`` -- the persistent 2-CTA block-scaled tcgen05 GEMM
+  (M > 256 unless tabulated below) with the TMA-store epilogue for a 16-byte
+  aligned output view whose row stride is a multiple of 8 elements, or the
+  register epilogue for other strides, or
 * ``decode:t<tok>_p<stages>[_fused][_res]`` -- the swap-AB split-K decode kernel
-  (M <= 256; the ``_fused`` instances quantize the token tile in-CTA, so the
-  quantization launch is skipped).
+  (M <= 256, and the single-N-tile families the measured table routes here up
+  to 16384 rows; the ``_fused`` instances quantize the token tile in-CTA, so
+  the quantization launch is skipped).
 
 Host work is split exactly like the Cake production launcher:
 
@@ -67,6 +71,7 @@ import tvm_ffi
 
 from .cake_jit import (
     GEMM_KERNEL_KEY,
+    GEMM_TSTORE_KERNEL_KEY,
     MODULES,
     decode_kernel_key,
     kernel_module_name,
@@ -92,7 +97,15 @@ E4M3_MAX = 448.0
 AMAX_FLOOR = 1e-4  # DeepGEMM per_token_cast_to_fp8 clamp
 QUANT_WARPS = 4  # warps per quantization CTA; a half warp quantizes one 128-element block per unit
 DECODE_MAX_M = 256  # rows above this use the persistent 2-CTA GEMM
-DECODE_TABLE_BUCKETS = (1, 8, 64, 256)  # M buckets of the measured dispatch table
+DECODE_TABLE_BUCKETS = (
+    1,
+    8,
+    64,
+    256,
+    4096,
+    16384,
+)  # M buckets of the measured dispatch table (the two large
+#                                                     buckets only list families measured faster than the GEMM)
 DEC_W_BYTES = 128 * BLOCK_K  # one 128-row weight tile x 256 K per stage
 DEC_SF_BYTES = 2048  # 2 K-sets x 512 B per operand
 DEC_SMEM_CAP = 230400  # decode SMEM pool budget
@@ -321,12 +334,11 @@ def decode_config(
 ) -> Optional[DecodeConfig]:
     """Decode route of the shape from the measured table (``None`` = quantization launch + GEMM).
 
-    Shapes above ``DECODE_MAX_M`` rows, and ``(N, K)`` families the table does not cover, take the GEMM route
-    (the Cake dispatcher falls back to its calibrated cost model for uncovered families; every representative
-    Kimi-K3 family is covered on both architectures)."""
+    ``(N, K)`` families the table does not cover take the GEMM route (the Cake dispatcher falls back to its
+    calibrated cost model for uncovered families up to ``DECODE_MAX_M`` rows; every representative Kimi-K3 family
+    is covered on both architectures).  Above ``DECODE_MAX_M`` rows only the tabulated narrow-N families (whose
+    activation stream the 2-CTA GEMM cannot spread over the SMs) keep the decode route."""
     M = int(M)
-    if M > DECODE_MAX_M:
-        return None
     entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
     if entry is None or entry.get("route") != "decode":
         return None
@@ -376,6 +388,7 @@ def required_kernel_keys(arch: str, sm_count: int = 148) -> tuple[str, ...]:
         quant_kernel_key(2),
         quant_kernel_key(4),
         GEMM_KERNEL_KEY,
+        GEMM_TSTORE_KERNEL_KEY,
     ]
     for key in DECODE_TABLE.get(arch, {}):
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
@@ -649,6 +662,21 @@ def _store_vec(data_ptr: int, ldo: int) -> int:
     return 2
 
 
+def gemm_tma_store_eligible(data_ptr: int, ldo: int, n_valid: int) -> bool:
+    """The output view can be a TMA tensor map: 16-byte base, a row stride that is a multiple of 16 bytes and a
+    16-byte column edge.  The TMA unit bounds-checks the inner (contiguous) axis of a store at 16-byte granularity,
+    so a map whose inner extent is not a multiple of 16 bytes writes the rest of the edge chunk (``n_valid = 6284``
+    with a 16-byte row stride stored columns 6284..6287 of the caller's padding); such views keep the predicated
+    register epilogue."""
+    return data_ptr % 16 == 0 and ldo % 8 == 0 and n_valid % 8 == 0
+
+
+GEMM_TS_COLS = (
+    128,
+    32,
+)  # [rows, BF16 columns] of the ``OUT`` descriptor placeholder of the register-epilogue GEMM
+
+
 @dataclass(frozen=True)
 class ProjectionPlan:
     """The resolved route of one ``(x, prepared, out, workspace)`` binding."""
@@ -658,6 +686,7 @@ class ProjectionPlan:
     M: int
     route: str  # "decode" or "gemm"
     decode: Optional[DecodeConfig]
+    gemm_tma_store: bool  # GEMM route: TMA-store epilogue (aligned output view) instead of the register epilogue
     quant_units: Optional[int]  # None when the decode instance quantizes in-CTA
     sf_rows: int
     kernels: tuple[str, ...]  # logical kernel key per launch, in launch order
@@ -669,9 +698,15 @@ class ProjectionPlan:
 
 
 def route_plan(
-    prepared: PreparedProjectionWeight, M: int, arch: str, sm_count: int
+    prepared: PreparedProjectionWeight,
+    M: int,
+    arch: str,
+    sm_count: int,
+    gemm_tma_store: bool = True,
 ) -> ProjectionPlan:
-    """Resolve the launch sequence of ``M`` rows without touching device memory."""
+    """Resolve the launch sequence of ``M`` rows without touching device memory.
+
+    ``gemm_tma_store`` selects the GEMM epilogue program (``gemm_tma_store_eligible`` of the output view)."""
     M = int(M)
     cfg = decode_config(M, prepared.n_tiles128, prepared.num_k_iters, arch, sm_count)
     c_off, _c_bytes, p_off, p_bytes = reduction_layout(prepared, M, cfg)
@@ -685,7 +720,7 @@ def route_plan(
         kernels.append(quant_kernel_key(units))
         grids.append(-(-(M * units_per_row) // (QUANT_WARPS * 2)))
     if cfg is None:
-        kernels.append(GEMM_KERNEL_KEY)
+        kernels.append(GEMM_TSTORE_KERNEL_KEY if gemm_tma_store else GEMM_KERNEL_KEY)
         grids.append(_gemm_grid(_m_tiles(M), prepared.n_tiles))
     else:
         kernels.append(cfg.kernel_key)
@@ -696,6 +731,7 @@ def route_plan(
         M=M,
         route="decode" if cfg is not None else "gemm",
         decode=cfg,
+        gemm_tma_store=cfg is None and bool(gemm_tma_store),
         quant_units=units,
         sf_rows=cfg.tok if cfg is not None else SF_TILE_ROWS,
         kernels=tuple(kernels),
@@ -867,9 +903,15 @@ def prepare_kimi_k3_fp8_projection(
     M = validate_kimi_k3_fp8_projection_inputs(
         x, prepared, out, workspace, arch=arch, sm_count=sm_count
     )
-    plan = route_plan(prepared, M, arch, sm_count)
     q, sf = workspace
     ldo = int(out.stride(0))
+    plan = route_plan(
+        prepared,
+        M,
+        arch,
+        sm_count,
+        gemm_tma_store_eligible(out.data_ptr(), ldo, prepared.n_valid),
+    )
     out_flat = torch.as_strided(
         out, (ldo * (M - 1) + prepared.n_valid,), (1,), out.storage_offset()
     )
@@ -902,6 +944,13 @@ def prepare_kimi_k3_fp8_projection(
             stage += 1
         cfg = plan.decode
         if cfg is None:
+            # ``OUT`` is the TMA-store descriptor over the [M, n_valid] output view (clipped rows / columns are never
+            # written); the register-epilogue program receives a placeholder map it never accesses.
+            out_map = (
+                out
+                if plan.gemm_tma_store
+                else torch.zeros(GEMM_TS_COLS, dtype=torch.bfloat16, device=device)
+            )
             launches.append(
                 _bind(
                     plan.modules[stage],
@@ -910,6 +959,9 @@ def prepare_kimi_k3_fp8_projection(
                         B=b_u8,
                         SFA=sfa,
                         SFB=prepared.scale_tiles.view(-1, 8, 128),
+                        OUT=out_map,
+                        x=x,
+                        K=prepared.K,
                         out=out_flat,
                         M=M,
                         m_tiles=_m_tiles(M),
