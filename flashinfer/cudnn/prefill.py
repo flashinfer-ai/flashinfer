@@ -1076,10 +1076,20 @@ class _CudnnPrefillPlan:
             and previous.metadata.o_data_type == metadata.o_data_type
             and previous.override_enabled == enabled
             and previous.exact_keys[True] == exact
-            and all(a is b for a, b in zip(previous.inputs, inputs, strict=True))
+            and all(
+                a is b
+                or (
+                    a is not None
+                    and b is not None
+                    and a.dtype == b.dtype
+                    and a.is_set_to(b)
+                )
+                for a, b in zip(previous.inputs, inputs, strict=True)
+            )
         ):
-            # Values changed in stable buffers. Descriptor equality above is
-            # still required: tensor identity alone does not freeze its layout.
+            # Fresh views over the same buffers can reuse the static bindings.
+            # Compare owned snapshots: set_() can rebind a caller's tensor
+            # without changing either its Python identity or descriptor.
             return previous
         return cls(
             metadata,
@@ -1102,7 +1112,6 @@ class _CudnnPrefillPlan:
         inputs,
         override_enabled,
     ):
-        self.inputs = inputs
         views = {}
         for name in self._tensor_fields:
             tensor = getattr(metadata, name)
@@ -1110,6 +1119,7 @@ class _CudnnPrefillPlan:
                 if id(tensor) not in views:
                     views[id(tensor)] = tensor.detach()
                 setattr(metadata, name, views[id(tensor)])
+        self.inputs = tuple(None if t is None else views[id(t)] for t in inputs)
         self.metadata = metadata
         self.device = device
         self.override_enabled = override_enabled

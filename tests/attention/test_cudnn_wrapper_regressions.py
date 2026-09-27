@@ -189,8 +189,8 @@ def test_prefill_warm_run_does_not_rebuild_plan_metadata(
 
 def test_prefill_plan_snapshots_layout_and_replan_rekeys(monkeypatch):
     monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
-    lengths = torch.empty(2, device="meta", dtype=torch.int32)
-    table = torch.empty(2, 4, device="meta", dtype=torch.int32)
+    lengths = torch.empty(2, dtype=torch.int32)
+    table = torch.empty(2, 4, dtype=torch.int32)
 
     def metadata():
         return prefill._PrefillMetadata(
@@ -216,6 +216,60 @@ def test_prefill_plan_snapshots_layout_and_replan_rekeys(monkeypatch):
         metadata(), torch.bfloat16, lengths.device, plan
     )
     assert replanned.exact_keys != plan.exact_keys
+
+
+@pytest.mark.parametrize("change", ["view_alias", "set_storage", "set_offset"])
+def test_prefill_replan_tracks_storage_not_tensor_identity(monkeypatch, change):
+    """Fresh views reuse bindings; rebinding the same tensor must replace them."""
+    monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: False)
+    lengths = torch.tensor([3, 2], dtype=torch.int32)
+    table = torch.arange(16, dtype=torch.int32)[:8].view(2, 4)
+
+    def metadata():
+        return prefill._PrefillMetadata(
+            3,
+            64,
+            False,
+            True,
+            actual_seq_lens_q=lengths.view_as(lengths),
+            actual_seq_lens_kv=lengths.view_as(lengths),
+            block_tables=table,
+        )
+
+    initial = metadata()
+    original_q, original_kv = initial.actual_seq_lens_q, initial.actual_seq_lens_kv
+    plan = prefill._CudnnPrefillPlan.prepare(initial, torch.bfloat16, lengths.device)
+    replace_storage = change != "view_alias"
+    if replace_storage:
+        old_table = plan.metadata.block_tables
+        if change == "set_storage":
+            table.set_(table.flip(1).contiguous())
+        else:
+            table.set_(table.untyped_storage(), 4, table.size(), table.stride())
+        # Reuse the same original tensor objects, as the former identity check
+        # did. Their detached plan snapshots still own the old allocation.
+        current = prefill._PrefillMetadata(
+            3,
+            64,
+            False,
+            True,
+            actual_seq_lens_q=original_q,
+            actual_seq_lens_kv=original_kv,
+            block_tables=table,
+        )
+    else:
+        table = table.view_as(table)
+        current = metadata()
+    new = prefill._CudnnPrefillPlan.prepare(
+        current, torch.bfloat16, lengths.device, plan
+    )
+    assert (new is plan) is (not replace_storage)
+    assert new.metadata.block_tables.is_set_to(table)
+    if replace_storage:
+        torch.testing.assert_close(
+            old_table, torch.arange(8, dtype=torch.int32).view(2, 4)
+        )
+        torch.testing.assert_close(new.metadata.block_tables, table)
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
