@@ -14,6 +14,7 @@ import torch
 from ...utils import register_custom_op, register_fake_op
 from .jit import (
     MMA_ROUTE_SUFFIX,
+    SPLIT_ROUTE_SUFFIX,
     TREE_KERNELS,
     gen_sm110_xqa_module,
     get_manifest,
@@ -266,8 +267,12 @@ def prepare(
     D512 accepts uniform or packed tree queries with contiguous FP16/FP8 KV
     or page128 KV. D128 accepts one FP16 decode query and contiguous FP16 KV.
     ``kernel`` selects the D512 physical family: ``"tcgen05"`` (default, tensor
-    memory) or ``"register_mma"`` (warp-level ``mma.sync`` with a 32-row Q tile
-    per CTA, split-K QK across idle warps and an in-kernel KV L2 prefetch).
+    memory), ``"register_mma"`` (warp-level ``mma.sync`` with a 32-row Q tile
+    per CTA, split-K QK across idle warps and an in-kernel KV L2 prefetch),
+    ``"register_mma_split"`` (the same Q tile, two eight-warp groups over the two
+    KV halves with an in-CTA merge; frozen for FP16 page128 KV only) or
+    ``"register_mma_auto"`` (``register_mma_split`` for FP16 page128 KV, the
+    ``register_mma`` route for every other D512 cache mode).
     Preparation performs compilation and may allocate output/scratch; call it
     before graph capture. D128 counters are zeroed once on the current stream;
     another launch stream must explicitly wait for that preparation stream.
@@ -275,8 +280,10 @@ def prepare(
     """
     _tensor(q, "q", dtype=torch.float16)
     require_sm110(q.device)
-    if kernel not in TREE_KERNELS:
-        raise ValueError(f"kernel must be one of {TREE_KERNELS}")
+    if kernel not in TREE_KERNELS + ("register_mma_auto",):
+        raise ValueError(
+            f"kernel must be one of {TREE_KERNELS + ('register_mma_auto',)}"
+        )
     if q.ndim not in (3, 4) or q.shape[-1] not in (128, 512):
         raise ValueError("q must be rank 3 or 4 with head dimension 128 or 512")
     dim = q.shape[-1]
@@ -494,7 +501,17 @@ def prepare(
     precision = "fp8" if kv.dtype == torch.float8_e4m3fn else "fp16"
     layout = "paged" if page_table is not None else "contiguous"
     route = f"tree_{precision}_{layout}"
-    if kernel == "register_mma":
+    fp16_paged = precision == "fp16" and layout == "paged"
+    if kernel == "register_mma_auto":
+        kernel = "register_mma_split" if fp16_paged else "register_mma"
+    if kernel == "register_mma_split":
+        if not fp16_paged:
+            raise ValueError(
+                "register_mma_split is frozen for FP16 page128 KV only; use "
+                "register_mma or register_mma_auto for other D512 cache modes"
+            )
+        route += SPLIT_ROUTE_SUFFIX
+    elif kernel == "register_mma":
         route += MMA_ROUTE_SUFFIX
     metadata = manifest["routes"][route]
     grid = (

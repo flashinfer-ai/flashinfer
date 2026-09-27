@@ -319,6 +319,56 @@ def test_tree_cache(
     )
 
 
+SPLIT_KERNELS = ("register_mma_split", "register_mma_auto")
+
+
+@pytest.mark.parametrize("kernel", SPLIT_KERNELS)
+@pytest.mark.parametrize(
+    "batch,queries,capacity,ratio,lengths,distribution", CACHE_CASES
+)
+def test_tree_fp16_paged_split(
+    batch, queries, capacity, ratio, lengths, distribution, kernel
+):
+    _tree_case(
+        batch,
+        queries,
+        capacity,
+        ratio,
+        lengths,
+        distribution,
+        "causal" if lengths is None else "binary_tree",
+        False,
+        True,
+        kernel,
+    )
+
+
+@pytest.mark.parametrize("kernel", ("register_mma_auto",))
+@pytest.mark.parametrize("fp8,paged", [(False, False), (True, False), (True, True)])
+def test_tree_auto_falls_back_to_register_mma(fp8, paged, kernel):
+    _tree_case(1, 20, 256, 8, None, "uniform", "causal", fp8, paged, kernel)
+
+
+@pytest.mark.parametrize("fp8,paged", [(False, False), (True, False), (True, True)])
+def test_split_kernel_rejects_other_cache_modes(fp8, paged):
+    q = _sample((1, 20, 32, 512))
+    kv = _sample((1, 2, 4, 256, 512), seed=29)
+    seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
+    stored, pages, _, k_scale, v_scale = _cache(kv, fp8, paged)
+    with pytest.raises(ValueError, match="register_mma_split"):
+        prepare(
+            q,
+            stored,
+            seq,
+            mask=_mask(20, 1, "causal"),
+            page_table=pages,
+            page_size=128 if paged else 0,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            kernel="register_mma_split",
+        )
+
+
 def test_decode_rejects_register_mma_kernel():
     q = _sample((1, 32, 128))
     kv = _sample((1, 2, 4, 256, 128), seed=23)

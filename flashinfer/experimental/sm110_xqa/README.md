@@ -1,9 +1,13 @@
 # Experimental SM110 XQA attention
 
 This opt-in module provides native attention for NVIDIA Thor GPUs with the
-exact SM110a target in two physical kernel families: `tcgen05` (tensor memory,
-D128 decode and D512 tree) and `register_mma` (the register `mma.sync` XQA
-schedule, D512 tree only, selected with `kernel="register_mma"`). Call
+exact SM110a target in three physical kernel families: `tcgen05` (tensor memory,
+D128 decode and D512 tree), `register_mma` (the register `mma.sync` XQA
+schedule, D512 tree only, selected with `kernel="register_mma"`) and
+`register_mma_split` (the same schedule split over the two KV halves by two
+eight-warp groups with an in-CTA merge, frozen for FP16 page128 KV only,
+selected with `kernel="register_mma_split"`; `kernel="register_mma_auto"`
+picks it for FP16 page128 KV and `register_mma` elsewhere). Call
 `flashinfer.sm110_xqa.prepare` for prepared replay or `attention` for a single
 invocation. It uses frozen
 CUDA sources, FlashInfer's JIT compiler and native TVM-FFI stream handling.
@@ -105,8 +109,9 @@ Neither API substitutes a kernel for another GPU architecture.
 
 The module requires CUDA 13.0 or newer and physical capability 11.0; the tested
 toolchain is CUDA 13.4. The frozen source manifest under `csrc/sm110_xqa/`
-specifies compiler flags and route geometry for ten base routes (six
-`tcgen05` routes and the four `register_mma` D512 tree routes `tree_*_mma`),
+specifies compiler flags and route geometry for eleven base routes (six
+`tcgen05` routes, the four `register_mma` D512 tree routes `tree_*_mma` and the
+`register_mma_split` FP16 page128 tree route `tree_fp16_paged_mma_split`),
 plus the single-partition specialization when required. Its `validation_status` field
 is an immutable source-generation record captured at freeze. Subsequent
 execution validation is documented separately in [RESULTS.md](RESULTS.md).
@@ -118,8 +123,15 @@ The `register_mma` tree routes launch one 32-row Q tile per CTA over all 512
 output columns with eight QK warps and eight PV warps (512 threads, grid
 `(1, Hkv * ceil(Q * ratio / 32), B)`), the same tensor layouts, mask contract,
 dequantization scales and tolerances as the `tcgen05` tree routes, and no
-tensor memory. The two families are selected explicitly; nothing is dispatched
-automatically between them. D128 decode has only the `tcgen05` family.
+tensor memory. The `register_mma_split` route keeps that Q tile, grid, mask
+contract, scales and tolerances, and runs two eight-warp groups over the two
+halves of the KV sequence (each with its own K/V ring) that merge their
+unnormalised partials and row statistics in shared memory before one group
+writes the output; it is frozen for FP16 page128 KV, the one cache mode where
+it is faster than `register_mma` on both validated Thor nodes. The families
+are selected explicitly; `register_mma_auto` is the only dispatch and it only
+chooses between the two register families. D128 decode has only the `tcgen05`
+family.
 Each route also records whether it stages raw FP8 bytes asynchronously before
 widening to FP16. This physical option applies only to E4M3 cache routes; FP16
 routes always record it as disabled. Raw prefetch is enabled only when that
