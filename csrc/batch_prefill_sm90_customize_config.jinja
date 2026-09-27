@@ -44,6 +44,12 @@ struct RaggedParams {
   IdType* work_indptr;
   IdType* batch_indices;
 
+  // Split-KV: per-work KV chunk index and per-chunk partial outputs, unused if num_kv_chunks == 1.
+  IdType* kv_chunk_indices = nullptr;
+  int64_t num_kv_chunks = 1;
+  DTypeO* tmp_o = nullptr;
+  float* tmp_lse = nullptr;
+
   struct AdditionalParams {
     {{ additional_params_decl }}
   } additional_params;
@@ -89,6 +95,12 @@ struct PagedParams {
   IdType* head_indices;
   IdType* work_indptr;
   IdType* batch_indices;
+
+  // Split-KV: per-work KV chunk index and per-chunk partial outputs, unused if num_kv_chunks == 1.
+  IdType* kv_chunk_indices = nullptr;
+  int64_t num_kv_chunks = 1;
+  DTypeO* tmp_o = nullptr;
+  float* tmp_lse = nullptr;
 
   struct AdditionalParams {
     {{ additional_params_decl }}
