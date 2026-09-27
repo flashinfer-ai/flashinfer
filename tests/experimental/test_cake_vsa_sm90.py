@@ -25,11 +25,16 @@ import torch
 from flashinfer.cake_vsa_sm90 import (
     MAX_NSPLIT,
     PLAN_HALFWORDS,
+    CLUSTER_GPC_SMS,
+    CLUSTER_VARIANTS,
     PLAN_META_SPLIT,
     PLAN_META_UNSPLIT,
     SMALL_KMAX_VARIANTS,
     SMALL_OCCUPANCY,
     CakeVsaSm90Plan,
+    cluster_cost,
+    cluster_variant_for,
+    split_cost,
     MAX_OWN,
     META_NOWN,
     META_NSEQ,
@@ -75,10 +80,10 @@ def _descriptors(h=2, mb=3, nb=5, device="cpu"):
 @pytest.mark.parametrize(
     "h,mb,nb,capacity,expected",
     [
-        (1, 1, 1, 1, (1, False)),  # one tile, one block
-        (4, 4, 4, 1, (1, False)),  # 16 tiles
-        (8, 4, 4, 3, (3, False)),
-        (8, 16, 16, 4, (4, False)),  # 128 tiles at 1 CTA/SM
+        (1, 1, 1, 1, (1, False, 0)),  # one tile, one block
+        (4, 4, 4, 1, (1, False, 0)),  # 16 tiles
+        (8, 4, 4, 3, (3, False, 0)),
+        (8, 16, 16, 4, (4, False, 0)),  # 128 tiles at 1 CTA/SM
         (
             8,
             17,
@@ -86,7 +91,7 @@ def _descriptors(h=2, mb=3, nb=5, device="cpu"):
             4,
             None,
         ),  # 136 tiles > 132 SMs at 1 CTA/SM, too many for the split rule
-        (8, 64, 64, 1, (1, False)),  # 512 tiles at 4 CTAs/SM
+        (8, 64, 64, 1, (1, False, 0)),  # 512 tiles at 4 CTAs/SM
         (8, 32, 32, 8, None),  # 8 blocks > KMAX 6, 256 tiles fill the persistent kernel
         (2, 128, 32, 6, None),  # 256 x 8 halfwords > PLAN_HALFWORDS
         (
@@ -94,9 +99,15 @@ def _descriptors(h=2, mb=3, nb=5, device="cpu"):
             16,
             16,
             16,
+            "cluster",
+        ),  # one head, 16 x 16 blocks: 32 warpgroups < 132 SMs -> cluster (uniform selection)
+        (
+            2,
+            8,
+            64,
+            32,
             "split",
-        ),  # one head, 16 x 16 blocks: 32 warpgroups < 132 SMs -> split-KV
-        (2, 8, 64, 32, "split"),  # 16 tiles x 32 blocks: 6 slices of KMAX 6 = 96 items
+        ),  # 16 tiles x 32 blocks: 6 slices of KMAX 6 = 96 items (no cluster holds 32)
         (
             2,
             8,
@@ -109,19 +120,69 @@ def _descriptors(h=2, mb=3, nb=5, device="cpu"):
 def test_small_route_rule(h, mb, nb, capacity, expected):
     mask = _random_mask(h, mb, nb, capacity, ragged=False)
     route = small_route(mask, sms=132)
+    counts = [capacity] * (h * mb)
     if expected == "split":
-        assert route is not None and route[1] is True
+        assert route is not None and route[1] is True and route[2] == 0
         kmax = route[0]
         assert kmax in SMALL_KMAX_VARIANTS and 2 * h * mb <= 132
         items = h * mb * -(-capacity // kmax)
         assert items <= SMALL_OCCUPANCY[kmax] * 132
         assert items * (kmax + PLAN_META_SPLIT) <= PLAN_HALFWORDS
-        assert kmax == split_kmax([capacity] * (h * mb), sms=132)
+        assert kmax == split_kmax(counts, sms=132)
+    elif expected == "cluster":
+        assert route is not None and route[1] is False and route[2] > 0
+        kmax, csize = route[0], route[2]
+        assert (kmax, csize) in CLUSTER_VARIANTS and kmax * csize >= capacity
+        assert h * mb <= (132 // CLUSTER_GPC_SMS) * (CLUSTER_GPC_SMS // csize)
+        assert (kmax, csize) == cluster_variant_for(counts, sms=132)
+        assert cluster_cost(counts, kmax, csize) < split_cost(
+            counts, split_kmax(counts, sms=132)
+        )
     else:
         assert route == expected
-    if expected not in (None, "split"):
+    if expected not in (None, "split", "cluster"):
         assert h * mb <= SMALL_OCCUPANCY[expected[0]] * 132
         assert h * mb * (expected[0] + PLAN_META_UNSPLIT) <= PLAN_HALFWORDS
+
+
+def test_cluster_route_prefers_split_on_ragged_selections():
+    """A cluster launches csize CTAs for every query block: ragged 1..8 selections stay on the split route."""
+    ragged = torch.zeros((4, 16, 16), dtype=torch.bool)
+    for t in range(64):
+        ragged.reshape(64, 16)[t, : 1 + t % 8] = True
+    counts = ragged.sum(-1).reshape(-1).tolist()
+    kmax, split, cluster = small_route(ragged, sms=132)
+    assert split and cluster == 0 and kmax == split_kmax(counts, sms=132)
+    assert (
+        cluster_variant_for(counts, sms=132) is not None
+    )  # a variant fits; it is just costlier
+    uniform = torch.zeros((1, 16, 16), dtype=torch.bool)
+    uniform[..., :16] = True
+    assert small_route(uniform, sms=132) == (3, False, 6)
+
+
+def test_plan_small_cluster_rows_pad_every_query_block():
+    mask = _random_mask(2, 8, 64, 16, seed=7, ragged=True)
+    for kmax, csize in CLUSTER_VARIANTS:
+        if kmax * csize < 16:
+            continue
+        plan = plan_small(mask, kmax=kmax, cluster=csize)
+        rows = _decode_small_rows(plan)
+        assert plan["cluster"] == csize and not plan["split"]
+        assert plan["num_items"] == len(rows) == 16 * csize
+        for tile in range(16):
+            selected = torch.nonzero(mask.reshape(16, 64)[tile]).flatten().tolist()
+            slices = rows[tile * csize : (tile + 1) * csize]
+            assert all(r["tile"] == tile and r["nsplit"] == csize for r in slices)
+            assert [r["split"] for r in slices] == list(range(csize))
+            assert all(0 <= r["count"] == len(r["blocks"]) <= kmax for r in slices)
+            assert sorted(b for r in slices for b in r["blocks"]) == selected
+    with pytest.raises(ValueError, match="cannot hold"):
+        plan_small(torch.ones((1, 16, 16), dtype=torch.bool), kmax=4, cluster=2)
+    with pytest.raises(ValueError, match="exclusive"):
+        plan_small(
+            torch.ones((1, 16, 16), dtype=torch.bool), kmax=4, split=True, cluster=4
+        )
 
 
 def _decode_small_rows(plan):
@@ -374,21 +435,30 @@ def _wrapper(mask, backend="cake", scale=None):
     return wrapper
 
 
-def _inputs(h, mb, nb):
+def _inputs(h, mb, nb, seed=7):
+    """Deterministic BF16 Q/K/V (HND) for the kernel-vs-reference checks."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
     return tuple(
-        torch.randn((h, length * 64, 128), device="cuda", dtype=torch.bfloat16)
+        torch.randn(
+            (h, length * 64, 128), device="cuda", dtype=torch.bfloat16, generator=g
+        )
         for length in (mb, nb, nb)
     )
 
 
 def _reference(q, k, v, mask, scale):
-    """Independent FP32 reference: masked dense softmax attention per head."""
+    """Independent FP32 reference: masked dense softmax attention per head.
+
+    Returned unrounded (FP32): the BF16 kernel output is compared against the
+    exact value, so the check bounds the kernel's own rounding (at most half a
+    BF16 ulp plus the FP32 accumulation difference) instead of asking two
+    independently rounded BF16 results to agree, which any two implementations
+    fail by one ulp (0.03125 for |o| in [4, 8)) on a fraction of the elements.
+    """
     scores = torch.einsum("hmd,hnd->hmn", q.float(), k.float()) * float(scale)
     dense = mask.to(q.device).repeat_interleave(64, dim=1).repeat_interleave(64, dim=2)
     scores.masked_fill_(~dense, float("-inf"))
-    return torch.einsum("hmn,hnd->hmd", torch.softmax(scores, dim=-1), v.float()).to(
-        q.dtype
-    )
+    return torch.einsum("hmn,hnd->hmd", torch.softmax(scores, dim=-1), v.float())
 
 
 @requires_hopper
@@ -470,10 +540,95 @@ def test_split_route_against_persistent(h, mb, nb, capacity, scale, ragged):
     rule = small_route(
         mask, sms=torch.cuda.get_device_properties(0).multi_processor_count
     )
-    expected_mode = (
-        "persistent" if rule is None else ("smallsplit" if rule[1] else "small")
-    )
+    expected_mode = _mode_of(rule)
     assert auto.mode == expected_mode
+
+
+def _mode_of(rule):
+    if rule is None:
+        return "persistent"
+    if rule[2]:
+        return "smallcluster"
+    return "smallsplit" if rule[1] else "small"
+
+
+@requires_hopper
+@pytest.mark.parametrize(
+    "h,mb,nb,capacity,scale,ragged",
+    [
+        (1, 16, 16, 16, None, False),  # the benchmark's h1-m1024-k16 row -> k3c6
+        (1, 16, 64, 16, 0.5, True),  # padded slices
+        (4, 16, 16, 8, None, True),  # forced: the ragged 8-block row (auto keeps split)
+        (3, 5, 10, 9, -0.125, True),
+        (1, 1, 2, 2, 1e-7, False),  # two blocks over four ranks
+        (2, 8, 64, 18, 0.0, False),  # 18 blocks: kmax 6 x 3
+    ],
+)
+def test_cluster_route_against_persistent(h, mb, nb, capacity, scale, ragged):
+    """The cluster / DSM-merge small kernel matches the persistent kernel and the reference; runs twice, bit-exact."""
+    mask = _random_mask(h, mb, nb, capacity, seed=19, ragged=ragged, device="cuda")
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
+    q, k, v = _inputs(h, mb, nb)
+    plan = CakeVsaSm90Plan(
+        "cuda", mask, rows, cols, h, h, 128, sm_scale=scale, route="smallcluster"
+    )
+    assert plan.mode == "smallcluster" and plan.small_cluster > 1
+    assert plan.num_items == plan.num_tiles * plan.small_cluster
+    first = plan.run(q, k, v).float()
+    second = plan.run(q, k, v).float()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(first, second, atol=0, rtol=0)
+    persistent = CakeVsaSm90Plan(
+        "cuda", mask, rows, cols, h, h, 128, sm_scale=scale, route="persistent"
+    )
+    reference = _reference(q, k, v, mask, 128**-0.5 if scale is None else scale).float()
+    for name, out in (
+        ("smallcluster", first),
+        ("persistent", persistent.run(q, k, v).float()),
+    ):
+        torch.testing.assert_close(out, reference, atol=1e-2, rtol=1e-2)
+        assert float((out - reference).abs().max()) <= 0.03, name
+    auto = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, sm_scale=scale)
+    rule = small_route(
+        mask, sms=torch.cuda.get_device_properties(0).multi_processor_count
+    )
+    assert auto.mode == _mode_of(rule)
+
+
+@requires_hopper
+def test_cluster_plan_stream_and_graph_lifetime():
+    """A cluster plan owns no device workspace: built on another stream, captured and replayed bit-exactly."""
+    h, mb, nb = 1, 16, 16
+    mask = _random_mask(h, mb, nb, 16, seed=17, ragged=False, device="cuda")
+    rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
+    cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
+    producer = torch.cuda.Stream()
+    with torch.cuda.stream(producer):
+        plan = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128)
+    assert plan.mode == "smallcluster" and (plan.small_kmax, plan.small_cluster) == (
+        3,
+        6,
+    )
+    q, k, v = _inputs(h, mb, nb)
+    expected = plan.run(q, k, v).clone()
+    out = torch.empty((h * mb * 64, 1, 128), device="cuda", dtype=q.dtype)
+    plan.run(q, k, v, out=out)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan.run(q, k, v, out=out)
+    for _ in range(3):
+        graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out.view_as(q), expected, atol=0, rtol=0)
+    q.normal_()
+    graph.replay()
+    torch.testing.assert_close(
+        out.view_as(q).float(),
+        _reference(q, k, v, mask, 128**-0.5),
+        atol=0.01,
+        rtol=0.01,
+    )
 
 
 @requires_hopper
@@ -485,7 +640,7 @@ def test_split_plan_stream_and_graph_lifetime():
     cols = torch.full((h, nb), 64, dtype=torch.int32, device="cuda")
     producer = torch.cuda.Stream()
     with torch.cuda.stream(producer):
-        plan = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128)
+        plan = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128, route="smallsplit")
     assert plan.mode == "smallsplit"
     q, k, v = _inputs(h, mb, nb)
     expected = plan.run(q, k, v).clone()
@@ -502,7 +657,10 @@ def test_split_plan_stream_and_graph_lifetime():
     q.normal_()
     graph.replay()
     torch.testing.assert_close(
-        out.view_as(q), _reference(q, k, v, mask, 128**-0.5), atol=0.01, rtol=0.01
+        out.view_as(q).float(),
+        _reference(q, k, v, mask, 128**-0.5),
+        atol=0.01,
+        rtol=0.01,
     )
 
 
@@ -562,7 +720,7 @@ def test_held_out_shapes_against_fp32_reference(h, mb, nb, capacity, ragged, sca
     actual = wrapper.run(q, k, v)
     expected = _reference(q, k, v, mask, 128**-0.5 if scale is None else scale)
     assert bool(torch.isfinite(actual).all())
-    torch.testing.assert_close(actual, expected, atol=0.01, rtol=0.01)
+    torch.testing.assert_close(actual.float(), expected, atol=0.01, rtol=0.01)
     assert float((actual.float() - expected.float()).abs().max()) <= 0.03
 
 
@@ -607,7 +765,7 @@ def test_signed_and_tiny_scales_against_math(scale):
     actual = _wrapper(mask, scale=scale).run(q, k, v)
     expected = _reference(q, k, v, mask, scale)
     assert bool(torch.isfinite(actual).all())
-    torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+    torch.testing.assert_close(actual.float(), expected, atol=0.02, rtol=0.02)
 
 
 @requires_hopper
@@ -716,7 +874,10 @@ def test_plan_stream_and_graph_lifetime():
     q.normal_()
     graph.replay()
     torch.testing.assert_close(
-        out.view_as(q), _reference(q, k, v, mask, 128**-0.5), atol=0.01, rtol=0.01
+        out.view_as(q).float(),
+        _reference(q, k, v, mask, 128**-0.5),
+        atol=0.01,
+        rtol=0.01,
     )
     with warnings.catch_warnings():
         # The capture is abandoned before any launch; torch warns about the empty graph.

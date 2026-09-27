@@ -33,14 +33,20 @@ kernel's *split-KV* variant: a query block's selection is sliced across
 ``ceil(count / KMAX)`` CTAs (``meta = count | split << 4 | nsplit << 10``);
 each slice publishes its FP32 accumulator and row statistics to a plan-owned
 workspace and the last-arriving CTA merges them in slice order and resets the
-arrival counter (:func:`split_kmax` picks the variant).  Everything else runs
+arrival counter (:func:`split_kmax` picks the variant).  Uniform sliced
+selections take the kernel's *cluster* variant instead when its modelled cost
+is lower (:func:`cluster_variant_for`): the ``csize`` slices of a query block
+form one thread-block cluster, every CTA publishes its FP32 partial and row
+statistics into its own shared memory and, after one cluster barrier, each
+rank merges one 32-column set through distributed shared memory (no
+workspace, no atomics; padded slices carry ``count = 0``).  Everything else runs
 the persistent kernel: the plan (:func:`plan_vsa_sm90`) is uploaded once as a
 per-CTA list of *tiles* (``grid = min(tiles, SMs)``).  A tile is either one
 64-row query block whose KV list alternates between the two consumer
 warpgroups (``split``) or two query blocks of one head that share the KV ring
 (``pair``); the mode with the smaller modelled makespan wins.  The plan layouts
-mirror the Cake kernels (``loom/examples/weave/vsa_sm90_bf16.py`` and
-``vsa_sm90_small.py``) and are validated by the kernels' own tests; both
+mirror the Cake kernel modules (``vsa_sm90_bf16`` and
+``vsa_sm90_small``) and are validated by the kernels' own tests; both
 planners are dependency-free ports of the Cake planners and must stay
 byte-identical to them.
 """
@@ -81,7 +87,7 @@ OWN_WORDS = MAX_OWN // 2
 META_OWN_OFF = META_SEQ_OFF + META_SEQ_WORDS
 META_WORDS = META_OWN_OFF + NUM_CONSUMER_WGS * OWN_WORDS  # 144
 
-# Small-selection route (port of loom/examples/weave/vsa_sm90_small.py).
+# Small-selection route (port of the Cake kernel module ``vsa_sm90_small``).
 SMALL_KMAX_VARIANTS = (1, 3, 4, 6)
 SMALL_OCCUPANCY = {
     1: 4,
@@ -93,13 +99,27 @@ PLAN_HALFWORDS = 1750  # int16 elements of the by-value plan parameter (3500 B)
 PLAN_META_UNSPLIT = 1  # unsplit rows: [count, blk...] per query block
 PLAN_META_SPLIT = 2  # split rows: [meta, qtile, blk...] per item
 MAX_NSPLIT = 31  # nsplit field of ``meta`` (bits 10..14 keep the int16 sign clear)
-SMALL_ITEM_ELEMS = BLOCK * HEAD_DIM  # BF16 partial accumulator per split item
+SMALL_ITEM_ELEMS = BLOCK * HEAD_DIM  # FP32 partial accumulator per split item
 SMALL_STATS_FLOATS = 2 * BLOCK  # (max, sum) per row per split item
 # Split-KV cost model (relative units): one KV block through the single
 # warpgroup chain vs. one extra slice merged by the last CTA (fitted on H100,
 # CAKE-671).  Same constants as the Cake planner (``vsa_sm90_small``).
 SPLIT_BLOCK_COST = 1.0
 SPLIT_MERGE_COST = 0.8
+# Cluster / DSM-merge route (port of the Cake cluster variants, CAKE-682):
+# (kmax, cluster size) variants, SMs per GPC assumed for one-wave placement,
+# and the cost model (merged rank, padded slot) in the same block units.
+CLUSTER_VARIANTS = (
+    (2, 4),
+    (3, 3),
+    (3, 6),
+    (4, 2),
+    (4, 4),
+    (6, 2),
+)  # (6, 3): receive buffers exceed the 227 KB SMEM
+CLUSTER_GPC_SMS = 16
+CLUSTER_MERGE_COST = 0.3
+CLUSTER_PAD_COST = 0.15
 
 
 def plan_meta(split: bool) -> int:
@@ -144,16 +164,68 @@ def split_kmax(counts: list[int], *, sms: Optional[int] = None) -> int:
     return best[1]
 
 
-def small_route(block_mask: torch.Tensor, *, sms: int) -> Optional[tuple[int, bool]]:
-    """``(kmax, split)`` when the problem should take a small-kernel route, else ``None``.
+def split_cost(counts: list[int], kmax: int) -> float:
+    """Modelled cost of the split-KV variant ``kmax`` (chain + merged slices of the fullest query block)."""
+    return (
+        kmax * SPLIT_BLOCK_COST
+        + (max(-(-c // kmax) for c in counts) - 1) * SPLIT_MERGE_COST
+    )
+
+
+def cluster_cost(counts: list[int], kmax: int, csize: int) -> float:
+    """Modelled cost of cluster variant ``(kmax, csize)``: chain, DSM-merged ranks and mean padded slots."""
+    pad = kmax * csize - sum(counts) / len(counts)
+    return (
+        kmax * SPLIT_BLOCK_COST
+        + (csize - 1) * CLUSTER_MERGE_COST
+        + pad * CLUSTER_PAD_COST
+    )
+
+
+def cluster_variant_for(
+    counts: list[int], *, sms: Optional[int] = None
+) -> Optional[tuple[int, int]]:
+    """``(kmax, csize)`` of the cheapest cluster variant for ``counts``, or ``None``.
+
+    Candidates hold the largest selection (``kmax * csize >= capacity``), fit
+    the plan parameter and, when ``sms`` is given, run as one wave of clusters
+    at one CTA per SM (``sms // CLUSTER_GPC_SMS`` GPCs each place
+    ``CLUSTER_GPC_SMS // csize`` clusters).  Ranked by :func:`cluster_cost`.
+    Mirrors ``vsa_sm90_small.cluster_variant_for``.
+    """
+    capacity = max(counts)
+    tiles = len(counts)
+    best = None
+    for kmax, csize in CLUSTER_VARIANTS:
+        if (
+            kmax * csize < capacity
+            or tiles * csize * (kmax + PLAN_META_SPLIT) > PLAN_HALFWORDS
+        ):
+            continue
+        if sms is not None and tiles > (sms // CLUSTER_GPC_SMS) * (
+            CLUSTER_GPC_SMS // csize
+        ):
+            continue
+        cost = cluster_cost(counts, kmax, csize)
+        if best is None or cost < best[0]:
+            best = (cost, kmax, csize)
+    return None if best is None else (best[1], best[2])
+
+
+def small_route(
+    block_mask: torch.Tensor, *, sms: int
+) -> Optional[tuple[int, bool, int]]:
+    """``(kmax, split, cluster)`` when the problem should take a small-kernel route, else ``None``.
 
     Unsplit rule: every query block selects at most ``SMALL_KMAX_VARIANTS[-1]``
     KV blocks, the whole grid fits one wave of the chosen variant (``tiles <=
-    occupancy * SMs``) and the plan fits the by-value parameter.  Split rule
+    occupancy * SMs``) and the plan fits the by-value parameter.  Sliced rules
     (tried when the unsplit rule fails): the grid is too small for the
-    persistent kernel's two consumer warpgroups per CTA (``2 * tiles <= SMs``)
-    and :func:`split_kmax` finds a one-wave variant.  Everything larger goes to
-    the persistent pair/split kernel.  Mirrors ``vsa_sm90_small.small_route``.
+    persistent kernel's two consumer warpgroups per CTA (``2 * tiles <= SMs``);
+    the split-KV variant of :func:`split_kmax` and the cluster variant of
+    :func:`cluster_variant_for` are compared by their modelled costs and the
+    cheaper one wins.  Everything larger goes to the persistent pair/split
+    kernel.  Mirrors ``vsa_sm90_small.small_route``.
     """
     mask = block_mask.to("cpu", torch.bool)
     h, mb, _nb = mask.shape
@@ -166,12 +238,19 @@ def small_route(block_mask: torch.Tensor, *, sms: int) -> Optional[tuple[int, bo
             tiles <= SMALL_OCCUPANCY[kmax] * sms
             and tiles * (kmax + PLAN_META_UNSPLIT) <= PLAN_HALFWORDS
         ):
-            return kmax, False
+            return kmax, False, 0
     if 2 * tiles <= sms:
         try:
-            return split_kmax(counts, sms=sms), True
+            split: Optional[int] = split_kmax(counts, sms=sms)
         except ValueError:
-            return None
+            split = None
+        cluster = cluster_variant_for(counts, sms=sms)
+        if cluster is not None and (
+            split is None or cluster_cost(counts, *cluster) < split_cost(counts, split)
+        ):
+            return cluster[0], False, cluster[1]
+        if split is not None:
+            return split, True, 0
     return None
 
 
@@ -188,14 +267,21 @@ def _balanced_chunks(ids: list[int], nsplit: int) -> list[list[int]]:
 
 
 def plan_small(
-    block_mask: torch.Tensor, *, kmax: Optional[int] = None, split: bool = False
+    block_mask: torch.Tensor,
+    *,
+    kmax: Optional[int] = None,
+    split: bool = False,
+    cluster: int = 0,
 ) -> dict:
-    """Plan rows as int16 halfwords: ``[count, blk...]`` per tile (unsplit) or ``[meta, qtile, blk...]`` per item (split).
+    """Plan rows as int16 halfwords: ``[count, blk...]`` per tile (unsplit) or ``[meta, qtile, blk...]`` per item (split / cluster).
 
     Without ``split`` every query block is one item (``nsplit = 1``) and
     ``kmax`` must hold the largest selection.  With ``split`` a query block
     whose selection exceeds ``kmax`` becomes ``ceil(count / kmax)`` items of
-    nearly equal size, merged on the device by the last-arriving CTA.
+    nearly equal size, merged on the device by the last-arriving CTA.  With
+    ``cluster = csize`` every query block is exactly ``csize`` consecutive
+    items (empty slices padded with ``count = 0``) forming one thread-block
+    cluster that merges through distributed shared memory.
     Returns the CPU int16 ``plan`` of exactly ``PLAN_HALFWORDS`` elements (the
     by-value kernel parameter, ``-1`` padded), or raises when the problem does
     not fit.  Byte-identical to the Cake planner (``vsa_sm90_small.plan_small``).
@@ -211,21 +297,47 @@ def plan_small(
         raise ValueError("every query block must select at least one KV block")
     capacity = int(counts.max())
     flat_counts = counts.reshape(-1).tolist()
-    if kmax is None:
+    cluster = int(cluster or 0)
+    if cluster and split:
+        raise ValueError("cluster and split are exclusive routes")
+    if cluster:
+        if kmax is None:
+            kmax = min(
+                (k for k, c in CLUSTER_VARIANTS if c == cluster and k * c >= capacity),
+                default=None,
+            )
+            if kmax is None:
+                raise ValueError(
+                    f"no cluster-{cluster} variant holds {capacity} blocks per query block"
+                )
+        if (int(kmax), cluster) not in CLUSTER_VARIANTS:
+            raise ValueError(
+                f"(kmax, cluster)=({kmax}, {cluster}) is not a compiled cluster variant {CLUSTER_VARIANTS}"
+            )
+        if int(kmax) * cluster < capacity:
+            raise ValueError(
+                f"kmax={kmax} x {cluster} slices cannot hold {capacity} blocks per query block"
+            )
+    elif kmax is None:
         kmax = small_kmax_for(capacity) if not split else split_kmax(flat_counts)
     kmax = int(kmax)
-    if kmax not in SMALL_KMAX_VARIANTS:
+    if kmax not in SMALL_KMAX_VARIANTS and not cluster:
         raise ValueError(
             f"kmax={kmax} is not a compiled small-kernel variant {SMALL_KMAX_VARIANTS}"
         )
-    if not split and kmax < capacity:
+    if not split and not cluster and kmax < capacity:
         raise ValueError(f"kmax={kmax} cannot hold {capacity} blocks per tile")
     tiles = h * mb
     if tiles > 32767:
         raise ValueError("query-block ids must fit int16")
-    meta_halfwords = plan_meta(split)
+    rowfmt = split or cluster > 0
+    meta_halfwords = plan_meta(rowfmt)
     stride = kmax + meta_halfwords
-    nsplits = [max(1, -(-c // kmax)) for c in flat_counts]
+    nsplits = (
+        [cluster] * len(flat_counts)
+        if cluster
+        else [max(1, -(-c // kmax)) for c in flat_counts]
+    )
     if max(nsplits) > MAX_NSPLIT:
         raise ValueError(
             f"a query block needs {max(nsplits)} slices; the plan encodes at most {MAX_NSPLIT}"
@@ -241,7 +353,7 @@ def plan_small(
     for tile in range(tiles):
         ids = order[tile, : flat_counts[tile]].tolist()
         for j, chunk in enumerate(_balanced_chunks(ids, nsplits[tile])):
-            if split:
+            if rowfmt:
                 rows[item, 0] = len(chunk) | (j << 4) | (nsplits[tile] << 10)
                 rows[item, 1] = tile
             else:
@@ -262,7 +374,8 @@ def plan_small(
         "num_tiles": tiles,
         "num_items": num_items,
         "max_nsplit": max(nsplits),
-        "split": max(nsplits) > 1,
+        "split": bool(split) and max(nsplits) > 1,
+        "cluster": cluster,
         "stride": stride,
         "meta_halfwords": meta_halfwords,
     }
@@ -680,7 +793,7 @@ class CakeVsaSm90Plan:
         non_blocking: bool = True,
         route: Optional[str] = None,
     ):
-        """``route`` ``None`` applies :func:`small_route`; ``"small"`` / ``"smallsplit"`` / ``"persistent"`` force one kernel."""
+        """``route`` ``None`` applies :func:`small_route`; ``"small"`` / ``"smallsplit"`` / ``"smallcluster"`` / ``"persistent"`` force one kernel."""
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("cake (SM90) requires a CUDA device")
@@ -715,28 +828,43 @@ class CakeVsaSm90Plan:
         self.scale_log2 = scale * LOG2E
         props = torch.cuda.get_device_properties(self.device)
         sms = int(props.multi_processor_count)
-        if route not in (None, "small", "smallsplit", "persistent"):
+        if route not in (None, "small", "smallsplit", "smallcluster", "persistent"):
             raise ValueError(
-                f"unknown route {route!r}; expected None, 'small', 'smallsplit' or 'persistent'"
+                f"unknown route {route!r}; expected None, 'small', 'smallsplit', 'smallcluster' or 'persistent'"
             )
-        small: Optional[tuple[int, bool]] = None
+        small: Optional[tuple[int, bool, int]] = None
         if route is None:
             small = small_route(block_mask_map, sms=sms)
         elif route == "small":
             small = (
                 small_kmax_for(int(block_mask_map.to("cpu").sum(dim=-1).max())),
                 False,
+                0,
             )
         elif route == "smallsplit":
             counts = block_mask_map.to("cpu").sum(dim=-1).reshape(-1).tolist()
-            small = (split_kmax(counts), True)
+            small = (split_kmax(counts), True, 0)
+        elif route == "smallcluster":
+            counts = block_mask_map.to("cpu").sum(dim=-1).reshape(-1).tolist()
+            variant = cluster_variant_for(counts)
+            if variant is None:
+                raise ValueError("no cluster variant holds this selection")
+            small = (variant[0], False, variant[1])
         self.captured = False
         self.small_kmax: Optional[int] = None if small is None else small[0]
         self.small_split = False
+        self.small_cluster = 0
         if small is not None:
-            plan = plan_small(block_mask_map, kmax=small[0], split=small[1])
+            plan = plan_small(
+                block_mask_map, kmax=small[0], split=small[1], cluster=small[2]
+            )
             self.small_split = bool(plan["split"])
-            self.mode = "smallsplit" if self.small_split else "small"
+            self.small_cluster = int(plan["cluster"])
+            self.mode = (
+                "smallcluster"
+                if self.small_cluster
+                else ("smallsplit" if self.small_split else "small")
+            )
             self.num_tiles = plan["num_tiles"]
             self.num_items = plan["num_items"]
             self.num_ctas = plan["num_items"]
@@ -745,17 +873,17 @@ class CakeVsaSm90Plan:
             self.qo_len = plan["MB"] * BLOCK
             self.kv_len = plan["NB"] * BLOCK
             # The plan is a launch parameter (CPU int16): nothing is uploaded,
-            # so an unsplit plan has no stream dependency and a captured graph
-            # replays it.  A split plan owns device workspace whose arrival
-            # counters must be zero before the first run (``ready``); the
-            # kernel leaves them zero, so replays need no host reset.  One run
-            # per plan may be in flight at a time.
+            # so an unsplit or cluster plan has no stream dependency and a
+            # captured graph replays it.  A split plan owns device workspace
+            # whose arrival counters must be zero before the first run
+            # (``ready``); the kernel leaves them zero, so replays need no host
+            # reset.  One run per split plan may be in flight at a time.
             self.plan_param = plan["plan"].contiguous()
             if self.small_split:
                 with torch.cuda.device(self.device):
                     self.partial_o = torch.empty(
                         (self.num_items * SMALL_ITEM_ELEMS,),
-                        dtype=torch.bfloat16,
+                        dtype=torch.float32,
                         device=self.device,
                     )
                     self.partial_stats = torch.empty(
@@ -865,6 +993,8 @@ class CakeVsaSm90Plan:
 
         if self.small_kmax is None:
             stage = "attention"
+        elif self.small_cluster:
+            stage = f"small_k{self.small_kmax}c{self.small_cluster}"
         else:
             stage = f"small_k{self.small_kmax}{'s' if self.small_split else ''}"
         module, _record = load_cake_vsa_sm90_module(stage)
@@ -948,6 +1078,7 @@ def create_plan(device, *args, **kwargs) -> CakeVsaSm90Plan:
 
 __all__ = [
     "CakeVsaSm90Plan",
+    "cluster_variant_for",
     "create_plan",
     "plan_small",
     "plan_vsa_sm90",
