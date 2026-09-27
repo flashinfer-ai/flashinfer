@@ -26,7 +26,12 @@ FP8 E4M3).  Both routes reproduce the chain's rounding points exactly:
   SMs the 128-CTA pair grid leaves free also takes the GEMM + act route: an
   odd tail runs as a single-CTA tile that ingests a whole B slab and costs
   ~1.5x a pair tile, so beyond the free SMs the CuTe GEMM (insensitive to odd
-  tails) + act is faster.  Without the routing the plan is shape-only.
+  tails) + act is faster.  Without the routing the plan is shape-only.  A
+  diverted problem with at least ``ACT_WIDE_MIN_ITEMS`` (row, 128-column group)
+  items runs the wide act kernel (eight lanes per group, four groups per warp,
+  64 B per lane in flight: 1.09-1.43x the one-warp-per-group kernel from
+  M = 2048, H = 1024 on, bitwise-identical outputs); smaller problems keep the
+  one-warp-per-group kernel, which is faster on latency-bound problems.
 
 Routing contract (the same as the CuTe-DSL contiguous grouped GEMM): rows are
 sorted by expert through ``m_indices``; every *internal* expert boundary is a
@@ -79,11 +84,17 @@ FP8_E4M3_MAX = 448.0
 # Route names double as the generated-program template names of their first kernel.
 FUSED_ROUTE = "fused_cg2_ab7_pairsched_solotail_kg4"
 ACT_ROUTE = "gemm_then_silu_mul_group_quant_fp8"
+ACT_WIDE_ROUTE = "gemm_then_silu_mul_group_quant_fp8_wide"
+ACT_ROUTES = frozenset({ACT_ROUTE, ACT_WIDE_ROUTE})
 # Generated kernel stages per route in launch order; the fused route's tail kernel has its own template geometry.
 FUSED_PAIR_STAGE = "pair"
 FUSED_TAIL_STAGE = "tail"
 ACT_STAGE = "main"
-ROUTE_STAGES = {FUSED_ROUTE: (FUSED_PAIR_STAGE, FUSED_TAIL_STAGE), ACT_ROUTE: (ACT_STAGE,)}
+ROUTE_STAGES = {
+    FUSED_ROUTE: (FUSED_PAIR_STAGE, FUSED_TAIL_STAGE),
+    ACT_ROUTE: (ACT_STAGE,),
+    ACT_WIDE_ROUTE: (ACT_STAGE,),
+}
 TAIL_GEOMETRY_KEY = f"{FUSED_ROUTE}_{FUSED_TAIL_STAGE}"
 # Rows below this take ACT_ROUTE (measured B200 crossover of the fused kernel against grouped GEMM + the fused
 # activation kernel; every problem with at most 9 row blocks lost to the chain in the fused kernel).
@@ -92,6 +103,13 @@ SMALL_M_MAX = 2048
 # CTAs per SM (32 registers x 128 threads, full occupancy); grid-stride beyond that.
 ACT_WARPS_PER_CTA = 4
 ACT_CTAS_PER_SM = 16
+# Wide act kernel launch: four (row, 128-column group) items per warp (eight lanes each), four warps per CTA, at
+# most ten resident CTAs per SM (48 registers x 128 threads); grid-stride beyond that.
+ACT_WIDE_GROUPS_PER_WARP = 4
+ACT_WIDE_CTAS_PER_SM = 10
+# A diverted large problem takes the wide act kernel from this many items on (measured B200 crossover envelope:
+# 1.085x at 16384 items = M 2048 x H 1024, 1.32-1.43x from 32768; 0.92-0.97x below ~2400 items).
+ACT_WIDE_MIN_ITEMS = 16384
 # GEMM kernels of the small-M route.
 GEMM_BACKEND_CUTE = "cute_dsl"  # group_gemm_fp8_nt_groupwise_contiguous (CuTe-DSL)
 GEMM_BACKEND_CAKE = (
@@ -167,13 +185,23 @@ def fused_tile_counts(n2: int, group_blocks: Sequence[int]) -> tuple[int, int]:
 ROUTING_AWARE_RULE = True
 
 
+def act_items(m: int, n2: int) -> int:
+    """(row, 128-column group) items of the act kernels for ``[M, 2H]``."""
+    return m * (n2 // 2 // GROUP_SIZE)
+
+
+def _diverted_act_route(m: int, n2: int) -> str:
+    return ACT_WIDE_ROUTE if act_items(m, n2) >= ACT_WIDE_MIN_ITEMS else ACT_ROUTE
+
+
 def select_route(
     m: int, n2: int, *, sm_count: int, group_blocks: Optional[Sequence[int]] = None
 ) -> str:
     """Route of a problem: ``M < SMALL_M_MAX`` takes the GEMM + act route; larger
     problems take the fused route unless the routing is known (``group_blocks``,
     128-row blocks per expert) and its odd-tail units outnumber the SMs the pair
-    grid leaves free.
+    grid leaves free, in which case they take the GEMM + wide act route (the
+    small-M act route below ``ACT_WIDE_MIN_ITEMS`` items).
     """
     if sm_count <= 0:
         raise ValueError("sm_count must be positive")
@@ -190,7 +218,11 @@ def select_route(
     _, _, cluster_ctas = route_geometry(FUSED_ROUTE)
     pair_ctas = (min(sm_count, CTA_CAP) // cluster_ctas) * cluster_ctas
     _, odd_units = fused_tile_counts(n2, group_blocks)
-    return FUSED_ROUTE if odd_units <= sm_count - pair_ctas else ACT_ROUTE
+    return (
+        FUSED_ROUTE
+        if odd_units <= sm_count - pair_ctas
+        else _diverted_act_route(m, n2)
+    )
 
 
 def launch_plan(
@@ -202,16 +234,24 @@ def launch_plan(
     per expert enables the routing-aware rule; ``prepare_...`` derives them
     when ``validate_indices=True``).  The GEMM + act route launches one warp
     per (row, 128-column group) item, ``ACT_WARPS_PER_CTA`` warps per CTA, at
-    most ``ACT_CTAS_PER_SM`` CTAs per SM.  The fused route launches complete
+    most ``ACT_CTAS_PER_SM`` CTAs per SM; the wide act route one warp per
+    ``ACT_WIDE_GROUPS_PER_WARP`` items, at most ``ACT_WIDE_CTAS_PER_SM`` CTAs
+    per SM.  The fused route launches complete
     CTA pairs; its tile upper bound counts every 128-row block as a lone block,
     and the 128-CTA cap is the measured B200 policy of the parent gate_up route
     (148 CTAs measured slower on every routing).
     """
     route = select_route(m, n2, sm_count=sm_count, group_blocks=group_blocks)
-    if route == ACT_ROUTE:
+    if route in ACT_ROUTES:
         route_geometry(route)  # the registry must carry the route
-        items = m * (n2 // 2 // GROUP_SIZE)
-        ctas = max(1, min(-(-items // ACT_WARPS_PER_CTA), ACT_CTAS_PER_SM * sm_count))
+        items = act_items(m, n2)
+        if route == ACT_WIDE_ROUTE:
+            warps = -(-items // ACT_WIDE_GROUPS_PER_WARP)
+            ctas_cap = ACT_WIDE_CTAS_PER_SM * sm_count
+        else:
+            warps = items
+            ctas_cap = ACT_CTAS_PER_SM * sm_count
+        ctas = max(1, min(-(-warps // ACT_WARPS_PER_CTA), ctas_cap))
         return route, (ctas, 1, 1)
     _, tile_n, cluster_ctas = route_geometry(route)
     max_tiles = math.ceil(m / ROW_BLOCK) * (n2 // tile_n)
@@ -298,8 +338,8 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
     *contents* may change between launches.  ``launch()`` submits exactly
     ``num_kernels`` kernels (two for the fused route: the pair kernel, then
     the tail kernel with the programmatic-dependent-launch attribute; two for
-    the small-M route: the grouped GEMM into the private BF16 workspace, then
-    the generated activation kernel) on PyTorch's current stream for the bound
+    the GEMM + act routes: the grouped GEMM into the private BF16 workspace,
+    then the generated activation kernel) on PyTorch's current stream for the bound
     device and returns ``(out_q, out_s)``.  The first launch initializes
     private TMA descriptor storage and must run outside CUDA Graph capture.
     ``grid`` is the grid of the route's first generated kernel;
@@ -337,7 +377,7 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
 
     @property
     def tail_grid(self) -> Optional[tuple[int, int, int]]:
-        """Grid of the fused route's tail kernel (``None`` on the small-M route)."""
+        """Grid of the fused route's tail kernel (``None`` on the GEMM + act routes)."""
         return self.stage_grids.get(FUSED_TAIL_STAGE)
 
     @property
@@ -568,6 +608,10 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
 
 __all__ = [
     "ACT_ROUTE",
+    "ACT_ROUTES",
+    "ACT_WIDE_MIN_ITEMS",
+    "ACT_WIDE_ROUTE",
+    "act_items",
     "FUSED_ROUTE",
     "GEMM_BACKEND_CAKE",
     "GEMM_BACKEND_CUTE",

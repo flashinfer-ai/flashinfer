@@ -12,10 +12,14 @@ from flashinfer.gemm import (
 )
 from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     ACT_ROUTE,
+    ACT_ROUTES,
+    ACT_WIDE_MIN_ITEMS,
+    ACT_WIDE_ROUTE,
     FUSED_ROUTE,
     GEMM_BACKEND_CAKE,
     GEMM_BACKEND_CUTE,
     SMALL_M_MAX,
+    act_items,
     fused_tile_counts,
     is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available,
     launch_plan,
@@ -374,9 +378,15 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
         assert set(prepared.stage_grids) == {"pair", "tail"}
     else:
         assert prepared.tail_grid is None
-        items = m * (n2 // 2 // GROUP_SIZE)
-        assert 1 <= grid[0] <= max(1, -(-items // 4))
-        assert grid[0] <= 16 * sm_count
+        assert route in ACT_ROUTES
+        items = act_items(m, n2)
+        if route == ACT_WIDE_ROUTE:
+            assert m >= SMALL_M_MAX and items >= ACT_WIDE_MIN_ITEMS
+            assert 1 <= grid[0] <= max(1, -(-items // 16))
+            assert grid[0] <= 10 * sm_count
+        else:
+            assert 1 <= grid[0] <= max(1, -(-items // 4))
+            assert grid[0] <= 16 * sm_count
 
 
 def test_routing_blocks_and_fused_tile_counts():
@@ -400,9 +410,18 @@ def test_routing_blocks_and_fused_tile_counts():
     assert select_route(4096, 2048, group_blocks=routing_blocks([256] * 16), **wide) == FUSED_ROUTE
     two_odd = routing_blocks([128, 384] + [256] * 14)  # 16 odd-tail units <= 20 free SMs
     assert select_route(4096, 2048, group_blocks=two_odd, **wide) == FUSED_ROUTE
-    assert select_route(4096, 2048, group_blocks=routing_blocks([384] * 8 + [128] * 8), **wide) == ACT_ROUTE
-    assert select_route(4096, 2048, group_blocks=blocks, **wide) == ACT_ROUTE  # random_aligned: 64 units
-    assert select_route(2048, 2048, group_blocks=routing_blocks([128] * 16), **wide) == ACT_ROUTE
+    # diverted wide rows take the wide act kernel (>= ACT_WIDE_MIN_ITEMS items)
+    assert select_route(4096, 2048, group_blocks=routing_blocks([384] * 8 + [128] * 8), **wide) == ACT_WIDE_ROUTE
+    assert select_route(4096, 2048, group_blocks=blocks, **wide) == ACT_WIDE_ROUTE  # random_aligned: 64 units
+    assert select_route(2048, 2048, group_blocks=routing_blocks([128] * 16), **wide) == ACT_WIDE_ROUTE
+    assert act_items(2048, 2048) == ACT_WIDE_MIN_ITEMS
+    # a diverted problem below the item threshold keeps the one-warp-per-group act kernel
+    assert select_route(2048, 256, group_blocks=routing_blocks([128] * 16), **wide) == ACT_ROUTE
+    # grids of the two act routes on the wide random_aligned row
+    _, wide_grid = launch_plan(4096, 2048, group_blocks=blocks, **wide)
+    assert wide_grid == (1480, 1, 1)  # ceil(32768 / 16) = 2048 warps-of-four capped at 10 CTAs x 148 SMs
+    _, small_grid = launch_plan(1024, 2048, group_blocks=routing_blocks([128] * 8), **wide)
+    assert small_grid == (2048, 1, 1)  # 8192 items, one warp each, four per CTA
 
 
 @pytest.mark.parametrize(
