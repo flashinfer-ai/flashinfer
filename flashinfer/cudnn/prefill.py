@@ -25,6 +25,18 @@ except Exception:
     CUDNN_AVAILABLE = False
 
 
+# Older FROST bindings specialize HN head stride on the declared token count.
+# Keep their established NH staging path: native HN must also preserve graph
+# reuse when serving changes packed token totals inside an override bucket.
+_CUDNN_NATIVE_HN_SUPPORTED = bool(
+    getattr(
+        getattr(getattr(cudnn, "_pybind_module", None), "_SdpaThdBinder", None),
+        "supports_stats_stride_override",
+        False,
+    )
+)
+
+
 @functools.cache
 def _cudnn_supports_direct_seqlens(dtype: torch.dtype, *, mixed: bool = False) -> bool:
     """True if cuDNN can consume token-unit indptr buffers directly for `dtype`.
@@ -308,10 +320,15 @@ def _prefill_override_descriptor_key(key, override_cache):
     )
 
 
-def _sdpa_prefill_key_fn(q, k_cache, v_cache, scale, *, o_data_type=None, **metadata):
+def _sdpa_prefill_key_fn(
+    q, k_cache, v_cache, scale, *, o_data_type=None, stats_head_stride=0, **metadata
+):
     return (
         _prefill_runtime_key(q, k_cache, v_cache, scale, o_data_type),
         _prefill_descriptor_key(**metadata),
+        bool(stats_head_stride)
+        if metadata.get("override_cache") is not None and _CUDNN_NATIVE_HN_SUPPORTED
+        else stats_head_stride,
     )
 
 
@@ -343,6 +360,7 @@ if CUDNN_AVAILABLE:
         lse: Optional[torch.Tensor] = None,
         o_data_type: Optional[torch.dtype] = None,
         override_cache: Optional[tuple[int, int, int]] = None,
+        stats_head_stride: int = 0,
     ):
         global _prefill_graph_builds
         _prefill_graph_builds += 1
@@ -742,7 +760,7 @@ if CUDNN_AVAILABLE:
                 ragged_stats.set_uid(UIDs.RAGGED_STATS_UID.value)
                 Stats.set_ragged_offset(ragged_stats)
                 if use_cu_seq_lens:
-                    Stats.set_ragged_offset_multiplier(h_qo)
+                    Stats.set_ragged_offset_multiplier(1 if stats_head_stride else h_qo)
 
             O.set_uid(UIDs.O_UID.value).set_output(True).set_dim(
                 [graph_b, h_qo, graph_s_qo, d_vo]
@@ -755,7 +773,11 @@ if CUDNN_AVAILABLE:
                     return_lse
                 ).set_data_type(cudnn.data_type.FLOAT).set_dim(
                     [graph_b, h_qo, graph_s_qo, 1]
-                ).set_stride([graph_s_qo * h_qo, 1, h_qo, 1])
+                ).set_stride(
+                    [h_qo * stats_head_stride, stats_head_stride, 1, 1]
+                    if stats_head_stride
+                    else [graph_s_qo * h_qo, 1, h_qo, 1]
+                )
 
             tensors_to_return = [cudnn_q, cudnn_k_cache, cudnn_v_cache, O]
             if return_lse:
@@ -788,6 +810,7 @@ def _override_execute_kwargs(
     s_qo: int,
     s_kv: int,
     with_stats: bool,
+    stats_head_stride: int = 0,
 ) -> dict:
     """Real shapes for an override-graph execute: the dims/strides
     _build_prefill_graph would have declared for this call, in the same form."""
@@ -824,7 +847,12 @@ def _override_execute_kwargs(
     if with_stats:
         uids += [UIDs.STATS_UID.value, UIDs.RAGGED_STATS_UID.value]
         shapes += [[batch_size, h_qo, s_qo, 1], rows]
-        strides += [[s_qo * h_qo, 1, h_qo, 1], unit]
+        strides += [
+            [h_qo * stats_head_stride, stats_head_stride, 1, 1]
+            if stats_head_stride
+            else [s_qo * h_qo, 1, h_qo, 1],
+            unit,
+        ]
     return dict(override_uids=uids, override_shapes=shapes, override_strides=strides)
 
 
@@ -1165,11 +1193,13 @@ class _CudnnPrefillPlan:
         )
         self.execution_shape = exact[0][0]
         self.bound_graph = None
+        self.bound_stats_head_stride = 0
         self.execute_kwargs = {}
         # Real shape overrides depend on bounds and on the prepared graph's
         # runtime tensor layout, not on the new indptr pointers or values.
         if previous is not None and previous.execution_shape == self.execution_shape:
             self.bound_graph = previous.bound_graph
+            self.bound_stats_head_stride = previous.bound_stats_head_stride
             self.execute_kwargs = previous.execute_kwargs
 
     def build_metadata(self, return_lse):
@@ -1205,16 +1235,36 @@ class CudnnPrefillGraph:
         "override_cache",
         "return_lse",
         "ordered_execution",
+        "stats_head_stride",
+        "requested_stats_head_stride",
     )
 
-    def __init__(self, key, graph, *, override_cache, return_lse: bool):
+    def __init__(
+        self,
+        key,
+        graph,
+        *,
+        override_cache,
+        return_lse: bool,
+        stats_head_stride=0,
+        requested_stats_head_stride=0,
+    ):
         self.key = key
         self.graph = graph
         self.override_cache = override_cache
         self.return_lse = return_lse
         self.ordered_execution = supports_ordered_cudnn_execution(type(graph))
+        self.stats_head_stride = stats_head_stride
+        self.requested_stats_head_stride = requested_stats_head_stride
 
-    def matches_plan(self, q, k_cache, v_cache, scale, plan, return_lse):
+    def matches_plan(
+        self, q, k_cache, v_cache, scale, plan, return_lse, stats_head_stride=0
+    ):
+        if self.override_cache is not None and _CUDNN_NATIVE_HN_SUPPORTED:
+            if bool(stats_head_stride) != bool(self.requested_stats_head_stride):
+                return False
+        elif stats_head_stride != self.requested_stats_head_stride:
+            return False
         metadata = plan.metadata
         if self.override_cache is not None:
             if plan.override != self.override_cache:
@@ -1240,7 +1290,11 @@ class CudnnPrefillGraph:
             raise ValueError(
                 "all cuDNN prefill buffers must be on the same device as q"
             )
-        if plan.bound_graph is not self:
+        stats_head_stride = q.size(0) if self.stats_head_stride else 0
+        if (
+            plan.bound_graph is not self
+            or plan.bound_stats_head_stride != stats_head_stride
+        ):
             metadata = plan.metadata
             plan.execute_kwargs = (
                 _override_execute_kwargs(
@@ -1251,11 +1305,13 @@ class CudnnPrefillGraph:
                     s_qo=metadata.max_token_per_sequence,
                     s_kv=metadata.max_sequence_kv,
                     with_stats=self.return_lse,
+                    stats_head_stride=stats_head_stride,
                 )
                 if self.override_cache is not None
                 else {}
             )
             plan.bound_graph = self
+            plan.bound_stats_head_stride = stats_head_stride
         if self.ordered_execution:
             uids, template = plan.ordered_bindings[self.return_lse]
             buffers = list(template)
@@ -1339,6 +1395,7 @@ class CudnnPrefillGraph:
                 s_qo=metadata.max_token_per_sequence,
                 s_kv=metadata.max_sequence_kv,
                 with_stats=self.return_lse,
+                stats_head_stride=q.size(0) if self.stats_head_stride else 0,
             )
 
         return self._execute(
@@ -1393,6 +1450,7 @@ def prepare_cudnn_batch_prefill(
     workspace_buffer: torch.Tensor,
     *,
     metadata: _PrefillMetadata,
+    stats_head_stride: int = 0,
 ) -> CudnnPrefillGraph:
     """Fetch (or build into the graph cache) the prefill graph for this call's
     signature and wrap it for execution.
@@ -1408,15 +1466,49 @@ def prepare_cudnn_batch_prefill(
     """
     override_cache = metadata.override_shape(q, k_cache)
 
-    graph, _ = _build_prefill_graph(
-        q=q,
-        k_cache=k_cache,
-        v_cache=v_cache,
-        scale=scale,
-        **metadata.graph_kwargs(override_cache),
-    )
+    requested_stats_head_stride = stats_head_stride
+    try:
+        graph, _ = _build_prefill_graph(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            scale=scale,
+            stats_head_stride=stats_head_stride,
+            **metadata.graph_kwargs(override_cache),
+        )
+        if stats_head_stride and override_cache is not None:
+            # Released native cuDNN can retain the declared HN stride after an
+            # override. Only the prepared half FROST binders currently prove
+            # native HN across changing token totals; preserve NH elsewhere.
+            engine = getattr(graph, "selected_engine", None)
+            if getattr(engine, "name", None) not in (
+                "sdpa_fwd_prefill_sm100",
+                "sdpa_fwd_prefill_sm107",
+                "sdpa_fwd_prefill_sm120",
+            ):
+                raise cudnn.cudnnGraphNotSupportedError(
+                    "selected engine cannot override packed HN Stats stride"
+                )
+    except cudnn.cudnnGraphNotSupportedError:
+        if not stats_head_stride:
+            raise
+        # Older engines can decline HN. Retain the established NH graph and
+        # remember the requested layout so warm runs do not retry this build.
+        stats_head_stride = 0
+        graph, _ = _build_prefill_graph(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            scale=scale,
+            **metadata.graph_kwargs(override_cache),
+        )
     key = _sdpa_prefill_key_fn(
-        q, k_cache, v_cache, scale, **metadata.graph_kwargs(override_cache)
+        q,
+        k_cache,
+        v_cache,
+        scale,
+        stats_head_stride=stats_head_stride,
+        **metadata.graph_kwargs(override_cache),
     )
     if override_cache is not None:
         workspace_bytes = workspace_buffer.numel() * workspace_buffer.element_size()
@@ -1430,13 +1522,24 @@ def prepare_cudnn_batch_prefill(
                 k_cache=k_cache,
                 v_cache=v_cache,
                 scale=scale,
+                stats_head_stride=stats_head_stride,
                 **metadata.graph_kwargs(None),
             )
             key = _sdpa_prefill_key_fn(
-                q, k_cache, v_cache, scale, **metadata.graph_kwargs(None)
+                q,
+                k_cache,
+                v_cache,
+                scale,
+                stats_head_stride=stats_head_stride,
+                **metadata.graph_kwargs(None),
             )
     return CudnnPrefillGraph(
-        key, graph, override_cache=override_cache, return_lse=metadata.return_lse
+        key,
+        graph,
+        override_cache=override_cache,
+        return_lse=metadata.return_lse,
+        stats_head_stride=stats_head_stride,
+        requested_stats_head_stride=requested_stats_head_stride,
     )
 
 

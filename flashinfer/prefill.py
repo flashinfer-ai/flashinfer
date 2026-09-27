@@ -27,6 +27,7 @@ from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
 from .cudnn.prefill import (
     CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE,
+    _CUDNN_NATIVE_HN_SUPPORTED,
     _cudnn_supports_direct_seqlens,
     CudnnPrefillGraph,
     _PrefillMetadata,
@@ -112,11 +113,18 @@ from .utils import (
 
 
 def _stage_lse(
-    lse: Optional[torch.Tensor], lse_layout: str, return_lse: bool, q: torch.Tensor
+    lse: Optional[torch.Tensor],
+    lse_layout: str,
+    return_lse: bool,
+    q: torch.Tensor,
+    *,
+    native_hn: bool = False,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-    """Kernels write ``[tokens, heads]``. For ``"HN"`` a caller's buffer is the
-    finisher's ``[heads, tokens]`` destination and the kernel gets a fresh NH
-    buffer; returns ``(lse_for_kernel, lse_out)``."""
+    """Return the kernel buffer and optional HN conversion destination.
+
+    Most kernels write NH. A prepared cuDNN graph can write HN directly;
+    validate the same public buffer contract before choosing either route.
+    """
     if not return_lse or lse_layout != "HN":
         return lse, None
     if lse is not None:
@@ -125,7 +133,7 @@ def _stage_lse(
         )
         if not lse.is_contiguous():
             raise ValueError('lse for lse_layout="HN" must be contiguous')
-    return None, lse
+    return (lse, None) if native_hn else (None, lse)
 
 
 def _finish_lse(
@@ -3363,7 +3371,8 @@ class BatchPrefillWithPagedKVCacheWrapper:
         lse_layout : str
             Layout of the returned ``lse``: ``"NH"`` (default) is
             ``[qo_indptr[-1], num_qo_heads]``, ``"HN"`` is the contiguous transpose
-            ``[num_qo_heads, qo_indptr[-1]]`` (one fused transpose + rescale kernel).
+            ``[num_qo_heads, qo_indptr[-1]]``. Prepared cuDNN graphs write HN
+            directly when supported; other paths transpose and rescale as needed.
             A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
@@ -3601,16 +3610,25 @@ class BatchPrefillWithPagedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
+        native_hn = (
+            return_lse
+            and lse_layout == "HN"
+            and _CUDNN_NATIVE_HN_SUPPORTED
+            and self._backend == "cudnn"
+            and self._cudnn_plan is not None
+            and self._cudnn_plan.metadata.causal == self._causal
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and q_scale is None
+            and k_scale is None
+            and v_scale is None
+        )
+        lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q, native_hn=native_hn)
         if return_lse:
+            lse_shape = (q.size(1), q.size(0)) if native_hn else (q.size(0), q.size(1))
             if lse is None:
-                lse = torch.empty(
-                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
-                )
+                lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
             else:
-                check_shape_dtype_device(
-                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
-                )
+                check_shape_dtype_device(lse, lse_shape, torch.float32, q.device, "lse")
 
         # For NVFP4 KV (uint8 packed), v_cache last dim is head_dim//2;
         # use q's head_dim for output instead
@@ -3705,7 +3723,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             ):
                 prepared = self._cudnn_prepared
                 if prepared is None or not prepared.matches_plan(
-                    q, k_cache, v_cache, sm_scale, plan, return_lse
+                    q,
+                    k_cache,
+                    v_cache,
+                    sm_scale,
+                    plan,
+                    return_lse,
+                    q.size(0) if native_hn else 0,
                 ):
                     prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
                         q,
@@ -3714,7 +3738,14 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         sm_scale,
                         self._float_workspace_buffer,
                         metadata=plan.build_metadata(return_lse),
+                        stats_head_stride=q.size(0) if native_hn else 0,
                     )
+                if native_hn and not prepared.stats_head_stride:
+                    lse_out = lse
+                    lse = torch.empty(
+                        (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
+                    )
+                    native_hn = False
                 prepared.run_planned(
                     q,
                     k_cache,
@@ -3882,7 +3913,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 else:
                     out *= v_scale
 
-        if return_lse:
+        if return_lse and not native_hn:
             # cuDNN already produced the requested base
             lse = _finish_lse(
                 lse,
@@ -5155,7 +5186,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         lse_layout : str
             Layout of the returned ``lse``: ``"NH"`` (default) is
             ``[qo_indptr[-1], num_qo_heads]``, ``"HN"`` is the contiguous transpose
-            ``[num_qo_heads, qo_indptr[-1]]`` (one fused transpose + rescale kernel).
+            ``[num_qo_heads, qo_indptr[-1]]``. Prepared cuDNN graphs write HN
+            directly when supported; other paths transpose and rescale as needed.
             A caller-provided :attr:`lse` must have the requested layout.
         enable_pdl : bool
             Whether to enable Programmatic Dependent Launch (PDL). See https://docs.nvidia.com/cuda/cuda-c-programming-guide/#programmatic-dependent-launch-and-synchronization
@@ -5229,16 +5261,25 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             rope_scale = 1.0
         if rope_theta is None:
             rope_theta = 1e4
-        lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q)
+        native_hn = (
+            return_lse
+            and lse_layout == "HN"
+            and _CUDNN_NATIVE_HN_SUPPORTED
+            and self._backend == "cudnn"
+            and self._cudnn_plan is not None
+            and self._cudnn_plan.metadata.causal == self._causal
+            and q.dtype in (torch.float16, torch.bfloat16)
+            and q_scale is None
+            and k_scale is None
+            and v_scale is None
+        )
+        lse, lse_out = _stage_lse(lse, lse_layout, return_lse, q, native_hn=native_hn)
         if return_lse:
+            lse_shape = (q.size(1), q.size(0)) if native_hn else (q.size(0), q.size(1))
             if lse is None:
-                lse = torch.empty(
-                    (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
-                )
+                lse = torch.empty(lse_shape, dtype=torch.float32, device=q.device)
             else:
-                check_shape_dtype_device(
-                    lse, (q.size(0), q.size(1)), torch.float32, q.device, "lse"
-                )
+                check_shape_dtype_device(lse, lse_shape, torch.float32, q.device, "lse")
         # Unpack kv_cache_sf for NVFP4 ragged KV
         k_sf, v_sf = None, None
         if kv_cache_sf is not None:
@@ -5517,7 +5558,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             ):
                 prepared = self._cudnn_prepared
                 if prepared is None or not prepared.matches_plan(
-                    q, k, v, sm_scale, plan, return_lse
+                    q, k, v, sm_scale, plan, return_lse, q.size(0) if native_hn else 0
                 ):
                     prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
                         q,
@@ -5526,7 +5567,14 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                         sm_scale,
                         self._float_workspace_buffer,
                         metadata=plan.build_metadata(return_lse),
+                        stats_head_stride=q.size(0) if native_hn else 0,
                     )
+                if native_hn and not prepared.stats_head_stride:
+                    lse_out = lse
+                    lse = torch.empty(
+                        (q.size(0), q.size(1)), dtype=torch.float32, device=q.device
+                    )
+                    native_hn = False
                 prepared.run_planned(
                     q,
                     k,
@@ -5570,7 +5618,10 @@ class BatchPrefillWithRaggedKVCacheWrapper:
 
             # base already handled inside cudnn_batch_prefill_with_kv_cache
             return (
-                (out, _finish_lse(lse, "log2", lse_layout, lse_out))
+                (
+                    out,
+                    lse if native_hn else _finish_lse(lse, "log2", lse_layout, lse_out),
+                )
                 if return_lse
                 else out
             )

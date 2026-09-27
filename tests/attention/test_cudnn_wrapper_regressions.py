@@ -274,8 +274,9 @@ def test_prefill_replan_tracks_storage_not_tensor_identity(monkeypatch, change):
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 @pytest.mark.parametrize("force_legacy", [False, True])
+@pytest.mark.parametrize("lse_layout", ["NH", "HN"])
 def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
-    monkeypatch, force_legacy
+    monkeypatch, force_legacy, lse_layout
 ):
     if force_legacy:
         # The wrapper imports its own alias; both dispatch and metadata
@@ -310,7 +311,7 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
             assert w._qo_indptr_buf.data_ptr() == pointer
             if direct:
                 assert w._cudnn_plan is plan
-        out, lse = w.run(q, k, v, return_lse=True)
+        out, lse = w.run(q, k, v, return_lse=True, lse_layout=lse_layout)
         ref, stats = _reference(
             q,
             k.unsqueeze(1),
@@ -324,7 +325,10 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
         )
         torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
         torch.testing.assert_close(
-            lse, stats * math.log2(math.e), atol=0.003, rtol=0.003
+            lse.T if lse_layout == "HN" else lse,
+            stats * math.log2(math.e),
+            atol=0.003,
+            rtol=0.003,
         )
     torch.testing.assert_close(qo_gpu.cpu(), torch.tensor([0, 3, 5], dtype=torch.int32))
     torch.testing.assert_close(
@@ -333,7 +337,7 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        w.run(q, k, v, out=out, lse=lse, return_lse=True)
+        w.run(q, k, v, out=out, lse=lse, return_lse=True, lse_layout=lse_layout)
     w.plan(qo.clone(), kv.clone(), 8, 2, 128, q_data_type=q.dtype)
     # Native capture holds raw metadata pointers. Reusing freed indptr storage
     # must not silently change the work done by subsequent replays.
@@ -342,7 +346,12 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
     lse.fill_(torch.nan)
     graph.replay()
     torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
-    torch.testing.assert_close(lse, stats * math.log2(math.e), atol=0.003, rtol=0.003)
+    torch.testing.assert_close(
+        lse.T if lse_layout == "HN" else lse,
+        stats * math.log2(math.e),
+        atol=0.003,
+        rtol=0.003,
+    )
     assert len(poison) == 128
 
 
@@ -350,7 +359,10 @@ def test_ragged_replan_reuses_owned_mirrors_without_writing_caller_buffers(
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize("lse_base", ["ln", "log2"])
 @pytest.mark.parametrize("explicit_metadata", [False, True])
-def test_paged_prefill_default_scale_layout_lse(layout, lse_base, explicit_metadata):
+@pytest.mark.parametrize("lse_layout", ["NH", "HN"])
+def test_paged_prefill_default_scale_layout_lse(
+    layout, lse_base, explicit_metadata, lse_layout
+):
     q, k, v, qo, ip, ix, last = _paged_inputs()
     last = last + 4
     ws = torch.empty(128 << 20, dtype=torch.uint8, device=q.device)
@@ -370,11 +382,13 @@ def test_paged_prefill_default_scale_layout_lse(layout, lse_base, explicit_metad
         qo, ip, ix, last, 8, 2, 128, 16, causal=True, q_data_type=q.dtype, **metadata
     )
     cache = (k, v) if layout == "NHD" else (k.transpose(1, 2), v.transpose(1, 2))
-    out, lse = w.run(q, cache, return_lse=True, lse_base=lse_base)
+    out, lse = w.run(
+        q, cache, return_lse=True, lse_base=lse_base, lse_layout=lse_layout
+    )
     ref, lse_ref = _reference(q, k, v, qo, ip, ix, last, causal=True, scale=128**-0.5)
     torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
     torch.testing.assert_close(
-        lse,
+        lse.T if lse_layout == "HN" else lse,
         lse_ref * (math.log2(math.e) if lse_base == "log2" else 1),
         atol=2e-3,
         rtol=2e-3,
@@ -382,7 +396,15 @@ def test_paged_prefill_default_scale_layout_lse(layout, lse_base, explicit_metad
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        w.run(q, cache, out=out, lse=lse, return_lse=True, lse_base=lse_base)
+        w.run(
+            q,
+            cache,
+            out=out,
+            lse=lse,
+            return_lse=True,
+            lse_base=lse_base,
+            lse_layout=lse_layout,
+        )
     lengths_ptr = w._seq_lens_kv.data_ptr()
     last = last - 2
     if explicit_metadata:
@@ -415,7 +437,7 @@ def test_paged_prefill_default_scale_layout_lse(layout, lse_base, explicit_metad
     ref, lse_ref = _reference(q, k, v, qo, ip, ix, last, causal=True, scale=128**-0.5)
     torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
     torch.testing.assert_close(
-        lse,
+        lse.T if lse_layout == "HN" else lse,
         lse_ref * (math.log2(math.e) if lse_base == "log2" else 1),
         atol=2e-3,
         rtol=2e-3,
@@ -879,5 +901,101 @@ def test_paged_graph_query_capacity_grows_and_replays(backend, declared_capacity
         graph.replay()
         check(64, small_qo)
         assert torch.isnan(out[64:]).all()
+    finally:
+        graph.reset()
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("mode", ["auto", "hn_declined", "legacy", "old_frontend"])
+def test_prefill_hn_layout_capacity_switch_keeps_old_capture(monkeypatch, mode):
+    """HN/NH graph keys and output bindings survive replan with fewer packed tokens."""
+    if mode == "legacy":
+        for module in (flashinfer.prefill, prefill):
+            monkeypatch.setattr(
+                module, "_cudnn_supports_direct_seqlens", lambda *a, **k: False
+            )
+    elif not prefill._cudnn_supports_direct_seqlens(torch.bfloat16, mixed=True):
+        pytest.skip("requires direct sequence lengths")
+    hn_attempts = []
+    if mode == "hn_declined" and not flashinfer.prefill._CUDNN_NATIVE_HN_SUPPORTED:
+        pytest.skip("native HN requires FE Stats stride override support")
+    if mode == "old_frontend":
+        monkeypatch.setattr(flashinfer.prefill, "_CUDNN_NATIVE_HN_SUPPORTED", False)
+    if mode == "hn_declined":
+        original = prefill._build_prefill_graph
+
+        def build(*args, **kwargs):
+            if kwargs.get("stats_head_stride", 0):
+                hn_attempts.append(kwargs["stats_head_stride"])
+                raise prefill.cudnn.cudnnGraphNotSupportedError(
+                    "test engine declines HN"
+                )
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(prefill, "_build_prefill_graph", build)
+    q, k, v, qo, ip, ix, last = _paged_inputs()
+    last = last + 4
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device=q.device),
+        "NHD",
+        backend="cudnn",
+        use_cuda_graph=True,
+        qo_indptr_buf=torch.empty_like(qo, device=q.device),
+        paged_kv_indptr_buf=torch.empty_like(ip, device=q.device),
+        paged_kv_indices_buf=torch.empty_like(ix, device=q.device),
+        paged_kv_last_page_len_buf=torch.empty_like(last, device=q.device),
+        max_total_num_rows=5,
+    )
+
+    def plan(offsets):
+        w.plan(offsets, ip, ix, last, 8, 2, 128, 16, causal=True, q_data_type=q.dtype)
+
+    def run(query, layout, **kwargs):
+        return w.run(
+            query, (k, v), return_lse=True, lse_base="ln", lse_layout=layout, **kwargs
+        )
+
+    plan(qo)
+    out, lse = run(q, "HN")
+    if mode == "auto":
+        assert w._cudnn_prepared.stats_head_stride in (0, q.shape[0])
+    elif mode in ("hn_declined", "old_frontend"):
+        assert w._cudnn_prepared.stats_head_stride == 0
+    else:
+        assert w._cudnn_plan is None
+    hn_graph = w._cudnn_prepared.graph if w._cudnn_prepared is not None else None
+    native_hn = bool(
+        w._cudnn_prepared is not None and w._cudnn_prepared.stats_head_stride
+    )
+    run(q, "HN", out=out, lse=lse)
+    if mode == "hn_declined":
+        assert hn_attempts == [5], "warm runs must not retry the unsupported layout"
+    graph = torch.cuda.CUDAGraph()
+    try:
+        with torch.cuda.graph(graph):
+            run(q, "HN", out=out, lse=lse)
+        # Switch the prepared wrapper's layout and then its physical head stride.
+        _, nh = run(q, "NH")
+        torch.testing.assert_close(lse, nh.T, atol=2e-3, rtol=2e-3)
+        qo2 = torch.tensor([0, 2, 4], dtype=torch.int32)
+        plan(qo2)
+        q.mul_(0.75)
+        v.mul_(0.5)
+        out2, lse2 = run(q[:4], "HN")
+        if native_hn and w._cudnn_prepared.override_cache is not None:
+            assert w._cudnn_prepared.graph is hn_graph
+        ref, stats = _reference(
+            q[:4], k, v, qo2, ip, ix, last, causal=True, scale=128**-0.5
+        )
+        torch.testing.assert_close(out2.float(), ref, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(lse2.T, stats, atol=2e-3, rtol=2e-3)
+        out.fill_(torch.nan)
+        lse.fill_(torch.nan)
+        graph.replay()
+        torch.testing.assert_close(out[:4].float(), ref, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(lse[:, :4].T, stats, atol=2e-3, rtol=2e-3)
+        assert bool(torch.isnan(out[4:]).all())
+        if native_hn:
+            assert bool(torch.isnan(lse[:, 4:]).all())
     finally:
         graph.reset()

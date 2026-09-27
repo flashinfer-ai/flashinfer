@@ -402,3 +402,144 @@ def test_prefill_metadata_rebind_and_lse_base(monkeypatch, lse_base, expected):
         torch.testing.assert_close(stats, torch.full_like(stats, expected))
     assert seen[0] is not seen[1]
     assert seen[0][prefill.UIDs.ACTUAL_SEQ_LENS_Q_UID.value] is indptr
+
+
+@pytest.mark.parametrize("mode", ["error", "backend"])
+def test_prefill_hn_decline_is_remembered_in_prepared_match(monkeypatch, mode):
+    monkeypatch.setattr(prefill, "_CUDNN_NATIVE_HN_SUPPORTED", True)
+    monkeypatch.setattr(
+        prefill, "_cudnn_supports_shape_override", lambda: mode == "backend"
+    )
+    q = torch.empty(3, 4, 8, dtype=torch.bfloat16)
+    kv = torch.empty(7, 2, 8, dtype=q.dtype)
+    cuq = torch.tensor([0, 1, 3], dtype=torch.int32)
+    cuk = torch.tensor([0, 3, 7], dtype=torch.int32)
+    metadata = prefill._PrefillMetadata(
+        2,
+        4,
+        False,
+        True,
+        cu_seq_lens_q=cuq,
+        cu_seq_lens_kv=cuk,
+        batch_offsets_q=cuq,
+        batch_offsets_o=cuq,
+        batch_offsets_stats=cuq,
+        batch_offsets_k=cuk,
+        batch_offsets_v=cuk,
+    )
+    calls = []
+
+    def build(**kwargs):
+        stride = kwargs.get("stats_head_stride", 0)
+        calls.append(stride)
+        if stride and mode == "error":
+            raise prefill.cudnn.cudnnGraphNotSupportedError("HN declined")
+        return SimpleNamespace(selected_engine=None, get_workspace_size=lambda: 0), []
+
+    monkeypatch.setattr(prefill, "_build_prefill_graph", build)
+    prepared = prefill.prepare_cudnn_batch_prefill(
+        q, kv, kv, 0.5, torch.empty(0), metadata=metadata, stats_head_stride=3
+    )
+    plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device)
+    assert calls == [3, 0]
+    assert prepared.stats_head_stride == 0
+    assert prepared.matches_plan(q, kv, kv, 0.5, plan, True, 3)
+    assert not prepared.matches_plan(q, kv, kv, 0.5, plan, True, 0)
+    assert prepared.matches_plan(q, kv, kv, 0.5, plan, True, 4) == (mode == "backend")
+    assert not prepared.matches_plan(q, kv, kv, 0.5, plan, False, 3)
+    # Layout/capacity affect compiled descriptors; runtime output addresses do not.
+    keys = [
+        prefill._sdpa_prefill_key_fn(
+            q, kv, kv, 0.5, stats_head_stride=n, **metadata.graph_kwargs(None)
+        )
+        for n in (0, 3, 4)
+    ]
+    assert len(set(keys)) == 3
+
+
+@pytest.mark.parametrize("supported", [False, True])
+def test_prefill_hn_override_key_ignores_runtime_token_count(monkeypatch, supported):
+    monkeypatch.setattr(prefill, "_CUDNN_NATIVE_HN_SUPPORTED", supported)
+    q = torch.empty(3, 4, 8, dtype=torch.bfloat16)
+    kv = torch.empty(7, 2, 8, dtype=q.dtype)
+    ptr = torch.tensor([0, 3], dtype=torch.int32)
+    metadata = prefill._PrefillMetadata(
+        3,
+        7,
+        False,
+        True,
+        cu_seq_lens_q=ptr,
+        cu_seq_lens_kv=ptr,
+        batch_offsets_q=ptr,
+        batch_offsets_o=ptr,
+        batch_offsets_stats=ptr,
+        batch_offsets_k=ptr,
+        batch_offsets_v=ptr,
+    )
+    for override in (None, (4096, 128, 128)):
+        keys = [
+            prefill._sdpa_prefill_key_fn(
+                q, kv, kv, 0.5, stats_head_stride=n, **metadata.graph_kwargs(override)
+            )
+            for n in (0, 3, 4)
+        ]
+        assert keys[0] != keys[1]  # NH/HN remain different specializations.
+        assert (keys[1] == keys[2]) == (supported and override is not None)
+
+
+def test_prefill_hn_same_plan_rebinds_current_output_stride(monkeypatch):
+    monkeypatch.setattr(prefill, "_CUDNN_NATIVE_HN_SUPPORTED", True)
+    monkeypatch.setattr(prefill, "_cudnn_supports_shape_override", lambda: True)
+    monkeypatch.setattr(prefill, "_create_cudnn_handle", lambda stream: 23)
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda *a: None)
+    q = torch.empty(3, 4, 8, dtype=torch.bfloat16)
+    kv = torch.empty(7, 2, 8, dtype=q.dtype)
+    cuq = torch.tensor([0, 3], dtype=torch.int32)
+    cuk = torch.tensor([0, 7], dtype=torch.int32)
+    metadata = prefill._PrefillMetadata(
+        3,
+        7,
+        False,
+        True,
+        cu_seq_lens_q=cuq,
+        cu_seq_lens_kv=cuk,
+        batch_offsets_q=cuq,
+        batch_offsets_o=cuq,
+        batch_offsets_stats=cuq,
+        batch_offsets_k=cuk,
+        batch_offsets_v=cuk,
+    )
+    calls = []
+
+    class Graph:
+        def execute(self, buffers, *, tensor_uids=None, **kwargs):
+            calls.append(kwargs)
+
+    plan = prefill._CudnnPrefillPlan.prepare(metadata, q.dtype, q.device)
+    key = prefill._sdpa_prefill_key_fn(
+        q, kv, kv, 0.5, stats_head_stride=3, **metadata.graph_kwargs(plan.override)
+    )
+    prepared = prefill.CudnnPrefillGraph(
+        key,
+        Graph(),
+        override_cache=plan.override,
+        return_lse=True,
+        stats_head_stride=3,
+        requested_stats_head_stride=3,
+    )
+    for tokens in (3, 2, 3):
+        assert prepared.matches_plan(q[:tokens], kv, kv, 0.5, plan, True, tokens)
+        prepared.run_planned(
+            q[:tokens],
+            kv,
+            kv,
+            torch.empty_like(q[:tokens]),
+            torch.empty(4, tokens),
+            torch.empty(0),
+            plan=plan,
+            lse_base="ln",
+        )
+    for call, tokens in zip(calls, (3, 2, 3), strict=True):
+        at = call["override_uids"].index(prefill.UIDs.STATS_UID.value)
+        assert call["override_strides"][at] == [4 * tokens, tokens, 1, 1]
+    assert calls[0]["override_strides"] is not calls[1]["override_strides"]
