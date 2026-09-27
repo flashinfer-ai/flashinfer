@@ -523,23 +523,48 @@ def registered_split_factors(arch: str) -> tuple[int, ...]:
         sorted(
             int(record["splits"])
             for record in MODULES.values()
-            if record["arch"] == arch and route_of(record) == "swap_tsk"
+            if record["arch"] == arch
+            and route_of(record) == "swap_tsk"
+            and not record.get("tail", False)
         )
     )
 
 
-def select_module(arch: str, splits: int) -> str:
-    """Return the registered persistent module name for ``arch`` and split factor ``splits``."""
+def tail_records(arch: str) -> list[dict[str, Any]]:
+    """Registered last-round-split programs of ``arch``, ascending split factor.
+
+    A tail program runs every full persistent round unsplit and only the
+    remainder items of the last round as ``splits``-CTA cluster units; its
+    ``cluster_capacity`` maps a part's SM count to the CTAs the driver
+    co-schedules as such clusters (clusters must fit inside one GPC).
+    """
+    return sorted(
+        (
+            record
+            for record in MODULES.values()
+            if record["arch"] == arch
+            and route_of(record) == "swap_tsk"
+            and record.get("tail", False)
+        ),
+        key=lambda record: int(record["splits"]),
+    )
+
+
+def select_module(arch: str, splits: int, tail: bool = False) -> str:
+    """Return the registered persistent module name for ``arch`` and split factor ``splits``
+    (``tail`` selects the last-round-split program of that factor)."""
     for name, record in MODULES.items():
         if (
             record["arch"] == arch
             and route_of(record) == "swap_tsk"
             and int(record["splits"]) == int(splits)
+            and bool(record.get("tail", False)) == bool(tail)
         ):
             return name
     raise NotImplementedError(
         "The generated NVFP4 MSA decode program for "
-        f"{arch} with split factor {splits} is not registered in this checkout"
+        f"{arch} with split factor {splits}{' (last-round split)' if tail else ''} "
+        "is not registered in this checkout"
     )
 
 
