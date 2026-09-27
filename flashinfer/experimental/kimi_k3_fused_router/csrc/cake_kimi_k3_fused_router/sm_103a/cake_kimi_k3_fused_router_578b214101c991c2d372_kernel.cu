@@ -88,7 +88,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_PLAN_BITMAP_STRIDE 14336
 #define SMEM_TOTAL 40960
 #define THREADS 224
-#define BLOCK_M 8
+#define BLOCK_M 16
 #define NUM_EXPERTS 896
 #define TOP_K 16
 #define ITEMS_PER_THREAD 4
@@ -140,7 +140,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(224, 3) void
-kernel_cake_kimi_k3_fused_router_9bd0bd54242c39406484(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+kernel_cake_kimi_k3_fused_router_578b214101c991c2d372(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -182,6 +182,30 @@ kernel_cake_kimi_k3_fused_router_9bd0bd54242c39406484(float* __restrict__ logits
     // === Task calls (dependency order) ===
     int global_thread = bid * THREADS + tid;
     int grid_threads = num_bids * THREADS;
+    int expert_base = tid * ITEMS_PER_THREAD;
+    float _vec_load_0[4];
+    {
+        float4 _v4 = *reinterpret_cast<const float4*>(bias + expert_base);
+        _vec_load_0[0 + 0] = _v4.x;
+        _vec_load_0[0 + 1] = _v4.y;
+        _vec_load_0[0 + 2] = _v4.z;
+        _vec_load_0[0 + 3] = _v4.w;
+    }
+    float row_logits[ITEMS_PER_THREAD];
+    if (bid < M) {
+        {
+            float4 _v4 = *reinterpret_cast<const float4*>(logits + (unsigned long long)bid * (unsigned long long)NUM_EXPERTS + (unsigned long long)expert_base);
+            row_logits[0 + 0] = _v4.x;
+            row_logits[0 + 1] = _v4.y;
+            row_logits[0 + 2] = _v4.z;
+            row_logits[0 + 3] = _v4.w;
+        }
+    } else {
+        #pragma unroll
+        for (int first_zero = 0; first_zero < ITEMS_PER_THREAD; first_zero++) {
+            row_logits[first_zero] = 0.0f;
+        }
+    }
     if (warp == 0) {
         if (elect_sync()) {
             #pragma unroll
@@ -196,32 +220,14 @@ kernel_cake_kimi_k3_fused_router_9bd0bd54242c39406484(float* __restrict__ logits
         plan_bitmap[bitmap_clear * THREADS + tid] = (unsigned int)0;
     }
     __syncthreads();
-    int expert_base = tid * ITEMS_PER_THREAD;
-    float _vec_load_0[4];
-    {
-        float4 _v4 = *reinterpret_cast<const float4*>(bias + expert_base);
-        _vec_load_0[0 + 0] = _v4.x;
-        _vec_load_0[0 + 1] = _v4.y;
-        _vec_load_0[0 + 2] = _v4.z;
-        _vec_load_0[0 + 3] = _v4.w;
-    }
     #pragma unroll 1
     for (int token = bid; token < M; token += num_bids) {
-        unsigned long long row_base = (unsigned long long)token * (unsigned long long)NUM_EXPERTS;
-        float _vec_load_1[4];
-        {
-            float4 _v4 = *reinterpret_cast<const float4*>(logits + row_base + (unsigned long long)expert_base);
-            _vec_load_1[0 + 0] = _v4.x;
-            _vec_load_1[0 + 1] = _v4.y;
-            _vec_load_1[0 + 2] = _v4.z;
-            _vec_load_1[0 + 3] = _v4.w;
-        }
         float unbiased[ITEMS_PER_THREAD];
         unsigned int keys[ITEMS_PER_THREAD];
         int active[ITEMS_PER_THREAD];
         #pragma unroll
         for (int item = 0; item < ITEMS_PER_THREAD; item++) {
-            float _expf_0 = __expf(-_vec_load_1[item]);
+            float _expf_0 = __expf(-row_logits[item]);
             float _fdiv_full_0;
             asm volatile("div.full.f32 %0, %1, %2;" : "=f"(_fdiv_full_0) : "f"(1.0f), "f"(1.0f + _expf_0));
             float score = _fdiv_full_0;
@@ -483,6 +489,21 @@ kernel_cake_kimi_k3_fused_router_9bd0bd54242c39406484(float* __restrict__ logits
             topk_ids[output_index] = selected_id;
         }
         __syncthreads();
+        int next_token = token + num_bids;
+        if (next_token < M) {
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(logits + (unsigned long long)next_token * (unsigned long long)NUM_EXPERTS + (unsigned long long)expert_base);
+                row_logits[0 + 0] = _v4.x;
+                row_logits[0 + 1] = _v4.y;
+                row_logits[0 + 2] = _v4.z;
+                row_logits[0 + 3] = _v4.w;
+            }
+        } else {
+            #pragma unroll
+            for (int next_zero = 0; next_zero < ITEMS_PER_THREAD; next_zero++) {
+                row_logits[next_zero] = 0.0f;
+            }
+        }
     }
     cooperative_groups::this_grid().sync();
     int owner_ctas = num_bids;
