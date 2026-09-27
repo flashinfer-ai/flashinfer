@@ -693,6 +693,7 @@ def test_batch_ragged_prefill_causal_kv_shorter_than_qo():
     rows = torch.arange(kv_len, device="cuda")
     scores.masked_fill_(rows[None, None, :] > rows[None, :, None], float("-inf"))
     lse_ref = (torch.logsumexp(scores, dim=-1) / math.log(2)).transpose(0, 1)
+    assert torch.isneginf(lse[:first_row]).all()
     torch.testing.assert_close(lse[first_row:], lse_ref, rtol=1e-3, atol=1e-3)
 
 

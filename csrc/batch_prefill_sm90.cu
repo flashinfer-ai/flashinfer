@@ -116,7 +116,7 @@ Array<int64_t> BatchPrefillWithKVCacheSM90Plan(
       static_cast<IdType*>(kv_indptr.data_ptr()), static_cast<IdType*>(kv_len_arr.data_ptr()),
       total_num_rows, batch_size, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo, page_size,
       causal, enable_cuda_graph,
-      /*sizeof_dtype_o=*/2, stream,
+      /*sizeof_dtype_o=*/sizeof(DTypeO), stream,
       /*allow_split_kv=*/!disable_split_kv && window_left < 0);
 
   TVM_FFI_ICHECK(status == cudaSuccess)
