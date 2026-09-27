@@ -160,10 +160,27 @@ def swap_row_tma(n_tile: int, gather_rows: bool = True) -> bool:
     GEMM1's gathered rows stay on the cp.async gather warps (``gather4`` is
     slow for 128-byte rows). ``SWAPAB_ROW_TMA=0|1`` overrides both.
     """
+    if n_tile == 192:
+        # The 192-row (2-CTA) tile gathers its rows with the cp.async warps.
+        return False
     env = os.environ.get("SWAPAB_ROW_TMA")
     if env:
         return bool(int(env))
     return n_tile >= 64 and not gather_rows
+
+
+def swap_two_cta(n_tile: int) -> bool:
+    """Whether this tile width runs the 2-CTA kernel (256 weight rows per
+    work item, the token tile split between the pair); ``SWAPAB_TWO_CTA=0``
+    keeps the 192-row tile on one CTA (measurement arm)."""
+    if n_tile != 192:
+        return False
+    return os.environ.get("SWAPAB_TWO_CTA", "1") != "0"
+
+
+# Stage depth of the 2-CTA GEMM2 (K = intermediate shard): 128-wide stages
+# keep the pair's 29 KB stages deep; ``SWAPAB_KBLOCKS2_2CTA`` overrides.
+SWAP_TWO_CTA_GEMM2_K_BLOCKS = int(os.environ.get("SWAPAB_KBLOCKS2_2CTA", "4"))
 
 
 def swap_m_group(n_tile: int, gemm2: bool = False) -> int:
@@ -378,6 +395,7 @@ def _get_compiled_swapab_kernel(
     split_max_items: int = 0,
     cluster_split: bool = False,
     remainder_split: bool = False,
+    two_cta: bool = False,
 ):
     import os
     import sys
@@ -423,6 +441,7 @@ def _get_compiled_swapab_kernel(
         split_max_items,
         cluster_split,
         remainder_split,
+        two_cta,
     )
     if key not in _swapab_kernel_cache:
         if os.environ.get("SWAPAB_DEBUG"):
@@ -453,6 +472,7 @@ def _get_compiled_swapab_kernel(
             split_max_items=split_max_items,
             cluster_split=cluster_split,
             remainder_split=remainder_split,
+            two_cta=two_cta,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -499,6 +519,7 @@ def swapab_gemm1_situ(
     late_dep_wait: bool = False,
     pdl_trigger_after_wait: bool = False,
     cluster_split_k: bool = False,
+    two_cta: Optional[bool] = None,
 ) -> None:
     """GEMM1 (up/gate) + SiTU + MXFP8 requantization on the swap path.
 
@@ -516,7 +537,11 @@ def swapab_gemm1_situ(
         raise ValueError(
             f"n_tile={n_tile} loads rows with TMA and needs permuted_idx_to_token_idx"
         )
+    if two_cta is None:
+        two_cta = swap_two_cta(n_tile)
     num_local_experts, rows_w, packed_k = w1.shape
+    if two_cta and rows_w % 256:
+        raise ValueError("the 2-CTA kernel needs 2I to be a multiple of 256")
     k = packed_k * 2
     num_tokens = x.shape[0]
     rows = permuted_idx_to_expanded_idx.shape[0]
@@ -533,7 +558,7 @@ def swapab_gemm1_situ(
             raise ValueError("zero_output byte size must be a multiple of 8")
         zero_words = zero_output.numel() * zero_output.element_size() // 8
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    max_active_clusters = get_max_active_clusters(1)
+    max_active_clusters = get_max_active_clusters(2 if two_cta else 1)
     use_linear_beta = linear_beta is not None
     if k_blocks_per_stage is None:
         k_blocks_per_stage = gemm1_k_blocks_per_stage(n_tile)
@@ -546,6 +571,7 @@ def swapab_gemm1_situ(
     cluster_split = False
     if (
         cluster_split_k
+        and not two_cta
         and n_tile <= 16
         and (k // (k_blocks_per_stage * 32)) % 2 == 0
         and swap_m_group(n_tile, gemm2=False) == 1
@@ -617,6 +643,7 @@ def swapab_gemm1_situ(
         split_max_items=split_max_items,
         cluster_split=cluster_split,
         remainder_split=bool(SWAP_REMAINDER_SPLIT) and cluster_split,
+        two_cta=two_cta,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm1"] = (compiled, args)
@@ -651,6 +678,7 @@ def swapab_gemm2(
     late_dep_wait: bool = False,
     pdl_trigger_after_wait: bool = False,
     split_k: int = 1,
+    two_cta: Optional[bool] = None,
 ) -> None:
     """GEMM2 (down) on the swap path.
 
@@ -667,8 +695,16 @@ def swapab_gemm2(
     """
     num_local_experts, rows_w, packed_k = w2.shape
     k = packed_k * 2
+    if two_cta is None:
+        two_cta = swap_two_cta(n_tile)
+    if two_cta and rows_w % 256:
+        raise ValueError("the 2-CTA kernel needs H to be a multiple of 256")
     if k_blocks_per_stage is None:
-        k_blocks_per_stage = gemm2_k_blocks_per_stage(k, n_tile)
+        k_blocks_per_stage = (
+            SWAP_TWO_CTA_GEMM2_K_BLOCKS
+            if two_cta
+            else gemm2_k_blocks_per_stage(k, n_tile)
+        )
     rows = act.shape[0]
     if act.shape[1] != k or act_sf.numel() != rows * (k // 32):
         raise ValueError("act must be [R, I] with act_sf of R * I/32 bytes")
@@ -692,11 +728,13 @@ def swapab_gemm2(
     # Deferred rows past 2^31 elements need the 64-bit store offset variant.
     wide_out = (not finalize) and out.shape[0] * out.shape[1] >= 1 << 31
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    max_active_clusters = get_max_active_clusters(1)
+    max_active_clusters = get_max_active_clusters(2 if two_cta else 1)
     # Split-K only for the additive finalize epilogue and an evenly divisible
     # stage count; the kernel splits at run time only while the valid work
     # items fit ``max_active_clusters // split_k`` CTAs.
-    if split_k > 1 and (not finalize or (k // (k_blocks_per_stage * 32)) % split_k):
+    if split_k > 1 and (
+        not finalize or two_cta or (k // (k_blocks_per_stage * 32)) % split_k
+    ):
         split_k = 1
     split_max_items = max_active_clusters // split_k if split_k > 1 else 0
     args = (
@@ -760,6 +798,7 @@ def swapab_gemm2(
         pdl_trigger_after_wait=pdl_trigger_after_wait,
         split_k=split_k,
         split_max_items=split_max_items,
+        two_cta=two_cta,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm2"] = (compiled, args)

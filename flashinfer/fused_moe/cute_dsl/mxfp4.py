@@ -51,6 +51,7 @@ from .swapab_moe import (
     SWAP_ROW_TILE,
     fill_permuted_token_index,
     swap_row_tma,
+    swap_two_cta,
     swapab_dispatch,
     swapab_gemm1_situ,
     swapab_gemm2,
@@ -207,6 +208,15 @@ SWAP_MIXED_EP = os.environ.get("SWAPAB_MIXED_EP", "0") == "1"
 # swap GEMM1/GEMM2 scales plain (valid with the dense tiles disabled).
 SWAP_MIXED_WIDE_PERMILLE = int(os.environ.get("SWAPAB_MIXED_WIDE_PERMILLE", "0"))
 SWAP_MIXED_SF_PLAIN = os.environ.get("SWAPAB_MIXED_SF_PLAIN", "0") == "1"
+# Wide swap form for the dense token range (T > swapab_max_tokens, finalize
+# only): 192-row sort groups and both GEMMs on the 2-CTA swap-AB kernel (256
+# weight rows x 192 tokens per work item, see the kernel docstring), so a
+# balanced 8192-token prefill pads its ~146-row experts to 192 instead of the
+# dense tile's 256 at the 2-CTA operand rate. Opt-in while under measurement
+# (CAKE-707 round 1); ``MXFP4_SWAP192_MIN_TOKENS`` raises the lower bound.
+SWAP_WIDE192 = os.environ.get("MXFP4_SWAP192", "0") == "1"
+SWAP_WIDE192_TILE = 192
+SWAP_WIDE192_MIN_TOKENS = int(os.environ.get("MXFP4_SWAP192_MIN_TOKENS", "0"))
 # Mixed form: weight M-tiles per swap-GEMM2 work item. Measured on B300 (TP8
 # T=256/1024 balanced): with the 128-row groups the GEMM2 of the policy tile
 # loses 6-9 % at m_group 1 and is back at the 32-row-group time with 2.
@@ -930,6 +940,9 @@ class Mxfp4MoESwapAbPlan:
         self.hybrid = wrapper._swap_hybrid(x.shape[0], self.finalize)
         self.mixed = wrapper._swap_mixed(x.shape[0], self.finalize)
         self.split = wrapper._swap_split(x.shape[0], self.finalize)
+        # Wide 192-row form (SWAP_WIDE192): 2-CTA GEMM1 and GEMM2, fused
+        # (atomic) finalize -- its permuted-row partial buffer would be GBs.
+        self.wide192 = wrapper._swap_wide192(x.shape[0], self.finalize)
         self.split_dense = False  # set by _prepare
         self._side_stream = None
         self._fork_event = self._join_event = None
@@ -943,6 +956,7 @@ class Mxfp4MoESwapAbPlan:
         self.two_stage = (
             self.finalize
             and not self.hybrid
+            and not self.wide192
             and x.shape[0] > SWAP_ATOMIC_FINALIZE_MAX_TOKENS
             and wrapper.intermediate_shard <= SWAP_TWO_STAGE_MAX_SHARD
         )
@@ -1181,6 +1195,7 @@ class Mxfp4MoESwapAbPlan:
                 # 0.947 / 0.932, T=4 hot 0.973, T=8 / 16 balanced 0.978 /
                 # 0.992; the unsplit rows pay the cluster image, <= 1 %).
                 cluster_split_k=SWAP_GEMM1_CLUSTER_SPLIT and self._dep_prefetch,
+                two_cta=swap_two_cta(self.n_tile),
                 **{
                     "num_non_exiting_tiles": b["out_num_non_exiting_tiles"],
                     **gemm1_lists,
@@ -1450,6 +1465,12 @@ class Mxfp4MoESwapAbPlan:
                 gemm2_m_group = SWAP_TP_GEMM2_MGROUP
                 if not os.environ.get("SWAPAB_KBLOCKS2"):
                     gemm2_k_blocks = 4
+            gemm2_two_cta = swap_two_cta(self.n_tile)
+            if self.wide192:
+                # 2-CTA kernel: one weight chunk per work item, whole K per
+                # item, launcher default stage depth.
+                gemm2_k_blocks = None
+                gemm2_m_group = 1
             gemm2_lists = {"num_non_exiting_tiles": b["out_num_non_exiting_tiles"]}
             if self.mixed:
                 # Every occupied n_tile-row sub-tile of the 128-row groups;
@@ -1487,7 +1508,12 @@ class Mxfp4MoESwapAbPlan:
                 _prepared_launches=launches,
                 m_group=gemm2_m_group,
                 late_dep_wait=self._pdl and self._dep_prefetch,
-                split_k=SWAP_GEMM2_SPLIT_K if self._dep_prefetch else 1,
+                split_k=(
+                    SWAP_GEMM2_SPLIT_K
+                    if (self._dep_prefetch and not self.wide192)
+                    else 1
+                ),
+                two_cta=gemm2_two_cta,
                 **gemm2_lists,
             )
 
@@ -1808,9 +1834,24 @@ class CuteDslMxfp4MoEWrapper:
     def _use_swapab(self, num_tokens, do_finalize=True):
         # Deferred output exists only on the swap-AB path, at any token count.
         return (
-            (1 <= num_tokens <= self.swapab_max_tokens or not do_finalize)
+            (
+                1 <= num_tokens <= self.swapab_max_tokens
+                or not do_finalize
+                or self._swap_wide192(num_tokens, do_finalize)
+            )
             and self.activation_type == ActivationType.Situ
             and (SWAP_PDL or not self.enable_pdl)
+        )
+
+    def _swap_wide192(self, num_tokens, do_finalize=True):
+        """Wide swap form (see SWAP_WIDE192): the dense token range with
+        192-row groups on the 2-CTA swap-AB kernel, both GEMMs."""
+        return (
+            SWAP_WIDE192
+            and bool(do_finalize)
+            and self.activation_type == ActivationType.Situ
+            and num_tokens > self.swapab_max_tokens
+            and num_tokens >= SWAP_WIDE192_MIN_TOKENS
         )
 
     def _dense_two_stage(self, num_tokens):
@@ -1827,7 +1868,9 @@ class CuteDslMxfp4MoEWrapper:
             return None
         return _DENSE_L2_HINTS["first"]
 
-    def _swap_tile(self, num_tokens):
+    def _swap_tile(self, num_tokens, do_finalize=True):
+        if self._swap_wide192(num_tokens, do_finalize):
+            return SWAP_WIDE192_TILE
         if num_tokens <= 16:
             return self.swapab_n_tile
         for max_tokens, tile in self.swapab_tile_policy:
@@ -1841,8 +1884,9 @@ class CuteDslMxfp4MoEWrapper:
         return (
             SWAP_HYBRID
             and bool(do_finalize)
+            and not self._swap_wide192(num_tokens, do_finalize)
             and num_tokens * self.top_k > SWAP_HYBRID_MIN_ROUTES
-            and self._swap_tile(num_tokens) >= SWAP_HYBRID_MIN_TILE
+            and self._swap_tile(num_tokens, do_finalize) >= SWAP_HYBRID_MIN_TILE
         )
 
     def _swap_mixed(self, num_tokens, do_finalize=True):
@@ -1860,7 +1904,8 @@ class CuteDslMxfp4MoEWrapper:
             and num_tokens >= SWAP_MIXED_MIN_TOKENS
             and (self.intermediate_shard < 1024 or SWAP_MIXED_EP)
             and not self._swap_hybrid(num_tokens, do_finalize)
-            and SWAP_HYBRID_GROUP_ROWS % self._swap_tile(num_tokens) == 0
+            and not self._swap_wide192(num_tokens, do_finalize)
+            and SWAP_HYBRID_GROUP_ROWS % self._swap_tile(num_tokens, do_finalize) == 0
         )
 
     def _fused_route_cap(self, num_tokens=None, do_finalize=True):
@@ -1889,7 +1934,7 @@ class CuteDslMxfp4MoEWrapper:
             and SWAP_SPLIT_MIN_TOKENS <= num_tokens <= SWAP_SPLIT_MAX_TOKENS
             and num_tokens * self.top_k <= FUSED_ROUTE_MAX_ROUTES_LARGE
             and (self.intermediate_shard < 1024 or SWAP_SPLIT_EP)
-            and self._swap_tile(num_tokens) < SWAP_SPLIT_WIDE_TILE
+            and self._swap_tile(num_tokens, do_finalize) < SWAP_SPLIT_WIDE_TILE
             and not self._swap_hybrid(num_tokens, do_finalize)
             and not self._swap_mixed(num_tokens, do_finalize)
         )
@@ -1923,13 +1968,13 @@ class CuteDslMxfp4MoEWrapper:
             num_tokens, do_finalize
         ):
             return SWAP_HYBRID_GROUP_ROWS
-        return self._swap_tile(num_tokens)
+        return self._swap_tile(num_tokens, do_finalize)
 
     def _workspace_fields(self, num_tokens, do_finalize=True):
         if num_tokens <= 0:
             raise ValueError("num_tokens must be positive")
         if self._use_swapab(num_tokens, do_finalize):
-            tile = self._swap_tile(num_tokens)
+            tile = self._swap_tile(num_tokens, do_finalize)
             hybrid = self._swap_hybrid(num_tokens, do_finalize)
             mixed = self._swap_mixed(num_tokens, do_finalize)
             split = self._swap_split(num_tokens, do_finalize)
@@ -2008,6 +2053,7 @@ class CuteDslMxfp4MoEWrapper:
             if (
                 do_finalize
                 and not hybrid
+                and not self._swap_wide192(num_tokens, do_finalize)
                 and num_tokens > SWAP_ATOMIC_FINALIZE_MAX_TOKENS
                 and self.intermediate_shard <= SWAP_TWO_STAGE_MAX_SHARD
             ):
@@ -2116,7 +2162,7 @@ class CuteDslMxfp4MoEWrapper:
             raise ValueError(
                 "deferred output requires SiTU activation (the swap-AB path)"
             )
-        tile = self._swap_tile(num_tokens)
+        tile = self._swap_tile(num_tokens, do_finalize=False)
         return (
             get_max_num_tiles(num_tokens, self.top_k, self.num_local_experts, tile)
             * tile
@@ -2357,7 +2403,7 @@ class CuteDslMxfp4MoEWrapper:
                     beta=beta,
                     linear_beta=linear_beta,
                     output=output,
-                    n_tile=self._swap_tile(num_tokens),
+                    n_tile=self._swap_tile(num_tokens, do_finalize),
                     finalize=do_finalize,
                 )
                 swap_plan._prepare()

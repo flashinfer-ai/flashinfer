@@ -12,9 +12,17 @@ to swap the operands:
     acc[weight_rows(128) x tokens(N_TILE)] = W_e[rows x K] (A, TMA)
                                             x X[rows(N_TILE) x K]^T (B, cp.async gather)
 
-with ``N_TILE`` in {8, 16, 32, 64, 128}. Weights therefore stream through TMA
-exactly once per row group while the MMA work per weight byte drops by
-128/N_TILE. For the narrow tiles (8-32) the row operand is gathered straight
+with ``N_TILE`` in {8, 16, 32, 64, 128, 192}. Weights therefore stream through
+TMA exactly once per row group while the MMA work per weight byte drops by
+128/N_TILE. ``two_cta=True`` pairs CTAs on the 2-CTA ``tcgen05.mma``
+(``cta_group::2``): the pair multiplies 256 weight rows (128 per CTA, each CTA
+streams its own half through TMA) by one ``N_TILE``-row token tile whose rows
+are split between the two CTAs' shared memories (``N_TILE / 2`` gathered rows
+per CTA, both CTAs hold the full token scale tile), so the operand bytes per
+MMA flop drop below the dense 128-row tile's while the token padding is
+``N_TILE`` (192: the prefill form, see ``mxfp4.py``). The pair's row gather
+completes on the leader's barrier through a relay warp, as in the dense
+gather kernel. For the narrow tiles (8-32) the row operand is gathered straight
 from the unpermuted activations by a dedicated ``cp.async`` warp (GEMM1: rows
 indexed through ``permuted_idx_to_expanded_idx``; GEMM2: contiguous permuted
 rows), so no separate permute kernel is needed. The wide tiles (64, 128; or
@@ -122,11 +130,33 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         split_max_items: int = 0,
         remainder_split: bool = False,
         cluster_split: bool = False,
+        two_cta: bool = False,
     ):
         if epilogue_kind not in EPILOGUE_KINDS:
             raise ValueError(f"unknown epilogue_kind {epilogue_kind!r}")
-        if n_tile not in (8, 16, 32, 64, 128):
-            raise ValueError("n_tile must be 8, 16, 32, 64 or 128")
+        if n_tile not in (8, 16, 32, 64, 128, 192):
+            raise ValueError("n_tile must be 8, 16, 32, 64, 128 or 192")
+        # 2-CTA form (see the module docstring): 256 weight rows per work item
+        # (128 per CTA), the token tile split between the pair's shared
+        # memories, the gathered rows relayed to the leader's barrier.
+        self.two_cta = bool(two_cta)
+        self.cta_v = 2 if self.two_cta else 1
+        if self.two_cta:
+            if n_tile % 64 or n_tile < 64:
+                raise ValueError("two_cta needs n_tile in {64, 128, 192}")
+            if m_group != 1 or split_k != 1 or cluster_split or perf_probe:
+                raise ValueError(
+                    "two_cta excludes m_group > 1, split_k, cluster_split and perf_probe"
+                )
+            if row_tma:
+                raise ValueError("two_cta loads the row operand with the gather warps")
+            row_tma = False
+        elif n_tile == 192 and row_tma:
+            raise ValueError("n_tile=192 loads the row operand with the gather warps")
+        elif n_tile == 192:
+            row_tma = False
+        # Token rows of the tile held by this CTA (all of them for one CTA).
+        self.rows_cta = n_tile // self.cta_v
         if k_blocks_per_stage not in (4, 8, 12):
             # The gather warp addresses whole 128-element K atoms (one 128-byte
             # swizzle atom per FP8 row, one 512-byte SF atom per 128 rows).
@@ -212,11 +242,16 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # lower the per-thread register cap (no setmaxnreg here) and slow the
         # epilogue. With the rows on TMA the gather warps only move SF bytes.
         if gather_warps is None:
-            gather_warps = 2 if (n_tile >= 64 and not self.row_tma) else 1
+            if self.two_cta or n_tile == 192:
+                # 96-192 gathered rows per stage at the 2-CTA / 192-row MMA
+                # rate: four warps, as in the dense gather kernel.
+                gather_warps = 4
+            else:
+                gather_warps = 2 if (n_tile >= 64 and not self.row_tma) else 1
         if gather_warps not in (1, 2, 4, 8):
             raise ValueError("gather_warps must be 1, 2, 4 or 8")
-        if (n_tile // 4) % gather_warps != 0:
-            raise ValueError("gather_warps must divide the n_tile // 4 row passes")
+        if (self.rows_cta // 4) % gather_warps != 0:
+            raise ValueError("gather_warps must divide the rows_cta // 4 row passes")
         self.num_gather_warps = int(gather_warps)
         # Weight M-tiles per work item. Every mainloop stage carries ``m_group``
         # 128-row weight tiles that all multiply the same (gathered) token stage,
@@ -269,10 +304,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # and weight-scale TMA loads; weights stream once per row group.
         self.weight_l2_hint = weight_l2_hint
         self.acc_dtype = cutlass.Float32
-        self.cta_group = tcgen05.CtaGroup.ONE
-        self.cluster_shape_mn = (1, 1)
+        self.cta_group = tcgen05.CtaGroup.TWO if self.two_cta else tcgen05.CtaGroup.ONE
+        self.cluster_shape_mn = (self.cta_v, 1)
         # K is deferred to _setup_attributes
-        self.mma_tiler = (128, n_tile, 1)
+        self.mma_tiler = (128 * self.cta_v, n_tile, 1)
         self.occupancy = 1
 
         self.epilog_warp_id = (0, 1, 2, 3)
@@ -280,9 +315,17 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         self.tma_warp_id = 5
         self.sched_warp_id = 6
         self.gather_warp_id = 7
+        # 2-CTA: one relay warp per CTA forwards the gather warps' stage
+        # completions (local cp.async arrivals) to the leader's barrier.
+        self.relay_warp_id = 7 + self.num_gather_warps
+        num_relay_warps = 1 if self.two_cta else 0
         self.threads_per_warp = 32
-        self.threads_per_cta = self.threads_per_warp * (7 + self.num_gather_warps)
-        self.threads_wo_sched = self.threads_per_warp * (6 + self.num_gather_warps)
+        self.threads_per_cta = self.threads_per_warp * (
+            7 + self.num_gather_warps + num_relay_warps
+        )
+        self.threads_wo_sched = self.threads_per_warp * (
+            6 + self.num_gather_warps + num_relay_warps
+        )
         self.num_epilog_threads = self.threads_per_warp * len(self.epilog_warp_id)
 
         self.cta_sync_barrier = pipeline.NamedBarrier(
@@ -305,9 +348,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
     def _setup_attributes(self):
         self.mma_inst_shape_mn = (self.mma_tiler[0], self.mma_tiler[1])
         # SF atoms cover 32 MN rows x (4 K blocks); the row-operand SF smem tile
-        # keeps the 128-row atom layout the S2T copy expects, the gather warp
-        # fills rows [0, n_tile) of atom 0 and the MMA reads at the TMEM base.
-        self.mma_inst_shape_mn_sfb = (self.mma_inst_shape_mn[0], 128)
+        # keeps the 128-row atom layout the S2T copy expects (two atoms for the
+        # 192-row tile), the gather warp fills rows [0, n_tile) and the MMA
+        # reads at the TMEM base. Per CTA: 128 weight rows, the full token tile.
+        self.mma_inst_shape_mn_sfb = (
+            self.mma_inst_shape_mn[0] // self.cta_v,
+            cute.round_up(self.mma_inst_shape_mn[1], 128),
+        )
 
         tiled_mma = sm100_utils.make_blockscaled_trivial_tiled_mma(
             self.a_dtype,
@@ -326,7 +373,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             self.b_major_mode,
             self.sf_dtype,
             self.sf_vec_size,
-            self.cta_group,
+            tcgen05.CtaGroup.ONE,
             self.mma_inst_shape_mn_sfb,
         )
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
@@ -341,7 +388,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             self.mma_inst_shape_mn_sfb[1],
             self.mma_tiler[2],
         )
-        self.cta_tile_shape_mnk = self.mma_tiler
+        self.cta_tile_shape_mnk = (
+            self.mma_tiler[0] // self.cta_v,
+            self.mma_tiler[1],
+            self.mma_tiler[2],
+        )
         self.cta_tile_shape_mnk_sfb = self.mma_tiler_sfb
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout((*self.cluster_shape_mn, 1)), (tiled_mma.thr_id.shape,)
@@ -455,7 +506,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         sfa_one = blockscaled_utils.make_smem_layout_sfa(
             tiled_mma, mma_tiler_mnk, sf_vec_size, 1
         )
-        sfb_tiler = (mma_tiler_mnk[0], 128, mma_tiler_mnk[2])
+        sfb_tiler = (
+            cute.size(tiled_mma_sfb.shape_mnk, mode=[0]),
+            cute.size(tiled_mma_sfb.shape_mnk, mode=[1]),
+            mma_tiler_mnk[2],
+        )
         sfb_one = blockscaled_utils.make_smem_layout_sfb(
             tiled_mma_sfb, sfb_tiler, sf_vec_size, 1
         )
@@ -476,14 +531,18 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             raise ValueError("not enough shared memory for two mainloop stages")
         return num_acc_stage, num_ab_stage, num_tile_stage
 
-    @staticmethod
     def _compute_grid(
+        self,
         num_m_tiles: int,
         num_row_groups: int,
         max_active_clusters: cutlass.Constexpr,
     ):
+        # 2-CTA: the raster runs over 128-row CTA tiles in pairs (cluster M =
+        # 2), each pair sharing one work item (weight rows 256 * chunk).
         tile_sched_params = utils.PersistentTileSchedulerParams(
-            (num_m_tiles, num_row_groups, 1), (1, 1, 1), raster_along_m=True
+            (num_m_tiles, num_row_groups, 1),
+            (self.cta_v, 1, 1),
+            raster_along_m=True,
         )
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
@@ -640,7 +699,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         )
         a_copy_size = cute.size_in_bytes(self.a_dtype, a_smem_layout)
         sfa_copy_size = cute.size_in_bytes(self.sf_dtype, sfa_smem_layout)
-        self.num_tma_load_bytes = (a_copy_size + sfa_copy_size) * self.m_group
+        # 2-CTA: both CTAs' weight loads complete on the leader's barrier.
+        self.num_tma_load_bytes = (
+            (a_copy_size + sfa_copy_size) * self.m_group * self.cta_v
+        )
 
         # Row operand through TMA: gather4 over the unpermuted activations
         # (GEMM1) or a plain tile load of the permuted rows (GEMM2). Both share
@@ -711,6 +773,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             ]
             ab_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
             b_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_ab_stage * 2]
+            # 2-CTA relay of the row-operand stage completions to the leader.
+            b_relay_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.num_ab_stage * 2 if self.two_cta else 2
+            ]
             acc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_acc_stage * 2]
             tile_info_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.num_tile_stage * 2
@@ -794,7 +860,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
-            cluster=(1, 1, 2 if self.cluster_split else 1),
+            cluster=(self.cta_v, 1, 2 if self.cluster_split else 1),
             smem=self.shared_storage.size_in_bytes(),  # type: ignore[attr-defined]
             stream=stream,
             min_blocks_per_mp=1,
@@ -954,6 +1020,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
 
         bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
+        # 2-CTA: rank 0 of the pair issues the MMAs and owns the stage barriers.
+        is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(
             cute.arch.block_idx_in_cluster()
         )
@@ -989,12 +1057,27 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
+        # 2-CTA: the relay warps of both CTAs arrive on the leader's barrier
+        # once their CTA's gathered stage has landed (no empty side: the
+        # relay is throttled by the row pipeline the leader's MMA releases in
+        # both CTAs).
+        b_relay_pipeline = None
+        if cutlass.const_expr(self.two_cta):
+            b_relay_pipeline = pipeline.PipelineAsyncUmma.create(
+                barrier_storage=storage.b_relay_mbar_ptr.data_ptr(),
+                num_stages=self.num_ab_stage,
+                producer_group=pipeline.CooperativeGroup(
+                    pipeline.Agent.Thread, self.threads_per_warp * self.cta_v
+                ),
+                consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                cta_layout_vmnk=cluster_layout_vmnk,
+            )
         acc_pipeline = pipeline.PipelineUmmaAsync.create(
             barrier_storage=storage.acc_mbar_ptr.data_ptr(),
             num_stages=self.num_acc_stage,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
             consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_epilog_threads
+                pipeline.Agent.Thread, self.num_epilog_threads * self.cta_v
             ),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
@@ -1023,7 +1106,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=self.tmem_alloc_barrier,
             allocator_warp_id=self.epilog_warp_id[0],
-            is_two_cta=False,
+            is_two_cta=self.two_cta,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
         tmem.allocate(self.num_tmem_alloc_cols)
@@ -1230,7 +1313,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         sk_begin = (cur[0] - sk_chunk * self.split_k) * sk_cnt_split
                 else:
                     sk_group = cur[1]
-                    sk_chunk = cur[0]
+                    # 2-CTA: the pair's two CTA tiles share one weight chunk.
+                    sk_chunk = cur[0] // self.cta_v
                     sk_cnt = k_tile_cnt
                     sk_begin = cutlass.Int32(0)
                 if sk_group < num_valid_groups:
@@ -1361,7 +1445,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         sk_begin = (cur[0] - sk_chunk * self.split_k) * sk_cnt_split
                 else:
                     sk_group = cur[1]
-                    sk_chunk = cur[0]
+                    # 2-CTA: the pair's two CTA tiles share one weight chunk.
+                    sk_chunk = cur[0] // self.cta_v
                     sk_cnt = k_tile_cnt
                     sk_begin = cutlass.Int32(0)
                 if sk_group < num_valid_groups:
@@ -1625,15 +1710,24 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             # (row, kblock) = kt*512 + (row % 32)*16 + (row // 32)*4 + kblock.
             chunk = lane_g % 8
             row_in_pass = lane_g // 8
-            n_pass = n_tile // 4  # 4 rows x 8 16-byte chunks per warp pass
+            # 2-CTA: this CTA holds rows [cta_row0, cta_row0 + rows_cta) of the
+            # token tile (its half); the SF tile is complete in every CTA.
+            rows_cta = self.rows_cta
+            cta_row0 = mma_tile_coord_v * rows_cta
+            n_pass = rows_cta // 4  # 4 rows x 8 16-byte chunks per warp pass
             n_sf = max(1, n_tile // 32)  # 4-byte SF copies per lane per k atom
             # Passes and SF atoms are dealt round-robin over the gather warps.
             n_pass_w = (n_pass + num_gather - 1) // num_gather
             n_sf_w = (n_sf + num_gather - 1) // num_gather
             n_kt = self.k_blocks_per_stage // 4  # 128-element K atoms per stage
             k_stage = self.mma_tiler[2]
-            b_bytes_per_stage = n_tile * k_stage
-            sf_bytes_per_stage = 512 * n_kt
+            b_bytes_per_stage = rows_cta * k_stage
+            # SF smem tile: one 512-byte atom per 128 rows per K atom, the K
+            # atoms of a 128-row block contiguous, the 128-row blocks (two for
+            # the 192-row tile) after each other.
+            n_sf_blocks = (n_tile + 127) // 128
+            sf_block_bytes = 512 * n_kt
+            sf_bytes_per_stage = sf_block_bytes * n_sf_blocks
             num_rows_b = mB.shape[0]
             k_cols = mB.shape[1]
             sf_cols = mSFB.shape[1]
@@ -1668,7 +1762,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     for i in cutlass.range_constexpr(n_pass_w):
                         p = gather_sub + num_gather * i
                         row = p * 4 + row_in_pass
-                        prow = row_base + row
+                        prow = row_base + cta_row0 + row
                         ok = prow < mn_limit
                         src_row = prow
                         if cutlass.const_expr(self.gather_rows):
@@ -1703,7 +1797,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         )
                     sf_src[i] = src_row * cutlass.Int32(ok)
                     sf_ok[i] = ok
-                    sf_dst[i] = lane_g * 16 + q * 4
+                    sf_dst[i] = (q // 4) * sf_block_bytes + lane_g * 16 + (q % 4) * 4
 
                 b_producer_state.reset_count()
                 for k_tile in cutlass.range(0, tile_info[6], 1, unroll=1):  # noqa: B007
@@ -1720,7 +1814,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 row = (gather_sub + num_gather * i) * 4 + row_in_pass
                                 # sB.iterator carries the SW128 swizzle: address the
                                 # logical (k atom, row, 16-byte chunk), it applies the XOR.
-                                dst_off = kt * n_tile * 128 + row * 128 + chunk * 16
+                                dst_off = kt * rows_cta * 128 + row * 128 + chunk * 16
                                 src_off = cute.assume(
                                     row_src[i] * k_cols + k0 + kt * 128 + chunk * 16,
                                     divby=16,
@@ -1781,9 +1875,70 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             b_pipeline.producer_tail(b_producer_state)
 
         #
+        # 2-CTA relay warp: forwards this CTA's gathered stages (local cp.async
+        # arrivals) to the leader's relay barrier, one arrive per stage.
+        #
+        if cutlass.const_expr(self.two_cta):
+            if warp_idx == self.relay_warp_id:
+                relay_b_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_ab_stage
+                )
+                relay_producer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_ab_stage
+                )
+                tile_info_consumer_state = pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_tile_stage
+                )
+                tile_info = cute.make_rmem_tensor((7,), cutlass.Int32)
+                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                for i in cutlass.range_constexpr(7):
+                    tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
+                is_valid_tile = tile_info[3] == 1
+                cute.arch.fence_proxy("async.shared", space="cta")
+                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
+                while is_valid_tile:
+                    for k_tile in cutlass.range(0, tile_info[6], 1, unroll=1):  # noqa: B007
+                        b_pipeline.consumer_wait(relay_b_state)
+                        # cp.async (generic proxy) writes of this CTA -> the
+                        # leader's tcgen05 (async proxy) reads of them.
+                        cute.arch.fence_proxy("async.shared", space="cta")
+                        b_relay_pipeline.producer_commit(relay_producer_state)
+                        relay_b_state.advance()
+                        relay_producer_state.advance()
+                    tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                    for i in cutlass.range_constexpr(7):
+                        tile_info[i] = sInfo[(i, tile_info_consumer_state.index)]
+                    is_valid_tile = tile_info[3] == 1
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                    tile_info_consumer_state.advance()
+                # No producer_tail: the relay's empty barriers are never
+                # arrived on (the leader's MMA releases the row pipeline of
+                # both CTAs instead).
+
+        #
+        # MMA warp of the 2-CTA peer: no MMA issue; keep the tile-info ring
+        # and the TMEM allocation barrier in step.
+        #
+        is_peer_cta = mma_tile_coord_v != 0
+        if warp_idx == self.mma_warp_id and is_peer_cta:
+            self.tmem_alloc_barrier.arrive_and_wait()
+            tile_info_consumer_state = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Consumer, self.num_tile_stage
+            )
+            peer_valid = cutlass.Boolean(1)
+            while peer_valid:
+                tile_info_pipeline.consumer_wait(tile_info_consumer_state)
+                peer_valid = sInfo[(3, tile_info_consumer_state.index)] == 1
+                cute.arch.fence_proxy("async.shared", space="cta")
+                tile_info_pipeline.consumer_release(tile_info_consumer_state)
+                tile_info_consumer_state.advance()
+
+        #
         # MMA warp
         #
-        if warp_idx == self.mma_warp_id:
+        if warp_idx == self.mma_warp_id and is_leader_cta:
             self.tmem_alloc_barrier.arrive_and_wait()
             acc_tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
@@ -1905,7 +2060,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 # accumulator. The first stage is peeled so the ACCUMULATE
                 # flag resets each accumulator statically.
                 ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
-                b_pipeline.consumer_wait(b_consumer_state)
+                if cutlass.const_expr(self.two_cta):
+                    b_relay_pipeline.consumer_wait(b_consumer_state)
+                else:
+                    b_pipeline.consumer_wait(b_consumer_state)
                 # cp.async (generic proxy) writes -> tcgen05 (async proxy) reads
                 cute.arch.fence_proxy("async.shared", space="cta")
                 sfb_stage_coord = (None, None, None, None, ab_consumer_state.index)
@@ -1979,7 +2137,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     )
                 for k_tile in cutlass.range(1, tile_info[6], 1):  # noqa: B007
                     ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
-                    b_pipeline.consumer_wait(b_consumer_state)
+                    if cutlass.const_expr(self.two_cta):
+                        b_relay_pipeline.consumer_wait(b_consumer_state)
+                    else:
+                        b_pipeline.consumer_wait(b_consumer_state)
                     # cp.async (generic proxy) writes -> tcgen05 (async proxy) reads
                     cute.arch.fence_proxy("async.shared", space="cta")
                     sfb_stage_coord = (None, None, None, None, ab_consumer_state.index)
@@ -2220,6 +2381,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 # past num_m_tiles (partial last chunk) are skipped uniformly.
                 for je in cutlass.range_constexpr(m_group):
                     m_tile = m_chunk * m_group + je
+                    # 128-row weight tile this CTA's accumulator belongs to
+                    # (2-CTA: the pair's chunk holds two).
+                    m_tile_out = m_tile * self.cta_v + mma_tile_coord_v
                     acc_slot_e = acc_stage_index * m_group + je
                     if m_tile < num_m_tiles:
                         vals = cute.make_rmem_tensor((n_tile,), cutlass.Float32)
@@ -2306,7 +2470,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                             cutlass.Float32(1.0) / linear_beta
                                         )
                                     # act = up_out * gate_out for intermediate j = m_tile*64 + epi_tidx
-                                    j = m_tile * 64 + epi_tidx
+                                    j = m_tile_out * 64 + epi_tidx
                                     num_sub = n_tile // epi_n
                                     amax = cute.make_rmem_tensor(
                                         (epi_n,), cutlass.Float32
@@ -2373,7 +2537,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                     )
                                                     if lane == 0:
                                                         sf_kb = (
-                                                            m_tile * 2 + epi_tidx // 32
+                                                            m_tile_out * 2
+                                                            + epi_tidx // 32
                                                         )
                                                         if cutlass.const_expr(
                                                             self.sf_blocked
@@ -2408,7 +2573,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 # nothing on the TMA unit. Column validity is a predicate,
                                 # not a branch, so the unrolled shuffles pipeline.
                                 # ``vals`` already carries the expert alpha.
-                                h = m_tile * 128 + epi_tidx
+                                h = m_tile_out * 128 + epi_tidx
                                 is_even_lane = (lane % 2) == 0
                                 for c in cutlass.range_constexpr(n_tile):
                                     if cutlass.const_expr(hold_meta):
