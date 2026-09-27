@@ -515,7 +515,15 @@ def _bind_stage(
         if kind == "grid":
             arguments.append(grid[name])
         elif name in kwargs:
-            arguments.append(kwargs[name])
+            value = kwargs[name]
+            if isinstance(value, torch.Tensor):
+                # Export the tensor through DLPack once here: the launch path
+                # then hands the FFI a ready ``tvm_ffi.Tensor`` (same storage,
+                # kept alive by the DLPack deleter) instead of converting the
+                # torch tensor on every call, so a launch touches no allocator
+                # and no torch<->FFI bridge regardless of the torch build.
+                value = tvm_ffi.from_dlpack(value)
+            arguments.append(value)
         else:
             raise KeyError(
                 f"generated module {module_name!r} expects argument {name!r} "
