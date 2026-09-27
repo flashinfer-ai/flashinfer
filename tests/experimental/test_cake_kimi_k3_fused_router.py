@@ -257,11 +257,20 @@ def test_route_tables_cover_the_routed_shapes():
     assert route_arm("sm_100a", 512, 8) == "Q4S"
     assert route_arm("sm_103a", 512, 8) == "Q4S"
     for arch in SHAPE_ROUTES:
-        assert route_arm(arch, 1, 16) == "L"
+        # The arm-LC token set is exactly the set of tokens the table routes to
+        # LC (one kernel per token count: a single CTA for one token, otherwise
+        # a cluster of num_tokens CTAs).
+        assert set(ARM_LC_TOKENS) == {
+            rows for (rows, _), arm in SHAPE_ROUTES[arch].items() if arm == "LC"
+        }
         for rows in ARM_LC_TOKENS:
             assert route_arm(arch, rows, 8) == "LC"
             assert route_arm(arch, rows, 16) == "LC"
-        assert route_arm(arch, 16, 8) == "L"
+        assert route_arm(arch, 1, 8) == "LC"
+        assert route_arm(arch, 1, 16) == "LC"
+        assert route_arm(arch, 16, 8) == "LC"
+        assert route_arm(arch, 16, 16) == "LC"
+        assert route_arm(arch, 32, 8) == "L"
         assert route_arm(arch, 128, 8) == "L"
         assert route_arm(arch, 256, 16) == "M"
         assert route_arm(arch, 2048, 8) == "Q4S"
@@ -285,9 +294,12 @@ def test_persistent_grid_cap():
 def test_launch_grid_rules(compute_capability, sm_count):
     cap = persistent_grid_cap(compute_capability, sm_count)
     kw = dict(compute_capability=compute_capability, sm_count=sm_count)
-    # Arm LC: one cluster of num_tokens CTAs.
+    # Arm LC: one cluster of num_tokens CTAs (a single CTA for one token, a
+    # 16-CTA cluster for sixteen).
     for rows in ARM_LC_TOKENS:
         assert launch_grid("LC", rows, **kw) == rows
+    assert launch_grid("LC", 1, **kw) == 1
+    assert launch_grid("LC", 16, **kw) == 16
     # Arm L: at least the 128 plan owners, otherwise one CTA per token up to the cap.
     assert launch_grid("L", 1, **kw) == ARM_L_MIN_GRID
     assert launch_grid("L", 16, **kw) == ARM_L_MIN_GRID
@@ -326,7 +338,7 @@ def test_launch_grid_rules(compute_capability, sm_count):
     with pytest.raises(RuntimeError):
         launch_grid("Q4S", 64, max_active_clusters=1000, **kw)
     with pytest.raises(RuntimeError, match="exactly num_tokens"):
-        launch_grid("LC", 16, **kw)
+        launch_grid("LC", 32, **kw)
     with pytest.raises(RuntimeError, match="launch bound"):
         launch_grid("GW", 4096, compute_capability=(9, 0), sm_count=132)
     with pytest.raises(ValueError):

@@ -26,9 +26,11 @@ cooperative persistent grid bounded by the device's SM count (arm Q4S
 additionally uses 4-CTA clusters at four CTAs per SM and is bounded by the
 driver's co-resident cluster capacity; arm GW, the warp-per-row two-join
 kernel for the largest batches, uses a per-architecture CTAs-per-SM bound);
-arm LC
-launches one non-cooperative cluster of ``num_tokens`` CTAs for the smallest
-batches.  Nothing is planned on the host and nothing is allocated
+arm LC serves the smallest batches with one non-cooperative kernel per token
+count: a single CTA for one token, otherwise one cluster of ``num_tokens``
+CTAs (2, 4, 8 or 16; the 16-CTA cluster is above the portable maximum of 8
+and the generated program opts into it with the non-portable cluster-size
+attribute).  Nothing is planned on the host and nothing is allocated
 at launch, so a prepared runner is CUDA Graph safe.  See ``README.md`` in
 this package.
 """
@@ -64,8 +66,11 @@ OWNER_CTAS = NUM_EXPERTS // NUM_WARPS
 ARM_L_MAX_TOKENS = 512
 # Arm L launches at least this many CTAs (the plan owners) whatever num_tokens is.
 ARM_L_MIN_GRID = 128
-# Arm LC: one kernel per row count, launched as a single cluster of num_tokens CTAs.
-ARM_LC_TOKENS = (2, 4, 8)
+# Arm LC: one kernel per token count, launched as a single cluster of num_tokens
+# CTAs (a single CTA for one token).  The 16-token kernel is a 16-CTA cluster,
+# above the portable maximum of 8: the generated program sets the non-portable
+# cluster-size attribute on that kernel before the launch.
+ARM_LC_TOKENS = (1, 2, 4, 8, 16)
 # Arm GW: persistent grid of CTAs-per-SM x SM count (launch bounds of the kernel,
 # __launch_bounds__(224, 4) on both architectures).
 ARM_GW_CTAS_PER_SM = {(10, 0): 4, (10, 3): 4}
@@ -96,16 +101,16 @@ MAIN_KWARGS = (
 # Per-shape dispatch arm, keyed by (num_tokens, block_m).  Both tables cover
 # the same 28 shapes with the same arms.
 _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
-    (1, 8): "L",
-    (1, 16): "L",
+    (1, 8): "LC",
+    (1, 16): "LC",
     (2, 8): "LC",
     (2, 16): "LC",
     (4, 8): "LC",
     (4, 16): "LC",
     (8, 8): "LC",
     (8, 16): "LC",
-    (16, 8): "L",
-    (16, 16): "L",
+    (16, 8): "LC",
+    (16, 16): "LC",
     (32, 8): "L",
     (32, 16): "L",
     (64, 8): "L",
