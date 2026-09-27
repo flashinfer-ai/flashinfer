@@ -77,8 +77,7 @@ static void BatchMLAPagedAttentionSM90RunImpl(
         params.kpe = static_cast<DTypeKV*>(kpe_cache.data_ptr());
 
         if (maybe_kv_len.has_value()) {
-          TVM_FFI_ICHECK(has_batch_metadata)
-              << "device KV lengths require planned batch metadata";
+          TVM_FFI_ICHECK(has_batch_metadata) << "device KV lengths require planned batch metadata";
           TVM_FFI_ICHECK(maybe_qo_indptr.has_value())
               << "qo_indptr is required when kv_len is provided";
           const TensorView& qo_indptr = maybe_qo_indptr.value();
