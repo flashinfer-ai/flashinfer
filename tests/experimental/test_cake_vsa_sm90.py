@@ -145,20 +145,25 @@ def test_small_route_rule(h, mb, nb, capacity, expected):
         assert h * mb * (expected[0] + PLAN_META_UNSPLIT) <= PLAN_HALFWORDS
 
 
-def test_cluster_route_prefers_split_on_ragged_selections():
-    """A cluster launches csize CTAs for every query block: ragged 1..8 selections stay on the split route."""
+def test_sliced_routes_take_the_cheaper_modelled_variant():
+    """Below the persistent kernel's occupancy the split and cluster variants are compared by
+    their modelled cost: ragged 1..8 selections over 64 query blocks take the two-CTA cluster
+    (two-warpgroup chain of two blocks, one DSM merge) and 16 uniform selections the 4 x 4 cluster."""
     ragged = torch.zeros((4, 16, 16), dtype=torch.bool)
     for t in range(64):
         ragged.reshape(64, 16)[t, : 1 + t % 8] = True
     counts = ragged.sum(-1).reshape(-1).tolist()
     kmax, split, cluster = small_route(ragged, sms=132)
-    assert split and cluster == 0 and kmax == split_kmax(counts, sms=132)
-    assert (
-        cluster_variant_for(counts, sms=132) is not None
-    )  # a variant fits; it is just costlier
+    assert (kmax, split, cluster) == (4, False, 2)
+    assert split_kmax(counts, sms=132) in (
+        3,
+        4,
+        6,
+    )  # a split variant fits; it is just costlier
+    assert cluster_variant_for(counts, sms=132) == (4, 2)
     uniform = torch.zeros((1, 16, 16), dtype=torch.bool)
     uniform[..., :16] = True
-    assert small_route(uniform, sms=132) == (3, False, 6)
+    assert small_route(uniform, sms=132) == (4, False, 4)
 
 
 def test_plan_small_cluster_rows_pad_every_query_block():
@@ -556,9 +561,16 @@ def _mode_of(rule):
 @pytest.mark.parametrize(
     "h,mb,nb,capacity,scale,ragged",
     [
-        (1, 16, 16, 16, None, False),  # the benchmark's h1-m1024-k16 row -> k3c6
+        (1, 16, 16, 16, None, False),  # the benchmark's h1-m1024-k16 row -> k4c4
         (1, 16, 64, 16, 0.5, True),  # padded slices
-        (4, 16, 16, 8, None, True),  # forced: the ragged 8-block row (auto keeps split)
+        (
+            4,
+            16,
+            16,
+            8,
+            None,
+            True,
+        ),  # the ragged 8-block row (auto routes it to the 4 x 2 cluster)
         (3, 5, 10, 9, -0.125, True),
         (1, 1, 2, 2, 1e-7, False),  # two blocks over four ranks
         (2, 8, 64, 18, 0.0, False),  # 18 blocks: kmax 6 x 3
@@ -607,8 +619,8 @@ def test_cluster_plan_stream_and_graph_lifetime():
     with torch.cuda.stream(producer):
         plan = CakeVsaSm90Plan("cuda", mask, rows, cols, h, h, 128)
     assert plan.mode == "smallcluster" and (plan.small_kmax, plan.small_cluster) == (
-        3,
-        6,
+        4,
+        4,
     )
     q, k, v = _inputs(h, mb, nb)
     expected = plan.run(q, k, v).clone()
