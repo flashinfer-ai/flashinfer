@@ -479,10 +479,31 @@ def norm_kernel_key(early_trigger: bool) -> str:
     return f"tail_norm:e{1 if early_trigger else 0}"
 
 
+# Ring depth of the prefill tail GEMM per row (Cake round-6 lever ledger, mirrored from
+# ``kimi_k3_latent_moe_tail.tail_gemm_config_for``): 6 stages for the TP1 rows at
+# T <= 256 (+1.0..+1.2 % in five paired samples on B200 and B300), 7 everywhere else.
+TAIL_NUM_STAGES = 7
+TAIL_RING6_TP = 1
+TAIL_RING6_MAX_T = 256
+TAIL_RING6_STAGES = 6
+
+
+def tail_gemm_num_stages(M: int, tp: int) -> int:
+    if int(tp) == TAIL_RING6_TP and int(M) <= TAIL_RING6_MAX_T:
+        return TAIL_RING6_STAGES
+    return TAIL_NUM_STAGES
+
+
 def tail_gemm_kernel_key(
-    tp: int, weights_evict_first: bool, fused_norm: bool = False
+    tp: int,
+    weights_evict_first: bool,
+    fused_norm: bool = False,
+    num_stages: int = TAIL_NUM_STAGES,
 ) -> str:
-    return f"tail_gemm:tp{int(tp)}e{1 if weights_evict_first else 0}f{1 if fused_norm else 0}"
+    key = f"tail_gemm:tp{int(tp)}e{1 if weights_evict_first else 0}f{1 if fused_norm else 0}"
+    if int(num_stages) != TAIL_NUM_STAGES:
+        key += f"s{int(num_stages)}"
+    return key
 
 
 def _sk_max_seg(sk_tiles: int, num_k: int, ipc: int) -> int:
@@ -596,6 +617,7 @@ def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, An
         early_trigger=bool(early),
         weights_evict_first=bool(weights_evict_first(gemm_grid, sm_count)),
         fused_norm=bool(use_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)),
+        num_stages=tail_gemm_num_stages(M, tp),
         **sk,
     )
 
@@ -628,7 +650,9 @@ def route_kernel_keys(
                 ),
             )
         plan = prefill_tail_plan(num_tokens, tp, sm_count)
-        gemm = tail_gemm_kernel_key(tp, plan["weights_evict_first"], plan["fused_norm"])
+        gemm = tail_gemm_kernel_key(
+            tp, plan["weights_evict_first"], plan["fused_norm"], plan["num_stages"]
+        )
         if plan["fused_norm"]:
             return (gemm,)
         return (norm_kernel_key(plan["early_trigger"]), gemm)
@@ -1070,7 +1094,7 @@ def prepare_kimi_k3_latent_moe_tail(
                 device, plan["sk_tiles"], plan["sk_max_seg"]
             )
             gemm_key = tail_gemm_kernel_key(
-                tp, plan["weights_evict_first"], plan["fused_norm"]
+                tp, plan["weights_evict_first"], plan["fused_norm"], plan["num_stages"]
             )
             gemm_kwargs = dict(
                 A1=y_workspace,

@@ -203,14 +203,18 @@ def test_route_keys_cover_the_row_set():
     assert {k for k in keys if k.startswith("tail_gemm:")} == {
         "tail_gemm:tp1e0f0",
         "tail_gemm:tp1e1f1",
+        "tail_gemm:tp1e1f1s6",
         "tail_gemm:tp8e0f0",
         "tail_gemm:tp8e1f0",
     }
     assert route_kernel_keys("front", 1, 128)[0].startswith("decode:")
     assert route_kernel_keys("front", 1, 256) == ("front:i6144",)
     assert route_kernel_keys("tail", 8, 256) == ("tail_norm:e1", "tail_gemm:tp8e1f0")
-    # TP1 single-wave rows fuse the norm into the GEMM launch (no tail_norm kernel).
-    assert route_kernel_keys("tail", 1, 256) == ("tail_gemm:tp1e1f1",)
+    # TP1 single-wave rows fuse the norm into the GEMM launch (no tail_norm kernel); the T <= 256 row
+    # takes the 6-deep ring instance (round-6 rule), T = 512 the default 7-deep ring.
+    assert route_kernel_keys("tail", 1, 256) == ("tail_gemm:tp1e1f1s6",)
+    assert cb.tail_gemm_num_stages(256, 1) == 6 and cb.tail_gemm_num_stages(512, 1) == 7
+    assert cb.tail_gemm_num_stages(256, 8) == 7
     # Single-wave grids (T = 256 / 512) stream the weights evict_first; persistent grids keep the default policy.
     assert route_kernel_keys("tail", 1, 512) == ("tail_gemm:tp1e1f1",)
     assert route_kernel_keys("tail", 1, 1024)[1] == "tail_gemm:tp1e0f0"
