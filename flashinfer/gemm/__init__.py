@@ -37,6 +37,12 @@ from .cake_grouped_fp8_gemm import (
 from .cake_grouped_fp8_gemm import (
     prepare_group_gemm_fp8_nt_groupwise_contiguous as prepare_group_gemm_fp8_nt_groupwise_contiguous,
 )
+from .cake_grouped_fp8_fused_silu_quant import (
+    PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant as PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant,
+)
+from .cake_grouped_fp8_fused_silu_quant import (
+    prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant as prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant,
+)
 from .kimi_k3_fp8_projection import (
     allocate_kimi_k3_fp8_projection_workspace as allocate_kimi_k3_fp8_projection_workspace,
 )
@@ -164,6 +170,8 @@ __all__ = (
         "group_gemm_fp8_nt_groupwise_contiguous",
         "prepare_group_gemm_fp8_nt_groupwise_contiguous",
         "PreparedGroupGemmFp8NtGroupwiseContiguous",
+        "prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant",
+        "PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant",
         "allocate_kimi_k3_fp8_projection_workspace",
         "kimi_k3_fp8_projection",
         "prepare_kimi_k3_fp8_projection",
