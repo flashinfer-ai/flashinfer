@@ -21,7 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ...jit import env as jit_env
-from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags, sm107a_nvcc_flags
 
 # Explicit target-owned registration of the generated programs.  One record per
 # (architecture, route, split-KV factor): the ``swap_tsk`` records (one per
@@ -509,6 +509,7 @@ STAGES = ("main",)
 ARCH_NVCC_FLAGS = {
     "sm_100a": sm100a_nvcc_flags,
     "sm_103a": sm103a_nvcc_flags,
+    "sm_107a": sm107a_nvcc_flags,
 }
 
 
