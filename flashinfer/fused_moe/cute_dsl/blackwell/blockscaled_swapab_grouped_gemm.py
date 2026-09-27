@@ -120,6 +120,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         pdl_trigger_after_wait: bool = False,
         split_k: int = 1,
         split_max_items: int = 0,
+        remainder_split: bool = False,
         cluster_split: bool = False,
     ):
         if epilogue_kind not in EPILOGUE_KINDS:
@@ -175,16 +176,26 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # onto two independent items (the original raster), so the cluster
         # only groups CTAs.
         self.cluster_split = bool(cluster_split)
+        # Remainder-only split: the full waves of the unsplit raster run as
+        # they are; the items of the last partial wave are split across
+        # the two CTAs of a cluster pair when they fit the pairs (the
+        # single-wave launch is the special case of no full wave). Off: the
+        # grid-uniform rule (every item split or none).
+        self.remainder_split = bool(remainder_split) and self.cluster_split
         if self.cluster_split:
             if epilogue_kind != "situ_mxfp8" or self.split_k != 2:
-                raise ValueError("cluster_split needs the situ_mxfp8 epilogue and split_k=2")
+                raise ValueError(
+                    "cluster_split needs the situ_mxfp8 epilogue and split_k=2"
+                )
             if m_group != 1 or n_tile > 32:
                 raise ValueError("cluster_split needs m_group=1 and n_tile <= 32")
         if self.split_k > 1 and epilogue_kind != "finalize" and not self.cluster_split:
             raise ValueError("split_k > 1 requires the finalize epilogue")
         self.pdl_trigger_after_wait = bool(pdl_trigger_after_wait)
         if self.pdl_trigger_early and self.pdl_trigger_after_wait:
-            raise ValueError("pdl_trigger_early and pdl_trigger_after_wait are exclusive")
+            raise ValueError(
+                "pdl_trigger_early and pdl_trigger_after_wait are exclusive"
+            )
         self.use_linear_beta = use_linear_beta
         # GEMM1 gathers activation rows through the permuted->expanded map;
         # GEMM2 reads the already-permuted GEMM1 output rows contiguously.
@@ -1148,7 +1159,28 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         sk_cnt_split = k_tile_cnt // self.split_k
         sk_do_split = cutlass.Boolean(0)
         sk_m_chunks = (num_m_tiles + m_group - 1) // m_group
-        if cutlass.const_expr(self.split_k > 1):
+        sk_full = cutlass.Int32(0)
+        sk_rem = cutlass.Int32(0)
+        if cutlass.const_expr(self.split_k > 1 and self.remainder_split):
+            # Items of the full waves run unsplit (round robin over the
+            # CTAs); the last partial wave's items are split across the
+            # cluster pairs when they fit them (the single-wave case of the
+            # grid-uniform rule is the special case of no full wave).
+            # The CTA budget is the compile-time constant behind
+            # ``split_max_items`` (the persistent grid is min(tiles, budget);
+            # a smaller grid means fewer items than the budget, i.e. no full
+            # wave, and the rule reduces to the single-wave one). A runtime
+            # division by ``grid_dim()`` here would make the decision
+            # non-provably warp-uniform and push the whole kernel off the
+            # uniform datapath (measured: +31 % on the single-tile chain);
+            # the scheduler mapping below is branch-free for the same reason.
+            sk_ctas = self.split_max_items * 2
+            sk_items = cutlass.Int32(num_valid_groups * sk_m_chunks)
+            sk_waves = sk_items // sk_ctas
+            sk_full = sk_waves * sk_ctas
+            sk_rem = sk_items - sk_full
+            sk_do_split = (sk_rem > 0) & (sk_rem <= self.split_max_items)
+        elif cutlass.const_expr(self.split_k > 1):
             sk_do_split = (num_valid_groups * sk_m_chunks) <= cutlass.Int32(
                 self.split_max_items
             )
@@ -1173,7 +1205,25 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     sk_chunk = sk_lin - sk_group * sk_m_chunks
                     sk_cnt = k_tile_cnt
                     sk_begin = cutlass.Int32(0)
-                    if sk_do_split:
+                    if cutlass.const_expr(self.remainder_split):
+                        # Remainder mapping (branch-free, see the decision
+                        # above): items below ``sk_full`` keep the unsplit
+                        # raster; pair p = (lin - full) // 2 takes item
+                        # full + p, its two CTAs the two K halves; pairs past
+                        # ``sk_rem`` have no item.
+                        sk_off = sk_lin - sk_full
+                        sk_pair = sk_off // 2
+                        sk_item = sk_full + sk_pair
+                        sk_in_rem = cutlass.Int32(sk_do_split & (sk_lin >= sk_full))
+                        sk_valid = sk_in_rem * cutlass.Int32(sk_pair < sk_rem)
+                        sk_skip = sk_in_rem - sk_valid
+                        sk_lin_item = sk_lin * (1 - sk_in_rem) + sk_item * sk_in_rem
+                        sk_group = sk_lin_item // sk_m_chunks
+                        sk_chunk = sk_lin_item - sk_group * sk_m_chunks
+                        sk_group = sk_group * (1 - sk_skip) + num_valid_groups * sk_skip
+                        sk_cnt = k_tile_cnt - (k_tile_cnt - sk_cnt_split) * sk_valid
+                        sk_begin = (sk_off - sk_pair * 2) * sk_cnt_split * sk_valid
+                    elif sk_do_split:
                         sk_group = cur[1]
                         sk_chunk = cur[0] // self.split_k
                         sk_cnt = sk_cnt_split
@@ -1286,7 +1336,25 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     sk_chunk = sk_lin - sk_group * sk_m_chunks
                     sk_cnt = k_tile_cnt
                     sk_begin = cutlass.Int32(0)
-                    if sk_do_split:
+                    if cutlass.const_expr(self.remainder_split):
+                        # Remainder mapping (branch-free, see the decision
+                        # above): items below ``sk_full`` keep the unsplit
+                        # raster; pair p = (lin - full) // 2 takes item
+                        # full + p, its two CTAs the two K halves; pairs past
+                        # ``sk_rem`` have no item.
+                        sk_off = sk_lin - sk_full
+                        sk_pair = sk_off // 2
+                        sk_item = sk_full + sk_pair
+                        sk_in_rem = cutlass.Int32(sk_do_split & (sk_lin >= sk_full))
+                        sk_valid = sk_in_rem * cutlass.Int32(sk_pair < sk_rem)
+                        sk_skip = sk_in_rem - sk_valid
+                        sk_lin_item = sk_lin * (1 - sk_in_rem) + sk_item * sk_in_rem
+                        sk_group = sk_lin_item // sk_m_chunks
+                        sk_chunk = sk_lin_item - sk_group * sk_m_chunks
+                        sk_group = sk_group * (1 - sk_skip) + num_valid_groups * sk_skip
+                        sk_cnt = k_tile_cnt - (k_tile_cnt - sk_cnt_split) * sk_valid
+                        sk_begin = (sk_off - sk_pair * 2) * sk_cnt_split * sk_valid
+                    elif sk_do_split:
                         sk_group = cur[1]
                         sk_chunk = cur[0] // self.split_k
                         sk_cnt = sk_cnt_split
@@ -1456,7 +1524,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                             tAgA_sj = tAgA_s3
                             tAgSFA_sj = tAgSFA_s3
                         tAgA_k = tAgA_sj[(None, tile_info[5] + ab_producer_state.count)]
-                        tAgSFA_k = tAgSFA_sj[(None, tile_info[5] + ab_producer_state.count)]
+                        tAgSFA_k = tAgSFA_sj[
+                            (None, tile_info[5] + ab_producer_state.count)
+                        ]
                         tAsA_pipe = tAsA[(None, slot_t)]
                         tAsSFA_pipe = tAsSFA[(None, slot_t)]
                         if cutlass.const_expr(self.weight_l2_hint is not None):
@@ -1488,7 +1558,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     if cutlass.const_expr(self.row_tma):
                         tBsB_pipe = tBsB[(None, ab_producer_state.index)]
                         if cutlass.const_expr(self.gather_rows):
-                            b_crd = (None, (row_group, tile_info[5] + ab_producer_state.count))
+                            b_crd = (
+                                None,
+                                (row_group, tile_info[5] + ab_producer_state.count),
+                            )
                             cute.copy(
                                 tma_atom_b,
                                 [tBgB[b_crd], tBgI[b_crd]],
@@ -1498,7 +1571,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         else:
                             cute.copy(
                                 tma_atom_b,
-                                tBgB_slice[(None, tile_info[5] + ab_producer_state.count)],
+                                tBgB_slice[
+                                    (None, tile_info[5] + ab_producer_state.count)
+                                ],
                                 tBsB_pipe,
                                 tma_bar_ptr=tma_bar,
                             )
@@ -1665,7 +1740,12 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                     # 512-byte SF atom per 128-wide K atom.
                                     sf_src_off = cute.assume(
                                         sf_src[i]
-                                        + ((tile_info[5] + b_producer_state.count) * n_kt + kt) * 512,
+                                        + (
+                                            (tile_info[5] + b_producer_state.count)
+                                            * n_kt
+                                            + kt
+                                        )
+                                        * 512,
                                         divby=4,
                                     )
                                 else:
@@ -2076,9 +2156,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             cs_remote_full = cutlass.Int32(0)
             cs_remote_empty = cutlass.Int32(0)
             if cutlass.const_expr(self.cluster_split):
-                cs_remote_red = mapa_shared_cluster_u32(
-                    storage.sRed.data_ptr(), cutlass.Int32(0)
-                ) + cutlass.Int32(4) * epi_tidx
+                cs_remote_red = (
+                    mapa_shared_cluster_u32(storage.sRed.data_ptr(), cutlass.Int32(0))
+                    + cutlass.Int32(4) * epi_tidx
+                )
                 cs_remote_full = mapa_shared_cluster_u32(
                     storage.red_full_mbar.ptr, cutlass.Int32(0)
                 )
@@ -2221,11 +2302,15 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                         linear_beta = cutlass.Float32(
                                             situ_linear_beta[lb_idx]
                                         )
-                                        inv_linear_beta = cutlass.Float32(1.0) / linear_beta
+                                        inv_linear_beta = (
+                                            cutlass.Float32(1.0) / linear_beta
+                                        )
                                     # act = up_out * gate_out for intermediate j = m_tile*64 + epi_tidx
                                     j = m_tile * 64 + epi_tidx
                                     num_sub = n_tile // epi_n
-                                    amax = cute.make_rmem_tensor((epi_n,), cutlass.Float32)
+                                    amax = cute.make_rmem_tensor(
+                                        (epi_n,), cutlass.Float32
+                                    )
                                     for sub in cutlass.range_constexpr(num_sub):
                                         # One 32-column subtile per gate exchange so the
                                         # exchange buffer is independent of n_tile.
@@ -2247,7 +2332,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                             * inv_linear_beta
                                                         )
                                                     )
-                                        cute.arch.fence_proxy("async.shared", space="cta")
+                                        cute.arch.fence_proxy(
+                                            "async.shared", space="cta"
+                                        )
                                         self.epilog_sync_barrier.arrive_and_wait()
                                         if not is_gate_lane:
                                             for c in cutlass.range_constexpr(epi_n):
@@ -2277,10 +2364,17 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                     inv_scale = ue8m0_to_inv_scale_fast(
                                                         scale_code
                                                     )
-                                                    q = vals[sub * epi_n + c] * inv_scale
-                                                    out[(prow, j, 0)] = q.to(self.out_dtype)
+                                                    q = (
+                                                        vals[sub * epi_n + c]
+                                                        * inv_scale
+                                                    )
+                                                    out[(prow, j, 0)] = q.to(
+                                                        self.out_dtype
+                                                    )
                                                     if lane == 0:
-                                                        sf_kb = m_tile * 2 + epi_tidx // 32
+                                                        sf_kb = (
+                                                            m_tile * 2 + epi_tidx // 32
+                                                        )
                                                         if cutlass.const_expr(
                                                             self.sf_blocked
                                                         ):
@@ -2293,11 +2387,15 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                                     sf_kb // 4,
                                                                     0,
                                                                 )
-                                                            ] = scale_code.to(cutlass.Uint8)
+                                                            ] = scale_code.to(
+                                                                cutlass.Uint8
+                                                            )
                                                         else:
                                                             # plain (rows, I/32) scale bytes; j // 32
                                                             out_sf[(prow, sf_kb)] = (
-                                                                scale_code.to(cutlass.Uint8)
+                                                                scale_code.to(
+                                                                    cutlass.Uint8
+                                                                )
                                                             )
                                         # The exchange buffer is reused by the next subtile.
                                         self.epilog_sync_barrier.arrive_and_wait()

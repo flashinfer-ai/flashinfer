@@ -94,6 +94,11 @@ SWAP_META_IN_SCHED = os.environ.get("SWAPAB_META", "sched") != "epi"
 # Each 128x128 MMA tile becomes one contiguous 8 KB block so the weight TMA
 # streams whole DRAM pages (B300: GEMM1 -2%, GEMM2 -2.5% at T=16 balanced).
 SWAP_TILED_WEIGHTS = int(os.environ.get("SWAPAB_TILED_W", "3"))
+# Cluster split-K of the swap GEMM1 on the last partial wave only (the full
+# waves run unsplit; B300 EP8 T=2/4/8/16 balanced and remote-dominated rows
+# -2 to -7 %, single-wave rows unchanged); ``SWAPAB_REMAINDER_SPLIT=0``
+# keeps the grid-uniform rule (split only when every item fits half the CTAs).
+SWAP_REMAINDER_SPLIT = int(os.environ.get("SWAPAB_REMAINDER_SPLIT", "1"))
 
 _tiled_weight_cache: "OrderedDict[Tuple, Tuple[torch.Tensor, torch.Tensor]]" = (
     OrderedDict()
@@ -372,6 +377,7 @@ def _get_compiled_swapab_kernel(
     split_k: int = 1,
     split_max_items: int = 0,
     cluster_split: bool = False,
+    remainder_split: bool = False,
 ):
     import os
     import sys
@@ -416,6 +422,7 @@ def _get_compiled_swapab_kernel(
         split_k,
         split_max_items,
         cluster_split,
+        remainder_split,
     )
     if key not in _swapab_kernel_cache:
         if os.environ.get("SWAPAB_DEBUG"):
@@ -445,6 +452,7 @@ def _get_compiled_swapab_kernel(
             split_k=split_k,
             split_max_items=split_max_items,
             cluster_split=cluster_split,
+            remainder_split=remainder_split,
         )
         _swapab_kernel_cache[key] = cute.compile(
             kernel.wrapper,
@@ -608,6 +616,7 @@ def swapab_gemm1_situ(
         split_k=split_k,
         split_max_items=split_max_items,
         cluster_split=cluster_split,
+        remainder_split=bool(SWAP_REMAINDER_SPLIT) and cluster_split,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm1"] = (compiled, args)
