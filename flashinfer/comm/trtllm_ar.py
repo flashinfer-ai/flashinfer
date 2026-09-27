@@ -366,16 +366,16 @@ def _cake_moe_allreduce_union_applies(
     device_index: int,
     moe_allreduce_out: Optional[torch.Tensor],
 ) -> bool:
-    """Select the verified SM100 world-size-4 source export of the Cake union.
+    """Select the verified SM100 source export of the Cake union.
 
-    The union export covers exactly the routes it validated: four ranks,
-    SM100, hidden_dim 7168, FP16/BF16, residual + norm outputs and the
+    The union export covers exactly the routes it validated: world sizes 2, 4
+    and 8, SM100, hidden_dim 7168, FP16/BF16, residual + norm outputs and the
     all-reduce output. Every other Cake configuration stays on the legacy
     isolated source bundle.
     """
-    from ..jit.cake_trtllm_moe_allreduce_union import WORLD_SIZE, route_applies
+    from ..jit.cake_trtllm_moe_allreduce_union import WORLD_SIZES, route_applies
 
-    if world_size != WORLD_SIZE or moe_allreduce_out is None:
+    if int(world_size) not in WORLD_SIZES or moe_allreduce_out is None:
         return False
     return route_applies(
         world_size=world_size,
@@ -631,8 +631,8 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     workspace_tensor = torch.tensor(
         workspace, dtype=torch.int64, device=torch.device("cuda")
     )
-    # The SM100 world-size-4 Cake MoE all-reduce route binds the control and
-    # per-rank payload addresses of this table as raw pointers; keep the
+    # The SM100 Cake MoE all-reduce union route (world sizes 2, 4 and 8) binds
+    # the control and per-rank payload addresses of this table as raw pointers; keep the
     # host-known values so no launch ever reads the table back from the device.
     register_cake_moe_allreduce_workspace_pointers(workspace_tensor, workspace)
 
@@ -1128,8 +1128,8 @@ def trtllm_moe_allreduce_fusion(
       and 8, hidden_dim=7168, token payloads within the existing Lamport
       ``MAX_COMM_SIZE`` byte limit, and residual plus norm outputs. It does not
       support quantization. ``weight_bias`` remains a runtime value; ``None`` is
-      passed to the kernel as 0.0. On SM100 with ``world_size=4`` and an
-      ``moe_allreduce_out`` tensor, ``"cake"`` runs the verified source export
+      passed to the kernel as 0.0. On SM100 with ``world_size`` 2, 4 or 8 and
+      an ``moe_allreduce_out`` tensor, ``"cake"`` runs the verified source export
       of the Cake all-reduce union (``flashinfer.jit.cake_trtllm_moe_allreduce_union``);
       the route binds the workspace pointer table the way
       ``trtllm_create_ipc_workspace_for_all_reduce_fusion`` registers it and
