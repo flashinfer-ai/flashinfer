@@ -655,9 +655,13 @@ def _store_vec(data_ptr: int, ldo: int) -> int:
     return 2
 
 
-def gemm_tma_store_eligible(data_ptr: int, ldo: int) -> bool:
-    """The output view can be a TMA tensor map: 16-byte base and a row stride that is a multiple of 16 bytes."""
-    return data_ptr % 16 == 0 and ldo % 8 == 0
+def gemm_tma_store_eligible(data_ptr: int, ldo: int, n_valid: int) -> bool:
+    """The output view can be a TMA tensor map: 16-byte base, a row stride that is a multiple of 16 bytes and a
+    16-byte column edge.  The TMA unit bounds-checks the inner (contiguous) axis of a store at 16-byte granularity,
+    so a map whose inner extent is not a multiple of 16 bytes writes the rest of the edge chunk (``n_valid = 6284``
+    with a 16-byte row stride stored columns 6284..6287 of the caller's padding); such views keep the predicated
+    register epilogue."""
+    return data_ptr % 16 == 0 and ldo % 8 == 0 and n_valid % 8 == 0
 
 
 GEMM_TS_COLS = 128, 32  # [rows, BF16 columns] of the ``OUT`` descriptor placeholder of the register-epilogue GEMM
@@ -892,7 +896,7 @@ def prepare_kimi_k3_fp8_projection(
     q, sf = workspace
     ldo = int(out.stride(0))
     plan = route_plan(
-        prepared, M, arch, sm_count, gemm_tma_store_eligible(out.data_ptr(), ldo)
+        prepared, M, arch, sm_count, gemm_tma_store_eligible(out.data_ptr(), ldo, prepared.n_valid)
     )
     out_flat = torch.as_strided(
         out, (ldo * (M - 1) + prepared.n_valid,), (1,), out.storage_offset()

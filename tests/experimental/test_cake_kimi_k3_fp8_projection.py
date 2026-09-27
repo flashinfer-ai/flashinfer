@@ -67,6 +67,8 @@ GPU_ROWS = [
     ("tp8", "kv_b", 129, 4),
     ("tp1", "kv_b", 256, 0),
     ("tp8", "q_proj", 1000, 0),
+    # 16-byte row stride (6288) with a column edge (6284) that is not: register epilogue, padding untouched
+    ("tp8", "in_proj_qkvgfab", 1000, 4),
     ("tp8", "q_b", 4096, 0),
     ("tp1", "o_proj", 4097, 4),
     ("tp8", "f_a", 4096, 0),  # narrow-N large-M row: tabulated fused decode route above DECODE_MAX_M
@@ -329,7 +331,9 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
     plan = runner.plan
     assert plan.route in ("decode", "gemm")
     if plan.route == "gemm":
-        aligned = cb.gemm_tma_store_eligible(_out.data_ptr(), _out.stride(0))
+        aligned = cb.gemm_tma_store_eligible(
+            _out.data_ptr(), _out.stride(0), _prepared.n_valid
+        )
         assert plan.kernels[-1] == ("gemm_tstore" if aligned else "gemm")
     if plan.route == "decode" and plan.decode.fused:
         assert runner.launch_count == 1
