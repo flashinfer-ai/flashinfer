@@ -1363,8 +1363,11 @@ def dequantize_block(
     if x_quant.dim() == 2:  # For activation tensors [batch_size, hidden_size]
         batch_size, hidden_size = x_quant.shape
         num_blocks = (hidden_size + 127) // 128
-        scales = scales.view(batch_size, num_blocks, 1).expand(-1, -1, 128)
-        scales = scales[:, :, : hidden_size % 128] if hidden_size % 128 != 0 else scales
+        scales = (
+            scales.view(batch_size, num_blocks, 1)
+            .expand(-1, -1, 128)
+            .reshape(batch_size, num_blocks * 128)[:, :hidden_size]
+        )
     else:  # For weight tensors [..., in_dim, out_dim]
         *_dims, in_dim, out_dim = x_quant.shape
 
@@ -1404,6 +1407,49 @@ def test_moe_fp8_block_scaling(
         top_k: Number of experts to route to per token
         intermediate_size: Intermediate dimension size
     """
+    _check_moe_fp8_block_scaling(
+        batch_size, hidden_size, num_experts, top_k, intermediate_size
+    )
+
+
+@pytest.mark.parametrize(
+    "batch_size, num_experts, top_k, routing",
+    [
+        (1, 256, 8, "random"),
+        (4, 256, 8, "last"),
+        (5, 37, 6, "random"),
+        (16, 64, 6, "first"),
+        (48, 128, 8, "random"),
+        (64, 160, 6, "last"),
+    ],
+)
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_fp8_block_scaling_many_experts(batch_size, num_experts, top_k, routing):
+    """FP8 block-scale MoE with many mostly empty experts.
+
+    The grouped GEMMs walk all expert groups to find each tile, so this covers skipping runs of
+    empty groups (routing to the first or last experts only), group counts that are not a
+    multiple of the scheduler lookahead, and both the swap-AB (small M) and normal kernels.
+    """
+    selected_experts = None
+    if routing != "random":
+        first = 0 if routing == "first" else num_experts - top_k
+        selected_experts = torch.stack(
+            [first + torch.randperm(top_k) for _ in range(batch_size)]
+        ).cuda()
+    _check_moe_fp8_block_scaling(
+        batch_size, 128, num_experts, top_k, 128, selected_experts=selected_experts
+    )
+
+
+def _check_moe_fp8_block_scaling(
+    batch_size,
+    hidden_size,
+    num_experts,
+    top_k,
+    intermediate_size,
+    selected_experts=None,
+):
     torch.manual_seed(42)
     otype = torch.bfloat16
 
@@ -1419,9 +1465,10 @@ def test_moe_fp8_block_scaling(
     )
 
     # Generate unique random expert indices for each token
-    selected_experts = torch.stack(
-        [torch.randperm(num_experts)[:top_k] for _ in range(batch_size)]
-    ).cuda()
+    if selected_experts is None:
+        selected_experts = torch.stack(
+            [torch.randperm(num_experts)[:top_k] for _ in range(batch_size)]
+        ).cuda()
 
     routing_weights = torch.randn((batch_size, top_k)).cuda()
     routing_weights = F.softmax(routing_weights, dim=1)

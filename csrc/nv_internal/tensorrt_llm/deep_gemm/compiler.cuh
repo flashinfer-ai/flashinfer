@@ -94,6 +94,11 @@ inline std::filesystem::path getTmpDir() { return getDefaultUserDir() / "tmp"; }
 
 inline std::filesystem::path getCacheDir() { return getDefaultUserDir() / "cache"; }
 
+// Part of every cached kernel name. The name has no hash of the kernel sources and the default
+// cache directory is shared with TensorRT-LLM, so bump this whenever the JIT kernel sources change;
+// otherwise cubins built from older sources keep being loaded from disk.
+constexpr char const* kJitCacheRevision = "fi1";
+
 inline std::string getNvccCompiler() {
   static std::string compiler;
   if (compiler.empty()) {
@@ -264,7 +269,8 @@ class Compiler {
                        std::to_string(block_n) + "_" + std::to_string(block_k) + "_" +
                        std::to_string(num_groups) + "_" + std::to_string(num_stages) +
                        std::to_string(num_groups) + "_" + std::to_string(num_stages) + "_" +
-                       std::to_string(num_tma_multicast) + "_" + gemm_type_to_string(gemm_type);
+                       std::to_string(num_tma_multicast) + "_" + kJitCacheRevision + "_" +
+                       gemm_type_to_string(gemm_type);
     std::filesystem::path path = getCacheDir() / name;
 
     // Check runtime cache or file system hit

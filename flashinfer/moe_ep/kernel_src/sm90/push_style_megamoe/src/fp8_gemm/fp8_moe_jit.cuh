@@ -33,12 +33,13 @@ inline std::filesystem::path grouped_kernel_cache_path(uint32_t shape_n, uint32_
                                                        uint32_t block_k, uint32_t num_groups,
                                                        uint32_t num_stages,
                                                        uint32_t num_tma_multicast, bool swap_ab) {
-  std::string const name =
-      std::string(swap_ab ? "gemm_swapAB_" : "gemm_") + std::to_string(shape_n) + "_" +
-      std::to_string(shape_k) + "_" + std::to_string(block_m) + "_" + std::to_string(block_n) +
-      "_" + std::to_string(block_k) + "_" + std::to_string(num_groups) + "_" +
-      std::to_string(num_stages) + std::to_string(num_groups) + "_" + std::to_string(num_stages) +
-      "_" + std::to_string(num_tma_multicast) + "_GroupedWithOffset";
+  std::string const name = std::string(swap_ab ? "gemm_swapAB_" : "gemm_") +
+                           std::to_string(shape_n) + "_" + std::to_string(shape_k) + "_" +
+                           std::to_string(block_m) + "_" + std::to_string(block_n) + "_" +
+                           std::to_string(block_k) + "_" + std::to_string(num_groups) + "_" +
+                           std::to_string(num_stages) + std::to_string(num_groups) + "_" +
+                           std::to_string(num_stages) + "_" + std::to_string(num_tma_multicast) +
+                           "_" + deep_gemm::jit::kJitCacheRevision + "_GroupedWithOffset";
   return deep_gemm::jit::getCacheDir() / name;
 }
 

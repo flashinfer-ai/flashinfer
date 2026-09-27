@@ -26,6 +26,7 @@ from flashinfer import fp4_quantize, mxfp8_quantize
 from flashinfer.tllm_enums import SfLayout
 from flashinfer.testing.utils import (
     bench_gpu_time,
+    per_block_cast_to_fp8,
 )
 
 from .flashinfer_benchmark_utils import (
@@ -277,8 +278,11 @@ def parse_moe_args(line, parser):
         type=str,
         required=False,
         default="base",
-        choices=["base", "fp8", "nvfp4"],
-        help="Variant for cutlass_fused_moe benchmark: base (no quant), fp8 (per-tensor), nvfp4 (fp4 blockscale)",
+        choices=["base", "fp8", "fp8_block", "nvfp4"],
+        help=(
+            "Variant for cutlass_fused_moe benchmark: base (no quant), fp8 (per-tensor), "
+            "fp8_block (DeepSeek-style 128x128 block-scale weights, SM90), nvfp4 (fp4 blockscale)"
+        ),
     )
     parser.add_argument(
         "--quantized_input",
@@ -865,6 +869,7 @@ def testCutlassFusedMoe(args):
     Variants:
       - base: no quantization
       - fp8: per-tensor fp8 for weights and activation scale
+      - fp8_block: FP8 weights with 128x128 block scales, BF16 input (SM90)
       - nvfp4: FP4 block-scale weights, optional quantized input
     Supports TP/EP via tp_size/tp_rank and ep_size/ep_rank.
     """
@@ -1065,6 +1070,65 @@ def testCutlassFusedMoe(args):
             out,
         )
 
+    elif variant == "fp8_block":
+        # DeepSeek-style FP8 weights with 128x128 block scales; the op quantizes the
+        # BF16 input to FP8 with 1x128 scales internally
+        local_num_experts = w31_local.shape[0]
+        w31_weight_fp8 = torch.empty_like(w31_local, dtype=torch.float8_e4m3fn)
+        w2_weight_fp8 = torch.empty_like(w2_local, dtype=torch.float8_e4m3fn)
+        w31_scales = torch.empty(
+            local_num_experts,
+            (w31_local.shape[1] + 127) // 128,
+            (hidden_size + 127) // 128,
+            dtype=torch.float32,
+            device=device,
+        )
+        w2_scales = torch.empty(
+            local_num_experts,
+            (hidden_size + 127) // 128,
+            (w2_local.shape[2] + 127) // 128,
+            dtype=torch.float32,
+            device=device,
+        )
+        for expert_id in range(local_num_experts):
+            w31_q, s31 = per_block_cast_to_fp8(w31_local[expert_id])
+            w2_q, s2 = per_block_cast_to_fp8(w2_local[expert_id])
+            w31_weight_fp8[expert_id].copy_(w31_q)
+            w31_scales[expert_id].copy_(s31)
+            w2_weight_fp8[expert_id].copy_(w2_q)
+            w2_scales[expert_id].copy_(s2)
+        quant_scales = [w31_scales, w2_scales]
+
+        def run_cutlass(
+            x, selected_experts, routing_weights, w31_weight_fp8, w2_weight_fp8, out
+        ):
+            return cutlass_fused_moe(
+                x,
+                selected_experts.to(torch.int),
+                routing_weights,
+                w31_weight_fp8,
+                w2_weight_fp8,
+                input_dtype,
+                tp_size=tp_size,
+                tp_rank=tp_rank,
+                ep_size=ep_size,
+                ep_rank=ep_rank,
+                quant_scales=quant_scales,
+                use_deepseek_fp8_block_scale=True,
+                output=out,
+                enable_pdl=args.enable_pdl,
+                **_activation_kwarg(cutlass_fused_moe, activation_type),
+            )
+
+        input_args_for_bench = (
+            x,
+            selected_experts,
+            routing_weights,
+            w31_weight_fp8,
+            w2_weight_fp8,
+            out,
+        )
+
     elif variant == "nvfp4":
         # NVFP4: FP4 block-scale weights, optional quantized input
 
@@ -1204,8 +1268,8 @@ def testCutlassFusedMoe(args):
         median_time,
         input_dtype,
         input_dtype,
-        input_format=variant,
-        weight_format=variant,
+        input_format=None if variant == "fp8_block" else variant,
+        weight_format="fp8_block_scale" if variant == "fp8_block" else variant,
         routing_logits_dtype=router_logits.dtype,
         active_experts=int(selected_experts.unique().numel()),
         verbose=args.verbose,
