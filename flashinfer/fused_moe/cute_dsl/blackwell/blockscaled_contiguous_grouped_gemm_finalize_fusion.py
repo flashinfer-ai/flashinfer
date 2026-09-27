@@ -378,6 +378,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         weight_l2_hint: Optional[int] = None,
         swizzle_size: int = 1,
         pdl_trigger_early: bool = False,
+        c_stages: int = 1,
     ):
         """Initializes the configuration for a Blackwell blockscaled dense GEMM kernel.
 
@@ -413,6 +414,13 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # independent work in a PDL chain (the split form's wide GEMM2) lets
         # the next kernel's CTAs become resident while it still runs.
         self.pdl_trigger_early = bool(pdl_trigger_early)
+        # Epilogue output staging buffers. With 2 the R2S staging of tile
+        # i+1 overlaps the bulk reduce-add drain of tile i (the wait_group
+        # leaves one committed group pending); falls back to 1 when the
+        # second buffer would leave fewer than two A/B stages.
+        if int(c_stages) not in (1, 2):
+            raise ValueError("c_stages must be 1 or 2")
+        self.c_stages = int(c_stages)
         self.acc_dtype = cutlass.Float32
         self.use_2cta_instrs = mma_tiler_mn[0] == 256
         self.cluster_shape_mn = cluster_shape_mn
@@ -620,6 +628,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             self.final_scale_dtype,
             self.num_smem_capacity,
             self.occupancy,
+            c_stages=self.c_stages,
         )
 
         # Compute A/B/C/Scale shared memory layout
@@ -2288,6 +2297,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
+            # Output staging buffer of the current tile (alternates when
+            # num_c_stage == 2).
+            c_stage = cutlass.Int32(0)
             while is_valid_tile:
                 tile_m_start = tile_info[0] * self.cta_tile_shape_mnk[0]
                 permuted_row = tile_m_start + epi_tidx
@@ -2358,11 +2370,18 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
 
                     tRS_rC.store(acc_vec_final.to(self.out_dtype))
                     if is_valid_row:
-                        cute.copy(
-                            tiled_copy_r2s,
-                            tRS_rC,
-                            tRS_sC[(None, None, real_subtile_idx, None)],
-                        )
+                        if cutlass.const_expr(self.num_c_stage > 1):
+                            cute.copy(
+                                tiled_copy_r2s,
+                                tRS_rC,
+                                tRS_sC[(None, None, real_subtile_idx, c_stage)],
+                            )
+                        else:
+                            cute.copy(
+                                tiled_copy_r2s,
+                                tRS_rC,
+                                tRS_sC[(None, None, real_subtile_idx, None)],
+                            )
 
                 # Make all R2S smem writes visible to the async bulk-reduce proxy.
                 cute.arch.fence_proxy(
@@ -2414,35 +2433,40 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                         if cutlass.const_expr(not self.use_fused_finalize):
                             blk_copy(
                                 scatter_out_offset,
-                                sC[reduce_row, None, 0],
+                                sC[reduce_row, None, c_stage],
                                 valid_copy_size,
                             )
                         elif cutlass.const_expr(self.out_dtype == cutlass.BFloat16):
                             blk_reduce_bf16(
                                 scatter_out_offset,
-                                sC[reduce_row, None, 0],
+                                sC[reduce_row, None, c_stage],
                                 valid_copy_size,
                             )
                         elif cutlass.const_expr(self.out_dtype == cutlass.Float32):
                             blk_reduce_fp32(
                                 scatter_out_offset,
-                                sC[reduce_row, None, 0],
+                                sC[reduce_row, None, c_stage],
                                 valid_copy_size,
                             )
                         elif cutlass.const_expr(self.out_dtype == cutlass.Float16):
                             blk_reduce_fp16(
                                 scatter_out_offset,
-                                sC[reduce_row, None, 0],
+                                sC[reduce_row, None, c_stage],
                                 valid_copy_size,
                             )
 
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                # With two staging buffers one committed group may stay in
+                # flight: its smem reads finish while the next tile is staged
+                # into the other buffer.
+                cute.arch.cp_async_bulk_wait_group(self.num_c_stage - 1, read=True)
                 self.epilog_sync_barrier.arrive_and_wait()
 
                 # Release the prefetched metadata slot for this tile.
                 meta_pipeline.consumer_release(meta_consumer_state)
                 meta_consumer_state.advance()
+                if cutlass.const_expr(self.num_c_stage > 1):
+                    c_stage = (c_stage + 1) % self.num_c_stage
 
                 #
                 # Advance to next tile
@@ -2459,6 +2483,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
                 )
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
+            # Drain the bulk reduce-adds still reading the staging buffers
+            # before the CTA exits.
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
             #
             # Dealloc the tensor memory buffer
             #
@@ -2571,6 +2598,7 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         final_scale_dtype: Type[cutlass.Numeric],
         num_smem_capacity: int,
         occupancy: int,
+        c_stages: int = 1,
     ) -> Tuple[int, int, int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -2602,8 +2630,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
         # Default ACC stages
         num_acc_stage = 1 if mma_tiler_mnk[1] == 256 else 2
 
-        # Default C stages
-        num_c_stage = 1
+        # C (output staging) stages: 1, or 2 to overlap the staging of the
+        # next tile with the bulk reduce-add drain of the current one.
+        num_c_stage = c_stages
 
         # Default Tile info stages
         num_tile_stage = 2
@@ -2672,6 +2701,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             num_smem_capacity // occupancy
             - (mbar_helpers_bytes + c_bytes + meta_smem_bytes)
         ) // ab_bytes_per_stage
+        if num_c_stage > 1 and num_ab_stage < 2:
+            # The second staging buffer must not starve the operand ring.
+            num_c_stage = 1
+            c_bytes = c_bytes_per_stage
+            num_ab_stage = (
+                num_smem_capacity // occupancy
+                - (mbar_helpers_bytes + c_bytes + meta_smem_bytes)
+            ) // ab_bytes_per_stage
 
         return num_acc_stage, num_ab_stage, num_c_stage, num_tile_stage, num_meta_stage  # type: ignore[return-value]
 

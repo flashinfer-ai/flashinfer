@@ -406,6 +406,11 @@ DENSE_TWO_STAGE_FINALIZE = os.environ.get("MXFP4_DENSE_TWO_STAGE", "0") == "1"
 # ``MXFP4_GEMM2_SWIZZLE`` (default 4) sets the group.
 DENSE_GEMM2_RASTER_M = os.environ.get("MXFP4_GEMM2_RASTER_M", "auto")
 DENSE_GEMM2_SWIZZLE = int(os.environ.get("MXFP4_GEMM2_SWIZZLE", "4"))
+# Output staging buffers of the dense finalize GEMM2 (Blackwell): 2 lets the
+# TMEM-to-smem staging of the next tile overlap the bulk reduce-add drain of
+# the current one (the shard's K=384 tiles are epilogue-bound). Measured in
+# phase 4; 1 keeps the phase-3 kernel.
+DENSE_GEMM2_C_STAGES = int(os.environ.get("MXFP4_GEMM2_C_STAGES", "1"))
 DENSE_GEMM2_RASTER_M_MAX_SHARD = int(
     os.environ.get("MXFP4_GEMM2_RASTER_M_MAX_SHARD", "512")
 )
@@ -2392,6 +2397,7 @@ class CuteDslMxfp4MoEWrapper:
                 dual_tile_threshold_permille=self.dense_dual_tile_threshold_permille,
                 gemm2_raster_along_m=gemm2_raster[0],
                 gemm2_swizzle_size=gemm2_raster[1],
+                gemm2_c_stages=DENSE_GEMM2_C_STAGES,
                 dual_alt_pdl=DENSE_DUAL_ALT_PDL,
                 moe_sort_buffers={
                     name: value

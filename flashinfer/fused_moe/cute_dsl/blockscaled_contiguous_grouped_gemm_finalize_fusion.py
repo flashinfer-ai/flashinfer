@@ -229,6 +229,7 @@ def _get_compiled_finalize_kernel(
     # the compiled kernel, the pointer value is a runtime parameter.
     row_group_ptr=None,
     pdl_trigger_early: bool = False,
+    c_stages: int = 1,
 ):
     """Get or compile the grouped GEMM with finalize fusion kernel.
 
@@ -269,6 +270,7 @@ def _get_compiled_finalize_kernel(
         swizzle_size,
         row_group_ptr is not None,
         pdl_trigger_early,
+        c_stages,
     )
 
     if cache_key not in _finalize_kernel_cache:
@@ -329,6 +331,7 @@ def _get_compiled_finalize_kernel(
                 weight_l2_hint=weight_l2_hint,
                 swizzle_size=swizzle_size,
                 pdl_trigger_early=pdl_trigger_early,
+                c_stages=c_stages,
             )
             wrapper_fn = gemm_bw.wrapper
 
@@ -411,6 +414,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     weight_l2_hint: Optional[int] = None,
     tile_idx_to_row_group: Optional[torch.Tensor] = None,
     pdl_trigger_early: bool = False,
+    c_stages: int = 1,
 ) -> torch.Tensor:
     """Blockscaled contiguous grouped GEMM for MoE GEMM2 workloads.
 
@@ -756,6 +760,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         enable_narrow_a=_enable_narrow_a,
         row_group_ptr=row_group_ptr,
         pdl_trigger_early=pdl_trigger_early,
+        c_stages=c_stages,
     )
 
     # Execute kernel with runtime parameters.

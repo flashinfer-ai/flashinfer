@@ -228,6 +228,9 @@ def _moe_core_impl(
     # L2-resident; N-fastest (default) reuses each A tile across N tiles.
     gemm2_raster_along_m: Union[bool, str] = False,
     gemm2_swizzle_size: int = 1,
+    # Output staging buffers of the Blackwell finalize GEMM2 (1, or 2 to
+    # overlap the next tile's staging with the bulk reduce-add drain).
+    gemm2_c_stages: int = 1,
     # Launch the alternate-tile GEMMs as programmatic dependents of the base
     # ones (PDL): their launch overlaps the base kernel's tail, so the variant
     # the routing did not choose costs about a launch gap instead of ~3 us.
@@ -644,6 +647,7 @@ def _moe_core_impl(
         weight_l2_hint=weight_l2_hint,
         raster_along_m=gemm2_raster_along_m,
         swizzle_size=gemm2_swizzle_size,
+        c_stages=gemm2_c_stages,
         _prepared_launches=_prepared_launches,
         _enable_narrow_a=_enable_decode_specialization,
     )
@@ -678,6 +682,7 @@ def _moe_core_impl(
             weight_l2_hint=weight_l2_hint,
             raster_along_m=gemm2_raster_along_m,
             swizzle_size=gemm2_swizzle_size,
+            c_stages=gemm2_c_stages,
             _prepared_launches=alt_launches,
             _enable_narrow_a=False,
         )
