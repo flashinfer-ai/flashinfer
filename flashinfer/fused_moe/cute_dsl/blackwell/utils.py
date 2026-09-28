@@ -512,25 +512,6 @@ def blk_reduce_fp32(dst_gemm, src_smem, size, loc=None, ip=None):
 
 
 @dsl_user_op
-def cp_async_cg16_l2hint(dst_smem, src_gmem, src_size_i32, policy_i64, loc=None, ip=None):
-    """16-byte ``cp.async.cg`` with an L2 cache-policy hint; ``src_size`` 0 zero-fills."""
-    llvm.inline_asm(
-        None,
-        [
-            dst_smem.iterator.llvm_ptr,
-            src_gmem.iterator.llvm_ptr,
-            cutlass.Int32(src_size_i32).ir_value(loc=loc, ip=ip),
-            cutlass.Int64(policy_i64).ir_value(loc=loc, ip=ip),
-        ],
-        "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, $2, $3;",
-        "l,l,r,l",
-        has_side_effects=True,
-        loc=loc,
-        ip=ip,
-    )
-
-
-@dsl_user_op
 def blk_reduce_fp16(dst_gemm, src_smem, size, loc=None, ip=None):
     llvm.inline_asm(
         None,

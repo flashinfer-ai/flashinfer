@@ -86,7 +86,6 @@ from .utils import (
     pack_bf16x2_f32,
     red_add_bf16x2_pair_pred,
     red_add_v4_bf16x2_pred,
-    cp_async_cg16_l2hint,
     st_e4m3_pred,
     st_global_v4_pred,
     st_u8_pred,
@@ -130,7 +129,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         fin_bufs: int = 2,
         fin_red: bool = True,
         weight_l2_hint: Optional[int] = None,
-        token_l2_hint: Optional[int] = None,
         row_tma: Optional[bool] = None,
         gather_warps: Optional[int] = None,
         m_group: int = 1,
@@ -326,10 +324,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # Optional L2 cache policy (``createpolicy`` encoding) for the weight
         # and weight-scale TMA loads; weights stream once per row group.
         self.weight_l2_hint = weight_l2_hint
-        # Optional L2 cache policy for the gathered token rows (cp.async.cg
-        # L2::cache_hint): the weight-chunk items of one row group re-gather
-        # the same rows, so evict_last keeps them resident for the siblings.
-        self.token_l2_hint = token_l2_hint
         self.acc_dtype = cutlass.Float32
         self.cta_group = tcgen05.CtaGroup.TWO if self.two_cta else tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (self.cta_v, 1)
@@ -1993,16 +1987,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 s_b = cute.make_tensor(
                                     sB_stage + dst_off, layout=cute.make_layout((16,))
                                 )
-                                if cutlass.const_expr(self.token_l2_hint is not None):
-                                    cp_async_cg16_l2hint(
-                                        s_b,
-                                        g_b,
-                                        cutlass.Int32(row_ok[i]) * 16,
-                                        cutlass.Int64(self.token_l2_hint),
-                                    )
-                                else:
-                                    pred1[0] = row_ok[i]
-                                    cute.copy_atom_call(b_atom_copy, g_b, s_b, pred=pred1)
+                                pred1[0] = row_ok[i]
+                                cute.copy_atom_call(b_atom_copy, g_b, s_b, pred=pred1)
                             # 4 UE8M0 bytes per row per 128-wide K atom -> SF atom row.
                             for i in cutlass.range_constexpr(n_sf_w):
                                 if cutlass.const_expr(self.sf_blocked_read):
