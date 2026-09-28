@@ -334,6 +334,7 @@ def swapab_dispatch_mixed(
     narrow_count_base: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
     _prepared_launches: Optional[Dict[str, Any]] = None,
+    _trace: Optional[torch.Tensor] = None,
 ) -> None:
     """Mixed-width work lists over ``group_rows``-row sort groups: per expert
     ``nwide`` dense ``group_rows``-row tiles (``wide_list``: sort group
@@ -438,6 +439,7 @@ def swapab_dispatch_mixed(
         narrow_list.data_ptr(),
         narrow_count.data_ptr(),
         ptr(narrow_count_base),
+        _trace.data_ptr() if _trace is not None else 0,
         bool(enable_pdl),
     )
     func(*args, torch.cuda.current_stream().cuda_stream)

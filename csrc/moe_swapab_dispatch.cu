@@ -177,6 +177,12 @@ __global__ void __launch_bounds__(kThreads)
 // padding and 0 under the alternate padding, for a GEMM2 that runs the swap
 // finalize over the windows only when the routing chose the base tile.
 constexpr int kMixedItems = 4;
+
+__device__ __forceinline__ uint64_t globaltimer_ns() {
+  uint64_t t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
 // Staged loads per thread issued before their shared-memory stores, so the
 // staging loop overlaps its global latencies instead of serializing them.
 constexpr int kStageUnroll = 4;
@@ -216,7 +222,12 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
     int32_t* __restrict__ wide_list, int32_t* __restrict__ wide_count,
     int32_t* __restrict__ alt_wide_list, int32_t* __restrict__ alt_wide_count,
     int32_t* __restrict__ narrow_list, int32_t* __restrict__ narrow_count,
-    int32_t* __restrict__ narrow_count_base) {
+    int32_t* __restrict__ narrow_count_base, int64_t* __restrict__ trace) {
+  // Optional phase trace (globaltimer ns, thread 0): [0] start, [1] lists
+  // staged, [2 + k] after scan pass k (k < 6), [8] end.
+  if (trace != nullptr && threadIdx.x == 0) {
+    trace[0] = static_cast<int64_t>(globaltimer_ns());
+  }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   if constexpr (kPdl) {
     cudaGridDependencySynchronize();
@@ -249,6 +260,9 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
     stage_pair<kStageUnroll>(alt_expert_idx, alt_mn_limit, stage_alt, s_alt_e, s_alt_l);
   }
   __syncthreads();
+  if (trace != nullptr && threadIdx.x == 0) {
+    trace[1] = static_cast<int64_t>(globaltimer_ns());
+  }
   const bool alt = (alt_expert_idx != nullptr) && (s_counts[2] == 0) && (s_counts[1] > 0);
   const int num_groups = alt ? s_counts[1] : s_counts[0];
   const int staged_len = alt ? stage_alt : stage_base;
@@ -327,8 +341,15 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
     }
     carry = CountsAdd()(carry, total);
     __syncthreads();
+    if (trace != nullptr && threadIdx.x == 0) {
+      const int k = base_g / (kThreads * kMixedItems);
+      if (k < 6) trace[2 + k] = static_cast<int64_t>(globaltimer_ns());
+    }
   }
   if (threadIdx.x == 0) {
+    if (trace != nullptr) {
+      trace[8] = static_cast<int64_t>(globaltimer_ns());
+    }
     *wide_count = alt ? 0 : carry.wide;
     if (alt_wide_count != nullptr) {
       *alt_wide_count = alt ? carry.wide : 0;
@@ -384,7 +405,7 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
                                int64_t wide_list_ptr, int64_t wide_count_ptr,
                                int64_t alt_wide_list_ptr, int64_t alt_wide_count_ptr,
                                int64_t narrow_list_ptr, int64_t narrow_count_ptr,
-                               int64_t narrow_count_base_ptr, bool use_pdl,
+                               int64_t narrow_count_base_ptr, int64_t trace_ptr, bool use_pdl,
                                int64_t cuda_stream_ptr) {
   TVM_FFI_ICHECK(row_unit > 0 && group_rows > 0 && narrow_tile > 0 &&
                  group_rows % row_unit == 0 && narrow_tile % row_unit == 0)
@@ -442,7 +463,7 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
       reinterpret_cast<int32_t*>(wide_count_ptr), reinterpret_cast<int32_t*>(alt_wide_list_ptr),
       reinterpret_cast<int32_t*>(alt_wide_count_ptr),
       reinterpret_cast<int32_t*>(narrow_list_ptr), reinterpret_cast<int32_t*>(narrow_count_ptr),
-      reinterpret_cast<int32_t*>(narrow_count_base_ptr));
+      reinterpret_cast<int32_t*>(narrow_count_base_ptr), reinterpret_cast<int64_t*>(trace_ptr));
   TVM_FFI_ICHECK(err == cudaSuccess)
       << "moe_swapab_dispatch_mixed launch failed: " << cudaGetErrorString(err);
 }
