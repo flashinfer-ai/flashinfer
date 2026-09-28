@@ -85,6 +85,7 @@ from .utils import (
     blk_reduce_bf16,
     pack_bf16x2_f32,
     red_add_bf16x2_pair_pred,
+    red_add_v4_bf16x2_pred,
     st_e4m3_pred,
     st_global_v4_pred,
     st_u8_pred,
@@ -125,7 +126,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         num_tile_stages: int = 8,
         meta_in_sched: bool = True,
         perf_probe: int = 0,
-        fin_bufs: int = 4,
+        fin_bufs: int = 2,
+        fin_red: bool = True,
         weight_l2_hint: Optional[int] = None,
         row_tma: Optional[bool] = None,
         gather_warps: Optional[int] = None,
@@ -316,6 +318,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         if fin_bufs < 2 or (fin_bufs & (fin_bufs - 1)):
             raise ValueError("fin_bufs must be a power of two >= 2")
         self.fin_bufs = fin_bufs
+        # Wide finalize: reduce the staged token rows with 16-B red.global.v4
+        # (True) or one cp.reduce.async.bulk per row (False).
+        self.fin_red = fin_red
         # Optional L2 cache policy (``createpolicy`` encoding) for the weight
         # and weight-scale TMA loads; weights stream once per row group.
         self.weight_l2_hint = weight_l2_hint
@@ -1265,6 +1270,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         )
         sTr = storage.sTr.get_tensor(
             cute.make_layout((128, 32, self.fin_bufs), stride=(1, 136, 136 * 32))
+        )
+        # 32-bit view of the same staging: (4 words, 16 chunks of 16 B, 32 tok, buf).
+        sTrW = cute.make_tensor(
+            cute.recast_ptr(storage.sTr.data_ptr(), dtype=cutlass.Uint32),
+            cute.make_layout((4, 16, 32, self.fin_bufs), stride=(1, 4, 68, 68 * 32)),
         )
         sRed = storage.sRed.get_tensor(
             cute.make_layout(
@@ -2718,6 +2728,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 h0 = m_tile_out * 128
                                 fin_row = epi_tidx // 4
                                 is_fin_issuer = (epi_tidx % 4) == 0
+                                fin_tok = epi_tidx // 16
+                                fin_chunk = epi_tidx % 16
                                 tTR_tAcc_m = tTR_tAcc_m_base[
                                     (None, None, None, None, None, acc_slot_e)
                                 ]
@@ -2727,7 +2739,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                     # buffer is ``fin_bufs`` groups back in every thread's FIFO.
                                     buf = fin_seq % self.fin_bufs
                                     fin_seq = fin_seq + 1
-                                    cute.arch.cp_async_bulk_wait_group(self.fin_bufs - 1, read=True)
+                                    if cutlass.const_expr(not self.fin_red):
+                                        cute.arch.cp_async_bulk_wait_group(self.fin_bufs - 1, read=True)
                                     self.epilog_sync_barrier.arrive_and_wait()
                                     if cutlass.const_expr(self.perf_probe < 2):
                                         cute.copy(
@@ -2747,18 +2760,35 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                             tRS_rC_m,
                                             tRS_sTr_m[(None, None, None, buf)],
                                         )
-                                        cute.arch.fence_proxy("async.shared", space="cta")
-                                        self.epilog_sync_barrier.arrive_and_wait()
-                                        if is_fin_issuer:
-                                            prow = row_base + sub * epi_n + fin_row
-                                            # perf_probe 4: stage, but issue no reduce.
-                                            if (prow < mn_limit) & (self.perf_probe != 4):
-                                                tok = sTok[(sub * epi_n + fin_row, meta_stage)]
-                                                dst = cute.domain_offset((tok, h0, 0), out)
-                                                blk_reduce_bf16(
-                                                    dst, sTr[(None, fin_row, buf)], cutlass.Int32(256)
+                                        if cutlass.const_expr(self.fin_red):
+                                            # 512 x 16-B vectors per subtile: thread t reduces chunk
+                                            # t % 16 of token rows t // 16 + 8k (k = 0..3).
+                                            self.epilog_sync_barrier.arrive_and_wait()
+                                            for k in cutlass.range_constexpr(4):
+                                                tok_s = fin_tok + 8 * k
+                                                prow = row_base + sub * epi_n + tok_s
+                                                ok = cutlass.Int32(prow < mn_limit) * cutlass.Int32(
+                                                    self.perf_probe != 4
                                                 )
-                                        cute.arch.cp_async_bulk_commit_group()
+                                                tok = sTok[(sub * epi_n + tok_s, meta_stage)]
+                                                w4 = sTrW[(None, fin_chunk, tok_s, buf)].load()
+                                                red_add_v4_bf16x2_pred(
+                                                    cute.domain_offset((tok, h0 + 8 * fin_chunk, 0), out),
+                                                    w4[0], w4[1], w4[2], w4[3], ok,
+                                                )
+                                        else:
+                                            cute.arch.fence_proxy("async.shared", space="cta")
+                                            self.epilog_sync_barrier.arrive_and_wait()
+                                            if is_fin_issuer:
+                                                prow = row_base + sub * epi_n + fin_row
+                                                # perf_probe 4: stage, but issue no reduce.
+                                                if (prow < mn_limit) & (self.perf_probe != 4):
+                                                    tok = sTok[(sub * epi_n + fin_row, meta_stage)]
+                                                    dst = cute.domain_offset((tok, h0, 0), out)
+                                                    blk_reduce_bf16(
+                                                        dst, sTr[(None, fin_row, buf)], cutlass.Int32(256)
+                                                    )
+                                            cute.arch.cp_async_bulk_commit_group()
                                 cute.arch.fence_view_async_tmem_load()
                         else:
                             vals = cute.make_rmem_tensor((n_tile,), cutlass.Float32)

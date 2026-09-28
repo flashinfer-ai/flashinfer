@@ -192,7 +192,9 @@ def swap_two_cta(n_tile: int) -> bool:
 SWAP_TWO_CTA_GEMM2_K_BLOCKS = int(os.environ.get("SWAPAB_KBLOCKS2_2CTA", "4"))
 # Wide finalize staging buffers (32-token rows each); more buffers = more bulk
 # reduce ops in flight per CTA. ``SWAPAB_FIN_BUFS`` overrides (power of two).
-SWAP_FIN_BUFS = int(os.environ.get("SWAPAB_FIN_BUFS", "4"))
+SWAP_FIN_BUFS = int(os.environ.get("SWAPAB_FIN_BUFS", "2"))
+# Wide finalize reduce path: 1 = 16-B red.global.v4 from the staging, 0 = bulk reduce rows.
+SWAP_FIN_RED = os.environ.get("SWAPAB_FIN_RED", "1") != "0"
 
 
 def swap_m_group(n_tile: int, gemm2: bool = False) -> int:
@@ -436,6 +438,7 @@ def _get_compiled_swapab_kernel(
         SWAP_META_IN_SCHED,
         SWAP_PERF_PROBE,
         SWAP_FIN_BUFS,
+        SWAP_FIN_RED,
         weight_l2_hint,
         tiled_a,
         # ``zero_output`` is a compile-time specialisation (None vs pointer).
@@ -472,6 +475,7 @@ def _get_compiled_swapab_kernel(
             meta_in_sched=SWAP_META_IN_SCHED,
             perf_probe=SWAP_PERF_PROBE,
             fin_bufs=SWAP_FIN_BUFS,
+            fin_red=SWAP_FIN_RED,
             weight_l2_hint=weight_l2_hint,
             row_tma=row_tma,
             gather_warps=gather_warps,
