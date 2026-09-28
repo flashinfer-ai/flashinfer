@@ -195,8 +195,6 @@ SWAP_TWO_CTA_GEMM2_K_BLOCKS = int(os.environ.get("SWAPAB_KBLOCKS2_2CTA", "4"))
 SWAP_FIN_BUFS = int(os.environ.get("SWAPAB_FIN_BUFS", "2"))
 # Wide finalize reduce path: 1 = 16-B red.global.v4 from the staging, 0 = bulk reduce rows.
 SWAP_FIN_RED = os.environ.get("SWAPAB_FIN_RED", "1") != "0"
-# Finalize reduce op width in 32-bit words: 4 (16-B red.v4) or 8 (32-B red.v8).
-SWAP_FIN_VEC = int(os.environ.get("SWAPAB_FIN_VEC", "4"))
 
 
 def swap_m_group(n_tile: int, gemm2: bool = False) -> int:
@@ -441,7 +439,6 @@ def _get_compiled_swapab_kernel(
         SWAP_PERF_PROBE,
         SWAP_FIN_BUFS,
         SWAP_FIN_RED,
-        SWAP_FIN_VEC,
         weight_l2_hint,
         tiled_a,
         # ``zero_output`` is a compile-time specialisation (None vs pointer).
@@ -479,7 +476,6 @@ def _get_compiled_swapab_kernel(
             perf_probe=SWAP_PERF_PROBE,
             fin_bufs=SWAP_FIN_BUFS,
             fin_red=SWAP_FIN_RED,
-            fin_vec=SWAP_FIN_VEC,
             weight_l2_hint=weight_l2_hint,
             row_tma=row_tma,
             gather_warps=gather_warps,
