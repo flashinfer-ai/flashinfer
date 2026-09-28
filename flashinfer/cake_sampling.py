@@ -160,6 +160,7 @@ def _stage1_has_fused_tail(cluster: int, ept: int, stream: bool) -> bool:
 
 _FLAG_FUSE_TAIL = 1
 _FLAG_EARLY_TRIGGER = 2
+_FLAG_STREAM_PREPASS = 4
 
 
 def _early_trigger_flag(batch: int, cluster: int, sm_count: int) -> int:
@@ -170,6 +171,17 @@ def _early_trigger_flag(batch: int, cluster: int, sm_count: int) -> int:
     grid = int(batch) * int(cluster)
     last_wave = grid % int(sm_count) or int(sm_count)
     return _FLAG_EARLY_TRIGGER if int(batch) <= int(sm_count) - last_wave else 0
+
+
+@functools.cache
+def _stream_prepass_flag(device_index: int) -> int:
+    """Stage-1 ``launch_flags`` bit that moves a streaming variant's early trigger from after its
+    filter pass (the whole row read once) to before its first pass.  The earlier point saves the
+    one-wave large-k cells 0.5-1 us of dependent launch latency on Blackwell and Rubin but costs
+    Hopper 1.4-1.9 us (the dependent's launch contends with the row read), so it is set for compute
+    capability >= 10 only.  Ignored by the register-resident variants and without the early trigger."""
+    major, _minor = torch.cuda.get_device_capability(device_index)
+    return _FLAG_STREAM_PREPASS if major >= 10 else 0
 
 
 @functools.cache
@@ -481,12 +493,14 @@ def top_k_top_p_sampling_from_probs(
     fused = kmax <= _fused_tail_kcap() and _stage1_has_fused_tail(
         cluster, ept, bool(stream_variant)
     )
-    # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave.
-    launch_flags = (
-        _FLAG_FUSE_TAIL
-        if fused
-        else _early_trigger_flag(batch, cluster, _sm_count(probs.device.index))
-    )
+    # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
+    # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
+    if fused:
+        launch_flags = _FLAG_FUSE_TAIL
+    else:
+        launch_flags = _early_trigger_flag(batch, cluster, _sm_count(probs.device.index))
+        if stream_variant:
+            launch_flags |= _stream_prepass_flag(probs.device.index)
     module.radix_topk(
         probs,
         k_arr,

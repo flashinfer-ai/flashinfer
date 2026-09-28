@@ -29,8 +29,11 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    ``griddepcontrol.launch_dependents`` before its first pass only when the batch fits on the
    SMs its last wave leaves free (one stage-1 CTA per SM), so the stage-2/3 CTAs are never
    packed onto the few SMs free mid-flight; larger batches let the dependent launch as stage 1
-   exits.  Both decisions travel in the stage-1 ``launch_flags`` argument (bit 0 fused tail,
-   bit 1 early trigger) and neither changes any output.
+   exits.  A streaming variant signals at that early point only on Blackwell and Rubin
+   (compute capability 10.x); on Hopper it signals after its filter pass, once the whole row
+   has been read, where the round-3 kernels did.  All three decisions travel in the stage-1
+   ``launch_flags`` argument (bit 0 fused tail, bit 1 early trigger, bit 2 stream pre-pass
+   point) and none changes any output.
 
 Semantics (support, tie-breaking toward the lower vocabulary index, Philox stream advancement
 through the generator) follow the ``top_k_first`` route with two extra guarantees:

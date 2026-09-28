@@ -32,6 +32,7 @@ import torch
 
 from flashinfer.cake_sampling import (
     _early_trigger_flag,
+    _stream_prepass_flag,
     _stage1_variants,
     cake_sampling_route,
     choose_stage1,
@@ -1217,7 +1218,8 @@ def test_fused_tail_matches_two_launch_form():
 
 def test_early_trigger_flag_and_bitwise_outputs():
     """Stage-1 launch_flags bit 1 (early PDL trigger) is set only when the stage-2/3 CTAs fit on the
-    SMs the last stage-1 wave leaves free; both trigger points give bitwise identical outputs."""
+    SMs the last stage-1 wave leaves free; bit 2 (stream pre-pass point) follows the compute capability;
+    every trigger point gives bitwise identical outputs."""
     # 148 SMs: B=32 cluster 4 -> grid 128, 20 free SMs < 32 rows -> exit trigger; B=16 -> 84 free -> early.
     assert _early_trigger_flag(32, 4, 148) == 0
     assert _early_trigger_flag(16, 4, 148) == 2
@@ -1234,6 +1236,9 @@ def test_early_trigger_flag_and_bitwise_outputs():
     assert _early_trigger_flag(37, 4, 148) == 0
     assert _early_trigger_flag(160, 4, 148) == 0
     _require_supported_device()
+    # streams: pre-pass point on Blackwell / Rubin (cc >= 10), the post-filter point on Hopper.
+    major = torch.cuda.get_device_capability(torch.cuda.current_device())[0]
+    assert _stream_prepass_flag(torch.cuda.current_device()) == (4 if major >= 10 else 0)
     man = load_manifest()
     probs = _probs(32, 32768, seed=17)
     pn = probs.cpu().numpy()
@@ -1246,7 +1251,7 @@ def test_early_trigger_flag_and_bitwise_outputs():
             if not v.get("stream", 0) and 512 * v["cluster"] * v["ept"] < 32768:
                 continue
             s1 = (v["cluster"], v["ept"], bool(v.get("stream", 0)))
-            for flags in (0, 2):
+            for flags in ((0, 2, 6, 4) if s1[2] else (0, 2)):
                 run = _run(probs, k, p, 0xEA51, 4, variant=(s1, (256, 4)), flags=flags)
                 _check(run, pn, k, p, 0xEA51, 4)
                 assert np.array_equal(run.samples, base.samples), (s1, flags)
