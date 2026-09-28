@@ -115,6 +115,13 @@ def test_decode_plan_rules():
         not t16["tmap_prefetch"]
         and decode_tail_plan(8, i_local_for_tp(8), 8)["tmap_prefetch"]
     )
+    # Round-7 lever 3b: the same instance defers the cluster rendezvous to its epilogue warps.
+    assert (
+        t16["wait_warps"]
+        and not decode_tail_plan(8, i_local_for_tp(8), 8)["wait_warps"]
+    )
+    assert not decode_tail_plan(32, i_local_for_tp(8), 8)["wait_warps"]
+    assert not decode_front_plan(16, i_local_for_tp(8))["wait_warps"]
     # one ring stage fewer than the smem budget for the small-T tail (T16 keeps its 5)
     assert decode_tail_plan(1, i_local_for_tp(8), 8)["stages"] == 8
     assert decode_tail_plan(8, i_local_for_tp(8), 8)["stages"] == 8
@@ -122,6 +129,20 @@ def test_decode_plan_rules():
     assert not decode_tail_plan(32, i_local_for_tp(8), 8)["smem_b1"]
     assert not decode_tail_plan(32, i_local_for_tp(1), 1)["smem_b1"]
     assert not decode_tail_plan(16, i_local_for_tp(1), 1)["rows_smem"]
+    # Round-7 landing-zone alias (lever 6a): only the N_PAD 128 cluster instances streaming >= 32 chunk units per CTA
+    # (tail TP1 T=128: 76 units, front TP8 T=128: 56) alias the DSMEM landing zone on the drained A ring and gain two
+    # ring stages (5 -> 7); the short TP8 tail (9 units) and the single-CTA TP1 front keep their own zone.
+    la_tail = decode_tail_plan(128, i_local_for_tp(1), 1)
+    assert la_tail["land_alias"] and la_tail["cluster"] == 2 and la_tail["stages"] == 7
+    la_front = decode_front_plan(128, i_local_for_tp(8))
+    assert (
+        la_front["land_alias"] and la_front["cluster"] == 2 and la_front["stages"] == 7
+    )
+    assert not decode_tail_plan(128, i_local_for_tp(8), 8)["land_alias"]
+    assert not decode_tail_plan(64, i_local_for_tp(1), 1)["land_alias"]
+    assert not decode_front_plan(128, i_local_for_tp(1))["land_alias"]
+    assert cb.land_alias_auto(128, 152) and not cb.land_alias_auto(128, 19)
+    assert not cb.land_alias_auto(64, 152)
     # A second routed partial disables the staged rows (P == 1 only).
     assert not decode_tail_plan(1, i_local_for_tp(8), 8, num_partials=2)["rows_smem"]
     with pytest.raises(ValueError):
@@ -136,6 +157,16 @@ def test_decode_symbol_encodes_the_plan():
     assert decode_kernel_key(plan) == "decode:" + symbol
     front = decode_symbol(decode_front_plan(1, i_local_for_tp(1)))
     assert "_t7_28_96_k112_0_o3584_c1" in front and "_f" not in front
+    assert decode_symbol(decode_tail_plan(128, i_local_for_tp(1), 1)).endswith(
+        "_c2_f_la"
+    )
+    assert decode_symbol(decode_front_plan(128, i_local_for_tp(8))).endswith("_c2_la")
+    assert not decode_symbol(decode_tail_plan(128, i_local_for_tp(8), 8)).endswith(
+        "_la"
+    )
+    assert decode_symbol(decode_tail_plan(16, i_local_for_tp(8), 8)).endswith(
+        "_sb_rs_np_ww"
+    )
 
 
 def test_split_plan_rules():
@@ -174,6 +205,23 @@ def test_prefill_tail_plan_and_trigger():
     assert tp1["gemm_grid"] == (tp1["num_items"]) * 2 and not tp1["early_trigger"]
     assert plan["weights_evict_first"] and tp1["weights_evict_first"]
     assert not prefill_tail_plan(2048, 1)["weights_evict_first"]
+    # Round-7 N128 rule (TP8 T=512): 128-wide pair tile, 56 column tiles, 224 CTAs, 9-deep ring, no stream-K region.
+    n128 = prefill_tail_plan(512, 8)
+    assert (n128["block_n"], n128["n_tiles"], n128["num_stages"]) == (128, 56, 9)
+    assert (
+        n128["cluster_tiles"] == 112
+        and n128["gemm_grid"] == 224
+        and n128["sk_tiles"] == 0
+    )
+    assert (
+        not n128["weights_evict_first"]
+        and n128["early_trigger"]
+        and not n128["fused_norm"]
+    )
+    assert (
+        prefill_tail_plan(256, 8)["block_n"] == 256
+        and prefill_tail_plan(256, 8)["n_tiles"] == 28
+    )
     # Fused norm: TP1 T = 256 / 512 (single wave, K2 = 96 blocks); TP8 (K2 = 12) and multi-wave grids do not fuse.
     assert tp1["fused_norm"] and prefill_tail_plan(512, 1)["fused_norm"]
     assert not plan["fused_norm"] and not prefill_tail_plan(1024, 1)["fused_norm"]
@@ -205,11 +253,24 @@ def test_route_keys_cover_the_row_set():
         "tail_gemm:tp1e1f1",
         "tail_gemm:tp1e1f1s6",
         "tail_gemm:tp8e0f0",
+        "tail_gemm:tp8e0f0s9n128",
         "tail_gemm:tp8e1f0",
     }
     assert route_kernel_keys("front", 1, 128)[0].startswith("decode:")
     assert route_kernel_keys("front", 1, 256) == ("front:i6144",)
     assert route_kernel_keys("tail", 8, 256) == ("tail_norm:e1", "tail_gemm:tp8e1f0")
+    # Round-7 N128 rule: TP8 T=512 takes the 128-wide pair tile (56 column tiles, 224 CTAs, 9-deep ring); its
+    # multi-wave grid drops the evict_first weight policy and fires the norm trigger early, so the late-trigger norm
+    # instance (``tail_norm:e0``) leaves the production route set.
+    assert route_kernel_keys("tail", 8, 512) == (
+        "tail_norm:e1",
+        "tail_gemm:tp8e0f0s9n128",
+    )
+    assert (
+        cb.tail_gemm_config(512, 8) == (9, 128) and cb.tail_gemm_block_n(512, 1) == 256
+    )
+    assert cb.tail_gemm_block_n(1024, 8) == 256 and cb.tail_gemm_num_stages(512, 8) == 9
+    assert "tail_norm:e0" not in keys
     # TP1 single-wave rows fuse the norm into the GEMM launch (no tail_norm kernel); the T <= 256 row
     # takes the 6-deep ring instance (round-6 rule), T = 512 the default 7-deep ring.
     assert route_kernel_keys("tail", 1, 256) == ("tail_gemm:tp1e1f1s6",)
