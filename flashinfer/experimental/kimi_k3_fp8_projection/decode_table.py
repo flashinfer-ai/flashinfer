@@ -20,9 +20,10 @@ limitations under the License.
 # replay with a cold L2, measured on B200 (sm_100a) and B300 (sm_103a)).
 # ``route`` is "decode" (swap-AB split-K decode kernel: ``tok`` token-tile
 # width, ``split`` K splits, ``fused`` in-CTA quantization, ``persist``
-# persistent grid, ``resident`` resident token tiles, optional ``xb_stages``
-# "auto" | N decoupled BF16 token ring and ``qlanes`` 4 / 8 narrow quantization
-# units of the fused variant) or "gemm" (quantization launch + persistent
+# persistent grid, optional ``grid`` balanced persistent CTA count, ``resident``
+# resident token tiles, optional ``xb_stages`` "auto" | N decoupled BF16 token
+# ring and ``qlanes`` 4 / 8 narrow quantization units of the fused variant) or
+# "gemm" (quantization launch + persistent
 # 2-CTA GEMM).  Generated from the Cake measurement sweeps
 # recorded in the source repository; do not edit by hand.
 
@@ -555,9 +556,10 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         "1,28,16384": {
             "route": "decode",
             "tok": 64,
-            "split": 4,
+            "split": 1,
             "fused": True,
             "persist": True,
+            "grid": 128,
             "resident": False,
             "xb_stages": "auto",
             "qlanes": 4,
@@ -1087,9 +1089,10 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         "1,28,16384": {
             "route": "decode",
             "tok": 64,
-            "split": 4,
+            "split": 1,
             "fused": True,
             "persist": True,
+            "grid": 128,
             "resident": False,
             "xb_stages": "auto",
             "qlanes": 4,
