@@ -8,14 +8,10 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=scripts/jit_cache_build_common.sh
 source "${SCRIPT_DIR}/jit_cache_build_common.sh"
 
-case "${CUDA_VERSION:-}" in
-  13.4|134)
-    ;;
-  *)
-    echo "ERROR: Patched sccache is only expected for CUDA 13.4, got ${CUDA_VERSION:-unset}"
-    exit 1
-    ;;
-esac
+if ! cuda_version_at_least "${CUDA_VERSION:-}" 13 4; then
+  echo "ERROR: Patched sccache is only expected for CUDA 13.4 or newer, got ${CUDA_VERSION:-unset}"
+  exit 1
+fi
 
 if [ -z "${SCCACHE_PATCHED_BINARY_PATH:-}" ]; then
   echo "ERROR: SCCACHE_PATCHED_BINARY_PATH must be set"

@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
@@ -87,6 +88,80 @@ def test_provider_release_matrix_rejects_duplicate_architectures(
         cuda_config_module.ConfigError, match="contains duplicate architectures"
     ):
         cuda_config_module.validate_cuda_config(invalid_config, REPO_ROOT)
+
+
+def test_jit_cache_python_setup_hardens_incomplete_downloads(tmp_path):
+    common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
+    fake_python = tmp_path / "python"
+    invocation_log = tmp_path / "python-invocations"
+    fake_python.write_text(
+        "#!/bin/bash\n"
+        f'printf \'%s|%s|%s\\n\' "$*" "${{PIP_CONSTRAINT-unset}}" '
+        f'"${{PIP_BUILD_CONSTRAINT-unset}}" >> "{invocation_log}"\n'
+        'if [ "${1:-}" = "-c" ]; then\n'
+        "  printf '%s\\n' 'torch==2.9.0+cu130'\n"
+        "fi\n"
+    )
+    fake_python.chmod(0o755)
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+export PIP_CONSTRAINT=/tmp/original-constraint
+export PIP_BUILD_CONSTRAINT=/tmp/original-build-constraint
+unset PIP_RETRIES PIP_RESUME_RETRIES PIP_DEFAULT_TIMEOUT
+setup_jit_cache_python_build "{fake_python}" 13.0 cu130
+test "${{PIP_RETRIES}}" = 10
+test "${{PIP_RESUME_RETRIES}}" = 10
+test "${{PIP_DEFAULT_TIMEOUT}}" = 120
+cleanup_jit_cache_python_build
+test "${{PIP_CONSTRAINT}}" = /tmp/original-constraint
+test "${{PIP_BUILD_CONSTRAINT}}" = /tmp/original-build-constraint
+"""
+
+    subprocess.run(["bash", "-c", script], check=True)
+
+    assert invocation_log.read_text().splitlines()[0] == (
+        "-m pip install --upgrade pip>=26.2.1 build|unset|unset"
+    )
+
+
+@pytest.mark.parametrize(
+    ("cuda_version", "expected_source"),
+    [
+        ("13.0", "github-release"),
+        ("130", "github-release"),
+        ("13.4", "github-source"),
+        ("134", "github-source"),
+        ("13.5", "github-source"),
+        ("135", "github-source"),
+        ("14.0", "github-source"),
+        ("140", "github-source"),
+    ],
+)
+def test_sccache_patch_applies_to_cuda_13_4_and_newer(cuda_version, expected_source):
+    common_script = REPO_ROOT / "scripts" / "jit_cache_build_common.sh"
+    script = f"""
+set -euo pipefail
+source "{common_script}"
+install_patched_sccache() {{ :; }}
+install_released_sccache() {{ :; }}
+export CUDA_VERSION={cuda_version}
+install_sccache 0.17.0 x86_64
+printf '%s' "${{FLASHINFER_SCCACHE_INSTALL_SOURCE}}"
+"""
+
+    result = subprocess.run(
+        ["bash", "-c", script], check=True, capture_output=True, text=True
+    )
+
+    assert result.stdout == expected_source
+
+
+def test_pr_aot_matrix_waits_for_published_cuda_image_tag():
+    workflow = (REPO_ROOT / ".github" / "workflows" / "pr-test.yml").read_text()
+
+    assert 'grep -q "^flashinfer/flashinfer-ci-${cuda}:" ci/docker-tags.yml' in workflow
+    assert "AOT image not published" in workflow
 
 
 def test_release_verifier_rejects_duplicate_wheel_distributions(
