@@ -255,7 +255,8 @@ class KimiK3Tp12TailWorkspace:
             torch.cuda.set_device(device.index)
         self.device = torch.device("cuda", torch.cuda.current_device())
         # persistent K3 grid: one CTA per SM and column half (the Cake runtime's default k3p_ctas)
-        self.sm_count = int(torch.cuda.get_device_properties(self.device).multi_processor_count)
+        props = torch.cuda.get_device_properties(self.device)
+        self.sm_count = int(props.multi_processor_count)
         self.rank = rank
         self.world_size = WORLD_SIZE
         self.max_tokens = int(max_tokens)
@@ -375,7 +376,8 @@ class KimiK3Tp12TailRunner:
     gemm: torch.Tensor
     up_weight_slice: torch.Tensor
     out: torch.Tensor
-    k2: Optional[_Launch] = None  # Cake K2-stream kernel (M <= K2_STREAM_MAX_TOKENS); None = cuBLAS torch.mm
+    # Cake K2-stream kernel (M <= K2_STREAM_MAX_TOKENS); None = cuBLAS torch.mm
+    k2: Optional[_Launch] = None
 
     @property
     def kernel_keys(self) -> tuple[str, ...]:
