@@ -2303,6 +2303,36 @@ def _require_tensor(
         raise ValueError(f"{name} must be contiguous")
 
 
+def _validate_qkv_layout(q, k, v) -> bool:
+    """Accept dense ``[B, T, H, 128]`` BF16 q / k / v or strided views of one packed row.
+
+    Returns ``True`` for dense operands.  Strided operands must keep a dense
+    ``[num_heads, 128]`` token payload, share one token stride that is a
+    multiple of 8 elements and at least ``num_heads * 128``, and use a plain
+    batch stride (``shape[1] * token stride``) so ``[B, T]`` folds to ``[1, B*T]``.
+    """
+    import torch
+
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        _require_tensor(tensor, name=name, dtype=torch.bfloat16, ndim=4, contiguous=False)
+    if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+        return True
+    heads_x_dim = q.shape[2] * HEAD_DIM
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        if tensor.stride(3) != 1 or tensor.stride(2) != HEAD_DIM:
+            raise ValueError(f"{name} must keep a dense [num_heads, {HEAD_DIM}] token payload")
+        if tensor.stride(1) < heads_x_dim or tensor.stride(1) % 8 != 0:
+            raise ValueError(
+                f"{name} token stride must be a multiple of 8 elements and at least "
+                f"num_heads * {HEAD_DIM}; got {tensor.stride(1)}"
+            )
+        if tensor.shape[0] > 1 and tensor.stride(0) != tensor.shape[1] * tensor.stride(1):
+            raise ValueError(f"{name} batch stride must be shape[1] * token stride")
+    if not (q.stride(1) == k.stride(1) == v.stride(1)):
+        raise ValueError("q, k and v must share one token stride")
+    return False
+
+
 class FlashKDABlackwellBF16FusedLaunch:
     """Preallocated single-kernel launch for the production BF16 path."""
 
@@ -2383,23 +2413,7 @@ class FlashKDABlackwellBF16FusedLaunch:
         # [num_heads, HEAD_DIM] payload is dense and the three share one pitch;
         # the fused M128 body reads them in place, every other body gets a
         # dense copy below.
-        for name, tensor in (("q", q), ("k", k), ("v", v)):
-            _require_tensor(tensor, name=name, dtype=torch.bfloat16, ndim=4, contiguous=False)
-        qkv_dense = q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
-        if not qkv_dense:
-            heads_x_dim = q.shape[2] * HEAD_DIM
-            for name, tensor in (("q", q), ("k", k), ("v", v)):
-                if tensor.stride(3) != 1 or tensor.stride(2) != HEAD_DIM:
-                    raise ValueError(f"{name} must keep a dense [num_heads, {HEAD_DIM}] token payload")
-                if tensor.stride(1) < heads_x_dim or tensor.stride(1) % 8 != 0:
-                    raise ValueError(
-                        f"{name} token stride must be a multiple of 8 elements and at least "
-                        f"num_heads * {HEAD_DIM}; got {tensor.stride(1)}"
-                    )
-                if tensor.shape[0] > 1 and tensor.stride(0) != tensor.shape[1] * tensor.stride(1):
-                    raise ValueError(f"{name} batch stride must be shape[1] * token stride")
-            if not (q.stride(1) == k.stride(1) == v.stride(1)):
-                raise ValueError("q, k and v must share one token stride")
+        qkv_dense = _validate_qkv_layout(q, k, v)
         qkv_strided_ok = False
         _require_tensor(g, name="g", dtype=torch.bfloat16, ndim=4, contiguous=False)
         _require_tensor(
@@ -4666,10 +4680,11 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self.active_beta_f32 = active_beta_f32
         if active_beta_f32 and (compute_dtype != "tf32" or lower_bound is None):
             raise ValueError("active-beta affine requires bounded TF32 compute")
-        if q.ndim != 4 or any(
-            (not tensor.is_contiguous() for tensor in (q, k, v, out))
-        ):
-            raise ValueError("affine q/k/v/out require contiguous [B,T,H,128] tensors")
+        if q.ndim != 4 or not out.is_contiguous():
+            raise ValueError("affine out requires a contiguous [B,T,H,128] tensor")
+        # Strided q / k / v views (lever 5b) reach the fused M128 main pass in
+        # place; the map / apply kernels read only the exported operators.
+        _validate_qkv_layout(q, k, v)
         if any((tensor.shape != q.shape for tensor in (k, v, out))):
             raise ValueError("affine q/k/v/out shapes must match")
         if initial_state is None or final_state is None or state_indices is None:
