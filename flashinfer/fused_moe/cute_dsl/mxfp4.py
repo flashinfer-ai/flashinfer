@@ -233,6 +233,11 @@ SWAP_WIDE192_ROW_UNIT = 64
 SWAP_WIDE192_MIXED_GEMM2 = os.environ.get("MXFP4_SWAP192_MIXED_GEMM2", "split")
 if SWAP_WIDE192_MIXED_GEMM2 not in ("split", "dense"):
     raise ValueError("MXFP4_SWAP192_MIXED_GEMM2 must be split or dense")
+# Mixed form on two streams: the dense chain (dense GEMM1, and the dense
+# finalize over the dense tiles in the ``split`` GEMM2 form) runs on the
+# plan's side stream beside the swap chain; the row sets are disjoint and
+# both finalizes add atomically into the zero-filled output.
+SWAP_WIDE192_MIXED_STREAMS = os.environ.get("MXFP4_SWAP192_MIXED_STREAMS", "0") == "1"
 # Mixed form: weight M-tiles per swap-GEMM2 work item. Measured on B300 (TP8
 # T=256/1024 balanced): with the 128-row groups the GEMM2 of the policy tile
 # loses 6-9 % at m_group 1 and is back at the 32-row-group time with 2.
@@ -965,7 +970,9 @@ class Mxfp4MoESwapAbPlan:
         self.split_dense = False  # set by _prepare
         self._side_stream = None
         self._fork_event = self._join_event = None
-        if self.split and SWAP_SPLIT_SIDE_STREAM:
+        if (self.split and SWAP_SPLIT_SIDE_STREAM) or (
+            self.mixed192 and SWAP_WIDE192_MIXED_STREAMS
+        ):
             self._side_stream = torch.cuda.Stream(device=self.device)
             self._fork_event = torch.cuda.Event()
             self._join_event = torch.cuda.Event()
@@ -1654,12 +1661,30 @@ class Mxfp4MoESwapAbPlan:
                 compiled(*args, stream=stream, **kwargs)
                 compiled, args = self._gemm2_wide
                 compiled(*args, stream=stream)
+            mixed_side = self.mixed192 and self._side_stream is not None
+            if mixed_side:
+                # Dense chain (dense GEMM1, then the dense finalize over the
+                # dense tiles when GEMM2 is split) beside the swap chain; the
+                # lists come from the dispatch kernel already enqueued.
+                main = torch.cuda.current_stream()
+                self._fork_event.record(main)
+                self._side_stream.wait_event(self._fork_event)
+                side = cuda.CUstream(self._side_stream.cuda_stream)
+                compiled, args, kwargs = self._gemm1_dense
+                compiled(*args, stream=side, **kwargs)
+                if self._gemm2_wide is not None:
+                    compiled, args = self._gemm2_wide
+                    compiled(*args, stream=side)
+                self._join_event.record(self._side_stream)
             self._gemm1(*self._gemm1_args, stream=stream)
-            if self._gemm1_dense is not None and not self.split:
+            if self._gemm1_dense is not None and not self.split and not mixed_side:
                 compiled, args, kwargs = self._gemm1_dense
                 compiled(*args, stream=stream, **kwargs)
+            if mixed_side and self._gemm2_wide is None:
+                # Dense finalize over every group: needs the dense tiles' rows.
+                torch.cuda.current_stream().wait_event(self._join_event)
             self._gemm2(*self._gemm2_args, stream=stream)
-            if self.mixed192 and self._gemm2_wide is not None:
+            if self.mixed192 and self._gemm2_wide is not None and not mixed_side:
                 compiled, args = self._gemm2_wide
                 compiled(*args, stream=stream)
             if self._side_stream is not None:
