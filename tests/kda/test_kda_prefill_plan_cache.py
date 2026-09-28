@@ -214,6 +214,49 @@ def test_hit_with_a_fresh_output_only_repoints_the_output_and_stays_bitwise():
     _assert_same(got, _snapshot(d))
 
 
+@pytest.mark.parametrize("fresh", ["out", "out+rows"])
+def test_apply_route_hit_with_a_fresh_output_re_encodes_its_tail_descriptors(fresh):
+    """The apply-route kernels TMA-store the output tail and in-place checkpoint
+    rows through prepared descriptors of CALLER storage.  A hit that moves the
+    output (serving allocates it per call) must land the tail in the new buffer
+    and leave the previous call's buffer untouched; before the fix the stale
+    descriptors kept writing into the old storage (an intermittent illegal
+    memory access in serving once that block was unmapped, silent stale output
+    otherwise)."""
+    cache = KDAPrefillPlanCache(8)
+    # one sequence with a 200-token tail after the 8192-token main window takes
+    # the split-sequence affine composite with the apply route
+    d = _inputs([8392], 16, seed=17)
+    d["state_checkpoints"] = torch.zeros_like(
+        d["state_checkpoints"], dtype=torch.float32
+    )
+    pool = d["pool"].clone()
+    miss = _run(d, cache)
+    assert "affine" in str(miss.schedule) and "apply" in str(miss.schedule)
+    previous = d
+    for _ in range(3):
+        previous["out"].zero_()
+        previous["state_checkpoints"].zero_()
+        d = dict(d, out=torch.empty_like(d["out"]))
+        if fresh == "out+rows":
+            d = dict(d, state_checkpoints=torch.zeros_like(d["state_checkpoints"]))
+        _run(d, cache)
+        torch.cuda.synchronize()
+        assert not previous["out"].any(), "the previous call's output received rows"
+        if fresh == "out+rows":
+            assert not previous["state_checkpoints"].any(), (
+                "the previous call's checkpoint rows received rows"
+            )
+        previous = d
+    assert (cache.misses, cache.hits) == (1, 3)
+    got = _snapshot(d)
+    d["pool"].copy_(pool)
+    d["state_checkpoints"].zero_()
+    for _ in range(4):
+        _run(d)
+    _assert_same(got, _snapshot(d))
+
+
 def test_deferred_part_rebinds_flush_before_another_hit_and_land_in_the_newest_output():
     """A composite hit defers its map/correction rebinds past the first chain kernel.
 
