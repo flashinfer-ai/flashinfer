@@ -981,3 +981,15 @@ def test_plan_uniform_128_cta_grid():
     plan = plan_vsa_sm90(mask, mode="pair", sms=132)
     per_cta = [len(t) for t in _cta_tiles(plan)]
     assert plan["num_ctas"] == 128 and max(per_cta) == 14
+
+
+def test_plan_refined_load_model_only_for_long_tiles():
+    # h8, 2048 tokens, K = 8: 4-position tiles.  The refined load model would
+    # pick the pair plan, which measured 8-14 % slower than the split plan on
+    # H100; below REFINED_LOAD_MIN_K blocks per query block the previous
+    # model decides (split, two tiles per CTA).
+    mask = _topk_mask(8, 32, 32, 8)
+    plan = plan_vsa_sm90(mask, sms=132)
+    assert int(plan["hdr"][3]) & 0xF == 1, "split plan expected on a short-tile row"
+    assert plan["num_tiles"] == 8 * 32
+    assert max(len(t) for t in _cta_tiles(plan)) == 2

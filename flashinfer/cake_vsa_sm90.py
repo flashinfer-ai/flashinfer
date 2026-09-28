@@ -661,6 +661,11 @@ GRID_MIN_FRACTION = (
 # accordingly and a uniform 128-CTA grid beats 132 CTAs carrying the same
 # maximum tile count.  Mirrors ``vsa_sm90_bf16``.
 GRID_MODEL = 1
+# The refined load model (per-tile fixed load, split-merge load, grid knee credit) is
+# calibrated on long tiles (>= 32 KV blocks per query block); on short tiles the pair plans
+# it prefers measured 8-14 % slower than the split plans of the previous model, so below this
+# mean number of KV blocks per query block the previous model (raw positions, flat grid) decides.
+REFINED_LOAD_MIN_K = 28.0
 GRID_RATE_FULL_PENALTY = 0.03
 GRID_RATE_EXP = 0.25
 GRID_RATE_KNEE = 128
@@ -711,7 +716,7 @@ def _grid_candidates(n_tiles: int, sms: int) -> list[int]:
 
 
 def _assign_tiles(
-    costs: list[float], lens: list[float], sms: int
+    costs: list[float], lens: list[float], sms: int, refined: bool = True
 ) -> tuple[list[list[int]], float]:
     """List-schedule the tiles onto ``g`` persistent CTAs.
 
@@ -726,7 +731,9 @@ def _assign_tiles(
     best = None
     max_full = None
     for g in _grid_candidates(len(costs), sms):  # descending: the full grid first
-        lists, makespan = _list_schedule(costs, lens, g, _grid_load_scale(g, sms))
+        lists, makespan = _list_schedule(
+            costs, lens, g, _grid_load_scale(g, sms) if refined else 1.0
+        )
         max_tiles = max(len(lst) for lst in lists)
         if max_full is None:
             max_full = max_tiles
@@ -874,6 +881,7 @@ def plan_vsa_sm90(
         raise ValueError("sms must be positive")
     rows = [[m.nonzero().flatten().tolist() for m in mask[hh]] for hh in range(h)]
     ragged = int(counts.min()) != int(counts.max())
+    refined = float(counts.sum()) / (h * mb) >= REFINED_LOAD_MIN_K
 
     def build(mode: str):
         infos: list[tuple[int, int, int, int]] = []
@@ -885,7 +893,10 @@ def plan_vsa_sm90(
             for qb, partner in pairs:
                 _emit_tile(hh, qb, partner, mode, rows, infos, seqs, owns, lens)
         costs = [_tile_cost(owns[t]) for t in range(len(infos))]
-        loads = [_tile_load(infos[t][3], lens[t]) for t in range(len(infos))]
+        loads = [
+            _tile_load(infos[t][3], lens[t]) if refined else float(lens[t])
+            for t in range(len(infos))
+        ]
         if not ragged:
             order = list(range(len(infos)))
         elif h * nb * BLOCK * HEAD_DIM * 2 * 2 <= TILE_ORDER_L2_BUDGET:
@@ -907,13 +918,13 @@ def plan_vsa_sm90(
         best = None
         for cand in ("split", "pair"):  # ties go to split
             built = build(cand)
-            _, makespan = _assign_tiles(built[4], built[5], sms)
+            _, makespan = _assign_tiles(built[4], built[5], sms, refined)
             if best is None or makespan < best[0]:
                 best = (makespan, cand, built)
         _, mode, (infos, seqs, owns, lens, costs, loads) = best
     else:
         infos, seqs, owns, lens, costs, loads = build(mode)
-    lists, makespan = _assign_tiles(costs, loads, sms)
+    lists, makespan = _assign_tiles(costs, loads, sms, refined)
     g = len(lists)
     stride = max(len(lst) for lst in lists)
     if g > HDR_CTAS:
