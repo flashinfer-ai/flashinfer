@@ -22,6 +22,16 @@ _BLOCK_SPARSE_Q_TILE_SIZES = (8, 16, 32, 64, 128)
 _BLOCK_SPARSE_MAX_HEADS_Q_PER_KV = 32
 
 
+def _num_sparse_pattern_heads(
+    num_kv_heads: int, share_pattern_across_kv_heads: bool
+) -> int:
+    """Return metadata head count without changing physical KV-head geometry.
+
+    The caller resolves its API's pattern-sharing default before calling.
+    """
+    return 1 if share_pattern_across_kv_heads else num_kv_heads
+
+
 def _validate_contiguous_route_mode(
     sparse_format: object,
     use_proxy_routes: object,

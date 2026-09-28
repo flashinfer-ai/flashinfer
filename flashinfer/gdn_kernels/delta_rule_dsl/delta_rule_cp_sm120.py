@@ -2567,8 +2567,8 @@ class CPDeltaRuleFixupSimtSm120(KeyedCompileMixin):
         rM: cute.Tensor,
         k: cutlass.Int32,
     ):
-        for i in cutlass.range_constexpr(self.rows_per_cta):
-            for j in cutlass.range_constexpr(16):
+        for j in cutlass.range_constexpr(16):
+            for i in cutlass.range_constexpr(self.rows_per_cta):
                 rAcc[i] = rAcc[i] + sState[i, k + cutlass.Int32(j)] * rM[j]
 
     @cute.jit

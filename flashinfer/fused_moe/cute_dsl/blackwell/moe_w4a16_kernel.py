@@ -96,6 +96,7 @@ class Sm100W4A16GroupedGemmKernel:
         use_clc_scheduler: bool,
         raster_along_m: bool,
         transform_fragment_size: int,
+        m_cluster_aligned: bool,
     ):
         """Initialize the W4A16 grouped GEMM configuration."""
         self.group_count = group_count
@@ -116,6 +117,7 @@ class Sm100W4A16GroupedGemmKernel:
         self.use_clc_scheduler = use_clc_scheduler
         self.raster_along_m = raster_along_m
         self.transform_fragment_size = transform_fragment_size
+        self.m_cluster_aligned = m_cluster_aligned
         if activation_type is None:
             if situ_beta is not None or situ_linear_beta is not None:
                 raise ValueError("SiTU parameters require an activation")
@@ -570,7 +572,7 @@ class Sm100W4A16GroupedGemmKernel:
         n: cutlass.Int64,
         k: cutlass.Int64,
         num_tokens: cutlass.Int64,
-        top_k: cutlass.Int64,
+        top_k: cutlass.Constexpr,
         max_active_clusters: cutlass.Constexpr,
         stream: cuda.CUstream,
     ):
@@ -2211,19 +2213,28 @@ class Sm100W4A16GroupedGemmKernel:
                             hidden_base = (
                                 work_tile.cta_coord_m * self.cta_tile_shape_mnk[0]
                             )
-                            valid_elements = (
-                                cutlass.Int64(final_output.shape[0]) - hidden_base
-                            )
-                            if valid_elements > 0:
+                            valid_elements = cutlass.Int64(self.cta_tile_shape_mnk[0])
+                            if cutlass.const_expr(not self.m_cluster_aligned):
+                                valid_elements = (
+                                    cutlass.Int64(final_output.shape[0]) - hidden_base
+                                )
+                            if (
+                                cutlass.const_expr(self.m_cluster_aligned)
+                                or valid_elements > 0
+                            ):
                                 scatter_out = cute.domain_offset(
                                     (hidden_base, reduce_token_idx, 0), final_output
                                 )
                                 copy_elements = cutlass.Int32(
-                                    cutlass.min(
-                                        cutlass.Int64(self.cta_tile_shape_mnk[0]),
-                                        valid_elements,
-                                    )
+                                    self.cta_tile_shape_mnk[0]
                                 )
+                                if cutlass.const_expr(not self.m_cluster_aligned):
+                                    copy_elements = cutlass.Int32(
+                                        cutlass.min(
+                                            cutlass.Int64(self.cta_tile_shape_mnk[0]),
+                                            valid_elements,
+                                        )
+                                    )
                                 blk_reduce_bf16(
                                     scatter_out,
                                     sFinalize[(reduce_route, None)],
@@ -2233,7 +2244,9 @@ class Sm100W4A16GroupedGemmKernel:
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(0, read=True)
                         self.epilog_sync_barrier.arrive_and_wait()
-                    elif tma_distance_to_boundary >= self.cta_tile_shape_mnk[1]:
+                    elif (
+                        tma_distance_to_boundary >= (subtile_idx + 1) * self.epi_tile_n
+                    ):
                         # Convert to C type
                         acc_vec = tiled_copy_r2s.retile(tTR_rAcc).load()
                         if cutlass.const_expr(not self.fuse_activation):
@@ -2279,10 +2292,15 @@ class Sm100W4A16GroupedGemmKernel:
                         m_thr_slice = m_thr_offset[(None, None, None, subtile_idx)]
                         for i in cutlass.range(cute.size(tCpC), unroll_full=True):
                             tCpC[i] = (
-                                m_thr_slice[(i)][0]
-                                + work_tile.cta_coord_m * self.cta_tile_shape_mnk_c[0]
-                                < cute.size(tensor_c.shape[0])
-                            ) and (m_thr_slice[(i)][1] < work_tile.distance_to_boundary)
+                                m_thr_slice[(i)][1] < work_tile.distance_to_boundary
+                            )
+                            if cutlass.const_expr(not self.m_cluster_aligned):
+                                tCpC[i] = (
+                                    m_thr_slice[(i)][0]
+                                    + work_tile.cta_coord_m
+                                    * self.cta_tile_shape_mnk_c[0]
+                                    < cute.size(tensor_c.shape[0])
+                                ) and tCpC[i]
                         # Store C to global memory
                         cute.copy(
                             simt_atom,

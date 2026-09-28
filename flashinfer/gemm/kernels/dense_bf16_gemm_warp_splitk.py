@@ -20,7 +20,6 @@ from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import warp
 from cutlass.cute.runtime import from_dlpack
 
-
 _MMA_SHAPE = (16, 8, 16)
 _COMPUTE_WARPS = 4
 _A_LOADER_WARPS = 2
@@ -383,7 +382,7 @@ def autotune_tactics(m: int, n: int, k: int) -> list[WarpSplitKTactic]:
             continue
         for token_tile in _SUPPORTED_TOKEN_TILES:
             if token_tile > 16 and m <= 16:
-                continue  # a 32-token tile only pays for M > 16
+                continue  # A 32-token tile only pays for M > 16.
             for k_tile in _SUPPORTED_K_TILES:
                 if k % k_tile:
                     continue
@@ -776,35 +775,43 @@ class CpAsyncWarpSplitKKernel:
                     ].to(output.element_type)
 
 
-def _from_dlpack(tensor: _torch.Tensor):
-    return from_dlpack(tensor, assumed_align=32)
+def _from_dlpack(tensor: _torch.Tensor, *, dynamic_m: bool = False):
+    tensor = from_dlpack(tensor.detach(), assumed_align=32)
+    if dynamic_m:
+        # Only M varies; the row stride and N/K extents stay static.
+        tensor = tensor.mark_compact_shape_dynamic(
+            mode=0, stride_order=(0, 1), divisibility=1
+        )
+    return tensor
 
 
 @functools.cache
 def _compile(
     device_index: int,
     dtype,
-    m: int,
     n: int,
     k: int,
     tactic: WarpSplitKTactic,
     use_pdl: bool,
     has_bias: bool,
 ):
-    device = _torch.device("cuda", device_index)
-    with _torch.cuda.device(device):
-        kernel = CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias)
-        tensors = tuple(
-            _from_dlpack(tensor)
-            for tensor in (
-                _torch.empty((n, k), device=device, dtype=dtype),
-                _torch.empty((m, k), device=device, dtype=dtype),
-                _torch.empty((n,), device=device, dtype=dtype),
-                _torch.empty((m, n), device=device, dtype=dtype),
-            )
+    with _torch.cuda.device(device_index):
+        return cute_ext.compile(
+            CpAsyncWarpSplitKKernel(tactic, use_pdl, has_bias),
+            *(
+                _from_dlpack(
+                    _torch.empty(shape, device="cuda", dtype=dtype),
+                    dynamic_m=dynamic_m,
+                )
+                for shape, dynamic_m in (
+                    ((n, k), False),
+                    ((_MAX_M, k), True),
+                    ((n,), False),
+                    ((_MAX_M, n), True),
+                )
+            ),
+            _cuda.CUstream(_torch.cuda.current_stream().cuda_stream),
         )
-        stream = _cuda.CUstream(_torch.cuda.current_stream(device).cuda_stream)
-        return cute_ext.compile(kernel, *tensors, stream)
 
 
 def run_warp_splitk_dense(a, b, out, pdl: bool, tactic: WarpSplitKTactic, bias=None):
@@ -813,18 +820,15 @@ def run_warp_splitk_dense(a, b, out, pdl: bool, tactic: WarpSplitKTactic, bias=N
     device_index = a.device.index
     assert device_index is not None
     with _torch.cuda.device(a.device):
-        compiled = _compile(
-            device_index, a.dtype, m, n, k, tactic, pdl, bias is not None
-        )
-        stream = _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream)
+        compiled = _compile(device_index, a.dtype, n, k, tactic, pdl, bias is not None)
         # Without bias the kernel never reads its bias argument; pass a row of
         # ``out`` so the launch signature stays fixed.
         compiled(
             _from_dlpack(b.T),
-            _from_dlpack(a),
+            _from_dlpack(a, dynamic_m=True),
             _from_dlpack(bias if bias is not None else out[0]),
-            _from_dlpack(out),
-            stream,
+            _from_dlpack(out, dynamic_m=True),
+            _cuda.CUstream(_torch.cuda.current_stream(a.device).cuda_stream),
         )
     return out
 

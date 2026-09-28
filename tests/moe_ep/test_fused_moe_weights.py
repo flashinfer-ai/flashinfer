@@ -14,14 +14,14 @@ def _bf16_moe_config(*, num_experts, local_num_experts, offset, intermediate, to
         ExpertConfig,
         MoEConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
         TrtllmBf16Config,
     )
 
     return MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(
             intermediate_size=intermediate,
             local_expert_offset=offset,
@@ -39,14 +39,14 @@ def _nvfp4_moe_config(*, num_experts, local_num_experts, offset, intermediate, t
         ExpertConfig,
         MoEConfig,
         QuantConfig,
-        QuantVariant,
+        QuantFormat,
         RoutingConfig,
         TrtllmFp4Config,
     )
 
     return MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(
             intermediate_size=intermediate,
             local_expert_offset=offset,
@@ -187,7 +187,7 @@ class TestMaterializeFusedMoeWeights:
             ExpertConfig,
             MoEConfig,
             QuantConfig,
-            QuantVariant,
+            QuantFormat,
             RoutingConfig,
             TrtllmBf16Config,
         )
@@ -201,7 +201,7 @@ class TestMaterializeFusedMoeWeights:
         w2 = torch.randn(1, 128, 128, device=device).to(torch.bfloat16)
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=2, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             experts=ExpertConfig(intermediate_size=128, local_num_experts=1),
             backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
             execution=ExecutionConfig(tune_max_num_tokens=64),

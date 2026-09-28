@@ -91,10 +91,9 @@ class NcclEpHandle(Handle):
         # long-lived Fleet makes the recv buffers, counter tensors and FFI
         # descriptor objects reusable across forwards. Tensor wrappers are
         # memoized by (data_ptr, dtype, shape), so an entry can only ever
-        # describe the same memory layout it was built for; the dict is cleared
-        # when it grows past a bound (entries are then rebuilt, which is always
-        # safe — each handle only needs address stability within its own
-        # lifetime).
+        # describe the same memory layout it was built for. Only those wrappers
+        # are evicted at the size bound: workspace buffers must stay alive at
+        # their existing addresses for graphs captured against this fleet.
         self._hot = fleet._hot_cache
         self._handle_knobs = _index_knobs(algo_knobs)
         self._stream = self._knob_stream()
@@ -233,6 +232,15 @@ class NcclEpHandle(Handle):
         never alias the wrong layout — a reused address with a different
         shape/dtype misses and builds a fresh wrapper. Large tensors are
         wrapped per call (see _WRAP_MEMO_MAX_BYTES).
+
+        ONLY call this for a tensor whose address the caller keeps stable. The
+        wrapper holds its torch tensor alive, so memoizing a per-call buffer
+        pins it and stops the allocator handing that address back until the
+        bounded cache is cleared. The memo then misses every time, defeating
+        its own premise. Combine's output is exactly that case and is gated on
+        ``CombineInputParams.out_is_stable``; do not route a churning tensor
+        here on the assumption that a repeated address proves stability, since
+        a freed-then-reallocated buffer repeats on the very next call.
         """
         if t.numel() * t.element_size() > self._WRAP_MEMO_MAX_BYTES:
             return self._ep.Tensor(t)
@@ -241,7 +249,16 @@ class NcclEpHandle(Handle):
         w = hot.get(key)
         if w is None:
             if len(hot) > self._WRAP_MEMO_MAX_ENTRIES:
-                hot.clear()
+                # Named entries own recv buffers, counters and configs. A
+                # captured graph may still reference their allocations after
+                # later eager calls fill the wrapper memo, so preserve them.
+                for cached_key in list(hot):
+                    if (
+                        isinstance(cached_key, tuple)
+                        and len(cached_key) == 3
+                        and isinstance(cached_key[0], int)
+                    ):
+                        del hot[cached_key]
             w = self._ep.Tensor(t)
             hot[key] = w
         return w
@@ -652,17 +669,20 @@ class NcclEpHandle(Handle):
                 self._num_tokens_in, hidden, dtype=x.dtype, device=x.device
             )
         )
+        # The stability promise applies only to a caller-supplied buffer.
+        # An output allocated above is fresh even if the flag was set.
+        out_is_stable = params.out is not None and params.out_is_stable
 
         if self._is_ht:
             x2d = x.reshape(-1, hidden)
-            # Cache the static config; the token wraps go through the _wrap
-            # memo (x2d is a fresh view each call, out_t may alias new tensors).
+            # Cache the static config and explicitly stable output only.
             ck = ("ht_comb_cfg", self._staged)
             config = self._hot.get(ck)
             if config is None:
                 config = self._ep.CombineConfig(send_only=int(self._staged))
                 self._hot[ck] = config
-            outputs = self._ep.CombineOutputs(tokens=self._wrap(out_t))
+            out_w = self._wrap(out_t) if out_is_stable else self._ep.Tensor(out_t)
+            outputs = self._ep.CombineOutputs(tokens=out_w)
             inputs = self._ep.CombineInputs(tokens=self._wrap(x2d))
             self._handle.combine(
                 inputs, outputs, config=config, stream=self._op_stream()
@@ -707,8 +727,13 @@ class NcclEpHandle(Handle):
             config = self._ep.CombineConfig(send_only=int(self._staged))
             self._hot[ck] = config
         inputs = self._ep.CombineInputs(tokens=self._wrap(x))
+        # Memoize the output descriptor only when the caller owns a stable
+        # buffer (a graph state does; the default forward's empty_like does
+        # not). Caching a per-call buffer retains one output per forward until
+        # the bounded cache is cleared -- see _wrap.
+        out_w = self._wrap(out_t) if out_is_stable else self._ep.Tensor(out_t)
         outputs = self._ep.CombineOutputs(
-            tokens=self._wrap(out_t),
+            tokens=out_w,
             topk_weights=weights_t,
         )
 

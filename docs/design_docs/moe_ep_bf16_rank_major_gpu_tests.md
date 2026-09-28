@@ -12,8 +12,12 @@ the GPUs. The fixed configuration is eight ranks, capacity 128 tokens per
 rank, hidden size 7168, intermediate size 2048, 256 experts (32 per rank),
 top-k 8, and BF16 weights/activations. All ranks use the same active-token
 count in the supported range 1–128. Use a CUDA-enabled PyTorch installation
-with symmetric-memory support, `cuda-bindings`, and CUDA 12.8+ `nvcc` on
+with NVSHMEM symmetric-memory support, `cuda-bindings`, and CUDA 12.8+ `nvcc` on
 `PATH` (or under `CUDA_HOME`/`CUDA_PATH`).
+
+The fixture selects PyTorch's NVSHMEM symmetric-memory backend before allocating
+the peer workspace. The independent reference disables TF32, including a forced
+`TORCH_ALLOW_TF32_CUBLAS_OVERRIDE` inherited from the environment.
 
 From the repository root:
 
