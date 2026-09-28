@@ -176,31 +176,38 @@ __global__ void __launch_bounds__(kThreads)
 // ``narrow_count_base`` (optional) receives the window count under the base
 // padding and 0 under the alternate padding, for a GEMM2 that runs the swap
 // finalize over the windows only when the routing chose the base tile.
-// A 256-thread block (16 groups per thread and scan pass): the block launch
-// and the barriers of a 1024-thread block cost more than the scan saves, and
-// the kernel is latency-bound (ncu: 16 K instructions over 13.5 K cycles).
-constexpr int kMixedThreads = 256;
-constexpr int kMixedItems = 16;
-// The lists are staged with 4-byte cp.async copies (all in flight at once,
-// one wait) instead of load-store pairs that each hold a global latency.
+constexpr int kMixedItems = 4;
+// Staged loads per thread issued before their shared-memory stores, so the
+// staging loop overlaps its global latencies instead of serializing them.
+constexpr int kStageUnroll = 4;
+
+template <int kUnroll>
 __device__ __forceinline__ void stage_pair(const int32_t* __restrict__ a,
                                            const int32_t* __restrict__ b, int32_t n,
                                            int32_t* __restrict__ sa, int32_t* __restrict__ sb) {
-  for (int i = static_cast<int>(threadIdx.x); i < n; i += kMixedThreads) {
-    const uint32_t da = static_cast<uint32_t>(__cvta_generic_to_shared(sa + i));
-    const uint32_t db = static_cast<uint32_t>(__cvta_generic_to_shared(sb + i));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(da), "l"(a + i));
-    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" ::"r"(db), "l"(b + i));
+  for (int i = static_cast<int>(threadIdx.x); i < n; i += kThreads * kUnroll) {
+    int32_t va[kUnroll], vb[kUnroll];
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int idx = i + u * kThreads;
+      if (idx < n) {
+        va[u] = a[idx];
+        vb[u] = b[idx];
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int idx = i + u * kThreads;
+      if (idx < n) {
+        sa[idx] = va[u];
+        sb[idx] = vb[u];
+      }
+    }
   }
 }
 
-__device__ __forceinline__ void stage_wait() {
-  asm volatile("cp.async.commit_group;");
-  asm volatile("cp.async.wait_all;");
-}
-
 template <bool kPdl>
-__global__ void __launch_bounds__(kMixedThreads) swapab_dispatch_mixed_kernel(
+__global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
     const int32_t* __restrict__ expert_idx, const int32_t* __restrict__ mn_limit,
     const int32_t* __restrict__ num_groups_ptr, const int32_t* __restrict__ alt_expert_idx,
     const int32_t* __restrict__ alt_mn_limit, const int32_t* __restrict__ alt_num_groups_ptr,
@@ -221,7 +228,7 @@ __global__ void __launch_bounds__(kMixedThreads) swapab_dispatch_mixed_kernel(
 #endif
   // Warp scans: the default raking scan serializes 32 struct adds per lane
   // of one warp twice per pass (about 3 us for 1024 threads).
-  using Scan = cub::BlockScan<Counts, kMixedThreads, cub::BLOCK_SCAN_WARP_SCANS>;
+  using Scan = cub::BlockScan<Counts, kThreads, cub::BLOCK_SCAN_WARP_SCANS>;
   __shared__ typename Scan::TempStorage temp;
   __shared__ int s_counts[3];
   extern __shared__ int32_t staged[];
@@ -237,11 +244,10 @@ __global__ void __launch_bounds__(kMixedThreads) swapab_dispatch_mixed_kernel(
   int32_t* const s_base_l = staged + stage_base;
   int32_t* const s_alt_e = staged + 2 * stage_base;
   int32_t* const s_alt_l = staged + 2 * stage_base + stage_alt;
-  stage_pair(expert_idx, mn_limit, stage_base, s_base_e, s_base_l);
+  stage_pair<kStageUnroll>(expert_idx, mn_limit, stage_base, s_base_e, s_base_l);
   if (stage_alt > 0) {
-    stage_pair(alt_expert_idx, alt_mn_limit, stage_alt, s_alt_e, s_alt_l);
+    stage_pair<kStageUnroll>(alt_expert_idx, alt_mn_limit, stage_alt, s_alt_e, s_alt_l);
   }
-  stage_wait();
   __syncthreads();
   const bool alt = (alt_expert_idx != nullptr) && (s_counts[2] == 0) && (s_counts[1] > 0);
   const int num_groups = alt ? s_counts[1] : s_counts[0];
@@ -256,7 +262,7 @@ __global__ void __launch_bounds__(kMixedThreads) swapab_dispatch_mixed_kernel(
   int32_t* const wl = alt ? alt_wide_list : wide_list;
   const int gu = rows / row_unit;
   Counts carry{0, 0, 0};
-  for (int base_g = 0; base_g < num_groups; base_g += kMixedThreads * kMixedItems) {
+  for (int base_g = 0; base_g < num_groups; base_g += kThreads * kMixedItems) {
     Counts mine[kMixedItems];
 #pragma unroll
     for (int j = 0; j < kMixedItems; ++j) {
@@ -414,7 +420,7 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
   }
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(1);
-  config.blockDim = dim3(kMixedThreads);
+  config.blockDim = dim3(kThreads);
   config.dynamicSmemBytes = smem_bytes;
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
