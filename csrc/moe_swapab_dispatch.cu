@@ -168,9 +168,13 @@ __global__ void __launch_bounds__(kThreads)
 // permutation either way (the base list is always valid over the chosen
 // padding, so the swap kernel's ``group_rows``-granular lookups hold).
 //
-// The expert / limit arrays of the active list are staged in dynamic shared
-// memory (``smem_capacity`` groups each) so the per-group run search reads
-// on-chip; a routing with more groups than the capacity reads global memory.
+// The expert / limit arrays of both lists are staged in dynamic shared memory
+// up to their buffer lengths (``stage_base`` / ``stage_alt`` groups, issued
+// together with the three count loads so the kernel pays one memory latency
+// before the scan); a list longer than its staged length reads global memory.
+// ``narrow_count_base`` (optional) receives the window count under the base
+// padding and 0 under the alternate padding, for a GEMM2 that runs the swap
+// finalize over the windows only when the routing chose the base tile.
 constexpr int kMixedItems = 4;
 
 template <bool kPdl>
@@ -179,10 +183,11 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
     const int32_t* __restrict__ num_groups_ptr, const int32_t* __restrict__ alt_expert_idx,
     const int32_t* __restrict__ alt_mn_limit, const int32_t* __restrict__ alt_num_groups_ptr,
     const int32_t* __restrict__ base_active_ptr, int32_t group_rows, int32_t alt_group_rows,
-    int32_t narrow_tile, int32_t row_unit, int32_t smem_capacity,
+    int32_t narrow_tile, int32_t row_unit, int32_t stage_base, int32_t stage_alt,
     int32_t* __restrict__ wide_list, int32_t* __restrict__ wide_count,
     int32_t* __restrict__ alt_wide_list, int32_t* __restrict__ alt_wide_count,
-    int32_t* __restrict__ narrow_list, int32_t* __restrict__ narrow_count) {
+    int32_t* __restrict__ narrow_list, int32_t* __restrict__ narrow_count,
+    int32_t* __restrict__ narrow_count_base) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   if constexpr (kPdl) {
     cudaGridDependencySynchronize();
@@ -190,25 +195,40 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
 #endif
   using Scan = cub::BlockScan<Counts, kThreads>;
   __shared__ typename Scan::TempStorage temp;
+  __shared__ int s_counts[3];
   extern __shared__ int32_t staged[];
-  bool alt = false;
-  if (alt_expert_idx != nullptr) {
-    alt = (*base_active_ptr == 0) && (*alt_num_groups_ptr > 0);
+  // One latency: the counts and both lists' arrays (up to their staged
+  // lengths, buffer contents past the routing's groups are never read).
+  if (threadIdx.x < 3) {
+    const int32_t* p = threadIdx.x == 0   ? num_groups_ptr
+                       : threadIdx.x == 1 ? alt_num_groups_ptr
+                                          : base_active_ptr;
+    s_counts[threadIdx.x] = p != nullptr ? *p : 0;
   }
+  int32_t* const s_base_e = staged;
+  int32_t* const s_base_l = staged + stage_base;
+  int32_t* const s_alt_e = staged + 2 * stage_base;
+  int32_t* const s_alt_l = staged + 2 * stage_base + stage_alt;
+  for (int i = static_cast<int>(threadIdx.x); i < stage_base; i += kThreads) {
+    s_base_e[i] = expert_idx[i];
+    s_base_l[i] = mn_limit[i];
+  }
+  for (int i = static_cast<int>(threadIdx.x); i < stage_alt; i += kThreads) {
+    s_alt_e[i] = alt_expert_idx[i];
+    s_alt_l[i] = alt_mn_limit[i];
+  }
+  __syncthreads();
+  const bool alt = (alt_expert_idx != nullptr) && (s_counts[2] == 0) && (s_counts[1] > 0);
+  const int num_groups = alt ? s_counts[1] : s_counts[0];
+  const int staged_len = alt ? stage_alt : stage_base;
   const int32_t* e = alt ? alt_expert_idx : expert_idx;
   const int32_t* l = alt ? alt_mn_limit : mn_limit;
-  const int rows = alt ? alt_group_rows : group_rows;
-  const int num_groups = alt ? *alt_num_groups_ptr : *num_groups_ptr;
-  int32_t* const wl = alt ? alt_wide_list : wide_list;
-  if (num_groups <= smem_capacity) {
-    for (int i = static_cast<int>(threadIdx.x); i < num_groups; i += kThreads) {
-      staged[i] = e[i];
-      staged[smem_capacity + i] = l[i];
-    }
-    __syncthreads();
-    e = staged;
-    l = staged + smem_capacity;
+  if (num_groups <= staged_len) {
+    e = alt ? s_alt_e : s_base_e;
+    l = alt ? s_alt_l : s_base_l;
   }
+  const int rows = alt ? alt_group_rows : group_rows;
+  int32_t* const wl = alt ? alt_wide_list : wide_list;
   const int gu = rows / row_unit;
   Counts carry{0, 0, 0};
   for (int base_g = 0; base_g < num_groups; base_g += kThreads * kMixedItems) {
@@ -283,6 +303,9 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
       *alt_wide_count = alt ? carry.wide : 0;
     }
     *narrow_count = carry.narrow;
+    if (narrow_count_base != nullptr) {
+      *narrow_count_base = alt ? 0 : carry.narrow;
+    }
   }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   if constexpr (kPdl) {
@@ -331,10 +354,12 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
                                int64_t alt_expert_idx_ptr, int64_t alt_mn_limit_ptr,
                                int64_t alt_num_groups_ptr, int64_t base_active_ptr,
                                int64_t group_rows, int64_t alt_group_rows, int64_t narrow_tile,
-                               int64_t row_unit, int64_t smem_groups, int64_t wide_list_ptr,
-                               int64_t wide_count_ptr, int64_t alt_wide_list_ptr,
-                               int64_t alt_wide_count_ptr, int64_t narrow_list_ptr,
-                               int64_t narrow_count_ptr, bool use_pdl, int64_t cuda_stream_ptr) {
+                               int64_t row_unit, int64_t stage_base, int64_t stage_alt,
+                               int64_t wide_list_ptr, int64_t wide_count_ptr,
+                               int64_t alt_wide_list_ptr, int64_t alt_wide_count_ptr,
+                               int64_t narrow_list_ptr, int64_t narrow_count_ptr,
+                               int64_t narrow_count_base_ptr, bool use_pdl,
+                               int64_t cuda_stream_ptr) {
   TVM_FFI_ICHECK(row_unit > 0 && group_rows > 0 && narrow_tile > 0 &&
                  group_rows % row_unit == 0 && narrow_tile % row_unit == 0)
       << "group_rows and narrow_tile must be positive multiples of row_unit";
@@ -345,10 +370,12 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
       << "the dual-tile arrays, counts and alternate wide list must be given together";
   TVM_FFI_ICHECK(!dual || (alt_group_rows > group_rows && alt_group_rows % row_unit == 0))
       << "alt_group_rows must be a multiple of row_unit above group_rows";
-  TVM_FFI_ICHECK(smem_groups >= 0 && smem_groups <= (1 << 20)) << "smem_groups out of range";
+  TVM_FFI_ICHECK(stage_base >= 0 && stage_alt >= 0 && (dual || stage_alt == 0) &&
+                 stage_base + stage_alt <= (1 << 20))
+      << "staged lengths out of range";
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
-  const size_t smem_bytes = 2 * sizeof(int32_t) * static_cast<size_t>(smem_groups);
+  const size_t smem_bytes = 2 * sizeof(int32_t) * static_cast<size_t>(stage_base + stage_alt);
   auto* kernel =
       use_pdl ? swapab_dispatch_mixed_kernel<true> : swapab_dispatch_mixed_kernel<false>;
   // The dynamic staging area may exceed the 48 KB default; the opt-in is
@@ -382,12 +409,12 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
       reinterpret_cast<const int32_t*>(alt_num_groups_ptr),
       reinterpret_cast<const int32_t*>(base_active_ptr), static_cast<int32_t>(group_rows),
       static_cast<int32_t>(alt_group_rows), static_cast<int32_t>(narrow_tile),
-      static_cast<int32_t>(row_unit), static_cast<int32_t>(smem_groups),
-      reinterpret_cast<int32_t*>(wide_list_ptr), reinterpret_cast<int32_t*>(wide_count_ptr),
-      reinterpret_cast<int32_t*>(alt_wide_list_ptr),
+      static_cast<int32_t>(row_unit), static_cast<int32_t>(stage_base),
+      static_cast<int32_t>(stage_alt), reinterpret_cast<int32_t*>(wide_list_ptr),
+      reinterpret_cast<int32_t*>(wide_count_ptr), reinterpret_cast<int32_t*>(alt_wide_list_ptr),
       reinterpret_cast<int32_t*>(alt_wide_count_ptr),
-      reinterpret_cast<int32_t*>(narrow_list_ptr),
-      reinterpret_cast<int32_t*>(narrow_count_ptr));
+      reinterpret_cast<int32_t*>(narrow_list_ptr), reinterpret_cast<int32_t*>(narrow_count_ptr),
+      reinterpret_cast<int32_t*>(narrow_count_base_ptr));
   TVM_FFI_ICHECK(err == cudaSuccess)
       << "moe_swapab_dispatch_mixed launch failed: " << cudaGetErrorString(err);
 }

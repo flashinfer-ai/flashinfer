@@ -1911,6 +1911,7 @@ def test_swapab_dispatch_mixed_follows_dual_tile_routing(
         narrow_count=torch.full((1,), -7, dtype=torch.int32, device="cuda"),
         alt_wide_list=torch.full((alt_tiles,), -7, dtype=torch.int32, device="cuda"),
         alt_wide_count=torch.full((1,), -7, dtype=torch.int32, device="cuda"),
+        narrow_count_base=torch.full((1,), -7, dtype=torch.int32, device="cuda"),
     )
     swapab_dispatch_mixed(
         tile_idx_to_expert_idx=buffers["out_tile_idx_to_expert_idx"],
@@ -1957,6 +1958,7 @@ def test_swapab_dispatch_mixed_follows_dual_tile_routing(
     assert (lists[idle_list] == -7).all()
     assert int(lists[active_count].item()) == len(wide_ref)
     assert int(lists["narrow_count"].item()) == len(narrow_ref)
+    assert int(lists["narrow_count_base"].item()) == (0 if use_alt else len(narrow_ref))
     assert lists[active_list][: len(wide_ref)].tolist() == wide_ref
     assert lists["narrow_list"][: len(narrow_ref)].tolist() == narrow_ref
     assert (lists[active_list][len(wide_ref) :] == -7).all()

@@ -306,8 +306,9 @@ def swapab_dispatch(
         _prepared_launches["swap_dispatch"] = (func, args)
 
 
-# Largest active-list length staged in the mixed dispatch kernel's shared
-# memory (two int32 arrays: 160 KB); longer lists read global memory.
+# Largest total list length (base + alternate groups) staged in the mixed
+# dispatch kernel's shared memory (two int32 arrays each: 160 KB); a list
+# beyond its staged length is read from global memory.
 SWAPAB_DISPATCH_SMEM_GROUPS = 20480
 
 
@@ -330,6 +331,7 @@ def swapab_dispatch_mixed(
     alt_group_rows: int = 0,
     alt_wide_list: Optional[torch.Tensor] = None,
     alt_wide_count: Optional[torch.Tensor] = None,
+    narrow_count_base: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -351,7 +353,9 @@ def swapab_dispatch_mixed(
     ``alt_group_rows``-row groups listed in ``alt_wide_list`` (at most three
     windows per expert with 256-row groups) and ``wide_count`` is 0;
     otherwise ``alt_wide_count`` is 0. The windows are ``row_unit`` offsets
-    of the one permutation either way."""
+    of the one permutation either way; ``narrow_count_base`` (optional) is
+    the window count under the base padding and 0 under the alternate one,
+    for a swap GEMM2 that runs only when the routing chose the base tile."""
     if group_rows % row_unit or narrow_tile % row_unit:
         raise ValueError("group_rows and narrow_tile must be multiples of row_unit")
     groups = tile_idx_to_mn_limit.shape[0]
@@ -394,6 +398,8 @@ def swapab_dispatch_mixed(
             raise ValueError("narrow_list must hold the alternate groups' windows")
     else:
         alt_groups = 0
+    if narrow_count_base is not None and not has_dual:
+        raise ValueError("narrow_count_base needs the dual-tile lists")
     for t in (
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
@@ -403,10 +409,12 @@ def swapab_dispatch_mixed(
         narrow_list,
         narrow_count,
         *(dual if has_dual else ()),
+        *((narrow_count_base,) if narrow_count_base is not None else ()),
     ):
         if t.dtype != torch.int32 or not t.is_contiguous():
             raise ValueError("dispatch buffers must be contiguous int32")
-    smem_groups = min(max(groups, alt_groups), SWAPAB_DISPATCH_SMEM_GROUPS)
+    stage_base = min(groups, SWAPAB_DISPATCH_SMEM_GROUPS)
+    stage_alt = min(alt_groups, SWAPAB_DISPATCH_SMEM_GROUPS - stage_base)
     func = _get_swapab_dispatch_module()["flashinfer_moe_swapab_dispatch_mixed"]
     ptr = lambda t: t.data_ptr() if t is not None else 0  # noqa: E731
     args = (
@@ -421,13 +429,15 @@ def swapab_dispatch_mixed(
         int(alt_group_rows) if has_dual else 0,
         int(narrow_tile),
         int(row_unit),
-        int(smem_groups),
+        int(stage_base),
+        int(stage_alt),
         wide_list.data_ptr(),
         wide_count.data_ptr(),
         ptr(alt_wide_list),
         ptr(alt_wide_count),
         narrow_list.data_ptr(),
         narrow_count.data_ptr(),
+        ptr(narrow_count_base),
         bool(enable_pdl),
     )
     func(*args, torch.cuda.current_stream().cuda_stream)

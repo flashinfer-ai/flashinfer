@@ -245,9 +245,13 @@ SWAP_WIDE192_ROW_UNIT = 64
 # ``SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS``, ``dense`` above it (B300: the swap
 # finalize wins while the shard's output stays L2-resident, the dense finalize
 # from T=16384 up; the rank's dense-all GEMM2 loses 5 % at T=8192).
+# ``alt`` (dual-tile routing only, else ``split``): ``split`` when the
+# routing chose the 128-row padding, the dense finalize over every 256-row
+# group when it chose the coarser one (the routing's own choice marks the
+# routings with few large experts, whose windows hold few rows).
 SWAP_WIDE192_MIXED_GEMM2 = os.environ.get("MXFP4_SWAP192_MIXED_GEMM2", "auto")
-if SWAP_WIDE192_MIXED_GEMM2 not in ("auto", "split", "dense"):
-    raise ValueError("MXFP4_SWAP192_MIXED_GEMM2 must be auto, split or dense")
+if SWAP_WIDE192_MIXED_GEMM2 not in ("auto", "split", "dense", "alt"):
+    raise ValueError("MXFP4_SWAP192_MIXED_GEMM2 must be auto, split, dense or alt")
 SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS = int(
     os.environ.get("MXFP4_SWAP192_DENSE_GEMM2_MIN_TOKENS", "16384")
 )
@@ -999,6 +1003,7 @@ class Mxfp4MoESwapAbPlan:
         # routing pads to 128- or 256-row groups at run time; the dense tiles
         # of the chosen padding run the dense path's tactic for that tile.
         self.mixed192_dual = wrapper._swap_mixed192_dual(x.shape[0], self.finalize)
+        self.mixed192_alt_gemm2 = False  # set by _prepare
         self.split_dense = False  # set by _prepare
         self._side_stream = None
         self._fork_event = self._join_event = None
@@ -1281,6 +1286,7 @@ class Mxfp4MoESwapAbPlan:
                             alt_group_rows=self.mixed192_dual[0],
                             alt_wide_list=b["swap_alt_wide_list"],
                             alt_wide_count=b["swap_alt_wide_count"],
+                            narrow_count_base=b["swap_row_group_count_base"],
                         )
                         if self.mixed192_dual is not None
                         else {}
@@ -1563,6 +1569,14 @@ class Mxfp4MoESwapAbPlan:
                     )
                     self._gemm1_dense_alt = alt_launches["gather"]
             mixed192_dense_gemm2 = self.mixed192 and self.mixed192_gemm2 == "dense"
+            # ``alt`` GEMM2 form: the swap finalize runs the windows only under
+            # the base padding; under the coarser padding the alternate dense
+            # finalize covers every 256-row group.
+            self.mixed192_alt_gemm2 = (
+                self.mixed192
+                and self.mixed192_gemm2 == "alt"
+                and self.mixed192_dual is not None
+            )
             if self.hybrid or mixed192_dense_gemm2:
                 # Dense contiguous grouped GEMM2 over the 128-row sort groups
                 # with the bulk-reduce finalize into the zero-filled output.
@@ -1665,9 +1679,16 @@ class Mxfp4MoESwapAbPlan:
                 self._gemm2_wide = wide_launches["finalize"]
                 if self.mixed192_dual is not None:
                     # Dense finalize of the coarser tile over the alternate
-                    # wide list (reduce-adds into the same output).
+                    # wide list (reduce-adds into the same output), or over
+                    # every alternate group in the ``alt`` GEMM2 form.
                     self._gemm2_dense_alt = self._prepare_dense_gemm2_alt(
-                        w, b, w2, w2_sf, num_tokens, pdl, wide=True
+                        w,
+                        b,
+                        w2,
+                        w2_sf,
+                        num_tokens,
+                        pdl,
+                        wide=not self.mixed192_alt_gemm2,
                     )
             self._gemm1, self._gemm1_args = launches["swap_gemm1"]
             self._gemm2, self._gemm2_args = launches["swap_gemm2"]
@@ -1821,7 +1842,11 @@ class Mxfp4MoESwapAbPlan:
                 # The 192-row windows (64-row offsets) behind each expert's
                 # dense tiles; blocked row scales from both GEMM1 forms.
                 gemm2_lists = dict(
-                    num_non_exiting_tiles=b["swap_row_group_count"],
+                    num_non_exiting_tiles=b[
+                        "swap_row_group_count_base"
+                        if self.mixed192_alt_gemm2
+                        else "swap_row_group_count"
+                    ],
                     tile_idx_to_row_group=b["swap_row_groups"],
                     group_rows=self.group_rows,
                     row_unit=SWAP_WIDE192_ROW_UNIT,
@@ -2259,7 +2284,7 @@ class CuteDslMxfp4MoEWrapper:
 
     def _swap_mixed192_gemm2(self, num_tokens):
         """GEMM2 form of the mixed 192-row form at this token count (see
-        SWAP_WIDE192_MIXED_GEMM2): ``split`` or ``dense``."""
+        SWAP_WIDE192_MIXED_GEMM2): ``split``, ``dense`` or ``alt``."""
         if SWAP_WIDE192_MIXED_GEMM2 != "auto":
             return SWAP_WIDE192_MIXED_GEMM2
         if (
@@ -2465,6 +2490,7 @@ class CuteDslMxfp4MoEWrapper:
                         ("out_base_active_num_non_exiting_tiles", (1,), torch.int32, 4),
                         ("swap_alt_wide_list", (alt_tiles,), torch.int32, 4),
                         ("swap_alt_wide_count", (1,), torch.int32, 4),
+                        ("swap_row_group_count_base", (1,), torch.int32, 4),
                     ]
                     if mixed192_dual is not None
                     else []
