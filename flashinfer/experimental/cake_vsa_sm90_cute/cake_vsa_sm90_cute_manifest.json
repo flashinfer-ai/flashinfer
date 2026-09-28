@@ -1502,7 +1502,7 @@
         "seqlen_q": "int32"
       },
       "source_bytes": 247196,
-      "source_sha256": "40187e53cc59e0ccd66d065363fb5df002ea41b712a315c24ee307bed45a0a43",
+      "source_sha256": "4d72e3a6b52b080a548b1817499288bc7312bc96b77a5a65c5fee680434f58a8",
       "stage": "small_k1s",
       "symbol": "vsa_sm90_bf16_small_k1s",
       "template": "vsa_sm90_bf16_small_k1s",
@@ -1792,7 +1792,7 @@
         "seqlen_q": "int32"
       },
       "source_bytes": 537460,
-      "source_sha256": "148b148755ef2fae2ae3d4bf27c74f2e9eb1ae0f0e8f1bf39376218e821d2cc0",
+      "source_sha256": "f2324b48f8673a3e3f04bbd17083fb4a65d858e7a8cc0a54e5bf87457db04023",
       "stage": "small_k3s",
       "symbol": "vsa_sm90_bf16_small_k3s",
       "template": "vsa_sm90_bf16_small_k3s",
@@ -2082,7 +2082,7 @@
         "seqlen_q": "int32"
       },
       "source_bytes": 668311,
-      "source_sha256": "4be30caca2bed8583af5d65728de74af8dc54cae39259f63a677ce5d43024761",
+      "source_sha256": "3243b5398d9435b00e7d478342f88844d3e0595e9464ed328d29c3077e491de6",
       "stage": "small_k4s",
       "symbol": "vsa_sm90_bf16_small_k4s",
       "template": "vsa_sm90_bf16_small_k4s",
@@ -2372,7 +2372,7 @@
         "seqlen_q": "int32"
       },
       "source_bytes": 930091,
-      "source_sha256": "4753efe93145d709f5bce92112f7d4b03abad4afa57e2be1b4a4cf79a30ca6de",
+      "source_sha256": "1f758003d82f9b78c9f8b443e7c8e15f37655b86c61c2d09a3452647132e404a",
       "stage": "small_k6s",
       "symbol": "vsa_sm90_bf16_small_k6s",
       "template": "vsa_sm90_bf16_small_k6s",
