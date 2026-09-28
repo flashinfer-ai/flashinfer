@@ -271,6 +271,67 @@ def pack_bf16x2_f32(lo_f32, hi_f32, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_e4m3_pred(dst_gmem, v_f32, pred_i32, loc=None, ip=None):
+    """Predicated store of one F32 rounded (RN, satfinite) to an E4M3 byte."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gmem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            cutlass.Float32(v_f32).ir_value(loc=loc, ip=ip),
+            pred_i32.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p_;\n\t.reg .b16 h_;\n\tsetp.ne.b32 p_, $2, 0;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f32 h_, $1, $1;\n\t@p_ st.global.b8 [$0], h_;\n}",
+        "l,f,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_u8_pred(dst_gmem, v_u32, pred_i32, loc=None, ip=None):
+    """Predicated store of the low byte of ``v_u32``."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gmem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(v_u32).ir_value(loc=loc, ip=ip),
+            pred_i32.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p_;\n\tsetp.ne.b32 p_, $2, 0;\n\t@p_ st.global.b8 [$0], $1;\n}",
+        "l,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def st_shared_b32_pred(addr_i32, v_u32, pred_i32, loc=None, ip=None):
+    """Predicated 32-bit store to a shared-memory address."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(addr_i32).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(v_u32).ir_value(loc=loc, ip=ip),
+            pred_i32.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p_;\n\tsetp.ne.b32 p_, $2, 0;\n\t@p_ st.shared.b32 [$0], $1;\n}",
+        "r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_bf16_pred(dst_gmem, v_f32, pred_i32, loc=None, ip=None):
     """Predicated 2-byte store of an F32 value rounded to BF16."""
     llvm.inline_asm(
