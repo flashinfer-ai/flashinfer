@@ -116,19 +116,53 @@ def _reference_gemm(a, b, a_scale, b_scale, m_indices):
     return out.to(torch.bfloat16)
 
 
-def _reference_activation(y_bf16):
-    """FlashInfer chain arithmetic in torch: BF16 gate/up halves, FP32 SwiGLU, BF16 activation."""
+def _reference_halves(y_bf16):
+    """The BF16 gate and up halves of the reference GEMM output, as FP32 tensors."""
     h = y_bf16.shape[1] // 2
-    g = y_bf16[:, :h].float()
-    u = y_bf16[:, h:].float()
-    act = (g * torch.sigmoid(g) * u).to(torch.bfloat16).float()
-    return g, u, act
+    return y_bf16[:, :h].float(), y_bf16[:, h:].float()
 
 
-def _reference_group_scales(act):
-    m, h = act.shape
-    absmax = act.reshape(m, h // GROUP_SIZE, GROUP_SIZE).abs().amax(dim=-1)
-    return (absmax.clamp_min(EPS) / 448.0).contiguous()
+def _bf16_step(x, direction):
+    """The BF16 neighbour of every element of ``x`` (bfloat16, finite) one ulp
+    toward +inf (``direction`` 1) or -inf (``direction`` -1)."""
+    bits = x.contiguous().view(torch.int16)
+    if direction > 0:
+        stepped = torch.where(bits >= 0, bits + 1, bits - 1)
+        # -0.0 steps to the smallest positive value
+        stepped = torch.where(bits == -(2**15), torch.ones_like(bits), stepped)
+    else:
+        stepped = torch.where(bits > 0, bits - 1, bits + 1)
+        # +0.0 steps to the smallest negative value
+        stepped = torch.where(bits == 0, torch.full_like(bits, -(2**15 - 1)), stepped)
+    return stepped.view(torch.bfloat16)
+
+
+def _activation_envelope(g, u):
+    """Per element, the BF16 interval ``[lo, hi]`` of activations a kernel can
+    produce whose gate and up halves each lie within one BF16 ulp of the
+    reference halves ``g`` and ``u``.
+
+    The kernel accumulates its FP32 dot products in a different order from
+    :func:`_reference_gemm`, so each of its BF16 halves is the reference value
+    or one of its two BF16 neighbours (nine gate/up candidates).  Its FP32
+    SwiGLU (``ex2.approx`` / ``rcp.approx``) can round a candidate's product to
+    a neighbouring BF16 activation, so the envelope extends one BF16 ulp
+    beyond the candidates' extremes.  (A half that is tiny through cancellation
+    can differ by more ulps of its own magnitude, but it lies far below the
+    group's quantization step and cannot set the group's absmax.)
+    """
+    g16, u16 = g.to(torch.bfloat16), u.to(torch.bfloat16)
+    gates = (_bf16_step(g16, -1), g16, _bf16_step(g16, 1))
+    ups = (_bf16_step(u16, -1), u16, _bf16_step(u16, 1))
+    lo = hi = None
+    for gate in gates:
+        gate = gate.float()
+        silu = gate * torch.sigmoid(gate)
+        for up in ups:
+            act = (silu * up.float()).to(torch.bfloat16)
+            lo = act if lo is None else torch.minimum(lo, act)
+            hi = act if hi is None else torch.maximum(hi, act)
+    return _bf16_step(lo, -1).float(), _bf16_step(hi, 1).float()
 
 
 def _e4m3_spacing(q):
@@ -137,34 +171,43 @@ def _e4m3_spacing(q):
     return torch.pow(2.0, exponent.float() - 4.0)
 
 
-def _assert_quantizes_reference(out_q, out_s, g, u, act):
+def _assert_quantizes_reference(out_q, out_s, g, u):
     """Definition check against the torch reference, independent of any FlashInfer kernel.
 
-    The reference GEMM accumulates in a different order, so its BF16 gate/up halves may differ
-    from the kernel's by one BF16 ulp: the group scales move by at most 2**-7 relative and the
-    activation by 2**-6 * |g| * |u| + 2**-7 * |act|.  Round-to-nearest quantization then places
-    the dequantized value within half an E4M3 spacing of the activation, whichever side of a
-    rounding boundary the kernel lands on.
+    :func:`_activation_envelope` encloses every BF16 activation of a kernel whose
+    gate and up halves are within one BF16 ulp of the reference halves.  The
+    group scale ``max(absmax, EPS) / 448`` (an FP32 division, as in the kernel)
+    therefore lies between the scales of the envelope's smallest and largest
+    magnitudes, and round-to-nearest quantization ``q = act * (1 / scale)``
+    places the dequantized value within half an E4M3 spacing of the envelope
+    plus the two FP32 roundings of the reciprocal-multiply.
     """
     m, h = out_q.shape
-    ref_s = _reference_group_scales(act)
+    lo, hi = _activation_envelope(g, u)
+    straddles_zero = (lo <= 0) & (hi >= 0)
+    magnitude_lo = torch.where(
+        straddles_zero, torch.zeros_like(lo), torch.minimum(lo.abs(), hi.abs())
+    )
+    magnitude_hi = torch.maximum(lo.abs(), hi.abs())
+    grouped = (m, h // GROUP_SIZE, GROUP_SIZE)
+    scale_lo = magnitude_lo.reshape(grouped).amax(dim=-1).clamp_min(EPS) / 448.0
+    scale_hi = magnitude_hi.reshape(grouped).amax(dim=-1).clamp_min(EPS) / 448.0
     assert torch.isfinite(out_s).all()
-    torch.testing.assert_close(
-        out_s, ref_s.reshape(out_s.shape), atol=0.0, rtol=2.0**-7
+    s = out_s.reshape(m, h // GROUP_SIZE)
+    outside = (s < scale_lo) | (s > scale_hi)
+    excess_rel = torch.maximum((scale_lo - s) / scale_lo, (s - scale_hi) / scale_hi)
+    assert not bool(outside.any()), (
+        f"{int(outside.sum())} group scales outside the one-ulp envelope "
+        f"(max relative excess {float(excess_rel.max()):.3e})"
     )
-    s = (
-        out_s.reshape(m, h // GROUP_SIZE, 1)
-        .expand(m, h // GROUP_SIZE, GROUP_SIZE)
-        .reshape(m, h)
-    )
+    s = s.reshape(m, h // GROUP_SIZE, 1).expand(grouped).reshape(m, h)
     dequantized = out_q.float() * s
     assert torch.isfinite(dequantized).all()
-    bound = (
-        0.5 * _e4m3_spacing(out_q) * s
-        + 2.0**-6 * g.abs() * u.abs()
-        + 2.0**-7 * act.abs()
+    distance = torch.clamp(lo - dequantized, min=0.0) + torch.clamp(
+        dequantized - hi, min=0.0
     )
-    excess = (dequantized - act).abs() - bound
+    bound = (0.5 * _e4m3_spacing(out_q) + 2.0**-22 * out_q.float().abs()) * s
+    excess = distance - bound
     violations = int((excess > 0).sum())
     assert violations == 0, (
         f"{violations} elements exceed the quantization bound "
@@ -273,11 +316,12 @@ ROUTING_CASES = [
 @pytest.mark.parametrize("group_counts,n2,k,arbitrary_scales", ROUTING_CASES)
 def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_scales):
     device = torch.device("cuda")
+    seed = 662 + len(group_counts) + n2 + k
     a, b, a_scale, b_scale, m_indices = _make_inputs(
         group_counts,
         n2,
         k,
-        seed=662 + len(group_counts) + n2 + k,
+        seed=seed,
         device=device,
         arbitrary_scales=arbitrary_scales,
     )
@@ -311,21 +355,20 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
         assert prepared.tail_grid is None and set(prepared.stage_grids) == {"main"}
     out_q, out_s = prepared.launch()
     torch.cuda.synchronize()
-    g, u, act = _reference_activation(
-        _reference_gemm(a, b, a_scale, b_scale, m_indices)
-    )
-    _assert_quantizes_reference(out_q, out_s, g, u, act)
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
     # Contents may change between launches of the same prepared object.
-    a.copy_(torch.randn(a.shape, device=device).to(torch.float8_e4m3fn))
+    refill = torch.Generator(device=device).manual_seed(seed + 1)
+    a.copy_(
+        torch.randn(a.shape, generator=refill, device=device).to(torch.float8_e4m3fn)
+    )
     out_q2, out_s2 = prepared()
     torch.cuda.synchronize()
     assert (
         out_q2.data_ptr() == out_q.data_ptr() and out_s2.data_ptr() == out_s.data_ptr()
     )
-    g, u, act = _reference_activation(
-        _reference_gemm(a, b, a_scale, b_scale, m_indices)
-    )
-    _assert_quantizes_reference(out_q2, out_s2, g, u, act)
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q2, out_s2, g, u)
 
 
 @pytest.mark.parametrize("group_counts,n2,k,arbitrary_scales", ROUTING_CASES)
