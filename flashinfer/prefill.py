@@ -1774,6 +1774,21 @@ _CUTLASS_PLAN_WORK_CAPACITY = 131072
 _CUTLASS_PLAN_QO_TILE_SIZE = 256
 
 
+def _plan_indptr_host(indptr, indptr_cpu, name):
+    if indptr_cpu is None:
+        return indptr.to("cpu")
+    if indptr_cpu.device.type != "cpu":
+        raise ValueError(f"{name} must be a CPU tensor")
+    if indptr_cpu.ndim != 1 or indptr_cpu.shape != indptr.shape:
+        raise ValueError(f"{name} must have the same 1-D shape as its indptr")
+    if (
+        indptr_cpu.dtype not in (torch.int32, torch.int64)
+        or indptr_cpu.dtype != indptr.dtype
+    ):
+        raise ValueError(f"{name} must have the same integer dtype as its indptr")
+    return indptr_cpu
+
+
 def _cutlass_plan_work_items(qo_indptr_host: torch.Tensor, num_qo_heads: int) -> int:
     """Work items `fmha_varlen_plan` will emit: one per (qo_tile, head, batch).
 
@@ -4351,6 +4366,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         max_sequence_kv: Optional[int] = None,
         v_indptr: Optional[torch.Tensor] = None,
         o_indptr: Optional[torch.Tensor] = None,
+        qo_indptr_cpu: Optional[torch.Tensor] = None,
+        kv_indptr_cpu: Optional[torch.Tensor] = None,
     ) -> None:
         r"""Plan batch prefill/append attention on Ragged KV-Cache for given problem specification.
 
@@ -4363,6 +4380,13 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             backend also requires ``kv_layout="NHD"``.
         kv_indptr : torch.Tensor
             The indptr of the key/value tensor, shape: ``[batch_size + 1]``.
+        qo_indptr_cpu, kv_indptr_cpu : Optional[torch.Tensor]
+            CPU mirrors of the corresponding indptrs, with the same shape,
+            integer dtype, and values. When supplied, planning reads these
+            mirrors without copying device indptrs back to the CPU. Device
+            bindings still use ``qo_indptr`` and ``kv_indptr``. The caller must
+            keep each mirror consistent with its device tensor at every plan;
+            values are not compared because that would require synchronization.
         num_qo_heads : int
             The number of query/output heads.
         num_kv_heads : int
@@ -4512,8 +4536,8 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             )
 
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
-        qo_indptr_host = qo_indptr.to("cpu")
-        kv_indptr_host = kv_indptr.to("cpu")
+        qo_indptr_host = _plan_indptr_host(qo_indptr, qo_indptr_cpu, "qo_indptr_cpu")
+        kv_indptr_host = _plan_indptr_host(kv_indptr, kv_indptr_cpu, "kv_indptr_cpu")
 
         self._qo_indptr_last = int(qo_indptr_host[-1])
         total_num_rows = self._qo_indptr_last
@@ -5029,9 +5053,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 num_qo_heads,
                 causal,
             )
-            self._max_qo_len = torch.max(
-                self._qo_indptr_buf[1:] - self._qo_indptr_buf[:-1]
-            ).item()
+            self._max_qo_len = max_qo_len
         elif self._backend == "fmha_v2":
             # fmha_v2 handles planning internally — no JIT module plan needed
             pass

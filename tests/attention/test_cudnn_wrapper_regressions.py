@@ -1034,3 +1034,66 @@ def test_prefill_hn_layout_capacity_switch_keeps_old_capture(monkeypatch, mode):
             assert bool(torch.isnan(lse[:, 4:]).all())
     finally:
         graph.reset()
+
+
+@pytest.mark.parametrize("backend", ["cudnn", "cutlass"])
+def test_ragged_cpu_prefixes_avoid_sync_and_preserve_device_bindings(backend):
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("requires Blackwell")
+    q = torch.randn(5, 8, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(50, 8, 128, device=q.device, dtype=q.dtype)
+    v = torch.randn_like(k)
+    qo = torch.tensor([0, 3, 5], dtype=torch.int32)
+    kv = torch.tensor([0, 33, 50], dtype=torch.int32)
+    qo_gpu, kv_gpu = qo.cuda(), kv.cuda()
+    w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 << 20, device=q.device, dtype=torch.uint8), backend=backend
+    )
+    kwargs = dict(q_data_type=q.dtype, qo_indptr_cpu=qo, kv_indptr_cpu=kv)
+    w.plan(qo_gpu, kv_gpu, 8, 8, 128, **kwargs)
+    w.run(q, k, v)
+    for split in (2, 3):
+        qo[1] = split
+        qo_gpu.copy_(qo)
+        torch.cuda.synchronize()
+        previous = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            w.plan(qo_gpu, kv_gpu, 8, 8, 128, **kwargs)
+        finally:
+            torch.cuda.set_sync_debug_mode(previous)
+        assert w._qo_indptr_buf.data_ptr() == qo_gpu.data_ptr()
+        assert w._kv_indptr_buf.data_ptr() == kv_gpu.data_ptr()
+        out, lse = w.run(q, k, v, return_lse=True, lse_base="ln")
+        ref, stats = _reference(
+            q,
+            k.unsqueeze(1),
+            v.unsqueeze(1),
+            qo,
+            kv,
+            torch.arange(50, dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+            causal=False,
+            scale=128**-0.5,
+        )
+        torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(lse, stats, atol=0.003, rtol=0.003)
+
+
+@pytest.mark.parametrize("name", ["qo_indptr_cpu", "kv_indptr_cpu"])
+@pytest.mark.parametrize("bad", ["device", "shape", "dtype"])
+def test_ragged_rejects_invalid_cpu_prefix_mirror(name, bad):
+    qo = torch.tensor([0, 3, 5], dtype=torch.int32)
+    kv = torch.tensor([0, 33, 50], dtype=torch.int32)
+    hints = dict(qo_indptr_cpu=qo, kv_indptr_cpu=kv)
+    if bad == "device":
+        hints[name] = hints[name].cuda()
+    elif bad == "shape":
+        hints[name] = hints[name][:2]
+    else:
+        hints[name] = hints[name].float()
+    w = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
+        torch.empty(128 << 20, device="cuda", dtype=torch.uint8), backend="cudnn"
+    )
+    with pytest.raises(ValueError, match=name):
+        w.plan(qo.cuda(), kv.cuda(), 8, 8, 128, q_data_type=torch.bfloat16, **hints)
