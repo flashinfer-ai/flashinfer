@@ -2444,6 +2444,14 @@ unchosen launches on the device (graph conditional nodes, the standing open
 item of the rank's tile choice above) so that a routing without windows
 costs the dispatch kernel alone. Both remain the L2 follow-ups; L3 (fused
 GEMM1 -> SiTU -> GEMM2, bounded at 1.0-1.7 % in round 23) stays closed.
+Against TRT-LLM Gen on the same allocation (graph, GPU span, TRT / mixed):
+shard T=8192 balanced / hot / ``empty`` 1.02 / 1.07 / 1.13 (dense path
+0.98 / 0.96 / 1.19), T=16384 1.20 / 1.18 / 1.09, T=32768 1.15 / 1.20 /
+1.04; rank T=8192 balanced / hot / ``empty`` / remote-dominated 1.09 / 1.10
+/ 1.81 / 1.51 (dense path 0.96 / 0.99 / 3.4 / 1.5), T=16384 1.15 / 1.20 /
+3.36 / 1.17, T=32768 1.20 / 1.13 / 3.34 / 1.26: with the form every dense
+row of both layouts runs ahead of TRT-LLM Gen, at the price of the
+``empty``-row regressions above against the dense path.
 Numerics: every mixed variant matches the FP64 reference at the dense path's
 relative L2 (0.0053 shard, 0.0017-0.0045 rank, T=8192 / 16384, three
 routings); compute-sanitizer synccheck and memcheck at T=2048 on both
