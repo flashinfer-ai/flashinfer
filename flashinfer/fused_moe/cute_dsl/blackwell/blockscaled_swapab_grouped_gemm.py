@@ -1576,9 +1576,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     zero_buf[zi] = cutlass.Int64(0)
 
         #
-        # Scheduler warp: row groups >= num_valid_groups carry no work. Because
-        # the raster order is m-fastest, once an invalid group is reached every
-        # later work item is invalid as well.
+        # Scheduler warp: row groups >= num_valid_groups carry no work. With the
+        # m-fastest raster, once an invalid group is reached every later work
+        # item is invalid as well; the group-fastest raster skips them.
         #
         if warp_idx == self.sched_warp_id:
             is_continue = cutlass.Boolean(1)
@@ -1686,7 +1686,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     tile_info_pipeline.producer_commit(tile_info_producer_state)
                     tile_info_producer_state.advance()
                 else:
-                    is_continue = cutlass.Boolean(0)
+                    # m-fastest raster: every later item is invalid too. Row
+                    # group-fastest raster: the invalid slots of this weight
+                    # chunk are followed by the next chunk's valid groups.
+                    if cutlass.const_expr(self.raster_along_m):
+                        is_continue = cutlass.Boolean(0)
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
