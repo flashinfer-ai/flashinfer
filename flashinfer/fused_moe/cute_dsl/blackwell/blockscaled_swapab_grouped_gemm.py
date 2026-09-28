@@ -2545,6 +2545,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                 sExch[(xrow, c)] = ux
                                         self.epilog_sync_barrier.arrive_and_wait()
                                         if is_gate_lane:
+                                            sf_codeg = cutlass.Int32(0)
                                             for c in cutlass.range_constexpr(half, epi_n):
                                                 vg = sExch[(xrow, c)] * native_situ_f32(
                                                     vals[c], beta, fastmath=True
@@ -2563,22 +2564,27 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                     vg * inv_scaleg,
                                                     okg * cutlass.Int32(self.perf_probe != 4),
                                                 )
-                                                if cutlass.const_expr(self.sf_blocked):
-                                                    sf_dstg = cute.domain_offset(
-                                                        (
-                                                            prowg % 32,
-                                                            (prowg // 32) % 4,
-                                                            prowg // 128,
-                                                            sf_kb % 4,
-                                                            sf_kb // 4,
-                                                            0,
-                                                        ),
-                                                        out_sf,
-                                                    )
-                                                else:
-                                                    sf_dstg = cute.domain_offset((prowg, sf_kb), out_sf)
-                                                st_u8_pred(sf_dstg, scale_codeg, okg * is_lane0 * cutlass.Int32(self.perf_probe != 4))
+                                                sf_codeg = sf_codeg | (scale_codeg * cutlass.Int32(lane == c))
+                                            # One SF store per subtile: lane c carries column c's code.
+                                            prow_l = row_base + sub * epi_n + lane
+                                            ok_l = cutlass.Int32(prow_l < mn_limit) * cutlass.Int32(lane >= half)
+                                            if cutlass.const_expr(self.sf_blocked):
+                                                sf_dstg = cute.domain_offset(
+                                                    (
+                                                        prow_l % 32,
+                                                        (prow_l // 32) % 4,
+                                                        prow_l // 128,
+                                                        sf_kb % 4,
+                                                        sf_kb // 4,
+                                                        0,
+                                                    ),
+                                                    out_sf,
+                                                )
+                                            else:
+                                                sf_dstg = cute.domain_offset((prow_l, sf_kb), out_sf)
+                                            st_u8_pred(sf_dstg, sf_codeg, ok_l * cutlass.Int32(self.perf_probe != 4))
                                         else:
+                                            sf_codeu = cutlass.Int32(0)
                                             for c in cutlass.range_constexpr(half):
                                                 uu = vals[c]
                                                 if cutlass.const_expr(self.use_linear_beta):
@@ -2598,21 +2604,25 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                     vu * inv_scaleu,
                                                     oku * cutlass.Int32(self.perf_probe != 4),
                                                 )
-                                                if cutlass.const_expr(self.sf_blocked):
-                                                    sf_dstu = cute.domain_offset(
-                                                        (
-                                                            prowu % 32,
-                                                            (prowu // 32) % 4,
-                                                            prowu // 128,
-                                                            sf_kb % 4,
-                                                            sf_kb // 4,
-                                                            0,
-                                                        ),
-                                                        out_sf,
-                                                    )
-                                                else:
-                                                    sf_dstu = cute.domain_offset((prowu, sf_kb), out_sf)
-                                                st_u8_pred(sf_dstu, scale_codeu, oku * is_lane0 * cutlass.Int32(self.perf_probe != 4))
+                                                sf_codeu = sf_codeu | (scale_codeu * cutlass.Int32(lane == c))
+                                            # One SF store per subtile: lane c carries column c's code.
+                                            prow_l = row_base + sub * epi_n + lane
+                                            ok_l = cutlass.Int32(prow_l < mn_limit) * cutlass.Int32(lane < half)
+                                            if cutlass.const_expr(self.sf_blocked):
+                                                sf_dstu = cute.domain_offset(
+                                                    (
+                                                        prow_l % 32,
+                                                        (prow_l // 32) % 4,
+                                                        prow_l // 128,
+                                                        sf_kb % 4,
+                                                        sf_kb // 4,
+                                                        0,
+                                                    ),
+                                                    out_sf,
+                                                )
+                                            else:
+                                                sf_dstu = cute.domain_offset((prow_l, sf_kb), out_sf)
+                                            st_u8_pred(sf_dstu, sf_codeu, ok_l * cutlass.Int32(self.perf_probe != 4))
                                 cute.arch.fence_view_async_tmem_load()
                             else:
                                 # ---- finalize: transposed staging + bulk reduce-add per token ----
