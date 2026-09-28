@@ -299,7 +299,17 @@ if SWAP_WIDE192_LISTS not in ("sort", "dispatch"):
 # expert's weights a second time for a saving below one tile; a small routing
 # is a launch chain the windows cannot shorten).
 SWAP_WIDE192_MAX_ROWS = int(os.environ.get("MXFP4_SWAP192_MAX_ROWS", "0"))
-SWAP_WIDE192_MIN_ROWS = int(os.environ.get("MXFP4_SWAP192_MIN_ROWS", "0"))
+SWAP_WIDE192_MIN_ROWS = int(os.environ.get("MXFP4_SWAP192_MIN_ROWS", "1024"))
+# Enqueue order of the win layout's GEMM1s. The first GEMM1 enqueued takes
+# the SMs: below this token count the routing pads most experts to one
+# 192-row window (the dense GEMM1s then only zero-fill the output) and the
+# window chain goes first; from it up the experts hold dense tiles ahead of
+# their windows and the two dense GEMM1s go first (round 28, B300: a dead
+# swap GEMM1 enqueued first delayed the rank's live dense GEMM1 by 4-10 us,
+# a fill-only dense GEMM1 enqueued first delayed the live swap GEMM1 by 18).
+SWAP_WIDE192_DENSE_FIRST_MIN_TOKENS = int(
+    os.environ.get("MXFP4_SWAP192_DENSE_FIRST_MIN_TOKENS", "16384")
+)
 # Mixed form: weight M-tiles per swap-GEMM2 work item. Measured on B300 (TP8
 # T=256/1024 balanced): with the 128-row groups the GEMM2 of the policy tile
 # loses 6-9 % at m_group 1 and is back at the 32-row-group time with 2.
@@ -1046,6 +1056,10 @@ class Mxfp4MoESwapAbPlan:
         # caller's stream.
         self.mixed192_win_streams = bool(
             self.mixed192_dual is not None and SWAP_WIDE192_MIXED_STREAMS == "win"
+        )
+        self.mixed192_dense_first = bool(
+            self.mixed192_win_streams
+            and x.shape[0] >= SWAP_WIDE192_DENSE_FIRST_MIN_TOKENS
         )
         # The routing kernel writes the mixed work lists (no dispatch launch).
         self.mixed192_lists_from_sort = bool(
@@ -1999,25 +2013,33 @@ class Mxfp4MoESwapAbPlan:
                 self._fork_event.record(main)
                 self._side_stream.wait_event(self._fork_event)
                 side = cuda.CUstream(self._side_stream.cuda_stream)
-                # The base dense GEMM1 is enqueued before the window chain:
-                # the graph launches the two GEMM1s in that order, and the
-                # first to arrive holds the SMs. Enqueued first, the swap
-                # GEMM1's clusters delayed the dense GEMM1 by 4-5 us on the
-                # rank's single-expert routings (round 28) even without a
-                # window, while on routings with many experts the dense
-                # GEMM1 arrived first regardless.
-                compiled, args, kwargs = self._gemm1_dense
-                compiled(*args, stream=stream, **kwargs)
-                if self._dispatch is not None:
-                    self._dispatch(*self._dispatch_args, self._side_stream.cuda_stream)
-                if self._token_index is not None:
-                    self._token_index(*self._token_index_args, stream=side)
-                self._gemm1(*self._gemm1_args, stream=side)
-                if self._gemm2_wide is None:
-                    self._swap_gemm1_event.record(self._side_stream)
-                if self._gemm1_dense_alt is not None:
-                    compiled, args, kwargs = self._gemm1_dense_alt
+                # The graph launches the GEMM1s in enqueue order and the
+                # first to arrive holds the SMs (see
+                # SWAP_WIDE192_DENSE_FIRST_MIN_TOKENS).
+                def window_chain():
+                    if self._dispatch is not None:
+                        self._dispatch(
+                            *self._dispatch_args, self._side_stream.cuda_stream
+                        )
+                    if self._token_index is not None:
+                        self._token_index(*self._token_index_args, stream=side)
+                    self._gemm1(*self._gemm1_args, stream=side)
+                    if self._gemm2_wide is None:
+                        self._swap_gemm1_event.record(self._side_stream)
+
+                def dense_gemm1s():
+                    compiled, args, kwargs = self._gemm1_dense
                     compiled(*args, stream=stream, **kwargs)
+                    if self._gemm1_dense_alt is not None:
+                        compiled, args, kwargs = self._gemm1_dense_alt
+                        compiled(*args, stream=stream, **kwargs)
+
+                if self.mixed192_dense_first:
+                    dense_gemm1s()
+                    window_chain()
+                else:
+                    window_chain()
+                    dense_gemm1s()
                 if self._gemm2_wide is not None:
                     self._fill_event.record(main)
                     self._side_stream.wait_event(self._fill_event)
