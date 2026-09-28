@@ -339,6 +339,38 @@ def decode_cs_alias_fits(
     return (2 * csplit - 1) * 128 * (chunk | 1) * 4 <= module_stages * stage_bytes
 
 
+def decode_cs_small_inbox_rounds(
+    tok: int, stages: int, fused: bool, resident: bool, csplit: int, xb_stages: int = 0
+) -> int:
+    """Round 5: exchange rounds of the small (non-aliased) cluster inbox next to the
+    physical pipeline stages (host mirror of the Cake ``decode_cs_small_inbox_rounds``
+    rule).  The aliased one-round exchange is selected only when this is > 1: with 4-8
+    rows per rank the small inbox already holds the owner range in one round, and the
+    all-rank ordering the aliased exchange needs costs ~1.6 us at C8."""
+    if csplit < 2:
+        return 1
+    tok_rows = max(tok, 32)
+    xb_bytes = tok * 512 if (fused and not resident) else 0
+    xb_ring = bool(fused and not resident and xb_stages > 0)
+    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
+    stage_bytes = (
+        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    )
+    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
+    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
+    module_stages = decode_module_stages(tok, stages, fused, resident, xb_stages)
+    need = 5 * (2 * csplit - 1) * 128 * 4
+    while (
+        module_stages > 1
+        and DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes < need
+    ):
+        module_stages -= 1
+    budget = DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+    tpc = -(-tok // csplit)
+    chunk = min(-(-tpc // 4) * 4, (budget // ((2 * csplit - 1) * 128 * 4) - 1) // 4 * 4)
+    return -(-tpc // max(chunk, 4))
+
+
 def decode_cluster_capacity(arch: str, csplit: int) -> int:
     """Co-resident cluster capacity of ``arch`` for cluster size ``csplit`` (tabulated; raises when not measured)."""
     table = DECODE_MAX_ACTIVE_CLUSTERS.get(arch, {})
@@ -515,7 +547,9 @@ def decode_config(
         csplit=csplit,
         cs_alias=csplit > 1
         and grid == total_work
-        and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages),
+        and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages)
+        and decode_cs_small_inbox_rounds(tok, stages, fused, resident, csplit, xb_stages)
+        > 1,
     )
 
 
