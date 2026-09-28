@@ -117,6 +117,34 @@ BT_ALL_REDUCE_GB300_TP8_H5120_PRESET_1 = BTAllReduceTuning(
     collective=BTCollectiveTuning(reduction_threads=320)
 )
 
+# hidden_size=6144, bf16, top_k 8. 768 bf16x8 vectors tile exactly under
+# every elements_per_thread/threads pair, so the finalize presets keep H5120's
+# shapes with prefetch_group tracking top_k. The all-reduce PRESET_1 keeps 320
+# reduction threads even though the owner reduce then leaves its third CTA
+# per token 80% busy: on B300 that 3-CTA split measured as fast as, or up to
+# ~4% faster than, an exact 2-CTA split at 384 threads, so CTA count matters
+# more here than idle lanes.
+BT_FINALIZE_B300_TP4_H6144_K8_PRESET_0 = BTFinalizeTuning(
+    elements_per_thread=2, threads=256, prefetch_group=8
+)
+BT_FINALIZE_B300_TP4_H6144_K8_PRESET_1 = BTFinalizeTuning(
+    elements_per_thread=8, threads=128, prefetch_group=8
+)
+BT_FINALIZE_B300_TP8_H6144_K8_PRESET_0 = BTFinalizeTuning(
+    elements_per_thread=2, threads=256, prefetch_group=8
+)
+BT_FINALIZE_B300_TP8_H6144_K8_PRESET_1 = BTFinalizeTuning(
+    elements_per_thread=8, threads=128, prefetch_group=8
+)
+BT_ALL_REDUCE_B300_TP4_H6144_PRESET_0 = BTAllReduceTuning()
+BT_ALL_REDUCE_B300_TP4_H6144_PRESET_1 = BTAllReduceTuning(
+    collective=BTCollectiveTuning(reduction_threads=320)
+)
+BT_ALL_REDUCE_B300_TP8_H6144_PRESET_0 = BTAllReduceTuning()
+BT_ALL_REDUCE_B300_TP8_H6144_PRESET_1 = BTAllReduceTuning(
+    collective=BTCollectiveTuning(reduction_threads=320)
+)
+
 
 @dataclass(slots=True)
 class BTProtocolState:
