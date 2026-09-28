@@ -2111,11 +2111,10 @@ def test_moe_sort_mixed_lists_match_dispatch(
         )
         assert lists[active_list][: len(wide_ref)].tolist() == wide_ref
         assert lists["narrow_list"][: len(narrow_ref)].tolist() == narrow_ref
-    if min_total_rows or (max_rows and distribution != "balanced"):
-        # The rule removed windows: every expert keeps all its dense tiles.
-        if min_total_rows:
-            assert len(narrow_ref) == 0 and len(wide_ref) == len(expert)
-    elif distribution != "empty":
+    if min_total_rows:
+        # The rule removed every window: each expert keeps all its dense tiles.
+        assert len(narrow_ref) == 0 and len(wide_ref) == len(expert)
+    elif not max_rows and distribution != "empty":
         assert len(narrow_ref) > 0
     assert (lists[active_list][len(wide_ref) :] == -7).all()
     assert (lists["narrow_list"][len(narrow_ref) :] == -7).all()

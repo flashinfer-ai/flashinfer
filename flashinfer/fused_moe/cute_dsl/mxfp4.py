@@ -2062,7 +2062,9 @@ class Mxfp4MoESwapAbPlan:
                     compiled(*args, stream=side)
                 self._join_event.record(self._side_stream)
             mixed_side = (
-                self.mixed192 and self._side_stream is not None and not tile_side
+                self.mixed192
+                and self._side_stream is not None
+                and not (tile_side or win_side)
             )
             if mixed_side:
                 # Dense chain (dense GEMM1, then the dense finalize over the
