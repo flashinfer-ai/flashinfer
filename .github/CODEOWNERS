@@ -66,20 +66,20 @@ include/flashinfer/mamba/       @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @j
 tests/mamba/                    @kahyunnam @yzh119 @bkryu @jimmyzho @ishovkun @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
 
 # ── KDA ──
-benchmarks/bench_recurrent_kda*          @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-csrc/kda/                                @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-docs/api/kda.rst                         @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-docs/api/kda_decode.rst                  @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-docs/api/kda_prefill.rst                 @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-flashinfer/jit/flash_kda.py              @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-flashinfer/jit/flash_kda_decode.py       @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-flashinfer/kda.py                        @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-flashinfer/kda_decode.py                 @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-flashinfer/kda_kernels/                  @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-flashinfer/kda_prefill.py                @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-flashinfer/trace/templates/kda.py        @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-tests/jit/test_flash_kda*                @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
-tests/kda/                               @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc
+benchmarks/bench_recurrent_kda*          @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+csrc/kda/                                @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+docs/api/kda.rst                         @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+docs/api/kda_decode.rst                  @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+docs/api/kda_prefill.rst                 @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+flashinfer/jit/flash_kda.py              @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+flashinfer/jit/flash_kda_decode.py       @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+flashinfer/kda.py                        @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+flashinfer/kda_decode.py                 @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+flashinfer/kda_kernels/                  @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+flashinfer/kda_prefill.py                @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+flashinfer/trace/templates/kda.py        @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+tests/jit/test_flash_kda*                @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
+tests/kda/                               @kahyunnam @yzh119 @bkryu @jimmyzho @jhjpark @aleozlx @Jingfan-Sun @YangXu1990uiuc @yyihuang
 
 # ── Autotuner ──
 flashinfer/autotuner/    @qiching @yzh119 @bkryu @aleozlx @Jingfan-Sun @YangXu1990uiuc
