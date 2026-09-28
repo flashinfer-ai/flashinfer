@@ -1414,6 +1414,11 @@ def test_seq_len_below_next_n_all_backends(backend):
     major, minor = get_compute_capability(torch.device("cuda"))
     if not flashinfer.top_k_varlen.is_backend_supported(backend, major * 10 + minor):
         pytest.skip(f"{backend} unsupported on this device")
+    if backend == "radix_filter":
+        from flashinfer.topk_varlen.topk_varlen import _radix_filter_kernel_dsl_ok
+
+        if not _radix_filter_kernel_dsl_ok():
+            pytest.skip("radix_filter requires nvidia-cutlass-dsl >= 4.8")
     top_k, N, next_n = 512, 8192, 3
     # request seq_lens: three that make some numerators negative
     # (0 -> -2,-1,0; 1 -> -1,0,1; 2 -> 0,1,2), one straddling top_k, two full.
