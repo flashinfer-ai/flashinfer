@@ -131,7 +131,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         fin_red: bool = True,
         weight_l2_hint: Optional[int] = None,
         token_l2_hint: Optional[int] = None,
-        raster_along_m: bool = True,
         row_tma: Optional[bool] = None,
         gather_warps: Optional[int] = None,
         m_group: int = 1,
@@ -331,11 +330,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # L2::cache_hint): the weight-chunk items of one row group re-gather
         # the same rows, so evict_last keeps them resident for the siblings.
         self.token_l2_hint = token_l2_hint
-        # Work-item raster: weight chunks fastest (True; the row group's token
-        # stage is re-gathered per chunk while its rows stay L2-hot) or row
-        # groups fastest (False; one 256-column output window of the finalize
-        # GEMM2 stays L2-resident across all row groups).
-        self.raster_along_m = raster_along_m
         self.acc_dtype = cutlass.Float32
         self.cta_group = tcgen05.CtaGroup.TWO if self.two_cta else tcgen05.CtaGroup.ONE
         self.cluster_shape_mn = (self.cta_v, 1)
@@ -591,7 +585,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         tile_sched_params = utils.PersistentTileSchedulerParams(
             (num_m_tiles, num_row_groups, 1),
             (self.cta_v, 1, 1),
-            raster_along_m=self.raster_along_m,
+            raster_along_m=True,
         )
         grid = utils.StaticPersistentTileScheduler.get_grid_shape(
             tile_sched_params, max_active_clusters
