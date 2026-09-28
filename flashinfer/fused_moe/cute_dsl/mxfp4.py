@@ -260,11 +260,20 @@ if SWAP_WIDE192_MIXED_GEMM2 not in ("auto", "split", "dense", "alt"):
 SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS = int(
     os.environ.get("MXFP4_SWAP192_DENSE_GEMM2_MIN_TOKENS", "16384")
 )
-# Mixed form on two streams: the dense chain (dense GEMM1, and the dense
-# finalize over the dense tiles in the ``split`` GEMM2 form) runs on the
-# plan's side stream beside the swap chain; the row sets are disjoint and
-# both finalizes add atomically into the zero-filled output.
-SWAP_WIDE192_MIXED_STREAMS = os.environ.get("MXFP4_SWAP192_MIXED_STREAMS", "0") == "1"
+# Mixed form on two streams. ``tile`` (default; needs the dual-tile
+# routing): the alternate-padding chain (M256 dense GEMM1 and finalize) runs
+# on the plan's side stream and the base-padding chain (swap GEMM1, M128
+# dense GEMM1, the GEMM2 form's launches) on the caller's stream, forked
+# after the dispatch kernel and joined at the end. The routing chooses one
+# padding per run, so one chain is always dead; on its own stream a dead
+# chain never sits between two live kernels, where each dead launch would
+# cost a dependency hop (2-3 us) under programmatic dependent launch (round
+# 27: 5.4 us between GEMM1 and GEMM2 and 5.7 us after GEMM2 on the shard's
+# T=8192 ``empty`` routing). ``1``: the dense chain on the side stream beside
+# the swap chain (round 26 form). ``0``: every launch on the caller's stream.
+SWAP_WIDE192_MIXED_STREAMS = os.environ.get("MXFP4_SWAP192_MIXED_STREAMS", "tile")
+if SWAP_WIDE192_MIXED_STREAMS not in ("0", "1", "tile"):
+    raise ValueError("MXFP4_SWAP192_MIXED_STREAMS must be 0, 1 or tile")
 # Wide 192-row forms: where the finalize output is zero-filled. ``route``:
 # the routing conversion kernel (17-99 us at T = 8192..32768 on the
 # critical path); ``gemm1``: the swap GEMM1's epilogue warps (grid-strided
@@ -1010,10 +1019,17 @@ class Mxfp4MoESwapAbPlan:
         self.mixed192_dual = wrapper._swap_mixed192_dual(x.shape[0], self.finalize)
         self.mixed192_alt_gemm2 = False  # set by _prepare
         self.split_dense = False  # set by _prepare
+        # Two-stream layouts (SWAP_WIDE192_MIXED_STREAMS): ``tile`` puts the
+        # alternate-padding chain on the side stream, ``1`` the dense chain.
+        self.mixed192_tile_streams = bool(
+            self.mixed192_dual is not None and SWAP_WIDE192_MIXED_STREAMS == "tile"
+        )
         self._side_stream = None
         self._fork_event = self._join_event = None
-        if (self.split and SWAP_SPLIT_SIDE_STREAM) or (
-            self.mixed192 and SWAP_WIDE192_MIXED_STREAMS
+        if (
+            (self.split and SWAP_SPLIT_SIDE_STREAM)
+            or (self.mixed192 and SWAP_WIDE192_MIXED_STREAMS == "1")
+            or self.mixed192_tile_streams
         ):
             self._side_stream = torch.cuda.Stream(device=self.device)
             self._fork_event = torch.cuda.Event()
@@ -1922,7 +1938,27 @@ class Mxfp4MoESwapAbPlan:
                 compiled(*args, stream=stream, **kwargs)
                 compiled, args = self._gemm2_wide
                 compiled(*args, stream=stream)
-            mixed_side = self.mixed192 and self._side_stream is not None
+            tile_side = self.mixed192_tile_streams
+            if tile_side:
+                # Alternate-padding chain (M256 dense GEMM1, then its finalize)
+                # on the side stream: live only when the routing chose the
+                # 256-row padding, when every launch left on this stream is
+                # dead; the two chains never wait on each other's kernels
+                # (disjoint rows, each GEMM1 zero-fills when the other holds no
+                # tiles), only on the dispatch (fork) and at the join.
+                main = torch.cuda.current_stream()
+                self._fork_event.record(main)
+                self._side_stream.wait_event(self._fork_event)
+                side = cuda.CUstream(self._side_stream.cuda_stream)
+                compiled, args, kwargs = self._gemm1_dense_alt
+                compiled(*args, stream=side, **kwargs)
+                if self._gemm2_dense_alt is not None:
+                    compiled, args = self._gemm2_dense_alt
+                    compiled(*args, stream=side)
+                self._join_event.record(self._side_stream)
+            mixed_side = (
+                self.mixed192 and self._side_stream is not None and not tile_side
+            )
             if mixed_side:
                 # Dense chain (dense GEMM1, then the dense finalize over the
                 # dense tiles when GEMM2 is split) beside the swap chain; the
@@ -1947,7 +1983,7 @@ class Mxfp4MoESwapAbPlan:
                         compiled, args = self._gemm2_dense_alt
                         compiled(*args, stream=side)
                 self._join_event.record(self._side_stream)
-            if self._gemm1_dense_alt is not None and not mixed_side:
+            if self._gemm1_dense_alt is not None and not (mixed_side or tile_side):
                 # Coarser-tile dense GEMM1 first: on the routings that choose
                 # it (few large experts) the swap and base-tile launches then
                 # find no work and overlap its tail instead of preceding it.
@@ -1965,7 +2001,7 @@ class Mxfp4MoESwapAbPlan:
                 # zero-fills on the side stream.
                 torch.cuda.current_stream().wait_event(self._gemm1_done_event)
             if self._gemm2_dense_alt is not None and not (
-                mixed_side and self._gemm2_wide is not None
+                (mixed_side and self._gemm2_wide is not None) or tile_side
             ):
                 # Same order for GEMM2 (all GEMM1s precede it in the stream).
                 compiled, args = self._gemm2_dense_alt
