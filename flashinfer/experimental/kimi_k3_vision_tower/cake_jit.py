@@ -38,7 +38,9 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # * ``gemm:<variant>:<tile>``   the fused tcgen05 BF16 GEMM family
 #   (``pos``, ``norm_qkv_rope``, ``residual_wo``, ``norm_gelu``,
 #   ``residual_fc1``, ``gelu_erf``, ``rmsnorm``) on the production tile
-#   configuration ``select_tile_config`` picks for the token count;
+#   configuration ``select_tile_config`` picks for the token count (the
+#   ``l_sk`` stream-K twin of the projector GEMMs inside its tile-census
+#   window);
 # * ``attention:tiles2`` / ``attention:tiles1`` / ``attention:ring3``   the
 #   packed-varlen BF16 attention kernel in its two-tile and SPLIT_KV unit
 #   layouts (the host plan rule ``select_tiles_per_cta`` chooses per

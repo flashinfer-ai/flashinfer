@@ -161,6 +161,22 @@ ATTN_MAX_SEGMENT_CLUSTERS = 1 << 16
 MODE_TWO_TILE = 2
 MODE_SPLIT_KV = 1
 SPLIT_MARGIN = 0.05
+# Round 4 (CAKE-722 lever A): the SPLIT_KV layout is priced per architecture (Cake
+# ``kimi_k3_vision_attention.SPLIT_COST_MODELS`` / ``split_cost_model``).  A split unit costs
+# ``iter_scale * stage_iters + unit_overhead`` K/V-block equivalents and the layout wins when its
+# LPT makespan is below ``(1 - margin)`` x the two-tile makespan (which keeps the H3 block model:
+# ``iter_scale`` 1, ``ATTN_UNIT_OVERHEAD_BLOCKS``).  ``"r3"`` is the round-3 model, used by the
+# arches without an entry and by plans built without an arch; on sm_100a the ring loop is priced
+# at its measured 0.95 blocks per K/V block with a one-block unit boundary and no margin (the
+# post-A4 re-fit routes every contract row but img_640x480 to the ring there).
+SPLIT_COST_MODELS: dict[str, dict[str, float]] = {
+    "r3": {
+        "iter_scale": 1.0,
+        "unit_overhead": float(ATTN_UNIT_OVERHEAD_BLOCKS),
+        "margin": SPLIT_MARGIN,
+    },
+    "sm_100a": {"iter_scale": 0.95, "unit_overhead": 1.0, "margin": 0.0},
+}
 # Round 3 (A5): the production SPLIT_KV form is the shared-O three-deep score ring
 # (``attention:ring3``) where the arch / longest-segment table selects it (Cake
 # ``kimi_k3_vision_attention.RING3_MAX_SEGMENT_TOKENS`` / ``RING3_MIN_SEGMENT_TOKENS``):
@@ -209,9 +225,11 @@ PRODUCTION_GEMM_VARIANTS = tuple(
 # ``grid_x/y/z``.  The GEMM template takes the packed RoPE table ``CS``
 # (bf16 view of the u32 words; defaults to ``B``), the tail split-K workspace
 # ``WS`` (f32) / arrival counters ``FLAGS`` (u32) with ``full_tiles`` /
-# ``tail_split``; the production tiles have no tail paths, so the host binds
-# the Cake launcher's dummies (``WS`` = f32 zeros[16], ``FLAGS`` = u32
-# zeros[16], ``full_tiles`` = cluster tiles, ``tail_split`` = 1).
+# ``tail_split``; the tiles without a stream-K tail have no tail paths, so the
+# host binds the Cake launcher's dummies (``WS`` = f32 zeros[16], ``FLAGS`` =
+# u32 zeros[16], ``full_tiles`` = cluster tiles, ``tail_split`` = 1); the
+# stream-K twin binds the plan's partial workspace / counters with the
+# data-parallel tile count and the k-steps per tail piece.
 GEMM_KWARGS = (
     "A",
     "A2",
@@ -424,16 +442,23 @@ def attention_grid_clusters(device: torch.device) -> int:
 
 
 def _attention_unit_costs(
-    lens: Sequence[int], num_heads: int, tiles_per_cta: int
-) -> tuple[list[tuple[int, int, int]], list[int]]:
-    """Enumerate (segment, head, cluster) units segment-major (heads slow, clusters fast) with LPT costs."""
+    lens: Sequence[int],
+    num_heads: int,
+    tiles_per_cta: int,
+    *,
+    iter_scale: float = 1.0,
+    unit_overhead: float = ATTN_UNIT_OVERHEAD_BLOCKS,
+) -> tuple[list[tuple[int, int, int]], list[float]]:
+    """Enumerate (segment, head, cluster) units segment-major (heads slow, clusters fast) with LPT costs
+    of ``iter_scale * stage_iters + unit_overhead`` K/V-block equivalents (the defaults are the H3
+    block-count model; the split cost model of the arch retunes the SPLIT_KV layout)."""
     rows_per_cluster = 2 * tiles_per_cta * ATTN_BLOCK_M
     units: list[tuple[int, int, int]] = []
-    costs: list[int] = []
+    costs: list[float] = []
     for seg, length in enumerate(lens):
         blocks = (length + ATTN_BLOCK_N - 1) // ATTN_BLOCK_N
         stage_iters = blocks if tiles_per_cta == MODE_TWO_TILE else (blocks + 1) // 2
-        cost = stage_iters + ATTN_UNIT_OVERHEAD_BLOCKS
+        cost = iter_scale * stage_iters + unit_overhead
         seg_clusters = (length + rows_per_cluster - 1) // rows_per_cluster
         if seg_clusters >= ATTN_MAX_SEGMENT_CLUSTERS:
             raise ValueError(
@@ -446,13 +471,13 @@ def _attention_unit_costs(
     return units, costs
 
 
-def lpt_makespan(costs: Sequence[int], grid_clusters: int) -> tuple[int, list[int]]:
+def lpt_makespan(costs: Sequence[float], grid_clusters: int) -> tuple[float, list[int]]:
     """(max per-cluster cost, slot -> unit) of the kernel's LPT slot assignment on ``grid_clusters`` slots."""
     if not costs:
-        return 0, []
+        return 0.0, []
     num_clusters = min(grid_clusters, len(costs))
     slots = assign_unit_slots(list(costs), num_clusters)
-    per_cluster = [0] * num_clusters
+    per_cluster = [0.0] * num_clusters
     for slot, unit in enumerate(slots):
         per_cluster[slot % num_clusters] += costs[unit]
     return max(per_cluster), slots
@@ -470,19 +495,47 @@ def ring3_selected(arch: str, lens: Sequence[int]) -> bool:
     return limit is None or longest <= int(limit)
 
 
+def split_cost_model(arch: Optional[str]) -> dict[str, float]:
+    """The SPLIT_KV cost model of ``arch`` (``SPLIT_COST_MODELS``; arches without an entry and
+    ``None`` use the round-3 model ``"r3"``).  Mirrors ``kimi_k3_vision_attention.split_cost_model``."""
+    if arch is not None and arch in SPLIT_COST_MODELS:
+        return SPLIT_COST_MODELS[arch]
+    return SPLIT_COST_MODELS["r3"]
+
+
 def select_tiles_per_cta(
-    lens: Sequence[int], num_heads: int, grid_clusters: int
+    lens: Sequence[int],
+    num_heads: int,
+    grid_clusters: int,
+    arch: Optional[str] = None,
 ) -> dict[str, Any]:
     """Unit layout from the LPT makespans on this device: two tiles per CTA unless
-    SPLIT_KV (one tile per CTA, both softmax stages on the K/V parities) wins by
-    ``SPLIT_MARGIN``.  Mirrors the Cake production planner's ``_select_tiles_per_cta``."""
-    makespan: dict[int, int] = {}
+    SPLIT_KV (one tile per CTA, both softmax stages on the K/V parities) wins by the
+    margin of ``arch``'s split cost model (:func:`split_cost_model`; the two-tile
+    layout is always priced by the H3 block model).  Mirrors the Cake production
+    planner's ``_select_tiles_per_cta``."""
+    model = split_cost_model(arch)
+    makespan: dict[int, float] = {}
     for mode in (MODE_TWO_TILE, MODE_SPLIT_KV):
-        _units, costs = _attention_unit_costs(lens, num_heads, mode)
+        if mode == MODE_SPLIT_KV:
+            _units, costs = _attention_unit_costs(
+                lens,
+                num_heads,
+                mode,
+                iter_scale=model["iter_scale"],
+                unit_overhead=model["unit_overhead"],
+            )
+        else:
+            _units, costs = _attention_unit_costs(lens, num_heads, mode)
         makespan[mode], _slots = lpt_makespan(costs, grid_clusters)
     two, split = makespan[MODE_TWO_TILE], makespan[MODE_SPLIT_KV]
-    chosen = MODE_SPLIT_KV if split < two * (1.0 - SPLIT_MARGIN) else MODE_TWO_TILE
-    return {"tiles_per_cta": chosen, "makespan": makespan}
+    force_split = bool(model.get("force_split", False))
+    chosen = (
+        MODE_SPLIT_KV
+        if force_split or split < two * (1.0 - model["margin"])
+        else MODE_TWO_TILE
+    )
+    return {"tiles_per_cta": chosen, "makespan": makespan, "cost_model": dict(model)}
 
 
 @dataclass(frozen=True)
@@ -503,7 +556,7 @@ class AttentionPlan:
     tiles_per_cta: int
     ring3: bool  # SPLIT_KV rows: the shared-O ring form (``attention:ring3``) instead of ``attention:tiles1``
     grid_clusters: int
-    makespan: dict[int, int]
+    makespan: dict[int, float]
     total_clusters: int
     total_tiles: int
     num_clusters: int
@@ -532,8 +585,9 @@ def build_attention_plan(
     ``grid_clusters`` defaults to :func:`attention_grid_clusters` of ``device``
     (which must then be a CUDA device); ``tiles_per_cta`` forces a unit layout
     (2 = two-tile, 1 = SPLIT_KV) instead of the runtime makespan rule.  ``arch``
-    selects the SPLIT_KV kernel form (``ring3`` per :func:`ring3_selected`; the
-    plain form when ``None``).
+    selects the split cost model of the layout rule (:func:`split_cost_model`; the
+    round-3 model when ``None``) and the SPLIT_KV kernel form (``ring3`` per
+    :func:`ring3_selected`; the plain form when ``None``).
     """
     cu = tuple(int(v) for v in cu_seqlens)
     if (
@@ -551,7 +605,7 @@ def build_attention_plan(
     segments = [(a, b - a) for a, b in zip(cu, cu[1:], strict=False) if b > a]
     begins = [a for a, _ in segments]
     lens = [length for _, length in segments]
-    selection = select_tiles_per_cta(lens, num_heads, grid_clusters)
+    selection = select_tiles_per_cta(lens, num_heads, grid_clusters, arch)
     mode = (
         int(tiles_per_cta)
         if tiles_per_cta is not None
@@ -621,6 +675,7 @@ class TileConfig:
     mcast: int = (
         1  # > 1: cluster of single-CTA tiles sharing the A tile (MCAST; opt-in in Cake)
     )
+    sk: bool = False  # stream-K tail: fractional K-ranges over the tail tiles, static ownership, staged fix-up (SK, round 4)
 
     @property
     def b_rows(self) -> int:
@@ -647,7 +702,8 @@ def _cfg(
 # ``w``, ``l_g8``, ``l_e8`` / ``s_e8`` eight epilogue warps) and the twins:
 # ``*_t`` tail split-K (opt-in in Cake; never selected by the production
 # policy), ``*_p`` / ``*_pf`` packed residual epilogue (+ pre-mainloop
-# residual / norm-weight prefetch) and ``*_cs`` packed f16x2 RoPE table.
+# residual / norm-weight prefetch), ``*_cs`` packed f16x2 RoPE table and
+# ``l_sk`` the pieces-first stream-K twin of the pair tile (round 4).
 TILE_CONFIGS: dict[str, TileConfig] = {
     c.name: c
     for c in (
@@ -685,6 +741,8 @@ TILE_CONFIGS: dict[str, TileConfig] = {
         _cfg("xs_cs_pf", 1, 64, 9, rope=True, prefetch=True),
         # Round 3: the one-buffer TMA-epilogue pair tile of the K = 1536 residual out-proj at M > 6144.
         _cfg("m_tma1", 2, 128, 8, packed=True, tma_epi=True, tma_onebuf=True),
+        # Round 4: the pieces-first stream-K twin of the 256 x 256 pair tile (projector GEMMs, census window).
+        _cfg("l_sk", 2, 256, 7, sk=True),
     )
 }
 # norm_qkv_rope: the packed f16x2 cos/sin twin of each base tile (Cake
@@ -706,12 +764,28 @@ PACKED_TWIN = {
 # Round 3 (G2): the TMA-epilogue twin of the 256 x 128 pair tile, taken by the K = 1536 residual
 # out-proj forms only (Cake ``_TMA_EPI_TWIN`` / ``_TMA_EPI_POLICY`` auto; ties ``m_p`` on the K = 4096 FC1).
 TMA_EPI_TWIN = {"m": "m_tma1"}
+# Round 4 (CAKE-722 lever C): the pieces-first stream-K twin of the 256 x 256 pair tile (Cake ``_SK_TWIN`` /
+# ``_SK_POLICY`` auto), taken by the projector GEMMs ``gelu_erf`` / ``rmsnorm`` inside the census window of
+# ``_sk_twin``.  The full rounds stay data-parallel; the tail tiles' K-steps are cut into ranges of
+# ``tail_split`` (= q) k-steps, one per cluster; the non-owning pieces dump FP32 partials to ``WS`` and the
+# owner sums them behind the arrival counters ``FLAGS`` (self-reset by the last arriver).
+SK_TWIN = {"l": "l_sk"}
+SK_MAX_CONTRIB = 4  # largest number of contributors per tail tile the kernel admits (ceil(K / q) + 1)
+SK_TAIL_FRAC_MAX = (
+    0.30  # stream-K twin only when the tail holds <= 30 % of the clusters
+)
+SK_MIN_SAVING = 0.065  # ... and removing that partial round is worth >= 6.5 % of the mainloop rounds
+DEFAULT_SM_COUNT = (
+    148  # B200 / B300: the census device of the tile rule when no plan supplies one
+)
 for _name in (
     *ROPE_TWIN,
     *ROPE_TWIN.values(),
     *PACKED_TWIN,
     *PACKED_TWIN.values(),
     *TMA_EPI_TWIN.values(),
+    *SK_TWIN,
+    *SK_TWIN.values(),
 ):
     assert _name in TILE_CONFIGS, _name
 
@@ -767,10 +841,46 @@ def _packed_twin(name: str, tma_ok: bool = True) -> str:
     return PACKED_TWIN.get(name, name)
 
 
-def select_tile_config(variant: str, M: int) -> TileConfig:
+def _sk_range(tail_tiles: int, clusters: int, k_iters: int) -> int:
+    """Stream-K k-steps per cluster over the tail (Cake ``_sk_range``): ceil(tail x K / clusters), raised to
+    ceil(K / (SK_MAX_CONTRIB - 1)) so that no tile has more than SK_MAX_CONTRIB contributors (clusters past
+    the tail's end get empty pieces); 0 = no tail."""
+    if tail_tiles <= 0:
+        return 0
+    return max(
+        -(-tail_tiles * k_iters // clusters), -(-k_iters // (SK_MAX_CONTRIB - 1))
+    )
+
+
+def _sk_twin(name: str, n_total: int, M: int, sm_count: int) -> str:
+    """The stream-K twin of a pair tile when the census for ``(N, M)`` on ``sm_count`` SMs leaves a small
+    tail whose removal is worth the fix-up (Cake ``_sk_twin``): ``tail / clusters <= SK_TAIL_FRAC_MAX`` and
+    ``(1 - tail / clusters) / rounds >= SK_MIN_SAVING``; tiles without a twin and M <= ``SMALL_M_LIMIT``
+    are returned unchanged."""
+    if name not in SK_TWIN or M <= SMALL_M_LIMIT:
+        return name
+    cfg = TILE_CONFIGS[name]
+    m_tiles = (M + GEMM_BLOCK_M - 1) // GEMM_BLOCK_M
+    m_tiles += m_tiles % cfg.cta_group
+    tiles = (m_tiles // cfg.cta_group) * (n_total // cfg.acc_n)
+    clusters = min(tiles, int(sm_count) // cfg.cta_group)
+    tail = tiles % clusters
+    if tail == 0:
+        return name
+    frac = tail / clusters
+    rounds = -(-tiles // clusters)
+    if frac <= SK_TAIL_FRAC_MAX and (1.0 - frac) / rounds >= SK_MIN_SAVING:
+        return SK_TWIN[name]
+    return name
+
+
+def select_tile_config(
+    variant: str, M: int, sm_count: int = DEFAULT_SM_COUNT
+) -> TileConfig:
     """Production tile config for ``(variant, M)``; mirrors ``kimi_k3_vision_gemm.select_tile_config``
     with its production policies (packed residual twins on, RoPE table twins on, TMA epilogue twin
-    for the out-proj on, round-3 tile boundaries, tail / SMEM-staged / multicast / L2-prefetch twins off).
+    for the out-proj on, round-3 tile boundaries, stream-K twin inside its census window on
+    ``sm_count`` SMs, tail / SMEM-staged / multicast / L2-prefetch twins off).
 
     Small M is bound by the per-CTA operand stream, so the smallest tile wins:
     128 x 64 up to ``SMALL_M_LIMIT`` for the N = 1024 shapes and up to
@@ -782,6 +892,8 @@ def select_tile_config(variant: str, M: int) -> TileConfig:
     ``FC1_S_E8_LIMIT``), the out-proj pair tile is the TMA-epilogue twin
     ``m_tma1``, and the K = 1024 norm GEMMs / projector GEMMs keep 128 x 64 to
     768 rows and 128 x 128 to 1536 / 1656 rows before the 256-wide pair tiles.
+    Round 4 added the stream-K twin ``l_sk`` of the projector GEMMs' pair tile
+    where the tile census leaves a small tail (:func:`_sk_twin`).
     """
     n_total, k_total, pos_split = GEMM_VARIANTS[variant]
     cfg = TILE_CONFIGS
@@ -815,7 +927,12 @@ def select_tile_config(variant: str, M: int) -> TileConfig:
         return cfg["s"]
     # The K = 1024 norm GEMMs (statistics handoff on the critical path) take the
     # eight-warp epilogue; the projector GEMMs the four-warp pair tile.
-    return cfg[_rope_twin("l_e8" if k_total == HIDDEN else "l", n_total)]
+    return cfg[
+        _rope_twin(
+            _sk_twin("l_e8" if k_total == HIDDEN else "l", n_total, M, sm_count),
+            n_total,
+        )
+    ]
 
 
 def launch_tile_config(
@@ -840,8 +957,8 @@ class GemmLaunchGeometry(NamedTuple):
     grid: tuple[int, int, int]
     m_tiles: int
     cluster_tiles: int
-    full_tiles: int  # cluster tiles before the tail split-K rounds (= cluster_tiles without a tail)
-    tail_split: int  # K-slices per tail tile (1: no tail split)
+    full_tiles: int  # cluster tiles of the data-parallel rounds (= cluster_tiles without a stream-K tail)
+    tail_split: int  # stream-K k-steps per cluster over the tail (``_sk_range``); 1 on the other tiles
 
 
 def gemm_launch_geometry(
@@ -851,15 +968,17 @@ def gemm_launch_geometry(
 
     The production tiles carry no tail split-K paths, so ``full_tiles`` is the
     cluster tile count and ``tail_split`` is 1 (the Cake launcher's values for
-    non-tail configs).  The ``*_t`` twins are opt-in in Cake and outside the
-    exported plan.
+    non-tail configs); the stream-K twin (``sk``) keeps the full rounds
+    data-parallel and cuts the tail tiles' k-steps into ranges of ``tail_split``
+    (= q) k-steps per cluster.  The ``*_t`` twins are opt-in in Cake and outside
+    the exported plan.
     """
     if cfg.tail:
         raise NotImplementedError(
             f"tile config {cfg.name!r} is a tail split-K twin: opt-in in Cake and not part of "
             "the exported production plan"
         )
-    n_total, _k_total, pos_split = GEMM_VARIANTS[variant]
+    n_total, k_total, pos_split = GEMM_VARIANTS[variant]
     if pos_split:
         m_tiles = 2 * ((M + 2 * GEMM_BLOCK_M - 1) // (2 * GEMM_BLOCK_M))
     else:
@@ -871,20 +990,36 @@ def gemm_launch_geometry(
         clusters = cluster_tiles  # non-persistent: one cluster per output tile
     else:
         clusters = min(cluster_tiles, int(sm_count) // cfg.cluster_x)
+    full_tiles, tail_split = cluster_tiles, 1
+    if cfg.sk:
+        # Stream-K: the full rounds stay data-parallel; the tail tiles' k-steps are cut into
+        # ranges of q per cluster (``tail_split`` carries q; 0 = no tail, every piece empty).
+        full_tiles = (cluster_tiles // clusters) * clusters
+        tail_split = _sk_range(
+            cluster_tiles - full_tiles, clusters, k_total // GEMM_BLOCK_K
+        )
     return GemmLaunchGeometry(
-        (clusters * cfg.cluster_x, 1, 1), m_tiles, cluster_tiles, cluster_tiles, 1
+        (clusters * cfg.cluster_x, 1, 1), m_tiles, cluster_tiles, full_tiles, tail_split
     )
 
 
-def gemm_configs_for(total_tokens: int, merged: int) -> dict[str, str]:
-    """Physical tile config name per launched GEMM variant for one ``(T, N)``."""
+def gemm_configs_for(
+    total_tokens: int, merged: int, sm_count: int = DEFAULT_SM_COUNT
+) -> dict[str, str]:
+    """Physical tile config name per launched GEMM variant for one ``(T, N)`` on ``sm_count`` SMs."""
     configs: dict[str, str] = {}
     for variant in PRODUCTION_GEMM_VARIANTS:
         count = total_tokens if variant not in ("gelu_erf", "rmsnorm") else merged
         configs[variant] = launch_tile_config(
-            variant, select_tile_config(variant, count)
+            variant, select_tile_config(variant, count, sm_count)
         ).name
     return configs
+
+
+def stream_k_workspace_ctas(sm_count: int) -> int:
+    """CTAs the stream-K partial workspace is sized for (the Cake launcher's ``_tail_buffers``: the
+    largest pair grid plus one cluster)."""
+    return (int(sm_count) // 2 + 1) * 2
 
 
 GEMM_BUCKET_COUNTS: tuple[int, ...] = (
@@ -907,12 +1042,33 @@ GEMM_BUCKET_COUNTS: tuple[int, ...] = (
 )
 
 
+# The stream-K twin is a census window inside the pair-tile range, not a token-count boundary: the
+# tile rule is scanned per 128-row tile (the census depends on the tile count only) up to this M.
+# Above it the pair grid runs >= 16 rounds and the twin's minimum saving (SK_MIN_SAVING = 6.5 % of
+# the rounds) can no longer be met, so the scan is exhaustive.  Mirrors the Cake export's
+# ``gemm_stream_k_counts``.
+STREAM_K_SCAN_LIMIT = 65536
+
+
+def gemm_stream_k_counts(
+    variant: str, sm_count: int = DEFAULT_SM_COUNT
+) -> tuple[int, ...]:
+    """The token counts (one per 128-row tile, ``SMALL_M_LIMIT`` < M <= ``STREAM_K_SCAN_LIMIT``) at
+    which the production rule selects a stream-K twin for ``variant``; empty for the forms without one."""
+    return tuple(
+        count
+        for count in range(SMALL_M_LIMIT + 1, STREAM_K_SCAN_LIMIT + 1, GEMM_BLOCK_M)
+        if launch_tile_config(variant, select_tile_config(variant, count, sm_count)).sk
+    )
+
+
 def required_kernel_keys(arch: str) -> tuple[str, ...]:
     """Every logical kernel the production plan can select on ``arch`` (one token count per interval
-    of the tile rule; both attention layouts; the ring3 SPLIT_KV form where the arch table selects it)."""
+    of the tile rule plus the stream-K census window of every form; both attention layouts; the
+    ring3 SPLIT_KV form where the arch table selects it)."""
     keys: list[str] = []
     for variant in PRODUCTION_GEMM_VARIANTS:
-        for count in GEMM_BUCKET_COUNTS:
+        for count in (*GEMM_BUCKET_COUNTS, *gemm_stream_k_counts(variant)):
             key = gemm_kernel_key(
                 variant,
                 launch_tile_config(variant, select_tile_config(variant, count)).name,
@@ -1126,7 +1282,10 @@ def attention_tma_workspace_bytes(
 
 
 def vision_workspace_shapes(
-    total_tokens: int, merged: int, attention_tma_bytes: int = 0
+    total_tokens: int,
+    merged: int,
+    attention_tma_bytes: int = 0,
+    stream_k_ctas: int = 0,
 ) -> dict[str, tuple[tuple[int, ...], torch.dtype]]:
     bf16 = torch.bfloat16
     shapes = {
@@ -1146,9 +1305,10 @@ def vision_workspace_shapes(
         "rowsumsq": ((merged,), torch.float32),
         # Bound to unused pointer parameters (never dereferenced for the tiles
         # the kernels run): FP32 dummy for COS/SIN/SQ and the tail workspace
-        # WS, u32 zeros for the tail arrival counters FLAGS, the odd-row pixel
-        # map when T == 1 (CS / XW / WN default to B / C / B like the Cake
-        # launcher), and the attention kernel's diagnostic probe buffer.
+        # WS / u32 zeros for the tail arrival counters FLAGS of the tiles
+        # without a stream-K tail, the odd-row pixel map when T == 1 (CS / XW /
+        # WN default to B / C / B like the Cake launcher), and the attention
+        # kernel's diagnostic probe buffer.
         "f32_dummy": ((16,), torch.float32),
         "u32_dummy": ((16,), torch.uint32),
         "pixel_dummy": ((2, PATCH_DIM), bf16),
@@ -1159,6 +1319,17 @@ def vision_workspace_shapes(
         # CUtensorMaps (prepared once by ``run_prepare_tma``; 128-byte aligned
         # by the caching allocator's 512-byte granularity, verified by the binding).
         shapes["attn_tma_desc"] = ((int(attention_tma_bytes),), torch.uint8)
+    if stream_k_ctas:
+        # Stream-K GEMM tiles (round 4): the FP32 partial workspace of SK_MAX_CONTRIB - 1
+        # pieces per (tail tile, CTA) over every tail tile of the largest grid, 256 columns
+        # wide, and the u32 arrival counters (zero; self-reset by the last arriver) -- the
+        # Cake launcher's ``_tail_buffers(device, SK_MAX_CONTRIB - 1)``, shared by every
+        # stream-K launch of the plan (the launches are stream-ordered).
+        shapes["sk_ws"] = (
+            (int(stream_k_ctas) * (SK_MAX_CONTRIB - 1) * GEMM_BLOCK_M * 256,),
+            torch.float32,
+        )
+        shapes["sk_flags"] = ((int(stream_k_ctas),), torch.uint32)
     return shapes
 
 
@@ -1225,10 +1396,16 @@ def build_kimi_k3_vision_plan(
         if device.type == "cuda"
         else 0
     )
+    gemm_configs = gemm_configs_for(total, merged, sm_count)
+    stream_k_ctas = (
+        stream_k_workspace_ctas(sm_count)
+        if any(TILE_CONFIGS[name].sk for name in gemm_configs.values())
+        else 0
+    )
     workspace = {
         name: torch.zeros(shape, dtype=dtype, device=device)
         for name, (shape, dtype) in vision_workspace_shapes(
-            total, merged, attention_tma_bytes=tma_bytes
+            total, merged, attention_tma_bytes=tma_bytes, stream_k_ctas=stream_k_ctas
         ).items()
     }
     return VisionTowerPlan(
@@ -1242,7 +1419,7 @@ def build_kimi_k3_vision_plan(
         sm_count=sm_count,
         attention=attention,
         merge_table=build_merge_table(grids, device),
-        gemm_configs=gemm_configs_for(total, merged),
+        gemm_configs=gemm_configs,
         cos=cos,
         sin=sin,
         rope_cs=pack_rope_table(cos, sin),
@@ -1444,8 +1621,10 @@ def _gemm_launch(
         SQ=SQ if SQ is not None else ws["f32_dummy"],
         XW=XW if XW is not None else C,
         WN=WN if WN is not None else B,
-        WS=ws["f32_dummy"],
-        FLAGS=ws["u32_dummy"],
+        # Stream-K tiles: the plan's FP32 partial workspace and arrival counters; the other
+        # tiles bind the Cake launcher's dummies (never dereferenced).
+        WS=ws["sk_ws"] if cfg.sk else ws["f32_dummy"],
+        FLAGS=ws["sk_flags"] if cfg.sk else ws["u32_dummy"],
         # TMA-epilogue tensor maps (residual tile in, C and xw tiles out); the register-epilogue
         # tiles bind any 2-D bf16 tensor with a 64-multiple row length (unused), as the Cake launcher.
         RT=(R if R is not None else C) if cfg.tma_epi else B,
