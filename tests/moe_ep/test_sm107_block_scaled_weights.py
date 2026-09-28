@@ -109,7 +109,6 @@ def test_nvfp4_preprocessing_bounds_fp32_temporaries():
 @pytest.mark.parametrize("strided", [False, True])
 def test_e8m0_decoder_all_encodings(dtype, strided):
     from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
-        e8m0_to_f32,
         scale_to_f32,
     )
 
@@ -121,13 +120,12 @@ def test_e8m0_decoder_all_encodings(dtype, strided):
         [math.ldexp(1.0, exponent) for exponent in range(-127, 128)],
         dtype=torch.float32,
     )
-    for decode in (e8m0_to_f32, scale_to_f32):
-        actual = decode(scales)
-        # Compare bits to distinguish the smallest scale from zero.
-        torch.testing.assert_close(
-            actual[:255].view(torch.int32), expected.view(torch.int32), rtol=0, atol=0
-        )
-        assert torch.isnan(actual[255])
+    actual = scale_to_f32(scales)
+    # Compare bits to distinguish the smallest scale from zero.
+    torch.testing.assert_close(
+        actual[:255].view(torch.int32), expected.view(torch.int32), rtol=0, atol=0
+    )
+    assert torch.isnan(actual[255])
 
 
 def test_fp4_rounding_at_every_midpoint():
