@@ -2113,8 +2113,10 @@ class _RecordingLauncher:
 @pytest.mark.parametrize(
     "num_query_tokens,sparse_topk,expected_program,expected_splits",
     [
-        (12, 260, "bf16_h128_topk128x_split3_sm100", 3),
-        (16, 260, "bf16_h128_topk128x_split3_sm100", 3),
+        # Three live KV tiles run the four-owner program (fourth tile fully
+        # masked): 14.8 -> 12.7 us on GB300, 15.7 -> 13.6 us on B200.
+        (12, 260, "bf16_h128_topk128x_split4_sm100", 4),
+        (16, 260, "bf16_h128_topk128x_split4_sm100", 4),
         (12, 388, "bf16_h128_topk128x_split4_sm100", 4),
         (16, 388, "bf16_h128_topk128x_split4_sm100", 4),
         # CAKE-624 W12: above the token bound one row-first owner per token.
