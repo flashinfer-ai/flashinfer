@@ -177,6 +177,34 @@ __global__ void __launch_bounds__(kThreads)
 // padding and 0 under the alternate padding, for a GEMM2 that runs the swap
 // finalize over the windows only when the routing chose the base tile.
 constexpr int kMixedItems = 4;
+// Staged loads per thread issued before their shared-memory stores, so the
+// staging loop overlaps its global latencies instead of serializing them.
+constexpr int kStageUnroll = 4;
+
+template <int kUnroll>
+__device__ __forceinline__ void stage_pair(const int32_t* __restrict__ a,
+                                           const int32_t* __restrict__ b, int32_t n,
+                                           int32_t* __restrict__ sa, int32_t* __restrict__ sb) {
+  for (int i = static_cast<int>(threadIdx.x); i < n; i += kThreads * kUnroll) {
+    int32_t va[kUnroll], vb[kUnroll];
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int idx = i + u * kThreads;
+      if (idx < n) {
+        va[u] = a[idx];
+        vb[u] = b[idx];
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kUnroll; ++u) {
+      const int idx = i + u * kThreads;
+      if (idx < n) {
+        sa[idx] = va[u];
+        sb[idx] = vb[u];
+      }
+    }
+  }
+}
 
 template <bool kPdl>
 __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
@@ -194,7 +222,9 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
     cudaGridDependencySynchronize();
   }
 #endif
-  using Scan = cub::BlockScan<Counts, kThreads>;
+  // Warp scans: the default raking scan serializes 32 struct adds per lane
+  // of one warp twice per pass (about 3 us for 1024 threads).
+  using Scan = cub::BlockScan<Counts, kThreads, cub::BLOCK_SCAN_WARP_SCANS>;
   __shared__ typename Scan::TempStorage temp;
   __shared__ int s_counts[3];
   extern __shared__ int32_t staged[];
@@ -210,13 +240,9 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
   int32_t* const s_base_l = staged + stage_base;
   int32_t* const s_alt_e = staged + 2 * stage_base;
   int32_t* const s_alt_l = staged + 2 * stage_base + stage_alt;
-  for (int i = static_cast<int>(threadIdx.x); i < stage_base; i += kThreads) {
-    s_base_e[i] = expert_idx[i];
-    s_base_l[i] = mn_limit[i];
-  }
-  for (int i = static_cast<int>(threadIdx.x); i < stage_alt; i += kThreads) {
-    s_alt_e[i] = alt_expert_idx[i];
-    s_alt_l[i] = alt_mn_limit[i];
+  stage_pair<kStageUnroll>(expert_idx, mn_limit, stage_base, s_base_e, s_base_l);
+  if (stage_alt > 0) {
+    stage_pair<kStageUnroll>(alt_expert_idx, alt_mn_limit, stage_alt, s_alt_e, s_alt_l);
   }
   __syncthreads();
   const bool alt = (alt_expert_idx != nullptr) && (s_counts[2] == 0) && (s_counts[1] > 0);
