@@ -11255,7 +11255,9 @@ def launch_grid_x(
             raise ValueError("cooperative modules launch one cluster per token")
         grid = int(token_num) * cluster
     else:
-        grid = (min(int(sm_count) * ctas_per_sm, int(token_num) * cluster) // cluster) * cluster
+        grid = (
+            min(int(sm_count) * ctas_per_sm, int(token_num) * cluster) // cluster
+        ) * cluster
     if grid <= 0:
         raise ValueError("the launch requires at least one complete cluster")
     return grid
