@@ -70,7 +70,7 @@ _MAX_FIXED_SPLITS = 5
 # the persistent KV-reuse prefill body (mirrors the Cake dispatcher's
 # BF16_H128_PREFILL_MIN_TOKENS, CAKE-624 W11).
 _BF16_H128_PREFILL_MIN_TOKENS = 64
-# Two-stage split3/split4 programs (3-4 owners x 2 CTAs per token) run one wave
+# The two-stage split4 program (4 owners x 2 CTAs per token) runs one wave
 # only up to this many query tokens; wider grids lose to trtllm-gen (CAKE-624 W12).
 # Mirrors the Cake seed's BF16_TOPK128X_SPLIT_MAX_TOKENS.
 _BF16_TOPK128X_SPLIT_MAX_TOKENS = 16
@@ -920,8 +920,10 @@ def _route(
             return "bf16_h32_topk128x_early_v47"
         raise ValueError("BF16 H32 compressed cache requires page size 64 or 2")
     if num_heads == 64:
-        if not ragged:
-            return "bf16_h64_fixed_q"
+        # Dense Q with equal q_lens is the same row memory as ragged Q: the
+        # not-ragged rows follow the ragged rules (the portfolio producer beats
+        # the former fixed-Q guard program on the sparse decode rows, GB300
+        # 1.03x -> 1.21x; the fixed-Q programs are no longer exported).
         if max_q_len >= 257:
             return "bf16_h64_prefill"
         if is_swa:
@@ -1335,10 +1337,10 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
             # predicate above); hardening-000037 0.77-0.90x -> 0.98-1.01x and
             # hardening-000027 +8-10 % vs the striped program.
             program_variant = "bf16_h128_prefill_v42_snake"
-        # The two-stage split programs (disjoint full-V KV owners + one LSE
-        # reducer) ship on both Blackwell targets: GB300 rows at width 260/388
-        # measured 1.18-1.26x vs trtllm-gen against 0.83-1.05x for the
-        # single-owner kernel (CAKE-624 W2).  Mirrors the Cake seed's
+        # The two-stage split program (four disjoint full-V KV owners + one
+        # LSE reducer) ships on both Blackwell targets: GB300 rows at width
+        # 260/388 measured 1.18-1.26x vs trtllm-gen against 0.83-1.05x for
+        # the single-owner kernel (CAKE-624 W2).  Mirrors the Cake seed's
         # BF16_TOPK128X_SPLIT_ARCHES.  Above the token bound the rows run one
         # full-V owner per token whose invalid (-1) sparse rows gather the
         # tile's first index (CAKE-624 W12: hardening-000025/31 0.45-0.95x ->
@@ -1349,10 +1351,13 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
             and T > _BF16_TOPK128X_SPLIT_MAX_TOKENS
         ):
             program_variant = "bf16_h128_topk128x_row_first"
-        elif route == "bf16_h128_topk128x" and 256 < topk <= 384:
-            num_splits = 3
-            program_variant = "bf16_h128_topk128x_split3_sm100"
-        elif route == "bf16_h128_topk128x" and topk == 388:
+        elif route == "bf16_h128_topk128x" and 256 < topk <= 388:
+            # Three live KV tiles run the four-owner program with a fully
+            # masked fourth tile: the split4 owner kernel is 12.3-13.0 us for
+            # width 260 against 14.8 us on the three-owner pair (GB300
+            # 1.23x -> 1.44x, B200 1.11x -> 1.29x vs trtllm-gen), so the
+            # three-owner program is retired.  Mirrors the Cake seed rule
+            # bf16_topk128x_uses_split3 (always False).
             num_splits = 4
             program_variant = "bf16_h128_topk128x_split4_sm100"
         parts = L.partials(num_splits)
