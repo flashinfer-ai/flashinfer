@@ -239,11 +239,15 @@ if SWAP_WIDE192_MIXED_GEMM2 not in ("split", "dense"):
 # plan's side stream beside the swap chain; the row sets are disjoint and
 # both finalizes add atomically into the zero-filled output.
 SWAP_WIDE192_MIXED_STREAMS = os.environ.get("MXFP4_SWAP192_MIXED_STREAMS", "0") == "1"
-# Wide 192-row forms: the finalize output is zero-filled by the swap GEMM1
-# (grid-strided over its CTAs) instead of the routing conversion kernel,
-# whose fill costs 17-99 us at T = 8192..32768 (the dense path fills inside
-# its GEMM1 from T = 8192 too).
-SWAP_WIDE192_ZERO_IN_GEMM1 = os.environ.get("MXFP4_SWAP192_ZF_GEMM1", "1") == "1"
+# Wide 192-row forms: where the finalize output is zero-filled. ``route``:
+# the routing conversion kernel (17-99 us at T = 8192..32768 on the
+# critical path); ``gemm1``: the swap GEMM1's epilogue warps (grid-strided
+# stores; measured +31 us on GEMM1 at T=8192, not hidden); ``dense``
+# (mixed form only): the dense gather GEMM1's asynchronous bulk fill spread
+# over its tile-less CTAs, the dense path's own mechanism.
+SWAP_WIDE192_ZERO_FILL = os.environ.get("MXFP4_SWAP192_ZF", "dense")
+if SWAP_WIDE192_ZERO_FILL not in ("route", "gemm1", "dense"):
+    raise ValueError("MXFP4_SWAP192_ZF must be route, gemm1 or dense")
 # Mixed form: weight M-tiles per swap-GEMM2 work item. Measured on B300 (TP8
 # T=256/1024 balanced): with the 128-row groups the GEMM2 of the policy tile
 # loses 6-9 % at m_group 1 and is back at the 32-row-group time with 2.
@@ -995,6 +999,12 @@ class Mxfp4MoESwapAbPlan:
             and wrapper.intermediate_shard <= SWAP_TWO_STAGE_MAX_SHARD
         )
         self._partial_rows = buffers["partial_rows"] if self.two_stage else None
+        # Dense gather GEMM1 zero-fill state (mixed form): (claim, done)
+        # counters zeroed once and self-resetting, and a zero "other launch
+        # tile count" so the launch always fills.
+        self._zero_fill_counters = torch.zeros(2, dtype=torch.int32, device=self.device)
+        self._zero_fill_other_tiles = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._gemm1_done_event = None
         self._finalize_rows = None
         # Deferred-finalize outputs (valid after ``run``): row of each
         # (token, slot) assignment (-1 when not local) and FP32 route weights.
@@ -1046,6 +1056,7 @@ class Mxfp4MoESwapAbPlan:
         self._dispatch = None
         self._dispatch_args = None
         self._gemm1_dense = None
+        self._gemm1_dense_fills = False
         self._gemm2_wide = None
         self._token_index = None
         self._token_index_args = None
@@ -1068,8 +1079,12 @@ class Mxfp4MoESwapAbPlan:
         # two-stage finalize the finalize kernel accumulates on top of it.
         split_dense = self.split and SWAP_SPLIT_DENSE_GEMM2
         self.split_dense = split_dense
-        zero_in_gemm1 = self.wide192 and SWAP_WIDE192_ZERO_IN_GEMM1
-        clear_output = (not self.two_stage or split_dense) and not zero_in_gemm1
+        zero_fill = SWAP_WIDE192_ZERO_FILL if self.wide192 else "route"
+        if zero_fill == "dense" and not self.mixed192:
+            zero_fill = "route"
+        zero_in_gemm1 = zero_fill == "gemm1"
+        zero_in_dense = zero_fill == "dense"
+        clear_output = (not self.two_stage or split_dense) and zero_fill == "route"
         if (self.finalize and not self.two_stage) or split_dense:
             clear_target = self.output
         elif self.two_stage:
@@ -1419,8 +1434,21 @@ class Mxfp4MoESwapAbPlan:
                         if self.mixed192
                         else {}
                     ),
+                    **(
+                        # Output zero-fill by the dense gather GEMM1 (bulk
+                        # copies over its tile-less CTAs; the counters are
+                        # self-resetting, the "other launch" has no tiles).
+                        dict(
+                            zero_fill_output=self.output,
+                            zero_fill_counters=self._zero_fill_counters,
+                            zero_fill_other_tiles=self._zero_fill_other_tiles,
+                        )
+                        if zero_in_dense
+                        else {}
+                    ),
                 )
                 self._gemm1_dense = launches["gather"]
+                self._gemm1_dense_fills = zero_in_dense
             mixed192_dense_gemm2 = (
                 self.mixed192 and SWAP_WIDE192_MIXED_GEMM2 == "dense"
             )
@@ -1703,6 +1731,10 @@ class Mxfp4MoESwapAbPlan:
                 side = cuda.CUstream(self._side_stream.cuda_stream)
                 compiled, args, kwargs = self._gemm1_dense
                 compiled(*args, stream=side, **kwargs)
+                if self._gemm1_dense_fills:
+                    if self._gemm1_done_event is None:
+                        self._gemm1_done_event = torch.cuda.Event()
+                    self._gemm1_done_event.record(self._side_stream)
                 if self._gemm2_wide is not None:
                     compiled, args = self._gemm2_wide
                     compiled(*args, stream=side)
@@ -1714,6 +1746,10 @@ class Mxfp4MoESwapAbPlan:
             if mixed_side and self._gemm2_wide is None:
                 # Dense finalize over every group: needs the dense tiles' rows.
                 torch.cuda.current_stream().wait_event(self._join_event)
+            elif mixed_side and self._gemm1_dense_fills:
+                # The swap finalize reduces into the output the dense GEMM1
+                # zero-fills on the side stream.
+                torch.cuda.current_stream().wait_event(self._gemm1_done_event)
             self._gemm2(*self._gemm2_args, stream=stream)
             if self.mixed192 and self._gemm2_wide is not None and not mixed_side:
                 compiled, args = self._gemm2_wide
