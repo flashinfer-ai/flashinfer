@@ -982,7 +982,37 @@ def test_moe_expert_parallel(
     # This test is specifically for 2 GPUs and 2 experts
     # GPU 0 (ep_rank=0) handles expert 0
     # GPU 1 (ep_rank=1) handles expert 1
-    ep_size = num_experts // 2
+    _check_expert_parallel(
+        batch_size,
+        hidden_size,
+        num_experts,
+        top_k,
+        intermediate_size,
+        ep_size=num_experts // 2,
+    )
+
+
+# More than 256 tokens takes the multi-block expert sort instead of the single-CTA fused
+# prologue. With 128 local experts, 4133 and 8192 tokens use the shared-memory tile sort and
+# 257 tokens stays on the per-expert prefix-sum kernels; 256 local experts exceed the tile
+# sort's shared-memory budget and always use the per-expert kernels.
+@pytest.mark.parametrize("batch_size", [257, 4133, 8192])
+@pytest.mark.parametrize("num_experts, ep_size", [(512, 4), (512, 2)])
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_expert_parallel_multi_block_sort(batch_size, num_experts, ep_size):
+    _check_expert_parallel(
+        batch_size,
+        hidden_size=128,
+        num_experts=num_experts,
+        top_k=8,
+        intermediate_size=128,
+        ep_size=ep_size,
+    )
+
+
+def _check_expert_parallel(
+    batch_size, hidden_size, num_experts, top_k, intermediate_size, ep_size
+):
     torch.manual_seed(42)
 
     # Create input tensors
