@@ -105,3 +105,52 @@ Synchronization (same protocol, hard 20 s limit, `memcheck` not run):
 | fp16_paged (split) | racecheck | pass_with_warnings | 19 s | ========= RACECHECK SUMMARY: 53 hazards displayed (0 errors, 53 warnings) |
 
 The racecheck warnings map to the same instruction classes as the `register_mma` routes (`LDGSTS.E.BYPASS.128` staging writes and `LDSM.16.MT88.4` fragment reads): asynchronous `cp.async` staging writes and `ldmatrix` reads of the K/V rings that are ordered by `cp.async.mbarrier.arrive` / `cp.async.wait_group` and mbarrier phases the tool does not model; no error-class hazard.
+
+## tcgen05/TMEM D512 tree routes (`kernel="tmem"`, `kernel="auto"`)
+
+The four `tree_*_tmem` routes wrap the tcgen05 tensor-memory schedule of the D512 tree kernel: one 128-row Q tile x one 256-column output half per 512-thread CTA (grid `(2, heads * ceil(q_len * ratio / 128), batch)`, 230400 B dynamic shared memory), K/V and Q fetched once per thread-block cluster by TMA multicast. Each route ships two compiled forms: the `(2, 2, 1)` cluster form pairs the two Q tiles of one KV head (K/V + Q multicast) and the `(2, 1, 1)` form (`*_q_kernel.cu`) multicasts Q only for heads with an odd Q-tile count; the binding selects the form from the Q-tile parity. Under the strict cold-L2 protocol the tmem route is faster than `register_mma_auto` and than the upstream Edge XQA source on every D512 cache mode on every validated Thor node, so `kernel="auto"` selects it for all four modes. Validation ran on NVIDIA Thor `sr250v3-0666` (20 SMs, CUDA 13.4, PyTorch 2.15.0a0+875d815502.nvinternal.main) in one container session.
+
+Artifact parity (frozen schedule launcher vs the exported TVM-FFI entry, identical tensors, one process, six alternating paired rounds, 250 ms warmup, 256 CUPTI cold-L2 samples per round, gate 3%):
+
+| Shape | Frozen schedule (us) | Native export (us) | Absolute difference | Cake-first | Export-first |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tree_fp16_contiguous_tmem | 30.5760 | 30.3680 | 0.680% | 0.9937 | 0.9948 |
+| tree_fp16_paged_tmem | 30.6400 | 30.7680 | 0.418% | 1.0010 | 1.0063 |
+| tree_fp8_contiguous_tmem | 23.7518 | 23.7280 | 0.100% | 1.0000 | 0.9993 |
+| tree_fp8_paged_tmem | 24.0000 | 23.8558 | 0.601% | 0.9947 | 0.9933 |
+
+**All 4 tmem rows pass; maximum difference is 0.680%.**
+
+Public ledger benchmark (`benchmarks/bench_sm110_xqa.py`, one process for all 16 rows, same protocol as above):
+
+| Ledger row | Kernel family | Native latency (us) | Ratio |
+| --- | --- | ---: | ---: |
+| tree_fp16_contiguous | tcgen05 | 69.680 | 1 (reference row) |
+| tree_fp16_contiguous_mma | register_mma | 31.408 | 2.219x faster than tcgen05 |
+| tree_fp16_contiguous_tmem | tmem | 31.168 | 2.236x faster than tcgen05, 1.008x faster than the previous `auto` row |
+| tree_fp16_paged | tcgen05 | 73.216 | 1 (reference row) |
+| tree_fp16_paged_mma_split | register_mma_split | 34.687 | 2.111x faster than tcgen05 |
+| tree_fp16_paged_tmem | tmem | 29.712 | 2.464x faster than tcgen05, 1.167x faster than the previous `auto` row |
+| tree_fp8_contiguous | tcgen05 | 61.088 | 1 (reference row) |
+| tree_fp8_contiguous_mma | register_mma | 24.544 | 2.489x faster than tcgen05 |
+| tree_fp8_contiguous_tmem | tmem | 23.887 | 2.557x faster than tcgen05, 1.027x faster than the previous `auto` row |
+| tree_fp8_paged | tcgen05 | 60.112 | 1 (reference row) |
+| tree_fp8_paged_mma | register_mma | 25.760 | 2.334x faster than tcgen05 |
+| tree_fp8_paged_tmem | tmem | 24.288 | 2.475x faster than tcgen05, 1.061x faster than the previous `auto` row |
+
+Correctness: JIT metadata suite 35 passed; GPU suite 177 passed (adds the tmem cache cases on all four modes with even and odd Q-tile counts, i.e. both cluster forms, `auto` routing to the tmem routes and the JIT fixture for the new family). pre-commit clean (ruff-format rewrote one blank line in test_sm110_xqa.py on the first run; the formatted file is the one validated and committed; all other hooks passed).
+
+Synchronization (same protocol, hard 20 s limit, `memcheck` not run):
+
+| Route | Tool | Verdict | Wall | Summary |
+| --- | --- | --- | ---: | --- |
+| fp16_contiguous (tmem) | synccheck | pass | 10 s | ========= ERROR SUMMARY: 0 errors |
+| fp16_contiguous (tmem) | racecheck | pass | 8 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |
+| fp16_paged (tmem) | synccheck | pass | 8 s | ========= ERROR SUMMARY: 0 errors |
+| fp16_paged (tmem) | racecheck | pass | 9 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |
+| fp8_contiguous (tmem) | synccheck | pass | 8 s | ========= ERROR SUMMARY: 0 errors |
+| fp8_contiguous (tmem) | racecheck | pass | 9 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |
+| fp8_paged (tmem) | synccheck | pass | 8 s | ========= ERROR SUMMARY: 0 errors |
+| fp8_paged (tmem) | racecheck | pass | 10 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |
+
+Both tools completed within the 20 s limit on the exported routes (8-10 s each) with no hazards. The same kernel under the frozen-schedule benchmark harness reached the 20 s racecheck deadline in every earlier run (a different launcher and process setup); that difference was not investigated.
