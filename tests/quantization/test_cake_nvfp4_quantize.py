@@ -259,16 +259,14 @@ def test_prepared_runner_graph_replay_and_no_allocation():
         with torch.cuda.graph(graph, stream=stream):
             runner()
     torch.cuda.synchronize()
-    for round_index in range(2):
+    for _round_index in range(2):
         x.copy_(torch.randn(m, k, device=device, dtype=torch.bfloat16, generator=g))
         for t in outputs:
             t.view(torch.uint8).fill_(0xFF)
         torch.cuda.synchronize()
         graph.replay()
         torch.cuda.synchronize()
-        expected = nvfp4_quantize(
-            x, gs_inv, per_token_activation=True, backend="cake"
-        )
+        expected = nvfp4_quantize(x, gs_inv, per_token_activation=True, backend="cake")
         torch.cuda.synchronize()
         for got, want in zip(outputs, expected, strict=True):
             assert torch.equal(got.reshape(-1), want.reshape(-1))

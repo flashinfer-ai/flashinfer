@@ -47,7 +47,12 @@ def test_default_tactic_rules():
     # More weight tiles than SMs: shallow K; two CTAs per SM on the 8-token tile or on
     # the 152-SM part, one CTA per SM for the 32-token tile on 148 SMs.
     t = cb.default_tactic(8, 28672, 8192, 148)
-    assert t["alpha_n"] and t["tile_n"] == 8 and not t["deep_k"] and t["blocks_per_sm"] == 2
+    assert (
+        t["alpha_n"]
+        and t["tile_n"] == 8
+        and not t["deep_k"]
+        and t["blocks_per_sm"] == 2
+    )
     t = cb.default_tactic(17, 28672, 8192, 148)
     assert t["tile_n"] == 32 and not t["deep_k"] and "blocks_per_sm" not in t
     t = cb.default_tactic(17, 28672, 8192, 152)
@@ -55,8 +60,17 @@ def test_default_tactic_rules():
     # One token tile over more 128-wide weight tiles than SMs: the 128-wide persistent tile
     # replaces the scorer's wider single-wave tile on the 148-SM part only.
     t = cb.default_tactic(128, 28672, 8192, 148)
-    assert t["tile_n"] == 128 and not t["alpha_n"] and "two_cta" not in t and not t["deep_k"]
-    assert t["a_hint"] is None and t["b_hint"] == "evict_first" and t["l2_promo"] == "l2_256b"
+    assert (
+        t["tile_n"] == 128
+        and not t["alpha_n"]
+        and "two_cta" not in t
+        and not t["deep_k"]
+    )
+    assert (
+        t["a_hint"] is None
+        and t["b_hint"] == "evict_first"
+        and t["l2_promo"] == "l2_256b"
+    )
     t = cb.default_tactic(128, 28672, 8192, 152)
     assert t["tile_n"] == 192 and "two_cta" not in t and t["l2_promo"] == "l2_256b"
     # One token tile, one wave of 128-wide tiles: no L2 promotion on the 152-SM part.
@@ -75,7 +89,12 @@ def test_default_tactic_rules():
     assert not t["alpha_n"] and t["tile_n"] == 64 and "two_cta" not in t
     assert "amc" not in t and "split_k" not in t
     t = cb.default_tactic(128, 18432, 7168, 152)
-    assert not t["alpha_n"] and t["tile_n"] == 128 and "two_cta" not in t and "amc" not in t
+    assert (
+        not t["alpha_n"]
+        and t["tile_n"] == 128
+        and "two_cta" not in t
+        and "amc" not in t
+    )
     # Large M: 2-CTA tiles, grouped raster for <= 32 weight tiles, CLC scheduler
     # once the pairs average >= 10 tiles.
     t = cb.default_tactic(8192, 7168, 16384, 148)
@@ -121,14 +140,24 @@ def test_gemm_kernel_key_and_plan():
     assert plan.kernel_key == "gemm:n8_k512_f16_aF_l2256b_s3" and plan.grid == 144
     with pytest.raises(ValueError, match="1-CTA persistent"):
         cb.gemm_plan(
-            8, 2112, 7168, False, "sm_100a", 148,
+            8,
+            2112,
+            7168,
+            False,
+            "sm_100a",
+            148,
             tactic={**cb.default_tactic(8, 2112, 7168, 148), "blocks_per_sm": 2},
         )
     with pytest.raises(ValueError, match="K="):
         cb.gemm_plan(128, 2112, 7000, False, "sm_100a", 148)
     with pytest.raises(ValueError, match="N % 8"):
         cb.gemm_plan(
-            8, 130, 7168, False, "sm_100a", 148,
+            8,
+            130,
+            7168,
+            False,
+            "sm_100a",
+            148,
             tactic={**cb.default_tactic(8, 2112, 7168, 148), "split_k": 1},
         )
 

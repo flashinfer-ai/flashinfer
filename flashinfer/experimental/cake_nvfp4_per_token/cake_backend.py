@@ -414,7 +414,7 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
             best = (score, tile_m, tile_n)
     assert best is not None
     _, tile_m, tile_n = best
-    tactic: dict[str, Any] = {
+    tactic = {
         "tile_n": tile_n,
         "deep_k": False,
         "alpha_n": False,
@@ -431,7 +431,12 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         # One 128-token tile over a few 64-wide weight tiles: the 2-CTA pair loads the
         # real token rows once (no grouped raster, no CLC on these short rows).
         return {**tactic, "two_cta": True, "a_hint": None, "b_hint": "evict_first"}
-    if m <= BLOCK_M and tile_m == BLOCK_M and tile_n > 128 and (n + 127) // 128 > sm_count:
+    if (
+        m <= BLOCK_M
+        and tile_m == BLOCK_M
+        and tile_n > 128
+        and (n + 127) // 128 > sm_count
+    ):
         # One token tile over more 128-wide weight tiles than SMs: on the 148-SM part the
         # 128-wide persistent tile (two waves) beats the scorer's single-wave wide tile.
         if sm_count < TWO_CTA_PER_SM_MIN_SMS:
@@ -594,9 +599,7 @@ def gemm_plan(
     sched = str(tactic.get("sched", "static"))
     if two_cta:
         grid = (
-            2 * num_tiles
-            if sched == "clc"
-            else 2 * min(int(sm_count) // 2, num_tiles)
+            2 * num_tiles if sched == "clc" else 2 * min(int(sm_count) // 2, num_tiles)
         )
     elif split_k > 1:
         grid = split_k * num_tiles
