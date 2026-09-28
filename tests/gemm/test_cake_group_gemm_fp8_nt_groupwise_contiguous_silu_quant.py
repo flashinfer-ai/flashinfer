@@ -15,7 +15,9 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     ACT_ROUTES,
     ACT_WIDE_MIN_ITEMS,
     ACT_WIDE_ROUTE,
+    FUSED_MIXED_ROUTE,
     FUSED_ROUTE,
+    FUSED_ROUTES,
     GEMM_BACKEND_CAKE,
     GEMM_BACKEND_CUTE,
     SMALL_M_MAX,
@@ -23,6 +25,7 @@ from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     fused_tile_counts,
     is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available,
     launch_plan,
+    mixed_clusters,
     routing_blocks,
     select_route,
     small_m_gemm_backend,
@@ -289,9 +292,8 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
         m, n2, sm_count=sm_count, group_blocks=routing_blocks(group_counts)
     )
     assert prepared.route == expected_route
-    assert (
-        prepared.num_kernels == 2
-    )  # GEMM + act kernel, or pair kernel + PDL tail kernel
+    # GEMM + act kernel, or pair kernel + PDL tail kernel; the mixed-schedule route is one kernel
+    assert prepared.num_kernels == (1 if prepared.route == FUSED_MIXED_ROUTE else 2)
     if m < SMALL_M_MAX:
         assert prepared.route == ACT_ROUTE
     if prepared.route in ACT_ROUTES:
@@ -300,10 +302,13 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
             GEMM_BACKEND_CAKE if (m % 128 and k >= 1024) else GEMM_BACKEND_CUTE
         )
         assert prepared.tail_grid is None
-    else:
-        assert prepared.route == FUSED_ROUTE
+    elif prepared.route == FUSED_ROUTE:
         assert prepared.gemm_backend is None
         assert prepared.tail_grid is not None and prepared.tail_grid[0] >= 1
+    else:
+        assert prepared.route == FUSED_MIXED_ROUTE
+        assert prepared.gemm_backend is None
+        assert prepared.tail_grid is None and set(prepared.stage_grids) == {"main"}
     out_q, out_s = prepared.launch()
     torch.cuda.synchronize()
     g, u, act = _reference_activation(
@@ -340,6 +345,12 @@ def test_prepared_matches_flashinfer_chain(group_counts, n2, k, arbitrary_scales
     ).launch()
     torch.cuda.synchronize()
     _assert_matches(out_q, out_s, chain_q, chain_s)
+    # with the routing known, the routing-aware rule may pick the GEMM + act or the mixed-schedule route instead
+    out_q, out_s = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    ).launch()
+    torch.cuda.synchronize()
+    _assert_matches(out_q, out_s, chain_q, chain_s)
 
 
 @pytest.mark.parametrize(
@@ -358,6 +369,30 @@ def test_prepared_matches_flashinfer_chain(group_counts, n2, k, arbitrary_scales
         ),
         pytest.param([384] * 8 + [128] * 8, 2048, 4096, None, id="wide_all_odd"),
         pytest.param([128] * 16, 2048, 4096, None, id="wide_all_one_block"),
+        pytest.param(
+            [
+                640,
+                128,
+                384,
+                0,
+                896,
+                128,
+                384,
+                256,
+                128,
+                0,
+                384,
+                128,
+                256,
+                128,
+                128,
+                128,
+            ],
+            2048,
+            4096,
+            None,
+            id="wide_mixed_tail",
+        ),
     ],
 )
 def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
@@ -392,6 +427,14 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
         tail = tail_launch_grid(m, n2, sm_count=sm_count)
         assert prepared.tail_grid == tail and 1 <= tail[0] <= sm_count
         assert set(prepared.stage_grids) == {"pair", "tail"}
+    elif route == FUSED_MIXED_ROUTE:
+        pair_tiles, odd_units = fused_tile_counts(n2, blocks)
+        clusters = mixed_clusters(pair_tiles, odd_units, sm_count=sm_count)
+        assert pair_tiles > clusters and pair_tiles % clusters
+        assert grid == (2 * clusters, 1, 1) and grid[0] <= 128
+        assert prepared.tail_grid is None
+        assert set(prepared.stage_grids) == {"main"}
+        assert prepared.num_kernels == 1
     else:
         assert prepared.tail_grid is None
         assert route in ACT_ROUTES
@@ -434,20 +477,28 @@ def test_routing_blocks_and_fused_tile_counts():
         [128, 384] + [256] * 14
     )  # 16 odd-tail units <= 20 free SMs
     assert select_route(4096, 2048, group_blocks=two_odd, **wide) == FUSED_ROUTE
-    # diverted wide rows take the wide act kernel (>= ACT_WIDE_MIN_ITEMS items)
-    assert (
-        select_route(
-            4096, 2048, group_blocks=routing_blocks([384] * 8 + [128] * 8), **wide
-        )
-        == ACT_WIDE_ROUTE
+    # diverted wide rows: the mixed-schedule route when the pair tiles outnumber the 64 clusters without dividing
+    # evenly (random_aligned: 96 pair tiles + 64 solo units), else the wide act kernel (>= ACT_WIDE_MIN_ITEMS items)
+    assert fused_tile_counts(2048, blocks) == (96, 64)
+    assert mixed_clusters(96, 64, sm_count=148) == 64
+    assert select_route(4096, 2048, group_blocks=blocks, **wide) == FUSED_MIXED_ROUTE
+    mixed_tail = routing_blocks(
+        [640, 128, 384, 0, 896, 128, 384, 256, 128, 0, 384, 128, 256, 128, 128, 128]
     )
+    assert fused_tile_counts(2048, mixed_tail) == (80, 96)
     assert (
-        select_route(4096, 2048, group_blocks=blocks, **wide) == ACT_WIDE_ROUTE
-    )  # random_aligned: 64 units
+        select_route(4096, 2048, group_blocks=mixed_tail, **wide) == FUSED_MIXED_ROUTE
+    )
+    all_odd = routing_blocks(
+        [384] * 8 + [128] * 8
+    )  # 64 pair tiles = one per cluster: nothing to balance
+    assert fused_tile_counts(2048, all_odd) == (64, 128)
+    assert select_route(4096, 2048, group_blocks=all_odd, **wide) == ACT_WIDE_ROUTE
     assert (
         select_route(2048, 2048, group_blocks=routing_blocks([128] * 16), **wide)
         == ACT_WIDE_ROUTE
-    )
+    )  # no pair tile at all
+    assert {FUSED_ROUTE, FUSED_MIXED_ROUTE} == FUSED_ROUTES
     assert act_items(2048, 2048) == ACT_WIDE_MIN_ITEMS
     # 16 odd-tail units fit on the 20 SMs the pair grid leaves free: the problem stays fused
     assert (
@@ -460,8 +511,14 @@ def test_routing_blocks_and_fused_tile_counts():
         select_route(2048, 512, group_blocks=routing_blocks([128] * 16), **wide)
         == ACT_ROUTE
     )
-    # grids of the two act routes on the wide random_aligned row
-    _, wide_grid = launch_plan(4096, 2048, group_blocks=blocks, **wide)
+    # grids: the mixed-schedule route on the wide random_aligned row, the two act routes on all_odd and a small row
+    _, mixed_grid = launch_plan(4096, 2048, group_blocks=blocks, **wide)
+    assert mixed_grid == (
+        128,
+        1,
+        1,
+    )  # 64 clusters of two CTAs (160 units capped at the 128-CTA grid)
+    _, wide_grid = launch_plan(4096, 2048, group_blocks=all_odd, **wide)
     assert wide_grid == (
         1480,
         1,
