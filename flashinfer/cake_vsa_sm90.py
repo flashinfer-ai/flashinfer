@@ -884,7 +884,10 @@ def plan_vsa_sm90(
         raise ValueError("sms must be positive")
     rows = [[m.nonzero().flatten().tolist() for m in mask[hh]] for hh in range(h)]
     ragged = int(counts.min()) != int(counts.max())
-    refined = float(counts.sum()) / (h * mb) >= REFINED_LOAD_MIN_K
+    # The refined load model is calibrated on uniform plans; on ragged plans it
+    # only re-orders and re-balances the list schedule and measured slower on
+    # the 32k-token K=64 ragged rows, so ragged plans keep the previous model.
+    refined = (not ragged) and float(counts.sum()) / (h * mb) >= REFINED_LOAD_MIN_K
 
     def build(mode: str):
         infos: list[tuple[int, int, int, int]] = []

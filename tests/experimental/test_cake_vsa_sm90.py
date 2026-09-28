@@ -1002,3 +1002,16 @@ def test_plan_no_credit_for_intermediate_grids():
     mask = _topk_mask(7, 1713, 1713, 64)
     plan = plan_vsa_sm90(mask, mode="pair", sms=132)
     assert len(_cta_tiles(plan)) == 132
+
+
+def test_plan_ragged_keeps_the_previous_load_model():
+    # h10, 32768 tokens, K = 64 ragged: the refined model would pick 128 CTAs;
+    # ragged plans keep the previous model (full grid, raw-position balance).
+    g = torch.Generator(device="cpu").manual_seed(42)
+    idx = torch.rand((10, 512, 512), generator=g).topk(64, dim=-1).indices
+    counts = torch.randint(1, 65, (10, 512), generator=g)
+    counts[:, 0] = 64
+    mask = torch.zeros((10, 512, 512), dtype=torch.bool)
+    mask.scatter_(-1, idx, torch.arange(64) < counts.unsqueeze(-1))
+    plan = plan_vsa_sm90(mask, sms=132)
+    assert len(_cta_tiles(plan)) == 132
