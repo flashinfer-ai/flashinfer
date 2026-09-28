@@ -80,9 +80,9 @@ HT_FINALIZE_GB300_TP16_H8192_K10 = HTFinalizeTuning(
 HT_ALL_REDUCE_GB300_TP8_H8192 = HTAllReduceTuning()
 HT_ALL_REDUCE_GB300_TP16_H8192 = HTAllReduceTuning()
 
-# K3's TP8 reduction shards contain 56 bf16x8 packs; eight lanes in each
-# two-warp reduction stay masked. Consumer tiles still cover a whole token.
-HT_FINALIZE_GB300_TP8_H3584_K16 = HTFinalizeTuning(
+# K3's TP4/8/16 reduction shards contain 112/56/28 bf16x8 packs.
+# Consumer tiles cover a whole token; partial reduction warps are masked.
+HT_FINALIZE_GB300_H3584_K16 = HTFinalizeTuning(
     consumer_threads=448,
     vectors_per_thread=1,
     stages=10,
@@ -92,7 +92,7 @@ HT_FINALIZE_GB300_TP8_H3584_K16 = HTFinalizeTuning(
     rms_shard_major=False,
     enable_pdl=True,
 )
-HT_ALL_REDUCE_GB300_TP8_H3584 = HTAllReduceTuning(
+HT_ALL_REDUCE_GB300_H3584 = HTAllReduceTuning(
     consumer_threads=448,
     vectors_per_thread=1,
     stages=2,

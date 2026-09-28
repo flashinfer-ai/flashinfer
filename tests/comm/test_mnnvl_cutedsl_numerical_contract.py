@@ -43,7 +43,7 @@ PROTOCOL_CONFIGS = {
     "bt": BT_ONLY_CONFIG,
     "ht": HT_ONLY_CONFIG,
 }
-pytestmark = [pytest.mark.gpu_8, pytest.mark.arch_blackwell]
+pytestmark = [pytest.mark.gpu_4, pytest.mark.arch_blackwell]
 
 
 @pytest.fixture(scope="module")
@@ -51,8 +51,8 @@ def distributed_group():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size not in (8, 16):
-        pytest.skip("Run this test with eight or sixteen distributed ranks")
+    if world_size not in (4, 8, 16):
+        pytest.skip("Run this test with four, eight, or sixteen distributed ranks")
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device = torch.device("cuda", local_rank)
@@ -241,8 +241,8 @@ def test_protocol_numerical_contract(
     group = distributed_group
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
-    if hidden_size == 3584 and world_size != 8:
-        pytest.skip("The K3 HT preset is TP8")
+    if hidden_size == 8192 and world_size == 4:
+        pytest.skip("The H8192 presets require TP8 or TP16")
     m = {8: 257, 16: 513}[world_size] if large_bt else world_size
     workspace = _workspace(protocol, m, group, hidden_size, top_k)
     symmetric_reference = (

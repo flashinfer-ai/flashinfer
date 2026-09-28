@@ -60,8 +60,8 @@ from .kernel_ll import (
     LL_FINALIZE_GB300_TP8_H8192_K10,
 )
 from .kernel_ht import (
-    HT_ALL_REDUCE_GB300_TP8_H3584,
-    HT_FINALIZE_GB300_TP8_H3584_K16,
+    HT_ALL_REDUCE_GB300_H3584,
+    HT_FINALIZE_GB300_H3584_K16,
     HT_ALL_REDUCE_GB300_TP4_H5120,
     HT_FINALIZE_GB300_TP4_H5120_K3,
     HT_FINALIZE_GB300_TP4_H5120_K6,
@@ -473,17 +473,45 @@ BT_ONLY_CONFIG = MNNVLCuteDSLConfig(
 HT_ONLY_CONFIG = MNNVLCuteDSLConfig(
     profiles=(
         StaticProfile(
+            tp_size=4,
+            hidden_size=3584,
+            top_k=16,
+            dtype=torch.bfloat16,
+            finalize_routes=MRangeDispatch(
+                upper_bounds=(None,),
+                targets=(_target(ProtocolKind.HT, HT_FINALIZE_GB300_H3584_K16),),
+            ),
+            all_reduce_routes=MRangeDispatch(
+                upper_bounds=(None,),
+                targets=(_target(ProtocolKind.HT, HT_ALL_REDUCE_GB300_H3584),),
+            ),
+        ),
+        StaticProfile(
             tp_size=8,
             hidden_size=3584,
             top_k=16,
             dtype=torch.bfloat16,
             finalize_routes=MRangeDispatch(
                 upper_bounds=(None,),
-                targets=(_target(ProtocolKind.HT, HT_FINALIZE_GB300_TP8_H3584_K16),),
+                targets=(_target(ProtocolKind.HT, HT_FINALIZE_GB300_H3584_K16),),
             ),
             all_reduce_routes=MRangeDispatch(
                 upper_bounds=(None,),
-                targets=(_target(ProtocolKind.HT, HT_ALL_REDUCE_GB300_TP8_H3584),),
+                targets=(_target(ProtocolKind.HT, HT_ALL_REDUCE_GB300_H3584),),
+            ),
+        ),
+        StaticProfile(
+            tp_size=16,
+            hidden_size=3584,
+            top_k=16,
+            dtype=torch.bfloat16,
+            finalize_routes=MRangeDispatch(
+                upper_bounds=(None,),
+                targets=(_target(ProtocolKind.HT, HT_FINALIZE_GB300_H3584_K16),),
+            ),
+            all_reduce_routes=MRangeDispatch(
+                upper_bounds=(None,),
+                targets=(_target(ProtocolKind.HT, HT_ALL_REDUCE_GB300_H3584),),
             ),
         ),
         StaticProfile(
