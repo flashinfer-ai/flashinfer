@@ -292,6 +292,29 @@ def st_e4m3_pred(dst_gmem, v_f32, pred_i32, loc=None, ip=None):
 
 
 @dsl_user_op
+def st_global_v4_pred(dst_gmem, w0, w1, w2, w3, pred_i32, loc=None, ip=None):
+    """Predicated 16-byte store of four 32-bit words."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gmem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w0).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w1).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w2).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w3).ir_value(loc=loc, ip=ip),
+            pred_i32.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p_;\n\tsetp.ne.b32 p_, $5, 0;\n\t@p_ st.global.v4.b32 [$0], {$1, $2, $3, $4};\n}",
+        "l,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_u8_pred(dst_gmem, v_u32, pred_i32, loc=None, ip=None):
     """Predicated store of the low byte of ``v_u32``."""
     llvm.inline_asm(

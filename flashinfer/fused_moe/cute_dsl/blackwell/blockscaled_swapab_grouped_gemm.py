@@ -86,6 +86,7 @@ from .utils import (
     pack_bf16x2_f32,
     red_add_bf16x2_pair_pred,
     st_e4m3_pred,
+    st_global_v4_pred,
     st_u8_pred,
     warp_max_nonneg_f32,
     st_bf16_pred,
@@ -97,6 +98,7 @@ from .utils import (
     griddepcontrol_wait,
     native_situ_f32,
     native_tanh_f32,
+    sigmoid_f32,
     tcgen05_fence_after_thread_sync,
     tcgen05_fence_before_thread_sync,
 )
@@ -496,13 +498,19 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # Wide finalize: two 32-token M-major BF16 staging buffers (128 h per
         # token row, rows padded to 272 B so stmatrix rows spread over banks).
         tr = 2 * 32 * 272 if self.wide_finalize_staging else 0
-        # Wide SiTU: parity-doubled gate/up exchange (128 rows).
-        exch_rows = 128 if (self.wide_epi and self.is_situ) else 64
-        return exch_rows * (n + 1) * 4 + red + tr
+        if self.wide_situ_frag:
+            # Fragment exchange (32 x 64 threads x 2 buffers F32) + e4m3 [tok][j]
+            # staging (2 x 32 rows x 144 B) + SF codes (2 warps x 32 x 2 buffers).
+            return 32 * 64 * 2 * 4 + 2 * 32 * 144 + 128 + red + tr
+        return 64 * (n + 1) * 4 + red + tr
 
     @property
     def wide_finalize_staging(self) -> bool:
         return self.wide_epi and self.epilogue_kind == "finalize"
+
+    @property
+    def wide_situ_frag(self) -> bool:
+        return self.wide_epi and self.is_situ
 
     @staticmethod
     def _compute_stages(
@@ -771,7 +779,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # Row stride padded to epi_n + 1 words: thread t owns row t, so an
         # unpadded stride of 32 words put every lane of a warp in one bank
         # (ncu: 18-30-way conflicts on the gate exchange).
-        exch_rows = 128 if (self.wide_epi and self.is_situ) else 64
+        exch_rows = 64
         self.exch_smem_layout = cute.make_layout(
             (exch_rows, epi_n), stride=(epi_n + 1, 1)
         )
@@ -834,8 +842,28 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             ]
             sExch: cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Float32, exch_rows * (min(n_tile, 32) + 1)
+                    cutlass.Float32,
+                    4 if self.wide_situ_frag else exch_rows * (min(n_tile, 32) + 1),
                 ],
+                16,
+            ]
+            # Wide SiTU (fragment path): gate/up exchange in fragment order
+            # (32 values x 64 threads x 2 buffers), e4m3 [tok][j] staging
+            # (2 buffers x 32 token rows x 144 B) and per-warp SF codes.
+            sExchF: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float32, 32 * 64 * 2 if self.wide_situ_frag else 4
+                ],
+                16,
+            ]
+            sAct: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Float8E4M3FN, 2 * 32 * 144 if self.wide_situ_frag else 16
+                ],
+                128,
+            ]
+            sCode: cute.struct.Align[
+                cute.struct.MemRange[cutlass.Uint32, 2 * 32 * 2 if self.wide_situ_frag else 4],
                 16,
             ]
             # Cluster split-K: the peer's partial accumulator (column-major,
@@ -1009,6 +1037,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         tAcc: cute.Tensor,
         epi_tile: cute.Tile,
         sTr: cute.Tensor,
+        stage_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
     ):
         """TMEM -> RF -> smem for the M-major (token-row) BF16 staging.
 
@@ -1020,7 +1049,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,
             utils.LayoutEnum.COL_MAJOR,
-            cutlass.BFloat16,
+            stage_dtype,
             self.acc_dtype,
             epi_tile,
             False,
@@ -1041,9 +1070,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # (T2R, T2R_M, T2R_N) coordinates within one epilogue subtile
         tTR_cC = thr_copy_t2r.partition_D(cC_epi)[(None, None, None, 0, 0)]
         tTR_rAcc = cute.make_rmem_tensor(tTR_cC.shape, self.acc_dtype)
-        tTR_rC = cute.make_rmem_tensor(tTR_cC.shape, cutlass.BFloat16)
+        tTR_rC = cute.make_rmem_tensor(tTR_cC.shape, stage_dtype)
         copy_atom_r2s = sm100_utils.get_smem_store_op(
-            utils.LayoutEnum.COL_MAJOR, cutlass.BFloat16, self.acc_dtype, tiled_copy_t2r
+            utils.LayoutEnum.COL_MAJOR, stage_dtype, self.acc_dtype, tiled_copy_t2r
         )
         tiled_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, tiled_copy_t2r)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
@@ -1219,6 +1248,17 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         sExch = storage.sExch.get_tensor(exch_smem_layout)
+        # (128 j, 32 tok, 2 buf) e4m3, token rows of 144 B; word view over j < 64.
+        sAct = storage.sAct.get_tensor(
+            cute.make_layout((128, 32, 2), stride=(1, 144, 144 * 32))
+        )
+        sActW = cute.make_tensor(
+            cute.recast_ptr(storage.sAct.data_ptr(), dtype=cutlass.Uint32),
+            cute.make_layout((4, 4, 32, 2), stride=(1, 4, 36, 36 * 32)),
+        )
+        sCode = storage.sCode.get_tensor(
+            cute.make_layout((2, 32, 2), stride=(32, 1, 64))
+        )
         sTr = storage.sTr.get_tensor(
             cute.make_layout((128, 32, 2), stride=(1, 136, 136 * 32))
         )
@@ -2376,6 +2416,29 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 tTR_cC_mg = cute.group_modes(tTR_cC_m, 0, cute.rank(tTR_cC_m))
                 fin_scl_m = cute.make_rmem_tensor(tTR_rAcc_m.shape, cutlass.Float32)
                 fin_scl_mg = cute.group_modes(fin_scl_m, 0, cute.rank(fin_scl_m))
+            if cutlass.const_expr(self.wide_situ_frag):
+                (
+                    tiled_copy_t2r_f,
+                    tTR_tAcc_f_base,
+                    tTR_cC_f,
+                    tTR_rAcc_f,
+                    tTR_rC_f,
+                    tiled_copy_r2s_f,
+                    tRS_rC_f,
+                    tRS_sAct_f,
+                ) = self.epilog_mmajor_copy_and_partition(
+                    epi_tidx, tCtAcc_base, epi_tile, sAct, cutlass.Float8E4M3FN
+                )
+                tTR_cC_fg = cute.group_modes(tTR_cC_f, 0, cute.rank(tTR_cC_f))
+                frag_v = cute.make_rmem_tensor(tTR_rAcc_f.shape, cutlass.Float32)
+                frag_vg = cute.group_modes(frag_v, 0, cute.rank(frag_v))
+                # Exchange in fragment (linear) order as (4, 8) per thread: 16-B groups of
+                # one thread are contiguous, consecutive threads adjacent (no bank conflicts).
+                frag_g = cute.make_rmem_tensor((4, 8), cutlass.Float32)
+                frag_gg = cute.group_modes(frag_g, 0, 2)
+                sExchF = storage.sExchF.get_tensor(
+                    cute.make_layout((4, 8, 64, 2), stride=(1, 256, 4, 2048))
+                )
 
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
@@ -2536,68 +2599,95 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                         lb_idx = expert_idx
                                     linear_beta = cutlass.Float32(situ_linear_beta[lb_idx])
                                     inv_linear_beta = cutlass.Float32(1.0) / linear_beta
-                                # Intermediate index of this lane's (up, gate) row pair and its
-                                # 32-wide requant group (one warp).
-                                row_x = epi_tidx % 64
-                                j = m_tile_out * 64 + row_x
-                                sf_kb = m_tile_out * 2 + row_x // 32
-                                half = epi_n // 2
-                                is_lane0 = cutlass.Int32(lane == 0)
-
+                                # ---- fragment path (rev 4b): 16x256b T2R gives each thread 2 rows x 2
+                                # columns per 8-column group; gate warps hand SiTU(gate) to the up warps in
+                                # fragment order (16-B smem vectors), the up warps scale, take the per-column
+                                # amax (register groups + xor shuffles), quantize with ``.to(e4m3)`` and
+                                # ``stmatrix.trans`` the subtile into [tok][j] staging; every thread then
+                                # stores one 16-B chunk of one token row and lanes 0..31 the SF byte.
+                                j0 = m_tile_out * 64
+                                t64 = epi_tidx % 64
+                                warp_in64 = t64 // 32
+                                sf_kb = m_tile_out * 2 + warp_in64
+                                st_tok = epi_tidx // 4
+                                st_chunk = epi_tidx % 4
+                                is_sf_writer = lane < 4
+                                inv_beta = cutlass.Float32(1.0) / beta
+                                tTR_tAcc_f = tTR_tAcc_f_base[
+                                    (None, None, None, None, None, acc_slot_e)
+                                ]
+                                tTR_tAcc_f = cute.group_modes(tTR_tAcc_f, 3, cute.rank(tTR_tAcc_f))
+                                col_groups = [[0, 2, 16, 18], [1, 3, 17, 19], [4, 6, 20, 22], [5, 7, 21, 23], [8, 10, 24, 26], [9, 11, 25, 27], [12, 14, 28, 30], [13, 15, 29, 31]]
+                                shfl_masks = [4, 8, 16]
                                 for sub in cutlass.range_constexpr(num_sub):
+                                    buf = sub % 2
                                     if cutlass.const_expr(self.perf_probe < 2):
                                         cute.copy(
-                                            tiled_copy_t2r, tTR_tAcc[(None, None, None, sub)], tTR_rAcc
+                                            tiled_copy_t2r_f,
+                                            tTR_tAcc_f[(None, None, None, sub)],
+                                            tTR_rAcc_f,
                                         )
-                                        acc_vec = tTR_rAcc.load()
-                                        for c in cutlass.range_constexpr(epi_n):
-                                            vals[c] = acc_vec[c] * alpha_val
+                                        frag_v.store(tTR_rAcc_f.load() * alpha_val)
                                     if cutlass.const_expr(self.perf_probe in (0, 4)):
-                                        # Exchange: gate lanes hand SiTU(gate) of columns [0, half) to
-                                        # the up lanes; up lanes hand up' of [half, epi_n) to the gate
-                                        # lanes. Each half then owns 16 columns end to end.
-                                        # Parity-doubled exchange rows: subtile ``sub`` uses rows
-                                        # [64 * (sub % 2), +64), so no barrier is needed before the
-                                        # next subtile overwrites the other half.
-                                        xrow = row_x + 64 * (sub % 2)
                                         if is_gate_lane:
-                                            for c in cutlass.range_constexpr(half):
-                                                sExch[(xrow, c)] = native_situ_f32(
-                                                    vals[c], beta, fastmath=True
+                                            for i in cutlass.range_constexpr(32):
+                                                xg = frag_vg[i]
+                                                frag_gg[i] = (
+                                                    beta
+                                                    * native_tanh_f32(xg * inv_beta)
+                                                    * sigmoid_f32(xg, fastmath=True)
                                                 )
+                                            sExchF[(None, None, t64, buf)].store(frag_g.load())
+                                            self.epilog_sync_barrier.arrive_and_wait()
+                                            self.epilog_sync_barrier.arrive_and_wait()
                                         else:
-                                            for c in cutlass.range_constexpr(half, epi_n):
-                                                ux = vals[c]
-                                                if cutlass.const_expr(self.use_linear_beta):
-                                                    ux = linear_beta * native_tanh_f32(ux * inv_linear_beta)
-                                                sExch[(xrow, c)] = ux
-                                        self.epilog_sync_barrier.arrive_and_wait()
-                                        if is_gate_lane:
-                                            sf_codeg = cutlass.Int32(0)
-                                            for c in cutlass.range_constexpr(half, epi_n):
-                                                vg = sExch[(xrow, c)] * native_situ_f32(
-                                                    vals[c], beta, fastmath=True
-                                                )
-                                                ag = cute.arch.fmax(vg, -vg)
-                                                amaxg = warp_max_nonneg_f32(ag)
-                                                prowg = row_base + sub * epi_n + c
-                                                okg = cutlass.Int32(prowg < mn_limit)
-                                                scale_codeg = float_to_ue8m0_fast(amaxg * inv_fp8_max)
-                                                inv_scaleg = ue8m0_to_inv_scale_fast(scale_codeg)
-                                                # Predicated stores keep the 16 column chains branch-free
-                                                # so their latencies interleave.
-                                                # perf_probe 4: everything but the global stores.
-                                                st_e4m3_pred(
-                                                    cute.domain_offset((prowg, j, 0), out),
-                                                    vg * inv_scaleg,
-                                                    okg * cutlass.Int32(self.perf_probe != 4),
-                                                )
-                                                sf_codeg = sf_codeg | (scale_codeg * cutlass.Int32(lane == c))
-                                            # One SF store per subtile: lane c carries column c's code.
+                                            if cutlass.const_expr(self.use_linear_beta):
+                                                for i in cutlass.range_constexpr(32):
+                                                    frag_vg[i] = linear_beta * native_tanh_f32(
+                                                        frag_vg[i] * inv_linear_beta
+                                                    )
+                                            self.epilog_sync_barrier.arrive_and_wait()
+                                            gx = sExchF[(None, None, t64, buf)].load()
+                                            for i in cutlass.range_constexpr(32):
+                                                frag_vg[i] = frag_vg[i] * gx[i]
+                                            for grp in cutlass.range_constexpr(len(col_groups)):
+                                                g0 = col_groups[grp]
+                                                a = cute.arch.fmax(frag_vg[g0[0]], -frag_vg[g0[0]])
+                                                for k in cutlass.range_constexpr(1, len(g0)):
+                                                    a = cute.arch.fmax(
+                                                        a, cute.arch.fmax(frag_vg[g0[k]], -frag_vg[g0[k]])
+                                                    )
+                                                for k in cutlass.range_constexpr(len(shfl_masks)):
+                                                    a = cute.arch.fmax(
+                                                        a, cute.arch.shuffle_sync_bfly(a, shfl_masks[k])
+                                                    )
+                                                code_q = float_to_ue8m0_fast(a * inv_fp8_max)
+                                                inv_q = ue8m0_to_inv_scale_fast(code_q)
+                                                for k in cutlass.range_constexpr(len(g0)):
+                                                    frag_vg[g0[k]] = frag_vg[g0[k]] * inv_q
+                                                if is_sf_writer:
+                                                    sCode[(warp_in64, tTR_cC_fg[g0[0]][1], buf)] = code_q
+                                            tTR_rC_f.store(frag_v.load().to(cutlass.Float8E4M3FN))
+                                            cute.copy(
+                                                tiled_copy_r2s_f,
+                                                tRS_rC_f,
+                                                tRS_sAct_f[(None, None, None, buf)],
+                                            )
+                                            self.epilog_sync_barrier.arrive_and_wait()
+                                        # Row-chunk stores (all 128 threads) + SF bytes (lanes of warps 0/1).
+                                        prow = row_base + sub * epi_n + st_tok
+                                        ok = cutlass.Int32(prow < mn_limit) * cutlass.Int32(self.perf_probe != 4)
+                                        w4 = sActW[(None, st_chunk, st_tok, buf)].load()  # 4 x u32 (16 B)
+                                        st_global_v4_pred(
+                                            cute.domain_offset((prow, j0 + 16 * st_chunk, 0), out),
+                                            w4[0], w4[1], w4[2], w4[3], ok,
+                                        )
+                                        if epi_tidx < 64:
                                             prow_l = row_base + sub * epi_n + lane
-                                            ok_l = cutlass.Int32(prow_l < mn_limit) * cutlass.Int32(lane >= half)
+                                            ok_l = cutlass.Int32(prow_l < mn_limit) * cutlass.Int32(self.perf_probe != 4)
+                                            code_l = sCode[(warp_in64, lane, buf)]
                                             if cutlass.const_expr(self.sf_blocked):
-                                                sf_dstg = cute.domain_offset(
+                                                sf_dst = cute.domain_offset(
                                                     (
                                                         prow_l % 32,
                                                         (prow_l // 32) % 4,
@@ -2609,48 +2699,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                     out_sf,
                                                 )
                                             else:
-                                                sf_dstg = cute.domain_offset((prow_l, sf_kb), out_sf)
-                                            st_u8_pred(sf_dstg, sf_codeg, ok_l * cutlass.Int32(self.perf_probe != 4))
-                                        else:
-                                            sf_codeu = cutlass.Int32(0)
-                                            for c in cutlass.range_constexpr(half):
-                                                uu = vals[c]
-                                                if cutlass.const_expr(self.use_linear_beta):
-                                                    uu = linear_beta * native_tanh_f32(uu * inv_linear_beta)
-                                                vu = uu * sExch[(xrow, c)]
-                                                au = cute.arch.fmax(vu, -vu)
-                                                amaxu = warp_max_nonneg_f32(au)
-                                                prowu = row_base + sub * epi_n + c
-                                                oku = cutlass.Int32(prowu < mn_limit)
-                                                scale_codeu = float_to_ue8m0_fast(amaxu * inv_fp8_max)
-                                                inv_scaleu = ue8m0_to_inv_scale_fast(scale_codeu)
-                                                # Predicated stores keep the 16 column chains branch-free
-                                                # so their latencies interleave.
-                                                # perf_probe 4: everything but the global stores.
-                                                st_e4m3_pred(
-                                                    cute.domain_offset((prowu, j, 0), out),
-                                                    vu * inv_scaleu,
-                                                    oku * cutlass.Int32(self.perf_probe != 4),
-                                                )
-                                                sf_codeu = sf_codeu | (scale_codeu * cutlass.Int32(lane == c))
-                                            # One SF store per subtile: lane c carries column c's code.
-                                            prow_l = row_base + sub * epi_n + lane
-                                            ok_l = cutlass.Int32(prow_l < mn_limit) * cutlass.Int32(lane < half)
-                                            if cutlass.const_expr(self.sf_blocked):
-                                                sf_dstu = cute.domain_offset(
-                                                    (
-                                                        prow_l % 32,
-                                                        (prow_l // 32) % 4,
-                                                        prow_l // 128,
-                                                        sf_kb % 4,
-                                                        sf_kb // 4,
-                                                        0,
-                                                    ),
-                                                    out_sf,
-                                                )
-                                            else:
-                                                sf_dstu = cute.domain_offset((prow_l, sf_kb), out_sf)
-                                            st_u8_pred(sf_dstu, sf_codeu, ok_l * cutlass.Int32(self.perf_probe != 4))
+                                                sf_dst = cute.domain_offset((prow_l, sf_kb), out_sf)
+                                            st_u8_pred(sf_dst, code_l, ok_l)
                                 cute.arch.fence_view_async_tmem_load()
                             else:
                                 # ---- finalize: M-major staging + bulk reduce-add per token ----
