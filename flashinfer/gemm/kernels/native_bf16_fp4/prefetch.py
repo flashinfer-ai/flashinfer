@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 by FlashInfer team.
 # SPDX-License-Identifier: Apache-2.0
-"""Bounded decode configurations for native W4A16 register prefetch."""
+"""Bounded small-M configurations for native W4A16 register prefetch."""
 
 from typing import Any
 
@@ -15,7 +15,7 @@ def is_supported(inputs):
     a, b, sf, alpha, out, _ = inputs
     return (
         get_compute_capability(a.device) == (12, 1)
-        and 1 <= a.shape[0] <= 16
+        and 1 <= a.shape[0] <= 64
         and (b.shape[0], a.shape[1]) in ((5120, 17408), (34816, 5120))
         and out.dtype == torch.bfloat16
         and alpha is not None
@@ -24,13 +24,18 @@ def is_supported(inputs):
 
 
 def _config(m, n):
+    if m > 16:
+        bm, bk = (32, 512) if m <= 32 else (64, 256)
+        step = 256 // (bk // 2)
+        rows = min(bm, ((m + step - 1) // step) * step)
+        return (bk, 8, rows, False, 128, bm, 1)
     # Compact B staging keeps the deeper K tile within the shared-memory limit.
     if n == 5120 and m in (14, 15):
-        return (1024, 7, m, True, 112)
+        return (1024, 7, m, True, 112, 16, 2)
     if n == 5120 and m == 13:
-        return (1024, 8, m, True, 128)
+        return (1024, 8, m, True, 128, 16, 2)
     bk = 1024 if (n == 5120 and m <= 12) or (n == 34816 and m <= 10) else 512
-    return (bk, 8, m, False, 128)
+    return (bk, 8, m, False, 128, 16, 2)
 
 
 def _compile(n, k, config):
@@ -40,7 +45,7 @@ def _compile(n, k, config):
     from ....jit.cute_dsl_core import build_and_load_cute_dsl_kernel
     from . import prefetch_kernel
 
-    bk, warps, rows, compact_b, bn = config
+    bk, warps, rows, compact_b, bn, bm, vec = config
     m = cute.sym_int()
     a = cute.runtime.make_fake_compact_tensor(
         cutlass.BFloat16, (m, k), stride_order=(1, 0), assumed_align=16
@@ -59,7 +64,7 @@ def _compile(n, k, config):
     )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     op = prefetch_kernel.NativeBf16Fp4PrefetchKernel(
-        16,
+        bm,
         bk,
         warps,
         1,
@@ -68,13 +73,13 @@ def _compile(n, k, config):
         rows,
         1,
         1,
-        2,
+        vec,
         0 if compact_b else -1,
         False,
         compact_b,
         bn,
     )
-    name = f"n{n}_k{k}_bk{bk}_w{warps}_r{rows}_cb{int(compact_b)}_bn{bn}"
+    name = f"n{n}_k{k}_bm{bm}_bk{bk}_w{warps}_r{rows}_cb{int(compact_b)}_bn{bn}_v{vec}"
     return build_and_load_cute_dsl_kernel(
         "native_bf16_fp4_prefetch_sm121",
         name,

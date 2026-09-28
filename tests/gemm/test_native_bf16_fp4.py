@@ -39,19 +39,48 @@ def make_case(m, n, k, seed=42):
     return a, b, sf, weight
 
 
-@pytest.mark.parametrize("m", [1, 4, 8, 13, 14, 15, 16])
+@pytest.mark.parametrize(
+    "m",
+    [
+        1,
+        4,
+        8,
+        13,
+        14,
+        15,
+        16,
+        17,
+        32,
+        33,
+        64,
+        65,
+        127,
+        128,
+        129,
+        256,
+        352,
+        512,
+        1024,
+        1568,
+        2000,
+        2048,
+        3072,
+        4096,
+        8192,
+    ],
+)
 @pytest.mark.parametrize("n,k", [(5120, 17408), (34816, 5120)])
-def test_prefetch_tactic_reference_and_graph_replay(m, n, k):
+def test_optimized_tactic_reference_and_graph_replay(m, n, k):
     from flashinfer.gemm.kernels.native_bf16_fp4.runner import get_runner
 
     if get_compute_capability(torch.device("cuda")) != (12, 1):
-        pytest.skip("Register-prefetch configurations are qualified for SM121")
+        pytest.skip("Optimized configurations target SM121")
     a, b, sf, weight = make_case(m, n, k)
     alpha = torch.tensor([0.375], device="cuda")
     out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
     inputs = [a, b, sf, alpha, out, True]
     runner = get_runner()
-    tactic = ("prefetch",)
+    tactic = ("prefetch",) if m <= 64 else ("grouped",)
     assert tactic in runner.get_valid_tactics(inputs, None)
     runner.forward(inputs, tactic=tactic, do_preparation=True)
     assert torch.isnan(out).all()
@@ -85,20 +114,23 @@ def test_prefetch_tactic_reference_and_graph_replay(m, n, k):
     )
 
 
-def test_prefetch_tactic_rejects_unsupported_views_and_output():
+@pytest.mark.parametrize(
+    "tactic,m,outside", [("prefetch", 1, 65), ("grouped", 128, 64)]
+)
+def test_optimized_tactic_rejects_unsupported_views_and_output(tactic, m, outside):
     from flashinfer.gemm.kernels.native_bf16_fp4.runner import get_runner
 
-    a, b, sf, _ = make_case(1, 5120, 17408)
+    a, b, sf, _ = make_case(m, 5120, 17408)
     alpha = torch.ones(1, device="cuda")
-    out = torch.empty((1, 5120), device="cuda", dtype=torch.bfloat16)
+    out = torch.empty((m, 5120), device="cuda", dtype=torch.bfloat16)
     runner = get_runner()
-    tactic = ("prefetch",)
+    tactic = (tactic,)
     shifted = torch.empty(sf.numel() + 1, dtype=sf.dtype, device=sf.device)[1:]
     for inputs in (
         [a, b, sf, None, out, True],
         [a, b, sf, alpha, out.to(torch.float16), True],
         [a, b, shifted, alpha, out, True],
-        [a.expand(17, -1).contiguous(), b, sf, alpha, out, True],
+        [a[:1].expand(outside, -1).contiguous(), b, sf, alpha, out, True],
     ):
         assert not runner.validate_tactic(inputs, tactic)
 
@@ -377,6 +409,29 @@ def test_tiled_traversal_preserves_outputs_with_m_and_n_tails(splits):
         compiled(a.view(torch.int32), b.view(torch.int32), sf, alpha, out, partial)
         outputs.append(out.clone())
     assert torch.equal(outputs[0].view(torch.int16), outputs[1].view(torch.int16))
+    torch.testing.assert_close(
+        out.float(), (a.float() @ weight.T) * alpha, atol=2e-3, rtol=8e-3
+    )
+
+
+def test_grouped_tactic_reuses_compilation_for_runtime_m():
+    from flashinfer.gemm.kernels.native_bf16_fp4 import grouped
+    from flashinfer.gemm.kernels.native_bf16_fp4.runner import get_runner
+
+    if get_compute_capability(torch.device("cuda")) != (12, 1):
+        pytest.skip("Grouped configurations target SM121")
+    a, b, sf, weight = make_case(67, 5120, 17408)
+    alpha = torch.tensor([-0.375], device="cuda")
+    out = torch.empty((67, 5120), device="cuda", dtype=torch.bfloat16)
+    runner = get_runner()
+    runner.forward([a[:65], b, sf, alpha, out[:65], True], tactic=("grouped",))
+    compiled = dict(grouped._COMPILED)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        runner.forward([a, b, sf, alpha, out, True], tactic=("grouped",))
+    graph.replay()
+    torch.cuda.synchronize()
+    assert compiled == grouped._COMPILED
     torch.testing.assert_close(
         out.float(), (a.float() @ weight.T) * alpha, atol=2e-3, rtol=8e-3
     )
