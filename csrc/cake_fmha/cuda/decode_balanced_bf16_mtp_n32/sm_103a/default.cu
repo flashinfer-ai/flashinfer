@@ -105,7 +105,7 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
 
 __device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
     asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
+        :: "l"(mbar_addr), "r"(count) : "memory");
 }
 
 
