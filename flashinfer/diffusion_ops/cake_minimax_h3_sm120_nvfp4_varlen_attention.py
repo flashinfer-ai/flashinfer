@@ -597,7 +597,10 @@ def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
       ratio vs the default route for a single segment of N tokens (56 heads, Gaussian inputs): 1.10 at
       N >= 128 (full blocks), 1.13 at 100, 1.18 at 64, 1.23 at 51, 1.32 at 32, 1.64 at 16 (max-abs 0.79,
       still inside the FP4 tolerance).  In a packed stream the aggregate error is dominated by the short
-      segments, whose outputs are larger per element;
+      segments, whose outputs are larger per element.  **Segments of fewer than 8 tokens exceed the FP4
+      tolerance on this route** (max-abs 1.2-2.7 at 2-6 tokens; a 1-token segment is exact by construction),
+      so do not use it for streams that contain such segments -- the default route stays within tolerance
+      there;
     * measured latency: the attention launch runs about 9-15 % faster on both GB202 SKUs (RTX 5090 and
       RTX PRO 6000 Blackwell; 220 registers instead of 246), the complete call proportionally less on
       short plans where pre-processing dominates.
