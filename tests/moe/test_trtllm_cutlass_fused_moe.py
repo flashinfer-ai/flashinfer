@@ -3875,15 +3875,15 @@ def test_tuning_config_tracks_each_call(monkeypatch, tuning):
         return result
 
     monkeypatch.setattr(AutoTuner, "choose_one", record_choice)
-    inputs = _make_ws_inputs(64)
+    inputs = _make_ws_inputs(8192)
     configs = {}
     outputs = {}
     tactics = {}
-    for num_tokens in (64, 8, 64, 32, 8, 32, 64):
+    for num_tokens in (64, 8192, 8, 64, 32, 8, 32, 64, 8192):
         x, ids, weights, w1, w2 = inputs
         x, ids, weights = x[:num_tokens], ids[:num_tokens], weights[:num_tokens]
         observed.clear()
-        with autotune(tuning):
+        with autotune(tuning and num_tokens != 8192):
             output = fused_moe.cutlass_fused_moe(
                 x,
                 ids,
@@ -3892,7 +3892,7 @@ def test_tuning_config_tracks_each_call(monkeypatch, tuning):
                 w2,
                 output_dtype=x.dtype,
                 quant_scales=[],
-                tune_max_num_tokens=num_tokens,
+                **({} if num_tokens == 8192 else {"tune_max_num_tokens": num_tokens}),
             )[0]
         reference = compute_with_experts(w1.shape[0], x, w1, w2, ids, weights)
         torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
