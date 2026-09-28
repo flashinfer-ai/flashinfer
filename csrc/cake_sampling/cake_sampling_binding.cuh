@@ -49,6 +49,9 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <mutex>
+#include <set>
+#include <utility>
 
 #include <cstdint>
 #include <limits>
@@ -147,6 +150,26 @@ inline void EnsureClusterAttribute(const void* kernel, int32_t cluster) {
   }
 }
 
+// One-time per (device, kernel) preparation: target check, dynamic shared memory opt-in and the
+//   non-portable cluster opt-in.  Function attributes persist for the process, and the runtime
+//   queries behind them (cudaDeviceGetAttribute x2, cudaFuncGetAttributes, cudaFuncSetAttribute)
+//   cost several microseconds each on Grace hosts -- for the stage-2/3 launch they sat between the
+//   two launches of the eager path, delaying the second kernel.
+inline void PrepareKernel(int32_t device_id, const void* kernel, int32_t smem_bytes,
+                          int32_t cluster) {
+  static std::mutex mutex;
+  static std::set<std::pair<int32_t, const void*>> prepared;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (prepared.count({device_id, kernel}) != 0) return;
+  }
+  CheckTarget(device_id, kernel);
+  EnsureSmemAttribute(kernel, smem_bytes);
+  EnsureClusterAttribute(kernel, cluster);
+  std::lock_guard<std::mutex> lock(mutex);
+  prepared.insert({device_id, kernel});
+}
+
 inline void CheckSlab(const TensorView& vals, const TensorView& idx, const TensorView& count,
                       int64_t rows) {
   CHECK_CUDA(vals);
@@ -214,7 +237,7 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
                                       static_cast<int32_t>(stream_variant));
   TVM_FFI_ICHECK(v != nullptr) << "no frozen stage-1 variant for cluster=" << cluster
                                << " ept=" << ept << " stream=" << stream_variant;
-  CheckTarget(device_id, v->kernel);
+  PrepareKernel(device_id, v->kernel, v->smem_bytes, v->cluster);
   TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept
       << " does not cover vocab=" << vocab;
@@ -251,8 +274,6 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
     }
   }
   if (batch == 0) return;
-  EnsureSmemAttribute(v->kernel, v->smem_bytes);
-  EnsureClusterAttribute(v->kernel, v->cluster);
 
   float* probs_ptr = static_cast<float*>(probs.data_ptr());
   int* topk_ptr = static_cast<int*>(topk_arr.data_ptr());
@@ -333,9 +354,8 @@ void SparseTopPSample(TensorView vals, TensorView idx, TensorView count, TensorV
   const Stage23Variant* v = FindStage23(static_cast<int32_t>(threads), static_cast<int32_t>(items));
   TVM_FFI_ICHECK(v != nullptr) << "no frozen stage-2/3 variant for threads=" << threads
                                << " items=" << items;
-  CheckTarget(device_id, v->kernel);
+  PrepareKernel(device_id, v->kernel, v->smem_bytes, 1);
   if (batch == 0) return;
-  EnsureSmemAttribute(v->kernel, v->smem_bytes);
 
   float* vals_ptr = static_cast<float*>(vals.data_ptr());
   int* idx_ptr = static_cast<int*>(idx.data_ptr());
