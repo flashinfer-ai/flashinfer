@@ -83,8 +83,9 @@ from .utils import (
     blk_reduce_bf16,
     pack_bf16x2_f32,
     red_add_bf16x2_pair_pred,
+    selp_f32,
+    st_async_b32_cluster,
     st_e4m3_pred,
-    st_shared_b32_pred,
     st_u8_pred,
     warp_max_nonneg_f32,
     st_bf16_pred,
@@ -494,8 +495,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # epilogue kind; finalize/partial write straight from registers.
         n = min(self.n_tile, 32)
         red = 128 * self.n_tile * 4 if self.cluster_split else 16
-        # Wide finalize: two 32-token x 128-BF16 transposed staging buffers.
-        tr = 2 * 32 * 128 * 2 if self.wide_finalize_staging else 0
+        # Wide finalize: two 32-token transposed BF16 staging buffers
+        # (128 h per row, or the pair's 256 h on the 2-CTA kernel).
+        tr = 2 * 32 * 4 * self.fin_row_words if self.wide_finalize_staging else 0
         # Wide SiTU: parity-doubled gate/up exchange (128 rows).
         exch_rows = 128 if (self.wide_epi and self.is_situ) else 64
         return exch_rows * (n + 1) * 4 + red + tr
@@ -503,6 +505,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
     @property
     def wide_finalize_staging(self) -> bool:
         return self.wide_epi and self.epilogue_kind == "finalize"
+
+    @property
+    def fin_row_words(self) -> int:
+        """32-bit words per staged token row: 128 h (1-CTA) or the pair's 256 h."""
+        return 128 if self.two_cta else 64
 
     @staticmethod
     def _compute_stages(
@@ -852,10 +859,15 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             # for the per-token bulk reduce-add.
             sTr: cute.struct.Align[
                 cute.struct.MemRange[
-                    cutlass.Uint32, 2 * 32 * 64 if self.wide_finalize_staging else 4
+                    cutlass.Uint32,
+                    2 * 32 * self.fin_row_words if self.wide_finalize_staging else 4,
                 ],
                 128,
             ]
+            # Paired finalize (2-CTA): leader-side ``full`` (peer half landed),
+            # peer-side ``empty`` (leader freed the buffer), per staging buffer.
+            fin_full_mbar: cute.struct.MemRange[cutlass.Int64, 2]
+            fin_empty_mbar: cute.struct.MemRange[cutlass.Int64, 2]
 
         self.shared_storage = SharedStorage
 
@@ -1135,6 +1147,14 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 cute.arch.mbarrier_init(storage.red_full_mbar.ptr, 1)
                 cute.arch.mbarrier_init(storage.red_empty_mbar.ptr, 1)
             cute.arch.mbarrier_init_fence()
+        if cutlass.const_expr(self.wide_finalize_staging and self.two_cta):
+            # Paired finalize barriers (one arrive each per phase); the 2-CTA
+            # cluster barrier below makes them visible before any remote use.
+            if tidx == 0:
+                for fb in cutlass.range_constexpr(2):
+                    cute.arch.mbarrier_init(storage.fin_full_mbar.data_ptr() + fb, 1)
+                    cute.arch.mbarrier_init(storage.fin_empty_mbar.data_ptr() + fb, 1)
+            cute.arch.mbarrier_init_fence()
 
         tmem = utils.TmemAllocator(
             storage.tmem_holding_buf.ptr,
@@ -1155,7 +1175,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         sExch = storage.sExch.get_tensor(exch_smem_layout)
         sTr = storage.sTr.get_tensor(
-            cute.make_layout((2, 32, 64), stride=(32 * 64, 64, 1))
+            cute.make_layout(
+                (2, 32, self.fin_row_words),
+                stride=(32 * self.fin_row_words, self.fin_row_words, 1),
+            )
         )
         sRed = storage.sRed.get_tensor(
             cute.make_layout(
@@ -2349,7 +2372,40 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                             pf_scale[c] = cutlass.Float32(1.0)
                             pf_tok[c] = pf_prow
 
+
             inv_fp8_max = cutlass.Float32(1.0 / 448.0)
+            # Wide finalize state (persists across tiles): lane-pair word within a
+            # staging row, issuer role, the peer-side remote addresses and the
+            # per-buffer mbarrier phases of the paired (2-CTA) protocol.
+            par = lane % 2
+            even_i32 = cutlass.Int32(par == 0)
+            is_issuer = (epi_tidx < 32) & is_leader_cta
+            pair_words = epi_tidx // 2 + 64 * mma_tile_coord_v
+            fin_first = cutlass.Int32(1)
+            fin_remote_tr = cutlass.Int32(0)
+            fin_remote_full0 = cutlass.Int32(0)
+            fin_remote_full1 = cutlass.Int32(0)
+            fin_remote_empty0 = cutlass.Int32(0)
+            fin_remote_empty1 = cutlass.Int32(0)
+            fin_full_ph = cute.make_rmem_tensor((2,), cutlass.Int32)
+            fin_empty_ph = cute.make_rmem_tensor((2,), cutlass.Int32)
+            fin_full_ph[0] = cutlass.Int32(0)
+            fin_full_ph[1] = cutlass.Int32(0)
+            # A fresh barrier passes a parity-1 wait: both buffers start free.
+            fin_empty_ph[0] = cutlass.Int32(1)
+            fin_empty_ph[1] = cutlass.Int32(1)
+            if cutlass.const_expr(self.wide_finalize_staging and self.two_cta):
+                fin_remote_tr = mapa_shared_cluster_u32(
+                    storage.sTr.data_ptr(), cutlass.Int32(0)
+                ) + cutlass.Int32(4) * pair_words
+                fin_remote_full0 = mapa_shared_cluster_u32(
+                    storage.fin_full_mbar.data_ptr(), cutlass.Int32(0)
+                )
+                fin_remote_full1 = fin_remote_full0 + cutlass.Int32(8)
+                fin_remote_empty0 = mapa_shared_cluster_u32(
+                    storage.fin_empty_mbar.data_ptr(), cutlass.Int32(1)
+                )
+                fin_remote_empty1 = fin_remote_empty0 + cutlass.Int32(8)
             # Cluster split-K exchange state. The peer's first ``red_empty``
             # wait passes (parity 1 of a fresh barrier), the leader's first
             # ``red_full`` wait needs the first partial (parity 0).
@@ -2562,20 +2618,46 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 cute.arch.fence_view_async_tmem_load()
                             else:
                                 # ---- finalize: transposed staging + bulk reduce-add per token ----
+                                # 1-CTA: stage [32 tok][128 h] BF16 (256-B rows), one reduce op per token
+                                # row. 2-CTA: the peer ships its 128-h half into the leader's staging
+                                # (``st.async``, tx on the leader's ``fin_full[buf]``); the leader stages
+                                # its own half, issues 512-B rows (one op per token per 256 h, as the
+                                # dense kernel does) and frees the buffer to the peer via ``fin_empty``.
+                                tr_words = self.fin_row_words
+                                tr_row_bytes = 4 * tr_words
                                 h0 = m_tile_out * 128
-                                even_i32 = cutlass.Int32((lane % 2) == 0)
-                                odd_i32 = cutlass.Int32(1) - even_i32
-                                is_issuer = epi_tidx < epi_n
-                                # Shared address of this lane pair's word in staging row 0.
-                                sTr_base = sTr.iterator.toint() + cutlass.Int32(4 * (epi_tidx // 2))
                                 for sub in cutlass.range_constexpr(num_sub):
                                     buf = sub % 2
-                                    # Staging buffer ``buf`` is free once the reduce issued two
-                                    # subtiles ago has finished reading it (one group may stay
-                                    # in flight).
-                                    if is_issuer:
-                                        cute.arch.cp_async_bulk_wait_group(1, read=True)
-                                    self.epilog_sync_barrier.arrive_and_wait()
+                                    fin_full_ptr = storage.fin_full_mbar.data_ptr() + buf
+                                    fin_empty_ptr = storage.fin_empty_mbar.data_ptr() + buf
+                                    if cutlass.const_expr(buf == 0):
+                                        fin_remote_full = fin_remote_full0
+                                        fin_remote_empty = fin_remote_empty0
+                                    else:
+                                        fin_remote_full = fin_remote_full1
+                                        fin_remote_empty = fin_remote_empty1
+                                    if cutlass.const_expr(self.two_cta):
+                                        if is_leader_cta:
+                                            # Buffer ``buf`` is free once the reduce issued two subtiles
+                                            # ago has finished reading it (one group may stay in flight).
+                                            if is_issuer:
+                                                cute.arch.cp_async_bulk_wait_group(1, read=True)
+                                            self.epilog_sync_barrier.arrive_and_wait()
+                                            if epi_tidx == 0:
+                                                # Tell the peer (not at the very first use of the buffer).
+                                                if cutlass.const_expr(sub >= 2):
+                                                    mbarrier_arrive_cluster(fin_remote_empty)
+                                                else:
+                                                    if fin_first == 0:
+                                                        mbarrier_arrive_cluster(fin_remote_empty)
+                                                cute.arch.mbarrier_arrive_and_expect_tx(fin_full_ptr, 8192)
+                                        else:
+                                            cute.arch.mbarrier_wait(fin_empty_ptr, fin_empty_ph[buf])
+                                            fin_empty_ph[buf] = cutlass.Int32(1) - fin_empty_ph[buf]
+                                    else:
+                                        if is_issuer:
+                                            cute.arch.cp_async_bulk_wait_group(1, read=True)
+                                        self.epilog_sync_barrier.arrive_and_wait()
                                     if cutlass.const_expr(self.perf_probe < 2):
                                         cute.copy(
                                             tiled_copy_t2r, tTR_tAcc[(None, None, None, sub)], tTR_rAcc
@@ -2584,19 +2666,40 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                         for c in cutlass.range_constexpr(epi_n):
                                             vals[c] = acc_vec[c] * alpha_val
                                     if cutlass.const_expr(self.perf_probe in (0, 4)):
-                                        for c in cutlass.range_constexpr(epi_n):
-                                            v = vals[c] * sScale[(sub * epi_n + c, meta_stage)]
-                                            vp = cute.arch.shuffle_sync_bfly(v, 1)
-                                            # Lane pairs (h, h+1) share one BF16x2 word of token row
-                                            # ``c``; even lanes write even columns, odd lanes odd
-                                            # (predicated, so the 32 chains stay branch-free).
-                                            tr_addr = sTr_base + cutlass.Int32(4 * (buf * 32 * 64 + c * 64))
-                                            if cutlass.const_expr(c % 2 == 0):
-                                                st_shared_b32_pred(tr_addr, pack_bf16x2_f32(v, vp), even_i32)
+                                        for c in cutlass.range_constexpr(0, epi_n, 2):
+                                            # Lane pairs (h, h+1): the even lane assembles token row ``c``
+                                            # (h, h+1), the odd lane row ``c + 1``; one shuffle per pair.
+                                            v0 = vals[c] * sScale[(sub * epi_n + c, meta_stage)]
+                                            v1 = vals[c + 1] * sScale[(sub * epi_n + c + 1, meta_stage)]
+                                            send = selp_f32(v1, v0, even_i32)
+                                            got = cute.arch.shuffle_sync_bfly(send, 1)
+                                            lo = selp_f32(v0, got, even_i32)
+                                            hi = selp_f32(got, v1, even_i32)
+                                            pk = pack_bf16x2_f32(lo, hi)
+                                            row = c + par
+                                            if cutlass.const_expr(self.two_cta):
+                                                if is_leader_cta:
+                                                    sTr[(buf, row, pair_words)] = pk
+                                                else:
+                                                    st_async_b32_cluster(
+                                                        fin_remote_tr
+                                                        + cutlass.Int32(buf * 32 * tr_row_bytes)
+                                                        + row * tr_row_bytes,
+                                                        pk,
+                                                        fin_remote_full,
+                                                    )
                                             else:
-                                                st_shared_b32_pred(tr_addr, pack_bf16x2_f32(vp, v), odd_i32)
-                                        cute.arch.fence_proxy("async.shared", space="cta")
-                                        self.epilog_sync_barrier.arrive_and_wait()
+                                                sTr[(buf, row, pair_words)] = pk
+                                        if cutlass.const_expr(self.two_cta):
+                                            if is_leader_cta:
+                                                # The peer's half has landed (tx complete).
+                                                cute.arch.mbarrier_wait(fin_full_ptr, fin_full_ph[buf])
+                                                fin_full_ph[buf] = cutlass.Int32(1) - fin_full_ph[buf]
+                                                cute.arch.fence_proxy("async.shared", space="cta")
+                                                self.epilog_sync_barrier.arrive_and_wait()
+                                        else:
+                                            cute.arch.fence_proxy("async.shared", space="cta")
+                                            self.epilog_sync_barrier.arrive_and_wait()
                                         if is_issuer:
                                             prow = row_base + sub * epi_n + epi_tidx
                                             # perf_probe 4: stage, but issue no reduce.
@@ -2604,9 +2707,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                 tok = sTok[(sub * epi_n + epi_tidx, meta_stage)]
                                                 dst = cute.domain_offset((tok, h0, 0), out)
                                                 blk_reduce_bf16(
-                                                    dst, sTr[(buf, epi_tidx, None)], cutlass.Int32(256)
+                                                    dst, sTr[(buf, epi_tidx, None)], cutlass.Int32(tr_row_bytes)
                                                 )
                                             cute.arch.cp_async_bulk_commit_group()
+                                fin_first = cutlass.Int32(0)
                                 cute.arch.fence_view_async_tmem_load()
                         else:
                             vals = cute.make_rmem_tensor((n_tile,), cutlass.Float32)
