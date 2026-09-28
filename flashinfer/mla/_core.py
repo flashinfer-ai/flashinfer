@@ -4709,7 +4709,7 @@ def prepare_nvfp4_batch_decode_with_kv_cache_mla(
     )
 
 
-@flashinfer_experimental_api(feature="NVFP4 sparse MLA decode (SM100)")
+@flashinfer_experimental_api(feature="NVFP4 sparse MLA decode (SM100/SM103)")
 def nvfp4_sparse_mla_decode(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -4720,7 +4720,7 @@ def nvfp4_sparse_mla_decode(
     num_ctas_per_token: Optional[int] = None,
     backend: str = "cuda",
 ) -> torch.Tensor:
-    r"""Sparse MLA decode over an NVFP4 (``nvfp4_ds_mla``) KV cache on SM100.
+    r"""Sparse MLA decode over an NVFP4 (``nvfp4_ds_mla``) KV cache on SM100 and SM103.
 
     Each query token attends to the KV rows its sparse indexer selected (DeepSeek-V3.2 and GLM-5 DSA)::
 
@@ -4762,8 +4762,8 @@ def nvfp4_sparse_mla_decode(
 
     Notes
     -----
-    Requires compute capability 10.0. The first call on a device compiles the kernel and queries its cluster
-    occupancy; later calls can be captured in CUDA graphs. Layout, limits and measurements:
+    Requires compute capability 10.0 (B200, GB200) or 10.3 (B300, GB300). The first call on a device compiles
+    the kernel and queries its cluster occupancy; later calls can be captured in CUDA graphs. Layout, limits and measurements:
     ``flashinfer/experimental/nvfp4_sparse_mla_decode/README.md``.
     """
     if backend != "cuda":

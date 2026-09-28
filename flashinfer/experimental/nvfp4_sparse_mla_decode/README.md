@@ -58,13 +58,14 @@ A NoPE value is `e2m1 * scale`, with no per-tensor factor.
 
 ## Limits
 
-- Compute capability 10.0 only: the module is built for `sm_100a`. SM103 is not built or tested yet.
+- Compute capability 10.0 (B200, GB200) or 10.3 (B300, GB300): the module is built for `sm_100a` or `sm_103a` to
+  match the device.
 - 16 query heads per rank, a 576-dim latent with 512-dim values, e4m3 queries, bf16 output. No LSE output, no attention
   sinks.
 - `topk` is a multiple of 32 that gives each CTA of a cluster 3 to 32 stages of 32 keys. Tested widths: 512, 1024, 2048.
 - `kv_cache` rows are contiguous; `indices` values are not range-checked (`-1` is the only special value).
-- Tuned for up to 46 query tokens per launch on GB200, what one wave of 3-CTA clusters holds. Larger batches run in
-  several waves and fall behind FP8 TRTLLM-gen.
+- Tuned for up to 45-46 query tokens per launch, what one wave of 3-CTA clusters holds on B300 and GB200. Larger
+  batches run in several waves and fall behind FP8 TRTLLM-gen.
 
 ## Design
 
@@ -83,7 +84,7 @@ owns each 8-dim output block, and merge after one cluster barrier: no second ker
 
 The cluster size is chosen per launch: the largest of 8, 6, 5, 4 and 3 whose clusters for every query token fit on the
 device at once, from `cudaOccupancyMaxActiveClusters`. On GB200 (152 SMs) that is 8 CTAs up to 15 tokens, 6 up to 23,
-5 up to 28, 4 up to 36 and 3 up to 46.
+5 up to 28, 4 up to 36 and 3 up to 46; on B300 (148 SMs) 8 up to 15, 6 up to 22, 5 up to 26, 4 up to 33 and 3 up to 45.
 
 Nsight Compute on the 3-CTA plan at 35 tokens: L1/shared 69 %, tensor pipe 24 %, DRAM 16 %. Shared-memory traffic
 bounds the kernel, 63 % of it the f16 key tile. A tcgen05 version that keeps keys in tensor memory is the natural
@@ -91,8 +92,19 @@ successor.
 
 ## Measurements
 
-GB200, CUDA 13.0, the same kernel body built outside FlashInfer. Microseconds per launch, top-k 2048, 16 heads,
-request-shaped indices, CUDA-graph replay:
+Microseconds per launch, top-k 2048, 16 heads, request-shaped indices, CUDA-graph replay.
+
+B300, CUDA 13.0, this module (`benchmarks/bench_nvfp4_sparse_mla_decode.py`):
+
+| tokens per launch | 5 | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 |
+|---|---|---|---|---|---|---|---|---|---|
+| FP8 TRTLLM-gen sparse MLA | 10.6 | 11.9 | 13.0 | 16.7 | 16.9 | 16.8 | 18.9 | 19.5 | 22.0 |
+| this kernel | 12.2 | 12.4 | 12.4 | 15.0 | 17.1 | 19.5 | 25.5 | 25.5 | 25.5 |
+
+From 34 tokens B300 fits no more than 33 4-CTA clusters in a wave, so the plan drops to 3-CTA clusters, where each CTA
+walks more key stages.
+
+GB200, CUDA 13.0, the same kernel body built outside FlashInfer:
 
 | tokens per launch | 15 | 20 | 25 | 35 |
 |---|---|---|---|---|
@@ -106,16 +118,16 @@ slower than this one): 15.6 against 17.0 us at 20 tokens, 17.8 against 17.3 at 2
 
 ## Validation status
 
-- The kernel body is the one validated on GB200 inside vLLM, end to end, and in an exact-reference harness at 0.26 %
-  relative error, including padded indices. For `sm_100a` this module's kernel compiles to the same SASS as that build
-  with its debug timestamps removed: 2,160 instructions with identical encodings, 128 registers, no spills.
-- This FlashInfer packaging (launcher, binding, JIT spec, API) builds and loads through FlashInfer's JIT with CUDA 13.0,
-  and the CPU-side tests pass. The GPU tests have not run yet: run
-  `pytest tests/experimental/test_nvfp4_sparse_mla_decode.py` on a B200 or GB200 before relying on it.
+- B300 (SM103, CUDA 13.0, driver 580): all 93 tests in `tests/experimental/test_nvfp4_sparse_mla_decode.py` pass,
+  including every cluster size, padded indices and CUDA-graph replay. The largest relative error against the exact
+  FP32 reference is 0.29 % over 5 to 64 tokens and three padding patterns.
+- SM100: the kernel body is the one validated on GB200 inside vLLM, end to end, and in an exact-reference harness at
+  0.26 % relative error, including padded indices. For `sm_100a` this module's kernel compiles to the same SASS as that
+  build with its debug timestamps removed: 2,160 instructions with identical encodings, 128 registers, no spills. The
+  packaged tests have not run on a compute capability 10.0 device yet.
 
 ## Graduation plan
 
 1. Run the tests and the benchmark on B200/GB200 in CI.
-2. Build and test for SM103 (B300/GB300).
-3. vLLM: let the FlashInfer sparse-MLA backend accept `nvfp4_ds_mla` and call this API.
-4. Replace the `mma.sync` pipeline with tcgen05 once it is faster at the same shapes.
+2. vLLM: let the FlashInfer sparse-MLA backend accept `nvfp4_ds_mla` and call this API.
+3. Replace the `mma.sync` pipeline with tcgen05 once it is faster at the same shapes.
