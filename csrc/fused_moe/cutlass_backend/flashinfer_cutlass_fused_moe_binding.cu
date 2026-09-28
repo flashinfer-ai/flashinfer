@@ -922,7 +922,7 @@ class FusedMoeRunner : public tvm::ffi::ModuleObj {
             tensorrt_llm::cutlass_extensions::MainloopScheduleType::SINGLE_WARPGROUP_ROLLING;
     if (is_single_warpgroup) {
       if (!mUseWfp4Afp8Humming || profile.sm_version != 90 || tile_m != 128 || tile_k != 128 ||
-          (tile_n != 8 && tile_n != 16 && tile_n != 32 && tile_n != 40) ||
+          (tile_n != 8 && tile_n != 16 && tile_n != 32 && tile_n != 40 && tile_n != 64) ||
           profile.cluster_shape !=
               tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_1x1x1 ||
           gemm_n % 128 != 0) {

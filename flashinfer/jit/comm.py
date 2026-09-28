@@ -14,14 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-from .core import JitSpec, gen_jit_spec, current_compilation_context
+from .core import (
+    JitSpec,
+    current_compilation_context,
+    gen_jit_spec,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+)
 from .utils import write_if_different
 from . import env as jit_env
 import os
 import pathlib
 import jinja2
 from itertools import product
-from typing import Dict, Tuple, List, Any
+from typing import Any, Dict, List, Literal, Tuple
 
 
 def gen_comm_alltoall_module() -> JitSpec:
@@ -248,6 +254,7 @@ def gen_pcie_ipc_comm_debug_module(
         [
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
         ],
+        extra_ldflags=["-lcuda"],
         extra_cuda_cflags=[
             f"-DFLASHINFER_PCIE_IPC_DEBUG_CROSS_STALL_NS={stall_ns}",
             f"-DFLASHINFER_PCIE_IPC_DEBUG_STALL_ISLAND={stall_island}",
@@ -268,10 +275,16 @@ def gen_pcie_ipc_comm_module() -> JitSpec:
         [
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
         ],
+        extra_ldflags=["-lcuda"],
     )
 
 
 def gen_ulysses_a2a_module() -> JitSpec:
+    from .cake_ulysses import generated_ulysses_spec
+
+    generated = generated_ulysses_spec()
+    if generated is not None:
+        return generated
     return gen_jit_spec(
         "ulysses_a2a",
         [
@@ -280,17 +293,46 @@ def gen_ulysses_a2a_module() -> JitSpec:
     )
 
 
-def gen_moe_alltoall_module() -> JitSpec:
+MoeAlltoAllTarget = Literal["legacy", "sm100a", "sm103a"]
+
+_MOE_ALLTOALL_GENERATED_SOURCE = {
+    "sm100a": "mnnvl_moe_alltoall_sm100.cu",
+    "sm103a": "mnnvl_moe_alltoall_sm103.cu",
+}
+_MOE_ALLTOALL_NVCC_FLAGS = {
+    "sm100a": sm100a_nvcc_flags,
+    "sm103a": sm103a_nvcc_flags,
+}
+
+
+def gen_moe_alltoall_module(target: MoeAlltoAllTarget = "legacy") -> JitSpec:
+    communication_kernels = (
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal"
+        / "tensorrt_llm"
+        / "kernels"
+        / "communicationKernels"
+    )
+    if target == "legacy":
+        module_name = "mnnvl_moe_alltoall"
+        kernel_sources = [communication_kernels / "moeAlltoAllKernels.cu"]
+        arch_flags = []
+    elif target in _MOE_ALLTOALL_GENERATED_SOURCE:
+        module_name = f"mnnvl_moe_alltoall_{target}"
+        kernel_sources = [
+            communication_kernels / "moeAlltoAllFusedKernels.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "generated"
+            / _MOE_ALLTOALL_GENERATED_SOURCE[target],
+        ]
+        arch_flags = _MOE_ALLTOALL_NVCC_FLAGS[target]
+    else:
+        raise ValueError(f"unsupported MNNVL MoE all-to-all target: {target}")
     return gen_jit_spec(
-        "mnnvl_moe_alltoall",
+        module_name,
         [
             jit_env.FLASHINFER_CSRC_DIR / "trtllm_moe_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "kernels"
-            / "communicationKernels"
-            / "moeAlltoAllKernels.cu",
+            *kernel_sources,
             jit_env.FLASHINFER_CSRC_DIR
             / "nv_internal"
             / "cpp"
@@ -317,38 +359,147 @@ def gen_moe_alltoall_module() -> JitSpec:
             str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
         ],
         extra_cuda_cflags=[
+            *arch_flags,
             "-DENABLE_BF16",
         ],
     )
 
 
-def gen_dcp_alltoall_module() -> JitSpec:
+def _dcp_alltoall_helix_sources() -> list:
+    return [
+        jit_env.FLASHINFER_CSRC_DIR / "trtllm_dcp_alltoall.cu",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal"
+        / "tensorrt_llm"
+        / "kernels"
+        / "helixAllToAll.cu",
+        jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "cpp" / "common" / "envUtils.cpp",
+        jit_env.FLASHINFER_CSRC_DIR
+        / "nv_internal"
+        / "cpp"
+        / "common"
+        / "tllmException.cpp",
+    ]
+
+
+def _dcp_alltoall_include_paths() -> list:
+    return [
+        str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal"),
+        str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
+    ]
+
+
+def gen_dcp_alltoall_helix_module() -> JitSpec:
+    """Portable helix DCP all-to-all module (every supported target)."""
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
         supported_major_versions=[9, 10, 11, 12]
     )
     return gen_jit_spec(
         "dcp_alltoall",
-        [
-            jit_env.FLASHINFER_CSRC_DIR / "trtllm_dcp_alltoall.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "tensorrt_llm"
-            / "kernels"
-            / "helixAllToAll.cu",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "cpp"
-            / "common"
-            / "envUtils.cpp",
-            jit_env.FLASHINFER_CSRC_DIR
-            / "nv_internal"
-            / "cpp"
-            / "common"
-            / "tllmException.cpp",
-        ],
-        extra_include_paths=[
-            str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal"),
-            str(jit_env.FLASHINFER_CSRC_DIR / "nv_internal" / "include"),
-        ],
+        _dcp_alltoall_helix_sources(),
+        extra_include_paths=_dcp_alltoall_include_paths(),
         extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_dcp_alltoall_module() -> JitSpec:
+    from .cake_dcp_alltoall import generated_dcp_alltoall_spec
+
+    generated = generated_dcp_alltoall_spec(
+        _dcp_alltoall_helix_sources(), _dcp_alltoall_include_paths()
+    )
+    if generated is not None:
+        return generated
+    return gen_dcp_alltoall_helix_module()
+
+
+def gen_dcp_lse_reduce_module() -> JitSpec:
+    """Build the NCCL-symmetric-memory DCP A2A + LSE-reduce op."""
+    from torch.utils.cpp_extension import include_paths, library_paths
+
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[9, 10, 11, 12]
+    )
+    # This kernel uses cooperative groups and NCCL's device API, neither of
+    # which requires Hopper's architecture-specific ``90a`` ISA. Compile a
+    # generic SM90 image so it also loads on H100 installations that expose
+    # compute capability 9.0 without the ``a`` feature set.
+    nvcc_flags = [
+        flag.replace("compute_90a,code=sm_90a", "compute_90,code=sm_90")
+        for flag in nvcc_flags
+    ]
+    try:
+        cuda_include_paths = include_paths(device_type="cuda")
+        cuda_library_paths = library_paths(device_type="cuda")
+    except TypeError:
+        # PyTorch < 2.6 uses the legacy ``cuda`` boolean argument.
+        cuda_include_paths = include_paths(cuda=True)
+        cuda_library_paths = library_paths(cuda=True)
+    extra_includes: list[str | pathlib.Path] = [
+        pathlib.Path(path) for path in cuda_include_paths
+    ]
+    extra_ldflags = [f"-L{path}" for path in cuda_library_paths]
+    nccl_ldflag = "-lnccl"
+
+    nccl_home_path: pathlib.Path | None = None
+    nccl_home = os.environ.get("NCCL_HOME")
+    if nccl_home:
+        nccl_home_path = pathlib.Path(nccl_home)
+    else:
+        # PyTorch CUDA wheels install NCCL as a Python package, but
+        # cpp_extension does not add that package's headers or libraries to
+        # extension builds. Discover the wheel location directly so CI and
+        # ordinary pip environments do not need to export NCCL_HOME.
+        try:
+            import nvidia.nccl  # type: ignore[import-not-found]
+
+            nccl_home_path = pathlib.Path(nvidia.nccl.__path__[0])
+        except (ImportError, AttributeError, IndexError):
+            # A system NCCL installation may already be on the compiler and
+            # linker search paths; retain the -lnccl fallback below.
+            pass
+
+    if nccl_home_path is not None:
+        nccl_lib_candidates = [
+            nccl_home_path / "lib",
+            nccl_home_path / "lib64",
+            nccl_home_path,
+        ]
+        nccl_lib_dir = next(
+            (
+                path
+                for path in nccl_lib_candidates
+                if (path / "libnccl.so").exists() or any(path.glob("libnccl.so.*"))
+            ),
+            nccl_home_path / "lib",
+        )
+        extra_includes.extend(
+            [
+                nccl_home_path / "include",
+                nccl_home_path / "include" / "nccl_device",
+            ]
+        )
+        extra_ldflags.insert(0, f"-L{nccl_lib_dir}")
+        # PyTorch's pip NCCL wheels include only the versioned shared object,
+        # whereas system installations also provide libnccl.so for -lnccl.
+        if not (nccl_lib_dir / "libnccl.so").exists():
+            versioned_libraries = sorted(nccl_lib_dir.glob("libnccl.so.*"))
+            if versioned_libraries:
+                nccl_ldflag = str(versioned_libraries[-1])
+
+    extra_ldflags += [
+        "-ltorch",
+        "-ltorch_cpu",
+        "-ltorch_cuda",
+        "-lc10",
+        "-lc10_cuda",
+        nccl_ldflag,
+    ]
+
+    return gen_jit_spec(
+        "dcp_lse_reduce",
+        [jit_env.FLASHINFER_CSRC_DIR / "dcp_lse_reduce.cu"],
+        extra_include_paths=extra_includes,
+        extra_cuda_cflags=["-std=c++20", "-DUSE_NCCL"] + nvcc_flags,
+        extra_ldflags=extra_ldflags,
     )

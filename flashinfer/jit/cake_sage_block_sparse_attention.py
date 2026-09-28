@@ -13,7 +13,16 @@
 # limitations under the License.
 
 
-"""JIT loader for generated SM120 Sage block-sparse attention kernels."""
+"""JIT loader for generated Cake Sage block-sparse attention kernels.
+
+Two source-only manifests live under ``csrc/cake_sage_block_sparse_attention``:
+
+* ``cake_sage_block_sparse_attention_manifest.json`` -- the SM120 (RTX PRO 6000 / RTX 5090)
+  ``mma.sync`` kernels, one module per specialization receipt.
+* ``cake_sage_block_sparse_attention_sm100_manifest.json`` -- the SM100/SM103 (B200 / B300)
+  variable-shape ``tcgen05`` attention kernel plus the two fused Sage-FP8 quantization
+  kernels, one module per (architecture, stage).
+"""
 
 from __future__ import annotations
 
@@ -24,10 +33,20 @@ from pathlib import Path
 from typing import Any
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, logger, sm120a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm120a_nvcc_flags,
+)
 
 _GENERATED_ROOT = "csrc/cake_sage_block_sparse_attention"
 _MANIFEST_NAME = "cake_sage_block_sparse_attention_manifest.json"
+_SM100_MANIFEST_NAME = "cake_sage_block_sparse_attention_sm100_manifest.json"
+_SM100_ARCH_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
+_SM100_STAGES = ("attention", "quantize_qk_vamax", "quantize_v")
 _SPECIALIZATION_NAMES = (
     "HAS_BLOCK_NUMS",
     "BLOCK_SIZES_MODE",
@@ -97,7 +116,9 @@ def _record(key: tuple[int, ...]) -> dict[str, Any]:
     return matches[0]
 
 
-def _source_path(relative_path: str) -> Path:
+def _source_path(relative_path: str, manifest: dict[str, Any] | None = None) -> Path:
+    if manifest is None:
+        manifest = _manifest()
     relative = Path(relative_path)
     prefix = Path(_GENERATED_ROOT)
     try:
@@ -107,7 +128,7 @@ def _source_path(relative_path: str) -> Path:
             f"generated source escaped {_GENERATED_ROOT}: {relative_path}"
         ) from exc
     path = _get_csrc_dir() / suffix
-    inventory = {item["path"]: item for item in _manifest()["files"]}
+    inventory = {item["path"]: item for item in manifest["files"]}
     receipt = inventory.get(relative.as_posix())
     if not isinstance(receipt, dict) or not path.is_file():
         raise FileNotFoundError(
@@ -180,8 +201,96 @@ def build_all_cake_sage_block_sparse_attention_modules() -> dict[str, str]:
     return result
 
 
+@functools.cache
+def _manifest_sm100() -> dict[str, Any]:
+    path = _get_csrc_dir() / _SM100_MANIFEST_NAME
+    value = json.loads(path.read_text(encoding="utf-8"))
+    if (
+        value.get("schema") != "cake.library_export.v4"
+        or value.get("producer") != "cake"
+        or value.get("library") != "flashinfer"
+        or value.get("name") != "cake_sage_block_sparse_attention_sm100"
+    ):
+        raise RuntimeError("invalid Cake SM100 Sage block-sparse attention manifest")
+    modules = value.get("modules")
+    if not isinstance(modules, list) or not modules:
+        raise RuntimeError(
+            "empty Cake SM100 Sage block-sparse attention module inventory"
+        )
+    return value
+
+
+def _record_sm100(arch: str, stage: str) -> dict[str, Any]:
+    if arch not in _SM100_ARCH_FLAGS:
+        raise RuntimeError(
+            f"Cake SM100 Sage block-sparse attention supports {sorted(_SM100_ARCH_FLAGS)}, got {arch!r}"
+        )
+    if stage not in _SM100_STAGES:
+        raise RuntimeError(
+            f"unknown Cake SM100 Sage stage {stage!r}; expected one of {_SM100_STAGES}"
+        )
+    matches = [
+        item
+        for item in _manifest_sm100()["modules"]
+        if item.get("arch") == arch
+        and dict(item.get("route", {})).get("stage") == stage
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            f"expected one generated SM100 Sage module for ({arch}, {stage}), got {len(matches)}"
+        )
+    return matches[0]
+
+
+@functools.cache
+def gen_cake_sage_sm100_module(arch: str, stage: str) -> JitSpec:
+    record = _record_sm100(arch, stage)
+    manifest = _manifest_sm100()
+    units = record["translation_units"]
+    spec = gen_jit_spec(
+        name=f"{record['name']}_{arch}",
+        sources=[
+            _source_path(units["device"], manifest),
+            _source_path(units["binding"], manifest),
+        ],
+        extra_cuda_cflags=[*_SM100_ARCH_FLAGS[arch], *record["compile_flags"]],
+        extra_ldflags=["-lcuda"],
+        extra_include_paths=[_get_csrc_dir().parent, _get_include_dir()],
+    )
+    logger.info(
+        "Generated Cake SM100 Sage block-sparse attention JIT spec: %s", spec.name
+    )
+    return spec
+
+
+@functools.cache
+def load_cake_sage_sm100_module(arch: str, stage: str):
+    """Build and load the (``arch``, ``stage``) module; return ``(module, manifest record)``."""
+    spec = gen_cake_sage_sm100_module(arch, stage)
+    module = spec.build_and_load()
+    return module, _record_sm100(arch, stage)
+
+
+def build_all_cake_sage_sm100_modules(arch: str | None = None) -> dict[str, str]:
+    result = {}
+    for record in _manifest_sm100()["modules"]:
+        if arch is not None and record["arch"] != arch:
+            continue
+        spec = gen_cake_sage_sm100_module(record["arch"], record["route"]["stage"])
+        module = spec.build_and_load()
+        if not hasattr(module, str(record["ffi_entry"])):
+            raise RuntimeError(f"built module {record['name']} lacks its FFI entry")
+        result[f"{record['name']}_{record['arch']}"] = str(
+            spec.get_library_path().resolve(strict=True)
+        )
+    return result
+
+
 __all__ = [
     "build_all_cake_sage_block_sparse_attention_modules",
+    "build_all_cake_sage_sm100_modules",
     "gen_cake_sage_block_sparse_attention_module",
+    "gen_cake_sage_sm100_module",
     "load_cake_sage_block_sparse_attention_module",
+    "load_cake_sage_sm100_module",
 ]

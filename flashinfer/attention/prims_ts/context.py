@@ -31,7 +31,7 @@ position is ``q + (S_kv - S_q)`` and ``window_left`` is measured from that
 position.
 
 PrimTS context entry points are intentionally excluded from ``fi_trace`` for
-now; unlike the decode APIs, their ``@flashinfer_api`` decorators do not
+now; unlike the decode APIs, their ``@flashinfer_experimental_api`` decorators do not
 register trace templates.
 """
 
@@ -46,9 +46,7 @@ from typing import TYPE_CHECKING, Callable, Literal, Optional
 
 import torch
 
-from flashinfer.api_logging import flashinfer_api
-
-from ._tensor_aliasing import _validate_out_does_not_overlap_inputs
+from flashinfer.api_logging import flashinfer_experimental_api
 
 
 if TYPE_CHECKING:
@@ -103,7 +101,8 @@ class _ContextGeometry:
     num_qo_heads: int
     num_kv_heads: int
     head_dim: int
-    q_dtype: torch.dtype
+    qk_dtype: torch.dtype
+    pv_dtype: torch.dtype
     output_dtype: torch.dtype
     mask_type: str
     window_left: int
@@ -114,6 +113,7 @@ class _ContextGeometry:
     packed_dense_k_mask: bool
     q_shape: tuple[int, ...]
     kv_shape: tuple[int, ...]
+    head_dim_vo: int | None = None
 
 
 @dataclass(frozen=True)
@@ -129,8 +129,8 @@ class _ContextPlanGeometry:
     num_qo_heads: int
     num_kv_heads: int
     head_dim: int
-    q_dtype: torch.dtype
-    kv_dtype: torch.dtype
+    qk_dtype: torch.dtype
+    pv_dtype: torch.dtype
     output_dtype: torch.dtype
     mask_type: str
     window_left: int
@@ -139,6 +139,7 @@ class _ContextPlanGeometry:
     has_q_offset: bool
     causal_single_kv_tile: bool
     packed_dense_k_mask: bool
+    head_dim_vo: int | None = None
 
 
 @dataclass(frozen=True)
@@ -168,8 +169,8 @@ class _PagedContextPlanGeometry:
     num_qo_heads: int
     num_kv_heads: int
     head_dim: int
-    q_dtype: torch.dtype
-    kv_dtype: torch.dtype
+    qk_dtype: torch.dtype
+    pv_dtype: torch.dtype
     output_dtype: torch.dtype
     mask_type: str
     window_left: int
@@ -217,7 +218,8 @@ class _ContextCompileSpec:
     num_qo_heads: int
     num_kv_heads: int
     head_dim: int
-    q_dtype_key: str
+    qk_dtype_key: str
+    pv_dtype_key: str
     output_dtype_key: str
     mask_type: str
     window_left: int
@@ -228,6 +230,7 @@ class _ContextCompileSpec:
     causal_single_kv_tile: bool
     packed_dense_k_mask: bool
     scheduler: _ContextScheduler
+    head_dim_vo: int | None = None
 
 
 @dataclass(frozen=True)
@@ -241,7 +244,8 @@ class _PagedContextCompileSpec:
     num_qo_heads: int
     num_kv_heads: int
     head_dim: int
-    q_dtype_key: str
+    qk_dtype_key: str
+    pv_dtype_key: str
     output_dtype_key: str
     mask_type: str
     window_left: int
@@ -255,9 +259,11 @@ class _PagedContextCompileSpec:
 
 def _make_context_kernel(
     *,
-    input_dtype,
+    input_qk_dtype,
+    input_pv_dtype,
     output_dtype,
     head_dim: int,
+    head_dim_vo: int | None = None,
     mask_type: str,
     window_left: int,
     head_paired: bool,
@@ -293,9 +299,11 @@ def _make_context_kernel(
     return FmhaTs(
         qk_acc_dtype=cutlass.Float32,
         pv_acc_dtype=cutlass.Float32,
-        in_dtype=input_dtype,
+        in_qk_dtype=input_qk_dtype,
+        in_pv_dtype=input_pv_dtype,
         out_dtype=output_dtype,
         d=head_dim,
+        d_v=head_dim_vo,
         is_persistent=is_persistent,
         is_causal=mask_type == "causal",
         has_variable_window=mask_type == "variable_window",
@@ -364,10 +372,22 @@ def _dtype_key(dtype: torch.dtype) -> str:
 
 
 def _validate_qkv_dtype(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
+    """Validate run-time Q/K/V tensor dtypes.
+
+    Q and K must match; V may differ only for the QK-BF16/PV-FP8 path.
+    """
     _dtype_key(q.dtype)
-    if k.dtype != q.dtype or v.dtype != q.dtype:
+    if q.dtype != k.dtype:
         raise NotImplementedError(
-            "attention-ts context requires Q, K, and V to use the same dtype; "
+            "attention-ts context requires Q and K to use the same dtype; "
+            f"got Q {q.dtype} and K {k.dtype}"
+        )
+    # V may keep its own dtype only for the supported QK-BF16/PV-FP8 path.
+    qk_bf16_pv_fp8 = q.dtype == torch.bfloat16 and v.dtype == torch.float8_e4m3fn
+    if v.dtype != q.dtype and not qk_bf16_pv_fp8:
+        raise NotImplementedError(
+            "attention-ts context requires Q, K, and V to use the same dtype "
+            "except for QK-BF16/PV-FP8; "
             f"got Q {q.dtype}, K {k.dtype}, and V {v.dtype}"
         )
 
@@ -380,45 +400,65 @@ def _validate_output_dtype(output_dtype: torch.dtype) -> None:
 
 def _validate_context_dtype_pair(
     q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
     output_dtype: torch.dtype,
 ) -> None:
     """Validate the explicit dtypes of a contiguous-context specialization."""
 
     for dtype, name in (
         (q_dtype, "q_dtype"),
-        (kv_dtype, "kv_dtype"),
+        (k_dtype, "k_dtype"),
+        (v_dtype, "v_dtype"),
         (output_dtype, "out_dtype"),
     ):
         if not isinstance(dtype, torch.dtype):
             raise TypeError(f"{name} must be a torch.dtype")
         _dtype_key(dtype)
-    if kv_dtype != q_dtype:
+    if k_dtype != q_dtype:
         raise NotImplementedError(
-            "attention-ts context requires Q and K/V to use the same dtype; "
-            f"got q_dtype={q_dtype} and kv_dtype={kv_dtype}"
+            "attention-ts context requires Q and K to use the same dtype; "
+            f"got q_dtype={q_dtype} and k_dtype={k_dtype}"
+        )
+    if v_dtype != q_dtype and not (
+        q_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
+    ):
+        raise NotImplementedError(
+            "attention-ts context requires Q, K, and V to use the same dtype "
+            "except for QK-BF16/PV-FP8; "
+            f"got q_dtype={q_dtype} and v_dtype={v_dtype}"
         )
 
 
 def _validate_paged_dtype_pair(
     q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
+    k_dtype: torch.dtype,
+    v_dtype: torch.dtype,
     output_dtype: torch.dtype,
 ) -> None:
     """Validate the explicit dtypes of a paged-context specialization."""
 
     for dtype, name in (
         (q_dtype, "q_dtype"),
-        (kv_dtype, "kv_dtype"),
+        (k_dtype, "k_dtype"),
+        (v_dtype, "v_dtype"),
         (output_dtype, "out_dtype"),
     ):
         if not isinstance(dtype, torch.dtype):
             raise TypeError(f"{name} must be a torch.dtype")
         _dtype_key(dtype)
-    if kv_dtype != q_dtype:
+    if k_dtype != q_dtype:
         raise NotImplementedError(
-            "attention-ts paged context requires Q and K/V to use the same "
-            f"dtype; got q_dtype={q_dtype} and kv_dtype={kv_dtype}"
+            "attention-ts paged context requires Q and K to use the same "
+            f"dtype; got q_dtype={q_dtype} and k_dtype={k_dtype}"
+        )
+    if v_dtype != q_dtype and not (
+        q_dtype == torch.bfloat16 and v_dtype == torch.float8_e4m3fn
+    ):
+        raise NotImplementedError(
+            "attention-ts paged context requires Q, K, and V to use the same "
+            "dtype except for QK-BF16/PV-FP8; "
+            f"got q_dtype={q_dtype} and v_dtype={v_dtype}"
         )
 
 
@@ -449,7 +489,7 @@ def _validate_device(device: torch.device) -> int:
 
 @functools.cache
 def _dsl_supports_ldtm_stat() -> bool:
-    """True if nvidia-cutlass-dsl >= 4.8.0."""
+    """LDTM.STAT uses a native wrapper in DSL 4.8 or inline PTX in 4.7."""
     try:
         dsl_version = importlib.metadata.version("nvidia-cutlass-dsl")
     except importlib.metadata.PackageNotFoundError:
@@ -457,19 +497,28 @@ def _dsl_supports_ldtm_stat() -> bool:
     from packaging import version as pkg_version
 
     try:
-        # Use .release so 4.8.0.dev* counts as >= 4.8.0.
-        return pkg_version.Version(dsl_version).release >= (4, 8, 0)
+        # Use .release so 4.7.0.dev* includes the inline-PTX path.
+        return pkg_version.Version(dsl_version).release >= (4, 7, 0)
     except pkg_version.InvalidVersion:
         return False
 
 
 def _default_uses_ldtm_stat(device_index: int) -> bool:
-    """Enable LDTM.STAT on SM103/SM107 when nvidia-cutlass-dsl >= 4.8.0."""
+    """Enable LDTM.STAT on SM103/SM107 with native or compatibility lowering."""
     if not _dsl_supports_ldtm_stat():
         return False
     # tcgen05.ld.red.max (LDTM.STAT) is available on B300 (SM103) and Rubin
     # (SM107), not B200 (SM100).
-    return torch.cuda.get_device_capability(device_index) in ((10, 3), (10, 7))
+    capability = torch.cuda.get_device_capability(device_index)
+    if capability == (10, 3):
+        return True
+    if capability == (10, 7):
+        # DSL 4.7's Rubin escape hatch targets sm_100f, which cannot emit
+        # LDTM.STAT. Keep Rubin on the native wrapper/target support path.
+        from cutlass.experimental import primitives as prims
+
+        return hasattr(prims, "tcgen05_ld_red")
+    return False
 
 
 def _resolve_cuda_device(
@@ -833,6 +882,8 @@ def _validate_base_tensors(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    allow_mla: bool = False,
 ) -> None:
     for tensor, name in ((q, "q"), (k, "k"), (v, "v")):
         _validate_tensor(tensor, name)
@@ -843,7 +894,13 @@ def _validate_base_tensors(
             f"got {q.device}, {k.device}, and {v.device}"
         )
     _validate_qkv_dtype(q, k, v)
-    if tuple(v.shape) != tuple(k.shape):
+    mla_shape = (
+        allow_mla
+        and k.ndim >= 1
+        and tuple(v.shape) == (*k.shape[:-1], 128)
+        and k.shape[-1] == 192
+    )
+    if tuple(v.shape) != tuple(k.shape) and not mla_shape:
         raise ValueError(
             f"v must have the same shape as k; got {tuple(v.shape)} and {tuple(k.shape)}"
         )
@@ -860,16 +917,25 @@ def _validate_head_geometry(num_qo_heads: int, num_kv_heads: int) -> int:
     return num_qo_heads // num_kv_heads
 
 
-def _validate_head_dim(q_head_dim: int, kv_head_dim: int) -> int:
+def _validate_head_dim(
+    q_head_dim: int, kv_head_dim: int, v_head_dim: int | None = None
+) -> int:
     if q_head_dim != kv_head_dim:
         raise ValueError(
-            "Q and K/V head dimensions must match; "
-            f"got Q {q_head_dim} and K/V {kv_head_dim}"
+            "Q and K head dimensions must match; "
+            f"got Q {q_head_dim} and K {kv_head_dim}"
+        )
+    if (q_head_dim, v_head_dim) == (192, 128):
+        return q_head_dim
+    if v_head_dim is not None and v_head_dim != q_head_dim:
+        raise NotImplementedError(
+            "separate QK/V dimensions require contiguous QK/V=(192, 128); "
+            f"got ({q_head_dim}, {v_head_dim})"
         )
     if q_head_dim not in _SUPPORTED_HEAD_DIMS:
         raise NotImplementedError(
             "attention-ts context supports head_dim in "
-            f"{_SUPPORTED_HEAD_DIMS}; got {q_head_dim}"
+            f"{_SUPPORTED_HEAD_DIMS}, or contiguous QK/V=(192, 128); got {q_head_dim}"
         )
     return q_head_dim
 
@@ -1044,7 +1110,7 @@ def _resolve_geometry(
 ) -> _ContextGeometry:
     """Validate one-shot inputs and derive their static wrapper bounds."""
 
-    _validate_base_tensors(q, k, v)
+    _validate_base_tensors(q, k, v, allow_mla=True)
     _validate_output_dtype(output_dtype)
     _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
@@ -1110,7 +1176,7 @@ def _resolve_geometry(
         q_shape = tuple(q.shape)
         kv_shape = tuple(k.shape)
 
-    _validate_head_dim(q_head_dim, kv_head_dim)
+    _validate_head_dim(q_head_dim, kv_head_dim, int(v.shape[-1]))
     head_ratio = _validate_head_geometry(num_qo_heads, num_kv_heads)
     if mask_type == "causal":
         for batch_idx, (q_length, k_length) in enumerate(
@@ -1122,6 +1188,8 @@ def _resolve_geometry(
                     f"request; got batch {batch_idx}: Sq={q_length}, Sk={k_length}"
                 )
 
+    if q_head_dim == 192 and window_left > 0:
+        raise NotImplementedError("192/128 context does not support a left window")
     head_paired = window_left > 0
     if head_paired and (head_ratio <= 1 or head_ratio % 2 != 0):
         raise NotImplementedError(
@@ -1158,7 +1226,9 @@ def _resolve_geometry(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=q_head_dim,
-        q_dtype=q.dtype,
+        head_dim_vo=int(v.shape[-1]),
+        qk_dtype=q.dtype,
+        pv_dtype=v.dtype,
         output_dtype=output_dtype,
         mask_type=mask_type,
         window_left=window_left,
@@ -1181,8 +1251,9 @@ def _resolve_context_plan_geometry(
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
+    head_dim_vo: int | None = None,
+    qk_dtype: torch.dtype,
+    pv_dtype: torch.dtype,
     packed: bool,
     mask_type: str,
     window_left: int,
@@ -1190,7 +1261,7 @@ def _resolve_context_plan_geometry(
 ) -> _ContextPlanGeometry:
     """Validate explicit static bounds for a reusable contiguous plan."""
 
-    _validate_context_dtype_pair(q_dtype, kv_dtype, output_dtype)
+    _validate_context_dtype_pair(qk_dtype, qk_dtype, pv_dtype, output_dtype)
     _validate_mask(mask_type)
     window_left = _validate_window_left(window_left, mask_type)
     if not isinstance(packed, bool):
@@ -1206,6 +1277,11 @@ def _resolve_context_plan_geometry(
     num_qo_heads = _validate_static_extent(num_qo_heads, "num_qo_heads")
     num_kv_heads = _validate_static_extent(num_kv_heads, "num_kv_heads")
     head_dim = _validate_static_extent(head_dim, "head_dim")
+    head_dim_vo = (
+        head_dim
+        if head_dim_vo is None
+        else _validate_static_extent(head_dim_vo, "head_dim_vo")
+    )
     device, device_index = _resolve_cuda_device(device)
 
     _validate_padded_data_extent(
@@ -1213,7 +1289,11 @@ def _resolve_context_plan_geometry(
     )
     _validate_padded_data_extent(batch_size * max_kv_len, "batch_size * max_kv_len")
     head_ratio = _validate_head_geometry(num_qo_heads, num_kv_heads)
-    _validate_head_dim(head_dim, head_dim)
+    _validate_head_dim(head_dim, head_dim, head_dim_vo)
+    if head_dim == 192 and window_left > 0:
+        raise NotImplementedError(
+            "QK/V=(192, 128) does not support a positive left window"
+        )
     if not packed and mask_type == "causal" and max_seq_len_q > max_kv_len:
         raise ValueError(
             "bottom-right causal context requires max_seq_len_q <= max_kv_len; "
@@ -1239,8 +1319,9 @@ def _resolve_context_plan_geometry(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
-        q_dtype=q_dtype,
-        kv_dtype=kv_dtype,
+        head_dim_vo=head_dim_vo,
+        qk_dtype=qk_dtype,
+        pv_dtype=pv_dtype,
         output_dtype=output_dtype,
         mask_type=mask_type,
         window_left=window_left,
@@ -1341,8 +1422,8 @@ def _resolve_paged_geometry(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=q_head_dim,
-        q_dtype=q.dtype,
-        kv_dtype=k_cache.dtype,
+        qk_dtype=q.dtype,
+        pv_dtype=v_cache.dtype,
         page_size=page_size,
         mask_type=mask_type,
         window_left=window_left,
@@ -1380,9 +1461,11 @@ def _make_context_scheduler_probe(
         torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     }
     probe = _make_context_kernel(
-        input_dtype=dtype_map[geometry.q_dtype],
+        input_qk_dtype=dtype_map[geometry.qk_dtype],
+        input_pv_dtype=dtype_map[geometry.pv_dtype],
         output_dtype=dtype_map[geometry.output_dtype],
         head_dim=geometry.head_dim,
+        head_dim_vo=getattr(geometry, "head_dim_vo", None),
         mask_type=geometry.mask_type,
         window_left=geometry.window_left,
         head_paired=geometry.head_paired,
@@ -1418,8 +1501,8 @@ def _resolve_paged_plan_geometry(
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    q_dtype: torch.dtype,
-    kv_dtype: torch.dtype,
+    qk_dtype: torch.dtype,
+    pv_dtype: torch.dtype,
     page_size: int,
     mask_type: str,
     window_left: int,
@@ -1430,7 +1513,7 @@ def _resolve_paged_plan_geometry(
 ) -> _PagedContextPlanGeometry:
     """Validate explicit static bounds for a reusable paged specialization."""
 
-    _validate_paged_dtype_pair(q_dtype, kv_dtype, output_dtype)
+    _validate_paged_dtype_pair(qk_dtype, qk_dtype, pv_dtype, output_dtype)
     _validate_mask(mask_type)
     if not isinstance(uniform_packed_lengths, bool):
         raise TypeError("uniform_packed_lengths must be a bool")
@@ -1479,8 +1562,8 @@ def _resolve_paged_plan_geometry(
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
-        q_dtype=q_dtype,
-        kv_dtype=kv_dtype,
+        qk_dtype=qk_dtype,
+        pv_dtype=pv_dtype,
         output_dtype=output_dtype,
         mask_type=mask_type,
         window_left=window_left,
@@ -1560,6 +1643,7 @@ def _resolve_paged_context_scheduler(
 
 
 def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec:
+    """Build the contiguous compile key, including separate QK and PV dtype keys."""
     return _ContextCompileSpec(
         device_index=geometry.device_index,
         max_seq_len_q=geometry.max_seq_len_q,
@@ -1567,7 +1651,9 @@ def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec
         num_qo_heads=geometry.num_qo_heads,
         num_kv_heads=geometry.num_kv_heads,
         head_dim=geometry.head_dim,
-        q_dtype_key=_dtype_key(geometry.q_dtype),
+        head_dim_vo=geometry.head_dim_vo,
+        qk_dtype_key=_dtype_key(geometry.qk_dtype),
+        pv_dtype_key=_dtype_key(geometry.pv_dtype),
         output_dtype_key=_dtype_key(geometry.output_dtype),
         mask_type=geometry.mask_type,
         window_left=geometry.window_left,
@@ -1584,6 +1670,7 @@ def _context_compile_spec(geometry: _ContextPlanGeometry) -> _ContextCompileSpec
 def _paged_context_compile_spec(
     geometry: _PagedContextPlanGeometry,
 ) -> _PagedContextCompileSpec:
+    """Build the paged compile key, including separate QK and PV dtype keys."""
     return _PagedContextCompileSpec(
         device_index=geometry.device_index,
         max_seq_len_q=geometry.max_seq_len_q,
@@ -1592,7 +1679,8 @@ def _paged_context_compile_spec(
         num_qo_heads=geometry.num_qo_heads,
         num_kv_heads=geometry.num_kv_heads,
         head_dim=geometry.head_dim,
-        q_dtype_key=_dtype_key(geometry.q_dtype),
+        qk_dtype_key=_dtype_key(geometry.qk_dtype),
+        pv_dtype_key=_dtype_key(geometry.pv_dtype),
         output_dtype_key=_dtype_key(geometry.output_dtype),
         mask_type=geometry.mask_type,
         window_left=geometry.window_left,
@@ -1617,7 +1705,9 @@ def _get_compiled_context(
     num_qo_heads = compile_spec.num_qo_heads
     num_kv_heads = compile_spec.num_kv_heads
     head_dim = compile_spec.head_dim
-    q_dtype_key = compile_spec.q_dtype_key
+    head_dim_vo = compile_spec.head_dim_vo or head_dim
+    qk_dtype_key = compile_spec.qk_dtype_key
+    pv_dtype_key = compile_spec.pv_dtype_key
     output_dtype_key = compile_spec.output_dtype_key
     mask_type = compile_spec.mask_type
     window_left = compile_spec.window_left
@@ -1639,15 +1729,18 @@ def _get_compiled_context(
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
     }
-    input_dtype = dtype_map[q_dtype_key]
+    input_qk_dtype = dtype_map[qk_dtype_key]
+    input_pv_dtype = dtype_map[pv_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     has_variable_window = mask_type == "variable_window"
     with torch.cuda.device(device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
     fmha = _make_context_kernel(
-        input_dtype=input_dtype,
+        input_qk_dtype=input_qk_dtype,
+        input_pv_dtype=input_pv_dtype,
         output_dtype=output_dtype,
         head_dim=head_dim,
+        head_dim_vo=head_dim_vo,
         mask_type=mask_type,
         window_left=window_left,
         head_paired=head_paired,
@@ -1746,19 +1839,19 @@ def _get_compiled_context(
         runtime_num_k_offsets = cute.sym_int()
         q_shape = (runtime_total_q, num_qo_heads, head_dim)
         kv_shape = (runtime_total_k, num_kv_heads, head_dim)
-        out_shape = (runtime_total_q, num_qo_heads, head_dim)
+        out_shape = (runtime_total_q, num_qo_heads, head_dim_vo)
         qo_indptr_shape = (runtime_num_q_offsets,)
         kv_indptr_shape = (runtime_num_k_offsets,)
     else:
         batch_size = cute.sym_int()
         q_shape = (batch_size, max_seq_len_q, num_qo_heads, head_dim)
         kv_shape = (batch_size, max_seq_len_k, num_kv_heads, head_dim)
-        out_shape = q_shape
+        out_shape = (*q_shape[:-1], head_dim_vo)
         qo_indptr_shape = (1,)
         kv_indptr_shape = (1,)
-    q_fake = fake_compact(input_dtype, q_shape, 16)
-    k_fake = fake_compact(input_dtype, kv_shape, 16)
-    v_fake = fake_compact(input_dtype, kv_shape, 16)
+    q_fake = fake_compact(input_qk_dtype, q_shape, 16)
+    k_fake = fake_compact(input_qk_dtype, kv_shape, 16)
+    v_fake = fake_compact(input_pv_dtype, (*kv_shape[:-1], head_dim_vo), 16)
     out_fake = fake_compact(output_dtype, out_shape, 16)
     scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
@@ -1828,7 +1921,8 @@ def _get_compiled_paged_context(
     num_qo_heads = compile_spec.num_qo_heads
     num_kv_heads = compile_spec.num_kv_heads
     head_dim = compile_spec.head_dim
-    q_dtype_key = compile_spec.q_dtype_key
+    qk_dtype_key = compile_spec.qk_dtype_key
+    pv_dtype_key = compile_spec.pv_dtype_key
     output_dtype_key = compile_spec.output_dtype_key
     mask_type = compile_spec.mask_type
     window_left = compile_spec.window_left
@@ -1849,12 +1943,14 @@ def _get_compiled_paged_context(
         "bfloat16": cutlass.BFloat16,
         "float8_e4m3fn": cutlass.Float8E4M3FN,
     }
-    input_dtype = dtype_map[q_dtype_key]
+    input_qk_dtype = dtype_map[qk_dtype_key]
+    input_pv_dtype = dtype_map[pv_dtype_key]
     output_dtype = dtype_map[output_dtype_key]
     with torch.cuda.device(device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
     fmha = _make_context_kernel(
-        input_dtype=input_dtype,
+        input_qk_dtype=input_qk_dtype,
+        input_pv_dtype=input_pv_dtype,
         output_dtype=output_dtype,
         head_dim=head_dim,
         mask_type=mask_type,
@@ -1928,15 +2024,15 @@ def _get_compiled_paged_context(
     runtime_num_pages = cute.sym_int()
     batch_size = cute.sym_int()
     runtime_num_q_offsets = cute.sym_int()
-    q_fake = fake_compact(input_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
+    q_fake = fake_compact(input_qk_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
     kv_shape = (
         runtime_num_pages,
         num_kv_heads,
         page_size,
         head_dim,
     )
-    k_fake = fake_compact(input_dtype, kv_shape, 16)
-    v_fake = fake_compact(input_dtype, kv_shape, 16)
+    k_fake = fake_compact(input_qk_dtype, kv_shape, 16)
+    v_fake = fake_compact(input_pv_dtype, kv_shape, 16)
     out_fake = fake_compact(output_dtype, (runtime_total_q, num_qo_heads, head_dim), 16)
     scale_fake = fake_compact(cutlass.Float32, (1,), 4)
     output_scale_fake = fake_compact(cutlass.Float32, (1,), 4)
@@ -1995,13 +2091,18 @@ def _validate_runtime_inputs(
 ) -> None:
     """Validate contiguous data and request metadata against one plan."""
 
-    _validate_base_tensors(q, k, v)
+    _validate_base_tensors(q, k, v, allow_mla=True)
     if q.device != geometry.device:
         raise ValueError(f"q must be on {geometry.device}, got {q.device}")
-    if q.dtype != geometry.q_dtype:
-        raise ValueError(f"q must have dtype {geometry.q_dtype}, got {q.dtype}")
-    if k.dtype != geometry.kv_dtype:
-        raise ValueError(f"k and v must have dtype {geometry.kv_dtype}, got {k.dtype}")
+    if q.dtype != geometry.qk_dtype:
+        raise ValueError(f"q must have dtype {geometry.qk_dtype}, got {q.dtype}")
+    if k.dtype != geometry.qk_dtype:
+        raise ValueError(f"k must have dtype {geometry.qk_dtype}, got {k.dtype}")
+    if v.dtype != geometry.pv_dtype:
+        raise ValueError(f"v must have dtype {geometry.pv_dtype}, got {v.dtype}")
+    v_shape = (*k.shape[:-1], geometry.head_dim_vo or geometry.head_dim)
+    if tuple(v.shape) != v_shape:
+        raise ValueError(f"v must have shape {v_shape}, got {tuple(v.shape)}")
 
     if geometry.packed:
         if q.ndim != 3 or tuple(q.shape[1:]) != (
@@ -2126,11 +2227,15 @@ def _validate_paged_runtime_inputs(
     _validate_base_tensors(q, k_cache, v_cache)
     if q.device != geometry.device:
         raise ValueError(f"q must be on {geometry.device}, got {q.device}")
-    if q.dtype != geometry.q_dtype:
-        raise ValueError(f"q must have dtype {geometry.q_dtype}, got {q.dtype}")
-    if k_cache.dtype != geometry.kv_dtype:
+    if q.dtype != geometry.qk_dtype:
+        raise ValueError(f"q must have dtype {geometry.qk_dtype}, got {q.dtype}")
+    if k_cache.dtype != geometry.qk_dtype:
         raise ValueError(
-            f"k_cache must have dtype {geometry.kv_dtype}, got {k_cache.dtype}"
+            f"k_cache must have dtype {geometry.qk_dtype}, got {k_cache.dtype}"
+        )
+    if v_cache.dtype != geometry.pv_dtype:
+        raise ValueError(
+            f"v_cache must have dtype {geometry.pv_dtype}, got {v_cache.dtype}"
         )
     if q.ndim != 3 or tuple(q.shape[1:]) != (
         geometry.num_qo_heads,
@@ -2284,14 +2389,14 @@ def _prepare_out(
     *,
     q: torch.Tensor,
     output_dtype: torch.dtype,
+    head_dim_vo: int | None = None,
 ) -> torch.Tensor:
+    out_shape = (*q.shape[:-1], head_dim_vo or q.shape[-1])
     if out is None:
-        return torch.empty(tuple(q.shape), dtype=output_dtype, device=q.device)
+        return torch.empty(out_shape, dtype=output_dtype, device=q.device)
     _validate_tensor(out, "out")
-    if tuple(out.shape) != tuple(q.shape):
-        raise ValueError(
-            f"out must have shape {tuple(q.shape)}, got {tuple(out.shape)}"
-        )
+    if tuple(out.shape) != out_shape:
+        raise ValueError(f"out must have shape {out_shape}, got {tuple(out.shape)}")
     if out.dtype != output_dtype:
         raise ValueError(f"out must have dtype {output_dtype}, got {out.dtype}")
     if out.device != q.device:
@@ -2304,6 +2409,10 @@ def _prepare_out(
 
 class BatchPrefillTSWrapper:
     """Compile and reuse fixed or packed-ragged contiguous context attention.
+
+    Supports equal QK/V dimensions 128 and 256, and separate QK=192/V=128
+    for non-absorbed MLA. Output has Q's leading dimensions and V's head
+    dimension. The 192/128 geometry does not support a positive left window.
 
     ``plan`` accepts only static compilation geometry. Q/K/V tensors, packed
     cumulative offsets, variable-window metadata, and optional scale overrides
@@ -2326,12 +2435,12 @@ class BatchPrefillTSWrapper:
     dependency.
     """
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def __init__(self) -> None:
         """Initialize an unplanned task-scheduled context-attention wrapper."""
         self._plan_state: Optional[_ContextPlanState] = None
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def plan(
         self,
         *,
@@ -2342,8 +2451,10 @@ class BatchPrefillTSWrapper:
         num_qo_heads: int,
         num_kv_heads: int,
         head_dim: int,
+        head_dim_vo: int | None = None,
         q_dtype: torch.dtype,
-        kv_dtype: torch.dtype,
+        k_dtype: torch.dtype,
+        v_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
         packed: bool = False,
         mask_type: Literal["dense", "causal", "variable_window"] = "dense",
@@ -2376,11 +2487,18 @@ class BatchPrefillTSWrapper:
         num_kv_heads : int
             Number of key/value heads.
         head_dim : int
-            Query, key, value, and output head dimension.
+            Query/key head dimension.
+        head_dim_vo : int, optional
+            Value/output head dimension; defaults to ``head_dim``. Separate
+            dimensions are supported for non-absorbed MLA with QK=192/V=128.
         q_dtype : torch.dtype
             Query dtype.
-        kv_dtype : torch.dtype
-            Key/value dtype. It must currently equal ``q_dtype``.
+        k_dtype : torch.dtype
+            Key dtype, and the value dtype when ``v_dtype`` is omitted. It
+            must currently equal ``q_dtype``.
+        v_dtype : torch.dtype, optional
+            Value dtype; defaults to ``k_dtype``. May differ from
+            ``k_dtype`` only for the QK-BF16/PV-FP8 combination.
         out_dtype : torch.dtype, optional
             Output dtype; defaults to ``q_dtype``.
         packed : bool
@@ -2397,6 +2515,12 @@ class BatchPrefillTSWrapper:
         """
 
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
+        resolved_v_dtype = k_dtype if v_dtype is None else v_dtype
+        if k_dtype != q_dtype:
+            raise NotImplementedError(
+                "attention-ts context requires Q and K to use the same dtype; "
+                f"got q_dtype={q_dtype} and k_dtype={k_dtype}"
+            )
         geometry = _resolve_context_plan_geometry(
             device=device,
             batch_size=batch_size,
@@ -2405,8 +2529,9 @@ class BatchPrefillTSWrapper:
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
+            head_dim_vo=head_dim_vo,
+            qk_dtype=k_dtype,
+            pv_dtype=resolved_v_dtype,
             packed=packed,
             mask_type=mask_type,
             window_left=window_left,
@@ -2463,7 +2588,7 @@ class BatchPrefillTSWrapper:
             policy=policy,
         )
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def run(
         self,
         q: torch.Tensor,
@@ -2506,9 +2631,10 @@ class BatchPrefillTSWrapper:
         output_scale : torch.Tensor, optional
             Per-run one-element float32 output scale. Defaults to the plan.
         validate : bool
-            Validate the complete runtime contract. Disable only when the
-            caller guarantees dtype, device, shape, stride, alignment, values,
-            aliasing, and lifetime. Defaults to ``True``.
+            Validate tensor structure and metadata values. Disable only when
+            the caller guarantees these contracts. Output must not overlap
+            any live input or plan-owned buffer in either mode; storage
+            overlap and lifetime are caller preconditions. Defaults to ``True``.
         """
 
         state = self._plan_state
@@ -2604,46 +2730,18 @@ class BatchPrefillTSWrapper:
                 device=geometry.device,
             )
 
-        caller_provided_out = out is not None
         if out is None:
             out = torch.empty(
-                tuple(q.shape), dtype=geometry.output_dtype, device=q.device
+                (*q.shape[:-1], geometry.head_dim_vo or geometry.head_dim),
+                dtype=geometry.output_dtype,
+                device=q.device,
             )
         elif validate:
-            out = _prepare_out(out, q=q, output_dtype=geometry.output_dtype)
-        if validate and caller_provided_out:
-            alias_inputs = [
-                ("q", q),
-                ("k", k),
-                ("v", v),
-                ("scale_softmax_log2", scale_softmax_log2),
-                ("output_scale", output_scale),
-            ]
-            if geometry.packed:
-                alias_inputs.extend(
-                    (("qo_indptr", runtime_qo_indptr), ("kv_indptr", runtime_kv_indptr))
-                )
-            if geometry.mask_type == "variable_window":
-                alias_inputs.extend(
-                    (
-                        ("variable_window_token_starts", runtime_window_starts),
-                        ("variable_window_token_ends", runtime_window_ends),
-                        ("variable_window_cta_starts", runtime_window_cta_starts),
-                    )
-                )
-                if (
-                    variable_window_cta_starts is None
-                    and state.variable_window_padded_starts is not None
-                ):
-                    alias_inputs.append(
-                        (
-                            "variable_window_padded_starts",
-                            state.variable_window_padded_starts,
-                        )
-                    )
-            _validate_out_does_not_overlap_inputs(
+            out = _prepare_out(
                 out,
-                *alias_inputs,
+                q=q,
+                output_dtype=geometry.output_dtype,
+                head_dim_vo=geometry.head_dim_vo,
             )
         state.compiled(
             q,
@@ -2689,7 +2787,7 @@ class BatchPrefillPagedTSWrapper:
     planning stream, the caller must establish that dependency.
     """
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def __init__(self, kv_layout: Literal["HND"] = "HND") -> None:
         """Create an unplanned paged-context wrapper.
 
@@ -2703,7 +2801,7 @@ class BatchPrefillPagedTSWrapper:
         self._kv_layout = kv_layout
         self._plan_state: Optional[_PagedContextPlanState] = None
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def plan(
         self,
         *,
@@ -2715,7 +2813,8 @@ class BatchPrefillPagedTSWrapper:
         num_kv_heads: int,
         head_dim: int,
         q_dtype: torch.dtype,
-        kv_dtype: torch.dtype,
+        k_dtype: torch.dtype,
+        v_dtype: Optional[torch.dtype] = None,
         out_dtype: Optional[torch.dtype] = None,
         page_size: int = _DEFAULT_PAGED_KV_PAGE_SIZE,
         mask_type: Literal["dense", "causal"] = "dense",
@@ -2769,8 +2868,12 @@ class BatchPrefillPagedTSWrapper:
             Query, key, value, and output head dimension.
         q_dtype : torch.dtype
             Query dtype.
-        kv_dtype : torch.dtype
-            Key/value cache dtype. It must currently equal ``q_dtype``.
+        k_dtype : torch.dtype
+            Key cache dtype, and the value cache dtype when ``v_dtype`` is
+            omitted. It must currently equal ``q_dtype``.
+        v_dtype : torch.dtype, optional
+            Value cache dtype; defaults to ``k_dtype``. May differ from
+            ``k_dtype`` only for the QK-BF16/PV-FP8 combination.
         out_dtype : torch.dtype, optional
             Output dtype; defaults to ``q_dtype``.
         page_size : int
@@ -2798,6 +2901,12 @@ class BatchPrefillPagedTSWrapper:
         """
 
         resolved_out_dtype = q_dtype if out_dtype is None else out_dtype
+        resolved_v_dtype = k_dtype if v_dtype is None else v_dtype
+        if k_dtype != q_dtype:
+            raise NotImplementedError(
+                "attention-ts paged context requires Q and K to use the same "
+                f"dtype; got q_dtype={q_dtype} and k_dtype={k_dtype}"
+            )
         geometry = _resolve_paged_plan_geometry(
             device=device,
             batch_size=batch_size,
@@ -2806,8 +2915,8 @@ class BatchPrefillPagedTSWrapper:
             num_qo_heads=num_qo_heads,
             num_kv_heads=num_kv_heads,
             head_dim=head_dim,
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
+            qk_dtype=k_dtype,
+            pv_dtype=resolved_v_dtype,
             page_size=page_size,
             mask_type=mask_type,
             window_left=window_left,
@@ -2844,7 +2953,7 @@ class BatchPrefillPagedTSWrapper:
             policy=policy,
         )
 
-    @flashinfer_api
+    @flashinfer_experimental_api
     def run(
         self,
         q: torch.Tensor,
@@ -2914,8 +3023,10 @@ class BatchPrefillPagedTSWrapper:
             retained by the plan.
         validate : bool
             Run explicit storage, shape, dtype, device, scale, output, and
-            aliasing validators. Disable only when the caller guarantees the
-            complete runtime contract. Defaults to ``True``.
+            metadata-value validators. Disable only when the caller guarantees
+            these contracts. Output must not overlap any live input or
+            plan-owned buffer in either mode; storage overlap is not checked.
+            Defaults to ``True``.
 
         Returns
         -------
@@ -2954,25 +3065,12 @@ class BatchPrefillPagedTSWrapper:
                 output_scale, "output_scale", device=geometry.device
             )
 
-        caller_provided_out = out is not None
         if out is None:
             out = torch.empty(
                 tuple(q.shape), dtype=geometry.output_dtype, device=q.device
             )
         elif validate:
             out = _prepare_out(out, q=q, output_dtype=geometry.output_dtype)
-        if validate and caller_provided_out:
-            _validate_out_does_not_overlap_inputs(
-                out,
-                ("q", q),
-                ("k_cache", k_cache),
-                ("v_cache", v_cache),
-                ("qo_indptr", qo_indptr),
-                ("block_tables", block_tables),
-                ("seq_lens_kv", seq_lens_kv),
-                ("scale_softmax_log2", scale_softmax_log2),
-                ("output_scale", output_scale),
-            )
         state.compiled(
             q,
             k_cache,
@@ -2987,7 +3085,7 @@ class BatchPrefillPagedTSWrapper:
         return out
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def batch_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3008,7 +3106,8 @@ def batch_prefill(
 
     Fixed tensors use ``[B, S, H, D]`` storage. Providing both cumulative
     int32 offset tensors selects packed ``[total_tokens, H, D]`` storage.
-    ``D`` may be 128 or 256.
+    Equal Q/K/V head dimensions may be 128 or 256. Separate Q/K=192 and
+    V=128 supports non-absorbed MLA; O uses V's head dimension.
     Causal masking is bottom-right aligned.  ``window_left=-1`` disables the
     left window; a positive value selects the private head-paired GQA policy
     and retains at most ``window_left + 1`` keys at each causal row, including
@@ -3017,7 +3116,9 @@ def batch_prefill(
     Parameters
     ----------
     q, k, v : torch.Tensor
-        Fixed or packed query, key, and value tensors.
+        Fixed or packed query, key, and value tensors. Q and K share one
+        dtype; V matches it or is ``torch.float8_e4m3fn`` with
+        ``torch.bfloat16`` Q/K.
     qo_indptr, kv_indptr : torch.Tensor, optional
         Cumulative query and K/V offsets for packed-ragged input.
     mask_type : {"dense", "causal", "variable_window"}
@@ -3076,8 +3177,10 @@ def batch_prefill(
         num_qo_heads=geometry.num_qo_heads,
         num_kv_heads=geometry.num_kv_heads,
         head_dim=geometry.head_dim,
-        q_dtype=geometry.q_dtype,
-        kv_dtype=geometry.q_dtype,
+        head_dim_vo=geometry.head_dim_vo,
+        q_dtype=geometry.qk_dtype,
+        k_dtype=geometry.qk_dtype,
+        v_dtype=geometry.pv_dtype,
         out_dtype=geometry.output_dtype,
         packed=geometry.packed,
         mask_type=mask_type,
@@ -3097,7 +3200,7 @@ def batch_prefill(
     )
 
 
-@flashinfer_api
+@flashinfer_experimental_api
 def batch_prefill_with_paged_kv_cache(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -3122,7 +3225,8 @@ def batch_prefill_with_paged_kv_cache(
     ``qo_indptr`` describes Q rows, ``block_tables`` supplies one fixed
     row-strided page table, and ``seq_lens_kv`` supplies logical K/V lengths.
     Physical page indices need not be identity ordered. ``D`` may be 128 or
-    256; Q, K, and V must share one supported dtype.
+    256. Q and K must share one supported dtype; V matches it or is
+    ``torch.float8_e4m3fn`` alongside ``torch.bfloat16`` Q/K.
 
     This convenience API reads request metadata on the host to derive exact
     plan bounds and is not CUDA-graph-capturable. Capture-sensitive callers
@@ -3201,8 +3305,9 @@ def batch_prefill_with_paged_kv_cache(
         num_qo_heads=geometry.num_qo_heads,
         num_kv_heads=geometry.num_kv_heads,
         head_dim=geometry.head_dim,
-        q_dtype=geometry.q_dtype,
-        kv_dtype=geometry.kv_dtype,
+        q_dtype=geometry.qk_dtype,
+        k_dtype=geometry.qk_dtype,
+        v_dtype=geometry.pv_dtype,
         out_dtype=geometry.output_dtype,
         page_size=page_size,
         mask_type=mask_type,

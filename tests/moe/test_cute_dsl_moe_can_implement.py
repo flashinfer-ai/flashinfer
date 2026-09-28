@@ -170,3 +170,30 @@ def test_w4a8_finalize_n_tiling(mma, n, expect):
         )
         is expect
     )
+
+
+def test_every_rubin_tactic_is_single_cta():
+    """No enumerated Rubin tactic may use a multi-CTA cluster.
+
+    ``moe_sort`` leaves tile-metadata entries past ``num_non_exiting_tiles``
+    uninitialized, and both GEMMs bound their reads by that exact count. A
+    ``cluster_shape_m > 1`` tactic would need the count rounded up to a
+    multiple of ``cluster_shape_m`` for barrier uniformity, which widens
+    those reads past what routing wrote. Neither the rounding nor the
+    matching buffer initialization is implemented, so such a tactic must
+    never reach the autotuner.
+    """
+    from flashinfer.fused_moe.cute_dsl.tuner import ALL_RUBIN_MOE_TACTICS
+
+    assert ALL_RUBIN_MOE_TACTICS, "Rubin tactic list is empty -- nothing asserted"
+    for tile_size, gemm1_tactic, gemm2_tactic in ALL_RUBIN_MOE_TACTICS:
+        _, _, gemm1_cluster_shape_mn, _ = gemm1_tactic
+        _, _, gemm2_cluster_shape_mn, _ = gemm2_tactic
+        assert gemm1_cluster_shape_mn[0] == 1, (
+            f"gemm1 tactic {gemm1_tactic} at tile_size={tile_size} uses "
+            f"cluster_shape_m={gemm1_cluster_shape_mn[0]}"
+        )
+        assert gemm2_cluster_shape_mn[0] == 1, (
+            f"gemm2 tactic {gemm2_tactic} at tile_size={tile_size} uses "
+            f"cluster_shape_m={gemm2_cluster_shape_mn[0]}"
+        )

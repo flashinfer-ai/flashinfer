@@ -1,0 +1,328 @@
+{
+  "contract": {
+    "architecture": "sm_110a",
+    "dtype": "float16",
+    "fused_routes": {
+      "n32_disjoint_s10": 10,
+      "n64_kvlast_s10": 10
+    },
+    "head_dim": 128,
+    "kv_heads": 8,
+    "q_heads": 32,
+    "routes": {
+      "1:1024": "n64_kvlast_s10",
+      "1:4096": "n32_disjoint_s10",
+      "1:64": "short",
+      "4:256": "n32_b4_direct"
+    },
+    "sequence_length_precondition": "each GPU value is positive and <= KV capacity at every launch",
+    "single_routes": [
+      "long",
+      "n32_b4_direct",
+      "short"
+    ],
+    "split_routes": {},
+    "workspace_owner": "prepared object; retained across all launches and graph replays"
+  },
+  "files": [
+    {
+      "path": "sm110_gqa_decode_n32_b4_direct.cu",
+      "sha256": "0390a5e58b35836a2ce1e3316f8f9794a597ba9aee8948116d75aec0a7fa878e"
+    },
+    {
+      "path": "sm110_gqa_decode_n32_b4_direct_binding.cu",
+      "sha256": "246fc3318c66e3ef58a198cd5c9e5d43ceee6d598d8854d67127205ac9cd25c9"
+    },
+    {
+      "path": "sm110_gqa_decode_n32_disjoint_s10.cu",
+      "sha256": "072ada34ccb92f2b14ceeaa2a210b6d77d38a5d29028601740378202ba1dee2c"
+    },
+    {
+      "path": "sm110_gqa_decode_n32_disjoint_s10_binding.cu",
+      "sha256": "686f1274ef497a33b674b4a884d76cf7afb0d946e8eb82de7f2beaed25982c4e"
+    },
+    {
+      "path": "sm110_gqa_decode_n64_kvlast_s10.cu",
+      "sha256": "1c70b8c240bb6f65afa030a8e9cc4f8743dc605a2d70ba283fb583a6370cb30e"
+    },
+    {
+      "path": "sm110_gqa_decode_n64_kvlast_s10_binding.cu",
+      "sha256": "6839d544fd6fea6b15f921d6e6afed67ac42511d3969f02a2677cf34b66212b8"
+    }
+  ],
+  "modules": [
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "V"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sequence_lengths"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_sm110_gqa_decode_n32_b4_direct",
+      "kind": "prepared",
+      "route": "n32_b4_direct",
+      "sources": [
+        "sm110_gqa_decode_n32_b4_direct.cu",
+        "sm110_gqa_decode_n32_b4_direct_binding.cu"
+      ]
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "V"
+        ],
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_max"
+        ],
+        [
+          "buffer",
+          "partial_sum"
+        ],
+        [
+          "buffer",
+          "completed"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sequence_lengths"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_sm110_gqa_decode_n32_disjoint_s10",
+      "kind": "prepared",
+      "route": "n32_disjoint_s10",
+      "sources": [
+        "sm110_gqa_decode_n32_disjoint_s10.cu",
+        "sm110_gqa_decode_n32_disjoint_s10_binding.cu"
+      ]
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "V"
+        ],
+        [
+          "buffer",
+          "partial_O"
+        ],
+        [
+          "buffer",
+          "partial_max"
+        ],
+        [
+          "buffer",
+          "partial_sum"
+        ],
+        [
+          "buffer",
+          "completed"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sequence_lengths"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "compile_flags": [
+        "--use_fast_math"
+      ],
+      "ffi_entry": "run",
+      "kernel_symbol": "kernel_sm110_gqa_decode_n64_kvlast_s10",
+      "kind": "prepared",
+      "route": "n64_kvlast_s10",
+      "sources": [
+        "sm110_gqa_decode_n64_kvlast_s10.cu",
+        "sm110_gqa_decode_n64_kvlast_s10_binding.cu"
+      ]
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "V"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sequence_lengths"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "ffi_entry": "run_short",
+      "kernel_symbol": "kernel_sm110_gqa_decode_short",
+      "kind": "original",
+      "route": "short"
+    },
+    {
+      "arg_plan": [
+        [
+          "tma_buffer",
+          "Q"
+        ],
+        [
+          "tma_buffer",
+          "K"
+        ],
+        [
+          "tma_buffer",
+          "V"
+        ],
+        [
+          "buffer",
+          "O"
+        ],
+        [
+          "buffer",
+          "sequence_lengths"
+        ],
+        [
+          "parameter",
+          "softmax_scale_log2"
+        ],
+        [
+          "grid",
+          "grid_x"
+        ],
+        [
+          "grid",
+          "grid_y"
+        ],
+        [
+          "grid",
+          "grid_z"
+        ]
+      ],
+      "ffi_entry": "run_long",
+      "kernel_symbol": "kernel_sm110_gqa_decode_long",
+      "kind": "original",
+      "route": "long"
+    }
+  ]
+}

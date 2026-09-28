@@ -1042,6 +1042,126 @@ def test_nvfp4_quantize_roundtrip(
     )
 
 
+@pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
+@pytest.mark.parametrize("m", [1, 17, 130])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_per_token_out_scale_fold(
+    sf_layout: SfLayout, m: int, dtype: torch.dtype, device: str
+) -> None:
+    """``out_scale`` must fold into ``per_token_scale`` alone, and the padding
+    rows of the scale buffer (``torch.empty``, filled by the kernel) must still
+    come back zeroed. ``m=1`` with ``128x4`` is the sharpest case: 127 of the
+    128 rows are padding.
+    """
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.manual_seed(0)
+    k = 256
+    x = torch.randn((m, k), dtype=dtype, device=device)
+    global_scale_inv = torch.tensor(1.0 / (448 * 6), dtype=torch.float32, device=device)
+    out_scale = torch.tensor(3.0, dtype=torch.float32, device=device)
+
+    def _quantize(layout: SfLayout, **kwargs):
+        return nvfp4_quantize(
+            x,
+            global_scale_inv,
+            sfLayout=layout,
+            per_token_activation=True,
+            backend="cute-dsl",
+            **kwargs,
+        )
+
+    q_base, sf_base, per_token_base = _quantize(sf_layout)
+    q_fold, sf_fold, per_token_fold = _quantize(sf_layout, out_scale=out_scale)
+
+    torch.testing.assert_close(q_fold, q_base, rtol=0, atol=0)
+    torch.testing.assert_close(sf_fold, sf_base, rtol=0, atol=0)
+    # One fp32 multiply on both sides, so the fold is exact.
+    torch.testing.assert_close(
+        per_token_fold, per_token_base * out_scale, rtol=0, atol=0
+    )
+
+    # The linear layout has no padding, so swizzling it with the reference
+    # helper (which pads with zeros) gives the full expected buffer, padding
+    # rows included.
+    if sf_layout != SfLayout.layout_linear:
+        _, sf_linear, _ = _quantize(SfLayout.layout_linear)
+        expected_sf = _te_ref_scale_bytes_for_layout(sf_linear, sf_layout)
+        torch.testing.assert_close(sf_fold, expected_sf, rtol=0, atol=0)
+
+
+# Row widths that exercise every CTA shape of the register-resident per-token
+# CuTe-DSL kernel: 128 threads with masked threads (k=1536: 96 blocks), one
+# block per thread at 512 threads (k=7168, 8192), 2..4 blocks per thread
+# (k=16384, 18432, 28672) and the two-pass fallback above 8 blocks per thread
+# (k=69632: 4352 blocks). m covers a single row, an odd tail and a tail past
+# one 128-row scale tile.
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("k", [1536, 7168, 8192, 16384, 18432, 28672, 69632])
+@pytest.mark.parametrize("m", [1, 17, 130])
+@pytest.mark.parametrize(
+    "sf_layout", [SfLayout.layout_128x4, SfLayout.layout_8x4, SfLayout.layout_linear]
+)
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+@torch.inference_mode()
+def test_nvfp4_quantize_per_token_cute_dsl_wide_rows(
+    dtype: torch.dtype, k: int, m: int, sf_layout: SfLayout, device: str
+) -> None:
+    """The per-token CuTe-DSL kernel must stay bitwise equal to the CUDA
+    per-token kernel (fp4 bytes, block scales including padding, per-token
+    scales) for every row width the kernel specialises on."""
+    if not _is_fp4_supported(torch.device(device)):
+        pytest.skip("Nvfp4 Requires compute capability >= 10 and CUDA >= 12.8")
+    if not _is_cute_dsl_available():
+        pytest.skip("CuTe-DSL not available")
+
+    torch.manual_seed(0)
+    x = torch.randn((m, k), dtype=dtype, device=device) * 3.0
+    # a zero row and a row with one huge element stress the amax paths
+    if m > 1:
+        x[1].zero_()
+        x[m - 1, k // 2] = 4096.0
+    global_scale_inv = torch.tensor(1.0 / (448 * 6), dtype=torch.float32, device=device)
+
+    outs = {}
+    for backend in ("cuda", "cute-dsl"):
+        outs[backend] = nvfp4_quantize(
+            x,
+            global_scale_inv,
+            sfLayout=sf_layout,
+            per_token_activation=True,
+            backend=backend,
+        )
+    q_cuda, sf_cuda, pts_cuda = outs["cuda"]
+    q_cute, sf_cute, pts_cute = outs["cute-dsl"]
+    torch.testing.assert_close(q_cute, q_cuda, rtol=0, atol=0)
+    torch.testing.assert_close(sf_cute.reshape(-1), sf_cuda.reshape(-1), rtol=0, atol=0)
+    torch.testing.assert_close(pts_cute, pts_cuda, rtol=0, atol=0)
+    # the per-token scale is the row absmax on the [-448*6, 448*6] encode range
+    expected = x.float().abs().amax(dim=1) * global_scale_inv
+    torch.testing.assert_close(pts_cute, expected, rtol=1e-6, atol=0)
+
+
+@pytest.mark.parametrize("device", CUDA_DEVICES)
+def test_nvfp4_quantize_out_scale_rejected_off_the_fold_path(device: str) -> None:
+    """``out_scale`` is only folded by the per-token CuTe-DSL kernel; the paths
+    that would drop it silently must refuse it."""
+    x = torch.randn((8, 64), dtype=torch.bfloat16, device=device)
+    scale = torch.tensor(1.0 / (448 * 6), dtype=torch.float32, device=device)
+    out_scale = torch.tensor(2.0, dtype=torch.float32, device=device)
+    with pytest.raises(ValueError, match="out_scale"):
+        nvfp4_quantize(
+            x, scale, per_token_activation=True, backend="cuda", out_scale=out_scale
+        )
+    with pytest.raises(ValueError, match="out_scale"):
+        nvfp4_quantize(x, scale, backend="cute-dsl", out_scale=out_scale)
+
+
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", NVFP4_SHAPES)
 @pytest.mark.parametrize("sf_layout", NVFP4_SF_LAYOUTS)
@@ -1183,7 +1303,21 @@ def test_nvfp4_quantize_cute_dsl_device_scale_cuda_graph(device: str) -> None:
     torch.testing.assert_close(scale_graph, scale_ref, rtol=0, atol=0)
 
 
-NVFP4_FP8_SHAPES = [(128, 64), (256, 128), (512, 256), (128, 1024)]
+# FP8 input pairs two SF blocks per thread when K/16 is even; the extra shapes
+# cover the unpaired odd-block path (K=80), pairing with padded scale columns
+# (K=96), the linear-layout tail predicate (odd total block count), the
+# column-loop path with padding (K=8224), and tiny M.
+NVFP4_FP8_SHAPES = [
+    (128, 64),
+    (256, 128),
+    (512, 256),
+    (128, 1024),
+    (37, 48),
+    (64, 80),
+    (100, 96),
+    (3, 1040),
+    (129, 8224),
+]
 
 
 @pytest.mark.parametrize("shape", NVFP4_FP8_SHAPES)
@@ -1347,8 +1481,8 @@ def test_nvfp4_quantize_tma_backend_parity(
     if not _is_cute_dsl_available():
         pytest.skip("CuTe-DSL not available")
 
-    # TMA is disabled by default (flashinfer#3905); force it on so this test
-    # still exercises the CuTe-DSL TMA kernel.
+    # TMA is opt-in outside SM107's large FP16/BF16 regime; force it on so this
+    # test also exercises it on other architectures and input dtypes.
     monkeypatch.setenv("FLASHINFER_NVFP4_QUANTIZE_USE_TMA", "1")
 
     torch.set_default_device(device)

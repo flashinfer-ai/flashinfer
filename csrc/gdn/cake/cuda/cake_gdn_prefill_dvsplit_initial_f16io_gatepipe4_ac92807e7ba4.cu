@@ -13,9 +13,9 @@
 // limitations under the License.
 
 // clang-format off
-#include "cake_gdn_common.cuh"
+#include "gdn_prefill_generated.cuh"
 
-#define CAKE_GDN_INF CUDART_INF_F
+#define GDN_NONCP_INF CUDART_INF_F
 #define TMEM_NCOLS 512
 #define TMEM_TMEM_STATE_OFFSET 0
 #define TMEM_TMEM_Q_STATE_OFFSET 128
@@ -559,7 +559,8 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4(const __
                             #pragma unroll
                             for (int prev_col_cg0 = 0; prev_col_cg0 < src_row_cg0; prev_col_cg0++) {
                                 int pivot_lane_cg0 = diag_group_base_cg0 + src_row_cg0;
-                                float _shfl_0 = __shfl_sync(0xFFFFFFFF, inv_row_cg0[prev_col_cg0], pivot_lane_cg0);
+                                float _shfl_0;
+                                asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_0) : "f"(inv_row_cg0[prev_col_cg0]), "r"(pivot_lane_cg0));
                                 float shfl_val_cg0 = _shfl_0;
                                 if (lane_in_diag_cg0 > src_row_cg0) {
                                     inv_row_cg0[prev_col_cg0] = inv_row_cg0[prev_col_cg0] + row_scale_cg0 * shfl_val_cg0;
@@ -1411,561 +1412,468 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4(const __
                             mbarrier_wait(cg1_shared_acc_full_addr, _phase_cg1_shared_acc_full_0);
                             _phase_cg1_shared_acc_full_0 ^= 1;
                             int _uniform_2 = make_warp_uniform(tid >> 5 & 3);
-                            int ks_delta_warp_cg1 = make_warp_uniform(_uniform_2);
-                            int ks_scratch_addr_cg1 = taddr + 448 + (unsigned int)tmem_row_base_v;
-                            if (ks_delta_warp_cg1 < 4) {
-                                int ks_addr_cg1 = taddr + 384 + (unsigned int)tmem_row_base_v;
-                                float ks_chunk_cg1[4];
-                                float ks_cumprod_chunk_cg1[4];
+                            int ks_slice_warp_cg1 = make_warp_uniform(_uniform_2);
+                            int ks_slice_dst_cg1 = taddr + 448 + (unsigned int)tmem_row_base_v;
+                            if (ks_slice_warp_cg1 < 4) {
+                                int ks_slice_src_cg1 = taddr + 384 + (unsigned int)tmem_row_base_v;
+                                float ks_slice_cg1[4];
+                                float ks_slice_v_delta_cg1[2];
+                                unsigned int ks_slice_packed_delta_cg1[1];
                                 asm volatile(
                                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                     " {%0, %1, %2, %3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[3]))
-                                    : "r"(ks_addr_cg1));
-                                {
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 2; _ls++)
-                                        mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 0))[_ls]);
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[3]))
+                                    : "r"(ks_slice_src_cg1));
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 2; _ls++)
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 0))[_ls]);
+                                const int ks_slice_pair_j_cg1 = 0;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1)[_pair]));
                                 }
-                                tmem_st_x4_f32(ks_scratch_addr_cg1, ks_chunk_cg1);
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 0))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1] = ks_slice_packed_delta_cg1[0];
+                                const int ks_slice_pair_j_cg1_0 = 1;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_0)[_pair]));
+                                }
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 2))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_0] = ks_slice_packed_delta_cg1[0];
                                 asm volatile(
                                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                     " {%0, %1, %2, %3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[3]))
-                                    : "r"(ks_addr_cg1 + 8));
-                                {
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 2; _ls++)
-                                        mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 4))[_ls]);
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[3]))
+                                    : "r"(ks_slice_src_cg1 + 8));
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 2; _ls++)
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 4))[_ls]);
+                                const int ks_slice_pair_j_cg1_1 = 2;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_1)[_pair]));
                                 }
-                                tmem_st_x4_f32(ks_scratch_addr_cg1 + 4, ks_chunk_cg1);
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 0))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_1] = ks_slice_packed_delta_cg1[0];
+                                const int ks_slice_pair_j_cg1_2 = 3;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_2)[_pair]));
+                                }
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 2))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_2] = ks_slice_packed_delta_cg1[0];
                                 asm volatile(
                                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                     " {%0, %1, %2, %3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[3]))
-                                    : "r"(ks_addr_cg1 + 16));
-                                {
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 2; _ls++)
-                                        mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 8))[_ls]);
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[3]))
+                                    : "r"(ks_slice_src_cg1 + 16));
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 2; _ls++)
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 8))[_ls]);
+                                const int ks_slice_pair_j_cg1_3 = 4;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_3)[_pair]));
                                 }
-                                tmem_st_x4_f32(ks_scratch_addr_cg1 + 8, ks_chunk_cg1);
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 0))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_3] = ks_slice_packed_delta_cg1[0];
+                                const int ks_slice_pair_j_cg1_4 = 5;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_4)[_pair]));
+                                }
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 2))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_4] = ks_slice_packed_delta_cg1[0];
                                 asm volatile(
                                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                     " {%0, %1, %2, %3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[3]))
-                                    : "r"(ks_addr_cg1 + 24));
-                                {
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 2; _ls++)
-                                        mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 12))[_ls]);
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[3]))
+                                    : "r"(ks_slice_src_cg1 + 24));
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 2; _ls++)
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 12))[_ls]);
+                                const int ks_slice_pair_j_cg1_5 = 6;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_5)[_pair]));
                                 }
-                                tmem_st_x4_f32(ks_scratch_addr_cg1 + 12, ks_chunk_cg1);
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 0))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_5] = ks_slice_packed_delta_cg1[0];
+                                const int ks_slice_pair_j_cg1_6 = 7;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_6)[_pair]));
+                                }
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 2))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_6] = ks_slice_packed_delta_cg1[0];
                                 asm volatile(
                                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                     " {%0, %1, %2, %3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[3]))
-                                    : "r"(ks_addr_cg1 + 32));
-                                {
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 2; _ls++)
-                                        mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 16))[_ls]);
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[3]))
+                                    : "r"(ks_slice_src_cg1 + 32));
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 2; _ls++)
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 16))[_ls]);
+                                const int ks_slice_pair_j_cg1_7 = 8;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_7)[_pair]));
                                 }
-                                tmem_st_x4_f32(ks_scratch_addr_cg1 + 16, ks_chunk_cg1);
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 0))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_7] = ks_slice_packed_delta_cg1[0];
+                                const int ks_slice_pair_j_cg1_8 = 9;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_8)[_pair]));
+                                }
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 2))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_8] = ks_slice_packed_delta_cg1[0];
                                 asm volatile(
                                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                     " {%0, %1, %2, %3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[3]))
-                                    : "r"(ks_addr_cg1 + 40));
-                                {
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 2; _ls++)
-                                        mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 20))[_ls]);
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[3]))
+                                    : "r"(ks_slice_src_cg1 + 40));
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 2; _ls++)
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 20))[_ls]);
+                                const int ks_slice_pair_j_cg1_9 = 10;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_9)[_pair]));
                                 }
-                                tmem_st_x4_f32(ks_scratch_addr_cg1 + 20, ks_chunk_cg1);
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 0))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_9] = ks_slice_packed_delta_cg1[0];
+                                const int ks_slice_pair_j_cg1_10 = 11;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_10)[_pair]));
+                                }
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 2))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_10] = ks_slice_packed_delta_cg1[0];
                                 asm volatile(
                                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                     " {%0, %1, %2, %3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[3]))
-                                    : "r"(ks_addr_cg1 + 48));
-                                {
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 2; _ls++)
-                                        mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 24))[_ls]);
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[3]))
+                                    : "r"(ks_slice_src_cg1 + 48));
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 2; _ls++)
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 24))[_ls]);
+                                const int ks_slice_pair_j_cg1_11 = 12;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_11)[_pair]));
                                 }
-                                tmem_st_x4_f32(ks_scratch_addr_cg1 + 24, ks_chunk_cg1);
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 0))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_11] = ks_slice_packed_delta_cg1[0];
+                                const int ks_slice_pair_j_cg1_12 = 13;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_12)[_pair]));
+                                }
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 2))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_12] = ks_slice_packed_delta_cg1[0];
                                 asm volatile(
                                     "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                     " {%0, %1, %2, %3}, [%4];"
-                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1[3]))
-                                    : "r"(ks_addr_cg1 + 56));
-                                {
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 2; _ls++)
-                                        mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 28))[_ls]);
+                                    : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1[3]))
+                                    : "r"(ks_slice_src_cg1 + 56));
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 2; _ls++)
+                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag + 28))[_ls]);
+                                const int ks_slice_pair_j_cg1_13 = 14;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_13)[_pair]));
                                 }
-                                tmem_st_x4_f32(ks_scratch_addr_cg1 + 28, ks_chunk_cg1);
-                                asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 0))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_13] = ks_slice_packed_delta_cg1[0];
+                                const int ks_slice_pair_j_cg1_14 = 15;
+                                #pragma unroll
+                                for (int _pair = 0; _pair < 1; _pair++) {
+                                    asm volatile(
+                                        "{\n\t"
+                                        ".reg .b16 h_lo, h_hi;\n\t"
+                                        ".reg .b32 f_lo, f_hi;\n\t"
+                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                        "}\n"
+                                        : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1[_pair * 2]))
+                                        : "r"((v_frag_cg1 + ks_slice_pair_j_cg1_14)[_pair]));
+                                }
+                                #pragma unroll
+                                for (int _ls = 0; _ls < 1; _ls++)
+                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1 + 2))[_ls]);
+                                #pragma unroll
+                                for (int _lp = 0; _lp < 1; _lp++) {
+                                    __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1[_lp*2 + 0], ks_slice_v_delta_cg1[_lp*2+1 + 0]));
+                                    ks_slice_packed_delta_cg1[_lp] = *(uint32_t*)&_h2;
+                                }
+                                v_frag_cg1[ks_slice_pair_j_cg1_14] = ks_slice_packed_delta_cg1[0];
                             }
                             mbarrier_arrive(cg1_shared_acc_empty_addr);
-                            if (ks_delta_warp_cg1 < 4) {
-                                float ks_pair_cg1[2];
-                                float v_delta_pair_cg1[2];
-                                unsigned int delta_pair_packed_cg1[1];
-                                {
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[_pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[0] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 2));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[1 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[1] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 4));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[2 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[2] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 6));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[3 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[3] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 8));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[4 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[4] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 10));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[5 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[5] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 12));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[6 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[6] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 14));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[7 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[7] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 16));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[8 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[8] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 18));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[9 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[9] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 20));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[10 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[10] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 22));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[11 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[11] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 24));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[12 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[12] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 26));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[13 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[13] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 28));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[14 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[14] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                        " {%0, %1}, [%2];"
-                                        : "=f"(ks_pair_cg1[0]), "=f"(ks_pair_cg1[1])
-                                        : "r"(ks_scratch_addr_cg1 + 30));
-                                    #pragma unroll
-                                    for (int _pair = 0; _pair < 1; _pair++) {
-                                        asm volatile(
-                                            "{\n\t"
-                                            ".reg .b16 h_lo, h_hi;\n\t"
-                                            ".reg .b32 f_lo, f_hi;\n\t"
-                                            "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                            "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                            "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                            "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                            "}\n"
-                                            : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1[_pair * 2]))
-                                            : "r"(v_frag_cg1[15 + _pair]));
-                                    }
-                                    #pragma unroll
-                                    for (int _ls = 0; _ls < 1; _ls++)
-                                        sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1)[_ls]);
-                                    #pragma unroll
-                                    for (int _lp = 0; _lp < 1; _lp++) {
-                                        __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1[_lp*2 + 0], v_delta_pair_cg1[_lp*2+1 + 0]));
-                                        delta_pair_packed_cg1[_lp] = *(uint32_t*)&_h2;
-                                    }
-                                    v_frag_cg1[15] = delta_pair_packed_cg1[0];
-                                    asm volatile(
-                                        "tcgen05.st.sync.aligned.16x128b.x8.b32"
-                                        " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                                        :: "r"(ks_scratch_addr_cg1), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[0])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[1])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[2])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[3])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[4])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[5])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[6])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[7])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[8])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[9])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[10])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[11])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[12])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[13])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[14])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[15])));
-                                }
+                            if (ks_slice_warp_cg1 < 4) {
+                                asm volatile(
+                                    "tcgen05.st.sync.aligned.16x128b.x8.b32"
+                                    " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                                    :: "r"(ks_slice_dst_cg1), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[0])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[1])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[2])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[3])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[4])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[5])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[6])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[7])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[8])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[9])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[10])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[11])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[12])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[13])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[14])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1[15])));
                                 asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                             }
                         }
@@ -2237,561 +2145,468 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4(const __
                         mbarrier_wait(cg1_shared_acc_full_addr, _phase_cg1_shared_acc_full_0);
                         _phase_cg1_shared_acc_full_0 ^= 1;
                         int _uniform_16 = make_warp_uniform(tid >> 5 & 3);
-                        int ks_delta_warp_cg1_1 = make_warp_uniform(_uniform_16);
-                        int ks_scratch_addr_cg1_1 = taddr + 448 + (unsigned int)tmem_row_base_v_1;
-                        if (ks_delta_warp_cg1_1 < 4) {
-                            int ks_addr_cg1_1 = taddr + 384 + (unsigned int)tmem_row_base_v_1;
-                            float ks_chunk_cg1_1[4];
-                            float ks_cumprod_chunk_cg1_1[4];
+                        int ks_slice_warp_cg1_1 = make_warp_uniform(_uniform_16);
+                        int ks_slice_dst_cg1_1 = taddr + 448 + (unsigned int)tmem_row_base_v_1;
+                        if (ks_slice_warp_cg1_1 < 4) {
+                            int ks_slice_src_cg1_1 = taddr + 384 + (unsigned int)tmem_row_base_v_1;
+                            float ks_slice_cg1_1[4];
+                            float ks_slice_v_delta_cg1_1[2];
+                            unsigned int ks_slice_packed_delta_cg1_1[1];
                             asm volatile(
                                 "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                 " {%0, %1, %2, %3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[3]))
-                                : "r"(ks_addr_cg1_1));
-                            {
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 2; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 0))[_ls]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[3]))
+                                : "r"(ks_slice_src_cg1_1));
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 2; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 0))[_ls]);
+                            const int ks_slice_pair_j_cg1_15 = 0;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_15)[_pair]));
                             }
-                            tmem_st_x4_f32(ks_scratch_addr_cg1_1, ks_chunk_cg1_1);
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 0))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_15] = ks_slice_packed_delta_cg1_1[0];
+                            const int ks_slice_pair_j_cg1_0_1 = 1;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_0_1)[_pair]));
+                            }
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 2))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_0_1] = ks_slice_packed_delta_cg1_1[0];
                             asm volatile(
                                 "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                 " {%0, %1, %2, %3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[3]))
-                                : "r"(ks_addr_cg1_1 + 8));
-                            {
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 2; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 4))[_ls]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[3]))
+                                : "r"(ks_slice_src_cg1_1 + 8));
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 2; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 4))[_ls]);
+                            const int ks_slice_pair_j_cg1_1_1 = 2;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_1_1)[_pair]));
                             }
-                            tmem_st_x4_f32(ks_scratch_addr_cg1_1 + 4, ks_chunk_cg1_1);
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 0))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_1_1] = ks_slice_packed_delta_cg1_1[0];
+                            const int ks_slice_pair_j_cg1_2_1 = 3;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_2_1)[_pair]));
+                            }
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 2))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_2_1] = ks_slice_packed_delta_cg1_1[0];
                             asm volatile(
                                 "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                 " {%0, %1, %2, %3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[3]))
-                                : "r"(ks_addr_cg1_1 + 16));
-                            {
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 2; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 8))[_ls]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[3]))
+                                : "r"(ks_slice_src_cg1_1 + 16));
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 2; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 8))[_ls]);
+                            const int ks_slice_pair_j_cg1_3_1 = 4;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_3_1)[_pair]));
                             }
-                            tmem_st_x4_f32(ks_scratch_addr_cg1_1 + 8, ks_chunk_cg1_1);
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 0))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_3_1] = ks_slice_packed_delta_cg1_1[0];
+                            const int ks_slice_pair_j_cg1_4_1 = 5;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_4_1)[_pair]));
+                            }
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 2))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_4_1] = ks_slice_packed_delta_cg1_1[0];
                             asm volatile(
                                 "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                 " {%0, %1, %2, %3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[3]))
-                                : "r"(ks_addr_cg1_1 + 24));
-                            {
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 2; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 12))[_ls]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[3]))
+                                : "r"(ks_slice_src_cg1_1 + 24));
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 2; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 12))[_ls]);
+                            const int ks_slice_pair_j_cg1_5_1 = 6;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_5_1)[_pair]));
                             }
-                            tmem_st_x4_f32(ks_scratch_addr_cg1_1 + 12, ks_chunk_cg1_1);
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 0))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_5_1] = ks_slice_packed_delta_cg1_1[0];
+                            const int ks_slice_pair_j_cg1_6_1 = 7;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_6_1)[_pair]));
+                            }
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 2))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_6_1] = ks_slice_packed_delta_cg1_1[0];
                             asm volatile(
                                 "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                 " {%0, %1, %2, %3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[3]))
-                                : "r"(ks_addr_cg1_1 + 32));
-                            {
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 2; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 16))[_ls]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[3]))
+                                : "r"(ks_slice_src_cg1_1 + 32));
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 2; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 16))[_ls]);
+                            const int ks_slice_pair_j_cg1_7_1 = 8;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_7_1)[_pair]));
                             }
-                            tmem_st_x4_f32(ks_scratch_addr_cg1_1 + 16, ks_chunk_cg1_1);
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 0))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_7_1] = ks_slice_packed_delta_cg1_1[0];
+                            const int ks_slice_pair_j_cg1_8_1 = 9;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_8_1)[_pair]));
+                            }
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 2))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_8_1] = ks_slice_packed_delta_cg1_1[0];
                             asm volatile(
                                 "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                 " {%0, %1, %2, %3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[3]))
-                                : "r"(ks_addr_cg1_1 + 40));
-                            {
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 2; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 20))[_ls]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[3]))
+                                : "r"(ks_slice_src_cg1_1 + 40));
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 2; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 20))[_ls]);
+                            const int ks_slice_pair_j_cg1_9_1 = 10;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_9_1)[_pair]));
                             }
-                            tmem_st_x4_f32(ks_scratch_addr_cg1_1 + 20, ks_chunk_cg1_1);
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 0))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_9_1] = ks_slice_packed_delta_cg1_1[0];
+                            const int ks_slice_pair_j_cg1_10_1 = 11;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_10_1)[_pair]));
+                            }
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 2))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_10_1] = ks_slice_packed_delta_cg1_1[0];
                             asm volatile(
                                 "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                 " {%0, %1, %2, %3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[3]))
-                                : "r"(ks_addr_cg1_1 + 48));
-                            {
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 2; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 24))[_ls]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[3]))
+                                : "r"(ks_slice_src_cg1_1 + 48));
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 2; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 24))[_ls]);
+                            const int ks_slice_pair_j_cg1_11_1 = 12;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_11_1)[_pair]));
                             }
-                            tmem_st_x4_f32(ks_scratch_addr_cg1_1 + 24, ks_chunk_cg1_1);
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 0))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_11_1] = ks_slice_packed_delta_cg1_1[0];
+                            const int ks_slice_pair_j_cg1_12_1 = 13;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_12_1)[_pair]));
+                            }
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 2))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_12_1] = ks_slice_packed_delta_cg1_1[0];
                             asm volatile(
                                 "tcgen05.ld.sync.aligned.16x256b.x1.b32"
                                 " {%0, %1, %2, %3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_chunk_cg1_1[3]))
-                                : "r"(ks_addr_cg1_1 + 56));
-                            {
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 2; _ls++)
-                                    mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_chunk_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 28))[_ls]);
+                                : "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[0])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[1])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[2])), "=r"(*reinterpret_cast<uint32_t*>(&ks_slice_cg1_1[3]))
+                                : "r"(ks_slice_src_cg1_1 + 56));
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 2; _ls++)
+                                mul_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_cg1_1)[_ls], reinterpret_cast<const float2*>((cg1_cumprod_frag_1 + 28))[_ls]);
+                            const int ks_slice_pair_j_cg1_13_1 = 14;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_13_1)[_pair]));
                             }
-                            tmem_st_x4_f32(ks_scratch_addr_cg1_1 + 28, ks_chunk_cg1_1);
-                            asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 0))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_13_1] = ks_slice_packed_delta_cg1_1[0];
+                            const int ks_slice_pair_j_cg1_14_1 = 15;
+                            #pragma unroll
+                            for (int _pair = 0; _pair < 1; _pair++) {
+                                asm volatile(
+                                    "{\n\t"
+                                    ".reg .b16 h_lo, h_hi;\n\t"
+                                    ".reg .b32 f_lo, f_hi;\n\t"
+                                    "mov.b32 {h_lo, h_hi}, %1;\n\t"
+                                    "cvt.f32.f16 f_lo, h_lo;\n\t"
+                                    "cvt.f32.f16 f_hi, h_hi;\n\t"
+                                    "mov.b64 %0, {f_lo, f_hi};\n\t"
+                                    "}\n"
+                                    : "=l"(*reinterpret_cast<unsigned long long*>(&ks_slice_v_delta_cg1_1[_pair * 2]))
+                                    : "r"((v_frag_cg1_1 + ks_slice_pair_j_cg1_14_1)[_pair]));
+                            }
+                            #pragma unroll
+                            for (int _ls = 0; _ls < 1; _ls++)
+                                sub_f32x2_inplace(&reinterpret_cast<float2*>(ks_slice_v_delta_cg1_1)[_ls], reinterpret_cast<const float2*>((ks_slice_cg1_1 + 2))[_ls]);
+                            #pragma unroll
+                            for (int _lp = 0; _lp < 1; _lp++) {
+                                __half2 _h2 = __float22half2_rn(make_float2(ks_slice_v_delta_cg1_1[_lp*2 + 0], ks_slice_v_delta_cg1_1[_lp*2+1 + 0]));
+                                ks_slice_packed_delta_cg1_1[_lp] = *(uint32_t*)&_h2;
+                            }
+                            v_frag_cg1_1[ks_slice_pair_j_cg1_14_1] = ks_slice_packed_delta_cg1_1[0];
                         }
                         mbarrier_arrive(cg1_shared_acc_empty_addr);
-                        if (ks_delta_warp_cg1_1 < 4) {
-                            float ks_pair_cg1_1[2];
-                            float v_delta_pair_cg1_1[2];
-                            unsigned int delta_pair_packed_cg1_1[1];
-                            {
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[_pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[0] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 2));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[1 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[1] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 4));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[2 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[2] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 6));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[3 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[3] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 8));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[4 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[4] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 10));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[5 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[5] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 12));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[6 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[6] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 14));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[7 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[7] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 16));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[8 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[8] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 18));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[9 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[9] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 20));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[10 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[10] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 22));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[11 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[11] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 24));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[12 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[12] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 26));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[13 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[13] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 28));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[14 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[14] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.ld.sync.aligned.32x32b.x2.b32"
-                                    " {%0, %1}, [%2];"
-                                    : "=f"(ks_pair_cg1_1[0]), "=f"(ks_pair_cg1_1[1])
-                                    : "r"(ks_scratch_addr_cg1_1 + 30));
-                                #pragma unroll
-                                for (int _pair = 0; _pair < 1; _pair++) {
-                                    asm volatile(
-                                        "{\n\t"
-                                        ".reg .b16 h_lo, h_hi;\n\t"
-                                        ".reg .b32 f_lo, f_hi;\n\t"
-                                        "mov.b32 {h_lo, h_hi}, %1;\n\t"
-                                        "cvt.f32.f16 f_lo, h_lo;\n\t"
-                                        "cvt.f32.f16 f_hi, h_hi;\n\t"
-                                        "mov.b64 %0, {f_lo, f_hi};\n\t"
-                                        "}\n"
-                                        : "=l"(*reinterpret_cast<unsigned long long*>(&v_delta_pair_cg1_1[_pair * 2]))
-                                        : "r"(v_frag_cg1_1[15 + _pair]));
-                                }
-                                #pragma unroll
-                                for (int _ls = 0; _ls < 1; _ls++)
-                                    sub_f32x2_inplace(&reinterpret_cast<float2*>(v_delta_pair_cg1_1)[_ls], reinterpret_cast<const float2*>(ks_pair_cg1_1)[_ls]);
-                                #pragma unroll
-                                for (int _lp = 0; _lp < 1; _lp++) {
-                                    __half2 _h2 = __float22half2_rn(make_float2(v_delta_pair_cg1_1[_lp*2 + 0], v_delta_pair_cg1_1[_lp*2+1 + 0]));
-                                    delta_pair_packed_cg1_1[_lp] = *(uint32_t*)&_h2;
-                                }
-                                v_frag_cg1_1[15] = delta_pair_packed_cg1_1[0];
-                                asm volatile(
-                                    "tcgen05.st.sync.aligned.16x128b.x8.b32"
-                                    " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
-                                    :: "r"(ks_scratch_addr_cg1_1), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[15])));
-                            }
+                        if (ks_slice_warp_cg1_1 < 4) {
+                            asm volatile(
+                                "tcgen05.st.sync.aligned.16x128b.x8.b32"
+                                " [%0], {%1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16};"
+                                :: "r"(ks_slice_dst_cg1_1), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[0])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[1])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[2])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[3])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[4])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[5])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[6])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[7])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[8])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[9])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[10])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[11])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[12])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[13])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[14])), "r"(*reinterpret_cast<const uint32_t*>(&v_frag_cg1_1[15])));
                             asm volatile("tcgen05.wait::st.sync.aligned;" ::: "memory");
                         }
                     }
@@ -4049,7 +3864,8 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4(const __
                         if (gb_lane >= 16) {
                             gate_log_1 = gate_log_1 + _shfl_up_9;
                         }
-                        float _shfl_1 = __shfl_sync(0xFFFFFFFF, gate_log_0, 31);
+                        float _shfl_1;
+                        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_1) : "f"(gate_log_0), "r"(31));
                         gate_log_1 = gate_log_1 + _shfl_1;
                         smem_cumsumlog[gate_elem_base + gb_lane] = gate_log_0;
                         smem_cumsumlog[gate_elem_base + gb_lane + 32] = gate_log_1;
@@ -4157,7 +3973,8 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4(const __
                             if (gb_lane_1 >= 16) {
                                 gate_log_1_1 = gate_log_1_1 + _shfl_up_19;
                             }
-                            float _shfl_2 = __shfl_sync(0xFFFFFFFF, gate_log_0_1, 31);
+                            float _shfl_2;
+                            asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_2) : "f"(gate_log_0_1), "r"(31));
                             gate_log_1_1 = gate_log_1_1 + _shfl_2;
                             smem_cumsumlog[gate_elem_base_1 + gb_lane_1] = gate_log_0_1;
                             smem_cumsumlog[gate_elem_base_1 + gb_lane_1 + 32] = gate_log_1_1;
@@ -4270,7 +4087,8 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4(const __
                         if (gb_lane_2 >= 16) {
                             gate_log_1_2 = gate_log_1_2 + _shfl_up_29;
                         }
-                        float _shfl_3 = __shfl_sync(0xFFFFFFFF, gate_log_0_2, 31);
+                        float _shfl_3;
+                        asm volatile("shfl.sync.idx.b32 %0, %1, %2, 0x1f, 0xffffffff;" : "=f"(_shfl_3) : "f"(gate_log_0_2), "r"(31));
                         gate_log_1_2 = gate_log_1_2 + _shfl_3;
                         smem_cumsumlog[gate_elem_base_2 + gb_lane_2] = gate_log_0_2;
                         smem_cumsumlog[gate_elem_base_2 + gb_lane_2 + 32] = gate_log_1_2;
@@ -4345,7 +4163,7 @@ kernel_flashinfer_blackwell_gdn_prefill_dvsplit_initial_f16io_gatepipe4(const __
 #undef ENABLE_CHECKPOINTS
 #undef HEAD_GROUP_LOG2
 #undef IS_GQA
-#undef CAKE_GDN_INF
+#undef GDN_NONCP_INF
 #undef NUM_AINV_PIPE_STAGES
 #undef NUM_CG0_ACC_PIPE_STAGES
 #undef NUM_GATE_PIPE_STAGES

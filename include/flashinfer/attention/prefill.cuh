@@ -69,46 +69,6 @@ constexpr uint32_t WARP_SIZE = 32;
 // Number of NVFP4 elements sharing one scale factor (UE4M3 byte).
 constexpr uint32_t NVFP4_SF_VEC_SIZE = 16;
 
-// Which E2M1-conversion regimes this translation unit is being built for.
-//
-// The NVFP4 tile repack exists to keep the software E2M1 -> 16-bit conversion out of the fully
-// unrolled MMA loops, where its instruction footprint starves the fetch pipe. From SM100 that
-// conversion is a single instruction, the premise does not hold, and the staging buffer would cost
-// shared memory -- and a smaller NUM_MMA_KV, since the occupancy budget counts it -- for nothing.
-//
-// The decision therefore has to be visible to the host, which sizes the storage and picks
-// NUM_MMA_KV, not just to the device. `__CUDA_ARCH__` is not, but `__CUDA_ARCH_LIST__` is: it holds
-// every target of this module in both passes. A module built for one regime hard-codes the answer
-// and instantiates a single variant; a module built for both (the release wheel bundles SM7.5
-// through SM12.x) instantiates both and the launcher picks by the device's compute capability.
-#if defined(__CUDA_ARCH_LIST__)
-namespace fp4_repack_targets {
-constexpr int kArchs[] = {__CUDA_ARCH_LIST__};
-constexpr bool any_below(int bound) {
-  for (int arch : kArchs) {
-    if (arch < bound) return true;
-  }
-  return false;
-}
-constexpr bool any_at_least(int bound) {
-  for (int arch : kArchs) {
-    if (arch >= bound) return true;
-  }
-  return false;
-}
-}  // namespace fp4_repack_targets
-// Targets that need the software conversion, i.e. that the repack is for.
-constexpr bool kTargetsSoftwareE2M1 = fp4_repack_targets::any_below(1000);
-// Targets whose E2M1 conversion is a single instruction, i.e. that must not pay for the repack.
-constexpr bool kTargetsNativeE2M1 = fp4_repack_targets::any_at_least(1000);
-#else
-// No arch list (host-only or non-nvcc translation): assume both, which forces the runtime choice.
-constexpr bool kTargetsSoftwareE2M1 = true;
-constexpr bool kTargetsNativeE2M1 = true;
-#endif
-// True when one instantiation cannot serve every target of this module.
-constexpr bool kFp4RepackNeedsRuntimeChoice = kTargetsSoftwareE2M1 && kTargetsNativeE2M1;
-
 /*!
  * \brief Convert four NVFP4 scale-factor bytes into two packed 16-bit pairs.
  *
@@ -199,15 +159,23 @@ struct KVScaleFactorSmem<DTypeKV, CTA_TILE_KV, HEAD_DIM_QK, HEAD_DIM_VO, true> {
 // budget all go through this, so they cannot drift apart -- which is what would silently reserve
 // (and charge NUM_MMA_KV for) a staging buffer the device never reads.
 //
-// ENABLE_FP4_REPACK is the per-variant answer to "does this instantiation serve targets whose E2M1
-// conversion is a software sequence"; see kTargetsSoftwareE2M1 above. It only gates FP4: FP8 keeps
-// the policy it has always had.
+// ENABLE_FP4_REPACK answers "does the launcher instantiating these traits implement the FP4 repack
+// in its mainloop". The prefill launchers below do, and pass true. The POD, batched-POD and
+// persistent kernels reuse KernelTraits but have no repack call site, so they take the default
+// false and keep FP4 on the in-loop path; flipping it for them would reserve a staging buffer their
+// mainloop never writes or reads. It only gates FP4: FP8 keeps the policy it has always had.
 template <typename DTypeKV, uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO>
 constexpr bool use_kv_repack(bool enable_fp4_repack) {
   return (sizeof(DTypeKV) == 1) && (HEAD_DIM_VO != 64) && (HEAD_DIM_VO <= 256) &&
          (CTA_TILE_Q > 16) &&
          (!is_fp4_type_v<DTypeKV> || (HEAD_DIM_QK <= 256 && enable_fp4_repack));
 }
+
+// The three FA2 prefill launchers below repack one-byte KV tiles in their mainloops, so the traits
+// they instantiate carry the capability. Their shared-memory budget and their KernelTraits read
+// this same constant: letting the two disagree would size the budget for a staging buffer the
+// kernel does not use, or the reverse.
+constexpr bool kPrefillLauncherRepacksFp4 = true;
 
 template <typename DTypeQ, typename DTypeKV, uint32_t CTA_TILE_Q, uint32_t CTA_TILE_KV,
           uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, bool ENABLE_FP4_REPACK,
@@ -398,7 +366,7 @@ struct KernelTraits {
   // The staging buffer is sized max(HEAD_DIM_QK, HEAD_DIM_VO), so an asymmetric FP4 shape with a
   // large HEAD_DIM_QK (e.g. 480 with HEAD_DIM_VO 128) would need more smem than the in-loop path
   // it replaces, leaving no launchable NUM_MMA_KV. Bound HEAD_DIM_QK the same way HEAD_DIM_VO is.
-  // ENABLE_FP4_REPACK_ carries the target-regime answer; see kTargetsSoftwareE2M1.
+  // ENABLE_FP4_REPACK_ carries the launcher's repack capability; see use_kv_repack above.
   static constexpr bool ENABLE_FP4_REPACK = ENABLE_FP4_REPACK_;
   static constexpr bool USE_KV_REPACK =
       use_kv_repack<DTypeKV_, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(ENABLE_FP4_REPACK_);
@@ -2521,10 +2489,10 @@ __device__ __forceinline__ void SinglePrefillWithKVCacheDevice(
       // buffer -- it shares SharedStorage with the ragged kernel, and USE_KV_REPACK decides both --
       // the buffer is already counted in the NUM_MMA_KV budget, so leaving FP4 on the in-loop path
       // would spend that shared memory for nothing. FP8 keeps the in-loop path it has always taken
-      // here: switching it over is a behavior change this PR does not measure, and single prefill
-      // has no FP8 KV test to catch a regression. The target-regime decision
-      // (KTraits::ENABLE_FP4_REPACK) is already folded into USE_KV_REPACK, so a native-only build
-      // has no staging buffer to spend in the first place.
+      // here: switching it over would change behavior nobody has measured, and single prefill has
+      // no FP8 KV test to catch a regression. The launcher's repack capability
+      // (KTraits::ENABLE_FP4_REPACK) is already folded into USE_KV_REPACK, so a caller without a
+      // repack call site has no staging buffer to spend in the first place.
       constexpr bool kRepackActive = KTraits::USE_KV_REPACK && is_fp4_type_v<DTypeKV>;
       // One-byte-KV repack path: 16-bit staging buffers + their (16-bit-strided) read offsets.
       // Guard the offsets so the stride-8 get_permuted_offset isn't instantiated for the k64B
@@ -2752,34 +2720,11 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void SinglePrefillWithKVCache
   SinglePrefillWithKVCacheDevice<KTraits>(params, smem_storage);
 }
 
-// Selects the NVFP4 repack variant. The whole launcher body -- shared-memory budget, NUM_MMA_KV
-// choice, storage type and kernel -- is templated on the policy, so every one of them sees the same
-// answer; splitting later would leave the budget sized for a staging buffer the kernel may not use.
-//
-// A module built for one E2M1 regime folds this to a single instantiation. Only a repack-eligible
-// NVFP4 configuration in a module spanning both regimes builds two and picks by the device.
-#define FLASHINFER_DISPATCH_FP4_REPACK(DTypeKV_, CTA_TILE_Q_, HEAD_DIM_QK_, HEAD_DIM_VO_, CALL) \
-  {                                                                                             \
-    constexpr bool kVariesAtRuntime =                                                           \
-        is_fp4_type_v<DTypeKV_> && kFp4RepackNeedsRuntimeChoice &&                              \
-        use_kv_repack<DTypeKV_, CTA_TILE_Q_, HEAD_DIM_QK_, HEAD_DIM_VO_>(true);                 \
-    if constexpr (!kVariesAtRuntime) {                                                          \
-      constexpr bool kEnable = (!is_fp4_type_v<DTypeKV_>) || kTargetsSoftwareE2M1;              \
-      return CALL(kEnable);                                                                     \
-    } else {                                                                                    \
-      int fp4_dev_id = 0, cc_major = 0;                                                         \
-      FLASHINFER_CUDA_CALL(cudaGetDevice(&fp4_dev_id));                                         \
-      FLASHINFER_CUDA_CALL(                                                                     \
-          cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, fp4_dev_id));    \
-      return cc_major < 10 ? CALL(true) : CALL(false);                                          \
-    }                                                                                           \
-  }
-
 template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
           bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params, bool ENABLE_FP4_REPACK>
-cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Params::DTypeO* tmp,
-                                                   cudaStream_t stream) {
+          typename Params>
+cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
+                                               cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -2834,7 +2779,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
     // the occupancy budget. Single prefill uses the repack for NVFP4 only, but the
     // buffer lives in SharedStorageQKVO for FP8 too, so it must be accounted.
     constexpr bool kUseRepack =
-        use_kv_repack<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(ENABLE_FP4_REPACK);
+        use_kv_repack<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(kPrefillLauncherRepacksFp4);
     constexpr bool kKVShared = !is_fp4_type_v<DTypeKV> && (HEAD_DIM_VO / 16 > 16) &&
                                ((HEAD_DIM_VO / 16) % NUM_WARPS_KV == 0) &&
                                (HEAD_DIM_QK == HEAD_DIM_VO) &&
@@ -2895,7 +2840,7 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
               KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                            NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
                            DTypeQKAccum, typename Params::IdType, AttentionVariant,
-                           ENABLE_FP4_REPACK>;
+                           kPrefillLauncherRepacksFp4>;
           if constexpr (KTraits::IsInvalid()) {
             // Invalid configuration, skip
             std::ostringstream err_msg;
@@ -2975,24 +2920,6 @@ cudaError_t SinglePrefillWithKVCacheDispatchedImpl(Params params, typename Param
         })
   });
   return cudaSuccess;
-}
-
-template <uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO, PosEncodingMode POS_ENCODING_MODE,
-          bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE, typename AttentionVariant,
-          typename Params>
-cudaError_t SinglePrefillWithKVCacheDispatched(Params params, typename Params::DTypeO* tmp,
-                                               cudaStream_t stream) {
-#define FLASHINFER_SINGLE_PREFILL_CALL(EN)                                                    \
-  (SinglePrefillWithKVCacheDispatchedImpl<HEAD_DIM_QK, HEAD_DIM_VO, POS_ENCODING_MODE,        \
-                                          USE_FP16_QK_REDUCTION, MASK_MODE, AttentionVariant, \
-                                          Params, EN>(params, tmp, stream))
-  // Single prefill dispatches CTA_TILE_Q inside the Impl, so the eligibility probe here uses a
-  // CTA that can be repack-eligible: it answers "could any CTA tile in this specialization take
-  // the repack", not "does this particular one". A mixed-architecture build therefore emits both
-  // policy variants for the whole specialization, including its CTA_TILE_Q=16 kernels.
-  FLASHINFER_DISPATCH_FP4_REPACK(typename Params::DTypeKV, 128u, HEAD_DIM_QK, HEAD_DIM_VO,
-                                 FLASHINFER_SINGLE_PREFILL_CALL)
-#undef FLASHINFER_SINGLE_PREFILL_CALL
 }
 
 // VO-split helpers used by large-head prefill kernels. Definitions live below the
@@ -3252,8 +3179,8 @@ __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithRaggedKV
                    warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
                    lane_idx % KV_THR_LAYOUT_COL);
 
-      // The target-regime decision lives in the instantiation (KTraits::ENABLE_FP4_REPACK), so it
-      // is already folded into USE_KV_REPACK here.
+      // The launcher's repack capability (KTraits::ENABLE_FP4_REPACK) is already folded into
+      // USE_KV_REPACK here.
       constexpr bool kRepackActive = KTraits::USE_KV_REPACK;
       // One-byte KV repack path: 16-bit staging buffers + their (16-bit-strided) read offsets.
       // Guard offsets by USE_KV_REPACK so the stride-8 get_permuted_offset isn't
@@ -3796,7 +3723,7 @@ __device__ __forceinline__ void vosplit_write_o(
   }
 }
 
-template <typename KTraits, typename Params, typename SmemStorage>
+template <typename KTraits, bool SAME_KV_STRIDES = false, typename Params, typename SmemStorage>
 __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
     const Params params, SmemStorage& smem_storage, const dim3 tid = threadIdx,
     const uint32_t bx = blockIdx.x, const uint32_t kv_head_idx = blockIdx.z,
@@ -4010,8 +3937,9 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       // smem path computes offsets on the fly, so the arrays collapse to [1] stubs there.
       [[maybe_unused]] size_t
           thr_local_kv_offset_k[KTraits::USE_KV_SHARED_SMEM ? 1 : NUM_PAGED_KV_OFFSETS];
-      [[maybe_unused]] size_t
-          thr_local_kv_offset_v[KTraits::USE_KV_SHARED_SMEM ? 1 : NUM_PAGED_KV_OFFSETS];
+      [[maybe_unused]] size_t thr_local_kv_offset_v[KTraits::USE_KV_SHARED_SMEM || SAME_KV_STRIDES
+                                                        ? 1
+                                                        : NUM_PAGED_KV_OFFSETS];
 
       uint32_t k_smem_offset_r = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                    get_warp_idx_kv<KTraits>(tid.z) * NUM_MMA_KV * 16 + 8 * (lane_idx / 16) +
@@ -4020,8 +3948,8 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                k_smem_offset_w = k_smem.template get_permuted_offset<UPCAST_STRIDE_K>(
                    warp_idx * KV_THR_LAYOUT_ROW + lane_idx / KV_THR_LAYOUT_COL,
                    lane_idx % KV_THR_LAYOUT_COL);
-      // The target-regime decision lives in the instantiation (KTraits::ENABLE_FP4_REPACK), so it
-      // is already folded into USE_KV_REPACK here.
+      // The launcher's repack capability (KTraits::ENABLE_FP4_REPACK) is already folded into
+      // USE_KV_REPACK here.
       constexpr bool kRepackActive = KTraits::USE_KV_REPACK;
       [[maybe_unused]] uint32_t v_smem_offset_r = 0;
       uint32_t v_smem_offset_w = v_smem.template get_permuted_offset<UPCAST_STRIDE_V>(
@@ -4070,8 +3998,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
               (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
           thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
               page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
-          thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
-              page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+          if constexpr (!SAME_KV_STRIDES) {
+            thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+                page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+          }
         }
         page_produce_kv<false, KTraits>(&smem_storage, &k_smem_offset_w, paged_kv.k_data, 0,
                                         thr_local_kv_offset_k, chunk_size, warp_idx, lane_idx);
@@ -4083,8 +4013,13 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
       cp_async::commit_group();
       // Shared K/V loads V(0) inside iter 0 after Q.K^T; preloading it would clobber K(0).
       if constexpr (!KTraits::USE_KV_SHARED_SMEM) {
-        page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
-                                       thr_local_kv_offset_v, chunk_size, warp_idx, lane_idx);
+        if constexpr (SAME_KV_STRIDES) {
+          page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
+                                         thr_local_kv_offset_k, chunk_size, warp_idx, lane_idx);
+        } else {
+          page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data, 0,
+                                         thr_local_kv_offset_v, chunk_size, warp_idx, lane_idx);
+        }
         page_produce_kv_sf<true, KTraits>(&smem_storage, maybe_v_cache_sf, packed_page_iter_base,
                                           last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx,
                                           v_sf_stride_page, v_sf_stride_h, v_sf_stride_n,
@@ -4177,8 +4112,10 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
                 (lane_idx % KV_THR_LAYOUT_COL) * upcast_size<DTypeKV>() / fp4_pack_factor;
             thr_local_kv_offset_k[i] = paged_kv.protective_get_k_offset(
                 page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
-            thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
-                page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+            if constexpr (!SAME_KV_STRIDES) {
+              thr_local_kv_offset_v[i] = paged_kv.protective_get_v_offset(
+                  page_iter, kv_head_idx, entry_idx, feat_idx, last_indptr);
+            }
           }
         }
         // Shared K/V serializes loads (no K/V prefetch overlap) -> drain fully.
@@ -4331,9 +4268,15 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
           cp_async::commit_group();
           packed_page_iter_base = next_packed_page_iter_base;
         } else {
-          page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
-                                         (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_v,
-                                         chunk_size, warp_idx, lane_idx);
+          if constexpr (SAME_KV_STRIDES) {
+            page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
+                                           (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_k,
+                                           chunk_size, warp_idx, lane_idx);
+          } else {
+            page_produce_kv<true, KTraits>(&smem_storage, &v_smem_offset_w, paged_kv.v_data,
+                                           (iter + 1) * CTA_TILE_KV, thr_local_kv_offset_v,
+                                           chunk_size, warp_idx, lane_idx);
+          }
           page_produce_kv_sf<true, KTraits>(
               &smem_storage, maybe_v_cache_sf, packed_page_iter_base,
               last_indptr * (uint32_t)paged_kv.page_size, kv_head_idx, v_sf_stride_page,
@@ -4412,21 +4355,20 @@ __device__ __forceinline__ void BatchPrefillWithPagedKVCacheDevice(
 #endif
 }
 
-template <typename KTraits, typename Params>
+template <bool SAME_KV_STRIDES, typename KTraits, typename Params>
 __global__ __launch_bounds__(KTraits::NUM_THREADS) void BatchPrefillWithPagedKVCacheKernel(
     const __grid_constant__ Params params) {
   extern __shared__ uint8_t smem[];
   auto& smem_storage = reinterpret_cast<typename KTraits::SharedStoragePaged&>(smem);
-  BatchPrefillWithPagedKVCacheDevice<KTraits>(params, smem_storage);
+  BatchPrefillWithPagedKVCacheDevice<KTraits, SAME_KV_STRIDES>(params, smem_storage);
 }
 
 template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename AttentionVariant, typename Params, bool ENABLE_FP4_REPACK>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatchedImpl(Params params,
-                                                        typename Params::DTypeO* tmp_v,
-                                                        float* tmp_s, bool enable_pdl,
-                                                        cudaStream_t stream) {
+          typename AttentionVariant, typename Params>
+cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
+                                                    float* tmp_s, bool enable_pdl,
+                                                    cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -4473,7 +4415,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatchedImpl(Params params,
   // is active, so NUM_MMA_KV is chosen to keep base+staging within the occupancy
   // budget (otherwise the staging silently drops blocks/SM at large head dims).
   constexpr bool kUseRepack =
-      use_kv_repack<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(ENABLE_FP4_REPACK);
+      use_kv_repack<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(kPrefillLauncherRepacksFp4);
   // Matches KernelTraits::USE_KV_SHARED_SMEM: at large head dims K and V
   // time-share one smem buffer, so the occupancy budget counts the K/V
   // footprint once exactly when the kernel actually shares it.
@@ -4542,7 +4484,7 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatchedImpl(Params params,
         using KTraits = KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK,
                                      NUM_MMA_D_VO, NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE,
                                      DTypeQ, DTypeKV, DTypeO, DTypeQKAccum, typename Params::IdType,
-                                     AttentionVariant, ENABLE_FP4_REPACK>;
+                                     AttentionVariant, kPrefillLauncherRepacksFp4>;
         if constexpr (KTraits::IsInvalid()) {
           // Invalid configuration, skip
           std::ostringstream err_msg;
@@ -4626,28 +4568,12 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatchedImpl(Params params,
   return cudaSuccess;
 }
 
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
+template <bool SAME_KV_STRIDES, uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
           PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
           typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                    float* tmp_s, bool enable_pdl,
-                                                    cudaStream_t stream) {
-#define FLASHINFER_RAGGED_PREFILL_CALL(EN)                                               \
-  (BatchPrefillWithRaggedKVCacheDispatchedImpl<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,     \
-                                               POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, \
-                                               MASK_MODE, AttentionVariant, Params, EN>( \
-      params, tmp_v, tmp_s, enable_pdl, stream))
-  FLASHINFER_DISPATCH_FP4_REPACK(typename Params::DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
-                                 FLASHINFER_RAGGED_PREFILL_CALL)
-#undef FLASHINFER_RAGGED_PREFILL_CALL
-}
-
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
-          PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename AttentionVariant, typename Params, bool ENABLE_FP4_REPACK>
-cudaError_t BatchPrefillWithPagedKVCacheDispatchedImpl(Params params,
-                                                       typename Params::DTypeO* tmp_v, float* tmp_s,
-                                                       bool enable_pdl, cudaStream_t stream) {
+cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
+                                                   float* tmp_s, bool enable_pdl,
+                                                   cudaStream_t stream) {
   using DTypeQ = typename Params::DTypeQ;
   using DTypeKV = typename Params::DTypeKV;
   using DTypeO = typename Params::DTypeO;
@@ -4692,7 +4618,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatchedImpl(Params params,
   // is active, so NUM_MMA_KV is chosen to keep base+staging within the occupancy
   // budget (otherwise the staging silently drops blocks/SM at large head dims).
   constexpr bool kUseRepack =
-      use_kv_repack<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(ENABLE_FP4_REPACK);
+      use_kv_repack<DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(kPrefillLauncherRepacksFp4);
   // Matches KernelTraits::USE_KV_SHARED_SMEM: K/V share one smem buffer for bf16/fp16 at every
   // tile and for FP8 only at CTA_TILE_Q=32 (not NVFP4), so the occupancy budget counts the K/V
   // footprint once exactly when the kernel actually shares it.
@@ -4754,7 +4680,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatchedImpl(Params params,
         using KTraits = KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK,
                                      NUM_MMA_D_VO, NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE,
                                      DTypeQ, DTypeKV, DTypeO, DTypeQKAccum, typename Params::IdType,
-                                     AttentionVariant, ENABLE_FP4_REPACK>;
+                                     AttentionVariant, kPrefillLauncherRepacksFp4>;
         if constexpr (KTraits::IsInvalid()) {
           // Invalid configuration, skip
           std::ostringstream err_msg;
@@ -4767,7 +4693,7 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatchedImpl(Params params,
           FLASHINFER_ERROR(err_msg.str());
         } else {
           size_t smem_size = sizeof(typename KTraits::SharedStoragePaged);
-          auto kernel = BatchPrefillWithPagedKVCacheKernel<KTraits, Params>;
+          auto kernel = BatchPrefillWithPagedKVCacheKernel<SAME_KV_STRIDES, KTraits, Params>;
           // Exact final check: the analytic NUM_MMA_KV budget can slightly
           // under-count the real struct (cross-warp merge buffers, padding);
           // fail with a clear error instead of a launch-time cudaErrorInvalidValue.
@@ -4832,22 +4758,6 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatchedImpl(Params params,
         }
       });
   return cudaSuccess;
-}
-
-template <uint32_t CTA_TILE_Q, uint32_t HEAD_DIM_QK, uint32_t HEAD_DIM_VO,
-          PosEncodingMode POS_ENCODING_MODE, bool USE_FP16_QK_REDUCTION, MaskMode MASK_MODE,
-          typename AttentionVariant, typename Params>
-cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Params::DTypeO* tmp_v,
-                                                   float* tmp_s, bool enable_pdl,
-                                                   cudaStream_t stream) {
-#define FLASHINFER_PAGED_PREFILL_CALL(EN)                                                          \
-  (BatchPrefillWithPagedKVCacheDispatchedImpl<CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,                \
-                                              POS_ENCODING_MODE, USE_FP16_QK_REDUCTION, MASK_MODE, \
-                                              AttentionVariant, Params, EN>(params, tmp_v, tmp_s,  \
-                                                                            enable_pdl, stream))
-  FLASHINFER_DISPATCH_FP4_REPACK(typename Params::DTypeKV, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO,
-                                 FLASHINFER_PAGED_PREFILL_CALL)
-#undef FLASHINFER_PAGED_PREFILL_CALL
 }
 
 }  // namespace flashinfer

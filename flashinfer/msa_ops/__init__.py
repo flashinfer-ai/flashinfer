@@ -8,12 +8,23 @@ import torch
 
 from ..utils import get_compute_capability
 from ._blackwell_sm100 import MSASparseAttentionWorkspace
+from ._nvfp4_decode_sm100 import (
+    msa_decode_nvfp4_specialized_stats,
+    warm as msa_decode_nvfp4_specialized_warmup,
+)
+from ._nvfp4_prefill_sm100 import (
+    msa_prefill_nvfp4_specialized_stats,
+    warm as msa_prefill_nvfp4_specialized_warmup,
+)
 from .proxy_score import (
     msa_proxy_score,
     msa_proxy_score_fp4,
 )
 from .sparse_prefill import msa_sparse_attention
-from .sparse_decode import msa_sparse_decode_attention
+from .sparse_decode import (
+    msa_sparse_decode_attention,
+    prepare_msa_nvfp4_sparse_decode,
+)
 from .sparse_topk_select import msa_topk_select
 
 # Legacy aggregate capability flag retained for callers that only target
@@ -33,10 +44,15 @@ def supports_packed_kv(device: torch.device | str) -> bool:
 __all__ = [
     "MSASparseAttentionWorkspace",
     "SUPPORTS_PACKED_KV",
+    "msa_decode_nvfp4_specialized_stats",
+    "msa_decode_nvfp4_specialized_warmup",
+    "msa_prefill_nvfp4_specialized_stats",
+    "msa_prefill_nvfp4_specialized_warmup",
     "msa_proxy_score",
     "msa_proxy_score_fp4",
     "msa_sparse_attention",
     "msa_sparse_decode_attention",
     "msa_topk_select",
+    "prepare_msa_nvfp4_sparse_decode",
     "supports_packed_kv",
 ]

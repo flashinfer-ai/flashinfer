@@ -29,8 +29,8 @@ import torch
 
 pytest.importorskip(
     "cutlass",
-    minversion="4.7.0",
-    reason="PrimTS attention tests require nvidia-cutlass-dsl==4.7.0",
+    minversion="4.7.0a0",
+    reason="PrimTS attention tests require nvidia-cutlass-dsl>=4.7.0a0",
 )
 
 from cutlass import BFloat16, Float16, Float32, Float8E4M3FN
@@ -42,10 +42,6 @@ from flashinfer.attention.prims_ts import (
     BatchPrefillTSWrapper,
     batch_prefill,
     batch_prefill_with_paged_kv_cache,
-)
-from flashinfer.attention.prims_ts._tensor_aliasing import (
-    _tensor_byte_span,
-    _tensors_overlap,
 )
 from flashinfer.attention.prims_ts.kernels.fmha_context.fmha_kernel import (
     FmhaTs,
@@ -201,15 +197,20 @@ def _make_paged_context_case(
     num_qo_heads: int,
     num_kv_heads: int,
     head_dim: int,
-    qkv_dtype: torch.dtype,
+    qk_dtype: torch.dtype,
     mask_type: str,
+    v_dtype: Optional[torch.dtype] = None,
     page_size: int = 32,
     window_left: int = -1,
     output_dtype: Optional[torch.dtype] = None,
     output_scale: float = 0.75,
     seed: int = 0,
 ) -> _PagedContextCase:
-    """Create nonidentity HND pages and the matching packed logical tensors."""
+    """Create nonidentity HND pages and the matching packed logical tensors.
+
+    ``v_dtype`` overrides the V cache element type for mixed QK/PV cases. The
+    reference V is quantized the same way.
+    """
 
     q_lengths = tuple(int(length) for length in q_lengths)
     k_lengths = tuple(int(length) for length in k_lengths)
@@ -220,7 +221,9 @@ def _make_paged_context_case(
 
     device = torch.device("cuda")
     generator = torch.Generator(device=device).manual_seed(seed)
-    input_scale = 0.125 if qkv_dtype == _FP8 else 0.2
+    input_scale = 0.125 if qk_dtype == _FP8 else 0.2
+    if v_dtype is None:
+        v_dtype = qk_dtype
 
     def random_tensor(shape: tuple[int, ...]) -> torch.Tensor:
         return (
@@ -228,7 +231,7 @@ def _make_paged_context_case(
             * torch.randn(
                 shape, generator=generator, device=device, dtype=torch.float32
             )
-        ).to(qkv_dtype)
+        ).to(qk_dtype)
 
     q = random_tensor((sum(q_lengths), num_qo_heads, head_dim)).contiguous()
     logical_k = random_tensor((sum(k_lengths), num_kv_heads, head_dim)).contiguous()
@@ -277,7 +280,7 @@ def _make_paged_context_case(
     reference = _ContextCase(
         q=q,
         k=logical_k,
-        v=logical_v,
+        v=logical_v.to(v_dtype),
         qo_indptr=qo_indptr,
         kv_indptr=torch.tensor(
             _cumulative(k_lengths), dtype=torch.int32, device=device
@@ -288,12 +291,12 @@ def _make_paged_context_case(
         window_left=window_left,
         sm_scale=1.0 / math.sqrt(head_dim),
         output_scale=output_scale,
-        output_dtype=qkv_dtype if output_dtype is None else output_dtype,
+        output_dtype=qk_dtype if output_dtype is None else output_dtype,
     )
     return _PagedContextCase(
         reference=reference,
-        k_cache=k_staging.to(qkv_dtype),
-        v_cache=v_staging.to(qkv_dtype),
+        k_cache=k_staging.to(qk_dtype),
+        v_cache=v_staging.to(v_dtype),
         qo_indptr=qo_indptr,
         paged_kv_indptr=paged_kv_indptr,
         paged_kv_indices=paged_kv_indices,
@@ -306,8 +309,9 @@ def _poison_invalid_paged_v_tails(case: _PagedContextCase) -> None:
     """Fill only unused final-page V rows with NaNs."""
 
     case.k_cache.nan_to_num_(nan=0.0)
-    case.v_cache.nan_to_num_(nan=0.0)
-    expected_nan = torch.zeros_like(case.v_cache, dtype=torch.bool)
+    # nan_to_num_/masked_fill_ have no FP8 CUDA kernels; edit a float16 copy.
+    v_staging = case.v_cache.to(torch.float16).nan_to_num_(nan=0.0)
+    expected_nan = torch.zeros_like(v_staging, dtype=torch.bool)
     page_indptr = case.paged_kv_indptr.tolist()
     page_indices = case.paged_kv_indices.tolist()
     last_page_lens = case.paged_kv_last_page_len.tolist()
@@ -315,9 +319,10 @@ def _poison_invalid_paged_v_tails(case: _PagedContextCase) -> None:
         physical_page = page_indices[page_indptr[batch_idx + 1] - 1]
         expected_nan[physical_page, :, last_page_len:, :] = True
 
-    case.v_cache.masked_fill_(expected_nan, float("nan"))
+    v_staging.masked_fill_(expected_nan, float("nan"))
+    case.v_cache.copy_(v_staging)
     assert torch.isfinite(case.k_cache).all()
-    assert torch.equal(torch.isnan(case.v_cache), expected_nan)
+    assert torch.equal(torch.isnan(case.v_cache.to(torch.float16)), expected_nan)
 
 
 def _request_slice(
@@ -443,7 +448,9 @@ def _assert_context_correct(
     assert torch.isfinite(actual.float()).all()
     # Select by the least precise input/output type. FP8 includes the kernel's
     # E4M3 probability quantization as well as optional E4M3 output rounding.
-    if case.q.dtype == _FP8 or case.output_dtype == _FP8:
+    # A QK-BF16/PV-FP8 case should use FP8 error as the E4M3 V cache and the kernel
+    # P-cast dominate the error budget.
+    if _FP8 in (case.q.dtype, case.v.dtype, case.output_dtype):
         rtol, atol, max_relative_l2 = 5e-2, 1.3e-1, 1e-1
     elif case.q.dtype == torch.bfloat16 or case.output_dtype == torch.bfloat16:
         rtol, atol, max_relative_l2 = 2e-2, 1e-2, 2e-2
@@ -503,7 +510,8 @@ def _plan_wrapper(wrapper: BatchPrefillTSWrapper, case: _ContextCase) -> None:
         num_kv_heads=int(case.k.shape[-2]),
         head_dim=int(case.q.shape[-1]),
         q_dtype=case.q.dtype,
-        kv_dtype=case.k.dtype,
+        k_dtype=case.k.dtype,
+        v_dtype=case.v.dtype,
         packed=case.packed,
         mask_type=case.mask_type,
         window_left=case.window_left,
@@ -561,7 +569,8 @@ def _plan_paged_wrapper(
         num_kv_heads=int(case.k_cache.shape[1]),
         head_dim=int(reference.q.shape[2]),
         q_dtype=reference.q.dtype,
-        kv_dtype=case.k_cache.dtype,
+        k_dtype=case.k_cache.dtype,
+        v_dtype=case.v_cache.dtype,
         out_dtype=reference.output_dtype,
         page_size=case.page_size,
         mask_type=reference.mask_type,
@@ -658,162 +667,6 @@ def _run_one_shot(case: _ContextCase, *, out: Optional[torch.Tensor] = None):
 # ---------------------------------------------------------------------------
 # CPU-only oracle and public API contract
 # ---------------------------------------------------------------------------
-
-
-def test_attention_ts_context_storage_span_includes_stride_and_offset() -> None:
-    storage = torch.empty(64, dtype=torch.bfloat16)
-    tensor = storage.as_strided((2, 3), (10, 2), storage_offset=3)
-
-    assert _tensor_byte_span(tensor) == (
-        tensor.data_ptr(),
-        tensor.data_ptr() + 15 * tensor.element_size(),
-    )
-
-
-def test_attention_ts_context_paged_views_are_conservatively_bounded() -> None:
-    combined_cache = torch.empty((3, 2, 2, 4), dtype=torch.uint8)
-    k_cache = combined_cache[:, 0]
-    v_cache = combined_cache[:, 1]
-
-    # The views select disjoint elements, but their outer-stride bounding spans
-    # overlap. Treating them as overlapping is safer than under-bounding a
-    # strided paged cache.
-    assert _tensors_overlap(k_cache, v_cache)
-
-
-def test_attention_ts_context_disjoint_storage_slices_do_not_overlap() -> None:
-    storage = torch.empty(16, dtype=torch.float32)
-
-    assert not _tensors_overlap(storage[:4], storage[8:12])
-
-
-def test_attention_ts_context_alias_guard_covers_fixed_plan_storage(
-    monkeypatch,
-) -> None:
-    """The contiguous wrapper checks runtime metadata and plan-owned scales."""
-
-    monkeypatch.setattr(
-        context_module, "_validate_runtime_inputs", lambda *_a, **_k: None
-    )
-    monkeypatch.setattr(
-        context_module,
-        "_prepare_out",
-        lambda out, *, q, output_dtype: out,
-    )
-    argument_names = (
-        "k",
-        "v",
-        "qo_indptr",
-        "kv_indptr",
-    )
-    plan_owned_names = (
-        "scale_softmax_log2",
-        "output_scale",
-    )
-
-    for aliased_name in (*argument_names, *plan_owned_names):
-        out = torch.empty(8)
-        q = torch.empty(8)
-        arguments = {name: torch.empty(8) for name in argument_names}
-        plan_owned = {name: torch.empty(8) for name in plan_owned_names}
-        empty_i32 = torch.empty(1)
-
-        if aliased_name in arguments:
-            arguments[aliased_name] = out
-        else:
-            plan_owned[aliased_name] = out
-        wrapper = BatchPrefillTSWrapper()
-        wrapper._plan_state = context_module._ContextPlanState(
-            geometry=SimpleNamespace(
-                output_dtype=out.dtype,
-                packed=True,
-                mask_type="dense",
-            ),
-            scale_softmax_log2=plan_owned["scale_softmax_log2"],
-            output_scale=plan_owned["output_scale"],
-            empty_i32=empty_i32,
-            variable_window_padded_starts=None,
-            variable_window_cta_starts=empty_i32,
-            compiled=lambda *_: None,
-            policy=(),
-        )
-
-        with pytest.raises(
-            ValueError,
-            match=rf"out must not overlap {aliased_name} storage",
-        ):
-            wrapper.run(
-                q,
-                arguments["k"],
-                arguments["v"],
-                arguments["qo_indptr"],
-                arguments["kv_indptr"],
-                out=out,
-            )
-
-
-def test_attention_ts_context_alias_guard_covers_paged_plan_storage(
-    monkeypatch,
-) -> None:
-    """The paged wrapper checks every per-run and plan-owned allocation."""
-
-    monkeypatch.setattr(
-        context_module, "_validate_paged_runtime_inputs", lambda *_: None
-    )
-    monkeypatch.setattr(
-        context_module,
-        "_validate_paged_runtime_metadata",
-        lambda *_args, **_kwargs: None,
-    )
-    monkeypatch.setattr(
-        context_module,
-        "_prepare_out",
-        lambda out, *, q, output_dtype: out,
-    )
-    argument_names = (
-        "k_cache",
-        "v_cache",
-        "qo_indptr",
-        "block_tables",
-        "seq_lens_kv",
-    )
-    plan_owned_names = (
-        "scale_softmax_log2",
-        "output_scale",
-    )
-
-    for aliased_name in (*argument_names, *plan_owned_names):
-        out = torch.empty(8)
-        q = torch.empty(8)
-        arguments = {name: torch.empty(8) for name in argument_names}
-        plan_owned = {name: torch.empty(8) for name in plan_owned_names}
-
-        if aliased_name in arguments:
-            arguments[aliased_name] = out
-        else:
-            plan_owned[aliased_name] = out
-        wrapper = BatchPrefillPagedTSWrapper()
-        wrapper._plan_state = context_module._PagedContextPlanState(
-            geometry=SimpleNamespace(output_dtype=out.dtype),
-            scale_softmax_log2=plan_owned["scale_softmax_log2"],
-            output_scale=plan_owned["output_scale"],
-            compiled=lambda *_: None,
-            policy=(),
-        )
-
-        with pytest.raises(
-            ValueError,
-            match=rf"out must not overlap {aliased_name} storage",
-        ):
-            wrapper.run(
-                q,
-                arguments["k_cache"],
-                arguments["v_cache"],
-                arguments["qo_indptr"],
-                arguments["block_tables"],
-                arguments["seq_lens_kv"],
-                out=out,
-            )
 
 
 def test_attention_ts_context_public_surfaces_hide_internal_tuning() -> None:
@@ -921,7 +774,8 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "num_kv_heads",
         "head_dim",
         "q_dtype",
-        "kv_dtype",
+        "k_dtype",
+        "v_dtype",
         "out_dtype",
         "page_size",
         "mask_type",
@@ -985,7 +839,7 @@ def test_attention_ts_context_paged_plan_rejects_non_bool_zero_tail_contract(
             num_kv_heads=2,
             head_dim=128,
             q_dtype=torch.float16,
-            kv_dtype=torch.float16,
+            k_dtype=torch.float16,
             paged_v_tail_is_zero=invalid_value,
         )
 
@@ -1003,8 +857,10 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "num_qo_heads",
         "num_kv_heads",
         "head_dim",
+        "head_dim_vo",
         "q_dtype",
-        "kv_dtype",
+        "k_dtype",
+        "v_dtype",
         "out_dtype",
         "packed",
         "mask_type",
@@ -1032,6 +888,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "output_scale",
         "validate",
     )
+    assert plan_parameters["head_dim_vo"].default is None
     assert run_parameters["qo_indptr"].default is None
     assert run_parameters["kv_indptr"].default is None
     assert run_parameters["variable_window_cta_starts"].kind is (
@@ -1135,8 +992,8 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
         num_qo_heads=4,
         num_kv_heads=2,
         head_dim=128,
-        q_dtype=torch.float16,
-        kv_dtype=torch.float16,
+        qk_dtype=torch.float16,
+        pv_dtype=torch.float16,
         output_dtype=torch.float16,
         uniform_packed_lengths=False,
         has_q_offset=False,
@@ -1313,7 +1170,7 @@ def test_attention_ts_context_contiguous_plan_reuses_dynamic_packed_requests(
         num_kv_heads=2,
         head_dim=128,
         q_dtype=torch.float16,
-        kv_dtype=torch.float16,
+        k_dtype=torch.float16,
         packed=True,
     )
     state = wrapper._plan_state
@@ -1406,7 +1263,7 @@ def test_attention_ts_context_variable_window_bounds_are_runtime_state(
         num_kv_heads=1,
         head_dim=128,
         q_dtype=torch.float16,
-        kv_dtype=torch.float16,
+        k_dtype=torch.float16,
         mask_type="variable_window",
     )
     state = wrapper._plan_state
@@ -1493,7 +1350,7 @@ def test_attention_ts_context_accepts_precomputed_variable_window_cta_starts(
         num_kv_heads=1,
         head_dim=128,
         q_dtype=torch.float16,
-        kv_dtype=torch.float16,
+        k_dtype=torch.float16,
         mask_type="variable_window",
     )
     state = wrapper._plan_state
@@ -1599,58 +1456,6 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
         )
 
 
-def test_attention_ts_context_alias_guard_covers_precomputed_cta_starts(
-    monkeypatch,
-) -> None:
-    monkeypatch.setattr(
-        context_module, "_validate_runtime_inputs", lambda *_args, **_kwargs: None
-    )
-    monkeypatch.setattr(context_module, "_validate_tensor", lambda *_args: None)
-    monkeypatch.setattr(
-        context_module,
-        "_prepare_out",
-        lambda out, *, q, output_dtype: out,
-    )
-    empty_i32 = torch.empty(1, dtype=torch.int32)
-    wrapper = BatchPrefillTSWrapper()
-    wrapper._plan_state = context_module._ContextPlanState(
-        geometry=SimpleNamespace(
-            device=torch.device("cpu"),
-            batch_size=1,
-            max_seq_len_q=1,
-            max_seq_len_k=1,
-            head_dim=128,
-            output_dtype=torch.int32,
-            packed=False,
-            mask_type="variable_window",
-        ),
-        scale_softmax_log2=torch.empty(1),
-        output_scale=torch.empty(1),
-        empty_i32=empty_i32,
-        variable_window_padded_starts=None,
-        variable_window_cta_starts=torch.empty(1, dtype=torch.int32),
-        compiled=lambda *_args: None,
-        policy=(),
-    )
-    starts = torch.zeros((1, 1), dtype=torch.int32)
-    ends = torch.zeros_like(starts)
-    out = torch.zeros((1, 1), dtype=torch.int32)
-
-    with pytest.raises(
-        ValueError,
-        match="out must not overlap variable_window_cta_starts storage",
-    ):
-        wrapper.run(
-            torch.empty(1),
-            torch.empty(1),
-            torch.empty(1),
-            variable_window_token_starts=starts,
-            variable_window_token_ends=ends,
-            variable_window_cta_starts=out,
-            out=out,
-        )
-
-
 def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
     monkeypatch,
 ) -> None:
@@ -1686,7 +1491,7 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
         num_kv_heads=2,
         head_dim=128,
         q_dtype=torch.float16,
-        kv_dtype=torch.float16,
+        k_dtype=torch.float16,
     )
     first_state = wrapper._plan_state
     assert first_state is not None
@@ -1700,7 +1505,7 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
             num_kv_heads=2,
             head_dim=128,
             q_dtype=torch.float16,
-            kv_dtype=torch.float16,
+            k_dtype=torch.float16,
         )
     assert wrapper._plan_state is first_state
 
@@ -1792,7 +1597,7 @@ def test_attention_ts_context_paged_explicit_uniform_plan_compiles_once(
         num_kv_heads=2,
         head_dim=128,
         q_dtype=torch.float16,
-        kv_dtype=torch.float16,
+        k_dtype=torch.float16,
         mask_type="causal",
         uniform_packed_lengths=True,
         has_q_offset=False,
@@ -1873,7 +1678,7 @@ def test_attention_ts_context_failed_paged_replan_retains_previous_state(
         num_kv_heads=2,
         head_dim=128,
         q_dtype=torch.float16,
-        kv_dtype=torch.float16,
+        k_dtype=torch.float16,
     )
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper.plan(**plan_kwargs)
@@ -1924,7 +1729,7 @@ def test_attention_ts_context_failed_contiguous_replan_retains_previous_state(
         num_kv_heads=1,
         head_dim=128,
         q_dtype=torch.float16,
-        kv_dtype=torch.float16,
+        k_dtype=torch.float16,
     )
     wrapper = BatchPrefillTSWrapper()
     wrapper.plan(**plan_kwargs)
@@ -1953,7 +1758,6 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
     monkeypatch.setattr(context_module, "_validate_paged_runtime_metadata", fail)
     monkeypatch.setattr(context_module, "_validate_runtime_scale_tensor", fail)
     monkeypatch.setattr(context_module, "_prepare_out", fail)
-    monkeypatch.setattr(context_module, "_validate_out_does_not_overlap_inputs", fail)
 
     out = torch.empty(1)
     launched = []
@@ -2508,7 +2312,8 @@ def test_attention_ts_context_d256_pipeline_policy_is_semantic_and_capacity_safe
     """Every D256 topology provides enough stages for its K/V cadence."""
 
     kernel = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         out_dtype=output_dtype,
         d=256,
         is_persistent=True,
@@ -2560,7 +2365,8 @@ def test_attention_ts_context_page_window_fits_static_geometry_and_capacity(
     """The wider page-ID handoff is selected only when its SMEM ring fits."""
 
     cfg = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         out_dtype=BFloat16,
         d=256,
         is_persistent=True,
@@ -2639,6 +2445,12 @@ def test_attention_ts_context_uses_ldtm_stat_default_follows_gpu():
         context_module._dsl_supports_ldtm_stat()
         and torch.cuda.get_device_capability() in ((10, 3), (10, 7))
     )
+    if torch.cuda.get_device_capability() == (10, 7):
+        # SM103 above supports both native and inline-PTX reduction. SM107
+        # additionally needs a native wrapper because DSL 4.7 targets sm_100f.
+        from cutlass.experimental import primitives as prims
+
+        expected = expected and hasattr(prims, "tcgen05_ld_red")
     assert (
         context_module._default_uses_ldtm_stat(torch.cuda.current_device()) is expected
     )
@@ -2652,7 +2464,8 @@ def test_attention_ts_context_uses_ldtm_stat_schedule_builds(
 ):
     """Contiguous task graphs build with either statistics path, without JIT."""
     kernel = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         qk_acc_dtype=Float32,
         pv_acc_dtype=Float32,
         d=head_dim,
@@ -2825,7 +2638,8 @@ def test_attention_ts_context_d128_paged_clc_task_graph_is_safe(
     """The paired D128 CLC graph is valid without a page-ID ring."""
 
     kernel = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         out_dtype=Float16,
         d=128,
         is_persistent=True,
@@ -2882,7 +2696,8 @@ def test_attention_ts_context_d256_live_paged_clc_uses_distinct_auxiliary_warps(
 ):
     """The live-ragged D256 CLC and page-ID producers cannot overlap."""
     kernel = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         out_dtype=Float16,
         d=256,
         is_persistent=True,
@@ -2962,7 +2777,8 @@ def test_attention_ts_context_d256_uniform_paged_static_scheduler_is_safe(
 
     balance_causal_workload = not has_q_offset
     kernel = FmhaTs(
-        in_dtype=input_dtype,
+        in_qk_dtype=input_dtype,
+        in_pv_dtype=input_dtype,
         out_dtype=Float16,
         d=256,
         is_persistent=True,
@@ -3056,7 +2872,7 @@ def test_attention_ts_context_public_plan_rejects_unsupported_arch(monkeypatch):
             num_kv_heads=2,
             head_dim=128,
             q_dtype=q.dtype,
-            kv_dtype=k.dtype,
+            k_dtype=k.dtype,
         )
 
 
@@ -3102,7 +2918,7 @@ def test_attention_ts_context_plan_rejects_critical_public_contracts(
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         q_dtype=dtype,
-        kv_dtype=dtype,
+        k_dtype=dtype,
     )
 
     if invalid_contract == "packed-offset":
@@ -3161,7 +2977,7 @@ def test_attention_ts_context_paged_supported_page_sizes_accuracy(
         num_qo_heads=8,
         num_kv_heads=2,
         head_dim=head_dim,
-        qkv_dtype=qkv_dtype,
+        qk_dtype=qkv_dtype,
         mask_type="causal",
         page_size=page_size,
         output_dtype=torch.bfloat16,
@@ -3187,7 +3003,7 @@ def test_attention_ts_context_paged_zero_fills_nan_v_tail():
         num_qo_heads=28,
         num_kv_heads=4,
         head_dim=128,
-        qkv_dtype=torch.bfloat16,
+        qk_dtype=torch.bfloat16,
         mask_type="causal",
         page_size=32,
         output_dtype=torch.bfloat16,
@@ -3217,7 +3033,7 @@ def test_attention_ts_context_run_rejects_causal_q_longer_than_kv(paged: bool):
             num_qo_heads=4,
             num_kv_heads=4,
             head_dim=128,
-            qkv_dtype=torch.bfloat16,
+            qk_dtype=torch.bfloat16,
             mask_type="causal",
             seed=2026071930,
         )
@@ -3279,8 +3095,8 @@ def test_attention_ts_context_paged_plan_uses_conservative_dynamic_facts(
         num_qo_heads=4,
         num_kv_heads=4,
         head_dim=128,
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        qk_dtype=torch.bfloat16,
+        pv_dtype=torch.bfloat16,
         page_size=32,
         window_left=-1,
         output_dtype=torch.bfloat16,
@@ -3469,7 +3285,7 @@ def test_attention_ts_context_paged_rejects_variable_window_before_compile(
             num_kv_heads=1,
             head_dim=128,
             q_dtype=torch.float16,
-            kv_dtype=torch.float16,
+            k_dtype=torch.float16,
             mask_type="variable_window",
             out_dtype=torch.float16,
         )
@@ -3493,8 +3309,8 @@ def test_attention_ts_context_paged_plan_ignores_aggregate_kv_capacity(monkeypat
         num_qo_heads=4,
         num_kv_heads=4,
         head_dim=128,
-        q_dtype=torch.bfloat16,
-        kv_dtype=torch.bfloat16,
+        qk_dtype=torch.bfloat16,
+        pv_dtype=torch.bfloat16,
         page_size=32,
         mask_type="dense",
         window_left=-1,
@@ -3964,7 +3780,7 @@ def test_attention_ts_paged_context_reuses_compiled_topology_across_batch_sizes(
             num_qo_heads=4,
             num_kv_heads=4,
             head_dim=128,
-            qkv_dtype=torch.float16,
+            qk_dtype=torch.float16,
             mask_type="dense",
             output_dtype=torch.float16,
             seed=2026071430 + batch_size,
@@ -4187,6 +4003,62 @@ def test_attention_ts_context_uniform_packed_window_offsets_accuracy():
 
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.parametrize("mask_type", ("dense", "causal"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_qkbf16_pvfp8_accuracy(head_dim: int, mask_type: str):
+    """QK-BF16/PV-FP8 stays accurate on both D topologies and both masks.
+
+    Paired D128 runs the k_dtype != v_dtype staging path under the early
+    tile-sum cadence, staged D256 under the split head-dimension cadence.
+    """
+    case = _make_context_case(
+        q_lengths=(64, 96),
+        k_lengths=(192, 160),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        head_dim=head_dim,
+        qkv_dtype=torch.bfloat16,
+        packed=True,
+        mask_type=mask_type,
+        output_dtype=torch.bfloat16,
+        device="cuda",
+        seed=2026082701 + head_dim,
+    )
+    case = replace(case, v=case.v.to(_FP8))
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    _assert_context_correct(_run_wrapper(wrapper, case), case)
+
+
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.parametrize("mask_type", ("dense", "causal"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_paged_qkbf16_pvfp8_accuracy(
+    head_dim: int, mask_type: str
+):
+    """A paged FP8 V cache reads through the same split staging path."""
+    case = _make_paged_context_case(
+        q_lengths=(33, 17),
+        k_lengths=(129, 97),
+        num_qo_heads=8,
+        num_kv_heads=2,
+        head_dim=head_dim,
+        qk_dtype=torch.bfloat16,
+        v_dtype=_FP8,
+        mask_type=mask_type,
+        output_dtype=torch.bfloat16,
+        output_scale=1.0,
+        seed=2026082702 + head_dim,
+    )
+    wrapper = BatchPrefillPagedTSWrapper()
+    metadata = _plan_paged_wrapper(wrapper, case)
+    output = _run_paged_wrapper(wrapper, case, metadata)
+    _assert_context_correct(output, case.reference)
+
+
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
 @pytest.mark.parametrize(
     "k_lengths",
     (
@@ -4207,7 +4079,7 @@ def test_attention_ts_context_paged_dense_k_mask_accuracy(
         num_qo_heads=8,
         num_kv_heads=4,
         head_dim=head_dim,
-        qkv_dtype=_FP8,
+        qk_dtype=_FP8,
         mask_type="dense",
         seed=2026071511 + head_dim + sum(k_lengths),
     )
@@ -4242,7 +4114,7 @@ def test_attention_ts_context_paged_invalid_padding_ids_are_not_dereferenced(
         num_qo_heads=4,
         num_kv_heads=2,
         head_dim=head_dim,
-        qkv_dtype=torch.bfloat16,
+        qk_dtype=torch.bfloat16,
         mask_type="causal",
         output_scale=1.0,
         seed=2026090303 + head_dim,
@@ -4269,7 +4141,8 @@ def test_attention_ts_context_paged_invalid_padding_ids_are_not_dereferenced(
     _plan_paged_wrapper(wrapper, case)
 
     cfg = FmhaTs(
-        in_dtype=BFloat16,
+        in_qk_dtype=BFloat16,
+        in_pv_dtype=BFloat16,
         out_dtype=BFloat16,
         d=head_dim,
         is_persistent=True,
@@ -4301,7 +4174,7 @@ def test_attention_ts_context_d128_paged_s16k_runtime(qkv_dtype: torch.dtype):
         num_qo_heads=4,
         num_kv_heads=4,
         head_dim=128,
-        qkv_dtype=qkv_dtype,
+        qk_dtype=qkv_dtype,
         mask_type="dense",
         seed=2026071522,
     )
@@ -4451,23 +4324,32 @@ def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 @pytest.mark.parametrize(
-    ("qkv_dtype", "output_dtype", "kv_length"),
+    ("qk_dtype", "output_dtype", "kv_length", "v_dtype"),
     (
-        pytest.param(torch.bfloat16, torch.bfloat16, 256, id="bf16-full-ring"),
+        pytest.param(torch.bfloat16, torch.bfloat16, 256, None, id="bf16-full-ring"),
         pytest.param(
             torch.bfloat16,
             torch.bfloat16,
             993,
+            None,
             id="bf16-split-rings-partial-tail",
         ),
-        pytest.param(_FP8, torch.bfloat16, 256, id="fp8-full-ring"),
-        pytest.param(_FP8, torch.bfloat16, 1024, id="fp8-split-rings"),
+        pytest.param(_FP8, torch.bfloat16, 256, None, id="fp8-full-ring"),
+        pytest.param(_FP8, torch.bfloat16, 1024, None, id="fp8-split-rings"),
+        pytest.param(
+            torch.bfloat16,
+            torch.bfloat16,
+            993,
+            _FP8,
+            id="bf16-fp8v-split-rings-partial-tail",
+        ),
     ),
 )
 def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
-    qkv_dtype: torch.dtype,
+    qk_dtype: torch.dtype,
     output_dtype: torch.dtype,
     kv_length: int,
+    v_dtype: Optional[torch.dtype],
 ):
     # Use more than three resident CTA waves across distinct batch page tables
     # while keeping Q compact. Eight pages retain the full page-ID ring and 32
@@ -4479,7 +4361,8 @@ def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
         num_qo_heads=128,
         num_kv_heads=32,
         head_dim=256,
-        qkv_dtype=qkv_dtype,
+        qk_dtype=qk_dtype,
+        v_dtype=v_dtype,
         mask_type="dense",
         seed=2026071826,
     )
@@ -4494,8 +4377,12 @@ def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
     assert dict(wrapper._plan_state.policy)["scheduler"] == "static_persistent"
     if kv_length == 993:
         assert wrapper._plan_state.geometry.max_kv_len == 993
+        resolved_v_dtype = v_dtype if v_dtype is not None else qk_dtype
         cfg = FmhaTs(
-            in_dtype=BFloat16,
+            in_qk_dtype=BFloat16 if qk_dtype == torch.bfloat16 else Float8E4M3FN,
+            in_pv_dtype=(
+                BFloat16 if resolved_v_dtype == torch.bfloat16 else Float8E4M3FN
+            ),
             out_dtype=BFloat16,
             d=256,
             is_persistent=True,
@@ -4520,7 +4407,7 @@ def test_attention_ts_context_d256_fp8_paged_dense_crosses_page_windows():
         num_qo_heads=64,
         num_kv_heads=4,
         head_dim=256,
-        qkv_dtype=_FP8,
+        qk_dtype=_FP8,
         mask_type="dense",
         seed=2026071935,
     )
@@ -4546,7 +4433,7 @@ def test_attention_ts_context_d256_paged_head_paired_window_runtime():
         num_qo_heads=8,
         num_kv_heads=2,
         head_dim=256,
-        qkv_dtype=torch.bfloat16,
+        qk_dtype=torch.bfloat16,
         mask_type="causal",
         window_left=63,
         output_scale=1.0,
@@ -4593,7 +4480,7 @@ def test_attention_ts_context_d256_paged_dynamic_causal_runtime(
         num_qo_heads=8,
         num_kv_heads=2,
         head_dim=256,
-        qkv_dtype=qkv_dtype,
+        qk_dtype=qkv_dtype,
         mask_type="causal",
         output_scale=1.0,
         seed=2026071933 + int(expected_q_offset) + int(qkv_dtype == _FP8) * 100,
@@ -4651,7 +4538,7 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
         num_qo_heads=4,
         num_kv_heads=2,
         head_dim=head_dim,
-        qkv_dtype=torch.bfloat16,
+        qk_dtype=torch.bfloat16,
         mask_type="causal",
         output_scale=1.0,
         seed=2026090302 + head_dim,
@@ -4667,7 +4554,8 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
     assert dict(wrapper._plan_state.policy)["scheduler"] == "clc_dynamic_persistent"
 
     cfg = FmhaTs(
-        in_dtype=BFloat16,
+        in_qk_dtype=BFloat16,
+        in_pv_dtype=BFloat16,
         out_dtype=BFloat16,
         d=head_dim,
         is_persistent=True,
@@ -4807,7 +4695,7 @@ def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
         num_qo_heads=8,
         num_kv_heads=4,
         head_dim=256,
-        qkv_dtype=torch.float16,
+        qk_dtype=torch.float16,
         mask_type="causal",
         seed=2026071520,
     )
@@ -4873,7 +4761,7 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
             num_qo_heads=4,
             num_kv_heads=4,
             head_dim=head_dim,
-            qkv_dtype=qkv_dtype,
+            qk_dtype=qkv_dtype,
             mask_type="causal",
             output_scale=1.0,
             seed=2026071931 + head_dim + (1 if qkv_dtype == _FP8 else 0),
@@ -5149,7 +5037,7 @@ def test_attention_ts_context_paged_window_live_q_redistribution_graph_replay():
         num_qo_heads=8,
         num_kv_heads=2,
         head_dim=128,
-        qkv_dtype=torch.bfloat16,
+        qk_dtype=torch.bfloat16,
         mask_type="causal",
         window_left=31,
         output_scale=1.0,
@@ -5194,7 +5082,7 @@ def test_attention_ts_context_paged_window_graph_replay_writes_fresh_output():
         num_qo_heads=8,
         num_kv_heads=2,
         head_dim=128,
-        qkv_dtype=_FP8,
+        qk_dtype=_FP8,
         mask_type="causal",
         window_left=31,
         seed=2026071521,
@@ -5250,8 +5138,6 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
 
     wrapper = BatchPrefillTSWrapper()
     _plan_wrapper(wrapper, first)
-    with pytest.raises(ValueError, match="out must not overlap q storage"):
-        _run_wrapper(wrapper, first, out=first.q)
 
     shared_out = torch.full_like(first.q, float("nan"), dtype=first.output_dtype)
     returned = _run_wrapper(wrapper, first, out=shared_out)
@@ -5282,3 +5168,174 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     graph.replay()
     torch.cuda.synchronize()
     _assert_context_correct(graph_out, second)
+
+
+# Non-absorbed MLA: separate compact Q/K=192, V/O=128.
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize(
+    ("packed", "q_lens", "k_lens", "large_masked_scores"),
+    [
+        pytest.param(False, (65,), (65,), False, id="fixed-b1-single-tile"),
+        pytest.param(False, (257, 257), (513, 513), False, id="fixed-b2-partial"),
+        pytest.param(False, (128,) * 4, (256,) * 4, False, id="fixed-b4-aligned"),
+        pytest.param(True, (257,), (513,), False, id="packed-b1-partial"),
+        pytest.param(True, (256, 256), (512, 512), False, id="packed-b2-replay"),
+        pytest.param(True, (65, 257), (129, 513), False, id="packed-b2-mixed"),
+        pytest.param(
+            True,
+            (1, 127, 128, 385),
+            (65, 128, 257, 513),
+            False,
+            id="packed-b4-mixed",
+        ),
+        pytest.param(False, (257,), (513,), True, id="fixed-b1-large-masked-scores"),
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mla_prefill(
+    dtype, out_dtype, packed, q_lens, k_lens, large_masked_scores, causal
+):
+    """Validate batched MLA with fixed/ragged lengths, dtype pairs and graph replay."""
+    torch.manual_seed(123)
+    batch_size = len(q_lens)
+    hq, hkv = (8, 2) if packed else (96, 1)
+    q = torch.randn(sum(q_lens), hq, 192, device="cuda")
+    k = torch.randn(sum(k_lens), hkv, 192, device="cuda")
+    v = torch.randn(sum(k_lens), hkv, 128, device="cuda")
+    if large_masked_scores:
+        # The first row's visible keys have strongly negative scores, while
+        # future keys in the same K tile are strongly positive. Including a
+        # masked maximum would underflow every valid probability. Put the
+        # signal in the separate 64-element QK tail as well.
+        q.zero_()
+        k.zero_()
+        q[..., 128:] = 16
+        k[..., 128:] = 16
+        k[: k_lens[0] - q_lens[0] + 1, :, 128:] = -16
+    # Exercise descales with large FP8 operands, as in the benchmark.
+    operand_scale = 16 if dtype == torch.float8_e4m3fn else 1
+    q = (q * operand_scale).to(dtype)
+    k = (k * operand_scale).to(dtype)
+    v = (v * operand_scale).to(dtype)
+    sm_scale = 1 / (math.sqrt(192) * operand_scale**2)
+    output_scale = 0.75 / operand_scale
+    qo = (
+        torch.tensor(_cumulative(q_lens), device="cuda", dtype=torch.int32)
+        if packed
+        else None
+    )
+    ko = (
+        torch.tensor(_cumulative(k_lens), device="cuda", dtype=torch.int32)
+        if packed
+        else None
+    )
+
+    def reference(q_lengths, k_lengths):
+        expected = []
+        q_offset = k_offset = 0
+        for nq, nk in zip(q_lengths, k_lengths, strict=True):
+            qr = q[q_offset : q_offset + nq].float().transpose(0, 1)
+            kr = k[k_offset : k_offset + nk].float().transpose(0, 1)
+            vr = v[k_offset : k_offset + nk].float().transpose(0, 1)
+            kr = kr.repeat_interleave(hq // hkv, dim=0)
+            vr = vr.repeat_interleave(hq // hkv, dim=0)
+            scores = (qr @ kr.transpose(-1, -2)) * sm_scale
+            if causal:
+                mask = torch.arange(nk, device="cuda")[None, :] > (
+                    nk - nq + torch.arange(nq, device="cuda")[:, None]
+                )
+                scores.masked_fill_(mask, -torch.inf)
+            expected.append((scores.softmax(-1) @ vr).transpose(0, 1) * output_scale)
+            q_offset += nq
+            k_offset += nk
+        return torch.cat(expected)
+
+    expected = reference(q_lens, k_lens)
+    if not packed:
+        q = q.reshape(batch_size, q_lens[0], hq, 192)
+        k = k.reshape(batch_size, k_lens[0], hkv, 192)
+        v = v.reshape(batch_size, k_lens[0], hkv, 128)
+        expected = expected.reshape(batch_size, q_lens[0], hq, 128)
+    out = torch.empty((*q.shape[:-1], 128), dtype=out_dtype, device="cuda")
+    replay_shift = (
+        min(129, q_lens[-1] - 1, k_lens[0] - q_lens[0])
+        if packed and batch_size > 1
+        else 0
+    )
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=q.device,
+        batch_size=batch_size,
+        max_seq_len_q=max(q_lens) + replay_shift,
+        max_kv_len=max(k_lens) + int(replay_shift > 0),
+        num_qo_heads=hq,
+        num_kv_heads=hkv,
+        head_dim=192,
+        head_dim_vo=128,
+        q_dtype=dtype,
+        k_dtype=dtype,
+        packed=packed,
+        mask_type="causal" if causal else "dense",
+        sm_scale=sm_scale,
+        output_scale=output_scale,
+        out_dtype=out_dtype,
+    )
+    actual = wrapper.run(q, k, v, qo, ko, out=out)
+    assert actual is out
+    assert actual.shape == expected.shape
+    has_fp8 = torch.float8_e4m3fn in (dtype, out_dtype)
+    atol, rtol = (0.13, 0.05) if has_fp8 else (0.01, 0.02)
+    torch.testing.assert_close(actual.float(), expected, atol=atol, rtol=rtol)
+    relative_l2 = torch.linalg.vector_norm(
+        actual.float() - expected
+    ) / torch.linalg.vector_norm(expected)
+    assert relative_l2.item() < (0.05 if has_fp8 else 0.01)
+    allocated = batch_prefill(
+        q,
+        k,
+        v,
+        qo_indptr=qo,
+        kv_indptr=ko,
+        mask_type="causal" if causal else "dense",
+        sm_scale=sm_scale,
+        output_scale=output_scale,
+        out_dtype=out_dtype,
+    )
+    assert allocated.shape == out.shape and allocated.dtype == out_dtype
+    torch.testing.assert_close(allocated.float(), expected, atol=atol, rtol=rtol)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, k, v, qo, ko, out=out, validate=False)
+    out.zero_()
+    graph.replay()
+    torch.testing.assert_close(out.float(), expected, atol=atol, rtol=rtol)
+    if replay_shift:
+        # Reuse the captured plan and storage while changing request lengths.
+        # In the equal-length case this also activates a previously empty Q tile.
+        changed_q = list(q_lens)
+        changed_q[0] += replay_shift
+        changed_q[-1] -= replay_shift
+        qo[1:-1].add_(replay_shift)
+        out.zero_()
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), reference(changed_q, k_lens), atol=atol, rtol=rtol
+        )
+        changed_k = list(k_lens)
+        changed_k[0] += 1
+        changed_k[-1] -= 1
+        ko[1:-1].add_(1)
+        out.zero_()
+        graph.replay()
+        torch.testing.assert_close(
+            out.float(), reference(changed_q, changed_k), atol=atol, rtol=rtol
+        )
+    with pytest.raises(ValueError, match="out must have shape"):
+        wrapper.run(q, k, v, qo, ko, out=torch.empty_like(q, dtype=torch.bfloat16))
+    with pytest.raises(ValueError, match="v must have"):
+        wrapper.run(q, k, torch.empty_like(k), qo, ko)
