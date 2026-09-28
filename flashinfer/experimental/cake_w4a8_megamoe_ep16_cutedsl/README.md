@@ -33,7 +33,7 @@ works and caches its most recent bindings after validating the arguments.
 
 The complete forward, including input quantization, dispatch, NVLink transfers,
 FC1/SwiGLU, intermediate quantization, FC2, ordered combine and workspace cleanup,
-uses one eager CuTeDSL kernel launch. Static FP4 weights are repacked without
+uses one CuTeDSL kernel launch per GPU. Static FP4 weights are repacked without
 changing bits; scale values and expert ownership are preserved. Weights are
 prepared once outside forward.
 Output must be caller-owned BF16 storage disjoint from inputs and workspace.
@@ -60,5 +60,84 @@ Run `examples/cake_w4a8_megamoe_ep16_cutedsl.py` using `torchrun` across the
 DeepGEMM at `atol = rtol = 1e-2`, with relative L2 below 0.02. They include
 repeated forwards, duplicate routes, empty input, 17-token extreme values and
 384-token all-hot routing. Performance comparisons must include the complete
-forward and identify the dependency revisions, graph/eager modes, compiled
+forward and identify the dependency revisions, graph use and kernel counts, compiled
 image and timing reduction used for every arm.
+
+## DeepGEMM with CUDA Graph baseline
+
+The baseline is **DeepGEMM with CUDA Graph**, using FlashInfer
+[`2f1dd17d`](https://github.com/flashinfer-ai/flashinfer/blob/2f1dd17d0c40badb0a866d5ca370ac5b428eed91/flashinfer/moe_ep/backends/mega/kernel/sm100/fp8_fp4_bf16_deepgemm/backend.py)
+and DeepGEMM
+[`559d79fb`](https://github.com/deepseek-ai/DeepGEMM/tree/559d79fb6994a58b8a15b4b93bf13ccc16edf247).
+The FlashInfer backend stages and quantizes BF16 inputs, then calls
+`deep_gemm.fp8_fp4_mega_moe`. Both operations belong to the measured forward.
+
+Run one process per GPU across 16 mutually NVLink-accessible GB300 GPUs.
+Set `FLASHINFER_MEGA_FUSED_STAGE=1` and `FLASHINFER_MOE_EP_KNOB_CACHE=0`
+before importing FlashInfer. With the distributed process group and symmetric
+memory initialized, construct the baseline from the same canonical weights,
+activations and routes as CuTeDSL:
+
+```python
+from flashinfer.moe_ep import (
+    BootstrapConfig, FleetParams, MegaConfig, MoEEpMegaLayer, MoEEpTensors,
+    Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
+)
+
+tensors = MoEEpTensors(hidden_states=x, topk_ids=ids, topk_weights=router_weights)
+layer = MoEEpMegaLayer(
+    bootstrap=BootstrapConfig(world_size=16, rank=rank, device=0),
+    fleet_params=FleetParams(
+        num_experts=512, max_tokens_per_rank=x.shape[0], token_hidden_size=3072,
+    ),
+    weights=weights,
+    backend=MegaConfig(
+        megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+            intermediate_size=5120, top_k=8, activation_clamp=None, fast_math=True,
+        ),
+        quantize_input=True, preprocess_weights=True,
+    ),
+)
+```
+
+Here `weights` is the canonical `MoEEpWeights` input, before CuTeDSL's static
+pair-major repacking. Complete lazy setup before capturing one full forward:
+
+```python
+import torch
+import torch.distributed as dist
+
+layer.forward(tensors)
+torch.cuda.synchronize()
+dist.barrier()
+stream = torch.cuda.Stream()
+stream.wait_stream(torch.cuda.current_stream())
+with torch.cuda.stream(stream):
+    for _ in range(3):
+        layer.forward(tensors)
+        stream.synchronize()
+torch.cuda.current_stream().wait_stream(stream)
+torch.cuda.synchronize()
+dist.barrier()
+graph = torch.cuda.CUDAGraph(keep_graph=True)
+with torch.cuda.graph(graph, stream=stream):
+    baseline_output = layer.forward(tensors)
+graph.instantiate()
+# Invoke this callable for each measured complete forward:
+baseline_forward = graph.replay
+```
+
+Keep the layer, tensors, graph and output alive through measurement. Graph
+construction and static weight preparation are setup; quantization, staging,
+communication, computation, output completion and cleanup stay in the graph.
+CUPTI verifies **two kernels per graph replay**, versus **one CuTeDSL kernel
+per complete forward on each GPU**. The same CuTeDSL image serves every row.
+
+Measure cold-L2 CUPTI complete spans, including copies, memsets and gaps:
+100 ms warmup, 1000 ms measurement, three balanced-order groups per row.
+Take the maximum over 16 ranks for each sample, then the median within each
+group and the median of three groups. Only the new CuTeDSL feature paths are
+added over the pinned FlashInfer dependency tree; its nine shared support
+modules are verified byte-identical. Correctness is also tested separately
+from the public checkout. This setup describes the baseline used for the
+reported numbers; graph capture alone is not the complete timing harness.
