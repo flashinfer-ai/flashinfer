@@ -725,11 +725,9 @@ def chunk_gated_delta_rule(
         Safe upper bound on the maximum logical sequence length, no larger
         than ``total_seq_len``. CP kernels use this host-side hint to
         bound their per-sequence launch grids without reading ``cu_seqlens``
-        back from the GPU. Pass the exact maximum for variable-length or
-        imbalanced batches. When omitted, CP assumes a balanced batch and uses
-        ``ceil(total_seq_len / num_seqs)``. That fallback can under-launch an
-        imbalanced batch, so callers allowing unequal lengths must provide this
-        argument whenever the CP path may be selected.
+        back from the GPU. When omitted, CP uses ``total_seq_len``, which is
+        correct for any batch; passing the exact maximum of a batched call
+        lets CP launch smaller grids.
 
     Returns
     -------
@@ -799,11 +797,10 @@ def chunk_gated_delta_rule(
     total_seq_len = q.size(0)
     if num_seqs <= 0:
         raise ValueError("cu_seqlens must contain at least two entries")
-    cp_max_seqlen = (
-        max_seqlen
-        if max_seqlen is not None
-        else (total_seq_len + num_seqs - 1) // num_seqs
-    )
+    # Without a hint, only the packed length is a bound that holds for
+    # every batch; a smaller one leaves the tail of the longest sequence
+    # unprocessed.
+    cp_max_seqlen = max_seqlen if max_seqlen is not None else total_seq_len
     if type(cp_max_seqlen) is not int or cp_max_seqlen < 0:
         raise ValueError("max_seqlen must be a nonnegative integer")
     if total_seq_len and cp_max_seqlen == 0:
