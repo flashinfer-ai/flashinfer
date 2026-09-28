@@ -2306,10 +2306,12 @@ def _require_tensor(
 def _validate_qkv_layout(q, k, v) -> bool:
     """Accept dense ``[B, T, H, 128]`` BF16 q / k / v or strided views of one packed row.
 
-    Returns ``True`` for dense operands.  Strided operands must keep a dense
-    ``[num_heads, 128]`` token payload, share one token stride that is a
-    multiple of 8 elements and at least ``num_heads * 128``, and use a plain
-    batch stride (``shape[1] * token stride``) so ``[B, T]`` folds to ``[1, B*T]``.
+    Returns ``True`` for dense operands.  A strided operand must keep a dense
+    ``[num_heads, 128]`` token payload, a token stride that is a multiple of 8
+    elements and at least ``num_heads * 128``, and a plain batch stride
+    (``shape[1] * token stride``) so ``[B, T]`` folds to ``[1, B*T]``.  The
+    fused M128 body reads each operand's token pitch from its TensorView, so
+    q, k and v may carry different pitches (e.g. a dense zero ``v``).
     """
     import torch
 
@@ -2328,8 +2330,6 @@ def _validate_qkv_layout(q, k, v) -> bool:
             )
         if tensor.shape[0] > 1 and tensor.stride(0) != tensor.shape[1] * tensor.stride(1):
             raise ValueError(f"{name} batch stride must be shape[1] * token stride")
-    if not (q.stride(1) == k.stride(1) == v.stride(1)):
-        raise ValueError("q, k and v must share one token stride")
     return False
 
 
@@ -4064,7 +4064,6 @@ class FlashKDABlackwellBF16FusedLaunch:
             self.operator_export = op_export
             self.args.update(
                 g_token_stride=g_flat.stride(0),
-                qkv_token_stride=q_flat.stride(0),
                 cu_chunk_offsets=(
                     op_export["cu_chunk_offsets"] if op_export else empty_chunk_offsets
                 ),
