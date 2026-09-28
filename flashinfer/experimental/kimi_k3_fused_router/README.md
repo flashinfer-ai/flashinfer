@@ -32,18 +32,23 @@ the expert-aligned route plan consumed by grouped MoE GEMMs in **one launch**:
   to one dispatch arm: for the smallest batches one kernel per token count
   (a single CTA for one token, otherwise one cluster of `num_tokens` CTAs --
   2, 4, 8 or 16 -- exchanging the selected ids through distributed shared
-  memory), one-join plan builders for small and medium batches, a
+  memory), one-join plan builders for small and medium batches (the 32- to
+  128-token shapes use a second kernel of the small-batch builder's family
+  which loads the bias and the first row's logits into registers before its
+  prologue barrier; the plain builder keeps 128 tokens x `block_m = 16` on
+  both architectures plus 128 tokens x `block_m = 8` on SM100 and 64 tokens x
+  `block_m = 16` on SM103), a
   4-CTA-cluster variant at four CTAs per SM for 512 to 2048 tokens (the
   2048-token shapes use a second kernel of that family which prefetches the
   next row's logits into registers) and a
   warp-per-row two-join persistent kernel for the largest batches. The two
-  architectures use the same table. Other shapes raise
-  `NotImplementedError`.
+  architectures' tables differ only in those two small-batch cells. Other
+  shapes raise `NotImplementedError`.
 - Every arm but the small-batch per-token-count one is a cooperative persistent launch
   whose grid is bounded by the device SM count (three CTAs per SM on CC 10.0,
   four on CC 10.3; the 4-CTA-cluster arms and the largest-batch arm use their
-  own launch bounds of four CTAs per SM, and the one-join arm launches at
-  least its 128 plan-owner CTAs).
+  own launch bounds of four CTAs per SM, and the two small-batch one-join
+  arms launch at least their 128 plan-owner CTAs).
   The two 4-CTA-cluster arms are additionally bounded by the number of
   co-resident clusters the driver reports for the kernel
   (`cudaOccupancyMaxActiveClusters`, queried once at preparation through a

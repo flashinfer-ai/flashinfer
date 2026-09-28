@@ -1644,6 +1644,9 @@ ARCH_NVCC_FLAGS = {
 # Dispatch arms of the generated program.  The per-shape route tables in
 # ``cake_backend`` name one arm per (architecture, num_tokens, block_m):
 #   L   : one-join plan builder, num_tokens <= 512, at least 128 CTAs launched
+#   LP  : the L kernel with a register prefetch of the bias and the first
+#         row's logits above its prologue barrier, same grid rule; eight of the
+#         twelve 32 <= num_tokens <= 128 cells (four per architecture)
 #   LC  : one cluster of num_tokens CTAs (2, 4 or 8) exchanging selected ids
 #         through distributed shared memory; one kernel per row count,
 #         non-cooperative cluster launch
@@ -1655,7 +1658,7 @@ ARCH_NVCC_FLAGS = {
 #         same cluster / launch bounds / grid rule, num_tokens = 2048
 #   G   : two-join persistent kernel for the largest batches, compiled with
 #         per-architecture launch bounds (4 CTAs/SM on SM100, 6 on SM103)
-ARMS = ("L", "LC", "M", "Q4S", "Q4SP", "G")
+ARMS = ("L", "LP", "LC", "M", "Q4S", "Q4SP", "G")
 # Arms registered per row count (one kernel per num_tokens); every other arm
 # registers one module per (arch, block_m) and serves all of its rows.
 PER_ROW_COUNT_ARMS = ("LC",)

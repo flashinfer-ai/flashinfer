@@ -20,6 +20,7 @@ import torch
 from flashinfer.experimental.kimi_k3_fused_router import cake_backend
 from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
     ARM_GW_CTAS_PER_SM,
+    ARM_L_FAMILY,
     ARM_L_MIN_GRID,
     ARM_LC_TOKENS,
     ARM_Q4S_CLUSTER,
@@ -250,12 +251,23 @@ def test_route_tables_cover_the_routed_shapes():
         assert {arm for arm in SHAPE_ROUTES[arch].values()} == {
             "L",
             "LC",
+            "LP",
             "M",
             "Q4S",
             "Q4SP",
             "GW",
         }
-    assert SHAPE_ROUTES["sm_100a"] == SHAPE_ROUTES["sm_103a"]
+    # v58: the two tables differ in exactly two cells of the L / LP family.
+    differing = {
+        key
+        for key in SHAPE_ROUTES["sm_100a"]
+        if SHAPE_ROUTES["sm_100a"][key] != SHAPE_ROUTES["sm_103a"][key]
+    }
+    assert differing == {(64, 16), (128, 8)}
+    assert route_arm("sm_100a", 64, 16) == "LP"
+    assert route_arm("sm_103a", 64, 16) == "L"
+    assert route_arm("sm_100a", 128, 8) == "L"
+    assert route_arm("sm_103a", 128, 8) == "LP"
     assert route_arm("sm_100a", 512, 8) == "Q4S"
     assert route_arm("sm_103a", 512, 8) == "Q4S"
     for arch in SHAPE_ROUTES:
@@ -272,8 +284,18 @@ def test_route_tables_cover_the_routed_shapes():
         assert route_arm(arch, 1, 16) == "LC"
         assert route_arm(arch, 16, 8) == "LC"
         assert route_arm(arch, 16, 16) == "LC"
-        assert route_arm(arch, 32, 8) == "L"
-        assert route_arm(arch, 128, 8) == "L"
+        # v58: the 32- to 128-token shapes are served by the L / LP family, LP
+        # on four cells per architecture; (128, 16) and one further cell per
+        # architecture (checked above) stay on L.
+        assert {
+            rows for (rows, _), arm in SHAPE_ROUTES[arch].items() if arm in ARM_L_FAMILY
+        } == {32, 64, 128}
+        assert route_arm(arch, 32, 8) == "LP"
+        assert route_arm(arch, 32, 16) == "LP"
+        assert route_arm(arch, 64, 8) == "LP"
+        assert route_arm(arch, 128, 16) == "L"
+        assert sum(1 for arm in SHAPE_ROUTES[arch].values() if arm == "L") == 2, arch
+        assert sum(1 for arm in SHAPE_ROUTES[arch].values() if arm == "LP") == 4, arch
         assert route_arm(arch, 256, 16) == "M"
         assert route_arm(arch, 512, 16) == "Q4S"
         assert route_arm(arch, 1024, 16) == "Q4S"
@@ -313,6 +335,14 @@ def test_launch_grid_rules(compute_capability, sm_count):
     assert launch_grid("L", 16, **kw) == ARM_L_MIN_GRID
     assert launch_grid("L", 128, **kw) == 128
     assert launch_grid("L", 512, **kw) == min(512, cap)
+    # Arm LP: the L rule (same kernel family, same admission guard).
+    assert ARM_L_FAMILY == ("L", "LP")
+    for rows in (32, 64, 128):
+        assert launch_grid("LP", rows, **kw) == launch_grid("L", rows, **kw)
+    assert launch_grid("LP", 32, **kw) == ARM_L_MIN_GRID
+    assert launch_grid("LP", 128, **kw) == 128
+    with pytest.raises(RuntimeError, match="at most"):
+        launch_grid("LP", 1024, **kw)
     assert launch_grid("M", 256, **kw) == 256
     assert launch_grid("M", 2048, **kw) == cap
     # Arm GW: CTAs-per-SM launch bound of the architecture (four on both).

@@ -22,11 +22,15 @@ sigmoid scores) and writes the expert-aligned route plan (``sorted_token_ids``,
 scatter offsets) consumed by grouped MoE GEMMs.  The program is a family of
 kernels: one dispatch arm per exact ``(num_tokens, block_m)`` shape of the
 routed set, selected by a per-architecture table.  Most arms launch as a
-cooperative persistent grid bounded by the device's SM count (arms Q4S and
-Q4SP -- the same 4-CTA-cluster kernel family at four CTAs per SM, Q4SP being
-the 2048-token variant that prefetches the next row's logits into registers --
-are bounded by the driver's co-resident cluster capacity; arm GW, the warp-per-row two-join
-kernel for the largest batches, uses a per-architecture CTAs-per-SM bound);
+cooperative persistent grid bounded by the device's SM count (arms L and LP
+-- the same one-join plan-builder kernel family for 32 to 128 tokens, LP
+being the variant that loads the bias and the first row's logits into
+registers before its prologue barrier -- launch at least their 128 plan-owner
+CTAs; arms Q4S and Q4SP -- the same 4-CTA-cluster kernel family at four CTAs
+per SM, Q4SP being the 2048-token variant that prefetches the next row's
+logits into registers -- are bounded by the driver's co-resident cluster
+capacity; arm GW, the warp-per-row two-join kernel for the largest batches,
+uses a per-architecture CTAs-per-SM bound);
 arm LC serves the smallest batches with one non-cooperative kernel per token
 count: a single CTA for one token, otherwise one cluster of ``num_tokens``
 CTAs (2, 4, 8 or 16; the 16-CTA cluster is above the portable maximum of 8
@@ -65,8 +69,14 @@ THREADS = 224
 NUM_WARPS = THREADS // 32
 OWNER_CTAS = NUM_EXPERTS // NUM_WARPS
 ARM_L_MAX_TOKENS = 512
-# Arm L launches at least this many CTAs (the plan owners) whatever num_tokens is.
+# Arms L / LP launch at least this many CTAs (the plan owners) whatever num_tokens is.
 ARM_L_MIN_GRID = 128
+# Arm LP (v58): the L body with the bias and first-row logits loads issued before
+# the prologue barrier (a register prefetch), a second kernel of the same family;
+# identical outputs, thread count, admission guard and grid rule.  Which of the
+# 32- to 128-token shapes it serves is decided per architecture (route tables);
+# the 128-token x block_m 16 shape stays on L on both.
+ARM_L_FAMILY = ("L", "LP")
 # Arm LC: one kernel per token count, launched as a single cluster of num_tokens
 # CTAs (a single CTA for one token).  The 16-token kernel is a 16-CTA cluster,
 # above the portable maximum of 8: the generated program sets the non-portable
@@ -104,7 +114,8 @@ MAIN_KWARGS = (
 )
 
 # Per-shape dispatch arm, keyed by (num_tokens, block_m).  Both tables cover
-# the same 28 shapes with the same arms.
+# the same 28 shapes with the same arms; they differ in exactly two cells of
+# the L / LP family (see _SM103_SHAPE_ROUTE below).
 _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (1, 8): "LC",
     (1, 16): "LC",
@@ -116,11 +127,11 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (8, 16): "LC",
     (16, 8): "LC",
     (16, 16): "LC",
-    (32, 8): "L",
-    (32, 16): "L",
-    (64, 8): "L",
-    (64, 16): "L",
-    (128, 8): "L",
+    (32, 8): "LP",
+    (32, 16): "LP",
+    (64, 8): "LP",
+    (64, 16): "LP",  # sm_103a: L
+    (128, 8): "L",  # sm_103a: LP
     (128, 16): "L",
     (256, 8): "M",
     (256, 16): "M",
@@ -135,7 +146,14 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (8192, 8): "GW",
     (8192, 16): "GW",
 }
-_SM103_SHAPE_ROUTE: dict[tuple[int, int], str] = dict(_SM100_SHAPE_ROUTE)
+# sm_103a: the sm_100a table with the two L / LP cells that differ between the
+# architectures -- sm_100a keeps L at (128, 8) and routes (64, 16) to LP;
+# sm_103a keeps L at (64, 16) and routes (128, 8) to LP.
+_SM103_SHAPE_ROUTE: dict[tuple[int, int], str] = {
+    **_SM100_SHAPE_ROUTE,
+    (64, 16): "L",
+    (128, 8): "LP",
+}
 SHAPE_ROUTES = {"sm_100a": _SM100_SHAPE_ROUTE, "sm_103a": _SM103_SHAPE_ROUTE}
 SUPPORTED_NUM_TOKENS = tuple(sorted({rows for rows, _ in _SM100_SHAPE_ROUTE}))
 
@@ -247,9 +265,9 @@ def launch_grid(
         if rows not in ARM_LC_TOKENS:
             raise RuntimeError(f"arm LC serves exactly num_tokens in {ARM_LC_TOKENS}")
         return rows
-    if arm == "L":
+    if arm in ARM_L_FAMILY:
         if rows > ARM_L_MAX_TOKENS:
-            raise RuntimeError(f"arm L admits at most {ARM_L_MAX_TOKENS} tokens")
+            raise RuntimeError(f"arm {arm} admits at most {ARM_L_MAX_TOKENS} tokens")
         return max(1, min(max(grid_rows, ARM_L_MIN_GRID), cap))
     if arm == "M":
         if rows > ARM_M_MAX_TOKENS or rows < OWNER_CTAS:
