@@ -168,24 +168,17 @@ def _pack_float4_to_fp8_e4m3(
     v2: Float32,
     v3: Float32,
 ) -> Int32:
-    """Pack four FP32 values with the public packed-conversion primitive."""
-    lo = prims.cvt_packfloat_f32(
-        v1,
-        v0,
-        Int32(0),
-        prims.CVTPackFloat.E4M3X2,
-        rnd=prims.FPRoundingMode.RN,
-        sat=prims.SaturationModeKind.SATFINITE,
-        extract_hi=False,
-    )
-    return prims.cvt_packfloat_f32(
-        v3,
-        v2,
-        lo,
-        prims.CVTPackFloat.E4M3X2,
-        rnd=prims.FPRoundingMode.RN,
-        sat=prims.SaturationModeKind.SATFINITE,
-        extract_hi=True,
+    """Pack four FP32 values into one e4m3x4 word. Two b16 conversions
+    are joined by mov.b32, which ptxas emits as F2FP pairs with no PRMT."""
+    return cute.arch.inline_ptx(
+        """{
+            .reg .b16 lo, hi;
+            cvt.rn.satfinite.e4m3x2.f32 lo, {$r1}, {$r0};
+            cvt.rn.satfinite.e4m3x2.f32 hi, {$r3}, {$r2};
+            mov.b32 {$w0}, {lo, hi};
+        }""",
+        write_only_types=[Int32],
+        read_only_args=[v0, v1, v2, v3],
     )
 
 
@@ -719,9 +712,16 @@ class FmhaConfig:
     def pv_p_scale(self) -> float:
         """Return the P scale applied before PV MMA."""
         if self.v_dtype is not None and self.v_dtype.width == 8:
-            # FP8 E4M3 has max finite magnitude 448; scaling P to that range
-            # before PV MMA preserves dynamic range.
-            return 448.0
+            # E4M3 saturates at 448. Exact correction keeps P <= 1, so P scales
+            # by 448. Lazy correction lets the softmax row max lag the true one
+            # by up to corr_skip_threshold_log2, so P <= 2^threshold. Keep a
+            # power-of-two scale there. The largest with P * scale <= 448 is
+            # 2^floor(log2(448) - threshold), which is 1 at threshold 8.
+            if self.corr_skip_threshold_log2 == 0.0:
+                return 448.0
+            return 2.0 ** max(
+                0.0, math.floor(math.log2(448.0) - self.corr_skip_threshold_log2)
+            )
         # Non-FP8 V uses P directly, so the PV-side P scale is identity.
         return 1.0
 
@@ -3325,11 +3325,12 @@ class TmemSPResource(MemoryResource):
         else:
             s_data = _tmem_sp_sdata.pop(id(self))
         if cutlass.const_expr(self.enable_early_tile_sum or partial):
-            # Keep four independent scalar dependency chains while expressing
-            # them as two packed float2 values.  The explicit packed primitive
-            # lowers to FADD2 for D128 instead of two scalar FADDs per pair.
+            # Four packed float2 accumulators keep eight independent FADD2
+            # chains, so no add waits on the MUFU result it consumes.
             local_sum_pair_0 = (Float32(0.0), Float32(0.0))
             local_sum_pair_1 = (Float32(0.0), Float32(0.0))
+            local_sum_pair_2 = (Float32(0.0), Float32(0.0))
+            local_sum_pair_3 = (Float32(0.0), Float32(0.0))
         for chunk_idx in cutlass.range_constexpr(chunk_lo, chunk_hi):
             p_vals = ()
             for elem_idx in cutlass.range_constexpr(0, tmem_x, 2):
@@ -3352,19 +3353,27 @@ class TmemSPResource(MemoryResource):
                     p1 = cute.math.exp2(fma_pair[1], fastmath=True)
                 if cutlass.const_expr(self.enable_early_tile_sum or partial):
                     pair_idx = chunk_idx * (tmem_x // 2) + elem_idx // 2
-                    if cutlass.const_expr(pair_idx % 2 == 0):
+                    if cutlass.const_expr(pair_idx % 4 == 0):
                         local_sum_pair_0 = cute.arch.add_packed_f32x2(
                             local_sum_pair_0,
                             (p0, p1),
                             rnd="rn",
                             ftz=False,
                         )
-                    else:
+                    elif cutlass.const_expr(pair_idx % 4 == 1):
                         local_sum_pair_1 = cute.arch.add_packed_f32x2(
                             local_sum_pair_1,
                             (p0, p1),
                             rnd="rn",
                             ftz=False,
+                        )
+                    elif cutlass.const_expr(pair_idx % 4 == 2):
+                        local_sum_pair_2 = cute.arch.add_packed_f32x2(
+                            local_sum_pair_2, (p0, p1), rnd="rn", ftz=False
+                        )
+                    else:
+                        local_sum_pair_3 = cute.arch.add_packed_f32x2(
+                            local_sum_pair_3, (p0, p1), rnd="rn", ftz=False
                         )
                 p_vals += (p0, p1)
             s_data[chunk_idx] = cutlass.Vector.from_elements(
@@ -3424,11 +3433,14 @@ class TmemSPResource(MemoryResource):
                     store_fragment,
                 )
         if cutlass.const_expr(self.enable_early_tile_sum or partial):
+            local_sum_pair_0 = cute.arch.add_packed_f32x2(
+                local_sum_pair_0, local_sum_pair_2, rnd="rn", ftz=False
+            )
+            local_sum_pair_1 = cute.arch.add_packed_f32x2(
+                local_sum_pair_1, local_sum_pair_3, rnd="rn", ftz=False
+            )
             local_sum_pair = cute.arch.add_packed_f32x2(
-                local_sum_pair_0,
-                local_sum_pair_1,
-                rnd="rn",
-                ftz=False,
+                local_sum_pair_0, local_sum_pair_1, rnd="rn", ftz=False
             )
             tile_sum = local_sum_pair[0] + local_sum_pair[1]
         if cutlass.const_expr(partial):
