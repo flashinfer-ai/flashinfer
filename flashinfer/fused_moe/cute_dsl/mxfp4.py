@@ -2018,6 +2018,7 @@ class Mxfp4MoESwapAbPlan:
                 self._fork_event.record(main)
                 self._side_stream.wait_event(self._fork_event)
                 side = cuda.CUstream(self._side_stream.cuda_stream)
+
                 # The graph launches the GEMM1s in enqueue order and the
                 # first to arrive holds the SMs (see
                 # SWAP_WIDE192_DENSE_FIRST_MIN_TOKENS).
