@@ -1566,23 +1566,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
 
         self.cta_sync_barrier.arrive_and_wait()
 
-        # Zero-fill the finalize output for the following GEMM2 (grid-strided,
-        # scheduler warp of every CTA) so no separate fill kernel is needed.
-        if cutlass.const_expr(zero_buf is not None):
-            if warp_idx == self.sched_warp_id:
-                grid_x, grid_y, grid_z = cute.arch.grid_dim()
-                # Linear CTA id / count: the persistent grid is (1, 1, #CTAs).
-                cta_linear = bidx + grid_x * (bidy + grid_y * bidz)
-                num_ctas = grid_x * grid_y * grid_z
-                zero_lane = tidx % self.threads_per_warp
-                zero_words = cute.size(zero_buf)
-                for zi in cutlass.range(
-                    cta_linear * self.threads_per_warp + zero_lane,
-                    zero_words,
-                    num_ctas * self.threads_per_warp,
-                ):
-                    zero_buf[zi] = cutlass.Int64(0)
-
         #
         # Scheduler warp: row groups >= num_valid_groups carry no work. Because
         # the raster order is m-fastest, once an invalid group is reached every
@@ -2442,6 +2425,23 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             tCtAcc_base = cute.make_tensor(tmem_ptr, tCtAcc_fake.layout)
             epi_tidx = tidx % self.num_epilog_threads
             lane = epi_tidx % self.threads_per_warp
+            # Zero-fill the finalize output for the following GEMM2
+            # (grid-strided over the epilogue threads of every CTA, which
+            # idle through the first mainloop) so no separate fill kernel is
+            # needed. On the scheduler warp the fill sat on the critical path
+            # (+46 us at T=8192, +110 us at 16384 on B300).
+            if cutlass.const_expr(zero_buf is not None):
+                grid_x, grid_y, grid_z = cute.arch.grid_dim()
+                # Linear CTA id / count: the persistent grid is (1, 1, #CTAs).
+                cta_linear = bidx + grid_x * (bidy + grid_y * bidz)
+                num_ctas = grid_x * grid_y * grid_z
+                zero_words = cute.size(zero_buf)
+                for zi in cutlass.range(
+                    cta_linear * self.num_epilog_threads + epi_tidx,
+                    zero_words,
+                    num_ctas * self.num_epilog_threads,
+                ):
+                    zero_buf[zi] = cutlass.Int64(0)
             (
                 tiled_copy_t2r,
                 tTR_tAcc_base,
