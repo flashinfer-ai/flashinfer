@@ -238,6 +238,11 @@ if SWAP_WIDE192_MIXED_GEMM2 not in ("split", "dense"):
 # plan's side stream beside the swap chain; the row sets are disjoint and
 # both finalizes add atomically into the zero-filled output.
 SWAP_WIDE192_MIXED_STREAMS = os.environ.get("MXFP4_SWAP192_MIXED_STREAMS", "0") == "1"
+# Wide 192-row forms: the finalize output is zero-filled by the swap GEMM1
+# (grid-strided over its CTAs) instead of the routing conversion kernel,
+# whose fill costs 17-99 us at T = 8192..32768 (the dense path fills inside
+# its GEMM1 from T = 8192 too).
+SWAP_WIDE192_ZERO_IN_GEMM1 = os.environ.get("MXFP4_SWAP192_ZF_GEMM1", "1") == "1"
 # Mixed form: weight M-tiles per swap-GEMM2 work item. Measured on B300 (TP8
 # T=256/1024 balanced): with the 128-row groups the GEMM2 of the policy tile
 # loses 6-9 % at m_group 1 and is back at the 32-row-group time with 2.
@@ -1062,7 +1067,8 @@ class Mxfp4MoESwapAbPlan:
         # two-stage finalize the finalize kernel accumulates on top of it.
         split_dense = self.split and SWAP_SPLIT_DENSE_GEMM2
         self.split_dense = split_dense
-        clear_output = not self.two_stage or split_dense
+        zero_in_gemm1 = self.wide192 and SWAP_WIDE192_ZERO_IN_GEMM1
+        clear_output = (not self.two_stage or split_dense) and not zero_in_gemm1
         if (self.finalize and not self.two_stage) or split_dense:
             clear_target = self.output
         elif self.two_stage:
@@ -1237,7 +1243,7 @@ class Mxfp4MoESwapAbPlan:
                 beta=self._beta,
                 linear_beta=self._linear_beta,
                 top_k=w.top_k,
-                zero_output=None,
+                zero_output=self.output if zero_in_gemm1 else None,
                 n_tile=self.n_tile,
                 enable_pdl=pdl,
                 pdl_trigger_after_wait=pdl and self._dep_prefetch,
@@ -1402,6 +1408,16 @@ class Mxfp4MoESwapAbPlan:
                     situ_linear_beta=self._linear_beta,
                     weight_l2_hint=DENSE_WEIGHT_L2_HINT,
                     _prepared_launches=launches,
+                    **(
+                        # The dense path's launch configuration.
+                        dict(
+                            cluster_split_k=w._dense_gemm1_cluster_split(
+                                gemm1_tactic, num_tokens
+                            )
+                        )
+                        if self.mixed192
+                        else {}
+                    ),
                 )
                 self._gemm1_dense = launches["gather"]
             mixed192_dense_gemm2 = (
@@ -1417,6 +1433,15 @@ class Mxfp4MoESwapAbPlan:
                     raise ValueError(
                         "hybrid GEMM2 tactic tile must match the "
                         f"{self.group_rows}-row sort groups, got {gemm2_tactic!r}"
+                    )
+                dense_gemm2_config = {}
+                if mixed192_dense_gemm2:
+                    # The dense path's raster / swizzle / C stages.
+                    gemm2_raster = w._gemm2_raster(num_tokens, gemm2_tactic[0][1])
+                    dense_gemm2_config = dict(
+                        raster_along_m=gemm2_raster[0],
+                        swizzle_size=gemm2_raster[1],
+                        c_stages=DENSE_GEMM2_C_STAGES,
                     )
                 blockscaled_contiguous_grouped_gemm_finalize_fusion(
                     a=b["gemm1_out"],
@@ -1441,6 +1466,7 @@ class Mxfp4MoESwapAbPlan:
                     use_fused_finalize=True,
                     weight_l2_hint=DENSE_WEIGHT_L2_HINT,
                     _prepared_launches=launches,
+                    **dense_gemm2_config,
                 )
                 launches["swap_gemm2"] = launches["finalize"]
             else:
@@ -1454,6 +1480,7 @@ class Mxfp4MoESwapAbPlan:
                 gemm2_tactic = w._tactic(num_tokens)[2]
                 if gemm2_tactic[0][0] != self.group_rows:
                     gemm2_tactic = ((self.group_rows, 192), (1, 2), False)
+                gemm2_raster = w._gemm2_raster(num_tokens, gemm2_tactic[0][1])
                 wide_launches = {}
                 blockscaled_contiguous_grouped_gemm_finalize_fusion(
                     a=b["gemm1_out"],
@@ -1478,6 +1505,9 @@ class Mxfp4MoESwapAbPlan:
                     use_fused_finalize=True,
                     weight_l2_hint=DENSE_WEIGHT_L2_HINT,
                     tile_idx_to_row_group=b["swap_wide_list"],
+                    raster_along_m=gemm2_raster[0],
+                    swizzle_size=gemm2_raster[1],
+                    c_stages=DENSE_GEMM2_C_STAGES,
                     _prepared_launches=wide_launches,
                 )
                 self._gemm2_wide = wide_launches["finalize"]
