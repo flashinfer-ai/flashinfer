@@ -262,7 +262,12 @@ if SWAP_WIDE192_MIXED_GEMM2 not in ("auto", "split", "dense", "alt"):
 SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS = int(
     os.environ.get("MXFP4_SWAP192_DENSE_GEMM2_MIN_TOKENS", "16384")
 )
-# Mixed form on two streams. ``tile`` (default; needs the dual-tile
+# Mixed form on two streams. ``win`` (default; needs the dual-tile routing
+# and the routing-emitted lists): the window chain (swap GEMM1 and, in the
+# split form, swap GEMM2) on the plan's side stream and the dense path's own
+# chain (both dense GEMM1s, the finalizes) on the caller's stream; round 28
+# on B300: shard T=8192 balanced 0.949 of main against 0.969 for ``tile``,
+# other rows within noise. ``tile`` (needs the dual-tile
 # routing): the alternate-padding chain (M256 dense GEMM1 and finalize) runs
 # on the plan's side stream and the base-padding chain (swap GEMM1, M128
 # dense GEMM1, the GEMM2 form's launches) on the caller's stream, forked
@@ -273,7 +278,7 @@ SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS = int(
 # 27: 5.4 us between GEMM1 and GEMM2 and 5.7 us after GEMM2 on the shard's
 # T=8192 ``empty`` routing). ``1``: the dense chain on the side stream beside
 # the swap chain (round 26 form). ``0``: every launch on the caller's stream.
-SWAP_WIDE192_MIXED_STREAMS = os.environ.get("MXFP4_SWAP192_MIXED_STREAMS", "tile")
+SWAP_WIDE192_MIXED_STREAMS = os.environ.get("MXFP4_SWAP192_MIXED_STREAMS", "win")
 if SWAP_WIDE192_MIXED_STREAMS not in ("0", "1", "tile", "win"):
     raise ValueError("MXFP4_SWAP192_MIXED_STREAMS must be 0, 1, tile or win")
 # Wide 192-row forms: where the finalize output is zero-filled. ``route``:
