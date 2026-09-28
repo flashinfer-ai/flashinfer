@@ -1137,7 +1137,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_mla_fp8_paged_attention_c43301e3628e995cecb9(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k, const __grid_constant__ CUtensorMap tmap_qr, const __grid_constant__ CUtensorMap tmap_kr, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int* __restrict__ page_table, float softmax_scale_log2, float bmm2_scale, int num_heads, int num_split, int max_pages_per_seq, int m_tiles, int n_full_items)
+kernel_cake_kimi_k3_mla_fp8_paged_attention_f70e949703268953f5d8(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k, const __grid_constant__ CUtensorMap tmap_qr, const __grid_constant__ CUtensorMap tmap_kr, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int* __restrict__ page_table, float softmax_scale_log2, float bmm2_scale, int num_heads, int num_split, int max_pages_per_seq, int m_tiles, int n_full_items)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1158,18 +1158,17 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c43301e3628e995cecb9(const __grid_co
     #define qk_done_addr (mbar_base + 160)
     #define s_full_addr (mbar_base + 200)
     #define s_empty_addr (mbar_base + 216)
-    #define p_full_addr (mbar_base + 232)
-    #define o_ready_addr (mbar_base + 248)
-    #define ref_full_addr (mbar_base + 264)
-    #define p_empty_addr (mbar_base + 280)
-    #define o_empty_addr (mbar_base + 296)
-    #define sum_ready_addr (mbar_base + 312)
-    #define o_full_addr (mbar_base + 320)
-    #define o_done_addr (mbar_base + 336)
-    #define partial_results_ready_addr (mbar_base + 344)
-    #define q_pair_ready_addr (mbar_base + 352)
-    #define tmem_dealloc_peer_addr (mbar_base + 360)
-    #define tmem_epoch_ready_addr (mbar_base + 368)
+    #define o_ready_addr (mbar_base + 232)
+    #define ref_full_addr (mbar_base + 248)
+    #define p_empty_addr (mbar_base + 264)
+    #define o_empty_addr (mbar_base + 280)
+    #define sum_ready_addr (mbar_base + 296)
+    #define o_full_addr (mbar_base + 304)
+    #define o_done_addr (mbar_base + 320)
+    #define partial_results_ready_addr (mbar_base + 328)
+    #define q_pair_ready_addr (mbar_base + 336)
+    #define tmem_dealloc_peer_addr (mbar_base + 344)
+    #define tmem_epoch_ready_addr (mbar_base + 352)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -1202,8 +1201,8 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c43301e3628e995cecb9(const __grid_co
     unsigned int* smem_epi = reinterpret_cast<unsigned int*>(smem_raw + 1024);
     const int smem_epi_addr = smem + 1024;
 
-    // Mbarrier init (21 pipeline groups, 0 ordered-sequence groups, 47 barriers)
-    // Mbarriers at smem_raw[0..376)
+    // Mbarrier init (20 pipeline groups, 0 ordered-sequence groups, 45 barriers)
+    // Mbarriers at smem_raw[0..360)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -1249,36 +1248,33 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c43301e3628e995cecb9(const __grid_co
             // s_empty: 2 barriers, init_count=8
             mbarrier_init(smem + 216, 8);
             mbarrier_init(smem + 224, 8);
-            // p_full: 2 barriers, init_count=8
+            // o_ready: 2 barriers, init_count=8
             mbarrier_init(smem + 232, 8);
             mbarrier_init(smem + 240, 8);
-            // o_ready: 2 barriers, init_count=8
-            mbarrier_init(smem + 248, 8);
-            mbarrier_init(smem + 256, 8);
             // ref_full: 2 barriers, init_count=4
-            mbarrier_init(smem + 264, 4);
-            mbarrier_init(smem + 272, 4);
+            mbarrier_init(smem + 248, 4);
+            mbarrier_init(smem + 256, 4);
             // p_empty: 2 barriers, init_count=1
-            mbarrier_init(smem + 280, 1);
-            mbarrier_init(smem + 288, 1);
+            mbarrier_init(smem + 264, 1);
+            mbarrier_init(smem + 272, 1);
             // o_empty: 2 barriers, init_count=8
-            mbarrier_init(smem + 296, 8);
-            mbarrier_init(smem + 304, 8);
+            mbarrier_init(smem + 280, 8);
+            mbarrier_init(smem + 288, 8);
             // sum_ready: 1 barriers, init_count=256
-            mbarrier_init(smem + 312, 256);
+            mbarrier_init(smem + 296, 256);
             // o_full: 2 barriers, init_count=1
-            mbarrier_init(smem + 320, 1);
-            mbarrier_init(smem + 328, 1);
+            mbarrier_init(smem + 304, 1);
+            mbarrier_init(smem + 312, 1);
             // o_done: 1 barriers, init_count=1
-            mbarrier_init(smem + 336, 1);
+            mbarrier_init(smem + 320, 1);
             // partial_results_ready: 1 barriers, init_count=256
-            mbarrier_init(smem + 344, 256);
+            mbarrier_init(smem + 328, 256);
             // q_pair_ready: 1 barriers, init_count=64
-            mbarrier_init(smem + 352, 64);
+            mbarrier_init(smem + 336, 64);
             // tmem_dealloc_peer: 1 barriers, init_count=32
-            mbarrier_init(smem + 360, 32);
+            mbarrier_init(smem + 344, 32);
             // tmem_epoch_ready: 1 barriers, init_count=256
-            mbarrier_init(smem + 368, 256);
+            mbarrier_init(smem + 352, 256);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -1289,9 +1285,9 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c43301e3628e995cecb9(const __grid_co
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 376);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 360);
     if (warp == 0) {
-        int _tmem_hold = smem + 376;
+        int _tmem_hold = smem + 360;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -2010,15 +2006,6 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c43301e3628e995cecb9(const __grid_co
                     }
                 }
                 __syncwarp();
-                if (elect_sync()) {
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b32 remAddr32;\n\t"
-                        "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
-                        "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
-                        "}"
-                        :: "r"(p_full_addr), "r"(0) : "memory");
-                }
                 if (rescale_due != 0) {
                     mbarrier_wait(o_full_addr + 8, tile - 1 >> 1 & 1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -3164,15 +3151,6 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c43301e3628e995cecb9(const __grid_co
                     }
                 }
                 __syncwarp();
-                if (elect_sync()) {
-                    asm volatile(
-                        "{\n\t"
-                        ".reg .b32 remAddr32;\n\t"
-                        "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
-                        "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
-                        "}"
-                        :: "r"(p_full_addr + 8), "r"(0) : "memory");
-                }
                 if (rescale_due_1 != 0) {
                     mbarrier_wait(o_full_addr, tile_1 - 1 >> 1 & 1);
                     asm volatile("tcgen05.fence::after_thread_sync;");
@@ -3913,7 +3891,6 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c43301e3628e995cecb9(const __grid_co
                     int pv_wait_phase = prev_tile >> 1 & 1;
                     if (cta_rank == 0) {
                         {
-                            mbarrier_wait(p_full_addr + (prev_phase) * 8, pv_wait_phase);
                             mbarrier_wait(o_ready_addr + (prev_phase) * 8, pv_wait_phase);
                         }
                         asm volatile("tcgen05.fence::after_thread_sync;");
@@ -4044,7 +4021,6 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_c43301e3628e995cecb9(const __grid_co
             int drain_wait_phase = last_tile >> 1 & 1;
             if (cta_rank == 0) {
                 {
-                    mbarrier_wait(p_full_addr + (last_phase) * 8, drain_wait_phase);
                     mbarrier_wait(o_ready_addr + (last_phase) * 8, drain_wait_phase);
                 }
                 asm volatile("tcgen05.fence::after_thread_sync;");
