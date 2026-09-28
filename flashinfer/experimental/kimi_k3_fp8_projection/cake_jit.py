@@ -1114,6 +1114,7 @@ ARCH_NVCC_FLAGS = {
 }
 
 GEMM_KERNEL_KEY = "gemm"  # register epilogue (any even output row stride)
+GEMM_RSTAGED_KERNEL_KEY = "gemm_rstaged"  # staged row-coalesced register epilogue (8-byte aligned output rows)
 GEMM_TSTORE_KERNEL_KEY = (
     "gemm_tstore"  # TMA-store epilogue (16-byte output base, row stride, column edge)
 )

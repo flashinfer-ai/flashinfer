@@ -71,6 +71,7 @@ import tvm_ffi
 
 from .cake_jit import (
     GEMM_KERNEL_KEY,
+    GEMM_RSTAGED_KERNEL_KEY,
     GEMM_TSTORE_KERNEL_KEY,
     MODULES,
     decode_kernel_key,
@@ -777,6 +778,13 @@ def _store_vec(data_ptr: int, ldo: int) -> int:
     return 2
 
 
+def gemm_reg_staged_eligible(tma_store: bool, store_vec: int) -> bool:
+    """Staged row-coalesced register epilogue (round 5) for output views the TMA store cannot address but whose rows
+    are at least 8-byte aligned (``store_vec >= 4``; e.g. ``n_valid = 6284``): the tile is staged in SMEM and copied
+    out row by row so every store instruction writes whole 32-byte sectors."""
+    return not tma_store and int(store_vec) >= 4
+
+
 def gemm_tma_store_eligible(data_ptr: int, ldo: int, n_valid: int) -> bool:
     """The output view can be a TMA tensor map: 16-byte base, a row stride that is a multiple of 16 bytes and a
     16-byte column edge.  The TMA unit bounds-checks the inner (contiguous) axis of a store at 16-byte granularity,
@@ -802,6 +810,7 @@ class ProjectionPlan:
     route: str  # "decode" or "gemm"
     decode: Optional[DecodeConfig]
     gemm_tma_store: bool  # GEMM route: TMA-store epilogue (aligned output view) instead of the register epilogue
+    gemm_reg_staged: bool  # GEMM route: staged row-coalesced register epilogue (8-byte aligned rows the TMA store cannot address)
     quant_units: Optional[int]  # None when the decode instance quantizes in-CTA
     sf_rows: int
     kernels: tuple[str, ...]  # logical kernel key per launch, in launch order
@@ -818,10 +827,12 @@ def route_plan(
     arch: str,
     sm_count: int,
     gemm_tma_store: bool = True,
+    gemm_reg_staged: bool = False,
 ) -> ProjectionPlan:
     """Resolve the launch sequence of ``M`` rows without touching device memory.
 
-    ``gemm_tma_store`` selects the GEMM epilogue program (``gemm_tma_store_eligible`` of the output view)."""
+    ``gemm_tma_store`` / ``gemm_reg_staged`` select the GEMM epilogue program (``gemm_tma_store_eligible`` /
+    ``gemm_reg_staged_eligible`` of the output view)."""
     M = int(M)
     cfg = decode_config(M, prepared.n_tiles128, prepared.num_k_iters, arch, sm_count)
     c_off, _c_bytes, p_off, p_bytes = reduction_layout(prepared, M, cfg)
@@ -835,7 +846,13 @@ def route_plan(
         kernels.append(quant_kernel_key(units))
         grids.append(-(-(M * units_per_row) // (QUANT_WARPS * 2)))
     if cfg is None:
-        kernels.append(GEMM_TSTORE_KERNEL_KEY if gemm_tma_store else GEMM_KERNEL_KEY)
+        kernels.append(
+            GEMM_TSTORE_KERNEL_KEY
+            if gemm_tma_store
+            else GEMM_RSTAGED_KERNEL_KEY
+            if gemm_reg_staged
+            else GEMM_KERNEL_KEY
+        )
         grids.append(_gemm_grid(_m_tiles(M), prepared.n_tiles))
     else:
         kernels.append(cfg.kernel_key)
@@ -847,6 +864,7 @@ def route_plan(
         route="decode" if cfg is not None else "gemm",
         decode=cfg,
         gemm_tma_store=cfg is None and bool(gemm_tma_store),
+        gemm_reg_staged=cfg is None and not gemm_tma_store and bool(gemm_reg_staged),
         quant_units=units,
         sf_rows=cfg.tok if cfg is not None else SF_TILE_ROWS,
         kernels=tuple(kernels),
@@ -1020,12 +1038,14 @@ def prepare_kimi_k3_fp8_projection(
     )
     q, sf = workspace
     ldo = int(out.stride(0))
+    tma_store = gemm_tma_store_eligible(out.data_ptr(), ldo, prepared.n_valid)
     plan = route_plan(
         prepared,
         M,
         arch,
         sm_count,
-        gemm_tma_store_eligible(out.data_ptr(), ldo, prepared.n_valid),
+        tma_store,
+        gemm_reg_staged_eligible(tma_store, _store_vec(out.data_ptr(), ldo)),
     )
     out_flat = torch.as_strided(
         out, (ldo * (M - 1) + prepared.n_valid,), (1,), out.storage_offset()
