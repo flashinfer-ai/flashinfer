@@ -61,6 +61,10 @@ def gemm2_k_blocks_per_stage(k: int, n_tile: int = 8) -> int:
         return int(_ENV_KBLOCKS2)
     if swap_m_group(n_tile, gemm2=True) > 1:
         return 4
+    if n_tile >= 192:
+        # 192-row stages: a 384-wide stage (96 KB + weights) leaves a single
+        # mainloop stage; keep the 128-wide stage.
+        return 4
     if k % 384 == 0:
         return 12
     return SWAP_K_BLOCKS_PER_STAGE
