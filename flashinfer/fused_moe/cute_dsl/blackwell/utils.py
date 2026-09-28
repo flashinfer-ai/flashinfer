@@ -292,6 +292,33 @@ def st_e4m3_pred(dst_gmem, v_f32, pred_i32, loc=None, ip=None):
 
 
 @dsl_user_op
+def red_add_v8_bf16x2_pred(dst_gmem, w0, w1, w2, w3, w4, w5, w6, w7, pred_i32, loc=None, ip=None):
+    """Predicated 32-byte ``red.global.add.noftz.v8.bf16x2`` (sixteen BF16 adds)."""
+    llvm.inline_asm(
+        None,
+        [
+            dst_gmem.iterator.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w0).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w1).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w2).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w3).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w4).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w5).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w6).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(w7).ir_value(loc=loc, ip=ip),
+            pred_i32.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred p_;\n\tsetp.ne.b32 p_, $9, 0;\n\t"
+        "@p_ red.global.add.noftz.v8.bf16x2 [$0], {$1, $2, $3, $4, $5, $6, $7, $8};\n}",
+        "l,r,r,r,r,r,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
 def red_add_v4_bf16x2_pred(dst_gmem, w0, w1, w2, w3, pred_i32, loc=None, ip=None):
     """Predicated 16-byte ``red.global.add.noftz.v4.bf16x2`` (eight BF16 adds)."""
     llvm.inline_asm(

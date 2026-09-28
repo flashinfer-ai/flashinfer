@@ -86,6 +86,7 @@ from .utils import (
     pack_bf16x2_f32,
     red_add_bf16x2_pair_pred,
     red_add_v4_bf16x2_pred,
+    red_add_v8_bf16x2_pred,
     st_e4m3_pred,
     st_global_v4_pred,
     st_u8_pred,
@@ -128,6 +129,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         perf_probe: int = 0,
         fin_bufs: int = 2,
         fin_red: bool = True,
+        fin_vec: int = 4,
         weight_l2_hint: Optional[int] = None,
         row_tma: Optional[bool] = None,
         gather_warps: Optional[int] = None,
@@ -321,6 +323,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # Wide finalize: reduce the staged token rows with 16-B red.global.v4
         # (True) or one cp.reduce.async.bulk per row (False).
         self.fin_red = fin_red
+        # Width of each finalize reduce op: 4 words (16 B, red.v4) or 8 words (32 B, red.v8).
+        if fin_vec not in (4, 8):
+            raise ValueError("fin_vec must be 4 or 8")
+        self.fin_vec = fin_vec
         # Optional L2 cache policy (``createpolicy`` encoding) for the weight
         # and weight-scale TMA loads; weights stream once per row group.
         self.weight_l2_hint = weight_l2_hint
@@ -2746,6 +2752,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 is_fin_issuer = (epi_tidx % 4) == 0
                                 fin_tok = epi_tidx // 16
                                 fin_chunk = epi_tidx % 16
+                                fin_tok8 = epi_tidx // 8
+                                fin_chunk8 = epi_tidx % 8
                                 tTR_tAcc_m = tTR_tAcc_m_base[
                                     (None, None, None, None, None, acc_slot_e)
                                 ]
@@ -2780,18 +2788,36 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                             # 512 x 16-B vectors per subtile: thread t reduces chunk
                                             # t % 16 of token rows t // 16 + 8k (k = 0..3).
                                             self.epilog_sync_barrier.arrive_and_wait()
-                                            for k in cutlass.range_constexpr(4):
-                                                tok_s = fin_tok + 8 * k
-                                                prow = row_base + sub * epi_n + tok_s
-                                                ok = cutlass.Int32(prow < mn_limit) * cutlass.Int32(
-                                                    self.perf_probe != 4
-                                                )
-                                                tok = sTok[(sub * epi_n + tok_s, meta_stage)]
-                                                w4 = sTrW[(None, fin_chunk, tok_s, buf)].load()
-                                                red_add_v4_bf16x2_pred(
-                                                    cute.domain_offset((tok, h0 + 8 * fin_chunk, 0), out),
-                                                    w4[0], w4[1], w4[2], w4[3], ok,
-                                                )
+                                            if cutlass.const_expr(self.fin_vec == 8):
+                                                # 256 x 32-B vectors per subtile: thread t reduces
+                                                # chunk t % 8 of token rows t // 8 + 16k (k = 0, 1).
+                                                for k in cutlass.range_constexpr(2):
+                                                    tok_s = fin_tok8 + 16 * k
+                                                    prow = row_base + sub * epi_n + tok_s
+                                                    ok = cutlass.Int32(prow < mn_limit) * cutlass.Int32(
+                                                        self.perf_probe != 4
+                                                    )
+                                                    tok = sTok[(sub * epi_n + tok_s, meta_stage)]
+                                                    wa = sTrW[(None, 2 * fin_chunk8, tok_s, buf)].load()
+                                                    wb = sTrW[(None, 2 * fin_chunk8 + 1, tok_s, buf)].load()
+                                                    red_add_v8_bf16x2_pred(
+                                                        cute.domain_offset((tok, h0 + 16 * fin_chunk8, 0), out),
+                                                        wa[0], wa[1], wa[2], wa[3],
+                                                        wb[0], wb[1], wb[2], wb[3], ok,
+                                                    )
+                                            else:
+                                                for k in cutlass.range_constexpr(4):
+                                                    tok_s = fin_tok + 8 * k
+                                                    prow = row_base + sub * epi_n + tok_s
+                                                    ok = cutlass.Int32(prow < mn_limit) * cutlass.Int32(
+                                                        self.perf_probe != 4
+                                                    )
+                                                    tok = sTok[(sub * epi_n + tok_s, meta_stage)]
+                                                    w4 = sTrW[(None, fin_chunk, tok_s, buf)].load()
+                                                    red_add_v4_bf16x2_pred(
+                                                        cute.domain_offset((tok, h0 + 8 * fin_chunk, 0), out),
+                                                        w4[0], w4[1], w4[2], w4[3], ok,
+                                                    )
                                         else:
                                             cute.arch.fence_proxy("async.shared", space="cta")
                                             self.epilog_sync_barrier.arrive_and_wait()
