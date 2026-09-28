@@ -51,9 +51,7 @@ REL_L2_RATIO_MAX = 1.15
 
 
 def _rel_l2(actual: torch.Tensor, expected: torch.Tensor) -> float:
-    return (
-        ((actual.float() - expected).norm() / expected.norm().clamp_min(1e-6)).item()
-    )
+    return ((actual.float() - expected).norm() / expected.norm().clamp_min(1e-6)).item()
 
 
 @requires_sm120

@@ -413,6 +413,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_nodelta_fake(
 ) -> None:
     pass
 
+
 @flashinfer_api
 def minimax_h3_sm120_varlen_attention_nvfp4(
     q: torch.Tensor,
@@ -691,6 +692,7 @@ def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
         float(softmax_scale),
     )
     return out
+
 
 __all__ = [
     "MINIMAX_H3_HEAD_DIM",
