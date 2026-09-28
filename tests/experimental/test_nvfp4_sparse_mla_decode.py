@@ -55,12 +55,16 @@ TOLERANCE = 1e-2
 GB200_CAPACITY = {8: 15, 6: 23, 5: 28, 4: 36, 3: 46}
 
 
-def _is_sm100() -> bool:
-    return torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0)
+def _is_supported_gpu() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability() in (
+        (10, 0),
+        (10, 3),
+    )
 
 
 requires_sm100 = pytest.mark.skipif(
-    not _is_sm100(), reason="NVFP4 sparse MLA decode requires compute capability 10.0"
+    not _is_supported_gpu(),
+    reason="NVFP4 sparse MLA decode requires compute capability 10.0 or 10.3",
 )
 
 

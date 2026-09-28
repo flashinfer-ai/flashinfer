@@ -90,8 +90,10 @@ def main():
     )
     args = parser.parse_args()
     dev = torch.device("cuda")
-    if torch.cuda.get_device_capability(dev) != (10, 0):
-        raise SystemExit("NVFP4 sparse MLA decode needs compute capability 10.0")
+    if torch.cuda.get_device_capability(dev) not in ((10, 0), (10, 3)):
+        raise SystemExit(
+            "NVFP4 sparse MLA decode needs compute capability 10.0 or 10.3"
+        )
     if max(args.requests) * (args.context // BLOCK) > args.blocks:
         raise SystemExit("not enough KV blocks for the requested contexts")
     g = torch.Generator(device=dev).manual_seed(0)

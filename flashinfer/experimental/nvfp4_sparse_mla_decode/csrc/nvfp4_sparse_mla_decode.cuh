@@ -13,8 +13,8 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-// NVFP4 sparse-MLA decode for SM100 (compute capability 10.0). Framework-agnostic: raw pointers
-// only.
+// NVFP4 sparse-MLA decode for SM100 and SM103 (compute capability 10.0 and 10.3).
+// Framework-agnostic: raw pointers only.
 //
 // Each query token t attends to the KV rows a sparse indexer picked for it (DeepSeek-V3.2 / GLM-5
 // DSA style):

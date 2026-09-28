@@ -33,14 +33,27 @@ MAX_KEYS_PER_CTA = 1024
 RING_SLOTS = 3
 # Cluster sizes the automatic plan considers, largest first. 7 fits no more clusters per wave than 8.
 PLAN_CTAS = (8, 6, 5, 4, 3)
-# Cluster sizes accepted from callers: the ones validated on SM100 (2 fits the kernel but was never validated).
+# Cluster sizes accepted from callers: the ones validated on GB200 and B300 (2 fits the kernel but was never validated).
 VALID_CTAS = range(3, 9)
 LOG2E = math.log2(math.e)
+# Compute capability -> the architecture-specific target the kernel is built for.
+ARCH_BY_COMPUTE_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 
 @functools.cache
-def get_module():
-    return gen_nvfp4_sparse_mla_decode_module().build_and_load()
+def get_module(arch: str):
+    return gen_nvfp4_sparse_mla_decode_module(arch).build_and_load()
+
+
+def device_arch(device) -> str:
+    capability = torch.cuda.get_device_capability(device)
+    arch = ARCH_BY_COMPUTE_CAPABILITY.get(capability)
+    if arch is None:
+        raise RuntimeError(
+            "NVFP4 sparse MLA decode requires compute capability 10.0 or 10.3 (B200/GB200, B300/GB300), "
+            f"got {capability}"
+        )
+    return arch
 
 
 def is_valid_config(topk_width: int, num_ctas: int) -> bool:
@@ -73,7 +86,7 @@ def select_num_ctas(num_tokens: int, topk_width: int, capacity: Dict[int, int]) 
 
 @functools.cache
 def _capacity(device_index: int) -> Dict[int, int]:
-    module = get_module()
+    module = get_module(device_arch(device_index))
     with torch.cuda.device(device_index):
         return {c: int(module.max_active_clusters(c)) for c in PLAN_CTAS}
 
@@ -94,11 +107,7 @@ def _check_inputs(
             raise ValueError(f"{name} is on {t.device}, query on {query.device}")
         if not t.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
-    if torch.cuda.get_device_capability(query.device) != (10, 0):
-        raise RuntimeError(
-            "NVFP4 sparse MLA decode requires compute capability 10.0 (SM100), got "
-            f"{torch.cuda.get_device_capability(query.device)}"
-        )
+    device_arch(query.device)
     if (
         query.dtype != torch.float8_e4m3fn
         or query.dim() != 3
@@ -170,7 +179,7 @@ def run(
                 f"{RING_SLOTS} to {MAX_KEYS_PER_CTA // STAGE_KEYS} stages of {STAGE_KEYS} keys "
                 f"(sizes {VALID_CTAS.start} to {VALID_CTAS.stop - 1})"
             )
-    get_module().run(
+    get_module(device_arch(query.device)).run(
         kv_cache,
         query,
         indices,
