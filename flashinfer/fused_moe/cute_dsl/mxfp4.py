@@ -1718,7 +1718,9 @@ class Mxfp4MoESwapAbPlan:
         swizzle and C stages. It has tiles only when the routing chose that
         padding. Returns the prepared (kernel, args) launch."""
         alt_tactic = self.mixed192_dual[2]
-        gemm2_raster = w._gemm2_raster(num_tokens, alt_tactic[0][1])
+        # The dense path derives the raster from its base GEMM2 tile and
+        # passes it to both variants.
+        gemm2_raster = w._gemm2_raster(num_tokens, w._tactic(num_tokens)[2][0][1])
         alt_launches = {}
         blockscaled_contiguous_grouped_gemm_finalize_fusion(
             a=b["gemm1_out"],
