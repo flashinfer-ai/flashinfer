@@ -62,6 +62,8 @@ tcgen05/TMEM (sm_100a, sm_103a).
 
 from typing import Optional, Tuple, Type
 
+import os
+
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
@@ -1048,6 +1050,12 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # (R2S, R2S_M, R2S_N, BUF)
         tRS_sTr = thr_copy_r2s.partition_D(sTr)
         tRS_rC = tiled_copy_r2s.retile(tTR_rC)
+        if os.environ.get("SWAPAB_DEBUG"):
+            # Trace-time dump of the fragment mapping (thread x value -> (h, tok)).
+            print("[swapab] mmajor t2r:", tiled_copy_t2r)
+            print("[swapab] mmajor r2s:", tiled_copy_r2s)
+            print("[swapab] mmajor tTR_cC layout:", tTR_cC.layout, "tRS_rC layout:", tRS_rC.layout)
+            print("[swapab] mmajor tRS_sTr layout:", tRS_sTr.layout)
         return (
             tiled_copy_t2r,
             tTR_tAcc,
