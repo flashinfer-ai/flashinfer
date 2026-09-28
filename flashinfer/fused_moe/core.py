@@ -684,16 +684,6 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             ],
             Any,
         ] = dict()
-        tuning_config = TuningConfig(
-            dynamic_tensor_specs=(
-                DynamicTensorSpec(
-                    (0,),
-                    (0,),
-                    get_hybrid_num_tokens_buckets(8192),
-                    make_hybrid_bucket_mapper(8192),
-                ),
-            )
-        )
 
         def __init__(
             self,
@@ -933,10 +923,10 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
                 self.activation_type,
             )
 
-        @classmethod
+        @staticmethod
         @functools.lru_cache(maxsize=None)
-        def refine_tuning_config(cls, tune_max_num_tokens: int):
-            cls.tuning_config = TuningConfig(
+        def get_tuning_config(tune_max_num_tokens: int) -> TuningConfig:
+            return TuningConfig(
                 dynamic_tensor_specs=(
                     DynamicTensorSpec(
                         (0,),
@@ -1018,14 +1008,14 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
 
         if profile_ids is None:
             tuner = AutoTuner.get()
-            MoERunner.refine_tuning_config(tune_max_num_tokens)
+            tuning_config = MoERunner.get_tuning_config(tune_max_num_tokens)
 
             # Limit tactics to GEMM1 during tuning
             moe_runner.gemm_idx_for_tuning = 1
             _, gemm_tactic_1 = tuner.choose_one(
                 "trtllm::fused_moe::gemm1",
                 [moe_runner],
-                MoERunner.tuning_config,
+                tuning_config,
                 [
                     input,
                     fc1_expert_weights,
@@ -1041,7 +1031,7 @@ def get_cutlass_fused_moe_module(backend: str = "100", use_fast_build: bool = Fa
             _, gemm_tactic_2 = tuner.choose_one(
                 "trtllm::fused_moe::gemm2",
                 [moe_runner],
-                MoERunner.tuning_config,
+                tuning_config,
                 [
                     input,
                     fc1_expert_weights,

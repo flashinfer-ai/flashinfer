@@ -3860,6 +3860,60 @@ def _ws_size(num_tokens, cfg=_WS_CFG, *, ep_size=1, ep_rank=0, device=None):
     )
 
 
+@pytest.mark.parametrize("tuning", [False, True])
+@_CUTLASS_MOE_ARCH_SKIP
+def test_tuning_config_tracks_each_call(monkeypatch, tuning):
+    from flashinfer.autotuner import AutoTuner
+    from flashinfer.fused_moe.utils import get_hybrid_num_tokens_buckets
+
+    choose_one = AutoTuner.choose_one
+    observed = []
+
+    def record_choice(self, custom_op, runners, tuning_config, inputs, **kwargs):
+        result = choose_one(self, custom_op, runners, tuning_config, inputs, **kwargs)
+        observed.append((kwargs["gemm_idx"], tuning_config, result[1]))
+        return result
+
+    monkeypatch.setattr(AutoTuner, "choose_one", record_choice)
+    inputs = _make_ws_inputs(64)
+    configs = {}
+    outputs = {}
+    tactics = {}
+    for num_tokens in (64, 8, 64, 32, 8, 32, 64):
+        x, ids, weights, w1, w2 = inputs
+        x, ids, weights = x[:num_tokens], ids[:num_tokens], weights[:num_tokens]
+        observed.clear()
+        with autotune(tuning):
+            output = fused_moe.cutlass_fused_moe(
+                x,
+                ids,
+                weights,
+                w1,
+                w2,
+                output_dtype=x.dtype,
+                quant_scales=[],
+                tune_max_num_tokens=num_tokens,
+            )[0]
+        reference = compute_with_experts(w1.shape[0], x, w1, w2, ids, weights)
+        torch.testing.assert_close(output, reference, rtol=1e-2, atol=1e-2)
+        assert [gemm for gemm, _, _ in observed] == [1, 2]
+        selected_tactics = tuple(tactic for _, _, tactic in observed)
+        config = observed[0][1]
+        assert observed[1][1] is config
+        spec = config.dynamic_tensor_specs[0]
+        assert spec.gen_tuning_buckets == get_hybrid_num_tokens_buckets(num_tokens)
+        assert spec.map_to_tuning_buckets(num_tokens) == num_tokens
+        if num_tokens in configs:
+            assert config is configs[num_tokens]
+            assert selected_tactics == tactics[num_tokens]
+            torch.testing.assert_close(
+                output, outputs[num_tokens], rtol=1e-2, atol=1e-2
+            )
+        configs[num_tokens] = config
+        outputs[num_tokens] = output
+        tactics[num_tokens] = selected_tactics
+
+
 @_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_size_positive_and_monotonic():
     sizes = [_ws_size(n) for n in [256, 1024, 4096, 8192]]
