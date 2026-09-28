@@ -2715,6 +2715,37 @@ and on (``MXFP4_SWAP192=1``):
    rank    32768  empty     148 / 145 / 147            163 / 163 / 164            1.103 / 1.125 / 1.113
    rank    32768  remote_d  2278 / 2245 / 2261         2003 / 2011 / 2000         0.879 / 0.896 / 0.885
 
+The full tables at this revision (one B300, pool0-0099, graph replay,
+CUPTI span, every lane a shared one-GPU step with whole-GPU isolation):
+expert-parallel rank 44 of 44 graph rows above TRT-LLM Gen (geometric
+mean 1.381, round 27 1.387; the rank runs the unchanged dense path),
+MoE-TP shard 33 of 33 (1.413, round 27 1.401; the form does not touch
+T <= 4096), long rows 1.454 / 1.145 (round 27 1.449 / 1.152). The shard's
+nine long rows read 1.053 / 1.101 / 1.205 at T=8192, 1.134 / 1.098 / 1.260
+at T=16384 and 1.136 / 1.225 / 1.107 at T=32768 (balanced / hot /
+``empty``; round 27: 1.025 / 1.079 / 1.193, 1.091 / 1.153 / 1.260, 1.161 /
+1.249 / 1.181). The rank's long rows read 0.961 / 0.981 at T=8192 balanced
+/ hot and 0.981 at T=16384 hot (round 27 0.959 / 0.998 / 0.988), T=16384
+balanced 1.063, remote-dominated 1.054 and the T=32768 rows 1.152 / 1.084
+/ 1.383; they stay open behind the rank's ``empty`` routings above.
+Deferred form 1.209 / 1.163 (round 27 1.203 / 1.152). Against the Goal
+floor 9 of 56 and 2 of 42 rows within 1.10 x, unchanged; against the
+reachable floor 45 of 56 (unchanged) and 37 of 42 (round 27: 39): the
+shard's T=8192 and T=16384 balanced / hot rows sit at 1.05 / 0.95 and
+1.14 / 1.02 of the mixed form's floor, T=32768 hot at 1.10. The two rows
+newly above 1.10 x are T=16384 balanced (1.14, round 27 1.09) and T=32768
+``empty`` (1.15, round 27 1.03): in this pass both arms ran slower than
+in round 27 (TRT-LLM Gen 3.19 -> 3.46 ms and 5.12 -> 5.34 ms, the
+candidate 2.92 -> 3.05 ms and 4.33 -> 4.82 ms), the power-cap drift of
+round 25, and the same-GPU pairing against main above has the two rows at
+0.93-0.97 and 0.98-1.02. Gates on this revision: the unit and deferred
+suites (214 / 69 / 16, 218 and 181 selected), the layout, all-local and
+paired-FP64 suites (4 + 4 skipped, 3 + 1, 2, 18), compute-sanitizer
+synccheck and memcheck over the gate matrix (78 runs, 155 clean
+summaries) and over the shard's mixed rows T=2048..32768 (16 runs, 88 clean
+summaries),
+all with the mixed form as the shard default and off on the rank.
+
 (*) The shard's T=2048 balanced row jitters +-1 % on every arm: a
 four-pass A/B/A/B of main, the round-27 tree, this tree with the form off
 and this revision read 0.997 / 1.015 / 0.998, 0.996 / 1.002 / 0.998 and
