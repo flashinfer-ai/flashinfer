@@ -592,6 +592,12 @@ def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
       default route (+9 %), max-abs about 0.064 vs 0.060; the FP4 block-scaled tolerance
       ``atol = 1.0, rtol = 0.1`` still holds on every element, and the tests bound the relative L2 at
       1.15x the default route's on the same inputs;
+    * the deviation grows on short segments: the dropped term is the mean over a 128-row Q block, and a
+      partial block of ``n`` rows has a block mean about ``sqrt(128 / n)`` larger.  Measured relative-L2
+      ratio vs the default route for a single segment of N tokens (56 heads, Gaussian inputs): 1.10 at
+      N >= 128 (full blocks), 1.13 at 100, 1.18 at 64, 1.23 at 51, 1.32 at 32, 1.64 at 16 (max-abs 0.79,
+      still inside the FP4 tolerance).  In a packed stream the aggregate error is dominated by the short
+      segments, whose outputs are larger per element;
     * measured latency: the attention launch runs about 9-15 % faster on both GB202 SKUs (RTX 5090 and
       RTX PRO 6000 Blackwell; 220 registers instead of 246), the complete call proportionally less on
       short plans where pre-processing dominates.
