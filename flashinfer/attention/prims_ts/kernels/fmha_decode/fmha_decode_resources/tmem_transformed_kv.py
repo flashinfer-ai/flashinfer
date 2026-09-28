@@ -50,11 +50,12 @@ from .smem_resources import SmemKvResource
 def _mul_e2m1x4_e4m3x4(packed_fp4: Int32, packed_sf: Int32) -> Int32:
     """Apply four E4M3 scale factors to four unpacked E2M1 values.
 
-    The ptx mul.e4m3x4.e2m1x4.e4m3x4 was introduced in PTX 9.4 (CTK 13.4)
+    PTX 9.4 (CUDA 13.4) supports the byte-padded E2M1 operand directly.
+    Each FP4 value occupies the low nibble of one byte in the 32-bit input.
     """
     if cutlass.const_expr(cutlass.target_version(min_version="13.4")):
         return cute.arch.inline_ptx(
-            "mul.e4m3x4.e2m1x4.e4m3x4.satfinite {$w0}, {$r0}, {$r1};",
+            "mul.e4m3x4.e2m1p4x4.e4m3x4.satfinite {$w0}, {$r0}, {$r1};",
             write_only_types=[Int32],
             read_only_args=[packed_fp4, packed_sf],
         )
