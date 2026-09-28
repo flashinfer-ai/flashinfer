@@ -427,8 +427,13 @@ struct KernelTraits {
 #else
   static constexpr bool kSmemFitsRepackWithScale = true;
 #endif
-  // The token-head-scale SM75 hd256 case disables the repack (FORCE_DISABLE_REPACK, or
-  // kSmemFitsRepackWithScale when the scale buffer no longer fits) to make room for the scales.
+  // Drop the repack staging buffer when the token-head-scale buffers leave no room for it:
+  // the scale smem (kScaleSmemPerMmaKV per mma_kv) is reserved in every token-head-scale
+  // instantiation, so on tight-smem parts (SM75 head_dim=256) the minimum KV tile plus the
+  // scale buffer exceeds the per-block opt-in limit and the repack buffer must go to make
+  // room. kSmemFitsRepackWithScale is the device-side (compile-time) check that sets the
+  // launched kernel's layout; the host reaches the same conclusion from the runtime-queried
+  // limit and passes FORCE_DISABLE_REPACK when it sizes the launch config.
   static constexpr bool kRepackEnabled =
       use_kv_repack<DTypeKV_, CTA_TILE_Q, HEAD_DIM_QK, HEAD_DIM_VO>(ENABLE_FP4_REPACK_) &&
       !FORCE_DISABLE_REPACK && (!USE_TOKEN_HEAD_SF || kSmemFitsRepackWithScale);
@@ -4960,11 +4965,11 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
 
   DISPATCH_NUM_MMA_KV(
       min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg), NUM_MMA_KV, {
-        using KTraits = KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK,
-                                     NUM_MMA_D_VO, NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE,
-                                     DTypeQ, DTypeKV, DTypeO, DTypeQKAccum, typename Params::IdType,
-                                     AttentionVariant, kPrefillLauncherRepacksFp4,
-                                     USE_TOKEN_HEAD_SF>;
+        using KTraits =
+            KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                         NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                         DTypeQKAccum, typename Params::IdType, AttentionVariant,
+                         kPrefillLauncherRepacksFp4, USE_TOKEN_HEAD_SF>;
         if constexpr (KTraits::IsInvalid()) {
           // Invalid configuration, skip
           std::ostringstream err_msg;
@@ -4984,7 +4989,8 @@ cudaError_t BatchPrefillWithRaggedKVCacheDispatched(Params params, typename Para
               KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                            NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
                            DTypeQKAccum, typename Params::IdType, AttentionVariant,
-                           kPrefillLauncherRepacksFp4, USE_TOKEN_HEAD_SF, /*FORCE_DISABLE_REPACK=*/true>;
+                           kPrefillLauncherRepacksFp4, USE_TOKEN_HEAD_SF,
+                           /*FORCE_DISABLE_REPACK=*/true>;
           using SmemStorageOff = std::conditional_t<KTraitsNoRepack::USE_SOFTMAX_VO_SPLIT,
                                                     typename KTraitsNoRepack::SharedStoragePaged,
                                                     typename KTraitsNoRepack::SharedStorage>;
@@ -5191,11 +5197,11 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
 
   DISPATCH_NUM_MMA_KV(
       min(static_cast<uint32_t>(max_num_mma_kv_smem), max_num_mma_kv_reg), NUM_MMA_KV, {
-        using KTraits = KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK,
-                                     NUM_MMA_D_VO, NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE,
-                                     DTypeQ, DTypeKV, DTypeO, DTypeQKAccum, typename Params::IdType,
-                                     AttentionVariant, kPrefillLauncherRepacksFp4,
-                                     USE_TOKEN_HEAD_SF>;
+        using KTraits =
+            KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
+                         NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
+                         DTypeQKAccum, typename Params::IdType, AttentionVariant,
+                         kPrefillLauncherRepacksFp4, USE_TOKEN_HEAD_SF>;
         if constexpr (KTraits::IsInvalid()) {
           // Invalid configuration, skip
           std::ostringstream err_msg;
@@ -5212,7 +5218,8 @@ cudaError_t BatchPrefillWithPagedKVCacheDispatched(Params params, typename Param
               KernelTraits<MASK_MODE, CTA_TILE_Q, NUM_MMA_Q, NUM_MMA_KV, NUM_MMA_D_QK, NUM_MMA_D_VO,
                            NUM_WARPS_Q, NUM_WARPS_KV, POS_ENCODING_MODE, DTypeQ, DTypeKV, DTypeO,
                            DTypeQKAccum, typename Params::IdType, AttentionVariant,
-                           kPrefillLauncherRepacksFp4, USE_TOKEN_HEAD_SF, /*FORCE_DISABLE_REPACK=*/true>;
+                           kPrefillLauncherRepacksFp4, USE_TOKEN_HEAD_SF,
+                           /*FORCE_DISABLE_REPACK=*/true>;
           const size_t smem_size = disable_repack
                                        ? sizeof(typename KTraitsNoRepack::SharedStoragePaged)
                                        : sizeof(typename KTraits::SharedStoragePaged);
