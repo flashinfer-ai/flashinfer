@@ -49245,7 +49245,7 @@ kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    if ((launch_flags & 2) != 0) {
+    if ((launch_flags & 6) == 6) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if ((vocab & 3) == 0) {
@@ -50882,6 +50882,9 @@ kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk
             n_2 = n_2 + total_129;
             n_w = n_2;
         }
+    }
+    if ((launch_flags & 6) == 2) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if (lane == 0) {
         scal[16 + warp] = n_w;
@@ -58597,7 +58600,7 @@ kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    if ((launch_flags & 2) != 0) {
+    if ((launch_flags & 6) == 6) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if ((vocab & 3) == 0) {
@@ -60256,6 +60259,9 @@ kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk
             n_2 = n_2 + total_129;
             n_w = n_2;
         }
+    }
+    if ((launch_flags & 6) == 2) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if (lane == 0) {
         scal[16 + warp] = n_w;
@@ -68295,7 +68301,7 @@ kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    if ((launch_flags & 2) != 0) {
+    if ((launch_flags & 6) == 6) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if ((vocab & 3) == 0) {
@@ -69978,6 +69984,9 @@ kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk
             n_2 = n_2 + total_129;
             n_w = n_2;
         }
+    }
+    if ((launch_flags & 6) == 2) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if (lane == 0) {
         scal[16 + warp] = n_w;
@@ -78355,7 +78364,7 @@ kernel_cake_radix_topk_c8_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    if ((launch_flags & 2) != 0) {
+    if ((launch_flags & 6) == 6) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if ((vocab & 3) == 0) {
@@ -80086,6 +80095,9 @@ kernel_cake_radix_topk_c8_e16s(float* __restrict__ probs, int* __restrict__ topk
             n_2 = n_2 + total_129;
             n_w = n_2;
         }
+    }
+    if ((launch_flags & 6) == 2) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if (lane == 0) {
         scal[16 + warp] = n_w;
