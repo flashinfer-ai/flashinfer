@@ -35,14 +35,14 @@
   "schema_version": 1,
   "semantics": {
     "determinism": "strict: no atomics decide any output; slab (vals, idx) is rewritten in sorted order and renorm_out is emitted in that order, bitwise identical across launches, CUDA-graph replay and every kernel variant",
-    "fused_tail": "stage 1 takes the stage-2/3 parameters and a host flag fuse_tail; with fuse_tail set and max top-k <= fused_tail_kcap every row's stage 2/3 runs inside the stage-1 kernel (warp 0 of rank 0 after one cluster barrier) with the same outputs, and the stage-2/3 kernel is not launched",
+    "fused_tail": "stage 1 takes the stage-2/3 parameters and a host flag fuse_tail; on a variant whose entry has fused_tail true, fuse_tail set and max top-k <= fused_tail_kcap runs every row's stage 2/3 inside the stage-1 kernel (warp 0 of rank 0 after one cluster barrier) with the same outputs, and the stage-2/3 kernel is not launched; variants with fused_tail false (the ept = 48 resident, a large-k pick) are built without the tail and reject fuse_tail",
     "nan_inf": "NaN, negative and -0.0 probabilities are sanitized to +0 and never sampled; a row containing +inf keeps exactly its +inf entries, samples uniformly among them and renormalizes to 1/m; a zero-mass row returns its smallest slab index with an all-zero renorm",
     "rng": "one curand_uniform per row from curand_init(seed, row, offset) (Philox4x32-10); a shared torch.Generator is advanced by 32 * batch like the FlashInfer top-p routes",
     "top_k": "first k entries of lexsort(-prob, index): k largest sanitized probabilities, ties toward the lower vocabulary index; k clamped to [1, min(vocab, slab_entries)]",
     "top_p": "shortest sorted prefix whose exclusive exact fixed-point mass is below p * mass(top-k), renormalized in float64; p clamped to (0, 1] (p <= 0 -> argmax, NaN -> 1)"
   },
   "slab_entries": 1024,
-  "source_sha256": "933b004167fadf1506edfb186803813cde5a26e4422538002165868c480f0e4b",
+  "source_sha256": "1695f8d5fc28c82d2abd521b8179d6a8007e2cb771288d495123839ad38e10a5",
   "stage1": [
     {
       "block_threads": 512,
@@ -50,6 +50,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 33152,
       "ept": 4,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e4"
     },
@@ -59,6 +60,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 33408,
       "ept": 8,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e8"
     },
@@ -68,6 +70,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 33920,
       "ept": 16,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e16"
     },
@@ -77,6 +80,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 34944,
       "ept": 32,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e32"
     },
@@ -86,6 +90,7 @@
       "cluster": 2,
       "dynamic_smem_bytes": 33152,
       "ept": 4,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e4"
     },
@@ -95,6 +100,7 @@
       "cluster": 2,
       "dynamic_smem_bytes": 33920,
       "ept": 16,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e16"
     },
@@ -104,6 +110,7 @@
       "cluster": 2,
       "dynamic_smem_bytes": 34944,
       "ept": 32,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e32"
     },
@@ -113,6 +120,7 @@
       "cluster": 4,
       "dynamic_smem_bytes": 33920,
       "ept": 16,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e16"
     },
@@ -122,6 +130,7 @@
       "cluster": 4,
       "dynamic_smem_bytes": 34944,
       "ept": 32,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e32"
     },
@@ -131,6 +140,7 @@
       "cluster": 8,
       "dynamic_smem_bytes": 33920,
       "ept": 16,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e16"
     },
@@ -140,6 +150,7 @@
       "cluster": 8,
       "dynamic_smem_bytes": 34944,
       "ept": 32,
+      "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e32"
     },
@@ -149,6 +160,7 @@
       "cluster": 8,
       "dynamic_smem_bytes": 35968,
       "ept": 48,
+      "fused_tail": false,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e48"
     },
@@ -158,6 +170,7 @@
       "cluster": 1,
       "dynamic_smem_bytes": 165248,
       "ept": 16,
+      "fused_tail": true,
       "stream": true,
       "symbol": "kernel_cake_radix_topk_c1_e16s"
     },
@@ -167,6 +180,7 @@
       "cluster": 2,
       "dynamic_smem_bytes": 165248,
       "ept": 16,
+      "fused_tail": true,
       "stream": true,
       "symbol": "kernel_cake_radix_topk_c2_e16s"
     },
@@ -176,6 +190,7 @@
       "cluster": 4,
       "dynamic_smem_bytes": 165248,
       "ept": 16,
+      "fused_tail": true,
       "stream": true,
       "symbol": "kernel_cake_radix_topk_c4_e16s"
     },
@@ -185,6 +200,7 @@
       "cluster": 8,
       "dynamic_smem_bytes": 165248,
       "ept": 16,
+      "fused_tail": true,
       "stream": true,
       "symbol": "kernel_cake_radix_topk_c8_e16s"
     }

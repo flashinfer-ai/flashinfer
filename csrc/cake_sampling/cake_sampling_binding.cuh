@@ -100,6 +100,7 @@ struct Stage1Variant {
   int32_t stream;  // 1: streaming variant (any vocab, runtime chunk count); 0: register-resident
   int32_t threads;
   int32_t smem_bytes;
+  int32_t fused_tail;  // 1: built with the fused stage-2/3 tail (accepts fuse_tail != 0)
 };
 
 struct Stage23Variant {
@@ -109,8 +110,8 @@ struct Stage23Variant {
   int32_t smem_bytes;
 };
 
-#define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem) \
-  {reinterpret_cast<const void*>(&symbol), cluster, ept, stream, threads, smem},
+#define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem, fused) \
+  {reinterpret_cast<const void*>(&symbol), cluster, ept, stream, threads, smem, fused},
 #define CAKE_SAMPLING_STAGE23_ENTRY(symbol, threads, items, smem) \
   {reinterpret_cast<const void*>(&symbol), threads, items, smem},
 
@@ -221,6 +222,9 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   CHECK_CUDA(out_samples);
   CHECK_CUDA(out_renorm);
   if (fuse_tail != 0) {
+    TVM_FFI_ICHECK(v->fused_tail == 1)
+        << "stage-1 variant cluster=" << cluster << " ept=" << ept << " stream=" << stream_variant
+        << " is built without the fused tail (manifest fused_tail = false)";
     TVM_FFI_ICHECK(topk_kind == kTopKPerRow || topk_scalar <= kFusedTailKCap)
         << "fuse_tail needs top_k <= " << kFusedTailKCap;
     CHECK_INPUT_TYPE(topp_arr, dl_float32);

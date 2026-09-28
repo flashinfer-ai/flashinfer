@@ -1144,6 +1144,15 @@ def test_fused_tail_matches_two_launch_form():
     man = load_manifest()
     kcap = int(man["fused_tail_kcap"])
     assert kcap >= 1
+    # The (8, 48) resident is the only variant built without the tail; no small-k pick may reach it.
+    assert [v["symbol"] for v in man["stage1"] if not v["fused_tail"]] == [
+        "kernel_cake_radix_topk_c8_e48"
+    ]
+    for sm_count in (132, 148, 212):
+        for vocab in (32768, 50257, 128256, 151936, 152064, 202048, 262144):
+            for batch in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+                c, e, s = choose_stage1(vocab=vocab, batch=batch, sm_count=sm_count, top_k_max=kcap)
+                assert (c, e) != (8, 48), (sm_count, vocab, batch)
     for vocab, batch in ((32768, 5), (128256, 3), (262144, 2)):
         probs = _probs(batch, vocab, seed=41 + vocab % 97)
         pn = probs.cpu().numpy()

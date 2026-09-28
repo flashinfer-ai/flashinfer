@@ -49091,577 +49091,6 @@ kernel_cake_radix_topk_c8_e48(float* __restrict__ probs, int* __restrict__ topk_
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
-        asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
-        asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-        if (rank == 0 && warp == 0) {
-            float p_row = ((topp_kind == 2) ? topp_arr[row] : topp_scalar);
-            unsigned long long comp[2];
-            int pos_1 = lane * 2;
-            unsigned long long c_in = 0;
-            if (pos_1 < k) {
-                int ix0 = out_idx[out_base + (unsigned long long)pos_1];
-                float v0i = out_vals[out_base + (unsigned long long)pos_1];
-                unsigned int bits_1_2 = __as_u32(v0i);
-                unsigned int key_2_2 = ((bits_1_2 <= 2139095040) ? bits_1_2 : 0);
-                c_in = (unsigned long long)key_2_2 << 32 | (unsigned long long)~(unsigned int)ix0;
-            }
-            comp[0] = c_in;
-            int pos_0 = lane * 2 + 1;
-            unsigned long long c_in_1 = 0;
-            if (pos_0 < k) {
-                int ix0_1 = out_idx[out_base + (unsigned long long)pos_0];
-                float v0i_1 = out_vals[out_base + (unsigned long long)pos_0];
-                unsigned int bits_1_3 = __as_u32(v0i_1);
-                unsigned int key_2_3 = ((bits_1_3 <= 2139095040) ? bits_1_3 : 0);
-                c_in_1 = (unsigned long long)key_2_3 << 32 | (unsigned long long)~(unsigned int)ix0_1;
-            }
-            comp[1] = c_in_1;
-            unsigned long long a = comp[0];
-            unsigned long long b = comp[1];
-            bool swap = a < b;
-            bool desc_r = (tid & 1) == 0;
-            swap = ((desc_r) ? a < b : a > b);
-            comp[0] = ((swap) ? b : a);
-            comp[1] = ((swap) ? a : b);
-            bool keep_max = (tid & 1) == 0;
-            keep_max = ((tid ^ tid >> 1) & 1) == 0;
-            unsigned long long _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
-            unsigned long long o = _shfl_xor_0;
-            unsigned long long hi = ((o > comp[0]) ? o : comp[0]);
-            unsigned long long lo_2 = ((o > comp[0]) ? comp[0] : o);
-            comp[0] = ((keep_max) ? hi : lo_2);
-            unsigned long long _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 1);
-            unsigned long long o_3 = _shfl_xor_1;
-            unsigned long long hi_4 = ((o_3 > comp[1]) ? o_3 : comp[1]);
-            unsigned long long lo_5 = ((o_3 > comp[1]) ? comp[1] : o_3);
-            comp[1] = ((keep_max) ? hi_4 : lo_5);
-            unsigned long long a_6 = comp[0];
-            unsigned long long b_7 = comp[1];
-            bool swap_8 = a_6 < b_7;
-            bool desc_r_9 = (tid & 2) == 0;
-            swap_8 = ((desc_r_9) ? a_6 < b_7 : a_6 > b_7);
-            comp[0] = ((swap_8) ? b_7 : a_6);
-            comp[1] = ((swap_8) ? a_6 : b_7);
-            bool keep_max_10 = (tid & 2) == 0;
-            keep_max_10 = ((tid >> 1 ^ tid >> 2) & 1) == 0;
-            unsigned long long _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 2);
-            unsigned long long o_11 = _shfl_xor_2;
-            unsigned long long hi_12 = ((o_11 > comp[0]) ? o_11 : comp[0]);
-            unsigned long long lo_13 = ((o_11 > comp[0]) ? comp[0] : o_11);
-            comp[0] = ((keep_max_10) ? hi_12 : lo_13);
-            unsigned long long _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 2);
-            unsigned long long o_14 = _shfl_xor_3;
-            unsigned long long hi_15 = ((o_14 > comp[1]) ? o_14 : comp[1]);
-            unsigned long long lo_16 = ((o_14 > comp[1]) ? comp[1] : o_14);
-            comp[1] = ((keep_max_10) ? hi_15 : lo_16);
-            bool keep_max_17 = (tid & 1) == 0;
-            keep_max_17 = ((tid ^ tid >> 2) & 1) == 0;
-            unsigned long long _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
-            unsigned long long o_18 = _shfl_xor_4;
-            unsigned long long hi_19 = ((o_18 > comp[0]) ? o_18 : comp[0]);
-            unsigned long long lo_20 = ((o_18 > comp[0]) ? comp[0] : o_18);
-            comp[0] = ((keep_max_17) ? hi_19 : lo_20);
-            unsigned long long _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 1);
-            unsigned long long o_21 = _shfl_xor_5;
-            unsigned long long hi_22 = ((o_21 > comp[1]) ? o_21 : comp[1]);
-            unsigned long long lo_23 = ((o_21 > comp[1]) ? comp[1] : o_21);
-            comp[1] = ((keep_max_17) ? hi_22 : lo_23);
-            unsigned long long a_24 = comp[0];
-            unsigned long long b_25 = comp[1];
-            bool swap_26 = a_24 < b_25;
-            bool desc_r_27 = (tid & 4) == 0;
-            swap_26 = ((desc_r_27) ? a_24 < b_25 : a_24 > b_25);
-            comp[0] = ((swap_26) ? b_25 : a_24);
-            comp[1] = ((swap_26) ? a_24 : b_25);
-            bool keep_max_28 = (tid & 4) == 0;
-            keep_max_28 = ((tid >> 2 ^ tid >> 3) & 1) == 0;
-            unsigned long long _shfl_xor_6 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 4);
-            unsigned long long o_29 = _shfl_xor_6;
-            unsigned long long hi_30 = ((o_29 > comp[0]) ? o_29 : comp[0]);
-            unsigned long long lo_31 = ((o_29 > comp[0]) ? comp[0] : o_29);
-            comp[0] = ((keep_max_28) ? hi_30 : lo_31);
-            unsigned long long _shfl_xor_7 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 4);
-            unsigned long long o_32 = _shfl_xor_7;
-            unsigned long long hi_33 = ((o_32 > comp[1]) ? o_32 : comp[1]);
-            unsigned long long lo_34 = ((o_32 > comp[1]) ? comp[1] : o_32);
-            comp[1] = ((keep_max_28) ? hi_33 : lo_34);
-            bool keep_max_35 = (tid & 2) == 0;
-            keep_max_35 = ((tid >> 1 ^ tid >> 3) & 1) == 0;
-            unsigned long long _shfl_xor_8 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 2);
-            unsigned long long o_36 = _shfl_xor_8;
-            unsigned long long hi_37 = ((o_36 > comp[0]) ? o_36 : comp[0]);
-            unsigned long long lo_38 = ((o_36 > comp[0]) ? comp[0] : o_36);
-            comp[0] = ((keep_max_35) ? hi_37 : lo_38);
-            unsigned long long _shfl_xor_9 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 2);
-            unsigned long long o_39 = _shfl_xor_9;
-            unsigned long long hi_40 = ((o_39 > comp[1]) ? o_39 : comp[1]);
-            unsigned long long lo_41 = ((o_39 > comp[1]) ? comp[1] : o_39);
-            comp[1] = ((keep_max_35) ? hi_40 : lo_41);
-            bool keep_max_42 = (tid & 1) == 0;
-            keep_max_42 = ((tid ^ tid >> 3) & 1) == 0;
-            unsigned long long _shfl_xor_10 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
-            unsigned long long o_43 = _shfl_xor_10;
-            unsigned long long hi_44 = ((o_43 > comp[0]) ? o_43 : comp[0]);
-            unsigned long long lo_45 = ((o_43 > comp[0]) ? comp[0] : o_43);
-            comp[0] = ((keep_max_42) ? hi_44 : lo_45);
-            unsigned long long _shfl_xor_11 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 1);
-            unsigned long long o_46 = _shfl_xor_11;
-            unsigned long long hi_47 = ((o_46 > comp[1]) ? o_46 : comp[1]);
-            unsigned long long lo_48 = ((o_46 > comp[1]) ? comp[1] : o_46);
-            comp[1] = ((keep_max_42) ? hi_47 : lo_48);
-            unsigned long long a_49 = comp[0];
-            unsigned long long b_50 = comp[1];
-            bool swap_51 = a_49 < b_50;
-            bool desc_r_52 = (tid & 8) == 0;
-            swap_51 = ((desc_r_52) ? a_49 < b_50 : a_49 > b_50);
-            comp[0] = ((swap_51) ? b_50 : a_49);
-            comp[1] = ((swap_51) ? a_49 : b_50);
-            bool keep_max_53 = (tid & 8) == 0;
-            keep_max_53 = ((tid >> 3 ^ tid >> 4) & 1) == 0;
-            unsigned long long _shfl_xor_12 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 8);
-            unsigned long long o_54 = _shfl_xor_12;
-            unsigned long long hi_55 = ((o_54 > comp[0]) ? o_54 : comp[0]);
-            unsigned long long lo_56 = ((o_54 > comp[0]) ? comp[0] : o_54);
-            comp[0] = ((keep_max_53) ? hi_55 : lo_56);
-            unsigned long long _shfl_xor_13 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 8);
-            unsigned long long o_57 = _shfl_xor_13;
-            unsigned long long hi_58 = ((o_57 > comp[1]) ? o_57 : comp[1]);
-            unsigned long long lo_59 = ((o_57 > comp[1]) ? comp[1] : o_57);
-            comp[1] = ((keep_max_53) ? hi_58 : lo_59);
-            bool keep_max_60 = (tid & 4) == 0;
-            keep_max_60 = ((tid >> 2 ^ tid >> 4) & 1) == 0;
-            unsigned long long _shfl_xor_14 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 4);
-            unsigned long long o_61 = _shfl_xor_14;
-            unsigned long long hi_62 = ((o_61 > comp[0]) ? o_61 : comp[0]);
-            unsigned long long lo_63 = ((o_61 > comp[0]) ? comp[0] : o_61);
-            comp[0] = ((keep_max_60) ? hi_62 : lo_63);
-            unsigned long long _shfl_xor_15 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 4);
-            unsigned long long o_64 = _shfl_xor_15;
-            unsigned long long hi_65 = ((o_64 > comp[1]) ? o_64 : comp[1]);
-            unsigned long long lo_66 = ((o_64 > comp[1]) ? comp[1] : o_64);
-            comp[1] = ((keep_max_60) ? hi_65 : lo_66);
-            bool keep_max_67 = (tid & 2) == 0;
-            keep_max_67 = ((tid >> 1 ^ tid >> 4) & 1) == 0;
-            unsigned long long _shfl_xor_16 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 2);
-            unsigned long long o_68 = _shfl_xor_16;
-            unsigned long long hi_69 = ((o_68 > comp[0]) ? o_68 : comp[0]);
-            unsigned long long lo_70 = ((o_68 > comp[0]) ? comp[0] : o_68);
-            comp[0] = ((keep_max_67) ? hi_69 : lo_70);
-            unsigned long long _shfl_xor_17 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 2);
-            unsigned long long o_71 = _shfl_xor_17;
-            unsigned long long hi_72 = ((o_71 > comp[1]) ? o_71 : comp[1]);
-            unsigned long long lo_73 = ((o_71 > comp[1]) ? comp[1] : o_71);
-            comp[1] = ((keep_max_67) ? hi_72 : lo_73);
-            bool keep_max_74 = (tid & 1) == 0;
-            keep_max_74 = ((tid ^ tid >> 4) & 1) == 0;
-            unsigned long long _shfl_xor_18 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
-            unsigned long long o_75 = _shfl_xor_18;
-            unsigned long long hi_76 = ((o_75 > comp[0]) ? o_75 : comp[0]);
-            unsigned long long lo_77 = ((o_75 > comp[0]) ? comp[0] : o_75);
-            comp[0] = ((keep_max_74) ? hi_76 : lo_77);
-            unsigned long long _shfl_xor_19 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 1);
-            unsigned long long o_78 = _shfl_xor_19;
-            unsigned long long hi_79 = ((o_78 > comp[1]) ? o_78 : comp[1]);
-            unsigned long long lo_80 = ((o_78 > comp[1]) ? comp[1] : o_78);
-            comp[1] = ((keep_max_74) ? hi_79 : lo_80);
-            unsigned long long a_81 = comp[0];
-            unsigned long long b_82 = comp[1];
-            bool swap_83 = a_81 < b_82;
-            bool desc_r_84 = (tid & 16) == 0;
-            swap_83 = ((desc_r_84) ? a_81 < b_82 : a_81 > b_82);
-            comp[0] = ((swap_83) ? b_82 : a_81);
-            comp[1] = ((swap_83) ? a_81 : b_82);
-            bool keep_max_85 = (tid & 16) == 0;
-            keep_max_85 = (tid & 16) == 0;
-            unsigned long long _shfl_xor_20 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 16);
-            unsigned long long o_86 = _shfl_xor_20;
-            unsigned long long hi_87 = ((o_86 > comp[0]) ? o_86 : comp[0]);
-            unsigned long long lo_88 = ((o_86 > comp[0]) ? comp[0] : o_86);
-            comp[0] = ((keep_max_85) ? hi_87 : lo_88);
-            unsigned long long _shfl_xor_21 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 16);
-            unsigned long long o_89 = _shfl_xor_21;
-            unsigned long long hi_90 = ((o_89 > comp[1]) ? o_89 : comp[1]);
-            unsigned long long lo_91 = ((o_89 > comp[1]) ? comp[1] : o_89);
-            comp[1] = ((keep_max_85) ? hi_90 : lo_91);
-            bool keep_max_92 = (tid & 8) == 0;
-            keep_max_92 = (tid & 8) == 0;
-            unsigned long long _shfl_xor_22 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 8);
-            unsigned long long o_93 = _shfl_xor_22;
-            unsigned long long hi_94 = ((o_93 > comp[0]) ? o_93 : comp[0]);
-            unsigned long long lo_95 = ((o_93 > comp[0]) ? comp[0] : o_93);
-            comp[0] = ((keep_max_92) ? hi_94 : lo_95);
-            unsigned long long _shfl_xor_23 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 8);
-            unsigned long long o_96 = _shfl_xor_23;
-            unsigned long long hi_97 = ((o_96 > comp[1]) ? o_96 : comp[1]);
-            unsigned long long lo_98 = ((o_96 > comp[1]) ? comp[1] : o_96);
-            comp[1] = ((keep_max_92) ? hi_97 : lo_98);
-            bool keep_max_99 = (tid & 4) == 0;
-            keep_max_99 = (tid & 4) == 0;
-            unsigned long long _shfl_xor_24 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 4);
-            unsigned long long o_100 = _shfl_xor_24;
-            unsigned long long hi_101 = ((o_100 > comp[0]) ? o_100 : comp[0]);
-            unsigned long long lo_102 = ((o_100 > comp[0]) ? comp[0] : o_100);
-            comp[0] = ((keep_max_99) ? hi_101 : lo_102);
-            unsigned long long _shfl_xor_25 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 4);
-            unsigned long long o_103 = _shfl_xor_25;
-            unsigned long long hi_104 = ((o_103 > comp[1]) ? o_103 : comp[1]);
-            unsigned long long lo_105 = ((o_103 > comp[1]) ? comp[1] : o_103);
-            comp[1] = ((keep_max_99) ? hi_104 : lo_105);
-            bool keep_max_106 = (tid & 2) == 0;
-            keep_max_106 = (tid & 2) == 0;
-            unsigned long long _shfl_xor_26 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 2);
-            unsigned long long o_107 = _shfl_xor_26;
-            unsigned long long hi_108 = ((o_107 > comp[0]) ? o_107 : comp[0]);
-            unsigned long long lo_109 = ((o_107 > comp[0]) ? comp[0] : o_107);
-            comp[0] = ((keep_max_106) ? hi_108 : lo_109);
-            unsigned long long _shfl_xor_27 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 2);
-            unsigned long long o_110 = _shfl_xor_27;
-            unsigned long long hi_111 = ((o_110 > comp[1]) ? o_110 : comp[1]);
-            unsigned long long lo_112 = ((o_110 > comp[1]) ? comp[1] : o_110);
-            comp[1] = ((keep_max_106) ? hi_111 : lo_112);
-            bool keep_max_113 = (tid & 1) == 0;
-            keep_max_113 = (tid & 1) == 0;
-            unsigned long long _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, comp[0], 1);
-            unsigned long long o_114 = _shfl_xor_28;
-            unsigned long long hi_115 = ((o_114 > comp[0]) ? o_114 : comp[0]);
-            unsigned long long lo_116 = ((o_114 > comp[0]) ? comp[0] : o_114);
-            comp[0] = ((keep_max_113) ? hi_115 : lo_116);
-            unsigned long long _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, comp[1], 1);
-            unsigned long long o_117 = _shfl_xor_29;
-            unsigned long long hi_118 = ((o_117 > comp[1]) ? o_117 : comp[1]);
-            unsigned long long lo_119 = ((o_117 > comp[1]) ? comp[1] : o_117);
-            comp[1] = ((keep_max_113) ? hi_118 : lo_119);
-            unsigned long long a_120 = comp[0];
-            unsigned long long b_121 = comp[1];
-            bool swap_122 = a_120 < b_121;
-            swap_122 = a_120 < b_121;
-            comp[0] = ((swap_122) ? b_121 : a_120);
-            comp[1] = ((swap_122) ? a_120 : b_121);
-            unsigned int keys_1[2];
-            unsigned int payload[2];
-            int ix_items[2];
-            float v_items[2];
-            unsigned long long c_out = comp[0];
-            keys_1[0] = (unsigned int)(c_out >> 32);
-            payload[0] = ((c_out != 0) ? ~(unsigned int)(c_out & 4294967295) : 4294967295u);
-            if (payload[0] != 4294967295u) {
-                ix_items[0] = (int)payload[0];
-            } else {
-                ix_items[0] = 0;
-            }
-            v_items[0] = __uint_as_float(keys_1[0]);
-            unsigned long long c_out_123 = comp[1];
-            keys_1[1] = (unsigned int)(c_out_123 >> 32);
-            payload[1] = ((c_out_123 != 0) ? ~(unsigned int)(c_out_123 & 4294967295) : 4294967295u);
-            if (payload[1] != 4294967295u) {
-                ix_items[1] = (int)payload[1];
-            } else {
-                ix_items[1] = 0;
-            }
-            v_items[1] = __uint_as_float(keys_1[1]);
-            unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, keys_1[0], 0);
-            unsigned int max_key = _shfl_0;
-            bool is_inf = max_key == 2139095040;
-            unsigned int e0 = max_key >> 23;
-            unsigned int eff_e0 = ((e0 != 0) ? e0 : 1);
-            unsigned int m0 = max_key & 8388607 | ((e0 != 0) ? 8388608 : 0);
-            unsigned long long vint[2];
-            unsigned long long thread_sum = 0;
-            unsigned int key_125_1 = keys_1[0];
-            unsigned int e = key_125_1 >> 23;
-            unsigned int eff_e = ((e != 0) ? e : 1);
-            unsigned int m_1 = key_125_1 & 8388607 | ((e != 0) ? 8388608 : 0);
-            unsigned int shift = eff_e0 - eff_e;
-            unsigned long long fixed = ((shift < 64) ? (unsigned long long)m_1 << 29 >> (unsigned long long)shift : 0);
-            unsigned long long inf_unit = ((key_125_1 == 2139095040) ? 1 : 0);
-            vint[0] = ((is_inf) ? inf_unit : fixed);
-            thread_sum = thread_sum + vint[0];
-            unsigned int key_126_1 = keys_1[1];
-            unsigned int e_127 = key_126_1 >> 23;
-            unsigned int eff_e_128 = ((e_127 != 0) ? e_127 : 1);
-            unsigned int m_129 = key_126_1 & 8388607 | ((e_127 != 0) ? 8388608 : 0);
-            unsigned int shift_130 = eff_e0 - eff_e_128;
-            unsigned long long fixed_131 = ((shift_130 < 64) ? (unsigned long long)m_129 << 29 >> (unsigned long long)shift_130 : 0);
-            unsigned long long inf_unit_132 = ((key_126_1 == 2139095040) ? 1 : 0);
-            vint[1] = ((is_inf) ? inf_unit_132 : fixed_131);
-            thread_sum = thread_sum + vint[1];
-            unsigned long long s = thread_sum;
-            unsigned long long _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, s, 1, 32);
-            unsigned long long y = _shfl_up_0;
-            if (lane >= 1) {
-                s = s + y;
-            }
-            unsigned long long _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, s, 2, 32);
-            unsigned long long y_133 = _shfl_up_1;
-            if (lane >= 2) {
-                s = s + y_133;
-            }
-            unsigned long long _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, s, 4, 32);
-            unsigned long long y_134 = _shfl_up_2;
-            if (lane >= 4) {
-                s = s + y_134;
-            }
-            unsigned long long _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, s, 8, 32);
-            unsigned long long y_135 = _shfl_up_3;
-            if (lane >= 8) {
-                s = s + y_135;
-            }
-            unsigned long long _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, s, 16, 32);
-            unsigned long long y_136 = _shfl_up_4;
-            if (lane >= 16) {
-                s = s + y_136;
-            }
-            unsigned long long _shfl_1 = __shfl_sync(0xFFFFFFFF, s, 31);
-            unsigned long long total_2 = _shfl_1;
-            unsigned long long excl_2[2];
-            unsigned long long incl_2[2];
-            unsigned long long running_1 = s - thread_sum;
-            excl_2[0] = running_1;
-            running_1 = running_1 + vint[0];
-            incl_2[0] = running_1;
-            excl_2[1] = running_1;
-            running_1 = running_1 + vint[1];
-            incl_2[1] = running_1;
-            double total_f = (double)total_2;
-            float p_eff = ((p_row < 1.0f) ? p_row : 1.0f);
-            double target = (double)p_eff * total_f;
-            if (max_key == 2139095040) {
-                target = total_f;
-            }
-            unsigned int target_pos = ((target > 0.0) ? 1 : 0);
-            if (target_pos == 0) {
-                target = 1.0;
-            }
-            bool kept[2];
-            unsigned int cut_local = 0;
-            unsigned long long kept_local = 0;
-            unsigned int is_owner = 0;
-            kept[0] = target > (double)excl_2[0] && vint[0] > 0;
-            if (kept[0] && target <= (double)incl_2[0]) {
-                cut_local = (unsigned int)(lane * 2);
-                kept_local = incl_2[0];
-                is_owner = 1;
-            }
-            kept[1] = target > (double)excl_2[1] && vint[1] > 0;
-            if (kept[1] && target <= (double)incl_2[1]) {
-                cut_local = (unsigned int)(lane * 2 + 1);
-                kept_local = incl_2[1];
-                is_owner = 1;
-            }
-            unsigned int lane_u = (unsigned int)lane;
-            unsigned int _warp_redux_u32_14;
-            asm volatile("redux.sync.max.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_14) : "r"(((is_owner != 0) ? lane_u : 0)));
-            unsigned int owner_lane = _warp_redux_u32_14;
-            unsigned int _shfl_2 = __shfl_sync(0xFFFFFFFF, cut_local, owner_lane);
-            unsigned int cutoff = _shfl_2;
-            unsigned long long _shfl_3 = __shfl_sync(0xFFFFFFFF, kept_local, owner_lane);
-            unsigned long long kept_int = _shfl_3;
-            double kept_f = (double)kept_int;
-            unsigned int c0_137 = offset_lo >> 2 | offset_hi << 30;
-            unsigned int c1_138 = offset_hi >> 2;
-            unsigned int c2_139 = (unsigned int)row;
-            unsigned int c3_140 = 0;
-            unsigned int k0 = seed_lo;
-            unsigned int k1 = seed_hi;
-            unsigned int t0 = 0;
-            unsigned int t1 = 0;
-            unsigned int t2 = 0;
-            unsigned int t3 = 0;
-            unsigned long long p0 = 0;
-            unsigned long long p1 = 0;
-            p0 = (unsigned long long)c0_137 * 3528531795;
-            p1 = (unsigned long long)c2_139 * 3449720151;
-            t0 = (unsigned int)(p1 >> 32) ^ c1_138 ^ k0;
-            t1 = (unsigned int)p1;
-            t2 = (unsigned int)(p0 >> 32) ^ c3_140 ^ k1;
-            t3 = (unsigned int)p0;
-            c0_137 = t0;
-            c1_138 = t1;
-            c2_139 = t2;
-            c3_140 = t3;
-            {
-                k0 = k0 + 2654435769u;
-                k1 = k1 + 3144134277u;
-            }
-            p0 = (unsigned long long)c0_137 * 3528531795;
-            p1 = (unsigned long long)c2_139 * 3449720151;
-            t0 = (unsigned int)(p1 >> 32) ^ c1_138 ^ k0;
-            t1 = (unsigned int)p1;
-            t2 = (unsigned int)(p0 >> 32) ^ c3_140 ^ k1;
-            t3 = (unsigned int)p0;
-            c0_137 = t0;
-            c1_138 = t1;
-            c2_139 = t2;
-            c3_140 = t3;
-            {
-                k0 = k0 + 2654435769u;
-                k1 = k1 + 3144134277u;
-            }
-            p0 = (unsigned long long)c0_137 * 3528531795;
-            p1 = (unsigned long long)c2_139 * 3449720151;
-            t0 = (unsigned int)(p1 >> 32) ^ c1_138 ^ k0;
-            t1 = (unsigned int)p1;
-            t2 = (unsigned int)(p0 >> 32) ^ c3_140 ^ k1;
-            t3 = (unsigned int)p0;
-            c0_137 = t0;
-            c1_138 = t1;
-            c2_139 = t2;
-            c3_140 = t3;
-            {
-                k0 = k0 + 2654435769u;
-                k1 = k1 + 3144134277u;
-            }
-            p0 = (unsigned long long)c0_137 * 3528531795;
-            p1 = (unsigned long long)c2_139 * 3449720151;
-            t0 = (unsigned int)(p1 >> 32) ^ c1_138 ^ k0;
-            t1 = (unsigned int)p1;
-            t2 = (unsigned int)(p0 >> 32) ^ c3_140 ^ k1;
-            t3 = (unsigned int)p0;
-            c0_137 = t0;
-            c1_138 = t1;
-            c2_139 = t2;
-            c3_140 = t3;
-            {
-                k0 = k0 + 2654435769u;
-                k1 = k1 + 3144134277u;
-            }
-            p0 = (unsigned long long)c0_137 * 3528531795;
-            p1 = (unsigned long long)c2_139 * 3449720151;
-            t0 = (unsigned int)(p1 >> 32) ^ c1_138 ^ k0;
-            t1 = (unsigned int)p1;
-            t2 = (unsigned int)(p0 >> 32) ^ c3_140 ^ k1;
-            t3 = (unsigned int)p0;
-            c0_137 = t0;
-            c1_138 = t1;
-            c2_139 = t2;
-            c3_140 = t3;
-            {
-                k0 = k0 + 2654435769u;
-                k1 = k1 + 3144134277u;
-            }
-            p0 = (unsigned long long)c0_137 * 3528531795;
-            p1 = (unsigned long long)c2_139 * 3449720151;
-            t0 = (unsigned int)(p1 >> 32) ^ c1_138 ^ k0;
-            t1 = (unsigned int)p1;
-            t2 = (unsigned int)(p0 >> 32) ^ c3_140 ^ k1;
-            t3 = (unsigned int)p0;
-            c0_137 = t0;
-            c1_138 = t1;
-            c2_139 = t2;
-            c3_140 = t3;
-            {
-                k0 = k0 + 2654435769u;
-                k1 = k1 + 3144134277u;
-            }
-            p0 = (unsigned long long)c0_137 * 3528531795;
-            p1 = (unsigned long long)c2_139 * 3449720151;
-            t0 = (unsigned int)(p1 >> 32) ^ c1_138 ^ k0;
-            t1 = (unsigned int)p1;
-            t2 = (unsigned int)(p0 >> 32) ^ c3_140 ^ k1;
-            t3 = (unsigned int)p0;
-            c0_137 = t0;
-            c1_138 = t1;
-            c2_139 = t2;
-            c3_140 = t3;
-            {
-                k0 = k0 + 2654435769u;
-                k1 = k1 + 3144134277u;
-            }
-            p0 = (unsigned long long)c0_137 * 3528531795;
-            p1 = (unsigned long long)c2_139 * 3449720151;
-            t0 = (unsigned int)(p1 >> 32) ^ c1_138 ^ k0;
-            t1 = (unsigned int)p1;
-            t2 = (unsigned int)(p0 >> 32) ^ c3_140 ^ k1;
-            t3 = (unsigned int)p0;
-            c0_137 = t0;
-            c1_138 = t1;
-            c2_139 = t2;
-            c3_140 = t3;
-            {
-                k0 = k0 + 2654435769u;
-                k1 = k1 + 3144134277u;
-            }
-            p0 = (unsigned long long)c0_137 * 3528531795;
-            p1 = (unsigned long long)c2_139 * 3449720151;
-            t0 = (unsigned int)(p1 >> 32) ^ c1_138 ^ k0;
-            t1 = (unsigned int)p1;
-            t2 = (unsigned int)(p0 >> 32) ^ c3_140 ^ k1;
-            t3 = (unsigned int)p0;
-            c0_137 = t0;
-            c1_138 = t1;
-            c2_139 = t2;
-            c3_140 = t3;
-            {
-                k0 = k0 + 2654435769u;
-                k1 = k1 + 3144134277u;
-            }
-            p0 = (unsigned long long)c0_137 * 3528531795;
-            p1 = (unsigned long long)c2_139 * 3449720151;
-            t0 = (unsigned int)(p1 >> 32) ^ c1_138 ^ k0;
-            t1 = (unsigned int)p1;
-            t2 = (unsigned int)(p0 >> 32) ^ c3_140 ^ k1;
-            t3 = (unsigned int)p0;
-            c0_137 = t0;
-            c1_138 = t1;
-            c2_139 = t2;
-            c3_140 = t3;
-            unsigned int state = offset_lo & 3;
-            unsigned int word = ((state == 0) ? c0_137 : ((state == 1) ? c1_138 : ((state == 2) ? c2_139 : c3_140)));
-            float u = (float)word * 2.3283064e-10f + 1.1641532e-10f;
-            float u_141 = u;
-            double u_f = (double)u_141 * kept_f;
-            if (u_f < kept_f) {
-                if (kept[0] && u_f >= (double)excl_2[0] && u_f < (double)incl_2[0]) {
-                    out_samples[row] = ix_items[0];
-                }
-            } else if ((unsigned int)(lane * 2) == cutoff) {
-                out_samples[row] = ix_items[0];
-            }
-            if (u_f < kept_f) {
-                if (kept[1] && u_f >= (double)excl_2[1] && u_f < (double)incl_2[1]) {
-                    out_samples[row] = ix_items[1];
-                }
-            } else if ((unsigned int)(lane * 2 + 1) == cutoff) {
-                out_samples[row] = ix_items[1];
-            }
-            float v0 = __uint_as_float(max_key);
-            double vint0_f = (double)((unsigned long long)m0 << 29);
-            double kept_mass = ((is_inf) ? kept_f : kept_f / vint0_f * (double)v0);
-            if (payload[0] != 4294967295u) {
-                unsigned long long dst_96 = out_base + (unsigned long long)(lane * 2);
-                out_idx[dst_96] = ix_items[0];
-                out_vals[dst_96] = v_items[0];
-                if (emit_renorm != 0) {
-                    float r_1 = 0.0f;
-                    if (kept[0] && kept_int > 0) {
-                        if (max_key == 2139095040) {
-                            r_1 = (float)(1.0 / kept_f);
-                        } else {
-                            r_1 = (float)((double)v_items[0] / kept_mass);
-                        }
-                    }
-                    out_renorm[dst_96] = r_1;
-                }
-            }
-            if (payload[1] != 4294967295u) {
-                unsigned long long dst_97 = out_base + (unsigned long long)(lane * 2 + 1);
-                out_idx[dst_97] = ix_items[1];
-                out_vals[dst_97] = v_items[1];
-                if (emit_renorm != 0) {
-                    float r_2 = 0.0f;
-                    if (kept[1] && kept_int > 0) {
-                        if (max_key == 2139095040) {
-                            r_2 = (float)(1.0 / kept_f);
-                        } else {
-                            r_2 = (float)((double)v_items[1] / kept_mass);
-                        }
-                    }
-                    out_renorm[dst_97] = r_2;
-                }
-            }
-        }
-    }
 }
 
 } // extern "C"
@@ -49792,6 +49221,7 @@ kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if ((vocab & 3) == 0) {
         for (int c = 0; c < nchunks; c++) {
             int vid = tid;
@@ -51427,7 +50857,6 @@ kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk
             n_w = n_2;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (lane == 0) {
         scal[16 + warp] = n_w;
     }
@@ -59142,6 +58571,7 @@ kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if ((vocab & 3) == 0) {
         for (int c = 0; c < nchunks; c++) {
             int vid = tid;
@@ -60799,7 +60229,6 @@ kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk
             n_w = n_2;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (lane == 0) {
         scal[16 + warp] = n_w;
     }
@@ -68838,6 +68267,7 @@ kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if ((vocab & 3) == 0) {
         for (int c = 0; c < nchunks; c++) {
             int vid = tid;
@@ -70519,7 +69949,6 @@ kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk
             n_w = n_2;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (lane == 0) {
         scal[16 + warp] = n_w;
     }
@@ -78896,6 +78325,7 @@ kernel_cake_radix_topk_c8_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if ((vocab & 3) == 0) {
         for (int c = 0; c < nchunks; c++) {
             int vid = tid;
@@ -80625,7 +80055,6 @@ kernel_cake_radix_topk_c8_e16s(float* __restrict__ probs, int* __restrict__ topk
             n_w = n_2;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     if (lane == 0) {
         scal[16 + warp] = n_w;
     }

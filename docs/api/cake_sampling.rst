@@ -23,6 +23,8 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    ``curand_init(seed, row, offset)``.  For ``top_k_max <= 64`` (``fused_tail_kcap`` in the
    manifest) this stage runs inside the stage-1 kernel on one warp of the cluster's first CTA,
    so the call is a single launch; the outputs are bitwise identical to the two-launch form.
+   Every variant the dispatcher can pick for such a top-k carries the tail (manifest
+   ``fused_tail``); the ``(8, 48)`` resident, a large-k pick, is built without it.
 
 Semantics (support, tie-breaking toward the lower vocabulary index, Philox stream advancement
 through the generator) follow the ``top_k_first`` route with two extra guarantees:

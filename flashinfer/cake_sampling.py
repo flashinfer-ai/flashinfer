@@ -147,6 +147,18 @@ def _fused_tail_kcap() -> int:
 
 
 @functools.cache
+def _stage1_has_fused_tail(cluster: int, ept: int, stream: bool) -> bool:
+    """Whether the frozen variant is built with the fused stage-2/3 tail (manifest ``fused_tail``).
+
+    The (8, 48) resident is a large-k pick and ships without the tail (inlining it cost that variant
+    2-7 % of stage-1 time on Blackwell / Rubin), so a launch that lands there takes two kernels."""
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            return bool(v["fused_tail"])
+    raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+
+
+@functools.cache
 def _sm_count(device_index: int) -> int:
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
 
@@ -452,7 +464,9 @@ def top_k_top_p_sampling_from_probs(
     module = load_cake_sampling_module()
     stream = torch.cuda.current_stream(device=probs.device).cuda_stream
     # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch).
-    fused = kmax <= _fused_tail_kcap()
+    fused = kmax <= _fused_tail_kcap() and _stage1_has_fused_tail(
+        cluster, ept, bool(stream_variant)
+    )
     module.radix_topk(
         probs,
         k_arr,
