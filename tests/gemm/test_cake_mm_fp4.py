@@ -191,9 +191,17 @@ def _operands(m, n, k, x_dtype, device, seed):
     )
     gs_inv = torch.tensor([GLOBAL_SCALE_INV], dtype=torch.float32, device=device)
     w_scale = (1.0 / w_global_sf).reshape(1).float()
-    a_fp4, a_sf, alpha = nvfp4_quantize(
-        x, gs_inv, per_token_activation=True, backend="cake", out_scale=w_scale
-    )
+    if x_dtype == torch.float16:
+        # The validated fp16-activation rows quantize without the folded output
+        # scale; fold the weight scale into alpha on the host instead.
+        a_fp4, a_sf, alpha = nvfp4_quantize(
+            x, gs_inv, per_token_activation=True, backend="cake"
+        )
+        alpha = alpha * w_scale
+    else:
+        a_fp4, a_sf, alpha = nvfp4_quantize(
+            x, gs_inv, per_token_activation=True, backend="cake", out_scale=w_scale
+        )
     return x, w, a_fp4, a_sf, alpha, w_fp4, w_sf, gs_inv, w_scale
 
 
