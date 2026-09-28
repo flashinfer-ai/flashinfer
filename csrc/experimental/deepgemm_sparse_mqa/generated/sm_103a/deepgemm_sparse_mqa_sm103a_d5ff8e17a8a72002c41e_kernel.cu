@@ -404,7 +404,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(768, 1) void
-kernel_deepgemm_sparse_mqa_sm103a_5a54616282439388b238(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap KV_TMA, const __grid_constant__ CUtensorMap SF_KV_TMA, uint8_t* __restrict__ KV, unsigned int* __restrict__ SF_KV, unsigned int* __restrict__ Metadata, __nv_bfloat16* __restrict__ Logits, unsigned int logits_stride, unsigned int kv_page_stride_bytes, unsigned int num_sms)
+kernel_deepgemm_sparse_mqa_sm103a_d5ff8e17a8a72002c41e(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap KV_TMA, const __grid_constant__ CUtensorMap SF_KV_TMA, uint8_t* __restrict__ KV, unsigned int* __restrict__ SF_KV, unsigned int* __restrict__ Metadata, __nv_bfloat16* __restrict__ Logits, unsigned int logits_stride, unsigned int kv_page_stride_bytes, unsigned int num_sms)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -561,7 +561,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5a54616282439388b238(const __grid_constant__ C
     // ---- Role: math ----
     if (warp <= 15) {
         { // math_main
-            asm volatile("setmaxnreg.inc.sync.aligned.u32 88;");
+            asm volatile("setmaxnreg.inc.sync.aligned.u32 96;");
             unsigned int asq = 0;
             unsigned int ask = 0;
             unsigned int ams = 0;
@@ -664,7 +664,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5a54616282439388b238(const __grid_constant__ C
     // ---- Role: producer ----
     } else if (warp == 16) {
         { // producer_main
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
             unsigned int psq = 0;
             unsigned int psk = 0;
             unsigned int nwaves = Metadata[1];
@@ -728,7 +728,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5a54616282439388b238(const __grid_constant__ C
     // ---- Role: transpose ----
     } else if (warp == 17) {
         { // transpose_main
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
             unsigned int tsq = 0;
             unsigned int tsk = 0;
             unsigned int _phase_qfull_1 = 0;
@@ -787,7 +787,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5a54616282439388b238(const __grid_constant__ C
     // ---- Role: mma ----
     } else if (warp == 18) {
         { // mma_main
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
             unsigned int msq = 0;
             unsigned int msk = 0;
             unsigned int mst = 0;
@@ -904,7 +904,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5a54616282439388b238(const __grid_constant__ C
     // ---- Role: copy ----
     } else if (warp >= 20 && warp <= 23) {
         { // copy_main
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
             unsigned int csk = 0;
             unsigned int cms = 0;
             unsigned int cwarp = warp - 20;
@@ -977,7 +977,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5a54616282439388b238(const __grid_constant__ C
     // ---- Role: idle ----
     } else if (warp == 19) {
         { // idle_main
-            asm volatile("setmaxnreg.dec.sync.aligned.u32 64;");
+            asm volatile("setmaxnreg.dec.sync.aligned.u32 40;");
         }
     }
 

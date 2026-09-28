@@ -69,7 +69,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256, 4) void
-kernel_deepgemm_sparse_mqa_sm100a_5d5f7f3ebc576d5b2984(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Context, unsigned int* __restrict__ BlockTable, unsigned int* __restrict__ Requests, unsigned int* __restrict__ Sparse, unsigned int* __restrict__ Metadata, unsigned int* __restrict__ Workspace, unsigned int num_q_tokens, unsigned int num_kv_tokens, unsigned int block_table_stride, unsigned int num_ctas)
+kernel_deepgemm_sparse_mqa_sm100a_bc2a098946d2bcc0887c(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Context, unsigned int* __restrict__ BlockTable, unsigned int* __restrict__ Requests, unsigned int* __restrict__ Sparse, unsigned int* __restrict__ Metadata, unsigned int* __restrict__ Workspace, unsigned int num_q_tokens, unsigned int num_kv_tokens, unsigned int block_table_stride, unsigned int num_ctas)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -100,7 +100,7 @@ kernel_deepgemm_sparse_mqa_sm100a_5d5f7f3ebc576d5b2984(unsigned int* __restrict_
     unsigned int rec_base = 96 + num_q_tokens * 2;
     #pragma unroll 1
     for (unsigned int claim_round = 0; claim_round < num_q_tokens + 1; claim_round++) {
-        if (tid == 0) {
+        if (((0) ? warp == 0 : tid == 0)) {
             state[1] = 0;
             #pragma unroll 1
             for (unsigned int candidate = 0; candidate < num_q_tokens + 1; candidate++) {
@@ -366,7 +366,7 @@ kernel_deepgemm_sparse_mqa_sm100a_5d5f7f3ebc576d5b2984(unsigned int* __restrict_
             pad_pair[3] = (unsigned int)4294967295;
             reinterpret_cast<int4*>(Metadata + dst_1)[0] = reinterpret_cast<int4*>(pad_pair)[0];
         }
-        if (tid == 0) {
+        if (((0) ? warp == 0 : tid == 0)) {
             qidx += num_ctas * 2;
         }
     }

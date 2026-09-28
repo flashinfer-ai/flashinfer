@@ -69,7 +69,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256, 4) void
-kernel_deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Context, unsigned int* __restrict__ BlockTable, unsigned int* __restrict__ Requests, unsigned int* __restrict__ Sparse, unsigned int* __restrict__ Metadata, unsigned int* __restrict__ Workspace, unsigned int num_q_tokens, unsigned int num_kv_tokens, unsigned int block_table_stride, unsigned int num_ctas)
+kernel_deepgemm_sparse_mqa_sm103a_e4473612ba24ae72d9c3(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Context, unsigned int* __restrict__ BlockTable, unsigned int* __restrict__ Requests, unsigned int* __restrict__ Sparse, unsigned int* __restrict__ Metadata, unsigned int* __restrict__ Workspace, unsigned int num_q_tokens, unsigned int num_kv_tokens, unsigned int block_table_stride, unsigned int num_ctas)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -100,7 +100,7 @@ kernel_deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd(unsigned int* __restrict_
     unsigned int rec_base = 96 + num_q_tokens * 2;
     #pragma unroll 1
     for (unsigned int claim_round = 0; claim_round < num_q_tokens + 1; claim_round++) {
-        if (tid == 0) {
+        if (((0) ? warp == 0 : tid == 0)) {
             state[1] = 0;
             #pragma unroll 1
             for (unsigned int candidate = 0; candidate < num_q_tokens + 1; candidate++) {
@@ -366,7 +366,7 @@ kernel_deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd(unsigned int* __restrict_
             pad_pair[3] = (unsigned int)4294967295;
             reinterpret_cast<int4*>(Metadata + dst_1)[0] = reinterpret_cast<int4*>(pad_pair)[0];
         }
-        if (tid == 0) {
+        if (((0) ? warp == 0 : tid == 0)) {
             qidx += num_ctas * 2;
         }
     }
@@ -389,9 +389,9 @@ kernel_deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd(unsigned int* __restrict_
         }
         __syncthreads();
         unsigned int nentries = 0;
-        if (tid < 148) {
-            unsigned int split_1 = ((unsigned long long)total_1 * (unsigned long long)tid + 148 - 1) / 148;
-            unsigned int end_1 = ((unsigned long long)total_1 * (unsigned long long)(tid + 1) + 148 - 1) / 148;
+        if (tid < 152) {
+            unsigned int split_1 = ((unsigned long long)total_1 * (unsigned long long)tid + 152 - 1) / 152;
+            unsigned int end_1 = ((unsigned long long)total_1 * (unsigned long long)(tid + 1) + 152 - 1) / 152;
             #pragma unroll 1
             for (unsigned int schedule_entry = 0; schedule_entry < end_1; schedule_entry++) {
                 if (split_1 >= end_1) {
@@ -404,7 +404,7 @@ kernel_deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd(unsigned int* __restrict_
                 unsigned int qbase_1 = (unsigned int)_vec_load_0[0];
                 unsigned int _min_5 = ((end_1) < ((unsigned int)(_vec_load_0[0] >> 32)) ? (end_1) : ((unsigned int)(_vec_load_0[0] >> 32)));
                 unsigned int entry_end = _min_5;
-                unsigned int dst_2 = sched + (nentries * 148 + (unsigned int)tid) * 4;
+                unsigned int dst_2 = sched + (nentries * 152 + (unsigned int)tid) * 4;
                 unsigned int schedule_entry_0[4];
                 schedule_entry_0[0] = split_1;
                 schedule_entry_0[1] = entry_end;
@@ -419,10 +419,10 @@ kernel_deepgemm_sparse_mqa_sm100a_10e9b158d892c9d9fdfd(unsigned int* __restrict_
         }
         __syncthreads();
         unsigned int waves = state[6];
-        if (tid < 148) {
+        if (tid < 152) {
             #pragma unroll 1
             for (unsigned int wave = nentries; wave < waves; wave++) {
-                unsigned int dst_3 = sched + (wave * 148 + (unsigned int)tid) * 4;
+                unsigned int dst_3 = sched + (wave * 152 + (unsigned int)tid) * 4;
                 unsigned int empty_entry[4];
                 #pragma unroll
                 for (int j_2 = 0; j_2 < 4; j_2++) {

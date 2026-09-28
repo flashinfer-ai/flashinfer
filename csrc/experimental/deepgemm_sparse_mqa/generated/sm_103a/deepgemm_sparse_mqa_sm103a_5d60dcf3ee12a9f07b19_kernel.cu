@@ -83,7 +83,7 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 extern "C" {
 
 __global__ __launch_bounds__(256, 4) void
-kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Context, unsigned int* __restrict__ BlockTable, unsigned int* __restrict__ Requests, unsigned int* __restrict__ Sparse, unsigned int* __restrict__ Metadata, unsigned int* __restrict__ Workspace, unsigned int num_q_tokens, unsigned int num_kv_tokens, unsigned int block_table_stride, unsigned int num_ctas)
+kernel_deepgemm_sparse_mqa_sm103a_5d60dcf3ee12a9f07b19(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Context, unsigned int* __restrict__ BlockTable, unsigned int* __restrict__ Requests, unsigned int* __restrict__ Sparse, unsigned int* __restrict__ Metadata, unsigned int* __restrict__ Workspace, unsigned int num_q_tokens, unsigned int num_kv_tokens, unsigned int block_table_stride, unsigned int num_ctas)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -113,7 +113,7 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
     unsigned int qidx = bid;
     #pragma unroll 1
     for (unsigned int claim_round = 0; claim_round < num_q_tokens + 1; claim_round++) {
-        if (tid == 0) {
+        if (((1) ? warp == 0 : tid == 0)) {
             state[1] = 0;
             #pragma unroll 1
             for (unsigned int candidate = 0; candidate < num_q_tokens + 1; candidate++) {
@@ -123,20 +123,56 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
                 unsigned int nq = ((num_q_tokens - qidx >= 2) ? 2 : 1);
                 unsigned int valid_q = 1;
                 unsigned int request = Requests[qidx];
-                unsigned int request_begin = qidx;
-                #pragma unroll 1
-                for (unsigned int previous = 0; previous < qidx; previous++) {
-                    if (Requests[request_begin - 1] != request) {
-                        break;
+                unsigned int probe_pos = 32;
+                if (qidx > lane) {
+                    if (Requests[qidx - 1 - lane] != request) {
+                        probe_pos = lane;
                     }
-                    request_begin -= 1;
+                }
+                unsigned int _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, probe_pos, 16);
+                unsigned int probe_other = _shfl_xor_0;
+                unsigned int _min_0 = ((probe_pos) < (probe_other) ? (probe_pos) : (probe_other));
+                probe_pos = _min_0;
+                unsigned int _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, probe_pos, 8);
+                unsigned int probe_other_0 = _shfl_xor_1;
+                unsigned int _min_1 = ((probe_pos) < (probe_other_0) ? (probe_pos) : (probe_other_0));
+                probe_pos = _min_1;
+                unsigned int _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, probe_pos, 4);
+                unsigned int probe_other_1 = _shfl_xor_2;
+                unsigned int _min_2 = ((probe_pos) < (probe_other_1) ? (probe_pos) : (probe_other_1));
+                probe_pos = _min_2;
+                unsigned int _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, probe_pos, 2);
+                unsigned int probe_other_2 = _shfl_xor_3;
+                unsigned int _min_3 = ((probe_pos) < (probe_other_2) ? (probe_pos) : (probe_other_2));
+                probe_pos = _min_3;
+                unsigned int _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, probe_pos, 1);
+                unsigned int probe_other_3 = _shfl_xor_4;
+                unsigned int _min_4 = ((probe_pos) < (probe_other_3) ? (probe_pos) : (probe_other_3));
+                probe_pos = _min_4;
+                unsigned int _min_5 = ((qidx) < ((unsigned int)32) ? (qidx) : ((unsigned int)32));
+                unsigned int _min_6 = ((probe_pos) < (_min_5) ? (probe_pos) : (_min_5));
+                unsigned int request_begin = qidx - _min_6;
+                if (probe_pos == 32) {
+                    #pragma unroll 1
+                    for (unsigned int previous = 0; previous < request_begin; previous++) {
+                        if (Requests[request_begin - 1] != request) {
+                            break;
+                        }
+                        request_begin -= 1;
+                    }
                 }
                 if ((qidx - request_begin) % 2 != 0) {
                     if (num_ctas >= num_q_tokens) {
                         qidx = num_q_tokens;
                     } else {
-                        unsigned int _atomic_old_0 = atomicAdd(&Workspace[32], 1);
-                        qidx = num_ctas + _atomic_old_0;
+                        unsigned int claim = 0;
+                        if (lane == 0) {
+                            unsigned int _atomic_old_0 = atomicAdd(&Workspace[32], 1);
+                            claim = _atomic_old_0;
+                        }
+                        unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, claim, 0);
+                        claim = _shfl_0;
+                        qidx = num_ctas + claim;
                     }
                     valid_q = 0;
                 } else {
@@ -156,8 +192,8 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
                         if (nq > (unsigned int)qi) {
                             unsigned int begin = 0;
                             unsigned int end = Context[qidx + (unsigned int)qi];
-                            int _min_0 = ((2048) < ((end - begin + 8 - 1) / 8) ? (2048) : ((end - begin + 8 - 1) / 8));
-                            nblocks = _min_0;
+                            int _min_7 = ((2048) < ((end - begin + 8 - 1) / 8) ? (2048) : ((end - begin + 8 - 1) / 8));
+                            nblocks = _min_7;
                         }
                         state[2 + qi] = nblocks;
                     }
@@ -190,8 +226,8 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
         unsigned int merge_end = (unsigned int)(tid + 1) * inputs / 256;
         unsigned int _max_0 = ((merge_begin) > (n1) ? (merge_begin) : (n1));
         unsigned int lo = _max_0 - n1;
-        unsigned int _min_1 = ((merge_begin) < (n0) ? (merge_begin) : (n0));
-        unsigned int hi = _min_1;
+        unsigned int _min_8 = ((merge_begin) < (n0) ? (merge_begin) : (n0));
+        unsigned int hi = _min_8;
         #pragma unroll 1
         for (unsigned int search = 0; search < n0 + 1; search++) {
             if (lo >= hi) {
@@ -305,10 +341,10 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
         if (lane >= 16) {
             warp_sum += synced_8;
         }
-        unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, warp_sum, 7);
-        unsigned int total = _shfl_0;
-        unsigned int _shfl_1 = __shfl_sync(0xFFFFFFFF, warp_sum - warp_total, warp);
-        unsigned int preceding = _shfl_1;
+        unsigned int _shfl_1 = __shfl_sync(0xFFFFFFFF, warp_sum, 7);
+        unsigned int total = _shfl_1;
+        unsigned int _shfl_2 = __shfl_sync(0xFFFFFFFF, warp_sum - warp_total, warp);
+        unsigned int preceding = _shfl_2;
         unsigned int nsplits = (total + 64 - 1) / 64;
         if (tid == 0) {
             state[4] = 0;
@@ -333,58 +369,89 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
         unsigned int split_base = state[4];
         unsigned int npairs = (total + 1) / 2;
         #pragma unroll
-        for (int k = 0; k < 8; k++) {
-            unsigned int pair_idx = tid + k * 256;
-            if (pair_idx < npairs) {
-                unsigned int first = pair_idx * 2;
-                unsigned int split_off = first / 64;
-                unsigned int split = split_base + split_off;
-                unsigned int block = first % 64;
-                unsigned int bases = packed_blocks[first - block];
-                unsigned int b0 = bases & 32767;
-                unsigned int b1 = bases >> 16 & 32767;
-                unsigned int packed_value = packed_blocks[first];
-                unsigned int s0 = packed_value & 32767;
-                unsigned int s1 = packed_value >> 16 & 32767;
-                unsigned int in0_1 = packed_value & 32768;
-                unsigned int in1_1 = packed_value & 2147483648;
-                unsigned int logical_block = ((in0_1 != 0) ? logical[s0] : logical[2048 + s1]);
-                unsigned int o0 = ((in0_1 != 0) ? s0 - b0 : (unsigned int)65535);
-                unsigned int o1 = ((in1_1 != 0) ? s1 - b1 : (unsigned int)65535);
-                unsigned int pair[4];
-                unsigned int logical_page = logical_block / 8;
-                pair[0] = BlockTable[(unsigned long long)qbase * (unsigned long long)block_table_stride + (unsigned long long)logical_page] * 8 + logical_block % 8;
-                pair[1] = o0 | o1 << 16;
-                unsigned int second_physical = 0;
-                unsigned int second_offsets = (unsigned int)4294967295;
-                if (total > first + 1) {
-                    unsigned int next_value = packed_blocks[first + 1];
-                    unsigned int t0 = next_value & 32767;
-                    unsigned int t1 = next_value >> 16 & 32767;
-                    unsigned int next_in0 = next_value & 32768;
-                    unsigned int next_in1 = next_value & 2147483648;
-                    unsigned int next_block = ((next_in0 != 0) ? logical[t0] : logical[2048 + t1]);
-                    unsigned int next_page = next_block / 8;
-                    second_physical = BlockTable[(unsigned long long)qbase * (unsigned long long)block_table_stride + (unsigned long long)next_page] * 8 + next_block % 8;
-                    unsigned int p0 = ((next_in0 != 0) ? t0 - b0 : (unsigned int)65535);
-                    unsigned int p1 = ((next_in1 != 0) ? t1 - b1 : (unsigned int)65535);
-                    second_offsets = p0 | p1 << 16;
+        for (int kc = 0; kc < 4; kc++) {
+            unsigned int pr_phys0[2];
+            unsigned int pr_phys1[2];
+            #pragma unroll
+            for (int kk = 0; kk < 2; kk++) {
+                unsigned int pair_idx = tid + (kc * 2 + kk) * 256;
+                if (pair_idx < npairs) {
+                    unsigned int first = pair_idx * 2;
+                    unsigned int packed_value = packed_blocks[first];
+                    unsigned int s0 = packed_value & 32767;
+                    unsigned int s1 = packed_value >> 16 & 32767;
+                    unsigned int in0_1 = packed_value & 32768;
+                    unsigned int logical_block = ((in0_1 != 0) ? logical[s0] : logical[2048 + s1]);
+                    unsigned int logical_page = logical_block / 8;
+                    unsigned int physical0 = BlockTable[(unsigned long long)qbase * (unsigned long long)block_table_stride + (unsigned long long)logical_page] * 8 + logical_block % 8;
+                    unsigned int physical1 = 0;
+                    if (total > first + 1) {
+                        unsigned int next_value = packed_blocks[first + 1];
+                        unsigned int t0 = next_value & 32767;
+                        unsigned int t1 = next_value >> 16 & 32767;
+                        unsigned int next_in0 = next_value & 32768;
+                        unsigned int next_block = ((next_in0 != 0) ? logical[t0] : logical[2048 + t1]);
+                        unsigned int next_page = next_block / 8;
+                        physical1 = BlockTable[(unsigned long long)qbase * (unsigned long long)block_table_stride + (unsigned long long)next_page] * 8 + next_block % 8;
+                    }
+                    pr_phys0[kk] = physical0;
+                    pr_phys1[kk] = physical1;
                 }
-                pair[2] = second_physical;
-                pair[3] = second_offsets;
-                unsigned int dst = 4 + split * 132;
-                if (block == 0) {
-                    int _min_2 = ((64) < (total - first) ? (64) : (total - first));
-                    unsigned int num_1 = _min_2;
-                    unsigned int contiguous = 0;
-                    unsigned int split_header[4];
-                    split_header[0] = qbase;
-                    split_header[1] = num_1 | contiguous;
-                    split_header[2] = b0;
-                    split_header[3] = ((nq_1 == 2) ? b1 : (unsigned int)4294967295);
-                    reinterpret_cast<int4*>(Metadata + dst)[0] = reinterpret_cast<int4*>(split_header)[0];
+            }
+            #pragma unroll
+            for (int kk_1 = 0; kk_1 < 2; kk_1++) {
+                unsigned int pair_idx_1 = tid + (kc * 2 + kk_1) * 256;
+                if (pair_idx_1 < npairs) {
+                    unsigned int first_1 = pair_idx_1 * 2;
+                    unsigned int split_off = first_1 / 64;
+                    unsigned int split = split_base + split_off;
+                    unsigned int block = first_1 % 64;
+                    unsigned int bases = packed_blocks[first_1 - block];
+                    unsigned int b0 = bases & 32767;
+                    unsigned int b1 = bases >> 16 & 32767;
+                    unsigned int packed_value_1 = packed_blocks[first_1];
+                    unsigned int s0_1 = packed_value_1 & 32767;
+                    unsigned int s1_1 = packed_value_1 >> 16 & 32767;
+                    unsigned int in0_2 = packed_value_1 & 32768;
+                    unsigned int in1_1 = packed_value_1 & 2147483648;
+                    unsigned int logical_block_1 = ((in0_2 != 0) ? logical[s0_1] : logical[2048 + s1_1]);
+                    unsigned int o0 = ((in0_2 != 0) ? s0_1 - b0 : (unsigned int)65535);
+                    unsigned int o1 = ((in1_1 != 0) ? s1_1 - b1 : (unsigned int)65535);
+                    unsigned int pair[4];
+                    unsigned int logical_page_1 = logical_block_1 / 8;
+                    pair[0] = pr_phys0[kk_1];
+                    pair[1] = o0 | o1 << 16;
+                    unsigned int second_physical = 0;
+                    unsigned int second_offsets = (unsigned int)4294967295;
+                    if (total > first_1 + 1) {
+                        unsigned int next_value_1 = packed_blocks[first_1 + 1];
+                        unsigned int t0_1 = next_value_1 & 32767;
+                        unsigned int t1_1 = next_value_1 >> 16 & 32767;
+                        unsigned int next_in0_1 = next_value_1 & 32768;
+                        unsigned int next_in1 = next_value_1 & 2147483648;
+                        unsigned int next_block_1 = ((next_in0_1 != 0) ? logical[t0_1] : logical[2048 + t1_1]);
+                        unsigned int next_page_1 = next_block_1 / 8;
+                        second_physical = pr_phys1[kk_1];
+                        unsigned int p0 = ((next_in0_1 != 0) ? t0_1 - b0 : (unsigned int)65535);
+                        unsigned int p1 = ((next_in1 != 0) ? t1_1 - b1 : (unsigned int)65535);
+                        second_offsets = p0 | p1 << 16;
+                    }
+                    pair[2] = second_physical;
+                    pair[3] = second_offsets;
+                    unsigned int dst = 4 + split * 132;
+                    if (block == 0) {
+                        int _min_9 = ((64) < (total - first_1) ? (64) : (total - first_1));
+                        unsigned int num_1 = _min_9;
+                        unsigned int contiguous = 0;
+                        unsigned int split_header[4];
+                        split_header[0] = qbase;
+                        split_header[1] = num_1 | contiguous;
+                        split_header[2] = b0;
+                        split_header[3] = ((nq_1 == 2) ? b1 : (unsigned int)4294967295);
+                        reinterpret_cast<int4*>(Metadata + dst)[0] = reinterpret_cast<int4*>(split_header)[0];
+                    }
+                    reinterpret_cast<int4*>(Metadata + (dst + 4 + block * 2))[0] = reinterpret_cast<int4*>(pair)[0];
                 }
-                reinterpret_cast<int4*>(Metadata + (dst + 4 + block * 2))[0] = reinterpret_cast<int4*>(pair)[0];
             }
         }
         #pragma unroll 1
@@ -397,12 +464,18 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
             pad_pair[3] = (unsigned int)4294967295;
             reinterpret_cast<int4*>(Metadata + dst_1)[0] = reinterpret_cast<int4*>(pad_pair)[0];
         }
-        if (tid == 0) {
+        if (((1) ? warp == 0 : tid == 0)) {
             if (num_ctas >= num_q_tokens) {
                 qidx = num_q_tokens;
             } else {
-                unsigned int _atomic_old_2 = atomicAdd(&Workspace[32], 1);
-                qidx = num_ctas + _atomic_old_2;
+                unsigned int claim_t = 0;
+                if (lane == 0) {
+                    unsigned int _atomic_old_2 = atomicAdd(&Workspace[32], 1);
+                    claim_t = _atomic_old_2;
+                }
+                unsigned int _shfl_3 = __shfl_sync(0xFFFFFFFF, claim_t, 0);
+                claim_t = _shfl_3;
+                qidx = num_ctas + claim_t;
             }
         }
     }
@@ -422,10 +495,13 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
         unsigned int sched = 4 + total_1 * 132;
         unsigned int nentries = 0;
         #pragma unroll 1
-        for (unsigned int qbatch = 0; qbatch < num_q_tokens; qbatch += 256) {
+        for (unsigned int qbatch = 0; qbatch < num_q_tokens; qbatch += 512) {
             unsigned int qi_2 = qbatch + (unsigned int)tid;
+            unsigned int qj = qbatch + 256 + (unsigned int)tid;
             unsigned int qsplit = 0;
             unsigned int qcount = 0;
+            unsigned int qsplit2 = 0;
+            unsigned int qcount2 = 0;
             if (qi_2 < num_q_tokens) {
                 unsigned long long _vec_load_0[1];
                 {
@@ -434,13 +510,28 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
                 qsplit = (unsigned int)_vec_load_0[0];
                 qcount = (unsigned int)(_vec_load_0[0] >> 32);
             }
+            if (qj < num_q_tokens) {
+                unsigned long long _vec_load_1[1];
+                {
+                    _vec_load_1[0] = *reinterpret_cast<const unsigned long long*>(Workspace + 96 + qj * 2);
+                }
+                qsplit2 = (unsigned int)_vec_load_1[0];
+                qcount2 = (unsigned int)(_vec_load_1[0] >> 32);
+            }
             unsigned int nq_2 = 1;
             if (qi_2 + 1 < num_q_tokens) {
                 if (Requests[qi_2 + 1] == Requests[qi_2]) {
                     nq_2 = 2;
                 }
             }
+            unsigned int nq2 = 1;
+            if (qj + 1 < num_q_tokens) {
+                if (Requests[qj + 1] == Requests[qj]) {
+                    nq2 = 2;
+                }
+            }
             unsigned int nqentries = (qcount + 7) / 8;
+            unsigned int nqentries2 = (qcount2 + 7) / 8;
             unsigned int lane_sum_1 = nqentries;
             unsigned int _shfl_up_10 = __shfl_up_sync(0xFFFFFFFF, lane_sum_1, 1, 32);
             unsigned int synced_9 = _shfl_up_10;
@@ -501,38 +592,119 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
             if (lane >= 16) {
                 warp_sum_1 += synced_8_1;
             }
-            unsigned int _shfl_2 = __shfl_sync(0xFFFFFFFF, warp_sum_1, 7);
-            unsigned int total_9 = _shfl_2;
-            unsigned int _shfl_3 = __shfl_sync(0xFFFFFFFF, warp_sum_1 - warp_total_1, warp);
-            unsigned int preceding_1 = _shfl_3;
-            unsigned int entry_begin = nentries + (lane_sum_1 - nqentries + preceding_1);
+            unsigned int _shfl_4 = __shfl_sync(0xFFFFFFFF, warp_sum_1, 7);
+            unsigned int total_9 = _shfl_4;
+            unsigned int _shfl_5 = __shfl_sync(0xFFFFFFFF, warp_sum_1 - warp_total_1, warp);
+            unsigned int preceding_1 = _shfl_5;
             unsigned int per_entry = ((nqentries != 0) ? qcount / nqentries : (unsigned int)0);
             unsigned int larger = ((nqentries != 0) ? qcount % nqentries : (unsigned int)0);
+            unsigned int cursor = qsplit;
             #pragma unroll 1
             for (unsigned int entry = 0; entry < nqentries; entry++) {
-                unsigned int entry_end = qsplit + per_entry + (unsigned int)(((larger > entry) ? 1 : 0));
-                unsigned int dst_2 = sched + (entry_begin + entry) * 4;
+                unsigned int entry_end = cursor + per_entry + (unsigned int)(((larger > entry) ? 1 : 0));
+                unsigned int dst_2 = sched + (nentries + (lane_sum_1 - nqentries + preceding_1) + entry) * 4;
                 unsigned int schedule_entry[4];
-                schedule_entry[0] = qsplit;
+                schedule_entry[0] = cursor;
                 schedule_entry[1] = entry_end;
                 schedule_entry[2] = qi_2;
                 schedule_entry[3] = nq_2;
                 reinterpret_cast<int4*>(Metadata + dst_2)[0] = reinterpret_cast<int4*>(schedule_entry)[0];
-                qsplit = entry_end;
+                cursor = entry_end;
             }
             nentries += total_9;
+            __syncthreads();
+            unsigned int lane_sum_10 = nqentries2;
+            unsigned int _shfl_up_20 = __shfl_up_sync(0xFFFFFFFF, lane_sum_10, 1, 32);
+            unsigned int synced_11 = _shfl_up_20;
+            if (lane >= 1) {
+                lane_sum_10 += synced_11;
+            }
+            unsigned int _shfl_up_21 = __shfl_up_sync(0xFFFFFFFF, lane_sum_10, 2, 32);
+            unsigned int synced_12 = _shfl_up_21;
+            if (lane >= 2) {
+                lane_sum_10 += synced_12;
+            }
+            unsigned int _shfl_up_22 = __shfl_up_sync(0xFFFFFFFF, lane_sum_10, 4, 32);
+            unsigned int synced_13 = _shfl_up_22;
+            if (lane >= 4) {
+                lane_sum_10 += synced_13;
+            }
+            unsigned int _shfl_up_23 = __shfl_up_sync(0xFFFFFFFF, lane_sum_10, 8, 32);
+            unsigned int synced_14 = _shfl_up_23;
+            if (lane >= 8) {
+                lane_sum_10 += synced_14;
+            }
+            unsigned int _shfl_up_24 = __shfl_up_sync(0xFFFFFFFF, lane_sum_10, 16, 32);
+            unsigned int synced_15 = _shfl_up_24;
+            if (lane >= 16) {
+                lane_sum_10 += synced_15;
+            }
+            if (lane == 31) {
+                warp_sums[warp] = lane_sum_10;
+            }
+            __syncthreads();
+            unsigned int warp_total_16 = 0;
+            if (lane < 8) {
+                warp_total_16 = warp_sums[lane];
+            }
+            unsigned int warp_sum_17 = warp_total_16;
+            unsigned int _shfl_up_25 = __shfl_up_sync(0xFFFFFFFF, warp_sum_17, 1, 32);
+            unsigned int synced_18 = _shfl_up_25;
+            if (lane >= 1) {
+                warp_sum_17 += synced_18;
+            }
+            unsigned int _shfl_up_26 = __shfl_up_sync(0xFFFFFFFF, warp_sum_17, 2, 32);
+            unsigned int synced_19 = _shfl_up_26;
+            if (lane >= 2) {
+                warp_sum_17 += synced_19;
+            }
+            unsigned int _shfl_up_27 = __shfl_up_sync(0xFFFFFFFF, warp_sum_17, 4, 32);
+            unsigned int synced_20 = _shfl_up_27;
+            if (lane >= 4) {
+                warp_sum_17 += synced_20;
+            }
+            unsigned int _shfl_up_28 = __shfl_up_sync(0xFFFFFFFF, warp_sum_17, 8, 32);
+            unsigned int synced_21 = _shfl_up_28;
+            if (lane >= 8) {
+                warp_sum_17 += synced_21;
+            }
+            unsigned int _shfl_up_29 = __shfl_up_sync(0xFFFFFFFF, warp_sum_17, 16, 32);
+            unsigned int synced_22 = _shfl_up_29;
+            if (lane >= 16) {
+                warp_sum_17 += synced_22;
+            }
+            unsigned int _shfl_6 = __shfl_sync(0xFFFFFFFF, warp_sum_17, 7);
+            unsigned int total_23 = _shfl_6;
+            unsigned int _shfl_7 = __shfl_sync(0xFFFFFFFF, warp_sum_17 - warp_total_16, warp);
+            unsigned int preceding_24 = _shfl_7;
+            unsigned int per_entry_25 = ((nqentries2 != 0) ? qcount2 / nqentries2 : (unsigned int)0);
+            unsigned int larger_26 = ((nqentries2 != 0) ? qcount2 % nqentries2 : (unsigned int)0);
+            unsigned int cursor_27 = qsplit2;
+            #pragma unroll 1
+            for (unsigned int entry_1 = 0; entry_1 < nqentries2; entry_1++) {
+                unsigned int entry_end_1 = cursor_27 + per_entry_25 + (unsigned int)(((larger_26 > entry_1) ? 1 : 0));
+                unsigned int dst_3 = sched + (nentries + (lane_sum_10 - nqentries2 + preceding_24) + entry_1) * 4;
+                unsigned int schedule_entry_1[4];
+                schedule_entry_1[0] = cursor_27;
+                schedule_entry_1[1] = entry_end_1;
+                schedule_entry_1[2] = qj;
+                schedule_entry_1[3] = nq2;
+                reinterpret_cast<int4*>(Metadata + dst_3)[0] = reinterpret_cast<int4*>(schedule_entry_1)[0];
+                cursor_27 = entry_end_1;
+            }
+            nentries += total_23;
             __syncthreads();
         }
         int _max_1 = ((1) > ((nentries + 152 - 1) / 152) ? (1) : ((nentries + 152 - 1) / 152));
         unsigned int waves = _max_1;
         #pragma unroll 1
-        for (unsigned int entry_1 = nentries + (unsigned int)tid; entry_1 < waves * 152; entry_1 += 256) {
+        for (unsigned int entry_2 = nentries + (unsigned int)tid; entry_2 < waves * 152; entry_2 += 256) {
             unsigned int empty_entry[4];
             #pragma unroll
             for (int j_2 = 0; j_2 < 4; j_2++) {
                 empty_entry[j_2] = 0;
             }
-            reinterpret_cast<int4*>(Metadata + (sched + entry_1 * 4))[0] = reinterpret_cast<int4*>(empty_entry)[0];
+            reinterpret_cast<int4*>(Metadata + (sched + entry_2 * 4))[0] = reinterpret_cast<int4*>(empty_entry)[0];
         }
         __syncthreads();
         if (waves != 1) {
@@ -544,19 +716,19 @@ kernel_deepgemm_sparse_mqa_sm103a_5b487c68d17072b278f8(unsigned int* __restrict_
                 for (int ei = 0; ei < 5; ei++) {
                     unsigned int sm = lane + (unsigned int)(ei * 32);
                     if (sm < 152) {
-                        unsigned int _vec_load_1[4];
+                        unsigned int _vec_load_2[4];
                         {
                             const uint4* _ivptr_0 = reinterpret_cast<const uint4*>(Metadata + sched + (wave * 152 + sm) * 4);
                             uint4 _ivld_0;
                             _ivld_0 = *_ivptr_0;
-                            _vec_load_1[0 + 0] = _ivld_0.x;
-                            _vec_load_1[0 + 1] = _ivld_0.y;
-                            _vec_load_1[0 + 2] = _ivld_0.z;
-                            _vec_load_1[0 + 3] = _ivld_0.w;
+                            _vec_load_2[0 + 0] = _ivld_0.x;
+                            _vec_load_2[0 + 1] = _ivld_0.y;
+                            _vec_load_2[0 + 2] = _ivld_0.z;
+                            _vec_load_2[0 + 3] = _ivld_0.w;
                         }
                         #pragma unroll
                         for (int j_3 = 0; j_3 < 4; j_3++) {
-                            entry_regs[ei * 4 + j_3] = _vec_load_1[j_3];
+                            entry_regs[ei * 4 + j_3] = _vec_load_2[j_3];
                         }
                     }
                 }
