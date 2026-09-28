@@ -151,10 +151,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         if self.two_cta:
             if n_tile % 64 or n_tile < 64:
                 raise ValueError("two_cta needs n_tile in {64, 128, 192}")
-            if m_group != 1 or split_k != 1 or cluster_split or perf_probe:
-                raise ValueError(
-                    "two_cta excludes m_group > 1, split_k, cluster_split and perf_probe"
-                )
+            if m_group != 1 or split_k != 1 or cluster_split:
+                raise ValueError("two_cta excludes m_group > 1, split_k and cluster_split")
             if row_tma:
                 raise ValueError("two_cta loads the row operand with the gather warps")
             row_tma = False
