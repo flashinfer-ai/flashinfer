@@ -88,7 +88,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_WARP_TOTALS_STRIDE 28
 #define SMEM_TOTAL 16896
 #define THREADS 224
-#define BLOCK_M 8
+#define BLOCK_M 16
 #define NUM_EXPERTS 896
 #define TOP_K 16
 #define ITEMS_PER_THREAD 4
@@ -154,8 +154,8 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(224, 1, 16) __cluster_dims__(16,1,1) void
-kernel_cake_kimi_k3_fused_router_3a5319e7ee55a7fa1e5c(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
+__global__ __launch_bounds__(224, 1) __cluster_dims__(16,1,1) void
+kernel_cake_kimi_k3_fused_router_8787533857087cc6314d(float* __restrict__ logits, float* __restrict__ bias, float* __restrict__ topk_weights, int* __restrict__ topk_ids, int* __restrict__ sorted_token_ids, int* __restrict__ expert_ids, int* __restrict__ num_tokens_post_padded, int* __restrict__ expert_counts, int* __restrict__ expert_offsets, int* __restrict__ expert_scatter_offsets, int M)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -163,7 +163,8 @@ kernel_cake_kimi_k3_fused_router_3a5319e7ee55a7fa1e5c(float* __restrict__ logits
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
-    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
