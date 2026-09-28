@@ -1038,8 +1038,10 @@ def test_prefill_hn_layout_capacity_switch_keeps_old_capture(monkeypatch, mode):
 
 @pytest.mark.parametrize("backend", ["cudnn", "cutlass"])
 def test_ragged_cpu_prefixes_avoid_sync_and_preserve_device_bindings(backend):
-    if torch.cuda.get_device_capability()[0] != 10:
-        pytest.skip("requires Blackwell")
+    if backend == "cutlass" and torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("CUTLASS prefill requires Blackwell")
+    if backend == "cudnn" and not prefill.CUDNN_AVAILABLE:
+        pytest.skip("requires cuDNN graph support")
     q = torch.randn(5, 8, 128, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(50, 8, 128, device=q.device, dtype=q.dtype)
     v = torch.randn_like(k)
