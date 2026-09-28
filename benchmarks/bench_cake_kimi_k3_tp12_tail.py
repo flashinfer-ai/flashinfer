@@ -25,12 +25,12 @@ Stock chain (the fastest stock route of every stage on GB200 / GB300):
 NCCL ``all_reduce(routed_partial)`` -> ``flashinfer.norm.rmsnorm`` ->
 cuBLAS ``torch.mm`` (the full replicated up-projection) ->
 NCCL ``all_reduce(shared_partial)`` -> ``torch.add``, captured in one CUDA graph.
-Fused: ``flashinfer.kimi_k3_tp12_tail`` (three launches per rank), captured in
-one CUDA graph.  Timing is CUPTI kernel activity per rank (cold L2);
-``bench_gpu_time_with_cupti`` gathers every iteration's span from all ranks, the
-row time is the median over iterations of the maximum over ranks (a collective
-finishes when its slowest rank does), and every rank's own median is reported
-as the rank spread.
+Fused: ``flashinfer.kimi_k3_tp12_tail`` (two generated launches per rank plus
+cuBLAS for ``M > 4``), captured in one CUDA graph.  Timing is CUPTI kernel
+activity per rank (cold L2); ``bench_gpu_time_with_cupti`` gathers every
+iteration's span from all ranks, the row time is the median over iterations of
+the maximum over ranks (a collective finishes when its slowest rank does), and
+every rank's own median is reported as the rank spread.
 """
 
 from __future__ import annotations

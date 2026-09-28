@@ -30,31 +30,45 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # ``MODULES`` holds one record per physical generated module (a kernel plus
 # its host binding): translation units, compile flags, FFI entry, argument
 # plan and closure identity.  ``KERNELS`` maps ``"<arch>"`` to the logical
-# kernel key -> module assignment the host runtime resolves at preparation:
+# kernel key -> module assignment the host runtime resolves at preparation.
+# Every route is two generated kernels, K1 and the tail, with cuBLAS between
+# them for ``M > 4``:
 #
-# * ``k1_oneshot:r<rank>``  the one-shot Lamport all-reduce of the routed
-#   partial fused with KimiRMSNorm for ``M <= 16`` tokens; the rank is a
-#   trace-time specialisation (reduction order and local packet position),
-#   so one module per rank;
-# * ``k1_twoshot:<grouped|pinned>``  the token-sliced two-shot form (owner
-#   reduce + norm, multicast broadcast) for ``M > 16``; ``grouped`` issues all
-#   twelve remote loads of the owner retry body before the first test
-#   (``M <= 256``), ``pinned`` keeps the per-rank pinned body (``M > 256``);
-# * ``k3:<grouped|pinned>``  the column reduce-scatter of the shared partial,
-#   fused add of this rank's up-projection slice, one BF16 rounding and the
-#   multicast all-gather of the output row, with the same poll schedule
-#   selection by ``M``, one CTA per token and column half (``4 < M < 256``,
-#   grouped poll schedule only);
-# * ``k3_persist:<grouped|pinned>``  the same K3 on a persistent grid of
+# * ``k1_oneshot_ess:r<rank>``  the one-shot Lamport all-reduce of the routed
+#   partial fused with KimiRMSNorm for ``M <= 16`` tokens with the early
+#   shared scatter (ESS): the same CTAs also scatter this rank's columns of
+#   the shared partial into the K3 workspace slots of their owner ranks (the
+#   K3 workspace pointers and flags are extra arguments); the rank is a
+#   trace-time specialisation (reduction order and local packet position), so
+#   one module per rank;
+# * ``k1_twoshot_ess:grouped``  the token-sliced two-shot form (owner reduce +
+#   norm, multicast broadcast) with the early shared scatter for
+#   ``16 < M < 256``; ``grouped`` issues all twelve remote loads of the owner
+#   retry body before the first test;
+# * ``k1_twoshot:<grouped|pinned>``  the two-shot form without the shared
+#   scatter for ``M >= 256`` (the persistent tail scatters the shared partial
+#   itself); ``grouped`` at ``M = 256``, ``pinned`` (the per-rank pinned retry
+#   body) above;
+# * ``k23:n<640|512>``  the fused up-projection + tail for ``M <= 4``: the
+#   fp32 slice GEMM of the normalised latent with this rank's weight slice in
+#   the K2-stream summation order, fused with the owner reduce of the
+#   ESS-scattered shared columns, the add, one BF16 rounding and the multicast
+#   all-gather of the output (the numerics of the round-4 K2-stream + fp32-add
+#   K3 pair); one CTA per eight output columns, one module per column width of
+#   the rank partition;
+# * ``k3_ess:grouped``  the tail for ``4 < M < 256`` after an ESS K1: owner
+#   reduce of the scattered shared columns, fused add of this rank's cuBLAS
+#   up-projection slice, one BF16 rounding and the multicast all-gather of
+#   the output row; one CTA per token and column half, no shared operand;
+# * ``k3_persist:grouped``  the full K3 (own scatter of the shared partial,
+#   owner reduce + add + rounding, all-gather) on a persistent grid of
 #   ``min(M, SM count)`` CTAs per column half, each walking its tokens as a
 #   three-stage pipeline (scatter ``t``, owner reduce + multicast ``t - P``,
 #   gather ``t - 2P``) so the fabric hops of consecutive tokens overlap
-#   (``M >= 256``; identical buffers, flags and numerics);
-# * ``k2_stream:n<640|512>``  the SIMT weight-streaming up-projection slice
-#   GEMM (fp32 output) that replaces cuBLAS for ``M <= 4``; one module per
-#   column width of the rank partition;
-# * ``k3_f32:grouped``  the fp32-add form of K3 that consumes the K2-stream
-#   slice (``M <= 4``).
+#   (``M = 256``);
+# * ``k3_persist_bulk:pinned``  the persistent K3 whose reduce-scatter stage
+#   pushes the shared columns with ``cp.async.bulk``, pinned poll schedule
+#   (``M > 256``).
 #
 # Every module is an exact-architecture program launched with programmatic
 # dependent launch.  Both literals are populated verbatim by the
@@ -1419,16 +1433,20 @@ POLL_SCHEDULES = ("grouped", "pinned")
 
 
 def required_kernel_keys() -> tuple[str, ...]:
-    """Every logical kernel the runtime can select on one architecture."""
+    """Every logical kernel the runtime can select on one architecture (twenty keys)."""
+    # Unreachable, hence not registered: ``k1_twoshot_ess:pinned`` and ``k3_ess:pinned``
+    # (the ESS range ``M < 256`` is grouped-only), ``k3_persist:pinned`` and
+    # ``k3_persist_bulk:grouped`` (the plain persistent K3 serves exactly 256 tokens,
+    # the cp.async.bulk form the whole pinned range ``M > 256``).
     return (
-        *(f"k1_oneshot:r{rank}" for rank in range(WORLD_SIZE)),
+        *(f"k1_oneshot_ess:r{rank}" for rank in range(WORLD_SIZE)),
+        "k1_twoshot_ess:grouped",
         *(f"k1_twoshot:{schedule}" for schedule in POLL_SCHEDULES),
-        # the one-CTA-per-token K3 only below 256 tokens (grouped); K3-P owns every M >= 256
-        "k3:grouped",
-        *(f"k3_persist:{schedule}" for schedule in POLL_SCHEDULES),
-        "k2_stream:n640",
-        "k2_stream:n512",
-        "k3_f32:grouped",
+        "k23:n640",
+        "k23:n512",
+        "k3_ess:grouped",
+        "k3_persist:grouped",
+        "k3_persist_bulk:pinned",
     )
 
 
