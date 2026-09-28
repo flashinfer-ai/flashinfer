@@ -2176,11 +2176,27 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 )
             tCtSFB_mma = cute.make_tensor(sfb_tmem_ptr, tCtSFB_layout)
             tCtSFB_full = cute.make_tensor(sfb_tmem_ptr, tCtSFB_full_layout)
+            # 2-CTA: build the S2T copy from the cta_group::2 layout the MMA
+            # reads (as the dense kernel does). The 1-CTA full-tile layout
+            # issued with the cta_group::2 copy atom scatters the second
+            # 128-row SF block (token rows 128..191 of the 192-row tile) to
+            # the wrong TMEM position: two192 was exact only for experts with
+            # <= 128 rows (bisect 2026-09-28, rl2 0.353 at TP8 T=8192).
+            if cutlass.const_expr(self.two_cta):
+                tCtSFB_s2t_dst = tCtSFB_mma
+            else:
+                tCtSFB_s2t_dst = tCtSFB_full
             (
                 tiled_copy_s2t_sfb,
                 tCsSFB_compact_s2t,
                 tCtSFB_compact_s2t,
-            ) = self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB_full)
+            ) = self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB_s2t_dst)
+            if cutlass.const_expr(os.environ.get("SWAPAB_DEBUG") is not None):
+                print("[swapab] sfb tmem read layout (tiled_mma):", tCtSFB_layout)
+                print("[swapab] sfb tmem full layout (tiled_mma_sfb):", tCtSFB_full_layout)
+                print("[swapab] sfb s2t tiled copy:", tiled_copy_s2t_sfb)
+                print("[swapab] sfb s2t smem part:", tCsSFB_compact_s2t.layout)
+                print("[swapab] sfb s2t tmem part:", tCtSFB_compact_s2t.layout)
 
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_ab_stage
