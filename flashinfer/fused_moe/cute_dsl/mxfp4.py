@@ -227,6 +227,12 @@ SWAP_WIDE192_MIN_TOKENS = int(os.environ.get("MXFP4_SWAP192_MIN_TOKENS", "0"))
 SWAP_WIDE192_MIXED = os.environ.get("MXFP4_SWAP192_MIXED", "0") == "1"
 SWAP_WIDE192_MIXED_MODE = int(os.environ.get("MXFP4_SWAP192_MIXED_MODE", "0"))
 SWAP_WIDE192_ROW_UNIT = 64
+# GEMM2 of the mixed form: ``split`` = 192-row swap finalize over the windows
+# + dense finalize over the dense tiles; ``dense`` = the dense finalize over
+# every 128-row sort group (the swap GEMM2 is not launched).
+SWAP_WIDE192_MIXED_GEMM2 = os.environ.get("MXFP4_SWAP192_MIXED_GEMM2", "split")
+if SWAP_WIDE192_MIXED_GEMM2 not in ("split", "dense"):
+    raise ValueError("MXFP4_SWAP192_MIXED_GEMM2 must be split or dense")
 # Mixed form: weight M-tiles per swap-GEMM2 work item. Measured on B300 (TP8
 # T=256/1024 balanced): with the 128-row groups the GEMM2 of the policy tile
 # loses 6-9 % at m_group 1 and is back at the 32-row-group time with 2.
@@ -1391,10 +1397,15 @@ class Mxfp4MoESwapAbPlan:
                     _prepared_launches=launches,
                 )
                 self._gemm1_dense = launches["gather"]
-            if self.hybrid:
+            mixed192_dense_gemm2 = (
+                self.mixed192 and SWAP_WIDE192_MIXED_GEMM2 == "dense"
+            )
+            if self.hybrid or mixed192_dense_gemm2:
                 # Dense contiguous grouped GEMM2 over the 128-row sort groups
                 # with the bulk-reduce finalize into the zero-filled output.
                 gemm2_tactic = w._tactic(num_tokens)[2]
+                if mixed192_dense_gemm2 and gemm2_tactic[0][0] != self.group_rows:
+                    gemm2_tactic = ((self.group_rows, 192), (1, 2), False)
                 if gemm2_tactic[0][0] != self.group_rows:
                     raise ValueError(
                         "hybrid GEMM2 tactic tile must match the "
@@ -1429,7 +1440,7 @@ class Mxfp4MoESwapAbPlan:
                 self._prepare_swap_gemm2(
                     w, b, w2, w2_sf, num_tokens, fused_finalize, launches
                 )
-            if self.mixed192:
+            if self.mixed192 and not mixed192_dense_gemm2:
                 # Dense finalize GEMM2 over the dense 128-row tiles (wide slot
                 # list): route-weighted reduce-add into the same zero-filled
                 # output the 192-row swap GEMM2 reduces its windows into.
@@ -1648,7 +1659,7 @@ class Mxfp4MoESwapAbPlan:
                 compiled, args, kwargs = self._gemm1_dense
                 compiled(*args, stream=stream, **kwargs)
             self._gemm2(*self._gemm2_args, stream=stream)
-            if self.mixed192:
+            if self.mixed192 and self._gemm2_wide is not None:
                 compiled, args = self._gemm2_wide
                 compiled(*args, stream=stream)
             if self._side_stream is not None:
