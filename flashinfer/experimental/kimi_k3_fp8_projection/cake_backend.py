@@ -351,6 +351,7 @@ class DecodeConfig:
         16  # lanes per quantization unit (16 = half-warp units, 8 / 4 = narrow units)
     )
     csplit: int = 1  # round 5: K split across the CTAs of one cluster (== split); the partials meet in SMEM (DSM)
+    cs_alias: bool = False  # round 5: the DSM inbox aliases the dead pipeline stages (one exchange round); only when every CTA owns one work item
 
     @property
     def tok_rows(self) -> int:
@@ -366,6 +367,7 @@ class DecodeConfig:
             self.xb_stages,
             self.qlanes,
             self.csplit,
+            cs_alias=self.cs_alias,
         )
 
 
@@ -490,6 +492,7 @@ def decode_config(
         xb_stages=xb_stages,
         qlanes=qlanes,
         csplit=csplit,
+        cs_alias=csplit > 1 and grid == total_work,
     )
 
 
