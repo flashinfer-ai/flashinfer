@@ -45,7 +45,7 @@ production PDL default (``kimi_k3_vision_tower.default_use_pdl``, env
 of the sequence carries the
 ``cudaLaunchAttributeProgrammaticStreamSerialization`` attribute.  The
 generated bindings own it: the attribute is emitted into each binding's
-launch (``loom/runtime/host_shim.py``), the kernel runs its prologue
+launch (the generated binding's host shim), the kernel runs its prologue
 (mbarrier / TMEM setup, descriptor prefetch) while its predecessor drains,
 ``griddepcontrol.wait``s before its first access to a route buffer and
 signals ``launch_dependents`` so the successor's prologue overlaps its tail.
