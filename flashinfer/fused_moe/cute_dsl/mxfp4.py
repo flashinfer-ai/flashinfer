@@ -215,7 +215,7 @@ SWAP_MIXED_SF_PLAIN = os.environ.get("SWAPAB_MIXED_SF_PLAIN", "0") == "1"
 # dense tile's 256 at the 2-CTA operand rate. Opt-in while under measurement
 # (CAKE-707 round 1); ``MXFP4_SWAP192_MIN_TOKENS`` raises the lower bound.
 SWAP_WIDE192 = os.environ.get("MXFP4_SWAP192", "0") == "1"
-SWAP_WIDE192_TILE = 192
+SWAP_WIDE192_TILE = int(os.environ.get("MXFP4_SWAP192_TILE", "192"))  # measurement arms: 64 / 128
 SWAP_WIDE192_MIN_TOKENS = int(os.environ.get("MXFP4_SWAP192_MIN_TOKENS", "0"))
 # Mixed form: weight M-tiles per swap-GEMM2 work item. Measured on B300 (TP8
 # T=256/1024 balanced): with the 128-row groups the GEMM2 of the policy tile

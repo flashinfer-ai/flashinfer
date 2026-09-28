@@ -160,8 +160,8 @@ def swap_row_tma(n_tile: int, gather_rows: bool = True) -> bool:
     GEMM1's gathered rows stay on the cp.async gather warps (``gather4`` is
     slow for 128-byte rows). ``SWAPAB_ROW_TMA=0|1`` overrides both.
     """
-    if n_tile == 192:
-        # The 192-row (2-CTA) tile gathers its rows with the cp.async warps.
+    if n_tile == 192 or swap_two_cta(n_tile):
+        # The 192-row and 2-CTA tiles gather their rows with the cp.async warps.
         return False
     env = os.environ.get("SWAPAB_ROW_TMA")
     if env:
@@ -173,9 +173,13 @@ def swap_two_cta(n_tile: int) -> bool:
     """Whether this tile width runs the 2-CTA kernel (256 weight rows per
     work item, the token tile split between the pair); ``SWAPAB_TWO_CTA=0``
     keeps the 192-row tile on one CTA (measurement arm)."""
-    if n_tile != 192:
+    env = os.environ.get("SWAPAB_TWO_CTA", "1")
+    if env == "0":
         return False
-    return os.environ.get("SWAPAB_TWO_CTA", "1") != "0"
+    if env == "2":
+        # Measurement arm: the 2-CTA kernel at every 64-row multiple.
+        return n_tile in (64, 128, 192)
+    return n_tile == 192
 
 
 # Stage depth of the 2-CTA GEMM2 (K = intermediate shard): 128-wide stages
@@ -559,6 +563,13 @@ def swapab_gemm1_situ(
         zero_words = zero_output.numel() * zero_output.element_size() // 8
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     max_active_clusters = get_max_active_clusters(2 if two_cta else 1)
+    if os.environ.get("SWAPAB_DEBUG"):
+        print(
+            f"[swapab] gemm1 n_tile={n_tile} two_cta={two_cta} rows_w={rows_w} k={k} "
+            f"experts={num_local_experts} groups={tile_idx_to_expert_idx.shape[0]} "
+            f"max_active_clusters={max_active_clusters}",
+            file=sys.stderr, flush=True,
+        )
     use_linear_beta = linear_beta is not None
     if k_blocks_per_stage is None:
         k_blocks_per_stage = gemm1_k_blocks_per_stage(n_tile)
@@ -729,6 +740,13 @@ def swapab_gemm2(
     wide_out = (not finalize) and out.shape[0] * out.shape[1] >= 1 << 31
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
     max_active_clusters = get_max_active_clusters(2 if two_cta else 1)
+    if os.environ.get("SWAPAB_DEBUG"):
+        print(
+            f"[swapab] gemm2 n_tile={n_tile} two_cta={two_cta} rows_w={rows_w} k={k} "
+            f"finalize={finalize} groups={tile_idx_to_expert_idx.shape[0]} "
+            f"k_blocks={k_blocks_per_stage} max_active_clusters={max_active_clusters}",
+            file=sys.stderr, flush=True,
+        )
     # Split-K only for the additive finalize epilogue and an evenly divisible
     # stage count; the kernel splits at run time only while the valid work
     # items fit ``max_active_clusters // split_k`` CTAs.

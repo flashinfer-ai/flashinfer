@@ -1275,6 +1275,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             if sk_do_split:
                 cute.arch.cluster_arrive_relaxed()
                 cute.arch.cluster_wait()
+        if cutlass.const_expr(self.two_cta):
+            # The pair's barrier inits are cluster-visible before the first
+            # remote arrive / multicast commit.
+            cute.arch.cluster_arrive_relaxed()
+            cute.arch.cluster_wait()
 
         # First tile before the CTA-wide sync so consumers can start immediately.
         if warp_idx == self.sched_warp_id:
