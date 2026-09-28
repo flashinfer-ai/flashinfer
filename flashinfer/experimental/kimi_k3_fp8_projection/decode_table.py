@@ -161,12 +161,11 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         },
         "12,28,256": {
             "route": "decode",
-            "tok": 128,
-            "split": 5,
+            "tok": 32,
+            "split": 1,
             "fused": False,
             "persist": True,
             "resident": False,
-            "csplit": 5,
         },
         "17,28,1": {
             "route": "decode",
@@ -706,12 +705,11 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         },
         "12,28,256": {
             "route": "decode",
-            "tok": 128,
-            "split": 5,
+            "tok": 32,
+            "split": 1,
             "fused": False,
             "persist": True,
             "resident": False,
-            "csplit": 5,
         },
         "17,28,1": {
             "route": "decode",
