@@ -223,6 +223,7 @@ def gen_pcie_ipc_comm_debug_module(
     no_block_epoch: int = 0,
     per_block_epoch: int = 0,
     no_barrier_entry_sync: int = 0,
+    no_row_sync: int = 0,
 ) -> JitSpec:
     """Build the kernels with one protocol mechanism disabled. Not for shipping.
 
@@ -247,10 +248,15 @@ def gen_pcie_ipc_comm_debug_module(
     ``no_barrier_entry_sync``
         Drop the leading CTA barrier from the three signalling helpers. Applies
         to every kernel that takes a barrier.
+
+    ``no_row_sync``
+        Drop the barrier between the per-warp partials being written and being
+        summed, in the fused RMSNorm's row reduction. The denominator then comes
+        from whatever a sibling warp had left in the slot.
     """
     return gen_jit_spec(
         f"pcie_ipc_comm_dbg{stall_ns}_{stall_island}_{no_block_epoch}"
-        f"_{per_block_epoch}_{no_barrier_entry_sync}",
+        f"_{per_block_epoch}_{no_barrier_entry_sync}_{no_row_sync}",
         [
             jit_env.FLASHINFER_CSRC_DIR / "pcie_ipc_all_reduce.cu",
         ],
@@ -261,6 +267,7 @@ def gen_pcie_ipc_comm_debug_module(
             f"-DFLASHINFER_PCIE_IPC_DEBUG_NO_BLOCK_EPOCH={no_block_epoch}",
             f"-DFLASHINFER_PCIE_IPC_DEBUG_PER_BLOCK_EPOCH={per_block_epoch}",
             f"-DFLASHINFER_PCIE_IPC_DEBUG_NO_BARRIER_ENTRY_SYNC={no_barrier_entry_sync}",
+            f"-DFLASHINFER_PCIE_IPC_DEBUG_NO_ROW_SYNC={no_row_sync}",
         ],
     )
 

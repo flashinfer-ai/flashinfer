@@ -41,7 +41,24 @@ if [ "$pcie_ipc_gpus" -lt 2 ]; then
 else
   echo "pcie ipc ar: $pcie_ipc_gpus GPUs visible (8 needed for full coverage)"
   pytest -s tests/comm/test_pcie_ipc_all_reduce.py
+  pytest -s tests/comm/test_pcie_ipc_fused_norm.py
+  pytest -s tests/comm/test_pcie_ipc_ce_ring.py
+  pytest -s tests/comm/test_pcie_ipc_compatibility.py
+  pytest -s tests/comm/test_pcie_ipc_cross_island_race.py
 fi
+# The rest of the pcie ipc suite. Outside the multi-GPU gate on purpose: these
+# need one device or none -- workspace_size() is a pure function, and the policy
+# and tuning files assert on host-side arithmetic -- so gating them on a GPU
+# count they do not use is how they went unrun.
+#
+# They were unrun for a release, and one of them was wrong for that whole time:
+# the workspace layout expectation omitted a term that is allocated only on some
+# compute capabilities, so it passed on every machine anyone happened to use.
+# A test nothing executes is not coverage.
+pytest -s tests/comm/test_pcie_ipc_workspace_layout.py
+pytest -s tests/comm/test_pcie_ipc_admission.py
+pytest -s tests/comm/test_pcie_ipc_policy.py
+pytest -s tests/comm/test_pcie_ipc_tuning.py
 # trtllm ar + fusion
 pytest -s tests/comm/test_trtllm_allreduce_fusion.py
 pytest -s tests/moe/test_trtllm_cutlass_fused_moe.py

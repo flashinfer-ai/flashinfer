@@ -106,6 +106,105 @@ __global__ void ce_add_kernel(uint4* out, const uint4* a, const uint4* b, int64_
   }
 }
 
+// Residual add and RMSNorm over a completed all-reduce, one row per block.
+//
+// The copy-engine plane needs this where the SM plane does not. There, the
+// fused kernels append the normalisation to the collective inside one launch,
+// because an SM kernel is what moved every byte and is still holding them. Here
+// the payload arrives by DMA: the engine cannot transform data, and the
+// all-gather that completes the tensor runs entirely on it, so there is no
+// kernel at the end to append to. One follows it instead.
+//
+// That costs a pass the SM plane does not pay, which is why this is worth doing
+// anyway: the fused entry point could not name a copy-engine transport at all,
+// and on a fabric where the engine wins by 1.8x at large payloads, being unable
+// to name it costs far more than the pass.
+//
+// No grid barrier and no cross-block dependency. A block owns a whole row, so
+// the denominator is a block reduction, and the row's data was published by a
+// prior kernel or copy on this stream -- the launch boundary orders it, which
+// is what the fused kernels have to spend a device-wide rendezvous on.
+//
+// `residual_out` arrives holding the all-reduced sum and leaves holding that
+// plus the residual: the collective writes it, this adds to it in place, and
+// the row stays in registers across both halves so the sum of squares costs no
+// second read.
+template <typename T>
+__global__ __launch_bounds__(1024, 1) void ce_fused_add_rmsnorm_kernel(T* residual_out, T* norm_out,
+                                                                       T const* residual_in,
+                                                                       T const* gamma, float eps,
+                                                                       int rows, int hidden_packs) {
+  extern __shared__ float row_smem[];
+  auto* out = reinterpret_cast<uint4*>(residual_out);
+  auto const* res = reinterpret_cast<uint4 const*>(residual_in);
+  auto const* gamma_packs = reinterpret_cast<uint4 const*>(gamma);
+
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+    const int base = row * hidden_packs;
+    uint4 held[kFusedMaxPacksPerThread];
+    float square_sum = 0.0f;
+#pragma unroll
+    for (int slot = 0; slot < kFusedMaxPacksPerThread; ++slot) {
+      const int p = threadIdx.x + slot * blockDim.x;
+      if (p < hidden_packs) {
+        held[slot] = packed_add_u4<T>(out[base + p], res[base + p]);
+        out[base + p] = held[slot];
+        square_sum += pack_square_sum<T>(held[slot]);
+      }
+    }
+    square_sum = block_reduce_sum(square_sum, row_smem);
+    const float scale =
+        rsqrtf(square_sum / static_cast<float>(hidden_packs * PackTraits<T>::kPackElems) + eps);
+#pragma unroll
+    for (int slot = 0; slot < kFusedMaxPacksPerThread; ++slot) {
+      const int p = threadIdx.x + slot * blockDim.x;
+      if (p < hidden_packs) {
+        reinterpret_cast<uint4*>(norm_out)[base + p] =
+            scale_pack<T>(held[slot], gamma_packs[p], scale);
+      }
+    }
+  }
+}
+
+// Launch the pass above. Separate from the collective on purpose: the two have
+// nothing to say to each other beyond the buffer, and keeping the ring's host
+// sequence untouched is what makes this addition cheap to reason about.
+//
+// The thread count is derived, not tuned. It is the smallest power of two that
+// can hold a row in registers at kFusedMaxPacksPerThread packs per thread, with
+// a floor because a block narrower than a few warps spends the reduction mostly
+// idle. A row too wide for 1024 threads is rejected rather than split: splitting
+// it would put the denominator back across blocks, which is the rendezvous this
+// pass exists to avoid.
+template <typename T>
+cudaError_t ce_fused_add_rmsnorm(T* residual_out, T* norm_out, T const* residual_in, T const* gamma,
+                                 float eps, int64_t numel, int64_t hidden, cudaStream_t stream) {
+  constexpr int kPackElems = PackTraits<T>::kPackElems;
+  if (hidden <= 0 || hidden % kPackElems != 0 || numel % hidden != 0) {
+    return cudaErrorInvalidValue;
+  }
+  const int64_t hidden_packs = hidden / kPackElems;
+  const int64_t rows = numel / hidden;
+  int threads = 256;
+  while (threads < (hidden_packs + kFusedMaxPacksPerThread - 1) / kFusedMaxPacksPerThread) {
+    threads *= 2;
+  }
+  if (threads > 1024) {
+    return cudaErrorInvalidValue;
+  }
+  // One block per row, and the kernel grid-strides, so the cap costs loop
+  // iterations rather than correctness on a payload with more rows than this.
+  const int grid = static_cast<int>(rows < 65535 ? rows : 65535);
+  if (grid <= 0) {
+    return cudaErrorInvalidValue;
+  }
+  const size_t smem = ((threads + 31) / 32) * sizeof(float);
+  ce_fused_add_rmsnorm_kernel<T>
+      <<<grid, threads, smem, stream>>>(residual_out, norm_out, residual_in, gamma, eps,
+                                        static_cast<int>(rows), static_cast<int>(hidden_packs));
+  return cudaGetLastError();
+}
+
 // Sub-chunk depth. Deeper chunking keeps the copy engine busy -- piece c+1's
 // copy overlaps piece c's wait and reduce -- but each piece adds a flag round
 // trip and two launches, so it stops paying once a piece is small: at the

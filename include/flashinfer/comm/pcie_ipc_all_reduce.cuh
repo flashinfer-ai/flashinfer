@@ -122,6 +122,12 @@ constexpr int kVariantCount = 7;
 //
 // At world_size 8 that puts the two topology kernels in kBlock and both
 // sentinel kernels in kPack.
+//
+// The fused RMSNorm kernels are sentinel kernels at every world size -- their
+// row-affine normalisation phase reads slots written by a *different* block,
+// which no barrier here orders (see all_reduce_fused_rmsnorm) -- so the whole
+// fused family lives in kPack, the one region that holds sentinel kernels at
+// every world size.
 enum class ScratchRegion : int { kBlock = 0, kPack = 1 };
 
 template <typename T, int N>
@@ -518,6 +524,12 @@ __host__ __device__ __forceinline__ int scratch_state_offset(int max_blocks, int
          2 * static_cast<int>(region);
 }
 
+// {arrival, generation} for grid_barrier(). Rank-local like the scratch state,
+// and placed just past it so no existing offset moves.
+__host__ __device__ __forceinline__ int grid_barrier_offset(int max_blocks, int world_size) {
+  return scratch_state_offset(max_blocks, world_size, ScratchRegion::kPack) + 2;
+}
+
 // Debug only: pin every call to half 0, i.e. the pre-double-buffer behaviour.
 // Kept because the cross-island race is invisible without a way to build the
 // broken protocol on demand -- it is what proves a repro actually has power,
@@ -543,6 +555,22 @@ __host__ __device__ __forceinline__ int scratch_state_offset(int max_blocks, int
 // Never define this in a shipping build.
 #ifndef FLASHINFER_PCIE_IPC_DEBUG_PER_BLOCK_EPOCH
 #define FLASHINFER_PCIE_IPC_DEBUG_PER_BLOCK_EPOCH 0
+#endif
+
+// Debug only: drop the barrier between the per-warp partials being written and
+// being summed, in the fused RMSNorm's row reduction. The resulting build reads
+// whatever a sibling warp had left in the slot, so the denominator is wrong for
+// some rows and right for others -- the negative control for the fused tests,
+// which without it cannot distinguish a correct reduction from a race that did
+// not happen to fire. Never define this in a shipping build.
+#ifndef FLASHINFER_PCIE_IPC_DEBUG_NO_ROW_SYNC
+#define FLASHINFER_PCIE_IPC_DEBUG_NO_ROW_SYNC 0
+#endif
+
+#if FLASHINFER_PCIE_IPC_DEBUG_NO_ROW_SYNC
+#define FI_PCIE_IPC_ROW_SYNC() ((void)0)
+#else
+#define FI_PCIE_IPC_ROW_SYNC() __syncthreads()
 #endif
 
 // Read this call's epoch and advance it, both at kernel entry.
@@ -613,6 +641,52 @@ __device__ __forceinline__ int advance_scratch_epoch(int32_t* state, int32_t* pe
   }
   return epoch;
 #endif
+}
+
+// Rendezvous of every block of this launch, on this device only.
+//
+// The peer barriers cannot substitute: block_barrier pairs block b with block b
+// of another *device* and says nothing about block b+1 here. The fused kernels
+// need exactly that missing edge -- their transport phases are chunk-anchored,
+// inherited verbatim from the plain kernels, while the normalisation is
+// row-affine, so the block that produced a pack is not the block that reads it
+// back.
+//
+// Two int32 of rank-local state, zeroed once at workspace init: an arrival
+// counter and a generation. A block reads the generation *before* arriving,
+// which is safe precisely because the barrier cannot complete without that
+// block's own arrival -- the counter can never reach `blocks` behind its back.
+//
+// This makes co-residency a hard requirement rather than a practical one: a
+// block that is never scheduled leaves every other block spinning here. The
+// launcher rejects a grid wider than the device can hold for this reason.
+__device__ __forceinline__ void grid_barrier(int32_t* state, int blocks) {
+  // Everything this block wrote must be visible before it announces arrival,
+  // and __syncthreads() alone does not order it device-wide.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    __threadfence();
+    const int generation = load_volatile_i32(state + 1);
+    if (atomicAdd(state, 1) == blocks - 1) {
+      // Last in. Rearm the counter before releasing, so the next call finds it
+      // at zero, and fence so the release cannot be seen before the reset.
+      store_volatile_i32(state, 0);
+      __threadfence();
+      store_volatile_i32(state + 1, generation + 1);
+    } else {
+      // Backoff, not a tight spin. Every waiting block polls the same 4-byte
+      // line, and with a wide grid that is a hundred-odd threads hammering one
+      // L2 set while the transport blocks are trying to push payload through
+      // the same L2. Sleeping between polls costs a few hundred nanoseconds of
+      // wake-up latency and gives the collective its bandwidth back.
+      while (load_volatile_i32(state + 1) == generation) {
+#if __CUDA_ARCH__ >= 700
+        __nanosleep(256);
+#endif
+      }
+    }
+  }
+  __syncthreads();
 }
 
 __device__ __forceinline__ void block_barrier(uint64_t const* signal_ptrs, int rank, int world_size,
@@ -1332,6 +1406,966 @@ __global__ __launch_bounds__(1024, 1) void ipc_rsag_push_param_kernel(
     }
   }
   debug_commit_per_block_epoch(epoch_slot, epoch);
+}
+
+// Packs one thread holds across a row's normalisation. The row is read once,
+// kept in registers, and scaled in place; re-reading it from HBM would give back
+// most of what the fusion buys. Admission rejects rows wider than this.
+constexpr int kFusedMaxPacksPerThread = 4;
+
+template <typename T>
+struct RsagFusedRmsNormData {
+  uint64_t tmp_ptrs[kMaxWorldSize];
+  // Only the staged transports take barriers; the flat push kernel leaves this
+  // untouched. Bound unconditionally so one launcher serves both.
+  uint64_t signal_ptrs[kMaxWorldSize];
+  T const* input;
+  T const* residual_in;
+  T const* gamma;
+  T* residual_out;
+  T* norm_out;
+  int32_t* epoch_slots;
+  int32_t* scratch_state;
+  // {arrival, generation} for the rank-local grid barrier between the transport
+  // and the normalisation.
+  int32_t* grid_state;
+  float eps;
+  int num_packs;
+  int hidden_packs;
+  int rank_stride_packs;
+  int epoch_stride_packs;
+  int rank;
+  int max_blocks;
+  // Blocks that run the collective. The rest go straight to the grid barrier
+  // and then normalise with everyone else.
+  //
+  // The two halves want opposite grids: concurrent transfers collapse on this
+  // fabric, so the collective is fastest on a handful of blocks, while the
+  // normalisation is HBM-bound and wants the whole device. One launch has one
+  // grid, which is why a fused kernel loses to the same collective followed by
+  // a separate norm kernel -- that pair gets both grids. Splitting the grid
+  // inside the launch is how one kernel gets both.
+  int transport_blocks;
+};
+
+// Sum across the block, in a fixed tree order.
+//
+// Deterministic by construction, which is load-bearing twice over: the tuner
+// screens candidates against a reference with an exact comparison, and every
+// rank must land on the same denominator or their normalised outputs diverge
+// and every downstream tensor-parallel GEMM diverges with them. An atomic
+// accumulation would satisfy neither.
+//
+// `smem` holds one float per warp. The entry barrier is what makes the buffer
+// reusable across rows.
+__device__ __forceinline__ float block_reduce_sum(float value, float* smem) {
+  __syncthreads();
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffffu, value, offset);
+  }
+  int lane = threadIdx.x & 31;
+  int warp = threadIdx.x >> 5;
+  if (lane == 0) {
+    smem[warp] = value;
+  }
+  FI_PCIE_IPC_ROW_SYNC();
+  int warps = (blockDim.x + 31) >> 5;
+  value = (threadIdx.x < warps) ? smem[threadIdx.x] : 0.0f;
+  if (warp == 0) {
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+      value += __shfl_down_sync(0xffffffffu, value, offset);
+    }
+    if (lane == 0) {
+      smem[0] = value;
+    }
+  }
+  __syncthreads();
+  return smem[0];
+}
+
+template <typename T>
+__device__ __forceinline__ float pack_square_sum(uint4 pack) {
+  float2 a = lane_to_float2<T>(pack.x);
+  float2 b = lane_to_float2<T>(pack.y);
+  float2 c = lane_to_float2<T>(pack.z);
+  float2 d = lane_to_float2<T>(pack.w);
+  return a.x * a.x + a.y * a.y + b.x * b.x + b.y * b.y + c.x * c.x + c.y * c.y + d.x * d.x +
+         d.y * d.y;
+}
+
+template <typename T>
+__device__ __forceinline__ uint4 scale_pack(uint4 pack, uint4 gamma, float scale) {
+  float2 v[4] = {lane_to_float2<T>(pack.x), lane_to_float2<T>(pack.y), lane_to_float2<T>(pack.z),
+                 lane_to_float2<T>(pack.w)};
+  float2 g[4] = {lane_to_float2<T>(gamma.x), lane_to_float2<T>(gamma.y), lane_to_float2<T>(gamma.z),
+                 lane_to_float2<T>(gamma.w)};
+  uint4 out;
+  uint32_t* lanes = &out.x;
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    float2 scaled = {v[i].x * scale * g[i].x, v[i].y * scale * g[i].y};
+    lanes[i] = float2_to_lane<T>(scaled);
+  }
+  return out;
+}
+
+// The normalisation, once residual_out already holds the reduced sum plus the
+// residual for the whole tensor.
+//
+// Every fused kernel ends here, and the phase is deliberately independent of
+// how the collective got there: the transports keep the plain kernels' own
+// chunk-anchored mappings, byte for byte, and this reads the result back. The
+// earlier design folded the normalisation into the collective to keep the row
+// in registers, which cost a re-read but forced the all-gather onto a row-affine
+// mapping -- and that turned one near-sequential outbound stream per rank into
+// gridDim scattered ones, which this fabric answers with 12-30% less
+// throughput. Re-reading residual_out costs one pass over the payload from L2
+// or HBM, which is far less than that.
+//
+// The caller must have run grid_barrier() first: the block that reduced a pack
+// is not the block that normalises it.
+template <typename T>
+__device__ __forceinline__ void fused_row_normalise(T* residual_out, T* norm_out, T const* gamma,
+                                                    float eps, int rows, int hidden_packs,
+                                                    float* row_smem) {
+  auto* residual = reinterpret_cast<uint4*>(residual_out);
+  auto const* gamma_packs = reinterpret_cast<uint4 const*>(gamma);
+  for (int row = blockIdx.x; row < rows; row += gridDim.x) {
+    int base = row * hidden_packs;
+    uint4 held[kFusedMaxPacksPerThread];
+    float square_sum = 0.0f;
+#pragma unroll
+    for (int slot = 0; slot < kFusedMaxPacksPerThread; ++slot) {
+      int p = threadIdx.x + slot * blockDim.x;
+      if (p < hidden_packs) {
+        // Volatile: written by another block, and the L1s are not coherent
+        // with each other. The grid barrier ordered it; this makes it visible.
+        held[slot] = load_u4_volatile(residual, base + p);
+        square_sum += pack_square_sum<T>(held[slot]);
+      }
+    }
+    square_sum = block_reduce_sum(square_sum, row_smem);
+    float scale =
+        rsqrtf(square_sum / static_cast<float>(hidden_packs * PackTraits<T>::kPackElems) + eps);
+#pragma unroll
+    for (int slot = 0; slot < kFusedMaxPacksPerThread; ++slot) {
+      int p = threadIdx.x + slot * blockDim.x;
+      if (p < hidden_packs) {
+        reinterpret_cast<uint4*>(norm_out)[base + p] =
+            scale_pack<T>(held[slot], gamma_packs[p], scale);
+      }
+    }
+  }
+}
+
+// One-shot push with the residual add and RMSNorm folded in.
+//
+// Every rank pushes its whole contribution to every peer, so once the poll
+// clears, each rank already holds every contribution to every pack. There is no
+// owner, no all-gather, and nothing to publish pre-norm -- the normalisation is
+// purely local, which makes this the simplest of the fused kernels and the one
+// whose grid split matters least.
+//
+// It moves (N-1)*P bytes per rank against the staged forms' 2(N-1)P/N, so it
+// wins only while the payload is small enough that one round trip beats two.
+// That is exactly the range where the staged fused kernels lose to a plain
+// one-shot followed by a separate norm, which is why this exists.
+//
+// Body is push_oneshot_param_kernel with Fp32Reduce=false, plus the residual
+// and residual_out. The self-push is kept: the poll then covers all WorldSize
+// slots uniformly, and the slot is written exactly once per epoch either way.
+template <typename T, int WorldSize, bool UsePdl>
+__global__ __launch_bounds__(1024, 1) void ipc_oneshot_fused_rmsnorm_kernel(
+    const RsagFusedRmsNormData<T> __grid_constant__ params) {
+  pdl_grid_sync_const<UsePdl>();
+  extern __shared__ float row_smem[];
+
+  int32_t* epoch_slot = params.epoch_slots + blockIdx.x;
+  int epoch = advance_scratch_epoch(params.scratch_state, epoch_slot);
+
+  if (blockIdx.x < params.transport_blocks) {
+    int stage_offset = epoch * params.epoch_stride_packs;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = params.transport_blocks * blockDim.x;
+
+    uint4 const* input = reinterpret_cast<uint4 const*>(params.input);
+    uint4 const* residual = reinterpret_cast<uint4 const*>(params.residual_in);
+    auto* out = reinterpret_cast<uint4*>(params.residual_out);
+    auto* local_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[params.rank]);
+    uint4 reset = {0u, 0u, 0u, 0u};
+
+    for (int idx = tid; idx < params.num_packs; idx += stride) {
+      uint4 value = clear_pos_zero_u4_16(input[idx]);
+#pragma unroll
+      for (int peer = 0; peer < WorldSize; ++peer) {
+        auto* peer_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[peer]);
+        int peer_offset = stage_offset + params.rank * params.rank_stride_packs + idx;
+        store_u4_volatile(peer_buffer, peer_offset, value);
+      }
+    }
+
+    for (int idx = tid; idx < params.num_packs; idx += stride) {
+      uint4 values[WorldSize];
+      while (true) {
+        bool waiting = false;
+#pragma unroll
+        for (int peer = 0; peer < WorldSize; ++peer) {
+          int peer_offset = stage_offset + peer * params.rank_stride_packs + idx;
+          values[peer] = load_u4_volatile(local_buffer, peer_offset);
+          waiting |= has_pos_zero_u4_16(values[peer]);
+        }
+        if (!waiting) {
+          break;
+        }
+      }
+      uint4 acc = values[0];
+#pragma unroll
+      for (int peer = 1; peer < WorldSize; ++peer) {
+        acc = packed_add_u4<T>(acc, values[peer]);
+      }
+      // Every rank holds the whole sum, so the residual is added by all of them
+      // rather than by an owner -- and identically, since residual_in is
+      // replicated.
+      out[idx] = packed_add_u4<T>(acc, residual[idx]);
+#pragma unroll
+      for (int peer = 0; peer < WorldSize; ++peer) {
+        store_u4_volatile(local_buffer, stage_offset + peer * params.rank_stride_packs + idx,
+                          reset);
+      }
+    }
+  }
+  debug_commit_per_block_epoch(epoch_slot, epoch);
+
+  grid_barrier(params.grid_state, gridDim.x);
+  fused_row_normalise<T>(params.residual_out, params.norm_out, params.gamma, params.eps,
+                         params.num_packs / params.hidden_packs, params.hidden_packs, row_smem);
+  pdl_grid_release_const<UsePdl>();
+}
+
+// TP8 topology one-shot with the residual add and RMSNorm folded in.
+//
+// The eight-rank counterpart of the kernel above. The flat one-shot is the
+// wrong shape here -- it has every rank writing to all seven peers at once,
+// which is the pattern this fabric collapses on, measured at 179 us against 20
+// for this one at batch 1. So this clones ipc_topo_rsag8_push_param_kernel:
+// each rank pushes to the island owner of the pack, the owner sums its island,
+// exchanges once across SYS with its paired owner, and publishes the final
+// value back to the island. No barriers, all sentinels, one grid-strided pass.
+//
+// The residual goes in where the final value is formed, so it lands exactly
+// once per pack -- on the owner, before the value is published.
+template <typename T, bool UsePdl>
+__global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_oneshot_fused_rmsnorm_kernel(
+    const RsagFusedRmsNormData<T> __grid_constant__ params) {
+  pdl_grid_sync_const<UsePdl>();
+  extern __shared__ float row_smem[];
+
+  int32_t* epoch_slot = params.epoch_slots + blockIdx.x;
+  int epoch = advance_scratch_epoch(params.scratch_state, epoch_slot);
+
+  if (blockIdx.x < params.transport_blocks) {
+    int stage_offset = epoch * params.epoch_stride_packs;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = params.transport_blocks * blockDim.x;
+    int part = params.num_packs / 4;
+    int base = params.rank < 4 ? 0 : 4;
+    int cross_base = base ^ 4;
+    int local_rank = params.rank - base;
+
+    uint4 const* input = reinterpret_cast<uint4 const*>(params.input);
+    uint4 const* residual = reinterpret_cast<uint4 const*>(params.residual_in);
+    auto* out = reinterpret_cast<uint4*>(params.residual_out);
+    auto* local_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[params.rank]);
+    uint4 reset = {0u, 0u, 0u, 0u};
+
+    for (int idx = tid; idx < params.num_packs; idx += stride) {
+      int chunk = rsag_owner_for_pack<4>(idx, part);
+      int owner = base + chunk;
+      auto* owner_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[owner]);
+      int input_offset = stage_offset + params.rank * params.rank_stride_packs + idx;
+      store_u4_volatile(owner_buffer, input_offset, clear_pos_zero_u4_16(input[idx]));
+
+      if (local_rank == chunk) {
+        uint4 values[4];
+        while (true) {
+          bool waiting = false;
+#pragma unroll
+          for (int peer_local = 0; peer_local < 4; ++peer_local) {
+            int peer = base + peer_local;
+            int offset = stage_offset + peer * params.rank_stride_packs + idx;
+            values[peer_local] = load_u4_volatile(local_buffer, offset);
+            waiting |= has_pos_zero_u4_16(values[peer_local]);
+          }
+          if (!waiting) {
+            break;
+          }
+        }
+        uint4 local_sum = values[0];
+#pragma unroll
+        for (int peer_local = 1; peer_local < 4; ++peer_local) {
+          local_sum = packed_add_u4<T>(local_sum, values[peer_local]);
+        }
+#pragma unroll
+        for (int peer_local = 0; peer_local < 4; ++peer_local) {
+          int peer = base + peer_local;
+          store_u4_volatile(local_buffer, stage_offset + peer * params.rank_stride_packs + idx,
+                            reset);
+        }
+
+        int cross_owner = cross_base + chunk;
+        auto* cross_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[cross_owner]);
+        int cross_write = stage_offset + params.rank * params.rank_stride_packs + idx;
+        store_u4_volatile(cross_buffer, cross_write, clear_pos_zero_u4_16(local_sum));
+
+        int cross_read = stage_offset + cross_owner * params.rank_stride_packs + idx;
+        uint4 cross_sum;
+        while (true) {
+          cross_sum = load_u4_volatile(local_buffer, cross_read);
+          if (!has_pos_zero_u4_16(cross_sum)) {
+            break;
+          }
+        }
+        // Added once, by the owner, before the value is published -- the island
+        // peers receive it already folded in.
+        uint4 final_value = packed_add_u4<T>(packed_add_u4<T>(local_sum, cross_sum), residual[idx]);
+        out[idx] = final_value;
+        store_u4_volatile(local_buffer, cross_read, reset);
+
+        uint4 publish_final = clear_pos_zero_u4_16(final_value);
+#pragma unroll
+        for (int peer_local = 0; peer_local < 4; ++peer_local) {
+          int peer = base + peer_local;
+          if (peer == params.rank) {
+            continue;
+          }
+          auto* peer_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[peer]);
+          store_u4_volatile(peer_buffer,
+                            stage_offset + params.rank * params.rank_stride_packs + idx,
+                            publish_final);
+        }
+      } else {
+        int final_offset = stage_offset + owner * params.rank_stride_packs + idx;
+        uint4 final_value;
+        while (true) {
+          final_value = load_u4_volatile(local_buffer, final_offset);
+          if (!has_pos_zero_u4_16(final_value)) {
+            break;
+          }
+        }
+        out[idx] = final_value;
+        store_u4_volatile(local_buffer, final_offset, reset);
+      }
+    }
+  }
+  debug_commit_per_block_epoch(epoch_slot, epoch);
+
+  grid_barrier(params.grid_state, gridDim.x);
+  fused_row_normalise<T>(params.residual_out, params.norm_out, params.gamma, params.eps,
+                         params.num_packs / params.hidden_packs, params.hidden_packs, row_smem);
+  pdl_grid_release_const<UsePdl>();
+}
+
+// Reduce-scatter / all-gather with the residual add and RMSNorm folded in.
+//
+// The flat all-to-all transport: every rank pushes to every peer at once. Kept
+// because it wins below the payload where that pattern starts to collapse; the
+// two ring kernels below take over above it.
+//
+// Body is ipc_rsag_push_param_kernel unchanged, with the residual folded into
+// the owner's sum and the result written to residual_out, then a device-local
+// rendezvous and the shared normalisation. See the note on fused_row_normalise
+// for why the collective is left exactly as measured.
+//
+// The published value stays *pre-norm*. Publishing the normalised value instead
+// would leave no rank able to reconstruct residual_out for the packs it does not
+// own, and repairing that needs a second all-gather -- 50% more bytes on the one
+// resource this fabric is short of. Since every rank ends the all-gather holding
+// the whole tensor, it can compute every row's denominator itself, so the norm
+// costs no communication at all and places no alignment requirement on the
+// batch.
+//
+// The consequence for numerics: a non-owner sees only the rounded payload, so
+// the sum of squares is taken over the rounded residual and
+// norm_out == rms_norm(residual_out) holds exactly, matching the other fusion
+// backends.
+template <typename T, int WorldSize, bool UsePdl>
+__global__ __launch_bounds__(1024, 1) void ipc_rsag_push_fused_rmsnorm_kernel(
+    const RsagFusedRmsNormData<T> __grid_constant__ params) {
+  pdl_grid_sync_const<UsePdl>();
+  extern __shared__ float row_smem[];
+
+  int32_t* epoch_slot = params.epoch_slots + blockIdx.x;
+  int epoch = advance_scratch_epoch(params.scratch_state, epoch_slot);
+
+  // Only these blocks run the collective; the rest go straight to the
+  // rendezvous. The epoch above is advanced by every block, because the
+  // arrival counter it settles is compared against gridDim.x.
+  if (blockIdx.x < params.transport_blocks) {
+    int stage_offset = epoch * params.epoch_stride_packs;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = params.transport_blocks * blockDim.x;
+    int part = params.num_packs / WorldSize;
+
+    uint4 const* input = reinterpret_cast<uint4 const*>(params.input);
+    uint4 const* residual = reinterpret_cast<uint4 const*>(params.residual_in);
+    auto* out = reinterpret_cast<uint4*>(params.residual_out);
+    auto* local_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[params.rank]);
+    uint4 reset = {0u, 0u, 0u, 0u};
+
+    for (int idx = tid; idx < params.num_packs; idx += stride) {
+      int owner = rsag_owner_for_pack<WorldSize>(idx, part);
+      auto* owner_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[owner]);
+      int offset = stage_offset + params.rank * params.rank_stride_packs + idx;
+      store_u4_volatile(owner_buffer, offset, clear_pos_zero_u4_16(input[idx]));
+    }
+
+    int start = params.rank * part;
+    int end = (params.rank == WorldSize - 1) ? params.num_packs : start + part;
+    for (int idx = start + tid; idx < end; idx += stride) {
+      uint4 values[WorldSize];
+      while (true) {
+        bool waiting = false;
+#pragma unroll
+        for (int peer = 0; peer < WorldSize; ++peer) {
+          int offset = stage_offset + peer * params.rank_stride_packs + idx;
+          values[peer] = load_u4_volatile(local_buffer, offset);
+          waiting |= has_pos_zero_u4_16(values[peer]);
+        }
+        if (!waiting) {
+          break;
+        }
+      }
+      uint4 acc = values[0];
+#pragma unroll
+      for (int peer = 1; peer < WorldSize; ++peer) {
+        acc = packed_add_u4<T>(acc, values[peer]);
+      }
+      // Added once, by the owner, after the reduction: adding it before the
+      // scatter would fold in one copy per rank.
+      acc = packed_add_u4<T>(acc, residual[idx]);
+      out[idx] = acc;
+      uint4 publish = clear_pos_zero_u4_16(acc);
+#pragma unroll
+      for (int peer = 0; peer < WorldSize; ++peer) {
+        int offset = stage_offset + peer * params.rank_stride_packs + idx;
+        store_u4_volatile(local_buffer, offset, reset);
+        if (peer != params.rank) {
+          auto* peer_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[peer]);
+          int final_offset = stage_offset + params.rank * params.rank_stride_packs + idx;
+          store_u4_volatile(peer_buffer, final_offset, publish);
+        }
+      }
+    }
+
+    for (int idx = tid; idx < params.num_packs; idx += stride) {
+      int owner = rsag_owner_for_pack<WorldSize>(idx, part);
+      if (owner == params.rank) {
+        continue;
+      }
+      int offset = stage_offset + owner * params.rank_stride_packs + idx;
+      uint4 value;
+      while (true) {
+        value = load_u4_volatile(local_buffer, offset);
+        if (!has_pos_zero_u4_16(value)) {
+          break;
+        }
+      }
+      out[idx] = value;
+      store_u4_volatile(local_buffer, offset, reset);
+    }
+  }  // transport blocks
+  debug_commit_per_block_epoch(epoch_slot, epoch);
+
+  grid_barrier(params.grid_state, gridDim.x);
+  fused_row_normalise<T>(params.residual_out, params.norm_out, params.gamma, params.eps,
+                         params.num_packs / params.hidden_packs, params.hidden_packs, row_smem);
+  pdl_grid_release_const<UsePdl>();
+}
+
+// Neighbour-ordered RS/AG with the residual add and RMSNorm folded in.
+//
+// Stands to ipc_rsag_ring_push_param_kernel exactly as the kernel above stands
+// to ipc_rsag_push_param_kernel, and exists for the same reason: where every
+// peer transfer crosses the CPU root complex, writing to all peers at once
+// collapses, and the collapse grows with the payload.
+//
+// The collective is that kernel's, unchanged -- same passes, same barrier
+// phases, same chunk-anchored sweeps, same sentinels and resets. Only two
+// things are added: the residual goes in where the owner forms the sum, and
+// the result lands in residual_out rather than output. Then every block
+// rendezvous on this device and the normalisation reads residual_out back.
+//
+// Keeping the transport untouched is the whole point. An earlier version folded
+// the normalisation into the collective so the row could stay in registers,
+// which forced the all-gather onto the normalisation's row-affine mapping;
+// that replaced one near-sequential outbound stream per rank with gridDim
+// scattered ones and cost 12-30% against this same kernel followed by a
+// separate flashinfer.norm.fused_add_rmsnorm. The re-read this version pays is
+// one pass over the payload, and it buys the measured transport back.
+template <typename T, int WorldSize, bool UsePdl>
+__global__ __launch_bounds__(1024, 1) void ipc_rsag_ring_fused_rmsnorm_kernel(
+    const RsagFusedRmsNormData<T> __grid_constant__ params) {
+  // RS uses phases [1, WorldSize-1], AG uses [WorldSize, 2*WorldSize-2].
+  static_assert(2 * WorldSize - 2 < kSignalPhases,
+                "ring push needs 2*(WorldSize-1) barrier phases");
+  pdl_grid_sync_const<UsePdl>();
+  extern __shared__ float row_smem[];
+
+  int32_t* self_signal = reinterpret_cast<int32_t*>(params.signal_ptrs[params.rank]);
+  int flag = static_cast<int32_t>(
+      static_cast<uint32_t>(
+          load_acquire_i32(self_signal + flag_offset(blockIdx.x, params.max_blocks, WorldSize))) +
+      1u);
+  int32_t* epoch_slot = params.epoch_slots + blockIdx.x;
+  int epoch = advance_scratch_epoch(params.scratch_state, epoch_slot);
+
+  // Only these blocks run the collective; the rest go straight to the
+  // rendezvous. The epoch above is advanced by every block, because the
+  // arrival counter it settles is compared against gridDim.x.
+  if (blockIdx.x < params.transport_blocks) {
+    int stage_offset = epoch * params.epoch_stride_packs;
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = params.transport_blocks * blockDim.x;
+    int part = params.num_packs / WorldSize;
+    int my_start = params.rank * part;
+    int my_end = (params.rank == WorldSize - 1) ? params.num_packs : my_start + part;
+    int my_slot = stage_offset + params.rank * params.rank_stride_packs;
+
+    uint4 const* input = reinterpret_cast<uint4 const*>(params.input);
+    uint4 const* residual = reinterpret_cast<uint4 const*>(params.residual_in);
+    auto* out = reinterpret_cast<uint4*>(params.residual_out);
+    auto* local_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[params.rank]);
+    uint4 reset = {0u, 0u, 0u, 0u};
+
+    // Reduce-scatter, own chunk: stays on this GPU, so it costs no fabric time
+    // and does not need a pass of its own.
+    for (int idx = my_start + tid; idx < my_end; idx += stride) {
+      store_u4_volatile(local_buffer, my_slot + idx, clear_pos_zero_u4_16(input[idx]));
+    }
+
+    // Reduce-scatter, staged: one destination per pass.
+    for (int p = 0; p < WorldSize - 1; ++p) {
+      int target = (params.rank + 1 + p) % WorldSize;
+      int t_start = target * part;
+      int t_end = (target == WorldSize - 1) ? params.num_packs : t_start + part;
+      auto* target_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[target]);
+      for (int idx = t_start + tid; idx < t_end; idx += stride) {
+        store_u4_volatile(target_buffer, my_slot + idx, clear_pos_zero_u4_16(input[idx]));
+      }
+      block_barrier(params.signal_ptrs, params.rank, WorldSize, params.max_blocks,
+                    kRingRsPhase0 + p, flag);
+    }
+
+    // Owner reduce, plus the residual: every contribution to this rank's chunk is
+    // in its own buffer now, so this phase touches local memory only. The
+    // residual is added exactly once, here, by the pack's owner -- adding it
+    // before the scatter would fold in one copy per rank.
+    for (int idx = my_start + tid; idx < my_end; idx += stride) {
+      uint4 values[WorldSize];
+      while (true) {
+        bool waiting = false;
+#pragma unroll
+        for (int peer = 0; peer < WorldSize; ++peer) {
+          int offset = stage_offset + peer * params.rank_stride_packs + idx;
+          values[peer] = load_u4_volatile(local_buffer, offset);
+          waiting |= has_pos_zero_u4_16(values[peer]);
+        }
+        if (!waiting) {
+          break;
+        }
+      }
+      uint4 acc = values[0];
+#pragma unroll
+      for (int peer = 1; peer < WorldSize; ++peer) {
+        acc = packed_add_u4<T>(acc, values[peer]);
+      }
+      acc = packed_add_u4<T>(acc, residual[idx]);
+      out[idx] = acc;
+#pragma unroll
+      for (int peer = 0; peer < WorldSize; ++peer) {
+        if (peer != params.rank) {
+          store_u4_volatile(local_buffer, stage_offset + peer * params.rank_stride_packs + idx,
+                            reset);
+        }
+      }
+      store_u4_volatile(local_buffer, my_slot + idx, clear_pos_zero_u4_16(acc));
+    }
+
+    // All-gather, staged: same permutation schedule as the reduce-scatter.
+    for (int p = 0; p < WorldSize - 1; ++p) {
+      int target = (params.rank + 1 + p) % WorldSize;
+      auto* target_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[target]);
+      for (int idx = my_start + tid; idx < my_end; idx += stride) {
+        store_u4_volatile(target_buffer, my_slot + idx,
+                          load_u4_volatile(local_buffer, my_slot + idx));
+      }
+      block_barrier(params.signal_ptrs, params.rank, WorldSize, params.max_blocks, WorldSize + p,
+                    flag);
+    }
+
+    // Consume the chunks owned by others, then clear this rank's own slot so the
+    // sentinel state is clean for the epoch that reuses it.
+    for (int idx = tid; idx < params.num_packs; idx += stride) {
+      int owner = rsag_owner_for_pack<WorldSize>(idx, part);
+      if (owner == params.rank) {
+        continue;
+      }
+      int offset = stage_offset + owner * params.rank_stride_packs + idx;
+      uint4 value;
+      while (true) {
+        value = load_u4_volatile(local_buffer, offset);
+        if (!has_pos_zero_u4_16(value)) {
+          break;
+        }
+      }
+      out[idx] = value;
+      store_u4_volatile(local_buffer, offset, reset);
+    }
+    for (int idx = my_start + tid; idx < my_end; idx += stride) {
+      store_u4_volatile(local_buffer, my_slot + idx, reset);
+    }
+
+    if (threadIdx.x == 0) {
+      store_release_i32(self_signal + flag_offset(blockIdx.x, params.max_blocks, WorldSize), flag);
+    }
+  }  // transport blocks
+  debug_commit_per_block_epoch(epoch_slot, epoch);
+
+  // residual_out is complete only once every block of this grid has written its
+  // share of it; the peer barriers above pair block b with block b of another
+  // device and cannot establish that.
+  grid_barrier(params.grid_state, gridDim.x);
+  fused_row_normalise<T>(params.residual_out, params.norm_out, params.gamma, params.eps,
+                         params.num_packs / params.hidden_packs, params.hidden_packs, row_smem);
+  pdl_grid_release_const<UsePdl>();
+}
+
+// TP8 topology ring with the residual add and RMSNorm folded in.
+//
+// The eight-rank counterpart of the kernel above, and built the same way: the
+// collective is ipc_topo_rsag8_ring_push_param_kernel unchanged -- island
+// reduce-scatter in three one-destination passes, one cross-SYS exchange with
+// the paired owner, island gather in three more -- with the residual folded in
+// where the final value is formed and the result written to residual_out. The
+// normalisation is appended after a device-local rendezvous.
+//
+// It clones the topology kernel rather than the flat ring because a
+// topology-blind ring is slower at eight ranks at every block count, and
+// because 2*(8-1) barrier phases would not fit in kSignalPhases anyway.
+template <typename T, bool UsePdl>
+__global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_ring_fused_rmsnorm_kernel(
+    const RsagFusedRmsNormData<T> __grid_constant__ params) {
+  static_assert(kSignalPhases >= 8, "topology ring push needs eight barrier phases");
+  pdl_grid_sync_const<UsePdl>();
+  extern __shared__ float row_smem[];
+
+  int32_t* epoch_slot = params.epoch_slots + blockIdx.x;
+  // Every block advances the epoch: the arrival counter it settles is compared
+  // against gridDim.x, so a block that skipped it would leave the half
+  // unflipped. Only the transport blocks go on to take barriers, and only they
+  // read the per-block generation flag those barriers use.
+  const int call_epoch = advance_scratch_epoch(params.scratch_state, epoch_slot);
+
+  if (blockIdx.x < params.transport_blocks) {
+    int32_t* self_signal = reinterpret_cast<int32_t*>(params.signal_ptrs[params.rank]);
+    int flag =
+        static_cast<int32_t>(static_cast<uint32_t>(load_acquire_i32(
+                                 self_signal + flag_offset(blockIdx.x, params.max_blocks, 8))) +
+                             1u);
+
+    const int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = params.transport_blocks * blockDim.x;
+    const int part = params.num_packs >> 2;
+    const int base = params.rank < 4 ? 0 : 4;
+    const int local = params.rank & 3;
+    const uint32_t island_mask = params.rank < 4 ? 0x0fu : 0xf0u;
+    const int cross_owner = params.rank ^ 4;
+    const int stage_offset = call_epoch * params.epoch_stride_packs;
+    const int my_start = local * part;
+    const int my_end = (local == 3) ? params.num_packs : my_start + part;
+    const int my_slot = stage_offset + params.rank * params.rank_stride_packs;
+    const int cross_slot = stage_offset + cross_owner * params.rank_stride_packs;
+
+    uint4 const* input = reinterpret_cast<uint4 const*>(params.input);
+    uint4 const* residual = reinterpret_cast<uint4 const*>(params.residual_in);
+    auto* out = reinterpret_cast<uint4*>(params.residual_out);
+    auto* local_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[params.rank]);
+    uint4 reset = {0u, 0u, 0u, 0u};
+
+    // Island reduce-scatter. The contribution to this rank's own chunk stays on
+    // this GPU, so it costs no fabric time and needs no pass of its own.
+    for (int idx = my_start + tid; idx < my_end; idx += stride) {
+      store_u4_volatile(local_buffer, my_slot + idx, input[idx]);
+    }
+    for (int p = 0; p < 3; ++p) {
+      const int t = (local + 1 + p) & 3;
+      const int owner_t = base + t;
+      const int t_start = t * part;
+      const int t_end = (t == 3) ? params.num_packs : t_start + part;
+      auto* owner_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[owner_t]);
+      for (int idx = t_start + tid; idx < t_end; idx += stride) {
+        store_u4_volatile(owner_buffer, my_slot + idx, input[idx]);
+      }
+      __threadfence_system();
+      block_barrier_mask(params.signal_ptrs, params.rank, 8, params.max_blocks, p, flag,
+                         island_mask);
+    }
+
+    // Island sum, then the one cross-SYS exchange with the paired owner.
+    for (int idx = my_start + tid; idx < my_end; idx += stride) {
+      uint4 v0 = load_u4_volatile(local_buffer,
+                                  stage_offset + (base + 0) * params.rank_stride_packs + idx);
+      uint4 v1 = load_u4_volatile(local_buffer,
+                                  stage_offset + (base + 1) * params.rank_stride_packs + idx);
+      uint4 v2 = load_u4_volatile(local_buffer,
+                                  stage_offset + (base + 2) * params.rank_stride_packs + idx);
+      uint4 v3 = load_u4_volatile(local_buffer,
+                                  stage_offset + (base + 3) * params.rank_stride_packs + idx);
+      uint4 local_sum = packed_add_u4<T>(packed_add_u4<T>(v0, v1), packed_add_u4<T>(v2, v3));
+      // Clear the island contributions as they are consumed. The parent kernel
+      // does not: it lives in the block region among barrier kernels, which leave
+      // their payload in place. This one is in the pack region, whose sentinel
+      // kernels read +0.0 as "not written yet", so it owes that region a clean
+      // slate on the way out.
+#pragma unroll
+      for (int i = 0; i < 4; ++i) {
+        if (i != local) {
+          store_u4_volatile(local_buffer,
+                            stage_offset + (base + i) * params.rank_stride_packs + idx, reset);
+        }
+      }
+      // Keep the island sum so the gather phase does not recompute it.
+      store_u4_volatile(local_buffer, my_slot + idx, local_sum);
+      auto* cross_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[cross_owner]);
+      store_u4_volatile(cross_buffer, my_slot + idx, local_sum);
+    }
+    __threadfence_system();
+    owner_pair_barrier(params.signal_ptrs, params.rank, params.rank, cross_owner, params.max_blocks,
+                       3, flag);
+    debug_cross_read_stall(params.rank);
+
+    // Final value for the owned chunk, plus the residual once, written locally.
+    for (int idx = my_start + tid; idx < my_end; idx += stride) {
+      uint4 mine = load_u4_volatile(local_buffer, my_slot + idx);
+      uint4 theirs = load_u4_volatile(local_buffer, cross_slot + idx);
+      uint4 final_value = packed_add_u4<T>(packed_add_u4<T>(mine, theirs), residual[idx]);
+      out[idx] = final_value;
+      store_u4_volatile(local_buffer, cross_slot + idx, reset);
+      store_u4_volatile(local_buffer, my_slot + idx, final_value);
+    }
+    __threadfence_system();
+
+    // Island all-gather, staged on the same permutation schedule.
+    for (int p = 0; p < 3; ++p) {
+      const int peer = base + ((local + 1 + p) & 3);
+      auto* peer_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[peer]);
+      for (int idx = my_start + tid; idx < my_end; idx += stride) {
+        store_u4_volatile(peer_buffer, my_slot + idx,
+                          load_u4_volatile(local_buffer, my_slot + idx));
+      }
+      __threadfence_system();
+      block_barrier_mask(params.signal_ptrs, params.rank, 8, params.max_blocks, 4 + p, flag,
+                         island_mask);
+    }
+
+    // Collect the three chunks owned by the other island members.
+    for (int p = 0; p < 3; ++p) {
+      const int t = (local + 1 + p) & 3;
+      const int owner_t = base + t;
+      const int t_start = t * part;
+      const int t_end = (t == 3) ? params.num_packs : t_start + part;
+      const int owner_slot = stage_offset + owner_t * params.rank_stride_packs;
+      for (int idx = t_start + tid; idx < t_end; idx += stride) {
+        out[idx] = load_u4_volatile(local_buffer, owner_slot + idx);
+        store_u4_volatile(local_buffer, owner_slot + idx, reset);
+      }
+    }
+    for (int idx = my_start + tid; idx < my_end; idx += stride) {
+      store_u4_volatile(local_buffer, my_slot + idx, reset);
+    }
+    // Hold the island until everyone has finished reading before the next call's
+    // reduce-scatter starts writing the same slots. This covers the intra-island
+    // reuse only; the cross-island edge is what the epoch double buffer supplies.
+    block_barrier_mask(params.signal_ptrs, params.rank, 8, params.max_blocks, 7, flag, island_mask);
+
+    if (threadIdx.x == 0) {
+      store_release_i32(self_signal + flag_offset(blockIdx.x, params.max_blocks, 8), flag);
+    }
+  }  // transport blocks
+  debug_commit_per_block_epoch(epoch_slot, call_epoch);
+
+  // Every block of this grid has to have written its share of residual_out
+  // before any block reads a row of it back. The island barriers cannot say
+  // that: they pair block b with block b of another device.
+  grid_barrier(params.grid_state, gridDim.x);
+  fused_row_normalise<T>(params.residual_out, params.norm_out, params.gamma, params.eps,
+                         params.num_packs / params.hidden_packs, params.hidden_packs, row_smem);
+  pdl_grid_release_const<UsePdl>();
+}
+
+// TP8 island-block push with the residual add and RMSNorm folded in.
+//
+// The fused counterpart of ipc_topo_rsag8_block_param_kernel, and the one the
+// family was missing. It matters on fabrics with three cost levels -- a NUMA
+// node feeding two PCIe switches, two GPUs behind each -- where the plain
+// dispatch picks this transport from batch 16 up and the fused dispatch, unable
+// to reach it, had to settle for the ring and lost 26-51% for it.
+//
+// The collective is the parent unchanged: every rank pushes its quarter to that
+// quarter's island owner in one shot, the owner sums the four, exchanges with
+// its opposite number across the root complex, and broadcasts the total back to
+// its three island peers. The residual folds in where the owner forms the final
+// value, so it is added exactly once; the peers receive a total that already
+// carries it and only have to write it out. Normalisation is appended after a
+// device-local rendezvous, as in the other four.
+template <typename T, bool UsePdl>
+__global__ __launch_bounds__(1024, 1) void ipc_topo_rsag8_block_fused_rmsnorm_kernel(
+    const RsagFusedRmsNormData<T> __grid_constant__ params) {
+  static_assert(kSignalPhases >= 5, "topology block push needs five barrier phases");
+  pdl_grid_sync_const<UsePdl>();
+  extern __shared__ float row_smem[];
+
+  int32_t* epoch_slot = params.epoch_slots + blockIdx.x;
+  // Every block advances the epoch: the arrival counter it settles is compared
+  // against gridDim.x, so a block that skipped it would leave the half
+  // unflipped. Only the transport blocks go on to take barriers.
+  const int call_epoch = advance_scratch_epoch(params.scratch_state, epoch_slot);
+
+  if (blockIdx.x < params.transport_blocks) {
+    int32_t* self_signal = reinterpret_cast<int32_t*>(params.signal_ptrs[params.rank]);
+    int flag =
+        static_cast<int32_t>(static_cast<uint32_t>(load_acquire_i32(
+                                 self_signal + flag_offset(blockIdx.x, params.max_blocks, 8))) +
+                             1u);
+
+    // The parent derives its partition from the whole grid. Here only the first
+    // transport_blocks blocks run the collective, so the divisor is that count
+    // -- gridDim.x would hand each chunk more blocks than are actually present
+    // and stride the loops past their work. The launcher requires both blocks
+    // and transport_blocks to be multiples of four, which is what keeps
+    // blocks_per_chunk non-zero and leaves blockIdx.x's low two bits covering
+    // the four chunks evenly.
+    const int chunk = blockIdx.x & 3;
+    const int chunk_block = blockIdx.x >> 2;
+    const int blocks_per_chunk = params.transport_blocks >> 2;
+    const int tid = chunk_block * blockDim.x + threadIdx.x;
+    const int stride = blocks_per_chunk * blockDim.x;
+    const int part = params.num_packs >> 2;
+    const int start = chunk * part;
+    const int end = (chunk == 3) ? params.num_packs : start + part;
+    const int base = params.rank < 4 ? 0 : 4;
+    const int owner = base + chunk;
+    const int cross_owner = owner ^ 4;
+    const int stage_offset = call_epoch * params.epoch_stride_packs;
+    // A slot is indexed by whoever writes it, in whichever buffer it lands in.
+    const int my_slot = stage_offset + params.rank * params.rank_stride_packs;
+    const int cross_slot = stage_offset + cross_owner * params.rank_stride_packs;
+    const int owner_slot = stage_offset + owner * params.rank_stride_packs;
+
+    uint4 const* input = reinterpret_cast<uint4 const*>(params.input);
+    uint4 const* residual = reinterpret_cast<uint4 const*>(params.residual_in);
+    auto* out = reinterpret_cast<uint4*>(params.residual_out);
+    auto* local_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[params.rank]);
+    auto* owner_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[owner]);
+    const uint4 reset = {0u, 0u, 0u, 0u};
+
+    for (int idx = start + tid; idx < end; idx += stride) {
+      store_u4_volatile(owner_buffer, my_slot + idx, input[idx]);
+    }
+    __threadfence_system();
+    island_owner_gather(params.signal_ptrs, params.rank, base, owner, params.max_blocks, 1, flag);
+
+    if (params.rank == owner) {
+      for (int idx = start + tid; idx < end; idx += stride) {
+        uint4 v0 = load_u4_volatile(local_buffer,
+                                    stage_offset + (base + 0) * params.rank_stride_packs + idx);
+        uint4 v1 = load_u4_volatile(local_buffer,
+                                    stage_offset + (base + 1) * params.rank_stride_packs + idx);
+        uint4 v2 = load_u4_volatile(local_buffer,
+                                    stage_offset + (base + 2) * params.rank_stride_packs + idx);
+        uint4 v3 = load_u4_volatile(local_buffer,
+                                    stage_offset + (base + 3) * params.rank_stride_packs + idx);
+        uint4 local_sum = packed_add_u4<T>(packed_add_u4<T>(v0, v1), packed_add_u4<T>(v2, v3));
+        auto* cross_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[cross_owner]);
+        store_u4_volatile(cross_buffer, my_slot + idx, local_sum);
+      }
+      __threadfence_system();
+    }
+    owner_pair_barrier(params.signal_ptrs, params.rank, owner, cross_owner, params.max_blocks, 2,
+                       flag);
+    debug_cross_read_stall(params.rank);
+
+    if (params.rank == owner) {
+      for (int idx = start + tid; idx < end; idx += stride) {
+        uint4 v0 = load_u4_volatile(local_buffer,
+                                    stage_offset + (base + 0) * params.rank_stride_packs + idx);
+        uint4 v1 = load_u4_volatile(local_buffer,
+                                    stage_offset + (base + 1) * params.rank_stride_packs + idx);
+        uint4 v2 = load_u4_volatile(local_buffer,
+                                    stage_offset + (base + 2) * params.rank_stride_packs + idx);
+        uint4 v3 = load_u4_volatile(local_buffer,
+                                    stage_offset + (base + 3) * params.rank_stride_packs + idx);
+        uint4 local_sum = packed_add_u4<T>(packed_add_u4<T>(v0, v1), packed_add_u4<T>(v2, v3));
+        uint4 cross_sum = load_u4_volatile(local_buffer, cross_slot + idx);
+        // Clear every slot as its last reader takes it. The parent clears
+        // nothing: it lives in the block region among barrier kernels, which
+        // leave their payload in place. This one is in the pack region, whose
+        // sentinel kernels read +0.0 as "not written yet", so it owes that
+        // region a clean slate on the way out. The four island contributions
+        // and the cross sum have no reader after this loop; the next call is
+        // held off by the phase 4 ack within the island and by the epoch double
+        // buffer across it.
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          store_u4_volatile(local_buffer,
+                            stage_offset + (base + i) * params.rank_stride_packs + idx, reset);
+        }
+        store_u4_volatile(local_buffer, cross_slot + idx, reset);
+        // The residual is added here and only here. What the peers receive
+        // already carries it, so they must not add it again.
+        uint4 final_value = packed_add_u4<T>(packed_add_u4<T>(local_sum, cross_sum), residual[idx]);
+        out[idx] = final_value;
+#pragma unroll
+        for (int peer_local = 0; peer_local < 4; ++peer_local) {
+          int peer = base + peer_local;
+          if (peer == params.rank) {
+            continue;
+          }
+          auto* peer_buffer = reinterpret_cast<uint4*>(params.tmp_ptrs[peer]);
+          store_u4_volatile(peer_buffer, my_slot + idx, final_value);
+        }
+      }
+      __threadfence_system();
+    }
+    island_owner_ready(params.signal_ptrs, params.rank, base, owner, params.max_blocks, 3, flag);
+
+    if (params.rank != owner) {
+      for (int idx = start + tid; idx < end; idx += stride) {
+        out[idx] = load_u4_volatile(local_buffer, owner_slot + idx);
+        store_u4_volatile(local_buffer, owner_slot + idx, reset);
+      }
+    }
+    // Hold the island until every peer has read and cleared before the next
+    // call's push starts writing the same slots.
+    island_owner_ack(params.signal_ptrs, params.rank, base, owner, params.max_blocks, 4, flag);
+
+    if (threadIdx.x == 0) {
+      store_release_i32(self_signal + flag_offset(blockIdx.x, params.max_blocks, 8), flag);
+    }
+  }  // transport blocks
+  debug_commit_per_block_epoch(epoch_slot, call_epoch);
+
+  // Every block of this grid has to have written its share of residual_out
+  // before any block reads a row of it back. The island barriers cannot say
+  // that: they pair block b with block b of another device.
+  grid_barrier(params.grid_state, gridDim.x);
+  fused_row_normalise<T>(params.residual_out, params.norm_out, params.gamma, params.eps,
+                         params.num_packs / params.hidden_packs, params.hidden_packs, row_smem);
+  // Placed after the normalisation, not before the last barrier as in the
+  // parent -- the parent's placement is a known bug it documents in place.
+  pdl_grid_release_const<UsePdl>();
 }
 
 template <typename T, bool UsePdl>
@@ -2110,8 +3144,14 @@ inline WorkspaceLayout compute_workspace_layout(int world_size, int64_t max_nume
   // {epoch, arrival} per scratch region, in ScratchRegion order. Appended at
   // the tail so phase_offset() and flag_offset(), both anchored at the front,
   // are unchanged. See scratch_state_offset().
+  // Per region, not the hardcoded pair this used to assume: the regions are
+  // enumerated now.
   const size_t scratch_state_slots = 2 * static_cast<size_t>(kScratchRegionCount);
-  const size_t signal_slots = epoch_slots + barrier_slots + flag_slots + scratch_state_slots;
+  // {arrival, generation} for the rank-local grid barrier. See
+  // grid_barrier_offset().
+  const size_t grid_barrier_slots = 2;
+  const size_t signal_slots =
+      epoch_slots + barrier_slots + flag_slots + scratch_state_slots + grid_barrier_slots;
   auto align128 = [](size_t n) { return (n + 127u) & ~static_cast<size_t>(127u); };
   WorkspaceLayout layout{};
   layout.signal_bytes = align128(sizeof(int32_t) * signal_slots);
@@ -2230,6 +3270,165 @@ inline cudaError_t launch(Kernel kernel, dim3 grid, dim3 block, cudaStream_t str
 // 0 < threads <= 1024; numel and max_numel both divisible by the 16-byte pack
 // width; numel * elem_size <= max_payload_bytes; and blocks % 4 == 0 for
 // (8, kStaged), since that kernel derives its chunk from blockIdx.x & 3.
+// AllReduce + residual add + RMSNorm, as one launch.
+//
+// Deliberately not a Variant of all_reduce(): the fused kernels take three more
+// tensors, so a caller cannot substitute one for the other, and the plain tuner
+// enumerates every Variant of the op it is tuning -- it would sweep this one
+// with null residual and gamma pointers. The fused op is tuned too, but under
+// its own name and over its own candidate set.
+//
+// `variant` names the transport, not a kernel of all_reduce(). The mapping is
+// deliberately the same one all_reduce() uses, so a tactic means the same thing
+// on both paths -- the two are compared against each other constantly, and a
+// variant that named different kernels on each side is what hid the world-8
+// gap below for a release:
+//
+//   world  variant       kernel
+//     2    kUnstaged     ipc_oneshot_fused_rmsnorm_kernel<2>
+//     2    kStaged       ipc_rsag_push_fused_rmsnorm_kernel<2>
+//     4    kUnstaged     ipc_oneshot_fused_rmsnorm_kernel<4>
+//     4    kStaged       ipc_rsag_push_fused_rmsnorm_kernel<4>
+//     4    kStagedRing   ipc_rsag_ring_fused_rmsnorm_kernel<4>
+//     8    kUnstaged     ipc_topo_rsag8_oneshot_fused_rmsnorm_kernel
+//     8    kStaged       ipc_topo_rsag8_block_fused_rmsnorm_kernel
+//     8    kStagedRing   ipc_topo_rsag8_ring_fused_rmsnorm_kernel
+//     8    kFlatStaged   ipc_rsag_push_fused_rmsnorm_kernel<8>
+//
+// Nothing else is accepted here.
+//
+// Preconditions the caller must have validated: world_size in {2,4,8}; the
+// (world_size, variant) pair appears above; numel divisible by hidden and by the
+// pack width; hidden divisible by the pack width; hidden_packs <=
+// kFusedMaxPacksPerThread * threads; the usual blocks/threads bounds; and both
+// blocks % 4 == 0 and transport_blocks % 4 == 0 for (8, kStaged), since that
+// kernel derives its chunk from blockIdx.x & 3 and its stride from
+// transport_blocks >> 2.
+//
+// Runs in the pack region, which is the sentinel family's home at every world
+// size. The block region would not do: at world_size 8 it holds the two
+// topology kernels, which are barrier-driven and leave their payload in place,
+// and a sentinel poll landing on that reads stale data rather than waiting.
+template <typename T>
+cudaError_t all_reduce_fused_rmsnorm(const T* input, const T* residual_in, const T* gamma,
+                                     T* residual_out, T* norm_out, int64_t numel, int64_t hidden,
+                                     float eps, const PeerViews& views, int rank, int world_size,
+                                     int max_blocks, int64_t max_numel, int blocks, int threads,
+                                     int transport_blocks, Variant variant, bool use_pdl,
+                                     cudaStream_t stream) {
+  using Traits = PackTraits<T>;
+  RsagFusedRmsNormData<T> params{};
+  for (int peer = 0; peer < world_size; ++peer) {
+    params.tmp_ptrs[peer] = views.pack[peer];
+    params.signal_ptrs[peer] = views.signal[peer];
+  }
+  params.input = input;
+  params.residual_in = residual_in;
+  params.gamma = gamma;
+  params.residual_out = residual_out;
+  params.norm_out = norm_out;
+  params.epoch_slots = views.self_signal;
+  params.scratch_state =
+      views.self_signal + scratch_state_offset(max_blocks, world_size, ScratchRegion::kPack);
+  params.grid_state = views.self_signal + grid_barrier_offset(max_blocks, world_size);
+  params.eps = eps;
+  params.num_packs = static_cast<int>(numel / Traits::kPackElems);
+  params.hidden_packs = static_cast<int>(hidden / Traits::kPackElems);
+  params.rank_stride_packs = static_cast<int>(max_numel / Traits::kPackElems);
+  params.epoch_stride_packs = world_size * params.rank_stride_packs;
+  params.rank = rank;
+  params.max_blocks = max_blocks;
+  params.transport_blocks = transport_blocks;
+
+  if (transport_blocks <= 0 || transport_blocks > blocks) {
+    return cudaErrorInvalidValue;
+  }
+
+  // Every fused kernel ends in grid_barrier(), which only completes if every
+  // block is resident: a block that has not been scheduled leaves the rest
+  // spinning. Refused rather than risked, because the failure is a hang with no
+  // timeout, and the check is one attribute read on a path that already builds
+  // a params struct.
+  int device = 0;
+  if (cudaError_t err = cudaGetDevice(&device); err != cudaSuccess) {
+    return err;
+  }
+  int sm_count = 0;
+  if (cudaError_t err = cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount, device);
+      err != cudaSuccess) {
+    return err;
+  }
+  // __launch_bounds__(1024, 1) puts at most one block of any size on an SM.
+  if (blocks > sm_count) {
+    return cudaErrorInvalidValue;
+  }
+
+  const dim3 grid(static_cast<unsigned>(blocks));
+  const dim3 cta(static_cast<unsigned>(threads));
+  // One float per warp, for the row reduction.
+  const size_t smem = ((threads + 31) / 32) * sizeof(float);
+
+#define FI_PCIE_IPC_FUSED_LAUNCH(KERNEL_EXPR)    \
+  do {                                           \
+    auto kernel = KERNEL_EXPR;                   \
+    kernel<<<grid, cta, smem, stream>>>(params); \
+    return cudaGetLastError();                   \
+  } while (false)
+
+#define FI_PCIE_IPC_FUSED_SELECT(PDL)                                                      \
+  do {                                                                                     \
+    if (variant == Variant::kStagedRing) {                                                 \
+      switch (world_size) {                                                                \
+        case 4:                                                                            \
+          FI_PCIE_IPC_FUSED_LAUNCH((ipc_rsag_ring_fused_rmsnorm_kernel<T, 4, PDL>));       \
+        case 8:                                                                            \
+          FI_PCIE_IPC_FUSED_LAUNCH((ipc_topo_rsag8_ring_fused_rmsnorm_kernel<T, PDL>));    \
+        default:                                                                           \
+          return cudaErrorInvalidValue;                                                    \
+      }                                                                                    \
+    }                                                                                      \
+    if (variant == Variant::kUnstaged) {                                                   \
+      switch (world_size) {                                                                \
+        case 2:                                                                            \
+          FI_PCIE_IPC_FUSED_LAUNCH((ipc_oneshot_fused_rmsnorm_kernel<T, 2, PDL>));         \
+        case 4:                                                                            \
+          FI_PCIE_IPC_FUSED_LAUNCH((ipc_oneshot_fused_rmsnorm_kernel<T, 4, PDL>));         \
+        case 8:                                                                            \
+          FI_PCIE_IPC_FUSED_LAUNCH((ipc_topo_rsag8_oneshot_fused_rmsnorm_kernel<T, PDL>)); \
+        default:                                                                           \
+          return cudaErrorInvalidValue;                                                    \
+      }                                                                                    \
+    }                                                                                      \
+    if (variant == Variant::kFlatStaged) {                                                 \
+      if (world_size != 8) {                                                               \
+        return cudaErrorInvalidValue;                                                      \
+      }                                                                                    \
+      FI_PCIE_IPC_FUSED_LAUNCH((ipc_rsag_push_fused_rmsnorm_kernel<T, 8, PDL>));           \
+    }                                                                                      \
+    if (variant != Variant::kStaged) {                                                     \
+      return cudaErrorInvalidValue;                                                        \
+    }                                                                                      \
+    switch (world_size) {                                                                  \
+      case 2:                                                                              \
+        FI_PCIE_IPC_FUSED_LAUNCH((ipc_rsag_push_fused_rmsnorm_kernel<T, 2, PDL>));         \
+      case 4:                                                                              \
+        FI_PCIE_IPC_FUSED_LAUNCH((ipc_rsag_push_fused_rmsnorm_kernel<T, 4, PDL>));         \
+      case 8:                                                                              \
+        FI_PCIE_IPC_FUSED_LAUNCH((ipc_topo_rsag8_block_fused_rmsnorm_kernel<T, PDL>));     \
+      default:                                                                             \
+        return cudaErrorInvalidValue;                                                      \
+    }                                                                                      \
+  } while (false)
+
+  if (use_pdl) {
+    FI_PCIE_IPC_FUSED_SELECT(true);
+  }
+  FI_PCIE_IPC_FUSED_SELECT(false);
+
+#undef FI_PCIE_IPC_FUSED_SELECT
+#undef FI_PCIE_IPC_FUSED_LAUNCH
+}
+
 template <typename T>
 cudaError_t all_reduce(const T* input, T* output, int64_t numel, const PeerViews& views, int rank,
                        int world_size, int max_blocks, int64_t max_numel, int blocks, int threads,

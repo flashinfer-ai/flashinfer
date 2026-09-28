@@ -42,9 +42,15 @@ from .pcie_ipc_ar import get_pcie_ipc_comm_module as get_pcie_ipc_comm_module
 from .pcie_ipc_policy import IpcLaunchConfig as PcieIpcLaunchConfig
 from .pcie_ipc_policy import IpcVariant as PcieIpcVariant
 from .pcie_ipc_tuning import PCIE_IPC_CUSTOM_OP as PCIE_IPC_CUSTOM_OP
+from .pcie_ipc_tuning import (
+    PCIE_IPC_FUSED_CUSTOM_OP as PCIE_IPC_FUSED_CUSTOM_OP,
+)
 from .pcie_ipc_tuning import default_cache_path as pcie_ipc_default_cache_path
 from .pcie_ipc_policy import (
     get_pcie_ipc_launch_config as get_pcie_ipc_launch_config,
+)
+from .pcie_ipc_policy import (
+    get_pcie_ipc_fused_launch_config as get_pcie_ipc_fused_launch_config,
 )
 from .pcie_ipc_topology import (
     probe_pcie_ipc_rank_topology as probe_pcie_ipc_rank_topology,
