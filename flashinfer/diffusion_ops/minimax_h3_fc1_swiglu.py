@@ -25,6 +25,10 @@ from ..jit.minimax_h3_fc1_swiglu import (
     minimax_h3_fc1_swiglu_target,
 )
 from ..utils import get_compute_capability, register_custom_op, register_fake_op
+from .cake_minimax_h3_sm120_quant_fc1_swiglu import (
+    _minimax_h3_fc1_swiglu_nvfp4_sm120,
+    prepare_minimax_h3_fc1_weight_nvfp4_sm120,
+)
 
 # MiniMax-H3 video DiT block dimensions served by the generated kernels.
 MINIMAX_H3_HIDDEN = 5376
@@ -37,8 +41,17 @@ MINIMAX_H3_MAX_ROWS = 1 << 24
 # GEMM tiling facts the host-side workspace sizing depends on.
 _BLOCK_M = 128
 _CTA_GROUP = 2
-_N_TILE_ROWS = 128  # gate/up weight rows per CTA of the quantized GEMMs
-_QUANT_N_TILES = MINIMAX_H3_FFN // _N_TILE_ROWS  # 112 output tiles
+_MXFP8_N_TILE_ROWS = (
+    128  # gate/up weight rows per CTA of the MXFP8 GEMM (256x256 pair tile)
+)
+_MXFP8_N_TILES = MINIMAX_H3_FFN // _MXFP8_N_TILE_ROWS  # 112 output tiles of 128 columns
+_NVFP4_N_TILE_ROWS = 112  # gate/up weight rows per MMA of the NVFP4 GEMM (256x448 pair tile, two N = 224 MMAs)
+_NVFP4_WEIGHT_SF_TILES = (
+    MINIMAX_H3_FFN // _NVFP4_N_TILE_ROWS
+)  # 128 combined weight scale sub-tiles
+_NVFP4_N_TILES = (
+    _NVFP4_WEIGHT_SF_TILES // 2
+)  # 64 output tiles of 224 columns (sub-tiles 2t, 2t + 1)
 
 # FlashInfer 128x4 swizzled scale-factor tiles: 512 bytes = 128 rows x 4 K-blocks, byte offset
 # (row % 32) * 16 + (row // 32) * 4 + kblock inside the tile; tiles ordered (row block, K set).
@@ -51,9 +64,12 @@ NVFP4_BLOCK = 16
 NVFP4_PACKED_COLS = MINIMAX_H3_HIDDEN // 2  # 2688 E2M1 nibble pairs per row
 NVFP4_SF_COLS = MINIMAX_H3_HIDDEN // NVFP4_BLOCK  # 336 UE4M3 scales per row
 NVFP4_SF_K_TILES = NVFP4_SF_COLS // 4  # 84 tiles per 128-row block
-# Combined 256-row gate/up weight scale tiles: [tile][k_set][half][512 bytes].
-MXFP8_FC1_SCALE_TILE_BYTES = _QUANT_N_TILES * MXFP8_SF_K_TILES * 2 * _SF_TILE_BYTES
-NVFP4_FC1_SCALE_TILE_BYTES = _QUANT_N_TILES * NVFP4_SF_K_TILES * 2 * _SF_TILE_BYTES
+# Combined gate/up weight scale tiles: [tile][k_set][half][512 bytes]; MXFP8 tiles pair 128 gate + 128
+# up rows, NVFP4 sub-tiles pair 112 gate + 112 up rows (rows 224..255 of each 256-row block are zero).
+MXFP8_FC1_SCALE_TILE_BYTES = _MXFP8_N_TILES * MXFP8_SF_K_TILES * 2 * _SF_TILE_BYTES
+NVFP4_FC1_SCALE_TILE_BYTES = (
+    _NVFP4_WEIGHT_SF_TILES * NVFP4_SF_K_TILES * 2 * _SF_TILE_BYTES
+)
 
 _E4M3_MAX = 448.0
 _E2M1_MAX = 6.0
@@ -66,6 +82,16 @@ def _get_module(target: MiniMaxH3Fc1SwigluTarget):
 
 def _module_for(device: torch.device):
     return _get_module(minimax_h3_fc1_swiglu_target(get_compute_capability(device)))
+
+
+def _is_sm120(tensor) -> bool:
+    """True when ``tensor`` lives on a compute capability 12.x device (RTX 5090 / RTX PRO 6000
+    Blackwell), which is served by the ``mma.sync`` SM120 route instead of the tcgen05 route."""
+    return (
+        isinstance(tensor, torch.Tensor)
+        and tensor.is_cuda
+        and get_compute_capability(tensor.device)[0] == 12
+    )
 
 
 def _m_tiles(rows: int) -> int:
@@ -242,34 +268,40 @@ def _unswizzle_sf_128x4(
     )
 
 
-def _combined_weight_scale_tiles(sf_linear: torch.Tensor) -> torch.Tensor:
+def _combined_weight_scale_tiles(
+    sf_linear: torch.Tensor, n_tile_rows: int
+) -> torch.Tensor:
     """``[28672, C]`` linear weight scales -> flat combined tiles ``[tile][k_set][half][512]``.
 
-    Output tile ``t`` (112 tiles of 128 output columns) pairs gate rows ``[128 t, 128 (t + 1))``
-    with the matching up rows into one 256-row block; each 128-K set of that block is two 512-byte
-    128x4 tiles (gate rows 0-127, then up rows 128-255), the order the 2-CTA block-scaled MMA
-    reads its B scale factors in."""
+    Output tile ``t`` (``14336 / n_tile_rows`` tiles of ``n_tile_rows`` output columns) pairs gate
+    rows ``[n_tile_rows t, n_tile_rows (t + 1))`` with the matching up rows into one ``2 n_tile_rows``-row
+    block padded to 256 rows (128 rows for MXFP8: a full block; 112 rows for NVFP4: rows 224..255 zero);
+    each 128-K set of that block is two 512-byte 128x4 tiles (combined rows 0-127, then 128-255), the
+    order the 2-CTA block-scaled MMA reads its B scale factors in."""
     if tuple(sf_linear.shape[:1]) != (MINIMAX_H3_FC1_ROWS,):
         raise ValueError(
             f"weight scales must have {MINIMAX_H3_FC1_ROWS} rows, got {tuple(sf_linear.shape)}"
         )
+    if MINIMAX_H3_FFN % n_tile_rows or 2 * n_tile_rows > 2 * _SF_TILE_ROWS:
+        raise ValueError(
+            f"n_tile_rows={n_tile_rows} must divide {MINIMAX_H3_FFN} and be at most {_SF_TILE_ROWS}"
+        )
+    n_tiles = MINIMAX_H3_FFN // n_tile_rows
     cols = int(sf_linear.shape[1])
-    gate = sf_linear[:MINIMAX_H3_FFN].reshape(_QUANT_N_TILES, _N_TILE_ROWS, cols)
-    up = sf_linear[MINIMAX_H3_FFN:].reshape(_QUANT_N_TILES, _N_TILE_ROWS, cols)
+    gate = sf_linear[:MINIMAX_H3_FFN].reshape(n_tiles, n_tile_rows, cols)
+    up = sf_linear[MINIMAX_H3_FFN:].reshape(n_tiles, n_tile_rows, cols)
     combined = torch.zeros(
-        (_QUANT_N_TILES, 2 * _SF_TILE_ROWS, cols),
+        (n_tiles, 2 * _SF_TILE_ROWS, cols),
         dtype=torch.uint8,
         device=sf_linear.device,
     )
-    combined[:, :_N_TILE_ROWS] = gate
-    combined[:, _N_TILE_ROWS : 2 * _N_TILE_ROWS] = up
-    tiles = _swizzle_sf_128x4(
-        combined.reshape(_QUANT_N_TILES * 2 * _SF_TILE_ROWS, cols)
-    )
+    combined[:, :n_tile_rows] = gate
+    combined[:, n_tile_rows : 2 * n_tile_rows] = up
+    tiles = _swizzle_sf_128x4(combined.reshape(n_tiles * 2 * _SF_TILE_ROWS, cols))
     k_sets = -(-cols // 4)
     # swizzle order is (row tile = n_tile * 2 + half, k_set) -> (n_tile, k_set, half)
     return (
-        tiles.reshape(_QUANT_N_TILES, 2, k_sets, _SF_TILE_BYTES)
+        tiles.reshape(n_tiles, 2, k_sets, _SF_TILE_BYTES)
         .permute(0, 2, 1, 3)
         .contiguous()
         .reshape(-1)
@@ -318,7 +350,7 @@ def prepare_minimax_h3_fc1_weight_mxfp8(
         )
     sf_linear = _unswizzle_sf_128x4(w_sf, MINIMAX_H3_FC1_ROWS, MXFP8_SF_COLS)
     return w_q.view(torch.float8_e4m3fn).contiguous(), _combined_weight_scale_tiles(
-        sf_linear
+        sf_linear, _MXFP8_N_TILE_ROWS
     )
 
 
@@ -350,14 +382,24 @@ def prepare_minimax_h3_fc1_weight_nvfp4(
     saturation of ``w * g / scale``; an all-zero block writes scale 0 and codes 0).
 
     Returns ``(fc1_weight_q, fc1_scale_tiles)``: packed E2M1 ``uint8`` ``[28672, 2688]`` weights
-    (even element in the low nibble) and a flat ``uint8`` tensor of ``112 * 84 * 1024`` bytes with
-    the weight scales in the combined 256-row gate/up tile order.  Relies on
+    (even element in the low nibble) and a flat ``uint8`` tensor of ``128 * 84 * 1024`` bytes with
+    the weight scales in the combined 224-row (112 gate + 112 up) sub-tile order of the 256x448 GEMM
+    tile (see :func:`_combined_weight_scale_tiles`).  Relies on
     ``nvfp4_quantize(..., sfLayout=SfLayout.layout_128x4, do_shuffle=False)`` returning the scales
     in the 128x4 swizzled layout with rows padded to 128 and columns to a multiple of 4.
+
+    The prepared layout is **device-architecture specific**: on a compute capability 12.x device
+    (RTX 5090 / RTX PRO 6000 Blackwell) this returns the SM120 layout of
+    :func:`~flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu.prepare_minimax_h3_fc1_weight_nvfp4_sm120`
+    (row-permuted weights, ``28672 * 336`` swizzled scale bytes) instead.  Prepare the weight on the
+    device that will run :func:`minimax_h3_fc1_swiglu_nvfp4`; the outputs are not interchangeable
+    between the two routes.
     """
     from ..quantization.fp4_quantization import nvfp4_quantize
     from ..tllm_enums import SfLayout
 
+    if _is_sm120(fc1_weight):
+        return prepare_minimax_h3_fc1_weight_nvfp4_sm120(fc1_weight, w_global_scale)
     if (
         tuple(fc1_weight.shape) != (MINIMAX_H3_FC1_ROWS, MINIMAX_H3_HIDDEN)
         or fc1_weight.dtype != torch.bfloat16
@@ -383,7 +425,7 @@ def prepare_minimax_h3_fc1_weight_nvfp4(
             f"nvfp4_quantize returned {w_sf.numel()} scale bytes, expected {expected}"
         )
     sf_linear = _unswizzle_sf_128x4(w_sf, MINIMAX_H3_FC1_ROWS, NVFP4_SF_COLS)
-    return w_q, _combined_weight_scale_tiles(sf_linear)
+    return w_q, _combined_weight_scale_tiles(sf_linear, _NVFP4_N_TILE_ROWS)
 
 
 # --------------------------------------------------------------------------------------------
@@ -737,6 +779,16 @@ def minimax_h3_fc1_swiglu_nvfp4(
     r"""NVFP4 (W4A4, E2M1 + UE4M3 per-16 block scales + FP32 global scales) variant of
     :func:`minimax_h3_fc1_swiglu`.
 
+    Dispatches on the compute capability of ``x``: 10.0 / 10.3 (B200 / B300) run the tcgen05 route
+    described below; 12.x (RTX 5090 / RTX PRO 6000 Blackwell) runs the ``mma.sync`` SM120 route
+    (:func:`~flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_fc1_swiglu._minimax_h3_fc1_swiglu_nvfp4_sm120`,
+    same signature and rounding points).  The prepared weight layout differs between the routes,
+    so ``fc1_weight_q`` / ``fc1_scale_tiles`` must come from :func:`prepare_minimax_h3_fc1_weight_nvfp4`
+    run on the same device architecture.  On SM120 ``workspace_sf`` receives dense row-major
+    ``[M, 336]`` scales in its first ``M * 336`` bytes (a buffer sized by
+    :func:`nvfp4_activation_scale_workspace_bytes` is always large enough) and ``eps`` may be any
+    positive value.
+
     The norm kernel computes the BF16 modulated activation ``a`` and quantizes it with FlashInfer's
     :func:`~flashinfer.nvfp4_quantize` recipe (``cvt_warp_fp16_to_fp4``): per 16 consecutive K
     elements ``sf = E4M3_RN(g * absmax * rcp(6))`` saturating at 448 with ``g = a_global_scale``,
@@ -760,7 +812,7 @@ def minimax_h3_fc1_swiglu_nvfp4(
         Packed E2M1 ``uint8`` ``[28672, 2688]`` weights from :func:`prepare_minimax_h3_fc1_weight_nvfp4`
         (gate rows then up rows).
     fc1_scale_tiles : torch.Tensor
-        Flat ``uint8`` ``[112 * 84 * 1024]`` weight scale tiles from the same call.
+        Flat ``uint8`` ``[128 * 84 * 1024]`` weight scale tiles from the same call.
     alpha : torch.Tensor
         ``float32`` ``[1]`` = ``1 / (a_global_scale * w_global_scale)`` (:func:`minimax_h3_nvfp4_alpha`).
     out : Optional[torch.Tensor]
@@ -777,6 +829,22 @@ def minimax_h3_fc1_swiglu_nvfp4(
     torch.Tensor
         ``bfloat16`` ``[M, 14336]``.
     """
+    if _is_sm120(x):
+        return _minimax_h3_fc1_swiglu_nvfp4_sm120(
+            x,
+            x_norm_weight,
+            adaln_scale,
+            adaln_shift,
+            adaln_index,
+            a_global_scale,
+            fc1_weight_q,
+            fc1_scale_tiles,
+            alpha,
+            out=out,
+            workspace_q=workspace_q,
+            workspace_sf=workspace_sf,
+            eps=eps,
+        )
     rows, device = _check_norm_inputs(
         x, x_norm_weight, adaln_scale, adaln_shift, adaln_index, eps
     )

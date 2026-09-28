@@ -26,7 +26,14 @@ import torch
 
 from .api_logging import flashinfer_api, flashinfer_experimental_api
 from .cudnn import cudnn_batch_prefill_with_kv_cache
-from .cudnn.prefill import _cudnn_supports_direct_seqlens
+from .cudnn.prefill import (
+    CUDNN_AVAILABLE as _CUDNN_GRAPH_AVAILABLE,
+    _cudnn_supports_direct_seqlens,
+    CudnnPrefillGraph,
+    _PrefillMetadata,
+    _CudnnPrefillPlan,
+    prepare_cudnn_batch_prefill,
+)
 from .jit import (
     MissingJITCacheError,
     gen_batch_prefill_module,
@@ -2182,9 +2189,6 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._variant_owns_mask = variant_owns_mask
 
         self._kv_layout = kv_layout
-        if backend == "cudnn":
-            assert kv_layout == "NHD", "CUDNN backend only supports NHD layout"
-
         self._float_workspace_buffer = float_workspace_buffer
         self._workspace_size = (
             self._float_workspace_buffer.numel()
@@ -2249,6 +2253,10 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._seq_lens_kv = None
         self._seq_lens_q = None
         self._block_tables = None
+        self._cudnn_block_tables: Optional[torch.Tensor] = None
+        self._cudnn_q_lens_buffer: Optional[torch.Tensor] = None
+        self._cudnn_prepared: Optional[CudnnPrefillGraph] = None
+        self._cudnn_plan: Optional[_CudnnPrefillPlan] = None
         self._prims_backend = None
         if backend == "cute-dsl-prims":
             try:
@@ -2286,6 +2294,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         )
         _check_workspace_buffer_alignment(int_workspace_buffer, "int_workspace_buffer")
         self._float_workspace_buffer = float_workspace_buffer
+        self._cudnn_prepared = None
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -2699,13 +2708,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
             A uint32 1D tensor indicating the kv sequence length of each prompt. shape: ``[batch_size]``.
         seq_lens_q: Optional[torch.Tensor]
             A uint32 1D tensor indicating the q sequence length of each prompt. shape: ``[batch_size]``.
-            If not provided, will be set to the same value as ``seq_lens``.
+            For cuDNN, defaults to the differences in ``qo_indptr``.
         block_tables: Optional[torch.Tensor]
             A uint32 2D tensor indicating the block table of each prompt. shape: ``[batch_size, max_num_blocks_per_seq]``.
         max_token_per_sequence: Optional[int],
-            Required for cudnn backend. This is the scalar max token length of each sequence.
+            Maximum query length for cuDNN; inferred from ``qo_indptr`` when omitted.
         max_sequence_kv: Optional[int],
-            Required for cudnn backend. This is the scalar max sequence length of each sequence in kv cache.
+            Maximum KV length for cuDNN; inferred from the paged metadata when omitted.
         fixed_split_size : Optional[int],
             The fixed split size for FA2 split-kv prefill/decode in pages. Recommend setting to the average sequence length of your workload.
             When enabled, will lead to deterministic softmax score reduction in the merge_states kernel, and therefore
@@ -3108,6 +3117,109 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._rope_theta = rope_theta
         self._seq_lens_kv = seq_lens
         self._seq_lens_q = seq_lens_q if seq_lens_q is not None else seq_lens
+
+        if self._backend == "cudnn":
+            if (
+                pos_encoding_mode != "NONE"
+                or window_left != -1
+                or logits_soft_cap != 0
+                or packed_custom_mask is not None
+                or self._variant_owns_mask
+                or prefix_len_ptr is not None
+            ):
+                raise NotImplementedError(
+                    "cuDNN paged prefill supports only causal or full attention without "
+                    "position encoding, window_left, logits_soft_cap or custom masks"
+                )
+            if self._qo_indptr_buf.dtype != torch.int32:
+                if self.is_cuda_graph_enabled:
+                    raise ValueError(
+                        "cuDNN requires int32 qo_indptr buffers in CUDA-graph mode"
+                    )
+                self._qo_indptr_buf = self._qo_indptr_buf.to(torch.int32)
+            # Without an explicit maximum, KV lengths were already staged
+            # above to compute _max_kv_len. With one, still update the captured
+            # buffer on every plan; the bound does not replace actual lengths.
+            if max_sequence_kv is not None:
+                kv_host = (
+                    seq_lens.cpu().flatten()
+                    if seq_lens is not None
+                    else get_seq_lens(
+                        paged_kv_indptr.to("cpu"),
+                        paged_kv_last_page_len.to("cpu"),
+                        page_size,
+                    )
+                )
+                if batch_size > self._kv_lens_buffer.shape[0]:
+                    self._kv_lens_buffer = torch.empty(
+                        batch_size, dtype=torch.int32, device=self.device
+                    )
+                self._kv_lens_buffer[:batch_size].copy_(
+                    kv_host, non_blocking=non_blocking
+                )
+            self._seq_lens_kv = self._kv_lens_buffer[:batch_size].view(
+                batch_size, 1, 1, 1
+            )
+            if (
+                self._cudnn_q_lens_buffer is None
+                or self._cudnn_q_lens_buffer.shape[0] < batch_size
+            ):
+                self._cudnn_q_lens_buffer = torch.empty(
+                    batch_size, dtype=torch.int32, device=self.device
+                )
+            q_host = (
+                seq_lens_q.cpu().flatten()
+                if seq_lens_q is not None
+                else qo_indptr_host[1:] - qo_indptr_host[:-1]
+            )
+            self._cudnn_q_lens_buffer[:batch_size].copy_(
+                q_host, non_blocking=non_blocking
+            )
+            self._seq_lens_q = self._cudnn_q_lens_buffer[:batch_size].view(
+                batch_size, 1, 1, 1
+            )
+            if block_tables is None:
+                table = _build_block_tables_from_paged_kv_indices(
+                    paged_kv_indptr.to("cpu"), paged_kv_indices, batch_size, self.device
+                )
+                old_table = self._cudnn_block_tables
+                if (
+                    old_table is None
+                    or old_table.shape[0] != batch_size
+                    or old_table.shape[1] < table.shape[1]
+                ):
+                    if self.is_cuda_graph_enabled and old_table is not None:
+                        raise ValueError(
+                            "captured cuDNN block table cannot grow; supply a fixed block_tables buffer"
+                        )
+                    self._cudnn_block_tables = table
+                else:
+                    old_table.zero_()
+                    old_table[:, : table.shape[1]].copy_(table)
+                self._block_tables = self._cudnn_block_tables
+            previous_cudnn_plan = self._cudnn_plan
+            self._cudnn_plan = None
+            if _CUDNN_GRAPH_AVAILABLE and _cudnn_supports_direct_seqlens(
+                q_data_type, mixed=True
+            ):
+                metadata = _PrefillMetadata(
+                    self._max_q_len,
+                    self._max_kv_len,
+                    causal,
+                    True,
+                    o_data_type=o_data_type,
+                    actual_seq_lens_q=self._seq_lens_q,
+                    actual_seq_lens_kv=self._seq_lens_kv,
+                    block_tables=self._block_tables,
+                    batch_offsets_q=self._qo_indptr_buf,
+                    batch_offsets_o=self._qo_indptr_buf,
+                    batch_offsets_stats=self._qo_indptr_buf,
+                ).resolve_from_plan(
+                    q_data_type, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo
+                )
+                self._cudnn_plan = _CudnnPrefillPlan.prepare(
+                    metadata, q_data_type, self.device, previous_cudnn_plan
+                )
 
     @flashinfer_api
     def prewarm_paged_kv_stride_variant(self, variant: str = "independent") -> None:
@@ -3587,6 +3699,27 @@ class BatchPrefillWithPagedKVCacheWrapper:
             mask_mode = MaskMode.MULTIITEMSCORING.value
 
         if self._backend == "cudnn":
+            # The cuDNN graph declares dense output and Stats strides.
+            if (
+                sinks is not None
+                or kv_cache_sf is not None
+                or skip_softmax_threshold_scale_factor is not None
+            ):
+                raise NotImplementedError(
+                    "cuDNN paged prefill does not support sinks, NVFP4 or skip-softmax"
+                )
+            if self._kv_layout == "NHD":
+                k_cache = k_cache.transpose(-3, -2)
+                v_cache = v_cache.transpose(-3, -2)
+            if return_lse and self._max_q_len == 1 and q.shape[1] != k_cache.shape[1]:
+                raise NotImplementedError(
+                    "cuDNN single-token GQA prefill does not write every LSE head "
+                    "(NVBug 6783545); use another backend or return_lse=False"
+                )
+            if not out.is_contiguous():
+                raise ValueError("out must be contiguous for the cuDNN backend")
+            if return_lse and not lse.is_contiguous():
+                raise ValueError("lse must be contiguous for the cuDNN backend")
             if self._seq_lens_q is not None and self._seq_lens_q.dim() == 1:
                 self._seq_lens_q = self._seq_lens_q.reshape(self._batch_size, 1, 1, 1)
 
@@ -3597,29 +3730,61 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # consumes it directly as cu_seq_len_q / the Q and O ragged offsets,
             # applying the per-tensor (num_heads * head_dim) multipliers itself, so
             # head_dim_qk != head_dim_vo is handled without any offset rescaling.
-            cudnn_batch_prefill_with_kv_cache(
-                q,
-                k_cache,  # Need to be changed
-                v_cache,  # Need to be changed
-                self._sm_scale,
-                self._float_workspace_buffer,
-                actual_seq_lens_q=self._seq_lens_q,
-                actual_seq_lens_kv=self._seq_lens_kv,
-                max_token_per_sequence=self._max_q_len,
-                max_sequence_kv=self._max_kv_len,
-                block_tables=self._block_tables,
-                causal=self._causal,
-                return_lse=return_lse,
-                lse_base=lse_base,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                batch_offsets_q=self._qo_indptr_buf,
-                batch_offsets_units="tokens",
-                out=out,
-                lse=lse,
-                o_data_type=out_dtype,
-            )
+            plan = self._cudnn_plan
+            if (
+                plan is not None
+                and plan.metadata.causal == self._causal
+                and q_scale is None
+                and k_scale is None
+                and v_scale is None
+            ):
+                prepared = self._cudnn_prepared
+                if prepared is None or not prepared.matches_plan(
+                    q, k_cache, v_cache, sm_scale, plan, return_lse
+                ):
+                    prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
+                        q,
+                        k_cache,
+                        v_cache,
+                        sm_scale,
+                        self._float_workspace_buffer,
+                        metadata=plan.build_metadata(return_lse),
+                    )
+                prepared.run_planned(
+                    q,
+                    k_cache,
+                    v_cache,
+                    out,
+                    lse,
+                    self._float_workspace_buffer,
+                    plan=plan,
+                    lse_base=lse_base,
+                )
+            else:
+                cudnn_batch_prefill_with_kv_cache(
+                    q,
+                    k_cache,
+                    v_cache,
+                    sm_scale,
+                    self._float_workspace_buffer,
+                    actual_seq_lens_q=self._seq_lens_q,
+                    actual_seq_lens_kv=self._seq_lens_kv,
+                    max_token_per_sequence=self._max_q_len,
+                    max_sequence_kv=self._max_kv_len,
+                    block_tables=self._block_tables,
+                    causal=self._causal,
+                    return_lse=return_lse,
+                    lse_base=lse_base,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    batch_offsets_q=self._qo_indptr_buf,
+                    batch_offsets_stats=self._qo_indptr_buf if return_lse else None,
+                    batch_offsets_units="tokens",
+                    out=out,
+                    lse=lse,
+                    o_data_type=out_dtype,
+                )
         else:
             if self._backend != "trtllm-gen":
                 assert self._plan_info is not None, "plan info is not initialized"
@@ -4089,6 +4254,23 @@ class BatchPrefillWithRaggedKVCacheWrapper:
         # cudnn: stats ragged offset so the LSE lands packed as
         # [total_tokens, num_qo_heads]; token-unit, so it is qo_indptr itself.
         self._cudnn_stats_offsets: Optional[torch.Tensor] = None
+        self._cudnn_prepared: Optional[CudnnPrefillGraph] = None
+        self._cudnn_plan: Optional[_CudnnPrefillPlan] = None
+        self._cudnn_cpu_indptr_buffers: list[Optional[torch.Tensor]] = [None, None]
+
+    def _stage_cudnn_indptr(self, source, index, non_blocking):
+        if source.device.type != "cpu":
+            return source.to(self.device, non_blocking=non_blocking)
+        buffer = self._cudnn_cpu_indptr_buffers[index]
+        if (
+            buffer is None
+            or buffer.shape != source.shape
+            or buffer.dtype != source.dtype
+        ):
+            buffer = torch.empty(source.shape, device=self.device, dtype=source.dtype)
+            self._cudnn_cpu_indptr_buffers[index] = buffer
+        buffer.copy_(source, non_blocking=non_blocking)
+        return buffer
 
     @property
     def is_cuda_graph_enabled(self) -> bool:
@@ -4110,6 +4292,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             be the same as the device of the input tensors.
         """
         self._float_workspace_buffer = float_workspace_buffer
+        self._cudnn_prepared = None
         self._int_workspace_buffer = int_workspace_buffer
         self._pin_memory_int_workspace_buffer = torch.empty(
             self._int_workspace_buffer.shape,
@@ -4352,8 +4535,22 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._custom_mask_buf[: len(packed_custom_mask)] = packed_custom_mask
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
-            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=non_blocking)
-            self._kv_indptr_buf = kv_indptr.to(self.device, non_blocking=non_blocking)
+            if self._backend == "cudnn":
+                # CPU metadata needs a device mirror, not a new allocation on
+                # every replan. Never overwrite a caller-owned CUDA tensor.
+                self._qo_indptr_buf = self._stage_cudnn_indptr(
+                    qo_indptr, 0, non_blocking
+                )
+                self._kv_indptr_buf = self._stage_cudnn_indptr(
+                    kv_indptr, 1, non_blocking
+                )
+            else:
+                self._qo_indptr_buf = qo_indptr.to(
+                    self.device, non_blocking=non_blocking
+                )
+                self._kv_indptr_buf = kv_indptr.to(
+                    self.device, non_blocking=non_blocking
+                )
             if packed_custom_mask is not None:
                 self._custom_mask_buf = packed_custom_mask.to(
                     self.device, non_blocking=non_blocking
@@ -4729,6 +4926,17 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 )
 
         if self._backend == "cudnn":
+            if (
+                pos_encoding_mode != "NONE"
+                or window_left != -1
+                or logits_soft_cap != 0
+                or self._custom_mask_buf is not None
+                or prefix_len_ptr is not None
+            ):
+                raise NotImplementedError(
+                    "cuDNN ragged prefill supports only causal or full attention without "
+                    "position encoding, window_left, logits_soft_cap or custom masks"
+                )
             # The graph's padded dims default to the indptr diffs computed
             # above, and cuDNN reads cu_seq_lens as int32. Done once here so
             # run() launches no conversion kernel.
@@ -4755,6 +4963,34 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 self._o_indptr_buf = self._o_indptr_buf.to(torch.int32)
                 self._v_indptr_buf = self._v_indptr_buf.to(torch.int32)
             self._cudnn_stats_offsets = self._qo_indptr_buf
+            previous_cudnn_plan = self._cudnn_plan
+            self._cudnn_plan = None
+            if _CUDNN_GRAPH_AVAILABLE and _cudnn_supports_direct_seqlens(q_data_type):
+                # run() defaults an FP8 output declaration to BF16.
+                cudnn_out_dtype = (
+                    torch.bfloat16
+                    if o_data_type in (torch.float8_e4m3fn, torch.float8_e5m2)
+                    else o_data_type
+                )
+                metadata = _PrefillMetadata(
+                    self._max_token_per_sequence,
+                    self._max_sequence_kv,
+                    causal,
+                    True,
+                    o_data_type=cudnn_out_dtype,
+                    actual_seq_lens_q=self._seq_lens_q,
+                    actual_seq_lens_kv=self._seq_lens_kv,
+                    batch_offsets_q=self._qo_indptr_buf,
+                    batch_offsets_o=self._o_indptr_buf,
+                    batch_offsets_k=self._kv_indptr_buf,
+                    batch_offsets_v=self._v_indptr_buf,
+                    batch_offsets_stats=self._cudnn_stats_offsets,
+                ).resolve_from_plan(
+                    q_data_type, num_qo_heads, num_kv_heads, head_dim_qk, head_dim_vo
+                )
+                self._cudnn_plan = _CudnnPrefillPlan.prepare(
+                    metadata, q_data_type, self.device, previous_cudnn_plan
+                )
 
         if self._backend == "cutlass":
             if self.is_cuda_graph_enabled:
@@ -5263,6 +5499,15 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 else out
             )
         elif self._backend == "cudnn":
+            # The cuDNN graph declares dense output and Stats strides.
+            if o_scale is not None or kv_cache_sf is not None:
+                raise NotImplementedError(
+                    "cuDNN ragged prefill does not support o_scale or NVFP4"
+                )
+            if not out.is_contiguous():
+                raise ValueError("out must be contiguous for the cuDNN backend")
+            if return_lse and not lse.is_contiguous():
+                raise ValueError("lse must be contiguous for the cuDNN backend")
             # cuDNN's ragged prefill graph has no kv_layout input and reads
             # k.shape[1] as the kv head count, i.e. it assumes NHD. Reject HND
             # loudly rather than silently addressing the wrong data.
@@ -5297,33 +5542,66 @@ class BatchPrefillWithRaggedKVCacheWrapper:
             if self._seq_lens_kv is not None and self._seq_lens_kv.dim() == 1:
                 self._seq_lens_kv = self._seq_lens_kv.reshape(-1, 1, 1, 1)
 
-            cudnn_batch_prefill_with_kv_cache(
-                q,
-                k,
-                v,
-                sm_scale,
-                self._float_workspace_buffer,
-                max_token_per_sequence=self._max_token_per_sequence,
-                max_sequence_kv=self._max_sequence_kv,
-                actual_seq_lens_q=self._seq_lens_q,
-                actual_seq_lens_kv=self._seq_lens_kv,
-                return_lse=return_lse,
-                causal=self._causal,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                batch_offsets_q=self._qo_indptr_buf,
-                batch_offsets_k=self._kv_indptr_buf,
-                batch_offsets_v=self._v_indptr_buf,
-                batch_offsets_o=self._o_indptr_buf,
-                batch_offsets_stats=(self._cudnn_stats_offsets if return_lse else None),
-                batch_offsets_units="tokens",
-                is_cuda_graph_compatible=self._use_cuda_graph,
-                lse_base=lse_base,
-                out=out,
-                lse=lse,
-                o_data_type=out_dtype,
-            )
+            plan = self._cudnn_plan
+            if (
+                plan is not None
+                and plan.metadata.causal == self._causal
+                and q_scale is None
+                and k_scale is None
+                and v_scale is None
+            ):
+                prepared = self._cudnn_prepared
+                if prepared is None or not prepared.matches_plan(
+                    q, k, v, sm_scale, plan, return_lse
+                ):
+                    prepared = self._cudnn_prepared = prepare_cudnn_batch_prefill(
+                        q,
+                        k,
+                        v,
+                        sm_scale,
+                        self._float_workspace_buffer,
+                        metadata=plan.build_metadata(return_lse),
+                    )
+                prepared.run_planned(
+                    q,
+                    k,
+                    v,
+                    out,
+                    lse,
+                    self._float_workspace_buffer,
+                    plan=plan,
+                    lse_base=lse_base,
+                )
+            else:
+                cudnn_batch_prefill_with_kv_cache(
+                    q,
+                    k,
+                    v,
+                    sm_scale,
+                    self._float_workspace_buffer,
+                    max_token_per_sequence=self._max_token_per_sequence,
+                    max_sequence_kv=self._max_sequence_kv,
+                    actual_seq_lens_q=self._seq_lens_q,
+                    actual_seq_lens_kv=self._seq_lens_kv,
+                    return_lse=return_lse,
+                    causal=self._causal,
+                    q_scale=q_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
+                    batch_offsets_q=self._qo_indptr_buf,
+                    batch_offsets_k=self._kv_indptr_buf,
+                    batch_offsets_v=self._v_indptr_buf,
+                    batch_offsets_o=self._o_indptr_buf,
+                    batch_offsets_stats=(
+                        self._cudnn_stats_offsets if return_lse else None
+                    ),
+                    batch_offsets_units="tokens",
+                    is_cuda_graph_compatible=self._use_cuda_graph,
+                    lse_base=lse_base,
+                    out=out,
+                    lse=lse,
+                    o_data_type=out_dtype,
+                )
 
             # base already handled inside cudnn_batch_prefill_with_kv_cache
             return (

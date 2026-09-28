@@ -22,6 +22,7 @@ not multiples of 4, identical rows, per-request tensors, bitwise replay across l
 CUDA graphs / every frozen kernel variant, and parity with ``top_k_first`` sampling.
 """
 
+import functools
 import math
 from dataclasses import dataclass
 
@@ -37,6 +38,7 @@ from flashinfer.cake_sampling import (
     top_k_probs_to_slab,
     top_k_top_p_sampling_from_probs,
 )
+import flashinfer.compilation_context as compilation_context
 import flashinfer.jit.cake_sampling as cake_sampling_jit
 from flashinfer.jit.cake_sampling import (
     load_cake_sampling_module,
@@ -46,6 +48,7 @@ from flashinfer.jit.cake_sampling import (
 )
 
 SLAB = 1024
+_FULL_SMEM_OPTIN = 232448  # 227 KB dynamic shared memory opt-in of 9.x-11.x devices
 INF_KEY = 0x7F800000
 _PHILOX_M0, _PHILOX_M1, _PHILOX_W0, _PHILOX_W1 = (
     0xD2511F53,
@@ -64,6 +67,36 @@ def _require_supported_device():
             "frozen radix sampling kernels need compute capability 9.0/10.0/10.3/10.7/11.0"
         )
     return capability
+
+
+def _device_streams() -> bool:
+    """Whether the current device opts in to enough dynamic shared memory for the streaming
+    stage-1 variants (145 KB).  9.x-11.x devices opt in to 227 KB; 12.x devices stop at 99 KB,
+    so a vocabulary beyond the register-resident capacity (196608 entries) takes the
+    ``fallback:vocab_too_large`` route to ``top_k_first`` there."""
+    optin = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).shared_memory_per_block_optin
+    return any(stream for _, _, stream in _stage1_variants(int(optin)))
+
+
+def _assert_fallback_matches_reference(probs, k, p, seed=7, offset=8):
+    """The public entry point serves a fallback request through the reference top_k_first path."""
+    from flashinfer.sampling import top_k_top_p_sampling_from_probs as reference
+
+    expected = reference(
+        probs,
+        k,
+        p,
+        filter_apply_order="top_k_first",
+        deterministic=True,
+        seed=seed,
+        offset=offset,
+    )
+    got = top_k_top_p_sampling_from_probs(
+        probs, k, p, philox_seed=seed, philox_offset=offset
+    )
+    assert got.dtype == torch.int32 and torch.equal(got.to(expected.dtype), expected)
 
 
 def _probs(batch, vocab, seed=536, scale=1.0):
@@ -351,6 +384,12 @@ def _kept(run: Run, r: int):
 def test_support_matches_top_k_first_semantics(batch, vocab, k, p):
     _require_supported_device()
     probs = _probs(batch, vocab)
+    if cake_sampling_route(probs, k) == "fallback:vocab_too_large":
+        # 99 KB devices (12.x) have no streaming variant, so V = 262144 is served by the
+        # reference top_k_first path; the slab checks below need the pipeline route.
+        assert not _device_streams() and vocab > 196608
+        _assert_fallback_matches_reference(probs, k, p)
+        return
     run, _ = _run_and_check(probs, k, p, 0xC0FFEE, 3)
     pn = probs.cpu().numpy()
     for r in range(batch):
@@ -487,35 +526,52 @@ def test_per_request_tensors_and_routes():
     assert cake_sampling_route(probs, vocab) == "fallback:top_k_disabled"
     assert cake_sampling_route(probs, 1025) == "fallback:top_k_gt_slab"
     assert cake_sampling_route(probs.half(), 50) == "fallback:dtype"
-    assert (
-        cake_sampling_route(torch.empty(256, 262144, device="cuda"), 50) == "pipeline"
+    # V = 262144 needs a streaming variant (145 KB of dynamic shared memory): served on 227 KB
+    # devices, routed to top_k_first on 99 KB (12.x) devices.
+    assert cake_sampling_route(torch.empty(256, 262144, device="cuda"), 50) == (
+        "pipeline" if _device_streams() else "fallback:vocab_too_large"
     )
+    # Dispatcher pins below describe the wave tables, so they use the full frozen variant set
+    # (227 KB opt-in) whatever the current device's dynamic-smem limit is.
+    pick = functools.partial(choose_stage1, smem_limit=_FULL_SMEM_OPTIN)
     # B200 wave table (148 SMs).
-    assert choose_stage1(1, 128256, sm_count=148) == (8, 32, False)
-    assert choose_stage1(8, 65536, sm_count=148) == (8, 16, False)
-    assert choose_stage1(16, 128256, sm_count=148) == (4, 16, True)
-    assert choose_stage1(32, 128256, sm_count=148) == (4, 16, True)
-    assert choose_stage1(64, 128256, sm_count=148) == (2, 16, True)
-    assert choose_stage1(16, 262144, sm_count=148) == (4, 16, True)
-    assert choose_stage1(64, 262144, sm_count=148)[2]
-    assert choose_stage1(128, 151936, sm_count=148)[2]
+    assert pick(1, 128256, sm_count=148) == (8, 32, False)
+    assert pick(8, 65536, sm_count=148) == (8, 16, False)
+    assert pick(16, 128256, sm_count=148) == (4, 16, True)
+    assert pick(32, 128256, sm_count=148) == (4, 16, True)
+    assert pick(64, 128256, sm_count=148) == (2, 16, True)
+    assert pick(16, 262144, sm_count=148) == (4, 16, True)
+    assert pick(64, 262144, sm_count=148)[2]
+    assert pick(128, 151936, sm_count=148)[2]
+    # Round 3 (stage-1 v6 candidate path) made the register-resident (8, 48) variant the fastest for
+    # small batches of 151936: 15.3 vs 19.9 us streaming on B200 (re-fitted constants, zero regret).
+    assert pick(1, 151936, sm_count=148) == (8, 48, False)
+    assert pick(8, 151936, sm_count=148) == (8, 48, False)
+    assert pick(16, 151936, sm_count=148) == (4, 16, True)
     # H100 wave table (132 SMs): 128 cluster-4 CTAs are two waves there, so B = 32 rows of a
     # large vocabulary stream with clusters of 2 and B = 32 rows of 32768 stay register-resident
     # on the 2-CTA variant; small batches and B >= 64 pick the same variants as on B200.
     for b, v in ((1, 128256), (8, 65536), (16, 128256), (64, 128256), (16, 262144)):
-        assert choose_stage1(b, v, sm_count=132) == choose_stage1(b, v, sm_count=148)
-    assert choose_stage1(32, 128256, sm_count=132) == (2, 16, True)
-    assert choose_stage1(32, 262144, sm_count=132) == (2, 16, True)
-    assert choose_stage1(32, 32768, sm_count=132) == (2, 32, False)
-    assert choose_stage1(32, 32768, sm_count=148) == (4, 16, False)
+        assert pick(b, v, sm_count=132) == pick(b, v, sm_count=148)
+    assert pick(32, 128256, sm_count=132) == (2, 16, True)
+    assert pick(32, 262144, sm_count=132) == (2, 16, True)
+    assert pick(32, 32768, sm_count=132) == (2, 32, False)
+    assert pick(32, 32768, sm_count=148) == (4, 16, False)
+    # Rubin R200 wave table (212 SMs): 128 cluster-8 CTAs are one wave (22 eight-CTA clusters
+    # fit), so B = 16 rows of 128256 stay register-resident on the 8-CTA variant while B = 32
+    # (256 CTAs) streams with clusters of 4 as on B200; V = 32768 B = 32 stays on (4, 16).
+    assert pick(16, 128256, sm_count=212) == (8, 32, False)
+    assert pick(32, 128256, sm_count=212) == (4, 16, True)
+    assert pick(32, 32768, sm_count=212) == (4, 16, False)
+    assert pick(64, 32768, sm_count=212) == (2, 32, False)
+    assert pick(128, 32768, sm_count=212) == (1, 16, True)
+    for b, v in ((1, 128256), (8, 65536), (64, 128256), (16, 262144), (64, 262144)):
+        assert pick(b, v, sm_count=212) == pick(b, v, sm_count=148)
     # Other SM counts use the nearest measured table.
-    assert choose_stage1(32, 128256, sm_count=152) == choose_stage1(
-        32, 128256, sm_count=148
-    )
-    assert choose_stage1(32, 128256, sm_count=114) == choose_stage1(
-        32, 128256, sm_count=132
-    )
-    assert choose_stage1(32, 128256) in {(2, 16, True), (4, 16, True)}
+    assert pick(32, 128256, sm_count=152) == pick(32, 128256, sm_count=148)
+    assert pick(16, 128256, sm_count=200) == pick(16, 128256, sm_count=212)
+    assert pick(32, 128256, sm_count=114) == pick(32, 128256, sm_count=132)
+    assert pick(32, 128256) in {(2, 16, True), (4, 16, True)}
     assert choose_stage23(50) == (32, 2)
     res = top_k_top_p_sampling_from_probs(probs, vocab, 0.9)
     assert res.dtype == torch.int32 and res.shape == (batch,)
@@ -540,11 +596,15 @@ def _gencode(flags):
     return [f for f in flags if f.startswith("-gencode")]
 
 
-def test_build_targets_follow_flashinfer_cuda_arch_list(arch_list):
+def test_build_targets_follow_flashinfer_cuda_arch_list(arch_list, monkeypatch):
     # AOT builds run on hosts without a GPU and name their targets through
     # FLASHINFER_CUDA_ARCH_LIST; the module compiles one cubin per listed architecture into a
     # single fatbin and serves exactly those capabilities.  (Suffixed entries skip the toolkit
     # version probe of CompilationContext so this test also runs without nvcc.)
+    # get_nvcc_flags_list rewrites 10.7 to sm_100f whenever the local nvcc cannot emit
+    # compute_107 (every CUDA 12.x toolkit, e.g. the cu129 CI image). This test is about which
+    # targets are named, not about the toolkit on the test host, so pin the probe.
+    monkeypatch.setattr(compilation_context, "_nvcc_supports_sm107", lambda: True)
     arch_list("9.0 10.3 12.0f")
     assert supported_capabilities() == ((9, 0), (10, 3), (12, 0))
     assert supported_capability((9, 0)) == (9, 0)

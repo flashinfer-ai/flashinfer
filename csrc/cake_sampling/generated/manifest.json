@@ -39,13 +39,13 @@
     "top_p": "shortest sorted prefix whose exclusive exact fixed-point mass is below p * mass(top-k), renormalized in float64; p clamped to (0, 1] (p <= 0 -> argmax, NaN -> 1)"
   },
   "slab_entries": 1024,
-  "source_sha256": "1b159e424498e470a9c6102035b8b0553d5d229fa050fbb87e022213e1910526",
+  "source_sha256": "120fc30940100b31885726d2f8439ffc7fd3656796abd63f2bd22846b7092cf4",
   "stage1": [
     {
       "block_threads": 512,
       "chunk": 2048,
       "cluster": 1,
-      "dynamic_smem_bytes": 16768,
+      "dynamic_smem_bytes": 33152,
       "ept": 4,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e4"
@@ -54,7 +54,7 @@
       "block_threads": 512,
       "chunk": 4096,
       "cluster": 1,
-      "dynamic_smem_bytes": 17024,
+      "dynamic_smem_bytes": 33408,
       "ept": 8,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e8"
@@ -63,7 +63,7 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 1,
-      "dynamic_smem_bytes": 17536,
+      "dynamic_smem_bytes": 33920,
       "ept": 16,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e16"
@@ -72,7 +72,7 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 1,
-      "dynamic_smem_bytes": 18560,
+      "dynamic_smem_bytes": 34944,
       "ept": 32,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e32"
@@ -81,7 +81,7 @@
       "block_threads": 512,
       "chunk": 2048,
       "cluster": 2,
-      "dynamic_smem_bytes": 16768,
+      "dynamic_smem_bytes": 33152,
       "ept": 4,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e4"
@@ -90,7 +90,7 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 2,
-      "dynamic_smem_bytes": 17536,
+      "dynamic_smem_bytes": 33920,
       "ept": 16,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e16"
@@ -99,7 +99,7 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 2,
-      "dynamic_smem_bytes": 18560,
+      "dynamic_smem_bytes": 34944,
       "ept": 32,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e32"
@@ -108,7 +108,7 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 4,
-      "dynamic_smem_bytes": 17536,
+      "dynamic_smem_bytes": 33920,
       "ept": 16,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e16"
@@ -117,7 +117,7 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 4,
-      "dynamic_smem_bytes": 18560,
+      "dynamic_smem_bytes": 34944,
       "ept": 32,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e32"
@@ -126,7 +126,7 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 8,
-      "dynamic_smem_bytes": 17536,
+      "dynamic_smem_bytes": 33920,
       "ept": 16,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e16"
@@ -135,7 +135,7 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 8,
-      "dynamic_smem_bytes": 18560,
+      "dynamic_smem_bytes": 34944,
       "ept": 32,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e32"
@@ -144,7 +144,7 @@
       "block_threads": 512,
       "chunk": 24576,
       "cluster": 8,
-      "dynamic_smem_bytes": 19584,
+      "dynamic_smem_bytes": 35968,
       "ept": 48,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e48"
@@ -181,7 +181,7 @@
     {
       "block_threads": 32,
       "capacity": 64,
-      "dynamic_smem_bytes": 18688,
+      "dynamic_smem_bytes": 1152,
       "items": 2,
       "symbol": "kernel_cake_sparse_topp_sample_t32_i2",
       "threads": 32
@@ -189,7 +189,7 @@
     {
       "block_threads": 64,
       "capacity": 128,
-      "dynamic_smem_bytes": 18688,
+      "dynamic_smem_bytes": 2176,
       "items": 2,
       "symbol": "kernel_cake_sparse_topp_sample_t64_i2",
       "threads": 64
@@ -197,7 +197,7 @@
     {
       "block_threads": 128,
       "capacity": 256,
-      "dynamic_smem_bytes": 18688,
+      "dynamic_smem_bytes": 4224,
       "items": 2,
       "symbol": "kernel_cake_sparse_topp_sample_t128_i2",
       "threads": 128
@@ -205,7 +205,7 @@
     {
       "block_threads": 256,
       "capacity": 512,
-      "dynamic_smem_bytes": 18688,
+      "dynamic_smem_bytes": 8320,
       "items": 2,
       "symbol": "kernel_cake_sparse_topp_sample_t256_i2",
       "threads": 256
@@ -213,7 +213,7 @@
     {
       "block_threads": 256,
       "capacity": 1024,
-      "dynamic_smem_bytes": 18688,
+      "dynamic_smem_bytes": 16512,
       "items": 4,
       "symbol": "kernel_cake_sparse_topp_sample_t256_i4",
       "threads": 256
@@ -221,7 +221,7 @@
     {
       "block_threads": 512,
       "capacity": 1024,
-      "dynamic_smem_bytes": 18688,
+      "dynamic_smem_bytes": 16640,
       "items": 2,
       "symbol": "kernel_cake_sparse_topp_sample_t512_i2",
       "threads": 512
