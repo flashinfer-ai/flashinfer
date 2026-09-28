@@ -33,7 +33,7 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16(
     cudaError_t status = cudaFuncSetAttribute(
         reinterpret_cast<const void*>(kernel_cake_fmha_decode_balanced_bf16),
         cudaFuncAttributeMaxDynamicSharedMemorySize,
-        149504);
+        215040);
     if (status != cudaSuccess) {
         return status;
     }
@@ -62,6 +62,6 @@ extern "C" cudaError_t cake_fmha_launch_decode_balanced_bf16(
         dim3(grid_x, grid_y, grid_z),
         dim3(512, 1, 1),
         kernel_args,
-        149504,
+        215040,
         stream);
 }

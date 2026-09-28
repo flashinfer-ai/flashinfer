@@ -42,7 +42,7 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define TMEM_TMEM_O0_OFFSET 80
 #define TMEM_TMEM_O1_OFFSET 88
 #define NUM_Q_PIPE_STAGES 2
-#define NUM_KV_PIPE_STAGES 4
+#define NUM_KV_PIPE_STAGES 6
 #define NUM_PAGE_PIPE_STAGES 6
 #define NUM_WORK_PIPE_STAGES 4
 #define SMEM_SMEM_CORR0_OFF 1024
@@ -72,46 +72,46 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define SMEM_SMEM_V_OFF 6144
 #define SMEM_SMEM_V_STAGE_BYTES 32768
 #define SMEM_SMEM_V_STRIDE 32768
-#define SMEM_SMEM_P0_OFF 137216
+#define SMEM_SMEM_P0_OFF 202752
 #define SMEM_SMEM_P0_STAGE_BYTES 2048
 #define SMEM_SMEM_P0_STRIDE 2048
-#define SMEM_SMEM_P1_OFF 141312
+#define SMEM_SMEM_P1_OFF 206848
 #define SMEM_SMEM_P1_STAGE_BYTES 2048
 #define SMEM_SMEM_P1_STRIDE 2048
-#define SMEM_SMEM_PAGE_OFFSETS_OFF 143360
+#define SMEM_SMEM_PAGE_OFFSETS_OFF 208896
 #define SMEM_SMEM_PAGE_OFFSETS_STAGE_BYTES 192
 #define SMEM_SMEM_PAGE_OFFSETS_STRIDE 192
-#define SMEM_SMEM_FINAL_SCALE0_OFF 143616
+#define SMEM_SMEM_FINAL_SCALE0_OFF 209152
 #define SMEM_SMEM_FINAL_SCALE0_STAGE_BYTES 32
 #define SMEM_SMEM_FINAL_SCALE0_STRIDE 32
-#define SMEM_SMEM_FINAL_SCALE1_OFF 143648
+#define SMEM_SMEM_FINAL_SCALE1_OFF 209184
 #define SMEM_SMEM_FINAL_SCALE1_STAGE_BYTES 32
 #define SMEM_SMEM_FINAL_SCALE1_STRIDE 32
-#define SMEM_SMEM_FINAL_INV_SUM_OFF 143680
+#define SMEM_SMEM_FINAL_INV_SUM_OFF 209216
 #define SMEM_SMEM_FINAL_INV_SUM_STAGE_BYTES 32
 #define SMEM_SMEM_FINAL_INV_SUM_STRIDE 32
-#define SMEM_WORK_TOKEN_WORDS_OFF 144496
+#define SMEM_WORK_TOKEN_WORDS_OFF 210032
 #define SMEM_WORK_TOKEN_WORDS_STAGE_BYTES 256
 #define SMEM_WORK_TOKEN_WORDS_STRIDE 256
-#define SMEM_SMEM_FINAL_MAX_OFF 144752
+#define SMEM_SMEM_FINAL_MAX_OFF 210288
 #define SMEM_SMEM_FINAL_MAX_STAGE_BYTES 32
 #define SMEM_SMEM_FINAL_MAX_STRIDE 32
-#define SMEM_SMEM_FINAL_SUM_OFF 144784
+#define SMEM_SMEM_FINAL_SUM_OFF 210320
 #define SMEM_SMEM_FINAL_SUM_STAGE_BYTES 32
 #define SMEM_SMEM_FINAL_SUM_STRIDE 32
-#define SMEM_SMEM_MERGE_FLAG_OFF 144816
+#define SMEM_SMEM_MERGE_FLAG_OFF 210352
 #define SMEM_SMEM_MERGE_FLAG_STAGE_BYTES 16
 #define SMEM_SMEM_MERGE_FLAG_STRIDE 16
-#define SMEM_SCHED_SEQ_LENS_OFF 145408
+#define SMEM_SCHED_SEQ_LENS_OFF 210944
 #define SMEM_SCHED_SEQ_LENS_STAGE_BYTES 4096
 #define SMEM_SCHED_SEQ_LENS_STRIDE 4096
-#define SMEM_TOTAL 149504
+#define SMEM_TOTAL 215040
 #define THREADS 512
 #define BLOCK_N 128
 #define HEAD_DIM 128
 #define TILE_Q 8
 #define PAGE_SIZE 16
-#define NUM_KV_STAGES 4
+#define NUM_KV_STAGES 6
 
 #include <math_constants.h>
 
@@ -536,29 +536,30 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
     #define q_full_addr (mbar_base + 0)
     #define q_empty_addr (mbar_base + 16)
     #define kv_full_addr (mbar_base + 32)
-    #define kv_empty_addr (mbar_base + 64)
-    #define s_full_0_addr (mbar_base + 96)
-    #define s_full_1_addr (mbar_base + 104)
-    #define s_empty_0_addr (mbar_base + 112)
-    #define s_empty_1_addr (mbar_base + 120)
-    #define p_full_0_addr (mbar_base + 128)
-    #define p_full_1_addr (mbar_base + 136)
-    #define p_empty_0_addr (mbar_base + 144)
-    #define p_empty_1_addr (mbar_base + 152)
-    #define corr_scale_0_addr (mbar_base + 160)
-    #define corr_scale_1_addr (mbar_base + 168)
-    #define corr_empty_0_addr (mbar_base + 176)
-    #define corr_empty_1_addr (mbar_base + 184)
-    #define stats_empty_addr (mbar_base + 192)
-    #define o_ready_0_addr (mbar_base + 200)
-    #define o_ready_1_addr (mbar_base + 208)
-    #define o_empty_0_addr (mbar_base + 216)
-    #define o_empty_1_addr (mbar_base + 224)
-    #define tmem_dealloc_addr (mbar_base + 232)
-    #define page_offsets_full_addr (mbar_base + 240)
-    #define page_offsets_empty_addr (mbar_base + 288)
-    #define work_full_addr (mbar_base + 336)
-    #define work_empty_addr (mbar_base + 368)
+    #define kv_empty_addr (mbar_base + 80)
+    #define s_full_0_addr (mbar_base + 128)
+    #define s_full_1_addr (mbar_base + 136)
+    #define s_empty_0_addr (mbar_base + 144)
+    #define s_empty_1_addr (mbar_base + 152)
+    #define p_full_0_addr (mbar_base + 160)
+    #define p_full_1_addr (mbar_base + 168)
+    #define p_empty_0_addr (mbar_base + 176)
+    #define p_empty_1_addr (mbar_base + 184)
+    #define corr_scale_0_addr (mbar_base + 192)
+    #define corr_scale_1_addr (mbar_base + 200)
+    #define corr_empty_0_addr (mbar_base + 208)
+    #define corr_empty_1_addr (mbar_base + 216)
+    #define stats_empty_addr (mbar_base + 224)
+    #define o_ready_0_addr (mbar_base + 232)
+    #define o_ready_1_addr (mbar_base + 240)
+    #define o_empty_0_addr (mbar_base + 248)
+    #define o_empty_1_addr (mbar_base + 256)
+    #define tmem_dealloc_addr (mbar_base + 264)
+    #define page_offsets_full_addr (mbar_base + 272)
+    #define page_offsets_empty_addr (mbar_base + 320)
+    #define work_full_addr (mbar_base + 368)
+    #define work_empty_addr (mbar_base + 400)
+    #define claim_gate_addr (mbar_base + 432)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -591,34 +592,34 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
     const int smem_kv_addr = smem + 6144;
     __nv_bfloat16* smem_v = reinterpret_cast<__nv_bfloat16*>(smem_raw + 6144);
     const int smem_v_addr = smem + 6144;
-    __nv_bfloat16* smem_p0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 137216);
-    const int smem_p0_addr = smem + 137216;
-    __nv_bfloat16* smem_p1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 141312);
-    const int smem_p1_addr = smem + 141312;
-    int* smem_page_offsets = reinterpret_cast<int*>(smem_raw + 143360);
-    const int smem_page_offsets_addr = smem + 143360;
-    float* smem_final_scale0 = reinterpret_cast<float*>(smem_raw + 143616);
-    const int smem_final_scale0_addr = smem + 143616;
-    float* smem_final_scale1 = reinterpret_cast<float*>(smem_raw + 143648);
-    const int smem_final_scale1_addr = smem + 143648;
-    float* smem_final_inv_sum = reinterpret_cast<float*>(smem_raw + 143680);
-    const int smem_final_inv_sum_addr = smem + 143680;
-    unsigned int* work_token_words = reinterpret_cast<unsigned int*>(smem_raw + 144496);
-    const int work_token_words_addr = smem + 144496;
-    float* smem_final_max = reinterpret_cast<float*>(smem_raw + 144752);
-    const int smem_final_max_addr = smem + 144752;
-    float* smem_final_sum = reinterpret_cast<float*>(smem_raw + 144784);
-    const int smem_final_sum_addr = smem + 144784;
-    unsigned int* smem_merge_flag = reinterpret_cast<unsigned int*>(smem_raw + 144816);
-    const int smem_merge_flag_addr = smem + 144816;
-    int* sched_seq_lens = reinterpret_cast<int*>(smem_raw + 145408);
-    const int sched_seq_lens_addr = smem + 145408;
+    __nv_bfloat16* smem_p0 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 202752);
+    const int smem_p0_addr = smem + 202752;
+    __nv_bfloat16* smem_p1 = reinterpret_cast<__nv_bfloat16*>(smem_raw + 206848);
+    const int smem_p1_addr = smem + 206848;
+    int* smem_page_offsets = reinterpret_cast<int*>(smem_raw + 208896);
+    const int smem_page_offsets_addr = smem + 208896;
+    float* smem_final_scale0 = reinterpret_cast<float*>(smem_raw + 209152);
+    const int smem_final_scale0_addr = smem + 209152;
+    float* smem_final_scale1 = reinterpret_cast<float*>(smem_raw + 209184);
+    const int smem_final_scale1_addr = smem + 209184;
+    float* smem_final_inv_sum = reinterpret_cast<float*>(smem_raw + 209216);
+    const int smem_final_inv_sum_addr = smem + 209216;
+    unsigned int* work_token_words = reinterpret_cast<unsigned int*>(smem_raw + 210032);
+    const int work_token_words_addr = smem + 210032;
+    float* smem_final_max = reinterpret_cast<float*>(smem_raw + 210288);
+    const int smem_final_max_addr = smem + 210288;
+    float* smem_final_sum = reinterpret_cast<float*>(smem_raw + 210320);
+    const int smem_final_sum_addr = smem + 210320;
+    unsigned int* smem_merge_flag = reinterpret_cast<unsigned int*>(smem_raw + 210352);
+    const int smem_merge_flag_addr = smem + 210352;
+    int* sched_seq_lens = reinterpret_cast<int*>(smem_raw + 210944);
+    const int sched_seq_lens_addr = smem + 210944;
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(Qt)) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(K)) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)(V)) : "memory");
 
-    // Mbarrier init (26 pipeline groups, 0 ordered-sequence groups, 50 barriers)
-    // Mbarriers at smem_raw[0..400)
+    // Mbarrier init (27 pipeline groups, 0 ordered-sequence groups, 55 barriers)
+    // Mbarriers at smem_raw[0..440)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -630,78 +631,84 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
             // q_empty: 2 barriers, init_count=1
             mbarrier_init(smem + 16, 1);
             mbarrier_init(smem + 24, 1);
-            // kv_full: 4 barriers, init_count=1
+            // kv_full: 6 barriers, init_count=1
             mbarrier_init(smem + 32, 1);
             mbarrier_init(smem + 40, 1);
             mbarrier_init(smem + 48, 1);
             mbarrier_init(smem + 56, 1);
-            // kv_empty: 4 barriers, init_count=1
             mbarrier_init(smem + 64, 1);
             mbarrier_init(smem + 72, 1);
+            // kv_empty: 6 barriers, init_count=1
             mbarrier_init(smem + 80, 1);
             mbarrier_init(smem + 88, 1);
-            // s_full_0: 1 barriers, init_count=1
             mbarrier_init(smem + 96, 1);
-            // s_full_1: 1 barriers, init_count=1
             mbarrier_init(smem + 104, 1);
+            mbarrier_init(smem + 112, 1);
+            mbarrier_init(smem + 120, 1);
+            // s_full_0: 1 barriers, init_count=1
+            mbarrier_init(smem + 128, 1);
+            // s_full_1: 1 barriers, init_count=1
+            mbarrier_init(smem + 136, 1);
             // s_empty_0: 1 barriers, init_count=128
-            mbarrier_init(smem + 112, 128);
+            mbarrier_init(smem + 144, 128);
             // s_empty_1: 1 barriers, init_count=128
-            mbarrier_init(smem + 120, 128);
+            mbarrier_init(smem + 152, 128);
             // p_full_0: 1 barriers, init_count=256
-            mbarrier_init(smem + 128, 256);
+            mbarrier_init(smem + 160, 256);
             // p_full_1: 1 barriers, init_count=256
-            mbarrier_init(smem + 136, 256);
+            mbarrier_init(smem + 168, 256);
             // p_empty_0: 1 barriers, init_count=1
-            mbarrier_init(smem + 144, 1);
+            mbarrier_init(smem + 176, 1);
             // p_empty_1: 1 barriers, init_count=1
-            mbarrier_init(smem + 152, 1);
+            mbarrier_init(smem + 184, 1);
             // corr_scale_0: 1 barriers, init_count=128
-            mbarrier_init(smem + 160, 128);
+            mbarrier_init(smem + 192, 128);
             // corr_scale_1: 1 barriers, init_count=128
-            mbarrier_init(smem + 168, 128);
+            mbarrier_init(smem + 200, 128);
             // corr_empty_0: 1 barriers, init_count=128
-            mbarrier_init(smem + 176, 128);
+            mbarrier_init(smem + 208, 128);
             // corr_empty_1: 1 barriers, init_count=128
-            mbarrier_init(smem + 184, 128);
-            // stats_empty: 1 barriers, init_count=4
-            mbarrier_init(smem + 192, 4);
-            // o_ready_0: 1 barriers, init_count=1
-            mbarrier_init(smem + 200, 1);
-            // o_ready_1: 1 barriers, init_count=1
-            mbarrier_init(smem + 208, 1);
-            // o_empty_0: 1 barriers, init_count=128
             mbarrier_init(smem + 216, 128);
+            // stats_empty: 1 barriers, init_count=4
+            mbarrier_init(smem + 224, 4);
+            // o_ready_0: 1 barriers, init_count=1
+            mbarrier_init(smem + 232, 1);
+            // o_ready_1: 1 barriers, init_count=1
+            mbarrier_init(smem + 240, 1);
+            // o_empty_0: 1 barriers, init_count=128
+            mbarrier_init(smem + 248, 128);
             // o_empty_1: 1 barriers, init_count=128
-            mbarrier_init(smem + 224, 128);
+            mbarrier_init(smem + 256, 128);
             // tmem_dealloc: 1 barriers, init_count=128
-            mbarrier_init(smem + 232, 128);
+            mbarrier_init(smem + 264, 128);
             // --- pipeline 'page_pipe' ---
             // page_offsets_full: 6 barriers, init_count=1
-            mbarrier_init(smem + 240, 1);
-            mbarrier_init(smem + 248, 1);
-            mbarrier_init(smem + 256, 1);
-            mbarrier_init(smem + 264, 1);
             mbarrier_init(smem + 272, 1);
             mbarrier_init(smem + 280, 1);
-            // page_offsets_empty: 6 barriers, init_count=1
             mbarrier_init(smem + 288, 1);
             mbarrier_init(smem + 296, 1);
             mbarrier_init(smem + 304, 1);
             mbarrier_init(smem + 312, 1);
+            // page_offsets_empty: 6 barriers, init_count=1
             mbarrier_init(smem + 320, 1);
             mbarrier_init(smem + 328, 1);
-            // --- pipeline 'work_pipe' ---
-            // work_full: 4 barriers, init_count=1
             mbarrier_init(smem + 336, 1);
             mbarrier_init(smem + 344, 1);
             mbarrier_init(smem + 352, 1);
             mbarrier_init(smem + 360, 1);
+            // --- pipeline 'work_pipe' ---
+            // work_full: 4 barriers, init_count=1
+            mbarrier_init(smem + 368, 1);
+            mbarrier_init(smem + 376, 1);
+            mbarrier_init(smem + 384, 1);
+            mbarrier_init(smem + 392, 1);
             // work_empty: 4 barriers, init_count=480
-            mbarrier_init(smem + 368, 480);
-            mbarrier_init(smem + 376, 480);
-            mbarrier_init(smem + 384, 480);
-            mbarrier_init(smem + 392, 480);
+            mbarrier_init(smem + 400, 480);
+            mbarrier_init(smem + 408, 480);
+            mbarrier_init(smem + 416, 480);
+            mbarrier_init(smem + 424, 480);
+            // claim_gate: 1 barriers, init_count=1
+            mbarrier_init(smem + 432, 1);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -709,9 +716,9 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
     __syncwarp();
 
     // TMEM alloc (128 columns, 96 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 400);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 440);
     if (warp == 0) {
-        int _tmem_hold = smem + 400;
+        int _tmem_hold = smem + 440;
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(128) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::1.sync.aligned;");
@@ -1375,17 +1382,19 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
                     mbarrier_arrive(stats_empty_addr);
                 }
                 if (publish_split != 0) {
-                    __threadfence();
                     asm volatile("barrier.sync 10, 128;" ::: "memory");
                     if (wg_tid_c == 0) {
-                        unsigned int _atomic_old_1 = atomicAdd(&tile_counters[counter_idx_c], 1);
-                        unsigned int old_count = _atomic_old_1;
+                        asm volatile("fence.release.gpu;" ::: "memory");
+                        unsigned int _atomic_old_2;
+                        asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                            : "=r"(_atomic_old_2) : "l"(&tile_counters[counter_idx_c]), "r"(static_cast<uint32_t>(1)) : "memory");
+                        unsigned int old_count = _atomic_old_2;
                         smem_merge_flag[0] = (((int)old_count + 1 == n_chunks_c) ? 1 : 0);
                     }
                     asm volatile("barrier.sync 10, 128;" ::: "memory");
                     unsigned int merge_flag = smem_merge_flag[0];
                     if (merge_flag != 0) {
-                        __threadfence();
+                        asm volatile("fence.acquire.gpu;" ::: "memory");
                         float merge_max = -CAKE_FMHA_INF;
                         #pragma unroll 1
                         for (int c_a = 0; c_a < n_chunks_c; c_a++) {
@@ -1620,9 +1629,9 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
                 #pragma unroll 1
                 for (int pair_2 = 0; pair_2 < num_pairs_2 - 1; pair_2++) {
                     int s0_1 = inst0_stage;
-                    int s1_1 = (inst0_stage + 1) % 4;
-                    int s0_next = (inst0_stage + 2) % 4;
-                    int s1_next = (inst0_stage + 3) % 4;
+                    int s1_1 = (inst0_stage + 1) % NUM_KV_STAGES;
+                    int s0_next = (inst0_stage + 2) % NUM_KV_STAGES;
+                    int s1_next = (inst0_stage + 3) % NUM_KV_STAGES;
                     mbarrier_wait(s_empty_0_addr, _phase_s_empty_0_0);
                     _phase_s_empty_0_0 ^= 1;
                     mbarrier_wait(kv_full_addr + (s0_next) * 8, 0);
@@ -1833,7 +1842,7 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
                 q_cons_stage += 1;
                 if (q_cons_stage == 2) { q_cons_stage = 0; q_cons_phase ^= 1; }
                 int s0_last = inst0_stage;
-                int s1_last = (inst0_stage + 1) % 4;
+                int s1_last = (inst0_stage + 1) % NUM_KV_STAGES;
                 mbarrier_wait(o_empty_0_addr, _phase_o_empty_0_0);
                 _phase_o_empty_0_0 ^= 1;
                 mbarrier_wait(kv_full_addr + (s0_last) * 8, 1);
@@ -2366,15 +2375,22 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
                 st_before_b[bi_3] = 0;
             }
             unsigned int first_claim = 1;
+            unsigned int gate_phase = 0;
             unsigned int _phase_work_empty = 1;
             #pragma unroll 1
             for (unsigned int _claim = 0; _claim < max_items + 1; _claim++) {
                 mbarrier_wait(work_empty_addr + (work_stage_sched) * 8, _phase_work_empty);
                 unsigned int ticket_lane0 = blockIdx.x;
                 if (first_claim == 0) {
-                    if (lane_0 == 0) {
-                        unsigned int _atomic_old_0 = atomicAdd(&queue_counters[0], 1);
-                        ticket_lane0 = _atomic_old_0 + (unsigned int)num_ctas;
+                    if (total_items <= (unsigned int)num_ctas) {
+                        ticket_lane0 = (unsigned int)num_ctas;
+                    } else {
+                        mbarrier_wait_hint(claim_gate_addr, gate_phase, 1000);
+                        gate_phase = gate_phase ^ 1;
+                        if (lane_0 == 0) {
+                            unsigned int _atomic_old_0 = atomicAdd(&queue_counters[0], 1);
+                            ticket_lane0 = _atomic_old_0 + (unsigned int)num_ctas;
+                        }
                     }
                 }
                 first_claim = 0;
@@ -2674,7 +2690,11 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
                     tma_3d_gmem2smem(smem_qt_addr + q_prod_stage * 2048, Qt, 0, off_qt, 0, q_full_addr + (q_prod_stage) * 8);
                     int kv_stage = 0;
                     int kv_phase = 1;
-                    int prefill = ((cta_n_blocks_3 < 2) ? cta_n_blocks_3 : 2);
+                    int prefill = ((cta_n_blocks_3 < 4) ? cta_n_blocks_3 : 4);
+                    int gate_block = cta_n_blocks_3 - 1 - 2;
+                    if (gate_block < 0) {
+                        gate_block = 0;
+                    }
                     #pragma unroll 1
                     for (int ni = 0; ni < prefill; ni++) {
                         int page_stage_unwrapped = page_cons_stage + (unsigned int)ni;
@@ -2706,14 +2726,14 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
                             }
                         }
                         kv_stage += 1;
-                        if (kv_stage == 4) { kv_stage = 0; kv_phase ^= 1; }
+                        if (kv_stage == 6) { kv_stage = 0; kv_phase ^= 1; }
                     }
                     #pragma unroll 1
                     for (int ni_1 = 0; ni_1 < cta_n_blocks_3; ni_1++) {
-                        int next_ni = ni_1 + 2;
+                        int next_ni = ni_1 + 4;
                         if (next_ni < cta_n_blocks_3) {
                             int k_stage = next_ni % NUM_KV_STAGES;
-                            int next_page_stage_unwrapped = page_cons_stage + 2;
+                            int next_page_stage_unwrapped = page_cons_stage + 4;
                             int next_page_stage = next_page_stage_unwrapped;
                             if (next_page_stage >= 6) {
                                 next_page_stage = next_page_stage - 6;
@@ -2742,7 +2762,7 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
                                 }
                             }
                         }
-                        int stage = ni_1 % 4;
+                        int stage = ni_1 % NUM_KV_STAGES;
                         int vpg_base = page_cons_stage * 8;
                         mbarrier_wait(kv_empty_addr + (stage) * 8, 0);
                         mbarrier_arrive_expect_tx(kv_full_addr + (stage) * 8, 32768);
@@ -2764,6 +2784,9 @@ kernel_cake_fmha_decode_balanced_bf16(CakeFmhaTensorMap const* Qt, CakeFmhaTenso
                         mbarrier_arrive(page_offsets_empty_addr + (page_cons_stage) * 8);
                         page_cons_stage += 1;
                         if (page_cons_stage == 6) { page_cons_stage = 0; page_cons_phase ^= 1; }
+                        if (ni_1 == gate_block) {
+                            mbarrier_arrive(claim_gate_addr);
+                        }
                     }
                 }
                 q_prod_stage += 1;

@@ -22,7 +22,10 @@
 //     one GQA-8 query row per item).
 //   * ``CAKE_FMHA_BALANCED_N_ROWS == 32 | 64`` — the packed-row MTP kernel
 //     (``Q_LEN`` 3..8: one ``8 * Q_LEN``-row tile per (request, KV head) so each
-//     KV chunk streams once per request instead of once per draft row).
+//     KV chunk streams once per request instead of once per draft row).  Both
+//     instances run the same 64-row physical tile (Q box, SMEM, MMA, partial
+//     slots); ``N_ROWS`` only selects the live rows that are normalised and
+//     stored, so every host-side size below is ``N_ROWS``-independent.
 //
 // The self-resetting split counters live in the zero-initialized
 // ``multi_ctas_kv_counter_buffer`` (the trtllm-gen contract: zeroed once at
@@ -86,10 +89,19 @@ constexpr int64_t kPartialOPerSlot = 8 * kHeadDim;   // FP32 O[8, 128] per split
 constexpr int64_t kStatsPerSlot = 16;                // m[8] then l[8]
 constexpr int64_t kCountersPerTile = 1;              // chunk arrivals
 #else
-constexpr int64_t kPartialOPerSlot = 64 * kHeadDim;  // FP32 O^T[64, 128] per split item
-constexpr int64_t kStatsPerSlot = 128;               // max[64] then sum[64]
-constexpr int64_t kCountersPerTile = 2;              // chunk arrivals, merge slices done
-constexpr uint32_t kQBoxRows = CAKE_FMHA_BALANCED_N_ROWS / kGroup;  // query tokens per Q box
+constexpr int64_t kMaxNRows = 64;                    // physical packed tile of both MTP instances
+constexpr int64_t kPartialOPerSlot = kMaxNRows * kHeadDim;  // FP32 O^T[64, 128] per split item
+constexpr int64_t kStatsPerSlot = 2 * kMaxNRows;     // max[64] then sum[64]
+// Per split tile: word 0 chunk arrivals, word 1 reduce tickets that observed the
+// completed tile, word 2 unused, word 3 the two-chunk published flag (mirrors
+// ``COUNTERS_PER_TILE`` of trtllm_fmha_forgen_bf16_balanced_mtp).
+constexpr int64_t kCountersPerTile = 4;
+// Reduce tickets per split tile: 1 (<= 4 chunks), 2 (<= 8), 4 (<= 16), 8 (more);
+// the ticket-loop bound counts the maximum (``REDUCE_SLICES_MAX``).
+constexpr int64_t kReduceSlicesMax = 8;
+// Query tokens per Q box: always the full 64-row A tile (``Q_BOX_ROWS``); rows at
+// or past ``N_ROWS`` are padding the kernel never stores.
+constexpr uint32_t kQBoxRows = static_cast<uint32_t>(kMaxNRows / kGroup);
 #endif
 
 void CheckSameDevice(TensorView query, TensorView tensor, const char* name) {
@@ -337,10 +349,11 @@ CUtensorMap EncodeTmaQuery(TensorView tensor) {
 }
 #else
 // Packed MTP kernel: the query [batch * q_len, Hq, 128] is read as a 4-D map
-// (64 dims, head, token, k-group) whose box (64, GROUP, Q_BOX_ROWS, 2) lands in
-// SMEM as packed row r = token * GROUP + head.  Tokens past the tensor are TMA
-// zero fill (padding rows whose results are never stored), so the token box may
-// exceed the token extent.
+// (64 dims, head, token, k-group) whose box (64, GROUP, Q_BOX_ROWS = 8, 2) lands
+// in SMEM as packed row r = token * GROUP + head — the full 64-row tile the
+// kernel's Q barrier expects for both ``N_ROWS`` instances (16 KiB).  Tokens past
+// the tensor are TMA zero fill (padding rows whose results are never stored), so
+// the token box may exceed the token extent.
 CUtensorMap EncodeTmaQuery(TensorView tensor) {
   TVM_FFI_ICHECK_EQ(tensor.ndim(), 3);
   TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_bfloat16);
@@ -401,13 +414,14 @@ int64_t MaxSplitItems(int64_t num_ctas) { return 2 * kMaxBalanceFactor * num_cta
 int64_t MaxSplitTiles(int64_t num_ctas) { return kMaxBalanceFactor * num_ctas; }
 
 // Host ticket-loop bound: whole tiles, every possible split chunk and (packed
-// kernel) every merge ticket.  Mirrors ``max_items_bound`` of the Cake modules.
+// kernel) the most reduce tickets per split tile.  Mirrors ``max_items_bound``
+// of the Cake modules.
 int64_t MaxItems(int64_t batch_size, int64_t num_kv_heads, int64_t num_ctas) {
 #if CAKE_FMHA_BALANCED_N_ROWS == 0
   return batch_size * Q_LEN * num_kv_heads + MaxSplitItems(num_ctas);
 #else
   return batch_size * num_kv_heads + MaxSplitItems(num_ctas) +
-         MaxSplitTiles(num_ctas) * (2 * Q_LEN);
+         MaxSplitTiles(num_ctas) * kReduceSlicesMax;
 #endif
 }
 

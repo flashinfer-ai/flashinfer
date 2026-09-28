@@ -1420,39 +1420,39 @@
     },
     "bindings/cake_fmha_decode_balanced_bf16_binding.cu": {
       "bytes": 2983,
-      "sha256": "a46e09930df855a7253b2e8febc8d8a58fd73c6065b45c9d03edb0a7c682ff07"
+      "sha256": "8a891e6e549928f05018c8905e4547f9e99a82d9b32e7d26b89d62522081e5f1"
     },
     "cuda/decode_balanced_bf16/sm_100a/default.cu": {
-      "bytes": 147627,
-      "sha256": "3ebe7bf6dd7b053a4f12d801ebde50a8365d4edc4755b77823c227272b0761dc"
+      "bytes": 148905,
+      "sha256": "168db4c5247093ef015ff49e05fd6cbc787d6653fba948959f09cccc58d0a471"
     },
     "cuda/decode_balanced_bf16/sm_103a/default.cu": {
-      "bytes": 147530,
-      "sha256": "1a2863fe9e7615feb2549c68a68bd9c06e98267dc8882736575998c26172318b"
+      "bytes": 148808,
+      "sha256": "4c48a89b6bb22154b130d7f1db716b3f8f159a6ead6e78fa3e87e9a8aaf40eae"
     },
     "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu": {
       "bytes": 2917,
-      "sha256": "d80f3c6f0024e25944c7ee983893741588c871ef1a3b1bc8491fde99e8aab5ab"
+      "sha256": "ded98975f79549a3f102998c2c019f8e1aeb00ecfaf55231e8bc3444700310c0"
     },
     "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu": {
-      "bytes": 149443,
-      "sha256": "9240be7117f21e0acbe3911c8a9c66957e7910c71206cac0b7f8820716fadfca"
+      "bytes": 212445,
+      "sha256": "2692b9b6ad8c976b58c87c2584f9fb572c04fad966c28680eafd1c06c6715730"
     },
     "cuda/decode_balanced_bf16_mtp_n32/sm_103a/default.cu": {
-      "bytes": 149346,
-      "sha256": "374177b3ba04d9d179ff4b489c8e5cb20984c69d9db2129add804b08318dc726"
+      "bytes": 212348,
+      "sha256": "55627188fe436abed0fbb08bb8e318fe9f348c79f7dc38ef5687bccf3de78f8d"
     },
     "bindings/cake_fmha_decode_balanced_bf16_mtp_n64_binding.cu": {
       "bytes": 2917,
-      "sha256": "2d4e19ff7fb2af032a6dbb68f259afcfa87544755f82cf56c32ea68690f790fa"
+      "sha256": "e82f183ea722ed39b7e2f34b983c3089f038fc5ec6aec54eb9e34b012df9dd54"
     },
     "cuda/decode_balanced_bf16_mtp_n64/sm_100a/default.cu": {
-      "bytes": 151059,
-      "sha256": "2471fe6df24113d58bdf3827fce671af37007d7a1e0c98de6c1241e4f8d5261a"
+      "bytes": 212445,
+      "sha256": "db429833c0eaee2a33c9d4423a5d9d92ff79f320725537092d0a22824643cab5"
     },
     "cuda/decode_balanced_bf16_mtp_n64/sm_103a/default.cu": {
-      "bytes": 150962,
-      "sha256": "27ce6bdba75c4602eed2bc36df4218d33ed84e334b1b32c7962d00a816a6bdcf"
+      "bytes": 212348,
+      "sha256": "c4134299df094046d3d53933d3410ea659981eab942d038f467271306df2208b"
     }
   },
   "capability": {
@@ -5523,9 +5523,9 @@
       "threads": 512
     },
     "decode_balanced_bf16": {
-      "binding_sha256": "a46e09930df855a7253b2e8febc8d8a58fd73c6065b45c9d03edb0a7c682ff07",
+      "binding_sha256": "8a891e6e549928f05018c8905e4547f9e99a82d9b32e7d26b89d62522081e5f1",
       "binding_source": "bindings/cake_fmha_decode_balanced_bf16_binding.cu",
-      "dynamic_shared_memory_bytes": 149504,
+      "dynamic_shared_memory_bytes": 215040,
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16",
       "parameters": [
         {
@@ -5625,8 +5625,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "3ebe7bf6dd7b053a4f12d801ebde50a8365d4edc4755b77823c227272b0761dc",
-            "sm_103a": "1a2863fe9e7615feb2549c68a68bd9c06e98267dc8882736575998c26172318b"
+            "sm_100a": "168db4c5247093ef015ff49e05fd6cbc787d6653fba948959f09cccc58d0a471",
+            "sm_103a": "4c48a89b6bb22154b130d7f1db716b3f8f159a6ead6e78fa3e87e9a8aaf40eae"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16/sm_100a/default.cu",
@@ -5637,9 +5637,9 @@
       "threads": 512
     },
     "decode_balanced_bf16_mtp_n32": {
-      "binding_sha256": "d80f3c6f0024e25944c7ee983893741588c871ef1a3b1bc8491fde99e8aab5ab",
+      "binding_sha256": "ded98975f79549a3f102998c2c019f8e1aeb00ecfaf55231e8bc3444700310c0",
       "binding_source": "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu",
-      "dynamic_shared_memory_bytes": 222464,
+      "dynamic_shared_memory_bytes": 222208,
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_mtp_n32",
       "parameters": [
         {
@@ -5734,8 +5734,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "9240be7117f21e0acbe3911c8a9c66957e7910c71206cac0b7f8820716fadfca",
-            "sm_103a": "374177b3ba04d9d179ff4b489c8e5cb20984c69d9db2129add804b08318dc726"
+            "sm_100a": "2692b9b6ad8c976b58c87c2584f9fb572c04fad966c28680eafd1c06c6715730",
+            "sm_103a": "55627188fe436abed0fbb08bb8e318fe9f348c79f7dc38ef5687bccf3de78f8d"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu",
@@ -5743,12 +5743,12 @@
           }
         }
       ],
-      "threads": 512
+      "threads": 384
     },
     "decode_balanced_bf16_mtp_n64": {
-      "binding_sha256": "2d4e19ff7fb2af032a6dbb68f259afcfa87544755f82cf56c32ea68690f790fa",
+      "binding_sha256": "e82f183ea722ed39b7e2f34b983c3089f038fc5ec6aec54eb9e34b012df9dd54",
       "binding_source": "bindings/cake_fmha_decode_balanced_bf16_mtp_n64_binding.cu",
-      "dynamic_shared_memory_bytes": 222464,
+      "dynamic_shared_memory_bytes": 222208,
       "launch_binding": "cake_fmha_launch_decode_balanced_bf16_mtp_n64",
       "parameters": [
         {
@@ -5843,8 +5843,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "2471fe6df24113d58bdf3827fce671af37007d7a1e0c98de6c1241e4f8d5261a",
-            "sm_103a": "27ce6bdba75c4602eed2bc36df4218d33ed84e334b1b32c7962d00a816a6bdcf"
+            "sm_100a": "db429833c0eaee2a33c9d4423a5d9d92ff79f320725537092d0a22824643cab5",
+            "sm_103a": "c4134299df094046d3d53933d3410ea659981eab942d038f467271306df2208b"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_mtp_n64/sm_100a/default.cu",
@@ -5852,7 +5852,7 @@
           }
         }
       ],
-      "threads": 512
+      "threads": 384
     }
   },
   "flashinfer_matrix_revision": "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b",
