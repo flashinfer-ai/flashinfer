@@ -930,10 +930,26 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             id="case-85",
         ),
         pytest.param(
-            torch.bfloat16, 64, 2, 5, False, 128, 1, "bf16_swa128_single_cta", id="case-85-swa"
+            torch.bfloat16,
+            64,
+            2,
+            5,
+            False,
+            128,
+            1,
+            "bf16_swa128_single_cta",
+            id="case-85-swa",
         ),
         pytest.param(
-            torch.bfloat16, 64, 6, 4, False, 640, 64, "bf16_h64_prefill", id="case-85-dense24"
+            torch.bfloat16,
+            64,
+            6,
+            4,
+            False,
+            640,
+            64,
+            "bf16_h64_prefill",
+            id="case-85-dense24",
         ),
         pytest.param(
             torch.bfloat16, 64, 2, 257, True, 640, 64, "bf16_h64_prefill", id="case-86"
@@ -1264,16 +1280,25 @@ _PUBLIC_COMPILE_FLAGS = {
 def test_registered_compile_flags_are_public(arch):
     """Exported programs must build with public nvcc/ptxas options only.
 
-    The FP8/H128 persistent prefill variants additionally pin the ptxas
+    The FP8/H128 persistent prefill variant additionally pins the ptxas
     register-usage level: without it ptxas re-orders the softmax exp2/convert
     chains across the P-publication fence and the exported build runs 3-5 %
-    slower than the source build on the 16-tile prefill shapes.
+    slower than the source build on the 16-tile prefill shapes.  The uniform
+    (sub-128-token decode) variant of the same body ships without the pin:
+    its softmax chain is not what paces the item and the pinned build reads
+    1-2 % slower on the uniform decode rows, so the flag must stay off there.
     """
-    for variant, spec in _ARCH_REGISTRATIONS[arch]["variants"].items():
+    pin = "-Xptxas=--register-usage-level=10"
+    variants = _ARCH_REGISTRATIONS[arch]["variants"]
+    assert "fp8_h128_prefill_source_persistent" in variants
+    assert "fp8_h128_prefill_source_persistent_uniform" in variants
+    for variant, spec in variants.items():
         flags = set(spec["compile_flags"])
         assert flags <= _PUBLIC_COMPILE_FLAGS, (variant, sorted(flags))
-        if variant.startswith("fp8_h128_prefill_source_persistent"):
-            assert "-Xptxas=--register-usage-level=10" in flags, variant
+        if variant == "fp8_h128_prefill_source_persistent":
+            assert pin in flags, variant
+        elif variant == "fp8_h128_prefill_source_persistent_uniform":
+            assert pin not in flags, variant
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
@@ -1520,7 +1545,10 @@ def _run_fake_dense_h64(monkeypatch, *, query_rows, metadata, workspace, out=Non
     """Drive run_cake_dsv4 on CPU tensors through the bf16 H64 dense split route."""
     recorder = _install_fake_variants(
         monkeypatch,
-        {"bf16_h64_compressed_q8_v38": _MAIN_PLAN, "bf16_h64_compressed_reduce": _REDUCE_PLAN},
+        {
+            "bf16_h64_compressed_q8_v38": _MAIN_PLAN,
+            "bf16_h64_compressed_reduce": _REDUCE_PLAN,
+        },
     )
     monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
     monkeypatch.setattr(cake, "_stream_ptr", lambda device: 0)
