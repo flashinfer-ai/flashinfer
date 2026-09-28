@@ -24,7 +24,13 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    manifest) this stage runs inside the stage-1 kernel on one warp of the cluster's first CTA,
    so the call is a single launch; the outputs are bitwise identical to the two-launch form.
    Every variant the dispatcher can pick for such a top-k carries the tail (manifest
-   ``fused_tail``); the ``(8, 48)`` resident, a large-k pick, is built without it.
+   ``fused_tail``); the ``(8, 48)`` resident, a large-k pick, is built without it.  In the
+   two-launch form the dispatcher also decides where the dependent kernel lands: stage 1 signals
+   ``griddepcontrol.launch_dependents`` before its first pass only when the batch fits on the
+   SMs its last wave leaves free (one stage-1 CTA per SM), so the stage-2/3 CTAs are never
+   packed onto the few SMs free mid-flight; larger batches let the dependent launch as stage 1
+   exits.  Both decisions travel in the stage-1 ``launch_flags`` argument (bit 0 fused tail,
+   bit 1 early trigger) and neither changes any output.
 
 Semantics (support, tie-breaking toward the lower vocabulary index, Philox stream advancement
 through the generator) follow the ``top_k_first`` route with two extra guarantees:
@@ -73,20 +79,21 @@ Measured performance
 
 ``python benchmarks/bench_cake_sampling.py --cupti --skip-joint --batches 1,2,4,8,16,32,64,128
 --vocabs 32768,128256,151936,262144`` with ``--top-k 10`` / ``50`` / ``1000`` and with ``--cuda-graph``
-(``flashinfer.testing.bench_gpu_time``, CUPTI kernel time, p = 0.9, median µs), round-3 bundle
-(candidate-list stage 1 + composite bitonic stage 2/3) on the four supported architectures.  The
-summary compares every cell with FlashInfer's default ``top_k_first`` route and with the previous
-frozen bundle (#5585) measured in the same run.
+(``flashinfer.testing.bench_gpu_time``, CUPTI kernel time, p = 0.9, median µs), round-4 bundle
+(streaming stage 1 with a gathered candidate list, fused stage 2/3 for ``top_k_max <= 64``, per-table
+k-aware dispatch) on the four supported architectures.  The summary compares every cell with
+FlashInfer's default ``top_k_first`` route and with the previous frozen bundle (#5607) measured in
+the same run.
 
-.. list-table:: Round-3 bundle, 192 cells per architecture (8 batches × 4 vocabularies × 3 k × eager/graph)
+.. list-table:: Round-4 bundle, 192 cells per architecture (8 batches × 4 vocabularies × 3 k × eager/graph)
    :header-rows: 1
    :widths: 18 14 20 24 24
 
    * - GPU
-     - cells slower than #5585 by > 2 %
+     - cells slower than #5607 by > 2 %
      - speedup vs top_k_first (min / median / max)
-     - gain vs #5585, B ≤ 16 (min / median / max)
-     - gain vs #5585, B ≥ 32 (min / median)
+     - gain vs #5607, B ≤ 16 (min / median / max)
+     - gain vs #5607, B ≥ 32 (min / median)
    * - H100 SXM (sm_90a, 132 SMs)
      - 0 of 192
      - 1.24x / 2.66x / 7.31x
