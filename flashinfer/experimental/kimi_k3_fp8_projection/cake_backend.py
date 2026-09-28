@@ -312,7 +312,8 @@ def decode_module_stages(
 # A persistent cluster grid larger than ``C x capacity`` serialises whole clusters into a second pass.  Measured on
 # B200 / B300; mirrors the source repository's table.
 DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
-    "sm_100a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15},  # 148 SMs; B300 (sm_103a) pending
+    "sm_100a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15},  # B200, 148 SMs
+    "sm_103a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15},  # B300, 148 SMs (same GPC topology)
 }
 
 
