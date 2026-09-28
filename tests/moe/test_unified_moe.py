@@ -2511,6 +2511,69 @@ def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("reverse_candidates", (False, True))
+def test_layer_selection_includes_per_call_packing(monkeypatch, reverse_candidates):
+    from flashinfer.testing import utils as testing_utils
+
+    gpu_work = []
+    measured = []
+    activations, weights = object(), object()
+    tactic = ("selected",)
+
+    class Runner:
+        def __init__(self, name, packing_cost, forward_cost):
+            self.backend_key = name
+            self.packing_cost = packing_cost
+            self.forward_cost = forward_cost
+            self.prepared = False
+
+        def pack_inputs(self, act_pack, weight_pack):
+            assert act_pack is activations and weight_pack is weights
+            if not self.prepared:
+                gpu_work.append(1000)  # One-time weight preparation is excluded.
+                self.prepared = True
+            gpu_work.append(self.packing_cost)
+            return [object()]
+
+        def launch_kwargs_for(self, inputs):
+            return {"launch_state": inputs[0]}
+
+        def tuning_config_for(self, inputs):
+            return TuningConfig()
+
+        def forward(self, inputs, *, tactic, launch_state):
+            # A fresh pack must use its own launch state, not the tuning pack's.
+            assert launch_state is inputs[0]
+            gpu_work.append(self.forward_cost)
+
+    def benchmark(fn, **kwargs):
+        assert kwargs["use_cuda_graph"]
+        times = []
+        for _ in range(2):
+            gpu_work.clear()
+            fn()
+            times.append(sum(gpu_work))
+        measured.append(times)
+        return times
+
+    monkeypatch.setattr(testing_utils, "bench_gpu_time", benchmark)
+    fast_kernel = Runner("fast_kernel", packing_cost=8, forward_cost=1)
+    fast_call = Runner("fast_call", packing_cost=1, forward_cost=4)
+    candidates = [fast_kernel, fast_call]
+    if reverse_candidates:
+        candidates.reverse()
+    layer = MoELayer.__new__(MoELayer)
+    layer.tuner = SimpleNamespace(
+        choose_one=lambda *, runners, **kwargs: (runners[0], tactic)
+    )
+
+    winner, selected_tactic = layer._select_winner(activations, weights, candidates)
+
+    assert winner is fast_call
+    assert selected_tactic == tactic
+    assert sorted(measured) == [[5, 5], [9, 9]]
+
+
 @sm100_required
 class TestUnifiedMoEDispatch:
     """Plumbing tests — invariants MoELayer must guarantee."""

@@ -32,11 +32,15 @@ def _build_graph(
     groups: int,
     op: str = "grouped_gemm1_swiglu",
     dtype: str = "bf16",
+    *,
+    quantize_output: bool = False,
 ):
     import cudnn
 
     if dtype not in ("bf16", "mxfp8", "nvfp4", "mxfp8_mxfp4"):
         raise ValueError(f"unsupported export dtype {dtype!r}")
+    if quantize_output and (dtype == "bf16" or op == "grouped_gemm2"):
+        raise ValueError("output quantization requires a block-scaled FC1")
     if dtype != "bf16" and (n % 128 or k % 128):
         raise ValueError(f"{dtype.upper()} export requires N and K divisible by 128")
     token_type, weight_type = {
@@ -211,7 +215,36 @@ def _build_graph(
     if up_out is not None:
         activated = graph.mul(a=activated, b=up_out, name="gated_activation")
     output = graph.mul(a=activated, b=scale, name="scale_output")
-    output.set_data_type(cudnn.data_type.BFLOAT16).set_output(True)
+    # Preserve the BF16 rounding of the materialized FC1 before quantization.
+    output.set_data_type(cudnn.data_type.BFLOAT16)
+    if not quantize_output:
+        output.set_output(True)
+        return graph
+    if dtype == "nvfp4":
+        quant_scale = graph.tensor(
+            name="quant_scale",
+            dim=[1, 1, 1],
+            stride=[1, 1, 1],
+            data_type=cudnn.data_type.FLOAT,
+        )
+        output = graph.mul(a=output, b=quant_scale, name="apply_quant_scale")
+    quantized, scales = graph.block_scale_quantize(
+        input=output,
+        block_size=block_size,
+        axis=-1,
+        group_offset=offsets,
+        name="quantize_output",
+    )
+    quantized.set_data_type(token_type).set_output(True)
+    active = min(s, groups)
+    scale_rows = 128 * (active + (s - active) // 128)
+    scale_cols = n // block_size
+    scales.set_dim([1, scale_rows, scale_cols]).set_stride(
+        [scale_rows * scale_cols, scale_cols, 1]
+    )
+    scales.set_data_type(
+        cudnn.data_type.FP8_E4M3 if dtype == "nvfp4" else cudnn.data_type.FP8_E8M0
+    ).set_reordering_type(cudnn.tensor_reordering.F8_128x4).set_output(True)
     return graph
 
 
@@ -308,6 +341,16 @@ def _export_source(
         from .source_template import extract_template
 
         source, parameters = extract_template(source, swap_ab=swap_ab)
+        constants = dict(parameters["constants"])
+        if (
+            constants.get("epi_store_dtype")
+            in ("cutlass.Float4E2M1FNx2", "cutlass.Float8E4M3FN")
+            and constants.get("n_tma_outputs") == "1"
+            and constants.get("epi_chunk_elems") != "32"
+        ):
+            raise ValueError(
+                "quantized TMA source templates require a 32-element epilogue"
+            )
     digest = hashlib.sha256(source.encode()).hexdigest()
     # One maintained implementation per family. A producer upgrade replaces the
     # family explicitly; it must not silently add another historical template.
@@ -403,7 +446,19 @@ def export_one(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("CUTE_DSL_ARCH must match the export GPU architecture")
     op = getattr(args, "op", "grouped_gemm1_swiglu")
     dtype = getattr(args, "dtype", "bf16")
-    graph = _build_graph(args.s, args.n, args.k, args.experts, args.groups, op, dtype)
+    quantize_output = getattr(args, "quantize_output", False)
+    if quantize_output and (dtype == "bf16" or config.swap_ab):
+        raise ValueError("fused output quantization requires normal block-scaled FC1")
+    graph = _build_graph(
+        args.s,
+        args.n,
+        args.k,
+        args.experts,
+        args.groups,
+        op,
+        dtype,
+        quantize_output=quantize_output,
+    )
     with force_stg_epi(args.store_mode == "stg"):
         compiled = _compile_graph(graph, config, args.cta_group, args.scheduler)
     return _export_compiled(args, compiled, config, arch)
@@ -415,6 +470,7 @@ def _export_compiled(args, compiled, config, arch):
         raise ValueError("exported CTA group must match the rendered tile config")
     op = getattr(args, "op", "grouped_gemm1_swiglu")
     dtype = getattr(args, "dtype", "bf16")
+    quantize_output = getattr(args, "quantize_output", False)
     swap_ab = getattr(config, "swap_ab", False)
     activation = (
         op.removeprefix("grouped_gemm1_") if op != "grouped_gemm2" else "identity"
@@ -427,7 +483,16 @@ def _export_compiled(args, compiled, config, arch):
     if compiled.chain.has_block_scale != (dtype != "bf16"):
         raise RuntimeError("cuDNN Frost compiled the wrong quantization pipeline")
     store_modes = tuple(compiled.store_modes)
-    if len(store_modes) != 1 or store_modes[0] not in ("stg", "tma"):
+    if quantize_output:
+        valid_store = (
+            dtype != "bf16"
+            and not swap_ab
+            and op != "grouped_gemm2"
+            and store_modes in (("stg", "stg"), ("tma", "stg"))
+        )
+    else:
+        valid_store = len(store_modes) == 1 and store_modes[0] in ("stg", "tma")
+    if not valid_store:
         raise RuntimeError(
             f"unexpected cuDNN Frost output store modes: {store_modes!r}"
         )
@@ -441,7 +506,7 @@ def _export_compiled(args, compiled, config, arch):
     artifact_id = args.id or _slug(
         f"{prefix}_{arch}_e{args.experts}_n{args.n}_k{args.k}_"
         f"g{args.groups}_{config.name}_{args.cta_group}cta_{args.scheduler}_"
-        f"{actual_store_mode}"
+        f"{actual_store_mode}{'_quantized' if quantize_output else ''}"
     )
     output_dir = args.output_dir.resolve()
     source = _export_source(
@@ -449,12 +514,18 @@ def _export_compiled(args, compiled, config, arch):
         output_dir,
         artifact_id,
         replace=args.replace,
-        template_family=f"{op}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
+        template_family=f"{op}{'_quantized' if quantize_output else ''}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
         swap_ab=swap_ab,
     )
     tma_slots: frozenset[int] = getattr(compiled, "tma_slots", frozenset())
     aux_names = [aux.name for aux in compiled.chain.aux_tensors]
     launch_tail = aux_names + ["output"] if 0 in tma_slots else ["output"] + aux_names
+    if quantize_output:
+        launch_tail = (
+            ["output_scale"] + aux_names + ["output"]
+            if 0 in tma_slots
+            else ["output", "output_scale"] + aux_names
+        )
     expected_aux = (
         {"scale", "gate_scale", "linear_scale"} if activation == "situ" else {"scale"}
     )
@@ -462,6 +533,8 @@ def _export_compiled(args, compiled, config, arch):
         expected_aux |= {"gate_alpha"}
         if is_gated(activation):
             expected_aux |= {"up_alpha"}
+    if quantize_output and dtype == "nvfp4":
+        expected_aux.add("quant_scale")
     if op != "grouped_gemm2" and set(aux_names) != expected_aux:
         raise RuntimeError(f"Unexpected FC1 auxiliary tensors: {aux_names}")
     if op == "grouped_gemm2":
@@ -477,7 +550,7 @@ def _export_compiled(args, compiled, config, arch):
         "id": artifact_id,
         "op": prefix,
         "arch": arch,
-        "abi": f"cudnn_frost_{prefix}{'_swap_ab' if swap_ab else ''}_v1",
+        "abi": f"cudnn_frost_{prefix}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}_v1",
         "source": source,
         "workspace_bytes": int(compiled.workspace_bytes),
         "launch": {"tail": launch_tail},
@@ -489,8 +562,17 @@ def _export_compiled(args, compiled, config, arch):
             "groups": args.groups,
             "token_dtype": token_dtype,
             "weight_dtype": weight_dtype,
-            "output_dtype": "bfloat16",
+            "output_dtype": token_dtype if quantize_output else "bfloat16",
             "activation": activation,
+            **(
+                {
+                    "intermediate_dtype": "bfloat16",
+                    "output_scale_layout": "segmented_F8_128x4",
+                    **({"quant_scale_dtype": "float32"} if dtype == "nvfp4" else {}),
+                }
+                if quantize_output
+                else {}
+            ),
             **(
                 {
                     "scale_dtype": (
@@ -555,7 +637,10 @@ def _write_manifest(output_dir: Path, kernel: dict[str, Any], replace: bool) -> 
         kernels[old] = kernel
     else:
         kernels.append(kernel)
-    payload["kernels"] = sorted(kernels, key=lambda item: item["id"])
+    payload["kernels"] = sorted(
+        kernels,
+        key=lambda item: (item["contract"]["output_dtype"] != "bfloat16", item["id"]),
+    )
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
     temporary.replace(path)
@@ -591,6 +676,11 @@ def main() -> None:
     parser.add_argument("--experts", type=int, required=True)
     parser.add_argument("--groups", type=int, help="defaults to --experts")
     parser.add_argument("--replace", action="store_true")
+    parser.add_argument(
+        "--quantize-output",
+        action="store_true",
+        help="fuse BF16 rounding and output quantization into normal block-scaled FC1",
+    )
     args = parser.parse_args()
     if args.groups is None:
         args.groups = args.experts
