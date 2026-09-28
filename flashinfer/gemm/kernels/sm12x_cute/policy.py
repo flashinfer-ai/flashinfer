@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Admission for independent and persistent ping-pong NVFP4 kernels."""
 
-VERSION = "sm12x_cute_nvfp4_v3"
+VERSION = "sm12x_cute_nvfp4_v4"
 SMALL = ("independent",)
 TMA = ("independent_tma",)
 RAW_TACTICS = (

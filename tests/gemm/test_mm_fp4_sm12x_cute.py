@@ -445,6 +445,7 @@ def test_public_rejects_tail_scales_without_physical_n_padding():
         (1024, 5120, 17408),
         (2048, 34816, 5120),
         (2048, 5120, 17408),
+        (4096, 34816, 5120),
         (8192, 34816, 5120),
         (4096, 5120, 17408),
         (8192, 5120, 17408),
@@ -558,3 +559,56 @@ def test_compile_cache_binds_input_device_capability(monkeypatch):
         (64, 34816, 5120, tactic, (12, 1)),
         (64, 34816, 5120, tactic, (12, 0)),
     ]
+
+
+@pytest.mark.parametrize(
+    "rows,n,k,tactic",
+    [
+        ((2, 3, 5, 7), 192, 320, policy.SMALL),
+        ((17, 19, 23), 256, 512, policy.SMALL),
+        ((33, 35, 39), 256, 512, policy.SMALL),
+        ((65, 129, 373), 192, 320, policy.SMALL),
+        ((33, 47, 63), 256, 512, policy.TMA),
+        ((65, 79, 127), 256, 512, policy.TMA),
+        ((129, 173, 373), 256, 512, policy.TMA),
+        ((35, 65, 129), 192, 320, policy.TMA),
+        *((((128, 256, 384), 512, 512, t)) for t in policy.RAW_TACTICS),
+    ],
+)
+def test_compiled_kernel_reuses_unseen_m_in_graph(monkeypatch, rows, n, k, tactic):
+    """Capture unseen row counts with a warm configuration and replay new inputs."""
+    from flashinfer.gemm.kernels.sm12x_cute import runner as native
+
+    monkeypatch.setattr(native, "_COMPILED", {})
+    runner = get_runner()
+
+    def forbid_compile(*args, **kwargs):
+        pytest.fail("An unseen M in the same configuration must reuse the kernel")
+
+    for index, m in enumerate(rows):
+        _, operands = make_inputs(m, n, k, 42)
+        alpha = torch.tensor([1.25], device="cuda", dtype=torch.float32)
+        out = torch.empty((m, n), device="cuda", dtype=torch.bfloat16)
+        inputs = [*operands, alpha, out.dtype, out, 16, True, None]
+        torch.cuda.synchronize()
+        expected = mm_fp4(*operands, alpha, backend="cutlass")
+        if index == 0:
+            runner(inputs, tactic=tactic)
+            _assert_bits(out, expected)
+            monkeypatch.setattr(native, "_compile", forbid_compile)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            runner(inputs, tactic=tactic)
+        out.fill_(float("nan"))
+        graph.replay()
+        _assert_bits(out, expected)
+        _, changed = make_inputs(m, n, k, 123)
+        for live, update in zip(operands, changed, strict=True):
+            live.copy_(update)
+        alpha.fill_(-0.75)
+        torch.cuda.synchronize()
+        expected = mm_fp4(*operands, alpha, backend="cutlass")
+        out.fill_(float("nan"))
+        graph.replay()
+        _assert_bits(out, expected)
+        assert len(native._COMPILED) == 1

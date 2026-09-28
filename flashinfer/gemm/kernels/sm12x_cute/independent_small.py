@@ -119,11 +119,11 @@ def load_b2(src, *, loc=None, ip=None):
 
 
 class IndependentSmall:
-    def __init__(self, m, n, k):
-        self.m, self.n, self.k = m, n, k
-        self.tile_m = min(m, 64)
+    def __init__(self, n, k, tile_m, tile_k):
+        self.n, self.k = n, k
+        self.tile_m = tile_m
         self.rows = ((self.tile_m + 7) // 8) * 8
-        self.tile_k = 256 if 16 < m <= 32 else 512
+        self.tile_k = tile_k
         self.words = self.tile_k // 8
         self.groups = self.tile_k // 64
         self.vectors = self.tile_k // 32
@@ -159,7 +159,7 @@ class IndependentSmall:
                 swizzled = word ^ ((row & 7) << 2)
                 src = Int32(0)
                 count = Int32(0)
-                if m0 + row < self.m:
+                if m0 + row < cute.size(a, mode=[0]):
                     if cutlass.const_expr(self.k % self.tile_k == 0):
                         src = (m0 + row) * (self.k // 8) + stage * self.words + word
                         count = Int32(16)
@@ -339,10 +339,10 @@ class IndependentSmall:
         scale = alpha[0]
         for mi in cutlass.range_constexpr(self.rows // 8):
             activation0 = m0 + mi * 8 + quarter * 2
-            if activation0 < self.m:
+            if activation0 < cute.size(a, mode=[0]):
                 out[activation0, weight0] = (acc[mi, 0] * scale).to(cutlass.BFloat16)
                 out[activation0, weight1] = (acc[mi, 2] * scale).to(cutlass.BFloat16)
-            if activation0 + 1 < self.m:
+            if activation0 + 1 < cute.size(a, mode=[0]):
                 out[activation0 + 1, weight0] = (acc[mi, 1] * scale).to(
                     cutlass.BFloat16
                 )
@@ -362,7 +362,11 @@ class IndependentSmall:
         stream: cuda.CUstream,
     ):
         self.kernel(a, b, sfa, sfb, alpha, out).launch(
-            grid=(self.n // 64, (self.m + self.tile_m - 1) // self.tile_m, 1),
+            grid=(
+                self.n // 64,
+                cute.ceil_div(cute.size(a, mode=[0]), self.tile_m),
+                1,
+            ),
             block=(128, 1, 1),
             smem=self.smem_bytes,
             stream=stream,

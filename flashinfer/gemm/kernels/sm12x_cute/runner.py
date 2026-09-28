@@ -74,6 +74,42 @@ def check_requirement(a, b, sfa, sfb, alpha, dtype, out, block_size, nvfp4, sf8)
     return True
 
 
+def _compile_config(m, n, k, tactic, compute_capability):
+    """Bound specialization by tile configuration, retaining hot decode schedules."""
+    family = tactic[0]
+    if family == "independent":
+        fixed_m = m if m in (1, 4, 8, 16) else 0
+        tile_m = fixed_m or min((m + 7) // 8 * 8, 64)
+        return fixed_m, tile_m, 256 if 16 < m <= 32 else 512
+    if family == "independent_tma":
+        return (
+            0,
+            64 if m <= 64 and k % 256 == 0 else 128,
+            256 if m <= 128 and k % 256 == 0 else 128,
+        )
+    extra_stage = (
+        compute_capability == (12, 1)
+        and m in (4096, 8192)
+        and (n, k) == (5120, 17408)
+        and tactic == ("raw", 64, 32, 8, False, True)
+    )
+    registers = compute_capability == (12, 1) and (
+        (
+            (m, n, k) == (256, 9216, 7168)
+            and tactic == ("raw", 64, 32, 2, False, True, 256, True)
+        )
+        or (
+            (m, n, k) == (512, 8192, 2048)
+            and tactic == ("raw", 64, 32, 4, False, True, 256, True)
+        )
+        or (
+            (m, n, k) == (512, 7168, 5120)
+            and tactic == ("raw", 64, 32, 8, False, True, 256, False)
+        )
+    )
+    return extra_stage, extra_stage and m == 8192, registers
+
+
 def _compile(m, n, k, tactic, *, compute_capability=None):
     import cutlass
     import cutlass.cute as cute
@@ -84,44 +120,52 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
     from . import blockscaled_gemm_dispatch, raw
 
     family = tactic[0]
+    config = _compile_config(m, n, k, tactic, compute_capability)
     if family in ("independent", "independent_tma"):
         from . import independent_small, independent_tma
 
         small = family == "independent"
         module = independent_small if small else independent_tma
+        fixed_m, tile_m, tile_k = config
         op = (
-            module.IndependentSmall(m, n, k)
+            module.IndependentSmall(n, k, tile_m, tile_k)
             if small
-            else module.IndependentMedium(m, n, k)
+            else module.IndependentMedium(n, k, tile_m, tile_k)
         )
+        rows_m = fixed_m or cute.sym_int()
         scalar = cutlass.Int32 if small else cutlass.Uint8
         divisor = 8 if small else 2
         operands = [
             cute.runtime.make_fake_compact_tensor(
                 scalar, (rows, k // divisor), stride_order=(1, 0), assumed_align=32
             )
-            for rows in (m, n)
+            for rows in (rows_m, n)
         ]
         operands += [
             cute.runtime.make_fake_compact_tensor(
                 cutlass.Int32,
-                (((rows + 127) // 128) * 128 * (k // 64),),
+                (extent,),
                 assumed_align=16,
             )
-            for rows in (m, n)
+            for extent in (
+                ((fixed_m + 127) // 128) * 128 * (k // 64)
+                if fixed_m
+                else cute.sym_int(),
+                ((n + 127) // 128) * 128 * (k // 64),
+            )
         ]
         operands += [
             cute.runtime.make_fake_compact_tensor(
                 cutlass.Float32, (1,), assumed_align=4
             ),
             cute.runtime.make_fake_compact_tensor(
-                cutlass.BFloat16, (m, n), stride_order=(1, 0), assumed_align=16
+                cutlass.BFloat16, (rows_m, n), stride_order=(1, 0), assumed_align=16
             ),
         ]
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         return build_and_load_cute_dsl_kernel(
             f"{policy.VERSION}_{family}",
-            f"m{m}_n{n}_k{k}",
+            f"m{fixed_m}_tm{tile_m}_tk{tile_k}_n{n}_k{k}",
             lambda: cute.compile(
                 op.launch if small else op,
                 *operands,
@@ -145,7 +189,7 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
             _, epi_m, epi_n, swizzle, elected, raster_m, tile_k, internal_swap = tactic
         else:
             raise ValueError("Invalid SM12x raw tactic")
-        kernel_m, kernel_n = (n, m) if internal_swap else (m, n)
+        extra_stage, half_stage, register_redistribution = config
         gemm = raw.Sm120BlockScaledGemmKernel(
             cutlass.Float32,
             16,
@@ -154,33 +198,8 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
             swizzle_size=swizzle,
             elected_release=elected,
             raster_along_m=raster_m,
-            half_stage_wait=(
-                compute_capability == (12, 1)
-                and m == 8192
-                and (n, k) == (5120, 17408)
-                and tactic == ("raw", 64, 32, 8, False, True)
-            ),
-            extra_mainloop_stage=(
-                compute_capability == (12, 1)
-                and m in (4096, 8192)
-                and (n, k) == (5120, 17408)
-                and tactic == ("raw", 64, 32, 8, False, True)
-            ),
-        )
-
-        register_redistribution = compute_capability == (12, 1) and (
-            (
-                (m, n, k) == (256, 9216, 7168)
-                and tactic == ("raw", 64, 32, 2, False, True, 256, True)
-            )
-            or (
-                (m, n, k) == (512, 8192, 2048)
-                and tactic == ("raw", 64, 32, 4, False, True, 256, True)
-            )
-            or (
-                (m, n, k) == (512, 7168, 5120)
-                and tactic == ("raw", 64, 32, 8, False, True, 256, False)
-            )
+            half_stage_wait=half_stage,
+            extra_mainloop_stage=extra_stage,
         )
         if register_redistribution:
             gemm.load_register_requirement = 24
@@ -207,6 +226,8 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
                 stream,
                 swap_ab: cutlass.Constexpr = False,
             ):
+                live_m = cute.size(a, mode=[0])
+                kernel_m, kernel_n = (n, live_m) if internal_swap else (live_m, n)
                 ap = cute.recast_ptr(a.iterator, dtype=cutlass.Float4E2M1FN)
                 bp = cute.recast_ptr(b.iterator, dtype=cutlass.Float4E2M1FN)
                 self.gemm(
@@ -230,7 +251,9 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
                         out.iterator,
                         cute.make_layout(
                             (kernel_m, kernel_n, 1),
-                            stride=(1, n, m * n) if internal_swap else (n, 1, m * n),
+                            stride=(1, n, live_m * n)
+                            if internal_swap
+                            else (n, 1, live_m * n),
                         ),
                     ),
                     alpha,
@@ -240,7 +263,7 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
 
         kernel = Adapter()
         shape_name = (
-            f"m{m}_n{n}_k{k}_"
+            f"dynamic_n{n}_k{k}_"
             f"ab5{int(gemm.extra_mainloop_stage)}_half{int(gemm.half_stage_wait)}_"
         )
         if register_redistribution:
@@ -317,9 +340,9 @@ class Sm12xCuTeFp4GemmRunner(TunableRunner):
     def _get_compiled(self, inputs, tactic):
         a, b = inputs[:2]
         m, n, k = a.shape[0], b.shape[1], a.shape[1] * 2
-        shape = (m, n, k)
         compute_capability = get_compute_capability(a.device)
-        key = (get_device_index(a.device), compute_capability, tactic, shape)
+        config = _compile_config(m, n, k, tactic, compute_capability)
+        key = (get_device_index(a.device), compute_capability, tactic, n, k, config)
         if key not in _COMPILED:
             if torch.cuda.is_current_stream_capturing():
                 raise RuntimeError(

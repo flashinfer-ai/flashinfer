@@ -169,13 +169,13 @@ def store_bf16_eight(dst, p0, p1, p2, p3, *, loc=None, ip=None):
 
 
 class IndependentMedium:
-    def __init__(self, m, n, k):
-        self.m, self.n, self.k = m, n, k
-        self.tile_m = 64 if m <= 64 and k % 256 == 0 else 128
+    def __init__(self, n, k, tile_m, tile_k):
+        self.n, self.k = n, k
+        self.tile_m = tile_m
         self.tile_n = self.tile_m
         self.mi = self.tile_m // 32
         self.threads = 64 * (self.tile_n // 32)
-        self.tile_k = 256 if m <= 128 and k % 256 == 0 else 128
+        self.tile_k = tile_k
         self.words = self.tile_k // 8
         self.groups = self.tile_k // 64
         self.swizzle_bits = 2 if self.tile_k == 128 else 3
@@ -220,7 +220,7 @@ class IndependentMedium:
         )
         self.kernel(atom_a, ta, atom_b, tb, sfa, sfb, alpha, out, la, lb).launch(
             grid=(
-                (self.m + self.tile_m - 1) // self.tile_m,
+                cute.ceil_div(cute.size(out, mode=[0]), self.tile_m),
                 (self.n + self.tile_n - 1) // self.tile_n,
                 1,
             ),
@@ -460,5 +460,5 @@ class IndependentMedium:
                 p0, p1, p2, p3 = transpose4(p0, p1, p2, p3, lane)
                 row = m0 + wm + mi * 16 + group + pair * 8
                 col = n0 + wn + t * 8
-                if row < self.m and col + 7 < self.n:
+                if row < cute.size(out, mode=[0]) and col + 7 < self.n:
                     store_bf16_eight(out.iterator + row * self.n + col, p0, p1, p2, p3)
