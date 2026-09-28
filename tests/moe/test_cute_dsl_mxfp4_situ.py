@@ -2120,13 +2120,13 @@ def test_moe_sort_mixed_lists_match_dispatch(
         assert len(narrow_ref) > 0
     assert (lists[active_list][len(wide_ref) :] == -7).all()
     assert (lists["narrow_list"][len(narrow_ref) :] == -7).all()
-    # Every window lies inside its expert's rows of the base list (the swap
-    # kernel reads the expert at the window's first 128-row group and the
-    # bound at its last).
+    # Every window lies inside its expert's rows of the chosen list (the swap
+    # kernel reads the expert at the window's first group of that tile and
+    # the bound at its last).
     for start in lists["narrow_list"][: len(narrow_ref)].tolist():
-        first = start * row_unit // group_rows
-        last = (start * row_unit + narrow_tile - 1) // group_rows
-        assert last < n_base and expert[first] == expert[last]
+        first = start * row_unit // rows
+        last = (start * row_unit + narrow_tile - 1) // rows
+        assert last < len(expert) and expert[first] == expert[last]
         assert start * row_unit < limit[last]
 
 
