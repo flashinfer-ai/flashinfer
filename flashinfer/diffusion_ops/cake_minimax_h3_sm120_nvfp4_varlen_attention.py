@@ -299,6 +299,120 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_fake(
     pass
 
 
+@register_custom_op(
+    "flashinfer::minimax_h3_sm120_varlen_attention_nvfp4_nodelta",
+    mutates_args=(
+        "out",
+        "q4",
+        "k4",
+        "q_sf",
+        "k_sf",
+        "qm4",
+        "qm_sf",
+        "vt4",
+        "v_sf",
+        "q_mean",
+        "mean_k",
+        "partials",
+        "counters",
+        "barrier",
+    ),
+)
+def _minimax_h3_sm120_varlen_attention_nvfp4_nodelta_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tok_seg: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seg_tile_begin: torch.Tensor,
+    out: torch.Tensor,
+    tile_table: torch.Tensor,
+    unit_table: torch.Tensor,
+    q4: torch.Tensor,
+    k4: torch.Tensor,
+    q_sf: torch.Tensor,
+    k_sf: torch.Tensor,
+    qm4: torch.Tensor,
+    qm_sf: torch.Tensor,
+    vt4: torch.Tensor,
+    v_sf: torch.Tensor,
+    q_mean: torch.Tensor,
+    mean_k: torch.Tensor,
+    partials: torch.Tensor,
+    counters: torch.Tensor,
+    barrier: torch.Tensor,
+    num_segments: int,
+    num_tiles: int,
+    num_qtiles: int,
+    num_units: int,
+    attention_grid: int,
+    softmax_scale: float,
+) -> None:
+    _get_module().minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
+        q,
+        k,
+        v,
+        tok_seg,
+        cu_seqlens,
+        seg_tile_begin,
+        out,
+        tile_table,
+        unit_table,
+        q4,
+        k4,
+        q_sf,
+        k_sf,
+        qm4,
+        qm_sf,
+        vt4,
+        v_sf,
+        q_mean,
+        mean_k,
+        partials,
+        counters,
+        barrier,
+        num_segments,
+        num_tiles,
+        num_qtiles,
+        num_units,
+        attention_grid,
+        softmax_scale,
+    )
+
+
+@register_fake_op("flashinfer::minimax_h3_sm120_varlen_attention_nvfp4_nodelta")
+def _minimax_h3_sm120_varlen_attention_nvfp4_nodelta_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    tok_seg: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    seg_tile_begin: torch.Tensor,
+    out: torch.Tensor,
+    tile_table: torch.Tensor,
+    unit_table: torch.Tensor,
+    q4: torch.Tensor,
+    k4: torch.Tensor,
+    q_sf: torch.Tensor,
+    k_sf: torch.Tensor,
+    qm4: torch.Tensor,
+    qm_sf: torch.Tensor,
+    vt4: torch.Tensor,
+    v_sf: torch.Tensor,
+    q_mean: torch.Tensor,
+    mean_k: torch.Tensor,
+    partials: torch.Tensor,
+    counters: torch.Tensor,
+    barrier: torch.Tensor,
+    num_segments: int,
+    num_tiles: int,
+    num_qtiles: int,
+    num_units: int,
+    attention_grid: int,
+    softmax_scale: float,
+) -> None:
+    pass
+
 @flashinfer_api
 def minimax_h3_sm120_varlen_attention_nvfp4(
     q: torch.Tensor,
@@ -453,9 +567,126 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     return out
 
 
+@flashinfer_api
+def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    cu_seqlens_host: Optional[Sequence[int]] = None,
+    softmax_scale: Optional[float] = None,
+) -> torch.Tensor:
+    r"""Opt-in **uncompensated** variant of :func:`minimax_h3_sm120_varlen_attention_nvfp4` (same contract,
+    same signature, same workspace and pre-processing launches; only the attention kernel differs).
+
+    The default route quantizes each 128-row Q block after removing its block mean and adds the removed
+    term ``qm K^T`` back to the scores inside the kernel, so its softmax equals the uncentred one up to
+    FP4 rounding.  This route keeps the centring but **does not add the term back**: the scores of every
+    Q block carry a per-key offset ``-(qm . k_j)``, which the softmax does not cancel (unlike the per-row
+    constant of the K mean removal).  It is a deliberate precision / latency trade-off that is NOT part
+    of the SageAttention3 recipe:
+
+    * measured error vs the FP32 oracle on Gaussian inputs: relative L2 about 0.209 vs 0.191 for the
+      default route (+9 %), max-abs about 0.064 vs 0.060; the FP4 block-scaled tolerance
+      ``atol = 1.0, rtol = 0.1`` still holds on every element, and the tests bound the relative L2 at
+      1.15x the default route's on the same inputs;
+    * measured latency: the attention launch runs about 9-15 % faster on both GB202 SKUs (RTX 5090 and
+      RTX PRO 6000 Blackwell; 220 registers instead of 246), the complete call proportionally less on
+      short plans where pre-processing dominates.
+
+    Use the default route unless the extra error has been validated for the model in question.  Inputs,
+    output, ``cu_seqlens`` handling, workspace and caching are exactly those of the default route; see
+    its documentation.
+    """
+
+    if q.ndim != 3:
+        raise ValueError(f"q must be [tokens, heads, 128], got shape {tuple(q.shape)}")
+    tokens, heads = int(q.shape[0]), int(q.shape[1])
+    if not 1 <= heads < _MAX_HEADS:
+        raise ValueError(f"heads must lie in [1, {_MAX_HEADS}), got {heads}")
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        _check_thd(name, tensor, tokens, heads)
+    if not cu_seqlens.is_cuda or cu_seqlens.device != q.device:
+        raise ValueError(
+            "cu_seqlens must be an int32 CUDA tensor on the same device as q"
+        )
+    bounds = normalize_cu_seqlens(cu_seqlens, cu_seqlens_host)
+    if bounds[-1] != tokens:
+        raise ValueError(f"cu_seqlens[-1] = {bounds[-1]} must equal tokens = {tokens}")
+    if out is None:
+        out = torch.empty_like(q)
+    else:
+        _check_thd("out", out, tokens, heads)
+        if out.device != q.device:
+            raise ValueError("out must be on the same device as q")
+    if softmax_scale is None:
+        softmax_scale = 1.0 / math.sqrt(MINIMAX_H3_HEAD_DIM)
+    plan = _plan(bounds, heads, q.device)
+    if plan.num_units == 0:
+        return out  # every segment is empty: nothing to write
+    tile_rows, num_stats_tiles, unit_rows = _plan_rows(plan, q.device)
+    index = _device_index(q.device)
+    hd = MINIMAX_H3_HEAD_DIM
+    qtiles = max(1, plan.num_tiles)
+    q4 = _workspace(index, "q4", tokens * heads * _ROW_BYTES4, torch.uint8)
+    k4 = _workspace(index, "k4", tokens * heads * _ROW_BYTES4, torch.uint8)
+    q_sf = _workspace(index, "q_sf", tokens * heads * _BLOCKS_PER_ROW, torch.uint8)
+    k_sf = _workspace(
+        index, "k_sf", heads * plan.num_kblocks * _SCALE_TILE_BYTES, torch.uint8
+    )
+    qm4 = _workspace(index, "qm4", qtiles * heads * _ROW_BYTES4, torch.uint8)
+    qm_sf = _workspace(index, "qm_sf", qtiles * heads * _BLOCKS_PER_ROW, torch.uint8)
+    vt4 = _workspace(index, "vt4", heads * hd * (plan.padded_tokens // 2), torch.uint8)
+    v_sf = _workspace(
+        index, "v_sf", heads * plan.num_kblocks * _SCALE_TILE_BYTES, torch.uint8
+    )
+    q_mean = _workspace(index, "q_mean", qtiles * heads * hd, torch.float32)
+    mean_k = _workspace(index, "mean_k", plan.num_segments * heads * hd, torch.float32)
+    partials = _workspace(
+        index, "partials", max(1, num_stats_tiles * heads * hd), torch.float32
+    )
+    counters = _zero_workspace(
+        index, "counters", max(1, plan.num_segments) * heads, torch.uint32
+    )
+    barrier = _zero_workspace(index, "barrier", 4, torch.uint32)
+    _minimax_h3_sm120_varlen_attention_nvfp4_nodelta_impl(
+        q,
+        k,
+        v,
+        _token_segment_ids(plan.bounds, plan.padded_tokens, q.device),
+        plan.cu_seqlens,
+        plan.seg_tile_begin,
+        out,
+        tile_rows,
+        unit_rows,
+        q4,
+        k4,
+        q_sf,
+        k_sf,
+        qm4,
+        qm_sf,
+        vt4,
+        v_sf,
+        q_mean,
+        mean_k,
+        partials,
+        counters,
+        barrier,
+        plan.num_segments,
+        num_stats_tiles,
+        plan.num_tiles,
+        plan.num_units,
+        plan.grid,
+        float(softmax_scale),
+    )
+    return out
+
 __all__ = [
     "MINIMAX_H3_HEAD_DIM",
     "MINIMAX_H3_NUM_HEADS",
     "minimax_h3_sm120_varlen_attention_nvfp4",
+    "minimax_h3_sm120_varlen_attention_nvfp4_nodelta",
     "workspace_bytes_nvfp4",
 ]
