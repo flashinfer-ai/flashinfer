@@ -29,11 +29,14 @@ limitations under the License.
 # * ``K1``  Lamport all-reduce of ``routed_partial`` fused with KimiRMSNorm ->
 #   the normalised latent ``y`` on every rank (one-shot for ``M <= 16``, the
 #   token-sliced two-shot form above);
-# * ``K2``  cuBLAS (``torch.mm``) on this rank's contiguous 640 / 512-row slice
-#   of ``up_weight`` (``7168 = 8 x 640 + 4 x 512``: 7168 is not divisible by 12);
+# * ``K2``  the up-projection of ``y`` with this rank's contiguous 640 / 512-row
+#   slice of ``up_weight`` (``7168 = 8 x 640 + 4 x 512``: 7168 is not divisible
+#   by 12): the generated K2-stream kernel (SIMT weight streaming, fp32 slice)
+#   for ``M <= K2_STREAM_MAX_TOKENS``, cuBLAS (``torch.mm``, BF16) above;
 # * ``K3``  column reduce-scatter of ``shared_partial`` to the owner rank, add of
 #   the up-projection slice, one BF16 rounding, multicast all-gather into the
-#   caller-owned ``out``.
+#   caller-owned ``out``; one CTA per token below ``K3_PERSIST_MIN_TOKENS``, the
+#   persistent token pipeline (``min(M, SM count)`` CTAs per column half) above.
 #
 # The three Lamport workspaces are FlashInfer's own MNNVL all-reduce
 # workspaces (``MNNVLAllReduceFusionWorkspace``: three rotating symmetric
@@ -73,6 +76,17 @@ GROUPED_MAX_TOKENS = 256
 #: One 16-byte packet per thread covers one 3584-wide row (K1) or one 3584-wide half row (K3).
 THREADS = 448
 K3_GRID_Y = 2
+#: K3 runs the persistent token pipeline (``k3_persist:*``, grid ``(min(M, SM count), 2, 1)``: CTA ``b`` walks tokens
+#: ``b, b + P, ...`` scattering token ``t_k`` while reducing ``t_{k-1}`` and gathering ``t_{k-2}``) from this many tokens
+#: on; below it the one-CTA-per-token form (``k3:*``, grid ``(M, 2, 1)``) is faster.  Pinned by the round-4 A/B on both
+#: NVL72 racks (identical kernels, buffers, flags and numerics; only the CTA -> token mapping differs).
+K3_PERSIST_MIN_TOKENS = 256
+#: K2 runs the Cake SIMT weight-streaming slice GEMM (``k2_stream:n<cols>``: 128 CTAs x 448 threads stream the rank's
+#: 4.6 MB BF16 weight slice once from HBM, fp32 output) and K3 its fp32-add form (``k3_f32:grouped``) for
+#: ``M <= K2_STREAM_MAX_TOKENS``; above, K2 is cuBLAS (``torch.mm`` on the contiguous weight-row slice, BF16) and K3 the
+#: BF16 form.  Pinned by the round-4 paired A/B on both racks (-6 .. -11 % at M = 1, 2, 4; tie at 8; slower at 16).
+K2_STREAM_MAX_TOKENS = 4
+K2_STREAM_GRID_X = 128
 DEFAULT_MAX_TOKENS = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
@@ -103,13 +117,47 @@ def k1_kernel_key(num_tokens: int, rank: int) -> str:
     return f"k1_twoshot:{poll_schedule_for(num_tokens)}"
 
 
+def k2_form_for(num_tokens: int) -> str:
+    """``"stream"`` (Cake K2-stream kernel, fp32 slice) for ``num_tokens <= K2_STREAM_MAX_TOKENS``, else ``"cublas"``."""
+    return "stream" if num_tokens <= K2_STREAM_MAX_TOKENS else "cublas"
+
+
+def k2_kernel_key(num_tokens: int, rank: int) -> Optional[str]:
+    """The K2 kernel key of ``rank`` (its column width selects the module), or ``None`` when K2 is cuBLAS."""
+    if k2_form_for(num_tokens) == "stream":
+        return f"k2_stream:n{PARTITION[rank]}"
+    return None
+
+
+def k3_form_for(num_tokens: int) -> str:
+    """``"persist"`` (persistent token pipeline) for ``num_tokens >= K3_PERSIST_MIN_TOKENS``, else ``"lamport"``."""
+    return "persist" if num_tokens >= K3_PERSIST_MIN_TOKENS else "lamport"
+
+
 def k3_kernel_key(num_tokens: int) -> str:
-    return f"k3:{poll_schedule_for(num_tokens)}"
+    if k2_form_for(num_tokens) == "stream":
+        # fp32 GEMM slice from K2-stream: the fp32-add K3 (one-CTA-per-token, grouped poll schedule; M <= 4 < 256)
+        return f"k3_f32:{poll_schedule_for(num_tokens)}"
+    prefix = "k3_persist" if k3_form_for(num_tokens) == "persist" else "k3"
+    return f"{prefix}:{poll_schedule_for(num_tokens)}"
 
 
-def route_kernel_keys(num_tokens: int, rank: int) -> tuple[str, str]:
-    """``(K1 key, K3 key)`` the runtime launches for ``num_tokens`` on ``rank``."""
-    return k1_kernel_key(num_tokens, rank), k3_kernel_key(num_tokens)
+def k3_grid(num_tokens: int, sm_count: int) -> tuple[int, int, int]:
+    """Launch grid of K3 for ``num_tokens`` on a device with ``sm_count`` SMs (both forms, two column halves)."""
+    if not isinstance(sm_count, int) or sm_count <= 0:
+        raise ValueError(f"sm_count must be a positive integer, got {sm_count!r}")
+    if k3_form_for(num_tokens) == "persist":
+        return (min(num_tokens, sm_count), K3_GRID_Y, 1)
+    return (num_tokens, K3_GRID_Y, 1)
+
+
+def route_kernel_keys(num_tokens: int, rank: int) -> tuple[str, ...]:
+    """The kernel keys the runtime launches for ``num_tokens`` on ``rank``, in launch order: ``(K1, K3)`` when K2 is
+    cuBLAS, ``(K1, K2, K3)`` when K2 is the Cake K2-stream kernel (``num_tokens <= K2_STREAM_MAX_TOKENS``)."""
+    k2 = k2_kernel_key(num_tokens, rank)
+    if k2 is None:
+        return k1_kernel_key(num_tokens, rank), k3_kernel_key(num_tokens)
+    return k1_kernel_key(num_tokens, rank), k2, k3_kernel_key(num_tokens)
 
 
 def workspace_buffer_bytes(max_tokens: int) -> dict[str, int]:
@@ -206,6 +254,9 @@ class KimiK3Tp12TailWorkspace:
         if device.index is not None:
             torch.cuda.set_device(device.index)
         self.device = torch.device("cuda", torch.cuda.current_device())
+        # persistent K3 grid: one CTA per SM and column half (the Cake runtime's default k3p_ctas)
+        props = torch.cuda.get_device_properties(self.device)
+        self.sm_count = int(props.multi_processor_count)
         self.rank = rank
         self.world_size = WORLD_SIZE
         self.max_tokens = int(max_tokens)
@@ -231,6 +282,12 @@ class KimiK3Tp12TailWorkspace:
             self.gemm = torch.empty(
                 (self.max_tokens, self.my_cols),
                 dtype=torch.bfloat16,
+                device=self.device,
+            )
+            # fp32 up-projection slice of the K2-stream route (M <= K2_STREAM_MAX_TOKENS)
+            self.gemm_f32 = torch.empty(
+                (min(self.max_tokens, K2_STREAM_MAX_TOKENS), self.my_cols),
+                dtype=torch.float32,
                 device=self.device,
             )
         except Exception:
@@ -300,7 +357,8 @@ class _Launch:
 class KimiK3Tp12TailRunner:
     """The prepared launch sequence of one fused tail call on one rank.
 
-    ``launch()`` submits K1, the cuBLAS up-projection slice and K3 in order on
+    ``launch()`` submits K1, the up-projection slice (the K2-stream kernel or
+    cuBLAS) and K3 in order on
     the current torch stream with no CUDA allocation and no host
     synchronisation; the kernels read every operand on device at launch, so
     the runner (or a CUDA Graph capturing it) replays for new values written
@@ -318,14 +376,21 @@ class KimiK3Tp12TailRunner:
     gemm: torch.Tensor
     up_weight_slice: torch.Tensor
     out: torch.Tensor
+    # Cake K2-stream kernel (M <= K2_STREAM_MAX_TOKENS); None = cuBLAS torch.mm
+    k2: Optional[_Launch] = None
 
     @property
-    def kernel_keys(self) -> tuple[str, str]:
-        return (self.k1.key, self.k3.key)
+    def kernel_keys(self) -> tuple[str, ...]:
+        """Generated-kernel keys in launch order (``(K1, K3)`` or ``(K1, K2, K3)``)."""
+        if self.k2 is None:
+            return (self.k1.key, self.k3.key)
+        return (self.k1.key, self.k2.key, self.k3.key)
 
     @property
-    def module_names(self) -> tuple[str, str]:
-        return (self.k1.module, self.k3.module)
+    def module_names(self) -> tuple[str, ...]:
+        if self.k2 is None:
+            return (self.k1.module, self.k3.module)
+        return (self.k1.module, self.k2.module, self.k3.module)
 
     @property
     def launch_count(self) -> int:
@@ -334,7 +399,10 @@ class KimiK3Tp12TailRunner:
     def launch(self) -> torch.Tensor:
         with tvm_ffi.use_torch_stream():
             self.k1()
-            torch.mm(self.y, self.up_weight_slice.t(), out=self.gemm)
+            if self.k2 is None:
+                torch.mm(self.y, self.up_weight_slice.t(), out=self.gemm)
+            else:
+                self.k2()
             self.k3()
         return self.out
 
@@ -402,11 +470,14 @@ def prepare_kimi_k3_tp12_tail(
         )
     arch = workspace.arch
     rank = workspace.rank
-    k1_key, k3_key = route_kernel_keys(M, rank)
+    keys = route_kernel_keys(M, rank)
+    k1_key, k3_key = keys[0], keys[-1]
+    k2_key = keys[1] if len(keys) == 3 else None
     k1_module = kernel_module_name(arch, k1_key)
     k3_module = kernel_module_name(arch, k3_key)
     y = workspace.y[:M]
-    gemm = workspace.gemm[:M]
+    # K3 reads the fp32 slice of the K2-stream kernel below K2_STREAM_MAX_TOKENS, cuBLAS's BF16 slice above
+    gemm = workspace.gemm_f32[:M] if k2_key is not None else workspace.gemm[:M]
     up_weight_slice = up_weight[
         workspace.my_col_begin : workspace.my_col_begin + workspace.my_cols
     ]
@@ -450,10 +521,22 @@ def prepare_kimi_k3_tp12_tail(
         my_cols=workspace.my_cols,
         gemm_plane_stride=M * workspace.my_cols,
         num_gemm_splits=1,
-        grid=(M, K3_GRID_Y, 1),
+        grid=k3_grid(M, workspace.sm_count),
     )
     k1_entry, k1_args = _bind(k1_module, k1_kwargs)
     k3_entry, k3_args = _bind(k3_module, k3_kwargs)
+    k2_launch = None
+    if k2_key is not None:
+        k2_module = kernel_module_name(arch, k2_key)
+        k2_kwargs: dict[str, Any] = dict(
+            y=y,
+            w_slice=up_weight_slice,
+            out=gemm,
+            num_tokens=M,
+            grid=(K2_STREAM_GRID_X, 1, 1),
+        )
+        k2_entry, k2_args = _bind(k2_module, k2_kwargs)
+        k2_launch = _Launch("k2", k2_key, k2_module, k2_kwargs, k2_entry, k2_args)
     return KimiK3Tp12TailRunner(
         num_tokens=M,
         rank=rank,
@@ -464,6 +547,7 @@ def prepare_kimi_k3_tp12_tail(
         gemm=gemm,
         up_weight_slice=up_weight_slice,
         out=out,
+        k2=k2_launch,
     )
 
 
@@ -471,6 +555,8 @@ __all__ = [
     "COL_BEGIN",
     "DEFAULT_MAX_TOKENS",
     "GROUPED_MAX_TOKENS",
+    "K2_STREAM_MAX_TOKENS",
+    "K3_PERSIST_MIN_TOKENS",
     "HIDDEN",
     "KERNELS",
     "KimiK3Tp12TailRunner",
@@ -486,6 +572,10 @@ __all__ = [
     "col_begin",
     "generated_program_available",
     "k1_kernel_key",
+    "k2_form_for",
+    "k2_kernel_key",
+    "k3_form_for",
+    "k3_grid",
     "k3_kernel_key",
     "poll_schedule_for",
     "prepare_kimi_k3_tp12_tail",

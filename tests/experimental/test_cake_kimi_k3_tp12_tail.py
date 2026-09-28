@@ -37,7 +37,7 @@ from flashinfer.experimental.kimi_k3_tp12_tail import cake_jit
 ATOL = RTOL = 1e-2
 SEED = 620
 # One-shot rows, two-shot grouped rows and one pinned row (M > 256).
-GPU_ROWS = (1, 8, 16, 32, 128, 300)
+GPU_ROWS = (1, 4, 8, 16, 32, 128, 256, 300)
 GPU_MAX_TOKENS = 512
 
 
@@ -52,22 +52,49 @@ def test_partition_covers_hidden_in_128_column_blocks():
 
 
 def test_route_selection_by_token_count():
-    for M in (1, 2, 8, 16):
+    # K2-stream regime: Cake SIMT slice GEMM (fp32) + fp32-add K3, module by the rank's column width
+    assert cb.K2_STREAM_MAX_TOKENS == 4
+    for M in (1, 2, 3, 4):
+        for rank in range(cb.WORLD_SIZE):
+            assert cb.route_kernel_keys(M, rank) == (
+                f"k1_oneshot:r{rank}",
+                f"k2_stream:n{cb.PARTITION[rank]}",
+                "k3_f32:grouped",
+            )
+    assert cb.k2_form_for(4) == "stream" and cb.k2_form_for(5) == "cublas"
+    assert cb.k2_kernel_key(4, 0) == "k2_stream:n640"
+    assert cb.k2_kernel_key(4, 11) == "k2_stream:n512"
+    assert cb.k2_kernel_key(5, 0) is None
+    for M in (5, 8, 16):
         for rank in range(cb.WORLD_SIZE):
             assert cb.route_kernel_keys(M, rank) == (
                 f"k1_oneshot:r{rank}",
                 "k3:grouped",
             )
-    for M in (17, 32, 128, 256):
+    for M in (17, 32, 128, 255):
         assert cb.route_kernel_keys(M, 3) == ("k1_twoshot:grouped", "k3:grouped")
+    # persistent K3 pipeline from K3_PERSIST_MIN_TOKENS on (the poll schedule still follows M)
+    assert cb.K3_PERSIST_MIN_TOKENS == 256
+    assert cb.route_kernel_keys(256, 3) == ("k1_twoshot:grouped", "k3_persist:grouped")
     for M in (257, 512, 4096):
-        assert cb.route_kernel_keys(M, 3) == ("k1_twoshot:pinned", "k3:pinned")
+        assert cb.route_kernel_keys(M, 3) == ("k1_twoshot:pinned", "k3_persist:pinned")
+    assert cb.k3_form_for(255) == "lamport" and cb.k3_form_for(256) == "persist"
+    assert cb.k3_grid(255, 152) == (255, 2, 1)
+    assert cb.k3_grid(256, 152) == (152, 2, 1)
+    assert cb.k3_grid(100, 152) == (100, 2, 1)
+    assert cb.k3_grid(4096, 148) == (148, 2, 1)
+    with pytest.raises(ValueError):
+        cb.k3_grid(4096, 0)
     assert set(cake_jit.required_kernel_keys()) == {
         *(f"k1_oneshot:r{r}" for r in range(12)),
         "k1_twoshot:grouped",
         "k1_twoshot:pinned",
         "k3:grouped",
-        "k3:pinned",
+        "k3_persist:grouped",
+        "k3_persist:pinned",
+        "k2_stream:n640",
+        "k2_stream:n512",
+        "k3_f32:grouped",
     }
 
 
@@ -124,6 +151,9 @@ def test_generated_module_inventory():
                     "num_tokens",
                     "epsilon",
                 } <= names
+            elif key.startswith("k2_stream:"):
+                assert raw == set()
+                assert {"y", "w_slice", "out", "num_tokens"} <= names
             elif key.startswith("k1_twoshot:"):
                 assert raw == {"mcast_ptr"}
                 assert {
@@ -244,6 +274,11 @@ def test_tail_matches_reference_on_twelve_ranks():
                 workspace=workspace,
             )
             assert runner.kernel_keys == cb.route_kernel_keys(M, rank)
+            assert runner.k3.kwargs["grid"] == cb.k3_grid(M, workspace.sm_count)
+            assert (runner.k2 is not None) == (M <= cb.K2_STREAM_MAX_TOKENS)
+            if runner.k2 is not None:
+                assert runner.k2.kwargs["grid"] == (cb.K2_STREAM_GRID_X, 1, 1)
+                assert runner.gemm.dtype == torch.float32
             inp["out"].fill_(float("nan"))
             runner()
             torch.cuda.synchronize()
