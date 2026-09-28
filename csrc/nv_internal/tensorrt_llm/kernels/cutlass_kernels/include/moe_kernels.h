@@ -1159,6 +1159,15 @@ struct GemmProfilerBackend {
   TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType mScalingType{};
 
  private:
+  bool profilesClampedRelu2Epilogue() const {
+    bool const is_mxfp8 = mUseMxfp8ActScaling && mDType == nvinfer1::DataType::kFP8 &&
+                          mWType == nvinfer1::DataType::kFP8;
+    bool const is_bf16 = mDType == nvinfer1::DataType::kBF16 && mWType == nvinfer1::DataType::kBF16;
+    return mSM >= 100 && mSM < 110 && mGemmToProfile == GemmToProfile::GEMM_1 &&
+           mActivationType == ActivationType::ClampedRelu2 && !mBias && !mUseLora &&
+           !mMinLatencyMode && (is_mxfp8 || is_bf16);
+  }
+
   bool isNativeWfp4Afp8Family() const {
     return mSM >= 100 && mDType == nvinfer1::DataType::kFP8 &&
            (mWType == nvinfer1::DataType::kFP4 || mWType == nvinfer1::DataType::kINT64);
