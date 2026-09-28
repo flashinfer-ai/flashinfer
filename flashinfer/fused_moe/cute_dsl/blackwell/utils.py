@@ -227,6 +227,50 @@ def red_add_bf16x2_pair_pred(dst_gmem, lo_f32, hi_f32, pred_i32, loc=None, ip=No
 
 
 @dsl_user_op
+def warp_max_nonneg_f32(v_f32, loc=None, ip=None):
+    """Warp-wide max of a non-negative F32 in one ``redux.sync.max.u32``.
+
+    Non-negative IEEE floats order like their bit patterns, so the integer
+    reduction returns the exact maximum. All 32 lanes must participate.
+    """
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [cutlass.Float32(v_f32).ir_value(loc=loc, ip=ip)],
+            "{\n\t.reg .b32 b_, m_;\n\tmov.b32 b_, $1;\n\t"
+            "redux.sync.max.u32 m_, b_, 0xffffffff;\n\tmov.b32 $0, m_;\n}",
+            "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def pack_bf16x2_f32(lo_f32, hi_f32, loc=None, ip=None):
+    """Two F32 values rounded to a packed BF16x2 word (``lo`` in the low half)."""
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Float32(lo_f32).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(hi_f32).ir_value(loc=loc, ip=ip),
+            ],
+            "cvt.rn.bf16x2.f32 $0, $2, $1;",
+            "=r,f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
 def st_bf16_pred(dst_gmem, v_f32, pred_i32, loc=None, ip=None):
     """Predicated 2-byte store of an F32 value rounded to BF16."""
     llvm.inline_asm(

@@ -80,7 +80,10 @@ from flashinfer.quantization.quantization_cute_dsl_utils import (
 from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     UnalignedNamedBarrier,
+    blk_reduce_bf16,
+    pack_bf16x2_f32,
     red_add_bf16x2_pair_pred,
+    warp_max_nonneg_f32,
     st_bf16_pred,
     st_bf16_pred_rowaddr,
     mapa_shared_cluster_u32,
@@ -157,6 +160,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             row_tma = False
         # Token rows of the tile held by this CTA (all of them for one CTA).
         self.rows_cta = n_tile // self.cta_v
+        # Wide-tile epilogue (192-row form): streamed subtiles, all four
+        # epilogue warps computing, bulk reduce-add finalize.
+        self.wide_epi = n_tile >= 192
+        if self.wide_epi and cluster_split:
+            raise ValueError("the 192-row tile excludes cluster_split")
         if k_blocks_per_stage not in (4, 8, 12):
             # The gather warp addresses whole 128-element K atoms (one 128-byte
             # swizzle atom per FP8 row, one 512-byte SF atom per 128 rows).
@@ -483,7 +491,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # epilogue kind; finalize/partial write straight from registers.
         n = min(self.n_tile, 32)
         red = 128 * self.n_tile * 4 if self.cluster_split else 16
-        return 64 * (n + 1) * 4 + red
+        # Wide finalize: two 32-token x 128-BF16 transposed staging buffers.
+        tr = 2 * 32 * 128 * 2 if self.wide_finalize_staging else 0
+        return 64 * (n + 1) * 4 + red + tr
+
+    @property
+    def wide_finalize_staging(self) -> bool:
+        return self.wide_epi and self.epilogue_kind == "finalize"
 
     @staticmethod
     def _compute_stages(
@@ -823,6 +837,14 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             ]
             red_full_mbar: cutlass.Int64
             red_empty_mbar: cutlass.Int64
+            # Wide finalize: (2 buffers, 32 tokens, 64 BF16x2 words) staging
+            # for the per-token bulk reduce-add.
+            sTr: cute.struct.Align[
+                cute.struct.MemRange[
+                    cutlass.Uint32, 2 * 32 * 64 if self.wide_finalize_staging else 4
+                ],
+                128,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -1121,6 +1143,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         sSFA = storage.sSFA.get_tensor(sfa_smem_layout_staged)
         sSFB = storage.sSFB.get_tensor(sfb_smem_layout_staged)
         sExch = storage.sExch.get_tensor(exch_smem_layout)
+        sTr = storage.sTr.get_tensor(
+            cute.make_layout((2, 32, 64), stride=(32 * 64, 64, 1))
+        )
         sRed = storage.sRed.get_tensor(
             cute.make_layout(
                 (128, n_tile if self.cluster_split else 1),
@@ -2392,227 +2417,385 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     m_tile_out = m_tile * self.cta_v + mma_tile_coord_v
                     acc_slot_e = acc_stage_index * m_group + je
                     if m_tile < num_m_tiles:
-                        vals = cute.make_rmem_tensor((n_tile,), cutlass.Float32)
-                        epi_n = epi_tile[1]
-                        tTR_tAcc = tTR_tAcc_base[
-                            (
-                                None,
-                                None,
-                                None,
-                                None,
-                                None,
-                                acc_slot_e,
-                            )
-                        ]
-                        tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
-                        if cutlass.const_expr(self.perf_probe < 2):
-                            for sub in cutlass.range_constexpr(n_tile // epi_n):
-                                cute.copy(
-                                    tiled_copy_t2r,
-                                    tTR_tAcc[(None, None, None, sub)],
-                                    tTR_rAcc,
-                                )
-                                acc_vec = tTR_rAcc.load()
-                                for c in cutlass.range_constexpr(epi_n):
-                                    vals[sub * epi_n + c] = acc_vec[c] * alpha_val
-                        cute.arch.fence_view_async_tmem_load()
-                        tcgen05_fence_before_thread_sync()
 
-                        # Cluster split-K: exchange the K halves of a split item.
-                        cs_do_store = cutlass.Boolean(1)
-                        if cutlass.const_expr(self.cluster_split):
-                            cs_split = tile_info[6] < k_tile_cnt
-                            if cs_split:
-                                if red_rank == 1:
-                                    # Peer: wait for the leader to have read the
-                                    # previous partial, then ship this one.
-                                    cute.arch.mbarrier_wait(
-                                        storage.red_empty_mbar.ptr, cs_empty_phase
-                                    )
-                                    cs_empty_phase = cutlass.Int32(1) - cs_empty_phase
-                                    for c in cutlass.range_constexpr(n_tile):
-                                        st_async_f32_cluster(
-                                            cs_remote_red + cutlass.Int32(4 * 128 * c),
-                                            vals[c],
-                                            cs_remote_full,
-                                        )
-                                    cs_do_store = cutlass.Boolean(0)
-                                else:
-                                    if epi_tidx == 0:
-                                        cute.arch.mbarrier_arrive_and_expect_tx(
-                                            storage.red_full_mbar.ptr, 128 * n_tile * 4
-                                        )
-                                    cute.arch.mbarrier_wait(
-                                        storage.red_full_mbar.ptr, cs_full_phase
-                                    )
-                                    cs_full_phase = cutlass.Int32(1) - cs_full_phase
-                                    for c in cutlass.range_constexpr(n_tile):
-                                        vals[c] = vals[c] + sRed[(epi_tidx, c)]
-                                    # Every leader thread has read the buffer.
-                                    self.epilog_sync_barrier.arrive_and_wait()
-                                    if epi_tidx == 0:
-                                        mbarrier_arrive_cluster(cs_remote_empty)
-                        if cutlass.const_expr(self.perf_probe == 0):
+                        if cutlass.const_expr(self.wide_epi):
+                            # ---- wide-tile epilogue (192-row form): streamed 32-column subtiles ----
+                            # ``vals`` holds one subtile (32 registers) instead of the whole tile;
+                            # SiTU: both lane halves compute (16 columns each) with one warp
+                            # reduction per column; finalize: transposed BF16 staging + one
+                            # ``cp.reduce.async.bulk`` per token row (the dense kernel's path).
+                            epi_n = epi_tile[1]
+                            num_sub = n_tile // epi_n
+                            tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_slot_e)]
+                            tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+                            vals = cute.make_rmem_tensor((epi_n,), cutlass.Float32)
                             if cutlass.const_expr(self.is_situ):
-                                if cs_do_store:
-                                    # ---- SiTU + MXFP8 requantization (transposed) ----
-                                    beta_idx = cutlass.Int32(0)
-                                    if cutlass.const_expr(not self.beta_broadcast):
-                                        beta_idx = expert_idx
-                                    beta = cutlass.Float32(situ_beta[beta_idx])
-                                    is_gate_lane = epi_tidx >= 64
-                                    linear_beta = cutlass.Float32(1.0)
-                                    inv_linear_beta = cutlass.Float32(1.0)
-                                    if cutlass.const_expr(self.use_linear_beta):
-                                        lb_idx = cutlass.Int32(0)
-                                        if cutlass.const_expr(
-                                            not self.linear_beta_broadcast
-                                        ):
-                                            lb_idx = expert_idx
-                                        linear_beta = cutlass.Float32(
-                                            situ_linear_beta[lb_idx]
+                                beta_idx = cutlass.Int32(0)
+                                if cutlass.const_expr(not self.beta_broadcast):
+                                    beta_idx = expert_idx
+                                beta = cutlass.Float32(situ_beta[beta_idx])
+                                is_gate_lane = epi_tidx >= 64
+                                linear_beta = cutlass.Float32(1.0)
+                                inv_linear_beta = cutlass.Float32(1.0)
+                                if cutlass.const_expr(self.use_linear_beta):
+                                    lb_idx = cutlass.Int32(0)
+                                    if cutlass.const_expr(not self.linear_beta_broadcast):
+                                        lb_idx = expert_idx
+                                    linear_beta = cutlass.Float32(situ_linear_beta[lb_idx])
+                                    inv_linear_beta = cutlass.Float32(1.0) / linear_beta
+                                # Intermediate index of this lane's (up, gate) row pair and its
+                                # 32-wide requant group (one warp).
+                                row_x = epi_tidx % 64
+                                j = m_tile_out * 64 + row_x
+                                sf_kb = m_tile_out * 2 + row_x // 32
+                                half = epi_n // 2
+
+                                for sub in cutlass.range_constexpr(num_sub):
+                                    if cutlass.const_expr(self.perf_probe < 2):
+                                        cute.copy(
+                                            tiled_copy_t2r, tTR_tAcc[(None, None, None, sub)], tTR_rAcc
                                         )
-                                        inv_linear_beta = (
-                                            cutlass.Float32(1.0) / linear_beta
-                                        )
-                                    # act = up_out * gate_out for intermediate j = m_tile*64 + epi_tidx
-                                    j = m_tile_out * 64 + epi_tidx
-                                    num_sub = n_tile // epi_n
-                                    amax = cute.make_rmem_tensor(
-                                        (epi_n,), cutlass.Float32
-                                    )
-                                    for sub in cutlass.range_constexpr(num_sub):
-                                        # One 32-column subtile per gate exchange so the
-                                        # exchange buffer is independent of n_tile.
+                                        acc_vec = tTR_rAcc.load()
+                                        for c in cutlass.range_constexpr(epi_n):
+                                            vals[c] = acc_vec[c] * alpha_val
+                                    if cutlass.const_expr(self.perf_probe == 0):
+                                        # Exchange: gate lanes hand SiTU(gate) of columns [0, half) to
+                                        # the up lanes; up lanes hand up' of [half, epi_n) to the gate
+                                        # lanes. Each half then owns 16 columns end to end.
                                         if is_gate_lane:
-                                            for c in cutlass.range_constexpr(epi_n):
-                                                g = native_situ_f32(
-                                                    vals[sub * epi_n + c],
-                                                    beta,
-                                                    fastmath=True,
+                                            for c in cutlass.range_constexpr(half):
+                                                sExch[(row_x, c)] = native_situ_f32(
+                                                    vals[c], beta, fastmath=True
                                                 )
-                                                sExch[(epi_tidx - 64, c)] = g
                                         else:
-                                            if cutlass.const_expr(self.use_linear_beta):
-                                                for c in cutlass.range_constexpr(epi_n):
-                                                    vals[sub * epi_n + c] = (
-                                                        linear_beta
-                                                        * native_tanh_f32(
-                                                            vals[sub * epi_n + c]
-                                                            * inv_linear_beta
-                                                        )
-                                                    )
-                                        cute.arch.fence_proxy(
-                                            "async.shared", space="cta"
-                                        )
+                                            for c in cutlass.range_constexpr(half, epi_n):
+                                                ux = vals[c]
+                                                if cutlass.const_expr(self.use_linear_beta):
+                                                    ux = linear_beta * native_tanh_f32(ux * inv_linear_beta)
+                                                sExch[(row_x, c)] = ux
                                         self.epilog_sync_barrier.arrive_and_wait()
-                                        if not is_gate_lane:
-                                            for c in cutlass.range_constexpr(epi_n):
-                                                v = (
-                                                    vals[sub * epi_n + c]
-                                                    * sExch[(epi_tidx, c)]
+                                        if is_gate_lane:
+                                            for c in cutlass.range_constexpr(half, epi_n):
+                                                vg = sExch[(row_x, c)] * native_situ_f32(
+                                                    vals[c], beta, fastmath=True
                                                 )
-                                                vals[sub * epi_n + c] = v
-                                                amax[c] = cute.arch.fmax(v, -v)
-                                            # One warp == one 32-wide requant group along j.
-                                            for c in cutlass.range_constexpr(epi_n):
-                                                v = amax[c]
-                                                for sh in cutlass.range_constexpr(5):
-                                                    v = cute.arch.fmax(
-                                                        v,
-                                                        cute.arch.shuffle_sync_bfly(
-                                                            v, 1 << sh
-                                                        ),
-                                                    )
-                                                amax[c] = v
-                                            for c in cutlass.range_constexpr(epi_n):
-                                                prow = row_base + sub * epi_n + c
-                                                if prow < mn_limit:
-                                                    scale_code = float_to_ue8m0_fast(
-                                                        amax[c] * inv_fp8_max
-                                                    )
-                                                    inv_scale = ue8m0_to_inv_scale_fast(
-                                                        scale_code
-                                                    )
-                                                    q = (
-                                                        vals[sub * epi_n + c]
-                                                        * inv_scale
-                                                    )
-                                                    out[(prow, j, 0)] = q.to(
-                                                        self.out_dtype
-                                                    )
+                                                ag = cute.arch.fmax(vg, -vg)
+                                                amaxg = warp_max_nonneg_f32(ag)
+                                                prowg = row_base + sub * epi_n + c
+                                                if prowg < mn_limit:
+                                                    scale_codeg = float_to_ue8m0_fast(amaxg * inv_fp8_max)
+                                                    inv_scaleg = ue8m0_to_inv_scale_fast(scale_codeg)
+                                                    out[(prowg, j, 0)] = (vg * inv_scaleg).to(self.out_dtype)
                                                     if lane == 0:
-                                                        sf_kb = (
-                                                            m_tile_out * 2
-                                                            + epi_tidx // 32
-                                                        )
-                                                        if cutlass.const_expr(
-                                                            self.sf_blocked
-                                                        ):
+                                                        if cutlass.const_expr(self.sf_blocked):
                                                             out_sf[
                                                                 (
-                                                                    prow % 32,
-                                                                    (prow // 32) % 4,
-                                                                    prow // 128,
+                                                                    prowg % 32,
+                                                                    (prowg // 32) % 4,
+                                                                    prowg // 128,
                                                                     sf_kb % 4,
                                                                     sf_kb // 4,
                                                                     0,
                                                                 )
-                                                            ] = scale_code.to(
-                                                                cutlass.Uint8
-                                                            )
+                                                            ] = scale_codeg.to(cutlass.Uint8)
                                                         else:
-                                                            # plain (rows, I/32) scale bytes; j // 32
-                                                            out_sf[(prow, sf_kb)] = (
-                                                                scale_code.to(
-                                                                    cutlass.Uint8
+                                                            out_sf[(prowg, sf_kb)] = scale_codeg.to(cutlass.Uint8)
+                                        else:
+                                            for c in cutlass.range_constexpr(half):
+                                                uu = vals[c]
+                                                if cutlass.const_expr(self.use_linear_beta):
+                                                    uu = linear_beta * native_tanh_f32(uu * inv_linear_beta)
+                                                vu = uu * sExch[(row_x, c)]
+                                                au = cute.arch.fmax(vu, -vu)
+                                                amaxu = warp_max_nonneg_f32(au)
+                                                prowu = row_base + sub * epi_n + c
+                                                if prowu < mn_limit:
+                                                    scale_codeu = float_to_ue8m0_fast(amaxu * inv_fp8_max)
+                                                    inv_scaleu = ue8m0_to_inv_scale_fast(scale_codeu)
+                                                    out[(prowu, j, 0)] = (vu * inv_scaleu).to(self.out_dtype)
+                                                    if lane == 0:
+                                                        if cutlass.const_expr(self.sf_blocked):
+                                                            out_sf[
+                                                                (
+                                                                    prowu % 32,
+                                                                    (prowu // 32) % 4,
+                                                                    prowu // 128,
+                                                                    sf_kb % 4,
+                                                                    sf_kb // 4,
+                                                                    0,
                                                                 )
-                                                            )
+                                                            ] = scale_codeu.to(cutlass.Uint8)
+                                                        else:
+                                                            out_sf[(prowu, sf_kb)] = scale_codeu.to(cutlass.Uint8)
                                         # The exchange buffer is reused by the next subtile.
                                         self.epilog_sync_barrier.arrive_and_wait()
+                                cute.arch.fence_view_async_tmem_load()
                             else:
-                                # ---- finalize / partial: per-element reduce / store ----
-                                # Thread ``epi_tidx`` owns hidden index h for every routed
-                                # column. Adjacent lanes pair their BF16 values so one
-                                # ``red.global.add.bf16x2`` per lane pair covers a coalesced
-                                # 256-byte row segment: no smem staging, no barrier, and
-                                # nothing on the TMA unit. Column validity is a predicate,
-                                # not a branch, so the unrolled shuffles pipeline.
-                                # ``vals`` already carries the expert alpha.
-                                h = m_tile_out * 128 + epi_tidx
+                                # ---- finalize: transposed staging + bulk reduce-add per token ----
+                                h0 = m_tile_out * 128
                                 is_even_lane = (lane % 2) == 0
-                                for c in cutlass.range_constexpr(n_tile):
-                                    if cutlass.const_expr(hold_meta):
-                                        v = vals[c] * sScale[(c, meta_stage)]
-                                        tok = sTok[(c, meta_stage)]
-                                    else:
-                                        v = vals[c] * cur_scale[c]
-                                        tok = cur_tok[c]
-                                    col_ok = (row_base + c) < mn_limit
-                                    if cutlass.const_expr(self.is_finalize):
-                                        dst = cute.domain_offset((tok, h, 0), out)
-                                        v_hi = cute.arch.shuffle_sync_bfly(v, 1)
-                                        red_add_bf16x2_pair_pred(
-                                            dst,
-                                            v,
-                                            v_hi,
-                                            cutlass.Int32(col_ok & is_even_lane),
+                                is_issuer = epi_tidx < epi_n
+                                for sub in cutlass.range_constexpr(num_sub):
+                                    buf = sub % 2
+                                    # Staging buffer ``buf`` is free once the reduce issued two
+                                    # subtiles ago has finished reading it (one group may stay
+                                    # in flight).
+                                    if is_issuer:
+                                        cute.arch.cp_async_bulk_wait_group(1, read=True)
+                                    self.epilog_sync_barrier.arrive_and_wait()
+                                    if cutlass.const_expr(self.perf_probe < 2):
+                                        cute.copy(
+                                            tiled_copy_t2r, tTR_tAcc[(None, None, None, sub)], tTR_rAcc
                                         )
-                                    elif cutlass.const_expr(self.wide_out):
-                                        # Deferred rows past 2^31 elements (MoE-TP
-                                        # shard, T >= 16384): 64-bit byte offset
-                                        # ``tok * (2 * cols) + 2 * h`` per store.
-                                        st_bf16_pred_rowaddr(
-                                            out,
-                                            tok,
-                                            out.shape[1] * 2,
-                                            h * 2,
-                                            v,
-                                            cutlass.Int32(col_ok),
+                                        acc_vec = tTR_rAcc.load()
+                                        for c in cutlass.range_constexpr(epi_n):
+                                            vals[c] = acc_vec[c] * alpha_val
+                                    if cutlass.const_expr(self.perf_probe == 0):
+                                        for c in cutlass.range_constexpr(epi_n):
+                                            v = vals[c] * sScale[(sub * epi_n + c, meta_stage)]
+                                            vp = cute.arch.shuffle_sync_bfly(v, 1)
+                                            # Lane pairs (h, h+1) share one BF16x2 word of token row
+                                            # ``c``; even lanes write even columns, odd lanes odd.
+                                            if cutlass.const_expr(c % 2 == 0):
+                                                if is_even_lane:
+                                                    sTr[(buf, c, epi_tidx // 2)] = pack_bf16x2_f32(v, vp)
+                                            else:
+                                                if not is_even_lane:
+                                                    sTr[(buf, c, epi_tidx // 2)] = pack_bf16x2_f32(vp, v)
+                                        cute.arch.fence_proxy("async.shared", space="cta")
+                                        self.epilog_sync_barrier.arrive_and_wait()
+                                        if is_issuer:
+                                            prow = row_base + sub * epi_n + epi_tidx
+                                            if prow < mn_limit:
+                                                tok = sTok[(sub * epi_n + epi_tidx, meta_stage)]
+                                                dst = cute.domain_offset((tok, h0, 0), out)
+                                                blk_reduce_bf16(
+                                                    dst, sTr[(buf, epi_tidx, None)], cutlass.Int32(256)
+                                                )
+                                            cute.arch.cp_async_bulk_commit_group()
+                                cute.arch.fence_view_async_tmem_load()
+                        else:
+                            vals = cute.make_rmem_tensor((n_tile,), cutlass.Float32)
+                            epi_n = epi_tile[1]
+                            tTR_tAcc = tTR_tAcc_base[
+                                (
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    None,
+                                    acc_slot_e,
+                                )
+                            ]
+                            tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+                            if cutlass.const_expr(self.perf_probe < 2):
+                                for sub in cutlass.range_constexpr(n_tile // epi_n):
+                                    cute.copy(
+                                        tiled_copy_t2r,
+                                        tTR_tAcc[(None, None, None, sub)],
+                                        tTR_rAcc,
+                                    )
+                                    acc_vec = tTR_rAcc.load()
+                                    for c in cutlass.range_constexpr(epi_n):
+                                        vals[sub * epi_n + c] = acc_vec[c] * alpha_val
+                            cute.arch.fence_view_async_tmem_load()
+                            tcgen05_fence_before_thread_sync()
+
+                            # Cluster split-K: exchange the K halves of a split item.
+                            cs_do_store = cutlass.Boolean(1)
+                            if cutlass.const_expr(self.cluster_split):
+                                cs_split = tile_info[6] < k_tile_cnt
+                                if cs_split:
+                                    if red_rank == 1:
+                                        # Peer: wait for the leader to have read the
+                                        # previous partial, then ship this one.
+                                        cute.arch.mbarrier_wait(
+                                            storage.red_empty_mbar.ptr, cs_empty_phase
                                         )
+                                        cs_empty_phase = cutlass.Int32(1) - cs_empty_phase
+                                        for c in cutlass.range_constexpr(n_tile):
+                                            st_async_f32_cluster(
+                                                cs_remote_red + cutlass.Int32(4 * 128 * c),
+                                                vals[c],
+                                                cs_remote_full,
+                                            )
+                                        cs_do_store = cutlass.Boolean(0)
                                     else:
-                                        dst = cute.domain_offset((tok, h, 0), out)
-                                        st_bf16_pred(dst, v, cutlass.Int32(col_ok))
+                                        if epi_tidx == 0:
+                                            cute.arch.mbarrier_arrive_and_expect_tx(
+                                                storage.red_full_mbar.ptr, 128 * n_tile * 4
+                                            )
+                                        cute.arch.mbarrier_wait(
+                                            storage.red_full_mbar.ptr, cs_full_phase
+                                        )
+                                        cs_full_phase = cutlass.Int32(1) - cs_full_phase
+                                        for c in cutlass.range_constexpr(n_tile):
+                                            vals[c] = vals[c] + sRed[(epi_tidx, c)]
+                                        # Every leader thread has read the buffer.
+                                        self.epilog_sync_barrier.arrive_and_wait()
+                                        if epi_tidx == 0:
+                                            mbarrier_arrive_cluster(cs_remote_empty)
+                            if cutlass.const_expr(self.perf_probe == 0):
+                                if cutlass.const_expr(self.is_situ):
+                                    if cs_do_store:
+                                        # ---- SiTU + MXFP8 requantization (transposed) ----
+                                        beta_idx = cutlass.Int32(0)
+                                        if cutlass.const_expr(not self.beta_broadcast):
+                                            beta_idx = expert_idx
+                                        beta = cutlass.Float32(situ_beta[beta_idx])
+                                        is_gate_lane = epi_tidx >= 64
+                                        linear_beta = cutlass.Float32(1.0)
+                                        inv_linear_beta = cutlass.Float32(1.0)
+                                        if cutlass.const_expr(self.use_linear_beta):
+                                            lb_idx = cutlass.Int32(0)
+                                            if cutlass.const_expr(
+                                                not self.linear_beta_broadcast
+                                            ):
+                                                lb_idx = expert_idx
+                                            linear_beta = cutlass.Float32(
+                                                situ_linear_beta[lb_idx]
+                                            )
+                                            inv_linear_beta = (
+                                                cutlass.Float32(1.0) / linear_beta
+                                            )
+                                        # act = up_out * gate_out for intermediate j = m_tile*64 + epi_tidx
+                                        j = m_tile_out * 64 + epi_tidx
+                                        num_sub = n_tile // epi_n
+                                        amax = cute.make_rmem_tensor(
+                                            (epi_n,), cutlass.Float32
+                                        )
+                                        for sub in cutlass.range_constexpr(num_sub):
+                                            # One 32-column subtile per gate exchange so the
+                                            # exchange buffer is independent of n_tile.
+                                            if is_gate_lane:
+                                                for c in cutlass.range_constexpr(epi_n):
+                                                    g = native_situ_f32(
+                                                        vals[sub * epi_n + c],
+                                                        beta,
+                                                        fastmath=True,
+                                                    )
+                                                    sExch[(epi_tidx - 64, c)] = g
+                                            else:
+                                                if cutlass.const_expr(self.use_linear_beta):
+                                                    for c in cutlass.range_constexpr(epi_n):
+                                                        vals[sub * epi_n + c] = (
+                                                            linear_beta
+                                                            * native_tanh_f32(
+                                                                vals[sub * epi_n + c]
+                                                                * inv_linear_beta
+                                                            )
+                                                        )
+                                            cute.arch.fence_proxy(
+                                                "async.shared", space="cta"
+                                            )
+                                            self.epilog_sync_barrier.arrive_and_wait()
+                                            if not is_gate_lane:
+                                                for c in cutlass.range_constexpr(epi_n):
+                                                    v = (
+                                                        vals[sub * epi_n + c]
+                                                        * sExch[(epi_tidx, c)]
+                                                    )
+                                                    vals[sub * epi_n + c] = v
+                                                    amax[c] = cute.arch.fmax(v, -v)
+                                                # One warp == one 32-wide requant group along j.
+                                                for c in cutlass.range_constexpr(epi_n):
+                                                    v = amax[c]
+                                                    for sh in cutlass.range_constexpr(5):
+                                                        v = cute.arch.fmax(
+                                                            v,
+                                                            cute.arch.shuffle_sync_bfly(
+                                                                v, 1 << sh
+                                                            ),
+                                                        )
+                                                    amax[c] = v
+                                                for c in cutlass.range_constexpr(epi_n):
+                                                    prow = row_base + sub * epi_n + c
+                                                    if prow < mn_limit:
+                                                        scale_code = float_to_ue8m0_fast(
+                                                            amax[c] * inv_fp8_max
+                                                        )
+                                                        inv_scale = ue8m0_to_inv_scale_fast(
+                                                            scale_code
+                                                        )
+                                                        q = (
+                                                            vals[sub * epi_n + c]
+                                                            * inv_scale
+                                                        )
+                                                        out[(prow, j, 0)] = q.to(
+                                                            self.out_dtype
+                                                        )
+                                                        if lane == 0:
+                                                            sf_kb = (
+                                                                m_tile_out * 2
+                                                                + epi_tidx // 32
+                                                            )
+                                                            if cutlass.const_expr(
+                                                                self.sf_blocked
+                                                            ):
+                                                                out_sf[
+                                                                    (
+                                                                        prow % 32,
+                                                                        (prow // 32) % 4,
+                                                                        prow // 128,
+                                                                        sf_kb % 4,
+                                                                        sf_kb // 4,
+                                                                        0,
+                                                                    )
+                                                                ] = scale_code.to(
+                                                                    cutlass.Uint8
+                                                                )
+                                                            else:
+                                                                # plain (rows, I/32) scale bytes; j // 32
+                                                                out_sf[(prow, sf_kb)] = (
+                                                                    scale_code.to(
+                                                                        cutlass.Uint8
+                                                                    )
+                                                                )
+                                            # The exchange buffer is reused by the next subtile.
+                                            self.epilog_sync_barrier.arrive_and_wait()
+                                else:
+                                    # ---- finalize / partial: per-element reduce / store ----
+                                    # Thread ``epi_tidx`` owns hidden index h for every routed
+                                    # column. Adjacent lanes pair their BF16 values so one
+                                    # ``red.global.add.bf16x2`` per lane pair covers a coalesced
+                                    # 256-byte row segment: no smem staging, no barrier, and
+                                    # nothing on the TMA unit. Column validity is a predicate,
+                                    # not a branch, so the unrolled shuffles pipeline.
+                                    # ``vals`` already carries the expert alpha.
+                                    h = m_tile_out * 128 + epi_tidx
+                                    is_even_lane = (lane % 2) == 0
+                                    for c in cutlass.range_constexpr(n_tile):
+                                        if cutlass.const_expr(hold_meta):
+                                            v = vals[c] * sScale[(c, meta_stage)]
+                                            tok = sTok[(c, meta_stage)]
+                                        else:
+                                            v = vals[c] * cur_scale[c]
+                                            tok = cur_tok[c]
+                                        col_ok = (row_base + c) < mn_limit
+                                        if cutlass.const_expr(self.is_finalize):
+                                            dst = cute.domain_offset((tok, h, 0), out)
+                                            v_hi = cute.arch.shuffle_sync_bfly(v, 1)
+                                            red_add_bf16x2_pair_pred(
+                                                dst,
+                                                v,
+                                                v_hi,
+                                                cutlass.Int32(col_ok & is_even_lane),
+                                            )
+                                        elif cutlass.const_expr(self.wide_out):
+                                            # Deferred rows past 2^31 elements (MoE-TP
+                                            # shard, T >= 16384): 64-bit byte offset
+                                            # ``tok * (2 * cols) + 2 * h`` per store.
+                                            st_bf16_pred_rowaddr(
+                                                out,
+                                                tok,
+                                                out.shape[1] * 2,
+                                                h * 2,
+                                                v,
+                                                cutlass.Int32(col_ok),
+                                            )
+                                        else:
+                                            dst = cute.domain_offset((tok, h, 0), out)
+                                            st_bf16_pred(dst, v, cutlass.Int32(col_ok))
 
                 tcgen05_fence_before_thread_sync()
                 acc_pipeline.consumer_release(acc_consumer_state)
@@ -2643,6 +2826,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
+            if cutlass.const_expr(self.wide_finalize_staging):
+                # The last bulk reduce-adds must finish reading smem before exit.
+                if epi_tidx < 32:
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
             tmem.relinquish_alloc_permit()
             self.epilog_sync_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
