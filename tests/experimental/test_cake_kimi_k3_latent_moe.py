@@ -78,12 +78,20 @@ def test_decode_plan_rules():
     assert (tp8["tiles"], tp8["grid"], tp8["cluster"], tp8["n_pad"]) == (47, 94, 2, 8)
     assert decode_front_plan(9, i_local_for_tp(8))["n_pad"] == 16
     assert decode_front_plan(128, i_local_for_tp(1))["n_pad"] == 128
+    # Front K depth 2 while its ring keeps >= 4 (one CTA per tile) / 6 (cluster pairs) stages: TP1 T <= 64, TP8 T <= 16.
     for plan in (tp1, tp8):
         assert (
-            plan["kdepth"] == 1
+            plan["kdepth"] == 2
             and 1 <= plan["stages"] <= cb.MAX_STAGES
             and not plan["fused"]
         )
+    assert decode_front_plan(64, i_local_for_tp(1))["kdepth"] == 2
+    assert decode_front_plan(128, i_local_for_tp(1))["kdepth"] == 1
+    assert decode_front_plan(16, i_local_for_tp(8))["kdepth"] == 2
+    assert decode_front_plan(32, i_local_for_tp(8))["kdepth"] == 1
+    assert decode_front_plan(32, i_local_for_tp(8))["stages"] == cb.plan_stages(
+        n_pad=32, kdepth=1, cluster=2
+    )
     # Tail: 56 output tiles -> 112 cluster-pair CTAs; the fused norm is always on.
     for tp in SUPPORTED_TP:
         for tokens in (1, 8, 16, 128):
@@ -96,12 +104,24 @@ def test_decode_plan_rules():
             )
             if plan["rows_smem"]:
                 assert plan["smem_b1"]
-    # The resident B operand with staged rows serves the smallest TP8 tails; T16 falls back to the global-y protocol.
+    # The resident B operand with staged rows serves the TP8 tails up to T16 (5 ring stages left); T32 falls back to
+    # the global-y protocol, and so does TP1 (long shared-down window).
     assert decode_tail_plan(1, i_local_for_tp(8), 8)["smem_b1"]
     assert decode_tail_plan(1, i_local_for_tp(8), 8)["rows_smem"]
     assert decode_tail_plan(8, i_local_for_tp(8), 8)["smem_b1"]
-    assert not decode_tail_plan(16, i_local_for_tp(8), 8)["smem_b1"]
+    t16 = decode_tail_plan(16, i_local_for_tp(8), 8)
+    assert t16["smem_b1"] and t16["rows_smem"] and t16["stages"] == 5
+    assert (
+        not t16["tmap_prefetch"]
+        and decode_tail_plan(8, i_local_for_tp(8), 8)["tmap_prefetch"]
+    )
+    # one ring stage fewer than the smem budget for the small-T tail (T16 keeps its 5)
+    assert decode_tail_plan(1, i_local_for_tp(8), 8)["stages"] == 8
+    assert decode_tail_plan(8, i_local_for_tp(8), 8)["stages"] == 8
+    assert decode_tail_plan(1, i_local_for_tp(1), 1)["stages"] == 10
+    assert not decode_tail_plan(32, i_local_for_tp(8), 8)["smem_b1"]
     assert not decode_tail_plan(32, i_local_for_tp(1), 1)["smem_b1"]
+    assert not decode_tail_plan(16, i_local_for_tp(1), 1)["rows_smem"]
     # A second routed partial disables the staged rows (P == 1 only).
     assert not decode_tail_plan(1, i_local_for_tp(8), 8, num_partials=2)["rows_smem"]
     with pytest.raises(ValueError):
@@ -126,6 +146,13 @@ def test_split_plan_rules():
     )
     assert split_plan(56, 19, SM_COUNT, 1)["sk_tiles"] == 0
     assert split_plan(60, 152, SM_COUNT, 4)["sk_tiles"] == 0
+    # Partial reuse (2-4 pair rows per column): only a remainder wave after a full wave is split, and only
+    # when it fills at most 55 % of the clusters (TP1 T=1024: 74 whole + 38 tiles as 74 x 79 iterations).
+    rem = split_plan(112, 152, SM_COUNT, 4)
+    assert rem["full_items"] == 74 and rem["sk_tiles"] == 38
+    assert rem["sk_ipc"] == 79 and rem["num_items"] == 148
+    assert split_plan(56, 152, SM_COUNT, 2)["sk_tiles"] == 0
+    assert split_plan(140, 152, SM_COUNT, 5)["sk_tiles"] == 0
     # TP1 T=2048 (224 pair tiles on 74 resident clusters): 2 x 74 whole + one stream-K wave (module docstring).
     sk = split_plan(224, 152, SM_COUNT, 8)
     assert sk["full_items"] == 148 and sk["sk_tiles"] == 76 and sk["sk_ipc"] == 157
@@ -147,6 +174,12 @@ def test_prefill_tail_plan_and_trigger():
     assert tp1["gemm_grid"] == (tp1["num_items"]) * 2 and not tp1["early_trigger"]
     assert plan["weights_evict_first"] and tp1["weights_evict_first"]
     assert not prefill_tail_plan(2048, 1)["weights_evict_first"]
+    # Fused norm: TP1 T = 256 / 512 (single wave, K2 = 96 blocks); TP8 (K2 = 12) and multi-wave grids do not fuse.
+    assert tp1["fused_norm"] and prefill_tail_plan(512, 1)["fused_norm"]
+    assert not plan["fused_norm"] and not prefill_tail_plan(1024, 1)["fused_norm"]
+    assert cb.use_fused_norm(256, 112, SM_COUNT, 96) and not cb.use_fused_norm(
+        256, 56, SM_COUNT, 12
+    )
     assert cb.weights_evict_first(112, SM_COUNT) and not cb.weights_evict_first(
         224, SM_COUNT
     )
@@ -168,18 +201,24 @@ def test_route_keys_cover_the_row_set():
     }
     assert "front:i6144" in keys and "front:i768" in keys
     assert {k for k in keys if k.startswith("tail_gemm:")} == {
-        "tail_gemm:tp1e0",
-        "tail_gemm:tp1e1",
-        "tail_gemm:tp8e0",
-        "tail_gemm:tp8e1",
+        "tail_gemm:tp1e0f0",
+        "tail_gemm:tp1e1f1",
+        "tail_gemm:tp1e1f1s6",
+        "tail_gemm:tp8e0f0",
+        "tail_gemm:tp8e1f0",
     }
     assert route_kernel_keys("front", 1, 128)[0].startswith("decode:")
     assert route_kernel_keys("front", 1, 256) == ("front:i6144",)
-    assert route_kernel_keys("tail", 8, 256) == ("tail_norm:e1", "tail_gemm:tp8e1")
+    assert route_kernel_keys("tail", 8, 256) == ("tail_norm:e1", "tail_gemm:tp8e1f0")
+    # TP1 single-wave rows fuse the norm into the GEMM launch (no tail_norm kernel); the T <= 256 row
+    # takes the 6-deep ring instance (round-6 rule), T = 512 the default 7-deep ring.
+    assert route_kernel_keys("tail", 1, 256) == ("tail_gemm:tp1e1f1s6",)
+    assert cb.tail_gemm_num_stages(256, 1) == 6 and cb.tail_gemm_num_stages(512, 1) == 7
+    assert cb.tail_gemm_num_stages(256, 8) == 7
     # Single-wave grids (T = 256 / 512) stream the weights evict_first; persistent grids keep the default policy.
-    assert route_kernel_keys("tail", 1, 512)[1] == "tail_gemm:tp1e1"
-    assert route_kernel_keys("tail", 1, 1024)[1] == "tail_gemm:tp1e0"
-    assert route_kernel_keys("tail", 8, 1024)[1] == "tail_gemm:tp8e0"
+    assert route_kernel_keys("tail", 1, 512) == ("tail_gemm:tp1e1f1",)
+    assert route_kernel_keys("tail", 1, 1024)[1] == "tail_gemm:tp1e0f0"
+    assert route_kernel_keys("tail", 8, 1024)[1] == "tail_gemm:tp8e0f0"
     assert len(route_kernel_keys("tail", 1, 16384)) == 2
     for stage in ("front", "tail"):
         for tp in SUPPORTED_TP:
@@ -455,7 +494,9 @@ def test_tail_matches_reference(tp, tokens):
     )
     assert runner.route == ("decode" if tokens <= DECODE_MAX_T else "prefill")
     assert runner.kernel_keys == route_kernel_keys("tail", tp, tokens)
-    assert runner.launch_count == (1 if tokens <= DECODE_MAX_T else 2)
+    assert runner.launch_count == (
+        1 if tokens <= DECODE_MAX_T or runner.plan.get("fused_norm") else 2
+    )
     runner()
     torch.cuda.synchronize()
     expected = tail_reference(routed, shared_act, w, tp, rank)

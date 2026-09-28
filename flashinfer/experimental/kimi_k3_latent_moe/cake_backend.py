@@ -91,6 +91,12 @@ SMEM_B1_MAX_TOKENS = 2 * EPI_WARPS
 SMEM_B1_MIN_STAGES = 6
 SMEM_B1_MAX_TOKENS_RS = 4 * EPI_WARPS
 SMEM_B1_MIN_STAGES_RS = 5
+TAIL_STAGE_TRIM_MAX_N_PAD = 8
+TAIL_STAGE_TRIM = 1
+ROWS_NO_TMAP_PREFETCH_MIN_N_PAD = 16
+#: Front stage: K depth 2 while the depth-2 ring keeps this many stages per cluster mode
+#: (1 = one CTA per tile, 2 = cluster pairs); the tail keeps depth 1 (kernel module constant).
+FRONT_KD2_MIN_STAGES = {1: 4, 2: 6}
 TL_SLOTS = 16
 TL_MAX_GRID = 512
 DECODE_THREADS = 192
@@ -179,18 +185,32 @@ def kdepth_for(*k_chunks: int, requested: Optional[int] = None) -> int:
 
 
 def choose_config(
-    *, tiles: int, n_pad: int, k_chunks: tuple[int, ...], sm_count: int
+    stage: str, *, tiles: int, n_pad: int, k_chunks: tuple[int, ...], sm_count: int
 ) -> tuple[int, int, int, int]:
-    """``(kdepth, grid, stages, cluster)`` of the production rule (depth 1, ring takes all smem)."""
+    """``(kdepth, grid, stages, cluster)`` of the production rule: depth 1 (ring takes all smem);
+    the front stage takes depth 2 while its ring keeps ``FRONT_KD2_MIN_STAGES[cluster]`` stages."""
+    k2 = k_chunks[1] if len(k_chunks) > 1 else 0
     kd = kdepth_for(*k_chunks, requested=1)
     part = plan_partition(
         tiles=tiles,
         k1_chunks=k_chunks[0],
-        k2_chunks=k_chunks[1] if len(k_chunks) > 1 else 0,
+        k2_chunks=k2,
         kdepth=kd,
         sm_count=sm_count,
         n_pad=n_pad,
     )
+    if stage == "front" and all(k % 2 == 0 for k in k_chunks):
+        stages2 = plan_stages(n_pad=n_pad, kdepth=2, cluster=part["cluster"])
+        if stages2 >= FRONT_KD2_MIN_STAGES[part["cluster"]]:
+            part2 = plan_partition(
+                tiles=tiles,
+                k1_chunks=k_chunks[0],
+                k2_chunks=k2,
+                kdepth=2,
+                sm_count=sm_count,
+                n_pad=n_pad,
+            )
+            return 2, part2["grid"], stages2, part2["cluster"]
     return (
         kd,
         part["grid"],
@@ -214,7 +234,7 @@ def decode_front_plan(
     tiles = r_tiles + l_tiles + s_tiles
     k_chunks = HIDDEN // CHUNK_K
     kdepth, grid, stages, cluster = choose_config(
-        tiles=tiles, n_pad=n_pad, k_chunks=(k_chunks,), sm_count=sm_count
+        "front", tiles=tiles, n_pad=n_pad, k_chunks=(k_chunks,), sm_count=sm_count
     )
     return dict(
         grid=grid,
@@ -262,7 +282,7 @@ def decode_tail_plan(
         raise ValueError("K slices must be multiples of 64")
     k1, k2 = k_up // CHUNK_K, i_local // CHUNK_K
     kdepth, grid, stages, cluster = choose_config(
-        tiles=tiles, n_pad=n_pad, k_chunks=(k1, k2), sm_count=sm_count
+        "tail", tiles=tiles, n_pad=n_pad, k_chunks=(k1, k2), sm_count=sm_count
     )
     k1_macros = k1 // kdepth
     cl_u0 = (k1_macros + 1) // 2 if cluster == 2 else k1_macros
@@ -290,11 +310,20 @@ def decode_tail_plan(
             bn_stages = plan_stages(
                 n_pad=n_pad, kdepth=kdepth, cluster=cluster, extra_bytes=bn_bytes
             )
-        if use_bn and bn_stages < SMEM_B1_MIN_STAGES:
+        if use_bn and bn_stages < (
+            SMEM_B1_MIN_STAGES_RS if use_rows else SMEM_B1_MIN_STAGES
+        ):
             use_bn = False
             use_rows = False
         elif use_bn:
             stages = bn_stages
+    if n_pad <= TAIL_STAGE_TRIM_MAX_N_PAD:
+        stages = max(
+            stages - TAIL_STAGE_TRIM,
+            SMEM_B1_MIN_STAGES_RS
+            if use_rows
+            else (SMEM_B1_MIN_STAGES if use_bn else 2),
+        )
     return dict(
         grid=grid,
         n_pad=n_pad,
@@ -321,7 +350,7 @@ def decode_tail_plan(
         rows_smem=bool(use_rows),
         timeline=False,
         gate_pro=GATE_PRO,
-        tmap_prefetch=True,
+        tmap_prefetch=not (use_rows and n_pad >= ROWS_NO_TMAP_PREFETCH_MIN_N_PAD),
         tiles=tiles,
         k1=k1,
         k2=k2,
@@ -360,6 +389,7 @@ BLOCK_K = 64
 FRONT_R_TILES = (NUM_EXPERTS + BLOCK_N - 1) // BLOCK_N  # 4
 FRONT_L_TILES = LATENT // BLOCK_N  # 14
 TAIL_N_TILES = HIDDEN // BLOCK_N  # 28
+TAIL_EPI_WARPS = 8  # prefill tail GEMM epilogue warps (fused norm: one latent row each)
 GROUP_M = 16
 NORM_THREADS = 128
 NORM_ROWS_PER_CTA = NORM_THREADS // 32
@@ -368,6 +398,7 @@ SK_MIN_NUM_K = 64
 SK_MIN_ITERS = 32
 SK_FIXUP_ITERS = 12
 SK_MIN_REUSE_ROWS = 8
+SK_PARTIAL_REUSE_MAX_REM_PCT = 55
 
 FRONT_KWARGS = (
     "A",
@@ -398,6 +429,12 @@ TAIL_GEMM_KWARGS = (
     "sk_ipc",
     "sk_max_seg",
     "sk_total",
+    "routed",
+    "norm_weight",
+    "y_out",
+    "norm_counter",
+    "num_partials",
+    "eps",
     "grid",
 )
 
@@ -442,8 +479,31 @@ def norm_kernel_key(early_trigger: bool) -> str:
     return f"tail_norm:e{1 if early_trigger else 0}"
 
 
-def tail_gemm_kernel_key(tp: int, weights_evict_first: bool) -> str:
-    return f"tail_gemm:tp{int(tp)}e{1 if weights_evict_first else 0}"
+# Ring depth of the prefill tail GEMM per row (Cake round-6 lever ledger, mirrored from
+# ``kimi_k3_latent_moe_tail.tail_gemm_config_for``): 6 stages for the TP1 rows at
+# T <= 256 (+1.0..+1.2 % in five paired samples on B200 and B300), 7 everywhere else.
+TAIL_NUM_STAGES = 7
+TAIL_RING6_TP = 1
+TAIL_RING6_MAX_T = 256
+TAIL_RING6_STAGES = 6
+
+
+def tail_gemm_num_stages(M: int, tp: int) -> int:
+    if int(tp) == TAIL_RING6_TP and int(M) <= TAIL_RING6_MAX_T:
+        return TAIL_RING6_STAGES
+    return TAIL_NUM_STAGES
+
+
+def tail_gemm_kernel_key(
+    tp: int,
+    weights_evict_first: bool,
+    fused_norm: bool = False,
+    num_stages: int = TAIL_NUM_STAGES,
+) -> str:
+    key = f"tail_gemm:tp{int(tp)}e{1 if weights_evict_first else 0}f{1 if fused_norm else 0}"
+    if int(num_stages) != TAIL_NUM_STAGES:
+        key += f"s{int(num_stages)}"
+    return key
 
 
 def _sk_max_seg(sk_tiles: int, num_k: int, ipc: int) -> int:
@@ -471,9 +531,18 @@ def split_plan(
         "sk_total": 0,
         "sk_tiles": 0,
     }
-    if rem == 0 or num_k < SK_MIN_NUM_K or 1 < reuse_rows < SK_MIN_REUSE_ROWS:
+    partial_reuse = 1 < reuse_rows < SK_MIN_REUSE_ROWS
+    if (
+        rem == 0
+        or num_k < SK_MIN_NUM_K
+        or (
+            partial_reuse
+            and (full == 0 or rem * 100 > SK_PARTIAL_REUSE_MAX_REM_PCT * resident)
+        )
+    ):
         return plan
-    for sk_tiles in (rem, rem + resident):
+    # Partial B-tile reuse: split only the remainder wave after a full wave (never the folded last full wave).
+    for sk_tiles in (rem,) if partial_reuse else (rem, rem + resident):
         if sk_tiles > cluster_tiles:
             continue
         full_i = cluster_tiles - sk_tiles
@@ -509,6 +578,21 @@ def weights_evict_first(gemm_ctas: int, sm_count: int) -> bool:
     return gemm_ctas <= sm_count
 
 
+FUSED_MIN_K2_ITERS = 48
+
+
+def fused_norm_fits(M: int, gemm_ctas: int, sm_count: int) -> bool:
+    """Single-wave grids whose epilogue warps can own every latent row (one row per warp)."""
+    return gemm_ctas <= sm_count and TAIL_EPI_WARPS * gemm_ctas >= M
+
+
+def use_fused_norm(M: int, gemm_ctas: int, sm_count: int, k2_iters: int) -> bool:
+    """One launch (the GEMM's epilogue warps normalise the latent while the shared-expert K blocks
+    stream) when the grid is single-wave and the shared-expert window of ``k2_iters`` 64-wide K
+    blocks hides the normalisation: TP1 (96 blocks) fuses, TP8 (12 blocks) keeps the norm launch."""
+    return fused_norm_fits(M, gemm_ctas, sm_count) and k2_iters >= FUSED_MIN_K2_ITERS
+
+
 def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, Any]:
     """Host plan of the prefill tail chain (norm launch + persistent GEMM) for ``M`` tokens."""
     k_up = k_up_for_tp(tp)
@@ -532,6 +616,8 @@ def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, An
         gemm_grid=gemm_grid,
         early_trigger=bool(early),
         weights_evict_first=bool(weights_evict_first(gemm_grid, sm_count)),
+        fused_norm=bool(use_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)),
+        num_stages=tail_gemm_num_stages(M, tp),
         **sk,
     )
 
@@ -564,10 +650,12 @@ def route_kernel_keys(
                 ),
             )
         plan = prefill_tail_plan(num_tokens, tp, sm_count)
-        return (
-            norm_kernel_key(plan["early_trigger"]),
-            tail_gemm_kernel_key(tp, plan["weights_evict_first"]),
+        gemm = tail_gemm_kernel_key(
+            tp, plan["weights_evict_first"], plan["fused_norm"], plan["num_stages"]
         )
+        if plan["fused_norm"]:
+            return (gemm,)
+        return (norm_kernel_key(plan["early_trigger"]), gemm)
     raise ValueError(f"stage must be 'front' or 'tail', got {stage!r}")
 
 
@@ -631,7 +719,9 @@ def generated_program_available(
 # ---------------------------------------------------------------------------
 
 _SCRATCH: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
-_TAIL_WS: dict[tuple[int, int, int], tuple[torch.Tensor, torch.Tensor]] = {}
+_TAIL_WS: dict[
+    tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+] = {}
 
 
 def _scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -657,8 +747,9 @@ def _scratch(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Te
 
 def _tail_workspace(
     device: torch.device, sk_tiles: int, max_seg: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Stream-K fp32 partial workspace + self-resetting arrival counters (per device and plan class)."""
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Stream-K fp32 partial workspace, self-resetting arrival counters and the fused-norm grid
+    semaphore (self-wrapping ``atom.inc``, never reset) per device and plan class."""
     index = device.index if device.index is not None else torch.cuda.current_device()
     key = (index, int(sk_tiles), int(max_seg))
     entry = _TAIL_WS.get(key)
@@ -668,6 +759,7 @@ def _tail_workspace(
         entry = (
             torch.empty(n * BLOCK_M * BLOCK_N, dtype=torch.float32, device=dev),
             torch.zeros(max(2, sk_tiles * CTA_GROUP), dtype=torch.int32, device=dev),
+            torch.zeros(4, dtype=torch.uint32, device=dev),
         )
         _TAIL_WS[key] = entry
     return entry
@@ -998,21 +1090,12 @@ def prepare_kimi_k3_latent_moe_tail(
             route = "decode"
         else:
             plan = prefill_tail_plan(T, tp)
-            norm_key = norm_kernel_key(plan["early_trigger"])
-            norm_kwargs = dict(
-                routed=routed,
-                norm_weight=norm_weight,
-                y_out=y_workspace,
-                M=T,
-                num_partials=P,
-                eps=float(RMS_EPS),
-                grid=(int(plan["norm_grid"]), 1, 1),
+            ws, counters, norm_counter = _tail_workspace(
+                device, plan["sk_tiles"], plan["sk_max_seg"]
             )
-            assert tuple(norm_kwargs) == NORM_KWARGS
-            norm_module = kernel_module_name(arch, norm_key)
-            norm_entry, norm_arguments = _bind(norm_module, norm_kwargs)
-            ws, counters = _tail_workspace(device, plan["sk_tiles"], plan["sk_max_seg"])
-            gemm_key = tail_gemm_kernel_key(tp, plan["weights_evict_first"])
+            gemm_key = tail_gemm_kernel_key(
+                tp, plan["weights_evict_first"], plan["fused_norm"], plan["num_stages"]
+            )
             gemm_kwargs = dict(
                 A1=y_workspace,
                 B1=up_weight,
@@ -1029,29 +1112,54 @@ def prepare_kimi_k3_latent_moe_tail(
                 sk_ipc=int(plan["sk_ipc"]),
                 sk_max_seg=int(plan["sk_max_seg"]),
                 sk_total=int(plan["sk_total"]),
+                routed=routed,
+                norm_weight=norm_weight,
+                y_out=y_workspace,
+                norm_counter=norm_counter,
+                num_partials=P,
+                eps=float(RMS_EPS),
                 grid=(int(plan["gemm_grid"]), 1, 1),
             )
             assert tuple(gemm_kwargs) == TAIL_GEMM_KWARGS
             gemm_module = kernel_module_name(arch, gemm_key)
             gemm_entry, gemm_arguments = _bind(gemm_module, gemm_kwargs)
-            launches = (
-                _Launch(
-                    "tail_norm",
-                    norm_key,
-                    norm_module,
-                    norm_kwargs,
-                    norm_entry,
-                    norm_arguments,
-                ),
-                _Launch(
-                    "tail_gemm",
-                    gemm_key,
-                    gemm_module,
-                    gemm_kwargs,
-                    gemm_entry,
-                    gemm_arguments,
-                ),
+            gemm_launch = _Launch(
+                "tail_gemm",
+                gemm_key,
+                gemm_module,
+                gemm_kwargs,
+                gemm_entry,
+                gemm_arguments,
             )
+            if plan["fused_norm"]:
+                # One launch: the GEMM's epilogue warps normalise the latent rows into
+                # ``y_workspace`` while its load warp streams the shared-expert K blocks.
+                launches = (gemm_launch,)
+            else:
+                norm_key = norm_kernel_key(plan["early_trigger"])
+                norm_kwargs = dict(
+                    routed=routed,
+                    norm_weight=norm_weight,
+                    y_out=y_workspace,
+                    M=T,
+                    num_partials=P,
+                    eps=float(RMS_EPS),
+                    grid=(int(plan["norm_grid"]), 1, 1),
+                )
+                assert tuple(norm_kwargs) == NORM_KWARGS
+                norm_module = kernel_module_name(arch, norm_key)
+                norm_entry, norm_arguments = _bind(norm_module, norm_kwargs)
+                launches = (
+                    _Launch(
+                        "tail_norm",
+                        norm_key,
+                        norm_module,
+                        norm_kwargs,
+                        norm_entry,
+                        norm_arguments,
+                    ),
+                    gemm_launch,
+                )
             route = "prefill"
     return KimiK3LatentMoeRunner(
         "tail", tp, rank, T, arch, route, plan, launches, (y_workspace, out)
@@ -1115,5 +1223,8 @@ __all__ = [
     "route_kernel_keys",
     "split_plan",
     "tail_gemm_kernel_key",
+    "use_fused_norm",
+    "fused_norm_fits",
+    "FUSED_MIN_K2_ITERS",
     "weights_evict_first",
 ]
