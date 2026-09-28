@@ -107,7 +107,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_radix_topk_c1_e4(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c1_e4(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -199,7 +199,7 @@ kernel_cake_radix_topk_c1_e4(float* __restrict__ probs, int* __restrict__ topk_a
             vals[3] = 0.0f;
         }
     }
-    if (gridDim.x * 2 <= 128) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_2 = tid; i_2 < 2048; i_2 += 512) {
@@ -1528,7 +1528,7 @@ kernel_cake_radix_topk_c1_e4(float* __restrict__ probs, int* __restrict__ topk_a
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         __syncthreads();
         if (rank == 0 && warp == 0) {
             float p_row = ((topp_kind == 2) ? topp_arr[row] : topp_scalar);
@@ -2157,7 +2157,7 @@ kernel_cake_radix_topk_c1_e4(float* __restrict__ probs, int* __restrict__ topk_a
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_radix_topk_c1_e8(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c1_e8(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -2290,7 +2290,7 @@ kernel_cake_radix_topk_c1_e8(float* __restrict__ probs, int* __restrict__ topk_a
             vals[7] = 0.0f;
         }
     }
-    if (gridDim.x * 2 <= 128) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_2 = tid; i_2 < 2048; i_2 += 512) {
@@ -3983,7 +3983,7 @@ kernel_cake_radix_topk_c1_e8(float* __restrict__ probs, int* __restrict__ topk_a
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         __syncthreads();
         if (rank == 0 && warp == 0) {
             float p_row = ((topp_kind == 2) ? topp_arr[row] : topp_scalar);
@@ -4612,7 +4612,7 @@ kernel_cake_radix_topk_c1_e8(float* __restrict__ probs, int* __restrict__ topk_a
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_radix_topk_c1_e16(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c1_e16(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -4827,7 +4827,7 @@ kernel_cake_radix_topk_c1_e16(float* __restrict__ probs, int* __restrict__ topk_
             vals[15] = 0.0f;
         }
     }
-    if (gridDim.x * 2 <= 128) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_4 = tid; i_4 < 2048; i_4 += 512) {
@@ -7248,7 +7248,7 @@ kernel_cake_radix_topk_c1_e16(float* __restrict__ probs, int* __restrict__ topk_
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         __syncthreads();
         if (rank == 0 && warp == 0) {
             float p_row = ((topp_kind == 2) ? topp_arr[row] : topp_scalar);
@@ -7877,7 +7877,7 @@ kernel_cake_radix_topk_c1_e16(float* __restrict__ probs, int* __restrict__ topk_
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_radix_topk_c1_e32(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c1_e32(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -8256,7 +8256,7 @@ kernel_cake_radix_topk_c1_e32(float* __restrict__ probs, int* __restrict__ topk_
             vals[31] = 0.0f;
         }
     }
-    if (gridDim.x * 2 <= 128) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_8 = tid; i_8 < 2048; i_8 += 512) {
@@ -12133,7 +12133,7 @@ kernel_cake_radix_topk_c1_e32(float* __restrict__ probs, int* __restrict__ topk_
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         __syncthreads();
         if (rank == 0 && warp == 0) {
             float p_row = ((topp_kind == 2) ? topp_arr[row] : topp_scalar);
@@ -12762,7 +12762,7 @@ kernel_cake_radix_topk_c1_e32(float* __restrict__ probs, int* __restrict__ topk_
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(2,1,1) void
-kernel_cake_radix_topk_c2_e4(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c2_e4(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -12859,7 +12859,7 @@ kernel_cake_radix_topk_c2_e4(float* __restrict__ probs, int* __restrict__ topk_a
             vals[3] = 0.0f;
         }
     }
-    if (gridDim.x * 3 <= 256) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_2 = tid; i_2 < 2048; i_2 += 512) {
@@ -14392,7 +14392,7 @@ kernel_cake_radix_topk_c2_e4(float* __restrict__ probs, int* __restrict__ topk_a
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         if (rank == 0 && warp == 0) {
@@ -15022,7 +15022,7 @@ kernel_cake_radix_topk_c2_e4(float* __restrict__ probs, int* __restrict__ topk_a
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(2,1,1) void
-kernel_cake_radix_topk_c2_e16(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c2_e16(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -15242,7 +15242,7 @@ kernel_cake_radix_topk_c2_e16(float* __restrict__ probs, int* __restrict__ topk_
             vals[15] = 0.0f;
         }
     }
-    if (gridDim.x * 3 <= 256) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_4 = tid; i_4 < 2048; i_4 += 512) {
@@ -17867,7 +17867,7 @@ kernel_cake_radix_topk_c2_e16(float* __restrict__ probs, int* __restrict__ topk_
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         if (rank == 0 && warp == 0) {
@@ -18497,7 +18497,7 @@ kernel_cake_radix_topk_c2_e16(float* __restrict__ probs, int* __restrict__ topk_
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(2,1,1) void
-kernel_cake_radix_topk_c2_e32(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c2_e32(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -18881,7 +18881,7 @@ kernel_cake_radix_topk_c2_e32(float* __restrict__ probs, int* __restrict__ topk_
             vals[31] = 0.0f;
         }
     }
-    if (gridDim.x * 3 <= 256) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_8 = tid; i_8 < 2048; i_8 += 512) {
@@ -22962,7 +22962,7 @@ kernel_cake_radix_topk_c2_e32(float* __restrict__ probs, int* __restrict__ topk_
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         if (rank == 0 && warp == 0) {
@@ -23592,7 +23592,7 @@ kernel_cake_radix_topk_c2_e32(float* __restrict__ probs, int* __restrict__ topk_
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(4,1,1) void
-kernel_cake_radix_topk_c4_e16(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c4_e16(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -23812,7 +23812,7 @@ kernel_cake_radix_topk_c4_e16(float* __restrict__ probs, int* __restrict__ topk_
             vals[15] = 0.0f;
         }
     }
-    if (gridDim.x * 5 <= 512) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_4 = tid; i_4 < 2048; i_4 += 512) {
@@ -26645,7 +26645,7 @@ kernel_cake_radix_topk_c4_e16(float* __restrict__ probs, int* __restrict__ topk_
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         if (rank == 0 && warp == 0) {
@@ -27275,7 +27275,7 @@ kernel_cake_radix_topk_c4_e16(float* __restrict__ probs, int* __restrict__ topk_
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(4,1,1) void
-kernel_cake_radix_topk_c4_e32(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c4_e32(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -27659,7 +27659,7 @@ kernel_cake_radix_topk_c4_e32(float* __restrict__ probs, int* __restrict__ topk_
             vals[31] = 0.0f;
         }
     }
-    if (gridDim.x * 5 <= 512) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_8 = tid; i_8 < 2048; i_8 += 512) {
@@ -31948,7 +31948,7 @@ kernel_cake_radix_topk_c4_e32(float* __restrict__ probs, int* __restrict__ topk_
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         if (rank == 0 && warp == 0) {
@@ -32578,7 +32578,7 @@ kernel_cake_radix_topk_c4_e32(float* __restrict__ probs, int* __restrict__ topk_
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
-kernel_cake_radix_topk_c8_e16(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c8_e16(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -32798,7 +32798,7 @@ kernel_cake_radix_topk_c8_e16(float* __restrict__ probs, int* __restrict__ topk_
             vals[15] = 0.0f;
         }
     }
-    if (gridDim.x * 9 <= 1024) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_4 = tid; i_4 < 2048; i_4 += 512) {
@@ -36047,7 +36047,7 @@ kernel_cake_radix_topk_c8_e16(float* __restrict__ probs, int* __restrict__ topk_
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         if (rank == 0 && warp == 0) {
@@ -36677,7 +36677,7 @@ kernel_cake_radix_topk_c8_e16(float* __restrict__ probs, int* __restrict__ topk_
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
-kernel_cake_radix_topk_c8_e32(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c8_e32(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -37061,7 +37061,7 @@ kernel_cake_radix_topk_c8_e32(float* __restrict__ probs, int* __restrict__ topk_
             vals[31] = 0.0f;
         }
     }
-    if (gridDim.x * 9 <= 1024) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_8 = tid; i_8 < 2048; i_8 += 512) {
@@ -41766,7 +41766,7 @@ kernel_cake_radix_topk_c8_e32(float* __restrict__ probs, int* __restrict__ topk_
             out_count[row] = k;
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         if (rank == 0 && warp == 0) {
@@ -42396,7 +42396,7 @@ kernel_cake_radix_topk_c8_e32(float* __restrict__ probs, int* __restrict__ topk_
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
-kernel_cake_radix_topk_c8_e48(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c8_e48(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -42944,7 +42944,7 @@ kernel_cake_radix_topk_c8_e48(float* __restrict__ probs, int* __restrict__ topk_
             vals[47] = 0.0f;
         }
     }
-    if (gridDim.x * 9 <= 1024) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     for (int i_12 = tid; i_12 < 2048; i_12 += 512) {
@@ -49180,7 +49180,7 @@ kernel_cake_radix_topk_c8_e48(float* __restrict__ probs, int* __restrict__ topk_
 extern "C" {
 
 __global__ __launch_bounds__(512) void
-kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -49245,7 +49245,7 @@ kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    if (gridDim.x * 2 <= 128) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if ((vocab & 3) == 0) {
@@ -57884,7 +57884,7 @@ kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk
             }
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         __syncthreads();
         if (rank == 0 && warp == 0) {
             float p_row = ((topp_kind == 2) ? topp_arr[row] : topp_scalar);
@@ -58527,7 +58527,7 @@ kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(2,1,1) void
-kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -58597,7 +58597,7 @@ kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    if (gridDim.x * 3 <= 256) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if ((vocab & 3) == 0) {
@@ -67581,7 +67581,7 @@ kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk
             }
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         if (rank == 0 && warp == 0) {
@@ -68225,7 +68225,7 @@ kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(4,1,1) void
-kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -68295,7 +68295,7 @@ kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    if (gridDim.x * 5 <= 512) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if ((vocab & 3) == 0) {
@@ -77641,7 +77641,7 @@ kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk
             }
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         if (rank == 0 && warp == 0) {
@@ -78285,7 +78285,7 @@ kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk
 extern "C" {
 
 __global__ __launch_bounds__(512) __cluster_dims__(8,1,1) void
-kernel_cake_radix_topk_c8_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int fuse_tail)
+kernel_cake_radix_topk_c8_e16s(float* __restrict__ probs, int* __restrict__ topk_arr, float* __restrict__ out_vals, int* __restrict__ out_idx, int* __restrict__ out_count, int vocab, int topk_scalar, int topk_kind, float* __restrict__ topp_arr, int* __restrict__ out_samples, float* __restrict__ out_renorm, float topp_scalar, int topp_kind, unsigned int seed_lo, unsigned int seed_hi, unsigned int offset_lo, unsigned int offset_hi, int emit_renorm, int launch_flags)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -78355,7 +78355,7 @@ kernel_cake_radix_topk_c8_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    if (gridDim.x * 9 <= 1024) {
+    if ((launch_flags & 2) != 0) {
         asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     }
     if ((vocab & 3) == 0) {
@@ -88425,7 +88425,7 @@ kernel_cake_radix_topk_c8_e16s(float* __restrict__ probs, int* __restrict__ topk
             }
         }
     }
-    if (fuse_tail != 0 && k <= 64) {
+    if ((launch_flags & 1) != 0 && k <= 64) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
         if (rank == 0 && warp == 0) {

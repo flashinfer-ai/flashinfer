@@ -35,14 +35,15 @@
   "schema_version": 1,
   "semantics": {
     "determinism": "strict: no atomics decide any output; slab (vals, idx) is rewritten in sorted order and renorm_out is emitted in that order, bitwise identical across launches, CUDA-graph replay and every kernel variant",
-    "fused_tail": "stage 1 takes the stage-2/3 parameters and a host flag fuse_tail; on a variant whose entry has fused_tail true, fuse_tail set and max top-k <= fused_tail_kcap runs every row's stage 2/3 inside the stage-1 kernel (warp 0 of rank 0 after one cluster barrier) with the same outputs, and the stage-2/3 kernel is not launched; variants with fused_tail false (the ept = 48 resident, a large-k pick) are built without the tail and reject fuse_tail",
+    "early_trigger": "launch_flags bit 1 makes stage 1 issue griddepcontrol.launch_dependents before its first pass so a PDL-chained stage-2/3 launch starts on the SMs this grid leaves free; the host sets it only when batch <= sm_count - (batch * cluster mod sm_count, or sm_count) so the dependent CTAs are not packed onto a few SMs; otherwise the trigger is left to CTA exit",
+    "fused_tail": "stage 1 takes the stage-2/3 parameters and a host launch_flags word (bit 0 = fuse the tail, bit 1 = early PDL trigger); on a variant whose entry has fused_tail true, bit 0 set and max top-k <= fused_tail_kcap runs every row's stage 2/3 inside the stage-1 kernel (warp 0 of rank 0 after one cluster barrier) with the same outputs, and the stage-2/3 kernel is not launched; variants with fused_tail false (the ept = 48 resident, a large-k pick) are built without the tail and reject bit 0",
     "nan_inf": "NaN, negative and -0.0 probabilities are sanitized to +0 and never sampled; a row containing +inf keeps exactly its +inf entries, samples uniformly among them and renormalizes to 1/m; a zero-mass row returns its smallest slab index with an all-zero renorm",
     "rng": "one curand_uniform per row from curand_init(seed, row, offset) (Philox4x32-10); a shared torch.Generator is advanced by 32 * batch like the FlashInfer top-p routes",
     "top_k": "first k entries of lexsort(-prob, index): k largest sanitized probabilities, ties toward the lower vocabulary index; k clamped to [1, min(vocab, slab_entries)]",
     "top_p": "shortest sorted prefix whose exclusive exact fixed-point mass is below p * mass(top-k), renormalized in float64; p clamped to (0, 1] (p <= 0 -> argmax, NaN -> 1)"
   },
   "slab_entries": 1024,
-  "source_sha256": "adf6d3c16070b767477032e599e2b33020f3c6811456b13b2c4ae71c9b915b37",
+  "source_sha256": "52cc1f5132228528b39b835bd4468d5f165877c25702f2ef0e050595008838dc",
   "stage1": [
     {
       "block_threads": 512,
