@@ -31,6 +31,7 @@ import pytest
 import torch
 
 from flashinfer.cake_sampling import (
+    _early_trigger_flag,
     _stage1_variants,
     cake_sampling_route,
     choose_stage1,
@@ -242,7 +243,7 @@ def _ws(batch):
     )
 
 
-def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True) -> Run:
+def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True, flags=0) -> Run:
     batch = probs.shape[0]
     ws = _ws(batch)
     renorm = torch.full((batch, SLAB), float("nan"), device="cuda")
@@ -292,7 +293,7 @@ def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True) -> Run:
             seed,
             offset,
             1,
-            0,  # explicit two-launch form: the fused tail is exercised by the pipeline route
+            flags,  # explicit two-launch form (bit 0 clear): the fused tail is the pipeline route's
             stream,
         )
         module.sparse_topp_sample(
@@ -1151,12 +1152,24 @@ def test_fused_tail_matches_two_launch_form():
     assert [v["symbol"] for v in man["stage1"] if not v["fused_tail"]] == [
         "kernel_cake_radix_topk_c8_e48"
     ]
+    # Dispatch tables of the measured architectures (full 227 KB opt-in).  On 12.x devices (99 KB)
+    # the streaming variants drop out and (8, 48) can be the only cover of V > 131072: those calls take
+    # the two-launch form, which the dispatcher selects from the manifest's fused_tail flags.
     for sm_count in (132, 148, 212):
         for vocab in (32768, 50257, 128256, 151936, 152064, 202048, 262144):
             for batch in (1, 2, 4, 8, 16, 32, 64, 128, 256):
-                c, e, s = choose_stage1(vocab=vocab, batch=batch, sm_count=sm_count, top_k_max=kcap)
+                c, e, s = choose_stage1(
+                    vocab=vocab,
+                    batch=batch,
+                    sm_count=sm_count,
+                    top_k_max=kcap,
+                    smem_limit=_FULL_SMEM_OPTIN,
+                )
                 assert (c, e) != (8, 48), (sm_count, vocab, batch)
+    streams_ok = _device_streams()  # 12.x devices (99 KB opt-in) cannot launch the streaming variants
     for vocab, batch in ((32768, 5), (128256, 3), (262144, 2)):
+        if vocab > 196608 and not streams_ok:
+            continue  # no frozen variant covers this vocabulary here; the dispatcher routes to top_k_first
         probs = _probs(batch, vocab, seed=41 + vocab % 97)
         pn = probs.cpu().numpy()
         pn[0, (np.arange(300) * 13) % vocab] = np.float32(2**-11)  # ties across the k boundary
@@ -1171,7 +1184,10 @@ def test_fused_tail_matches_two_launch_form():
         s1 = [
             (v["cluster"], v["ept"], bool(v.get("stream", 0)))
             for v in man["stage1"]
-            if 512 * v["cluster"] * v["ept"] >= vocab or v.get("stream", 0)
+            if (
+                (v.get("stream", 0) and streams_ok)
+                or (not v.get("stream", 0) and 512 * v["cluster"] * v["ept"] >= vocab)
+            )
         ]
         assert s1
         for k, p in ((kcap, 0.9), (max(1, kcap // 4), p_row), (k_row, 0.75), (1, 1.0)):
@@ -1197,6 +1213,55 @@ def test_fused_tail_matches_two_launch_form():
     probs = _probs(2, 32768, seed=5)
     _run_and_check(probs, kcap, 0.9, 1, 2)
     _run_and_check(probs, kcap + 1, 0.9, 1, 2)
+
+
+def test_early_trigger_flag_and_bitwise_outputs():
+    """Stage-1 launch_flags bit 1 (early PDL trigger) is set only when the stage-2/3 CTAs fit on the
+    SMs the last stage-1 wave leaves free; both trigger points give bitwise identical outputs."""
+    # 148 SMs: B=32 cluster 4 -> grid 128, 20 free SMs < 32 rows -> exit trigger; B=16 -> 84 free -> early.
+    assert _early_trigger_flag(32, 4, 148) == 0
+    assert _early_trigger_flag(16, 4, 148) == 2
+    assert _early_trigger_flag(1, 8, 148) == 2
+    # 212 SMs: B=32 cluster 4 -> 84 free SMs >= 32 -> early (the R200 cells the constant rule missed).
+    assert _early_trigger_flag(32, 4, 212) == 2
+    assert _early_trigger_flag(64, 2, 212) == 2
+    # B=128 cluster 1 -> grid 128, 84 free SMs < 128 rows -> exit trigger; cluster 2 -> grid 256,
+    # last wave 44 -> 168 free -> early.
+    assert _early_trigger_flag(128, 1, 212) == 0
+    assert _early_trigger_flag(128, 2, 212) == 2
+    # full waves leave no SM free; a grid larger than the device never fits.
+    assert _early_trigger_flag(148, 1, 148) == 0
+    assert _early_trigger_flag(37, 4, 148) == 0
+    assert _early_trigger_flag(160, 4, 148) == 0
+    _require_supported_device()
+    man = load_manifest()
+    probs = _probs(32, 32768, seed=17)
+    pn = probs.cpu().numpy()
+    streams_ok = _device_streams()
+    for k, p in ((1000, 0.9), (200, 0.5)):
+        base = _run_and_check(probs, k, p, 0xEA51, 4)[0]
+        for v in man["stage1"]:
+            if v.get("stream", 0) and not streams_ok:
+                continue  # 165 KB streaming variants exceed the 12.x opt-in
+            if not v.get("stream", 0) and 512 * v["cluster"] * v["ept"] < 32768:
+                continue
+            s1 = (v["cluster"], v["ept"], bool(v.get("stream", 0)))
+            for flags in (0, 2):
+                run = _run(probs, k, p, 0xEA51, 4, variant=(s1, (256, 4)), flags=flags)
+                _check(run, pn, k, p, 0xEA51, 4)
+                assert np.array_equal(run.samples, base.samples), (s1, flags)
+                assert np.array_equal(run.vals[:, :k].view(np.uint32), base.vals[:, :k].view(np.uint32))
+                assert np.array_equal(run.idx[:, :k], base.idx[:, :k]), (s1, flags)
+    # bit 0 on the tail-less (8, 48) resident is rejected; bit 1 alone is accepted there.
+    vals, idxs, cnt = _ws(2)
+    probs2 = _probs(2, 32768, seed=3)
+    module = load_cake_sampling_module()
+    stream = torch.cuda.current_stream().cuda_stream
+    args = [probs2, cnt, 10, 1, vals, idxs, cnt, 8, 48, 0, probs2, 0.9, 1, cnt, vals, 0, 0, 0]
+    module.radix_topk(*args, 2, stream)
+    torch.cuda.synchronize()
+    with pytest.raises(Exception, match="fused tail"):
+        module.radix_topk(*args, 1, stream)
 
 
 def test_adv_stage1_slab_is_deterministic_and_exact():

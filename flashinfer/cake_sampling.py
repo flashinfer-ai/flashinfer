@@ -158,6 +158,20 @@ def _stage1_has_fused_tail(cluster: int, ept: int, stream: bool) -> bool:
     raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
 
 
+_FLAG_FUSE_TAIL = 1
+_FLAG_EARLY_TRIGGER = 2
+
+
+def _early_trigger_flag(batch: int, cluster: int, sm_count: int) -> int:
+    """Stage-1 ``launch_flags`` bit that lets the PDL-chained stage-2/3 launch start before stage 1
+    ends.  Its ``batch`` CTAs are placed on the SMs free at trigger time and keep that placement; one
+    stage-1 CTA occupies an SM, so the dependent must fit next to the last stage-1 wave or it gets
+    packed onto a few SMs and its tail grows 1.5-2.5x.  Otherwise stage 1 triggers at CTA exit."""
+    grid = int(batch) * int(cluster)
+    last_wave = grid % int(sm_count) or int(sm_count)
+    return _FLAG_EARLY_TRIGGER if int(batch) <= int(sm_count) - last_wave else 0
+
+
 @functools.cache
 def _sm_count(device_index: int) -> int:
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
@@ -467,6 +481,12 @@ def top_k_top_p_sampling_from_probs(
     fused = kmax <= _fused_tail_kcap() and _stage1_has_fused_tail(
         cluster, ept, bool(stream_variant)
     )
+    # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave.
+    launch_flags = (
+        _FLAG_FUSE_TAIL
+        if fused
+        else _early_trigger_flag(batch, cluster, _sm_count(probs.device.index))
+    )
     module.radix_topk(
         probs,
         k_arr,
@@ -486,7 +506,7 @@ def top_k_top_p_sampling_from_probs(
         int(philox_seed) & 0xFFFFFFFFFFFFFFFF,
         int(philox_offset) & 0xFFFFFFFFFFFFFFFF,
         1 if renorm_out is not None else 0,
-        1 if fused else 0,
+        launch_flags,
         stream,
     )
     if fused:
@@ -591,7 +611,7 @@ def top_k_probs_to_slab(
         cluster,
         ept,
         1 if stream_variant else 0,
-        vals,  # stage-2/3 tensors: unused with fuse_tail == 0
+        vals,  # stage-2/3 tensors: unused without launch_flags bit 0
         1.0,
         _TOPP_SCALAR,
         cnt,
@@ -599,7 +619,7 @@ def top_k_probs_to_slab(
         0,
         0,
         0,
-        0,
+        0,  # launch_flags: no fused tail, no PDL dependent follows
         stream,
     )
     return vals, idxs, cnt

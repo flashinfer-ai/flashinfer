@@ -63,6 +63,9 @@ namespace cake_sampling {
 
 constexpr int64_t kSlab = CAKE_SAMPLING_SLAB;
 constexpr int64_t kFusedTailKCap = CAKE_SAMPLING_FUSED_TAIL_KCAP;
+// Stage-1 launch_flags bits (see RadixTopK): fused stage-2/3 tail, early PDL trigger.
+constexpr int64_t kFlagFuseTail = 1;
+constexpr int64_t kFlagEarlyTrigger = 2;
 constexpr int32_t kTopKScalar = 1;
 constexpr int32_t kTopKPerRow = 2;
 constexpr int32_t kTopPScalar = 1;
@@ -103,7 +106,7 @@ struct Stage1Variant {
   int32_t stream;  // 1: streaming variant (any vocab, runtime chunk count); 0: register-resident
   int32_t threads;
   int32_t smem_bytes;
-  int32_t fused_tail;  // 1: built with the fused stage-2/3 tail (accepts fuse_tail != 0)
+  int32_t fused_tail;  // 1: built with the fused stage-2/3 tail (accepts launch_flags bit 0)
 };
 
 struct Stage23Variant {
@@ -194,18 +197,23 @@ inline void CheckSlab(const TensorView& vals, const TensorView& idx, const Tenso
 //   topk_arr   int32 [batch] (only read when topk_kind == kTopKPerRow; pass any int32 CUDA tensor
 //   otherwise) cluster/ept/stream_variant select the frozen variant; a register-resident variant
 //   (stream_variant == 0) needs cluster * ept * threads >= vocab, a streaming one covers any vocab.
-//   Fused tail: with fuse_tail != 0 every row whose k <= CAKE_SAMPLING_FUSED_TAIL_KCAP runs stage 2/3
+//   launch_flags bit 0 (fused tail): every row whose k <= CAKE_SAMPLING_FUSED_TAIL_KCAP runs stage 2/3
 //   (top-p, sample, sorted write-back, renorm; same semantics and outputs as SparseTopPSample) inside
 //   this kernel, so the host must not launch SparseTopPSample afterwards; the stage-2/3 arguments
 //   (topp_arr / topp_scalar / topp_kind / out_samples / out_renorm / seed / offset / emit_renorm) are
 //   only read then.  Rows with k above the fused capacity are left to SparseTopPSample, so the host
-//   sets fuse_tail only when the largest top-k of the batch fits.  With fuse_tail == 0 pass any valid
-//   CUDA tensors for the stage-2/3 tensors (they are never dereferenced).
+//   sets bit 0 only when the largest top-k of the batch fits.  Without it pass any valid CUDA
+//   tensors for the stage-2/3 tensors (they are never dereferenced).
+//   launch_flags bit 1 (early PDL trigger): the kernel signals griddepcontrol.launch_dependents before
+//   its first pass, so a programmatic-dependent SparseTopPSample launch is resident (spinning in its
+//   griddepcontrol.wait) when stage 1 ends.  Its CTAs are placed on the SMs free at that moment and
+//   keep that placement, so the host sets bit 1 only when the batch fits next to the last stage-1
+//   wave (see cake_sampling.py); otherwise the trigger happens at CTA exit.  Other bits are ignored.
 void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64_t topk_kind,
                TensorView out_vals, TensorView out_idx, TensorView out_count, int64_t cluster,
                int64_t ept, int64_t stream_variant, TensorView topp_arr, double topp_scalar,
                int64_t topp_kind, TensorView out_samples, TensorView out_renorm, int64_t seed,
-               int64_t offset, int64_t emit_renorm, int64_t fuse_tail, int64_t cuda_stream) {
+               int64_t offset, int64_t emit_renorm, int64_t launch_flags, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(probs);
   const int32_t device_id = probs.device().device_id;
@@ -244,12 +252,14 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   CHECK_CUDA(topp_arr);
   CHECK_CUDA(out_samples);
   CHECK_CUDA(out_renorm);
-  if (fuse_tail != 0) {
+  TVM_FFI_ICHECK(launch_flags >= 0) << "launch_flags must be non-negative";
+  const bool fuse_tail = (launch_flags & kFlagFuseTail) != 0;
+  if (fuse_tail) {
     TVM_FFI_ICHECK(v->fused_tail == 1)
         << "stage-1 variant cluster=" << cluster << " ept=" << ept << " stream=" << stream_variant
         << " is built without the fused tail (manifest fused_tail = false)";
     TVM_FFI_ICHECK(topk_kind == kTopKPerRow || topk_scalar <= kFusedTailKCap)
-        << "fuse_tail needs top_k <= " << kFusedTailKCap;
+        << "the fused tail (launch_flags bit 0) needs top_k <= " << kFusedTailKCap;
     CHECK_INPUT_TYPE(topp_arr, dl_float32);
     TVM_FFI_ICHECK(topp_kind == kTopPScalar || topp_kind == kTopPPerRow) << "invalid topp_kind";
     if (topp_kind == kTopPPerRow) {
@@ -295,11 +305,11 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   unsigned int offset_lo = static_cast<unsigned int>(offset_u & 0xFFFFFFFFu);
   unsigned int offset_hi = static_cast<unsigned int>(offset_u >> 32);
   int renorm_i = emit_renorm != 0 ? 1 : 0;
-  int fuse_i = fuse_tail != 0 ? 1 : 0;
+  int flags_i = static_cast<int>(launch_flags & (kFlagFuseTail | kFlagEarlyTrigger));
   // Argument order = the frozen kernel signature (see the generated source).
   void* args[] = {&probs_ptr, &topk_ptr,  &vals_ptr,   &idx_ptr,    &count_ptr, &vocab_i,  &topk_i,
                   &kind_i,    &topp_ptr,  &samples_ptr, &renorm_ptr, &topp_f,    &pkind_i,  &seed_lo,
-                  &seed_hi,   &offset_lo, &offset_hi,  &renorm_i,   &fuse_i};
+                  &seed_hi,   &offset_lo, &offset_hi,  &renorm_i,   &flags_i};
 
   cudaLaunchConfig_t config = {};
   config.gridDim = dim3(static_cast<uint32_t>(batch * v->cluster), 1, 1);
