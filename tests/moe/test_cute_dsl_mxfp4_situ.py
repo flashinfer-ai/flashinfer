@@ -2114,7 +2114,9 @@ def test_moe_sort_mixed_lists_match_dispatch(
     if min_total_rows:
         # The rule removed every window: each expert keeps all its dense tiles.
         assert len(narrow_ref) == 0 and len(wide_ref) == len(expert)
-    elif not max_rows and distribution != "empty":
+    elif not max_rows and distribution == "balanced":
+        # Balanced routings (about 146 or 292 rows per expert) always hold
+        # experts whose cover ends in a window; skewed ones need not.
         assert len(narrow_ref) > 0
     assert (lists[active_list][len(wide_ref) :] == -7).all()
     assert (lists["narrow_list"][len(narrow_ref) :] == -7).all()
