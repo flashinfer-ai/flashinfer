@@ -9,9 +9,10 @@ Runs ONLY under its own torchrun invocation (``run_tests.sh mega_sm107``)::
 Every rank builds the SAME global expert bank (fixed seed), the layer routes
 real cross-rank EP traffic over the NVLink symmetric heap, and each rank's
 output is checked against the pure-torch oracle evaluated over the full bank
-for that rank's tokens (tolerance bands: the oracle emulates but does not
-bit-match the in-kernel FC2-input requantization).  Covers BOTH sm107
-backends (mxfp8_e4m3 and nvfp4).
+for that rank's tokens. References share quantization helpers with preprocessing;
+activation evaluation, accumulation, and intermediate requantization can round
+differently from the kernel. Output checks use relative L2 tolerances and cover
+NVFP4 and MXFP8 E4M3/E5M2.
 """
 
 from __future__ import annotations
@@ -49,8 +50,7 @@ TOP_K = 4
 NUM_TOKENS = 96
 MAX_TOKENS = 128
 
-# The nvfp4 wire is much coarser (4-bit data, per-16 fp8 scales through TWO
-# GEMMs); the mxfp8 band matches the previous GLU-kernel test.
+# Relative L2 limits for kernel vs Torch outputs, not per-element error bounds.
 _REL_L2_BAND = {"mxfp8_e4m3": 0.02, "mxfp8_e5m2": 0.02, "nvfp4": 0.06}
 
 

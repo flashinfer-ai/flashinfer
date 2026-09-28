@@ -10,7 +10,7 @@ Match the deployment's GPU, EP world size, geometry, and token capacity::
         --dtype nvfp4 --hidden 7168 --intermediate 2048 \
         --num-experts 256 --topk 8 --max-tokens 8 512 2048
 
-``--intermediate`` is the post-SwiGLU width. Use ``MEGA_NO_DIST=1`` for
+``--intermediate`` is the width after activation. Use ``MEGA_NO_DIST=1`` for
 single-rank tuning. Atomic reduction candidates require
 ``--allow-nondeterministic`` and an engine configuration that enables IKR.
 """

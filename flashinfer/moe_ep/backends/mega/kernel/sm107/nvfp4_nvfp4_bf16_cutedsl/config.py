@@ -11,18 +11,17 @@ if TYPE_CHECKING:
 
 @dataclass
 class Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
-    """Kernel params for ``kernel_src.sm107.next_cutedsl_megamoe.sm107_block_scaled_mega_moe``.
+    """Configure Rubin inference with NVFP4 activations and weights.
 
-    The Rubin inference block-scaled swap-AB fused dispatch + FC1 + SwiGLU +
-    FC2 + combine mega kernel (``BlockScaledSwapAbMegaMoeKernel``) at quant
-    kind nvfp4: nvfp4 activations x nvfp4 weights -> bf16 output, sf_vec_size
-    16 (FP8-E4M3 block scales), gate/up interleave 16. SiTU requires both
-    positive beta parameters. NVFP4 scaling follows the SM100 interface:
-    input_norm_const controls BF16 staging; per-expert alpha tensors correct
-    GEMM accumulators, and fc1_norm_const scales intermediate quantization.
+    The kernel fuses dispatch, FC1, activation, FC2, and BF16 combine. It uses
+    E4M3 scales per 16 values and 16-row gate/up stripes. SwiGLU is the default;
+    SiTU requires both positive, finite beta parameters.
+
+    input_norm_const controls BF16 input staging. Per-expert alpha tensors
+    correct GEMM accumulators; fc1_norm_const scales intermediate quantization.
     """
 
-    intermediate_size: int  # post-SwiGLU width; FC1 GEMM N is 2*intermediate_size
+    intermediate_size: int  # width after activation; FC1 N is 2*intermediate_size
     top_k: int
     kernel_name: str = "sm107_nvfp4_nvfp4_bf16_cutedsl"
     gate_up_clamp: Optional[float] = None

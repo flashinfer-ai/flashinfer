@@ -1,5 +1,7 @@
 """Host regressions for SM107 quantization layout and bounded preprocessing."""
 
+import math
+
 import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
@@ -101,6 +103,31 @@ def test_nvfp4_preprocessing_bounds_fp32_temporaries():
             chunk_rows=rows_per_chunk,
         )
     assert tracker.largest <= rows_per_chunk * max(hidden, intermediate) * 8
+
+
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float8_e8m0fnu])
+@pytest.mark.parametrize("strided", [False, True])
+def test_e8m0_decoder_all_encodings(dtype, strided):
+    from flashinfer.moe_ep.kernel_src.sm107.next_cutedsl_megamoe import (
+        e8m0_to_f32,
+        scale_to_f32,
+    )
+
+    codes = torch.arange(256, dtype=torch.uint8)
+    if strided:
+        codes = torch.stack((codes, codes), dim=-1)[:, 0]
+    scales = codes.view(dtype)
+    expected = torch.tensor(
+        [math.ldexp(1.0, exponent) for exponent in range(-127, 128)],
+        dtype=torch.float32,
+    )
+    for decode in (e8m0_to_f32, scale_to_f32):
+        actual = decode(scales)
+        # Compare bits to distinguish the smallest scale from zero.
+        torch.testing.assert_close(
+            actual[:255].view(torch.int32), expected.view(torch.int32), rtol=0, atol=0
+        )
+        assert torch.isnan(actual[255])
 
 
 def test_fp4_rounding_at_every_midpoint():

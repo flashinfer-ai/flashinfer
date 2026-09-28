@@ -1,25 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Torch-side helpers for the SM107 block-scaled mega kernel (quant, SF swizzle,
-reference).
+"""Torch quantization, weight layouts, and numerical reference for SM107 MegaMoE.
 
-The ``next/`` drop's own quant/swizzle helpers live in its *test harness*
-(``tester/``), which is not vendored, so the torch-side equivalents live here
-in the shim.  Semantics mirror the harness:
+The upstream quantization and layout helpers live in ``tester/``, outside
+the vendored kernel export. These helpers supply the corresponding operations:
 
-- MXFP8 block-32 quantization uses a round-toward-+inf (``cvt.rp.satfinite``)
-  E8M0 block scale, so quantized data never overflows fp8.  The harness routes
-  the rounding + reciprocal through instruction-faithful device ops; the torch
-  emulation here differs by at most 1 ulp of the fp32 reciprocal, which is why
-  the shim reference is compared with tolerance bands, never bitwise.
-- NVFP4 block-16 quantization uses an FP8-E4M3 block scale of
-  ``absmax / 6 * norm_const`` and rescales by ``norm_const / round_trip(scale)``
-  (the kernel epilogue's ``nvfp4_quant_impl``); the torch emulation uses exact
-  fp32 division instead of ``rcp.approx.ftz`` and a distance-min E2M1 encoder
-  instead of ``cvt.rn.satfinite.e2m1x2`` — again a tolerance-band, not bitwise,
-  match.  All transcendental-free (torch's jiterator/NVRTC rejects sm_107).
-- The weight scale-factor plane is the 32x4x4 atom swizzle (``to_blocked``),
-  flattened per expert — identical layout math to the harness/SM100 helpers.
+- MXFP8 uses per-32 E8M0 block scales rounded up to powers of two.
+- NVFP4 uses per-16 E4M3 block scales from ``absmax / 6 * norm_const`` and
+  scales data by ``norm_const / round_trip(scale)`` before FP4 encoding.
+- Weight scales use the 32x4x4 atom swizzle, flattened per expert.
+
+The reference uses Torch division and activation functions. The kernel uses
+approximate device operations, and GEMM accumulation, intermediate
+requantization, and expert-output reduction can also round differently.
+Output checks use relative L2 tolerances; layout-only checks compare bytes.
 """
 
 from __future__ import annotations
@@ -61,14 +55,10 @@ def round_up(a: int, b: int) -> int:
 
 
 def _ceil_log2_exponent(x: torch.Tensor) -> torch.Tensor:
-    """``ceil(log2(x))`` as int32, via exact fp32 bit decomposition.
+    """Return ``ceil(log2(x))``, clamped to FP32 normal exponents.
 
-    Pure integer/bit ops only: transcendentals like ``torch.exp2``/``log2``
-    (and potentially ``frexp``) route through torch's jiterator (NVRTC), whose
-    bundled compiler rejects ``sm_107``. For a positive normal fp32,
-    ``ceil(log2(x)) = unbiased_exponent + (mantissa_bits != 0)``. Zero /
-    non-finite inputs map to the smallest usable exponent (the data block is
-    all-zero in that case anyway).
+    Bit decomposition avoids transcendental rounding at power-of-two
+    boundaries. Non-finite inputs and values below ``2**-126`` map to ``-126``.
     """
     finite = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     bits = finite.clamp_min(2.0**-126).view(torch.int32)
@@ -89,8 +79,8 @@ def quantize_mxfp8_block32(
 
     Returns ``(data, scale)`` where ``data`` has ``tensor``'s shape in
     ``data_dtype`` and ``scale`` is E8M0 (viewed as ``float8_e8m0fnu``) with
-    the trailing dim divided by 32. The scale rounds toward +inf
-    (``cvt.rp.satfinite`` semantics), so data never overflows fp8.
+    the trailing dim divided by 32. For finite FP32 values, rounding the scale
+    up to a power of two keeps the largest magnitude within the data range.
     """
     if tensor.shape[-1] % Mxfp8BlockSize != 0:
         raise ValueError(
@@ -114,6 +104,7 @@ def pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
     decodes). Distance-min against the 8-value magnitude table; exact
     midpoints resolve to the EVEN code, matching the instruction's
     round-to-nearest-even (e.g. 0.75 -> 1.0, 1.25 -> 1.0, 2.5 -> 2.0).
+    NaNs and signed zeros map to positive zero.
     """
     if fp32.shape[-1] % 2 != 0:
         raise ValueError(f"FP4 pack needs an even trailing dim, got {fp32.shape[-1]}.")
@@ -179,12 +170,17 @@ def quantize_nvfp4_block16(
 
 
 def e8m0_to_f32(scale: torch.Tensor) -> torch.Tensor:
-    """E8M0 (or uint8-viewed) scale plane -> fp32 powers of two (bit-exact)."""
-    return (scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+    """Decode typed E8M0 scales or raw E8M0 bytes as FP32."""
+    codes = scale.view(torch.uint8).to(torch.int32)
+    bits = codes << 23
+    # E8M0 code 0 encodes 2**-127; code 255 encodes NaN.
+    bits = torch.where(codes == 0, 0x00400000, bits)
+    bits = torch.where(codes == 255, 0x7FC00000, bits)
+    return bits.view(torch.float32)
 
 
 def scale_to_f32(scale: torch.Tensor) -> torch.Tensor:
-    """Any SF plane (E8M0 or E4M3, possibly uint8-viewed) -> fp32."""
+    """Decode typed E4M3 or E8M0 scales; raw uint8 bytes mean E8M0."""
     if scale.dtype == torch.float8_e4m3fn:
         return scale.to(torch.float32)
     return e8m0_to_f32(scale)
@@ -494,10 +490,10 @@ def compute_megamoe_reference_sm107_block_scaled(
 ) -> torch.Tensor:
     """Pure-torch single-rank oracle for the SM107 block-scaled inference kernel.
 
-    Consumes the SAME staged quantized payloads + RAW (unswizzled) scale planes
-    the kernel sees, so the only divergence from the device kernel is fp32 GEMM
-    accumulation order and the in-kernel FC2-input requantization (approximate
-    reciprocal / E2M1 tie rounding) — compare with tolerance bands.
+    Evaluates MoE math from staged quantized inputs and transformed weights.
+    It shares quantization helpers with preprocessing. Activation evaluation,
+    GEMM accumulation, intermediate requantization, and expert-output reduction
+    can round differently from the kernel; compare outputs with tolerances.
 
     Weight tensors are K-MAJOR PHYSICAL layout (what the transforms build
     before the logical transpose view): ``fc1_weight_k_major

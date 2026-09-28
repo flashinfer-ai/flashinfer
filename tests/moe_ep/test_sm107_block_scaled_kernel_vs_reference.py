@@ -3,9 +3,9 @@
 Drives the vendored ``next_cutedsl_megamoe`` drop's fused inference mega
 kernel (``BlockScaledSwapAbMegaMoeKernel``) through the shim allocator +
 compute entry on ONE Rubin GPU (``MEGA_NO_DIST=1``, world_size 1: every
-"peer" resolves to the local buffer, no NVSHMEM), for BOTH wired quant kinds
-(mxfp8_e4m3 and nvfp4), and compares against the shim's pure-torch reference
-over the SAME staged quantized payloads.
+"peer" resolves to the local buffer, no NVSHMEM), for NVFP4 and MXFP8
+E4M3/E5M2. Layer tests use a reference with canonical weight layouts; direct
+kernel tests use the shim reference over the same staged quantized payloads.
 
 Process isolation: the drop is imported only inside test bodies, this file is
 excluded from ``run_unit``, and runs via ``run_tests.sh oracle_sm107``.
@@ -14,9 +14,9 @@ Direct invocation::
     MEGA_NO_DIST=1 CUDA_VISIBLE_DEVICES=0 python -m pytest \
         tests/moe_ep/test_sm107_block_scaled_kernel_vs_reference.py -v -m arch_rubin
 
-The torch reference emulates the in-kernel FC2-input requantization but not
-the instruction-exact rcp / E2M1-tie sequences, so comparisons use tolerance
-bands (rel_l2), never bitwise.
+Both references share quantization helpers with preprocessing. Activation
+evaluation, accumulation, and intermediate requantization can round differently
+from the kernel, so output comparisons use relative L2 tolerances.
 """
 
 from __future__ import annotations
@@ -214,8 +214,7 @@ def test_layer_situ_prequantized_weights_and_scaling(
             layer.destroy()
 
 
-# The nvfp4 wire is much coarser (4-bit data, per-16 fp8 scales through TWO
-# GEMMs); the mxfp8 band matches the previous GLU-kernel test.
+# Relative L2 limits for kernel vs Torch outputs, not per-element error bounds.
 _REL_L2_BAND = {"mxfp8_e4m3": 0.02, "mxfp8_e5m2": 0.02, "nvfp4": 0.06}
 
 

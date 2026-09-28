@@ -1,4 +1,8 @@
-"""Canonical-layout references for Rubin activation and quantization tests."""
+"""MoE references using canonical weight layouts and the shim's quantizers.
+
+The reference evaluates activation and scaling math without the production
+weight transform. Quantization and unpacking helpers are shared with the shim.
+"""
 
 import torch
 

@@ -4,8 +4,8 @@
 
 The JSON format and file location are shared with SM100. An ``sm107:`` device
 prefix keeps the architectures' entries separate. Implementation revision,
-quantization, EP size, geometry, combine format, nondeterminism permission,
-and routing-weight policy must match.
+quantization, EP size, geometry, combine format, activation and beta parameters,
+gate/up clamp, nondeterminism permission, and routing-weight policy must match.
 
 Populate entries with ``python -m flashinfer.moe_ep.tune``. Set
 ``FLASHINFER_MOE_EP_KNOB_CACHE`` to a path, or ``0``/``off`` to disable it;

@@ -7,8 +7,8 @@ Wraps the vendored ``sources.kernel_src.rubin.inference.mega`` kernel
 contract:
 
 - :func:`get_symm_buffer_for_sm107_block_scaled_mega_moe` — workspace allocator
-- :func:`sm107_block_scaled_mega_moe` — fused dispatch + FC1 + SwiGLU + FC2 +
-  combine compute entry
+- :func:`sm107_block_scaled_mega_moe` — fused dispatch + FC1 + activation +
+  FC2 + combine compute entry, with SwiGLU or SiTU
 
 The kernel is generic over the drop's ``QuantKind``; this shim wires up the
 ``nvfp4`` and ``mxfp8_e4m3`` / ``mxfp8_e5m2`` kinds (``mxfp4`` /
@@ -17,12 +17,10 @@ The kernel is generic over the drop's ``QuantKind``; this shim wires up the
 All ``sources`` / ``cutlass`` imports are function-local so importing this
 module stays CPU-safe (the package ``__init__`` re-exports from here).
 
-The staging/launch protocol mirrors the drop's own runner
-(``next/repo_internal_only/test_megamoe_rubin.py``): activation, activation
-SF, topk scores, the shared workspace, and (for the in-kernel-reduce path) the
-output live on the symmetric heap; routing indices are local int32 (16-byte
-aligned); workspaces are 128-byte aligned with their leading bytes zeroed
-before the first launch.
+Input activations, block scales, routing scores, and the shared workspace
+live on the symmetric heap, as does the output for in-kernel reduction.
+Routing indices are local int32 tensors aligned to 16 bytes. Workspaces are
+128-byte aligned with their leading bytes zeroed before the first launch.
 """
 
 from __future__ import annotations
@@ -124,7 +122,7 @@ class Sm107BlockScaledMoeConfig:
     max_tokens_per_rank: int
     num_topk: int
     hidden: int
-    intermediate: int  # post-SwiGLU width; the FC1 GEMM N is 2*intermediate
+    intermediate: int  # width after activation; the FC1 GEMM N is 2*intermediate
     rank: int
     world_size: int
     quant_kind: Sm107QuantKind = "mxfp8_e4m3"
@@ -720,7 +718,7 @@ def get_symm_buffer_for_sm107_block_scaled_mega_moe(
     """Allocate the SM107 block-scaled mega session workspace.
 
     Problem sizes positional, tuning knobs keyword-only (the standard mega
-    allocator contract). ``intermediate`` is the post-SwiGLU width. Expert
+    allocator contract). ``intermediate`` is the width after activation. Expert
     weights are NOT owned by the workspace; they are passed per launch.
     """
     config = Sm107BlockScaledMoeConfig(
@@ -823,7 +821,7 @@ def sm107_block_scaled_mega_moe(
     fast_math: bool = True,  # accepted for mega API parity; the kernel has no toggle
     sync: bool = False,
 ) -> Optional[torch.Tensor]:
-    """Fused dispatch + FC1 + SwiGLU + FC2 + combine; writes ``y[:num_tokens]``.
+    """Fused dispatch, FC1, SwiGLU/SiTU, FC2, and combine; writes ``y[:num_tokens]``.
 
     The caller must have staged ``symm_buffer.x`` / ``.x_sf`` and the routing
     slices first. With ``y=None`` returns a workspace view (valid under stream

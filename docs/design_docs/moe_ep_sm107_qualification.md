@@ -9,8 +9,14 @@ records the full source and exporter revisions.
 
 ## Correctness coverage
 
-At FlashInfer `5bd5aeef60c44a99341e6b6a183968d73bf582e7`, native tests passed
-50 single-GPU cases and 16 EP4 cases on each rank.
+At FlashInfer `0f710df8e7e1843a91009d679a9f4deed47352f3`, native tests passed
+187 host/CUDA checks, 72 single-GPU cases, and 34 distributed cases per rank
+at EP2, EP4, and EP8, with no skips. Coverage includes SiTU, prequantized
+weight ingestion, non-unit NVFP4 scaling, pooled workspaces, and graph replay.
+
+The subsequent E8M0 reference-decoder fix has a separate regression covering
+all 256 encodings, typed and raw-byte scales, and strided storage. The native
+qualification counts above refer to the stated commit.
 
 ## Setup
 
@@ -44,7 +50,7 @@ power limits, clocks, other GPU activity, and `NVSHMEM_SYMMETRIC_SIZE`.
 | BF16 inputs | `quantize_input=True`; staging quantizes on the caller's stream |
 | Prequantized inputs | Matching data format; scales are `[T, H/16]` E4M3 for NVFP4 or `[T, H/32]` E8M0 for MXFP8; uint8 scale storage is interpreted as raw bytes. Pass the logical scale columns, excluding internal workspace communication padding. |
 | Activation | SwiGLU by default; SiTU requires both positive, finite beta parameters and excludes gate/up clamps |
-| Normalization | NVFP4 accepts positive, finite local-expert FP32 vectors for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`; omitted values default to one. MXFP8 does not accept these scalars. |
+| Normalization | NVFP4 accepts positive, finite local-expert FP32 vectors for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`. Per-call values override config defaults; if both omit a value, staging uses one. MXFP8 does not accept these scalars. |
 | Routing values | Unique valid expert IDs per token or `-1` masked slots; finite scores; repeated masked slots are allowed |
 | Output | BF16; owned tensor by default; workspace views expire on the next workspace use or destruction |
 | Graphs and pooling | Warm up eagerly on every rank before capture; sequential, stream-ordered use of a shared workspace |
@@ -69,9 +75,9 @@ Graph replay keeps captured shapes, pointers, and live-token count fixed.
 Change tensor contents in place; recapture for a new shape/count, or mask
 inactive rows while retaining the captured shape.
 
-BF16 Rubin kernels, training, local fused-routing MegaMoE, MXFP4, mixed W4A8, and cross-node
-communication are not part of this implementation. BF16 input staging currently uses Torch operations; its cost is included in
-full-forward measurements.
+BF16 Rubin kernels, training, local fused-routing MegaMoE, MXFP4, mixed W4A8,
+and cross-node communication are not part of this implementation. BF16 input
+staging uses Torch operations; its cost is included in full-forward measurements.
 
 ## SiTU and prequantized weights
 
@@ -134,8 +140,8 @@ layer = MoEEpLayer(
 
 FC1 alpha is applied before activation; intermediate normalization is applied
 during FC1-to-FC2 quantization; FC2 alpha is applied before the BF16 output
-conversion. Block scales remain unchanged. BF16 weight preprocessing uses
-unit normalization, so nw1 and nw2 are one for that path.
+conversion. Prequantized weight block scales remain unchanged. BF16 weight
+preprocessing uses unit normalization, so nw1 and nw2 are one for that path.
 
 Per-call tensors on `MoEEpTensors` override the matching config tensor. An
 omitted override restores the config default, or one if the config also omits
@@ -189,6 +195,19 @@ mixed clusters, bulk TMA stages, token-back modes, and clamp. Metadata tests
 reject unsupported scalars, scale layouts, and unsafe geometry. Activation and
 weight-ingestion tests compare against canonical-layout Torch math, including
 non-unit per-expert scaling, BF16/prequantized inputs, and pooled SiTU graphs.
+
+Output comparisons require relative L2 error below 0.02 for MXFP8 and 0.06
+for NVFP4. The test metric is `norm(output - reference) / max(norm(reference),
+1e-6)`. These are aggregate acceptance limits, not per-element error bounds.
+The references share quantization and unpacking helpers with preprocessing;
+the canonical-weight reference independently checks the physical weight
+transform. Activation evaluation, accumulation, intermediate requantization,
+and expert-output reduction can round differently from the kernel. These
+tests do not establish bitwise parity with upstream quantizers or model quality.
+
+Layout and prequantized-ingestion tests compare bytes. The E8M0 decoder test
+checks every finite encoding against its exact FP32 value and checks NaN
+separately. In particular, byte 0 decodes to `2**-127` and byte 255 to NaN.
 
 Run negative device-assertion cases in separate workers. After a CUDA failure,
 terminate the whole job: collective free/finalize can hang if a peer has failed.

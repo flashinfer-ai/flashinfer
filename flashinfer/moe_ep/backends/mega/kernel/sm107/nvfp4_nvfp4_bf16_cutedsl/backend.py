@@ -198,7 +198,7 @@ class Sm107Nvfp4BlockScaledMegaKernelBackend(MegaKernelBackend):
         )
 
     def _scalar_values(self, t=None):
-        """Per-call tensors override layer defaults; omitted values mean one."""
+        """Resolve per-call tensors, then config defaults; staging fills None with one."""
         values = {}
         for name in ("fc1_alpha", "fc2_alpha", "fc1_norm_const"):
             override = getattr(t, name, None)
