@@ -69,10 +69,10 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
     assert manifest["capability"]["cake_coverage_ratio"] == 1.0
     assert manifest["capability"]["upstream_valid_cases"] == 57_280
     assert manifest["capability"]["cake_covered_cases"] == 57_280
-    assert manifest["capability"]["route_counts"]["cake_fmha_compat_v1"] == 55_476
-    # 29 pinned product probes plus the two correctness rows the balanced
-    # BF16 decode route owns (CAKE-685).
-    assert len(manifest["route_probes"]) == 31
+    assert manifest["capability"]["route_counts"]["cake_fmha_compat_v1"] == 55_470
+    # 29 pinned product probes plus the two correctness rows each balanced
+    # route (bf16, fp16) adds to the contract.
+    assert len(manifest["route_probes"]) == 33
     assert {probe["label"] for probe in manifest["route_probes"]} >= {
         "correctness_compat_decode_fp8_nhd_separate_group5",
         "correctness_compat_decode_fp8_hnd_shared_group8_partial",
@@ -80,7 +80,7 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
     }
     # 143 base/composed artifacts plus the six CAKE-459 small-M hd256 decode
     # instances (two arch bodies + one launch binding each).
-    assert len(manifest["artifacts"]) == 170
+    assert len(manifest["artifacts"]) == 179
     dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
     assert dcp_addon["installed"] is True
     assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
@@ -107,8 +107,8 @@ def test_cake_fmha_registry_accounts_for_manifest_routes_and_components() -> Non
     manifest_route_counts = manifest["capability"]["route_counts"]
     manifest_optimized_routes = set(manifest_route_counts) - {"cake_fmha_compat_v1"}
     assert manifest_optimized_routes <= set(cake_api._PRODUCT_ROUTE_COMPONENTS)
-    assert cake_api._manifest_optimized_route_accounting() == (1_804, 1_804)
-    assert cake_api._manifest_authenticated_route_accounting() == (1_804, 1_804)
+    assert cake_api._manifest_optimized_route_accounting() == (1_810, 1_810)
+    assert cake_api._manifest_authenticated_route_accounting() == (1_810, 1_810)
     for route_name, components in cake_api._PRODUCT_ROUTE_COMPONENTS.items():
         manifest_components = tuple(
             dict.fromkeys(
@@ -138,13 +138,13 @@ def test_cake_fmha_high_level_selectors_match_pinned_capability_corpus(
     assert PINNED_FLASHINFER_REVISION == CAKE_FMHA_FLASHINFER_MATRIX_REVISION
     assert report.raw_cases == 80_768
     assert report.valid_cases == 57_280
-    assert report.optimized_cases == 1_804
-    assert report.compat_cases == 55_476
+    assert report.optimized_cases == 1_810
+    assert report.compat_cases == 55_470
     assert report.route_counts == dict(
         sorted(manifest["capability"]["route_counts"].items())
     )
     assert report.digest == (
-        "2ad39f70fcb0128155f990c1e01ab7bdad70c7815c6ed9555c99d695523137a5"
+        "c3c1e73cb08724c9938b6d38fba8a0338cc8db3be676ad0325343c63b11aa16c"
     )
 
 

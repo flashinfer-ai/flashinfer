@@ -810,6 +810,30 @@
       "bytes": 2937,
       "sha256": "67d4ad3e1ceb1f8d5b91aba130e756f0dfb236f91b53d5f62b6d11a3a51f070f"
     },
+    "bindings/cake_fmha_decode_balanced_bf16_binding.cu": {
+      "bytes": 2983,
+      "sha256": "8a891e6e549928f05018c8905e4547f9e99a82d9b32e7d26b89d62522081e5f1"
+    },
+    "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu": {
+      "bytes": 2917,
+      "sha256": "ded98975f79549a3f102998c2c019f8e1aeb00ecfaf55231e8bc3444700310c0"
+    },
+    "bindings/cake_fmha_decode_balanced_bf16_mtp_n64_binding.cu": {
+      "bytes": 2917,
+      "sha256": "e82f183ea722ed39b7e2f34b983c3089f038fc5ec6aec54eb9e34b012df9dd54"
+    },
+    "bindings/cake_fmha_decode_balanced_fp16_binding.cu": {
+      "bytes": 2969,
+      "sha256": "9eea504a790e8f867b03a95971805ced67bd3e875e890d4f96657ae4f26a3bc1"
+    },
+    "bindings/cake_fmha_decode_balanced_fp16_mtp_n32_binding.cu": {
+      "bytes": 2903,
+      "sha256": "827359598209a20b4f08da5e7093a8da06735bce6ae635f3be769afa0e896e50"
+    },
+    "bindings/cake_fmha_decode_balanced_fp16_mtp_n64_binding.cu": {
+      "bytes": 2903,
+      "sha256": "e91cb9a5447cbaa92554e58222cd87ff8e9c8a67bd413ebb503bf4f4e9799fc0"
+    },
     "bindings/cake_fmha_decode_native_bf16_b4_exact_cga_binding.cu": {
       "bytes": 3224,
       "sha256": "d09d25e1062b4bb4baee9ac352c02465aa277a48cdc80bd01b6635a6c4441d37"
@@ -1093,6 +1117,54 @@
     "cuda/dcp_spec/dcp_spec_bf16_v4/num_split9.cu": {
       "bytes": 111060,
       "sha256": "026fb02787b8dbaa1552278248e836acadc3d1023858d7794480b6af4c6ae53c"
+    },
+    "cuda/decode_balanced_bf16/sm_100a/default.cu": {
+      "bytes": 148525,
+      "sha256": "85a7323cfb2e72050b2b06933f55fa35aad8576d700a3ecb5d0bed276226aa0b"
+    },
+    "cuda/decode_balanced_bf16/sm_103a/default.cu": {
+      "bytes": 148428,
+      "sha256": "b14c1bc6dbcea0ab9fab928e30eea6707b3687d4c876e68f77075ead0c646894"
+    },
+    "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu": {
+      "bytes": 212456,
+      "sha256": "33ce36a3213025b48bd4bbea4f38f1e5f3d1cd91b24dae053fd2690dcf3b8c1f"
+    },
+    "cuda/decode_balanced_bf16_mtp_n32/sm_103a/default.cu": {
+      "bytes": 212359,
+      "sha256": "4da1555e64631b8ebb0524426b058868d7f7c14af4301735e28c39af214a68fd"
+    },
+    "cuda/decode_balanced_bf16_mtp_n64/sm_100a/default.cu": {
+      "bytes": 212456,
+      "sha256": "41d9f89e8eb5af3e3b402d2e083910a8b2f3ba0b6365c11c80a259b24f533f8d"
+    },
+    "cuda/decode_balanced_bf16_mtp_n64/sm_103a/default.cu": {
+      "bytes": 212359,
+      "sha256": "3e5ef81359f72a050a03ed655f97dcac0972aa7c8531b60015260773ea3e637a"
+    },
+    "cuda/decode_balanced_fp16/sm_100a/default.cu": {
+      "bytes": 148406,
+      "sha256": "a8cbddca82be00d005aefab77a9d72d0f64bb3c8c0e92ad5d5c5a3012949000f"
+    },
+    "cuda/decode_balanced_fp16/sm_103a/default.cu": {
+      "bytes": 148309,
+      "sha256": "c79368c30561771a7d903494665d3292f36b5efb9d2d86b9a282560f5c81a530"
+    },
+    "cuda/decode_balanced_fp16_mtp_n32/sm_100a/default.cu": {
+      "bytes": 212263,
+      "sha256": "7e90cd3f11360193c2c6de5c55d6b4614ba7fe690ddeecd03e565b747edc7567"
+    },
+    "cuda/decode_balanced_fp16_mtp_n32/sm_103a/default.cu": {
+      "bytes": 212166,
+      "sha256": "41a4cde51aa80595bce4627c483f88424736eb2d5f3819eca44f3abc038650ea"
+    },
+    "cuda/decode_balanced_fp16_mtp_n64/sm_100a/default.cu": {
+      "bytes": 212263,
+      "sha256": "a2e2a4d46d832808f7c0cd1048a5a332a3c2d58dc15a20e830f31d2181c201f0"
+    },
+    "cuda/decode_balanced_fp16_mtp_n64/sm_103a/default.cu": {
+      "bytes": 212166,
+      "sha256": "ecba1df2c63fe13fc724880fbec682a0ce6e668b53947516f75f01390c12ddee"
     },
     "cuda/decode_native_bf16/batch_size128_has_sink0_has_window0_num_kv_heads4_num_q_heads32_q_len1_retain_kv_l20_use_scale_ptr0.cu": {
       "bytes": 101897,
@@ -1403,8 +1475,8 @@
       "sha256": "14388bf51cabd8e32ba47fe6f1d767b55f716795a80246fa33e95f1148059f72"
     },
     "include/cake_fmha.h": {
-      "bytes": 15124,
-      "sha256": "a8fc33343c6b0e4da5fb88eb6d01448df59422fcc6522cb1cf56b1790b560601"
+      "bytes": 16924,
+      "sha256": "46883c6e257ec5b6242123f0d404f90f877c5eae57f0e000dd5e6940803867e5"
     },
     "include/cake_fmha_hd256_support.h": {
       "bytes": 1964,
@@ -1417,42 +1489,6 @@
     "runtime/cake_fmha_qmul4.py": {
       "bytes": 6848,
       "sha256": "335c456d48c400fc29a5c223528fd138d667027478bc9cee899c42c5d5d3f2d1"
-    },
-    "bindings/cake_fmha_decode_balanced_bf16_binding.cu": {
-      "bytes": 2983,
-      "sha256": "8a891e6e549928f05018c8905e4547f9e99a82d9b32e7d26b89d62522081e5f1"
-    },
-    "cuda/decode_balanced_bf16/sm_100a/default.cu": {
-      "bytes": 148525,
-      "sha256": "85a7323cfb2e72050b2b06933f55fa35aad8576d700a3ecb5d0bed276226aa0b"
-    },
-    "cuda/decode_balanced_bf16/sm_103a/default.cu": {
-      "bytes": 148428,
-      "sha256": "b14c1bc6dbcea0ab9fab928e30eea6707b3687d4c876e68f77075ead0c646894"
-    },
-    "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu": {
-      "bytes": 2917,
-      "sha256": "ded98975f79549a3f102998c2c019f8e1aeb00ecfaf55231e8bc3444700310c0"
-    },
-    "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu": {
-      "bytes": 212456,
-      "sha256": "33ce36a3213025b48bd4bbea4f38f1e5f3d1cd91b24dae053fd2690dcf3b8c1f"
-    },
-    "cuda/decode_balanced_bf16_mtp_n32/sm_103a/default.cu": {
-      "bytes": 212359,
-      "sha256": "4da1555e64631b8ebb0524426b058868d7f7c14af4301735e28c39af214a68fd"
-    },
-    "bindings/cake_fmha_decode_balanced_bf16_mtp_n64_binding.cu": {
-      "bytes": 2917,
-      "sha256": "e82f183ea722ed39b7e2f34b983c3089f038fc5ec6aec54eb9e34b012df9dd54"
-    },
-    "cuda/decode_balanced_bf16_mtp_n64/sm_100a/default.cu": {
-      "bytes": 212456,
-      "sha256": "41d9f89e8eb5af3e3b402d2e083910a8b2f3ba0b6365c11c80a259b24f533f8d"
-    },
-    "cuda/decode_balanced_bf16_mtp_n64/sm_103a/default.cu": {
-      "bytes": 212359,
-      "sha256": "3e5ef81359f72a050a03ed655f97dcac0972aa7c8531b60015260773ea3e637a"
     }
   },
   "capability": {
@@ -1464,13 +1500,14 @@
     "gap_counts": {},
     "raw_cases": 80768,
     "route_counts": {
-      "cake_fmha_compat_v1": 55476,
+      "cake_fmha_compat_v1": 55470,
       "ctx_bf16_hnd_hd128_hgpack_03df_v2": 640,
       "ctx_fp16_nhd_hd256_stage16_v1": 40,
       "ctx_fp8_bf16_nhd_hd256_stage16_v1": 40,
       "ctx_fp8_hnd_hd128_hgpack_48b5_v1": 640,
       "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": 6,
       "decode_balanced_bf16_v1": 6,
+      "decode_balanced_fp16_v1": 6,
       "decode_native_bf16_hd256_smallm_v1": 6,
       "decode_native_bf16_v1_bece": 114,
       "decode_native_fp16_nhd_v1_f32d": 240,
@@ -2814,6 +2851,670 @@
         }
       ],
       "threads": 512
+    },
+    "decode_balanced_bf16": {
+      "binding_sha256": "8a891e6e549928f05018c8905e4547f9e99a82d9b32e7d26b89d62522081e5f1",
+      "binding_source": "bindings/cake_fmha_decode_balanced_bf16_binding.cu",
+      "dynamic_shared_memory_bytes": 215040,
+      "launch_binding": "cake_fmha_launch_decode_balanced_bf16",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__nv_bfloat16*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_o"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_stats"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "tile_counters"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "queue_counters"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "group_ratio"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_items"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_balanced_bf16",
+      "source_family": [
+        {
+          "selector": {},
+          "sha256": {
+            "sm_100a": "85a7323cfb2e72050b2b06933f55fa35aad8576d700a3ecb5d0bed276226aa0b",
+            "sm_103a": "b14c1bc6dbcea0ab9fab928e30eea6707b3687d4c876e68f77075ead0c646894"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_balanced_bf16/sm_100a/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16/sm_103a/default.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_balanced_bf16_mtp_n32": {
+      "binding_sha256": "ded98975f79549a3f102998c2c019f8e1aeb00ecfaf55231e8bc3444700310c0",
+      "binding_source": "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu",
+      "dynamic_shared_memory_bytes": 222208,
+      "launch_binding": "cake_fmha_launch_decode_balanced_bf16_mtp_n32",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Q"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__nv_bfloat16*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_o"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_stats"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "tile_counters"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "queue_counters"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_items"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_balanced_bf16_mtp_n32",
+      "source_family": [
+        {
+          "selector": {},
+          "sha256": {
+            "sm_100a": "33ce36a3213025b48bd4bbea4f38f1e5f3d1cd91b24dae053fd2690dcf3b8c1f",
+            "sm_103a": "4da1555e64631b8ebb0524426b058868d7f7c14af4301735e28c39af214a68fd"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_mtp_n32/sm_103a/default.cu"
+          }
+        }
+      ],
+      "threads": 384
+    },
+    "decode_balanced_bf16_mtp_n64": {
+      "binding_sha256": "e82f183ea722ed39b7e2f34b983c3089f038fc5ec6aec54eb9e34b012df9dd54",
+      "binding_source": "bindings/cake_fmha_decode_balanced_bf16_mtp_n64_binding.cu",
+      "dynamic_shared_memory_bytes": 222208,
+      "launch_binding": "cake_fmha_launch_decode_balanced_bf16_mtp_n64",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Q"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__nv_bfloat16*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_o"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_stats"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "tile_counters"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "queue_counters"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_items"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_balanced_bf16_mtp_n64",
+      "source_family": [
+        {
+          "selector": {},
+          "sha256": {
+            "sm_100a": "41d9f89e8eb5af3e3b402d2e083910a8b2f3ba0b6365c11c80a259b24f533f8d",
+            "sm_103a": "3e5ef81359f72a050a03ed655f97dcac0972aa7c8531b60015260773ea3e637a"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_balanced_bf16_mtp_n64/sm_100a/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_mtp_n64/sm_103a/default.cu"
+          }
+        }
+      ],
+      "threads": 384
+    },
+    "decode_balanced_fp16": {
+      "binding_sha256": "9eea504a790e8f867b03a95971805ced67bd3e875e890d4f96657ae4f26a3bc1",
+      "binding_source": "bindings/cake_fmha_decode_balanced_fp16_binding.cu",
+      "dynamic_shared_memory_bytes": 215040,
+      "launch_binding": "cake_fmha_launch_decode_balanced_fp16",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Qt"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_o"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_stats"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "tile_counters"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "queue_counters"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "group_ratio"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_items"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_balanced_fp16",
+      "source_family": [
+        {
+          "selector": {},
+          "sha256": {
+            "sm_100a": "a8cbddca82be00d005aefab77a9d72d0f64bb3c8c0e92ad5d5c5a3012949000f",
+            "sm_103a": "c79368c30561771a7d903494665d3292f36b5efb9d2d86b9a282560f5c81a530"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_balanced_fp16/sm_100a/default.cu",
+            "sm_103a": "cuda/decode_balanced_fp16/sm_103a/default.cu"
+          }
+        }
+      ],
+      "threads": 512
+    },
+    "decode_balanced_fp16_mtp_n32": {
+      "binding_sha256": "827359598209a20b4f08da5e7093a8da06735bce6ae635f3be769afa0e896e50",
+      "binding_source": "bindings/cake_fmha_decode_balanced_fp16_mtp_n32_binding.cu",
+      "dynamic_shared_memory_bytes": 222208,
+      "launch_binding": "cake_fmha_launch_decode_balanced_fp16_mtp_n32",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Q"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_o"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_stats"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "tile_counters"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "queue_counters"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_items"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_balanced_fp16_mtp_n32",
+      "source_family": [
+        {
+          "selector": {},
+          "sha256": {
+            "sm_100a": "7e90cd3f11360193c2c6de5c55d6b4614ba7fe690ddeecd03e565b747edc7567",
+            "sm_103a": "41a4cde51aa80595bce4627c483f88424736eb2d5f3819eca44f3abc038650ea"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_balanced_fp16_mtp_n32/sm_100a/default.cu",
+            "sm_103a": "cuda/decode_balanced_fp16_mtp_n32/sm_103a/default.cu"
+          }
+        }
+      ],
+      "threads": 384
+    },
+    "decode_balanced_fp16_mtp_n64": {
+      "binding_sha256": "e91cb9a5447cbaa92554e58222cd87ff8e9c8a67bd413ebb503bf4f4e9799fc0",
+      "binding_source": "bindings/cake_fmha_decode_balanced_fp16_mtp_n64_binding.cu",
+      "dynamic_shared_memory_bytes": 222208,
+      "launch_binding": "cake_fmha_launch_decode_balanced_fp16_mtp_n64",
+      "parameters": [
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "Q"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "K"
+        },
+        {
+          "ctype": "CakeFmhaTensorMap const*",
+          "kind": "pointer",
+          "name": "V"
+        },
+        {
+          "ctype": "__half*",
+          "kind": "pointer",
+          "name": "O_ptr"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "page_table"
+        },
+        {
+          "ctype": "int*",
+          "kind": "pointer",
+          "name": "seq_lens_kv"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_o"
+        },
+        {
+          "ctype": "float*",
+          "kind": "pointer",
+          "name": "partial_stats"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "tile_counters"
+        },
+        {
+          "ctype": "uint32_t*",
+          "kind": "pointer",
+          "name": "queue_counters"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "max_pages_per_seq"
+        },
+        {
+          "ctype": "float",
+          "kind": "value",
+          "name": "softmax_scale_log2"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_q_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "num_kv_heads"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "batch_size"
+        },
+        {
+          "ctype": "int",
+          "kind": "value",
+          "name": "q_len"
+        },
+        {
+          "ctype": "uint32_t",
+          "kind": "value",
+          "name": "max_items"
+        }
+      ],
+      "parametric_axes": [],
+      "public_symbol": "kernel_cake_fmha_decode_balanced_fp16_mtp_n64",
+      "source_family": [
+        {
+          "selector": {},
+          "sha256": {
+            "sm_100a": "a2e2a4d46d832808f7c0cd1048a5a332a3c2d58dc15a20e830f31d2181c201f0",
+            "sm_103a": "ecba1df2c63fe13fc724880fbec682a0ce6e668b53947516f75f01390c12ddee"
+          },
+          "sources": {
+            "sm_100a": "cuda/decode_balanced_fp16_mtp_n64/sm_100a/default.cu",
+            "sm_103a": "cuda/decode_balanced_fp16_mtp_n64/sm_103a/default.cu"
+          }
+        }
+      ],
+      "threads": 384
     },
     "decode_native_bf16": {
       "binding_sha256": "146f21656b704383a205b04c7da6d4165e5b8c1101d0228a63af49e26c62d2fc",
@@ -5522,338 +6223,6 @@
         }
       ],
       "threads": 512
-    },
-    "decode_balanced_bf16": {
-      "binding_sha256": "8a891e6e549928f05018c8905e4547f9e99a82d9b32e7d26b89d62522081e5f1",
-      "binding_source": "bindings/cake_fmha_decode_balanced_bf16_binding.cu",
-      "dynamic_shared_memory_bytes": 215040,
-      "launch_binding": "cake_fmha_launch_decode_balanced_bf16",
-      "parameters": [
-        {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
-          "name": "Qt"
-        },
-        {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
-          "name": "K"
-        },
-        {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
-          "name": "V"
-        },
-        {
-          "ctype": "__nv_bfloat16*",
-          "kind": "pointer",
-          "name": "O_ptr"
-        },
-        {
-          "ctype": "int*",
-          "kind": "pointer",
-          "name": "page_table"
-        },
-        {
-          "ctype": "int*",
-          "kind": "pointer",
-          "name": "seq_lens_kv"
-        },
-        {
-          "ctype": "float*",
-          "kind": "pointer",
-          "name": "partial_o"
-        },
-        {
-          "ctype": "float*",
-          "kind": "pointer",
-          "name": "partial_stats"
-        },
-        {
-          "ctype": "uint32_t*",
-          "kind": "pointer",
-          "name": "tile_counters"
-        },
-        {
-          "ctype": "uint32_t*",
-          "kind": "pointer",
-          "name": "queue_counters"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "max_pages_per_seq"
-        },
-        {
-          "ctype": "float",
-          "kind": "value",
-          "name": "softmax_scale"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "num_q_heads"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "num_kv_heads"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "group_ratio"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "batch_size"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "q_len"
-        },
-        {
-          "ctype": "uint32_t",
-          "kind": "value",
-          "name": "max_items"
-        }
-      ],
-      "parametric_axes": [],
-      "public_symbol": "kernel_cake_fmha_decode_balanced_bf16",
-      "source_family": [
-        {
-          "selector": {},
-          "sha256": {
-            "sm_100a": "85a7323cfb2e72050b2b06933f55fa35aad8576d700a3ecb5d0bed276226aa0b",
-            "sm_103a": "b14c1bc6dbcea0ab9fab928e30eea6707b3687d4c876e68f77075ead0c646894"
-          },
-          "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16/sm_103a/default.cu"
-          }
-        }
-      ],
-      "threads": 512
-    },
-    "decode_balanced_bf16_mtp_n32": {
-      "binding_sha256": "ded98975f79549a3f102998c2c019f8e1aeb00ecfaf55231e8bc3444700310c0",
-      "binding_source": "bindings/cake_fmha_decode_balanced_bf16_mtp_n32_binding.cu",
-      "dynamic_shared_memory_bytes": 222208,
-      "launch_binding": "cake_fmha_launch_decode_balanced_bf16_mtp_n32",
-      "parameters": [
-        {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
-          "name": "Q"
-        },
-        {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
-          "name": "K"
-        },
-        {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
-          "name": "V"
-        },
-        {
-          "ctype": "__nv_bfloat16*",
-          "kind": "pointer",
-          "name": "O_ptr"
-        },
-        {
-          "ctype": "int*",
-          "kind": "pointer",
-          "name": "page_table"
-        },
-        {
-          "ctype": "int*",
-          "kind": "pointer",
-          "name": "seq_lens_kv"
-        },
-        {
-          "ctype": "float*",
-          "kind": "pointer",
-          "name": "partial_o"
-        },
-        {
-          "ctype": "float*",
-          "kind": "pointer",
-          "name": "partial_stats"
-        },
-        {
-          "ctype": "uint32_t*",
-          "kind": "pointer",
-          "name": "tile_counters"
-        },
-        {
-          "ctype": "uint32_t*",
-          "kind": "pointer",
-          "name": "queue_counters"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "max_pages_per_seq"
-        },
-        {
-          "ctype": "float",
-          "kind": "value",
-          "name": "softmax_scale_log2"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "num_q_heads"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "num_kv_heads"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "batch_size"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "q_len"
-        },
-        {
-          "ctype": "uint32_t",
-          "kind": "value",
-          "name": "max_items"
-        }
-      ],
-      "parametric_axes": [],
-      "public_symbol": "kernel_cake_fmha_decode_balanced_bf16_mtp_n32",
-      "source_family": [
-        {
-          "selector": {},
-          "sha256": {
-            "sm_100a": "33ce36a3213025b48bd4bbea4f38f1e5f3d1cd91b24dae053fd2690dcf3b8c1f",
-            "sm_103a": "4da1555e64631b8ebb0524426b058868d7f7c14af4301735e28c39af214a68fd"
-          },
-          "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_mtp_n32/sm_103a/default.cu"
-          }
-        }
-      ],
-      "threads": 384
-    },
-    "decode_balanced_bf16_mtp_n64": {
-      "binding_sha256": "e82f183ea722ed39b7e2f34b983c3089f038fc5ec6aec54eb9e34b012df9dd54",
-      "binding_source": "bindings/cake_fmha_decode_balanced_bf16_mtp_n64_binding.cu",
-      "dynamic_shared_memory_bytes": 222208,
-      "launch_binding": "cake_fmha_launch_decode_balanced_bf16_mtp_n64",
-      "parameters": [
-        {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
-          "name": "Q"
-        },
-        {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
-          "name": "K"
-        },
-        {
-          "ctype": "CakeFmhaTensorMap const*",
-          "kind": "pointer",
-          "name": "V"
-        },
-        {
-          "ctype": "__nv_bfloat16*",
-          "kind": "pointer",
-          "name": "O_ptr"
-        },
-        {
-          "ctype": "int*",
-          "kind": "pointer",
-          "name": "page_table"
-        },
-        {
-          "ctype": "int*",
-          "kind": "pointer",
-          "name": "seq_lens_kv"
-        },
-        {
-          "ctype": "float*",
-          "kind": "pointer",
-          "name": "partial_o"
-        },
-        {
-          "ctype": "float*",
-          "kind": "pointer",
-          "name": "partial_stats"
-        },
-        {
-          "ctype": "uint32_t*",
-          "kind": "pointer",
-          "name": "tile_counters"
-        },
-        {
-          "ctype": "uint32_t*",
-          "kind": "pointer",
-          "name": "queue_counters"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "max_pages_per_seq"
-        },
-        {
-          "ctype": "float",
-          "kind": "value",
-          "name": "softmax_scale_log2"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "num_q_heads"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "num_kv_heads"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "batch_size"
-        },
-        {
-          "ctype": "int",
-          "kind": "value",
-          "name": "q_len"
-        },
-        {
-          "ctype": "uint32_t",
-          "kind": "value",
-          "name": "max_items"
-        }
-      ],
-      "parametric_axes": [],
-      "public_symbol": "kernel_cake_fmha_decode_balanced_bf16_mtp_n64",
-      "source_family": [
-        {
-          "selector": {},
-          "sha256": {
-            "sm_100a": "41d9f89e8eb5af3e3b402d2e083910a8b2f3ba0b6365c11c80a259b24f533f8d",
-            "sm_103a": "3e5ef81359f72a050a03ed655f97dcac0972aa7c8531b60015260773ea3e637a"
-          },
-          "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_mtp_n64/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_mtp_n64/sm_103a/default.cu"
-          }
-        }
-      ],
-      "threads": 384
     }
   },
   "flashinfer_matrix_revision": "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b",
@@ -6021,6 +6390,16 @@
       "label": "correctness_decode_bf16_balanced_mtp",
       "profile": "conventional",
       "selected_route": "decode_balanced_bf16_v1"
+    },
+    {
+      "label": "correctness_decode_fp16_balanced_ragged",
+      "profile": "conventional",
+      "selected_route": "decode_balanced_fp16_v1"
+    },
+    {
+      "label": "correctness_decode_fp16_balanced_mtp",
+      "profile": "conventional",
+      "selected_route": "decode_balanced_fp16_v1"
     }
   ],
   "routes": {
@@ -6101,6 +6480,44 @@
         {
           "component": "context_nvfp4",
           "condition": "fused portable/native QMUL4 context"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "decode_balanced_bf16_v1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "decode_balanced_bf16",
+          "condition": "q_len == 1"
+        },
+        {
+          "component": "decode_balanced_bf16_mtp_n32",
+          "condition": "3 <= q_len <= 4"
+        },
+        {
+          "component": "decode_balanced_bf16_mtp_n64",
+          "condition": "5 <= q_len <= 8"
+        }
+      ],
+      "standalone_ready": true,
+      "support_gaps": []
+    },
+    "decode_balanced_fp16_v1": {
+      "all_components_exported": true,
+      "components": [
+        {
+          "component": "decode_balanced_fp16",
+          "condition": "q_len == 1"
+        },
+        {
+          "component": "decode_balanced_fp16_mtp_n32",
+          "condition": "3 <= q_len <= 4"
+        },
+        {
+          "component": "decode_balanced_fp16_mtp_n64",
+          "condition": "5 <= q_len <= 8"
         }
       ],
       "standalone_ready": true,
@@ -6206,25 +6623,6 @@
         {
           "component": "decode_quant_fp8_reduce",
           "condition": "num_splits > 1"
-        }
-      ],
-      "standalone_ready": true,
-      "support_gaps": []
-    },
-    "decode_balanced_bf16_v1": {
-      "all_components_exported": true,
-      "components": [
-        {
-          "component": "decode_balanced_bf16",
-          "condition": "q_len == 1"
-        },
-        {
-          "component": "decode_balanced_bf16_mtp_n32",
-          "condition": "3 <= q_len <= 4"
-        },
-        {
-          "component": "decode_balanced_bf16_mtp_n64",
-          "condition": "5 <= q_len <= 8"
         }
       ],
       "standalone_ready": true,
