@@ -39,6 +39,70 @@ def make_case(m, n, k, seed=42):
     return a, b, sf, weight
 
 
+@pytest.mark.parametrize("m", [1, 4, 8, 13, 14, 15, 16])
+@pytest.mark.parametrize("n,k", [(5120, 17408), (34816, 5120)])
+def test_prefetch_tactic_reference_and_graph_replay(m, n, k):
+    from flashinfer.gemm.kernels.native_bf16_fp4.runner import get_runner
+
+    if get_compute_capability(torch.device("cuda")) != (12, 1):
+        pytest.skip("Register-prefetch configurations are qualified for SM121")
+    a, b, sf, weight = make_case(m, n, k)
+    alpha = torch.tensor([0.375], device="cuda")
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=torch.bfloat16)
+    inputs = [a, b, sf, alpha, out, True]
+    runner = get_runner()
+    tactic = ("prefetch",)
+    assert tactic in runner.get_valid_tactics(inputs, None)
+    runner.forward(inputs, tactic=tactic, do_preparation=True)
+    assert torch.isnan(out).all()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        runner.forward(inputs, tactic=tactic)
+    stream.synchronize()
+    torch.testing.assert_close(
+        out.float(), (a.float() @ weight.T) * alpha, atol=2e-3, rtol=8e-3
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        runner.forward(inputs, tactic=tactic)
+    with torch.cuda.stream(stream):
+        a.mul_(0.5)
+        b.bitwise_xor_(0x88)
+        alpha.fill_(-1.75)
+        graph.replay()
+    stream.synchronize()
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(
+        out.float(), (a.float() @ -weight.T) * alpha, atol=2e-3, rtol=8e-3
+    )
+    with torch.cuda.stream(stream):
+        sf.view(torch.uint8).bitwise_xor_(0x80)
+        graph.replay()
+    stream.synchronize()
+    torch.testing.assert_close(
+        out.float(), (a.float() @ weight.T) * alpha, atol=2e-3, rtol=8e-3
+    )
+
+
+def test_prefetch_tactic_rejects_unsupported_views_and_output():
+    from flashinfer.gemm.kernels.native_bf16_fp4.runner import get_runner
+
+    a, b, sf, _ = make_case(1, 5120, 17408)
+    alpha = torch.ones(1, device="cuda")
+    out = torch.empty((1, 5120), device="cuda", dtype=torch.bfloat16)
+    runner = get_runner()
+    tactic = ("prefetch",)
+    shifted = torch.empty(sf.numel() + 1, dtype=sf.dtype, device=sf.device)[1:]
+    for inputs in (
+        [a, b, sf, None, out, True],
+        [a, b, sf, alpha, out.to(torch.float16), True],
+        [a, b, shifted, alpha, out, True],
+        [a.expand(17, -1).contiguous(), b, sf, alpha, out, True],
+    ):
+        assert not runner.validate_tactic(inputs, tactic)
+
+
 @pytest.mark.parametrize(
     "m,n,k",
     [

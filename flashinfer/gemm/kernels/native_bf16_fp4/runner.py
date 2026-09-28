@@ -9,6 +9,7 @@ import torch
 
 from ....autotuner import AutoTuner, TunableRunner, TuningConfig
 from ....utils import get_compute_capability, get_device_index
+from . import prefetch
 
 _COMPILED: dict[tuple, Any] = {}
 _TUNING_CONFIG = TuningConfig(use_cuda_graph=True, use_cold_l2_cache=True)
@@ -113,10 +114,14 @@ class NativeBf16Fp4Runner(TunableRunner):
             alpha is None,
             enable_pdl,
             _can_stage(inputs),
+            prefetch.is_supported(inputs),
         )
 
     def get_valid_tactics(self, inputs, profile):
-        return self._get_tactics(inputs, for_tuning=True)
+        tactics = self._get_tactics(inputs, for_tuning=True)
+        if prefetch.is_supported(inputs):
+            tactics.append(("prefetch",))
+        return tactics
 
     def _get_tactics(self, inputs, *, for_tuning):
         """Prune fallback tactics for tuning without rejecting safe execution."""
@@ -186,6 +191,8 @@ class NativeBf16Fp4Runner(TunableRunner):
 
     def validate_tactic(self, inputs, tactic):
         # Cold-L2 profiling clones can be more aligned than the caller's views.
+        if tactic == ("prefetch",):
+            return prefetch.is_supported(inputs)
         return tactic == -1 or tactic in self._get_tactics(inputs, for_tuning=False)
 
     def forward(self, inputs, tactic=-1, do_preparation=False, **kwargs):
@@ -194,6 +201,8 @@ class NativeBf16Fp4Runner(TunableRunner):
         n = b.shape[0]
         if not self.validate_tactic(inputs, tactic):
             raise ValueError("Invalid native W4A16 tactic")
+        if tactic == ("prefetch",):
+            return prefetch.run(a, b, sf, alpha, out, do_preparation=do_preparation)
         if tactic == -1:
             if m > 16:
                 tactic = (
