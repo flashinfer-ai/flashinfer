@@ -78,6 +78,9 @@ TMA_L2_EVICT_FIRST = 0x12F0000000000000
 TMA_L2_EVICT_LAST = 0x14F0000000000000
 _L2_HINTS = {"none": None, "first": TMA_L2_EVICT_FIRST, "last": TMA_L2_EVICT_LAST}
 _ENV_L2HINT = os.environ.get("SWAPAB_L2HINT")
+# L2 policy for the gathered token rows of the swap-AB mainloop (cp.async
+# L2::cache_hint); SWAPAB_TOKEN_L2HINT = none | last (default none until the A/B).
+_TOKEN_L2HINT = _L2_HINTS[os.environ.get("SWAPAB_TOKEN_L2HINT", "none")]
 
 
 def _resolve_weight_l2_hint(weight_l2_hint: Optional[int]) -> Optional[int]:
@@ -440,6 +443,7 @@ def _get_compiled_swapab_kernel(
         SWAP_FIN_BUFS,
         SWAP_FIN_RED,
         weight_l2_hint,
+        _TOKEN_L2HINT,
         tiled_a,
         # ``zero_output`` is a compile-time specialisation (None vs pointer).
         zero_fill,
@@ -477,6 +481,7 @@ def _get_compiled_swapab_kernel(
             fin_bufs=SWAP_FIN_BUFS,
             fin_red=SWAP_FIN_RED,
             weight_l2_hint=weight_l2_hint,
+            token_l2_hint=_TOKEN_L2HINT,
             row_tma=row_tma,
             gather_warps=gather_warps,
             m_group=m_group,
