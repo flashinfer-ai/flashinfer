@@ -2813,6 +2813,32 @@ one grid, no second launch to skip); neither is part of this round. The
 form stays off on the rank by default; the three levers stay as opt-ins for
 the form-on configuration.
 
+*Round 30 (B300, CAKE-707 phase 4): CUDA-graph conditional nodes around
+the window chain, measured and closed.* The first of the two directions
+left by round 29 was tested in isolation before any kernel work (one B300,
+pool0-0242, CUDA 13.1 in the container, ``cudaGraphSetConditional`` links
+without relocatable device code; 300 replays per graph, 3 passes, two
+binaries agree). A captured graph with a routing stub, a 117 MB store as
+the live dense GEMM1 and a second store after the join replays in 43.0 us.
+Two dead 296-CTA / 200 KB-smem grids that exit at entry on a forked side
+stream (the current form-on graph) add +2.3 to +2.5 us. Wrapping the same
+two grids in a conditional ``IF`` node that a 1-thread kernel sets from the
+window count adds +7.7 to +8.3 us when the body is *skipped* and +10.1 to
++10.8 us when it runs; with the routing kernel setting the conditional
+itself (no extra launch) the skipped ``IF`` still adds +6.2 to +8.2 us,
+while the extra 1-thread launch alone costs +0.4 to +0.6 us. So the
+conditional node itself costs 6-7.5 us per replay when its body is
+skipped on this driver / toolchain, about three times the two dead launches
+it would remove, against a 1 % budget of 0.6-1.4 us on the rank's
+``empty`` rows: this direction is closed. What remains for the rank is one
+persistent kernel over both tile kinds (256-row 2-CTA dense pairs and
+192-row swap windows in one grid, no second launch to skip), which also
+removes the routing's mixed-list pass only if the window decision moves
+into that kernel; it is a redesign of the dense GEMM1's tile scheduler and
+epilogue, not a lever on the current version. The form stays off on the
+rank by default; the rank's T=8192 balanced / hot and T=16384 hot rows keep
+their round-28 values on the dense path.
+
 *Wide rank at T=8192 and T=16384 remote-dominated.* These rows are the
 slowest against TRT-LLM Gen (0.79-0.86) and 2.0-2.4 x their floor: the
 first from tile padding (146 rows per expert, two M128 tiles), the second
