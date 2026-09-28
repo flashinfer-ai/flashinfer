@@ -2755,6 +2755,64 @@ unchanged swap and dense paths (the mixed lists are requested only when
 the form is on, so the routing kernel of every other row is the main
 branch's).
 
+*Round 29 (B300, CAKE-707 phase 4).* The dead window chain on the
+expert-parallel rank, measured lever by lever (fork branch
+``averyh/fi5156-p4-r29``, opt-in; one B300, pool0-0052, 3 passes x 20
+replays, candidate time / main time). With the form on, the rank's
+single-expert ``empty`` routings emit no windows and the window chain's
+swap GEMM1 and GEMM2 become dead persistent grids next to the live dense
+GEMM1 and wide finalize. Three levers against their cost:
+
+1. Entry exit (``MXFP4_SWAP192_EXIT_EMPTY=1``): the swap kernels wait on
+   their dependency at kernel entry and issue PTX ``exit`` when the routing's
+   window count is zero, before the shared-memory, barrier and TMEM setup.
+   Rank ``empty`` rows 1.18 / 1.11 / 1.11 -> 1.13 / 1.05 / 1.06 of main at
+   T=8192 / 16384 / 32768 (the dead grid no longer holds its SMs through
+   the prologue, TMEM allocation and scheduler drain); T=8192
+   remote-dominated 1.015 unchanged. On the shard (exit only) every row
+   stays within 1 % of the round-28 version or faster (T=8192 ``empty``
+   0.991-0.999, T=16384 ``empty`` 0.996-1.000, T=8192 balanced / hot 0.94 /
+   0.89 against main): below 1 %, so it is not adopted for the shard.
+2. No programmatic dependent launch on the window chain
+   (``MXFP4_SWAP192_CHAIN_PDL=0``): the dead grid becomes resident only
+   after the routing completes, so it never takes the SMs the live dense
+   GEMM1 prefetches on during the routing's tail. With the exit: rank
+   ``empty`` 1.094-1.099 / 1.001-1.017 / 1.041-1.045, remote-dominated
+   T=8192 1.002-1.003; balanced / hot / remote-dominated rows at T >= 16384
+   0.87-0.90 as before. On the shard the same combination (exit + no PDL) stays
+   within 1 % of the round-28 version or faster on every row (T=8192
+   ``empty`` 0.993-0.996, T=16384 ``empty`` 0.989-1.019, the T=32768 rows
+   inside their power band; T=8192 balanced / hot 0.94 / 0.89 against
+   main), again below 1 %: not adopted. Final tree ``22554daf``: rank
+   ``empty`` 1.080-1.093 / 1.018-1.025 / 1.041-1.044, remote-dominated
+   T=8192 1.001-1.002.
+3. One 64-bit routing scan for the padded offsets, dense-tile counts and
+   window counts (in place of the mixed lists' extra 32-bit scan): no
+   measurable change on the rank (the routing's three kernels read +1.8 us
+   at T=8192 and +3.9 us at T=32768 with the mixed lists either way; the
+   cost is the per-expert cover pass and the list writes, not the scan
+   count), and the packed word's 12-bit dense-tile field overflows on the
+   shard at T=32768 (up to 4992 tiles). Dropped.
+
+What remains with the best combination (exit + no PDL) on the T=8192
+``empty`` row, kernel by kernel against main (CUPTI, same GPU): routing
+9.2 -> 11.0 us, dead swap GEMM1 2.5 us and dead swap GEMM2 2.7 us on the
+side stream (launch and drain of a 148-cluster grid that exits at entry),
+dense GEMM1 36.7 -> 37.4 us, wide finalize 14.8 -> 16.6 us (displaced by the
+dead GEMM2 grid), span 64.5 -> 70.8 us; at T=32768 the routing pays +3.9 us
+and the span +6.3 us. So any rank form that keeps the window launches in
+the captured graph costs these rows about 6 us, 4-10 % of 64-138 us, against
+a 1 % budget of 0.6-1.4 us: the rank's ``empty`` rows (acceptance 2) and its
+T=8192 balanced / hot and T=16384 hot rows (acceptance 1, 0.96-0.98 on the
+dense path, 1.13-1.16 with the form) cannot both be met by the mixed form as
+launched. The two directions that remove the dead launches rather than
+cheapen them are CUDA-graph conditional nodes around the window chain
+(device-side skip when the window count is zero) and one persistent kernel
+over both tile kinds (256-row 2-CTA dense pairs and 192-row swap windows in
+one grid, no second launch to skip); neither is part of this round. The
+form stays off on the rank by default; the three levers stay as opt-ins for
+the form-on configuration.
+
 *Wide rank at T=8192 and T=16384 remote-dominated.* These rows are the
 slowest against TRT-LLM Gen (0.79-0.86) and 2.0-2.4 x their floor: the
 first from tile padding (146 rows per expert, two M128 tiles), the second
