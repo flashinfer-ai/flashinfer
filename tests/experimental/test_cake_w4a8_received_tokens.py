@@ -112,3 +112,34 @@ def test_input_contract():
     bad[0] = bad[0].T.contiguous().T
     with pytest.raises(ValueError, match="contiguous"):
         prepare_fp4_block_scale_routed_moe(*bad, local_expert_offset=0, output=output)
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two CUDA devices")
+@pytest.mark.parametrize("rows", [121, 384, 732])
+def test_run_with_different_current_device(rows):
+    """Honor the bound device's stream while restoring the caller's device."""
+    with torch.cuda.device(0):
+        inputs = make_inputs(rows, "duplicates")
+        output = torch.empty((rows, 3072), dtype=torch.bfloat16, device="cuda")
+        prepared = prepare_fp4_block_scale_routed_moe(
+            *inputs, local_expert_offset=0, output=output, backend="cake"
+        )
+        expected = reference(inputs)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            output.fill_(float("nan"))
+            with torch.cuda.device(1):
+                assert prepared.run() is output
+                assert torch.cuda.current_device() == 1
+        torch.cuda.current_stream().wait_stream(stream)
+        assert_correct(output, expected)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream), torch.cuda.device(1):
+            assert prepared.run() is output
+            assert torch.cuda.current_device() == 1
+        for _ in range(3):
+            output.fill_(float("nan"))
+            graph.replay()
+            assert_correct(output, expected)

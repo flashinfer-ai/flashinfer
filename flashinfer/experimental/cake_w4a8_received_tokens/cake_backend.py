@@ -196,50 +196,52 @@ class PreparedRoutedMoE:
         self.fc2_grid = (128, 1, 1) if narrow else (24, self.tiles, 1)
 
     def run(self):
-        routing, fc1, fc2, finalize = self.modules
-        forward, tokens, inverse, experts, limits, size, nonexit = self.metadata
-        routing.run(
-            self.inputs["ids"],
-            *self.metadata,
-            self.tokens,
-            self.inputs["local_expert_offset"],
-            self.padding_log2,
-            8,
-            1,
-            1,
-        )
-        fc1.run(
-            self.w1,
-            self.x_bytes,
-            self.w1_scale,
-            self.x_scale_words,
-            self.fc1_output,
-            self.activation_scale,
-            tokens,
-            experts,
-            limits,
-            nonexit,
-            self.tokens,
-            *self.fc1_grid,
-        )
-        fc2.run(
-            self.w2,
-            self.activation,
-            self.w2_scale,
-            self.fc2_scale,
-            self.fc2_output,
-            experts,
-            limits,
-            nonexit,
-            *self.fc2_grid,
-        )
-        finalize.run(
-            self.expert_output,
-            self.inputs["scores"],
-            forward,
-            self.output,
-            self.tokens * 2,
-            1,
-            1,
-        )
+        """Run on the bound device's current stream and return the local output."""
+        with torch.cuda.device(self.output.device):
+            routing, fc1, fc2, finalize = self.modules
+            forward, tokens, inverse, experts, limits, size, nonexit = self.metadata
+            routing.run(
+                self.inputs["ids"],
+                *self.metadata,
+                self.tokens,
+                self.inputs["local_expert_offset"],
+                self.padding_log2,
+                8,
+                1,
+                1,
+            )
+            fc1.run(
+                self.w1,
+                self.x_bytes,
+                self.w1_scale,
+                self.x_scale_words,
+                self.fc1_output,
+                self.activation_scale,
+                tokens,
+                experts,
+                limits,
+                nonexit,
+                self.tokens,
+                *self.fc1_grid,
+            )
+            fc2.run(
+                self.w2,
+                self.activation,
+                self.w2_scale,
+                self.fc2_scale,
+                self.fc2_output,
+                experts,
+                limits,
+                nonexit,
+                *self.fc2_grid,
+            )
+            finalize.run(
+                self.expert_output,
+                self.inputs["scores"],
+                forward,
+                self.output,
+                self.tokens * 2,
+                1,
+                1,
+            )
         return self.output
