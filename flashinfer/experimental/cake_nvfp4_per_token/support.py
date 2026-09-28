@@ -62,7 +62,7 @@ def cake_mm_fp4_requirement(
             raise ValueError(message)
         return False
 
-    if alpha is None or alpha.numel() <= 1:
+    if alpha is None or alpha.dim() != 1 or alpha.numel() != a.shape[0]:
         return reject(
             "the cake mm_fp4 backend implements the per-token alpha path only "
             "(alpha of shape [M]); use another backend for a scalar alpha"

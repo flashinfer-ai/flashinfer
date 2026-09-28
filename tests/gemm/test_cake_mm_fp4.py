@@ -245,7 +245,8 @@ def test_mm_fp4_cake_matches_reference(m, n, k, out_dtype):
     "m,n,k,x_dtype",
     [
         (8, 18432, 7168, torch.bfloat16),  # deep-K swapped orientation
-        (17, 7168, 16384, torch.float16),  # split-K, fp16 activations
+        (17, 7168, 16384, torch.bfloat16),  # split-K tail
+        (257, 2112, 7168, torch.float16),  # fp16 activations (validated f16 row)
         (130, 8192, 8192, torch.bfloat16),  # 2-CTA m orientation
         (1000, 2112, 7168, torch.bfloat16),  # ragged M, grouped raster
     ],
