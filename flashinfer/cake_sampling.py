@@ -107,7 +107,7 @@ _STAGE1_COST_BY_SM_COUNT: dict[
 ] = {
     # (resident_base_us, resident_per_ept_us, stream_wave_base_us, stream_chunk_us,
     #  stream_cluster_cta_us, launch_cta_us, stream_large_k_us)
-    148: (2.0, 0.1, 4.0, 0.4, 0.0, 0.0, 1.0),
+    148: (2.0, 0.1, 4.0, 0.4, 0.0, 0.0, 2.0),
     132: (2.0, 0.1, 4.0, 0.4, 0.1, 1.5, 2.0),
     212: (1.5, 0.1, 4.0, 0.4, 0.0, 0.0, 2.0),
 }

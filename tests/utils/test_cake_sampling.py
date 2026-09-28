@@ -603,9 +603,12 @@ def test_per_request_tensors_and_routes():
         assert pick(1, 128256, sm_count=sm, top_k_max=50) == pick(1, 128256, sm_count=sm)
     assert pick(16, 128256, sm_count=148, top_k_max=1000) == (4, 16, True)
     assert pick(16, 128256, sm_count=212, top_k_max=1000) == (8, 32, False)
-    # V = 151936 at k = 1000: B200 / B300 keep the (8, 16) stream (15.2 vs 15.6 us for the (8, 48)
-    # resident), H100 and R200 take (8, 48) (H100 15.5 vs 16.9 at B = 1; R200 14.9 vs 15.7 at B = 16).
-    assert pick(1, 151936, sm_count=148, top_k_max=1000) == (8, 16, True)
+    # V = 151936 at k = 1000, B <= 8: every table takes the (8, 48) resident (H100 15.6 vs 16.9 us for the
+    # (8, 16) stream at B = 1; R200 12.4 vs 12.7; on B200 / B300 the kernels tie but the two-launch call is
+    # 2.6-3.6 % faster with the resident at B = 1); the (4, 16) stream owns B = 16 on the 148 / 132 tables.
+    assert pick(1, 151936, sm_count=148, top_k_max=1000) == (8, 48, False)
+    assert pick(8, 151936, sm_count=148, top_k_max=1000) == (8, 48, False)
+    assert pick(16, 151936, sm_count=148, top_k_max=1000) == (4, 16, True)
     assert pick(1, 151936, sm_count=132, top_k_max=1000) == (8, 48, False)
     assert pick(1, 151936, sm_count=212, top_k_max=1000) == (8, 48, False)
     assert pick(16, 151936, sm_count=212, top_k_max=1000) == (8, 48, False)
