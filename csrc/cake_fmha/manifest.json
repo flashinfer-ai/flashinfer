@@ -1470,8 +1470,9 @@
       "ctx_fp8_bf16_nhd_hd256_stage16_v1": 40,
       "ctx_fp8_hnd_hd128_hgpack_48b5_v1": 640,
       "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": 6,
+      "decode_balanced_bf16_v1": 6,
       "decode_native_bf16_hd256_smallm_v1": 6,
-      "decode_native_bf16_v1_bece": 120,
+      "decode_native_bf16_v1_bece": 114,
       "decode_native_fp16_nhd_v1_f32d": 240,
       "decode_quantized_bf16q_9d8b_v1": 48,
       "decode_quantized_nvfp4_8e5b_v1": 24

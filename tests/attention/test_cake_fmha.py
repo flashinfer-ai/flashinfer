@@ -142,7 +142,7 @@ def test_cake_fmha_high_level_selectors_match_pinned_capability_corpus(
         sorted(manifest["capability"]["route_counts"].items())
     )
     assert report.digest == (
-        "5068efc8ee2f999381a2ee4608746edab6dd7299cfea1e9df041fde6a5e8b764"
+        "2ad39f70fcb0128155f990c1e01ab7bdad70c7815c6ed9555c99d695523137a5"
     )
 
 
