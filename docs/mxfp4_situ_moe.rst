@@ -2364,6 +2364,91 @@ at T=512 / 1024 / 2048 in all three passes -- a 1.5 % gain on three
 rows, kept for the next code round rather than spent as a gate cycle of
 its own.
 
+*Round 26 (B300, CAKE-707 phase 4).* Mixed tile heights per expert on the
+dense rows (lever L2). The dense path pads every expert to 128-row (or
+paired 256-row) tiles: a balanced T=8192 shard prefill holds ~170 rows per
+expert and pads 33 %. The mixed form keeps the dense path's 128-row
+``moe_sort`` groups and, per expert, runs its dense 128-row tiles first and
+one 192-row window of the 2-CTA swap-AB kernel (256 weight rows x 192
+tokens per work item) behind them, covering ``ceil(c / 64) * 64`` rows (at
+least 128): a single-CTA dispatch kernel (``swapab_dispatch_mixed``, binary
+search for each expert's run of sort groups, closed-form cover, ~4 us in
+the graph) writes the dense slot list and the window list (64-row units);
+the dense gather GEMM1 and the swap GEMM1 both write blocked row scales,
+and the dense gather GEMM1's asynchronous bulk fill zero-fills the output
+for the finalize. GEMM2 runs either as the dense finalize over every sort
+group (``MXFP4_SWAP192_MIXED_GEMM2=dense``, the swap GEMM2 is not launched)
+or split between the swap finalize over the windows and the dense finalize
+over the dense slots (``split``; both add atomically into the zero-filled
+output). Measured against the dense path on the same GPU (A/B, 3 x 20 graph
+replays, CUPTI span), the closed directions first: the pure 192-row form
+(192-row sort groups, both GEMMs on the swap kernel) wins the T=8192 rows
+(0.88-0.95) but loses 14-29 % at T=16384 and T=32768 on both layouts,
+where its 64-77 % SM throughput and 39-46 % L2 hit rate against the dense
+gather GEMM1's 87 % / 46-56 % cost more than the padding it saves; ties in
+the cover broken toward more windows (two windows for 384 rows) are within
+noise of the fewer-window rule and dropped; zero-filling the output from
+the swap GEMM1's scheduler warp costs +46 / +110 us and from its epilogue
+warps +31 us on the T=8192 GEMM1 (and 20 us when the grid holds few
+windows), so the fill stays on the dense GEMM1's tile-less CTAs; the
+dispatch kernel's serial scan of each expert's groups and full cover search
+took 20 us on routings with few large experts before the closed form; the
+second stream for the dense chain (``MXFP4_SWAP192_MIXED_STREAMS``) reads
+within noise of the single stream with the dense-all GEMM2 on the shard.
+The form's spans against the dense path (same GPU, same allocation, graph
+replay, three passes x 20; the GEMM2 form of the ``auto`` policy: ``split``
+on the rank and at T=8192 on the shard, ``dense`` on the shard from
+T=16384; the rank's dense chain on the second stream):
+
+.. code-block:: text
+
+   layout  T      routing   dense us (3 passes)     mixed us (3 passes)     mixed / dense
+   shard   8192   balanced  1672 / 1674 / 1672      1601 / 1602 / 1601      0.957 / 0.957 / 0.957
+   shard   8192   hot       1734 / 1690 / 1697      1521 / 1522 / 1528      0.877 / 0.900 / 0.901
+   shard   8192   empty     1016 / 1011 / 1026      1073 / 1082 / 1069      1.056 / 1.070 / 1.042
+   shard   16384  balanced  2795 / 2798 / 2923      2800 / 2670 / 2668      1.002 / 0.954 / 0.913
+   shard   16384  hot       2797 / 2759 / 2836      2704 / 2668 / 2663      0.966 / 0.967 / 0.939
+   shard   16384  empty     2042 / 1978 / 2069      2254 / 2189 / 2247      1.104 / 1.107 / 1.086
+   shard   32768  balanced  5589 / 5585 / 5429      5370 / 5362 / 5424      0.961 / 0.960 / 0.999
+   shard   32768  hot       5301 / 5392 / 5257      5157 / 5167 / 5057      0.973 / 0.958 / 0.962
+   shard   32768  empty     4624 / 4488 / 4287      4638 / 4818 / 4747      1.003 / 1.073 / 1.107
+   rank    8192   balanced  1212 / 1214 / 1214      1082 / 1080 / 1080      0.892 / 0.890 / 0.889
+   rank    8192   hot       1522 / 1536 / 1542      1374 / 1406 / 1386      0.902 / 0.915 / 0.899
+   rank    8192   empty     70 / 73 / 68            112 / 110 / 114         1.607 / 1.517 / 1.675
+   rank    16384  balanced  2225 / 2224 / 2212      2000 / 1980 / 1994      0.899 / 0.890 / 0.902
+   rank    16384  hot       2914 / 3019 / 2952      2714 / 2678 / 2721      0.931 / 0.887 / 0.922
+   rank    16384  empty     95 / 89 / 87            101 / 98 / 102          1.063 / 1.100 / 1.163
+   rank    32768  balanced  3657 / 3964 / 3959      3783 / 3791 / 4032      1.034 / 0.956 / 1.018
+   rank    32768  hot       5813 / 5806 / 5872      5745 / 5502 / 5521      0.988 / 0.948 / 0.940
+   rank    32768  empty     152 / 139 / 148         177 / 168 / 172         1.169 / 1.207 / 1.166
+
+The six rows the dense path runs behind TRT-LLM Gen (rank and shard T=8192
+balanced / hot, rank T=16384 balanced / hot, at 0.95-0.99) move 4-16 %
+ahead, and the shard's T=16384 / 32768 balanced / hot rows 3-6 %; every
+``empty`` row loses. On the rank the ``empty`` routings are launch chains of
+70-150 us and the form adds the dispatch kernel and two more GEMM launches
+(5-8 us under PDL) plus the 117-235 MB output zero-fill that the dense
+path's own GEMM1 hides under its mainloop and the mixed dense GEMM1, holding
+almost no tiles there, cannot (dense GEMM1 23-54 us on the side stream). On
+the shard the ``empty`` routings hold few large experts: the mixed dispatch
+emits no windows for them (``ceil(c / 64) * 64`` is a multiple of 128) and
+the whole 4-11 % is the dense chain over the 128-row sort groups against the
+dense path's device-side 128 / 256-row tile choice (GEMM1 470 vs 441 us at
+T=8192, 1016 vs ~900 us at T=16384) plus the 12 us of launches. The form is
+therefore opt-in (``MXFP4_SWAP192_LAYOUTS``; ``MXFP4_SWAP192=1`` forces it)
+and the tables below keep the dense path; making it free on the ``empty``
+routings needs the two items the round leaves open: the mixed dispatch
+emitting the paired 256-row dense tiles (the dual-tile dense launch over the
+mixed slot list) for experts with two or more dense groups, and skipping the
+unchosen launches on the device (graph conditional nodes, the standing open
+item of the rank's tile choice above) so that a routing without windows
+costs the dispatch kernel alone. Both remain the L2 follow-ups; L3 (fused
+GEMM1 -> SiTU -> GEMM2, bounded at 1.0-1.7 % in round 23) stays closed.
+Numerics: every mixed variant matches the FP64 reference at the dense path's
+relative L2 (0.0053 shard, 0.0017-0.0045 rank, T=8192 / 16384, three
+routings); compute-sanitizer synccheck and memcheck at T=2048 on both
+layouts are recorded with the round.
+
 *Wide rank at T=8192 and T=16384 remote-dominated.* These rows are the
 slowest against TRT-LLM Gen (0.79-0.86) and 2.0-2.4 x their floor: the
 first from tile padding (146 rows per expert, two M128 tiles), the second
