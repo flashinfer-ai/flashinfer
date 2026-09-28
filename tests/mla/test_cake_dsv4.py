@@ -919,7 +919,18 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             id="case-84",
         ),
         pytest.param(
-            torch.bfloat16, 64, 2, 5, False, 640, 64, "bf16_h64_fixed_q", id="case-85"
+            torch.bfloat16,
+            64,
+            2,
+            5,
+            False,
+            640,
+            64,
+            "bf16_h64_compressed_q8_v38",
+            id="case-85",
+        ),
+        pytest.param(
+            torch.bfloat16, 64, 2, 5, False, 128, 1, "bf16_h64_fixed_q", id="case-85-swa"
         ),
         pytest.param(
             torch.bfloat16, 64, 2, 257, True, 640, 64, "bf16_h64_prefill", id="case-86"
