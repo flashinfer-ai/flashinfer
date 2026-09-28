@@ -214,18 +214,23 @@ SWAP_MIXED_SF_PLAIN = os.environ.get("SWAPAB_MIXED_SF_PLAIN", "0") == "1"
 # tokens per work item, see the kernel docstring), in the mixed form below
 # beside the dense 128-row tiles. ``MXFP4_SWAP192``: ``auto`` (default) runs
 # it on the layouts named in ``MXFP4_SWAP192_LAYOUTS`` (``expert_parallel``,
-# ``moe_tensor_parallel``; default none: the form is opt-in, see the docs'
-# round 26 -- it takes the balanced / hot T=8192 and 16384 rows down 4-16 %
-# but its extra launches and fixed 128-row dense tiles cost the ``empty``
-# routings 4-17 % on the shard and more on the rank) from
-# ``MXFP4_SWAP192_MIN_TOKENS`` (default 8192: below it the shard's experts
-# hold <= 128 rows and the form degenerates to the dense tiles plus its
-# overhead); ``1`` / ``0`` force it on every layout / off.
+# ``moe_tensor_parallel``; default the MoE-TP shard, see the docs' rounds 26
+# and 27: with the dense tiles following the routing's 128 / 256-row
+# padding the form takes the shard's balanced / hot T=8192..32768 rows down
+# 4-13 % and its ``empty`` routings stay within 1 % of the dense path; on
+# the expert-parallel rank its extra launches still cost the 70-150 us
+# ``empty`` routings 25-45 %, so the rank keeps the dense path until they can
+# be skipped on the device) from ``MXFP4_SWAP192_MIN_TOKENS`` (default 8192:
+# below it the shard's experts hold <= 128 rows and the form degenerates to
+# the dense tiles plus its overhead); ``1`` / ``0`` force it on every layout
+# / off.
 SWAP_WIDE192_MODE = os.environ.get("MXFP4_SWAP192", "auto")
 if SWAP_WIDE192_MODE not in ("auto", "0", "1"):
     raise ValueError("MXFP4_SWAP192 must be auto, 0 or 1")
 SWAP_WIDE192_LAYOUTS = tuple(
-    x for x in os.environ.get("MXFP4_SWAP192_LAYOUTS", "").split(",") if x
+    x
+    for x in os.environ.get("MXFP4_SWAP192_LAYOUTS", "moe_tensor_parallel").split(",")
+    if x
 )
 SWAP_WIDE192_MIN_TOKENS = int(os.environ.get("MXFP4_SWAP192_MIN_TOKENS", "8192"))
 SWAP_WIDE192_TILE = int(os.environ.get("MXFP4_SWAP192_TILE", "192"))  # measurement arms: 64 / 128
