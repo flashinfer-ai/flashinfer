@@ -512,18 +512,21 @@ def blk_reduce_fp32(dst_gemm, src_smem, size, loc=None, ip=None):
 
 
 @dsl_user_op
-def cp_async_cg16_l2hint(dst_smem, src_gmem, src_size_i32, policy_i64, loc=None, ip=None):
-    """16-byte ``cp.async.cg`` with an L2 cache-policy hint; ``src_size`` 0 zero-fills."""
+def cp_async_cg16_l2hint(dst_smem_u32, src_gmem_u64, src_size_i32, policy_i64, loc=None, ip=None):
+    """16-byte ``cp.async.cg`` with an L2 cache-policy hint; ``src_size`` 0 zero-fills.
+
+    ``dst_smem_u32`` is the (already swizzled) 32-bit shared address, ``src_gmem_u64``
+    the global address."""
     llvm.inline_asm(
         None,
         [
-            dst_smem.iterator.llvm_ptr,
-            src_gmem.iterator.llvm_ptr,
+            cutlass.Int32(dst_smem_u32).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(src_gmem_u64).ir_value(loc=loc, ip=ip),
             cutlass.Int32(src_size_i32).ir_value(loc=loc, ip=ip),
             cutlass.Int64(policy_i64).ir_value(loc=loc, ip=ip),
         ],
         "cp.async.cg.shared.global.L2::cache_hint [$0], [$1], 16, $2, $3;",
-        "l,l,r,l",
+        "r,l,r,l",
         has_side_effects=True,
         loc=loc,
         ip=ip,

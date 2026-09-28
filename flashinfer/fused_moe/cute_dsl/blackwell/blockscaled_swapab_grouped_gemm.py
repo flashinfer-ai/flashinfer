@@ -1923,6 +1923,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             # tail of the 128-row SF block. Passes are dealt evenly (asserted
             # in the constructor), so no row folds onto another.
             pred1 = cute.make_rmem_tensor(cute.make_layout((1,)), cutlass.Boolean)
+            if cutlass.const_expr(self.token_l2_hint is not None):
+                sB_base_u32 = cutlass.Int32(sB.iterator.toint())
 
             while is_valid_tile:
                 row_group = tile_info[1]
@@ -2000,9 +2002,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                     sB_stage + dst_off, layout=cute.make_layout((16,))
                                 )
                                 if cutlass.const_expr(self.token_l2_hint is not None):
+                                    # Inline cp.async bypasses the swizzled iterator: apply
+                                    # the SW128 XOR (16-B chunk bits 4..6 ^= row bits 7..9)
+                                    # on the stage-relative byte offset by hand.
+                                    swz_off = dst_off ^ (((dst_off >> 7) & 7) << 4)
                                     cp_async_cg16_l2hint(
-                                        s_b,
-                                        g_b,
+                                        sB_base_u32 + stage * b_bytes_per_stage + swz_off,
+                                        mB.iterator.toint() + src_off,
                                         cutlass.Int32(row_ok[i]) * 16,
                                         cutlass.Int64(self.token_l2_hint),
                                     )
