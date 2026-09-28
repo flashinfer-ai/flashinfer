@@ -920,19 +920,10 @@ def _route(
             return "bf16_h32_topk128x_early_v47"
         raise ValueError("BF16 H32 compressed cache requires page size 64 or 2")
     if num_heads == 64:
-        if not ragged:
-            if (
-                (is_topk4x or is_topk128x)
-                and max_q_len < 257
-                and num_query_tokens < _BF16_H64_COMPRESSED_PREFILL_TOKENS
-            ):
-                # Dense Q with equal q_lens is the same row memory as ragged
-                # Q; the portfolio producer (T x splits x 2 owners + two-warp
-                # reducer) beats the fixed-Q cluster-2 guard program on the
-                # sparse fixed-Q decode rows (GB300 1.03x -> 1.21x). SWA-only,
-                # 24+ token and prefill fixed-Q rows keep the guard program.
-                return "bf16_h64_compressed_q8_v38"
-            return "bf16_h64_fixed_q"
+        # Dense Q with equal q_lens is the same row memory as ragged Q: the
+        # not-ragged rows follow the ragged rules (the portfolio producer beats
+        # the former fixed-Q guard program on the sparse decode rows, GB300
+        # 1.03x -> 1.21x; the fixed-Q programs are no longer exported).
         if max_q_len >= 257:
             return "bf16_h64_prefill"
         if is_swa:

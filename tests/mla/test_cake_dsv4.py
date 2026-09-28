@@ -930,7 +930,10 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             id="case-85",
         ),
         pytest.param(
-            torch.bfloat16, 64, 2, 5, False, 128, 1, "bf16_h64_fixed_q", id="case-85-swa"
+            torch.bfloat16, 64, 2, 5, False, 128, 1, "bf16_swa128_single_cta", id="case-85-swa"
+        ),
+        pytest.param(
+            torch.bfloat16, 64, 6, 4, False, 640, 64, "bf16_h64_prefill", id="case-85-dense24"
         ),
         pytest.param(
             torch.bfloat16, 64, 2, 257, True, 640, 64, "bf16_h64_prefill", id="case-86"
@@ -1517,7 +1520,7 @@ def _run_fake_dense_h64(monkeypatch, *, query_rows, metadata, workspace, out=Non
     """Drive run_cake_dsv4 on CPU tensors through the bf16 H64 dense split route."""
     recorder = _install_fake_variants(
         monkeypatch,
-        {"bf16_h64_fixed_q": _MAIN_PLAN, "bf16_h64_fixed_q_reduce": _REDUCE_PLAN},
+        {"bf16_h64_compressed_q8_v38": _MAIN_PLAN, "bf16_h64_compressed_reduce": _REDUCE_PLAN},
     )
     monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
     monkeypatch.setattr(cake, "_stream_ptr", lambda device: 0)
