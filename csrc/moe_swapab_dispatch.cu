@@ -33,6 +33,7 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cub/block/block_reduce.cuh>
 #include <cub/block/block_scan.cuh>
@@ -378,17 +379,19 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
   const size_t smem_bytes = 2 * sizeof(int32_t) * static_cast<size_t>(stage_base + stage_alt);
   auto* kernel =
       use_pdl ? swapab_dispatch_mixed_kernel<true> : swapab_dispatch_mixed_kernel<false>;
-  // The dynamic staging area may exceed the 48 KB default; the opt-in is
-  // recorded per kernel variant so replays (graph capture) skip the call.
+  // Static (block scan) plus dynamic (staging) shared memory exceeds the 48
+  // KB default without the opt-in; the largest dynamic size seen is recorded
+  // per kernel variant so replays (graph capture) skip the call.
   static size_t configured_bytes[2] = {0, 0};
   size_t& configured = configured_bytes[use_pdl ? 1 : 0];
-  if (smem_bytes > configured && smem_bytes > 48 * 1024) {
+  if (smem_bytes > configured || configured == 0) {
+    const size_t request = std::max(smem_bytes, static_cast<size_t>(1));
     cudaError_t aerr = cudaFuncSetAttribute(
-        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(request));
     TVM_FFI_ICHECK(aerr == cudaSuccess)
-        << "moe_swapab_dispatch_mixed: cannot reserve " << smem_bytes
+        << "moe_swapab_dispatch_mixed: cannot reserve " << request
         << " B of dynamic shared memory: " << cudaGetErrorString(aerr);
-    configured = smem_bytes;
+    configured = request;
   }
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(1);
