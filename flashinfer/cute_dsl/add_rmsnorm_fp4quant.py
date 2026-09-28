@@ -73,6 +73,7 @@ from .fp4_common import (
     ue8m0_to_output_scale,
     # Reduction utilities
     row_reduce,
+    warp_reduce,
     # Predicate utility
     predicate_k,
     # Helper functions for SF block processing
@@ -188,15 +189,23 @@ class AddRMSNormFP4QuantKernel:
         scale_format: str | None = None,
         output_both_sf_layouts: bool = False,
         output_norm: bool = False,
+        output_hidden_size: int | None = None,
+        router_num_experts: int = 0,
+        router_has_bias: bool = False,
     ):
         self.dtype = dtype
         self.H = H
+        self.output_hidden_size = (
+            H if output_hidden_size is None else output_hidden_size
+        )
         self.block_size = block_size
         self.output_swizzled = output_swizzled
         self.is_fp16 = is_fp16
         self.sm_version = sm_version if sm_version is not None else get_sm_version()
         self.output_both_sf_layouts = output_both_sf_layouts
         self.output_norm = output_norm
+        self.router_num_experts = router_num_experts
+        self.router_has_bias = router_has_bias
 
         if scale_format is None:
             self.scale_format = "ue8m0" if block_size == 32 else "e4m3"
@@ -235,6 +244,23 @@ class AddRMSNormFP4QuantKernel:
         self.cols_per_tile = self.vec_size * self.num_vec_blocks * self.threads_per_row
 
         self.num_sf_blocks_per_row = H // block_size
+        if router_num_experts and (
+            self.cluster_n != 1 or block_size != 16 or self.scale_format != "e4m3"
+        ):
+            raise ValueError("Router fusion requires single-CTA NVFP4")
+        if self.output_hidden_size != H and (
+            self.output_hidden_size < H
+            or self.output_hidden_size % 16 != 0
+            or block_size != 16
+            or self.scale_format != "e4m3"
+            or output_swizzled
+            or output_both_sf_layouts
+            or self.cluster_n != 1
+        ):
+            raise ValueError(
+                "Padded outputs require single-CTA NVFP4 with row-major scales "
+                "and output_hidden_size >= hidden_size divisible by 16"
+            )
 
         # Need swizzle params if output_swizzled or output_both_sf_layouts
         if output_swizzled or output_both_sf_layouts:
@@ -390,6 +416,9 @@ class AddRMSNormFP4QuantKernel:
         eps: Float32,
         enable_pdl: cutlass.Constexpr[bool],
         stream,
+        mRouterWeight: cute.Tensor | None = None,
+        mRouterBias: cute.Tensor | None = None,
+        mRouterLogits: cute.Tensor | None = None,
     ):
         """Host function to launch the kernel.
 
@@ -397,7 +426,7 @@ class AddRMSNormFP4QuantKernel:
         - mX: Input tensor, shape (M, H), row-major (read-only)
         - mR: Residual tensor, shape (M, H), row-major (modified in-place to input + residual)
         - mW: Weight tensor, shape (H,)
-        - mY: Output FP4 tensor, shape (M, H // 2), row-major (packed)
+        - mY: Output FP4 tensor, shape (M, output_hidden_size // 2), packed
         - mS: Scale factor tensor, shape depends on swizzle mode
         - mS_unswizzled: Unswizzled scale factor tensor (used when output_both_sf_layouts=True)
         - mYNorm: Optional normed output tensor, flat 1D view of (M, H), same dtype as
@@ -428,6 +457,9 @@ class AddRMSNormFP4QuantKernel:
             enable_pdl,
             tv_layout,
             tiler_mn,
+            mRouterWeight,
+            mRouterBias,
+            mRouterLogits,
         ).launch(
             grid=[cute.ceil_div(M, self.rows_per_block), self.cluster_n, 1],
             block=[self.num_threads, 1, 1],
@@ -455,6 +487,9 @@ class AddRMSNormFP4QuantKernel:
         enable_pdl: cutlass.Constexpr[bool],
         tv_layout: cute.Layout,
         tiler_mn: cute.Shape,
+        mRouterWeight: cute.Tensor | None = None,
+        mRouterBias: cute.Tensor | None = None,
+        mRouterLogits: cute.Tensor | None = None,
     ):
         """Device kernel with cluster sync and Half2 SIMD.
 
@@ -689,6 +724,10 @@ class AddRMSNormFP4QuantKernel:
                                 y = (h * rstd * w).to(mX.element_type).to(Float32)
                                 y_f32[i] = y
                                 max_abs = fmax_f32(max_abs, fabs_f32(y))
+                                if cutlass.const_expr(self.router_num_experts > 0):
+                                    # Each scale block has one owner. Reuse sH
+                                    # only after consuming its FP32 residual sum.
+                                    sH[row_in_block, block_start + i] = y
 
                             # E4M3: global_scale is incorporated into block scale
                             scale_float = global_scale_val * (max_abs * fp4_max_rcp)
@@ -740,7 +779,9 @@ class AddRMSNormFP4QuantKernel:
                             packed64 = quantize_and_pack_16(y_f32, inv_scale)
                             out_offset = block_start // 2
                             out_ptr = get_ptr_as_int64(
-                                mY, actual_row_idx * (H // 2) + out_offset
+                                mY,
+                                Int64(actual_row_idx) * (self.output_hidden_size // 2)
+                                + out_offset,
                             )
                             st_global_u64(out_ptr, packed64)
 
@@ -1061,6 +1102,41 @@ class AddRMSNormFP4QuantKernel:
                                     is_fp16,
                                 )
 
+        if cutlass.const_expr(self.output_hidden_size != H):
+            # Each lane owns disjoint complete quantization blocks. Do not
+            # normalize padding or launch a separate fill/copy operation.
+            if actual_row_idx < M:
+                for sf_idx in range(
+                    self.num_sf_blocks_per_row + lane_in_row,
+                    self.output_hidden_size // 16,
+                    threads_per_row,
+                ):
+                    out_ptr = get_ptr_as_int64(
+                        mY,
+                        Int64(actual_row_idx) * (self.output_hidden_size // 2)
+                        + sf_idx * 8,
+                    )
+                    st_global_u64(out_ptr, Uint64(0))
+                    mS[actual_row_idx, sf_idx] = Uint8(0)
+
+        if cutlass.const_expr(self.router_num_experts > 0):
+            # Inactive rows must also reach this CTA-wide barrier.
+            cute.arch.barrier()
+            if actual_row_idx < M:
+                lane = lane_in_row % 32
+                warp = lane_in_row // 32
+                for expert in range(warp, self.router_num_experts, warps_per_row):
+                    acc = Float32(0.0)
+                    for col in range(lane, H, 32):
+                        acc = acc + sH[row_in_block, col] * mRouterWeight[
+                            expert, col
+                        ].to(Float32)
+                    acc = warp_reduce(acc, lambda a, b: a + b)
+                    if lane == 0:
+                        if cutlass.const_expr(self.router_has_bias):
+                            acc = acc + mRouterBias[expert].to(Float32)
+                        mRouterLogits[actual_row_idx, expert] = acc.to(self.dtype)
+
         if enable_pdl:
             cute.arch.griddepcontrol_launch_dependents()
 
@@ -1081,6 +1157,9 @@ def _get_compiled_kernel(
     output_both_sf_layouts: bool = False,
     enable_pdl: bool = False,
     output_norm: bool = False,
+    output_hidden_size: int | None = None,
+    router_num_experts: int = 0,
+    router_has_bias: bool = False,
 ) -> Callable:
     """
     Get a compiled kernel closure that takes torch.Tensor directly.
@@ -1099,7 +1178,11 @@ def _get_compiled_kernel(
         scale_format=scale_format,
         output_both_sf_layouts=output_both_sf_layouts,
         output_norm=output_norm,
+        output_hidden_size=output_hidden_size,
+        router_num_experts=router_num_experts,
+        router_has_bias=router_has_bias,
     )
+    physical_size = kernel_obj.output_hidden_size
 
     # Use symbolic size for dynamic M dimension
     sym_m = cute.sym_int()
@@ -1116,7 +1199,10 @@ def _get_compiled_kernel(
         cutlass_dtype, (hidden_size,), assumed_align=128
     )
     y_fake = cute.runtime.make_fake_compact_tensor(
-        cutlass.Uint8, (sym_m, hidden_size // 2), stride_order=(1, 0), assumed_align=128
+        cutlass.Uint8,
+        (sym_m, physical_size // 2),
+        stride_order=(1, 0),
+        assumed_align=128,
     )
 
     # Scale factor tensor layout depends on swizzle mode or output_both_sf_layouts
@@ -1132,7 +1218,7 @@ def _get_compiled_kernel(
         # For non-swizzled mode, use 2D row-major layout
         s_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Uint8,
-            (sym_m, hidden_size // block_size),
+            (sym_m, physical_size // block_size),
             stride_order=(1, 0),
             assumed_align=128,
         )
@@ -1140,7 +1226,7 @@ def _get_compiled_kernel(
     # Unswizzled scale factor tensor (always 2D row-major, used when output_both_sf_layouts=True)
     s_unswizzled_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Uint8,
-        (sym_m, hidden_size // block_size),
+        (sym_m, physical_size // block_size),
         stride_order=(1, 0),
         assumed_align=128,
     )
@@ -1160,6 +1246,23 @@ def _get_compiled_kernel(
     global_scale_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Float32, (1,), assumed_align=4
     )
+    router_weight_fake = router_bias_fake = router_logits_fake = None
+    if router_num_experts:
+        router_weight_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass_dtype,
+            (router_num_experts, hidden_size),
+            stride_order=(1, 0),
+        )
+        if router_has_bias:
+            router_bias_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass_dtype,
+                (router_num_experts,),
+            )
+        router_logits_fake = cute.runtime.make_fake_compact_tensor(
+            cutlass_dtype,
+            (sym_m, router_num_experts),
+            stride_order=(1, 0),
+        )
 
     # Compile with TVM-FFI enabled
     compiled_kernel = cute.compile(
@@ -1176,6 +1279,9 @@ def _get_compiled_kernel(
         Float32(1e-6),  # Dummy eps
         enable_pdl,
         stream_fake,
+        router_weight_fake,
+        router_bias_fake,
+        router_logits_fake,
         options="--enable-tvm-ffi",
     )
 
@@ -1190,6 +1296,9 @@ def _get_compiled_kernel(
         global_scale: torch.Tensor,
         M: int,
         eps: float,
+        router_weight: torch.Tensor | None = None,
+        router_bias: torch.Tensor | None = None,
+        router_logits: torch.Tensor | None = None,
     ) -> None:
         """Runtime API that passes torch tensors directly via TVM-FFI."""
         nonlocal compiled_kernel
@@ -1212,6 +1321,9 @@ def _get_compiled_kernel(
             global_scale,
             M,
             eps,
+            router_weight,
+            router_bias,
+            router_logits,
         )
 
     return tensor_api
@@ -1233,6 +1345,7 @@ def add_rmsnorm_fp4quant(
     block_scale_unswizzled: torch.Tensor | None = None,
     enable_pdl: bool | None = None,
     y_out: torch.Tensor | None = None,
+    output_hidden_size: int | None = None,
 ) -> Union[
     Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, torch.Tensor]
 ]:
@@ -1260,13 +1373,15 @@ def add_rmsnorm_fp4quant(
     y_fp4 : torch.Tensor, optional
         Output tensor for quantized values in FP4_E2M1 format with dtype
         ``torch.float4_e2m1fn_x2``.
-        Shape must be ``(batch_size, hidden_size // 2)`` or matching 3D input.
+        Shape must be ``(batch_size, output_hidden_size // 2)`` or matching
+        3D input; the physical width defaults to ``hidden_size``.
         If ``None``, will be allocated automatically.
     block_scale : torch.Tensor, optional
         Output tensor for per-block scale factors.
 
         - If ``is_sf_swizzled_layout=False`` and ``output_both_sf_layouts=False``: row-major
-          layout with shape ``(batch_size, hidden_size // block_size)`` or matching 3D input.
+          layout with shape ``(batch_size, output_hidden_size // block_size)``
+          or matching 3D input; the physical width defaults to ``hidden_size``.
         - If ``is_sf_swizzled_layout=True`` or ``output_both_sf_layouts=True``: swizzled layout
           for efficient tensor core access, with shape
           ``(batch_size * hidden_size // block_size,)`` flattened.
@@ -1328,6 +1443,12 @@ def add_rmsnorm_fp4quant(
         When ``None`` (default), the normed values are not materialized and
         the generated kernel is identical to the baseline (the presence of
         ``y_out`` is a compile-time specialization).
+    output_hidden_size : int, optional
+        Physical width of the quantized output, defaulting to ``hidden_size``.
+        A larger width writes zero FP4 payload and zero E4M3 scales in the tail
+        in the same launch. Normalization, residual and ``y_out`` keep the
+        logical input width. Currently only single-CTA NVFP4 with row-major
+        scales supports padding. Must be >= ``hidden_size`` and divisible by 16.
 
     Returns
     -------
@@ -1358,6 +1479,46 @@ def add_rmsnorm_fp4quant(
     - For block_size=32 (MXFP4): uses UE8M0 scale factors (power-of-2 scales).
     - FP4 E2M1 format has a max representable value of 6.0.
     """
+    return _add_rmsnorm_fp4quant_impl(
+        input,
+        residual,
+        weight,
+        y_fp4,
+        block_scale,
+        global_scale,
+        eps,
+        block_size,
+        scale_format,
+        is_sf_swizzled_layout,
+        output_both_sf_layouts,
+        block_scale_unswizzled,
+        enable_pdl,
+        y_out,
+        output_hidden_size,
+    )
+
+
+def _add_rmsnorm_fp4quant_impl(
+    input,
+    residual,
+    weight,
+    y_fp4=None,
+    block_scale=None,
+    global_scale=None,
+    eps=1e-6,
+    block_size=16,
+    scale_format=None,
+    is_sf_swizzled_layout=False,
+    output_both_sf_layouts=False,
+    block_scale_unswizzled=None,
+    enable_pdl=None,
+    y_out=None,
+    output_hidden_size=None,
+    *,
+    router_weight=None,
+    router_bias=None,
+    router_logits=None,
+):
     _require_cute_dsl_arch_for(input.device)
     is_3d = input.dim() == 3
     if is_3d:
@@ -1370,10 +1531,28 @@ def add_rmsnorm_fp4quant(
 
     batch_size, hidden_size = input_2d.shape
     dtype = input.dtype
+    physical_size = hidden_size if output_hidden_size is None else output_hidden_size
+    if output_hidden_size is not None and (
+        not isinstance(output_hidden_size, int) or isinstance(output_hidden_size, bool)
+    ):
+        raise ValueError("output_hidden_size must be an integer")
+    padded_output = physical_size != hidden_size
 
     assert hidden_size % block_size == 0, "hidden_size must be divisible by block_size"
     assert hidden_size >= 64, "hidden_size must be >= 64"
     assert block_size in [16, 32], "block_size must be 16 or 32"
+    if padded_output and (
+        physical_size < hidden_size
+        or physical_size % 16 != 0
+        or block_size != 16
+        or scale_format not in (None, "e4m3")
+        or is_sf_swizzled_layout
+        or output_both_sf_layouts
+    ):
+        raise ValueError(
+            "Padded outputs require NVFP4 with row-major scales and "
+            "output_hidden_size >= hidden_size divisible by 16"
+        )
 
     is_fp16 = dtype == torch.float16
     actual_scale_format = (
@@ -1386,19 +1565,19 @@ def add_rmsnorm_fp4quant(
 
     # Determine scale dtype based on format
     scale_dtype = torch.uint8 if actual_scale_format == "ue8m0" else torch.float8_e4m3fn
-    num_sf_blocks_per_row = hidden_size // block_size
+    num_sf_blocks_per_row = physical_size // block_size
 
     # Allocate output tensors if not provided
     if y_fp4 is None:
         if is_3d:
             y_fp4 = torch.empty(
-                (B, S, hidden_size // 2),
+                (B, S, physical_size // 2),
                 dtype=torch.float4_e2m1fn_x2,
                 device=input.device,
             )
         else:
             y_fp4 = torch.empty(
-                (batch_size, hidden_size // 2),
+                (batch_size, physical_size // 2),
                 dtype=torch.float4_e2m1fn_x2,
                 device=input.device,
             )
@@ -1445,16 +1624,46 @@ def add_rmsnorm_fp4quant(
                 device=input.device,
             )
 
+    if padded_output:
+        prefix = tuple(input.shape[:-1])
+        for name, tensor, shape, expected_dtype in (
+            ("y_fp4", y_fp4, prefix + (physical_size // 2,), torch.float4_e2m1fn_x2),
+            (
+                "block_scale",
+                block_scale,
+                prefix + (num_sf_blocks_per_row,),
+                scale_dtype,
+            ),
+            (
+                "block_scale_unswizzled",
+                block_scale_unswizzled,
+                prefix + (num_sf_blocks_per_row,),
+                scale_dtype,
+            ),
+        ):
+            if (
+                tuple(tensor.shape) != shape
+                or tensor.dtype != expected_dtype
+                or tensor.device != input.device
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous {expected_dtype} with shape {shape} "
+                    "on the input device for padded outputs"
+                )
+
     # Get 2D views for kernel
     if is_3d:
-        y_fp4_2d = y_fp4.view(B * S, -1)
+        y_fp4_2d = y_fp4.view(B * S, physical_size // 2)
         block_scale_2d = (
-            block_scale.view(B * S, -1)
+            block_scale.view(B * S, num_sf_blocks_per_row)
             if not (is_sf_swizzled_layout or output_both_sf_layouts)
             else block_scale
         )
         # Always convert to 2D for kernel call
-        block_scale_unswizzled_2d = block_scale_unswizzled.view(B * S, -1)
+        block_scale_unswizzled_2d = block_scale_unswizzled.view(
+            B * S, num_sf_blocks_per_row
+        )
     else:
         y_fp4_2d = y_fp4
         block_scale_2d = block_scale
@@ -1496,7 +1705,16 @@ def add_rmsnorm_fp4quant(
         output_both_sf_layouts,
         enable_pdl,
         output_norm,
+        physical_size,
+        0 if router_weight is None else router_weight.shape[0],
+        router_bias is not None,
     )
+    if batch_size == 0:
+        return (
+            (y_fp4, block_scale, block_scale_unswizzled)
+            if output_both_sf_layouts
+            else (y_fp4, block_scale)
+        )
     tensor_api(
         input_2d.contiguous(),
         residual_2d.contiguous(),
@@ -1508,6 +1726,9 @@ def add_rmsnorm_fp4quant(
         global_scale.contiguous(),
         batch_size,
         eps,
+        router_weight,
+        router_bias,
+        router_logits,
     )
 
     if output_both_sf_layouts:

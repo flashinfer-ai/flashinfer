@@ -1,4 +1,4 @@
-# Copyright (c) 2025 by FlashInfer team.
+# Copyright (c) 2025-2026 by FlashInfer team.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -970,7 +970,7 @@ add_rmsnorm_fp4quant_trace = TraceTemplate(
         "CuTe-DSL fused (residual + input) → RMSNorm → FP4 quantize. "
         "Mutates the residual buffer in-place with the prenorm sum. "
         "Note: the optional output variants of the runtime API "
-        "(``output_both_sf_layouts`` and ``y_out``) are not modeled by this "
+        "(``output_both_sf_layouts``, ``y_out`` and ``output_hidden_size``) are not modeled by this "
         "trace template — it captures the core FP4-quantize signature only; "
         "dump/replay of those extra mutated buffers is unsupported."
     ),
@@ -1006,11 +1006,16 @@ def add_rmsnorm_fp4quant_trace_dispatch(save_dir=None, name=None, **kwargs):
     The static template models only the core FP4-quantize signature. The
     optional output variants — ``y_out`` (an extra normed bf16/fp16 store)
     and ``output_both_sf_layouts`` (a second scale-factor buffer) — add
-    mutated outputs the template does not represent. Refuse to emit a trace
+    mutated outputs the template does not represent. ``output_hidden_size``
+    additionally changes the physical output shape. Refuse to emit a trace
     for those calls (return ``None``) instead of silently dumping an
     incomplete definition that dump/replay tooling would mis-handle.
     """
-    if kwargs.get("y_out") is not None or kwargs.get("output_both_sf_layouts"):
+    if (
+        kwargs.get("y_out") is not None
+        or kwargs.get("output_both_sf_layouts")
+        or kwargs.get("output_hidden_size") is not None
+    ):
         return None
     return add_rmsnorm_fp4quant_trace
 
