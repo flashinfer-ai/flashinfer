@@ -110,19 +110,7 @@ def _mask_padding_rows_nonlocal(
             f"({num_local_experts} * {cap} = {num_local_experts * cap}), got {m}"
         )
 
-    # Row r of the pack is position r % cap of expert r // cap, so the mask is just
-    # a broadcast compare against recv_count once the rows are viewed as
-    # [num_local_experts, cap]. Doing it that way instead of with arange(m) plus
-    # remainder / floor_divide / gather matters: this runs on a step whose GPU is
-    # not saturated at small per-expert GEMMs, so each extra kernel launch lands on
-    # the critical path. Profiling the arithmetic version showed the masking added
-    # ~13 launches for ~25us of actual work, which is what made the change a
-    # wall-clock loss on small-MoE shapes even though it cut total GPU work.
-    # Scalar `other` in torch.where avoids materialising full_like / zeros_like.
-    # No-op (returns self, no kernel) when recv_count is already on this device,
-    # which it is on the dispatch path; kept so a host-side caller cannot fault.
-    # Deliberately no dtype cast: comparing in recv_count's own dtype avoids an
-    # int32 -> int64 copy that the previous version paid on every call.
+    # Mask padding rows by marking them as remote; efficient as broadcast compare.
     recv_count = recv_count.to(device)
     col = torch.arange(cap, device=device, dtype=recv_count.dtype)
     is_real = (col.unsqueeze(0) < recv_count.unsqueeze(1)).reshape(m, 1)

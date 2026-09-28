@@ -98,32 +98,11 @@ class FusedMoeSplitKernelBackend(SplitKernelBackend):
         return self._compute
 
     def _recv_count_for_exclusion(self, ctx: SplitKernelContext):
-        """Per-expert REAL token counts, when they can be used to drop EP padding.
+        """Per-expert REAL token counts, to be used to drop EP padding.
 
-        Returning None is always safe: the bridge then marks every padded row as a
-        real token, which is what this path did before - correct, just wasteful.
+        Guarded by env var FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1 (off by default)
 
-        EXPERT_MAJOR only. RANK_MAJOR's counts are per-source-rank rather than
-        per-expert, and its rows are not laid out with a fixed per-expert stride, so
-        the same tensor means something different there.
-
-        **Opt-in**: set FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1 to enable.
-
-        Off by default because the win is strongly shape-dependent. Measured over 264
-        A/B pairs on GB200 (4-32 ranks, NVFP4), end-to-end speedup ranges from 5.24x
-        down to 0.84x, and the losing region grows with EP width: 31% of measured
-        configurations regress at 4 ranks, 78% at 32. The cause is not an
-        implementation artifact - profiling shows this path always reduces GPU work,
-        but on small-MoE shapes the expert GEMM is only ~2.6% of the step (the rest
-        being nccl_ep dispatch/combine), so there is not enough of it to pay for the
-        transform.
-
-        Rule of thumb for when to enable, from that data: turn it on when the
-        baseline's per-GPU padded work clears roughly
-
-            num_local_experts * cap * hidden_size * intermediate_size > 3e11
-
-        which had zero regressions across the 240 configurations it selects.
+        Returns None if all the rows should be considered real tokens
         """
         if ctx.recv_count is None:
             return None
