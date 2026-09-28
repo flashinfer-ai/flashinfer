@@ -306,6 +306,11 @@ def swapab_dispatch(
         _prepared_launches["swap_dispatch"] = (func, args)
 
 
+# Largest active-list length staged in the mixed dispatch kernel's shared
+# memory (two int32 arrays: 160 KB); longer lists read global memory.
+SWAPAB_DISPATCH_SMEM_GROUPS = 20480
+
+
 def swapab_dispatch_mixed(
     *,
     tile_idx_to_expert_idx: torch.Tensor,
@@ -318,6 +323,13 @@ def swapab_dispatch_mixed(
     wide_count: torch.Tensor,
     narrow_list: torch.Tensor,
     narrow_count: torch.Tensor,
+    alt_tile_idx_to_expert_idx: Optional[torch.Tensor] = None,
+    alt_tile_idx_to_mn_limit: Optional[torch.Tensor] = None,
+    alt_num_non_exiting_tiles: Optional[torch.Tensor] = None,
+    base_active_num_non_exiting_tiles: Optional[torch.Tensor] = None,
+    alt_group_rows: int = 0,
+    alt_wide_list: Optional[torch.Tensor] = None,
+    alt_wide_count: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -330,7 +342,16 @@ def swapab_dispatch_mixed(
     groups, and with 128-row groups and 192-row windows it is
     ``ceil(c / 64) * 64`` with at most one window per expert). Both lists are in
     permutation order and hold at most one entry per sort group. Single
-    CTA, graph-capturable."""
+    CTA, graph-capturable.
+
+    With the dual-tile routing outputs (``alt_*`` lists of
+    ``alt_group_rows``-row groups, the alternate count and the base active
+    count, see ``moe_sort``) the kernel follows the routing's run-time tile
+    choice: when the routing chose the coarser padding the dense tiles are
+    ``alt_group_rows``-row groups listed in ``alt_wide_list`` (at most three
+    windows per expert with 256-row groups) and ``wide_count`` is 0;
+    otherwise ``alt_wide_count`` is 0. The windows are ``row_unit`` offsets
+    of the one permutation either way."""
     if group_rows % row_unit or narrow_tile % row_unit:
         raise ValueError("group_rows and narrow_tile must be multiples of row_unit")
     groups = tile_idx_to_mn_limit.shape[0]
@@ -338,6 +359,41 @@ def swapab_dispatch_mixed(
         raise ValueError("tile_idx_to_expert_idx and tile_idx_to_mn_limit must match")
     if wide_list.shape[0] < groups or narrow_list.shape[0] < groups:
         raise ValueError(f"wide_list and narrow_list need {groups} entries")
+    dual = (
+        alt_tile_idx_to_expert_idx,
+        alt_tile_idx_to_mn_limit,
+        alt_num_non_exiting_tiles,
+        base_active_num_non_exiting_tiles,
+        alt_wide_list,
+        alt_wide_count,
+    )
+    has_dual = any(t is not None for t in dual)
+    if has_dual:
+        if any(t is None for t in dual) or alt_group_rows <= 0:
+            raise ValueError(
+                "the dual-tile lists, counts, alternate wide list and alt_group_rows "
+                "must be given together"
+            )
+        if alt_group_rows <= group_rows or alt_group_rows % row_unit:
+            raise ValueError(
+                "alt_group_rows must be a multiple of row_unit above group_rows"
+            )
+        alt_groups = alt_tile_idx_to_mn_limit.shape[0]
+        if (
+            alt_tile_idx_to_expert_idx.shape[0] != alt_groups
+            or alt_wide_list.shape[0] < alt_groups
+        ):
+            raise ValueError(
+                "alt_tile_idx_to_expert_idx, alt_tile_idx_to_mn_limit and "
+                "alt_wide_list must cover the alternate groups"
+            )
+        # Every window starts in an expert's own alternate group and covers at
+        # most alt_group_rows / row_unit - 1 windows per expert (see the
+        # kernel), so the base-granular narrow list holds them.
+        if narrow_list.shape[0] < alt_groups * (alt_group_rows // group_rows):
+            raise ValueError("narrow_list must hold the alternate groups' windows")
+    else:
+        alt_groups = 0
     for t in (
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
@@ -346,19 +402,30 @@ def swapab_dispatch_mixed(
         wide_count,
         narrow_list,
         narrow_count,
+        *(dual if has_dual else ()),
     ):
         if t.dtype != torch.int32 or not t.is_contiguous():
             raise ValueError("dispatch buffers must be contiguous int32")
+    smem_groups = min(max(groups, alt_groups), SWAPAB_DISPATCH_SMEM_GROUPS)
     func = _get_swapab_dispatch_module()["flashinfer_moe_swapab_dispatch_mixed"]
+    ptr = lambda t: t.data_ptr() if t is not None else 0  # noqa: E731
     args = (
         tile_idx_to_expert_idx.data_ptr(),
         tile_idx_to_mn_limit.data_ptr(),
         num_non_exiting_tiles.data_ptr(),
+        ptr(alt_tile_idx_to_expert_idx),
+        ptr(alt_tile_idx_to_mn_limit),
+        ptr(alt_num_non_exiting_tiles),
+        ptr(base_active_num_non_exiting_tiles),
         int(group_rows),
+        int(alt_group_rows) if has_dual else 0,
         int(narrow_tile),
         int(row_unit),
+        int(smem_groups),
         wide_list.data_ptr(),
         wide_count.data_ptr(),
+        ptr(alt_wide_list),
+        ptr(alt_wide_count),
         narrow_list.data_ptr(),
         narrow_count.data_ptr(),
         bool(enable_pdl),

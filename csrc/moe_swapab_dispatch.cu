@@ -157,15 +157,32 @@ __global__ void __launch_bounds__(kThreads)
 // ``narrow_tile`` and never leave the expert's groups: the minimal cover is
 // at most ``group_rows * ceil(c / group_rows)`` (a windows-only rule would
 // not be: 192 rows over a 37-row expert's single 128-row group).
+//
+// Dual-tile routing (``alt_expert_idx != nullptr``): the routing padded every
+// expert to ``group_rows`` or ``alt_group_rows`` rows at run time and wrote
+// the coarser list only when it chose it (``base_active == 0`` and
+// ``alt_num_groups > 0``).  The kernel then covers each expert with
+// ``alt_group_rows``-row dense tiles (listed as alternate-group indices in
+// ``alt_wide_list``) and windows; the list of the tile the routing did not
+// choose gets count 0.  The windows are ``row_unit`` offsets of the shared
+// permutation either way (the base list is always valid over the chosen
+// padding, so the swap kernel's ``group_rows``-granular lookups hold).
+//
+// The expert / limit arrays of the active list are staged in dynamic shared
+// memory (``smem_capacity`` groups each) so the per-group run search reads
+// on-chip; a routing with more groups than the capacity reads global memory.
+constexpr int kMixedItems = 4;
+
 template <bool kPdl>
-__global__ void __launch_bounds__(kThreads)
-    swapab_dispatch_mixed_kernel(const int32_t* __restrict__ expert_idx,
-                                 const int32_t* __restrict__ mn_limit,
-                                 const int32_t* __restrict__ num_groups_ptr, int32_t group_rows,
-                                 int32_t narrow_tile, int32_t row_unit,
-                                 int32_t* __restrict__ wide_list, int32_t* __restrict__ wide_count,
-                                 int32_t* __restrict__ narrow_list,
-                                 int32_t* __restrict__ narrow_count) {
+__global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
+    const int32_t* __restrict__ expert_idx, const int32_t* __restrict__ mn_limit,
+    const int32_t* __restrict__ num_groups_ptr, const int32_t* __restrict__ alt_expert_idx,
+    const int32_t* __restrict__ alt_mn_limit, const int32_t* __restrict__ alt_num_groups_ptr,
+    const int32_t* __restrict__ base_active_ptr, int32_t group_rows, int32_t alt_group_rows,
+    int32_t narrow_tile, int32_t row_unit, int32_t smem_capacity,
+    int32_t* __restrict__ wide_list, int32_t* __restrict__ wide_count,
+    int32_t* __restrict__ alt_wide_list, int32_t* __restrict__ alt_wide_count,
+    int32_t* __restrict__ narrow_list, int32_t* __restrict__ narrow_count) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   if constexpr (kPdl) {
     cudaGridDependencySynchronize();
@@ -173,67 +190,98 @@ __global__ void __launch_bounds__(kThreads)
 #endif
   using Scan = cub::BlockScan<Counts, kThreads>;
   __shared__ typename Scan::TempStorage temp;
-  const int num_groups = *num_groups_ptr;
+  extern __shared__ int32_t staged[];
+  bool alt = false;
+  if (alt_expert_idx != nullptr) {
+    alt = (*base_active_ptr == 0) && (*alt_num_groups_ptr > 0);
+  }
+  const int32_t* e = alt ? alt_expert_idx : expert_idx;
+  const int32_t* l = alt ? alt_mn_limit : mn_limit;
+  const int rows = alt ? alt_group_rows : group_rows;
+  const int num_groups = alt ? *alt_num_groups_ptr : *num_groups_ptr;
+  int32_t* const wl = alt ? alt_wide_list : wide_list;
+  if (num_groups <= smem_capacity) {
+    for (int i = static_cast<int>(threadIdx.x); i < num_groups; i += kThreads) {
+      staged[i] = e[i];
+      staged[smem_capacity + i] = l[i];
+    }
+    __syncthreads();
+    e = staged;
+    l = staged + smem_capacity;
+  }
+  const int gu = rows / row_unit;
   Counts carry{0, 0, 0};
-  for (int base_g = 0; base_g < num_groups; base_g += kThreads) {
-    const int g = base_g + static_cast<int>(threadIdx.x);
-    int nwide = 0, nnarrow = 0;
-    if (g < num_groups) {
-      // The first group of an expert owns the expert's whole row range,
-      // bounded by the last group of the run of equal expert indices.  The
-      // sort writes the groups in expert order, so the run end is found by a
-      // binary search over the non-decreasing expert indices.
-      const int e = expert_idx[g];
-      const bool first = (g == 0) || (expert_idx[g - 1] != e);
-      int c = 0;
-      if (first) {
-        int lo = g + 1, hi = num_groups;  // first index with a different expert in [lo, hi]
-        while (lo < hi) {
-          const int mid = lo + ((hi - lo) >> 1);
-          if (expert_idx[mid] == e) {
-            lo = mid + 1;
-          } else {
-            hi = mid;
+  for (int base_g = 0; base_g < num_groups; base_g += kThreads * kMixedItems) {
+    Counts mine[kMixedItems];
+#pragma unroll
+    for (int j = 0; j < kMixedItems; ++j) {
+      const int g = base_g + static_cast<int>(threadIdx.x) * kMixedItems + j;
+      int nwide = 0, nnarrow = 0;
+      if (g < num_groups) {
+        // The first group of an expert owns the expert's whole row range,
+        // bounded by the last group of the run of equal expert indices.  The
+        // sort writes the groups in expert order, so the run end is found by
+        // a binary search over the non-decreasing expert indices.
+        const int ex = e[g];
+        const bool first = (g == 0) || (e[g - 1] != ex);
+        int c = 0;
+        if (first) {
+          int lo = g + 1, hi = num_groups;  // first index with a different expert in [lo, hi]
+          while (lo < hi) {
+            const int mid = lo + ((hi - lo) >> 1);
+            if (e[mid] == ex) {
+              lo = mid + 1;
+            } else {
+              hi = mid;
+            }
+          }
+          c = max(l[lo - 1] - g * rows, 0);
+        }
+        if (c > 0) {
+          // Minimal cover by wide (rows) tiles and narrow windows, ties to
+          // fewer windows.  cover(a + gu) == cover(a) for gu = rows /
+          // row_unit, so a in [0, gu) suffices: with 128-row groups and
+          // 192-row windows the cover is ceil(c / 64) * 64 (at least one wide
+          // tile) and at most one window per expert; with 256-row groups it
+          // is at most three windows per expert.
+          int best_cover = 0x7fffffff;
+          for (int a = 0; a < gu; ++a) {
+            const int rem = c - a * narrow_tile;
+            const int w = rem > 0 ? (rem + rows - 1) / rows : 0;
+            const int cover = w * rows + a * narrow_tile;
+            if (cover < best_cover) {
+              best_cover = cover;
+              nwide = w;
+              nnarrow = a;
+            }
+            if (rem <= 0) break;
           }
         }
-        c = max(mn_limit[lo - 1] - g * group_rows, 0);
       }
-      if (c > 0) {
-        // Minimal cover by wide (group_rows) tiles and narrow windows, ties to
-        // fewer windows.  cover(a + gu) == cover(a) for gu = group_rows /
-        // row_unit, so a in [0, gu) suffices: with 128-row groups and 192-row
-        // windows the cover is ceil(c / 64) * 64 (at least one wide tile) and
-        // at most one window per expert.
-        const int gu = group_rows / row_unit;
-        int best_cover = 0x7fffffff;
-        for (int a = 0; a < gu; ++a) {
-          const int rem = c - a * narrow_tile;
-          const int w = rem > 0 ? (rem + group_rows - 1) / group_rows : 0;
-          const int cover = w * group_rows + a * narrow_tile;
-          if (cover < best_cover) {
-            best_cover = cover;
-            nwide = w;
-            nnarrow = a;
-          }
-          if (rem <= 0) break;
-        }
-      }
+      mine[j] = Counts{nwide, nnarrow, 0};
     }
-    Counts mine{nwide, nnarrow, 0};
-    Counts excl{0, 0, 0}, total{0, 0, 0};
+    Counts excl[kMixedItems];
+    Counts total{0, 0, 0};
     Scan(temp).ExclusiveScan(mine, excl, Counts{0, 0, 0}, CountsAdd(), total);
-    for (int j = 0; j < nwide; ++j) {
-      wide_list[carry.wide + excl.wide + j] = g + j;
-    }
-    const int narrow_row0 = g * group_rows + nwide * group_rows;
-    for (int i = 0; i < nnarrow; ++i) {
-      narrow_list[carry.narrow + excl.narrow + i] = (narrow_row0 + i * narrow_tile) / row_unit;
+#pragma unroll
+    for (int j = 0; j < kMixedItems; ++j) {
+      const int g = base_g + static_cast<int>(threadIdx.x) * kMixedItems + j;
+      for (int t = 0; t < mine[j].wide; ++t) {
+        wl[carry.wide + excl[j].wide + t] = g + t;
+      }
+      const int narrow_row0 = (g + mine[j].wide) * rows;
+      for (int i = 0; i < mine[j].narrow; ++i) {
+        narrow_list[carry.narrow + excl[j].narrow + i] = (narrow_row0 + i * narrow_tile) / row_unit;
+      }
     }
     carry = CountsAdd()(carry, total);
     __syncthreads();
   }
   if (threadIdx.x == 0) {
-    *wide_count = carry.wide;
+    *wide_count = alt ? 0 : carry.wide;
+    if (alt_wide_count != nullptr) {
+      *alt_wide_count = alt ? carry.wide : 0;
+    }
     *narrow_count = carry.narrow;
   }
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -280,34 +328,65 @@ void moe_swapab_dispatch(int64_t mn_limit_ptr, int64_t num_groups_ptr, int64_t g
 }
 
 void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int64_t num_groups_ptr,
-                               int64_t group_rows, int64_t narrow_tile, int64_t row_unit,
-                               int64_t wide_list_ptr, int64_t wide_count_ptr,
-                               int64_t narrow_list_ptr, int64_t narrow_count_ptr, bool use_pdl,
-                               int64_t cuda_stream_ptr) {
+                               int64_t alt_expert_idx_ptr, int64_t alt_mn_limit_ptr,
+                               int64_t alt_num_groups_ptr, int64_t base_active_ptr,
+                               int64_t group_rows, int64_t alt_group_rows, int64_t narrow_tile,
+                               int64_t row_unit, int64_t smem_groups, int64_t wide_list_ptr,
+                               int64_t wide_count_ptr, int64_t alt_wide_list_ptr,
+                               int64_t alt_wide_count_ptr, int64_t narrow_list_ptr,
+                               int64_t narrow_count_ptr, bool use_pdl, int64_t cuda_stream_ptr) {
   TVM_FFI_ICHECK(row_unit > 0 && group_rows > 0 && narrow_tile > 0 &&
                  group_rows % row_unit == 0 && narrow_tile % row_unit == 0)
       << "group_rows and narrow_tile must be positive multiples of row_unit";
+  const bool dual = alt_expert_idx_ptr != 0;
+  TVM_FFI_ICHECK((alt_mn_limit_ptr != 0) == dual && (alt_num_groups_ptr != 0) == dual &&
+                 (base_active_ptr != 0) == dual && (alt_wide_list_ptr != 0) == dual &&
+                 (alt_wide_count_ptr != 0) == dual)
+      << "the dual-tile arrays, counts and alternate wide list must be given together";
+  TVM_FFI_ICHECK(!dual || (alt_group_rows > group_rows && alt_group_rows % row_unit == 0))
+      << "alt_group_rows must be a multiple of row_unit above group_rows";
+  TVM_FFI_ICHECK(smem_groups >= 0 && smem_groups <= (1 << 20)) << "smem_groups out of range";
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
+  const size_t smem_bytes = 2 * sizeof(int32_t) * static_cast<size_t>(smem_groups);
+  auto* kernel =
+      use_pdl ? swapab_dispatch_mixed_kernel<true> : swapab_dispatch_mixed_kernel<false>;
+  // The dynamic staging area may exceed the 48 KB default; the opt-in is
+  // recorded per kernel variant so replays (graph capture) skip the call.
+  static size_t configured_bytes[2] = {0, 0};
+  size_t& configured = configured_bytes[use_pdl ? 1 : 0];
+  if (smem_bytes > configured && smem_bytes > 48 * 1024) {
+    cudaError_t aerr = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    TVM_FFI_ICHECK(aerr == cudaSuccess)
+        << "moe_swapab_dispatch_mixed: cannot reserve " << smem_bytes
+        << " B of dynamic shared memory: " << cudaGetErrorString(aerr);
+    configured = smem_bytes;
+  }
   cudaLaunchConfig_t config{};
   config.gridDim = dim3(1);
   config.blockDim = dim3(kThreads);
-  config.dynamicSmemBytes = 0;
+  config.dynamicSmemBytes = smem_bytes;
   config.stream = stream;
   cudaLaunchAttribute attrs[1];
   attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
   attrs[0].val.programmaticStreamSerializationAllowed = use_pdl ? 1 : 0;
   config.attrs = attrs;
   config.numAttrs = 1;
-  auto* kernel =
-      use_pdl ? swapab_dispatch_mixed_kernel<true> : swapab_dispatch_mixed_kernel<false>;
   cudaError_t err = cudaLaunchKernelEx(
       &config, kernel, reinterpret_cast<const int32_t*>(expert_idx_ptr),
       reinterpret_cast<const int32_t*>(mn_limit_ptr),
-      reinterpret_cast<const int32_t*>(num_groups_ptr), static_cast<int32_t>(group_rows),
-      static_cast<int32_t>(narrow_tile), static_cast<int32_t>(row_unit),
-      reinterpret_cast<int32_t*>(wide_list_ptr),
-      reinterpret_cast<int32_t*>(wide_count_ptr), reinterpret_cast<int32_t*>(narrow_list_ptr),
+      reinterpret_cast<const int32_t*>(num_groups_ptr),
+      reinterpret_cast<const int32_t*>(alt_expert_idx_ptr),
+      reinterpret_cast<const int32_t*>(alt_mn_limit_ptr),
+      reinterpret_cast<const int32_t*>(alt_num_groups_ptr),
+      reinterpret_cast<const int32_t*>(base_active_ptr), static_cast<int32_t>(group_rows),
+      static_cast<int32_t>(alt_group_rows), static_cast<int32_t>(narrow_tile),
+      static_cast<int32_t>(row_unit), static_cast<int32_t>(smem_groups),
+      reinterpret_cast<int32_t*>(wide_list_ptr), reinterpret_cast<int32_t*>(wide_count_ptr),
+      reinterpret_cast<int32_t*>(alt_wide_list_ptr),
+      reinterpret_cast<int32_t*>(alt_wide_count_ptr),
+      reinterpret_cast<int32_t*>(narrow_list_ptr),
       reinterpret_cast<int32_t*>(narrow_count_ptr));
   TVM_FFI_ICHECK(err == cudaSuccess)
       << "moe_swapab_dispatch_mixed launch failed: " << cudaGetErrorString(err);

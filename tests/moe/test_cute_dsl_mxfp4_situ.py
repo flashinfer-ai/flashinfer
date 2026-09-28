@@ -1742,6 +1742,12 @@ def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit):
         if group_rows == 128 and narrow_tile == 192 and row_unit == 64:
             assert w * group_rows + a * narrow_tile == max(-(-rows // 64) * 64, 128)
             assert a <= 1
+        if group_rows == 256 and narrow_tile == 192 and row_unit == 64:
+            # Covers are multiples of 64 from 384 up (192, 256 below it): at
+            # most three windows, waste under 64 rows beyond 320 rows.
+            assert a <= 3
+            if rows > 320:
+                assert w * group_rows + a * narrow_tile == -(-rows // 64) * 64
         wide += [g + j for j in range(w)]
         first = base + w * group_rows
         narrow += [(first + i * narrow_tile) // row_unit for i in range(a)]
@@ -1834,6 +1840,135 @@ def test_swapab_dispatch_mixed_matches_reference(
         assert len(wide_ref) + len(narrow_ref) <= n
     for base, end, cover_end in covered:
         assert base % group_rows == 0 and end <= cover_end
+
+
+@pytest.mark.parametrize(
+    "tokens, local_experts, offset, distribution",
+    [
+        (1024, 112, 336, "hot"),
+        (1024, 112, 336, "empty"),
+        (2048, 896, 0, "balanced"),
+    ],
+)
+@pytest.mark.parametrize("threshold_permille", [1, 10**6])
+def test_swapab_dispatch_mixed_follows_dual_tile_routing(
+    tokens, local_experts, offset, distribution, threshold_permille
+):
+    """With the dual-tile routing (128 / 256-row padding chosen at run time;
+    forced here through the threshold) the mixed dispatch covers each expert
+    with dense tiles of the chosen padding: 256-row alternate groups (alt
+    wide list, at most three windows per expert, base wide count 0) or the
+    128-row base groups (alt wide count 0); each equals the host reference
+    over the active list, and the base list stays valid over the coarser
+    padding for the swap kernel's 128-granular lookups."""
+    _require_blackwell()
+    from flashinfer.fused_moe.cute_dsl.moe_utils import (
+        allocate_moe_sort_buffers,
+        get_max_num_tiles,
+        moe_sort,
+    )
+    from flashinfer.fused_moe.cute_dsl.swapab_moe import swapab_dispatch_mixed
+
+    group_rows, alt_group_rows, narrow_tile, row_unit, top_k = 128, 256, 192, 64, 16
+    ids, weights = make_routing(tokens, 896, top_k, local_experts, offset, distribution)
+    alt_tiles = get_max_num_tiles(tokens, top_k, local_experts, alt_group_rows)
+    tiles = alt_tiles * alt_group_rows // group_rows
+    # Rows padded to the coarser tile bound the permutation; the base lists
+    # are sized by those rows.
+    buffers = allocate_moe_sort_buffers(tokens, 896, top_k, local_experts, alt_group_rows)
+    for name in ("out_tile_idx_to_expert_idx", "out_tile_idx_to_mn_limit"):
+        buffers[name] = torch.full((tiles,), -3, dtype=torch.int32, device="cuda")
+    for name in ("out_alt_tile_idx_to_expert_idx", "out_alt_tile_idx_to_mn_limit"):
+        buffers[name] = torch.full((alt_tiles,), -3, dtype=torch.int32, device="cuda")
+    for name in (
+        "out_alt_num_non_exiting_tiles",
+        "out_base_active_num_non_exiting_tiles",
+    ):
+        buffers[name] = torch.zeros((1,), dtype=torch.int32, device="cuda")
+    moe_sort(
+        token_selected_experts=ids,
+        token_final_scales=weights.float(),
+        num_experts=896,
+        top_k=top_k,
+        local_expert_offset=offset,
+        num_local_experts=local_experts,
+        tile_tokens_dim=group_rows,
+        tile_tokens_dim_alt=alt_group_rows,
+        dual_tile_threshold_permille=threshold_permille,
+        **buffers,
+    )
+    torch.cuda.synchronize()
+    n_base = int(buffers["out_num_non_exiting_tiles"].item())
+    n_alt = int(buffers["out_alt_num_non_exiting_tiles"].item())
+    base_active = int(buffers["out_base_active_num_non_exiting_tiles"].item())
+    use_alt = threshold_permille > 1000
+    assert (n_alt > 0) == use_alt and (base_active > 0) == (not use_alt)
+    assert n_base == int(buffers["out_total_num_padded_tokens"].item()) // group_rows
+    lists = dict(
+        wide_list=torch.full((tiles,), -7, dtype=torch.int32, device="cuda"),
+        wide_count=torch.full((1,), -7, dtype=torch.int32, device="cuda"),
+        narrow_list=torch.full((tiles,), -7, dtype=torch.int32, device="cuda"),
+        narrow_count=torch.full((1,), -7, dtype=torch.int32, device="cuda"),
+        alt_wide_list=torch.full((alt_tiles,), -7, dtype=torch.int32, device="cuda"),
+        alt_wide_count=torch.full((1,), -7, dtype=torch.int32, device="cuda"),
+    )
+    swapab_dispatch_mixed(
+        tile_idx_to_expert_idx=buffers["out_tile_idx_to_expert_idx"],
+        tile_idx_to_mn_limit=buffers["out_tile_idx_to_mn_limit"],
+        num_non_exiting_tiles=buffers["out_num_non_exiting_tiles"],
+        group_rows=group_rows,
+        narrow_tile=narrow_tile,
+        row_unit=row_unit,
+        alt_tile_idx_to_expert_idx=buffers["out_alt_tile_idx_to_expert_idx"],
+        alt_tile_idx_to_mn_limit=buffers["out_alt_tile_idx_to_mn_limit"],
+        alt_num_non_exiting_tiles=buffers["out_alt_num_non_exiting_tiles"],
+        base_active_num_non_exiting_tiles=buffers[
+            "out_base_active_num_non_exiting_tiles"
+        ],
+        alt_group_rows=alt_group_rows,
+        **lists,
+    )
+    torch.cuda.synchronize()
+    expert = buffers["out_tile_idx_to_expert_idx"][:n_base].tolist()
+    limit = buffers["out_tile_idx_to_mn_limit"][:n_base].tolist()
+    if use_alt:
+        alt_expert = buffers["out_alt_tile_idx_to_expert_idx"][:n_alt].tolist()
+        alt_limit = buffers["out_alt_tile_idx_to_mn_limit"][:n_alt].tolist()
+        assert n_base == 2 * n_alt
+        # The base list over the coarser padding: both halves of every
+        # alternate group name its expert; the group bounds are clipped to
+        # the expert's end, so the second half of a short expert is empty.
+        for g in range(n_alt):
+            assert expert[2 * g] == expert[2 * g + 1] == alt_expert[g]
+            assert limit[2 * g + 1] == alt_limit[g]
+            assert limit[2 * g] == min(alt_limit[g], (2 * g + 1) * group_rows)
+        wide_ref, narrow_ref, covered = _mixed192_reference(
+            alt_expert, alt_limit, alt_group_rows, narrow_tile, row_unit
+        )
+        active_list, active_count = "alt_wide_list", "alt_wide_count"
+        idle_list, idle_count = "wide_list", "wide_count"
+    else:
+        wide_ref, narrow_ref, covered = _mixed192_reference(
+            expert, limit, group_rows, narrow_tile, row_unit
+        )
+        active_list, active_count = "wide_list", "wide_count"
+        idle_list, idle_count = "alt_wide_list", "alt_wide_count"
+    assert int(lists[idle_count].item()) == 0
+    assert (lists[idle_list] == -7).all()
+    assert int(lists[active_count].item()) == len(wide_ref)
+    assert int(lists["narrow_count"].item()) == len(narrow_ref)
+    assert lists[active_list][: len(wide_ref)].tolist() == wide_ref
+    assert lists["narrow_list"][: len(narrow_ref)].tolist() == narrow_ref
+    assert (lists[active_list][len(wide_ref) :] == -7).all()
+    assert (lists["narrow_list"][len(narrow_ref) :] == -7).all()
+    # Every window lies inside its expert's rows of the base list (the swap
+    # kernel reads the expert at the window's first 128-row group and the
+    # bound at its last).
+    for start in lists["narrow_list"][: len(narrow_ref)].tolist():
+        first = start * row_unit // group_rows
+        last = (start * row_unit + narrow_tile - 1) // group_rows
+        assert last < n_base and expert[first] == expert[last]
+        assert start * row_unit < limit[last]
 
 
 def _policy_wrapper(*, ep_size=1, ep_rank=0, moe_tp_size=1, moe_tp_rank=0):
@@ -1940,6 +2075,21 @@ def test_swap_wide192_policy(monkeypatch):
     names = [f.name for f in tp8._workspace_fields(8192)[0]]
     assert "swap_wide_list" in names and "swap_row_groups" in names
     assert "swap_wide_list" not in [f.name for f in ep8._workspace_fields(8192)[0]]
+    # The dense path's dual-tile rule carries over: the mixed form's dense
+    # tiles follow the routing's 128 / 256-row padding on the shard above
+    # DENSE_DUAL_TILE_MIN_TOKENS (alternate list + its dense tiles).
+    monkeypatch.setattr(mxfp4, "DENSE_DUAL_TILE", True)
+    monkeypatch.setattr(mxfp4, "DENSE_DUAL_TILE_MIN_TOKENS", 7168)
+    monkeypatch.setattr(mxfp4, "DENSE_DUAL_TILE_MAX_SHARD", 3072)
+    assert tp8._swap_mixed192_dual(8192) == mxfp4.B300_SITU_DENSE_DUAL_TACTIC
+    assert tp8._swap_mixed192_dual(8192)[0] == 256
+    names = [f.name for f in tp8._workspace_fields(8192)[0]]
+    assert "swap_alt_wide_list" in names and "out_alt_tile_idx_to_mn_limit" in names
+    assert "out_base_active_num_non_exiting_tiles" in names
+    monkeypatch.setattr(mxfp4, "DENSE_DUAL_TILE", False)
+    assert tp8._swap_mixed192_dual(8192) is None
+    assert "swap_alt_wide_list" not in [f.name for f in tp8._workspace_fields(8192)[0]]
+    monkeypatch.setattr(mxfp4, "DENSE_DUAL_TILE", True)
     monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MODE", "1")
     assert ep8._swap_mixed192(8192) and not ep8._swap_mixed192(4096)
     monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MODE", "0")
