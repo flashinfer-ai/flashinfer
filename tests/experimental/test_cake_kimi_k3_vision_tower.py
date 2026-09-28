@@ -163,8 +163,8 @@ def test_select_tile_config_buckets():
         "pos": ("xs_pf", "xs_pf", "s_e8_pf", "s_e8_pf"),
         "pos_sqxw": ("xs_pf", "xs_pf", "s_e8_pf", "s_e8_pf"),
         "norm_qkv_rope": ("xs_cs_pf", "s_cs", "l_e8_cs", "l_e8_cs"),
-        "residual_wo": ("xs_pf", "xs_pf", "m_p", "m_p"),
-        "residual_wo_sqxw": ("xs_pf", "xs_pf", "m_p", "m_p"),
+        "residual_wo": ("xs_pf", "xs_pf", "s_e8_pf", "m_tma1"),
+        "residual_wo_sqxw": ("xs_pf", "xs_pf", "s_e8_pf", "m_tma1"),
         "residual_fc1": ("xs_k4_pf", "xs_pf", "l_e8_pf", "m_p"),
         "residual_fc1_sqxw": ("xs_k4_pf", "xs_pf", "l_e8_pf", "m_p"),
         "norm_gelu": ("xs", "s", "l_e8", "l_e8"),
@@ -174,6 +174,40 @@ def test_select_tile_config_buckets():
     for variant, names in expect.items():
         got = tuple(select_tile_config(variant, m).name for m in (4, 1024, 4144, 10764))
         assert got == names, (variant, got)
+    # Round-3 per-form boundaries (Cake ``kimi_k3_vision_gemm`` r3 tile-boundary policy):
+    # (first M of each interval, tile) over M = 1 .. 20000.
+    boundaries = {
+        "pos": [(1, "xs_pf"), (1025, "s_e8_pf")],
+        "pos_sqxw": [(1, "xs_pf"), (1025, "s_e8_pf")],
+        "norm_qkv_rope": [(1, "xs_cs_pf"), (769, "s_cs"), (1537, "l_e8_cs")],
+        "residual_wo": [(1, "xs_pf"), (1025, "s_e8_pf"), (6145, "m_tma1")],
+        "residual_wo_sqxw": [(1, "xs_pf"), (1025, "s_e8_pf"), (6145, "m_tma1")],
+        "residual_fc1": [
+            (1, "xs_k4_pf"),
+            (257, "xs_pf"),
+            (1025, "s_e8_pf"),
+            (2305, "l_e8_pf"),
+            (8193, "m_p"),
+        ],
+        "residual_fc1_sqxw": [
+            (1, "xs_k4_pf"),
+            (257, "xs_pf"),
+            (1025, "s_e8_pf"),
+            (2305, "l_e8_pf"),
+            (8193, "m_p"),
+        ],
+        "norm_gelu": [(1, "xs"), (257, "s"), (513, "xs"), (769, "s"), (1657, "l_e8")],
+        "gelu_erf": [(1, "xs"), (257, "s"), (513, "xs"), (769, "s"), (1657, "l")],
+        "rmsnorm": [(1, "s"), (1025, "l")],
+    }
+    for variant, segments in boundaries.items():
+        got, prev = [], None
+        for m in range(1, 20001):
+            name = select_tile_config(variant, m).name
+            if name != prev:
+                got.append((m, name))
+                prev = name
+        assert got == segments, (variant, got)
     for cfg in TILE_CONFIGS.values():
         assert cfg.cluster_x == cfg.cta_group * cfg.ksplit
         assert not cfg.tail or cfg.ksplit == 1
@@ -213,20 +247,31 @@ def test_gemm_launch_geometry():
 
 
 def test_required_kernel_keys():
-    assert "attention:tiles1" in REQUIRED_KERNEL_KEYS
-    assert "attention:tiles2" in REQUIRED_KERNEL_KEYS
-    assert "merge" in REQUIRED_KERNEL_KEYS
-    assert "rmsnorm_apply" in REQUIRED_KERNEL_KEYS
-    gemm_keys = [k for k in REQUIRED_KERNEL_KEYS if k.startswith("gemm:")]
-    assert "gemm:pos_sqxw:xs_pf" in gemm_keys
-    assert "gemm:residual_fc1_sqxw:xs_k4_pf" in gemm_keys
-    assert "gemm:residual_fc1:xs_k4_pf" in gemm_keys
-    assert "gemm:norm_qkv_rope:l_e8_cs" in gemm_keys and "gemm:gelu_erf:l" in gemm_keys
-    # Every registered GEMM tile is a production (non-tail) config.
-    assert not any(TILE_CONFIGS[k.split(":")[2]].tail for k in gemm_keys)
-    # Only the launched variants (the ``_sq``-only forms are not part of the tower).
-    assert not any(k.split(":")[1].endswith("_sq") for k in gemm_keys)
-    assert len(gemm_keys) == len(set(gemm_keys)) == 23
+    # The plain SPLIT_KV form is reachable only on sm_103a (segments < 576 tokens or > 10764
+    # tokens); on sm_100a every SPLIT_KV row runs the ring3 form.
+    assert set(REQUIRED_KERNEL_KEYS) == {"sm_100a", "sm_103a"}
+    assert "attention:tiles1" not in REQUIRED_KERNEL_KEYS["sm_100a"]
+    assert "attention:tiles1" in REQUIRED_KERNEL_KEYS["sm_103a"]
+    for keys in REQUIRED_KERNEL_KEYS.values():
+        assert "attention:ring3" in keys
+        assert "attention:tiles2" in keys
+        assert "merge" in keys
+        assert "rmsnorm_apply" in keys
+        gemm_keys = [k for k in keys if k.startswith("gemm:")]
+        assert "gemm:pos_sqxw:xs_pf" in gemm_keys
+        assert "gemm:residual_fc1_sqxw:xs_k4_pf" in gemm_keys
+        assert "gemm:residual_fc1:xs_k4_pf" in gemm_keys
+        assert "gemm:residual_wo_sqxw:m_tma1" in gemm_keys
+        assert "gemm:residual_wo_sqxw:s_e8_pf" in gemm_keys
+        assert "gemm:residual_fc1:s_e8_pf" in gemm_keys
+        assert (
+            "gemm:norm_qkv_rope:l_e8_cs" in gemm_keys and "gemm:gelu_erf:l" in gemm_keys
+        )
+        # Every registered GEMM tile is a production (non-tail) config.
+        assert not any(TILE_CONFIGS[k.split(":")[2]].tail for k in gemm_keys)
+        # Only the launched variants (the ``_sq``-only forms are not part of the tower).
+        assert not any(k.split(":")[1].endswith("_sq") for k in gemm_keys)
+        assert len(gemm_keys) == len(set(gemm_keys)) == 26
 
 
 @pytest.mark.parametrize("label,grids", list(CONTRACT_GRIDS.items()))
@@ -272,6 +317,25 @@ def test_attention_plan_layout_rule():
             grid_clusters=GRID_CLUSTERS,
         )
         assert plan.tiles_per_cta == mode, label
+        assert plan.ring3 is False  # no arch: the plain form
+    # Round 3: the SPLIT_KV form is the shared-O ring per arch / longest segment
+    # (every SPLIT_KV row on sm_100a; 576 .. 10764-token segments on sm_103a).
+    for label, arch, ring3 in (
+        ("img_224", "sm_100a", True),
+        ("img_224", "sm_103a", False),
+        ("img_448", "sm_100a", True),
+        ("img_448", "sm_103a", True),
+        ("img_max_4096sq", "sm_100a", False),
+    ):
+        plan = build_attention_plan(
+            cu_seqlens_of(CONTRACT_GRIDS[label]),
+            torch.device("cpu"),
+            HEADS,
+            grid_clusters=GRID_CLUSTERS,
+            arch=arch,
+        )
+        assert plan.ring3 is ring3, (label, arch, plan.tiles_per_cta)
+        assert not (plan.ring3 and plan.tiles_per_cta != MODE_SPLIT_KV)
     forced = build_attention_plan(
         [0, 256],
         torch.device("cpu"),
@@ -384,7 +448,7 @@ def test_plan_on_cpu_device_needs_sm_count():
     assert plan.total_tokens == 264 and plan.merged_tokens == 62
     assert plan.gemm_configs == {
         "pos_sqxw": "xs_pf",
-        "norm_qkv_rope": "s_cs",
+        "norm_qkv_rope": "xs_cs_pf",
         "residual_wo_sqxw": "xs_pf",
         "norm_gelu": "s",
         "residual_fc1_sqxw": "xs_pf",
