@@ -22,9 +22,10 @@ sigmoid scores) and writes the expert-aligned route plan (``sorted_token_ids``,
 scatter offsets) consumed by grouped MoE GEMMs.  The program is a family of
 kernels: one dispatch arm per exact ``(num_tokens, block_m)`` shape of the
 routed set, selected by a per-architecture table.  Most arms launch as a
-cooperative persistent grid bounded by the device's SM count (arm Q4S
-additionally uses 4-CTA clusters at four CTAs per SM and is bounded by the
-driver's co-resident cluster capacity; arm GW, the warp-per-row two-join
+cooperative persistent grid bounded by the device's SM count (arms Q4S and
+Q4SP -- the same 4-CTA-cluster kernel family at four CTAs per SM, Q4SP being
+the 2048-token variant that prefetches the next row's logits into registers --
+are bounded by the driver's co-resident cluster capacity; arm GW, the warp-per-row two-join
 kernel for the largest batches, uses a per-architecture CTAs-per-SM bound);
 arm LC serves the smallest batches with one non-cooperative kernel per token
 count: a single CTA for one token, otherwise one cluster of ``num_tokens``
@@ -80,6 +81,10 @@ ARM_M_MAX_TOKENS = 2048
 ARM_Q4S_MAX_TOKENS = 2048
 ARM_Q4S_CLUSTER = 4
 ARM_Q4S_CTAS_PER_SM = 4
+# Arm Q4SP (v57): the Q4S body with a register prefetch of the next row's logits,
+# a second kernel of the same family serving the 2048-token shapes; identical
+# cluster shape, launch bounds, admission guards and grid rule.
+ARM_Q4S_FAMILY = ("Q4S", "Q4SP")
 
 # Exact keyword set of the generated program's ``run`` entry (bound by the
 # export's argument plan); ``grid`` is expanded to ``grid_x/y/z``.
@@ -123,8 +128,8 @@ _SM100_SHAPE_ROUTE: dict[tuple[int, int], str] = {
     (512, 16): "Q4S",
     (1024, 8): "Q4S",
     (1024, 16): "Q4S",
-    (2048, 8): "Q4S",
-    (2048, 16): "Q4S",
+    (2048, 8): "Q4SP",
+    (2048, 16): "Q4SP",
     (4096, 8): "GW",
     (4096, 16): "GW",
     (8192, 8): "GW",
@@ -230,7 +235,7 @@ def launch_grid(
     """``grid_x`` of the persistent launch for ``arm`` on the described device.
 
     ``max_active_clusters`` is the driver's co-resident cluster capacity for the
-    arm-Q4S kernel (required for arm Q4S only).
+    Q4S-family kernels (required for arms Q4S and Q4SP only).
     """
     rows = int(num_tokens)
     major, minor = (int(v) for v in compute_capability)
@@ -252,21 +257,21 @@ def launch_grid(
                 f"arm M admits {OWNER_CTAS} <= num_tokens <= {ARM_M_MAX_TOKENS}"
             )
         return grid_x
-    if arm == "Q4S":
+    if arm in ARM_Q4S_FAMILY:
         if rows > ARM_Q4S_MAX_TOKENS or rows < OWNER_CTAS:
             raise RuntimeError(
-                f"arm Q4S admits {OWNER_CTAS} <= num_tokens <= {ARM_Q4S_MAX_TOKENS}"
+                f"arm {arm} admits {OWNER_CTAS} <= num_tokens <= {ARM_Q4S_MAX_TOKENS}"
             )
         if max_active_clusters is None:
             raise RuntimeError(
-                "arm Q4S needs the driver's co-resident cluster capacity"
+                f"arm {arm} needs the driver's co-resident cluster capacity"
             )
         cluster_cap = int(max_active_clusters) * ARM_Q4S_CLUSTER
         grid_x = min(grid_rows, ARM_Q4S_CTAS_PER_SM * int(sm_count), cluster_cap)
         grid_x = (grid_x // ARM_Q4S_CLUSTER) * ARM_Q4S_CLUSTER
         if grid_x < OWNER_CTAS:
             raise RuntimeError(
-                f"arm Q4S needs {OWNER_CTAS} co-resident owner CTAs; the driver admits "
+                f"arm {arm} needs {OWNER_CTAS} co-resident owner CTAs; the driver admits "
                 f"{cluster_cap} clustered CTAs"
             )
         return grid_x
@@ -504,7 +509,7 @@ def prepare_kimi_k3_fused_router(
         module = load_kimi_k3_fused_router_module(module_name, "main")
         properties = torch.cuda.get_device_properties(device_index)
         max_active_clusters = None
-        if arm == "Q4S" and uses_cluster_launch(record):
+        if arm in ARM_Q4S_FAMILY and uses_cluster_launch(record):
             max_active_clusters = _max_active_clusters(module, record, device_index)
         grid_x = launch_grid(
             arm,

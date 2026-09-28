@@ -1490,10 +1490,12 @@ ARCH_NVCC_FLAGS = {
 #   M   : one-join bitmap plan builder, num_tokens = 256
 #   Q4S : arm M's cp.async ID stream in 4-CTA clusters (cooperative cluster
 #         launch), compiled with __launch_bounds__(224, 4): four CTAs per SM,
-#         512 <= num_tokens <= 2048
+#         512 <= num_tokens <= 1024
+#   Q4SP: the Q4S kernel with a register prefetch of the next row's logits,
+#         same cluster / launch bounds / grid rule, num_tokens = 2048
 #   G   : two-join persistent kernel for the largest batches, compiled with
 #         per-architecture launch bounds (4 CTAs/SM on SM100, 6 on SM103)
-ARMS = ("L", "LC", "M", "Q4S", "G")
+ARMS = ("L", "LC", "M", "Q4S", "Q4SP", "G")
 # Arms registered per row count (one kernel per num_tokens); every other arm
 # registers one module per (arch, block_m) and serves all of its rows.
 PER_ROW_COUNT_ARMS = ("LC",)

@@ -24,6 +24,7 @@ from flashinfer.experimental.kimi_k3_fused_router.cake_backend import (
     ARM_LC_TOKENS,
     ARM_Q4S_CLUSTER,
     ARM_Q4S_CTAS_PER_SM,
+    ARM_Q4S_FAMILY,
     BLOCK_M_VALUES,
     NUM_EXPERTS,
     OWNER_CTAS,
@@ -251,6 +252,7 @@ def test_route_tables_cover_the_routed_shapes():
             "LC",
             "M",
             "Q4S",
+            "Q4SP",
             "GW",
         }
     assert SHAPE_ROUTES["sm_100a"] == SHAPE_ROUTES["sm_103a"]
@@ -273,8 +275,14 @@ def test_route_tables_cover_the_routed_shapes():
         assert route_arm(arch, 32, 8) == "L"
         assert route_arm(arch, 128, 8) == "L"
         assert route_arm(arch, 256, 16) == "M"
-        assert route_arm(arch, 2048, 8) == "Q4S"
+        assert route_arm(arch, 512, 16) == "Q4S"
         assert route_arm(arch, 1024, 16) == "Q4S"
+        # v57: the 2048-token shapes are the only Q4SP rows.
+        assert route_arm(arch, 2048, 8) == "Q4SP"
+        assert route_arm(arch, 2048, 16) == "Q4SP"
+        assert {
+            rows for (rows, _), arm in SHAPE_ROUTES[arch].items() if arm == "Q4SP"
+        } == {2048}
         assert route_arm(arch, 8192, 16) == "GW"
     with pytest.raises(NotImplementedError, match="exactly num_tokens"):
         route_arm("sm_100a", 3, 8)
@@ -331,6 +339,25 @@ def test_launch_grid_rules(compute_capability, sm_count):
         )
     with pytest.raises(RuntimeError, match="cluster capacity"):
         launch_grid("Q4S", 1024, **kw)
+    # Arm Q4SP: the Q4S rule (four CTAs per SM, whole co-resident clusters).
+    assert ARM_Q4S_FAMILY == ("Q4S", "Q4SP")
+    assert (
+        launch_grid("Q4SP", 2048, max_active_clusters=1000, **kw) == (q4s_ctas // 4) * 4
+    )
+    assert (
+        launch_grid("Q4SP", 2048, max_active_clusters=37, **kw) == 37 * ARM_Q4S_CLUSTER
+    )
+    assert launch_grid("Q4SP", 2048, max_active_clusters=1000, **kw) == launch_grid(
+        "Q4S", 2048, max_active_clusters=1000, **kw
+    )
+    with pytest.raises(RuntimeError, match="cluster capacity"):
+        launch_grid("Q4SP", 2048, **kw)
+    with pytest.raises(RuntimeError, match="co-resident owner CTAs"):
+        launch_grid(
+            "Q4SP", 2048, max_active_clusters=OWNER_CTAS // ARM_Q4S_CLUSTER - 1, **kw
+        )
+    with pytest.raises(RuntimeError):
+        launch_grid("Q4SP", 64, max_active_clusters=1000, **kw)
     with pytest.raises(RuntimeError):
         launch_grid("L", 1024, **kw)
     with pytest.raises(RuntimeError):
