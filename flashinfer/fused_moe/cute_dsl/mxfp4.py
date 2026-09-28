@@ -1999,6 +1999,15 @@ class Mxfp4MoESwapAbPlan:
                 self._fork_event.record(main)
                 self._side_stream.wait_event(self._fork_event)
                 side = cuda.CUstream(self._side_stream.cuda_stream)
+                # The base dense GEMM1 is enqueued before the window chain:
+                # the graph launches the two GEMM1s in that order, and the
+                # first to arrive holds the SMs. Enqueued first, the swap
+                # GEMM1's clusters delayed the dense GEMM1 by 4-5 us on the
+                # rank's single-expert routings (round 28) even without a
+                # window, while on routings with many experts the dense
+                # GEMM1 arrived first regardless.
+                compiled, args, kwargs = self._gemm1_dense
+                compiled(*args, stream=stream, **kwargs)
                 if self._dispatch is not None:
                     self._dispatch(*self._dispatch_args, self._side_stream.cuda_stream)
                 if self._token_index is not None:
@@ -2006,8 +2015,6 @@ class Mxfp4MoESwapAbPlan:
                 self._gemm1(*self._gemm1_args, stream=side)
                 if self._gemm2_wide is None:
                     self._swap_gemm1_event.record(self._side_stream)
-                compiled, args, kwargs = self._gemm1_dense
-                compiled(*args, stream=stream, **kwargs)
                 if self._gemm1_dense_alt is not None:
                     compiled, args, kwargs = self._gemm1_dense_alt
                     compiled(*args, stream=stream, **kwargs)

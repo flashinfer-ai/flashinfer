@@ -442,10 +442,11 @@ void moe_sort(
   if (mixed_narrow_tile > 0) {
     TVM_FFI_ICHECK(tile_tokens_dim_alt > 0)
         << "the mixed work lists need the dual-tile routing (tile_tokens_dim_alt)";
-    TVM_FFI_ICHECK(mixed_row_unit > 0 && tile_tokens_dim % mixed_row_unit == 0 &&
+    TVM_FFI_ICHECK(mixed_row_unit > 0 && (mixed_row_unit & (mixed_row_unit - 1)) == 0 &&
+                   tile_tokens_dim % mixed_row_unit == 0 &&
                    tile_tokens_dim_alt % mixed_row_unit == 0 &&
                    mixed_narrow_tile % mixed_row_unit == 0)
-        << "mixed_row_unit must divide both tiles and mixed_narrow_tile";
+        << "mixed_row_unit must be a power of two dividing both tiles and mixed_narrow_tile";
     TVM_FFI_ICHECK(mixed_wide_list_ptr != 0 && mixed_wide_count_ptr != 0 &&
                    mixed_alt_wide_list_ptr != 0 && mixed_alt_wide_count_ptr != 0 &&
                    mixed_narrow_list_ptr != 0 && mixed_narrow_count_ptr != 0)
