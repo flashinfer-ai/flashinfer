@@ -138,7 +138,13 @@ CLUSTER_VARIANTS = (
 # over-counted four-CTA clusters on the 132-SM H100 (32 vs 30) and sent
 # 31-32-tile problems into a second cluster wave.  The reference table below
 # is that device's measured capacity, for tests only — planning resolves it.
-REFERENCE_CLUSTER_CAPACITY_H100_SXM: dict[int, int] = {2: 66, 3: 39, 4: 30, 6: 17, 8: 15}
+REFERENCE_CLUSTER_CAPACITY_H100_SXM: dict[int, int] = {
+    2: 66,
+    3: 39,
+    4: 30,
+    6: 17,
+    8: 15,
+}
 CLUSTER_MERGE_COST = 0.3
 CLUSTER_PAD_COST = 0.15
 
@@ -258,7 +264,9 @@ def cluster_variant_for(
 
 _PROBE_KERNEL = "cake_vsa_sm90_cluster_capacity_probe"
 _PROBE_SOURCE = f'extern "C" __global__ void {_PROBE_KERNEL}() {{}}\n'
-CLUSTER_SIZES: tuple[int, ...] = tuple(sorted({csize for _kmax, csize in CLUSTER_VARIANTS}))
+CLUSTER_SIZES: tuple[int, ...] = tuple(
+    sorted({csize for _kmax, csize in CLUSTER_VARIANTS})
+)
 
 
 @functools.lru_cache(maxsize=None)
@@ -308,7 +316,9 @@ def cluster_capacity(device_index: int) -> dict[int, int]:
                 result = {}
                 for csize in CLUSTER_SIZES:
                     attr = driver.CUlaunchAttribute()
-                    attr.id = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                    attr.id = (
+                        driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                    )
                     attr.value.clusterDim.x = csize
                     attr.value.clusterDim.y = 1
                     attr.value.clusterDim.z = 1
@@ -323,7 +333,9 @@ def cluster_capacity(device_index: int) -> dict[int, int]:
                     config.attrs = [attr]
                     config.numAttrs = 1
                     result[int(csize)] = int(
-                        checkCudaErrors(driver.cuOccupancyMaxActiveClusters(func, config))
+                        checkCudaErrors(
+                            driver.cuOccupancyMaxActiveClusters(func, config)
+                        )
                     )
             finally:
                 checkCudaErrors(driver.cuModuleUnload(module))
@@ -365,7 +377,9 @@ def small_route(
             split: Optional[int] = split_kmax(counts, sms=sms)
         except ValueError:
             split = None
-        cluster = cluster_variant_for(counts, sms=sms, cluster_capacity=cluster_capacity)
+        cluster = cluster_variant_for(
+            counts, sms=sms, cluster_capacity=cluster_capacity
+        )
         if cluster is not None and (
             split is None or cluster_cost(counts, *cluster) < split_cost(counts, split)
         ):
@@ -629,7 +643,9 @@ def _tile_cost(owns_t) -> float:
     return max(len(o) for o in owns_t) + TILE_FIXED_COST
 
 
-GRID_MIN_FRACTION = 0.9  # a smaller, uniform persistent grid only while >= 90 % of the SMs stay busy
+GRID_MIN_FRACTION = (
+    0.9  # a smaller, uniform persistent grid only while >= 90 % of the SMs stay busy
+)
 
 
 def _list_schedule(
@@ -1018,7 +1034,9 @@ class CakeVsaSm90Plan:
         small: Optional[tuple[int, bool, int]] = None
         if route is None:
             small = small_route(
-                block_mask_map, sms=sms, cluster_capacity=cluster_capacity(self.device.index)
+                block_mask_map,
+                sms=sms,
+                cluster_capacity=cluster_capacity(self.device.index),
             )
         elif route == "small":
             small = (

@@ -21,6 +21,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "tvm_ffi_utils.h"
+
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -29,17 +31,13 @@
 #include <unordered_map>
 #include <vector>
 
-#include "tvm_ffi_utils.h"
-
 template <typename T, int N>
 struct CakeParamArray {
-  T v[N];
-  __device__ __forceinline__ const T& operator[](int i) const { return v[i]; }
+    T v[N];
+    __device__ __forceinline__ const T& operator[](int i) const { return v[i]; }
 };
-extern "C" __global__ void kernel_cake_vsa_sm90_29638efd414121649a92(
-    const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K,
-    const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O,
-    const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2);
+extern "C" __global__ void kernel_cake_vsa_sm90_29638efd414121649a92(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2);
+
 
 namespace cake_host_shim_de35360c2d454551 {
 
@@ -51,12 +49,13 @@ class ScopedCudaDevice {
   explicit ScopedCudaDevice(int device_id) {
     cudaError_t error = cudaGetDevice(&previous_device_);
     TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
-        << "cudaGetDevice failed before host-shim launch: cudaError=" << static_cast<int>(error);
+        << "cudaGetDevice failed before host-shim launch: cudaError="
+        << static_cast<int>(error);
     if (previous_device_ != device_id) {
       error = cudaSetDevice(device_id);
       TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
-          << "cudaSetDevice failed before host-shim launch for cuda:" << device_id
-          << ": cudaError=" << static_cast<int>(error);
+          << "cudaSetDevice failed before host-shim launch for cuda:"
+          << device_id << ": cudaError=" << static_cast<int>(error);
       restore_ = true;
     }
   }
@@ -84,7 +83,8 @@ inline int64_t CakeDeviceMultiprocessorCount(int device_id) {
   if (cached > 0) return cached;
 
   int count = 0;
-  cudaError_t error = cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device_id);
+  cudaError_t error = cudaDeviceGetAttribute(
+      &count, cudaDevAttrMultiProcessorCount, device_id);
   TVM_FFI_CHECK(error == cudaSuccess && count > 0, RuntimeError)
       << "querying multiProcessorCount failed for cuda:" << device_id
       << ": cudaError=" << static_cast<int>(error) << ", count=" << count;
@@ -99,21 +99,28 @@ inline void CheckCudaTensor(const TensorView& t, const char* name) {
       << name << " must be a CUDA tensor, got device_type=" << (int)t.device().device_type;
 }
 
-inline void CheckSameCudaDevice(const TensorView& t, const TensorView& reference, const char* name,
-                                const char* reference_name) {
+inline void CheckSameCudaDevice(
+    const TensorView& t,
+    const TensorView& reference,
+    const char* name,
+    const char* reference_name) {
   TVM_FFI_CHECK(t.device().device_id == reference.device().device_id, ValueError)
       << name << " must be on the same CUDA device as " << reference_name
-      << ": got cuda:" << t.device().device_id << " versus cuda:" << reference.device().device_id;
+      << ": got cuda:" << t.device().device_id
+      << " versus cuda:" << reference.device().device_id;
 }
 
-inline void CheckCurrentCudaDevice(const TensorView& reference, const char* reference_name) {
+inline void CheckCurrentCudaDevice(
+    const TensorView& reference,
+    const char* reference_name) {
   int current_device = -1;
   cudaError_t error = cudaGetDevice(&current_device);
   TVM_FFI_CHECK(error == cudaSuccess, RuntimeError)
       << "cudaGetDevice failed while validating " << reference_name
       << ": cudaError=" << static_cast<int>(error);
   TVM_FFI_CHECK(current_device == reference.device().device_id, ValueError)
-      << "current CUDA device must match " << reference_name << ": current=cuda:" << current_device
+      << "current CUDA device must match " << reference_name
+      << ": current=cuda:" << current_device
       << ", tensor=cuda:" << reference.device().device_id;
 }
 
@@ -143,15 +150,16 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
     return;
   }
   int64_t step = t.stride(outer_last);
-  TVM_FFI_CHECK(step > 0, ValueError) << name << " physical strides must be positive";
+  TVM_FFI_CHECK(step > 0, ValueError)
+      << name << " physical strides must be positive";
   int64_t expected = step;
   for (int axis = outer_last - 1; axis >= 0; --axis) {
     expected *= t.size(axis + 1);
     if (t.size(axis) > 1) {
       TVM_FFI_CHECK(t.stride(axis) == expected, ValueError)
           << name << " leading dims are not physically foldable above " << trailing
-          << " trailing dims: stride(" << axis << ")=" << t.stride(axis) << ", expected "
-          << expected;
+          << " trailing dims: stride(" << axis << ")=" << t.stride(axis)
+          << ", expected " << expected;
     }
   }
 }
@@ -164,13 +172,16 @@ inline CUtensorMap EncodeTma_Q(const TensorView& t) {
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'Q' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError) << "TMA source 'Q' trailing dims must be positive";
+  TVM_FFI_CHECK(d1 > 0, ValueError)
+      << "TMA source 'Q' trailing dims must be positive";
   int64_t outer1 = t.numel() / (d1);
   CheckDenseLeadingFold(t, 1, "Q");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError) << "TMA source 'Q' physical strides must be positive";
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source 'Q' physical strides must be positive";
   TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'Q' extent " << d1 << " must divide exactly by " << 64;
+      << "TMA source 'Q' extent " << d1
+      << " must divide exactly by " << 64;
   uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'Q' resolved a non-positive global dim";
@@ -198,11 +209,10 @@ inline CUtensorMap EncodeTma_Q(const TensorView& t) {
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm{};
   const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(&tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
-                                      const_cast<void*>(tensor_base), global_dim, global_strides,
-                                      box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                                      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'Q') failed: CUresult=" << (int)r;
   return tm;
@@ -216,13 +226,16 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'K' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError) << "TMA source 'K' trailing dims must be positive";
+  TVM_FFI_CHECK(d1 > 0, ValueError)
+      << "TMA source 'K' trailing dims must be positive";
   int64_t outer1 = t.numel() / (d1);
   CheckDenseLeadingFold(t, 1, "K");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError) << "TMA source 'K' physical strides must be positive";
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source 'K' physical strides must be positive";
   TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'K' extent " << d1 << " must divide exactly by " << 64;
+      << "TMA source 'K' extent " << d1
+      << " must divide exactly by " << 64;
   uint64_t global_dim[3] = {(uint64_t)(64), (uint64_t)(outer1), (uint64_t)((d1 / 64))};
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'K' resolved a non-positive global dim";
@@ -250,11 +263,10 @@ inline CUtensorMap EncodeTma_K(const TensorView& t) {
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm{};
   const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(&tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3,
-                                      const_cast<void*>(tensor_base), global_dim, global_strides,
-                                      box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                                      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'K') failed: CUresult=" << (int)r;
   return tm;
@@ -268,23 +280,23 @@ inline CUtensorMap EncodeTma_Vt(const TensorView& t) {
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
       << "TMA source 'Vt' must have unit innermost stride, got " << t.stride(-1);
   int64_t d1 = t.size(t.ndim() - 1);
-  TVM_FFI_CHECK(d1 > 0, ValueError) << "TMA source 'Vt' trailing dims must be positive";
+  TVM_FFI_CHECK(d1 > 0, ValueError)
+      << "TMA source 'Vt' trailing dims must be positive";
   int64_t outer1 = t.numel() / (d1);
   CheckDenseLeadingFold(t, 1, "Vt");
   int64_t s2 = t.stride(t.ndim() - 2) * 1;
-  TVM_FFI_CHECK(s2 > 0, ValueError) << "TMA source 'Vt' physical strides must be positive";
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source 'Vt' physical strides must be positive";
   TVM_FFI_CHECK(outer1 % 8 == 0, ValueError)
-      << "TMA source 'Vt' extent " << outer1 << " must divide exactly by " << 8;
+      << "TMA source 'Vt' extent " << outer1
+      << " must divide exactly by " << 8;
   TVM_FFI_CHECK(d1 % 64 == 0, ValueError)
-      << "TMA source 'Vt' extent " << d1 << " must divide exactly by " << 64;
-  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(8), (uint64_t)((outer1 / 8)),
-                            (uint64_t)((d1 / 64))};
-  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0,
-                ValueError)
+      << "TMA source 'Vt' extent " << d1
+      << " must divide exactly by " << 64;
+  uint64_t global_dim[4] = {(uint64_t)(64), (uint64_t)(8), (uint64_t)((outer1 / 8)), (uint64_t)((d1 / 64))};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0 && global_dim[3] > 0, ValueError)
       << "TMA descriptor for 'Vt' resolved a non-positive global dim";
-  TVM_FFI_CHECK(
-      64u <= global_dim[0] && 8u <= global_dim[1] && 8u <= global_dim[2] && 2u <= global_dim[3],
-      ValueError)
+  TVM_FFI_CHECK(64u <= global_dim[0] && 8u <= global_dim[1] && 8u <= global_dim[2] && 2u <= global_dim[3], ValueError)
       << "TMA box (64, 8, 8, 2) exceeds resolved global dims for 'Vt'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
@@ -316,19 +328,16 @@ inline CUtensorMap EncodeTma_Vt(const TensorView& t) {
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   CUtensorMap tm{};
   const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
-  CUresult r = cuTensorMapEncodeTiled(&tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4,
-                                      const_cast<void*>(tensor_base), global_dim, global_strides,
-                                      box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE,
-                                      CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
-                                      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (4D, 'Vt') failed: CUresult=" << (int)r;
   return tm;
 }
 
-void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_Vt, TensorView arg_O,
-         TensorView arg_plan, int64_t arg_seqlen_q, int64_t arg_seqlen_k, double arg_scale_log2,
-         int64_t grid_x, int64_t grid_y, int64_t grid_z) {
+void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_Vt, TensorView arg_O, TensorView arg_plan, int64_t arg_seqlen_q, int64_t arg_seqlen_k, double arg_scale_log2, int64_t grid_x, int64_t grid_y, int64_t grid_z) {
   DLDevice dev = arg_Q.device();
   ScopedCudaDevice device_guard(dev.device_id);
   CheckCudaTensor(arg_Q, "Q");
@@ -356,8 +365,8 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_Vt, TensorView arg_O
   CheckSameCudaDevice(arg_Vt, arg_Q, "Vt", "Q");
   CheckSameCudaDevice(arg_O, arg_Q, "O", "Q");
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
-      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y << ", "
-      << grid_z << ")";
+      << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
+      << ", " << grid_z << ")";
   TVM_FFI_CHECK(grid_x % 4 == 0 && grid_y % 1 == 0 && grid_z % 1 == 0, ValueError)
       << "launch grid (" << grid_x << ", " << grid_y << ", " << grid_z
       << ") must be divisible by cluster dims (4, 1, 1)";
@@ -375,7 +384,8 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_Vt, TensorView arg_O
   void* kargs[] = {&p_Q, &p_K, &p_Vt, &p_O, &v_plan, &v_seqlen_q, &v_seqlen_k, &v_scale_log2};
 
   static std::mutex smem_mu;
-  static auto* smem_status_by_device = new std::unordered_map<int, cudaError_t>();
+  static auto* smem_status_by_device =
+      new std::unordered_map<int, cudaError_t>();
   cudaError_t smem_status = cudaSuccess;
   {
     std::lock_guard<std::mutex> lock(smem_mu);
@@ -389,7 +399,8 @@ void Run(TensorView arg_Q, TensorView arg_K, TensorView arg_Vt, TensorView arg_O
       if (smem_status == cudaSuccess) {
         smem_status = cudaFuncSetAttribute(
             reinterpret_cast<const void*>(kernel_cake_vsa_sm90_29638efd414121649a92),
-            cudaFuncAttributeMaxDynamicSharedMemorySize, 111616);
+            cudaFuncAttributeMaxDynamicSharedMemorySize,
+            111616);
       }
       smem_status_by_device->emplace(dev.device_id, smem_status);
     } else {
