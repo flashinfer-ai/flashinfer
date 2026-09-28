@@ -129,5 +129,6 @@ slower than this one): 15.6 against 17.0 us at 20 tokens, 17.8 against 17.3 at 2
 ## Graduation plan
 
 1. Run the tests and the benchmark on B200/GB200 in CI.
-2. vLLM: let the FlashInfer sparse-MLA backend accept `nvfp4_ds_mla` and call this API.
+2. vLLM: let the FlashInfer sparse-MLA backend accept `nvfp4_ds_mla` and call this API. A branch that does both is
+   [stu-cao/vllm `feat/nvfp4-ds-mla-flashinfer-sparse`](https://github.com/stu-cao/vllm/tree/feat/nvfp4-ds-mla-flashinfer-sparse).
 3. Replace the `mma.sync` pipeline with tcgen05 once it is faster at the same shapes.
