@@ -1202,6 +1202,50 @@ def test_top_k_mask_logits_mixed_k_persistent_loop(dtype):
             )
 
 
+@pytest.mark.parametrize("initial_offset", [0, 12])
+def test_get_seed_and_offset_reserves_current_range(initial_offset):
+    seed = 12345
+    generator = torch.Generator(device="cuda:0").manual_seed(seed)
+    generator.set_offset(initial_offset)
+    expected_offset = initial_offset
+
+    for increment in [1, 5, 32, 2, 0]:
+        actual_seed, actual_offset = flashinfer.sampling.get_seed_and_offset(
+            increment, generator
+        )
+        assert (actual_seed, actual_offset) == (seed, expected_offset)
+        expected_offset += (increment + 3) // 4 * 4
+        assert generator.get_offset() == expected_offset
+        assert generator.initial_seed() == seed
+
+
+def test_chain_speculative_sampling_reserves_current_range():
+    seed = 12345
+    generator = torch.Generator(device="cuda:0").manual_seed(seed)
+
+    # Rejection consumes N+2 draws: reserve 8 for N=3, then 4 for N=1.
+    for n, offset, next_offset in [(3, 0, 8), (1, 8, 12)]:
+        draft_probs = torch.zeros((1, n, 3), device="cuda:0")
+        draft_probs[..., 0] = 1
+        draft_token_ids = torch.zeros((1, n), dtype=torch.int32, device="cuda:0")
+        target_probs = torch.tensor(
+            [[[0.0, 0.5, 0.5]] + [[0.5, 0.5, 0.0]] * n], device="cuda:0"
+        )
+        args = (draft_probs, draft_token_ids, target_probs)
+
+        actual = flashinfer.sampling.chain_speculative_sampling(
+            *args, generator=generator
+        )
+        assert generator.get_offset() == next_offset
+        expected = flashinfer.sampling.chain_speculative_sampling(
+            *args, generator=generator, seed=seed, offset=offset
+        )
+        # Explicit seed/offset must bypass generator reservation.
+        assert generator.get_offset() == next_offset
+        for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+            torch.testing.assert_close(actual_tensor, expected_tensor, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("num_speculate_tokens", [1, 3, 5, 7])
