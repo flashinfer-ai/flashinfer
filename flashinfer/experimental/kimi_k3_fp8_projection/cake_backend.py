@@ -318,6 +318,27 @@ DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
 }
 
 
+def decode_cs_alias_fits(
+    tok: int, stages: int, fused: bool, resident: bool, csplit: int, xb_stages: int = 0
+) -> bool:
+    """Round 5: True when the one-round cluster exchange inbox + staging blocks
+    ``(2C - 1) x 128 x (chunk | 1) x 4`` fit inside the physical instance's pipeline
+    stages (host mirror of the Cake ``decode_cs_alias_fits`` rule); the fused view of a
+    wide tile (1 stage at t128) does not fit and keeps the small-inbox exchange."""
+    if csplit < 2:
+        return False
+    tok_rows = max(tok, 32)
+    xb_bytes = tok * 512 if (fused and not resident) else 0
+    xb_ring = bool(fused and not resident and xb_stages > 0)
+    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
+    stage_bytes = (
+        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    )
+    module_stages = decode_module_stages(tok, stages, fused, resident, xb_stages)
+    chunk = -(-(-(-tok // csplit)) // 4) * 4
+    return (2 * csplit - 1) * 128 * (chunk | 1) * 4 <= module_stages * stage_bytes
+
+
 def decode_cluster_capacity(arch: str, csplit: int) -> int:
     """Co-resident cluster capacity of ``arch`` for cluster size ``csplit`` (tabulated; raises when not measured)."""
     table = DECODE_MAX_ACTIVE_CLUSTERS.get(arch, {})
@@ -492,7 +513,9 @@ def decode_config(
         xb_stages=xb_stages,
         qlanes=qlanes,
         csplit=csplit,
-        cs_alias=csplit > 1 and grid == total_work,
+        cs_alias=csplit > 1
+        and grid == total_work
+        and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages),
     )
 
 
