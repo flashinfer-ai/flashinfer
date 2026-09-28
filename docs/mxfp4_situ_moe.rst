@@ -2619,6 +2619,111 @@ Gates on this revision: the unit and deferred suites (214 / 69 / 16 and
 (155 clean summaries) and over the shard's mixed rows T=2048..32768 (16
 runs, 88 clean summaries), all with the mixed form as the default.
 
+*Round 28 (B300, CAKE-707 phase 4).* Three changes to the mixed form, and a
+measured limit on the expert-parallel rank.
+
+1. The routing kernel writes the mixed work lists itself
+   (``routingDualTilePadding``, ``DataBase::mMixedNarrowTile``): per expert
+   the dense tiles of the chosen padding first, then its 192-row windows,
+   the same closed-form cover as ``swapab_dispatch_mixed`` (which stays as
+   the ``MXFP4_SWAP192_LISTS=dispatch`` alternative and as the parity
+   reference of ``test_moe_sort_mixed_lists_match_dispatch``). One packed
+   block scan (dense-tile and window counts in one 32-bit word) and shifts
+   in place of divisions keep the routing kernel within +1.4 us (T=8192 and
+   16384) and +3.2 us (T=32768) of the plain dual-tile routing; the dispatch
+   launch (6.7 us) leaves the critical path.
+2. Window rule (``MXFP4_SWAP192_MAX_ROWS``, ``MXFP4_SWAP192_MIN_ROWS``,
+   default 0 / 1024): experts above MAX_ROWS rows, or every expert when the
+   routing's padded row total is below MIN_ROWS, keep all their dense tiles.
+   A window on a lone expert is a latency-bound tile on the swap kernel:
+   the rank's single-expert routing at T=8192 (167 rows) spends 47.6 us in
+   the swap GEMM1 and 19.4 us in the swap GEMM2 for one window against
+   36.9 + 14.8 us for the dense tile it replaces.
+3. ``win`` stream layout (``MXFP4_SWAP192_MIXED_STREAMS=win``, now the
+   default): the window chain (swap GEMM1, and in the split form the swap
+   GEMM2 after the dense GEMM1s' zero-fill event) runs on the plan's side
+   stream, both dense GEMM1s and the finalizes on the caller's stream. The
+   graph launches the GEMM1s in enqueue order and the first to arrive holds
+   the SMs, so the order follows the token count
+   (``MXFP4_SWAP192_DENSE_FIRST_MIN_TOKENS`` = 16384): below it the routing
+   pads most experts to one window and the dense GEMM1s only zero-fill the
+   output (a fill-only dense GEMM1 enqueued first delayed the rank's live
+   swap GEMM1 by 18 us at T=8192); from it up the experts hold dense tiles
+   ahead of their windows (a dead swap GEMM1 enqueued first delayed the
+   live dense GEMM1 by 4-10 us and cost its fill 8 us of SM time).
+   Shard, same GPU, 4 x 20 replays, GPU span relative to main: T=8192
+   balanced 0.949 (``tile`` layout 0.969), hot 0.90, empty 1.00; T=16384
+   balanced 0.95, hot 0.93, empty 1.00.
+
+Expert-parallel rank: the form is measured but stays off
+(``MXFP4_SWAP192_LAYOUTS`` = moe_tensor_parallel). With the rule and the
+layout above, relative to main (rank 3 of 8, same GPU, three passes in
+the table below): T=8192 balanced 0.875, hot 0.86-0.88, remote_dominated
+1.012-1.016; T=16384 balanced 0.89, hot 0.87-0.90, remote_dominated 0.90;
+T=32768 balanced 0.96-1.04, hot 0.96-1.03, remote_dominated 0.88-0.90 --
+and the ``empty`` routings (one touched expert, 167 / 334 / 668 rows)
+1.16-1.26 / 1.12-1.25 / 1.10-1.13. Those rows are a bytes floor: with one expert the
+dense GEMM1's tiles take 24-27 us and its duration (36.9 / 53.0 / 91.8 us)
+is the output zero-fill (117 / 235 / 470 MB at 4.4-5.2 TB/s, the rank's
+output is zero for every token it does not serve); the routing kernel's
+list emission (1.4-3.2 us) and each launch the form adds (a dead persistent
+kernel holds the SMs for 3-8 us) exceed 1 % of the 64-137 us rows, so no
+rank form that adds a launch can stay within 1 % of main there while the
+same form brings the rank's balanced/hot rows at T=8192 and 16384 above
+trtllm-gen. The choice between the two is left to the owner; the tables
+report both.
+
+Same GPU, three passes x 20 graph replays, CUPTI span, this revision
+against the main branch (05ebb2d7976), the shard with its default (the
+mixed form, ``win`` layout) and the rank with the form off (its default)
+and on (``MXFP4_SWAP192=1``):
+
+.. code-block:: text
+
+   layout  T      routing   main us (3 passes)         this revision us           ratio
+   shard   2048   balanced  807 / 814 / 810            824 / 819 / 823            1.021 / 1.006 / 1.015  (*)
+   shard   2048   hot       808 / 808 / 808            808 / 808 / 810            1.000 / 1.000 / 1.002
+   shard   2048   empty     293 / 293 / 293            294 / 294 / 294            1.003 / 1.002 / 1.002
+   shard   4096   balanced  913 / 912 / 913            913 / 913 / 914            1.000 / 1.001 / 1.001
+   shard   4096   hot       918 / 916 / 916            917 / 916 / 916            0.999 / 1.000 / 1.000
+   shard   4096   empty     531 / 531 / 531            531 / 540 / 541            1.001 / 1.018 / 1.019
+   shard   8192   balanced  1644 / 1646 / 1648         1563 / 1562 / 1562         0.950 / 0.949 / 0.948
+   shard   8192   hot       1725 / 1655 / 1703         1478 / 1477 / 1480         0.856 / 0.892 / 0.869
+   shard   8192   empty     989 / 1004 / 996           1007 / 1000 / 992          1.017 / 0.996 / 0.996
+   shard   16384  balanced  2852 / 2733 / 2730         2644 / 2644 / 2647         0.927 / 0.968 / 0.970
+   shard   16384  hot       2749 / 2733 / 2709         2659 / 2570 / 2582         0.967 / 0.940 / 0.953
+   shard   16384  empty     2030 / 2017 / 2018         2025 / 1991 / 1985         0.998 / 0.987 / 0.984
+   shard   32768  balanced  5316 / 5491 / 5352         5185 / 5374 / 5254         0.975 / 0.979 / 0.982
+   shard   32768  hot       4986 / 5088 / 5167         4998 / 5015 / 4926         1.002 / 0.986 / 0.953
+   shard   32768  empty     4308 / 4012 / 4383         4303 / 4153 / 4194         0.999 / 1.035 / 0.957
+   rank    8192   balanced  1182 / 1184 / 1185         1187 / 1189 / 1189         1.005 / 1.005 / 1.003  (form off)
+   rank    8192   hot       1501 / 1492 / 1486         1483 / 1518 / 1496         0.988 / 1.018 / 1.007
+   rank    8192   empty     70 / 69 / 66               70 / 70 / 69               0.998 / 1.009 / 1.044
+   rank    16384  balanced  2173 / 2179 / 2179         2178 / 2184 / 2183         1.003 / 1.003 / 1.002
+   rank    16384  hot       2965 / 2904 / 2994         2892 / 2854 / 2992         0.975 / 0.983 / 0.999
+   rank    32768  balanced  4011 / 3862 / 3693         3843 / 3950 / 3550         0.958 / 1.023 / 0.961
+   rank    8192   balanced  1184 / 1186 / 1186         1036 / 1036 / 1038         0.875 / 0.873 / 0.875  (form on)
+   rank    8192   hot       1491 / 1519 / 1499         1285 / 1304 / 1314         0.862 / 0.859 / 0.877
+   rank    8192   empty     68 / 72 / 71               81 / 90 / 83               1.182 / 1.261 / 1.161
+   rank    8192   remote_d  849 / 854 / 854            863 / 864 / 868            1.016 / 1.012 / 1.016
+   rank    16384  balanced  2180 / 2187 / 2180         1946 / 1945 / 1943         0.893 / 0.889 / 0.891
+   rank    16384  hot       2911 / 2828 / 2960         2601 / 2549 / 2566         0.893 / 0.901 / 0.867
+   rank    16384  empty     85 / 87 / 88               106 / 98 / 106             1.246 / 1.119 / 1.215
+   rank    16384  remote_d  1198 / 1199 / 1200         1080 / 1087 / 1090         0.902 / 0.906 / 0.908
+   rank    32768  balanced  3715 / 3737 / 3743         3858 / 3575 / 3650         1.039 / 0.957 / 0.975
+   rank    32768  hot       5178 / 5384 / 5477         5310 / 5269 / 5265         1.025 / 0.979 / 0.961
+   rank    32768  empty     148 / 145 / 147            163 / 163 / 164            1.103 / 1.125 / 1.113
+   rank    32768  remote_d  2278 / 2245 / 2261         2003 / 2011 / 2000         0.879 / 0.896 / 0.885
+
+(*) The shard's T=2048 balanced row jitters +-1 % on every arm: a
+four-pass A/B/A/B of main, the round-27 tree, this tree with the form off
+and this revision read 0.997 / 1.015 / 0.998, 0.996 / 1.002 / 0.998 and
+0.993 / 1.007 / 1.011 with main itself at 804-812 us; its hot and empty
+rows and every T=4096 row are at 1.000. The T <= 4096 rows run the
+unchanged swap and dense paths (the mixed lists are requested only when
+the form is on, so the routing kernel of every other row is the main
+branch's).
+
 *Wide rank at T=8192 and T=16384 remote-dominated.* These rows are the
 slowest against TRT-LLM Gen (0.79-0.86) and 2.0-2.4 x their floor: the
 first from tile padding (146 rows per expert, two M128 tiles), the second
