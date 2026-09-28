@@ -1738,8 +1738,9 @@ def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit, mode):
             candidates = []
             for a in range(-(-rows // narrow_tile) + 1):
                 w = max(0, -(-(rows - a * narrow_tile) // group_rows))
-                candidates.append((w * group_rows + a * narrow_tile, a, w))
-            _, a, w = min(candidates)
+                tie = -a if mode == 2 else a
+                candidates.append((w * group_rows + a * narrow_tile, tie, a, w))
+            _, _, a, w = min(candidates)
             best = (w, a)
         w, a = best
         wide += [g + j for j in range(w)]
@@ -1753,7 +1754,7 @@ def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit, mode):
     return wide, narrow, covered
 
 
-@pytest.mark.parametrize("mode", [0, 1])
+@pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize(
     "tokens, local_experts, offset, distribution",
     [

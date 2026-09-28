@@ -150,7 +150,8 @@ __global__ void __launch_bounds__(kThreads)
 // the bound of its last group).  Per expert with ``c`` valid rows the kernel
 // picks ``nwide`` dense tiles followed by ``a`` ``narrow_tile``-row windows
 // (``mode`` 0: minimal covered rows ``group_rows * nwide + narrow_tile * a
-// >= c``, ties to fewer windows; 1: dense tiles only) and emits the dense
+// >= c``, ties to fewer windows; 1: dense tiles only; 2: minimal cover with
+// ties to more windows) and emits the dense
 // tiles as sort-group indices (``wide_list``) and the windows as row
 // offsets in ``row_unit`` rows (``narrow_list``), both in permutation
 // order.  The windows start ``group_rows``-aligned plus a multiple of
@@ -198,7 +199,7 @@ __global__ void __launch_bounds__(kThreads)
             const int rem = c - a * narrow_tile;
             const int w = rem > 0 ? (rem + group_rows - 1) / group_rows : 0;
             const int cover = w * group_rows + a * narrow_tile;
-            if (cover < best_cover) {
+            if (cover < best_cover || (cover == best_cover && mode == 2)) {
               best_cover = cover;
               nwide = w;
               nnarrow = a;
@@ -276,7 +277,8 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
   TVM_FFI_ICHECK(row_unit > 0 && group_rows > 0 && narrow_tile > 0 &&
                  group_rows % row_unit == 0 && narrow_tile % row_unit == 0)
       << "group_rows and narrow_tile must be positive multiples of row_unit";
-  TVM_FFI_ICHECK(mode >= 0 && mode <= 1) << "mode must be 0 (minimal cover) or 1 (tiles)";
+  TVM_FFI_ICHECK(mode >= 0 && mode <= 2)
+      << "mode must be 0 (minimal cover), 1 (tiles) or 2 (minimal cover, ties to windows)";
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   cudaLaunchConfig_t config{};

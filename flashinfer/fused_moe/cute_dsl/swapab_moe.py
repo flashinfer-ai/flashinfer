@@ -328,13 +328,14 @@ def swapab_dispatch_mixed(
     (``narrow_list``: row offsets in ``row_unit`` rows, the swap kernel's
     ``tile_idx_to_row_group`` with ``row_unit``), ``mode`` 0 minimising the
     covered rows (ties to fewer windows; the cover never exceeds the
-    expert's own sort groups), 1 dense tiles only. Both lists are in
+    expert's own sort groups), 1 dense tiles only, 2 minimal cover with
+    ties to more windows. Both lists are in
     permutation order and hold at most one entry per sort group. Single
     CTA, graph-capturable."""
     if group_rows % row_unit or narrow_tile % row_unit:
         raise ValueError("group_rows and narrow_tile must be multiples of row_unit")
-    if mode not in (0, 1):
-        raise ValueError("mode must be 0 or 1")
+    if mode not in (0, 1, 2):
+        raise ValueError("mode must be 0, 1 or 2")
     groups = tile_idx_to_mn_limit.shape[0]
     if tile_idx_to_expert_idx.shape[0] != groups:
         raise ValueError("tile_idx_to_expert_idx and tile_idx_to_mn_limit must match")

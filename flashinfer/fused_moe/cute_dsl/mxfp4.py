@@ -223,7 +223,8 @@ SWAP_WIDE192_MIN_TOKENS = int(os.environ.get("MXFP4_SWAP192_MIN_TOKENS", "0"))
 # first (dense gather GEMM1 and dense finalize GEMM2 over the wide slot
 # list, blocked row scales) and 192-row 2-CTA swap windows behind them
 # (row-group list in 64-row units), covering the fewest rows. Mode 1: dense
-# tiles only (measurement arm; the pure 192-row form is MXFP4_SWAP192_MIXED=0).
+# tiles only (measurement arm; the pure 192-row form is MXFP4_SWAP192_MIXED=0);
+# mode 2: fewest rows with ties to more windows.
 SWAP_WIDE192_MIXED = os.environ.get("MXFP4_SWAP192_MIXED", "0") == "1"
 SWAP_WIDE192_MIXED_MODE = int(os.environ.get("MXFP4_SWAP192_MIXED_MODE", "0"))
 SWAP_WIDE192_ROW_UNIT = 64
