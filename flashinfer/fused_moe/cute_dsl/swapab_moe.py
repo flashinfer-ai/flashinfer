@@ -306,6 +306,70 @@ def swapab_dispatch(
         _prepared_launches["swap_dispatch"] = (func, args)
 
 
+def swapab_dispatch_mixed(
+    *,
+    tile_idx_to_expert_idx: torch.Tensor,
+    tile_idx_to_mn_limit: torch.Tensor,
+    num_non_exiting_tiles: torch.Tensor,
+    group_rows: int,
+    narrow_tile: int,
+    row_unit: int,
+    wide_list: torch.Tensor,
+    wide_count: torch.Tensor,
+    narrow_list: torch.Tensor,
+    narrow_count: torch.Tensor,
+    mode: int = 0,
+    enable_pdl: bool = False,
+    _prepared_launches: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Mixed-width work lists over ``group_rows``-row sort groups: per expert
+    ``nwide`` dense ``group_rows``-row tiles (``wide_list``: sort group
+    indices) followed by ``a`` ``narrow_tile``-row swap windows
+    (``narrow_list``: row offsets in ``row_unit`` rows, the swap kernel's
+    ``tile_idx_to_row_group`` with ``row_unit``), ``mode`` 0 minimising the
+    covered rows (ties to fewer windows), 1 windows only, 2 tiles only. Both
+    lists are in permutation order and hold at most one entry per sort
+    group. Single CTA, graph-capturable."""
+    if group_rows % row_unit or narrow_tile % row_unit:
+        raise ValueError("group_rows and narrow_tile must be multiples of row_unit")
+    if mode not in (0, 1, 2):
+        raise ValueError("mode must be 0, 1 or 2")
+    groups = tile_idx_to_mn_limit.shape[0]
+    if tile_idx_to_expert_idx.shape[0] != groups:
+        raise ValueError("tile_idx_to_expert_idx and tile_idx_to_mn_limit must match")
+    if wide_list.shape[0] < groups or narrow_list.shape[0] < groups:
+        raise ValueError(f"wide_list and narrow_list need {groups} entries")
+    for t in (
+        tile_idx_to_expert_idx,
+        tile_idx_to_mn_limit,
+        num_non_exiting_tiles,
+        wide_list,
+        wide_count,
+        narrow_list,
+        narrow_count,
+    ):
+        if t.dtype != torch.int32 or not t.is_contiguous():
+            raise ValueError("dispatch buffers must be contiguous int32")
+    func = _get_swapab_dispatch_module()["flashinfer_moe_swapab_dispatch_mixed"]
+    args = (
+        tile_idx_to_expert_idx.data_ptr(),
+        tile_idx_to_mn_limit.data_ptr(),
+        num_non_exiting_tiles.data_ptr(),
+        int(group_rows),
+        int(narrow_tile),
+        int(row_unit),
+        int(mode),
+        wide_list.data_ptr(),
+        wide_count.data_ptr(),
+        narrow_list.data_ptr(),
+        narrow_count.data_ptr(),
+        bool(enable_pdl),
+    )
+    func(*args, torch.cuda.current_stream().cuda_stream)
+    if _prepared_launches is not None:
+        _prepared_launches["swap_dispatch"] = (func, args)
+
+
 class _PermutedTokenIndex:
     """``permuted_idx_to_token_idx[r] = expanded[r] // top_k`` with the
     out-of-range value ``num_tokens`` for padding rows (``expanded < 0``), the
@@ -399,6 +463,7 @@ def _get_compiled_swapab_kernel(
     row_tma: Optional[bool] = None,
     gather_warps: Optional[int] = None,
     group_rows: Optional[int] = None,
+    row_unit: Optional[int] = None,
     sf_blocked: bool = False,
     wide_out: bool = False,
     m_group: Optional[int] = None,
@@ -448,6 +513,7 @@ def _get_compiled_swapab_kernel(
         m_group,
         row_group_list,
         group_rows,
+        row_unit,
         sf_blocked,
         wide_out,
         pdl_trigger_early,
@@ -481,6 +547,7 @@ def _get_compiled_swapab_kernel(
             gather_warps=gather_warps,
             m_group=m_group,
             group_rows=group_rows,
+            row_unit=row_unit,
             sf_blocked=sf_blocked,
             wide_out=wide_out,
             pdl_trigger_early=pdl_trigger_early,
@@ -532,6 +599,7 @@ def swapab_gemm1_situ(
     _prepared_launches: Optional[Dict[str, Any]] = None,
     tile_idx_to_row_group: Optional[torch.Tensor] = None,
     group_rows: Optional[int] = None,
+    row_unit: Optional[int] = None,
     sf_blocked: bool = False,
     pdl_trigger_early: bool = False,
     late_dep_wait: bool = False,
@@ -660,6 +728,7 @@ def swapab_gemm1_situ(
         weight_l2_hint=_resolve_weight_l2_hint(weight_l2_hint),
         row_tma=row_tma,
         group_rows=group_rows,
+        row_unit=row_unit,
         sf_blocked=sf_blocked,
         pdl_trigger_early=pdl_trigger_early,
         late_dep_wait=late_dep_wait,
@@ -697,6 +766,7 @@ def swapab_gemm2(
     _prepared_launches: Optional[Dict[str, Any]] = None,
     tile_idx_to_row_group: Optional[torch.Tensor] = None,
     group_rows: Optional[int] = None,
+    row_unit: Optional[int] = None,
     sf_blocked: bool = False,
     m_group: Optional[int] = None,
     pdl_trigger_early: bool = False,
@@ -822,6 +892,7 @@ def swapab_gemm2(
         tiled_a=bool(SWAP_TILED_WEIGHTS & 2),
         weight_l2_hint=_resolve_weight_l2_hint(weight_l2_hint),
         group_rows=group_rows,
+        row_unit=row_unit,
         sf_blocked=sf_blocked,
         wide_out=wide_out,
         m_group=m_group,

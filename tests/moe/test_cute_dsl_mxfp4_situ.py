@@ -1716,6 +1716,128 @@ def test_fused_routing_dispatch_lists_match_dispatch_kernel(
         check(expect_wide=False)
 
 
+def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit, mode):
+    """Host reference of ``swapab_dispatch_mixed``: per expert the dense tiles
+    first, then the windows, covering the fewest rows (ties to fewer windows)."""
+    wide, narrow, covered = [], [], []
+    g, n = 0, len(expert)
+    while g < n:
+        base = g * group_rows
+        rows = int(limit[g]) - base
+        assert rows > 0
+        groups = -(-rows // group_rows)
+        for j in range(groups):
+            assert int(expert[g + j]) == int(expert[g])
+            assert int(limit[g + j]) == int(limit[g])
+        assert g + groups == n or int(expert[g + groups]) != int(expert[g])
+        if mode == 1:
+            best = (0, -(-rows // narrow_tile))
+        elif mode == 2:
+            best = (groups, 0)
+        else:
+            candidates = []
+            for a in range(-(-rows // narrow_tile) + 1):
+                w = max(0, -(-(rows - a * narrow_tile) // group_rows))
+                candidates.append((w * group_rows + a * narrow_tile, a, w))
+            _, a, w = min(candidates)
+            best = (w, a)
+        w, a = best
+        wide += [g + j for j in range(w)]
+        first = base + w * group_rows
+        narrow += [(first + i * narrow_tile) // row_unit for i in range(a)]
+        # Disjoint cover of the expert's rows inside its own sort groups.
+        cover = w * group_rows + a * narrow_tile
+        assert rows <= cover <= groups * group_rows
+        covered.append((base, base + rows, base + cover))
+        g += groups
+    return wide, narrow, covered
+
+
+@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize(
+    "tokens, local_experts, offset, distribution",
+    [
+        (256, 112, 336, "balanced"),
+        (1024, 112, 336, "hot"),
+        (1024, 112, 336, "empty"),
+        (1024, 896, 0, "balanced"),
+    ],
+)
+def test_swapab_dispatch_mixed_matches_reference(
+    tokens, local_experts, offset, distribution, mode
+):
+    """``swapab_dispatch_mixed`` lists every expert's dense 128-row tiles
+    ahead of its 192-row windows (64-row offsets) in permutation order,
+    covering the fewest rows, and equals the host reference; both lists
+    stay inside the expert's own sort groups."""
+    _require_blackwell()
+    from flashinfer.fused_moe.cute_dsl.moe_utils import (
+        allocate_moe_sort_buffers,
+        get_max_num_tiles,
+    )
+    from flashinfer.fused_moe.cute_dsl.mxfp4_routing import _plan_route_preprocess
+    from flashinfer.fused_moe.cute_dsl.swapab_moe import swapab_dispatch_mixed
+
+    group_rows, narrow_tile, row_unit, top_k = 128, 192, 64, 16
+    ids, weights = make_routing(tokens, 896, top_k, local_experts, offset, distribution)
+    source_ids = pack_topk(ids, weights)
+    route_ids = torch.empty_like(ids)
+    route_weights = torch.empty_like(weights, dtype=torch.float32)
+    buffers = allocate_moe_sort_buffers(tokens, 896, top_k, local_experts, group_rows)
+    output = torch.zeros((tokens, 512), dtype=torch.bfloat16, device="cuda")
+    tiles = get_max_num_tiles(tokens, top_k, local_experts, group_rows)
+    plan = _plan_route_preprocess(
+        source_ids,
+        None,
+        output=output,
+        route_ids=route_ids,
+        route_weights=route_weights,
+        moe_sort_buffers=buffers,
+        num_experts=896,
+        num_local_experts=local_experts,
+        local_expert_offset=offset,
+        tile_size=group_rows,
+        _single_tile_per_expert=group_rows >= tokens,
+    )
+    del plan  # the planning run sorted the routing
+    torch.cuda.synchronize()
+    lists = dict(
+        wide_list=torch.full((tiles,), -7, dtype=torch.int32, device="cuda"),
+        wide_count=torch.zeros((1,), dtype=torch.int32, device="cuda"),
+        narrow_list=torch.full((tiles,), -7, dtype=torch.int32, device="cuda"),
+        narrow_count=torch.zeros((1,), dtype=torch.int32, device="cuda"),
+    )
+    swapab_dispatch_mixed(
+        tile_idx_to_expert_idx=buffers["out_tile_idx_to_expert_idx"],
+        tile_idx_to_mn_limit=buffers["out_tile_idx_to_mn_limit"],
+        num_non_exiting_tiles=buffers["out_num_non_exiting_tiles"],
+        group_rows=group_rows,
+        narrow_tile=narrow_tile,
+        row_unit=row_unit,
+        mode=mode,
+        **lists,
+    )
+    torch.cuda.synchronize()
+    n = int(buffers["out_num_non_exiting_tiles"].item())
+    expert = buffers["out_tile_idx_to_expert_idx"][:n].tolist()
+    limit = buffers["out_tile_idx_to_mn_limit"][:n].tolist()
+    wide_ref, narrow_ref, covered = _mixed192_reference(
+        expert, limit, group_rows, narrow_tile, row_unit, mode
+    )
+    assert int(lists["wide_count"].item()) == len(wide_ref)
+    assert int(lists["narrow_count"].item()) == len(narrow_ref)
+    assert lists["wide_list"][: len(wide_ref)].tolist() == wide_ref
+    assert lists["narrow_list"][: len(narrow_ref)].tolist() == narrow_ref
+    assert (lists["wide_list"][len(wide_ref) :] == -7).all()
+    assert (lists["narrow_list"][len(narrow_ref) :] == -7).all()
+    if mode == 0 and distribution != "empty":
+        # Minimal cover beats the pure forms on at least one expert unless
+        # every expert count is a multiple of both tiles.
+        assert len(wide_ref) + len(narrow_ref) <= n
+    for base, end, cover_end in covered:
+        assert base % group_rows == 0 and end <= cover_end
+
+
 def _policy_wrapper(*, ep_size=1, ep_rank=0, moe_tp_size=1, moe_tp_rank=0):
     from flashinfer.fused_moe.cute_dsl.mxfp4 import (
         CuteDslMxfp4MoEWrapper,

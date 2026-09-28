@@ -53,6 +53,7 @@ from .swapab_moe import (
     swap_row_tma,
     swap_two_cta,
     swapab_dispatch,
+    swapab_dispatch_mixed,
     swapab_gemm1_situ,
     swapab_gemm2,
 )
@@ -217,6 +218,15 @@ SWAP_MIXED_SF_PLAIN = os.environ.get("SWAPAB_MIXED_SF_PLAIN", "0") == "1"
 SWAP_WIDE192 = os.environ.get("MXFP4_SWAP192", "0") == "1"
 SWAP_WIDE192_TILE = int(os.environ.get("MXFP4_SWAP192_TILE", "192"))  # measurement arms: 64 / 128
 SWAP_WIDE192_MIN_TOKENS = int(os.environ.get("MXFP4_SWAP192_MIN_TOKENS", "0"))
+# Mixed 192-row form (MXFP4_SWAP192_MIXED=1 with SWAP_WIDE192): 128-row sort
+# groups; per expert ``swapab_dispatch_mixed`` lists dense 128-row tiles
+# first (dense gather GEMM1 and dense finalize GEMM2 over the wide slot
+# list, blocked row scales) and 192-row 2-CTA swap windows behind them
+# (row-group list in 64-row units), covering the fewest rows. Mode 1 / 2:
+# windows only / dense tiles only (measurement arms).
+SWAP_WIDE192_MIXED = os.environ.get("MXFP4_SWAP192_MIXED", "0") == "1"
+SWAP_WIDE192_MIXED_MODE = int(os.environ.get("MXFP4_SWAP192_MIXED_MODE", "0"))
+SWAP_WIDE192_ROW_UNIT = 64
 # Mixed form: weight M-tiles per swap-GEMM2 work item. Measured on B300 (TP8
 # T=256/1024 balanced): with the 128-row groups the GEMM2 of the policy tile
 # loses 6-9 % at m_group 1 and is back at the 32-row-group time with 2.
@@ -943,6 +953,9 @@ class Mxfp4MoESwapAbPlan:
         # Wide 192-row form (SWAP_WIDE192): 2-CTA GEMM1 and GEMM2, fused
         # (atomic) finalize -- its permuted-row partial buffer would be GBs.
         self.wide192 = wrapper._swap_wide192(x.shape[0], self.finalize)
+        # Mixed 192-row form: dense 128-row tiles ahead of the 192-row swap
+        # windows of every expert (SWAP_WIDE192_MIXED).
+        self.mixed192 = wrapper._swap_mixed192(x.shape[0], self.finalize)
         self.split_dense = False  # set by _prepare
         self._side_stream = None
         self._fork_event = self._join_event = None
@@ -951,7 +964,9 @@ class Mxfp4MoESwapAbPlan:
             self._fork_event = torch.cuda.Event()
             self._join_event = torch.cuda.Event()
         self.group_rows = (
-            SWAP_HYBRID_GROUP_ROWS if (self.hybrid or self.mixed) else n_tile
+            SWAP_HYBRID_GROUP_ROWS
+            if (self.hybrid or self.mixed or self.mixed192)
+            else n_tile
         )
         self.two_stage = (
             self.finalize
@@ -1002,7 +1017,7 @@ class Mxfp4MoESwapAbPlan:
         # its first read of a predecessor's output.
         self._pdl = pdl = w.enable_pdl or SWAP_PDL
         self._dep_prefetch = SWAP_DEP_PREFETCH and not (
-            self.split or self.hybrid or self.mixed
+            self.split or self.hybrid or self.mixed or self.mixed192
         )
         x, x_sf, topk_ids, topk_weights, w1, w1_sf, w2, w2_sf = self._inputs
         b = self._buffers
@@ -1156,6 +1171,33 @@ class Mxfp4MoESwapAbPlan:
                     group_rows=self.group_rows,
                     sf_blocked=not (self.mixed and SWAP_MIXED_SF_PLAIN),
                 )
+            if self.mixed192:
+                # Per expert: dense 128-row tiles (wide slot list) then
+                # 192-row swap windows (64-row offsets) covering the fewest
+                # rows; both GEMM1 forms write blocked row scales.
+                swapab_dispatch_mixed(
+                    tile_idx_to_expert_idx=b["out_tile_idx_to_expert_idx"],
+                    tile_idx_to_mn_limit=b["out_tile_idx_to_mn_limit"],
+                    num_non_exiting_tiles=b["out_num_non_exiting_tiles"],
+                    group_rows=self.group_rows,
+                    narrow_tile=self.n_tile,
+                    row_unit=SWAP_WIDE192_ROW_UNIT,
+                    mode=SWAP_WIDE192_MIXED_MODE,
+                    wide_list=b["swap_wide_list"],
+                    wide_count=b["swap_wide_count"],
+                    narrow_list=b["swap_row_groups"],
+                    narrow_count=b["swap_row_group_count"],
+                    enable_pdl=pdl,
+                    _prepared_launches=launches,
+                )
+                self._dispatch, self._dispatch_args = launches["swap_dispatch"]
+                gemm1_lists = dict(
+                    tile_idx_to_row_group=b["swap_row_groups"],
+                    num_non_exiting_tiles=b["swap_row_group_count"],
+                    group_rows=self.group_rows,
+                    row_unit=SWAP_WIDE192_ROW_UNIT,
+                    sf_blocked=True,
+                )
             token_idx = None
             if swap_row_tma(self.n_tile, True):
                 fill_permuted_token_index(
@@ -1301,13 +1343,19 @@ class Mxfp4MoESwapAbPlan:
                     )
                     self._gemm2_wide = wide_launches["swap_gemm2"]
             if (
-                self.hybrid or self.mixed
-            ) and self.group_rows > SWAP_HYBRID_DENSE_MIN_ROWS:
+                (self.hybrid or self.mixed)
+                and self.group_rows > SWAP_HYBRID_DENSE_MIN_ROWS
+            ) or self.mixed192:
                 # Dense gather GEMM1 over the wide list (sort groups with more
-                # than SWAP_HYBRID_DENSE_MIN_ROWS valid rows); it writes the
+                # than SWAP_HYBRID_DENSE_MIN_ROWS valid rows; mixed-192: the
+                # dense tiles ahead of each expert's windows); it writes the
                 # same E4M3 rows and blocked scales the swap sub-tiles write
                 # for the narrow groups, so GEMM2 sees one contiguous layout.
                 gemm1_tactic = w._tactic(num_tokens)[1]
+                if self.mixed192 and gemm1_tactic[0][0] != self.group_rows:
+                    # The dense table's M256 2-CTA tile does not address
+                    # 128-row slots; the M128 N256 tile of its neighbours.
+                    gemm1_tactic = ((self.group_rows, 256), (1, 1), False)
                 if gemm1_tactic[0][0] != self.group_rows:
                     raise ValueError(
                         "mixed-tile GEMM1 tactic tile must match the "
@@ -1381,6 +1429,40 @@ class Mxfp4MoESwapAbPlan:
                 self._prepare_swap_gemm2(
                     w, b, w2, w2_sf, num_tokens, fused_finalize, launches
                 )
+            if self.mixed192:
+                # Dense finalize GEMM2 over the dense 128-row tiles (wide slot
+                # list): route-weighted reduce-add into the same zero-filled
+                # output the 192-row swap GEMM2 reduces its windows into.
+                gemm2_tactic = w._tactic(num_tokens)[2]
+                if gemm2_tactic[0][0] != self.group_rows:
+                    gemm2_tactic = ((self.group_rows, 192), (1, 2), False)
+                wide_launches = {}
+                blockscaled_contiguous_grouped_gemm_finalize_fusion(
+                    a=b["gemm1_out"],
+                    b=w2,
+                    a_scale=b["gemm1_out_scale"],
+                    b_scale=w2_sf,
+                    alpha=b["w2_alpha"],
+                    tile_idx_to_expert_idx=b["out_tile_idx_to_expert_idx"],
+                    num_non_exiting_tiles=b["swap_wide_count"],
+                    tile_idx_to_mn_limit=b["out_tile_idx_to_mn_limit"],
+                    permuted_idx_to_expanded_idx=b["out_permuted_idx_to_expanded_idx"],
+                    token_final_scales=self._route_weights,
+                    out=self.output,
+                    a_dtype="float8_e4m3fn",
+                    b_dtype="float4_e2m1fn",
+                    sf_dtype="float8_e8m0fnu",
+                    sf_vec_size=32,
+                    out_dtype="bfloat16",
+                    mma_tiler_mn=gemm2_tactic[0],
+                    cluster_shape_mn=gemm2_tactic[1],
+                    enable_pdl=pdl,
+                    use_fused_finalize=True,
+                    weight_l2_hint=DENSE_WEIGHT_L2_HINT,
+                    tile_idx_to_row_group=b["swap_wide_list"],
+                    _prepared_launches=wide_launches,
+                )
+                self._gemm2_wide = wide_launches["finalize"]
             self._gemm1, self._gemm1_args = launches["swap_gemm1"]
             self._gemm2, self._gemm2_args = launches["swap_gemm2"]
             if self.two_stage:
@@ -1488,6 +1570,16 @@ class Mxfp4MoESwapAbPlan:
                     group_rows=self.group_rows,
                     sf_blocked=not SWAP_MIXED_SF_PLAIN,
                 )
+            if self.mixed192:
+                # The 192-row windows (64-row offsets) behind each expert's
+                # dense tiles; blocked row scales from both GEMM1 forms.
+                gemm2_lists = dict(
+                    num_non_exiting_tiles=b["swap_row_group_count"],
+                    tile_idx_to_row_group=b["swap_row_groups"],
+                    group_rows=self.group_rows,
+                    row_unit=SWAP_WIDE192_ROW_UNIT,
+                    sf_blocked=True,
+                )
             swapab_gemm2(
                 w2=w2,
                 w2_sf=w2_sf,
@@ -1556,6 +1648,9 @@ class Mxfp4MoESwapAbPlan:
                 compiled, args, kwargs = self._gemm1_dense
                 compiled(*args, stream=stream, **kwargs)
             self._gemm2(*self._gemm2_args, stream=stream)
+            if self.mixed192:
+                compiled, args = self._gemm2_wide
+                compiled(*args, stream=stream)
             if self._side_stream is not None:
                 # Join before the finalize reads the wide GEMM2's output rows
                 # (or before returning, when GEMM2 reduce-adds directly).
@@ -1854,6 +1949,12 @@ class CuteDslMxfp4MoEWrapper:
             and num_tokens >= SWAP_WIDE192_MIN_TOKENS
         )
 
+    def _swap_mixed192(self, num_tokens, do_finalize=True):
+        """Mixed 192-row form (see SWAP_WIDE192_MIXED): the wide form over
+        128-row sort groups with dense 128-row tiles ahead of the 192-row
+        swap windows of every expert."""
+        return SWAP_WIDE192_MIXED and self._swap_wide192(num_tokens, do_finalize)
+
     def _dense_two_stage(self, num_tokens):
         # Dense path: expanded-row GEMM2 output + finalize kernel instead of
         # the bulk reduce-add epilogue (experimental, env-gated).
@@ -1964,8 +2065,10 @@ class CuteDslMxfp4MoEWrapper:
         return wide_groups, rows
 
     def _swap_group_rows(self, num_tokens, do_finalize=True):
-        if self._swap_hybrid(num_tokens, do_finalize) or self._swap_mixed(
-            num_tokens, do_finalize
+        if (
+            self._swap_hybrid(num_tokens, do_finalize)
+            or self._swap_mixed(num_tokens, do_finalize)
+            or self._swap_mixed192(num_tokens, do_finalize)
         ):
             return SWAP_HYBRID_GROUP_ROWS
         return self._swap_tile(num_tokens, do_finalize)
@@ -1977,6 +2080,7 @@ class CuteDslMxfp4MoEWrapper:
             tile = self._swap_tile(num_tokens, do_finalize)
             hybrid = self._swap_hybrid(num_tokens, do_finalize)
             mixed = self._swap_mixed(num_tokens, do_finalize)
+            mixed192 = self._swap_mixed192(num_tokens, do_finalize)
             split = self._swap_split(num_tokens, do_finalize)
             group = self._swap_group_rows(num_tokens, do_finalize)
             tiles = get_max_num_tiles(
@@ -2002,14 +2106,20 @@ class CuteDslMxfp4MoEWrapper:
                     else []
                 ),
                 *(
-                    # Dispatch work lists of the hybrid form.
+                    # Dispatch work lists of the hybrid / mixed-192 forms
+                    # (mixed-192: at most one window or tile per sort group).
                     [
-                        ("swap_row_groups", (tiles * (group // tile),), torch.int32, 4),
+                        (
+                            "swap_row_groups",
+                            (tiles * max(group // tile, 1),),
+                            torch.int32,
+                            4,
+                        ),
                         ("swap_row_group_count", (1,), torch.int32, 4),
                         ("swap_wide_list", (tiles,), torch.int32, 4),
                         ("swap_wide_count", (1,), torch.int32, 4),
                     ]
-                    if (hybrid or mixed)
+                    if (hybrid or mixed or mixed192)
                     else []
                 ),
                 *(

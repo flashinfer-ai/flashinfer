@@ -133,6 +133,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         gather_warps: Optional[int] = None,
         m_group: int = 1,
         group_rows: Optional[int] = None,
+        row_unit: Optional[int] = None,
         sf_blocked: bool = False,
         wide_out: bool = False,
         pdl_trigger_early: bool = False,
@@ -281,10 +282,18 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # groups; expert and row bound are looked up per sort group.
         if group_rows is None:
             group_rows = n_tile
-        if group_rows % n_tile != 0:
-            raise ValueError("group_rows must be a multiple of n_tile")
+        # Row-group list unit: a work item's rows start at
+        # ``row_group * row_unit`` (default ``n_tile``: items are n_tile-row
+        # sub-tiles). The mixed 192-row form lists 64-row offsets, so a
+        # 192-row window can start behind any number of 128-row dense
+        # tiles of the same sort group range; the expert and row bound are
+        # those of the sort group holding the window's first row.
+        if row_unit is None:
+            row_unit = n_tile
+        if group_rows % row_unit != 0 or n_tile % row_unit != 0:
+            raise ValueError("group_rows and n_tile must be multiples of row_unit")
         self.group_rows = int(group_rows)
-        self.row_group_ratio = self.group_rows // n_tile
+        self.row_unit = int(row_unit)
         # SiTU output scales in the tcgen05 block-scaled SFA atom layout
         # (``(32, 4, rows/128, 4, K/128)`` order (2,1,4,0,3)) so a dense
         # contiguous grouped GEMM2 can consume the rows directly, instead of
@@ -1484,7 +1493,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     sched_lookup = sk_group
                     if cutlass.const_expr(tile_idx_to_row_group is not None):
                         sched_row_group = tile_idx_to_row_group[sk_group]
-                        sched_lookup = sched_row_group // self.row_group_ratio
+                        sched_lookup = (
+                            sched_row_group * self.row_unit
+                        ) // self.group_rows
                     expert_idx = tile_idx_to_expert_idx[sched_lookup]
                     mn_limit = tile_idx_to_mn_limit[sched_lookup]
                     if cutlass.const_expr(self.meta_in_sched):
@@ -1501,7 +1512,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                             for mq in cutlass.range_constexpr((n_tile + 31) // 32):
                                 meta_col = mq * 32 + sched_lane
                                 if meta_col < n_tile:
-                                    meta_prow = sched_row_group * n_tile + meta_col
+                                    meta_prow = (
+                                        sched_row_group * self.row_unit + meta_col
+                                    )
                                     if cutlass.const_expr(self.is_finalize):
                                         meta_valid = meta_prow < mn_limit
                                         meta_expanded = permuted_idx_to_expanded_idx[
@@ -1616,7 +1629,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     sched_lookup = sk_group
                     if cutlass.const_expr(tile_idx_to_row_group is not None):
                         sched_row_group = tile_idx_to_row_group[sk_group]
-                        sched_lookup = sched_row_group // self.row_group_ratio
+                        sched_lookup = (
+                            sched_row_group * self.row_unit
+                        ) // self.group_rows
                     expert_idx = tile_idx_to_expert_idx[sched_lookup]
                     mn_limit = tile_idx_to_mn_limit[sched_lookup]
                     if cutlass.const_expr(self.meta_in_sched):
@@ -1633,7 +1648,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                             for mq in cutlass.range_constexpr((n_tile + 31) // 32):
                                 meta_col = mq * 32 + sched_lane
                                 if meta_col < n_tile:
-                                    meta_prow = sched_row_group * n_tile + meta_col
+                                    meta_prow = (
+                                        sched_row_group * self.row_unit + meta_col
+                                    )
                                     if cutlass.const_expr(self.is_finalize):
                                         meta_valid = meta_prow < mn_limit
                                         meta_expanded = permuted_idx_to_expanded_idx[
@@ -1915,7 +1932,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             while is_valid_tile:
                 row_group = tile_info[1]
                 mn_limit = tile_info[4]
-                row_base = row_group * n_tile
+                row_base = row_group * self.row_unit
                 # Source row per (pass, lane): the token row for GEMM1, the
                 # permuted row itself for GEMM2. Rows beyond mn_limit or with a
                 # garbage expanded index are skipped (their columns are dropped).
@@ -2506,7 +2523,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 )
                 if cutlass.const_expr(not self.is_situ):
                     for c in cutlass.range_constexpr(n_tile):
-                        pf_prow = tile_info[1] * n_tile + c
+                        pf_prow = tile_info[1] * self.row_unit + c
                         if cutlass.const_expr(self.is_finalize):
                             pf_valid = pf_prow < tile_info[4]
                             pf_expanded = permuted_idx_to_expanded_idx[pf_prow]
@@ -2551,7 +2568,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 row_group = tile_info[1]
                 expert_idx = tile_info[2]
                 mn_limit = tile_info[4]
-                row_base = row_group * n_tile
+                row_base = row_group * self.row_unit
                 meta_stage = tile_info_consumer_state.index
                 if cutlass.const_expr(self.meta_in_sched):
                     alpha_val = meta_alpha[0]
@@ -2575,7 +2592,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     )
                     if cutlass.const_expr(not self.is_situ):
                         for c in cutlass.range_constexpr(n_tile):
-                            pf_prow = tile_info[1] * n_tile + c
+                            pf_prow = tile_info[1] * self.row_unit + c
                             if cutlass.const_expr(self.is_finalize):
                                 pf_valid = pf_prow < tile_info[4]
                                 pf_expanded = permuted_idx_to_expanded_idx[pf_prow]
