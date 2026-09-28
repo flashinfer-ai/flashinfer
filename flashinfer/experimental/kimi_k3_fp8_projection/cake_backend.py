@@ -529,6 +529,7 @@ def required_kernel_keys(arch: str, sm_count: int = 148) -> tuple[str, ...]:
         quant_kernel_key(4),
         GEMM_KERNEL_KEY,
         GEMM_TSTORE_KERNEL_KEY,
+        GEMM_RSTAGED_KERNEL_KEY,
     ]
     for key in DECODE_TABLE.get(arch, {}):
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
