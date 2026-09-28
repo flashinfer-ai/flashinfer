@@ -332,6 +332,49 @@ def st_shared_b32_pred(addr_i32, v_u32, pred_i32, loc=None, ip=None):
 
 
 @dsl_user_op
+def selp_f32(a_f32, b_f32, cond_i32, loc=None, ip=None):
+    """``cond != 0 ? a : b`` (one ``selp``; exact, no arithmetic)."""
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(a_f32).ir_value(loc=loc, ip=ip),
+                cutlass.Float32(b_f32).ir_value(loc=loc, ip=ip),
+                cutlass.Int32(cond_i32).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t.reg .pred p_;\n\tsetp.ne.b32 p_, $3, 0;\n\tselp.f32 $0, $1, $2, p_;\n}",
+            "=f,f,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
+        )
+    )
+
+
+@dsl_user_op
+def st_async_b32_cluster(remote_addr_i32, v_u32, remote_mbar_i32, loc=None, ip=None):
+    """``st.async`` of one 32-bit word into a peer CTA's shared memory; the
+    peer's mbarrier at ``remote_mbar`` receives ``complete_tx`` of 4 bytes."""
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(remote_addr_i32).ir_value(loc=loc, ip=ip),
+            cutlass.Uint32(v_u32).ir_value(loc=loc, ip=ip),
+            cutlass.Int32(remote_mbar_i32).ir_value(loc=loc, ip=ip),
+        ],
+        "st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [$0], $1, [$2];",
+        "r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
 def st_bf16_pred(dst_gmem, v_f32, pred_i32, loc=None, ip=None):
     """Predicated 2-byte store of an F32 value rounded to BF16."""
     llvm.inline_asm(
