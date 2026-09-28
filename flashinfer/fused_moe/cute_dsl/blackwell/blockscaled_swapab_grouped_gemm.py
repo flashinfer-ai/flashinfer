@@ -125,6 +125,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         num_tile_stages: int = 8,
         meta_in_sched: bool = True,
         perf_probe: int = 0,
+        fin_bufs: int = 4,
         weight_l2_hint: Optional[int] = None,
         row_tma: Optional[bool] = None,
         gather_warps: Optional[int] = None,
@@ -312,6 +313,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # store/reduce, 2 also skips the TMEM accumulator load, 3 skips the
         # gather warp's row-operand cp.async copies (barriers still cycle).
         self.perf_probe = perf_probe
+        if fin_bufs < 2 or (fin_bufs & (fin_bufs - 1)):
+            raise ValueError("fin_bufs must be a power of two >= 2")
+        self.fin_bufs = fin_bufs
         # Optional L2 cache policy (``createpolicy`` encoding) for the weight
         # and weight-scale TMA loads; weights stream once per row group.
         self.weight_l2_hint = weight_l2_hint
@@ -497,7 +501,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         red = 128 * self.n_tile * 4 if self.cluster_split else 16
         # Wide finalize: two 32-token M-major BF16 staging buffers (128 h per
         # token row, rows padded to 272 B so stmatrix rows spread over banks).
-        tr = 2 * 32 * 272 if self.wide_finalize_staging else 0
+        tr = self.fin_bufs * 32 * 272 if self.wide_finalize_staging else 0
         if self.wide_situ_frag:
             # Fragment exchange (32 x 64 threads x 2 buffers F32) + e4m3 [tok][j]
             # staging (2 x 32 rows x 144 B) + SF codes (2 warps x 32 x 2 buffers).
@@ -881,7 +885,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             sTr: cute.struct.Align[
                 cute.struct.MemRange[
                     cutlass.BFloat16,
-                    2 * 32 * 136 if self.wide_finalize_staging else 8,
+                    self.fin_bufs * 32 * 136 if self.wide_finalize_staging else 8,
                 ],
                 128,
             ]
@@ -1260,7 +1264,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             cute.make_layout((2, 32, 2), stride=(32, 1, 64))
         )
         sTr = storage.sTr.get_tensor(
-            cute.make_layout((128, 32, 2), stride=(1, 136, 136 * 32))
+            cute.make_layout((128, 32, self.fin_bufs), stride=(1, 136, 136 * 32))
         )
         sRed = storage.sRed.get_tensor(
             cute.make_layout(
@@ -2495,6 +2499,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
 
 
             inv_fp8_max = cutlass.Float32(1.0 / 448.0)
+            fin_seq = cutlass.Int32(0)
             # Cluster split-K exchange state. The peer's first ``red_empty``
             # wait passes (parity 1 of a fresh barrier), the leader's first
             # ``red_full`` wait needs the first partial (parity 0).
@@ -2708,8 +2713,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 # 16x256b TMEM loads + transposed stmatrix; every 4th thread then
                                 # issues one ``cp.reduce.async.bulk`` for its row (8 rows per warp,
                                 # so the uniform-operand issue loop is 4x shorter than from one
-                                # warp). Two buffers: a row is reused two subtiles later, after
-                                # its issuing thread's older bulk groups finished reading smem.
+                                # warp). ``fin_bufs`` staging buffers keep up to fin_bufs x 32 reduce
+                                # ops in flight per CTA (the async unit is latency-bound per op).
                                 h0 = m_tile_out * 128
                                 fin_row = epi_tidx // 4
                                 is_fin_issuer = (epi_tidx % 4) == 0
@@ -2718,8 +2723,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 ]
                                 tTR_tAcc_m = cute.group_modes(tTR_tAcc_m, 3, cute.rank(tTR_tAcc_m))
                                 for sub in cutlass.range_constexpr(num_sub):
-                                    buf = sub % 2
-                                    cute.arch.cp_async_bulk_wait_group(1, read=True)
+                                    # Buffers cycle across tiles: the group that last read this
+                                    # buffer is ``fin_bufs`` groups back in every thread's FIFO.
+                                    buf = fin_seq % self.fin_bufs
+                                    fin_seq = fin_seq + 1
+                                    cute.arch.cp_async_bulk_wait_group(self.fin_bufs - 1, read=True)
                                     self.epilog_sync_barrier.arrive_and_wait()
                                     if cutlass.const_expr(self.perf_probe < 2):
                                         cute.copy(

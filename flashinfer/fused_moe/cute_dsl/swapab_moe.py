@@ -190,6 +190,9 @@ def swap_two_cta(n_tile: int) -> bool:
 # Stage depth of the 2-CTA GEMM2 (K = intermediate shard): 128-wide stages
 # keep the pair's 29 KB stages deep; ``SWAPAB_KBLOCKS2_2CTA`` overrides.
 SWAP_TWO_CTA_GEMM2_K_BLOCKS = int(os.environ.get("SWAPAB_KBLOCKS2_2CTA", "4"))
+# Wide finalize staging buffers (32-token rows each); more buffers = more bulk
+# reduce ops in flight per CTA. ``SWAPAB_FIN_BUFS`` overrides (power of two).
+SWAP_FIN_BUFS = int(os.environ.get("SWAPAB_FIN_BUFS", "4"))
 
 
 def swap_m_group(n_tile: int, gemm2: bool = False) -> int:
@@ -432,6 +435,7 @@ def _get_compiled_swapab_kernel(
         SWAP_TILE_STAGES,
         SWAP_META_IN_SCHED,
         SWAP_PERF_PROBE,
+        SWAP_FIN_BUFS,
         weight_l2_hint,
         tiled_a,
         # ``zero_output`` is a compile-time specialisation (None vs pointer).
@@ -467,6 +471,7 @@ def _get_compiled_swapab_kernel(
             num_tile_stages=SWAP_TILE_STAGES,
             meta_in_sched=SWAP_META_IN_SCHED,
             perf_probe=SWAP_PERF_PROBE,
+            fin_bufs=SWAP_FIN_BUFS,
             weight_l2_hint=weight_l2_hint,
             row_tma=row_tma,
             gather_warps=gather_warps,
