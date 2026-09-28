@@ -307,6 +307,25 @@ def decode_module_stages(
     )
 
 
+# Co-resident cluster capacity of the cluster split-K decode instances per architecture and cluster size
+# (``cuOccupancyMaxActiveClusters`` of the ``_cs<C>`` instance; one CTA per SM, so it depends only on the GPC topology).
+# A persistent cluster grid larger than ``C x capacity`` serialises whole clusters into a second pass.  Measured on
+# B200 / B300; mirrors the source repository's table.
+DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
+    "sm_100a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15},  # 148 SMs; B300 (sm_103a) pending
+}
+
+
+def decode_cluster_capacity(arch: str, csplit: int) -> int:
+    """Co-resident cluster capacity of ``arch`` for cluster size ``csplit`` (tabulated; raises when not measured)."""
+    table = DECODE_MAX_ACTIVE_CLUSTERS.get(arch, {})
+    if csplit not in table:
+        raise ValueError(
+            f"cluster capacity of {arch} for csplit {csplit} is not tabulated (DECODE_MAX_ACTIVE_CLUSTERS)"
+        )
+    return int(table[csplit])
+
+
 @dataclass(frozen=True)
 class DecodeConfig:
     """Resolved decode route of one ``(M, n_tiles128, num_k_iters)`` on one architecture."""
@@ -329,6 +348,7 @@ class DecodeConfig:
     qlanes: int = (
         16  # lanes per quantization unit (16 = half-warp units, 8 / 4 = narrow units)
     )
+    csplit: int = 1  # round 5: K split across the CTAs of one cluster (== split); the partials meet in SMEM (DSM)
 
     @property
     def tok_rows(self) -> int:
@@ -343,6 +363,7 @@ class DecodeConfig:
             self.resident,
             self.xb_stages,
             self.qlanes,
+            self.csplit,
         )
 
 
@@ -375,6 +396,16 @@ def decode_config(
     tok, split, fused = int(entry["tok"]), int(entry["split"]), bool(entry["fused"])
     persist = bool(entry.get("persist", True))
     split = max(1, min(split, int(num_k_iters)))
+    # Table key ``csplit`` (round 5): the K split runs across the C CTAs of one cluster and the FP32 partials meet
+    # in the owning CTA's shared memory (no gmem partials, no counters); ``split`` == C and the persistent grid is a
+    # whole number of clusters.
+    csplit = int(entry.get("csplit", 1))
+    if csplit > 1:
+        if csplit > 8 or csplit > tok or csplit > int(num_k_iters):
+            raise ValueError(
+                f"decode table entry csplit {csplit} needs 2 <= C <= min(8, tok {tok}, num_k_iters {num_k_iters})"
+            )
+        split = csplit
     tok_rows = max(tok, 32)
     epi_bytes = min(32, tok) * 128 * 4
     xb_bytes = tok * 512
@@ -422,6 +453,9 @@ def decode_config(
     grid = (
         min(total_work, int(entry.get("grid") or sm_count)) if persist else total_work
     )
+    if csplit > 1:
+        # Whole clusters, and no more clusters than the GPCs co-schedule (a second pass of clusters doubles the time).
+        grid = csplit * max(1, min(grid // csplit, decode_cluster_capacity(arch, csplit)))
     resident = (
         bool(entry.get("resident", False))
         and fused
@@ -429,6 +463,7 @@ def decode_config(
         and split == 1
         and tok <= 64
         and -(-total_work // grid) <= DEC_RES_SLOTS
+        and csplit == 1
     )
     if resident:
         xb_stages = 0  # resident tiles are fetched once; no ring
@@ -452,6 +487,7 @@ def decode_config(
         tok_per_cta=-(-tok // split),
         xb_stages=xb_stages,
         qlanes=qlanes,
+        csplit=csplit,
     )
 
 
@@ -674,6 +710,8 @@ def reduction_layout(
     c_off = -(-sf_bytes // 256) * 256
     if cfg is None:
         return c_off, 0, c_off, 0
+    if cfg.csplit > 1:
+        return c_off, 256, c_off + 256, 0  # the cluster exchange keeps its partials in SMEM
     split_cap = min(prepared.num_k_iters, max(cfg.split * 2, 1))
     c_bytes = -(-(cfg.tiles * 2 * 4) // 256) * 256
     p_off = c_off + c_bytes

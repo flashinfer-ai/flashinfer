@@ -1130,6 +1130,7 @@ def decode_kernel_key(
     resident: bool,
     xb_stages: int = 0,
     qlanes: int = 16,
+    csplit: int = 1,
 ) -> str:
     key = f"decode:t{int(tok)}_p{int(stages)}"
     if fused:
@@ -1140,6 +1141,8 @@ def decode_kernel_key(
         key += f"_r{int(xb_stages)}"
     if qlanes != 16:
         key += f"_q{int(qlanes)}"
+    if int(csplit) > 1:
+        key += f"_cs{int(csplit)}"  # round 5: K split across the CTAs of one cluster, DSM partial exchange
     return key
 
 
