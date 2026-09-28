@@ -81,6 +81,10 @@ _ENV_L2HINT = os.environ.get("SWAPAB_L2HINT")
 # L2 policy for the gathered token rows of the swap-AB mainloop (cp.async
 # L2::cache_hint); SWAPAB_TOKEN_L2HINT = none | last (default none until the A/B).
 _TOKEN_L2HINT = _L2_HINTS[os.environ.get("SWAPAB_TOKEN_L2HINT", "none")]
+# Wide finalize GEMM2 (n_tile 192): raster the work items row-group-fastest so
+# each 256-column output window is reduced by every row group while L2-resident
+# (SWAPAB_G2_RASTER_N=1; default weight-chunk-fastest until the A/B).
+SWAP_G2_RASTER_N = os.environ.get("SWAPAB_G2_RASTER_N", "0") == "1"
 
 
 def _resolve_weight_l2_hint(weight_l2_hint: Optional[int]) -> Optional[int]:
@@ -426,7 +430,9 @@ def _get_compiled_swapab_kernel(
     # ``compile_args[16]`` is the optional per-work-item row-group pointer
     # (wrapper position: after ``row_index_ptr``).
     row_group_list = compile_args[16] is not None
+    raster_along_m = not (SWAP_G2_RASTER_N and epilogue_kind != "situ_mxfp8" and n_tile >= 192)
     key = (
+        raster_along_m,
         epilogue_kind,
         n_tile,
         k_blocks_per_stage,
@@ -482,6 +488,7 @@ def _get_compiled_swapab_kernel(
             fin_red=SWAP_FIN_RED,
             weight_l2_hint=weight_l2_hint,
             token_l2_hint=_TOKEN_L2HINT,
+            raster_along_m=raster_along_m,
             row_tma=row_tma,
             gather_warps=gather_warps,
             m_group=m_group,
