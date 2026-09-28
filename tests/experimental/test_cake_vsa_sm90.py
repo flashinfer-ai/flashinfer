@@ -944,3 +944,40 @@ def test_plan_stream_and_graph_lifetime():
             graph2 = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph2):
                 wrapper.run(q, k, v)
+
+
+def _topk_mask(h, mb, nb, k, seed=42):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    idx = torch.rand((h, mb, nb), generator=g).topk(k, dim=-1).indices
+    mask = torch.zeros((h, mb, nb), dtype=torch.bool)
+    mask.scatter_(-1, idx, True)
+    return mask
+
+
+def test_plan_prefers_pair_over_short_split_tiles():
+    # h3, 75648 tokens, K = 32: 16-position tiles.  The split plan has twice
+    # the tiles, each paying the fixed per-tile load and a partial merge; the
+    # pair plan measured 6-12 % faster on H100, so the load model must pick it.
+    mask = _topk_mask(3, 1182, 1182, 32)
+    plan = plan_vsa_sm90(mask, sms=132)
+    assert int(plan["hdr"][3]) & 0xF != 1, "pair plan expected"
+    assert plan["num_tiles"] == 3 * 1182 // 2
+
+
+def test_plan_smaller_grid_only_without_an_extra_tile():
+    # h7, 109632 tokens, K = 64: 5999 pair tiles, 46 per CTA on the full grid.
+    # A smaller grid may take the per-SM rate credit only when its fullest CTA
+    # carries the same number of tiles (128 CTAs x 47-48 measured slower).
+    mask = _topk_mask(7, 1713, 1713, 64)
+    plan = plan_vsa_sm90(mask, mode="pair", sms=132)
+    per_cta = [len(t) for t in _cta_tiles(plan)]
+    assert max(per_cta) == 46 and plan["num_ctas"] >= 131
+
+
+def test_plan_uniform_128_cta_grid():
+    # 7 x 256 pair tiles = 1792 = 14 x 128: the knee model takes 128 CTAs with
+    # the same maximum tile count instead of 132 (measured 1-2 % faster).
+    mask = _topk_mask(7, 512, 512, 64)
+    plan = plan_vsa_sm90(mask, mode="pair", sms=132)
+    per_cta = [len(t) for t in _cta_tiles(plan)]
+    assert plan["num_ctas"] == 128 and max(per_cta) == 14

@@ -99,8 +99,8 @@
         "seqlen_q": "int32",
         "tile_stride": "int32"
       },
-      "source_bytes": 708437,
-      "source_sha256": "fb5132f2d4fb588122612093fc3540562dde43685b4fe7f279ec61dc5d8e0766",
+      "source_bytes": 708471,
+      "source_sha256": "2c83965aafd35f6ef13df647fbb39d49004b2d85b2f7b3382ae0640ab2e1a1e3",
       "stage": "attention",
       "symbol": "vsa_sm90_bf16_fwd",
       "template": "vsa_sm90_bf16_fwd",

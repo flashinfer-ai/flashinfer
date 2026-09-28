@@ -6988,6 +6988,7 @@ def kernel_vsa_sm90_bf16_fwd(Q: cutlass.GridConstant[TensorMap], K: cutlass.Grid
                 o_off_7 = cutlass.Int32(((o_row_base + (m_local_r_3 * 128)) + ((12 + qj) * 8)))
                 _gmem_store_raw_55 = cutlass.Vector.from_elements([cutlass.Uint32(o_vec[0]), cutlass.Uint32(o_vec[1]), cutlass.Uint32(o_vec[2]), cutlass.Uint32(o_vec[3])], cutlass.Uint32)
                 prims.store_ext(_gmem_store_raw_55.ir_value(), O + o_off_7)
+            cute.arch.sync_warp()
             if prims.elect_sync():
                 cute.arch.mbarrier_arrive(meta_empty_addr + slot_m)
     if _cake_ldparam_b64(_hdr__base + 0, 'u64') != cutlass.Uint64(hdr__slot_0):
