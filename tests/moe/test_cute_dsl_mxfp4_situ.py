@@ -1875,7 +1875,9 @@ def test_swapab_dispatch_mixed_follows_dual_tile_routing(
     tiles = alt_tiles * alt_group_rows // group_rows
     # Rows padded to the coarser tile bound the permutation; the base lists
     # are sized by those rows.
-    buffers = allocate_moe_sort_buffers(tokens, 896, top_k, local_experts, alt_group_rows)
+    buffers = allocate_moe_sort_buffers(
+        tokens, 896, top_k, local_experts, alt_group_rows
+    )
     for name in ("out_tile_idx_to_expert_idx", "out_tile_idx_to_mn_limit"):
         buffers[name] = torch.full((tiles,), -3, dtype=torch.int32, device="cuda")
     for name in ("out_alt_tile_idx_to_expert_idx", "out_alt_tile_idx_to_mn_limit"):

@@ -233,7 +233,9 @@ SWAP_WIDE192_LAYOUTS = tuple(
     if x
 )
 SWAP_WIDE192_MIN_TOKENS = int(os.environ.get("MXFP4_SWAP192_MIN_TOKENS", "8192"))
-SWAP_WIDE192_TILE = int(os.environ.get("MXFP4_SWAP192_TILE", "192"))  # measurement arms: 64 / 128
+SWAP_WIDE192_TILE = int(
+    os.environ.get("MXFP4_SWAP192_TILE", "192")
+)  # measurement arms: 64 / 128
 # Mixed 192-row form (MXFP4_SWAP192_MIXED, default on; 0 = the pure 192-row
 # measurement arm with 192-row sort groups): 128-row sort
 # groups; per expert ``swapab_dispatch_mixed`` lists dense 128-row tiles
@@ -1051,7 +1053,9 @@ class Mxfp4MoESwapAbPlan:
         # counters zeroed once and self-resetting, and a zero "other launch
         # tile count" so the launch always fills.
         self._zero_fill_counters = torch.zeros(2, dtype=torch.int32, device=self.device)
-        self._zero_fill_other_tiles = torch.zeros(1, dtype=torch.int32, device=self.device)
+        self._zero_fill_other_tiles = torch.zeros(
+            1, dtype=torch.int32, device=self.device
+        )
         self._gemm1_done_event = None
         self._finalize_rows = None
         # Deferred-finalize outputs (valid after ``run``): row of each
@@ -2531,7 +2535,12 @@ class CuteDslMxfp4MoEWrapper:
                     # Mixed-192 form with the dual-tile routing: the coarser
                     # tile's list, the two active counts and its dense tiles.
                     [
-                        ("out_alt_tile_idx_to_expert_idx", (alt_tiles,), torch.int32, 4),
+                        (
+                            "out_alt_tile_idx_to_expert_idx",
+                            (alt_tiles,),
+                            torch.int32,
+                            4,
+                        ),
                         ("out_alt_tile_idx_to_mn_limit", (alt_tiles,), torch.int32, 4),
                         ("out_alt_num_non_exiting_tiles", (1,), torch.int32, 4),
                         ("out_base_active_num_non_exiting_tiles", (1,), torch.int32, 4),

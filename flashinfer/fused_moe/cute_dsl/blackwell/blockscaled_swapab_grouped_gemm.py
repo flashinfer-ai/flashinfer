@@ -83,13 +83,10 @@ from .custom_pipeline import PipelineCpAsyncUmma
 from .utils import (
     UnalignedNamedBarrier,
     blk_reduce_bf16,
-    pack_bf16x2_f32,
     red_add_bf16x2_pair_pred,
     red_add_v4_bf16x2_pred,
-    st_e4m3_pred,
     st_global_v4_pred,
     st_u8_pred,
-    warp_max_nonneg_f32,
     st_bf16_pred,
     st_bf16_pred_rowaddr,
     mapa_shared_cluster_u32,
@@ -158,7 +155,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             if n_tile % 64 or n_tile < 64:
                 raise ValueError("two_cta needs n_tile in {64, 128, 192}")
             if m_group != 1 or split_k != 1 or cluster_split:
-                raise ValueError("two_cta excludes m_group > 1, split_k and cluster_split")
+                raise ValueError(
+                    "two_cta excludes m_group > 1, split_k and cluster_split"
+                )
             if row_tma:
                 raise ValueError("two_cta loads the row operand with the gather warps")
             row_tma = False
@@ -884,7 +883,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                 128,
             ]
             sCode: cute.struct.Align[
-                cute.struct.MemRange[cutlass.Uint32, 2 * 32 * 2 if self.wide_situ_frag else 4],
+                cute.struct.MemRange[
+                    cutlass.Uint32, 2 * 32 * 2 if self.wide_situ_frag else 4
+                ],
                 16,
             ]
             # Cluster split-K: the peer's partial accumulator (column-major,
@@ -1104,7 +1105,12 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             # Trace-time dump of the fragment mapping (thread x value -> (h, tok)).
             print("[swapab] mmajor t2r:", tiled_copy_t2r)
             print("[swapab] mmajor r2s:", tiled_copy_r2s)
-            print("[swapab] mmajor tTR_cC layout:", tTR_cC.layout, "tRS_rC layout:", tRS_rC.layout)
+            print(
+                "[swapab] mmajor tTR_cC layout:",
+                tTR_cC.layout,
+                "tRS_rC layout:",
+                tRS_rC.layout,
+            )
             print("[swapab] mmajor tRS_sTr layout:", tRS_sTr.layout)
         return (
             tiled_copy_t2r,
@@ -2204,7 +2210,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             ) = self.mainloop_s2t_copy_and_partition(sSFB, tCtSFB_s2t_dst)
             if cutlass.const_expr(os.environ.get("SWAPAB_DEBUG") is not None):
                 print("[swapab] sfb tmem read layout (tiled_mma):", tCtSFB_layout)
-                print("[swapab] sfb tmem full layout (tiled_mma_sfb):", tCtSFB_full_layout)
+                print(
+                    "[swapab] sfb tmem full layout (tiled_mma_sfb):", tCtSFB_full_layout
+                )
                 print("[swapab] sfb s2t tiled copy:", tiled_copy_s2t_sfb)
                 print("[swapab] sfb s2t smem part:", tCsSFB_compact_s2t.layout)
                 print("[swapab] sfb s2t tmem part:", tCtSFB_compact_s2t.layout)
@@ -2551,7 +2559,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                             pf_scale[c] = cutlass.Float32(1.0)
                             pf_tok[c] = pf_prow
 
-
             inv_fp8_max = cutlass.Float32(1.0 / 448.0)
             fin_seq = cutlass.Int32(0)
             # Cluster split-K exchange state. The peer's first ``red_empty``
@@ -2632,7 +2639,6 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     m_tile_out = m_tile * self.cta_v + mma_tile_coord_v
                     acc_slot_e = acc_stage_index * m_group + je
                     if m_tile < num_m_tiles:
-
                         if cutlass.const_expr(self.wide_epi):
                             # ---- wide-tile epilogue (192-row form): streamed 32-column subtiles ----
                             # ``vals`` holds one subtile (32 registers) instead of the whole tile;
@@ -2641,8 +2647,12 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                             # ``cp.reduce.async.bulk`` per token row (the dense kernel's path).
                             epi_n = epi_tile[1]
                             num_sub = n_tile // epi_n
-                            tTR_tAcc = tTR_tAcc_base[(None, None, None, None, None, acc_slot_e)]
-                            tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+                            tTR_tAcc = tTR_tAcc_base[
+                                (None, None, None, None, None, acc_slot_e)
+                            ]
+                            tTR_tAcc = cute.group_modes(
+                                tTR_tAcc, 3, cute.rank(tTR_tAcc)
+                            )
                             vals = cute.make_rmem_tensor((epi_n,), cutlass.Float32)
                             if cutlass.const_expr(self.is_situ):
                                 beta_idx = cutlass.Int32(0)
@@ -2654,9 +2664,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 inv_linear_beta = cutlass.Float32(1.0)
                                 if cutlass.const_expr(self.use_linear_beta):
                                     lb_idx = cutlass.Int32(0)
-                                    if cutlass.const_expr(not self.linear_beta_broadcast):
+                                    if cutlass.const_expr(
+                                        not self.linear_beta_broadcast
+                                    ):
                                         lb_idx = expert_idx
-                                    linear_beta = cutlass.Float32(situ_linear_beta[lb_idx])
+                                    linear_beta = cutlass.Float32(
+                                        situ_linear_beta[lb_idx]
+                                    )
                                     inv_linear_beta = cutlass.Float32(1.0) / linear_beta
                                 # ---- fragment path (rev 4b): 16x256b T2R gives each thread 2 rows x 2
                                 # columns per 8-column group; gate warps hand SiTU(gate) to the up warps in
@@ -2675,8 +2689,19 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 tTR_tAcc_f = tTR_tAcc_f_base[
                                     (None, None, None, None, None, acc_slot_e)
                                 ]
-                                tTR_tAcc_f = cute.group_modes(tTR_tAcc_f, 3, cute.rank(tTR_tAcc_f))
-                                col_groups = [[0, 2, 16, 18], [1, 3, 17, 19], [4, 6, 20, 22], [5, 7, 21, 23], [8, 10, 24, 26], [9, 11, 25, 27], [12, 14, 28, 30], [13, 15, 29, 31]]
+                                tTR_tAcc_f = cute.group_modes(
+                                    tTR_tAcc_f, 3, cute.rank(tTR_tAcc_f)
+                                )
+                                col_groups = [
+                                    [0, 2, 16, 18],
+                                    [1, 3, 17, 19],
+                                    [4, 6, 20, 22],
+                                    [5, 7, 21, 23],
+                                    [8, 10, 24, 26],
+                                    [9, 11, 25, 27],
+                                    [12, 14, 28, 30],
+                                    [13, 15, 29, 31],
+                                ]
                                 shfl_masks = [4, 8, 16]
                                 for sub in cutlass.range_constexpr(num_sub):
                                     buf = sub % 2
@@ -2696,37 +2721,71 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                     * native_tanh_f32(xg * inv_beta)
                                                     * sigmoid_f32(xg, fastmath=True)
                                                 )
-                                            sExchF[(None, None, t64, buf)].store(frag_g.load())
+                                            sExchF[(None, None, t64, buf)].store(
+                                                frag_g.load()
+                                            )
                                             self.epilog_sync_barrier.arrive_and_wait()
                                             self.epilog_sync_barrier.arrive_and_wait()
                                         else:
                                             if cutlass.const_expr(self.use_linear_beta):
                                                 for i in cutlass.range_constexpr(32):
-                                                    frag_vg[i] = linear_beta * native_tanh_f32(
-                                                        frag_vg[i] * inv_linear_beta
+                                                    frag_vg[i] = (
+                                                        linear_beta
+                                                        * native_tanh_f32(
+                                                            frag_vg[i] * inv_linear_beta
+                                                        )
                                                     )
                                             self.epilog_sync_barrier.arrive_and_wait()
                                             gx = sExchF[(None, None, t64, buf)].load()
                                             for i in cutlass.range_constexpr(32):
                                                 frag_vg[i] = frag_vg[i] * gx[i]
-                                            for grp in cutlass.range_constexpr(len(col_groups)):
+                                            for grp in cutlass.range_constexpr(
+                                                len(col_groups)
+                                            ):
                                                 g0 = col_groups[grp]
-                                                a = cute.arch.fmax(frag_vg[g0[0]], -frag_vg[g0[0]])
-                                                for k in cutlass.range_constexpr(1, len(g0)):
+                                                a = cute.arch.fmax(
+                                                    frag_vg[g0[0]], -frag_vg[g0[0]]
+                                                )
+                                                for k in cutlass.range_constexpr(
+                                                    1, len(g0)
+                                                ):
                                                     a = cute.arch.fmax(
-                                                        a, cute.arch.fmax(frag_vg[g0[k]], -frag_vg[g0[k]])
+                                                        a,
+                                                        cute.arch.fmax(
+                                                            frag_vg[g0[k]],
+                                                            -frag_vg[g0[k]],
+                                                        ),
                                                     )
-                                                for k in cutlass.range_constexpr(len(shfl_masks)):
+                                                for k in cutlass.range_constexpr(
+                                                    len(shfl_masks)
+                                                ):
                                                     a = cute.arch.fmax(
-                                                        a, cute.arch.shuffle_sync_bfly(a, shfl_masks[k])
+                                                        a,
+                                                        cute.arch.shuffle_sync_bfly(
+                                                            a, shfl_masks[k]
+                                                        ),
                                                     )
-                                                code_q = float_to_ue8m0_fast(a * inv_fp8_max)
+                                                code_q = float_to_ue8m0_fast(
+                                                    a * inv_fp8_max
+                                                )
                                                 inv_q = ue8m0_to_inv_scale_fast(code_q)
-                                                for k in cutlass.range_constexpr(len(g0)):
-                                                    frag_vg[g0[k]] = frag_vg[g0[k]] * inv_q
+                                                for k in cutlass.range_constexpr(
+                                                    len(g0)
+                                                ):
+                                                    frag_vg[g0[k]] = (
+                                                        frag_vg[g0[k]] * inv_q
+                                                    )
                                                 if is_sf_writer:
-                                                    sCode[(warp_in64, tTR_cC_fg[g0[0]][1], buf)] = code_q
-                                            tTR_rC_f.store(frag_v.load().to(cutlass.Float8E4M3FN))
+                                                    sCode[
+                                                        (
+                                                            warp_in64,
+                                                            tTR_cC_fg[g0[0]][1],
+                                                            buf,
+                                                        )
+                                                    ] = code_q
+                                            tTR_rC_f.store(
+                                                frag_v.load().to(cutlass.Float8E4M3FN)
+                                            )
                                             cute.copy(
                                                 tiled_copy_r2s_f,
                                                 tRS_rC_f,
@@ -2735,15 +2794,27 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                             self.epilog_sync_barrier.arrive_and_wait()
                                         # Row-chunk stores (all 128 threads) + SF bytes (lanes of warps 0/1).
                                         prow = row_base + sub * epi_n + st_tok
-                                        ok = cutlass.Int32(prow < mn_limit) * cutlass.Int32(self.perf_probe != 4)
-                                        w4 = sActW[(None, st_chunk, st_tok, buf)].load()  # 4 x u32 (16 B)
+                                        ok = cutlass.Int32(
+                                            prow < mn_limit
+                                        ) * cutlass.Int32(self.perf_probe != 4)
+                                        w4 = sActW[
+                                            (None, st_chunk, st_tok, buf)
+                                        ].load()  # 4 x u32 (16 B)
                                         st_global_v4_pred(
-                                            cute.domain_offset((prow, j0 + 16 * st_chunk, 0), out),
-                                            w4[0], w4[1], w4[2], w4[3], ok,
+                                            cute.domain_offset(
+                                                (prow, j0 + 16 * st_chunk, 0), out
+                                            ),
+                                            w4[0],
+                                            w4[1],
+                                            w4[2],
+                                            w4[3],
+                                            ok,
                                         )
                                         if epi_tidx < 64:
                                             prow_l = row_base + sub * epi_n + lane
-                                            ok_l = cutlass.Int32(prow_l < mn_limit) * cutlass.Int32(self.perf_probe != 4)
+                                            ok_l = cutlass.Int32(
+                                                prow_l < mn_limit
+                                            ) * cutlass.Int32(self.perf_probe != 4)
                                             code_l = sCode[(warp_in64, lane, buf)]
                                             if cutlass.const_expr(self.sf_blocked):
                                                 sf_dst = cute.domain_offset(
@@ -2758,7 +2829,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                     out_sf,
                                                 )
                                             else:
-                                                sf_dst = cute.domain_offset((prow_l, sf_kb), out_sf)
+                                                sf_dst = cute.domain_offset(
+                                                    (prow_l, sf_kb), out_sf
+                                                )
                                             st_u8_pred(sf_dst, code_l, ok_l)
                                 cute.arch.fence_view_async_tmem_load()
                             else:
@@ -2777,14 +2850,18 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                 tTR_tAcc_m = tTR_tAcc_m_base[
                                     (None, None, None, None, None, acc_slot_e)
                                 ]
-                                tTR_tAcc_m = cute.group_modes(tTR_tAcc_m, 3, cute.rank(tTR_tAcc_m))
+                                tTR_tAcc_m = cute.group_modes(
+                                    tTR_tAcc_m, 3, cute.rank(tTR_tAcc_m)
+                                )
                                 for sub in cutlass.range_constexpr(num_sub):
                                     # Buffers cycle across tiles: the group that last read this
                                     # buffer is ``fin_bufs`` groups back in every thread's FIFO.
                                     buf = fin_seq % self.fin_bufs
                                     fin_seq = fin_seq + 1
                                     if cutlass.const_expr(not self.fin_red):
-                                        cute.arch.cp_async_bulk_wait_group(self.fin_bufs - 1, read=True)
+                                        cute.arch.cp_async_bulk_wait_group(
+                                            self.fin_bufs - 1, read=True
+                                        )
                                     self.epilog_sync_barrier.arrive_and_wait()
                                     if cutlass.const_expr(self.perf_probe < 2):
                                         cute.copy(
@@ -2792,9 +2869,14 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                             tTR_tAcc_m[(None, None, None, sub)],
                                             tTR_rAcc_m,
                                         )
-                                        for i in cutlass.range_constexpr(cute.size(fin_scl_mg)):
+                                        for i in cutlass.range_constexpr(
+                                            cute.size(fin_scl_mg)
+                                        ):
                                             fin_scl_mg[i] = sScale[
-                                                (sub * epi_n + tTR_cC_mg[i][1], meta_stage)
+                                                (
+                                                    sub * epi_n + tTR_cC_mg[i][1],
+                                                    meta_stage,
+                                                )
                                             ]
                                         acc_vec_m = tTR_rAcc_m.load() * fin_scl_m.load()
                                         tTR_rC_m.store(acc_vec_m.to(cutlass.BFloat16))
@@ -2811,26 +2893,50 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                             for k in cutlass.range_constexpr(4):
                                                 tok_s = fin_tok + 8 * k
                                                 prow = row_base + sub * epi_n + tok_s
-                                                ok = cutlass.Int32(prow < mn_limit) * cutlass.Int32(
-                                                    self.perf_probe != 4
-                                                )
-                                                tok = sTok[(sub * epi_n + tok_s, meta_stage)]
-                                                w4 = sTrW[(None, fin_chunk, tok_s, buf)].load()
+                                                ok = cutlass.Int32(
+                                                    prow < mn_limit
+                                                ) * cutlass.Int32(self.perf_probe != 4)
+                                                tok = sTok[
+                                                    (sub * epi_n + tok_s, meta_stage)
+                                                ]
+                                                w4 = sTrW[
+                                                    (None, fin_chunk, tok_s, buf)
+                                                ].load()
                                                 red_add_v4_bf16x2_pred(
-                                                    cute.domain_offset((tok, h0 + 8 * fin_chunk, 0), out),
-                                                    w4[0], w4[1], w4[2], w4[3], ok,
+                                                    cute.domain_offset(
+                                                        (tok, h0 + 8 * fin_chunk, 0),
+                                                        out,
+                                                    ),
+                                                    w4[0],
+                                                    w4[1],
+                                                    w4[2],
+                                                    w4[3],
+                                                    ok,
                                                 )
                                         else:
-                                            cute.arch.fence_proxy("async.shared", space="cta")
+                                            cute.arch.fence_proxy(
+                                                "async.shared", space="cta"
+                                            )
                                             self.epilog_sync_barrier.arrive_and_wait()
                                             if is_fin_issuer:
                                                 prow = row_base + sub * epi_n + fin_row
                                                 # perf_probe 4: stage, but issue no reduce.
-                                                if (prow < mn_limit) & (self.perf_probe != 4):
-                                                    tok = sTok[(sub * epi_n + fin_row, meta_stage)]
-                                                    dst = cute.domain_offset((tok, h0, 0), out)
+                                                if (prow < mn_limit) & (
+                                                    self.perf_probe != 4
+                                                ):
+                                                    tok = sTok[
+                                                        (
+                                                            sub * epi_n + fin_row,
+                                                            meta_stage,
+                                                        )
+                                                    ]
+                                                    dst = cute.domain_offset(
+                                                        (tok, h0, 0), out
+                                                    )
                                                     blk_reduce_bf16(
-                                                        dst, sTr[(None, fin_row, buf)], cutlass.Int32(256)
+                                                        dst,
+                                                        sTr[(None, fin_row, buf)],
+                                                        cutlass.Int32(256),
                                                     )
                                             cute.arch.cp_async_bulk_commit_group()
                                 cute.arch.fence_view_async_tmem_load()
@@ -2847,7 +2953,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                     acc_slot_e,
                                 )
                             ]
-                            tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
+                            tTR_tAcc = cute.group_modes(
+                                tTR_tAcc, 3, cute.rank(tTR_tAcc)
+                            )
                             if cutlass.const_expr(self.perf_probe < 2):
                                 for sub in cutlass.range_constexpr(n_tile // epi_n):
                                     cute.copy(
@@ -2872,10 +2980,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                         cute.arch.mbarrier_wait(
                                             storage.red_empty_mbar.ptr, cs_empty_phase
                                         )
-                                        cs_empty_phase = cutlass.Int32(1) - cs_empty_phase
+                                        cs_empty_phase = (
+                                            cutlass.Int32(1) - cs_empty_phase
+                                        )
                                         for c in cutlass.range_constexpr(n_tile):
                                             st_async_f32_cluster(
-                                                cs_remote_red + cutlass.Int32(4 * 128 * c),
+                                                cs_remote_red
+                                                + cutlass.Int32(4 * 128 * c),
                                                 vals[c],
                                                 cs_remote_full,
                                             )
@@ -2883,7 +2994,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                     else:
                                         if epi_tidx == 0:
                                             cute.arch.mbarrier_arrive_and_expect_tx(
-                                                storage.red_full_mbar.ptr, 128 * n_tile * 4
+                                                storage.red_full_mbar.ptr,
+                                                128 * n_tile * 4,
                                             )
                                         cute.arch.mbarrier_wait(
                                             storage.red_full_mbar.ptr, cs_full_phase
@@ -2936,8 +3048,12 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                     )
                                                     sExch[(epi_tidx - 64, c)] = g
                                             else:
-                                                if cutlass.const_expr(self.use_linear_beta):
-                                                    for c in cutlass.range_constexpr(epi_n):
+                                                if cutlass.const_expr(
+                                                    self.use_linear_beta
+                                                ):
+                                                    for c in cutlass.range_constexpr(
+                                                        epi_n
+                                                    ):
                                                         vals[sub * epi_n + c] = (
                                                             linear_beta
                                                             * native_tanh_f32(
@@ -2960,7 +3076,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                 # One warp == one 32-wide requant group along j.
                                                 for c in cutlass.range_constexpr(epi_n):
                                                     v = amax[c]
-                                                    for sh in cutlass.range_constexpr(5):
+                                                    for sh in cutlass.range_constexpr(
+                                                        5
+                                                    ):
                                                         v = cute.arch.fmax(
                                                             v,
                                                             cute.arch.shuffle_sync_bfly(
@@ -2971,11 +3089,15 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                 for c in cutlass.range_constexpr(epi_n):
                                                     prow = row_base + sub * epi_n + c
                                                     if prow < mn_limit:
-                                                        scale_code = float_to_ue8m0_fast(
-                                                            amax[c] * inv_fp8_max
+                                                        scale_code = (
+                                                            float_to_ue8m0_fast(
+                                                                amax[c] * inv_fp8_max
+                                                            )
                                                         )
-                                                        inv_scale = ue8m0_to_inv_scale_fast(
-                                                            scale_code
+                                                        inv_scale = (
+                                                            ue8m0_to_inv_scale_fast(
+                                                                scale_code
+                                                            )
                                                         )
                                                         q = (
                                                             vals[sub * epi_n + c]
@@ -2995,7 +3117,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                                 out_sf[
                                                                     (
                                                                         prow % 32,
-                                                                        (prow // 32) % 4,
+                                                                        (prow // 32)
+                                                                        % 4,
                                                                         prow // 128,
                                                                         sf_kb % 4,
                                                                         sf_kb // 4,
@@ -3006,10 +3129,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                                 )
                                                             else:
                                                                 # plain (rows, I/32) scale bytes; j // 32
-                                                                out_sf[(prow, sf_kb)] = (
-                                                                    scale_code.to(
-                                                                        cutlass.Uint8
-                                                                    )
+                                                                out_sf[
+                                                                    (prow, sf_kb)
+                                                                ] = scale_code.to(
+                                                                    cutlass.Uint8
                                                                 )
                                             # The exchange buffer is reused by the next subtile.
                                             self.epilog_sync_barrier.arrive_and_wait()

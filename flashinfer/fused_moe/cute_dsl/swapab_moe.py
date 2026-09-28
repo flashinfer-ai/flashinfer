@@ -727,7 +727,8 @@ def swapab_gemm1_situ(
             f"[swapab] gemm1 n_tile={n_tile} two_cta={two_cta} rows_w={rows_w} k={k} "
             f"experts={num_local_experts} groups={tile_idx_to_expert_idx.shape[0]} "
             f"max_active_clusters={max_active_clusters}",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
     use_linear_beta = linear_beta is not None
     if k_blocks_per_stage is None:
@@ -906,7 +907,8 @@ def swapab_gemm2(
             f"[swapab] gemm2 n_tile={n_tile} two_cta={two_cta} rows_w={rows_w} k={k} "
             f"finalize={finalize} groups={tile_idx_to_expert_idx.shape[0]} "
             f"k_blocks={k_blocks_per_stage} max_active_clusters={max_active_clusters}",
-            file=sys.stderr, flush=True,
+            file=sys.stderr,
+            flush=True,
         )
     # Split-K only for the additive finalize epilogue and an evenly divisible
     # stage count; the kernel splits at run time only while the valid work
