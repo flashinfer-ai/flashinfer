@@ -247,7 +247,9 @@ def test_decode_config_rules(arch):
         assert cfg.tiles == n_tiles128 * -(-bucket // cfg.tok)
         assert cfg.total_work == cfg.tiles * cfg.split
         assert cfg.grid == (
-            min(cfg.total_work, SM_COUNT) if cfg.persist else cfg.total_work
+            min(cfg.total_work, int(entry.get("grid") or SM_COUNT))
+            if cfg.persist
+            else cfg.total_work
         )
         assert 1 <= cfg.module_stages <= cfg.stages <= cb.DEC_MAX_STAGES
         if cfg.resident:
@@ -280,13 +282,16 @@ def test_decode_config_round3_fused_rows(arch):
     assert (cfg.tok, cfg.stages, cfg.xb_stages, cfg.qlanes) == (32, 3, 5, 4)
     assert cfg.kernel_key == "decode:t32_p3_fused_r5_q4"
     cfg = decode_config(16384, 1, 28, arch, SM_COUNT)
-    assert (cfg.tok, cfg.split, cfg.stages, cfg.xb_stages, cfg.qlanes) == (
+    # Round 4: split 1 on 128 persistent CTAs (2 balanced work items each) replaces split 4 on 148 (6.9 items each).
+    assert (cfg.tok, cfg.split, cfg.stages, cfg.xb_stages, cfg.qlanes, cfg.grid) == (
         64,
-        4,
+        1,
         2,
         3,
         4,
+        128,
     )
+    assert cfg.total_work == 256
     assert cfg.kernel_key == "decode:t64_p2_fused_r3_q4"
     # 16-token tiles cannot keep eight 4-lane groups busy per stage: the table's 4 lanes widen to 8, coupled staging.
     cfg = decode_config(256, 1, 28, arch, SM_COUNT)

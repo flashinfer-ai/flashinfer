@@ -417,7 +417,11 @@ def decode_config(
     m_tiles = -(-M // tok)
     tiles = int(n_tiles128) * m_tiles
     total_work = tiles * split
-    grid = min(total_work, int(sm_count)) if persist else total_work
+    # Table key ``grid`` (round 4): a balanced persistent CTA count (e.g. 128 CTAs for 256 work items) instead of one
+    # CTA per SM; the round-4 A/B of the 16384-row buckets preferred 128 x 2 items over 148 x 1.73.
+    grid = (
+        min(total_work, int(entry.get("grid") or sm_count)) if persist else total_work
+    )
     resident = (
         bool(entry.get("resident", False))
         and fused
