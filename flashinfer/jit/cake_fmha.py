@@ -26,7 +26,7 @@ CAKE_FMHA_MANIFEST_SHA256 = (
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "a956905a6f5c5f0c0e08bf6c499c991447267dce260cee16d7a6863133bbfc1c"
+    "10a7cbf58884360752d4d91bfd110c35827fc083e391a65477cc740e97cb6dab"
 )
 
 _FLASHINFER_BINDINGS = (
@@ -35,7 +35,7 @@ _FLASHINFER_BINDINGS = (
     "jit/cake_fmha_context_fp8_jit_binding.cu",
     "jit/cake_fmha_context_hd256_jit_binding.cu",
     "jit/cake_fmha_decode_native_bf16_jit_binding.cu",
-    "jit/cake_fmha_decode_balanced_bf16_jit_binding.cu",
+    "jit/cake_fmha_decode_balanced_jit_binding.cu",
     "jit/cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu",
     "jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu",
     "jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu",
@@ -52,7 +52,8 @@ _TARGET_FLAGS = {
 }
 _TARGET_MANIFEST_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
 _DECODE_NATIVE_BF16_JIT_BINDING = "jit/cake_fmha_decode_native_bf16_jit_binding.cu"
-_DECODE_BALANCED_BF16_JIT_BINDING = "jit/cake_fmha_decode_balanced_bf16_jit_binding.cu"
+_DECODE_BALANCED_JIT_BINDING = "jit/cake_fmha_decode_balanced_jit_binding.cu"
+CAKE_FMHA_BALANCED_DTYPES = ("bf16", "fp16")
 CAKE_FMHA_BALANCED_MTP_ROWS = (32, 64)
 _DECODE_NATIVE_BF16_HD256_SMALLM_JIT_BINDING = (
     "jit/cake_fmha_decode_native_bf16_hd256_smallm_jit_binding.cu"
@@ -1252,67 +1253,110 @@ def cake_fmha_balanced_n_rows(q_len: int) -> int:
     if 5 <= q_len <= 8:
         return 64
     raise ValueError(
-        f"balanced BF16 decode serves q_len 1 or 3..8 (packed MTP tiles), got {q_len}"
+        f"balanced decode serves q_len 1 or 3..8 (packed MTP tiles), got {q_len}"
     )
 
 
-def cake_fmha_balanced_component_name(q_len: int) -> str:
-    """Manifest component of the balanced decode kernel serving ``q_len``."""
+def cake_fmha_balanced_component_name(q_len: int, dtype: str = "bf16") -> str:
+    """Manifest component of the balanced decode kernel serving ``q_len`` in ``dtype``."""
 
+    if dtype not in CAKE_FMHA_BALANCED_DTYPES:
+        raise ValueError(
+            f"balanced decode serves the dtypes {CAKE_FMHA_BALANCED_DTYPES}, got {dtype!r}"
+        )
     n_rows = cake_fmha_balanced_n_rows(q_len)
     if n_rows == 0:
-        return "decode_balanced_bf16"
-    return f"decode_balanced_bf16_mtp_n{n_rows}"
+        return f"decode_balanced_{dtype}"
+    return f"decode_balanced_{dtype}_mtp_n{n_rows}"
 
 
-def get_cake_fmha_decode_balanced_bf16_uri(target: CakeFmhaTarget, q_len: int) -> str:
+def get_cake_fmha_decode_balanced_uri(
+    target: CakeFmhaTarget, q_len: int, dtype: str = "bf16"
+) -> str:
     if target not in _TARGET_FLAGS:
         raise ValueError(f"unsupported Cake FMHA target: {target}")
-    component = cake_fmha_balanced_component_name(q_len)
+    component = cake_fmha_balanced_component_name(q_len, dtype)
     return (
         f"cake_fmha_{component}_{target}_q{q_len}"
         f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
     )
 
 
+def get_cake_fmha_decode_balanced_bf16_uri(target: CakeFmhaTarget, q_len: int) -> str:
+    return get_cake_fmha_decode_balanced_uri(target, q_len, "bf16")
+
+
+def get_cake_fmha_decode_balanced_fp16_uri(target: CakeFmhaTarget, q_len: int) -> str:
+    return get_cake_fmha_decode_balanced_uri(target, q_len, "fp16")
+
+
 @functools.cache
-def gen_cake_fmha_decode_balanced_bf16_module(
-    target: CakeFmhaTarget, q_len: int
+def gen_cake_fmha_decode_balanced_module(
+    target: CakeFmhaTarget, q_len: int, dtype: str = "bf16"
 ) -> JitSpec:
-    """Build the on-device load-balanced BF16 decode module for one ``q_len``.
+    """Build the on-device load-balanced decode module for one ``(dtype, q_len)``.
 
     Batch, heads and KV lengths are runtime kernel arguments, so one module
-    serves every shape of a ``q_len``; only the packed-row tile (32/64 rows
-    for q_len 3..8) selects a different manifest component.
+    serves every shape of a ``q_len``; the dtype selects the generated program
+    (the same two Cake ForGen kernels rendered with BF16 or FP16 Q/K/V/O) and only the
+    packed-row tile (32/64 rows for q_len 3..8) selects a different manifest
+    component.  One adapter serves both dtypes (``CAKE_FMHA_BALANCED_FP16``).
     """
 
-    component = cake_fmha_balanced_component_name(q_len)
+    component = cake_fmha_balanced_component_name(q_len, dtype)
     manifest_component = get_cake_fmha_manifest()["components"][component]
     sources = _get_component_sources(
-        component, target, {}, _DECODE_BALANCED_BF16_JIT_BINDING
+        component, target, {}, _DECODE_BALANCED_JIT_BINDING
     )
     n_rows = cake_fmha_balanced_n_rows(q_len)
     spec = gen_jit_spec(
-        name=get_cake_fmha_decode_balanced_bf16_uri(target, q_len),
+        name=get_cake_fmha_decode_balanced_uri(target, q_len, dtype),
         sources=list(sources),
         extra_cuda_cflags=[
             *_TARGET_FLAGS[target],
             "-use_fast_math",
             f"-DQ_LEN={q_len}",
             f"-DCAKE_FMHA_BALANCED_N_ROWS={n_rows}",
+            f"-DCAKE_FMHA_BALANCED_FP16={int(dtype == 'fp16')}",
             f"-DCAKE_FMHA_BALANCED_LAUNCH={manifest_component['launch_binding']}",
         ],
         extra_include_paths=[get_cake_fmha_csrc_dir(), jit_env.FLASHINFER_CSRC_DIR],
     )
-    logger.info("Generated Cake FMHA balanced BF16 decode JIT spec: %s", spec.name)
+    logger.info(
+        "Generated Cake FMHA balanced %s decode JIT spec: %s", dtype.upper(), spec.name
+    )
     return spec
+
+
+def gen_cake_fmha_decode_balanced_bf16_module(
+    target: CakeFmhaTarget, q_len: int
+) -> JitSpec:
+    return gen_cake_fmha_decode_balanced_module(target, q_len, "bf16")
+
+
+def gen_cake_fmha_decode_balanced_fp16_module(
+    target: CakeFmhaTarget, q_len: int
+) -> JitSpec:
+    return gen_cake_fmha_decode_balanced_module(target, q_len, "fp16")
+
+
+@functools.cache
+def load_cake_fmha_decode_balanced_module(
+    target: CakeFmhaTarget, q_len: int, dtype: str = "bf16"
+):
+    module = gen_cake_fmha_decode_balanced_module(target, q_len, dtype).build_and_load()
+    logger.info("Loaded Cake FMHA balanced %s decode module: %s", dtype.upper(), module)
+    return module
 
 
 @functools.cache
 def load_cake_fmha_decode_balanced_bf16_module(target: CakeFmhaTarget, q_len: int):
-    module = gen_cake_fmha_decode_balanced_bf16_module(target, q_len).build_and_load()
-    logger.info("Loaded Cake FMHA balanced BF16 decode module: %s", module)
-    return module
+    return load_cake_fmha_decode_balanced_module(target, q_len, "bf16")
+
+
+@functools.cache
+def load_cake_fmha_decode_balanced_fp16_module(target: CakeFmhaTarget, q_len: int):
+    return load_cake_fmha_decode_balanced_module(target, q_len, "fp16")
 
 
 def get_cake_fmha_decode_native_fp16_nhd_uri(
@@ -2005,6 +2049,7 @@ def load_cake_fmha_compat_module(target: CakeFmhaTarget):
 
 
 __all__ = [
+    "CAKE_FMHA_BALANCED_DTYPES",
     "CAKE_FMHA_FLASHINFER_BINDINGS_SHA256",
     "CAKE_FMHA_FLASHINFER_MATRIX_REVISION",
     "CAKE_FMHA_MANIFEST_SHA256",
@@ -2014,6 +2059,8 @@ __all__ = [
     "gen_cake_fmha_context_nvfp4_module",
     "gen_cake_fmha_compat_module",
     "gen_cake_fmha_decode_balanced_bf16_module",
+    "gen_cake_fmha_decode_balanced_fp16_module",
+    "gen_cake_fmha_decode_balanced_module",
     "gen_cake_fmha_decode_native_bf16_module",
     "gen_cake_fmha_decode_native_fp16_hd512_module",
     "gen_cake_fmha_decode_native_fp16_nhd_module",
@@ -2023,6 +2070,8 @@ __all__ = [
     "get_cake_fmha_compat_uri",
     "get_cake_fmha_csrc_dir",
     "get_cake_fmha_decode_balanced_bf16_uri",
+    "get_cake_fmha_decode_balanced_fp16_uri",
+    "get_cake_fmha_decode_balanced_uri",
     "get_cake_fmha_decode_native_bf16_uri",
     "get_cake_fmha_decode_native_fp16_hd512_uri",
     "get_cake_fmha_decode_native_fp16_nhd_uri",
@@ -2032,6 +2081,8 @@ __all__ = [
     "load_cake_fmha_context_nvfp4_module",
     "load_cake_fmha_compat_module",
     "load_cake_fmha_decode_balanced_bf16_module",
+    "load_cake_fmha_decode_balanced_fp16_module",
+    "load_cake_fmha_decode_balanced_module",
     "load_cake_fmha_decode_native_bf16_module",
     "load_cake_fmha_decode_native_fp16_hd512_module",
     "load_cake_fmha_decode_native_fp16_nhd_module",

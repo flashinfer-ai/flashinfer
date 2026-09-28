@@ -27,6 +27,11 @@ neither arm pays a per-call zero-fill on the stream.
 Usage::
 
     python benchmarks/bench_cake_balanced_gqa_decode.py [--with-trtllm] [--production] [--rows agentx_b16 ...]
+    python benchmarks/bench_cake_balanced_gqa_decode.py --dtype fp16 --with-trtllm [--rows ...]
+
+``--dtype fp16`` times the production ``backend="cake"`` route with FP16 Q/K/V/O
+(the experimental ``balanced_gqa_decode`` API is BF16-only, so the ``balanced``
+column is the production route there and ``--production`` is implied).
 """
 
 import argparse
@@ -106,7 +111,7 @@ ROWS = {
 }
 
 
-def make_inputs(seq_lens, num_kv_heads, q_len, device, seed=0):
+def make_inputs(seq_lens, num_kv_heads, q_len, device, seed=0, dtype=torch.bfloat16):
     gen = torch.Generator(device=device).manual_seed(seed)
     batch = len(seq_lens)
     num_q_heads = GROUP_RATIO * num_kv_heads
@@ -115,13 +120,13 @@ def make_inputs(seq_lens, num_kv_heads, q_len, device, seed=0):
     num_pages = batch * max_pages
     query = torch.randn(
         (batch * q_len, num_q_heads, HEAD_DIM), generator=gen, device=device
-    ).to(torch.bfloat16)
+    ).to(dtype)
     k_cache = torch.randn(
         (num_pages, num_kv_heads, PAGE_SIZE, HEAD_DIM), generator=gen, device=device
-    ).to(torch.bfloat16)
+    ).to(dtype)
     v_cache = torch.randn(
         (num_pages, num_kv_heads, PAGE_SIZE, HEAD_DIM), generator=gen, device=device
-    ).to(torch.bfloat16)
+    ).to(dtype)
     block_tables = (
         torch.randperm(num_pages, generator=gen, device=device)
         .to(torch.int32)
@@ -161,7 +166,16 @@ def main():
         help="also time the production backend='cake' route (eager + graph replay)",
     )
     parser.add_argument("--json", default=None)
+    parser.add_argument(
+        "--dtype",
+        choices=("bf16", "fp16"),
+        default="bf16",
+        help="Q/K/V/O dtype; fp16 times the production route as the balanced column",
+    )
     args = parser.parse_args()
+    dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[args.dtype]
+    if args.dtype == "fp16":
+        args.production = True
     device = torch.device("cuda", 0)
     workspace = torch.empty(
         balanced_gqa_decode_workspace_size(device), dtype=torch.uint8, device=device
@@ -187,31 +201,39 @@ def main():
     for name in args.rows:
         seq_lens, num_kv_heads, q_len = ROWS[name]
         query, k_cache, v_cache, block_tables, seq_lens_dev = make_inputs(
-            seq_lens, num_kv_heads, q_len, device
+            seq_lens, num_kv_heads, q_len, device, dtype=dtype
         )
         out = torch.empty_like(query)
-        runner = prepare_balanced_batch_decode_with_kv_cache(
-            query,
-            (k_cache, v_cache),
-            block_tables,
-            seq_lens_dev,
-            workspace,
-            sm_scale=sm_scale,
-            q_len_per_req=q_len,
-            out=out,
-        )
-        ms = _median_ms(runner)
+        if args.dtype == "bf16":
+            runner = prepare_balanced_batch_decode_with_kv_cache(
+                query,
+                (k_cache, v_cache),
+                block_tables,
+                seq_lens_dev,
+                workspace,
+                sm_scale=sm_scale,
+                q_len_per_req=q_len,
+                out=out,
+            )
+            ms = _median_ms(runner)
+        else:
+            ms = None  # filled from the production route below
         flops = _flops(seq_lens, GROUP_RATIO * num_kv_heads, q_len)
         row = dict(
             row=name,
             batch=len(seq_lens),
             num_kv_heads=num_kv_heads,
             q_len=q_len,
-            balanced_ms=ms,
-            tflops=flops / ms / 1e9,
-            gbps=_bytes(seq_lens, num_kv_heads, q_len) / ms / 1e6,
+            dtype=args.dtype,
         )
-        line = f"{name:<30}{ms:>13.4f}{row['tflops']:>9.1f}{row['gbps']:>8.0f}"
+        line = f"{name:<30}"
+        if ms is not None:
+            row.update(
+                balanced_ms=ms,
+                tflops=flops / ms / 1e9,
+                gbps=_bytes(seq_lens, num_kv_heads, q_len) / ms / 1e6,
+            )
+            line += f"{ms:>13.4f}{row['tflops']:>9.1f}{row['gbps']:>8.0f}"
         kv_cache = None
         counter_buffer = None
         if args.production or args.with_trtllm:
@@ -251,6 +273,15 @@ def main():
             torch.cuda.synchronize()
             production_ms = _median_ms(_production)
             production_graph_ms = _median_ms(_production, use_cuda_graph=True)
+            if ms is None:
+                ms = production_ms
+                out.copy_(production_out)
+                row.update(
+                    balanced_ms=ms,
+                    tflops=flops / ms / 1e9,
+                    gbps=_bytes(seq_lens, num_kv_heads, q_len) / ms / 1e6,
+                )
+                line = f"{name:<30}{ms:>13.4f}{row['tflops']:>9.1f}{row['gbps']:>8.0f}"
             row.update(
                 production_ms=production_ms,
                 production_graph_ms=production_graph_ms,

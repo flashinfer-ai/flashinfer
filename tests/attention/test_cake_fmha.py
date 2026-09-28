@@ -27,6 +27,7 @@ from flashinfer.jit.cake_fmha import (
     gen_cake_fmha_context_fp8_hd256_module,
     gen_cake_fmha_context_nvfp4_module,
     gen_cake_fmha_decode_balanced_bf16_module,
+    gen_cake_fmha_decode_balanced_module,
     gen_cake_fmha_decode_native_bf16_module,
     gen_cake_fmha_decode_native_fp16_hd512_module,
     gen_cake_fmha_decode_native_fp16_nhd_module,
@@ -41,6 +42,7 @@ from flashinfer.jit.cake_fmha import (
     get_cake_fmha_context_fp8_hd256_uri,
     get_cake_fmha_context_nvfp4_uri,
     get_cake_fmha_decode_balanced_bf16_uri,
+    get_cake_fmha_decode_balanced_uri,
     get_cake_fmha_decode_native_bf16_uri,
     get_cake_fmha_decode_native_fp16_hd512_uri,
     get_cake_fmha_decode_native_fp16_nhd_uri,
@@ -880,7 +882,7 @@ def test_cake_fmha_optimized_context_adapters_require_signed_seq_lens(
         ("jit/cake_fmha_context_fp8_jit_binding.cu", 5),
         ("jit/cake_fmha_context_hd256_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_bf16_jit_binding.cu", 3),
-        ("jit/cake_fmha_decode_balanced_bf16_jit_binding.cu", 3),
+        ("jit/cake_fmha_decode_balanced_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_quant_bf16q_jit_binding.cu", 2),
@@ -920,7 +922,7 @@ def test_cake_fmha_typed_launch_adapters_use_typed_tensor_maps(
             ("{q_slot, k_slot, v_slot}",),
         ),
         (
-            "jit/cake_fmha_decode_balanced_bf16_jit_binding.cu",
+            "jit/cake_fmha_decode_balanced_jit_binding.cu",
             ("{q_slot, k_slot, v_slot}",),
         ),
         (
@@ -3055,11 +3057,17 @@ def test_cake_decode_bf16_hd256_smallm_route_is_selected() -> None:
 
 
 def _balanced_decode_kwargs(
-    *, batch_size: int, q_len: int, num_kv_heads: int, seq_lens, sm_count: int = 148
+    *,
+    batch_size: int,
+    q_len: int,
+    num_kv_heads: int,
+    seq_lens,
+    sm_count: int = 148,
+    dtype: torch.dtype = torch.bfloat16,
 ):
     num_q_heads = 8 * num_kv_heads
-    query = torch.empty((batch_size * q_len, num_q_heads, 128), dtype=torch.bfloat16)
-    key = torch.empty((4, num_kv_heads, 16, 128), dtype=torch.bfloat16)
+    query = torch.empty((batch_size * q_len, num_q_heads, 128), dtype=dtype)
+    key = torch.empty((4, num_kv_heads, 16, 128), dtype=dtype)
     value = torch.empty_like(key)
     seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
     max_seq_len = int(seq_lens.max())
@@ -3097,9 +3105,12 @@ def _balanced_decode_kwargs(
     )
 
 
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])
 def test_cake_fmha_balanced_decode_route_owns_long_ragged_gqa8_decode(
-    monkeypatch,
+    monkeypatch, dtype_name
 ) -> None:
+    torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype_name]
+    component = f"decode_balanced_{dtype_name}"
     monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
     monkeypatch.setattr(cake_api, "_smallm_sm_count", lambda device: 148)
     monkeypatch.setattr(
@@ -3126,7 +3137,7 @@ def test_cake_fmha_balanced_decode_route_owns_long_ragged_gqa8_decode(
         200000,
     ]
     kwargs = _balanced_decode_kwargs(
-        batch_size=16, q_len=1, num_kv_heads=1, seq_lens=agentx
+        batch_size=16, q_len=1, num_kv_heads=1, seq_lens=agentx, dtype=torch_dtype
     )
     route = cake_api.select_cake_fmha_decode_route(kwargs["query"].device, **kwargs)
     assert route == cake_api.CakeFmhaDecodeRoute(
@@ -3139,49 +3150,56 @@ def test_cake_fmha_balanced_decode_route_owns_long_ragged_gqa8_decode(
         has_window=False,
         use_scale_ptr=False,
         retain_kv_l2=False,
-        component="decode_balanced_bf16",
+        component=component,
         page_size=16,
     )
     assert cake_api.cake_fmha_route_is_optimized(route)
     assert cake_api._route_components(route) == (
-        "decode_balanced_bf16",
-        "decode_balanced_bf16_mtp_n32",
-        "decode_balanced_bf16_mtp_n64",
+        component,
+        f"{component}_mtp_n32",
+        f"{component}_mtp_n64",
     )
 
     # Packed-row MTP draft lengths 3..8 stay on the balanced route; q_len 2 and
     # 9 fall through to the incumbent grid-stride kernel.
     for q_len in (3, 4, 5, 8):
         mtp = _balanced_decode_kwargs(
-            batch_size=64, q_len=q_len, num_kv_heads=1, seq_lens=[65536] * 64
+            batch_size=64,
+            q_len=q_len,
+            num_kv_heads=1,
+            seq_lens=[65536] * 64,
+            dtype=torch_dtype,
         )
         mtp_route = cake_api.select_cake_fmha_decode_route(mtp["query"].device, **mtp)
-        assert (
-            mtp_route is not None and mtp_route.component == "decode_balanced_bf16"
-        ), q_len
+        assert mtp_route is not None and mtp_route.component == component, q_len
     for q_len in (2, 9):
         other = _balanced_decode_kwargs(
-            batch_size=64, q_len=q_len, num_kv_heads=1, seq_lens=[65536] * 64
+            batch_size=64,
+            q_len=q_len,
+            num_kv_heads=1,
+            seq_lens=[65536] * 64,
+            dtype=torch_dtype,
         )
         other_route = cake_api.select_cake_fmha_decode_route(
             other["query"].device, **other
         )
-        assert other_route is None or other_route.component != "decode_balanced_bf16", (
-            q_len
-        )
+        assert other_route is None or other_route.component != component, q_len
 
-    # Host-metadata band (q_len 1 only): below 32 K KV or below nine
-    # (request, KV head) work tiles the incumbent route keeps the batch.
+    # Host-metadata band (q_len 1 only).  BF16: below 32 K KV or below nine
+    # (request, KV head) work tiles the incumbent grid-stride route keeps the
+    # batch.  FP16 (HND, page 16, GQA-8) has no other optimized route -- the
+    # previous contract was the compat fallback -- so the band admits every shape.
     short = _balanced_decode_kwargs(
-        batch_size=16, q_len=1, num_kv_heads=1, seq_lens=[32767] * 16
+        batch_size=16, q_len=1, num_kv_heads=1, seq_lens=[32767] * 16, dtype=torch_dtype
     )
     short_route = cake_api.select_cake_fmha_decode_route(short["query"].device, **short)
-    assert short_route is not None and short_route.component == "decode_native_bf16"
     few = _balanced_decode_kwargs(
-        batch_size=8, q_len=1, num_kv_heads=1, seq_lens=[65536] * 8
+        batch_size=8, q_len=1, num_kv_heads=1, seq_lens=[65536] * 8, dtype=torch_dtype
     )
     few_route = cake_api.select_cake_fmha_decode_route(few["query"].device, **few)
-    assert few_route is not None and few_route.component == "decode_native_bf16"
+    below_band = "decode_native_bf16" if dtype_name == "bf16" else component
+    assert short_route is not None and short_route.component == below_band
+    assert few_route is not None and few_route.component == below_band
     # The packed MTP tiles take the balanced kernel at every KV length and
     # tile count (1.6-11.8x faster than the grid-stride route on every
     # measured short / few-tile shape).
@@ -3192,15 +3210,20 @@ def test_cake_fmha_balanced_decode_route_owns_long_ragged_gqa8_decode(
         (8, 2, [128, 16]),
     ):
         mtp_small = _balanced_decode_kwargs(
-            batch_size=batch_size, q_len=q_len, num_kv_heads=1, seq_lens=seq_lens
+            batch_size=batch_size,
+            q_len=q_len,
+            num_kv_heads=1,
+            seq_lens=seq_lens,
+            dtype=torch_dtype,
         )
         mtp_small_route = cake_api.select_cake_fmha_decode_route(
             mtp_small["query"].device, **mtp_small
         )
-        assert (
-            mtp_small_route is not None
-            and mtp_small_route.component == "decode_balanced_bf16"
-        ), (q_len, batch_size, seq_lens)
+        assert mtp_small_route is not None and mtp_small_route.component == component, (
+            q_len,
+            batch_size,
+            seq_lens,
+        )
 
     # Fail closed on every field the exported kernels do not serve.
     for mutation in (
@@ -3215,8 +3238,8 @@ def test_cake_fmha_balanced_decode_route_owns_long_ragged_gqa8_decode(
         {"multi_ctas_kv_counter_buffer": torch.zeros(64, dtype=torch.uint8)},
         {
             "batch_size": 1025,
-            "query": torch.empty((1025, 8, 128), dtype=torch.bfloat16),
-            "out": torch.empty((1025, 8, 128), dtype=torch.bfloat16),
+            "query": torch.empty((1025, 8, 128), dtype=torch_dtype),
+            "out": torch.empty((1025, 8, 128), dtype=torch_dtype),
             "seq_lens": torch.full((1025,), 65536, dtype=torch.int32),
             "block_tables": torch.zeros((1025, 4096), dtype=torch.int32),
         },
@@ -3225,9 +3248,7 @@ def test_cake_fmha_balanced_decode_route_owns_long_ragged_gqa8_decode(
         selected = cake_api.select_cake_fmha_decode_route(
             mutated["query"].device, **mutated
         )
-        assert selected is None or selected.component != "decode_balanced_bf16", (
-            mutation
-        )
+        assert selected is None or selected.component != component, mutation
 
 
 def test_cake_fmha_balanced_decode_buffer_sizing_is_shape_independent() -> None:
@@ -3261,30 +3282,42 @@ def test_cake_fmha_balanced_decode_buffer_sizing_is_shape_independent() -> None:
     ):
         assert cake_jit.cake_fmha_balanced_n_rows(q_len) == n_rows
         assert cake_jit.cake_fmha_balanced_component_name(q_len) == component
+        assert cake_jit.cake_fmha_balanced_component_name(
+            q_len, "fp16"
+        ) == component.replace("bf16", "fp16")
     with pytest.raises(ValueError):
         cake_jit.cake_fmha_balanced_n_rows(2)
+    with pytest.raises(ValueError):
+        cake_jit.cake_fmha_balanced_component_name(1, "fp8")
 
 
-def test_cake_fmha_decode_balanced_bf16_jit_selects_the_q_len_component(
-    monkeypatch,
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])
+def test_cake_fmha_decode_balanced_jit_selects_the_q_len_component(
+    monkeypatch, dtype_name
 ) -> None:
     import flashinfer.jit.core as jit_core
 
     monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
-    for q_len, component, n_rows in (
-        (1, "decode_balanced_bf16", 0),
-        (4, "decode_balanced_bf16_mtp_n32", 32),
-        (7, "decode_balanced_bf16_mtp_n64", 64),
-    ):
-        spec = gen_cake_fmha_decode_balanced_bf16_module("sm100a", q_len)
-        assert spec.name == get_cake_fmha_decode_balanced_bf16_uri("sm100a", q_len)
+    for q_len, suffix, n_rows in ((1, "", 0), (4, "_mtp_n32", 32), (7, "_mtp_n64", 64)):
+        component = f"decode_balanced_{dtype_name}{suffix}"
+        spec = gen_cake_fmha_decode_balanced_module("sm100a", q_len, dtype_name)
+        assert spec.name == get_cake_fmha_decode_balanced_uri(
+            "sm100a", q_len, dtype_name
+        )
+        if dtype_name == "bf16":
+            assert spec is gen_cake_fmha_decode_balanced_bf16_module("sm100a", q_len)
+            assert spec.name == get_cake_fmha_decode_balanced_bf16_uri("sm100a", q_len)
         assert {Path(source).name for source in spec.sources} == {
             "default.cu",
             f"cake_fmha_{component}_binding.cu",
-            "cake_fmha_decode_balanced_bf16_jit_binding.cu",
+            "cake_fmha_decode_balanced_jit_binding.cu",
         }
         assert f"-DQ_LEN={q_len}" in spec.extra_cuda_cflags
         assert f"-DCAKE_FMHA_BALANCED_N_ROWS={n_rows}" in spec.extra_cuda_cflags
+        assert (
+            f"-DCAKE_FMHA_BALANCED_FP16={int(dtype_name == 'fp16')}"
+            in spec.extra_cuda_cflags
+        )
         assert (
             f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
             in spec.extra_cuda_cflags
@@ -3331,18 +3364,20 @@ def _balanced_reference_decode(
     return out.to(query.dtype)
 
 
-def _balanced_case(device, *, q_len, num_kv_heads, seq_lens, seed):
+def _balanced_case(
+    device, *, q_len, num_kv_heads, seq_lens, seed, dtype=torch.bfloat16
+):
     generator = torch.Generator(device="cpu").manual_seed(seed)
     batch = len(seq_lens)
     num_q_heads = 8 * num_kv_heads
     pages_per_req = [(s + 15) // 16 for s in seq_lens]
     total_pages = sum(pages_per_req)
     query = torch.randn((batch * q_len, num_q_heads, 128), generator=generator).to(
-        device=device, dtype=torch.bfloat16
+        device=device, dtype=dtype
     )
     kv_cache = torch.randn(
         (total_pages, 2, num_kv_heads, 16, 128), generator=generator
-    ).to(device=device, dtype=torch.bfloat16)
+    ).to(device=device, dtype=dtype)
     max_pages = max(pages_per_req)
     block_tables = torch.zeros((batch, max_pages), dtype=torch.int32)
     order = torch.randperm(total_pages, generator=generator)
@@ -3392,16 +3427,19 @@ _BALANCED_AGENTX = [
         (7, 2, [65536, 32775, 40000, 4103, 12345, 50000, 33000, 70000]),
     ],
 )
-def test_cake_decode_bf16_balanced_route_matches_reference_and_replays(
-    q_len, num_kv_heads, seq_lens
+@pytest.mark.parametrize("dtype_name", ["bf16", "fp16"])
+def test_cake_decode_balanced_route_matches_reference_and_replays(
+    q_len, num_kv_heads, seq_lens, dtype_name
 ) -> None:
     device = torch.device("cuda")
+    torch_dtype = {"bf16": torch.bfloat16, "fp16": torch.float16}[dtype_name]
     query, kv_cache, block_tables, seq_lens_t = _balanced_case(
         device,
         q_len=q_len,
         num_kv_heads=num_kv_heads,
         seq_lens=seq_lens,
         seed=685_000 + q_len,
+        dtype=torch_dtype,
     )
     scale = 128**-0.5
     max_seq_len = max(seq_lens)
@@ -3431,7 +3469,7 @@ def test_cake_decode_bf16_balanced_route_matches_reference_and_replays(
         skip_softmax_threshold_scale_factor=None,
         enable_block_sparse_attention=False,
     )
-    assert route is not None and route.component == "decode_balanced_bf16"
+    assert route is not None and route.component == f"decode_balanced_{dtype_name}"
 
     def run():
         return cake_api.cake_batch_decode_with_kv_cache(

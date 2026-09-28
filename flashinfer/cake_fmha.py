@@ -28,6 +28,7 @@ from .jit.cake_fmha import (
     load_cake_fmha_compat_module,
     load_cake_fmha_decode_native_bf16_hd256_smallm_module,
     load_cake_fmha_decode_balanced_bf16_module,
+    load_cake_fmha_decode_balanced_fp16_module,
     load_cake_fmha_decode_native_bf16_module,
     load_cake_fmha_decode_native_fp16_hd512_module,
     load_cake_fmha_decode_native_fp16_nhd_module,
@@ -431,6 +432,7 @@ class CakeFmhaDecodeRoute:
     retain_kv_l2: bool
     component: Literal[
         "decode_balanced_bf16",
+        "decode_balanced_fp16",
         "decode_native_bf16",
         "decode_native_bf16_hd256_smallm",
         "decode_native_fp16_hd512",
@@ -492,6 +494,11 @@ _PRODUCT_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
         "decode_balanced_bf16_mtp_n32",
         "decode_balanced_bf16_mtp_n64",
     ),
+    "decode_balanced_fp16_v1": (
+        "decode_balanced_fp16",
+        "decode_balanced_fp16_mtp_n32",
+        "decode_balanced_fp16_mtp_n64",
+    ),
     "decode_native_bf16_v1_bece": ("decode_native_bf16",),
     "decode_native_bf16_hd256_smallm_v1": (
         "decode_native_bf16_hd256_smallm_n32_p16",
@@ -529,6 +536,9 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
         "decode_balanced_bf16",
         "decode_balanced_bf16_mtp_n32",
         "decode_balanced_bf16_mtp_n64",
+        "decode_balanced_fp16",
+        "decode_balanced_fp16_mtp_n32",
+        "decode_balanced_fp16_mtp_n64",
         "decode_native_bf16",
         "decode_native_bf16_hd256_smallm_n32_p16",
         "decode_native_bf16_hd256_smallm_n32_p32",
@@ -552,6 +562,7 @@ def _route_components(
     if isinstance(route, CakeFmhaDecodeRoute):
         route_name = {
             "decode_balanced_bf16": "decode_balanced_bf16_v1",
+            "decode_balanced_fp16": "decode_balanced_fp16_v1",
             "decode_native_bf16": "decode_native_bf16_v1_bece",
             "decode_native_bf16_hd256_smallm": "decode_native_bf16_hd256_smallm_v1",
             "decode_native_fp16_hd512": "decode_native_fp16_hd512_v1_66b1",
@@ -641,21 +652,26 @@ def _smallm_sm_count(device: torch.device) -> int:
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
-# On-device load-balanced split-KV BF16 decode (Cake route
-# ``decode_balanced_bf16_v1``).  The band is host metadata only: the caller's
+# On-device load-balanced split-KV decode (Cake routes ``decode_balanced_bf16_v1``
+# and ``decode_balanced_fp16_v1``).  The band is host metadata only: the caller's
 # KV length bound (``max_seq_len``) and the number of (request, KV head) work
-# tiles, per query-length class.  For ``q_len == 1`` the static grid-stride
-# route keeps every tile whole below the band; the packed MTP tiles
+# tiles, per dtype and query-length class.  BF16: for ``q_len == 1`` the static
+# grid-stride route keeps every tile whole below the band; the packed MTP tiles
 # (``q_len`` 3..8) take the balanced kernel at every shape (1.6-11.8x faster
-# than the static route on every measured shape, B200 + GB300).  Values mirror
-# the Cake dispatcher's per-arch ``ROUTE_BAND`` and were set from paired
-# same-input cold-L2 CUPTI measurements on B200 / GB300.
-CAKE_FMHA_BALANCED_ROUTE_BAND: dict[str, dict[str, tuple[int, int]]] = {
+# than the static route on every measured shape, B200 + GB300).  FP16 (HND,
+# page 16, GQA-8) has no other optimized Cake route -- the previous contract was
+# the compat fallback -- so its band admits every shape.  Values mirror the Cake
+# dispatcher's per-arch ``ROUTE_BAND`` and were set from paired same-input
+# cold-L2 CUPTI measurements on B200 / GB300.
+CAKE_FMHA_BALANCED_ROUTE_BAND: dict[str, dict[str, dict[str, tuple[int, int]]]] = {
     "sm100a": {
-        "q1": (32768, 9),
-        "mtp": (1, 1),
+        "bf16": {"q1": (32768, 9), "mtp": (1, 1)},
+        "fp16": {"q1": (1, 1), "mtp": (1, 1)},
     },  # (min KV length bound, min work tiles)
-    "sm103a": {"q1": (32768, 9), "mtp": (1, 1)},
+    "sm103a": {
+        "bf16": {"q1": (32768, 9), "mtp": (1, 1)},
+        "fp16": {"q1": (1, 1), "mtp": (1, 1)},
+    },
 }
 CAKE_FMHA_BALANCED_MAX_REQUESTS = 1024
 CAKE_FMHA_BALANCED_MTP_Q_LENS = (3, 4, 5, 6, 7, 8)
@@ -716,6 +732,7 @@ def cake_fmha_balanced_workspace_bytes(sm_count: int, q_len: int) -> int:
 def _balanced_route_supported(
     target: CakeFmhaTarget,
     *,
+    dtype: str,
     batch_size: int,
     q_len: int,
     num_kv_heads: int,
@@ -724,13 +741,13 @@ def _balanced_route_supported(
     workspace_buffer: torch.Tensor,
     counter_buffer: torch.Tensor | None,
 ) -> bool:
-    """Host-only admission of the on-device load-balanced BF16 decode route."""
+    """Host-only admission of the on-device load-balanced decode route (``dtype`` bf16 / fp16)."""
 
     if q_len != 1 and q_len not in CAKE_FMHA_BALANCED_MTP_Q_LENS:
         return False
     if batch_size > CAKE_FMHA_BALANCED_MAX_REQUESTS:
         return False
-    arch_band = CAKE_FMHA_BALANCED_ROUTE_BAND.get(target)
+    arch_band = CAKE_FMHA_BALANCED_ROUTE_BAND.get(target, {}).get(dtype)
     if arch_band is None:
         return False
     min_kv_len, min_work_tiles = arch_band["q1" if q_len == 1 else "mtp"]
@@ -1292,6 +1309,7 @@ def select_cake_fmha_decode_route(
             and _tma_paged_kv_strides_supported(value_cache)
             and _balanced_route_supported(
                 _cake_fmha_target(device),
+                dtype="bf16",
                 batch_size=batch_size,
                 q_len=q_len,
                 num_kv_heads=num_kv_heads,
@@ -1331,6 +1349,38 @@ def select_cake_fmha_decode_route(
         return None
 
     if dtypes == (torch.float16,) * 4:
+        if (
+            query.is_contiguous()
+            and query.shape[2] == 128
+            and key_cache.shape[2:] == (16, 128)
+            and kv_layout == "HND"
+            and uses_shared_paged_kv_idx
+            and num_q_heads // num_kv_heads == 8
+            and sinks is None
+            and window_left < 0
+            and lse is None
+            and not isinstance(bmm1_scale, torch.Tensor)
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+            and _tma_paged_kv_strides_supported(key_cache)
+            and _tma_paged_kv_strides_supported(value_cache)
+            and _balanced_route_supported(
+                _cake_fmha_target(device),
+                dtype="fp16",
+                batch_size=batch_size,
+                q_len=q_len,
+                num_kv_heads=num_kv_heads,
+                max_seq_len=max_seq_len,
+                sm_count=_smallm_sm_count(device),
+                workspace_buffer=workspace_buffer,
+                counter_buffer=multi_ctas_kv_counter_buffer,
+            )
+        ):
+            # Long-context / ragged FP16 decode: the same on-device balanced
+            # scheduler and physical schedule, traced with FP16 Q/K/V/O.
+            return route("decode_balanced_fp16", selected_page_size=16)
         if (
             query.shape[2] == 128
             and key_cache.shape[2:] == (32, 128)
@@ -1526,6 +1576,7 @@ def _resolve_cake_fmha_decode_module(
         raise RuntimeError("Cake FMHA decode route target does not match the device")
     loader = {
         "decode_balanced_bf16": load_cake_fmha_decode_balanced_bf16_module,
+        "decode_balanced_fp16": load_cake_fmha_decode_balanced_fp16_module,
         "decode_native_bf16": load_cake_fmha_decode_native_bf16_module,
         "decode_native_bf16_hd256_smallm": load_cake_fmha_decode_native_bf16_hd256_smallm_module,
         "decode_native_fp16_hd512": load_cake_fmha_decode_native_fp16_hd512_module,
@@ -1545,7 +1596,7 @@ def _resolve_cake_fmha_decode_module(
         route.num_q_heads,
         route.num_kv_heads,
     )
-    if route.component == "decode_balanced_bf16":
+    if route.component in ("decode_balanced_bf16", "decode_balanced_fp16"):
         return loader(route.target, route.q_len), True
     if route.component == "decode_native_bf16_hd256_smallm":
         group = route.num_q_heads // route.num_kv_heads

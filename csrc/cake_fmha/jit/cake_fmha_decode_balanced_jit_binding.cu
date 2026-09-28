@@ -8,7 +8,8 @@
  *   http://www.apache.org/licenses/LICENSE-2.0
  */
 
-// On-device load-balanced BF16 paged decode (Cake route ``decode_balanced_bf16_v1``).
+// On-device load-balanced BF16 / FP16 paged decode (Cake routes ``decode_balanced_bf16_v1``
+// and ``decode_balanced_fp16_v1``; ``CAKE_FMHA_BALANCED_FP16`` selects the element type).
 //
 // One persistent CTA per SM plans the split-KV schedule on the device from the
 // ``seq_lens`` buffer: a scheduler warp derives the chunk length, buckets the
@@ -58,6 +59,9 @@
 #ifndef CAKE_FMHA_BALANCED_LAUNCH
 #error "CAKE_FMHA_BALANCED_LAUNCH must name the exported launch binding"
 #endif
+#ifndef CAKE_FMHA_BALANCED_FP16
+#error "CAKE_FMHA_BALANCED_FP16 must be supplied by the route-specific JIT (0 = BF16, 1 = FP16)"
+#endif
 
 #if CAKE_FMHA_BALANCED_N_ROWS == 0
 static_assert(Q_LEN == 1, "the eight-row balanced kernel serves q_len == 1");
@@ -77,6 +81,20 @@ namespace cake_fmha {
 namespace {
 
 using tvm::ffi::TensorView;
+
+// Q/K/V/O element type of this instance; the generated programs are the same two
+// Cake ForGen kernels rendered with QKV_DTYPE = bf16 or f16 (one module per dtype and q_len).
+#if CAKE_FMHA_BALANCED_FP16
+using Element = __half;
+constexpr DLDataType kElementDtype = dl_float16;
+constexpr CUtensorMapDataType kTmaDtype = CU_TENSOR_MAP_DATA_TYPE_FLOAT16;
+constexpr char const* kDtypeName = "FP16";
+#else
+using Element = __nv_bfloat16;
+constexpr DLDataType kElementDtype = dl_bfloat16;
+constexpr CUtensorMapDataType kTmaDtype = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+constexpr char const* kDtypeName = "BF16";
+#endif
 
 constexpr int64_t kGroup = 8;              // query heads per KV head (ForGen GQA-8 layout)
 constexpr int64_t kHeadDim = 128;
@@ -332,7 +350,7 @@ void RecordTmaDeviceSlotUses(std::initializer_list<TmaDeviceSlotLease> leases,
 // [batch * Hq, 128]; a box of eight consecutive rows is one GQA group.
 CUtensorMap EncodeTmaQuery(TensorView tensor) {
   TVM_FFI_ICHECK_EQ(tensor.ndim(), 3);
-  TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(tensor.dtype(), kElementDtype);
   TVM_FFI_ICHECK(tensor.IsContiguous());
   TVM_FFI_ICHECK_EQ(tensor.size(2), kHeadDim);
   uint64_t global_dim[3] = {64u, static_cast<uint64_t>(tensor.size(0) * tensor.size(1)), 2u};
@@ -341,7 +359,7 @@ CUtensorMap EncodeTmaQuery(TensorView tensor) {
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm;
   CUresult result = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 3, tensor.data_ptr(), global_dim, global_strides,
+      &tm, kTmaDtype, 3, tensor.data_ptr(), global_dim, global_strides,
       box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
       CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS) << "failed to encode Cake FMHA query tensor map";
@@ -356,7 +374,7 @@ CUtensorMap EncodeTmaQuery(TensorView tensor) {
 // the token box may exceed the token extent.
 CUtensorMap EncodeTmaQuery(TensorView tensor) {
   TVM_FFI_ICHECK_EQ(tensor.ndim(), 3);
-  TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(tensor.dtype(), kElementDtype);
   TVM_FFI_ICHECK(tensor.IsContiguous());
   TVM_FFI_ICHECK_EQ(tensor.size(2), kHeadDim);
   TVM_FFI_ICHECK_GE(tensor.size(1), kGroup);
@@ -368,7 +386,7 @@ CUtensorMap EncodeTmaQuery(TensorView tensor) {
   uint32_t elem_strides[4] = {1u, 1u, 1u, 1u};
   CUtensorMap tm;
   CUresult result = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 4, tensor.data_ptr(), global_dim, global_strides,
+      &tm, kTmaDtype, 4, tensor.data_ptr(), global_dim, global_strides,
       box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
       CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS) << "failed to encode Cake FMHA packed query tensor map";
@@ -381,7 +399,7 @@ CUtensorMap EncodeTmaQuery(TensorView tensor) {
 // production stacked ``kv_cache[:, side]`` views load in place.
 CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
   TVM_FFI_ICHECK_EQ(tensor.ndim(), 4) << name << " must be rank-4 HND paged KV";
-  TVM_FFI_ICHECK_EQ(tensor.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(tensor.dtype(), kElementDtype);
   TVM_FFI_ICHECK_EQ(tensor.size(2), kPageSize);
   TVM_FFI_ICHECK_EQ(tensor.size(3), kHeadDim);
   TVM_FFI_ICHECK_EQ(tensor.stride(3), 1);
@@ -397,7 +415,7 @@ CUtensorMap EncodeTmaPagedKv(TensorView tensor, const char* name) {
   uint32_t elem_strides[5] = {1u, 1u, 1u, 1u, 1u};
   CUtensorMap tm;
   CUresult result = cuTensorMapEncodeTiled(
-      &tm, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 5, tensor.data_ptr(), global_dim, global_strides,
+      &tm, kTmaDtype, 5, tensor.data_ptr(), global_dim, global_strides,
       box_dim, elem_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
       CU_TENSOR_MAP_L2_PROMOTION_NONE, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
   TVM_FFI_ICHECK_EQ(result, CUDA_SUCCESS) << "failed to encode Cake FMHA " << name << " tensor map";
@@ -440,10 +458,10 @@ void cake_paged_attention_decode(
     Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
     int64_t lse_stride_heads, bool enable_block_sparse_attention,
     Optional<TensorView> sparse_mla_top_k_lens) {
-  TVM_FFI_ICHECK_EQ(query.dtype(), dl_bfloat16);
-  TVM_FFI_ICHECK_EQ(key_cache.dtype(), dl_bfloat16);
-  TVM_FFI_ICHECK_EQ(value_cache.dtype(), dl_bfloat16);
-  TVM_FFI_ICHECK_EQ(out.dtype(), dl_bfloat16);
+  TVM_FFI_ICHECK_EQ(query.dtype(), kElementDtype);
+  TVM_FFI_ICHECK_EQ(key_cache.dtype(), kElementDtype);
+  TVM_FFI_ICHECK_EQ(value_cache.dtype(), kElementDtype);
+  TVM_FFI_ICHECK_EQ(out.dtype(), kElementDtype);
   TVM_FFI_ICHECK(query.IsContiguous());
   TVM_FFI_ICHECK_EQ(query.ndim(), 3);
   TVM_FFI_ICHECK_EQ(query.size(2), kHeadDim);
@@ -463,7 +481,7 @@ void cake_paged_attention_decode(
   int64_t const num_kv_heads = key_cache.size(1);
   TVM_FFI_ICHECK_EQ(value_cache.size(1), num_kv_heads);
   TVM_FFI_ICHECK_EQ(num_q_heads, kGroup * num_kv_heads)
-      << "the balanced BF16 decode route serves exactly eight query heads per KV head";
+      << "the balanced " << kDtypeName << " decode route serves exactly eight query heads per KV head";
   TVM_FFI_ICHECK_EQ(key_cache.size(0), value_cache.size(0));
   TVM_FFI_ICHECK_EQ(key_cache.size(2), value_cache.size(2));
   TVM_FFI_ICHECK_EQ(key_cache.size(3), value_cache.size(3));
@@ -556,7 +574,7 @@ void cake_paged_attention_decode(
   unsigned int const grid_x = static_cast<unsigned int>(num_ctas);
 
   cudaError_t status = CAKE_FMHA_BALANCED_LAUNCH(
-      p_q, p_k, p_v, static_cast<__nv_bfloat16*>(out.data_ptr()),
+      p_q, p_k, p_v, static_cast<Element*>(out.data_ptr()),
       static_cast<int*>(block_tables.data_ptr()), static_cast<int*>(seq_lens.data_ptr()),
       partial_o, partial_stats, tile_counters, queue_counters, max_pages_per_seq,
 #if CAKE_FMHA_BALANCED_N_ROWS == 0
@@ -570,7 +588,7 @@ void cake_paged_attention_decode(
       grid_x, 1u, 1u, stream);
   RecordTmaDeviceSlotUses({q_slot, k_slot, v_slot}, stream);
   TVM_FFI_ICHECK_EQ(status, cudaSuccess)
-      << "Cake FMHA balanced BF16 decode launch failed: " << cudaGetErrorString(status);
+      << "Cake FMHA balanced " << kDtypeName << " decode launch failed: " << cudaGetErrorString(status);
 
   (void)lse_stride_tokens;
   (void)lse_stride_heads;
