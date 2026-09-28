@@ -149,9 +149,8 @@ __global__ void __launch_bounds__(kThreads)
 // bound, ``min((g + 1) * group_rows, expert end)``, so the expert's end is
 // the bound of its last group).  Per expert with ``c`` valid rows the kernel
 // picks ``nwide`` dense tiles followed by ``a`` ``narrow_tile``-row windows
-// (``mode`` 0: minimal covered rows ``group_rows * nwide + narrow_tile * a
-// >= c``, ties to fewer windows; 1: dense tiles only; 2: minimal cover with
-// ties to more windows) and emits the dense
+// covering the fewest rows (``group_rows * nwide + narrow_tile * a >= c``,
+// ties to fewer windows) and emits the dense
 // tiles as sort-group indices (``wide_list``) and the windows as row
 // offsets in ``row_unit`` rows (``narrow_list``), both in permutation
 // order.  The windows start ``group_rows``-aligned plus a multiple of
@@ -163,7 +162,7 @@ __global__ void __launch_bounds__(kThreads)
     swapab_dispatch_mixed_kernel(const int32_t* __restrict__ expert_idx,
                                  const int32_t* __restrict__ mn_limit,
                                  const int32_t* __restrict__ num_groups_ptr, int32_t group_rows,
-                                 int32_t narrow_tile, int32_t row_unit, int32_t mode,
+                                 int32_t narrow_tile, int32_t row_unit,
                                  int32_t* __restrict__ wide_list, int32_t* __restrict__ wide_count,
                                  int32_t* __restrict__ narrow_list,
                                  int32_t* __restrict__ narrow_count) {
@@ -181,31 +180,42 @@ __global__ void __launch_bounds__(kThreads)
     int nwide = 0, nnarrow = 0;
     if (g < num_groups) {
       // The first group of an expert owns the expert's whole row range,
-      // bounded by the last group of the run of equal expert indices.
+      // bounded by the last group of the run of equal expert indices.  The
+      // sort writes the groups in expert order, so the run end is found by a
+      // binary search over the non-decreasing expert indices.
       const int e = expert_idx[g];
       const bool first = (g == 0) || (expert_idx[g - 1] != e);
       int c = 0;
       if (first) {
-        int last = g;
-        while (last + 1 < num_groups && expert_idx[last + 1] == e) ++last;
-        c = max(mn_limit[last] - g * group_rows, 0);
+        int lo = g + 1, hi = num_groups;  // first index with a different expert in [lo, hi]
+        while (lo < hi) {
+          const int mid = lo + ((hi - lo) >> 1);
+          if (expert_idx[mid] == e) {
+            lo = mid + 1;
+          } else {
+            hi = mid;
+          }
+        }
+        c = max(mn_limit[lo - 1] - g * group_rows, 0);
       }
       if (c > 0) {
-        if (mode == 1) {
-          nwide = (c + group_rows - 1) / group_rows;
-        } else {
-          int best_cover = 0x7fffffff;
-          for (int a = 0;; ++a) {
-            const int rem = c - a * narrow_tile;
-            const int w = rem > 0 ? (rem + group_rows - 1) / group_rows : 0;
-            const int cover = w * group_rows + a * narrow_tile;
-            if (cover < best_cover || (cover == best_cover && mode == 2)) {
-              best_cover = cover;
-              nwide = w;
-              nnarrow = a;
-            }
-            if (rem <= 0) break;
+        // Minimal cover by wide (group_rows) tiles and narrow windows, ties to
+        // fewer windows.  cover(a + gu) == cover(a) for gu = group_rows /
+        // row_unit, so a in [0, gu) suffices: with 128-row groups and 192-row
+        // windows the cover is ceil(c / 64) * 64 (at least one wide tile) and
+        // at most one window per expert.
+        const int gu = group_rows / row_unit;
+        int best_cover = 0x7fffffff;
+        for (int a = 0; a < gu; ++a) {
+          const int rem = c - a * narrow_tile;
+          const int w = rem > 0 ? (rem + group_rows - 1) / group_rows : 0;
+          const int cover = w * group_rows + a * narrow_tile;
+          if (cover < best_cover) {
+            best_cover = cover;
+            nwide = w;
+            nnarrow = a;
           }
+          if (rem <= 0) break;
         }
       }
     }
@@ -271,14 +281,12 @@ void moe_swapab_dispatch(int64_t mn_limit_ptr, int64_t num_groups_ptr, int64_t g
 
 void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int64_t num_groups_ptr,
                                int64_t group_rows, int64_t narrow_tile, int64_t row_unit,
-                               int64_t mode, int64_t wide_list_ptr, int64_t wide_count_ptr,
+                               int64_t wide_list_ptr, int64_t wide_count_ptr,
                                int64_t narrow_list_ptr, int64_t narrow_count_ptr, bool use_pdl,
                                int64_t cuda_stream_ptr) {
   TVM_FFI_ICHECK(row_unit > 0 && group_rows > 0 && narrow_tile > 0 &&
                  group_rows % row_unit == 0 && narrow_tile % row_unit == 0)
       << "group_rows and narrow_tile must be positive multiples of row_unit";
-  TVM_FFI_ICHECK(mode >= 0 && mode <= 2)
-      << "mode must be 0 (minimal cover), 1 (tiles) or 2 (minimal cover, ties to windows)";
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   cudaLaunchConfig_t config{};
@@ -298,7 +306,7 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
       reinterpret_cast<const int32_t*>(mn_limit_ptr),
       reinterpret_cast<const int32_t*>(num_groups_ptr), static_cast<int32_t>(group_rows),
       static_cast<int32_t>(narrow_tile), static_cast<int32_t>(row_unit),
-      static_cast<int32_t>(mode), reinterpret_cast<int32_t*>(wide_list_ptr),
+      reinterpret_cast<int32_t*>(wide_list_ptr),
       reinterpret_cast<int32_t*>(wide_count_ptr), reinterpret_cast<int32_t*>(narrow_list_ptr),
       reinterpret_cast<int32_t*>(narrow_count_ptr));
   TVM_FFI_ICHECK(err == cudaSuccess)

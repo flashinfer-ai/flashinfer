@@ -222,11 +222,9 @@ SWAP_WIDE192_MIN_TOKENS = int(os.environ.get("MXFP4_SWAP192_MIN_TOKENS", "0"))
 # groups; per expert ``swapab_dispatch_mixed`` lists dense 128-row tiles
 # first (dense gather GEMM1 and dense finalize GEMM2 over the wide slot
 # list, blocked row scales) and 192-row 2-CTA swap windows behind them
-# (row-group list in 64-row units), covering the fewest rows. Mode 1: dense
-# tiles only (measurement arm; the pure 192-row form is MXFP4_SWAP192_MIXED=0);
-# mode 2: fewest rows with ties to more windows.
+# (row-group list in 64-row units), covering the fewest rows (ceil(c / 64) * 64
+# per expert, at most one window; the pure 192-row form is MXFP4_SWAP192_MIXED=0).
 SWAP_WIDE192_MIXED = os.environ.get("MXFP4_SWAP192_MIXED", "0") == "1"
-SWAP_WIDE192_MIXED_MODE = int(os.environ.get("MXFP4_SWAP192_MIXED_MODE", "0"))
 SWAP_WIDE192_ROW_UNIT = 64
 # GEMM2 of the mixed form: ``split`` = 192-row swap finalize over the windows
 # + dense finalize over the dense tiles; ``dense`` = the dense finalize over
@@ -1217,7 +1215,6 @@ class Mxfp4MoESwapAbPlan:
                     group_rows=self.group_rows,
                     narrow_tile=self.n_tile,
                     row_unit=SWAP_WIDE192_ROW_UNIT,
-                    mode=SWAP_WIDE192_MIXED_MODE,
                     wide_list=b["swap_wide_list"],
                     wide_count=b["swap_wide_count"],
                     narrow_list=b["swap_row_groups"],

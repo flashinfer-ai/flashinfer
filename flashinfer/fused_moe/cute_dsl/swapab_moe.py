@@ -318,7 +318,6 @@ def swapab_dispatch_mixed(
     wide_count: torch.Tensor,
     narrow_list: torch.Tensor,
     narrow_count: torch.Tensor,
-    mode: int = 0,
     enable_pdl: bool = False,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> None:
@@ -326,16 +325,14 @@ def swapab_dispatch_mixed(
     ``nwide`` dense ``group_rows``-row tiles (``wide_list``: sort group
     indices) followed by ``a`` ``narrow_tile``-row swap windows
     (``narrow_list``: row offsets in ``row_unit`` rows, the swap kernel's
-    ``tile_idx_to_row_group`` with ``row_unit``), ``mode`` 0 minimising the
-    covered rows (ties to fewer windows; the cover never exceeds the
-    expert's own sort groups), 1 dense tiles only, 2 minimal cover with
-    ties to more windows. Both lists are in
+    ``tile_idx_to_row_group`` with ``row_unit``) covering the fewest rows
+    (ties to fewer windows; the cover never exceeds the expert's own sort
+    groups, and with 128-row groups and 192-row windows it is
+    ``ceil(c / 64) * 64`` with at most one window per expert). Both lists are in
     permutation order and hold at most one entry per sort group. Single
     CTA, graph-capturable."""
     if group_rows % row_unit or narrow_tile % row_unit:
         raise ValueError("group_rows and narrow_tile must be multiples of row_unit")
-    if mode not in (0, 1, 2):
-        raise ValueError("mode must be 0, 1 or 2")
     groups = tile_idx_to_mn_limit.shape[0]
     if tile_idx_to_expert_idx.shape[0] != groups:
         raise ValueError("tile_idx_to_expert_idx and tile_idx_to_mn_limit must match")
@@ -360,7 +357,6 @@ def swapab_dispatch_mixed(
         int(group_rows),
         int(narrow_tile),
         int(row_unit),
-        int(mode),
         wide_list.data_ptr(),
         wide_count.data_ptr(),
         narrow_list.data_ptr(),

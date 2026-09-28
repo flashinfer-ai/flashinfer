@@ -1716,7 +1716,7 @@ def test_fused_routing_dispatch_lists_match_dispatch_kernel(
         check(expect_wide=False)
 
 
-def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit, mode):
+def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit):
     """Host reference of ``swapab_dispatch_mixed``: per expert (a run of
     sort groups with one expert index; each group's bound is its own clipped
     ``min((g + 1) * group_rows, expert end)``) the dense tiles first, then
@@ -1732,17 +1732,16 @@ def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit, mode):
         assert rows > 0 and groups == -(-rows // group_rows)
         for j in range(groups):
             assert int(limit[g + j]) == min(base + (j + 1) * group_rows, base + rows)
-        if mode == 1:
-            best = (groups, 0)
-        else:
-            candidates = []
-            for a in range(-(-rows // narrow_tile) + 1):
-                w = max(0, -(-(rows - a * narrow_tile) // group_rows))
-                tie = -a if mode == 2 else a
-                candidates.append((w * group_rows + a * narrow_tile, tie, a, w))
-            _, _, a, w = min(candidates)
-            best = (w, a)
-        w, a = best
+        # Exhaustive search over the window count; the kernel uses the
+        # closed form (a in [0, group_rows / row_unit)).
+        candidates = []
+        for a in range(-(-rows // narrow_tile) + 1):
+            w = max(0, -(-(rows - a * narrow_tile) // group_rows))
+            candidates.append((w * group_rows + a * narrow_tile, a, w))
+        _, a, w = min(candidates)
+        if group_rows == 128 and narrow_tile == 192 and row_unit == 64:
+            assert w * group_rows + a * narrow_tile == max(-(-rows // 64) * 64, 128)
+            assert a <= 1
         wide += [g + j for j in range(w)]
         first = base + w * group_rows
         narrow += [(first + i * narrow_tile) // row_unit for i in range(a)]
@@ -1754,7 +1753,6 @@ def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit, mode):
     return wide, narrow, covered
 
 
-@pytest.mark.parametrize("mode", [0, 1, 2])
 @pytest.mark.parametrize(
     "tokens, local_experts, offset, distribution",
     [
@@ -1765,7 +1763,7 @@ def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit, mode):
     ],
 )
 def test_swapab_dispatch_mixed_matches_reference(
-    tokens, local_experts, offset, distribution, mode
+    tokens, local_experts, offset, distribution
 ):
     """``swapab_dispatch_mixed`` lists every expert's dense 128-row tiles
     ahead of its 192-row windows (64-row offsets) in permutation order,
@@ -1815,7 +1813,6 @@ def test_swapab_dispatch_mixed_matches_reference(
         group_rows=group_rows,
         narrow_tile=narrow_tile,
         row_unit=row_unit,
-        mode=mode,
         **lists,
     )
     torch.cuda.synchronize()
@@ -1823,7 +1820,7 @@ def test_swapab_dispatch_mixed_matches_reference(
     expert = buffers["out_tile_idx_to_expert_idx"][:n].tolist()
     limit = buffers["out_tile_idx_to_mn_limit"][:n].tolist()
     wide_ref, narrow_ref, covered = _mixed192_reference(
-        expert, limit, group_rows, narrow_tile, row_unit, mode
+        expert, limit, group_rows, narrow_tile, row_unit
     )
     assert int(lists["wide_count"].item()) == len(wide_ref)
     assert int(lists["narrow_count"].item()) == len(narrow_ref)
@@ -1831,7 +1828,7 @@ def test_swapab_dispatch_mixed_matches_reference(
     assert lists["narrow_list"][: len(narrow_ref)].tolist() == narrow_ref
     assert (lists["wide_list"][len(wide_ref) :] == -7).all()
     assert (lists["narrow_list"][len(narrow_ref) :] == -7).all()
-    if mode == 0 and distribution != "empty":
+    if distribution != "empty":
         # Minimal cover beats the pure forms on at least one expert unless
         # every expert count is a multiple of both tiles.
         assert len(wide_ref) + len(narrow_ref) <= n
