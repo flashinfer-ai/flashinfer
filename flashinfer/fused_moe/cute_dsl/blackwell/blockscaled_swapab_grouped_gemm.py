@@ -286,8 +286,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # ``row_group * row_unit`` (default ``n_tile``: items are n_tile-row
         # sub-tiles). The mixed 192-row form lists 64-row offsets, so a
         # 192-row window can start behind any number of 128-row dense
-        # tiles of the same sort group range; the expert and row bound are
-        # those of the sort group holding the window's first row.
+        # tiles of the same sort group range; the expert is that of the
+        # sort group holding the window's first row and the row bound that
+        # of the group holding its last row (each group's bound is its own
+        # clipped ``min((g + 1) * group_rows, expert end)``; the window never
+        # leaves the expert's groups).
         if row_unit is None:
             row_unit = n_tile
         if group_rows % row_unit != 0 or n_tile % row_unit != 0:
@@ -1491,13 +1494,17 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
                     sched_row_group = sk_group
                     sched_lookup = sk_group
+                    sched_lookup_limit = sk_group
                     if cutlass.const_expr(tile_idx_to_row_group is not None):
                         sched_row_group = tile_idx_to_row_group[sk_group]
                         sched_lookup = (
                             sched_row_group * self.row_unit
                         ) // self.group_rows
+                        sched_lookup_limit = (
+                            sched_row_group * self.row_unit + n_tile - 1
+                        ) // self.group_rows
                     expert_idx = tile_idx_to_expert_idx[sched_lookup]
-                    mn_limit = tile_idx_to_mn_limit[sched_lookup]
+                    mn_limit = tile_idx_to_mn_limit[sched_lookup_limit]
                     if cutlass.const_expr(self.meta_in_sched):
                         # Epilogue metadata for this tile: the scheduler warp
                         # runs tiles ahead, so the dependent route lookups
@@ -1627,13 +1634,17 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     tile_info_pipeline.producer_acquire(tile_info_producer_state)
                     sched_row_group = sk_group
                     sched_lookup = sk_group
+                    sched_lookup_limit = sk_group
                     if cutlass.const_expr(tile_idx_to_row_group is not None):
                         sched_row_group = tile_idx_to_row_group[sk_group]
                         sched_lookup = (
                             sched_row_group * self.row_unit
                         ) // self.group_rows
+                        sched_lookup_limit = (
+                            sched_row_group * self.row_unit + n_tile - 1
+                        ) // self.group_rows
                     expert_idx = tile_idx_to_expert_idx[sched_lookup]
-                    mn_limit = tile_idx_to_mn_limit[sched_lookup]
+                    mn_limit = tile_idx_to_mn_limit[sched_lookup_limit]
                     if cutlass.const_expr(self.meta_in_sched):
                         # Epilogue metadata for this tile: the scheduler warp
                         # runs tiles ahead, so the dependent route lookups

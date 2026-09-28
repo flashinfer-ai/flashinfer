@@ -1717,19 +1717,21 @@ def test_fused_routing_dispatch_lists_match_dispatch_kernel(
 
 
 def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit, mode):
-    """Host reference of ``swapab_dispatch_mixed``: per expert the dense tiles
-    first, then the windows, covering the fewest rows (ties to fewer windows)."""
+    """Host reference of ``swapab_dispatch_mixed``: per expert (a run of
+    sort groups with one expert index; each group's bound is its own clipped
+    ``min((g + 1) * group_rows, expert end)``) the dense tiles first, then
+    the windows, covering the fewest rows (ties to fewer windows)."""
     wide, narrow, covered = [], [], []
     g, n = 0, len(expert)
     while g < n:
         base = g * group_rows
-        rows = int(limit[g]) - base
-        assert rows > 0
-        groups = -(-rows // group_rows)
+        groups = 1
+        while g + groups < n and int(expert[g + groups]) == int(expert[g]):
+            groups += 1
+        rows = int(limit[g + groups - 1]) - base
+        assert rows > 0 and groups == -(-rows // group_rows)
         for j in range(groups):
-            assert int(expert[g + j]) == int(expert[g])
-            assert int(limit[g + j]) == int(limit[g])
-        assert g + groups == n or int(expert[g + groups]) != int(expert[g])
+            assert int(limit[g + j]) == min(base + (j + 1) * group_rows, base + rows)
         if mode == 1:
             best = (groups, 0)
         else:

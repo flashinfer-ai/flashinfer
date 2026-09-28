@@ -145,8 +145,9 @@ __global__ void __launch_bounds__(kThreads)
 // Mixed-width work lists for the wide (2-CTA, ``narrow_tile``-row) swap-AB
 // kernel plus dense ``group_rows``-row tiles, both over one ``moe_sort``
 // permutation with ``group_rows``-row groups (expert bases are
-// ``group_rows``-aligned, ``mn_limit`` of every group of an expert is the
-// expert's exclusive row bound).  Per expert with ``c`` valid rows the kernel
+// ``group_rows``-aligned; ``mn_limit[g]`` is the group's own exclusive row
+// bound, ``min((g + 1) * group_rows, expert end)``, so the expert's end is
+// the bound of its last group).  Per expert with ``c`` valid rows the kernel
 // picks ``nwide`` dense tiles followed by ``a`` ``narrow_tile``-row windows
 // (``mode`` 0: minimal covered rows ``group_rows * nwide + narrow_tile * a
 // >= c``, ties to fewer windows; 1: dense tiles only) and emits the dense
@@ -178,9 +179,16 @@ __global__ void __launch_bounds__(kThreads)
     const int g = base_g + static_cast<int>(threadIdx.x);
     int nwide = 0, nnarrow = 0;
     if (g < num_groups) {
-      // The first group of an expert owns the expert's whole row range.
-      const bool first = (g == 0) || (expert_idx[g - 1] != expert_idx[g]);
-      const int c = first ? max(mn_limit[g] - g * group_rows, 0) : 0;
+      // The first group of an expert owns the expert's whole row range,
+      // bounded by the last group of the run of equal expert indices.
+      const int e = expert_idx[g];
+      const bool first = (g == 0) || (expert_idx[g - 1] != e);
+      int c = 0;
+      if (first) {
+        int last = g;
+        while (last + 1 < num_groups && expert_idx[last + 1] == e) ++last;
+        c = max(mn_limit[last] - g * group_rows, 0);
+      }
       if (c > 0) {
         if (mode == 1) {
           nwide = (c + group_rows - 1) / group_rows;
