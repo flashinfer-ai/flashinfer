@@ -293,6 +293,7 @@ def main() -> None:
                 extra_topk_length,
                 cpb,
                 stage1_only,
+                1.0,
             )
 
         if args.probe_prefill_kernel:
@@ -312,6 +313,7 @@ def main() -> None:
                     nvfp4_extra_cache,
                     extra_indices,
                     None,
+                    1.0,
                 )
 
             prefill_cta_us = _median_us(
@@ -378,6 +380,7 @@ def main() -> None:
                         None,
                         section_splits,
                         False,
+                        1.0,
                     )
                     return section_out, section_lse
 

@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Online (warmup-time) knob autotuning for the SM90 Hopper FP8 MegaMoE frontend.
 
-Sibling-fork mirror of ``kernel_src/cutedsl_megamoe/shim/autotune.py``: times
+Sibling-fork mirror of ``kernel_src/sm100/cutedsl_megamoe/shim/autotune.py``: times
 a curated candidate knob set on the live problem and applies the winner to
 the session's frontend, replacing the token-bucket heuristic table with a
 measured choice.  Candidates are the heuristic table's per-bucket winners

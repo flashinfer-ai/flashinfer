@@ -21,6 +21,7 @@ from typing import Callable, Literal, Optional, Tuple, Union, cast
 import torch
 
 from .api_logging import flashinfer_api
+from .cute_dsl.availability import is_cute_dsl_arch_supported
 from .trace.templates.gdn import gdn_prefill_trace
 
 try:
@@ -643,7 +644,9 @@ def chunk_gated_delta_rule(
         variable-length sequences (varlen mode); must not be ``None``.
         Repeated adjacent offsets represent legal zero-length sequences.
     use_qk_l2norm_in_kernel : bool
-        Whether to use QK L2 normalization in kernel.  Default: ``False``.
+        Whether to L2-normalize each Q/K head with epsilon ``1e-6``.
+        Normalization accumulates in float32 and rounds back to the input
+        dtype before the chunked kernel. Default: ``False``.
     output : torch.Tensor, optional
         Pre-allocated output tensor of shape
         ``[total_seq_len, num_o_heads, head_size]`` where ``num_o_heads =
@@ -969,6 +972,21 @@ def chunk_gated_delta_rule(
                 "the state pool ([N_pool, H, V, K]); refusing to auto-allocate a "
                 "compact [num_seqs, ...] tensor that would be indexed out of bounds."
             )
+    if (
+        use_qk_l2norm_in_kernel
+        and _arch_major in (9, 10, 12)
+        and (_arch_major != 10 or _cuda_major >= 13)
+        and is_cute_dsl_arch_supported(*_device_capability)
+    ):
+        # The chunked backends consume caller-normalized operands. Honor the
+        # public flag before dispatch; unnormalized keys can make the delta
+        # recurrence expansive and produce nonfinite outputs. Unsupported
+        # configurations must reach the backend checks without compiling here.
+        from .gdn_kernels.qk_l2norm import normalize_qk
+
+        q, k = normalize_qk(q, k)
+        use_qk_l2norm_in_kernel = False
+
     if will_use_cp:
         cp_rejection_reason = _cp_delta_rule_rejection_reason(
             arch_major=_arch_major,

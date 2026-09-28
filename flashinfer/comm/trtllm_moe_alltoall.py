@@ -625,7 +625,20 @@ def moe_a2a_dispatch(
         # This uses absolute offsets in the workspace, so skip indexing into the workspace
         # Reuse views to avoid four tensor constructions per payload. Cached views
         # still observe fresh writes to the workspace bound above.
-        key = (ep_size, runtime_max_tokens_per_rank, offset, size, input_payload.dtype)
+        # ``int()`` guards the key rather than fixing an observed miss: tvm-ffi
+        # materializes an ``Array<int64_t>`` element as a real Python ``int``
+        # today, so these already hash by value. Coercing keeps that property
+        # local to this function instead of resting on an FFI implementation
+        # detail -- an int-like that hashed by identity would miss on every
+        # lookup, silently disabling the cache while the dict still grew. Same
+        # idiom as the ``int()`` on FFI scalars in ``_init_constants`` below.
+        key = (
+            ep_size,
+            runtime_max_tokens_per_rank,
+            int(offset),
+            int(size),
+            input_payload.dtype,
+        )
         payload_view = None if recv_view_cache is None else recv_view_cache.get(key)
         if payload_view is None:
             payload_view = moe_a2a_wrap_payload_tensor_in_workspace(

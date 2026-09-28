@@ -20,6 +20,7 @@
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
 #include "../../arch/mma_sm120_nvfp4.cuh"
+#include "../../common/lse.cuh"
 #include "../../common/zero_row.cuh"
 #include "../../compute/nvfp4_vt.cuh"
 #include "../../compute/warp_tiles.cuh"
@@ -40,7 +41,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const uint8_t* __restrict__ extra_kv_cache, const int32_t* __restrict__ extra_indices,
         const int* __restrict__ extra_topk_length_ptr, int extra_topk, int extra_page_block_size,
         size_t extra_page_stride_bytes, int num_tokens, int scratch_split_stride,
-        int chunks_per_block, float sm_scale, size_t page_stride_bytes, bool write_direct) {
+        int chunks_per_block, float sm_scale, size_t page_stride_bytes, bool write_direct,
+        float lse_scale) {
   static_assert(NUM_HEADS <= STREAMING_HEADS_PER_CTA || NUM_HEADS % STREAMING_HEADS_PER_CTA == 0);
   constexpr int VALID_HEAD_GROUPS =
       NUM_HEADS < STREAMING_HEADS_PER_CTA ? (NUM_HEADS + HPB - 1) / HPB : STREAMING_HEAD_GROUPS;
@@ -112,7 +114,7 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
         const int h = h_start + threadIdx.x;
         if (write_direct) {
           out_lse[(size_t)token_idx * NUM_HEADS + h] =
-              attn_sink ? __ldg(attn_sink + h) * LOG2E : -INFINITY;
+              scale_output_lse(attn_sink ? __ldg(attn_sink + h) * LOG2E : -INFINITY, lse_scale);
         } else {
           mid_lse[((size_t)token_idx * NUM_HEADS + h) * scratch_split_stride + split_idx] = -1e30f;
         }
@@ -492,8 +494,8 @@ __global__ void __launch_bounds__(STREAMING_BLOCK_THREADS, 1)
       final_output_scale[group * HPB + gid] = output_scale0;
       final_output_scale[group * HPB + gid + 8] = output_scale1;
       if (write_direct) {
-        out_lse[(size_t)token_idx * NUM_HEADS + h0] = lse0;
-        out_lse[(size_t)token_idx * NUM_HEADS + h0 + 8] = lse1;
+        out_lse[(size_t)token_idx * NUM_HEADS + h0] = scale_output_lse(lse0, lse_scale);
+        out_lse[(size_t)token_idx * NUM_HEADS + h0 + 8] = scale_output_lse(lse1, lse_scale);
       } else {
         const size_t lse_base = (size_t)token_idx * NUM_HEADS * scratch_split_stride;
         mid_lse[lse_base + (size_t)h0 * scratch_split_stride + split_idx] = lse0;

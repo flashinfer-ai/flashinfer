@@ -296,6 +296,7 @@ def sm90_contiguous_gather_grouped_gemm_act_fusion(
         k,
         num_local_experts,
         swizzle_size=swizzle_size,
+        gated=gated,
     ):
         raise ValueError(
             "sm90_contiguous_gather_grouped_gemm_act_fusion cannot implement "

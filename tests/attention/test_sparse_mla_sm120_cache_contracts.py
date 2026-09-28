@@ -63,6 +63,7 @@ def test_dsv4_nvfp4_masked_rows_ignore_poisoned_slot_zero(route, tokens, heads, 
                 None,
                 1,
                 False,
+                1.0,
             )
         else:
             module.sparse_mla_sm120_nvfp4_prefill(
@@ -77,6 +78,7 @@ def test_dsv4_nvfp4_masked_rows_ignore_poisoned_slot_zero(route, tokens, heads, 
                 extra,
                 exidx,
                 None,
+                1.0,
             )
 
     call()
@@ -142,6 +144,7 @@ def _fp8_call(cache, prefill, model=1, extra=None):
             model,
             1,
             False,
+            1.0,
         )
     torch.cuda.synchronize()
 
@@ -230,6 +233,7 @@ def test_glm_decode_preserves_scratch_guards(tokens, heads, sm12x):
             None,
             3,
             1,
+            1.0,
         )
 
     call()
@@ -299,6 +303,7 @@ def test_flat_page_pitch_preserved(prefill, glm, sm12x):
                 None,
                 model,
                 1,
+                1.0,
             )
         else:
             m.sparse_mla_sm120_decode_dsv4(
@@ -319,6 +324,7 @@ def test_flat_page_pitch_preserved(prefill, glm, sm12x):
                 model,
                 1,
                 False,
+                1.0,
             )
         return out, lse
 
@@ -427,6 +433,7 @@ def test_dsv4_nvfp4_final_helper_rejects_stage1_only(monkeypatch, sm12x):
         None,
         1,
         True,
+        1.0,
     )
     assert torch.isfinite(mid).all() and torch.isfinite(mlse).all()
     assert torch.isnan(out).all() and torch.isnan(lse).all()
