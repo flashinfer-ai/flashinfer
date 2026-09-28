@@ -993,3 +993,12 @@ def test_plan_refined_load_model_only_for_long_tiles():
     assert int(plan["hdr"][3]) & 0xF == 1, "split plan expected on a short-tile row"
     assert plan["num_tiles"] == 8 * 32
     assert max(len(t) for t in _cta_tiles(plan)) == 2
+
+
+def test_plan_no_credit_for_intermediate_grids():
+    # h7, 109632 tokens, K = 64: 5999 pair tiles.  A 131-CTA grid carries the same
+    # 46-tile maximum but measured slower on H100; grids between 128 and the
+    # full machine take no rate credit, so the full grid is kept.
+    mask = _topk_mask(7, 1713, 1713, 64)
+    plan = plan_vsa_sm90(mask, mode="pair", sms=132)
+    assert len(_cta_tiles(plan)) == 132

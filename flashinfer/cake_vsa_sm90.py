@@ -674,9 +674,12 @@ GRID_RATE_KNEE = 128
 def _grid_load_scale(g: int, sms: int) -> float:
     if GRID_MODEL == 0 or sms <= GRID_RATE_KNEE or g >= sms:
         return 1.0
+    if g > GRID_RATE_KNEE:
+        # Grids between the knee and the full machine measured 0.2-1.3 % slower
+        # on the CuTe route when chosen for a sub-1 % model credit; only the
+        # measured knee (<= 128 CTAs) takes the credit.
+        return 1.0
     knee = 1.0 - GRID_RATE_FULL_PENALTY
-    if g >= GRID_RATE_KNEE:
-        return knee + (1.0 - knee) * (g - GRID_RATE_KNEE) / (sms - GRID_RATE_KNEE)
     return knee * (g / GRID_RATE_KNEE) ** GRID_RATE_EXP
 
 
