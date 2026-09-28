@@ -18,11 +18,16 @@ limitations under the License.
 # Do "from .jit import env as jit_env" and use "jit_env.xxx" instead.
 # This helps AOT script to override envs.
 
+import functools
 import logging
 import os
 import pathlib
 from dataclasses import dataclass
-from typing import FrozenSet, Tuple
+from typing import Any, FrozenSet, Mapping, Optional, Tuple
+
+from ._cuda_architecture import (
+    cuda_binary_target_compatibility_score,
+)
 
 from ..compilation_context import CompilationContext
 from ..version import __version__ as flashinfer_version
@@ -125,6 +130,15 @@ class AOTProvider:
     modules: FrozenSet[str]
 
 
+@dataclass(frozen=True)
+class AOTArtifact:
+    """One loadable AOT module and the CUDA targets provided by its wheel."""
+
+    provider_id: str
+    path: pathlib.Path
+    cuda_architectures: Optional[FrozenSet[str]]
+
+
 def _check_jit_cache_version(distribution: str, package_version: str) -> None:
     # NOTE(Zihao): jit-cache versions contain a CUDA local-version suffix,
     # for example 0.3.1+cu129, so allow only that suffix after an exact version.
@@ -142,45 +156,60 @@ def _check_jit_cache_version(distribution: str, package_version: str) -> None:
         )
 
 
-def _get_aot_locations() -> Tuple[pathlib.Path, Tuple[AOTProvider, ...]]:
-    """
-    Get the legacy AOT directory and any installed binary provider packages.
-
-    ``flashinfer-jit-cache`` historically owned one directory containing every
-    module. Newer shim builds discover separately installable providers while
-    retaining that directory as a compatibility fallback.
-    """
-    if has_flashinfer_jit_cache():
-        import flashinfer_jit_cache
-
-        flashinfer_jit_cache_version = flashinfer_jit_cache.__version__
-        _check_jit_cache_version("flashinfer-jit-cache", flashinfer_jit_cache_version)
-
-        providers = []
-        get_providers = getattr(flashinfer_jit_cache, "get_jit_cache_providers", None)
-        if get_providers is not None:
-            for provider in get_providers():
-                _check_jit_cache_version(provider.distribution, provider.version)
-                providers.append(
-                    AOTProvider(
-                        provider_id=provider.provider_id,
-                        distribution=provider.distribution,
-                        version=provider.version,
-                        jit_cache_dir=pathlib.Path(provider.jit_cache_dir),
-                        cuda_architectures=frozenset(provider.cuda_architectures),
-                        modules=frozenset(provider.modules),
-                    )
-                )
-
-        return (
-            pathlib.Path(flashinfer_jit_cache.get_jit_cache_dir()),
-            tuple(providers),
+def _check_jit_cache_provider_version(
+    distribution: str, package_version: str, shim_version: str
+) -> None:
+    _check_jit_cache_version(distribution, package_version)
+    if (
+        not os.getenv("FLASHINFER_DISABLE_VERSION_CHECK")
+        and package_version != shim_version
+    ):
+        raise RuntimeError(
+            f"{distribution} version ({package_version}) does not match "
+            f"flashinfer-jit-cache version ({shim_version}). "
+            "Please install the same CUDA-specific version of the shim and provider. "
+            "Set FLASHINFER_DISABLE_VERSION_CHECK=1 to bypass this check."
         )
 
-    return _package_root / "data" / "aot", ()
+
+def _get_aot_providers() -> Tuple[AOTProvider, ...]:
+    """Discover compatible AOT provider packages through the installed shim."""
+    if not has_flashinfer_jit_cache():
+        return ()
+
+    import flashinfer_jit_cache
+
+    _check_jit_cache_version("flashinfer-jit-cache", flashinfer_jit_cache.__version__)
+    providers = []
+    for provider in flashinfer_jit_cache.get_jit_cache_providers():
+        try:
+            _check_jit_cache_provider_version(
+                provider.distribution,
+                provider.version,
+                flashinfer_jit_cache.__version__,
+            )
+        except RuntimeError as error:
+            logger.warning(
+                "Ignoring incompatible flashinfer jit-cache provider %s: %s",
+                provider.distribution,
+                error,
+            )
+            continue
+        providers.append(
+            AOTProvider(
+                provider_id=provider.provider_id,
+                distribution=provider.distribution,
+                version=provider.version,
+                jit_cache_dir=pathlib.Path(provider.jit_cache_dir),
+                cuda_architectures=frozenset(provider.cuda_architectures),
+                modules=frozenset(provider.modules),
+            )
+        )
+    return tuple(providers)
 
 
-FLASHINFER_AOT_DIR, FLASHINFER_AOT_PROVIDERS = _get_aot_locations()
+FLASHINFER_AOT_DIR: pathlib.Path = _package_root / "data" / "aot"
+FLASHINFER_AOT_PROVIDERS = _get_aot_providers()
 FLASHINFER_AOT_DIRS: Tuple[pathlib.Path, ...] = (FLASHINFER_AOT_DIR,) + tuple(
     provider.jit_cache_dir for provider in FLASHINFER_AOT_PROVIDERS
 )
@@ -196,39 +225,131 @@ def _target_cuda_architectures() -> FrozenSet[str]:
 def _provider_covers_targets(
     provider_architectures: FrozenSet[str], target_architectures: FrozenSet[str]
 ) -> bool:
-    """Return whether a provider explicitly covers every active CUDA target.
-
-    Exact matching is intentional. In particular, ``a`` targets are
-    architecture-specific and cannot be forwarded to another compute capability.
-    Baseline and ``f`` targets also remain exact here until provider manifests can
-    distinguish executable compatibility from complete AOT module coverage.
-    """
-    return target_architectures.issubset(provider_architectures)
+    """Return whether provider targets can execute on every active CUDA target."""
+    return (
+        _provider_compatibility_score(provider_architectures, target_architectures)
+        is not None
+    )
 
 
-def get_aot_path(module_name: str) -> pathlib.Path:
-    """Resolve an AOT module from the legacy wheel or a compatible provider."""
-    legacy_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
-    if legacy_path.exists():
-        return legacy_path
+def _provider_compatibility_score(
+    provider_architectures: FrozenSet[str], target_architectures: FrozenSet[str]
+) -> tuple[tuple[int, int], ...] | None:
+    """Score a provider, preferring exact and newer compatible targets."""
+    scores = []
+    for target in sorted(target_architectures):
+        compatible_scores = [
+            score
+            for architecture in provider_architectures
+            if (score := cuda_binary_target_compatibility_score(architecture, target))
+            is not None
+        ]
+        if not compatible_scores:
+            return None
+        scores.append(max(compatible_scores))
+    return tuple(sorted(scores))
+
+
+def _provider_target_compatibility_score(
+    provider_architectures: FrozenSet[str], target_architecture: str
+) -> tuple[int, int] | None:
+    scores = [
+        score
+        for architecture in provider_architectures
+        if (
+            score := cuda_binary_target_compatibility_score(
+                architecture, target_architecture
+            )
+        )
+        is not None
+    ]
+    return max(scores) if scores else None
+
+
+def get_aot_artifacts(module_name: str) -> Tuple[AOTArtifact, ...]:
+    """Resolve the best installed AOT artifact for each visible CUDA target."""
+    fallback_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
+    if fallback_path.exists():
+        return (AOTArtifact("flashinfer-python", fallback_path, None),)
 
     target_architectures = _target_cuda_architectures()
     if not target_architectures:
-        return legacy_path
-    for provider in FLASHINFER_AOT_PROVIDERS:
-        if module_name not in provider.modules:
-            continue
-        if not _provider_covers_targets(
-            provider.cuda_architectures, target_architectures
-        ):
-            continue
-        provider_path = provider.jit_cache_dir / module_name / f"{module_name}.so"
-        if provider_path.exists():
-            return provider_path
+        return ()
 
-    # JitSpec uses this stable path for existence checks and diagnostics when
-    # no compatible prebuilt module is installed.
-    return legacy_path
+    selected = {}
+    for target in sorted(target_architectures):
+        candidates = []
+        for provider in FLASHINFER_AOT_PROVIDERS:
+            if module_name not in provider.modules:
+                continue
+            compatibility_score = _provider_target_compatibility_score(
+                provider.cuda_architectures, target
+            )
+            if compatibility_score is None:
+                continue
+            provider_path = provider.jit_cache_dir / module_name / f"{module_name}.so"
+            if provider_path.exists():
+                artifact = AOTArtifact(
+                    provider.provider_id,
+                    provider_path,
+                    provider.cuda_architectures,
+                )
+                candidates.append((compatibility_score, provider.provider_id, artifact))
+        if candidates:
+            artifact = max(candidates, key=lambda candidate: candidate[:2])[2]
+            selected[(artifact.provider_id, artifact.path)] = artifact
+    return tuple(sorted(selected.values(), key=lambda artifact: artifact.provider_id))
+
+
+def get_aot_path(module_name: str) -> pathlib.Path:
+    """Return the primary path for an AOT module, or its stable fallback path."""
+    fallback_path = FLASHINFER_AOT_DIR / module_name / f"{module_name}.so"
+    artifacts = get_aot_artifacts(module_name)
+    return artifacts[0].path if artifacts else fallback_path
+
+
+@functools.cache
+def _cuda_architecture_for_device(device_index: int) -> str:
+    import torch
+
+    major, minor = torch.cuda.get_device_capability(device_index)
+    major, normalized_minor = CompilationContext._normalize_cuda_arch(major, minor)
+    return f"sm{major}{normalized_minor}"
+
+
+def _cuda_architectures_for_call(
+    args: Tuple[Any, ...], kwargs: Mapping[str, Any]
+) -> FrozenSet[str]:
+    """Return CUDA architectures referenced by call arguments or current device."""
+    import torch
+
+    device_indices = set()
+
+    def collect(value: Any) -> None:
+        device = getattr(value, "device", None)
+        if getattr(device, "type", None) == "cuda":
+            index = device.index
+            device_indices.add(
+                torch.cuda.current_device() if index is None else int(index)
+            )
+            return
+        if isinstance(value, Mapping):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                collect(item)
+
+    collect(args)
+    collect(kwargs)
+    if not device_indices:
+        try:
+            device_indices.add(torch.cuda.current_device())
+        except Exception:
+            return frozenset()
+    return frozenset(
+        _cuda_architecture_for_device(device_index) for device_index in device_indices
+    )
 
 
 def _get_workspace_dir_name() -> pathlib.Path:

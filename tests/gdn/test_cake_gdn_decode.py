@@ -59,13 +59,19 @@ def _decode(**overrides):
     return cake_gdn.select_cake_gdn_decode_variant(**params)
 
 
-def test_manifest_is_frozen_and_source_only() -> None:
+def test_manifest_is_consistent_and_source_only() -> None:
+    # Check the manifest's own bookkeeping instead of pinning row counts:
+    # every promoted row lands here, so literal counts break on each export.
     manifest = cake_gdn._manifest()
-    assert manifest["contract_row_count"] == 1779
-    assert manifest["architecture_row_count"] == 3558
-    assert manifest["admitted_architecture_rows"] == 3504
-    assert manifest["fail_closed_architecture_rows"] == 54
-    assert manifest["variant_count"] == len(manifest["variants"]) == 104
+    assert manifest["contract_row_count"] == len(manifest["contract_rows"]) > 0
+    assert manifest["architecture_row_count"] == manifest["contract_row_count"] * len(
+        manifest["architectures"]
+    )
+    assert manifest["architecture_row_count"] == (
+        manifest["admitted_architecture_rows"]
+        + manifest["fail_closed_architecture_rows"]
+    )
+    assert manifest["variant_count"] == len(manifest["variants"]) > 0
     assert manifest["source_only"] is True
     assert manifest["binary_artifacts"] is False
 

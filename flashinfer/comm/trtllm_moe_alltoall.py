@@ -516,6 +516,7 @@ def moe_a2a_dispatch(
     active_rank_mask: Optional[torch.Tensor] = None,
     *,
     backend: MoeAlltoAllBackend = "trtllm",
+    recv_view_cache: Optional[dict] = None,
 ):
     r"""Dispatch tokens and payloads to their target expert ranks.
 
@@ -565,6 +566,13 @@ def moe_a2a_dispatch(
     backend : {"trtllm", "cake"}
         Defaults to ``"trtllm"``. Pass ``"cake"`` to opt in on CC 10.0/10.3;
         must match workspace initialization, combine, and all peer ranks.
+    recv_view_cache : dict, optional
+        Opaque cache of receive views. Pass an empty dictionary to enable
+        caching; ``None`` (default) disables it. The cache retains a reference
+        to ``workspace`` and is cleared when a different workspace tensor is
+        passed. Keep the backing allocation alive and do not change workspace
+        or cached-view shape, strides, or storage in place. Clear the dictionary
+        to release its references; otherwise, leave its contents unchanged.
 
     Returns
     -------
@@ -602,20 +610,47 @@ def moe_a2a_dispatch(
         active_rank_mask,
     )
 
+    # Bind once per dispatch without pointer/device queries in the hot path.
+    if (
+        recv_view_cache is not None
+        and recv_view_cache.get("_workspace") is not workspace
+    ):
+        recv_view_cache.clear()
+        recv_view_cache["_workspace"] = workspace
+
     output_payloads = []
     for input_payload, offset, size in zip(
         input_payloads, recv_offsets, recv_sizes, strict=True
     ):
         # This uses absolute offsets in the workspace, so skip indexing into the workspace
-        output_payloads.append(
-            moe_a2a_wrap_payload_tensor_in_workspace(
+        # Reuse views to avoid four tensor constructions per payload. Cached views
+        # still observe fresh writes to the workspace bound above.
+        # ``int()`` guards the key rather than fixing an observed miss: tvm-ffi
+        # materializes an ``Array<int64_t>`` element as a real Python ``int``
+        # today, so these already hash by value. Coercing keeps that property
+        # local to this function instead of resting on an FFI implementation
+        # detail -- an int-like that hashed by identity would miss on every
+        # lookup, silently disabling the cache while the dict still grew. Same
+        # idiom as the ``int()`` on FFI scalars in ``_init_constants`` below.
+        key = (
+            ep_size,
+            runtime_max_tokens_per_rank,
+            int(offset),
+            int(size),
+            input_payload.dtype,
+        )
+        payload_view = None if recv_view_cache is None else recv_view_cache.get(key)
+        if payload_view is None:
+            payload_view = moe_a2a_wrap_payload_tensor_in_workspace(
                 workspace,
                 [ep_size, runtime_max_tokens_per_rank],
                 offset,
                 offset + size,
                 input_payload.dtype,
             )
-        )
+            if recv_view_cache is not None:
+                recv_view_cache[key] = payload_view
+        output_payloads.append(payload_view)
 
     eplb_gathered_stats = None
     if eplb_gathered_stats_offset >= 0:
@@ -725,6 +760,9 @@ def moe_a2a_combine(
         :func:`moe_a2a_active_rank_mask`).  Should match the mask passed to the
         corresponding :func:`moe_a2a_dispatch` call (or be omitted from both).  Requires
         ``enable_rank_mask=True``.
+    backend : MoeAlltoAllBackend
+        Communication backend. Defaults to ``"trtllm"``; use ``"cake"`` only
+        with a workspace initialized by the Cake backend.
 
     Returns
     -------
@@ -802,6 +840,9 @@ def moe_a2a_sanitize_expert_ids(
     enable_pdl : Optional[bool]
         Whether to use programmatic dependent launch.  ``None`` auto-detects
         from the device.
+    backend : MoeAlltoAllBackend
+        Communication backend. Defaults to ``"trtllm"``; use ``"cake"`` only
+        with a workspace initialized by the Cake backend.
     """
     if enable_pdl is None:
         enable_pdl = device_support_pdl(expert_ids.device)
@@ -840,6 +881,9 @@ def moe_a2a_get_workspace_size_per_rank(
     eplb_stats_num_experts : int
         Number of experts reserved for the EPLB gathered-stats region
         (``0`` disables it).
+    backend : MoeAlltoAllBackend
+        Communication backend used to size the workspace. Defaults to
+        ``"trtllm"``; pass ``"cake"`` for the Cake backend.
 
     Returns
     -------
@@ -985,6 +1029,9 @@ class MoeAlltoAll:
         eplb_stats_num_experts : int
             Number of experts reserved for the EPLB gathered-stats region
             (``0`` disables it).
+        backend : MoeAlltoAllBackend
+            Communication backend used to size the workspace. Defaults to
+            ``"trtllm"``; pass ``"cake"`` for the Cake backend.
 
         Returns
         -------
@@ -1157,6 +1204,9 @@ class MoeAlltoAll:
         self.workspace = self._WORKSPACE["workspace"]
         self.metainfo = self._WORKSPACE["metainfo"]
         self._state = _A2AState()
+        # Keep views across combine calls while retaining the workspace and its
+        # MNNVL allocation through this instance.
+        self._recv_view_cache: dict = {"_workspace": self.workspace}
 
     @property
     def eplb_gathered_stats(self) -> Optional[torch.Tensor]:
@@ -1345,6 +1395,7 @@ class MoeAlltoAll:
             enable_rank_mask=self.enable_rank_mask,
             active_rank_mask=active_rank_mask,
             backend=self._backend,
+            recv_view_cache=self._recv_view_cache,
         )
 
         # Update state

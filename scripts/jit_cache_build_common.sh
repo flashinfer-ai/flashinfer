@@ -8,8 +8,6 @@
 SCCACHE_VERSION="0.17.0"
 SCCACHE_CUDA_134_REVISION="e9b15a35f7240a7edd1b9644583edb388c6cb5f9"
 SCCACHE_CUDA_134_SOURCE_SHA256="9e444cc5097a839f03c81c59c5cadebc20090aad1fc699e398d5c1c18c44118c"
-# The v0.17 client-side architecture remains opt-in while this change isolates
-# the version upgrade from a separate execution-mode change.
 
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
@@ -369,6 +367,11 @@ setup_sccache() {
   export SCCACHE_BASEDIRS="${source_root}${SCCACHE_BASEDIRS:+:${SCCACHE_BASEDIRS}}"
   export SCCACHE_S3_KEY_PREFIX="${key_prefix}"
   export SCCACHE_IDLE_TIMEOUT=0
+  # Server-side mode is intentional. Client-side mode adds compiler probes for
+  # nvcc and reduced provider-build throughput in CI. The build watchdog scans
+  # /proc system-wide, including daemon-owned compilers, and docker --rm is the
+  # final containment boundary if the watchdog cannot signal one of them.
+  unset SCCACHE_CLIENT_SIDE
   export FLASHINFER_CXX_LAUNCHER="sccache"
   export FLASHINFER_NVCC_LAUNCHER="sccache"
 
@@ -422,6 +425,14 @@ setup_sccache() {
   fi
 }
 
+run_sccache_control_command() {
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=5s 30s sccache "$@"
+  else
+    sccache "$@"
+  fi
+}
+
 # When SCCACHE_STATS_DIR is configured, retain text/JSON stats for a dedicated
 # workflow log step and artifact upload. Otherwise, print the stats directly.
 # This helper is intended for EXIT traps; callers should ignore failures so
@@ -436,22 +447,23 @@ collect_sccache_stats() {
 
   if [ -n "${SCCACHE_STATS_DIR:-}" ]; then
     mkdir -p "${SCCACHE_STATS_DIR}"
-    if ! sccache --show-stats > "${SCCACHE_STATS_DIR}/sccache-stats.txt"; then
+    if ! run_sccache_control_command --show-stats \
+        > "${SCCACHE_STATS_DIR}/sccache-stats.txt"; then
       echo "WARNING: Failed to collect text sccache stats" >&2
     fi
-    if ! sccache --show-stats --stats-format=json \
+    if ! run_sccache_control_command --show-stats --stats-format=json \
         > "${SCCACHE_STATS_DIR}/sccache-stats.json"; then
       echo "WARNING: Failed to collect JSON sccache stats" >&2
     fi
-    if ! sccache --show-adv-stats --stats-format=json \
+    if ! run_sccache_control_command --show-adv-stats --stats-format=json \
         > "${SCCACHE_STATS_DIR}/sccache-advanced-stats.json"; then
       echo "WARNING: Failed to collect advanced JSON sccache stats" >&2
     fi
   else
     echo "::group::sccache stats"
-    sccache --show-stats || true
+    run_sccache_control_command --show-stats || true
     echo "::endgroup::"
   fi
-  sccache --stop-server >/dev/null 2>&1 || true
+  run_sccache_control_command --stop-server >/dev/null 2>&1 || true
   export FLASHINFER_SCCACHE_ACTIVE=false
 }

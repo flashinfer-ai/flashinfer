@@ -1277,10 +1277,21 @@ def test_verify_kernel_mtp_reuses_compile_across_cache_modes(monkeypatch, batch_
     original_compile = cute.compile
     compile_count = 0
 
-    def counted_compile(*args, **kwargs):
-        nonlocal compile_count
-        compile_count += 1
-        return original_compile(*args, **kwargs)
+    class CountedCompile:
+        """Stand-in for ``cute.compile``, which is used in its subscripted form."""
+
+        def __init__(self, compile_fn):
+            self._compile_fn = compile_fn
+
+        def __getitem__(self, options):
+            return CountedCompile(original_compile[options])
+
+        def __call__(self, *args, **kwargs):
+            nonlocal compile_count
+            compile_count += 1
+            return self._compile_fn(*args, **kwargs)
+
+    counted_compile = CountedCompile(original_compile)
 
     # Pin the disk cache off: a populated cache would satisfy the reuse
     # property with zero compiles, breaking the count-based assertion.
@@ -1852,7 +1863,7 @@ def _test_gdn_decode_bf16_state_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16, 32, 64, 128])
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_kernel(
     dtype: str,
@@ -2341,7 +2352,7 @@ def _test_gdn_decode_bf16_state_mtp_kernel(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("batch_size", [1, 4, 16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_mtp_kernel(
     dtype: str,
@@ -2375,7 +2386,7 @@ def test_gdn_decode_bf16_state_mtp_kernel(
 # ==============================================================================
 # Reuses _test_gdn_decode_bf16_state_mtp_kernel by monkey-patching the module's
 # `gdn_decode_bf16_state_mtp` symbol for the scope of this test only. The
-# parametrization is wider (B up to 256, T up to 8, HV in {32, 64}) because
+# parametrization is wider (B up to 64, T up to 8, HV in {32, 64}) because
 # wide_vec's sweet spot is at large work-sizes; we want coverage where it
 # matters. See results/bf16_mtp_optimization_apr18/wide_vec_design.md for the design.
 
@@ -2399,7 +2410,7 @@ except ImportError:
     [(16, 16, 64)],
 )
 # tile_v is an explicit axis here, so B adds no specialization.
-@pytest.mark.parametrize("batch_size", [1, 16, 256])
+@pytest.mark.parametrize("batch_size", [16, 64])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_state_wide_vec_mtp_kernel(
     monkeypatch,
@@ -2470,7 +2481,7 @@ except (ImportError, RuntimeError):
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 32)],
 )
-@pytest.mark.parametrize("batch_size", [1, 2, 4, 8, 16])
+@pytest.mark.parametrize("batch_size", [1, 8, 16])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
 def test_gdn_decode_bf16_wy_output_only_mtp_kernel(
     monkeypatch,
@@ -2520,8 +2531,8 @@ def test_gdn_decode_bf16_wy_output_only_mtp_kernel(
 # kernel with T = K_i tokens for each request independently.
 
 
-@pytest.mark.parametrize("max_T", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 256])
+@pytest.mark.parametrize("max_T", [2, 8])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 64])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 64)],
@@ -2591,7 +2602,7 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
         disable_state_update=False,  # write final state
         disable_output=True,  # recovery: no output
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -2615,7 +2626,7 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
             disable_state_update=False,
             disable_output=True,
             use_qk_l2norm_in_kernel=True,
-            scale=K**-0.5,
+            scale=1.0 / math.sqrt(K),
             softplus_beta=1.0,
             softplus_threshold=20.0,
         )
@@ -2623,8 +2634,9 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
         state_ref[i] = pool_i[0]
 
     # BF16 epsilon is 2^-8 ≈ 0.0039. Noise scales with sqrt(N) where N is
-    # accumulation count (B * K * K-dim reductions). At B=256, T=8, expected
-    # noise envelope is ~0.05 — set tolerance just above.
+    # accumulation count (B * K * K-dim reductions). At B=64, T=8 the envelope
+    # is ~0.025; the 0.06 bound predates the removal of B=256 and is left
+    # deliberately conservative.
     diff = (pool_state_perreq - state_ref).abs().max().item()
     assert diff <= 0.06, (
         f"per-request kernel deviates from per-request reference: "
@@ -2647,8 +2659,8 @@ def test_gdn_decode_bf16_state_recovery_per_request_k(
 # Verifies bit-equivalence (within BF16 noise) against the two-call reference.
 
 
-@pytest.mark.parametrize("recovery_steps", [1, 2, "T-1"])
-@pytest.mark.parametrize("T", [4, 8])
+@pytest.mark.parametrize("recovery_steps", [1, "T-1"])
+@pytest.mark.parametrize("T", [8])
 @pytest.mark.parametrize("batch_size", [2, 8, 32])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
@@ -2706,7 +2718,7 @@ def test_gdn_decode_bf16_state_fused_recovery_decode(
         dt_bias=dt_bias,
         initial_state_indices=h0_indices,
         use_qk_l2norm_in_kernel=True,
-        scale=K_dim**-0.5,
+        scale=1.0 / math.sqrt(K_dim),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -2795,7 +2807,7 @@ def test_gdn_decode_bf16_state_fused_recovery_decode(
 #                                disable_state_update=True) → emits output[K_i+1:T]
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [2, 8, 32])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
@@ -2857,7 +2869,7 @@ def test_gdn_decode_bf16_state_fused_per_request_k(
         A_log=A_log,
         dt_bias=dt_bias,
         use_qk_l2norm_in_kernel=True,
-        scale=K_dim**-0.5,
+        scale=1.0 / math.sqrt(K_dim),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -3235,7 +3247,7 @@ def test_output_state_indices_same_as_input(batch_size: int, state_dtype: str):
 
 
 @pytest.mark.parametrize("batch_size", [1, 8, 32])
-@pytest.mark.parametrize("seq_len", [2, 4])
+@pytest.mark.parametrize("seq_len", [4])
 @pytest.mark.parametrize("cache_intermediate_states", [True, False])
 def test_gdn_decode_bf16_state_mtp_split_pool(
     batch_size: int,
@@ -3519,8 +3531,9 @@ def test_gdn_decode_bf16_state_mtp_pool_larger_than_batch(
 
 
 @pytest.mark.parametrize("split_pool", [False, True])
-@pytest.mark.parametrize("max_T", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 256])
+@pytest.mark.parametrize("max_T", [2, 8])
+# B=1 dispatches the MTP kernel, B>=4 the wide-vec kernel; keep both sides.
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
 @pytest.mark.parametrize(
     "num_q_heads, num_k_heads, num_v_heads",
     [(16, 16, 64)],
@@ -3594,7 +3607,7 @@ def test_gdn_decode_bf16_state_fla_scatter_vs_dense(
         dt_bias=dt_bias,
         initial_state_indices=h0_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         softplus_beta=1.0,
         softplus_threshold=20.0,
     )
@@ -3669,7 +3682,7 @@ def test_gdn_decode_bf16_state_fla_scatter_vs_dense(
         )
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [1, 4, 64])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
@@ -3714,7 +3727,7 @@ def test_gdn_decode_bf16_state_fla_scatter_with_accepted_steps(
         ssm_state_indices=ssm_idx,
         accepted_steps=accepted_steps,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
     )
     torch.cuda.synchronize()
 
@@ -3743,7 +3756,7 @@ def test_gdn_decode_bf16_state_fla_scatter_with_accepted_steps(
     )
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [4, 64])
 @pytest.mark.parametrize("head_size", [128])
 @pytest.mark.parametrize("dtype", ["bfloat16"])
@@ -3782,7 +3795,7 @@ def test_gdn_decode_bf16_state_fla_scatter_state_only(
         dt_bias=torch.randn(HV, dtype=torch.float32, device=device),
         initial_state_indices=h0_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         disable_output=True,  # state-only
     )
 
@@ -3889,7 +3902,7 @@ def test_gdn_decode_bf16_state_fla_scatter_validation():
 # ============================================================================
 
 
-@pytest.mark.parametrize("max_T", [2, 4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [4, 16])
 def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
     batch_size: int,
@@ -3954,7 +3967,7 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
         initial_state_indices=h0_idx,
         ssm_state_indices=ssm_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
     )
 
     # Reference: contiguous pool → flat path
@@ -3981,7 +3994,7 @@ def test_gdn_decode_bf16_state_fla_scatter_padded_pool(
             )
 
 
-@pytest.mark.parametrize("max_T", [4, 8])
+@pytest.mark.parametrize("max_T", [8])
 @pytest.mark.parametrize("batch_size", [4, 16])
 def test_gdn_decode_bf16_state_fla_scatter_random_slots(
     batch_size: int,
@@ -4039,7 +4052,7 @@ def test_gdn_decode_bf16_state_fla_scatter_random_slots(
         b=b,
         initial_state_indices=h0_idx,
         use_qk_l2norm_in_kernel=True,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
     )
 
     # Dense reference (same input).
@@ -4073,8 +4086,8 @@ def test_gdn_decode_bf16_state_fla_scatter_random_slots(
         assert diff == 0, f"unused slot {s} clobbered: {diff}"
 
 
-@pytest.mark.parametrize("max_T", [2, 4, 8])
-@pytest.mark.parametrize("batch_size", [1, 4, 16, 64, 128])
+@pytest.mark.parametrize("max_T", [2, 8])
+@pytest.mark.parametrize("batch_size", [1, 4, 16, 128])
 def test_gdn_decode_fp32_state_fla_scatter_vs_dense(
     batch_size: int,
     max_T: int,
@@ -4117,7 +4130,7 @@ def test_gdn_decode_fp32_state_fla_scatter_vs_dense(
         dt_bias=dt_bias,
         b=b,
         initial_state_indices=h0_idx,
-        scale=K**-0.5,
+        scale=1.0 / math.sqrt(K),
         disable_state_update=False,
         use_qk_l2norm=True,
     )

@@ -18,6 +18,10 @@ import pytest
 import torch
 
 import flashinfer
+from tests.test_helpers.parametrize import (
+    parametrize_product,
+    pairwise_product_cases,
+)
 
 
 def normal_distribution(std):
@@ -50,6 +54,289 @@ def test_softmax_low_temperature_normalization(shape, per_row_temperature):
     expected = torch.zeros_like(logits)
     expected[:, 123] = 1.0
     torch.testing.assert_close(probs, expected, atol=1e-6, rtol=0)
+
+
+def test_softmax_rejects_cpu_before_cuda_state(monkeypatch):
+    def fail_if_called(*args, **kwargs):
+        pytest.fail("CUDA workspace or capability state was accessed for CPU logits")
+
+    monkeypatch.setattr(flashinfer.sampling, "_get_cache_buf", fail_if_called)
+    monkeypatch.setattr(flashinfer.sampling, "device_support_pdl", fail_if_called)
+    monkeypatch.setattr(
+        flashinfer.sampling, "_supports_blackwell_softmax", fail_if_called
+    )
+
+    with pytest.raises(ValueError, match="logits must be a CUDA tensor"):
+        flashinfer.sampling.softmax(torch.randn(2, 3))
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float16, torch.bfloat16, torch.float32, torch.float64]
+)
+def test_validate_softmax_temperature_accepts_floating_row_tensor(dtype):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+    temperature = torch.ones(3, dtype=dtype)
+
+    temperature_arr, temperature_val, temperature_is_none = (
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+    )
+
+    assert temperature_arr is temperature
+    assert temperature_val == 0.0
+    assert not temperature_is_none
+
+
+@pytest.mark.parametrize(
+    "temperature,expected_value,is_none",
+    [(None, 1.0, True), (1, 1.0, False), (0.5, 0.5, False)],
+)
+def test_validate_softmax_temperature_accepts_scalar(
+    temperature, expected_value, is_none
+):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+
+    temperature_arr, temperature_val, temperature_is_none = (
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+    )
+
+    assert temperature_arr is None
+    assert temperature_val == expected_value
+    assert temperature_is_none is is_none
+
+
+@pytest.mark.parametrize(
+    "temperature,error_match",
+    [
+        (torch.tensor(1.0), "must be 1D"),
+        (torch.ones(3, 1), "must be 1D"),
+        (torch.ones(2), "length must equal logits.size\\(0\\)"),
+        (torch.ones(3, dtype=torch.int32), "must have dtype"),
+        (torch.ones(3, dtype=torch.bool), "must have dtype"),
+    ],
+)
+def test_validate_softmax_temperature_rejects_invalid_tensor(temperature, error_match):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+
+    with pytest.raises(ValueError, match=error_match):
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+
+
+def test_validate_softmax_temperature_rejects_other_device():
+    logits = torch.empty((3, 5), dtype=torch.float32)
+    temperature = torch.ones(3, device="meta")
+
+    with pytest.raises(ValueError, match="same device as logits"):
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+
+
+@pytest.mark.parametrize("temperature", [True, "1.0", object()])
+def test_validate_softmax_temperature_rejects_non_numeric_scalar(temperature):
+    logits = torch.empty((3, 5), dtype=torch.float32)
+
+    with pytest.raises(TypeError, match="temperature must be None, a real scalar"):
+        flashinfer.sampling._validate_softmax_temperature(logits, temperature)
+
+
+@pytest.mark.parametrize("rows", [128, 512, 1024])
+def test_blackwell_mr515_none_route_is_exact_and_correct(rows):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("MR515 hybrid route is restricted to sm_103a")
+
+    logits = torch.randn((rows, 32000), device="cuda", dtype=torch.float32)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=None, enable_pdl=False
+    )
+    actual = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
+    expected = torch.softmax(logits, dim=-1)
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512
+    assert actual.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+def test_blackwell_scalar_one_pdl_b64_v32000_takes_cached_cluster_route():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    logits = torch.randn((64, 32000), device="cuda", dtype=torch.float32)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=1.0, enable_pdl=True
+    )
+    actual = flashinfer.sampling.softmax(logits, temperature=1.0, enable_pdl=True)
+    expected = torch.softmax(logits, dim=-1)
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER
+    assert actual.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(actual, expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,temperature,enable_pdl",
+    [
+        (4, None, False),
+        (64, None, False),
+        (256, None, False),
+        (128, None, True),
+        (512, 1.0, False),
+        (64, 1.0, True),
+        (64, 0.5, True),
+    ],
+)
+def test_blackwell_mr515_route_does_not_interpolate(rows, temperature, enable_pdl):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("MR515 hybrid route is restricted to sm_103a")
+
+    logits = torch.empty((rows, 32000), device="cuda", dtype=torch.float32)
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+
+    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_MR515_V32000_T512
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature,enable_pdl,expected_route",
+    [
+        (1, 111, 0.5, False, 1),
+        (256, 32000, None, False, 2),
+        (1, 32004, None, False, 3),
+        (512, 32000, None, False, 4),
+        (256, 32000, 0.5, False, 5),
+        (256, 64000, None, False, 5),
+        (1, 32000, None, False, 5),
+        (1, 256000, None, False, 5),
+    ],
+)
+def test_blackwell_softmax_all_negative_infinity_matches_public_semantics(
+    rows, vocab_size, temperature, enable_pdl, expected_route
+):
+    capability = torch.cuda.get_device_capability()
+    if capability not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+    if expected_route == 4 and capability != (10, 3):
+        pytest.skip("MR515 hybrid route is restricted to sm_103a")
+
+    logits = torch.full((rows, vocab_size), -torch.inf, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    actual = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    expected = torch.softmax(logits, dim=-1)
+
+    assert route == expected_route
+    assert actual.data_ptr() != logits.data_ptr()
+    assert torch.isnan(expected).all()
+    assert torch.isnan(actual).all()
+
+
+def test_blackwell_route_observer_falls_back_off_blackwell():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+    if torch.cuda.get_device_capability() in ((10, 0), (10, 3)):
+        pytest.skip("This test exercises the non-Blackwell observer gate")
+
+    logits = torch.empty((1, 111), device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=0.5, enable_pdl=False
+    )
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size,temperature_kind,enable_pdl",
+    [
+        (1, 32000, "none", False),
+        (1, 262144, "none", False),  # widest cached row: 16 CTAs x 8 tiles
+        (8, 4096, "scalar", False),
+        (64, 32000, "scalar", True),  # scalar 0.5 leaves the sm_103a MR515 shape
+        (1024, 128000, "none", False),
+        (1024, 256000, "per_row", True),  # 16-CTA non-portable clusters
+        (989, 128256, "per_row", True),
+    ],
+)
+def test_blackwell_cached_cluster_route_is_selected_and_correct(
+    rows, vocab_size, temperature_kind, enable_pdl
+):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    torch.manual_seed(7)
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    if temperature_kind == "none":
+        temperature = None
+        probs_ref = torch.softmax(logits, dim=-1)
+    elif temperature_kind == "scalar":
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    else:
+        temperature = torch.rand(rows, device="cuda") * 0.9 + 0.1
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=enable_pdl
+    )
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER
+    assert probs.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(probs, probs_ref, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.parametrize(
+    "rows,vocab_size",
+    [
+        (1, 32004),  # vocabulary not a multiple of 8
+        (256, 262152),  # wider than the 16 x 8 x 2048 cache
+    ],
+)
+def test_blackwell_cached_cluster_route_declines_unaligned_rows(rows, vocab_size):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=None, enable_pdl=False
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
+
+    assert route not in (
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK,
+        flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_CACHED_CLUSTER,
+    )
+    torch.testing.assert_close(
+        probs, torch.softmax(logits, dim=-1), atol=1e-3, rtol=1e-3
+    )
+
+
+@pytest.mark.parametrize("rows,vocab_size", [(16, 32000), (256, 32004), (1, 111)])
+def test_blackwell_misaligned_base_pointer_takes_fallback(rows, vocab_size):
+    # Every generated route reads 128/256-bit vectors relative to the buffer
+    # base; a storage-offset view with a 16-byte aligned base must not reach
+    # them (the bootstrap kernel faults with cudaErrorMisalignedAddress).
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Blackwell Softmax routes require SM100 or SM103")
+
+    storage = torch.randn(rows * vocab_size + 4, device="cuda")
+    logits = storage[4:].view(rows, vocab_size)  # contiguous, 16-byte aligned base
+    assert logits.is_contiguous() and logits.data_ptr() % 32 == 16
+
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=None, enable_pdl=False
+    )
+    probs = flashinfer.sampling.softmax(logits, temperature=None, enable_pdl=False)
+
+    assert route == flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+    torch.testing.assert_close(
+        probs, torch.softmax(logits, dim=-1), atol=1e-3, rtol=1e-3
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
@@ -88,6 +375,71 @@ def test_softmax(
     probs_ref = torch.softmax(logits_scaled, dim=-1)
 
     assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "batch_size,vocab_size,temperature_kind",
+    [
+        (1, 32000, "none"),  # cached cluster route, one row spread over 16 CTAs
+        (256, 32000, "none"),  # rowwise route (ties the cluster family here)
+        (256, 64000, "none"),  # cached cluster route, 8-CTA clusters
+        (512, 64000, "none"),  # cached cluster route, 8-CTA clusters
+        (1024, 64000, "none"),  # cached cluster route, 8-CTA clusters
+        (1024, 256000, "none"),  # cached cluster route, 16-CTA non-portable clusters
+        (989, 128256, "per_row"),  # cached cluster route, per-row temperature
+        (1, 32004, "none"),  # cooperative bootstrap route (vocab not a multiple of 8)
+        (256, 32004, "none"),  # rowwise route (vocab not a multiple of 8)
+        (1, 111, "scalar"),  # scalar-temperature warp-packed route
+        (1, 111, "per_row"),  # per-row-temperature warp-packed route
+    ],
+)
+def test_softmax_blackwell_routes(batch_size, vocab_size, temperature_kind):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake softmax routes require SM100 or SM103")
+
+    torch.manual_seed(42)
+    logits = torch.randn(batch_size, vocab_size, device="cuda")
+    if temperature_kind == "none":
+        temperature = None
+        probs_ref = torch.softmax(logits, dim=-1)
+    elif temperature_kind == "scalar":
+        temperature = 0.5
+        probs_ref = torch.softmax(logits / temperature, dim=-1)
+    else:
+        temperature = torch.full((batch_size,), 0.5, device="cuda")
+        probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=False
+    )
+
+    assert torch.allclose(probs, probs_ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+def test_softmax_blackwell_random_per_row_temperature_contract(vocab_size):
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Cake softmax routes require SM100 or SM103")
+
+    torch.manual_seed(42)
+    rows = 989
+    logits = torch.randn(rows, vocab_size, device="cuda")
+    temperature = torch.rand(rows, device="cuda")
+    route = flashinfer.sampling._blackwell_softmax_route_for_testing(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    probs = flashinfer.sampling.softmax(
+        logits, temperature=temperature, enable_pdl=True
+    )
+    probs_ref = torch.softmax(logits / temperature[:, None], dim=-1)
+
+    assert route != flashinfer.sampling._BLACKWELL_SOFTMAX_ROUTE_FALLBACK
+    assert probs.data_ptr() != logits.data_ptr()
+    torch.testing.assert_close(
+        probs,
+        probs_ref,
+        atol=1e-3,
+        rtol=1e-3,
+    )
 
 
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
@@ -373,10 +725,15 @@ def test_top_k_top_p_joint_sampling_from_probs(batch_size, vocab_size, p):
         ]
 
 
-@pytest.mark.parametrize("batch_size", [1, 99, 989])
-@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
-@pytest.mark.parametrize("k", [100])
-@pytest.mark.parametrize("p", [0.1, 0.5])
+@parametrize_product(
+    {
+        "batch_size": [1, 99, 989],
+        "vocab_size": [111, 32000, 128256],
+        "k": [100],
+        "p": [0.1, 0.5],
+    },
+    regular=pairwise_product_cases,
+)
 def test_top_k_top_p_sampling_from_probs_logits_alignment(batch_size, vocab_size, k, p):
     torch.manual_seed(42)
     logits = torch.randn(batch_size, vocab_size, device="cuda:0") * 5
@@ -555,6 +912,71 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k, distribution, dtype):
         f"Some rows have more non-zero elements than allowed by ties. "
         f"nonzero_counts max: {nonzero_counts.max()}, max_valid max: {max_valid.max()}"
     )
+
+
+@pytest.mark.parametrize("top_k_arr", [True, False])
+@pytest.mark.parametrize("is_deterministic", [None, False, True])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_renorm_probs_custom_op(top_k_arr, is_deterministic, dtype):
+    torch.manual_seed(42)
+    probs = torch.softmax(torch.randn(4, 128, device="cuda:0"), dim=-1).to(dtype)
+    if top_k_arr:
+        top_k = torch.tensor([1, 10, 50, 128], dtype=torch.int32, device=probs.device)
+        maybe_top_k_arr, top_k_val = top_k, 0
+    else:
+        top_k = 10
+        maybe_top_k_arr, top_k_val = None, top_k
+    row_states_buffer = torch.zeros(1024 * 1024, dtype=torch.uint8, device=probs.device)
+    op = flashinfer.sampling.get_sampling_module().top_k_renorm_probs
+
+    if is_deterministic is None:
+        # Preserve the four-argument call used by ProbsTopKOp.
+        actual = op(probs, maybe_top_k_arr, top_k_val, row_states_buffer)
+    else:
+        actual = op(
+            probs, maybe_top_k_arr, top_k_val, row_states_buffer, is_deterministic
+        )
+
+    expected = flashinfer.sampling.top_k_renorm_probs(
+        probs, top_k, is_deterministic=bool(is_deterministic)
+    )
+    torch.testing.assert_close(actual, expected)
+
+
+@pytest.mark.parametrize("batch_size", [1, 99, 989])
+@pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
+@pytest.mark.parametrize("k", [10, 500])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_top_k_renorm_probs_deterministic(batch_size, vocab_size, k, dtype):
+    """is_deterministic=True must be bitwise reproducible across invocations.
+
+    The default multi-CTA path accumulates the renormalization sum with float
+    atomicAdd, so CTA arrival order changes the last-bit rounding and repeated
+    calls on identical input differ bitwise. Replicated execution (e.g.
+    tensor-parallel ranks running the sampler redundantly on identical inputs)
+    then diverges, which desynchronizes downstream state. The deterministic
+    mode accumulates in fixed-point integer atomics instead.
+    """
+    if k > vocab_size:
+        pytest.skip("k should be less than vocab_size")
+
+    torch.manual_seed(42)
+    logits = normal_distribution(1)((batch_size, vocab_size), "cuda:0")
+    probs = torch.softmax(logits, dim=-1).to(dtype)
+
+    base = flashinfer.sampling.top_k_renorm_probs(probs, k, is_deterministic=True)
+    for _ in range(10):
+        again = flashinfer.sampling.top_k_renorm_probs(probs, k, is_deterministic=True)
+        assert torch.equal(again, base), "deterministic renorm differed across calls"
+
+    # Same kept support as the default kernel; values match within the
+    # fixed-point quantization noise (far below the test tolerance).
+    ref = flashinfer.sampling.top_k_renorm_probs(probs, k)
+    assert torch.equal(base > 0, ref > 0)
+    torch.testing.assert_close(base, ref, rtol=1e-3, atol=1e-3)
+
+    sums = base.float().sum(dim=-1)
+    torch.testing.assert_close(sums, torch.ones_like(sums), rtol=1e-2, atol=1e-2)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])

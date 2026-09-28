@@ -54,11 +54,13 @@ class TestKernelRequiresWeights:
 
         moe = fm.MoEConfig(
             routing=fm.RoutingConfig(num_experts=2, top_k=1),
-            quant=fm.QuantConfig(
-                variant=(
-                    fm.QuantVariant.MXFP4
-                    if variant == "mxfp4"
-                    else fm.QuantVariant.NVFP4
+            quant=(
+                fm.QuantConfig(
+                    weight=fm.QuantFormat.MXFP4, activation=fm.QuantFormat.MXFP8
+                )
+                if variant == "mxfp4"
+                else fm.QuantConfig(
+                    weight=fm.QuantFormat.NVFP4, activation=fm.QuantFormat.NVFP4
                 )
             ),
             experts=fm.ExpertConfig(intermediate_size=128, local_num_experts=2),
