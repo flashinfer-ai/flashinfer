@@ -6398,9 +6398,8 @@ def kernel_vsa_sm90_bf16_fwd(Q: cutlass.GridConstant[TensorMap], K: cutlass.Grid
             partner_idle = cutlass.Int32((n_other == 0))
             self_idle = cutlass.Int32((n_own == 0))
             skip_merge = cutlass.Int32((1 if (partner_idle != 0) else (1 if (self_idle != 0) else 0)))
-            if (is_split != 0):
-                _if_condition_46 = cutlass.Boolean((skip_merge != 0))
-                store_wg[0] = cutlass.Int32(cutlass.select_(_if_condition_46, cutlass.Int32((0 if (self_idle != 0) else 1)), store_wg[0]))
+            _if_condition_46 = cutlass.Boolean((self_idle != 0))
+            store_wg[0] = cutlass.Int32(cutlass.select_(_if_condition_46, cutlass.Int32(0), store_wg[0]))
             do_merge[0] = cutlass.Int32((1 if (is_split != 0) else 0))
             _if_condition_47 = cutlass.Boolean((skip_merge != 0))
             do_merge[0] = cutlass.Int32(cutlass.select_(_if_condition_47, cutlass.Int32(0), do_merge[0]))

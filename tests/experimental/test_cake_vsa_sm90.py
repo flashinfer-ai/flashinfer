@@ -1015,3 +1015,57 @@ def test_plan_ragged_keeps_the_previous_load_model():
     mask.scatter_(-1, idx, torch.arange(64) < counts.unsqueeze(-1))
     plan = plan_vsa_sm90(mask, sms=132)
     assert len(_cta_tiles(plan)) == 132
+
+
+def _odd_single_block_mask():
+    """Pair plan with one odd block per head that has a single KV block.
+
+    129 query blocks per head at 64 KV blocks each pair up to 64 pair tiles and
+    leave query block 128 (one KV block) alone on warpgroup 0 (tile mode 2).
+    """
+    g = torch.Generator().manual_seed(3)
+    mask = torch.zeros((2, 129, 1024), dtype=torch.bool)
+    for head in range(2):
+        for row in range(129):
+            count = 1 if row == 128 else 64
+            mask[head, row, torch.randperm(1024, generator=g)[:count]] = True
+    return mask
+
+
+def test_plan_odd_block_of_a_pair_plan_runs_alone_on_warpgroup_0():
+    plan = plan_vsa_sm90(_odd_single_block_mask(), sms=132)
+    assert plan["mode"] == "pair"
+    meta, stride = plan["meta"], plan["tile_stride"]
+    odd = [
+        meta[c * stride + i]
+        for c in range(plan["num_ctas"])
+        for i in range(int(meta[c * stride, META_NTILES]))
+        if int(meta[c * stride + i, 3]) == 2
+    ]
+    assert len(odd) == 2
+    for row in odd:
+        assert int(row[1]) == int(row[2]) == 128
+        assert int(row[META_NSEQ]) == 1
+        assert (int(row[META_NOWN]), int(row[META_NOWN + 1])) == (1, 0)
+
+
+@requires_hopper
+@pytest.mark.parametrize("backend", ["cake", "cake_cute"])
+def test_odd_single_block_tile_never_stores_from_the_idle_warpgroup(backend):
+    # On a mode-2 tile both warpgroups address the same 64 output rows; the
+    # idle warpgroup's accumulator is 0 x rcp(0) = NaN and its store must not
+    # happen (it raced the owner's store).  NaN-filled output, many runs.
+    mask = _odd_single_block_mask().cuda()
+    torch.manual_seed(11)
+    q, k, v = _inputs(2, 129, 1024)
+    wrapper = _wrapper(mask, backend=backend)
+    expected = _reference(q, k, v, mask, 128**-0.5)
+    for _ in range(20):
+        out = torch.full(
+            (2 * 129 * 64, 1, 128), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        actual = wrapper.run(q, k, v, out=out)
+        assert bool(torch.isfinite(actual).all()), (
+            "an output row was never written or holds NaN"
+        )
+        torch.testing.assert_close(actual.float(), expected, atol=0.01, rtol=0.01)
