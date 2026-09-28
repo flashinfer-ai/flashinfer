@@ -1979,7 +1979,7 @@ def test_swapab_dispatch_mixed_follows_dual_tile_routing(
         (1024, 112, 336, "hot"),
         (1024, 112, 336, "empty"),
         (2048, 896, 0, "balanced"),
-        (4096, 112, 336, "balanced"),
+        (8192, 112, 336, "balanced"),
     ],
 )
 @pytest.mark.parametrize("threshold_permille", [1, 10**6])
@@ -2114,9 +2114,9 @@ def test_moe_sort_mixed_lists_match_dispatch(
     if min_total_rows:
         # The rule removed every window: each expert keeps all its dense tiles.
         assert len(narrow_ref) == 0 and len(wide_ref) == len(expert)
-    elif not max_rows and distribution == "balanced":
-        # Balanced routings (about 146 or 292 rows per expert) always hold
-        # experts whose cover ends in a window; skewed ones need not.
+    elif not max_rows and distribution == "balanced" and tokens == 8192:
+        # 146 rows per expert on the rank: covers of 192 (one window) beat
+        # the 256-row padding; smaller or skewed routings need no window.
         assert len(narrow_ref) > 0
     assert (lists[active_list][len(wide_ref) :] == -7).all()
     assert (lists["narrow_list"][len(narrow_ref) :] == -7).all()
