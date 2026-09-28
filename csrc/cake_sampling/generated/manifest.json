@@ -42,7 +42,7 @@
     "top_p": "shortest sorted prefix whose exclusive exact fixed-point mass is below p * mass(top-k), renormalized in float64; p clamped to (0, 1] (p <= 0 -> argmax, NaN -> 1)"
   },
   "slab_entries": 1024,
-  "source_sha256": "1695f8d5fc28c82d2abd521b8179d6a8007e2cb771288d495123839ad38e10a5",
+  "source_sha256": "adf6d3c16070b767477032e599e2b33020f3c6811456b13b2c4ae71c9b915b37",
   "stage1": [
     {
       "block_threads": 512,

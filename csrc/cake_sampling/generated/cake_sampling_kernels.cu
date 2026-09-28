@@ -199,7 +199,9 @@ kernel_cake_radix_topk_c1_e4(float* __restrict__ probs, int* __restrict__ topk_a
             vals[3] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 2 <= 128) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_2 = tid; i_2 < 2048; i_2 += 512) {
         hist0[i_2] = 0;
         hist1[i_2] = 0;
@@ -2288,7 +2290,9 @@ kernel_cake_radix_topk_c1_e8(float* __restrict__ probs, int* __restrict__ topk_a
             vals[7] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 2 <= 128) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_2 = tid; i_2 < 2048; i_2 += 512) {
         hist0[i_2] = 0;
         hist1[i_2] = 0;
@@ -4823,7 +4827,9 @@ kernel_cake_radix_topk_c1_e16(float* __restrict__ probs, int* __restrict__ topk_
             vals[15] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 2 <= 128) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_4 = tid; i_4 < 2048; i_4 += 512) {
         hist0[i_4] = 0;
         hist1[i_4] = 0;
@@ -8250,7 +8256,9 @@ kernel_cake_radix_topk_c1_e32(float* __restrict__ probs, int* __restrict__ topk_
             vals[31] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 2 <= 128) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_8 = tid; i_8 < 2048; i_8 += 512) {
         hist0[i_8] = 0;
         hist1[i_8] = 0;
@@ -12851,7 +12859,9 @@ kernel_cake_radix_topk_c2_e4(float* __restrict__ probs, int* __restrict__ topk_a
             vals[3] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 3 <= 256) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_2 = tid; i_2 < 2048; i_2 += 512) {
         hist0[i_2] = 0;
         hist1[i_2] = 0;
@@ -15232,7 +15242,9 @@ kernel_cake_radix_topk_c2_e16(float* __restrict__ probs, int* __restrict__ topk_
             vals[15] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 3 <= 256) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_4 = tid; i_4 < 2048; i_4 += 512) {
         hist0[i_4] = 0;
         hist1[i_4] = 0;
@@ -18869,7 +18881,9 @@ kernel_cake_radix_topk_c2_e32(float* __restrict__ probs, int* __restrict__ topk_
             vals[31] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 3 <= 256) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_8 = tid; i_8 < 2048; i_8 += 512) {
         hist0[i_8] = 0;
         hist1[i_8] = 0;
@@ -23798,7 +23812,9 @@ kernel_cake_radix_topk_c4_e16(float* __restrict__ probs, int* __restrict__ topk_
             vals[15] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 5 <= 512) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_4 = tid; i_4 < 2048; i_4 += 512) {
         hist0[i_4] = 0;
         hist1[i_4] = 0;
@@ -27643,7 +27659,9 @@ kernel_cake_radix_topk_c4_e32(float* __restrict__ probs, int* __restrict__ topk_
             vals[31] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 5 <= 512) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_8 = tid; i_8 < 2048; i_8 += 512) {
         hist0[i_8] = 0;
         hist1[i_8] = 0;
@@ -32780,7 +32798,9 @@ kernel_cake_radix_topk_c8_e16(float* __restrict__ probs, int* __restrict__ topk_
             vals[15] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 9 <= 1024) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_4 = tid; i_4 < 2048; i_4 += 512) {
         hist0[i_4] = 0;
         hist1[i_4] = 0;
@@ -37041,7 +37061,9 @@ kernel_cake_radix_topk_c8_e32(float* __restrict__ probs, int* __restrict__ topk_
             vals[31] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 9 <= 1024) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_8 = tid; i_8 < 2048; i_8 += 512) {
         hist0[i_8] = 0;
         hist1[i_8] = 0;
@@ -42922,7 +42944,9 @@ kernel_cake_radix_topk_c8_e48(float* __restrict__ probs, int* __restrict__ topk_
             vals[47] = 0.0f;
         }
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 9 <= 1024) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     for (int i_12 = tid; i_12 < 2048; i_12 += 512) {
         hist0[i_12] = 0;
         hist1[i_12] = 0;
@@ -49221,7 +49245,9 @@ kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 2 <= 128) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     if ((vocab & 3) == 0) {
         for (int c = 0; c < nchunks; c++) {
             int vid = tid;
@@ -58571,7 +58597,9 @@ kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 3 <= 256) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     if ((vocab & 3) == 0) {
         for (int c = 0; c < nchunks; c++) {
             int vid = tid;
@@ -68267,7 +68295,9 @@ kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 5 <= 512) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     if ((vocab & 3) == 0) {
         for (int c = 0; c < nchunks; c++) {
             int vid = tid;
@@ -78325,7 +78355,9 @@ kernel_cake_radix_topk_c8_e16s(float* __restrict__ probs, int* __restrict__ topk
         scal[tid] = 0;
     }
     __syncthreads();
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    if (gridDim.x * 9 <= 1024) {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     if ((vocab & 3) == 0) {
         for (int c = 0; c < nchunks; c++) {
             int vid = tid;
