@@ -49,12 +49,12 @@
 
 #include <cuda.h>
 #include <cuda_runtime.h>
-#include <mutex>
-#include <set>
-#include <utility>
 
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <set>
+#include <utility>
 
 #include "tvm_ffi_utils.h"
 
@@ -63,8 +63,8 @@ namespace cake_sampling {
 
 constexpr int64_t kSlab = CAKE_SAMPLING_SLAB;
 constexpr int64_t kFusedTailKCap = CAKE_SAMPLING_FUSED_TAIL_KCAP;
-// Stage-1 launch_flags bits (see RadixTopK): fused stage-2/3 tail, early PDL trigger, stream pre-pass
-// trigger point.
+// Stage-1 launch_flags bits (see RadixTopK): fused stage-2/3 tail, early PDL trigger, stream
+// pre-pass trigger point.
 constexpr int64_t kFlagFuseTail = 1;
 constexpr int64_t kFlagEarlyTrigger = 2;
 constexpr int64_t kFlagStreamPrepass = 4;
@@ -199,23 +199,23 @@ inline void CheckSlab(const TensorView& vals, const TensorView& idx, const Tenso
 //   topk_arr   int32 [batch] (only read when topk_kind == kTopKPerRow; pass any int32 CUDA tensor
 //   otherwise) cluster/ept/stream_variant select the frozen variant; a register-resident variant
 //   (stream_variant == 0) needs cluster * ept * threads >= vocab, a streaming one covers any vocab.
-//   launch_flags bit 0 (fused tail): every row whose k <= CAKE_SAMPLING_FUSED_TAIL_KCAP runs stage 2/3
-//   (top-p, sample, sorted write-back, renorm; same semantics and outputs as SparseTopPSample) inside
-//   this kernel, so the host must not launch SparseTopPSample afterwards; the stage-2/3 arguments
-//   (topp_arr / topp_scalar / topp_kind / out_samples / out_renorm / seed / offset / emit_renorm) are
-//   only read then.  Rows with k above the fused capacity are left to SparseTopPSample, so the host
-//   sets bit 0 only when the largest top-k of the batch fits.  Without it pass any valid CUDA
-//   tensors for the stage-2/3 tensors (they are never dereferenced).
-//   launch_flags bit 1 (early PDL trigger): the kernel signals griddepcontrol.launch_dependents early
-//   (a register-resident variant once its row is in registers, a streaming variant at the point bit 2
-//   selects), so a programmatic-dependent SparseTopPSample launch is resident (spinning in its
-//   griddepcontrol.wait) when stage 1 ends.  Its CTAs are placed on the SMs free at that moment and
-//   keep that placement, so the host sets bit 1 only when the batch fits next to the last stage-1
-//   wave (see cake_sampling.py); otherwise the trigger happens at CTA exit.
-//   launch_flags bit 2 (stream pre-pass trigger): with bit 1, a streaming variant triggers before its
-//   first pass instead of after its filter pass (Blackwell / Rubin win 0.5-1 us there, Hopper loses
-//   1.4-1.9 us, so the host sets it for compute capability >= 10).  Residents ignore it.  Other bits
-//   are ignored.
+//   launch_flags bit 0 (fused tail): every row whose k <= CAKE_SAMPLING_FUSED_TAIL_KCAP runs stage
+//   2/3 (top-p, sample, sorted write-back, renorm; same semantics and outputs as SparseTopPSample)
+//   inside this kernel, so the host must not launch SparseTopPSample afterwards; the stage-2/3
+//   arguments (topp_arr / topp_scalar / topp_kind / out_samples / out_renorm / seed / offset /
+//   emit_renorm) are only read then.  Rows with k above the fused capacity are left to
+//   SparseTopPSample, so the host sets bit 0 only when the largest top-k of the batch fits. Without
+//   it pass any valid CUDA tensors for the stage-2/3 tensors (they are never dereferenced).
+//   launch_flags bit 1 (early PDL trigger): the kernel signals griddepcontrol.launch_dependents
+//   early (a register-resident variant once its row is in registers, a streaming variant at the
+//   point bit 2 selects), so a programmatic-dependent SparseTopPSample launch is resident (spinning
+//   in its griddepcontrol.wait) when stage 1 ends.  Its CTAs are placed on the SMs free at that
+//   moment and keep that placement, so the host sets bit 1 only when the batch fits next to the
+//   last stage-1 wave (see cake_sampling.py); otherwise the trigger happens at CTA exit.
+//   launch_flags bit 2 (stream pre-pass trigger): with bit 1, a streaming variant triggers before
+//   its first pass instead of after its filter pass (Blackwell / Rubin win 0.5-1 us there, Hopper
+//   loses 1.4-1.9 us, so the host sets it for compute capability >= 10).  Residents ignore it.
+//   Other bits are ignored.
 void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64_t topk_kind,
                TensorView out_vals, TensorView out_idx, TensorView out_count, int64_t cluster,
                int64_t ept, int64_t stream_variant, TensorView topp_arr, double topp_scalar,
@@ -315,9 +315,9 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   int flags_i =
       static_cast<int>(launch_flags & (kFlagFuseTail | kFlagEarlyTrigger | kFlagStreamPrepass));
   // Argument order = the frozen kernel signature (see the generated source).
-  void* args[] = {&probs_ptr, &topk_ptr,  &vals_ptr,   &idx_ptr,    &count_ptr, &vocab_i,  &topk_i,
-                  &kind_i,    &topp_ptr,  &samples_ptr, &renorm_ptr, &topp_f,    &pkind_i,  &seed_lo,
-                  &seed_hi,   &offset_lo, &offset_hi,  &renorm_i,   &flags_i};
+  void* args[] = {&probs_ptr, &topk_ptr,  &vals_ptr,    &idx_ptr,    &count_ptr, &vocab_i, &topk_i,
+                  &kind_i,    &topp_ptr,  &samples_ptr, &renorm_ptr, &topp_f,    &pkind_i, &seed_lo,
+                  &seed_hi,   &offset_lo, &offset_hi,   &renorm_i,   &flags_i};
 
   cudaLaunchConfig_t config = {};
   config.gridDim = dim3(static_cast<uint32_t>(batch * v->cluster), 1, 1);

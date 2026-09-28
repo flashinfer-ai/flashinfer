@@ -498,7 +498,9 @@ def top_k_top_p_sampling_from_probs(
     if fused:
         launch_flags = _FLAG_FUSE_TAIL
     else:
-        launch_flags = _early_trigger_flag(batch, cluster, _sm_count(probs.device.index))
+        launch_flags = _early_trigger_flag(
+            batch, cluster, _sm_count(probs.device.index)
+        )
         if stream_variant:
             launch_flags |= _stream_prepass_flag(probs.device.index)
     module.radix_topk(

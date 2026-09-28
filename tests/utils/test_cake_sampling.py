@@ -244,7 +244,9 @@ def _ws(batch):
     )
 
 
-def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True, flags=0) -> Run:
+def _run(
+    probs, k, p, seed, offset, *, variant=None, out=None, pdl=True, flags=0
+) -> Run:
     batch = probs.shape[0]
     ws = _ws(batch)
     renorm = torch.full((batch, SLAB), float("nan"), device="cuda")
@@ -602,7 +604,9 @@ def test_per_request_tensors_and_routes():
         assert pick(64, 32768, sm_count=sm, top_k_max=1000) == (2, 32, False)
         assert pick(1, 262144, sm_count=sm, top_k_max=1000) == (8, 16, True)
         assert pick(128, 32768, sm_count=sm, top_k_max=1000) == (1, 16, True)
-        assert pick(1, 128256, sm_count=sm, top_k_max=50) == pick(1, 128256, sm_count=sm)
+        assert pick(1, 128256, sm_count=sm, top_k_max=50) == pick(
+            1, 128256, sm_count=sm
+        )
     assert pick(16, 128256, sm_count=148, top_k_max=1000) == (4, 16, True)
     assert pick(16, 128256, sm_count=212, top_k_max=1000) == (8, 32, False)
     # V = 151936 at k = 1000, B <= 8: every table takes the (8, 48) resident (H100 15.6 vs 16.9 us for the
@@ -1167,13 +1171,17 @@ def test_fused_tail_matches_two_launch_form():
                     smem_limit=_FULL_SMEM_OPTIN,
                 )
                 assert (c, e) != (8, 48), (sm_count, vocab, batch)
-    streams_ok = _device_streams()  # 12.x devices (99 KB opt-in) cannot launch the streaming variants
+    streams_ok = (
+        _device_streams()
+    )  # 12.x devices (99 KB opt-in) cannot launch the streaming variants
     for vocab, batch in ((32768, 5), (128256, 3), (262144, 2)):
         if vocab > 196608 and not streams_ok:
             continue  # no frozen variant covers this vocabulary here; the dispatcher routes to top_k_first
         probs = _probs(batch, vocab, seed=41 + vocab % 97)
         pn = probs.cpu().numpy()
-        pn[0, (np.arange(300) * 13) % vocab] = np.float32(2**-11)  # ties across the k boundary
+        pn[0, (np.arange(300) * 13) % vocab] = np.float32(
+            2**-11
+        )  # ties across the k boundary
         pn[1, [7, 4096]] = np.inf
         probs.copy_(torch.tensor(pn, device="cuda"))
         p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
@@ -1198,13 +1206,24 @@ def test_fused_tail_matches_two_launch_form():
                 fused, _ = _run_and_check(probs, k, p, 0xC0DE, 3, pdl=pdl)
                 for v1 in s1:
                     two = _run(probs, k, p, 0xC0DE, 3, variant=(v1, (32, 2)), pdl=pdl)
-                    assert np.array_equal(two.samples, fused.samples), (vocab, k, v1, pdl)
+                    assert np.array_equal(two.samples, fused.samples), (
+                        vocab,
+                        k,
+                        v1,
+                        pdl,
+                    )
                     assert np.array_equal(two.count, fused.count), (vocab, k, v1)
                     for r in range(batch):
                         kr = int(k if isinstance(k, int) else k[r])
-                        assert np.array_equal(two.idx[r, :kr], fused.idx[r, :kr]), (vocab, k, v1, r)
+                        assert np.array_equal(two.idx[r, :kr], fused.idx[r, :kr]), (
+                            vocab,
+                            k,
+                            v1,
+                            r,
+                        )
                         assert np.array_equal(
-                            two.vals[r, :kr].view(np.uint32), fused.vals[r, :kr].view(np.uint32)
+                            two.vals[r, :kr].view(np.uint32),
+                            fused.vals[r, :kr].view(np.uint32),
                         ), (vocab, k, v1, r)
                         assert np.array_equal(
                             two.renorm[r, :kr].view(np.uint32),
@@ -1238,7 +1257,9 @@ def test_early_trigger_flag_and_bitwise_outputs():
     _require_supported_device()
     # streams: pre-pass point on Blackwell / Rubin (cc >= 10), the post-filter point on Hopper.
     major = torch.cuda.get_device_capability(torch.cuda.current_device())[0]
-    assert _stream_prepass_flag(torch.cuda.current_device()) == (4 if major >= 10 else 0)
+    assert _stream_prepass_flag(torch.cuda.current_device()) == (
+        4 if major >= 10 else 0
+    )
     man = load_manifest()
     probs = _probs(32, 32768, seed=17)
     pn = probs.cpu().numpy()
@@ -1251,18 +1272,39 @@ def test_early_trigger_flag_and_bitwise_outputs():
             if not v.get("stream", 0) and 512 * v["cluster"] * v["ept"] < 32768:
                 continue
             s1 = (v["cluster"], v["ept"], bool(v.get("stream", 0)))
-            for flags in ((0, 2, 6, 4) if s1[2] else (0, 2)):
+            for flags in (0, 2, 6, 4) if s1[2] else (0, 2):
                 run = _run(probs, k, p, 0xEA51, 4, variant=(s1, (256, 4)), flags=flags)
                 _check(run, pn, k, p, 0xEA51, 4)
                 assert np.array_equal(run.samples, base.samples), (s1, flags)
-                assert np.array_equal(run.vals[:, :k].view(np.uint32), base.vals[:, :k].view(np.uint32))
+                assert np.array_equal(
+                    run.vals[:, :k].view(np.uint32), base.vals[:, :k].view(np.uint32)
+                )
                 assert np.array_equal(run.idx[:, :k], base.idx[:, :k]), (s1, flags)
     # bit 0 on the tail-less (8, 48) resident is rejected; bit 1 alone is accepted there.
     vals, idxs, cnt = _ws(2)
     probs2 = _probs(2, 32768, seed=3)
     module = load_cake_sampling_module()
     stream = torch.cuda.current_stream().cuda_stream
-    args = [probs2, cnt, 10, 1, vals, idxs, cnt, 8, 48, 0, probs2, 0.9, 1, cnt, vals, 0, 0, 0]
+    args = [
+        probs2,
+        cnt,
+        10,
+        1,
+        vals,
+        idxs,
+        cnt,
+        8,
+        48,
+        0,
+        probs2,
+        0.9,
+        1,
+        cnt,
+        vals,
+        0,
+        0,
+        0,
+    ]
     module.radix_topk(*args, 2, stream)
     torch.cuda.synchronize()
     with pytest.raises(Exception, match="fused tail"):
