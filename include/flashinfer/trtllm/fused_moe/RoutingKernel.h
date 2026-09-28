@@ -153,6 +153,29 @@ struct DataBase {
   int32_t* mPtrCtaIdxXyToMnLimitAlt{nullptr};
   int32_t* mPtrNumNonExitingCtasAlt{nullptr};
   int32_t* mPtrNumNonExitingCtasBaseActive{nullptr};
+  //
+  // Optional mixed work lists of the dual-tile routing (mMixedNarrowTile > 0):
+  // per local expert with c valid rows, nwide dense tiles of the chosen padding
+  // followed by nnarrow mMixedNarrowTile-row windows (mMixedRowUnit-row offsets
+  // of the permutation) covering the fewest rows, the same closed form as
+  // swapab_dispatch_mixed; the dense tiles of the chosen padding go to
+  // mPtrMixedWideList (base) or mPtrMixedAltWideList (alternate) as group
+  // indices of that list, the other count is 0. An expert with more than
+  // mMixedMaxRows rows (0 = no limit), or every expert when the padded row
+  // total is below mMixedMinTotalRows, keeps all its dense tiles and gets no
+  // window. mPtrMixedNarrowCountBase (optional) = window count under the base
+  // padding, 0 under the alternate one.
+  int32_t mMixedNarrowTile{0};
+  int32_t mMixedRowUnit{0};
+  int32_t mMixedMaxRows{0};
+  int32_t mMixedMinTotalRows{0};
+  int32_t* mPtrMixedWideList{nullptr};
+  int32_t* mPtrMixedWideCount{nullptr};
+  int32_t* mPtrMixedAltWideList{nullptr};
+  int32_t* mPtrMixedAltWideCount{nullptr};
+  int32_t* mPtrMixedNarrowList{nullptr};
+  int32_t* mPtrMixedNarrowCount{nullptr};
+  int32_t* mPtrMixedNarrowCountBase{nullptr};
 };
 
 template <typename InputT_, typename OutputT_, int MaxNumExperts_, int MaxNumTopExperts_>
@@ -206,6 +229,18 @@ struct KernelParamsBase {
   int32_t* mPtrCtaIdxXyToMnLimitAlt = nullptr;
   int32_t* mPtrNumNonExitingCtasAlt = nullptr;
   int32_t* mPtrNumNonExitingCtasBaseActive = nullptr;
+  // Mixed work lists of the dual-tile routing (see DataBase).
+  int32_t mMixedNarrowTile = 0;
+  int32_t mMixedRowUnit = 0;
+  int32_t mMixedMaxRows = 0;
+  int32_t mMixedMinTotalRows = 0;
+  int32_t* mPtrMixedWideList = nullptr;
+  int32_t* mPtrMixedWideCount = nullptr;
+  int32_t* mPtrMixedAltWideList = nullptr;
+  int32_t* mPtrMixedAltWideCount = nullptr;
+  int32_t* mPtrMixedNarrowList = nullptr;
+  int32_t* mPtrMixedNarrowCount = nullptr;
+  int32_t* mPtrMixedNarrowCountBase = nullptr;
 
   // Public initialization function - make it a template to accept different Data types
   template <typename DataType>
@@ -246,6 +281,17 @@ struct KernelParamsBase {
     mPtrCtaIdxXyToMnLimitAlt = data.mPtrCtaIdxXyToMnLimitAlt;
     mPtrNumNonExitingCtasAlt = data.mPtrNumNonExitingCtasAlt;
     mPtrNumNonExitingCtasBaseActive = data.mPtrNumNonExitingCtasBaseActive;
+    mMixedNarrowTile = data.mMixedNarrowTile;
+    mMixedRowUnit = data.mMixedRowUnit;
+    mMixedMaxRows = data.mMixedMaxRows;
+    mMixedMinTotalRows = data.mMixedMinTotalRows;
+    mPtrMixedWideList = data.mPtrMixedWideList;
+    mPtrMixedWideCount = data.mPtrMixedWideCount;
+    mPtrMixedAltWideList = data.mPtrMixedAltWideList;
+    mPtrMixedAltWideCount = data.mPtrMixedAltWideCount;
+    mPtrMixedNarrowList = data.mPtrMixedNarrowList;
+    mPtrMixedNarrowCount = data.mPtrMixedNarrowCount;
+    mPtrMixedNarrowCountBase = data.mPtrMixedNarrowCountBase;
   }
 };
 

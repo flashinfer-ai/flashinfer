@@ -172,9 +172,16 @@ __host__ __device__ constexpr T divUpMulTileN(T a, T tileN) {
 // padded row totals of the two tiles, scan the chosen padding and write the tile lists. Every
 // thread owns ExpertsPerThread consecutive experts (threadIdx.x * ExpertsPerThread + e); count[e]
 // is 0 for experts that are not local or past mNumExperts. The list-writing loops are strided by
-// (strideStart, stride) so co-operating blocks share the work. Runs three block scans; all
-// threads of the block must call it. Returns the chosen padding log2 and the per-expert padded
-// row offsets of the chosen padding.
+// (strideStart, stride) so co-operating blocks share the work. Runs three block scans (five
+// with the mixed work lists, DataBase::mMixedNarrowTile); all threads of the block must call it.
+// Returns the chosen padding log2 and the per-expert padded row offsets of the chosen padding.
+//
+// Mixed work lists: per expert with c rows, nwide dense tiles of the chosen padding followed by
+// nnarrow narrow-tile windows covering the fewest rows (ties to fewer windows; the same closed
+// form as swapab_dispatch_mixed in moe_swapab_dispatch.cu, which this replaces on the routing's
+// critical path). Experts above mMixedMaxRows rows, or every expert when the padded row total is
+// below mMixedMinTotalRows, keep all their dense tiles (no window: a window on a large expert
+// streams its weights a second time for a saving below one tile).
 template <typename KernelParams>
 __host__ __device__ inline bool routingDualTileEnabled(KernelParams const& params) {
   return params.mPaddingLog2Alt > params.mPaddingLog2 &&
@@ -212,6 +219,49 @@ __device__ __forceinline__ int32_t routingDualTilePadding(
   }
   Scan(tempStorage).ExclusiveSum(padded, paddedOffset, paddedTotal);
   __syncthreads();
+  bool const mixed = params.mMixedNarrowTile > 0 && params.mPtrMixedNarrowList != nullptr;
+  int32_t nwide[ExpertsPerThread];
+  int32_t nnarrow[ExpertsPerThread];
+  int32_t wideOffset[ExpertsPerThread];
+  int32_t narrowOffset[ExpertsPerThread];
+  int32_t wideTotal = 0;
+  int32_t narrowTotal = 0;
+  if (mixed) {
+    int32_t const rows = 1 << log2Chosen;
+    int32_t const narrow = params.mMixedNarrowTile;
+    int32_t const gu = rows / params.mMixedRowUnit;
+    bool const windows = paddedTotal >= params.mMixedMinTotalRows;
+#pragma unroll
+    for (int e = 0; e < ExpertsPerThread; e++) {
+      int32_t const c = count[e];
+      int32_t nw = 0;
+      int32_t nn = 0;
+      if (c > 0) {
+        if (!windows || (params.mMixedMaxRows > 0 && c > params.mMixedMaxRows)) {
+          nw = padded[e] >> log2Chosen;
+        } else {
+          int32_t bestCover = 0x7fffffff;
+          for (int32_t a = 0; a < gu; ++a) {
+            int32_t const rem = c - a * narrow;
+            int32_t const w = rem > 0 ? (rem + rows - 1) / rows : 0;
+            int32_t const cover = w * rows + a * narrow;
+            if (cover < bestCover) {
+              bestCover = cover;
+              nw = w;
+              nn = a;
+            }
+            if (rem <= 0) break;
+          }
+        }
+      }
+      nwide[e] = nw;
+      nnarrow[e] = nn;
+    }
+    Scan(tempStorage).ExclusiveSum(nwide, wideOffset, wideTotal);
+    __syncthreads();
+    Scan(tempStorage).ExclusiveSum(nnarrow, narrowOffset, narrowTotal);
+    __syncthreads();
+  }
 #pragma unroll
   for (int e = 0; e < ExpertsPerThread; e++) {
     if (count[e] > 0) {
@@ -237,6 +287,30 @@ __device__ __forceinline__ int32_t routingDualTilePadding(
               min(paddedOffset[e] + mulLog2<int32_t>(t + 1, log2Alt), rowLimit);
         }
       }
+      if (mixed) {
+        // Dense tiles as group indices of the chosen padding's list, then the
+        // windows as row offsets (mMixedRowUnit rows) of the permutation.
+        int32_t* const wl = useAlt ? params.mPtrMixedAltWideList : params.mPtrMixedWideList;
+        int32_t const first = paddedOffset[e] >> log2Chosen;
+        for (int32_t t = strideStart; t < nwide[e]; t += stride) {
+          wl[wideOffset[e] + t] = first + t;
+        }
+        int32_t const narrowRow0 = paddedOffset[e] + mulLog2<int32_t>(nwide[e], log2Chosen);
+        for (int32_t i = strideStart; i < nnarrow[e]; i += stride) {
+          params.mPtrMixedNarrowList[narrowOffset[e] + i] =
+              (narrowRow0 + i * params.mMixedNarrowTile) / params.mMixedRowUnit;
+        }
+      }
+    }
+  }
+  if (writeCounts && mixed) {
+    params.mPtrMixedWideCount[0] = useAlt ? 0 : wideTotal;
+    if (params.mPtrMixedAltWideCount != nullptr) {
+      params.mPtrMixedAltWideCount[0] = useAlt ? wideTotal : 0;
+    }
+    params.mPtrMixedNarrowCount[0] = narrowTotal;
+    if (params.mPtrMixedNarrowCountBase != nullptr) {
+      params.mPtrMixedNarrowCountBase[0] = useAlt ? 0 : narrowTotal;
     }
   }
   if (writeCounts) {

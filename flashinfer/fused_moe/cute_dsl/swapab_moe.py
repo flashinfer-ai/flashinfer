@@ -332,6 +332,8 @@ def swapab_dispatch_mixed(
     alt_wide_list: Optional[torch.Tensor] = None,
     alt_wide_count: Optional[torch.Tensor] = None,
     narrow_count_base: Optional[torch.Tensor] = None,
+    max_rows: int = 0,
+    min_total_rows: int = 0,
     enable_pdl: bool = False,
     _prepared_launches: Optional[Dict[str, Any]] = None,
     _trace: Optional[torch.Tensor] = None,
@@ -356,7 +358,14 @@ def swapab_dispatch_mixed(
     otherwise ``alt_wide_count`` is 0. The windows are ``row_unit`` offsets
     of the one permutation either way; ``narrow_count_base`` (optional) is
     the window count under the base padding and 0 under the alternate one,
-    for a swap GEMM2 that runs only when the routing chose the base tile."""
+    for a swap GEMM2 that runs only when the routing chose the base tile.
+
+    Window rule: experts above ``max_rows`` rows (0: no limit), or every
+    expert when the padded row total is below ``min_total_rows``, keep all
+    their dense tiles and get no window (a window on a large expert streams
+    its weights a second time for a saving below one tile). The routing
+    kernel's mixed lists (``moe_sort(mixed_narrow_tile=...)``) apply the same
+    rule."""
     if group_rows % row_unit or narrow_tile % row_unit:
         raise ValueError("group_rows and narrow_tile must be multiples of row_unit")
     groups = tile_idx_to_mn_limit.shape[0]
@@ -430,6 +439,8 @@ def swapab_dispatch_mixed(
         int(alt_group_rows) if has_dual else 0,
         int(narrow_tile),
         int(row_unit),
+        int(max_rows),
+        int(min_total_rows),
         int(stage_base),
         int(stage_alt),
         wide_list.data_ptr(),

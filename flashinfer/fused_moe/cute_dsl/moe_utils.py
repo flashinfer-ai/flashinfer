@@ -605,6 +605,28 @@ def moe_sort(
     out_alt_tile_idx_to_mn_limit: Optional[torch.Tensor] = None,
     out_alt_num_non_exiting_tiles: Optional[torch.Tensor] = None,
     out_base_active_num_non_exiting_tiles: Optional[torch.Tensor] = None,
+    # Mixed work lists of the dual-tile routing (mixed_narrow_tile == 0: off):
+    # per local expert with c rows, nwide dense tiles of the chosen padding
+    # followed by nnarrow mixed_narrow_tile-row windows (mixed_row_unit-row
+    # offsets of the permutation) covering the fewest rows, the closed form of
+    # ``swapab_dispatch_mixed`` (whose launch this replaces). The dense tiles
+    # go to out_mixed_wide_list (base padding chosen) or out_mixed_alt_wide_list
+    # (alternate) as group indices of that list; the other count is 0. Experts
+    # above mixed_max_rows rows (0: no limit), or all experts when the padded
+    # row total is below mixed_min_total_rows, keep every dense tile and get
+    # no window. out_mixed_narrow_count_base = window count under the base
+    # padding, 0 under the alternate.
+    mixed_narrow_tile: int = 0,
+    mixed_row_unit: int = 64,
+    mixed_max_rows: int = 0,
+    mixed_min_total_rows: int = 0,
+    out_mixed_wide_list: Optional[torch.Tensor] = None,
+    out_mixed_wide_count: Optional[torch.Tensor] = None,
+    out_mixed_alt_wide_list: Optional[torch.Tensor] = None,
+    out_mixed_alt_wide_count: Optional[torch.Tensor] = None,
+    out_mixed_narrow_list: Optional[torch.Tensor] = None,
+    out_mixed_narrow_count: Optional[torch.Tensor] = None,
+    out_mixed_narrow_count_base: Optional[torch.Tensor] = None,
     *,
     _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> Tuple[
@@ -832,6 +854,52 @@ def moe_sort(
             alt_count.data_ptr(),
             base_active.data_ptr(),
         )
+    mixed_ptrs = (0,) * 7
+    if mixed_narrow_tile:
+        if not tile_tokens_dim_alt:
+            raise ValueError("the mixed work lists need the dual-tile routing")
+        if (
+            mixed_row_unit <= 0
+            or tile_tokens_dim % mixed_row_unit
+            or tile_tokens_dim_alt % mixed_row_unit
+            or mixed_narrow_tile % mixed_row_unit
+        ):
+            raise ValueError(
+                "mixed_row_unit must divide both tiles and mixed_narrow_tile"
+            )
+        # Windows start in an expert's own group (at most alt_tile / row_unit
+        # - 1 per expert): one list entry per base group holds them.
+        needs = (
+            ("out_mixed_wide_list", out_mixed_wide_list, max_num_tiles),
+            ("out_mixed_wide_count", out_mixed_wide_count, 1),
+            ("out_mixed_alt_wide_list", out_mixed_alt_wide_list, max_num_alt_tiles),
+            ("out_mixed_alt_wide_count", out_mixed_alt_wide_count, 1),
+            ("out_mixed_narrow_list", out_mixed_narrow_list, max_num_tiles),
+            ("out_mixed_narrow_count", out_mixed_narrow_count, 1),
+        )
+        for name, buf, need in needs:
+            if buf is None:
+                raise ValueError(f"{name} is required with mixed_narrow_tile")
+            if (
+                buf.dtype != torch.int32
+                or buf.numel() < need
+                or buf.device != device
+                or not buf.is_contiguous()
+            ):
+                raise ValueError(
+                    f"{name} must be contiguous int32 with >= {need} elements on {device}"
+                )
+        if out_mixed_narrow_count_base is not None and (
+            out_mixed_narrow_count_base.dtype != torch.int32
+            or out_mixed_narrow_count_base.numel() < 1
+            or out_mixed_narrow_count_base.device != device
+        ):
+            raise ValueError("out_mixed_narrow_count_base must be int32 on the device")
+        mixed_ptrs = tuple(buf.data_ptr() for _, buf, _ in needs) + (
+            out_mixed_narrow_count_base.data_ptr()
+            if out_mixed_narrow_count_base is not None
+            else 0,
+        )
 
     # Allocate expert counts buffer for large token counts (>1024).
     # Required size: 2 * num_experts. The kernel zeros this internally via
@@ -888,6 +956,12 @@ def moe_sort(
         tile_tokens_dim_alt,
         dual_tile_threshold_permille,
         *dual_ptrs,
+        # Mixed work lists
+        int(mixed_narrow_tile),
+        int(mixed_row_unit),
+        int(mixed_max_rows),
+        int(mixed_min_total_rows),
+        *mixed_ptrs,
     )
     if _prepared_launches is not None:
         _prepared_launches["sort"] = (func, launch_args)

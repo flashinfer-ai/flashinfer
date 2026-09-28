@@ -274,8 +274,8 @@ SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS = int(
 # T=8192 ``empty`` routing). ``1``: the dense chain on the side stream beside
 # the swap chain (round 26 form). ``0``: every launch on the caller's stream.
 SWAP_WIDE192_MIXED_STREAMS = os.environ.get("MXFP4_SWAP192_MIXED_STREAMS", "tile")
-if SWAP_WIDE192_MIXED_STREAMS not in ("0", "1", "tile"):
-    raise ValueError("MXFP4_SWAP192_MIXED_STREAMS must be 0, 1 or tile")
+if SWAP_WIDE192_MIXED_STREAMS not in ("0", "1", "tile", "win"):
+    raise ValueError("MXFP4_SWAP192_MIXED_STREAMS must be 0, 1, tile or win")
 # Wide 192-row forms: where the finalize output is zero-filled. ``route``:
 # the routing conversion kernel (17-99 us at T = 8192..32768 on the
 # critical path); ``gemm1``: the swap GEMM1's epilogue warps (grid-strided
@@ -285,6 +285,21 @@ if SWAP_WIDE192_MIXED_STREAMS not in ("0", "1", "tile"):
 SWAP_WIDE192_ZERO_FILL = os.environ.get("MXFP4_SWAP192_ZF", "dense")
 if SWAP_WIDE192_ZERO_FILL not in ("route", "gemm1", "dense"):
     raise ValueError("MXFP4_SWAP192_ZF must be route, gemm1 or dense")
+# Where the mixed form's work lists come from under the dual-tile routing:
+# "sort" = the routing kernel writes them with its tile lists (no dispatch
+# launch on the critical path), "dispatch" = the ``swapab_dispatch_mixed``
+# kernel after the routing.
+SWAP_WIDE192_LISTS = os.environ.get("MXFP4_SWAP192_LISTS", "sort")
+if SWAP_WIDE192_LISTS not in ("sort", "dispatch"):
+    raise ValueError("MXFP4_SWAP192_LISTS must be sort or dispatch")
+# Window rule of the mixed form (both list producers): an expert with more
+# than MXFP4_SWAP192_MAX_ROWS rows (0 = no limit), or every expert when the
+# routing's padded row total is below MXFP4_SWAP192_MIN_ROWS, keeps all its
+# dense tiles and gets no window (a window on a large expert streams the
+# expert's weights a second time for a saving below one tile; a small routing
+# is a launch chain the windows cannot shorten).
+SWAP_WIDE192_MAX_ROWS = int(os.environ.get("MXFP4_SWAP192_MAX_ROWS", "0"))
+SWAP_WIDE192_MIN_ROWS = int(os.environ.get("MXFP4_SWAP192_MIN_ROWS", "0"))
 # Mixed form: weight M-tiles per swap-GEMM2 work item. Measured on B300 (TP8
 # T=256/1024 balanced): with the 128-row groups the GEMM2 of the policy tile
 # loses 6-9 % at m_group 1 and is back at the 32-row-group time with 2.
@@ -1026,16 +1041,31 @@ class Mxfp4MoESwapAbPlan:
         self.mixed192_tile_streams = bool(
             self.mixed192_dual is not None and SWAP_WIDE192_MIXED_STREAMS == "tile"
         )
+        # "win": the window chain (dispatch, token index, swap GEMM1, swap
+        # GEMM2) on the side stream, the dense path's own chain on the
+        # caller's stream.
+        self.mixed192_win_streams = bool(
+            self.mixed192_dual is not None and SWAP_WIDE192_MIXED_STREAMS == "win"
+        )
+        # The routing kernel writes the mixed work lists (no dispatch launch).
+        self.mixed192_lists_from_sort = bool(
+            self.mixed192_dual is not None and SWAP_WIDE192_LISTS == "sort"
+        )
         self._side_stream = None
         self._fork_event = self._join_event = None
+        self._fill_event = self._swap_gemm1_event = None
         if (
             (self.split and SWAP_SPLIT_SIDE_STREAM)
             or (self.mixed192 and SWAP_WIDE192_MIXED_STREAMS == "1")
             or self.mixed192_tile_streams
+            or self.mixed192_win_streams
         ):
             self._side_stream = torch.cuda.Stream(device=self.device)
             self._fork_event = torch.cuda.Event()
             self._join_event = torch.cuda.Event()
+        if self.mixed192_win_streams:
+            self._fill_event = torch.cuda.Event()
+            self._swap_gemm1_event = torch.cuda.Event()
         self.group_rows = (
             SWAP_HYBRID_GROUP_ROWS
             if (self.hybrid or self.mixed or self.mixed192)
@@ -1240,6 +1270,27 @@ class Mxfp4MoESwapAbPlan:
                         if self.mixed192_dual is not None
                         else {}
                     ),
+                    **(
+                        # Mixed work lists from the routing kernel: the dense
+                        # tiles of the chosen padding and the 192-row windows
+                        # into the dispatch kernel's buffers (see
+                        # ``swapab_dispatch_mixed``), same window rule.
+                        dict(
+                            mixed_narrow_tile=self.n_tile,
+                            mixed_row_unit=SWAP_WIDE192_ROW_UNIT,
+                            mixed_max_rows=SWAP_WIDE192_MAX_ROWS,
+                            mixed_min_total_rows=SWAP_WIDE192_MIN_ROWS,
+                            out_mixed_wide_list=b["swap_wide_list"],
+                            out_mixed_wide_count=b["swap_wide_count"],
+                            out_mixed_alt_wide_list=b["swap_alt_wide_list"],
+                            out_mixed_alt_wide_count=b["swap_alt_wide_count"],
+                            out_mixed_narrow_list=b["swap_row_groups"],
+                            out_mixed_narrow_count=b["swap_row_group_count"],
+                            out_mixed_narrow_count_base=b["swap_row_group_count_base"],
+                        )
+                        if self.mixed192_lists_from_sort
+                        else {}
+                    ),
                     **sort_buffers,
                 )
                 self._sort, self._sort_args = launches["sort"]
@@ -1277,7 +1328,16 @@ class Mxfp4MoESwapAbPlan:
                     group_rows=self.group_rows,
                     sf_blocked=not (self.mixed and SWAP_MIXED_SF_PLAIN),
                 )
-            if self.mixed192:
+            if self.mixed192 and self.mixed192_lists_from_sort:
+                # The routing kernel wrote the lists (``moe_sort`` above).
+                gemm1_lists = dict(
+                    tile_idx_to_row_group=b["swap_row_groups"],
+                    num_non_exiting_tiles=b["swap_row_group_count"],
+                    group_rows=self.group_rows,
+                    row_unit=SWAP_WIDE192_ROW_UNIT,
+                    sf_blocked=True,
+                )
+            elif self.mixed192:
                 # Per expert: dense 128-row tiles (wide slot list) then
                 # 192-row swap windows (64-row offsets) covering the fewest
                 # rows; both GEMM1 forms write blocked row scales.
@@ -1292,6 +1352,8 @@ class Mxfp4MoESwapAbPlan:
                     wide_count=b["swap_wide_count"],
                     narrow_list=b["swap_row_groups"],
                     narrow_count=b["swap_row_group_count"],
+                    max_rows=SWAP_WIDE192_MAX_ROWS,
+                    min_total_rows=SWAP_WIDE192_MIN_ROWS,
                     enable_pdl=pdl,
                     _prepared_launches=launches,
                     **(
@@ -1919,10 +1981,49 @@ class Mxfp4MoESwapAbPlan:
             self._route_preprocess.run(stream)
             if self._sort is not None:
                 self._sort(*self._sort_args, stream_ptr)
-            if self._dispatch is not None:
+            win_side = self.mixed192_win_streams
+            if self._dispatch is not None and not win_side:
                 self._dispatch(*self._dispatch_args, stream_ptr)
-            if self._token_index is not None:
+            if self._token_index is not None and not win_side:
                 self._token_index(*self._token_index_args, stream=stream)
+            if win_side:
+                # Window chain on the side stream: the dispatch (when the
+                # routing kernel did not write the lists), the token index,
+                # the swap GEMM1 over the windows and, in the split form, the
+                # swap GEMM2 once the dense GEMM1s zero-filled the output. The
+                # caller's stream keeps the dense path's own chain (both dense
+                # GEMM1s, then the finalizes), so a routing without windows
+                # costs the dense path's time plus the join; the dense-all
+                # GEMM2 waits for the windows' GEMM1 rows.
+                main = torch.cuda.current_stream()
+                self._fork_event.record(main)
+                self._side_stream.wait_event(self._fork_event)
+                side = cuda.CUstream(self._side_stream.cuda_stream)
+                if self._dispatch is not None:
+                    self._dispatch(*self._dispatch_args, self._side_stream.cuda_stream)
+                if self._token_index is not None:
+                    self._token_index(*self._token_index_args, stream=side)
+                self._gemm1(*self._gemm1_args, stream=side)
+                if self._gemm2_wide is None:
+                    self._swap_gemm1_event.record(self._side_stream)
+                compiled, args, kwargs = self._gemm1_dense
+                compiled(*args, stream=stream, **kwargs)
+                if self._gemm1_dense_alt is not None:
+                    compiled, args, kwargs = self._gemm1_dense_alt
+                    compiled(*args, stream=stream, **kwargs)
+                if self._gemm2_wide is not None:
+                    self._fill_event.record(main)
+                    self._side_stream.wait_event(self._fill_event)
+                    self._gemm2(*self._gemm2_args, stream=side)
+                    compiled, args = self._gemm2_wide
+                    compiled(*args, stream=stream)
+                else:
+                    main.wait_event(self._swap_gemm1_event)
+                    self._gemm2(*self._gemm2_args, stream=stream)
+                if self._gemm2_dense_alt is not None:
+                    compiled, args = self._gemm2_dense_alt
+                    compiled(*args, stream=stream)
+                self._join_event.record(self._side_stream)
             if self.split and self._side_stream is not None:
                 # Fork: the wide chain runs on the plan's side stream after
                 # the routing kernel; the narrow chain keeps its PDL edges.
@@ -1987,14 +2088,21 @@ class Mxfp4MoESwapAbPlan:
                         compiled, args = self._gemm2_dense_alt
                         compiled(*args, stream=side)
                 self._join_event.record(self._side_stream)
-            if self._gemm1_dense_alt is not None and not (mixed_side or tile_side):
+            if self._gemm1_dense_alt is not None and not (
+                mixed_side or tile_side or win_side
+            ):
                 # Coarser-tile dense GEMM1 first: on the routings that choose
                 # it (few large experts) the swap and base-tile launches then
                 # find no work and overlap its tail instead of preceding it.
                 compiled, args, kwargs = self._gemm1_dense_alt
                 compiled(*args, stream=stream, **kwargs)
-            self._gemm1(*self._gemm1_args, stream=stream)
-            if self._gemm1_dense is not None and not self.split and not mixed_side:
+            if not win_side:
+                self._gemm1(*self._gemm1_args, stream=stream)
+            if (
+                self._gemm1_dense is not None
+                and not self.split
+                and not (mixed_side or win_side)
+            ):
                 compiled, args, kwargs = self._gemm1_dense
                 compiled(*args, stream=stream, **kwargs)
             if mixed_side and self._gemm2_wide is None:
@@ -2005,13 +2113,18 @@ class Mxfp4MoESwapAbPlan:
                 # zero-fills on the side stream.
                 torch.cuda.current_stream().wait_event(self._gemm1_done_event)
             if self._gemm2_dense_alt is not None and not (
-                (mixed_side and self._gemm2_wide is not None) or tile_side
+                (mixed_side and self._gemm2_wide is not None) or tile_side or win_side
             ):
                 # Same order for GEMM2 (all GEMM1s precede it in the stream).
                 compiled, args = self._gemm2_dense_alt
                 compiled(*args, stream=stream)
-            self._gemm2(*self._gemm2_args, stream=stream)
-            if self.mixed192 and self._gemm2_wide is not None and not mixed_side:
+            if not win_side:
+                self._gemm2(*self._gemm2_args, stream=stream)
+            if (
+                self.mixed192
+                and self._gemm2_wide is not None
+                and not (mixed_side or win_side)
+            ):
                 compiled, args = self._gemm2_wide
                 compiled(*args, stream=stream)
             if self._side_stream is not None:

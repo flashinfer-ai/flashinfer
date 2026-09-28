@@ -371,6 +371,13 @@ void moe_sort(
     int32_t tile_tokens_dim_alt, int32_t dual_tile_threshold_permille,
     int64_t alt_tile_idx_to_expert_idx_ptr, int64_t alt_tile_idx_to_mn_limit_ptr,
     int64_t alt_num_non_exiting_tiles_ptr, int64_t base_active_num_non_exiting_tiles_ptr,
+    // Optional mixed work lists of the dual-tile routing (mixed_narrow_tile == 0 = off; see
+    // DataBase::mMixedNarrowTile): dense tiles of the chosen padding + narrow-tile windows.
+    int32_t mixed_narrow_tile, int32_t mixed_row_unit, int32_t mixed_max_rows,
+    int32_t mixed_min_total_rows, int64_t mixed_wide_list_ptr, int64_t mixed_wide_count_ptr,
+    int64_t mixed_alt_wide_list_ptr, int64_t mixed_alt_wide_count_ptr,
+    int64_t mixed_narrow_list_ptr, int64_t mixed_narrow_count_ptr,
+    int64_t mixed_narrow_count_base_ptr,
     // Optional: explicit CUDA stream pointer for CUDA graph compatibility
     // If 0, uses TVM FFI's current stream
     int64_t cuda_stream_ptr) {
@@ -431,6 +438,29 @@ void moe_sort(
         reinterpret_cast<int32_t*>(alt_num_non_exiting_tiles_ptr);
     routingData.mPtrNumNonExitingCtasBaseActive =
         reinterpret_cast<int32_t*>(base_active_num_non_exiting_tiles_ptr);
+  }
+  if (mixed_narrow_tile > 0) {
+    TVM_FFI_ICHECK(tile_tokens_dim_alt > 0)
+        << "the mixed work lists need the dual-tile routing (tile_tokens_dim_alt)";
+    TVM_FFI_ICHECK(mixed_row_unit > 0 && tile_tokens_dim % mixed_row_unit == 0 &&
+                   tile_tokens_dim_alt % mixed_row_unit == 0 &&
+                   mixed_narrow_tile % mixed_row_unit == 0)
+        << "mixed_row_unit must divide both tiles and mixed_narrow_tile";
+    TVM_FFI_ICHECK(mixed_wide_list_ptr != 0 && mixed_wide_count_ptr != 0 &&
+                   mixed_alt_wide_list_ptr != 0 && mixed_alt_wide_count_ptr != 0 &&
+                   mixed_narrow_list_ptr != 0 && mixed_narrow_count_ptr != 0)
+        << "the mixed work lists need both dense lists, their counts, the window list and count";
+    routingData.mMixedNarrowTile = mixed_narrow_tile;
+    routingData.mMixedRowUnit = mixed_row_unit;
+    routingData.mMixedMaxRows = mixed_max_rows;
+    routingData.mMixedMinTotalRows = mixed_min_total_rows;
+    routingData.mPtrMixedWideList = reinterpret_cast<int32_t*>(mixed_wide_list_ptr);
+    routingData.mPtrMixedWideCount = reinterpret_cast<int32_t*>(mixed_wide_count_ptr);
+    routingData.mPtrMixedAltWideList = reinterpret_cast<int32_t*>(mixed_alt_wide_list_ptr);
+    routingData.mPtrMixedAltWideCount = reinterpret_cast<int32_t*>(mixed_alt_wide_count_ptr);
+    routingData.mPtrMixedNarrowList = reinterpret_cast<int32_t*>(mixed_narrow_list_ptr);
+    routingData.mPtrMixedNarrowCount = reinterpret_cast<int32_t*>(mixed_narrow_count_ptr);
+    routingData.mPtrMixedNarrowCountBase = reinterpret_cast<int32_t*>(mixed_narrow_count_base_ptr);
   }
   routingData.mLocalExpertsStartIdx = local_expert_offset;
   routingData.mLocalExpertsStrideLog2 = 0;

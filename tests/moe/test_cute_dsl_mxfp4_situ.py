@@ -1716,13 +1716,19 @@ def test_fused_routing_dispatch_lists_match_dispatch_kernel(
         check(expect_wide=False)
 
 
-def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit):
-    """Host reference of ``swapab_dispatch_mixed``: per expert (a run of
-    sort groups with one expert index; each group's bound is its own clipped
-    ``min((g + 1) * group_rows, expert end)``) the dense tiles first, then
-    the windows, covering the fewest rows (ties to fewer windows)."""
+def _mixed192_reference(
+    expert, limit, group_rows, narrow_tile, row_unit, max_rows=0, min_total_rows=0
+):
+    """Host reference of ``swapab_dispatch_mixed`` and of the routing kernel's
+    mixed lists: per expert (a run of sort groups with one expert index; each
+    group's bound is its own clipped ``min((g + 1) * group_rows, expert
+    end)``) the dense tiles first, then the windows, covering the fewest rows
+    (ties to fewer windows). Window rule: an expert above ``max_rows`` rows
+    (0: no limit), or every expert when the padded row total is below
+    ``min_total_rows``, keeps all its dense tiles and gets no window."""
     wide, narrow, covered = [], [], []
     g, n = 0, len(expert)
+    windows_allowed = n * group_rows >= min_total_rows
     while g < n:
         base = g * group_rows
         groups = 1
@@ -1739,7 +1745,9 @@ def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit):
             w = max(0, -(-(rows - a * narrow_tile) // group_rows))
             candidates.append((w * group_rows + a * narrow_tile, a, w))
         _, a, w = min(candidates)
-        if group_rows == 128 and narrow_tile == 192 and row_unit == 64:
+        if not windows_allowed or (max_rows > 0 and rows > max_rows):
+            a, w = 0, groups
+        elif group_rows == 128 and narrow_tile == 192 and row_unit == 64:
             assert w * group_rows + a * narrow_tile == max(-(-rows // 64) * 64, 128)
             assert a <= 1
         if group_rows == 256 and narrow_tile == 192 and row_unit == 64:
@@ -1963,6 +1971,152 @@ def test_swapab_dispatch_mixed_follows_dual_tile_routing(
     assert int(lists["narrow_count_base"].item()) == (0 if use_alt else len(narrow_ref))
     assert lists[active_list][: len(wide_ref)].tolist() == wide_ref
     assert lists["narrow_list"][: len(narrow_ref)].tolist() == narrow_ref
+
+
+@pytest.mark.parametrize(
+    "tokens, local_experts, offset, distribution",
+    [
+        (1024, 112, 336, "hot"),
+        (1024, 112, 336, "empty"),
+        (2048, 896, 0, "balanced"),
+        (4096, 112, 336, "balanced"),
+    ],
+)
+@pytest.mark.parametrize("threshold_permille", [1, 10**6])
+@pytest.mark.parametrize("max_rows, min_total_rows", [(0, 0), (512, 0), (0, 1 << 22)])
+def test_moe_sort_mixed_lists_match_dispatch(
+    tokens,
+    local_experts,
+    offset,
+    distribution,
+    threshold_permille,
+    max_rows,
+    min_total_rows,
+):
+    """``moe_sort(mixed_narrow_tile=192, ...)`` writes the mixed work lists
+    with its dual-tile lists: the dense tiles of the chosen padding (base or
+    alternate list, the other count 0), the 192-row windows and the base-only
+    window count equal ``swapab_dispatch_mixed`` over the same routing and
+    the host reference, under the same window rule (``max_rows`` cuts the
+    windows of large experts, ``min_total_rows`` all of them)."""
+    _require_blackwell()
+    from flashinfer.fused_moe.cute_dsl.moe_utils import (
+        allocate_moe_sort_buffers,
+        get_max_num_tiles,
+        moe_sort,
+    )
+    from flashinfer.fused_moe.cute_dsl.swapab_moe import swapab_dispatch_mixed
+
+    group_rows, alt_group_rows, narrow_tile, row_unit, top_k = 128, 256, 192, 64, 16
+    ids, weights = make_routing(tokens, 896, top_k, local_experts, offset, distribution)
+    alt_tiles = get_max_num_tiles(tokens, top_k, local_experts, alt_group_rows)
+    tiles = alt_tiles * alt_group_rows // group_rows
+    buffers = allocate_moe_sort_buffers(
+        tokens, 896, top_k, local_experts, alt_group_rows
+    )
+    for name in ("out_tile_idx_to_expert_idx", "out_tile_idx_to_mn_limit"):
+        buffers[name] = torch.full((tiles,), -3, dtype=torch.int32, device="cuda")
+    for name in ("out_alt_tile_idx_to_expert_idx", "out_alt_tile_idx_to_mn_limit"):
+        buffers[name] = torch.full((alt_tiles,), -3, dtype=torch.int32, device="cuda")
+    for name in (
+        "out_alt_num_non_exiting_tiles",
+        "out_base_active_num_non_exiting_tiles",
+    ):
+        buffers[name] = torch.zeros((1,), dtype=torch.int32, device="cuda")
+
+    def fresh():
+        return dict(
+            wide_list=torch.full((tiles,), -7, dtype=torch.int32, device="cuda"),
+            wide_count=torch.full((1,), -7, dtype=torch.int32, device="cuda"),
+            narrow_list=torch.full((tiles,), -7, dtype=torch.int32, device="cuda"),
+            narrow_count=torch.full((1,), -7, dtype=torch.int32, device="cuda"),
+            alt_wide_list=torch.full(
+                (alt_tiles,), -7, dtype=torch.int32, device="cuda"
+            ),
+            alt_wide_count=torch.full((1,), -7, dtype=torch.int32, device="cuda"),
+            narrow_count_base=torch.full((1,), -7, dtype=torch.int32, device="cuda"),
+        )
+
+    from_sort = fresh()
+    moe_sort(
+        token_selected_experts=ids,
+        token_final_scales=weights.float(),
+        num_experts=896,
+        top_k=top_k,
+        local_expert_offset=offset,
+        num_local_experts=local_experts,
+        tile_tokens_dim=group_rows,
+        tile_tokens_dim_alt=alt_group_rows,
+        dual_tile_threshold_permille=threshold_permille,
+        mixed_narrow_tile=narrow_tile,
+        mixed_row_unit=row_unit,
+        mixed_max_rows=max_rows,
+        mixed_min_total_rows=min_total_rows,
+        out_mixed_wide_list=from_sort["wide_list"],
+        out_mixed_wide_count=from_sort["wide_count"],
+        out_mixed_alt_wide_list=from_sort["alt_wide_list"],
+        out_mixed_alt_wide_count=from_sort["alt_wide_count"],
+        out_mixed_narrow_list=from_sort["narrow_list"],
+        out_mixed_narrow_count=from_sort["narrow_count"],
+        out_mixed_narrow_count_base=from_sort["narrow_count_base"],
+        **buffers,
+    )
+    torch.cuda.synchronize()
+    from_dispatch = fresh()
+    swapab_dispatch_mixed(
+        tile_idx_to_expert_idx=buffers["out_tile_idx_to_expert_idx"],
+        tile_idx_to_mn_limit=buffers["out_tile_idx_to_mn_limit"],
+        num_non_exiting_tiles=buffers["out_num_non_exiting_tiles"],
+        group_rows=group_rows,
+        narrow_tile=narrow_tile,
+        row_unit=row_unit,
+        alt_tile_idx_to_expert_idx=buffers["out_alt_tile_idx_to_expert_idx"],
+        alt_tile_idx_to_mn_limit=buffers["out_alt_tile_idx_to_mn_limit"],
+        alt_num_non_exiting_tiles=buffers["out_alt_num_non_exiting_tiles"],
+        base_active_num_non_exiting_tiles=buffers[
+            "out_base_active_num_non_exiting_tiles"
+        ],
+        alt_group_rows=alt_group_rows,
+        max_rows=max_rows,
+        min_total_rows=min_total_rows,
+        **from_dispatch,
+    )
+    torch.cuda.synchronize()
+    n_base = int(buffers["out_num_non_exiting_tiles"].item())
+    n_alt = int(buffers["out_alt_num_non_exiting_tiles"].item())
+    use_alt = threshold_permille > 1000
+    assert (n_alt > 0) == use_alt
+    if use_alt:
+        expert = buffers["out_alt_tile_idx_to_expert_idx"][:n_alt].tolist()
+        limit = buffers["out_alt_tile_idx_to_mn_limit"][:n_alt].tolist()
+        rows = alt_group_rows
+        active_list, active_count = "alt_wide_list", "alt_wide_count"
+        idle_list, idle_count = "wide_list", "wide_count"
+    else:
+        expert = buffers["out_tile_idx_to_expert_idx"][:n_base].tolist()
+        limit = buffers["out_tile_idx_to_mn_limit"][:n_base].tolist()
+        rows = group_rows
+        active_list, active_count = "wide_list", "wide_count"
+        idle_list, idle_count = "alt_wide_list", "alt_wide_count"
+    wide_ref, narrow_ref, _ = _mixed192_reference(
+        expert, limit, rows, narrow_tile, row_unit, max_rows, min_total_rows
+    )
+    for lists in (from_sort, from_dispatch):
+        assert int(lists[idle_count].item()) == 0
+        assert (lists[idle_list] == -7).all()
+        assert int(lists[active_count].item()) == len(wide_ref)
+        assert int(lists["narrow_count"].item()) == len(narrow_ref)
+        assert int(lists["narrow_count_base"].item()) == (
+            0 if use_alt else len(narrow_ref)
+        )
+        assert lists[active_list][: len(wide_ref)].tolist() == wide_ref
+        assert lists["narrow_list"][: len(narrow_ref)].tolist() == narrow_ref
+    if min_total_rows or (max_rows and distribution != "balanced"):
+        # The rule removed windows: every expert keeps all its dense tiles.
+        if min_total_rows:
+            assert len(narrow_ref) == 0 and len(wide_ref) == len(expert)
+    elif distribution != "empty":
+        assert len(narrow_ref) > 0
     assert (lists[active_list][len(wide_ref) :] == -7).all()
     assert (lists["narrow_list"][len(narrow_ref) :] == -7).all()
     # Every window lies inside its expert's rows of the base list (the swap

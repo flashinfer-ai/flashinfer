@@ -218,11 +218,12 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
     const int32_t* __restrict__ num_groups_ptr, const int32_t* __restrict__ alt_expert_idx,
     const int32_t* __restrict__ alt_mn_limit, const int32_t* __restrict__ alt_num_groups_ptr,
     const int32_t* __restrict__ base_active_ptr, int32_t group_rows, int32_t alt_group_rows,
-    int32_t narrow_tile, int32_t row_unit, int32_t stage_base, int32_t stage_alt,
-    int32_t* __restrict__ wide_list, int32_t* __restrict__ wide_count,
-    int32_t* __restrict__ alt_wide_list, int32_t* __restrict__ alt_wide_count,
-    int32_t* __restrict__ narrow_list, int32_t* __restrict__ narrow_count,
-    int32_t* __restrict__ narrow_count_base, int64_t* __restrict__ trace) {
+    int32_t narrow_tile, int32_t row_unit, int32_t max_rows, int32_t min_total_rows,
+    int32_t stage_base, int32_t stage_alt, int32_t* __restrict__ wide_list,
+    int32_t* __restrict__ wide_count, int32_t* __restrict__ alt_wide_list,
+    int32_t* __restrict__ alt_wide_count, int32_t* __restrict__ narrow_list,
+    int32_t* __restrict__ narrow_count, int32_t* __restrict__ narrow_count_base,
+    int64_t* __restrict__ trace) {
   // Optional phase trace (globaltimer ns, thread 0): [0] start, [1] lists
   // staged, [2 + k] after scan pass k (k < 6), [8] end.
   if (trace != nullptr && threadIdx.x == 0) {
@@ -275,6 +276,10 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
   const int rows = alt ? alt_group_rows : group_rows;
   int32_t* const wl = alt ? alt_wide_list : wide_list;
   const int gu = rows / row_unit;
+  // Window rule (shared with the routing kernel's mixed lists): no windows
+  // when the padded row total is below min_total_rows, nor for experts above
+  // max_rows rows (0 = no limit); such experts keep all their dense tiles.
+  const bool windows = static_cast<int64_t>(num_groups) * rows >= min_total_rows;
   Counts carry{0, 0, 0};
   for (int base_g = 0; base_g < num_groups; base_g += kThreads * kMixedItems) {
     Counts mine[kMixedItems];
@@ -302,7 +307,9 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
           }
           c = max(l[lo - 1] - g * rows, 0);
         }
-        if (c > 0) {
+        if (c > 0 && (!windows || (max_rows > 0 && c > max_rows))) {
+          nwide = (c + rows - 1) / rows;
+        } else if (c > 0) {
           // Minimal cover by wide (rows) tiles and narrow windows, ties to
           // fewer windows.  cover(a + gu) == cover(a) for gu = rows /
           // row_unit, so a in [0, gu) suffices: with 128-row groups and
@@ -401,12 +408,12 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
                                int64_t alt_expert_idx_ptr, int64_t alt_mn_limit_ptr,
                                int64_t alt_num_groups_ptr, int64_t base_active_ptr,
                                int64_t group_rows, int64_t alt_group_rows, int64_t narrow_tile,
-                               int64_t row_unit, int64_t stage_base, int64_t stage_alt,
-                               int64_t wide_list_ptr, int64_t wide_count_ptr,
-                               int64_t alt_wide_list_ptr, int64_t alt_wide_count_ptr,
-                               int64_t narrow_list_ptr, int64_t narrow_count_ptr,
-                               int64_t narrow_count_base_ptr, int64_t trace_ptr, bool use_pdl,
-                               int64_t cuda_stream_ptr) {
+                               int64_t row_unit, int64_t max_rows, int64_t min_total_rows,
+                               int64_t stage_base, int64_t stage_alt, int64_t wide_list_ptr,
+                               int64_t wide_count_ptr, int64_t alt_wide_list_ptr,
+                               int64_t alt_wide_count_ptr, int64_t narrow_list_ptr,
+                               int64_t narrow_count_ptr, int64_t narrow_count_base_ptr,
+                               int64_t trace_ptr, bool use_pdl, int64_t cuda_stream_ptr) {
   TVM_FFI_ICHECK(row_unit > 0 && group_rows > 0 && narrow_tile > 0 && group_rows % row_unit == 0 &&
                  narrow_tile % row_unit == 0)
       << "group_rows and narrow_tile must be positive multiples of row_unit";
@@ -457,7 +464,8 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
       reinterpret_cast<const int32_t*>(alt_num_groups_ptr),
       reinterpret_cast<const int32_t*>(base_active_ptr), static_cast<int32_t>(group_rows),
       static_cast<int32_t>(alt_group_rows), static_cast<int32_t>(narrow_tile),
-      static_cast<int32_t>(row_unit), static_cast<int32_t>(stage_base),
+      static_cast<int32_t>(row_unit), static_cast<int32_t>(max_rows),
+      static_cast<int32_t>(min_total_rows), static_cast<int32_t>(stage_base),
       static_cast<int32_t>(stage_alt), reinterpret_cast<int32_t*>(wide_list_ptr),
       reinterpret_cast<int32_t*>(wide_count_ptr), reinterpret_cast<int32_t*>(alt_wide_list_ptr),
       reinterpret_cast<int32_t*>(alt_wide_count_ptr), reinterpret_cast<int32_t*>(narrow_list_ptr),
