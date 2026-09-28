@@ -2316,19 +2316,25 @@ def _validate_qkv_layout(q, k, v) -> bool:
     import torch
 
     for name, tensor in (("q", q), ("k", k), ("v", v)):
-        _require_tensor(tensor, name=name, dtype=torch.bfloat16, ndim=4, contiguous=False)
+        _require_tensor(
+            tensor, name=name, dtype=torch.bfloat16, ndim=4, contiguous=False
+        )
     if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
         return True
     heads_x_dim = q.shape[2] * HEAD_DIM
     for name, tensor in (("q", q), ("k", k), ("v", v)):
         if tensor.stride(3) != 1 or tensor.stride(2) != HEAD_DIM:
-            raise ValueError(f"{name} must keep a dense [num_heads, {HEAD_DIM}] token payload")
+            raise ValueError(
+                f"{name} must keep a dense [num_heads, {HEAD_DIM}] token payload"
+            )
         if tensor.stride(1) < heads_x_dim or tensor.stride(1) % 8 != 0:
             raise ValueError(
                 f"{name} token stride must be a multiple of 8 elements and at least "
                 f"num_heads * {HEAD_DIM}; got {tensor.stride(1)}"
             )
-        if tensor.shape[0] > 1 and tensor.stride(0) != tensor.shape[1] * tensor.stride(1):
+        if tensor.shape[0] > 1 and tensor.stride(0) != tensor.shape[1] * tensor.stride(
+            1
+        ):
             raise ValueError(f"{name} batch stride must be shape[1] * token stride")
     return False
 
@@ -5902,12 +5908,18 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         or (state_indices is None)
     ):
         return False
-    if any(
-        (
-            tensor is None or not tensor.is_contiguous()
-            for tensor in (q, argument(1, "k"), argument(2, "v"), argument(6, "out"))
-        )
-    ):
+    k = argument(1, "k")
+    v = argument(2, "v")
+    out = argument(6, "out")
+    if any(tensor is None for tensor in (k, v, out)) or not out.is_contiguous():
+        return False
+    # Round-5 lever 5b: serving hands q / k / v over as strided views of one
+    # packed qkv row.  The split's main pass accepts every layout
+    # ``_validate_qkv_layout`` accepts (dense, or in place / one dense copy),
+    # so the gate must not send such calls to the sequential body.
+    try:
+        _validate_qkv_layout(q, k, v)
+    except (TypeError, ValueError):
         return False
     checkpoint_request = (
         state_checkpoints is not None
