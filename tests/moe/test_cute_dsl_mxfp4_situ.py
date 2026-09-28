@@ -1911,6 +1911,51 @@ def test_dense_gemm2_raster_policy(monkeypatch):
     assert tp8._gemm2_raster(8192, 256) == ("auto", 7)
 
 
+def test_swap_wide192_policy(monkeypatch):
+    """Mixed 192-row form: opt-in per layout (``MXFP4_SWAP192_LAYOUTS``)
+    from SWAP_WIDE192_MIN_TOKENS up, finalize only; ``MXFP4_SWAP192=1`` /
+    ``0`` force it on every layout / off. The workspace then carries the
+    128-row sort groups' lists, and the GEMM2 form follows the layout and
+    token count."""
+    from flashinfer.fused_moe.cute_dsl import mxfp4
+
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MODE", "auto")
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_LAYOUTS", ())
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MIN_TOKENS", 8192)
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MIXED", True)
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MIXED_GEMM2", "auto")
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS", 16384)
+    tp8 = _policy_wrapper(moe_tp_size=8, moe_tp_rank=0)
+    ep8 = _policy_wrapper(ep_size=8, ep_rank=3)
+    # Opt-in: no layout named, the dense path runs on both layouts.
+    assert not tp8._swap_mixed192(8192) and not ep8._swap_mixed192(8192)
+    assert not tp8._use_swapab(8192)
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_LAYOUTS", ("moe_tensor_parallel",))
+    assert tp8._swap_mixed192(8192) and tp8._swap_mixed192(32768)
+    assert not tp8._swap_mixed192(4096)  # below SWAP_WIDE192_MIN_TOKENS
+    assert not tp8._swap_mixed192(8192, do_finalize=False)
+    assert not ep8._swap_mixed192(8192) and not ep8._swap_mixed192(32768)
+    assert tp8._use_swapab(8192) and not ep8._use_swapab(8192)
+    assert tp8._swap_group_rows(8192) == mxfp4.SWAP_HYBRID_GROUP_ROWS == 128
+    names = [f.name for f in tp8._workspace_fields(8192)[0]]
+    assert "swap_wide_list" in names and "swap_row_groups" in names
+    assert "swap_wide_list" not in [f.name for f in ep8._workspace_fields(8192)[0]]
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MODE", "1")
+    assert ep8._swap_mixed192(8192) and not ep8._swap_mixed192(4096)
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MODE", "0")
+    assert not tp8._swap_mixed192(8192) and not ep8._swap_mixed192(8192)
+    assert not tp8._swap_wide192(8192)
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MODE", "auto")
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MIXED", False)
+    assert tp8._swap_wide192(8192) and not tp8._swap_mixed192(8192)
+    # GEMM2 form: split on the rank and on the shard below 16384 tokens.
+    assert tp8._swap_mixed192_gemm2(8192) == "split"
+    assert tp8._swap_mixed192_gemm2(16384) == "dense"
+    assert ep8._swap_mixed192_gemm2(32768) == "split"
+    monkeypatch.setattr(mxfp4, "SWAP_WIDE192_MIXED_GEMM2", "dense")
+    assert ep8._swap_mixed192_gemm2(8192) == "dense"
+
+
 def test_swap_split_policy(monkeypatch):
     """Split form (policy-tile groups plus 128-row groups for the experts
     above SWAP_SPLIT_MIN_ROWS rows): fused-routing token counts from

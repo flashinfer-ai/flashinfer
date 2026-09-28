@@ -210,28 +210,47 @@ SWAP_MIXED_EP = os.environ.get("SWAPAB_MIXED_EP", "0") == "1"
 SWAP_MIXED_WIDE_PERMILLE = int(os.environ.get("SWAPAB_MIXED_WIDE_PERMILLE", "0"))
 SWAP_MIXED_SF_PLAIN = os.environ.get("SWAPAB_MIXED_SF_PLAIN", "0") == "1"
 # Wide swap form for the dense token range (T > swapab_max_tokens, finalize
-# only): 192-row sort groups and both GEMMs on the 2-CTA swap-AB kernel (256
-# weight rows x 192 tokens per work item, see the kernel docstring), so a
-# balanced 8192-token prefill pads its ~146-row experts to 192 instead of the
-# dense tile's 256 at the 2-CTA operand rate. Opt-in while under measurement
-# (CAKE-707 round 1); ``MXFP4_SWAP192_MIN_TOKENS`` raises the lower bound.
-SWAP_WIDE192 = os.environ.get("MXFP4_SWAP192", "0") == "1"
+# only): the 2-CTA swap-AB kernel over 192-row windows (256 weight rows x 192
+# tokens per work item, see the kernel docstring), in the mixed form below
+# beside the dense 128-row tiles. ``MXFP4_SWAP192``: ``auto`` (default) runs
+# it on the layouts named in ``MXFP4_SWAP192_LAYOUTS`` (``expert_parallel``,
+# ``moe_tensor_parallel``; default none: the form is opt-in, see the docs'
+# round 26 -- it takes the balanced / hot T=8192 and 16384 rows down 4-16 %
+# but its extra launches and fixed 128-row dense tiles cost the ``empty``
+# routings 4-17 % on the shard and more on the rank) from
+# ``MXFP4_SWAP192_MIN_TOKENS`` (default 8192: below it the shard's experts
+# hold <= 128 rows and the form degenerates to the dense tiles plus its
+# overhead); ``1`` / ``0`` force it on every layout / off.
+SWAP_WIDE192_MODE = os.environ.get("MXFP4_SWAP192", "auto")
+if SWAP_WIDE192_MODE not in ("auto", "0", "1"):
+    raise ValueError("MXFP4_SWAP192 must be auto, 0 or 1")
+SWAP_WIDE192_LAYOUTS = tuple(
+    x for x in os.environ.get("MXFP4_SWAP192_LAYOUTS", "").split(",") if x
+)
+SWAP_WIDE192_MIN_TOKENS = int(os.environ.get("MXFP4_SWAP192_MIN_TOKENS", "8192"))
 SWAP_WIDE192_TILE = int(os.environ.get("MXFP4_SWAP192_TILE", "192"))  # measurement arms: 64 / 128
-SWAP_WIDE192_MIN_TOKENS = int(os.environ.get("MXFP4_SWAP192_MIN_TOKENS", "0"))
-# Mixed 192-row form (MXFP4_SWAP192_MIXED=1 with SWAP_WIDE192): 128-row sort
+# Mixed 192-row form (MXFP4_SWAP192_MIXED, default on; 0 = the pure 192-row
+# measurement arm with 192-row sort groups): 128-row sort
 # groups; per expert ``swapab_dispatch_mixed`` lists dense 128-row tiles
 # first (dense gather GEMM1 and dense finalize GEMM2 over the wide slot
 # list, blocked row scales) and 192-row 2-CTA swap windows behind them
 # (row-group list in 64-row units), covering the fewest rows (ceil(c / 64) * 64
-# per expert, at most one window; the pure 192-row form is MXFP4_SWAP192_MIXED=0).
-SWAP_WIDE192_MIXED = os.environ.get("MXFP4_SWAP192_MIXED", "0") == "1"
+# per expert, at most one window).
+SWAP_WIDE192_MIXED = os.environ.get("MXFP4_SWAP192_MIXED", "1") == "1"
 SWAP_WIDE192_ROW_UNIT = 64
 # GEMM2 of the mixed form: ``split`` = 192-row swap finalize over the windows
 # + dense finalize over the dense tiles; ``dense`` = the dense finalize over
-# every 128-row sort group (the swap GEMM2 is not launched).
-SWAP_WIDE192_MIXED_GEMM2 = os.environ.get("MXFP4_SWAP192_MIXED_GEMM2", "split")
-if SWAP_WIDE192_MIXED_GEMM2 not in ("split", "dense"):
-    raise ValueError("MXFP4_SWAP192_MIXED_GEMM2 must be split or dense")
+# every 128-row sort group (the swap GEMM2 is not launched); ``auto``
+# (default) = ``split`` on the expert-parallel rank and on the shard below
+# ``SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS``, ``dense`` above it (B300: the swap
+# finalize wins while the shard's output stays L2-resident, the dense finalize
+# from T=16384 up; the rank's dense-all GEMM2 loses 5 % at T=8192).
+SWAP_WIDE192_MIXED_GEMM2 = os.environ.get("MXFP4_SWAP192_MIXED_GEMM2", "auto")
+if SWAP_WIDE192_MIXED_GEMM2 not in ("auto", "split", "dense"):
+    raise ValueError("MXFP4_SWAP192_MIXED_GEMM2 must be auto, split or dense")
+SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS = int(
+    os.environ.get("MXFP4_SWAP192_DENSE_GEMM2_MIN_TOKENS", "16384")
+)
 # Mixed form on two streams: the dense chain (dense GEMM1, and the dense
 # finalize over the dense tiles in the ``split`` GEMM2 form) runs on the
 # plan's side stream beside the swap chain; the row sets are disjoint and
@@ -969,12 +988,13 @@ class Mxfp4MoESwapAbPlan:
         self.hybrid = wrapper._swap_hybrid(x.shape[0], self.finalize)
         self.mixed = wrapper._swap_mixed(x.shape[0], self.finalize)
         self.split = wrapper._swap_split(x.shape[0], self.finalize)
-        # Wide 192-row form (SWAP_WIDE192): 2-CTA GEMM1 and GEMM2, fused
+        # Wide 192-row form (SWAP_WIDE192_MODE): 2-CTA GEMM1 and GEMM2, fused
         # (atomic) finalize -- its permuted-row partial buffer would be GBs.
         self.wide192 = wrapper._swap_wide192(x.shape[0], self.finalize)
         # Mixed 192-row form: dense 128-row tiles ahead of the 192-row swap
         # windows of every expert (SWAP_WIDE192_MIXED).
         self.mixed192 = wrapper._swap_mixed192(x.shape[0], self.finalize)
+        self.mixed192_gemm2 = wrapper._swap_mixed192_gemm2(x.shape[0])
         self.split_dense = False  # set by _prepare
         self._side_stream = None
         self._fork_event = self._join_event = None
@@ -1446,9 +1466,7 @@ class Mxfp4MoESwapAbPlan:
                 )
                 self._gemm1_dense = launches["gather"]
                 self._gemm1_dense_fills = zero_in_dense
-            mixed192_dense_gemm2 = (
-                self.mixed192 and SWAP_WIDE192_MIXED_GEMM2 == "dense"
-            )
+            mixed192_dense_gemm2 = self.mixed192 and self.mixed192_gemm2 == "dense"
             if self.hybrid or mixed192_dense_gemm2:
                 # Dense contiguous grouped GEMM2 over the 128-row sort groups
                 # with the bulk-reduce finalize into the zero-filled output.
@@ -2039,10 +2057,12 @@ class CuteDslMxfp4MoEWrapper:
         )
 
     def _swap_wide192(self, num_tokens, do_finalize=True):
-        """Wide swap form (see SWAP_WIDE192): the dense token range with
-        192-row groups on the 2-CTA swap-AB kernel, both GEMMs."""
+        """Wide swap form (see SWAP_WIDE192_MODE): the dense token range
+        with 192-row windows on the 2-CTA swap-AB kernel."""
+        if SWAP_WIDE192_MODE == "0":
+            return False
         return (
-            SWAP_WIDE192
+            (SWAP_WIDE192_MODE == "1" or self.layout.mode in SWAP_WIDE192_LAYOUTS)
             and bool(do_finalize)
             and self.activation_type == ActivationType.Situ
             and num_tokens > self.swapab_max_tokens
@@ -2054,6 +2074,18 @@ class CuteDslMxfp4MoEWrapper:
         128-row sort groups with dense 128-row tiles ahead of the 192-row
         swap windows of every expert."""
         return SWAP_WIDE192_MIXED and self._swap_wide192(num_tokens, do_finalize)
+
+    def _swap_mixed192_gemm2(self, num_tokens):
+        """GEMM2 form of the mixed 192-row form at this token count (see
+        SWAP_WIDE192_MIXED_GEMM2): ``split`` or ``dense``."""
+        if SWAP_WIDE192_MIXED_GEMM2 != "auto":
+            return SWAP_WIDE192_MIXED_GEMM2
+        if (
+            self.layout.mode == "moe_tensor_parallel"
+            and num_tokens >= SWAP_WIDE192_DENSE_GEMM2_MIN_TOKENS
+        ):
+            return "dense"
+        return "split"
 
     def _dense_two_stage(self, num_tokens):
         # Dense path: expanded-row GEMM2 output + finalize kernel instead of
