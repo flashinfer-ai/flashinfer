@@ -2377,8 +2377,30 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (not self._affine_main_indexed_initial_bf16),
         )
         self.compute_dtype = compute_dtype
-        for name, tensor in (("q", q), ("k", k), ("v", v), ("out", out)):
-            _require_tensor(tensor, name=name, dtype=torch.bfloat16, ndim=4)
+        _require_tensor(out, name="out", dtype=torch.bfloat16, ndim=4)
+        # Round-5 lever 5b: q / k / v may be strided views of a packed qkv row
+        # (token pitch > num_heads * HEAD_DIM) as long as each token's
+        # [num_heads, HEAD_DIM] payload is dense and the three share one pitch;
+        # the fused M128 body reads them in place, every other body gets a
+        # dense copy below.
+        for name, tensor in (("q", q), ("k", k), ("v", v)):
+            _require_tensor(tensor, name=name, dtype=torch.bfloat16, ndim=4, contiguous=False)
+        qkv_dense = q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+        if not qkv_dense:
+            heads_x_dim = q.shape[2] * HEAD_DIM
+            for name, tensor in (("q", q), ("k", k), ("v", v)):
+                if tensor.stride(3) != 1 or tensor.stride(2) != HEAD_DIM:
+                    raise ValueError(f"{name} must keep a dense [num_heads, {HEAD_DIM}] token payload")
+                if tensor.stride(1) < heads_x_dim or tensor.stride(1) % 8 != 0:
+                    raise ValueError(
+                        f"{name} token stride must be a multiple of 8 elements and at least "
+                        f"num_heads * {HEAD_DIM}; got {tensor.stride(1)}"
+                    )
+                if tensor.shape[0] > 1 and tensor.stride(0) != tensor.shape[1] * tensor.stride(1):
+                    raise ValueError(f"{name} batch stride must be shape[1] * token stride")
+            if not (q.stride(1) == k.stride(1) == v.stride(1)):
+                raise ValueError("q, k and v must share one token stride")
+        qkv_strided_ok = False
         _require_tensor(g, name="g", dtype=torch.bfloat16, ndim=4, contiguous=False)
         _require_tensor(
             beta,
@@ -3489,6 +3511,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 raise ValueError(
                     "checkpoint accumulation requires FP32 checkpoint rows"
                 )
+            qkv_strided_ok = True
             self.module = _build_kda_module(
                 partial(_factory, "compiled_bf16_fused_m128"),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
@@ -3896,6 +3919,16 @@ class FlashKDABlackwellBF16FusedLaunch:
         if n32_value_rows == 64:
             self.grid = (2 * self.grid[0], 1, 1)
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
+        if not qkv_dense and not qkv_strided_ok:
+            # Only the fused M128 body carries the q / k / v token pitch; the
+            # other bodies read a dense layout, so densify here (one copy per
+            # operand, the cost the caller used to pay unconditionally).
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            q_flat = q.reshape(total_tokens, num_heads, HEAD_DIM)
+            k_flat = k.reshape(total_tokens, num_heads, HEAD_DIM)
+            v_flat = v.reshape(total_tokens, num_heads, HEAD_DIM)
         self.args = {
             "q": q_flat,
             "q_tma": q_flat,
@@ -4017,6 +4050,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             self.operator_export = op_export
             self.args.update(
                 g_token_stride=g_flat.stride(0),
+                qkv_token_stride=q_flat.stride(0),
                 cu_chunk_offsets=(
                     op_export["cu_chunk_offsets"] if op_export else empty_chunk_offsets
                 ),
