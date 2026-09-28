@@ -307,6 +307,19 @@ _CACHE = {}
 def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
     total_q, Hq, D = q.shape
     num_pages = k.shape[0]
+    # The caller's score buffer is (hq, max_k_tiles, total_q) where max_k_tiles
+    # comes from the longest sequence in the batch. page_table is a persistent
+    # allocation sized to max_model_len, so it is WIDER: 2048 slots against
+    # ~1555 real tiles for a 200k-token request. Deriving the tile count from
+    # the page table therefore walks ~493 tiles past the end of max_score.
+    # Bound it by the output; the extra page-table columns are padding.
+    nkt = int(max_score.shape[1])
+    if page_table.shape[1] < nkt:
+        raise ValueError(
+            f"page_table has {page_table.shape[1]} tile columns but max_score "
+            f"expects {nkt}"
+        )
+    page_table = page_table[:, :nkt]
     B, max_k_tiles = page_table.shape
     sq = total_q // B
     nq = Hq * sq
