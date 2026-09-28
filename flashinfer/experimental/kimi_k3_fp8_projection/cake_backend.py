@@ -314,7 +314,15 @@ def decode_module_stages(
 # B200 / B300; mirrors the source repository's table.
 DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
     "sm_100a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15},  # B200, 148 SMs
-    "sm_103a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15},  # B300, 148 SMs (same GPC topology)
+    "sm_103a": {
+        2: 74,
+        3: 45,
+        4: 33,
+        5: 26,
+        6: 22,
+        7: 15,
+        8: 15,
+    },  # B300, 148 SMs (same GPC topology)
 }
 
 
@@ -335,7 +343,10 @@ def decode_cs_alias_fits(
         DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
     )
     module_stages = decode_module_stages(tok, stages, fused, resident, xb_stages)
-    chunk = -(-(-(-tok // csplit)) // 4) * 4
+    tok_per_cta = -(-tok // csplit)  # ceil(tok / csplit)
+    chunk = (
+        -(-tok_per_cta // 4) * 4
+    )  # round the per-CTA row count up to a multiple of 4
     return (2 * csplit - 1) * 128 * (chunk | 1) * 4 <= module_stages * stage_bytes
 
 
@@ -362,7 +373,8 @@ def decode_cs_small_inbox_rounds(
     need = 5 * (2 * csplit - 1) * 128 * 4
     while (
         module_stages > 1
-        and DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes < need
+        and DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+        < need
     ):
         module_stages -= 1
     budget = DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
@@ -512,7 +524,9 @@ def decode_config(
     )
     if csplit > 1:
         # Whole clusters, and no more clusters than the GPCs co-schedule (a second pass of clusters doubles the time).
-        grid = csplit * max(1, min(grid // csplit, decode_cluster_capacity(arch, csplit)))
+        grid = csplit * max(
+            1, min(grid // csplit, decode_cluster_capacity(arch, csplit))
+        )
     resident = (
         bool(entry.get("resident", False))
         and fused
@@ -548,7 +562,9 @@ def decode_config(
         cs_alias=csplit > 1
         and grid == total_work
         and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages)
-        and decode_cs_small_inbox_rounds(tok, stages, fused, resident, csplit, xb_stages)
+        and decode_cs_small_inbox_rounds(
+            tok, stages, fused, resident, csplit, xb_stages
+        )
         > 1,
     )
 
@@ -774,7 +790,12 @@ def reduction_layout(
     if cfg is None:
         return c_off, 0, c_off, 0
     if cfg.csplit > 1:
-        return c_off, 256, c_off + 256, 0  # the cluster exchange keeps its partials in SMEM
+        return (
+            c_off,
+            256,
+            c_off + 256,
+            0,
+        )  # the cluster exchange keeps its partials in SMEM
     split_cap = min(prepared.num_k_iters, max(cfg.split * 2, 1))
     c_bytes = -(-(cfg.tiles * 2 * 4) // 256) * 256
     p_off = c_off + c_bytes

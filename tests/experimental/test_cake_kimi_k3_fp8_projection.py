@@ -297,7 +297,13 @@ def test_decode_config_round3_fused_rows(arch):
     # Round 5: the 24-tile M = 256 row moves to a 4-CTA cluster split-K route (each CTA owns a quarter of K, FP32 partials
     # are exchanged through distributed shared memory in one round); the small dedicated inbox is used (no aliasing).
     cfg = decode_config(256, 1, 28, arch, SM_COUNT)
-    assert (cfg.tok, cfg.split, cfg.csplit, cfg.cs_alias, cfg.fused) == (16, 4, 4, False, True)
+    assert (cfg.tok, cfg.split, cfg.csplit, cfg.cs_alias, cfg.fused) == (
+        16,
+        4,
+        4,
+        False,
+        True,
+    )
     assert cfg.kernel_key == "decode:t16_p4_fused_cs4"
 
 
