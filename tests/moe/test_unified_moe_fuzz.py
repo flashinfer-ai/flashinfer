@@ -202,6 +202,10 @@ from flashinfer.fused_moe.api import (
     BackendOptions,
     B12xNvfp4Config,
     B12xW4A16Config,
+    CudnnGroupedGemmBf16Config,
+    CudnnGroupedGemmFp8PerTensorConfig,
+    CudnnGroupedGemmMxfp8Config,
+    CudnnGroupedGemmNvfp4Config,
     CutlassBf16Config,
     CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
@@ -226,8 +230,12 @@ from flashinfer.fused_moe.api import (
     TrtllmMxInt4Config,
 )
 from flashinfer.fused_moe.layer import _BACKEND_RUNNERS
-from flashinfer.fused_moe.runners import _TrtllmRunnerBase
+from flashinfer.fused_moe.runners import (
+    _CudnnGroupedGemmRunnerBase,
+    _TrtllmRunnerBase,
+)
 from flashinfer.fused_moe.prepare import _quantize_mxfp4_linear
+from flashinfer.grouped_mm.cudnn import _CUDNN_MOE_MIN_VERSION
 from flashinfer.jit.cpp_ext import get_cuda_version
 from flashinfer.quantization import e2m1_and_ufp8sf_scale_to_float
 from flashinfer.quantization.fp8_quantization import mxfp8_quantize
@@ -952,6 +960,22 @@ def _dequant_cutlass_nvfp4_experts(packed, scales, device):
     ).to(device=device, dtype=torch.bfloat16)
 
 
+def _dequant_cudnn_nvfp4_experts(view, prefix, device):
+    """Dequantize a cuDNN NVFP4 weight view entry (per-expert global scale) to BF16."""
+    packed, scales, dequant = (
+        view[f"{prefix}_expert_weights"],
+        view[f"{prefix}_weight_scale"],
+        view[f"{prefix}_dequant"],
+    )
+    return torch.stack(
+        [
+            _dequant_cutlass_nvfp4(packed[i], scales[i].view(torch.uint8))
+            * dequant[i].cpu()
+            for i in range(packed.shape[0])
+        ]
+    ).to(device=device, dtype=torch.bfloat16)
+
+
 def _dequant_int4_grouped(packed, scale, group_size=128):
     even = packed.to(torch.int16) & 0xF
     odd = packed.to(torch.int16) >> 4
@@ -1032,6 +1056,27 @@ def _cutlass_post_reference(backend_key):
             w2_ref = (
                 view["fc2_expert_weights"].float() * view["fc2_dequant"][:, None, None]
             )
+        elif backend_key == "cudnn_grouped_gemm_fp8_per_tensor":
+            # Canonical TRTLLM pack: static multipliers live in the view and the
+            # pack carries no scale; GEMM1 output is requantized with the
+            # static intermediate multiplier before GEMM2.
+            assert view["_activation_scale"] is None
+            x_ref = view["_activation_q"].float() / view["hidden_states_scale_global"]
+            intermediate_hook = fp8_per_tensor_requant_hook(
+                view["intermediate_scale_global"]
+            )
+            w1_ref = (
+                view["fc1_expert_weights"].float() * view["fc1_dequant"][:, None, None]
+            )
+            # The cuDNN view stores fc1 rows as [gate, up]; the reference
+            # wants [up, gate].
+            w1_ref = torch.cat(
+                (w1_ref[:, intermediate_size:], w1_ref[:, :intermediate_size]),
+                dim=1,
+            )
+            w2_ref = (
+                view["fc2_expert_weights"].float() * view["fc2_dequant"][:, None, None]
+            )
         elif backend_key == "cutlass_fp8_block":
             w1_ref = view["fc1_expert_weights"].float() * view[
                 "fc1_block_scale"
@@ -1084,6 +1129,35 @@ def _cutlass_post_reference(backend_key):
             # _pack_mxfp8_weight_scales transformation in the production path.
             w1_ref = _mxfp8_quant_dequant_experts(w1)
             w2_ref = _mxfp8_quant_dequant_experts(w2)
+        elif backend_key == "cudnn_grouped_gemm_mxfp8":
+            from flashinfer import mxfp8_dequantize_host
+
+            x_ref = mxfp8_dequantize_host(
+                view["_activation_q"].cpu().view(torch.uint8),
+                view["_activation_scale"].cpu().view(torch.uint8).reshape(-1),
+                False,
+            ).to(x.device)
+            w1_ref = _mxfp8_quant_dequant_experts(w1)
+            w2_ref = _mxfp8_quant_dequant_experts(w2)
+        elif backend_key == "cudnn_grouped_gemm_nvfp4":
+            packed = view["_activation_q"]
+            x_ref = (
+                e2m1_and_ufp8sf_scale_to_float(
+                    packed.cpu(),
+                    view["_activation_scale"].cpu().view(torch.uint8).reshape(-1),
+                    torch.ones(1, dtype=torch.float32),
+                    16,
+                    1,
+                    False,
+                )
+                .view(packed.shape[0], packed.shape[1] * 2)
+                .to(x.device)
+            )
+            w1_ref = _dequant_cudnn_nvfp4_experts(view, "fc1", x.device)
+            w1_ref = torch.cat(
+                (w1_ref[:, intermediate_size:], w1_ref[:, :intermediate_size]), dim=1
+            )
+            w2_ref = _dequant_cudnn_nvfp4_experts(view, "fc2", x.device)
         elif backend_key == "cutlass_w4a8":
             from flashinfer.fused_moe.prepare import _quantize_int4_grouped
 
@@ -1310,6 +1384,41 @@ _CONTRACT_HANDLERS = {
         atol_frac=0.1,
         rtol=0.1,
     ),
+    "cudnn_grouped_gemm_bf16": _contract_handler(
+        CudnnGroupedGemmBf16Config,
+        "bf16",
+        activation_pack=_contract_bf16_act_pack,
+        reference=_cutlass_post_reference("cudnn_grouped_gemm_bf16"),
+        snap=_bf16_snap,
+        atol_frac=0.05,
+        rtol=0.05,
+    ),
+    "cudnn_grouped_gemm_fp8_per_tensor": _contract_handler(
+        CudnnGroupedGemmFp8PerTensorConfig,
+        "fp8pertensor",
+        # Same static-scale pack as the TRTLLM per-tensor handler.
+        activation_pack=_fp8_per_tensor_act_pack,
+        reference=_cutlass_post_reference("cudnn_grouped_gemm_fp8_per_tensor"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cudnn_grouped_gemm_mxfp8": _contract_handler(
+        CudnnGroupedGemmMxfp8Config,
+        "mxfp8",
+        activation_pack=_contract_fp8_act_pack(CudnnGroupedGemmMxfp8Config),
+        reference=_cutlass_post_reference("cudnn_grouped_gemm_mxfp8"),
+        atol_frac=0.1,
+        rtol=0.1,
+    ),
+    "cudnn_grouped_gemm_nvfp4": _contract_handler(
+        CudnnGroupedGemmNvfp4Config,
+        "nvfp4",
+        activation_pack=_contract_fp8_act_pack(CudnnGroupedGemmNvfp4Config),
+        reference=_cutlass_post_reference("cudnn_grouped_gemm_nvfp4"),
+        snap=_snap_to_nvfp4,
+        atol_frac=0.25,
+        rtol=0.1,
+    ),
     "cutlass_fp8_block": _contract_handler(
         CutlassFp8BlockConfig,
         "deepseekfp8",
@@ -1373,6 +1482,17 @@ _CONTRACT_HANDLERS = {
     ),
 }
 _B12X_BACKEND_KEYS = frozenset(("b12x_nvfp4", "b12x_w4a16"))
+_CUDNN_GROUPED_GEMM_BACKEND_KEYS = frozenset(
+    (
+        "cudnn_grouped_gemm_bf16",
+        "cudnn_grouped_gemm_fp8_per_tensor",
+        "cudnn_grouped_gemm_mxfp8",
+        "cudnn_grouped_gemm_nvfp4",
+    )
+)
+_CUDNN_BLOCK_SCALE_BACKEND_KEYS = frozenset(
+    ("cudnn_grouped_gemm_mxfp8", "cudnn_grouped_gemm_nvfp4")
+)
 _FP8_BLOCK_BACKEND_KEY = "cutlass_fp8_block"
 
 # Cfg.variant string <-> handler lookup (random-generation ids stay unchanged).
@@ -1510,7 +1630,7 @@ _EP_BACKENDS = {
 _UNFINALIZED_BACKENDS = {
     cfg_cls
     for cfg_cls, runner_cls in _BACKEND_RUNNERS.items()
-    if issubclass(runner_cls, _TrtllmRunnerBase)
+    if issubclass(runner_cls, (_TrtllmRunnerBase, _CudnnGroupedGemmRunnerBase))
 }
 _UNPACKED_VARIANT_IDS = tuple(
     vid
@@ -2166,10 +2286,11 @@ _CURATED = [
             ("mxfp8", 900_075),
         )
     ],
-    # Contract-isolated CUTLASS and b12x coverage. These are deliberately
-    # curated-only: random generation and its historical seed stream remain
-    # unchanged. Every case is PackedPrecomputed, finalized, non-EP, and has a
-    # singleton backend candidate through its synthetic handler id.
+    # Contract-isolated CUTLASS, b12x and cuDNN grouped-GEMM coverage. These are
+    # deliberately curated-only: random generation and its historical seed
+    # stream remain unchanged. Every case is PackedPrecomputed, non-EP, has a
+    # singleton backend candidate through its synthetic handler id, and is
+    # finalized unless the case exercises a backend's unfinalized output.
     *[
         Cfg(
             16,
@@ -2231,6 +2352,47 @@ _CURATED = [
             ("cutlass_nvfp4", "cutlass_nvfp4", "silu", 900_101),
         )
     ],
+    # cuDNN grouped-GEMM runners: the unfinalized triple through the host
+    # recombination (every architecture) and the kernel finalize (SM90/SM100/
+    # SM103, skipped elsewhere). The imbalanced routes leave experts empty.
+    *[
+        Cfg(
+            16,
+            128,
+            256,
+            4,
+            2,
+            variant,
+            route,
+            seed,
+            activation=activation,
+            expected_backend=variant,
+            do_finalize=do_finalize,
+        )
+        for variant, route, activation, seed, do_finalize in (
+            ("cudnn_grouped_gemm_bf16", "uniform", "swiglu", 900_102, False),
+            ("cudnn_grouped_gemm_bf16", "uniform", "geglutanh", 900_103, False),
+            ("cudnn_grouped_gemm_bf16", "uniform", "geglu", 900_104, False),
+            ("cudnn_grouped_gemm_bf16", "imbalanced", "swiglu", 900_105, False),
+            ("cudnn_grouped_gemm_fp8_per_tensor", "uniform", "swiglu", 900_106, False),
+            ("cudnn_grouped_gemm_mxfp8", "uniform", "geglu", 900_107, False),
+            (
+                "cudnn_grouped_gemm_fp8_per_tensor",
+                "imbalanced",
+                "swiglu",
+                900_108,
+                False,
+            ),
+            ("cudnn_grouped_gemm_mxfp8", "uniform", "swiglu", 900_109, False),
+            ("cudnn_grouped_gemm_mxfp8", "imbalanced", "geglutanh", 900_110, False),
+            ("cudnn_grouped_gemm_nvfp4", "uniform", "swiglu", 900_111, False),
+            ("cudnn_grouped_gemm_nvfp4", "imbalanced", "geglutanh", 900_112, False),
+            ("cudnn_grouped_gemm_bf16", "imbalanced", "geglu", 900_113, True),
+            ("cudnn_grouped_gemm_fp8_per_tensor", "uniform", "swiglu", 900_114, True),
+            ("cudnn_grouped_gemm_mxfp8", "uniform", "geglutanh", 900_115, True),
+            ("cudnn_grouped_gemm_nvfp4", "imbalanced", "swiglu", 900_116, True),
+        )
+    ],
 ]
 _CURATED_BY_SEED = {}
 for _cfg in _CURATED:
@@ -2279,7 +2441,7 @@ def test_b12x_w4a16_uses_nvfp4_weight_snap():
 
 def test_contract_curated_seeds_match_declared_capabilities():
     contract_cases = [cfg for cfg in _CURATED if cfg.variant in _CONTRACT_HANDLERS]
-    assert {cfg.seed for cfg in contract_cases} == set(range(900_080, 900_102))
+    assert {cfg.seed for cfg in contract_cases} == set(range(900_080, 900_117))
     for cfg in contract_cases:
         handler = _handler_for(cfg)
         config_type = handler.candidate_configs[0]
@@ -2296,7 +2458,8 @@ def test_contract_curated_seeds_match_declared_capabilities():
         )
         assert type(_activation_for(cfg)) in activations
         assert cfg.routing_input_mode == "prerouted"
-        assert cfg.do_finalize and not cfg.is_ep
+        assert cfg.do_finalize or config_type in _UNFINALIZED_BACKENDS
+        assert not cfg.is_ep
         assert cfg.num_fused_shared_experts == 0
         assert runner_type.backend_key == cfg.expected_backend
 
@@ -2547,9 +2710,19 @@ def _is_unsupported(e):
 _ENV_NEEDS_CUDA13 = "requires CUDA 13 or later"
 _ENV_NEEDS_CUTE_DSL = "requires the CuTe DSL package"
 _ENV_NEEDS_CUDA128 = "FP8 block scaling requires CUDA 12.8 or newer"
+# Fragments of the two errors flashinfer.grouped_mm.cudnn raises for an
+# unusable cuDNN (backend too old / frontend without moe_grouped_matmul_mode).
+_ENV_NEEDS_CUDNN_MOE = f"requires backend version >= {_CUDNN_MOE_MIN_VERSION}"
+_ENV_NEEDS_CUDNN_MOE_FRONTEND = "requires a frontend exposing"
 _CONTRACT_ENVIRONMENT_ERRORS = tuple(
     fragment.lower()
-    for fragment in (_ENV_NEEDS_CUDA13, _ENV_NEEDS_CUTE_DSL, _ENV_NEEDS_CUDA128)
+    for fragment in (
+        _ENV_NEEDS_CUDA13,
+        _ENV_NEEDS_CUTE_DSL,
+        _ENV_NEEDS_CUDA128,
+        _ENV_NEEDS_CUDNN_MOE,
+        _ENV_NEEDS_CUDNN_MOE_FRONTEND,
+    )
 )
 
 
@@ -2567,11 +2740,23 @@ def _cuda_toolkit_version() -> tuple[int, int]:
     return version.major, version.minor
 
 
+@functools.cache
+def _cudnn_moe_available() -> bool:
+    try:
+        import cudnn
+    except (ImportError, OSError):
+        return False
+    return cudnn.backend_version() >= _CUDNN_MOE_MIN_VERSION and hasattr(
+        cudnn, "moe_grouped_matmul_mode"
+    )
+
+
 def _contract_preflight_skip_reason(
     cfg: Cfg,
     *,
     cuda_version: tuple[int, int] | None = None,
     cute_dsl_available: bool | None = None,
+    sm: int | None = None,
 ) -> str | None:
     if cfg.variant in _B12X_BACKEND_KEYS:
         if cuda_version is None:
@@ -2587,6 +2772,19 @@ def _contract_preflight_skip_reason(
             cuda_version = _cuda_toolkit_version()
         if cuda_version < (12, 8):
             return _ENV_NEEDS_CUDA128
+    elif cfg.variant in _CUDNN_GROUPED_GEMM_BACKEND_KEYS:
+        if not _cudnn_moe_available():
+            return f"{cfg.variant} unified MoE {_ENV_NEEDS_CUDNN_MOE}"
+        if cfg.variant in _CUDNN_BLOCK_SCALE_BACKEND_KEYS and sm in (120, 121):
+            import cudnn
+
+            # The flat grouped_mm_mxfp8 / grouped_mm_fp4 list SM120 / SM121, but
+            # cuDNN below 9.22 has no block-scaled MoE grouped-GEMM engine there.
+            if cudnn.backend_version() < 92200:
+                return (
+                    f"{cfg.variant} unified MoE on SM{sm} requires cuDNN >= 9.22 "
+                    "(no SM12x engine for the block-scaled MoE grouped GEMM)"
+                )
     return None
 
 
@@ -2759,7 +2957,7 @@ def test_unified_moe_fuzz(cfg):
 
     handler = _handler_for(cfg)
     dev = torch.device("cuda")
-    if reason := _contract_preflight_skip_reason(cfg):
+    if reason := _contract_preflight_skip_reason(cfg, sm=sm):
         pytest.skip(reason)
     if handler.variant == "w4a16" and sm == 103:
         pytest.skip("TRTLLM MXFP4×BF16 is disabled on SM103")
@@ -2783,8 +2981,9 @@ def test_unified_moe_fuzz(cfg):
         # and block-FP8). MxInt4 stays packed/FromLogits to match the flat API.
         wired_backends = [B for B in wired_backends if B in _UNPACKED_BACKENDS]
     if not cfg.do_finalize:
-        # Only TRTLLM returns unfinalized intermediates; like the EP filter
-        # below, this keeps an unsupported arch on the precise skip path.
+        # Only TRTLLM and the cuDNN grouped-GEMM runners return unfinalized
+        # intermediates; like the EP filter below, this keeps an unsupported
+        # arch on the precise skip path.
         wired_backends = [B for B in wired_backends if B in _UNFINALIZED_BACKENDS]
     if cfg.is_ep:
         # An EP shard needs the runner to map global ids onto a local expert subset;
@@ -2909,7 +3108,11 @@ def test_unified_moe_fuzz(cfg):
         # NVFP4/MXFP4/W4A16. Both need the logical variant to select preparation.
         if BackendCfg in (TrtllmFp8BlockConfig, TrtllmFp4Config):
             prepare_kwargs["quant"] = _quant_config_for_handler(handler)
-        elif BackendCfg in (TrtllmFp8PerTensorConfig, CutlassFp8PerTensorConfig):
+        elif BackendCfg in (
+            TrtllmFp8PerTensorConfig,
+            CutlassFp8PerTensorConfig,
+            CudnnGroupedGemmFp8PerTensorConfig,
+        ):
             prepare_kwargs.update(
                 hidden_states_scale_global=fp8_per_tensor_global_scale(x),
                 intermediate_scale_global=torch.tensor(64.0, device=dev),
