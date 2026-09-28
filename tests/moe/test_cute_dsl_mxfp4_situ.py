@@ -1731,8 +1731,6 @@ def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit, mode):
             assert int(limit[g + j]) == int(limit[g])
         assert g + groups == n or int(expert[g + groups]) != int(expert[g])
         if mode == 1:
-            best = (0, -(-rows // narrow_tile))
-        elif mode == 2:
             best = (groups, 0)
         else:
             candidates = []
@@ -1753,14 +1751,14 @@ def _mixed192_reference(expert, limit, group_rows, narrow_tile, row_unit, mode):
     return wide, narrow, covered
 
 
-@pytest.mark.parametrize("mode", [0, 1, 2])
+@pytest.mark.parametrize("mode", [0, 1])
 @pytest.mark.parametrize(
     "tokens, local_experts, offset, distribution",
     [
         (256, 112, 336, "balanced"),
         (1024, 112, 336, "hot"),
         (1024, 112, 336, "empty"),
-        (1024, 896, 0, "balanced"),
+        (512, 896, 0, "balanced"),
     ],
 )
 def test_swapab_dispatch_mixed_matches_reference(
@@ -1768,8 +1766,8 @@ def test_swapab_dispatch_mixed_matches_reference(
 ):
     """``swapab_dispatch_mixed`` lists every expert's dense 128-row tiles
     ahead of its 192-row windows (64-row offsets) in permutation order,
-    covering the fewest rows, and equals the host reference; both lists
-    stay inside the expert's own sort groups."""
+    covering the fewest rows (mode 1: dense tiles only), and equals the host
+    reference; the cover stays inside the expert's own sort groups."""
     _require_blackwell()
     from flashinfer.fused_moe.cute_dsl.moe_utils import (
         allocate_moe_sort_buffers,

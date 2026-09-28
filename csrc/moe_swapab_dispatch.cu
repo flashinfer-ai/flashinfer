@@ -149,12 +149,13 @@ __global__ void __launch_bounds__(kThreads)
 // expert's exclusive row bound).  Per expert with ``c`` valid rows the kernel
 // picks ``nwide`` dense tiles followed by ``a`` ``narrow_tile``-row windows
 // (``mode`` 0: minimal covered rows ``group_rows * nwide + narrow_tile * a
-// >= c``, ties to fewer windows; 1: windows only; 2: dense tiles only) and
-// emits the dense tiles as sort-group indices (``wide_list``) and the
-// windows as row offsets in ``row_unit`` rows (``narrow_list``), both in
-// permutation order.  The windows start ``group_rows``-aligned plus a
-// multiple of ``narrow_tile`` and never leave the expert's groups: the
-// minimal cover is at most ``group_rows * ceil(c / group_rows)``.
+// >= c``, ties to fewer windows; 1: dense tiles only) and emits the dense
+// tiles as sort-group indices (``wide_list``) and the windows as row
+// offsets in ``row_unit`` rows (``narrow_list``), both in permutation
+// order.  The windows start ``group_rows``-aligned plus a multiple of
+// ``narrow_tile`` and never leave the expert's groups: the minimal cover is
+// at most ``group_rows * ceil(c / group_rows)`` (a windows-only rule would
+// not be: 192 rows over a 37-row expert's single 128-row group).
 template <bool kPdl>
 __global__ void __launch_bounds__(kThreads)
     swapab_dispatch_mixed_kernel(const int32_t* __restrict__ expert_idx,
@@ -182,8 +183,6 @@ __global__ void __launch_bounds__(kThreads)
       const int c = first ? max(mn_limit[g] - g * group_rows, 0) : 0;
       if (c > 0) {
         if (mode == 1) {
-          nnarrow = (c + narrow_tile - 1) / narrow_tile;
-        } else if (mode == 2) {
           nwide = (c + group_rows - 1) / group_rows;
         } else {
           int best_cover = 0x7fffffff;
@@ -269,8 +268,7 @@ void moe_swapab_dispatch_mixed(int64_t expert_idx_ptr, int64_t mn_limit_ptr, int
   TVM_FFI_ICHECK(row_unit > 0 && group_rows > 0 && narrow_tile > 0 &&
                  group_rows % row_unit == 0 && narrow_tile % row_unit == 0)
       << "group_rows and narrow_tile must be positive multiples of row_unit";
-  TVM_FFI_ICHECK(mode >= 0 && mode <= 2)
-      << "mode must be 0 (minimal cover), 1 (windows) or 2 (tiles)";
+  TVM_FFI_ICHECK(mode >= 0 && mode <= 1) << "mode must be 0 (minimal cover) or 1 (tiles)";
   cudaStream_t stream =
       cuda_stream_ptr != 0 ? reinterpret_cast<cudaStream_t>(cuda_stream_ptr) : get_current_stream();
   cudaLaunchConfig_t config{};
