@@ -34,20 +34,47 @@ _SM120 = (12, 0)
 # Exported architectures and the compute capability each one serves.
 _ARCHES = {"sm_100a": _SM100, "sm_103a": _SM103}
 
-# World size 4 on SM100 keeps exactly the reviewed route set of the first export.
+_WIDE = union.SPECIALIZATION_WIDE_MLP
+# World size 4 on SM100 keeps exactly the reviewed route set: the bfloat16
+# classes keep a generic program (their T=1 / T=64 rows run wide_mlp; the
+# no-PDL T=1 row additionally runs the reviewed single-CTA geometry), the
+# float16 classes run wide_mlp for every token count (the resident and
+# owner-forward shapes compose with it).
 _SM100_WS4_ROUTE_KEYS = {
-    ("sm_100a", 4, dtype, pdl, union.SPECIALIZATION_GENERIC)
-    for dtype in _DTYPES
-    for pdl in _PDL
-} | {
-    ("sm_100a", 4, "bfloat16", False, union.SPECIALIZATION_T1_E8_SERIAL_CLEAR),
-    ("sm_100a", 4, "float16", False, union.SPECIALIZATION_T64_E12_RESIDENT),
-    ("sm_100a", 4, "float16", True, union.SPECIALIZATION_T128_E16_OWNER_FORWARD),
+    ("sm_100a", 4, "bfloat16", False, union.SPECIALIZATION_GENERIC),
+    ("sm_100a", 4, "bfloat16", True, union.SPECIALIZATION_GENERIC),
+    (
+        "sm_100a",
+        4,
+        "bfloat16",
+        False,
+        f"{_WIDE}_{union.SPECIALIZATION_T1_E8_SERIAL_CLEAR}_{union.SPECIALIZATION_CTA1}",
+    ),
+    ("sm_100a", 4, "bfloat16", True, _WIDE),
+    (
+        "sm_100a",
+        4,
+        "float16",
+        False,
+        f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
+    ),
+    ("sm_100a", 4, "float16", False, _WIDE),
+    (
+        "sm_100a",
+        4,
+        "float16",
+        True,
+        f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
+    ),
+    ("sm_100a", 4, "float16", True, _WIDE),
 }
-# Cooperative (resident-grid) shape specializations of the union.
+# Cooperative (resident-grid) shape specializations of the union (alone or
+# composed with the wide_mlp schedule).
 _COOPERATIVE_SPECIALIZATIONS = {
     union.SPECIALIZATION_T64_E12_RESIDENT,
     union.SPECIALIZATION_T128_E16_OWNER_FORWARD,
+    f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
+    f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
 }
 # Every (arch, world size) carries one generic route per (dtype, launch_with_pdl)
 # pair plus reviewed specializations drawn from this allow-list.  Extend a set
@@ -55,16 +82,17 @@ _COOPERATIVE_SPECIALIZATIONS = {
 # ``sm103_t1`` schedule variant applies at T=1 and composes with the
 # world-size-4 shape specializations (serial clear at BF16/T1/E8/no-PDL).
 _EXTRA_SPECIALIZATIONS = {
-    ("sm_100a", 2): frozenset(),
+    ("sm_100a", 2): frozenset({_WIDE, f"{_WIDE}_{union.SPECIALIZATION_CTA1}"}),
     ("sm_100a", 4): {key[4] for key in _SM100_WS4_ROUTE_KEYS}
     - {union.SPECIALIZATION_GENERIC},
     ("sm_100a", 8): frozenset({union.SPECIALIZATION_SM100_WS8_MID}),
-    ("sm_103a", 2): frozenset({union.SPECIALIZATION_SM103_T1}),
+    ("sm_103a", 2): frozenset({union.SPECIALIZATION_SM103_T1, _WIDE}),
     ("sm_103a", 4): frozenset(
         {
             f"{union.SPECIALIZATION_SM103_T1}_{union.SPECIALIZATION_T1_E8_SERIAL_CLEAR}",
-            union.SPECIALIZATION_T64_E12_RESIDENT,
-            union.SPECIALIZATION_T128_E16_OWNER_FORWARD,
+            _WIDE,
+            f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
+            f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
         }
     ),
     ("sm_103a", 8): frozenset(
@@ -130,11 +158,19 @@ def test_module_inventory_is_verified_source_only() -> None:
         assert ("buffer", "workspace_tensor") in record["arg_plan"]
         launch = record["launch"]
         block = tuple(launch["block"])
-        assert tuple(launch["cluster"]) == (union.CLUSTER_CTAS, 1, 1)
-        if world_size == 4:
-            assert block == (224, 1, 1)
-        else:
-            assert block[1:] == (1, 1) and block[0] > 0 and block[0] % 32 == 0
+        cluster = tuple(launch["cluster"])
+        # One 7168-wide token is covered by 896 threads (16 B per thread): four
+        # 224-thread CTAs in a cluster, or one 896-thread CTA where the T=1
+        # geometry probe measured the single-CTA build faster.
+        assert cluster[1:] == (1, 1) and cluster[0] in {1, 4}
+        assert block[1:] == (1, 1) and block[0] * cluster[0] == 896
+        residency = launch["persistent_ctas_per_sm"]
+        assert isinstance(residency, int) and residency >= 1
+        if launch["cooperative"]:
+            assert residency == 1
+        if cluster[0] == 1:
+            assert record["arch"] == "sm_100a" and world_size in {2, 4}
+            assert not launch["cooperative"] and launch["persistent_ctas_per_sm"] == 1
 
 
 def test_exported_architectures_are_sm100_and_sm103() -> None:
@@ -155,15 +191,33 @@ def test_routes_cover_exactly_the_reviewed_specializations() -> None:
     assert {key[2] for key in union.ROUTES} <= set(_DTYPES)
     assert {key[3] for key in union.ROUTES} <= set(_PDL)
     assert _route_keys("sm_100a", 4) == _SM100_WS4_ROUTE_KEYS
+    classes = set(union._WIDE_MLP_CLASSES)
+    assert all(len(key) == 4 for key in classes)
     for arch in _ARCHES:
         for world_size in _WORLD_SIZES:
             keys = _route_keys(arch, world_size)
-            generic = {
-                (arch, world_size, dtype, pdl, union.SPECIALIZATION_GENERIC)
-                for dtype in _DTYPES
-                for pdl in _PDL
-            }
-            assert keys >= generic
+            for dtype in _DTYPES:
+                for pdl in _PDL:
+                    # Every (dtype, PDL) class has one persistent program for
+                    # unreviewed token counts: generic, or wide_mlp for a
+                    # promoted class (which then exports no generic program).
+                    if (arch, world_size, dtype, pdl) in classes:
+                        assert (arch, world_size, dtype, pdl, _WIDE) in keys
+                        assert (
+                            arch,
+                            world_size,
+                            dtype,
+                            pdl,
+                            union.SPECIALIZATION_GENERIC,
+                        ) not in keys
+                    else:
+                        assert (
+                            arch,
+                            world_size,
+                            dtype,
+                            pdl,
+                            union.SPECIALIZATION_GENERIC,
+                        ) in keys
             extra = {key[4] for key in keys} - {union.SPECIALIZATION_GENERIC}
             assert extra <= _EXTRA_SPECIALIZATIONS[(arch, world_size)]
     for (_arch, world_size, _dtype, pdl, specialization), names in union.ROUTES.items():
@@ -174,22 +228,33 @@ def test_routes_cover_exactly_the_reviewed_specializations() -> None:
             # One route launches every rank the same way.
             assert launch["cooperative"] is launches[0]["cooperative"]
             assert tuple(launch["block"]) == tuple(launches[0]["block"])
-        if specialization == union.SPECIALIZATION_GENERIC:
-            # Generic serves up to 2048 tokens; a one-cluster-per-token cooperative
-            # grid cannot be co-resident at that size, so generic is persistent.
+            assert (
+                launch["persistent_ctas_per_sm"]
+                == launches[0]["persistent_ctas_per_sm"]
+            )
+        if specialization in {union.SPECIALIZATION_GENERIC, _WIDE}:
+            # The persistent programs serve up to 2048 tokens; a one-cluster-per-token
+            # cooperative grid cannot be co-resident at that size.
             assert launches[0]["cooperative"] is False
         if world_size == 4:
             assert launches[0]["cooperative"] is (
                 specialization in _COOPERATIVE_SPECIALIZATIONS
             )
-        if specialization == union.SPECIALIZATION_T128_E16_OWNER_FORWARD:
+        if specialization.endswith(union.SPECIALIZATION_T128_E16_OWNER_FORWARD):
             # Owner forwarding is rank-specialized: one physical module per rank.
             assert len(set(names)) == world_size
+        # The single-CTA geometry is a named specialization: exactly the routes
+        # whose name carries the suffix launch one-CTA clusters.
+        single_cta = specialization.endswith(union.SPECIALIZATION_CTA1)
+        for launch in launches:
+            assert (tuple(launch["cluster"])[0] == 1) is single_cta
 
 
 @pytest.mark.parametrize(
     "arch,world_size,dtype_name,pdl,tokens,experts,expected",
     [
+        # SM100 world size 4: bfloat16 keeps generic except its reviewed T=1 (serial
+        # clear) and T=64 rows; float16 is a wide_mlp class for every token count.
         (
             "sm_100a",
             4,
@@ -197,12 +262,23 @@ def test_routes_cover_exactly_the_reviewed_specializations() -> None:
             False,
             1,
             8,
-            union.SPECIALIZATION_T1_E8_SERIAL_CLEAR,
+            f"{_WIDE}_{union.SPECIALIZATION_T1_E8_SERIAL_CLEAR}_{union.SPECIALIZATION_CTA1}",
         ),
         ("sm_100a", 4, "bfloat16", True, 1, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 4, "float16", False, 1, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 4, "float16", False, 64, 12, union.SPECIALIZATION_T64_E12_RESIDENT),
-        ("sm_100a", 4, "float16", True, 64, 12, union.SPECIALIZATION_GENERIC),
+        ("sm_100a", 4, "bfloat16", True, 64, 8, _WIDE),
+        ("sm_100a", 4, "bfloat16", True, 64, 12, union.SPECIALIZATION_GENERIC),
+        ("sm_100a", 4, "float16", False, 1, 8, _WIDE),
+        (
+            "sm_100a",
+            4,
+            "float16",
+            False,
+            64,
+            12,
+            f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
+        ),
+        ("sm_100a", 4, "float16", True, 64, 12, _WIDE),
+        ("sm_100a", 4, "float16", False, 512, 8, _WIDE),
         (
             "sm_100a",
             4,
@@ -210,15 +286,19 @@ def test_routes_cover_exactly_the_reviewed_specializations() -> None:
             True,
             128,
             16,
-            union.SPECIALIZATION_T128_E16_OWNER_FORWARD,
+            f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
         ),
         ("sm_100a", 4, "bfloat16", False, 128, 16, union.SPECIALIZATION_GENERIC),
+        ("sm_100a", 4, "bfloat16", False, 512, 8, union.SPECIALIZATION_GENERIC),
         ("sm_100a", 4, "bfloat16", True, 2048, 12, union.SPECIALIZATION_GENERIC),
-        # The world-size-4 reviewed shapes do not leak into other world sizes.
-        ("sm_100a", 2, "bfloat16", False, 1, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 2, "float16", False, 64, 12, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 2, "float16", True, 128, 16, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 2, "bfloat16", True, 2048, 12, union.SPECIALIZATION_GENERIC),
+        # The world-size-4 reviewed shapes do not leak into other world sizes;
+        # every SM100 two-rank class runs wide_mlp (no generic program) and the
+        # bfloat16 no-PDL T=1 row runs its single-CTA wide_mlp build.
+        ("sm_100a", 2, "bfloat16", False, 1, 8, f"{_WIDE}_{union.SPECIALIZATION_CTA1}"),
+        ("sm_100a", 2, "float16", False, 64, 12, _WIDE),
+        ("sm_100a", 2, "float16", True, 128, 16, _WIDE),
+        ("sm_100a", 2, "bfloat16", True, 2048, 12, _WIDE),
+        ("sm_100a", 2, "bfloat16", True, 512, 8, _WIDE),
         ("sm_100a", 8, "bfloat16", False, 1, 8, union.SPECIALIZATION_GENERIC),
         ("sm_100a", 8, "float16", True, 1, 8, union.SPECIALIZATION_GENERIC),
         ("sm_100a", 8, "float16", False, 2048, 12, union.SPECIALIZATION_GENERIC),
@@ -237,7 +317,17 @@ def test_routes_cover_exactly_the_reviewed_specializations() -> None:
             f"{union.SPECIALIZATION_SM103_T1}_{union.SPECIALIZATION_T1_E8_SERIAL_CLEAR}",
         ),
         ("sm_103a", 8, "bfloat16", False, 1, 8, union.SPECIALIZATION_SM103_T1),
-        ("sm_103a", 4, "float16", False, 64, 12, union.SPECIALIZATION_T64_E12_RESIDENT),
+        # SM103 wide_mlp classes (bfloat16 without PDL at two and four ranks, float16 at
+        # four ranks) and reviewed rows inside mixed classes.
+        (
+            "sm_103a",
+            4,
+            "float16",
+            False,
+            64,
+            12,
+            f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
+        ),
         (
             "sm_103a",
             4,
@@ -245,12 +335,21 @@ def test_routes_cover_exactly_the_reviewed_specializations() -> None:
             True,
             128,
             16,
-            union.SPECIALIZATION_T128_E16_OWNER_FORWARD,
+            f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
         ),
+        ("sm_103a", 4, "float16", True, 1024, 16, _WIDE),
+        ("sm_103a", 4, "bfloat16", False, 256, 8, _WIDE),
+        ("sm_103a", 4, "bfloat16", True, 256, 12, _WIDE),
+        ("sm_103a", 4, "bfloat16", True, 2048, 12, union.SPECIALIZATION_GENERIC),
+        ("sm_103a", 2, "bfloat16", False, 64, 8, _WIDE),
+        ("sm_103a", 2, "bfloat16", True, 64, 8, _WIDE),
+        ("sm_103a", 2, "bfloat16", True, 128, 16, union.SPECIALIZATION_GENERIC),
+        ("sm_103a", 2, "float16", True, 128, 16, _WIDE),
         ("sm_103a", 2, "float16", True, 2048, 16, union.SPECIALIZATION_GENERIC),
         ("sm_103a", 8, "float16", False, 2048, 8, union.SPECIALIZATION_GENERIC),
+        ("sm_103a", 8, "bfloat16", True, 64, 8, union.SPECIALIZATION_GENERIC),
         # Reviewed SM103 shapes do not leak into SM100 and vice versa.
-        ("sm_100a", 2, "bfloat16", False, 1, 8, union.SPECIALIZATION_GENERIC),
+        ("sm_100a", 2, "bfloat16", False, 1, 8, f"{_WIDE}_{union.SPECIALIZATION_CTA1}"),
     ],
 )
 def test_select_specialization_rules(
@@ -346,12 +445,39 @@ def test_route_scope_rejects_unexported_world_sizes(world_size: int) -> None:
 
 
 def test_launch_grid_rule() -> None:
-    assert union.launch_grid_x(1, False, 148) == 4
-    assert union.launch_grid_x(2048, False, 148) == 148
-    assert union.launch_grid_x(64, True, 148) == 256
-    assert union.launch_grid_x(128, True, 148) == 512
+    # SM-bounded persistent grid at one CTA per SM, then at k resident CTAs per SM
+    # (four-CTA clusters).
+    assert union.launch_grid_x(1, False, 148, 1, 4) == 4
+    assert union.launch_grid_x(2048, False, 148, 1, 4) == 148
+    assert union.launch_grid_x(1, False, 148, 4, 4) == 4
+    assert union.launch_grid_x(64, False, 148, 4, 4) == 256
+    assert union.launch_grid_x(2048, False, 148, 4, 4) == 592
+    assert union.launch_grid_x(2048, False, 148, 5, 4) == 740
+    # Single-CTA modules (the reviewed T=1 rows) launch one CTA per token.
+    assert union.launch_grid_x(1, False, 148, 1, 1) == 1
+    assert union.launch_grid_x(64, False, 148, 1, 1) == 64
+    # Resident-grid (cooperative) modules launch one cluster per token.
+    assert union.launch_grid_x(64, True, 148, 1, 4) == 256
+    assert union.launch_grid_x(128, True, 148, 1, 4) == 512
     with pytest.raises(ValueError):
-        union.launch_grid_x(0, False, 148)
+        union.launch_grid_x(0, False, 148, 1, 4)
+    with pytest.raises(ValueError):
+        union.launch_grid_x(64, True, 148, 2, 4)
+    with pytest.raises(ValueError):
+        union.launch_grid_x(64, False, 148, 0, 4)
+    with pytest.raises(ValueError):
+        union.launch_grid_x(64, False, 148, 1, 0)
+    for record in union.MODULES.values():
+        launch = record["launch"]
+        cluster_ctas = int(launch["cluster"][0])
+        grid = union.launch_grid_x(
+            2048,
+            launch["cooperative"],
+            148,
+            launch["persistent_ctas_per_sm"],
+            cluster_ctas,
+        )
+        assert grid % cluster_ctas == 0 and grid > 0
 
 
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
