@@ -2470,7 +2470,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                         acc_vec = tTR_rAcc.load()
                                         for c in cutlass.range_constexpr(epi_n):
                                             vals[c] = acc_vec[c] * alpha_val
-                                    if cutlass.const_expr(self.perf_probe == 0):
+                                    if cutlass.const_expr(self.perf_probe in (0, 4)):
                                         # Exchange: gate lanes hand SiTU(gate) of columns [0, half) to
                                         # the up lanes; up lanes hand up' of [half, epi_n) to the gate
                                         # lanes. Each half then owns 16 columns end to end.
@@ -2503,10 +2503,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                 inv_scaleg = ue8m0_to_inv_scale_fast(scale_codeg)
                                                 # Predicated stores keep the 16 column chains branch-free
                                                 # so their latencies interleave.
+                                                # perf_probe 4: everything but the global stores.
                                                 st_e4m3_pred(
                                                     cute.domain_offset((prowg, j, 0), out),
                                                     vg * inv_scaleg,
-                                                    okg,
+                                                    okg * cutlass.Int32(self.perf_probe != 4),
                                                 )
                                                 if cutlass.const_expr(self.sf_blocked):
                                                     sf_dstg = cute.domain_offset(
@@ -2522,7 +2523,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                     )
                                                 else:
                                                     sf_dstg = cute.domain_offset((prowg, sf_kb), out_sf)
-                                                st_u8_pred(sf_dstg, scale_codeg, okg * is_lane0)
+                                                st_u8_pred(sf_dstg, scale_codeg, okg * is_lane0 * cutlass.Int32(self.perf_probe != 4))
                                         else:
                                             for c in cutlass.range_constexpr(half):
                                                 uu = vals[c]
@@ -2537,10 +2538,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                 inv_scaleu = ue8m0_to_inv_scale_fast(scale_codeu)
                                                 # Predicated stores keep the 16 column chains branch-free
                                                 # so their latencies interleave.
+                                                # perf_probe 4: everything but the global stores.
                                                 st_e4m3_pred(
                                                     cute.domain_offset((prowu, j, 0), out),
                                                     vu * inv_scaleu,
-                                                    oku,
+                                                    oku * cutlass.Int32(self.perf_probe != 4),
                                                 )
                                                 if cutlass.const_expr(self.sf_blocked):
                                                     sf_dstu = cute.domain_offset(
@@ -2556,7 +2558,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                                     )
                                                 else:
                                                     sf_dstu = cute.domain_offset((prowu, sf_kb), out_sf)
-                                                st_u8_pred(sf_dstu, scale_codeu, oku * is_lane0)
+                                                st_u8_pred(sf_dstu, scale_codeu, oku * is_lane0 * cutlass.Int32(self.perf_probe != 4))
                                 cute.arch.fence_view_async_tmem_load()
                             else:
                                 # ---- finalize: transposed staging + bulk reduce-add per token ----
@@ -2581,7 +2583,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                         acc_vec = tTR_rAcc.load()
                                         for c in cutlass.range_constexpr(epi_n):
                                             vals[c] = acc_vec[c] * alpha_val
-                                    if cutlass.const_expr(self.perf_probe == 0):
+                                    if cutlass.const_expr(self.perf_probe in (0, 4)):
                                         for c in cutlass.range_constexpr(epi_n):
                                             v = vals[c] * sScale[(sub * epi_n + c, meta_stage)]
                                             vp = cute.arch.shuffle_sync_bfly(v, 1)
@@ -2597,7 +2599,8 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                                         self.epilog_sync_barrier.arrive_and_wait()
                                         if is_issuer:
                                             prow = row_base + sub * epi_n + epi_tidx
-                                            if prow < mn_limit:
+                                            # perf_probe 4: stage, but issue no reduce.
+                                            if (prow < mn_limit) & (self.perf_probe != 4):
                                                 tok = sTok[(sub * epi_n + epi_tidx, meta_stage)]
                                                 dst = cute.domain_offset((tok, h0, 0), out)
                                                 blk_reduce_bf16(
