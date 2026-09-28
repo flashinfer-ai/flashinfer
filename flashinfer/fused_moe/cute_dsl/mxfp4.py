@@ -1942,13 +1942,16 @@ class Mxfp4MoESwapAbPlan:
                         compiled, args = self._gemm2_dense_alt
                         compiled(*args, stream=side)
                 self._join_event.record(self._side_stream)
+            if self._gemm1_dense_alt is not None and not mixed_side:
+                # Coarser-tile dense GEMM1 first: on the routings that choose
+                # it (few large experts) the swap and base-tile launches then
+                # find no work and overlap its tail instead of preceding it.
+                compiled, args, kwargs = self._gemm1_dense_alt
+                compiled(*args, stream=stream, **kwargs)
             self._gemm1(*self._gemm1_args, stream=stream)
             if self._gemm1_dense is not None and not self.split and not mixed_side:
                 compiled, args, kwargs = self._gemm1_dense
                 compiled(*args, stream=stream, **kwargs)
-                if self._gemm1_dense_alt is not None:
-                    compiled, args, kwargs = self._gemm1_dense_alt
-                    compiled(*args, stream=stream, **kwargs)
             if mixed_side and self._gemm2_wide is None:
                 # Dense finalize over every group: needs the dense tiles' rows.
                 torch.cuda.current_stream().wait_event(self._join_event)
@@ -1956,14 +1959,15 @@ class Mxfp4MoESwapAbPlan:
                 # The swap finalize reduces into the output the dense GEMM1
                 # zero-fills on the side stream.
                 torch.cuda.current_stream().wait_event(self._gemm1_done_event)
-            self._gemm2(*self._gemm2_args, stream=stream)
-            if self.mixed192 and self._gemm2_wide is not None and not mixed_side:
-                compiled, args = self._gemm2_wide
-                compiled(*args, stream=stream)
             if self._gemm2_dense_alt is not None and not (
                 mixed_side and self._gemm2_wide is not None
             ):
+                # Same order for GEMM2 (all GEMM1s precede it in the stream).
                 compiled, args = self._gemm2_dense_alt
+                compiled(*args, stream=stream)
+            self._gemm2(*self._gemm2_args, stream=stream)
+            if self.mixed192 and self._gemm2_wide is not None and not mixed_side:
+                compiled, args = self._gemm2_wide
                 compiled(*args, stream=stream)
             if self._side_stream is not None:
                 # Join before the finalize reads the wide GEMM2's output rows

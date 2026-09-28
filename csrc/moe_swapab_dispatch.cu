@@ -220,6 +220,10 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   if constexpr (kPdl) {
     cudaGridDependencySynchronize();
+    // Dependents wait for this grid's completion before reading the lists
+    // (every consumer runs griddepcontrol.wait first); releasing them here
+    // hides their launch latency under this kernel.
+    cudaTriggerProgrammaticLaunchCompletion();
   }
 #endif
   // Warp scans: the default raking scan serializes 32 struct adds per lane
@@ -334,11 +338,6 @@ __global__ void __launch_bounds__(kThreads) swapab_dispatch_mixed_kernel(
       *narrow_count_base = alt ? 0 : carry.narrow;
     }
   }
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
-  if constexpr (kPdl) {
-    cudaTriggerProgrammaticLaunchCompletion();
-  }
-#endif
 }
 
 }  // namespace
