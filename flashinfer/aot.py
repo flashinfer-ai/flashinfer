@@ -873,6 +873,9 @@ def gen_all_modules(
             jit_specs.append(gen_trtllm_gen_fused_moe_sm100_module(enable_rubin=True))
         if has_sm110:
             jit_specs.append(gen_fp4_quantization_sm110_module())
+            # fused_moe_100 also targets SM110 and must ship in its provider.
+            if not has_sm100:
+                jit_specs.append(gen_cutlass_fused_moe_sm100_module())
         if has_sm120:
             jit_specs.append(gen_fp4_quantization_sm120_module())
         if has_sm121:
