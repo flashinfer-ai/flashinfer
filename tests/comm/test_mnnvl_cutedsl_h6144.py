@@ -218,9 +218,8 @@ def _order_sensitive_local(m: int, rank: int, world_size: int) -> torch.Tensor:
 def _past_bt_split(tp_size: int) -> int:
     """Smallest M past every finite BT_ONLY bound, so both BT presets run.
 
-    Derived from the profile rather than hard-coded: the H6144 splits are
-    provisional until the sweep lands, and a stale constant here would quietly
-    stop exercising PRESET_1.
+    Derived from the profile rather than hard-coded, so retuning the splits
+    cannot leave a stale constant here that quietly stops exercising PRESET_1.
     """
     (profile,) = (
         p
