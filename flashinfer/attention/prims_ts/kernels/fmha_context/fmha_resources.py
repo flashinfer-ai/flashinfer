@@ -2431,6 +2431,7 @@ class TmemSPResource(MemoryResource):
         return (
             not self.cfg.is_causal
             and not self.cfg.has_varlen
+            and not self.cfg.has_variable_window
             and self.cfg.fixed_dense_k_tail > 0
         )
 

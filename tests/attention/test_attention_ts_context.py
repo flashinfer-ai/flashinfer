@@ -3892,9 +3892,10 @@ def test_attention_ts_context_fixed_dense_k_tail_excludes_tma_padding():
     )
 
 
-# Fixed dense K tails. The tail size S % 128 selects the partial-tile path in
-# the query-paired softmax schedule. Lengths with two or more K/V tiles run
-# unmasked loop iterations before the masked last tile.
+# Fixed dense K tails. The tail size S % 128 selects the partial-tile path.
+# D128 runs the query-paired softmax schedule, which masks the last tile after
+# the loop. D256 runs the single-QKV schedule, which masks it inside the loop.
+# Lengths with two or more K/V tiles run unmasked iterations before the tail.
 _FIXED_DENSE_K_TAIL_CASES = (
     pytest.param((272,), id="two-tiles-tail16"),
     pytest.param((336,), id="two-tiles-tail80"),
@@ -3911,11 +3912,13 @@ _FIXED_DENSE_K_TAIL_CASES = (
     (torch.bfloat16, _FP8),
     ids=("pv-bf16", "pv-fp8"),
 )
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_fixed_dense_k_tail_accuracy(
     k_lengths: tuple[int, ...],
     pv_dtype: torch.dtype,
+    head_dim: int,
 ):
     """Random data on the fixed dense tail path against the torch reference.
 
@@ -3932,9 +3935,10 @@ def test_attention_ts_context_fixed_dense_k_tail_accuracy(
         qkv_dtype=torch.bfloat16,
         packed=False,
         mask_type="dense",
+        head_dim=head_dim,
         output_dtype=torch.bfloat16,
         device="cuda",
-        seed=2026091602 + k_length,
+        seed=2026091602 + k_length + head_dim,
     )
     if pv_dtype is _FP8:
         case = replace(case, v=case.v.to(_FP8))
