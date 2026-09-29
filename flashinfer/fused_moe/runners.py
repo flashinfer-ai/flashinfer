@@ -6982,6 +6982,14 @@ class PrimsTsRunner(_TrtllmRunnerBase):
     ) -> List[torch.Tensor]:
         self._require_built()
         self._validate_pack_contract(act)
+        # The class-level opt-in covers NVFP4×NVFP4 only; BF16×BF16 and an
+        # NVFP4 runner built without per_token_scale=True would drop the scale.
+        if act.per_token_scale is not None and not self._per_token:
+            raise ValueError(
+                f"{type(self).__name__} was configured without "
+                "QuantConfig(per_token_scale=True) and does not consume "
+                "MoEActivationPack.per_token_scale."
+            )
         from flashinfer.prims_ts.moe.support import (
             is_prims_ts_bf16_supported,
             is_prims_ts_nvfp4_supported,

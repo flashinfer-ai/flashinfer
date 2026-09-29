@@ -205,6 +205,30 @@ class TestPrimsTsUnifiedValidation:
         with pytest.raises(NotImplementedError, match="SM100/SM103"):
             runner.check_support()
 
+    def test_bf16_rejects_per_token_scale_config(self):
+        runner = self._runner(
+            _config(variant=dataclasses.replace(_BF16, per_token_scale=True))
+        )
+        with pytest.raises(NotImplementedError, match="per-token scale"):
+            runner.check_support()
+
+    @pytest.mark.parametrize("variant", [_BF16, _NVFP4], ids=["bf16", "nvfp4"])
+    def test_pack_rejects_per_token_scale_when_not_configured(self, variant):
+        runner = self._runner(_config(variant=variant))
+        runner._built = True
+        runner._per_token = False
+        hidden = torch.zeros(4, 8, dtype=torch.bfloat16)
+        act = MoEActivationPack(
+            hidden,
+            None,
+            torch.zeros(4, 2, dtype=torch.int32),
+            torch.ones(4, 2, dtype=torch.float32),
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+            per_token_scale=torch.ones(4, dtype=torch.float32),
+        )
+        with pytest.raises(ValueError, match="per_token_scale"):
+            runner.pack_inputs(act, weights=None)
+
     def test_intermediate_size_alignment(self):
         runner = self._runner(_config(experts=ExpertConfig(intermediate_size=64)))
         with pytest.raises(NotImplementedError, match="intermediate_size"):
