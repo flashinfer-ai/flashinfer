@@ -75,6 +75,7 @@ from .cake_jit import (
     GEMM_TSTORE_KERNEL_KEY,
     MODULES,
     decode_kernel_key,
+    gemm_kernel_key,
     kernel_module_name,
     load_cake_kimi_k3_fp8_projection_module,
     quant_kernel_key,
@@ -283,7 +284,12 @@ def quant_units(M: int, k_blocks: int) -> int:
 
 
 def decode_module_stages(
-    tok: int, stages: int, fused: bool, resident: bool, xb_stages: int = 0
+    tok: int,
+    stages: int,
+    fused: bool,
+    resident: bool,
+    xb_stages: int = 0,
+    epi_chunk: int = 32,
 ) -> int:
     """Pipeline depth of the physical decode instance after its SMEM clamp (the Cake ``decode_ir`` rule).
 
@@ -298,7 +304,7 @@ def decode_module_stages(
     )
     xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
     res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
-    epi_bytes = min(32, tok) * 128 * 4
+    epi_bytes = min(int(epi_chunk), 32, tok) * 128 * 4
     return max(
         1,
         min(
@@ -417,6 +423,8 @@ class DecodeConfig:
     )
     csplit: int = 1  # round 5: K split across the CTAs of one cluster (== split); the partials meet in SMEM (DSM)
     cs_alias: bool = False  # round 5: the DSM inbox aliases the dead pipeline stages (one exchange round); only when every CTA owns one work item
+    epi_chunk: int = 32  # round 6: epilogue staging rows per flush (table key ``epi_chunk``; 16 frees SMEM for the 5-stage t32 ring)
+    pf: int = 0  # round 6 (lever P): weight-tile L2 prefetch distance in stages (table key ``pf``; 0 = off)
 
     @property
     def tok_rows(self) -> int:
@@ -433,6 +441,8 @@ class DecodeConfig:
             self.qlanes,
             self.csplit,
             cs_alias=self.cs_alias,
+            epi_chunk=self.epi_chunk,
+            pf=self.pf,
         )
 
 
@@ -476,7 +486,10 @@ def decode_config(
             )
         split = csplit
     tok_rows = max(tok, 32)
-    epi_bytes = min(32, tok) * 128 * 4
+    # Table key ``epi_chunk`` (round 6): epilogue staging rows per flush (32, 16 or 8; a smaller chunk frees SMEM for a
+    # deeper ring at the cost of more flush barriers per item).
+    epi_chunk = min(int(entry.get("epi_chunk", 32)), tok)
+    epi_bytes = epi_chunk * 128 * 4
     xb_bytes = tok * 512
     stage_bytes_ring = DEC_W_BYTES + tok_rows * BLOCK_K + DEC_SF_BYTES
     # Fused variant: the BF16 token tiles either share the W / X stage (coupled, ``xb_stages`` 0) or stream through
@@ -514,6 +527,12 @@ def decode_config(
     if xb_stages == 0:
         stage_bytes = stage_bytes_ring + (xb_bytes if fused else 0)
         stages = max(2, min(DEC_MAX_STAGES, (DEC_SMEM_CAP - epi_bytes) // stage_bytes))
+    # Table key ``stages`` (round 6, lever D): the row pins the ring depth past ``DEC_MAX_STAGES`` (5 x 43008 B + an 8 KB
+    # epilogue chunk fit the pool at t32); the physical instance still applies the SMEM clamp (``decode_module_stages``).
+    if entry.get("stages"):
+        stages = int(entry["stages"])
+    # Table key ``pf`` (round 6, lever P): the weight tiles (+ weight scales) are prefetched into L2 ``pf`` stages ahead.
+    pf = int(entry.get("pf", 0))
     m_tiles = -(-M // tok)
     tiles = int(n_tiles128) * m_tiles
     total_work = tiles * split
@@ -550,7 +569,9 @@ def decode_config(
         resident=resident,
         persist=persist,
         stages=stages,
-        module_stages=decode_module_stages(tok, stages, fused, resident, xb_stages),
+        module_stages=decode_module_stages(
+            tok, stages, fused, resident, xb_stages, epi_chunk
+        ),
         m_tiles=m_tiles,
         tiles=tiles,
         total_work=total_work,
@@ -559,6 +580,8 @@ def decode_config(
         xb_stages=xb_stages,
         qlanes=qlanes,
         csplit=csplit,
+        epi_chunk=epi_chunk,
+        pf=pf,
         cs_alias=csplit > 1
         and grid == total_work
         and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages)
@@ -567,6 +590,18 @@ def decode_config(
         )
         > 1,
     )
+
+
+def gemm_prefetch_distance(
+    M: int, n_tiles128: int, num_k_iters: int, arch: str
+) -> int:
+    """Round 6 (lever GP): weight-tile L2 prefetch distance of the GEMM route from the shape's table row (key
+    ``gemm_pf``; 0 = off). Only tabulated GEMM-routed rows prefetch (e.g. the 48-pair ``tp1:q_proj:256`` whose 3-stage
+    weight stream is HBM-latency-bound: 1.14x on both architectures)."""
+    entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
+    if entry is None or entry.get("route") != "gemm":
+        return 0
+    return int(entry.get("gemm_pf", 0))
 
 
 def required_kernel_keys(arch: str, sm_count: int = 148) -> tuple[str, ...]:
@@ -581,8 +616,14 @@ def required_kernel_keys(arch: str, sm_count: int = 148) -> tuple[str, ...]:
         GEMM_TSTORE_KERNEL_KEY,
         GEMM_RSTAGED_KERNEL_KEY,
     ]
-    for key in DECODE_TABLE.get(arch, {}):
+    for key, entry in DECODE_TABLE.get(arch, {}).items():
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
+        if entry.get("route") == "gemm" and int(entry.get("gemm_pf", 0)) > 0:
+            # round 6 (lever GP): the prefetching GEMM program of the tabulated row's production epilogue (16-byte
+            # aligned views: TMA store); other views fall back to the non-prefetching program (``route_plan``)
+            gkey = gemm_kernel_key(GEMM_TSTORE_KERNEL_KEY, int(entry["gemm_pf"]))
+            if gkey not in keys:
+                keys.append(gkey)
         for M in _bucket_rows(bucket):
             cfg = decode_config(M, n_tiles128, num_k_iters, arch, sm_count)
             if cfg is not None and cfg.kernel_key not in keys:
@@ -928,13 +969,19 @@ def route_plan(
         kernels.append(quant_kernel_key(units))
         grids.append(-(-(M * units_per_row) // (QUANT_WARPS * 2)))
     if cfg is None:
-        kernels.append(
+        base = (
             GEMM_TSTORE_KERNEL_KEY
             if gemm_tma_store
             else GEMM_RSTAGED_KERNEL_KEY
             if gemm_reg_staged
             else GEMM_KERNEL_KEY
         )
+        gpf = gemm_prefetch_distance(
+            M, prepared.n_tiles128, prepared.num_k_iters, arch
+        )
+        # round 6 (lever GP): the prefetching program when it is registered for this epilogue, else the plain one
+        key = gemm_kernel_key(base, gpf)
+        kernels.append(key if gpf and route_available(arch, (key,)) else base)
         grids.append(_gemm_grid(_m_tiles(M), prepared.n_tiles))
     else:
         kernels.append(cfg.kernel_key)

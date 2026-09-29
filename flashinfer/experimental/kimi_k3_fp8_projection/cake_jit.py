@@ -1505,6 +1505,8 @@ def decode_kernel_key(
     qlanes: int = 16,
     csplit: int = 1,
     cs_alias: bool = False,
+    epi_chunk: int = 0,
+    pf: int = 0,
 ) -> str:
     key = f"decode:t{int(tok)}_p{int(stages)}"
     if fused:
@@ -1515,11 +1517,21 @@ def decode_kernel_key(
         key += f"_r{int(xb_stages)}"
     if qlanes != 16:
         key += f"_q{int(qlanes)}"
+    if epi_chunk and int(epi_chunk) != min(32, int(tok)):
+        key += f"_c{int(epi_chunk)}"  # round 6: epilogue staging rows per flush (a 16-row chunk frees SMEM for a 5th stage)
     if int(csplit) > 1:
         key += f"_cs{int(csplit)}"  # round 5: K split across the CTAs of one cluster, DSM partial exchange
         if cs_alias:
             key += "a"  # the exchange inbox aliases the dead pipeline stages (one round; one work item per CTA)
+    if int(pf) > 0:
+        key += f"_pf{int(pf)}"  # round 6 (lever P): weight tiles prefetched into L2 pf stages ahead of their TMA load
     return key
+
+
+def gemm_kernel_key(base: str, pf: int = 0) -> str:
+    """``gemm`` / ``gemm_tstore`` / ``gemm_rstaged`` plus ``_pf<D>`` when the shape's table row prefetches the weight
+    tiles ``D`` stages ahead (round 6, lever GP; table key ``gemm_pf``)."""
+    return base + (f"_pf{int(pf)}" if int(pf) > 0 else "")
 
 
 def route_available(arch: str, required_keys: tuple[str, ...] = ()) -> bool:
