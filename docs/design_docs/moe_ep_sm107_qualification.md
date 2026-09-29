@@ -37,6 +37,19 @@ For each run, save the source revision and any local diff, `python -m
 flashinfer.collect_env`, `nvidia-smi -q`, and `nvidia-smi topo -m`. Record
 power limits, clocks, other GPU activity, and `NVSHMEM_SYMMETRIC_SIZE`.
 
+### NVSHMEM startup
+
+- If initialization reports `No more teams available`, try
+  `NVSHMEM_MAX_TEAMS=512`. The limit includes NVSHMEM's internal teams.
+- If repeated initialization spends excessive time creating NCCL communicators,
+  try `NVSHMEM_DISABLE_NCCL=1`. This disables NVSHMEM's use of NCCL for
+  collectives; PyTorch's NCCL process group and MegaMoE's direct peer access
+  are unchanged.
+
+Set these on every rank before NVSHMEM initialization. They are optional
+troubleshooting settings whose usefulness depends on the NVSHMEM version and
+topology. See the [NVSHMEM environment variable reference](https://docs.nvidia.com/nvshmem/api/latest/gen/env.html).
+
 ## Supported contracts
 
 | Contract | Requirement |
