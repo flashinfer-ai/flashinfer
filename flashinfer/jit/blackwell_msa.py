@@ -70,7 +70,7 @@ BlackwellMSAVariant = Literal[
     "reverse_prefill_bf16_query_fp8_kv_flat_topk8_qagg_pdl_reduce",
     "topk",
 ]
-BlackwellMSATarget = Literal["sm100a", "sm103a"]
+BlackwellMSATarget = Literal["sm100a", "sm103a", "sm107a"]
 
 _COMMON_VARIANTS: tuple[BlackwellMSAVariant, ...] = (
     "decode_m16_bf16_flat",

@@ -34,6 +34,7 @@ from typing import Any
 import torch
 
 from flashinfer.jit.cake_megamoe_topk_reduce import (
+    resolve_arch,
     run_cake_megamoe_topk_reduce,
 )
 from flashinfer.testing import bench_gpu_time
@@ -60,16 +61,17 @@ _CUTEDSL_SOURCE_SHA256 = (
 )
 
 
-def _require_exact_sm100a() -> None:
+def _require_frozen_reducer_target() -> str:
+    """Return the frozen export arch (``sm_100a``/``sm_103a``) for this GPU."""
     if not torch.cuda.is_available():
         raise RuntimeError("this benchmark requires CUDA")
-    capability = torch.cuda.get_device_capability()
-    if capability != (10, 0):
-        raise RuntimeError(
-            f"frozen reducer requires exact SM100a, found capability {capability}"
-        )
+    try:
+        arch = resolve_arch()
+    except NotImplementedError as error:
+        raise RuntimeError(str(error)) from None
     if not is_sm100a_supported(torch.device("cuda")):
-        raise RuntimeError("frozen reducer requires SM100a with CUDA 12.8+")
+        raise RuntimeError("frozen reducer requires Blackwell with CUDA 12.8+")
+    return arch
 
 
 def _require_cupti() -> None:
@@ -206,7 +208,7 @@ def _make_vendored_cutedsl_runner(
             scale_dtype=None,
             scale_block=None,
         ),
-        sm_arch="sm_100a",
+        sm_arch=resolve_arch(partials.device),
     )
     compile_kwargs = {
         "combine_quant": partials_cute,
@@ -406,7 +408,7 @@ def main() -> None:
     if args.dry_run_iters <= 0 or args.repeat_iters <= 0:
         parser.error("iteration counts must be positive")
 
-    _require_exact_sm100a()
+    arch = _require_frozen_reducer_target()
     _require_cupti()
 
     results = []
@@ -444,7 +446,7 @@ def main() -> None:
         [result["baseline_over_native_latency_ratio"] for result in results]
     )
     summary = {
-        "architecture": "sm_100a",
+        "architecture": arch,
         "dtype": "bfloat16",
         "comparison_kind": results[0]["comparison_kind"],
         "atol": _ATOL,

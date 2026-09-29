@@ -78,6 +78,32 @@ BMM_EXPORT_HEADERS = [
 ]
 
 
+def _alphamoe_nvfp4_sm100_nvcc_flags() -> List[str]:
+    """Return flags for exactly the AlphaMoE-supported Blackwell targets.
+
+    Filtering only by CUDA major version is not sufficient here: major 10
+    also contains targets such as SM107 whose instruction and cubin contracts
+    differ from the frozen SM100/SM103 Loom schedule.
+    """
+
+    supported_archs = {(10, "0a"), (10, "3a")}
+    target_archs = sorted(
+        current_compilation_context.TARGET_CUDA_ARCHS.intersection(supported_archs)
+    )
+    if not target_archs:
+        raise RuntimeError(
+            "alphamoe_nvfp4_sm100 requires an exact SM100a or SM103a compilation target"
+        )
+    return [
+        *(
+            f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"
+            for major, minor in target_archs
+        ),
+        "--use_fast_math",
+        *common_nvcc_flags,
+    ]
+
+
 def gen_cutlass_fused_moe_sm120_module(use_fast_build: bool = False) -> JitSpec:
     nvcc_flags = [
         "-DCOMPILE_BLACKWELL_TMA_GEMMS",
@@ -527,5 +553,23 @@ def gen_alphamoe_sm100_module() -> JitSpec:
         "alphamoe_sm100",
         [jit_env.FLASHINFER_CSRC_DIR / "alphamoe_sm100.cu"],
         extra_cuda_cflags=nvcc_flags,
+        extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
+    )
+
+
+def gen_alphamoe_nvfp4_sm100_module() -> JitSpec:
+    """Generate the frozen SM100/SM103 AlphaMoE NVFP4 module."""
+
+    return gen_jit_spec(
+        "alphamoe_nvfp4_sm100",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_sm100.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c346_finalize.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c368_finalize.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c376_alignment.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c386_up.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "alphamoe_nvfp4_c388_up.cu",
+        ],
+        extra_cuda_cflags=_alphamoe_nvfp4_sm100_nvcc_flags(),
         extra_include_paths=[jit_env.FLASHINFER_CSRC_DIR],
     )

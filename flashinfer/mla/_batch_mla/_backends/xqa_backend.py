@@ -197,27 +197,47 @@ class _BatchMLAPagedAttentionXqaBackend:
     def plan_from_wrapper(
         cls, args: _MLAPlanArguments
     ) -> "_BatchMLAPagedAttentionXqaBackend":
-        _validate_xqa_plan_contract(args)
-        if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
-            raise _BackendPlanUnsupportedError(reason)
-        _validate_xqa_device_capability(args._float_workspace_buffer.device)
-        args.require_cuda_graph_dense_metadata("xqa")
-        dense = args.device_dense(table_width_alignment=128 // args.page_size)
-        backend = cls(args._float_workspace_buffer)
-        backend.plan(
-            cum_seq_lens_q=dense.cum_seq_lens_q,
-            block_tables=dense.block_tables,
-            seq_lens=dense.seq_lens,
-            num_heads=args.num_heads,
-            head_dim_ckv=args.head_dim_ckv,
-            head_dim_kpe=args.head_dim_kpe,
-            page_size=args.page_size,
-            sm_scale=args.sm_scale,
-            q_data_type=args.q_data_type,
-            kv_data_type=args.kv_data_type,
-            enable_pdl=args.enable_pdl,
-        )
-        return backend
+        snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
+        try:
+            _validate_xqa_plan_contract(args)
+            if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
+                raise _BackendPlanUnsupportedError(reason)
+            _validate_xqa_device_capability(args._float_workspace_buffer.device)
+            args.require_cuda_graph_dense_metadata("xqa")
+            dense = args.device_dense(table_width_alignment=128 // args.page_size)
+            backend = cls(args._float_workspace_buffer)
+            workspace = args._float_workspace_buffer
+            if not workspace.is_contiguous():
+                raise ValueError(
+                    "workspace buffer must be contiguous for XQA MLA wrapper."
+                )
+            workspace_u8 = workspace.view(torch.uint8).flatten()
+            if workspace_u8.numel() < _XQA_MIN_WORKSPACE_BYTES:
+                raise _BackendPlanUnsupportedError(
+                    "XQA MLA wrapper workspace must contain at least 128 MiB, got "
+                    f"{workspace_u8.numel()} bytes."
+                )
+            # plan() zeroes only the semaphore; scratch is first written by run().
+            semaphore = workspace_u8[:_XQA_SEMAPHORE_BYTES]
+            snapshots.append((semaphore, semaphore.clone()))
+            backend.plan(
+                cum_seq_lens_q=dense.cum_seq_lens_q,
+                block_tables=dense.block_tables,
+                seq_lens=dense.seq_lens,
+                num_heads=args.num_heads,
+                head_dim_ckv=args.head_dim_ckv,
+                head_dim_kpe=args.head_dim_kpe,
+                page_size=args.page_size,
+                sm_scale=args.sm_scale,
+                q_data_type=args.q_data_type,
+                kv_data_type=args.kv_data_type,
+                enable_pdl=args.enable_pdl,
+            )
+            return backend
+        except BaseException:
+            for buffer, original in snapshots:
+                buffer.copy_(original)
+            raise
 
     def plan(
         self,
