@@ -26,19 +26,22 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # Explicit target-owned registration of the generated training programs.  One
 # record per architecture.  A record carries ``arch``, the host binding
 # profile ``abi`` (the keyword set its kernels expect, see ``cake_backend``),
-# the list of kernel ``stages`` it registers, and one physical entry per stage
-# (translation units, compile flags, FFI entry, argument plan, grid rule and
-# closure identity).  Populated verbatim by the generated-program export; do
-# not edit by hand.
+# the list of kernel ``stages`` it registers, for a backward the layout of its
+# FP32 dK/dV accumulators (``dkv_acc_layout``: ``"natural"`` row-major or
+# ``"permuted"``, internal to the kernels and un-permuted by ``bwd_cast``), and
+# one physical entry per stage (translation units, compile flags, FFI entry,
+# argument plan, grid rule and closure identity).  Populated verbatim by the
+# generated-program export; do not edit by hand.
 MODULES: dict[str, dict[str, Any]] = {}
 
 # Kernel stages of one training step, in launch order.  ``fwd`` writes the
 # output, the natural-log LSE and the output residual; ``bwd_delta`` forms
 # delta = rowsum(dO * (O + O_lo)); ``bwd_main`` recomputes P, accumulates the
 # FP32 dK/dV partials and, when ``bwd_dq`` is absent, also dQ; ``bwd_dq`` is
-# the separate dQ pass of a two-pass backward; ``bwd_cast`` casts the FP32
-# dK/dV accumulators to BF16.  A record registers the subset its program uses
-# (``bwd_dq`` and ``bwd_cast`` are optional).
+# the separate dQ pass of a two-pass backward; ``bwd_cast`` turns the FP32
+# dK/dV accumulators into natural-layout BF16 (or FP32) outputs.  A record
+# registers the subset its program uses (``bwd_dq`` and ``bwd_cast`` are
+# optional; a ``permuted`` accumulator layout requires ``bwd_cast``).
 STAGES = ("fwd", "bwd_delta", "bwd_main", "bwd_dq", "bwd_cast")
 FORWARD_STAGES = ("fwd",)
 BACKWARD_STAGES = ("bwd_delta", "bwd_main", "bwd_dq", "bwd_cast")

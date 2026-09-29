@@ -35,7 +35,11 @@ Contract
 * Backward returns ``dq_latent [T, 64, 512]`` and ``dq_rope [T, 64, 64]`` BF16
   (computed once per row: no atomics, bitwise deterministic) and
   ``dkv_latent [S, 512]`` / ``dk_rope [S, 64]`` BF16 (FP32 ``red.global``
-  accumulation then a cast; ``dkv_fp32=True`` returns the FP32 accumulators).
+  accumulation then a cast).  ``dkv_fp32=True`` returns natural-layout FP32
+  gradients instead: the accumulators themselves when the program accumulates
+  in natural row-major layout, or the cast's FP32 outputs when it accumulates
+  in an internal permuted layout (registry field ``dkv_acc_layout``); the raw
+  accumulators of a permuted program never cross the API boundary.
 * BF16 operands into the MMAs (Q, K, V, P, dS), FP32 accumulation; S is
   recomputed in the backward from the BF16 Q and K.
 
@@ -113,6 +117,8 @@ CONTRACT_TENSORS = (
     "dk_rope_acc",
     "dkv_latent",
     "dk_rope",
+    "dkv_latent_fp32",  # bwd_cast: natural-layout FP32 outputs of the dkv_fp32 mode (out_f32 = 1); otherwise a placeholder
+    "dk_rope_fp32",
     "workspace",  # kernel-private scratch of the backward main stage (record field workspace_bytes)
     "tma_descriptor_workspace",
 )
@@ -133,7 +139,14 @@ CONTRACT_SCALARS = (
     "num_rows",  # bwd_delta: num_queries * 64 (token, head) rows
     "latent_vecs",  # bwd_cast: num_kv * 512 / 16 sixteen-element vectors
     "rope_vecs",  # bwd_cast: num_kv * 64 / 16
+    "latent_groups",  # bwd_cast: num_kv * 512 / 32 permuted 32-element groups
+    "rope_groups",  # bwd_cast: num_kv * 64 / 32
+    "out_f32",  # bwd_cast: 1 when the cast writes natural-layout FP32 outputs (dkv_fp32 mode of a permuted program)
+    "token_base",  # bwd_main: token = token_base + token_step * blockIdx.x (0, 1: one CTA per token in row order)
+    "token_step",
 )
+# FP32 dK/dV accumulator layouts a backward record declares (``dkv_acc_layout``).
+DKV_ACC_LAYOUTS = ("natural", "permuted")
 # Accepted spellings of the same host value (kernel side -> host side).
 CONTRACT_ALIASES = {
     "sm_scale": "softmax_scale",
@@ -155,6 +168,8 @@ CONTRACT_ALIASES = {
     "src_rope": "dk_rope_acc",
     "dst_latent": "dkv_latent",
     "dst_rope": "dk_rope",
+    "dst_latent_f32": "dkv_latent_fp32",
+    "dst_rope_f32": "dk_rope_fp32",
     "do": "dout",
     "d_out": "dout",
 }
@@ -211,6 +226,19 @@ def record_abi(record: dict[str, Any]) -> str:
     if abi not in SUPPORTED_ABIS:
         raise NotImplementedError(f"unsupported host binding profile {abi!r}")
     return abi
+
+
+def record_dkv_acc_layout(record: dict[str, Any]) -> str:
+    """Layout of the backward's FP32 dK/dV accumulators: ``"natural"`` (row-major
+    ``[S, 512]`` / ``[S, 64]``, returnable as FP32 gradients) or ``"permuted"``
+    (internal to the kernels; only ``bwd_cast`` yields natural-layout outputs).
+    A record with a backward must declare it."""
+    layout = record.get("dkv_acc_layout")
+    if layout not in DKV_ACC_LAYOUTS:
+        raise ValueError(
+            f"registry record declares dkv_acc_layout {layout!r}; expected one of {DKV_ACC_LAYOUTS}"
+        )
+    return str(layout)
 
 
 # ---------------------------------------------------------------------------
@@ -582,8 +610,10 @@ class DSATrainRunner:
 
     ``forward()`` writes ``out``, ``lse`` and ``o_lo``; ``backward()`` writes
     ``dq_latent``, ``dq_rope``, ``dkv_latent`` and ``dk_rope`` (the BF16 casts
-    of the FP32 accumulators ``dkv_latent_acc`` / ``dk_rope_acc``, or those
-    accumulators themselves when prepared with ``dkv_fp32=True``); ``step()``
+    of the FP32 accumulators ``dkv_latent_acc`` / ``dk_rope_acc``; prepared
+    with ``dkv_fp32=True`` it returns natural-layout FP32 gradients -- the
+    accumulators themselves for a ``natural`` program, the cast's FP32 outputs
+    ``dkv_latent_fp32`` / ``dk_rope_fp32`` for a ``permuted`` one); ``step()``
     runs both.  No launch allocates or synchronizes; capture into a CUDA graph
     belongs to the caller.  Prepare a new runner when a shape, dtype or tensor
     binding changes; values may change freely.
@@ -604,6 +634,8 @@ class DSATrainRunner:
     # The flat workspace the scratch regions of ``tensors`` are carved from, and their byte layout.
     workspace: torch.Tensor = field(repr=False)
     layout: dict = field(repr=False)
+    # True when the program accumulates dK/dV in an internal permuted layout (the dkv_fp32 outputs come from the cast).
+    dkv_acc_permuted: bool = False
     _tma_prepared: bool = False
 
     @property
@@ -667,6 +699,8 @@ class DSATrainRunner:
         t["dk_rope_acc"].zero_()
         self._run(BACKWARD_STAGES)
         if self.dkv_fp32:
+            if self.dkv_acc_permuted:  # natural-layout FP32 written by bwd_cast (out_f32 = 1)
+                return t["dq_latent"], t["dq_rope"], t["dkv_latent_fp32"], t["dk_rope_fp32"]
             return t["dq_latent"], t["dq_rope"], t["dkv_latent_acc"], t["dk_rope_acc"]
         if "bwd_cast" not in self.launches:
             t["dkv_latent"].copy_(t["dkv_latent_acc"])
@@ -711,6 +745,10 @@ def _contract_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dic
     values["num_rows"] = int(scalars["num_queries"]) * NUM_HEADS
     values["latent_vecs"] = int(scalars["num_kv"]) * D_LATENT // 16
     values["rope_vecs"] = int(scalars["num_kv"]) * D_ROPE // 16
+    values["latent_groups"] = int(scalars["num_kv"]) * D_LATENT // 32
+    values["rope_groups"] = int(scalars["num_kv"]) * D_ROPE // 32
+    values["out_f32"] = int(scalars.get("out_f32", 0))
+    values["token_base"], values["token_step"] = 0, 1  # one CTA per token, token = blockIdx.x
     return values
 
 
@@ -764,7 +802,8 @@ def prepare_dsa_train(
     the backward stages to be registered.  Missing outputs and the workspace
     are allocated here (the only allocations of the backend).  Pass
     ``workspace_buffer`` of :func:`dsa_train_workspace_size` bytes to reuse
-    storage across steps.
+    storage across steps.  ``dkv_fp32=True`` makes ``backward()`` return
+    natural-layout FP32 dK/dV gradients (see :func:`record_dkv_acc_layout`).
     """
     if backend != "cake":
         raise ValueError("DSA sparse-attention training supports backend='cake'")
@@ -791,6 +830,12 @@ def prepare_dsa_train(
     if abi == ABI_SEED and (topk < 128 or topk % 64):
         raise NotImplementedError(
             "the placeholder forward program serves top-k values that are multiples of 64 and >= 128"
+        )
+    permuted = backward and record_dkv_acc_layout(record) == "permuted"
+    if backward and dkv_fp32 and permuted and "bwd_cast" not in stages:
+        raise NotImplementedError(
+            f"program {module_name!r} accumulates dK/dV in a permuted layout and registers no cast stage; "
+            "dkv_fp32 outputs are unavailable"
         )
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
@@ -846,6 +891,14 @@ def prepare_dsa_train(
         if not dkv_fp32:
             t["dkv_latent"] = dkv_latent if dkv_latent is not None else torch.empty((num_kv, D_LATENT), dtype=torch.bfloat16, device=device)
             t["dk_rope"] = dk_rope if dk_rope is not None else torch.empty((num_kv, D_ROPE), dtype=torch.bfloat16, device=device)
+            # the cast's FP32 output pointers are not dereferenced when out_f32 = 0: alias the accumulators
+            t["dkv_latent_fp32"], t["dk_rope_fp32"] = t["dkv_latent_acc"], t["dk_rope_acc"]
+        elif permuted:
+            # natural-layout FP32 outputs written by bwd_cast (out_f32 = 1); its BF16 output pointers are not dereferenced
+            t["dkv_latent_fp32"] = torch.empty((num_kv, D_LATENT), dtype=torch.float32, device=device)
+            t["dk_rope_fp32"] = torch.empty((num_kv, D_ROPE), dtype=torch.float32, device=device)
+            t["dkv_latent"] = torch.empty((0,), dtype=torch.bfloat16, device=device)
+            t["dk_rope"] = torch.empty((0,), dtype=torch.bfloat16, device=device)
     if layout.get("workspace"):
         t["workspace"] = _carve(flat, layout, "workspace", torch.uint8, (layout["workspace"][1],))
     if layout.get("tma_descriptor_workspace"):
@@ -855,13 +908,13 @@ def prepare_dsa_train(
 
     scalars = dict(
         num_queries=num_queries, num_kv=num_kv, topk=topk, softmax_scale=float(softmax_scale),
-        has_topk_length=has_topk_length,
+        has_topk_length=has_topk_length, out_f32=int(bool(backward and dkv_fp32 and permuted)),
     )
     values = _seed_values(t, scalars) if abi == ABI_SEED else _contract_values(t, scalars)
     num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     wanted = FORWARD_STAGES + (BACKWARD_STAGES if backward else ())
-    if dkv_fp32:
-        wanted = tuple(s for s in wanted if s != "bwd_cast")  # the FP32 accumulators are the outputs
+    if dkv_fp32 and not permuted:
+        wanted = tuple(s for s in wanted if s != "bwd_cast")  # the natural-layout FP32 accumulators are the outputs
     launches = {}
     for stage in stages:
         if stage not in wanted:
@@ -887,6 +940,7 @@ def prepare_dsa_train(
         device_index=int(device.index if device.index is not None else torch.cuda.current_device()),
         workspace=flat,
         layout=layout,
+        dkv_acc_permuted=bool(permuted),
     )
 
 
@@ -987,6 +1041,7 @@ class _Binding:
     owned: dict[str, torch.Tensor] = field(repr=False)
     acc_span: Optional[torch.Tensor] = field(repr=False)  # bytes covering both FP32 accumulators
     owned_bytes: int = 0
+    dkv_acc_permuted: bool = False
 
     @classmethod
     def from_runner(cls, runner: DSATrainRunner) -> "_Binding":
@@ -994,9 +1049,18 @@ class _Binding:
             raise ValueError(f"only the {ABI_CONTRACT!r} profile can be remembered")
         t = runner.tensors
         owned = {name: t[name] for name in _OWNED_SCRATCH if name in t}
-        if runner.dkv_fp32:  # the accumulators are the outputs: fresh per call
+        if runner.dkv_fp32 and not runner.dkv_acc_permuted:  # the accumulators are the outputs: fresh per call
             owned.pop("dkv_latent_acc", None)
             owned.pop("dk_rope_acc", None)
+        if runner.has_backward and not runner.dkv_fp32:
+            # the cast's FP32 output pointers alias the accumulators (not dereferenced when out_f32 = 0)
+            for name in ("dkv_latent_fp32", "dk_rope_fp32"):
+                if name in t:
+                    owned[name] = t[name]
+        if runner.dkv_fp32 and runner.dkv_acc_permuted:
+            # zero-element BF16 placeholders of the cast (not dereferenced when out_f32 = 1); the accumulators stay owned scratch
+            for name in ("dkv_latent", "dk_rope"):
+                owned[name] = t[name]
         if not runner.has_topk_length:
             owned["topk_length"] = t["topk_length"]
         acc_span = None
@@ -1014,6 +1078,7 @@ class _Binding:
             owned=owned,
             acc_span=acc_span,
             owned_bytes=int(runner.workspace.numel()),
+            dkv_acc_permuted=runner.dkv_acc_permuted,
         )
 
     def holds_no_tensor(self) -> bool:
@@ -1067,6 +1132,12 @@ class _Binding:
         if topk_length is not None:
             current["topk_length"] = topk_length
         if self.dkv_fp32:
+            if self.dkv_acc_permuted:  # fresh natural-layout FP32 outputs from the cast; owned accumulators zeroed
+                self.acc_span.zero_()
+                current["dkv_latent_fp32"] = torch.empty((S, D_LATENT), dtype=torch.float32, device=device)
+                current["dk_rope_fp32"] = torch.empty((S, D_ROPE), dtype=torch.float32, device=device)
+                self._launch(current, BACKWARD_STAGES)
+                return dq_latent, dq_rope, current["dkv_latent_fp32"], current["dk_rope_fp32"]
             acc = torch.zeros((S * D_QK,), dtype=torch.float32, device=device)
             current["dkv_latent_acc"] = acc[: S * D_LATENT].view(S, D_LATENT)
             current["dk_rope_acc"] = acc[S * D_LATENT :].view(S, D_ROPE)
@@ -1203,7 +1274,9 @@ def backward(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Backward pass from the saved forward outputs: ``(dq_latent, dq_rope, dkv_latent, dk_rope)``.
 
-    Validates and binds once per input binding like :func:`forward`.
+    Validates and binds once per input binding like :func:`forward`.  With
+    ``dkv_fp32=True`` the dK/dV gradients are natural-layout FP32 tensors
+    (fresh per call, never the kernels' internal accumulators).
     """
     if o_lo is None:
         raise NotImplementedError(

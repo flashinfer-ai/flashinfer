@@ -32,6 +32,8 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     ABI_SEED,
     D_LATENT,
     D_QK,
+    D_ROPE,
+    DKV_ACC_LAYOUTS,
     NUM_HEADS,
     SUPPORTED_ABIS,
     SUPPORTED_COMPUTE_CAPABILITIES,
@@ -46,6 +48,7 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     offset_gather_kv_indices,
     prepare_dsa_train,
     record_abi,
+    record_dkv_acc_layout,
     record_for,
     validate_dsa_train_inputs,
     workspace_layout,
@@ -127,6 +130,8 @@ def test_registry_records_are_well_formed():
         assert record_abi(record) in SUPPORTED_ABIS
         stages = cake_jit.registered_stages(name)
         assert "fwd" in stages
+        if "bwd_main" in stages:
+            assert record_dkv_acc_layout(record) in DKV_ACC_LAYOUTS
         for stage in stages:
             physical = record[stage]
             assert len(physical["sources"]) == 2
@@ -318,6 +323,58 @@ def test_bind_stage_records_rebind_slots(monkeypatch):
     assert rebound[1] is storage2 and rebound[2] == offset2 and rebound[5:] == [0.5, 2]
     with pytest.raises(RuntimeError, match="topk_length"):
         template.arguments_for(dict(q_latent=values["q_latent"], k_rope_storage=storage2, k_rope_offset=offset2))
+
+
+def test_bind_stage_serves_permuted_cast_plan(monkeypatch):
+    """The cast of a program with permuted FP32 accumulators names its own operands
+    (``src_*`` / ``dst_*`` / ``dst_*_f32`` / ``*_groups`` / ``out_f32``); the contract
+    profile provides every one of them, and a backward record must declare its
+    accumulator layout."""
+    record = {
+        "arch": "sm_100a",
+        "abi": ABI_CONTRACT,
+        "stages": ["fwd", "bwd_delta", "bwd_main", "bwd_cast"],
+        "dkv_acc_layout": "permuted",
+        "bwd_cast": {
+            "module": "fake",
+            "sources": [],
+            "compile_flags": [],
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["buffer", "src_latent"], ["buffer", "src_rope"], ["buffer", "dst_latent"], ["buffer", "dst_rope"],
+                ["buffer", "dst_latent_f32"], ["buffer", "dst_rope_f32"], ["parameter", "latent_groups"],
+                ["parameter", "rope_groups"], ["parameter", "out_f32"], ["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"],
+            ],
+            "closure_sha256": "0" * 64,
+            "tma_workspace_bytes": 0,
+        },
+        "bwd_main": {"module": "fake", "ffi_entry": "run", "arg_plan": [["parameter", "token_base"], ["parameter", "token_step"]]},
+        "closure_sha256": "0" * 64,
+    }
+    monkeypatch.setitem(cake_jit.MODULES, "cake_dsa_h64_train_fake", record)
+    monkeypatch.setattr(cake_backend, "load_cake_dsa_train_module", lambda name, stage: SimpleNamespace(run=lambda *a: None))
+    S = 8
+    t = dict(
+        q_latent=torch.zeros(2, NUM_HEADS, D_LATENT, dtype=torch.bfloat16), q_rope=torch.zeros(2, NUM_HEADS, D_ROPE, dtype=torch.bfloat16),
+        kv_latent=torch.zeros(S, D_LATENT, dtype=torch.bfloat16), k_rope=torch.zeros(S, D_ROPE, dtype=torch.bfloat16),
+        indices=torch.zeros(2, 4, dtype=torch.int32), dkv_latent_acc=torch.zeros(S, D_LATENT), dk_rope_acc=torch.zeros(S, D_ROPE),
+        dkv_latent=torch.empty(0, dtype=torch.bfloat16), dk_rope=torch.empty(0, dtype=torch.bfloat16),
+        dkv_latent_fp32=torch.zeros(S, D_LATENT), dk_rope_fp32=torch.zeros(S, D_ROPE),
+    )
+    scalars = dict(num_queries=2, num_kv=S, topk=4, softmax_scale=1.0, has_topk_length=0, out_f32=1)
+    values = cake_backend._contract_values(t, scalars)
+    assert (values["token_base"], values["token_step"]) == (0, 1)
+    assert (values["latent_groups"], values["rope_groups"], values["out_f32"]) == (S * 16, S * 2, 1)
+    launch = bind_stage("cake_dsa_h64_train_fake", "bwd_cast", values, (3, 1, 1))
+    assert launch.arguments[0] is t["dkv_latent_acc"] and launch.arguments[4] is t["dkv_latent_fp32"]
+    assert launch.arguments[2] is t["dkv_latent"] and launch.arguments[6:9] == (S * 16, S * 2, 1)
+    # the FP32 outputs are re-bindable slots (fresh per call in the dkv_fp32 mode)
+    assert {key for _, key in launch.slots} >= {"dkv_latent_acc", "dkv_latent_fp32", "dk_rope_fp32", "dkv_latent", "dk_rope"}
+    main = bind_stage("cake_dsa_h64_train_fake", "bwd_main", values, (2, 1, 1))
+    assert main.arguments == (0, 1)
+    assert record_dkv_acc_layout(record) == "permuted"
+    with pytest.raises(ValueError, match="dkv_acc_layout"):
+        record_dkv_acc_layout({"arch": "sm_100a", "stages": ["fwd", "bwd_main"]})
 
 
 def test_binding_keys_cover_pointer_shape_stride_dtype_scale_and_lengths():
@@ -555,19 +612,36 @@ def test_autograd_function_matches_explicit_backward():
     _check_backward(grads, ref)
 
 
-def test_backward_dkv_fp32_returns_accumulators():
+def test_backward_dkv_fp32_returns_natural_layout_gradients():
+    """``dkv_fp32=True`` yields natural-layout FP32 dK/dV: equal to the BF16 path within BF16 rounding
+    plus the ``red.global`` run-to-run spread, and never the kernels' internal accumulators."""
     _require_program(backward=True)
     inp = make_inputs([256], [512], seed=SEED + 11, topk=128)
     out, lse, o_lo = cake_backend.forward(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
-    _, _, dkv_latent, dk_rope = cake_backend.backward(
-        inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, out, o_lo, lse, inp.dout, dkv_fp32=True
-    )
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, out, o_lo, lse, inp.dout)
+    dq_l, dq_r, dkv_latent, dk_rope = cake_backend.backward(*args, dkv_fp32=True)
+    bq_l, bq_r, dkv_bf16, dkr_bf16 = cake_backend.backward(*args)
     torch.cuda.synchronize()
+    S = inp.kv_latent.shape[0]
     assert dkv_latent.dtype == torch.float32 and dk_rope.dtype == torch.float32
+    assert tuple(dkv_latent.shape) == (S, D_LATENT) and tuple(dk_rope.shape) == (S, D_ROPE)
+    assert dkv_latent.is_contiguous() and dk_rope.is_contiguous()
+    assert torch.equal(dq_l, bq_l) and torch.equal(dq_r, bq_r)  # dq does not depend on the dkv mode
     ref = reference_fp64(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, dout=inp.dout)
-    # the FP32 accumulators are at least as close to the reference as their BF16 casts' floor
+    # the FP32 gradients are at least as close to the reference as their BF16 casts' floor ...
     assert rel_l2(dkv_latent, ref["dkv_latent"]) <= FLOOR_MARGIN * rel_l2(ref["dkv_latent_emu"], ref["dkv_latent"]) + FLOOR_ABS
     assert rel_l2(dk_rope, ref["dk_rope"]) <= FLOOR_MARGIN * rel_l2(ref["dk_rope_emu"], ref["dk_rope"]) + FLOOR_ABS
+    # ... and agree with the BF16 path element by element (a permuted accumulator layout would not)
+    assert rel_l2(dkv_latent.to(torch.bfloat16), dkv_bf16) < 1e-2 and rel_l2(dk_rope.to(torch.bfloat16), dkr_bf16) < 1e-2
+    _, record = record_for(torch.device("cuda"))
+    if record_dkv_acc_layout(record) == "permuted":
+        runner = prepare_dsa_train(*args[:5], dout=inp.dout, backward=True, dkv_fp32=True)
+        runner.forward()
+        _, _, f_lat, f_rope = runner.backward()
+        torch.cuda.synchronize()
+        assert f_lat.data_ptr() != runner.tensors["dkv_latent_acc"].data_ptr()
+        assert f_rope.data_ptr() != runner.tensors["dk_rope_acc"].data_ptr()
+        assert "bwd_cast" in runner.launches and rel_l2(f_lat, dkv_latent) < 1e-2
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +754,12 @@ def test_binding_cache_backward_hits_are_bitwise_and_fresh():
         f1[2].fill_(7.0)
         assert torch.equal(f2[2], snapshot) and rel_l2(snapshot, a[2].float()) < 1e-2
         fp32_binding = cache.peek(backward_binding_key(*args, None, default_softmax_scale(), True))
-        assert fp32_binding is not binding and "dkv_latent_acc" not in fp32_binding.owned
+        assert fp32_binding is not binding and fp32_binding.holds_no_tensor()
+        permuted = record_dkv_acc_layout(record_for(torch.device("cuda"))[1]) == "permuted"
+        # natural accumulators are the fresh outputs (not owned); permuted ones stay owned scratch behind the cast
+        assert ("dkv_latent_acc" in fp32_binding.owned) == permuted
+        assert f1[2].data_ptr() not in {t.data_ptr() for t in fp32_binding.owned.values()}
+        assert torch.equal(f1[0], a[0]) and torch.equal(f2[1], a[1])  # dq bitwise across modes and calls
         # the autograd path: the forward of a repeated step hits; its backward hits when the allocator hands
         # the freed forward outputs back at the same addresses (informational: the key is the binding)
         leaves = [t.detach().clone().requires_grad_() for t in fwd_args[:4]]

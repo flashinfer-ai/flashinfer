@@ -37,8 +37,14 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
   `lse = -inf`.  The autograd wrapper also keeps the BF16 output residual
   `o_lo = bf16(fp32(O) - bf16(O))` for the backward's exact `delta`.
 * Backward: `dq_latent`, `dq_rope` (computed once per row, bitwise
-  deterministic), `dkv_latent [S, 512]`, `dk_rope [S, 64]` (FP32 accumulation,
-  BF16 cast).  BF16 MMA operands, FP32 accumulation throughout.
+  deterministic), `dkv_latent [S, 512]`, `dk_rope [S, 64]` (FP32 `red.global`
+  accumulation, then a cast to natural-layout BF16).  BF16 MMA operands, FP32
+  accumulation throughout.  `cake_backend.backward(..., dkv_fp32=True)` (and a
+  runner prepared with `dkv_fp32=True`) returns the dK/dV gradients as
+  natural-layout FP32 tensors instead; the kernels' internal accumulator layout
+  (registry field `dkv_acc_layout`, `natural` or `permuted`) never crosses the
+  API boundary -- a permuted program serves the FP32 mode through its cast
+  stage.
 
 Explicit forward / backward entry points without autograd, a prepared
 allocation-free runner (`prepare_dsa_train`, CUDA-graph capturable) and the
@@ -62,6 +68,23 @@ GPU-bound training step this is hidden behind the backward kernels (6-8 ms at
 `cake_backend.backward` directly (about 25 / 40 us per call with a remembered
 binding) or capture the prepared runner into a CUDA graph.
 
+## Kernel structure of one training step
+
+* `fwd`: one CTA per query token gathers its top-k keys once (TMA gather) and
+  produces `out`, the natural-log `lse` and the BF16 output residual `o_lo`.
+* `bwd_delta`: `delta = rowsum(dO * (O + O_lo))`, one (token, head) row per warp.
+* `bwd_main`: one CTA per query token (20 warps: gather, compute, reduce, MMA,
+  load and metadata roles) recomputes S and P from the BF16 Q and the gathered
+  K, forms dP and dS, accumulates dQ / dQ_rope in tensor memory (written once
+  per row: bitwise deterministic) and scatters the per-token dK/dV and dK_rope
+  contributions with vectorized FP32 `red.global.add` into the accumulators.
+* `bwd_cast`: converts the FP32 accumulators to the natural `[S, 512]` /
+  `[S, 64]` BF16 outputs (or FP32 in the `dkv_fp32` mode).
+
+Grid rules live in the registry record (`num_queries` CTAs for `fwd` and
+`bwd_main`, `num_queries*8` for `bwd_delta`, `num_kv*18/256` for `bwd_cast`)
+and are evaluated by the host from the problem scalars.
+
 ## Layout of this package
 
 * `cake_jit.py` -- `MODULES` registry (one record per architecture, filled by
@@ -75,8 +98,9 @@ binding) or capture the prepared runner into a CUDA graph.
 
 ## Status
 
-The registry is empty in this checkout: the native forward and backward
-programs are exported once they pass their correctness gates.  The host
+The registry holds one record per architecture (`sm_100a`, `sm_103a`) with the
+forward, backward preprocess, backward main and cast stages, exported from the
+kernel snapshot named in the pull request.  The host
 binding supports two argument profiles, selected by the record's `abi` field:
 `dsa_h64_v1` (the native kernels) and `flashmla_v41_prefill_seed` (a
 forward-only FlashMLA-derived prefill program used to exercise the export
