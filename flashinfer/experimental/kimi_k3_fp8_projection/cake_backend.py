@@ -1393,12 +1393,8 @@ def prepare_kimi_k3_fp8_projection(
                         K=prepared.K,
                         XB=x,
                         # ``OUT``: the [M, n_valid] output view for the TMA-store epilogue (rows >= M / columns >= n_valid are
-                        # clipped by the unit); the register-epilogue programs receive a placeholder map they never access.
-                        OUT=out
-                        if plan.decode_tma_store
-                        else torch.zeros(
-                            (32, 128), dtype=torch.bfloat16, device=device
-                        ),
+                        # clipped by the unit); the register-epilogue programs do not take the parameter.
+                        **({"OUT": out} if plan.decode_tma_store else {}),
                         grid=(plan.grids[stage], 1, 1),
                     ),
                 )
