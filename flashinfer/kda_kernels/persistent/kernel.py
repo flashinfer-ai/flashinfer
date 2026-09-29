@@ -100,6 +100,11 @@ THREADS = 1024
 # TMEM allocation must be a power of two, so the alloc is the full 512.
 TMEM_COLS = 512
 GRAM_COL = 256
+# MMA4 reads v* after MB_FIN, while the next chunk may already be storing INP.
+# Varlen routes give v* free columns after the Gram windows. Fixed routes keep
+# it in INP columns 0-15, where the INP store waits for MB_OFIN; moving it
+# costs those routes about 3%.
+RI4_FREE_COL = GRAM_COL + 5 * 32
 STAGE_BYTES = 40960
 STAGE_ELTS = STAGE_BYTES // 2
 STAGE_F32 = STAGE_BYTES // 4
@@ -465,8 +470,9 @@ def _pkd(
         cute.recast_ptr(tmem_ptr + 224, dtype=cutlass.BFloat16), ri3_base.layout
     )
     ri4_base = thr4a.make_fragment_A(mma_4a.partition_shape_A((BM, C)))
+    ri4_col = RI4_FREE_COL if GATE2_ == 0 else 0
     t_ri4 = cute.make_tensor(
-        cute.recast_ptr(tmem_ptr, dtype=cutlass.BFloat16), ri4_base.layout
+        cute.recast_ptr(tmem_ptr + ri4_col, dtype=cutlass.BFloat16), ri4_base.layout
     )
     acc32_base = thr1.make_fragment_C(mma_1.partition_shape_C((BM, C)))
     t_vst = cute.make_tensor(
@@ -619,6 +625,9 @@ def _pkd(
         p_oo = cutlass.Int32(0)
         p_u2a = cutlass.Int32(0)
         p_fin = cutlass.Int32(0)
+        # Previous chunk's MB_OFIN; a parity-1 wait on a fresh barrier passes.
+        ofin_stage = cutlass.Int32(STAGES - 1)
+        ofin_phase = cutlass.Int32(1)
         for kx in cutlass.range(k1 - k0):
             chain = cute.arch.make_warp_uniform(schain[k0 + kx])
             seq_idx = chain // H_
@@ -751,6 +760,8 @@ def _pkd(
                     mv = rcur.load()
                     rb32f.store(mv.to(cutlass.BFloat16))
                     rcur.store(mv * r_gt.load())
+                    if cutlass.const_expr(GATE2_ == 1 and win == 0):
+                        cute.arch.mbarrier_wait(mb + MB_OFIN + ofin_stage, ofin_phase)
                     cute.copy(w16b_st, rb32f, w16b_thr.partition_D(twin))
                     cute.copy(mst_st, rcur, mst_sthr.partition_D(msth))
                 cute.arch.fence_view_async_tmem_store()
@@ -782,7 +793,8 @@ def _pkd(
                 cute.arch.mbarrier_wait(mb + MB_VFULL + csc, p_vf)
                 cute.arch.mbarrier_wait(mb + MB_OOUT + csc, p_oo)
                 twri = cute.make_tensor(
-                    cute.recast_ptr(tmem_ptr, dtype=cutlass.BFloat16), w32b_base.layout
+                    cute.recast_ptr(tmem_ptr + ri4_col, dtype=cutlass.BFloat16),
+                    w32b_base.layout,
                 )
                 twri_dv = cute.make_tensor(
                     cute.recast_ptr(tmem_ptr + 224, dtype=cutlass.BFloat16),
@@ -874,7 +886,8 @@ def _pkd(
                         rb_u2h.store(r_u2h.load().to(cutlass.BFloat16))
                         twri_h = cute.make_tensor(
                             cute.recast_ptr(
-                                tmem_ptr + half * 8, dtype=cutlass.BFloat16
+                                tmem_ptr + ri4_col + half * 8,
+                                dtype=cutlass.BFloat16,
                             ),
                             w8b_base.layout,
                         )
@@ -893,6 +906,8 @@ def _pkd(
                     u2_inp_bar.arrive()
 
                 cute.arch.mbarrier_wait(mb + MB_FIN + csc, p_fin)
+                ofin_stage = csc
+                ofin_phase = p_fin
                 csc += 1
                 if csc == STAGES:
                     csc = 0
