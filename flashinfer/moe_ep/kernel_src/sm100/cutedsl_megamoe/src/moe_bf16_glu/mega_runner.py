@@ -358,7 +358,7 @@ class MegaMoEBf16Tester(MegaMoETester):
         """Return the internal Form-A combine staging as a BF16 torch view."""
         if self._kernel is None or self.shared_workspace is None:
             raise RuntimeError("skip-topk staging is unavailable before run_kernel.")
-        descriptor = self._kernel.skip_topk_reduce_region()
+        descriptor = self._kernel.topk_reduce_input_region()
         raw = self.shared_workspace.narrow(
             0,
             int(descriptor["byte_offset"]),
@@ -847,6 +847,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                         nvshmem.core.free_tensor(sym_tensor)
                     except Exception:  # noqa: BLE001
                         pass
+            if (
+                tester.impl.in_kernel_fc2_reduce
+                and tester.output_activation is not None
+            ):
+                try:
+                    nvshmem.core.free_tensor(tester.output_activation)
+                except Exception:  # noqa: BLE001
+                    pass
             tester.my_activation = None
             tester.my_topk_idx = None
             tester.my_topk_weights = None

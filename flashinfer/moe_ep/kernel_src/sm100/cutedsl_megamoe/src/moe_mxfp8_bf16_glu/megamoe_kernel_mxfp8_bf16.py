@@ -529,7 +529,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         """Return ``(local_workspace_bytes, shared_workspace_bytes)``."""
         return self._local_total, self._shared_total
 
-    def skip_topk_reduce_region(self) -> Dict[str, Any]:
+    def topk_reduce_input_region(self) -> Dict[str, Any]:
         """Describe the borrowed BF16 ``combine_quant`` staging region."""
         if not self.skip_topk_reduce:
             raise RuntimeError("skip_topk_reduce mode is not enabled")

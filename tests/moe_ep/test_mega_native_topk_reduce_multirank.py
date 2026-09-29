@@ -183,8 +183,10 @@ def _public_pointer_snapshot(workspace) -> tuple[int, ...]:
     )
 
 
-def _deferred_pointer_snapshot(workspace) -> tuple[int, int, tuple[int, ...]]:
-    partials, root, descriptor = workspace._frontend.deferred_topk_reduce_workspace()
+def _custom_finalize_pointer_snapshot(
+    workspace,
+) -> tuple[int, int, tuple[int, ...]]:
+    partials, root, descriptor = workspace._frontend.custom_finalize_workspace()
     return partials.data_ptr(), root.data_ptr(), tuple(descriptor["shape"])
 
 
@@ -324,10 +326,10 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
             references[(num_tokens, capacity)] = reference
 
         assert is_cake_megamoe_topk_reduce_module_loaded()
-        small_deferred_ptrs = _deferred_pointer_snapshot(small_raw)
-        large_deferred_ptrs = _deferred_pointer_snapshot(large_raw)
-        assert small_deferred_ptrs[2] == (256, _TOP_K, _HIDDEN)
-        assert large_deferred_ptrs[2] == (4096, _TOP_K, _HIDDEN)
+        small_custom_finalize_ptrs = _custom_finalize_pointer_snapshot(small_raw)
+        large_custom_finalize_ptrs = _custom_finalize_pointer_snapshot(large_raw)
+        assert small_custom_finalize_ptrs[2] == (256, _TOP_K, _HIDDEN)
+        assert large_custom_finalize_ptrs[2] == (4096, _TOP_K, _HIDDEN)
 
         # Alternate profile selection after the faithful issue-shape pass.
         # The large handle deliberately runs a short live batch to prove that
@@ -427,8 +429,12 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
 
         assert _public_pointer_snapshot(small_raw) == small_public_ptrs
         assert _public_pointer_snapshot(large_raw) == large_public_ptrs
-        assert _deferred_pointer_snapshot(small_raw) == small_deferred_ptrs
-        assert _deferred_pointer_snapshot(large_raw) == large_deferred_ptrs
+        assert (
+            _custom_finalize_pointer_snapshot(small_raw) == small_custom_finalize_ptrs
+        )
+        assert (
+            _custom_finalize_pointer_snapshot(large_raw) == large_custom_finalize_ptrs
+        )
         assert layer._preprocessing_count == 1
 
         # Drop graphs before releasing their borrowed workspace addresses.

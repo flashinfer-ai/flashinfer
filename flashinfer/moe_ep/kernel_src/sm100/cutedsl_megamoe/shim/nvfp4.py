@@ -468,18 +468,18 @@ class MegaMoENvfp4Frontend:
 
         return thunk
 
-    def deferred_topk_reduce_workspace(
+    def custom_finalize_workspace(
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
-        """Return a zero-copy combine view and its canonical root descriptor."""
+        """Return the zero-copy reducer input and its canonical root descriptor."""
         if not self.config.use_custom_finalize:
-            raise RuntimeError("deferred TopK-reduce mode is not enabled")
+            raise RuntimeError("custom finalize mode is not enabled")
         mega = self._mega
         if mega is None or mega.compiled is None:
             raise RuntimeError(
-                "deferred TopK-reduce workspace is unavailable before compilation"
+                "custom finalize workspace is unavailable before compilation"
             )
-        descriptor = mega.kernel.skip_topk_reduce_region()
+        descriptor = mega.kernel.topk_reduce_input_region()
         root = mega.shared_workspace
         byte_offset = int(descriptor["byte_offset"])
         nbytes = int(descriptor["nbytes"])

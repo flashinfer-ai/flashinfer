@@ -549,7 +549,7 @@ class Sm100MegaMoEBf16Kernel(Sm100SwigluBf16Fc12Kernel):
         """Return ``(local_ws_bytes, shared_ws_bytes)``."""
         return self._local_total, self._shared_total
 
-    def skip_topk_reduce_region(self) -> Dict[str, Any]:
+    def topk_reduce_input_region(self) -> Dict[str, Any]:
         """Describe the borrowed BF16 ``combine_quant`` staging region."""
         if not self.skip_topk_reduce:
             raise RuntimeError("skip_topk_reduce mode is not enabled")

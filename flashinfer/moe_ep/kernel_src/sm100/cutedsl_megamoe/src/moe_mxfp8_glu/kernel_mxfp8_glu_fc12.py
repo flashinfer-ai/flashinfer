@@ -104,7 +104,7 @@ class Sm100SwigluMxfp8Fc12Kernel:
                 raise ValueError(
                     f"ab_dtype={ab_dtype.__name__} is not valid for "
                     f"sf_vec_size={sf_vec_size}. "
-                    f"Expected one of: {[t.__name__ for t in valid_ab_tuple]}."
+                    f"Expected one of: {[t.__name__ for t in valid_ab]}."
                 )
         else:
             raise NotImplementedError(

@@ -227,8 +227,8 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             or combine_format.is_quantized
         ):
             raise ValueError(
-                "skip_topk_reduce requires in_kernel_fc2_reduce=False, "
-                "a bf16 combine format."
+                "skip_topk_reduce requires in_kernel_fc2_reduce=False "
+                "and a bf16 combine format."
             )
         if (
             combine_format.act_dtype is cutlass.Float4E2M1FN
@@ -842,7 +842,7 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         """
         return self._local_total, self._shared_total
 
-    def skip_topk_reduce_region(self) -> Dict[str, Any]:
+    def topk_reduce_input_region(self) -> Dict[str, Any]:
         """Describe the borrowed BF16 ``combine_quant`` staging region."""
         if not self.skip_topk_reduce:
             raise RuntimeError("skip_topk_reduce mode is not enabled")

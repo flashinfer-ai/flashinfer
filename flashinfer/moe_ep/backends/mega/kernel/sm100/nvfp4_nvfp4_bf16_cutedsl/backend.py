@@ -402,7 +402,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         reducer_state = None
         if workspace._frontend.config.use_custom_finalize:
             partials, workspace_root, _region = (
-                workspace._frontend.deferred_topk_reduce_workspace()
+                workspace._frontend.custom_finalize_workspace()
             )
             # Resolve/load the native module and borrowed view before the
             # upstream launch.  The terminal interval below must contain only
