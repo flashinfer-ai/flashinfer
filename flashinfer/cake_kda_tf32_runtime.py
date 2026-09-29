@@ -242,6 +242,18 @@ INDEPENDENT_DVSPLIT_MIN_SEQ_LEN = 512
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
+# The M64 value split carries the recurrent state between 64-token chunks in
+# BF16.  With a bounded gate that rounding accumulates under trained Kimi-K3
+# deep-layer statistics (beta ~ 1, exp(A_log) ~ 1) on FP32 and BF16 state
+# pools alike: worst-head final-state rrmse against FP32 Triton 0.011 at 384
+# tokens, 0.014 at 512, 0.051 at 2241, 0.19 at 8192 (CAKE-736 rounds 7-8,
+# B200 and GB300, H12 and H16), while the direct M128 N32/N16 bodies carry FP32
+# chunk state and stay below 0.01 at every length.  Only single-chunk
+# residuals (no chunk-to-chunk carrier) keep the split's measured preference.
+# Active FP32 beta is the exception: no direct body accepts it beyond 256
+# tokens, so its value split keeps the BF16 carrier (same drift; not the
+# serving path, which passes BF16 logit beta).
+BF16_DVSPLIT_STATE_CARRIER_MAX_SEQ_LEN = 64
 BT16_CHUNK = 16
 BT16_VALUE_SPLITS = 2
 TF32_BT16_PREP_RESIDENT_CTAS = 6
@@ -958,6 +970,27 @@ def _should_use_independent_dvsplit(
         and (num_seqs == 1)
         and (max_seq_len >= INDEPENDENT_DVSPLIT_MIN_SEQ_LEN)
         and (INDEPENDENT_DVSPLIT_CTAS * num_heads <= sm_count)
+    )
+
+
+def _dvsplit_carrier_precision_ok(
+    *,
+    compute_dtype: str,
+    bounded_gate: bool,
+    max_seq_len: int,
+) -> bool:
+    """Return whether the BF16 M64 value split may carry this sequence's state.
+
+    The split is a grid/tile choice whose recurrent carrier is BF16; a bounded
+    gate beyond ``BF16_DVSPLIT_STATE_CARRIER_MAX_SEQ_LEN`` tokens needs the
+    FP32 chunk carrier of the direct M128 family on either pool dtype (see the
+    constant's note).  Unbounded gates never reach the split, and TF32 keeps
+    its own BT16 policy.
+    """
+    return not (
+        compute_dtype == "bf16"
+        and bounded_gate
+        and max_seq_len > BF16_DVSPLIT_STATE_CARRIER_MAX_SEQ_LEN
     )
 
 
@@ -2809,6 +2842,32 @@ class FlashKDABlackwellBF16FusedLaunch:
             # policy above resolved, including the checkpoint-constrained and
             # active-beta direct families; forced tiles were excluded above.
             route = BF16_ROUTE_M64
+        if (
+            route == BF16_ROUTE_M64
+            and not self._force_independent_dvsplit
+            # Active FP32 beta has no direct body beyond 256 tokens (the
+            # direct active-beta family is the short H12 indexed schedule);
+            # its value split keeps the BF16 carrier, documented in the
+            # constant's note.
+            and not self._active_beta_f32
+            and not _dvsplit_carrier_precision_ok(
+                compute_dtype=compute_dtype,
+                bounded_gate=gate_kind == KDAGateKind.LOWER_BOUND,
+                max_seq_len=max_seq_len,
+            )
+        ):
+            # Every automatic M64 selection above (one-wave split, H12
+            # active-beta split, H64 fixed-layout split) shares the BF16
+            # chunk carrier; bounded sequences beyond one chunk take the FP32
+            # carrier of the direct family instead.  The N32 tile is the
+            # measured preference wherever the checkpoint cadence allows it
+            # (CAKE-736 round 8: N16 is 1.75x slower than the split at H12
+            # 8192 tokens, N32 1.10x); explicit M64 requests keep their body.
+            route = (
+                BF16_ROUTE_DIRECT_M128
+                if checkpoint_fits_n32 and not self._force_direct_m128
+                else BF16_ROUTE_DIRECT_M128_N16
+            )
         if compute_dtype == "tf32":
             if route in {
                 BF16_ROUTE_SMALL_BH_M128,

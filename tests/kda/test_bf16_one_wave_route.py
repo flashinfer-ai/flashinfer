@@ -4,7 +4,12 @@ Licensed under the Apache License, Version 2.0.
 https://www.apache.org/licenses/LICENSE-2.0
 """
 
-"""BF16 prefill routing: one-wave grids take the M64 value split on SM100a/SM103a."""
+"""BF16 prefill routing: one-wave grids take the M64 value split on SM100a/SM103a.
+
+Bounded logit-beta grids longer than one 64-token chunk keep the direct N32
+body instead (FP32 chunk carrier; CAKE-736 round 8); active FP32 beta and
+single-chunk residuals keep the split.
+"""
 
 import pytest
 import torch
@@ -77,8 +82,13 @@ def _prepare(lengths, heads, *, active_beta):
             True,
             "fused_active_beta_checkpoint_dvsplit_m64",
         ),
-        # Logit beta, FP32 state, 24 tasks: the FP32-state M64 split.
-        ((33, 1025), 12, False, "fused_m64_independent_dvsplit_fp32_state"),
+        # Logit beta, FP32 state, 24 tasks, 1025 tokens: beyond one chunk the
+        # bounded gate keeps the FP32 chunk carrier of the direct N32 body
+        # (the M64 split's BF16 carrier drifted 0.026 at 1024 tokens under
+        # trained deep-layer statistics; CAKE-736 round 8).
+        ((33, 1025), 12, False, "fused_checkpoint_direct_m128_n32"),
+        # Logit beta, FP32 state, single-chunk residuals: the split stays.
+        ((17, 64, 33, 64, 9, 64), 6, False, "fused_m64_independent_dvsplit_fp32_state"),
         # Mixed lengths with six heads (36 tasks), active beta.
         (
             (1300, 547, 2048, 963, 271, 3063),

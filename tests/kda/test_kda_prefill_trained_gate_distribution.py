@@ -279,11 +279,8 @@ def test_facade_bf16_state_matches_fp64_recurrence(lengths, heads, seed, checkpo
         _check("checkpoint0", first, inp["state"].bfloat16().double(), tol=1e-6)
 
 
-@pytest.mark.parametrize(("lengths", "heads", "seed"), CASES)
-@pytest.mark.parametrize("checkpoints", [False, True], ids=["nocp", "cp64"])
-def test_prepared_bf16_export_matches_fp64_recurrence(
-    lengths, heads, seed, checkpoints
-):
+def _run_prepared_bf16_export(lengths, heads, seed, checkpoints):
+    """Launch the prepared export on an FP32 pool; return the FP64 verdict inputs."""
     inp = trained_gate_inputs(lengths=lengths, heads=heads, seed=seed)
     expected_out, expected_final = fp64_reference(inp)
     n = len(lengths)
@@ -341,3 +338,33 @@ def test_prepared_bf16_export_matches_fp64_recurrence(
     if checkpoints:
         first = kwargs["state_checkpoints"][kwargs["checkpoint_cu_starts"][:-1].long()]
         _check("checkpoint0", first, inp["state"].bfloat16().double(), tol=1e-6)
+    return call
+
+
+@pytest.mark.parametrize(("lengths", "heads", "seed"), CASES)
+@pytest.mark.parametrize("checkpoints", [False, True], ids=["nocp", "cp64"])
+def test_prepared_bf16_export_matches_fp64_recurrence(
+    lengths, heads, seed, checkpoints
+):
+    _run_prepared_bf16_export(lengths, heads, seed, checkpoints)
+
+
+# Long bounded sequences with checkpoint rows on the FP32 pool: serving's
+# radix-cache shape.  The one-wave M64 value split carried the state between
+# 64-token chunks in BF16 and drifted under these statistics (worst-head
+# final-state rel L2 0.05 at 2241 tokens, 0.19 at 8192 against FP32 Triton on
+# B200 and GB300; SGLang #34299 follow-up, CAKE-736 round 7).  The direct M128
+# body carries FP32 chunk state; these rows fail on the split and pass on it.
+LONG_CASES = [
+    pytest.param((2048,), 12, 4411, id="bs1_t2048"),
+    pytest.param((2241,), 12, 4412, id="bs1_t2241"),
+    pytest.param((1024,) * 4, 12, 4413, id="bs4_t1024"),
+]
+
+
+@pytest.mark.parametrize(("lengths", "heads", "seed"), LONG_CASES)
+def test_prepared_bf16_export_long_bounded_rows_keep_fp32_state_carrier(
+    lengths, heads, seed
+):
+    call = _run_prepared_bf16_export(lengths, heads, seed, checkpoints=True)
+    assert "dvsplit" not in str(call.schedule), str(call.schedule)
