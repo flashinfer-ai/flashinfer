@@ -6,7 +6,7 @@ CUDA and CuTe DSL imports are deferred until the backend is used.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -21,7 +21,7 @@ from ......core.validation.common import (
 )
 from ......weights import MoEWeightPack
 from ..validation import validate_routing_values, validate_unit_scalars
-from .config import Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+from .config import Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig, Sm107Mxfp8Kind
 from .staging import stage_mega_moe_inputs, validate_sm107_forward_inputs
 from .weights import (
     TransformedMegaWeights,
@@ -31,10 +31,14 @@ from .weights import (
 
 if TYPE_CHECKING:
     from ......tensors import MoEEpTensors
+    from ..mxfp8_mxfp4_bf16_cutedsl.config import (
+        Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    )
 
 
 def _resolve_gate_up_clamp(
-    config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+    | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
 ) -> float | None:
     if config.gate_up_clamp is not None:
         return config.gate_up_clamp
@@ -48,7 +52,11 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     # compute(output=None) returns a view into the workspace.
     supports_output_view = True
 
-    def __init__(self, config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig) -> None:
+    def __init__(
+        self,
+        config: Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig
+        | Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
+    ) -> None:
         super().__init__(config)
         self._kernel_config = config
 
@@ -80,11 +88,12 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
     def preprocess_weights(
         self, weights: MoEWeightPack, fleet_params: FleetParams
     ) -> TransformedMegaWeights:
+        # The MXFP4 subclass overrides both weight methods below.
         return preprocess_mega_weights(
             weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
-            kind=self._kernel_config.kind,
+            kind=cast(Sm107Mxfp8Kind, self._kernel_config.kind),
         )
 
     def validate_transformed_weights(
@@ -97,7 +106,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             transformed_weights,
             intermediate_size=self._kernel_config.intermediate_size,
             hidden_size=fleet_params.token_hidden_size,
-            kind=self._kernel_config.kind,
+            kind=cast(Sm107Mxfp8Kind, self._kernel_config.kind),
             world_size=self.ep_world_size,
             num_experts=fleet_params.num_experts,
         )
