@@ -944,3 +944,128 @@ def test_plan_stream_and_graph_lifetime():
             graph2 = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph2):
                 wrapper.run(q, k, v)
+
+
+def _topk_mask(h, mb, nb, k, seed=42):
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    idx = torch.rand((h, mb, nb), generator=g).topk(k, dim=-1).indices
+    mask = torch.zeros((h, mb, nb), dtype=torch.bool)
+    mask.scatter_(-1, idx, True)
+    return mask
+
+
+def test_plan_prefers_pair_over_short_split_tiles():
+    # h3, 75648 tokens, K = 32: 16-position tiles.  The split plan has twice
+    # the tiles, each paying the fixed per-tile load and a partial merge; the
+    # pair plan measured 6-12 % faster on H100, so the load model must pick it.
+    mask = _topk_mask(3, 1182, 1182, 32)
+    plan = plan_vsa_sm90(mask, sms=132)
+    assert int(plan["hdr"][3]) & 0xF != 1, "pair plan expected"
+    assert plan["num_tiles"] == 3 * 1182 // 2
+
+
+def test_plan_smaller_grid_only_without_an_extra_tile():
+    # h7, 109632 tokens, K = 64: 5999 pair tiles, 46 per CTA on the full grid.
+    # A smaller grid may take the per-SM rate credit only when its fullest CTA
+    # carries the same number of tiles (128 CTAs x 47-48 measured slower).
+    mask = _topk_mask(7, 1713, 1713, 64)
+    plan = plan_vsa_sm90(mask, mode="pair", sms=132)
+    per_cta = [len(t) for t in _cta_tiles(plan)]
+    assert max(per_cta) == 46 and plan["num_ctas"] >= 131
+
+
+def test_plan_uniform_128_cta_grid():
+    # 7 x 256 pair tiles = 1792 = 14 x 128: the knee model takes 128 CTAs with
+    # the same maximum tile count instead of 132 (measured 1-2 % faster).
+    mask = _topk_mask(7, 512, 512, 64)
+    plan = plan_vsa_sm90(mask, mode="pair", sms=132)
+    per_cta = [len(t) for t in _cta_tiles(plan)]
+    assert plan["num_ctas"] == 128 and max(per_cta) == 14
+
+
+def test_plan_refined_load_model_only_for_long_tiles():
+    # h8, 2048 tokens, K = 8: 4-position tiles.  The refined load model would
+    # pick the pair plan, which measured 8-14 % slower than the split plan on
+    # H100; below REFINED_LOAD_MIN_K blocks per query block the previous
+    # model decides (split, two tiles per CTA).
+    mask = _topk_mask(8, 32, 32, 8)
+    plan = plan_vsa_sm90(mask, sms=132)
+    assert int(plan["hdr"][3]) & 0xF == 1, "split plan expected on a short-tile row"
+    assert plan["num_tiles"] == 8 * 32
+    assert max(len(t) for t in _cta_tiles(plan)) == 2
+
+
+def test_plan_no_credit_for_intermediate_grids():
+    # h7, 109632 tokens, K = 64: 5999 pair tiles.  A 131-CTA grid carries the same
+    # 46-tile maximum but measured slower on H100; grids between 128 and the
+    # full machine take no rate credit, so the full grid is kept.
+    mask = _topk_mask(7, 1713, 1713, 64)
+    plan = plan_vsa_sm90(mask, mode="pair", sms=132)
+    assert len(_cta_tiles(plan)) == 132
+
+
+def test_plan_ragged_keeps_the_previous_load_model():
+    # h10, 32768 tokens, K = 64 ragged: the refined model would pick 128 CTAs;
+    # ragged plans keep the previous model (full grid, raw-position balance).
+    g = torch.Generator(device="cpu").manual_seed(42)
+    idx = torch.rand((10, 512, 512), generator=g).topk(64, dim=-1).indices
+    counts = torch.randint(1, 65, (10, 512), generator=g)
+    counts[:, 0] = 64
+    mask = torch.zeros((10, 512, 512), dtype=torch.bool)
+    mask.scatter_(-1, idx, torch.arange(64) < counts.unsqueeze(-1))
+    plan = plan_vsa_sm90(mask, sms=132)
+    assert len(_cta_tiles(plan)) == 132
+
+
+def _odd_single_block_mask():
+    """Pair plan with one odd block per head that has a single KV block.
+
+    129 query blocks per head at 64 KV blocks each pair up to 64 pair tiles and
+    leave query block 128 (one KV block) alone on warpgroup 0 (tile mode 2).
+    """
+    g = torch.Generator().manual_seed(3)
+    mask = torch.zeros((2, 129, 1024), dtype=torch.bool)
+    for head in range(2):
+        for row in range(129):
+            count = 1 if row == 128 else 64
+            mask[head, row, torch.randperm(1024, generator=g)[:count]] = True
+    return mask
+
+
+def test_plan_odd_block_of_a_pair_plan_runs_alone_on_warpgroup_0():
+    plan = plan_vsa_sm90(_odd_single_block_mask(), sms=132)
+    assert plan["mode"] == "pair"
+    meta, stride = plan["meta"], plan["tile_stride"]
+    odd = [
+        meta[c * stride + i]
+        for c in range(plan["num_ctas"])
+        for i in range(int(meta[c * stride, META_NTILES]))
+        if int(meta[c * stride + i, 3]) == 2
+    ]
+    assert len(odd) == 2
+    for row in odd:
+        assert int(row[1]) == int(row[2]) == 128
+        assert int(row[META_NSEQ]) == 1
+        assert (int(row[META_NOWN]), int(row[META_NOWN + 1])) == (1, 0)
+
+
+@requires_hopper
+@pytest.mark.parametrize("backend", ["cake", "cake_cute"])
+def test_odd_single_block_tile_never_stores_from_the_idle_warpgroup(backend):
+    # On a mode-2 tile both warpgroups address the same 64 output rows; the
+    # idle warpgroup's accumulator is 0 x rcp(0) = NaN and its store must not
+    # happen (it raced the owner's store).  NaN-filled output, many runs.
+    mask = _odd_single_block_mask().cuda()
+    torch.manual_seed(11)
+    q, k, v = _inputs(2, 129, 1024)
+    wrapper = _wrapper(mask, backend=backend)
+    expected = _reference(q, k, v, mask, 128**-0.5)
+    for _ in range(20):
+        out = torch.full(
+            (2 * 129 * 64, 1, 128), float("nan"), dtype=torch.bfloat16, device="cuda"
+        )
+        actual = wrapper.run(q, k, v, out=out)
+        assert bool(torch.isfinite(actual).all()), (
+            "an output row was never written or holds NaN"
+        )
+        torch.testing.assert_close(actual.float(), expected, atol=0.01, rtol=0.01)

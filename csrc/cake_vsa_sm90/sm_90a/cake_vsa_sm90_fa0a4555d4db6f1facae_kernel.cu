@@ -389,7 +389,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_cake_vsa_sm90_cac71118a9d73c254efe(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, int* __restrict__ meta, const CakeParamArray<int16_t, 1728> hdr, int tile_stride, int seqlen_q, int seqlen_k, float scale_log2, int* __restrict__ dbg, unsigned long long* __restrict__ tl)
+kernel_cake_vsa_sm90_fa0a4555d4db6f1facae(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, int* __restrict__ meta, const CakeParamArray<int16_t, 1728> hdr, int tile_stride, int seqlen_q, int seqlen_k, float scale_log2, int* __restrict__ dbg, unsigned long long* __restrict__ tl)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -2189,10 +2189,8 @@ kernel_cake_vsa_sm90_cac71118a9d73c254efe(const __grid_constant__ CUtensorMap Q,
                 int partner_idle = n_other == 0;
                 int self_idle = n_own == 0;
                 int skip_merge = ((partner_idle != 0) ? 1 : ((self_idle != 0) ? 1 : 0));
-                if (is_split != 0) {
-                    if (skip_merge != 0) {
-                        store_wg = ((self_idle != 0) ? 0 : 1);
-                    }
+                if (self_idle != 0) {
+                    store_wg = 0;
                 }
                 int do_merge = ((is_split != 0) ? 1 : 0);
                 if (skip_merge != 0) {
@@ -3037,6 +3035,7 @@ kernel_cake_vsa_sm90_cac71118a9d73c254efe(const __grid_constant__ CUtensorMap Q,
                     int o_off_7 = o_row_base + m_local_r_3 * 128 + (12 + qj) * 8;
                     reinterpret_cast<int4*>(O + o_off_7)[0] = reinterpret_cast<int4*>(o_vec)[0];
                 }
+                __syncwarp();
                 if (elect_sync()) {
                     mbarrier_arrive(meta_empty_addr + (slot_m) * 8);
                 }
