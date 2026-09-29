@@ -62,6 +62,9 @@ struct CakeParamArray {
 #define SMEM_PART_HI0_OFF 82944
 #define SMEM_PART_HI0_STAGE_BYTES 16384
 #define SMEM_PART_HI0_STRIDE 16384
+#define SMEM_FLAG_OFF 215040
+#define SMEM_FLAG_STAGE_BYTES 16
+#define SMEM_FLAG_STRIDE 16
 #define SMEM_Q_SMEM_OFF 1024
 #define SMEM_Q_SMEM_STAGE_BYTES 16384
 #define SMEM_Q_SMEM_STRIDE 16384
@@ -71,7 +74,7 @@ struct CakeParamArray {
 #define SMEM_VT_SMEM_OFF 115712
 #define SMEM_VT_SMEM_STAGE_BYTES 16384
 #define SMEM_VT_SMEM_STRIDE 16384
-#define SMEM_TOTAL 215040
+#define SMEM_TOTAL 215168
 #define THREADS 256
 
 #include <math_constants.h>
@@ -377,7 +380,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(256, 1) void
-kernel_cake_vsa_sm90_0c03881ce89322bfb46a(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2)
+kernel_cake_vsa_sm90_88ae58b09797858c7f17(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap K, const __grid_constant__ CUtensorMap Vt, __nv_bfloat16* __restrict__ O, const CakeParamArray<int16_t, 1750> plan, int seqlen_q, int seqlen_k, float scale_log2, float* __restrict__ Wo, float* __restrict__ Ws, unsigned int* __restrict__ Wc)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -416,6 +419,8 @@ kernel_cake_vsa_sm90_0c03881ce89322bfb46a(const __grid_constant__ CUtensorMap Q,
     const int part_hi_addr = smem + 197632;
     float* part_hi0 = reinterpret_cast<float*>(smem_raw + 82944);
     const int part_hi0_addr = smem + 82944;
+    int* flag = reinterpret_cast<int*>(smem_raw + 215040);
+    const int flag_addr = smem + 215040;
     __nv_bfloat16* q_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 1024);
     const int q_smem_addr = smem + 1024;
     __nv_bfloat16* k_smem = reinterpret_cast<__nv_bfloat16*>(smem_raw + 17408);
@@ -467,11 +472,11 @@ kernel_cake_vsa_sm90_0c03881ce89322bfb46a(const __grid_constant__ CUtensorMap Q,
     if (warp == 0) { asm volatile("prefetch.tensormap [%0];" :: "l"((uint64_t)((&Vt))) : "memory"); }
     int item = bid;
     int mb = seqlen_q / 64;
-    int plan_base = item * 7;
+    int plan_base = item * 8;
     int meta = plan[plan_base];
-    int cnt = meta;
-    int tile = item;
-    int blk_base = plan_base + 1;
+    int cnt = meta & 15;
+    int tile = plan[plan_base + 1];
+    int blk_base = plan_base + 2;
     int head = tile / mb;
     int qb = tile - head * mb;
     int q_row = head * seqlen_q + qb * 64;
@@ -2793,6 +2798,38 @@ kernel_cake_vsa_sm90_0c03881ce89322bfb46a(const __grid_constant__ CUtensorMap Q,
         part_lo[3712 + tid_wg] = d_o[29];
         part_lo[3840 + tid_wg] = d_o[30];
         part_lo[3968 + tid_wg] = d_o[31];
+        part_hi[tid_wg] = d_o[32];
+        part_hi[128 + tid_wg] = d_o[33];
+        part_hi[256 + tid_wg] = d_o[34];
+        part_hi[384 + tid_wg] = d_o[35];
+        part_hi[512 + tid_wg] = d_o[36];
+        part_hi[640 + tid_wg] = d_o[37];
+        part_hi[768 + tid_wg] = d_o[38];
+        part_hi[896 + tid_wg] = d_o[39];
+        part_hi[1024 + tid_wg] = d_o[40];
+        part_hi[1152 + tid_wg] = d_o[41];
+        part_hi[1280 + tid_wg] = d_o[42];
+        part_hi[1408 + tid_wg] = d_o[43];
+        part_hi[1536 + tid_wg] = d_o[44];
+        part_hi[1664 + tid_wg] = d_o[45];
+        part_hi[1792 + tid_wg] = d_o[46];
+        part_hi[1920 + tid_wg] = d_o[47];
+        part_hi[2048 + tid_wg] = d_o[48];
+        part_hi[2176 + tid_wg] = d_o[49];
+        part_hi[2304 + tid_wg] = d_o[50];
+        part_hi[2432 + tid_wg] = d_o[51];
+        part_hi[2560 + tid_wg] = d_o[52];
+        part_hi[2688 + tid_wg] = d_o[53];
+        part_hi[2816 + tid_wg] = d_o[54];
+        part_hi[2944 + tid_wg] = d_o[55];
+        part_hi[3072 + tid_wg] = d_o[56];
+        part_hi[3200 + tid_wg] = d_o[57];
+        part_hi[3328 + tid_wg] = d_o[58];
+        part_hi[3456 + tid_wg] = d_o[59];
+        part_hi[3584 + tid_wg] = d_o[60];
+        part_hi[3712 + tid_wg] = d_o[61];
+        part_hi[3840 + tid_wg] = d_o[62];
+        part_hi[3968 + tid_wg] = d_o[63];
         if (qj == 0) {
             mstats[quad * 4] = row_max0;
             mstats[quad * 4 + 1] = row_max1;
@@ -2800,77 +2837,24 @@ kernel_cake_vsa_sm90_0c03881ce89322bfb46a(const __grid_constant__ CUtensorMap Q,
             mstats[quad * 4 + 3] = row_sum1;
         }
     }
+    asm volatile("barrier.sync 9, 256;" ::: "memory");
     if (wg == 0) {
-        part_hi0[tid_wg] = d_o[32];
-        part_hi0[128 + tid_wg] = d_o[33];
-        part_hi0[256 + tid_wg] = d_o[34];
-        part_hi0[384 + tid_wg] = d_o[35];
-        part_hi0[512 + tid_wg] = d_o[36];
-        part_hi0[640 + tid_wg] = d_o[37];
-        part_hi0[768 + tid_wg] = d_o[38];
-        part_hi0[896 + tid_wg] = d_o[39];
-        part_hi0[1024 + tid_wg] = d_o[40];
-        part_hi0[1152 + tid_wg] = d_o[41];
-        part_hi0[1280 + tid_wg] = d_o[42];
-        part_hi0[1408 + tid_wg] = d_o[43];
-        part_hi0[1536 + tid_wg] = d_o[44];
-        part_hi0[1664 + tid_wg] = d_o[45];
-        part_hi0[1792 + tid_wg] = d_o[46];
-        part_hi0[1920 + tid_wg] = d_o[47];
-        part_hi0[2048 + tid_wg] = d_o[48];
-        part_hi0[2176 + tid_wg] = d_o[49];
-        part_hi0[2304 + tid_wg] = d_o[50];
-        part_hi0[2432 + tid_wg] = d_o[51];
-        part_hi0[2560 + tid_wg] = d_o[52];
-        part_hi0[2688 + tid_wg] = d_o[53];
-        part_hi0[2816 + tid_wg] = d_o[54];
-        part_hi0[2944 + tid_wg] = d_o[55];
-        part_hi0[3072 + tid_wg] = d_o[56];
-        part_hi0[3200 + tid_wg] = d_o[57];
-        part_hi0[3328 + tid_wg] = d_o[58];
-        part_hi0[3456 + tid_wg] = d_o[59];
-        part_hi0[3584 + tid_wg] = d_o[60];
-        part_hi0[3712 + tid_wg] = d_o[61];
-        part_hi0[3840 + tid_wg] = d_o[62];
-        part_hi0[3968 + tid_wg] = d_o[63];
-        if (qj == 0) {
-            mstats[128 + quad * 4] = row_max0;
-            mstats[128 + quad * 4 + 1] = row_max1;
-            mstats[128 + quad * 4 + 2] = row_sum0;
-            mstats[128 + quad * 4 + 3] = row_sum1;
-        }
-    }
-    asm volatile("barrier.sync 8, 256;" ::: "memory");
-    int pbase = ((wg == 0) ? 0 : 128);
-    float pm0 = mstats[pbase + quad * 4];
-    float pm1 = mstats[pbase + quad * 4 + 1];
-    float pl0 = mstats[pbase + quad * 4 + 2];
-    float pl1 = mstats[pbase + quad * 4 + 3];
-    float x0m0 = ((wg == 0) ? row_max0 : pm0);
-    float x0m1 = ((wg == 0) ? row_max1 : pm1);
-    float x1m0 = ((wg == 0) ? pm0 : row_max0);
-    float x1m1 = ((wg == 0) ? pm1 : row_max1);
-    float x0l0 = ((wg == 0) ? row_sum0 : pl0);
-    float x0l1 = ((wg == 0) ? row_sum1 : pl1);
-    float x1l0 = ((wg == 0) ? pl0 : row_sum0);
-    float x1l1 = ((wg == 0) ? pl1 : row_sum1);
-    float _max_228 = max_noftz(x0m0, x1m0);
-    float mm0 = _max_228;
-    float _max_229 = max_noftz(x0m1, x1m1);
-    float mm1 = _max_229;
-    float _exp2_204 = approx_exp2(x0m0 - mm0);
-    float f00 = ((x0m0 == -CAKE_INF) ? 0.0f : _exp2_204);
-    float _exp2_205 = approx_exp2(x0m1 - mm1);
-    float f01 = ((x0m1 == -CAKE_INF) ? 0.0f : _exp2_205);
-    float _exp2_206 = approx_exp2(x1m0 - mm0);
-    float f10 = ((x1m0 == -CAKE_INF) ? 0.0f : _exp2_206);
-    float _exp2_207 = approx_exp2(x1m1 - mm1);
-    float f11 = ((x1m1 == -CAKE_INF) ? 0.0f : _exp2_207);
-    float a0 = ((wg == 0) ? f00 : f10);
-    float a1 = ((wg == 0) ? f01 : f11);
-    float b0 = ((wg == 0) ? f10 : f00);
-    float b1 = ((wg == 0) ? f11 : f01);
-    if (wg == 0) {
+        float pm0 = mstats[quad * 4];
+        float pm1 = mstats[quad * 4 + 1];
+        float pl0 = mstats[quad * 4 + 2];
+        float pl1 = mstats[quad * 4 + 3];
+        float _max_228 = max_noftz(row_max0, pm0);
+        float mm0 = _max_228;
+        float _max_229 = max_noftz(row_max1, pm1);
+        float mm1 = _max_229;
+        float _exp2_204 = approx_exp2(row_max0 - mm0);
+        float a0 = ((row_max0 == -CAKE_INF) ? 0.0f : _exp2_204);
+        float _exp2_205 = approx_exp2(row_max1 - mm1);
+        float a1 = ((row_max1 == -CAKE_INF) ? 0.0f : _exp2_205);
+        float _exp2_206 = approx_exp2(pm0 - mm0);
+        float b0 = ((pm0 == -CAKE_INF) ? 0.0f : _exp2_206);
+        float _exp2_207 = approx_exp2(pm1 - mm1);
+        float b1 = ((pm1 == -CAKE_INF) ? 0.0f : _exp2_207);
         float _fma_0 = __fmaf_rn(part_lo[tid_wg], ((0) ? b1 : b0), d_o[0] * ((0) ? a1 : a0));
         d_o[0] = _fma_0;
         float _fma_1 = __fmaf_rn(part_lo[128 + tid_wg], ((0) ? b1 : b0), d_o[1] * ((0) ? a1 : a0));
@@ -2935,564 +2919,1011 @@ kernel_cake_vsa_sm90_0c03881ce89322bfb46a(const __grid_constant__ CUtensorMap Q,
         d_o[30] = _fma_30;
         float _fma_31 = __fmaf_rn(part_lo[3968 + tid_wg], ((1) ? b1 : b0), d_o[31] * ((1) ? a1 : a0));
         d_o[31] = _fma_31;
-    }
-    if (wg == 1) {
-        float _fma_32 = __fmaf_rn(part_hi0[tid_wg], ((0) ? b1 : b0), d_o[32] * ((0) ? a1 : a0));
+        float _fma_32 = __fmaf_rn(part_hi[tid_wg], ((0) ? b1 : b0), d_o[32] * ((0) ? a1 : a0));
         d_o[32] = _fma_32;
-        float _fma_33 = __fmaf_rn(part_hi0[128 + tid_wg], ((0) ? b1 : b0), d_o[33] * ((0) ? a1 : a0));
+        float _fma_33 = __fmaf_rn(part_hi[128 + tid_wg], ((0) ? b1 : b0), d_o[33] * ((0) ? a1 : a0));
         d_o[33] = _fma_33;
-        float _fma_34 = __fmaf_rn(part_hi0[256 + tid_wg], ((1) ? b1 : b0), d_o[34] * ((1) ? a1 : a0));
+        float _fma_34 = __fmaf_rn(part_hi[256 + tid_wg], ((1) ? b1 : b0), d_o[34] * ((1) ? a1 : a0));
         d_o[34] = _fma_34;
-        float _fma_35 = __fmaf_rn(part_hi0[384 + tid_wg], ((1) ? b1 : b0), d_o[35] * ((1) ? a1 : a0));
+        float _fma_35 = __fmaf_rn(part_hi[384 + tid_wg], ((1) ? b1 : b0), d_o[35] * ((1) ? a1 : a0));
         d_o[35] = _fma_35;
-        float _fma_36 = __fmaf_rn(part_hi0[512 + tid_wg], ((0) ? b1 : b0), d_o[36] * ((0) ? a1 : a0));
+        float _fma_36 = __fmaf_rn(part_hi[512 + tid_wg], ((0) ? b1 : b0), d_o[36] * ((0) ? a1 : a0));
         d_o[36] = _fma_36;
-        float _fma_37 = __fmaf_rn(part_hi0[640 + tid_wg], ((0) ? b1 : b0), d_o[37] * ((0) ? a1 : a0));
+        float _fma_37 = __fmaf_rn(part_hi[640 + tid_wg], ((0) ? b1 : b0), d_o[37] * ((0) ? a1 : a0));
         d_o[37] = _fma_37;
-        float _fma_38 = __fmaf_rn(part_hi0[768 + tid_wg], ((1) ? b1 : b0), d_o[38] * ((1) ? a1 : a0));
+        float _fma_38 = __fmaf_rn(part_hi[768 + tid_wg], ((1) ? b1 : b0), d_o[38] * ((1) ? a1 : a0));
         d_o[38] = _fma_38;
-        float _fma_39 = __fmaf_rn(part_hi0[896 + tid_wg], ((1) ? b1 : b0), d_o[39] * ((1) ? a1 : a0));
+        float _fma_39 = __fmaf_rn(part_hi[896 + tid_wg], ((1) ? b1 : b0), d_o[39] * ((1) ? a1 : a0));
         d_o[39] = _fma_39;
-        float _fma_40 = __fmaf_rn(part_hi0[1024 + tid_wg], ((0) ? b1 : b0), d_o[40] * ((0) ? a1 : a0));
+        float _fma_40 = __fmaf_rn(part_hi[1024 + tid_wg], ((0) ? b1 : b0), d_o[40] * ((0) ? a1 : a0));
         d_o[40] = _fma_40;
-        float _fma_41 = __fmaf_rn(part_hi0[1152 + tid_wg], ((0) ? b1 : b0), d_o[41] * ((0) ? a1 : a0));
+        float _fma_41 = __fmaf_rn(part_hi[1152 + tid_wg], ((0) ? b1 : b0), d_o[41] * ((0) ? a1 : a0));
         d_o[41] = _fma_41;
-        float _fma_42 = __fmaf_rn(part_hi0[1280 + tid_wg], ((1) ? b1 : b0), d_o[42] * ((1) ? a1 : a0));
+        float _fma_42 = __fmaf_rn(part_hi[1280 + tid_wg], ((1) ? b1 : b0), d_o[42] * ((1) ? a1 : a0));
         d_o[42] = _fma_42;
-        float _fma_43 = __fmaf_rn(part_hi0[1408 + tid_wg], ((1) ? b1 : b0), d_o[43] * ((1) ? a1 : a0));
+        float _fma_43 = __fmaf_rn(part_hi[1408 + tid_wg], ((1) ? b1 : b0), d_o[43] * ((1) ? a1 : a0));
         d_o[43] = _fma_43;
-        float _fma_44 = __fmaf_rn(part_hi0[1536 + tid_wg], ((0) ? b1 : b0), d_o[44] * ((0) ? a1 : a0));
+        float _fma_44 = __fmaf_rn(part_hi[1536 + tid_wg], ((0) ? b1 : b0), d_o[44] * ((0) ? a1 : a0));
         d_o[44] = _fma_44;
-        float _fma_45 = __fmaf_rn(part_hi0[1664 + tid_wg], ((0) ? b1 : b0), d_o[45] * ((0) ? a1 : a0));
+        float _fma_45 = __fmaf_rn(part_hi[1664 + tid_wg], ((0) ? b1 : b0), d_o[45] * ((0) ? a1 : a0));
         d_o[45] = _fma_45;
-        float _fma_46 = __fmaf_rn(part_hi0[1792 + tid_wg], ((1) ? b1 : b0), d_o[46] * ((1) ? a1 : a0));
+        float _fma_46 = __fmaf_rn(part_hi[1792 + tid_wg], ((1) ? b1 : b0), d_o[46] * ((1) ? a1 : a0));
         d_o[46] = _fma_46;
-        float _fma_47 = __fmaf_rn(part_hi0[1920 + tid_wg], ((1) ? b1 : b0), d_o[47] * ((1) ? a1 : a0));
+        float _fma_47 = __fmaf_rn(part_hi[1920 + tid_wg], ((1) ? b1 : b0), d_o[47] * ((1) ? a1 : a0));
         d_o[47] = _fma_47;
-        float _fma_48 = __fmaf_rn(part_hi0[2048 + tid_wg], ((0) ? b1 : b0), d_o[48] * ((0) ? a1 : a0));
+        float _fma_48 = __fmaf_rn(part_hi[2048 + tid_wg], ((0) ? b1 : b0), d_o[48] * ((0) ? a1 : a0));
         d_o[48] = _fma_48;
-        float _fma_49 = __fmaf_rn(part_hi0[2176 + tid_wg], ((0) ? b1 : b0), d_o[49] * ((0) ? a1 : a0));
+        float _fma_49 = __fmaf_rn(part_hi[2176 + tid_wg], ((0) ? b1 : b0), d_o[49] * ((0) ? a1 : a0));
         d_o[49] = _fma_49;
-        float _fma_50 = __fmaf_rn(part_hi0[2304 + tid_wg], ((1) ? b1 : b0), d_o[50] * ((1) ? a1 : a0));
+        float _fma_50 = __fmaf_rn(part_hi[2304 + tid_wg], ((1) ? b1 : b0), d_o[50] * ((1) ? a1 : a0));
         d_o[50] = _fma_50;
-        float _fma_51 = __fmaf_rn(part_hi0[2432 + tid_wg], ((1) ? b1 : b0), d_o[51] * ((1) ? a1 : a0));
+        float _fma_51 = __fmaf_rn(part_hi[2432 + tid_wg], ((1) ? b1 : b0), d_o[51] * ((1) ? a1 : a0));
         d_o[51] = _fma_51;
-        float _fma_52 = __fmaf_rn(part_hi0[2560 + tid_wg], ((0) ? b1 : b0), d_o[52] * ((0) ? a1 : a0));
+        float _fma_52 = __fmaf_rn(part_hi[2560 + tid_wg], ((0) ? b1 : b0), d_o[52] * ((0) ? a1 : a0));
         d_o[52] = _fma_52;
-        float _fma_53 = __fmaf_rn(part_hi0[2688 + tid_wg], ((0) ? b1 : b0), d_o[53] * ((0) ? a1 : a0));
+        float _fma_53 = __fmaf_rn(part_hi[2688 + tid_wg], ((0) ? b1 : b0), d_o[53] * ((0) ? a1 : a0));
         d_o[53] = _fma_53;
-        float _fma_54 = __fmaf_rn(part_hi0[2816 + tid_wg], ((1) ? b1 : b0), d_o[54] * ((1) ? a1 : a0));
+        float _fma_54 = __fmaf_rn(part_hi[2816 + tid_wg], ((1) ? b1 : b0), d_o[54] * ((1) ? a1 : a0));
         d_o[54] = _fma_54;
-        float _fma_55 = __fmaf_rn(part_hi0[2944 + tid_wg], ((1) ? b1 : b0), d_o[55] * ((1) ? a1 : a0));
+        float _fma_55 = __fmaf_rn(part_hi[2944 + tid_wg], ((1) ? b1 : b0), d_o[55] * ((1) ? a1 : a0));
         d_o[55] = _fma_55;
-        float _fma_56 = __fmaf_rn(part_hi0[3072 + tid_wg], ((0) ? b1 : b0), d_o[56] * ((0) ? a1 : a0));
+        float _fma_56 = __fmaf_rn(part_hi[3072 + tid_wg], ((0) ? b1 : b0), d_o[56] * ((0) ? a1 : a0));
         d_o[56] = _fma_56;
-        float _fma_57 = __fmaf_rn(part_hi0[3200 + tid_wg], ((0) ? b1 : b0), d_o[57] * ((0) ? a1 : a0));
+        float _fma_57 = __fmaf_rn(part_hi[3200 + tid_wg], ((0) ? b1 : b0), d_o[57] * ((0) ? a1 : a0));
         d_o[57] = _fma_57;
-        float _fma_58 = __fmaf_rn(part_hi0[3328 + tid_wg], ((1) ? b1 : b0), d_o[58] * ((1) ? a1 : a0));
+        float _fma_58 = __fmaf_rn(part_hi[3328 + tid_wg], ((1) ? b1 : b0), d_o[58] * ((1) ? a1 : a0));
         d_o[58] = _fma_58;
-        float _fma_59 = __fmaf_rn(part_hi0[3456 + tid_wg], ((1) ? b1 : b0), d_o[59] * ((1) ? a1 : a0));
+        float _fma_59 = __fmaf_rn(part_hi[3456 + tid_wg], ((1) ? b1 : b0), d_o[59] * ((1) ? a1 : a0));
         d_o[59] = _fma_59;
-        float _fma_60 = __fmaf_rn(part_hi0[3584 + tid_wg], ((0) ? b1 : b0), d_o[60] * ((0) ? a1 : a0));
+        float _fma_60 = __fmaf_rn(part_hi[3584 + tid_wg], ((0) ? b1 : b0), d_o[60] * ((0) ? a1 : a0));
         d_o[60] = _fma_60;
-        float _fma_61 = __fmaf_rn(part_hi0[3712 + tid_wg], ((0) ? b1 : b0), d_o[61] * ((0) ? a1 : a0));
+        float _fma_61 = __fmaf_rn(part_hi[3712 + tid_wg], ((0) ? b1 : b0), d_o[61] * ((0) ? a1 : a0));
         d_o[61] = _fma_61;
-        float _fma_62 = __fmaf_rn(part_hi0[3840 + tid_wg], ((1) ? b1 : b0), d_o[62] * ((1) ? a1 : a0));
+        float _fma_62 = __fmaf_rn(part_hi[3840 + tid_wg], ((1) ? b1 : b0), d_o[62] * ((1) ? a1 : a0));
         d_o[62] = _fma_62;
-        float _fma_63 = __fmaf_rn(part_hi0[3968 + tid_wg], ((1) ? b1 : b0), d_o[63] * ((1) ? a1 : a0));
+        float _fma_63 = __fmaf_rn(part_hi[3968 + tid_wg], ((1) ? b1 : b0), d_o[63] * ((1) ? a1 : a0));
         d_o[63] = _fma_63;
+        float _fma_64 = __fmaf_rn(pl0, b0, row_sum0 * a0);
+        row_sum0 = _fma_64;
+        float _fma_65 = __fmaf_rn(pl1, b1, row_sum1 * a1);
+        row_sum1 = _fma_65;
+        row_max0 = mm0;
+        row_max1 = mm1;
     }
-    float _fma_64 = __fmaf_rn(x1l0, f10, x0l0 * f00);
-    row_sum0 = _fma_64;
-    float _fma_65 = __fmaf_rn(x1l1, f11, x0l1 * f01);
-    row_sum1 = _fma_65;
-    row_max0 = mm0;
-    row_max1 = mm1;
     if (wg == 0) {
-        float _rcp_0 = approx_rcp(row_sum0);
-        float _rcp_1 = approx_rcp(row_sum1);
-        d_o[0] = d_o[0] * _rcp_0;
-        d_o[1] = d_o[1] * _rcp_0;
-        d_o[2] = d_o[2] * _rcp_1;
-        d_o[3] = d_o[3] * _rcp_1;
-        d_o[4] = d_o[4] * _rcp_0;
-        d_o[5] = d_o[5] * _rcp_0;
-        d_o[6] = d_o[6] * _rcp_1;
-        d_o[7] = d_o[7] * _rcp_1;
-        d_o[8] = d_o[8] * _rcp_0;
-        d_o[9] = d_o[9] * _rcp_0;
-        d_o[10] = d_o[10] * _rcp_1;
-        d_o[11] = d_o[11] * _rcp_1;
-        d_o[12] = d_o[12] * _rcp_0;
-        d_o[13] = d_o[13] * _rcp_0;
-        d_o[14] = d_o[14] * _rcp_1;
-        d_o[15] = d_o[15] * _rcp_1;
-        d_o[16] = d_o[16] * _rcp_0;
-        d_o[17] = d_o[17] * _rcp_0;
-        d_o[18] = d_o[18] * _rcp_1;
-        d_o[19] = d_o[19] * _rcp_1;
-        d_o[20] = d_o[20] * _rcp_0;
-        d_o[21] = d_o[21] * _rcp_0;
-        d_o[22] = d_o[22] * _rcp_1;
-        d_o[23] = d_o[23] * _rcp_1;
-        d_o[24] = d_o[24] * _rcp_0;
-        d_o[25] = d_o[25] * _rcp_0;
-        d_o[26] = d_o[26] * _rcp_1;
-        d_o[27] = d_o[27] * _rcp_1;
-        d_o[28] = d_o[28] * _rcp_0;
-        d_o[29] = d_o[29] * _rcp_0;
-        d_o[30] = d_o[30] * _rcp_1;
-        d_o[31] = d_o[31] * _rcp_1;
-        int qj1 = qj & 1;
-        int qj2 = qj & 2;
-        unsigned int o_vec[4];
-        unsigned int o_tmp[4];
-        int o_row_base = q_row * 128;
-        int m_local_r = ((1) ? m0_local : m1_local);
-        __nv_bfloat162 _bf16x2_96 = __float22bfloat162_rn(make_float2(d_o[0], d_o[1]));
-        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_96)[0];
-        __nv_bfloat162 _bf16x2_97 = __float22bfloat162_rn(make_float2(d_o[4], d_o[5]));
-        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_97)[0];
-        __nv_bfloat162 _bf16x2_98 = __float22bfloat162_rn(make_float2(d_o[8], d_o[9]));
-        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_98)[0];
-        __nv_bfloat162 _bf16x2_99 = __float22bfloat162_rn(make_float2(d_o[12], d_o[13]));
-        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_99)[0];
-        unsigned int _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-        o_tmp[0] = _shfl_xor_28;
-        unsigned int _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-        o_tmp[1] = _shfl_xor_29;
-        unsigned int _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-        o_tmp[2] = _shfl_xor_30;
-        unsigned int _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-        o_tmp[3] = _shfl_xor_31;
-        {
-            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+        float fsum0 = row_sum0;
+        float fsum1 = row_sum1;
+        int do_store = 1;
+        int nsplit = meta >> 10;
+        if (nsplit > 1) {
+            unsigned int w_vec[4];
+            int item_base = item * 8192 + tid * 4;
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[0])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[1])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[2])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[3])[0];
+            reinterpret_cast<int4*>(Wo + item_base)[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[4])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[5])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[6])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[7])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 512))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[8])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[9])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[10])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[11])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 1024))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[12])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[13])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[14])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[15])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 1536))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[16])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[17])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[18])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[19])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 2048))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[20])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[21])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[22])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[23])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 2560))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[24])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[25])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[26])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[27])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 3072))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[28])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[29])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[30])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[31])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 3584))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[32])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[33])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[34])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[35])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 4096))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[36])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[37])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[38])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[39])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 4608))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[40])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[41])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[42])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[43])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 5120))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[44])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[45])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[46])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[47])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 5632))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[48])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[49])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[50])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[51])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 6144))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[52])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[53])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[54])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[55])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 6656))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[56])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[57])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[58])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[59])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 7168))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            w_vec[0] = reinterpret_cast<unsigned int*>(&d_o[60])[0];
+            w_vec[1] = reinterpret_cast<unsigned int*>(&d_o[61])[0];
+            w_vec[2] = reinterpret_cast<unsigned int*>(&d_o[62])[0];
+            w_vec[3] = reinterpret_cast<unsigned int*>(&d_o[63])[0];
+            reinterpret_cast<int4*>(Wo + (item_base + 7680))[0] = reinterpret_cast<int4*>(w_vec)[0];
+            int stats_base = item * 128;
+            if (qj == 0) {
+                *(reinterpret_cast<float*>(Ws + (stats_base + m0_local * 2)) + (0)) = row_max0;
+                *(reinterpret_cast<float*>(Ws + (stats_base + m0_local * 2 + 1)) + (0)) = row_sum0;
+                *(reinterpret_cast<float*>(Ws + (stats_base + m1_local * 2)) + (0)) = row_max1;
+                *(reinterpret_cast<float*>(Ws + (stats_base + m1_local * 2 + 1)) + (0)) = row_sum1;
+            }
+            asm volatile("barrier.sync 8, 128;" ::: "memory");
+            if (tid == 0) {
+                unsigned int _atomic_old_0;
+                asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                    : "=r"(_atomic_old_0) : "l"(&Wc[tile]), "r"(static_cast<uint32_t>(1)) : "memory");
+                unsigned int old_count = _atomic_old_0;
+                flag[0] = ((old_count + 1 == (unsigned int)nsplit) ? 1 : 0);
+            }
+            asm volatile("barrier.sync 8, 128;" ::: "memory");
+            do_store = flag[0];
+            if (do_store != 0) {
+                int my_split = meta >> 4 & 63;
+                int first_item = item - my_split;
+                float merged_max0_5 = row_max0;
+                float merged_max1_5 = row_max1;
+                #pragma unroll 1
+                for (int j = 0; j < nsplit; j++) {
+                    int other_stats = (first_item + j) * 128;
+                    float _max_230 = max_noftz(merged_max0_5, Ws[other_stats + m0_local * 2]);
+                    merged_max0_5 = _max_230;
+                    float _max_231 = max_noftz(merged_max1_5, Ws[other_stats + m1_local * 2]);
+                    merged_max1_5 = _max_231;
+                }
+                d_o[0] = 0.0f;
+                d_o[1] = 0.0f;
+                d_o[2] = 0.0f;
+                d_o[3] = 0.0f;
+                d_o[4] = 0.0f;
+                d_o[5] = 0.0f;
+                d_o[6] = 0.0f;
+                d_o[7] = 0.0f;
+                d_o[8] = 0.0f;
+                d_o[9] = 0.0f;
+                d_o[10] = 0.0f;
+                d_o[11] = 0.0f;
+                d_o[12] = 0.0f;
+                d_o[13] = 0.0f;
+                d_o[14] = 0.0f;
+                d_o[15] = 0.0f;
+                d_o[16] = 0.0f;
+                d_o[17] = 0.0f;
+                d_o[18] = 0.0f;
+                d_o[19] = 0.0f;
+                d_o[20] = 0.0f;
+                d_o[21] = 0.0f;
+                d_o[22] = 0.0f;
+                d_o[23] = 0.0f;
+                d_o[24] = 0.0f;
+                d_o[25] = 0.0f;
+                d_o[26] = 0.0f;
+                d_o[27] = 0.0f;
+                d_o[28] = 0.0f;
+                d_o[29] = 0.0f;
+                d_o[30] = 0.0f;
+                d_o[31] = 0.0f;
+                d_o[32] = 0.0f;
+                d_o[33] = 0.0f;
+                d_o[34] = 0.0f;
+                d_o[35] = 0.0f;
+                d_o[36] = 0.0f;
+                d_o[37] = 0.0f;
+                d_o[38] = 0.0f;
+                d_o[39] = 0.0f;
+                d_o[40] = 0.0f;
+                d_o[41] = 0.0f;
+                d_o[42] = 0.0f;
+                d_o[43] = 0.0f;
+                d_o[44] = 0.0f;
+                d_o[45] = 0.0f;
+                d_o[46] = 0.0f;
+                d_o[47] = 0.0f;
+                d_o[48] = 0.0f;
+                d_o[49] = 0.0f;
+                d_o[50] = 0.0f;
+                d_o[51] = 0.0f;
+                d_o[52] = 0.0f;
+                d_o[53] = 0.0f;
+                d_o[54] = 0.0f;
+                d_o[55] = 0.0f;
+                d_o[56] = 0.0f;
+                d_o[57] = 0.0f;
+                d_o[58] = 0.0f;
+                d_o[59] = 0.0f;
+                d_o[60] = 0.0f;
+                d_o[61] = 0.0f;
+                d_o[62] = 0.0f;
+                d_o[63] = 0.0f;
+                fsum0 = 0.0f;
+                fsum1 = 0.0f;
+                #pragma unroll 1
+                for (int j_1 = 0; j_1 < nsplit; j_1++) {
+                    int other_item = first_item + j_1;
+                    int other_stats_1 = other_item * 128;
+                    float _exp2_208 = approx_exp2(Ws[other_stats_1 + m0_local * 2] - merged_max0_5);
+                    float other_w0 = _exp2_208;
+                    float _exp2_209 = approx_exp2(Ws[other_stats_1 + m1_local * 2] - merged_max1_5);
+                    float other_w1 = _exp2_209;
+                    float _fma_66 = __fmaf_rn(Ws[other_stats_1 + m0_local * 2 + 1], other_w0, fsum0);
+                    fsum0 = _fma_66;
+                    float _fma_67 = __fmaf_rn(Ws[other_stats_1 + m1_local * 2 + 1], other_w1, fsum1);
+                    fsum1 = _fma_67;
+                    int other_base = other_item * 8192 + tid * 4;
+                    float _vec_load_0[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + other_base + 0);
+                        _vec_load_0[0 + 0] = _v4.x;
+                        _vec_load_0[0 + 1] = _v4.y;
+                        _vec_load_0[0 + 2] = _v4.z;
+                        _vec_load_0[0 + 3] = _v4.w;
+                    }
+                    float _fma_68 = __fmaf_rn(_vec_load_0[0], ((0) ? other_w1 : other_w0), d_o[0]);
+                    d_o[0] = _fma_68;
+                    float _fma_69 = __fmaf_rn(_vec_load_0[1], ((0) ? other_w1 : other_w0), d_o[1]);
+                    d_o[1] = _fma_69;
+                    float _fma_70 = __fmaf_rn(_vec_load_0[2], ((1) ? other_w1 : other_w0), d_o[2]);
+                    d_o[2] = _fma_70;
+                    float _fma_71 = __fmaf_rn(_vec_load_0[3], ((1) ? other_w1 : other_w0), d_o[3]);
+                    d_o[3] = _fma_71;
+                    float _vec_load_1[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 512) + 0);
+                        _vec_load_1[0 + 0] = _v4.x;
+                        _vec_load_1[0 + 1] = _v4.y;
+                        _vec_load_1[0 + 2] = _v4.z;
+                        _vec_load_1[0 + 3] = _v4.w;
+                    }
+                    float _fma_72 = __fmaf_rn(_vec_load_1[0], ((0) ? other_w1 : other_w0), d_o[4]);
+                    d_o[4] = _fma_72;
+                    float _fma_73 = __fmaf_rn(_vec_load_1[1], ((0) ? other_w1 : other_w0), d_o[5]);
+                    d_o[5] = _fma_73;
+                    float _fma_74 = __fmaf_rn(_vec_load_1[2], ((1) ? other_w1 : other_w0), d_o[6]);
+                    d_o[6] = _fma_74;
+                    float _fma_75 = __fmaf_rn(_vec_load_1[3], ((1) ? other_w1 : other_w0), d_o[7]);
+                    d_o[7] = _fma_75;
+                    float _vec_load_2[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 1024) + 0);
+                        _vec_load_2[0 + 0] = _v4.x;
+                        _vec_load_2[0 + 1] = _v4.y;
+                        _vec_load_2[0 + 2] = _v4.z;
+                        _vec_load_2[0 + 3] = _v4.w;
+                    }
+                    float _fma_76 = __fmaf_rn(_vec_load_2[0], ((0) ? other_w1 : other_w0), d_o[8]);
+                    d_o[8] = _fma_76;
+                    float _fma_77 = __fmaf_rn(_vec_load_2[1], ((0) ? other_w1 : other_w0), d_o[9]);
+                    d_o[9] = _fma_77;
+                    float _fma_78 = __fmaf_rn(_vec_load_2[2], ((1) ? other_w1 : other_w0), d_o[10]);
+                    d_o[10] = _fma_78;
+                    float _fma_79 = __fmaf_rn(_vec_load_2[3], ((1) ? other_w1 : other_w0), d_o[11]);
+                    d_o[11] = _fma_79;
+                    float _vec_load_3[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 1536) + 0);
+                        _vec_load_3[0 + 0] = _v4.x;
+                        _vec_load_3[0 + 1] = _v4.y;
+                        _vec_load_3[0 + 2] = _v4.z;
+                        _vec_load_3[0 + 3] = _v4.w;
+                    }
+                    float _fma_80 = __fmaf_rn(_vec_load_3[0], ((0) ? other_w1 : other_w0), d_o[12]);
+                    d_o[12] = _fma_80;
+                    float _fma_81 = __fmaf_rn(_vec_load_3[1], ((0) ? other_w1 : other_w0), d_o[13]);
+                    d_o[13] = _fma_81;
+                    float _fma_82 = __fmaf_rn(_vec_load_3[2], ((1) ? other_w1 : other_w0), d_o[14]);
+                    d_o[14] = _fma_82;
+                    float _fma_83 = __fmaf_rn(_vec_load_3[3], ((1) ? other_w1 : other_w0), d_o[15]);
+                    d_o[15] = _fma_83;
+                    float _vec_load_4[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 2048) + 0);
+                        _vec_load_4[0 + 0] = _v4.x;
+                        _vec_load_4[0 + 1] = _v4.y;
+                        _vec_load_4[0 + 2] = _v4.z;
+                        _vec_load_4[0 + 3] = _v4.w;
+                    }
+                    float _fma_84 = __fmaf_rn(_vec_load_4[0], ((0) ? other_w1 : other_w0), d_o[16]);
+                    d_o[16] = _fma_84;
+                    float _fma_85 = __fmaf_rn(_vec_load_4[1], ((0) ? other_w1 : other_w0), d_o[17]);
+                    d_o[17] = _fma_85;
+                    float _fma_86 = __fmaf_rn(_vec_load_4[2], ((1) ? other_w1 : other_w0), d_o[18]);
+                    d_o[18] = _fma_86;
+                    float _fma_87 = __fmaf_rn(_vec_load_4[3], ((1) ? other_w1 : other_w0), d_o[19]);
+                    d_o[19] = _fma_87;
+                    float _vec_load_5[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 2560) + 0);
+                        _vec_load_5[0 + 0] = _v4.x;
+                        _vec_load_5[0 + 1] = _v4.y;
+                        _vec_load_5[0 + 2] = _v4.z;
+                        _vec_load_5[0 + 3] = _v4.w;
+                    }
+                    float _fma_88 = __fmaf_rn(_vec_load_5[0], ((0) ? other_w1 : other_w0), d_o[20]);
+                    d_o[20] = _fma_88;
+                    float _fma_89 = __fmaf_rn(_vec_load_5[1], ((0) ? other_w1 : other_w0), d_o[21]);
+                    d_o[21] = _fma_89;
+                    float _fma_90 = __fmaf_rn(_vec_load_5[2], ((1) ? other_w1 : other_w0), d_o[22]);
+                    d_o[22] = _fma_90;
+                    float _fma_91 = __fmaf_rn(_vec_load_5[3], ((1) ? other_w1 : other_w0), d_o[23]);
+                    d_o[23] = _fma_91;
+                    float _vec_load_6[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 3072) + 0);
+                        _vec_load_6[0 + 0] = _v4.x;
+                        _vec_load_6[0 + 1] = _v4.y;
+                        _vec_load_6[0 + 2] = _v4.z;
+                        _vec_load_6[0 + 3] = _v4.w;
+                    }
+                    float _fma_92 = __fmaf_rn(_vec_load_6[0], ((0) ? other_w1 : other_w0), d_o[24]);
+                    d_o[24] = _fma_92;
+                    float _fma_93 = __fmaf_rn(_vec_load_6[1], ((0) ? other_w1 : other_w0), d_o[25]);
+                    d_o[25] = _fma_93;
+                    float _fma_94 = __fmaf_rn(_vec_load_6[2], ((1) ? other_w1 : other_w0), d_o[26]);
+                    d_o[26] = _fma_94;
+                    float _fma_95 = __fmaf_rn(_vec_load_6[3], ((1) ? other_w1 : other_w0), d_o[27]);
+                    d_o[27] = _fma_95;
+                    float _vec_load_7[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 3584) + 0);
+                        _vec_load_7[0 + 0] = _v4.x;
+                        _vec_load_7[0 + 1] = _v4.y;
+                        _vec_load_7[0 + 2] = _v4.z;
+                        _vec_load_7[0 + 3] = _v4.w;
+                    }
+                    float _fma_96 = __fmaf_rn(_vec_load_7[0], ((0) ? other_w1 : other_w0), d_o[28]);
+                    d_o[28] = _fma_96;
+                    float _fma_97 = __fmaf_rn(_vec_load_7[1], ((0) ? other_w1 : other_w0), d_o[29]);
+                    d_o[29] = _fma_97;
+                    float _fma_98 = __fmaf_rn(_vec_load_7[2], ((1) ? other_w1 : other_w0), d_o[30]);
+                    d_o[30] = _fma_98;
+                    float _fma_99 = __fmaf_rn(_vec_load_7[3], ((1) ? other_w1 : other_w0), d_o[31]);
+                    d_o[31] = _fma_99;
+                    float _vec_load_8[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 4096) + 0);
+                        _vec_load_8[0 + 0] = _v4.x;
+                        _vec_load_8[0 + 1] = _v4.y;
+                        _vec_load_8[0 + 2] = _v4.z;
+                        _vec_load_8[0 + 3] = _v4.w;
+                    }
+                    float _fma_100 = __fmaf_rn(_vec_load_8[0], ((0) ? other_w1 : other_w0), d_o[32]);
+                    d_o[32] = _fma_100;
+                    float _fma_101 = __fmaf_rn(_vec_load_8[1], ((0) ? other_w1 : other_w0), d_o[33]);
+                    d_o[33] = _fma_101;
+                    float _fma_102 = __fmaf_rn(_vec_load_8[2], ((1) ? other_w1 : other_w0), d_o[34]);
+                    d_o[34] = _fma_102;
+                    float _fma_103 = __fmaf_rn(_vec_load_8[3], ((1) ? other_w1 : other_w0), d_o[35]);
+                    d_o[35] = _fma_103;
+                    float _vec_load_9[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 4608) + 0);
+                        _vec_load_9[0 + 0] = _v4.x;
+                        _vec_load_9[0 + 1] = _v4.y;
+                        _vec_load_9[0 + 2] = _v4.z;
+                        _vec_load_9[0 + 3] = _v4.w;
+                    }
+                    float _fma_104 = __fmaf_rn(_vec_load_9[0], ((0) ? other_w1 : other_w0), d_o[36]);
+                    d_o[36] = _fma_104;
+                    float _fma_105 = __fmaf_rn(_vec_load_9[1], ((0) ? other_w1 : other_w0), d_o[37]);
+                    d_o[37] = _fma_105;
+                    float _fma_106 = __fmaf_rn(_vec_load_9[2], ((1) ? other_w1 : other_w0), d_o[38]);
+                    d_o[38] = _fma_106;
+                    float _fma_107 = __fmaf_rn(_vec_load_9[3], ((1) ? other_w1 : other_w0), d_o[39]);
+                    d_o[39] = _fma_107;
+                    float _vec_load_10[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 5120) + 0);
+                        _vec_load_10[0 + 0] = _v4.x;
+                        _vec_load_10[0 + 1] = _v4.y;
+                        _vec_load_10[0 + 2] = _v4.z;
+                        _vec_load_10[0 + 3] = _v4.w;
+                    }
+                    float _fma_108 = __fmaf_rn(_vec_load_10[0], ((0) ? other_w1 : other_w0), d_o[40]);
+                    d_o[40] = _fma_108;
+                    float _fma_109 = __fmaf_rn(_vec_load_10[1], ((0) ? other_w1 : other_w0), d_o[41]);
+                    d_o[41] = _fma_109;
+                    float _fma_110 = __fmaf_rn(_vec_load_10[2], ((1) ? other_w1 : other_w0), d_o[42]);
+                    d_o[42] = _fma_110;
+                    float _fma_111 = __fmaf_rn(_vec_load_10[3], ((1) ? other_w1 : other_w0), d_o[43]);
+                    d_o[43] = _fma_111;
+                    float _vec_load_11[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 5632) + 0);
+                        _vec_load_11[0 + 0] = _v4.x;
+                        _vec_load_11[0 + 1] = _v4.y;
+                        _vec_load_11[0 + 2] = _v4.z;
+                        _vec_load_11[0 + 3] = _v4.w;
+                    }
+                    float _fma_112 = __fmaf_rn(_vec_load_11[0], ((0) ? other_w1 : other_w0), d_o[44]);
+                    d_o[44] = _fma_112;
+                    float _fma_113 = __fmaf_rn(_vec_load_11[1], ((0) ? other_w1 : other_w0), d_o[45]);
+                    d_o[45] = _fma_113;
+                    float _fma_114 = __fmaf_rn(_vec_load_11[2], ((1) ? other_w1 : other_w0), d_o[46]);
+                    d_o[46] = _fma_114;
+                    float _fma_115 = __fmaf_rn(_vec_load_11[3], ((1) ? other_w1 : other_w0), d_o[47]);
+                    d_o[47] = _fma_115;
+                    float _vec_load_12[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 6144) + 0);
+                        _vec_load_12[0 + 0] = _v4.x;
+                        _vec_load_12[0 + 1] = _v4.y;
+                        _vec_load_12[0 + 2] = _v4.z;
+                        _vec_load_12[0 + 3] = _v4.w;
+                    }
+                    float _fma_116 = __fmaf_rn(_vec_load_12[0], ((0) ? other_w1 : other_w0), d_o[48]);
+                    d_o[48] = _fma_116;
+                    float _fma_117 = __fmaf_rn(_vec_load_12[1], ((0) ? other_w1 : other_w0), d_o[49]);
+                    d_o[49] = _fma_117;
+                    float _fma_118 = __fmaf_rn(_vec_load_12[2], ((1) ? other_w1 : other_w0), d_o[50]);
+                    d_o[50] = _fma_118;
+                    float _fma_119 = __fmaf_rn(_vec_load_12[3], ((1) ? other_w1 : other_w0), d_o[51]);
+                    d_o[51] = _fma_119;
+                    float _vec_load_13[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 6656) + 0);
+                        _vec_load_13[0 + 0] = _v4.x;
+                        _vec_load_13[0 + 1] = _v4.y;
+                        _vec_load_13[0 + 2] = _v4.z;
+                        _vec_load_13[0 + 3] = _v4.w;
+                    }
+                    float _fma_120 = __fmaf_rn(_vec_load_13[0], ((0) ? other_w1 : other_w0), d_o[52]);
+                    d_o[52] = _fma_120;
+                    float _fma_121 = __fmaf_rn(_vec_load_13[1], ((0) ? other_w1 : other_w0), d_o[53]);
+                    d_o[53] = _fma_121;
+                    float _fma_122 = __fmaf_rn(_vec_load_13[2], ((1) ? other_w1 : other_w0), d_o[54]);
+                    d_o[54] = _fma_122;
+                    float _fma_123 = __fmaf_rn(_vec_load_13[3], ((1) ? other_w1 : other_w0), d_o[55]);
+                    d_o[55] = _fma_123;
+                    float _vec_load_14[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 7168) + 0);
+                        _vec_load_14[0 + 0] = _v4.x;
+                        _vec_load_14[0 + 1] = _v4.y;
+                        _vec_load_14[0 + 2] = _v4.z;
+                        _vec_load_14[0 + 3] = _v4.w;
+                    }
+                    float _fma_124 = __fmaf_rn(_vec_load_14[0], ((0) ? other_w1 : other_w0), d_o[56]);
+                    d_o[56] = _fma_124;
+                    float _fma_125 = __fmaf_rn(_vec_load_14[1], ((0) ? other_w1 : other_w0), d_o[57]);
+                    d_o[57] = _fma_125;
+                    float _fma_126 = __fmaf_rn(_vec_load_14[2], ((1) ? other_w1 : other_w0), d_o[58]);
+                    d_o[58] = _fma_126;
+                    float _fma_127 = __fmaf_rn(_vec_load_14[3], ((1) ? other_w1 : other_w0), d_o[59]);
+                    d_o[59] = _fma_127;
+                    float _vec_load_15[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(Wo + (other_base + 7680) + 0);
+                        _vec_load_15[0 + 0] = _v4.x;
+                        _vec_load_15[0 + 1] = _v4.y;
+                        _vec_load_15[0 + 2] = _v4.z;
+                        _vec_load_15[0 + 3] = _v4.w;
+                    }
+                    float _fma_128 = __fmaf_rn(_vec_load_15[0], ((0) ? other_w1 : other_w0), d_o[60]);
+                    d_o[60] = _fma_128;
+                    float _fma_129 = __fmaf_rn(_vec_load_15[1], ((0) ? other_w1 : other_w0), d_o[61]);
+                    d_o[61] = _fma_129;
+                    float _fma_130 = __fmaf_rn(_vec_load_15[2], ((1) ? other_w1 : other_w0), d_o[62]);
+                    d_o[62] = _fma_130;
+                    float _fma_131 = __fmaf_rn(_vec_load_15[3], ((1) ? other_w1 : other_w0), d_o[63]);
+                    d_o[63] = _fma_131;
+                }
+                if (tid == 0) {
+                    *(reinterpret_cast<unsigned int*>(Wc + tile) + (0)) = 0;
+                }
+            }
+        }
+        if (do_store != 0) {
+            float _rcp_0 = approx_rcp(fsum0);
+            float _rcp_1 = approx_rcp(fsum1);
+            d_o[0] = d_o[0] * _rcp_0;
+            d_o[1] = d_o[1] * _rcp_0;
+            d_o[2] = d_o[2] * _rcp_1;
+            d_o[3] = d_o[3] * _rcp_1;
+            d_o[4] = d_o[4] * _rcp_0;
+            d_o[5] = d_o[5] * _rcp_0;
+            d_o[6] = d_o[6] * _rcp_1;
+            d_o[7] = d_o[7] * _rcp_1;
+            d_o[8] = d_o[8] * _rcp_0;
+            d_o[9] = d_o[9] * _rcp_0;
+            d_o[10] = d_o[10] * _rcp_1;
+            d_o[11] = d_o[11] * _rcp_1;
+            d_o[12] = d_o[12] * _rcp_0;
+            d_o[13] = d_o[13] * _rcp_0;
+            d_o[14] = d_o[14] * _rcp_1;
+            d_o[15] = d_o[15] * _rcp_1;
+            d_o[16] = d_o[16] * _rcp_0;
+            d_o[17] = d_o[17] * _rcp_0;
+            d_o[18] = d_o[18] * _rcp_1;
+            d_o[19] = d_o[19] * _rcp_1;
+            d_o[20] = d_o[20] * _rcp_0;
+            d_o[21] = d_o[21] * _rcp_0;
+            d_o[22] = d_o[22] * _rcp_1;
+            d_o[23] = d_o[23] * _rcp_1;
+            d_o[24] = d_o[24] * _rcp_0;
+            d_o[25] = d_o[25] * _rcp_0;
+            d_o[26] = d_o[26] * _rcp_1;
+            d_o[27] = d_o[27] * _rcp_1;
+            d_o[28] = d_o[28] * _rcp_0;
+            d_o[29] = d_o[29] * _rcp_0;
+            d_o[30] = d_o[30] * _rcp_1;
+            d_o[31] = d_o[31] * _rcp_1;
+            d_o[32] = d_o[32] * _rcp_0;
+            d_o[33] = d_o[33] * _rcp_0;
+            d_o[34] = d_o[34] * _rcp_1;
+            d_o[35] = d_o[35] * _rcp_1;
+            d_o[36] = d_o[36] * _rcp_0;
+            d_o[37] = d_o[37] * _rcp_0;
+            d_o[38] = d_o[38] * _rcp_1;
+            d_o[39] = d_o[39] * _rcp_1;
+            d_o[40] = d_o[40] * _rcp_0;
+            d_o[41] = d_o[41] * _rcp_0;
+            d_o[42] = d_o[42] * _rcp_1;
+            d_o[43] = d_o[43] * _rcp_1;
+            d_o[44] = d_o[44] * _rcp_0;
+            d_o[45] = d_o[45] * _rcp_0;
+            d_o[46] = d_o[46] * _rcp_1;
+            d_o[47] = d_o[47] * _rcp_1;
+            d_o[48] = d_o[48] * _rcp_0;
+            d_o[49] = d_o[49] * _rcp_0;
+            d_o[50] = d_o[50] * _rcp_1;
+            d_o[51] = d_o[51] * _rcp_1;
+            d_o[52] = d_o[52] * _rcp_0;
+            d_o[53] = d_o[53] * _rcp_0;
+            d_o[54] = d_o[54] * _rcp_1;
+            d_o[55] = d_o[55] * _rcp_1;
+            d_o[56] = d_o[56] * _rcp_0;
+            d_o[57] = d_o[57] * _rcp_0;
+            d_o[58] = d_o[58] * _rcp_1;
+            d_o[59] = d_o[59] * _rcp_1;
+            d_o[60] = d_o[60] * _rcp_0;
+            d_o[61] = d_o[61] * _rcp_0;
+            d_o[62] = d_o[62] * _rcp_1;
+            d_o[63] = d_o[63] * _rcp_1;
+            int qj1 = qj & 1;
+            int qj2 = qj & 2;
+            unsigned int o_vec[4];
+            unsigned int o_tmp[4];
+            int o_row_base = q_row * 128;
+            int m_local_r = ((1) ? m0_local : m1_local);
+            __nv_bfloat162 _bf16x2_96 = __float22bfloat162_rn(make_float2(d_o[0], d_o[1]));
+            o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_96)[0];
+            __nv_bfloat162 _bf16x2_97 = __float22bfloat162_rn(make_float2(d_o[4], d_o[5]));
+            o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_97)[0];
+            __nv_bfloat162 _bf16x2_98 = __float22bfloat162_rn(make_float2(d_o[8], d_o[9]));
+            o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_98)[0];
+            __nv_bfloat162 _bf16x2_99 = __float22bfloat162_rn(make_float2(d_o[12], d_o[13]));
+            o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_99)[0];
+            unsigned int _shfl_xor_28 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+            o_tmp[0] = _shfl_xor_28;
+            unsigned int _shfl_xor_29 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+            o_tmp[1] = _shfl_xor_29;
+            unsigned int _shfl_xor_30 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+            o_tmp[2] = _shfl_xor_30;
+            unsigned int _shfl_xor_31 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+            o_tmp[3] = _shfl_xor_31;
+            {
+                o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            unsigned int _shfl_xor_32 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+            o_tmp[0] = _shfl_xor_32;
+            unsigned int _shfl_xor_33 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+            o_tmp[1] = _shfl_xor_33;
+            unsigned int _shfl_xor_34 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+            o_tmp[2] = _shfl_xor_34;
+            unsigned int _shfl_xor_35 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+            o_tmp[3] = _shfl_xor_35;
+            {
+                o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            int o_off = o_row_base + m_local_r * 128 + qj * 8;
+            reinterpret_cast<int4*>(O + o_off)[0] = reinterpret_cast<int4*>(o_vec)[0];
+            __nv_bfloat162 _bf16x2_100 = __float22bfloat162_rn(make_float2(d_o[16], d_o[17]));
+            o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_100)[0];
+            __nv_bfloat162 _bf16x2_101 = __float22bfloat162_rn(make_float2(d_o[20], d_o[21]));
+            o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_101)[0];
+            __nv_bfloat162 _bf16x2_102 = __float22bfloat162_rn(make_float2(d_o[24], d_o[25]));
+            o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_102)[0];
+            __nv_bfloat162 _bf16x2_103 = __float22bfloat162_rn(make_float2(d_o[28], d_o[29]));
+            o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_103)[0];
+            unsigned int _shfl_xor_36 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+            o_tmp[0] = _shfl_xor_36;
+            unsigned int _shfl_xor_37 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+            o_tmp[1] = _shfl_xor_37;
+            unsigned int _shfl_xor_38 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+            o_tmp[2] = _shfl_xor_38;
+            unsigned int _shfl_xor_39 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+            o_tmp[3] = _shfl_xor_39;
+            {
+                o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            unsigned int _shfl_xor_40 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+            o_tmp[0] = _shfl_xor_40;
+            unsigned int _shfl_xor_41 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+            o_tmp[1] = _shfl_xor_41;
+            unsigned int _shfl_xor_42 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+            o_tmp[2] = _shfl_xor_42;
+            unsigned int _shfl_xor_43 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+            o_tmp[3] = _shfl_xor_43;
+            {
+                o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            int o_off_0 = o_row_base + m_local_r * 128 + (4 + qj) * 8;
+            reinterpret_cast<int4*>(O + o_off_0)[0] = reinterpret_cast<int4*>(o_vec)[0];
+            __nv_bfloat162 _bf16x2_104 = __float22bfloat162_rn(make_float2(d_o[32], d_o[33]));
+            o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_104)[0];
+            __nv_bfloat162 _bf16x2_105 = __float22bfloat162_rn(make_float2(d_o[36], d_o[37]));
+            o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_105)[0];
+            __nv_bfloat162 _bf16x2_106 = __float22bfloat162_rn(make_float2(d_o[40], d_o[41]));
+            o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_106)[0];
+            __nv_bfloat162 _bf16x2_107 = __float22bfloat162_rn(make_float2(d_o[44], d_o[45]));
+            o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_107)[0];
+            unsigned int _shfl_xor_44 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+            o_tmp[0] = _shfl_xor_44;
+            unsigned int _shfl_xor_45 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+            o_tmp[1] = _shfl_xor_45;
+            unsigned int _shfl_xor_46 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+            o_tmp[2] = _shfl_xor_46;
+            unsigned int _shfl_xor_47 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+            o_tmp[3] = _shfl_xor_47;
+            {
+                o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            unsigned int _shfl_xor_48 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+            o_tmp[0] = _shfl_xor_48;
+            unsigned int _shfl_xor_49 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+            o_tmp[1] = _shfl_xor_49;
+            unsigned int _shfl_xor_50 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+            o_tmp[2] = _shfl_xor_50;
+            unsigned int _shfl_xor_51 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+            o_tmp[3] = _shfl_xor_51;
+            {
+                o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            int o_off_1 = o_row_base + m_local_r * 128 + (8 + qj) * 8;
+            reinterpret_cast<int4*>(O + o_off_1)[0] = reinterpret_cast<int4*>(o_vec)[0];
+            __nv_bfloat162 _bf16x2_108 = __float22bfloat162_rn(make_float2(d_o[48], d_o[49]));
+            o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_108)[0];
+            __nv_bfloat162 _bf16x2_109 = __float22bfloat162_rn(make_float2(d_o[52], d_o[53]));
+            o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_109)[0];
+            __nv_bfloat162 _bf16x2_110 = __float22bfloat162_rn(make_float2(d_o[56], d_o[57]));
+            o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_110)[0];
+            __nv_bfloat162 _bf16x2_111 = __float22bfloat162_rn(make_float2(d_o[60], d_o[61]));
+            o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_111)[0];
+            unsigned int _shfl_xor_52 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+            o_tmp[0] = _shfl_xor_52;
+            unsigned int _shfl_xor_53 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+            o_tmp[1] = _shfl_xor_53;
+            unsigned int _shfl_xor_54 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+            o_tmp[2] = _shfl_xor_54;
+            unsigned int _shfl_xor_55 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+            o_tmp[3] = _shfl_xor_55;
+            {
+                o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            unsigned int _shfl_xor_56 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+            o_tmp[0] = _shfl_xor_56;
+            unsigned int _shfl_xor_57 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+            o_tmp[1] = _shfl_xor_57;
+            unsigned int _shfl_xor_58 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+            o_tmp[2] = _shfl_xor_58;
+            unsigned int _shfl_xor_59 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+            o_tmp[3] = _shfl_xor_59;
+            {
+                o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            int o_off_2 = o_row_base + m_local_r * 128 + (12 + qj) * 8;
+            reinterpret_cast<int4*>(O + o_off_2)[0] = reinterpret_cast<int4*>(o_vec)[0];
+            int m_local_r_3 = ((0) ? m0_local : m1_local);
+            __nv_bfloat162 _bf16x2_112 = __float22bfloat162_rn(make_float2(d_o[2], d_o[3]));
+            o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_112)[0];
+            __nv_bfloat162 _bf16x2_113 = __float22bfloat162_rn(make_float2(d_o[6], d_o[7]));
+            o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_113)[0];
+            __nv_bfloat162 _bf16x2_114 = __float22bfloat162_rn(make_float2(d_o[10], d_o[11]));
+            o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_114)[0];
+            __nv_bfloat162 _bf16x2_115 = __float22bfloat162_rn(make_float2(d_o[14], d_o[15]));
+            o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_115)[0];
+            unsigned int _shfl_xor_60 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+            o_tmp[0] = _shfl_xor_60;
+            unsigned int _shfl_xor_61 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+            o_tmp[1] = _shfl_xor_61;
+            unsigned int _shfl_xor_62 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+            o_tmp[2] = _shfl_xor_62;
+            unsigned int _shfl_xor_63 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+            o_tmp[3] = _shfl_xor_63;
+            {
+                o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            unsigned int _shfl_xor_64 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+            o_tmp[0] = _shfl_xor_64;
+            unsigned int _shfl_xor_65 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+            o_tmp[1] = _shfl_xor_65;
+            unsigned int _shfl_xor_66 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+            o_tmp[2] = _shfl_xor_66;
+            unsigned int _shfl_xor_67 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+            o_tmp[3] = _shfl_xor_67;
+            {
+                o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            int o_off_4 = o_row_base + m_local_r_3 * 128 + qj * 8;
+            reinterpret_cast<int4*>(O + o_off_4)[0] = reinterpret_cast<int4*>(o_vec)[0];
+            __nv_bfloat162 _bf16x2_116 = __float22bfloat162_rn(make_float2(d_o[18], d_o[19]));
+            o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_116)[0];
+            __nv_bfloat162 _bf16x2_117 = __float22bfloat162_rn(make_float2(d_o[22], d_o[23]));
+            o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_117)[0];
+            __nv_bfloat162 _bf16x2_118 = __float22bfloat162_rn(make_float2(d_o[26], d_o[27]));
+            o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_118)[0];
+            __nv_bfloat162 _bf16x2_119 = __float22bfloat162_rn(make_float2(d_o[30], d_o[31]));
+            o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_119)[0];
+            unsigned int _shfl_xor_68 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+            o_tmp[0] = _shfl_xor_68;
+            unsigned int _shfl_xor_69 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+            o_tmp[1] = _shfl_xor_69;
+            unsigned int _shfl_xor_70 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+            o_tmp[2] = _shfl_xor_70;
+            unsigned int _shfl_xor_71 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+            o_tmp[3] = _shfl_xor_71;
+            {
+                o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            unsigned int _shfl_xor_72 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+            o_tmp[0] = _shfl_xor_72;
+            unsigned int _shfl_xor_73 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+            o_tmp[1] = _shfl_xor_73;
+            unsigned int _shfl_xor_74 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+            o_tmp[2] = _shfl_xor_74;
+            unsigned int _shfl_xor_75 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+            o_tmp[3] = _shfl_xor_75;
+            {
+                o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            int o_off_5 = o_row_base + m_local_r_3 * 128 + (4 + qj) * 8;
+            reinterpret_cast<int4*>(O + o_off_5)[0] = reinterpret_cast<int4*>(o_vec)[0];
+            __nv_bfloat162 _bf16x2_120 = __float22bfloat162_rn(make_float2(d_o[34], d_o[35]));
+            o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_120)[0];
+            __nv_bfloat162 _bf16x2_121 = __float22bfloat162_rn(make_float2(d_o[38], d_o[39]));
+            o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_121)[0];
+            __nv_bfloat162 _bf16x2_122 = __float22bfloat162_rn(make_float2(d_o[42], d_o[43]));
+            o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_122)[0];
+            __nv_bfloat162 _bf16x2_123 = __float22bfloat162_rn(make_float2(d_o[46], d_o[47]));
+            o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_123)[0];
+            unsigned int _shfl_xor_76 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+            o_tmp[0] = _shfl_xor_76;
+            unsigned int _shfl_xor_77 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+            o_tmp[1] = _shfl_xor_77;
+            unsigned int _shfl_xor_78 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+            o_tmp[2] = _shfl_xor_78;
+            unsigned int _shfl_xor_79 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+            o_tmp[3] = _shfl_xor_79;
+            {
+                o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            unsigned int _shfl_xor_80 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+            o_tmp[0] = _shfl_xor_80;
+            unsigned int _shfl_xor_81 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+            o_tmp[1] = _shfl_xor_81;
+            unsigned int _shfl_xor_82 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+            o_tmp[2] = _shfl_xor_82;
+            unsigned int _shfl_xor_83 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+            o_tmp[3] = _shfl_xor_83;
+            {
+                o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            int o_off_6 = o_row_base + m_local_r_3 * 128 + (8 + qj) * 8;
+            reinterpret_cast<int4*>(O + o_off_6)[0] = reinterpret_cast<int4*>(o_vec)[0];
+            __nv_bfloat162 _bf16x2_124 = __float22bfloat162_rn(make_float2(d_o[50], d_o[51]));
+            o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_124)[0];
+            __nv_bfloat162 _bf16x2_125 = __float22bfloat162_rn(make_float2(d_o[54], d_o[55]));
+            o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_125)[0];
+            __nv_bfloat162 _bf16x2_126 = __float22bfloat162_rn(make_float2(d_o[58], d_o[59]));
+            o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_126)[0];
+            __nv_bfloat162 _bf16x2_127 = __float22bfloat162_rn(make_float2(d_o[62], d_o[63]));
+            o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_127)[0];
+            unsigned int _shfl_xor_84 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
+            o_tmp[0] = _shfl_xor_84;
+            unsigned int _shfl_xor_85 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
+            o_tmp[1] = _shfl_xor_85;
+            unsigned int _shfl_xor_86 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
+            o_tmp[2] = _shfl_xor_86;
+            unsigned int _shfl_xor_87 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
+            o_tmp[3] = _shfl_xor_87;
+            {
+                o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            unsigned int _shfl_xor_88 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
+            o_tmp[0] = _shfl_xor_88;
+            unsigned int _shfl_xor_89 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
+            o_tmp[1] = _shfl_xor_89;
+            unsigned int _shfl_xor_90 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
+            o_tmp[2] = _shfl_xor_90;
+            unsigned int _shfl_xor_91 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
+            o_tmp[3] = _shfl_xor_91;
+            {
+                o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
+            }
+            {
+                o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
+            }
+            {
+                o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
+            }
+            {
+                o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
+            }
+            int o_off_7 = o_row_base + m_local_r_3 * 128 + (12 + qj) * 8;
+            reinterpret_cast<int4*>(O + o_off_7)[0] = reinterpret_cast<int4*>(o_vec)[0];
         }
-        {
-            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-        }
-        {
-            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-        }
-        {
-            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-        }
-        unsigned int _shfl_xor_32 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-        o_tmp[0] = _shfl_xor_32;
-        unsigned int _shfl_xor_33 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-        o_tmp[1] = _shfl_xor_33;
-        unsigned int _shfl_xor_34 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-        o_tmp[2] = _shfl_xor_34;
-        unsigned int _shfl_xor_35 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-        o_tmp[3] = _shfl_xor_35;
-        {
-            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-        }
-        {
-            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-        }
-        {
-            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-        }
-        {
-            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-        }
-        int o_off = o_row_base + m_local_r * 128 + qj * 8;
-        reinterpret_cast<int4*>(O + o_off)[0] = reinterpret_cast<int4*>(o_vec)[0];
-        __nv_bfloat162 _bf16x2_100 = __float22bfloat162_rn(make_float2(d_o[16], d_o[17]));
-        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_100)[0];
-        __nv_bfloat162 _bf16x2_101 = __float22bfloat162_rn(make_float2(d_o[20], d_o[21]));
-        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_101)[0];
-        __nv_bfloat162 _bf16x2_102 = __float22bfloat162_rn(make_float2(d_o[24], d_o[25]));
-        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_102)[0];
-        __nv_bfloat162 _bf16x2_103 = __float22bfloat162_rn(make_float2(d_o[28], d_o[29]));
-        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_103)[0];
-        unsigned int _shfl_xor_36 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-        o_tmp[0] = _shfl_xor_36;
-        unsigned int _shfl_xor_37 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-        o_tmp[1] = _shfl_xor_37;
-        unsigned int _shfl_xor_38 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-        o_tmp[2] = _shfl_xor_38;
-        unsigned int _shfl_xor_39 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-        o_tmp[3] = _shfl_xor_39;
-        {
-            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
-        }
-        {
-            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-        }
-        {
-            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-        }
-        {
-            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-        }
-        unsigned int _shfl_xor_40 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-        o_tmp[0] = _shfl_xor_40;
-        unsigned int _shfl_xor_41 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-        o_tmp[1] = _shfl_xor_41;
-        unsigned int _shfl_xor_42 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-        o_tmp[2] = _shfl_xor_42;
-        unsigned int _shfl_xor_43 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-        o_tmp[3] = _shfl_xor_43;
-        {
-            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-        }
-        {
-            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-        }
-        {
-            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-        }
-        {
-            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-        }
-        int o_off_0 = o_row_base + m_local_r * 128 + (4 + qj) * 8;
-        reinterpret_cast<int4*>(O + o_off_0)[0] = reinterpret_cast<int4*>(o_vec)[0];
-        int m_local_r_1 = ((0) ? m0_local : m1_local);
-        __nv_bfloat162 _bf16x2_104 = __float22bfloat162_rn(make_float2(d_o[2], d_o[3]));
-        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_104)[0];
-        __nv_bfloat162 _bf16x2_105 = __float22bfloat162_rn(make_float2(d_o[6], d_o[7]));
-        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_105)[0];
-        __nv_bfloat162 _bf16x2_106 = __float22bfloat162_rn(make_float2(d_o[10], d_o[11]));
-        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_106)[0];
-        __nv_bfloat162 _bf16x2_107 = __float22bfloat162_rn(make_float2(d_o[14], d_o[15]));
-        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_107)[0];
-        unsigned int _shfl_xor_44 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-        o_tmp[0] = _shfl_xor_44;
-        unsigned int _shfl_xor_45 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-        o_tmp[1] = _shfl_xor_45;
-        unsigned int _shfl_xor_46 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-        o_tmp[2] = _shfl_xor_46;
-        unsigned int _shfl_xor_47 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-        o_tmp[3] = _shfl_xor_47;
-        {
-            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
-        }
-        {
-            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-        }
-        {
-            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-        }
-        {
-            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-        }
-        unsigned int _shfl_xor_48 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-        o_tmp[0] = _shfl_xor_48;
-        unsigned int _shfl_xor_49 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-        o_tmp[1] = _shfl_xor_49;
-        unsigned int _shfl_xor_50 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-        o_tmp[2] = _shfl_xor_50;
-        unsigned int _shfl_xor_51 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-        o_tmp[3] = _shfl_xor_51;
-        {
-            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-        }
-        {
-            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-        }
-        {
-            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-        }
-        {
-            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-        }
-        int o_off_2 = o_row_base + m_local_r_1 * 128 + qj * 8;
-        reinterpret_cast<int4*>(O + o_off_2)[0] = reinterpret_cast<int4*>(o_vec)[0];
-        __nv_bfloat162 _bf16x2_108 = __float22bfloat162_rn(make_float2(d_o[18], d_o[19]));
-        o_vec[0] = reinterpret_cast<unsigned int*>(&_bf16x2_108)[0];
-        __nv_bfloat162 _bf16x2_109 = __float22bfloat162_rn(make_float2(d_o[22], d_o[23]));
-        o_vec[1] = reinterpret_cast<unsigned int*>(&_bf16x2_109)[0];
-        __nv_bfloat162 _bf16x2_110 = __float22bfloat162_rn(make_float2(d_o[26], d_o[27]));
-        o_vec[2] = reinterpret_cast<unsigned int*>(&_bf16x2_110)[0];
-        __nv_bfloat162 _bf16x2_111 = __float22bfloat162_rn(make_float2(d_o[30], d_o[31]));
-        o_vec[3] = reinterpret_cast<unsigned int*>(&_bf16x2_111)[0];
-        unsigned int _shfl_xor_52 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 1);
-        o_tmp[0] = _shfl_xor_52;
-        unsigned int _shfl_xor_53 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 1);
-        o_tmp[1] = _shfl_xor_53;
-        unsigned int _shfl_xor_54 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 1);
-        o_tmp[2] = _shfl_xor_54;
-        unsigned int _shfl_xor_55 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 1);
-        o_tmp[3] = _shfl_xor_55;
-        {
-            o_vec[0] = ((qj1 != 0) ? o_tmp[0] : o_vec[0]);
-        }
-        {
-            o_vec[1] = ((qj1 == 0) ? o_tmp[1] : o_vec[1]);
-        }
-        {
-            o_vec[2] = ((qj1 != 0) ? o_tmp[2] : o_vec[2]);
-        }
-        {
-            o_vec[3] = ((qj1 == 0) ? o_tmp[3] : o_vec[3]);
-        }
-        unsigned int _shfl_xor_56 = __shfl_xor_sync(0xFFFFFFFF, o_vec[2], 2);
-        o_tmp[0] = _shfl_xor_56;
-        unsigned int _shfl_xor_57 = __shfl_xor_sync(0xFFFFFFFF, o_vec[3], 2);
-        o_tmp[1] = _shfl_xor_57;
-        unsigned int _shfl_xor_58 = __shfl_xor_sync(0xFFFFFFFF, o_vec[0], 2);
-        o_tmp[2] = _shfl_xor_58;
-        unsigned int _shfl_xor_59 = __shfl_xor_sync(0xFFFFFFFF, o_vec[1], 2);
-        o_tmp[3] = _shfl_xor_59;
-        {
-            o_vec[0] = ((qj2 != 0) ? o_tmp[0] : o_vec[0]);
-        }
-        {
-            o_vec[1] = ((qj2 != 0) ? o_tmp[1] : o_vec[1]);
-        }
-        {
-            o_vec[2] = ((qj2 == 0) ? o_tmp[2] : o_vec[2]);
-        }
-        {
-            o_vec[3] = ((qj2 == 0) ? o_tmp[3] : o_vec[3]);
-        }
-        int o_off_3 = o_row_base + m_local_r_1 * 128 + (4 + qj) * 8;
-        reinterpret_cast<int4*>(O + o_off_3)[0] = reinterpret_cast<int4*>(o_vec)[0];
-    }
-    if (wg == 1) {
-        float _rcp_2 = approx_rcp(row_sum0);
-        float _rcp_3 = approx_rcp(row_sum1);
-        d_o[32] = d_o[32] * _rcp_2;
-        d_o[33] = d_o[33] * _rcp_2;
-        d_o[34] = d_o[34] * _rcp_3;
-        d_o[35] = d_o[35] * _rcp_3;
-        d_o[36] = d_o[36] * _rcp_2;
-        d_o[37] = d_o[37] * _rcp_2;
-        d_o[38] = d_o[38] * _rcp_3;
-        d_o[39] = d_o[39] * _rcp_3;
-        d_o[40] = d_o[40] * _rcp_2;
-        d_o[41] = d_o[41] * _rcp_2;
-        d_o[42] = d_o[42] * _rcp_3;
-        d_o[43] = d_o[43] * _rcp_3;
-        d_o[44] = d_o[44] * _rcp_2;
-        d_o[45] = d_o[45] * _rcp_2;
-        d_o[46] = d_o[46] * _rcp_3;
-        d_o[47] = d_o[47] * _rcp_3;
-        d_o[48] = d_o[48] * _rcp_2;
-        d_o[49] = d_o[49] * _rcp_2;
-        d_o[50] = d_o[50] * _rcp_3;
-        d_o[51] = d_o[51] * _rcp_3;
-        d_o[52] = d_o[52] * _rcp_2;
-        d_o[53] = d_o[53] * _rcp_2;
-        d_o[54] = d_o[54] * _rcp_3;
-        d_o[55] = d_o[55] * _rcp_3;
-        d_o[56] = d_o[56] * _rcp_2;
-        d_o[57] = d_o[57] * _rcp_2;
-        d_o[58] = d_o[58] * _rcp_3;
-        d_o[59] = d_o[59] * _rcp_3;
-        d_o[60] = d_o[60] * _rcp_2;
-        d_o[61] = d_o[61] * _rcp_2;
-        d_o[62] = d_o[62] * _rcp_3;
-        d_o[63] = d_o[63] * _rcp_3;
-        int qj1_1 = qj & 1;
-        int qj2_1 = qj & 2;
-        unsigned int o_vec_1[4];
-        unsigned int o_tmp_1[4];
-        int o_row_base_1 = q_row * 128;
-        int m_local_r_2 = ((1) ? m0_local : m1_local);
-        __nv_bfloat162 _bf16x2_112 = __float22bfloat162_rn(make_float2(d_o[32], d_o[33]));
-        o_vec_1[0] = reinterpret_cast<unsigned int*>(&_bf16x2_112)[0];
-        __nv_bfloat162 _bf16x2_113 = __float22bfloat162_rn(make_float2(d_o[36], d_o[37]));
-        o_vec_1[1] = reinterpret_cast<unsigned int*>(&_bf16x2_113)[0];
-        __nv_bfloat162 _bf16x2_114 = __float22bfloat162_rn(make_float2(d_o[40], d_o[41]));
-        o_vec_1[2] = reinterpret_cast<unsigned int*>(&_bf16x2_114)[0];
-        __nv_bfloat162 _bf16x2_115 = __float22bfloat162_rn(make_float2(d_o[44], d_o[45]));
-        o_vec_1[3] = reinterpret_cast<unsigned int*>(&_bf16x2_115)[0];
-        unsigned int _shfl_xor_60 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 1);
-        o_tmp_1[0] = _shfl_xor_60;
-        unsigned int _shfl_xor_61 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 1);
-        o_tmp_1[1] = _shfl_xor_61;
-        unsigned int _shfl_xor_62 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 1);
-        o_tmp_1[2] = _shfl_xor_62;
-        unsigned int _shfl_xor_63 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 1);
-        o_tmp_1[3] = _shfl_xor_63;
-        {
-            o_vec_1[0] = ((qj1_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
-        }
-        {
-            o_vec_1[1] = ((qj1_1 == 0) ? o_tmp_1[1] : o_vec_1[1]);
-        }
-        {
-            o_vec_1[2] = ((qj1_1 != 0) ? o_tmp_1[2] : o_vec_1[2]);
-        }
-        {
-            o_vec_1[3] = ((qj1_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-        }
-        unsigned int _shfl_xor_64 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 2);
-        o_tmp_1[0] = _shfl_xor_64;
-        unsigned int _shfl_xor_65 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 2);
-        o_tmp_1[1] = _shfl_xor_65;
-        unsigned int _shfl_xor_66 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 2);
-        o_tmp_1[2] = _shfl_xor_66;
-        unsigned int _shfl_xor_67 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 2);
-        o_tmp_1[3] = _shfl_xor_67;
-        {
-            o_vec_1[0] = ((qj2_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
-        }
-        {
-            o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
-        }
-        {
-            o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
-        }
-        {
-            o_vec_1[3] = ((qj2_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-        }
-        int o_off_1 = o_row_base_1 + m_local_r_2 * 128 + (8 + qj) * 8;
-        reinterpret_cast<int4*>(O + o_off_1)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
-        __nv_bfloat162 _bf16x2_116 = __float22bfloat162_rn(make_float2(d_o[48], d_o[49]));
-        o_vec_1[0] = reinterpret_cast<unsigned int*>(&_bf16x2_116)[0];
-        __nv_bfloat162 _bf16x2_117 = __float22bfloat162_rn(make_float2(d_o[52], d_o[53]));
-        o_vec_1[1] = reinterpret_cast<unsigned int*>(&_bf16x2_117)[0];
-        __nv_bfloat162 _bf16x2_118 = __float22bfloat162_rn(make_float2(d_o[56], d_o[57]));
-        o_vec_1[2] = reinterpret_cast<unsigned int*>(&_bf16x2_118)[0];
-        __nv_bfloat162 _bf16x2_119 = __float22bfloat162_rn(make_float2(d_o[60], d_o[61]));
-        o_vec_1[3] = reinterpret_cast<unsigned int*>(&_bf16x2_119)[0];
-        unsigned int _shfl_xor_68 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 1);
-        o_tmp_1[0] = _shfl_xor_68;
-        unsigned int _shfl_xor_69 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 1);
-        o_tmp_1[1] = _shfl_xor_69;
-        unsigned int _shfl_xor_70 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 1);
-        o_tmp_1[2] = _shfl_xor_70;
-        unsigned int _shfl_xor_71 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 1);
-        o_tmp_1[3] = _shfl_xor_71;
-        {
-            o_vec_1[0] = ((qj1_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
-        }
-        {
-            o_vec_1[1] = ((qj1_1 == 0) ? o_tmp_1[1] : o_vec_1[1]);
-        }
-        {
-            o_vec_1[2] = ((qj1_1 != 0) ? o_tmp_1[2] : o_vec_1[2]);
-        }
-        {
-            o_vec_1[3] = ((qj1_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-        }
-        unsigned int _shfl_xor_72 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 2);
-        o_tmp_1[0] = _shfl_xor_72;
-        unsigned int _shfl_xor_73 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 2);
-        o_tmp_1[1] = _shfl_xor_73;
-        unsigned int _shfl_xor_74 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 2);
-        o_tmp_1[2] = _shfl_xor_74;
-        unsigned int _shfl_xor_75 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 2);
-        o_tmp_1[3] = _shfl_xor_75;
-        {
-            o_vec_1[0] = ((qj2_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
-        }
-        {
-            o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
-        }
-        {
-            o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
-        }
-        {
-            o_vec_1[3] = ((qj2_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-        }
-        int o_off_0_1 = o_row_base_1 + m_local_r_2 * 128 + (12 + qj) * 8;
-        reinterpret_cast<int4*>(O + o_off_0_1)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
-        int m_local_r_1_1 = ((0) ? m0_local : m1_local);
-        __nv_bfloat162 _bf16x2_120 = __float22bfloat162_rn(make_float2(d_o[34], d_o[35]));
-        o_vec_1[0] = reinterpret_cast<unsigned int*>(&_bf16x2_120)[0];
-        __nv_bfloat162 _bf16x2_121 = __float22bfloat162_rn(make_float2(d_o[38], d_o[39]));
-        o_vec_1[1] = reinterpret_cast<unsigned int*>(&_bf16x2_121)[0];
-        __nv_bfloat162 _bf16x2_122 = __float22bfloat162_rn(make_float2(d_o[42], d_o[43]));
-        o_vec_1[2] = reinterpret_cast<unsigned int*>(&_bf16x2_122)[0];
-        __nv_bfloat162 _bf16x2_123 = __float22bfloat162_rn(make_float2(d_o[46], d_o[47]));
-        o_vec_1[3] = reinterpret_cast<unsigned int*>(&_bf16x2_123)[0];
-        unsigned int _shfl_xor_76 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 1);
-        o_tmp_1[0] = _shfl_xor_76;
-        unsigned int _shfl_xor_77 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 1);
-        o_tmp_1[1] = _shfl_xor_77;
-        unsigned int _shfl_xor_78 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 1);
-        o_tmp_1[2] = _shfl_xor_78;
-        unsigned int _shfl_xor_79 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 1);
-        o_tmp_1[3] = _shfl_xor_79;
-        {
-            o_vec_1[0] = ((qj1_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
-        }
-        {
-            o_vec_1[1] = ((qj1_1 == 0) ? o_tmp_1[1] : o_vec_1[1]);
-        }
-        {
-            o_vec_1[2] = ((qj1_1 != 0) ? o_tmp_1[2] : o_vec_1[2]);
-        }
-        {
-            o_vec_1[3] = ((qj1_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-        }
-        unsigned int _shfl_xor_80 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 2);
-        o_tmp_1[0] = _shfl_xor_80;
-        unsigned int _shfl_xor_81 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 2);
-        o_tmp_1[1] = _shfl_xor_81;
-        unsigned int _shfl_xor_82 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 2);
-        o_tmp_1[2] = _shfl_xor_82;
-        unsigned int _shfl_xor_83 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 2);
-        o_tmp_1[3] = _shfl_xor_83;
-        {
-            o_vec_1[0] = ((qj2_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
-        }
-        {
-            o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
-        }
-        {
-            o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
-        }
-        {
-            o_vec_1[3] = ((qj2_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-        }
-        int o_off_2_1 = o_row_base_1 + m_local_r_1_1 * 128 + (8 + qj) * 8;
-        reinterpret_cast<int4*>(O + o_off_2_1)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
-        __nv_bfloat162 _bf16x2_124 = __float22bfloat162_rn(make_float2(d_o[50], d_o[51]));
-        o_vec_1[0] = reinterpret_cast<unsigned int*>(&_bf16x2_124)[0];
-        __nv_bfloat162 _bf16x2_125 = __float22bfloat162_rn(make_float2(d_o[54], d_o[55]));
-        o_vec_1[1] = reinterpret_cast<unsigned int*>(&_bf16x2_125)[0];
-        __nv_bfloat162 _bf16x2_126 = __float22bfloat162_rn(make_float2(d_o[58], d_o[59]));
-        o_vec_1[2] = reinterpret_cast<unsigned int*>(&_bf16x2_126)[0];
-        __nv_bfloat162 _bf16x2_127 = __float22bfloat162_rn(make_float2(d_o[62], d_o[63]));
-        o_vec_1[3] = reinterpret_cast<unsigned int*>(&_bf16x2_127)[0];
-        unsigned int _shfl_xor_84 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 1);
-        o_tmp_1[0] = _shfl_xor_84;
-        unsigned int _shfl_xor_85 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 1);
-        o_tmp_1[1] = _shfl_xor_85;
-        unsigned int _shfl_xor_86 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 1);
-        o_tmp_1[2] = _shfl_xor_86;
-        unsigned int _shfl_xor_87 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 1);
-        o_tmp_1[3] = _shfl_xor_87;
-        {
-            o_vec_1[0] = ((qj1_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
-        }
-        {
-            o_vec_1[1] = ((qj1_1 == 0) ? o_tmp_1[1] : o_vec_1[1]);
-        }
-        {
-            o_vec_1[2] = ((qj1_1 != 0) ? o_tmp_1[2] : o_vec_1[2]);
-        }
-        {
-            o_vec_1[3] = ((qj1_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-        }
-        unsigned int _shfl_xor_88 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[2], 2);
-        o_tmp_1[0] = _shfl_xor_88;
-        unsigned int _shfl_xor_89 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[3], 2);
-        o_tmp_1[1] = _shfl_xor_89;
-        unsigned int _shfl_xor_90 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[0], 2);
-        o_tmp_1[2] = _shfl_xor_90;
-        unsigned int _shfl_xor_91 = __shfl_xor_sync(0xFFFFFFFF, o_vec_1[1], 2);
-        o_tmp_1[3] = _shfl_xor_91;
-        {
-            o_vec_1[0] = ((qj2_1 != 0) ? o_tmp_1[0] : o_vec_1[0]);
-        }
-        {
-            o_vec_1[1] = ((qj2_1 != 0) ? o_tmp_1[1] : o_vec_1[1]);
-        }
-        {
-            o_vec_1[2] = ((qj2_1 == 0) ? o_tmp_1[2] : o_vec_1[2]);
-        }
-        {
-            o_vec_1[3] = ((qj2_1 == 0) ? o_tmp_1[3] : o_vec_1[3]);
-        }
-        int o_off_3_1 = o_row_base_1 + m_local_r_1_1 * 128 + (12 + qj) * 8;
-        reinterpret_cast<int4*>(O + o_off_3_1)[0] = reinterpret_cast<int4*>(o_vec_1)[0];
     }
 
     // Cleanup
