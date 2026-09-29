@@ -46,6 +46,7 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     workspace_layout,
 )
 from tests.test_helpers.cake_dsa_train_reference import (
+    calibrate_beta,
     make_inputs,
     reference_fp64,
     rel_l2,
@@ -412,10 +413,16 @@ def test_backward_masked_rows_give_zero_dq():
 
 
 def test_backward_peaked():
+    """Own key carrying ~99 % of the softmax mass (the strongest calibrated peaked case).
+
+    A saturated softmax (self weight -> 1) makes the exact dQ vanish and the relative error
+    meaningless, so beta is calibrated to the target weight at this shape instead of fixed.
+    """
     _require_program(backward=True)
-    inp = make_inputs([512], [512], seed=SEED + 8, topk=128, self_including=True, beta=3.0)
+    beta = calibrate_beta(0.99, seed=SEED + 8, probe_len=512, topk=128)
+    inp = make_inputs([512], [512], seed=SEED + 8, topk=128, self_including=True, beta=beta)
     ref = reference_fp64(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, dout=inp.dout, own_key=inp.own_key)
-    assert ref["self_weight"] > 0.5, "the peaked configuration must concentrate the softmax on the own key"
+    assert 0.9 < ref["self_weight"] < 0.999, f"calibrated self weight {ref['self_weight']:.4f} outside the peaked window"
     out, lse, o_lo = cake_backend.forward(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
     grads = cake_backend.backward(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, out, o_lo, lse, inp.dout)
     torch.cuda.synchronize()
