@@ -113,10 +113,13 @@ CONTRACT_SCALARS = (
     "topk",
     "softmax_scale",
     "softmax_scale_log2",
+    "idx_stride",  # indices row stride (elements)
+    "k_rope_stride",  # k_rope row stride (elements); k_rope is passed as its storage alias
+    "k_rope_offset",  # element offset of k_rope inside that storage (0 when contiguous)
+    "has_topk_length",  # 1 when the caller supplied topk_length
     "q_latent_row_stride",
     "q_rope_row_stride",
     "kv_latent_row_stride",
-    "k_rope_row_stride",
 )
 # Accepted spellings of the same host value (kernel side -> host side).
 CONTRACT_ALIASES = {
@@ -129,6 +132,8 @@ CONTRACT_ALIASES = {
     "num_keys": "num_kv",
     "seqlen_kv": "num_kv",
     "lengths": "topk_length",
+    "indices_stride": "idx_stride",
+    "k_rope_row_stride": "k_rope_stride",
     "dkv_latent_f32": "dkv_latent_acc",
     "dk_rope_f32": "dk_rope_acc",
     "do": "dout",
@@ -461,7 +466,7 @@ def bind_stage(
         key = CONTRACT_ALIASES.get(name, name)
         if kind == "grid":
             arguments.append(grid_values[name])
-        elif key in values and values[key] is not None:
+        elif key in values and values[key] is not None:  # buffer / tma_buffer / workspace / parameter
             arguments.append(values[key])
         else:
             raise KeyError(
@@ -577,6 +582,20 @@ class DSATrainRunner:
     __call__ = step
 
 
+def _pointer_alias(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
+    """Contiguous zero-copy alias of ``tensor``'s storage plus its element offset.
+
+    Raw pointer arguments are checked for contiguity at the FFI boundary; a
+    strided view (the rope columns of a packed ``[S, 576]`` tensor) is passed
+    as the whole storage viewed flat plus the element offset the kernel adds.
+    """
+    if tensor.is_contiguous():
+        return tensor, 0
+    flat = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
+    flat.set_(tensor.untyped_storage())
+    return flat, int(tensor.storage_offset())
+
+
 def _contract_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dict[str, Any]:
     values: dict[str, Any] = {name: t.get(name) for name in CONTRACT_TENSORS}
     values.update(scalars)
@@ -585,9 +604,11 @@ def _contract_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dic
         ("q_latent", "q_latent_row_stride"),
         ("q_rope", "q_rope_row_stride"),
         ("kv_latent", "kv_latent_row_stride"),
-        ("k_rope", "k_rope_row_stride"),
     ):
         values[key] = int(t[name].stride(0))
+    values["idx_stride"] = int(t["indices"].stride(0))
+    values["k_rope_stride"] = int(t["k_rope"].stride(0))
+    values["k_rope"], values["k_rope_offset"] = _pointer_alias(t["k_rope"])
     return values
 
 
@@ -609,6 +630,7 @@ def _seed_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dict[st
         topk=scalars["topk"],
         has_sinks=0,
         scale_log2=float(scalars["softmax_scale"]) * LOG2E,
+        tma_descriptor_workspace=t.get("tma_descriptor_workspace"),
     )
 
 
@@ -696,6 +718,7 @@ def prepare_dsa_train(
     t: dict[str, torch.Tensor] = dict(
         q_latent=q_latent, q_rope=q_rope, kv_latent=kv_latent, k_rope=k_rope, indices=indices
     )
+    has_topk_length = int(topk_length is not None)
     if topk_length is None:
         topk_length = _carve(flat, layout, "topk_length", torch.int32, (num_queries,))
         topk_length.fill_(topk)
@@ -724,7 +747,10 @@ def prepare_dsa_train(
             flat, layout, "tma_descriptor_workspace", torch.uint8, (layout["tma_descriptor_workspace"][1],)
         )
 
-    scalars = dict(num_queries=num_queries, num_kv=num_kv, topk=topk, softmax_scale=float(softmax_scale))
+    scalars = dict(
+        num_queries=num_queries, num_kv=num_kv, topk=topk, softmax_scale=float(softmax_scale),
+        has_topk_length=has_topk_length,
+    )
     values = _seed_values(t, scalars) if abi == ABI_SEED else _contract_values(t, scalars)
     num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     wanted = FORWARD_STAGES + (BACKWARD_STAGES if backward else ())

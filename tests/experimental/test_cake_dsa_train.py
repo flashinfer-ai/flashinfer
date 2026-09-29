@@ -119,7 +119,7 @@ def test_registry_records_are_well_formed():
             assert len(physical["sources"]) == 2
             assert all(s.startswith("cake_dsa_h64_train/") for s in physical["sources"])
             assert len(physical["closure_sha256"]) == 64
-            assert all(kind in {"buffer", "tma_buffer", "parameter", "grid"} for kind, _ in physical["arg_plan"])
+            assert all(kind in {"buffer", "tma_buffer", "workspace", "parameter", "grid"} for kind, _ in physical["arg_plan"])
             assert len(physical.get("grid", ["num_queries", 1, 1])) == 3
 
 
