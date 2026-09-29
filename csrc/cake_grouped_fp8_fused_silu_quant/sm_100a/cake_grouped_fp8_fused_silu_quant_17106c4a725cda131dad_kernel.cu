@@ -624,7 +624,7 @@ __device__ __forceinline__ float2 fma_sub_f32x2_rp_ftz(float2 a, float2 b, float
 extern "C" {
 
 __global__ __launch_bounds__(128) void
-kernel_cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405(const __nv_bfloat16* __restrict__ y, uint8_t* __restrict__ out_q, float* __restrict__ out_s, int M, int H)
+kernel_cake_grouped_fp8_fused_silu_quant_17106c4a725cda131dad(const __nv_bfloat16* __restrict__ y, uint8_t* __restrict__ out_q, float* __restrict__ out_s, int M, int H)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
