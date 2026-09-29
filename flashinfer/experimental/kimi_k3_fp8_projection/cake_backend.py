@@ -547,8 +547,10 @@ def decode_config(
         )
     if mc > 1 and m_tiles % mc:
         # A bucket spans row counts with different m-tile counts (the 256 bucket serves M = 65..256 at t128): rows without
-        # whole m-tile groups take the same route without the multicast cluster (host mirror of the Cake rule).
+        # whole m-tile groups take the plain instance of the route (no multicast cluster, no prefetch; host mirror of the
+        # Cake rule -- the exported program set only carries the instances the contract rows exercise).
         mc = 1
+        pf = 0
     total_work = tiles * split if mc == 1 else int(n_tiles128) * (m_tiles // mc)
     # Table key ``grid`` (round 4): a balanced persistent CTA count (e.g. 128 CTAs for 256 work items) instead of one
     # CTA per SM; the round-4 A/B of the 16384-row buckets preferred 128 x 2 items over 148 x 1.73.
@@ -997,10 +999,12 @@ def route_plan(
             if gemm_reg_staged
             else GEMM_KERNEL_KEY
         )
-        gpf = gemm_prefetch_distance(
-            M, prepared.n_tiles128, prepared.num_k_iters, arch
+        gpf = (
+            gemm_prefetch_distance(M, prepared.n_tiles128, prepared.num_k_iters, arch)
+            if gemm_tma_store
+            else 0
         )
-        # round 6 (lever GP): the prefetching program when it is registered for this epilogue, else the plain one
+        # round 6 (lever GP): the prefetching program ships with the TMA-store epilogue only (Cake rule); use it when registered
         key = gemm_kernel_key(base, gpf)
         kernels.append(key if gpf and route_available(arch, (key,)) else base)
         grids.append(_gemm_grid(_m_tiles(M), prepared.n_tiles))
