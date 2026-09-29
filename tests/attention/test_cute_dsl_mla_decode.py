@@ -1114,7 +1114,7 @@ def test_nonpersistent_grid_y_limit():
 
 
 def test_mla_reducer_d_tile_selection():
-    """Use output bands only when they shorten an underfilled reducer wave."""
+    """Split output rows into two D bands only while the grid stays small."""
     if not is_cute_dsl_available():
         pytest.skip("CuTe DSL not available")
 
@@ -1122,20 +1122,41 @@ def test_mla_reducer_d_tile_selection():
         _get_reducer_d_tiles,
     )
 
-    # B1/H32 and B1/H96 use D4; B1/H64 uses D2. H128 already fills a wave.
-    assert _get_reducer_d_tiles(1, 1, 32, 148, 32) == 4
-    assert _get_reducer_d_tiles(1, 1, 64, 148, 32) == 2
-    assert _get_reducer_d_tiles(1, 1, 96, 148, 32) == 4
-    # Prefer the smaller tied topology and avoid duplication once rows fill a wave.
-    assert _get_reducer_d_tiles(1, 1, 48, 148, 32) == 2
-    assert _get_reducer_d_tiles(1, 1, 128, 148, 32) == 1
+    assert _get_reducer_d_tiles(1, 1, 12, 212, 48) == 2
+    assert _get_reducer_d_tiles(1, 1, 48, 212, 48) == 2
+    assert _get_reducer_d_tiles(1, 1, 32, 148, 32) == 2
+    assert _get_reducer_d_tiles(1, 8, 12, 212, 48) == 1
+    assert _get_reducer_d_tiles(1, 1, 128, 212, 48) == 1
     assert _get_reducer_d_tiles(4, 1, 96, 148, 32) == 1
     assert _get_reducer_d_tiles(1, 1, 96, 0, 32) == 1
-    # Do not duplicate LSE work when a short sequence exposes too few splits.
-    assert _get_reducer_d_tiles(1, 1, 96, 148, 1) == 1
-    assert _get_reducer_d_tiles(1, 1, 24, 148, 2) == 2
+    # Do not duplicate LSE work when a short sequence exposes a single split.
+    assert _get_reducer_d_tiles(1, 1, 12, 212, 1) == 1
     # Variable-Q reducers still launch their rectangular B x max_q_len grid.
     assert _get_reducer_d_tiles(148, 8, 96, 148, 32) == 1
+
+
+def test_mla_split_kv_cap():
+    """Low-occupancy decode splits KV up to the static reducer capacity."""
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode import (
+        _STATIC_REDUCER_MAX_SPLITS,
+        _get_reducer_max_splits,
+        _get_split_kv_and_workspace_size,
+    )
+
+    assert _STATIC_REDUCER_MAX_SPLITS == 48
+    assert [_get_reducer_max_splits(s) for s in (1, 2, 3, 5, 13, 26, 32, 33, 48)] == [
+        4, 4, 4, 8, 16, 32, 32, 48, 48,
+    ]
+    assert _get_split_kv_and_workspace_size(1, 8, 12, 512, 212)[0] == 48
+    assert _get_split_kv_and_workspace_size(2, 1, 128, 512, 212)[0] == 48
+    assert _get_split_kv_and_workspace_size(4, 1, 128, 512, 212)[0] == 26
+    # A known short max_seq_len still trims empty splits.
+    assert (
+        _get_split_kv_and_workspace_size(1, 1, 12, 512, 212, max_seq_len=4096)[0] == 32
+    )
 
 
 @pytest.mark.parametrize(
