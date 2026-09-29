@@ -1235,6 +1235,9 @@ def _resolve_dsv4_sparse_mla_backend(
 ) -> Literal["trtllm-gen", "cute-dsl", "sparse", "cake"]:
     cc = get_compute_capability(device)
     is_sm100_family = cc in ((10, 0), (10, 3), (10, 7))
+    # CuTe DSL HCA and the SM100 CAKE kernels require SM100/SM103;
+    # only the prebuilt cubin backend additionally covers SM107.
+    is_sm100_or_sm103 = cc in ((10, 0), (10, 3))
     is_sm120_family = cc in ((12, 0), (12, 1))
     if requested_backend == "auto":
         if is_sm120_family:
@@ -1254,9 +1257,11 @@ def _resolve_dsv4_sparse_mla_backend(
         raise ValueError(
             f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
+    if requested_backend == "cute-dsl" and not is_sm100_or_sm103:
+        raise ValueError(f"backend='cute-dsl' requires SM100/SM103, got SM{cc[0]}{cc[1]}")
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
-    if requested_backend == "cake" and not (is_sm100_family or is_sm120_family):
+    if requested_backend == "cake" and not (is_sm100_or_sm103 or is_sm120_family):
         raise ValueError(
             f"backend='cake' requires SM100/SM103 or SM120/SM121, got SM{cc[0]}{cc[1]}"
         )

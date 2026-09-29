@@ -195,6 +195,7 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
         == "trtllm-gen"
     )
+    sm100_default = mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
     assert (
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
         == "cute-dsl"
@@ -213,6 +214,27 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
     with pytest.raises(ValueError, match="requires SM100/SM103"):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
+
+    monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 7))
+    sm107_default = mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
+    assert sm107_default == sm100_default
+    assert (
+        mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), sm100_default)
+        == sm100_default
+    )
+    with pytest.raises(ValueError, match="requires SM100/SM103, got SM107"):
+        mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
+    with pytest.raises(
+        ValueError, match="requires SM100/SM103 or SM120/SM121, got SM107"
+    ):
+        mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cake")
+
+    for cc in ((10, 0), (10, 3), (12, 0), (12, 1)):
+        monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: cc)
+        assert (
+            mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cake")
+            == "cake"
+        )
 
 
 @pytest.mark.parametrize(
