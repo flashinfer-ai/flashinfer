@@ -29,7 +29,7 @@ from ..cache import (
 )
 from ..capabilities import require_compiler
 from ..shortlist import _read, select
-from . import runtime
+from . import runtime, fma
 from .support import is_eligible
 
 _WEIGHT_KEYS = (
@@ -40,7 +40,7 @@ _WEIGHT_KEYS = (
     "fc1_input_scale",
     "fc2_input_scale",
 )
-_TAG = "cudnn_frost-mxfp8_mxfp4-moe-v1"
+_TAG = "cudnn_frost-mxfp8_mxfp4-moe-v2"
 
 
 def _tensor_version(tensor):
@@ -60,7 +60,7 @@ def _module(arch):
     if arch != "sm_107a":
         raise ValueError("cuDNN Frost MXFP8 × MXFP4 MoE kernels require SM107a")
     return gen_jit_spec(
-        f"cudnn_frost_mxfp8_mxfp4_moe_v1_{arch}",
+        f"cudnn_frost_mxfp8_mxfp4_moe_v2_{arch}",
         [Path(__file__).parent.parent / "csrc" / "moe_mxfp8_mxfp4.cu"],
         extra_cuda_cflags=sm107a_nvcc_flags,
     ).build_and_load()
@@ -70,12 +70,14 @@ def _artifact_roots():
     return (common.artifact_root("mxfp8_mxfp4"),)
 
 
-def _kernels(rows, hidden, intermediate, experts, device, activation):
+def _kernels(
+    rows, hidden, intermediate, experts, device, activation, *, quantized_output=False
+):
     name = activation_name(activation)
     arch = common._arch_for(device)
     first, second = [], []
     for root in _artifact_roots():
-        for kernel in runtime.discover(root):
+        for kernel in runtime.discover(root, quantized_output=quantized_output):
             n, k = (intermediate, hidden) if kernel.fc1 else (hidden, intermediate)
             dims = dict(s=rows, n=n, k=k, experts=experts, groups=experts)
             if kernel.arch != arch or not all(
@@ -108,9 +110,39 @@ def _selected_kernels(tokens, hidden, intermediate, experts, topk, device, activ
     first, second = _kernels(
         tokens * topk, hidden, intermediate, experts, device, activation
     )
-    return select(
+    first, second = select(
         roots, arch, name, tokens, hidden, intermediate, experts, topk, first, second
     )
+    fused, _ = _kernels(
+        tokens * topk,
+        hidden,
+        intermediate,
+        experts,
+        device,
+        activation,
+        quantized_output=True,
+    )
+    tiles = {kernel.tactic_metadata["tile"] for kernel in first}
+    # Retain the measured unfused choices: fusion can trade mainloop overlap
+    # for fewer launches. Include available data-store modes in full-pipeline tuning;
+    # the fused scale output uses STG in both variants.
+    variants = tuple(
+        kernel for kernel in fused if kernel.tactic_metadata["tile"] in tiles
+    )
+    return first + variants, second
+
+
+def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation):
+    if not fma.supported(
+        tokens, hidden, intermediate, experts, topk, activation_name(activation)
+    ):
+        return None
+    try:
+        fma.check_support(activation_name(activation))
+    except NotImplementedError:
+        # An older DSL can still run the existing Tensor Core candidates.
+        return None
+    return fma.tactic(activation_name(activation))
 
 
 class _Inputs(list):
@@ -133,6 +165,7 @@ class _Plans:
         second,
         workspace_pool,
         swizzled=False,
+        fma_tactic=None,
     ):
         self.plans, self.launches = {}, {}
         required = 0
@@ -151,15 +184,44 @@ class _Plans:
                 a.workspace_bytes,
                 b.workspace_bytes,
                 a.gated,
-                [
-                    {"output": -1, "scale": 0, "gate_scale": 1, "linear_scale": 2}[name]
-                    for name in a.launch_tail
-                ],
+                [runtime._TAIL_SLOTS[name] for name in a.launch_tail],
                 a.swap_ab,
                 b.swap_ab,
                 swizzled,
+                False,
             )
             self.plans[key], self.launches[key] = plan, plan["run"]
+            required = max(required, plan["workspace_size"]())
+        if fma_tactic is not None:
+            fc1, fc2 = fma.build(
+                tokens,
+                hidden,
+                intermediate,
+                experts,
+                topk,
+                device,
+                swizzled,
+                fma_tactic[1],
+            )
+            plan = module.make_plan(
+                fc1,
+                fc2,
+                tokens,
+                hidden,
+                intermediate,
+                experts,
+                topk,
+                device.index,
+                0,
+                0,
+                first[0].gated,
+                [],
+                False,
+                False,
+                swizzled,
+                True,
+            )
+            self.plans[fma_tactic], self.launches[fma_tactic] = plan, plan["run"]
             required = max(required, plan["workspace_size"]())
         capacity = min((size for size in workspace_pool if size >= required), default=0)
         if not capacity:
@@ -173,10 +235,12 @@ class _Plans:
 def prepared_stage_inputs(inputs, *, tactic=None):
     """Expose grouped inputs from a prepared call for offline stage measurements.
 
-    Executes routing, FC1, and the exact native intermediate quantizer. The
+    Executes routing, FC1, and intermediate quantization. Fused plans omit
+    the BF16 ``fc1_output`` view. The
     returned views borrow the plan workspace and are overwritten by another
     invocation; copy them before running the complete pipeline. Prepare and call
-    this measurement helper outside CUDA Graph capture.
+    this measurement helper outside CUDA Graph capture. FMA plans reject this
+    helper because their intermediate tensors remain in token/slot order.
     """
     state = inputs.launch_state
     plan = state.plans[next(iter(state.plans)) if tactic is None else tactic]
@@ -192,18 +256,21 @@ def prepared_stage_inputs(inputs, *, tactic=None):
         size = torch.empty((), dtype=dtype).element_size()
         return raw[start : start + count * size].view(dtype).view(shape)
 
-    return {
+    result = {
         "fc1_tokens": view(xp, s * h, torch.float8_e4m3fn, (s, h)),
         "fc1_token_scales": view(sp1, sf_rows * h // 32, torch.uint8, (-1,)),
-        "fc1_output": view(mp, s * i, torch.bfloat16, (s, i)),
         "fc2_tokens": view(qp, s * i, torch.float8_e4m3fn, (s, i)),
         "fc2_token_scales": view(sp2, sf_rows * i // 32, torch.uint8, (-1,)),
         "offsets": view(op, e, torch.int32, (e,)),
     }
 
+    if mp >= 0:
+        result["fc1_output"] = view(mp, s * i, torch.bfloat16, (s, i))
+    return result
+
 
 class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
-    """Four measured FC1/FC2 combinations per supported problem-size bucket.
+    """Measured FC1/FC2 choices and their fused FC1 quantization variants.
 
     Prepared weight scales are static during CUDA Graph replay. Updating an
     ordinary scale tensor and calling ``pack_inputs`` again refreshes its
@@ -247,7 +314,8 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
                 {
                     (kernel.source_path, kernel.source_sha256)
                     for root in _artifact_roots()
-                    for kernel in runtime.discover(root)
+                    for quantized in (False, True)
+                    for kernel in runtime.discover(root, quantized_output=quantized)
                     if kernel.arch == "sm_107a"
                     and (not kernel.fc1 or kernel.activation == name)
                 }
@@ -383,7 +451,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         first, second = _selected_kernels(
             t, h, i, e, k, self.device, self.config.activation
         )
-        return len(first) == len(second) == 2
+        return 2 <= len(first) <= 6 and len(second) == 2
 
     def pack_inputs(self, act, weights):
         self._require_built()
@@ -408,10 +476,11 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
         first, second = _selected_kernels(
             t, h, i, e, k, self.device, self.config.activation
         )
-        if len(first) != 2 or len(second) != 2:
+        if not (2 <= len(first) <= 6 and len(second) == 2):
             raise ValueError(
                 "No measured two-by-two cuDNN Frost MXFP8 × MXFP4 shortlist for this problem"
             )
+        fma_tactic = _fma_tactic(t, h, i, e, k, self.config.activation)
         key = (
             t,
             h,
@@ -420,6 +489,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
             k,
             tuple(a.tactic for a in first),
             tuple(b.tactic for b in second),
+            fma_tactic,
         )
         if key not in self._plans:
             with torch.cuda.device(self.device):
@@ -438,6 +508,7 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
                     second,
                     self._workspace_pool,
                     self.config.quant.swizzled_scale_factors is True,
+                    fma_tactic,
                 )
         output = torch.empty((t, h), dtype=torch.bfloat16, device=self.device)
         ids, scores = act.topk_ids, act.topk_weights
@@ -474,7 +545,18 @@ class CudnnFrostMxfp8Mxfp4MoeRunner(MoERunner):
             self.device,
             self.config.activation,
         )
-        return [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
+        tactics = [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
+        fma_tactic = _fma_tactic(
+            tokens,
+            hidden,
+            self.config.experts.intermediate_size,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            self.config.activation,
+        )
+        if fma_tactic is not None:
+            tactics.append(fma_tactic)
+        return tactics
 
     def get_cache_key_extras(self, inputs):
         return super().get_cache_key_extras(inputs) + (

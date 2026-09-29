@@ -1233,6 +1233,48 @@ def _normalize_scale(value: float | torch.Tensor, name: str) -> float:
     return result
 
 
+# (qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, num_heads) tuples with generated programs.
+DENSE_DIMENSION_TUPLES = frozenset(
+    {
+        (128, 512, 64, 128),
+        (128, 512, 64, 64),
+        (64, 256, 64, 32),
+        (512, 512, 64, 128),
+    }
+)
+TOPK_DIMENSION_TUPLES = frozenset(
+    {
+        (128, 512, 64, 128),
+        (128, 512, 64, 64),
+        (192, 512, 64, 128),
+        (192, 512, 64, 64),
+    }
+)
+
+
+def supports_dimension_tuple(
+    qk_nope_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    num_heads: int,
+    sparse_mla_top_k: int = 0,
+) -> bool:
+    """Whether this backend has a generated program for the dimension tuple.
+
+    ``backend="cake"`` dispatch uses this to leave other MLA families (for example the
+    Kimi-K3 FP8 paged-cache route, ``flashinfer.mla.cake_kimi_k3_mla``) to their own kernels.
+    """
+    key = (
+        int(qk_nope_head_dim),
+        int(kv_lora_rank),
+        int(qk_rope_head_dim),
+        int(num_heads),
+    )
+    if int(sparse_mla_top_k) > 0:
+        return key in TOPK_DIMENSION_TUPLES
+    return key in DENSE_DIMENSION_TUPLES
+
+
 def trtllm_mla_blackwell_decode(
     query: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -1380,29 +1422,9 @@ def trtllm_mla_blackwell_decode(
     num_heads = int(query.shape[-2])
     qk_dim = int(query.shape[-1])
     value_dim = int(kv_lora_rank)
-    valid_dense = sparse_mla_top_k == 0 and (
-        qk_nope_head_dim,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        num_heads,
-    ) in {
-        (128, 512, 64, 128),
-        (128, 512, 64, 64),
-        (64, 256, 64, 32),
-        (512, 512, 64, 128),
-    }
-    valid_topk = sparse_mla_top_k > 0 and (
-        qk_nope_head_dim,
-        kv_lora_rank,
-        qk_rope_head_dim,
-        num_heads,
-    ) in {
-        (128, 512, 64, 128),
-        (128, 512, 64, 64),
-        (192, 512, 64, 128),
-        (192, 512, 64, 64),
-    }
-    if not valid_dense and not valid_topk:
+    if not supports_dimension_tuple(
+        qk_nope_head_dim, kv_lora_rank, qk_rope_head_dim, num_heads, sparse_mla_top_k
+    ):
         raise ValueError("unsupported TRT-LLM MLA Blackwell dimension tuple")
     if qk_dim != kv_lora_rank + qk_rope_head_dim:
         raise ValueError("query width must equal kv_lora_rank + qk_rope_head_dim")

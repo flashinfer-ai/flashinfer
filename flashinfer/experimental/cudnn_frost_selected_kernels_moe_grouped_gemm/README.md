@@ -90,6 +90,29 @@ construction. The root `support.py` contains the shared model/top-k and token-ra
 policy. BF16 also provides its standalone `fc2.py`; MXFP8's grouped FC1 and FC2 share the same
 block-scale runtime.
 
+BF16 additionally offers an independent FMA tactic for all ten default activations
+on SM107a: E64/H2048/I1408/K6 at T=1..4, and E12/H7168/I3072/K2 at T=1. Full-pipeline
+autotuning compares it with the existing Tensor Core candidates. FC1 reads
+original tokens and routing IDs, computes BF16 products with FP32 FMA
+accumulation, and writes a route-ordered BF16 activation intermediate. FC2 preserves
+each expert's BF16 output boundary, then performs FP32 routing weighting and
+slot-ordered reduction inside the same kernel. The complete path launches two
+kernels without separate routing, gather, or finalize launches. FC1 computes
+two outputs per warp at T=1 and four at T=2..4. Other shapes retain their
+existing Tensor Core candidates. The `bf16/fma*.py` sources use
+the shared persistent JIT cache, external PTXAS and graph resource retention.
+
+All four FMA dtype paths share `fma_activations.py`. FC1 specializes the activation
+at compile time; non-gated variants omit gate weight/scale loads and the second
+dot product. FC1 compilation and tactic identities include the activation, while
+FC2's compiled source is shared across activations. The supported contracts are
+`SwiGLU`, `GeGLU`, `GeGLUTanh`, `SwiGLUStep`, `SiTU`, `Identity`, `ReLU`, `ReLU2`,
+`SiLU` and `GELU`, with their default parameters. GeGLU/GELU use erf, and
+GeGLUTanh uses the tanh approximation. SwiGLUStep clamps after SiLU; SiTU
+transforms both up and gate. Activation runs in FP32, followed by BF16 rounding
+and, for quantized paths, intermediate quantization. Existing restrictions on
+custom activation parameters and per-expert overrides still apply.
+
 ## Artifact layout
 
 Artifacts are grouped by operand dtype under a common root:
@@ -152,6 +175,20 @@ eligible backends. Intermediate token counts use the next measured profile;
 native plans use the exact input shape. Calls beyond the largest token profile
 or without a matching table entry retain their original candidates.
 
+All ten default activations additionally offer an independent small-token FMA
+tactic on SM107a: E64/H2048/I1408/K6 at T=1..4, and E12/H7168/I3072/K2 at T=1.
+FC1 directly reads the original tokens and routing IDs, computes block32
+products with FP32 FMA accumulation, and fuses activation, BF16 rounding and MXFP8
+requantization. Each CTA produces one complete 32-element quantization block.
+FC2 consumes this route-ordered intermediate, preserves each expert's BF16
+output boundary, and fuses FP32 routing weighting and slot-ordered reduction.
+The complete path launches two kernels. It accepts linear and F8_128x4 input
+scales, including the minimum E8M0 scale, and retains the Tensor Core tactics
+for full-pipeline autotuning. Other shapes retain their existing candidates.
+`prepared_stage_inputs` rejects the FMA tactic because it has no grouped views.
+The `mxfp8/fma*.py` sources share the persistent JIT cache, external PTXAS and
+graph resource retention used by the other FMA paths.
+
 Prepare and autotune outside CUDA Graph capture. Activation data, activation
 scales, expert ids and routing weights may change between graph replays.
 Prepared weights and weight scales must remain static. For ordinary tensors,
@@ -177,8 +214,9 @@ each call. `bf16.runtime.clear_artifact_cache()` invalidates this metadata when
 refreshing artifacts. Measure ordinary warm calls separately from CUDA Graph
 replay, which bypasses Python admission and packing.
 
-The `artifacts/mxfp8/` pool retains 169 selected configurations in 39 source
-templates, with 400 measured two-by-two profiles. The offline pool covers all
+The `artifacts/mxfp8/` pool retains 169 selected BF16-output configurations in
+39 source templates, with 400 measured two-by-two profiles. It also includes
+111 fused FC1 configurations in twenty templates (60 STG and 51 TMA). The offline pool covers all
 44 families: ten FC1 activations and one shared FC2, each with normal/swap-AB
 and STG/TMA output variants. Only families used by the selected profiles ship.
 Geometry records share these templates. CTA/MMA/cluster geometry,
@@ -210,6 +248,17 @@ python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.
   --s 1024 --n 256 --k 128 --experts 8 \
   --output-dir "$ARTIFACT_DIR" --cudnn-frost-revision "$FROST_REVISION"
 ```
+
+Add `--quantize-output` for normal FC1 with fused MXFP8 quantization, using
+`--store-mode stg` or `--store-mode tma`. These variants retain a 32-element
+epilogue and explicit BF16 rounding before block32 quantization. Data stores
+use STG or TMA; E8M0 scales use STG in segmented F8_128x4 layout. Scale
+conversion rounds upward, and normalization honors byte zero as `2^-127`.
+The fused path removes the BF16 intermediate buffer and standalone quantizer.
+The runner keeps the original two FC1 choices and adds available fused variants
+of their normal geometries, paired with the same two FC2 choices. Autotuning
+measures up to twelve complete pipelines because fusion need not win for every
+shape. Standalone grouped preparation still accepts BF16-output kernels only.
 
 Use `--op grouped_gemm2` for FC2. Changing geometry while retaining the same
 operation, dtype, orientation and output store reuses the source file; an
@@ -278,7 +327,7 @@ python benchmarks/bench_cudnn_frost_moe_mxfp8.py benchmark \
   --routing uniform --verify-locked-clocks --output "$RESULT_DIR/mxfp8_e2e.jsonl"
 ```
 
-The benchmark preserves the original backend tactics, checks all four Frost
+The benchmark preserves the original backend tactics, checks all Frost
 plans eagerly and through CUDA Graph replay, and records actual autotune winners.
 It alternates timing order over batched graph replays and reports numerical
 error, raw timings and GPU telemetry. Use `--artifacts DIR` to benchmark another
@@ -325,9 +374,51 @@ corresponding NVFP4 × NVFP4 pipeline and `cudnn_frost_nvfp4` automatic
 candidate. Both operands contain two E2M1 values per byte, with E4M3 block
 scales per 16 logical K elements. Logical N and K must be divisible by 128;
 packing halves the tensor's last storage dimension, not its logical K.
-Both grouped stages produce BF16. The native pipeline gathers packed inputs,
-runs fused FC1/activation, requantizes the intermediate to NVFP4, runs FC2,
-and reduces routed outputs in FP32 before the final BF16 conversion.
+The native pipeline gathers packed inputs, runs FC1/activation and intermediate
+NVFP4 quantization, runs FC2 with BF16 output, and reduces routed outputs in
+FP32 before the final BF16 conversion.
+
+Normal-orientation FC1 also has a fused quantization variant. Its graph marks
+the post-activation intermediate as BF16 before applying the FP32 global
+quantization scale. Frost preserves that BF16 conversion in registers, then
+writes packed E2M1 data and expert-segmented E4M3 scales directly for FC2.
+The data output has STG and TMA variants; the scale output uses STG in both.
+This removes the BF16 intermediate write/read and the standalone quantization
+launch. Blocks whose E4M3 scale underflows to zero may have different FP4 codes
+from the standalone quantizer, but both dequantize to zero.
+
+The measured two FC1 and two FC2 choices remain available. Their normal FC1
+geometries additionally contribute fused STG variants and, where Frost uses a
+32-element epilogue, fused TMA variants, for up to twelve full-pipeline tactics.
+Online tuning compares complete MoE calls because fusion can affect GEMM overlap.
+Swap-AB FC1 retains its
+separate quantizer; packed FP4 output in that orientation is not enabled.
+The standalone grouped API continues to return BF16.
+
+All ten default activations also offer one independent small-token NVFP4 FMA
+tactic on SM107a: E64/H2048/I1408/K6 at T=1..4, and E12/H7168/I3072/K2 at T=1. The existing
+Tensor Core candidates remain available to full-pipeline autotuning. Other
+geometries retain their existing candidate sets.
+
+This tactic launches two kernels. FC1 reads the original input and routing IDs,
+computes the required up/gate branches, applies activation and BF16 rounding,
+then writes NVFP4 data and one F8_128x4 scale segment per route. FC2 consumes
+those segments and combines
+the expert results in top-k slot order, preserving each expert's BF16 output
+boundary before FP32 weighting/reduction and final BF16 conversion. Both
+kernels decode FP4 in registers, use FP16 vector arithmetic for short dot
+products, and use FP32 for block scaling, accumulation and warp reductions.
+They do not materialize grouped inputs or a BF16 intermediate in global memory.
+`prepared_stage_inputs` rejects this tactic because its workspace is route-ordered.
+
+The FMA sources in `nvfp4/fma_fc*.py` follow the tiny-MoE algorithm from
+[PR #4](https://github.com/YangXu1990uiuc/flashinfer/pull/4). FC1's `_o2` and
+`_o4` variants compute two and four intermediate outputs per warp, respectively.
+`nvfp4/fma.py`
+specializes their shapes and uses the same source verification, external PTXAS,
+and persistent compilation path as the frozen Tensor Core kernels. Conversion
+helpers and the native adapter participate in source/tactic identities. Compiled
+functions remain owned by the native plan and retained during CUDA Graph replay.
 
 The runner consumes the canonical `cutlass_nvfp4` weight view. Activation
 scales may use linear or F8_128x4 layout. FC1 dequantization multiplies the
@@ -352,13 +443,21 @@ present, Frost reuses it without another
 copy; otherwise, retaining it alongside other backend views consumes
 additional weight memory. Frost does not convert other backends' views.
 
-`artifacts/nvfp4/` retains 154 selected configurations in 34 geometry-parameterized
-source templates and 400 measured two-by-two profiles. The offline sweep
+`artifacts/nvfp4/` retains 154 selected BF16-output configurations in 34
+geometry-parameterized source templates and 400 measured two-by-two profiles.
+It also contains 98 fused FC1 configurations (53 STG and 45 TMA) in twenty
+additional source templates, using the normal FC1 geometries from those profiles.
+Fused TMA templates retain only the 32-element epilogue drain. The offline sweep
 covers all 44 operation/orientation/store families, including every default
 gated and non-gated activation and the shared FC2. Only templates referenced
 by the selected profiles are packaged.
 
-Use `--dtype nvfp4` with the shared exporter. The corresponding stage and
+Use `--dtype nvfp4` with the shared exporter; add `--quantize-output` and
+`--store-mode stg` or `--store-mode tma` for a normal FC1 quantization variant.
+Export requires a Frost producer whose
+grouped scale-output ABI supports dynamic allocation extents. cuDNN remains an
+offline dependency; the frozen sources contain that ABI.
+The corresponding stage and
 full-layer benchmark is `benchmarks/bench_cudnn_frost_moe_nvfp4.py`, with
 the same command-line structure as the MXFP8 benchmark. Its default input
 standard deviation is 1.0: tiny inputs combined with unit global scales
@@ -376,7 +475,16 @@ tactic pool and including GPU work performed by `pack_inputs`.
 `cudnn_frost_mxfp8_mxfp4` automatic candidate. Activations use E4M3 data;
 weights pack two E2M1 values per byte. Both operands use E8M0 block scales
 per 32 logical K elements. Logical N and K must be divisible by 128.
-FC1/activation and FC2 produce BF16, with MXFP8 intermediate requantization.
+FC1 rounds its activation to BF16 before MXFP8 intermediate quantization;
+FC2 produces BF16. Normal FC1 also supports the fused STG/TMA variants
+described for MXFP8 above, with the same E8M0 block32 scale contract.
+
+The same small-token FMA tactic is available for the geometries listed in the
+MXFP8 section. `mxfp8_mxfp4/fma.py` specializes the shared `mxfp8/fma*.py`
+kernels for packed E2M1 weights. Both MX paths use FP32 dot-product accumulation:
+unscaled E4M3 products or block sums can overflow FP16 before the E8M0 scales
+are applied. Their intermediate quantization and finalized output contracts
+match the existing Tensor Core paths.
 
 The runner reuses the canonical `cutlass_mxfp8_mxfp4` weight view, including
 its packed weights, F8_128x4 scales and unit input multipliers. Input scales
@@ -391,8 +499,10 @@ backend list. Automatic Frost candidates are added when the layer is called.
 The quantization configuration uses
 `QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)`.
 
-`artifacts/mxfp8_mxfp4/` retains 169 selected configurations in 42
+`artifacts/mxfp8_mxfp4/` retains 169 selected BF16-output configurations in 42
 geometry-parameterized source templates and 400 measured two-by-two profiles.
+It also includes 101 fused FC1 configurations in twenty templates (52 STG and
+49 TMA).
 The offline pool covers all 44 operation/orientation/store families.
 
 Use `--dtype mxfp8_mxfp4` with the shared exporter and

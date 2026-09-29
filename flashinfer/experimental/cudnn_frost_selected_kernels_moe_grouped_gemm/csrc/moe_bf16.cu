@@ -161,7 +161,7 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
   CudnnFrostMoePlan(Function fc1, Function fc2, int64_t tokens, int64_t hidden,
                     int64_t intermediate, int64_t experts, int64_t topk, int device,
                     size_t scratch1, size_t scratch2, bool gated, Array<int64_t> tail, bool swap1,
-                    bool swap2)
+                    bool swap2, bool fma)
       : fc1_(std::move(fc1)),
         fc2_(std::move(fc2)),
         t_(tokens),
@@ -177,6 +177,7 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
         tail_(std::move(tail)),
         swap1_(swap1),
         swap2_(swap2),
+        fma_(fma),
         problem1_{s_, i_,          h_, e_, e_,          h_, 1, s_ * h_, h_,
                   1,  2 * i_ * h_, h_, 1,  2 * i_ * h_, i_, 1, s_ * i_},
         problem2_{s_, h_, i_, e_, e_, i_, 1, s_ * i_, i_, 1, h_ * i_, h_, 1, s_ * h_} {
@@ -198,15 +199,15 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
       pos += align128(bytes);
       return start;
     };
-    x_pos_ = reserve(s_ * h_ * 2);
+    x_pos_ = reserve(fma_ ? 0 : s_ * h_ * 2);
     mid_pos_ = reserve(s_ * i_ * 2);
     // FC1 has finished consuming grouped tokens before FC2 writes its output.
     y_pos_ = x_pos_;
-    counts_pos_ = reserve(e_ * 4);
-    offsets_pos_ = reserve(e_ * 4);
-    cursors_pos_ = reserve(e_ * 4);
-    mapping_pos_ = reserve(s_ * 4);
-    scale_pos_ = reserve(3 * sizeof(float));
+    counts_pos_ = reserve(fma_ ? 0 : e_ * 4);
+    offsets_pos_ = reserve(fma_ ? 0 : e_ * 4);
+    cursors_pos_ = reserve(fma_ ? 0 : e_ * 4);
+    mapping_pos_ = reserve(fma_ ? 0 : s_ * 4);
+    scale_pos_ = reserve(fma_ ? 0 : 3 * sizeof(float));
     scratch_pos_ = reserve(std::max(scratch1_, scratch2_));
     workspace_size_ = pos;
   }
@@ -237,6 +238,14 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
     ffi::CUDADeviceGuard guard(device_.device_id);
     auto stream = get_stream(device_);
     auto base = static_cast<char*>(workspace.data_ptr());
+    if (fma_) {
+      int64_t shape[]{s_, i_}, stride[]{i_, 1};
+      DLTensor mid{base + mid_pos_, device_, 2, dl_bfloat16, shape, stride, 0};
+      fc1_(x, w1, ids, TensorView(&mid), static_cast<void*>(stream));
+      fc2_(TensorView(&mid), w2, ids, scores, out, static_cast<void*>(stream));
+      checked(cudaGetLastError());
+      return;
+    }
     auto gx = reinterpret_cast<__nv_bfloat16*>(base + x_pos_);
     auto mid = reinterpret_cast<__nv_bfloat16*>(base + mid_pos_);
     auto gy = reinterpret_cast<__nv_bfloat16*>(base + y_pos_);
@@ -328,7 +337,7 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
   size_t scratch1_, scratch2_;
   bool gated_;
   Array<int64_t> tail_;
-  bool swap1_, swap2_;
+  bool swap1_, swap2_, fma_;
   Array<int64_t> problem1_, problem2_;
   size_t x_pos_, mid_pos_, y_pos_, counts_pos_, offsets_pos_, cursors_pos_, mapping_pos_,
       scale_pos_, scratch_pos_, workspace_size_;
@@ -336,7 +345,7 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
 
 Module make_plan(Function fc1, Function fc2, int64_t tokens, int64_t hidden, int64_t intermediate,
                  int64_t experts, int64_t topk, int64_t device, int64_t scratch1, int64_t scratch2,
-                 bool gated, Array<int64_t> tail, bool swap1, bool swap2) {
+                 bool gated, Array<int64_t> tail, bool swap1, bool swap2, bool fma) {
   // Limit the private ABI to practical int32-indexed dimensions and avoid
   // overflow in the workspace/launch descriptors even for malformed callers.
   constexpr int64_t max_dim = 1 << 20;
@@ -346,17 +355,24 @@ Module make_plan(Function fc1, Function fc2, int64_t tokens, int64_t hidden, int
   TVM_FFI_ICHECK_LE(tokens * topk, std::numeric_limits<int32_t>::max());
   TVM_FFI_ICHECK_EQ(hidden % 8, 0) << "cuDNN Frost MoE routing uses 128-bit BF16 packs";
   TVM_FFI_ICHECK(scratch1 >= 0 && scratch1 % 128 == 0 && scratch2 >= 0 && scratch2 % 128 == 0);
-  TVM_FFI_ICHECK(tail.size() == 2 || tail.size() == 4);
-  int mask = 0;
-  for (auto slot : tail) {
-    TVM_FFI_ICHECK(slot >= -1 && slot <= 2);
-    TVM_FFI_ICHECK_EQ(mask & (1 << (slot + 1)), 0);
-    mask |= 1 << (slot + 1);
+  if (fma) {
+    TVM_FFI_ICHECK(!swap1 && !swap2 && scratch1 == 0 && scratch2 == 0 && tail.empty());
+    TVM_FFI_ICHECK(
+        (experts == 64 && hidden == 2048 && intermediate == 1408 && topk == 6 && tokens <= 4) ||
+        (experts == 12 && hidden == 7168 && intermediate == 3072 && topk == 2 && tokens == 1));
+  } else {
+    TVM_FFI_ICHECK(tail.size() == 2 || tail.size() == 4);
+    int mask = 0;
+    for (auto slot : tail) {
+      TVM_FFI_ICHECK(slot >= -1 && slot <= 2);
+      TVM_FFI_ICHECK_EQ(mask & (1 << (slot + 1)), 0);
+      mask |= 1 << (slot + 1);
+    }
+    TVM_FFI_ICHECK(mask == 3 || mask == 15);
   }
-  TVM_FFI_ICHECK(mask == 3 || mask == 15);
   return Module(tvm::ffi::make_object<CudnnFrostMoePlan>(
       std::move(fc1), std::move(fc2), tokens, hidden, intermediate, experts, topk, device, scratch1,
-      scratch2, gated, std::move(tail), swap1, swap2));
+      scratch2, gated, std::move(tail), swap1, swap2, fma));
 }
 }  // namespace
 

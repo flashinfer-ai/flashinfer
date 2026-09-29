@@ -126,18 +126,16 @@ KV_SPLIT_MIN_GAIN = 0.03
 KV_SPLIT_MAX_WAVES = 4
 # Per-unit cost of the split-capable NVFP4 attention program relative to the
 # dense program, per (pv_mode, arch), measured with both programs on the same
-# plan: the sm_103a fp8pv split program runs 1.21x slower per unit on a
-# 33k-token plan and an effective 1.30-1.42x on the 48-58 block units of the
-# partial-wave rows (its block loop is rescheduled at the softmax register
-# budget; the per-unit prologue/epilogue is a larger share of a short unit),
-# so it carries 1.35: the 1.42-wave row stays dense, the 1.14-wave row still
-# splits. The sm_100a fp4pv split program costs 1.03x, the other two
-# combinations are at parity. A split
-# plan runs the split program on every unit, so the planner scales the split
-# candidates' makespan by this cost (mirrors the production planner's
-# ``SPLIT_PROGRAM_COST``).
+# unsplit plans (same node). sm_103a fp8pv is at 1.00-1.01x since the fp8
+# softmax body waits for the free P buffer after its exp2/pack block (before,
+# ptxas shared that wait's scoreboard with an exp2 result in the split program
+# and the first E4M3 pack waited for the previous PV drain: 1.21x per unit,
+# carried as 1.35). The sm_100a fp4pv split program costs 1.03x, the other two
+# combinations are at parity. A split plan runs the split program on every
+# unit, so the planner scales the split candidates' makespan by this cost
+# (mirrors the production planner's ``SPLIT_PROGRAM_COST``).
 SPLIT_PROGRAM_COST: dict[tuple[str, str], float] = {
-    ("fp8", "sm_103a"): 1.35,
+    ("fp8", "sm_103a"): 1.01,
     ("fp4", "sm_100a"): 1.03,
 }
 # Combine kernel: 128 threads = one warp per output row, four rows per CTA.
@@ -354,7 +352,7 @@ def bf16_grid_clusters(device: torch.device) -> int:
     return max(1, torch.cuda.get_device_properties(device).multi_processor_count // 2)
 
 
-def assign_unit_slots(unit_costs: Sequence[int], num_clusters: int) -> list[int]:
+def assign_unit_slots(unit_costs: Sequence[float], num_clusters: int) -> list[int]:
     """Longest-processing-time-first placement of units into persistent-grid slots.
 
     Slot ``k * num_clusters + i`` is the ``k``-th unit of cluster ``i``.  The
