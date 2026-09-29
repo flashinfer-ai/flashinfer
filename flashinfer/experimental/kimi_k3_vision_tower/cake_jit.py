@@ -39,8 +39,16 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   (``pos``, ``norm_qkv_rope``, ``residual_wo``, ``norm_gelu``,
 #   ``residual_fc1``, ``gelu_erf``, ``rmsnorm``) on the production tile
 #   configuration ``select_tile_config`` picks for the token count (the
-#   ``l_sk`` stream-K twin of the projector GEMMs inside its tile-census
-#   window);
+#   stream-K twins ``l_sk`` / ``m_sk`` inside their tile-census windows, the
+#   eight-warp 256 x 128 tiles ``m_e8`` / ``m_e8_cs`` of the norm GEMMs) in
+#   its production PDL form;
+# * ``gemm:<variant>:<tile>:pdle`` the same tile's ``PDL_EARLY`` binary
+#   (round 5: the grid-dependency wait moved into the load / epilogue roles
+#   so the first weight stages stream before it), which the host launches
+#   only inside the form's census window (``cake_backend.pdl_early_on``) and
+#   never on the stream-K / tail / multicast / ``pos`` tiles
+#   (``cake_backend.pdl_early_selected``); same kernel parameters, same
+#   numerics;
 # * ``attention:tiles2`` / ``attention:tiles1`` / ``attention:ring3``   the
 #   packed-varlen BF16 attention kernel in its two-tile and SPLIT_KV unit
 #   layouts (the host plan rule ``select_tiles_per_cta`` chooses per
@@ -2744,8 +2752,14 @@ ARCH_NVCC_FLAGS = {
 }
 
 
-def gemm_kernel_key(variant: str, tile: str) -> str:
-    return f"gemm:{variant}:{tile}"
+PDL_EARLY_KEY_SUFFIX = "pdle"
+
+
+def gemm_kernel_key(variant: str, tile: str, pdl_early: bool = False) -> str:
+    """``gemm:<variant>:<tile>`` for the production PDL binary of the tile, ``gemm:<variant>:<tile>:pdle``
+    for its PDL_EARLY binary (mirrors the Cake export adapter's ``gemm_kernel_key``)."""
+    key = f"gemm:{variant}:{tile}"
+    return f"{key}:{PDL_EARLY_KEY_SUFFIX}" if pdl_early else key
 
 
 def attention_kernel_key(tiles_per_cta: int, ring3: bool = False) -> str:
