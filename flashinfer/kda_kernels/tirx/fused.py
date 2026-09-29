@@ -1772,6 +1772,10 @@ def build_kernel(
                     for a in range(2):
                         r = ra if a == 0 else rb
                         va = tokA + a < nvalid
+                        gate_c = txl.local_scalar(
+                            "float32",
+                            init=txl.Select(va, txl.float32(GATE_C), txl.float32(0.0)),
+                        )
                         ld4u(g8, 0, tptr_off(gs_, r))
                         ld4u(qraw, 0, tptr_off(kqs, r + KQ_QQ_OFF))
                         ld4u(kraw, 0, tptr_off(kqs, r + KQ_K_OFF))
@@ -1786,20 +1790,8 @@ def build_kernel(
                             th1 = txl.local_scalar("float32")
                             txl.ptx.tanh.approx.f32(th0, x0)
                             txl.ptx.tanh.approx.f32(th1, x1)
-                            gl0, gl1 = ffma2f(
-                                th0,
-                                th1,
-                                txl.float32(GATE_C),
-                                txl.float32(GATE_C),
-                                txl.float32(GATE_C),
-                                txl.float32(GATE_C),
-                            )
-                            gl0 = txl.local_scalar(
-                                "float32", init=txl.Select(va, gl0, txl.float32(0.0))
-                            )
-                            gl1 = txl.local_scalar(
-                                "float32", init=txl.Select(va, gl1, txl.float32(0.0))
-                            )
+                            # rows past the sequence end get a zero log-decay: the mask is the FMA's constant
+                            gl0, gl1 = ffma2f(th0, th1, gate_c, gate_c, gate_c, gate_c)
 
                             gl0, gl1 = fadd2f(
                                 cY[8 * (1 - a) + 2 * p],
@@ -2029,21 +2021,19 @@ def build_kernel(
                         ld4u(qraw, 0, tptr_off(kqs, r + KQ_QQ_OFF))
                         ld4u(kraw, 0, tptr_off(kqs, r + KQ_K_OFF))
                         for p in range(4):
-                            x0 = txl.local_scalar(
-                                "float32", init=cX[a * 8 + 2 * p] + excl[2 * p]
+                            x0, x1 = fadd2f(
+                                cX[a * 8 + 2 * p],
+                                cX[a * 8 + 2 * p + 1],
+                                excl[2 * p],
+                                excl[2 * p + 1],
                             )
-                            x1 = txl.local_scalar(
-                                "float32", init=cX[a * 8 + 2 * p + 1] + excl[2 * p + 1]
-                            )
-                            txl.assign(Ex[p], bf16x2(ex2(x0), ex2(x1)))
-                            # 1/Ex as its own ex2: kf feeds kA (the state update), and a one-step bf16 Newton
-                            # reciprocal is biased (mean -0.14%, max 0.63% over the used range)
+                            ex0, ex1 = ex2(x0), ex2(x1)
+                            txl.assign(Ex[p], bf16x2(ex0, ex1))
+                            # 1/Ex from the fp32 ex (rcp.approx, 1 ulp): kf feeds kA (the state update), and a
+                            # one-step bf16 Newton reciprocal is biased (mean -0.14%, max 0.63% over the used range)
                             txl.assign(
                                 Fp[p],
-                                bf16x2(
-                                    ex2(txl.float32(0.0) - x0),
-                                    ex2(txl.float32(0.0) - x1),
-                                ),
+                                bf16x2(rcp(ex0), rcp(ex1)),
                             )
                         for p in range(4):
                             qn = hmul2(qraw[p], rq2[a])
