@@ -15,13 +15,16 @@ from ...jit.core import JitSpec, gen_jit_spec, sm110a_nvcc_flags
 
 SCHEMA = "flashinfer.sm110_xqa.v1"
 DECODE_SINGLE_PARTITION_ROUTE = "decode_fp16_contiguous_single_partition"
-TREE_KERNELS = ("tcgen05", "register_mma", "register_mma_split", "tmem")
+TREE_KERNELS = ("tcgen05", "register_mma", "register_mma_split", "tmem", "pair")
 MMA_ROUTE_SUFFIX = "_mma"
 SPLIT_ROUTE_SUFFIX = "_mma_split"
 TMEM_ROUTE_SUFFIX = "_tmem"
+PAIR_ROUTE_SUFFIX = "_pair"
 TMEM_CLUSTER = [2, 2, 1]
 TMEM_FALLBACK_CLUSTER = [2, 1, 1]
-TMEM_GQA_RATIO = 8
+PAIR_CLUSTER = [4, 1, 1]
+# One frozen tmem / pair trace per GQA ratio (the 128-row Q tile is ratio heads x 128 / ratio tokens).
+TREE_GQA_RATIOS = (2, 4, 8, 16)
 ROUTE_ENTRIES = {
     "tree_fp16_contiguous": "run_tree",
     "tree_fp16_paged": "run_tree",
@@ -36,20 +39,24 @@ ROUTE_ENTRIES = {
     "tree_fp16_paged_tmem": "run_tree",
     "tree_fp8_contiguous_tmem": "run_tree",
     "tree_fp8_paged_tmem": "run_tree",
+    "tree_fp8_contiguous_pair": "run_tree",
+    "tree_fp8_paged_pair": "run_tree",
     "decode_fp16_contiguous": "run_decode",
     "decode_merge": "run_decode_merge",
 }
 
 
 def route_kernel(name: str, route: dict[str, Any]) -> str:
-    """Physical kernel family of a route: ``tmem`` for the ``*_tmem`` tree routes,
-    ``register_mma_split`` for the ``*_mma_split`` tree route, ``register_mma`` for the
-    other ``*_mma`` tree routes, else ``tcgen05``."""
+    """Physical kernel family of a route: ``pair`` for the ``*_pair`` tree routes, ``tmem``
+    for the ``*_tmem`` tree routes, ``register_mma_split`` for the ``*_mma_split`` tree route,
+    ``register_mma`` for the other ``*_mma`` tree routes, else ``tcgen05``."""
     kernel = route.get("kernel", "tcgen05")
     if kernel not in TREE_KERNELS:
         raise ValueError(f"unknown kernel family for {name}")
     if name.startswith("tree_"):
-        if name.endswith(TMEM_ROUTE_SUFFIX):
+        if name.endswith(PAIR_ROUTE_SUFFIX):
+            expected = "pair"
+        elif name.endswith(TMEM_ROUTE_SUFFIX):
             expected = "tmem"
         elif name.endswith(SPLIT_ROUTE_SUFFIX):
             expected = "register_mma_split"
@@ -60,6 +67,29 @@ def route_kernel(name: str, route: dict[str, Any]) -> str:
         if kernel != expected:
             raise ValueError(f"route name and kernel family disagree for {name}")
     return kernel
+
+
+def _ratio_symbols(route: dict[str, Any], forms: tuple[str, ...] | None) -> bool:
+    """True when the route names one kernel symbol per supported GQA ratio (one per
+    cluster form when ``forms`` is given)."""
+    symbols = route.get("kernel_symbols")
+    if route.get("gqa_ratios") != list(TREE_GQA_RATIOS) or not isinstance(
+        symbols, dict
+    ):
+        return False
+    if sorted(symbols) != sorted(str(ratio) for ratio in TREE_GQA_RATIOS):
+        return False
+    for entry in symbols.values():
+        if forms is None:
+            if not isinstance(entry, str):
+                return False
+        elif (
+            not isinstance(entry, dict)
+            or sorted(entry) != sorted(forms)
+            or any(not isinstance(entry[form], str) for form in forms)
+        ):
+            return False
+    return True
 
 
 def _source_root() -> Path:
@@ -78,9 +108,7 @@ def _read_manifest(source_root: Path) -> dict[str, Any]:
         raise ValueError("SM110 XQA requires the versioned exact-sm_110a manifest")
     routes = manifest.get("routes")
     if not isinstance(routes, dict) or not set(ROUTE_ENTRIES).issubset(routes):
-        raise ValueError(
-            "SM110 XQA manifest must enumerate all fourteen base physical routes"
-        )
+        raise ValueError("SM110 XQA manifest must enumerate every base physical route")
     producer = routes["decode_fp16_contiguous"]
     expected_entries = dict(ROUTE_ENTRIES)
     if producer.get("merge_stats_cache") is True:
@@ -160,19 +188,34 @@ def _read_manifest(source_root: Path) -> dict[str, Any]:
             elif route_kernel(name, route) == "tmem":
                 # tcgen05/TMEM tree route: one 128-row Q tile x one 256-column output half per
                 # CTA (512 threads), K/V and Q multicast over a (2, 2, 1) KV-head cluster; the
-                # (2, 1, 1) Q-multicast form serves heads with an odd number of Q tiles. The
-                # frozen trace is specialised for one GQA ratio (Q tile = ratio x tokens).
+                # (2, 1, 1) Q-multicast form serves heads with an odd number of Q tiles. One
+                # frozen trace per GQA ratio and form (Q tile = ratio heads x 128 / ratio tokens).
                 if (
                     rows != 128
                     or columns != 256
-                    or route.get("gqa_ratio") != TMEM_GQA_RATIO
                     or route.get("cluster") != TMEM_CLUSTER
                     or route.get("fallback_cluster") != TMEM_FALLBACK_CLUSTER
-                    or not isinstance(route.get("fallback_kernel_symbol"), str)
                     or route.get("block") != [512, 1, 1]
+                    or not _ratio_symbols(route, ("even", "odd"))
                 ):
                     raise ValueError(
                         f"unsupported TMEM tree launch geometry for {name}"
+                    )
+            elif route_kernel(name, route) == "pair":
+                # cta_group::2 pair tree route: a (4, 1, 1) cluster of two CTA pairs covers the
+                # two 128-row Q tiles of one KV head x the two 256-column output halves (512
+                # threads per CTA); heads need an even Q-tile count. One frozen trace per GQA ratio.
+                if (
+                    rows != 128
+                    or columns != 256
+                    or route.get("cluster") != PAIR_CLUSTER
+                    or route.get("cta_group") != 2
+                    or route.get("q_tiles_per_cluster") != 2
+                    or route.get("block") != [512, 1, 1]
+                    or not _ratio_symbols(route, None)
+                ):
+                    raise ValueError(
+                        f"unsupported pair tree launch geometry for {name}"
                     )
             elif (
                 rows not in (64, 128)

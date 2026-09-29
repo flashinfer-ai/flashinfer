@@ -1,17 +1,21 @@
 # Experimental SM110 XQA attention
 
 This opt-in module provides native attention for NVIDIA Thor GPUs with the
-exact SM110a target in four physical kernel families: `tcgen05` (tensor memory,
+exact SM110a target in five physical kernel families: `tcgen05` (tensor memory,
 D128 decode and D512 tree), `register_mma` (the register `mma.sync` XQA
 schedule, D512 tree only, selected with `kernel="register_mma"`),
 `register_mma_split` (the same schedule split over the two KV halves by two
 eight-warp groups with an in-CTA merge, frozen for FP16 page128 KV only,
 selected with `kernel="register_mma_split"`; `kernel="register_mma_auto"`
-picks it for FP16 page128 KV and `register_mma` elsewhere) and `tmem` (the
+picks it for FP16 page128 KV and `register_mma` elsewhere), `tmem` (the
 tcgen05/TMEM-accumulator D512 tree schedule with Q and K/V fetched once per
-thread-block cluster by TMA multicast, every D512 cache mode at GQA ratio 8,
-selected with `kernel="tmem"`; `kernel="auto"` picks it at GQA ratio 8 and the
-`register_mma_auto` selection for the other ratios). Call
+thread-block cluster by TMA multicast, every D512 cache mode, one frozen trace
+per GQA ratio 2/4/8/16, selected with `kernel="tmem"`) and `pair` (the same
+schedule as two `cta_group::2` CTA pairs in a `(4, 1, 1)` cluster that issue
+one MMA stream for the two 128-row Q tiles of a KV head; E4M3 KV with an even
+Q-tile count per head, GQA ratios 2/4/8/16, selected with `kernel="pair"`;
+`kernel="auto"` picks `pair` for E4M3 KV with an even Q-tile count and `tmem`
+otherwise). Call
 `flashinfer.sm110_xqa.prepare` for prepared replay or `attention` for a single
 invocation. It uses frozen
 CUDA sources, FlashInfer's JIT compiler and native TVM-FFI stream handling.
@@ -113,10 +117,11 @@ Neither API substitutes a kernel for another GPU architecture.
 
 The module requires CUDA 13.0 or newer and physical capability 11.0; the tested
 toolchain is CUDA 13.4. The frozen source manifest under `csrc/sm110_xqa/`
-specifies compiler flags and route geometry for fifteen base routes (six
+specifies compiler flags and route geometry for seventeen base routes (six
 `tcgen05` routes, the four `register_mma` D512 tree routes `tree_*_mma`, the
-`register_mma_split` FP16 page128 tree route `tree_fp16_paged_mma_split` and
-the four `tmem` D512 tree routes `tree_*_tmem`),
+`register_mma_split` FP16 page128 tree route `tree_fp16_paged_mma_split`, the
+four `tmem` D512 tree routes `tree_*_tmem` and the two `pair` E4M3 tree routes
+`tree_fp8_*_pair`),
 plus the single-partition specialization when required. Its `validation_status` field
 is an immutable source-generation record captured at freeze. Subsequent
 execution validation is documented separately in [RESULTS.md](RESULTS.md).
@@ -143,11 +148,21 @@ per cluster by TMA multicast (a `(2, 1, 1)` Q-multicast form serves heads with
 an odd number of Q tiles). The binding encodes the Q and KV tensor maps on the
 host from the caller's tensors and launches with the cluster attribute; the
 same tensor layouts, mask contract, dequantization scales and tolerances apply.
-The frozen `tmem` trace is specialised for GQA ratio 8 (Hq = 8 x Hkv, the
-validated shape family); `kernel="tmem"` rejects other ratios. The families are
-selected explicitly; `register_mma_auto` chooses between the two register
-families and `auto` selects the `tmem` route at ratio 8 and `register_mma_auto`
-otherwise. D128 decode has only the `tcgen05` family.
+Each `tmem` route ships one frozen trace per GQA ratio (2, 4, 8 and 16: the
+128-row Q tile is ratio heads x 128 / ratio tokens) and cluster form; the
+binding selects the kernel from the ratio and the Q-tile parity and encodes Q
+with the ratio's box. The `pair` tree routes (`tree_fp8_{contiguous,paged}_pair`)
+run the same tcgen05/TMEM schedule as two `cta_group::2` CTA pairs in a
+`(4, 1, 1)` cluster per two Q tiles of a KV head (grid
+`(4, Hkv * ceil(Q * ratio / 128) / 2, B)`, one kernel per GQA ratio): the pair
+leader issues one M256 MMA stream for both Q tiles, each CTA holds one token
+half of every K chunk and one column half of every V chunk, and the raw E4M3 V
+rows are multicast to the pair. They serve E4M3 KV whose heads have an even
+number of 128-row Q tiles; `kernel="pair"` rejects FP16 KV and odd Q-tile
+counts. The families are selected explicitly; `register_mma_auto` chooses
+between the two register families and `auto` selects `pair` for E4M3 KV with
+an even Q-tile count per head and `tmem` otherwise. D128 decode has only the
+`tcgen05` family.
 Each route also records whether it stages raw FP8 bytes asynchronously before
 widening to FP16. This physical option applies only to E4M3 cache routes; FP16
 routes always record it as disabled. Raw prefetch is enabled only when that

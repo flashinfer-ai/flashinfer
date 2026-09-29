@@ -149,10 +149,119 @@ inline void CheckDenseLeadingFold(const TensorView& t, int trailing, const char*
     }
   }
 }
+// 3D TMA descriptor for buffer 'Q' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_Q_r2(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'Q' must have at least 3 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'Q' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  int64_t d2 = t.size(t.ndim() - 2);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+      << "TMA source 'Q' trailing dims must be positive";
+  int64_t outer2 = t.numel() / (d1 * d2);
+  CheckDenseLeadingFold(t, 2, "Q");
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source 'Q' physical strides must be positive";
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s3 > 0, ValueError)
+      << "TMA source 'Q' physical strides must be positive";
+  uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d2), (uint64_t)(outer2)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+      << "TMA descriptor for 'Q' resolved a non-positive global dim";
+  TVM_FFI_CHECK(64u <= global_dim[0] && 2u <= global_dim[1], ValueError)
+      << "TMA box (64, 2, 64) exceeds resolved global dims for 'Q'";
+  int64_t carrier_stride_0 = s2;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 1 zero while global dimension 1 is not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = s3;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 2 zero while global dimension 2 is not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 2 to a non-whole-byte offset";
+  uint64_t global_strides[2] = {
+      (uint64_t)((carrier_stride_0 * 16) / 8),
+      (uint64_t)((carrier_stride_1 * 16) / 8),
+  };
+  uint32_t box_dim[3] = {64u, 2u, 64u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (3D, 'Q') failed: CUresult=" << (int)r;
+  return tm;
+}
 
 // 3D TMA descriptor for buffer 'Q' — compiled from the
 // descriptor's std.Expr global_dim/global_strides/checks record.
-inline CUtensorMap EncodeTma_Q(const TensorView& t) {
+inline CUtensorMap EncodeTma_Q_r4(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'Q' must have at least 3 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'Q' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  int64_t d2 = t.size(t.ndim() - 2);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+      << "TMA source 'Q' trailing dims must be positive";
+  int64_t outer2 = t.numel() / (d1 * d2);
+  CheckDenseLeadingFold(t, 2, "Q");
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source 'Q' physical strides must be positive";
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s3 > 0, ValueError)
+      << "TMA source 'Q' physical strides must be positive";
+  uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d2), (uint64_t)(outer2)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+      << "TMA descriptor for 'Q' resolved a non-positive global dim";
+  TVM_FFI_CHECK(64u <= global_dim[0] && 4u <= global_dim[1], ValueError)
+      << "TMA box (64, 4, 32) exceeds resolved global dims for 'Q'";
+  int64_t carrier_stride_0 = s2;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 1 zero while global dimension 1 is not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = s3;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 2 zero while global dimension 2 is not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 2 to a non-whole-byte offset";
+  uint64_t global_strides[2] = {
+      (uint64_t)((carrier_stride_0 * 16) / 8),
+      (uint64_t)((carrier_stride_1 * 16) / 8),
+  };
+  uint32_t box_dim[3] = {64u, 4u, 32u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (3D, 'Q') failed: CUresult=" << (int)r;
+  return tm;
+}
+
+// 3D TMA descriptor for buffer 'Q' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_Q_r8(const TensorView& t) {
   TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
       << "TMA source 'Q' must have at least 3 dimensions, got ndim=" << t.ndim();
   TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
@@ -203,6 +312,74 @@ inline CUtensorMap EncodeTma_Q(const TensorView& t) {
   TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
       << "cuTensorMapEncodeTiled (3D, 'Q') failed: CUresult=" << (int)r;
   return tm;
+}
+
+// 3D TMA descriptor for buffer 'Q' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_Q_r16(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'Q' must have at least 3 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'Q' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  int64_t d2 = t.size(t.ndim() - 2);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+      << "TMA source 'Q' trailing dims must be positive";
+  int64_t outer2 = t.numel() / (d1 * d2);
+  CheckDenseLeadingFold(t, 2, "Q");
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source 'Q' physical strides must be positive";
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s3 > 0, ValueError)
+      << "TMA source 'Q' physical strides must be positive";
+  uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d2), (uint64_t)(outer2)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+      << "TMA descriptor for 'Q' resolved a non-positive global dim";
+  TVM_FFI_CHECK(64u <= global_dim[0] && 16u <= global_dim[1], ValueError)
+      << "TMA box (64, 16, 8) exceeds resolved global dims for 'Q'";
+  int64_t carrier_stride_0 = s2;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 1 zero while global dimension 1 is not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = s3;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 2 zero while global dimension 2 is not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 16) % 8 == 0, ValueError)
+      << "TMA descriptor for 'Q' resolved global stride 2 to a non-whole-byte offset";
+  uint64_t global_strides[2] = {
+      (uint64_t)((carrier_stride_0 * 16) / 8),
+      (uint64_t)((carrier_stride_1 * 16) / 8),
+  };
+  uint32_t box_dim[3] = {64u, 16u, 8u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_FLOAT16, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (3D, 'Q') failed: CUresult=" << (int)r;
+  return tm;
+}
+
+// The Q box is (64 d, ratio heads, 128 / ratio tokens): one 128-row Q tile per GQA ratio.
+inline CUtensorMap EncodeQ(const TensorView& t, int64_t ratio) {
+  switch (ratio) {
+    case 2: return EncodeTma_Q_r2(t);
+    case 4: return EncodeTma_Q_r4(t);
+    case 8: return EncodeTma_Q_r8(t);
+    case 16: return EncodeTma_Q_r16(t);
+    default: break;
+  }
+  TVM_FFI_CHECK(false, ValueError) << "GQA ratio must be 2, 4, 8 or 16";
+  return CUtensorMap{};
 }
 
 // 3D TMA descriptor for buffer 'KV' — compiled from the
@@ -274,8 +451,14 @@ struct __align__(8) KVCacheList {
   unsigned int max_pages;
 };
 
+extern "C" __global__ void kernel_sm110_xqa_tree_fp16_paged_tmem_r2(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
+extern "C" __global__ void kernel_sm110_xqa_tree_fp16_paged_tmem_r2_q(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
+extern "C" __global__ void kernel_sm110_xqa_tree_fp16_paged_tmem_r4(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
+extern "C" __global__ void kernel_sm110_xqa_tree_fp16_paged_tmem_r4_q(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
 extern "C" __global__ void kernel_sm110_xqa_tree_fp16_paged_tmem(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
 extern "C" __global__ void kernel_sm110_xqa_tree_fp16_paged_tmem_q(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
+extern "C" __global__ void kernel_sm110_xqa_tree_fp16_paged_tmem_r16(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
+extern "C" __global__ void kernel_sm110_xqa_tree_fp16_paged_tmem_r16_q(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
 
 void run_tree(
     TensorView q,
@@ -303,8 +486,9 @@ void run_tree(
   CheckTensor(mask, "mask", device, dl_int32, 4);
   CheckTensor(output, "output", device, dl_float16, 16);
   U32(q_len, "q_len"); U32(heads, "heads"); U32(capacity, "capacity");
-  // The frozen trace is specialised for GQA ratio 8 (Q tile = 8 heads x 16 tokens).
-  TVM_FFI_CHECK(ratio == 8, ValueError) << "tmem tree routes are frozen for GQA ratio 8";
+  // One frozen trace per GQA ratio (the Q tile is ratio heads x 128 / ratio tokens).
+  TVM_FFI_CHECK(ratio == 2 || ratio == 4 || ratio == 8 || ratio == 16, ValueError)
+      << "tree GQA ratio must be 2, 4, 8 or 16";
   TVM_FFI_CHECK(lengths.ndim() == 1, ValueError) << "lengths must have rank one";
   const int64_t batch = U32(lengths.size(0), "batch");
   const int64_t q_heads = Product({heads, ratio});
@@ -343,11 +527,30 @@ void run_tree(
   cudaStream_t stream = get_stream(device);
   // The (2, 2, 1) cluster form pairs the two Q tiles of one KV head for K/V multicast and needs an
   // even Q-tile count per head; otherwise the (2, 1, 1) form multicasts Q only. Cluster dimensions
-  // are compiled into each kernel.
-  const void* kernel = q_tiles % 2 == 0 ? reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp16_paged_tmem)
-                                        : reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp16_paged_tmem_q);
+  // and the GQA ratio (Q-tile geometry) are compiled into each kernel.
+  const void* kernel = nullptr;
+  switch (ratio) {
+    case 2:
+      kernel = q_tiles % 2 == 0 ? reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp16_paged_tmem_r2)
+                                : reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp16_paged_tmem_r2_q);
+      break;
+    case 4:
+      kernel = q_tiles % 2 == 0 ? reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp16_paged_tmem_r4)
+                                : reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp16_paged_tmem_r4_q);
+      break;
+    case 8:
+      kernel = q_tiles % 2 == 0 ? reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp16_paged_tmem)
+                                : reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp16_paged_tmem_q);
+      break;
+    case 16:
+      kernel = q_tiles % 2 == 0 ? reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp16_paged_tmem_r16)
+                                : reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp16_paged_tmem_r16_q);
+      break;
+    default: break;
+  }
+  TVM_FFI_CHECK(kernel != nullptr, ValueError) << "tree GQA ratio must be 2, 4, 8 or 16";
   CheckCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 230400));
-  CUtensorMap p_Q = EncodeTma_Q(q);
+  CUtensorMap p_Q = EncodeQ(q, ratio);
   CUtensorMap p_KV = EncodeTma_KV(kv);
   uint32_t p_q_seq_len = static_cast<uint32_t>(q_len);
   uint32_t p_num_kv_heads = static_cast<uint32_t>(heads);

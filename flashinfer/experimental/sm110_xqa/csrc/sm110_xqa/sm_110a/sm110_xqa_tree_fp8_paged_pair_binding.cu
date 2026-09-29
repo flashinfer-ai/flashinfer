@@ -405,7 +405,7 @@ inline CUtensorMap EncodeTma_KV(const TensorView& t) {
   TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
       << "TMA descriptor for 'KV' resolved a non-positive global dim";
   TVM_FFI_CHECK(128u <= global_dim[0], ValueError)
-      << "TMA box (128, 64, 1) exceeds resolved global dims for 'KV'";
+      << "TMA box (128, 1, 32) exceeds resolved global dims for 'KV'";
   int64_t carrier_stride_0 = s2;
   TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
       << "TMA descriptor for 'KV' resolved global stride 1 negative";
@@ -424,7 +424,7 @@ inline CUtensorMap EncodeTma_KV(const TensorView& t) {
       (uint64_t)((carrier_stride_0 * 8) / 8),
       (uint64_t)((carrier_stride_1 * 8) / 8),
   };
-  uint32_t box_dim[3] = {128u, 64u, 1u};
+  uint32_t box_dim[3] = {128u, 1u, 32u};
   uint32_t elem_strides[3] = {1u, 1u, 1u};
   CUtensorMap tm{};
   const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
@@ -436,6 +436,61 @@ inline CUtensorMap EncodeTma_KV(const TensorView& t) {
       << "cuTensorMapEncodeTiled (3D, 'KV') failed: CUresult=" << (int)r;
   return tm;
 }
+
+// 3D TMA descriptor for buffer 'KVV' — compiled from the
+// descriptor's std.Expr global_dim/global_strides/checks record.
+inline CUtensorMap EncodeTma_KVV(const TensorView& t) {
+  TVM_FFI_CHECK(t.ndim() >= 3, ValueError)
+      << "TMA source 'KVV' must have at least 3 dimensions, got ndim=" << t.ndim();
+  TVM_FFI_CHECK(t.stride(-1) == 1, ValueError)
+      << "TMA source 'KVV' must have unit innermost stride, got " << t.stride(-1);
+  int64_t d1 = t.size(t.ndim() - 1);
+  int64_t d2 = t.size(t.ndim() - 2);
+  TVM_FFI_CHECK(d1 > 0 && d2 > 0, ValueError)
+      << "TMA source 'KVV' trailing dims must be positive";
+  int64_t outer2 = t.numel() / (d1 * d2);
+  CheckDenseLeadingFold(t, 2, "KVV");
+  int64_t s2 = t.stride(t.ndim() - 2) * 1;
+  TVM_FFI_CHECK(s2 > 0, ValueError)
+      << "TMA source 'KVV' physical strides must be positive";
+  int64_t s3 = t.stride(t.ndim() - 3) * 1;
+  TVM_FFI_CHECK(s3 > 0, ValueError)
+      << "TMA source 'KVV' physical strides must be positive";
+  uint64_t global_dim[3] = {(uint64_t)(d1), (uint64_t)(d2), (uint64_t)(outer2)};
+  TVM_FFI_CHECK(global_dim[0] > 0 && global_dim[1] > 0 && global_dim[2] > 0, ValueError)
+      << "TMA descriptor for 'KVV' resolved a non-positive global dim";
+  TVM_FFI_CHECK(128u <= global_dim[0], ValueError)
+      << "TMA box (128, 1, 64) exceeds resolved global dims for 'KVV'";
+  int64_t carrier_stride_0 = s2;
+  TVM_FFI_CHECK(carrier_stride_0 >= 0, ValueError)
+      << "TMA descriptor for 'KVV' resolved global stride 1 negative";
+  TVM_FFI_CHECK(carrier_stride_0 != 0 || global_dim[1] == 1, ValueError)
+      << "TMA descriptor for 'KVV' resolved global stride 1 zero while global dimension 1 is not 1";
+  TVM_FFI_CHECK((carrier_stride_0 * 8) % 8 == 0, ValueError)
+      << "TMA descriptor for 'KVV' resolved global stride 1 to a non-whole-byte offset";
+  int64_t carrier_stride_1 = s3;
+  TVM_FFI_CHECK(carrier_stride_1 >= 0, ValueError)
+      << "TMA descriptor for 'KVV' resolved global stride 2 negative";
+  TVM_FFI_CHECK(carrier_stride_1 != 0 || global_dim[2] == 1, ValueError)
+      << "TMA descriptor for 'KVV' resolved global stride 2 zero while global dimension 2 is not 1";
+  TVM_FFI_CHECK((carrier_stride_1 * 8) % 8 == 0, ValueError)
+      << "TMA descriptor for 'KVV' resolved global stride 2 to a non-whole-byte offset";
+  uint64_t global_strides[2] = {
+      (uint64_t)((carrier_stride_0 * 8) / 8),
+      (uint64_t)((carrier_stride_1 * 8) / 8),
+  };
+  uint32_t box_dim[3] = {128u, 1u, 64u};
+  uint32_t elem_strides[3] = {1u, 1u, 1u};
+  CUtensorMap tm{};
+  const void* tensor_base = static_cast<const char*>(t.data_ptr()) + 0u;
+  CUresult r = cuTensorMapEncodeTiled(
+      &tm, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void*>(tensor_base), global_dim, global_strides, box_dim, elem_strides,
+      CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_NONE, CU_TENSOR_MAP_L2_PROMOTION_NONE,
+      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+  TVM_FFI_CHECK(r == CUDA_SUCCESS, RuntimeError)
+      << "cuTensorMapEncodeTiled (3D, 'KVV') failed: CUresult=" << (int)r;
+  return tm;
+}
 }  // namespace
 
 // 64-byte aligned by-value tensor-map kernel parameter (matches the kernel translation units).
@@ -445,19 +500,16 @@ static_assert(sizeof(Sm110XqaTensorMap64) == 128 && alignof(Sm110XqaTensorMap64)
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
 
 struct __align__(8) KVCacheList {
-  void* data;
+  void* pool;
+  const int* page_list;
   const int* sequence_lengths;
-  unsigned int capacity;
+  unsigned int max_pages;
 };
 
-extern "C" __global__ void kernel_sm110_xqa_tree_fp8_contiguous_tmem_r2(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
-extern "C" __global__ void kernel_sm110_xqa_tree_fp8_contiguous_tmem_r2_q(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
-extern "C" __global__ void kernel_sm110_xqa_tree_fp8_contiguous_tmem_r4(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
-extern "C" __global__ void kernel_sm110_xqa_tree_fp8_contiguous_tmem_r4_q(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
-extern "C" __global__ void kernel_sm110_xqa_tree_fp8_contiguous_tmem(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
-extern "C" __global__ void kernel_sm110_xqa_tree_fp8_contiguous_tmem_q(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
-extern "C" __global__ void kernel_sm110_xqa_tree_fp8_contiguous_tmem_r16(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
-extern "C" __global__ void kernel_sm110_xqa_tree_fp8_contiguous_tmem_r16_q(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
+extern "C" __global__ void kernel_sm110_xqa_tree_fp8_paged_pair_r2(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, const __grid_constant__ Sm110XqaTensorMap64 KVV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
+extern "C" __global__ void kernel_sm110_xqa_tree_fp8_paged_pair_r4(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, const __grid_constant__ Sm110XqaTensorMap64 KVV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
+extern "C" __global__ void kernel_sm110_xqa_tree_fp8_paged_pair_r8(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, const __grid_constant__ Sm110XqaTensorMap64 KVV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
+extern "C" __global__ void kernel_sm110_xqa_tree_fp8_paged_pair_r16(const __grid_constant__ Sm110XqaTensorMap64 Q, const __grid_constant__ Sm110XqaTensorMap64 KV, const __grid_constant__ Sm110XqaTensorMap64 KVV, unsigned int q_seq_len, unsigned int num_kv_heads, unsigned int head_group_size, const unsigned int* __restrict__ q_cu_seq_lens, float attention_scale, __half* __restrict__ output, const unsigned int* __restrict__ mask, KVCacheList kv_cache_list, unsigned int batch_size, float k_cache_scale, float v_cache_scale);
 
 void run_tree(
     TensorView q,
@@ -506,45 +558,42 @@ void run_tree(
   }
   Like(output, q);
   Disjoint(output, {q, kv, lengths, mask});
-  // One 128-row Q tile x one 256-column output half per CTA:
-  // grid (2, heads * ceil(q_len * ratio / 128), batch).
+  // One (4, 1, 1) cluster per pair of 128-row Q tiles of a KV head: the two CTAs of a cta_group::2 pair
+  // hold the two Q tiles, the two pairs the two 256-column output halves -
+  // grid (4, heads * ceil(q_len * ratio / 128) / 2, batch); the Q-tile count per head must be even.
   const int64_t q_tiles = (Product({q_len, ratio}) + 127) / 128;
-  Grid(grid_x, grid_y, grid_z, 2, Product({heads, q_tiles}), batch);
+  TVM_FFI_CHECK(q_tiles % 2 == 0, ValueError)
+      << "pair tree routes need an even number of 128-row Q tiles per KV head";
+  Grid(grid_x, grid_y, grid_z, 4, Product({heads, q_tiles / 2}), batch);
   Scale(sm_scale); Scale(k_scale); Scale(v_scale);
 
-  TVM_FFI_CHECK(!pages.has_value() && max_pages == 0, ValueError) << "contiguous route takes no page table";
-  Shape(kv, {batch, 2, heads, capacity, 512}, "kv");
+  TVM_FFI_CHECK(pages.has_value(), ValueError) << "paged route requires a page table";
+  CheckTensor(pages.value(), "pages", device, dl_int32, 4);
+  U32(max_pages, "max_pages");
+  Shape(pages.value(), {batch, 2, max_pages}, "pages");
+  TVM_FFI_CHECK(kv.ndim() == 4 && kv.size(0) > 0, ValueError) << "paged KV must have rank four";
+  Shape(kv, {kv.size(0), 128, heads, 512}, "kv");
+  TVM_FFI_CHECK(capacity == Product({max_pages, 128}), ValueError) << "paged capacity mismatch";
+  Disjoint(output, {pages.value()});
 
   DeviceGuard guard(device);
   CheckArch(device);
   cudaStream_t stream = get_stream(device);
-  // The (2, 2, 1) cluster form pairs the two Q tiles of one KV head for K/V multicast and needs an
-  // even Q-tile count per head; otherwise the (2, 1, 1) form multicasts Q only. Cluster dimensions
-  // and the GQA ratio (Q-tile geometry) are compiled into each kernel.
+  // One kernel per GQA ratio (Q-tile geometry compiled in); the (4, 1, 1) cluster of two cta_group::2
+  // pairs is compiled into each kernel.
   const void* kernel = nullptr;
   switch (ratio) {
-    case 2:
-      kernel = q_tiles % 2 == 0 ? reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_contiguous_tmem_r2)
-                                : reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_contiguous_tmem_r2_q);
-      break;
-    case 4:
-      kernel = q_tiles % 2 == 0 ? reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_contiguous_tmem_r4)
-                                : reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_contiguous_tmem_r4_q);
-      break;
-    case 8:
-      kernel = q_tiles % 2 == 0 ? reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_contiguous_tmem)
-                                : reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_contiguous_tmem_q);
-      break;
-    case 16:
-      kernel = q_tiles % 2 == 0 ? reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_contiguous_tmem_r16)
-                                : reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_contiguous_tmem_r16_q);
-      break;
+    case 2: kernel = reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_paged_pair_r2); break;
+    case 4: kernel = reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_paged_pair_r4); break;
+    case 8: kernel = reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_paged_pair_r8); break;
+    case 16: kernel = reinterpret_cast<const void*>(kernel_sm110_xqa_tree_fp8_paged_pair_r16); break;
     default: break;
   }
   TVM_FFI_CHECK(kernel != nullptr, ValueError) << "tree GQA ratio must be 2, 4, 8 or 16";
   CheckCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, 230400));
   CUtensorMap p_Q = EncodeQ(q, ratio);
   CUtensorMap p_KV = EncodeTma_KV(kv);
+  CUtensorMap p_KVV = EncodeTma_KVV(kv);
   uint32_t p_q_seq_len = static_cast<uint32_t>(q_len);
   uint32_t p_num_kv_heads = static_cast<uint32_t>(heads);
   uint32_t p_head_group_size = static_cast<uint32_t>(ratio);
@@ -553,13 +602,14 @@ void run_tree(
   __half* p_output = reinterpret_cast<__half*>(output.data_ptr());
   const uint32_t* p_mask = reinterpret_cast<const uint32_t*>(mask.data_ptr());
   KVCacheList p_kv_cache_list;
-  p_kv_cache_list.data = kv.data_ptr();
+  p_kv_cache_list.pool = kv.data_ptr();
+  p_kv_cache_list.page_list = reinterpret_cast<const int*>(pages.value().data_ptr());
   p_kv_cache_list.sequence_lengths = reinterpret_cast<const int*>(lengths.data_ptr());
-  p_kv_cache_list.capacity = static_cast<unsigned int>(capacity);
+  p_kv_cache_list.max_pages = static_cast<unsigned int>(max_pages);
   uint32_t p_batch_size = static_cast<uint32_t>(batch);
   float p_k_cache_scale = static_cast<float>(Scale(k_scale));
   float p_v_cache_scale = static_cast<float>(Scale(v_scale));
-  void* arguments[] = {&p_Q, &p_KV, &p_q_seq_len, &p_num_kv_heads, &p_head_group_size, &p_q_cu_seq_lens, &p_attention_scale, &p_output, &p_mask, &p_kv_cache_list, &p_batch_size, &p_k_cache_scale, &p_v_cache_scale};
+  void* arguments[] = {&p_Q, &p_KV, &p_KVV, &p_q_seq_len, &p_num_kv_heads, &p_head_group_size, &p_q_cu_seq_lens, &p_attention_scale, &p_output, &p_mask, &p_kv_cache_list, &p_batch_size, &p_k_cache_scale, &p_v_cache_scale};
   CheckCuda(cudaLaunchKernel(kernel,
       dim3(static_cast<uint32_t>(grid_x), static_cast<uint32_t>(grid_y), static_cast<uint32_t>(grid_z)),
       dim3(512, 1, 1), arguments, 230400, stream));
