@@ -21,6 +21,7 @@ limitations under the License.
 import contextlib
 import ctypes
 import functools
+import os
 import re
 import sys
 import warnings
@@ -2355,26 +2356,41 @@ class UlyssesCommunicator:
 # The CUDA P2P and mlx5 RDMA routes share one translation unit, so these are
 # required even when topology selects all-P2P.
 def missing_ulysses_pcie_dependencies() -> List[str]:
-    """Names of the rdma-core libraries this machine does not provide.
+    """Names of rdma-core build inputs this machine does not provide.
 
     Cheap and side-effect free (compiles nothing), so an environment guard can
     distinguish an unsupported host from a real build failure. It probes the
-    shared libraries only; the development headers the JIT build also needs
-    surface as a compile error instead.
+    shared libraries and headers required by the shared P2P/RDMA translation
+    unit. An older rdma-core may still fail at JIT compile time.
 
     Returns
     -------
     List[str]
-        ``"libibverbs"`` and/or ``"libmlx5"`` when absent; empty when both
-        are found.
+        Missing library and header names; empty when all are found.
     """
     import ctypes.util
 
-    return [
+    missing = [
         f"lib{name}"
         for name in ("ibverbs", "mlx5")
         if ctypes.util.find_library(name) is None
     ]
+    include_roots = [
+        "/usr/include",
+        "/usr/local/include",
+        "/usr/local/cuda/include",
+        f"{sys.prefix}/include",
+    ]
+    for variable in ("CPATH", "C_INCLUDE_PATH", "CPLUS_INCLUDE_PATH"):
+        include_roots.extend(
+            filter(None, os.environ.get(variable, "").split(os.pathsep))
+        )
+    for header in ("infiniband/verbs.h", "infiniband/mlx5dv.h"):
+        if not any(
+            os.path.isfile(os.path.join(root, header)) for root in include_roots
+        ):
+            missing.append(header)
+    return missing
 
 
 @functools.cache

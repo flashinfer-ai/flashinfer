@@ -25,6 +25,7 @@ from .utils import write_if_different
 from . import env as jit_env
 import os
 import pathlib
+import sys
 import jinja2
 from itertools import product
 from typing import Any, Dict, List, Literal, Tuple
@@ -315,10 +316,19 @@ def gen_ulysses_pcie_module() -> JitSpec:
     (a ``.cuh`` there would become its own translation unit); ninja's depfile
     tracks it for rebuilds.
     """
+    # The CI Conda environment provides rdma-core headers and libraries under
+    # sys.prefix rather than the system paths searched by nvcc and the linker.
+    rdma_prefix = pathlib.Path(sys.prefix)
+    rdma_include = rdma_prefix / "include"
+    rdma_lib = rdma_prefix / "lib"
     return gen_jit_spec(
         "ulysses_pcie",
         [jit_env.FLASHINFER_CSRC_DIR / "ulysses_pcie.cu"],
-        extra_ldflags=["-libverbs", "-lmlx5", "-lcuda"],
+        extra_include_paths=[rdma_include]
+        if (rdma_include / "infiniband/mlx5dv.h").is_file()
+        else [],
+        extra_ldflags=([f"-L{rdma_lib}"] if (rdma_lib / "libmlx5.so").is_file() else [])
+        + ["-libverbs", "-lmlx5", "-lcuda"],
     )
 
 
