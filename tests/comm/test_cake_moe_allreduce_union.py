@@ -67,6 +67,12 @@ _SM100_WS4_ROUTE_KEYS = {
         f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
     ),
     ("sm_100a", 4, "float16", True, _WIDE),
+    # Convergence round: the three T=2048 rows run the pipelined publish / poll
+    # variant, the bfloat16 no-PDL T=128 e16 row the clear-first wide body.
+    ("sm_100a", 4, "bfloat16", True, "pipe2_u4_b5"),
+    ("sm_100a", 4, "float16", True, "pipe2_u4_b5"),
+    ("sm_100a", 4, "float16", False, "pipe2_u4_b5"),
+    ("sm_100a", 4, "bfloat16", False, "clrfirst"),
 }
 # Cooperative (resident-grid) shape specializations of the union (alone or
 # composed with the wide_mlp schedule).
@@ -82,21 +88,30 @@ _COOPERATIVE_SPECIALIZATIONS = {
 # ``sm103_t1`` schedule variant applies at T=1 and composes with the
 # world-size-4 shape specializations (serial clear at BF16/T1/E8/no-PDL).
 _EXTRA_SPECIALIZATIONS = {
-    ("sm_100a", 2): frozenset({_WIDE, f"{_WIDE}_{union.SPECIALIZATION_CTA1}"}),
+    ("sm_100a", 2): frozenset(
+        {_WIDE, f"{_WIDE}_{union.SPECIALIZATION_CTA1}", "pipe2_u4", "pipe2_u4_b5"}
+    ),
     ("sm_100a", 4): {key[4] for key in _SM100_WS4_ROUTE_KEYS}
     - {union.SPECIALIZATION_GENERIC},
-    ("sm_100a", 8): frozenset({union.SPECIALIZATION_SM100_WS8_MID}),
-    ("sm_103a", 2): frozenset({union.SPECIALIZATION_SM103_T1, _WIDE}),
+    ("sm_100a", 8): frozenset({union.SPECIALIZATION_SM100_WS8_MID, "pipe1_u4_b5"}),
+    ("sm_103a", 2): frozenset({union.SPECIALIZATION_SM103_T1, _WIDE, "pipe1_u4_b5"}),
     ("sm_103a", 4): frozenset(
         {
             f"{union.SPECIALIZATION_SM103_T1}_{union.SPECIALIZATION_T1_E8_SERIAL_CLEAR}",
             _WIDE,
             f"{_WIDE}_{union.SPECIALIZATION_T64_E12_RESIDENT}",
             f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
+            "pipe2_u4_b5",
         }
     ),
     ("sm_103a", 8): frozenset(
-        {union.SPECIALIZATION_SM103_T1, union.SPECIALIZATION_SM103_WS8_MID}
+        {
+            union.SPECIALIZATION_SM103_T1,
+            union.SPECIALIZATION_SM103_WS8_MID,
+            "pipe1_u4_b5",
+            "push_g",
+            "pipe1",
+        }
     ),
 }
 
@@ -166,11 +181,14 @@ def test_module_inventory_is_verified_source_only() -> None:
         assert block[1:] == (1, 1) and block[0] * cluster[0] == 896
         residency = launch["persistent_ctas_per_sm"]
         assert isinstance(residency, int) and residency >= 1
+        cap = launch["max_persistent_clusters"]
+        assert cap is None or (isinstance(cap, int) and cap >= 1)
         if launch["cooperative"]:
-            assert residency == 1
+            assert residency == 1 and cap is None
         if cluster[0] == 1:
             assert record["arch"] == "sm_100a" and world_size in {2, 4}
             assert not launch["cooperative"] and launch["persistent_ctas_per_sm"] == 1
+            assert cap is None
 
 
 def test_exported_architectures_are_sm100_and_sm103() -> None:
@@ -232,6 +250,10 @@ def test_routes_cover_exactly_the_reviewed_specializations() -> None:
                 launch["persistent_ctas_per_sm"]
                 == launches[0]["persistent_ctas_per_sm"]
             )
+            assert (
+                launch["max_persistent_clusters"]
+                == launches[0]["max_persistent_clusters"]
+            )
         if specialization in {union.SPECIALIZATION_GENERIC, _WIDE}:
             # The persistent programs serve up to 2048 tokens; a one-cluster-per-token
             # cooperative grid cannot be co-resident at that size.
@@ -288,21 +310,24 @@ def test_routes_cover_exactly_the_reviewed_specializations() -> None:
             16,
             f"{_WIDE}_{union.SPECIALIZATION_T128_E16_OWNER_FORWARD}",
         ),
-        ("sm_100a", 4, "bfloat16", False, 128, 16, union.SPECIALIZATION_GENERIC),
+        ("sm_100a", 4, "bfloat16", False, 128, 16, "clrfirst"),
+        ("sm_100a", 4, "bfloat16", False, 128, 8, union.SPECIALIZATION_GENERIC),
         ("sm_100a", 4, "bfloat16", False, 512, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 4, "bfloat16", True, 2048, 12, union.SPECIALIZATION_GENERIC),
+        ("sm_100a", 4, "bfloat16", True, 2048, 12, "pipe2_u4_b5"),
         # The world-size-4 reviewed shapes do not leak into other world sizes;
         # every SM100 two-rank class runs wide_mlp (no generic program) and the
         # bfloat16 no-PDL T=1 row runs its single-CTA wide_mlp build.
         ("sm_100a", 2, "bfloat16", False, 1, 8, f"{_WIDE}_{union.SPECIALIZATION_CTA1}"),
         ("sm_100a", 2, "float16", False, 64, 12, _WIDE),
         ("sm_100a", 2, "float16", True, 128, 16, _WIDE),
-        ("sm_100a", 2, "bfloat16", True, 2048, 12, _WIDE),
+        ("sm_100a", 2, "bfloat16", True, 2048, 12, "pipe2_u4_b5"),
         ("sm_100a", 2, "bfloat16", True, 512, 8, _WIDE),
         ("sm_100a", 8, "bfloat16", False, 1, 8, union.SPECIALIZATION_GENERIC),
         ("sm_100a", 8, "float16", True, 1, 8, union.SPECIALIZATION_GENERIC),
         ("sm_100a", 8, "float16", False, 2048, 12, union.SPECIALIZATION_GENERIC),
         ("sm_100a", 8, "bfloat16", True, 2048, 16, union.SPECIALIZATION_GENERIC),
+        ("sm_100a", 8, "bfloat16", True, 2048, 12, "pipe1_u4_b5"),
+        ("sm_100a", 8, "float16", False, 2048, 8, "pipe1_u4_b5"),
         # SM103: the T=1 schedule variant is reviewed at every world size and
         # composes with the world-size-4 serial clear; the SM100 world-size-4
         # shape specializations apply on SM103 too.
@@ -340,14 +365,18 @@ def test_routes_cover_exactly_the_reviewed_specializations() -> None:
         ("sm_103a", 4, "float16", True, 1024, 16, _WIDE),
         ("sm_103a", 4, "bfloat16", False, 256, 8, _WIDE),
         ("sm_103a", 4, "bfloat16", True, 256, 12, _WIDE),
-        ("sm_103a", 4, "bfloat16", True, 2048, 12, union.SPECIALIZATION_GENERIC),
+        ("sm_103a", 4, "bfloat16", True, 2048, 12, "pipe2_u4_b5"),
         ("sm_103a", 2, "bfloat16", False, 64, 8, _WIDE),
         ("sm_103a", 2, "bfloat16", True, 64, 8, _WIDE),
         ("sm_103a", 2, "bfloat16", True, 128, 16, union.SPECIALIZATION_GENERIC),
         ("sm_103a", 2, "float16", True, 128, 16, _WIDE),
-        ("sm_103a", 2, "float16", True, 2048, 16, union.SPECIALIZATION_GENERIC),
-        ("sm_103a", 8, "float16", False, 2048, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_103a", 8, "bfloat16", True, 64, 8, union.SPECIALIZATION_GENERIC),
+        ("sm_103a", 2, "float16", True, 2048, 16, "pipe1_u4_b5"),
+        ("sm_103a", 2, "float16", True, 1024, 16, union.SPECIALIZATION_GENERIC),
+        ("sm_103a", 8, "float16", False, 2048, 8, "pipe1_u4_b5"),
+        ("sm_103a", 8, "float16", False, 256, 8, union.SPECIALIZATION_GENERIC),
+        ("sm_103a", 8, "bfloat16", True, 64, 8, "push_g"),
+        ("sm_103a", 8, "bfloat16", True, 256, 12, "push_g"),
+        ("sm_103a", 8, "bfloat16", False, 256, 8, "pipe1"),
         # Reviewed SM103 shapes do not leak into SM100 and vice versa.
         ("sm_100a", 2, "bfloat16", False, 1, 8, f"{_WIDE}_{union.SPECIALIZATION_CTA1}"),
     ],
@@ -453,6 +482,11 @@ def test_launch_grid_rule() -> None:
     assert union.launch_grid_x(64, False, 148, 4, 4) == 256
     assert union.launch_grid_x(2048, False, 148, 4, 4) == 592
     assert union.launch_grid_x(2048, False, 148, 5, 4) == 740
+    # A recorded cluster cap bounds the persistent grid at that many co-resident
+    # clusters (five CTAs per SM on 148 SMs would be 185 clusters against 175).
+    assert union.launch_grid_x(2048, False, 148, 5, 4, 175) == 700
+    assert union.launch_grid_x(64, False, 148, 5, 4, 175) == 256
+    assert union.launch_grid_x(2048, False, 148, 4, 4, 175) == 592
     # Single-CTA modules (the reviewed T=1 rows) launch one CTA per token.
     assert union.launch_grid_x(1, False, 148, 1, 1) == 1
     assert union.launch_grid_x(64, False, 148, 1, 1) == 64
@@ -467,6 +501,10 @@ def test_launch_grid_rule() -> None:
         union.launch_grid_x(64, False, 148, 0, 4)
     with pytest.raises(ValueError):
         union.launch_grid_x(64, False, 148, 1, 0)
+    with pytest.raises(ValueError):
+        union.launch_grid_x(64, False, 148, 5, 4, 0)
+    with pytest.raises(ValueError):
+        union.launch_grid_x(64, True, 148, 1, 4, 175)
     for record in union.MODULES.values():
         launch = record["launch"]
         cluster_ctas = int(launch["cluster"][0])
@@ -476,8 +514,11 @@ def test_launch_grid_rule() -> None:
             148,
             launch["persistent_ctas_per_sm"],
             cluster_ctas,
+            launch["max_persistent_clusters"],
         )
         assert grid % cluster_ctas == 0 and grid > 0
+        if launch["max_persistent_clusters"] is not None:
+            assert grid <= launch["max_persistent_clusters"] * cluster_ctas
 
 
 @pytest.mark.parametrize("world_size", _WORLD_SIZES)
