@@ -1003,3 +1003,180 @@ ulysses_scatter_qkv_trace_dispatch.templates = (  # type: ignore[attr-defined]
     ulysses_scatter_qkv_sm90_trace,
     ulysses_scatter_qkv_sm120_trace,
 )
+
+
+def _pcie_ipc_collective_templates(collective, input_rows, output_rows):
+    # The group size belongs to the workspace, not the call signature. Finite
+    # templates preserve it as a Const and remain discoverable by trace tooling.
+    operation = "all-gather" if collective == "all_gather" else "SUM reduce-scatter"
+    return {
+        world_size: TraceTemplate(
+            op_type="comm",
+            name_prefix=f"pcie_ipc_{collective}_tp{world_size}",
+            description=(
+                f"PCIe IPC {operation} with rank-major shards. "
+                "This is a per-rank metadata schema; "
+                "execution requires a collectively initialized workspace."
+            ),
+            axes={
+                "local_rows": Var(description="Rows in one rank's shard."),
+                "total_rows": Var(description="Rows across all rank-major shards."),
+                "hidden_dim": Const(abbrev="h"),
+                "world_size": Const(value=world_size, abbrev=""),
+            },
+            inputs={"inp": Tensor([input_rows, "hidden_dim"])},
+            outputs={
+                "output": Tensor(
+                    [output_rows, "hidden_dim"], param="out", dtype_from="inp"
+                )
+            },
+            constraints=["total_rows == world_size * local_rows"],
+            tags=["stage:comm"],
+            # A local tensor alone cannot define a distributed reference/init.
+        )
+        for world_size in (2, 4, 8)
+    }
+
+
+_pcie_ipc_all_gather_templates = _pcie_ipc_collective_templates(
+    "all_gather", "local_rows", "total_rows"
+)
+_pcie_ipc_reduce_scatter_templates = _pcie_ipc_collective_templates(
+    "reduce_scatter", "total_rows", "local_rows"
+)
+
+
+def _pcie_ipc_collective_trace_dispatch(templates, kwargs):
+    world_size = getattr(kwargs.get("self"), "world_size", None)
+    if world_size not in templates:
+        raise ValueError(
+            "PCIe IPC collective tracing requires a bound workspace with "
+            "world_size 2, 4, or 8; use fi_trace(workspace.all_gather, inp=...) "
+            "or fi_trace(workspace.reduce_scatter, inp=...)."
+        )
+    return templates[world_size]
+
+
+def pcie_ipc_all_gather_trace_dispatch(**kwargs):
+    return _pcie_ipc_collective_trace_dispatch(_pcie_ipc_all_gather_templates, kwargs)
+
+
+def pcie_ipc_reduce_scatter_trace_dispatch(**kwargs):
+    return _pcie_ipc_collective_trace_dispatch(
+        _pcie_ipc_reduce_scatter_templates, kwargs
+    )
+
+
+pcie_ipc_all_gather_trace_dispatch.templates = tuple(  # type: ignore[attr-defined]
+    _pcie_ipc_all_gather_templates.values()
+)
+pcie_ipc_reduce_scatter_trace_dispatch.templates = tuple(  # type: ignore[attr-defined]
+    _pcie_ipc_reduce_scatter_templates.values()
+)
+
+
+# ── Fused NCCL-LSA DCP all-to-all + LSE reduce ───────────────────────────────
+
+
+@torch.no_grad()
+def _decode_cp_a2a_lse_reduce_reference(
+    partial_o: torch.Tensor,
+    partial_lse: torch.Tensor,
+    workspace,
+    cp_rank: int,
+    cp_size: int,
+    lse_mode: str = "base2",
+    **_unused,
+):
+    """Local LSE merge reference; multi-rank exchange is tested under tests/comm."""
+    lse = torch.where(
+        torch.isnan(partial_lse) | torch.isposinf(partial_lse),
+        torch.full_like(partial_lse, float("-inf")),
+        partial_lse,
+    )
+    lse_max = lse.amax(dim=-1, keepdim=True)
+    lse_max = torch.where(torch.isneginf(lse_max), 0, lse_max)
+    weights = (
+        torch.exp(lse - lse_max) if lse_mode == "basee" else torch.exp2(lse - lse_max)
+    )
+    denom = weights.sum(dim=-1, keepdim=True)
+    output = (partial_o.float() * weights.unsqueeze(-1)).sum(dim=-2)
+    output = output / denom.clamp_min(1e-20)
+    output = torch.where(denom == 0, torch.zeros_like(output), output)
+    return output.to(partial_o.dtype)
+
+
+def _decode_cp_a2a_lse_reduce_init(
+    *,
+    batch_dim: int,
+    cp_size: int,
+    head_dim: int = 128,
+    workspace_bytes: int = 16,
+    cp_rank: int = 0,
+    lse_mode: str = "base2",
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build schema inputs; the real workspace must be rendezvoused collectively."""
+    torch.manual_seed(seed)
+    return {
+        "partial_o": torch.randn(
+            batch_dim, cp_size, head_dim, dtype=torch.bfloat16, device=device
+        ),
+        "partial_lse": torch.randn(
+            batch_dim, cp_size, dtype=torch.float32, device=device
+        ),
+        "workspace": torch.zeros(workspace_bytes, dtype=torch.uint8, device=device),
+        "cp_rank": int(cp_rank),
+        "cp_size": int(cp_size),
+        "lse_mode": lse_mode,
+    }
+
+
+decode_cp_a2a_lse_reduce_trace = TraceTemplate(
+    op_type="comm",
+    name_prefix="decode_cp_a2a_lse_reduce",
+    description=(
+        "Fused context-parallel NCCL-LSA all-to-all and LSE-weighted "
+        "attention-output reduction. The trace reference models the local "
+        "LSE merge; multi-rank exchange correctness is exercised by tests/comm."
+    ),
+    axes={
+        "batch_dim": Var(
+            description=(
+                "Flattened batch and head dimensions (batch * heads); heads may "
+                "be local or total."
+            )
+        ),
+        "cp_size": Var(description="Context-parallel group size."),
+        "head_dim": Const(abbrev="d"),
+        "workspace_bytes": Var(),
+    },
+    inputs={
+        "partial_o": Tensor(
+            ["batch_dim", "cp_size", "head_dim"],
+            description=(
+                "Per-rank partial attention outputs [batch, heads, cp_size, head_dim]."
+            ),
+        ),
+        "partial_lse": Tensor(
+            ["batch_dim", "cp_size"],
+            dtype="float32",
+            description="Per-rank log-sum-exp values [batch, heads, cp_size].",
+        ),
+        "workspace": Tensor(["workspace_bytes"], dtype="uint8"),
+        "cp_rank": Scalar("int32"),
+        "cp_size": Scalar("int32"),
+        "lse_mode": Scalar("str"),
+    },
+    outputs={
+        "output": Tensor(
+            ["batch_dim", "head_dim"],
+            dtype_from="partial_o",
+            description="Reduced output [batch, heads, head_dim].",
+        ),
+    },
+    tags=["status:experimental", "stage:comm"],
+    reference=_decode_cp_a2a_lse_reduce_reference,
+    init=_decode_cp_a2a_lse_reduce_init,
+)

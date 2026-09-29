@@ -24,7 +24,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
                Optional<TensorView> attn_sink, Optional<TensorView> extra_kv_cache,
                Optional<TensorView> extra_indices, Optional<TensorView> extra_topk_length,
                int64_t cpb, bool stage1_only, bool prefill,
-               const execution::ExecutionPlan* prepared = nullptr) {
+               const execution::ExecutionPlan* prepared = nullptr, double lse_scale = 1.0) {
   CHECK_INPUT_AND_TYPE(q, dl_bfloat16);
   check_attention_alignment(q, alignof(__nv_bfloat162), "q");
   CHECK_CUDA(kv_cache);
@@ -71,6 +71,7 @@ void attention(TensorView q, TensorView kv_cache, TensorView indices, Optional<T
   p.out_lse = static_cast<float*>(out_lse.data_ptr());
   p.num_tokens = tokens;
   p.sm_scale = static_cast<float>(sm_scale);
+  p.lse_scale = static_cast<float>(lse_scale);
   p.page_stride_bytes = layout.page_stride_bytes;
   auto length_pointer = [&](Optional<TensorView> value, const char* name) -> const int* {
     if (!value.has_value()) return nullptr;
@@ -204,10 +205,11 @@ void SparseMlaSm120NVFP4Decode(TensorView q, TensorView kv_cache, TensorView ind
                                Optional<TensorView> extra_kv_cache,
                                Optional<TensorView> extra_indices,
                                Optional<TensorView> extra_topk_length,
-                               int64_t chunks_per_block_override, bool stage1_only) {
+                               int64_t chunks_per_block_override, bool stage1_only,
+                               double lse_scale) {
   attention(q, kv_cache, indices, mid_out, mid_lse, output, out_lse, num_splits, sm_scale,
             topk_length, attn_sink, extra_kv_cache, extra_indices, extra_topk_length,
-            chunks_per_block_override, stage1_only, false);
+            chunks_per_block_override, stage1_only, false, nullptr, lse_scale);
 }
 
 void SparseMlaSm120NVFP4Prefill(TensorView q, TensorView kv_cache, TensorView indices,
@@ -215,10 +217,10 @@ void SparseMlaSm120NVFP4Prefill(TensorView q, TensorView kv_cache, TensorView in
                                 Optional<TensorView> topk_length, Optional<TensorView> attn_sink,
                                 Optional<TensorView> extra_kv_cache,
                                 Optional<TensorView> extra_indices,
-                                Optional<TensorView> extra_topk_length) {
+                                Optional<TensorView> extra_topk_length, double lse_scale) {
   attention(q, kv_cache, indices, Optional<TensorView>(), Optional<TensorView>(), output, out_lse,
             0, sm_scale, topk_length, attn_sink, extra_kv_cache, extra_indices, extra_topk_length,
-            0, false, true);
+            0, false, true, nullptr, lse_scale);
 }
 
 void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache,
@@ -226,14 +228,14 @@ void ExecuteAttentionPlan(ffi::Module descriptor, TensorView q, TensorView cache
                           TensorView output, TensorView lse, double scale,
                           Optional<TensorView> lengths, Optional<TensorView> sink,
                           Optional<TensorView> extra_cache, Optional<TensorView> extra_indices,
-                          Optional<TensorView> extra_lengths) {
+                          Optional<TensorView> extra_lengths, double lse_scale) {
   const auto& plan = execution::unpack_plan(descriptor, true);
   TVM_FFI_ICHECK(q.ndim() == 3 && q.size(0) == plan.metadata.tokens &&
                  q.size(1) == plan.metadata.heads)
       << "DSV4 NVFP4 execution plan query mismatch";
   attention(q, cache, indices, mid, mlse, output, lse, plan.chunk_capacity, scale, lengths, sink,
             extra_cache, extra_indices, extra_lengths, plan.cpb,
-            plan.merge == execution::Merge::Stage1, plan.metadata.variant == 1, &plan);
+            plan.merge == execution::Merge::Stage1, plan.metadata.variant == 1, &plan, lse_scale);
 }
 
 }  // namespace flashinfer::sparse_mla_sm120::nvfp4

@@ -191,6 +191,7 @@ def main() -> None:
                 nvfp4_extra_cache,
                 extra_indices,
                 None,
+                1.0,
             )
 
         run_nv()

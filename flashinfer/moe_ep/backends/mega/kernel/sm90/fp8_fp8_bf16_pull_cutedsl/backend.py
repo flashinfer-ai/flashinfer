@@ -188,6 +188,7 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             fc1_early_done_publish=k.fc1_early_done_publish,
             fold_producer_warps=k.fold_producer_warps,
             generate_c=k.generate_c,
+            tail_split_pairs=k.tail_split_pairs,
         )
 
     def validate_forward(
@@ -379,5 +380,6 @@ class Sm90PullFp8MegaKernelBackend(MegaKernelBackend):
             k.fc1_early_done_publish,
             k.fold_producer_warps,
             k.generate_c,
+            k.tail_split_pairs,
             knobs_pool_key(k.knobs),
         )

@@ -26,6 +26,7 @@ from .jit.cake_fmha import (
     load_cake_fmha_context_fp16_hd256_module,
     load_cake_fmha_context_fp8_hd256_module,
     load_cake_fmha_compat_module,
+    load_cake_fmha_decode_native_bf16_hd256_smallm_module,
     load_cake_fmha_decode_native_bf16_module,
     load_cake_fmha_decode_native_fp16_hd512_module,
     load_cake_fmha_decode_native_fp16_nhd_module,
@@ -429,6 +430,7 @@ class CakeFmhaDecodeRoute:
     retain_kv_l2: bool
     component: Literal[
         "decode_native_bf16",
+        "decode_native_bf16_hd256_smallm",
         "decode_native_fp16_hd512",
         "decode_native_fp16_nhd",
         "decode_quant_bf16q",
@@ -437,6 +439,8 @@ class CakeFmhaDecodeRoute:
         "decode_quant_nvfp4",
     ] = "decode_native_bf16"
     page_size: int = 16
+    # Small-M hd256 speculative decode: one resident wave of Split-KV CTAs.
+    num_split: int = 0
 
 
 CakeFmhaContextComponent = Literal[
@@ -482,6 +486,14 @@ _PRODUCT_ROUTE_COMPONENTS: dict[str, tuple[str, ...]] = {
     "ctx_fp8_hnd_hd128_hgpack_48b5_v1": ("context_fp8",),
     "ctx_nvfp4_hnd_hd128_dequant_fp8_hg_v1": ("context_nvfp4",),
     "decode_native_bf16_v1_bece": ("decode_native_bf16",),
+    "decode_native_bf16_hd256_smallm_v1": (
+        "decode_native_bf16_hd256_smallm_n32_p16",
+        "decode_native_bf16_hd256_smallm_n32_p32",
+        "decode_native_bf16_hd256_smallm_n32_p64",
+        "decode_native_bf16_hd256_smallm_n64_p16",
+        "decode_native_bf16_hd256_smallm_n64_p32",
+        "decode_native_bf16_hd256_smallm_n64_p64",
+    ),
     "decode_native_fp16_hd512_v1_66b1": ("decode_native_fp16_hd512",),
     "decode_native_fp16_nhd_v1_f32d": ("decode_native_fp16_nhd",),
     "decode_quantized_bf16q_9d8b_v1": ("decode_quant_bf16q",),
@@ -508,6 +520,12 @@ _AUTHENTICATED_JIT_COMPONENTS = frozenset(
         "context_hd256_support",
         "context_nvfp4",
         "decode_native_bf16",
+        "decode_native_bf16_hd256_smallm_n32_p16",
+        "decode_native_bf16_hd256_smallm_n32_p32",
+        "decode_native_bf16_hd256_smallm_n32_p64",
+        "decode_native_bf16_hd256_smallm_n64_p16",
+        "decode_native_bf16_hd256_smallm_n64_p32",
+        "decode_native_bf16_hd256_smallm_n64_p64",
         "decode_native_fp16_hd512",
         "decode_native_fp16_nhd",
         "decode_quant_bf16q",
@@ -524,6 +542,7 @@ def _route_components(
     if isinstance(route, CakeFmhaDecodeRoute):
         route_name = {
             "decode_native_bf16": "decode_native_bf16_v1_bece",
+            "decode_native_bf16_hd256_smallm": "decode_native_bf16_hd256_smallm_v1",
             "decode_native_fp16_hd512": "decode_native_fp16_hd512_v1_66b1",
             "decode_native_fp16_nhd": "decode_native_fp16_nhd_v1_f32d",
             "decode_quant_bf16q": "decode_quantized_bf16q_9d8b_v1",
@@ -600,6 +619,74 @@ def _tma_nvfp4_scale_strides_supported(tensor: torch.Tensor) -> bool:
         and tensor.stride(1) % 16 == 0
         and tensor.stride(0) % 16 == 0
     )
+
+
+_SMALLM_MIN_SUPPORTED_SM_COUNT = 148  # B200; used only for non-CUDA capability replays
+
+
+def _smallm_sm_count(device: torch.device) -> int:
+    if device.type != "cuda":
+        return _SMALLM_MIN_SUPPORTED_SM_COUNT
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+def _smallm_tile_rows(packed_rows: int) -> int | None:
+    """Instance tile (32 or 64 rows) holding ``q_len * group`` packed rows.
+
+    Rows in (16, 32] use the 32-row instance and rows in (32, 64] the 64-row
+    instance; rows above the packed count are tile padding the kernel never
+    stores.  Fewer than 17 rows are left to other routes.
+    """
+
+    if packed_rows <= 16 or packed_rows > 64:
+        return None
+    return 32 if packed_rows <= 32 else 64
+
+
+def _smallm_tile_rows_for(q_len: int, group: int) -> int | None:
+    """Tile rows for ``q_len * group`` packed rows when ``group`` divides the tile."""
+
+    n_rows = _smallm_tile_rows(q_len * group)
+    if n_rows is None or group <= 0 or n_rows % group:
+        return None
+    return n_rows
+
+
+def _smallm_num_split(
+    *, tiles: int, sm_count: int, max_seq_len: int, n_rows: int
+) -> int:
+    """One-wave Split-KV factor mirroring the Cake route (0 when not resident)."""
+
+    if tiles <= 0 or tiles > sm_count:
+        return 0
+    blocks = max(1, (max_seq_len + 127) // 128)
+    return max(1, min(sm_count // tiles, max(blocks, n_rows), 256))
+
+
+def _smallm_workspace_supported(
+    workspace_buffer: torch.Tensor,
+    query: torch.Tensor,
+    *,
+    tiles: int,
+    num_split: int,
+    n_rows: int,
+    lse: torch.Tensor | None,
+) -> bool:
+    """Mirror the small-M binding's partial/counter/LSE workspace layout."""
+
+    if not workspace_buffer.is_contiguous() or workspace_buffer.device != query.device:
+        return False
+
+    def align(value: int) -> int:
+        return (value + 255) // 256 * 256
+
+    slots = tiles * num_split
+    cursor = align(slots * n_rows * 256 * 2)
+    cursor = align(cursor + slots * n_rows * 4)
+    cursor = align(cursor + tiles * 2 * 4)
+    if lse is None:
+        cursor += query.shape[0] * query.shape[1] * 4
+    return workspace_buffer.numel() * workspace_buffer.element_size() >= cursor
 
 
 def _decode_native_workspace_supported(
@@ -1015,6 +1102,58 @@ def select_cake_fmha_decode_route(
     dtypes = (query.dtype, key_cache.dtype, value_cache.dtype, out.dtype)
     no_block_scales = key_block_scales is None and value_block_scales is None
     if dtypes == (torch.bfloat16,) * 4:
+        group = num_q_heads // num_kv_heads
+        smallm_rows = _smallm_tile_rows_for(q_len, group)
+        smallm_tiles = batch_size * num_kv_heads
+        smallm_sm_count = _smallm_sm_count(device)
+        smallm_num_split = _smallm_num_split(
+            tiles=smallm_tiles,
+            sm_count=smallm_sm_count,
+            max_seq_len=max_seq_len,
+            n_rows=smallm_rows or 64,
+        )
+        if (
+            query.is_contiguous()
+            and query.shape[2] == 256
+            and smallm_rows is not None
+            and page_size in (16, 32, 64)
+            and key_cache.shape[3] == 256
+            and kv_layout == "HND"
+            and uses_shared_paged_kv_idx
+            and sinks is None
+            and window_left < 0
+            and not isinstance(bmm1_scale, torch.Tensor)
+            and _tma_paged_kv_strides_supported(key_cache)
+            and _tma_paged_kv_strides_supported(value_cache)
+            and smallm_num_split >= 1
+            and _smallm_workspace_supported(
+                workspace_buffer,
+                query,
+                tiles=smallm_tiles,
+                num_split=smallm_num_split,
+                n_rows=smallm_rows,
+                lse=lse,
+            )
+            and no_block_scales
+            and not isinstance(bmm2_scale, torch.Tensor)
+            and float(bmm2_scale) == 1.0
+            and (o_scale is None or float(o_scale) == 1.0)
+        ):
+            candidate = CakeFmhaDecodeRoute(
+                target=_cake_fmha_target(device),
+                batch_size=batch_size,
+                q_len=q_len,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                has_sink=False,
+                has_window=False,
+                use_scale_ptr=False,
+                retain_kv_l2=local_blocks <= 9,
+                component="decode_native_bf16_hd256_smallm",
+                page_size=page_size,
+                num_split=smallm_num_split,
+            )
+            return candidate if cake_fmha_route_is_optimized(candidate) else None
         if (
             query.is_contiguous()
             and query.shape[2] == 128
@@ -1237,6 +1376,7 @@ def _resolve_cake_fmha_decode_module(
         raise RuntimeError("Cake FMHA decode route target does not match the device")
     loader = {
         "decode_native_bf16": load_cake_fmha_decode_native_bf16_module,
+        "decode_native_bf16_hd256_smallm": load_cake_fmha_decode_native_bf16_hd256_smallm_module,
         "decode_native_fp16_hd512": load_cake_fmha_decode_native_fp16_hd512_module,
         "decode_native_fp16_nhd": load_cake_fmha_decode_native_fp16_nhd_module,
         "decode_quant_bf16q": load_cake_fmha_decode_quant_bf16q_module,
@@ -1254,6 +1394,19 @@ def _resolve_cake_fmha_decode_module(
         route.num_q_heads,
         route.num_kv_heads,
     )
+    if route.component == "decode_native_bf16_hd256_smallm":
+        group = route.num_q_heads // route.num_kv_heads
+        return (
+            loader(
+                route.target,
+                _smallm_tile_rows_for(route.q_len, group),
+                route.page_size,
+                route.q_len,
+                group,
+                route.num_split,
+            ),
+            True,
+        )
     if route.component == "decode_native_fp16_hd512":
         return (
             loader(

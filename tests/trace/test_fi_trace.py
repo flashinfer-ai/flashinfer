@@ -319,6 +319,39 @@ def test_recurrent_kda_fi_trace():
     assert defn["axes"]["head_dim"]["value"] == head_dim
 
 
+def test_recurrent_kda_facades_trace_under_distinct_names():
+    """Two public APIs must not share one trace label.
+
+    The ``fi_api`` tag always told them apart, but the name did not, so a
+    trace inventory could not attribute a definition to a facade.
+    """
+    import flashinfer.kda
+    import flashinfer.kda_decode
+
+    batch_size, num_q_heads, num_v_heads, head_dim = 4, 8, 16, 128
+    q = torch.empty(batch_size, 1, num_q_heads, head_dim, dtype=torch.bfloat16)
+    v = torch.empty(batch_size, 1, num_v_heads, head_dim, dtype=torch.bfloat16)
+    call = dict(
+        q=q,
+        k=torch.empty_like(q),
+        v=v,
+        g=torch.empty_like(v),
+        beta=torch.empty(batch_size, 1, num_v_heads, dtype=torch.bfloat16),
+    )
+
+    canonical = flashinfer.kda.recurrent_kda.fi_trace(**call)
+    deprecated = flashinfer.kda_decode.recurrent_kda.fi_trace(**call)
+
+    assert canonical["name"] == "recurrent_kda_q8_v16_d128"
+    assert deprecated["name"] == "recurrent_kda_decode_q8_v16_d128"
+
+    # The canonical facade serves both phases; the decode facade serves one.
+    assert "stage:prefill" in canonical["tags"]
+    assert "stage:decode" in canonical["tags"]
+    assert "stage:prefill" not in deprecated["tags"]
+    assert "stage:decode" in deprecated["tags"]
+
+
 def test_ssd_combined_trace_dispatch_exposes_exact_finite_matrix():
     from flashinfer.trace.templates.mamba import ssd_combined_trace_dispatch
 
@@ -1302,6 +1335,51 @@ def test_trtllm_batch_decode_mla_fi_trace_dense_and_ragged():
         "kv_lora_rank",
     ]
     assert ragged["inputs"]["max_q_len"]["shape"] is None
+
+
+@pytest.mark.parametrize("layout", ["dense", "ragged", "sparse"])
+@pytest.mark.parametrize("return_lse_base", ["basee", "base2", None])
+def test_trtllm_mla_fi_trace_lse_base(layout, return_lse_base, tmp_path):
+    import flashinfer.mla
+    from flashinfer.trace.templates import attention
+
+    # Small CPU tensors exercise schema dispatch and the reference without a kernel.
+    kwargs = {
+        "query": torch.ones(1, 1, 2, 6),
+        "kv_cache": torch.ones(1, 1, 2, 6),
+        "workspace_buffer": torch.empty(1, dtype=torch.uint8),
+        "qk_nope_head_dim": 4,
+        "kv_lora_rank": 4,
+        "qk_rope_head_dim": 2,
+        "block_tables": torch.zeros(1, 1, dtype=torch.int32),
+        "seq_lens": torch.tensor([2], dtype=torch.int32),
+        "max_seq_len": 2,
+        "return_lse_base": return_lse_base,
+    }
+    if layout == "ragged":
+        kwargs["query"] = kwargs["query"].reshape(1, 2, 6)
+        kwargs["cum_seq_lens_q"] = torch.tensor([0, 1], dtype=torch.int32)
+        kwargs["max_q_len"] = 1
+    elif layout == "sparse":
+        kwargs["block_tables"] = kwargs["block_tables"].reshape(1, 1, 1)
+        kwargs["sparse_mla_top_k"] = 1
+
+    definition = flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla.fi_trace(
+        save_dir=tmp_path, **kwargs
+    )
+    assert definition["name"].startswith(f"trtllm_batch_decode_mla_{layout}")
+    serialized = json.loads((tmp_path / f"{definition['name']}.json").read_text())
+    assert "return_lse_base_on_e" not in serialized["inputs"]
+    option = serialized["inputs"]["return_lse_base"]
+    assert option["shape"] is None
+    assert option["dtype"] == "string"
+    assert option["optional"] is True
+
+    # These templates currently model only the attention output, which must
+    # remain unchanged when the requested LSE base changes.
+    template = getattr(attention, f"trtllm_batch_decode_mla_{layout}_trace")
+    output = template.reference(**kwargs)
+    torch.testing.assert_close(output, torch.ones(*kwargs["query"].shape[:-1], 4))
 
 
 def test_trtllm_mla_prefill_fi_trace_only_changes_public_api_tag():

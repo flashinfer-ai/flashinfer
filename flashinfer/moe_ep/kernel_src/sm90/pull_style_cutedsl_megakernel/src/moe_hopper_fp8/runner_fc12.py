@@ -86,9 +86,16 @@ class ImplDesc(_BaseImplDesc):
     every launch geometry (both layouts, both scale modes, heuristic or
     explicit tiles) -- there is no separate training descriptor on Hopper;
     the runner pads expert pool segments to 128 rows when it is on.
+
+    ``tail_split_pairs`` splits the tail cluster block of an expert with an
+    odd CTA-tile count into pair tasks (both CTAs compute the single valid
+    token tile against adjacent weight tiles).  It requires a token-side
+    cluster of 2 (swap-AB cga (1,2,1), non-swap cga (2,1,1)) and defaults to
+    False so the default build is unchanged.
     """
 
     generate_c: bool = False
+    tail_split_pairs: bool = False
 
     def _validate_mma_cta_mode(self, m: int) -> None:
         if self.use_2cta_instrs:
@@ -697,6 +704,7 @@ class SwigluFp8Fc12Tester(Fc12TesterBase):
             fp8_accum_mode=self.fp8_accum_mode,
             pingpong=self.pingpong,
             gate_up_clamp=self.problem.gate_up_clamp,
+            tail_split_pairs=self.impl.tail_split_pairs,
         )
 
     def _ensure_fp8_per_tensor_scale_tensors(self) -> None:
@@ -923,6 +931,14 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--pingpong", action="store_true",
         help="Alternate complete task tiles across two WGMMA+epilogue warpgroups.",
     )
+    parser.add_argument(
+        "--tail_split_pairs", action="store_true", default=False,
+        help="Split the tail cluster block of an expert with an odd CTA-tile "
+             "count into pair tasks (both CTAs compute the single valid token "
+             "tile against adjacent weight tiles).  Requires a token-side "
+             "cluster of 2: --swap_ab with --cluster_shape_mnk 1,2,1 or "
+             "non-swap with --cluster_shape_mnk 2,1,1.",
+    )
 
     return parser
 
@@ -958,6 +974,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         load_balance_mode=args.load_balance_mode,
         group_hint=args.group_hint,
         flag_batch=args.flag_batch,
+        tail_split_pairs=args.tail_split_pairs,
     )
 
     misc = MiscDesc(
