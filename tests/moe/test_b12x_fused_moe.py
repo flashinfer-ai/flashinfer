@@ -1552,6 +1552,87 @@ class TestB12xFunctional:
         passed, percent_within, atol = check_accuracy(result, ref_output)
         assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
 
+    @pytest.mark.parametrize(
+        ("backend", "num_tokens"),
+        [(None, 4), ("micro", 4), ("static", 64), ("dynamic", 256)],
+    )
+    @pytest.mark.parametrize("activation", ["silu", "relu2"])
+    @pytest.mark.parametrize("intermediate_size", [160, 320, 704])
+    def test_unaligned_intermediate_matches_reference(
+        self,
+        backend: str | None,
+        num_tokens: int,
+        activation: str,
+        intermediate_size: int,
+        monkeypatch,
+    ):
+        """An intermediate size that is not a multiple of the N128 tile (e.g.
+        Qwen3.8's 640-wide experts split over two ranks) runs on the caller's
+        unpadded weights on every W4A4 backend. Direct micro needs whole
+        256-wide FC2 chunks, so tiny decode batches select the MMA micro
+        kernel instead."""
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        hidden_size = 256
+        num_experts, top_k = 8, 2
+        assert not moe_dispatch._direct_micro_supported(
+            num_tokens, hidden_size, intermediate_size, top_k, num_experts
+        )
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", backend)
+        gated = activation == "silu"
+        tensors = (create_moe_tensors if gated else create_relu2_moe_tensors)(
+            num_tokens=num_tokens,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            num_experts=num_experts,
+            num_local_experts=num_experts,
+            top_k=top_k,
+            vary_block_scales=True,
+        )
+        result = b12x_fused_moe(
+            x=tensors["x_bf16"],
+            w1_weight=tensors["w1_weight"],
+            w1_weight_sf=tensors["w1_weight_sf"],
+            w1_alpha=tensors["w1_alpha"],
+            fc2_input_scale=tensors["fc2_input_scale"],
+            w2_weight=tensors["w2_weight"],
+            w2_weight_sf=tensors["w2_weight_sf"],
+            w2_alpha=tensors["w2_alpha"],
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_experts=num_experts,
+            top_k=top_k,
+            num_local_experts=num_experts,
+            activation=activation,
+        )
+        assert not torch.isnan(result).any() and not torch.isinf(result).any()
+        reference_inputs = dict(
+            hidden_states=tensors["x_bf16"].float().cuda(),
+            token_selected_experts=tensors["token_selected_experts"],
+            token_final_scales=tensors["token_final_scales"],
+            num_tokens=num_tokens,
+            num_experts=num_experts,
+            top_k=top_k,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            fc2_input_scale=tensors["fc2_input_scale"],
+        )
+        if gated:
+            ref_output = compute_reference_moe_fp4(
+                gemm1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                gemm2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                **reference_inputs,
+            )
+        else:
+            ref_output = compute_reference_moe_relu2(
+                fc1_weights=tensors["w1_weight_bf16"].float().cuda(),
+                fc2_weights=tensors["w2_weight_bf16"].float().cuda(),
+                **reference_inputs,
+            )
+        passed, percent_within, atol = check_accuracy(result, ref_output)
+        assert passed, f"Only {percent_within * 100:.2f}% within tol (atol={atol:.4f})"
+
     def test_activation_precision_api_validation(self):
         """W4A4 requires fc2_input_scale; W4A16 tolerates it."""
         from flashinfer import b12x_fused_moe

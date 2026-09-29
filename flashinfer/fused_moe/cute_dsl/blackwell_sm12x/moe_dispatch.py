@@ -19,7 +19,6 @@ import torch
 
 from flashinfer.cute_dsl.utils import (
     convert_sf_from_mma_layout,
-    convert_sf_to_mma_layout,
     get_max_active_clusters,
     get_num_sm,
     make_ptr,
@@ -39,13 +38,11 @@ from .moe_dynamic_kernel import (
 )
 from .moe_micro_kernel import MoEMicroKernel
 from .moe_static_kernel import MoEStaticKernel
-from .moe_w4a16_fp4_helpers import swizzle_block_scale
 from .moe_w4a16_host import (
     _W4A16_ALLOWED_ROUTED_SIZES,
     max_packed_route_slots,
     packed_gemm_scratch_elements,
     route_pack_numel_capacity,
-    unswizzle_block_scale,
     validate_activation,
 )
 from .moe_w4a16_kernel import run_w4a16_moe
@@ -409,10 +406,25 @@ class Sm120StaticMoEWorkspace:
     dm_down_input_scale: torch.Tensor | None = None
 
 
+# Direct micro FC2 consumes the FP4 intermediate in 256-wide chunks and does not
+# mask a partial last chunk on every path, so W4A4 weight views use it only for
+# whole chunks. Other intermediate sizes take the MMA micro kernel.
+_DIRECT_MICRO_N_ALIGNMENT = 256
+
+
+def _direct_micro_supported(
+    m: int, k: int, n: int, num_topk: int, weight_E: int
+) -> bool:
+    """Whether the direct micro kernel can run this W4A4 shape."""
+    return n % _DIRECT_MICRO_N_ALIGNMENT == 0 and MoEDirectMicroKernel.is_supported(
+        m, k, n, num_topk, weight_E
+    )
+
+
 def _direct_micro_candidate(k: int, n: int, num_topk: int, weight_E: int) -> bool:
     """Whether any m in the tiny-decode band can run the direct micro kernel."""
     return any(
-        MoEDirectMicroKernel.is_supported(m, k, n, num_topk, weight_E)
+        _direct_micro_supported(m, k, n, num_topk, weight_E)
         for m in range(1, _MICRO_MAX_TOKENS + 1)
     )
 
@@ -573,6 +585,78 @@ def _register_cache_eviction(cache: Dict, key: Tuple, *source_tensors) -> None:
 _WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
 
 
+def _sf_block_rows(sf_2d: torch.Tensor, num_groups: int) -> torch.Tensor:
+    """Row-major view of 128x4-block swizzled scale factors.
+
+    ``sf_2d`` is the ``(num_groups * m_pad, cols)`` storage returned by
+    ``convert_sf_from_mma_layout``; row ``r`` of a group lives in block
+    ``r // 128`` at ``(r % 32, (r % 128) // 32)``. The bytes are permuted as
+    is, so both NVFP4 (E4M3) and MXFP4 (UE8M0) scales round-trip exactly.
+    """
+    rows, cols = sf_2d.shape
+    m_pad = rows // num_groups
+    blocks = sf_2d.view(torch.uint8).reshape(
+        num_groups, m_pad // 128, cols // 4, 32, 4, 4
+    )
+    return blocks.permute(0, 1, 4, 3, 2, 5).reshape(num_groups, m_pad, cols)
+
+
+def _sf_swizzle_rows(sf_rows: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Inverse of ``_sf_block_rows``: ``(num_groups, m_pad, cols)`` rows back
+    to ``(num_groups * m_pad, cols)`` 128x4-block storage."""
+    num_groups, m_pad, cols = sf_rows.shape
+    blocks = sf_rows.reshape(num_groups, m_pad // 128, 4, 32, cols // 4, 4)
+    return (
+        blocks.permute(0, 1, 4, 3, 2, 5)
+        .reshape(num_groups * m_pad, cols)
+        .contiguous()
+        .view(dtype)
+    )
+
+
+def _w13_branch_scale_factors(
+    sf_2d: torch.Tensor, n: int, num_groups: int, is_gated: bool
+) -> torch.Tensor:
+    """Lay out w13 scale factors so each FC1 branch starts on a 128-row block.
+
+    The kernels read w13 weights through one TMA view per branch ([up, gate]
+    rows of ``n`` each), but address their scale factors in 128-row blocks.
+    When ``n`` is not a multiple of 128 the gate rows would start mid-block,
+    so each branch's scale rows are zero-padded to ``align_up(n, 128)``. The
+    padded rows pair with weight rows the TMA views zero-fill, and zero scales
+    keep them from contributing non-finite values.
+    """
+    branch_rows = _align_up(n, 128)
+    num_branches = 2 if is_gated else 1
+    if branch_rows == n:
+        return sf_2d
+    rows = _sf_block_rows(sf_2d, num_groups)
+    padded = rows.new_zeros(num_groups, num_branches * branch_rows, rows.shape[2])
+    for branch in range(num_branches):
+        padded[:, branch * branch_rows : branch * branch_rows + n] = rows[
+            :, branch * n : (branch + 1) * n
+        ]
+    return _sf_swizzle_rows(padded, sf_2d.dtype)
+
+
+def _down_scale_factors(
+    sf_2d: torch.Tensor, n: int, num_groups: int, sf_vec_size: int
+) -> torch.Tensor:
+    """Zero the storage-padding scale columns of w2 past ``n``.
+
+    FC2 reduces over the intermediate size in whole K tiles, so a partial last
+    tile reads the scale columns padded up to the 4-column block. Their weight
+    columns are zero-filled by TMA; zero scales keep them from contributing
+    non-finite values whatever the producer left in the padding.
+    """
+    valid_cols = (n + sf_vec_size - 1) // sf_vec_size
+    if valid_cols == sf_2d.shape[1]:
+        return sf_2d
+    rows = _sf_block_rows(sf_2d, num_groups).clone()
+    rows[:, :, valid_cols:] = 0
+    return _sf_swizzle_rows(rows, sf_2d.dtype)
+
+
 def _get_weight_views(
     w1_fp4: torch.Tensor,
     w1_blockscale: torch.Tensor,
@@ -585,22 +669,16 @@ def _get_weight_views(
     activation_precision: str = "fp4",
     quant_mode: str = "nvfp4",
 ) -> _WeightViews:
-    """Create permuted weight views for the static kernel.
+    """Create permuted weight views for the static and dynamic kernels.
 
-    The kernel expects concatenated w13 data with shape [2*n, k//2, E]
-    via a single TMA descriptor.
+    The kernels read concatenated w13 data with shape [2*n, k//2, E] for gated
+    activations (``n`` rows for non-gated ones) through one TMA view per FC1
+    branch, so ``n`` need not be a multiple of the N tile. The w13 scale
+    factors are laid out per branch by ``_w13_branch_scale_factors``.
     """
     activation_precision = _normalize_activation_precision(activation_precision)
     quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
-    tile_n = _level_tile_n(activation_precision)
-    # The kernel splits w13 into gate/up halves by tile index. This only works
-    # when the boundary between halves lands on a tile-aligned column.
-    if n % tile_n != 0:
-        raise ValueError(
-            f"intermediate_size ({n}) must be a multiple of {tile_n} "
-            f"for the SM120 MoE kernel's gate/up tile split."
-        )
 
     key = (
         activation_precision,
@@ -617,17 +695,27 @@ def _get_weight_views(
         # Cache the fresh buffers (scale factors + fp32 alphas).
         w1_rows = w1_fp4.shape[1]  # 2*n for gated, n for non-gated
         cached = (
-            convert_sf_from_mma_layout(
-                w1_blockscale,
-                m=w1_rows,
-                k=k,
+            _w13_branch_scale_factors(
+                convert_sf_from_mma_layout(
+                    w1_blockscale,
+                    m=w1_rows,
+                    k=k,
+                    num_groups=w1_fp4.shape[0],
+                    sf_vec_size=sf_vec_size,
+                ),
+                n=n,
                 num_groups=w1_fp4.shape[0],
-                sf_vec_size=sf_vec_size,
+                is_gated=w1_rows == 2 * n,
             ).contiguous(),
-            convert_sf_from_mma_layout(
-                w2_blockscale,
-                m=k,
-                k=n,
+            _down_scale_factors(
+                convert_sf_from_mma_layout(
+                    w2_blockscale,
+                    m=k,
+                    k=n,
+                    num_groups=w2_fp4.shape[0],
+                    sf_vec_size=sf_vec_size,
+                ),
+                n=n,
                 num_groups=w2_fp4.shape[0],
                 sf_vec_size=sf_vec_size,
             ).contiguous(),
@@ -1010,7 +1098,11 @@ def _get_static_kernel(
     )
     route_output_scratch_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.BFloat16,
-        (max_rows * max(1, n // _STATIC_RETAINED_GROUP_N) * k,),
+        (
+            max_rows
+            * max(1, _align_up(n, _STATIC_RETAINED_GROUP_N) // _STATIC_RETAINED_GROUP_N)
+            * k,
+        ),
         assumed_align=16,
     )
     scale_storage_fake = cute.runtime.make_fake_compact_tensor(
@@ -1579,7 +1671,7 @@ def launch_sm120_static_moe(
         and num_tokens <= _MICRO_MAX_TOKENS
         and routed_rows < _DIRECT_MICRO_CUTOVER_PAIRS
         and n <= _DIRECT_MICRO_MAX_N
-        and MoEDirectMicroKernel.is_supported(num_tokens, k, n, top_k, num_experts)
+        and _direct_micro_supported(num_tokens, k, n, top_k, num_experts)
     )
     if _FORCED_BACKEND is not None:
         if _FORCED_BACKEND == "direct_micro":
@@ -1588,7 +1680,7 @@ def launch_sm120_static_moe(
                     "forced direct_micro backend only supports quant_mode=nvfp4"
                 )
             if workspace.dm_barrier_count is None or not (
-                MoEDirectMicroKernel.is_supported(num_tokens, k, n, top_k, num_experts)
+                _direct_micro_supported(num_tokens, k, n, top_k, num_experts)
             ):
                 raise ValueError(
                     "forced direct_micro backend cannot run this shape "
@@ -2920,7 +3012,6 @@ def clear_sm120_moe_caches() -> None:
     _WORKSPACE_CACHE.clear()
     _WEIGHT_CACHE.clear()
     _W4A16_WEIGHT_CACHE.clear()
-    _PADDED_WEIGHT_CACHE.clear()
     _STATIC_KERNEL_CACHE.clear()
     _MICRO_KERNEL_CACHE.clear()
     _DIRECT_MICRO_LAUNCH_CACHE.clear()
@@ -3088,138 +3179,6 @@ def _get_cached_workspace(
 # ==========================================================================
 # Unified dispatch
 # ==========================================================================
-_PADDED_WEIGHT_CACHE: Dict[Tuple, Tuple] = {}
-
-
-def _pad_intermediate_to_tile(
-    w1_weight,
-    w1_weight_sf,
-    w2_weight,
-    w2_weight_sf,
-    fc2_input_scale,
-    n,
-    tile,
-    h,
-    num_experts,
-    is_gated,
-    quant_mode="nvfp4",
-):
-    """Zero-pad W4A4 weights + scale factors so the intermediate size is a
-    multiple of ``tile`` (gate/up tile-split requirement); padded channels are
-    zero, so the result is numerically identical.
-    """
-    quant_mode = _normalize_quant_mode(quant_mode)
-    sf_vec_size, _ = _sf_params_for_quant_mode(quant_mode)
-    n_pad = ((n + tile - 1) // tile) * tile
-    if n_pad == n:
-        return w1_weight, w1_weight_sf, w2_weight, w2_weight_sf, fc2_input_scale, n
-    E = int(num_experts)
-    fc2_input_scale_src = fc2_input_scale
-    key = (
-        n,
-        tile,
-        h,
-        E,
-        bool(is_gated),
-        quant_mode,
-        w1_weight.data_ptr(),
-        w1_weight_sf.data_ptr(),
-        w2_weight.data_ptr(),
-        w2_weight_sf.data_ptr(),
-        fc2_input_scale_src.data_ptr() if fc2_input_scale_src is not None else 0,
-    )
-    cached = _PADDED_WEIGHT_CACHE.get(key)
-    if cached is not None:
-        return cached
-
-    def mma_to_logical(sf, m, k):
-        sw = convert_sf_from_mma_layout(
-            sf,
-            m=m,
-            k=k,
-            num_groups=E,
-            sf_vec_size=sf_vec_size,
-        )
-        m_pad = ((m + 127) // 128) * 128
-        sw = sw.reshape(E, m_pad, -1)
-        cb = (k + sf_vec_size - 1) // sf_vec_size
-        # MXFP4 logical scales remain raw UE8M0 bytes.
-        if quant_mode == "mxfp4":
-            cols_padded = ((cb + 3) // 4) * 4
-            return torch.stack(
-                [
-                    sw[e]
-                    .reshape(m_pad // 128, cols_padded // 4, 32, 4, 4)
-                    .permute(0, 3, 2, 1, 4)
-                    .contiguous()
-                    .reshape(m_pad, cols_padded)[:m, :cb]
-                    for e in range(E)
-                ],
-                0,
-            )
-        # NVFP4 logical scales are decoded float32 magnitudes.
-        return torch.stack(
-            [unswizzle_block_scale(sw[e], rows=m, cols_blocks=cb) for e in range(E)], 0
-        )
-
-    def logical_to_mma(log, m, k):
-        sw = torch.stack([swizzle_block_scale(log[e]) for e in range(E)], 0)
-        scale_dtype = torch.uint8 if quant_mode == "mxfp4" else torch.float8_e4m3fn
-        sw2d = sw.reshape(E * sw.shape[1], sw.shape[2]).to(scale_dtype)
-        return convert_sf_to_mma_layout(
-            sw2d,
-            m=m,
-            k=k,
-            num_groups=E,
-            sf_vec_size=sf_vec_size,
-        )
-
-    def pad_dim(t, dim, old, new):
-        if new == old:
-            return t
-        shp = list(t.shape)
-        shp[dim] = new - old
-        return torch.cat([t, t.new_zeros(shp)], dim=dim)
-
-    if is_gated:
-        # w1 packs [up(0:n), gate(n:2n)] rows; pad each half so the split stays
-        # tile-aligned, then re-concat.
-        up, gate = w1_weight[:, :n, :], w1_weight[:, n : 2 * n, :]
-        w1p = torch.cat([pad_dim(up, 1, n, n_pad), pad_dim(gate, 1, n, n_pad)], dim=1)
-        log1 = mma_to_logical(w1_weight_sf, m=2 * n, k=h)
-        up_sf, gate_sf = log1[:, :n, :], log1[:, n : 2 * n, :]
-        log1p = torch.cat(
-            [pad_dim(up_sf, 1, n, n_pad), pad_dim(gate_sf, 1, n, n_pad)], dim=1
-        )
-        w1_sf_p = logical_to_mma(log1p, m=2 * n_pad, k=h)
-    else:
-        w1p = pad_dim(w1_weight, 1, n, n_pad)
-        log1 = mma_to_logical(w1_weight_sf, m=n, k=h)
-        w1_sf_p = logical_to_mma(pad_dim(log1, 1, n, n_pad), m=n_pad, k=h)
-
-    # w2 reduces over the intermediate dim: pad its packed columns + SF columns.
-    w2p = pad_dim(w2_weight, 2, n // 2, n_pad // 2)
-    log2 = mma_to_logical(w2_weight_sf, m=h, k=n)
-    cb_n = (n + sf_vec_size - 1) // sf_vec_size
-    cb_np = (n_pad + sf_vec_size - 1) // sf_vec_size
-    w2_sf_p = logical_to_mma(pad_dim(log2, 2, cb_n, cb_np), m=h, k=n_pad)
-
-    if fc2_input_scale_src is not None and fc2_input_scale_src.numel() == n:
-        fc2_input_scale = pad_dim(fc2_input_scale_src, 0, n, n_pad)
-    result = (w1p, w1_sf_p, w2p, w2_sf_p, fc2_input_scale, n_pad)
-    _PADDED_WEIGHT_CACHE[key] = result
-    _register_cache_eviction(
-        _PADDED_WEIGHT_CACHE,
-        key,
-        w1_weight,
-        w1_weight_sf,
-        w2_weight,
-        w2_weight_sf,
-        fc2_input_scale_src,
-    )
-    return result
-
-
 def _validate_static_workspace_for_launch(
     workspace,
     *,
@@ -3234,6 +3193,9 @@ def _validate_static_workspace_for_launch(
     quant_mode: str,
 ) -> None:
     """Reject stale or undersized shared static workspaces before launch."""
+    # Static workspaces record the retained-group-aligned intermediate size
+    # (see allocate_sm120_static_workspace).
+    n = _align_up(n, _STATIC_RETAINED_GROUP_N)
     if type(workspace) is not Sm120StaticMoEWorkspace:
         raise ValueError(
             "pre-allocated static workspace must be Sm120StaticMoEWorkspace"
@@ -3429,29 +3391,6 @@ def launch_sm120_moe(
     if quant_mode == "mxfp4" and k % 128 != 0:
         raise ValueError(f"MXFP4 b12x hidden_size ({k}) must be a multiple of 128.")
 
-    # W4A4 kernels need a tile-aligned gate/up split.
-    if quant_mode != "w4a16" and n % _LEVEL_TILE_N != 0 and _weight_views is None:
-        (
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            fc2_input_scale,
-            n,
-        ) = _pad_intermediate_to_tile(
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            fc2_input_scale,
-            n,
-            _LEVEL_TILE_N,
-            k,
-            w1_weight.size(0),
-            is_gated,
-            quant_mode,
-        )
-
     routed_rows = num_tokens * top_k
 
     if quant_mode == "w4a16":
@@ -3531,32 +3470,7 @@ def launch_sm120_moe(
         if backend == "dynamic" and num_local_experts != num_experts:
             backend = "static"
 
-    # retained2 always consumes two adjacent N128 slices. Keep that physical
-    # padding inside the static dispatch path; the wrapper remains unaware of
-    # the schedule and dynamic keeps its native N128 geometry.
     weight_views = _weight_views
-    if backend == "static" and n % _STATIC_RETAINED_GROUP_N != 0:
-        (
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            fc2_input_scale,
-            n,
-        ) = _pad_intermediate_to_tile(
-            w1_weight,
-            w1_weight_sf,
-            w2_weight,
-            w2_weight_sf,
-            fc2_input_scale,
-            n,
-            _STATIC_RETAINED_GROUP_N,
-            k,
-            w1_weight.size(0),
-            is_gated,
-            quant_mode,
-        )
-        weight_views = None
 
     if fc2_input_scale is None:
         if quant_mode == "nvfp4":

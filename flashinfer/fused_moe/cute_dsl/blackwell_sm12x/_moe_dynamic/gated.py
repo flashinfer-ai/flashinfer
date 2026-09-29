@@ -2718,8 +2718,8 @@ class MoEGatedDynamicKernel:
         gmem_partitions,
         smem_partitions,
     ):
-        tma_a, tma_b_w13, tma_sfa, tma_sfb_w13 = tma_inputs
-        tAgA_mk, tAgSFA_mk, tBgB_w13, tBgSFB_w13 = gmem_partitions
+        tma_a, tma_b_w13, tma_b_w13_up, tma_sfa, tma_sfb_w13 = tma_inputs
+        tAgA_mk, tAgSFA_mk, tBgB_w13, tBgB_w13_up, tBgSFB_w13 = gmem_partitions
         (
             tAsA,
             tAsSFA,
@@ -2737,22 +2737,22 @@ class MoEGatedDynamicKernel:
         prod_state.reset_count()
         gate_wait_pending = wait_for_prior_slice
         for fc1_half in cutlass.range_constexpr(2):
-            native_up_slice_idx = intermediate_slice * Int32(2) + Int32(fc1_half)
-            native_gate_slice_idx = (intermediate_slice + gate_tile_cnt) * Int32(
-                2
-            ) + Int32(fc1_half)
+            # Gate and Up are separate branch views sharing native indices;
+            # their scale factors share one view with Gate offset by
+            # sfb_gate_slice_offset logical slices.
+            native_slice_idx = intermediate_slice * Int32(2) + Int32(fc1_half)
             tBgB_w13_gate_nk = tBgB_w13[
                 (
                     None,
-                    native_gate_slice_idx,
+                    native_slice_idx,
                     None,
                     task_expert_idx,
                 )
             ]
-            tBgB_w13_up_nk = tBgB_w13[
+            tBgB_w13_up_nk = tBgB_w13_up[
                 (
                     None,
-                    native_up_slice_idx,
+                    native_slice_idx,
                     None,
                     task_expert_idx,
                 )
@@ -2760,7 +2760,7 @@ class MoEGatedDynamicKernel:
             tBgSFB_w13_gate_nk = tBgSFB_w13[
                 (
                     None,
-                    intermediate_slice + gate_tile_cnt,
+                    intermediate_slice + Int32(self.sfb_gate_slice_offset),
                     None,
                     task_expert_idx,
                 )
@@ -2798,7 +2798,7 @@ class MoEGatedDynamicKernel:
                     tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state),
                 )
                 cute.copy(
-                    tma_b_w13,
+                    tma_b_w13_up,
                     tBgB_w13_up_nk[(None, k_tile)],
                     tBsB_w13_up[(None, prod_state.index)],
                     tma_bar_ptr=ml_pipeline.producer_get_barrier(prod_state),
@@ -3722,9 +3722,24 @@ class MoEGatedDynamicKernel:
         )
         sfa_tensor = cute.make_tensor(sfa_ptr, sfa_layout)
 
-        # SF tensor for w13 (gated: gate+up concatenated; relu2: single W1)
+        # w13 packs [up, gate] rows of fc1_branch_rows each. Each branch gets
+        # its own weight view and TMA descriptor bounded by its own rows, so a
+        # partial last N tile reads zeros rather than the next branch: the
+        # intermediate size need not be a multiple of the N128 slice. The
+        # branch scale factors each start on a 128-row block (see
+        # moe_dispatch._w13_branch_scale_factors).
+        fc1_branch_rows = b_w13.shape[0] // 2
+        sfb_branch_rows = (fc1_branch_rows + 127) // 128 * 128
+        self.sfb_gate_slice_offset = sfb_branch_rows // self.tile_shape_mnk[1]
+        branch_layout = cute.make_layout(
+            (fc1_branch_rows, b_w13.shape[1], b_w13.shape[2]), stride=b_w13.stride
+        )
+        b_w13_up = cute.make_tensor(b_w13.iterator, branch_layout)
+        b_w13_gate = cute.make_tensor(
+            b_w13.iterator + fc1_branch_rows * b_w13.stride[0], branch_layout
+        )
         sfb_w13_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_w13.shape, self.sf_vec_size
+            (2 * sfb_branch_rows, b_w13.shape[1], b_w13.shape[2]), self.sf_vec_size
         )
         sfb_w13_tensor = cute.make_tensor(sfb_w13_ptr, sfb_w13_layout)
 
@@ -3742,10 +3757,16 @@ class MoEGatedDynamicKernel:
             1,
             internal_type=cutlass.Int16,
         )
-        # FC1 B uses a true N64 descriptor.  Each logical N128 slice is two
-        # consecutive native B tiles; Up precedes Gate in global w13 storage.
+        # FC1 B uses a true N64 descriptor per branch (gate, up).  Each
+        # logical N128 slice is two consecutive native B tiles of a branch.
         tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
-            b_w13,
+            b_w13_gate,
+            self.fc1_b_smem_layout_staged,
+            (self.fc1_tile_shape_mnk[1], self.fc1_tile_shape_mnk[2]),
+            1,
+        )
+        tma_b_w13_up, gB_w13_up = self._dense_cls._make_tma_atoms_and_tensors(
+            b_w13_up,
             self.fc1_b_smem_layout_staged,
             (self.fc1_tile_shape_mnk[1], self.fc1_tile_shape_mnk[2]),
             1,
@@ -3779,8 +3800,10 @@ class MoEGatedDynamicKernel:
             internal_type=cutlass.Int16,
         )
 
-        # W13 concatenates equally-sized Gate and Up branches along N.
-        gate_tile_cnt_static = b_w13.shape[0] // self.tile_shape_mnk[1] // 2
+        # Each branch spans ceil(fc1_branch_rows / N128) logical slices.
+        gate_tile_cnt_static = (
+            fc1_branch_rows + self.tile_shape_mnk[1] - 1
+        ) // self.tile_shape_mnk[1]
         if cutlass.const_expr(gate_tile_cnt_static > _TASK_SLICE_CHUNK):
             raise ValueError(
                 "the gated dynamic kernel retains at most four intermediate "
@@ -3808,6 +3831,8 @@ class MoEGatedDynamicKernel:
             gSFA,
             tma_b_w13,
             gB_w13,
+            tma_b_w13_up,
+            gB_w13_up,
             tma_sfb_w13,
             gSFB_w13,
             tma_b_down,
@@ -3868,6 +3893,8 @@ class MoEGatedDynamicKernel:
         mSFA: cute.Tensor,
         tma_b_w13: cute.CopyAtom,
         mB_w13: cute.Tensor,
+        tma_b_w13_up: cute.CopyAtom,
+        mB_w13_up: cute.Tensor,
         tma_sfb_w13: cute.CopyAtom,
         mSFB_w13: cute.Tensor,
         tma_b_down: cute.CopyAtom,
@@ -3913,6 +3940,7 @@ class MoEGatedDynamicKernel:
             cpasync.prefetch_descriptor(tma_a)
             cpasync.prefetch_descriptor(tma_sfa)
             cpasync.prefetch_descriptor(tma_b_w13)
+            cpasync.prefetch_descriptor(tma_b_w13_up)
             cpasync.prefetch_descriptor(tma_sfb_w13)
             cpasync.prefetch_descriptor(tma_b_down)
             cpasync.prefetch_descriptor(tma_sfb_down)
@@ -4167,6 +4195,11 @@ class MoEGatedDynamicKernel:
             cute.slice_(self.fc1_tile_shape_mnk, (0, None, None)),
             (None, None, None),
         )
+        gB_w13_up_tiled = cute.local_tile(
+            mB_w13_up,
+            cute.slice_(self.fc1_tile_shape_mnk, (0, None, None)),
+            (None, None, None),
+        )
         gSFA = cute.local_tile(
             mSFA, cute.slice_(self.tile_shape_mnk, (None, 0, None)), (None, None, None)
         )
@@ -4208,12 +4241,12 @@ class MoEGatedDynamicKernel:
             cute.group_modes(sB_fc1, 0, 2),
             cute.group_modes(gB_w13_tiled, 0, 2),
         )
-        tBsB_w13_up, _tBgB_w13_up = cpasync.tma_partition(
-            tma_b_w13,
+        tBsB_w13_up, tBgB_w13_up = cpasync.tma_partition(
+            tma_b_w13_up,
             b_cta_crd,
             b_cta_layout,
             cute.group_modes(sB_up_fc1, 0, 2),
-            cute.group_modes(gB_w13_tiled, 0, 2),
+            cute.group_modes(gB_w13_up_tiled, 0, 2),
         )
         tBsSFB_w13, tBgSFB_w13 = cpasync.tma_partition(
             tma_sfb_w13,
@@ -4316,9 +4349,9 @@ class MoEGatedDynamicKernel:
         acc_shape = (sub_shape[0], sub_shape[1] * epi_m_scale, sub_shape[2])
         k_tile_cnt = cute.size(gA, mode=[3])
         fc1_k_tile_cnt = k_tile_cnt
-        # gB is native-N64 while tasks and FC2 remain logical-N128.
-        native_fc1_tile_cnt = cute.size(gB_w13_tiled, mode=[2]) // Int32(2)
-        gate_tile_cnt = native_fc1_tile_cnt // Int32(2)
+        # gB is native-N64 per branch while tasks and FC2 remain logical-N128.
+        native_fc1_tile_cnt = cute.size(gB_w13_tiled, mode=[2])
+        gate_tile_cnt = (native_fc1_tile_cnt + Int32(1)) // Int32(2)
         output_tile_cnt = cute.size(gB_down, mode=[2])
 
         prod_state = pipeline.make_pipeline_state(
@@ -4779,8 +4812,8 @@ class MoEGatedDynamicKernel:
                         ml_pipeline,
                         up_prod_state,
                         up_pipeline,
-                        (tma_a, tma_b_w13, tma_sfa, tma_sfb_w13),
-                        (tAgA_mk, tAgSFA_mk, tBgB_w13, tBgSFB_w13),
+                        (tma_a, tma_b_w13, tma_b_w13_up, tma_sfa, tma_sfb_w13),
+                        (tAgA_mk, tAgSFA_mk, tBgB_w13, tBgB_w13_up, tBgSFB_w13),
                         (
                             tAsA,
                             tAsSFA,

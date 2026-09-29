@@ -37,7 +37,7 @@ Example (Wrapper API with CUDA Graph):
     >>> output = moe.run(x=hidden_states_bf16, ...)
 """
 
-from typing import Any, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch
 
@@ -405,8 +405,6 @@ class B12xMoEWrapper:
         self._dynamic_workspace: object = None
         self._weight_views: object = None
         self._weight_key: Optional[Tuple] = None
-        self._padded_weights: Any = None
-        self._padded_weight_key: Optional[Tuple] = None
         self._moe_output: Optional[torch.Tensor] = None
         self._folded_w1_alpha: Optional[torch.Tensor] = None
         self._folded_w1_alpha_key: Optional[Tuple] = None
@@ -636,9 +634,6 @@ class B12xMoEWrapper:
             launch_sm120_moe,
             select_sm120_moe_backend,
             _get_weight_views as _get_sm120_weight_views,
-            _pad_intermediate_to_tile,
-            _LEVEL_TILE_N,
-            is_gated_activation,
         )
 
         # Pick the right pre-allocated workspace for this call's token
@@ -689,40 +684,6 @@ class B12xMoEWrapper:
                 w2_weight_sf.data_ptr(),
                 w2_alpha.data_ptr(),
             )
-            n_eff = self.intermediate_size
-            # Pad non-128-aligned intermediate sizes once and cache.
-            if self.intermediate_size % _LEVEL_TILE_N != 0:
-                padded_weight_key = (
-                    *weight_key,
-                    fc2_input_scale.data_ptr() if fc2_input_scale is not None else 0,
-                )
-                if (
-                    self._padded_weights is None
-                    or self._padded_weight_key != padded_weight_key
-                ):
-                    is_gated = is_gated_activation(self.activation)
-                    self._padded_weights = _pad_intermediate_to_tile(
-                        w1_weight,
-                        w1_weight_sf,
-                        w2_weight,
-                        w2_weight_sf,
-                        fc2_input_scale,
-                        self.intermediate_size,
-                        _LEVEL_TILE_N,
-                        self.hidden_size,
-                        w1_weight.size(0),
-                        is_gated,
-                        self.quant_mode,
-                    )
-                    self._padded_weight_key = padded_weight_key
-                (
-                    w1_weight,
-                    w1_weight_sf,
-                    w2_weight,
-                    w2_weight_sf,
-                    fc2_input_scale,
-                    n_eff,
-                ) = self._padded_weights
 
             if self._weight_views is None or self._weight_key != weight_key:
                 self._weight_views = _get_sm120_weight_views(
@@ -732,7 +693,7 @@ class B12xMoEWrapper:
                     w2_blockscale=w2_weight_sf,
                     w1_alphas=w1_alpha,
                     w2_alphas=w2_alpha,
-                    n=n_eff,
+                    n=self.intermediate_size,
                     k=self.hidden_size,
                     activation_precision=self.activation_precision,
                     quant_mode=self.quant_mode,

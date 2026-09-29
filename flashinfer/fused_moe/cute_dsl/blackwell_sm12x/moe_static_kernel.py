@@ -1002,9 +1002,33 @@ class MoEStaticKernel:
         )
         sfa_tensor = cute.make_tensor(sfa_ptr, sfa_layout)
 
-        # Single SF tensor for concatenated w13 (gate+up scale factors)
+        # w13 packs [up, gate] rows of fc1_branch_rows each (gated), or one
+        # branch (non-gated). Each branch gets its own weight view and TMA
+        # descriptor bounded by its own rows, so a partial last N tile reads
+        # zeros rather than the next branch: the intermediate size need not be
+        # a multiple of the N tile. The branch scale factors each start on a
+        # 128-row block (see moe_dispatch._w13_branch_scale_factors).
+        fc1_branch_rows = b_w13.shape[0] // 2 if self.is_gated else b_w13.shape[0]
+        sfb_branch_rows = (fc1_branch_rows + 127) // 128 * 128
+        self.sfb_gate_tile_offset = sfb_branch_rows // self.tile_shape_mnk[1]
+        branch_layout = cute.make_layout(
+            (fc1_branch_rows, b_w13.shape[1], b_w13.shape[2]), stride=b_w13.stride
+        )
+        b_w13_up = cute.make_tensor(b_w13.iterator, branch_layout)
+        b_w13_gate = (
+            cute.make_tensor(
+                b_w13.iterator + fc1_branch_rows * b_w13.stride[0], branch_layout
+            )
+            if self.is_gated
+            else b_w13_up
+        )
         sfb_w13_layout = blockscaled_utils.tile_atom_to_shape_SF(
-            b_w13.shape, self.sf_vec_size
+            (
+                (2 if self.is_gated else 1) * sfb_branch_rows,
+                b_w13.shape[1],
+                b_w13.shape[2],
+            ),
+            self.sf_vec_size,
         )
         sfb_w13_tensor = cute.make_tensor(sfb_w13_ptr, sfb_w13_layout)
 
@@ -1022,10 +1046,16 @@ class MoEStaticKernel:
             1,
             internal_type=cutlass.Int16,
         )
-        # Single TMA descriptor over concatenated w13 [2*I_tp, K, E].
-        # Up tiles at N=0..I_tp/tile_N-1, gate tiles at N=I_tp/tile_N..2*I_tp/tile_N-1.
+        # One TMA descriptor per w13 branch: gate (or the single non-gated
+        # branch) and up.
         tma_b_w13, gB_w13 = self._dense_cls._make_tma_atoms_and_tensors(
-            b_w13,
+            b_w13_gate,
+            self.b_smem_layout_staged,
+            (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
+            1,
+        )
+        tma_b_w13_up, gB_w13_up = self._dense_cls._make_tma_atoms_and_tensors(
+            b_w13_up,
             self.b_smem_layout_staged,
             (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
             1,
@@ -1073,6 +1103,8 @@ class MoEStaticKernel:
             gSFA,
             tma_b_w13,
             gB_w13,
+            tma_b_w13_up,
+            gB_w13_up,
             tma_sfb_w13,
             gSFB_w13,
             tma_b_down,
@@ -1115,8 +1147,9 @@ class MoEStaticKernel:
         # non-gated FC1 slice count is the full w13 tile count.  This must
         # match the device-side gate_tile_cnt/retained_group_count, or the
         # finalize sums the wrong route-scratch slots.
-        fc1_branch_rows = b_w13.shape[0] // 2 if self.is_gated else b_w13.shape[0]
-        gate_tile_count = fc1_branch_rows // self.tile_shape_mnk[1]
+        gate_tile_count = (
+            fc1_branch_rows + self.tile_shape_mnk[1] - 1
+        ) // self.tile_shape_mnk[1]
         retained_group_count = (gate_tile_count + 1) // 2
         final_vec_count = (a_input.shape[0] * hidden_size) // 8
         final_grid_z = (final_vec_count + 255) // 256
@@ -1151,6 +1184,8 @@ class MoEStaticKernel:
         mSFA: cute.Tensor,
         tma_b_w13: cute.CopyAtom,
         mB_w13: cute.Tensor,
+        tma_b_w13_up: cute.CopyAtom,
+        mB_w13_up: cute.Tensor,
         tma_sfb_w13: cute.CopyAtom,
         mSFB_w13: cute.Tensor,
         tma_b_down: cute.CopyAtom,
@@ -1193,6 +1228,8 @@ class MoEStaticKernel:
             cpasync.prefetch_descriptor(tma_a)
             cpasync.prefetch_descriptor(tma_sfa)
             cpasync.prefetch_descriptor(tma_b_w13)
+            if cutlass.const_expr(self.is_gated):
+                cpasync.prefetch_descriptor(tma_b_w13_up)
             cpasync.prefetch_descriptor(tma_sfb_w13)
             cpasync.prefetch_descriptor(tma_b_down)
             cpasync.prefetch_descriptor(tma_sfb_down)
@@ -1548,12 +1585,16 @@ class MoEStaticKernel:
         )
 
         gA = cute.local_tile(mA, self.sa_tile_shape_mk, (None, None, None))
-        # Single tiled view over concatenated w13 [2*I_tp, K, E].
-        # W13 is packed as [up, gate] across the concatenated N dimension.
-        # Up tiles: N-indices 0..gate_tile_cnt-1
-        # Gate tiles: N-indices gate_tile_cnt..2*gate_tile_cnt-1
+        # One tiled view per w13 branch; both share N-tile indices
+        # 0..gate_tile_cnt-1. Scale factors keep one [up, gate] view whose gate
+        # branch starts sfb_gate_tile_offset N tiles in.
         gB_w13_tiled = cute.local_tile(
             mB_w13,
+            cute.slice_(self.tile_shape_mnk, (0, None, None)),
+            (None, None, None),
+        )
+        gB_w13_up_tiled = cute.local_tile(
+            mB_w13_up,
             cute.slice_(self.tile_shape_mnk, (0, None, None)),
             (None, None, None),
         )
@@ -1585,7 +1626,8 @@ class MoEStaticKernel:
         tAsSFA = cute.filter_zeros(tAsSFA)
         tAgSFA = cute.filter_zeros(tAgSFA)
 
-        # Single w13 TMA partition (gate+up concatenated)
+        # w13 TMA partitions: gate (or the single non-gated branch) into sB,
+        # up into sB_up.
         tBsB_w13, tBgB_w13 = cpasync.tma_partition(
             tma_b_w13,
             b_cta_crd,
@@ -1593,12 +1635,12 @@ class MoEStaticKernel:
             cute.group_modes(sB, 0, 2),
             cute.group_modes(gB_w13_tiled, 0, 2),
         )
-        tBsB_w13_up, _ = cpasync.tma_partition(
-            tma_b_w13,
+        tBsB_w13_up, tBgB_w13_up = cpasync.tma_partition(
+            tma_b_w13_up,
             b_cta_crd,
             b_cta_layout,
             cute.group_modes(sB_up, 0, 2),
-            cute.group_modes(gB_w13_tiled, 0, 2),
+            cute.group_modes(gB_w13_up_tiled, 0, 2),
         )
         tBsSFB_w13, tBgSFB_w13 = cpasync.tma_partition(
             tma_sfb_w13,
@@ -1678,14 +1720,8 @@ class MoEStaticKernel:
 
         k_tile_cnt = cute.size(gA, mode=[3])
         fc1_k_tile_cnt = k_tile_cnt
-        # Gated: w13 has 2*I_tp/tile_N N-tiles. Gate = second half, up = first half.
-        # ReLU2: w13 has I_tp/tile_N N-tiles. Single FC1 pass, no split.
-        intermediate_tile_cnt = cute.size(gB_w13_tiled, mode=[2])
-        gate_tile_cnt = (
-            intermediate_tile_cnt // Int32(2)
-            if self.is_gated
-            else intermediate_tile_cnt
-        )
+        # Each w13 branch view spans ceil(I_tp / tile_N) N-tiles.
+        gate_tile_cnt = cute.size(gB_w13_tiled, mode=[2])
         output_tile_cnt = cute.size(gB_down, mode=[2])
         retained_group_count = (gate_tile_cnt + Int32(1)) // Int32(2)
         prod_state = pipeline.make_pipeline_state(
@@ -2553,22 +2589,22 @@ class MoEStaticKernel:
                 # no extra shared storage is needed.
                 for retained_slice_idx in cutlass.range_constexpr(2):
                     current_slice = intermediate_slice + Int32(retained_slice_idx)
-                    tBgB_w13_up_nk = tBgB_w13[
+                    tBgB_w13_up_nk = tBgB_w13_up[
                         (None, current_slice, None, weight_expert_idx)
                     ]
                     sfb_up_tile_coord = current_slice // self.sfb_tiles_per_block
                     tBgSFB_w13_up_nk = tBgSFB_w13[
                         (None, sfb_up_tile_coord, None, weight_expert_idx)
                     ]
-                    gate_slice = (
-                        current_slice + gate_tile_cnt
+                    tBgB_w13_gate_nk = tBgB_w13[
+                        (None, current_slice, None, weight_expert_idx)
+                    ]
+                    sfb_gate_slice = (
+                        current_slice + Int32(self.sfb_gate_tile_offset)
                         if self.is_gated
                         else current_slice
                     )
-                    tBgB_w13_gate_nk = tBgB_w13[
-                        (None, gate_slice, None, weight_expert_idx)
-                    ]
-                    sfb_gate_tile_coord = gate_slice // self.sfb_tiles_per_block
+                    sfb_gate_tile_coord = sfb_gate_slice // self.sfb_tiles_per_block
                     tBgSFB_w13_gate_nk = tBgSFB_w13[
                         (None, sfb_gate_tile_coord, None, weight_expert_idx)
                     ]
@@ -2590,7 +2626,7 @@ class MoEStaticKernel:
                         )
                         if cutlass.const_expr(self.is_gated):
                             cute.copy(
-                                tma_b_w13,
+                                tma_b_w13_up,
                                 tBgB_w13_up_nk[(None, k_tile)],
                                 tBsB_w13_up[(None, prod_state.index)],
                                 tma_bar_ptr=ml_pipeline.producer_get_barrier(
