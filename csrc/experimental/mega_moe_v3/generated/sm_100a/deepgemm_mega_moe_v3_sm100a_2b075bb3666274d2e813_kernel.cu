@@ -74,7 +74,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TASK_INFOS_STRIDE 64
 #define SMEM_TOTAL 230400
 #define THREADS 512
-#define NUM_CTAS 152
+#define NUM_CTAS 148
 
 #include <math_constants.h>
 
@@ -984,7 +984,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_deepgemm_mega_moe_v3_sm103a_bbcc4ffd73424bef02d0(int* __restrict__ topk_idx_i32, float* __restrict__ topk_weights, int* __restrict__ x_fp8, unsigned int* __restrict__ x_sf, const __grid_constant__ CUtensorMap A, int* __restrict__ pool_fp8, unsigned int* __restrict__ pool_sf, float* __restrict__ routing_weight_pool, int* __restrict__ token_to_permuted, int* __restrict__ meta_token, int* __restrict__ meta_slot, int* __restrict__ expert_counts, int* __restrict__ expert_row_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ total_m_tiles_out, const __grid_constant__ CUtensorMap B1, const __grid_constant__ CUtensorMap SFB1, const __grid_constant__ CUtensorMap I_fp8_w, uint8_t* __restrict__ SF_I_w, __nv_bfloat16* __restrict__ l1_bf16_capture, const __grid_constant__ CUtensorMap A2, unsigned int* __restrict__ SFA2, const __grid_constant__ CUtensorMap B2, const __grid_constant__ CUtensorMap SFB2, __nv_bfloat16* __restrict__ expert_output, __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ histogram_done, unsigned int* __restrict__ prefix_done, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ l1_arrival, unsigned int* __restrict__ l2_done, int num_tokens, int top_k, int num_experts, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles, int M_total, float activation_clamp, unsigned int* __restrict__ PrivateCounters, unsigned long long* __restrict__ PrivateMasks, unsigned int* __restrict__ PublicExpertOutput, unsigned int* __restrict__ PrivateSFBlockOffsets, const __grid_constant__ CUtensorMap PrivateSF1, const __grid_constant__ CUtensorMap PrivateSF2, unsigned int* __restrict__ PrivateSF1Words, uint8_t* __restrict__ PrivateSF2Bytes)
+kernel_deepgemm_mega_moe_v3_sm100a_2b075bb3666274d2e813(int* __restrict__ topk_idx_i32, float* __restrict__ topk_weights, int* __restrict__ x_fp8, unsigned int* __restrict__ x_sf, const __grid_constant__ CUtensorMap A, int* __restrict__ pool_fp8, unsigned int* __restrict__ pool_sf, float* __restrict__ routing_weight_pool, int* __restrict__ token_to_permuted, int* __restrict__ meta_token, int* __restrict__ meta_slot, int* __restrict__ expert_counts, int* __restrict__ expert_row_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ total_m_tiles_out, const __grid_constant__ CUtensorMap B1, const __grid_constant__ CUtensorMap SFB1, const __grid_constant__ CUtensorMap I_fp8_w, uint8_t* __restrict__ SF_I_w, __nv_bfloat16* __restrict__ l1_bf16_capture, const __grid_constant__ CUtensorMap A2, unsigned int* __restrict__ SFA2, const __grid_constant__ CUtensorMap B2, const __grid_constant__ CUtensorMap SFB2, __nv_bfloat16* __restrict__ expert_output, __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ histogram_done, unsigned int* __restrict__ prefix_done, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ l1_arrival, unsigned int* __restrict__ l2_done, int num_tokens, int top_k, int num_experts, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles, int M_total, float activation_clamp, unsigned int* __restrict__ PrivateCounters, unsigned long long* __restrict__ PrivateMasks, unsigned int* __restrict__ PublicExpertOutput, unsigned int* __restrict__ PrivateSFBlockOffsets, const __grid_constant__ CUtensorMap PrivateSF1, const __grid_constant__ CUtensorMap PrivateSF2, unsigned int* __restrict__ PrivateSF1Words, uint8_t* __restrict__ PrivateSF2Bytes)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1343,30 +1343,132 @@ kernel_deepgemm_mega_moe_v3_sm103a_bbcc4ffd73424bef02d0(int* __restrict__ topk_i
                 int dst_row = smem_dst_row[disp_warp];
                 unsigned long long src_u32_off = (unsigned long long)t_s * (unsigned long long)hidden_u32;
                 unsigned long long dst_u32_off = (unsigned long long)dst_row * (unsigned long long)hidden_u32;
-                #pragma unroll 1
-                for (int base = lane * 4; base < hidden_u32; base += 128) {
-                    int _vec_load_0[4];
-                    {
-                        const int4* _ivptr_0 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)base) + 0);
-                        int4 _ivld_0;
-                        _ivld_0 = *_ivptr_0;
-                        _vec_load_0[0 + 0] = _ivld_0.x;
-                        _vec_load_0[0 + 1] = _ivld_0.y;
-                        _vec_load_0[0 + 2] = _ivld_0.z;
-                        _vec_load_0[0 + 3] = _ivld_0.w;
-                    }
-                    reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)base))[0] = reinterpret_cast<int4*>(_vec_load_0)[0];
+                int pull_lane_off = lane * 4;
+                int _vec_load_0[4];
+                {
+                    const int4* _ivptr_0 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off) + 0);
+                    int4 _ivld_0;
+                    _ivld_0 = *_ivptr_0;
+                    _vec_load_0[0 + 0] = _ivld_0.x;
+                    _vec_load_0[0 + 1] = _ivld_0.y;
+                    _vec_load_0[0 + 2] = _ivld_0.z;
+                    _vec_load_0[0 + 3] = _ivld_0.w;
                 }
+                int _vec_load_1[4];
+                {
+                    const int4* _ivptr_1 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 128) + 0);
+                    int4 _ivld_1;
+                    _ivld_1 = *_ivptr_1;
+                    _vec_load_1[0 + 0] = _ivld_1.x;
+                    _vec_load_1[0 + 1] = _ivld_1.y;
+                    _vec_load_1[0 + 2] = _ivld_1.z;
+                    _vec_load_1[0 + 3] = _ivld_1.w;
+                }
+                int _vec_load_2[4];
+                {
+                    const int4* _ivptr_2 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 256) + 0);
+                    int4 _ivld_2;
+                    _ivld_2 = *_ivptr_2;
+                    _vec_load_2[0 + 0] = _ivld_2.x;
+                    _vec_load_2[0 + 1] = _ivld_2.y;
+                    _vec_load_2[0 + 2] = _ivld_2.z;
+                    _vec_load_2[0 + 3] = _ivld_2.w;
+                }
+                int _vec_load_3[4];
+                {
+                    const int4* _ivptr_3 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 384) + 0);
+                    int4 _ivld_3;
+                    _ivld_3 = *_ivptr_3;
+                    _vec_load_3[0 + 0] = _ivld_3.x;
+                    _vec_load_3[0 + 1] = _ivld_3.y;
+                    _vec_load_3[0 + 2] = _ivld_3.z;
+                    _vec_load_3[0 + 3] = _ivld_3.w;
+                }
+                int _vec_load_4[4];
+                {
+                    const int4* _ivptr_4 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 512) + 0);
+                    int4 _ivld_4;
+                    _ivld_4 = *_ivptr_4;
+                    _vec_load_4[0 + 0] = _ivld_4.x;
+                    _vec_load_4[0 + 1] = _ivld_4.y;
+                    _vec_load_4[0 + 2] = _ivld_4.z;
+                    _vec_load_4[0 + 3] = _ivld_4.w;
+                }
+                int _vec_load_5[4];
+                {
+                    const int4* _ivptr_5 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 640) + 0);
+                    int4 _ivld_5;
+                    _ivld_5 = *_ivptr_5;
+                    _vec_load_5[0 + 0] = _ivld_5.x;
+                    _vec_load_5[0 + 1] = _ivld_5.y;
+                    _vec_load_5[0 + 2] = _ivld_5.z;
+                    _vec_load_5[0 + 3] = _ivld_5.w;
+                }
+                int _vec_load_6[4];
+                {
+                    const int4* _ivptr_6 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 768) + 0);
+                    int4 _ivld_6;
+                    _ivld_6 = *_ivptr_6;
+                    _vec_load_6[0 + 0] = _ivld_6.x;
+                    _vec_load_6[0 + 1] = _ivld_6.y;
+                    _vec_load_6[0 + 2] = _ivld_6.z;
+                    _vec_load_6[0 + 3] = _ivld_6.w;
+                }
+                int _vec_load_7[4];
+                {
+                    const int4* _ivptr_7 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 896) + 0);
+                    int4 _ivld_7;
+                    _ivld_7 = *_ivptr_7;
+                    _vec_load_7[0 + 0] = _ivld_7.x;
+                    _vec_load_7[0 + 1] = _ivld_7.y;
+                    _vec_load_7[0 + 2] = _ivld_7.z;
+                    _vec_load_7[0 + 3] = _ivld_7.w;
+                }
+                int _vec_load_8[4];
+                {
+                    const int4* _ivptr_8 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 1024) + 0);
+                    int4 _ivld_8;
+                    _ivld_8 = *_ivptr_8;
+                    _vec_load_8[0 + 0] = _ivld_8.x;
+                    _vec_load_8[0 + 1] = _ivld_8.y;
+                    _vec_load_8[0 + 2] = _ivld_8.z;
+                    _vec_load_8[0 + 3] = _ivld_8.w;
+                }
+                int _vec_load_9[4];
+                {
+                    const int4* _ivptr_9 = reinterpret_cast<const int4*>(x_fp8 + (src_u32_off + (unsigned long long)pull_lane_off + 1152) + 0);
+                    int4 _ivld_9;
+                    _ivld_9 = *_ivptr_9;
+                    _vec_load_9[0 + 0] = _ivld_9.x;
+                    _vec_load_9[0 + 1] = _ivld_9.y;
+                    _vec_load_9[0 + 2] = _ivld_9.z;
+                    _vec_load_9[0 + 3] = _ivld_9.w;
+                }
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off))[0] = reinterpret_cast<int4*>(_vec_load_0)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 128))[0] = reinterpret_cast<int4*>(_vec_load_1)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 256))[0] = reinterpret_cast<int4*>(_vec_load_2)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 384))[0] = reinterpret_cast<int4*>(_vec_load_3)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 512))[0] = reinterpret_cast<int4*>(_vec_load_4)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 640))[0] = reinterpret_cast<int4*>(_vec_load_5)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 768))[0] = reinterpret_cast<int4*>(_vec_load_6)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 896))[0] = reinterpret_cast<int4*>(_vec_load_7)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 1024))[0] = reinterpret_cast<int4*>(_vec_load_8)[0];
+                reinterpret_cast<int4*>(pool_fp8 + (dst_u32_off + (unsigned long long)pull_lane_off + 1152))[0] = reinterpret_cast<int4*>(_vec_load_9)[0];
                 unsigned long long src_sf_off = (unsigned long long)t_s * (unsigned long long)sf_words_x;
                 unsigned long long dst_sf_off = (unsigned long long)dst_row * (unsigned long long)sf_words_x;
                 unsigned int in_expert = (unsigned int)(dst_row - expert_row_offsets[e_s]);
                 unsigned int sf_block = PrivateSFBlockOffsets[e_s] + in_expert / 16;
                 unsigned int source_sf_token = sf_block * 128 + in_expert % 16 * 4;
-                #pragma unroll 1
-                for (int w = lane; w < sf_words_x; w += 32) {
-                    unsigned int sf_word = x_sf[src_sf_off + (unsigned long long)w];
-                    pool_sf[dst_sf_off + (unsigned long long)w] = sf_word;
-                    PrivateSF1Words[(unsigned int)(w * 49280) + source_sf_token] = sf_word;
+                unsigned int sfw0 = x_sf[src_sf_off + (unsigned long long)lane];
+                unsigned int sfw1 = 0;
+                if ((unsigned int)sf_words_x > lane + 32) {
+                    sfw1 = x_sf[src_sf_off + (unsigned long long)lane + 32];
+                }
+                pool_sf[dst_sf_off + (unsigned long long)lane] = sfw0;
+                PrivateSF1Words[lane * 49280 + source_sf_token] = sfw0;
+                if ((unsigned int)sf_words_x > lane + 32) {
+                    pool_sf[dst_sf_off + (unsigned long long)lane + 32] = sfw1;
+                    PrivateSF1Words[(lane + 32) * 49280 + source_sf_token] = sfw1;
                 }
                 __syncwarp();
                 if (elect_sync()) {
@@ -1717,7 +1819,7 @@ kernel_deepgemm_mega_moe_v3_sm103a_bbcc4ffd73424bef02d0(int* __restrict__ topk_i
                 unsigned int _warp_redux_u32_0;
                 asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(num_blocks));
                 unsigned int total = _warp_redux_u32_0;
-                unsigned int waves = (total * 18 + 76 - 1) / 76;
+                unsigned int waves = (total * 18 + 74 - 1) / 74;
                 unsigned int interleave_waves = 2;
                 state[0] = total;
                 int _max_0 = ((1) > (interleave_waves) ? (1) : (interleave_waves));
@@ -2826,7 +2928,7 @@ kernel_deepgemm_mega_moe_v3_sm103a_bbcc4ffd73424bef02d0(int* __restrict__ topk_i
             float reduced[40];
             unsigned int store_values[4];
             #pragma unroll 1
-            for (unsigned int token_chunk = epi_warp_2 * 152 + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += 1216) {
+            for (unsigned int token_chunk = epi_warp_2 * 148 + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += 1184) {
                 unsigned int token = token_chunk / 4;
                 unsigned int chunk = token_chunk % 4;
                 unsigned int stored_row = 0;
