@@ -437,12 +437,15 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
         del off_fwd, off_bwd, on_fwd, on_bwd
         # kernel-only time of both paths (CUPTI, per-iteration GPU span)
         kernel_ms = {}
-        for mode in ("off", "on"):
-            cache.enabled = mode == "on"
-            kernel_ms[mode] = dict(forward=median_ms(eager_forward, kernel_steps))
-            if backward_available:
-                kernel_ms[mode]["backward"] = median_ms(eager_backward, kernel_steps)
-                kernel_ms[mode]["autograd_step"] = median_ms(autograd_step, kernel_steps)
+        try:
+            for mode in ("off", "on"):
+                cache.enabled = mode == "on"
+                kernel_ms[mode] = dict(forward=median_ms(eager_forward, kernel_steps))
+                if backward_available:
+                    kernel_ms[mode]["backward"] = median_ms(eager_backward, kernel_steps)
+                    kernel_ms[mode]["autograd_step"] = median_ms(autograd_step, kernel_steps)
+        except Exception as exc:  # the host figures stand on their own when CUPTI tracing is unavailable
+            kernel_ms["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         cache.enabled = was_enabled
     host_us = {
