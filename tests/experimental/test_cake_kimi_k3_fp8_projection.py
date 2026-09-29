@@ -412,10 +412,27 @@ def test_decode_config_round6_continuation_rules(arch):
         assert clusters <= cb.decode_cluster_capacity(arch, c)
         assert cfg.grid == c * clusters and cfg.total_work == cfg.grid
         assert f"_cs{c}" in cfg.kernel_key and not cfg.tstore
+        # the small-inbox exchange of a 7..16-wide cluster gives up one t16 stage (2C - 1 inbox lines next to the ring)
+        assert cfg.module_stages == (3 if c >= 7 else 4), cfg
+        assert cfg.kernel_key == f"decode:t16_p{cfg.module_stages}_fused_cs{c}"
     assert (
         cb.decode_cluster_capacity(arch, 14) == 7
         and cb.decode_cluster_capacity(arch, 9) == 15
     )
+    # The plan carries both programs of every tstore row (the register program is the fallback of unaligned views).
+    required = set(cb.required_kernel_keys(arch, SM_COUNT))
+    assert {
+        "decode:t128_p3",
+        "decode:t128_p3_tso",
+        "decode:t16_p3_fused_cs14",
+        "decode:t16_p3_fused_cs7",
+    } <= required
+    assert not {
+        k
+        for k in required
+        if k.endswith("_tso") and k.removesuffix("_tso") not in required
+    }
+    assert "decode:t16_p4_fused_cs14" not in required
 
 
 def test_decode_module_stage_clamp():

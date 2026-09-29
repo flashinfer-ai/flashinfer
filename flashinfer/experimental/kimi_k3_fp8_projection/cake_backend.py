@@ -375,6 +375,43 @@ def decode_cs_alias_fits(
     return (2 * csplit - 1) * 128 * (chunk | 1) * 4 <= module_stages * stage_bytes
 
 
+def decode_cs_inbox_stages(
+    tok: int,
+    stages: int,
+    fused: bool,
+    resident: bool,
+    csplit: int,
+    xb_stages: int = 0,
+    epi_chunk: int = 32,
+) -> int:
+    """Physical pipeline depth of the small-inbox (non-aliased) cluster split-K instance: the clamped depth of
+    ``decode_module_stages`` reduced until a 4-row inbox round, ``(2C - 1) x 128 x 5 x 4`` bytes, fits next to the
+    stages (host mirror of the Cake ``decode_cs_inbox_stages`` rule; the 7..16-wide clusters of round 6 give up one
+    t16 stage)."""
+    if csplit < 2:
+        return decode_module_stages(tok, stages, fused, resident, xb_stages, epi_chunk)
+    tok_rows = max(tok, 32)
+    xb_bytes = tok * 512 if (fused and not resident) else 0
+    xb_ring = bool(fused and not resident and xb_stages > 0)
+    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
+    stage_bytes = (
+        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    )
+    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
+    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
+    module_stages = decode_module_stages(
+        tok, stages, fused, resident, xb_stages, epi_chunk
+    )
+    need = 5 * (2 * csplit - 1) * 128 * 4
+    while (
+        module_stages > 1
+        and DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+        < need
+    ):
+        module_stages -= 1
+    return module_stages
+
+
 def decode_cs_small_inbox_rounds(
     tok: int, stages: int, fused: bool, resident: bool, csplit: int, xb_stages: int = 0
 ) -> int:
@@ -620,6 +657,15 @@ def decode_config(
         raise ValueError(
             f"decode table entry tstore needs split 1 and no cluster split-K (got {entry})"
         )
+    cs_alias = (
+        csplit > 1
+        and grid == total_work
+        and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages)
+        and decode_cs_small_inbox_rounds(
+            tok, stages, fused, resident, csplit, xb_stages
+        )
+        > 1
+    )
     return DecodeConfig(
         tok=tok,
         split=split,
@@ -628,9 +674,12 @@ def decode_config(
         persist=persist,
         tstore=tstore,
         stages=stages,
-        module_stages=decode_module_stages(
-            tok, stages, fused, resident, xb_stages, epi_chunk
-        ),
+        # The small-inbox cluster exchange gives up pipeline depth until the inbox fits (round 6: one t16 stage at C7..C16).
+        module_stages=decode_cs_inbox_stages(
+            tok, stages, fused, resident, csplit, xb_stages, epi_chunk
+        )
+        if csplit > 1 and not cs_alias
+        else decode_module_stages(tok, stages, fused, resident, xb_stages, epi_chunk),
         m_tiles=m_tiles,
         tiles=tiles,
         total_work=total_work,
@@ -642,13 +691,7 @@ def decode_config(
         epi_chunk=epi_chunk,
         pf=pf,
         mc=mc,
-        cs_alias=csplit > 1
-        and grid == total_work
-        and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages)
-        and decode_cs_small_inbox_rounds(
-            tok, stages, fused, resident, csplit, xb_stages
-        )
-        > 1,
+        cs_alias=cs_alias,
     )
 
 
@@ -684,8 +727,15 @@ def required_kernel_keys(arch: str, sm_count: int = 148) -> tuple[str, ...]:
                 keys.append(gkey)
         for M in _bucket_rows(bucket):
             cfg = decode_config(M, n_tiles128, num_k_iters, arch, sm_count)
-            if cfg is not None and cfg.kernel_key not in keys:
+            if cfg is None:
+                continue
+            if cfg.kernel_key not in keys:
                 keys.append(cfg.kernel_key)
+            # round 6 (lever E1): tstore rows launch the ``_tso`` program on 16-byte-aligned output views and fall back to
+            # the register-epilogue program otherwise, so both programs belong to the plan
+            tso_key = cfg.kernel_key_for(True)
+            if tso_key not in keys:
+                keys.append(tso_key)
     return tuple(keys)
 
 
