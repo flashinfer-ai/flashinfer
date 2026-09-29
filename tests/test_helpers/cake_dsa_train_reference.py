@@ -199,15 +199,20 @@ def reference_fp64(
     """Chunked FP64 reference from the BF16 inputs.
 
     Returns ``out [T, 64, 512]``, natural-log ``lse [T, 64]`` (``-inf`` for
-    fully masked rows) and, with ``dout``, ``dq_latent``, ``dq_rope``,
-    ``dkv_latent [S, 512]``, ``dk_rope [S, 64]``; with ``own_key`` also the
-    mean softmax mass on the query's own key (``self_weight``).  Slots that
-    are ``-1``, ``>= S`` or ``>= topk_length[t]`` are invalid.
+    fully masked rows), ``out_emu`` (the same forward with the numerics of a
+    BF16-P kernel emulated in fp64: probabilities rounded to BF16 relative to
+    the exact row maximum, row sum over the unrounded values, output rounded
+    to BF16 -- its error against ``out`` is the floor such a kernel can reach)
+    and, with ``dout``, ``dq_latent``, ``dq_rope``, ``dkv_latent [S, 512]``,
+    ``dk_rope [S, 64]``; with ``own_key`` also the mean softmax mass on the
+    query's own key (``self_weight``).  Slots that are ``-1``, ``>= S`` or
+    ``>= topk_length[t]`` are invalid.
     """
     device = q_latent.device
     total_q, total_k = int(q_latent.shape[0]), int(kv_latent.shape[0])
     kf, vf = k_rope.double(), kv_latent.double()
     out = torch.empty(total_q, NUM_HEADS, D_LATENT, dtype=torch.float64, device=device)
+    out_emu = torch.empty_like(out)
     lse = torch.empty(total_q, NUM_HEADS, dtype=torch.float64, device=device)
     want_grad = dout is not None
     dql = torch.empty_like(out) if want_grad else None
@@ -231,6 +236,12 @@ def reference_fp64(
         p = torch.exp(s - l[..., None]).nan_to_num(0.0)
         o = torch.einsum("thw,twd->thd", p, vg)
         out[r0:r1], lse[r0:r1] = o, l
+        m = s.amax(dim=-1, keepdim=True)
+        m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+        p_rel = torch.exp(s - m).nan_to_num(0.0)
+        num = torch.einsum("thw,twd->thd", p_rel.to(torch.bfloat16).double(), vg)
+        out_emu[r0:r1] = (num / p_rel.sum(-1, keepdim=True)).nan_to_num(0.0).to(torch.bfloat16).double()
+        del p_rel, num
         if own_key is not None:
             is_own = (ix == own_key[r0:r1, None]) & valid
             self_w += (p * is_own[:, None, :]).sum()
@@ -243,7 +254,7 @@ def reference_fp64(
             dkr.index_add_(0, ix[valid], torch.einsum("thw,thd->twd", ds, qr)[valid])
             dvl = torch.einsum("thw,thd->twd", ds, ql) + torch.einsum("thw,thd->twd", p, g)
             dkvl.index_add_(0, ix[valid], dvl[valid])
-    result = dict(out=out, lse=lse)
+    result = dict(out=out, lse=lse, out_emu=out_emu)
     if want_grad:
         result.update(dq_latent=dql, dq_rope=dqr, dkv_latent=dkvl, dk_rope=dkr)
     if own_key is not None:
