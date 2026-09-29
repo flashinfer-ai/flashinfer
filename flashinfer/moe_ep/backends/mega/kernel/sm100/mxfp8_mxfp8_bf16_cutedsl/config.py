@@ -28,6 +28,9 @@ class Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig:
     fast_math: bool = True
     # Enables in_kernel_fc2_reduce, autotune may still disable this if it is faster
     enable_in_kernel_fc2_reduce: bool = False
+    # Forwards the actual token count to the top-k function to prevent wasted work
+    # when max_num_tokens is larger than the actual token count.
+    use_persistent_finalize_kernel: bool = False
     # Kernel tuning knobs (see kernel_src.sm100.cutedsl_megamoe.shim.tuner); overrides
     # the token-count default heuristic entirely when set, e.g. a winner from the
     # kernel repo's tester sweep. None -> tuner.default_knobs(..., dtype="mxfp8").

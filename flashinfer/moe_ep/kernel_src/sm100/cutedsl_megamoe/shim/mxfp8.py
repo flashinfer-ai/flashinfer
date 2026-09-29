@@ -69,7 +69,7 @@ class MegaMoEMxfp8Config:
     epi_flag_batch: Tuple[int, int] = (1, 1)
     enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
-    topk_reduce_persistent: bool = False
+    use_persistent_finalize_kernel: bool = False
     token_back_by_dispatch: bool = False
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
@@ -266,7 +266,10 @@ class MegaMoEMxfp8Frontend:
             )
         if resolved == 0:
             return None
-        if self.config.topk_reduce_persistent:
+        if (
+            self.config.use_persistent_finalize_kernel
+            and not self.config.in_kernel_fc2_reduce
+        ):
             inputs.num_valid_tokens.fill_(valid)
         key = self._launch_cache_key(inputs, resolved)
         mega = self._mega
@@ -318,7 +321,11 @@ class MegaMoEMxfp8Frontend:
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return lambda: None
-        if self.config.topk_reduce_persistent and num_tokens is not None:
+        if (
+            self.config.use_persistent_finalize_kernel
+            and not self.config.in_kernel_fc2_reduce
+            and num_tokens is not None
+        ):
             inputs.num_valid_tokens.fill_(launch_inputs.activation.shape[0])
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
@@ -381,7 +388,7 @@ class MegaMoEMxfp8Frontend:
             c.flag_batch,
             c.epi_flag_batch,
             c.in_kernel_fc2_reduce,
-            c.topk_reduce_persistent,
+            c.use_persistent_finalize_kernel,
             c.token_back_by_dispatch,
             self._gate_up_clamp,
             c.enable_iket,
@@ -435,7 +442,7 @@ class MegaMoEMxfp8Frontend:
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
             skip_topk_reduce=False,
-            topk_reduce_persistent=c.topk_reduce_persistent,
+            topk_reduce_persistent=c.use_persistent_finalize_kernel,
             # kernel renamed the bool token_back_by_dispatch -> token_back_mode enum:
             # dispatch-reuse maps to "reuse_dispatch_warps", default to "epi_warps".
             token_back_mode=(
@@ -769,7 +776,7 @@ class MegaMoEMxfp8Frontend:
                     assumed_align=4,
                     static_layout=True,
                 )
-                if c.topk_reduce_persistent
+                if c.use_persistent_finalize_kernel and not c.in_kernel_fc2_reduce
                 else None
             ),
         )
@@ -868,7 +875,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
-    topk_reduce_persistent: bool = False,
+    use_persistent_finalize_kernel: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEMxfp8SymmBuffer:
     """Allocate symmetric-heap inputs + combine staging for one MXFP8 session.
@@ -880,8 +887,8 @@ def get_symm_buffer_for_mxfp8_mega_moe(
     ``gate_up_clamp`` sets the kernel gate-up clamp.  ``activation_clamp`` is a
     deprecated alias for ``gate_up_clamp``.
     ``intermediate`` is the post-SwiGLU width, matching NVFP4 and SGLang.
-    ``topk_reduce_persistent`` keeps the standalone top-k reducer's grid fixed
-    across token counts. It is ignored when that reducer is not used.
+    ``use_persistent_finalize_kernel`` forwards the actual token count to the
+    standalone top-k reducer. It is ignored when that reducer is not used.
 
     Expert weights are not allocated here; supply kernel-ready ``(weight, scale)``
     tuples to :func:`mxfp8_mega_moe` instead.
@@ -909,7 +916,7 @@ def get_symm_buffer_for_mxfp8_mega_moe(
         kind=kind,
         gate_up_clamp=clamp,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
-        topk_reduce_persistent=topk_reduce_persistent,
+        use_persistent_finalize_kernel=use_persistent_finalize_kernel,
     )
     from .knob_cache import resolve_knobs
     from .tuner import with_knobs

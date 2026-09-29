@@ -19,3 +19,6 @@ class Sm100_Bf16_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(Sm100_Bf16_Cutedsl_MegaMoeConf
 
     kernel_name: str = "sm100_bf16_mxfp8_bf16_cutedsl"
     kind: Literal["bf16_mxfp8_e4m3", "bf16_mxfp8_e5m2"] = "bf16_mxfp8_e4m3"
+    # Forwards the actual token count to the top-k function to prevent wasted work
+    # when max_num_tokens is larger than the actual token count.
+    use_persistent_finalize_kernel: bool = False

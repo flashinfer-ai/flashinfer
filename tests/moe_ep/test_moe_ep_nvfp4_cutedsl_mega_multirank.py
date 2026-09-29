@@ -1755,7 +1755,7 @@ def test_nvfp4_cutedsl_mega_kernel_is_registered():
     assert kernel.kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
 
 
-def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
+def test_nvfp4_cutedsl_config_exposes_reducer_controls():
     """The TRT-LLM-import knobs are plumbed through the FI backend config."""
     from flashinfer.moe_ep import Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
@@ -1767,6 +1767,13 @@ def test_nvfp4_cutedsl_config_exposes_ikr_and_combine_dtype():
     )
     assert cfg.combine_dtype == "bf16"
     assert create_mega_kernel(cfg).kernel_name() == "sm100_nvfp4_nvfp4_bf16_cutedsl"
+
+    persistent_cfg = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+        intermediate_size=128,
+        top_k=2,
+        use_persistent_finalize_kernel=True,
+    )
+    assert persistent_cfg.use_persistent_finalize_kernel
 
     cfg_q = Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=128,

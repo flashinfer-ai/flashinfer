@@ -51,6 +51,7 @@ class MegaMoEBf16Mxfp8Config:
     epi_flag_batch: Tuple[int, int] = (1, 1)
     enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
+    use_persistent_finalize_kernel: bool = False
     token_back_mode: Literal["epi_warps", "reuse_dispatch_warps"] = "epi_warps"
     gate_up_clamp: Optional[float] = None
     enable_iket: bool = False
@@ -116,6 +117,7 @@ class MegaMoEBf16Mxfp8Inputs:
     fc2_weight: torch.Tensor
     fc2_weight_sf: torch.Tensor
     output_activation: torch.Tensor
+    num_valid_tokens: torch.Tensor
 
 
 class MegaMoEBf16Mxfp8Frontend:
@@ -247,6 +249,14 @@ class MegaMoEBf16Mxfp8Frontend:
             raise ValueError(
                 "output_activation has an invalid mixed MegaMoE shape or dtype."
             )
+        if (
+            not inputs.num_valid_tokens.is_cuda
+            or inputs.num_valid_tokens.dtype != torch.int32
+            or tuple(inputs.num_valid_tokens.shape) != (1,)
+        ):
+            raise ValueError(
+                "num_valid_tokens must be a CUDA int32 tensor of shape (1,)."
+            )
 
     def _runtime_kwargs(
         self, inputs: MegaMoEBf16Mxfp8Inputs, mega: _CompiledMega
@@ -274,6 +284,15 @@ class MegaMoEBf16Mxfp8Frontend:
                 num_max_ranks=self.config.world_size,
             ),
             "stream": cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+            "num_valid_tokens": (
+                self._to_cute(
+                    inputs.num_valid_tokens,
+                    static_layout=True,
+                )
+                if self.config.use_persistent_finalize_kernel
+                and not self.config.in_kernel_fc2_reduce
+                else None
+            ),
         }
 
     def _ensure_compiled(self, inputs: MegaMoEBf16Mxfp8Inputs) -> _CompiledMega:
@@ -326,6 +345,7 @@ class MegaMoEBf16Mxfp8Frontend:
             hidden=c.hidden,
             fc2_in_kernel_topk_reduce=c.in_kernel_fc2_reduce,
             skip_topk_reduce=False,
+            topk_reduce_persistent=c.use_persistent_finalize_kernel,
             token_back_by_dispatch=c.token_back_mode == "reuse_dispatch_warps",
             token_back_mode=c.token_back_mode,
             epi_flag_batch=c.epi_flag_batch,
@@ -375,6 +395,7 @@ class MegaMoEBf16Mxfp8Frontend:
             inputs.fc2_weight.data_ptr(),
             inputs.fc2_weight_sf.data_ptr(),
             inputs.output_activation.data_ptr(),
+            inputs.num_valid_tokens.data_ptr(),
             torch.cuda.current_stream().cuda_stream,
         )
         if mega.launch_key != key:
@@ -382,6 +403,12 @@ class MegaMoEBf16Mxfp8Frontend:
             mega.launch_key = key
         if self.config.in_kernel_fc2_reduce:
             inputs.output_activation.zero_()
+        if (
+            self.config.use_persistent_finalize_kernel
+            and not self.config.in_kernel_fc2_reduce
+        ):
+            inputs.num_valid_tokens.fill_(n)
+            mega.local_workspace.zero_()
         mega.compiled(**mega.launch_kwargs)
         if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
@@ -389,10 +416,17 @@ class MegaMoEBf16Mxfp8Frontend:
 
     def make_launch_thunk(self, inputs: MegaMoEBf16Mxfp8Inputs) -> Callable[[], Any]:
         self._validate(inputs, inputs.activation.shape[0])
+        if (
+            self.config.use_persistent_finalize_kernel
+            and not self.config.in_kernel_fc2_reduce
+        ):
+            inputs.num_valid_tokens.fill_(inputs.activation.shape[0])
         mega = self._ensure_compiled(inputs)
         kwargs = self._runtime_kwargs(inputs, mega)
         if self.config.in_kernel_fc2_reduce:
             return lambda: (inputs.output_activation.zero_(), mega.compiled(**kwargs))
+        if self.config.use_persistent_finalize_kernel:
+            return lambda: (mega.local_workspace.zero_(), mega.compiled(**kwargs))
         return lambda: mega.compiled(**kwargs)
 
 
@@ -409,6 +443,7 @@ class MegaMoEBf16Mxfp8SymmBuffer:
     topk_idx: torch.Tensor
     topk_weights: torch.Tensor
     output_activation: torch.Tensor
+    num_valid_tokens: torch.Tensor
     _frontend: MegaMoEBf16Mxfp8Frontend
     _sym_roots: list[torch.Tensor] = field(default_factory=list)
     _destroyed: bool = False
@@ -439,6 +474,7 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
     kind: MixedKind = "bf16_mxfp8_e4m3",
     gate_up_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
+    use_persistent_finalize_kernel: bool = False,
     knobs: Optional[dict] = None,
 ) -> MegaMoEBf16Mxfp8SymmBuffer:
     from flashinfer.moe_ep.core.validation.common import (
@@ -477,6 +513,7 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
             gate_up_clamp=gate_up_clamp, activation_clamp=None
         ),
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        use_persistent_finalize_kernel=use_persistent_finalize_kernel,
     )
     if not is_valid_bf16_mxfp8_for_config(config, knobs):
         raise ValueError(
@@ -490,6 +527,9 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
     topk_idx.fill_(-1)
     topk_weights = sym_zeros((num_max_tokens, num_topk), torch.float32)
     output_activation = sym_zeros((num_max_tokens, hidden), torch.bfloat16)
+    num_valid_tokens = torch.full(
+        (1,), num_max_tokens, dtype=torch.int32, device="cuda"
+    )
     return MegaMoEBf16Mxfp8SymmBuffer(
         num_total_experts,
         num_max_tokens,
@@ -502,6 +542,7 @@ def get_symm_buffer_for_bf16_mxfp8_mega_moe(
         topk_idx,
         topk_weights,
         output_activation,
+        num_valid_tokens,
         MegaMoEBf16Mxfp8Frontend(config),
         [x, topk_idx, topk_weights, output_activation],
     )
@@ -541,6 +582,7 @@ def bf16_mxfp8_mega_moe(
             transformed_l2[0],
             transformed_l2[1],
             symm_buffer.output_activation,
+            symm_buffer.num_valid_tokens,
         ),
         num_tokens=n,
         sync=False,
@@ -569,6 +611,7 @@ def create_dummy_inputs(
     kind: MixedKind = "bf16_mxfp8_e4m3",
     gate_up_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
+    use_persistent_finalize_kernel: bool = False,
     knobs: Optional[dict] = None,
     seed: int = 0,
 ) -> tuple[
@@ -604,6 +647,7 @@ def create_dummy_inputs(
             gate_up_clamp=gate_up_clamp, activation_clamp=None
         ),
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
+        use_persistent_finalize_kernel=use_persistent_finalize_kernel,
         knobs=knobs,
     )
 
@@ -662,6 +706,7 @@ def bf16_mxfp8_mega_launch_thunk(
             transformed_l2[0],
             transformed_l2[1],
             symm_buffer.output_activation,
+            symm_buffer.num_valid_tokens,
         )
     )
     return launch

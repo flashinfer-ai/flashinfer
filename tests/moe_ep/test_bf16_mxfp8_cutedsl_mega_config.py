@@ -293,7 +293,9 @@ def test_mixed_config_inherits_bf16_options():
         top_k=2,
         gate_up_clamp=1.5,
         enable_in_kernel_fc2_reduce=True,
+        use_persistent_finalize_kernel=True,
     )
     assert isinstance(config, Sm100_Bf16_Cutedsl_MegaMoeConfigBase)
     assert config.gate_up_clamp == 1.5
     assert config.enable_in_kernel_fc2_reduce
+    assert config.use_persistent_finalize_kernel

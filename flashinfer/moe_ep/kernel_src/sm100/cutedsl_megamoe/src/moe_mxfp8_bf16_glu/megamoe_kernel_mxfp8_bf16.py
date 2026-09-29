@@ -34,6 +34,7 @@ from typing import Any, Dict, List, Literal, Optional, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as cutlass_utils
 from cutlass.cute.typing import AddressSpace
 from cutlass.cutlass_dsl import Int64
 
@@ -87,6 +88,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         hidden: int,
         fc2_in_kernel_topk_reduce: bool = False,
         skip_topk_reduce: bool = False,
+        topk_reduce_persistent: bool = False,
         token_back_by_dispatch: bool = False,
         token_back_mode: Literal[
             "epi_warps", "standalone_warps", "reuse_dispatch_warps"
@@ -215,6 +217,16 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         self.combine_format = combine_format
         self.fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
         self.skip_topk_reduce = skip_topk_reduce
+        self.topk_reduce_persistent = bool(
+            topk_reduce_persistent
+            and not self.fc2_in_kernel_topk_reduce
+            and not self.skip_topk_reduce
+        )
+        self.topk_reduce_num_sms = (
+            cutlass_utils.HardwareInfo().get_device_multiprocessor_count()
+            if self.topk_reduce_persistent
+            else 0
+        )
         self.token_back_by_dispatch = token_back_by_dispatch
         self.token_back_mode = token_back_mode
         self.token_back_standalone = False
@@ -420,6 +432,15 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
             specs.append(
                 _RegionSpec(
                     "load_balance_counter",
+                    cutlass.Int32,
+                    (1,),
+                    16,
+                )
+            )
+        if self.topk_reduce_persistent:
+            specs.append(
+                _RegionSpec(
+                    "topk_reduce_counters",
                     cutlass.Int32,
                     (1,),
                     16,
@@ -829,6 +850,7 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         peer_rank_ptr_mapper_host,
         max_active_clusters: cutlass.Constexpr,
         stream,
+        num_valid_tokens: Optional[cute.Tensor] = None,
     ) -> None:
         """Launch dispatch, mixed FC12, combine, and optional TopkReduce."""
         self._validate_public_inputs(
@@ -1032,18 +1054,44 @@ class Sm100MegaMoEMxfp8Bf16Kernel(Sm100SwapABMxfp8Bf16Fc12Kernel):
         if cutlass.const_expr(
             not self.fc2_in_kernel_topk_reduce and not self.skip_topk_reduce
         ):
-            TopkReduce(
+            if cutlass.const_expr(
+                num_valid_tokens is not None and not self.topk_reduce_persistent
+            ):
+                raise ValueError(
+                    "num_valid_tokens requires topk_reduce_persistent=True."
+                )
+            if cutlass.const_expr(
+                num_valid_tokens is None and self.topk_reduce_persistent
+            ):
+                raise ValueError(
+                    "topk_reduce_persistent=True requires num_valid_tokens."
+                )
+            reduce = TopkReduce(
                 self.hidden,
                 self.num_topk,
                 self.combine_format,
                 sm_arch=get_cutedsl_target_arch(),
-            )(
-                combine_target,
-                None,
-                output_activation,
-                None,
-                stream,
+                persistent=self.topk_reduce_persistent,
+                num_sms=self.topk_reduce_num_sms,
             )
+            if cutlass.const_expr(self.topk_reduce_persistent):
+                reduce(
+                    combine_target,
+                    None,
+                    output_activation,
+                    None,
+                    stream,
+                    self._view_local(local_workspace, "topk_reduce_counters"),
+                    num_tokens_dev=num_valid_tokens,
+                )
+            else:
+                reduce(
+                    combine_target,
+                    None,
+                    output_activation,
+                    None,
+                    stream,
+                )
 
     # ------------------------------------------------------------------
     # Token communication hooks consumed by the mixed FC12 base

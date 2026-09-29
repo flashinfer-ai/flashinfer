@@ -141,6 +141,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             use_custom_finalize=self._uses_native_topk_reduce(fleet_params),
+            use_persistent_finalize_kernel=k.use_persistent_finalize_kernel,
             combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
@@ -164,6 +165,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             and fleet_params.token_hidden_size == 4096
             and k.top_k == 6
             and not k.enable_in_kernel_fc2_reduce
+            and not k.use_persistent_finalize_kernel
             and k.combine_dtype == "bf16"
             and k.apply_routing_weights_before_fc2
         )
@@ -418,7 +420,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 workspace_root,
                 key[3],
             )
-        if workspace._frontend.config.topk_reduce_persistent:
+        if workspace._frontend.config.use_persistent_finalize_kernel:
             workspace.num_valid_tokens.fill_(num_tokens)
         thunk()
         if reducer_state is not None:

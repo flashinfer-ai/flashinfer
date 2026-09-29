@@ -32,8 +32,9 @@ Compared with the reference upstream branch, the tracked differences are:
   `89e339be770daa35b2faaa29d8c6a13606330845`. It is integrated behind
   `topk_reduce_persistent` in
   `src/moe_nvfp4_swapab/megamoe_kernel.py` and
-  `src/moe_mxfp8_glu/megamoe_kernel_mxfp8.py`; both integrations honor the
-  vendored `skip_topk_reduce` path.
+  `src/moe_mxfp8_glu/megamoe_kernel_mxfp8.py`, and
+  `src/moe_mxfp8_bf16_glu/megamoe_kernel_mxfp8_bf16.py`; all integrations
+  honor the vendored `skip_topk_reduce` path.
 - **Activation controls:** `src/moe_nvfp4_swapab/{epilogue_refactor,kernel_fc12,megamoe_kernel}.py`
   retain FlashInfer's custom SwiGLU alpha/beta parameters and allow
   `situ_linear_beta=None`; upstream implements standard SwiGLU and requires

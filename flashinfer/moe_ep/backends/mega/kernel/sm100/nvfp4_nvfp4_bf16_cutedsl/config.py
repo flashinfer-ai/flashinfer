@@ -45,6 +45,9 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     # traffic), "nvfp4" (4x less).  Quantized wires trade accuracy for NVLink
     # bandwidth and require enable_in_kernel_fc2_reduce=False.
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16"
+    # Forwards the actual token count to the top-k function to prevent wasted work
+    # when max_num_tokens is larger than the actual token count.
+    use_persistent_finalize_kernel: bool = False
     input_norm_const: float = 1.0
     fc1_alpha: Optional["torch.Tensor"] = None
     fc2_alpha: Optional["torch.Tensor"] = None

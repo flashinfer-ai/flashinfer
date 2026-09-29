@@ -104,7 +104,7 @@ class MegaMoENvfp4Config:
     enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
     use_custom_finalize: bool = False
-    topk_reduce_persistent: bool = False
+    use_persistent_finalize_kernel: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
@@ -219,9 +219,9 @@ class MegaMoENvfp4Config:
                 "scales. use_custom_finalize=True requires "
                 "apply_routing_weights_before_fc2=True."
             )
-        if self.use_custom_finalize and self.topk_reduce_persistent:
+        if self.use_custom_finalize and self.use_persistent_finalize_kernel:
             raise ValueError(
-                "use_custom_finalize and topk_reduce_persistent cannot be used together."
+                "use_custom_finalize and use_persistent_finalize_kernel cannot be used together."
             )
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
@@ -395,7 +395,10 @@ class MegaMoENvfp4Frontend:
             )
         if resolved == 0:
             return None
-        if self.config.topk_reduce_persistent:
+        if (
+            self.config.use_persistent_finalize_kernel
+            and not self.config.in_kernel_fc2_reduce
+        ):
             inputs.num_valid_tokens.fill_(valid)
         key = self._launch_cache_key(inputs, resolved)
         mega = self._mega
@@ -451,7 +454,11 @@ class MegaMoENvfp4Frontend:
         launch_inputs = self._prepare_launch_inputs(inputs, num_tokens=num_tokens)
         if launch_inputs is None:
             return lambda: None
-        if self.config.topk_reduce_persistent and num_tokens is not None:
+        if (
+            self.config.use_persistent_finalize_kernel
+            and not self.config.in_kernel_fc2_reduce
+            and num_tokens is not None
+        ):
             inputs.num_valid_tokens.fill_(launch_inputs.activation.shape[0])
         mega = self._ensure_mega_compiled(inputs)
         runtime_kwargs = self._build_mega_runtime_kwargs(launch_inputs, mega)
@@ -545,7 +552,7 @@ class MegaMoENvfp4Frontend:
             c.non_ubulk_fc2_store,
             c.in_kernel_fc2_reduce,
             c.use_custom_finalize,
-            c.topk_reduce_persistent,
+            c.use_persistent_finalize_kernel,
             c.token_back_mode,
             c.combine_dtype,
             c.apply_routing_weights_before_fc2,
@@ -612,7 +619,7 @@ class MegaMoENvfp4Frontend:
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
             skip_topk_reduce=c.use_custom_finalize,
-            topk_reduce_persistent=c.topk_reduce_persistent,
+            topk_reduce_persistent=c.use_persistent_finalize_kernel,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
             gate_up_clamp=self._gate_up_clamp,
@@ -975,7 +982,7 @@ class MegaMoENvfp4Frontend:
                     assumed_align=4,
                     static_layout=True,
                 )
-                if c.topk_reduce_persistent
+                if c.use_persistent_finalize_kernel and not c.in_kernel_fc2_reduce
                 else None
             ),
         )
@@ -1146,7 +1153,7 @@ def get_symm_buffer_for_mega_moe(
     apply_routing_weights_before_fc2: bool = True,
     enable_in_kernel_fc2_reduce: bool = False,
     use_custom_finalize: bool = False,
-    topk_reduce_persistent: bool = False,
+    use_persistent_finalize_kernel: bool = False,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
     fc2_alpha: Optional[PerExpertEpilogue] = None,
@@ -1181,8 +1188,8 @@ def get_symm_buffer_for_mega_moe(
     accumulation order is nondeterministic (compare with a tolerance, not
     bit-exact).
 
-    ``topk_reduce_persistent`` keeps the standalone top-k reducer's grid fixed
-    across token counts. It is ignored when that reducer is not used.
+    ``use_persistent_finalize_kernel`` forwards the actual token count to the
+    standalone top-k reducer. It is ignored when that reducer is not used.
 
     ``combine_dtype`` selects the cross-rank combine wire format: ``"bf16"``
     (default, exact), ``"mxfp8"`` (fp8+e8m0 SF, 2x less combine traffic), or
@@ -1250,7 +1257,7 @@ def get_symm_buffer_for_mega_moe(
         apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         use_custom_finalize=use_custom_finalize,
-        topk_reduce_persistent=topk_reduce_persistent,
+        use_persistent_finalize_kernel=use_persistent_finalize_kernel,
         combine_dtype=combine_dtype,
         # Constructed valid even before knobs land: quantized combine rejects
         # the default epi_warps token-back in __post_init__.
