@@ -178,9 +178,9 @@ inline ManifestStatus EnsureDeviceReady(int32_t device, bool allow_initializatio
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100), cudaFuncAttributeMaxDynamicSharedMemorySize, 64128);
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
-  error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe), cudaFuncAttributeMaxDynamicSharedMemorySize, 159872);
-  if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready), cudaFuncAttributeMaxDynamicSharedMemorySize, 199040);
+  if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
+  error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe), cudaFuncAttributeMaxDynamicSharedMemorySize, 81536);
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_dsv4_fc2_terminal_recycle_v21_sm100), cudaFuncAttributeMaxDynamicSharedMemorySize, 85120);
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
@@ -323,30 +323,6 @@ inline cudaError_t Submit_device_00(const cudaLaunchConfig_t* config, const void
       args.route_experts, args.route_map, args.tile_expert, args.tile_mn_limit, args.route_slots, args.num_non_exiting_ctas, args.fc1_work_counter, args.fc2_work_counter, args.route_count, args.top_k, args.local_expert_offset, args.num_experts, args.fc1_initial_work, args.fc2_initial_work);
 }
 
-struct Args_device_07 {
-  CUtensorMap A;
-  CUtensorMap B;
-  CUtensorMap SFA;
-  CUtensorMap SFB;
-  CUtensorMap C_tma;
-  __nv_bfloat16* C;
-  float* scale_c;
-  int* tile_expert;
-  int* tile_mn_limit;
-  int* num_non_exiting_ctas;
-  int* work_counter;
-  int M;
-  int K;
-  int grid_m;
-  int grid_n;
-  int K_tiles;
-};
-inline cudaError_t Submit_device_07(const cudaLaunchConfig_t* config, const void* opaque) {
-  const auto& args = *static_cast<const Args_device_07*>(opaque);
-  return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe,
-      args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles);
-}
-
 struct Args_device_06 {
   CUtensorMap A;
   uint8_t* B;
@@ -388,6 +364,30 @@ inline cudaError_t Submit_device_04(const cudaLaunchConfig_t* config, const void
   const auto& args = *static_cast<const Args_device_04*>(opaque);
   return SubmitExtendedKernel(config, kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100,
       args.route_outputs, args.route_weights, args.output, args.num_tokens, args.route_stride, args.M);
+}
+
+struct Args_device_07 {
+  CUtensorMap A;
+  CUtensorMap B;
+  CUtensorMap SFA;
+  CUtensorMap SFB;
+  CUtensorMap C_tma;
+  __nv_bfloat16* C;
+  float* scale_c;
+  int* tile_expert;
+  int* tile_mn_limit;
+  int* num_non_exiting_ctas;
+  int* work_counter;
+  int M;
+  int K;
+  int grid_m;
+  int grid_n;
+  int K_tiles;
+};
+inline cudaError_t Submit_device_07(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const Args_device_07*>(opaque);
+  return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe,
+      args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 
 struct Args_device_05 {
@@ -615,9 +615,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 6, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      159872u, true, false, false, false,
-      &Submit_device_07, &args_1, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 6, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      81536u, true, false, false, false,
+      &Submit_device_07, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 1, 1), dim3(128, 1, 1), dim3(1, 1, 1),
@@ -775,9 +775,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 12, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      159872u, true, false, false, false,
-      &Submit_device_07, &args_1, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 12, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      81536u, true, false, false, false,
+      &Submit_device_07, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 2, 1), dim3(128, 1, 1), dim3(1, 1, 1),
@@ -935,9 +935,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 18, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      159872u, true, false, false, false,
-      &Submit_device_07, &args_1, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 18, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      81536u, true, false, false, false,
+      &Submit_device_07, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 3, 1), dim3(128, 1, 1), dim3(1, 1, 1),
@@ -1095,9 +1095,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 24, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      159872u, true, false, false, false,
-      &Submit_device_07, &args_1, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 24, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      81536u, true, false, false, false,
+      &Submit_device_07, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 4, 1), dim3(128, 1, 1), dim3(1, 1, 1),
@@ -1255,9 +1255,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 30, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      159872u, true, false, false, false,
-      &Submit_device_07, &args_1, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 30, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      81536u, true, false, false, false,
+      &Submit_device_07, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 5, 1), dim3(128, 1, 1), dim3(1, 1, 1),
@@ -1415,9 +1415,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_06, &args_0, -1};
     visitor(launch_0, context);
     KernelLaunch launch_1{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 36, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      159872u, true, false, false, false,
-      &Submit_device_07, &args_1, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 36, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      81536u, true, false, false, false,
+      &Submit_device_07, &args_1, 100};
     visitor(launch_1, context);
     KernelLaunch launch_2{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 6, 1), dim3(128, 1, 1), dim3(1, 1, 1),
@@ -1585,9 +1585,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_02, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      159872u, true, false, false, false,
-      &Submit_device_07, &args_2, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 42, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      81536u, true, false, false, false,
+      &Submit_device_07, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 7, 1), dim3(128, 1, 1), dim3(1, 1, 1),
@@ -1755,9 +1755,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_02, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 48, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      159872u, true, false, false, false,
-      &Submit_device_07, &args_2, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 48, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      81536u, true, false, false, false,
+      &Submit_device_07, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 8, 1), dim3(128, 1, 1), dim3(1, 1, 1),
@@ -1925,9 +1925,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_02, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_direct_stg_probe", dim3(32, 54, 1), dim3(512, 1, 1), dim3(1, 1, 1),
-      159872u, true, false, false, false,
-      &Submit_device_07, &args_2, -1};
+      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 54, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      81536u, true, false, false, false,
+      &Submit_device_07, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 9, 1), dim3(128, 1, 1), dim3(1, 1, 1),
