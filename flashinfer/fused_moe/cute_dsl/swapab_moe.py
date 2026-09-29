@@ -37,13 +37,15 @@ SWAP_K_BLOCKS_PER_STAGE = int(_ENV_KBLOCKS or "4")
 
 
 def gemm1_k_blocks_per_stage(n_tile: int) -> int:
-    """Stage depth for GEMM1 (K = hidden size). 8-row groups are bound by the
-    per-stage round trip once the weights sit in L2 (few hot experts), so they
-    take 256-wide stages; wider groups stream from HBM and keep 128-wide
-    stages with the deeper pipeline (B300: 32-row prefill tiles lose ~3% at 8)."""
+    """Stage depth for GEMM1 (K = hidden size). 8- and 16-row groups are bound
+    by the per-stage round trip (few rows per expert: decode and the 128-token
+    EP8 prefill), so they take 256-wide stages (B300, Kimi K3 EP8 T=128:
+    16-row groups gain 4-7 us over 128-wide stages on both routes); 32-row and
+    wider groups stream from HBM and keep 128-wide stages with the deeper
+    pipeline (B300: 32-row prefill tiles lose ~3% at 8)."""
     if _ENV_KBLOCKS:
         return int(_ENV_KBLOCKS)
-    return 8 if n_tile == 8 else 4
+    return 8 if n_tile <= 16 else 4
 
 
 # GEMM2 (K = intermediate shard) may use a different stage depth: 12 covers a

@@ -352,6 +352,10 @@ tiles from T=256 up keep the 4-block stages (nine stages in flight beat
 four 256-wide ones by 4-8 us at T=256, while at T=128 the 4-block form is
 0-4 us slower); the 384-wide MoE-TP shard always uses one stage. On an expert-parallel rank the dense
 path is faster above T=1024.
+The swap GEMM1 (K = hidden size) takes 8-K-block (256-wide) stages for the 8- and
+16-row groups as well (B300, Kimi K3 EP8 T=128: the 16-row groups gain 4-7 us over
+128-wide stages on both routes); 32-row and wider groups keep the 128-wide
+stages with the deeper pipeline (``SWAPAB_KBLOCKS`` overrides).
 
 From T=1025 to T=2048 the MoE-TP shard uses the hybrid form
 (``SWAPAB_HYBRID=0`` disables it): ``moe_sort`` groups the permuted rows in 128-row tiles, a
