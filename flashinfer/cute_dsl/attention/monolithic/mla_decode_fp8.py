@@ -371,6 +371,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
 
         self.load_q_stage = 1
+        # sm_107 has 327 KB of shared memory per CTA, enough for 4 K / 4 V stages (~324 KB).
         sm107 = get_current_arch() == "sm_107"
         self.load_k_stage = 4 if sm107 else 3
         self.load_v_stage = 4 if sm107 else 2
