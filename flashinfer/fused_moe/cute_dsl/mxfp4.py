@@ -1419,9 +1419,8 @@ class Mxfp4MoESwapAbPlan:
             # single stage of a narrow MoE-TP shard stays (one stage is its
             # whole K).
             gemm2_k_blocks = None
-            if (
-                w.intermediate_shard > SWAP_TWO_STAGE_MAX_SHARD
-                and not os.environ.get("SWAPAB_KBLOCKS2")
+            if w.intermediate_shard > SWAP_TWO_STAGE_MAX_SHARD and not os.environ.get(
+                "SWAPAB_KBLOCKS2"
             ):
                 gemm2_k_blocks = 4
                 # dep_prefetch_full_ring: with the dependent-side prefetch the

@@ -1227,7 +1227,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         sk_chunk = sk_lin_item - sk_group * sk_m_chunks
                         sk_group = sk_group * (1 - sk_skip) + num_valid_groups * sk_skip
                         sk_cnt = k_tile_cnt - (k_tile_cnt - sk_cnt_split) * sk_valid
-                        sk_begin = (sk_off - sk_pair * self.split_k) * sk_cnt_split * sk_valid
+                        sk_begin = (
+                            (sk_off - sk_pair * self.split_k) * sk_cnt_split * sk_valid
+                        )
                     elif sk_do_split:
                         sk_group = cur[1]
                         sk_chunk = cur[0] // self.split_k
@@ -1358,7 +1360,9 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         sk_chunk = sk_lin_item - sk_group * sk_m_chunks
                         sk_group = sk_group * (1 - sk_skip) + num_valid_groups * sk_skip
                         sk_cnt = k_tile_cnt - (k_tile_cnt - sk_cnt_split) * sk_valid
-                        sk_begin = (sk_off - sk_pair * self.split_k) * sk_cnt_split * sk_valid
+                        sk_begin = (
+                            (sk_off - sk_pair * self.split_k) * sk_cnt_split * sk_valid
+                        )
                     elif sk_do_split:
                         sk_group = cur[1]
                         sk_chunk = cur[0] // self.split_k
