@@ -38,6 +38,8 @@ NOPE_DIM = 128
 ROPE_DIM = 64
 V_DIM = 128
 _KV_DIM = NOPE_DIM + V_DIM
+# Largest finite float8_e4m3fn magnitude; the fused kernel saturates to it.
+_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 _QK_DIM = NOPE_DIM + ROPE_DIM
 
 # Dispatch surface of the fused kernel (package data; see the file's note).
@@ -152,15 +154,17 @@ def _fallback(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Composable stock path: two casts + two strided copies (any geometry).
 
-    Uses ``Tensor.to(float8_e4m3fn)``, whose overflow behaviour follows the
-    running torch (saturating since torch 2.13); the fused kernel always
-    saturates. Byte-identical to the kernel on torch >= 2.13.
+    Finite values are clamped to the e4m3fn range before ``Tensor.to``: torch
+    < 2.13 encodes finite overflow as NaN, while the fused kernel saturates to
+    +/-448. NaN passes through the clamp unchanged (both encode it as 0x7F), so
+    the fallback is byte-identical to the kernel on every supported torch.
     """
     num_tokens = kv_nope.shape[0]
-    kv_fp8 = kv_nope.to(key.dtype)
+    kv_fp8 = kv_nope.clamp(-_FP8_MAX, _FP8_MAX).to(key.dtype)
     key[..., :nope_dim].copy_(kv_fp8[..., :nope_dim])
     key[..., nope_dim:].copy_(
-        k_pe.reshape(num_tokens, 1, k_pe.shape[-1])
+        k_pe.clamp(-_FP8_MAX, _FP8_MAX)
+        .reshape(num_tokens, 1, k_pe.shape[-1])
         .to(key.dtype)
         .expand(num_tokens, kv_nope.shape[1], k_pe.shape[-1])
     )

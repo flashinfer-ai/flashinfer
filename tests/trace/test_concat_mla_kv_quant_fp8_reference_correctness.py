@@ -20,10 +20,7 @@ def test_concat_mla_kv_quant_fp8_reference_correctness(shape_kwargs):
 
     inputs = concat_mla_kv_quant_fp8_trace.init(**shape_kwargs)
     _assert_finite(inputs["kv_nope"], inputs["k_pe"])
-    try:
-        key_api, value_api = concat_mla_kv_quant_fp8(**inputs)
-    except Exception as exc:
-        pytest.skip(f"concat_mla_kv_quant_fp8 unavailable: {exc}")
+    key_api, value_api = concat_mla_kv_quant_fp8(**inputs)
     key_ref, value_ref = concat_mla_kv_quant_fp8_trace.reference(**inputs)
     # fp8 outputs: compare the byte encodings (NaN-safe), the cast is exact.
     assert torch.equal(key_api.view(torch.uint8), key_ref.view(torch.uint8))
