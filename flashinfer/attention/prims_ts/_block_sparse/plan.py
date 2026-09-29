@@ -18,13 +18,17 @@ from collections.abc import Callable
 from dataclasses import dataclass
 import functools
 import _thread
-from typing import Concatenate, ParamSpec, Protocol, TypeVar, cast
+from typing import Concatenate, Literal, ParamSpec, Protocol, TypeVar, cast
 
 import torch
 
 from flashinfer.utils import ceil_div
 
-from .common import _SIGNED_INT32_MAX
+from .common import (
+    _SIGNED_INT32_MAX,
+    _block_sparse_proxy_summary_geometry,
+    _num_sparse_pattern_heads,
+)
 from .compiler import _get_compiled_block_sparse
 from .config import (
     _BlockSparseStaticProfile,
@@ -85,6 +89,8 @@ class _BlockSparsePlanState:
     cannot prevent in-place modification or replace graph ownership.
     """
 
+    sparse_format: Literal["bsr", "bitmask"]
+    use_proxy_routes: bool
     device: torch.device
     batch_size: int
     seq_len_q: int
@@ -93,6 +99,7 @@ class _BlockSparsePlanState:
     num_kv_heads: int
     head_dim: int
     q_block_size: int
+    kv_block_size: int
     q_dtype: torch.dtype
     kv_dtype: torch.dtype
     output_dtype: torch.dtype
@@ -115,6 +122,7 @@ class _BlockSparsePlanState:
     # All plan-stream work happens-before run after waiting on this event.
     ready_event: torch.cuda.Event
     ready_stream_handle: int
+    share_pattern_across_kv_heads: bool = False
 
 
 def _allocate_dummy_kv_valid_bits(
@@ -179,27 +187,33 @@ def _build_block_sparse_plan_state(
     device: torch.device,
     device_index: int,
     plan_stream: torch.cuda.Stream,
+    sparse_format: Literal["bsr", "bitmask"] = "bsr",
+    use_proxy_routes: bool = False,
 ) -> _BlockSparsePlanState:
-    """Build and close one complete state after storage validation."""
+    """Build one format- and route-specialized plan atomically."""
 
     assert static.max_blocks_per_row is not None
+    if static.page_size is not None:
+        assert sparse_format == "bsr" and not use_proxy_routes
+    num_rows = (
+        static.batch_size
+        * _num_sparse_pattern_heads(
+            static.num_kv_heads, static.share_pattern_across_kv_heads
+        )
+        * ceil_div(static.seq_len_q, static.q_block_size)
+    )
+    if num_rows > _SIGNED_INT32_MAX:
+        raise OverflowError("row_count must fit in signed int32")
     max_row_route_capacity = ceil_div(
         static.max_blocks_per_row * static.kv_block_size,
         static.kv_route_size,
     )
-    num_rows = (
-        static.batch_size
-        * static.num_kv_heads
-        * ceil_div(static.seq_len_q, static.q_block_size)
-    )
-    route_layout = _BlockSparseRouteLayout.create(
-        kv_route_size=static.kv_route_size,
-        kv_block_size=static.kv_block_size,
-        page_size=static.page_size,
-        has_token_bits=static.use_kv_valid_bits,
-        route_metadata_capacity=num_rows * max_row_route_capacity,
-        num_rows=num_rows,
-    )
+    if use_proxy_routes:
+        num_summaries, _ = _block_sparse_proxy_summary_geometry(
+            static.seq_len_kv,
+            static.kv_block_size,
+        )
+        max_row_route_capacity += ceil_div(num_summaries, static.kv_route_size)
     with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
         spec = _resolve_block_sparse_launch_spec(
             device_index=device_index,
@@ -208,6 +222,7 @@ def _build_block_sparse_plan_state(
             seq_len_kv=static.seq_len_kv,
             num_qo_heads=static.num_qo_heads,
             num_kv_heads=static.num_kv_heads,
+            share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
             head_dim=static.head_dim,
             q_block_size=static.q_block_size,
             kv_block_size=static.kv_block_size,
@@ -217,10 +232,20 @@ def _build_block_sparse_plan_state(
             mask_type=static.mask_type,
             use_kv_valid_bits=static.use_kv_valid_bits,
             max_row_route_capacity=max_row_route_capacity,
+            sparse_format=sparse_format,
+            use_proxy_routes=use_proxy_routes,
         )
         policy = (
             *spec.policy,
             ("max_blocks_per_row", static.max_blocks_per_row),
+        )
+        route_layout = _BlockSparseRouteLayout.create(
+            kv_route_size=static.kv_route_size,
+            kv_block_size=static.kv_block_size,
+            page_size=static.page_size,
+            has_token_bits=spec.prepares_score_words,
+            route_metadata_capacity=num_rows * max_row_route_capacity,
+            num_rows=num_rows,
         )
         compiled = _get_compiled_block_sparse(spec.compile_key)
         dummy_kv_valid_bits = (
@@ -240,6 +265,8 @@ def _build_block_sparse_plan_state(
         ready_event = _record_block_sparse_plan_ready_event(plan_stream)
 
     return _BlockSparsePlanState(
+        sparse_format=sparse_format,
+        use_proxy_routes=use_proxy_routes,
         device=device,
         batch_size=static.batch_size,
         seq_len_q=static.seq_len_q,
@@ -248,6 +275,7 @@ def _build_block_sparse_plan_state(
         num_kv_heads=static.num_kv_heads,
         head_dim=static.head_dim,
         q_block_size=static.q_block_size,
+        kv_block_size=static.kv_block_size,
         q_dtype=static.q_dtype,
         kv_dtype=static.kv_dtype,
         output_dtype=static.output_dtype,
@@ -261,6 +289,7 @@ def _build_block_sparse_plan_state(
         compiled=compiled,
         ready_event=ready_event,
         ready_stream_handle=plan_stream.cuda_stream,
+        share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
     )
 
 

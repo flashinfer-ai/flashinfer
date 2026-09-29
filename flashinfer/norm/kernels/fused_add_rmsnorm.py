@@ -47,7 +47,7 @@ from ..utils import (
     get_cutlass_dtype,
 )
 
-from .rmsnorm import RMSNormKernel
+from .rmsnorm import _LATENCY_BOUND_SMS, RMSNormKernel
 
 
 # =============================================================================
@@ -459,7 +459,13 @@ class FusedAddRMSNormQuantKernel:
 
         self.threads_per_row = RMSNormKernel._compute_threads_per_row(self.H_per_cta)
         self.num_threads = RMSNormKernel._compute_num_threads(self.H_per_cta)
-        if self.H_per_cta > 8192 and self.num_threads < 256:
+        # Two rows per CTA for H > 8192 doubles the smem tiles and halves resident
+        # CTAs, which costs bandwidth on Blackwell and Rubin.
+        if (
+            self.H_per_cta > 8192
+            and self.num_threads < 256
+            and self.sm_version not in _LATENCY_BOUND_SMS
+        ):
             self.num_threads = 256
         self.rows_per_block = self.num_threads // self.threads_per_row
         self.warps_per_row = max(self.threads_per_row // 32, 1)

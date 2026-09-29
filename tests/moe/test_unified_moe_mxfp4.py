@@ -34,7 +34,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
     RoutingMethodType,
@@ -52,6 +52,7 @@ from tests.moe.test_cute_dsl_fused_moe import (
     check_accuracy,
     compute_reference_moe_fp4,
 )
+from tests.moe.utils import quant_id
 
 
 def _sm100_family() -> bool:
@@ -66,8 +67,8 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def _xfail_w4a16_sm103(variant: QuantVariant) -> None:
-    if variant is QuantVariant.W4A16 and get_compute_capability(
+def _xfail_w4a16_sm103(variant: QuantConfig) -> None:
+    if variant.pair == (QuantFormat.MXFP4, QuantFormat.BF16) and get_compute_capability(
         torch.device("cuda")
     ) == (10, 3):
         pytest.xfail("TRTLLM MXFP4×BF16 is currently disabled on SM103")
@@ -143,7 +144,7 @@ def _expected_mxfp4_weight_view(w1_bf16, w2_bf16):
 
 
 def _make_runtime_case(
-    variant: QuantVariant,
+    variant: QuantConfig,
     *,
     num_tokens: int = 8,
     global_experts: int = 8,
@@ -195,7 +196,7 @@ def _make_runtime_case(
         device=device,
         dtype=torch.float32,
     )
-    x_q, x_sf = TrtllmFp4Config.prepare_activations(x, variant=variant)
+    x_q, x_sf = TrtllmFp4Config.prepare_activations(x, quant=variant)
     act = MoEActivationPack(
         hidden_states_q=x_q,
         hidden_states_scale=x_sf,
@@ -208,7 +209,7 @@ def _make_runtime_case(
         TrtllmFp4Config.prepare_weights(
             w1,
             w2,
-            variant=variant,
+            quant=variant,
             num_local_experts=local_experts,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
@@ -217,7 +218,7 @@ def _make_runtime_case(
     )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=global_experts, top_k=top_k),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_expert_offset=expert_offset,
@@ -230,8 +231,14 @@ def _make_runtime_case(
     return act, weights, config
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
-def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+    ],
+)
+def test_trtllm_mxfp4_unified_matches_reference(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
 
     torch.manual_seed(42)
@@ -278,7 +285,7 @@ def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
 
     hidden_states_q, hidden_states_scale = TrtllmFp4Config.prepare_activations(
         hidden_states_bf16,
-        variant=variant,
+        quant=variant,
     )
     act_pack = MoEActivationPack(
         hidden_states_q=hidden_states_q,
@@ -290,7 +297,7 @@ def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
     prepared_weights = TrtllmFp4Config.prepare_weights(
         w1_bf16,
         w2_bf16,
-        variant=variant,
+        quant=variant,
         num_local_experts=num_experts,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -310,7 +317,7 @@ def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
     )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(intermediate_size=intermediate_size),
         activation=SwiGLU(),
         backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
@@ -335,7 +342,8 @@ def test_trtllm_mxfp4_unified_matches_reference(variant: QuantVariant):
     )
     passed, pct, atol = check_accuracy(output, reference)
     assert passed, (
-        f"{variant.name}: only {pct * 100:.2f}% values within tolerance "
+        f"{variant.weight.name}×{variant.activation.name}: only "
+        f"{pct * 100:.2f}% values within tolerance "
         f"(atol={atol:.4f})"
     )
 
@@ -384,12 +392,12 @@ def _make_fp4_shared_case(variant, num_shared, *, activation=None, shared_scale=
     w1[num_experts:] *= shared_scale
     w2[num_experts:] *= shared_scale
     hidden_states_q, hidden_states_scale = TrtllmFp4Config.prepare_activations(
-        hidden_states, variant=variant
+        hidden_states, quant=variant
     )
     view = TrtllmFp4Config.prepare_weights(
         w1,
         w2,
-        variant=variant,
+        quant=variant,
         num_local_experts=num_weight_rows,
         hidden_size=hidden_size,
         intermediate_size=intermediate_size,
@@ -423,7 +431,7 @@ def _make_fp4_shared_case(variant, num_shared, *, activation=None, shared_scale=
             topk_group=1,
             routed_scaling_factor=2.5,
         ),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             num_fused_shared_experts=num_shared,
@@ -438,9 +446,21 @@ def _make_fp4_shared_case(variant, num_shared, *, activation=None, shared_scale=
 @pytest.mark.parametrize(
     "variant,num_shared",
     [
-        pytest.param(QuantVariant.NVFP4, 1, id="nvfp4-s1"),
-        pytest.param(QuantVariant.MXFP4, 2, id="mxfp4-s2"),
-        pytest.param(QuantVariant.W4A16, 1, id="w4a16-s1"),
+        pytest.param(
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            1,
+            id="nvfp4-s1",
+        ),
+        pytest.param(
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            2,
+            id="mxfp4-s2",
+        ),
+        pytest.param(
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+            1,
+            id="w4a16-s1",
+        ),
     ],
 )
 def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
@@ -484,16 +504,22 @@ def test_trtllm_fp4_fused_shared_experts_match_legacy(variant, num_shared):
     torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.05)
 
 
+_FP4_PREP_SHAPE_CASES = [
+    *[
+        (variant, activation)
+        for variant in (
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        )
+        for activation in (SwiGLU(), GeGLU(), SiTU(), ReLU2())
+    ],
+    (QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16), SwiGLU()),
+]
+
+
 @pytest.mark.parametrize(
     "variant,activation",
-    [
-        *[
-            (variant, activation)
-            for variant in (QuantVariant.NVFP4, QuantVariant.MXFP4)
-            for activation in (SwiGLU(), GeGLU(), SiTU(), ReLU2())
-        ],
-        (QuantVariant.W4A16, SwiGLU()),
-    ],
+    _FP4_PREP_SHAPE_CASES,
 )
 def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activation):
     _xfail_w4a16_sm103(variant)
@@ -511,9 +537,19 @@ def test_trtllm_fp4_preparation_shape_for_declared_activations(variant, activati
         ReLU2(),
     ),
 )
-@pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.MXFP4))
+@pytest.mark.parametrize(
+    "variant",
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+    ),
+)
 def test_trtllm_fp4_new_activations_match_flat_launcher(variant, activation):
     _xfail_w4a16_sm103(variant)
+    if get_compute_capability(torch.device("cuda")) == (10, 7) and isinstance(
+        activation, SiTU
+    ):
+        pytest.skip("TRTLLM FP4 SiTU is not implemented on SM107")
     act, weights, config, view, (routing_logits, routing_bias) = _make_fp4_shared_case(
         variant,
         0,
@@ -555,12 +591,14 @@ def test_trtllm_fp4_new_activations_match_flat_launcher(variant, activation):
 
 def test_trtllm_fp4_fused_shared_experts_contribute():
     live_act, live_weights, live_config, _, _ = _make_fp4_shared_case(
-        QuantVariant.NVFP4, 1
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4), 1
     )
     live = MoELayer(live_config)(live_act, live_weights).clone()
 
     muted_act, muted_weights, muted_config, _, _ = _make_fp4_shared_case(
-        QuantVariant.NVFP4, 1, shared_scale=0.0
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        1,
+        shared_scale=0.0,
     )
     muted = MoELayer(muted_config)(muted_act, muted_weights).clone()
 
@@ -574,7 +612,9 @@ def test_trtllm_fp4_fused_shared_experts_contribute():
 
 
 def test_trtllm_fp4_fused_shared_experts_cuda_graph_replay():
-    act, weights, config, _, _ = _make_fp4_shared_case(QuantVariant.NVFP4, 1)
+    act, weights, config, _, _ = _make_fp4_shared_case(
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4), 1
+    )
     layer = MoELayer(config)
     eager = layer(act, weights).clone()
 
@@ -603,14 +643,14 @@ def test_trtllm_fp4_fused_shared_experts_cuda_graph_replay():
 def test_trtllm_fp4_validates_optional_physical_expert_rows(name):
     T, H, I, rows = 2, 256, 128, 9
     runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
-    runner._variant = QuantVariant.NVFP4
+    runner._pair = (QuantFormat.NVFP4, QuantFormat.NVFP4)
     runner._num_weight_rows = rows
     runner._intermediate_size = I
     # _validate_fp4_tensors derives the expected GEMM1 row count from the
     # activation's gating, so the bare runner needs a config to validate against.
     runner.config = MoEConfig(
         routing=RoutingConfig(num_experts=rows, top_k=2),
-        quant=QuantConfig(variant=QuantVariant.NVFP4),
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         experts=ExpertConfig(intermediate_size=I),
         activation=SwiGLU(),
         backend=BackendOptions(candidates=(TrtllmFp4Config(),)),
@@ -641,8 +681,14 @@ def test_trtllm_fp4_validates_optional_physical_expert_rows(name):
         runner._validate_fp4_tensors(act, view, H)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
-def test_trtllm_mxfp4_from_logits_matches_prerouted(variant: QuantVariant):
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+    ],
+)
+def test_trtllm_mxfp4_from_logits_matches_prerouted(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
     act, weights, config = _make_runtime_case(variant)
     logits = torch.randn(
@@ -672,10 +718,16 @@ def test_trtllm_mxfp4_from_logits_matches_prerouted(variant: QuantVariant):
     torch.testing.assert_close(actual, expected, rtol=0.05, atol=0.05)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+    ],
+)
 @pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
 def test_trtllm_mxfp4_unpacked_matches_packed(
-    variant: QuantVariant, weights_dtype: torch.dtype
+    variant: QuantConfig, weights_dtype: torch.dtype
 ):
     _xfail_w4a16_sm103(variant)
     packed, weights, config = _make_runtime_case(variant)
@@ -692,8 +744,14 @@ def test_trtllm_mxfp4_unpacked_matches_packed(
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
-def test_trtllm_mxfp4_nonzero_expert_offset(variant: QuantVariant):
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+    ],
+)
+def test_trtllm_mxfp4_nonzero_expert_offset(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
     baseline_act, baseline_weights, baseline_config = _make_runtime_case(
         variant,
@@ -712,8 +770,14 @@ def test_trtllm_mxfp4_nonzero_expert_offset(variant: QuantVariant):
     torch.testing.assert_close(actual, baseline, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
-def test_trtllm_mxfp4_cuda_graph_and_autotune(variant: QuantVariant):
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+    ],
+)
+def test_trtllm_mxfp4_cuda_graph_and_autotune(variant: QuantConfig):
     _xfail_w4a16_sm103(variant)
     act, weights, config = _make_runtime_case(variant)
     with autotune(True):
@@ -730,13 +794,19 @@ def test_trtllm_mxfp4_cuda_graph_and_autotune(variant: QuantVariant):
     torch.testing.assert_close(captured, eager, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("variant", [QuantVariant.MXFP4, QuantVariant.W4A16])
+@pytest.mark.parametrize(
+    "variant",
+    [
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+    ],
+)
 @pytest.mark.parametrize(
     "hidden_size,intermediate_size",
     [(160, 128), (128, 160)],
 )
 def test_trtllm_mxfp4_rejects_unaligned_weights(
-    variant: QuantVariant, hidden_size: int, intermediate_size: int
+    variant: QuantConfig, hidden_size: int, intermediate_size: int
 ):
     w1 = torch.zeros(
         1, 2 * intermediate_size, hidden_size, dtype=torch.bfloat16, device="cuda"
@@ -748,28 +818,83 @@ def test_trtllm_mxfp4_rejects_unaligned_weights(
         TrtllmFp4Config.prepare_weights(
             w1,
             w2,
-            variant=variant,
+            quant=variant,
             num_local_experts=1,
             hidden_size=hidden_size,
             intermediate_size=intermediate_size,
         )
 
 
+_FP4_ARCH_GATES = [
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        (10, 0),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        (10, 3),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        (10, 7),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        (12, 0),
+        False,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        (10, 0),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        (10, 3),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        (10, 7),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+        (12, 0),
+        False,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+        (10, 0),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+        (10, 3),
+        False,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+        (10, 7),
+        True,
+    ),
+    (
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+        (12, 0),
+        False,
+    ),
+]
+
+
 @pytest.mark.parametrize(
     "variant,compute_capability,supported",
-    [
-        (QuantVariant.NVFP4, (10, 0), True),
-        (QuantVariant.NVFP4, (10, 3), True),
-        (QuantVariant.NVFP4, (10, 7), True),
-        (QuantVariant.NVFP4, (12, 0), False),
-        (QuantVariant.MXFP4, (10, 0), True),
-        (QuantVariant.MXFP4, (10, 3), True),
-        (QuantVariant.MXFP4, (10, 7), True),
-        (QuantVariant.MXFP4, (12, 0), False),
-        (QuantVariant.W4A16, (10, 0), True),
-        (QuantVariant.W4A16, (10, 3), False),
-        (QuantVariant.W4A16, (10, 7), True),
-        (QuantVariant.W4A16, (12, 0), False),
+    _FP4_ARCH_GATES,
+    ids=[
+        f"{quant_id(quant)}-sm{cc[0]}{cc[1]}-{supported}"
+        for quant, cc, supported in _FP4_ARCH_GATES
     ],
 )
 def test_trtllm_fp4_variant_architecture_gates(
@@ -781,7 +906,7 @@ def test_trtllm_fp4_variant_architecture_gates(
     )
     config = MoEConfig(
         routing=RoutingConfig(num_experts=8, top_k=2),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(intermediate_size=128),
         activation=SwiGLU(),
     )

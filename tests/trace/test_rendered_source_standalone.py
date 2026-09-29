@@ -104,7 +104,7 @@ _PMQA_INIT_KWARGS = dict(
     num_heads=64,
     head_dim=128,
     block_size=64,
-    max_context_len=256,
+    max_seq_len=256,
     device="cpu",
 )
 
@@ -138,7 +138,7 @@ def test_paged_mqa_logits_json_init_and_reference_standalone(json_path, prefix):
     out = ref_fn(**inputs)
 
     rows = _PMQA_INIT_KWARGS["batch_size"] * _PMQA_INIT_KWARGS["next_n"]
-    assert out.shape == (rows, _PMQA_INIT_KWARGS["max_context_len"])
+    assert out.shape == (rows, _PMQA_INIT_KWARGS["max_seq_len"])
     # dtype comes from the reference's own default; it must match what the
     # artifact's output schema advertises.
     assert str(out.dtype).rsplit(".", 1)[-1] == doc["outputs"]["logits"]["dtype"]

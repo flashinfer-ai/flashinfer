@@ -180,8 +180,9 @@ void trtllm_paged_attention_launcher(
     bool uses_shared_paged_kv_idx, bool enable_block_sparse_attention, int64_t sm_count,
     bool enable_pdl, int64_t workspace_size, int64_t k_sf_stride_heads, int64_t k_sf_stride_batch,
     int64_t v_sf_stride_heads, int64_t v_sf_stride_batch, bool is_causal, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads, int64_t bf16q_fp8kv_transform_mode, bool use_fp16_softmax,
-    bool uses_spcompress, cudaStream_t stream) {
+    int64_t lse_stride_heads, double lse_scale, int64_t bf16q_fp8kv_transform_mode,
+    bool use_fp16_softmax, bool uses_spcompress, float const* dsv4_inv_rope_cos_sin_cache,
+    float* dsv4_output_scale, int64_t dsv4_scale_buf_m, cudaStream_t stream) {
   if (num_qo_heads % num_kv_heads != 0) {
     std::ostringstream err_msg;
     err_msg << "num_qo_heads must be a multiple of num_kv_heads, got num_kv_heads: " << num_kv_heads
@@ -249,6 +250,10 @@ void trtllm_paged_attention_launcher(
   runner_params.scaleSoftmaxLog2 = bmm1_scale * M_LOG2E;
   runner_params.scaleSoftmaxLog2Ptr = bmm1_scale_log2_ptr;
   runner_params.oSfPtr = out_scale_factor;
+  runner_params.dsv4InvRopeCosSinCachePtr = dsv4_inv_rope_cos_sin_cache;
+  runner_params.dsv4OScalePtr = dsv4_output_scale;
+  runner_params.mDsv4ScaleBufM = dsv4_scale_buf_m;
+  runner_params.mFusesDsv4InvRopeFp8Quant = dsv4_inv_rope_cos_sin_cache != nullptr;
   runner_params.mSfStartTokenIdx = o_sf_start_index;
   runner_params.mScaleSfO = o_sf_scale;
   TVM_FFI_ICHECK(o_sf_vec_size == 16 || o_sf_vec_size == -1)
@@ -353,6 +358,7 @@ void trtllm_paged_attention_launcher(
         sizeof(float2) * softmax_slots + kTrtllmGenSoftmaxStatsGuardBytes, 16,
         "trtllm_gen_softmax_workspace");
     runner_params.lsePtr = lse;
+    runner_params.lseScale = lse_scale;
     runner_params.lseStrideTokens = lse_stride_tokens;
     runner_params.lseStrideHeads = lse_stride_heads;
   }
@@ -404,6 +410,48 @@ inline Data_type dl_dtype_to_tllm_data_type(const DLDataType dtype) {
 
 inline bool is_4bit(Data_type data_type) { return data_type == Data_type::DATA_TYPE_E2M1; }
 
+// Private planned-MLA query. These are the selection inputs of the dense MLA decode launcher;
+// no tensor data, workspace allocation, cubin loading, or kernel launch is needed.
+int64_t mla_plan_head_divisor(TensorView workspace, bool is_fp8, int64_t batch_size,
+                              int64_t max_q_len, int64_t max_kv_len, int64_t num_heads,
+                              int64_t head_dim_qk, int64_t head_dim_vo, int64_t page_size,
+                              int64_t sm_count) {
+  CHECK_CUDA(workspace);
+  for (auto value : {batch_size, max_q_len, max_kv_len, num_heads, sm_count}) {
+    TVM_FFI_ICHECK(value > 0 && value <= INT_MAX)
+        << "MLA planning dimensions must be positive int32 values";
+  }
+  TVM_FFI_ICHECK((head_dim_qk == 576 && head_dim_vo == 512) ||
+                 (head_dim_qk == 320 && head_dim_vo == 256))
+      << "The head-divisibility query requires MLA head dimensions";
+  TVM_FFI_ICHECK(page_size == 32 || page_size == 64);
+  ffi::CUDADeviceGuard device_guard(workspace.device().device_id);
+  auto const dtype = is_fp8 ? Data_type::DATA_TYPE_E4M3 : Data_type::DATA_TYPE_BF16;
+  auto runner = TllmGenFmhaRunnerCache::get(dtype, dtype, dtype, Data_type::DATA_TYPE_BF16);
+  TllmGenFmhaRunnerParams params{};
+  params.mHeadDimQk = head_dim_qk;
+  params.mHeadDimV = head_dim_vo;
+  params.mNumHeadsQ = num_heads;
+  params.mNumHeadsKv = 1;
+  params.mNumHeadsQPerKv = num_heads;
+  params.mBatchSize = batch_size;
+  params.mMaxSeqLenQ = max_q_len;
+  params.mMaxSeqLenKv = max_kv_len;
+  params.mNumTokensPerPage = page_size;
+  params.mQkvLayout = QkvLayout::PagedKv;
+  params.mMultiProcessorCount = sm_count;
+  params.mAttentionWindowSize = INT_MAX;
+  params.mChunkedAttentionSize = INT_MAX;
+  params.mUsesSharedPagedKvIdx = true;
+  params.mMaskType = TrtllmGenAttentionMaskType::Dense;
+  params.mKernelType = FmhaKernelType::Generation;
+  params.mTileScheduler = TileScheduler::Static;
+  params.mMultiCtasKvMode = true;
+  // Other cubin selectors are zero, matching the planned adapter: no sparse MLA,
+  // BF16/FP8 transform, skip-softmax, FP16 softmax, sparse compression, or fused DSv4 output.
+  return runner->getMlaInitialHeadDivisor(params);
+}
+
 void trtllm_paged_attention_decode(
     TensorView out, Optional<TensorView> out_scale_factor, TensorView query, TensorView key_cache,
     TensorView value_cache, TensorView workspace_buffer, TensorView multi_ctas_kv_counter_buffer,
@@ -414,8 +462,8 @@ void trtllm_paged_attention_decode(
     int64_t workspace_size, Optional<TensorView> attention_sinks,
     Optional<TensorView> cum_seq_lens_q, Optional<TensorView> key_block_scales,
     Optional<TensorView> value_block_scales, Optional<float> skip_softmax_threshold_scale_factor,
-    Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, int64_t lse_stride_tokens,
-    int64_t lse_stride_heads, bool enable_block_sparse_attention,
+    Optional<bool> uses_shared_paged_kv_idx, Optional<TensorView> lse, double lse_scale,
+    int64_t lse_stride_tokens, int64_t lse_stride_heads, bool enable_block_sparse_attention,
     Optional<TensorView> sparse_mla_top_k_lens, int64_t bf16q_fp8kv_transform_mode,
     Optional<bool> use_fp16_softmax) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
@@ -591,8 +639,9 @@ void trtllm_paged_attention_decode(
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       enable_block_sparse_attention, sm_count, enable_pdl, workspace_size, k_sf_stride_heads,
       k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, /*is_causal=*/true,
-      lse_stride_tokens, lse_stride_heads, bf16q_fp8kv_transform_mode, use_fp16_softmax_value,
-      uses_spcompress_value, stream);
+      lse_stride_tokens, lse_stride_heads, lse_scale, bf16q_fp8kv_transform_mode,
+      use_fp16_softmax_value, uses_spcompress_value, /*dsv4_inv_rope_cos_sin_cache=*/nullptr,
+      /*dsv4_output_scale=*/nullptr, /*dsv4_scale_buf_m=*/0, stream);
 }
 
 void trtllm_paged_attention_context(
@@ -606,7 +655,8 @@ void trtllm_paged_attention_context(
     Optional<TensorView> key_block_scales, Optional<TensorView> value_block_scales,
     Optional<float> skip_softmax_threshold_scale_factor, Optional<bool> uses_shared_paged_kv_idx,
     Optional<bool> use_fp16_softmax, Optional<bool> uses_spcompress, bool is_causal,
-    Optional<TensorView> lse, int64_t lse_stride_tokens, int64_t lse_stride_heads) {
+    Optional<TensorView> lse, double lse_scale, int64_t lse_stride_tokens,
+    int64_t lse_stride_heads) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(key_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
@@ -735,8 +785,9 @@ void trtllm_paged_attention_context(
       skip_softmax_threshold_scale_factor_value, skips_softmax, uses_shared_paged_kv_idx_value,
       /*enable_block_sparse_attention=*/false, sm_count, enable_pdl, workspace_size,
       k_sf_stride_heads, k_sf_stride_batch, v_sf_stride_heads, v_sf_stride_batch, is_causal,
-      lse_stride_tokens, lse_stride_heads, /*bf16q_fp8kv_transform_mode=*/0, use_fp16_softmax_value,
-      uses_spcompress_value, stream);
+      lse_stride_tokens, lse_stride_heads, lse_scale, /*bf16q_fp8kv_transform_mode=*/0,
+      use_fp16_softmax_value, uses_spcompress_value, /*dsv4_inv_rope_cos_sin_cache=*/nullptr,
+      /*dsv4_output_scale=*/nullptr, /*dsv4_scale_buf_m=*/0, stream);
 }
 
 void trtllm_ragged_attention_launcher(
@@ -824,6 +875,7 @@ void trtllm_ragged_attention_launcher(
         sizeof(float2) * softmax_slots + kTrtllmGenSoftmaxStatsGuardBytes, 16,
         "trtllm_gen_softmax_workspace");
     runner_params.lsePtr = lse;
+    runner_params.lseScale = 1.0f;
     runner_params.lseStrideTokens = lse_stride_tokens;
     runner_params.lseStrideHeads = lse_stride_heads;
   }
@@ -973,10 +1025,14 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
     TensorView seq_lens, TensorView sparse_mla_top_k_lens, Variant<double, ffi::Tensor> bmm1_scale,
     Variant<double, ffi::Tensor> bmm2_scale, int64_t batch_size, int64_t max_q_len,
     int64_t sm_count, bool enable_pdl, int64_t workspace_size, Optional<TensorView> attention_sinks,
-    Optional<TensorView> cum_seq_lens_q) {
+    Optional<TensorView> cum_seq_lens_q, Optional<TensorView> dsv4_inv_rope_cos_sin_cache,
+    Optional<TensorView> dsv4_output_scale) {
   auto q_data_type = dl_dtype_to_tllm_data_type(query.dtype());
   auto kv_data_type = dl_dtype_to_tllm_data_type(primary_kv_cache.dtype());
   auto o_data_type = dl_dtype_to_tllm_data_type(out.dtype());
+  bool const fuses_dsv4_inv_rope_fp8_quant = dsv4_inv_rope_cos_sin_cache.has_value();
+  TVM_FFI_ICHECK_EQ(fuses_dsv4_inv_rope_fp8_quant, dsv4_output_scale.has_value())
+      << "dsv4_inv_rope_cos_sin_cache and dsv4_output_scale must be provided together";
 
   TVM_FFI_ICHECK(query.ndim() == 3) << "query must have shape [B*Q, H, D]";
   TVM_FFI_ICHECK(primary_kv_cache.ndim() == 4)
@@ -996,8 +1052,15 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
   TVM_FFI_ICHECK_EQ(kv_data_type, q_data_type) << "primary_kv_cache dtype must match query dtype";
   TVM_FFI_ICHECK_EQ(dl_dtype_to_tllm_data_type(sliding_window_kv_cache.dtype()), q_data_type)
       << "sliding_window_kv_cache dtype must match query dtype";
-  TVM_FFI_ICHECK_EQ(o_data_type, Data_type::DATA_TYPE_BF16)
-      << "DeepSeek V4 sparse MLA output must be BF16";
+  if (fuses_dsv4_inv_rope_fp8_quant) {
+    TVM_FFI_ICHECK_EQ(q_data_type, Data_type::DATA_TYPE_E4M3)
+        << "DeepSeek V4 RopeQuant requires FP8 E4M3 query and KV inputs";
+    TVM_FFI_ICHECK_EQ(o_data_type, Data_type::DATA_TYPE_E4M3)
+        << "DeepSeek V4 RopeQuant output must be FP8 E4M3";
+  } else {
+    TVM_FFI_ICHECK_EQ(o_data_type, Data_type::DATA_TYPE_BF16)
+        << "DeepSeek V4 sparse MLA output must be BF16";
+  }
 
   int const sum_seq_q = query.size(0);
   int const num_qo_heads = query.size(1);
@@ -1006,6 +1069,9 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
   int* cum_seq_lens_q_ptr =
       is_varlen_q ? static_cast<int*>(cum_seq_lens_q.value().data_ptr()) : nullptr;
   TVM_FFI_ICHECK_EQ(num_kv_heads, 1) << "DeepSeek V4 sparse MLA expects one KV head";
+  if (fuses_dsv4_inv_rope_fp8_quant) {
+    TVM_FFI_ICHECK_EQ(num_qo_heads, 128) << "DeepSeek V4 RopeQuant requires 128 query heads";
+  }
   TVM_FFI_ICHECK_EQ(sliding_window_kv_cache.size(-3), 1)
       << "sliding_window_kv_cache must have one KV head";
   TVM_FFI_ICHECK_EQ(seq_lens.size(0), batch_size);
@@ -1030,11 +1096,62 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       is_4bit(kv_data_type) ? primary_kv_cache.size(-1) * 2 : primary_kv_cache.size(-1);
   int const head_dim_sw = is_4bit(kv_data_type) ? sliding_window_kv_cache.size(-1) * 2
                                                 : sliding_window_kv_cache.size(-1);
-  int const head_dim_o = is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1);
+  int const head_dim_o = fuses_dsv4_inv_rope_fp8_quant
+                             ? 512
+                             : (is_4bit(o_data_type) ? out.size(-1) * 2 : out.size(-1));
   TVM_FFI_ICHECK_EQ(head_dim_q, 512);
   TVM_FFI_ICHECK_EQ(head_dim_k, 512);
   TVM_FFI_ICHECK_EQ(head_dim_sw, 512);
   TVM_FFI_ICHECK_EQ(head_dim_o, 512);
+
+  float const* dsv4_inv_rope_cos_sin_cache_ptr = nullptr;
+  float* dsv4_output_scale_ptr = nullptr;
+  int64_t dsv4_scale_buf_m = 0;
+  if (fuses_dsv4_inv_rope_fp8_quant) {
+    auto const& cos_sin_cache = dsv4_inv_rope_cos_sin_cache.value();
+    auto const& output_scale = dsv4_output_scale.value();
+    int64_t constexpr heads_per_group = 8;
+    int64_t const num_groups = num_qo_heads / heads_per_group;
+    int64_t const group_width = heads_per_group * head_dim_o;
+
+    TVM_FFI_ICHECK_EQ(out.ndim(), 3)
+        << "RopeQuant out must have shape [sum_q, num_head_groups, group_width]";
+    TVM_FFI_ICHECK_EQ(out.size(0), sum_seq_q);
+    TVM_FFI_ICHECK_EQ(out.size(1), num_groups);
+    TVM_FFI_ICHECK_EQ(out.size(2), group_width);
+    TVM_FFI_ICHECK_EQ(out.stride(0), group_width);
+    TVM_FFI_ICHECK_EQ(out.stride(1), sum_seq_q * group_width);
+    TVM_FFI_ICHECK_EQ(out.stride(2), 1);
+
+    TVM_FFI_ICHECK_EQ(cos_sin_cache.dtype(), dl_float32)
+        << "dsv4_inv_rope_cos_sin_cache must be float32";
+    TVM_FFI_ICHECK(cos_sin_cache.ndim() == 2 && cos_sin_cache.size(1) == 64 &&
+                   cos_sin_cache.IsContiguous())
+        << "dsv4_inv_rope_cos_sin_cache must be contiguous [max_position, 64]";
+
+    TVM_FFI_ICHECK_EQ(output_scale.dtype(), dl_int32)
+        << "dsv4_output_scale must contain packed UE8M0 values in int32 storage";
+    TVM_FFI_ICHECK_EQ(output_scale.ndim(), 3)
+        << "dsv4_output_scale must have shape [sum_q, num_head_groups, 8]";
+    TVM_FFI_ICHECK_EQ(output_scale.size(0), sum_seq_q);
+    TVM_FFI_ICHECK_EQ(output_scale.size(1), num_groups);
+    TVM_FFI_ICHECK_EQ(output_scale.size(2), heads_per_group);
+    TVM_FFI_ICHECK_EQ(output_scale.stride(0), 1);
+    dsv4_scale_buf_m = output_scale.stride(2);
+    TVM_FFI_ICHECK(dsv4_scale_buf_m >= sum_seq_q && dsv4_scale_buf_m <= INT_MAX &&
+                   dsv4_scale_buf_m % 4 == 0)
+        << "dsv4_output_scale token stride must be a multiple of 4 and cover sum_q";
+    TVM_FFI_ICHECK_EQ(output_scale.stride(1), heads_per_group * dsv4_scale_buf_m);
+
+    for (auto const& tensor : {out, output_scale, cos_sin_cache}) {
+      TVM_FFI_ICHECK(tensor.device().device_type == query.device().device_type &&
+                     tensor.device().device_id == query.device().device_id)
+          << "RopeQuant outputs and cos/sin cache must be on the same device as query";
+    }
+
+    dsv4_inv_rope_cos_sin_cache_ptr = static_cast<float const*>(cos_sin_cache.data_ptr());
+    dsv4_output_scale_ptr = static_cast<float*>(output_scale.data_ptr());
+  }
 
   int const sparse_mla_top_k = sparse_indices.size(-1);
   TVM_FFI_ICHECK(sparse_mla_top_k >= kDsv4SparseMlaSlidingWindowTopK)
@@ -1154,8 +1271,9 @@ void trtllm_paged_attention_decode_sparse_mla_dsv4(
       enable_pdl, workspace_size,
       /*k_sf_stride_heads=*/0, /*k_sf_stride_batch=*/0, /*v_sf_stride_heads=*/0,
       /*v_sf_stride_batch=*/0, /*is_causal=*/true, /*lse_stride_tokens=*/0,
-      /*lse_stride_heads=*/0, /*bf16q_fp8kv_transform_mode=*/0, /*use_fp16_softmax=*/false,
-      /*uses_spcompress=*/false, stream);
+      /*lse_stride_heads=*/0, /*lse_scale=*/1.0f, /*bf16q_fp8kv_transform_mode=*/0,
+      /*use_fp16_softmax=*/false, /*uses_spcompress=*/false, dsv4_inv_rope_cos_sin_cache_ptr,
+      dsv4_output_scale_ptr, dsv4_scale_buf_m, stream);
 }
 
 namespace trtllm_cubin_loader {
@@ -1163,6 +1281,7 @@ namespace trtllm_cubin_loader {
 }
 
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode, trtllm_paged_attention_decode);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(_mla_plan_head_divisor, mla_plan_head_divisor);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_context, trtllm_paged_attention_context);
 TVM_FFI_DLL_EXPORT_TYPED_FUNC(trtllm_paged_attention_decode_sparse_mla_dsv4,
                               trtllm_paged_attention_decode_sparse_mla_dsv4);

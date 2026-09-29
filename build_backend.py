@@ -31,8 +31,9 @@ _data_dir = _root / "flashinfer" / "data"
 
 # moe_ep build infra. Both EP backends are ON BY DEFAULT since the moe_ep
 # runtime deps moved into the base dependencies (`pip install .` is enough):
-#   NCCL-EP  — provided by the `nccl4py>=0.3.1` wheel (a base dep now); NO
-#              in-tree build.
+#   NCCL-EP  — provided by the `nccl-extensions>=0.1.0` wheel (a base dep
+#              now); NO in-tree build. (nccl.ep used to ship in nccl4py;
+#              nccl4py 0.4.1 dropped it — see requirements.txt.)
 #   NIXL-EP  — built in-tree from 3rdparty/nixl (meson). Missing build deps
 #              (meson/ninja/nvcc/UCX/...) skip the backend with a warning
 #              instead of failing the install (best-effort).
@@ -128,17 +129,26 @@ def _no_pip_installs() -> bool:
     return os.environ.get("FLASHINFER_BUILD_NO_PIP") == "1"
 
 
-def _detect_cuda_major() -> int:
-    """Best-effort detection of the CUDA major version on the host."""
+def _detect_cuda_release() -> tuple[int, int] | None:
+    """Best-effort detection of the CUDA major/minor release on the host."""
     try:
         out = subprocess.check_output(["nvcc", "--version"]).decode()
         for line in out.splitlines():
             if "release" in line:
                 # e.g. "Cuda compilation tools, release 13.0, V13.0.48"
                 token = line.split("release", 1)[1].split(",", 1)[0].strip()
-                return int(token.split(".")[0])
+                major, minor = token.split(".", 1)
+                return int(major), int(minor)
     except Exception:
         pass
+    return None
+
+
+def _detect_cuda_major() -> int:
+    """Best-effort detection of the CUDA major version on the host."""
+    release = _detect_cuda_release()
+    if release is not None:
+        return release[0]
     return 13  # default — pyproject's nvep extras pin cu13 packages
 
 
@@ -491,8 +501,9 @@ def _build_nccl_ep() -> None:
             shutil.copy(sopath, dst / soname)
             print(f"[BUILD_NVEP] staged: {soname}")
 
-    # NOTE: nccl_ep (ctypes wrapper from contrib/nccl_ep/python) and nccl4py
-    # (Cython bindings + Communicator(ptr=...) bridge) are NOT pip-installed
+    # NOTE: nccl_ep (ctypes wrapper from contrib/nccl_ep/python) and the
+    # nccl Python bindings (Cython bindings + Communicator(ptr=...) bridge)
+    # are NOT pip-installed
     # from this build hook. When `uv pip install` runs the FlashInfer build,
     # sys.executable points to uv's isolated build env (which has no pip), so
     # `python -m pip install` from here fails. Install them as a separate
@@ -500,11 +511,12 @@ def _build_nccl_ep() -> None:
     #
     #   pip install -e 3rdparty/nccl/contrib/nccl_ep/python
     #   CUDA_HOME=/usr/local/cuda pip install -e 3rdparty/nccl/bindings/nccl4py[cu13]
+    #   CUDA_HOME=/usr/local/cuda pip install -e 3rdparty/nccl-extensions/python[cu13]
     #
     # docker/Dockerfile.flashinfer-nvep already chains these after the main
     # `BUILD_NVEP=1 uv pip install ...` step.
     print(
-        "[BUILD_NVEP] nccl_ep + nccl4py pip-installs deferred to post-build "
+        "[BUILD_NVEP] nccl_ep + nccl4py/nccl-extensions pip-installs deferred to post-build "
         "step (see docker/Dockerfile.flashinfer-nvep). Skipping in hook."
     )
 
@@ -777,6 +789,15 @@ def _compile_deps_installed(specs) -> bool:
     return True
 
 
+def _system_cuda_tile_compiler_available() -> bool:
+    """Return whether CUDA 13.4+ provides an executable toolkit TileIRAS."""
+    release = _detect_cuda_release()
+    if release is None or release < (13, 4):
+        return False
+    compiler = Path("/usr/local/cuda/bin/tileiras")
+    return compiler.is_file() and os.access(compiler, os.X_OK)
+
+
 def _install_cuda_tile_compile_deps() -> None:
     """Install cuda-tile's compile chain with ``--no-deps`` to dodge libcudart.so.13.
 
@@ -806,13 +827,22 @@ def _install_cuda_tile_compile_deps() -> None:
     ``pip install`` from within that environment to resolve the
     ``nvidia-cuda-runtime`` version conflict described above.
 
-    In such isolated builds (e.g. the AOT Build Import workflow) the compile
-    chain is already present on flashinfer-ci images, so we *warn and continue*
-    instead of blocking the build.  A clean PyPI install on a system that lacks
+    CUDA toolkits that provide ``/usr/local/cuda/bin/tileiras`` (CUDA 13.4 and
+    newer) do not need the pip compiler overlay. In isolated builds (e.g. the
+    AOT Build Import workflow) without that system compiler, the compile chain
+    is already present on flashinfer-ci images, so we *warn and continue*
+    instead of blocking the build. A clean PyPI install on a system that lacks
     both ``uv`` and the compile chain will surface a clear ``ImportError`` the
     first time the user calls a cuTile kernel — a better failure mode than
     aborting the install entirely.
     """
+    if _system_cuda_tile_compiler_available():
+        print(
+            "[BUILD] using system cuda-tile compiler; skipping pip compile deps",
+            flush=True,
+        )
+        return
+
     wheels = get_cuda_tile_compile_dependency_requirements()
 
     if _compile_deps_installed(wheels):
@@ -922,12 +952,12 @@ def _build_nvep_if_enabled() -> None:
         )
 
     # NCCL-EP is not built from source — it is provided by the released
-    # `nccl4py` wheel (>=0.3.1, the `nccl.ep` API + bundled libnccl_ep.so),
-    # which is a base dependency now. So BUILD_NCCL_EP requires no in-tree
-    # build step; we only note it here.
+    # `nccl-extensions` wheel (>=0.1.0, the `nccl.ep` API + bundled
+    # libnccl_ep.so), which is a base dependency now. So BUILD_NCCL_EP
+    # requires no in-tree build step; we only note it here.
     if _BUILD_NCCL_EP:
         print(
-            "[BUILD_NVEP] NCCL-EP is provided by the nccl4py wheel (>=0.3.1), "
+            "[BUILD_NVEP] NCCL-EP is provided by the nccl-extensions wheel (>=0.1.0), "
             "a base dependency of flashinfer-python; no in-tree build."
         )
         # torch's cu13 wheels pin nvidia-nccl-cu13 exactly (< the B200 EP
@@ -995,7 +1025,7 @@ def _build_nvep_if_enabled() -> None:
 
     built = [b for b, is_enabled in (("NIXL-EP", built_nixl),) if is_enabled]
     if _BUILD_NCCL_EP:
-        built.append("NCCL-EP (via nccl4py wheel)")
+        built.append("NCCL-EP (via nccl-extensions wheel)")
     print(f"[BUILD_NVEP] done — built: {', '.join(built) if built else 'nothing'}")
 
 

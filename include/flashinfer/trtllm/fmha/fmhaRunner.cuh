@@ -71,6 +71,11 @@ class TllmGenFmhaRunner {
     return mKernel->checkIfKernelExist(runnerParams);
   }
 
+  // Query only the initial dense-MLA head tiling, without loading a cubin.
+  int getMlaInitialHeadDivisor(TllmGenFmhaRunnerParams const& runnerParams) const {
+    return mKernel->getMlaInitialHeadDivisor(runnerParams);
+  }
+
   // Run the fmha kernel.
   void run(TllmGenFmhaRunnerParams const& runnerParams) { mKernel->run(runnerParams); }
 

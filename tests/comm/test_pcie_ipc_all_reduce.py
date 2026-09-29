@@ -829,7 +829,10 @@ def _tune_worker(world_size: int, rank: int, port: int, tmpdir: str) -> None:
             tune_batches=_TUNE_BATCHES,
         )
         before = {b: ws.supports(_tune_input(b, device)) for b in _TUNE_BATCHES}
-        ws.tune([_TUNE_HIDDEN], cache=path, warmup=2, repeat=5)
+        # Default sample counts, not the reduced ones: tune() refuses to write
+        # the file below them, and everything after this line reads it back.
+        # Affordable because these buckets are 12-48 KiB.
+        ws.tune([_TUNE_HIDDEN], cache=path)
 
         resolved = {}
         for batch in _TUNE_BATCHES:
@@ -1128,7 +1131,7 @@ def _untuned_warning_worker(world_size: int, rank: int, port: int, tmpdir: str) 
         assert not during, during
 
         # And silent afterwards, including on a shape tuning did not cover.
-        ws.tune([_TUNE_HIDDEN], cache=path, warmup=2, repeat=5)
+        ws.tune([_TUNE_HIDDEN], cache=path)
         after = _untuned_warnings(lambda: ws.all_reduce(_tune_input(4, device)))
         assert not after, after
 

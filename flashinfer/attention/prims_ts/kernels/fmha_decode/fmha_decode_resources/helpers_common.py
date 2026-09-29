@@ -22,9 +22,12 @@ multiple resource classes (and the other ``_helpers_*`` modules) need.
 from functools import partial
 from typing import ClassVar
 
+
 import cutlass
 import cutlass.cute as cute
 from cutlass import BFloat16, Float16, Float32, Int32, Int64, Uint32
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.resources import (
@@ -53,11 +56,27 @@ TaskCache = tuple[
     Int32,
     Int32,
 ]
-DescriptorValue = prims.Tcgen05SmemDesc | cutlass.Int64
+DescriptorValue = prims.Tcgen05SmemDesc | cutlass.Int64 | Int32
 ResourceVarValue = (
     Int32 | Float32 | Uint32 | cutlass.Int64 | cutlass.Array | DescriptorValue
 )
 ResourceVars = dict[str, ResourceVarValue]
+
+
+@dsl_user_op
+def _assume_nonnegative_i32(value: Int32, *, loc=None, ip=None) -> Int32:
+    """Express a caller-guaranteed nonnegative Int32 contract to codegen."""
+
+    condition = cutlass.Boolean(value >= Int32(0))
+    llvm.intr_assume(
+        condition.ir_value(loc=loc, ip=ip),
+        [],
+        [],
+        loc=loc,
+        ip=ip,
+    )
+    return value
+
 
 # Offsets into DecodeGenTask.make_task_cache(). Keeping these symbolic makes
 # resource code explicit about which task-local lane or address value it needs.
@@ -109,14 +128,55 @@ def _warp_broadcast_i32(value: Int32, source_lane: Constexpr[int]) -> Int32:
     )
 
 
-def _mma_kind_for_qkv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
-    """Select the tcgen05 MMA opcode family used for Q/K/V operands."""
-    return prims.Tcgen05MMAKind.F8F6F4 if cfg.use_fp8_qkv else prims.Tcgen05MMAKind.F16
+@cute.jit
+def _swaps_routed_coordinate(
+    cfg: Constexpr[FmhaDecodeConfig],
+    lane_k_offset: Int32,
+    origin0: Int32,
+    origin1: Int32,
+    origin2: Int32,
+    origin3: Int32,
+    *,
+    token_group_idx: Constexpr[int],
+) -> tuple[Int32, Int32]:
+    """Map one SWAP register group to its staged atom and logical coordinate."""
+
+    atom_size = min(cfg.kv_block_size, 32)
+    groups_per_atom = atom_size // 8
+    origin_idx = token_group_idx // groups_per_atom
+    atom_origin = origin0
+    if cutlass.const_expr(origin_idx == 1):
+        atom_origin = origin1
+    elif cutlass.const_expr(origin_idx == 2):
+        atom_origin = origin2
+    elif cutlass.const_expr(origin_idx == 3):
+        atom_origin = origin3
+    token_offset = (token_group_idx % groups_per_atom) * 8
+    return atom_origin, atom_origin + Int32(token_offset) + lane_k_offset
 
 
-def _mma_k_step(cfg: FmhaDecodeConfig) -> int:
-    """Return the K dimension advanced by one tcgen05 MMA instruction."""
-    return 32 if cfg.use_fp8_qkv else 16
+def _mma_kind_for_qk(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA opcode family for the QK GEMM."""
+    if cfg.use_fp8_qk:
+        return prims.Tcgen05MMAKind.F8F6F4
+    return prims.Tcgen05MMAKind.F16
+
+
+def _mma_k_step_qk(cfg: FmhaDecodeConfig) -> int:
+    """Return the K dimension advanced by one QK-GEMM MMA instruction."""
+    return 32 if cfg.use_fp8_qk else 16
+
+
+def _mma_kind_for_pv(cfg: FmhaDecodeConfig) -> prims.Tcgen05MMAKind:
+    """Select the tcgen05 MMA opcode family for the PV GEMM."""
+    if cfg.use_fp8_pv:
+        return prims.Tcgen05MMAKind.F8F6F4
+    return prims.Tcgen05MMAKind.F16
+
+
+def _mma_k_step_pv(cfg: FmhaDecodeConfig) -> int:
+    """Return the K dimension advanced by one PV-GEMM MMA instruction."""
+    return 32 if cfg.use_fp8_pv else 16
 
 
 @cute.jit
@@ -307,9 +367,30 @@ def _pack_float2_to_bf16(v0: Float32, v1: Float32) -> Int32:
     )
 
 
-def _qkv_smem_swizzle(cfg: FmhaDecodeConfig) -> prims.Tcgen05SmemSwizzle:
-    """Select the tcgen05 SMEM swizzle for staged Q/K/V tiles."""
-    if cfg.use_fp8_qkv and cfg.headdim == 64:
+def _q_dtype_elements(cfg: FmhaDecodeConfig) -> int:
+    """Return element count in one staged Q SMEM allocation."""
+    return cfg.smem_q_tile_bytes // cfg.q_dtype_bytes
+
+
+def _kv_dtype_elements(cfg: FmhaDecodeConfig) -> int:
+    """Return element count in one staged K/V SMEM allocation."""
+    return cfg.smem_kv_tile_elements
+
+
+def _qkv_smem_swizzle(
+    cfg: FmhaDecodeConfig,
+) -> prims.Tcgen05SmemSwizzle:
+    """Select the tcgen05 SMEM swizzle for staged Q tiles."""
+    if cfg.use_fp8_q and cfg.headdim == 64:
+        return prims.Tcgen05SmemSwizzle.SWIZZLE_64B
+    return prims.Tcgen05SmemSwizzle.SWIZZLE_128B
+
+
+def _kv_smem_swizzle(
+    cfg: FmhaDecodeConfig,
+) -> prims.Tcgen05SmemSwizzle:
+    """Select the tcgen05 SMEM swizzle for raw staged K/V tiles."""
+    if cfg.use_fp8_kv and cfg.headdim == 64:
         return prims.Tcgen05SmemSwizzle.SWIZZLE_64B
     return prims.Tcgen05SmemSwizzle.SWIZZLE_128B
 

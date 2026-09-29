@@ -32,6 +32,16 @@ def gen_mla_module() -> JitSpec:
     )
 
 
+def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
+    """Compatibility alias: the NVFP4 route lives in the unified SM120 module."""
+    return gen_sparse_mla_sm120_module()
+
+
+def gen_sparse_mla_nvfp4_sm120_tile_module() -> JitSpec:
+    """Compatibility alias: the MMA layout probes live in the unified module."""
+    return gen_sparse_mla_sm120_module()
+
+
 def gen_sparse_mla_sm120_module() -> JitSpec:
     """Sparse-MLA paged attention for SM120.
 
@@ -45,11 +55,19 @@ def gen_sparse_mla_sm120_module() -> JitSpec:
     return gen_jit_spec(
         "sparse_mla_sm120",
         [
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_decode_dsv3_2.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_decode_dsv4.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_prefill.cu",
-            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120_jit_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv32_decode_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/decode_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv41_fp4_cache_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/nvfp4_mma_layout_probe.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_cache_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "sparse_mla_sm120/dsv4_nvfp4_attention_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_resolve.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/attention_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/attention_resolve.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
     )
