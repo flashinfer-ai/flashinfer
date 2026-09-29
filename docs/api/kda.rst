@@ -572,6 +572,18 @@ It fuses Q/K L2 normalization, the bounded K3 gate, beta sigmoid, preparation,
 triangular solves and recurrence. A continuous five-stage preparation pipeline
 is shared across each CTA's sequence/head chains. Recurrent state and
 inter-CTA state handoffs use FP32; tensor-core operands and output use BF16.
+Values, states and outputs up to about ``2**69`` in magnitude stay finite:
+the BF16 state operand is stored scaled by ``2**-57`` so that the anchored
+decay factors cannot overflow the FP32 accumulators.
+
+The work schedule is derived per call from a cost model, independent of
+specific sequence lengths or SM counts. Whole (sequence, head) chains are
+packed longest-processing-time first onto at most one CTA per SM. When
+cutting chains lowers the modelled makespan by at least 5%, the scheduler
+either cuts short heads off the longest chains or wraps chains across CTAs.
+Every cut piece hands FP32 state from a producer that leads its CTA to a
+consumer that ends another one, so no producer waits on a consumer. A
+sequence's partial last chunk is loaded as a full tile and masked.
 The gate-prefix table remains FP32 on all routes. FP32 state storage does not
 make the arithmetic an FP32-only recurrence: tensor-core operands, residual
 updates and beta carriers are rounded to BF16. In particular, near-unit decay
@@ -610,9 +622,9 @@ outlive the graph. Q/K/V/G, beta, gate parameters and state contents may change
 between replays, but sequence offsets and scalar arguments must stay fixed.
 Handoff flags are cleared on the launch stream before every invocation, so
 captured replays can be interleaved with independent eager calls.
-The split schedules rely on the full persistent grid being resident. Serialize
-independent split-grid invocations; overlapping them on separate CUDA streams
-is not supported.
+Split schedules launch without clusters and rely on the full persistent grid
+being resident. Serialize independent split-grid invocations; overlapping
+them on separate CUDA streams is not supported.
 
 In eager mode, offset values are read on the host to prepare the schedule;
 this also detects edits made under ``torch.inference_mode``. Only the most

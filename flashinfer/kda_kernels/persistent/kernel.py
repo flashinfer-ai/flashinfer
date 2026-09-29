@@ -19,8 +19,9 @@ Compute performs the recurrent updates with BF16 MMA operands and FP32
 accumulators; epilogue stores BF16 outputs and FP32 terminal state.
 
 Tensor-memory columns: input/residual 0-63, master state 64-191, output
-192-223, U 224-255, and five preparation Gram windows 256-415. The allocation
-is rounded to 512 columns. Shared stage storage is reused only after its
+192-223, U 224-255, and five preparation Gram windows 256-415; varlen routes
+keep MMA4's residual operand in 416-431. The allocation is rounded to 512
+columns. Shared stage storage is reused only after its
 smem-free barrier: gate scan, decorations, Gram/solve, restored operands,
 then V staging. FP32 gate-prefix storage is retained on every route.
 """
@@ -1249,7 +1250,10 @@ def _pkd(
                                         v_gt8[(8 + hh * 2 + gv, None, csn)], g8d
                                     )
                                 mv = rcur.load()
-                                rbh.store(mv.to(cutlass.BFloat16) * cutlass.BFloat16(INP_SCALE))
+                                rbh.store(
+                                    mv.to(cutlass.BFloat16)
+                                    * cutlass.BFloat16(INP_SCALE)
+                                )
                                 rcur.store(mv * gt16.load())
                                 tw8 = cute.make_tensor(
                                     cute.recast_ptr(
@@ -2004,9 +2008,7 @@ def _pkd(
                     # beta (dedicated buffer -> written pre-walker; read by the
                     # grams two barriers later and by compute after qk_full)
                     if plw == 2:
-                        if cutlass.const_expr(
-                            (not static_full) or (QK_ROWPAIR_ != 8)
-                        ):
+                        if cutlass.const_expr((not static_full) or (QK_ROWPAIR_ != 8)):
                             if cutlass.const_expr(BETA_TMA_ == 1):
                                 cute.arch.mbarrier_wait(mb + MB_BRAW + inst, pp_braw)
                             if lane < cc:
@@ -2027,9 +2029,7 @@ def _pkd(
                         # store-gate / reload / walker phase pair (~256 fewer
                         # L1 wavefronts per chunk on the ~86%-busy LSU pipe).
                         # v99 note kept out: TMAs stay full-chunk-gated here.
-                        if cutlass.const_expr(
-                            (not static_full) or (QK_ROWPAIR_ != 8)
-                        ):
+                        if cutlass.const_expr((not static_full) or (QK_ROWPAIR_ != 8)):
                             if tma:
                                 cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
                         accg = cutlass.Float32(0.0)

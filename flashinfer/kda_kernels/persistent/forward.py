@@ -579,7 +579,7 @@ def make_plan(offsets, H, dev):
     soff, schain, spt0, sptn, ssrc, sdst, G, nbuf = _piece_schedule(
         lens, H, _sm_count(dev), dev
     )
-    # Keep every inter-CTA handoff in FP32, including shapes outside INT21.
+    # Every inter-CTA handoff carries FP32 state.
     mid = torch.empty(max(nbuf, 1), D, D, dtype=torch.float32, device=dev)
     flags = torch.zeros(max(nbuf, 1), dtype=torch.int32, device=dev)
     return (

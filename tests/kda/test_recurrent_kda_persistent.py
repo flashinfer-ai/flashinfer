@@ -139,7 +139,15 @@ def test_persistent_kda_reference(lengths, packed, heads, state):
 
 @pytest.mark.parametrize("heads", [64, 96])
 @pytest.mark.parametrize(
-    "lengths", [(8192,), (1300, 547, 2048, 963, 271, 3063), (1024,) * 8]
+    "lengths",
+    [
+        (8192,),
+        (1300, 547, 2048, 963, 271, 3063),
+        (1024,) * 8,
+        # Outside INT21: reordered and partial-chunk lengths.
+        (3063, 271, 963, 2048, 547, 1300),
+        (1023,) * 8,
+    ],
 )
 def test_persistent_kda_int21(heads, lengths, monkeypatch):
     monkeypatch.setenv("FLA_FLASH_KDA", "0")
@@ -316,3 +324,89 @@ def test_persistent_kda_capture_requires_exact_warm_buffers():
         torch.cuda.graph(torch.cuda.CUDAGraph(), stream=stream),
     ):
         _call({**inputs, "q": replacement}, output=output, prefill_workspace=workspace)
+
+
+@pytest.mark.parametrize("lengths", [(1024,) * 8, (1300, 547, 2048, 963, 271, 3063)])
+def test_persistent_kda_repeat_is_deterministic(lengths):
+    """Repeated launches must be bitwise identical; a TMEM ordering race between
+    MMA4's output leg and the next chunk's state operand broke this on CUDA 12.9."""
+    inputs = _inputs(lengths, 64, True)
+    initial = inputs["initial_state"].clone()
+    results = []
+    for _ in range(4):
+        inputs["initial_state"].copy_(initial)
+        out, state = _call(inputs, output_final_state=True)
+        results.append((out.clone(), state.clone()))
+    for out, state in results[1:]:
+        assert torch.equal(out, results[0][0])
+        assert torch.equal(state, results[0][1])
+
+
+@pytest.mark.parametrize(
+    "lengths,packed", [((8192,), False), ((1300, 547, 2048), True)]
+)
+@pytest.mark.parametrize("power", [20, 60])
+def test_persistent_kda_large_values(lengths, packed, power):
+    """KDA is linear in (v, state): exact power-of-two scaling must commute.
+    Anchored decorations used to overflow FP32 for values near 1e4."""
+    inputs = _inputs(lengths, 64, packed)
+    base = _call(
+        {**inputs, "initial_state": inputs["initial_state"].clone()},
+        output_final_state=True,
+    )
+    scale = 2.0**power
+    scaled = {
+        **inputs,
+        "v": inputs["v"] * scale,
+        "initial_state": inputs["initial_state"] * scale,
+    }
+    out, state = _call(scaled, output_final_state=True)
+    assert torch.isfinite(out).all() and torch.isfinite(state).all()
+    torch.testing.assert_close(out.float() / scale, base[0].float(), atol=0, rtol=0)
+    torch.testing.assert_close(state / scale, base[1], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("nslots", [132, 148, 152])
+@pytest.mark.parametrize(
+    "heads,lengths",
+    [
+        (64, (1300, 547, 2048, 963, 271, 3063)),
+        (64, (3063, 271, 963, 2048, 547, 1300)),
+        (64, (1024,) * 8),
+        (96, (1000,) * 8),
+        (96, (459, 840, 1417, 582, 2098, 2432, 364)),
+        (192, (8192,)),
+    ],
+)
+def test_persistent_kda_schedule_invariants(heads, lengths, nslots):
+    """Schedules cover every token once for any length order and SM count, and
+    every consumer piece's producer leads its CTA, so no handoff can deadlock."""
+    from flashinfer.kda_kernels.persistent.forward import _piece_schedule
+
+    soff, chain, t0, tn, src, dst, grid, nbuf = (
+        x.tolist() if isinstance(x, torch.Tensor) else x
+        for x in _piece_schedule(list(lengths), heads, nslots, torch.device("cpu"))
+    )
+    assert grid <= nslots
+    producers = {}
+    covered = {}
+    for slot in range(grid):
+        items = range(soff[slot], soff[slot + 1])
+        kinds = [2 if src[i] >= 0 else 0 if dst[i] >= 0 else 1 for i in items]
+        # Producers first, whole chains next, consumers last.
+        assert kinds == sorted(kinds)
+        for i in items:
+            covered.setdefault(chain[i], []).append((t0[i], tn[i]))
+            if dst[i] >= 0:
+                assert src[i] < 0 and t0[i] == 0 and tn[i] % 32 == 0
+                producers[dst[i]] = (chain[i], tn[i])
+    for i in range(len(chain)):
+        if src[i] >= 0:
+            assert producers[src[i]] == (chain[i], t0[i])
+    assert len(producers) == nbuf
+    for c in range(len(lengths) * heads):
+        pieces = sorted(covered[c])
+        assert pieces[0][0] == 0
+        assert sum(n for _, n in pieces) == lengths[c // heads]
+        for (a, n), (b, _) in zip(pieces, pieces[1:], strict=False):
+            assert a + n == b
