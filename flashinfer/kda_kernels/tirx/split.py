@@ -250,13 +250,16 @@ def make_front(H: int, arch: str):
 
         sp = txl.specialize()
 
-        prep = sp.role("prep", warps=list(range(8)), regs=128)
-        rdo = sp.role("rdo", warps=[8, 9, 10, 11], regs=96)
-        solve = sp.role("solve", warps=[12, 13, 14, 15], regs=88)
-        mma2 = sp.role("mma2", warps=[16], regs=40)
-        mma3 = sp.role("mma3", warps=[17], regs=40)
-        tma = sp.role("tma", warps=[18], regs=40)
-        aux = sp.role("aux", warps=[19], regs=40)
+        # The 640-thread launch gives a 61440-register pool. NVRTC 13.3 hoists
+        # more loop invariants in prep; 128 registers spill there and slow the
+        # fixed route by about 25%, so prep takes the single-warp roles' slack.
+        prep = sp.role("prep", warps=list(range(8)), regs=144)
+        rdo = sp.role("rdo", warps=[8, 9, 10, 11], regs=88)
+        solve = sp.role("solve", warps=[12, 13, 14, 15], regs=80)
+        mma2 = sp.role("mma2", warps=[16], regs=24)
+        mma3 = sp.role("mma3", warps=[17], regs=24)
+        tma = sp.role("tma", warps=[18], regs=24)
+        aux = sp.role("aux", warps=[19], regs=24)
 
         smem = txl.smem_pool()
         s_tmem_addr = smem.alloc((1,), txl.i32, align=4)
