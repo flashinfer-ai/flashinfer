@@ -74,7 +74,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_TASK_INFOS_STRIDE 64
 #define SMEM_TOTAL 230400
 #define THREADS 512
-#define NUM_CTAS 152
+#define NUM_CTAS 148
 
 #include <math_constants.h>
 
@@ -984,7 +984,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_idx_i32, float* __restrict__ topk_weights, int* __restrict__ x_fp8, unsigned int* __restrict__ x_sf, const __grid_constant__ CUtensorMap A, int* __restrict__ pool_fp8, unsigned int* __restrict__ pool_sf, float* __restrict__ routing_weight_pool, int* __restrict__ token_to_permuted, int* __restrict__ meta_token, int* __restrict__ meta_slot, int* __restrict__ expert_counts, int* __restrict__ expert_row_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ total_m_tiles_out, const __grid_constant__ CUtensorMap B1, const __grid_constant__ CUtensorMap SFB1, const __grid_constant__ CUtensorMap I_fp8_w, uint8_t* __restrict__ SF_I_w, __nv_bfloat16* __restrict__ l1_bf16_capture, const __grid_constant__ CUtensorMap A2, unsigned int* __restrict__ SFA2, const __grid_constant__ CUtensorMap B2, const __grid_constant__ CUtensorMap SFB2, __nv_bfloat16* __restrict__ expert_output, __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ histogram_done, unsigned int* __restrict__ prefix_done, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ l1_arrival, unsigned int* __restrict__ l2_done, int num_tokens, int top_k, int num_experts, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles, int M_total, float activation_clamp, unsigned int* __restrict__ PrivateCounters, unsigned long long* __restrict__ PrivateMasks, unsigned int* __restrict__ PublicExpertOutput, unsigned int* __restrict__ PrivateSFBlockOffsets, const __grid_constant__ CUtensorMap PrivateSF1, const __grid_constant__ CUtensorMap PrivateSF2, unsigned int* __restrict__ PrivateSF1Words, uint8_t* __restrict__ PrivateSF2Bytes)
+kernel_deepgemm_mega_moe_v3_sm100a_481043d5bc11056bcd83(int* __restrict__ topk_idx_i32, float* __restrict__ topk_weights, int* __restrict__ x_fp8, unsigned int* __restrict__ x_sf, const __grid_constant__ CUtensorMap A, int* __restrict__ pool_fp8, unsigned int* __restrict__ pool_sf, float* __restrict__ routing_weight_pool, int* __restrict__ token_to_permuted, int* __restrict__ meta_token, int* __restrict__ meta_slot, int* __restrict__ expert_counts, int* __restrict__ expert_row_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ tile_expert, int* __restrict__ tile_m_local, int* __restrict__ total_m_tiles_out, const __grid_constant__ CUtensorMap B1, const __grid_constant__ CUtensorMap SFB1, const __grid_constant__ CUtensorMap I_fp8_w, uint8_t* __restrict__ SF_I_w, __nv_bfloat16* __restrict__ l1_bf16_capture, const __grid_constant__ CUtensorMap A2, unsigned int* __restrict__ SFA2, const __grid_constant__ CUtensorMap B2, const __grid_constant__ CUtensorMap SFB2, __nv_bfloat16* __restrict__ expert_output, __nv_bfloat16* __restrict__ y, unsigned int* __restrict__ histogram_done, unsigned int* __restrict__ prefix_done, unsigned int* __restrict__ dispatch_done, unsigned int* __restrict__ l1_arrival, unsigned int* __restrict__ l2_done, int num_tokens, int top_k, int num_experts, int N1, int K1, int grid_n1, int K1_tiles, int N2, int K2, int grid_n2, int K2_tiles, int total_m_tiles, int M_total, float activation_clamp, unsigned int* __restrict__ PrivateCounters, unsigned long long* __restrict__ PrivateMasks, unsigned int* __restrict__ PublicExpertOutput, unsigned int* __restrict__ PrivateSFBlockOffsets, const __grid_constant__ CUtensorMap PrivateSF1, const __grid_constant__ CUtensorMap PrivateSF2, unsigned int* __restrict__ PrivateSF1Words, uint8_t* __restrict__ PrivateSF2Bytes)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -1187,140 +1187,123 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
                 smem_hist[i] = 0;
             }
             asm volatile("barrier.sync 10, 128;" ::: "memory");
-            int grid_stride = num_bids * 128;
-            int cta_base = bid * 128;
             #pragma unroll 1
-            for (int idx = cta_base + disp_tid; idx < total_pairs; idx += grid_stride) {
+            for (int idx = disp_tid; idx < total_pairs; idx += 128) {
                 int e_h = topk_idx_i32[idx * 2];
                 atomicAdd(&smem_hist[e_h], 1);
             }
             asm volatile("barrier.sync 10, 128;" ::: "memory");
-            #pragma unroll 1
-            for (int i_1 = disp_tid; i_1 < num_experts; i_1 += 128) {
-                int c_h = smem_hist[i_1];
-                if (c_h > 0) {
-                    atomicAdd(&expert_counts[i_1], c_h);
-                }
-            }
-            asm volatile("barrier.sync 10, 128;" ::: "memory");
-            unsigned int hist_ticket = 0;
-            if (warp == 0) {
-                if (elect_sync()) {
-                    unsigned int _atomic_old_0;
-                    asm volatile("atom.release.gpu.global.add.u32 %0, [%1], %2;"
-                        : "=r"(_atomic_old_0) : "l"(histogram_done), "r"(static_cast<uint32_t>(hist_addend)) : "memory");
-                    hist_ticket = _atomic_old_0;
-                    unsigned int _wait_acquire_mask_0;
-                    do {
-                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_wait_acquire_mask_0) : "l"(reinterpret_cast<unsigned int*>(histogram_done)) : "memory");
-                    } while (((_wait_acquire_mask_0 ^ static_cast<unsigned int>(hist_ticket ^ sync_tag)) & static_cast<unsigned int>(sync_tag)) != 0);
-                }
-            }
-            asm volatile("barrier.sync 10, 128;" ::: "memory");
             if (bid == 0) {
-                if (warp == 0) {
-                    unsigned int public_prior = 0;
-                    unsigned int source_prior = 0;
-                    unsigned int prefetched[12];
-                    prefetched[0] = (unsigned int)expert_counts[lane];
-                    prefetched[1] = (unsigned int)expert_counts[32 + lane];
-                    prefetched[2] = (unsigned int)expert_counts[64 + lane];
-                    prefetched[3] = (unsigned int)expert_counts[96 + lane];
-                    prefetched[4] = (unsigned int)expert_counts[128 + lane];
-                    prefetched[5] = (unsigned int)expert_counts[160 + lane];
-                    prefetched[6] = (unsigned int)expert_counts[192 + lane];
-                    prefetched[7] = (unsigned int)expert_counts[224 + lane];
-                    prefetched[8] = (unsigned int)expert_counts[256 + lane];
-                    prefetched[9] = (unsigned int)expert_counts[288 + lane];
-                    prefetched[10] = (unsigned int)expert_counts[320 + lane];
-                    prefetched[11] = (unsigned int)expert_counts[352 + lane];
-                    #pragma unroll
-                    for (int stripe = 0; stripe < 12; stripe++) {
-                        unsigned int expert = (unsigned int)(stripe * 32) + lane;
-                        unsigned int prefix_count = 0;
-                        prefix_count = prefetched[stripe];
-                        unsigned int public_tiles = (prefix_count + 256 - 1) / 256 * 2;
-                        unsigned int source_blocks = (prefix_count + 16 - 1) / 16;
-                        unsigned int public_inclusive = public_tiles;
-                        unsigned int source_inclusive = source_blocks;
-                        unsigned int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, public_inclusive, 1, 32);
-                        unsigned int public_previous = _shfl_up_0;
-                        unsigned int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, source_inclusive, 1, 32);
-                        unsigned int source_previous = _shfl_up_1;
-                        if (lane >= 1) {
-                            public_inclusive += public_previous;
-                            source_inclusive += source_previous;
-                        }
-                        unsigned int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, public_inclusive, 2, 32);
-                        unsigned int public_previous_0 = _shfl_up_2;
-                        unsigned int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, source_inclusive, 2, 32);
-                        unsigned int source_previous_1 = _shfl_up_3;
-                        if (lane >= 2) {
-                            public_inclusive += public_previous_0;
-                            source_inclusive += source_previous_1;
-                        }
-                        unsigned int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, public_inclusive, 4, 32);
-                        unsigned int public_previous_2 = _shfl_up_4;
-                        unsigned int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, source_inclusive, 4, 32);
-                        unsigned int source_previous_3 = _shfl_up_5;
-                        if (lane >= 4) {
-                            public_inclusive += public_previous_2;
-                            source_inclusive += source_previous_3;
-                        }
-                        unsigned int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, public_inclusive, 8, 32);
-                        unsigned int public_previous_4 = _shfl_up_6;
-                        unsigned int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, source_inclusive, 8, 32);
-                        unsigned int source_previous_5 = _shfl_up_7;
-                        if (lane >= 8) {
-                            public_inclusive += public_previous_4;
-                            source_inclusive += source_previous_5;
-                        }
-                        unsigned int _shfl_up_8 = __shfl_up_sync(0xFFFFFFFF, public_inclusive, 16, 32);
-                        unsigned int public_previous_6 = _shfl_up_8;
-                        unsigned int _shfl_up_9 = __shfl_up_sync(0xFFFFFFFF, source_inclusive, 16, 32);
-                        unsigned int source_previous_7 = _shfl_up_9;
-                        if (lane >= 16) {
-                            public_inclusive += public_previous_6;
-                            source_inclusive += source_previous_7;
-                        }
-                        unsigned int public_offset = public_prior + public_inclusive - public_tiles;
-                        unsigned int source_offset = source_prior + source_inclusive - source_blocks;
-                        if (expert < (unsigned int)num_experts) {
-                            expert_row_offsets[expert] = (int)(public_offset * 128);
-                            PrivateSFBlockOffsets[expert] = source_offset;
+                #pragma unroll 1
+                for (int i_1 = disp_tid; i_1 < num_experts; i_1 += 128) {
+                    int c_h = smem_hist[i_1];
+                    if (c_h > 0) {
+                        atomicAdd(&expert_counts[i_1], c_h);
+                    }
+                }
+            }
+            asm volatile("barrier.sync 10, 128;" ::: "memory");
+            if (warp == 0) {
+                unsigned int fold_public_prior = 0;
+                unsigned int fold_source_prior = 0;
+                unsigned int fold_prefetched[12];
+                int fold_count = smem_hist[lane];
+                fold_prefetched[0] = (unsigned int)fold_count;
+                int fold_count_0 = smem_hist[32 + lane];
+                fold_prefetched[1] = (unsigned int)fold_count_0;
+                int fold_count_1 = smem_hist[64 + lane];
+                fold_prefetched[2] = (unsigned int)fold_count_1;
+                int fold_count_2 = smem_hist[96 + lane];
+                fold_prefetched[3] = (unsigned int)fold_count_2;
+                int fold_count_3 = smem_hist[128 + lane];
+                fold_prefetched[4] = (unsigned int)fold_count_3;
+                int fold_count_4 = smem_hist[160 + lane];
+                fold_prefetched[5] = (unsigned int)fold_count_4;
+                int fold_count_5 = smem_hist[192 + lane];
+                fold_prefetched[6] = (unsigned int)fold_count_5;
+                int fold_count_6 = smem_hist[224 + lane];
+                fold_prefetched[7] = (unsigned int)fold_count_6;
+                int fold_count_7 = smem_hist[256 + lane];
+                fold_prefetched[8] = (unsigned int)fold_count_7;
+                int fold_count_8 = smem_hist[288 + lane];
+                fold_prefetched[9] = (unsigned int)fold_count_8;
+                int fold_count_9 = smem_hist[320 + lane];
+                fold_prefetched[10] = (unsigned int)fold_count_9;
+                int fold_count_10 = smem_hist[352 + lane];
+                fold_prefetched[11] = (unsigned int)fold_count_10;
+                #pragma unroll
+                for (int stripe = 0; stripe < 12; stripe++) {
+                    unsigned int fold_expert = (unsigned int)(stripe * 32) + lane;
+                    unsigned int fold_prefix_count = fold_prefetched[stripe];
+                    unsigned int fold_public_tiles = (fold_prefix_count + 256 - 1) / 256 * 2;
+                    unsigned int fold_source_blocks = (fold_prefix_count + 16 - 1) / 16;
+                    unsigned int fold_public_inclusive = fold_public_tiles;
+                    unsigned int fold_source_inclusive = fold_source_blocks;
+                    unsigned int _shfl_up_0 = __shfl_up_sync(0xFFFFFFFF, fold_public_inclusive, 1, 32);
+                    unsigned int fold_public_previous = _shfl_up_0;
+                    unsigned int _shfl_up_1 = __shfl_up_sync(0xFFFFFFFF, fold_source_inclusive, 1, 32);
+                    unsigned int fold_source_previous = _shfl_up_1;
+                    if (lane >= 1) {
+                        fold_public_inclusive += fold_public_previous;
+                        fold_source_inclusive += fold_source_previous;
+                    }
+                    unsigned int _shfl_up_2 = __shfl_up_sync(0xFFFFFFFF, fold_public_inclusive, 2, 32);
+                    unsigned int fold_public_previous_0 = _shfl_up_2;
+                    unsigned int _shfl_up_3 = __shfl_up_sync(0xFFFFFFFF, fold_source_inclusive, 2, 32);
+                    unsigned int fold_source_previous_1 = _shfl_up_3;
+                    if (lane >= 2) {
+                        fold_public_inclusive += fold_public_previous_0;
+                        fold_source_inclusive += fold_source_previous_1;
+                    }
+                    unsigned int _shfl_up_4 = __shfl_up_sync(0xFFFFFFFF, fold_public_inclusive, 4, 32);
+                    unsigned int fold_public_previous_2 = _shfl_up_4;
+                    unsigned int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, fold_source_inclusive, 4, 32);
+                    unsigned int fold_source_previous_3 = _shfl_up_5;
+                    if (lane >= 4) {
+                        fold_public_inclusive += fold_public_previous_2;
+                        fold_source_inclusive += fold_source_previous_3;
+                    }
+                    unsigned int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, fold_public_inclusive, 8, 32);
+                    unsigned int fold_public_previous_4 = _shfl_up_6;
+                    unsigned int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, fold_source_inclusive, 8, 32);
+                    unsigned int fold_source_previous_5 = _shfl_up_7;
+                    if (lane >= 8) {
+                        fold_public_inclusive += fold_public_previous_4;
+                        fold_source_inclusive += fold_source_previous_5;
+                    }
+                    unsigned int _shfl_up_8 = __shfl_up_sync(0xFFFFFFFF, fold_public_inclusive, 16, 32);
+                    unsigned int fold_public_previous_6 = _shfl_up_8;
+                    unsigned int _shfl_up_9 = __shfl_up_sync(0xFFFFFFFF, fold_source_inclusive, 16, 32);
+                    unsigned int fold_source_previous_7 = _shfl_up_9;
+                    if (lane >= 16) {
+                        fold_public_inclusive += fold_public_previous_6;
+                        fold_source_inclusive += fold_source_previous_7;
+                    }
+                    unsigned int fold_public_offset = fold_public_prior + fold_public_inclusive - fold_public_tiles;
+                    unsigned int fold_source_offset = fold_source_prior + fold_source_inclusive - fold_source_blocks;
+                    if (fold_expert < (unsigned int)num_experts) {
+                        expert_row_offsets[fold_expert] = (int)(fold_public_offset * 128);
+                        PrivateSFBlockOffsets[fold_expert] = fold_source_offset;
+                        if (bid == 0) {
                             #pragma unroll 1
-                            for (int tt = 0; tt < public_tiles; tt++) {
-                                tile_expert[public_offset + (unsigned int)tt] = (int)expert;
-                                tile_m_local[public_offset + (unsigned int)tt] = (int)(tt * 128);
+                            for (int tt = 0; tt < fold_public_tiles; tt++) {
+                                tile_expert[fold_public_offset + (unsigned int)tt] = (int)fold_expert;
+                                tile_m_local[fold_public_offset + (unsigned int)tt] = (int)(tt * 128);
                             }
                         }
-                        unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, public_inclusive, 31);
-                        public_prior += _shfl_0;
-                        unsigned int _shfl_1 = __shfl_sync(0xFFFFFFFF, source_inclusive, 31);
-                        source_prior += _shfl_1;
                     }
+                    unsigned int _shfl_0 = __shfl_sync(0xFFFFFFFF, fold_public_inclusive, 31);
+                    fold_public_prior += _shfl_0;
+                    unsigned int _shfl_1 = __shfl_sync(0xFFFFFFFF, fold_source_inclusive, 31);
+                    fold_source_prior += _shfl_1;
+                }
+                if (bid == 0) {
                     if (lane == 0) {
-                        total_m_tiles_out[0] = (int)public_prior;
+                        total_m_tiles_out[0] = (int)fold_public_prior;
                     }
                 }
-                if (warp == 0) {
-                    __syncwarp();
-                }
             }
-            unsigned int prefix_ticket = 0;
-            if (warp == 0) {
-                if (elect_sync()) {
-                    unsigned int _atomic_old_1;
-                    asm volatile("atom.release.gpu.global.add.u32 %0, [%1], %2;"
-                        : "=r"(_atomic_old_1) : "l"(prefix_done), "r"(static_cast<uint32_t>(prefix_addend)) : "memory");
-                    prefix_ticket = _atomic_old_1;
-                    unsigned int _wait_acquire_mask_1;
-                    do {
-                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_wait_acquire_mask_1) : "l"(reinterpret_cast<unsigned int*>(prefix_done)) : "memory");
-                    } while (((_wait_acquire_mask_1 ^ static_cast<unsigned int>(prefix_ticket ^ sync_tag)) & static_cast<unsigned int>(sync_tag)) != 0);
-                }
-            }
-            asm volatile("barrier.sync 10, 128;" ::: "memory");
+            asm volatile("barrier.sync 12, 512;" ::: "memory");
             int global_warp_idx = bid * 4 + disp_warp;
             int warps_per_grid = NUM_CTAS * 4;
             #pragma unroll 1
@@ -1330,8 +1313,8 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
                 int k_s = pair_idx - t_s * top_k;
                 if (lane == 0) {
                     float cached_rw = topk_weights[pair_idx];
-                    int _atomic_old_2 = atomicAdd(&expert_scatter_offsets[e_s], 1);
-                    int claim = _atomic_old_2;
+                    int _atomic_old_0 = atomicAdd(&expert_scatter_offsets[e_s], 1);
+                    int claim = _atomic_old_0;
                     int dst_row_e = expert_row_offsets[e_s] + claim;
                     smem_dst_row[disp_warp] = dst_row_e;
                     token_to_permuted[pair_idx] = dst_row_e;
@@ -1473,7 +1456,8 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
                 __syncwarp();
                 if (elect_sync()) {
                     unsigned int arrivals = 1;
-                    if (in_expert + 1 == (unsigned int)expert_counts[e_s]) {
+                    int fold_expert_count = smem_hist[e_s];
+                    if (in_expert + 1 == (unsigned int)fold_expert_count) {
                         arrivals = 16 - in_expert % 16;
                     }
                     asm volatile("red.release.gpu.global.add.u32 [%0], %1;" :: "l"((reinterpret_cast<unsigned int*>(PrivateCounters) + (772 + sf_block))), "r"(static_cast<unsigned int>(arrivals)) : "memory");
@@ -1484,9 +1468,9 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
             __threadfence_system();
             if (warp == 0) {
                 if (elect_sync()) {
-                    unsigned int _atomic_old_3;
+                    unsigned int _atomic_old_1;
                     asm volatile("atom.release.gpu.global.add.u32 %0, [%1], %2;"
-                        : "=r"(_atomic_old_3) : "l"(dispatch_done), "r"(static_cast<uint32_t>(done_addend)) : "memory");
+                        : "=r"(_atomic_old_1) : "l"(dispatch_done), "r"(static_cast<uint32_t>(done_addend)) : "memory");
                 }
             }
             asm volatile("barrier.sync 1, 384;" ::: "memory");
@@ -1513,6 +1497,7 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
     if (warp == 4) {
         { // load_a_main
             asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
+            asm volatile("barrier.sync 12, 512;" ::: "memory");
             unsigned int task[8];
             unsigned int a_stage = 0;
             unsigned int _phase_empty = 1;
@@ -1547,11 +1532,11 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
                     if (task[0] == 2) {
                         unsigned long long k_mask = (unsigned long long)3 << (unsigned long long)(k * 2);
                         if ((pending & k_mask) != 0) {
-                            unsigned long long _wait_acquire_mask_3;
+                            unsigned long long _wait_acquire_mask_0;
                             do {
-                            asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_wait_acquire_mask_3) : "l"((reinterpret_cast<unsigned long long*>(PrivateMasks) + (task[4]))) : "memory");
-                            } while (((_wait_acquire_mask_3 ^ static_cast<unsigned long long>((unsigned long long)68719476735)) & static_cast<unsigned long long>(k_mask)) != 0);
-                            unsigned long long observed = _wait_acquire_mask_3;
+                            asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(_wait_acquire_mask_0) : "l"((reinterpret_cast<unsigned long long*>(PrivateMasks) + (task[4]))) : "memory");
+                            } while (((_wait_acquire_mask_0 ^ static_cast<unsigned long long>((unsigned long long)68719476735)) & static_cast<unsigned long long>(k_mask)) != 0);
+                            unsigned long long observed = _wait_acquire_mask_0;
                             pending = observed ^ 68719476735;
                         }
                     }
@@ -1583,6 +1568,7 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
     if (warp == 5) {
         { // load_b_main
             asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
+            asm volatile("barrier.sync 12, 512;" ::: "memory");
             unsigned int task_1[8];
             unsigned int b_stage = 0;
             unsigned int _phase_empty_1 = 1;
@@ -1632,6 +1618,7 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
     if (warp == 6) {
         { // mma_main
             asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
+            asm volatile("barrier.sync 12, 512;" ::: "memory");
             unsigned int task_2[8];
             unsigned int mma_stage = 0;
             unsigned int completed_tasks = 0;
@@ -1700,6 +1687,7 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
     if (warp == 7) {
         { // schedule_main
             asm volatile("setmaxnreg.dec.sync.aligned.u32 88;");
+            asm volatile("barrier.sync 12, 512;" ::: "memory");
             unsigned int counts[12];
             unsigned int state[2];
             unsigned int task_3[8];
@@ -1707,76 +1695,77 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
             unsigned int sched_tag = (unsigned int)1 << 31;
             unsigned int sched_ticket = 0;
             if (cta_rank == 0) {
-                if (elect_sync()) {
-                    unsigned int _atomic_old_4;
-                    asm volatile("atom.release.gpu.global.add.u32 %0, [%1], %2;"
-                        : "=r"(_atomic_old_4) : "l"(prefix_done), "r"(static_cast<uint32_t>(1)) : "memory");
-                    sched_ticket = _atomic_old_4;
-                    unsigned int _wait_acquire_mask_2;
-                    do {
-                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_wait_acquire_mask_2) : "l"(reinterpret_cast<unsigned int*>(prefix_done)) : "memory");
-                    } while (((_wait_acquire_mask_2 ^ static_cast<unsigned int>(sched_ticket ^ sched_tag)) & static_cast<unsigned int>(sched_tag)) != 0);
-                }
-                __syncwarp();
-                unsigned int expert_1 = lane;
+                unsigned int expert = lane;
                 counts[0] = 0;
-                if (expert_1 < 384) {
-                    counts[0] = (unsigned int)expert_counts[expert_1];
+                if (expert < 384) {
+                    int fold_c = smem_hist[expert];
+                    counts[0] = (unsigned int)fold_c;
                 }
                 unsigned int expert_0 = 32 + lane;
                 counts[1] = 0;
                 if (expert_0 < 384) {
-                    counts[1] = (unsigned int)expert_counts[expert_0];
+                    int fold_c_1 = smem_hist[expert_0];
+                    counts[1] = (unsigned int)fold_c_1;
                 }
-                unsigned int expert_1_1 = 64 + lane;
+                unsigned int expert_1 = 64 + lane;
                 counts[2] = 0;
-                if (expert_1_1 < 384) {
-                    counts[2] = (unsigned int)expert_counts[expert_1_1];
+                if (expert_1 < 384) {
+                    int fold_c_2 = smem_hist[expert_1];
+                    counts[2] = (unsigned int)fold_c_2;
                 }
                 unsigned int expert_2 = 96 + lane;
                 counts[3] = 0;
                 if (expert_2 < 384) {
-                    counts[3] = (unsigned int)expert_counts[expert_2];
+                    int fold_c_3 = smem_hist[expert_2];
+                    counts[3] = (unsigned int)fold_c_3;
                 }
                 unsigned int expert_3 = 128 + lane;
                 counts[4] = 0;
                 if (expert_3 < 384) {
-                    counts[4] = (unsigned int)expert_counts[expert_3];
+                    int fold_c_4 = smem_hist[expert_3];
+                    counts[4] = (unsigned int)fold_c_4;
                 }
                 unsigned int expert_4 = 160 + lane;
                 counts[5] = 0;
                 if (expert_4 < 384) {
-                    counts[5] = (unsigned int)expert_counts[expert_4];
+                    int fold_c_5 = smem_hist[expert_4];
+                    counts[5] = (unsigned int)fold_c_5;
                 }
                 unsigned int expert_5 = 192 + lane;
                 counts[6] = 0;
                 if (expert_5 < 384) {
-                    counts[6] = (unsigned int)expert_counts[expert_5];
+                    int fold_c_6 = smem_hist[expert_5];
+                    counts[6] = (unsigned int)fold_c_6;
                 }
                 unsigned int expert_6 = 224 + lane;
                 counts[7] = 0;
                 if (expert_6 < 384) {
-                    counts[7] = (unsigned int)expert_counts[expert_6];
+                    int fold_c_7 = smem_hist[expert_6];
+                    counts[7] = (unsigned int)fold_c_7;
                 }
                 unsigned int expert_7 = 256 + lane;
                 counts[8] = 0;
                 if (expert_7 < 384) {
-                    counts[8] = (unsigned int)expert_counts[expert_7];
+                    int fold_c_8 = smem_hist[expert_7];
+                    counts[8] = (unsigned int)fold_c_8;
                 }
                 unsigned int expert_8 = 288 + lane;
                 counts[9] = 0;
                 if (expert_8 < 384) {
-                    counts[9] = (unsigned int)expert_counts[expert_8];
+                    int fold_c_9 = smem_hist[expert_8];
+                    counts[9] = (unsigned int)fold_c_9;
                 }
                 unsigned int expert_9 = 320 + lane;
                 counts[10] = 0;
                 if (expert_9 < 384) {
-                    counts[10] = (unsigned int)expert_counts[expert_9];
+                    int fold_c_10 = smem_hist[expert_9];
+                    counts[10] = (unsigned int)fold_c_10;
                 }
                 unsigned int expert_10 = 352 + lane;
                 counts[11] = 0;
                 if (expert_10 < 384) {
-                    counts[11] = (unsigned int)expert_counts[expert_10];
+                    int fold_c_11 = smem_hist[expert_10];
+                    counts[11] = (unsigned int)fold_c_11;
                 }
                 __syncwarp();
                 unsigned int num_blocks = 0;
@@ -1819,7 +1808,7 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
                 unsigned int _warp_redux_u32_0;
                 asm volatile("redux.sync.add.u32 %0, %1, 0xffffffff;" : "=r"(_warp_redux_u32_0) : "r"(num_blocks));
                 unsigned int total = _warp_redux_u32_0;
-                unsigned int waves = (total * 18 + 76 - 1) / 76;
+                unsigned int waves = (total * 18 + 74 - 1) / 74;
                 unsigned int interleave_waves = 2;
                 state[0] = total;
                 int _max_0 = ((1) > (interleave_waves) ? (1) : (interleave_waves));
@@ -1837,8 +1826,8 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
                         state[1] = state[1] - 1;
                         unsigned int claimed_0 = 0;
                         if (lane == 0) {
-                            unsigned int _atomic_old_5 = atomicAdd(PrivateCounters, 1);
-                            claimed_0 = _atomic_old_5;
+                            unsigned int _atomic_old_2 = atomicAdd(PrivateCounters, 1);
+                            claimed_0 = _atomic_old_2;
                         }
                         unsigned int _shfl_2 = __shfl_sync(0xFFFFFFFF, claimed_0, 0);
                         claimed = _shfl_2;
@@ -1851,8 +1840,8 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
                     if (phase == 0) {
                         unsigned int claimed_0_1 = 0;
                         if (lane == 0) {
-                            unsigned int _atomic_old_6 = atomicAdd(PrivateCounters + 1, 1);
-                            claimed_0_1 = _atomic_old_6;
+                            unsigned int _atomic_old_3 = atomicAdd(PrivateCounters + 1, 1);
+                            claimed_0_1 = _atomic_old_3;
                         }
                         unsigned int _shfl_3 = __shfl_sync(0xFFFFFFFF, claimed_0_1, 0);
                         claimed = _shfl_3;
@@ -2524,6 +2513,7 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
     if (warp >= 8 && warp <= 15) {
         { // epilogue_main
             asm volatile("setmaxnreg.inc.sync.aligned.u32 160;");
+            asm volatile("barrier.sync 12, 512;" ::: "memory");
             unsigned int task_4[8];
             #pragma unroll 1
             for (int task_iteration_3 = 0; task_iteration_3 < 14631; task_iteration_3++) {
@@ -2906,18 +2896,18 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
             unsigned int l2_ticket = 0;
             if (warp == 8) {
                 if (lane == 0) {
-                    unsigned int _atomic_old_7;
+                    unsigned int _atomic_old_4;
                     asm volatile("atom.release.gpu.global.add.u32 %0, [%1], %2;"
-                        : "=r"(_atomic_old_7) : "l"(l2_done), "r"(static_cast<uint32_t>(l2_addend)) : "memory");
-                    l2_ticket = _atomic_old_7;
+                        : "=r"(_atomic_old_4) : "l"(l2_done), "r"(static_cast<uint32_t>(l2_addend)) : "memory");
+                    l2_ticket = _atomic_old_4;
                 }
             }
             if (warp == 8) {
                 if (lane == 0) {
-                    unsigned int _wait_acquire_mask_4;
+                    unsigned int _wait_acquire_mask_1;
                     do {
-                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_wait_acquire_mask_4) : "l"(reinterpret_cast<unsigned int*>(l2_done)) : "memory");
-                    } while (((_wait_acquire_mask_4 ^ static_cast<unsigned int>(l2_ticket ^ l2_tag)) & static_cast<unsigned int>(l2_tag)) != 0);
+                    asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_wait_acquire_mask_1) : "l"(reinterpret_cast<unsigned int*>(l2_done)) : "memory");
+                    } while (((_wait_acquire_mask_1 ^ static_cast<unsigned int>(l2_ticket ^ l2_tag)) & static_cast<unsigned int>(l2_tag)) != 0);
                 }
             }
             asm volatile("barrier.sync 15, 256;" ::: "memory");
@@ -2928,7 +2918,7 @@ kernel_deepgemm_mega_moe_v3_sm103a_8c3e4b551451802ef2ef(int* __restrict__ topk_i
             float reduced[40];
             unsigned int store_values[4];
             #pragma unroll 1
-            for (unsigned int token_chunk = epi_warp_2 * 152 + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += 1216) {
+            for (unsigned int token_chunk = epi_warp_2 * 148 + (unsigned int)bid; token_chunk < num_tokens * 4; token_chunk += 1184) {
                 unsigned int token = token_chunk / 4;
                 unsigned int chunk = token_chunk % 4;
                 unsigned int stored_row = 0;
