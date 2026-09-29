@@ -317,6 +317,7 @@ __global__ void moe_bgmv_shrink_direct_kernel(
 
 #pragma unroll
   for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  static_assert(NTHREADS % 32 == 0, "moe_bgmv_shrink_direct_kernel requires full warps");
   __shared__ float warp_sum[NTHREADS / 32];
   if ((tid & 31) == 0) warp_sum[tid >> 5] = acc;
   __syncthreads();
