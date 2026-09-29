@@ -64,7 +64,10 @@ def causal_topk_local(
             scores[torch.arange(r1 - r0, device=device), pos] = 2.0
         invalid = (key_idx[None, :] > pos[:, None]) | (key_idx >= seq_k)[None, :]
         scores.masked_fill_(invalid, float("-inf"))
-        val, idx = scores.topk(topk, dim=-1)
+        # Descending argsort rather than topk: identical selection for distinct random scores, and
+        # independent of any vendor-specific topk override (masked slots sort last and become -1).
+        idx = scores.argsort(dim=-1, descending=True)[:, :topk]
+        val = scores.gather(-1, idx)
         out[r0:r1] = idx.masked_fill(torch.isinf(val), -1).to(torch.int32)
     return out
 
