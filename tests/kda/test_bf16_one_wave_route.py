@@ -6,9 +6,10 @@ https://www.apache.org/licenses/LICENSE-2.0
 
 """BF16 prefill routing: one-wave grids take the M64 value split on SM100a/SM103a.
 
-Bounded logit-beta grids longer than one 64-token chunk keep the direct N32
-body instead (FP32 chunk carrier; CAKE-736 round 8); active FP32 beta and
-single-chunk residuals keep the split.
+The prepared export serves FP32 state pools, whose split body carries FP32
+chunk state (CAKE-736 round 9), so bounded logit-beta grids keep the split at
+every length; the BF16-pool split body (not exported here) keeps its BF16
+carrier and is routed to the direct N32 body beyond one 64-token chunk.
 """
 
 import pytest
@@ -82,11 +83,13 @@ def _prepare(lengths, heads, *, active_beta):
             True,
             "fused_active_beta_checkpoint_dvsplit_m64",
         ),
-        # Logit beta, FP32 state, 24 tasks, 1025 tokens: beyond one chunk the
-        # bounded gate keeps the FP32 chunk carrier of the direct N32 body
-        # (the M64 split's BF16 carrier drifted 0.026 at 1024 tokens under
-        # trained deep-layer statistics; CAKE-736 round 8).
-        ((33, 1025), 12, False, "fused_checkpoint_direct_m128_n32"),
+        # Logit beta, FP32 state, 24 tasks, 1025 tokens: the FP32-state M64
+        # split.  Its round-7 body re-derived the chunk state from a BF16 copy
+        # and drifted 0.026 at 1024 tokens under trained deep-layer statistics
+        # (CAKE-736 round 8 routed it to the direct N32 body); the round-9 body
+        # accumulates the decay correction onto the FP32 state (delta decay),
+        # so the split is back.
+        ((33, 1025), 12, False, "fused_m64_independent_dvsplit_fp32_state"),
         # Logit beta, FP32 state, single-chunk residuals: the split stays.
         ((17, 64, 33, 64, 9, 64), 6, False, "fused_m64_independent_dvsplit_fp32_state"),
         # Mixed lengths with six heads (36 tasks), active beta.

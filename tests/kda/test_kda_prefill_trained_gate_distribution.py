@@ -350,11 +350,13 @@ def test_prepared_bf16_export_matches_fp64_recurrence(
 
 
 # Long bounded sequences with checkpoint rows on the FP32 pool: serving's
-# radix-cache shape.  The one-wave M64 value split carried the state between
-# 64-token chunks in BF16 and drifted under these statistics (worst-head
-# final-state rel L2 0.05 at 2241 tokens, 0.19 at 8192 against FP32 Triton on
-# B200 and GB300; SGLang #34299 follow-up, CAKE-736 round 7).  The direct M128
-# body carries FP32 chunk state; these rows fail on the split and pass on it.
+# radix-cache shape.  The one-wave M64 value split's FP32-pool body re-derived
+# the chunk state from its BF16 projection copy and drifted under these
+# statistics (worst-head final-state rel L2 0.05 at 2241 tokens, 0.19 at 8192
+# against FP32 Triton on B200 and GB300; SGLang #34299 follow-up, CAKE-736
+# round 7).  The round-9 body accumulates the BF16 decay correction onto the
+# FP32 state instead of re-deriving it (delta decay; FP32 chunk
+# carrier); these rows fail on the round-7 split body and pass on the fixed one.
 LONG_CASES = [
     pytest.param((2048,), 12, 4411, id="bs1_t2048"),
     pytest.param((2241,), 12, 4412, id="bs1_t2241"),
@@ -367,4 +369,6 @@ def test_prepared_bf16_export_long_bounded_rows_keep_fp32_state_carrier(
     lengths, heads, seed
 ):
     call = _run_prepared_bf16_export(lengths, heads, seed, checkpoints=True)
-    assert "dvsplit" not in str(call.schedule), str(call.schedule)
+    assert str(call.schedule) == "fused_m64_independent_dvsplit_fp32_state", str(
+        call.schedule
+    )
