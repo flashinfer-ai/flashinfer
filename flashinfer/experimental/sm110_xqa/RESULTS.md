@@ -108,7 +108,7 @@ The racecheck warnings map to the same instruction classes as the `register_mma`
 
 ## tcgen05/TMEM D512 tree routes (`kernel="tmem"`, `kernel="auto"`)
 
-The four `tree_*_tmem` routes wrap the tcgen05 tensor-memory schedule of the D512 tree kernel: one 128-row Q tile x one 256-column output half per 512-thread CTA (grid `(2, heads * ceil(q_len * ratio / 128), batch)`, 230400 B dynamic shared memory), K/V and Q fetched once per thread-block cluster by TMA multicast. Each route ships two compiled forms: the `(2, 2, 1)` cluster form pairs the two Q tiles of one KV head (K/V + Q multicast) and the `(2, 1, 1)` form (`*_q_kernel.cu`) multicasts Q only for heads with an odd Q-tile count; the binding selects the form from the Q-tile parity. Under the strict cold-L2 protocol the tmem route is faster than `register_mma_auto` and than the upstream Edge XQA source on every D512 cache mode on every validated Thor node, so `kernel="auto"` selects it for all four modes. Validation ran on NVIDIA Thor `sr250v3-0666` (20 SMs, CUDA 13.4, PyTorch 2.15.0a0+875d815502.nvinternal.main) in one container session.
+The four `tree_*_tmem` routes wrap the tcgen05 tensor-memory schedule of the D512 tree kernel: one 128-row Q tile x one 256-column output half per 512-thread CTA (grid `(2, heads * ceil(q_len * ratio / 128), batch)`, 230400 B dynamic shared memory), K/V and Q fetched once per thread-block cluster by TMA multicast. Each route ships two compiled forms: the `(2, 2, 1)` cluster form pairs the two Q tiles of one KV head (K/V + Q multicast) and the `(2, 1, 1)` form (`*_q_kernel.cu`) multicasts Q only for heads with an odd Q-tile count; the binding selects the form from the Q-tile parity. Under the strict cold-L2 protocol the tmem route is faster than `register_mma_auto` and than the upstream Edge XQA source on every D512 cache mode on every validated Thor node, so `kernel="auto"` selected it for all four modes (round 9 below: for E4M3 KV whose heads have an even Q-tile count `auto` now selects the pair route). Validation ran on NVIDIA Thor `sr250v3-0666` (20 SMs, CUDA 13.4, PyTorch 2.15.0a0+875d815502.nvinternal.main) in one container session.
 
 Artifact parity (frozen schedule launcher vs the exported TVM-FFI entry, identical tensors, one process, six alternating paired rounds, 250 ms warmup, 256 CUPTI cold-L2 samples per round, gate 3%):
 
@@ -154,3 +154,54 @@ Synchronization (same protocol, hard 20 s limit, `memcheck` not run):
 | fp8_paged (tmem) | racecheck | pass | 10 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |
 
 Both tools completed within the 20 s limit on the exported routes (8-10 s each) with no hazards. The same kernel under the frozen-schedule benchmark harness reached the 20 s racecheck deadline in every earlier run (a different launcher and process setup); that difference was not investigated.
+
+## Round 9: per-GQA-ratio tmem kernels and the cta_group::2 pair routes (`kernel="pair"`, `kernel="auto"`)
+
+Each `tree_*_tmem` route now ships one frozen trace per GQA ratio (2, 4, 8 and 16) and cluster form; the binding selects the kernel from the ratio and the Q-tile parity and encodes Q with the ratio's box (`(64, ratio, 128 / ratio)`), lifting the ratio-8 freeze of the previous round. The two new `tree_fp8_{contiguous,paged}_pair` routes run the same tcgen05/TMEM schedule as two `cta_group::2` CTA pairs in a `(4, 1, 1)` cluster per two 128-row Q tiles of a KV head (grid `(4, heads * ceil(q_len * ratio / 128) / 2, batch)`, 230400 B dynamic shared memory, one kernel per GQA ratio): the pair leader issues one M256 MMA stream for both Q tiles, each CTA holds one token half of every K chunk and one column half of every V chunk, and the raw E4M3 V rows are multicast to the pair. Under the strict cold-L2 protocol the pair route is faster than the tmem route on both E4M3 cache modes on every validated Thor node (1.034-1.071 per process, pooled 1.037-1.049), so `kernel="auto"` selects it for E4M3 KV whose heads have an even Q-tile count and `tmem` otherwise. Validation ran on NVIDIA Thor `sr250v3-0667` (20 SMs, CUDA 13.4, PyTorch 2.15.0a0+875d815502.nvinternal.main) in one container session.
+
+Artifact parity (frozen schedule launcher vs the exported TVM-FFI entry, identical tensors, one process, six alternating paired rounds, 250 ms warmup, 256 CUPTI cold-L2 samples per round, gate 3%):
+
+| Shape | Frozen schedule (us) | Native export (us) | Absolute difference | Cake-first | Export-first |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| tree_fp16_contiguous_tmem | 30.9520 | 30.7520 | 0.646% | 0.9928 | 0.9959 |
+| tree_fp16_paged_tmem | 29.8242 | 29.8720 | 0.160% | 1.0022 | 1.0000 |
+| tree_fp8_contiguous_tmem | 23.9125 | 23.8723 | 0.168% | 0.9987 | 0.9967 |
+| tree_fp8_paged_tmem | 24.0320 | 23.8160 | 0.899% | 0.9907 | 0.9880 |
+| tree_fp8_contiguous_pair | 22.7200 | 22.8640 | 0.634% | 1.0056 | 1.0070 |
+| tree_fp8_paged_pair | 22.6803 | 22.7045 | 0.107% | 1.0014 | 1.0000 |
+
+**All 6 rows (four tmem, two pair) pass; maximum difference is 0.899%.**
+
+Public ledger benchmark (`benchmarks/bench_sm110_xqa.py`, one process for all 18 rows, same protocol as above):
+
+| Ledger row | Kernel family | Native latency (us) | Ratio |
+| --- | --- | ---: | ---: |
+| tree_fp16_contiguous | tcgen05 | 59.345 | 1 (reference row) |
+| tree_fp16_contiguous_tmem | tmem | 30.208 | 1.965x faster than tcgen05 |
+| tree_fp16_paged | tcgen05 | 61.505 | 1 (reference row) |
+| tree_fp16_paged_tmem | tmem | 30.944 | 1.988x faster than tcgen05 |
+| tree_fp8_contiguous | tcgen05 | 58.880 | 1 (reference row) |
+| tree_fp8_contiguous_tmem | tmem | 23.840 | 2.470x faster than tcgen05 |
+| tree_fp8_contiguous_pair | pair | 22.305 | 2.640x faster than tcgen05, 1.069x faster than the previous `auto` row (tmem) |
+| tree_fp8_paged | tcgen05 | 59.680 | 1 (reference row) |
+| tree_fp8_paged_tmem | tmem | 23.904 | 2.497x faster than tcgen05 |
+| tree_fp8_paged_pair | pair | 22.912 | 2.605x faster than tcgen05, 1.043x faster than the previous `auto` row (tmem) |
+
+Correctness: JIT metadata suite 44 passed; GPU suite 306 passed (adds the tmem cache cases at GQA ratios 2/4/8/16 with even and odd Q-tile counts, the pair cases on both E4M3 modes at every ratio, `auto` routing to pair / tmem, the pair rejections of FP16 KV and odd Q-tile counts, and the JIT fixture for the per-ratio schema). pre-commit clean.
+
+Synchronization (same protocol, hard 20 s limit, `memcheck` not run):
+
+| Route | Tool | Verdict | Wall | Summary |
+| --- | --- | --- | ---: | --- |
+| tree_fp16_contiguous_tmem | synccheck | pass | 8 s | ========= ERROR SUMMARY: 0 errors |
+| tree_fp16_contiguous_tmem | racecheck | pass | 9 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |
+| tree_fp16_paged_tmem | synccheck | pass | 7 s | ========= ERROR SUMMARY: 0 errors |
+| tree_fp16_paged_tmem | racecheck | pass | 9 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |
+| tree_fp8_contiguous_tmem | synccheck | pass | 7 s | ========= ERROR SUMMARY: 0 errors |
+| tree_fp8_contiguous_tmem | racecheck | pass | 8 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |
+| tree_fp8_paged_tmem | synccheck | pass | 8 s | ========= ERROR SUMMARY: 0 errors |
+| tree_fp8_paged_tmem | racecheck | pass | 9 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |
+| tree_fp8_contiguous_pair | synccheck | pass | 7 s | ========= ERROR SUMMARY: 0 errors |
+| tree_fp8_contiguous_pair | racecheck | pass | 8 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |
+| tree_fp8_paged_pair | synccheck | pass | 8 s | ========= ERROR SUMMARY: 0 errors |
+| tree_fp8_paged_pair | racecheck | pass | 8 s | ========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings) |

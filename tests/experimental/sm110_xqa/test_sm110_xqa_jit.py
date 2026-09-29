@@ -36,10 +36,31 @@ def _package(tmp_path):
                         "block": [512, 1, 1],
                         "cluster": [2, 2, 1],
                         "fallback_cluster": [2, 1, 1],
-                        "fallback_kernel_symbol": "integrity_fallback",
-                        "gqa_ratio": 8,
+                        "gqa_ratios": [2, 4, 8, 16],
+                        "kernel_symbols": {
+                            str(ratio): {
+                                "even": f"integrity_r{ratio}",
+                                "odd": f"integrity_r{ratio}_q",
+                            }
+                            for ratio in (2, 4, 8, 16)
+                        },
                     }
                     if name.startswith("tree_") and name.endswith("_tmem")
+                    else {
+                        "kernel": "pair",
+                        "tile_rows": 128,
+                        "output_tile_columns": 256,
+                        "block": [512, 1, 1],
+                        "cluster": [4, 1, 1],
+                        "cta_group": 2,
+                        "q_tiles_per_cluster": 2,
+                        "gqa_ratios": [2, 4, 8, 16],
+                        "kernel_symbols": {
+                            str(ratio): f"integrity_pair_r{ratio}"
+                            for ratio in (2, 4, 8, 16)
+                        },
+                    }
+                    if name.startswith("tree_") and name.endswith("_pair")
                     else {
                         "kernel": "register_mma_split",
                         "tile_rows": 32,
@@ -127,7 +148,7 @@ def test_incomplete_route_inventory_is_rejected(tmp_path):
     manifest = _package(tmp_path)
     del manifest["routes"]["decode_merge"]
     _write(tmp_path, manifest)
-    with pytest.raises(ValueError, match="all fourteen"):
+    with pytest.raises(ValueError, match="every base physical route"):
         _read_manifest(tmp_path)
 
 
@@ -236,4 +257,33 @@ def test_invalid_decode_workspace_or_candidate_contract(tmp_path, field, value):
     manifest["routes"]["decode_fp16_contiguous"][field] = value
     _write(tmp_path, manifest)
     with pytest.raises(ValueError, match="decode"):
+        _read_manifest(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "route,field,value",
+    [
+        ("tree_fp8_paged_tmem", "gqa_ratios", [8]),
+        ("tree_fp8_paged_tmem", "kernel_symbols", {"8": {"even": "a", "odd": "b"}}),
+        ("tree_fp8_paged_tmem", "cluster", [4, 1, 1]),
+        ("tree_fp8_paged_pair", "gqa_ratios", [8]),
+        ("tree_fp8_paged_pair", "kernel_symbols", {"8": "a"}),
+        ("tree_fp8_paged_pair", "cluster", [2, 2, 1]),
+        ("tree_fp8_paged_pair", "q_tiles_per_cluster", 1),
+        ("tree_fp8_paged_pair", "cta_group", 1),
+    ],
+)
+def test_per_ratio_tree_geometry_is_checked(tmp_path, route, field, value):
+    manifest = _package(tmp_path)
+    manifest["routes"][route][field] = value
+    _write(tmp_path, manifest)
+    with pytest.raises(ValueError, match="launch geometry"):
+        _read_manifest(tmp_path)
+
+
+def test_pair_route_name_and_family_must_agree(tmp_path):
+    manifest = _package(tmp_path)
+    manifest["routes"]["tree_fp8_paged_pair"]["kernel"] = "tmem"
+    _write(tmp_path, manifest)
+    with pytest.raises(ValueError, match="disagree"):
         _read_manifest(tmp_path)
