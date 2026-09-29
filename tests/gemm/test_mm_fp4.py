@@ -404,6 +404,36 @@ def test_mm_fp4_per_token_alpha(m, n, k, res_dtype, backend, auto_tuning):
     )
 
 
+def test_mm_fp4_per_token_alpha_accepts_row_vector_shape():
+    """A (1, m) alpha has m elements and passes validation; the autotuner must
+    see it as 1-D or its M constraint would profile with a (profiled_m, m)
+    alpha and the runner would fail to reshape it."""
+    _skip_unless_per_token_alpha_gpu()
+    m, n, k = 17, 256, 256
+    torch.manual_seed(0)
+    a, b, a_fp4, a_s, b_fp4, b_s, alpha = _nvfp4_operands(m, n, k)
+    row = 0.25 + torch.arange(m, device="cuda", dtype=torch.float32) / m
+    per_token_alpha = (alpha.float().reshape(1) * row).reshape(1, m)
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    with autotune(True):
+        mm_fp4(
+            a_fp4,
+            b_fp4.T,
+            a_s,
+            b_s.T,
+            per_token_alpha,
+            torch.bfloat16,
+            out,
+            block_size=16,
+            backend="cute-dsl",
+            use_nvfp4=True,
+            skip_check=False,
+        )
+    reference = torch.mm(a, b.T).float() * row[:, None]
+    cos_sim = F.cosine_similarity(reference.reshape(-1), out.float().reshape(-1), dim=0)
+    assert cos_sim > 0.97
+
+
 @pytest.mark.parametrize(
     "backend", ["cutlass", "cudnn", "trtllm", "b12x", "cutedsl_low_latency"]
 )
