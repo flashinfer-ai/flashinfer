@@ -168,7 +168,12 @@ def _fmha_v2_specs(items):
     # test item (~2.4k items would grind for many minutes).
     fmha_keys = set()  # (layout, dtype, o_dtype-or-None)
     sink_keys = set()  # (dtype, use_swa, head_dim)
-    need_sm120_module = False
+    test_names = {it.name.split("[")[0] for it in items}
+    need_sm120_module = sm12x and any(
+        name == "test_fmha_v2_prefill_deepseek"
+        or name.startswith("test_fmha_v2_prefill_sm120")
+        for name in test_names
+    )
     for it in items:
         cs = getattr(it, "callspec", None)
         if cs is None:
@@ -176,7 +181,6 @@ def _fmha_v2_specs(items):
         p = cs.params
         fn = it.name.split("[")[0]
         if fn == "test_fmha_v2_prefill_deepseek":
-            need_sm120_module = sm12x
             continue
         if fn == "test_trtllm_fmha_v2_prefill_sm120_large_head_dim" and not sm12x:
             continue  # test skips on non-SM12x
@@ -319,6 +323,8 @@ def _batch_prefill_specs(items):
     nvfp4_fns = {
         "test_batch_prefill_with_paged_kv_cache_nvfp4",
         "test_batch_prefill_with_paged_kv_cache_nvfp4_strided_scale_views",
+        "test_batch_prefill_with_paged_kv_cache_nvfp4_head_dim_256",
+        "test_batch_prefill_with_ragged_kv_cache_nvfp4_head_dim_256",
         "test_batch_prefill_with_ragged_kv_cache_nvfp4",
         "test_batch_prefill_with_paged_kv_cache_nvfp4_large_head",
         "test_batch_prefill_with_paged_kv_cache_nvfp4_large_head_bf16",
@@ -339,6 +345,17 @@ def _batch_prefill_specs(items):
                 for p in (0, 1):
                     bp("fa2", q, U8, q, I, 512, 512, p, False, False, False)
                     sp("fa2", q, q, q, 512, 512, p, False, False, False)
+
+    if fns & {
+        "test_batch_prefill_with_paged_kv_cache_nvfp4_head_dim_256",
+        "test_batch_prefill_with_ragged_kv_cache_nvfp4_head_dim_256",
+    }:
+        # Symmetric head_dim 256 NVFP4: the fixture grid above only carries 128/128 and
+        # 512/512 for this dtype pair, so prebuild the 256/256 pair and its reference. The
+        # paged and ragged cases share these modules; specs are deduplicated by name.
+        for q in (H, B):
+            bp("fa2", q, U8, q, I, 256, 256, 0, False, False, False)
+            sp("fa2", q, q, q, 256, 256, 0, False, False, False)
 
     if (
         "test_batch_prefill_with_paged_kv_cache_nvfp4_asymmetric" in fns

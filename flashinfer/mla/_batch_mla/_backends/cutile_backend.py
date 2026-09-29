@@ -6,21 +6,68 @@ you may not use this file except in compliance with the License.
 """
 
 import functools
+import importlib.metadata
 import math
-from typing import ClassVar, Optional, cast
+from typing import ClassVar, Optional, Union, cast
 
 import torch
+from packaging.version import InvalidVersion, Version
 
-from ....attention.prims_ts._tensor_aliasing import (
-    _validate_out_does_not_overlap_inputs,
-)
 from ....utils import get_compute_capability
 from .._contracts import _are_adjacent_last_dim_views
-from .._planning import _MLAPlanArguments
-from ._capabilities import MLAPlanCapabilities, plan_capability_rejection_reason
+from .._planning import _MLAPlanArguments, _audit_plan_from_wrapper_arguments
+from ._capabilities import (
+    MLAPlanCapabilities,
+    _BackendPlanUnsupportedError,
+    plan_capability_rejection_reason,
+)
 
 
 _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES = frozenset({(10, 0), (10, 3), (12, 0), (12, 1)})
+
+
+def _tensor_byte_span(tensor: torch.Tensor) -> tuple[int, int]:
+    """Conservatively bound a cuTile input view, including stride holes."""
+    if not isinstance(tensor, torch.Tensor):
+        raise TypeError("tensor must be a torch.Tensor")
+    if tensor.layout != torch.strided:
+        raise TypeError("tensor must have strided layout")
+    byte_start = tensor.data_ptr()
+    numel = tensor.numel()
+    if numel == 0:
+        return byte_start, byte_start
+    element_size = tensor.element_size()
+    if tensor.is_contiguous():
+        return byte_start, byte_start + numel * element_size
+    min_element_offset = 0
+    max_element_offset = 0
+    for extent, stride in zip(tensor.shape, tensor.stride(), strict=True):
+        last_offset = (int(extent) - 1) * int(stride)
+        min_element_offset += min(last_offset, 0)
+        max_element_offset += max(last_offset, 0)
+    return (
+        byte_start + min_element_offset * element_size,
+        byte_start + (max_element_offset + 1) * element_size,
+    )
+
+
+def _validate_out_does_not_overlap_inputs(
+    out: torch.Tensor,
+    *named_inputs: tuple[str, Optional[torch.Tensor]],
+) -> None:
+    """Preserve cuTile MLA's checked-output contract independently of PrimTS."""
+    out_start, out_end = _tensor_byte_span(out)
+    for name, tensor in named_inputs:
+        if tensor is None or tensor.device != out.device:
+            continue
+        start, end = _tensor_byte_span(tensor)
+        if (
+            out_start != out_end
+            and start != end
+            and out_start < end
+            and start < out_end
+        ):
+            raise ValueError(f"out must not overlap {name} storage")
 
 
 def _get_compute_capability(device: torch.device):
@@ -31,41 +78,55 @@ def _get_compute_capability(device: torch.device):
     return get_compute_capability(device)
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1)
 def get_cutile_mla_decode():
-    """Load the cuda.tile kernel only after the cuTile plan is validated."""
+    """Resolve executable preparation only after the cuTile plan is validated."""
 
-    from ....attention.kernels.cutile.fmha_decode_bsr_cutile import (
-        decode_mla_kv_paged_cutile,
-    )
+    try:
+        installed_version = Version(importlib.metadata.version("cuda-tile"))
+    except (importlib.metadata.PackageNotFoundError, InvalidVersion) as exc:
+        raise _BackendPlanUnsupportedError(
+            "cutile requires cuda-tile>=1.4 with valid package version metadata."
+        ) from exc
+    if installed_version < Version("1.4"):
+        raise _BackendPlanUnsupportedError(
+            f"cutile requires cuda-tile>=1.4, got {installed_version}."
+        )
 
-    return decode_mla_kv_paged_cutile
+    from ....cutile.cutile_common import is_cuda_tile_available
+    from ._cutile_prepared import prepare_cutile_mla_decode
+
+    try:
+        available = is_cuda_tile_available()
+    except ModuleNotFoundError as exc:
+        if not exc.name.startswith("cuda.tile"):
+            raise
+        available = False
+    if not available:
+        raise _BackendPlanUnsupportedError(
+            "cutile requires cuda-tile>=1.4 and an available tileiras compiler."
+        )
+    return prepare_cutile_mla_decode
 
 
 def _validate_cutile_page_size(page_size: int) -> None:
     if (
         not isinstance(page_size, int)
         or isinstance(page_size, bool)
-        or page_size < 2
+        or page_size < 1
         or page_size > 128
         or page_size & (page_size - 1)
     ):
         raise ValueError(
             "cutile backend requires a power-of-two integer page_size in "
-            f"[2, 128], got {page_size!r}."
+            f"[1, 128], got {page_size!r}."
         )
 
 
 def _validate_cutile_num_heads(num_heads: int) -> None:
-    if (
-        not isinstance(num_heads, int)
-        or isinstance(num_heads, bool)
-        or num_heads < 8
-        or num_heads > 128
-        or num_heads % 8 != 0
-    ):
+    if not isinstance(num_heads, int) or isinstance(num_heads, bool) or num_heads < 1:
         raise ValueError(
-            "cutile backend requires num_heads to be a multiple of 8 in [8, 128], "
+            "cutile backend requires num_heads to be a positive integer, "
             f"got {num_heads!r}."
         )
 
@@ -159,6 +220,7 @@ class _BatchMLAPagedAttentionCutileBackend:
         kv_layouts=frozenset({"combined", "independent-split"}),
         output_scales=frozenset({"none"}),
         scale_modes=frozenset({"default"}),
+        is_experimental=True,
         requires_packed_query=False,
         requires_packed_kv_cache=False,
     )
@@ -169,11 +231,12 @@ class _BatchMLAPagedAttentionCutileBackend:
         self.device = float_workspace_buffer.device
 
     @classmethod
+    @_audit_plan_from_wrapper_arguments
     def plan_from_wrapper(
         cls, args: _MLAPlanArguments
     ) -> "_BatchMLAPagedAttentionCutileBackend":
         if reason := plan_capability_rejection_reason(args, cls._plan_capabilities):
-            raise ValueError(reason)
+            raise _BackendPlanUnsupportedError(reason)
         dense = args.native_dense()
         backend = cls(args._float_workspace_buffer)
         backend.plan(
@@ -220,32 +283,36 @@ class _BatchMLAPagedAttentionCutileBackend:
         # Validate the cuTile plan contract before importing cuda.tile
         # -----------------------------------------------------------------------
         if use_profiler:
-            raise ValueError("use_profiler is not supported by the cutile backend.")
-        if causal:
-            raise ValueError("causal=True is not supported by the cutile backend.")
-        _validate_cutile_num_heads(num_heads)
-        if head_dim_ckv != 512 or head_dim_kpe != 64:
-            raise ValueError(
-                "cutile backend expects head_dim_ckv=512 and head_dim_kpe=64, "
+            raise _BackendPlanUnsupportedError(
+                "use_profiler is not supported by the cutile backend."
+            )
+        try:
+            _validate_cutile_num_heads(num_heads)
+            _validate_cutile_page_size(page_size)
+        except ValueError as exc:
+            raise _BackendPlanUnsupportedError(str(exc)) from exc
+        if head_dim_ckv not in (256, 512) or head_dim_kpe != 64:
+            raise _BackendPlanUnsupportedError(
+                "cutile backend expects head_dim_ckv in (256, 512) and head_dim_kpe=64, "
                 f"got {head_dim_ckv=} and {head_dim_kpe=}."
             )
         if q_data_type not in (torch.float16, torch.bfloat16):
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 "cutile backend expects q_data_type to be torch.float16 or "
                 f"torch.bfloat16, got {q_data_type}."
             )
         if kv_data_type != q_data_type:
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 "cutile backend expects kv_data_type to match q_data_type, "
                 f"got {kv_data_type=} and {q_data_type=}."
             )
         if output_dtype != q_data_type:
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 "cutile backend expects output_dtype to match q_data_type, "
                 f"got {output_dtype=} and {q_data_type=}."
             )
         if output_scale != "none":
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 f"cutile backend does not support output_scale={output_scale!r}."
             )
         if not isinstance(sm_scale, (int, float)) or isinstance(sm_scale, bool):
@@ -253,25 +320,25 @@ class _BatchMLAPagedAttentionCutileBackend:
                 f"sm_scale must be a finite positive number, got {sm_scale!r}."
             )
         resolved_sm_scale = float(sm_scale)
-        if not math.isfinite(resolved_sm_scale) or resolved_sm_scale <= 0.0:
+        if not math.isfinite(resolved_sm_scale):
             raise ValueError(
                 f"sm_scale must be a finite positive number, got {sm_scale!r}."
             )
-        _validate_cutile_page_size(page_size)
+        if resolved_sm_scale <= 0.0:
+            raise _BackendPlanUnsupportedError(
+                "cutile backend requires a positive sm_scale."
+            )
         major, minor = _get_compute_capability(self.device)
         if (major, minor) not in _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES:
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 "cutile backend supports only the validated Blackwell targets "
                 f"SM100, SM103, SM120, and SM121, got SM{major}{minor}."
             )
 
         batch_size = cum_seq_lens_q.numel() - 1
         if batch_size <= 0:
-            raise ValueError("cutile backend requires a positive batch size.")
-        if max_q_len != 1:
-            raise ValueError(
-                "cutile backend supports decode plans with one query per request, "
-                f"got max_q_len={max_q_len}."
+            raise _BackendPlanUnsupportedError(
+                "cutile backend requires a positive batch size."
             )
         expected_cum_seq_lens_q = torch.arange(
             batch_size + 1,
@@ -279,7 +346,7 @@ class _BatchMLAPagedAttentionCutileBackend:
             device=cum_seq_lens_q.device,
         )
         if not torch.equal(cum_seq_lens_q, expected_cum_seq_lens_q):
-            raise ValueError(
+            raise _BackendPlanUnsupportedError(
                 "cutile backend requires cum_seq_lens_q=[0, 1, ..., batch_size]."
             )
         if tuple(kv_len.shape) != (batch_size,):
@@ -293,13 +360,24 @@ class _BatchMLAPagedAttentionCutileBackend:
                 f"shape {tuple(page_table.shape)}."
             )
         if page_table.shape[1] <= 0:
-            raise ValueError("cutile page_table must have positive width.")
+            raise _BackendPlanUnsupportedError(
+                "cutile page_table must have positive width."
+            )
 
         # Stage canonical metadata during planning. Device inputs retain their
         # identity, which lets callers mutate values in place before graph replay.
         planned_kv_len = kv_len.to(device=self.device, non_blocking=True)
         planned_page_table = page_table.to(device=self.device, non_blocking=True)
-        decode_mla_kv_paged_cutile = get_cutile_mla_decode()
+        decode_mla_kv_paged_cutile = get_cutile_mla_decode()(
+            device=self.device,
+            batch=batch_size,
+            heads=num_heads,
+            page=page_size,
+            table_width=page_table.shape[1],
+            dtype=q_data_type,
+            sm_scale=resolved_sm_scale,
+            dim=head_dim_ckv,
+        )
 
         # -----------------------------------------------------------------------
         # Publish only fully validated plan state
@@ -335,6 +413,10 @@ class _BatchMLAPagedAttentionCutileBackend:
         ckv_scale: Optional[float],
         ckv_scale_arr: Optional[torch.Tensor],
         kpe_scale: Optional[float],
+        sinks: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor: Optional[float] = None,
+        bmm1_scale: Optional[Union[float, torch.Tensor]] = None,
+        bmm2_scale: Optional[Union[float, torch.Tensor]] = None,
     ) -> torch.Tensor:
         # -----------------------------------------------------------------------
         # Validate the run contract and resolve planned metadata
@@ -356,6 +438,15 @@ class _BatchMLAPagedAttentionCutileBackend:
                 "ckv_scale / ckv_scale_arr / kpe_scale are not supported with "
                 "cutile backend."
             )
+        if sinks is not None:
+            raise ValueError("sinks are not supported with cutile backend.")
+        if skip_softmax_threshold_scale_factor is not None:
+            raise ValueError(
+                "skip_softmax_threshold_scale_factor is not supported with "
+                "cutile backend."
+            )
+        if bmm1_scale is not None or bmm2_scale is not None:
+            raise ValueError("BMM scales are not supported with cutile backend.")
         if (kv_len is None) != (page_table is None):
             raise ValueError(
                 "run-time kv_len and page_table must both be omitted or both be provided."
@@ -449,7 +540,7 @@ class _BatchMLAPagedAttentionCutileBackend:
         )
 
         # -----------------------------------------------------------------------
-        # Launch the lazily loaded cuTile backend
+        # Launch the cuTile kernel acquired during planning
         # -----------------------------------------------------------------------
         launch_args = (
             q_nope,
@@ -461,21 +552,11 @@ class _BatchMLAPagedAttentionCutileBackend:
             self._sm_scale,
             1.0,
         )
-        if self.device.type == "cuda":
-            with torch.cuda.device(self.device):
-                self._decode_mla_kv_paged_cutile(
-                    *launch_args,
-                    max_seq_len=-1,
-                    outputs=out,
-                )
-        else:
-            # This path is reachable only by tests that replace the architecture
-            # probe and kernel loader with CPU fakes.
-            self._decode_mla_kv_paged_cutile(
-                *launch_args,
-                max_seq_len=-1,
-                outputs=out,
-            )
+        self._decode_mla_kv_paged_cutile(
+            *launch_args,
+            max_seq_len=-1,
+            outputs=out,
+        )
         return cast(torch.Tensor, out)
 
 

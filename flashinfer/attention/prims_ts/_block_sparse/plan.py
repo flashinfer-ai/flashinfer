@@ -24,7 +24,11 @@ import torch
 
 from flashinfer.utils import ceil_div
 
-from .common import _SIGNED_INT32_MAX, _block_sparse_proxy_summary_geometry
+from .common import (
+    _SIGNED_INT32_MAX,
+    _block_sparse_proxy_summary_geometry,
+    _num_sparse_pattern_heads,
+)
 from .compiler import _get_compiled_block_sparse
 from .config import (
     _BlockSparseStaticProfile,
@@ -118,6 +122,7 @@ class _BlockSparsePlanState:
     # All plan-stream work happens-before run after waiting on this event.
     ready_event: torch.cuda.Event
     ready_stream_handle: int
+    share_pattern_across_kv_heads: bool = False
 
 
 def _allocate_dummy_kv_valid_bits(
@@ -192,7 +197,9 @@ def _build_block_sparse_plan_state(
         assert sparse_format == "bsr" and not use_proxy_routes
     num_rows = (
         static.batch_size
-        * static.num_kv_heads
+        * _num_sparse_pattern_heads(
+            static.num_kv_heads, static.share_pattern_across_kv_heads
+        )
         * ceil_div(static.seq_len_q, static.q_block_size)
     )
     if num_rows > _SIGNED_INT32_MAX:
@@ -207,14 +214,6 @@ def _build_block_sparse_plan_state(
             static.kv_block_size,
         )
         max_row_route_capacity += ceil_div(num_summaries, static.kv_route_size)
-    route_layout = _BlockSparseRouteLayout.create(
-        kv_route_size=static.kv_route_size,
-        kv_block_size=static.kv_block_size,
-        page_size=static.page_size,
-        has_token_bits=static.use_kv_valid_bits or use_proxy_routes,
-        route_metadata_capacity=num_rows * max_row_route_capacity,
-        num_rows=num_rows,
-    )
     with torch.cuda.device(device_index), torch.cuda.stream(plan_stream):
         spec = _resolve_block_sparse_launch_spec(
             device_index=device_index,
@@ -223,6 +222,7 @@ def _build_block_sparse_plan_state(
             seq_len_kv=static.seq_len_kv,
             num_qo_heads=static.num_qo_heads,
             num_kv_heads=static.num_kv_heads,
+            share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
             head_dim=static.head_dim,
             q_block_size=static.q_block_size,
             kv_block_size=static.kv_block_size,
@@ -238,6 +238,14 @@ def _build_block_sparse_plan_state(
         policy = (
             *spec.policy,
             ("max_blocks_per_row", static.max_blocks_per_row),
+        )
+        route_layout = _BlockSparseRouteLayout.create(
+            kv_route_size=static.kv_route_size,
+            kv_block_size=static.kv_block_size,
+            page_size=static.page_size,
+            has_token_bits=spec.prepares_score_words,
+            route_metadata_capacity=num_rows * max_row_route_capacity,
+            num_rows=num_rows,
         )
         compiled = _get_compiled_block_sparse(spec.compile_key)
         dummy_kv_valid_bits = (
@@ -281,6 +289,7 @@ def _build_block_sparse_plan_state(
         compiled=compiled,
         ready_event=ready_event,
         ready_stream_handle=plan_stream.cuda_stream,
+        share_pattern_across_kv_heads=static.share_pattern_across_kv_heads,
     )
 
 

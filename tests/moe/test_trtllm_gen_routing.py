@@ -62,8 +62,10 @@ WEIGHT_RTOL = 2e-2
 def require_supported_gpu():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
-    major, _ = get_compute_capability(torch.device("cuda"))
-    if major not in (10, 12):
+    compute_capability = get_compute_capability(torch.device("cuda"))
+    if compute_capability == (10, 7):
+        pytest.skip("trtllm-gen routing is not implemented on SM107")
+    if compute_capability[0] not in (10, 12):
         pytest.skip("trtllm-gen routing requires SM100/SM103/SM120/SM121")
 
 

@@ -250,6 +250,9 @@ struct TllmGenFmhaRunnerParams {
   float* lsePtr;
   // Strides (in elements) for the LSE buffer laid out as [num_tokens, num_heads_q].
   int64_t lseStrideTokens;
+  // Multiplies the base-2 LSE; 1.0f keeps base 2. Set by launcher
+  // alongside lsePtr
+  float lseScale;
   int64_t lseStrideHeads;
 
   // SageAttention scaling factors (null when SageAttention is not used).

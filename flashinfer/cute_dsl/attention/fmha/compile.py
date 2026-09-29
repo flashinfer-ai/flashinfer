@@ -117,6 +117,11 @@ def compile_cute_dsl_fmha_kernel(
         mask_type=_mask_type(has_window_left or has_window_right),
         enable_ex2_emulation=enable_ex2_emulation,
         enable_skip_correction=True,
+        # Rescale threshold compresses the dynamic range when quantizing P and interferes
+        # skip-softmax criteria. Limit rescale threshold to a small epsilon (0.0 disables
+        # skip-correction) when skip-softmax is enabled, or P becomes the main source of
+        # quantization error (P, in v_dtype, being narrower than qk_dtype).
+        rescale_threshold=2**-8 if enable_skip_softmax or pv.width < qk.width else 8.0,
         use_tma_store=False,  # varlen -> STG
     )
 
@@ -200,6 +205,11 @@ def compile_cute_dsl_fmha_kernel(
         None,
         stream_fake,
         use_pdl,
+        None,
+        None,
+        None,
+        None,
+        None,
         options="--enable-tvm-ffi --opt-level 2",
     )
 
@@ -212,7 +222,7 @@ def compile_cute_dsl_fmha_kernel(
 @functools.cache
 def compile_cute_dsl_fmha_blockscaled_kernel(
     qk_mode: str,
-    pv_dtype: torch.dtype,
+    v_dtype: torch.dtype,
     out_dtype: torch.dtype,
     num_qo_heads: int,
     num_kv_heads: int,
@@ -232,7 +242,7 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
         has_window_right = is_causal
     enable_ex2_emulation = _ex2_emulation_enabled(device)
     qk, sf_dt, sf_vec = _BLOCKSCALED_MODES[qk_mode]
-    pv = _CUTLASS_DTYPE[pv_dtype]
+    pv = _CUTLASS_DTYPE[v_dtype]
     out = _CUTLASS_DTYPE[out_dtype]
     d = dv = head_dim
 
@@ -246,6 +256,10 @@ def compile_cute_dsl_fmha_blockscaled_kernel(
         enable_ex2_emulation=enable_ex2_emulation,
         enable_skip_correction=True,
         qk_sf_vec_size=sf_vec,
+        # Rescale threshold compresses the dynamic range when quantizing P and interferes
+        # skip-softmax criteria. Limit rescale threshold to a small epsilon (0.0 disables
+        # skip-correction) when either is enabled.
+        rescale_threshold=2**-8 if enable_skip_softmax or pv.width <= 8 else 8.0,
         use_tma_store=True,  # non-varlen
     )
 

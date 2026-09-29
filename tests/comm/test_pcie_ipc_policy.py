@@ -271,14 +271,31 @@ def test_every_dispatchable_variant_is_reachable_from_the_tuner() -> None:
     round. The seed deliberately reaches only some of them, so the tuner's
     candidate list is where this has to hold.
     """
+    # World size 2 admits two variants and no more: the launcher's check is a
+    # whitelist of variant numbers, so naming a launcher of your own does not
+    # exempt a variant from it. A ring listed here hits that hard check on the
+    # first candidate of a two-rank tune -- on every rank at once, since the
+    # rule is shape-independent; a shape-dependent one would throw on one rank
+    # while the others spun.
     expected = {
         2: {IpcVariant.UNSTAGED, IpcVariant.STAGED},
-        4: {IpcVariant.UNSTAGED, IpcVariant.STAGED, IpcVariant.STAGED_RING},
+        4: {
+            IpcVariant.UNSTAGED,
+            IpcVariant.STAGED,
+            IpcVariant.STAGED_RING,
+            IpcVariant.COPY_ENGINE_RING,
+        },
         8: {
             IpcVariant.UNSTAGED,
             IpcVariant.STAGED,
             IpcVariant.STAGED_RING,
             IpcVariant.FLAT_STAGED,
+            IpcVariant.COPY_ENGINE_RING,
+            # World size 8 only -- it is a 4+4 decomposition. Reachable here
+            # because this asks with no profile, i.e. which configurations can
+            # exist; get_valid_tactics passes one and drops it on a fabric the
+            # grouping does not describe.
+            IpcVariant.COPY_ENGINE_ISLAND,
         },
     }
     seen = {

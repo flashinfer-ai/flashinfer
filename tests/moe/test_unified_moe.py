@@ -16,13 +16,13 @@ limitations under the License.
 
 Two sections:
 
-  * CPU-only config/dataclass tests (no GPU or JIT). These track the actual MVP
-    API surface (single-knob ``QuantVariant``, explicit
+  * CPU-only config/dataclass tests (no GPU or JIT). These track the actual
+    API surface (three-axis ``QuantConfig`` / ``QuantFormat``, explicit
     ``BackendOptions(candidates=(...))``); see
-    ``docs/design_docs/flashinfer_moe_api.md`` §10 CR1.
+    ``docs/design_docs/flashinfer_moe_api.md``.
 
   * SM100 (Blackwell) GPU tests for ``MoELayer`` + Packs, parametrized per
-    ``QuantVariant`` via ``VariantSpec`` (currently NVFP4 + BF16, pre-routed
+    MMA pair via ``VariantSpec`` (currently NVFP4 + BF16, pre-routed
     path): accuracy vs an independent reference, direct-runner conformance,
     CUDA-graph replay, autotune candidate visitation, and the packed-topk-id
     contract (CR3). Adding a variant = registering one spec.
@@ -73,7 +73,7 @@ from flashinfer.fused_moe import (
     MoELayer,
     MoEWeightPack,
     QuantConfig,
-    QuantVariant,
+    QuantFormat,
     RoutingConfig,
     RoutingInputMode,
     RoutingMethodType,
@@ -94,8 +94,46 @@ from flashinfer.fused_moe.runners import (
     _TrtllmPackedInputs,
 )
 from flashinfer.fused_moe.core import _fake_trtllm_moe_output
-from flashinfer.tllm_enums import DEFAULT_SITU_BETA, DEFAULT_SITU_LINEAR_BETA
+from flashinfer.fused_moe.backends.trtllm.sm100_runner import (
+    MoERunner as TrtllmKernelRunner,
+)
+from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+from flashinfer.tllm_enums import (
+    DEFAULT_SITU_BETA,
+    DEFAULT_SITU_LINEAR_BETA,
+    DtypeTrtllmGen,
+    Fp8QuantizationType,
+    WeightLayout,
+)
+from flashinfer.quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    _UNSET,
+    nvfp4_4over6_cache_key,
+)
 from flashinfer.utils import get_compute_capability
+
+# The explicit states of QuantConfig.nvfp4_4over6 (the field's default, an
+# unset sentinel, is the third: "read the environment").  ``None`` (off) and
+# an explicit config are only legal with activation=QuantFormat.NVFP4 (see
+# TestQuantConfig below), so this list is used with NVFP4 configs.
+NVFP4_4OVER6_SETTINGS = [
+    None,
+    NVFP44Over6Config(),
+    NVFP44Over6Config(e4m3_max=256, err_mode="MSE", err_use_fast_math=True),
+]
+
+NVFP4_4OVER6_ENV_VARS = (
+    "FLASHINFER_NVFP4_4OVER6",
+    "FLASHINFER_NVFP4_4OVER6_ERR_MODE",
+    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256",
+)
+
+
+def _clear_4over6_env(monkeypatch) -> None:
+    """Delete every 4over6 variable so ambient shell state cannot skew a test."""
+    for name in NVFP4_4OVER6_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
 
 
 def _build_direct_runner(runner_type, config, device):
@@ -154,8 +192,8 @@ class TestEnumRepr:
     def test_activation_repr(self, member):
         assert eval(repr(member)) == member
 
-    @pytest.mark.parametrize("member", list(QuantVariant))
-    def test_quant_variant_repr(self, member):
+    @pytest.mark.parametrize("member", list(QuantFormat))
+    def test_quant_format_repr(self, member):
         assert eval(repr(member)) == member
 
 
@@ -218,6 +256,53 @@ class TestTrtllmFakeOutputContract:
         assert result[0].shape == (4, 32)
         assert result[1].shape == (8,)
         assert result[2].shape == (17, 64)
+
+    def test_extracted_runner_returns_unfinalized_native_result(self):
+        gemm2 = torch.empty((5, 4), dtype=torch.bfloat16)
+        permutation = torch.arange(4, dtype=torch.int32)
+        native_result = [gemm2, torch.empty(0), permutation]
+
+        runner = TrtllmKernelRunner.__new__(TrtllmKernelRunner)
+        runner.moe_op = SimpleNamespace(trtllm_bf16_moe=lambda *args: native_result)
+        runner.num_local_experts = 2
+        runner.top_k = 2
+        runner.intermediate_size = 8
+        runner.dtype_act = DtypeTrtllmGen.Bfloat16
+        runner.dtype_weights = DtypeTrtllmGen.Bfloat16
+        runner.fp8_quantization_type = Fp8QuantizationType.NoneFp8
+        runner.activation_type = ActivationType.Swiglu
+
+        weights = torch.empty((2, 2), dtype=torch.bfloat16)
+        inputs = MoeRunnerInputs(
+            output=torch.empty((2, 0), dtype=torch.bfloat16),
+            routing_logits=None,
+            topk_ids=torch.zeros((2, 2), dtype=torch.int32),
+            expert_weights=weights,
+            hidden_states=torch.empty((2, 4), dtype=torch.bfloat16),
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        ).to_list()
+        result = runner.forward(
+            inputs,
+            routing_bias=None,
+            gemm1_weights=torch.empty(0),
+            gemm2_weights=torch.empty(0),
+            num_experts=2,
+            n_group=0,
+            topk_group=0,
+            local_expert_offset=0,
+            routed_scaling_factor=None,
+            routing_method_type=RoutingMethodType.Default,
+            use_shuffled_weight=True,
+            weight_layout=WeightLayout.BlockMajorK,
+            do_finalize=False,
+            enable_pdl=False,
+        )
+
+        assert result[0].data_ptr() == gemm2.data_ptr()
+        assert result[1] is weights
+        assert result[2].data_ptr() == permutation.data_ptr()
 
 
 def test_trtllm_synthetic_packed_calls_keep_their_launch_state():
@@ -289,14 +374,16 @@ class TestImmutability:
             cfg.top_k = 4
 
     def test_quant_config_frozen(self):
-        cfg = QuantConfig(variant=QuantVariant.FP8PerTensor)
+        cfg = QuantConfig(
+            weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+        )
         with pytest.raises(dataclasses.FrozenInstanceError):
-            cfg.variant = QuantVariant.BF16
+            cfg.weight = QuantFormat.BF16
 
     def test_moe_config_frozen(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         with pytest.raises(dataclasses.FrozenInstanceError):
@@ -333,10 +420,81 @@ class TestReprRoundTrip:
         )
         assert _eval_repr(cfg) == cfg
 
-    @pytest.mark.parametrize("variant", list(QuantVariant))
-    def test_quant_config(self, variant):
-        cfg = QuantConfig(variant=variant)
+    @pytest.mark.parametrize(
+        "quant",
+        [
+            QuantConfig(),
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            QuantConfig(weight=QuantFormat.MXINT4, activation=QuantFormat.BF16),
+        ],
+    )
+    def test_quant_config(self, quant):
+        assert _eval_repr(quant) == quant
+
+    def test_quant_config_w4a16_pairs(self):
+        for cfg in (
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        ):
+            assert _eval_repr(cfg) == cfg
+
+    @pytest.mark.parametrize("setting", NVFP4_4OVER6_SETTINGS, ids=repr)
+    def test_quant_config_nvfp4_4over6(self, setting):
+        """Every explicit 4over6 setting must survive repr/eval.
+
+        This is why ``NVFP44Over6Config`` and ``NVFP44Over6ErrMode`` carry a
+        hand-written ``__repr__`` and why
+        ``flashinfer/fused_moe/api.py`` imports the two type names it never
+        calls — ``_eval_repr`` evaluates in that module's namespace.
+        """
+        cfg = QuantConfig(
+            weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4, nvfp4_4over6=setting
+        )
         assert _eval_repr(cfg) == cfg
+
+    def test_quant_config_repr_keeps_none_but_elides_unset(self):
+        """``None`` means 4over6 off; the unset default is not emitted.
+
+        Eliding ``None`` would make ``eval(repr(cfg))`` return an unset config,
+        which compares unequal to the original.
+        """
+        axes = (
+            "weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4, "
+            "output=QuantFormat.BF16"
+        )
+        assert repr(
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+        ) == (f"QuantConfig({axes})")
+        assert (
+            repr(
+                QuantConfig(
+                    weight=QuantFormat.NVFP4,
+                    activation=QuantFormat.NVFP4,
+                    nvfp4_4over6=None,
+                )
+            )
+            == f"QuantConfig({axes}, nvfp4_4over6=None)"
+        )
+
+    @pytest.mark.parametrize("setting", NVFP4_4OVER6_SETTINGS, ids=repr)
+    def test_moe_config_with_nvfp4_4over6(self, setting):
+        """The setting must round-trip through a whole MoEConfig too."""
+        cfg = MoEConfig(
+            routing=RoutingConfig(num_experts=32, top_k=2),
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=setting,
+            ),
+            experts=ExpertConfig(intermediate_size=512),
+            activation=SwiGLU(),
+            backend=BackendOptions(candidates=(CuteDslConfig(),)),
+        )
+        assert _eval_repr(cfg) == cfg
+        # MoEConfig is used as a dict key elsewhere in this file; the new field
+        # must not make it unhashable.
+        assert hash(cfg) == hash(_eval_repr(cfg))
 
     def test_activation_config(self):
         for cfg in (
@@ -396,7 +554,7 @@ class TestReprRoundTrip:
     def test_moe_config_minimal(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         assert _eval_repr(cfg) == cfg
@@ -411,7 +569,7 @@ class TestReprRoundTrip:
                 topk_group=4,
                 routed_scaling_factor=1.0,
             ),
-            quant=QuantConfig(variant=QuantVariant.MxFp8),
+            quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
             experts=ExpertConfig(intermediate_size=2048, local_num_experts=32),
             activation=GeGLU(),
             backend=BackendOptions(
@@ -491,14 +649,139 @@ class TestBackendOptions:
 
 class TestQuantConfig:
     def test_default_is_bf16(self):
-        assert QuantConfig().variant == QuantVariant.BF16
+        cfg = QuantConfig()
+        assert cfg.pair == (QuantFormat.BF16, QuantFormat.BF16)
+        assert cfg.output is QuantFormat.BF16
 
-    def test_explicit_variant(self):
-        assert QuantConfig(variant=QuantVariant.NVFP4).variant == QuantVariant.NVFP4
+    def test_explicit_pair(self):
+        assert QuantConfig(
+            weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
+        ).pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
 
-    @pytest.mark.parametrize("variant", list(QuantVariant))
-    def test_all_variants_constructible(self, variant):
-        assert QuantConfig(variant=variant).variant is variant
+    @pytest.mark.parametrize("fmt", list(QuantFormat))
+    def test_same_format_pair_constructible(self, fmt):
+        cfg = QuantConfig(weight=fmt, activation=fmt)
+        assert cfg.pair == (fmt, fmt)
+
+    def test_w4a16_pairs_are_distinct(self):
+        mx = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
+        nv = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16)
+        assert mx.weight is QuantFormat.MXFP4
+        assert nv.weight is QuantFormat.NVFP4
+        assert mx.activation is QuantFormat.BF16
+        assert nv.activation is QuantFormat.BF16
+
+    def test_mxfp4_pair_is_mxfp8_activation(self):
+        cfg = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
+        assert cfg.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"weight": QuantFormat.MXFP4},
+            {"weight": QuantFormat.NVFP4},
+            {"activation": QuantFormat.BF16},
+        ],
+    )
+    def test_omitted_axis_defaults_to_bf16(self, kwargs):
+        cfg = QuantConfig(**kwargs)
+        expected = (
+            kwargs.get("weight", QuantFormat.BF16),
+            kwargs.get("activation", QuantFormat.BF16),
+        )
+        assert cfg.pair == expected
+        assert cfg.output is QuantFormat.BF16
+
+    def test_weight_only_mxfp4_is_w4a16(self):
+        cfg = QuantConfig(weight=QuantFormat.MXFP4)
+        assert cfg.pair == (QuantFormat.MXFP4, QuantFormat.BF16)
+
+    def test_knobs_are_keyword_only(self):
+        with pytest.raises(TypeError):
+            QuantConfig(QuantFormat.MXFP4, QuantFormat.MXFP8, QuantFormat.BF16, None)
+        cfg = QuantConfig(QuantFormat.MXFP4, QuantFormat.MXFP8, QuantFormat.BF16)
+        assert cfg.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+
+    def test_explicit_pair_with_default_output(self):
+        cfg = QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16)
+        assert cfg.pair == (QuantFormat.MXFP4, QuantFormat.BF16)
+        assert cfg.output is QuantFormat.BF16
+
+    def test_rejects_torch_dtype(self):
+        with pytest.raises(TypeError, match="must be a QuantFormat"):
+            QuantConfig(output=torch.bfloat16)
+
+    def test_replace_keeps_pair_and_can_change_output(self):
+        cfg = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+        replaced = dataclasses.replace(cfg, output=QuantFormat.FP16)
+        assert replaced.pair == cfg.pair
+        assert replaced.output is QuantFormat.FP16
+        changed = dataclasses.replace(
+            cfg, weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8
+        )
+        assert changed.pair == (QuantFormat.MXFP4, QuantFormat.MXFP8)
+
+    def test_nvfp4_4over6_defaults_to_unset(self):
+        assert QuantConfig().nvfp4_4over6 is _UNSET
+        assert "nvfp4_4over6" not in repr(QuantConfig())
+
+    @pytest.mark.parametrize("activation", list(QuantFormat))
+    def test_unset_is_legal_on_every_activation_format(self, activation):
+        """The default must not break a single existing non-NVFP4 config."""
+        cfg = QuantConfig(activation=activation)
+        assert cfg.nvfp4_4over6 is _UNSET
+        assert _eval_repr(cfg) == cfg
+
+    @pytest.mark.parametrize(
+        "activation", [f for f in QuantFormat if f is not QuantFormat.NVFP4]
+    )
+    @pytest.mark.parametrize(
+        "setting",
+        [
+            None,
+            NVFP44Over6Config(),
+            NVFP44Over6Config(e4m3_max=256, err_mode="MSE"),
+        ],
+        ids=repr,
+    )
+    def test_explicit_4over6_rejected_on_non_nvfp4_activation(
+        self, activation, setting
+    ):
+        """A cross-field mistake must name itself, not vanish.
+
+        Raised in ``__post_init__`` rather than a runner's ``_check_support``
+        on purpose: ``MoELayer`` swallows support-check exceptions to filter
+        backends, so this would otherwise surface as "no backend available".
+        The recipe governs activation quantization, so the weight axis may be
+        NVFP4 (W4A16) and the config is still rejected.
+        """
+        with pytest.raises(ValueError, match=r"activation=QuantFormat\.NVFP4"):
+            QuantConfig(
+                weight=QuantFormat.NVFP4, activation=activation, nvfp4_4over6=setting
+            )
+
+    @pytest.mark.parametrize("bogus", ["auto", 3, 1.5, ["MAE"]])
+    def test_bogus_4over6_rejected_where_it_is_written(self, bogus):
+        """Type errors surface at config construction, not at kernel launch."""
+        with pytest.raises(TypeError, match="nvfp4_4over6"):
+            QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=bogus,
+            )
+
+    @pytest.mark.parametrize("setting", NVFP4_4OVER6_SETTINGS, ids=repr)
+    def test_quant_config_stays_hashable(self, setting):
+        cfg = QuantConfig(
+            weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4, nvfp4_4over6=setting
+        )
+        assert hash(cfg) == hash(
+            QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=setting,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -510,7 +793,7 @@ class TestMoEConfigDictProtocol:
     def test_keys(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         keys = list(cfg.keys())
@@ -525,7 +808,7 @@ class TestMoEConfigDictProtocol:
         routing = RoutingConfig(num_experts=8, top_k=2)
         cfg = MoEConfig(
             routing=routing,
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         assert cfg["routing"] is routing
@@ -533,7 +816,7 @@ class TestMoEConfigDictProtocol:
     def test_unpack(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         d = dict(**cfg)
@@ -550,20 +833,25 @@ class TestImmutableReplace:
     def test_replace_quant(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=2048),
         )
         fp8_cfg = dataclasses.replace(
             cfg,
-            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+            quant=QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
         )
-        assert fp8_cfg.quant.variant == QuantVariant.DeepSeekFp8
-        assert cfg.quant.variant == QuantVariant.BF16  # original unchanged
+        assert fp8_cfg.quant.pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8)
+        assert cfg.quant.pair == (
+            QuantFormat.BF16,
+            QuantFormat.BF16,
+        )  # original unchanged
 
     def test_replace_backend(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             experts=ExpertConfig(intermediate_size=512),
         )
         narrow = dataclasses.replace(
@@ -587,7 +875,7 @@ class TestHashability:
     def test_moe_config_hashable(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=512),
             backend=BackendOptions(
                 candidates=(TrtllmBf16Config(), CutlassBf16Config())
@@ -600,7 +888,7 @@ class TestHashability:
     def test_moe_config_as_dict_key(self):
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=512),
         )
         d = {cfg: "value"}
@@ -706,6 +994,52 @@ class TestTypedActivationConfig:
             "situ_beta": DEFAULT_SITU_BETA,
             "situ_linear_beta": None,
         }
+
+    def test_sm12x_mxfp8_mxfp4_activation_mapping(self):
+        from flashinfer.fused_moe.runners import _sm12x_mxfp8_mxfp4_activation_kwargs
+
+        assert _sm12x_mxfp8_mxfp4_activation_kwargs(SwiGLU()) == {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": None,
+        }
+        assert _sm12x_mxfp8_mxfp4_activation_kwargs(SwiGLU(limit=10.0)) == {
+            "activation": ActivationType.Swiglu,
+            "swiglu_limit": 10.0,
+        }
+        assert _sm12x_mxfp8_mxfp4_activation_kwargs(SiTU()) == {
+            "activation": ActivationType.Situ,
+            "situ_beta": DEFAULT_SITU_BETA,
+            "situ_linear_beta": DEFAULT_SITU_LINEAR_BETA,
+        }
+        with pytest.raises(NotImplementedError):
+            _sm12x_mxfp8_mxfp4_activation_kwargs(SwiGLU(alpha=2.0))
+        with pytest.raises(NotImplementedError):
+            _sm12x_mxfp8_mxfp4_activation_kwargs(SiTU(clamp_limit=1.0))
+
+    def test_sm12x_mxfp8_mxfp4_weight_view_validation(self):
+        from flashinfer.fused_moe.runners import _validate_sm12x_mxfp8_mxfp4_weight_view
+
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=2, top_k=1),
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            experts=ExpertConfig(intermediate_size=128, local_num_experts=2),
+        )
+        x = torch.empty(3, 128, dtype=torch.bfloat16)
+        view = {
+            "w1_weight": torch.empty(2, 256, 64, dtype=torch.uint8),
+            "w1_weight_sf": torch.empty(2, 1, 1024, dtype=torch.uint8),
+            "w2_weight": torch.empty(2, 128, 64, dtype=torch.uint8),
+            "w2_weight_sf": torch.empty(2, 1, 512, dtype=torch.uint8),
+        }
+        _validate_sm12x_mxfp8_mxfp4_weight_view(view, x, config)
+        with pytest.raises(ValueError, match="w1_weight shape"):
+            _validate_sm12x_mxfp8_mxfp4_weight_view(
+                {**view, "w1_weight": view["w1_weight"][:, :-1]}, x, config
+            )
+        with pytest.raises(TypeError, match="w2_weight must be uint8"):
+            _validate_sm12x_mxfp8_mxfp4_weight_view(
+                {**view, "w2_weight": view["w2_weight"].float()}, x, config
+            )
 
     def test_situ_unclamped_linear_branch_is_expressible(self):
         activation = SiTU(linear_scale=None)
@@ -891,8 +1225,8 @@ def test_trtllm_fp8_per_tensor_preparation_shapes_for_declared_activations(
 class TestExpressiveness:
     """Verify that the unified config can express every existing test scenario.
 
-    Each scenario maps a legacy flat-API configuration onto the single-knob
-    ``QuantVariant`` surface.
+    Each scenario maps a legacy flat-API configuration onto three-axis
+    ``QuantConfig``.
     """
 
     def test_trtllm_fp4_deepseekv3(self):
@@ -906,7 +1240,7 @@ class TestExpressiveness:
                 topk_group=4,
                 routed_scaling_factor=1.0,
             ),
-            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
             activation=SwiGLU(),
             backend=BackendOptions(
@@ -914,7 +1248,7 @@ class TestExpressiveness:
             ),
         )
         assert cfg.routing.method == RoutingMethodType.DeepSeekV3
-        assert cfg.quant.variant == QuantVariant.NVFP4
+        assert cfg.quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
         assert cfg.activation.is_gated
 
     def test_trtllm_fp8_block_mxfp8(self):
@@ -925,26 +1259,28 @@ class TestExpressiveness:
                 top_k=8,
                 method=RoutingMethodType.Renormalize,
             ),
-            quant=QuantConfig(variant=QuantVariant.MxFp8),
+            quant=QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
             experts=ExpertConfig(intermediate_size=512),
             activation=SwiGLU(),
             backend=BackendOptions(
                 candidates=(TrtllmFp8BlockConfig(), CutlassMxfp8Config())
             ),
         )
-        assert cfg.quant.variant == QuantVariant.MxFp8
+        assert cfg.quant.pair == (QuantFormat.MXFP8, QuantFormat.MXFP8)
 
     def test_trtllm_fp8_per_tensor(self):
         """Per-tensor FP8 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.FP8PerTensor),
+            quant=QuantConfig(
+                weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+            ),
             experts=ExpertConfig(intermediate_size=512),
             backend=BackendOptions(
                 candidates=(TrtllmFp8PerTensorConfig(), CutlassFp8PerTensorConfig())
             ),
         )
-        assert cfg.quant.variant == QuantVariant.FP8PerTensor
+        assert cfg.quant.pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor)
 
     def test_trtllm_bf16(self):
         """BF16 unquantized config."""
@@ -954,29 +1290,31 @@ class TestExpressiveness:
                 top_k=2,
                 method=RoutingMethodType.Renormalize,
             ),
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=512),
             backend=BackendOptions(
                 candidates=(TrtllmBf16Config(), CutlassBf16Config())
             ),
         )
-        assert cfg.quant.variant == QuantVariant.BF16
+        assert cfg.quant.pair == (QuantFormat.BF16, QuantFormat.BF16)
 
     def test_trtllm_mxint4(self):
         """MxInt4 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=8, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.MxInt4),
+            quant=QuantConfig(weight=QuantFormat.MXINT4, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=512),
             backend=BackendOptions((TrtllmMxInt4Config(),)),
         )
-        assert cfg.quant.variant == QuantVariant.MxInt4
+        assert cfg.quant.pair == (QuantFormat.MXINT4, QuantFormat.BF16)
 
     def test_cutlass_modular_fp8(self):
         """CUTLASS DeepSeek block-scale FP8 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),
-            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+            quant=QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
             experts=ExpertConfig(intermediate_size=2048),
             activation=SwiGLU(),
             backend=BackendOptions((CutlassFp8BlockConfig(),)),
@@ -987,7 +1325,7 @@ class TestExpressiveness:
         """CuteDSL NVFP4 config."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=64, top_k=8),
-            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             experts=ExpertConfig(intermediate_size=1024),
             activation=SwiGLU(),
             backend=BackendOptions(candidates=(CuteDslConfig(), CutlassNvfp4Config())),
@@ -998,7 +1336,9 @@ class TestExpressiveness:
         """Config with expert parallelism (EP)."""
         cfg = MoEConfig(
             routing=RoutingConfig(num_experts=256, top_k=8),
-            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+            quant=QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
             experts=ExpertConfig(
                 intermediate_size=2048,
                 local_expert_offset=32,
@@ -1016,7 +1356,7 @@ class TestExpressiveness:
                 top_k=1,
                 method=RoutingMethodType.Llama4,
             ),
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             experts=ExpertConfig(intermediate_size=4096),
         )
         assert cfg.routing.method == RoutingMethodType.Llama4
@@ -1030,7 +1370,9 @@ class TestExpressiveness:
                 top_k=8,
                 method=RoutingMethodType.RenormalizeNaive,
             ),
-            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+            quant=QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
             experts=ExpertConfig(intermediate_size=1024),
         )
         assert cfg.routing.method == RoutingMethodType.RenormalizeNaive
@@ -1076,9 +1418,9 @@ class TestMoERunnerSupport:
             SiTU,
         )
         assert TrtllmFp4RoutedRunner.supported_activation_classes_by_quant == {
-            QuantVariant.NVFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
-            QuantVariant.MXFP4: (SwiGLU, GeGLU, SiTU, ReLU2),
-            QuantVariant.W4A16: (SwiGLU,),
+            (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU, GeGLU, SiTU, ReLU2),
+            (QuantFormat.MXFP4, QuantFormat.MXFP8): (SwiGLU, GeGLU, SiTU, ReLU2),
+            (QuantFormat.MXFP4, QuantFormat.BF16): (SwiGLU,),
         }
         assert TrtllmBf16RoutedRunner.supported_activation_classes == (
             SwiGLU,
@@ -1089,15 +1431,15 @@ class TestMoERunnerSupport:
             ReLU2,
         )
         assert TrtllmFp8BlockRunner.supported_activation_classes_by_quant == {
-            QuantVariant.DeepSeekFp8: (SwiGLU,),
-            QuantVariant.MxFp8: (SwiGLU, GeGLU, ReLU2),
+            (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8): (SwiGLU,),
+            (QuantFormat.MXFP8, QuantFormat.MXFP8): (SwiGLU, GeGLU, ReLU2),
         }
         assert TrtllmMxInt4RoutedRunner.supported_activation_classes == (SwiGLU,)
 
     def _nvfp4_swiglu(self, **overrides):
         base = dict(
             routing=RoutingConfig(num_experts=32, top_k=2),
-            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             experts=ExpertConfig(intermediate_size=512),
             activation=SwiGLU(),
         )
@@ -1134,11 +1476,16 @@ class TestMoERunnerSupport:
                 runner.check_support()
 
     @pytest.mark.parametrize(
-        "variant", (QuantVariant.NVFP4, QuantVariant.MXFP4, QuantVariant.W4A16)
+        "variant",
+        (
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+        ),
     )
     def test_cute_dsl_quant_variants_supported(self, variant):
         runner = CuteDslRunner.__new__(CuteDslRunner)
-        runner.config = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
+        runner.config = self._nvfp4_swiglu(quant=variant)
         assert runner.check_support() is None
 
     def test_cute_dsl_w4a8_rejected_on_rubin(self, monkeypatch):
@@ -1146,17 +1493,44 @@ class TestMoERunnerSupport:
 
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(
-            quant=QuantConfig(variant=QuantVariant.MXFP4)
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
         )
         runner.device = torch.device("cuda")
         monkeypatch.setattr(utils, "get_compute_capability", lambda _: (10, 7))
         with pytest.raises(NotImplementedError, match=r"W4A8.*SM107"):
             runner.check_support()
 
+    def test_cute_dsl_pinned_4over6_requires_per_token_scale(self):
+        """The guard lives in _check_support(), so it fires on every device.
+
+        Without per-token scales GEMM1's NVFP4 epilogue produces the GEMM2
+        input and has no 4over6 variant; a pinned recipe must be refused, not
+        silently dropped.  ``None`` (off) is what that path already does.
+        """
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=NVFP44Over6Config(),
+            )
+        )
+        with pytest.raises(NotImplementedError, match="per_token_scale=True"):
+            runner.check_support()
+
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=None,
+            )
+        )
+        assert runner.check_support() is None
+
     def test_cute_dsl_w4a8_requires_fused_finalize(self):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(
-            quant=QuantConfig(variant=QuantVariant.MXFP4),
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
             finalize=MoEFinalizeConfig(use_fused_finalize=False),
         )
         with pytest.raises(NotImplementedError, match="requires fused finalize"):
@@ -1192,7 +1566,7 @@ class TestMoERunnerSupport:
     def test_cute_dsl_mxfp4_pack_uses_unpacked_mxfp8_and_no_fc2_scale(self):
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(
-            quant=QuantConfig(variant=QuantVariant.MXFP4)
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8)
         )
         runner._built = True
         runner._inner = SimpleNamespace(top_k=2)
@@ -1228,7 +1602,9 @@ class TestMoERunnerSupport:
             CuteDslConfig.prepare_weights(
                 w1,
                 w2,
-                variant=QuantVariant.MXFP4,
+                quant=QuantConfig(
+                    weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8
+                ),
                 num_local_experts=2,
                 hidden_size=256,
                 intermediate_size=96,
@@ -1245,6 +1621,46 @@ class TestMoERunnerSupport:
         runner = CuteDslRunner.__new__(CuteDslRunner)
         runner.config = self._nvfp4_swiglu(activation=SiTU(linear_scale=None))
         assert runner.check_support() is None
+
+    @pytest.mark.parametrize(
+        ("runner_cls", "quant"),
+        (
+            (
+                TrtllmFp4RoutedRunner,
+                QuantConfig(
+                    weight=QuantFormat.MXFP4,
+                    activation=QuantFormat.MXFP8,
+                    swizzled_scale_factors=True,
+                ),
+            ),
+            (
+                TrtllmFp8BlockRunner,
+                QuantConfig(
+                    weight=QuantFormat.MXFP8,
+                    activation=QuantFormat.MXFP8,
+                    swizzled_scale_factors=True,
+                ),
+            ),
+            (
+                CuteDslRunner,
+                QuantConfig(
+                    weight=QuantFormat.MXFP4,
+                    activation=QuantFormat.MXFP8,
+                    swizzled_scale_factors=True,
+                ),
+            ),
+        ),
+    )
+    def test_swizzled_scale_factors_rejected_outside_cutlass_mxfp8(
+        self, runner_cls, quant
+    ):
+        """The flat swizzled input_sf is a CUTLASS MXFP8 opt-in; every other
+        candidate for the pair must refuse it in check_support rather than
+        fail at pack_inputs with a shape error."""
+        runner = runner_cls.__new__(runner_cls)
+        runner.config = self._nvfp4_swiglu(quant=quant)
+        with pytest.raises(NotImplementedError, match="swizzled_scale_factors=True"):
+            runner.check_support()
 
     def test_trtllm_rejects_unclamped_situ_linear_branch(self):
         # The TRT-LLM per-expert gemm1_beta tensor cannot encode "no clamp",
@@ -1268,38 +1684,107 @@ class TestMoERunnerSupport:
 
     def test_missing_per_quant_capability_entry_is_rejected(self):
         # A runner declaring per-quant activation support must declare it for
-        # every variant it accepts; an unmapped variant must not fall back to
+        # every MMA pair it accepts; an unmapped pair must not fall back to
         # the permissive class default.
         class _UnmappedRunner(TrtllmFp4RoutedRunner):
-            supported_quant_variants: ClassVar[tuple[QuantVariant, ...]] = (
-                QuantVariant.NVFP4,
-                QuantVariant.MXFP4,
+            supported_quant_variants: ClassVar[
+                tuple[tuple[QuantFormat, QuantFormat], ...]
+            ] = (
+                (QuantFormat.NVFP4, QuantFormat.NVFP4),
+                (QuantFormat.MXFP4, QuantFormat.MXFP8),
             )
             supported_activation_classes_by_quant: ClassVar[dict] = {
-                QuantVariant.NVFP4: (SwiGLU,),
+                (QuantFormat.NVFP4, QuantFormat.NVFP4): (SwiGLU,),
             }
 
         runner = _UnmappedRunner.__new__(_UnmappedRunner)
         runner.config = self._nvfp4_swiglu(
-            quant=QuantConfig(variant=QuantVariant.MXFP4), activation=GeGLU()
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            activation=GeGLU(),
         )
-        with pytest.raises(NotImplementedError, match="no entry for QuantVariant"):
+        with pytest.raises(NotImplementedError, match="no entry for weight="):
             runner.check_support()
+
+    def test_unmapped_same_format_pair_is_accepted_when_declared(self):
+        # A pair with no legacy name (e.g. MXFP4×MXFP4) can be declared; dispatch
+        # is pair-keyed, so check_support succeeds when the runner lists it.
+        class _Mxfp4xMxfp4Runner(MoERunner):
+            supported_quant_variants = ((QuantFormat.MXFP4, QuantFormat.MXFP4),)
+            supported_activation_classes_by_quant = {
+                (QuantFormat.MXFP4, QuantFormat.MXFP4): (SwiGLU,),
+            }
+
+            def get_valid_tactics(self, inputs, profile):
+                return [-1]
+
+            def forward(self, inputs, **kwargs):
+                return None
+
+        runner = _Mxfp4xMxfp4Runner()
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP4)
+        )
+        runner.check_support()
+
+    def test_moe_layer_rejects_unsupported_output_format(self, monkeypatch):
+        from flashinfer.fused_moe import layer as layer_module
+
+        monkeypatch.setattr(
+            layer_module, "get_compute_capability", lambda device: (9, 0)
+        )
+        config = MoEConfig(
+            routing=RoutingConfig(num_experts=4, top_k=2),
+            quant=QuantConfig(output=QuantFormat.FP16),
+            experts=ExpertConfig(intermediate_size=256),
+            backend=BackendOptions(candidates=(CutlassBf16Config(),)),
+        )
+        with pytest.raises(
+            RuntimeError, match=r"none of the configured backends"
+        ) as exc:
+            MoELayer(config, device=torch.device("cpu"))
+        assert "output=FP16" in str(exc.value)
 
     @pytest.mark.parametrize(
         "runner_type,variant",
         (
-            (CuteDslRunner, QuantVariant.BF16),
-            (TrtllmFp4RoutedRunner, QuantVariant.BF16),
-            (TrtllmBf16RoutedRunner, QuantVariant.NVFP4),
-            (TrtllmFp8BlockRunner, QuantVariant.BF16),
+            (
+                CuteDslRunner,
+                QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            ),
+            (
+                TrtllmFp4RoutedRunner,
+                QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            ),
+            (
+                TrtllmBf16RoutedRunner,
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            ),
+            (
+                TrtllmFp8BlockRunner,
+                QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            ),
         ),
     )
     def test_unsupported_quant_variant_rejected(self, runner_type, variant):
-        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
+        cfg = self._nvfp4_swiglu(quant=variant)
         runner = runner_type.__new__(runner_type)
         runner.config = cfg
-        with pytest.raises(NotImplementedError, match=f"QuantVariant.{variant.name}"):
+        with pytest.raises(
+            NotImplementedError,
+            match=f"weight={variant.weight.name}, activation={variant.activation.name}",
+        ):
+            runner.check_support()
+
+    def test_unsupported_output_format_rejected(self):
+        runner = CuteDslRunner.__new__(CuteDslRunner)
+        runner.config = self._nvfp4_swiglu(
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                output=QuantFormat.FP16,
+            )
+        )
+        with pytest.raises(NotImplementedError, match="output=FP16"):
             runner.check_support()
 
     @pytest.mark.parametrize(
@@ -1309,15 +1794,29 @@ class TestMoERunnerSupport:
     @pytest.mark.parametrize(
         "runner_type,variant",
         (
-            (CuteDslRunner, QuantVariant.NVFP4),
-            (TrtllmFp4RoutedRunner, QuantVariant.NVFP4),
-            (TrtllmBf16RoutedRunner, QuantVariant.BF16),
-            (TrtllmFp8BlockRunner, QuantVariant.DeepSeekFp8),
+            (
+                CuteDslRunner,
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            ),
+            (
+                TrtllmFp4RoutedRunner,
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            ),
+            (
+                TrtllmBf16RoutedRunner,
+                QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            ),
+            (
+                TrtllmFp8BlockRunner,
+                QuantConfig(
+                    weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+                ),
+            ),
         ),
     )
     def test_not_supported_activation(self, runner_type, variant, act):
         cfg = self._nvfp4_swiglu(
-            quant=QuantConfig(variant=variant),
+            quant=variant,
             activation=act,
         )
         runner = runner_type.__new__(runner_type)
@@ -1329,7 +1828,9 @@ class TestMoERunnerSupport:
         import flashinfer.utils as utils
 
         cfg = self._nvfp4_swiglu(
-            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+            quant=QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
             finalize=MoEFinalizeConfig(do_finalize=False),
         )
         runner = TrtllmFp8BlockRunner.__new__(TrtllmFp8BlockRunner)
@@ -1341,8 +1842,18 @@ class TestMoERunnerSupport:
     @pytest.mark.parametrize(
         ("runner_type", "variant"),
         [
-            (TrtllmFp8BlockRunner, QuantVariant.DeepSeekFp8),
-            (TrtllmFp8PerTensorRunner, QuantVariant.FP8PerTensor),
+            (
+                TrtllmFp8BlockRunner,
+                QuantConfig(
+                    weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+                ),
+            ),
+            (
+                TrtllmFp8PerTensorRunner,
+                QuantConfig(
+                    weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+                ),
+            ),
         ],
     )
     @pytest.mark.parametrize(
@@ -1354,7 +1865,7 @@ class TestMoERunnerSupport:
     ):
         import flashinfer.utils as utils
 
-        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
+        cfg = self._nvfp4_swiglu(quant=variant)
         runner = runner_type.__new__(runner_type)
         runner.config = cfg
         runner.device = torch.device("cuda")
@@ -1371,7 +1882,7 @@ class TestMoERunnerSupport:
         import flashinfer.utils as utils
 
         cfg = self._nvfp4_swiglu(
-            quant=QuantConfig(variant=QuantVariant.BF16),
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             finalize=MoEFinalizeConfig(do_finalize=False),
         )
         runner = TrtllmBf16RoutedRunner.__new__(TrtllmBf16RoutedRunner)
@@ -1383,7 +1894,9 @@ class TestMoERunnerSupport:
     def test_bf16_sm120_rejected_before_launch(self, monkeypatch):
         import flashinfer.utils as utils
 
-        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=QuantVariant.BF16))
+        cfg = self._nvfp4_swiglu(
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)
+        )
         runner = TrtllmBf16RoutedRunner.__new__(TrtllmBf16RoutedRunner)
         runner.config = cfg
         runner.device = torch.device("cuda")
@@ -1394,7 +1907,9 @@ class TestMoERunnerSupport:
     def test_bf16_sm107_supported_after_reland(self, monkeypatch):
         import flashinfer.utils as utils
 
-        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=QuantVariant.BF16))
+        cfg = self._nvfp4_swiglu(
+            quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16)
+        )
         runner = TrtllmBf16RoutedRunner.__new__(TrtllmBf16RoutedRunner)
         runner.config = cfg
         runner.device = torch.device("cuda")
@@ -1403,12 +1918,16 @@ class TestMoERunnerSupport:
 
     @pytest.mark.parametrize(
         "variant",
-        [QuantVariant.NVFP4, QuantVariant.MXFP4, QuantVariant.W4A16],
+        [
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
+            QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.BF16),
+        ],
     )
     def test_fp4_sm107_variant_support_after_reland(self, monkeypatch, variant):
         import flashinfer.utils as utils
 
-        cfg = self._nvfp4_swiglu(quant=QuantConfig(variant=variant))
+        cfg = self._nvfp4_swiglu(quant=variant)
         runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
         runner.config = cfg
         runner.device = torch.device("cuda")
@@ -1417,7 +1936,7 @@ class TestMoERunnerSupport:
 
     def test_moe_runner_quant_support_check(self):
         class Runner(MoERunner):
-            supported_quant_variants = (QuantVariant.NVFP4,)
+            supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
             supported_activation_classes = (SwiGLU,)
 
             def get_valid_tactics(self, inputs, profile):
@@ -1432,7 +1951,7 @@ class TestMoERunnerSupport:
 
     def test_moe_runner_without_activation_capability_is_rejected(self):
         class Runner(MoERunner):
-            supported_quant_variants = (QuantVariant.NVFP4,)
+            supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
 
             def get_valid_tactics(self, inputs, profile):
                 return []
@@ -1448,12 +1967,121 @@ class TestMoERunnerSupport:
             runner.check_support()
 
 
+def _make_4over6_runner_class(supports: bool):
+    """A minimal concrete MoERunner that only varies in 4over6 support."""
+
+    class _Runner(MoERunner):
+        backend_key = "fake_4over6" if supports else "fake_env_only"
+        supported_quant_variants = ((QuantFormat.NVFP4, QuantFormat.NVFP4),)
+        supported_routing_modes = (RoutingInputMode.PackedPrecomputed,)
+        supported_activation_classes = (SwiGLU,)
+        supports_nvfp4_4over6 = supports
+
+        def __init__(self, config, device=None):
+            super().__init__()
+            self.config = config
+            self.device = device
+
+        def get_valid_tactics(self, inputs, profile):
+            return []
+
+        def forward(self, inputs, **kwargs):
+            return None
+
+    return _Runner
+
+
+class TestRunner4Over6Support:
+    """``MoERunner.supports_nvfp4_4over6`` is an opt-in.
+
+    A runner whose quantizer still reads ``FLASHINFER_NVFP4_4OVER6*`` cannot
+    honor a pinned recipe and must refuse it instead of quantizing with
+    whatever the environment says.
+    """
+
+    @staticmethod
+    def _config(setting, **overrides):
+        base = dict(
+            routing=RoutingConfig(num_experts=32, top_k=2),
+            quant=QuantConfig(
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
+                nvfp4_4over6=setting,
+            ),
+            experts=ExpertConfig(intermediate_size=512),
+            activation=SwiGLU(),
+        )
+        base.update(overrides)
+        return MoEConfig(**base)
+
+    def test_base_default_is_opt_out(self):
+        """Default False: a new runner cannot accidentally claim support."""
+        assert MoERunner.supports_nvfp4_4over6 is False
+
+    @pytest.mark.parametrize("setting", NVFP4_4OVER6_SETTINGS, ids=repr)
+    def test_unsupporting_runner_rejects_explicit_recipe(self, setting):
+        runner_cls = _make_4over6_runner_class(supports=False)
+        runner = runner_cls(self._config(setting))
+        with pytest.raises(NotImplementedError, match="nvfp4_4over6"):
+            runner.check_support()
+
+    def test_unsupporting_runner_accepts_unset(self):
+        """Reading the environment is what every backend already does — stay silent."""
+        runner_cls = _make_4over6_runner_class(supports=False)
+        runner = runner_cls(self._config(_UNSET))
+        assert runner.check_support() is None
+
+    @pytest.mark.parametrize("setting", NVFP4_4OVER6_SETTINGS + [_UNSET], ids=repr)
+    def test_supporting_runner_accepts_every_state(self, setting):
+        runner_cls = _make_4over6_runner_class(supports=True)
+        runner = runner_cls(self._config(setting))
+        assert runner.check_support() is None
+
+    @pytest.mark.parametrize("setting", [None, NVFP44Over6Config()], ids=repr)
+    def test_trtllm_fp4_runner_rejects_explicit_recipe(self, setting):
+        """The real env-only backend, not just the synthetic one."""
+        runner = TrtllmFp4RoutedRunner.__new__(TrtllmFp4RoutedRunner)
+        runner.config = self._config(setting)
+        runner.device = torch.device("cuda")
+        with pytest.raises(NotImplementedError, match="nvfp4_4over6"):
+            runner.check_support()
+
+    def test_moe_layer_names_the_setting_when_no_backend_can_honor_it(
+        self, monkeypatch
+    ):
+        """A pinned recipe nobody implements must be named in the error.
+
+        ``MoELayer`` swallows ``check_support()`` failures to filter backends,
+        so the "no usable backend" message has to mention ``nvfp4_4over6``.
+        """
+        from flashinfer.fused_moe import layer as layer_mod
+
+        monkeypatch.setattr(layer_mod, "get_compute_capability", lambda _: (10, 0))
+        monkeypatch.setitem(
+            layer_mod._BACKEND_RUNNERS,
+            CuteDslConfig,
+            _make_4over6_runner_class(supports=False),
+        )
+        config = self._config(
+            NVFP44Over6Config(),
+            backend=BackendOptions(candidates=(CuteDslConfig(),)),
+        )
+        with pytest.raises((RuntimeError, NotImplementedError)) as excinfo:
+            MoELayer(config, device=torch.device("cuda"))
+        assert "nvfp4_4over6" in str(excinfo.value), (
+            "MoELayer dropped the reason each backend was rejected. "
+            "flashinfer/fused_moe/layer.py must collect the check_support() "
+            "messages it swallows and include them in the RuntimeError, or a "
+            "pinned 4over6 recipe fails as an unexplained 'no usable backend'."
+        )
+
+
 class TestBuiltInRunnerLifecycle:
     @staticmethod
     def _config(variant):
         return MoEConfig(
             routing=RoutingConfig(num_experts=32, top_k=2),
-            quant=QuantConfig(variant=variant),
+            quant=variant,
             experts=ExpertConfig(intermediate_size=512),
             activation=SwiGLU(),
             execution=ExecutionConfig(enable_pdl=False),
@@ -1462,11 +2090,30 @@ class TestBuiltInRunnerLifecycle:
     @pytest.mark.parametrize(
         "runner_type,variant",
         (
-            (TrtllmFp4RoutedRunner, QuantVariant.NVFP4),
-            (TrtllmFp8BlockRunner, QuantVariant.DeepSeekFp8),
-            (TrtllmFp8PerTensorRunner, QuantVariant.FP8PerTensor),
-            (TrtllmBf16RoutedRunner, QuantVariant.BF16),
-            (TrtllmMxInt4RoutedRunner, QuantVariant.MxInt4),
+            (
+                TrtllmFp4RoutedRunner,
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+            ),
+            (
+                TrtllmFp8BlockRunner,
+                QuantConfig(
+                    weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+                ),
+            ),
+            (
+                TrtllmFp8PerTensorRunner,
+                QuantConfig(
+                    weight=QuantFormat.FP8PerTensor, activation=QuantFormat.FP8PerTensor
+                ),
+            ),
+            (
+                TrtllmBf16RoutedRunner,
+                QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
+            ),
+            (
+                TrtllmMxInt4RoutedRunner,
+                QuantConfig(weight=QuantFormat.MXINT4, activation=QuantFormat.BF16),
+            ),
         ),
     )
     def test_trtllm_constructor_defers_idempotent_module_build(
@@ -1511,7 +2158,12 @@ class TestBuiltInRunnerLifecycle:
 
         monkeypatch.setattr(tuner, "CuteDslFusedMoERunner", Inner)
         monkeypatch.setattr(fused_moe, "_cute_dsl_fused_moe_impl", object())
-        runner = CuteDslRunner(self._config(QuantVariant.NVFP4), torch.device("cuda:0"))
+        runner = CuteDslRunner(
+            self._config(
+                QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+            ),
+            torch.device("cuda:0"),
+        )
         runner._check_support = lambda: None
 
         assert runner._inner is None
@@ -1902,6 +2554,9 @@ SMALL = dict(hidden_size=1024, intermediate_size=512, num_experts=32, top_k=2)
 # ---------------------------------------------------------------------------
 
 
+_NVFP4_NVFP4 = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+
+
 def _make_packs_and_config(
     num_tokens: int,
     *,
@@ -1912,7 +2567,7 @@ def _make_packs_and_config(
     local_num_experts: int | None = None,
     max_tokens: int | None = None,
     activation=None,
-    variant: QuantVariant = QuantVariant.NVFP4,
+    quant: QuantConfig = _NVFP4_NVFP4,
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for a given shape.
 
@@ -1939,7 +2594,7 @@ def _make_packs_and_config(
         top_k=top_k,
     )
 
-    w4a16 = variant is QuantVariant.W4A16
+    w4a16 = quant.pair == (QuantFormat.NVFP4, QuantFormat.BF16)
     act_pack = MoEActivationPack(
         hidden_states_q=tensors["x_bf16"] if w4a16 else tensors["x"],
         hidden_states_scale=None if w4a16 else tensors["x_sf"].squeeze(-1),
@@ -1960,23 +2615,26 @@ def _make_packs_and_config(
             "w2_alpha": tensors["w2_alpha"],
         },
     )
-    weight_pack.prepare_for(
-        "trtllm_fp4_routed",
-        TrtllmFp4Config.prepare_weights(
-            tensors["w1_weight_bf16"],
-            tensors["w2_weight_bf16"],
-            variant=variant,
-            num_local_experts=local_num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            activation=activation,
-            device=device,
-        ),
-    )
+    # CuteDSL W4A16 is NVFP4×BF16; TRTLLM W4A16 is MXFP4×BF16, so this helper
+    # only prepares the TRTLLM view for pairs that runner actually accepts.
+    if quant.pair != (QuantFormat.NVFP4, QuantFormat.BF16):
+        weight_pack.prepare_for(
+            "trtllm_fp4_routed",
+            TrtllmFp4Config.prepare_weights(
+                tensors["w1_weight_bf16"],
+                tensors["w2_weight_bf16"],
+                quant=quant,
+                num_local_experts=local_num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                activation=activation,
+                device=device,
+            ),
+        )
 
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=variant),
+        quant=quant,
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_num_experts=local_num_experts,
@@ -2036,7 +2694,13 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
 
 
 @cute_dsl_sm100_required
-@pytest.mark.parametrize("variant", (QuantVariant.NVFP4, QuantVariant.W4A16))
+@pytest.mark.parametrize(
+    "quant",
+    (
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.BF16),
+    ),
+)
 @pytest.mark.parametrize(
     "activation",
     (
@@ -2046,7 +2710,17 @@ def _compute_ref(act_pack, tensors, shape, activation=None, wrong_formula=False)
         ReLU2(),
     ),
 )
-def test_cute_dsl_typed_activation_matches_flat_reference(variant, activation):
+def test_cute_dsl_typed_activation_matches_flat_reference(quant, activation):
+    if (
+        get_compute_capability(torch.device("cuda")) == (10, 7)
+        and quant.activation is QuantFormat.NVFP4
+        and (
+            isinstance(activation, (GeGLUTanh, ReLU2))
+            or isinstance(activation, SwiGLU)
+            and activation != SwiGLU()
+        )
+    ):
+        pytest.skip("SM107 CuTe DSL MoE supports only default SwiGLU and SiTU")
     shape = dict(
         hidden_size=1024,
         intermediate_size=512,
@@ -2056,7 +2730,7 @@ def test_cute_dsl_typed_activation_matches_flat_reference(variant, activation):
     act_pack, weight_pack, config, tensors = _make_packs_and_config(
         8,
         activation=activation,
-        variant=variant,
+        quant=quant,
         **shape,
     )
     config = dataclasses.replace(
@@ -2118,6 +2792,69 @@ def test_cute_dsl_typed_activation_matches_flat_reference(variant, activation):
 # ---------------------------------------------------------------------------
 # 2. Dispatch plumbing
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("reverse_candidates", (False, True))
+def test_layer_selection_includes_per_call_packing(monkeypatch, reverse_candidates):
+    from flashinfer.testing import utils as testing_utils
+
+    gpu_work = []
+    measured = []
+    activations, weights = object(), object()
+    tactic = ("selected",)
+
+    class Runner:
+        def __init__(self, name, packing_cost, forward_cost):
+            self.backend_key = name
+            self.packing_cost = packing_cost
+            self.forward_cost = forward_cost
+            self.prepared = False
+
+        def pack_inputs(self, act_pack, weight_pack):
+            assert act_pack is activations and weight_pack is weights
+            if not self.prepared:
+                gpu_work.append(1000)  # One-time weight preparation is excluded.
+                self.prepared = True
+            gpu_work.append(self.packing_cost)
+            return [object()]
+
+        def launch_kwargs_for(self, inputs):
+            return {"launch_state": inputs[0]}
+
+        def tuning_config_for(self, inputs):
+            return TuningConfig()
+
+        def forward(self, inputs, *, tactic, launch_state):
+            # A fresh pack must use its own launch state, not the tuning pack's.
+            assert launch_state is inputs[0]
+            gpu_work.append(self.forward_cost)
+
+    def benchmark(fn, **kwargs):
+        assert kwargs["use_cuda_graph"]
+        times = []
+        for _ in range(2):
+            gpu_work.clear()
+            fn()
+            times.append(sum(gpu_work))
+        measured.append(times)
+        return times
+
+    monkeypatch.setattr(testing_utils, "bench_gpu_time", benchmark)
+    fast_kernel = Runner("fast_kernel", packing_cost=8, forward_cost=1)
+    fast_call = Runner("fast_call", packing_cost=1, forward_cost=4)
+    candidates = [fast_kernel, fast_call]
+    if reverse_candidates:
+        candidates.reverse()
+    layer = MoELayer.__new__(MoELayer)
+    layer.tuner = SimpleNamespace(
+        choose_one=lambda *, runners, **kwargs: (runners[0], tactic)
+    )
+
+    winner, selected_tactic = layer._select_winner(activations, weights, candidates)
+
+    assert winner is fast_call
+    assert selected_tactic == tactic
+    assert sorted(measured) == [[5, 5], [9, 9]]
 
 
 @sm100_required
@@ -2183,7 +2920,15 @@ BF16_ATOL = 3e-2
 
 
 def _bf16_dense_reference(
-    x, w1, w2, selected_experts, final_scales, intermediate_size, expert_offset=0
+    x,
+    w1,
+    w2,
+    selected_experts,
+    final_scales,
+    intermediate_size,
+    expert_offset=0,
+    *,
+    narrow_routing_weights=True,
 ):
     """fp32 dense MoE authority for the bf16 path.
 
@@ -2194,7 +2939,9 @@ def _bf16_dense_reference(
     LOCAL experts; a token routed to global id ``g`` uses local weight
     ``g - expert_offset``.
     """
-    final_scales = final_scales.to(torch.bfloat16).float()
+    if narrow_routing_weights:
+        final_scales = final_scales.to(torch.bfloat16)
+    final_scales = final_scales.float()
     x32 = x.float()
     out = torch.zeros_like(x32)
     for local_e in range(w1.shape[0]):
@@ -2221,13 +2968,20 @@ def _make_bf16_packs_and_config(
     local_expert_offset: int = 0,
     max_tokens: int | None = None,
     seed: int = 42,
+    routing_input_mode: RoutingInputMode = RoutingInputMode.PackedPrecomputed,
+    routing_weights_dtype: torch.dtype = torch.float32,
+    gate_up_scale: tuple[float, float] | None = None,
+    backend_configs: tuple = (TrtllmBf16Config(),),
 ):
     """Build (act_pack, weight_pack, config, tensors_dict) for the bf16 path.
 
     Mirrors ``_make_packs_and_config`` but with raw bf16 activations — no
     quantization and no scale tensors (the runner reads ``hidden_states_q``
     directly and ignores ``hidden_states_scale``).  ``tensors_dict`` holds the
-    UNSHUFFLED weights for ``_bf16_dense_reference``.
+    UNSHUFFLED weights for ``_bf16_dense_reference``.  ``gate_up_scale``
+    multiplies the canonical ``[up, gate]`` halves of ``w1`` so a swapped
+    reading is numerically distinguishable.  One native view is prepared per
+    entry of ``backend_configs``.
     """
     local_num_experts = local_num_experts or num_experts
     max_tokens = max_tokens or max(num_tokens, 8192)
@@ -2245,6 +2999,9 @@ def _make_bf16_packs_and_config(
         )
         / hidden_size**0.5
     )
+    if gate_up_scale is not None:
+        up, gate = w1.chunk(2, dim=1)
+        w1 = torch.cat((up * gate_up_scale[0], gate * gate_up_scale[1]), dim=1)
     w2 = (
         torch.randn(
             local_num_experts,
@@ -2262,44 +3019,46 @@ def _make_bf16_packs_and_config(
     selected_experts = (
         torch.topk(logits, top_k, dim=-1).indices + local_expert_offset
     ).to(torch.int32)
-    # Snap gate weights to the bf16 grid: pack_inputs truncates them to bf16 bits
-    # for the packed top-k ids, so unsnapped fp32 scales would add rounding noise
-    # the reference cannot see.
     final_scales = torch.rand(num_tokens, top_k, device=device)
-    final_scales = (
-        (final_scales / final_scales.sum(-1, keepdim=True)).to(torch.bfloat16).float()
-    )
+    final_scales = final_scales / final_scales.sum(-1, keepdim=True)
+    if routing_input_mode is RoutingInputMode.PackedPrecomputed:
+        # Packed IDs truncate weights to BF16 bits, so the reference must see
+        # the same values. Unpacked FP32 routing intentionally preserves the
+        # full caller-provided precision.
+        final_scales = final_scales.to(torch.bfloat16).float()
 
     act_pack = MoEActivationPack(
         hidden_states_q=x,  # raw bf16 on this path
         hidden_states_scale=None,  # unused by trtllm_bf16_routed
         topk_ids=selected_experts,
-        topk_weights=final_scales,
+        topk_weights=final_scales.to(routing_weights_dtype),
+        routing_input_mode=routing_input_mode,
     )
 
     weight_pack = MoEWeightPack()
-    weight_pack.prepare_for(
-        "trtllm_bf16_routed",
-        TrtllmBf16Config.prepare_weights(
-            w1,
-            w2,
-            num_local_experts=local_num_experts,
-            hidden_size=hidden_size,
-            intermediate_size=intermediate_size,
-            device=device,
-        ),
-    )
+    for backend_cfg in backend_configs:
+        weight_pack.prepare_for(
+            _BACKEND_RUNNERS[type(backend_cfg)].backend_key,
+            type(backend_cfg).prepare_weights(
+                w1,
+                w2,
+                num_local_experts=local_num_experts,
+                hidden_size=hidden_size,
+                intermediate_size=intermediate_size,
+                device=device,
+            ),
+        )
 
     config = MoEConfig(
         routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-        quant=QuantConfig(variant=QuantVariant.BF16),
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         experts=ExpertConfig(
             intermediate_size=intermediate_size,
             local_expert_offset=local_expert_offset,
             local_num_experts=local_num_experts,
         ),
         activation=SwiGLU(),
-        backend=BackendOptions(candidates=(TrtllmBf16Config(),)),
+        backend=BackendOptions(candidates=backend_configs),
         execution=ExecutionConfig(tune_max_num_tokens=max_tokens),
     )
     return act_pack, weight_pack, config, {"x": x, "w1": w1, "w2": w2}
@@ -2365,10 +3124,74 @@ def test_trtllm_interleaved_real_packs_keep_their_launch_state():
         first.launch_state.static_kwargs["gemm1_weights"] = second_gemm1
 
 
+@sm100_required
+def test_trtllm_dual_stream_packed_calls_match_reference():
+    """One runner may launch distinct packed calls concurrently on two streams."""
+    cases = [
+        _make_bf16_packs_and_config(
+            64,
+            hidden_size=256,
+            intermediate_size=256,
+            num_experts=4,
+            top_k=2,
+            max_tokens=64,
+            seed=seed,
+        )
+        for seed in (1, 2)
+    ]
+    runner = _build_direct_runner(
+        TrtllmBf16RoutedRunner,
+        cases[0][2],
+        cases[0][0].hidden_states_q.device,
+    )
+    packed_calls = [
+        runner.pack_inputs(act_pack, weight_pack)
+        for act_pack, weight_pack, _, _ in cases
+    ]
+    references = [
+        _bf16_dense_reference(
+            tensors["x"],
+            tensors["w1"],
+            tensors["w2"],
+            act_pack.topk_ids,
+            act_pack.topk_weights,
+            intermediate_size=256,
+        )
+        for act_pack, _, _, tensors in cases
+    ]
+
+    producer = torch.cuda.current_stream()
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    gate_stream = torch.cuda.Stream()
+    launch_gate = torch.cuda.Event()
+    with torch.cuda.stream(gate_stream):
+        gate_stream.wait_stream(producer)
+        torch.cuda._sleep(1_000_000)
+        launch_gate.record()
+    for stream in streams:
+        stream.wait_stream(producer)
+        stream.wait_event(launch_gate)
+
+    for _ in range(16):
+        for stream, packed in zip(streams, packed_calls, strict=True):
+            with torch.cuda.stream(stream):
+                runner.forward(packed, tactic=-1)
+    for stream in streams:
+        stream.synchronize()
+
+    for packed, reference in zip(packed_calls, references, strict=True):
+        torch.testing.assert_close(
+            packed[0].float(),
+            reference,
+            rtol=BF16_RTOL,
+            atol=BF16_ATOL,
+        )
+
+
 # ---------------------------------------------------------------------------
 # 5. Variant-parametrized conformance + packing contract
 # ---------------------------------------------------------------------------
-# One VariantSpec per executable QuantVariant drives the shared GPU test
+# One VariantSpec per executable MMA pair drives the shared GPU test
 # bodies below; the variant shows up in the test id (e.g. ``[nvfp4-128]``).
 # Adding a variant (FP8, MxInt4, ...) = register one spec.  ``check``
 # deliberately preserves each variant's assertion semantics (percent-within
@@ -2420,6 +3243,9 @@ def _bf16_ref(act_pack, tensors, expert_offset=0):
         act_pack.topk_weights,
         tensors["w2"].shape[-1],  # intermediate_size, derived not hardcoded
         expert_offset=expert_offset,
+        narrow_routing_weights=(
+            act_pack.routing_input_mode is not RoutingInputMode.UnpackedPrecomputed
+        ),
     )
 
 
@@ -2427,9 +3253,80 @@ def _bf16_check(out, ref, label):
     torch.testing.assert_close(out.float(), ref, rtol=BF16_RTOL, atol=BF16_ATOL)
 
 
+@sm100_required
+def test_bf16_gate_up_row_order_is_up_then_gate():
+    """TRT-LLM and CUTLASS BF16 read canonical gated ``w1`` rows as ``[up, gate]``.
+
+    Random weights let a backend and a reference that share the same swapped
+    reading agree; scaling the halves apart makes ``[gate, up]`` fail loudly.
+    """
+    arch = get_compute_capability(torch.device("cuda"))
+    arch = arch[0] * 10 + arch[1]
+    configs = tuple(
+        cfg for cfg in (TrtllmBf16Config(), CutlassBf16Config()) if cfg.supported(arch)
+    )
+    act, weights, config, tensors = _make_bf16_packs_and_config(
+        256,
+        max_tokens=256,
+        gate_up_scale=(0.25, 4.0),
+        backend_configs=configs,
+        **SMALL,
+    )
+    ref = _bf16_ref(act, tensors)
+    swapped_w1 = torch.cat(tensors["w1"].chunk(2, dim=1)[::-1], dim=1)
+    swapped_ref = _bf16_ref(act, {**tensors, "w1": swapped_w1})
+    assert not torch.allclose(ref, swapped_ref, rtol=BF16_RTOL, atol=BF16_ATOL), (
+        "fixture cannot distinguish [up, gate] from [gate, up]"
+    )
+
+    layer = MoELayer(config)
+    assert {r.backend_key for r in layer.runners} == {
+        _BACKEND_RUNNERS[type(cfg)].backend_key for cfg in configs
+    }
+    for runner in layer.runners:
+        out = runner.forward(runner.pack_inputs(act, weights), tactic=-1)
+        _bf16_check(out, ref, runner.backend_key)
+
+
+@sm100_required
+@pytest.mark.parametrize("weights_dtype", [torch.bfloat16, torch.float32])
+def test_bf16_unpacked_routing_forwards_inputs_and_matches_reference(weights_dtype):
+    from flashinfer.fused_moe.core import MoeRunnerInputs
+
+    act, weights, config, tensors = _make_bf16_packs_and_config(
+        64,
+        hidden_size=256,
+        intermediate_size=256,
+        num_experts=8,
+        top_k=2,
+        local_num_experts=4,
+        local_expert_offset=4,
+        max_tokens=64,
+        routing_input_mode=RoutingInputMode.UnpackedPrecomputed,
+        routing_weights_dtype=weights_dtype,
+    )
+    ids = act.topk_ids
+    route_weights = act.topk_weights
+    reference = _bf16_ref(act, tensors, expert_offset=4)
+    runner = _build_direct_runner(
+        TrtllmBf16RoutedRunner, config, act.hidden_states_q.device
+    )
+    inputs = runner.pack_inputs(act, weights)
+    moe_inputs = MoeRunnerInputs.from_list(inputs)
+
+    assert moe_inputs.topk_ids is ids
+    assert moe_inputs.expert_weights is route_weights
+    assert (
+        inputs.launch_state.static_kwargs["routing_input_mode"]
+        is RoutingInputMode.UnpackedPrecomputed
+    )
+    _bf16_check(runner.forward(inputs, tactic=-1), reference, "bf16 direct")
+    _bf16_check(MoELayer(config)(act, weights), reference, "bf16 layer")
+
+
 @dataclasses.dataclass(frozen=True)
 class VariantSpec:
-    """Everything the shared conformance bodies need for one QuantVariant."""
+    """Everything the shared conformance bodies need for one MMA pair."""
 
     id: str
     backend_keys: tuple  # runner backend_key strings to exercise directly
@@ -2617,7 +3514,7 @@ class PackingSpec:
 
     id: str
     runner_cls: type
-    variant: QuantVariant
+    quant: QuantConfig
     view_keys: tuple  # weight-view keys the runner's pack_inputs requires
     make_hidden: Callable  # (num_tokens, hidden_size, device) -> (q, scale)
 
@@ -2626,7 +3523,7 @@ _PACKING_SPECS = (
     PackingSpec(
         id="fp4",
         runner_cls=TrtllmFp4RoutedRunner,
-        variant=QuantVariant.NVFP4,
+        quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
         view_keys=(
             "gemm1_weights",
             "gemm1_weights_scale",
@@ -2639,7 +3536,7 @@ _PACKING_SPECS = (
     PackingSpec(
         id="bf16",
         runner_cls=TrtllmBf16RoutedRunner,
-        variant=QuantVariant.BF16,
+        quant=QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
         view_keys=("gemm1_weights", "gemm2_weights"),
         make_hidden=_bf16_dummy_hidden,
     ),
@@ -2700,7 +3597,7 @@ class TestTrtllmRoutedPackingContract:
 
         config = MoEConfig(
             routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-            quant=QuantConfig(variant=spec.variant),
+            quant=spec.quant,
             experts=ExpertConfig(
                 intermediate_size=512,
                 local_expert_offset=local_expert_offset,
@@ -2731,7 +3628,7 @@ class TestTrtllmRoutedPackingContract:
 
         # No kernel launches, but runners still validate their backend-native
         # weight contracts before exposing the packed routing buffers.
-        if spec.variant is QuantVariant.NVFP4:
+        if spec.quant.pair == (QuantFormat.NVFP4, QuantFormat.NVFP4):
             weight_view = _fp4_dummy_weight_view(
                 local_num_experts,
                 hidden_size,
@@ -2778,7 +3675,7 @@ class TestTrtllmFp4UnpackedContract:
         num_tokens, hidden_size, top_k = 16, 256, 4
         config = MoEConfig(
             routing=RoutingConfig(num_experts=128, top_k=top_k),
-            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             experts=ExpertConfig(
                 intermediate_size=512,
                 local_expert_offset=32,
@@ -2848,7 +3745,8 @@ class TestTrtllmFp4UnpackedContract:
         config = MoEConfig(
             routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
             quant=QuantConfig(
-                variant=QuantVariant.NVFP4,
+                weight=QuantFormat.NVFP4,
+                activation=QuantFormat.NVFP4,
                 per_token_scale=True,
             ),
             experts=ExpertConfig(
@@ -2995,7 +3893,9 @@ class TestTrtllmEPOffset:
         def run(offset: int) -> torch.Tensor:
             config = MoEConfig(
                 routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-                quant=QuantConfig(variant=QuantVariant.NVFP4),
+                quant=QuantConfig(
+                    weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4
+                ),
                 experts=ExpertConfig(
                     intermediate_size=intermediate_size,
                     local_expert_offset=offset,
@@ -3057,7 +3957,7 @@ class TestTrtllmFromLogitsPackingContract:
 
         config = MoEConfig(
             routing=RoutingConfig(num_experts=num_experts, top_k=top_k),
-            quant=QuantConfig(variant=QuantVariant.NVFP4),
+            quant=QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             experts=ExpertConfig(intermediate_size=512),
         )
         runner = _build_direct_runner(TrtllmFp4RoutedRunner, config, device)
@@ -3362,7 +4262,9 @@ class TestFusedSharedExpertsConfig:
         experts.update(overrides.pop("experts", {}))
         return MoEConfig(
             routing=RoutingConfig(**routing),
-            quant=QuantConfig(variant=QuantVariant.DeepSeekFp8),
+            quant=QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
             experts=ExpertConfig(**experts),
         )
 
@@ -3415,7 +4317,7 @@ class TestFusedSharedExpertsConfig:
 class TestFusedSharedExpertsBackendGating:
     """Backends must opt in before ``check_support()`` accepts S > 0."""
 
-    def _shared_cfg(self, variant):
+    def _shared_cfg(self, quant):
         return MoEConfig(
             routing=RoutingConfig(
                 num_experts=64,
@@ -3425,7 +4327,7 @@ class TestFusedSharedExpertsBackendGating:
                 topk_group=4,
                 routed_scaling_factor=2.5,
             ),
-            quant=QuantConfig(variant=variant),
+            quant=quant,
             experts=ExpertConfig(intermediate_size=512, num_fused_shared_experts=2),
         )
 
@@ -3452,9 +4354,11 @@ class TestFusedSharedExpertsBackendGating:
         for runner_cls in set(_BACKEND_RUNNERS.values()):
             if runner_cls.supports_fused_shared_experts:
                 continue
-            variant = runner_cls.supported_quant_variants[0]
+            pair = runner_cls.supported_quant_variants[0]
             runner = runner_cls.__new__(runner_cls)
-            runner.config = self._shared_cfg(variant)
+            runner.config = self._shared_cfg(
+                QuantConfig(weight=pair[0], activation=pair[1])
+            )
             with pytest.raises(
                 NotImplementedError, match="does not support fused shared experts"
             ):
@@ -3478,21 +4382,21 @@ _RUNNERS = [
     pytest.param(
         TrtllmFp8BlockRunner,
         TrtllmFp8BlockConfig(),
-        QuantVariant.DeepSeekFp8,
-        QuantVariant.MxFp8,
+        QuantConfig(weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8),
+        QuantConfig(weight=QuantFormat.MXFP8, activation=QuantFormat.MXFP8),
         id="fp8_block",
     ),
     pytest.param(
         TrtllmFp4RoutedRunner,
         TrtllmFp4Config(),
-        QuantVariant.NVFP4,
-        QuantVariant.MXFP4,
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+        QuantConfig(weight=QuantFormat.MXFP4, activation=QuantFormat.MXFP8),
         id="fp4",
     ),
     pytest.param(
         TrtllmMxInt4RoutedRunner,
         TrtllmMxInt4Config(),
-        QuantVariant.MxInt4,
+        QuantConfig(weight=QuantFormat.MXINT4, activation=QuantFormat.BF16),
         None,
         id="mxint4",
     ),
@@ -3518,7 +4422,7 @@ def _cache_key_config(backend_cfg, variant, **overrides):
             topk_group=4,
             routed_scaling_factor=2.5,
         ),
-        quant=QuantConfig(variant=variant),
+        quant=variant,
         experts=ExpertConfig(
             intermediate_size=fields["intermediate_size"],
             local_expert_offset=fields["local_expert_offset"],
@@ -3584,6 +4488,153 @@ def test_quant_variant_changes_both_cache_keys(
     assert str(base.get_cache_key_extras([])) != str(other.get_cache_key_extras([]))
 
 
+# ---------------------------------------------------------------------------
+# 4over6 in the tactic cache key
+# ---------------------------------------------------------------------------
+# The recipe changes the quantized activation values a tactic is timed and
+# ranked on, and nothing else in the extras tuple reflects it. Both halves
+# matter: an explicit recipe must separate from ``None`` (off), and an unset
+# field must resolve before it is keyed — otherwise two processes with opposite
+# FLASHINFER_NVFP4_4OVER6 settings write the same ``file_key`` to disk.
+
+
+def _nvfp4_cache_key_config(setting, **overrides):
+    """``_cache_key_config`` for TRT-LLM FP4, with a 4over6 setting attached."""
+    return _cache_key_config(
+        TrtllmFp4Config(),
+        QuantConfig(
+            weight=QuantFormat.NVFP4,
+            activation=QuantFormat.NVFP4,
+            nvfp4_4over6=setting,
+        ),
+        **overrides,
+    )
+
+
+def _extras_for(setting, **overrides):
+    """Build a fresh runner and return its (memory, on-disk) key pair.
+
+    Fresh every time on purpose: ``MoERunner._nvfp4_4over6_key`` is a
+    ``functools.cached_property``, so one instance cannot observe two different
+    environments.
+    """
+    runner = _cache_key_runner(
+        TrtllmFp4RoutedRunner, _nvfp4_cache_key_config(setting, **overrides)
+    )
+    return hash(runner), str(runner.get_cache_key_extras([]))
+
+
+def test_off_and_explicit_recipe_have_different_cache_keys(monkeypatch):
+    _clear_4over6_env(monkeypatch)
+    standard = _extras_for(None)
+    enabled = _extras_for(NVFP44Over6Config())
+    assert standard[0] != enabled[0], (
+        "None and NVFP44Over6Config() share a runner_hash, so one in-memory "
+        "tuned tactic would serve both recipes."
+    )
+    assert standard[1] != enabled[1], (
+        "None and NVFP44Over6Config() share a persisted cache key, so the "
+        "on-disk tactic (which drops runner_hash) collides."
+    )
+
+
+@pytest.mark.parametrize(
+    "a,b",
+    [
+        (NVFP44Over6Config(), NVFP44Over6Config(e4m3_max=256)),
+        (NVFP44Over6Config(), NVFP44Over6Config(err_mode="MSE")),
+        (NVFP44Over6Config(), NVFP44Over6Config(err_use_fast_math=True)),
+    ],
+    ids=["e4m3_max", "err_mode", "err_use_fast_math"],
+)
+def test_every_recipe_field_changes_both_cache_keys(monkeypatch, a, b):
+    _clear_4over6_env(monkeypatch)
+    assert _extras_for(a) != _extras_for(b)
+
+
+def test_unset_cache_key_follows_the_environment(monkeypatch):
+    """An unset field must be *resolved* before it lands in the key.
+
+    The sentinel's ``str`` renders identically in a process running with
+    ``FLASHINFER_NVFP4_4OVER6=1`` and one running without it, so keying the
+    unresolved setting would let a tactic tuned for 4over6 be replayed for
+    standard NVFP4 (and vice versa) through the on-disk cache.
+    """
+    _clear_4over6_env(monkeypatch)
+    env_off = _extras_for(_UNSET)
+
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+    env_on = _extras_for(_UNSET)
+
+    assert env_off[0] != env_on[0]
+    assert env_off[1] != env_on[1]
+
+    # ... and each must agree with the pinned recipe it resolves to, so a
+    # process that pins the recipe reuses the tactics an env-driven process
+    # tuned rather than re-tuning from scratch.
+    assert env_on == _extras_for(NVFP44Over6Config())
+    monkeypatch.delenv("FLASHINFER_NVFP4_4OVER6")
+    assert env_off == _extras_for(None)
+
+
+def test_unset_cache_key_tracks_every_environment_variable(monkeypatch):
+    _clear_4over6_env(monkeypatch)
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "1")
+    base = _extras_for(_UNSET)
+    for name, value, pinned in (
+        ("FLASHINFER_NVFP4_4OVER6_ERR_MODE", "MSE", {"err_mode": "MSE"}),
+        (
+            "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH",
+            "1",
+            {"err_use_fast_math": True},
+        ),
+        ("FLASHINFER_NVFP4_4OVER6_E4M3_USE_256", "1", {"e4m3_max": 256}),
+    ):
+        monkeypatch.setenv(name, value)
+        varied = _extras_for(_UNSET)
+        assert varied != base, f"{name} does not reach the tactic cache key"
+        assert varied == _extras_for(NVFP44Over6Config(**pinned))
+        monkeypatch.delenv(name)
+
+
+def test_4over6_cache_key_element_is_the_canonical_token(monkeypatch):
+    """The keyed element is the shared ``nvfp4_4over6_cache_key`` string.
+
+    A plain ``str`` (not the enum or the dataclass) because
+    ``ProfilingCacheKey.file_key`` stringifies the extras and writes them to
+    disk; reusing the canonical token keeps that file key aligned with the
+    CuTe-DSL kernel-artifact name for the same recipe.
+    """
+    _clear_4over6_env(monkeypatch)
+    for setting, resolved in (
+        (None, None),
+        (NVFP44Over6Config(), NVFP44Over6Config()),
+        (
+            NVFP44Over6Config(e4m3_max=256, err_mode="MSE", err_use_fast_math=True),
+            NVFP44Over6Config(e4m3_max=256, err_mode="MSE", err_use_fast_math=True),
+        ),
+    ):
+        runner = _cache_key_runner(
+            TrtllmFp4RoutedRunner, _nvfp4_cache_key_config(setting)
+        )
+        extras = runner.get_cache_key_extras([])
+        token = nvfp4_4over6_cache_key(resolved)
+        assert token in extras, (
+            f"expected the canonical token {token!r} in the cache-key extras "
+            f"for nvfp4_4over6={setting!r}, got {extras!r}"
+        )
+        assert all(
+            isinstance(e, (int, float, str, bool, tuple, type(None))) for e in extras
+        )
+
+
+def test_4over6_does_not_split_the_key_for_identical_configs(monkeypatch):
+    """Guard the opposite failure: over-keying makes every layer re-tune."""
+    _clear_4over6_env(monkeypatch)
+    for setting in (_UNSET, None, NVFP44Over6Config()):
+        assert _extras_for(setting) == _extras_for(setting)
+
+
 @pytest.mark.parametrize("runner_cls,backend_cfg,variant,alt_variant", _RUNNERS)
 def test_identical_config_shares_cache_key(
     runner_cls, backend_cfg, variant, alt_variant
@@ -3597,6 +4648,47 @@ def test_identical_config_shares_cache_key(
     b = _cache_key_runner(runner_cls, _cache_key_config(backend_cfg, variant))
     assert hash(a) == hash(b)
     assert str(a.get_cache_key_extras([])) == str(b.get_cache_key_extras([]))
+
+
+def test_trtllm_runtime_routing_cache_preserves_runner_hash():
+    """Per-call routing tensor identity must not invalidate a tuned tactic."""
+    moe_op = object()
+
+    def make_runner():
+        return TrtllmKernelRunner(
+            moe_op,
+            top_k=4,
+            num_local_experts=8,
+            dtype_act=DtypeTrtllmGen.E4m3,
+            dtype_weights=DtypeTrtllmGen.E4m3,
+            fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+            hidden_size=128,
+            intermediate_size=128,
+            num_experts=8,
+        )
+
+    def make_inputs():
+        return MoeRunnerInputs(
+            output=torch.empty(4, 128),
+            routing_logits=None,
+            topk_ids=torch.zeros(4, 4, dtype=torch.int32),
+            expert_weights=torch.empty(4, 4),
+            hidden_states=torch.empty(4, 128),
+            hidden_states_scale=None,
+            gemm1_lora_delta=None,
+            per_token_scale=None,
+        )
+
+    first, second = make_runner(), make_runner()
+    first_inputs, second_inputs = make_inputs(), make_inputs()
+    assert hash(first) == hash(second)
+
+    first._make_tuning_config(first_inputs, tune_max_num_tokens=4)
+    second._make_tuning_config(second_inputs, tune_max_num_tokens=4)
+
+    assert first._topk_initializer_cache[0] is first_inputs.topk_ids
+    assert second._topk_initializer_cache[0] is second_inputs.topk_ids
+    assert hash(first) == hash(second)
 
 
 @pytest.mark.parametrize("runner_cls,backend_cfg,variant,alt_variant", _RUNNERS)
@@ -3638,7 +4730,10 @@ def test_cute_dsl_cache_key_extends_unified_fields():
         enable_pdl = True
 
     runner = CuteDslRunner.__new__(CuteDslRunner)
-    runner.config = _cache_key_config(CuteDslConfig(), QuantVariant.NVFP4)
+    runner.config = _cache_key_config(
+        CuteDslConfig(),
+        QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
+    )
     runner._inner = Inner()
 
     shared = MoERunner._cache_key_extras(runner)
@@ -3651,28 +4746,28 @@ def test_cute_dsl_cache_key_extends_unified_fields():
         (
             CutlassBf16Runner,
             CutlassBf16Config(),
-            QuantVariant.BF16,
+            QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             SwiGLU(),
             SwiGLU(alpha=1.7, beta=1.0, limit=7.0),
         ),
         (
             CutlassBf16Runner,
             CutlassBf16Config(),
-            QuantVariant.BF16,
+            QuantConfig(weight=QuantFormat.BF16, activation=QuantFormat.BF16),
             SwiGLUStep(limit=7.0),
             SwiGLUStep(limit=6.0),
         ),
         (
             CuteDslRunner,
             CuteDslConfig(),
-            QuantVariant.NVFP4,
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             SwiGLU(),
             SwiGLU(alpha=1.7, beta=1.0, limit=7.0),
         ),
         (
             CuteDslRunner,
             CuteDslConfig(),
-            QuantVariant.NVFP4,
+            QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4),
             SiTU(gate_scale=1.0, linear_scale=1.0),
             SiTU(gate_scale=2.0, linear_scale=3.0),
         ),
@@ -3716,12 +4811,21 @@ def test_profiling_cache_key_file_key_separates_configs():
     """
     base = _cache_key_runner(
         TrtllmFp8BlockRunner,
-        _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8),
+        _cache_key_config(
+            TrtllmFp8BlockConfig(),
+            QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
+        ),
     )
     other = _cache_key_runner(
         TrtllmFp8BlockRunner,
         _cache_key_config(
-            TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8, intermediate_size=512
+            TrtllmFp8BlockConfig(),
+            QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
+            intermediate_size=512,
         ),
     )
     shared_profile = ((64, 256), (64, 2))
@@ -3753,11 +4857,21 @@ def test_fused_shared_experts_change_both_cache_keys():
     """
     base = _cache_key_runner(
         TrtllmFp8BlockRunner,
-        _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8),
+        _cache_key_config(
+            TrtllmFp8BlockConfig(),
+            QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
+        ),
     )
     keys = {0: (hash(base), str(base.get_cache_key_extras([])))}
     for num_shared in (1, 2):
-        cfg = _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8)
+        cfg = _cache_key_config(
+            TrtllmFp8BlockConfig(),
+            QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
+        )
         cfg = dataclasses.replace(
             cfg,
             experts=dataclasses.replace(
@@ -3817,12 +4931,21 @@ def _cache_key_config_with(backend_cfg, variant, **overrides):
 def test_ranking_relevant_dimension_changes_both_cache_keys(dimension, override):
     base = _cache_key_runner(
         TrtllmFp8BlockRunner,
-        _cache_key_config(TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8),
+        _cache_key_config(
+            TrtllmFp8BlockConfig(),
+            QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
+        ),
     )
     other = _cache_key_runner(
         TrtllmFp8BlockRunner,
         _cache_key_config_with(
-            TrtllmFp8BlockConfig(), QuantVariant.DeepSeekFp8, **override
+            TrtllmFp8BlockConfig(),
+            QuantConfig(
+                weight=QuantFormat.DeepSeekFp8, activation=QuantFormat.DeepSeekFp8
+            ),
+            **override,
         ),
     )
     assert hash(base) != hash(other), f"{dimension} does not change runner_hash"

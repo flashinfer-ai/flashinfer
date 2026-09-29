@@ -540,7 +540,7 @@ def create_allreduce_fusion_workspace(
 
 
 # ============================================================================
-# MAIN API - NO backend parameter, infers from workspace type
+# MAIN API - workspace type selects the AllReduce backend
 # ============================================================================
 
 
@@ -579,12 +579,16 @@ def allreduce_fusion(
     block_quant_group_size: Optional[int] = None,
     # ===== RMSNorm variant =====
     weight_bias: float = 0.0,
+    *,
+    moe_finalize_backend: Literal["trtllm", "cake"] = "trtllm",
 ) -> torch.Tensor:
     r"""AllReduce + RMSNorm fusion operation, with optional FP8/NVFP4
     quantization for supported backends.
 
-    Backend is automatically determined from workspace type. If you need a
-    different backend, create the workspace for that backend.
+    The AllReduce backend is automatically determined from workspace type. If
+    you need a different AllReduce backend, create the workspace for that
+    backend. ``moe_finalize_backend`` only selects the implementation of the
+    MoE finalize pattern on a TRT-LLM workspace.
 
     Supports multiple fusion patterns:
 
@@ -630,8 +634,8 @@ def allreduce_fusion(
         dynamic FP8 patterns (10-11). Packed group quant patterns remain
         TRT-LLM only.
 
-        ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM and
-        the explicit MNNVL CuTe DSL backend.
+        ``kMoEFinalizeARResidualRMSNorm`` is available through TRT-LLM,
+        Cake on a TRT-LLM workspace, and the explicit MNNVL CuTe DSL backend.
     launch_with_pdl : bool
         Use Programmatic Dependent Launch. MNNVL CuTe DSL presets determine
         their compiled PDL mode and warn when it differs from this value.
@@ -712,6 +716,9 @@ def allreduce_fusion(
         Supported by both TRT-LLM and MNNVL backends for standard RMSNorm
         and quant patterns (1-5), and by TRT-LLM for MoE RMSNorm
         variants. Ignored for ``kAllReduce``.
+    moe_finalize_backend : {"trtllm", "cake"}
+        Implementation for ``kMoEFinalizeARResidualRMSNorm`` on a TRT-LLM
+        workspace. Defaults to ``"trtllm"``.
 
     Returns
     -------
@@ -741,6 +748,13 @@ def allreduce_fusion(
     ...     rms_gamma=norm_weight,
     ... )
     """
+    if moe_finalize_backend == "cake" and not isinstance(
+        workspace, TRTLLMAllReduceFusionWorkspace
+    ):
+        raise ValueError(
+            "moe_finalize_backend='cake' requires a TRTLLMAllReduceFusionWorkspace"
+        )
+
     # Dispatch based on workspace type
     if isinstance(workspace, TRTLLMAllReduceFusionWorkspace):
         # TensorRT-LLM backend implementation
@@ -859,6 +873,7 @@ def allreduce_fusion(
                 expert_scale_factor=expert_scale_factor,
                 routed_scaling_factor=None,
                 weight_bias=weight_bias,
+                backend=moe_finalize_backend,
             )
 
             return norm_out

@@ -25,9 +25,11 @@ The FlashInfer candidate is always invoked through the public
 device/shape policy, while ``nonpersistent`` supplies the same explicit
 workspace and packed sequence order used by the historical benchmark to keep
 B200 on the direct schedule family. ``--backend`` selects one public API
-backend per invocation; compare auto, CuTe DSL, and Cake with separate commands
-over the same case set. The resolved backend, logical schedule, physical module
-variants, and target are recorded during untimed warmup. With
+backend per invocation; compare auto, CuTe DSL, Cake, small-BH, and cuDNN with
+separate commands over the same case set. ``--backend cudnn`` runs the fused cuDNN
+SM100 engine, which takes packed input only, so fixed-layout cases are dropped
+and recorded as skip entries. The resolved backend, logical schedule, physical
+module variants, and target are recorded during untimed warmup. With
 ``--flash-kda-peer``, two commit-verified MoonshotAI/FlashKDA measurements are
 reported:
 
@@ -35,11 +37,17 @@ reported:
 * a public-semantics adapter that follows ``_fwd_raw`` with the same-stream
   state copy-back required to emulate ``recurrent_kda`` on FlashKDA.
 
-All paths use the same deterministic tensors and seeds. Preinitialized
-rotating state buffers ensure every timed invocation sees the same initial
-state. The FlashInfer path updates each state slot in place inside the kernel;
-it has no state scratch or copy-back. Allocation, metadata, sequence ordering,
-build/JIT, and state-pool reset are outside the measured region.
+All paths use the same deterministic tensors and seeds. Eager timing rotates
+preinitialized state buffers so every invocation sees the same initial state.
+Graph timing captures one state slot and reinitializes it before each timing
+block; state values then evolve across replays. Eager candidate timing lets
+``recurrent_kda`` allocate its own output, so no backend is charged a copy
+another avoids. CUDA graph capture supplies a stable caller-owned output for
+every backend. The FlashKDA peer scopes keep the preallocated outputs
+``_fwd_raw`` requires. Cake and CuTe DSL update the state slot in the kernel,
+while cuDNN allocates its final state and copies it back inside the timed scope.
+Metadata, sequence ordering, build/JIT, graph capture, and state-pool reset are
+outside the measured region.
 """
 
 import argparse
@@ -54,7 +62,7 @@ from typing import Callable, Optional
 import numpy as np
 import torch
 
-from flashinfer.kda import recurrent_kda
+from flashinfer.kda import RecurrentKDAPrefillWrapper, recurrent_kda
 from flashinfer.kda_prefill import RecurrentKDAPrefillWorkspace
 from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import get_compute_capability
@@ -64,6 +72,7 @@ FLASH_KDA_CUTLASS_COMMIT = "5c149f52a436782210263fb2f19b354443a61c6a"
 DEFAULT_LEGACY_STATE_ROTATIONS = 1024
 DEFAULT_H12_STATE_ROTATIONS = 4096
 DEFAULT_PRODUCTION_STATE_BUDGET_BYTES = 8 * 1024**3
+STATE_DTYPE = torch.bfloat16
 _CUPTI_ESTIMATE_CALLS_PER_BLOCK = 1 + 5
 SUPPORTED_FLASH_KDA_ARCHS = {(10, 0): "sm100a", (10, 3): "sm103a"}
 BENCHMARKS_DIR = Path(__file__).resolve().parent
@@ -85,13 +94,13 @@ class PreparedCase:
     peer_raw_run: Optional[Callable[[], None]]
     peer_adapted_run: Optional[Callable[[], None]]
     reset_state_pools: Callable[[], None]
-    candidate_output: torch.Tensor
     candidate_state_pool: torch.Tensor
     peer_raw_output: Optional[torch.Tensor]
     peer_raw_final_state: Optional[torch.Tensor]
     peer_adapted_output: Optional[torch.Tensor]
     peer_adapted_state_pool: Optional[torch.Tensor]
     state_cursors: dict[str, list[int]]
+    capture_cuda_graphs: Callable[[], dict[str, torch.cuda.CUDAGraph]]
     metadata: dict
 
 
@@ -240,6 +249,36 @@ def _resolve_recorded_cake_route(
     )
 
 
+def _resolve_recorded_generated_cake_route(
+    routes: list[tuple[str, str, str, str]],
+) -> tuple[str, str, list[str]]:
+    """Normalize metadata-selected Cake modules observed during warmup."""
+
+    if not routes:
+        raise RuntimeError("expected at least one generated Cake module")
+    logical_route, _, target, _ = routes[0]
+    if any(route != logical_route for route, _, _, _ in routes):
+        raise RuntimeError(
+            f"expected one generated Cake logical route during warmup, got {routes}"
+        )
+    if any(route_target != target for _, _, route_target, _ in routes):
+        raise RuntimeError(
+            f"expected one generated Cake target during warmup, got {routes}"
+        )
+    roles = [role for _, role, _, _ in routes]
+    expected_roles = (
+        ["bt16_prepare", "main"]
+        if logical_route == "bt16_prepare_chain_m64"
+        else ["main"]
+    )
+    if roles != expected_roles:
+        raise RuntimeError(
+            "expected one generated Cake main module or one ordered BT16 "
+            f"prepare/chain pair during warmup, got {routes}"
+        )
+    return logical_route, target, [variant_id for _, _, _, variant_id in routes]
+
+
 def _default_state_rotations(case: Case) -> int:
     base = (
         DEFAULT_H12_STATE_ROTATIONS
@@ -248,7 +287,7 @@ def _default_state_rotations(case: Case) -> int:
     )
     if case not in PRODUCTION_CASES:
         return base
-    state_bytes = len(case.seq_lens) * case.num_heads * 128 * 128 * 2
+    state_bytes = len(case.seq_lens) * case.num_heads * 128 * 128 * STATE_DTYPE.itemsize
     budget_capacity = max(8, DEFAULT_PRODUCTION_STATE_BUDGET_BYTES // state_bytes)
     return min(base, budget_capacity)
 
@@ -390,6 +429,7 @@ def _make_case(
     state_rotations: int,
     candidate_route: str,
     candidate_backend: str,
+    cuda_graph: bool,
     flash_kda=None,
 ) -> PreparedCase:
     total_tokens = sum(case.seq_lens)
@@ -423,12 +463,12 @@ def _make_case(
             device="cuda",
         )
         * 0.25
-    ).to(torch.bfloat16)
+    ).to(STATE_DTYPE)
     candidate_state_pool = _make_state_pool(initial_state, state_rotations)
-    candidate_output = torch.empty_like(q)
+    candidate_output = torch.empty_like(q) if cuda_graph else None
     candidate_workspace = (
         RecurrentKDAPrefillWorkspace(q.device)
-        if candidate_route == "nonpersistent"
+        if candidate_route == "nonpersistent" and candidate_backend != "cudnn"
         else None
     )
     state_cursors = {"pr": [0], "adapted": [0]}
@@ -439,6 +479,15 @@ def _make_case(
     cu_seqlens = (
         torch.tensor(offsets, dtype=torch.int64, device="cuda") if case.packed else None
     )
+    candidate_packed_wrapper = None
+    candidate_api = recurrent_kda
+
+    def planned_candidate_api(**kwargs):
+        assert candidate_packed_wrapper is not None
+        for name in ("cu_seqlens", "seq_order", "prefill_workspace", "backend"):
+            kwargs.pop(name)
+        return candidate_packed_wrapper.run(**kwargs)
+
     seq_order = (
         torch.tensor(
             sorted(
@@ -449,7 +498,9 @@ def _make_case(
             dtype=torch.int32,
             device="cuda",
         )
-        if case.packed and candidate_route == "nonpersistent"
+        if case.packed
+        and candidate_route == "nonpersistent"
+        and candidate_backend != "cudnn"
         else None
     )
     scale = float(1.0 / np.sqrt(128.0))
@@ -461,7 +512,7 @@ def _make_case(
                 f"PR state rotations exhausted: {state_index} >= {state_rotations}"
             )
         state_cursors["pr"][0] += 1
-        return recurrent_kda(
+        return candidate_api(
             q=q,
             k=k,
             v=v,
@@ -472,7 +523,7 @@ def _make_case(
             scale=scale,
             initial_state=candidate_state_pool[state_index],
             output=candidate_output,
-            output_final_state=False,
+            output_final_state=True,
             use_qk_l2norm_in_kernel=True,
             use_gate_in_kernel=True,
             lower_bound=-5.0,
@@ -570,38 +621,132 @@ def _make_case(
             peer_adapted_state_pool.copy_(initial_state.unsqueeze(0))
             state_cursors["adapted"][0] = 0
 
+    def capture_cuda_graphs() -> dict[str, torch.cuda.CUDAGraph]:
+        """Capture every requested timing path after same-stream warmup."""
+
+        nonlocal candidate_packed_wrapper, candidate_workspace
+
+        def capture(run: Callable[[], object]) -> torch.cuda.CUDAGraph:
+            stream = torch.cuda.Stream(device=q.device)
+            stream.wait_stream(torch.cuda.current_stream(q.device))
+            with torch.cuda.stream(stream):
+                run()
+            stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                run()
+            torch.cuda.synchronize(q.device)
+            return graph
+
+        graphs = {}
+        reset_state_pools()
+        # Captured KDA workspaces are stream-bound and single-capture resources.
+        if candidate_packed_wrapper is not None:
+            assert cu_seqlens is not None
+            candidate_packed_wrapper = RecurrentKDAPrefillWrapper(q.device)
+            candidate_packed_wrapper.plan(cu_seqlens)
+        elif candidate_backend != "cudnn":
+            candidate_workspace = RecurrentKDAPrefillWorkspace(q.device)
+        graphs["pr"] = capture(candidate_run)
+        for name, run in (("raw", peer_raw_run), ("adapted", peer_adapted_run)):
+            if run is not None:
+                reset_state_pools()
+                graphs[name] = capture(run)
+        reset_state_pools()
+        return graphs
+
     # Observe the actual internal module selected by the public API once during
     # untimed warmup. This avoids duplicating dispatcher policy in the evidence
     # harness while keeping route logging out of every timed call.
     kda_prefill_module = import_module("flashinfer.kda_prefill")
     kda_prefill_cute_module = import_module("flashinfer.kda_prefill_cute")
+    small_bh_module = import_module("flashinfer.kda_prefill_cute_small_bh")
+    cudnn_module = import_module("flashinfer.cudnn")
     original_get_module = kda_prefill_module._get_flash_kda_prefill_module
+    original_get_generated_module = kda_prefill_module._get_flash_kda_generated_module
     original_cute_run = kda_prefill_cute_module._run_cute_dsl_kda_prefill
-    resolved_cake_routes = []
-    resolved_backends = []
+    original_small_bh_run = small_bh_module._run_kda_prefill_cute_small_bh
+    original_cudnn_run = cudnn_module.cudnn_recurrent_kda
+    resolved_cake_routes: list[tuple[str, str]] = []
+    resolved_generated_cake_routes: list[tuple[str, str, str, str]] = []
+    resolved_backends: list[str] = []
+    resolved_cudnn_calls: list[str] = []
 
     def recording_get_module(variant, target):
         resolved_cake_routes.append((variant, target))
         return original_get_module(variant, target)
 
+    def recording_get_generated_module(selector_key):
+        metadata, module = original_get_generated_module(selector_key)
+        route = selector_key.get("route")
+        role = selector_key.get("route_role")
+        target = metadata.target
+        variant_id = metadata.variant_id
+        if not all(
+            isinstance(value, str) and value
+            for value in (route, role, target, variant_id)
+        ):
+            raise RuntimeError(
+                "generated Cake route metadata is incomplete during warmup"
+            )
+        resolved_generated_cake_routes.append((route, role, target, variant_id))
+        return metadata, module
+
     def recording_cute_run(**kwargs):
         resolved_backends.append("cute-dsl")
         return original_cute_run(**kwargs)
 
+    def recording_small_bh_run(**kwargs):
+        resolved_backends.append("small-bh")
+        return original_small_bh_run(**kwargs)
+
+    def recording_cudnn_run(*call_args, **kwargs):
+        resolved_cudnn_calls.append("cudnn")
+        return original_cudnn_run(*call_args, **kwargs)
+
     kda_prefill_module._get_flash_kda_prefill_module = recording_get_module
+    kda_prefill_module._get_flash_kda_generated_module = recording_get_generated_module
     kda_prefill_cute_module._run_cute_dsl_kda_prefill = recording_cute_run
+    small_bh_module._run_kda_prefill_cute_small_bh = recording_small_bh_run
+    cudnn_module.cudnn_recurrent_kda = recording_cudnn_run
     try:
         candidate_run()
         torch.cuda.synchronize()
     finally:
         kda_prefill_module._get_flash_kda_prefill_module = original_get_module
+        kda_prefill_module._get_flash_kda_generated_module = (
+            original_get_generated_module
+        )
         kda_prefill_cute_module._run_cute_dsl_kda_prefill = original_cute_run
+        small_bh_module._run_kda_prefill_cute_small_bh = original_small_bh_run
+        cudnn_module.cudnn_recurrent_kda = original_cudnn_run
         reset_state_pools()
-    if resolved_backends:
-        if resolved_backends != ["cute-dsl"] or resolved_cake_routes:
+    has_cake_routes = bool(resolved_cake_routes or resolved_generated_cake_routes)
+    if resolved_cudnn_calls:
+        if len(resolved_cudnn_calls) != 1 or resolved_backends or has_cake_routes:
+            raise RuntimeError(
+                "expected exactly one cuDNN route during warmup, got "
+                f"cudnn={resolved_cudnn_calls}, backends={resolved_backends}, "
+                f"cake={resolved_cake_routes}, "
+                f"generated_cake={resolved_generated_cake_routes}"
+            )
+        resolved_backend = "cudnn"
+        resolved_variant = "frost"
+        resolved_target = "sm100"
+        resolved_physical_variants = ["frost"]
+    elif resolved_backends == ["small-bh"] and not has_cake_routes:
+        if candidate_workspace is None:
+            candidate_workspace = RecurrentKDAPrefillWorkspace(q.device)
+        resolved_backend = "small-bh"
+        resolved_variant = "k1_k2"
+        resolved_target = "bt16"
+        resolved_physical_variants = ["k1", "k2"]
+    elif resolved_backends:
+        if resolved_backends != ["cute-dsl"] or has_cake_routes:
             raise RuntimeError(
                 "expected exactly one CuTe DSL route during warmup, got "
-                f"backends={resolved_backends}, cake={resolved_cake_routes}"
+                f"backends={resolved_backends}, cake={resolved_cake_routes}, "
+                f"generated_cake={resolved_generated_cake_routes}"
             )
         resolved_backend = "cute-dsl"
         decomp_ctas = len(case.seq_lens) * case.num_heads * 2
@@ -609,6 +754,19 @@ def _make_case(
         resolved_variant = "decomp" if decomp_ctas <= sm_count else "engine"
         resolved_target = "bt16"
         resolved_physical_variants = [resolved_variant]
+    elif resolved_generated_cake_routes:
+        if resolved_cake_routes:
+            raise RuntimeError(
+                "expected one Cake loader family during warmup, got "
+                f"legacy={resolved_cake_routes}, "
+                f"generated={resolved_generated_cake_routes}"
+            )
+        resolved_backend = "cake"
+        (
+            resolved_variant,
+            resolved_target,
+            resolved_physical_variants,
+        ) = _resolve_recorded_generated_cake_route(resolved_generated_cake_routes)
     elif resolved_cake_routes:
         resolved_backend = "cake"
         (
@@ -619,8 +777,14 @@ def _make_case(
     else:
         raise RuntimeError(
             "expected one recurrent-KDA prefill route during warmup, got "
-            f"backends={resolved_backends}, cake={resolved_cake_routes}"
+            f"backends={resolved_backends}, cake={resolved_cake_routes}, "
+            f"generated_cake={resolved_generated_cake_routes}"
         )
+    if cuda_graph and resolved_backend == "cute-dsl" and case.packed:
+        assert cu_seqlens is not None
+        candidate_packed_wrapper = RecurrentKDAPrefillWrapper(q.device)
+        candidate_packed_wrapper.plan(cu_seqlens)
+        candidate_api = planned_candidate_api
 
     metadata = {
         "name": case.name,
@@ -632,8 +796,12 @@ def _make_case(
         "physical_variants": resolved_physical_variants,
         "target": resolved_target,
         "candidate_route": candidate_route,
+        "capture_route": (
+            "nonpersistent" if cuda_graph and resolved_backend != "cudnn" else None
+        ),
         "requested_backend": candidate_backend,
         "resolved_backend": resolved_backend,
+        "state_dtype": str(initial_state.dtype).removeprefix("torch."),
         "seed": case.seed,
         "state_rotation_capacity": state_rotations,
     }
@@ -642,13 +810,13 @@ def _make_case(
         peer_raw_run=peer_raw_run,
         peer_adapted_run=peer_adapted_run,
         reset_state_pools=reset_state_pools,
-        candidate_output=candidate_output,
         candidate_state_pool=candidate_state_pool,
         peer_raw_output=peer_raw_output,
         peer_raw_final_state=peer_raw_final_state,
         peer_adapted_output=peer_adapted_output,
         peer_adapted_state_pool=peer_adapted_state_pool,
         state_cursors=state_cursors,
+        capture_cuda_graphs=capture_cuda_graphs,
         metadata=metadata,
     )
 
@@ -661,7 +829,7 @@ def _check_peer(prepared: PreparedCase) -> dict[str, float]:
     assert prepared.peer_adapted_output is not None
     assert prepared.peer_adapted_state_pool is not None
     prepared.reset_state_pools()
-    prepared.candidate_run()
+    candidate_output, _ = prepared.candidate_run()
     prepared.peer_raw_run()
     prepared.peer_adapted_run()
     torch.cuda.synchronize()
@@ -671,7 +839,7 @@ def _check_peer(prepared: PreparedCase) -> dict[str, float]:
     comparisons = (
         (
             "raw_output_max_abs",
-            prepared.candidate_output,
+            candidate_output,
             prepared.peer_raw_output,
         ),
         (
@@ -681,7 +849,7 @@ def _check_peer(prepared: PreparedCase) -> dict[str, float]:
         ),
         (
             "adapted_output_max_abs",
-            prepared.candidate_output,
+            candidate_output,
             prepared.peer_adapted_output,
         ),
         ("adapted_state_max_abs", candidate_state, adapted_state),
@@ -721,6 +889,11 @@ def main() -> None:
     parser.add_argument("--dry-run-iters", type=int, default=20)
     parser.add_argument("--repeat-iters", type=int, default=100)
     parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help="CUPTI-time cold-L2 replays of one pre-captured call per path.",
+    )
+    parser.add_argument(
         "--case-set",
         choices=("all", "legacy", "h12", "small_bh", "production"),
         default="all",
@@ -735,7 +908,8 @@ def main() -> None:
         type=int,
         help=(
             "Override the number of preinitialized same-input state slots per "
-            "mutable path. By default legacy and small-BH cases use "
+            "mutable path. CUDA graph timing defaults to two slots; otherwise "
+            "legacy and small-BH cases use "
             f"{DEFAULT_LEGACY_STATE_ROTATIONS} slots and H12 cases use "
             f"{DEFAULT_H12_STATE_ROTATIONS} slots."
         ),
@@ -751,7 +925,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--backend",
-        choices=("auto", "cute-dsl", "cake"),
+        choices=("auto", "cute-dsl", "cake", "small-bh", "cudnn"),
         default="auto",
         help=(
             "Select one backend for this invocation of the public recurrent_kda "
@@ -835,22 +1009,52 @@ def main() -> None:
         "production": PRODUCTION_CASES,
     }[args.case_set]
     results = []
+    if args.backend == "cudnn":
+        fixed = [case for case in selected_cases if not case.packed]
+        if fixed:
+            names = [case.name for case in fixed]
+            print(
+                f"Skipping {len(fixed)} fixed-layout case(s) under --backend cudnn "
+                f"(packed input only): {', '.join(names)}"
+            )
+            results.extend(
+                {
+                    "name": case.name,
+                    "layout": "fixed",
+                    "requested_backend": args.backend,
+                    "skipped": True,
+                    "skip_reason": (
+                        "the cuDNN linear-attention engines accept packed THD "
+                        "input only"
+                    ),
+                }
+                for case in fixed
+            )
+            selected_cases = [case for case in selected_cases if case.packed]
     for case in selected_cases:
         state_rotations = args.state_rotations
         if state_rotations is None:
-            state_rotations = _default_state_rotations(case)
-        dry_run_iters, repeat_iters = _timing_iteration_budget(
-            state_rotation_capacity=state_rotations,
-            requested_dry_run_iters=args.dry_run_iters,
-            requested_repeat_iters=args.repeat_iters,
-        )
+            state_rotations = 2 if args.cuda_graph else _default_state_rotations(case)
+        if args.cuda_graph:
+            if state_rotations < 2:
+                parser.error("--cuda-graph requires at least two state rotations")
+            dry_run_iters, repeat_iters = args.dry_run_iters, args.repeat_iters
+        else:
+            dry_run_iters, repeat_iters = _timing_iteration_budget(
+                state_rotation_capacity=state_rotations,
+                requested_dry_run_iters=args.dry_run_iters,
+                requested_repeat_iters=args.repeat_iters,
+            )
         timing_iteration_budget = {
             "cupti_estimate_calls": _CUPTI_ESTIMATE_CALLS_PER_BLOCK,
             "dry_run_iters": dry_run_iters,
             "repeat_iters": repeat_iters,
             "total_stateful_calls_per_block": (
-                _CUPTI_ESTIMATE_CALLS_PER_BLOCK + dry_run_iters + repeat_iters
+                0
+                if args.cuda_graph
+                else _CUPTI_ESTIMATE_CALLS_PER_BLOCK + dry_run_iters + repeat_iters
             ),
+            "graph_capture_stateful_calls_per_path": 2 if args.cuda_graph else 0,
             "state_rotation_capacity": state_rotations,
             "low_sample_count": repeat_iters < 10,
         }
@@ -859,6 +1063,7 @@ def main() -> None:
             state_rotations=state_rotations,
             candidate_route=args.candidate_route,
             candidate_backend=args.backend,
+            cuda_graph=args.cuda_graph,
             flash_kda=flash_kda,
         )
         result = {**prepared.metadata, "hardware": hardware}
@@ -866,9 +1071,14 @@ def main() -> None:
             prepared.reset_state_pools()
             prepared.candidate_run()
             torch.cuda.synchronize()
+            candidate_run: Callable[[], object] = prepared.candidate_run
+            captured_graphs = None
+            if args.cuda_graph:
+                captured_graphs = prepared.capture_cuda_graphs()
+                candidate_run = captured_graphs["pr"].replay
             prepared.reset_state_pools()
             candidate_ms, candidate_samples = _measure(
-                prepared.candidate_run,
+                candidate_run,
                 dry_run_iters=dry_run_iters,
                 repeat_iters=repeat_iters,
             )
@@ -893,19 +1103,24 @@ def main() -> None:
                     **correctness,
                 }
             )
+            timing_runs: dict[str, Callable[[], object]] = {
+                "pr": prepared.candidate_run,
+                "raw": prepared.peer_raw_run,
+                "adapted": prepared.peer_adapted_run,
+            }
+            captured_graphs = None
+            if args.cuda_graph:
+                captured_graphs = prepared.capture_cuda_graphs()
+                timing_runs = {
+                    name: graph.replay for name, graph in captured_graphs.items()
+                }
             samples = {"pr": [], "raw": [], "adapted": []}
             block_medians = {"pr": [], "raw": [], "adapted": []}
             state_slots_used = {"pr": [], "adapted": []}
             # Symmetric ABCCBA order bounds temperature/clock drift while
             # retaining two independent medians for every timing scope.
-            for backend, run in (
-                ("pr", prepared.candidate_run),
-                ("raw", prepared.peer_raw_run),
-                ("adapted", prepared.peer_adapted_run),
-                ("adapted", prepared.peer_adapted_run),
-                ("raw", prepared.peer_raw_run),
-                ("pr", prepared.candidate_run),
-            ):
+            for backend in ("pr", "raw", "adapted", "adapted", "raw", "pr"):
+                run = timing_runs[backend]
                 prepared.reset_state_pools()
                 torch.cuda.synchronize()
                 block_median, block_samples = _measure(
@@ -951,7 +1166,8 @@ def main() -> None:
                         "raw_fwd_plus_public_state_copy_back"
                     ),
                     "pair_order": "PR/raw/adapted/adapted/raw/PR",
-                    "same_initial_state_per_timed_call": True,
+                    "same_initial_state_per_timed_call": not args.cuda_graph,
+                    "graph_state_reinitialized_per_block": args.cuda_graph,
                     "state_slots_used_per_block": state_slots_used,
                     "flash_kda_peer_provenance": peer_provenance,
                 }
@@ -965,8 +1181,12 @@ def main() -> None:
                 "block_medians_ms": candidate_block_medians,
                 "timing_backend": "cupti",
                 "cold_l2": True,
-                "cuda_graph": False,
-                "timing_scope": ("public_recurrent_kda_with_inplace_state_update"),
+                "cuda_graph": args.cuda_graph,
+                "timing_scope": (
+                    "cuda_graph_replay_with_inplace_state_update"
+                    if args.cuda_graph
+                    else "public_recurrent_kda_with_inplace_state_update"
+                ),
                 "requested_dry_run_iters": args.dry_run_iters,
                 "requested_repeat_iters": args.repeat_iters,
                 "timing_iteration_budget": timing_iteration_budget,

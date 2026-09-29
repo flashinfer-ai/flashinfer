@@ -73,6 +73,7 @@ cache_permute_indices: Dict[tuple, torch.Tensor] = {}
         pytest.param(ActivationType.Relu2, id="Relu2"),
     ],
 )
+@pytest.mark.parametrize("zero_rows", [False, True])
 def test_routed_fused_moe(
     num_tokens: int,
     hidden_size: int,
@@ -82,6 +83,7 @@ def test_routed_fused_moe(
     use_4over6: bool,
     weights_use_4over6: bool,
     activation_type: ActivationType,
+    zero_rows: bool,
 ):
     device = torch.device("cuda:0")
     compute_capability = get_compute_capability(torch.device(device="cuda"))
@@ -109,6 +111,12 @@ def test_routed_fused_moe(
         )
         * 0.1
     )
+    if zero_rows:
+        if is_gated:
+            pytest.skip("zero_rows targets non-gated activations")
+        hidden_states_bf16 = hidden_states_bf16.abs() + 0.1
+        hidden_states_bf16[0] = 0  # all-zero input row for the input quant
+        w13_bf16 = -(w13_bf16.abs() + 0.01)
     w2_bf16 = (
         torch.randn(
             num_experts,
@@ -361,4 +369,9 @@ def test_routed_fused_moe(
 
     torch.cuda.synchronize()
 
+    if zero_rows:
+        assert torch.all(reference == 0)
+        assert torch.isfinite(result).all(), "NaN/inf from all-zero per-token rows"
+        assert torch.all(result == 0)
+        return
     check_accuracy(reference, result, atol=0.1, rtol=0.85, percent=0.9)

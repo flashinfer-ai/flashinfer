@@ -45,6 +45,20 @@ from tests.test_helpers.utils_fp4 import nvfp4_global_encode_scale_te
 
 from . import utils as moe_utils
 
+_CUTLASS_MOE_SUPPORTED_ARCHES = {
+    (8, 9),
+    (9, 0),
+    (10, 0),
+    (10, 3),
+    (11, 0),
+    (12, 0),
+    (12, 1),
+}
+_CUTLASS_MOE_ARCH_SKIP = pytest.mark.skipif(
+    get_compute_capability(torch.device("cuda")) not in _CUTLASS_MOE_SUPPORTED_ARCHES,
+    reason="CUTLASS fused MoE is not supported on this architecture",
+)
+
 pytestmark = pytest.mark.solo
 
 FLOAT4_E2M1_MAX = 6.0
@@ -429,6 +443,7 @@ EP_TOP_K = [2]
     ],
     ids=["swiglu", "swiglustep", "situ_default", "situ_per_expert"],
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe(
     batch_size,
     hidden_size,
@@ -543,6 +558,7 @@ def compute_with_experts_gelu_tanh(
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate_size):
     """Gated tanh-GELU activation (ActivationType.GegluTanh) on the bf16 CUTLASS
     MoE path. Same shapes / weight-split convention as the SwiGLU ``test_moe``,
@@ -592,6 +608,7 @@ def test_moe_gelu_tanh(batch_size, hidden_size, num_experts, top_k, intermediate
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_unfused_finalize(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
@@ -666,6 +683,7 @@ def test_moe_unfused_finalize(
     [ActivationType.Swiglu, ActivationType.SwigluStep, ActivationType.Situ],
     ids=["swiglu", "swiglustep", "situ"],
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_fp8(
     batch_size,
     hidden_size,
@@ -770,10 +788,13 @@ def test_moe_fp8(
     ids=["swiglu", "swiglustep", "relu2"],
 )
 @pytest.mark.parametrize("use_4over6", [False, True])
+# use_autotune=True is regression coverage for issue #4003 (NVFP4 autotune crash).
+@pytest.mark.parametrize("use_autotune", [False, True])
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4(
     batch_size,
     hidden_size,
@@ -785,6 +806,7 @@ def test_moe_nvfp4(
     quantized_input,
     activation_type,
     use_4over6,
+    use_autotune,
 ):
     # Skip invalid configurations
     if top_k > num_experts:
@@ -875,19 +897,20 @@ def test_moe_nvfp4(
     input_sf = None
     if quantized_input:
         hidden_states, input_sf = fp4_quantize(x, a1_gs)
-    _ = fused_moe.cutlass_fused_moe(
-        hidden_states,
-        selected_experts.to(torch.int),
-        routing_weights,
-        w1_q.contiguous().view(torch.long),
-        w2_q.contiguous().view(torch.long),
-        otype,
-        quant_scales=quant_scales,
-        input_sf=input_sf,
-        output=flash_output,
-        activation_type=activation_type,
-        swiglu_limit=swiglu_limit,
-    )
+    with autotune(True) if use_autotune else nullcontext():
+        _ = fused_moe.cutlass_fused_moe(
+            hidden_states,
+            selected_experts.to(torch.int),
+            routing_weights,
+            w1_q.contiguous().view(torch.long),
+            w2_q.contiguous().view(torch.long),
+            otype,
+            quant_scales=quant_scales,
+            input_sf=input_sf,
+            output=flash_output,
+            activation_type=activation_type,
+            swiglu_limit=swiglu_limit,
+        )
 
     # Ref check
     a_fp4, a_scale_interleaved = fp4_quantize(x, a1_gs)
@@ -940,6 +963,7 @@ def test_moe_nvfp4(
 @pytest.mark.parametrize("num_experts", EP_NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", EP_TOP_K)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_expert_parallel(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
@@ -1036,6 +1060,7 @@ TP_SIZES = [2, 4]
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("tp_size", TP_SIZES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_tensor_parallel(
     batch_size, hidden_size, num_experts, tp_size, intermediate_size
 ):
@@ -1143,6 +1168,7 @@ def test_moe_tensor_parallel(
 @pytest.mark.parametrize("top_k", EP_TOP_K)
 @pytest.mark.parametrize("tp_size", TP_SIZES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_tensor_expert_parallel(
     batch_size, hidden_size, num_experts, top_k, tp_size, intermediate_size
 ):
@@ -1361,6 +1387,7 @@ def dequantize_block(
 @pytest.mark.parametrize("num_experts", NUM_EXPERTS)
 @pytest.mark.parametrize("top_k", TOP_K_VALUES)
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_fp8_block_scaling(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
@@ -1560,6 +1587,7 @@ def dequant_mxfp8_batches(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_mxfp8_mxfp4(
     batch_size,
     hidden_size,
@@ -1699,6 +1727,7 @@ def test_moe_mxfp8_mxfp4(
     torch.cuda.get_device_capability()[0] not in [10],
     reason="MXFP8xMXFP8 is only supported on SM100 for now",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_mxfp8_mxfp8(
     batch_size,
     hidden_size,
@@ -1823,6 +1852,7 @@ def dequant_mxfp4_batches_host(
     torch.cuda.get_device_capability()[0] != 9,
     reason="BF16xMXFP4 is only supported on SM90",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_bf16_mxfp4(
     batch_size,
     hidden_size,
@@ -1937,6 +1967,7 @@ def test_moe_bf16_mxfp4(
 @pytest.mark.parametrize("intermediate_size", INTERMEDIATE_SIZES)
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("use_autotune", [False, True])
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_w4a8(
     batch_size: int,
     hidden_size: int,
@@ -2105,6 +2136,7 @@ def test_moe_w4a8(
     not is_sm100a_supported(torch.device("cuda")),
     reason="NVFP4 is only supported on SM100+",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_unswizzled_input_sf():
     """Test cutlass_fused_moe with swizzled_input_sf=False (linear layout input_sf).
 
@@ -2262,6 +2294,7 @@ def test_moe_nvfp4_unswizzled_input_sf():
     and not is_sm12x_supported(torch.device("cuda")),
     reason="NVFP4 is only supported on SM100+",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_unaligned_hidden_size(
     batch_size,
     hidden_size,
@@ -2441,6 +2474,7 @@ NDIM_PADDING_INTERMEDIATE_SIZES = [768, 1024]
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="NVFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_nvfp4_ndim_padding_safety(
     batch_size,
     hidden_size,
@@ -2599,6 +2633,7 @@ def test_moe_nvfp4_ndim_padding_safety(
     torch.cuda.get_device_capability()[0] not in [10, 11, 12],
     reason="MXFP8xMXFP4 is only supported on SM100, SM110 and SM120/SM121",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_mxfp8_mxfp4_ndim_padding_safety(
     batch_size,
     hidden_size,
@@ -3183,6 +3218,7 @@ def _run_w4a16_moe_hopper(
     W4A16_CORRECTNESS_CONFIGS,
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in W4A16_CORRECTNESS_CONFIGS],
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_bf16_mxfp4_hopper_correctness(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
@@ -3200,6 +3236,7 @@ def test_moe_bf16_mxfp4_hopper_correctness(
     W4A16_COVERAGE_CONFIGS,
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}_n{c[4]}" for c in W4A16_COVERAGE_CONFIGS],
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_bf16_mxfp4_hopper_coverage(
     batch_size, hidden_size, num_experts, top_k, intermediate_size
 ):
@@ -3224,6 +3261,7 @@ def test_moe_bf16_mxfp4_hopper_coverage(
     W4A16_ACTIVATION_CONFIGS,
     ids=["swiglu_default", "alpha_0.5", "alpha_1.702"],
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_bf16_mxfp4_hopper_activations(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, alpha, beta, limit
 ):
@@ -3249,6 +3287,7 @@ def test_moe_bf16_mxfp4_hopper_activations(
     ids=list(PHASE3_HUMMING_E2E_CASES.keys()),
 )
 @pytest.mark.parametrize("use_autotune", [False, True])
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
     case_name, case, use_autotune
 ):
@@ -3483,6 +3522,75 @@ def test_moe_fp8_mxfp4_humming_prescale_hopper_correctness(
         assert_flash_output(profile_label, run_flash())
 
 
+@pytest.mark.skipif(
+    not is_sm90a_supported(torch.device("cuda")),
+    reason="FP8xMXFP4 Humming tiny-amax regression requires SM90",
+)
+@pytest.mark.parametrize("tiny_stage", ["input", "post_activation"])
+@_CUTLASS_MOE_ARCH_SKIP
+def test_moe_fp8_mxfp4_humming_tiny_amax_stays_finite(tiny_stage):
+    """A tiny nonzero row must not overflow its dynamic FP8 scale."""
+    torch.manual_seed(29)
+    device = torch.device("cuda")
+    e, m, n, k = 1, 1, 512, 512
+
+    if tiny_stage == "input":
+        x = torch.full((m, k), 3e-37, device=device, dtype=torch.bfloat16)
+        fc1_expert_residual_scale = torch.ones(e, device=device)
+    else:
+        x = (torch.randn(m, k, device=device) * 0.05).to(torch.bfloat16)
+        fc1_expert_residual_scale = torch.full((e,), 3e-18, device=device)
+    w1 = torch.randint(0, 256, (e, 2 * n, k // 2), device=device, dtype=torch.uint8)
+    w2 = torch.randint(0, 256, (e, k, n // 2), device=device, dtype=torch.uint8)
+    w1_raw_scale = torch.full(
+        (e, 2 * n, k // 32), 122, device=device, dtype=torch.uint8
+    )
+    w2_raw_scale = torch.full((e, k, n // 32), 122, device=device, dtype=torch.uint8)
+
+    w1_processed, w1_exp_offset, _ = (
+        fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+            w1, w1_raw_scale, interleave=False
+        )
+    )
+    w2_processed, w2_exp_offset, w2_residual = (
+        fused_moe.preprocess_moe_weights_for_sm90_mixed_gemm_humming(
+            w2, w2_raw_scale, interleave=False
+        )
+    )
+    w1_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w1_processed, "fp4_fp8"
+    )
+    w2_il = fused_moe.interleave_moe_weights_for_sm90_mixed_gemm(
+        w2_processed, "fp4_fp8"
+    )
+    w1_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w1_exp_offset)
+    w2_scale_il = fused_moe.interleave_moe_scales_for_sm90_mixed_gemm(w2_exp_offset)
+
+    selected_experts = torch.zeros((m, 1), device=device, dtype=torch.int32)
+    routing_weights = torch.ones((m, 1), device=device, dtype=torch.float32)
+    output = torch.zeros((m, k), device=device, dtype=torch.bfloat16)
+    fused_moe.cutlass_fused_moe(
+        x,
+        selected_experts,
+        routing_weights,
+        w1_il,
+        w2_il,
+        torch.bfloat16,
+        quant_scales=[
+            w1_scale_il.view(torch.int32),
+            fc1_expert_residual_scale,
+            torch.ones((), device=device, dtype=torch.float32),
+            w2_scale_il.view(torch.int32),
+            w2_residual * 64.0,
+        ],
+        use_w4_group_scaling=True,
+        use_wfp4afp8_humming=True,
+        output=output,
+    )
+
+    assert torch.isfinite(output).all()
+
+
 # W4A8 Hopper interleaved path.
 #
 # Strict-tolerance envelope: h == intermediate_size == 512 with e == 2 only.
@@ -3655,6 +3763,7 @@ def _run_w4a8_moe_hopper(
     ids=[f"m{c[0]}_h{c[1]}_e{c[2]}_k{c[3]}" for c in W4A8_CORRECTNESS_CONFIGS],
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_w4a8_hopper_correctness(
     batch_size, hidden_size, num_experts, top_k, intermediate_size, dtype
 ):
@@ -3667,6 +3776,7 @@ def test_moe_w4a8_hopper_correctness(
     not is_sm90a_supported(torch.device("cuda")),
     reason="W4A8 MoE (Hopper mixed-input) requires SM90",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_moe_w4a8_hopper_autotune():
     _run_w4a8_moe_hopper(4, 512, 2, 2, 512, dtype=torch.bfloat16, use_autotune=True)
 
@@ -3675,6 +3785,7 @@ def test_moe_w4a8_hopper_autotune():
     not is_sm90a_supported(torch.device("cuda")),
     reason="W4A8 MoE (Hopper mixed-input) requires SM90",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_exact_size_accepted_with_packed_weights():
     _run_w4a8_moe_hopper(
         1,
@@ -3690,21 +3801,6 @@ def test_workspace_exact_size_accepted_with_packed_weights():
 # ---------------------------------------------------------------------------
 # Workspace buffer tests (issue #3364, Option A)
 # ---------------------------------------------------------------------------
-_WS_CUTLASS_MOE_SUPPORTED_ARCHES = {
-    (8, 9),
-    (9, 0),
-    (10, 0),
-    (10, 3),
-    (11, 0),
-    (12, 0),
-    (12, 1),
-}
-_WS_CUTLASS_MOE_SKIP = pytest.mark.skipif(
-    get_compute_capability(torch.device("cuda"))
-    not in _WS_CUTLASS_MOE_SUPPORTED_ARCHES,
-    reason="CUTLASS fused MoE is not supported on this architecture",
-)
-
 _WS_CFG = dict(
     hidden_size=256,
     intermediate_size=512,
@@ -3764,14 +3860,14 @@ def _ws_size(num_tokens, cfg=_WS_CFG, *, ep_size=1, ep_rank=0, device=None):
     )
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_size_positive_and_monotonic():
     sizes = [_ws_size(n) for n in [256, 1024, 4096, 8192]]
     assert all(s > 0 for s in sizes)
     assert all(sizes[i] <= sizes[i + 1] for i in range(len(sizes) - 1))
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_buffered_matches_unbuffered():
     inputs = _make_ws_inputs(256)
     out_unbuf = _call_ws(*inputs)[0]
@@ -3780,14 +3876,14 @@ def test_workspace_buffered_matches_unbuffered():
     torch.testing.assert_close(out_unbuf, out_buf, rtol=0, atol=0)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_exact_size_accepted():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(_ws_size(256), dtype=torch.uint8, device="cuda")
     _call_ws(*inputs, workspace_buffer=ws)  # must not raise
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_exact_size_accepted_with_ep():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(
@@ -3798,7 +3894,7 @@ def test_workspace_exact_size_accepted_with_ep():
     _call_ws(*inputs, workspace_buffer=ws, ep_size=2, ep_rank=0)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_undersized_rejected():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(1, dtype=torch.uint8, device="cuda")
@@ -3806,7 +3902,7 @@ def test_workspace_undersized_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_wrong_dtype_rejected():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(_ws_size(256), dtype=torch.float32, device="cuda")
@@ -3814,7 +3910,7 @@ def test_workspace_wrong_dtype_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_cpu_tensor_rejected():
     inputs = _make_ws_inputs(256)
     ws = torch.empty(_ws_size(256), dtype=torch.uint8, device="cpu")
@@ -3822,11 +3918,11 @@ def test_workspace_cpu_tensor_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2,
     reason="workspace device-guard test requires two CUDA devices",
 )
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_device_tracks_input_not_current_device():
     with torch.cuda.device(1):
         inputs = _make_ws_inputs(64)
@@ -3843,7 +3939,7 @@ def test_workspace_device_tracks_input_not_current_device():
             _call_ws(*inputs, workspace_buffer=wrong_device_ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_wrong_ndim_rejected():
     inputs = _make_ws_inputs(256)
     n = _ws_size(256)
@@ -3852,7 +3948,7 @@ def test_workspace_wrong_ndim_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_noncontiguous_rejected():
     inputs = _make_ws_inputs(64)
     n = _ws_size(64)
@@ -3863,7 +3959,7 @@ def test_workspace_noncontiguous_rejected():
         _call_ws(*inputs, workspace_buffer=ws)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_size_rejects_nonpositive_dims():
     from flashinfer.fused_moe.core import cutlass_fused_moe_workspace_size
 
@@ -3893,7 +3989,7 @@ def test_workspace_size_rejects_nonpositive_dims():
         )
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_no_alloc_during_buffered_call():
     inputs = _make_ws_inputs(512)
     ws = torch.empty(_ws_size(512), dtype=torch.uint8, device="cuda")
@@ -3914,7 +4010,7 @@ def test_workspace_no_alloc_during_buffered_call():
     )
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_workspace_cuda_graph_capture_replay():
     num_tokens = 128
     inputs = _make_ws_inputs(num_tokens)
@@ -3944,7 +4040,7 @@ def _small_moe_inputs(m, hidden, inter, e, top_k, dtype=torch.bfloat16):
     return w31, w2, weights.float().contiguous(), ids.to(torch.int)
 
 
-@_WS_CUTLASS_MOE_SKIP
+@_CUTLASS_MOE_ARCH_SKIP
 def test_vectorized_kernel_rejects_misaligned_input():
     """The vectorized expand/activation kernels need 16B-aligned rows; a
     misaligned input base must fail fast on the host with a clear diagnostic
