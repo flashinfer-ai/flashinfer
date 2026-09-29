@@ -32,13 +32,16 @@ from flashinfer.fused_moe import (
     prims_ts_fp8_block_scale_moe,
     prims_ts_fp8_block_scale_routed_moe,
 )
-from flashinfer.prims_ts.utils import is_prims_ts_available
 from flashinfer.prims_ts.moe.config_mapper import (
     map_trtllm_deepseek_fp8_moe_tactic,
     valid_prims_ts_deepseek_fp8_moe_tactics,
 )
+from flashinfer.prims_ts import (
+    is_prims_ts_available,
+    is_prims_ts_device_supported,
+)
 from flashinfer.tllm_enums import ActivationType, Fp8QuantizationType
-from flashinfer.utils import device_support_pdl, get_compute_capability
+from flashinfer.utils import device_support_pdl
 
 
 @pytest.fixture(scope="module")
@@ -46,9 +49,9 @@ def cache_permute_indices():
     return {}
 
 
-def _skip_prims_ts_on_sm107() -> None:
-    if get_compute_capability(torch.device("cuda")) == (10, 7):
-        pytest.skip("Prims-TS MoE kernels support SM100 and SM103, not SM107")
+def _skip_if_prims_ts_device_unsupported() -> None:
+    if not is_prims_ts_device_supported(torch.device("cuda")):
+        pytest.skip("Prims-TS MoE kernels do not support this device")
 
 
 def _find_native_mxfp8_tactic(tile_n: int, tile_k: int) -> tuple[int, int]:
@@ -87,7 +90,7 @@ def test_prims_ts_fp8_block_scale_moe_smoke(
     case_id,
     cache_permute_indices,
 ):
-    _skip_prims_ts_on_sm107()
+    _skip_if_prims_ts_device_unsupported()
     if case_id == "deepseek":
         num_tokens = 128
         hidden_size = 512
@@ -136,7 +139,7 @@ def test_prims_ts_fp8_block_scale_moe_smoke(
 def test_prims_ts_deepseek_fp8_block_scale_tile16_smoke(
     cache_permute_indices,
 ):
-    _skip_prims_ts_on_sm107()
+    _skip_if_prims_ts_device_unsupported()
     run_moe_test(
         num_tokens=128,
         hidden_size=512,
@@ -190,6 +193,7 @@ def test_prims_ts_deepseek_native_mxfp8_tile8_stays_close_to_true_dsfp8(
     dataflow. The ordinary-FP32 case keeps the production checkpoint-scale
     approximation in scope and guards its end-to-end relative-L2 envelope.
     """
+    _skip_if_prims_ts_device_unsupported()
     from flashinfer.autotuner import AutoTuner
 
     def make_moe(*, use_mxfp8_backed_dsfp8):
@@ -280,6 +284,7 @@ def test_prims_ts_deepseek_native_mxfp8_tile256_matches_tile128(
     tile_k,
 ):
     """Tile-N256 preserves the validated tile-N128 fused-MX result."""
+    _skip_if_prims_ts_device_unsupported()
     from flashinfer.autotuner import AutoTuner
 
     tuner = AutoTuner.get()
@@ -334,7 +339,7 @@ def test_prims_ts_deepseek_native_mxfp8_tile256_matches_tile128(
 
 
 def test_prims_ts_deepseek_fp8_accepts_fp32_logits(cache_permute_indices):
-    _skip_prims_ts_on_sm107()
+    _skip_if_prims_ts_device_unsupported()
     run_moe_test(
         num_tokens=32,
         hidden_size=512,
@@ -383,7 +388,7 @@ def test_prims_ts_mxfp8_block_scale_bias(
     cache_permute_indices,
 ):
     if moe_gemm_backend is MoeGemmBackend.PRIMS_TS:
-        _skip_prims_ts_on_sm107()
+        _skip_if_prims_ts_device_unsupported()
     num_tokens = 32
     hidden_size = 512
     intermediate_size = 512
@@ -460,10 +465,7 @@ def test_prims_ts_fp8_block_scale_routed_modes_match_logits(
     use_mxfp8_backed_dsfp8,
 ):
     """Packed and unpacked Prims-TS routed inputs match the logits path."""
-    _skip_prims_ts_on_sm107()
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10]:
-        pytest.skip("These tests are only guaranteed to work on SM100 and SM103 GPUs.")
+    _skip_if_prims_ts_device_unsupported()
     if not is_prims_ts_available():
         pytest.skip("Prims-TS dependencies are unavailable")
 

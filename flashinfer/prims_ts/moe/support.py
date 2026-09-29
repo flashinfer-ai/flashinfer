@@ -23,7 +23,10 @@ from typing import Any, Sequence
 
 import torch
 
-from flashinfer.prims_ts.utils import is_prims_ts_available
+from flashinfer.prims_ts.utils import (
+    is_prims_ts_available,
+    is_prims_ts_device_supported,
+)
 from flashinfer.tllm_enums import (
     ActivationType,
     DtypeTrtllmGen,
@@ -31,7 +34,6 @@ from flashinfer.tllm_enums import (
     RoutingMethodType,
     WeightLayout,
 )
-from flashinfer.utils import get_compute_capability
 
 _SUPPORTED_ACTIVATIONS = (
     ActivationType.Identity,
@@ -151,13 +153,6 @@ def _validate_block_major_k_storage_matches_config(
     return True, ""
 
 
-def _device_supports_prims_ts(device: torch.device) -> bool:
-    if device.type != "cuda" or not torch.cuda.is_available():
-        return False
-    major, minor = get_compute_capability(device)
-    return (major, minor) in ((10, 0), (10, 3))
-
-
 def _has_gemm1_oa_params(kwargs: dict[str, Any]) -> bool:
     return (
         kwargs.get("gemm1_alpha") is not None
@@ -261,7 +256,7 @@ def is_prims_ts_bf16_supported(
     hidden_states = moe_inputs.hidden_states
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
-    if not _device_supports_prims_ts(hidden_states.device):
+    if not is_prims_ts_device_supported(hidden_states.device):
         return False, "requires an SM100 or SM103 CUDA device"
     if not _enum_eq(runner.dtype_act, DtypeTrtllmGen.Bfloat16) or not _enum_eq(
         runner.dtype_weights, DtypeTrtllmGen.Bfloat16
@@ -337,7 +332,7 @@ def is_prims_ts_nvfp4_supported(
     hidden_states = moe_inputs.hidden_states
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
-    if not _device_supports_prims_ts(hidden_states.device):
+    if not is_prims_ts_device_supported(hidden_states.device):
         return False, "requires an SM100 or SM103 CUDA device"
     if not _enum_eq(runner.dtype_act, DtypeTrtllmGen.E2m1) or not _enum_eq(
         runner.dtype_weights, DtypeTrtllmGen.E2m1
@@ -424,7 +419,7 @@ def is_prims_ts_mxfp4_mxfp8_supported(
     hidden_states = moe_inputs.hidden_states
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
-    if not _device_supports_prims_ts(hidden_states.device):
+    if not is_prims_ts_device_supported(hidden_states.device):
         return False, "requires an SM100 or SM103 CUDA device"
     if not _enum_eq(runner.dtype_act, DtypeTrtllmGen.MxE4m3) or not _enum_eq(
         runner.dtype_weights, DtypeTrtllmGen.MxE2m1
@@ -507,7 +502,7 @@ def is_prims_ts_mxfp4_bf16_supported(
     hidden_states = moe_inputs.hidden_states
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
-    if not _device_supports_prims_ts(hidden_states.device):
+    if not is_prims_ts_device_supported(hidden_states.device):
         return False, "requires an SM100 or SM103 CUDA device"
     if not _enum_eq(runner.dtype_act, DtypeTrtllmGen.Bfloat16) or not _enum_eq(
         runner.dtype_weights, DtypeTrtllmGen.MxE2m1
@@ -591,7 +586,7 @@ def is_prims_ts_fp8_per_tensor_supported(
     hidden_states = moe_inputs.hidden_states
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
-    if not _device_supports_prims_ts(hidden_states.device):
+    if not is_prims_ts_device_supported(hidden_states.device):
         return False, "requires an SM100 or SM103 CUDA device"
     if not _enum_eq(runner.dtype_act, DtypeTrtllmGen.E4m3) or not _enum_eq(
         runner.dtype_weights, DtypeTrtllmGen.E4m3
@@ -723,7 +718,7 @@ def is_prims_ts_fp8_block_scale_supported(
     hidden_states = moe_inputs.hidden_states
     if not is_prims_ts_available():
         return False, "nvidia-cutlass-dsl Prims-TS dependencies are not importable"
-    if not _device_supports_prims_ts(hidden_states.device):
+    if not is_prims_ts_device_supported(hidden_states.device):
         return False, "requires an SM100 or SM103 CUDA device"
     if hidden_states.dtype != torch.float8_e4m3fn:
         return False, "hidden_states must be float8_e4m3fn"
