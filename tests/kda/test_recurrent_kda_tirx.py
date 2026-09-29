@@ -460,3 +460,18 @@ def test_tirx_kda_large_values(lengths, packed, scale):
     assert torch.isfinite(out).all() and torch.isfinite(state).all()
     torch.testing.assert_close(out.float() / scale, base[0].float(), atol=0, rtol=0)
     torch.testing.assert_close(state / scale, base[1], atol=0, rtol=0)
+
+
+def test_tirx_kda_fused_decoration_precision():
+    """The fused kernel rounds each normalized, decayed Q / K operand to BF16 once.
+
+    Packed BF16 decoration chains (up to four roundings per operand) measured
+    0.58% output and 0.39% state relative error on these inputs; single
+    rounding measures 0.42% and 0.27%.
+    """
+    inputs = _inputs((300, 97, 640), 16, packed=True)
+    reference = _reference({**inputs, "initial_state": inputs["initial_state"].clone()})
+    result = _call(inputs, output_final_state=True)
+    for got, want, bound in zip(result, reference, (5e-3, 3.5e-3), strict=True):
+        error = torch.linalg.vector_norm(got.float() - want.float())
+        assert error <= bound * torch.linalg.vector_norm(want.float())

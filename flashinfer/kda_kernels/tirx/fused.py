@@ -1556,8 +1556,8 @@ def build_kernel(
                         txl.ptx.rsqrt.approx.ftz.f32(norm, n0 + n1 + txl.float32(EPS))
                         fac = norm * scale if which == 0 else norm
                         fac = txl.Select(row < nvalid, fac, txl.float32(0.0))
-                        txl.ptx.st.shared.b32(
-                            rsq.ptr_to([s * 256 + which * 128 + row]), bf16x2(fac, fac)
+                        txl.ptx.st.shared.f32(
+                            rsq.ptr_to([s * 256 + which * 128 + row]), fac
                         )
                     rawb = txl.local_scalar("uint16")
                     txl.ptx.ld.shared.b16(
@@ -1672,6 +1672,19 @@ def build_kernel(
                 o0 = txl.local_scalar("float32")
                 o1 = txl.local_scalar("float32")
                 txl.ptx.add.rn.f32x2(
+                    packed,
+                    txl.cuda.make_float2(a0, a1),
+                    txl.cuda.make_float2(b0, b1),
+                )
+                txl.ptx.mov.b64(o0, o1, packed)
+                return o0, o1
+
+            def fmul2f(a0, a1, b0, b1):
+                """Two independent RN fp32 products in one packed instruction (no .ftz: subnormal results survive)."""
+                packed = txl.local_scalar("uint64")
+                o0 = txl.local_scalar("float32")
+                o1 = txl.local_scalar("float32")
+                txl.ptx.mul.rn.f32x2(
                     packed,
                     txl.cuda.make_float2(a0, a1),
                     txl.cuda.make_float2(b0, b1),
@@ -1986,7 +1999,7 @@ def build_kernel(
                         )
                         txl.assign(cst4[3 * p + z], v)
 
-                # all tot reads finish before reuse, and the helper's packed norms and beta are visible before phase B publishes rfull
+                # all tot reads finish before reuse, and the helper's fp32 norm factors and beta are visible before phase B publishes rfull
                 txl.ptx.bar.sync(txl.uint32(NB_PREP), txl.uint32(288))
                 iend(tok_pc)
 
@@ -1995,8 +2008,6 @@ def build_kernel(
                     fwait(oi_done, 0, (c + 1) % 2, "pr-wait-oidone")
                     txl.ptx.fence.proxy.async_.shared__cta()
                 tok_pb = irange("pr-phaseB")
-                Ex = txl.alloc_local((4,), "uint32")
-                Fp = txl.alloc_local((4,), "uint32")
                 xq = txl.alloc_local((4,), "uint32")
                 xk = txl.alloc_local((4,), "uint32")
                 q2v = txl.alloc_local((4,), "uint32")
@@ -2020,6 +2031,13 @@ def build_kernel(
                         r = ra if a == 0 else rb
                         ld4u(qraw, 0, tptr_off(kqs, r + KQ_QQ_OFF))
                         ld4u(kraw, 0, tptr_off(kqs, r + KQ_K_OFF))
+                        fq = txl.reinterpret("float32", rq2[a])
+                        fk = txl.reinterpret("float32", rk2[a])
+                        # q / k decorations in fp32 with a single rounding to bf16 (norm factor, decay factor and
+                        # their product; 1/Ex from its own fp32 reciprocal).  Packed bf16 chains here cost up to four
+                        # roundings per operand, and the former one-step bf16 Newton 1/Ex was biased by -0.14%.
+                        # mul.rn.f32x2 keeps subnormal products: late half-1 targets of strong-decay chunks sit
+                        # near 2^-120 and must not be flushed.
                         for p in range(4):
                             x0, x1 = fadd2f(
                                 cX[a * 8 + 2 * p],
@@ -2028,19 +2046,15 @@ def build_kernel(
                                 excl[2 * p + 1],
                             )
                             ex0, ex1 = ex2(x0), ex2(x1)
-                            txl.assign(Ex[p], bf16x2(ex0, ex1))
-                            # 1/Ex from the fp32 ex (rcp.approx, 1 ulp): kf feeds kA (the state update), and a
-                            # one-step bf16 Newton reciprocal is biased (mean -0.14%, max 0.63% over the used range)
-                            txl.assign(
-                                Fp[p],
-                                bf16x2(rcp(ex0), rcp(ex1)),
-                            )
+                            rx0, rx1 = rcp(ex0), rcp(ex1)
+                            q0, q1 = unpack(qraw[p])
+                            k0, k1 = unpack(kraw[p])
+                            qn0, qn1 = fmul2f(q0, q1, fq, fq)
+                            kn0, kn1 = fmul2f(k0, k1, fk, fk)
+                            txl.assign(xq[p], bf16x2(*fmul2f(qn0, qn1, ex0, ex1)))
+                            txl.assign(xk[p], bf16x2(*fmul2f(kn0, kn1, ex0, ex1)))
+                            txl.assign(kf[p], bf16x2(*fmul2f(kn0, kn1, rx0, rx1)))
                         for p in range(4):
-                            qn = hmul2(qraw[p], rq2[a])
-                            kn = hmul2(kraw[p], rk2[a])
-                            txl.assign(xq[p], hmul2(qn, Ex[p]))
-                            txl.assign(xk[p], hmul2(kn, Ex[p]))
-                            txl.assign(kf[p], hmul2(kn, Fp[p]))
                             # q2 and k2 share the fused power-of-two clamp product cc = cst4[3 p]
                             txl.assign(q2v[p], hmul2(xq[p], cst4[3 * p]))
                             txl.assign(k2v[p], hmul2(xk[p], cst4[3 * p]))
