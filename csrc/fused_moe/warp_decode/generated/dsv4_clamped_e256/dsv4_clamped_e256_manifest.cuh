@@ -184,6 +184,8 @@ inline ManifestStatus EnsureDeviceReady(int32_t device, bool allow_initializatio
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_dsv4_fc2_terminal_recycle_v21_sm100), cudaFuncAttributeMaxDynamicSharedMemorySize, 85120);
   if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
+  error = cudaFuncSetAttribute(reinterpret_cast<const void*>(kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe_loader_bypass_v23), cudaFuncAttributeMaxDynamicSharedMemorySize, 81536);
+  if (error != cudaSuccess) return Runtime(error, "clamped E256 dynamic shared memory");
   state.ready = true;
   return ManifestStatus::Success();
 }
@@ -459,6 +461,30 @@ inline cudaError_t Submit_device_09(const cudaLaunchConfig_t* config, const void
   const auto& args = *static_cast<const Args_device_09*>(opaque);
   return SubmitExtendedKernel(config, kernel_dsv4_fc2_terminal_recycle_v21_sm100,
       args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles, args.total_tiles);
+}
+
+struct Args_device_12 {
+  CUtensorMap A;
+  CUtensorMap B;
+  CUtensorMap SFA;
+  CUtensorMap SFB;
+  CUtensorMap C_tma;
+  __nv_bfloat16* C;
+  float* scale_c;
+  int* tile_expert;
+  int* tile_mn_limit;
+  int* num_non_exiting_ctas;
+  int* work_counter;
+  int M;
+  int K;
+  int grid_m;
+  int grid_n;
+  int K_tiles;
+};
+inline cudaError_t Submit_device_12(const cudaLaunchConfig_t* config, const void* opaque) {
+  const auto& args = *static_cast<const Args_device_12*>(opaque);
+  return SubmitExtendedKernel(config, kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe_loader_bypass_v23,
+      args.A, args.B, args.SFA, args.SFB, args.C_tma, args.C, args.scale_c, args.tile_expert, args.tile_mn_limit, args.num_non_exiting_ctas, args.work_counter, args.M, args.K, args.grid_m, args.grid_n, args.K_tiles);
 }
 
 inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, LaunchVisitor visitor, void* context) {
@@ -1830,7 +1856,7 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
     args_1.grid_n = static_cast<int>(54);
     args_1.K_tiles = static_cast<int>(8);
     args_1.route_order = reinterpret_cast<int*>((static_cast<uint8_t*>(inv.workspace) + 0u));
-    Args_device_07 args_2{};
+    Args_device_12 args_2{};
     {
       CUtensorMap encoded{};
       const uint64_t map_67_dims[] = {2048ull, 4096ull, 256ull};
@@ -1925,9 +1951,9 @@ inline void ForEachLaunch(const Invocation& inv, const Schedule& schedule, Launc
       &Submit_device_02, &args_1, -1};
     visitor(launch_1, context);
     KernelLaunch launch_2{
-      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe", dim3(32, 54, 1), dim3(512, 1, 1), dim3(1, 1, 1),
+      "kernel_trtllm_moe_bmm_tile_n8_fc2_nvfp4_k512_two_cta_s2_uniform_regs_direct_stg_probe_loader_bypass_v23", dim3(32, 54, 1), dim3(512, 1, 1), dim3(1, 1, 1),
       81536u, true, false, false, false,
-      &Submit_device_07, &args_2, 100};
+      &Submit_device_12, &args_2, 100};
     visitor(launch_2, context);
     KernelLaunch launch_3{
       "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100", dim3(16, 9, 1), dim3(128, 1, 1), dim3(1, 1, 1),
