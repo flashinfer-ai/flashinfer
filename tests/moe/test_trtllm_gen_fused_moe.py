@@ -900,17 +900,19 @@ def test_mxfp4_mxfp8_kimi_k3_situ_reference(moe_gemm_backend, cache_permute_indi
 def test_fp4_prims_ts_routed_modes_match_logits(cache_permute_indices):
     """Packed and unpacked Prims-TS routed inputs match the logits path."""
     from flashinfer.autotuner import autotune
-    from flashinfer.prims_ts.utils import is_prims_ts_available
+    from flashinfer.prims_ts import (
+        is_prims_ts_available,
+        is_prims_ts_device_supported,
+    )
     from flashinfer.utils import device_support_pdl
 
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("These tests require TRTLLM FP8 MoE on SM100, SM103, or SM107.")
+    device = torch.device("cuda:0")
+    if not is_prims_ts_device_supported(device):
+        pytest.skip("Prims-TS MoE kernels do not support this device")
     if not is_prims_ts_available():
         pytest.skip("Prims-TS dependencies are unavailable")
 
     torch.manual_seed(0)
-    device = torch.device("cuda:0")
     num_tokens = 32
     hidden_size = 1024
     intermediate_size = 512
