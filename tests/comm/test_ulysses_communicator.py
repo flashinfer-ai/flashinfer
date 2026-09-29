@@ -146,6 +146,17 @@ def test_ctor_nccl_backend_never_touches_ipc_jit(gloo_pg, monkeypatch):
 
 
 @requires_cuda
+def test_ctor_legacy_element_capacity(gloo_pg, monkeypatch):
+    _forbid_ipc_and_jit(monkeypatch)
+    comm = UlyssesCommunicator(
+        gloo_pg, max_elems=1024, dtype=torch.float16, backend="nccl"
+    )
+    assert comm.max_bytes == 1024 * torch.float16.itemsize
+    assert comm.max_elems == 1024
+    comm.close()
+
+
+@requires_cuda
 def test_ctor_auto_fallback_never_touches_ipc_jit(gloo_pg, monkeypatch):
     _forbid_ipc_and_jit(monkeypatch)
     _patch_probe_mesh(monkeypatch, 1)
@@ -185,6 +196,13 @@ def test_ctor_forced_nvlink_fails_before_ipc_jit(gloo_pg, monkeypatch):
         (dict(max_bytes="big", dtype=torch.float16), "max_bytes"),
         (dict(max_bytes=True, dtype=torch.float16), "max_bytes"),
         (dict(max_bytes=2**33, dtype=torch.float16), "int32"),
+        (dict(max_elems=0, dtype=torch.float16), "max_elems"),
+        (dict(max_elems=2**31, dtype=torch.float16), "max_elems"),
+        (
+            dict(max_bytes=2048, max_elems=1024, dtype=torch.float16),
+            "only one of max_bytes or max_elems",
+        ),
+        (dict(dtype=torch.float16), "either max_bytes or max_elems"),
         (dict(max_bytes=1024, dtype=torch.int32), "dtype"),
         (dict(max_bytes=1024, dtype="float16"), "dtype"),
         (dict(max_bytes=1024, dtype=torch.float16, device="cpu"), "CUDA device"),

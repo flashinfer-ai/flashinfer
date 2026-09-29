@@ -424,6 +424,12 @@ for the full integration)::
         o_ = attention(q_, k_, v_)
         o = comm.gather_heads(o_)    # [B,S_global,H_local,D] -> [B,S_local,H,D]
 
+Existing callers can continue passing ``max_elems=...`` instead of
+``max_bytes=...``; the constructor multiplies it by ``dtype.itemsize``.
+Pass only one capacity argument. ``comm.max_elems`` remains available in the
+construction dtype, while ``comm.max_bytes`` is the byte capacity used by the
+new packed-chunk API.
+
 Preallocated outputs and NCCL staging can be reused across serialized calls::
 
     workspace = comm.create_workspace()

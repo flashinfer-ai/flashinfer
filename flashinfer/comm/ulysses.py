@@ -380,7 +380,7 @@ class UlyssesCommunicator:
     ----------
     group : torch.distributed.ProcessGroup, optional
         Process group of the Ulysses ranks. Defaults to ``dist.group.WORLD``.
-    max_bytes : int
+    max_bytes : int, optional
         Per-rank byte capacity of one communication operand, shared across
         dtypes and transforms. Sizes the NVLink staging buffer once at
         construction. For quantized QKV this must cover the complete packed
@@ -389,6 +389,9 @@ class UlyssesCommunicator:
         separate; this is not a total memory budget. The maximum is
         ``(2**31 - 1) * 4`` bytes, and each call separately enforces the
         int32 element-index limit.
+    max_elems : int, optional
+        Legacy element capacity. Converted to bytes using ``dtype.itemsize``.
+        Provide either ``max_elems`` or ``max_bytes``.
     dtype : torch.dtype
         Element type of all operands (float16 / bfloat16 / float32); enforced
         on every call.
@@ -412,10 +415,11 @@ class UlyssesCommunicator:
         self,
         group: Optional[ProcessGroup] = None,
         *,
-        max_bytes: int,
+        max_bytes: Optional[int] = None,
         dtype: torch.dtype,
         backend: str = "auto",
         device: Optional[Union[torch.device, str, int]] = None,
+        max_elems: Optional[int] = None,
     ):
         r"""Construct a Ulysses communicator.
 
@@ -424,10 +428,13 @@ class UlyssesCommunicator:
         group : Optional[ProcessGroup], optional
             Process group spanning the participating ranks. ``None`` uses
             ``torch.distributed.group.WORLD``.
-        max_bytes : int
+        max_bytes : int, optional
             Per-rank upper bound in bytes on one communication operand.
             Quantized QKV requires the complete packed payload to fit.
             Used to size the backend workspace.
+        max_elems : int, optional
+            Legacy upper bound in elements, converted with ``dtype.itemsize``.
+            Mutually exclusive with ``max_bytes``.
         dtype : torch.dtype
             Element dtype for collective operands. Must be one of
             ``torch.float16``, ``torch.bfloat16``, or ``torch.float32``.
@@ -473,11 +480,14 @@ class UlyssesCommunicator:
         # same error on every rank instead of hanging peers in a later gather.
         # Devices are validated per rank but may legitimately differ across
         # ranks (cuda:rank); only max_bytes and dtype must match.
-        config = self._encode_config(max_bytes, dtype, device)
+        capacity_bytes, capacity_error = self._normalize_capacity(
+            max_bytes, max_elems, dtype
+        )
+        config = self._encode_config(capacity_bytes, dtype, device, capacity_error)
         configs = self._gather(config)
         self._validate_configs_jointly(configs)
 
-        self.max_bytes = max_bytes
+        self.max_bytes = int(capacity_bytes)
         self.dtype = dtype
 
         # ---- backend selection: strictly before any IPC/JIT -----------------
@@ -517,6 +527,33 @@ class UlyssesCommunicator:
                 )
 
         self._state = _OPEN
+
+    @property
+    def max_elems(self) -> int:
+        """Legacy capacity in elements of the communicator's construction dtype."""
+        return self.max_bytes // self.dtype.itemsize
+
+    @staticmethod
+    def _normalize_capacity(max_bytes, max_elems, dtype):
+        """Normalize both public capacity forms without raising before the rank gather."""
+        if max_elems is None:
+            if max_bytes is None:
+                return None, "provide either max_bytes or max_elems"
+            return max_bytes, ""
+        if max_bytes is not None:
+            return max_bytes, "provide only one of max_bytes or max_elems"
+        if type(max_elems) is not int:
+            return (
+                None,
+                f"max_elems must be a positive int, got {type(max_elems).__name__}",
+            )
+        if max_elems <= 0:
+            return None, f"max_elems must be a positive int, got {max_elems}"
+        if max_elems > _INT32_MAX:
+            return None, f"max_elems must be at most {_INT32_MAX}, got {max_elems}"
+        if not isinstance(dtype, torch.dtype):
+            return None, "max_elems requires a valid dtype"
+        return max_elems * dtype.itemsize, ""
 
     # ---- collective helpers ---------------------------------------------------
 
@@ -616,7 +653,9 @@ class UlyssesCommunicator:
             return torch.device("cuda", 0)
 
     @classmethod
-    def _encode_config(cls, max_bytes, dtype, device) -> Tuple[str, str, str]:
+    def _encode_config(
+        cls, max_bytes, dtype, device, capacity_error=""
+    ) -> Tuple[str, str, str, str]:
         if type(max_bytes) is not int:  # bool is an int subclass: reject it too
             nbytes = f"<invalid type: {type(max_bytes).__name__}>"
         else:
@@ -635,21 +674,24 @@ class UlyssesCommunicator:
             dev = "cuda"
         else:
             dev = f"cuda:{index}"
-        return (nbytes, dt, dev)
+        return (nbytes, dt, dev, capacity_error)
 
     def _validate_configs_jointly(self, configs) -> None:
         supported = tuple(str(d) for d in _SUPPORTED_DTYPES)
         problems = {}
-        for r, (nbytes, dt, dev) in enumerate(configs):
+        for r, (nbytes, dt, dev, capacity_error) in enumerate(configs):
             errs = []
-            if not nbytes.isdigit() or int(nbytes) <= 0:
-                errs.append(f"max_bytes must be a positive int, got {nbytes}")
-            elif int(nbytes) > _MAX_CAPACITY_BYTES:
-                errs.append(
-                    f"max_bytes must be at most {_MAX_CAPACITY_BYTES} (int32 "
-                    f"kernel index range at the widest supported element), "
-                    f"got {nbytes}"
-                )
+            if capacity_error:
+                errs.append(capacity_error)
+            else:
+                if not nbytes.isdigit() or int(nbytes) <= 0:
+                    errs.append(f"max_bytes must be a positive int, got {nbytes}")
+                elif int(nbytes) > _MAX_CAPACITY_BYTES:
+                    errs.append(
+                        f"max_bytes must be at most {_MAX_CAPACITY_BYTES} (int32 "
+                        f"kernel index range at the widest supported element), "
+                        f"got {nbytes}"
+                    )
             if dt not in supported:
                 errs.append(f"dtype must be one of {supported}, got {dt}")
             if not dev.startswith("cuda"):
@@ -658,7 +700,7 @@ class UlyssesCommunicator:
                 problems[r] = "; ".join(errs)
         if problems:
             raise ValueError(f"invalid UlyssesCommunicator config by rank: {problems}")
-        shared = {(nbytes, dt) for (nbytes, dt, _dev) in configs}
+        shared = {(nbytes, dt) for (nbytes, dt, _dev, _error) in configs}
         if len(shared) > 1:
             raise ValueError(
                 f"inconsistent UlyssesCommunicator configs across ranks: "
