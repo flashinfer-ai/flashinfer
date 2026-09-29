@@ -389,7 +389,8 @@ __global__ void __launch_bounds__(BLK, 4) moe_bgmv_expand_opt_kernel(
     const int64_t* __restrict__ lora_indices, const float* __restrict__ topk_weights,
     const int64_t* __restrict__ slice_start_loc, int64_t num_pairs, int64_t num_experts,
     int64_t total_feat_out, int64_t num_tokens, int64_t lora_stride, float scale) {
-  constexpr int KVEC = 8;                  // 8 bf16 = 128-bit
+  constexpr int KVEC = 8;  // 8 bf16 = 128-bit
+  static_assert(sizeof(W_T) == 2, "moe_bgmv_expand_opt_kernel requires 16-bit weights");
   constexpr int KGROUPS = FEAT_IN / KVEC;  // K-slices per column (rank/8)
   constexpr int PASSES = COLS_PER_BLOCK / (BLK / KGROUPS);
   // Shape invariants the reduction layout relies on (dispatcher only advertises FEAT_IN % 8 == 0).
