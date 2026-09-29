@@ -60,7 +60,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--intermediate",
         type=int,
         required=True,
-        help="model post-SwiGLU intermediate size "
+        help="model width after activation "
         "(*MegaMoeConfig.intermediate_size convention)",
     )
     parser.add_argument("--num-experts", type=int, required=True)
