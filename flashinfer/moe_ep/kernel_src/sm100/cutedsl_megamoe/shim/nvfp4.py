@@ -219,7 +219,10 @@ class MegaMoENvfp4Config:
                 "scales. use_custom_finalize=True requires "
                 "apply_routing_weights_before_fc2=True."
             )
-
+        if self.use_custom_finalize and self.topk_reduce_persistent:
+            raise ValueError(
+                "use_custom_finalize and topk_reduce_persistent cannot be used together."
+            )
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
                 f"group_hint must be positive when set, got {self.group_hint}."
