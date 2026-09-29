@@ -17,19 +17,6 @@ from cutlass.cute.runtime import from_dlpack
 from . import kernel as _k
 from ...jit.cute_dsl_core import build_and_load_cute_dsl_kernel
 
-# Retained workload-specific schedules. Keep their predicates here rather than
-# using sequence count as an implicit workload label in kernel routing.
-_MIXED_LENS = [1300, 547, 2048, 963, 271, 3063]
-
-
-def _is_mixed(lens) -> bool:
-    return lens == _MIXED_LENS
-
-
-def _is_uniform_1024(lens) -> bool:
-    return len(lens) == 8 and all(length == 1024 for length in lens)
-
-
 D = 128
 C32 = 32
 LOG2E = 1.4426950408889634
@@ -398,222 +385,169 @@ def _launch_forward(
 
 
 C_TOK = 32  # chunk tokens; split points are chunk-aligned
-INLINE_SPLIT_MARGIN = 0.98
-HANDOFF_SPLIT_SLOPE = 0.04
+# Modelled per-piece cost (state seed/export and pipeline refill), in chunks;
+# measured B300 chain starts cost about three chunks.
+PIECE_OVERHEAD = 3
+# Smallest producer or consumer piece, in chunks.
+MIN_PIECE = 2
+# Split only for this modelled gain: the handoff-capable kernel variant costs
+# up to 3% on H96 routes.
+MIN_SPLIT_GAIN = 0.05
 
 
-def _exact_inline_schedule(lens, H: int, nslots: int):
-    """Build the retained exact head/tail handoff schedule for INT21 varlen shapes."""
-    if nslots != 148 or H not in (64, 96):
-        return None
-    if not (
-        (_is_mixed(lens) and H in (64, 96)) or (H == 64 and _is_uniform_1024(lens))
-    ):
-        return None
-
-    chunks = [(length + C_TOK - 1) // C_TOK for length in lens]
-    full = [length // C_TOK for length in lens]
-    chain_chunks = [chunks[chain // H] for chain in range(len(lens) * H)]
-    chain_full = [full[chain // H] for chain in range(len(lens) * H)]
-    order_desc = sorted(
-        range(len(chain_chunks)), key=lambda chain: -chain_chunks[chain]
-    )
-
-    def lpt_makespan(costs):
-        heap = [0.0] * nslots
-        heapq.heapify(heap)
-        for cost in sorted(costs, reverse=True):
-            load = heapq.heappop(heap)
-            heapq.heappush(heap, load + cost)
-        return max(heap)
-
-    base_span = lpt_makespan([count + 1 for count in chain_chunks])
-    area_floor = -(-(sum(chain_chunks) + len(chain_chunks)) // nslots)
-    longest = max(chain_chunks)
-    if base_span * INLINE_SPLIT_MARGIN <= area_floor + 1:
-        return None
-    if longest + 1 >= base_span:
-        return None
-
-    def build_jobs(n_split, prefix):
-        jobs = []
-        for pos, chain in enumerate(order_desc):
-            count = chain_chunks[chain]
-            if pos < n_split:
-                if prefix >= count or prefix > chain_full[chain]:
-                    return None
-                jobs.append((prefix + 1, 1, chain))
-                jobs.append((count - prefix + 1, 2, chain))
-            else:
-                jobs.append((count + 1, 0, chain))
-        return jobs
-
-    def pack_and_simulate(jobs):
-        heap = [(0, slot) for slot in range(nslots)]
-        heapq.heapify(heap)
-        bins = [[] for _ in range(nslots)]
-        for job in sorted(
-            range(len(jobs)), key=lambda idx: (-jobs[idx][0], jobs[idx][1])
-        ):
-            load, slot = heapq.heappop(heap)
-            bins[slot].append(job)
-            heapq.heappush(heap, (load + jobs[job][0], slot))
-        rank = {1: 0, 0: 1, 2: 2}
-        ready = {}
-        for slot_jobs in bins:
-            slot_jobs.sort(key=lambda idx: (rank[jobs[idx][1]], -jobs[idx][0]))
-            elapsed = 0
-            for job in slot_jobs:
-                cost, kind, chain = jobs[job]
-                if kind == 2:
-                    continue
-                elapsed += cost
-                if kind == 1:
-                    ready[chain] = elapsed
-        span = 0
-        for slot_jobs in bins:
-            elapsed = 0
-            for job in slot_jobs:
-                cost, kind, chain = jobs[job]
-                if kind == 2:
-                    elapsed = max(elapsed, ready[chain])
-                elapsed += cost
-            span = max(span, elapsed)
-        return span, bins
-
-    best = None
-    for n_split in range(8, len(chain_chunks) + 1, 8):
-        for prefix in range(1, longest):
-            jobs = build_jobs(n_split, prefix)
-            if jobs is None:
-                continue
-            span, bins = pack_and_simulate(jobs)
-            key = (span + HANDOFF_SPLIT_SLOPE * n_split, n_split, prefix)
-            if best is None or key < best[0]:
-                best = (key, n_split, prefix, jobs, bins)
-    if best is None or best[0][0] > base_span - 1.0:
-        return None
-
-    if H == 96 and _is_mixed(lens):
-        n_split, prefix = 56, 4
-        jobs = build_jobs(n_split, prefix)
-        _, bins = pack_and_simulate(jobs)
-    else:
-        _, n_split, prefix, jobs, bins = best
-    buffer_for = {chain: index for index, chain in enumerate(order_desc[:n_split])}
-    items = []
-    for slot_jobs in bins:
-        slot = []
-        for job in slot_jobs:
-            _cost, kind, chain = jobs[job]
-            length = lens[chain // H]
-            if kind == 0:
-                slot.append((chain, 0, length, -1, -1))
-            elif kind == 1:
-                slot.append((chain, 0, prefix * C_TOK, -1, buffer_for[chain]))
-            else:
-                start = prefix * C_TOK
-                slot.append((chain, start, length - start, buffer_for[chain], -1))
-        items.append(slot)
-    return items, n_split
-
-
-def _piece_schedule(
-    lens, H: int, nslots: int, dev: torch.device, store_final_state: bool
-):
-    """Pack whole chains, with exact handoff schedules for INT21 varlen.
-
-    Generic layouts retain whole-chain LPT. The tuned schedules put producers
-    before consumers and fit in one resident CTA per SM, avoiding dependency
-    cycles and waits on unscheduled CTAs.
-    """
-    inline = _exact_inline_schedule(lens, H, nslots) if store_final_state else None
-    if inline is not None:
-        items, nbuf = inline
-        fc, ft0, ftn, fsrc, fdst, off = [], [], [], [], [], [0]
-        for slot in items:
-            for chain, t0, tn, src, dst in slot:
-                fc.append(chain)
-                ft0.append(t0)
-                ftn.append(tn)
-                fsrc.append(src)
-                fdst.append(dst)
-            off.append(len(fc))
-        i32 = lambda values: torch.tensor(values, dtype=torch.int32, device=dev)
-        return (
-            i32(off),
-            i32(fc),
-            i32(ft0),
-            i32(ftn),
-            i32(fsrc),
-            i32(fdst),
-            len(items),
-            nbuf,
-        )
-
-    nseq = len(lens)
-    chains = nseq * H
-    G = min(chains, nslots)
-    heap = [(0, s) for s in range(G)]
+def _lpt(costs, nslots):
+    """Longest-processing-time packing of whole chains; returns (slots, loads)."""
+    heap = [(0, slot) for slot in range(nslots)]
     heapq.heapify(heap)
-    slots: list[list[int]] = [[] for _ in range(G)]
-    loads = [0] * G
-    order = sorted(range(nseq), key=lambda i: -lens[i])
-    for s_i in order:
-        for h in range(H):
-            load, sl = heapq.heappop(heap)
-            slots[sl].append(s_i * H + h)
-            loads[sl] = load + lens[s_i]
-            heapq.heappush(heap, (loads[sl], sl))
-    items = [[(c, 0, lens[c // H], -1, -1) for c in sl] for sl in slots]
-    M0 = max(loads)
+    slots: list[list[int]] = [[] for _ in range(nslots)]
+    loads = [0] * nslots
+    for chain in sorted(range(len(costs)), key=lambda c: (-costs[c], c)):
+        load, slot = heapq.heappop(heap)
+        slots[slot].append(chain)
+        loads[slot] = load + costs[chain]
+        heapq.heappush(heap, (loads[slot], slot))
+    return slots, loads
+
+
+def _wrap_around(chunks, full, span, nslots):
+    """McNaughton wrap-around packing at makespan ``span`` (chunks).
+
+    Chains fill slots in order. The chain crossing a slot boundary is cut at a
+    chunk boundary: its first part (a producer, full chunks only) starts the
+    next slot and its remainder (the consumer) ends the current one. Producers
+    lead their slots and never wait, so every consumer's producer runs on a
+    resident CTA and the handoff graph cannot deadlock. Returns None when the
+    chains do not fit in ``nslots`` slots.
+    """
+    slots = [[]]
+    load = 0
+    # Alternate long and short chains so every slot gets a similar mix of
+    # chain starts; short chains cost more per chunk than the model assumes.
+    ranked = sorted(range(len(chunks)), key=lambda c: (-chunks[c], c))
+    order = [
+        ranked[i // 2] if i % 2 == 0 else ranked[-1 - i // 2]
+        for i in range(len(ranked))
+    ]
+    for chain in order:
+        count = chunks[chain]
+        if load + count + PIECE_OVERHEAD <= span:
+            slots[-1].append((chain, 0, count))
+            load += count + PIECE_OVERHEAD
+            continue
+        tail = span - load - 2 * PIECE_OVERHEAD
+        head = count - tail
+        if tail >= MIN_PIECE and MIN_PIECE <= head <= full[chain]:
+            slots[-1].append((chain, head, count))
+            slots.append([(chain, 0, head)])
+            load = head + PIECE_OVERHEAD
+        else:
+            slots.append([(chain, 0, count)])
+            load = count + PIECE_OVERHEAD
+        if len(slots) > nslots:
+            return None
+    return slots
+
+
+def _split_heads(chunks, full, nslots, span_limit):
+    """LPT after cutting a short head off the longest chains.
+
+    Each head is a producer placed before every other piece of its slot, so
+    producers never wait; the rest of the chain is a consumer that ends its
+    slot. Searches a coarse grid of split counts and head lengths with a
+    waiting-aware simulation and returns the best (span, slots) below
+    ``span_limit``, where slots hold (chain, first chunk, end chunk), or None.
+    """
+    order = sorted(range(len(chunks)), key=lambda c: (-chunks[c], c))
+    best = None
+    for n_split in (8, 16, 24, 32, 48, 64, 96, 128, 192, 256):
+        if n_split > len(order):
+            break
+        cut = order[:n_split]
+        room = min(full[c] for c in cut)
+        for head in (2, 4, 6, 8, 12, 16, 24, 32, 48, 64):
+            if head > room or chunks[cut[-1]] - head < MIN_PIECE:
+                break
+            # (cost, kind, chain, first chunk, end chunk); kind 0 = producer,
+            # 1 = whole chain, 2 = consumer.
+            jobs = [
+                (chunks[c] + PIECE_OVERHEAD, 1, c, 0, chunks[c])
+                for c in order[n_split:]
+            ]
+            for c in cut:
+                jobs.append((head + PIECE_OVERHEAD, 0, c, 0, head))
+                jobs.append((chunks[c] - head + PIECE_OVERHEAD, 2, c, head, chunks[c]))
+            heap = [(0, slot) for slot in range(nslots)]
+            slots = [[] for _ in range(nslots)]
+            for job in sorted(jobs, key=lambda j: (-j[0], j[1], j[2])):
+                load, slot = heapq.heappop(heap)
+                slots[slot].append(job)
+                heapq.heappush(heap, (load + job[0], slot))
+            ready = {}
+            for slot in slots:
+                slot.sort(key=lambda j: (j[1], -j[0]))
+                t = 0
+                for cost, kind, c, _, _ in slot:
+                    if kind == 0:
+                        t += cost
+                        ready[c] = t
+            span = 0
+            for slot in slots:
+                t = 0
+                for cost, kind, c, _, _ in slot:
+                    if kind == 2:
+                        t = max(t, ready[c])
+                    t += cost
+                span = max(span, t)
+            if span < span_limit and (best is None or span < best[0]):
+                best = (span, [[j[2:] for j in slot] for slot in slots])
+    return best
+
+
+def _piece_schedule(lens, H: int, nslots: int, dev: torch.device):
+    """Pack the (sequence, head) chains onto at most ``nslots`` persistent CTAs.
+
+    Whole-chain LPT is used unless cutting chains lowers the modelled
+    makespan. Split schedules use wrap-around packing, with exact FP32 state
+    handoffs between the pieces of a chain.
+    """
+    nchains = len(lens) * H
+    chunks = [(lens[c // H] + C_TOK - 1) // C_TOK for c in range(nchains)]
+    full = [lens[c // H] // C_TOK for c in range(nchains)]
+    G = min(nchains, nslots)
+    costs = [count + PIECE_OVERHEAD for count in chunks]
+    lpt_slots, loads = _lpt(costs, G)
+    items = [[(c, 0, lens[c // H], -1, -1) for c in slot] for slot in lpt_slots]
     nbuf = 0
-    if H == 96 and G == 148 and _is_uniform_1024(lens):
-        # Remove the 28 sixth chains, then split each 32-chunk chain as
-        # 6+6+6+7+7.  The 140 pieces occupy distinct slots after one
-        # through five whole chains, giving each dependency a full-chain
-        # lead and reaching the 167-chunk integer lower bound.
-        peaks = [(s, slots[s][-1]) for s in range(G) if loads[s] == M0]
-        for s, c in peaks:
-            idx = slots[s].index(c)
-            slots[s].pop(idx)
-            items[s].pop(idx)
-        np = len(peaks)
-        cuts = (0, 6, 12, 18, 25, 32)
-        for i, (_, c) in enumerate(peaks):
-            bufs = tuple(range(nbuf, nbuf + 4))
-            nbuf += 4
-            for p in range(5):
-                src = -1 if p == 0 else bufs[p - 1]
-                dst = -1 if p == 4 else bufs[p]
-                t0 = cuts[p] * C_TOK
-                tn = (cuts[p + 1] - cuts[p]) * C_TOK
-                sl = p * np + i
-                items[sl].insert(1 + p, (c, t0, tn, src, dst))
-    # B300 maps persistent block IDs to SM/topology positions repeatably.
-    # Rotate only heterogeneous/full-device official schedules so their
-    # critical slot band lands on the faster block-ID region.  Slot contents,
-    # within-slot order, dependencies, and all output ownership stay intact.
-    # Donor-Gram routes were re-swept after their issue timing changed
-    # (mixed H64 in v138, uniform H96 in v139). Uniform H96 uses rotation 106,
-    # tuned while that route still stored its gate table as FP16.
-    mixed = _is_mixed(lens)
-    uniform = _is_uniform_1024(lens)
-    rotation = 0
-    if G == 148:
-        if H == 96 and mixed:
-            rotation = 18
-        elif H == 64 and mixed:
-            rotation = 134
-        elif H == 96 and uniform:
-            rotation = 106
-        elif H == 64 and uniform:
-            rotation = 53
-    if rotation:
-        items = items[rotation:] + items[:rotation]
+    span = max(max(costs), -(-sum(costs) // G))
+    limit = max(loads) * (1 - MIN_SPLIT_GAIN)
+    if nchains > G and span <= limit:
+        packed = None
+        while packed is None and span <= limit:
+            packed = _wrap_around(chunks, full, span, G)
+            span += 1
+        heads = _split_heads(chunks, full, G, span if packed else limit + 1)
+        if heads is not None:
+            packed = heads[1]
+        if packed is not None:
+            split = sorted({chain for slot in packed for chain, c0, _ in slot if c0})
+            buffer_of = {chain: index for index, chain in enumerate(split)}
+            items = [
+                [
+                    (
+                        chain,
+                        c0 * C_TOK,
+                        min(c1 * C_TOK, lens[chain // H]) - c0 * C_TOK,
+                        buffer_of[chain] if c0 else -1,
+                        buffer_of[chain] if c1 < chunks[chain] else -1,
+                    )
+                    for chain, c0, c1 in slot
+                ]
+                for slot in packed
+            ]
+            nbuf = len(buffer_of)
     fc, ft0, ftn, fsrc, fdst, off = [], [], [], [], [], [0]
-    for s in range(G):
-        for c, t0, tn, src, dst in items[s]:
+    for slot in items:
+        for c, t0, tn, src, dst in slot:
             fc.append(c)
             ft0.append(t0)
             ftn.append(tn)
@@ -621,15 +555,24 @@ def _piece_schedule(
             fdst.append(dst)
         off.append(len(fc))
     i32 = lambda x: torch.tensor(x, dtype=torch.int32, device=dev)
-    return (i32(off), i32(fc), i32(ft0), i32(ftn), i32(fsrc), i32(fdst), G, nbuf)
+    return (
+        i32(off),
+        i32(fc),
+        i32(ft0),
+        i32(ftn),
+        i32(fsrc),
+        i32(fdst),
+        len(items),
+        nbuf,
+    )
 
 
-def make_plan(offsets, H, dev, store_final_state=True):
+def make_plan(offsets, H, dev):
     """Build private scheduling and handoff storage from validated host offsets."""
     lens = [end - start for start, end in zip(offsets, offsets[1:], strict=False)]
     cu32 = torch.tensor(offsets, dtype=torch.int32, device=dev)
     soff, schain, spt0, sptn, ssrc, sdst, G, nbuf = _piece_schedule(
-        lens, H, _sm_count(dev), dev, store_final_state
+        lens, H, _sm_count(dev), dev
     )
     # Keep every inter-CTA handoff in FP32, including shapes outside INT21.
     mid = torch.empty(max(nbuf, 1), D, D, dtype=torch.float32, device=dev)
@@ -717,9 +660,9 @@ def fwd(
     reg_mode = 1 if fixed else 0
     if not fixed:
         reg_mode = 1 if full_chunks or (H == 96 and store_final_state) else 2
-    # Cluster-2 also wins on uniform H64 after the dedicated MMA issuer;
-    # matched 15x100 bookends improve by 0.208% over cluster-1.
-    cluster_size = 4 if fixed else (2 if nseq in (6, 8) else 1)
+    # Split schedules need every producer CTA resident, which clusters would
+    # not guarantee. Unsplit single sequences keep cluster-4 launches.
+    cluster_size = 1 if has_split else (4 if fixed else 1)
     while G % cluster_size:
         cluster_size //= 2
     return _launch_forward(

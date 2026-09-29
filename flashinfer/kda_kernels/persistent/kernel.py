@@ -92,6 +92,12 @@ def _store_final_f32x8(dst, values, *, loc=None, ip=None):
 D = 128
 C = 32
 BM = 128
+# MMA1 multiplies the BF16 state image by Qd/Kd decorated with up to 2^116.
+# Storing that image scaled by INP_SCALE keeps U and the output accumulators
+# within FP32 for magnitudes up to about 2^69; the FP32 master state itself
+# stays unscaled.
+INP_SCALE = 2.0**-57
+INV_INP_SCALE = 2.0**57
 NFT = 192
 STAGES = 5
 THREADS = 1024
@@ -616,7 +622,7 @@ def _pkd(
         lower_bound_log2 = lb2
         if cutlass.const_expr(LOWER_BOUND_M5_ == 1):
             lower_bound_log2 = -7.213475204444817
-        deanchor = _exp2f(lower_bound_log2 * 16.0)
+        deanchor = _exp2f(lower_bound_log2 * 16.0) * INV_INP_SCALE
         p_oe = cutlass.Int32(1)
         p_inp = cutlass.Int32(0)
         csc = cutlass.Int32(0)
@@ -758,7 +764,7 @@ def _pkd(
                         )
                         cute.autovec_copy(v_gt8[(win * 4 + gv, None, csc)], g8d)
                     mv = rcur.load()
-                    rb32f.store(mv.to(cutlass.BFloat16))
+                    rb32f.store(mv.to(cutlass.BFloat16) * cutlass.BFloat16(INP_SCALE))
                     rcur.store(mv * r_gt.load())
                     if cutlass.const_expr(GATE2_ == 1 and win == 0):
                         cute.arch.mbarrier_wait(mb + MB_OFIN + ofin_stage, ofin_phase)
@@ -1053,7 +1059,7 @@ def _pkd(
         lower_bound_log2 = lb2
         if cutlass.const_expr(LOWER_BOUND_M5_ == 1):
             lower_bound_log2 = -7.213475204444817
-        out_deanchor = _exp2f(lower_bound_log2 * 16.0)
+        out_deanchor = _exp2f(lower_bound_log2 * 16.0) * INV_INP_SCALE
         cse = cutlass.Int32(0)
         pe_state = cutlass.Int32(0)
         pe_fin = cutlass.Int32(0)
@@ -1177,7 +1183,7 @@ def _pkd(
                     )
                     cute.autovec_copy(v_gt8[(8 + hh * 2 + gv, None, csn)], g8d)
                 mv = rcur.load()
-                rbh.store(mv.to(cutlass.BFloat16))
+                rbh.store(mv.to(cutlass.BFloat16) * cutlass.BFloat16(INP_SCALE))
                 rcur.store(mv * gt16.load())
                 tw8 = cute.make_tensor(
                     cute.recast_ptr(tmem_ptr + 32 + hh * 8, dtype=cutlass.BFloat16),
@@ -1242,7 +1248,7 @@ def _pkd(
                                         v_gt8[(8 + hh * 2 + gv, None, csn)], g8d
                                     )
                                 mv = rcur.load()
-                                rbh.store(mv.to(cutlass.BFloat16))
+                                rbh.store(mv.to(cutlass.BFloat16) * cutlass.BFloat16(INP_SCALE))
                                 rcur.store(mv * gt16.load())
                                 tw8 = cute.make_tensor(
                                     cute.recast_ptr(
@@ -1778,6 +1784,8 @@ def _pkd(
         anch = lower_bound_log2 * 16.0
         konst2 = _exp2f(anch)
         inv_konst2 = _exp2f(-anch)
+        # The output's Gram block matches the scaled state image.
+        g_scale = inv_konst2 * INP_SCALE
 
         qr = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.BFloat16)
         kr = cute.make_rmem_tensor(cute.make_layout((8,)), cutlass.BFloat16)
@@ -2178,7 +2186,7 @@ def _pkd(
                             crd = gram_id[e]
                             mv = cutlass.Float32(0.0)
                             if crd[1] <= crd[0]:
-                                mv = r_gram[e] * inv_konst2
+                                mv = r_gram[e] * g_scale
                             r_gram[e] = mv
                     else:
                         for e in cutlass.range_constexpr(cute.size(r_gram)):
