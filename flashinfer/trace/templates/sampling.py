@@ -684,6 +684,134 @@ top_k_top_p_sampling_from_logits_trace = TraceTemplate(
 )
 
 
+# ── HY3 fused sampling (B200 heavy path) ─────────────────────────────────────
+
+
+def _fused_sampling_hy3_init(
+    *,
+    batch_size: int,
+    vocab_size: int = 120832,
+    penalty_rows: int = 0,
+    vocab_bytes: int = 0,
+    workspace_bytes: int = 8 * 1024 * 1024,
+    output_width: int = 1,
+    device: str = "cuda",
+    seed: int = 0,
+):
+    """Build the scalar-parameter B200 heavy path for the HY3 sampler."""
+    del output_width  # fixed by the public API
+    torch.manual_seed(seed)
+    penalty_rows = max(batch_size, penalty_rows)
+    vocab_bytes = max((vocab_size + 7) // 8, vocab_bytes)
+    return {
+        "logits": make_logits(
+            batch_size, vocab_size, dtype=torch.bfloat16, device=device
+        ),
+        "workspace_buffer": torch.empty(
+            workspace_bytes, dtype=torch.uint8, device=device
+        ),
+        "out": torch.empty(batch_size, 1, dtype=torch.int32, device=device),
+        "penalty_mask": torch.zeros(
+            penalty_rows, vocab_bytes, dtype=torch.uint8, device=device
+        ),
+        "slot_id": torch.arange(batch_size, dtype=torch.int32, device=device),
+        "repetition_penalty": 1.1,
+        "temperature": 0.8,
+        "softmax_policy": 2,
+        "top_k": 20,
+        "top_p": 0.9,
+        "max_top_k": 32,
+        "gumbel_noise": torch.zeros(
+            batch_size, vocab_size, dtype=torch.float32, device=device
+        ),
+    }
+
+
+fused_sampling_hy3_trace = TraceTemplate(
+    op_type="sampling",
+    name_prefix="fused_sampling_hy3",
+    description=(
+        "HY3 B200 heavy sampling path: apply a packed repetition mask, "
+        "temperature, top-k, top-p, and external Gumbel noise in a fused "
+        "pipeline. The sampled vocabulary entry is written back to the "
+        "penalty mask. Tensor-valued scalar parameters and the "
+        "temperature-only path are intentionally outside this trace variant."
+    ),
+    axes={
+        "batch_size": Var(),
+        "vocab_size": Const(abbrev="v"),
+        "penalty_rows": Var(),
+        "vocab_bytes": Var(),
+        "workspace_bytes": Var(),
+        "output_width": Const(value=1, abbrev=""),
+    },
+    inputs={
+        "logits": Tensor(["batch_size", "vocab_size"]),
+        "penalty_mask": Tensor(
+            ["penalty_rows", "vocab_bytes"],
+            dtype="uint8",
+            description="Packed repetition mask, updated in place.",
+        ),
+        "slot_id": Tensor(["batch_size"], dtype="int32"),
+        "repetition_penalty": Scalar("float32"),
+        "temperature": Scalar("float32"),
+        "softmax_policy": Scalar("int32"),
+        "top_k": Scalar("int32"),
+        "top_p": Scalar("float32"),
+        "max_top_k": Scalar("int32"),
+        "gumbel_noise": Tensor(["batch_size", "vocab_size"], dtype="float32"),
+        "workspace_buffer": Tensor(["workspace_bytes"], dtype="uint8", optional=True),
+        "out": Tensor(["batch_size", "output_width"], dtype="int32", optional=True),
+    },
+    outputs={
+        "samples": Tensor(["batch_size", "output_width"], dtype="int32", param="out"),
+        "penalty_mask": Tensor(
+            ["penalty_rows", "vocab_bytes"],
+            dtype="uint8",
+            param="penalty_mask",
+            description="Packed repetition mask after setting each sampled entry.",
+        ),
+    },
+    constraints=[
+        "penalty_rows >= batch_size",
+        "vocab_bytes * 8 >= vocab_size",
+        "softmax_policy == 2",
+        "max_top_k == 32",
+    ],
+    tags=["status:experimental", "fused", "arch:sm100"],
+    init=_fused_sampling_hy3_init,
+)
+
+
+def fused_sampling_hy3_trace_dispatch(save_dir=None, name=None, **kwargs):
+    """Trace only the scalar-parameter heavy path implemented for B200."""
+    del save_dir, name
+    if "logits" not in kwargs and "batch_size" in kwargs:
+        return fused_sampling_hy3_trace
+    logits = kwargs.get("logits")
+    if not isinstance(logits, torch.Tensor) or logits.ndim != 2:
+        return None
+    scalar_params = ("repetition_penalty", "temperature", "top_k", "top_p")
+    if any(isinstance(kwargs.get(param), torch.Tensor) for param in scalar_params):
+        return None
+    if (
+        logits.shape[1] != 120832
+        or kwargs.get("penalty_mask") is None
+        or kwargs.get("slot_id") is None
+        or kwargs.get("gumbel_noise") is None
+        or kwargs.get("draft_token_ids") is not None
+        or int(kwargs.get("softmax_policy", 0)) != 2
+        or int(kwargs.get("max_top_k", 32)) != 32
+    ):
+        return None
+    return fused_sampling_hy3_trace
+
+
+fused_sampling_hy3_trace_dispatch.templates = (  # type: ignore[attr-defined]
+    fused_sampling_hy3_trace,
+)
+
+
 @torch.no_grad()
 def _chain_speculative_sampling_reference(
     draft_probs,
