@@ -393,11 +393,13 @@ def _compile_graph(graph: Any, config: Any, cta_group: int, scheduler: str) -> A
 
     parameters = inspect.signature(jit_from_cudnn_graph).parameters
     kwargs: dict[str, Any] = {"config": config}
+    # SM120 configurations have no CTA pair, and therefore no cta_group field.
+    config_cta_group = getattr(config, "cta_group", 1)
     if "cta_group" in parameters:
         kwargs["cta_group"] = cta_group
-    elif config.cta_group != cta_group:
+    elif config_cta_group != cta_group:
         raise ValueError(
-            f"tile config {config.name!r} has cta_group={config.cta_group}, "
+            f"tile config {config.name!r} has cta_group={config_cta_group}, "
             f"but --cta-group={cta_group} was requested"
         )
     if "scheduler" in parameters:
@@ -509,12 +511,16 @@ def _export_compiled(args, compiled, config, arch):
         f"{actual_store_mode}{'_quantized' if quantize_output else ''}"
     )
     output_dir = args.output_dir.resolve()
+    # Families of other pipelines (SM120's warp-MMA template) share a dtype
+    # directory with the SM100 ones, so their file names name the pipeline.
+    pipeline = getattr(config, "pipeline", "sm100")
+    pipeline_tag = "" if pipeline == "sm100" else f"_{pipeline}"
     source = _export_source(
         Path(compiled.generated_path),
         output_dir,
         artifact_id,
         replace=args.replace,
-        template_family=f"{op}{'_quantized' if quantize_output else ''}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
+        template_family=f"{op}{'_quantized' if quantize_output else ''}_{dtype}{pipeline_tag}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
         swap_ab=swap_ab,
     )
     tma_slots: frozenset[int] = getattr(compiled, "tma_slots", frozenset())
