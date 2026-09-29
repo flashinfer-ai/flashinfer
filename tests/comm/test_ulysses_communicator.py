@@ -134,6 +134,29 @@ def _make_mock_pcie_comm():
 # ---- PCIe host/mock regressions -----------------------------------------------
 
 
+def test_pcie_dependency_probe_requires_development_headers(monkeypatch, tmp_path):
+    # The CI image has the runtime libraries but may lack the headers needed
+    # to JIT even the all-P2P route.
+    monkeypatch.setattr("ctypes.util.find_library", lambda _name: "present")
+    real_isfile = os.path.isfile
+    monkeypatch.setattr(
+        os.path,
+        "isfile",
+        lambda path: str(path).startswith(str(tmp_path)) and real_isfile(path),
+    )
+    monkeypatch.setenv("CPATH", str(tmp_path))
+    assert set(missing_ulysses_pcie_dependencies()) == {
+        "infiniband/verbs.h",
+        "infiniband/mlx5dv.h",
+    }
+
+    headers = tmp_path / "infiniband"
+    headers.mkdir()
+    (headers / "verbs.h").touch()
+    (headers / "mlx5dv.h").touch()
+    assert missing_ulysses_pcie_dependencies() == []
+
+
 def test_out_storage_overlap_is_rejected_before_backend_launch(monkeypatch):
     ulysses_mod = importlib.import_module("flashinfer.comm.ulysses")
     comm = _make_mock_pcie_comm()
