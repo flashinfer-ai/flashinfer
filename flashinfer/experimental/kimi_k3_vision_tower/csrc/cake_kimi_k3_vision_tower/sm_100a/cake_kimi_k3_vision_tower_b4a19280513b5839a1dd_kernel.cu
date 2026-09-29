@@ -1113,7 +1113,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(512, 1) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_vision_tower_92b9c4aa13630dfc966c(CakeTensorMap const* Q, __nv_bfloat16* __restrict__ Q_raw, CakeTensorMap const* K, CakeTensorMap const* V, __nv_bfloat16* __restrict__ O, CakeTensorMap const* O_tma, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, unsigned long long* __restrict__ probe, unsigned int total_tiles, int num_heads, float softmax_scale_log2)
+kernel_cake_kimi_k3_vision_tower_b4a19280513b5839a1dd(CakeTensorMap const* Q, __nv_bfloat16* __restrict__ Q_raw, CakeTensorMap const* K, CakeTensorMap const* V, __nv_bfloat16* __restrict__ O, CakeTensorMap const* O_tma, int* __restrict__ seg_begin, int* __restrict__ seg_len, int* __restrict__ unit_table, unsigned long long* __restrict__ probe, unsigned int total_tiles, int num_heads, float softmax_scale_log2)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1596,8 +1596,8 @@ kernel_cake_kimi_k3_vision_tower_92b9c4aa13630dfc966c(CakeTensorMap const* Q, __
                     for (int _lf = 0; _lf < 56; _lf++)
                         fma_f32x2_inplace(&reinterpret_cast<float2*>((sv + 16))[_lf], _fma_b2_10, _fma_c2_11);
                     #pragma unroll
-                    for (int _le = 0; _le < 56; _le++) {
-                        if (1 && _le >= 42) {
+                    for (int _le = 0; _le < 16; _le++) {
+                        if (1 && _le >= 12) {
                             float2 _exp2_pair_12 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 16], sv[_le*2 + 1 + 16]));
                             sv[_le*2 + 16] = _exp2_pair_12.x;
                             sv[_le*2 + 1 + 16] = _exp2_pair_12.y;
@@ -1605,6 +1605,32 @@ kernel_cake_kimi_k3_vision_tower_92b9c4aa13630dfc966c(CakeTensorMap const* Q, __
                             sv[_le*2 + 16] = approx_exp2(sv[_le*2 + 16]);
                             sv[_le*2 + 1 + 16] = approx_exp2(sv[_le*2 + 1 + 16]);
                         }
+                    }
+                    #pragma unroll
+                    for (int _le = 0; _le < 16; _le++) {
+                        if (1 && _le >= 12) {
+                            float2 _exp2_pair_13 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 48], sv[_le*2 + 1 + 48]));
+                            sv[_le*2 + 48] = _exp2_pair_13.x;
+                            sv[_le*2 + 1 + 48] = _exp2_pair_13.y;
+                        } else {
+                            sv[_le*2 + 48] = approx_exp2(sv[_le*2 + 48]);
+                            sv[_le*2 + 1 + 48] = approx_exp2(sv[_le*2 + 1 + 48]);
+                        }
+                    }
+                    #pragma unroll
+                    for (int _le = 0; _le < 16; _le++) {
+                        if (1 && _le >= 12) {
+                            float2 _exp2_pair_14 = ex2_emulation_f32x2_value(make_float2(sv[_le*2 + 80], sv[_le*2 + 1 + 80]));
+                            sv[_le*2 + 80] = _exp2_pair_14.x;
+                            sv[_le*2 + 1 + 80] = _exp2_pair_14.y;
+                        } else {
+                            sv[_le*2 + 80] = approx_exp2(sv[_le*2 + 80]);
+                            sv[_le*2 + 1 + 80] = approx_exp2(sv[_le*2 + 1 + 80]);
+                        }
+                    }
+                    #pragma unroll
+                    for (int _le = 0; _le < 16; _le++) {
+                        sv[_le + 112] = approx_exp2(sv[_le + 112]);
                     }
                     int p_addr = s_addr + 64;
                     float2 _f2_0 = make_float2(sv[0], sv[1]);

@@ -168,12 +168,16 @@ def test_select_tile_config_buckets():
         "residual_fc1": ("xs_k4_pf", "xs_pf", "l_e8_pf", "m_p"),
         "residual_fc1_sqxw": ("xs_k4_pf", "xs_pf", "l_e8_pf", "m_p"),
         "norm_gelu": ("xs", "s", "l_e8", "l_e8"),
-        "gelu_erf": ("xs", "s", "l", "l"),
+        # Round 4: the projector GEMMs take the stream-K twin ``l_sk`` inside the tile-census
+        # window (gelu_erf at 10764: 688 pair tiles on 74 clusters, tail 22 = 30 %, saving 7 %).
+        "gelu_erf": ("xs", "s", "l", "l_sk"),
         "rmsnorm": ("s", "s", "l", "l"),
     }
     for variant, names in expect.items():
         got = tuple(select_tile_config(variant, m).name for m in (4, 1024, 4144, 10764))
         assert got == names, (variant, got)
+    # The census is per device: on 160 SMs (80 clusters) the same M leaves a 48-tile tail (60 %), no twin.
+    assert select_tile_config("gelu_erf", 10764, sm_count=160).name == "l"
     # Round-3 per-form boundaries (Cake ``kimi_k3_vision_gemm`` r3 tile-boundary policy):
     # (first M of each interval, tile) over M = 1 .. 20000.
     boundaries = {
@@ -197,8 +201,60 @@ def test_select_tile_config_buckets():
             (8193, "m_p"),
         ],
         "norm_gelu": [(1, "xs"), (257, "s"), (513, "xs"), (769, "s"), (1657, "l_e8")],
-        "gelu_erf": [(1, "xs"), (257, "s"), (513, "xs"), (769, "s"), (1657, "l")],
-        "rmsnorm": [(1, "s"), (1025, "l")],
+        # Round 4: ``l`` <-> ``l_sk`` alternate per 128-row tile pair inside the pair-tile range
+        # wherever the census leaves a tail of <= 30 % of the 74 clusters worth >= 6.5 % of the rounds
+        # (Cake ``_sk_twin``; identical to the Cake rule over M = 1 .. 65536, checked at the re-freeze).
+        "gelu_erf": [
+            (1, "xs"),
+            (257, "s"),
+            (513, "xs"),
+            (769, "s"),
+            (1657, "l"),
+            (2305, "l_sk"),
+            (2561, "l"),
+            (3329, "l_sk"),
+            (3841, "l"),
+            (4609, "l_sk"),
+            (4865, "l"),
+            (5889, "l_sk"),
+            (6145, "l"),
+            (6913, "l_sk"),
+            (7425, "l"),
+            (8193, "l_sk"),
+            (8449, "l"),
+            (9473, "l_sk"),
+            (9729, "l"),
+            (10497, "l_sk"),
+            (11009, "l"),
+            (11777, "l_sk"),
+            (12033, "l"),
+            (12801, "l_sk"),
+            (13057, "l"),
+            (14081, "l_sk"),
+            (14337, "l"),
+        ],
+        "rmsnorm": [
+            (1, "s"),
+            (1025, "l"),
+            (1281, "l_sk"),
+            (1537, "l"),
+            (1793, "l_sk"),
+            (2049, "l"),
+            (2561, "l_sk"),
+            (2817, "l"),
+            (3329, "l_sk"),
+            (3585, "l"),
+            (3841, "l_sk"),
+            (4097, "l"),
+            (4609, "l_sk"),
+            (4865, "l"),
+            (5889, "l_sk"),
+            (6145, "l"),
+            (6657, "l_sk"),
+            (6913, "l"),
+            (7937, "l_sk"),
+            (8193, "l"),
+        ],
     }
     for variant, segments in boundaries.items():
         got, prev = [], None
@@ -211,6 +267,19 @@ def test_select_tile_config_buckets():
     for cfg in TILE_CONFIGS.values():
         assert cfg.cluster_x == cfg.cta_group * cfg.ksplit
         assert not cfg.tail or cfg.ksplit == 1
+        assert not (cfg.sk and (cfg.tail or cfg.ksplit != 1 or cfg.cta_group != 2))
+    # The stream-K twin exists for the pair tile of the projector GEMMs only; above 16 rounds
+    # (M > 17792 for gelu_erf) the window can no longer be met.
+    for variant in expect:
+        if variant not in ("gelu_erf", "rmsnorm"):
+            assert not any(
+                select_tile_config(variant, m).sk for m in range(1, 65537, 128)
+            ), variant
+    assert not any(
+        select_tile_config("gelu_erf", m).sk for m in range(17793, 65537, 128)
+    )
+    assert cb.gemm_stream_k_counts("gelu_erf")[:3] == (2305, 2433, 3329)
+    assert cb.gemm_stream_k_counts("norm_gelu") == ()
     # The tail split-K twins are opt-in in Cake and never selected.
     for variant in expect:
         for m in (4, 256, 257, 1024, 1025, 8192, 8193, 153088):
@@ -244,6 +313,18 @@ def test_gemm_launch_geometry():
     assert (geo.full_tiles, geo.tail_split) == (geo.cluster_tiles, 1)
     with pytest.raises(NotImplementedError):
         gemm_launch_geometry("norm_qkv_rope", TILE_CONFIGS["l_e8_t"], 4144, SM_COUNT)
+    # Stream-K twin (round 4): the full rounds stay data-parallel; the 22-tile tail of gelu_erf
+    # at M = 10764 (688 pair tiles on 74 clusters) is cut into q = 22 k-steps per cluster
+    # (ceil(22 x 64 / 74) = 20, raised to ceil(64 / (SK_MAX_CONTRIB - 1)) = 22).
+    cfg = select_tile_config("gelu_erf", 10764)
+    assert cfg.name == "l_sk" and cfg.sk
+    geo = gemm_launch_geometry("gelu_erf", cfg, 10764, SM_COUNT)
+    assert (geo.grid, geo.m_tiles, geo.cluster_tiles) == ((148, 1, 1), 86, 688)
+    assert (geo.full_tiles, geo.tail_split) == (666, 22)
+    # A tail-free census (37 pair rows x 16 column tiles = 8 x 74) keeps every piece empty: q = 0.
+    geo = gemm_launch_geometry("gelu_erf", TILE_CONFIGS["l_sk"], 9300, SM_COUNT)
+    assert (geo.cluster_tiles, geo.full_tiles, geo.tail_split) == (592, 592, 0)
+    assert cb.stream_k_workspace_ctas(SM_COUNT) == 150
 
 
 def test_required_kernel_keys():
@@ -267,11 +348,18 @@ def test_required_kernel_keys():
         assert (
             "gemm:norm_qkv_rope:l_e8_cs" in gemm_keys and "gemm:gelu_erf:l" in gemm_keys
         )
+        # Round 4: the stream-K twin of the projector GEMMs (a census window, not a bucket).
+        assert "gemm:gelu_erf:l_sk" in gemm_keys and "gemm:rmsnorm:l_sk" in gemm_keys
+        assert not any(
+            k.endswith(":l_sk")
+            for k in gemm_keys
+            if "gelu_erf" not in k and "rmsnorm" not in k
+        )
         # Every registered GEMM tile is a production (non-tail) config.
         assert not any(TILE_CONFIGS[k.split(":")[2]].tail for k in gemm_keys)
         # Only the launched variants (the ``_sq``-only forms are not part of the tower).
         assert not any(k.split(":")[1].endswith("_sq") for k in gemm_keys)
-        assert len(gemm_keys) == len(set(gemm_keys)) == 26
+        assert len(gemm_keys) == len(set(gemm_keys)) == 28
 
 
 @pytest.mark.parametrize("label,grids", list(CONTRACT_GRIDS.items()))
@@ -320,12 +408,20 @@ def test_attention_plan_layout_rule():
         assert plan.ring3 is False  # no arch: the plain form
     # Round 3: the SPLIT_KV form is the shared-O ring per arch / longest segment
     # (every SPLIT_KV row on sm_100a; 576 .. 10764-token segments on sm_103a).
+    # Round 4: sm_100a prices the split layout with its own cost model (the ring loop at
+    # 0.95 blocks per K/V block, a one-block unit boundary, no margin) and routes the long
+    # rows to the ring too; sm_103a keeps the round-3 model (two tiles above 10764 tokens).
     for label, arch, ring3 in (
         ("img_224", "sm_100a", True),
         ("img_224", "sm_103a", False),
         ("img_448", "sm_100a", True),
         ("img_448", "sm_103a", True),
-        ("img_max_4096sq", "sm_100a", False),
+        ("img_1920x1080", "sm_100a", True),
+        ("img_1920x1080", "sm_103a", True),
+        ("batch8_448", "sm_100a", True),
+        ("batch8_448", "sm_103a", False),
+        ("img_max_4096sq", "sm_100a", True),
+        ("img_max_4096sq", "sm_103a", False),
     ):
         plan = build_attention_plan(
             cu_seqlens_of(CONTRACT_GRIDS[label]),
@@ -344,6 +440,22 @@ def test_attention_plan_layout_rule():
         tiles_per_cta=2,
     )
     assert forced.tiles_per_cta == 2 and forced.total_clusters == 1
+    # The per-arch split cost model: eight 1024-token segments (8 K/V blocks each) cost 30 blocks
+    # per cluster on two tiles (192 units x (8 + 2) over 74 clusters, 3 rounds); the split layout
+    # (384 half-units, 6 rounds) costs 36 under the H3 model (4 + 2 per unit; sm_103a / no arch:
+    # two tiles) and 28.8 under the sm_100a model (0.95 x 4 + 1: the ring).
+    lens = [1024] * 8
+    for arch, mode, split in (
+        ("sm_100a", MODE_SPLIT_KV, 28.8),
+        ("sm_103a", MODE_TWO_TILE, 36.0),
+        (None, MODE_TWO_TILE, 36.0),
+    ):
+        sel = cb.select_tiles_per_cta(lens, HEADS, GRID_CLUSTERS, arch)
+        assert sel["tiles_per_cta"] == mode, (arch, sel)
+        assert sel["makespan"][MODE_TWO_TILE] == pytest.approx(30.0), (arch, sel)
+        assert sel["makespan"][MODE_SPLIT_KV] == pytest.approx(split), (arch, sel)
+    assert cb.split_cost_model(None) is cb.SPLIT_COST_MODELS["r3"]
+    assert cb.split_cost_model("sm_103a") is cb.SPLIT_COST_MODELS["r3"]
 
 
 def test_attention_plan_drops_empty_segments():
@@ -468,6 +580,22 @@ def test_plan_on_cpu_device_needs_sm_count():
     assert plan.workspace["u32_dummy"].dtype == torch.uint32
     assert plan.workspace["x"].shape == (264, HIDDEN)
     assert plan.workspace["xw"].shape == (264, HIDDEN)
+    # No stream-K tile in this plan: no partial workspace.
+    assert "sk_ws" not in plan.workspace and "sk_flags" not in plan.workspace
+    # img_1920x1080 (T = 10764, 2691 merged tokens): the projector RMSNorm GEMM takes the
+    # stream-K twin, so the plan owns the FP32 partial workspace (150 CTAs x 3 pieces x
+    # 128 x 256) and the zeroed arrival counters of the Cake launcher's ``_tail_buffers``.
+    sk_plan = build_kimi_k3_vision_plan(
+        CONTRACT_GRIDS["img_1920x1080"], "cpu", num_layers=1, sm_count=SM_COUNT
+    )
+    assert sk_plan.merged_tokens == 2691
+    assert sk_plan.gemm_configs["rmsnorm"] == "l_sk"
+    assert sk_plan.gemm_configs["gelu_erf"] == "l"
+    assert sk_plan.workspace["sk_ws"].shape == (150 * 3 * 128 * 256,)
+    assert sk_plan.workspace["sk_ws"].dtype == torch.float32
+    assert sk_plan.workspace["sk_flags"].shape == (150,)
+    assert sk_plan.workspace["sk_flags"].dtype == torch.uint32
+    assert int(sk_plan.workspace["sk_flags"].sum()) == 0
     assert plan.workspace["stats"].shape == (264, cb.STATS_PARTS)
     assert plan.workspace["stats"].dtype == torch.float32
 

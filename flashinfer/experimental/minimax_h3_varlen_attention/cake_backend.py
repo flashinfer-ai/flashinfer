@@ -352,7 +352,7 @@ def bf16_grid_clusters(device: torch.device) -> int:
     return max(1, torch.cuda.get_device_properties(device).multi_processor_count // 2)
 
 
-def assign_unit_slots(unit_costs: Sequence[int], num_clusters: int) -> list[int]:
+def assign_unit_slots(unit_costs: Sequence[float], num_clusters: int) -> list[int]:
     """Longest-processing-time-first placement of units into persistent-grid slots.
 
     Slot ``k * num_clusters + i`` is the ``k``-th unit of cluster ``i``.  The
