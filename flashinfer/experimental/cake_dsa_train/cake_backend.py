@@ -792,6 +792,8 @@ def prepare_dsa_train(
     values = _seed_values(t, scalars) if abi == ABI_SEED else _contract_values(t, scalars)
     num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     wanted = FORWARD_STAGES + (BACKWARD_STAGES if backward else ())
+    if dkv_fp32:
+        wanted = tuple(s for s in wanted if s != "bwd_cast")  # the FP32 accumulators are the outputs
     launches = {}
     for stage in stages:
         if stage not in wanted:

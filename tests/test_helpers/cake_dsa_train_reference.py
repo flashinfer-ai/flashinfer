@@ -204,7 +204,8 @@ def reference_fp64(
     the exact row maximum, row sum over the unrounded values, output rounded
     to BF16 -- its error against ``out`` is the floor such a kernel can reach)
     and, with ``dout``, ``dq_latent``, ``dq_rope``, ``dkv_latent [S, 512]``,
-    ``dk_rope [S, 64]``; with ``own_key`` also the mean softmax mass on the
+    ``dk_rope [S, 64]`` plus their ``*_emu`` BF16-P/dS numerics floors (P and dS
+    rounded to BF16 at the MMA inputs, BF16 outputs); with ``own_key`` also the mean softmax mass on the
     query's own key (``self_weight``).  Slots that are ``-1``, ``>= S`` or
     ``>= topk_length[t]`` are invalid.
     """
@@ -219,6 +220,12 @@ def reference_fp64(
     dqr = torch.empty(total_q, NUM_HEADS, D_ROPE, dtype=torch.float64, device=device) if want_grad else None
     dkvl = torch.zeros(total_k, D_LATENT, dtype=torch.float64, device=device) if want_grad else None
     dkr = torch.zeros(total_k, D_ROPE, dtype=torch.float64, device=device) if want_grad else None
+    # BF16-P/dS numerics floor of the backward: P and dS rounded to BF16 where a kernel feeds them to
+    # its MMAs, FP32-exact accumulation, BF16 outputs (dQ directly, dKV/dKr after the FP32 sum).
+    dql_emu = torch.empty_like(dql) if want_grad else None
+    dqr_emu = torch.empty_like(dqr) if want_grad else None
+    dkvl_emu = torch.zeros_like(dkvl) if want_grad else None
+    dkr_emu = torch.zeros_like(dkr) if want_grad else None
     self_w = torch.zeros((), dtype=torch.float64, device=device)
     slot = torch.arange(indices.shape[1], device=device)
     for r0 in range(0, total_q, chunk_rows):
@@ -254,9 +261,20 @@ def reference_fp64(
             dkr.index_add_(0, ix[valid], torch.einsum("thw,thd->twd", ds, qr)[valid])
             dvl = torch.einsum("thw,thd->twd", ds, ql) + torch.einsum("thw,thd->twd", p, g)
             dkvl.index_add_(0, ix[valid], dvl[valid])
+            p_b = p.to(torch.bfloat16).double()
+            ds_b = ds.to(torch.bfloat16).double()
+            dqr_emu[r0:r1] = torch.einsum("thw,twd->thd", ds_b, kg).to(torch.bfloat16).double()
+            dql_emu[r0:r1] = torch.einsum("thw,twd->thd", ds_b, vg).to(torch.bfloat16).double()
+            dkr_emu.index_add_(0, ix[valid], torch.einsum("thw,thd->twd", ds_b, qr)[valid])
+            dkvl_emu.index_add_(0, ix[valid], (torch.einsum("thw,thd->twd", ds_b, ql) + torch.einsum("thw,thd->twd", p_b, g))[valid])
+            del p_b, ds_b
     result = dict(out=out, lse=lse, out_emu=out_emu)
     if want_grad:
-        result.update(dq_latent=dql, dq_rope=dqr, dkv_latent=dkvl, dk_rope=dkr)
+        result.update(
+            dq_latent=dql, dq_rope=dqr, dkv_latent=dkvl, dk_rope=dkr,
+            dq_latent_emu=dql_emu, dq_rope_emu=dqr_emu,
+            dkv_latent_emu=dkvl_emu.to(torch.bfloat16).double(), dk_rope_emu=dkr_emu.to(torch.bfloat16).double(),
+        )
     if own_key is not None:
         result["self_weight"] = (self_w / (total_q * NUM_HEADS)).item()
     return result

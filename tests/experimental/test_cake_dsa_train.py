@@ -283,17 +283,23 @@ def _check_forward(inp, out, lse, ref, *, valid_rows=None):
         assert torch.all(out[rows] == 0)
 
 
-def _check_backward(grads, ref, *, peaked=False):
-    dq_latent, dq_rope, dkv_latent, dk_rope = grads
+def _check_backward(grads, ref, *, canonical=False, peaked=False):
+    """Every gradient within 1.05x its BF16-P/dS numerics floor on the same inputs; the canonical
+    iid top-k-2048 configuration also within the fixed gates calibrated there."""
+    names = ("dq_latent", "dq_rope", "dkv_latent", "dk_rope")
     for g in grads:
         assert torch.isfinite(g.float()).all()
-    dq_gate = GATE_PEAKED if peaked else GATE_DQ_LATENT
-    dkv_gate = GATE_PEAKED if peaked else GATE_DKV_LATENT
-    rope_factor = 1.0 if peaked else GATE_ROPE_FACTOR
-    assert rel_l2(dq_latent, ref["dq_latent"]) <= dq_gate
-    assert rel_l2(dq_rope, ref["dq_rope"]) <= dq_gate * rope_factor
-    assert rel_l2(dkv_latent, ref["dkv_latent"]) <= dkv_gate
-    assert rel_l2(dk_rope, ref["dk_rope"]) <= dkv_gate * rope_factor
+    for g, name in zip(grads, names, strict=True):
+        got, floor = rel_l2(g, ref[name]), rel_l2(ref[f"{name}_emu"], ref[name])
+        assert got <= FLOOR_MARGIN * floor + FLOOR_ABS, f"{name}: rel-L2 {got:.6f} vs floor {floor:.6f}"
+    if canonical:
+        dq_gate = GATE_PEAKED if peaked else GATE_DQ_LATENT
+        dkv_gate = GATE_PEAKED if peaked else GATE_DKV_LATENT
+        rope_factor = 1.0 if peaked else GATE_ROPE_FACTOR
+        assert rel_l2(grads[0], ref["dq_latent"]) <= dq_gate
+        assert rel_l2(grads[1], ref["dq_rope"]) <= dq_gate * rope_factor
+        assert rel_l2(grads[2], ref["dkv_latent"]) <= dkv_gate
+        assert rel_l2(grads[3], ref["dk_rope"]) <= dkv_gate * rope_factor
 
 
 @pytest.mark.parametrize("topk", [128, 200])
@@ -377,15 +383,16 @@ def test_runner_launches_without_allocation():
     assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
 
 
-def test_backward_iid():
+@pytest.mark.parametrize("seq_q, seq_k, topk, canonical", [(384, 1024, 200, False), (256, 4096, 2048, True)])
+def test_backward_iid(seq_q, seq_k, topk, canonical):
     _require_program(backward=True)
-    inp = make_inputs([384], [1024], seed=SEED + 6, topk=200)
+    inp = make_inputs([seq_q], [seq_k], seed=SEED + 6, topk=topk)
     out, lse, o_lo = cake_backend.forward(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
     grads = cake_backend.backward(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, out, o_lo, lse, inp.dout)
     torch.cuda.synchronize()
     ref = reference_fp64(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, dout=inp.dout)
     _check_forward(inp, out, lse, ref)
-    _check_backward(grads, ref)
+    _check_backward(grads, ref, canonical=canonical)
 
 
 def test_backward_masked_rows_give_zero_dq():
@@ -455,4 +462,6 @@ def test_backward_dkv_fp32_returns_accumulators():
     torch.cuda.synchronize()
     assert dkv_latent.dtype == torch.float32 and dk_rope.dtype == torch.float32
     ref = reference_fp64(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, dout=inp.dout)
-    assert rel_l2(dkv_latent, ref["dkv_latent"]) <= GATE_DKV_LATENT
+    # the FP32 accumulators are at least as close to the reference as their BF16 casts' floor
+    assert rel_l2(dkv_latent, ref["dkv_latent"]) <= FLOOR_MARGIN * rel_l2(ref["dkv_latent_emu"], ref["dkv_latent"]) + FLOOR_ABS
+    assert rel_l2(dk_rope, ref["dk_rope"]) <= FLOOR_MARGIN * rel_l2(ref["dk_rope_emu"], ref["dk_rope"]) + FLOOR_ABS
