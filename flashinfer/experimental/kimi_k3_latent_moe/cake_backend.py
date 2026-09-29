@@ -533,9 +533,15 @@ def front_grid(m_tiles: int, i_local: int) -> int:
 FRONT_BLOCK_N = 256
 FRONT_NUM_K_ITERS = HIDDEN // BLOCK_K  # 112 K iterations per 256 x 256 pair tile
 FRONT_SPLIT = 2  # trailing-wave tiles cut into two aligned K halves (round-8 rule)
-FRONT_SK_EPI_ITERS = 18  # exposed stream-K epilogue of the last contributor, in K iterations
-FRONT_SK_MIN_GAIN = 0.04  # split only when the modelled saving is >= 4 % of the whole-tile cost
-FRONT_EVICT_FIRST_MAX_PAIR_ROWS = 2  # weight boxes re-read by <= 2 pair rows stream evict_first
+FRONT_SK_EPI_ITERS = (
+    18  # exposed stream-K epilogue of the last contributor, in K iterations
+)
+FRONT_SK_MIN_GAIN = (
+    0.04  # split only when the modelled saving is >= 4 % of the whole-tile cost
+)
+FRONT_EVICT_FIRST_MAX_PAIR_ROWS = (
+    2  # weight boxes re-read by <= 2 pair rows stream evict_first
+)
 
 
 def front_split_plan(cluster_tiles: int, sm_count: int = SM_COUNT) -> dict[str, int]:
@@ -582,7 +588,9 @@ def front_kernel_key(i_local: int, evict_first: bool = False) -> str:
     return f"front:i{int(i_local)}" + ("e1" if evict_first else "")
 
 
-def prefill_front_plan(M: int, i_local: int, sm_count: int = SM_COUNT) -> dict[str, Any]:
+def prefill_front_plan(
+    M: int, i_local: int, sm_count: int = SM_COUNT
+) -> dict[str, Any]:
     """Host plan of the prefill front GEMM (one persistent launch) for ``M`` tokens of one rank."""
     m_tiles = m_tiles_for(M)
     n_tiles = front_n_tiles(i_local)
@@ -1131,7 +1139,9 @@ def prepare_kimi_k3_latent_moe_front(
         else:
             plan = prefill_front_plan(T, i_local)
             key = front_kernel_key(i_local, plan["evict_first"])
-            ws, counters = _front_workspace(device, plan["sk_tiles"], plan["sk_max_seg"])
+            ws, counters = _front_workspace(
+                device, plan["sk_tiles"], plan["sk_max_seg"]
+            )
             kwargs = dict(
                 A=x,
                 WG=gate_weight,

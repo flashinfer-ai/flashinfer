@@ -198,26 +198,54 @@ def test_split_plan_rules():
 def test_front_split_plan_rules():
     # Round-8 rule: the trailing wave's tiles become two aligned K halves when the halves fit one wave of the
     # 74 resident clusters and the modelled saving is >= 4 % of the whole-tile cost; every other shape runs whole.
-    whole = dict(num_items=48, full_items=48, sk_ipc=112, sk_max_seg=1, sk_total=0, sk_tiles=0)
-    assert front_split_plan(48, SM_COUNT) == whole  # TP8 T=512: 96 halves would need two waves
+    whole = dict(
+        num_items=48, full_items=48, sk_ipc=112, sk_max_seg=1, sk_total=0, sk_tiles=0
+    )
+    assert (
+        front_split_plan(48, SM_COUNT) == whole
+    )  # TP8 T=512: 96 halves would need two waves
     assert front_split_plan(24, SM_COUNT) == dict(
-        num_items=48, full_items=0, sk_ipc=56, sk_max_seg=2, sk_total=24 * 112, sk_tiles=24
+        num_items=48,
+        full_items=0,
+        sk_ipc=56,
+        sk_max_seg=2,
+        sk_total=24 * 112,
+        sk_tiles=24,
     )  # TP8 T=256
     assert front_split_plan(96, SM_COUNT) == dict(
-        num_items=118, full_items=74, sk_ipc=56, sk_max_seg=2, sk_total=22 * 112, sk_tiles=22
+        num_items=118,
+        full_items=74,
+        sk_ipc=56,
+        sk_max_seg=2,
+        sk_total=22 * 112,
+        sk_tiles=22,
     )  # TP8 T=1024
-    assert front_split_plan(384, SM_COUNT)["sk_tiles"] == 14  # TP8 T=4096: 370 whole + 14 x 2
-    assert front_split_plan(528, SM_COUNT)["sk_tiles"] == 10  # TP1 T=2048: 518 whole + 10 x 2
-    assert front_split_plan(768, SM_COUNT)["sk_tiles"] == 0  # TP8 T=8192: 3.1 % modelled -> whole
-    assert front_split_plan(1056, SM_COUNT)["sk_tiles"] == 0  # TP1 T=4096: 2.3 % modelled -> whole
+    assert (
+        front_split_plan(384, SM_COUNT)["sk_tiles"] == 14
+    )  # TP8 T=4096: 370 whole + 14 x 2
+    assert (
+        front_split_plan(528, SM_COUNT)["sk_tiles"] == 10
+    )  # TP1 T=2048: 518 whole + 10 x 2
+    assert (
+        front_split_plan(768, SM_COUNT)["sk_tiles"] == 0
+    )  # TP8 T=8192: 3.1 % modelled -> whole
+    assert (
+        front_split_plan(1056, SM_COUNT)["sk_tiles"] == 0
+    )  # TP1 T=4096: 2.3 % modelled -> whole
     for tiles in (66, 132, 264, 192, 1536, 2112, 4224):
         assert front_split_plan(tiles, SM_COUNT)["sk_max_seg"] == 1
     plan = prefill_front_plan(1024, i_local_for_tp(8))
-    assert plan["cluster_tiles"] == 96 and plan["grid"] == 118 * 2 and not plan["evict_first"]
+    assert (
+        plan["cluster_tiles"] == 96
+        and plan["grid"] == 118 * 2
+        and not plan["evict_first"]
+    )
     assert prefill_front_plan(256, i_local_for_tp(1))["evict_first"]
     assert prefill_front_plan(512, i_local_for_tp(8))["evict_first"]
     assert not prefill_front_plan(1024, i_local_for_tp(1))["evict_first"]
-    assert prefill_front_plan(256, i_local_for_tp(1))["grid"] == cb.front_grid(cb.m_tiles_for(256), i_local_for_tp(1))
+    assert prefill_front_plan(256, i_local_for_tp(1))["grid"] == cb.front_grid(
+        cb.m_tiles_for(256), i_local_for_tp(1)
+    )
     assert cb.front_evict_first(4) and not cb.front_evict_first(6)
 
 
