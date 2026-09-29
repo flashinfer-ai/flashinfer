@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import threading
 import weakref
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Union
@@ -2908,16 +2909,64 @@ _Sm120Workspace = Union[
 ]
 
 # Stores the workspace with the largest capacity seen per key and never
-# shrinks within a process. clear_sm120_moe_caches() releases everything.
+# shrinks within a process. clear_sm120_moe_caches() releases entries that no
+# captured CUDA graph references; graph-referenced entries are parked instead
+# (see _GRAPH_REFERENCED_WORKSPACES).
 _WORKSPACE_CACHE: Dict[Tuple, _Sm120Workspace] = {}
+# Workspaces handed out while a CUDA graph capture was underway. A captured
+# graph replays through the workspace's raw device pointers, so once a
+# workspace is graph-referenced its storage must not return to the allocator
+# while any capturing graph can still replay: replacement or cache clearing
+# would let the freed pages back a later unrelated allocation that replay
+# then overwrites. Growth is one parked workspace per replacement or clear of
+# a graph-referenced entry; release_graph_referenced_workspaces() frees them
+# once the caller has destroyed every graph captured against them.
+_GRAPH_REFERENCED_WORKSPACES: list = []
+# Serializes cache lookup and marking against replacement and clearing so a
+# concurrent mutation cannot drop a workspace between a capture-time cache
+# read and its graph-referenced marking.
+_WORKSPACE_CACHE_LOCK = threading.Lock()
+
+
+def _mark_graph_referenced(workspace):
+    if workspace is not None and _is_cuda_graph_capturing():
+        workspace._sm12x_graph_referenced = True
+    return workspace
+
+
+def _retire_workspace(workspace) -> None:
+    """Drop a cache entry; graph-referenced storage is parked, not freed."""
+    if workspace is not None and getattr(workspace, "_sm12x_graph_referenced", False):
+        _GRAPH_REFERENCED_WORKSPACES.append(workspace)
+
+
+def release_graph_referenced_workspaces() -> None:
+    """Free workspaces parked for captured CUDA graphs.
+
+    Only call this after every CUDA graph captured while SM12x MoE
+    workspaces were cached has been destroyed; a remaining graph would
+    replay through freed storage. Graph-referenced markers on workspaces
+    still in the cache are also cleared, since the graphs that recorded
+    them no longer exist.
+    """
+    with _WORKSPACE_CACHE_LOCK:
+        _GRAPH_REFERENCED_WORKSPACES.clear()
+        for workspace in _WORKSPACE_CACHE.values():
+            if getattr(workspace, "_sm12x_graph_referenced", False):
+                workspace._sm12x_graph_referenced = False  # type: ignore[union-attr]
 
 
 def clear_sm120_moe_caches() -> None:
     """Release every module-level SM12x MoE cache.
 
-    References held by callers are unaffected.
+    References held by callers are unaffected. Workspaces recorded by a
+    captured CUDA graph are parked instead of released; see
+    release_graph_referenced_workspaces().
     """
-    _WORKSPACE_CACHE.clear()
+    with _WORKSPACE_CACHE_LOCK:
+        for workspace in _WORKSPACE_CACHE.values():
+            _retire_workspace(workspace)
+        _WORKSPACE_CACHE.clear()
     _WEIGHT_CACHE.clear()
     _W4A16_WEIGHT_CACHE.clear()
     _PADDED_WEIGHT_CACHE.clear()
@@ -3046,43 +3095,45 @@ def _get_cached_workspace(
         activation,
         tile_m,
     )
-    cached = _WORKSPACE_CACHE.get(cache_key)
+    with _WORKSPACE_CACHE_LOCK:
+        cached = _WORKSPACE_CACHE.get(cache_key)
 
-    if cached is not None:
-        if isinstance(cached, Sm120DynamicMoEWorkspace):
-            if cached.routed_rows_capacity >= max(1, routed_rows):
-                assert tile_m is None or cached.tile_m == tile_m
-                return cached
-        elif isinstance(cached, Sm120W4A16MoEWorkspace):
-            if cached.routed_rows_capacity >= max(1, routed_rows):
-                return cached
-        else:
-            if cached.max_rows >= max(1, routed_rows):
-                return cached
+        if cached is not None:
+            if isinstance(cached, Sm120DynamicMoEWorkspace):
+                if cached.routed_rows_capacity >= max(1, routed_rows):
+                    assert tile_m is None or cached.tile_m == tile_m
+                    return _mark_graph_referenced(cached)
+            elif isinstance(cached, Sm120W4A16MoEWorkspace):
+                if cached.routed_rows_capacity >= max(1, routed_rows):
+                    return _mark_graph_referenced(cached)
+            else:
+                if cached.max_rows >= max(1, routed_rows):
+                    return _mark_graph_referenced(cached)
 
-    if quant_mode == "w4a16" and _is_cuda_graph_capturing():
-        raise RuntimeError(
-            "W4A16 workspace is not initialized for CUDA graph capture; "
-            "provide a preallocated workspace from "
-            "allocate_sm120_moe_workspace(..., quant_mode='w4a16') or warm the "
-            "functional path before capture."
+        if quant_mode == "w4a16" and _is_cuda_graph_capturing():
+            raise RuntimeError(
+                "W4A16 workspace is not initialized for CUDA graph capture; "
+                "provide a preallocated workspace from "
+                "allocate_sm120_moe_workspace(..., quant_mode='w4a16') or warm the "
+                "functional path before capture."
+            )
+        workspace = allocate_sm120_moe_workspace(
+            state_E=state_E,
+            weight_E=weight_E,
+            routed_rows=routed_rows,
+            k=k,
+            n=n,
+            num_topk=num_topk,
+            device=device,
+            quant_mode=quant_mode,
+            activation_precision=activation_precision,
+            backend=backend,
+            activation=activation,
         )
-    workspace = allocate_sm120_moe_workspace(
-        state_E=state_E,
-        weight_E=weight_E,
-        routed_rows=routed_rows,
-        k=k,
-        n=n,
-        num_topk=num_topk,
-        device=device,
-        quant_mode=quant_mode,
-        activation_precision=activation_precision,
-        backend=backend,
-        activation=activation,
-    )
 
-    _WORKSPACE_CACHE[cache_key] = workspace
-    return workspace
+        _retire_workspace(cached)
+        _WORKSPACE_CACHE[cache_key] = workspace
+        return _mark_graph_referenced(workspace)
 
 
 # ==========================================================================
