@@ -503,6 +503,22 @@ never touch the peer. Measured on B300 (same GPU, paired, FP64-checked):
 EP=8 single-expert decode rows 1.08-1.09 x (20.9-21.7 -> 19.2-20.0 us),
 EP=8 ``empty`` T=128 1.10 x, the shard unchanged.
 
+The dense finalize-fusion GEMM2 of the split form obeys the same rule
+since round 31: it executes ``griddepcontrol.wait`` (and its early
+trigger) before the tile-scheduler setup, ahead of its first read of the
+wide-tile count and lists. It used to read them first and wait after the
+cluster wait, which is safe only when the producer of its dependency
+triggers after its own wait; the dense gather GEMM1 triggers at entry
+(``SWAPAB_SPLIT_EARLY_TRIGGER``), so the finalize grid could start while
+the routing kernel was still writing the lists and its scheduler warp
+loaded ``tile_idx_to_expert_idx`` with a stale group index (GPU core dump
+on B300: ``cudaErrorIllegalAddress`` / ``cudaErrorInvalidAddressSpace``
+in about 1 of 30 graph replays of the ``swap_split_form_matches_default``
+selection, on main as well). With the wait first: 0 faults in 150
+full-selection replays under ``CUDA_LAUNCH_BLOCKING=1``, memcheck and
+synccheck clean over the selection; the raster sample and the first tile
+are still emitted before the cluster wait.
+
 Routing preprocessing (expert histogram, permutation, per-row scale, output
 clear) runs as one fused CuTe kernel whenever ``T * top_k <= 8192``
 (``FUSED_ROUTE_MAX_ROUTES``, T <= 512 for Kimi K3) or, on a rank with at
