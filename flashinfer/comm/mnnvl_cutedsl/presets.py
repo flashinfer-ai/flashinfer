@@ -28,16 +28,24 @@ from .config import (
 from .kernel_bt import (
     BT_ALL_REDUCE_GB300_TP4_H5120_PRESET_0,
     BT_ALL_REDUCE_GB300_TP4_H5120_PRESET_1,
+    BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_0,
+    BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_1,
     BT_ALL_REDUCE_GB300_TP8_H5120_PRESET_0,
     BT_ALL_REDUCE_GB300_TP8_H5120_PRESET_1,
+    BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_0,
+    BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_1,
     BT_FINALIZE_GB300_TP4_H5120_K3_PRESET_0,
     BT_FINALIZE_GB300_TP4_H5120_K3_PRESET_1,
     BT_FINALIZE_GB300_TP4_H5120_K6_PRESET_0,
     BT_FINALIZE_GB300_TP4_H5120_K6_PRESET_1,
+    BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_0,
+    BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_1,
     BT_FINALIZE_GB300_TP8_H5120_K3_PRESET_0,
     BT_FINALIZE_GB300_TP8_H5120_K3_PRESET_1,
     BT_FINALIZE_GB300_TP8_H5120_K6_PRESET_0,
     BT_FINALIZE_GB300_TP8_H5120_K6_PRESET_1,
+    BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_0,
+    BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_1,
     BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_0,
     BT_ALL_REDUCE_GB300_TP16_H8192_PRESET_1,
     BT_ALL_REDUCE_GB300_TP8_H8192_PRESET_0,
@@ -49,11 +57,15 @@ from .kernel_bt import (
 )
 from .kernel_ll import (
     LL_ALL_REDUCE_GB300_TP4_H5120,
+    LL_ALL_REDUCE_GB300_TP4_H7168,
     LL_ALL_REDUCE_GB300_TP8_H5120,
+    LL_ALL_REDUCE_GB300_TP8_H7168,
     LL_FINALIZE_GB300_TP4_H5120_K3,
     LL_FINALIZE_GB300_TP4_H5120_K6,
+    LL_FINALIZE_GB300_TP4_H7168_K16,
     LL_FINALIZE_GB300_TP8_H5120_K3,
     LL_FINALIZE_GB300_TP8_H5120_K6,
+    LL_FINALIZE_GB300_TP8_H7168_K16,
     LL_ALL_REDUCE_GB300_TP16_H8192,
     LL_ALL_REDUCE_GB300_TP8_H8192,
     LL_FINALIZE_GB300_TP16_H8192_K10,
@@ -61,8 +73,10 @@ from .kernel_ll import (
 )
 from .kernel_ht import (
     HT_ALL_REDUCE_GB300_TP4_H5120,
+    HT_ALL_REDUCE_GB300_TP4_H7168,
     HT_FINALIZE_GB300_TP4_H5120_K3,
     HT_FINALIZE_GB300_TP4_H5120_K6,
+    HT_FINALIZE_GB300_TP4_H7168_K16,
     HT_ALL_REDUCE_GB300_TP16_H8192,
     HT_ALL_REDUCE_GB300_TP8_H8192,
     HT_FINALIZE_GB300_TP16_H8192_K10,
@@ -336,6 +350,185 @@ def _h5120_profiles(
     )
 
 
+# hidden_size=7168, bf16, top_k=16 (Kimi K3), TP4 and TP8. HT is legal only
+# at TP4 because the TP8 reduction shard is not divisible by a warp; see the
+# shape proof beside the H7168 HT presets in kernel_ht/protocol.py.
+_H7168_HIDDEN = 7168
+_H7168_TOP_K = 16
+_H7168_TP_SIZES = (4, 8)
+
+_LL_H7168_FINALIZE = {
+    4: LL_FINALIZE_GB300_TP4_H7168_K16,
+    8: LL_FINALIZE_GB300_TP8_H7168_K16,
+}
+_LL_H7168_ALL_REDUCE = {
+    4: LL_ALL_REDUCE_GB300_TP4_H7168,
+    8: LL_ALL_REDUCE_GB300_TP8_H7168,
+}
+_BT_H7168_FINALIZE = {
+    4: (
+        BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_0,
+        BT_FINALIZE_GB300_TP4_H7168_K16_PRESET_1,
+    ),
+    8: (
+        BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_0,
+        BT_FINALIZE_GB300_TP8_H7168_K16_PRESET_1,
+    ),
+}
+_BT_H7168_ALL_REDUCE = {
+    4: (
+        BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_0,
+        BT_ALL_REDUCE_GB300_TP4_H7168_PRESET_1,
+    ),
+    8: (
+        BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_0,
+        BT_ALL_REDUCE_GB300_TP8_H7168_PRESET_1,
+    ),
+}
+_HT_H7168_FINALIZE = {4: HT_FINALIZE_GB300_TP4_H7168_K16}
+_HT_H7168_ALL_REDUCE = {4: HT_ALL_REDUCE_GB300_TP4_H7168}
+
+# Boundaries come from the 30-repeat CUDA-graph finalist sweep over M=1..8192.
+# They retain one LL and two BT regions per TP: this compact routing is within
+# 0.3% geometric mean of selecting the best finalist independently at every M.
+_H7168_FINALIZE_LL_MAX = {4: 24, 8: 12}
+_H7168_ALL_REDUCE_LL_MAX = {4: 28, 8: 12}
+_H7168_FINALIZE_BT_SPLIT = {4: 512, 8: 512}
+_H7168_ALL_REDUCE_BT_SPLIT = {4: 512, 8: 256}
+_H7168_FINALIZE_BT_MAX = {4: 768}
+_H7168_ALL_REDUCE_BT_MAX = {4: 2048}
+
+
+def _h7168_ll_only_finalize(tp: int) -> MRangeDispatch:
+    return MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.LL, _LL_H7168_FINALIZE[tp]),),
+    )
+
+
+def _h7168_ll_only_all_reduce(tp: int) -> MRangeDispatch:
+    return MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.LL, _LL_H7168_ALL_REDUCE[tp]),),
+    )
+
+
+def _h7168_bt_only_finalize(tp: int) -> MRangeDispatch:
+    preset_0, preset_1 = _BT_H7168_FINALIZE[tp]
+    return MRangeDispatch(
+        upper_bounds=(_H7168_FINALIZE_BT_SPLIT[tp], None),
+        targets=(
+            _target(ProtocolKind.BT, preset_0),
+            _target(ProtocolKind.BT, preset_1),
+        ),
+    )
+
+
+def _h7168_bt_only_all_reduce(tp: int) -> MRangeDispatch:
+    preset_0, preset_1 = _BT_H7168_ALL_REDUCE[tp]
+    return MRangeDispatch(
+        upper_bounds=(_H7168_ALL_REDUCE_BT_SPLIT[tp], None),
+        targets=(
+            _target(ProtocolKind.BT, preset_0),
+            _target(ProtocolKind.BT, preset_1),
+        ),
+    )
+
+
+def _h7168_ht_only_finalize(tp: int) -> MRangeDispatch:
+    return MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.HT, _HT_H7168_FINALIZE[tp]),),
+    )
+
+
+def _h7168_ht_only_all_reduce(tp: int) -> MRangeDispatch:
+    return MRangeDispatch(
+        upper_bounds=(None,),
+        targets=(_target(ProtocolKind.HT, _HT_H7168_ALL_REDUCE[tp]),),
+    )
+
+
+def _h7168_default_finalize(tp: int) -> MRangeDispatch:
+    preset_0, preset_1 = _BT_H7168_FINALIZE[tp]
+    if tp in _HT_H7168_FINALIZE:
+        return MRangeDispatch(
+            upper_bounds=(
+                _H7168_FINALIZE_LL_MAX[tp],
+                _H7168_FINALIZE_BT_SPLIT[tp],
+                _H7168_FINALIZE_BT_MAX[tp],
+                None,
+            ),
+            targets=(
+                _target(ProtocolKind.LL, _LL_H7168_FINALIZE[tp]),
+                _target(ProtocolKind.BT, preset_0),
+                _target(ProtocolKind.BT, preset_1),
+                _target(ProtocolKind.HT, _HT_H7168_FINALIZE[tp]),
+            ),
+        )
+    return MRangeDispatch(
+        upper_bounds=(
+            _H7168_FINALIZE_LL_MAX[tp],
+            _H7168_FINALIZE_BT_SPLIT[tp],
+            None,
+        ),
+        targets=(
+            _target(ProtocolKind.LL, _LL_H7168_FINALIZE[tp]),
+            _target(ProtocolKind.BT, preset_0),
+            _target(ProtocolKind.BT, preset_1),
+        ),
+    )
+
+
+def _h7168_default_all_reduce(tp: int) -> MRangeDispatch:
+    preset_0, preset_1 = _BT_H7168_ALL_REDUCE[tp]
+    if tp in _HT_H7168_ALL_REDUCE:
+        return MRangeDispatch(
+            upper_bounds=(
+                _H7168_ALL_REDUCE_LL_MAX[tp],
+                _H7168_ALL_REDUCE_BT_SPLIT[tp],
+                _H7168_ALL_REDUCE_BT_MAX[tp],
+                None,
+            ),
+            targets=(
+                _target(ProtocolKind.LL, _LL_H7168_ALL_REDUCE[tp]),
+                _target(ProtocolKind.BT, preset_0),
+                _target(ProtocolKind.BT, preset_1),
+                _target(ProtocolKind.HT, _HT_H7168_ALL_REDUCE[tp]),
+            ),
+        )
+    return MRangeDispatch(
+        upper_bounds=(
+            _H7168_ALL_REDUCE_LL_MAX[tp],
+            _H7168_ALL_REDUCE_BT_SPLIT[tp],
+            None,
+        ),
+        targets=(
+            _target(ProtocolKind.LL, _LL_H7168_ALL_REDUCE[tp]),
+            _target(ProtocolKind.BT, preset_0),
+            _target(ProtocolKind.BT, preset_1),
+        ),
+    )
+
+
+def _h7168_profiles(
+    finalize_routes: Callable[[int], MRangeDispatch],
+    all_reduce_routes: Callable[[int], MRangeDispatch],
+    tp_sizes: tuple[int, ...] = _H7168_TP_SIZES,
+) -> tuple[StaticProfile, ...]:
+    return tuple(
+        StaticProfile(
+            tp_size=tp,
+            hidden_size=_H7168_HIDDEN,
+            top_k=_H7168_TOP_K,
+            dtype=torch.bfloat16,
+            finalize_routes=finalize_routes(tp),
+            all_reduce_routes=all_reduce_routes(tp),
+        )
+        for tp in tp_sizes
+    )
+
+
 LL_ONLY_CONFIG = MNNVLCuteDSLConfig(
     profiles=(
         StaticProfile(
@@ -387,6 +580,7 @@ LL_ONLY_CONFIG = MNNVLCuteDSLConfig(
             ),
         ),
         *_h5120_profiles(_h5120_ll_only_finalize, _h5120_ll_only_all_reduce),
+        *_h7168_profiles(_h7168_ll_only_finalize, _h7168_ll_only_all_reduce),
     ),
     # Protocol-pinned: these ranges force one protocol rather than describe a
     # crossover, so the config suits either apply_rms_norm setting.
@@ -461,6 +655,7 @@ BT_ONLY_CONFIG = MNNVLCuteDSLConfig(
             ),
         ),
         *_h5120_profiles(_h5120_bt_only_finalize, _h5120_bt_only_all_reduce),
+        *_h7168_profiles(_h7168_bt_only_finalize, _h7168_bt_only_all_reduce),
     ),
     # Protocol-pinned: these ranges force one protocol rather than describe a
     # crossover, so the config suits either apply_rms_norm setting.
@@ -520,6 +715,9 @@ HT_ONLY_CONFIG = MNNVLCuteDSLConfig(
         ),
         *_h5120_profiles(
             _h5120_ht_only_finalize, _h5120_ht_only_all_reduce, tp_sizes=(4,)
+        ),
+        *_h7168_profiles(
+            _h7168_ht_only_finalize, _h7168_ht_only_all_reduce, tp_sizes=(4,)
         ),
     ),
     # Protocol-pinned: these ranges force one protocol rather than describe a
@@ -627,6 +825,7 @@ DEFAULT_CONFIG = MNNVLCuteDSLConfig(
             ),
         ),
         *_h5120_profiles(_h5120_default_finalize, _h5120_default_all_reduce),
+        *_h7168_profiles(_h7168_default_finalize, _h7168_default_all_reduce),
     )
 )
 

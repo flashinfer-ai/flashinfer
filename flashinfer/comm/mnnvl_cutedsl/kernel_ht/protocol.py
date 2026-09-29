@@ -103,6 +103,19 @@ HT_ALL_REDUCE_GB300_TP4_H5120 = HTAllReduceTuning(
     consumer_threads=128, vectors_per_thread=5, reduction_warps=1
 )
 
+# hidden_size=7168, bf16, top_k=16 (Kimi K3), TP4 only. A token is 896
+# bf16x8 packs, or 224 packs per TP4 reduction shard, which is divisible by
+# one 32-thread reduction warp. At TP8 the shard has 112 packs and no legal
+# reduction-warp count divides it, so TP8 remains on BT for large M. Both
+# measured TP4 consumer shapes tile all 896 packs exactly: finalize prefers
+# 448x2, while all-reduce prefers the lower-thread-count 128x7 shape.
+HT_FINALIZE_GB300_TP4_H7168_K16 = HTFinalizeTuning(
+    consumer_threads=448, vectors_per_thread=2, reduction_warps=1
+)
+HT_ALL_REDUCE_GB300_TP4_H7168 = HTAllReduceTuning(
+    consumer_threads=128, vectors_per_thread=7, reduction_warps=1
+)
+
 
 @dataclass(slots=True)
 class HTProtocolState:
