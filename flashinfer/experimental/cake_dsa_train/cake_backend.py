@@ -204,7 +204,8 @@ def _check_head_tensor(t: torch.Tensor, name: str, last: int) -> None:
         raise ValueError(f"{name} must be a BF16 [T, {NUM_HEADS}, {last}] tensor")
     if t.dtype != torch.bfloat16:
         raise ValueError(f"{name} must be bfloat16")
-    if t.stride(2) != 1 or t.stride(1) != last:
+    # Heads are ``last`` apart in a contiguous tensor and ``D_QK`` apart in a view of a packed [T, 64, 576] tensor.
+    if t.stride(2) != 1 or t.stride(1) not in (last, D_QK):
         raise ValueError(
             f"{name} must be contiguous within a token row (a view of a packed "
             f"[T, {NUM_HEADS}, {D_QK}] tensor is allowed)"
