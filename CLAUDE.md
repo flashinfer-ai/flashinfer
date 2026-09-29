@@ -40,6 +40,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Skip MoE EP CuTe-DSL import/version guard | `export FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1` |
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
+| Enable MoE EP EXPERT_MAJOR padding-row exclusion (opt-in; shape-dependent) | `export FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1` |
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
 | Override Prims-TS CuTe-DSL compile options | `export FLASHINFER_PRIMS_TS_COMPILE_OPTIONS="--opt-level 2"` |
@@ -192,7 +193,7 @@ times = bench_gpu_time(
 median_time_ms = statistics.median(times)
 ```
 
-→ **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/skill.md`](.claude/skills/benchmark-kernel/skill.md)**
+→ **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/SKILL.md`](.claude/skills/benchmark-kernel/SKILL.md)**
 
 `flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous` is the standalone
 CuTe-DSL grouped FP8 API; `group_deepgemm_fp8_nt_groupwise` keeps its original
@@ -237,6 +238,13 @@ missed:
   a reproducible benchmark (e.g. `benchmarks/flashinfer_benchmark.py`), naming the GPU and the
   problem sizes. Speedup ratios without absolute numbers, or numbers without a named GPU, are
   not enough.
+
+When preparing changes for a PR, a self-review is strongly recommended: follow
+[`.claude/skills/self-review/SKILL.md`](.claude/skills/self-review/SKILL.md), which walks the
+diff through the repository's review guidance and PR rules. It is informal and not required —
+its purpose is to make review easier for reviewers and contributors alike by catching common
+issues before a human looks. Changes made only to test something locally, with no PR intended,
+do not need one.
 
 → **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**
 
@@ -288,7 +296,7 @@ FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some k
 - JIT modules specify `supported_major_versions=[9, 10, 11, 12]` to limit compilation to specific SM versions
 - If GPU not supported → `RuntimeError: No supported CUDA architectures found`
 
-→ **See [`.claude/skills/add-cuda-kernel/skill.md`](.claude/skills/add-cuda-kernel/skill.md) for usage examples**
+→ **See [`.claude/skills/add-cuda-kernel/SKILL.md`](.claude/skills/add-cuda-kernel/SKILL.md) for usage examples**
 
 ### Layer 2: Code Generation
 
@@ -409,7 +417,7 @@ flashinfer/
 
 ## Adding a New Operation
 
-→ **For complete step-by-step tutorial, see [`.claude/skills/add-cuda-kernel/skill.md`](.claude/skills/add-cuda-kernel/skill.md)**
+→ **For complete step-by-step tutorial, see [`.claude/skills/add-cuda-kernel/SKILL.md`](.claude/skills/add-cuda-kernel/SKILL.md)**
 
 **Quick overview of the process:**
 1. Write kernel in `include/flashinfer/new_op.cuh` (framework-agnostic, raw pointers)
@@ -532,7 +540,7 @@ python my_script.py
 - Track tensor shapes/dtypes through pipeline
 - Detect NaN/Inf issues (level 5)
 
-→ **For complete debugging guide, see [`.claude/skills/debug-cuda-crash/skill.md`](.claude/skills/debug-cuda-crash/skill.md)**
+→ **For complete debugging guide, see [`.claude/skills/debug-cuda-crash/SKILL.md`](.claude/skills/debug-cuda-crash/SKILL.md)**
 
 ## Debugging
 
@@ -587,6 +595,7 @@ match what the code uses today; values are strings unless noted.
 |----------|---------|---------|--------|
 | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
+| `FLASHINFER_CUDNN_FROST_PTXAS` | unset | `flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/compiler.py` | Select an external PTXAS executable path for all Frost dtypes; unset or empty uses the bundled assembler. The executable path, version, and SHA-256 participate in compiler and tactic cache identities. |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the AOT/JIT-cache version check that pins flashinfer-jit-cache to the installed flashinfer-python. Bypass only when you intentionally mix versions. |
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
 | `FLASHINFER_JIT_PREBUILD_MAX_JOBS` | unset (uses `MAX_JOBS`) | `flashinfer/jit/core.py` | Maximum parallel Ninja jobs for a bulk `build_jit_specs()` prebuild. This does not control ordinary on-demand module builds. The sharded test runner sets it to the host-wide automatic build budget before reducing each worker's `MAX_JOBS`; an explicit value is preserved. |

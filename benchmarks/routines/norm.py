@@ -31,6 +31,23 @@ from .flashinfer_benchmark_utils import (
 )
 
 
+def _fp8_code_stats(ref, out):
+    """Compare two fp8 tensors in code space. Returns (n_beyond_one_ulp, n_elements, pct, n_ties)."""
+
+    def order(t):
+        c = t.view(torch.uint8).to(torch.int16)
+        return torch.where(c & 0x80 != 0, -(c & 0x7F), c & 0x7F)
+
+    n = ref.numel()
+    nan = torch.isnan(ref.float()) | torch.isnan(out.float())
+    dist = (order(out) - order(ref)).abs()
+    dist = torch.where(nan, torch.zeros_like(dist), dist)
+    n_nan = int((torch.isnan(out.float()) & ~torch.isnan(ref.float())).sum())
+    n_bad = int((dist > 1).sum()) + n_nan
+    n_ties = int((dist == 1).sum())
+    return n_bad, n, n_bad / n * 100.0, n_ties
+
+
 def run_norm_test(args):
     """
     Run a norm test.
@@ -961,18 +978,21 @@ def testRmsnormQuant(args):
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                # Compare in float for FP8 outputs
-                ref_float = reference_output.float()
-                out_float = tested_outputs[i].float()
                 (
                     num_different_elements,
                     num_elements,
                     num_different_elements_percentage,
-                ) = is_close_stats(ref_float, out_float, rtol=1e-1, atol=1e-1)
+                    num_one_ulp_ties,
+                ) = _fp8_code_stats(reference_output, tested_outputs[i])
+                if num_one_ulp_ties > 0 and args.verbose >= 1:
+                    print(
+                        f"[INFO] Backend {tested_backends[i]}: {num_one_ulp_ties}/{num_elements} "
+                        f"({num_one_ulp_ties / num_elements * 100:.2f}%) elements land on an adjacent fp8 code"
+                    )
                 if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
-                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ by more than one fp8 code"
                     )
                     if not args.allow_output_mismatch:
                         raise AssertionError(
@@ -1128,8 +1148,8 @@ def testLayernormQuant(args):
         )
         # The CUDA kernel rounds the normalized value to bf16 before scaling
         # and again before casting to fp8; the CuTe-DSL kernel stays in fp32.
-        # Mirror each so 1-ulp fp8 differences do not trip the tight refcheck
-        # tolerance.
+        # Mirror each so a backend's own rounding does not inflate the
+        # adjacent-fp8-code tie count.
         cuda_ref = (
             (layernorm_output.to(input_dtype).float() / scale)
             .to(input_dtype)
@@ -1171,18 +1191,23 @@ def testLayernormQuant(args):
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                # Compare in float for FP8 outputs
-                ref_float = reference_outputs[tested_backends[i]].float()
-                out_float = tested_outputs[i].float()
                 (
                     num_different_elements,
                     num_elements,
                     num_different_elements_percentage,
-                ) = is_close_stats(ref_float, out_float, rtol=1e-1, atol=1e-1)
+                    num_one_ulp_ties,
+                ) = _fp8_code_stats(
+                    reference_outputs[tested_backends[i]], tested_outputs[i]
+                )
+                if num_one_ulp_ties > 0 and args.verbose >= 1:
+                    print(
+                        f"[INFO] Backend {tested_backends[i]}: {num_one_ulp_ties}/{num_elements} "
+                        f"({num_one_ulp_ties / num_elements * 100:.2f}%) elements land on an adjacent fp8 code"
+                    )
                 if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
-                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ by more than one fp8 code"
                     )
                     if not args.allow_output_mismatch:
                         raise AssertionError(
@@ -1373,18 +1398,21 @@ def testFusedAddRmsnormQuant(args):
     if len(tested_backends) > 0:
         if run_refcheck and has_reference_output:
             for i in range(len(tested_backends)):
-                # Compare in float for FP8 outputs
-                ref_float = reference_output.float()
-                out_float = tested_outputs[i].float()
                 (
                     num_different_elements,
                     num_elements,
                     num_different_elements_percentage,
-                ) = is_close_stats(ref_float, out_float, rtol=1e-1, atol=1e-1)
+                    num_one_ulp_ties,
+                ) = _fp8_code_stats(reference_output, tested_outputs[i])
+                if num_one_ulp_ties > 0 and args.verbose >= 1:
+                    print(
+                        f"[INFO] Backend {tested_backends[i]}: {num_one_ulp_ties}/{num_elements} "
+                        f"({num_one_ulp_ties / num_elements * 100:.2f}%) elements land on an adjacent fp8 code"
+                    )
                 if num_different_elements > 0:
                     print(
                         f"[ERROR] Output tensor mismatch from backend {tested_backends[i]}: "
-                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ"
+                        f"{num_different_elements}/{num_elements} ({num_different_elements_percentage:.2f}%) elements differ by more than one fp8 code"
                     )
                     if not args.allow_output_mismatch:
                         raise AssertionError(
@@ -1954,6 +1982,7 @@ def testFusedDitLayernorm(args):
     hidden_dim = 3072
     eps = args.eps
     mode = args.dit_mode
+    is_cuda_graph_compatible = not args.no_cuda_graph
 
     torch.manual_seed(42)
     input_t = torch.randn(
@@ -1988,7 +2017,7 @@ def testFusedDitLayernorm(args):
 
     if mode == "gate_residual_gamma_beta":
 
-        def fused_fn():
+        def fused_fn(input_t, residual):
             return fused_dit_gate_residual_layernorm_gamma_beta(
                 input_t,
                 residual,
@@ -1999,14 +2028,14 @@ def testFusedDitLayernorm(args):
                 epsilon=eps,
             )
 
-        def eager_fn():
+        def eager_fn(input_t, residual):
             r = residual.float() + input_t.float() * (gate.float() + gate_bias.float())
             n = torch.layer_norm(r, [hidden_dim], weight=gamma, bias=beta, eps=eps)
             return r.to(torch.bfloat16), n.to(torch.bfloat16)
 
     elif mode == "gate_residual_scale_shift":
 
-        def fused_fn():
+        def fused_fn(input_t, residual):
             return fused_dit_gate_residual_layernorm_scale_shift(
                 input_t,
                 residual,
@@ -2019,7 +2048,7 @@ def testFusedDitLayernorm(args):
                 epsilon=eps,
             )
 
-        def eager_fn():
+        def eager_fn(input_t, residual):
             r = residual.float() + input_t.float() * (
                 c_gate.float() + c_gate_bias.float()
             )
@@ -2031,7 +2060,7 @@ def testFusedDitLayernorm(args):
 
     elif mode == "residual_scale_shift":
 
-        def fused_fn():
+        def fused_fn(input_t, residual):
             return fused_dit_residual_layernorm_scale_shift(
                 input_t,
                 c_scale,
@@ -2042,7 +2071,7 @@ def testFusedDitLayernorm(args):
                 epsilon=eps,
             )
 
-        def eager_fn():
+        def eager_fn(input_t, residual):
             r = residual.float() + input_t.float()
             n = torch.layer_norm(r, [hidden_dim], eps=eps)
             n = n * (1 + c_scale.float() + c_scale_bias.float()) + (
@@ -2055,10 +2084,20 @@ def testFusedDitLayernorm(args):
 
     # Warmup + benchmark
     fused_times = bench_gpu_time(
-        fused_fn, enable_cupti=True, dry_run_iters=10, repeat_iters=100
+        fused_fn,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+        input_args=(input_t, residual),
     )
     eager_times = bench_gpu_time(
-        eager_fn, enable_cupti=True, dry_run_iters=10, repeat_iters=100
+        eager_fn,
+        dry_run_iters=args.dry_run_iters,
+        repeat_iters=args.num_iters,
+        enable_cupti=args.use_cupti,
+        use_cuda_graph=is_cuda_graph_compatible,
+        input_args=(input_t, residual),
     )
 
     fused_ms = float(np.median(fused_times))
@@ -2066,8 +2105,8 @@ def testFusedDitLayernorm(args):
 
     # Reference check
     if args.refcheck:
-        r_fused, n_fused = fused_fn()
-        r_eager, n_eager = eager_fn()
+        r_fused, n_fused = fused_fn(input_t, residual)
+        r_eager, n_eager = eager_fn(input_t, residual)
         torch.testing.assert_close(
             r_fused.float(), r_eager.float(), rtol=1.6e-2, atol=1e-5
         )
@@ -2182,7 +2221,7 @@ def testFusedQkRmsnormRope(args):
         is_qk_norm=True,
     )
 
-    def run_fused():
+    def run_fused(qkv=qkv):
         return fused_qk_rmsnorm_rope(qkv, q_weight, k_weight, **kwargs)
 
     # Reference check
@@ -2219,6 +2258,7 @@ def testFusedQkRmsnormRope(args):
         repeat_iters=args.num_iters,
         enable_cupti=args.use_cupti,
         use_cuda_graph=is_cuda_graph_compatible,
+        input_args=(qkv,),
     )
 
     if len(backend_times) > 0:
