@@ -223,11 +223,8 @@ def collect_module_alias_exports(
     A `.rst` file may document ``flashinfer.comm.vllm_all_reduce`` whose
     actual definition lives in ``flashinfer.comm.vllm_ar`` as ``def all_reduce``
     (decorated with ``@flashinfer_api``). We follow ``ast.ImportFrom`` chains
-    inside package ``__init__.py`` files to surface the *aliased* name under
-    the *importing* module's dotted path. Imports in ordinary implementation
-    modules count only when the surfaced name is explicitly listed in a
-    statically declared module ``__all__``; otherwise they are internal
-    dependencies, not public API re-exports.
+    inside any ``__init__.py`` (and other modules) to surface the *aliased*
+    name under the *importing* module's dotted path.
 
     Returns ``{importing_module_dotted: set(alias_name, ...)}`` containing
     aliases that ultimately resolve to a ``@decorator``-decorated top-level
@@ -251,7 +248,7 @@ def collect_module_alias_exports(
                 available.setdefault(mod, set()).add(node.name)
 
     pkg_dotted = pkg_root.name
-    raw_imports: list[tuple[str, str, list[ast.alias], set[str] | None]] = []
+    raw_imports: list[tuple[str, str, list[ast.alias]]] = []
 
     class ModuleScopeImportFromVisitor(ast.NodeVisitor):
         """Visit imports reachable without entering a nested scope."""
@@ -274,48 +271,6 @@ def collect_module_alias_exports(
         def visit_ClassDef(self, node: ast.ClassDef) -> None:
             return
 
-    def explicit_module_exports(tree: ast.Module) -> set[str] | None:
-        """Return a literal module ``__all__``, or ``None`` when absent/dynamic."""
-
-        exports: set[str] | None = None
-        for node in tree.body:
-            value: ast.expr | None = None
-            if (
-                isinstance(node, ast.Assign)
-                and any(
-                    isinstance(target, ast.Name) and target.id == "__all__"
-                    for target in node.targets
-                )
-            ) or (
-                isinstance(node, ast.AnnAssign)
-                and isinstance(node.target, ast.Name)
-                and node.target.id == "__all__"
-            ):
-                value = node.value
-            elif (
-                isinstance(node, ast.AugAssign)
-                and isinstance(node.target, ast.Name)
-                and node.target.id == "__all__"
-                and isinstance(node.op, ast.Add)
-            ):
-                value = node.value
-                if exports is None:
-                    return None
-            else:
-                continue
-
-            if not isinstance(value, (ast.List, ast.Tuple, ast.Set)) or not all(
-                isinstance(item, ast.Constant) and isinstance(item.value, str)
-                for item in value.elts
-            ):
-                return None
-            names = {item.value for item in value.elts}
-            if isinstance(node, ast.AugAssign):
-                exports.update(names)
-            else:
-                exports = names
-        return exports
-
     for py_file in sorted(pkg_root.rglob("*.py")):
         try:
             tree = ast.parse(
@@ -326,9 +281,6 @@ def collect_module_alias_exports(
         importer_mod = module_name(py_file, pkg_root)
         importer_parts = importer_mod.split(".")
         is_package = py_file.name == "__init__.py"
-        public_names = None if is_package else explicit_module_exports(tree)
-        if not is_package and public_names is None:
-            continue
         visitor = ModuleScopeImportFromVisitor()
         visitor.visit(tree)
         for node in visitor.imports:
@@ -347,21 +299,19 @@ def collect_module_alias_exports(
                 if not node.module or not node.module.startswith(pkg_dotted):
                     continue
                 target_mod = node.module
-            raw_imports.append((importer_mod, target_mod, node.names, public_names))
+            raw_imports.append((importer_mod, target_mod, node.names))
 
     aliases: dict[str, set[str]] = {}
     changed = True
     while changed:
         changed = False
-        for importer_mod, target_mod, names, public_names in raw_imports:
+        for importer_mod, target_mod, names in raw_imports:
             for alias in names:
-                surfaced = alias.asname or alias.name
-                if public_names is not None and surfaced not in public_names:
-                    continue
                 if alias.name == "*" or alias.name not in available.get(
                     target_mod, set()
                 ):
                     continue
+                surfaced = alias.asname or alias.name
                 target_names = available.setdefault(importer_mod, set())
                 if surfaced in target_names:
                     continue
