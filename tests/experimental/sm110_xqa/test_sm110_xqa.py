@@ -232,7 +232,7 @@ CACHE_CASES = [
 ]
 
 
-KERNELS = ("tcgen05", "register_mma")
+KERNELS = ("tcgen05", "register_mma", "tmem")
 
 
 def _tree_case(
@@ -247,6 +247,8 @@ def _tree_case(
     paged,
     kernel="tcgen05",
 ):
+    if kernel == "tmem" and ratio != 8:
+        pytest.skip("tmem routes are frozen for GQA ratio 8")
     q = _sample((batch, queries, 4 * ratio, 512), distribution)
     kv = _sample((batch, 2, 4, capacity, 512), distribution, seed=29)
     kv[:, 0].mul_(0.5)
@@ -317,6 +319,98 @@ def test_tree_cache(
         paged,
         kernel,
     )
+
+
+TMEM_CASES = [
+    # (batch, queries, ratio): even and odd numbers of 128-row Q tiles per KV head
+    # (the (2, 2, 1) K/V-multicast form and the (2, 1, 1) Q-multicast fallback).
+    (1, 20, 8),
+    (2, 32, 8),
+    (1, 7, 8),
+    (1, 33, 8),
+]
+
+
+@pytest.mark.parametrize("kernel", ("tmem", "auto"))
+@pytest.mark.parametrize(
+    "fp8,paged", [(False, False), (False, True), (True, False), (True, True)]
+)
+@pytest.mark.parametrize("batch,queries,ratio", TMEM_CASES)
+def test_tree_tmem_all_cache_modes(batch, queries, ratio, fp8, paged, kernel):
+    _tree_case(
+        batch, queries, 256, ratio, None, "uniform", "binary_tree", fp8, paged, kernel
+    )
+
+
+@pytest.mark.parametrize(
+    "fp8,paged", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_auto_routes_to_tmem(fp8, paged):
+    q = _sample((1, 20, 32, 512))
+    kv = _sample((1, 2, 4, 256, 512), seed=29)
+    seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
+    stored, pages, _, k_scale, v_scale = _cache(kv, fp8, paged)
+    prepared = prepare(
+        q,
+        stored,
+        seq,
+        mask=_mask(20, 1, "causal"),
+        page_table=pages,
+        page_size=128 if paged else 0,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kernel="auto",
+    )
+    precision = "fp8" if fp8 else "fp16"
+    layout = "paged" if paged else "contiguous"
+    assert prepared.route == f"tree_{precision}_{layout}_tmem"
+    assert get_manifest()["routes"][prepared.route]["kernel"] == "tmem"
+
+
+@pytest.mark.parametrize("fp8,paged", [(False, False), (False, True), (True, True)])
+def test_tmem_rejects_other_gqa_ratios(fp8, paged):
+    q = _sample((1, 20, 16, 512))
+    kv = _sample((1, 2, 4, 256, 512), seed=29)
+    seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
+    stored, pages, _, k_scale, v_scale = _cache(kv, fp8, paged)
+    with pytest.raises(ValueError, match="GQA ratio 8"):
+        prepare(
+            q,
+            stored,
+            seq,
+            mask=_mask(20, 1, "causal"),
+            page_table=pages,
+            page_size=128 if paged else 0,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            kernel="tmem",
+        )
+
+
+@pytest.mark.parametrize(
+    "fp8,paged", [(False, False), (False, True), (True, False), (True, True)]
+)
+def test_auto_keeps_register_routes_off_ratio_8(fp8, paged):
+    q = _sample((1, 20, 16, 512))
+    kv = _sample((1, 2, 4, 256, 512), seed=29)
+    seq = torch.full((1,), 256, device="cuda", dtype=torch.int32)
+    stored, pages, dense, k_scale, v_scale = _cache(kv, fp8, paged)
+    prepared = prepare(
+        q,
+        stored,
+        seq,
+        mask=_mask(20, 1, "causal"),
+        page_table=pages,
+        page_size=128 if paged else 0,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        kernel="auto",
+    )
+    precision, layout = "fp8" if fp8 else "fp16", "paged" if paged else "contiguous"
+    suffix = "_mma_split" if (not fp8 and paged) else "_mma"
+    assert prepared.route == f"tree_{precision}_{layout}{suffix}"
+    expected = _oracle(q, dense, [256], _mask(20, 1, "causal"))
+    torch.testing.assert_close(prepared.run(), expected, atol=1e-2, rtol=1e-2)
 
 
 SPLIT_KERNELS = ("register_mma_split", "register_mma_auto")

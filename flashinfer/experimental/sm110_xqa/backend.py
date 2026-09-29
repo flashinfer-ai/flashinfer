@@ -15,6 +15,8 @@ from ...utils import register_custom_op, register_fake_op
 from .jit import (
     MMA_ROUTE_SUFFIX,
     SPLIT_ROUTE_SUFFIX,
+    TMEM_GQA_RATIO,
+    TMEM_ROUTE_SUFFIX,
     TREE_KERNELS,
     gen_sm110_xqa_module,
     get_manifest,
@@ -272,7 +274,11 @@ def prepare(
     ``"register_mma_split"`` (the same Q tile, two eight-warp groups over the two
     KV halves with an in-CTA merge; frozen for FP16 page128 KV only) or
     ``"register_mma_auto"`` (``register_mma_split`` for FP16 page128 KV, the
-    ``register_mma`` route for every other D512 cache mode).
+    ``register_mma`` route for every other D512 cache mode), ``"tmem"`` (the
+    tcgen05/TMEM-accumulator schedule: 128-row Q tile x 256-column output half per
+    CTA, Q and K/V fetched once per thread-block cluster by TMA multicast; every
+    D512 cache mode, frozen for GQA ratio 8) or ``"auto"`` (the ``tmem`` route at
+    GQA ratio 8, the ``register_mma_auto`` selection for the other ratios).
     Preparation performs compilation and may allocate output/scratch; call it
     before graph capture. D128 counters are zeroed once on the current stream;
     another launch stream must explicitly wait for that preparation stream.
@@ -280,9 +286,9 @@ def prepare(
     """
     _tensor(q, "q", dtype=torch.float16)
     require_sm110(q.device)
-    if kernel not in TREE_KERNELS + ("register_mma_auto",):
+    if kernel not in TREE_KERNELS + ("register_mma_auto", "auto"):
         raise ValueError(
-            f"kernel must be one of {TREE_KERNELS + ('register_mma_auto',)}"
+            f"kernel must be one of {TREE_KERNELS + ('register_mma_auto', 'auto')}"
         )
     if q.ndim not in (3, 4) or q.shape[-1] not in (128, 512):
         raise ValueError("q must be rank 3 or 4 with head dimension 128 or 512")
@@ -502,9 +508,18 @@ def prepare(
     layout = "paged" if page_table is not None else "contiguous"
     route = f"tree_{precision}_{layout}"
     fp16_paged = precision == "fp16" and layout == "paged"
+    if kernel == "auto":
+        kernel = "tmem" if ratio == TMEM_GQA_RATIO else "register_mma_auto"
     if kernel == "register_mma_auto":
         kernel = "register_mma_split" if fp16_paged else "register_mma"
-    if kernel == "register_mma_split":
+    if kernel == "tmem":
+        if ratio != TMEM_GQA_RATIO:
+            raise ValueError(
+                f"tmem is frozen for GQA ratio {TMEM_GQA_RATIO} (query heads = "
+                f"{TMEM_GQA_RATIO} x KV heads); use register_mma_auto for other ratios"
+            )
+        route += TMEM_ROUTE_SUFFIX
+    elif kernel == "register_mma_split":
         if not fp16_paged:
             raise ValueError(
                 "register_mma_split is frozen for FP16 page128 KV only; use "

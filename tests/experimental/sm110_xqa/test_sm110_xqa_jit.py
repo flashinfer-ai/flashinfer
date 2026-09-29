@@ -30,6 +30,17 @@ def _package(tmp_path):
                 "nvcc_options": [],
                 **(
                     {
+                        "kernel": "tmem",
+                        "tile_rows": 128,
+                        "output_tile_columns": 256,
+                        "block": [512, 1, 1],
+                        "cluster": [2, 2, 1],
+                        "fallback_cluster": [2, 1, 1],
+                        "fallback_kernel_symbol": "integrity_fallback",
+                        "gqa_ratio": 8,
+                    }
+                    if name.startswith("tree_") and name.endswith("_tmem")
+                    else {
                         "kernel": "register_mma_split",
                         "tile_rows": 32,
                         "output_tile_columns": 512,
@@ -116,7 +127,7 @@ def test_incomplete_route_inventory_is_rejected(tmp_path):
     manifest = _package(tmp_path)
     del manifest["routes"]["decode_merge"]
     _write(tmp_path, manifest)
-    with pytest.raises(ValueError, match="all ten"):
+    with pytest.raises(ValueError, match="all fourteen"):
         _read_manifest(tmp_path)
 
 

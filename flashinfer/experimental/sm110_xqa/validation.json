@@ -1315,5 +1315,807 @@
       "gpufull": 13
     },
     "schedule_harness_reference": "two Thor nodes, strict cold-L2 CUPTI paired timing: split 33.50/34.10 us vs register_mma 35.58/36.88 us cold, 21.60/21.71 vs 22.59/22.56 us warm (FP16 page128)"
+  },
+  "tmem": {
+    "gpu": "NVIDIA Thor",
+    "host": "sr250v3-0666",
+    "multiprocessors": 20,
+    "torch": "2.15.0a0+875d815502.nvinternal.main",
+    "cuda": "13.4",
+    "protocol": {
+      "timer": "CUPTI kernel-span timer of the frozen-schedule harness (cold L2 flush before every sample, no backend fallback)",
+      "pairs": 6,
+      "samples_per_round": 256,
+      "warmup_ms": 250.0,
+      "order": "round r: Cake->Export if r even else Export->Cake",
+      "metric": "ratio of medians of round medians",
+      "gate": "abs(export/schedule - 1) <= 0.03 on every row; correctness before and after timing (atol=rtol=1e-2 FP16, 0.1 FP8 vs the other arm and FP32 oracle)"
+    },
+    "rows": [
+      {
+        "name": "tree_fp16_contiguous_tmem",
+        "mode": "fp16_contiguous",
+        "shape": {
+          "batch": 1,
+          "queries": 20,
+          "heads": 32,
+          "kv_heads": 4,
+          "dim": 512,
+          "capacity": 256
+        },
+        "route": "tree_fp16_contiguous_tmem",
+        "jit_module": "sm110_xqa_tree_fp16_contiguous_tmem_da988afccf6c2bfe5810",
+        "kernel_symbol": "kernel_sm110_xqa_tree_fp16_contiguous_tmem",
+        "source_cubin_sha256": "2e8662c075ee9c6b02863da747b471a37beef3ec27fe369299755cc80485131d",
+        "input_sha256": {
+          "q": "ac80ded5ef5092207ce9df8a7040b4390a1e2c68ddbc582c213a0ece5e3d49e3",
+          "kv": "fd8c70468851a2fee4019abd23a45993bed081d20a3c208a75e0e7f2fb540d1b",
+          "lengths": "bf5e8ffa51a9e748985800c1d3d7f1a2a6ae7435136593ca8d9637e3f87c699c",
+          "mask": "26cae58e9756e70a22f0f67d6d1e2e88da75118099830c427a35109428fd6a47"
+        },
+        "frozen_schedule_us": 30.576,
+        "native_export_us": 30.368,
+        "export_over_schedule": 0.9931972789115645,
+        "absolute_relative_error_percent": 0.6802721088435493,
+        "cake_first_ratio": 0.9937238493723848,
+        "export_first_ratio": 0.9947698744769874,
+        "round_export_over_schedule": [
+          0.9900783289817232,
+          0.9947534102833159,
+          0.9937238493723848,
+          0.995798319327731,
+          0.9947643979057592,
+          0.9947698744769874
+        ],
+        "rounds": [
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 30.64,
+              "n": 256,
+              "min_us": 29.312,
+              "max_us": 45.983999999999995
+            },
+            "export": {
+              "median_us": 30.336,
+              "n": 256,
+              "min_us": 28.992,
+              "max_us": 41.375
+            },
+            "export_over_cake": 0.9900783289817232
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 30.336,
+              "n": 256,
+              "min_us": 28.736,
+              "max_us": 38.080000000000005
+            },
+            "cake": {
+              "median_us": 30.496,
+              "n": 256,
+              "min_us": 28.991,
+              "max_us": 41.664
+            },
+            "export_over_cake": 0.9947534102833159
+          },
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 30.592000000000002,
+              "n": 256,
+              "min_us": 29.503999999999998,
+              "max_us": 41.952000000000005
+            },
+            "export": {
+              "median_us": 30.4,
+              "n": 256,
+              "min_us": 29.536,
+              "max_us": 37.567
+            },
+            "export_over_cake": 0.9937238493723848
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 30.336,
+              "n": 256,
+              "min_us": 29.215999999999998,
+              "max_us": 41.408
+            },
+            "cake": {
+              "median_us": 30.464000000000002,
+              "n": 256,
+              "min_us": 29.055999999999997,
+              "max_us": 39.967999999999996
+            },
+            "export_over_cake": 0.995798319327731
+          },
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 30.56,
+              "n": 256,
+              "min_us": 29.152,
+              "max_us": 41.792
+            },
+            "export": {
+              "median_us": 30.4,
+              "n": 256,
+              "min_us": 29.183,
+              "max_us": 40.96
+            },
+            "export_over_cake": 0.9947643979057592
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 30.432000000000002,
+              "n": 256,
+              "min_us": 29.184,
+              "max_us": 43.839999999999996
+            },
+            "cake": {
+              "median_us": 30.592000000000002,
+              "n": 256,
+              "min_us": 29.44,
+              "max_us": 39.711000000000006
+            },
+            "export_over_cake": 0.9947698744769874
+          }
+        ],
+        "correctness": [
+          {
+            "stage": "pre",
+            "max_abs_cake_vs_export": 0.0,
+            "max_abs_cake_vs_oracle": 0.0001220703125,
+            "max_abs_export_vs_oracle": 0.0001220703125,
+            "tol": 0.01
+          },
+          {
+            "stage": "post",
+            "max_abs_cake_vs_export": 0.0,
+            "max_abs_cake_vs_oracle": 0.0001220703125,
+            "max_abs_export_vs_oracle": 0.0001220703125,
+            "tol": 0.01
+          }
+        ],
+        "passed": true,
+        "physical_seconds": 28.889072342019062
+      },
+      {
+        "name": "tree_fp16_paged_tmem",
+        "mode": "fp16_paged",
+        "shape": {
+          "batch": 1,
+          "queries": 20,
+          "heads": 32,
+          "kv_heads": 4,
+          "dim": 512,
+          "capacity": 256
+        },
+        "route": "tree_fp16_paged_tmem",
+        "jit_module": "sm110_xqa_tree_fp16_paged_tmem_da988afccf6c2bfe5810",
+        "kernel_symbol": "kernel_sm110_xqa_tree_fp16_paged_tmem",
+        "source_cubin_sha256": "f1f8f090b341615acd4ffac5e02df86d83f7483fe2f8d35cafa121f33580bec0",
+        "input_sha256": {
+          "q": "ac80ded5ef5092207ce9df8a7040b4390a1e2c68ddbc582c213a0ece5e3d49e3",
+          "kv": "d43e36fa7d6284f987e1ee88a319f08411ecd7c5643fb40b970831300eb2c537",
+          "lengths": "bf5e8ffa51a9e748985800c1d3d7f1a2a6ae7435136593ca8d9637e3f87c699c",
+          "mask": "26cae58e9756e70a22f0f67d6d1e2e88da75118099830c427a35109428fd6a47",
+          "pages": "baed642339816affb3fe8719792d0e4ce82f12db72b7373d244eaa65445800fe"
+        },
+        "frozen_schedule_us": 30.64,
+        "native_export_us": 30.768,
+        "export_over_schedule": 1.004177545691906,
+        "absolute_relative_error_percent": 0.41775456919059817,
+        "cake_first_ratio": 1.0010460251046025,
+        "export_first_ratio": 1.006269592476489,
+        "round_export_over_schedule": [
+          1.002087682672234,
+          1.00836820083682,
+          1.0010460251046025,
+          1.0052192066805845,
+          1.0,
+          1.006269592476489
+        ],
+        "rounds": [
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 30.656,
+              "n": 256,
+              "min_us": 28.832,
+              "max_us": 41.76
+            },
+            "export": {
+              "median_us": 30.720000000000002,
+              "n": 256,
+              "min_us": 29.055,
+              "max_us": 40.480000000000004
+            },
+            "export_over_cake": 1.002087682672234
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 30.848,
+              "n": 256,
+              "min_us": 29.152,
+              "max_us": 47.391999999999996
+            },
+            "cake": {
+              "median_us": 30.592000000000002,
+              "n": 256,
+              "min_us": 28.927999999999997,
+              "max_us": 48.384
+            },
+            "export_over_cake": 1.00836820083682
+          },
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 30.592000000000002,
+              "n": 256,
+              "min_us": 29.055999999999997,
+              "max_us": 48.672
+            },
+            "export": {
+              "median_us": 30.624,
+              "n": 256,
+              "min_us": 28.512,
+              "max_us": 41.696
+            },
+            "export_over_cake": 1.0010460251046025
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 30.816,
+              "n": 256,
+              "min_us": 29.312,
+              "max_us": 45.12
+            },
+            "cake": {
+              "median_us": 30.656,
+              "n": 256,
+              "min_us": 28.896,
+              "max_us": 48.384
+            },
+            "export_over_cake": 1.0052192066805845
+          },
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 30.656,
+              "n": 256,
+              "min_us": 29.12,
+              "max_us": 40.704
+            },
+            "export": {
+              "median_us": 30.656,
+              "n": 256,
+              "min_us": 29.088,
+              "max_us": 48.384
+            },
+            "export_over_cake": 1.0
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 30.816,
+              "n": 256,
+              "min_us": 28.832,
+              "max_us": 42.88
+            },
+            "cake": {
+              "median_us": 30.624,
+              "n": 256,
+              "min_us": 28.927999999999997,
+              "max_us": 41.76
+            },
+            "export_over_cake": 1.006269592476489
+          }
+        ],
+        "correctness": [
+          {
+            "stage": "pre",
+            "max_abs_cake_vs_export": 0.0,
+            "max_abs_cake_vs_oracle": 0.0001220703125,
+            "max_abs_export_vs_oracle": 0.0001220703125,
+            "tol": 0.01
+          },
+          {
+            "stage": "post",
+            "max_abs_cake_vs_export": 0.0,
+            "max_abs_cake_vs_oracle": 0.0001220703125,
+            "max_abs_export_vs_oracle": 0.0001220703125,
+            "tol": 0.01
+          }
+        ],
+        "passed": true,
+        "physical_seconds": 24.402285084011964
+      },
+      {
+        "name": "tree_fp8_contiguous_tmem",
+        "mode": "fp8_contiguous",
+        "shape": {
+          "batch": 1,
+          "queries": 20,
+          "heads": 32,
+          "kv_heads": 4,
+          "dim": 512,
+          "capacity": 256
+        },
+        "route": "tree_fp8_contiguous_tmem",
+        "jit_module": "sm110_xqa_tree_fp8_contiguous_tmem_da988afccf6c2bfe5810",
+        "kernel_symbol": "kernel_sm110_xqa_tree_fp8_contiguous_tmem",
+        "source_cubin_sha256": "59856f72a657307e385b602a6484eba03a8bf3ca4095adfab46ef3a4b1162998",
+        "input_sha256": {
+          "q": "ac80ded5ef5092207ce9df8a7040b4390a1e2c68ddbc582c213a0ece5e3d49e3",
+          "kv": "c3a7d2edc0e537cb65cc544fc44d976ee90d498011411cf1ab3e53af5953ed85",
+          "lengths": "bf5e8ffa51a9e748985800c1d3d7f1a2a6ae7435136593ca8d9637e3f87c699c",
+          "mask": "26cae58e9756e70a22f0f67d6d1e2e88da75118099830c427a35109428fd6a47"
+        },
+        "frozen_schedule_us": 23.75175,
+        "native_export_us": 23.728,
+        "export_over_schedule": 0.9990000736787816,
+        "absolute_relative_error_percent": 0.09999263212183696,
+        "cake_first_ratio": 1.0000210300519443,
+        "export_first_ratio": 0.9993476293693048,
+        "round_export_over_schedule": [
+          1.0013550135501355,
+          0.993270524899058,
+          1.0000210300519443,
+          0.9993476293693048,
+          0.9986522911051213,
+          1.0
+        ],
+        "rounds": [
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 23.616000000000003,
+              "n": 256,
+              "min_us": 23.168000000000003,
+              "max_us": 32.864
+            },
+            "export": {
+              "median_us": 23.648,
+              "n": 256,
+              "min_us": 23.104,
+              "max_us": 34.272
+            },
+            "export_over_cake": 1.0013550135501355
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 23.616000000000003,
+              "n": 256,
+              "min_us": 23.072,
+              "max_us": 37.407999999999994
+            },
+            "cake": {
+              "median_us": 23.776,
+              "n": 256,
+              "min_us": 23.2,
+              "max_us": 33.344
+            },
+            "export_over_cake": 0.993270524899058
+          },
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 23.775499999999997,
+              "n": 256,
+              "min_us": 23.264,
+              "max_us": 32.576
+            },
+            "export": {
+              "median_us": 23.776,
+              "n": 256,
+              "min_us": 23.040000000000003,
+              "max_us": 34.592
+            },
+            "export_over_cake": 1.0000210300519443
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 23.744,
+              "n": 256,
+              "min_us": 23.136,
+              "max_us": 34.368
+            },
+            "cake": {
+              "median_us": 23.759500000000003,
+              "n": 256,
+              "min_us": 23.264,
+              "max_us": 34.656
+            },
+            "export_over_cake": 0.9993476293693048
+          },
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 23.744,
+              "n": 256,
+              "min_us": 22.944,
+              "max_us": 32.768
+            },
+            "export": {
+              "median_us": 23.712,
+              "n": 256,
+              "min_us": 23.008,
+              "max_us": 32.896
+            },
+            "export_over_cake": 0.9986522911051213
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 23.744,
+              "n": 256,
+              "min_us": 23.2,
+              "max_us": 35.552
+            },
+            "cake": {
+              "median_us": 23.744,
+              "n": 256,
+              "min_us": 23.040000000000003,
+              "max_us": 42.976
+            },
+            "export_over_cake": 1.0
+          }
+        ],
+        "correctness": [
+          {
+            "stage": "pre",
+            "max_abs_cake_vs_export": 0.0,
+            "max_abs_cake_vs_oracle": 0.0001220703125,
+            "max_abs_export_vs_oracle": 0.0001220703125,
+            "tol": 0.1
+          },
+          {
+            "stage": "post",
+            "max_abs_cake_vs_export": 0.0,
+            "max_abs_cake_vs_oracle": 0.0001220703125,
+            "max_abs_export_vs_oracle": 0.0001220703125,
+            "tol": 0.1
+          }
+        ],
+        "passed": true,
+        "physical_seconds": 24.26750694704242
+      },
+      {
+        "name": "tree_fp8_paged_tmem",
+        "mode": "fp8_paged",
+        "shape": {
+          "batch": 1,
+          "queries": 20,
+          "heads": 32,
+          "kv_heads": 4,
+          "dim": 512,
+          "capacity": 256
+        },
+        "route": "tree_fp8_paged_tmem",
+        "jit_module": "sm110_xqa_tree_fp8_paged_tmem_da988afccf6c2bfe5810",
+        "kernel_symbol": "kernel_sm110_xqa_tree_fp8_paged_tmem",
+        "source_cubin_sha256": "3146887da213d3ef9e3f82431bf8f3246922a081fbffbd765325d8966881da57",
+        "input_sha256": {
+          "q": "ac80ded5ef5092207ce9df8a7040b4390a1e2c68ddbc582c213a0ece5e3d49e3",
+          "kv": "36f5a049146f6a3053c4916dfc9fcc710a958cb935c2d31bd263a71e87f0c89d",
+          "lengths": "bf5e8ffa51a9e748985800c1d3d7f1a2a6ae7435136593ca8d9637e3f87c699c",
+          "mask": "26cae58e9756e70a22f0f67d6d1e2e88da75118099830c427a35109428fd6a47",
+          "pages": "baed642339816affb3fe8719792d0e4ce82f12db72b7373d244eaa65445800fe"
+        },
+        "frozen_schedule_us": 24.0,
+        "native_export_us": 23.85575,
+        "export_over_schedule": 0.9939895833333333,
+        "absolute_relative_error_percent": 0.6010416666666685,
+        "cake_first_ratio": 0.9946666666666667,
+        "export_first_ratio": 0.9933333333333333,
+        "round_export_over_schedule": [
+          0.9960206675278137,
+          0.9933333333333333,
+          0.9946666666666667,
+          0.9932916666666666,
+          0.9933333333333333,
+          0.9946458333333333
+        ],
+        "rounds": [
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 23.999,
+              "n": 256,
+              "min_us": 23.264,
+              "max_us": 40.832
+            },
+            "export": {
+              "median_us": 23.9035,
+              "n": 256,
+              "min_us": 23.2,
+              "max_us": 36.768
+            },
+            "export_over_cake": 0.9960206675278137
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 23.84,
+              "n": 256,
+              "min_us": 23.328000000000003,
+              "max_us": 40.416000000000004
+            },
+            "cake": {
+              "median_us": 24.0,
+              "n": 256,
+              "min_us": 23.424,
+              "max_us": 33.279999999999994
+            },
+            "export_over_cake": 0.9933333333333333
+          },
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 24.0,
+              "n": 256,
+              "min_us": 23.424,
+              "max_us": 35.583999999999996
+            },
+            "export": {
+              "median_us": 23.872,
+              "n": 256,
+              "min_us": 23.008,
+              "max_us": 34.464
+            },
+            "export_over_cake": 0.9946666666666667
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 23.839,
+              "n": 256,
+              "min_us": 23.328000000000003,
+              "max_us": 34.016
+            },
+            "cake": {
+              "median_us": 24.0,
+              "n": 256,
+              "min_us": 23.424,
+              "max_us": 32.160000000000004
+            },
+            "export_over_cake": 0.9932916666666666
+          },
+          {
+            "order": [
+              "cake",
+              "export"
+            ],
+            "cake": {
+              "median_us": 24.0,
+              "n": 256,
+              "min_us": 23.296,
+              "max_us": 32.0
+            },
+            "export": {
+              "median_us": 23.84,
+              "n": 256,
+              "min_us": 23.136,
+              "max_us": 30.496
+            },
+            "export_over_cake": 0.9933333333333333
+          },
+          {
+            "order": [
+              "export",
+              "cake"
+            ],
+            "export": {
+              "median_us": 23.8715,
+              "n": 256,
+              "min_us": 23.328000000000003,
+              "max_us": 33.44
+            },
+            "cake": {
+              "median_us": 24.0,
+              "n": 256,
+              "min_us": 23.488,
+              "max_us": 33.408
+            },
+            "export_over_cake": 0.9946458333333333
+          }
+        ],
+        "correctness": [
+          {
+            "stage": "pre",
+            "max_abs_cake_vs_export": 0.0,
+            "max_abs_cake_vs_oracle": 0.0001220703125,
+            "max_abs_export_vs_oracle": 0.0001220703125,
+            "tol": 0.1
+          },
+          {
+            "stage": "post",
+            "max_abs_cake_vs_export": 0.0,
+            "max_abs_cake_vs_oracle": 0.0001220703125,
+            "max_abs_export_vs_oracle": 0.0001220703125,
+            "tol": 0.1
+          }
+        ],
+        "passed": true,
+        "physical_seconds": 24.53818555898033
+      }
+    ],
+    "all_rows_passed": true,
+    "ledger_benchmark_us": {
+      "tree_fp16_contiguous": 69.67999999999999,
+      "tree_fp16_paged": 73.21600000000001,
+      "tree_fp8_contiguous": 61.088,
+      "tree_fp8_paged": 60.1125,
+      "tree_fp16_contiguous_mma": 31.407500000000006,
+      "tree_fp16_paged_mma": 37.344,
+      "tree_fp16_paged_mma_split": 34.68749999999999,
+      "tree_fp8_contiguous_mma": 24.544,
+      "tree_fp8_paged_mma": 25.76,
+      "tree_fp16_contiguous_tmem": 31.168000000000003,
+      "tree_fp16_paged_tmem": 29.712000000000003,
+      "tree_fp8_contiguous_tmem": 23.8875,
+      "tree_fp8_paged_tmem": 24.288,
+      "decode_fp16_contiguous": 26.223499999999998,
+      "decode_fp16_contiguous_single_partition": 24.736
+    },
+    "sanitizers": [
+      {
+        "route": "tree_fp16_contiguous_tmem",
+        "tool": "synccheck",
+        "verdict": "pass",
+        "wall_seconds": 10,
+        "summary": "========= ERROR SUMMARY: 0 errors",
+        "rc": 0
+      },
+      {
+        "route": "tree_fp16_contiguous_tmem",
+        "tool": "racecheck",
+        "verdict": "pass",
+        "wall_seconds": 8,
+        "summary": "========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)",
+        "rc": 0
+      },
+      {
+        "route": "tree_fp16_paged_tmem",
+        "tool": "synccheck",
+        "verdict": "pass",
+        "wall_seconds": 8,
+        "summary": "========= ERROR SUMMARY: 0 errors",
+        "rc": 0
+      },
+      {
+        "route": "tree_fp16_paged_tmem",
+        "tool": "racecheck",
+        "verdict": "pass",
+        "wall_seconds": 9,
+        "summary": "========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)",
+        "rc": 0
+      },
+      {
+        "route": "tree_fp8_contiguous_tmem",
+        "tool": "synccheck",
+        "verdict": "pass",
+        "wall_seconds": 8,
+        "summary": "========= ERROR SUMMARY: 0 errors",
+        "rc": 0
+      },
+      {
+        "route": "tree_fp8_contiguous_tmem",
+        "tool": "racecheck",
+        "verdict": "pass",
+        "wall_seconds": 9,
+        "summary": "========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)",
+        "rc": 0
+      },
+      {
+        "route": "tree_fp8_paged_tmem",
+        "tool": "synccheck",
+        "verdict": "pass",
+        "wall_seconds": 8,
+        "summary": "========= ERROR SUMMARY: 0 errors",
+        "rc": 0
+      },
+      {
+        "route": "tree_fp8_paged_tmem",
+        "tool": "racecheck",
+        "verdict": "pass",
+        "wall_seconds": 10,
+        "summary": "========= RACECHECK SUMMARY: 0 hazards displayed (0 errors, 0 warnings)",
+        "rc": 0
+      }
+    ],
+    "tests": {
+      "jit_passed": 35,
+      "gpu_passed": 177
+    },
+    "pre_commit": "clean (ruff-format rewrote one blank line in test_sm110_xqa.py on the first run; the formatted file is the one validated and committed; all other hooks passed)",
+    "physical_seconds": {
+      "apply": 3,
+      "env": 20,
+      "precommit": 9,
+      "jit": 12,
+      "gpu": 68,
+      "gpufull": 52,
+      "bench": 16,
+      "parity": 114,
+      "sanitize": 10,
+      "racemap": 2
+    },
+    "schedule_harness_reference": "Cake tmem kernel of record (MR !989 commit 9998b45295, route d90fb18462) launched by prepare_edge_xqa_tree(kernel='tmem') in the same process"
   }
 }
