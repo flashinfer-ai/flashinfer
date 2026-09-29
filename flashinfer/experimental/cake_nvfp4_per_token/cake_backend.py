@@ -81,6 +81,8 @@ K_TILE = 256  # mainloop K tile (512 with the deep-K variant)
 N_ORIENTATION_MAX_M = 32
 SUPPORTED_THREADS = (64, 128, 256, 512)
 BASELINE_THREADS = (128, 256, 512)
+# Row counts that launch as one wave of one-row CTAs on both supported parts (148 / 152 SMs).
+SINGLE_WAVE_MAX_ROWS = 148
 MAX_REG_BLOCKS = 8  # 16-element blocks one quantizer thread holds in registers
 WIDE_MAX_M = 4096
 SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
@@ -188,8 +190,10 @@ def cta_config(k: int, m: int) -> tuple[int, int]:
     Rows with few CTAs (``M < 512``) take the widest CTA with one or two CTAs
     per SM (two above 128 rows so the second wave's loads overlap the first
     wave's reduction); ``K <= 8192`` with ``2 <= M < 512`` prefers 256 threads,
-    and ``128 < M < 512`` with at most four blocks per 256-thread lane
-    (``K <= 16384``) the 256-wide CTA at two per SM.
+    and ``148 < M < 512`` (more than one wave of one-row CTAs on the 148 / 152-SM
+    parts) with at most four blocks per 256-thread lane (``K <= 16384``) the
+    256-wide CTA at two per SM; a single wave (``128 < M <= 148``) keeps the
+    widest CTA.
     Rows with many CTAs take narrow CTAs holding 4-8 blocks per thread."""
     num_blocks = k // SF_VEC
 
@@ -199,7 +203,7 @@ def cta_config(k: int, m: int) -> tuple[int, int]:
     if m < 512:
         if m > 1 and bpt(256) <= 2:
             return 256, 3
-        if m > 128 and bpt(256) <= 4:
+        if m > SINGLE_WAVE_MAX_ROWS and bpt(256) <= 4:
             return 256, 2
         return cta_threads(k, m), (2 if m > 128 else 1)
     if m < 8192:
