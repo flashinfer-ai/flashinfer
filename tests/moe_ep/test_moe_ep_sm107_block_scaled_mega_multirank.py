@@ -12,7 +12,7 @@ output is checked against the pure-torch oracle evaluated over the full bank
 for that rank's tokens. References share quantization helpers with preprocessing;
 activation evaluation, accumulation, and intermediate requantization can round
 differently from the kernel. Output checks use relative L2 tolerances and cover
-NVFP4 and MXFP8 E4M3/E5M2.
+NVFP4, MXFP8 E4M3/E5M2, and MXFP4 weights with MXFP8 E4M3 activations.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ from flashinfer.moe_ep import (  # noqa: E402
     MoEEpTensors,
     MoEWeightPack,
     Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig,
+    Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig,
     Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig,
     bootstrap_moe_ep_runtime,
     ensure_moe_ep_cuda_device,
@@ -136,6 +137,10 @@ def _megakernel_config(quant_kind: str, **overrides):
         return Sm107_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
             intermediate_size=INTERMEDIATE, top_k=TOP_K, **overrides
         )
+    if quant_kind == "mxfp4_mxfp8":
+        return Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=INTERMEDIATE, top_k=TOP_K, **overrides
+        )
     return Sm107_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig(
         intermediate_size=INTERMEDIATE, top_k=TOP_K, kind=quant_kind, **overrides
     )
@@ -146,7 +151,10 @@ def _megakernel_config(quant_kind: str, **overrides):
 @pytest.mark.parametrize("ikr,early", [(False, True), (False, False), (True, True)])
 @pytest.mark.parametrize(
     "kind,situ,scaled",
-    [(kind, True, False) for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2")]
+    [
+        (kind, True, False)
+        for kind in ("nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8")
+    ]
     + [("nvfp4", situ, True) for situ in (False, True)],
 )
 def test_prequantized_situ_and_scaling_multirank(kind, situ, scaled, ikr, early):
@@ -229,7 +237,7 @@ def test_prequantized_situ_and_scaling_multirank(kind, situ, scaled, ikr, early)
 
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
-@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"])
+@pytest.mark.parametrize("kind", ["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"])
 def test_prequantized_situ_pooled_graph_with_scaling(kind):
     import torch.distributed as dist
     from flashinfer.moe_ep import PrequantizedMoEWeights
@@ -589,3 +597,14 @@ def test_sm107_pooled_layers_graph_rebinds_weights_and_stream(kind):
         for layer in layers:
             layer.destroy()
         finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_2
+@pytest.mark.arch_rubin
+def test_mxfp4_k3_routed_expert_geometry_multirank():
+    from tests.moe_ep.sm107_test_utils import run_mxfp4_k3_geometry
+
+    rank, world = _launcher_ranks()
+    if world < 2:
+        pytest.skip("requires torchrun with >= 2 ranks")
+    run_mxfp4_k3_geometry(rank, world)

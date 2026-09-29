@@ -265,7 +265,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
         k = self._kernel_config
         fp = fleet_params
         return (
-            "sm107_mxfp8_mxfp8_bf16_cutedsl",
+            self.kernel_name(),
             torch.cuda.current_device(),
             self.ep_rank,
             self.ep_world_size,

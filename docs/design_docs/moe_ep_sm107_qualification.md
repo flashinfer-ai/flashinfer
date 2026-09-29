@@ -2,7 +2,8 @@
 
 **Scope**: Validation requirements, correctness tests, and qualification procedures for the SM107 MegaMoE backends.
 
-The Rubin backends support NVFP4 and MXFP8 E4M3/E5M2 inference through
+The Rubin backends support NVFP4, MXFP8 E4M3/E5M2, and MXFP4 weights with
+MXFP8 E4M3 activations through
 `MoEEpLayer`, with BF16 combine and output. The kernel comes from CuTe DSL
 MegaMoE `1667b47a`; [VENDOR.md](../../flashinfer/moe_ep/kernel_src/sm107/next_cutedsl_megamoe/VENDOR.md)
 records the full source and exporter revisions.
@@ -43,14 +44,14 @@ power limits, clocks, other GPU activity, and `NVSHMEM_SYMMETRIC_SIZE`.
 | Device | Exact compute capability 10.7; all tensors and the current stream on the owning device |
 | Distributed execution | One GPU per EP rank, same NVLink domain, matching NVSHMEM PE and EP identities |
 | Experts and routes | Positive expert count, evenly sharded; top-k in `[1, E]`; at most 16,384 experts and 2,097,152 padded routes/rank |
-| Public layer geometry | H multiple of 64 for NVFP4, 128 for MXFP8; I multiple of 64 |
+| Public layer geometry | H multiple of 64 for NVFP4, 128 for MX formats; I multiple of 64, or 128 for MXFP4/MXFP8 |
 | Canonical weights | Floating `[E_local, 2I, H]` and `[E_local, H, I]`; canonical gate rows precede up rows |
 | Prequantized weights | Canonical gate-then-up packed data and typed, unswizzled block scales; see the ingestion contract below |
 | Transformed weights | K-major physical storage, 16-byte aligned, exact typed scale planes; preserve physical layout when concatenating experts |
 | BF16 inputs | `quantize_input=True`; staging quantizes on the caller's stream |
 | Prequantized inputs | Matching data format; scales are `[T, H/16]` E4M3 for NVFP4 or `[T, H/32]` E8M0 for MXFP8; uint8 scale storage is interpreted as raw bytes. Pass the logical scale columns, excluding internal workspace communication padding. |
 | Activation | SwiGLU by default; SiTU requires both positive, finite beta parameters and excludes gate/up clamps |
-| Normalization | NVFP4 accepts positive, finite local-expert FP32 vectors for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`. Per-call values override config defaults; if both omit a value, staging uses one. MXFP8 does not accept these scalars. |
+| Normalization | NVFP4 accepts positive, finite local-expert FP32 vectors for `fc1_alpha`, `fc2_alpha`, and `fc1_norm_const`. Per-call values override config defaults; if both omit a value, staging uses one. MXFP8 and MXFP4/MXFP8 do not accept these scalars. |
 | Routing values | Unique valid expert IDs per token or `-1` masked slots; finite scores; repeated masked slots are allowed |
 | Output | BF16; owned tensor by default; workspace views expire on the next workspace use or destruction |
 | Graphs and pooling | Warm up eagerly on every rank before capture; sequential, stream-ordered use of a shared workspace |
@@ -75,13 +76,13 @@ Graph replay keeps captured shapes, pointers, and live-token count fixed.
 Change tensor contents in place; recapture for a new shape/count, or mask
 inactive rows while retaining the captured shape.
 
-BF16 Rubin kernels, training, local fused-routing MegaMoE, MXFP4, mixed W4A8,
-and cross-node communication are not part of this implementation. BF16 input
+BF16 Rubin kernels, training, local fused-routing MegaMoE, FP4 activations
+with E8M0 scales, and cross-node communication are not part of this implementation. BF16 input
 staging uses Torch operations; its cost is included in full-forward measurements.
 
 ## SiTU and prequantized weights
 
-Both Rubin configs accept `activation="situ"`, `situ_beta`, and
+The Rubin configs accept `activation="situ"`, `situ_beta`, and
 `situ_linear_beta`. Both betas are required, matching the vendored kernel:
 
 ```python
@@ -102,14 +103,31 @@ Here E is the number of local experts:
 | Format | w13 / w2 | w13_scale / w2_scale |
 |---|---|---|
 | NVFP4 | `[E, 2I, H/2]` / `[E, H, I/2]`, uint8 or float4_e2m1fn_x2 | `[E, 2I, H/16]` / `[E, H, I/16]`, float8_e4m3fn |
+| MXFP4/MXFP8 | `[E, 2I, H/2]` / `[E, H, I/2]`, uint8 or float4_e2m1fn_x2 | `[E, 2I, H/32]` / `[E, H, I/32]`, float8_e8m0fnu |
 | MXFP8 | `[E, 2I, H]` / `[E, H, I]`, float8_e4m3fn or float8_e5m2 matching `kind` | `[E, 2I, H/32]` / `[E, H, I/32]`, float8_e8m0fnu |
 
-FC1 gate rows precede up rows in both data and scales. NVFP4 packs the even K
+FC1 gate rows precede up rows in both data and scales. FP4 packs the even K
 element into the low nibble. The backend interleaves gate/up rows, creates
 K-major views, and pads/swizzles scales without numerical conversion. Scale
 tensors must have the stated dtype; explicitly reinterpret raw scale bytes
 with `.view(dtype)` first. Do not pass already interleaved/swizzled tensors
 through this canonical ingestion path; those belong in `transformed_weights`.
+
+Select the mixed format with `Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig`.
+The backend name lists activation, weight, and output formats in that order;
+the upstream quantization tag is `mxfp4_mxfp8`. Both FC1 inputs and the
+FC1-to-FC2 intermediate use MXFP8 E4M3 with block-32 E8M0 scales. Weights
+remain packed E2M1 throughout ingestion. Floating-point weight preprocessing
+also produces this layout, using power-of-two scales and nearest-even E2M1
+rounding.
+
+For [K3 routed experts](https://huggingface.co/moonshotai/Kimi-K3/blob/main/config.json),
+use H=3584, I=3072, 896 total experts, top-k=16,
+`activation="situ"`, `situ_beta=4.0`, and `situ_linear_beta=25.0`.
+Set `apply_topk_in_fc1=False` to apply routing weights after FC2; the default
+applies them before intermediate quantization and can round differently.
+The geometry regression uses synthetic checkpoint-format tensors. It does
+not cover the model's latent projections, shared experts, or engine integration.
 
 ## NVFP4 normalization
 
@@ -187,7 +205,7 @@ NPROC_MULTIRANK=4 bash tests/moe_ep/run_tests.sh mega_sm107
 `PYTHON` and `TORCHRUN` can override the executables. The strict runner covers
 these files, so the shell commands are useful for debugging individual suites.
 
-Coverage includes all three formats, early/late routing weights, separate and
+Coverage includes the block-scaled formats, early/late routing weights, separate and
 in-kernel reduction, partial tiles, routing-vector tails, masked routes, idle
 ranks, workspace reuse, and pooled layers with different weights captured on a
 new stream. Boundary tests exercise one-CTA and two-CTA instructions, deeper K,
@@ -196,8 +214,8 @@ reject unsupported scalars, scale layouts, and unsafe geometry. Activation and
 weight-ingestion tests compare against canonical-layout Torch math, including
 non-unit per-expert scaling, BF16/prequantized inputs, and pooled SiTU graphs.
 
-Output comparisons require relative L2 error below 0.02 for MXFP8 and 0.06
-for NVFP4. The test metric is `norm(output - reference) / max(norm(reference),
+Output comparisons require relative L2 error below 0.02 for MXFP8 and
+MXFP4/MXFP8, and 0.06 for NVFP4. The test metric is `norm(output - reference) / max(norm(reference),
 1e-6)`. These are aggregate acceptance limits, not per-element error bounds.
 The references share quantization and unpacking helpers with preprocessing;
 the canonical-weight reference independently checks the physical weight

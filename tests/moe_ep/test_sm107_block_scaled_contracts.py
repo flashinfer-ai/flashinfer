@@ -46,6 +46,39 @@ def _config(**kw):
     )
 
 
+def test_mxfp4_weights_have_independent_dtype_and_packing():
+    cfg = _config(quant_kind="mxfp4_mxfp8", intermediate=128)
+    assert cfg.torch_act_data_dtype == torch.float8_e4m3fn
+    assert cfg.torch_weight_data_dtype == getattr(
+        torch, "float4_e2m1fn_x2", torch.uint8
+    )
+    assert cfg.torch_act_sf_dtype == torch.float8_e8m0fnu
+    assert cfg.sf_vec_size == 32
+    assert cfg.instruction_k == 64
+    shapes = block_scaled._expected_weight_shapes(cfg)
+    assert shapes[:2] == ((8, 64, 256), (8, 64, 128))
+    with pytest.raises(ValueError, match="multiple of 128"):
+        _config(quant_kind="mxfp4_mxfp8", intermediate=192)
+
+
+def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():
+    from flashinfer.moe_ep import (
+        PrequantizedMoEWeights,
+        preprocess_sm107_mxfp4_mega_weights,
+    )
+
+    pack = PrequantizedMoEWeights(
+        torch.zeros(1, 256, 64, dtype=torch.uint8),
+        torch.zeros(1, 128, 64, dtype=torch.uint8),
+        torch.zeros(1, 256, 4, dtype=torch.float8_e4m3fn),
+        torch.zeros(1, 128, 4, dtype=torch.float8_e4m3fn),
+    )
+    with pytest.raises(ValueError, match="block scales"):
+        preprocess_sm107_mxfp4_mega_weights(
+            pack, intermediate_size=128, hidden_size=128
+        )
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
