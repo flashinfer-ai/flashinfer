@@ -1034,7 +1034,11 @@ def test_queue_kernel_matches_the_static_kernel_bit_exact(engine, monkeypatch):
     every launch, and a captured graph replays it."""
     import flashinfer.cake_vsa_sm90 as module
 
-    h, mb, nb = 8, 528, 64  # 2112 pair tiles: 15-16 per CTA on 132 SMs (>= POOL_MIN_TILES)
+    h, mb, nb = (
+        8,
+        528,
+        64,
+    )  # 2112 pair tiles: 15-16 per CTA on 132 SMs (>= POOL_MIN_TILES)
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     mask = _topk_mask(h, mb, nb, 8).cuda()
     rows = torch.full((h, mb), 64, dtype=torch.int32, device="cuda")
