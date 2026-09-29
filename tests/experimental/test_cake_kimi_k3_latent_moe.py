@@ -33,7 +33,9 @@ from flashinfer.experimental.kimi_k3_latent_moe.cake_backend import (
     decode_kernel_key,
     decode_symbol,
     decode_tail_plan,
+    front_split_plan,
     i_local_for_tp,
+    prefill_front_plan,
     prefill_tail_plan,
     required_kernel_keys,
     route_kernel_keys,
@@ -193,6 +195,32 @@ def test_split_plan_rules():
     )
 
 
+def test_front_split_plan_rules():
+    # Round-8 rule: the trailing wave's tiles become two aligned K halves when the halves fit one wave of the
+    # 74 resident clusters and the modelled saving is >= 4 % of the whole-tile cost; every other shape runs whole.
+    whole = dict(num_items=48, full_items=48, sk_ipc=112, sk_max_seg=1, sk_total=0, sk_tiles=0)
+    assert front_split_plan(48, SM_COUNT) == whole  # TP8 T=512: 96 halves would need two waves
+    assert front_split_plan(24, SM_COUNT) == dict(
+        num_items=48, full_items=0, sk_ipc=56, sk_max_seg=2, sk_total=24 * 112, sk_tiles=24
+    )  # TP8 T=256
+    assert front_split_plan(96, SM_COUNT) == dict(
+        num_items=118, full_items=74, sk_ipc=56, sk_max_seg=2, sk_total=22 * 112, sk_tiles=22
+    )  # TP8 T=1024
+    assert front_split_plan(384, SM_COUNT)["sk_tiles"] == 14  # TP8 T=4096: 370 whole + 14 x 2
+    assert front_split_plan(528, SM_COUNT)["sk_tiles"] == 10  # TP1 T=2048: 518 whole + 10 x 2
+    assert front_split_plan(768, SM_COUNT)["sk_tiles"] == 0  # TP8 T=8192: 3.1 % modelled -> whole
+    assert front_split_plan(1056, SM_COUNT)["sk_tiles"] == 0  # TP1 T=4096: 2.3 % modelled -> whole
+    for tiles in (66, 132, 264, 192, 1536, 2112, 4224):
+        assert front_split_plan(tiles, SM_COUNT)["sk_max_seg"] == 1
+    plan = prefill_front_plan(1024, i_local_for_tp(8))
+    assert plan["cluster_tiles"] == 96 and plan["grid"] == 118 * 2 and not plan["evict_first"]
+    assert prefill_front_plan(256, i_local_for_tp(1))["evict_first"]
+    assert prefill_front_plan(512, i_local_for_tp(8))["evict_first"]
+    assert not prefill_front_plan(1024, i_local_for_tp(1))["evict_first"]
+    assert prefill_front_plan(256, i_local_for_tp(1))["grid"] == cb.front_grid(cb.m_tiles_for(256), i_local_for_tp(1))
+    assert cb.front_evict_first(4) and not cb.front_evict_first(6)
+
+
 def test_prefill_tail_plan_and_trigger():
     plan = prefill_tail_plan(256, 8)
     assert (
@@ -247,7 +275,12 @@ def test_route_keys_cover_the_row_set():
         "tail_norm",
         "tail_gemm",
     }
-    assert "front:i6144" in keys and "front:i768" in keys
+    assert {k for k in keys if k.startswith("front:")} == {
+        "front:i6144",
+        "front:i6144e1",
+        "front:i768",
+        "front:i768e1",
+    }
     assert {k for k in keys if k.startswith("tail_gemm:")} == {
         "tail_gemm:tp1e0f0",
         "tail_gemm:tp1e1f1",
@@ -257,7 +290,10 @@ def test_route_keys_cover_the_row_set():
         "tail_gemm:tp8e1f0",
     }
     assert route_kernel_keys("front", 1, 128)[0].startswith("decode:")
-    assert route_kernel_keys("front", 1, 256) == ("front:i6144",)
+    # Round-8 lever 13b: T <= 512 (<= 2 pair rows per weight column) takes the evict_first front instance.
+    assert route_kernel_keys("front", 1, 256) == ("front:i6144e1",)
+    assert route_kernel_keys("front", 8, 512) == ("front:i768e1",)
+    assert route_kernel_keys("front", 1, 1024) == ("front:i6144",)
     assert route_kernel_keys("tail", 8, 256) == ("tail_norm:e1", "tail_gemm:tp8e1f0")
     # Round-7 N128 rule: TP8 T=512 takes the 128-wide pair tile (56 column tiles, 224 CTAs, 9-deep ring); its
     # multi-wave grid drops the evict_first weight policy and fires the norm trigger early, so the late-trigger norm
