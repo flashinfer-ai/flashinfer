@@ -245,17 +245,51 @@ def test_decode_config_rules(arch):
         assert cfg.tok == entry["tok"] and cfg.fused == entry["fused"]
         assert 1 <= cfg.split <= num_k_iters
         assert cfg.tiles == n_tiles128 * -(-bucket // cfg.tok)
-        assert cfg.total_work == cfg.tiles * cfg.split
-        assert cfg.grid == (
+        # Round 6 (lever M): at the bucket's M every N tile's m tiles fill whole clusters; one cluster item per N tile.
+        assert cfg.mc == int(entry.get("mc", 1)) and cfg.pf == int(entry.get("pf", 0))
+        if cfg.mc > 1:
+            assert cfg.split == 1 and cfg.csplit == 1 and not cfg.resident
+            assert cfg.m_tiles % cfg.mc == 0 and cfg.total_work == cfg.tiles // cfg.mc
+        else:
+            assert cfg.total_work == cfg.tiles * cfg.split
+        expected_grid = (
             min(cfg.total_work, int(entry.get("grid") or SM_COUNT))
             if cfg.persist
             else cfg.total_work
         )
-        assert 1 <= cfg.module_stages <= cfg.stages <= cb.DEC_MAX_STAGES
+        if cfg.csplit > 1:
+            expected_grid = cfg.csplit * max(
+                1,
+                min(
+                    expected_grid // cfg.csplit,
+                    cb.decode_cluster_capacity(arch, cfg.csplit),
+                ),
+            )
+        if cfg.mc > 1:
+            expected_grid = cfg.mc * max(
+                1,
+                min(
+                    expected_grid,
+                    SM_COUNT // cfg.mc,
+                    cb.decode_cluster_capacity(arch, cfg.mc),
+                ),
+            )
+        assert cfg.grid == expected_grid
+        # Round 6 (lever D): a table row may pin the ring deeper than the host default (``12,28,256``: 5 stages).
+        assert (
+            1
+            <= cfg.module_stages
+            <= cfg.stages
+            <= max(cb.DEC_MAX_STAGES, int(entry.get("stages") or 0))
+        )
         if cfg.resident:
             assert cfg.fused and num_k_iters == 1 and cfg.split == 1 and cfg.tok <= 64
             assert -(-cfg.total_work // cfg.grid) <= cb.DEC_RES_SLOTS
         assert cfg.kernel_key.startswith(f"decode:t{cfg.tok}_p{cfg.module_stages}")
+        # Round 6: ``_mc<C>`` / ``_pf<D>`` close the key (after the cluster split-K field); strip them for the older checks.
+        assert (f"_mc{cfg.mc}" in cfg.kernel_key) == (cfg.mc > 1)
+        assert (f"_pf{cfg.pf}" in cfg.kernel_key) == (cfg.pf > 0)
+        core_key = re.sub(r"(_mc\d+)?(_pf\d+)?$", "", cfg.kernel_key)
         # Round-3 fused knobs: a decoupled ring only for fused, non-resident rows; narrow units divide evenly.
         if entry.get("xb_stages"):
             assert (
@@ -269,10 +303,10 @@ def test_decode_config_rules(arch):
         assert cfg.qlanes in (4, 8, 16)
         assert (2 * cfg.tok) % (cb.DEC_QUANT_WARPS * (32 // cfg.qlanes)) == 0
         if not (cfg.fused and not cfg.resident) or "qlanes" not in entry:
-            assert cfg.qlanes == 16 and "_q" not in cfg.kernel_key
+            assert cfg.qlanes == 16 and "_q" not in core_key
         else:
             assert cfg.qlanes >= entry["qlanes"]
-        assert cfg.kernel_key.endswith(f"_q{cfg.qlanes}") == (cfg.qlanes != 16)
+        assert core_key.endswith(f"_q{cfg.qlanes}") == (cfg.qlanes != 16)
 
 
 @pytest.mark.parametrize("arch", ARCHES)
@@ -292,7 +326,9 @@ def test_decode_config_round3_fused_rows(arch):
         128,
     )
     assert cfg.total_work == 256
-    assert cfg.kernel_key == "decode:t64_p2_fused_r3_q4"
+    # Round 6 (lever P): the row prefetches its weight tiles four stages ahead into L2 (``_pf4``; 1.02x on both GPUs).
+    assert cfg.pf == 4
+    assert cfg.kernel_key == "decode:t64_p2_fused_r3_q4_pf4"
     # 16-token tiles cannot keep eight 4-lane groups busy per stage: the table's 4 lanes widen to 8, coupled staging.
     # Round 5: the 24-tile M = 256 row moves to a 4-CTA cluster split-K route (each CTA owns a quarter of K, FP32 partials
     # are exchanged through distributed shared memory in one round); the small dedicated inbox is used (no aliasing).
@@ -305,6 +341,34 @@ def test_decode_config_round3_fused_rows(arch):
         True,
     )
     assert cfg.kernel_key == "decode:t16_p4_fused_cs4"
+
+
+@pytest.mark.parametrize("arch", ARCHES)
+def test_decode_config_round6_rules(arch):
+    # Round 6 (levers P + M): the 48-50-tile M = 256 rows pair the two 128-token m tiles of one N tile in a 2-CTA
+    # cluster that shares the W stage through TMA multicast and prefetches W three stages ahead into L2.
+    cfg = decode_config(256, 50, 28, arch, SM_COUNT)
+    assert (cfg.tok, cfg.split, cfg.csplit, cfg.mc, cfg.pf) == (128, 1, 1, 2, 3)
+    assert cfg.m_tiles == 2 and cfg.tiles == 100 and cfg.total_work == 50
+    assert cfg.grid == 2 * min(50, SM_COUNT // 2, cb.decode_cluster_capacity(arch, 2))
+    assert cfg.kernel_key == "decode:t128_p3_mc2_pf3"
+    # Bucket edge: an M whose m-tile count does not fill whole clusters (65..128 rows -> one 128-token tile) falls back
+    # to the plain instance -- multicast off and no prefetch (the fallback is not a tabulated route).
+    cfg = decode_config(65, 50, 28, arch, SM_COUNT)
+    assert (cfg.tok, cfg.m_tiles, cfg.mc, cfg.pf) == (128, 1, 1, 0)
+    assert cfg.kernel_key == "decode:t128_p3"
+    # Lever P alone on the M = 64 bucket of the same family (two stages ahead).
+    cfg = decode_config(64, 50, 28, arch, SM_COUNT)
+    assert (cfg.tok, cfg.mc, cfg.pf) == (64, 1, 2)
+    assert cfg.kernel_key == "decode:t64_p4_pf2"
+    # Lever D: the 12-tile M = 256 rows pin a 5-stage ring with 16-row epilogue flushes.
+    cfg = decode_config(256, 12, 28, arch, SM_COUNT)
+    assert (cfg.tok, cfg.stages, cfg.module_stages, cfg.epi_chunk) == (32, 5, 5, 16)
+    assert cfg.kernel_key == "decode:t32_p5_c16"
+    # Lever GP: only the tabulated GEMM-routed row prefetches (tp1 q_proj M = 256); other GEMM shapes do not.
+    assert cb.gemm_prefetch_distance(256, 96, 28, arch) == 2
+    assert cb.gemm_prefetch_distance(4096, 96, 28, arch) == 0
+    assert cb.gemm_prefetch_distance(257, 12, 28, arch) == 0
 
 
 def test_decode_module_stage_clamp():
