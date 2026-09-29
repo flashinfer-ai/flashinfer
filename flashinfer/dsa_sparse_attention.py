@@ -29,7 +29,9 @@ _FEATURE = "DSA sparse-attention training (64 query heads, SM100/SM103)"
 
 def _backend(backend: str):
     if backend != "cake":
-        raise ValueError("DSA sparse-attention training currently supports backend='cake'")
+        raise ValueError(
+            "DSA sparse-attention training currently supports backend='cake'"
+        )
     from .experimental.cake_dsa_train import cake_backend
 
     return cake_backend

@@ -118,7 +118,15 @@ class Inputs:
     def bytes_inputs(self) -> int:
         return sum(
             t.numel() * t.element_size()
-            for t in (self.q_latent, self.q_rope, self.kv_latent, self.k_rope, self.dout, self.idx_local, self.idx_global)
+            for t in (
+                self.q_latent,
+                self.q_rope,
+                self.kv_latent,
+                self.k_rope,
+                self.dout,
+                self.idx_local,
+                self.idx_global,
+            )
         )
 
 
@@ -139,8 +147,12 @@ def make_inputs(
     the selection (``self_including``) for that to be meaningful.
     """
     seq_q, seq_k = [int(x) for x in seq_q], [int(x) for x in seq_k]
-    if len(seq_q) != len(seq_k) or any(lq > lk for lq, lk in zip(seq_q, seq_k)):
-        raise ValueError("documents need seq_q <= seq_k, one key length per query length")
+    if len(seq_q) != len(seq_k) or any(
+        lq > lk for lq, lk in zip(seq_q, seq_k, strict=True)
+    ):
+        raise ValueError(
+            "documents need seq_q <= seq_k, one key length per query length"
+        )
     device = torch.device(device)
     gen = torch.Generator(device=device)
     gen.manual_seed(seed)
@@ -153,8 +165,10 @@ def make_inputs(
     cu_q = [0] + torch.tensor(seq_q).cumsum(0).tolist()
     cu_k = [0] + torch.tensor(seq_k).cumsum(0).tolist()
     locals_, globals_, own = [], [], []
-    for d, (lq, lk) in enumerate(zip(seq_q, seq_k)):
-        loc = causal_topk_local(lq, lk, topk, gen, device, self_including=self_including)
+    for d, (lq, lk) in enumerate(zip(seq_q, seq_k, strict=True)):
+        loc = causal_topk_local(
+            lq, lk, topk, gen, device, self_including=self_including
+        )
         locals_.append(loc)
         globals_.append(torch.where(loc >= 0, loc + cu_k[d], loc))
         own.append(torch.arange(lq, device=device) + (cu_k[d] + lk - lq))
@@ -217,9 +231,21 @@ def reference_fp64(
     lse = torch.empty(total_q, NUM_HEADS, dtype=torch.float64, device=device)
     want_grad = dout is not None
     dql = torch.empty_like(out) if want_grad else None
-    dqr = torch.empty(total_q, NUM_HEADS, D_ROPE, dtype=torch.float64, device=device) if want_grad else None
-    dkvl = torch.zeros(total_k, D_LATENT, dtype=torch.float64, device=device) if want_grad else None
-    dkr = torch.zeros(total_k, D_ROPE, dtype=torch.float64, device=device) if want_grad else None
+    dqr = (
+        torch.empty(total_q, NUM_HEADS, D_ROPE, dtype=torch.float64, device=device)
+        if want_grad
+        else None
+    )
+    dkvl = (
+        torch.zeros(total_k, D_LATENT, dtype=torch.float64, device=device)
+        if want_grad
+        else None
+    )
+    dkr = (
+        torch.zeros(total_k, D_ROPE, dtype=torch.float64, device=device)
+        if want_grad
+        else None
+    )
     # BF16-P/dS numerics floor of the backward: P and dS rounded to BF16 where a kernel feeds them to
     # its MMAs, FP32-exact accumulation, BF16 outputs (dQ directly, dKV/dKr after the FP32 sum).
     dql_emu = torch.empty_like(dql) if want_grad else None
@@ -247,7 +273,12 @@ def reference_fp64(
         m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
         p_rel = torch.exp(s - m).nan_to_num(0.0)
         num = torch.einsum("thw,twd->thd", p_rel.to(torch.bfloat16).double(), vg)
-        out_emu[r0:r1] = (num / p_rel.sum(-1, keepdim=True)).nan_to_num(0.0).to(torch.bfloat16).double()
+        out_emu[r0:r1] = (
+            (num / p_rel.sum(-1, keepdim=True))
+            .nan_to_num(0.0)
+            .to(torch.bfloat16)
+            .double()
+        )
         del p_rel, num
         if own_key is not None:
             is_own = (ix == own_key[r0:r1, None]) & valid
@@ -259,21 +290,41 @@ def reference_fp64(
             dqr[r0:r1] = torch.einsum("thw,twd->thd", ds, kg)
             dql[r0:r1] = torch.einsum("thw,twd->thd", ds, vg)
             dkr.index_add_(0, ix[valid], torch.einsum("thw,thd->twd", ds, qr)[valid])
-            dvl = torch.einsum("thw,thd->twd", ds, ql) + torch.einsum("thw,thd->twd", p, g)
+            dvl = torch.einsum("thw,thd->twd", ds, ql) + torch.einsum(
+                "thw,thd->twd", p, g
+            )
             dkvl.index_add_(0, ix[valid], dvl[valid])
             p_b = p.to(torch.bfloat16).double()
             ds_b = ds.to(torch.bfloat16).double()
-            dqr_emu[r0:r1] = torch.einsum("thw,twd->thd", ds_b, kg).to(torch.bfloat16).double()
-            dql_emu[r0:r1] = torch.einsum("thw,twd->thd", ds_b, vg).to(torch.bfloat16).double()
-            dkr_emu.index_add_(0, ix[valid], torch.einsum("thw,thd->twd", ds_b, qr)[valid])
-            dkvl_emu.index_add_(0, ix[valid], (torch.einsum("thw,thd->twd", ds_b, ql) + torch.einsum("thw,thd->twd", p_b, g))[valid])
+            dqr_emu[r0:r1] = (
+                torch.einsum("thw,twd->thd", ds_b, kg).to(torch.bfloat16).double()
+            )
+            dql_emu[r0:r1] = (
+                torch.einsum("thw,twd->thd", ds_b, vg).to(torch.bfloat16).double()
+            )
+            dkr_emu.index_add_(
+                0, ix[valid], torch.einsum("thw,thd->twd", ds_b, qr)[valid]
+            )
+            dkvl_emu.index_add_(
+                0,
+                ix[valid],
+                (
+                    torch.einsum("thw,thd->twd", ds_b, ql)
+                    + torch.einsum("thw,thd->twd", p_b, g)
+                )[valid],
+            )
             del p_b, ds_b
     result = dict(out=out, lse=lse, out_emu=out_emu)
     if want_grad:
         result.update(
-            dq_latent=dql, dq_rope=dqr, dkv_latent=dkvl, dk_rope=dkr,
-            dq_latent_emu=dql_emu, dq_rope_emu=dqr_emu,
-            dkv_latent_emu=dkvl_emu.to(torch.bfloat16).double(), dk_rope_emu=dkr_emu.to(torch.bfloat16).double(),
+            dq_latent=dql,
+            dq_rope=dqr,
+            dkv_latent=dkvl,
+            dk_rope=dkr,
+            dq_latent_emu=dql_emu,
+            dq_rope_emu=dqr_emu,
+            dkv_latent_emu=dkvl_emu.to(torch.bfloat16).double(),
+            dk_rope_emu=dkr_emu.to(torch.bfloat16).double(),
         )
     if own_key is not None:
         result["self_weight"] = (self_w / (total_q * NUM_HEADS)).item()
@@ -292,14 +343,36 @@ def rel_l2_rows(a: torch.Tensor, ref: torch.Tensor) -> torch.Tensor:
     return (a - ref).norm(dim=1) / ref.norm(dim=1).clamp_min(1e-30)
 
 
-def calibrate_beta(target_self_weight: float, *, seed: int, probe_len: int = 4096, topk: int = DEFAULT_TOPK, device="cuda") -> float:
+def calibrate_beta(
+    target_self_weight: float,
+    *,
+    seed: int,
+    probe_len: int = 4096,
+    topk: int = DEFAULT_TOPK,
+    device="cuda",
+) -> float:
     """``beta`` of :func:`make_inputs` giving the mean own-key softmax mass ``target``
     on a ``probe_len x probe_len`` peaked problem (bisection on the FP64 reference)."""
     lo, hi = 0.0, 8.0
     for _ in range(18):
         mid = 0.5 * (lo + hi)
-        inp = make_inputs([probe_len], [probe_len], seed=seed, topk=topk, self_including=True, beta=mid, device=device)
-        w = reference_fp64(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, own_key=inp.own_key)["self_weight"]
+        inp = make_inputs(
+            [probe_len],
+            [probe_len],
+            seed=seed,
+            topk=topk,
+            self_including=True,
+            beta=mid,
+            device=device,
+        )
+        w = reference_fp64(
+            inp.q_latent,
+            inp.q_rope,
+            inp.kv_latent,
+            inp.k_rope,
+            inp.idx_global,
+            own_key=inp.own_key,
+        )["self_weight"]
         if w < target_self_weight:
             lo = mid
         else:

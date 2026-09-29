@@ -89,15 +89,23 @@ for _s in (65536, 131072, 196608):
     ROWS[f"spread_32k_{_s}"] = ([32768], [_s])
 
 ACCURACY_CASES = {
-    "iid_4k": dict(seq_q=[4096], seq_k=[4096], self_including=False, target_self_weight=None),
-    "peaked_053_4k": dict(seq_q=[4096], seq_k=[4096], self_including=True, target_self_weight=0.53),
-    "peaked_099_4k": dict(seq_q=[4096], seq_k=[4096], self_including=True, target_self_weight=0.99),
+    "iid_4k": dict(
+        seq_q=[4096], seq_k=[4096], self_including=False, target_self_weight=None
+    ),
+    "peaked_053_4k": dict(
+        seq_q=[4096], seq_k=[4096], self_including=True, target_self_weight=0.53
+    ),
+    "peaked_099_4k": dict(
+        seq_q=[4096], seq_k=[4096], self_including=True, target_self_weight=0.99
+    ),
 }
 SEED = 1701
 
 
 def median_ms(fn, steps):
-    times = bench_gpu_time(fn, dry_run_iters=3, repeat_iters=steps, enable_cupti=True, cold_l2_cache=True)
+    times = bench_gpu_time(
+        fn, dry_run_iters=3, repeat_iters=steps, enable_cupti=True, cold_l2_cache=True
+    )
     return float(statistics.median(times))
 
 
@@ -115,15 +123,27 @@ class ArmCake:
 
     def __init__(self, inp):
         self.inp = inp
-        self.backward_available = cake_backend.generated_program_available(inp.q_latent.device, backward=True)
+        self.backward_available = cake_backend.generated_program_available(
+            inp.q_latent.device, backward=True
+        )
         self.runner = cake_backend.prepare_dsa_train(
-            inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global,
-            topk_length=inp.topk_length, dout=inp.dout if self.backward_available else None,
-            softmax_scale=DEFAULT_SCALE, backward=self.backward_available,
+            inp.q_latent,
+            inp.q_rope,
+            inp.kv_latent,
+            inp.k_rope,
+            inp.idx_global,
+            topk_length=inp.topk_length,
+            dout=inp.dout if self.backward_available else None,
+            softmax_scale=DEFAULT_SCALE,
+            backward=self.backward_available,
         )
 
     def versions(self):
-        return dict(module=self.runner.module_name, abi=self.runner.abi, stages=list(self.runner.stages))
+        return dict(
+            module=self.runner.module_name,
+            abi=self.runner.abi,
+            stages=list(self.runner.stages),
+        )
 
     def forward(self):
         out, lse, _ = self.runner.forward()
@@ -131,7 +151,9 @@ class ArmCake:
 
     def backward(self, st):
         dq_latent, dq_rope, dkv_latent, dk_rope = self.runner.backward()
-        return dict(dq_latent=dq_latent, dq_rope=dq_rope, dkv_latent=dkv_latent, dk_rope=dk_rope)
+        return dict(
+            dq_latent=dq_latent, dq_rope=dq_rope, dkv_latent=dkv_latent, dk_rope=dk_rope
+        )
 
     def outputs(self, st):
         return st
@@ -151,7 +173,9 @@ class ArmFlashMLACudnn:
         self.DSA = DSA
         self.q = torch.cat([inp.q_latent, inp.q_rope], dim=-1)
         self.kv = torch.cat([inp.kv_latent, inp.k_rope], dim=-1)
-        self.sink = torch.full((NUM_HEADS,), float("-inf"), dtype=torch.float32, device=self.q.device)
+        self.sink = torch.full(
+            (NUM_HEADS,), float("-inf"), dtype=torch.float32, device=self.q.device
+        )
         # cuDNN: valid slots first + topk_length; sentinels replaced by 0 (ignored past topk_length)
         self.idx_cudnn = inp.idx_global.clamp_min(0).contiguous()
         self.dq = torch.empty_like(self.q)
@@ -160,23 +184,42 @@ class ArmFlashMLACudnn:
     def versions(self):
         import cudnn
 
-        return dict(flash_mla=getattr(self.flash_mla, "__file__", "?"), cudnn_frontend=cudnn.__version__, torch_cudnn=torch.backends.cudnn.version())
+        return dict(
+            flash_mla=getattr(self.flash_mla, "__file__", "?"),
+            cudnn_frontend=cudnn.__version__,
+            torch_cudnn=torch.backends.cudnn.version(),
+        )
 
     def forward(self):
         out, max_logits, lse = self.flash_mla.flash_mla_sparse_fwd(
-            self.q, self.kv.unsqueeze(1), self.inp.idx_global.unsqueeze(1), DEFAULT_SCALE, D_LATENT
+            self.q,
+            self.kv.unsqueeze(1),
+            self.inp.idx_global.unsqueeze(1),
+            DEFAULT_SCALE,
+            D_LATENT,
         )
         return dict(out=out, lse=lse, max_logits=max_logits)
 
     def backward(self, st):
         self.dkv.zero_()
         self.DSA.sparse_attention_backward_wrapper(
-            self.q, self.kv, st["out"], self.inp.dout, st["lse"], self.sink, self.idx_cudnn,
-            softmax_scale=DEFAULT_SCALE, topk_length=self.inp.topk_length, dq=self.dq, dkv=self.dkv,
+            self.q,
+            self.kv,
+            st["out"],
+            self.inp.dout,
+            st["lse"],
+            self.sink,
+            self.idx_cudnn,
+            softmax_scale=DEFAULT_SCALE,
+            topk_length=self.inp.topk_length,
+            dq=self.dq,
+            dkv=self.dkv,
         )
         return dict(
-            dq_latent=self.dq[..., :D_LATENT], dq_rope=self.dq[..., D_LATENT:],
-            dkv_latent=self.dkv[:, :D_LATENT], dk_rope=self.dkv[:, D_LATENT:],
+            dq_latent=self.dq[..., :D_LATENT],
+            dq_rope=self.dq[..., D_LATENT:],
+            dkv_latent=self.dkv[:, :D_LATENT],
+            dk_rope=self.dkv[:, D_LATENT:],
         )
 
     def outputs(self, st):
@@ -197,7 +240,9 @@ class ArmFA4:
         self.q_rope = inp.q_rope.detach().requires_grad_()
         self.q_latent = inp.q_latent.detach().requires_grad_()
         self.k_rope = inp.k_rope.detach().unsqueeze(1).contiguous().requires_grad_()
-        self.kv_latent = inp.kv_latent.detach().unsqueeze(1).contiguous().requires_grad_()
+        self.kv_latent = (
+            inp.kv_latent.detach().unsqueeze(1).contiguous().requires_grad_()
+        )
 
     def versions(self):
         import cutlass
@@ -208,19 +253,37 @@ class ArmFA4:
     def forward(self):
         inp = self.inp
         out, lse = self.fn(
-            self.q_rope, self.k_rope, self.kv_latent, qv=self.q_latent,
-            cu_seqlens_q=inp.cu_seqlens_q, cu_seqlens_k=inp.cu_seqlens_k,
-            max_seqlen_q=inp.max_seqlen_q, max_seqlen_k=inp.max_seqlen_k,
-            softmax_scale=DEFAULT_SCALE, causal=True, gather_kv_indices=inp.idx_local, pack_gqa=True,
-            gather_bwd_recompute_p=True, gather_bwd_token_chunk=self.token_chunk, return_lse=True,
+            self.q_rope,
+            self.k_rope,
+            self.kv_latent,
+            qv=self.q_latent,
+            cu_seqlens_q=inp.cu_seqlens_q,
+            cu_seqlens_k=inp.cu_seqlens_k,
+            max_seqlen_q=inp.max_seqlen_q,
+            max_seqlen_k=inp.max_seqlen_k,
+            softmax_scale=DEFAULT_SCALE,
+            causal=True,
+            gather_kv_indices=inp.idx_local,
+            pack_gqa=True,
+            gather_bwd_recompute_p=True,
+            gather_bwd_token_chunk=self.token_chunk,
+            return_lse=True,
         )
         return dict(out=out, lse=lse)
 
     def backward(self, st):
         dq_rope, dk_rope, dkv_latent, dq_latent = torch.autograd.grad(
-            st["out"], (self.q_rope, self.k_rope, self.kv_latent, self.q_latent), self.inp.dout, retain_graph=True
+            st["out"],
+            (self.q_rope, self.k_rope, self.kv_latent, self.q_latent),
+            self.inp.dout,
+            retain_graph=True,
         )
-        return dict(dq_latent=dq_latent, dq_rope=dq_rope, dkv_latent=dkv_latent[:, 0], dk_rope=dk_rope[:, 0])
+        return dict(
+            dq_latent=dq_latent,
+            dq_rope=dq_rope,
+            dkv_latent=dkv_latent[:, 0],
+            dk_rope=dk_rope[:, 0],
+        )
 
     def outputs(self, st):
         lse = st["lse"]
@@ -229,7 +292,11 @@ class ArmFA4:
         return dict(out=st["out"], lse=lse)
 
 
-ARMS = {ArmCake.name: ArmCake, ArmFlashMLACudnn.name: ArmFlashMLACudnn, ArmFA4.name: ArmFA4}
+ARMS = {
+    ArmCake.name: ArmCake,
+    ArmFlashMLACudnn.name: ArmFlashMLACudnn,
+    ArmFA4.name: ArmFA4,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +327,9 @@ def measure_perf(arm, steps):
         arm.backward(s)
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated() - base
-    return dict(fwd_ms=fwd_ms, bwd_ms=bwd_ms, step_ms=step_ms, peak_above_inputs_gib=gib(peak))
+    return dict(
+        fwd_ms=fwd_ms, bwd_ms=bwd_ms, step_ms=step_ms, peak_above_inputs_gib=gib(peak)
+    )
 
 
 def measure_accuracy(arm, inp):
@@ -272,38 +341,61 @@ def measure_accuracy(arm, inp):
         grads = dict(error=str(exc))
     torch.cuda.synchronize()
     ref = reference_fp64(
-        inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global,
-        dout=inp.dout, own_key=inp.own_key,
+        inp.q_latent,
+        inp.q_rope,
+        inp.kv_latent,
+        inp.k_rope,
+        inp.idx_global,
+        dout=inp.dout,
+        own_key=inp.own_key,
     )
     outs = arm.outputs(st)
     valid = torch.isfinite(ref["lse"])
     record = dict(
         self_weight=ref["self_weight"],
         out_rel_l2=rel_l2(outs["out"], ref["out"]),
-        lse_max_abs=float((outs["lse"].double()[valid] - ref["lse"][valid]).abs().max()) if valid.any() else 0.0,
+        lse_max_abs=float((outs["lse"].double()[valid] - ref["lse"][valid]).abs().max())
+        if valid.any()
+        else 0.0,
     )
     if "error" in grads:
         record["backward"] = grads["error"]
     else:
         for name in ("dq_latent", "dq_rope", "dkv_latent", "dk_rope"):
             record[f"{name}_rel_l2"] = rel_l2(grads[name], ref[name])
-        record["dq_latent_row_p99"] = float(rel_l2_rows(grads["dq_latent"], ref["dq_latent"]).quantile(0.99))
+        record["dq_latent_row_p99"] = float(
+            rel_l2_rows(grads["dq_latent"], ref["dq_latent"]).quantile(0.99)
+        )
     return record
 
 
 def _arm_or_error(cls, inp):
     try:
         return cls(inp), None
-    except Exception as exc:  # optional dependency missing or arm unavailable on this device
+    except (
+        Exception
+    ) as exc:  # optional dependency missing or arm unavailable on this device
         return None, f"{type(exc).__name__}: {exc}"
 
 
 def run_perf(args, results):
-    steps_for = lambda inp: max(args.min_steps, args.steps if inp.total_q * inp.total_k <= 2**34 else args.steps_128k)
+    steps_for = lambda inp: max(
+        args.min_steps,
+        args.steps if inp.total_q * inp.total_k <= 2**34 else args.steps_128k,
+    )
     for row in args.rows:
         seq_q, seq_k = ROWS[row]
-        inp = make_inputs(seq_q, seq_k, seed=SEED, topk=DEFAULT_TOPK, device=args.device)
-        entry = dict(row=row, total_q=inp.total_q, total_k=inp.total_k, num_docs=len(seq_q), inputs_gib=gib(inp.bytes_inputs()), arms={})
+        inp = make_inputs(
+            seq_q, seq_k, seed=SEED, topk=DEFAULT_TOPK, device=args.device
+        )
+        entry = dict(
+            row=row,
+            total_q=inp.total_q,
+            total_k=inp.total_k,
+            num_docs=len(seq_q),
+            inputs_gib=gib(inp.bytes_inputs()),
+            arms={},
+        )
         for name in args.arms:
             arm, error = _arm_or_error(ARMS[name], inp)
             if arm is None:
@@ -314,7 +406,10 @@ def run_perf(args, results):
                 perf = measure_perf(arm, steps_for(inp))
                 perf["versions"] = arm.versions()
             except Exception as exc:
-                perf = dict(error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+                perf = dict(
+                    error=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc(),
+                )
             entry["arms"][name] = perf
             fmt = lambda v: "   n/a" if v is None else f"{v:8.3f}"
             if "error" in perf:
@@ -336,8 +431,18 @@ def run_accuracy(args, results):
     for case, spec in ACCURACY_CASES.items():
         beta = 0.0
         if spec["target_self_weight"] is not None:
-            beta = calibrate_beta(spec["target_self_weight"], seed=SEED, device=args.device)
-        inp = make_inputs(spec["seq_q"], spec["seq_k"], seed=SEED, topk=DEFAULT_TOPK, self_including=spec["self_including"], beta=beta, device=args.device)
+            beta = calibrate_beta(
+                spec["target_self_weight"], seed=SEED, device=args.device
+            )
+        inp = make_inputs(
+            spec["seq_q"],
+            spec["seq_k"],
+            seed=SEED,
+            topk=DEFAULT_TOPK,
+            self_including=spec["self_including"],
+            beta=beta,
+            device=args.device,
+        )
         entry = dict(case=case, beta=beta, arms={})
         for name in args.arms:
             arm, error = _arm_or_error(ARMS[name], inp)
@@ -348,7 +453,10 @@ def run_accuracy(args, results):
                 entry["arms"][name] = measure_accuracy(arm, inp)
             except Exception as exc:
                 entry["arms"][name] = dict(error=f"{type(exc).__name__}: {exc}")
-            print(f"{case:16s} {name:15s} {json.dumps(entry['arms'][name], default=str)}", flush=True)
+            print(
+                f"{case:16s} {name:15s} {json.dumps(entry['arms'][name], default=str)}",
+                flush=True,
+            )
             del arm
             torch.cuda.empty_cache()
         results["accuracy"].append(entry)
@@ -377,7 +485,9 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
     cache = cake_backend.BINDING_CACHE
     was_enabled = cache.enabled
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
-    backward_available = cake_backend.generated_program_available(inp.q_latent.device, backward=True)
+    backward_available = cake_backend.generated_program_available(
+        inp.q_latent.device, backward=True
+    )
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", ExperimentalWarning)
         dsa_sparse_attention(*args)  # the experimental banner fires once per process
@@ -405,9 +515,15 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
 
     entry_points = [("forward", eager_forward), ("public_forward", public_forward)]
     if backward_available:
-        entry_points += [("backward", eager_backward), ("public_backward", public_backward), ("autograd_step", autograd_step)]
+        entry_points += [
+            ("backward", eager_backward),
+            ("public_backward", public_backward),
+            ("autograd_step", autograd_step),
+        ]
     samples = {name: {"off": [], "on": []} for name, _ in entry_points}
-    lookups = {name: [] for name, _ in entry_points}  # (hits, misses) of the measured cache-on calls
+    lookups = {
+        name: [] for name, _ in entry_points
+    }  # (hits, misses) of the measured cache-on calls
     try:
         for _ in range(rounds):
             for mode in ("off", "on"):
@@ -426,7 +542,10 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
         on_fwd = eager_forward()
         on_bwd = eager_backward() if backward_available else None
         torch.cuda.synchronize()
-        same = dict(out=torch.equal(off_fwd[0], on_fwd[0]), lse=torch.equal(off_fwd[1], on_fwd[1]))
+        same = dict(
+            out=torch.equal(off_fwd[0], on_fwd[0]),
+            lse=torch.equal(off_fwd[1], on_fwd[1]),
+        )
         if backward_available:
             same.update(
                 dq_latent=torch.equal(off_bwd[0], on_bwd[0]),
@@ -442,32 +561,63 @@ def measure_host_path(inp, *, calls, rounds, kernel_steps):
                 cache.enabled = mode == "on"
                 kernel_ms[mode] = dict(forward=median_ms(eager_forward, kernel_steps))
                 if backward_available:
-                    kernel_ms[mode]["backward"] = median_ms(eager_backward, kernel_steps)
-                    kernel_ms[mode]["autograd_step"] = median_ms(autograd_step, kernel_steps)
+                    kernel_ms[mode]["backward"] = median_ms(
+                        eager_backward, kernel_steps
+                    )
+                    kernel_ms[mode]["autograd_step"] = median_ms(
+                        autograd_step, kernel_steps
+                    )
         except Exception as exc:  # the host figures stand on their own when CUPTI tracing is unavailable
             kernel_ms["error"] = f"{type(exc).__name__}: {exc}"
     finally:
         cache.enabled = was_enabled
     host_us = {
-        name: {mode: dict(median=float(statistics.median(v)), min=float(min(v)), rounds=[float(x) for x in v]) for mode, v in modes.items()}
+        name: {
+            mode: dict(
+                median=float(statistics.median(v)),
+                min=float(min(v)),
+                rounds=[float(x) for x in v],
+            )
+            for mode, v in modes.items()
+        }
         for name, modes in samples.items()
     }
     for name, hm in lookups.items():
-        host_us[name]["on"]["lookups"] = dict(hits=sum(h for h, _ in hm), misses=sum(m for _, m in hm))
+        host_us[name]["on"]["lookups"] = dict(
+            hits=sum(h for h, _ in hm), misses=sum(m for _, m in hm)
+        )
     return dict(
-        calls=calls, rounds=rounds, host_us=host_us, same_results=same, kernel_ms=kernel_ms,
-        cache=dict(hits=cache.hits, misses=cache.misses, bindings=len(cache), owned_bytes=cache.owned_bytes),
+        calls=calls,
+        rounds=rounds,
+        host_us=host_us,
+        same_results=same,
+        kernel_ms=kernel_ms,
+        cache=dict(
+            hits=cache.hits,
+            misses=cache.misses,
+            bindings=len(cache),
+            owned_bytes=cache.owned_bytes,
+        ),
     )
 
 
 def run_host_path(args, results):
     for row in args.rows:
         seq_q, seq_k = ROWS[row]
-        inp = make_inputs(seq_q, seq_k, seed=SEED, topk=DEFAULT_TOPK, device=args.device)
+        inp = make_inputs(
+            seq_q, seq_k, seed=SEED, topk=DEFAULT_TOPK, device=args.device
+        )
         try:
-            entry = measure_host_path(inp, calls=args.host_calls, rounds=args.host_rounds, kernel_steps=max(args.min_steps, args.steps_128k))
+            entry = measure_host_path(
+                inp,
+                calls=args.host_calls,
+                rounds=args.host_rounds,
+                kernel_steps=max(args.min_steps, args.steps_128k),
+            )
         except Exception as exc:
-            entry = dict(error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+            entry = dict(
+                error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc()
+            )
             print(f"{row:22s} host path failed: {entry['error']}", flush=True)
         else:
             for name, modes in entry["host_us"].items():
@@ -478,9 +628,15 @@ def run_host_path(args, results):
                     f"  lookups hit {lk['hits']} miss {lk['misses']}",
                     flush=True,
                 )
-            print(f"{row:22s} same results: {json.dumps(entry['same_results'], default=str)}", flush=True)
+            print(
+                f"{row:22s} same results: {json.dumps(entry['same_results'], default=str)}",
+                flush=True,
+            )
             for mode, ms in entry["kernel_ms"].items():
-                print(f"{row:22s} kernel-only ms (cache {mode}): {json.dumps(ms)}", flush=True)
+                print(
+                    f"{row:22s} kernel-only ms (cache {mode}): {json.dumps(ms)}",
+                    flush=True,
+                )
         entry["row"] = row
         results["host_path"].append(entry)
         del inp
@@ -488,14 +644,22 @@ def run_host_path(args, results):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--rows", nargs="*", default=list(ROWS), choices=list(ROWS))
     parser.add_argument("--arms", default="cake,flashmla_cudnn,fa4")
     parser.add_argument("--steps", type=int, default=20)
-    parser.add_argument("--steps-128k", type=int, default=13, help="iterations for the largest problems")
+    parser.add_argument(
+        "--steps-128k", type=int, default=13, help="iterations for the largest problems"
+    )
     parser.add_argument("--min-steps", type=int, default=5)
     parser.add_argument("--accuracy", action="store_true")
-    parser.add_argument("--host-us", action="store_true", help="host microseconds per call, binding cache off / on")
+    parser.add_argument(
+        "--host-us",
+        action="store_true",
+        help="host microseconds per call, binding cache off / on",
+    )
     parser.add_argument("--host-calls", type=int, default=20)
     parser.add_argument("--host-rounds", type=int, default=3)
     parser.add_argument("--no-perf", action="store_true")

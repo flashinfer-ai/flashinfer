@@ -276,7 +276,9 @@ def _check_key_tensor(t: torch.Tensor, name: str, last: int) -> None:
     if t.dtype != torch.bfloat16:
         raise ValueError(f"{name} must be bfloat16")
     if t.stride(1) != 1:
-        raise ValueError(f"{name} rows must be contiguous (a view of a packed [S, {D_QK}] tensor is allowed)")
+        raise ValueError(
+            f"{name} rows must be contiguous (a view of a packed [S, {D_QK}] tensor is allowed)"
+        )
 
 
 def validate_dsa_train_inputs(
@@ -304,7 +306,11 @@ def validate_dsa_train_inputs(
         raise ValueError("q_latent and q_rope must have the same number of rows")
     if int(k_rope.shape[0]) != num_kv:
         raise ValueError("kv_latent and k_rope must have the same number of rows")
-    if indices.ndim != 2 or indices.dtype != torch.int32 or int(indices.shape[0]) != num_queries:
+    if (
+        indices.ndim != 2
+        or indices.dtype != torch.int32
+        or int(indices.shape[0]) != num_queries
+    ):
         raise ValueError("indices must be an int32 [T, topk] tensor")
     if not indices.is_contiguous():
         raise ValueError("indices must be contiguous")
@@ -330,7 +336,9 @@ def _check_output(t: Optional[torch.Tensor], name: str, shape: tuple, dtype) -> 
     if t is None:
         return
     if tuple(t.shape) != tuple(shape) or t.dtype != dtype or not t.is_contiguous():
-        raise ValueError(f"{name} must be a contiguous {dtype} tensor of shape {tuple(shape)}")
+        raise ValueError(
+            f"{name} must be a contiguous {dtype} tensor of shape {tuple(shape)}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +397,9 @@ def workspace_layout(
 
 
 def _record_tma_bytes(record: dict[str, Any], stages: tuple[str, ...]) -> int:
-    return max((int(record[s].get("tma_workspace_bytes", 0)) for s in stages), default=0)
+    return max(
+        (int(record[s].get("tma_workspace_bytes", 0)) for s in stages), default=0
+    )
 
 
 def _record_scratch_bytes(record: dict[str, Any], stages: tuple[str, ...]) -> int:
@@ -425,7 +435,9 @@ def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape) -> torch.T
     offset, nbytes = layout[name]
     needed = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
     if needed > nbytes:
-        raise ValueError(f"workspace region {name!r} holds {nbytes} bytes, {needed} needed")
+        raise ValueError(
+            f"workspace region {name!r} holds {nbytes} bytes, {needed} needed"
+        )
     return flat[offset : offset + needed].view(dtype).view(shape)
 
 
@@ -455,7 +467,9 @@ def offset_gather_kv_indices(
         if cu.ndim != 1 or cu.dtype != torch.int32 or cu.numel() < 2:
             raise ValueError(f"{name} must be an int32 [num_docs + 1] tensor")
     if cu_seqlens_q.numel() != cu_seqlens_k.numel():
-        raise ValueError("cu_seqlens_q and cu_seqlens_k must describe the same documents")
+        raise ValueError(
+            "cu_seqlens_q and cu_seqlens_k must describe the same documents"
+        )
     total_q = int(gather_kv_indices.shape[0])
     num_docs = int(cu_seqlens_q.numel()) - 1
     device = gather_kv_indices.device
@@ -464,10 +478,14 @@ def offset_gather_kv_indices(
         torch.arange(num_docs, device=device), seqlens_q, output_size=total_q
     )
     key_base = cu_seqlens_k[:-1].to(torch.int64)[doc_of_row][:, None]
-    key_len = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).to(torch.int64)[doc_of_row][:, None]
+    key_len = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).to(torch.int64)[doc_of_row][
+        :, None
+    ]
     local = gather_kv_indices.to(torch.int64)
     valid = (local >= 0) & (local < key_len)
-    result = torch.where(valid, local + key_base, torch.full_like(local, -1)).to(torch.int32)
+    result = torch.where(valid, local + key_base, torch.full_like(local, -1)).to(
+        torch.int32
+    )
     if out is None:
         return result
     out.copy_(result)
@@ -479,7 +497,7 @@ def offset_gather_kv_indices(
 # ---------------------------------------------------------------------------
 
 
-def grid_dims(rule, scalars: dict[str, int], num_sms: int) -> tuple[int, int, int]:
+def grid_dims(rule, scalars: dict[str, Any], num_sms: int) -> tuple[int, int, int]:
     """Evaluate a registry grid rule.
 
     Each of the three entries is an integer, ``"sms"``, ``"sms*<n>"`` or
@@ -571,7 +589,9 @@ def bind_stage(
         key = name if name in values else CONTRACT_ALIASES.get(name, name)
         if kind == "grid":
             arguments.append(grid_values[name])
-        elif key in values and values[key] is not None:  # buffer / tma_buffer / workspace / parameter
+        elif (
+            key in values and values[key] is not None
+        ):  # buffer / tma_buffer / workspace / parameter
             value = values[key]
             if kind == "buffer" and f"{key}_storage" in values:
                 key = f"{key}_storage"  # raw pointer: whole storage + <name>_offset elements
@@ -588,7 +608,13 @@ def bind_stage(
     prepare_entry = physical.get("tma_prepare_entry")
     prepare = getattr(module, prepare_entry) if prepare_entry else None
     return _Launch(
-        stage, module_name, getattr(module, physical["ffi_entry"]), tuple(arguments), grid, prepare, tuple(slots)
+        stage,
+        module_name,
+        getattr(module, physical["ffi_entry"]),
+        tuple(arguments),
+        grid,
+        prepare,
+        tuple(slots),
     )
 
 
@@ -606,7 +632,11 @@ def _ffi_stream_context(index: int):
     if device is None:
         device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
     getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    raw = getter(index) if getter is not None else torch.cuda.current_stream(index).cuda_stream
+    raw = (
+        getter(index)
+        if getter is not None
+        else torch.cuda.current_stream(index).cuda_stream
+    )
     return tvm_ffi.use_raw_stream(device, raw)
 
 
@@ -695,7 +725,9 @@ class DSATrainRunner:
         self._run(FORWARD_STAGES)
         if self.abi == ABI_SEED:
             lse = t["lse"]
-            torch.isposinf(lse, out=t["lse_mask"])  # empty rows; no temporaries (launch path allocates nothing)
+            torch.isposinf(
+                lse, out=t["lse_mask"]
+            )  # empty rows; no temporaries (launch path allocates nothing)
             lse.masked_fill_(t["lse_mask"], float("-inf"))
         return t["out"], t["lse"], t.get("o_lo")
 
@@ -710,8 +742,15 @@ class DSATrainRunner:
         t["dk_rope_acc"].zero_()
         self._run(BACKWARD_STAGES)
         if self.dkv_fp32:
-            if self.dkv_acc_permuted:  # natural-layout FP32 written by bwd_cast (out_f32 = 1)
-                return t["dq_latent"], t["dq_rope"], t["dkv_latent_fp32"], t["dk_rope_fp32"]
+            if (
+                self.dkv_acc_permuted
+            ):  # natural-layout FP32 written by bwd_cast (out_f32 = 1)
+                return (
+                    t["dq_latent"],
+                    t["dq_rope"],
+                    t["dkv_latent_fp32"],
+                    t["dk_rope_fp32"],
+                )
             return t["dq_latent"], t["dq_rope"], t["dkv_latent_acc"], t["dk_rope_acc"]
         if "bwd_cast" not in self.launches:
             t["dkv_latent"].copy_(t["dkv_latent_acc"])
@@ -751,7 +790,9 @@ def _inert_pass_values(values: dict[str, Any], num_kv: int) -> dict[str, Any]:
     return values
 
 
-def _contract_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dict[str, Any]:
+def _contract_values(
+    t: dict[str, torch.Tensor], scalars: dict[str, Any]
+) -> dict[str, Any]:
     values: dict[str, Any] = {name: t.get(name) for name in CONTRACT_TENSORS}
     values.update(scalars)
     values["softmax_scale_log2"] = float(scalars["softmax_scale"]) * LOG2E
@@ -771,7 +812,10 @@ def _contract_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dic
     values["latent_groups"] = int(scalars["num_kv"]) * D_LATENT // 32
     values["rope_groups"] = int(scalars["num_kv"]) * D_ROPE // 32
     values["out_f32"] = int(scalars.get("out_f32", 0))
-    values["token_base"], values["token_step"] = 0, 1  # one CTA per token, token = blockIdx.x
+    values["token_base"], values["token_step"] = (
+        0,
+        1,
+    )  # one CTA per token, token = blockIdx.x
     return _inert_pass_values(values, int(scalars["num_kv"]))
 
 
@@ -839,7 +883,22 @@ def prepare_dsa_train(
         raise ValueError("a backward binding needs dout")
     device = q_latent.device
     tensors = [q_latent, q_rope, kv_latent, k_rope, indices]
-    tensors += [t for t in (topk_length, dout, workspace_buffer, out, lse, o_lo, dq_latent, dq_rope, dkv_latent, dk_rope) if t is not None]
+    tensors += [
+        t
+        for t in (
+            topk_length,
+            dout,
+            workspace_buffer,
+            out,
+            lse,
+            o_lo,
+            dq_latent,
+            dq_rope,
+            dkv_latent,
+            dk_rope,
+        )
+        if t is not None
+    ]
     if not all(t.is_cuda and t.device == device for t in tensors):
         raise ValueError("Expected all tensors on one CUDA device")
     module_name, record = record_for(device)
@@ -866,7 +925,9 @@ def prepare_dsa_train(
     _check_output(out, "out", (num_queries, NUM_HEADS, D_LATENT), torch.bfloat16)
     _check_output(lse, "lse", (num_queries, NUM_HEADS), torch.float32)
     _check_output(o_lo, "o_lo", (num_queries, NUM_HEADS, D_LATENT), torch.bfloat16)
-    _check_output(dq_latent, "dq_latent", (num_queries, NUM_HEADS, D_LATENT), torch.bfloat16)
+    _check_output(
+        dq_latent, "dq_latent", (num_queries, NUM_HEADS, D_LATENT), torch.bfloat16
+    )
     _check_output(dq_rope, "dq_rope", (num_queries, NUM_HEADS, D_ROPE), torch.bfloat16)
     _check_output(dkv_latent, "dkv_latent", (num_kv, D_LATENT), torch.bfloat16)
     _check_output(dk_rope, "dk_rope", (num_kv, D_ROPE), torch.bfloat16)
@@ -881,63 +942,138 @@ def prepare_dsa_train(
         scratch_bytes=_record_scratch_bytes(record, stages) if backward else 0,
     )
     if workspace_buffer is None:
-        workspace_buffer = torch.empty(layout["total"], dtype=torch.uint8, device=device)
+        workspace_buffer = torch.empty(
+            layout["total"], dtype=torch.uint8, device=device
+        )
     flat = workspace_buffer.view(-1).view(torch.uint8)
     if flat.numel() < layout["total"]:
-        raise ValueError(f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}")
+        raise ValueError(
+            f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}"
+        )
 
     t: dict[str, torch.Tensor] = dict(
-        q_latent=q_latent, q_rope=q_rope, kv_latent=kv_latent, k_rope=k_rope, indices=indices
+        q_latent=q_latent,
+        q_rope=q_rope,
+        kv_latent=kv_latent,
+        k_rope=k_rope,
+        indices=indices,
     )
     has_topk_length = int(topk_length is not None)
     if topk_length is None:
         topk_length = _carve(flat, layout, "topk_length", torch.int32, (num_queries,))
         topk_length.fill_(topk)
     t["topk_length"] = topk_length
-    t["out"] = out if out is not None else torch.empty((num_queries, NUM_HEADS, D_LATENT), dtype=torch.bfloat16, device=device)
-    t["lse"] = lse if lse is not None else torch.empty((num_queries, NUM_HEADS), dtype=torch.float32, device=device)
+    t["out"] = (
+        out
+        if out is not None
+        else torch.empty(
+            (num_queries, NUM_HEADS, D_LATENT), dtype=torch.bfloat16, device=device
+        )
+    )
+    t["lse"] = (
+        lse
+        if lse is not None
+        else torch.empty((num_queries, NUM_HEADS), dtype=torch.float32, device=device)
+    )
     if abi == ABI_CONTRACT:
         t["o_lo"] = o_lo if o_lo is not None else torch.empty_like(t["out"])
     else:
-        t["packed_q"] = _carve(flat, layout, "packed_q", torch.bfloat16, (num_queries, NUM_HEADS, D_QK))
-        t["packed_kv"] = _carve(flat, layout, "packed_kv", torch.bfloat16, (num_kv, D_QK))
-        t["aux_logits"] = _carve(flat, layout, "aux_logits", torch.float32, (num_queries, NUM_HEADS))
+        t["packed_q"] = _carve(
+            flat, layout, "packed_q", torch.bfloat16, (num_queries, NUM_HEADS, D_QK)
+        )
+        t["packed_kv"] = _carve(
+            flat, layout, "packed_kv", torch.bfloat16, (num_kv, D_QK)
+        )
+        t["aux_logits"] = _carve(
+            flat, layout, "aux_logits", torch.float32, (num_queries, NUM_HEADS)
+        )
         t["sinks"] = _carve(flat, layout, "sinks", torch.float32, (NUM_HEADS,))
-        t["lse_mask"] = torch.empty((num_queries, NUM_HEADS), dtype=torch.bool, device=device)  # +inf -> -inf rewrite scratch
+        t["lse_mask"] = torch.empty(
+            (num_queries, NUM_HEADS), dtype=torch.bool, device=device
+        )  # +inf -> -inf rewrite scratch
     if backward:
         t["dout"] = dout
-        t["delta"] = _carve(flat, layout, "delta", torch.float32, (num_queries, NUM_HEADS))
-        t["dkv_latent_acc"] = _carve(flat, layout, "dkv_latent_acc", torch.float32, (num_kv, D_LATENT))
-        t["dk_rope_acc"] = _carve(flat, layout, "dk_rope_acc", torch.float32, (num_kv, D_ROPE))
-        t["dq_latent"] = dq_latent if dq_latent is not None else torch.empty((num_queries, NUM_HEADS, D_LATENT), dtype=torch.bfloat16, device=device)
-        t["dq_rope"] = dq_rope if dq_rope is not None else torch.empty((num_queries, NUM_HEADS, D_ROPE), dtype=torch.bfloat16, device=device)
+        t["delta"] = _carve(
+            flat, layout, "delta", torch.float32, (num_queries, NUM_HEADS)
+        )
+        t["dkv_latent_acc"] = _carve(
+            flat, layout, "dkv_latent_acc", torch.float32, (num_kv, D_LATENT)
+        )
+        t["dk_rope_acc"] = _carve(
+            flat, layout, "dk_rope_acc", torch.float32, (num_kv, D_ROPE)
+        )
+        t["dq_latent"] = (
+            dq_latent
+            if dq_latent is not None
+            else torch.empty(
+                (num_queries, NUM_HEADS, D_LATENT), dtype=torch.bfloat16, device=device
+            )
+        )
+        t["dq_rope"] = (
+            dq_rope
+            if dq_rope is not None
+            else torch.empty(
+                (num_queries, NUM_HEADS, D_ROPE), dtype=torch.bfloat16, device=device
+            )
+        )
         if not dkv_fp32:
-            t["dkv_latent"] = dkv_latent if dkv_latent is not None else torch.empty((num_kv, D_LATENT), dtype=torch.bfloat16, device=device)
-            t["dk_rope"] = dk_rope if dk_rope is not None else torch.empty((num_kv, D_ROPE), dtype=torch.bfloat16, device=device)
+            t["dkv_latent"] = (
+                dkv_latent
+                if dkv_latent is not None
+                else torch.empty(
+                    (num_kv, D_LATENT), dtype=torch.bfloat16, device=device
+                )
+            )
+            t["dk_rope"] = (
+                dk_rope
+                if dk_rope is not None
+                else torch.empty((num_kv, D_ROPE), dtype=torch.bfloat16, device=device)
+            )
             # the cast's FP32 output pointers are not dereferenced when out_f32 = 0: alias the accumulators
-            t["dkv_latent_fp32"], t["dk_rope_fp32"] = t["dkv_latent_acc"], t["dk_rope_acc"]
+            t["dkv_latent_fp32"], t["dk_rope_fp32"] = (
+                t["dkv_latent_acc"],
+                t["dk_rope_acc"],
+            )
         elif permuted:
             # natural-layout FP32 outputs written by bwd_cast (out_f32 = 1); its BF16 output pointers are not dereferenced
-            t["dkv_latent_fp32"] = torch.empty((num_kv, D_LATENT), dtype=torch.float32, device=device)
-            t["dk_rope_fp32"] = torch.empty((num_kv, D_ROPE), dtype=torch.float32, device=device)
+            t["dkv_latent_fp32"] = torch.empty(
+                (num_kv, D_LATENT), dtype=torch.float32, device=device
+            )
+            t["dk_rope_fp32"] = torch.empty(
+                (num_kv, D_ROPE), dtype=torch.float32, device=device
+            )
             t["dkv_latent"] = torch.empty((0,), dtype=torch.bfloat16, device=device)
             t["dk_rope"] = torch.empty((0,), dtype=torch.bfloat16, device=device)
     if layout.get("workspace"):
-        t["workspace"] = _carve(flat, layout, "workspace", torch.uint8, (layout["workspace"][1],))
+        t["workspace"] = _carve(
+            flat, layout, "workspace", torch.uint8, (layout["workspace"][1],)
+        )
     if layout.get("tma_descriptor_workspace"):
         t["tma_descriptor_workspace"] = _carve(
-            flat, layout, "tma_descriptor_workspace", torch.uint8, (layout["tma_descriptor_workspace"][1],)
+            flat,
+            layout,
+            "tma_descriptor_workspace",
+            torch.uint8,
+            (layout["tma_descriptor_workspace"][1],),
         )
 
     scalars = dict(
-        num_queries=num_queries, num_kv=num_kv, topk=topk, softmax_scale=float(softmax_scale),
-        has_topk_length=has_topk_length, out_f32=int(bool(backward and dkv_fp32 and permuted)),
+        num_queries=num_queries,
+        num_kv=num_kv,
+        topk=topk,
+        softmax_scale=float(softmax_scale),
+        has_topk_length=has_topk_length,
+        out_f32=int(bool(backward and dkv_fp32 and permuted)),
     )
-    values = _seed_values(t, scalars) if abi == ABI_SEED else _contract_values(t, scalars)
+    values = (
+        _seed_values(t, scalars) if abi == ABI_SEED else _contract_values(t, scalars)
+    )
     num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     wanted = FORWARD_STAGES + (BACKWARD_STAGES if backward else ())
     if dkv_fp32 and not permuted:
-        wanted = tuple(s for s in wanted if s != "bwd_cast")  # the natural-layout FP32 accumulators are the outputs
+        wanted = tuple(
+            s for s in wanted if s != "bwd_cast"
+        )  # the natural-layout FP32 accumulators are the outputs
     launches = {}
     for stage in stages:
         if stage not in wanted:
@@ -946,7 +1082,9 @@ def prepare_dsa_train(
         grid = grid_dims(physical.get("grid", ["num_queries", 1, 1]), scalars, num_sms)
         cluster = physical.get("launch", {}).get("cluster")
         if cluster and any(g % c for g, c in zip(grid, cluster, strict=True)):
-            raise ValueError(f"stage {stage!r}: grid {grid} is not a multiple of the cluster shape {tuple(cluster)} baked into the module")
+            raise ValueError(
+                f"stage {stage!r}: grid {grid} is not a multiple of the cluster shape {tuple(cluster)} baked into the module"
+            )
         launches[stage] = bind_stage(module_name, stage, values, grid)
     return DSATrainRunner(
         module_name=module_name,
@@ -960,7 +1098,9 @@ def prepare_dsa_train(
         stages=stages,
         dkv_fp32=bool(dkv_fp32),
         has_topk_length=bool(has_topk_length),
-        device_index=int(device.index if device.index is not None else torch.cuda.current_device()),
+        device_index=int(
+            device.index if device.index is not None else torch.cuda.current_device()
+        ),
         workspace=flat,
         layout=layout,
         dkv_acc_permuted=bool(permuted),
@@ -971,7 +1111,9 @@ def prepare_dsa_train(
 # Binding cache of the eager entry points
 # ---------------------------------------------------------------------------
 
-BINDING_CACHE_ENV = "FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE"  # "0" disables the cache at import
+BINDING_CACHE_ENV = (
+    "FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE"  # "0" disables the cache at import
+)
 # Scratch the cache owns per remembered backward binding is bounded by this many bytes in total.
 BINDING_CACHE_BUDGET_BYTES = 512 << 20
 
@@ -1039,7 +1181,13 @@ def backward_binding_key(
 
 
 # Workspace regions a remembered binding keeps (the caller never sees them).
-_OWNED_SCRATCH = ("delta", "dkv_latent_acc", "dk_rope_acc", "workspace", "tma_descriptor_workspace")
+_OWNED_SCRATCH = (
+    "delta",
+    "dkv_latent_acc",
+    "dk_rope_acc",
+    "workspace",
+    "tma_descriptor_workspace",
+)
 
 
 @dataclass
@@ -1062,7 +1210,9 @@ class _Binding:
     dkv_fp32: bool
     launches: dict[str, _Launch] = field(repr=False)
     owned: dict[str, torch.Tensor] = field(repr=False)
-    acc_span: Optional[torch.Tensor] = field(repr=False)  # bytes covering both FP32 accumulators
+    acc_span: Optional[torch.Tensor] = field(
+        repr=False
+    )  # bytes covering both FP32 accumulators
     owned_bytes: int = 0
     dkv_acc_permuted: bool = False
 
@@ -1072,7 +1222,9 @@ class _Binding:
             raise ValueError(f"only the {ABI_CONTRACT!r} profile can be remembered")
         t = runner.tensors
         owned = {name: t[name] for name in _OWNED_SCRATCH if name in t}
-        if runner.dkv_fp32 and not runner.dkv_acc_permuted:  # the accumulators are the outputs: fresh per call
+        if (
+            runner.dkv_fp32 and not runner.dkv_acc_permuted
+        ):  # the accumulators are the outputs: fresh per call
             owned.pop("dkv_latent_acc", None)
             owned.pop("dk_rope_acc", None)
         if runner.has_backward and not runner.dkv_fp32:
@@ -1088,7 +1240,10 @@ class _Binding:
             owned["topk_length"] = t["topk_length"]
         acc_span = None
         if "dkv_latent_acc" in owned and "dk_rope_acc" in owned:
-            (o1, n1), (o2, n2) = runner.layout["dkv_latent_acc"], runner.layout["dk_rope_acc"]
+            (o1, n1), (o2, n2) = (
+                runner.layout["dkv_latent_acc"],
+                runner.layout["dk_rope_acc"],
+            )
             acc_span = runner.workspace[min(o1, o2) : max(o1 + n1, o2 + n2)]
         return cls(
             num_queries=runner.num_queries,
@@ -1097,7 +1252,9 @@ class _Binding:
             device=t["q_latent"].device,
             device_index=runner.device_index,
             dkv_fp32=runner.dkv_fp32,
-            launches={stage: launch.templated() for stage, launch in runner.launches.items()},
+            launches={
+                stage: launch.templated() for stage, launch in runner.launches.items()
+            },
             owned=owned,
             acc_span=acc_span,
             owned_bytes=int(runner.workspace.numel()),
@@ -1106,7 +1263,9 @@ class _Binding:
 
     def holds_no_tensor(self) -> bool:
         return not any(
-            isinstance(a, torch.Tensor) for launch in self.launches.values() for a in launch.arguments
+            isinstance(a, torch.Tensor)
+            for launch in self.launches.values()
+            for a in launch.arguments
         )
 
     def rebind_values(self, current: dict[str, torch.Tensor]) -> dict[str, Any]:
@@ -1114,11 +1273,17 @@ class _Binding:
         storage alias / element offset of the raw-pointer operands, re-read now."""
         values: dict[str, Any] = dict(self.owned)
         values.update(current)
-        values["indices_storage"], values["indices_offset"] = _pointer_alias(current["indices"])
-        values["k_rope_storage"], values["k_rope_offset"] = _pointer_alias(current["k_rope"])
+        values["indices_storage"], values["indices_offset"] = _pointer_alias(
+            current["indices"]
+        )
+        values["k_rope_storage"], values["k_rope_offset"] = _pointer_alias(
+            current["k_rope"]
+        )
         return _inert_pass_values(values, self.num_kv)
 
-    def _launch(self, current: dict[str, torch.Tensor], stages: tuple[str, ...]) -> None:
+    def _launch(
+        self, current: dict[str, torch.Tensor], stages: tuple[str, ...]
+    ) -> None:
         values = self.rebind_values(current)
         with _ffi_stream_context(self.device_index):
             for stage in stages:
@@ -1126,7 +1291,9 @@ class _Binding:
                 if launch is None:
                     continue
                 arguments = launch.arguments_for(values)
-                if launch.prepare is not None:  # descriptors of a pointer-ABI stage see the fresh outputs
+                if (
+                    launch.prepare is not None
+                ):  # descriptors of a pointer-ABI stage see the fresh outputs
                     launch.prepare(*arguments)
                 launch.entry(*arguments)
 
@@ -1136,31 +1303,71 @@ class _Binding:
         o_lo = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
         lse = torch.empty(shape[:2], dtype=torch.float32, device=self.device)
         current = dict(
-            q_latent=q_latent, q_rope=q_rope, kv_latent=kv_latent, k_rope=k_rope, indices=indices,
-            out=out, o_lo=o_lo, lse=lse,
+            q_latent=q_latent,
+            q_rope=q_rope,
+            kv_latent=kv_latent,
+            k_rope=k_rope,
+            indices=indices,
+            out=out,
+            o_lo=o_lo,
+            lse=lse,
         )
         if topk_length is not None:
             current["topk_length"] = topk_length
         self._launch(current, FORWARD_STAGES)
         return out, lse, o_lo
 
-    def backward(self, q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout, topk_length):
+    def backward(
+        self,
+        q_latent,
+        q_rope,
+        kv_latent,
+        k_rope,
+        indices,
+        out,
+        o_lo,
+        lse,
+        dout,
+        topk_length,
+    ):
         T, S, device = self.num_queries, self.num_kv, self.device
-        dq_latent = torch.empty((T, NUM_HEADS, D_LATENT), dtype=torch.bfloat16, device=device)
-        dq_rope = torch.empty((T, NUM_HEADS, D_ROPE), dtype=torch.bfloat16, device=device)
+        dq_latent = torch.empty(
+            (T, NUM_HEADS, D_LATENT), dtype=torch.bfloat16, device=device
+        )
+        dq_rope = torch.empty(
+            (T, NUM_HEADS, D_ROPE), dtype=torch.bfloat16, device=device
+        )
         current = dict(
-            q_latent=q_latent, q_rope=q_rope, kv_latent=kv_latent, k_rope=k_rope, indices=indices,
-            out=out, o_lo=o_lo, lse=lse, dout=dout, dq_latent=dq_latent, dq_rope=dq_rope,
+            q_latent=q_latent,
+            q_rope=q_rope,
+            kv_latent=kv_latent,
+            k_rope=k_rope,
+            indices=indices,
+            out=out,
+            o_lo=o_lo,
+            lse=lse,
+            dout=dout,
+            dq_latent=dq_latent,
+            dq_rope=dq_rope,
         )
         if topk_length is not None:
             current["topk_length"] = topk_length
         if self.dkv_fp32:
             if self.dkv_acc_permuted:  # fresh natural-layout FP32 outputs from the cast; owned accumulators zeroed
                 self.acc_span.zero_()
-                current["dkv_latent_fp32"] = torch.empty((S, D_LATENT), dtype=torch.float32, device=device)
-                current["dk_rope_fp32"] = torch.empty((S, D_ROPE), dtype=torch.float32, device=device)
+                current["dkv_latent_fp32"] = torch.empty(
+                    (S, D_LATENT), dtype=torch.float32, device=device
+                )
+                current["dk_rope_fp32"] = torch.empty(
+                    (S, D_ROPE), dtype=torch.float32, device=device
+                )
                 self._launch(current, BACKWARD_STAGES)
-                return dq_latent, dq_rope, current["dkv_latent_fp32"], current["dk_rope_fp32"]
+                return (
+                    dq_latent,
+                    dq_rope,
+                    current["dkv_latent_fp32"],
+                    current["dk_rope_fp32"],
+                )
             acc = torch.zeros((S * D_QK,), dtype=torch.float32, device=device)
             current["dkv_latent_acc"] = acc[: S * D_LATENT].view(S, D_LATENT)
             current["dk_rope_acc"] = acc[S * D_LATENT :].view(S, D_ROPE)
@@ -1197,7 +1404,12 @@ class BindingCache:
     ``enabled = False`` routes every call through the validating path.
     """
 
-    def __init__(self, capacity: int = 32, budget_bytes: int = BINDING_CACHE_BUDGET_BYTES, enabled: bool = True):
+    def __init__(
+        self,
+        capacity: int = 32,
+        budget_bytes: int = BINDING_CACHE_BUDGET_BYTES,
+        enabled: bool = True,
+    ):
         self.capacity = int(capacity)
         self.budget_bytes = int(budget_bytes)
         self.enabled = bool(enabled)
@@ -1262,17 +1474,29 @@ def forward(
     :func:`prepare_dsa_train`; later calls with the same binding take the
     remembered launch (:data:`BINDING_CACHE`).
     """
-    scale = float(softmax_scale) if softmax_scale is not None else default_softmax_scale()
+    scale = (
+        float(softmax_scale) if softmax_scale is not None else default_softmax_scale()
+    )
     cache = BINDING_CACHE
     key = None
     if cache.enabled:
-        key = forward_binding_key(q_latent, q_rope, kv_latent, k_rope, indices, topk_length, scale)
+        key = forward_binding_key(
+            q_latent, q_rope, kv_latent, k_rope, indices, topk_length, scale
+        )
         binding = cache.lookup(key)
         if binding is not None:
-            return binding.forward(q_latent, q_rope, kv_latent, k_rope, indices, topk_length)
+            return binding.forward(
+                q_latent, q_rope, kv_latent, k_rope, indices, topk_length
+            )
     runner = prepare_dsa_train(
-        q_latent, q_rope, kv_latent, k_rope, indices, topk_length=topk_length,
-        softmax_scale=scale, backward=False,
+        q_latent,
+        q_rope,
+        kv_latent,
+        k_rope,
+        indices,
+        topk_length=topk_length,
+        softmax_scale=scale,
+        backward=False,
     )
     result = runner.forward()
     if key is not None and runner.abi == ABI_CONTRACT:
@@ -1306,23 +1530,59 @@ def backward(
             "the forward produced no output residual (placeholder program); backward is unavailable"
         )
     dout = dout.contiguous()
-    scale = float(softmax_scale) if softmax_scale is not None else default_softmax_scale()
+    scale = (
+        float(softmax_scale) if softmax_scale is not None else default_softmax_scale()
+    )
     cache = BINDING_CACHE
     key = None
     if cache.enabled:
         key = backward_binding_key(
-            q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout, topk_length, scale, dkv_fp32
+            q_latent,
+            q_rope,
+            kv_latent,
+            k_rope,
+            indices,
+            out,
+            o_lo,
+            lse,
+            dout,
+            topk_length,
+            scale,
+            dkv_fp32,
         )
         binding = cache.lookup(key)
         if binding is not None:
-            return binding.backward(q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout, topk_length)
+            return binding.backward(
+                q_latent,
+                q_rope,
+                kv_latent,
+                k_rope,
+                indices,
+                out,
+                o_lo,
+                lse,
+                dout,
+                topk_length,
+            )
     _check_output(out, "out", (q_latent.shape[0], NUM_HEADS, D_LATENT), torch.bfloat16)
-    _check_output(o_lo, "o_lo", (q_latent.shape[0], NUM_HEADS, D_LATENT), torch.bfloat16)
+    _check_output(
+        o_lo, "o_lo", (q_latent.shape[0], NUM_HEADS, D_LATENT), torch.bfloat16
+    )
     _check_output(lse, "lse", (q_latent.shape[0], NUM_HEADS), torch.float32)
     runner = prepare_dsa_train(
-        q_latent, q_rope, kv_latent, k_rope, indices, topk_length=topk_length,
-        dout=dout, softmax_scale=scale, out=out, lse=lse, o_lo=o_lo,
-        dkv_fp32=dkv_fp32, backward=True,
+        q_latent,
+        q_rope,
+        kv_latent,
+        k_rope,
+        indices,
+        topk_length=topk_length,
+        dout=dout,
+        softmax_scale=scale,
+        out=out,
+        lse=lse,
+        o_lo=o_lo,
+        dkv_fp32=dkv_fp32,
+        backward=True,
     )
     result = runner.backward()
     if key is not None and runner.abi == ABI_CONTRACT:
@@ -1334,12 +1594,21 @@ class DSASparseAttentionFunction(torch.autograd.Function):
     """Autograd wrapper: saves ``out``, ``o_lo``, ``lse`` and the inputs for the backward."""
 
     @staticmethod
-    def forward(ctx, q_latent, q_rope, kv_latent, k_rope, indices, topk_length, softmax_scale):
+    def forward(
+        ctx, q_latent, q_rope, kv_latent, k_rope, indices, topk_length, softmax_scale
+    ):
         out, lse, o_lo = forward(
-            q_latent, q_rope, kv_latent, k_rope, indices,
-            topk_length=topk_length, softmax_scale=softmax_scale,
+            q_latent,
+            q_rope,
+            kv_latent,
+            k_rope,
+            indices,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
         )
-        ctx.set_materialize_grads(False)  # no zero-filled grad for an unused lse; dout is None when out is unused
+        ctx.set_materialize_grads(
+            False
+        )  # no zero-filled grad for an unused lse; dout is None when out is unused
         ctx.softmax_scale = softmax_scale
         ctx.has_topk_length = topk_length is not None
         saved = [q_latent, q_rope, kv_latent, k_rope, indices, out, lse]
@@ -1352,16 +1621,28 @@ class DSASparseAttentionFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, dlse=None):
         if dlse is not None:
-            raise NotImplementedError("gradients through lse are not supported; only out is differentiable")
+            raise NotImplementedError(
+                "gradients through lse are not supported; only out is differentiable"
+            )
         if dout is None:  # out unused downstream
             return None, None, None, None, None, None, None
-        q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo, topk_length = ctx.saved_tensors
+        q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo, topk_length = (
+            ctx.saved_tensors
+        )
         if not ctx.has_o_lo:
             raise NotImplementedError(
                 "backward is unavailable: the registered program is forward-only (placeholder)"
             )
         dq_latent, dq_rope, dkv_latent, dk_rope = backward(
-            q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout,
+            q_latent,
+            q_rope,
+            kv_latent,
+            k_rope,
+            indices,
+            out,
+            o_lo,
+            lse,
+            dout,
             topk_length=topk_length if ctx.has_topk_length else None,
             softmax_scale=ctx.softmax_scale,
         )
@@ -1413,6 +1694,12 @@ def dsa_sparse_attention_varlen(
     del max_seqlen_q, max_seqlen_k
     indices = offset_gather_kv_indices(gather_kv_indices, cu_seqlens_q, cu_seqlens_k)
     return dsa_sparse_attention(
-        q_latent, q_rope, kv_latent, k_rope, indices,
-        topk_length=topk_length, softmax_scale=softmax_scale, return_lse=return_lse,
+        q_latent,
+        q_rope,
+        kv_latent,
+        k_rope,
+        indices,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        return_lse=return_lse,
     )
