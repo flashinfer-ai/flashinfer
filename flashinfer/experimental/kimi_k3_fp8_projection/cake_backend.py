@@ -615,9 +615,7 @@ def decode_config(
     )
 
 
-def gemm_prefetch_distance(
-    M: int, n_tiles128: int, num_k_iters: int, arch: str
-) -> int:
+def gemm_prefetch_distance(M: int, n_tiles128: int, num_k_iters: int, arch: str) -> int:
     """Round 6 (lever GP): weight-tile L2 prefetch distance of the GEMM route from the shape's table row (key
     ``gemm_pf``; 0 = off). Only tabulated GEMM-routed rows prefetch (e.g. the 48-pair ``tp1:q_proj:256`` whose 3-stage
     weight stream is HBM-latency-bound: 1.14x on both architectures)."""
