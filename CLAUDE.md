@@ -211,6 +211,14 @@ The standalone API's optional `validate_indices=True` checks expert-index values
 and synchronizes with the CPU. Validate new routing data before CUDA graph
 capture; the default path assumes valid indices and performs metadata checks only.
 
+Prims-TS decode keeps raw storage dtypes (`q_dtype`, `k_dtype`, `v_dtype`)
+separate from effective MMA dtypes (`qk_dtype`, `pv_dtype`). Transformed
+FP8/NVFP4 K/V uses Q's compute dtype; BF16 Q/K with FP8 V uses FP8 PV without
+that transform. Kernel predicates, P packing, and attention-sink scaling must
+follow effective compute precision; TMA descriptors and raw allocations must
+follow storage precision. The public plan accepts separate `k_data_type` and
+`v_data_type`, with `kv_data_type` retained as a common-KV compatibility alias.
+
 ## Code Linting
 
 Run all pre-commit hooks:
@@ -607,6 +615,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_EXTRA_CFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to the host C++ compiler. |
 | `FLASHINFER_EXTRA_CUDAFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to `nvcc`. |
 | `FLASHINFER_EXTRA_LDFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra linker flags passed to the linker. |
+| `FLASHINFER_CAKE_GDN_VALIDATE_SLOTS` | `0` | `flashinfer/gdn_decode.py` | `1` enables extra slot-validation checks in the CAKE GDN path for debugging or invariant validation. Leave disabled in normal runs to avoid extra validation overhead. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
 
@@ -681,6 +690,11 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_AUTOTUNE_CACHE_DIR` | `FLASHINFER_CACHE_DIR/autotune` | `flashinfer/autotune_cache.py` | Root **directory** of the managed v2 autotune store used by `autotune_v2()` (placement only; distinct from the MLA-specific `FLASHINFER_AUTOTUNE_DIR` above). |
 | `FLASHINFER_RAGGED_AUTO_BACKEND_ORDER` | unset | `flashinfer/prefill.py` | Comma-separated backend order for `BatchPrefillWithRaggedKVCacheWrapper` under `backend="auto"` on Blackwell (e.g. `cutlass,cudnn`, or a single name to pin one). Overrides both the per-shape table and the global default; eligibility is still enforced, so a backend that cannot serve the problem is skipped rather than forced. For benchmarking and regression bisection on hardware whose ranking differs from the measured B200 defaults. |
 | `FLASHINFER_NVFP4_QUANTIZE_USE_TMA` | unset | `flashinfer/quantization/kernels/nvfp4_quantize.py` | Overrides the NVFP4 CuTe-DSL TMA-kernel heuristic: `0` forces the vectorized-load kernel, `1` enables the shape heuristic on every architecture and input dtype. Unset, TMA is used only where it was measured to win (SM107 with FP16/BF16 input, layout-specific M/K crossovers). Never taken for fp8 input or an active 4over6 recipe, whatever the setting. For benchmarking and re-tuning on new hardware. |
+| `FLASHINFER_NVFP4_PER_TOKEN_THREADS` | shape-dependent (`128`-`512`) | `flashinfer/quantization/kernels/nvfp4_quantize.py` | Override the CTA thread count for per-token NVFP4 quantization. Intended for benchmarking; invalid or unsupported values can make kernel compilation or launch fail. |
+| `FLASHINFER_KDA_AFFINE_POLICY` | `model` | `flashinfer/cake_kda_tf32_runtime.py` | Set to `legacy` to restore the pre-2026-09-23 BF16 affine-split gate for A/B measurements. `model`, `packed`, and unrecognized values use the measured cost model. |
+| `FLASHINFER_KDA_AFFINE_WINDOW_WAVES` | `auto` | `flashinfer/cake_kda_tf32_runtime.py` | Override resident affine-composite windows in CTA waves. Integer values are clamped to `1`-`3`; unset, `auto`, and invalid values let the cost model choose. |
+| `FLASHINFER_KDA_AFFINE_FUSED_EPILOGUE` | `1` | `flashinfer/cake_kda_tf32_runtime.py` | `0` restores the equivalent PyTorch checkpoint/tail/final-state epilogue for A/B testing; any other value keeps the fused epilogue. |
+| `FLASHINFER_KDA_PLAN_CACHE_MAX_BYTES` | `8589934592` (8 GiB) | `flashinfer/kda_prefill.py` | Maximum workspace bytes retained by the KDA prefill plan cache. Must parse as a positive integer. |
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k backend (otherwise the dispatcher chooses based on shape/dtype/mode via benefit gates): `default` (radix), `clusters` (SM100), `cub` (cub::DeviceBatchedTopK; bypasses the benefit gates). Used for benchmarking / regression bisection. |
 | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
 | `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN` | unset | `csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh` | Forces the TRT-LLM MoE custom-routing kernel into "one-block-per-token" mode regardless of the active routing policy. Mainly used to reproduce specific perf points. |

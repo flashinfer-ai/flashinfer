@@ -40,17 +40,20 @@ limitations under the License.
 #   (``torch.mm``, BF16 slice) above;
 # * the tail  owner reduce of the scattered ``shared_partial`` columns, add of
 #   the up-projection slice, one BF16 rounding, multicast all-gather into the
-#   caller-owned ``out``: ``k23:n<cols>`` (the fp32 slice GEMM in the
-#   K2-stream summation order fused with the K3-ESS reduce / add / all-gather,
-#   one CTA per ``K23_ROWS`` output columns) for ``M <= 4``; ``k3_ess:grouped``
-#   (one CTA per token and column half) for ``4 < M < 256``; the persistent
+#   caller-owned ``out``: ``k23:n<cols>:c<capacity>`` (the fp32 slice GEMM in
+#   the K2-stream summation order fused with the K3-ESS reduce / add /
+#   all-gather, one CTA per ``K23_ROWS`` output columns; the four-token module
+#   for ``M <= 4``, the eight-token module for ``5 <= M <= 8``) for ``M <= 8``;
+#   ``k3_ess:grouped`` (one CTA per token and column half) for ``8 < M < 256``; the persistent
 #   token pipeline (``min(M, SM count)`` CTAs per column half, own scatter of
 #   ``shared_partial``) as ``k3_persist:grouped`` at 256 tokens and as
 #   ``k3_persist_bulk:pinned`` (``cp.async.bulk`` reduce-scatter pushes) above.
 #
-# Every row is bitwise identical to the round-4 route (K23 keeps the numerics
-# of the round-4 K2-stream + fp32-add K3 pair); the thresholds are pinned by
-# the round-5 paired A/B on GB200 and GB300 NVL72.
+# Rows ``M <= 4`` and ``M > 8`` are bitwise identical to the round-4 / round-5
+# routes (K23 keeps the numerics of the round-4 K2-stream + fp32-add K3 pair);
+# ``5 <= M <= 8`` (round 6) round once instead of twice -- a strict error
+# reduction against the fp64 reference.  The thresholds are pinned by the
+# round-5 / round-6 paired A/Bs on GB200 and GB300 NVL72.
 #
 # The three Lamport workspaces are FlashInfer's own MNNVL all-reduce
 # workspaces (``MNNVLAllReduceFusionWorkspace``: three rotating symmetric
@@ -90,10 +93,16 @@ GROUPED_MAX_TOKENS = 256
 #: One 16-byte packet per thread covers one 3584-wide row (K1) or one 3584-wide half row (K3).
 THREADS = 448
 K3_GRID_Y = 2
-#: The fused K23 tail (``k23:n<cols>``: this rank's fp32 up-projection slice GEMM in the K2-stream summation order fused
-#: with the owner reduce, add, BF16 rounding and multicast all-gather; no ``torch.mm``) up to this many tokens; cuBLAS
-#: (``torch.mm`` on the contiguous weight-row slice, BF16) plus a separate tail kernel above.
-K23_MAX_TOKENS = 4
+#: The fused K23 tail (``k23:n<cols>:c<capacity>``: this rank's fp32 up-projection slice GEMM in the K2-stream summation
+#: order fused with the owner reduce, add, BF16 rounding and multicast all-gather; no ``torch.mm``) up to this many
+#: tokens; cuBLAS (``torch.mm`` on the contiguous weight-row slice, BF16) plus a separate tail kernel above.
+K23_MAX_TOKENS = 8
+#: K23 accumulator capacities compiled side by side (round 6, CAKE-740): ``M`` runs on the smallest capacity ``>= M``, so
+#: ``M <= 4`` keeps the round-5 four-token module bit for bit and ``5 <= M <= 8`` takes the eight-token module.  The
+#: eight-token rows round once (fp32 slice + shared sum -> BF16) where the round-5 chain rounded twice (cuBLAS BF16 slice,
+#: then the add): paired against an fp64 reference their mean / max absolute error is 0.78x / 0.64-0.93x of the round-5
+#: chain on every correctness shape (Cake design doc, round 6).
+K23_LADDER = (4, 8)
 #: Up-projection weight rows (= output columns) per K23 CTA: grid ``(cols / K23_ROWS, 1, 1)``, 80 CTAs on a 640-column
 #: rank, 64 on a 512-column rank.
 K23_ROWS = 8
@@ -144,6 +153,15 @@ def up_proj_form_for(num_tokens: int) -> str:
     return "k23" if num_tokens <= K23_MAX_TOKENS else "cublas"
 
 
+def k23_capacity_for(num_tokens: int) -> int:
+    """The K23 accumulator capacity serving ``num_tokens`` (``<= K23_MAX_TOKENS``): the smallest ladder rung ``>= M``."""
+    if not 1 <= num_tokens <= K23_MAX_TOKENS:
+        raise ValueError(
+            f"num_tokens must be in [1, {K23_MAX_TOKENS}] for the fused K23 tail, got {num_tokens}"
+        )
+    return next(c for c in K23_LADDER if c >= num_tokens)
+
+
 def k3_form_for(num_tokens: int) -> str:
     """Tail form for ``num_tokens``: ``"k23"`` (fused up-projection + tail, ``M <= K23_MAX_TOKENS``), ``"ess"`` (one CTA
     per token and column half after an ESS K1, ``M < K3_PERSIST_MIN_TOKENS``), ``"persist"`` (persistent token
@@ -161,7 +179,7 @@ def k3_kernel_key(num_tokens: int, rank: int) -> str:
     """The tail kernel key of ``rank`` (its column width selects the K23 module)."""
     form = k3_form_for(num_tokens)
     if form == "k23":
-        return f"k23:n{PARTITION[rank]}"
+        return f"k23:n{PARTITION[rank]}:c{k23_capacity_for(num_tokens)}"
     return f"k3_{form}:{poll_schedule_for(num_tokens)}"
 
 
@@ -618,6 +636,7 @@ __all__ = [
     "COL_BEGIN",
     "DEFAULT_MAX_TOKENS",
     "GROUPED_MAX_TOKENS",
+    "K23_LADDER",
     "K23_MAX_TOKENS",
     "K23_ROWS",
     "K3_PERSIST_MIN_TOKENS",
@@ -638,6 +657,7 @@ __all__ = [
     "k1_kernel_key",
     "k3_form_for",
     "k3_grid",
+    "k23_capacity_for",
     "k3_kernel_key",
     "poll_schedule_for",
     "prepare_kimi_k3_tp12_tail",

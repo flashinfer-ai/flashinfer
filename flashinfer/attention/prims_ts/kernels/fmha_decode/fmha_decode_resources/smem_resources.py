@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Uint32
+from cutlass import Int32, Uint32, Uint8
 from cutlass.experimental import primitives as prims
 
 from cutlass.experimental.task_scheduling.enums import WorkAttr
@@ -71,6 +71,7 @@ from .helpers_common import (
     ResourceVars,
     _clamp_valid_tile_idx,
     _decode_gen_task_cache,
+    _kv_smem_swizzle,
     _logical_head_batch,
     _logical_q_group_idx,
     _major_k_stride_bytes,
@@ -362,7 +363,7 @@ class SmemQResource(DecodeGenResourceBase):
             )
             leading_byte_offset = q_leading_bytes
             stride_byte_offset = Int32(1024)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv):
+            if cutlass.const_expr(self.cfg.use_fp8_q):
                 q_head_dim_stage = self.cfg.head_dim_kv_stage
                 q_tile_bytes = Int32(
                     self.cfg.tile_size_q * q_head_dim_stage * self.cfg.q_dtype_bytes
@@ -509,7 +510,7 @@ class SmemQResource(DecodeGenResourceBase):
         # barrier attached to stage_info protects this stage until QK consumes it.
         stage_elems = cfg.smem_q_tile_elements
         stage_base = self._smem_base_q.subview(stage_info.stage_idx * stage_elems)
-        if cutlass.const_expr(cfg.use_fp8_qkv):
+        if cutlass.const_expr(cfg.use_fp8_q):
             if _is_load_task_warp_leader(cfg):
                 if cutlass.const_expr(cfg.num_head_dim_stages_kv == 1):
                     # FP8 with one head-dim stage is one tensor copy into the
@@ -612,7 +613,12 @@ class SmemQResource(DecodeGenResourceBase):
 
 @dataclass(kw_only=True)
 class SmemKvTileResource(DecodeGenResourceBase):
-    """Single K or V tile in SMEM for the split K/V decode schedule."""
+    """Single raw K or V tile in SMEM for the split K/V decode schedule.
+
+    When Q's dtype is different from KV's dtype, `SmemTransformedKvResource`
+    will be added to transform raw KV and stored in SMEM. Otherwise,
+    `SmemKvTileResource` will be used directly for MMA.
+    """
 
     _task_local_specs: ClassVar[tuple[tuple, ...]] = (
         (
@@ -631,6 +637,8 @@ class SmemKvTileResource(DecodeGenResourceBase):
     cfg: Constexpr[FmhaDecodeConfig] = None
     tma_desc_k: cutlass.Pointer | None = None
     tma_desc_v: cutlass.Pointer | None = None
+    tma_desc_k_sf: cutlass.Pointer | None = None
+    tma_desc_v_sf: cutlass.Pointer | None = None
     tma_desc_k_atom: cutlass.Pointer | None = None
     tma_desc_v_atom: cutlass.Pointer | None = None
     tma_desc_k_summary: cutlass.Pointer | None = None
@@ -648,7 +656,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
     inst_id: Constexpr[int] = 0
     kv_kind: Constexpr[int] = KV_KIND_K
     _alloc: Constexpr[SmemAllocation | None] = None
+    _sf_alloc: Constexpr[SmemAllocation | None] = None
     _smem_base_kv: cutlass.Array = None
+    _smem_base_kv_sf: cutlass.Array = None
     _desc_base: prims.Tcgen05SmemDesc = None
     kv_desc_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
     v_desc_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -658,8 +668,13 @@ class SmemKvTileResource(DecodeGenResourceBase):
         num_stages = (
             self.pipeline_config.num_stages if self.pipeline_config is not None else 1
         )
+        smem_dtype = (
+            Uint8
+            if self.cfg.use_nvfp4_kv
+            else (self.cfg.v_dtype if self.kv_kind == KV_KIND_V else self.cfg.k_dtype)
+        )
         self._smem_base_kv = _placeholder_smem_array(
-            self.cfg.v_dtype if self.kv_kind == KV_KIND_V else self.cfg.k_dtype,
+            smem_dtype,
             (
                 self.cfg.smem_v_tile_elements
                 if self.kv_kind == KV_KIND_V
@@ -667,6 +682,11 @@ class SmemKvTileResource(DecodeGenResourceBase):
             )
             * num_stages,
         )
+        if self.cfg.use_nvfp4_kv:
+            self._smem_base_kv_sf = _placeholder_smem_array(
+                Uint8,
+                self.cfg.smem_kv_sf_tile_bytes * num_stages,
+            )
         self._desc_base = prims.Tcgen05SmemDesc(0)
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
@@ -676,16 +696,25 @@ class SmemKvTileResource(DecodeGenResourceBase):
         )
         if self._alloc is None:
             tile_bytes = (
-                self.cfg.smem_v_tile_bytes
+                self.cfg.smem_v_storage_tile_bytes
                 if self.kv_kind == KV_KIND_V
-                else self.cfg.smem_k_tile_bytes
+                else self.cfg.smem_k_storage_tile_bytes
             )
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
                 size_bytes=tile_bytes * num_stages,
                 alignment=self.cfg.stensor_align,
             )
-        return [self._alloc]
+        allocs = [self._alloc]
+        if self.cfg.use_nvfp4_kv:
+            if self._sf_alloc is None:
+                self._sf_alloc = SmemAllocation(
+                    name=f"{self.name}Sf",
+                    size_bytes=self.cfg.smem_kv_sf_tile_bytes * num_stages,
+                    alignment=self.cfg.stensor_align,
+                )
+            allocs.append(self._sf_alloc)
+        return allocs
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Split K/V staging uses SMEM only."""
@@ -705,9 +734,11 @@ class SmemKvTileResource(DecodeGenResourceBase):
             inst_dtype_bytes = _kv_dtype_bytes_for_kind(self.cfg, self.kv_kind)
             self._smem_base_kv = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
-                dtype=self.cfg.v_dtype
-                if self.kv_kind == KV_KIND_V
-                else self.cfg.k_dtype,
+                dtype=Uint8
+                if self.cfg.use_nvfp4_kv
+                else (
+                    self.cfg.v_dtype if self.kv_kind == KV_KIND_V else self.cfg.k_dtype
+                ),
                 shape=(
                     (
                         self.cfg.smem_v_tile_elements
@@ -718,6 +749,17 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 ),
                 addrspace=3,
             )
+            if cutlass.const_expr(self.cfg.use_nvfp4_kv):
+                self._smem_base_kv_sf = cutlass.Array(
+                    context.smem_base.data_ptr() + self._sf_alloc.offset,
+                    dtype=Uint8,
+                    shape=(self.cfg.smem_kv_sf_tile_bytes * num_stages,),
+                    addrspace=3,
+                )
+                # NVFP4 KV is never consumed by MMA. The supported MMA operand types are
+                # FP16, BF16, and FP8.
+                self._desc_base = prims.Tcgen05SmemDesc(0)
+                return {"kv_desc": cutlass.Int64(0), "v_desc": cutlass.Int64(0)}
             kv_tile_bytes = Int32(
                 self.cfg.tile_size_kv * self.cfg.head_dim_kv_stage * inst_dtype_bytes
             )
@@ -727,25 +769,18 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 * inst_dtype_bytes
             )
             stride_byte_offset = Int32(1024)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv or inst_dtype_bytes == 1):
+            if cutlass.const_expr(inst_dtype_bytes == 1):
                 leading_byte_offset = kv_tile_bytes
                 stride_byte_offset = Int32(
                     _major_k_stride_bytes(inst_dtype_bytes, self.cfg.head_dim_kv_stage)
                 )
             if cutlass.const_expr(
                 self.kv_kind == KV_KIND_V
-                and (
-                    self.cfg.use_fp8_qkv
-                    or inst_dtype_bytes == 1
-                    or self.cfg.headdim == 64
-                )
+                and (inst_dtype_bytes == 1 or self.cfg.headdim == 64)
             ):
                 leading_byte_offset = Int32(0)
             inst_swizzle = prims.Tcgen05SmemSwizzle.SWIZZLE_128B
-            if cutlass.const_expr(
-                (self.cfg.use_fp8_qkv or inst_dtype_bytes == 1)
-                and self.cfg.headdim == 64
-            ):
+            if cutlass.const_expr(inst_dtype_bytes == 1 and self.cfg.headdim == 64):
                 inst_swizzle = prims.Tcgen05SmemSwizzle.SWIZZLE_64B
             self._desc_base = prims.Tcgen05SmemDesc.build(
                 self._smem_base_kv,
@@ -788,6 +823,12 @@ class SmemKvTileResource(DecodeGenResourceBase):
             else self.cfg.smem_k_tile_elements
         )
         return self._smem_base_kv.subview(stage_info.stage_idx * stage_elems)
+
+    @cute.jit
+    def _sf_stage_base(self, stage_idx: Int32) -> cutlass.Array:
+        """Return the NVFP4 scale-factor SMEM slice for one pipeline stage."""
+        sf_stage_elems = Int32(self.cfg.smem_kv_sf_tile_bytes)
+        return self._smem_base_kv_sf.subview(stage_idx * sf_stage_elems)
 
     @cute.jit
     def _local_tile_idx(
@@ -916,12 +957,20 @@ class SmemKvTileResource(DecodeGenResourceBase):
                     tile_size_kv=cfg.tile_size_kv,
                     kv_atom_size=kv_atom_size,
                     head_dim_stage=head_dim_stage,
-                    kv_dtype_bytes=cfg.kv_dtype_bytes,
+                    kv_dtype_bytes=_kv_dtype_bytes_for_kind(cfg, self.kv_kind),
                 )
-                assert total_transaction_bytes == cfg.smem_kv_tile_bytes
+                assert total_transaction_bytes == (
+                    cfg.smem_v_tile_bytes
+                    if self.kv_kind == KV_KIND_V
+                    else cfg.smem_k_tile_bytes
+                )
                 num_chunks = transactions_per_load // atoms_per_route
-                chunk_hd = transaction_bytes // (kv_atom_size * cfg.kv_dtype_bytes)
-                atom_chunk_elems = transaction_bytes // cfg.kv_dtype_bytes
+                chunk_hd = transaction_bytes // (
+                    kv_atom_size * _kv_dtype_bytes_for_kind(cfg, self.kv_kind)
+                )
+                atom_chunk_elems = transaction_bytes // _kv_dtype_bytes_for_kind(
+                    cfg, self.kv_kind
+                )
                 tile_chunk_elems = chunk_hd * cfg.tile_size_kv
                 if prims.elect_sync():
                     stage_base = self._stage_base(stage_info)
@@ -1127,11 +1176,11 @@ class SmemKvTileResource(DecodeGenResourceBase):
             page_fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
             inst_dtype_bytes = _kv_dtype_bytes_for_kind(self.cfg, self.kv_kind)
-            if cutlass.const_expr(cfg.use_fp8_qkv or inst_dtype_bytes == 1):
+            if cutlass.const_expr(inst_dtype_bytes == 1):
                 if prims.elect_sync() and _load_task_warp_rank(cfg) < Int32(
                     min(page_fragments, cfg.load_num_warps)
                 ):
-                    # FP8 pages are copied as one contiguous head-dim stage per
+                    # NVFP4/FP8 pages are copied as one contiguous head-dim stage per
                     # page fragment. Partition the fragments across loader
                     # warps: elect_sync selects one issuer per warp, not one
                     # issuer for the complete cooperative group. Letting every
@@ -1139,6 +1188,16 @@ class SmemKvTileResource(DecodeGenResourceBase):
                     # transaction barrier when load_num_warps > 1.
                     stage_base = self._stage_base(stage_info)
                     page_ids = self.page_offsets_kv.page_ids(tile_idx, local_tile_idx)
+                    sf_desc = (
+                        self.tma_desc_v_sf
+                        if cutlass.const_expr(self.kv_kind == KV_KIND_V)
+                        else self.tma_desc_k_sf
+                    )
+                    if cutlass.const_expr(cfg.use_nvfp4_kv):
+                        sf_stage_base = self._sf_stage_base(stage_info.stage_idx)
+                        sf_page_elems = Int32(
+                            cfg.num_tokens_per_page * cfg.smem_kv_sf_bytes_per_token
+                        )
                     active_load_warps = min(page_fragments, cfg.load_num_warps)
                     transactions_per_warp = page_fragments // active_load_warps
                     first_page_frag = _load_task_warp_rank(cfg) * Int32(
@@ -1152,24 +1211,49 @@ class SmemKvTileResource(DecodeGenResourceBase):
                             cfg, Int32(page_ids[page_frag])
                         )
                         smem_page_offset = Int32(
-                            page_frag * cfg.num_tokens_per_page * head_dim_stage
+                            page_frag
+                            * cfg.num_tokens_per_page
+                            * (
+                                head_dim_stage // 2
+                                if cfg.use_nvfp4_kv
+                                and not cfg.store_transformed_kv_in_tmem
+                                else head_dim_stage
+                            )
                         )
                         prims.cp_async_bulk_tensor_shared_cta_global(
                             stage_base.subview(smem_page_offset),
                             tma_desc,
                             (
-                                Int32(head_dim_stage_offset),
+                                Int32(
+                                    head_dim_stage_offset // 2
+                                    if cfg.use_nvfp4_kv
+                                    and not cfg.store_transformed_kv_in_tmem
+                                    else head_dim_stage_offset
+                                ),
                                 token_offset,
                                 logical_h_k_idx,
                                 physical_page,
                             ),
                             stage_info.barrier,
                         )
+                        if cutlass.const_expr(cfg.use_nvfp4_kv):
+                            # SF TensorMaps fold multiple tokens into dim0.
+                            prims.cp_async_bulk_tensor_shared_cta_global(
+                                sf_stage_base.subview(page_frag * sf_page_elems),
+                                sf_desc,
+                                (
+                                    Int32(0),
+                                    token_offset // Int32(cfg.sf_tma_reshape_factor),
+                                    logical_h_k_idx,
+                                    physical_page,
+                                ),
+                                stage_info.barrier,
+                            )
             else:
-                # 16-bit pages are copied in 64-column chunks so the SMEM
-                # layout matches the K/V tcgen05 descriptor swizzle.
-                chunk_hd = min(head_dim_stage, 64)
-                num_chunks = head_dim_stage // chunk_hd
+                # 128B TMA swizzling permits 64 columns per copy for 16-bit K/V.
+                # Store each chunk as a separate slab matching the tcgen05 layout.
+                chunk_hd = min(head_dim_stage, 128 // inst_dtype_bytes)
+                num_head_dim_tma_chunks = head_dim_stage // chunk_hd
                 tile_chunk_elems = chunk_hd * cfg.tile_size_kv
                 page_chunk_elems = chunk_hd * cfg.num_tokens_per_page
                 if cutlass.const_expr(cfg.uses_scattered_page_route):
@@ -1190,7 +1274,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
                 stage_base = self._stage_base(stage_info)
                 if prims.elect_sync():
                     page_ids = self.page_offsets_kv.page_ids(tile_idx, local_tile_idx)
-                    for chunk_idx in cutlass.range_constexpr(num_chunks):
+                    for chunk_idx in cutlass.range_constexpr(num_head_dim_tma_chunks):
                         local_head_dim_offset = chunk_idx * chunk_hd
                         global_head_dim_offset = (
                             head_dim_stage_offset + local_head_dim_offset
@@ -1222,7 +1306,7 @@ class SmemKvTileResource(DecodeGenResourceBase):
             head_dim_stage = cfg.head_dim_kv_stage
             head_dim_stage_offset = head_dim_stage_idx * head_dim_stage
             inst_dtype_bytes = _kv_dtype_bytes_for_kind(self.cfg, self.kv_kind)
-            if cutlass.const_expr(cfg.use_fp8_qkv or inst_dtype_bytes == 1):
+            if cutlass.const_expr(inst_dtype_bytes == 1):
                 if prims.elect_sync():
                     # FP8 dense K/V needs one tensor copy for the active
                     # head-dim stage.
@@ -1323,9 +1407,9 @@ class SmemKvTileResource(DecodeGenResourceBase):
     def _build_desc(self, stage_info: StageInfo) -> prims.Tcgen05SmemDesc:
         """Advance the split K/V base descriptor to the committed stage."""
         tile_bytes = (
-            self.cfg.smem_v_tile_bytes
+            self.cfg.smem_v_storage_tile_bytes
             if self.kv_kind == KV_KIND_V
-            else self.cfg.smem_k_tile_bytes
+            else self.cfg.smem_k_storage_tile_bytes
         )
         stage_offset_bytes = stage_info.stage_idx * Int32(tile_bytes)
         return self._desc_base.advance_start_address(stage_offset_bytes)
@@ -1759,7 +1843,7 @@ class SmemPageOffsetsKvResource(DecodeGenResourceBase):
         # BF16 TMA is issued only by the elected lane, so only that lane needs
         # the register cache. FP8's predicated helper builds coordinates in
         # every lane and therefore keeps the existing all-lane semantics.
-        if cutlass.const_expr(cfg.use_fp8_qkv or inst_dtype_bytes == 1):
+        if cutlass.const_expr(inst_dtype_bytes == 1):
             fp8_page_ids = self.page_ids(tile_idx, local_tile_idx)
             for page_frag in cutlass.range_constexpr(pages_per_tile):
                 cached_page_ids[page_frag] = Int32(fp8_page_ids[page_frag])
@@ -2256,6 +2340,8 @@ class SmemKvResource(DecodeGenResourceBase):
     cfg: Constexpr[FmhaDecodeConfig] = None
     tma_desc_k: cutlass.Pointer | None = None
     tma_desc_v: cutlass.Pointer | None = None
+    tma_desc_k_sf: cutlass.Pointer | None = None
+    tma_desc_v_sf: cutlass.Pointer | None = None
     tma_desc_k_atom: cutlass.Pointer | None = None
     tma_desc_v_atom: cutlass.Pointer | None = None
     tma_desc_k_summary: cutlass.Pointer | None = None
@@ -2272,7 +2358,9 @@ class SmemKvResource(DecodeGenResourceBase):
     q_group_idx: Int32 = None
     seq_len_q: Int32 = None
     _alloc: Constexpr[SmemAllocation | None] = None
+    _sf_alloc: Constexpr[SmemAllocation | None] = None
     _smem_base_kv: cutlass.Array = None
+    _smem_base_kv_sf: cutlass.Array = None
     _k_desc_base: prims.Tcgen05SmemDesc = None
     _v_desc_base: prims.Tcgen05SmemDesc = None
     kv_desc_slot: Constexpr[TaskLocalVariable] = TaskLocalVariable.uninitialized()
@@ -2290,26 +2378,38 @@ class SmemKvResource(DecodeGenResourceBase):
         # yet express differing K/V byte-widths.
         assert self.cfg.k_dtype == self.cfg.v_dtype
         self._smem_base_kv = _placeholder_smem_array(
-            self.cfg.k_dtype,
+            Uint8 if self.cfg.use_nvfp4_kv else self.cfg.k_dtype,
             self.cfg.smem_kv_tile_elements * num_stages,
         )
+        if self.cfg.use_nvfp4_kv:
+            self._smem_base_kv_sf = _placeholder_smem_array(
+                Uint8,
+                self.cfg.smem_kv_sf_tile_bytes * num_stages,
+            )
         self._k_desc_base = prims.Tcgen05SmemDesc(0)
         self._v_desc_base = prims.Tcgen05SmemDesc(0)
 
     def get_smem_requirements(self) -> list[SmemAllocation]:
         """Allocate the shared K/V staged SMEM ring."""
-        num_stages = (
-            self.pipeline_config.num_stages
-            if self.pipeline_config is not None
-            else self.cfg.kv_stages
-        )
+        num_stages = self.pipeline_config.num_stages
         if self._alloc is None:
             self._alloc = SmemAllocation(
                 name=f"{self.name}",
-                size_bytes=self.cfg.smem_kv_tile_bytes * num_stages,
+                size_bytes=self.cfg.smem_kv_storage_tile_bytes * num_stages,
                 alignment=self.cfg.stensor_align,
             )
-        return [self._alloc]
+        allocs = [self._alloc]
+        # NVFP4 scale factors ride the same TMA pipeline; give them a separate
+        # SMEM ring of the same stage depth, read by TransformKvTask.
+        if self.cfg.use_nvfp4_kv:
+            if self._sf_alloc is None:
+                self._sf_alloc = SmemAllocation(
+                    name=f"{self.name}Sf",
+                    size_bytes=self.cfg.smem_kv_sf_tile_bytes * num_stages,
+                    alignment=self.cfg.stensor_align,
+                )
+            allocs.append(self._sf_alloc)
+        return allocs
 
     def get_tmem_requirements(self) -> list[TmemAllocation]:
         """Shared K/V staging uses SMEM only."""
@@ -2333,10 +2433,26 @@ class SmemKvResource(DecodeGenResourceBase):
             )
             self._smem_base_kv = cutlass.Array(
                 context.smem_base.data_ptr() + self._alloc.offset,
-                dtype=self.cfg.k_dtype,
+                dtype=Uint8 if self.cfg.use_nvfp4_kv else self.cfg.k_dtype,
                 shape=(self.cfg.smem_kv_tile_elements * num_stages,),
                 addrspace=3,
             )
+            if cutlass.const_expr(self.cfg.use_nvfp4_kv):
+                # NVFP4 KV is never consumed by MMA. The supported MMA operand types are
+                # FP16, BF16, and FP8.
+                self._smem_base_kv_sf = cutlass.Array(
+                    context.smem_base.data_ptr() + self._sf_alloc.offset,
+                    dtype=Uint8,
+                    shape=(self.cfg.smem_kv_sf_tile_bytes * num_stages,),
+                    addrspace=3,
+                )
+                self._k_desc_base = prims.Tcgen05SmemDesc(0)
+                self._v_desc_base = prims.Tcgen05SmemDesc(0)
+                return {
+                    "kv_desc": cutlass.Int64(0),
+                    "v_desc_0": cutlass.Int64(0),
+                    "v_desc_1": cutlass.Int64(0),
+                }
             kv_tile_bytes = Int32(
                 self.cfg.tile_size_kv
                 * self.cfg.head_dim_kv_stage
@@ -2350,7 +2466,7 @@ class SmemKvResource(DecodeGenResourceBase):
                 * self.cfg.kv_dtype_bytes
             )
             stride_byte_offset = Int32(1024)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv):
+            if cutlass.const_expr(self.cfg.use_fp8_kv):
                 k_leading_byte_offset = kv_tile_bytes
                 stride_byte_offset = Int32(
                     _major_k_stride_bytes(
@@ -2363,7 +2479,7 @@ class SmemKvResource(DecodeGenResourceBase):
                 # staged as four semantic KV64 blocks, each with D/64 adjacent
                 # D64 halves, so its MMA-K leading step is one KV64 block.
                 v_leading_byte_offset = Int32(64 * 64 * self.cfg.kv_dtype_bytes)
-            if cutlass.const_expr(self.cfg.use_fp8_qkv or self.cfg.headdim == 64):
+            if cutlass.const_expr(self.cfg.use_fp8_kv or self.cfg.headdim == 64):
                 v_leading_byte_offset = Int32(0)
             # Descriptor bases are advanced per stage at consumption time; the
             # swizzle parameters are invariant for the resource.
@@ -2371,13 +2487,13 @@ class SmemKvResource(DecodeGenResourceBase):
                 self._smem_base_kv,
                 leading_byte_offset=k_leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
-                layout=_qkv_smem_swizzle(self.cfg),
+                layout=_kv_smem_swizzle(self.cfg),
             )
             self._v_desc_base = prims.Tcgen05SmemDesc.build(
                 self._smem_base_kv,
                 leading_byte_offset=v_leading_byte_offset,
                 stride_byte_offset=stride_byte_offset,
-                layout=_qkv_smem_swizzle(self.cfg),
+                layout=_kv_smem_swizzle(self.cfg),
             )
         return {
             "kv_desc": cutlass.Int64(0),
@@ -2417,8 +2533,17 @@ class SmemKvResource(DecodeGenResourceBase):
     def _stage_base(self, stage_info: StageInfo) -> cutlass.Array:
         """Return the SMEM base for the current shared K/V pipeline stage."""
         # Return the base pointer for the producer stage selected by TS.
-        stage_elems = self.cfg.smem_kv_tile_bytes // self.cfg.kv_dtype_bytes
+        # return self._smem_base_kv.subview(
+        #     stage_info.stage_idx * self.cfg.smem_kv_tile_elements
+        # )
+        stage_elems = self.cfg.smem_kv_storage_tile_bytes // self.cfg.kv_dtype_bytes
         return self._smem_base_kv.subview(stage_info.stage_idx * stage_elems)
+
+    @cute.jit
+    def _sf_stage_base(self, stage_idx: Int32) -> cutlass.Array:
+        # Uint8 base pointer for the NVFP4 scale-factor slice of one stage.
+        sf_stage_elems = Int32(self.cfg.smem_kv_sf_tile_bytes)
+        return self._smem_base_kv_sf.subview(stage_idx * sf_stage_elems)
 
     @cute.jit
     def _logical_coords(
@@ -2547,72 +2672,92 @@ class SmemKvResource(DecodeGenResourceBase):
             # runtime-resolved tile_idx so the right per-tile slice is
             # selected from the shared window.
             page_fragments = cfg.tile_size_kv // cfg.num_tokens_per_page
-            if cutlass.const_expr(cfg.use_fp8_qkv):
-                # FP8 pages are contiguous across the staged head dimension.
-                fp8_stage_base = self._stage_base(stage_info)
-                if cutlass.const_expr(cached_page_ids is None):
-                    grouped_tile_idx = self._maybe_runtime_tile_idx(
-                        stage_info, local_tile_idx
+            grouped_tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
+            if cutlass.const_expr(cfg.use_fp8_kv or cfg.use_nvfp4_kv):
+                # NVFP4/FP8 pages are contiguous across the staged head dimension.
+                stage_base = self._stage_base(stage_info)
+                page_ids = (
+                    self.page_offsets_kv.page_ids(grouped_tile_idx, local_tile_idx)
+                    if cutlass.const_expr(cached_page_ids is None)
+                    else cached_page_ids
+                )
+                sf_desc = (
+                    self.tma_desc_v_sf
+                    if cutlass.const_expr(kv_kind == KV_KIND_V)
+                    else self.tma_desc_k_sf
+                )
+                if cutlass.const_expr(cfg.use_nvfp4_kv):
+                    sf_stage_base = self._sf_stage_base(stage_info.stage_idx)
+                    sf_page_elems = Int32(
+                        cfg.num_tokens_per_page * cfg.smem_kv_sf_bytes_per_token
                     )
-                    fp8_page_ids = self.page_offsets_kv.page_ids(
-                        grouped_tile_idx, local_tile_idx
-                    )
-                else:
-                    fp8_page_ids = cached_page_ids
+                # Each active warp owns disjoint page fragments. Keep NVFP4
+                # payload and scale copies together on the same barrier.
+                active_load_warps = min(page_fragments, cfg.load_num_warps)
+                assert page_fragments % active_load_warps == 0
+                pages_per_warp = page_fragments // active_load_warps
+                load_warp_rank = Int32(0)
                 if cutlass.const_expr(cfg.load_num_warps > 1):
-                    # elect_sync() chooses one lane per warp. Partition the
-                    # page fragments so the cooperative load group issues
-                    # every TMA exactly once instead of replaying the complete
-                    # tile from every loader warp.
-                    active_load_warps = min(page_fragments, cfg.load_num_warps)
-                    pages_per_warp = page_fragments // active_load_warps
                     load_warp_rank = _load_task_warp_rank(cfg)
-                    if load_warp_rank < Int32(active_load_warps):
-                        for local_page_idx in cutlass.range_constexpr(pages_per_warp):
-                            fp8_page_frag = load_warp_rank * Int32(
-                                pages_per_warp
-                            ) + Int32(local_page_idx)
-                            token_offset, physical_page = _decode_native_page_locator(
-                                cfg, Int32(fp8_page_ids[fp8_page_frag])
+                if cutlass.const_expr(
+                    cfg.load_num_warps == 1
+                ) or load_warp_rank < Int32(active_load_warps):
+                    for local_page_idx in cutlass.range_constexpr(pages_per_warp):
+                        page_frag = local_page_idx
+                        if cutlass.const_expr(cfg.load_num_warps > 1):
+                            page_frag = load_warp_rank * Int32(pages_per_warp) + Int32(
+                                local_page_idx
                             )
-                            fp8_smem_page_offset = Int32(
-                                fp8_page_frag * cfg.num_tokens_per_page * head_dim_stage
+                        token_offset, physical_page = _decode_native_page_locator(
+                            cfg, Int32(page_ids[page_frag])
+                        )
+                        # Packed E2M1 stores two head-dimension values per byte.
+                        smem_page_offset = Int32(
+                            page_frag
+                            * cfg.num_tokens_per_page
+                            * (
+                                head_dim_stage // 2
+                                if cfg.use_nvfp4_kv
+                                and not cfg.store_transformed_kv_in_tmem
+                                else head_dim_stage
                             )
+                        )
+                        _cp_async_bulk_tensor_4d_shared_cta_global_predicated(
+                            stage_base.subview(smem_page_offset),
+                            tma_desc,
+                            (
+                                Int32(
+                                    head_dim_stage_offset // 2
+                                    if cfg.use_nvfp4_kv
+                                    and not cfg.store_transformed_kv_in_tmem
+                                    else head_dim_stage_offset
+                                ),
+                                token_offset,
+                                logical_h_k_idx,
+                                physical_page,
+                            ),
+                            stage_info.barrier,
+                        )
+                        # Scale factors for the same page use the same transaction
+                        # barrier as the packed K/V payload. Their TensorMaps
+                        # fold multiple tokens into dim0.
+                        if cutlass.const_expr(cfg.use_nvfp4_kv):
                             _cp_async_bulk_tensor_4d_shared_cta_global_predicated(
-                                fp8_stage_base.subview(fp8_smem_page_offset),
-                                tma_desc,
+                                sf_stage_base.subview(page_frag * sf_page_elems),
+                                sf_desc,
                                 (
-                                    Int32(head_dim_stage_offset),
-                                    token_offset,
+                                    Int32(0),
+                                    token_offset // Int32(cfg.sf_tma_reshape_factor),
                                     logical_h_k_idx,
                                     physical_page,
                                 ),
                                 stage_info.barrier,
                             )
-                    return
-                for fp8_page_frag in cutlass.range_constexpr(page_fragments):
-                    token_offset, physical_page = _decode_native_page_locator(
-                        cfg, Int32(fp8_page_ids[fp8_page_frag])
-                    )
-                    fp8_smem_page_offset = Int32(
-                        fp8_page_frag * cfg.num_tokens_per_page * head_dim_stage
-                    )
-                    _cp_async_bulk_tensor_4d_shared_cta_global_predicated(
-                        fp8_stage_base.subview(fp8_smem_page_offset),
-                        tma_desc,
-                        (
-                            Int32(head_dim_stage_offset),
-                            token_offset,
-                            logical_h_k_idx,
-                            physical_page,
-                        ),
-                        stage_info.barrier,
-                    )
             else:
-                # 16-bit pages are split into 64-column chunks inside the
-                # staged head-dim slice.
-                chunk_hd = min(head_dim_stage, 64)
-                num_chunks = head_dim_stage // chunk_hd
+                # 128B TMA swizzling permits 64 columns per copy for 16-bit K/V.
+                # Store each chunk as a separate slab matching the tcgen05 layout.
+                chunk_hd = min(head_dim_stage, 128 // cfg.kv_dtype_bytes)
+                num_head_dim_tma_chunks = head_dim_stage // chunk_hd
                 tile_chunk_elems = chunk_hd * cfg.tile_size_kv
                 page_chunk_elems = chunk_hd * cfg.num_tokens_per_page
                 stage_base = self._stage_base(stage_info)
@@ -2656,7 +2801,9 @@ class SmemKvResource(DecodeGenResourceBase):
                         token_offset, physical_page = _decode_native_page_locator(
                             cfg, Int32(page_ids[page_frag])
                         )
-                        for chunk_idx in cutlass.range_constexpr(num_chunks):
+                        for chunk_idx in cutlass.range_constexpr(
+                            num_head_dim_tma_chunks
+                        ):
                             local_head_dim_offset = chunk_idx * chunk_hd
                             global_head_dim_offset = (
                                 head_dim_stage_offset + local_head_dim_offset
@@ -2676,8 +2823,8 @@ class SmemKvResource(DecodeGenResourceBase):
                                 ),
                                 stage_info.barrier,
                             )
-        elif cutlass.const_expr(cfg.use_fp8_qkv):
-            # Dense FP8 path: one tensor TMA loads the staged K or V tile.
+        elif cutlass.const_expr(cfg.use_fp8_kv):
+            # Dense FP8 path: one tensor TMA loads the whole K or V tile.
             tile_idx = self._maybe_runtime_tile_idx(stage_info, local_tile_idx)
             tile_offset = tile_idx * Int32(cfg.tile_size_kv)
             if prims.elect_sync():
@@ -3011,7 +3158,9 @@ class SmemKvResource(DecodeGenResourceBase):
         """Advance the shared K or V descriptor to the committed stage."""
         # Consumers see the same descriptor layout for every stage; only the
         # base address advances by the committed SMEM stage index.
-        stage_offset_bytes = stage_info.stage_idx * Int32(self.cfg.smem_kv_tile_bytes)
+        stage_offset_bytes = stage_info.stage_idx * Int32(
+            self.cfg.smem_kv_storage_tile_bytes
+        )
         return (
             self._v_desc_base.advance_start_address(stage_offset_bytes)
             if cutlass.const_expr(kv_kind == KV_KIND_V)

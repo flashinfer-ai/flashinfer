@@ -6,7 +6,7 @@ These are the generated Cake programs for the MoE gate_up chain that FlashInfer
 otherwise runs as three kernels: :func:`flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous`
 (BF16 ``[M, 2H]``), :func:`flashinfer.activation.silu_and_mul` and
 :func:`flashinfer.quantization.per_token_group_quant_8bit` (group size 128,
-FP8 E4M3).  Both routes reproduce the chain's rounding points exactly:
+FP8 E4M3).  Every route reproduces the chain's rounding points exactly:
 ``g = BF16(gate)``, ``u = BF16(up)``, ``h = BF16(silu(g) * u)``,
 ``scale = max(absmax_128(h), eps) / 448``, ``q = E4M3(clamp(h / scale, -448, 448))``.
 
@@ -23,15 +23,27 @@ FP8 E4M3).  Both routes reproduce the chain's rounding points exactly:
   ``validate_indices=True`` derives the 128-row block count of every expert
   from ``m_indices`` inside its synchronizing check — a large problem whose
   odd-tail blocks (experts with an odd block count) x N256 tiles outnumber the
-  SMs the 128-CTA pair grid leaves free also takes the GEMM + act route: an
+  SMs the 128-CTA pair grid leaves free leaves the pair + tail route: an
   odd tail runs as a single-CTA tile that ingests a whole B slab and costs
-  ~1.5x a pair tile, so beyond the free SMs the CuTe GEMM (insensitive to odd
-  tails) + act is faster.  Without the routing the plan is shape-only.  A
-  diverted problem with at least ``ACT_WIDE_MIN_ITEMS`` (row, 128-column group)
-  items runs the wide act kernel (eight lanes per group, four groups per warp,
-  64 B per lane in flight: 1.09-1.43x the one-warp-per-group kernel from
-  M = 2048, H = 1024 on, bitwise-identical outputs); smaller problems keep the
-  one-warp-per-group kernel, which is faster on latency-bound problems.
+  ~1.5x a pair tile, so beyond the free SMs it waits for a retiring cluster.
+  Without the routing the plan is shape-only.
+* Mixed-schedule route (``FUSED_MIXED_ROUTE``): a diverted problem with more
+  pair tiles than the grid's clusters (``min(sm_count, 128) // 2``) that do not
+  divide evenly over them runs one persistent ``cta_group::2`` kernel whose
+  clusters process the complete block pairs as 256-row tiles and every odd
+  tail block as a two-CTA M=128 solo unit (no tail kernel, no BF16
+  intermediate).  The heavy clusters hold one pair more, so the light clusters
+  take the first two solo units each and the remaining solo units round-robin
+  over every cluster (longest-processing-time first).  Measured on B200 at
+  ``[M=4096, 2H=2048, K=4096]``: 1.066x the GEMM + wide act route on the
+  random 128-aligned and mixed-tail routings, a tie where every cluster holds
+  the same pair count, which is why only that envelope selects it.
+* Every other diverted problem runs the GEMM + act route; with at least
+  ``ACT_WIDE_MIN_ITEMS`` (row, 128-column group) items it takes the wide act
+  kernel (eight lanes per group, four groups per warp, 64 B per lane in
+  flight: 1.09-1.43x the one-warp-per-group kernel from M = 2048, H = 1024 on,
+  bitwise-identical outputs); smaller problems keep the one-warp-per-group
+  kernel, which is faster on latency-bound problems.
 
 Routing contract (the same as the CuTe-DSL contiguous grouped GEMM): rows are
 sorted by expert through ``m_indices``; every *internal* expert boundary is a
@@ -46,7 +58,7 @@ attribute right after the pair kernel (which signals its dependents at start),
 so its CTAs fill the SMs the pair grid leaves free or retires from; it reads
 only the operator's inputs.
 
-Descriptor storage for the pointer TMA ABI (fused route, and the Cake GEMM of
+Descriptor storage for the pointer TMA ABI (fused routes, and the Cake GEMM of
 the small-M route) is private to each prepared launch: the first ``launch()``
 initializes it synchronously and must run outside CUDA Graph capture; later
 launches only submit work on the current stream and may be captured.
@@ -83,15 +95,19 @@ FP8_E4M3_MAX = 448.0
 
 # Route names double as the generated-program template names of their first kernel.
 FUSED_ROUTE = "fused_cg2_ab7_pairsched_solotail_kg4"
+FUSED_MIXED_ROUTE = "fused_cg2_ab7_mixedsched_lpt_kg4"
+FUSED_ROUTES = frozenset({FUSED_ROUTE, FUSED_MIXED_ROUTE})
 ACT_ROUTE = "gemm_then_silu_mul_group_quant_fp8"
 ACT_WIDE_ROUTE = "gemm_then_silu_mul_group_quant_fp8_wide"
 ACT_ROUTES = frozenset({ACT_ROUTE, ACT_WIDE_ROUTE})
-# Generated kernel stages per route in launch order; the fused route's tail kernel has its own template geometry.
+# Generated kernel stages per route in launch order; the pair + tail route's tail kernel has its own template geometry.
 FUSED_PAIR_STAGE = "pair"
 FUSED_TAIL_STAGE = "tail"
+FUSED_MAIN_STAGE = "main"
 ACT_STAGE = "main"
 ROUTE_STAGES = {
     FUSED_ROUTE: (FUSED_PAIR_STAGE, FUSED_TAIL_STAGE),
+    FUSED_MIXED_ROUTE: (FUSED_MAIN_STAGE,),
     ACT_ROUTE: (ACT_STAGE,),
     ACT_WIDE_ROUTE: (ACT_STAGE,),
 }
@@ -180,8 +196,9 @@ def fused_tile_counts(n2: int, group_blocks: Sequence[int]) -> tuple[int, int]:
 # pair tile; the units that start on the SMs the 128-CTA pair grid leaves free
 # finish inside the pair phase, every further unit waits for a retiring cluster
 # and adds its full latency.  With at most that many odd-tail units the fused
-# route wins, beyond it the CuTe GEMM + act route is faster on every routing
-# measured.  ``False`` keeps the shape-only rule.
+# route wins; beyond it a diverted problem takes the mixed-schedule route on
+# the measured envelope (more pair tiles than clusters, not dividing evenly)
+# and the CuTe GEMM + act route otherwise.  ``False`` keeps the shape-only rule.
 ROUTING_AWARE_RULE = True
 
 
@@ -194,14 +211,22 @@ def _diverted_act_route(m: int, n2: int) -> str:
     return ACT_WIDE_ROUTE if act_items(m, n2) >= ACT_WIDE_MIN_ITEMS else ACT_ROUTE
 
 
+def mixed_clusters(pair_tiles: int, odd_units: int, *, sm_count: int) -> int:
+    """Clusters of the mixed-schedule route for a routing: one per unit up to the 128-CTA cap."""
+    _, _, cluster_ctas = route_geometry(FUSED_ROUTE)
+    return min(pair_tiles + odd_units, min(sm_count, CTA_CAP) // cluster_ctas)
+
+
 def select_route(
     m: int, n2: int, *, sm_count: int, group_blocks: Optional[Sequence[int]] = None
 ) -> str:
     """Route of a problem: ``M < SMALL_M_MAX`` takes the GEMM + act route; larger
-    problems take the fused route unless the routing is known (``group_blocks``,
-    128-row blocks per expert) and its odd-tail units outnumber the SMs the pair
-    grid leaves free, in which case they take the GEMM + wide act route (the
-    small-M act route below ``ACT_WIDE_MIN_ITEMS`` items).
+    problems take the pair + tail route unless the routing is known
+    (``group_blocks``, 128-row blocks per expert) and its odd-tail units outnumber
+    the SMs the pair grid leaves free.  Such a diverted problem takes the
+    mixed-schedule route when it has more pair tiles than the grid's clusters and
+    they do not divide evenly (:func:`mixed_clusters`), otherwise the GEMM + wide
+    act route (the small-M act route below ``ACT_WIDE_MIN_ITEMS`` items).
     """
     if sm_count <= 0:
         raise ValueError("sm_count must be positive")
@@ -217,10 +242,13 @@ def select_route(
         )
     _, _, cluster_ctas = route_geometry(FUSED_ROUTE)
     pair_ctas = (min(sm_count, CTA_CAP) // cluster_ctas) * cluster_ctas
-    _, odd_units = fused_tile_counts(n2, group_blocks)
-    return (
-        FUSED_ROUTE if odd_units <= sm_count - pair_ctas else _diverted_act_route(m, n2)
-    )
+    pair_tiles, odd_units = fused_tile_counts(n2, group_blocks)
+    if odd_units <= sm_count - pair_ctas:
+        return FUSED_ROUTE
+    clusters = mixed_clusters(pair_tiles, odd_units, sm_count=sm_count)
+    if pair_tiles > clusters and pair_tiles % clusters:
+        return FUSED_MIXED_ROUTE
+    return _diverted_act_route(m, n2)
 
 
 def launch_plan(
@@ -252,8 +280,14 @@ def launch_plan(
         ctas = max(1, min(-(-warps // ACT_WARPS_PER_CTA), ctas_cap))
         return route, (ctas, 1, 1)
     _, tile_n, cluster_ctas = route_geometry(route)
-    max_tiles = math.ceil(m / ROW_BLOCK) * (n2 // tile_n)
-    clusters = min(max_tiles, min(sm_count, CTA_CAP) // cluster_ctas)
+    if route == FUSED_MIXED_ROUTE:
+        # selected only with the routing: one cluster per pair tile or solo unit up to the cap
+        clusters = mixed_clusters(
+            *fused_tile_counts(n2, group_blocks), sm_count=sm_count
+        )
+    else:
+        max_tiles = math.ceil(m / ROW_BLOCK) * (n2 // tile_n)
+        clusters = min(max_tiles, min(sm_count, CTA_CAP) // cluster_ctas)
     if clusters <= 0:
         raise ValueError("device cannot schedule one complete CTA pair")
     return route, (clusters * cluster_ctas, 1, 1)
@@ -334,10 +368,11 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
 
     Tensor storage, shapes and dtypes are bound at preparation; tensor
     *contents* may change between launches.  ``launch()`` submits exactly
-    ``num_kernels`` kernels (two for the fused route: the pair kernel, then
-    the tail kernel with the programmatic-dependent-launch attribute; two for
-    the GEMM + act routes: the grouped GEMM into the private BF16 workspace,
-    then the generated activation kernel) on PyTorch's current stream for the bound
+    ``num_kernels`` kernels (two for the pair + tail route: the pair kernel,
+    then the tail kernel with the programmatic-dependent-launch attribute; one
+    for the mixed-schedule route; two for the GEMM + act routes: the grouped
+    GEMM into the private BF16 workspace, then the generated activation
+    kernel) on PyTorch's current stream for the bound
     device and returns ``(out_q, out_s)``.  The first launch initializes
     private TMA descriptor storage and must run outside CUDA Graph capture.
     ``grid`` is the grid of the route's first generated kernel;
@@ -370,12 +405,12 @@ class PreparedGroupGemmFp8NtGroupwiseContiguousSiluQuant:
 
     @property
     def num_ctas(self) -> int:
-        """CTAs of the route's first generated kernel (the pair kernel or the activation kernel)."""
+        """CTAs of the route's first generated kernel (the pair, mixed-schedule or activation kernel)."""
         return int(self.grid[0])
 
     @property
     def tail_grid(self) -> Optional[tuple[int, int, int]]:
-        """Grid of the fused route's tail kernel (``None`` on the GEMM + act routes)."""
+        """Grid of the pair + tail route's tail kernel (``None`` on the other routes)."""
         return self.stage_grids.get(FUSED_TAIL_STAGE)
 
     @property
@@ -438,7 +473,8 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     Notes
     -----
     Requires an SM100a (compute capability 10.0) device and a registered
-    generated program for the resolved route (:func:`launch_plan`).  All
+    generated program for the resolved route (:func:`launch_plan`); the
+    mixed-schedule route is reachable only with ``validate_indices=True``.  All
     tensors must live on the same CUDA device and be 16-byte aligned
     (``out_s`` 4-byte).  The outputs match the three-kernel FlashInfer chain
     (CuTe-DSL grouped GEMM, ``silu_and_mul``, ``per_token_group_quant_8bit``)
@@ -521,7 +557,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
     gemm_backend: Optional[str] = None
     gemm: Optional[Callable[[], Any]] = None
     gemm_out: Optional[torch.Tensor] = None
-    if route == FUSED_ROUTE:
+    if route in FUSED_ROUTES:
         bindings: dict[str, Any] = {
             "A": a.view(torch.uint8),
             "B": b.view(torch.uint8),
@@ -535,6 +571,9 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
             "K": k,
             "G": groups,
         }
+        if route == FUSED_MIXED_ROUTE:
+            # the solo units' 64-row A box: a second descriptor over the same A tensor
+            bindings["A64"] = bindings["A"]
     else:
         gemm_backend = small_m_gemm_backend(m, n2, k)
         gemm_out = torch.empty((m, n2), dtype=torch.bfloat16, device=device)
@@ -561,7 +600,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         entry = getattr(module, record["ffi_entry"])
         descriptor_storage: Optional[torch.Tensor] = None
         workspace_bytes = int(record["tma_workspace_bytes"])
-        if route == FUSED_ROUTE:
+        if route in FUSED_ROUTES:
             descriptor_storage = torch.empty(
                 max(workspace_bytes, 128), dtype=torch.uint8, device=device
             )
@@ -612,7 +651,9 @@ __all__ = [
     "ACT_WIDE_MIN_ITEMS",
     "ACT_WIDE_ROUTE",
     "act_items",
+    "FUSED_MIXED_ROUTE",
     "FUSED_ROUTE",
+    "FUSED_ROUTES",
     "GEMM_BACKEND_CAKE",
     "GEMM_BACKEND_CUTE",
     "SMALL_M_MAX",
@@ -620,6 +661,7 @@ __all__ = [
     "is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available",
     "fused_tile_counts",
     "launch_plan",
+    "mixed_clusters",
     "prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant",
     "routing_blocks",
     "select_route",

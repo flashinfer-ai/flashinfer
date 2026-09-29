@@ -1253,13 +1253,23 @@ def _combined_metadata(rows: int, compressed: int, *, value_base: int = 0):
     return table, lens
 
 
+# Tensors run_cake_dsv4 places in the host value table that a generated TMA
+# descriptor may alias (see cake._TMA_SOURCE_ALIASES).
+_HOST_TMA_SOURCE_TENSORS = frozenset({"Q", "SWA_cache", "compressed_KV_cache", "O"})
+
+
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_registered_arg_plans_use_known_names(arch):
     """Every generated argument is either bindable by name or a documented retired name."""
     unknown = []
+    unaliased_tma = []
     for variant, spec in _ARCH_REGISTRATIONS[arch]["variants"].items():
         for kind, name in spec["arg_plan"]:
             canonical = cake.canonical_arg_name(kind, name)
+            if kind == "tma_buffer" and canonical not in _HOST_TMA_SOURCE_TENSORS:
+                # A descriptor name the host binds only by vocabulary would still
+                # fail at launch: ``_bind_argument`` needs a tensor value for it.
+                unaliased_tma.append((variant, name, canonical))
             if (
                 cake.is_bindable_arg(kind, name)
                 or canonical in cake._RETIRED_ARG_REASONS
@@ -1267,6 +1277,7 @@ def test_registered_arg_plans_use_known_names(arch):
                 continue
             unknown.append((variant, kind, name))
     assert unknown == []
+    assert unaliased_tma == []
 
 
 _PUBLIC_COMPILE_FLAGS = {
@@ -1321,7 +1332,13 @@ def test_metadata_param_vocabulary_is_bindable():
     for name in KERNEL_METADATA_PARAMS:
         kind = "buffer" if name.endswith(("indices", "lens")) else "parameter"
         assert cake.is_bindable_arg(kind, name), name
-    for tma_name in ("tmap_q", "tmap_swa_k", "tmap_swa_kv", "tmap_compressed_v"):
+    for tma_name in (
+        "tmap_q",
+        "tmap_swa_k",
+        "tmap_swa_kv",
+        "tmap_compressed_v",
+        "tmap_o",
+    ):
         assert cake.is_bindable_arg("tma_buffer", tma_name)
     assert cake.canonical_arg_name("parameter", "num_q_heads") == "num_heads"
     assert cake.canonical_arg_name("parameter", "num_split") == "num_splits"
