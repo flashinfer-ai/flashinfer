@@ -156,7 +156,9 @@ def up_proj_form_for(num_tokens: int) -> str:
 def k23_capacity_for(num_tokens: int) -> int:
     """The K23 accumulator capacity serving ``num_tokens`` (``<= K23_MAX_TOKENS``): the smallest ladder rung ``>= M``."""
     if not 1 <= num_tokens <= K23_MAX_TOKENS:
-        raise ValueError(f"num_tokens must be in [1, {K23_MAX_TOKENS}] for the fused K23 tail, got {num_tokens}")
+        raise ValueError(
+            f"num_tokens must be in [1, {K23_MAX_TOKENS}] for the fused K23 tail, got {num_tokens}"
+        )
     return next(c for c in K23_LADDER if c >= num_tokens)
 
 
