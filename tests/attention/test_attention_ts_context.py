@@ -5407,16 +5407,16 @@ def test_attention_ts_context_mla_prefill(
 def test_attention_ts_context_two_cta_matches_single_cta(monkeypatch, pv_dtype):
     """The paired kernel reproduces the single-CTA kernel and the reference.
 
-    8456 tokens give 33 query tiles per (batch, head): the odd count exercises the
-    even-grid padding of the cluster launch, and the 8-row remainder exercises the
-    partial last tile under two-CTA. Two batches and two heads make the pairing
-    cross batch and head boundaries. The device default is overridden both ways
-    so the kernel is exercised on SM100 as well as SM103, where it is the default.
+    8200 tokens give 33 query tiles of 256 rows per (batch, head): the odd count
+    exercises the even-grid padding of the cluster launch, and the 8-row remainder
+    exercises the partial last tile under two-CTA. The device default is
+    overridden both ways so the kernel is exercised on SM100 as well as SM103,
+    where it is the default.
     """
 
     case = _make_context_case(
-        q_lengths=(8456, 8456),
-        k_lengths=(8456, 8456),
+        q_lengths=(8200, 8200),
+        k_lengths=(8200, 8200),
         num_qo_heads=2,
         num_kv_heads=2,
         qkv_dtype=torch.bfloat16,
