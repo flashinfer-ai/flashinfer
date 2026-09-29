@@ -798,6 +798,9 @@ def prepare_dsa_train(
             continue
         physical = record[stage]
         grid = grid_dims(physical.get("grid", ["num_queries", 1, 1]), scalars, num_sms)
+        cluster = physical.get("launch", {}).get("cluster")
+        if cluster and any(g % c for g, c in zip(grid, cluster, strict=True)):
+            raise ValueError(f"stage {stage!r}: grid {grid} is not a multiple of the cluster shape {tuple(cluster)} baked into the module")
         launches[stage] = bind_stage(module_name, stage, values, grid)
     return DSATrainRunner(
         module_name=module_name,

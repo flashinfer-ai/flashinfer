@@ -127,6 +127,10 @@ def test_registry_records_are_well_formed():
             assert all(s.startswith("cake_dsa_h64_train/") for s in physical["sources"])
             assert len(physical["closure_sha256"]) == 64
             assert all(kind in {"buffer", "tma_buffer", "workspace", "parameter", "grid"} for kind, _ in physical["arg_plan"])
+            launch = physical.get("launch")
+            if launch is not None:
+                assert len(launch["cluster"]) == 3 and all(int(c) >= 1 for c in launch["cluster"])
+                assert len(launch["block"]) == 3 and all(int(b) >= 1 for b in launch["block"])
             assert len(physical.get("grid", ["num_queries", 1, 1])) == 3
 
 
