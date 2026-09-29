@@ -541,10 +541,14 @@ def decode_config(
     # TMA multicast (each rank streams 1 / C of the weight bytes).  Whole m-tile groups, an unsplit K, no cluster split-K;
     # one work item = (N tile, m-tile group).  Host mirror of the Cake ``decode_config`` rule.
     mc = int(entry.get("mc", 1))
-    if mc > 1 and (mc not in (2, 4, 8) or csplit > 1 or split != 1 or m_tiles % mc):
+    if mc > 1 and (mc not in (2, 4, 8) or csplit > 1 or split != 1):
         raise ValueError(
-            f"decode table entry mc {mc} needs C in (2, 4, 8), split 1, no csplit and m_tiles ({m_tiles}) % C == 0"
+            f"decode table entry mc {mc} needs C in (2, 4, 8), split 1 and no csplit (got {entry})"
         )
+    if mc > 1 and m_tiles % mc:
+        # A bucket spans row counts with different m-tile counts (the 256 bucket serves M = 65..256 at t128): rows without
+        # whole m-tile groups take the same route without the multicast cluster (host mirror of the Cake rule).
+        mc = 1
     total_work = tiles * split if mc == 1 else int(n_tiles128) * (m_tiles // mc)
     # Table key ``grid`` (round 4): a balanced persistent CTA count (e.g. 128 CTAs for 256 work items) instead of one
     # CTA per SM; the round-4 A/B of the 16384-row buckets preferred 128 x 2 items over 148 x 1.73.
