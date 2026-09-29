@@ -304,6 +304,85 @@ class NativeBf16Fp4GroupedKernel:
                 copy_async_16(dst, src, valid)
         cute.arch.cp_async_commit_group()
 
+    @cute.jit
+    def accumulate_stage(self, sa, sb, ssf, acc, stage):
+        # Bound tensor-core accumulation depth before rounded FP32 addition.
+        lane = cute.arch.lane_idx()
+        warp = cute.arch.warp_idx()
+        group, pair = (lane // 4, lane % 4)
+        bfrag0 = cute.make_rmem_tensor((self.n_tiles, self.tile_k // 16), Uint32)
+        bfrag1 = cute.make_rmem_tensor((self.n_tiles, self.tile_k // 16), Uint32)
+        if cutlass.const_expr(self.word_scales):
+            scale_words = cute.make_rmem_tensor((self.n_tiles,), Uint32)
+            for scale_group in cutlass.range_constexpr(self.tile_k // 64):
+                for nt in cutlass.range_constexpr(self.n_tiles):
+                    ni = warp * self.n_tiles * 8 + nt * 8 + group
+                    si = ni % 32 * 16 + ni // 32 * 4 + scale_group * 512
+                    scale_addr = get_smem_ptr_as_int32(ssf, ssf.layout((si, stage)))
+                    scale_words[nt] = ld_shared_u32(scale_addr)
+                for scale_byte in cutlass.range_constexpr(4):
+                    fragment = scale_group * 4 + scale_byte
+                    for nt in cutlass.range_constexpr(self.n_tiles):
+                        ni = warp * self.n_tiles * 8 + nt * 8 + group
+                        b_col = fragment * 2
+                        if cutlass.const_expr(self.compact_b):
+                            b_col = ((b_col >> 2 ^ ni >> 2 & 1) << 2) + (b_col & 3)
+                        addr = get_smem_ptr_as_int32(sb, sb.layout((ni, b_col, stage)))
+                        lo, hi = ld_shared_v2_u32(addr)
+                        bfrag0[nt, fragment], bfrag1[nt, fragment] = (
+                            scaled_two_pairs_e4m3_word(
+                                lo >> pair * 8,
+                                hi >> pair * 8,
+                                scale_words[nt],
+                                scale_byte,
+                            )
+                        )
+        else:
+            for fragment in cutlass.range_constexpr(self.tile_k // 16):
+                for nt in cutlass.range_constexpr(self.n_tiles):
+                    ni = warp * self.n_tiles * 8 + nt * 8 + group
+                    b_col = fragment * 2
+                    if cutlass.const_expr(self.compact_b):
+                        b_col = ((b_col >> 2 ^ ni >> 2 & 1) << 2) + (b_col & 3)
+                    addr = get_smem_ptr_as_int32(sb, sb.layout((ni, b_col, stage)))
+                    lo, hi = ld_shared_v2_u32(addr)
+                    si = ni % 32 * 16 + ni // 32 * 4
+                    si = si + fragment // 4 * 512 + fragment % 4
+                    scale = Uint32(ssf[si, stage])
+                    bfrag0[nt, fragment], bfrag1[nt, fragment] = scaled_two_pairs_e4m3(
+                        lo >> pair * 8, hi >> pair * 8, scale
+                    )
+        for mt in cutlass.range_constexpr(self.m_tiles):
+            partial = cute.make_rmem_tensor((self.n_tiles, 4), Float32)
+            partial.fill(0.0)
+            for fragment in cutlass.range_constexpr(self.tile_k // 16):
+                a_row = mt * 16 + lane % 16
+                a_col = fragment * 8 + lane // 16 * 4
+                if cutlass.const_expr(self.compact_a):
+                    a_col = (a_col >> 2 ^ a_row & 7) << 2
+                addr = get_smem_ptr_as_int32(sa, sa.layout((a_row, a_col, stage)))
+                a0, a1, a2, a3 = load_matrix_a(addr)
+                for nt in cutlass.range_constexpr(self.n_tiles):
+                    c0, c1, c2, c3 = mma_bf16(
+                        a0,
+                        a1,
+                        a2,
+                        a3,
+                        bfrag0[nt, fragment],
+                        bfrag1[nt, fragment],
+                        partial[nt, 0],
+                        partial[nt, 1],
+                        partial[nt, 2],
+                        partial[nt, 3],
+                    )
+                    partial[nt, 0] = c0
+                    partial[nt, 1] = c1
+                    partial[nt, 2] = c2
+                    partial[nt, 3] = c3
+            for nt in cutlass.range_constexpr(self.n_tiles):
+                for i in cutlass.range_constexpr(4):
+                    acc[mt, nt, i] += partial[nt, i]
+
     @cute.kernel
     def kernel(
         self,
@@ -392,7 +471,9 @@ class NativeBf16Fp4GroupedKernel:
             stage = offset % self.stages
             cute.arch.cp_async_wait_group(self.stages - 1)
             cute.arch.sync_threads()
-            if cutlass.const_expr(self.word_scales):
+            if cutlass.const_expr(k == 17408):
+                self.accumulate_stage(sa, sb, ssf, acc, stage)
+            elif cutlass.const_expr(self.word_scales):
                 for scale_group in cutlass.range_constexpr(self.tile_k // 64):
                     for nt in cutlass.range_constexpr(self.n_tiles):
                         ni = warp * self.n_tiles * 8 + nt * 8 + group

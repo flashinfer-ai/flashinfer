@@ -25,7 +25,6 @@ _TILE_CONFIGS = {
     (34816, 256): (8, 8, 128, 2),
     (34816, 512): (8, 8, 128, 2),
 }
-_UNROLL = {(5120, 128): 8, (5120, 512): 8, (5120, 3072): 16}
 _GROUP_M = {
     (5120, 256): 2,
     (5120, 1568): 6,
@@ -82,7 +81,12 @@ def _config(m, n):
             8192: 21,
         }.get(m, 16)
         warps, tile_k, stages = (8, 64, 2)
-    unroll = _UNROLL.get(shape, 2 if m in (352, 1024) or shape == (5120, 2048) else 4)
+    if n == 5120 and m >= 352:
+        unroll = 1
+    elif shape == (5120, 128):
+        unroll = 8
+    else:
+        unroll = 2 if m in (352, 1024) else 4
     return (
         tiles,
         warps,
