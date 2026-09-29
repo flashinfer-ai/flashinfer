@@ -348,7 +348,14 @@ def test_bind_stage_serves_permuted_cast_plan(monkeypatch):
             "closure_sha256": "0" * 64,
             "tma_workspace_bytes": 0,
         },
-        "bwd_main": {"module": "fake", "ffi_entry": "run", "arg_plan": [["parameter", "token_base"], ["parameter", "token_step"]]},
+        "bwd_main": {
+            "module": "fake",
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["parameter", "token_base"], ["parameter", "token_step"], ["parameter", "pass_lo"], ["parameter", "pass_hi"],
+                ["parameter", "dq_mode"], ["buffer", "dq_partial"], ["buffer", "key_scratch"], ["buffer", "pass_counts"],
+            ],
+        },
         "closure_sha256": "0" * 64,
     }
     monkeypatch.setitem(cake_jit.MODULES, "cake_dsa_h64_train_fake", record)
@@ -357,7 +364,8 @@ def test_bind_stage_serves_permuted_cast_plan(monkeypatch):
     t = dict(
         q_latent=torch.zeros(2, NUM_HEADS, D_LATENT, dtype=torch.bfloat16), q_rope=torch.zeros(2, NUM_HEADS, D_ROPE, dtype=torch.bfloat16),
         kv_latent=torch.zeros(S, D_LATENT, dtype=torch.bfloat16), k_rope=torch.zeros(S, D_ROPE, dtype=torch.bfloat16),
-        indices=torch.zeros(2, 4, dtype=torch.int32), dkv_latent_acc=torch.zeros(S, D_LATENT), dk_rope_acc=torch.zeros(S, D_ROPE),
+        indices=torch.zeros(2, 4, dtype=torch.int32), delta=torch.zeros(2, NUM_HEADS),
+        dkv_latent_acc=torch.zeros(S, D_LATENT), dk_rope_acc=torch.zeros(S, D_ROPE),
         dkv_latent=torch.empty(0, dtype=torch.bfloat16), dk_rope=torch.empty(0, dtype=torch.bfloat16),
         dkv_latent_fp32=torch.zeros(S, D_LATENT), dk_rope_fp32=torch.zeros(S, D_ROPE),
     )
@@ -371,7 +379,13 @@ def test_bind_stage_serves_permuted_cast_plan(monkeypatch):
     # the FP32 outputs are re-bindable slots (fresh per call in the dkv_fp32 mode)
     assert {key for _, key in launch.slots} >= {"dkv_latent_acc", "dkv_latent_fp32", "dk_rope_fp32", "dkv_latent", "dk_rope"}
     main = bind_stage("cake_dsa_h64_train_fake", "bwd_main", values, (2, 1, 1))
-    assert main.arguments == (0, 1)
+    # key-range-pass operands of the single-pass program: whole key range, dq_mode 0, inert placeholders as in the
+    # production launcher (delta for the dQ partials, the indices storage for the compacted keys and counts)
+    assert main.arguments[:5] == (0, 1, 0, S, 0)
+    assert main.arguments[5] is t["delta"] and main.arguments[6] is t["indices"] and main.arguments[7] is t["indices"]
+    assert {key for _, key in main.slots} == {"dq_partial", "key_scratch", "pass_counts"}
+    rebound = main.templated().arguments_for(cake_backend._inert_pass_values(dict(delta=t["delta"], indices_storage=t["indices"]), S))
+    assert rebound[5] is t["delta"] and rebound[6] is t["indices"]
     assert record_dkv_acc_layout(record) == "permuted"
     with pytest.raises(ValueError, match="dkv_acc_layout"):
         record_dkv_acc_layout({"arch": "sm_100a", "stages": ["fwd", "bwd_main"]})

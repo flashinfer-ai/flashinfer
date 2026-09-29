@@ -119,6 +119,12 @@ CONTRACT_TENSORS = (
     "dk_rope",
     "dkv_latent_fp32",  # bwd_cast: natural-layout FP32 outputs of the dkv_fp32 mode (out_f32 = 1); otherwise a placeholder
     "dk_rope_fp32",
+    # bwd_main: reserved for the key-range-pass variant of the main stage (FP32 dQ partials, per-pass compacted keys and
+    # their counts); the single-pass kernel of this program never reads them and receives, like its production launcher,
+    # ``delta`` and the indices storage as inert placeholders (see _inert_pass_values).
+    "dq_partial",
+    "key_scratch",
+    "pass_counts",
     "workspace",  # kernel-private scratch of the backward main stage (record field workspace_bytes)
     "tma_descriptor_workspace",
 )
@@ -144,6 +150,11 @@ CONTRACT_SCALARS = (
     "out_f32",  # bwd_cast: 1 when the cast writes natural-layout FP32 outputs (dkv_fp32 mode of a permuted program)
     "token_base",  # bwd_main: token = token_base + token_step * blockIdx.x (0, 1: one CTA per token in row order)
     "token_step",
+    # bwd_main: key-range-pass controls of the multi-pass variant; the single-pass kernel is launched with the whole key range
+    # and dq_mode 0 (direct BF16 dQ output) and does not read them.
+    "pass_lo",
+    "pass_hi",
+    "dq_mode",
 )
 # FP32 dK/dV accumulator layouts a backward record declares (``dkv_acc_layout``).
 DKV_ACC_LAYOUTS = ("natural", "permuted")
@@ -728,6 +739,18 @@ def _pointer_alias(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
     return flat, int(tensor.storage_offset())
 
 
+def _inert_pass_values(values: dict[str, Any], num_kv: int) -> dict[str, Any]:
+    """Key-range-pass operands of the backward main stage for the single-pass program: the whole key range,
+    ``dq_mode`` 0, and never-dereferenced placeholders (``delta`` for the FP32 dQ partials, the indices storage for
+    the compacted keys and their counts) -- exactly what the production launcher passes for one pass."""
+    values["pass_lo"], values["pass_hi"], values["dq_mode"] = 0, int(num_kv), 0
+    if values.get("delta") is not None:
+        values["dq_partial"] = values["delta"]
+    if values.get("indices_storage") is not None:
+        values["key_scratch"] = values["pass_counts"] = values["indices_storage"]
+    return values
+
+
 def _contract_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dict[str, Any]:
     values: dict[str, Any] = {name: t.get(name) for name in CONTRACT_TENSORS}
     values.update(scalars)
@@ -749,7 +772,7 @@ def _contract_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dic
     values["rope_groups"] = int(scalars["num_kv"]) * D_ROPE // 32
     values["out_f32"] = int(scalars.get("out_f32", 0))
     values["token_base"], values["token_step"] = 0, 1  # one CTA per token, token = blockIdx.x
-    return values
+    return _inert_pass_values(values, int(scalars["num_kv"]))
 
 
 def _seed_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dict[str, Any]:
@@ -1093,7 +1116,7 @@ class _Binding:
         values.update(current)
         values["indices_storage"], values["indices_offset"] = _pointer_alias(current["indices"])
         values["k_rope_storage"], values["k_rope_offset"] = _pointer_alias(current["k_rope"])
-        return values
+        return _inert_pass_values(values, self.num_kv)
 
     def _launch(self, current: dict[str, torch.Tensor], stages: tuple[str, ...]) -> None:
         values = self.rebind_values(current)
