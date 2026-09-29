@@ -30,11 +30,14 @@ def test_reject_preimported_namespace_sources(monkeypatch, tmp_path):
     (tmp_path / "sources").mkdir()
     monkeypatch.setattr(sys, "path", [str(tmp_path)])
     monkeypatch.delitem(sys.modules, "sources", raising=False)
-    namespace = importlib.import_module("sources")
-    assert namespace.__file__ is None
+    try:
+        namespace = importlib.import_module("sources")
+        assert namespace.__file__ is None
 
-    with pytest.raises(RuntimeError, match="already imported without a file"):
-        _load_paths().bootstrap_paths()
+        with pytest.raises(RuntimeError, match="already imported without a file"):
+            _load_paths().bootstrap_paths()
+    finally:
+        monkeypatch.delitem(sys.modules, "sources", raising=False)
 
 
 def test_reject_preimported_regular_external_sources(monkeypatch, tmp_path):
