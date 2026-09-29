@@ -224,6 +224,14 @@ def main():
         action="store_true",
         help="skip trtllm-gen autotuning (default: tuned baseline, as in production)",
     )
+    parser.add_argument(
+        "--arm-order",
+        choices=("auto", "candidate-first", "trt-first"),
+        default="auto",
+        help="which backend each row times first: auto alternates by row "
+        "position ((tokens index + distributions index) %% 2); the other two "
+        "fix the order for every row. Each row records the order it used",
+    )
     parser.add_argument("--run-id", default="default")
     parser.add_argument(
         "--candidate-impl",
@@ -377,6 +385,9 @@ def main():
                 "intermediate_shard": shard,
             }
         )
+    if args.arm_order != "auto":
+        # Added only for a fixed order so default checkpoints still resume.
+        configuration["arm_order"] = args.arm_order
     configuration = json.loads(json.dumps(configuration))
     environment = {
         "gpu": torch.cuda.get_device_name(),
@@ -628,6 +639,12 @@ def main():
                 rank_histogram = reference.parallel_routing_histogram(
                     ids, experts, histogram_ranks
                 )
+                if args.arm_order == "auto":
+                    trt_first = bool(
+                        (tokens.index(count) + distributions.index(distribution)) % 2
+                    )
+                else:
+                    trt_first = args.arm_order == "trt-first"
                 for mode in modes:
                     active_key = f"{count}/{distribution}/{mode}"
                     if complete(active_key):
@@ -639,7 +656,7 @@ def main():
                         ("candidate", candidate_run),
                         ("trtllm_gen", baseline),
                     ]
-                    if (tokens.index(count) + distributions.index(distribution)) % 2:
+                    if trt_first:
                         implementations.reverse()
                     measurements = {
                         name: _measure(
@@ -665,6 +682,7 @@ def main():
                         "distribution": distribution,
                         "mode": mode,
                         "routing": args.routing,
+                        "arm_order": "trt-first" if trt_first else "candidate-first",
                         "measurements": measurements,
                         **ratios,
                         "routing_histogram": histogram,

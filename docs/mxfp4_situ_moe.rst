@@ -2617,4 +2617,7 @@ offset ``112R``) and ``--layout tp8 --rank R`` measures a MoE-tensor-parallel
 shard (896 experts, intermediate 384); both require ``--full`` and generate
 the rank-local bank directly rather than slicing a full bank. Every row
 records the global and per-rank routing histograms; ``--distributions`` also
-accepts ``remote_dominated``. The default invocation is unchanged.
+accepts ``remote_dominated``. ``--arm-order candidate-first`` or
+``--arm-order trt-first`` times that backend first on every row instead of
+the default alternation by row position, and every row records the order it
+used as ``arm_order``. The default invocation is unchanged.
