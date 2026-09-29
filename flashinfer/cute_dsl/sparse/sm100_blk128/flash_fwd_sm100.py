@@ -24,6 +24,14 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
+# ``Arch.sm_107*`` only exists in CuTe DSL >= 4.8; requirements.txt allows 4.7,
+# where a bare attribute access raises AttributeError as soon as this branch is
+# evaluated (the SM100 and SM103 clauses short-circuit before it, so only an
+# arch outside both ranges reaches it).  Fall back to the sm_103 bounds so an
+# older DSL keeps exactly its pre-Rubin behaviour.
+_ARCH_SM107 = getattr(Arch, "sm_107", Arch.sm_103f)
+_ARCH_SM107F = getattr(Arch, "sm_107f", Arch.sm_103f)
+
 from quack import copy_utils, layout_utils
 
 from .cute_dsl_utils import assume_tensor_aligned
@@ -94,7 +102,7 @@ class FlashAttentionForwardSm100:
         assert (
             Arch.sm_100 <= self.arch <= Arch.sm_100f
             or Arch.sm_103 <= self.arch <= Arch.sm_103f
-            or Arch.sm_107 <= self.arch <= Arch.sm_107f
+            or _ARCH_SM107 <= self.arch <= _ARCH_SM107F
         ), "Only SM100, SM103 and SM107 are supported"
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
