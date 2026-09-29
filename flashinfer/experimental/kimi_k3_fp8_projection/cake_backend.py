@@ -319,7 +319,8 @@ def decode_module_stages(
 # A persistent cluster grid larger than ``C x capacity`` serialises whole clusters into a second pass.  Measured on
 # B200 / B300; mirrors the source repository's table.
 DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
-    "sm_100a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15},  # B200, 148 SMs
+    # 9..16 = non-portable clusters (round 6, lever C16), measured on the t16 fused small-inbox instance on both GPUs
+    "sm_100a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15, 9: 15, 10: 11, 12: 7, 14: 7, 16: 7},  # B200, 148 SMs
     "sm_103a": {
         2: 74,
         3: 45,
@@ -328,6 +329,11 @@ DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
         6: 22,
         7: 15,
         8: 15,
+        9: 15,
+        10: 11,
+        12: 7,
+        14: 7,
+        16: 7,
     },  # B300, 148 SMs (same GPC topology)
 }
 
@@ -426,6 +432,7 @@ class DecodeConfig:
     epi_chunk: int = 32  # round 6: epilogue staging rows per flush (table key ``epi_chunk``; 16 frees SMEM for the 5-stage t32 ring)
     pf: int = 0  # round 6 (lever P): weight-tile L2 prefetch distance in stages (table key ``pf``; 0 = off)
     mc: int = 1  # round 6 (lever M): m tiles of one N tile per cluster sharing the W stage through TMA multicast (table key ``mc``; 1 = off)
+    tstore: bool = False  # round 6 (lever E1): the split-1 epilogue stores BF16 through TMA (table key ``tstore``; the launch still needs a 16-byte-aligned output view)
 
     @property
     def tok_rows(self) -> int:
@@ -433,6 +440,11 @@ class DecodeConfig:
 
     @property
     def kernel_key(self) -> str:
+        """Kernel key of the register-epilogue program (the table row's instance without the output-view-dependent TMA store)."""
+        return self.kernel_key_for(False)
+
+    def kernel_key_for(self, tma_store: bool) -> str:
+        """Kernel key of the launched program: ``_tso`` when the row's ``tstore`` applies to a TMA-eligible output view."""
         return decode_kernel_key(
             self.tok,
             self.module_stages,
@@ -445,6 +457,7 @@ class DecodeConfig:
             epi_chunk=self.epi_chunk,
             pf=self.pf,
             mc=self.mc,
+            tstore=bool(tma_store) and self.tstore and self.split == 1 and self.csplit == 1,
         )
 
 
@@ -482,9 +495,9 @@ def decode_config(
     # whole number of clusters.
     csplit = int(entry.get("csplit", 1))
     if csplit > 1:
-        if csplit > 8 or csplit > tok or csplit > int(num_k_iters):
+        if csplit > 16 or csplit > tok or csplit > int(num_k_iters):
             raise ValueError(
-                f"decode table entry csplit {csplit} needs 2 <= C <= min(8, tok {tok}, num_k_iters {num_k_iters})"
+                f"decode table entry csplit {csplit} needs 2 <= C <= min(16, tok {tok}, num_k_iters {num_k_iters})"
             )
         split = csplit
     tok_rows = max(tok, 32)
@@ -584,12 +597,20 @@ def decode_config(
     qlanes = int(entry.get("qlanes", 16)) if fused and not resident else 16
     while qlanes < 16 and (2 * tok) % (DEC_QUANT_WARPS * (32 // qlanes)):
         qlanes *= 2
+    # Table key ``tstore`` (round 6, lever E1): the split-1 epilogue stores BF16 through TMA; the instance has no TMA path
+    # for the split-K / cluster reductions.
+    tstore = bool(entry.get("tstore", False))
+    if tstore and (split != 1 or csplit > 1):
+        raise ValueError(
+            f"decode table entry tstore needs split 1 and no cluster split-K (got {entry})"
+        )
     return DecodeConfig(
         tok=tok,
         split=split,
         fused=fused,
         resident=resident,
         persist=persist,
+        tstore=tstore,
         stages=stages,
         module_stages=decode_module_stages(
             tok, stages, fused, resident, xb_stages, epi_chunk
@@ -955,6 +976,7 @@ class ProjectionPlan:
     decode: Optional[DecodeConfig]
     gemm_tma_store: bool  # GEMM route: TMA-store epilogue (aligned output view) instead of the register epilogue
     gemm_reg_staged: bool  # GEMM route: staged row-coalesced register epilogue (8-byte aligned rows the TMA store cannot address)
+    decode_tma_store: bool  # decode route: the row's ``tstore`` instance on a 16-byte-aligned output view (round 6, lever E1)
     quant_units: Optional[int]  # None when the decode instance quantizes in-CTA
     sf_rows: int
     kernels: tuple[str, ...]  # logical kernel key per launch, in launch order
@@ -972,11 +994,15 @@ def route_plan(
     sm_count: int,
     gemm_tma_store: bool = True,
     gemm_reg_staged: bool = False,
+    decode_tma_store: Optional[bool] = None,
 ) -> ProjectionPlan:
     """Resolve the launch sequence of ``M`` rows without touching device memory.
 
     ``gemm_tma_store`` / ``gemm_reg_staged`` select the GEMM epilogue program (``gemm_tma_store_eligible`` /
-    ``gemm_reg_staged_eligible`` of the output view)."""
+    ``gemm_reg_staged_eligible`` of the output view); ``decode_tma_store`` (default = ``gemm_tma_store``) tells whether the
+    output view admits the decode TMA-store epilogue of a ``tstore`` table row (round 6, lever E1)."""
+    if decode_tma_store is None:
+        decode_tma_store = bool(gemm_tma_store)
     M = int(M)
     cfg = decode_config(M, prepared.n_tiles128, prepared.num_k_iters, arch, sm_count)
     c_off, _c_bytes, p_off, p_bytes = reduction_layout(prepared, M, cfg)
@@ -1006,8 +1032,13 @@ def route_plan(
         key = gemm_kernel_key(base, gpf)
         kernels.append(key if gpf and route_available(arch, (key,)) else base)
         grids.append(_gemm_grid(_m_tiles(M), prepared.n_tiles))
-    else:
-        kernels.append(cfg.kernel_key)
+    dec_ts = False
+    if cfg is not None:
+        key = cfg.kernel_key_for(bool(decode_tma_store))
+        dec_ts = key != cfg.kernel_key
+        if dec_ts and not route_available(arch, (key,)):
+            key, dec_ts = cfg.kernel_key, False  # the TMA-store program is not registered for this arch: register epilogue
+        kernels.append(key)
         grids.append(cfg.grid)
     return ProjectionPlan(
         arch=arch,
@@ -1017,6 +1048,7 @@ def route_plan(
         decode=cfg,
         gemm_tma_store=cfg is None and bool(gemm_tma_store),
         gemm_reg_staged=cfg is None and not gemm_tma_store and bool(gemm_reg_staged),
+        decode_tma_store=dec_ts,
         quant_units=units,
         sf_rows=cfg.tok if cfg is not None else SF_TILE_ROWS,
         kernels=tuple(kernels),
@@ -1198,6 +1230,7 @@ def prepare_kimi_k3_fp8_projection(
         sm_count,
         tma_store,
         gemm_reg_staged_eligible(tma_store, _store_vec(out.data_ptr(), ldo)),
+        decode_tma_store=tma_store,
     )
     out_flat = torch.as_strided(
         out, (ldo * (M - 1) + prepared.n_valid,), (1,), out.storage_offset()
@@ -1290,6 +1323,11 @@ def prepare_kimi_k3_fp8_projection(
                         x=x,
                         K=prepared.K,
                         XB=x,
+                        # ``OUT``: the [M, n_valid] output view for the TMA-store epilogue (rows >= M / columns >= n_valid are
+                        # clipped by the unit); the register-epilogue programs receive a placeholder map they never access.
+                        OUT=out
+                        if plan.decode_tma_store
+                        else torch.zeros((32, 128), dtype=torch.bfloat16, device=device),
                         grid=(plan.grids[stage], 1, 1),
                     ),
                 )
