@@ -34,7 +34,8 @@ These experimental context entry points are not currently registered with
 support for other PrimTS APIs.
 
 Both reusable wrappers use a static-spec lifecycle. `plan()` receives only
-device, capacity, head, dtype, mask, window, and default-scale information. The
+device, capacity, head, dtype, mask, window, default-scale, and
+`store_softmax_stats` specialization information. The
 contiguous plan also freezes its `packed` storage-mode choice (`False` for fixed
 BSHD, `True` for packed THD); the paged plan additionally receives page size
 and optional `uniform_packed_lengths`, `has_q_offset`, and
@@ -70,6 +71,7 @@ alignment, value, aliasing, and lifetime obligation in the runtime contract.
 | Sliding window | Positive causal left window; `window_left=-1` disables it |
 | Scheduling | Automatic nonpersistent, static-persistent, or CLC-persistent selection; no public tuning knob |
 | Accumulation | FP32 QK/PV and softmax state |
+| Softmax statistics | Optional caller-owned FP32 maximum/denominator output for every supported layout, mask, and dtype |
 
 The established equal-dimension paths have accuracy and performance signoff
 on SM100a/B200. The 192/128 extension has been validated on SM103/GB300;
@@ -78,7 +80,10 @@ have not been validated for this extension.
 
 A positive left window requires GQA with an even `Hq/Hkv` ratio greater than
 one. Causal attention requires `Sq <= Sk` for every request at run time. All
-tensor extents and packed request lengths must be positive. For each contiguous
+tensor extents and packed request lengths must be positive, except that dense
+contiguous wrapper runs with `store_softmax_stats=True` may contain empty K/V
+partitions for merging. Such rows write zero output and `(-inf, 0)` statistics.
+For each contiguous
 run, the aggregate logical Q and K extents—`B*Sq` and `B*Sk` for fixed storage,
 or `total_q` and `total_k` for packed storage—must each be at most
 `2**31 - 256`. Paged runs apply that limit only to `total_q`. At plan time,
@@ -93,8 +98,20 @@ be compact CUDA `torch.int32` tensors on that device and at least 4-byte
 aligned. `block_tables` instead permits the row-strided layout documented
 below. A caller-provided `out` must not overlap Q, K, V, any runtime metadata,
 or active plan-owned scale/scratch storage. This is an unchecked caller
-precondition in both validation modes. The API returns O only; rowwise LSE and other
-softmax state remain internal to the kernel.
+precondition in both validation modes. The API returns O only. To also export
+statistics, set `plan(store_softmax_stats=True)` and pass
+`run(..., softmax_stats=stats)`, where `stats` is a contiguous, 4-byte-aligned
+FP32 tensor shaped `[*out.shape[:-1], 2]` on the same device. Every run must
+supply it when enabled and omit it when disabled, even with `validate=False`.
+The buffer must not overlap inputs, output, metadata, or plan-owned storage.
+One-shot APIs expose the same flag and buffer.
+
+The two values are the scaled token-logit maximum `m` in natural-log units and
+`sum(exp(logit - m))` after masking. Internal FP8 probability scaling is removed;
+`output_scale` does not affect statistics. Both query-paired and head-paired
+paths export the same query/head ordering. The buffer is runtime state and can
+be rebound between eager calls without replanning; CUDA graphs retain its
+captured address. No additional statistics scratch is needed for prefill.
 
 ## Tensor and metadata layouts
 

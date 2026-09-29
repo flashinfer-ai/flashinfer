@@ -1023,9 +1023,33 @@ def _fmha_trace_variant(kwargs, *, query_param: str, cache_param: str, plan_stat
 
 # fi_trace retains builders by template identity, so repeated traces must reuse
 # their templates, including each supported encoded fragment size.
+def _with_prims_ts_softmax_stats(
+    template: TraceTemplate, *, enabled: bool, one_shot: bool = False
+) -> TraceTemplate:
+    """Add the caller-owned statistics output only to enabled specializations."""
+    if enabled:
+        template.name_prefix += "_softmax_stats"
+        template.axes["softmax_stats_width"] = Const(abbrev="", value=2)
+        template.axes["store_softmax_stats"] = Const(abbrev="", value=1)
+        template.outputs["softmax_stats"] = Tensor(
+            [*template.outputs["output"].dim_names[:-1], "softmax_stats_width"],
+            dtype="float32",
+            param="softmax_stats",
+            description="Scaled natural-log token maximum and unscaled denominator.",
+        )
+        if one_shot:
+            template.inputs["store_softmax_stats"] = Scalar("bool")
+    return template
+
+
 @lru_cache(maxsize=None)
 def _make_attention_ts_decode_trace(
-    *, combined: bool, fp16_output: bool, q_mode: str, encoded_page_size: int = 0
+    *,
+    combined: bool,
+    fp16_output: bool,
+    q_mode: str,
+    encoded_page_size: int = 0,
+    store_softmax_stats: bool = False,
 ):
     cache_form = "combined" if combined else "tuple"
     page_suffix = f"_encoded_page{encoded_page_size}" if encoded_page_size else ""
@@ -1110,7 +1134,7 @@ def _make_attention_ts_decode_trace(
         constraints.append("seq_len_q >= 2")
     else:
         constraints.append("seq_len_q == 1")
-    return TraceTemplate(
+    template = TraceTemplate(
         op_type="gqa_paged",
         name_prefix=f"attention_ts_decode_{cache_form}{page_suffix}{output_suffix}{q_suffix}",
         description=(
@@ -1131,6 +1155,9 @@ def _make_attention_ts_decode_trace(
         },
         constraints=constraints,
         tags=["stage:decode", "backend:prims-ts", "status:experimental"],
+    )
+    return _with_prims_ts_softmax_stats(
+        template, enabled=store_softmax_stats, one_shot=True
     )
 
 
@@ -1161,6 +1188,7 @@ def attention_ts_decode_trace_dispatch(**kwargs):
         fp16_output=fp16_output,
         q_mode=q_mode,
         encoded_page_size=_fmha_encoded_page_size(kwargs, cache_param="paged_kv_cache"),
+        store_softmax_stats=bool(kwargs.get("store_softmax_stats", False)),
     )
 
 
@@ -1183,6 +1211,7 @@ def _make_prims_ts_decode_wrapper_trace(
     plan_owns_seq_lens: bool,
     encoded_page_size: int = 0,
     split_kv: bool = True,
+    store_softmax_stats: bool = False,
 ):
     """Describe one plan-bound ``BatchDecodePagedTSWrapper.run`` call."""
 
@@ -1311,7 +1340,7 @@ def _make_prims_ts_decode_wrapper_trace(
         constraints.append("kv_planes == 2")
     if q_mode == _Q_FIXED_MULTI:
         constraints.append("seq_len_q >= 2")
-    return TraceTemplate(
+    template = TraceTemplate(
         op_type="gqa_paged",
         name_prefix=(
             f"prims_ts_decode_wrapper_{cache_form}{page_suffix}{output_suffix}{q_suffix}_{mask_type}"
@@ -1351,6 +1380,7 @@ def _make_prims_ts_decode_wrapper_trace(
             f"seq-lens-source:{'plan' if plan_owns_seq_lens else 'run'}",
         ],
     )
+    return _with_prims_ts_softmax_stats(template, enabled=store_softmax_stats)
 
 
 # Finite examples support trace discovery and schema-consistency tests. Bound
@@ -1400,6 +1430,7 @@ def _get_prims_ts_decode_wrapper_trace(
     plan_owns_seq_lens: bool,
     encoded_page_size: int = 0,
     split_kv: bool = True,
+    store_softmax_stats: bool = False,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen FMHA plan identity."""
 
@@ -1416,6 +1447,7 @@ def _get_prims_ts_decode_wrapper_trace(
         plan_owns_seq_lens=plan_owns_seq_lens,
         encoded_page_size=encoded_page_size,
         split_kv=split_kv,
+        store_softmax_stats=store_softmax_stats,
     )
 
 
@@ -1502,6 +1534,9 @@ def prims_ts_decode_wrapper_trace_dispatch(**kwargs):
         encoded_page_size=encoded_page_size,
         # Preserve caller permission, not whether this shape actually splits.
         split_kv=bool(dict(getattr(state, "policy", ())).get("split_kv_allowed", True)),
+        store_softmax_stats=bool(
+            getattr(getattr(state, "config", None), "store_softmax_stats", False)
+        ),
     )
 
 
@@ -1510,7 +1545,10 @@ prims_ts_decode_wrapper_trace_dispatch.templates = list(  # type: ignore[attr-de
 )
 
 
-def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query: bool):
+@lru_cache(maxsize=None)
+def _make_prims_ts_decode_mla_one_shot_trace(
+    *, rank4_cache: bool, packed_query: bool, store_softmax_stats: bool = False
+):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
     axes: dict[str, Var | Const] = {
@@ -1542,7 +1580,7 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
         cache_dims = ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"]
     else:
         cache_dims = ["num_pages", "page_size", "head_dim_qk"]
-    return TraceTemplate(
+    template = TraceTemplate(
         op_type="mla_paged",
         name_prefix=f"prims_ts_decode_mla_one_shot{cache_suffix}{q_suffix}",
         description=(
@@ -1591,6 +1629,9 @@ def _make_prims_ts_decode_mla_one_shot_trace(*, rank4_cache: bool, packed_query:
         ],
         tags=["stage:decode", "backend:prims-ts", "status:experimental", "mla"],
     )
+    return _with_prims_ts_softmax_stats(
+        template, enabled=store_softmax_stats, one_shot=True
+    )
 
 
 _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
@@ -1604,11 +1645,11 @@ _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES = {
 
 def prims_ts_decode_mla_one_shot_trace_dispatch(**kwargs):
     kv_cache = kwargs.get("kv_cache")
-    key = (
-        isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
-        kwargs.get("qo_indptr") is not None,
+    return _make_prims_ts_decode_mla_one_shot_trace(
+        rank4_cache=isinstance(kv_cache, torch.Tensor) and kv_cache.ndim == 4,
+        packed_query=kwargs.get("qo_indptr") is not None,
+        store_softmax_stats=bool(kwargs.get("store_softmax_stats", False)),
     )
-    return _PRIMS_TS_DECODE_MLA_ONE_SHOT_TRACES[key]
 
 
 prims_ts_decode_mla_one_shot_trace_dispatch.templates = list(  # type: ignore[attr-defined]
@@ -1625,6 +1666,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    store_softmax_stats: bool = False,
 ):
     cache_suffix = "_rank4" if rank4_cache else ""
     q_suffix = "_packed_q" if packed_query else ""
@@ -1679,7 +1721,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
         cache_dims = ["num_pages", "kv_pad_dim", "page_size", "head_dim_qk"]
     else:
         cache_dims = ["num_pages", "page_size", "head_dim_qk"]
-    return TraceTemplate(
+    template = TraceTemplate(
         op_type="mla_paged",
         name_prefix=(
             f"prims_ts_decode_mla_wrapper{cache_suffix}{q_suffix}_{mask_type}"
@@ -1745,6 +1787,7 @@ def _make_prims_ts_decode_mla_wrapper_trace(
             f"mask:{mask_type}",
         ],
     )
+    return _with_prims_ts_softmax_stats(template, enabled=store_softmax_stats)
 
 
 # Finite examples support trace discovery and schema-consistency tests. Bound
@@ -1776,6 +1819,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
     max_kv_len: int,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    store_softmax_stats: bool = False,
 ) -> TraceTemplate:
     """Return one stable trace template for a frozen MLA plan identity."""
 
@@ -1787,6 +1831,7 @@ def _get_prims_ts_decode_mla_wrapper_trace(
         max_kv_len=max_kv_len,
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
+        store_softmax_stats=store_softmax_stats,
     )
 
 
@@ -1823,6 +1868,7 @@ def prims_ts_decode_mla_wrapper_trace_dispatch(**kwargs):
         max_kv_len=int(state.max_kv_len),
         kv_lora_rank=int(state.kv_lora_rank),
         qk_rope_head_dim=int(state.qk_rope_head_dim),
+        store_softmax_stats=bool(getattr(state, "store_softmax_stats", False)),
     )
 
 

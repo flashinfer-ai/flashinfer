@@ -785,6 +785,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "uniform_packed_lengths",
         "has_q_offset",
         "paged_v_tail_is_zero",
+        "store_softmax_stats",
     )
     assert all(
         parameter.kind is inspect.Parameter.KEYWORD_ONLY
@@ -800,6 +801,7 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
         "block_tables",
         "seq_lens_kv",
         "out",
+        "softmax_stats",
         "scale_softmax_log2",
         "output_scale",
         "validate",
@@ -809,6 +811,8 @@ def test_attention_ts_context_paged_wrapper_exposes_compile_oriented_contract() 
     assert plan_parameters["uniform_packed_lengths"].default is False
     assert plan_parameters["has_q_offset"].default is True
     assert plan_parameters["paged_v_tail_is_zero"].default is False
+    assert plan_parameters["store_softmax_stats"].default is False
+    assert run_parameters["softmax_stats"].default is None
     assert not hasattr(BatchPrefillPagedTSWrapper, "plan_live")
     assert not hasattr(context_module, "PlanSpec")
     assert not hasattr(context_module, "PlanHints")
@@ -863,6 +867,7 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "v_dtype",
         "out_dtype",
         "packed",
+        "store_softmax_stats",
         "mask_type",
         "window_left",
         "sm_scale",
@@ -884,11 +889,15 @@ def test_attention_ts_context_contiguous_wrapper_exposes_compile_oriented_contra
         "variable_window_token_ends",
         "variable_window_cta_starts",
         "out",
+        "softmax_stats",
         "scale_softmax_log2",
         "output_scale",
         "validate",
     )
     assert plan_parameters["head_dim_vo"].default is None
+    assert plan_parameters["store_softmax_stats"].default is False
+    assert run_parameters["softmax_stats"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert run_parameters["softmax_stats"].default is None
     assert run_parameters["qo_indptr"].default is None
     assert run_parameters["kv_indptr"].default is None
     assert run_parameters["variable_window_cta_starts"].kind is (
@@ -919,6 +928,8 @@ def test_attention_ts_context_paged_one_shot_exposes_fixed_table_contract() -> N
         "output_scale": 1.0,
         "out_dtype": None,
         "out": None,
+        "store_softmax_stats": False,
+        "softmax_stats": None,
     }
 
     assert tuple(parameters) == (*required_parameters, *keyword_only_defaults)
@@ -965,8 +976,10 @@ def test_attention_ts_context_one_shot_apis_reject_cuda_graph_capture(
         )
 
 
+@pytest.mark.parametrize("store_softmax_stats", [False, True])
 def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     monkeypatch,
+    store_softmax_stats,
 ) -> None:
     """The convenience API preserves caller-owned fixed metadata tensors."""
 
@@ -1018,6 +1031,7 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     block_tables = torch.tensor(((3, 1, -1), (7, 0, 2)), dtype=torch.int32)
     seq_lens_kv = torch.tensor((33, 65), dtype=torch.int32)
     out = torch.empty_like(q)
+    stats = torch.empty((*q.shape[:-1], 2)) if store_softmax_stats else None
 
     returned = batch_prefill_with_paged_kv_cache(
         q,
@@ -1027,6 +1041,8 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
         block_tables,
         seq_lens_kv,
         out=out,
+        store_softmax_stats=store_softmax_stats,
+        softmax_stats=stats,
     )
 
     assert returned is out
@@ -1039,12 +1055,14 @@ def test_attention_ts_context_paged_one_shot_forwards_fixed_table_to_wrapper(
     assert calls["plan"]["uniform_packed_lengths"] is False
     assert calls["plan"]["has_q_offset"] is False
     assert calls["plan"]["paged_v_tail_is_zero"] is False
+    assert calls["plan"]["store_softmax_stats"] is store_softmax_stats
     assert "max_num_pages_per_seq_kv" not in calls["plan"]
     run_args, run_kwargs = calls["run"]
     assert run_args[3] is qo_indptr
     assert run_args[4] is block_tables
     assert run_args[5] is seq_lens_kv
-    assert tuple(run_kwargs) == ("out",)
+    assert tuple(run_kwargs) == ("out", "softmax_stats")
+    assert run_kwargs["softmax_stats"] is stats
     assert run_kwargs["out"] is out
 
 
@@ -1135,8 +1153,10 @@ def test_attention_ts_context_paged_one_shot_rejects_invalid_fixed_metadata(
         )
 
 
+@pytest.mark.parametrize("store_softmax_stats", [False, True])
 def test_attention_ts_context_contiguous_plan_reuses_dynamic_packed_requests(
     monkeypatch,
+    store_softmax_stats,
 ) -> None:
     compile_calls = []
     launch_calls = []
@@ -1172,6 +1192,7 @@ def test_attention_ts_context_contiguous_plan_reuses_dynamic_packed_requests(
         q_dtype=torch.float16,
         k_dtype=torch.float16,
         packed=True,
+        store_softmax_stats=store_softmax_stats,
     )
     state = wrapper._plan_state
     assert state is not None
@@ -1194,11 +1215,29 @@ def test_attention_ts_context_contiguous_plan_reuses_dynamic_packed_requests(
     second_out = torch.empty_like(second[0])
     scale_softmax_log2 = torch.tensor((0.25,), dtype=torch.float32)
     output_scale = torch.tensor((0.5,), dtype=torch.float32)
+    first_stats = (
+        torch.empty((*first[0].shape[:-1], 2), dtype=torch.float32)
+        if store_softmax_stats
+        else None
+    )
+    second_stats = (
+        torch.empty((*second[0].shape[:-1], 2), dtype=torch.float32)
+        if store_softmax_stats
+        else None
+    )
+    with pytest.raises(ValueError, match="softmax_stats must be supplied exactly"):
+        wrapper.run(
+            *first,
+            out=first_out,
+            softmax_stats=None if store_softmax_stats else torch.empty(1),
+            validate=False,
+        )
 
-    wrapper.run(*first, out=first_out, validate=False)
+    wrapper.run(*first, out=first_out, softmax_stats=first_stats, validate=False)
     wrapper.run(
         *second,
         out=second_out,
+        softmax_stats=second_stats,
         scale_softmax_log2=scale_softmax_log2,
         output_scale=output_scale,
         validate=False,
@@ -1216,6 +1255,10 @@ def test_attention_ts_context_contiguous_plan_reuses_dynamic_packed_requests(
     assert launch_calls[0][5] is state.output_scale
     assert launch_calls[1][4] is scale_softmax_log2
     assert launch_calls[1][5] is output_scale
+    assert launch_calls[0][11] is first_stats
+    assert launch_calls[1][11] is second_stats
+    assert compile_calls[0][0].store_softmax_stats is store_softmax_stats
+    assert state.geometry.store_softmax_stats is store_softmax_stats
     assert state.geometry.uniform_packed_lengths is False
     assert state.geometry.packed_dense_k_mask is True
     for request_name in (
@@ -1433,7 +1476,9 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
     empty_i32 = torch.empty(1, dtype=torch.int32)
     wrapper = BatchPrefillTSWrapper()
     wrapper._plan_state = context_module._ContextPlanState(
-        geometry=SimpleNamespace(packed=False, mask_type="dense"),
+        geometry=SimpleNamespace(
+            packed=False, mask_type="dense", store_softmax_stats=False
+        ),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
         empty_i32=empty_i32,
@@ -1456,8 +1501,10 @@ def test_attention_ts_context_rejects_cta_starts_for_non_variable_mask() -> None
         )
 
 
+@pytest.mark.parametrize("store_softmax_stats", [False, True])
 def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
     monkeypatch,
+    store_softmax_stats,
 ) -> None:
     compile_calls = []
     launch_calls = []
@@ -1492,6 +1539,7 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
         head_dim=128,
         q_dtype=torch.float16,
         k_dtype=torch.float16,
+        store_softmax_stats=store_softmax_stats,
     )
     first_state = wrapper._plan_state
     assert first_state is not None
@@ -1515,6 +1563,19 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
     out = torch.empty_like(q)
     first_metadata = tuple(torch.empty(1) for _ in range(3))
     second_metadata = tuple(torch.empty(2) for _ in range(3))
+    first_stats = torch.empty((*q.shape[:-1], 2)) if store_softmax_stats else None
+    second_stats = torch.empty_like(first_stats) if store_softmax_stats else None
+
+    with pytest.raises(ValueError, match="softmax_stats must be supplied exactly"):
+        wrapper.run(
+            q,
+            k_cache,
+            v_cache,
+            *first_metadata,
+            out=out,
+            softmax_stats=None if store_softmax_stats else torch.empty(1),
+            validate=False,
+        )
 
     wrapper.run(
         q,
@@ -1522,6 +1583,7 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
         v_cache,
         *first_metadata,
         out=out,
+        softmax_stats=first_stats,
         validate=False,
     )
     wrapper.run(
@@ -1530,11 +1592,15 @@ def test_attention_ts_context_paged_plan_compiles_once_for_dynamic_metadata(
         v_cache,
         *second_metadata,
         out=out,
+        softmax_stats=second_stats,
         validate=False,
     )
 
     assert len(compile_calls) == 1
     assert len(launch_calls) == 2
+    assert compile_calls[0][0].store_softmax_stats is store_softmax_stats
+    assert launch_calls[0][9] is first_stats
+    assert launch_calls[1][9] is second_stats
     assert first_state is not None
     assert launch_calls[0][4] is first_state.scale_softmax_log2
     assert launch_calls[1][4] is first_state.scale_softmax_log2
@@ -1767,6 +1833,7 @@ def test_attention_ts_context_paged_run_validate_false_bypasses_validators(
             output_dtype=out.dtype,
             uniform_packed_lengths=True,
             has_q_offset=False,
+            store_softmax_stats=False,
         ),
         scale_softmax_log2=torch.empty(1),
         output_scale=torch.empty(1),
@@ -1821,7 +1888,9 @@ def test_attention_ts_context_paged_run_rejects_invalid_runtime_scale_values(
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(
-            device=torch.device("cpu"), output_dtype=torch.float32
+            device=torch.device("cpu"),
+            output_dtype=torch.float32,
+            store_softmax_stats=False,
         ),
         scale_softmax_log2=torch.tensor((0.25,), dtype=torch.float32),
         output_scale=torch.tensor((0.5,), dtype=torch.float32),
@@ -1867,7 +1936,9 @@ def test_attention_ts_context_paged_run_forwards_valid_scales(
     wrapper = BatchPrefillPagedTSWrapper()
     wrapper._plan_state = context_module._PagedContextPlanState(
         geometry=SimpleNamespace(
-            device=torch.device("cpu"), output_dtype=torch.float32
+            device=torch.device("cpu"),
+            output_dtype=torch.float32,
+            store_softmax_stats=False,
         ),
         scale_softmax_log2=plan_scale_softmax_log2,
         output_scale=plan_output_scale,
@@ -1906,6 +1977,7 @@ def test_attention_ts_context_paged_run_forwards_valid_scales(
         qo_indptr,
         block_tables,
         seq_lens_kv,
+        None,
     )
     assert all(
         actual is expected
@@ -5170,7 +5242,221 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     _assert_context_correct(graph_out, second)
 
 
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim,head_dim_vo", [(128, 128), (192, 128), (256, 256)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("out_dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_softmax_stats(
+    packed, causal, head_dim, head_dim_vo, dtype, out_dtype
+):
+    """Statistics use the natural-log maximum/denominator chunk-merge contract."""
+    torch.manual_seed(123)
+    q_lens = (65, 257) if packed else (257, 257)
+    k_lens = (129, 513) if packed else (513, 513)
+    heads = 6  # Kimi K3 full attention at TP16.
+    q = torch.randn(sum(q_lens), heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(k_lens), heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(
+        sum(k_lens), heads, head_dim_vo, device="cuda", dtype=torch.bfloat16
+    )
+    q, k, v = (tensor.to(dtype) for tensor in (q, k, v))
+    sm_scale = 0.75 / math.sqrt(head_dim)
+    output_scale = 0.625
+    expected_out, expected_stats = [], []
+    qi = ki = 0
+    for nq, nk in zip(q_lens, k_lens, strict=True):
+        scores = torch.einsum(
+            "qhd,khd->qhk", q[qi : qi + nq].float(), k[ki : ki + nk].float()
+        )
+        scores *= sm_scale
+        if causal:
+            masked = torch.arange(nk, device="cuda")[None, :] > (
+                nk - nq + torch.arange(nq, device="cuda")[:, None]
+            )
+            scores.masked_fill_(masked[:, None, :], -torch.inf)
+        maximum = scores.amax(-1)
+        denominator = (scores - maximum[..., None]).exp().sum(-1)
+        expected_stats.append(torch.stack((maximum, denominator), -1))
+        expected_out.append(
+            torch.einsum("qhk,khd->qhd", scores.softmax(-1), v[ki : ki + nk].float())
+            * output_scale
+        )
+        qi += nq
+        ki += nk
+    expected_out = torch.cat(expected_out)
+    expected_stats = torch.cat(expected_stats)
+    qo = ko = None
+    if packed:
+        qo = torch.tensor(_cumulative(q_lens), device="cuda", dtype=torch.int32)
+        ko = torch.tensor(_cumulative(k_lens), device="cuda", dtype=torch.int32)
+    else:
+        q = q.view(2, q_lens[0], heads, head_dim)
+        k = k.view(2, k_lens[0], heads, head_dim)
+        v = v.view(2, k_lens[0], heads, head_dim_vo)
+    out = torch.empty((*q.shape[:-1], head_dim_vo), device="cuda", dtype=out_dtype)
+    out_atol, out_rtol = (
+        (0.02, 0.08) if out_dtype == torch.float8_e4m3fn else (0.01, 0.02)
+    )
+    stats = torch.full((*q.shape[:-1], 2), torch.nan, device="cuda")
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=q.device,
+        batch_size=2,
+        max_seq_len_q=max(q_lens),
+        max_kv_len=max(k_lens),
+        num_qo_heads=heads,
+        num_kv_heads=heads,
+        head_dim=head_dim,
+        head_dim_vo=head_dim_vo,
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        out_dtype=out.dtype,
+        packed=packed,
+        mask_type="causal" if causal else "dense",
+        sm_scale=sm_scale,
+        output_scale=output_scale,
+        store_softmax_stats=True,
+    )
+    with pytest.raises(ValueError, match="softmax_stats must be supplied"):
+        wrapper.run(q, k, v, qo, ko, out=out)
+    wrapper.run(q, k, v, qo, ko, out=out, softmax_stats=stats)
+    torch.testing.assert_close(
+        stats.reshape_as(expected_stats), expected_stats, atol=2e-3, rtol=2e-3
+    )
+    torch.testing.assert_close(
+        out.float().reshape_as(expected_out), expected_out, atol=out_atol, rtol=out_rtol
+    )
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        wrapper.run(q, k, v, qo, ko, out=out, softmax_stats=stats, validate=False)
+    stats.fill_(torch.nan)
+    graph.replay()
+    torch.testing.assert_close(
+        stats.reshape_as(expected_stats), expected_stats, atol=2e-3, rtol=2e-3
+    )
+    stats.fill_(torch.nan)
+    one_shot = batch_prefill(
+        q,
+        k,
+        v,
+        qo_indptr=qo,
+        kv_indptr=ko,
+        mask_type="causal" if causal else "dense",
+        sm_scale=sm_scale,
+        output_scale=output_scale,
+        out_dtype=out.dtype,
+        out=out,
+        store_softmax_stats=True,
+        softmax_stats=stats,
+    )
+    assert one_shot is out
+    torch.testing.assert_close(
+        stats.reshape_as(expected_stats), expected_stats, atol=2e-3, rtol=2e-3
+    )
+    torch.testing.assert_close(
+        out.float().reshape_as(expected_out), expected_out, atol=out_atol, rtol=out_rtol
+    )
+
+
+@pytest.mark.parametrize("heads", [6, 96])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_mla_chunk_merge(heads, dtype):
+    """Merge a dense cached prefix with a causal suffix, for TP16 and DP heads."""
+    torch.manual_seed(314)
+    q = torch.randn(1, 129, heads, 192, device="cuda").to(dtype)
+    k = torch.randn(1, 385, heads, 192, device="cuda").to(dtype)
+    v = torch.randn(1, 385, heads, 128, device="cuda").to(dtype)
+    pieces = []
+    for start, end, mask in ((0, 128, "dense"), (128, 385, "causal")):
+        wrapper = BatchPrefillTSWrapper()
+        wrapper.plan(
+            device=q.device,
+            batch_size=1,
+            max_seq_len_q=129,
+            max_kv_len=end - start,
+            num_qo_heads=heads,
+            num_kv_heads=heads,
+            head_dim=192,
+            head_dim_vo=128,
+            q_dtype=dtype,
+            k_dtype=dtype,
+            out_dtype=torch.bfloat16,
+            mask_type=mask,
+            store_softmax_stats=True,
+        )
+        stats = torch.empty((*q.shape[:-1], 2), device="cuda")
+        out = wrapper.run(
+            q,
+            k[0, start:end].unsqueeze(0),
+            v[0, start:end].unsqueeze(0),
+            softmax_stats=stats,
+        )
+        pieces.append((out.float(), stats))
+    (o0, s0), (o1, s1) = pieces
+    maximum = torch.maximum(s0[..., 0], s1[..., 0])
+    w0 = s0[..., 1] * (s0[..., 0] - maximum).exp()
+    w1 = s1[..., 1] * (s1[..., 0] - maximum).exp()
+    merged = (o0 * w0[..., None] + o1 * w1[..., None]) / (w0 + w1)[..., None]
+    scores = torch.einsum("bqhd,bkhd->bqhk", q.float(), k.float()) / math.sqrt(192)
+    mask = torch.arange(385, device="cuda")[None, :] > (
+        256 + torch.arange(129, device="cuda")[:, None]
+    )
+    scores.masked_fill_(mask[None, :, None, :], -torch.inf)
+    expected = torch.einsum("bqhk,bkhd->bqhd", scores.softmax(-1), v.float())
+    # FP8 PV also rounds probabilities, unlike the FP32 reference. Bound both
+    # per-element error and aggregate relative RMS error over all 96 heads.
+    torch.testing.assert_close(
+        merged, expected, atol=0.02 if dtype == torch.float8_e4m3fn else 0.01, rtol=0.02
+    )
+    relative_rms = (merged - expected).square().mean() / expected.square().mean()
+    assert relative_rms.sqrt() < (0.03 if dtype == torch.float8_e4m3fn else 0.01)
+
+
 # Non-absorbed MLA: separate compact Q/K=192, V/O=128.
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_empty_mla_chunk(dtype):
+    """A batch member with no cached chunk must not read a neighbor's KV."""
+    torch.manual_seed(123)
+    q = torch.randn(130, 6, 192, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(257, 6, 192, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(257, 6, 128, device="cuda", dtype=torch.bfloat16)
+    q, k, v = (tensor.to(dtype) for tensor in (q, k, v))
+    qo = torch.tensor([0, 65, 130], dtype=torch.int32, device="cuda")
+    ko = torch.tensor([0, 0, 257], dtype=torch.int32, device="cuda")
+    stats = torch.empty(130, 6, 2, device="cuda")
+    wrapper = BatchPrefillTSWrapper()
+    wrapper.plan(
+        device=q.device,
+        batch_size=2,
+        max_seq_len_q=65,
+        max_kv_len=257,
+        num_qo_heads=6,
+        num_kv_heads=6,
+        head_dim=192,
+        head_dim_vo=128,
+        q_dtype=q.dtype,
+        k_dtype=k.dtype,
+        out_dtype=torch.bfloat16,
+        packed=True,
+        mask_type="dense",
+        store_softmax_stats=True,
+    )
+    out = wrapper.run(q, k, v, qo, ko, softmax_stats=stats)
+    torch.testing.assert_close(out[:65], torch.zeros_like(out[:65]), atol=0, rtol=0)
+    assert torch.isneginf(stats[:65, :, 0]).all()
+    assert (stats[:65, :, 1] == 0).all()
+    scores = torch.einsum("qhd,khd->qhk", q[65:].float(), k.float()) / math.sqrt(192)
+    expected = torch.einsum("qhk,khd->qhd", scores.softmax(-1), v.float())
+    torch.testing.assert_close(out[65:].float(), expected, atol=0.01, rtol=0.02)
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
