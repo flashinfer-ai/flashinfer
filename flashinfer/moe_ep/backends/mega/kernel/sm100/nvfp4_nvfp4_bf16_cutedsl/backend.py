@@ -138,7 +138,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             activation=k.activation,
             situ_beta=k.situ_beta,
             situ_linear_beta=k.situ_linear_beta,
-            apply_topk_in_fc1=k.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
             use_custom_finalize=self._uses_native_topk_reduce(fleet_params),
             combine_dtype=k.combine_dtype,
@@ -165,7 +165,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             and k.top_k == 6
             and not k.enable_in_kernel_fc2_reduce
             and k.combine_dtype == "bf16"
-            and k.apply_topk_in_fc1
+            and k.apply_routing_weights_before_fc2
         )
 
     def validate_forward(
@@ -460,7 +460,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             k.activation,
             k.situ_beta,
             k.situ_linear_beta,
-            k.apply_topk_in_fc1,
+            k.apply_routing_weights_before_fc2,
             k.enable_in_kernel_fc2_reduce,
             self._uses_native_topk_reduce(fleet_params),
             k.combine_dtype,

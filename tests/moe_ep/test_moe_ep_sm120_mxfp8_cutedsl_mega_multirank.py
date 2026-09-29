@@ -26,7 +26,7 @@ ownership, cross-rank combine), because both sides run the same CUDA kernel.
 gap with the sm100 twin's methodology: every rank all-gathers the actual
 staged MXFP8 payloads, routing, and plain weight legs, runs the
 multi-rank-native SM120 ``compute_megamoe_reference_mxfp8`` (which pins
-``gate_up_interleave=8`` and ``apply_topk_in_fc1=True``) on the global
+``gate_up_interleave=8`` and routing weights before FC2) on the global
 problem, and checks its own rank's slice against the real-EP kernel output.
 """
 
@@ -696,7 +696,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
     activations + routing + plain (pre-swizzle) weight legs (no reliance on
     cross-rank RNG determinism) and feeds the global problem to the SM120
     ``compute_megamoe_reference_mxfp8`` — which is multi-rank native and pins
-    ``gate_up_interleave=8`` / ``apply_topk_in_fc1=True`` internally.  Each
+    ``gate_up_interleave=8`` / routing weights before FC2 internally. Each
     rank asserts its own output slice within the term-magnitude band.
     """
     import torch
@@ -798,7 +798,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
 
         # Reassemble the global problem from the operands each rank staged;
         # the reference consumes (num_ranks, ...) stacks directly.  The SM120
-        # wrapper pins gate_up_interleave=8 and apply_topk_in_fc1=True itself.
+        # wrapper pins gate_up_interleave=8 and early routing-weight application.
         fc1_plain, fc1_sf, fc2_plain, fc2_sf = _plain_mxfp8_from_bf16(problem)
         combine_ref = compute_megamoe_reference_mxfp8(
             input_activation=_all_gather_stack(x_local),

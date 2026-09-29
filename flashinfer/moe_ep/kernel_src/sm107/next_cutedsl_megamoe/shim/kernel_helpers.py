@@ -405,7 +405,7 @@ def compute_megamoe_reference_sm107_block_scaled(
     quant_kind: str,
     local_expert_offset: int,
     gate_up_clamp: Optional[float],
-    apply_topk_at_fc1: bool,
+    apply_routing_weights_before_fc2: bool,
     num_tokens: Optional[int] = None,
     weight_scales_are_swizzled: bool = False,
     return_fp32: bool = False,
@@ -452,7 +452,7 @@ def compute_megamoe_reference_sm107_block_scaled(
             gate = gate.clamp(max=gate_up_clamp)
             up = up.clamp(min=-gate_up_clamp, max=gate_up_clamp)
         act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
-        if apply_topk_at_fc1:
+        if apply_routing_weights_before_fc2:
             act = act * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         # In-kernel FC2-input requantization (the FC1->FC2 wire format).
         act_q, act_sf = _quantize_fc2_wire(quant_kind, act)
@@ -464,7 +464,7 @@ def compute_megamoe_reference_sm107_block_scaled(
         act = act * scale_to_f32(act_sf).repeat_interleave(vec, dim=1)
         w2 = _dequant_weight_k_major(quant_kind, fc2_weight_k_major[local_e], sf2)
         term = (act @ w2.transpose(0, 1)).to(torch.bfloat16).to(torch.float32)
-        if not apply_topk_at_fc1:
+        if not apply_routing_weights_before_fc2:
             term = term * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         output.index_add_(0, src_t, term)
 

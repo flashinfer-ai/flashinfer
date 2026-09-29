@@ -927,7 +927,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
                 fc2_weight_sf=_all_gather_stack(fc2_sf),
                 ab_dtype=torch.float8_e4m3fn,
                 gate_up_clamp=problem["gate_up_clamp"],
-                apply_topk_in_fc1=True,
+                apply_routing_weights_before_fc2=True,
             )
             # The topk weight is already folded before the fc1-out round-trip, so
             # the per-topk terms reduce with a plain sum; compare this rank's slice.

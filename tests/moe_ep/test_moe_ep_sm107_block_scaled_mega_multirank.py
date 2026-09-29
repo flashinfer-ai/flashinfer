@@ -140,7 +140,13 @@ def _megakernel_config(quant_kind: str, **overrides):
 
 
 def _torch_oracle(
-    x_rank, topk_ids_rank, topk_weights_rank, w13, w2, quant_kind, apply_topk_at_fc1
+    x_rank,
+    topk_ids_rank,
+    topk_weights_rank,
+    w13,
+    w2,
+    quant_kind,
+    apply_routing_weights_before_fc2,
 ):
     """Full-bank oracle for one rank's tokens over the layer's exact quant path."""
     if x_rank.shape[0] == 0:
@@ -180,7 +186,7 @@ def _torch_oracle(
         quant_kind=quant_kind,
         local_expert_offset=0,
         gate_up_clamp=None,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
     )
 
 
@@ -231,7 +237,7 @@ def test_sm107_preprocess_mega_weights_from_bf16(quant_kind):
 @pytest.mark.gpu_2
 @pytest.mark.arch_rubin
 @pytest.mark.parametrize(
-    "quant_kind, in_kernel_fc2_reduce, apply_topk_in_fc1",
+    "quant_kind, in_kernel_fc2_reduce, apply_routing_weights_before_fc2",
     [
         (kind, ikr, early)
         for kind in ("mxfp8_e4m3", "mxfp8_e5m2", "nvfp4")
@@ -239,7 +245,7 @@ def test_sm107_preprocess_mega_weights_from_bf16(quant_kind):
     ],
 )
 def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
-    quant_kind, in_kernel_fc2_reduce, apply_topk_in_fc1
+    quant_kind, in_kernel_fc2_reduce, apply_routing_weights_before_fc2
 ):
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -255,7 +261,7 @@ def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
     cfg = _megakernel_config(
         quant_kind,
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
     )
     kernel = create_mega_kernel(cfg)
     runtime = bootstrap_moe_ep_runtime(
@@ -300,7 +306,7 @@ def test_moe_ep_sm107_block_scaled_mega_multirank_torch_oracle(
                 w13,
                 w2,
                 quant_kind,
-                apply_topk_at_fc1=cfg.apply_topk_in_fc1,
+                apply_routing_weights_before_fc2=(cfg.apply_routing_weights_before_fc2),
             )[:live]
             yk = y[:live].to(torch.float32)
             yr = y_ref.to(torch.float32)

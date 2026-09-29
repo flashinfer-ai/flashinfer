@@ -225,11 +225,10 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
         if skip_topk_reduce and (
             in_kernel_fc2_reduce
             or combine_format.is_quantized
-            or not apply_topk_in_fc1
         ):
             raise ValueError(
                 "skip_topk_reduce requires in_kernel_fc2_reduce=False, "
-                "a bf16 combine format, and apply_topk_in_fc1=True."
+                "a bf16 combine format."
             )
         if (
             combine_format.act_dtype is cutlass.Float4E2M1FN

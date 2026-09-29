@@ -137,12 +137,9 @@ class Sm100MegaMoEBf16Kernel(Sm100SwigluBf16Fc12Kernel):
                 "the in-kernel reduction collapses the topk axis before a "
                 "separate reducer can apply the routing weights."
             )
-        if skip_topk_reduce and (
-            fc2_in_kernel_topk_reduce or not apply_topk_in_fc1
-        ):
+        if skip_topk_reduce and fc2_in_kernel_topk_reduce:
             raise ValueError(
-                "skip_topk_reduce requires fc2_in_kernel_topk_reduce=False "
-                "and apply_topk_in_fc1=True."
+                "skip_topk_reduce and fc2_in_kernel_topk_reduce are mutually exclusive."
             )
         if token_back_mode not in (
             "epi_warps", "standalone_warps", "reuse_dispatch_warps",

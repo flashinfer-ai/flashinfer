@@ -48,7 +48,7 @@ class MegaMoEBf16Config:
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
     gate_up_clamp: Optional[float] = None
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     enable_iket: bool = False
 
     def __post_init__(self) -> None:
@@ -179,7 +179,7 @@ class MegaMoEBf16Frontend:
             c.in_kernel_fc2_reduce,
             c.token_back_mode,
             self._gate_up_clamp,
-            c.apply_topk_in_fc1,
+            c.apply_routing_weights_before_fc2,
             c.enable_iket,
         )
 
@@ -228,7 +228,7 @@ class MegaMoEBf16Frontend:
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
             gate_up_clamp=self._gate_up_clamp,
-            apply_topk_in_fc1=c.apply_topk_in_fc1,
+            apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
         )
         local_bytes, shared_bytes = kernel.get_workspace_sizes()
         local_workspace = torch.zeros(local_bytes, dtype=torch.uint8, device="cuda")

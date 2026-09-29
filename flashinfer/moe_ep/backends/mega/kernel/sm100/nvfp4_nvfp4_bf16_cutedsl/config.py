@@ -32,13 +32,14 @@ class Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig:
     situ_beta: float | None = None
     situ_linear_beta: float | None = None
     fast_math: bool = True
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     # Enables in_kernel_fc2_reduce, knobs may still disable this if it is faster
     # In-flight top-k combine: cross-rank REDG atomic-add collapses the combine
     # as peer data arrives (no per-topk staging / explicit tail reduce).
     # ~1-2% faster and removes the multi-GB combine staging from the symmetric
-    # workspace.  Requires apply_topk_in_fc1=True and combine_dtype="bf16";
-    # accumulation order is nondeterministic (tolerance-compare outputs).
+    # workspace.  Requires apply_routing_weights_before_fc2=True and
+    # combine_dtype="bf16"; accumulation order is nondeterministic
+    # (tolerance-compare outputs).
     enable_in_kernel_fc2_reduce: bool = False
     # Cross-rank combine wire format: "bf16" (exact), "mxfp8" (2x less combine
     # traffic), "nvfp4" (4x less).  Quantized wires trade accuracy for NVLink

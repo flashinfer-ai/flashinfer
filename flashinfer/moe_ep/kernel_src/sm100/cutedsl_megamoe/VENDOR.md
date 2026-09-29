@@ -6,7 +6,7 @@ replace, what to audit) lives in `SKILL.md`.
 
 ## Upstream
 
-- **Vendored commit**: `1e6950b51e2cdc481572e309390b9a904003ae42`
+- **Vendored commit**: `4d80fece66fc5b5e8c94026a33f0854d3a01afe9`
 - **Last synced**: 2026-09-29
 - **Vendored subset**: the six kernel packages only (`common/`, `src/`,
   `moe_bf16_glu/`, `moe_mxfp8_glu/`, `moe_mxfp8_bf16_glu/`,

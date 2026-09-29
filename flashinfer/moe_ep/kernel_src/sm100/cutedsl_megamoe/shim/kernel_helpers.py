@@ -93,24 +93,63 @@ _LAZY = {
     ),
     "_make_fp8_tensor": ("moe_mxfp8_glu.mega_runner", "_make_fp8_tensor"),
     "_make_e8m0_scale_tensor": ("moe_mxfp8_glu.mega_runner", "_make_e8m0_scale_tensor"),
-    "compute_megamoe_reference_mxfp8": (
-        "moe_mxfp8_glu.mega_reference_mxfp8",
-        "compute_megamoe_reference_mxfp8",
-    ),
-    "compute_megamoe_reference_bf16_mxfp8": (
-        "moe_mxfp8_bf16_glu.mega_reference_mxfp8_bf16",
-        "compute_megamoe_reference_mxfp8_bf16",
-    ),
     "CombineFormat": ("src.token_comm", "CombineFormat"),
     "combine_roundtrip_to_fp32": (
         "moe_nvfp4_swapab.mega_reference",
         "combine_roundtrip_to_fp32",
     ),
-    "compute_megamoe_reference_bf16": (
+}
+
+
+def _reference_with_routing_weight_name(
+    module_name,
+    function_name,
+    args,
+    kwargs,
+    apply_routing_weights_before_fc2,
+):
+    function = getattr(importlib.import_module(module_name), function_name)
+    return function(
+        *args,
+        apply_topk_in_fc1=apply_routing_weights_before_fc2,
+        **kwargs,
+    )
+
+
+def compute_megamoe_reference_mxfp8(
+    *args, apply_routing_weights_before_fc2=False, **kwargs
+):
+    return _reference_with_routing_weight_name(
+        "moe_mxfp8_glu.mega_reference_mxfp8",
+        "compute_megamoe_reference_mxfp8",
+        args,
+        kwargs,
+        apply_routing_weights_before_fc2,
+    )
+
+
+def compute_megamoe_reference_bf16_mxfp8(
+    *args, apply_routing_weights_before_fc2=False, **kwargs
+):
+    return _reference_with_routing_weight_name(
+        "moe_mxfp8_bf16_glu.mega_reference_mxfp8_bf16",
+        "compute_megamoe_reference_mxfp8_bf16",
+        args,
+        kwargs,
+        apply_routing_weights_before_fc2,
+    )
+
+
+def compute_megamoe_reference_bf16(
+    *args, apply_routing_weights_before_fc2=False, **kwargs
+):
+    return _reference_with_routing_weight_name(
         "moe_bf16_glu.mega_reference_bf16",
         "compute_megamoe_reference",
-    ),
-}
+        args,
+        kwargs,
+        apply_routing_weights_before_fc2,
+    )
 
 
 def __getattr__(name):  # PEP 562: keep cutlass out of the import-time path

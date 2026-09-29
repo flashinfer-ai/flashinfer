@@ -48,7 +48,7 @@ class MegaMoEBf16Nvfp4Config:
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
     gate_up_clamp: Optional[float] = None
-    apply_topk_in_fc1: bool = False
+    apply_routing_weights_before_fc2: bool = False
     enable_iket: bool = False
     swiglu_alpha: Optional[float] = None
     swiglu_beta: Optional[float] = None
@@ -202,7 +202,9 @@ class MegaMoEBf16Nvfp4Frontend:
             {
                 **knobs,
                 "gate_up_clamp": self.config.gate_up_clamp,
-                "apply_topk_in_fc1": self.config.apply_topk_in_fc1,
+                "apply_routing_weights_before_fc2": (
+                    self.config.apply_routing_weights_before_fc2
+                ),
                 "enable_in_kernel_fc2_reduce": self.config.enable_in_kernel_fc2_reduce,
                 "swiglu_alpha": self.config.swiglu_alpha,
                 "swiglu_beta": self.config.swiglu_beta,
@@ -275,7 +277,7 @@ class MegaMoEBf16Nvfp4Frontend:
                 epi_flag_batch=c.epi_flag_batch,
                 flag_batch=c.flag_batch,
                 gate_up_clamp=c.gate_up_clamp,
-                apply_topk_in_fc1=c.apply_topk_in_fc1,
+                apply_routing_weights_before_fc2=(c.apply_routing_weights_before_fc2),
                 swiglu_alpha=c.swiglu_alpha,
                 swiglu_beta=c.swiglu_beta,
                 situ_beta=c.situ_beta,
@@ -662,7 +664,7 @@ class MegaMoEBf16Nvfp4Frontend:
             compact(combined),
             None,
             compact(output),
-            None if self.config.apply_topk_in_fc1 else compact(scores),
+            (None if self.config.apply_routing_weights_before_fc2 else compact(scores)),
             cuda.CUstream(torch.cuda.current_stream().cuda_stream),
         )
         if self._reduce is None:
@@ -734,7 +736,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     enable_in_kernel_fc2_reduce: bool = False,
-    apply_topk_in_fc1: bool = False,
+    apply_routing_weights_before_fc2: bool = False,
     fc1_alpha: torch.Tensor | int | float | None = None,
     fc2_alpha: torch.Tensor | int | float | None = None,
     token_back_mode: Optional[
@@ -798,7 +800,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
             max_tokens=num_max_tokens,
             combine_dtype="bf16",
             enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
-            apply_topk_in_fc1=apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=(apply_routing_weights_before_fc2),
         )
     else:
         resolved_knobs = {}
@@ -808,7 +810,7 @@ def get_symm_buffer_for_bf16_nvfp4_mega_moe(
         **(knobs or {}),
         "gate_up_clamp": clamp,
         "enable_in_kernel_fc2_reduce": enable_in_kernel_fc2_reduce,
-        "apply_topk_in_fc1": apply_topk_in_fc1,
+        "apply_routing_weights_before_fc2": apply_routing_weights_before_fc2,
         "swiglu_alpha": swiglu_alpha,
         "swiglu_beta": swiglu_beta,
         "activation": activation,

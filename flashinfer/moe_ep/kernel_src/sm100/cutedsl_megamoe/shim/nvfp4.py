@@ -109,7 +109,7 @@ class MegaMoENvfp4Config:
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
     ] = "epi_warps"
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16"
-    apply_topk_in_fc1: bool = True
+    apply_routing_weights_before_fc2: bool = True
     activation: Literal["swiglu", "situ"] = "swiglu"
     situ_beta: Optional[float] = None
     situ_linear_beta: Optional[float] = None
@@ -198,22 +198,28 @@ class MegaMoENvfp4Config:
             raise ValueError(
                 "in_kernel_fc2_reduce is selected but enable_in_kernel_fc2_reduce is False"
             )
-        if self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1:
+        if self.in_kernel_fc2_reduce and not self.apply_routing_weights_before_fc2:
             # Mirrors the kernel ctor check; fail at config build, not compile.
             raise ValueError(
-                "in_kernel_fc2_reduce requires apply_topk_in_fc1=True; the REDG "
-                "path can only atomic-add terms whose topk score was already "
-                "absorbed before fc2."
+                "in_kernel_fc2_reduce requires "
+                "apply_routing_weights_before_fc2=True; the REDG path can only "
+                "atomic-add terms whose routing weight was already absorbed "
+                "before fc2."
             )
         if self.use_custom_finalize and (
-            self.in_kernel_fc2_reduce
-            or self.combine_dtype != "bf16"
-            or not self.apply_topk_in_fc1
+            self.in_kernel_fc2_reduce or self.combine_dtype != "bf16"
         ):
             raise ValueError(
                 "use_custom_finalize requires in_kernel_fc2_reduce=False, "
-                "combine_dtype='bf16', and apply_topk_in_fc1=True."
+                "and combine_dtype='bf16'."
             )
+        if self.use_custom_finalize and not self.apply_routing_weights_before_fc2:
+            raise ValueError(
+                "The current custom finalize does not implement final weight "
+                "scales. use_custom_finalize=True requires "
+                "apply_routing_weights_before_fc2=True."
+            )
+
         if self.group_hint is not None and self.group_hint <= 0:
             raise ValueError(
                 f"group_hint must be positive when set, got {self.group_hint}."
@@ -539,7 +545,7 @@ class MegaMoENvfp4Frontend:
             c.topk_reduce_persistent,
             c.token_back_mode,
             c.combine_dtype,
-            c.apply_topk_in_fc1,
+            c.apply_routing_weights_before_fc2,
             c.activation,
             c.situ_beta,
             c.situ_linear_beta,
@@ -605,7 +611,7 @@ class MegaMoENvfp4Frontend:
             skip_topk_reduce=c.use_custom_finalize,
             topk_reduce_persistent=c.topk_reduce_persistent,
             token_back_mode=c.token_back_mode,
-            apply_topk_in_fc1=c.apply_topk_in_fc1,
+            apply_topk_in_fc1=c.apply_routing_weights_before_fc2,
             gate_up_clamp=self._gate_up_clamp,
             swiglu_alpha=c.swiglu_alpha,
             swiglu_beta=c.swiglu_beta,
@@ -1134,7 +1140,7 @@ def get_symm_buffer_for_mega_moe(
     activation: Literal["swiglu", "situ"] = "swiglu",
     situ_beta: Optional[float] = None,
     situ_linear_beta: Optional[float] = None,
-    apply_topk_in_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
     enable_in_kernel_fc2_reduce: bool = False,
     use_custom_finalize: bool = False,
     topk_reduce_persistent: bool = False,
@@ -1161,15 +1167,16 @@ def get_symm_buffer_for_mega_moe(
     ``situ_beta``. ``situ_linear_beta`` optionally bounds the up branch with
     ``linear_beta * tanh(up / linear_beta)``.
 
-    ``apply_topk_in_fc1`` mirrors ``mega_runner``'s
+    ``apply_routing_weights_before_fc2`` mirrors ``mega_runner``'s
     ``ref_compute_graph == "deepgemm"`` behaviour when ``True`` (default).
 
     ``in_kernel_fc2_reduce`` collapses the top-k combine in flight via
     cross-rank REDG atomic-add instead of staging the per-topk ``(T, K, H)``
     tensor + explicit tail reduce: ~1-2% faster end to end and the multi-GB
     internal combine staging disappears from ``shared_workspace``.  Requires
-    ``apply_topk_in_fc1=True`` and a bf16 combine wire; the accumulation order
-    is nondeterministic (compare with a tolerance, not bit-exact).
+    ``apply_routing_weights_before_fc2=True`` and a bf16 combine wire; the
+    accumulation order is nondeterministic (compare with a tolerance, not
+    bit-exact).
 
     ``topk_reduce_persistent`` keeps the standalone top-k reducer's grid fixed
     across token counts. It is ignored when that reducer is not used.
@@ -1237,7 +1244,7 @@ def get_symm_buffer_for_mega_moe(
         activation=activation,
         situ_beta=situ_beta,
         situ_linear_beta=situ_linear_beta,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
         use_custom_finalize=use_custom_finalize,
         topk_reduce_persistent=topk_reduce_persistent,
