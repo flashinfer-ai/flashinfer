@@ -345,10 +345,12 @@ MoE-TP shard, whose rank sees eight times the local rows. Both follow
 ``swapab_max_tokens``/``SWAPAB_MAX_TOKENS``. On an expert-parallel rank
 (full 3072-wide shard) GEMM2 streams its K in 4-K-block (128-wide) stages
 at every token count (a deeper pipeline: 6-10 us for the single-group case
-up to T=256 and 2-9 us at T=512/1024 against one 384-wide stage), promoted
-to 8-K-block stages up to T=256 by the dependent-side prefetch described
-below (``SWAP_GEMM2_FULL_RING_MAX_TOKENS``); the 384-wide MoE-TP shard
-always uses one stage. On an expert-parallel rank the dense
+and 4-9 us at T=256..1024 against one 384-wide stage), promoted to
+8-K-block stages up to T=128 (8- and 16-row tiles) by the dependent-side
+prefetch described below (``SWAP_GEMM2_FULL_RING_MAX_TOKENS``); the 32-row
+tiles from T=256 up keep the 4-block stages (nine stages in flight beat
+four 256-wide ones by 4-8 us at T=256, while at T=128 the 4-block form is
+0-4 us slower); the 384-wide MoE-TP shard always uses one stage. On an expert-parallel rank the dense
 path is faster above T=1024.
 
 From T=1025 to T=2048 the MoE-TP shard uses the hybrid form
@@ -475,11 +477,10 @@ GEMM1's output (the gather warps, plus the TMA warp when the row tile is
 TMA-fed); its scheduler reads the routing tables and its TMA warp streams
 the weight stages at once, so GEMM2's tile CTAs take the SMs GEMM1's
 tile-less CTAs leave and hold their weights before GEMM1 ends. The
-decode-class GEMM2 (short 4-block stages) takes 8-block stages up to T=256
+decode-class GEMM2 (short 4-block stages) takes 8-block stages up to T=128
 (``SWAP_GEMM2_FULL_RING_MAX_TOKENS``) when the stage ring then covers the
-whole K (K = 3072: 12 stages of 256), so the whole tile is resident; above
-that the experts hold several row groups each and the 4-block pipeline is
-faster than the full ring. Measured on B300 (same GPU, paired, FP64
+whole K (K = 3072: 12 stages of 256), so the whole tile is resident; from
+T=256 up (32-row tiles) the 4-block pipeline is faster than the full ring. Measured on B300 (same GPU, paired, FP64
 identical): EP=8 decode rows 1.04-1.05 x (22.4-23.0 -> 21.5-21.9 us),
 MoE-TP decode 1.00-1.03 x, EP=8 ``empty`` T=128 1.03 x and T=256..1024
 1.01 x; every other row 0.997-1.007 x. Every other input of GEMM2 (tables,

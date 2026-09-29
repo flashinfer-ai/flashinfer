@@ -74,11 +74,13 @@ SWAP_TWO_STAGE_MAX_SHARD = int(os.environ.get("SWAPAB_TWO_STAGE_MAX_SHARD", "512
 # Largest token count whose swap-AB GEMM2 on a wide (expert-parallel) shard
 # takes the 8-K-block stages of the dependent-side prefetch (the stage ring
 # then covers the whole K, so a tile's weights are resident before GEMM1
-# ends). Above it every expert holds several row groups and the shard streams
-# 4-K-block (128-wide) stages: the deeper pipeline beat both the 8-block
-# stages and the single 384-wide stage at T=512/1024 (B300 EP8, 2-9 us).
+# ends): the 8- and 16-row tiles of the decode rows and T=128. From T=256 up
+# (32-row tiles) the shard streams 4-K-block (128-wide) stages: nine stages
+# in flight instead of four beat both the 8-block stages and the single
+# 384-wide stage (B300 EP8: T=256 4-8 us, T=512/1024 4-9 us; at T=128 the
+# 4-block form is 0-4 us slower).
 SWAP_GEMM2_FULL_RING_MAX_TOKENS = int(
-    os.environ.get("SWAPAB_GEMM2_FULL_RING_MAX_TOKENS", "256")
+    os.environ.get("SWAPAB_GEMM2_FULL_RING_MAX_TOKENS", "128")
 )
 # L2 eviction policy for the dense grouped GEMMs' weight TMA loads (CUTLASS
 # SM90 TMA cache-hint encodings). Weights stream once per token tile while the
@@ -1412,7 +1414,7 @@ class Mxfp4MoESwapAbPlan:
         with torch.cuda.device(self.device):
             # Short GEMM2 stages (4 K blocks) pipeline deeper on the wide
             # expert-parallel shard at every token count: 6-10 us while every
-            # expert fits one row group (T <= 256) and 2-9 us at T=512/1024
+            # expert fits one row group (T <= 256) and 4-9 us at T=256..1024
             # against the single 384-wide stage (B300 EP8). The 384-wide
             # single stage of a narrow MoE-TP shard stays (one stage is its
             # whole K).
@@ -1426,8 +1428,9 @@ class Mxfp4MoESwapAbPlan:
                 # weight tile is resident before GEMM1 ends only if the stage
                 # ring covers K; 8-block (256-wide) stages do for K = 3072
                 # (12 stages). B300 EP8 decode rows: 1.02-1.03x -> 1.04-1.05x.
-                # Above SWAP_GEMM2_FULL_RING_MAX_TOKENS the experts hold
-                # several row groups each and the 4-block pipeline wins.
+                # Above SWAP_GEMM2_FULL_RING_MAX_TOKENS (32-row tiles) the
+                # 4-block pipeline wins: nine 128-wide stages in flight
+                # against four 256-wide ones.
                 if (
                     num_tokens <= SWAP_GEMM2_FULL_RING_MAX_TOKENS
                     and self._dep_prefetch
