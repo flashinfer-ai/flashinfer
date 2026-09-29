@@ -154,11 +154,18 @@ independent of packed/fixed Q and must match workspace sizing and planning.
 metadata plus disjoint attention scratch. The model's per-request
 `max_seq_len_kv`, rather than the global physical page-pool capacity, bounds
 the plan. Each group and pattern head forms at most
-`G * (block_topk + 1)` selected/tail candidates, sorts and unique-reduces
-them in one CTA, and ORs per-query membership bits. It processes only candidate
-IDs, with no full-context bitmap or scan. Shared patterns prepare one row per
+`G * (block_topk + 1)` selected/tail candidates and ORs per-query membership
+bits in one CTA. A shared byte/bit map forms the sorted union when its footprint
+fits without adding CTA waves; otherwise bounded radix sort is used. This
+temporary map is sized by model context, not physical cache capacity, and adds
+no caller-owned workspace. Shared patterns prepare one row per
 group; independent patterns prepare one per group and KV head. G1 resolves
 selected blocks and the causal tail inside attention, without a metadata launch.
+
+Eligible prepared FP8 G2–G8/page-4 Keeps routes store query-oriented membership
+words internally, with eight query slots and complete tail tiles reserved in
+the workspace. Unused slots and tail bits are zero. Standalone metadata outputs
+retain four membership bytes per Int32 word; the public plan/run API is unchanged.
 
 Nonsplit sparse grids larger than one service wave use the common CLC
 persistent scheduler. Each work item resolves its own request, query group and
@@ -189,6 +196,8 @@ The convenience API infers physical page size from `paged_kv_cache`; only
 the prepared wrapper's `plan` takes `page_size` explicitly.
 
 On SM90 and newer, the combined route-builder and attention launch use PDL.
+Metadata releases at entry so the attention prologue can overlap it; the
+attention dependency wait still covers all metadata stores.
 Attention initializes its independent resources before acquiring immediately
 ahead of the first metadata-dependent read. Split-KV attention releases its
 reducer only after producer completion and TMEM teardown; the reducer

@@ -52,6 +52,7 @@ from .fmha_decode_constants import (
     MAX_WARP_GROUPS,
     MIN_LOOP_ITERS_PER_SPLIT,
     PARALLEL_REDUCTION_BYTES_PER_SLICE,
+    PARALLEL_REDUCTION_SLOT_LANES,
     PARALLEL_REDUCTION_THREADS_PER_CTA,
     PARTIAL_O_ELEMENT_BYTES,
     PARTIAL_STATS_VALUES_PER_ROW,
@@ -129,7 +130,8 @@ KV_TILE_256_SOFTMAX_TASK_REGISTERS = 152
 KV_TILE_256_CORRECTION_TASK_REGISTERS = 152
 
 # Sparse route unions reuse the dense Keeps staging: D64/D128 use two
-# unstaged K/V instances; D256 uses one instance with D128 head bands.
+# unstaged K/V instances; D256 uses one instance with D128 bands or a full
+# D256 FP8 stage assembled from 128-byte swizzled chunks.
 _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
     (
         dtype,
@@ -149,6 +151,10 @@ _Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES = {
         (Float8E4M3FN, BFloat16),
     )
 }
+_Q_TOKEN_KV_BLOCK_SPARSE_GROUPED_KEEPS_PROFILES.update(
+    (Float8E4M3FN, Float8E4M3FN, Float8E4M3FN, output, 256, 256, 1, 1)
+    for output in (Float16, BFloat16)
+)
 
 _KV_TILE_256_PHYSICAL_DEFAULTS: Mapping[str, ConfigValue] = {
     "tmem_s_cols": 128,
@@ -548,6 +554,9 @@ class FmhaDecodeConfig:
     # sparse routes consume query membership from a separate packed-word table;
     # Q1 uses the same scattered page route without membership masking.
     use_q_token_kv_block_sparse_route: bool = False
+    # Private prepared-plan layout: eight query words per 32 page-4 IDs.
+    # Legacy public membership tensors keep the default page-byte encoding.
+    query_major_memberships: bool = False
     # None preserves each sparse family's default in raw/static configs too.
     share_pattern_across_kv_heads: bool | None = None
     # Allow the attention grid to acquire a programmatic launch dependency.
@@ -754,6 +763,19 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def supports_query_major_memberships(self) -> bool:
+        """Whether this CTA can read eight-slot/page-4 query masks for G2..G8."""
+        return (
+            self.uses_q_token_kv_block_sparse_page_membership
+            and self.use_keeps_mma_ab
+            and 2 <= self.max_seq_len_q <= 8
+            and self.has_single_q_cta
+            and self.num_tokens_per_page == 4
+            and self.tile_size_kv == 128
+            and self.tile_size_q in (64, 128)
+        )
+
+    @property
     def uses_held_encoded_locator_window(self) -> bool:
         """Whether encoded paging keeps the complete CTA route in SMEM."""
 
@@ -785,11 +807,19 @@ class FmhaDecodeConfig:
 
     @property
     def softmax_task_num_registers(self) -> int | None:
+        """Softmax's preferred grant, capped by the CTA's initial register pool.
+
+        Dense and sparse Keeps kernels share this rule. Full 128-score rows
+        can use 232 registers only when the pool permits; active producer and
+        correction grants are unchanged. KV256 keeps its separate budget.
+        """
         if not self.uses_task_register_reallocation:
             return None
-        preferred = (
-            KV_TILE_256_SOFTMAX_TASK_REGISTERS if self.tile_size_kv == 256 else 184
-        )
+        # Complete Q128 rows keep 128 scores live through masking and P
+        # conversion. Give them headroom without taking registers from TMA.
+        preferred = 232 if self.softmax_score_fragment_regs == 128 else 184
+        if self.tile_size_kv == 256:
+            preferred = KV_TILE_256_SOFTMAX_TASK_REGISTERS
         # setmaxnreg redistributes the CTA's initial register pool, not the
         # whole SM register file. Complete 8-register/thread quanta leave
         # unused SM registers when a CTA has more than 16 warps.
@@ -807,6 +837,14 @@ class FmhaDecodeConfig:
             - self.correction_num_warps * correction_regs
             - other_warps * producer_regs
         )
+        # Only whole padding warpgroups may donate independently. Padding
+        # beside active tasks must execute the same setmaxnreg as its peers.
+        for wg_idx in range(MAX_WARP_GROUPS):
+            padding_warps = getattr(self, f"wg{wg_idx}_padding_num_warps")
+            if padding_warps == 4:
+                padding_regs = self.padding_task_num_registers(wg_idx * 4, 4)
+                assert padding_regs is not None
+                available += padding_warps * (producer_regs - padding_regs)
         return min(preferred, available // (softmax_warps * 8) * 8)
 
     @property
@@ -818,6 +856,21 @@ class FmhaDecodeConfig:
     @property
     def mma_load_task_num_registers(self) -> int | None:
         return 56 if self.uses_task_register_reallocation else None
+
+    def padding_task_num_registers(self, warp_idx: int, num_warps: int) -> int | None:
+        """Release unused registers only from complete padding warpgroups."""
+        if not self.uses_task_register_reallocation:
+            return None
+        if (
+            self.tile_size_kv != 256
+            and self.softmax_score_fragment_regs == 128
+            and warp_idx % 4 == 0
+            and num_warps == 4
+        ):
+            # setmaxnreg's minimum legal grant; no attention work runs here.
+            # Smaller score fragments keep their existing allocation.
+            return 24
+        return self.mma_load_task_num_registers
 
     # ------------------------------------------------------------------
     # SMEM allocation alignment
@@ -912,6 +965,23 @@ class FmhaDecodeConfig:
     def num_head_dim_stages_kv(self) -> int:
         """Number of K/V head-dim stages needed to cover headdim."""
         return (self.headdim + self.head_dim_kv_stage - 1) // self.head_dim_kv_stage
+
+    @property
+    def uses_2d_flat_kv_tma(self) -> bool:
+        """Whether warp-owned issuing can omit the flat map's singleton axes."""
+        return (
+            self.use_flat_native_kv_tma
+            and (self.tile_size_kv // self.num_tokens_per_page) % self.load_num_warps
+            == 0
+            and (
+                self.k_dtype == self.v_dtype == BFloat16
+                or (
+                    self.use_fp8_qkv
+                    and self.use_persistent_scheduler
+                    and self.head_dim_kv_stage // 128 > 1
+                )
+            )
+        )
 
     @property
     def tmem_o_cols_per_head_dim_stage(self) -> int:
@@ -1122,6 +1192,11 @@ class FmhaDecodeConfig:
     # page-four table:
     # locator = physical_page * subpages_per_storage_page + subpage.
     storage_tokens_per_page: int = 0
+    # Prepared compact caches can view physical pages and heads as tensor rows.
+    # The paired metadata plan selects the corresponding locator head span.
+    use_flat_native_kv_tma: bool = False
+    # Prepared locators count the complete physical head span between pages.
+    flat_native_kv_num_heads: int = 1
     # Maximum number of pages per (batch, head_kv) — sizes the page index
     # table stride.
     max_num_pages_per_seq_kv: int = 1
@@ -1210,7 +1285,7 @@ class FmhaDecodeConfig:
             return 1
         return {
             8: 1,
-            16: 2,
+            16: 1,
             32: 4,
             64: 8,
             128: 16,
@@ -1227,11 +1302,22 @@ class FmhaDecodeConfig:
         )
 
     @property
+    def parallel_reduction_slot_lanes(self) -> int:
+        """Share a single-CTA fragment's split slots across adjacent lanes."""
+        if (
+            self.use_compact_parallel_reduction
+            or self.parallel_reduction_cluster_size != 1
+            or self.parallel_reduction_splits_per_cta % PARALLEL_REDUCTION_SLOT_LANES
+        ):
+            return 1
+        return PARALLEL_REDUCTION_SLOT_LANES
+
+    @property
     def parallel_reduction_threads_per_cta(self) -> int:
         """Return the thread count selected by the reducer schedule."""
         if self.use_compact_parallel_reduction:
             return REDUCTION_THREADS_PER_CTA
-        return PARALLEL_REDUCTION_THREADS_PER_CTA
+        return PARALLEL_REDUCTION_THREADS_PER_CTA * self.parallel_reduction_slot_lanes
 
     @property
     def parallel_reduction_bytes_per_slice(self) -> int:
@@ -1849,7 +1935,14 @@ class FmhaDecodeConfig:
         return (
             self.use_keeps_mma_ab
             and self.headdim == 256
-            and self.head_dim_per_stage_kv == 128
+            and (
+                self.head_dim_per_stage_kv == 128
+                or (
+                    self.head_dim_per_stage_kv == 256
+                    and self.use_fp8_qkv
+                    and self.uses_scattered_page_route
+                )
+            )
             and self.num_insts_kv == 1
             and self.o_stages == 1
         )
@@ -3947,7 +4040,7 @@ def _validate_profile_support(
         padded_splits = cfg.parallel_reduction_padded_splits
         default_cluster_size = {
             8: 1,
-            16: 2,
+            16: 1,
             32: 4,
             64: 8,
             128: 16,
@@ -3960,7 +4053,7 @@ def _validate_profile_support(
         clustered_topology_supported = (
             not cfg.use_compact_parallel_reduction
             and default_cluster_size == cluster_size
-            and splits_per_cta in (2, 4, 8)
+            and splits_per_cta in (2, 4, 8, 16)
             and cluster_size * splits_per_cta == padded_splits
         )
         if not (
@@ -4040,22 +4133,27 @@ def _validate_profile_support(
         effective_head_dim_stage = cfg.head_dim_per_stage_kv
         effective_num_insts_kv = cfg.num_insts_kv
         effective_o_stages = cfg.o_stages
+        supported_head_stage = effective_head_dim_stage == 128 or (
+            effective_head_dim_stage == 256
+            and cfg.use_fp8_qkv
+            and cfg.uses_q_token_kv_block_sparse_page_route
+        )
         if effective_num_insts_kv == 1 and (
-            headdim != 256 or effective_head_dim_stage != 128 or effective_o_stages != 1
+            headdim != 256 or not supported_head_stage or effective_o_stages != 1
         ):
             raise ValueError(
                 "one-instance KeepsMmaAb is enabled only for the staged "
-                "headDim=256 profile with head_dim_per_stage_kv=128 and "
+                "headDim=256 profile with D128 bands (or D256 for sparse FP8) and "
                 "o_stages=1"
             )
         if headdim == 256 and (
-            effective_head_dim_stage != 128
+            not supported_head_stage
             or effective_num_insts_kv != 1
             or effective_o_stages != 1
         ):
             raise ValueError(
                 "fmha_decode keepsMmaAb headDim=256 requires "
-                "head_dim_per_stage_kv=128, num_insts_kv=1, and o_stages=1"
+                "D128 bands (or D256 for sparse FP8), num_insts_kv=1, and o_stages=1"
             )
         if headdim != 256 and effective_head_dim_stage != 0:
             raise ValueError(
@@ -4117,7 +4215,7 @@ def _validate_profile_support(
                     and cfg.uses_q_token_kv_block_sparse_page_route
                 )
             )
-            and effective_head_dim_stage == 128
+            and supported_head_stage
             and effective_num_insts_kv == 1
             and effective_o_stages == 1
         )

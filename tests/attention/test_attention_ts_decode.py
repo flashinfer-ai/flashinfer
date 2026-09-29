@@ -2180,31 +2180,53 @@ def test_attention_ts_decode_register_reallocation_follows_task_graph(
         assert all(value is not None and value % 8 == 0 for value in budgets)
 
 
-@pytest.mark.parametrize("load_warps", (4, 8))
+@pytest.mark.parametrize("load_warps", (1, 4, 8))
+@pytest.mark.parametrize("num_insts_kv", (1, 2))
 def test_attention_ts_decode_register_reallocation_fits_initial_cta_pool(
     load_warps: int,
+    num_insts_kv: int,
 ) -> None:
-    """Extra producers must not request unassigned registers outside the CTA pool."""
+    """Padding may donate registers without starving active or mixed groups."""
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_config import (
+        _active_warp_roles,
+    )
+
     config = FmhaDecodeConfig(
         use_keeps_mma_ab=True,
         tile_size_q=128,
         tile_size_kv=128,
-        headdim=256,
-        head_dim_per_stage_kv=128,
-        num_insts_kv=1,
-        o_stages=1,
+        headdim=256 if num_insts_kv == 1 else 128,
+        head_dim_per_stage_kv=128 if num_insts_kv == 1 else 0,
+        num_insts_kv=num_insts_kv,
+        o_stages=1 if num_insts_kv == 1 else 2,
         load_warp_idx=16,
         load_num_warps=load_warps,
     )
     threads = config.threads_per_cta
-    softmax_warps = config.softmax0_num_warps
-    correction_warps = config.correction_num_warps
-    producer_warps = threads // 32 - softmax_warps - correction_warps
-    requested = 32 * (
-        softmax_warps * config.softmax_task_num_registers
-        + correction_warps * config.correction_task_num_registers
-        + producer_warps * config.mma_load_task_num_registers
-    )
+    requested = 0
+    warpgroup_budgets: dict[int, set[int]] = {}
+    for role in _active_warp_roles(config):
+        if role.is_padding:
+            budget = config.padding_task_num_registers(
+                role.preferred_warp_idx, role.num_warps
+            )
+            if role.num_warps == 4:
+                assert budget < config.mma_load_task_num_registers
+            else:
+                assert budget == config.mma_load_task_num_registers
+        elif role.name.startswith("softmax"):
+            budget = config.softmax_task_num_registers
+        elif role.name == "correction":
+            budget = config.correction_task_num_registers
+        else:
+            budget = config.mma_load_task_num_registers
+        assert budget is not None and 24 <= budget <= 256 and budget % 8 == 0
+        requested += 32 * role.num_warps * budget
+        for warp in range(
+            role.preferred_warp_idx, role.preferred_warp_idx + role.num_warps
+        ):
+            warpgroup_budgets.setdefault(warp // 4, set()).add(budget)
+    assert all(len(budgets) == 1 for budgets in warpgroup_budgets.values())
     initial_per_thread = 65536 // (threads * 8) * 8
     assert requested <= threads * initial_per_thread
 
@@ -2980,19 +3002,80 @@ def test_attention_ts_decode_page4_encoded_subpages_all_tp_geometries(
     _assert_case_correct(one_shot, case)
 
 
+@_REQUIRES_PAGE4_PRIMTS_GPU
+def test_q_token_membership_keep_word16():
+    """Packed extraction preserves all query bits and the sixteen page positions."""
+    import cutlass.cute as cute
+    from cutlass import Int32, Uint32
+    from cutlass.cute.runtime import from_dlpack
+    from flashinfer.attention.prims_ts.kernels.fmha_decode.fmha_decode_resources.smem_resources import (
+        _q_token_membership_keep_word16,
+    )
+
+    rows, queries, expected = [], [], []
+    # Every four-page pattern at every query bit, with both clear and set
+    # non-query bits. Distinct nibbles check ordering of the four packed words.
+    for other_bits in (0, 255):
+        for query in range(8):
+            for pattern in range(16):
+                keep = sum(
+                    ((pattern + 3 * word) % 16) << (4 * word) for word in range(4)
+                )
+                page_bytes = [
+                    (other_bits & ~(1 << query)) | (((keep >> page) & 1) << query)
+                    for page in range(16)
+                ]
+                rows.append(page_bytes)
+                queries.append(query)
+                expected.append(keep)
+    for query in (8, 15, 31, 32, 63):
+        rows.append([255] * 16)
+        queries.append(query)
+        expected.append(0)
+    words = torch.tensor(rows, dtype=torch.uint8, device="cuda").view(torch.int32)
+    query_indices = torch.tensor(queries, dtype=torch.int32, device="cuda")
+    output = torch.empty(len(rows), dtype=torch.int32, device="cuda")
+
+    @cute.kernel
+    def extract(words: cute.Tensor, queries: cute.Tensor, output: cute.Tensor):
+        i = cute.arch.thread_idx()[0] + cute.arch.block_idx()[0] * 128
+        if i < output.shape[0]:
+            output[i] = Int32(
+                _q_token_membership_keep_word16(
+                    Uint32(words[i, 0]),
+                    Uint32(words[i, 1]),
+                    Uint32(words[i, 2]),
+                    Uint32(words[i, 3]),
+                    queries[i],
+                )
+            )
+
+    @cute.jit
+    def launch(words: cute.Tensor, queries: cute.Tensor, output: cute.Tensor):
+        extract(words, queries, output).launch(grid=(3, 1, 1), block=(128, 1, 1))
+
+    launch(from_dlpack(words), from_dlpack(query_indices), from_dlpack(output))
+    torch.testing.assert_close(
+        output, torch.tensor(expected, dtype=torch.int32, device="cuda"), atol=0, rtol=0
+    )
+
+
 @pytest.mark.arch_blackwell
 @_REQUIRES_PAGE4_PRIMTS_GPU
-@pytest.mark.parametrize("group_size", (2, 4, 5))
+@pytest.mark.parametrize(
+    ("group_size", "splits"), ((2, 2), (4, 2), (5, 2), (4, 5), (5, 9), (5, 16))
+)
 def test_attention_ts_decode_grouped_keeps_split_reduction(
     monkeypatch,
     group_size: int,
+    splits: int,
 ) -> None:
     """Merge grouped BF16 rows with the standard split-KV reducer."""
 
     from flashinfer.attention.prims_ts import decode as decode_module
     from flashinfer.attention.prims_ts.kernels.fmha_decode import fmha_decode_config
 
-    kv_tokens = 2528
+    kv_tokens = max(2528, splits * 256 + 32)
     storage_page_size = 16
     issuers = 8
     cfg = fmha_decode_config.make_decode_config(
@@ -3026,12 +3109,12 @@ def test_attention_ts_decode_grouped_keeps_split_reduction(
         num_tokens_per_page=4,
         storage_tokens_per_page=storage_page_size,
         split_kv_mode="gmem_reduction_with_separate_kernel",
-        splits_kv=2,
-        max_splits_kv=2,
+        splits_kv=splits,
+        max_splits_kv=splits,
         mask_type="causal",
         auto_tuner=False,
     )
-    assert cfg.splits_kv == 2
+    assert cfg.splits_kv == splits
     assert cfg.use_separate_reduction_kernel
     spec = decode_module._decode_launch_spec_from_config(
         cfg,
@@ -3870,11 +3953,11 @@ def test_attention_ts_decode_q64_keeps_p_in_smem_within_capacity(
 
 @pytest.mark.parametrize("dtype", (BFloat16, Float8E4M3FN))
 @pytest.mark.parametrize("tile_size_q", (64, 128))
-def test_attention_ts_decode_d256_staged_tmem_p_has_overwrite_gate(
+def test_attention_ts_decode_d256_staged_tmem_p_has_separate_stats(
     dtype,
     tile_size_q: int,
 ) -> None:
-    """D256 P remains inside S and retains its overwrite-credit gate."""
+    """D256 P stays inside S while statistics have independent SMEM storage."""
 
     cfg = _make_contiguous_keeps_config(
         dtype=dtype,
@@ -3888,10 +3971,12 @@ def test_attention_ts_decode_d256_staged_tmem_p_has_overwrite_gate(
 
     assert cfg.keeps_stats_via_smem
     assert resources["tmemSoftmaxLocal0"]._alloc is None
+    assert isinstance(resources["tmemSoftmaxLocal0"]._smem_alloc, SmemAllocation)
     assert p.offset == s.offset + cfg.tmem_stats_cols
 
-    assert "tmemStatsDone0" in resources
-    assert "tmemStatsDone1" not in resources
+    # Same-warp MMA A reads precede later MMA D writes to the aliased slot.
+    # The softmax-local pipeline independently protects the SMEM statistics.
+    assert cfg.mma_num_warps == 1
     assert resources["smemP0"]._alloc is None
     assert s.offset <= p.offset
     assert p.offset + p.num_columns <= s.offset + s.num_columns
@@ -7304,34 +7389,97 @@ def test_attention_ts_decode_page_cache_sliding_product(
 @pytest.mark.arch_blackwell
 @_REQUIRES_BLACKWELL_PRIMTS_GPU
 @pytest.mark.parametrize(
-    ("group", "dim", "ratio", "block", "page", "packed", "shared", "batch"),
+    ("group", "dim", "ratio", "block", "page", "packed", "shared", "batch", "dtype"),
     (
-        (1, 64, 3, 4, 16, False, False, 256),
-        (3, 128, 4, 8, 16, True, False, 2),
-        (5, 128, 6, 16, 128, False, True, 2),
-        (4, 256, 12, 32, 16, True, False, 256),
-        (8, 64, 3, 64, 128, False, True, 2),
-        (8, 128, 12, 128, 20, True, False, 256),
+        (1, 64, 3, 4, 16, False, False, 256, torch.bfloat16),
+        (3, 128, 4, 8, 16, True, False, 2, torch.bfloat16),
+        (5, 128, 6, 16, 128, False, True, 2, torch.bfloat16),
+        (4, 256, 12, 32, 16, True, False, 256, torch.bfloat16),
+        (8, 64, 3, 64, 128, False, True, 2, torch.bfloat16),
+        (8, 128, 12, 128, 20, True, False, 256, torch.bfloat16),
+        # FP8 page fragments with padded Q rows and non-power-of-two storage.
+        (8, 256, 12, 4, 20, True, False, 256, torch.float8_e4m3fn),
+        # Query-oriented memberships across one/two-instance and Q64/Q128 profiles.
+        pytest.param(2, 64, 32, 4, 20, False, True, 2, _FP8, id="fp8-query-g2"),
+        pytest.param(3, 128, 12, 4, 20, True, False, 2, _FP8, id="fp8-query-g3"),
+        pytest.param(4, 256, 12, 4, 20, False, True, 256, _FP8, id="fp8-query-g4"),
+        pytest.param(5, 256, 12, 4, 20, True, False, 2, _FP8, id="fp8-query-g5"),
+        pytest.param(6, 128, 12, 4, 20, False, False, 2, _FP8, id="fp8-query-g6"),
+        pytest.param(7, 256, 12, 4, 20, True, True, 256, _FP8, id="fp8-query-g7"),
+        pytest.param(
+            8,
+            64,
+            6,
+            4,
+            20,
+            True,
+            False,
+            2,
+            _FP8,
+            id="fp8-query-layout-d64-r6",
+        ),
+        pytest.param(
+            8,
+            128,
+            6,
+            4,
+            20,
+            True,
+            False,
+            256,
+            _FP8,
+            id="fp8-query-layout-d128-r6",
+        ),
+        pytest.param(
+            8,
+            128,
+            12,
+            4,
+            20,
+            True,
+            False,
+            2,
+            _FP8,
+            id="fp8-query-layout-d128-r12",
+        ),
+        pytest.param(
+            8,
+            256,
+            6,
+            4,
+            20,
+            True,
+            False,
+            2,
+            _FP8,
+            id="fp8-query-layout-d256-r6",
+        ),
     ),
 )
 def test_q_token_sparse_geometry_graph(
-    group, dim, ratio, block, page, packed, shared, batch
+    group, dim, ratio, block, page, packed, shared, batch, dtype
 ):
     """Check sparse geometry and persistent reuse against an independent mask."""
     torch.manual_seed(71845)
     context, topk, hkv = 1024, 3, 2
-    q = torch.randn(batch, group, hkv * ratio, dim, device="cuda", dtype=torch.bfloat16)
+    q = torch.randn(
+        batch, group, hkv * ratio, dim, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
     rows = batch * group - int(packed)
     query = q.reshape(-1, hkv * ratio, dim)[:rows] if packed else q[:, None]
-    out = torch.empty_like(query)
+    out = torch.empty_like(query, dtype=torch.bfloat16)
     offsets = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * group
     offsets[-1] = rows
     width = (context + page - 1) // page
     table = torch.randperm(batch * width, device="cuda", dtype=torch.int32).view(
         batch, width
     )
-    k = torch.randn(batch * width, hkv, page, dim, device="cuda", dtype=q.dtype)
-    v = torch.randn_like(k)
+    k = torch.randn(
+        batch * width, hkv, page, dim, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
+    v = torch.randn(
+        batch * width, hkv, page, dim, device="cuda", dtype=torch.bfloat16
+    ).to(dtype)
     if context % page:
         k[table[:, -1].long(), :, context % page :] = 0
         v[table[:, -1].long(), :, context % page :] = 0
@@ -7362,6 +7510,7 @@ def test_q_token_sparse_geometry_graph(
             qo_indptr=qo_indptr,
             seq_len_q=group if packed else None,
             kv_block_size=block,
+            o_data_type=out.dtype,
             split_kv=False,
             share_pattern_across_kv_heads=shared,
         ),
@@ -7385,6 +7534,7 @@ def test_q_token_sparse_geometry_graph(
         split_kv=False,
         share_pattern_across_kv_heads=shared,
         q_data_type=q.dtype,
+        o_data_type=out.dtype,
     )
 
     def run():
@@ -7408,16 +7558,29 @@ def test_q_token_sparse_geometry_graph(
         selected = (tokens // block == ids[..., None]).any(-2)
         tail = tokens // block == (positions[..., None, None] + 1) // block
         visible = (selected | tail) & (tokens <= positions[..., None, None])
-        scores = (
-            torch.einsum(
-                "bghrd,bkhd->bghrk",
-                q.view(batch, group, hkv, ratio, dim).float(),
-                keys,
-            )
-            * dim**-0.5
+        scores = torch.einsum(
+            "bghrd,bkhd->bghrk",
+            q.view(batch, group, hkv, ratio, dim).float(),
+            keys,
         )
         scores.masked_fill_(~visible[..., None, :], -torch.inf)
-        expected = torch.einsum("bghrk,bkhd->bghrd", scores.softmax(-1), values)
+        if dtype == _FP8:
+            # This union fits one KV tile. Match FP8 P and its FP32 denominator.
+            # The kernel incorporates P's scale into the log2 exponent before
+            # the FMA. exp(score-max)*448 can round to a different FP8 bin.
+            assert group * (topk + 1) * block <= _FP8_KV_TILE_SIZE
+            scale = torch.tensor(
+                dim**-0.5 * math.log2(math.e), device="cuda", dtype=torch.float32
+            )
+            bias = -scores.amax(-1, keepdim=True) * scale
+            bias = bias + math.log2(_FP8_PROBABILITY_SCALE)
+            probabilities = torch.addcmul(bias, scores, scale).exp2()
+            weights = probabilities.to(_FP8).float() / probabilities.sum(
+                -1, keepdim=True
+            )
+        else:
+            weights = (scores * dim**-0.5).softmax(-1)
+        expected = torch.einsum("bghrk,bkhd->bghrd", weights, values)
         torch.testing.assert_close(
             out.reshape(rows, hkv * ratio, dim).float(),
             expected.reshape(batch * group, hkv * ratio, dim)[:rows],
@@ -7451,13 +7614,16 @@ def test_q_token_sparse_geometry_graph(
         "packed",
         "split_kv",
         "shared",
+        "batch",
     ),
     (
-        (256, torch.bfloat16, 8, 128, 4, 512, 262144, True, False, False),
-        (128, torch.float8_e4m3fn, 8, 128, 4, 512, 524288, False, False, True),
-        (256, torch.bfloat16, 5, 128, 128, 16, 16384, False, True, False),
-        (128, torch.float8_e4m3fn, 4, 128, 64, 16, 16384, True, True, False),
-        (64, torch.float8_e4m3fn, 3, 32, 16, 16, 8192, False, True, False),
+        (256, torch.bfloat16, 8, 128, 4, 512, 262144, True, False, False, 2),
+        (128, torch.float8_e4m3fn, 8, 128, 4, 512, 524288, False, False, True, 2),
+        (256, torch.bfloat16, 5, 128, 128, 16, 16384, False, True, False, 2),
+        (128, torch.float8_e4m3fn, 4, 128, 64, 16, 16384, True, True, False, 2),
+        (64, torch.float8_e4m3fn, 3, 32, 16, 16, 8192, False, True, False, 2),
+        # Full-row FP8 with enough independent work to reuse persistent CTAs.
+        (256, torch.float8_e4m3fn, 8, 128, 128, 16, 8192, True, False, True, 256),
     ),
 )
 def test_q_token_sparse_membership_capacity_and_per_head_reduction(
@@ -7471,7 +7637,7 @@ def test_q_token_sparse_membership_capacity_and_per_head_reduction(
     packed,
     split_kv,
     shared,
-    batch=2,
+    batch,
     ratio=12,
 ):
     """Large nonsplit metadata and unequal per-head split domains stay correct."""
