@@ -369,3 +369,89 @@ def test_tirx_kda_warm_fixed_int21(heads):
         )
         for got, want in zip(result, expected, strict=True):
             torch.testing.assert_close(got, want, atol=0, rtol=0)
+
+
+def test_tirx_kda_fixed_partial_tail_graph():
+    """A fixed length that is not a multiple of 32 runs its full chunks on the
+    split route and the tail on the fused route; both are captured."""
+    inputs = _inputs((1001,), 16)
+    output = torch.empty_like(inputs["q"])
+    initial = inputs["initial_state"].clone()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    workspace = RecurrentKDAPrefillWorkspace(device=inputs["q"].device)
+    with torch.cuda.stream(stream):
+        for _ in range(2):
+            inputs["initial_state"].copy_(initial)
+            _call(inputs, output=output, prefill_workspace=workspace)
+    stream.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        _call(inputs, output=output, prefill_workspace=workspace)
+    other = _inputs((1001,), 16, seed=5)
+    for key in ("q", "k", "v", "g", "beta"):
+        inputs[key].copy_(other[key])
+    inputs["initial_state"].copy_(initial)
+    reference = _reference({**inputs, "initial_state": initial})
+    graph.replay()
+    torch.cuda.synchronize()
+    _assert_int21_close((output, inputs["initial_state"]), reference)
+
+
+@pytest.mark.parametrize("num_ctas", [132, 148, 152])
+@pytest.mark.parametrize(
+    "heads,lengths",
+    [
+        (64, (1300, 547, 2048, 963, 271, 3063)),
+        (64, (3063, 271, 963, 2048, 547, 1300)),
+        (64, (1056,) * 8),
+        (96, (1000,) * 8),
+        (96, (459, 840, 1417, 582, 2098, 2432, 364)),
+    ],
+)
+def test_tirx_kda_schedule_invariants(heads, lengths, num_ctas):
+    """Work lists cover every chunk once, in order, for any length order and SM
+    count; a range that continues a chain comes after the CTA's other items."""
+    from flashinfer.kda_kernels.tirx.schedule import BT, _host_item_table
+
+    offsets = [0]
+    for length in lengths:
+        offsets.append(offsets[-1] + length)
+    lists = _host_item_table(offsets, heads, min(num_ctas, heads * len(lengths)))
+    seen = {}
+    for items in lists:
+        continued = False
+        for word0, word1 in items:
+            seq, head = word1 & 0xFFFF, word1 >> 16
+            tok0 = (word0 & 0xFFFF) | (((word0 >> 23) & 0x1F) << 16)
+            chunk = (tok0 - offsets[seq]) // BT
+            key = (seq, head)
+            assert seen.get(key, -1) == chunk - 1
+            seen[key] = chunk
+            if word0 & (1 << 29):
+                continued = True
+            elif word0 & (1 << 30):
+                # A chain start after a continuation would wait behind it.
+                assert not continued
+    for seq, length in enumerate(lengths):
+        for head in range(heads):
+            assert seen[(seq, head)] == (length + BT - 1) // BT - 1
+
+
+def test_tirx_kda_large_values():
+    """KDA is linear in (v, state): exact power-of-two scaling must commute."""
+    inputs = _inputs((8192,), 64)
+    base = _call(
+        {**inputs, "initial_state": inputs["initial_state"].clone()},
+        output_final_state=True,
+    )
+    scale = 2.0**20
+    scaled = {
+        **inputs,
+        "v": inputs["v"] * scale,
+        "initial_state": inputs["initial_state"] * scale,
+    }
+    out, state = _call(scaled, output_final_state=True)
+    assert torch.isfinite(out).all() and torch.isfinite(state).all()
+    torch.testing.assert_close(out.float() / scale, base[0].float(), atol=0, rtol=0)
+    torch.testing.assert_close(state / scale, base[1], atol=0, rtol=0)

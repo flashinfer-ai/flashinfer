@@ -278,7 +278,10 @@ def _launch_tirx_kda(
                     "state": state,
                     "data": data,
                 }
-                workspace.__dict__["_tirx_kda"] = entry
+                # An internally allocated output never matches a later call,
+                # so caching that plan would only pin its tensors and scratch.
+                if explicit or output is not None:
+                    workspace.__dict__["_tirx_kda"] = entry
             entry["signature"] = signature
             entry["tensors"] = tensors
         state = entry["state"]

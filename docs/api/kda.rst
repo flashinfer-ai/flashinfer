@@ -568,19 +568,24 @@ TIRx prefill
 ``recurrent_kda(..., backend="tirx")`` selects the optional TIRx KDA kernels
 adapted from `humanfia/kda-for-kda-release
 <https://github.com/humanfia/kda-for-kda-release/tree/b642859a00544f2599e7bb7edce686f637759a73/tirx>`_.
-A fixed single sequence whose length is divisible by 32 uses a BT32 front end
-and recurrent chain, with concurrent execution when the device has sufficient
-SMs. Other inputs use a fused persistent BT64 kernel with a host-built work
-list. TIRx is imported only when explicitly selecting this backend.
+A fixed single sequence uses a BT32 front end and recurrent chain, with
+concurrent execution when the device has sufficient SMs; when its length is
+not divisible by 32, the final partial chunk continues on the fused kernel.
+Other inputs use a fused persistent BT64 kernel with a host-built work list.
+The work list is chosen per call from a cost model, independent of specific
+sequence lengths or SM counts: whole (sequence, head) chains packed by
+longest-processing-time, or equal-cost ranges that hand FP32 state between
+CTAs when that lowers the modelled makespan by at least 5%. TIRx is imported
+only when explicitly selecting this backend.
 
 Install CUDA-enabled TVM, the TIRx Lite frontend and a CUDA 13 toolkit with
 ``nvcc`` available. The validated compiler packages are::
 
     pip install 'apache-tvm==0.27.0' 'apache-tvm-ffi==0.1.14.post1'
-    pip install 'tirx-kernels @ git+https://github.com/mlc-ai/tirx-kernels.git@532949266f42ee23211e2dbd6d26dbe9c7a6ca3f'
+    pip install 'tirx-kernels @ git+https://github.com/mlc-ai/tirx-kernels.git@c4b700e7e8c390f069b369b588ecfe20215e5850'
 
-``tirx_kernels.tirx_lite`` must be present; the PyPI ``tirx-kernels==0.1.1``
-wheel does not include it. ``CUDA_PATH`` can select the toolkit root. Compiled
+The pinned commit is the ``v0.1.0`` release; ``tirx_kernels.tirx_lite`` must be
+present. ``CUDA_PATH`` can select the toolkit root. Compiled
 modules are stored in FlashInfer's JIT cache and keyed by architecture,
 specialization, source and compiler versions. The shared JIT lifecycle provides
 cross-process locking and honors ``FLASHINFER_DISABLE_JIT``.
@@ -607,9 +612,8 @@ state without a supplied initial state is caller-owned in implicit eager
 mode and workspace-owned with an explicit workspace. State pools, checkpoints,
 frozen-state mode, GQA, speculative decode and strided activations are rejected.
 
-Initial and final state are FP32. The retained H64 mixed/uniform INT21 routes
-use BF16 continuation buffers; other fused routes use FP32 handoffs. Tensor
-core operands and residuals also round to BF16. Numerical validation uses the
+Initial and final state, and every state handoff between CTAs, are FP32.
+Tensor core operands and residuals round to BF16. Numerical validation uses the
 source INT21 contract: relative L2 error at most 3%, with each error bounded
 by ``max(0.5 * RMS(reference), 0.05 * abs(reference))``. Short cases also
 compare against an independent FP64 token recurrence.
