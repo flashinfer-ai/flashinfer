@@ -1336,74 +1336,11 @@ def _pkd(
                                 cute.arch.cp_async_bulk_commit_group()
                         ping ^= 1
                     else:
-                        if cutlass.const_expr(H_ == 96):
-                            if warp == 4:
-                                cute.arch.cp_async_bulk_wait_group(1, read=True)
-                            ep_bar.arrive_and_wait()
-                            r_ob.store((r_o.load() * out_deanchor).to(cutlass.BFloat16))
-                            for dh in cutlass.range_constexpr(2):
-                                for tg in cutlass.range_constexpr(2):
-                                    dim_base = elw * 32 + dh * 16 + (mtx & 1) * 8
-                                    ta = tg * 16 + (mtx >> 1) * 8 + row8
-                                    tp = ta >> 1
-                                    par = ta & 1
-                                    raw_row = tp + (dim_base >> 6) * 16
-                                    raw_col = (
-                                        (dim_base & 63) ^ ((tp & 3) << 4) ^ (par << 3)
-                                    ) + par * 64
-                                    addr = (
-                                        so_base
-                                        + ping * 8192
-                                        + (raw_row * 128 + raw_col) * 2
-                                    )
-                                    e0 = dh * 16 + tg * 8
-                                    s8 = cute.make_tensor(
-                                        r_ob.iterator + e0, cute.make_layout((8,))
-                                    )
-                                    dst = cute.make_tensor(
-                                        cute.make_ptr(
-                                            cutlass.BFloat16,
-                                            addr,
-                                            cute.AddressSpace.smem,
-                                            assumed_align=16,
-                                        ),
-                                        cute.make_layout((8,)),
-                                    )
-                                    cute.copy(stm_np, s8, dst)
-                            cute.arch.fence_proxy("async.shared", space="cta")
-                            ep_bar.arrive_and_wait()
-                            for tail_pass in cutlass.range_constexpr(4):
-                                tail_item = tail_pass * 128 + etx
-                                tail_row = tail_item // 16
-                                tail_seg = tail_item % 16
-                                if (tail_row < cc_t) & (t >= warm_chunks):
-                                    src8 = cute.local_tile(
-                                        v_o,
-                                        (1, 8, 1, 1),
-                                        (tail_row, tail_seg & 7, tail_seg >> 3, ping),
-                                    )
-                                    src8 = cute.group_modes(src8, 0, 4)
-                                    tail8 = cute.make_tensor(
-                                        r_ob.iterator, cute.make_layout((8,))
-                                    )
-                                    cute.autovec_copy(src8, tail8)
-                                    dst8 = cute.local_tile(
-                                        out_raw,
-                                        (1, 1, 8),
-                                        (bos + t * C + tail_row, hidx, tail_seg),
-                                    )
-                                    cute.autovec_copy(
-                                        tail8, cute.group_modes(dst8, 0, 3)
-                                    )
-                            ep_bar.arrive_and_wait()
-                        else:
-                            r_ob.store((r_o.load() * out_deanchor).to(cutlass.BFloat16))
-                            for e in cutlass.range_constexpr(cute.size(r_o)):
-                                tt2 = o_id[e][1]
-                                if (tt2 < cc_t) & (t >= warm_chunks):
-                                    out_raw[bos + t * C + tt2, hidx, o_id[e][0]] = r_ob[
-                                        e
-                                    ]
+                        r_ob.store((r_o.load() * out_deanchor).to(cutlass.BFloat16))
+                        for e in cutlass.range_constexpr(cute.size(r_o)):
+                            tt2 = o_id[e][1]
+                            if (tt2 < cc_t) & (t >= warm_chunks):
+                                out_raw[bos + t * C + tt2, hidx, o_id[e][0]] = r_ob[e]
                     cse += 1
                     if cse == STAGES:
                         cse = 0

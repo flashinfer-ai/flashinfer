@@ -615,11 +615,7 @@ def fwd(
     cu_seqlens=None,
     plan=None,
 ):
-    H = q.shape[2]
-    nseq = 1 if cu_seqlens is None else int(cu_seqlens.numel()) - 1
-    fixed = nseq == 1
-    store_final_state = final_state is not None
-
+    fixed = cu_seqlens is None or int(cu_seqlens.numel()) == 2
     (
         cu32,
         soff,
@@ -637,39 +633,13 @@ def fwd(
     # Reset before every launch, including captured launches and graph replays.
     if has_split:
         mfl.zero_()
-    fepoch = 1
-    # v98 fused-gate kernel variant: routed to single-sequence (fixed)
-    # shapes only — it wins ~1-3% there (long chains, steady-state L1
-    # relief) but costs ~2% on short varlen chains (prep-latency exposure
-    # at chain starts; profiles/NOTES.md session 2).
-    common = {
-        "initial_state": initial_state,
-        "final_state": final_state,
-        "cu_seqlens": cu32,
-        "sched": (soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, fepoch),
-        "gate2": 1 if fixed else 0,
-    }
-    # NCU v119 source counters identify the prep warpgroup's raw-Q/K indexing
-    # as a compiler-spill trigger.  Mode 4 is algebraically just a four-row
-    # half-warp pairing through the combined prep-thread coordinate.  Mode 8
-    # keeps that row map and enables the fused per-channel gate scan while
-    # retaining varlen's measured-faster raw V/residual layout.
-    qk_rowpair = 4 if fixed else 8
-    # Central, preaddressed Gram issue relieves generic-tail prep scheduling.
-    # Full-chunk varlen routes retain per-instance self-issue.
-    generic = not fixed and not full_chunks
-    gram_w9 = 2 if generic else 0
-    # Full-chunk varlen favors 160/88/24/48. Packed normalization lets generic
-    # mixed use 152/96/24/48 without H96's old 56-reg prep. Both fixed shapes
-    # use 160/88/24/48 after the strict final-state retune.
-    reg_mode = 1 if fixed else 0
-    if not fixed:
-        reg_mode = 1 if full_chunks or (H == 96 and store_final_state) else 2
-    # Split schedules need every producer CTA resident, which clusters would
-    # not guarantee. Unsplit single sequences keep cluster-4 launches.
-    cluster_size = 1 if has_split else (4 if fixed else 1)
-    while G % cluster_size:
-        cluster_size //= 2
+    # The only route decision is a single sequence versus packed sequences.
+    # Single sequences use the fused-gate kernel with row-paired Q/K prep and a
+    # per-element partial tail; packed sequences roll the gate scan in
+    # eight-row batches and TMA-load partial chunks with row masks. Whether
+    # every chunk is full is a static property of the lengths, and a -5 lower
+    # bound folds into the gate. Measured on H32/64/96/128 fixed and varlen
+    # shapes; there are no per-head-count settings.
     return _launch_forward(
         q,
         k,
@@ -681,25 +651,19 @@ def fwd(
         A_log,
         dt_bias,
         lower_bound,
+        initial_state=initial_state,
+        final_state=final_state,
+        cu_seqlens=cu32,
+        sched=(soff, schain, spt0, sptn, ssrc, sdst, G, mid, mfl, 1),
+        gate2=1 if fixed else 0,
         has_split=has_split,
         beta_tma=True,
-        qk_rowpair=qk_rowpair,
-        gram_w9=gram_w9,
+        qk_rowpair=4 if fixed else 8,
         restore_tail=False,
-        reg_mode=reg_mode,
+        reg_mode=2,
         full_chunks=full_chunks,
-        # H64 generic also benefits from deleting the runtime lower-bound
-        # scalar; the same specialization regresses generic H96.
-        lower_bound_m5=(full_chunks or H == 64) and lower_bound == -5.0,
+        lower_bound_m5=lower_bound == -5.0,
         approximate_split=False,
-        prep_peel=H == 96 and generic,
-        cluster_size=cluster_size,
-        # Rolling eight-row gate batches also shorten generic H64 by about
-        # 0.17% in matched 5x100 bookends; full-chunk H64 still prefers the
-        # scalar schedule.
-        gate_roll=generic,
-        # Varlen routes load partial last chunks by TMA and mask them; the
-        # single-sequence route keeps its per-element tail (2% faster).
+        gate_roll=not fixed,
         partial_tma=not fixed,
-        **common,
     )
