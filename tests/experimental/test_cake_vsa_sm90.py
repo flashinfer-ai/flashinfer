@@ -1026,7 +1026,10 @@ def test_plan_stream_and_graph_lifetime():
                 wrapper.run(q, k, v)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="cake (SM90) VSA requires Hopper compute capability 9.0",
+)
 @pytest.mark.parametrize("engine", ["cuda", "cute"])
 def test_queue_kernel_matches_the_static_kernel_bit_exact(engine, monkeypatch):
     """The queue kernel only moves tiles between CTAs: its output is bit-identical
