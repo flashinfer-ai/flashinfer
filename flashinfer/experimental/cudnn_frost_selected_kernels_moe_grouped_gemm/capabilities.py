@@ -129,7 +129,13 @@ def _compiler_error(arch: str, sources: tuple[tuple[Path, str], ...]) -> str | N
             for part in (
                 name[len(module_name) + 1 :].split(".") if name != module_name else ()
             ):
-                value = getattr(value, part)
+                # Dtype descriptors construct an IR type only inside a JIT
+                # context. Admission checks their presence without evaluating it.
+                value = (
+                    inspect.getattr_static(value, part)
+                    if part == "mlir_type"
+                    else getattr(value, part)
+                )
             if value is None:
                 raise AttributeError(name)
         except (ImportError, AttributeError) as exc:

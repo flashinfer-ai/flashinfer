@@ -15,9 +15,13 @@ from ...jit.core import JitSpec, gen_jit_spec, sm110a_nvcc_flags
 
 SCHEMA = "flashinfer.sm110_xqa.v1"
 DECODE_SINGLE_PARTITION_ROUTE = "decode_fp16_contiguous_single_partition"
-TREE_KERNELS = ("tcgen05", "register_mma", "register_mma_split")
+TREE_KERNELS = ("tcgen05", "register_mma", "register_mma_split", "tmem")
 MMA_ROUTE_SUFFIX = "_mma"
 SPLIT_ROUTE_SUFFIX = "_mma_split"
+TMEM_ROUTE_SUFFIX = "_tmem"
+TMEM_CLUSTER = [2, 2, 1]
+TMEM_FALLBACK_CLUSTER = [2, 1, 1]
+TMEM_GQA_RATIO = 8
 ROUTE_ENTRIES = {
     "tree_fp16_contiguous": "run_tree",
     "tree_fp16_paged": "run_tree",
@@ -28,19 +32,26 @@ ROUTE_ENTRIES = {
     "tree_fp8_contiguous_mma": "run_tree",
     "tree_fp8_paged_mma": "run_tree",
     "tree_fp16_paged_mma_split": "run_tree",
+    "tree_fp16_contiguous_tmem": "run_tree",
+    "tree_fp16_paged_tmem": "run_tree",
+    "tree_fp8_contiguous_tmem": "run_tree",
+    "tree_fp8_paged_tmem": "run_tree",
     "decode_fp16_contiguous": "run_decode",
     "decode_merge": "run_decode_merge",
 }
 
 
 def route_kernel(name: str, route: dict[str, Any]) -> str:
-    """Physical kernel family of a route: ``register_mma_split`` for the ``*_mma_split`` tree
-    route, ``register_mma`` for the other ``*_mma`` tree routes, else ``tcgen05``."""
+    """Physical kernel family of a route: ``tmem`` for the ``*_tmem`` tree routes,
+    ``register_mma_split`` for the ``*_mma_split`` tree route, ``register_mma`` for the
+    other ``*_mma`` tree routes, else ``tcgen05``."""
     kernel = route.get("kernel", "tcgen05")
     if kernel not in TREE_KERNELS:
         raise ValueError(f"unknown kernel family for {name}")
     if name.startswith("tree_"):
-        if name.endswith(SPLIT_ROUTE_SUFFIX):
+        if name.endswith(TMEM_ROUTE_SUFFIX):
+            expected = "tmem"
+        elif name.endswith(SPLIT_ROUTE_SUFFIX):
             expected = "register_mma_split"
         elif name.endswith(MMA_ROUTE_SUFFIX):
             expected = "register_mma"
@@ -68,7 +79,7 @@ def _read_manifest(source_root: Path) -> dict[str, Any]:
     routes = manifest.get("routes")
     if not isinstance(routes, dict) or not set(ROUTE_ENTRIES).issubset(routes):
         raise ValueError(
-            "SM110 XQA manifest must enumerate all ten base physical routes"
+            "SM110 XQA manifest must enumerate all fourteen base physical routes"
         )
     producer = routes["decode_fp16_contiguous"]
     expected_entries = dict(ROUTE_ENTRIES)
@@ -145,6 +156,23 @@ def _read_manifest(source_root: Path) -> dict[str, Any]:
                 ):
                     raise ValueError(
                         f"unsupported split register-MMA tree launch geometry for {name}"
+                    )
+            elif route_kernel(name, route) == "tmem":
+                # tcgen05/TMEM tree route: one 128-row Q tile x one 256-column output half per
+                # CTA (512 threads), K/V and Q multicast over a (2, 2, 1) KV-head cluster; the
+                # (2, 1, 1) Q-multicast form serves heads with an odd number of Q tiles. The
+                # frozen trace is specialised for one GQA ratio (Q tile = ratio x tokens).
+                if (
+                    rows != 128
+                    or columns != 256
+                    or route.get("gqa_ratio") != TMEM_GQA_RATIO
+                    or route.get("cluster") != TMEM_CLUSTER
+                    or route.get("fallback_cluster") != TMEM_FALLBACK_CLUSTER
+                    or not isinstance(route.get("fallback_kernel_symbol"), str)
+                    or route.get("block") != [512, 1, 1]
+                ):
+                    raise ValueError(
+                        f"unsupported TMEM tree launch geometry for {name}"
                     )
             elif (
                 rows not in (64, 128)

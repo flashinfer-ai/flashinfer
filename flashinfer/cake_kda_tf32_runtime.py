@@ -2303,6 +2303,42 @@ def _require_tensor(
         raise ValueError(f"{name} must be contiguous")
 
 
+def _validate_qkv_layout(q, k, v) -> bool:
+    """Accept dense ``[B, T, H, 128]`` BF16 q / k / v or strided views of one packed row.
+
+    Returns ``True`` for dense operands.  A strided operand must keep a dense
+    ``[num_heads, 128]`` token payload, a token stride that is a multiple of 8
+    elements and at least ``num_heads * 128``, and a plain batch stride
+    (``shape[1] * token stride``) so ``[B, T]`` folds to ``[1, B*T]``.  The
+    fused M128 body reads each operand's token pitch from its TensorView, so
+    q, k and v may carry different pitches (e.g. a dense zero ``v``).
+    """
+    import torch
+
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        _require_tensor(
+            tensor, name=name, dtype=torch.bfloat16, ndim=4, contiguous=False
+        )
+    if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+        return True
+    heads_x_dim = q.shape[2] * HEAD_DIM
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        if tensor.stride(3) != 1 or tensor.stride(2) != HEAD_DIM:
+            raise ValueError(
+                f"{name} must keep a dense [num_heads, {HEAD_DIM}] token payload"
+            )
+        if tensor.stride(1) < heads_x_dim or tensor.stride(1) % 8 != 0:
+            raise ValueError(
+                f"{name} token stride must be a multiple of 8 elements and at least "
+                f"num_heads * {HEAD_DIM}; got {tensor.stride(1)}"
+            )
+        if tensor.shape[0] > 1 and tensor.stride(0) != tensor.shape[1] * tensor.stride(
+            1
+        ):
+            raise ValueError(f"{name} batch stride must be shape[1] * token stride")
+    return False
+
+
 class FlashKDABlackwellBF16FusedLaunch:
     """Preallocated single-kernel launch for the production BF16 path."""
 
@@ -2377,8 +2413,14 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (not self._affine_main_indexed_initial_bf16),
         )
         self.compute_dtype = compute_dtype
-        for name, tensor in (("q", q), ("k", k), ("v", v), ("out", out)):
-            _require_tensor(tensor, name=name, dtype=torch.bfloat16, ndim=4)
+        _require_tensor(out, name="out", dtype=torch.bfloat16, ndim=4)
+        # Round-5 lever 5b: q / k / v may be strided views of a packed qkv row
+        # (token pitch > num_heads * HEAD_DIM) as long as each token's
+        # [num_heads, HEAD_DIM] payload is dense and the three share one pitch;
+        # the fused M128 body reads them in place, every other body gets a
+        # dense copy below.
+        qkv_dense = _validate_qkv_layout(q, k, v)
+        qkv_strided_ok = False
         _require_tensor(g, name="g", dtype=torch.bfloat16, ndim=4, contiguous=False)
         _require_tensor(
             beta,
@@ -3489,6 +3531,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 raise ValueError(
                     "checkpoint accumulation requires FP32 checkpoint rows"
                 )
+            qkv_strided_ok = True
             self.module = _build_kda_module(
                 partial(_factory, "compiled_bf16_fused_m128"),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
@@ -3896,6 +3939,16 @@ class FlashKDABlackwellBF16FusedLaunch:
         if n32_value_rows == 64:
             self.grid = (2 * self.grid[0], 1, 1)
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
+        if not qkv_dense and not qkv_strided_ok:
+            # Only the fused M128 body carries the q / k / v token pitch; the
+            # other bodies read a dense layout, so densify here (one copy per
+            # operand, the cost the caller used to pay unconditionally).
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            q_flat = q.reshape(total_tokens, num_heads, HEAD_DIM)
+            k_flat = k.reshape(total_tokens, num_heads, HEAD_DIM)
+            v_flat = v.reshape(total_tokens, num_heads, HEAD_DIM)
         self.args = {
             "q": q_flat,
             "q_tma": q_flat,
@@ -4632,10 +4685,11 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self.active_beta_f32 = active_beta_f32
         if active_beta_f32 and (compute_dtype != "tf32" or lower_bound is None):
             raise ValueError("active-beta affine requires bounded TF32 compute")
-        if q.ndim != 4 or any(
-            (not tensor.is_contiguous() for tensor in (q, k, v, out))
-        ):
-            raise ValueError("affine q/k/v/out require contiguous [B,T,H,128] tensors")
+        if q.ndim != 4 or not out.is_contiguous():
+            raise ValueError("affine out requires a contiguous [B,T,H,128] tensor")
+        # Strided q / k / v views (lever 5b) reach the fused M128 main pass in
+        # place; the map / apply kernels read only the exported operators.
+        _validate_qkv_layout(q, k, v)
         if any((tensor.shape != q.shape for tensor in (k, v, out))):
             raise ValueError("affine q/k/v/out shapes must match")
         if initial_state is None or final_state is None or state_indices is None:
@@ -5854,12 +5908,18 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         or (state_indices is None)
     ):
         return False
-    if any(
-        (
-            tensor is None or not tensor.is_contiguous()
-            for tensor in (q, argument(1, "k"), argument(2, "v"), argument(6, "out"))
-        )
-    ):
+    k = argument(1, "k")
+    v = argument(2, "v")
+    out = argument(6, "out")
+    if any(tensor is None for tensor in (k, v, out)) or not out.is_contiguous():
+        return False
+    # Round-5 lever 5b: serving hands q / k / v over as strided views of one
+    # packed qkv row.  The split's main pass accepts every layout
+    # ``_validate_qkv_layout`` accepts (dense, or in place / one dense copy),
+    # so the gate must not send such calls to the sequential body.
+    try:
+        _validate_qkv_layout(q, k, v)
+    except (TypeError, ValueError):
         return False
     checkpoint_request = (
         state_checkpoints is not None

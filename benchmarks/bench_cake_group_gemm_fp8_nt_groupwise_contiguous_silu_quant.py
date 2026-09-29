@@ -38,6 +38,13 @@ SHAPES = [
         4096,
     ),
     ("wide_ep32_gate_up_all_odd", [384] * 8 + [128] * 8, 2048, 4096),
+    ("wide_ep32_gate_up_all_one_block", [128] * 16, 2048, 4096),
+    (
+        "wide_ep32_gate_up_mixed_tail",
+        [640, 128, 384, 0, 896, 128, 384, 256, 128, 0, 384, 128, 256, 128, 128, 128],
+        2048,
+        4096,
+    ),
     # small-M route (grouped GEMM + generated SwiGLU/group-quant kernel): aligned and partial-tail routings
     ("one_pair", [256], 512, 1024),
     ("odd_blocks_with_empty", [384, 128, 0, 640], 512, 512),
@@ -90,8 +97,9 @@ def main():
     for label, group_counts, n2, k in SHAPES:
         a, b, a_scale, b_scale, m_indices = make_inputs(group_counts, n2, k, device)
         m = sum(group_counts)
+        # validate_indices=True also hands the routing to the route rule (odd-tail share -> fused vs GEMM + act)
         prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
-            a, b, a_scale, b_scale, m_indices
+            a, b, a_scale, b_scale, m_indices, validate_indices=True
         )
         fused_q, fused_s = prepared.launch()
         y = torch.empty((m, n2), dtype=torch.bfloat16, device=device)

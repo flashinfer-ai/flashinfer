@@ -31,6 +31,15 @@
     "sm_110a/sm110_xqa_tree_fp16_contiguous_mma_kernel.cu": {
       "sha256": "3435e1351208b58bd38dbec71acb51b5d45d4cede7b540e75db046441d68ddf6"
     },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_binding.cu": {
+      "sha256": "de0012b0867fce49350a6ca9f0411c073d87b920dc954ff656eaa5ee72508ec6"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_kernel.cu": {
+      "sha256": "3b5853923c92baaca65216843cc39722aeda1db48c70381b0cf8bdfaae91739d"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_q_kernel.cu": {
+      "sha256": "daa1ce6d8d50218a07b03bae93088da6bd64a078f760dd83396ce59480a915a0"
+    },
     "sm_110a/sm110_xqa_tree_fp16_paged_binding.cu": {
       "sha256": "a291f25e709abbd60aa74f60eb6bc9c11b508ef352184fd3f4a0803ca026dc48"
     },
@@ -49,6 +58,15 @@
     "sm_110a/sm110_xqa_tree_fp16_paged_mma_split_kernel.cu": {
       "sha256": "827afd309cb292597a029b6e9fd760eee490a6ea160350b1960a6029b00ca1d1"
     },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_binding.cu": {
+      "sha256": "f232a25938a4a0f9d7798baa34bf3cad951a9b36675276dc296c2ebcddfb53fd"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_kernel.cu": {
+      "sha256": "ac9b89cc81dadc265746dedbfcf3327980e753a6276bb6d76775494c9473c044"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_q_kernel.cu": {
+      "sha256": "c3e4b968f0725d9e384dcad4c69322205835e356921a45281fb8c9a9b54a07ff"
+    },
     "sm_110a/sm110_xqa_tree_fp8_contiguous_binding.cu": {
       "sha256": "f114800fff81ec7092824080927b505326be0472842ab159d13fc7e331a6be76"
     },
@@ -61,6 +79,15 @@
     "sm_110a/sm110_xqa_tree_fp8_contiguous_mma_kernel.cu": {
       "sha256": "5e28b7d80817db1cf8007ace12ed5645c7eee530fee18eb314542a96273b57a6"
     },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_binding.cu": {
+      "sha256": "6f35335386855792fe579f1eea6b9534821b261ab218450744786ec41c9923af"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_kernel.cu": {
+      "sha256": "0f33c34b348245d8e26e092175b117fcc39acd51dadff632025a562b9cec9695"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_q_kernel.cu": {
+      "sha256": "d018bf8dae149e3a7bc4e10c37405b11211c5045d10af60976bf86a8e2fdd9b0"
+    },
     "sm_110a/sm110_xqa_tree_fp8_paged_binding.cu": {
       "sha256": "59a4b291c580b8b3a423c06db4038ce0af9dd7d9875bd9524954d2b6601941b1"
     },
@@ -72,6 +99,15 @@
     },
     "sm_110a/sm110_xqa_tree_fp8_paged_mma_kernel.cu": {
       "sha256": "f3a53f957ece731f3c60e6c2054ae2e520bc9c14e323bff43f8508c02242f0d1"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_binding.cu": {
+      "sha256": "113bf18adfcd9feaaa64887bbd320975a345560163d239633a5b7156eb5ffe6b"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_kernel.cu": {
+      "sha256": "41da00ad9663c6059e3da94cb1bd94b5fb3365d48179a07dbc914969a1bda6b2"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_q_kernel.cu": {
+      "sha256": "2a5d4d10be4143df9ff63cff112f0cccab46d5d55092d3d0f4cb2eb2b817a614"
     }
   },
   "routes": {
@@ -539,6 +575,120 @@
         }
       ]
     },
+    "tree_fp16_contiguous_tmem": {
+      "kernel": "tmem",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp16_contiguous_tmem",
+      "fallback_kernel_symbol": "kernel_sm110_xqa_tree_fp16_contiguous_tmem_q",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        2,
+        2,
+        1
+      ],
+      "fallback_cluster": [
+        2,
+        1,
+        1
+      ],
+      "gqa_ratio": 8,
+      "form_selection": "kernel_symbol when ceil(q_len * ratio / 128) is even, else fallback_kernel_symbol",
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 230400,
+      "tile_rows": 128,
+      "output_tile_columns": 256,
+      "threads_per_cta": 512,
+      "tma_multicast": {
+        "q": true,
+        "kv": true
+      },
+      "fallback_tma_multicast": {
+        "q": true,
+        "kv": false
+      },
+      "source_cubin_sha256": "2e8662c075ee9c6b02863da747b471a37beef3ec27fe369299755cc80485131d",
+      "fallback_source_cubin_sha256": "a2a44ab758846df9b298c16ba11cba0ea800a1c9339388784211593eba1a53d0",
+      "device_parameters": [
+        {
+          "name": "Q",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* data; const int* sequence_lengths; uint32_t capacity;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        }
+      ]
+    },
     "tree_fp16_paged": {
       "block": [
         256,
@@ -869,6 +1019,120 @@
       "kv_l2_prefetch": true,
       "merge": "in_cta_smem"
     },
+    "tree_fp16_paged_tmem": {
+      "kernel": "tmem",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp16_paged_tmem",
+      "fallback_kernel_symbol": "kernel_sm110_xqa_tree_fp16_paged_tmem_q",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        2,
+        2,
+        1
+      ],
+      "fallback_cluster": [
+        2,
+        1,
+        1
+      ],
+      "gqa_ratio": 8,
+      "form_selection": "kernel_symbol when ceil(q_len * ratio / 128) is even, else fallback_kernel_symbol",
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 230400,
+      "tile_rows": 128,
+      "output_tile_columns": 256,
+      "threads_per_cta": 512,
+      "tma_multicast": {
+        "q": true,
+        "kv": true
+      },
+      "fallback_tma_multicast": {
+        "q": true,
+        "kv": false
+      },
+      "source_cubin_sha256": "f1f8f090b341615acd4ffac5e02df86d83f7483fe2f8d35cafa121f33580bec0",
+      "fallback_source_cubin_sha256": "6c134187cf8868e30fc9b95358a070bd4733f7979532bf008fb5985db479892f",
+      "device_parameters": [
+        {
+          "name": "Q",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* pool; const int* page_list; const int* sequence_lengths; uint32_t max_pages;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        }
+      ]
+    },
     "tree_fp8_contiguous": {
       "block": [
         256,
@@ -1086,6 +1350,120 @@
           "name": "scratch",
           "ctype": "void*",
           "kind": "pointer"
+        }
+      ]
+    },
+    "tree_fp8_contiguous_tmem": {
+      "kernel": "tmem",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp8_contiguous_tmem",
+      "fallback_kernel_symbol": "kernel_sm110_xqa_tree_fp8_contiguous_tmem_q",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        2,
+        2,
+        1
+      ],
+      "fallback_cluster": [
+        2,
+        1,
+        1
+      ],
+      "gqa_ratio": 8,
+      "form_selection": "kernel_symbol when ceil(q_len * ratio / 128) is even, else fallback_kernel_symbol",
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 230400,
+      "tile_rows": 128,
+      "output_tile_columns": 256,
+      "threads_per_cta": 512,
+      "tma_multicast": {
+        "q": true,
+        "kv": true
+      },
+      "fallback_tma_multicast": {
+        "q": true,
+        "kv": false
+      },
+      "source_cubin_sha256": "59856f72a657307e385b602a6484eba03a8bf3ca4095adfab46ef3a4b1162998",
+      "fallback_source_cubin_sha256": "ba3b7561104bc6d498c8e581ac4e1ca5add91af619d5dd0cb1c84e7ca86236ca",
+      "device_parameters": [
+        {
+          "name": "Q",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* data; const int* sequence_lengths; uint32_t capacity;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
         }
       ]
     },
@@ -1308,10 +1686,124 @@
           "kind": "pointer"
         }
       ]
+    },
+    "tree_fp8_paged_tmem": {
+      "kernel": "tmem",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp8_paged_tmem",
+      "fallback_kernel_symbol": "kernel_sm110_xqa_tree_fp8_paged_tmem_q",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        2,
+        2,
+        1
+      ],
+      "fallback_cluster": [
+        2,
+        1,
+        1
+      ],
+      "gqa_ratio": 8,
+      "form_selection": "kernel_symbol when ceil(q_len * ratio / 128) is even, else fallback_kernel_symbol",
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 230400,
+      "tile_rows": 128,
+      "output_tile_columns": 256,
+      "threads_per_cta": 512,
+      "tma_multicast": {
+        "q": true,
+        "kv": true
+      },
+      "fallback_tma_multicast": {
+        "q": true,
+        "kv": false
+      },
+      "source_cubin_sha256": "3146887da213d3ef9e3f82431bf8f3246922a081fbffbd765325d8966881da57",
+      "fallback_source_cubin_sha256": "5ba1beea24f50db2ae0be490ba83703e6f98bd250d704d0b914f25a5e037d478",
+      "device_parameters": [
+        {
+          "name": "Q",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* pool; const int* page_list; const int* sequence_lengths; uint32_t max_pages;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        }
+      ]
     }
   },
   "schema": "flashinfer.sm110_xqa.v1",
-  "shape_count": 12,
+  "shape_count": 16,
   "shape_denominator": [
     "tree_fp16_contiguous",
     "tree_fp16_paged",
@@ -1322,10 +1814,14 @@
     "tree_fp16_paged_mma_split",
     "tree_fp8_contiguous_mma",
     "tree_fp8_paged_mma",
+    "tree_fp16_contiguous_tmem",
+    "tree_fp16_paged_tmem",
+    "tree_fp8_contiguous_tmem",
+    "tree_fp8_paged_tmem",
     "decode_b1_c1024",
     "decode_b2_c512",
     "decode_b4_c256"
   ],
-  "shape_ledger_sha256": "e644edf9091922eceee831e2f69175bc89a3d751f27dadb8f1bbd60f6ad479f8",
+  "shape_ledger_sha256": "0d981939df776287b717d53dac6d9203cb04bf59909c2cbb1e0aff21ab96347b",
   "validation_status": "source_only_unvalidated"
 }

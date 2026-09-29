@@ -36,8 +36,9 @@ from flashinfer.experimental.kimi_k3_tp12_tail import cake_jit
 
 ATOL = RTOL = 1e-2
 SEED = 620
-# One-shot rows, two-shot grouped rows and one pinned row (M > 256).
-GPU_ROWS = (1, 8, 16, 32, 128, 300)
+# Fused K23 rows (M <= 4), K3-ESS rows with the one-shot / two-shot ESS K1, the plain
+# persistent K3 at 256 and one cp.async.bulk pinned row (M > 256).
+GPU_ROWS = (1, 4, 8, 16, 32, 128, 256, 300)
 GPU_MAX_TOKENS = 512
 
 
@@ -52,22 +53,64 @@ def test_partition_covers_hidden_in_128_column_blocks():
 
 
 def test_route_selection_by_token_count():
-    for M in (1, 2, 8, 16):
+    # fused K23 regime: ESS one-shot K1 + fused slice GEMM / tail, module by the rank's column width
+    assert cb.K23_MAX_TOKENS == 4 and cb.K23_ROWS == 8
+    for M in (1, 2, 3, 4):
         for rank in range(cb.WORLD_SIZE):
             assert cb.route_kernel_keys(M, rank) == (
-                f"k1_oneshot:r{rank}",
-                "k3:grouped",
+                f"k1_oneshot_ess:r{rank}",
+                f"k23:n{cb.PARTITION[rank]}",
             )
-    for M in (17, 32, 128, 256):
-        assert cb.route_kernel_keys(M, 3) == ("k1_twoshot:grouped", "k3:grouped")
+    assert cb.up_proj_form_for(4) == "k23" and cb.up_proj_form_for(5) == "cublas"
+    assert cb.k3_kernel_key(4, 0) == "k23:n640"
+    assert cb.k3_kernel_key(4, 11) == "k23:n512"
+    # cuBLAS + K3-ESS regime: the ESS K1 scattered the shared partial, one CTA per token and column half
+    for M in (5, 8, 16):
+        for rank in range(cb.WORLD_SIZE):
+            assert cb.route_kernel_keys(M, rank) == (
+                f"k1_oneshot_ess:r{rank}",
+                "k3_ess:grouped",
+            )
+    for M in (17, 32, 128, 255):
+        assert cb.route_kernel_keys(M, 3) == (
+            "k1_twoshot_ess:grouped",
+            "k3_ess:grouped",
+        )
+    # persistent K3 pipeline from K3_PERSIST_MIN_TOKENS on: plain at 256 (grouped), cp.async.bulk pushes above (pinned)
+    assert cb.K3_PERSIST_MIN_TOKENS == 256 and cb.BULK_MIN_TOKENS == 257
+    assert cb.route_kernel_keys(256, 3) == ("k1_twoshot:grouped", "k3_persist:grouped")
     for M in (257, 512, 4096):
-        assert cb.route_kernel_keys(M, 3) == ("k1_twoshot:pinned", "k3:pinned")
+        assert cb.route_kernel_keys(M, 3) == (
+            "k1_twoshot:pinned",
+            "k3_persist_bulk:pinned",
+        )
+    for M in (1, 4, 5, 255, 256, 257, 4096):
+        assert len(cb.route_kernel_keys(M, 0)) == 2
+    assert cb.k3_form_for(4) == "k23" and cb.k3_form_for(5) == "ess"
+    assert cb.k3_form_for(255) == "ess" and cb.k3_form_for(256) == "persist"
+    assert cb.k3_form_for(257) == "persist_bulk"
+    # K23: one CTA per K23_ROWS output columns of the rank (80 for 640, 64 for 512)
+    assert cb.k3_grid(1, 152, 0) == (80, 1, 1)
+    assert cb.k3_grid(4, 148, 11) == (64, 1, 1)
+    # K3-ESS: one CTA per token and column half; persistent forms: min(M, SM count)
+    assert cb.k3_grid(5, 152, 0) == (5, 2, 1)
+    assert cb.k3_grid(100, 152, 3) == (100, 2, 1)
+    assert cb.k3_grid(255, 152, 3) == (255, 2, 1)
+    assert cb.k3_grid(256, 152, 3) == (152, 2, 1)
+    assert cb.k3_grid(4096, 148, 3) == (148, 2, 1)
+    with pytest.raises(ValueError):
+        cb.k3_grid(4096, 0, 3)
+    assert len(cake_jit.required_kernel_keys()) == 20
     assert set(cake_jit.required_kernel_keys()) == {
-        *(f"k1_oneshot:r{r}" for r in range(12)),
+        *(f"k1_oneshot_ess:r{r}" for r in range(12)),
+        "k1_twoshot_ess:grouped",
         "k1_twoshot:grouped",
         "k1_twoshot:pinned",
-        "k3:grouped",
-        "k3:pinned",
+        "k23:n640",
+        "k23:n512",
+        "k3_ess:grouped",
+        "k3_persist:grouped",
+        "k3_persist_bulk:pinned",
     }
 
 
@@ -114,18 +157,36 @@ def test_generated_module_inventory():
             raw = {n for kind, n in record["arg_plan"] if kind == "raw_pointer"}
             assert record["launch"]["use_pdl"] is True
             assert tuple(record["launch"]["block"]) == (cb.THREADS, 1, 1)
-            if key.startswith("k1_oneshot:"):
-                assert raw == {"mcast_ptr", "local_unicast_ptr"}
+            if key.startswith("k1_oneshot_ess:"):
+                # one-shot K1 with the early shared scatter into the K3 workspace
+                assert raw == {"mcast_ptr", "local_unicast_ptr", "k3_mcast_ptr"}
                 assert {
                     "routed",
+                    "shared",
                     "y_out",
                     "gamma",
                     "buffer_flags",
+                    "k3_peer_ptrs",
+                    "k3_flags",
                     "num_tokens",
                     "epsilon",
                 } <= names
+            elif key.startswith("k1_twoshot_ess:"):
+                assert raw == {"mcast_ptr", "k3_mcast_ptr"}
+                assert {
+                    "routed",
+                    "shared",
+                    "y_out",
+                    "gamma",
+                    "peer_ptrs",
+                    "buffer_flags",
+                    "k3_peer_ptrs",
+                    "k3_flags",
+                    "rank",
+                } <= names
             elif key.startswith("k1_twoshot:"):
                 assert raw == {"mcast_ptr"}
+                assert "shared" not in names
                 assert {
                     "routed",
                     "y_out",
@@ -134,7 +195,35 @@ def test_generated_module_inventory():
                     "buffer_flags",
                     "rank",
                 } <= names
-            else:
+            elif key.startswith("k23:"):
+                # fused slice GEMM + tail: reads y and the weight slice, no GEMM buffer, no shared operand
+                assert raw == {"mcast_ptr"}
+                assert "shared" not in names and "gemm_slice" not in names
+                assert {
+                    "y",
+                    "w_slice",
+                    "out",
+                    "peer_ptrs",
+                    "buffer_flags",
+                    "num_tokens",
+                    "rank",
+                    "my_col_begin",
+                } <= names
+            elif key.startswith("k3_ess:"):
+                # the ESS K1 scattered the shared partial: no shared operand
+                assert raw == {"mcast_ptr"}
+                assert "shared" not in names
+                assert {
+                    "gemm_slice",
+                    "out",
+                    "peer_ptrs",
+                    "buffer_flags",
+                    "my_col_begin",
+                    "my_cols",
+                    "gemm_plane_stride",
+                    "num_gemm_splits",
+                } <= names
+            elif key.startswith(("k3_persist:", "k3_persist_bulk:")):
                 assert raw == {"mcast_ptr"}
                 assert {
                     "shared",
@@ -147,6 +236,8 @@ def test_generated_module_inventory():
                     "gemm_plane_stride",
                     "num_gemm_splits",
                 } <= names
+            else:
+                pytest.fail(f"unexpected kernel key {key!r} in the {arch} table")
     for arch in cake_jit.KERNELS:
         assert cake_jit.route_available(arch, tuple(required))
 
@@ -244,6 +335,9 @@ def test_tail_matches_reference_on_twelve_ranks():
                 workspace=workspace,
             )
             assert runner.kernel_keys == cb.route_kernel_keys(M, rank)
+            assert runner.k3.kwargs["grid"] == cb.k3_grid(M, workspace.sm_count, rank)
+            assert runner.cublas == (M > cb.K23_MAX_TOKENS)
+            assert runner.launch_count == (2 if M <= cb.K23_MAX_TOKENS else 3)
             inp["out"].fill_(float("nan"))
             runner()
             torch.cuda.synchronize()

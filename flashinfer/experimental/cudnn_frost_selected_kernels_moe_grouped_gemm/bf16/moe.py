@@ -18,7 +18,7 @@ from ....autotuner import TuningConfig
 from ....fused_moe.api import QuantFormat, RoutingInputMode, SwiGLU
 from ....fused_moe.runners import MoERunner, _validate_prerouted_inputs
 from ....utils import get_compute_capability
-from . import fc2, runtime
+from . import fc2, fma, runtime
 from ..cache import (
     LRUCache,
     require_graph_resource_retention,
@@ -121,6 +121,19 @@ def _selected_kernels_cached(
     )
 
 
+def _fma_tactic(tokens, hidden, intermediate, experts, topk, activation):
+    if not fma.supported(
+        tokens, hidden, intermediate, experts, topk, activation_name(activation)
+    ):
+        return None
+    try:
+        fma.check_support(activation_name(activation))
+    except NotImplementedError:
+        # An older DSL can still run the existing Tensor Core candidates.
+        return None
+    return fma.tactic(activation_name(activation))
+
+
 class _Inputs(list):
     def __init__(self, tensors, state, tuning_config):
         super().__init__(tensors)
@@ -140,6 +153,7 @@ class _Plans:
         first,
         second,
         workspace_pool,
+        fma_tactic=None,
     ):
         self.plans = {}
         self.launches = {}
@@ -165,10 +179,34 @@ class _Plans:
                 ],
                 a.swap_ab,
                 b.swap_ab,
+                False,
             )
             # Retain Module ownership: its run Function borrows the native plan.
             self.plans[key] = plan
             self.launches[key] = plan["run"]
+            required = max(required, plan["workspace_size"]())
+        if fma_tactic is not None:
+            first_fma, second_fma = fma.build(
+                tokens, hidden, intermediate, experts, topk, device, fma_tactic[1]
+            )
+            plan = module.make_plan(
+                first_fma,
+                second_fma,
+                tokens,
+                hidden,
+                intermediate,
+                experts,
+                topk,
+                device.index,
+                0,
+                0,
+                first[0].gated,
+                [],
+                False,
+                False,
+                True,
+            )
+            self.plans[fma_tactic], self.launches[fma_tactic] = plan, plan["run"]
             required = max(required, plan["workspace_size"]())
         # Exact-shape host plans must not imply one large GPU allocation per
         # token count. Share geometrically grown storage on this runner's stream.
@@ -311,6 +349,7 @@ class CudnnFrostBf16MoeRunner(MoERunner):
         )
         if not first or not second:
             raise ValueError("No matching cuDNN Frost FC1/FC2 source kernels")
+        fma_tactic = _fma_tactic(t, h, i, e, k, self.config.activation)
         key = (
             t,
             h,
@@ -319,6 +358,7 @@ class CudnnFrostBf16MoeRunner(MoERunner):
             k,
             tuple(a.tactic for a in first),
             tuple(b.tactic for b in second),
+            fma_tactic,
         )
         if key not in self._plans:
             with torch.cuda.device(self.device):
@@ -327,7 +367,16 @@ class CudnnFrostBf16MoeRunner(MoERunner):
                         "Prepare cuDNN Frost MoE outside CUDA Graph capture"
                     )
                 self._plans[key] = _Plans(
-                    t, h, i, e, k, self.device, first, second, self._workspace_pool
+                    t,
+                    h,
+                    i,
+                    e,
+                    k,
+                    self.device,
+                    first,
+                    second,
+                    self._workspace_pool,
+                    fma_tactic,
                 )
         output = torch.empty_like(act.hidden_states_q)
         # Exact shapes: a fixed native plan cannot execute a rounded profile.
@@ -369,7 +418,18 @@ class CudnnFrostBf16MoeRunner(MoERunner):
             self.device,
             self.config.activation,
         )
-        return [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
+        tactics = [(_TAG, a.tactic, b.tactic) for a, b in product(first, second)]
+        fma_tactic = _fma_tactic(
+            tokens,
+            hidden,
+            self.config.experts.intermediate_size,
+            self.config.routing.num_experts,
+            self.config.routing.top_k,
+            self.config.activation,
+        )
+        if fma_tactic is not None:
+            tactics.append(fma_tactic)
+        return tactics
 
     def get_cache_key_extras(self, inputs):
         return super().get_cache_key_extras(inputs) + (

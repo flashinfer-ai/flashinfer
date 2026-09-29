@@ -71,6 +71,7 @@ import tvm_ffi
 
 from .cake_jit import (
     GEMM_KERNEL_KEY,
+    GEMM_RSTAGED_KERNEL_KEY,
     GEMM_TSTORE_KERNEL_KEY,
     MODULES,
     decode_kernel_key,
@@ -307,6 +308,91 @@ def decode_module_stages(
     )
 
 
+# Co-resident cluster capacity of the cluster split-K decode instances per architecture and cluster size
+# (``cuOccupancyMaxActiveClusters`` of the ``_cs<C>`` instance; one CTA per SM, so it depends only on the GPC topology).
+# A persistent cluster grid larger than ``C x capacity`` serialises whole clusters into a second pass.  Measured on
+# B200 / B300; mirrors the source repository's table.
+DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
+    "sm_100a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15},  # B200, 148 SMs
+    "sm_103a": {
+        2: 74,
+        3: 45,
+        4: 33,
+        5: 26,
+        6: 22,
+        7: 15,
+        8: 15,
+    },  # B300, 148 SMs (same GPC topology)
+}
+
+
+def decode_cs_alias_fits(
+    tok: int, stages: int, fused: bool, resident: bool, csplit: int, xb_stages: int = 0
+) -> bool:
+    """Round 5: True when the one-round cluster exchange inbox + staging blocks
+    ``(2C - 1) x 128 x (chunk | 1) x 4`` fit inside the physical instance's pipeline
+    stages (host mirror of the Cake ``decode_cs_alias_fits`` rule); the fused view of a
+    wide tile (1 stage at t128) does not fit and keeps the small-inbox exchange."""
+    if csplit < 2:
+        return False
+    tok_rows = max(tok, 32)
+    xb_bytes = tok * 512 if (fused and not resident) else 0
+    xb_ring = bool(fused and not resident and xb_stages > 0)
+    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
+    stage_bytes = (
+        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    )
+    module_stages = decode_module_stages(tok, stages, fused, resident, xb_stages)
+    tok_per_cta = -(-tok // csplit)  # ceil(tok / csplit)
+    chunk = (
+        -(-tok_per_cta // 4) * 4
+    )  # round the per-CTA row count up to a multiple of 4
+    return (2 * csplit - 1) * 128 * (chunk | 1) * 4 <= module_stages * stage_bytes
+
+
+def decode_cs_small_inbox_rounds(
+    tok: int, stages: int, fused: bool, resident: bool, csplit: int, xb_stages: int = 0
+) -> int:
+    """Round 5: exchange rounds of the small (non-aliased) cluster inbox next to the
+    physical pipeline stages (host mirror of the Cake ``decode_cs_small_inbox_rounds``
+    rule).  The aliased one-round exchange is selected only when this is > 1: with 4-8
+    rows per rank the small inbox already holds the owner range in one round, and the
+    all-rank ordering the aliased exchange needs costs ~1.6 us at C8."""
+    if csplit < 2:
+        return 1
+    tok_rows = max(tok, 32)
+    xb_bytes = tok * 512 if (fused and not resident) else 0
+    xb_ring = bool(fused and not resident and xb_stages > 0)
+    stage_x_bytes = 0 if resident else tok_rows * BLOCK_K
+    stage_bytes = (
+        DEC_W_BYTES + stage_x_bytes + DEC_SF_BYTES + (0 if xb_ring else xb_bytes)
+    )
+    xb_ring_bytes = xb_stages * xb_bytes if xb_ring else 0
+    res_bytes = DEC_RES_SLOTS * (tok_rows * BLOCK_K + 1024) if resident else 0
+    module_stages = decode_module_stages(tok, stages, fused, resident, xb_stages)
+    need = 5 * (2 * csplit - 1) * 128 * 4
+    while (
+        module_stages > 1
+        and DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+        < need
+    ):
+        module_stages -= 1
+    budget = DEC_SMEM_CAP - module_stages * stage_bytes - res_bytes - xb_ring_bytes
+    tpc = -(-tok // csplit)
+    chunk = min(-(-tpc // 4) * 4, (budget // ((2 * csplit - 1) * 128 * 4) - 1) // 4 * 4)
+    return -(-tpc // max(chunk, 4))
+
+
+def decode_cluster_capacity(arch: str, csplit: int) -> int:
+    """Co-resident cluster capacity of ``arch`` for cluster size ``csplit`` (tabulated; raises when not measured)."""
+    table = DECODE_MAX_ACTIVE_CLUSTERS.get(arch, {})
+    if csplit not in table:
+        raise ValueError(
+            f"cluster capacity of {arch} for csplit {csplit} is not tabulated (DECODE_MAX_ACTIVE_CLUSTERS)"
+        )
+    return int(table[csplit])
+
+
 @dataclass(frozen=True)
 class DecodeConfig:
     """Resolved decode route of one ``(M, n_tiles128, num_k_iters)`` on one architecture."""
@@ -329,6 +415,8 @@ class DecodeConfig:
     qlanes: int = (
         16  # lanes per quantization unit (16 = half-warp units, 8 / 4 = narrow units)
     )
+    csplit: int = 1  # round 5: K split across the CTAs of one cluster (== split); the partials meet in SMEM (DSM)
+    cs_alias: bool = False  # round 5: the DSM inbox aliases the dead pipeline stages (one exchange round); only when every CTA owns one work item
 
     @property
     def tok_rows(self) -> int:
@@ -343,6 +431,8 @@ class DecodeConfig:
             self.resident,
             self.xb_stages,
             self.qlanes,
+            self.csplit,
+            cs_alias=self.cs_alias,
         )
 
 
@@ -375,6 +465,16 @@ def decode_config(
     tok, split, fused = int(entry["tok"]), int(entry["split"]), bool(entry["fused"])
     persist = bool(entry.get("persist", True))
     split = max(1, min(split, int(num_k_iters)))
+    # Table key ``csplit`` (round 5): the K split runs across the C CTAs of one cluster and the FP32 partials meet
+    # in the owning CTA's shared memory (no gmem partials, no counters); ``split`` == C and the persistent grid is a
+    # whole number of clusters.
+    csplit = int(entry.get("csplit", 1))
+    if csplit > 1:
+        if csplit > 8 or csplit > tok or csplit > int(num_k_iters):
+            raise ValueError(
+                f"decode table entry csplit {csplit} needs 2 <= C <= min(8, tok {tok}, num_k_iters {num_k_iters})"
+            )
+        split = csplit
     tok_rows = max(tok, 32)
     epi_bytes = min(32, tok) * 128 * 4
     xb_bytes = tok * 512
@@ -417,7 +517,16 @@ def decode_config(
     m_tiles = -(-M // tok)
     tiles = int(n_tiles128) * m_tiles
     total_work = tiles * split
-    grid = min(total_work, int(sm_count)) if persist else total_work
+    # Table key ``grid`` (round 4): a balanced persistent CTA count (e.g. 128 CTAs for 256 work items) instead of one
+    # CTA per SM; the round-4 A/B of the 16384-row buckets preferred 128 x 2 items over 148 x 1.73.
+    grid = (
+        min(total_work, int(entry.get("grid") or sm_count)) if persist else total_work
+    )
+    if csplit > 1:
+        # Whole clusters, and no more clusters than the GPCs co-schedule (a second pass of clusters doubles the time).
+        grid = csplit * max(
+            1, min(grid // csplit, decode_cluster_capacity(arch, csplit))
+        )
     resident = (
         bool(entry.get("resident", False))
         and fused
@@ -425,6 +534,7 @@ def decode_config(
         and split == 1
         and tok <= 64
         and -(-total_work // grid) <= DEC_RES_SLOTS
+        and csplit == 1
     )
     if resident:
         xb_stages = 0  # resident tiles are fetched once; no ring
@@ -448,6 +558,14 @@ def decode_config(
         tok_per_cta=-(-tok // split),
         xb_stages=xb_stages,
         qlanes=qlanes,
+        csplit=csplit,
+        cs_alias=csplit > 1
+        and grid == total_work
+        and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages)
+        and decode_cs_small_inbox_rounds(
+            tok, stages, fused, resident, csplit, xb_stages
+        )
+        > 1,
     )
 
 
@@ -461,6 +579,7 @@ def required_kernel_keys(arch: str, sm_count: int = 148) -> tuple[str, ...]:
         quant_kernel_key(4),
         GEMM_KERNEL_KEY,
         GEMM_TSTORE_KERNEL_KEY,
+        GEMM_RSTAGED_KERNEL_KEY,
     ]
     for key in DECODE_TABLE.get(arch, {}):
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
@@ -670,6 +789,13 @@ def reduction_layout(
     c_off = -(-sf_bytes // 256) * 256
     if cfg is None:
         return c_off, 0, c_off, 0
+    if cfg.csplit > 1:
+        return (
+            c_off,
+            256,
+            c_off + 256,
+            0,
+        )  # the cluster exchange keeps its partials in SMEM
     split_cap = min(prepared.num_k_iters, max(cfg.split * 2, 1))
     c_bytes = -(-(cfg.tiles * 2 * 4) // 256) * 256
     p_off = c_off + c_bytes
@@ -734,6 +860,13 @@ def _store_vec(data_ptr: int, ldo: int) -> int:
     return 2
 
 
+def gemm_reg_staged_eligible(tma_store: bool, store_vec: int) -> bool:
+    """Staged row-coalesced register epilogue (round 5) for output views the TMA store cannot address but whose rows
+    are at least 8-byte aligned (``store_vec >= 4``; e.g. ``n_valid = 6284``): the tile is staged in SMEM and copied
+    out row by row so every store instruction writes whole 32-byte sectors."""
+    return not tma_store and int(store_vec) >= 4
+
+
 def gemm_tma_store_eligible(data_ptr: int, ldo: int, n_valid: int) -> bool:
     """The output view can be a TMA tensor map: 16-byte base, a row stride that is a multiple of 16 bytes and a
     16-byte column edge.  The TMA unit bounds-checks the inner (contiguous) axis of a store at 16-byte granularity,
@@ -759,6 +892,7 @@ class ProjectionPlan:
     route: str  # "decode" or "gemm"
     decode: Optional[DecodeConfig]
     gemm_tma_store: bool  # GEMM route: TMA-store epilogue (aligned output view) instead of the register epilogue
+    gemm_reg_staged: bool  # GEMM route: staged row-coalesced register epilogue (8-byte aligned rows the TMA store cannot address)
     quant_units: Optional[int]  # None when the decode instance quantizes in-CTA
     sf_rows: int
     kernels: tuple[str, ...]  # logical kernel key per launch, in launch order
@@ -775,10 +909,12 @@ def route_plan(
     arch: str,
     sm_count: int,
     gemm_tma_store: bool = True,
+    gemm_reg_staged: bool = False,
 ) -> ProjectionPlan:
     """Resolve the launch sequence of ``M`` rows without touching device memory.
 
-    ``gemm_tma_store`` selects the GEMM epilogue program (``gemm_tma_store_eligible`` of the output view)."""
+    ``gemm_tma_store`` / ``gemm_reg_staged`` select the GEMM epilogue program (``gemm_tma_store_eligible`` /
+    ``gemm_reg_staged_eligible`` of the output view)."""
     M = int(M)
     cfg = decode_config(M, prepared.n_tiles128, prepared.num_k_iters, arch, sm_count)
     c_off, _c_bytes, p_off, p_bytes = reduction_layout(prepared, M, cfg)
@@ -792,7 +928,13 @@ def route_plan(
         kernels.append(quant_kernel_key(units))
         grids.append(-(-(M * units_per_row) // (QUANT_WARPS * 2)))
     if cfg is None:
-        kernels.append(GEMM_TSTORE_KERNEL_KEY if gemm_tma_store else GEMM_KERNEL_KEY)
+        kernels.append(
+            GEMM_TSTORE_KERNEL_KEY
+            if gemm_tma_store
+            else GEMM_RSTAGED_KERNEL_KEY
+            if gemm_reg_staged
+            else GEMM_KERNEL_KEY
+        )
         grids.append(_gemm_grid(_m_tiles(M), prepared.n_tiles))
     else:
         kernels.append(cfg.kernel_key)
@@ -804,6 +946,7 @@ def route_plan(
         route="decode" if cfg is not None else "gemm",
         decode=cfg,
         gemm_tma_store=cfg is None and bool(gemm_tma_store),
+        gemm_reg_staged=cfg is None and not gemm_tma_store and bool(gemm_reg_staged),
         quant_units=units,
         sf_rows=cfg.tok if cfg is not None else SF_TILE_ROWS,
         kernels=tuple(kernels),
@@ -977,12 +1120,14 @@ def prepare_kimi_k3_fp8_projection(
     )
     q, sf = workspace
     ldo = int(out.stride(0))
+    tma_store = gemm_tma_store_eligible(out.data_ptr(), ldo, prepared.n_valid)
     plan = route_plan(
         prepared,
         M,
         arch,
         sm_count,
-        gemm_tma_store_eligible(out.data_ptr(), ldo, prepared.n_valid),
+        tma_store,
+        gemm_reg_staged_eligible(tma_store, _store_vec(out.data_ptr(), ldo)),
     )
     out_flat = torch.as_strided(
         out, (ldo * (M - 1) + prepared.n_valid,), (1,), out.storage_offset()

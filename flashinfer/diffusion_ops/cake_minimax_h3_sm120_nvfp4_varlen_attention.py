@@ -335,6 +335,19 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     with the FP4 block-scaled tolerance ``atol = 1.0, rtol = 0.1`` (see the tests), not the FP8
     operator's ``0.1``.
 
+    Performance ceiling of the attention launch (measured on RTX 5090 and RTX PRO 6000 Blackwell,
+    both GB202): the kernel needs 246 registers per thread, so one 8-warp CTA is resident per SM
+    (two warps per SM sub-partition) and each warp alternates a ~1400-cycle ``mxf4nvf4`` MMA burst
+    with a ~2700-cycle FP32 softmax / P-quantization phase that only the other warp's burst can
+    overlap.  The tensor pipe is therefore active ~58 % of the time and the launch runs at ~60 %
+    of the tensor-pipe floor on production plans (~55 % on 4096-token plans), against 84-88 % for
+    the MMA-only skeleton; L2 and DRAM are idle (L2 hit > 99 %).  Ping-pong barrier placement,
+    softmax emission order, FMA-pipe exp2, power-of-two P block scales, packed f16x2 P conversions,
+    a precomputed ``qm K^T`` compensation table, K/V multicast / DSM sharing, a 64-key 3-CTA
+    geometry and split-KV were each measured or bounded on both SKUs and none is faster within the
+    FP4 error budget, so the attention kernel is unchanged; the softmax dependency chain under the
+    two-warps-per-sub-partition register budget is the binding resource.
+
     Parameters
     ----------
     q, k, v : torch.Tensor

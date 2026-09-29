@@ -483,6 +483,41 @@ def test_packed_calls_take_the_affine_split_and_cache_bitwise(lengths):
 
 
 @pytest.mark.parametrize(
+    "lengths,heads", [([16384], 16), ([16384], 12), ([8192, 8192], 16)]
+)
+def test_strided_qkv_views_take_the_same_route_as_dense_bitwise(lengths, heads):
+    # Serving hands q / k / v over as split(dim=-1) views of one packed qkv row
+    # (token pitch > heads * 128).  The affine split gate must see the same
+    # route as the dense copies it used to receive, and the composite must
+    # produce the same bits from the views as from dense operands.
+    dense = _inputs(lengths, heads, seed=23)
+    pool = dense["pool"].clone()
+    dense_call = _run(dense)
+    dense_got = _snapshot(dense)
+    if len(lengths) == 1:
+        assert "affine" in str(dense_call.schedule)
+
+    strided = dict(dense)
+    tokens = sum(lengths)
+    packed = torch.zeros(
+        1, tokens, 4 * heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
+    packed[:, :, 0:heads].copy_(dense["q"])
+    packed[:, :, heads : 2 * heads].copy_(dense["k"])
+    packed[:, :, 2 * heads : 3 * heads].copy_(dense["v"])
+    strided["q"] = packed[:, :, 0:heads]
+    strided["k"] = packed[:, :, heads : 2 * heads]
+    strided["v"] = packed[:, :, 2 * heads : 3 * heads]
+    assert not strided["q"].is_contiguous()
+    strided["out"] = torch.empty_like(dense["out"])
+    strided["state_checkpoints"] = torch.zeros_like(dense["state_checkpoints"])
+    dense["pool"].copy_(pool)
+    strided_call = _run(strided)
+    assert str(strided_call.schedule) == str(dense_call.schedule)
+    _assert_same(_snapshot(strided), dense_got)
+
+
+@pytest.mark.parametrize(
     "lengths", [[5461, 5461, 5462], [4096] * 4, [500] * 6 + [13384], [2048] * 8]
 )
 def test_packed_calls_below_the_break_even_keep_the_sequential_body(lengths):
