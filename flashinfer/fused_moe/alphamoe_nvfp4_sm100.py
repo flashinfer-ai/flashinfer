@@ -427,7 +427,8 @@ def alphamoe_nvfp4_aligned_moe(
     ----------
     hidden_states : torch.Tensor
         Packed E2M1 activations ``[M, K / 2]``. The innermost stride must be 1;
-        row-strided views are supported.
+        row-strided views require a positive row stride of at least ``K / 2``
+        that is divisible by 16, and a 16-byte-aligned data pointer.
     hidden_states_scale : torch.Tensor
         Linear E4M3 scales ``[M, K / 16]``.
     gemm1_weights : torch.Tensor
