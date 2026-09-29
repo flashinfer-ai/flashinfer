@@ -191,6 +191,7 @@ from .jit.cake_sparse_mla_sm120_dsv41_mixed import (
     cake_sparse_mla_sm120_dsv41_mixed_available,
     gen_cake_sparse_mla_sm120_dsv41_mixed_module,
 )
+from .jit.mla_kv_pack import gen_mla_kv_pack_fp8_module
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -912,6 +913,9 @@ def gen_all_modules(
         )
         if has_sm100a_exact or has_sm103a_exact:
             jit_specs.append(gen_alphamoe_sm100_module())
+        if has_sm100 or has_sm103 or has_sm107 or has_sm110 or has_sm120 or has_sm121:
+            # Fused MLA context K/V pack (dispatched on compute capability 10.0+).
+            jit_specs.append(gen_mla_kv_pack_fp8_module())
         if has_sm103:
             jit_specs.append(gen_fp4_quantization_sm103_module())
             jit_specs.append(gen_cutlass_fused_moe_sm103_module())
