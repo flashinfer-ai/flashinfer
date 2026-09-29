@@ -149,14 +149,8 @@ def get_kernel(kind, arch, heads, tuning=()):
         if kind == "fused":
             from .fused import build_kernel
 
-            intra_unroll, bf16_handoff, max_items = tuning
-            return build_kernel(
-                heads,
-                arch,
-                intra_unroll=intra_unroll,
-                bf16_handoff=bf16_handoff,
-                max_items=max_items,
-            )
+            (max_items,) = tuning
+            return build_kernel(heads, arch, max_items=max_items)
         from .split import make_front, make_chain
 
         if kind == "front":

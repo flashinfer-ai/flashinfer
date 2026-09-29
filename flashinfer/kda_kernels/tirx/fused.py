@@ -111,8 +111,6 @@ def build_kernel(
     wg_regs=40,
     intra_regs=104,
     prep_regs=112,
-    intra_unroll=False,
-    bf16_handoff=False,
     max_items=MAX_ITEMS,
 ):
     """Persistent CTAs, each walking its host-built item list (see _host_item_table).
@@ -714,7 +712,7 @@ def build_kernel(
                 load_state_from(h0, base, external=True)
 
             def load_state_hand():
-                """Continuation piece: acquire the producer CTA's flag, then expand its bf16 handoff state.
+                """Continuation piece: acquire the producer CTA's flag, then load its fp32 handoff state.
 
                 Warp 0 polls (all lanes read the same word); the other state warps wait at the role barrier, which
                 orders their loads after the acquire.  The flag is reset here so every launch starts from zero."""
@@ -731,34 +729,7 @@ def build_kernel(
                         txl.ptx.st.global_.s32(flags.ptr_to([cta]), txl.int32(0))
                 txl.ptx.bar.sync(txl.uint32(NB_STATE), txl.uint32(128))
                 base = txl.local_scalar("int32", init=cta * (D * D) + v_idx * D)
-                if bf16_handoff:
-                    for half_ in range(2):
-                        for q_ in range(2):
-                            qbase = 64 * half_ + 32 * q_
-                            for u in range(4):
-                                txl.ptx.ld.global_.v4.b32(
-                                    packed[4 * u],
-                                    packed[4 * u + 1],
-                                    packed[4 * u + 2],
-                                    packed[4 * u + 3],
-                                    hand.ptr_to([base + qbase + 8 * u]),
-                                )
-                            for j in range(16):
-                                lo, hi = unpack(packed[j])
-                                txl.assign(regs[2 * j], lo)
-                                txl.assign(regs[2 * j + 1], hi)
-                            txl.ptx[ST32x32](
-                                tmem(C_SACC + qbase), *[regs[j] for j in range(32)]
-                            )
-                            txl.ptx[ST32x16](
-                                tmem(C_SBF + qbase // 2),
-                                *[packed[j] for j in range(16)],
-                            )
-                    txl.ptx.tcgen05.wait__st.sync.aligned()
-                    txl.ptx[FENCE_BEFORE]()
-                    warrive(S_ready, 0)
-                else:
-                    load_state_from(hand, base)
+                load_state_from(hand, base)
 
             def store_state_to(buf, fbase, external=False):
                 """S_acc (after the piece's last decay) -> [v][k] fp32 block at element offset `fbase`, one v row per lane.
@@ -793,32 +764,14 @@ def build_kernel(
                 store_state_to(final_state, fbase, external=True)
 
             def store_state_hand():
-                """Head piece: quantize once into a bf16 handoff slot, then publish it.
+                """Head piece: store the fp32 state into its handoff slot, then publish it.
 
                 Every thread fences its own stores, the role barrier collects them, and thread 0 releases the flag
-                at gpu scope.  The authoritative final-state path remains fp32."""
+                at gpu scope."""
                 fbase = txl.local_scalar(
                     "int32", init=(cta + txl.int32(1)) * (D * D) + v_idx * D
                 )
-                if bf16_handoff:
-                    for half_ in range(2):
-                        for q_ in range(2):
-                            qbase = 64 * half_ + 32 * q_
-                            txl.ptx[LD32x16](
-                                *[packed[j] for j in range(16)],
-                                tmem(C_SBF + qbase // 2),
-                            )
-                            txl.ptx.tcgen05.wait__ld.sync.aligned()
-                            for u in range(4):
-                                txl.ptx.st.global_.v4.b32(
-                                    hand.ptr_to([fbase + qbase + 8 * u]),
-                                    packed[4 * u],
-                                    packed[4 * u + 1],
-                                    packed[4 * u + 2],
-                                    packed[4 * u + 3],
-                                )
-                else:
-                    store_state_to(hand, fbase)
+                store_state_to(hand, fbase)
                 txl.ptx.fence.acq_rel.gpu()
                 txl.ptx.bar.sync(txl.uint32(NB_STATE), txl.uint32(128))
                 with txl.If(tid == 0), txl.Then():
@@ -1238,13 +1191,13 @@ def build_kernel(
                         ),
                     )
 
-            def beta_rows(sb, J, neg=True):
+            def beta_rows(sb, J):
                 """Row scales of T' = T diag(beta), carrying the state frame's 2^-S_SHIFT."""
                 b0 = txl.local_scalar("float32")
                 b1 = txl.local_scalar("float32")
                 txl.ptx.ld.shared.f32(b0, bsig.ptr_to([sb * 64 + 16 * J + r16]))
                 txl.ptx.ld.shared.f32(b1, bsig.ptr_to([sb * 64 + 16 * J + r16 + 8]))
-                f = txl.float32(-(2.0**-S_SHIFT) if neg else 2.0**-S_SHIFT)
+                f = txl.float32(2.0**-S_SHIFT)
                 return (b0 * f, b1 * f)
 
             AQK_SHIFT2 = txl.uint32(
@@ -1435,8 +1388,8 @@ def build_kernel(
                     fwait(vnew_done, (c + 1) % 2, ((c - 1) // 2) % 2, "in-wait-vnew")
                     txl.ptx.fence.proxy.async_.shared__cta()
                 st_frag(TT, 16 * q, 16 * q, tA[0])
-                # acc holds +T here (the negation and beta_rows' sign cancel): scale by +beta
-                rs = beta_rows(sb, q, neg=False)
+                # acc holds +T here: scale its rows by +beta
+                rs = beta_rows(sb, q)
                 pack_acc_rs_hilo(a_frag, a_lo, rs)
                 st_frag(TpT, 16 * q, 16 * q, a_frag)
                 st_frag(TpTlo, 16 * q, 16 * q, a_lo)
@@ -1445,67 +1398,40 @@ def build_kernel(
                 # beta is constant across the off-diagonal block-column solve: reuse the diagonal's row scales at every chain step
                 chain_rs = (txl.float32(0.0) - rs[0], txl.float32(0.0) - rs[1])
 
-                if intra_unroll:
+                # software-pipelined chain: step s+1's ldmatrix operands are fetched during step s; unconsumed fetches are clamped to an already written block
+                bL2 = [txl.alloc_local((4,), "uint32") for _ in range(3)]
+                b_frag2 = txl.alloc_local((4,), "uint32")
 
-                    def chain(I, J, terms):
-                        for n, Kk in enumerate(terms):
-                            ld_b(LT, 16 * Kk, 16 * I, bL[n])
-                        ld_b(TT, 16 * I, 16 * I, b_frag)
-                        for n, Kk in enumerate(terms):
-                            mma_frag(tA[Kk - J], bL[n], n == 0)
-                        pack_acc(a_frag)
-                        mma_frag(a_frag, b_frag, True)
-                        if I - J < 3:
-                            pack_acc(tA[I - J], neg=True)
-                        rs = beta_rows(sb, J)
-                        pack_acc_rs_hilo(a_frag, a_lo, rs)
-                        st_frag(TpT, 16 * J, 16 * I, a_frag)
-                        st_frag(TpTlo, 16 * J, 16 * I, a_lo)
+                def ld_ops(I_rt, dbL, db):
+                    # unconsumed operands are clamped onto the diagonal block of the same column (always written)
+                    I_c = txl.min(I_rt, 3)
+                    for n in range(3):
+                        ld_b(LT, 16 * txl.min(q + n, I_c), 16 * I_c, dbL[n])
+                    ld_b(TT, 16 * I_c, 16 * I_c, db)
 
-                    with txl.If(q == 0), txl.Then():
-                        chain(1, 0, [0])
-                        chain(2, 0, [0, 1])
-                        chain(3, 0, [0, 1, 2])
-                    with txl.If(q == 1), txl.Then():
-                        chain(2, 1, [1])
-                        chain(3, 1, [1, 2])
-                    with txl.If(q == 2), txl.Then():
-                        chain(3, 2, [2])
-                else:
-                    # software-pipelined chain: step s+1's ldmatrix operands are fetched during step s; unconsumed fetches are clamped to an already written block
-                    bL2 = [txl.alloc_local((4,), "uint32") for _ in range(3)]
-                    b_frag2 = txl.alloc_local((4,), "uint32")
-
-                    def ld_ops(I_rt, dbL, db):
-                        # unconsumed operands are clamped onto the diagonal block of the same column (always written)
-                        I_c = txl.min(I_rt, 3)
-                        for n in range(3):
-                            ld_b(LT, 16 * txl.min(q + n, I_c), 16 * I_c, dbL[n])
-                        ld_b(TT, 16 * I_c, 16 * I_c, db)
-
-                    with txl.If(q < 3), txl.Then():
-                        ld_ops(q + 1, bL, b_frag)
-                    with txl.serial(3 - q, unroll=False) as step:
-                        I_rt = q + 1 + step
-                        mma_frag(tA[0], bL[0], True)
-                        for n in range(1, 3):
-                            with txl.If(n <= step), txl.Then():
-                                mma_frag(tA[n], bL[n], False)
-                        pack_acc(a_frag)
-                        mma_frag(a_frag, b_frag, True)
-                        ld_ops(I_rt + 1, bL2, b_frag2)
-                        with txl.If(step == 0), txl.Then():
-                            pack_acc(tA[1], neg=True)
-                        with txl.If(step == 1), txl.Then():
-                            pack_acc(tA[2], neg=True)
-                        pack_acc_rs_hilo(a_frag, a_lo, chain_rs)
-                        st_frag(TpT, 16 * q, 16 * I_rt, a_frag)
-                        st_frag(TpTlo, 16 * q, 16 * I_rt, a_lo)
-                        for n in range(3):
-                            for z in range(4):
-                                txl.assign(bL[n][z], bL2[n][z])
+                with txl.If(q < 3), txl.Then():
+                    ld_ops(q + 1, bL, b_frag)
+                with txl.serial(3 - q, unroll=False) as step:
+                    I_rt = q + 1 + step
+                    mma_frag(tA[0], bL[0], True)
+                    for n in range(1, 3):
+                        with txl.If(n <= step), txl.Then():
+                            mma_frag(tA[n], bL[n], False)
+                    pack_acc(a_frag)
+                    mma_frag(a_frag, b_frag, True)
+                    ld_ops(I_rt + 1, bL2, b_frag2)
+                    with txl.If(step == 0), txl.Then():
+                        pack_acc(tA[1], neg=True)
+                    with txl.If(step == 1), txl.Then():
+                        pack_acc(tA[2], neg=True)
+                    pack_acc_rs_hilo(a_frag, a_lo, chain_rs)
+                    st_frag(TpT, 16 * q, 16 * I_rt, a_frag)
+                    st_frag(TpTlo, 16 * q, 16 * I_rt, a_lo)
+                    for n in range(3):
                         for z in range(4):
-                            txl.assign(b_frag[z], b_frag2[z])
+                            txl.assign(bL[n][z], bL2[n][z])
+                    for z in range(4):
+                        txl.assign(b_frag[z], b_frag2[z])
 
                 isync()
                 txl.ptx.fence.proxy.async_.shared__cta()
@@ -2119,7 +2045,7 @@ def build_kernel(
         "dt_bias": txl.gptr[txl.f32, (H * D,)],
         "h0": txl.gptr[txl.f32],
         "final_state": txl.gptr[txl.f32],
-        "hand": txl.gptr[txl.bf16] if bf16_handoff else txl.gptr[txl.f32],
+        "hand": txl.gptr[txl.f32],
         "flags": txl.gptr[txl.i32],
         "items": txl.gptr[txl.u32],
         "item_counts": txl.gptr[txl.i32],

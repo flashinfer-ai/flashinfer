@@ -93,8 +93,6 @@ def _fused_plan(data, offsets, T, H, arch):
     nseq = len(lengths)
     sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
     num_ctas = min(sm_count, H * nseq)
-    # Every split schedule hands off FP32 state.
-    bf16_handoff = False
     lists = _host_item_table(offsets, H, num_ctas)
     # max_items is a compile-time per-CTA stride: bucket it so varied long
     # work lists reuse a few kernels.
@@ -109,7 +107,7 @@ def _fused_plan(data, offsets, T, H, arch):
     counts = torch.tensor(list(map(len, lists)), dtype=torch.int32, device=dev)
     hand = torch.empty(
         (num_ctas + 1) * D * D,
-        dtype=torch.bfloat16 if bf16_handoff else torch.float32,
+        dtype=torch.float32,
         device=dev,
     )
     flags = torch.zeros(num_ctas + 1, dtype=torch.int32, device=dev)
@@ -125,9 +123,7 @@ def _fused_plan(data, offsets, T, H, arch):
         _TensorMap(data["beta"], (H, T), (H * 2,), (8, 64), 0, 2),
         activation_map(data["output"], rows=32),
     ]
-    executable = get_kernel(
-        "fused", arch, H, (H == 64 and nseq == 1, bf16_handoff, max_items)
-    )
+    executable = get_kernel("fused", arch, H, (max_items,))
     args = _convert(
         (
             *(m.ptr for m in maps),
@@ -263,16 +259,10 @@ def _split_plan(data, T, H, arch):
         current = torch.cuda.current_stream(dev)
         fork.record(current)
         chain_stream.wait_event(fork)
-        if H == 64:
-            with tvm_ffi.use_torch_stream(torch.cuda.stream(chain_stream)):
-                chain(*a2)
-            with tvm_ffi.use_torch_stream():
-                front(*a1)
-        else:
-            with tvm_ffi.use_torch_stream():
-                front(*a1)
-            with tvm_ffi.use_torch_stream(torch.cuda.stream(chain_stream)):
-                chain(*a2)
+        with tvm_ffi.use_torch_stream():
+            front(*a1)
+        with tvm_ffi.use_torch_stream(torch.cuda.stream(chain_stream)):
+            chain(*a2)
         join.record(chain_stream)
         current.wait_event(join)
 

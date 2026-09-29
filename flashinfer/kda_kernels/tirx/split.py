@@ -210,9 +210,10 @@ def make_front(H: int, arch: str):
     so that every L row / Aqk row lands in ONE TMEM lane (Layout F); the norms are folded into
     T1' = diag(kn) T diag(b) and T2' = T1' diag(kn); one warp per item inverts (four solvers)."""
 
-    # H64 benefits from amortizing publication over eight completed items.
-    # Keep four for H96, where more frequent publication measures faster.
-    signal_batch = 8 if H == 64 else SIG_BATCH
+    # Publish completed items to the chain in batches: eight amortizes the
+    # flag traffic once 64+ heads load the front end, while fewer heads keep
+    # the chain's wait short with four (H16-H48 vs H64-H128, B300).
+    signal_batch = 8 if H >= 64 else SIG_BATCH
 
     @txl.kernel(warps=20, arch=arch, min_blocks_per_sm=1, grid="num_ctas")
     def kda_front(
