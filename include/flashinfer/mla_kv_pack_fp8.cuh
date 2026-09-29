@@ -57,11 +57,11 @@ constexpr int kRopeUint4PerRow = kRopeDim * 2 / 16;  // 8
 __device__ __forceinline__ uint2 cvt_octet_satfinite(const uint4 bits) {
   uint2 out;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 890
-  // No fp8 cvt before sm_89; the Python guard never dispatches here.
+  // No fp8 cvt before sm_89; the Python guard never dispatches here. The asm
+  // is excluded (not just skipped) so ptxas never sees it for older targets.
   __trap();
   out = make_uint2(0u, 0u);
-  return out;
-#endif
+#else
   asm("{\n\t"
       ".reg .b16 p0, p1, p2, p3;\n\t"
       "cvt.rn.satfinite.e4m3x2.f32 p0, %2, %3;\n\t"
@@ -76,6 +76,7 @@ __device__ __forceinline__ uint2 cvt_octet_satfinite(const uint4 bits) {
         "f"(__uint_as_float(bits.y & 0xFFFF0000u)), "f"(__uint_as_float(bits.y << 16)),
         "f"(__uint_as_float(bits.z & 0xFFFF0000u)), "f"(__uint_as_float(bits.z << 16)),
         "f"(__uint_as_float(bits.w & 0xFFFF0000u)), "f"(__uint_as_float(bits.w << 16)));
+#endif
   return out;
 }
 
