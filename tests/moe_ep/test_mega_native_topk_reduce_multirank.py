@@ -126,7 +126,7 @@ def _allocate_reference_workspace(
         rank,
         world_size,
         gate_up_clamp=problem["gate_up_clamp"],
-        defer_topk_reduce=False,
+        use_custom_finalize=False,
         combine_dtype="bf16",
         fc1_alpha=problem["fc1_alpha"],
         fc2_alpha=problem["fc2_alpha"],
@@ -277,8 +277,8 @@ def test_native_reducer_reusable_workspaces_four_rank_end_to_end():
         assert large.max_tokens_per_rank == 4096
         assert layer._kernel._uses_native_topk_reduce(small._fleet_params)
         assert layer._kernel._uses_native_topk_reduce(large._fleet_params)
-        assert small_raw._frontend.config.defer_topk_reduce
-        assert large_raw._frontend.config.defer_topk_reduce
+        assert small_raw._frontend.config.use_custom_finalize
+        assert large_raw._frontend.config.use_custom_finalize
         assert pooled_workspace_refcount(small_raw) == 1
         assert pooled_workspace_refcount(large_raw) == 1
         assert layer._preprocessing_count == 1

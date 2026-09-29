@@ -103,7 +103,7 @@ class MegaMoENvfp4Config:
     non_ubulk_fc2_store: bool = True
     enable_in_kernel_fc2_reduce: bool = False
     in_kernel_fc2_reduce: bool = False
-    defer_topk_reduce: bool = False
+    use_custom_finalize: bool = False
     topk_reduce_persistent: bool = False
     token_back_mode: Literal[
         "epi_warps", "standalone_warps", "reuse_dispatch_warps"
@@ -205,13 +205,13 @@ class MegaMoENvfp4Config:
                 "path can only atomic-add terms whose topk score was already "
                 "absorbed before fc2."
             )
-        if self.defer_topk_reduce and (
+        if self.use_custom_finalize and (
             self.in_kernel_fc2_reduce
             or self.combine_dtype != "bf16"
             or not self.apply_topk_in_fc1
         ):
             raise ValueError(
-                "defer_topk_reduce requires in_kernel_fc2_reduce=False, "
+                "use_custom_finalize requires in_kernel_fc2_reduce=False, "
                 "combine_dtype='bf16', and apply_topk_in_fc1=True."
             )
         if self.group_hint is not None and self.group_hint <= 0:
@@ -372,10 +372,10 @@ class MegaMoENvfp4Frontend:
         a validated-once fast path: validation and cute-tensor construction
         run only when the launch cache misses.
         """
-        if self.config.defer_topk_reduce:
+        if self.config.use_custom_finalize:
             raise RuntimeError(
                 "run() cannot return an unreduced output when "
-                "defer_topk_reduce=True; use the terminal adapter"
+                "use_custom_finalize=True; use the terminal adapter"
             )
         resolved = self._resolve_num_tokens(inputs, num_tokens)
         valid = resolved if valid_num_tokens is None else valid_num_tokens
@@ -466,7 +466,7 @@ class MegaMoENvfp4Frontend:
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """Return a zero-copy combine view and its canonical root descriptor."""
-        if not self.config.defer_topk_reduce:
+        if not self.config.use_custom_finalize:
             raise RuntimeError("deferred TopK-reduce mode is not enabled")
         mega = self._mega
         if mega is None or mega.compiled is None:
@@ -535,7 +535,7 @@ class MegaMoENvfp4Frontend:
             c.epi_flag_batch,
             c.non_ubulk_fc2_store,
             c.in_kernel_fc2_reduce,
-            c.defer_topk_reduce,
+            c.use_custom_finalize,
             c.topk_reduce_persistent,
             c.token_back_mode,
             c.combine_dtype,
@@ -602,7 +602,7 @@ class MegaMoENvfp4Frontend:
             fc2_output_dtype=cutlass.BFloat16,
             non_ubulk_fc2_store=c.non_ubulk_fc2_store,
             in_kernel_fc2_reduce=c.in_kernel_fc2_reduce,
-            skip_topk_reduce=c.defer_topk_reduce,
+            skip_topk_reduce=c.use_custom_finalize,
             topk_reduce_persistent=c.topk_reduce_persistent,
             token_back_mode=c.token_back_mode,
             apply_topk_in_fc1=c.apply_topk_in_fc1,
@@ -1136,7 +1136,7 @@ def get_symm_buffer_for_mega_moe(
     situ_linear_beta: Optional[float] = None,
     apply_topk_in_fc1: bool = True,
     enable_in_kernel_fc2_reduce: bool = False,
-    defer_topk_reduce: bool = False,
+    use_custom_finalize: bool = False,
     topk_reduce_persistent: bool = False,
     combine_dtype: Literal["bf16", "mxfp8", "nvfp4"] = "bf16",
     fc1_alpha: Optional[PerExpertEpilogue] = None,
@@ -1239,7 +1239,7 @@ def get_symm_buffer_for_mega_moe(
         situ_linear_beta=situ_linear_beta,
         apply_topk_in_fc1=apply_topk_in_fc1,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
-        defer_topk_reduce=defer_topk_reduce,
+        use_custom_finalize=use_custom_finalize,
         topk_reduce_persistent=topk_reduce_persistent,
         combine_dtype=combine_dtype,
         # Constructed valid even before knobs land: quantized combine rejects

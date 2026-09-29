@@ -140,7 +140,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
             situ_linear_beta=k.situ_linear_beta,
             apply_topk_in_fc1=k.apply_topk_in_fc1,
             enable_in_kernel_fc2_reduce=k.enable_in_kernel_fc2_reduce,
-            defer_topk_reduce=self._uses_native_topk_reduce(fleet_params),
+            use_custom_finalize=self._uses_native_topk_reduce(fleet_params),
             combine_dtype=k.combine_dtype,
             fc1_alpha=k.fc1_alpha,
             fc2_alpha=k.fc2_alpha,
@@ -270,7 +270,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
                 "MegaMoE workspace is not warmed for CUDA graph capture; "
                 "call layer.warmup(..., workspace=workspace) first"
             )
-        if frontend.config.defer_topk_reduce:
+        if frontend.config.use_custom_finalize:
             from flashinfer.jit.cake_megamoe_topk_reduce import (
                 is_cake_megamoe_topk_reduce_module_loaded,
             )
@@ -400,7 +400,7 @@ class Nvfp4CutedslMegaKernelBackend(MegaKernelBackend):
         state = self._prepared_thunk_state(workspace, transformed_weights)
         key, thunk, out_buf = state
         reducer_state = None
-        if workspace._frontend.config.defer_topk_reduce:
+        if workspace._frontend.config.use_custom_finalize:
             partials, workspace_root, _region = (
                 workspace._frontend.deferred_topk_reduce_workspace()
             )
