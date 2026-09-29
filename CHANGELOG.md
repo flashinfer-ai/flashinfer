@@ -1,3 +1,19 @@
+## Routed decode workspace preparation and graph ordering
+
+Clean up the temporary preparation event when recording or synchronizing it
+fails, preserving the original exception. Include the supported E256 clamped
+SwiGLU geometry in shape diagnostics and document caller ordering for graph
+replays that share workspace scratch.
+
+Validation: 112 CPU tests and seven API/graph cases passed at BF16
+atol=rtol=0.01, including autotuning, backend selection and cross-stream replay.
+Only the host binding object changed; all 44 device objects are unchanged.
+The reference library rebuild changed only 12 bytes of NVCC temporary filenames
+in its non-runtime symbol string table; all other bytes are identical.
+The previously reported full T=1..32 timings remain unchanged: geometric mean
+1.021482434x and 32 wins against FlashInfer, minimum 1.004732110x at T14.
+Hardware-limit evidence remains pending.
+
 # Changelog
 
 ## 2026-09-28

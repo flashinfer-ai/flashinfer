@@ -216,7 +216,8 @@ Shape CheckedShape(int64_t num_tokens, int64_t hidden_size, int64_t intermediate
          "(H=3072, I=1536, E=256, top_k=8) "
          "with SwiGLU, or "
          "(H=6144, I=1536, E=192, top_k=4) with SiLU, "
-         "(H=6144, I=3072, E=128, top_k=4) with parameterized SwiGLU, or "
+         "(H=6144, I=3072, E=128, top_k=4) with parameterized SwiGLU, "
+         "(H=4096, I=2048, E=256, top_k=6) with clamped SwiGLU, or "
          "(H=3584, I=3072, E=896, top_k=16) with SiTU, with 1 <= num_tokens <= 32";
   TVM_FFI_ICHECK(ActivationForGeometry(schedule.geometry) != Activation::kSiLU ||
                  FLASHINFER_CAKE_WARP_DECODE_HAS_SILU)
@@ -436,8 +437,14 @@ int64_t PrepareWorkspaceAlways(const Invocation& invocation, const Schedule& sch
   cudaEvent_t ready = nullptr;
   CheckCuda(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming),
             "cudaEventCreateWithFlags(workspace ready)");
-  CheckCuda(cudaEventRecord(ready, stream), "cudaEventRecord(workspace ready)");
-  CheckCuda(cudaEventSynchronize(ready), "cudaEventSynchronize(workspace ready)");
+  try {
+    CheckCuda(cudaEventRecord(ready, stream), "cudaEventRecord(workspace ready)");
+    CheckCuda(cudaEventSynchronize(ready), "cudaEventSynchronize(workspace ready)");
+  } catch (...) {
+    // Preserve the record/synchronize exception if cleanup also fails.
+    (void)cudaEventDestroy(ready);
+    throw;
+  }
   CheckCuda(cudaEventDestroy(ready), "cudaEventDestroy(workspace ready)");
 
   TVM_FFI_ICHECK(next_workspace_receipt > 0 &&

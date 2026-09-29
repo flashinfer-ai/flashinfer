@@ -1144,8 +1144,8 @@ class CakeWarpDecodeRunner(MoERunner):
         # pack_inputs runs before forward on every MoELayer call. During graph
         # capture it cannot allocate, so transfer the most recently used,
         # already-prepared workspace for this exact geometry to the capture
-        # stream. forward records the stream claim and C++ inserts the external
-        # completion-event dependency on any prior warmup submission.
+        # stream. forward records the stream claim. The caller must order uses
+        # of shared scratch: captured calls do not wait on a prior submission.
         for cached_key, (_, workspace) in reversed(self._workspace_cache.items()):
             if cached_key[1] != geometry:
                 continue
@@ -1189,10 +1189,10 @@ class CakeWarpDecodeRunner(MoERunner):
             )
         ):
             # A framework may pack on its caller stream and perform the first
-            # real launch on an internal side stream. During capture, the C++
-            # completion event records the dependency on any prior warmup
-            # submission, so the prepared packed workspace can transfer without
-            # allocation. Eager cross-stream calls still allocate independently.
+            # real launch on an internal side stream. Capture can transfer the
+            # prepared workspace without allocation; the caller must order any
+            # graph replay or eager call sharing it. Captured launches do not
+            # insert a wait. Eager cross-stream calls allocate independently.
             self._cache_workspace_for_stream(stream, geometry, packed_workspace)
             return packed_workspace
 

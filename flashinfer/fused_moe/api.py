@@ -595,6 +595,11 @@ class CakeWarpDecodeConfig:
     The physical weight and activation layouts are exactly those produced by
     :class:`TrtllmFp4Config` for NVFP4×NVFP4. This keeps one quantized
     representation usable by both runners.
+
+    CUDA Graph capture requires a warmed workspace. Graph replays and eager
+    calls that share a workspace must be ordered by the caller; captured calls
+    do not insert a wait for another graph using that workspace. Use separate
+    MoELayer instances for graphs that need to execute concurrently.
     """
 
     backend: Literal["cake"] = "cake"
