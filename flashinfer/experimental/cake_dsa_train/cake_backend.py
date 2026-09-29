@@ -1243,6 +1243,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
             q_latent, q_rope, kv_latent, k_rope, indices,
             topk_length=topk_length, softmax_scale=softmax_scale,
         )
+        ctx.set_materialize_grads(False)  # no zero-filled grad for an unused lse; dout is None when out is unused
         ctx.softmax_scale = softmax_scale
         ctx.has_topk_length = topk_length is not None
         saved = [q_latent, q_rope, kv_latent, k_rope, indices, out, lse]
@@ -1254,13 +1255,17 @@ class DSASparseAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse=None):
+        if dlse is not None:
+            raise NotImplementedError("gradients through lse are not supported; only out is differentiable")
+        if dout is None:  # out unused downstream
+            return None, None, None, None, None, None, None
         q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo, topk_length = ctx.saved_tensors
         if not ctx.has_o_lo:
             raise NotImplementedError(
                 "backward is unavailable: the registered program is forward-only (placeholder)"
             )
         dq_latent, dq_rope, dkv_latent, dk_rope = backward(
-            q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout.contiguous(),
+            q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout,
             topk_length=topk_length if ctx.has_topk_length else None,
             softmax_scale=ctx.softmax_scale,
         )
