@@ -308,6 +308,19 @@ __device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_
 }
 
 
+__device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
+    asm volatile(
+        "tcgen05.ld.sync.aligned.32x32b.x16.b32"
+        " {%0, %1, %2, %3, %4, %5, %6, %7,"
+        "  %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
+        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
+          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
+          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
+          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
+        : "r"(tmem_addr));
+}
+
+
 __device__ __forceinline__ float max_noftz(float a, float b) {
     float c;
     asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
@@ -372,25 +385,6 @@ __device__ __forceinline__ void tcgen05_commit(int mbar_addr) {
 }
 
 
-__device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
-    asm volatile(
-        "tcgen05.ld.sync.aligned.32x32b.x16.b32"
-        " {%0, %1, %2, %3, %4, %5, %6, %7,"
-        "  %8, %9, %10, %11, %12, %13, %14, %15}, [%16];"
-        : "=f"(dst[0]),  "=f"(dst[1]),  "=f"(dst[2]),  "=f"(dst[3]),
-          "=f"(dst[4]),  "=f"(dst[5]),  "=f"(dst[6]),  "=f"(dst[7]),
-          "=f"(dst[8]),  "=f"(dst[9]),  "=f"(dst[10]), "=f"(dst[11]),
-          "=f"(dst[12]), "=f"(dst[13]), "=f"(dst[14]), "=f"(dst[15])
-        : "r"(tmem_addr));
-}
-
-
-__device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
-    tmem_ld_x16(dst, addr);
-    asm volatile("tcgen05.wait::ld.sync.aligned;");
-}
-
-
 __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
     uint32_t result;
     asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1f, 0xffffffff;"
@@ -401,7 +395,7 @@ __device__ __forceinline__ uint32_t make_warp_uniform(uint32_t val) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) void
-kernel_deepgemm_dense_mqa_sm100a_777c689b6ee1eeff5bde(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta)
+kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta)
 {
     const int tid = threadIdx.x;
     const uint32_t warp = __shfl_sync(0xffffffff, threadIdx.x / 32, 0);
@@ -586,18 +580,20 @@ kernel_deepgemm_dense_mqa_sm100a_777c689b6ee1eeff5bde(const __grid_constant__ CU
                         mbarrier_wait(umma_full_addr + (math_tmem_stage) * 8, _phase_umma_full);
                         asm volatile("tcgen05.fence::after_thread_sync;");
                         int kv_pos = (unsigned int)kv_start + kv_iter * 256 + wg_idx * 128 + (warp % 4 * 32 + lane);
-                        #pragma unroll
-                        for (int qi = 0; qi < 4; qi++) {
-                            int acc_base = taddr + math_tmem_stage * 128 + (unsigned int)(qi * 32) + (warp % 4 * 32 << 16);
-                            float _tmem_load_0[32];
-                            tmem_ld_x16(&_tmem_load_0[0], acc_base);
-                            asm volatile("tcgen05.wait::ld.sync.aligned;");
-                            tmem_ld_x16(&_tmem_load_0[16], acc_base + 16);
-                            asm volatile("tcgen05.wait::ld.sync.aligned;");
-                            if (qi == 3) {
-                                asm volatile("tcgen05.fence::before_thread_sync;");
-                                mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
-                            }
+                        float _tmem_load_0[32];
+                        tmem_ld_x16(&_tmem_load_0[0], taddr + math_tmem_stage * 128 + (warp % 4 * 32 << 16));
+                        tmem_ld_x16(&_tmem_load_0[16], taddr + math_tmem_stage * 128 + (warp % 4 * 32 << 16) + 16);
+                        float _tmem_load_1[32];
+                        tmem_ld_x16(&_tmem_load_1[0], taddr + math_tmem_stage * 128 + 32 + (warp % 4 * 32 << 16));
+                        tmem_ld_x16(&_tmem_load_1[16], taddr + math_tmem_stage * 128 + 32 + (warp % 4 * 32 << 16) + 16);
+                        asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                        float _tmem_load_2[32];
+                        tmem_ld_x16(&_tmem_load_2[0], taddr + math_tmem_stage * 128 + 64 + (warp % 4 * 32 << 16));
+                        tmem_ld_x16(&_tmem_load_2[16], taddr + math_tmem_stage * 128 + 64 + (warp % 4 * 32 << 16) + 16);
+                        float _tmem_load_3[32];
+                        tmem_ld_x16(&_tmem_load_3[0], taddr + math_tmem_stage * 128 + 96 + (warp % 4 * 32 << 16));
+                        tmem_ld_x16(&_tmem_load_3[16], taddr + math_tmem_stage * 128 + 96 + (warp % 4 * 32 << 16) + 16);
+                        {
                             float _relu_wsum_0;
                             {
                                 float2 _sum0 = make_float2(0.0f, 0.0f);
@@ -608,13 +604,13 @@ kernel_deepgemm_dense_mqa_sm100a_777c689b6ee1eeff5bde(const __grid_constant__ CU
                                     float2 _a0_abs = make_float2(fabsf(_tmem_load_0[0 + _j]), fabsf(_tmem_load_0[0 + _j + 1]));
                                     float2 _a0;
                                     asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_a0) : "l"(*(const unsigned long long*)&_a0_raw), "l"(*(const unsigned long long*)&_a0_abs));
-                                    float2 _b0 = make_float2(weights_reg[qi * 32 + _j], weights_reg[qi * 32 + _j + 1]);
+                                    float2 _b0 = make_float2(weights_reg[0 + _j], weights_reg[0 + _j + 1]);
                                     asm volatile("fma.rn.f32x2 %0, %1, %2, %0;" : "+l"(*(unsigned long long*)&_sum0) : "l"(*(const unsigned long long*)&_a0), "l"(*(const unsigned long long*)&_b0));
                                     float2 _a1_raw = make_float2(_tmem_load_0[0 + _j + 2], _tmem_load_0[0 + _j + 3]);
                                     float2 _a1_abs = make_float2(fabsf(_tmem_load_0[0 + _j + 2]), fabsf(_tmem_load_0[0 + _j + 3]));
                                     float2 _a1;
                                     asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_a1) : "l"(*(const unsigned long long*)&_a1_raw), "l"(*(const unsigned long long*)&_a1_abs));
-                                    float2 _b1 = make_float2(weights_reg[qi * 32 + _j + 2], weights_reg[qi * 32 + _j + 3]);
+                                    float2 _b1 = make_float2(weights_reg[0 + _j + 2], weights_reg[0 + _j + 3]);
                                     asm volatile("fma.rn.f32x2 %0, %1, %2, %0;" : "+l"(*(unsigned long long*)&_sum1) : "l"(*(const unsigned long long*)&_a1), "l"(*(const unsigned long long*)&_b1));
                                 }
                                 float2 _sum;
@@ -622,13 +618,115 @@ kernel_deepgemm_dense_mqa_sm100a_777c689b6ee1eeff5bde(const __grid_constant__ CU
                                 _relu_wsum_0 = (_sum.x + _sum.y) * 0.5f;
                             }
                             float weighted_sum = _relu_wsum_0;
-                            int q_row = q_start + qi;
+                            int q_row = q_start;
                             unsigned long long q_offset = (unsigned long long)q_row * (unsigned long long)stride_logits;
                             unsigned long long out_elem = q_offset + (unsigned long long)kv_pos;
                             {
-                                weighted_sum = ((kv_pos >= seq_start[qi] && kv_pos < seq_end[qi]) ? weighted_sum : -CUDART_INF_F);
+                                weighted_sum = ((kv_pos >= seq_start[0] && kv_pos < seq_end[0]) ? weighted_sum : -CUDART_INF_F);
                             }
                             *(reinterpret_cast<float*>(Logits + out_elem) + (0)) = weighted_sum;
+                        }
+                        {
+                            float _relu_wsum_1;
+                            {
+                                float2 _sum0 = make_float2(0.0f, 0.0f);
+                                float2 _sum1 = make_float2(0.0f, 0.0f);
+                                #pragma unroll
+                                for (int _j = 0; _j < 32; _j += 4) {
+                                    float2 _a0_raw = make_float2(_tmem_load_1[0 + _j], _tmem_load_1[0 + _j + 1]);
+                                    float2 _a0_abs = make_float2(fabsf(_tmem_load_1[0 + _j]), fabsf(_tmem_load_1[0 + _j + 1]));
+                                    float2 _a0;
+                                    asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_a0) : "l"(*(const unsigned long long*)&_a0_raw), "l"(*(const unsigned long long*)&_a0_abs));
+                                    float2 _b0 = make_float2(weights_reg[32 + _j], weights_reg[32 + _j + 1]);
+                                    asm volatile("fma.rn.f32x2 %0, %1, %2, %0;" : "+l"(*(unsigned long long*)&_sum0) : "l"(*(const unsigned long long*)&_a0), "l"(*(const unsigned long long*)&_b0));
+                                    float2 _a1_raw = make_float2(_tmem_load_1[0 + _j + 2], _tmem_load_1[0 + _j + 3]);
+                                    float2 _a1_abs = make_float2(fabsf(_tmem_load_1[0 + _j + 2]), fabsf(_tmem_load_1[0 + _j + 3]));
+                                    float2 _a1;
+                                    asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_a1) : "l"(*(const unsigned long long*)&_a1_raw), "l"(*(const unsigned long long*)&_a1_abs));
+                                    float2 _b1 = make_float2(weights_reg[32 + _j + 2], weights_reg[32 + _j + 3]);
+                                    asm volatile("fma.rn.f32x2 %0, %1, %2, %0;" : "+l"(*(unsigned long long*)&_sum1) : "l"(*(const unsigned long long*)&_a1), "l"(*(const unsigned long long*)&_b1));
+                                }
+                                float2 _sum;
+                                asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_sum) : "l"(*(const unsigned long long*)&_sum0), "l"(*(const unsigned long long*)&_sum1));
+                                _relu_wsum_1 = (_sum.x + _sum.y) * 0.5f;
+                            }
+                            float weighted_sum_1 = _relu_wsum_1;
+                            int q_row_1 = q_start + 1;
+                            unsigned long long q_offset_1 = (unsigned long long)q_row_1 * (unsigned long long)stride_logits;
+                            unsigned long long out_elem_1 = q_offset_1 + (unsigned long long)kv_pos;
+                            {
+                                weighted_sum_1 = ((kv_pos >= seq_start[1] && kv_pos < seq_end[1]) ? weighted_sum_1 : -CUDART_INF_F);
+                            }
+                            *(reinterpret_cast<float*>(Logits + out_elem_1) + (0)) = weighted_sum_1;
+                        }
+                        {
+                            asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
+                            asm volatile("tcgen05.fence::before_thread_sync;");
+                            mbarrier_arrive(umma_empty_addr + (math_tmem_stage) * 8);
+                            float _relu_wsum_2;
+                            {
+                                float2 _sum0 = make_float2(0.0f, 0.0f);
+                                float2 _sum1 = make_float2(0.0f, 0.0f);
+                                #pragma unroll
+                                for (int _j = 0; _j < 32; _j += 4) {
+                                    float2 _a0_raw = make_float2(_tmem_load_2[0 + _j], _tmem_load_2[0 + _j + 1]);
+                                    float2 _a0_abs = make_float2(fabsf(_tmem_load_2[0 + _j]), fabsf(_tmem_load_2[0 + _j + 1]));
+                                    float2 _a0;
+                                    asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_a0) : "l"(*(const unsigned long long*)&_a0_raw), "l"(*(const unsigned long long*)&_a0_abs));
+                                    float2 _b0 = make_float2(weights_reg[64 + _j], weights_reg[64 + _j + 1]);
+                                    asm volatile("fma.rn.f32x2 %0, %1, %2, %0;" : "+l"(*(unsigned long long*)&_sum0) : "l"(*(const unsigned long long*)&_a0), "l"(*(const unsigned long long*)&_b0));
+                                    float2 _a1_raw = make_float2(_tmem_load_2[0 + _j + 2], _tmem_load_2[0 + _j + 3]);
+                                    float2 _a1_abs = make_float2(fabsf(_tmem_load_2[0 + _j + 2]), fabsf(_tmem_load_2[0 + _j + 3]));
+                                    float2 _a1;
+                                    asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_a1) : "l"(*(const unsigned long long*)&_a1_raw), "l"(*(const unsigned long long*)&_a1_abs));
+                                    float2 _b1 = make_float2(weights_reg[64 + _j + 2], weights_reg[64 + _j + 3]);
+                                    asm volatile("fma.rn.f32x2 %0, %1, %2, %0;" : "+l"(*(unsigned long long*)&_sum1) : "l"(*(const unsigned long long*)&_a1), "l"(*(const unsigned long long*)&_b1));
+                                }
+                                float2 _sum;
+                                asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_sum) : "l"(*(const unsigned long long*)&_sum0), "l"(*(const unsigned long long*)&_sum1));
+                                _relu_wsum_2 = (_sum.x + _sum.y) * 0.5f;
+                            }
+                            float weighted_sum_2 = _relu_wsum_2;
+                            int q_row_2 = q_start + 2;
+                            unsigned long long q_offset_2 = (unsigned long long)q_row_2 * (unsigned long long)stride_logits;
+                            unsigned long long out_elem_2 = q_offset_2 + (unsigned long long)kv_pos;
+                            {
+                                weighted_sum_2 = ((kv_pos >= seq_start[2] && kv_pos < seq_end[2]) ? weighted_sum_2 : -CUDART_INF_F);
+                            }
+                            *(reinterpret_cast<float*>(Logits + out_elem_2) + (0)) = weighted_sum_2;
+                        }
+                        {
+                            float _relu_wsum_3;
+                            {
+                                float2 _sum0 = make_float2(0.0f, 0.0f);
+                                float2 _sum1 = make_float2(0.0f, 0.0f);
+                                #pragma unroll
+                                for (int _j = 0; _j < 32; _j += 4) {
+                                    float2 _a0_raw = make_float2(_tmem_load_3[0 + _j], _tmem_load_3[0 + _j + 1]);
+                                    float2 _a0_abs = make_float2(fabsf(_tmem_load_3[0 + _j]), fabsf(_tmem_load_3[0 + _j + 1]));
+                                    float2 _a0;
+                                    asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_a0) : "l"(*(const unsigned long long*)&_a0_raw), "l"(*(const unsigned long long*)&_a0_abs));
+                                    float2 _b0 = make_float2(weights_reg[96 + _j], weights_reg[96 + _j + 1]);
+                                    asm volatile("fma.rn.f32x2 %0, %1, %2, %0;" : "+l"(*(unsigned long long*)&_sum0) : "l"(*(const unsigned long long*)&_a0), "l"(*(const unsigned long long*)&_b0));
+                                    float2 _a1_raw = make_float2(_tmem_load_3[0 + _j + 2], _tmem_load_3[0 + _j + 3]);
+                                    float2 _a1_abs = make_float2(fabsf(_tmem_load_3[0 + _j + 2]), fabsf(_tmem_load_3[0 + _j + 3]));
+                                    float2 _a1;
+                                    asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_a1) : "l"(*(const unsigned long long*)&_a1_raw), "l"(*(const unsigned long long*)&_a1_abs));
+                                    float2 _b1 = make_float2(weights_reg[96 + _j + 2], weights_reg[96 + _j + 3]);
+                                    asm volatile("fma.rn.f32x2 %0, %1, %2, %0;" : "+l"(*(unsigned long long*)&_sum1) : "l"(*(const unsigned long long*)&_a1), "l"(*(const unsigned long long*)&_b1));
+                                }
+                                float2 _sum;
+                                asm volatile("add.rn.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_sum) : "l"(*(const unsigned long long*)&_sum0), "l"(*(const unsigned long long*)&_sum1));
+                                _relu_wsum_3 = (_sum.x + _sum.y) * 0.5f;
+                            }
+                            float weighted_sum_3 = _relu_wsum_3;
+                            int q_row_3 = q_start + 3;
+                            unsigned long long q_offset_3 = (unsigned long long)q_row_3 * (unsigned long long)stride_logits;
+                            unsigned long long out_elem_3 = q_offset_3 + (unsigned long long)kv_pos;
+                            {
+                                weighted_sum_3 = ((kv_pos >= seq_start[3] && kv_pos < seq_end[3]) ? weighted_sum_3 : -CUDART_INF_F);
+                            }
+                            *(reinterpret_cast<float*>(Logits + out_elem_3) + (0)) = weighted_sum_3;
                         }
                         math_tmem_stage += 1;
                         if (math_tmem_stage == 3) { math_tmem_stage = 0; _phase_umma_full ^= 1; }
@@ -930,8 +1028,8 @@ kernel_deepgemm_dense_mqa_sm100a_777c689b6ee1eeff5bde(const __grid_constant__ CU
                     int raw_end_1 = (unsigned int)kv_start_4 + num_kv_blocks_4 * 256;
                     int coverage_end = ((raw_end_1 < stride_logits) ? raw_end_1 : stride_logits);
                     #pragma unroll 1
-                    for (int qi_1 = 0; qi_1 < 4; qi_1++) {
-                        unsigned long long row_base = (unsigned long long)(q_start_4 + qi_1) * (unsigned long long)stride_logits;
+                    for (int qi = 0; qi < 4; qi++) {
+                        unsigned long long row_base = (unsigned long long)(q_start_4 + qi) * (unsigned long long)stride_logits;
                         int _min_1 = ((kv_start_4) < (clean_end) ? (kv_start_4) : (clean_end));
                         int aligned_start = (clean_begin + 3) / 4 * 4;
                         int aligned_end = _min_1 / 4 * 4;

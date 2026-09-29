@@ -18,11 +18,11 @@
 #include <unordered_map>
 #include <vector>
 
-extern "C" __global__ void kernel_deepgemm_dense_mqa_sm103a_8a5b2b84f38bf37c84b6(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Metadata, unsigned int num_q_tokens, unsigned int num_kv_tokens);
-extern "C" __global__ void kernel_deepgemm_dense_mqa_sm103a_ffe7cb3c68384cf2be65(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta);
+extern "C" __global__ void kernel_deepgemm_dense_mqa_sm100a_a8d73c728bfde94795f9(unsigned int* __restrict__ Starts, unsigned int* __restrict__ Ends, unsigned int* __restrict__ Metadata, unsigned int num_q_tokens, unsigned int num_kv_tokens);
+extern "C" __global__ void kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca(const __grid_constant__ CUtensorMap Q, const __grid_constant__ CUtensorMap KV, const __grid_constant__ CUtensorMap Weights, const __grid_constant__ CUtensorMap SF_Q, const __grid_constant__ CUtensorMap SF_KV, float* __restrict__ Logits, int* __restrict__ cu_seq_len_k_start, int* __restrict__ cu_seq_len_k_end, int seq_len, int seq_len_kv, int stride_logits, int num_q_blocks, unsigned int* __restrict__ ScheduleMeta);
 
 
-namespace deepgemm_host_shim_88a2491461c57bb3 {
+namespace deepgemm_host_shim_02dca873f69ee2a2 {
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
@@ -225,9 +225,9 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_deepgemm_dense_mqa_sm103a_8a5b2b84f38bf37c84b6), kargs);
+      &config, reinterpret_cast<const void*>(kernel_deepgemm_dense_mqa_sm100a_a8d73c728bfde94795f9), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_deepgemm_dense_mqa_sm103a_8a5b2b84f38bf37c84b6 failed: "
+      << "cudaLaunchKernelExC for kernel_deepgemm_dense_mqa_sm100a_a8d73c728bfde94795f9 failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -547,7 +547,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_Q, TensorView arg_K
       }
       if (smem_status == cudaSuccess) {
         smem_status = cudaFuncSetAttribute(
-            reinterpret_cast<const void*>(kernel_deepgemm_dense_mqa_sm103a_ffe7cb3c68384cf2be65),
+            reinterpret_cast<const void*>(kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca),
             cudaFuncAttributeMaxDynamicSharedMemorySize,
             206336);
       }
@@ -557,7 +557,7 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_Q, TensorView arg_K
     }
   }
   TVM_FFI_CHECK(smem_status == cudaSuccess, RuntimeError)
-      << "cudaFuncSetAttribute for kernel_deepgemm_dense_mqa_sm103a_ffe7cb3c68384cf2be65 failed: "
+      << "cudaFuncSetAttribute for kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca failed: "
       << cudaGetErrorString(smem_status);
   prepared.p_Q = EncodeTma_Q(arg_Q);
   prepared.p_KV = EncodeTma_KV(arg_KV);
@@ -608,9 +608,9 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   config.attrs = attrs;
   config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_deepgemm_dense_mqa_sm103a_ffe7cb3c68384cf2be65), kargs);
+      &config, reinterpret_cast<const void*>(kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_deepgemm_dense_mqa_sm103a_ffe7cb3c68384cf2be65 failed: "
+      << "cudaLaunchKernelExC for kernel_deepgemm_dense_mqa_sm100a_50a476da21eb88ff4bca failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -631,14 +631,14 @@ void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
   stage_logits::Submit(prepared_logits, stream);
 }
 
-}  // namespace deepgemm_host_shim_88a2491461c57bb3
+}  // namespace deepgemm_host_shim_02dca873f69ee2a2
 
 extern "C" {
 TVM_FFI_DLL_EXPORT int __tvm_ffi_run(
     void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result) {
   TVM_FFI_SAFE_CALL_BEGIN();
   (void)self;
-  deepgemm_host_shim_88a2491461c57bb3::RunPacked(
+  deepgemm_host_shim_02dca873f69ee2a2::RunPacked(
       reinterpret_cast<const tvm::ffi::AnyView*>(args), num_args);
   tvm::ffi::TypeTraits<std::nullptr_t>::CopyToAnyView(nullptr, result);
   TVM_FFI_SAFE_CALL_END();
