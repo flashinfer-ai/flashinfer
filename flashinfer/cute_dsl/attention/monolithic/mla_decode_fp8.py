@@ -92,6 +92,14 @@ from .mla_helpers import (
     get_variable_query_tile_info,
 )
 
+
+def _is_sm107() -> bool:
+    if not hasattr(Arch, "sm_107"):
+        return False
+    arch = BaseDSL._get_dsl().get_arch_enum()
+    return Arch.sm_107 <= arch <= Arch.sm_107f
+
+
 """
 A Multi-Head Latent Attention (MLA) example using fp8 as input/output for the NVIDIA Blackwell SM100 architecture using CUTE DSL
 
@@ -370,8 +378,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
 
         self.load_q_stage = 1
-        self.load_k_stage = 3
-        self.load_v_stage = 2
+        self.load_k_stage, self.load_v_stage = (4, 4) if _is_sm107() else (3, 2)
         self.mma_s_stage = 2
         self.p_mma_stage = 2
         self.p_cor_stage = 2
