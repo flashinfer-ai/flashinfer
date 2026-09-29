@@ -453,14 +453,18 @@ class TestStaticExtentRules:
                 if key[0] == E and key[2] == H
             )
         else:
-            # MMA micro keeps the 128-aligned operands (correct and faster than the 256 extent);
+            # MMA micro keeps true extents when TMA-legal; otherwise it pads to 128;
             # key: ("micro", quant_mode, state_E, weight_E, m, k, n, ...)
             assert any(
-                key[6] == n_aligned
+                key[6] == (I if I % 32 == 0 else n_aligned)
                 for key in moe_dispatch._MICRO_KERNEL_CACHE
                 if key[0] == "micro" and key[3] == E and key[5] == H
             )
-            assert views.legacy_materialized
+            if I % 32 == 0:
+                assert views.tma_w13_fp4.data_ptr() == t["w1_weight"].data_ptr()
+                assert views.tma_down_fp4.data_ptr() == t["w2_weight"].data_ptr()
+            else:
+                assert views.legacy_materialized
 
     @pytest.mark.parametrize("intermediate", [272, 336])
     def test_unaligned_stride_uses_padded_views_for_both_kernels(self, intermediate):

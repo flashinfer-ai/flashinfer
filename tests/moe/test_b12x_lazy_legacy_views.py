@@ -1,14 +1,9 @@
-"""The tile-padded legacy weight views (generic dynamic / micro kernels) are built lazily.
+"""True-extent TMA views share FP4 storage across static, micro, and dynamic.
 
-The static kernel and the branch-paired gated NVFP4 dynamic kernel stream FP4 weights at the true intermediate extent
-through branch-major TMA views and need only the 128-aligned block scales, so a wrapper that only ever selects those
-kernels must never allocate or retain the padded FP4 copies. The first generic-dynamic or micro call materializes them
-once (never inside a CUDA graph capture: an eager warm-up call is required first). These tests pin that lifecycle on a
-non-128-multiple intermediate size.
-
-Which dynamic kernel runs depends on the workspace tile: the small-capacity wrappers of ``TestLazyLegacyViews`` size
-their dynamic workspace per call (tile M16/M32 -> the generic kernel on the legacy views); the capacity graph wrappers
-of ``TestBranchMajorDynamic`` get tile M128 -> the gated kernel on the branch-major views.
+Only the block scales need tile padding for MMA micro and generic dynamic.
+Small per-call dynamic workspaces select generic; capacity workspaces with
+M128 tiles select the optimized gated kernel. Both retain capture warm-up
+requirements and must agree numerically without materializing FP4 copies.
 """
 
 from __future__ import annotations
@@ -117,27 +112,28 @@ def _capture(graph, moe, kwargs):
 
 @pytest.mark.skipif(not _is_sm120(), reason="SM120 kernels")
 class TestLazyLegacyViews:
-    def test_dynamic_first_materializes_once_and_is_accurate(self):
+    def test_dynamic_first_shares_weights_and_is_accurate(self):
         num_tokens = _cutover_tokens() + 64
         t = _tensors(num_tokens)
         moe = _wrapper(max_num_tokens=num_tokens, use_cuda_graph=False)
         out = moe.run(**_kwargs(t))
         torch.cuda.synchronize()
         views = moe._weight_views
-        assert views.legacy_materialized
+        assert not views.legacy_materialized
         assert (
-            views.w13_fp4.shape[0] == 2 * 384 and views.down_fp4.shape[1] == 384 // 2
-        ), (
-            "legacy views must carry the 128-aligned extent (384 = align128(320)) per branch"
-        )
-        padded_w1, padded_w2 = views.w1_storage, views.w2_storage
+            views.tma_w13_fp4.shape[0] == 2 * INTERMEDIATE
+            and views.branch_major_down_fp4.shape[1] == INTERMEDIATE // 2
+        ), "generic TMA views must carry the true extent per branch"
+        assert views.tma_w13_fp4.data_ptr() == t["w1_weight"].data_ptr()
+        assert views.branch_major_down_fp4.data_ptr() == t["w2_weight"].data_ptr()
+        source_w1, source_w2 = views.w1_storage, views.w2_storage
         passed, pct, atol = check_accuracy(out, _reference(t, num_tokens))
         assert passed, f"dynamic output: {pct * 100:.2f}% within tol (atol={atol:.4f})"
         moe.run(**_kwargs(t))
         torch.cuda.synchronize()
         assert (
-            moe._weight_views.w1_storage is padded_w1
-            and moe._weight_views.w2_storage is padded_w2
+            moe._weight_views.w1_storage is source_w1
+            and moe._weight_views.w2_storage is source_w2
         )
 
     def test_static_then_dynamic_on_one_wrapper(self):
@@ -153,13 +149,13 @@ class TestLazyLegacyViews:
         assert not moe._weight_views.legacy_materialized
         out_big = moe.run(**_kwargs(t))
         torch.cuda.synchronize()
-        assert moe._weight_views.legacy_materialized
+        assert not moe._weight_views.legacy_materialized
         ref = _reference(t, big)
         assert check_accuracy(out_big, ref)[0]
         assert check_accuracy(out_small, ref[:64])[0]
 
-    def test_micro_calls_materialize_legacy_views(self):
-        """Direct micro shares true-extent weights; MMA micro still pads lazily."""
+    def test_micro_calls_share_true_extent_views(self):
+        """Direct and MMA micro both reuse source FP4 storage at I=320."""
         from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
         num_tokens = 4  # 8 routed rows -> direct micro under auto dispatch
@@ -174,16 +170,90 @@ class TestLazyLegacyViews:
         try:
             out = moe.run(**_kwargs(t))
             torch.cuda.synchronize()
-            assert moe._weight_views.legacy_materialized
-            padded_w1 = moe._weight_views.w1_storage
+            assert not moe._weight_views.legacy_materialized
+            source_w1 = moe._weight_views.w1_storage
+            assert source_w1.data_ptr() == t["w1_weight"].data_ptr()
             out = moe.run(**_kwargs(t))
             torch.cuda.synchronize()
         finally:
             moe_dispatch._FORCED_BACKEND = previous
         assert (
-            moe._weight_views.w1_storage is padded_w1
-        )  # materialized once, reused by the MMA micro kernel
+            moe._weight_views.w1_storage is source_w1
+        )  # reused by the MMA micro kernel
         assert check_accuracy(out, _reference(t, num_tokens))[0]
+
+    @pytest.mark.parametrize("backend", ["micro", "dynamic"])
+    @pytest.mark.parametrize("weight", ["w1_weight", "w2_weight"])
+    def test_strided_weights_copy_once_and_replay(self, backend, weight, monkeypatch):
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", backend)
+        num_tokens = 4 if backend == "micro" else _cutover_tokens() + 64
+        t = _tensors(num_tokens)
+        expected = _wrapper(num_tokens, True).run(**_kwargs(t)).clone()
+        kwargs = _kwargs(t)
+        packed = kwargs[weight]
+        kwargs[weight] = torch.stack((packed, torch.zeros_like(packed)), -1)[..., 0]
+        assert not kwargs[weight].is_contiguous()
+        moe = _wrapper(num_tokens, True)
+        actual = moe.run(**kwargs).clone()
+        views = moe._weight_views
+        assert not views.legacy_materialized
+        pointers = (views.tma_w13_fp4.data_ptr(), views.tma_down_fp4.data_ptr())
+        assert pointers[0 if weight == "w1_weight" else 1] != kwargs[weight].data_ptr()
+        assert views.tma_w13_fp4.shape[0] == 2 * INTERMEDIATE
+        assert views.tma_down_fp4.shape[1] == INTERMEDIATE // 2
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = moe.run(**kwargs)
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured, expected, atol=2e-2, rtol=2e-2)
+        assert pointers == (views.tma_w13_fp4.data_ptr(), views.tma_down_fp4.data_ptr())
+
+    @pytest.mark.parametrize("backend", ["micro", "dynamic"])
+    @pytest.mark.parametrize("weight", ["w1_weight", "w2_weight"])
+    def test_functional_strided_weights_reuse_copies_during_capture(
+        self, backend, weight, monkeypatch
+    ):
+        from flashinfer import b12x_fused_moe
+        from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
+
+        monkeypatch.setattr(moe_dispatch, "_FORCED_BACKEND", backend)
+        num_tokens = 4 if backend == "micro" else _cutover_tokens() + 64
+        # I=160 exercises true extents with eagerly prepared block scales.
+        t = create_moe_tensors(
+            num_tokens=num_tokens,
+            hidden_size=HIDDEN,
+            intermediate_size=160,
+            num_experts=EXPERTS,
+            num_local_experts=EXPERTS,
+            top_k=TOPK,
+            interleave_gated_weights=False,
+            use_nontrivial_alphas=False,
+        )
+        kwargs = dict(
+            _kwargs(t),
+            num_experts=EXPERTS,
+            top_k=TOPK,
+            output=torch.empty_like(t["x_bf16"]),
+        )
+        expected = b12x_fused_moe(**kwargs).clone()
+        packed = kwargs[weight]
+        kwargs[weight] = torch.stack((packed, torch.zeros_like(packed)), -1)[..., 0]
+        actual = b12x_fused_moe(**kwargs).clone()
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=2e-2)
+        # A fresh prepared view must find the eager copy instead of allocating
+        # another one (or refusing capture) on every functional invocation.
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = b12x_fused_moe(**kwargs)
+        for _ in range(3):
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(captured, expected, atol=2e-2, rtol=2e-2)
 
     def test_graph_capture_of_first_dynamic_use_is_refused_then_prewarm_works(self):
         num_tokens = _cutover_tokens() + 64
@@ -201,14 +271,14 @@ class TestLazyLegacyViews:
         # ... so capturing the first dynamic call is refused with a clear error, not a silent allocation.
         graph = torch.cuda.CUDAGraph()
         with pytest.raises(
-            ValueError, match="cannot be created during CUDA graph capture"
+            (ValueError, RuntimeError), match="during CUDA graph capture"
         ):
             _capture(graph, moe, kwargs)
         assert not moe._weight_views.legacy_materialized
-        # The natural pre-warm - one eager dynamic call - materializes; capture and replay then work and match eager.
+        # Eager warm-up prepares padded scales and kernels; replay reuses both.
         eager = moe.run(**kwargs).clone()
         torch.cuda.synchronize()
-        assert moe._weight_views.legacy_materialized
+        assert not moe._weight_views.legacy_materialized
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             captured = moe.run(**kwargs)
@@ -306,7 +376,7 @@ class TestLazyLegacyViews:
 
 
 def _dynamic_key_extents():
-    """branch_major_extent of every compiled dynamic kernel key for this module's shape (None = legacy views)."""
+    """branch_major_extent of every compiled dynamic kernel key for this module's shape (None = generic kernel)."""
     from flashinfer.fused_moe.cute_dsl.blackwell_sm12x import moe_dispatch
 
     return sorted(
@@ -369,9 +439,9 @@ class TestBranchMajorDynamic:
             f"branch-major dynamic output: {pct * 100:.2f}% within tol (atol={atol:.4f})"
         )
 
-    def test_gated_dynamic_agrees_with_generic_kernel_on_legacy_views(self):
+    def test_gated_dynamic_agrees_with_generic_kernel_on_true_extent_views(self):
         """Two independent kernels, same FP4 numerics: the branch-major gated kernel (capacity workspace, tile M128)
-        and the generic kernel on the padded legacy views (per-call workspace, 32 rows per expert -> tile M32) must
+        and the generic kernel on concatenated true-extent views (per-call workspace, 32 rows per expert -> tile M32) must
         agree at the FP4 noise floor on the same routes."""
         num_tokens = (
             32 * EXPERTS // TOPK
@@ -385,7 +455,7 @@ class TestBranchMajorDynamic:
         moe_generic = _wrapper(max_num_tokens=num_tokens, use_cuda_graph=False)
         out_generic = moe_generic.run(**_kwargs(t)).float()
         torch.cuda.synchronize()
-        assert moe_generic._weight_views.legacy_materialized
+        assert not moe_generic._weight_views.legacy_materialized
         assert None in _dynamic_key_extents()
         rel = ((out_gated - out_generic).norm() / out_generic.norm()).item()
         assert rel < 0.03, f"gated vs generic dynamic rel L2 {rel:.3e}"

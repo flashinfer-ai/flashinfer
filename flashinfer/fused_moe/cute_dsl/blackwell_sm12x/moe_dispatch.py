@@ -781,16 +781,20 @@ class _WeightViews:
     # (the static views may span a larger extent, see static_override).
     branch_major_w13_fp4: object = None
     branch_major_down_fp4: object = None
-    # Single-slice shapes: the whole static family (static, MMA micro, direct
-    # micro) consumes the 256-aligned copies; these are their storages and
+    # Concatenated branch view for MMA micro and generic dynamic TMA.
+    # Shares the true-extent backing (or the same TMA-stride fallback).
+    tma_w13_fp4: object = None
+    tma_down_fp4: object = None
+    # Single-slice shapes: static and direct micro consume 256-aligned
+    # copies; these are their storages and
     # the concatenated [2*256, k//2, E] / [k, 256//2, E] views.
     static_family_w1_storage: torch.Tensor | None = None
     static_family_w2_storage: torch.Tensor | None = None
     static_family_w13_fp4: object = None
     static_family_down_fp4: object = None
     # Lazy legacy views: when the caller hands over unpadded weights, the
-    # tile-padded [2n, k//2, E] / [k, n//2, E] copies the dynamic and micro
-    # kernels consume are built by this callable on first use only.
+    # tile-padded [2n, k//2, E] / [k, n//2, E] copies for direct-micro
+    # fallbacks are built by this callable on first use only.
     _legacy_builder: Optional[Callable[[], Tuple[torch.Tensor, torch.Tensor]]] = None
     # Source-layout scale storages; eligible dynamic FC2 also reads down scales
     # directly. Dynamic FC1 and fallback consumers use the tile-padded storages
@@ -801,6 +805,39 @@ class _WeightViews:
     )
     _padded_w13_sf_storage: torch.Tensor | None = None
     _padded_down_sf_storage: torch.Tensor | None = None
+
+    def compact_tma_weights(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Share compact backing; copy strided micro/generic inputs once.
+
+        Compiled TMA operands require compact [E, rows, packed_columns]
+        strides. A contiguous copy preserves the true extent without FP4
+        padding, and must be prepared eagerly before graph capture.
+        """
+        for name in ("tma_w13_fp4", "tma_down_fp4"):
+            tensor = getattr(self, name)
+            if not tensor.permute(2, 0, 1).is_contiguous():
+                # Functional calls recreate _WeightViews, so retain copies in
+                # the shared cache as well as this wrapper's prepared views.
+                key = (
+                    "compact_tma",
+                    tensor.data_ptr(),
+                    tensor.device,
+                    tensor.dtype,
+                    tuple(tensor.shape),
+                    tuple(tensor.stride()),
+                )
+                cached = _WEIGHT_CACHE.get(key)
+                if cached is None:
+                    _refuse_during_capture("contiguous micro / generic dynamic weights")
+                    compact = tensor.view(torch.uint8).permute(2, 0, 1).contiguous()
+                    cached = (compact.permute(1, 2, 0).view(tensor.dtype),)
+                    _WEIGHT_CACHE[key] = cached
+                    source = (
+                        self.w1_storage if name == "tma_w13_fp4" else self.w2_storage
+                    )
+                    _register_cache_eviction(_WEIGHT_CACHE, key, source)
+                setattr(self, name, cached[0])
+        return self.tma_w13_fp4, self.tma_down_fp4
 
     def padded_scales(self) -> Tuple[torch.Tensor, torch.Tensor]:
         """The tile-padded block-scale storages (dynamic / micro / direct-micro
@@ -827,10 +864,9 @@ class _WeightViews:
         return self.w13_fp4 is not None and self.down_fp4 is not None
 
     def ensure_legacy(self) -> None:
-        """Materialize the tile-padded legacy weight views on first dynamic /
-        micro use.  Static-only callers never reach this.  Refused during CUDA
-        graph capture: run one eager call that selects the dynamic or micro
-        backend (the natural warm-up) before capturing.
+        """Materialize tile-padded FP4 views for direct-micro fallbacks.
+        Refused during CUDA graph capture: run one eager call on the same
+        backend before capturing.
         """
         if self.legacy_materialized:
             return
@@ -840,10 +876,10 @@ class _WeightViews:
             )
         if torch.cuda.is_current_stream_capturing():
             raise ValueError(
-                "the tile-padded legacy weight views (dynamic / micro kernels) are "
+                "the tile-padded legacy weight views (direct-micro fallback) are "
                 "materialized on first use and cannot be created during CUDA graph "
-                "capture; run one eager warm-up call that selects the dynamic or "
-                "micro backend before capturing the graph"
+                "capture; run one eager warm-up call on the same backend "
+                "before capturing the graph"
             )
         w1_padded, w2_padded = self._legacy_builder()
         self.w13_fp4 = w1_padded.permute(1, 2, 0).view(torch.float4_e2m1fn_x2)
@@ -1080,9 +1116,9 @@ def _get_weight_views(
     describe and ``legacy_builder`` produces the padded copies lazily
     (``_WeightViews.ensure_legacy``), so a static-only caller never pins them.
 
-    ``n`` is the tile-aligned intermediate size that ``w1_fp4``/``w2_fp4``
-    carry ([2*n, k//2, E] concatenated w13 for dynamic/micro).  The static
-    kernel also gets branch-major views ([n_true, k//2, 2E] gated w13,
+    ``n`` is the tile-aligned intermediate size for padded scales and legacy
+    FP4 copies. MMA micro and generic dynamic get concatenated true-extent
+    views; static and gated dynamic get branch-major views ([n_true, k//2, 2E] gated w13,
     [k, n_true//2, E] down) built from the unpadded weights when the true
     ``intermediate_size`` differs, so TMA zero-fills a partial tail tile
     instead of streaming physically padded zeros.
@@ -1098,18 +1134,18 @@ def _get_weight_views(
       kernel needs two slices, so the caller passes ``static_override`` =
       ``(w1_fp4_256, w1_sf_256, w2_fp4_256, w2_sf_256, 256)`` (the 256-padded
       copies from ``_pad_intermediate_to_tile``) and the static kernel gets its
-      own scale storages; dynamic and micro keep the 128-aligned operands.
+      own scale storages; dynamic and MMA micro keep the TMA-legal extent.
     """
     activation_precision = _normalize_activation_precision(activation_precision)
     quant_mode = _normalize_quant_mode(quant_mode, activation_precision)
     sf_vec_size, sf_dtype = _sf_params_for_quant_mode(quant_mode)
     tile_n = _level_tile_n(activation_precision)
-    # The kernel splits w13 into gate/up halves by tile index. This only works
-    # when the boundary between halves lands on a tile-aligned column.
+    # Block-scale branches and legacy FP4 copies use a tile-aligned extent.
+    # True-extent FP4 descriptors are constructed separately below.
     if n % tile_n != 0:
         raise ValueError(
             f"intermediate_size ({n}) must be a multiple of {tile_n} "
-            f"for the SM120 MoE kernel's gate/up tile split."
+            f"for the SM120 MoE block-scale branches and padded operands."
         )
 
     key = (
@@ -1132,7 +1168,7 @@ def _get_weight_views(
     if not padded_fp4_present and n != n_true and legacy_builder is None:
         raise ValueError(
             "unpadded w13/down weights need a legacy_builder for the tile-padded "
-            "views the dynamic and micro kernels consume"
+            "FP4 fallback views"
         )
     cached = _WEIGHT_CACHE.get(key)
     if cached is None:
@@ -1194,6 +1230,7 @@ def _get_weight_views(
         w1_static.shape[0] * branches, n_true, w1_static.shape[2]
     ).permute(1, 2, 0)
     static_down = w2_static.permute(1, 2, 0)
+    tma_w13 = w1_static.permute(1, 2, 0)
     static_sf: Tuple[torch.Tensor | None, torch.Tensor | None] = (None, None)
     family: Tuple = (None, None, None, None)
     # Branch-major views for the gated dynamic kernel (and the static kernel
@@ -1221,6 +1258,7 @@ def _get_weight_views(
             w1_fp4.shape[0] * branches, n, w1_fp4.shape[2]
         ).permute(1, 2, 0)
         static_down = w2_fp4.permute(1, 2, 0)
+        tma_w13 = w1_fp4.permute(1, 2, 0)
         n_true = n
     branch_major_w13, branch_major_down = static_w13, static_down
     static_extent = n_true
@@ -1284,6 +1322,8 @@ def _get_weight_views(
         static_down_sf_storage=static_sf[1],
         branch_major_w13_fp4=branch_major_w13.view(torch.float4_e2m1fn_x2),
         branch_major_down_fp4=branch_major_down.view(torch.float4_e2m1fn_x2),
+        tma_w13_fp4=tma_w13.view(torch.float4_e2m1fn_x2),
+        tma_down_fp4=branch_major_down.view(torch.float4_e2m1fn_x2),
         static_family_w1_storage=family[0],
         static_family_w2_storage=family[1],
         static_family_w13_fp4=family[2],
@@ -2273,8 +2313,7 @@ def launch_sm120_static_moe(
 
     # Single-slice shapes: the static kernel and the direct CUDA-core micro
     # kernel consume the 256-aligned copies (_get_weight_views static_override);
-    # the MMA micro kernel is correct and faster on the 128-aligned operands
-    # and keeps them.
+    # MMA micro keeps the TMA-legal extent in weights.intermediate_size.
     family_n = n
     if weights.static_family_w13_fp4 is not None:
         family_n = int(weights.static_intermediate_size or n)
@@ -2490,7 +2529,7 @@ def launch_sm120_static_moe(
             num_experts,
             num_tokens,
             k,
-            n,
+            int(weights.intermediate_size or n),
             top_k,
             # Kernels take the per-slot row stride (token_map.shape[1]), not
             # the routed-row capacity.
@@ -2557,12 +2596,13 @@ def launch_sm120_static_moe(
     # ``make_fake_stream(use_tvm_ffi_env_stream=True)``, so TVM-FFI supplies
     # the caller's current stream and the parameter is absent from the
     # compiled signature.
-    # Micro kernels index the tile-aligned [2n, k//2, E] view; the static
-    # kernel streams the branch-major views at the true intermediate extent.
+    # MMA micro and static both stream TMA-legal extents: concatenated
+    # branches for micro, branch-major batches for static.
     w13_sf_arg, down_sf_arg = weights._w13_sf_storage, weights._down_sf_storage
     if use_micro:
         w13_sf_arg, down_sf_arg = weights.padded_scales()
-    if use_micro or weights.static_w13_fp4 is None:
+        w13_arg, down_arg = weights.compact_tma_weights()
+    elif weights.static_w13_fp4 is None:
         weights.ensure_legacy()
         w13_arg, down_arg = weights.w13_fp4, weights.down_fp4
     else:
@@ -2969,13 +3009,10 @@ def _dynamic_branch_major_extent(
     num_topk: int,
     share_input_across_experts: bool,
 ) -> int | None:
-    """True intermediate extent when the dynamic launch streams the
-    branch-major weight views (``_WeightViews.static_*``): only the
-    branch-paired gated NVFP4 kernel consumes them (up at batch 2e, gate at
-    2e+1, N and the FC2 reduction at the true extent).  The generic dynamic
-    kernel (relu2, MXFP4, oversize shapes) keeps the tile-padded concatenated
-    legacy views, so ``None`` is returned for it.  Mirrors the eligibility
-    decision of :class:`MoEDynamicKernel` exactly.
+    """Return the prepared branch-major extent for the gated NVFP4 kernel.
+
+    Mirror :class:`MoEDynamicKernel` eligibility. Generic dynamic returns
+    ``None`` and uses concatenated TMA views at the prepared weight extent.
     """
     if intermediate_size is None:
         return None
@@ -3182,7 +3219,7 @@ def _get_dynamic_kernel(
         w13_fake_shape = (branch_major_extent, k, 2 * E)
         down_fake_shape = (k, branch_major_extent, E)
     else:
-        # Generic kernel: tile-padded concatenated legacy views.
+        # Generic kernel: concatenated views with independently bounded branches.
         w13_fake_shape = (w1_rows, k, E)
         down_fake_shape = (k, n, E)
     b_w13_fake = cute.runtime.make_fake_compact_tensor(
@@ -3344,7 +3381,7 @@ def launch_sm120_dynamic_moe(
         num_experts,
         num_tokens,
         k,
-        n,
+        n if branch_major_extent is not None else int(weights.intermediate_size or n),
         top_k,
         workspace.max_rows,
         topk_ids_dtype=torch.int32,
@@ -3366,13 +3403,12 @@ def launch_sm120_dynamic_moe(
     # fixed-shape args are Tensor (pass torch tensor directly).  No stream
     # argument -- see the note in launch_sm120_static_moe.
     # The branch-paired gated kernel streams the branch-major views at the
-    # true intermediate extent (no padded FP4 copies); the generic kernel
-    # indexes the tile-padded concatenated legacy views.
+    # true intermediate extent; generic uses independently bounded branch
+    # descriptors over a concatenated view of the same TMA-legal backing.
     if branch_major_extent is not None and weights.branch_major_w13_fp4 is not None:
         w13_arg, down_arg = weights.branch_major_w13_fp4, weights.branch_major_down_fp4
     else:
-        weights.ensure_legacy()
-        w13_arg, down_arg = weights.w13_fp4, weights.down_fp4
+        w13_arg, down_arg = weights.compact_tma_weights()
     dynamic_w13_sf, dynamic_down_sf = weights.padded_scales()
     if source_down_scales:
         dynamic_down_sf = weights._down_sf_storage
