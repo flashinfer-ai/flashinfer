@@ -37,7 +37,7 @@ srun --jobid="$SLURM_JOB_ID" \
   --pty bash -l
 
 # 3. (Re)build FlashInfer in editable mode (EP backends are on by default;
-#    NCCL-EP needs no build step — nccl4py is a base dependency)
+#    NCCL-EP needs no build step — nccl-extensions is a base dependency)
 BUILD_NIXL_EP=0 \
     pip install --no-cache-dir --no-build-isolation -e .
 ```
@@ -51,6 +51,46 @@ NIXL-EP meson build, `BUILD_NIXL_EP=1` makes its missing build deps a hard
 error, `BUILD_NVEP=0` turns both backends off. Probe availability at runtime
 with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 
+### CUTLASS DSL version
+
+After the editable install, bring the DSL up to a supported version:
+
+```bash
+pip install -U "nvidia-cutlass-dsl[cu13]"   # or pin, e.g. ==4.6.1
+```
+
+The pt2605 container ships nvidia-cutlass-dsl **4.5.0**; the cutedsl mega
+kernels need ≥ 4.6.x. **4.6.1** is the perf-validated reference (the TUNING.md
+and benchmark tables were measured on it); **4.7.0** is correctness-validated
+(2026-08-10, jobs 2384640/2384641/2384650: drop harness, fused-quant unit
+tests, and the full deep_gemm/nvfp4/mxfp8 mega multirank + oracle suites all
+green) but its perf has not been measured — pin 4.6.1 when producing numbers
+meant to compare against the reference tables.
+
+History: this section used to be a hard `==4.6.1` pin because 4.7.0 crashed
+every 4-rank `deep_gemm.fp8_fp4_mega_moe` launch with
+`CUDA_ERROR_MISALIGNED_ADDRESS` (bisected 2026-08-05 on B200). The
+root cause was not deep_gemm or the dsl's bundled CUDA libs but the fused
+activation-quant staging (`DataPreprocess` in
+`kernel_src/sm100/cutedsl_megamoe/src/src/inputs_process.py`), shared by every mega
+staging path — fixed by the upstream `50117315d` sync recorded in that drop's
+VENDOR.md, after which the pin was lifted. The vLLM e2e sections below keep
+their own separate **4.5.2** pin (vLLM 0.25.1's requirement) — that pin is for
+the vLLM engine env, not for running the moe_ep test suite.
+
+Tolerance note (dsl-version-independent, resolved 2026-08-05): on B200 nodes
+`test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle[False]` used to fail by
+one bf16 cell (rank 3, |d|=16.0 vs atol=8.0, rel_l2≈0.0017) — the flat atol
+was really "1 bf16 ULP at |term|≈2048" calibrated on GB200's rounding, and
+where large per-topk terms nearly cancel the achievable agreement is bounded
+by the bf16 round-off of the TERMS, not of the final value. The mxfp8 oracle
+compares (multirank + single-GPU) now use a per-cell term-magnitude band
+derived from the oracle's own pre-reduce terms
+(`_assert_mega_oracle_term_band_close` in
+`tests/moe_ep/test_mxfp8_cutedsl_preprocess_vs_reference.py`), which is
+arch-independent. GB200 verified 2026-08-05; if a B200 run still trips the
+band, that is a real signal, not marginality.
+
 ### Run tests
 
 `tests/moe_ep/run_tests.sh <target>` — targets and requirements:
@@ -60,13 +100,26 @@ with `have_nccl_ep()`, `have_nixl_ep()`, `available_backends()`.
 | `bash tests/moe_ep/run_tests.sh unit` | 1 (host-only) | none — mocks + single GPU, no multirank |
 | `bash tests/moe_ep/run_tests.sh multirank` | 4 | NCCL-EP (NIXL-EP too if built) |
 | `bash tests/moe_ep/run_tests.sh split_path_correctness_bf16` | 4 | Blackwell |
-| `bash tests/moe_ep/run_tests.sh mega` | 4 | Blackwell sm_100+; DeepGEMM + NVFP4 + MXFP8 |
+| `bash tests/moe_ep/run_tests.sh mega` | 4 | Blackwell sm_100+; DeepGEMM + BF16 + NVFP4 + MXFP8 |
 
-- **unit** — host-only pytest (mocks + single-GPU).
+- **unit** — host-only pytest (mocks + single-GPU). The full run accumulates
+  native heap damage somewhere in the GPU/DSL/transport stack: with every
+  test PASSING, the process aborts either (a) at the first heavy
+  import/compile burst — historically
+  `test_workspace_pool.py::test_two_nvfp4_layers_share_one_symm_buffer`
+  (`Fatal Python error: Aborted` in the nvfp4 warmup's module imports) — or
+  (b) in CPython teardown after the pytest summary
+  (`malloc(): unaligned tcache chunk detected`, job 2388315). Not a kernel
+  or test bug: everything passes standalone, per-file, and in every subset
+  tried (observed since 2026-07-22; B200, dsl 4.6.1). `run_tests.sh unit`
+  therefore (1) runs that test in its own pytest process and (2) exits both
+  processes via `os._exit(pytest_rc)` to skip interpreter finalization. If
+  the isolated invocation ever FAILS (not crashes), that is a real signal.
+  Root cause still open — needs an ASAN/valgrind pass over the suite.
 - **multirank** — 4-GPU split path over NCCL-EP (and NIXL-EP when built).
 - **split_path_correctness_bf16** — 4-GPU bf16 split-path numerics vs a
   single-process `MoELayer` reference.
-- **mega** — 4-GPU DeepGEMM + NVFP4 + MXFP8 mega parity, plus a single-rank
+- **mega** — 4-GPU DeepGEMM + BF16 + NVFP4 + MXFP8 mega parity, plus single-rank
   MXFP8 preprocess-vs-reference check.
 
 `all` and `smoke` targets also exist. Split-path numerics are **bf16-only** for
@@ -141,8 +194,93 @@ Notes:
 - `NPROC_SMOKE` / `NPROC_MULTIRANK` (default 4) override the rank count for
   the `run_tests.sh` targets.
 - UCX/ibverbs are **build-time** deps; the tests set no `NIXL_*`/`UCX_*` env.
+  When UCX lives in a non-default prefix (e.g. `/opt/ucx` from the source
+  build above), put its `lib/` on `LD_LIBRARY_PATH` at **runtime** too —
+  loading a different UCX than the one nixl was built against fails at fleet
+  creation with `registerMem(...) != NIXL_SUCCESS`.
+- **Pin the `nixl-cu13` wheel to the 3rdparty/nixl submodule tag** (currently
+  `==1.3.1`; the build hook installs the pinned version via
+  `_NIXL_WHEEL_VERSION` in `build_backend.py`). `nixl_ep_cpp.so` compiles the
+  submodule's device kernels but loads the wheel's `libnixl.so` at runtime —
+  a skewed pair (e.g. a 1.4.x wheel over the v1.3.1 kernels) builds and
+  imports fine, then dies at the first dispatch with device asserts
+  (`nixlPut(...) == NIXL_IN_PROG` → `cudaErrorIllegalAddress`).
+- **Do not run concurrent `BUILD_NIXL_EP=1` installs from one checkout**
+  (e.g. several SLURM jobs sharing a network-filesystem clone): the build
+  patches `3rdparty/nixl` in place and shares `build_nvep/`, so parallel
+  installs race and fail with `git apply` / meson `Unknown option` errors.
+  Serialize the first build; later installs reuse the staged `_libs/` .so.
+- The install and the launcher must resolve to the **same interpreter**: an
+  editable install into a venv is invisible to a `torchrun` that resolves to
+  the system python (`ModuleNotFoundError: flashinfer` in the spawned ranks
+  while parent-shell imports work). When in doubt, launch with
+  `python -m torch.distributed.run` so the launcher is pinned to the python
+  that owns the install.
 - NIXL-EP coverage today is smoke + multirank + mocked unit tests only; the
   correctness/mega targets are NCCL-EP-only.
+
+### NCCL-EP low-latency device-kernel limits
+
+Two constraints of the `nccl.ep` LL device kernel (probed empirically on
+nccl-extensions 0.1.0; not enforced by `validate_fleet_params`, so they surface as
+device-side aborts):
+
+- **Per-token row widths are whitelisted**: LL dispatch accepts bf16 rows of
+  {2048, 2560, 4096, 5120, 6144, 7168, 8192} elements only — 3072, sub-2048
+  widths, and all 1-byte payload dtypes are rejected with
+  `low_latency.cu 'Unsupported hidden'`. The sent row may be narrower than
+  `FleetParams.token_hidden_size` (recv buffers mirror the sent row), which
+  is what the split path's packed-MXFP8 dispatch relies on.
+- **top-k is capped at 8** (`numTopk <= kNumMaxTopK`, `low_latency.cu`):
+  top-10 models (e.g. Qwen3.5) abort on NCCL-EP LL; use the HT algorithm or
+  NIXL-EP (which handles top-10 at LL).
+
+### SM90 mega token sweep
+
+Hopper-only (`sm90_fp8_fp8_bf16_pull_cutedsl`) correctness targets run in their own pytest
+process (the SM90/SM100 kernel trees are mutually exclusive per process):
+`bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
+`bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
+
+### SM107 (Rubin) mega tests
+
+The Rubin suites cover NVFP4 and MXFP8 E4M3/E5M2 on compute capability 10.7.
+Use the strict runner to collect per-rank results and fail on skips, OOMs,
+empty selections, or timeouts:
+
+```bash
+export CUTE_DSL_ARCH=sm_107a
+python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 \
+  --output-dir "${FI_RESULTS:?}/sm107-ep4"
+```
+
+For individual suites, use `bash tests/moe_ep/run_tests.sh oracle_sm107`
+(single GPU) or `NPROC_MULTIRANK=4 bash tests/moe_ep/run_tests.sh mega_sm107`.
+The distributed target also accepts 2 or 8 ranks. See the
+[validation guide](moe_ep_sm107_qualification.md).
+
+### Hopper performance benchmark
+
+The perf microbenchmark reproduces the kernel drop's Hopper P03 multirank
+token sweep (`moe_hopper_fp8/run_token_sweep_benchmark.py`, DSV4 geometry:
+topk 6, 384 experts EP4, hidden 7168, intermediate 3072 post-SwiGLU, tokens
+per rank 512..32768) through the FI `MoEEpLayer` mega path, on 4×H100:
+
+```bash
+torchrun --nproc_per_node=4 benchmarks/bench_moe_ep_sm90_mega.py
+```
+
+Rank 0 prints one `BENCH_CSV` row per (scale_mode, layout, tokens) point;
+each row names the matching drop reference CSV
+(`moe_hopper_fp8/benchmark_data/20260720/...`) so comparison is one grep
+away. The `compute_*_us` columns map to the drop's per-rank
+`mega_us + topk_us`; `e2e_*_us` adds FI staging/validation/output-copy.
+Axes: `--scale-mode {per_tensor,blockwise,both}`, `--swap-ab`/`--no-swap-ab`
+(default both layouts at the shim default tiles: non-swap M64 N128, swap-AB
+M256 N32), `--mma-tiler M,N`, `--tokens`, `--kind`. See the module docstring
+for the full timing/mapping notes. Measured results, comparison caveats,
+and the reproduce recipe live in
+[`kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm90/pull_style_cutedsl_megakernel/TUNING.md).
 
 ---
 
@@ -169,7 +307,7 @@ tree's `4_5_2-perf-fix` flashinfer branch, on **nvidia-cutlass-dsl 4.5.2**
 below only as a parity *reference*: the MR!27 mainloop WAR brings 4.5.2 to
 4.6.1 parity, so 4.5.2 is the runtime floor and versions below it are
 unsupported (4.5.0 fails at `cute.compile`) — see
-[`../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/cutedsl_megamoe/TUNING.md).
+[`../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md`](../../flashinfer/moe_ep/kernel_src/sm100/cutedsl_megamoe/TUNING.md).
 
 ### 1. Microbenchmark
 
@@ -180,11 +318,11 @@ models (`model_shapes/shapes.tsv`). The `deepseek_v3` geometry
 
 | column          | variant          | backend          | env |
 |-----------------|------------------|------------------|-----|
-| `dg`            | `fi_dg`          | `deep_gemm_mega` | — |
-| `nvfp4 bf16`    | `fi_fp4`         | `nvfp4_cutedsl`  | — |
-| `+ikr`          | `fi_ikr`         | `nvfp4_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
-| `+combine_nvfp4`| `fi_combine_fp4` | `nvfp4_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
-| `+combine_mxfp8`| `fi_combine_fp8` | `nvfp4_cutedsl`  | `MEGA_COMBINE_DTYPE=mxfp8` (32·e4m3 + e8m0/32 wire) |
+| `dg`            | `fi_dg`          | `sm100_fp8_fp4_bf16_deepgemm` | — |
+| `nvfp4 bf16`    | `fi_fp4`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | — |
+| `+ikr`          | `fi_ikr`         | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_IKR=1` (in-kernel fc2 reduce) |
+| `+combine_nvfp4`| `fi_combine_fp4` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=nvfp4` (16·e2m1 + bf16/16 wire) |
+| `+combine_mxfp8`| `fi_combine_fp8` | `sm100_nvfp4_nvfp4_bf16_cutedsl`  | `MEGA_COMBINE_DTYPE=mxfp8` (32·e4m3 + e8m0/32 wire) |
 
 Inside the flashinfer-EP container (editable install per "Build & test
 environment" above), pin the DSL and run the sweep:
@@ -214,7 +352,7 @@ python model_shapes/make_tables.py model_shapes/results/model_shapes_*.csv
 #### Microbenchmark results (2026-07-22, `e2e_pipelined` p50 µs)
 
 Default geometry (7168 hidden / 2048 inter / 256 experts / top-8), heuristic
-knobs, speedup vs `deep_gemm_mega` in parens:
+knobs, speedup vs `sm100_fp8_fp4_bf16_deepgemm` in parens:
 
 | tok/rank | dg     | nvfp4 bf16     | +ikr           | +combine_nvfp4     | +combine_mxfp8 |
 |---------:|-------:|---------------:|---------------:|-------------------:|---------------:|
@@ -233,7 +371,7 @@ The small-batch regime is weight-load bound and fp4-vs-fp4 there is a wash.
 **Real-model geometry sweep (2026-07-21)** — same recipe/session/node; pattern
 holds everywhere (dg-parity below ~512 tok/rank, fp4 combine-wire best at large
 tokens, 1.6-1.9x on 7168-hidden shapes). `e2e_pipelined` p50 µs, speedup vs
-`deep_gemm_mega` in parens.
+`sm100_fp8_fp4_bf16_deepgemm` in parens.
 
 _deepseek_v3_ — hidden 7168, inter 2048, 256 experts, top-8 (independent
 same-session re-run of the default table; matches within run noise):
@@ -308,8 +446,8 @@ env (all runs pass `--moe-backend deep_gemm_mega_moe`; the fi path is env-gated)
 | config   | env |
 |----------|-----|
 | native   | `FI_MOE_EP=0` |
-| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=deep_gemm_mega` |
-| fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=nvfp4_cutedsl` |
+| fi_dg    | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_fp8_fp4_bf16_deepgemm` |
+| fi_nvfp4 | `FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl` |
 
 ```bash
 W=$ROOT/moe_ep_benchmark/vllm_e2e
@@ -326,7 +464,7 @@ JOBID=$JOBID bash $W/in_container.sh 'bash bench_throughput.sh'
 JOBID=$JOBID bash $W/in_container.sh \
   'source venv0251/bin/activate && FI_MOE_EP=0 python eval_gsm8k.py --tag native --out results/gsm8k_native.json'
 JOBID=$JOBID bash $W/in_container.sh \
-  'source venv0251/bin/activate && FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=nvfp4_cutedsl python eval_gsm8k.py --tag fi_nvfp4 --out results/gsm8k_fi_nvfp4.json'
+  'source venv0251/bin/activate && FI_MOE_EP=1 FI_MOE_EP_MEGAKERNEL=sm100_nvfp4_nvfp4_bf16_cutedsl python eval_gsm8k.py --tag fi_nvfp4 --out results/gsm8k_fi_nvfp4.json'
 ```
 
 Reproducing the **headline cells** (not `bench_throughput.sh`'s defaults):
@@ -378,12 +516,28 @@ prefill chunks), per-role offline knob caches.
 ## Adding a new mega-kernel backend
 
 A mega kernel owns fused comm + local MoE. To wire a new one, add a subpackage
-under `flashinfer/moe_ep/backends/mega/kernel/<name>/`. The kernel sources
-themselves live under
-`flashinfer/moe_ep/kernel_src/cutedsl_megamoe/src/` and are exposed
-through the `kernel_src/cutedsl_megamoe/` public API (e.g. `mxfp8_mega_moe`,
-`get_symm_buffer_for_mxfp8_mega_moe`). Use the existing `mxfp8_cutedsl` backend
-as the reference template.
+under `flashinfer/moe_ep/backends/mega/kernel/sm<arch>/<act>_<weight>_<out>_<style>/`. Kernel-team drops are
+vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
+
+- `kernel_src/sm100/cutedsl_megamoe/` — Blackwell (NVFP4 + MXFP8 kernels)
+- `kernel_src/sm90/pull_style_cutedsl_megakernel/` — Hopper pull-style FP8
+  (a fork of the same kernel repo)
+- `kernel_src/sm90/push_style_megamoe/` — Hopper push-style FP8 (raw CUDA,
+  JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
+- `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer
+  (sm_120/sm_121) swap-AB MXFP8 (another fork snapshot of the same repo)
+- `kernel_src/sm107/next_cutedsl_megamoe/` — Rubin SM107, the kernel repo's `next/`
+  block-scaled inference export; generic inference is integrated, with
+  GenPhase included for future integration (see its `VENDOR.md`)
+
+Each tree exposes its kernels through its own package public API (e.g. the
+sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The
+trees duplicate the shared kernel-repo runtime (`common`, `src`, …) at their
+own drop revision and are **process-exclusive** — the top-level kernel module
+names collide, so each tree's `shim/_paths.py` refuses to bootstrap when the
+sibling tree's modules are already imported (a process runs on one
+architecture anyway). Use the existing `sm100_mxfp8_mxfp8_bf16_cutedsl` backend as the
+reference template.
 
 ### 1. Kernel + frontend (the "backend config" it links to)
 
@@ -409,7 +563,8 @@ def get_symm_buffer_for_<name>_mega_moe(
     world_size: int,            # self.ep_world_size
     *,
     kind=...,                   # dtype selector, if applicable
-    # ... kernel knobs: clamps, in_kernel_fc2_reduce, token_back_by_dispatch, ...
+    # ... session params: clamps, enable_in_kernel_fc2_reduce, ...
+    knobs=...,                  # tile/schedule/token-back tactics, or None
 ) -> <Name>SymmBuffer: ...
 ```
 
@@ -438,12 +593,13 @@ def <name>_mega_moe(
 caller (the backend's `stage_inputs`) must have filled `symm_buffer.x` and the
 routing slices first.
 
-Add both functions under
-`kernel_src/cutedsl_megamoe/shim/` (alongside `nvfp4.py` / `mxfp8.py`) and
-re-export them from the package `__init__.py` (or point at your own kernel
-module). Raw kernel sources live under `kernel_src/cutedsl_megamoe/src/` — see
-`kernel_src/cutedsl_megamoe/SKILL.md` for how to update that directory when the
-kernel team ships a new drop. The kernel-specific tuning knobs
+Add both functions under the owning tree's `shim/` — e.g.
+`kernel_src/sm100/cutedsl_megamoe/shim/` for Blackwell kernels (alongside
+`nvfp4.py` / `mxfp8.py`), `kernel_src/sm90/pull_style_cutedsl_megakernel/shim/`
+for Hopper — and re-export them from that package's `__init__.py` (or point at
+your own kernel module). Raw kernel sources live under the tree's `src/` — see
+the tree's `SKILL.md` for how to update that directory when the kernel team
+ships a new drop. The kernel-specific tuning knobs
 (intermediate size, top_k, clamps, dtype `kind`, fast-math, reduce/dispatch
 flags) live on the **config** dataclass in step 2 and are threaded through to
 these two calls by the backend in step 4 — so an SM90/SM120 kernel that needs
@@ -530,6 +686,198 @@ The raw megakernel config must be wrapped in `MegaConfig` — `MoEEpLayer` route
 `MegaConfig` → `MoEEpMegaLayer` → `create_mega_kernel(cfg)`, which looks up
 `cfg.kernel_name` in `_MEGA_KERNEL_REGISTRY`.
 
+## CUDA graphs (split layer)
+
+`MoEEpSplitLayer.forward()` on its own is **not** capturable, by construction:
+it creates a `Handle` per call and destroys it in a `finally`, so a graph --
+which records the device pointers it sees at capture time -- would replay
+against freed memory. That failure is silent at capture and only surfaces at
+replay, as an illegal memory access, so `forward()` now refuses capture
+outright and points at the API below.
+
+Capture with `create_graph_state()`, which holds one long-lived handle across
+forwards (the allocating half outside the capture, `Handle.update()` recorded
+inside it):
+
+```python
+state = layer.create_graph_state(t)          # outside any capture, ALL ranks
+layer.forward(t, graph_state=state)          # warmup, still eager -- REQUIRED
+torch.cuda.synchronize()
+
+g = torch.cuda.CUDAGraph()
+with torch.cuda.graph(g):
+    y = layer.forward(t, graph_state=state)
+
+t.hidden_states.copy_(new_x)                 # in place -- same buffers
+t.topk_ids.copy_(new_ids)
+g.replay()                                   # y now holds this step's result
+```
+
+Rules, in rough order of how easily they are violated:
+
+- **Update the registered tensors in place, never rebind them.** `t`'s
+  tensors become the graph's bound buffers (`topk_weights` is bound into the
+  handle at creation; `out` is the address combine writes). `forward()`
+  re-checks their addresses and tensor metadata, including shape, dtype, device,
+  and strides, and also validates the state's output buffer. Only the contents
+  may change: rebinding or changing the layout would leave an existing graph
+  using its original pointers and layout.
+- **The warmup forward is not optional, and `forward()` enforces it.**
+  Capturing through a `graph_state` on a layer that has never completed an
+  eager forward raises instead of proceeding. The first round trip is what
+  builds and autotunes the inner MoE kernel — whose backend selection captures
+  a graph of its own, and nested capture is illegal — and what gives the
+  transport its steady state; neither can happen during capture, and the
+  symptom otherwise surfaces from inside the inner kernel and names nothing in
+  the EP layer. What satisfies the check is one *eager* (non-capturing)
+  forward on **this layer** that returns normally: `layer.forward(t)` and
+  `layer.forward(t, graph_state=state)` both count, since both run the same
+  round trip over the same fleet and kernel. `create_graph_state()` alone does
+  not — it builds the fleet and the handle but runs no round trip. Warm on
+  every EP rank.
+- **One shape per state and per graph — and one live state per layer.**
+  `top_k` and the token count are baked into the handle *and* into the graph,
+  so a different batch size needs its own state and its own graph, the usual
+  multi-size-graph pattern. But `create_graph_state()` refuses a second state
+  while the first is live, and destroying the live one to make room frees the
+  buffers every graph already captured from it replays against. So today a
+  second shape needs a second `MoEEpSplitLayer`, not a second state on this
+  one.
+- **Pass each layer the state its own `create_graph_state()` returned, and
+  keep that layer alive.** Fleets are per layer, so a state carries one
+  layer's handle: that layer's communicator, its transport buffers, its `out`.
+  `forward()` re-checks the owner on every call because the mixed-up case is
+  silent — with the usual homogeneous `FleetParams` no shape disagrees
+  anywhere, so the call just runs this layer's tokens over the other layer's
+  transport and writes the other state's `out`, and both forwards hand back
+  the same tensor. (A model with N MoE layers holds N layers and N states,
+  which is exactly the shape of code an off-by-one over `states[i]` lives in.)
+  The state holds only a weakref to its layer, so a `forward()` through a
+  state whose layer has already been collected is refused too, rather than
+  running on a handle whose fleet is gone — keep the layer alive at least as
+  long as the state and every graph captured from it.
+- **`enable_timing` is off-limits under capture.** It synchronizes the device
+  to read its CUDA events, which capture forbids. Time `g.replay()` instead
+  (`benchmarks/bench_moe_ep.py --cuda-graph` does exactly this).
+- **All EP ranks must run the same sequence of eager calls and replays.**
+  Ordinary collective discipline, but nixl_ep makes it sharper: its Buffer
+  toggles a *host-side* double-buffer index (`buffer_idx ^= 1`) on every
+  dispatch and combine. Replays run no host code, so every replay reuses the
+  slot that was current at capture. That stays consistent only while the ranks
+  agree on the call sequence.
+- **Retire the graphs before `state.destroy()` or `layer.destroy()`.** They
+  hold pointers into the handle's buffers. `layer.destroy()` tears down state
+  → fleet → comm runtime in that order (the handle borrows fleet buffers, the
+  fleet's group lives on the runtime) and is terminal: afterwards `forward()`
+  and `create_graph_state()` raise, rather than lazily rebuilding a second
+  fleet on an already-finalized comm runtime.
+
+Backend notes:
+
+- **nccl_ep** implements the real split: `ncclEpInitHandle` (via
+  `create_handle`) stays outside the capture and `ncclEpUpdateHandle` is
+  recorded inside, mirroring `contrib/nccl_ep/ep_test.cu --use_cuda_graph`.
+  Covered for LL *and* HT.
+- **nixl_ep** has no handle-init step at all — LL dispatch recomputes routing
+  in-kernel from `topk_idx`, and the recv buffers live in the Buffer's
+  persistent RDMA arena. Its `update()` therefore exists to guarantee the
+  *binding* (when this build's index width differs from the caller's, the ids
+  cast lands in a handle-owned buffer, so the
+  captured address keeps receiving new routing). Under capture the handle also
+  disables the recv hook (`return_recv_hook=False`) and records the combined
+  send/receive kernel. The hook only defers the receive-phase kernel launch;
+  it performs no host-side wait. A receive kernel launched through a hook on
+  a captured stream would also be recorded. Combining the phases avoids that
+  host orchestration, while retaining the same device-side arrival waits.
+
+### Scope of validation, and how a stall surfaces
+
+What is covered: 4xGB200, single node, 4 ranks, 64 tokens/rank, one
+dispatch/combine pair per replay. What is **not**: the sustained serving load
+(DP8, 2048-token, ~256 concurrent prompts) under which the nixl_ep combine
+deadlock of PR #4139 appeared, and multi-node. On one NVLink node `p2p_ptr_get`
+succeeds, so the LL transfers are plain stores and the `nixlPut` /
+`nixlAtomicAdd` network path is likely never exercised under capture at all.
+The argument that dropping the recv hook is safe (it defers a kernel launch
+rather than performing a wait) is a source-reading argument, not a measurement.
+
+Know how a stall ends, because **the two backends end it differently** and
+neither raises a Python exception. LL arrival is a device-side spin on a
+peer-written flag, bounded by a timeout:
+
+| backend | timeout | on expiry |
+|---|---|---|
+| `nixl_ep` | 30 s (`DEFAULT_TIMEOUT_MS`) | printf, then the **mask** branch -- `update_memory_buffers` always allocates the mask buffer, so `trap()` is never reached. The peer is masked, its tokens are dropped, and the mask is sticky device state every later replay inherits: **output silently degrades**. |
+| `nccl_ep` | ~97 s (compile-time default) | `rankMask` is null unless `FleetAlgoKnobFaultTolerance` set `enable_mask`, so the default path **`trap()`s** -- a hard CUDA error on the next sync. Loud, not silent. |
+
+So on nixl_ep treat an unexplained accuracy drop after a long run as a candidate
+symptom and check stderr for `NIXL-EP timeout`; on nccl_ep you will get an error
+instead.
+
+What actually causes a replay to stall: a replay runs no host code, so anything
+the transport keeps on the host freezes. Concretely, nixl_ep toggles a
+double-buffer index (`buffer_idx ^= 1`) per dispatch and per combine on the
+**host**, so under replay it stays at its capture-time value forever. If one
+rank's sequence of eager calls and replays diverges from its peers', the sender
+writes slot A while the receiver polls slot B, and the receiver spins to
+timeout. That is the concrete failure behind the lockstep rule above, and it is
+why the capture tests assert that output tracks in-place input rewrites --
+nothing weaker proves a replay actually ran.
+
+### Why this is opt-in rather than the default
+
+The explicit API makes the lifetime and buffer-reuse requirements visible to
+the caller. It avoids repeating `create_handle`, `empty_like(out)`, and
+`destroy()` on every forward, and eager forwards using a graph state were faster
+in the measured cases. Those measurements do not establish a performance
+guarantee for every backend or workload. The reasons to retain the opt-in are:
+
+* `out` is a **reused** buffer. A caller retaining the previous result observes
+  it change on the next forward or replay; retaining a snapshot requires a copy.
+* The input tensors, handle, and output remain live for the state's lifetime.
+  Every graph using them must be retired before destroying that state or layer.
+  An implicit cache miss cannot safely evict an old state while a graph still
+  refers to its buffers.
+* An address alone is not a binding contract: the shape, dtype, device, layout,
+  stream, and routing state also matter. Explicit state lets `forward()` reject
+  an incompatible binding rather than silently replace buffers that a graph
+  still uses.
+* State creation and transport calls must follow the same sequence on every EP
+  rank. Independent address-cache misses on different ranks cannot determine
+  when to rebuild collective resources safely. The caller also has to maintain
+  that ordering across eager forwards and replays.
+
+This is separate from the NCCL tensor-wrapper memo. That memo is cleared after
+passing its 256-entry threshold and bypasses tensors larger than 2 MiB. Caching
+a fresh eager output there retained it until a cache flush, causing bounded
+memory retention and allocation churn, rather than unbounded growth. Eager
+combine outputs bypass that memo; graph-state outputs may be cached because
+their addresses are reused.
+Wrapper eviction preserves the fleet's receive buffers, counters, and configs.
+Those allocations must retain their addresses when eager forwards interleave
+with replay of an existing graph.
+
+The smoke harness includes the layer graph tests for both available backends,
+the W4A16 graph tests on Blackwell, and the NCCL handle graph and output-memo
+regressions. `BACKEND` selects a backend; an unavailable backend is skipped only
+when selecting `both`.
+
+The checked-in CI workflows do not invoke this harness. A distributed run on a
+CUDA 13 host with at least four supported GPUs is still required to execute
+these regressions; ordinary pytest collection skips them without `torchrun`.
+
+```bash
+NPROC=4 BACKEND=both bash scripts/task_test_moe_ep_smoke.sh
+```
+
+To run just the layer graph tests (`--backend=nixl_ep` selects NIXL instead):
+
+```bash
+torchrun --nproc_per_node=4 -m pytest \
+    tests/moe_ep/test_split_layer_cudagraph_multirank.py \
+    -v -m "nvep and gpu_4" --backend=nccl_ep
+```
+
 ## Fault tolerance
 
 Enable with `FleetAlgoKnobFaultTolerance()` in `fleet_knobs`. Check support
@@ -537,12 +885,12 @@ first — it needs more than the backend being built:
 
 ```python
 from flashinfer.moe_ep import supports_fault_tolerance
-supports_fault_tolerance("nccl_ep")   # needs nccl4py with GroupConfig.enable_mask
+supports_fault_tolerance("nccl_ep")   # needs nccl-extensions with GroupConfig.enable_mask
                                       # AND a libnccl_ep exporting ncclEpMask*
 supports_fault_tolerance("nixl_ep")   # true whenever the backend is staged
 ```
 
-If `nccl_ep` returns False, upgrade the nccl4py wheel that ships
+If `nccl_ep` returns False, upgrade the nccl-extensions wheel that ships
 `libnccl_ep.so` and confirm it is the one actually loaded
 (`python -m nccl show_versions`). The probe never raises, and the Fleet
 constructor fails with the same diagnosis rather than waiting for a real fault.

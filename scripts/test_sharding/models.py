@@ -4,10 +4,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-SCHEMA_VERSION = 3
-ALGORITHM_VERSION = "lpt-ms-v3"
+SCHEMA_VERSION = 4
+ALGORITHM_VERSION = "lpt-ms-v4"
 DEFAULT_CHECKPOINT_SECONDS = 1_000_000
 DEFAULT_TARGET_UNIT_SECONDS = 1_000_000
+RUNTIME_TIMING_PROFILE = "unprofiled"
 
 
 def source_file_for_nodeid(nodeid: str) -> str:
@@ -30,6 +31,7 @@ class CollectedNode:
     order: int
     shard_group: str | None = None
     solo: bool = False
+    long_running: bool = False
 
     @classmethod
     def from_nodeid(
@@ -39,6 +41,7 @@ class CollectedNode:
         shard_group: str | None = None,
         *,
         solo: bool = False,
+        long_running: bool = False,
     ) -> "CollectedNode":
         return cls(
             nodeid=nodeid,
@@ -47,6 +50,7 @@ class CollectedNode:
             order=order,
             shard_group=shard_group,
             solo=solo,
+            long_running=long_running,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,15 +61,16 @@ class CollectedNode:
             "order": self.order,
             "shard_group": self.shard_group,
             "solo": self.solo,
+            "long_running": self.long_running,
         }
 
 
 @dataclass(frozen=True)
 class PlanningOptions:
-    profile: str
     checkpoint_seconds: int = DEFAULT_CHECKPOINT_SECONDS
     target_unit_seconds: int = DEFAULT_TARGET_UNIT_SECONDS
-    unknown_case_seconds: int = 5
+    default_case_seconds: int = 1
+    default_source_overhead_seconds: int = 30
     shard_count: int = 1
 
     def __post_init__(self) -> None:
@@ -73,17 +78,19 @@ class PlanningOptions:
             raise ValueError("checkpoint_seconds must be positive")
         if self.target_unit_seconds <= 0:
             raise ValueError("target_unit_seconds must be positive")
-        if self.unknown_case_seconds <= 0:
-            raise ValueError("unknown_case_seconds must be positive")
+        if self.default_case_seconds <= 0:
+            raise ValueError("default_case_seconds must be positive")
+        if self.default_source_overhead_seconds < 0:
+            raise ValueError("default_source_overhead_seconds must be nonnegative")
         if self.shard_count <= 0:
             raise ValueError("shard_count must be positive")
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "profile": self.profile,
             "checkpoint_seconds": self.checkpoint_seconds,
             "target_unit_seconds": self.target_unit_seconds,
-            "unknown_case_seconds": self.unknown_case_seconds,
+            "default_case_seconds": self.default_case_seconds,
+            "default_source_overhead_seconds": self.default_source_overhead_seconds,
             "shard_count": self.shard_count,
         }
 
@@ -185,6 +192,10 @@ class Plan:
             {node.source_file for node in self.nodes if node.solo},
             key=lambda value: value.encode("utf-8"),
         )
+        long_running_sources = sorted(
+            {node.source_file for node in self.nodes if node.long_running},
+            key=lambda value: value.encode("utf-8"),
+        )
         return {
             "schema_version": SCHEMA_VERSION,
             "algorithm_version": ALGORITHM_VERSION,
@@ -196,6 +207,7 @@ class Plan:
             ],
             "shard_groups": shard_groups,
             "solo_sources": solo_sources,
+            "long_running_sources": long_running_sources,
             "units": [
                 {
                     "id": unit.id,
@@ -231,10 +243,16 @@ class Plan:
     def from_dict(cls, value: dict[str, Any]) -> "Plan":
         option_value = value["options"]
         options = PlanningOptions(
-            profile=option_value["profile"],
             checkpoint_seconds=int(option_value["checkpoint_seconds"]),
             target_unit_seconds=int(option_value["target_unit_seconds"]),
-            unknown_case_seconds=int(option_value["unknown_case_seconds"]),
+            default_case_seconds=int(
+                option_value.get(
+                    "default_case_seconds", option_value.get("unknown_case_seconds", 1)
+                )
+            ),
+            default_source_overhead_seconds=int(
+                option_value.get("default_source_overhead_seconds", 30)
+            ),
             shard_count=int(option_value["shard_count"]),
         )
         if "nodeids" not in value:
@@ -248,6 +266,7 @@ class Plan:
                         order=int(node["order"]),
                         shard_group=node.get("shard_group"),
                         solo=bool(node.get("solo", False)),
+                        long_running=bool(node.get("long_running", False)),
                     )
                     for node in value["nodes"]
                 ),
@@ -272,6 +291,9 @@ class Plan:
             for index in group["node_indexes"]
         }
         solo_sources = {str(source) for source in value.get("solo_sources", [])}
+        long_running_sources = {
+            str(source) for source in value.get("long_running_sources", [])
+        }
         nodes = tuple(
             CollectedNode(
                 nodeid,
@@ -280,6 +302,8 @@ class Plan:
                 index,
                 shard_groups.get(index),
                 source_files.get(index, source_file_for_nodeid(nodeid)) in solo_sources,
+                source_files.get(index, source_file_for_nodeid(nodeid))
+                in long_running_sources,
             )
             for index, nodeid in enumerate(nodeids)
         )

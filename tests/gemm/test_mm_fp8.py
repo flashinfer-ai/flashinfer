@@ -17,6 +17,7 @@ _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
 @pytest.mark.parametrize("input_dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mat2_dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("res_dtype", [torch.bfloat16])
+@pytest.mark.parametrize("backend", ["trtllm_low_latency", "cutedsl_low_latency"])
 def test_mm_fp8(
     m: int,
     n: int,
@@ -24,10 +25,16 @@ def test_mm_fp8(
     input_dtype: torch.dtype,
     mat2_dtype: torch.dtype,
     res_dtype: torch.dtype,
+    backend: str,
 ):
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     if compute_capability[0] not in [10]:
         pytest.skip("mm_fp8 is only supported on Blackwell GPUs.")
+    if backend == "cutedsl_low_latency":
+        if compute_capability[1] not in (0, 3):
+            pytest.skip("cutedsl_low_latency mm_fp8 requires SM100/SM103")
+        if m > 8:
+            pytest.skip("cutedsl_low_latency mm_fp8 requires M <= 8")
 
     torch.manual_seed(123)
     input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
@@ -39,15 +46,18 @@ def test_mm_fp8(
     res = torch.zeros([m, n], device="cuda", dtype=res_dtype)
     global_scale = input_inv_s * mat2_inv_s
 
-    prepared_weights = prepare_low_latency_gemm_weights(
-        mat2_fp8, _cache_permute_indices
+    weights = (
+        prepare_low_latency_gemm_weights(mat2_fp8, _cache_permute_indices)
+        if backend == "trtllm_low_latency"
+        else mat2_fp8
     )
     with autotune():
         mm_fp8(
             input_fp8,
-            prepared_weights,
+            weights,
             global_scale,
             out=res,
+            backend=backend,
         )
 
     reference = torch.mm(input, mat2.transpose(-2, -1))

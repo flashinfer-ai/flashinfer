@@ -88,6 +88,14 @@ class BootstrapConfig:
     rank: int
     stream: int = 0  # int representation of a cudaStream_t; 0 = default stream
     auto_bootstrap: bool = True
+    # CUDA device ordinal to bind for this rank. None = derive from the
+    # LOCAL_RANK env var, falling back to ``rank`` (torchrun convention).
+    # Host frameworks that already bound their worker's device (possibly
+    # under a remapped CUDA_VISIBLE_DEVICES, where the derived ordinal would
+    # point at the wrong or a nonexistent GPU) should pass
+    # ``torch.cuda.current_device()``. Keyword-only so it does not shift the
+    # positional binding of the pre-existing fields below.
+    device: Optional[int] = field(default=None, kw_only=True)
     nccl_comm: Optional[int] = (
         None  # int representation of ncclComm_t; None = derive from PG
     )
@@ -105,6 +113,8 @@ class BootstrapConfig:
             raise ValueError(f"world_size must be positive, got {self.world_size}")
         if not (0 <= self.rank < self.world_size):
             raise ValueError(f"rank {self.rank} not in [0, {self.world_size})")
+        if self.device is not None and self.device < 0:
+            raise ValueError(f"device must be non-negative, got {self.device}")
 
 
 @dataclass(frozen=True)
@@ -225,6 +235,13 @@ class CombineInputParams:
 
     x: Sequence["torch.Tensor"]
     out: Optional["torch.Tensor"] = None
+    # Whether ``out`` keeps its address across calls. Only the caller knows: a
+    # graph state reuses one buffer, while the default forward allocates a
+    # fresh one per call. Backends that cache per-address FFI state must not
+    # cache a churning buffer -- doing so pins it, prevents the allocator
+    # reusing that address, and leaks one output per call. Defaults to False so
+    # a caller that says nothing is never cached.
+    out_is_stable: bool = False
 
 
 @dataclass(frozen=True)

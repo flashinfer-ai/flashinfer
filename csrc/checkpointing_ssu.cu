@@ -20,6 +20,8 @@
 #include <flashinfer/mamba/checkpointing_ssu.cuh>
 #include <flashinfer/mamba/launch_checkpointing_ssu.cuh>
 // clang-format on
+#include <limits>
+
 #include "tvm_ffi_utils.h"
 
 using namespace flashinfer;
@@ -56,7 +58,9 @@ void checkpointing_ssu(
     Optional<TensorView> cb_scaled,    // two-kernel: bf16 (batch, nheads, 32, 8) fragA-native
     Optional<TensorView> cumAdt_vec,   // two-kernel: f32 (batch, nheads, T_pad) raw cumAdt
     Optional<TensorView> cb_old,       // two-kernel: bf16 (batch, nheads, 32, K_old/2) fragA-native
-    int64_t precompute_heads_per_cta) {  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
+    int64_t precompute_heads_per_cta,  // two-kernel PRECOMPUTE: heads per CTA (0 = heuristic)
+    int64_t main_pipeline_stages,      // two-kernel MAIN: pipeline depth (0 = heuristic)
+    int64_t main_ctas_per_sm) {        // two-kernel MAIN: grid cap (0 = heuristic)
 
   bool const is_varlen = cu_seqlens.has_value();
 
@@ -121,6 +125,15 @@ void checkpointing_ssu(
                      "state dim 1 (nheads) must be contiguous with dim 2, got stride ", s[1],
                      " expected ", sz[2] * sz[3]);
   }
+
+  // Two-kernel persistent-main runtime tuning knobs.  Zero preserves the
+  // launcher's regime default; positive values override it.
+  FLASHINFER_CHECK(
+      main_pipeline_stages == 0 || main_pipeline_stages == 1 || main_pipeline_stages == 2,
+      "main_pipeline_stages=", main_pipeline_stages, " must be 0 (heuristic), 1, or 2");
+  FLASHINFER_CHECK(main_ctas_per_sm >= 0 && main_ctas_per_sm <= std::numeric_limits<int>::max(),
+                   "main_ctas_per_sm=", main_ctas_per_sm,
+                   " must be 0 (heuristic) or a positive value representable as int");
 
   // ── Validate x ──
   // Non-varlen: shape (batch, NPREDICTED, nheads, dim).
@@ -441,14 +454,18 @@ void checkpointing_ssu(
                    " < 32 (output MMA m16n8 atom floor with _1×4 warp layout)");
 
   // ── Validate precompute_heads_per_cta (two-kernel PRECOMPUTE head-tiling, host knob) ──
-  // 0 = use the launcher's co-residency heuristic; >0 overrides (must divide HEADS_PER_GROUP).
+  // 0 = use the launcher's co-residency heuristic; >0 overrides and must match
+  // the HEADS_PER_GROUP>>k chain instantiated by dispatch_heads_per_cta.
   {
     int64_t const hpg = nheads / ngroups;
-    FLASHINFER_CHECK(precompute_heads_per_cta >= 0 &&
-                         (precompute_heads_per_cta == 0 || hpg % precompute_heads_per_cta == 0),
-                     "precompute_heads_per_cta=", precompute_heads_per_cta,
-                     " must be 0 (heuristic) or a positive divisor of HEADS_PER_GROUP "
-                     "(nheads/ngroups=",
+    bool valid_heads_per_cta = precompute_heads_per_cta == 0;
+    for (int64_t candidate = hpg; candidate >= 1; candidate >>= 1) {
+      valid_heads_per_cta |= precompute_heads_per_cta == candidate;
+      if (candidate == 1) break;
+    }
+    FLASHINFER_CHECK(valid_heads_per_cta, "precompute_heads_per_cta=", precompute_heads_per_cta,
+                     " must be 0 (heuristic) or a value on the HEADS_PER_GROUP>>k chain "
+                     "(HEADS_PER_GROUP=",
                      hpg, ")");
   }
 
@@ -606,7 +623,8 @@ void checkpointing_ssu(
   const cudaStream_t stream = get_stream(state.device());
 
   launchCheckpointingSsu<input_t, dt_t, weight_t, matrixA_t, state_t, stateIndex_t, state_scale_t>(
-      p, static_cast<int>(precompute_heads_per_cta), stream);
+      p, static_cast<int>(precompute_heads_per_cta), static_cast<int>(main_pipeline_stages),
+      static_cast<int>(main_ctas_per_sm), stream);
 }
 
 }  // namespace flashinfer::mamba::checkpointing

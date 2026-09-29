@@ -46,6 +46,11 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from .cute_dsl_cache_naming import make_kernel_name
+from .device_target import gdn_compile_options, gdn_device_target, target_arch
+from .dtype_compat import as_bf16
+
 # ============================================================================
 # Global configuration for MTP (Multiple Token Processing) version
 # ============================================================================
@@ -224,7 +229,8 @@ def gdn_verify_kernel_mtp(
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
-    cache_intermediate_states: cutlass.Constexpr[bool],
+    # Runtime-uniform so cache on/off can share one compiled kernel.
+    cache_intermediate_states: cutlass.Boolean,
     use_pool_indexing: cutlass.Constexpr[
         bool
     ],  # True: h0_source is 4D [pool, HV, V, K]; False: 3D [pool*HV, V, K]
@@ -678,7 +684,7 @@ def gdn_verify_kernel_mtp(
                             r_h[7, i] += r_k[i] * vn7
 
                         # Cache intermediate state if needed
-                        if cutlass.const_expr(cache_intermediate_states):
+                        if cache_intermediate_states:
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             it0 = cute.local_tile(
                                 intermediate_states,
@@ -1236,7 +1242,7 @@ def gdn_verify_kernel_mtp(
 
                         # Cache intermediate state LAST in timestep (fire-and-forget stores
                         # overlap with next timestep's compute)
-                        if cutlass.const_expr(cache_intermediate_states):
+                        if cache_intermediate_states:
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
@@ -1407,7 +1413,7 @@ def gdn_verify_kernel_mtp(
                             r_h[1, i] += r_k[i] * v_new_b
 
                         # Cache intermediate state if needed
-                        if cutlass.const_expr(cache_intermediate_states):
+                        if cache_intermediate_states:
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
@@ -1536,7 +1542,8 @@ def run_gdn_verify_kernel_mtp(
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
-    cache_intermediate_states: cutlass.Constexpr[bool],
+    # Runtime-uniform so cache on/off can share one compiled kernel.
+    cache_intermediate_states: cutlass.Boolean,
     use_pool_indexing: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
@@ -1647,7 +1654,7 @@ def gdn_verify_kernel_mtp_inline(
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
-    cache_intermediate_states: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Boolean,
     use_pool_indexing: cutlass.Constexpr[
         bool
     ],  # True: h0_source is 4D [pool, HV, V, K]; False: 3D [pool*HV, V, K]
@@ -1962,7 +1969,7 @@ def gdn_verify_kernel_mtp_inline(
                                 r_h[3, i] += r_k[i] * v_new_d
 
                         # Cache intermediate state if needed
-                        if cutlass.const_expr(cache_intermediate_states):
+                        if cache_intermediate_states:
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
@@ -2296,7 +2303,7 @@ def gdn_verify_kernel_mtp_inline(
                                 sum_hq_b += r_h[1, i] * r_q_all[i_t, i]
 
                         # Cache intermediate state
-                        if cutlass.const_expr(cache_intermediate_states):
+                        if cache_intermediate_states:
                             flat_idx = i_n * T * HV + i_t * HV + i_hv
                             inter_tile_a = cute.local_tile(
                                 intermediate_states,
@@ -2422,7 +2429,7 @@ def run_gdn_verify_kernel_mtp_inline(
     use_qk_l2norm: cutlass.Constexpr[bool],
     is_varlen: cutlass.Constexpr[bool],
     disable_state_update: cutlass.Constexpr[bool],
-    cache_intermediate_states: cutlass.Constexpr[bool],
+    cache_intermediate_states: cutlass.Boolean,
     use_pool_indexing: cutlass.Constexpr[bool],
     ilp_rows: cutlass.Constexpr[int],
     use_smem_v: cutlass.Constexpr[bool],
@@ -2494,8 +2501,12 @@ def run_gdn_verify_kernel_mtp_inline(
     )
 
 
-@functools.cache
-def _get_compiled_mtp_kernel(
+_CUTE_DSL_MODULE = "gdn_decode_mtp"
+
+
+def _mtp_kernel_name(
+    variant: str,
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -2503,13 +2514,62 @@ def _get_compiled_mtp_kernel(
     V: int,
     cache_steps: int,
     disable_state_update: bool,
-    cache_intermediate_states: bool,
     use_pool_indexing: bool,
     pool_strides_key,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
     vec_size: int,
+    dtype_key: tuple,
+    ilp_rows: int = 4,
+    use_smem_v: bool = False,
+    use_packed_fma: bool = True,
+    per_token_pool_scatter: bool = False,
+) -> str:
+    """Specialization name within the gdn_decode_mtp module, encoding the
+    kernel variant ("inline" or "warp") and every parameter that affects
+    codegen."""
+    return make_kernel_name(
+        variant,
+        target_arch(target_key),
+        T,
+        H,
+        HV,
+        K,
+        V,
+        cache_steps,
+        disable_state_update,
+        use_pool_indexing,
+        pool_strides_key,
+        scale,
+        use_qk_l2norm,
+        tile_v,
+        vec_size,
+        dtype_key,
+        ilp_rows,
+        use_smem_v,
+        use_packed_fma,
+        per_token_pool_scatter,
+    )
+
+
+@functools.cache
+def _get_compiled_mtp_kernel(
+    target_key: tuple,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    cache_steps: int,
+    disable_state_update: bool,
+    use_pool_indexing: bool,
+    pool_strides_key,
+    scale: float,
+    use_qk_l2norm: bool,
+    tile_v: int,
+    vec_size: int,
+    dtype_key: tuple,
     ilp_rows: int = 4,
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
@@ -2521,6 +2581,7 @@ def _get_compiled_mtp_kernel(
 
 @functools.cache
 def _get_compiled_mtp_kernel_inline(
+    target_key: tuple,
     T: int,
     H: int,
     HV: int,
@@ -2528,13 +2589,13 @@ def _get_compiled_mtp_kernel_inline(
     V: int,
     cache_steps: int,
     disable_state_update: bool,
-    cache_intermediate_states: bool,
     use_pool_indexing: bool,
     pool_strides_key,
     scale: float,
     use_qk_l2norm: bool,
     tile_v: int,
     vec_size: int,
+    dtype_key: tuple,
     ilp_rows: int = 4,
     use_smem_v: bool = False,
     use_packed_fma: bool = True,
@@ -2605,26 +2666,38 @@ def run_mtp_decode(
             initial_state_indices. Negative entries skip the writeback for
             that batch slot (matching the read-side padding skip semantics).
     """
+    # Kernel is bf16-only for q/k/v/a/b/output; stage non-bf16 caller output for writeback.
+    q, k, v, a, b = as_bf16(q, k, v, a, b)
+    output_writeback = None
+    if output.dtype != torch.bfloat16:
+        output_writeback = output
+        # Keep padding rows (negative indices); do not use empty scratch.
+        output = output_writeback.to(torch.bfloat16)
+
     # Dispatch between inline kernel and warp-specialized kernel based on CTA work units
     _, _, ilp_rows, use_smem_v = get_mtp_config(B, T, HV, V, disable_state_update)
     use_inline_kernel = (B * HV) <= 128
-    major, _ = torch.cuda.get_device_capability(q.device)
-    use_packed_fma = major >= 10  # SM100+ (Blackwell) supports packed F32x2
+    target = gdn_device_target(q.device)
+    use_packed_fma = target.use_packed_fma
 
     per_token_pool_scatter = ssm_state_indices is not None
 
-    # `cute.compile` bakes h0_source strides into the produced binary. When
-    # `use_pool_indexing=True` callers can legitimately pass 4D pools with
-    # different stride patterns (e.g., differently-paged pools), so we must
-    # include the strides in the cache key. For the flat path strides are
-    # always (V*K, K, 1) and don't need to be keyed.
+    # cute.compile bakes pool strides; key them only for the 4D pool-indexing path.
     if use_pool_indexing:
         pool_strides_key = tuple(h0_source.stride())
     else:
         pool_strides_key = None
 
+    # Polymorphic dtypes baked into the compile signature (q/k/v/a/b/output are pinned).
+    dtype_key = (
+        A_log.dtype,
+        dt_bias.dtype,
+        initial_state_indices.dtype,
+    )
+
     if use_inline_kernel:
         inline_cache_key = (
+            target.compile_key,
             T,
             H,
             HV,
@@ -2632,13 +2705,13 @@ def run_mtp_decode(
             V,
             cache_steps,
             disable_state_update,
-            cache_intermediate_states,
             use_pool_indexing,
             pool_strides_key,
             scale,
             use_qk_l2norm,
             tile_v,
             vec_size,
+            dtype_key,
             ilp_rows,
             use_smem_v,
             use_packed_fma,
@@ -2647,6 +2720,7 @@ def run_mtp_decode(
         cache = _get_compiled_mtp_kernel_inline(*inline_cache_key)
     else:
         warp_cache_key = (
+            target.compile_key,
             T,
             H,
             HV,
@@ -2654,19 +2728,31 @@ def run_mtp_decode(
             V,
             cache_steps,
             disable_state_update,
-            cache_intermediate_states,
             use_pool_indexing,
             pool_strides_key,
             scale,
             use_qk_l2norm,
             tile_v,
             vec_size,
+            dtype_key,
             ilp_rows,
             use_smem_v,
             use_packed_fma,
             per_token_pool_scatter,
         )
         cache = _get_compiled_mtp_kernel(*warp_cache_key)
+
+    if not cache_intermediate_states:
+        # TVM-FFI validates static inner dimensions even when the runtime flag
+        # disables all accesses, so use a small [1, V, K] tensor instead of the
+        # public wrapper's [1, 1, 1] placeholder.
+        dummy_intermediate_states = cache.setdefault("dummy_intermediate_states", {})
+        dummy_key = (q.device, h0_source.dtype)
+        if dummy_key not in dummy_intermediate_states:
+            dummy_intermediate_states[dummy_key] = torch.empty(
+                1, V, K, dtype=h0_source.dtype, device=q.device
+            )
+        intermediate_states = dummy_intermediate_states[dummy_key]
 
     cu_seqlens_map = cache.setdefault("cu_seqlens", {})
     cu_key = (B, q.device)
@@ -2698,7 +2784,7 @@ def run_mtp_decode(
         h0_out_indices = initial_state_indices
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
         if use_pool_indexing:
             # 4D pool [pool, HV, V, K], possibly non-contiguous (e.g. a strided
@@ -2718,13 +2804,11 @@ def run_mtp_decode(
                 h0_source, assumed_align=16
             ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         intermediate_states_tensor = from_dlpack(intermediate_states, assumed_align=16)
-        if cache_intermediate_states:
-            # Caching-off dummy ([1,1,1]) is never read; skip marking it.
-            intermediate_states_tensor = (
-                intermediate_states_tensor.mark_compact_shape_dynamic(
-                    mode=0, stride_order=(0, 1, 2), divisibility=1
-                )
+        intermediate_states_tensor = (
+            intermediate_states_tensor.mark_compact_shape_dynamic(
+                mode=0, stride_order=(0, 1, 2), divisibility=1
             )
+        )
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
         # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
         a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
@@ -2747,91 +2831,106 @@ def run_mtp_decode(
             ssm_state_indices_arg, assumed_align=16
         ).mark_layout_dynamic()
 
+        compile_options = gdn_compile_options(
+            q.device, cute.EnableTVMFFI(True), cute.GenerateLineInfo(True)
+        )
         if use_inline_kernel:
-            compiled = cute.compile(
-                run_gdn_verify_kernel_mtp_inline,
-                h0_source_tensor,
-                intermediate_states_tensor,
-                A_log_tensor,
-                a_tensor,
-                dt_bias_tensor,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                b_tensor,
-                o_tensor,
-                h0_indices_tensor,
-                h0_out_indices_tensor,
-                cu_seqlens_tensor,
-                ssm_idx_tensor,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                scale=scale,
-                HV=HV,
-                T=T,
-                H=H,
-                K=K,
-                V=V,
-                tile_v=tile_v,
-                vec_size=vec_size,
-                use_initial_state=True,
-                use_qk_l2norm=use_qk_l2norm,
-                is_varlen=False,
-                disable_state_update=disable_state_update,
-                cache_intermediate_states=cache_intermediate_states,
-                use_pool_indexing=use_pool_indexing,
-                ilp_rows=ilp_rows,
-                use_smem_v=use_smem_v,
-                use_packed_fma=use_packed_fma,
-                per_token_pool_scatter=per_token_pool_scatter,
-                stream=stream,
-                options="--enable-tvm-ffi --generate-line-info",
+            compiled = build_and_load_cute_dsl_kernel(
+                _CUTE_DSL_MODULE,
+                _mtp_kernel_name("inline", *inline_cache_key),
+                lambda: cute.compile[compile_options](
+                    run_gdn_verify_kernel_mtp_inline,
+                    h0_source_tensor,
+                    intermediate_states_tensor,
+                    A_log_tensor,
+                    a_tensor,
+                    dt_bias_tensor,
+                    q_tensor,
+                    k_tensor,
+                    v_tensor,
+                    b_tensor,
+                    o_tensor,
+                    h0_indices_tensor,
+                    h0_out_indices_tensor,
+                    cu_seqlens_tensor,
+                    ssm_idx_tensor,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    scale=scale,
+                    HV=HV,
+                    T=T,
+                    H=H,
+                    K=K,
+                    V=V,
+                    tile_v=tile_v,
+                    vec_size=vec_size,
+                    use_initial_state=True,
+                    use_qk_l2norm=use_qk_l2norm,
+                    is_varlen=False,
+                    disable_state_update=disable_state_update,
+                    cache_intermediate_states=cutlass.Boolean(
+                        cache_intermediate_states
+                    ),
+                    use_pool_indexing=use_pool_indexing,
+                    ilp_rows=ilp_rows,
+                    use_smem_v=use_smem_v,
+                    use_packed_fma=use_packed_fma,
+                    per_token_pool_scatter=per_token_pool_scatter,
+                    stream=stream,
+                ),
+                extra_key_files=(__file__,),
             )
         else:
-            compiled = cute.compile(
-                run_gdn_verify_kernel_mtp,
-                h0_source_tensor,
-                intermediate_states_tensor,
-                A_log_tensor,
-                a_tensor,
-                dt_bias_tensor,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                b_tensor,
-                o_tensor,
-                h0_indices_tensor,
-                h0_out_indices_tensor,
-                cu_seqlens_tensor,
-                ssm_idx_tensor,
-                softplus_beta=1.0,
-                softplus_threshold=20.0,
-                scale=scale,
-                HV=HV,
-                T=T,
-                H=H,
-                K=K,
-                V=V,
-                tile_v=tile_v,
-                vec_size=vec_size,
-                use_initial_state=True,
-                use_qk_l2norm=use_qk_l2norm,
-                is_varlen=False,
-                disable_state_update=disable_state_update,
-                cache_intermediate_states=cache_intermediate_states,
-                use_pool_indexing=use_pool_indexing,
-                ilp_rows=ilp_rows,
-                use_smem_v=use_smem_v,
-                use_packed_fma=use_packed_fma,
-                per_token_pool_scatter=per_token_pool_scatter,
-                stream=stream,
-                options="--enable-tvm-ffi --generate-line-info",
+            compiled = build_and_load_cute_dsl_kernel(
+                _CUTE_DSL_MODULE,
+                _mtp_kernel_name("warp", *warp_cache_key),
+                lambda: cute.compile[compile_options](
+                    run_gdn_verify_kernel_mtp,
+                    h0_source_tensor,
+                    intermediate_states_tensor,
+                    A_log_tensor,
+                    a_tensor,
+                    dt_bias_tensor,
+                    q_tensor,
+                    k_tensor,
+                    v_tensor,
+                    b_tensor,
+                    o_tensor,
+                    h0_indices_tensor,
+                    h0_out_indices_tensor,
+                    cu_seqlens_tensor,
+                    ssm_idx_tensor,
+                    softplus_beta=1.0,
+                    softplus_threshold=20.0,
+                    scale=scale,
+                    HV=HV,
+                    T=T,
+                    H=H,
+                    K=K,
+                    V=V,
+                    tile_v=tile_v,
+                    vec_size=vec_size,
+                    use_initial_state=True,
+                    use_qk_l2norm=use_qk_l2norm,
+                    is_varlen=False,
+                    disable_state_update=disable_state_update,
+                    cache_intermediate_states=cutlass.Boolean(
+                        cache_intermediate_states
+                    ),
+                    use_pool_indexing=use_pool_indexing,
+                    ilp_rows=ilp_rows,
+                    use_smem_v=use_smem_v,
+                    use_packed_fma=use_packed_fma,
+                    per_token_pool_scatter=per_token_pool_scatter,
+                    stream=stream,
+                ),
+                extra_key_files=(__file__,),
             )
         cache["compiled"] = compiled
     else:
         compiled = cache["compiled"]
 
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     compiled(
         h0_source,
         intermediate_states,
@@ -2847,5 +2946,9 @@ def run_mtp_decode(
         h0_out_indices,
         cu_seqlens,
         ssm_state_indices_arg,
+        cache_intermediate_states,
         stream,
     )
+
+    if output_writeback is not None:
+        output_writeback.copy_(output)

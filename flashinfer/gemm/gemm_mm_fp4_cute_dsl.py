@@ -58,6 +58,7 @@ def _compile_block_scaled_gemm(
     cluster_shape_k=1,
     cache_module_name=None,
     device_index=None,
+    per_token_alpha=None,
 ):
     """Compile a block-scaled GEMM kernel via CuTe DSL and cache it.
 
@@ -100,6 +101,7 @@ def _compile_block_scaled_gemm(
         sf_k=sf_k,
         batch_size=batch_size,
         max_active_clusters=max_active_clusters,
+        per_token_alpha=per_token_alpha,
     )
 
     if cache_module_name is None:
@@ -136,14 +138,30 @@ def _blockscaled_kernel_disk_name(cache_key, batch_size, max_active_clusters):
         use_tma_store,
         enable_pdl,
         out_dtype,
+        per_token_alpha,
+        l2_policy,
     ) = cache_key
-    tma = "x" if use_tma_store is None else int(use_tma_store)
+    # On SM107 the use_tma_store slot is repurposed to carry the Rubin kernel
+    # shape (inst_m, inst_n, inst_k, tiler_k, prefetch_dist), so render it as a
+    # symbol-safe joined string; a bare int() would raise on the tuple.
+    if use_tma_store is None:
+        tma = "x"
+    elif isinstance(use_tma_store, tuple):
+        # prefetch_dist is enumerated as (0, 2, None) - None means "auto" and
+        # compiles differently from 0, so render it as its own symbol rather
+        # than letting int(None) raise.
+        tma = "s" + "s".join("x" if v is None else str(int(v)) for v in use_tma_store)
+    else:
+        tma = int(use_tma_store)
     dtype = str(out_dtype).removeprefix("torch.")
+    alpha = "x" if per_token_alpha is None else per_token_alpha
+    l2 = "x" if l2_policy is None else l2_policy
     return (
         f"sf{sf_vec_size}_t{mma_tiler_mn[0]}x{mma_tiler_mn[1]}"
         f"_c{cluster_shape_mn[0]}x{cluster_shape_mn[1]}"
         f"_swap{int(swap_ab)}_pf{int(use_prefetch)}_{kernel_type}"
         f"_tma{tma}_pdl{int(enable_pdl)}_{dtype}"
+        f"_pta{alpha}_l2{l2}"
         f"_b{batch_size}_mac{max_active_clusters}"
     )
 
@@ -160,6 +178,7 @@ def _make_blockscaled_gemm_compile_fn(
     sf_k,
     batch_size,
     max_active_clusters,
+    per_token_alpha=None,
 ):
     """Build a zero-arg closure that runs ``cute.compile`` for gemm."""
     import cutlass
@@ -201,8 +220,11 @@ def _make_blockscaled_gemm_compile_fn(
 
         a_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
         b_sf_ptr = make_ptr(sf_dtype, 16, cute.AddressSpace.gmem, 16)
+        # Binding alpha to the symbolic extent the tokens live on keeps one
+        # compiled kernel across all token counts.
+        alpha_extent = {None: 1, "m": sym_m, "n": sym_n}[per_token_alpha]
         alpha_fake = cute.runtime.make_fake_compact_tensor(
-            cutlass.Float32, (1,), assumed_align=4
+            cutlass.Float32, (alpha_extent,), assumed_align=4
         )
 
         stream_fake = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
@@ -226,6 +248,26 @@ def _make_blockscaled_gemm_compile_fn(
         )
 
     return compile_kernel
+
+
+_CUTE_DSL_ALPHA_ONE_CACHE: dict = {}
+
+
+def _prepare_alpha_for_launch(alpha_tensor, device):
+    """Prepare alpha as a 1-dim float32 device tensor with shape [1].
+
+    When *alpha_tensor* is ``None``, returns a cached ``tensor([1.0])``
+    on *device* (allocated once, reused forever).
+    """
+    if alpha_tensor is None:
+        cached = _CUTE_DSL_ALPHA_ONE_CACHE.get(device)
+        if cached is None:
+            cached = torch.tensor([1.0], dtype=torch.float32, device=device)
+            _CUTE_DSL_ALPHA_ONE_CACHE[device] = cached
+        return cached
+    if alpha_tensor.dim() == 0:
+        return alpha_tensor.unsqueeze(0)
+    return alpha_tensor.reshape(1)
 
 
 def _mm_fp4_precompile_worker(payload):
@@ -259,14 +301,26 @@ def _mm_fp4_precompile_worker(payload):
             _use_tma_store,
             enable_pdl,
             out_dtype,
+            per_token_alpha,
+            l2_policy,
         ) = payload["cache_key"]
 
+        # The use_tma_store slot of an "sm100" tactic carries the MMA K
+        # instructions per stage (None -> 4, 8 -> K tile 512); the worker must
+        # build the same kernel the runner would, since the disk name derives
+        # from the cache key.
         gemm = Sm100BlockScaledPersistentDenseGemmKernel(
             sf_vec_size,
             mma_tiler_mn,
             cluster_shape_mn,
             use_prefetch,
             enable_pdl,
+            per_token_alpha,
+            mma_inst_tile_k=_use_tma_store or 4,
+            a_l2_evict_first=l2_policy == "a_ef",
+            b_l2_evict_first=l2_policy == "b_ef",
+            a_l2_evict_last=l2_policy == "ab_el",
+            b_l2_evict_last=l2_policy == "ab_el",
         )
         compile_fn = _make_blockscaled_gemm_compile_fn(
             gemm,
@@ -282,6 +336,7 @@ def _mm_fp4_precompile_worker(payload):
             sf_k=payload["sf_k"],
             batch_size=payload["batch_size"],
             max_active_clusters=payload["max_active_clusters"],
+            per_token_alpha=per_token_alpha,
         )
         spec = JitSpecCuteDsl(
             "mm_fp4",
@@ -391,17 +446,81 @@ def _run_mm_fp4_precompile_pool(payloads) -> None:
             )
 
 
-def _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype):
+def per_token_alpha_mode(per_token_alpha, swap_ab):
+    """Kernel extent the alpha vector indexes, or ``None`` for a scalar alpha.
+
+    The SM100 runner swaps A and B at the call site, so under ``swap_ab`` the
+    caller's rows are the kernel's N extent.
+    """
+    if not per_token_alpha:
+        return None
+    return "n" if swap_ab else "m"
+
+
+def _mm_fp4_cache_key(
+    sf_vec_size,
+    tactic,
+    enable_pdl,
+    out_dtype,
+    per_token_alpha=None,
+    l2_policy=None,
+):
     """In-memory kernel-cache key for one mm_fp4 tactic tuple.
 
     Shared by the runner's forward path and the precompile path, which
     must agree byte-for-byte: the on-disk kernel name derives from it.
+    ``l2_policy`` is :func:`mm_fp4_l2_policy` for the shape.
     """
-    return (sf_vec_size, *tactic, enable_pdl, out_dtype)
+    return (
+        sf_vec_size,
+        *tactic,
+        enable_pdl,
+        out_dtype,
+        per_token_alpha,
+        l2_policy,
+    )
+
+
+def mm_fp4_l2_policy(m, mma_tiler_mn, swap_ab, kernel_type):
+    """L2 eviction policy for the operand streams of an ``"sm100"`` tactic.
+
+    The persistent kernel streams the weight matrix once per token tile while
+    every CTA of a column re-reads the same token tile and its scale factors.
+
+    * With at most two token tiles the weights are read at most twice, so
+      loading them with ``evict_first`` keeps the shared token tile resident
+      instead of letting the 32-117 MB weight stream flush it (1.04-1.24x on
+      the M <= 512 rows of the projection shapes, both B200 and GB300).
+      Returns ``"a_ef"`` (weights are the kernel's A operand, ``swap_ab``) or
+      ``"b_ef"`` (B operand).
+    * With more token tiles both operands are re-read through L2 (the
+      weights by every M tile, the token tiles by every N tile): loading both
+      with ``evict_last`` gains 0.1-10 % on the M = 2048 / 8192 rows of the
+      no-swap kernel (32/32 rows > 1 on B200 and GB300; ``evict_last`` on the
+      token operand alone left two GB300 rows at 0.999). Returns ``"ab_el"``.
+
+    Returns ``None`` for other kernels. Cache hints only: outputs do not
+    change.
+    """
+    if kernel_type != "sm100":
+        return None
+    token_tile = mma_tiler_mn[1] if swap_ab else mma_tiler_mn[0]
+    if (m + token_tile - 1) // token_tile <= 2:
+        return "a_ef" if swap_ab else "b_ef"
+    return None if swap_ab else "ab_el"
 
 
 def precompile_mm_fp4_tactics(
-    tactics, m, n, real_k, use_nvfp4, enable_pdl, out_dtype, kernel_cache, device
+    tactics,
+    m,
+    n,
+    real_k,
+    use_nvfp4,
+    enable_pdl,
+    out_dtype,
+    kernel_cache,
+    device,
+    per_token_alpha=False,
 ) -> None:
     """Batch-compile not-yet-cached mm_fp4 tactics into the on-disk
     CuTe-DSL cache with a pool of subprocesses.
@@ -441,7 +560,14 @@ def precompile_mm_fp4_tactics(
         ) = tactic
         if kernel_type != "sm100":
             continue
-        cache_key = _mm_fp4_cache_key(sf_vec_size, tactic, enable_pdl, out_dtype)
+        cache_key = _mm_fp4_cache_key(
+            sf_vec_size,
+            tactic,
+            enable_pdl,
+            out_dtype,
+            per_token_alpha_mode(per_token_alpha, swap_ab),
+            mm_fp4_l2_policy(m, mma_tiler_mn, swap_ab, kernel_type),
+        )
         if (device_index, cache_key) in kernel_cache:
             continue
 

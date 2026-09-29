@@ -1,0 +1,2745 @@
+# Copyright (c) 2025 by FlashInfer team.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Paged MQA logits: FP8 and FP4 attention-score kernels for datacentre
+Blackwell (SM100/SM103) and Rubin (SM107).
+
+These kernels compute, for each batch element b, speculative slot t, and KV
+position pos:
+
+    output[b*next_n + t, pos] = Σ_h w[b*next_n+t, h] · relu(Q[b,t,h,:] @ K[pos,:]ᵀ)
+
+where K is paged via block_tables, used for sparse attention indexing in DeepSeek MLA.
+
+ReLU is applied per head, *before* weighting and reduction -- not to the sum.
+With head scores [1, -1] and weights [1, 1] the result is 1, not 0, and negative
+weights can make the output negative.
+
+Two variants, differing in how their scale factors enter:
+  fp8_paged_mqa_logits — FP8 Q/K; the per-token FP32 KV scale multiplies the
+                         result, so the expression above gains a `· scale[pos]`
+  fp4_paged_mqa_logits — MXFP4 Q/K; the per-(token, K-group) UE8M0 scales are
+                         folded into dequantizing Q and K, so there is no
+                         trailing scale factor
+
+The split is algebra, not taste: a per-token scale is uniform across the whole
+q·k dot product, so it factors out and is applied once to the result (positive,
+so it also commutes with the ReLU); a per-32-element-group scale on both
+operands does not factor out and must be applied while dequantizing inside the
+MMA pipeline.
+
+Their other differences, all downstream of the quantization formats:
+  inputs      — fp4 adds q_sf (one int32 of packed UE8M0 scales per
+                (token, head)) plus sf_vec_size and is_kv_sf_interleaved;
+                its q packs two FP4 values per byte, so q's last dim is
+                head_dim/2
+  dtype knobs — only fp8 exposes acc_dtype (MMA accumulator, float32 or
+                float16); fp4's accumulator is fixed float32.  Default
+                output_dtype: float32 (fp8) vs bfloat16 (fp4)
+  shapes      — fp8 is parametric (head_dim a multiple of 32, num_heads a
+                multiple of 4, next_n*num_heads a multiple of 8 in
+                [8, 256]); fp4 is specialised to exactly num_heads=64,
+                head_dim=128
+  next_n=4    — single-pass everywhere on fp8; on fp4 single-pass only on
+                Rubin (SM107): SM100/SM103 run two internal KV passes
+                (identical numerics, ~2x KV reads); a caller schedule_meta
+                must then be built with the schedule helper's matching
+                next_n/variant arguments
+
+Paging arguments, the output contract and row ordering, schedule_meta
+semantics, and out=/padded_seq_len sizing are identical by design.
+
+Both run on datacentre Blackwell (SM100/SM103) and Rubin (SM107); consumer
+Blackwell (SM120/121) is deliberately unsupported (the kernels' block-scaled
+tensor-core path and on-chip accumulator budget are sized for the datacentre
+parts).
+
+Typical call (the DeepSeek indexer shape)::
+
+    # q [B, next_n, 64, 128] e4m3fn (64 = num_heads); weights [B*next_n, 64] f32;
+    # kv_fused [num_blocks, block_size=64, 1, 132] uint8; seq_lens/block_tables
+    # int32 on q's device.  (The per-function Examples use block_size=32.)
+    logits = flashinfer.fp8_paged_mqa_logits(
+        q, kv_fused, weights, block_tables, seq_lens, max_seq_len
+    )  # -> [B*next_n, max_seq_len]; mask each row past its causal limit
+
+See each function's docstring for a runnable example, the fused-KV byte
+layout, and the CUDA-graph recipe.
+"""
+
+import contextlib
+import functools
+import os
+import warnings
+from typing import Optional, Sequence, Tuple
+
+import numpy as np
+import torch
+
+from ..api_logging import flashinfer_api
+from ..cute_dsl.availability import is_cute_dsl_available
+from ..trace.templates.attn_scores import (
+    fp4_paged_mqa_logits_trace,
+    fp8_paged_mqa_logits_trace,
+)
+from ..utils import (
+    backend_requirement,
+    get_device_index,
+    get_device_sm_count,
+    supported_compute_capability,
+)
+
+# FP8 kernel epilogue supports fp32/fp16 only (matches TRT-LLM's validated
+# surface); bf16 epi has no kernel branch and would silently miscompute.
+_FP8_DTYPES = (torch.float32, torch.float16)
+# FP4 kernel supports fp32/fp16/bf16 for epilogue and output.
+_FP4_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+# FP8 UMMA instruction K. The kernel derives mma_inst_tile_k = head_dim // this
+# via integer division, so head_dim must be an exact multiple (see the guard in
+# fp8_paged_mqa_logits).
+_FP8_MMA_INST_K = 32
+# FP8 epilogue FMA unroll granularity.  The kernel's register and SMEM weight
+# paths both consume heads this many at a time (kernel-side _EPI_UNROLL), so
+# num_heads must be a multiple of it.  The UMMA N-mode rule below does not
+# imply it: next_n*num_heads % 8 == 0 admits e.g. next_n=4, num_heads=10.
+# Mirrored at the API boundary because the kernel constructor's own check is
+# phrased in terms of an internal compile-layer parameter (num_epi_subtiles)
+# the caller never sees, and fires only after the output has been allocated
+# and the schedule kernel compiled.
+_EPI_SUBTILE_UNROLL = 4
+# FP4 hardcodes these in FP4MQALogitsKernel.__init__ (asserts on head_dim and
+# num_heads); mirrored at the API boundary for a clearer error.
+_FP4_REQUIRED_HEAD_DIM = 128
+_FP4_REQUIRED_NUM_HEADS = 64
+# Max TMA sub-copies per compute tile (kernel: `num_blocks_per_mma <= 4`).
+_MAX_BLOCKS_PER_MMA = 4
+# UMMA N-mode limits, reported by the DSL as
+# "expects the N-mode to satisfy 8 <= N <= 256 and N % 8 == 0".
+# N here is next_n * num_heads.
+_MMA_N_MIN, _MMA_N_MAX, _MMA_N_MULTIPLE = 8, 256, 8
+# Largest logical next_n the FP4 path accepts. This is NOT the per-atom cap:
+# the kernel's TMEM budget limits one *atom* to 3 on Blackwell and 4 on Rubin
+# (see _fp4_max_atom_for_device), and the in-kernel atom split decomposes next_n
+# into atoms, so next_n=4 is reachable everywhere -- directly on Rubin, as two
+# atoms of 2 on Blackwell. 4 is where upstream's validation stops, so the API
+# stops there too rather than at the arbitrary limit an atom of 1 would allow.
+_FP4_MAX_NEXT_N = 4
+# is_kv_sf_interleaved is only implemented for this block size (1 physical
+# block == 1 UTCCP atom); the kernel silently ignores the flag otherwise.
+_FP4_SF_INTERLEAVE_BLOCK_SIZE = 128
+# MXFP4 scale-factor block size: one UE8M0 exponent per this many FP4 values.
+_FP4_SF_VEC_SIZE = 32
+# q_sf packs the per-token scale factors of one head into a single int32, so
+# head_dim // sf_vec_size must equal the number of bytes in an int32.
+_SF_PER_INT32 = 4
+
+
+def _validate_weights(
+    weights: torch.Tensor, batch_size: int, next_n: int, num_heads: int, fn_name: str
+) -> None:
+    """``weights`` holds one per-head mixing weight per (row, head)."""
+    expected = (batch_size * next_n, num_heads)
+    if weights.dim() != 2 or tuple(weights.shape) != expected:
+        raise ValueError(
+            f"{fn_name}: weights must be {list(expected)} "
+            f"(batch_size*next_n, num_heads; batch_size={batch_size} and "
+            f"next_n={next_n} inferred from q.shape); got {list(weights.shape)}."
+        )
+    if weights.dtype != torch.float32:
+        raise ValueError(
+            f"{fn_name}: weights must be float32 (cast to the epilogue dtype "
+            f"internally); got {weights.dtype}."
+        )
+
+
+def _validate_sf_vec_size(sf_vec_size: int, head_dim: int, fn_name: str) -> int:
+    """Validate the SF block size and return the scale-factor count per token."""
+    if sf_vec_size != _FP4_SF_VEC_SIZE:
+        raise ValueError(
+            f"{fn_name}: sf_vec_size must be {_FP4_SF_VEC_SIZE} (MXFP4 block "
+            f"scaling); got {sf_vec_size}."
+        )
+    if head_dim % sf_vec_size != 0:
+        raise ValueError(
+            f"{fn_name}: head_dim ({head_dim}) must be a multiple of sf_vec_size "
+            f"({sf_vec_size})."
+        )
+    scales_per_token = head_dim // sf_vec_size
+    if scales_per_token != _SF_PER_INT32:
+        raise ValueError(
+            f"{fn_name}: head_dim/sf_vec_size = {scales_per_token} scale factors "
+            f"per token, but q_sf packs exactly {_SF_PER_INT32} UE8M0 bytes into "
+            f"each int32."
+        )
+    return scales_per_token
+
+
+@functools.cache
+def _cached_gpu_arch(device_index: int) -> str:
+    """The CuTe-DSL codegen target for a device, e.g. ``"sm_100a"``.
+
+    Resolved from the *requested* device, not the process-wide current one.
+    CUTLASS's own probe queries ordinal 0 unconditionally, so on a
+    heterogeneous system it would otherwise emit code for the wrong GPU while
+    num_sms came from this one.  Uses the same normalization as
+    ``CompilationContext`` so the string matches the arch names used elsewhere.
+    """
+    from ..compilation_context import CompilationContext
+
+    major, minor = torch.cuda.get_device_capability(torch.device("cuda", device_index))
+    _, minor_str = CompilationContext._normalize_cuda_arch(major, minor)
+    return f"sm_{major}{minor_str}"
+
+
+def _on_device(device_index: int):
+    """Make ``device_index`` current for a compile+launch, if it is not already.
+
+    The kernels take the TVM-FFI environment stream, which resolves to the
+    current stream of the *current* device.  Launching with tensors that live on
+    another device onto that stream is wrong independently of architecture, so
+    the target has to be current for the duration of the launch.  Compilation is
+    inside the same scope because ``JitSpecCuteDsl`` tags its on-disk cache from
+    the current device too.
+
+    Returns a null context when the target is already current, so the ordinary
+    single-GPU path pays nothing.
+    """
+    if device_index == torch.cuda.current_device():
+        return contextlib.nullcontext()
+    return torch.cuda.device(device_index)
+
+
+def _arch_for_launch(device_index: int, fn_name: str) -> str:
+    """Codegen arch for a launch, rejecting a target this process cannot run.
+
+    CuTe-DSL does not reject a ``--gpu-arch`` the current device cannot
+    execute.  Measured on sm_100a: sm_90a, sm_103a and sm_80 each compile
+    cleanly, export, reload, and then raise only on first invocation.
+    Exporting and reloading does not help -- ``load_module`` performs no
+    architecture check -- so a mismatch has to be caught here, before the
+    caller is handed a callable with no execution engine.
+
+    Since the launch paths now run inside :func:`_on_device`, the target is
+    already current by the time this is reached and the mismatch cannot arise
+    there.  It is kept as a backstop for any future caller that compiles for a
+    device without first entering it -- the failure it prevents is silent and
+    deferred, so a cheap check is worth keeping even when it should be
+    unreachable.
+
+    ``precompile_paged_mqa_logits`` deliberately does NOT use this: building a
+    foreign-arch artifact for another worker to load later is its documented
+    job, and it never invokes what it builds.
+    """
+    arch = _cached_gpu_arch(device_index)
+    current = torch.cuda.current_device()
+    if device_index != current:
+        runnable = _cached_gpu_arch(current)
+        if arch != runnable:
+            raise ValueError(
+                f"{fn_name}: tensors are on cuda:{device_index} ({arch}) but the "
+                f"current CUDA device is cuda:{current} ({runnable}). The kernel "
+                f"would be generated for {arch} and launched from a {runnable} "
+                f"context; CuTe-DSL accepts that at compile time and fails only "
+                f"on invocation, so it is rejected here instead. Make the target "
+                f"current, e.g. `with torch.cuda.device({device_index}):`, or "
+                f"move the tensors to cuda:{current}."
+            )
+    return arch
+
+
+@functools.cache
+def _cached_num_sms(device_index: int) -> int:
+    """Cache SM count per device — get_device_sm_count has non-trivial overhead."""
+    return get_device_sm_count(torch.device("cuda", device_index))
+
+
+def _validate_on_device(device: torch.device, fn_name: str, **tensors) -> None:
+    """Every tensor argument must live on q's exact device.
+
+    ``is_cuda`` alone admits a tensor on another GPU; the kernel launched on
+    q's device would then dereference peer pointers -- working or faulting
+    depending on peer access, silently either way."""
+    for name, t in tensors.items():
+        if t.device != device:
+            raise ValueError(
+                f"{fn_name}: {name} is on {t.device} but q is on {device}; "
+                f"all tensor arguments must be on q's device."
+            )
+
+
+def _validate_paged_inputs(
+    seq_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    batch_size: int,
+    fn_name: str,
+) -> None:
+    """Validate seq_lens / block_tables (cheap host-side checks; no device sync).
+
+    They must be int32 CUDA tensors (the kernels are compiled against on-device
+    Int32 fakes; a CPU or int64 tensor would make the kernel dereference a bad
+    pointer or misread storage) and have exactly ``batch_size`` rows.
+
+    NOTE (caller invariant, not checked here): ``block_tables`` must have at
+    least ``max_b ceil(seq_lens[b] / block_size)`` columns -- the natural
+    width, one entry per KV block a request occupies.  The kernels predicate
+    every block-table read on the row's own block count, so nothing past a
+    row's blocks is ever read; a narrower table is an out-of-bounds read.
+    The bound needs the per-row lengths from device memory, so it cannot be
+    checked here without a D2H copy; :func:`_validate_paged_bounds` performs
+    it when ``FLASHINFER_VALIDATE_INPUTS`` is set."""
+    if not (seq_lens.is_cuda and seq_lens.dtype == torch.int32):
+        raise ValueError(
+            f"{fn_name}: seq_lens must be an int32 CUDA tensor, got "
+            f"dtype={seq_lens.dtype}, device={seq_lens.device}"
+        )
+    if not (block_tables.is_cuda and block_tables.dtype == torch.int32):
+        raise ValueError(
+            f"{fn_name}: block_tables must be an int32 CUDA tensor, got "
+            f"dtype={block_tables.dtype}, device={block_tables.device}"
+        )
+    if seq_lens.dim() != 1 or seq_lens.shape[0] != batch_size:
+        raise ValueError(
+            f"{fn_name}: seq_lens must be 1-D with shape[0] == batch_size "
+            f"({batch_size}) inferred from q.shape[0]; got shape "
+            f"{tuple(seq_lens.shape)}"
+        )
+    if block_tables.dim() != 2 or block_tables.shape[0] != batch_size:
+        raise ValueError(
+            f"{fn_name}: block_tables must be 2-D with shape[0] == batch_size "
+            f"({batch_size}) inferred from q.shape[0]; got shape "
+            f"{tuple(block_tables.shape)}"
+        )
+    # Layout: the kernels read both index tensors through their layouts with
+    # scalar Int32 loads and are compiled with symbolic outer strides, so the
+    # only real requirement is that a block-table row's entries are adjacent
+    # (the compiled inner stride is 1).  seq_lens may have any stride, and a
+    # row-strided table view (block_tables[::next_n]) is accepted zero-copy --
+    # never force a copy the kernel does not need.
+    if block_tables.shape[1] > 1 and block_tables.stride(1) != 1:
+        raise ValueError(
+            f"{fn_name}: block_tables' innermost stride must be 1 (each row's "
+            f"entries contiguous; a row-strided view such as table[::k] is "
+            f"fine); got strides {tuple(block_tables.stride())}. Call "
+            f".contiguous() first."
+        )
+
+
+def _validate_schedule_meta_fresh(
+    schedule_meta: torch.Tensor,
+    seq_lens: torch.Tensor,
+    fn_name: str,
+    *,
+    next_n: int,
+    variant: str,
+) -> None:
+    """Debug-mode check that a caller-supplied ``schedule_meta`` is not stale.
+
+    ``seq_lens`` must be the caller's NATIVE ``[batch]`` lengths.  The schedule
+    is a pure function of ``(seq_lens, num_sms, variant, next_n)``: this runs
+    the exact public-helper call the error message recommends -- with this
+    call's ``next_n``/``variant`` -- so the fp4 atom decomposition is applied
+    here, after the early returns, and following the message is guaranteed to
+    produce the schedule this check accepts.  Reuse is only valid while the
+    whole ``ceil(seq_lens / _SPLIT_KV)`` vector is unchanged -- a single
+    sequence crossing a ``_SPLIT_KV`` boundary (256 -> 257) changes one row's
+    split count from 1 to 2 while every tensor shape stays identical.
+
+    A stale schedule does not merely give wrong numbers: the persistent kernel
+    terminates on exact equality with the stored end boundary, so an endpoint
+    that the runtime lengths can no longer produce makes the loop run forever.
+    e.g. a B=1 schedule built for length 257 ends CTA 0 at (q=0, kv_idx=2);
+    replayed at length 256 the iterator steps (0,0) -> (1,0), never hits (0,2),
+    and hangs.  Under the fp4 split a schedule built with the helper's DEFAULT
+    arguments describes the native B rows while the kernel iterates
+    B*num_atoms -- the same hang class, or silently unwritten output rows.
+
+    Recomputing costs exactly the work ``schedule_meta`` exists to avoid, so this
+    is opt-in via ``FLASHINFER_VALIDATE_INPUTS`` and skipped during CUDA-graph
+    capture.  Note that capture is where staleness is most likely, so this check
+    cannot see the case it most wants to catch -- it is a development aid, not a
+    guarantee.
+    """
+    if not _sync_input_validation_enabled():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    expected = compute_paged_mqa_logits_schedule(
+        seq_lens, device=schedule_meta.device, next_n=next_n, variant=variant
+    )
+    if not torch.equal(expected, schedule_meta):
+        recipe = (
+            f"compute_paged_mqa_logits_schedule(seq_lens, next_n={next_n}, "
+            f"variant={variant!r}, out=schedule_meta)"
+        )
+        raise ValueError(
+            f"{fn_name}: schedule_meta does not match seq_lens. It is a "
+            f"function of the contents of seq_lens, the device SM count, and "
+            f"this call's (variant, next_n): a changed sequence length can "
+            f"invalidate it even when every tensor shape is unchanged, and a "
+            f"schedule built with the helper's default arguments is wrong for "
+            f"variant='fp4', next_n=4 on SM100/SM103. Recompute it with "
+            f"{recipe}; reusing a stale or mismatched schedule can hang the "
+            f"persistent kernel."
+        )
+
+
+def _validate_schedule_meta(
+    schedule_meta: torch.Tensor, num_sms: int, device, fn_name: str
+) -> None:
+    """A caller-supplied schedule_meta must be an int32 CUDA [num_sms+1, 2] tensor;
+    a smaller one causes an out-of-bounds schedule read in the kernel."""
+    if not (schedule_meta.is_cuda and schedule_meta.dtype == torch.int32):
+        raise ValueError(
+            f"{fn_name}: schedule_meta must be an int32 CUDA tensor, got "
+            f"dtype={schedule_meta.dtype}, device={schedule_meta.device}"
+        )
+    if tuple(schedule_meta.shape) != (num_sms + 1, 2):
+        raise ValueError(
+            f"{fn_name}: schedule_meta must have shape ({num_sms + 1}, 2) for this "
+            f"device; got {tuple(schedule_meta.shape)}. "
+            f"Use compute_paged_mqa_logits_schedule()."
+        )
+    if not schedule_meta.is_contiguous():
+        raise ValueError(
+            f"{fn_name}: schedule_meta must be contiguous; got stride "
+            f"{tuple(schedule_meta.stride())}. "
+            f"Use compute_paged_mqa_logits_schedule() or pass a contiguous buffer."
+        )
+    # is_cuda above only says "some CUDA device"; without this a schedule built
+    # on another GPU reaches the FFI binding before anything complains.
+    if schedule_meta.device != torch.device(device):
+        raise ValueError(
+            f"{fn_name}: schedule_meta.device ({schedule_meta.device}) must match "
+            f"q.device ({device})"
+        )
+
+
+def _validate_schedule_seq_lens(
+    seq_lens: torch.Tensor, device: torch.device, fn_name: str
+) -> None:
+    """``seq_lens`` given to the schedule helper must be a 1-D int32 ``[B]``
+    tensor and, when it lives on CUDA, on the target ``device``.
+
+    The helper's three internal paths fail differently on a malformed tensor,
+    and two of them fail silently: the GPU kernel path reaches the FFI binding
+    and errors bare on a ``[1, B]`` or foreign-device tensor; the fp4 split
+    path reshapes ``[1, B]`` through ``_expand_seq_lens`` into a wrong flat
+    vector; and the CPU fallback's numpy loop reads ``shape[0] == 1`` and
+    emits a one-row schedule.  A wrong schedule is not a wrong number but a
+    hang or unwritten rows in the persistent kernel, so reject up front --
+    before the fp4 expansion, which would otherwise mask the rank error.
+
+    Layout is deliberately not checked: every path reads ``seq_lens`` through
+    its layout, so a strided view is accepted (see ``_validate_paged_inputs``).
+    """
+    if seq_lens.dtype != torch.int32:
+        raise ValueError(
+            f"{fn_name}: seq_lens must be int32 (matching fp8/fp4_paged_mqa_logits); "
+            f"got {seq_lens.dtype}"
+        )
+    if seq_lens.dim() != 1:
+        raise ValueError(
+            f"{fn_name}: seq_lens must be 1-D with shape [batch_size]; got shape "
+            f"{tuple(seq_lens.shape)}"
+        )
+    if seq_lens.is_cuda and seq_lens.device != device:
+        raise ValueError(
+            f"{fn_name}: seq_lens is on {seq_lens.device} but the schedule is "
+            f"being built for {device}; pass device= to match, or move seq_lens."
+        )
+
+
+def _validate_output_addressable(
+    rows: int, padded_max_seq_len: int, out: Optional[torch.Tensor], fn_name: str
+) -> None:
+    """The kernels index the output with 32-bit offsets (row * stride + col),
+    so the addressable span is bounded by 2^31 elements.  Beyond it the carried
+    offset wraps negative and stores land far outside the buffer -- silent
+    device-memory corruption, not an error.  Reject up front instead.  The
+    bound is enforced uniformly across architectures for a stable contract
+    (Rubin's gated store path would tolerate more, but an arch-dependent
+    output limit is worse than a conservative one)."""
+    stride0 = (
+        out.stride(0)
+        if (out is not None and out.dim() == 2 and out.shape[0] > 1)
+        else padded_max_seq_len
+    )
+    span = rows * max(stride0, padded_max_seq_len)
+    if span >= 2**31:
+        raise ValueError(
+            f"{fn_name}: the output would span {span} elements "
+            f"(batch_size*next_n = {rows} rows x row stride "
+            f"{max(stride0, padded_max_seq_len)}), but the kernel's output indexing "
+            f"is 32-bit (< 2^31 elements). Reduce batch_size or max_seq_len, "
+            f"or split the call."
+        )
+
+
+def _validate_out(
+    out: torch.Tensor,
+    rows: int,
+    padded_max_seq_len: int,
+    device: torch.device,
+    out_dtype: torch.dtype,
+    fn_name: str,
+) -> None:
+    """Validate a caller-provided ``out=`` buffer.
+
+    The kernel writes UNCONDITIONALLY into the SPLIT_KV-padded trailing region,
+    so ``out`` must have at least ``padded_max_seq_len`` columns (use
+    :func:`padded_seq_len`) and ``rows`` rows — otherwise the store spills
+    past each row / past the buffer (silent corruption or illegal address).
+    Its rows must also be distinct storage: the kernel addresses row ``r`` as
+    ``r * stride(0)`` and writes ``padded_max_seq_len`` columns from there, so
+    a row stride below that (an ``as_strided`` pitch, or 0 from ``.expand()``)
+    makes later rows overwrite earlier ones -- wrong logits, never an error."""
+    if out.device != device:
+        raise ValueError(
+            f"{fn_name}: out.device ({out.device}) must match q.device ({device})"
+        )
+    if out.dtype != out_dtype:
+        raise ValueError(
+            f"{fn_name}: out.dtype ({out.dtype}) must match output_dtype ({out_dtype})"
+        )
+    if out.dim() != 2 or out.shape[0] < rows or out.shape[1] < padded_max_seq_len:
+        raise ValueError(
+            f"{fn_name}: out must be at least ({rows}, {padded_max_seq_len}); the "
+            f"kernel writes into the padded trailing region. Use "
+            f"padded_seq_len(max_seq_len) for the column count. "
+            f"Got shape {tuple(out.shape)}."
+        )
+    # The kernel is compiled against a row-major output with unit inner stride;
+    # a column-strided view would reach the FFI binding with a bare layout
+    # error (or worse), so reject it here with the allocation recipe.
+    if out.stride(1) != 1:
+        raise ValueError(
+            f"{fn_name}: out's innermost stride must be 1 (row-contiguous); got "
+            f"strides {tuple(out.stride())}. Allocate with torch.empty((rows, "
+            f"padded_seq_len(max_seq_len)), ...)."
+        )
+    # Shape and dtype say nothing about aliasing: a pitched as_strided view or
+    # an .expand()ed row pass every check above with the right shape.  Only the
+    # rows the kernel writes matter -- a single row has nothing to collide with
+    # -- and a LARGER stride (a row slice of a wider buffer) is fine.
+    if rows > 1 and out.stride(0) < padded_max_seq_len:
+        raise ValueError(
+            f"{fn_name}: out's rows overlap: row stride {out.stride(0)} is "
+            f"smaller than the {padded_max_seq_len} columns the kernel writes "
+            f"per row (padded_seq_len(max_seq_len)); got strides "
+            f"{tuple(out.stride())}. Rows must be distinct storage -- allocate "
+            f"with torch.empty((rows, padded_seq_len(max_seq_len)), ...) or "
+            f"take a row slice of a wider buffer; do not build it with "
+            f"as_strided() or expand()."
+        )
+
+
+def _sync_input_validation_enabled() -> bool:
+    """``FLASHINFER_VALIDATE_INPUTS=1`` opts into checks that need a device sync."""
+    return os.environ.get("FLASHINFER_VALIDATE_INPUTS", "0") not in ("0", "")
+
+
+def _validate_paged_bounds(
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    block_size: int,
+    num_blocks: int,
+    fn_name: str,
+) -> None:
+    """Debug-mode bounds checks that need the per-row ``seq_lens``.
+
+    Two invariants keep the kernel inside its buffers, and both depend on values
+    that live in device memory, so one D2H copy covers both.
+
+    1. ``max(seq_lens) <= max_seq_len``.  The output row is sized from
+       ``max_seq_len`` while the schedule is derived from ``seq_lens``,
+       and nothing ties the two together.  A longer sequence schedules splits
+       past the end of the allocated row, and the kernel stores unconditionally,
+       so it writes there -- silent corruption rather than a fault.  e.g.
+       seq_lens=[257] with max_seq_len=256 allocates 256 columns while
+       the schedule reaches 512.
+
+    2. ``block_tables`` at least the natural width
+
+    Row ``b`` must have ``ceil(seq_lens[b] / block_size)`` entries -- one per
+    KV block the request occupies, the width a paged-KV serving stack keeps
+    anyway.  The kernels walk KV in ``_COMPUTE_BLOCK_KV``-token compute tiles
+    that span ``_COMPUTE_BLOCK_KV // block_size`` table columns, but predicate
+    each column on the row's own block count, so the last tile of a length
+    that is not a multiple of the tile (ctx=257 with block_size=64: 5 blocks,
+    3 tiles spanning 6 columns) never reads column 5.  A table narrower than
+    the natural width IS read out of bounds: interior rows pick up the next
+    row's entries, the last row reads past the allocation.
+
+    The bound depends on the per-row ``seq_lens``, which live on device, so
+    this costs a D2H copy.  It is therefore opt-in via
+    ``FLASHINFER_VALIDATE_INPUTS`` and skipped during CUDA-graph capture, where
+    a sync is illegal.  ``max_seq_len`` cannot stand in for the per-row
+    lengths: it is the output width (typically the model maximum), so it
+    over-estimates the requirement by the ratio between it and the real lengths.
+    """
+    if not _sync_input_validation_enabled():
+        return
+    if torch.cuda.is_current_stream_capturing():
+        return
+    lens = seq_lens.tolist()  # the single D2H sync; both checks use it
+    if not lens:
+        return
+    longest = max(lens)
+    if longest > max_seq_len:
+        raise ValueError(
+            f"{fn_name}: max_seq_len ({max_seq_len}) must be at least "
+            f"max(seq_lens) ({longest}). The output row is sized from "
+            f"max_seq_len but the schedule follows seq_lens, so a longer "
+            f"sequence is written past the end of the row."
+        )
+    need = min_block_table_width(longest, block_size)
+    if block_tables.shape[1] < need:
+        raise ValueError(
+            f"{fn_name}: block_tables has {block_tables.shape[1]} columns but the "
+            f"longest sequence ({longest} tokens) occupies {need} blocks of "
+            f"{block_size} (= min_block_table_width(max(seq_lens), block_size)). "
+            f"A narrower table is a device-side out-of-bounds READ."
+        )
+    # 3. Every block-table entry the kernel can READ must be a valid pool
+    #    index -- the classic stale-block bug. Per row r the kernel reads
+    #    exactly columns [0, ceil(ctx_r / block_size)); entries beyond a row's
+    #    own blocks are never read and are unconstrained. This path already
+    #    paid the D2H sync, so the value check rides along.
+    bt = block_tables.cpu()
+    per_row_need = torch.tensor(
+        [min_block_table_width(c, block_size) for c in lens], dtype=torch.int64
+    )
+    read_mask = (
+        torch.arange(bt.shape[1], dtype=torch.int64)[None, :] < per_row_need[:, None]
+    )
+    used = bt[read_mask]
+    if used.numel():
+        lo, hi = int(used.min()), int(used.max())
+        if lo < 0 or hi >= num_blocks:
+            raise ValueError(
+                f"{fn_name}: block_tables entries the kernel reads span "
+                f"[{lo}, {hi}] but kv_fused has only {num_blocks} blocks "
+                f"(valid indices 0..{num_blocks - 1}); a stale or out-of-pool "
+                f"block index is a device-side out-of-bounds READ."
+            )
+
+
+def _validate_phys_block_kv(block_size: int, fn_name: str) -> None:
+    """Validate the physical KV block size, taken from ``kv_fused.shape[1]``.
+
+    Both kernels tile KV in a fixed ``_COMPUTE_BLOCK_KV``-token compute tile and
+    issue ``_COMPUTE_BLOCK_KV // block_size`` TMA sub-copies to fill it,
+    capped at ``_MAX_BLOCKS_PER_MMA``. So the block size must divide the compute
+    tile and not be too small. Measured on sm_100a: {32, 64, 128} work, while
+    16 (too many sub-copies) and 48 / 96 / 256 (not divisors) each trip a bare
+    assertion from inside kernel construction.
+    """
+    if (
+        block_size <= 0
+        or _COMPUTE_BLOCK_KV % block_size != 0
+        or _COMPUTE_BLOCK_KV // block_size > _MAX_BLOCKS_PER_MMA
+    ):
+        supported = [
+            b
+            for b in range(1, _COMPUTE_BLOCK_KV + 1)
+            if _COMPUTE_BLOCK_KV % b == 0
+            and _COMPUTE_BLOCK_KV // b <= _MAX_BLOCKS_PER_MMA
+        ]
+        raise ValueError(
+            f"{fn_name}: block_size (kv_fused.shape[1]) must divide the "
+            f"{_COMPUTE_BLOCK_KV}-token compute tile into at most "
+            f"{_MAX_BLOCKS_PER_MMA} sub-blocks; supported values are {supported}, "
+            f"got {block_size}."
+        )
+
+
+def _fp8_smem_bytes(block_kv: int, head_dim: int, n: int, epi_bytes: int) -> int:
+    """Predict the FP8 kernel's per-CTA shared-memory usage, in bytes.
+
+    Mirrors ``FP8MQALogitsKernel.__init__`` for the configuration this wrapper
+    always builds (``max_kv_pipeline=False`` -> 3 KV stages, 3 Q stages, both
+    math groups resident).  Verified against the driver: head_dim=256 with
+    block_kv=128, n=64, fp32 epilogue predicts 249856 B and the launch reports
+    "Allocated: 249856 bytes".
+    """
+    num_kv_stages = 3
+    num_q_stages = 3
+    # KV + per-token fp32 scales, ×2 math groups.
+    kv_scale_per_stage = 2 * (block_kv * head_dim + block_kv * 4)
+    # Weights are padded to a 128 B stage stride for TMA alignment.
+    w_stage_stride = ((n * epi_bytes + 127) // 128 * 128) // epi_bytes
+    qw_per_stage = n * head_dim + w_stage_stride * epi_bytes
+    barriers = 256
+    return barriers + kv_scale_per_stage * num_kv_stages + qw_per_stage * num_q_stages
+
+
+@functools.cache
+def _cached_max_smem_per_block(device_index: int) -> int:
+    """Opt-in per-CTA SMEM cap for the device (232448 B on sm_100a)."""
+    props = torch.cuda.get_device_properties(torch.device("cuda", device_index))
+    for attr in ("shared_memory_per_block_optin", "sharedMemPerBlockOptin"):
+        val = getattr(props, attr, None)
+        if val:
+            return int(val)
+    return 232448  # sm_100a fallback
+
+
+_CUTE_DSL_AVAILABLE = is_cute_dsl_available()
+
+
+@functools.cache
+def _cached_dsl_targets_device(device_index: int) -> bool:
+    """Whether the installed CuTe DSL can natively target this device's arch.
+
+    Cached per device index: the answer is a property of (installed DSL,
+    device), both fixed for the process lifetime, and this sits on the eager
+    hot path of a host-launch-bound API -- the uncached probe chain
+    (get_device_capability -> Arch lookup) costs a few microseconds per call,
+    a measurable slice of the ~50 us eager dispatch.
+    """
+    major, minor = torch.cuda.get_device_capability(torch.device("cuda", device_index))
+    from ..cute_dsl.utils import is_cute_dsl_arch_supported
+
+    return is_cute_dsl_arch_supported(major, minor, native_only=True)
+
+
+def _require_cute_dsl(device: torch.device, fn_name: str) -> None:
+    """Raise unless the installed CuTe DSL can generate code for ``device``.
+
+    Two distinct failures get one entry point.  ``_CUTE_DSL_AVAILABLE`` only
+    says the package imports; it does not say the DSL knows the *device's*
+    architecture.  A DSL release predating a part resolves e.g. ``sm_107a`` to
+    a ``KeyError`` raised deep inside ``cute.compile``, long after the caller
+    has passed validation -- so the capability lists above (which say what
+    FlashInfer has kernels for) are checked against what the toolchain can
+    actually emit.
+
+    ``native_only=True`` because these kernels use block-scaled ``tcgen05``
+    MMA.  The probe's family-conditional fallback (compiling an sm_107 device
+    for ``sm_100f``) is only sound for family-portable feature sets, which
+    this is not.
+    """
+    if not _CUTE_DSL_AVAILABLE:
+        raise RuntimeError(
+            f"{fn_name} requires nvidia-cutlass-dsl (pip install nvidia-cutlass-dsl)."
+        )
+
+    if not _cached_dsl_targets_device(get_device_index(device)):
+        major, minor = torch.cuda.get_device_capability(device)
+        raise RuntimeError(
+            f"{fn_name}: the installed nvidia-cutlass-dsl cannot target "
+            f"sm_{major}{minor}a. FlashInfer ships kernels for this device, but "
+            f"the DSL release in use predates it and would fail inside "
+            f"cute.compile. Upgrade nvidia-cutlass-dsl."
+        )
+
+
+# Datacentre Blackwell (SM100/SM103) and Rubin (SM107).
+#
+# The kernels are written against the family-portable tcgen05 surface, so the
+# CuTe DSL compiles them for ``sm_107a`` unchanged -- no Rubin-specific kernel
+# code is needed for the next_n <= 3 path. What the DSL will *not* do is warn
+# when it lacks the device's architecture altogether, so ``_require_cute_dsl``
+# above gates on that separately.
+#
+# Consumer Blackwell (SM120/121) is deliberately absent: these kernels use
+# block-scaled tcgen05 MMA and a 2-CTA-free TMEM budget sized for the
+# datacentre parts.
+_PAGED_MQA_CCS = [100, 103, 107]
+
+
+def _fp4_max_atom_for_device(device: torch.device) -> int:
+    """Largest per-atom FP4 next_n this device's TMEM can hold.
+
+    An atom of 4 needs 544 raw TMEM columns. Blackwell (SM100/SM103) caps at
+    512, so 3 is its maximum; Rubin (SM107+) exposes 576 and fits 4 via an
+    exclusive, non-power-of-two allocation. Mirrors the kernel-side
+    ``max_next_n_for_target``, but keyed on the torch device so the API can
+    report the limit without entering the DSL.
+    """
+    major, minor = torch.cuda.get_device_capability(device)
+    # Same predicate as the kernel-side check, deliberately NOT a tuple
+    # compare: (major, minor) >= (10, 7) would also claim 4 for major >= 11,
+    # where the TMEM budget is unknown. Unreachable today (the CC allow-list
+    # stops at 107), but the two capacity oracles must stay identical.
+    return 4 if (major == 10 and minor >= 7) else 3
+
+
+def _fp4_atom_decomposition(next_n: int, device: torch.device) -> "tuple[int, int]":
+    """Return ``(atom, num_atoms)``: the fixed FP4 decomposition for a device.
+
+    Direct (one atom of next_n) whenever the device's TMEM holds it, else the
+    minimal split into equal atoms.  Shared by the fp4 launch path and
+    :func:`compute_paged_mqa_logits_schedule` so a caller-built schedule is
+    always built for the decomposition the kernel actually runs.
+    """
+    max_atom = _fp4_max_atom_for_device(device)
+    atom = (
+        next_n
+        if next_n <= max_atom
+        else max(a for a in range(1, max_atom + 1) if next_n % a == 0)
+    )
+    return atom, next_n // atom
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Schedule-metadata computation (pure Python, mirrors DeepGEMM scheduler)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_COMPUTE_BLOCK_KV = 128  # kernel's fixed compute tile (immutable)
+_NUM_MATH_WG = 2  # warp groups per CTA; kernel multiplies col-1 by this
+
+_ATOM_OFFSETS_CACHE: dict = {}
+
+
+def _atom_offsets(num_atoms: int, atom: int, device: torch.device) -> torch.Tensor:
+    """Per-atom context-length offsets ``[(num_atoms-1)*atom, ..., 0]``.
+
+    Cached because it depends only on the decomposition and the device, while
+    ``_expand_seq_lens`` runs on every call. These kernels are only a few
+    microseconds each, so the whole API call is host-launch-bound -- building
+    this tensor per call cost more in dispatch overhead than the paged-MQA
+    kernel itself takes to run.
+
+    A manual dict rather than ``functools.cache`` so that a CUDA-graph capture
+    can never populate it: a tensor allocated during capture comes from the
+    graph's private memory pool and would dangle once that graph is freed. On a
+    cache miss during capture the offsets are computed (and captured) but not
+    retained; a warmed-up caller hits the cache and the question never arises.
+    """
+    key = (num_atoms, atom, device)
+    off = _ATOM_OFFSETS_CACHE.get(key)
+    if off is None:
+        off = (
+            torch.arange(num_atoms - 1, -1, -1, device=device, dtype=torch.int32) * atom
+        )
+        if not torch.cuda.is_current_stream_capturing():
+            _ATOM_OFFSETS_CACHE[key] = off
+    return off
+
+
+def _expand_seq_lens(seq_lens: torch.Tensor, num_atoms: int, atom: int) -> torch.Tensor:
+    """Expand ``[batch]`` context lengths to ``[batch*num_atoms]`` for the split.
+
+    Atom ``i`` (0 = oldest) of a sequence sees ``ctx - (num_atoms-1-i)*atom``,
+    which reproduces the unsplit next_n's staggered causal limits. Identity when
+    ``num_atoms == 1``.
+
+    A per-atom length may come out zero or negative when a sequence is shorter
+    than the atom's offset. That is deliberately left unclamped: the offset is
+    below next_n (<= 4), so ``ceil_div(ctx, block_kv)`` floors such an atom to
+    zero work in both the scheduler and the kernel, keeping the two in
+    agreement. Clamping to 0 here would be equivalent, but leaving the raw value
+    keeps this function a pure inverse of the kernel's ``_atom_ctx_len``.
+    """
+    if num_atoms == 1:
+        return seq_lens
+    off = _atom_offsets(num_atoms, atom, seq_lens.device)
+    # One kernel: the broadcast subtract already produces a contiguous
+    # [batch, num_atoms] result, so reshape is a view and no copy is needed.
+    return (seq_lens.unsqueeze(1) - off.unsqueeze(0)).reshape(-1)
+
+
+def _compute_schedule_metadata(
+    seq_lens_cpu: torch.Tensor,
+    num_ctas: int,
+) -> torch.Tensor:
+    """Return [num_ctas+1, 2] int32 on CPU.
+
+    Each row (q_idx, kv_split_half) marks a CTA boundary.  The kernel
+    multiplies col-1 by NUM_MATH_WG=2 internally to get block-granularity
+    kv_idx.  Algorithm mirrors DeepGEMM's PagedMQALogitsScheduler.
+
+    Implemented with vectorized numpy to avoid Python-loop overhead (~150
+    torch.tensor() allocations per call that otherwise cost ~600µs).
+    """
+    ctx_np = seq_lens_cpu.numpy().astype(np.int64)
+    num_kv = (ctx_np + _COMPUTE_BLOCK_KV - 1) // _COMPUTE_BLOCK_KV
+    splits = (num_kv + 1) // 2  # ceil_div(num_kv, NUM_MATH_WG)
+
+    total = int(splits.sum())
+    q_div, r_mod = divmod(total, num_ctas)
+    batch_size = len(splits)
+
+    # Cumulative splits: cum[j] = sum(splits[0..j-1]), cum[0]=0
+    cum = np.concatenate([[0], np.cumsum(splits)])  # [B+1]
+
+    # For each CTA boundary i, compute the target = total splits before CTA i
+    i_vals = np.arange(num_ctas + 1, dtype=np.int64)
+    targets = i_vals * q_div + np.minimum(i_vals, r_mod)  # [num_ctas+1]
+
+    # seq_idx[i] = number of fully-assigned sequences before CTA i
+    # searchsorted(cum[1:], target, 'right') → first j where cum[j+1] > target
+    seq_idx = np.searchsorted(cum[1:], targets, side="right")  # [num_ctas+1]
+
+    # Clamp and build sentinel mask
+    out_of_range = seq_idx >= batch_size
+    seq_idx_clamped = np.minimum(seq_idx, batch_size - 1) if batch_size > 0 else seq_idx
+
+    # local[i] = target[i] - cum[seq_idx[i]]  (offset within current sequence)
+    local = targets - cum[seq_idx_clamped]
+
+    # Apply sentinel: when all sequences done, row = (batch_size, 0)
+    seq_out = np.where(out_of_range, batch_size, seq_idx).astype(np.int32)
+    loc_out = np.where(out_of_range, 0, local).astype(np.int32)
+
+    schedule = torch.empty((num_ctas + 1, 2), dtype=torch.int32)
+    schedule[:, 0] = torch.from_numpy(seq_out)
+    schedule[:, 1] = torch.from_numpy(loc_out)
+    return schedule
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Torch ↔ CuTe DSL dtype helpers
+# ──────────────────────────────────────────────────────────────────────────────
+
+if _CUTE_DSL_AVAILABLE:
+    import cutlass
+    import cutlass.cute as cute
+
+    _TORCH_TO_CUTLASS = {
+        torch.float32: cutlass.Float32,
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+    }
+
+    def _to_cutlass(dtype: torch.dtype):
+        try:
+            return _TORCH_TO_CUTLASS[dtype]
+        except KeyError:
+            raise ValueError(
+                f"fp8/fp4_paged_mqa_logits: unsupported dtype {dtype}; supported: "
+                f"{', '.join(str(k) for k in _TORCH_TO_CUTLASS)} (fp8 output/"
+                f"epi/acc additionally exclude bfloat16)."
+            ) from None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FP8 kernel: compile cache + source-file tracker
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@functools.cache
+def _cached_fp8_source_files() -> Tuple[str, ...]:
+    from .kernels import fp8_paged_mqa_logits as _m
+
+    return (__file__, _m.__file__)
+
+
+@functools.cache
+def _cached_compile_fp8_kernel(
+    block_size: int,
+    num_heads: int,
+    head_dim: int,
+    next_n: int,
+    num_sms: int,
+    epi_dtype,  # cutlass dtype object
+    acc_dtype,  # cutlass dtype object
+    output_dtype,  # cutlass dtype object
+    # Epilogue policy -- deliberately NOT public.  Both values come from
+    # _fp8_epilogue_policy, an internal per-shape table measured on these
+    # kernels, and are routed through here so the in-process cache key and the
+    # on-disk tag carry them.  Every caller passes them positionally:
+    # functools.cache keys on the literal call shape, so a defaulted argument
+    # would split one kernel into two entries.  The kernel constructor
+    # validates them.
+    num_epi_subtiles: int,
+    w_cache_regs: Optional[int],
+    arch: str,
+):
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from .kernels import FP8MQALogitsKernel
+
+    N = next_n * num_heads
+    block_bytes = block_size * (head_dim + 4)
+
+    sym_npb = cute.sym_int()
+    sym_B = cute.sym_int()
+    max_ctx = cute.sym_int()
+    max_blocks = cute.sym_int()
+    num_ctas_sym = cute.sym_int()
+
+    # KV may come from a K-cache pool view that is strided in dim 0 (pool
+    # layouts interleave layers, e.g. [num_blocks, num_layers, kvFactor,
+    # block_bytes]). Declare the outer stride as a symbol so the actual
+    # per-block stride is read at runtime; the innermost stride is fixed to 1
+    # (bytes are contiguous within one logical block). A compact-tensor
+    # declaration would bake block_bytes in as the outer stride and reject
+    # such a view at the FFI boundary. Matches TensorRT-LLM's production
+    # CuteDSLPagedMQALogitsRunner._compile.
+    kv_fake = cute.runtime.make_fake_tensor(
+        cutlass.Uint8,
+        (sym_npb, block_bytes),
+        stride=(cute.sym_int64(), 1),
+    )
+    q_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (N, head_dim, sym_B), stride_order=(1, 0, 2)
+    )
+    w_dtype = cutlass.Float16 if epi_dtype == cutlass.Float16 else epi_dtype
+    w_fake = cute.runtime.make_fake_compact_tensor(
+        w_dtype, (N, sym_B), stride_order=(0, 1)
+    )
+    logits_fake = cute.runtime.make_fake_tensor(
+        output_dtype,
+        (cute.sym_int(), max_ctx),
+        stride=(cute.sym_int64(), 1),
+    )
+    # block_tables / seq_lens are read only through their layouts with scalar
+    # Int32 loads (no TMA descriptor), so the kernel needs a unit inner stride
+    # on the table and nothing else: declare the row stride (and seq_lens'
+    # stride) symbolic so views such as block_tables[::next_n] /
+    # seq_lens[::next_n] -- a per-draft-token table de-expanded without a
+    # copy -- are consumed zero-copy, like kv_fused and logits above.  A
+    # compact declaration would bake the row stride in and reject them at the
+    # FFI boundary.  4-byte alignment is all an Int32 base pointer guarantees.
+    bt_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32,
+        (sym_B, max_blocks),
+        stride=(cute.sym_int64(), 1),
+        assumed_align=4,
+    )
+    cl_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32, (sym_B,), stride=(cute.sym_int(),), assumed_align=4
+    )
+    sm_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (num_ctas_sym, 2), stride_order=(1, 0)
+    )
+    fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    kernel = FP8MQALogitsKernel(
+        block_kv=_COMPUTE_BLOCK_KV,
+        phys_block_kv=block_size,  # kernel kwarg name is fixed (verbatim TRT-LLM port)
+        num_heads=num_heads,
+        head_dim=head_dim,
+        next_n=next_n,
+        num_sms=num_sms,
+        num_epi_subtiles=num_epi_subtiles,
+        epi_dtype=epi_dtype,
+        acc_dtype=acc_dtype,
+        output_dtype=output_dtype,
+        w_cache_regs=w_cache_regs,
+        # Construction-time arch gates (is_rubin levers, TMEM columns) must
+        # follow the compile target, not the DSL's ambient device-0 probe.
+        arch=arch,
+    )
+
+    def _compile_fn():
+        return cute.compile(
+            kernel,
+            kv_fake,
+            q_fake,
+            w_fake,
+            logits_fake,
+            bt_fake,
+            cl_fake,
+            sm_fake,
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            fake_stream,
+            options=f"--gpu-arch {arch} --enable-tvm-ffi",
+        )
+
+    tag = (
+        f"fp8_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
+        f"_sms{num_sms}_epi{epi_dtype}_acc{acc_dtype}_out{output_dtype}"
+        f"_sub{num_epi_subtiles}_w{w_cache_regs or 0}_{arch}"
+    )
+    return build_and_load_cute_dsl_kernel(
+        "attn_scores_fp8",
+        tag,
+        _compile_fn,
+        extra_key_files=_cached_fp8_source_files(),
+    )
+
+
+# (num_epi_subtiles, w_cache_regs) for the FP8 kernel's epilogue, by shape.
+# None for w_cache_regs keeps the kernel's default register budget
+# (_MAX_W_CACHE_REGS = 160).  Deliberately an internal table, not a public
+# kwarg or env var: execution-strategy choices are made here from
+# measurements on these kernels (graph-replay methodology of
+# benchmarks/bench_paged_mqa_logits.py, same node per arch), and neither knob
+# changes the head accumulation order, so every entry is bit-identical to the
+# default -- the table is purely a speed decision, pinned by
+# test_fp8_epilogue_policy_is_bit_identical_and_keyed.
+#
+# Measured 2026-09, graph_ms ratio vs the default (1, None), B200 / Rubin,
+# cells (batch, seq) = (1, 4K) (16, 4K) (64, 16K), fp32 epilogue unless noted:
+#   num_heads=64, next_n=1..4 (the tuned shape): subtiles 1/2/4 tie, 8 is
+#     5-11% slower -> default.
+#   num_heads=32, next_n=6, budget 96 (16 weights/slot instead of 24):
+#     0.92 0.85 0.89 / 0.81 0.89 0.65.  Nsight Compute on the default:
+#     ~12k local loads + ~8k local stores per launch (register spills);
+#     0 at budget 96.  Budgets 64/48 (12/8 per slot) spill nothing either
+#     but pay more SMEM weight reads and are 2-4% slower than 96.
+#   num_heads=32, next_n=8, budget 96: 1.00 0.85 0.71 / 0.79 0.78 0.63.
+#   num_heads=32, next_n=5, budget 96 (16/slot instead of 32): B200
+#     0.99 0.84 0.76; default spills ~33k local loads + ~22k stores per
+#     launch, 0 at 96.  Rubin ratios 0.88 0.87 0.73, taken while that board
+#     was stuck at idle clocks (absolutes 8x off its ledger) -- direction only.
+#   num_heads=32, next_n=7, budget 96 (12/slot instead of 20): B200
+#     0.91 0.99 0.91; default spills ~14k local loads + ~11k stores, 0 at 96.
+#     Rubin ratios 0.96 0.85 0.74 under the same caveat.
+#   num_heads=32, next_n=4, budget 96: 1.00 1.00 1.01 / 0.90 1.00 0.95
+#     (neutral).  At next_n<=3 the formula already caches all 32 heads per
+#     slot within 96 registers, so the budget compiles the identical kernel.
+#   num_heads=32, next_n=6, fp16 epilogue: the budget does not bind (two
+#     weights per register); two epilogue subtiles: 1.00 1.00 0.95 /
+#     1.00 0.97 0.87 -> (2, None).
+# The rule below encodes exactly that: a 96-register budget for the fp32
+# epilogue at num_heads=32 -- every next_n the API admits there (1..8,
+# N <= 256) is covered: identical kernel at 1..3, neutral at 4, measured wins
+# at 5..8 -- two subtiles for its fp16 epilogue at next_n=6, and the default
+# everywhere else, including every num_heads other than 32 and the other
+# fp16 shapes, which were not measured.
+_FP8_EPILOGUE_DEFAULT = (1, None)
+
+
+def _fp8_epilogue_policy(num_heads: int, next_n: int, epi_dtype) -> "tuple":
+    """Return ``(num_epi_subtiles, w_cache_regs)`` for the fp8 kernel; see the
+    measured table above."""
+    if num_heads == 32:
+        if epi_dtype == cutlass.Float16:
+            return (2, None) if next_n == 6 else _FP8_EPILOGUE_DEFAULT
+        return (1, 96)
+    return _FP8_EPILOGUE_DEFAULT
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# FP4 kernel: compile cache + source-file tracker
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+@functools.cache
+def _cached_fp4_source_files() -> Tuple[str, ...]:
+    from .kernels import fp4_paged_mqa_logits as _m
+
+    return (__file__, _m.__file__)
+
+
+@functools.cache
+def _cached_compile_fp4_kernel(
+    block_size: int,
+    num_heads: int,
+    head_dim: int,
+    next_n: int,
+    num_sms: int,
+    epi_dtype,  # cutlass dtype object
+    output_dtype,  # cutlass dtype object
+    # num_epi_subtiles is deliberately NOT public: measured on sm_100a at
+    # num_heads=64, subtile counts 1/2/4 tie and 8 is 5-11% slower, so the API
+    # always passes 1 (TensorRT-LLM never varies it in production either). The
+    # parameter and its _sub{n} cache tag stay so a future per-shape policy --
+    # or a reinstated argument, should some geometry ever profit -- can route a
+    # value through without a cache redesign. The kernel constructor validates
+    # the divisibility rules.
+    num_epi_subtiles: int,
+    is_kv_sf_interleaved: bool,
+    arch: str,
+    # Deliberately NO default: functools.cache keys on the literal call shape,
+    # so f(..., arch) and f(..., arch, 1) would be distinct entries for the
+    # same kernel -- a warm from one call site would silently miss from the
+    # other. Forcing every caller to pass it keeps the key canonical.
+    num_next_n_atoms: int,
+):
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+    from .kernels import FP4MQALogitsKernel
+
+    # next_n is the LOGICAL next-token count. The fake Q/SF/W carry one atom of
+    # N = next_n_atom * num_heads, and the kernel tiles the split over
+    # q_atom_idx; block_tables / seq_lens stay [batch]-shaped.
+    next_n_atom = next_n // num_next_n_atoms
+    N = next_n_atom * num_heads
+    half_D = head_dim // 2
+    block_bytes = block_size * (half_D + 4)
+
+    sym_npb = cute.sym_int()
+    sym_B = cute.sym_int()  # Q / SF / weights L dim = batch * num_next_n_atoms
+    sym_batch = cute.sym_int()  # native block_tables / seq_lens rows
+    max_ctx = cute.sym_int()
+    max_blocks = cute.sym_int()
+    num_ctas_sym = cute.sym_int()
+
+    # Symbolic outer stride so a strided K-cache pool view works zero-copy;
+    # see the matching comment in _cached_compile_fp8_kernel.
+    kv_fake = cute.runtime.make_fake_tensor(
+        cutlass.Uint8,
+        (sym_npb, block_bytes),
+        stride=(cute.sym_int64(), 1),
+    )
+    q_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Uint8, (N, half_D, sym_B), stride_order=(1, 0, 2)
+    )
+    sf_q_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (N, sym_B), stride_order=(0, 1)
+    )
+    w_fake = cute.runtime.make_fake_compact_tensor(
+        epi_dtype, (N, sym_B), stride_order=(0, 1)
+    )
+    logits_fake = cute.runtime.make_fake_tensor(
+        output_dtype,
+        (cute.sym_int(), max_ctx),
+        stride=(cute.sym_int64(), 1),
+    )
+    # Symbolic strides for the index tensors -- see the fp8 twin above.
+    bt_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32,
+        (sym_batch, max_blocks),
+        stride=(cute.sym_int64(), 1),
+        assumed_align=4,
+    )
+    cl_fake = cute.runtime.make_fake_tensor(
+        cutlass.Int32, (sym_batch,), stride=(cute.sym_int(),), assumed_align=4
+    )
+    sm_fake = cute.runtime.make_fake_compact_tensor(
+        cutlass.Int32, (num_ctas_sym, 2), stride_order=(1, 0)
+    )
+    fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+
+    kernel = FP4MQALogitsKernel(
+        block_kv=_COMPUTE_BLOCK_KV,
+        phys_block_kv=block_size,  # kernel kwarg name is fixed (verbatim TRT-LLM port)
+        num_heads=num_heads,
+        head_dim=head_dim,
+        next_n=next_n,
+        num_next_n_atoms=num_next_n_atoms,
+        num_sms=num_sms,
+        num_epi_subtiles=num_epi_subtiles,
+        epi_dtype=epi_dtype,
+        output_dtype=output_dtype,
+        # kernel kwarg name is fixed (verbatim TRT-LLM port)
+        remove_online_sf_transpose=is_kv_sf_interleaved,
+        # Construction-time arch gates (atom cap, is_rubin levers) must follow
+        # the compile target, not the DSL's ambient device-0 probe.
+        arch=arch,
+    )
+
+    def _compile_fn():
+        return cute.compile(
+            kernel,
+            kv_fake,
+            q_fake,
+            sf_q_fake,
+            w_fake,
+            logits_fake,
+            bt_fake,
+            cl_fake,
+            sm_fake,
+            cutlass.Int32(1),
+            cutlass.Int32(1),
+            fake_stream,
+            options=f"--gpu-arch {arch} --enable-tvm-ffi",
+        )
+
+    tag = (
+        f"fp4_bs{block_size}_H{num_heads}_D{head_dim}_nn{next_n}"
+        f"_at{num_next_n_atoms}"
+        f"_sms{num_sms}_epi{epi_dtype}_out{output_dtype}"
+        f"_sub{num_epi_subtiles}_sfI{int(is_kv_sf_interleaved)}_{arch}"
+    )
+    return build_and_load_cute_dsl_kernel(
+        "attn_scores_fp4",
+        tag,
+        _compile_fn,
+        extra_key_files=_cached_fp4_source_files(),
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Public API
+# ──────────────────────────────────────────────────────────────────────────────
+
+_SPLIT_KV = _COMPUTE_BLOCK_KV * _NUM_MATH_WG  # 256 — output alignment granularity
+
+
+def _schedule_bucket(num_rows: int) -> int:
+    """The 32-row bucket the schedule kernel is specialised on.
+
+    ``num_rows`` is the scheduler row count -- the caller's batch size for fp8
+    and unsplit fp4, ``batch_size * num_atoms`` under the fp4 atom split.  The
+    single definition shared by the launch path and precompile, so the two
+    cannot drift apart again.
+    """
+    return max(((num_rows + 31) // 32) * 32, 32)
+
+
+def _precompile_schedule_buckets(batch_sizes, variants, device: torch.device) -> set:
+    """Every schedule-kernel bucket the given variants can request for the
+    given caller batch sizes: bucket(B) for fp8 and unsplit fp4, plus
+    bucket(B * num_atoms) for each fp4 next_n that splits on ``device``."""
+    multipliers = {1}
+    if "fp4" in variants:
+        for nn in range(1, _FP4_MAX_NEXT_N + 1):
+            _, num_atoms = _fp4_atom_decomposition(nn, device)
+            multipliers.add(num_atoms)
+    return {_schedule_bucket(int(b) * m) for b in batch_sizes for m in multipliers}
+
+
+def _gpu_schedule(
+    seq_lens: torch.Tensor,
+    schedule_meta: torch.Tensor,
+    num_sms: int,
+) -> None:
+    """Run GPU schedule kernel in-place: fills schedule_meta from seq_lens.
+
+    Both tensors must already be on the same CUDA device.
+    schedule_meta must be [num_sms+1, 2] int32.
+    """
+    from .kernels.schedule_kernel import _compile_schedule_kernel
+
+    batch_size = int(seq_lens.shape[0])
+    aligned_b = _schedule_bucket(batch_size)
+    dev_index = get_device_index(schedule_meta.device)
+    with _on_device(dev_index):
+        compiled = _compile_schedule_kernel(
+            aligned_b,
+            _SPLIT_KV,
+            num_sms,
+            _arch_for_launch(dev_index, "compute_paged_mqa_logits_schedule"),
+        )
+        compiled(seq_lens, schedule_meta, batch_size)
+
+
+def padded_seq_len(max_seq_len: int) -> int:
+    """Return the minimum column count of the paged MQA logits ``out`` buffer.
+
+    Rounds ``max_seq_len`` up to the kernels' internal output-store
+    granularity.  The kernels write the padded trailing positions
+    unconditionally, so the output tensor must be allocated with at least this
+    many columns (a narrower ``out`` is an out-of-bounds write).  The
+    granularity is an implementation detail that may change -- always call
+    this helper rather than hard-coding the padding.  The padding columns hold
+    unspecified scratch -- never consume them.
+
+    Use this to pre-allocate the ``out`` parameter:
+        out = torch.empty(
+            (B * next_n, padded_seq_len(max_seq_len)), dtype=..., device="cuda"
+        )
+        logits = fp8_paged_mqa_logits(..., out=out)
+    """
+    return ((max_seq_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+
+
+def min_block_table_width(seq_len: int, block_size: int) -> int:
+    """Return the minimum ``block_tables`` column count for a sequence length.
+
+    This is the natural width ``ceil(seq_len / block_size)`` -- one entry per
+    KV block the sequence occupies, exactly the table a paged-KV serving stack
+    already keeps per request.  The kernels predicate every block-table read
+    on the row's own block count, so no padding columns are needed and
+    entries past a sequence's blocks are never read (they may hold anything).
+
+    Kept as a helper so callers name the contract in one place rather than
+    hard-coding the rule; a future kernel that needs a wider table can change
+    it here without touching call sites.
+
+    Allocate ``block_tables`` as::
+
+        [batch_size, min_block_table_width(int(seq_lens.max()), block_size)]
+
+    (using ``max_seq_len`` as the bound also works; see the Example in
+    :func:`fp8_paged_mqa_logits`).
+    """
+    return -(-seq_len // block_size)
+
+
+def compute_paged_mqa_logits_schedule(
+    seq_lens: torch.Tensor,
+    device: Optional[torch.device] = None,
+    *,
+    next_n: int = 1,
+    variant: str = "fp8",
+    use_gpu_kernel: bool = True,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compute the CTA schedule tensor for paged MQA logits kernels.
+
+    Returns [num_sms+1, 2] int32 on CUDA, ready to pass as ``schedule_meta``
+    to :func:`fp8_paged_mqa_logits` or :func:`fp4_paged_mqa_logits`.  Pass
+    the same ``variant`` and ``next_n`` as the upcoming main call: for some
+    (variant, next_n, device) combinations the kernel internally restructures
+    the problem, and this helper applies the same internal policy so the
+    returned schedule always describes the work the kernel actually runs.
+    Treat the contents as opaque -- never inspect, serialize, or reuse them
+    across flashinfer versions, devices, or different (variant, next_n).
+
+    Args:
+        seq_lens:       [B] int32 (1-D), on CPU or on ``device``; any stride.
+        device:         target CUDA device.  Defaults to seq_lens.device,
+                        or the current CUDA device when seq_lens is on CPU.
+        next_n:         the next_n (q.shape[1]) of the upcoming main call.
+                        Defaults to 1 (plain decode).
+        variant:        "fp8" or "fp4" -- which paged-MQA API the schedule
+                        is for.  Defaults to "fp8".
+        use_gpu_kernel: if True (default), compute entirely on-GPU via a
+                        small dedicated schedule kernel -- no D2H copy,
+                        CUDA-graph-capturable.  Falls back to CPU numpy (not
+                        graph-capturable) when the CuTe DSL is unavailable,
+                        cannot target the device's architecture, or
+                        seq_lens is on CPU.
+        out:            optional pre-allocated [num_sms+1, 2] int32 on CUDA.
+                        Required for CUDA-graph capture (static buffer).
+                        If None, a new tensor is allocated each call.
+                        This provides static storage, not static contents:
+                        the address stays stable, but the values must be
+                        recomputed into it whenever the contents of seq_lens
+                        change -- including on every graph replay where the
+                        lengths may have moved.
+
+    Returns:
+        schedule_meta: [num_sms+1, 2] int32 on CUDA (``out`` if provided).
+    """
+    if device is None:
+        device = seq_lens.device if seq_lens.is_cuda else torch.device("cuda")
+    device = torch.device(device)
+    if device.type == "cuda" and device.index is None:
+        # Normalize an index-less "cuda" to the current device so the
+        # device-equality checks below compare like with like.
+        device = torch.device("cuda", torch.cuda.current_device())
+    # Before the fp4 expansion: it would reshape a malformed [1, B] into a
+    # plausible flat vector and hide the rank error from every later check.
+    _validate_schedule_seq_lens(seq_lens, device, "compute_paged_mqa_logits_schedule")
+    if variant not in ("fp8", "fp4"):
+        raise ValueError(
+            f"compute_paged_mqa_logits_schedule: variant must be 'fp8' or "
+            f"'fp4'; got {variant!r}"
+        )
+    if next_n < 1:
+        raise ValueError(
+            f"compute_paged_mqa_logits_schedule: next_n must be >= 1; got {next_n}"
+        )
+    if variant == "fp4" and next_n > 1:
+        # Mirror the kernel's internal decomposition (see fp4_paged_mqa_logits)
+        # so the schedule describes the work the kernel actually runs.  When
+        # no split is active this is the identity.
+        atom, num_atoms = _fp4_atom_decomposition(next_n, device)
+        seq_lens = _expand_seq_lens(seq_lens, num_atoms, atom)
+    num_sms = _cached_num_sms(get_device_index(device))
+    if out is not None:
+        _validate_schedule_meta(
+            out, num_sms, device, "compute_paged_mqa_logits_schedule"
+        )
+
+    # The GPU path additionally requires a DSL release that can target this
+    # device's architecture; otherwise fall back to CPU rather than fail deep
+    # inside cute.compile with a KeyError.
+    if (
+        use_gpu_kernel
+        and _CUTE_DSL_AVAILABLE
+        and seq_lens.is_cuda
+        and _cached_dsl_targets_device(get_device_index(device))
+    ):
+        if out is None:
+            out = torch.empty((num_sms + 1, 2), dtype=torch.int32, device=device)
+        _gpu_schedule(seq_lens, out, num_sms)
+        return out
+
+    # CPU fallback: D2H copy + numpy schedule + H2D copy
+    result = _compute_schedule_metadata(seq_lens.cpu(), num_sms).to(device)
+    if out is not None:
+        out.copy_(result)
+        return out
+    return result
+
+
+@supported_compute_capability(_PAGED_MQA_CCS)
+def _check_fp8_paged_mqa_logits_supported(
+    q: torch.Tensor,
+    kv_fused: torch.Tensor,
+    weights: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    output_dtype: torch.dtype = torch.float32,
+    epi_dtype: torch.dtype = torch.float32,
+    acc_dtype: torch.dtype = torch.float32,
+    schedule_meta: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> bool:
+    """Return True when the FP8 kernel supports this problem, else raise ``ValueError``.
+
+    This function is the single place that encodes what the *current* kernel
+    can run, keeping those limits out of the public signature.  It covers every
+    constraint FP8MQALogitsKernel asserts (block_kv % phys_block_kv,
+    num_blocks_per_mma) plus three bounds the kernel does not check and
+    would otherwise fail on obscurely:
+    head_dim vs the MMA instruction K, the UMMA N-mode range, and the per-CTA
+    SMEM budget.
+
+    Signature mirrors :func:`fp8_paged_mqa_logits` (``backend_requirement`` binds
+    the public arguments and forwards them all by keyword); ``schedule_meta`` and
+    ``out`` are accepted but validated in the API body instead — they describe
+    caller-supplied output storage rather than problem supportedness, and must
+    stay enforced even under ``skip_check=True`` because a too-small buffer is a
+    silent out-of-bounds write.
+    """
+    if q.dim() != 4:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: q must be 4-D [batch_size, next_n, num_heads, "
+            f"head_dim]; got {q.dim()}-D {tuple(q.shape)}. next_n is a separate "
+            f"dimension even for plain decode -- pass q.unsqueeze(1) for next_n=1."
+        )
+    if kv_fused.dim() != 4:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: kv_fused must be 4-D "
+            f"[num_blocks, block_size, 1, head_dim+4]; got {kv_fused.dim()}-D "
+            f"{tuple(kv_fused.shape)}."
+        )
+    if kv_fused.dtype != torch.uint8:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: kv_fused must be uint8 (fused bytes: values "
+            f"then per-token float32 scales); view your cache with "
+            f".view(torch.uint8) if it is stored as {kv_fused.dtype}."
+        )
+    _validate_on_device(
+        q.device,
+        "fp8_paged_mqa_logits",
+        kv_fused=kv_fused,
+        weights=weights,
+        seq_lens=seq_lens,
+        block_tables=block_tables,
+    )
+    B, next_n, H, D = q.shape
+    N = next_n * H
+    block_size = kv_fused.shape[1]
+
+    _validate_weights(weights, B, next_n, H, "fp8_paged_mqa_logits")
+    if q.dtype != torch.float8_e4m3fn:
+        raise ValueError(
+            f"fp8_paged_mqa_logits requires q.dtype == float8_e4m3fn; got {q.dtype}. "
+            "(e5m2 has a different byte layout and would be silently misread as e4m3.)"
+        )
+    if (
+        output_dtype not in _FP8_DTYPES
+        or epi_dtype not in _FP8_DTYPES
+        or acc_dtype not in _FP8_DTYPES
+    ):
+        raise ValueError(
+            "fp8_paged_mqa_logits supports output/epi/acc dtype in {float32, "
+            f"float16}}; got output_dtype={output_dtype}, epi_dtype={epi_dtype}, "
+            f"acc_dtype={acc_dtype}."
+        )
+    # --- head_dim supportedness -------------------------------------------
+    # The FP8 kernel is parametric over head_dim (unlike FP4, which hardcodes
+    # 128), but two conditions bound it. Both are checked here so the caller
+    # gets an actionable error instead of a silently-wrong result or a bare
+    # cudaErrorInvalidValue from the driver at launch.
+    #
+    # (1) Multiple of the MMA instruction K. The kernel computes
+    #     mma_inst_tile_k = head_dim // 32 with integer division, so a
+    #     non-multiple silently truncates the QK contraction (head_dim=100
+    #     would reduce over only 96 elements) and returns wrong logits.
+    if D % _FP8_MMA_INST_K != 0:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: head_dim must be a multiple of "
+            f"{_FP8_MMA_INST_K} (FP8 MMA instruction K); "
+            f"got head_dim={D} from q.shape. A non-multiple would silently truncate the "
+            f"QK contraction to {D // _FP8_MMA_INST_K * _FP8_MMA_INST_K} elements."
+        )
+    # (2) SMEM budget. Tile sizing scales linearly with head_dim; an oversized
+    #     config fails at launch with an opaque driver error. Measured on
+    #     sm_100a: head_dim <= 192 fits, 256 does not (249856 B > 232448 B).
+    _smem_needed = _fp8_smem_bytes(
+        _COMPUTE_BLOCK_KV, D, N, 2 if epi_dtype == torch.float16 else 4
+    )
+    _smem_limit = _cached_max_smem_per_block(get_device_index(q.device))
+    if _smem_needed > _smem_limit:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: head_dim={D} with num_heads={H}, "
+            f"next_n={next_n} needs {_smem_needed} B "
+            f"of shared memory per CTA but this device allows {_smem_limit} B. "
+            f"Reduce head_dim (<=192 fits at num_heads=64, next_n=1), num_heads, "
+            f"or next_n."
+        )
+    # UMMA N-mode: N = next_n * num_heads must be a multiple of 8 in [8, 256].
+    # Exceeding it fails inside the DSL with an opaque OpError (measured:
+    # next_n=5 at num_heads=64 gives N=320 -> "expects the N-mode to satisfy
+    # 8 <= N <= 256 and N % 8 == 0, but got 320").
+    if N < _MMA_N_MIN or N > _MMA_N_MAX or N % _MMA_N_MULTIPLE != 0:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: next_n * num_heads must be a multiple of "
+            f"{_MMA_N_MULTIPLE} in "
+            f"[{_MMA_N_MIN}, {_MMA_N_MAX}] (UMMA N-mode); got next_n={next_n} * "
+            f"num_heads={H} = {N}."
+        )
+    # Epilogue unroll granularity (see _EPI_SUBTILE_UNROLL).  Independent of
+    # the N-mode rule: with next_n a multiple of 4, num_heads=10 or 9 pass it.
+    if H % _EPI_SUBTILE_UNROLL != 0:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: num_heads must be a multiple of "
+            f"{_EPI_SUBTILE_UNROLL} (epilogue FMA unroll granularity); got "
+            f"num_heads={H} from q.shape."
+        )
+    _validate_phys_block_kv(block_size, "fp8_paged_mqa_logits")
+    if kv_fused.dim() != 4 or kv_fused.shape[2] != 1 or kv_fused.shape[-1] != D + 4:
+        raise ValueError(
+            f"fp8_paged_mqa_logits: kv_fused must be "
+            f"[num_blocks, block_size, 1, head_dim+4={D + 4}] "
+            f"(head_dim={D} from q); got shape {tuple(kv_fused.shape)}"
+        )
+    _validate_paged_inputs(seq_lens, block_tables, B, "fp8_paged_mqa_logits")
+    return True
+
+
+@backend_requirement({}, common_check=_check_fp8_paged_mqa_logits_supported)
+@flashinfer_api(trace=fp8_paged_mqa_logits_trace)
+def fp8_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_fused: torch.Tensor,
+    weights: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    *,
+    output_dtype: torch.dtype = torch.float32,
+    epi_dtype: torch.dtype = torch.float32,
+    acc_dtype: torch.dtype = torch.float32,
+    schedule_meta: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP8 paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
+
+    Computes weighted per-head ReLU attention scores against a paged FP8 KV
+    cache -- the DeepSeek-style sparse-attention indexer::
+
+        logits[b*next_n + t, pos] =          (stored as output_dtype)
+            scale[pos] * sum_h weights[b*next_n + t, h] * relu(q[b,t,h,:] @ k[pos,:])
+            └────────────── epilogue: epi_dtype ─────────────┘   └─ MMA: acc_dtype ───┘
+
+    The per-head dot product accumulates over head_dim inside the tensor core
+    in acc_dtype; everything after it -- ReLU, the weights multiply, the sum
+    across heads, the scale[pos] multiply -- runs on CUDA cores in epi_dtype;
+    the result is converted to output_dtype on store.
+    ReLU is applied per head, BEFORE the weighted sum, so negative weights can
+    make the output negative.  ``next_n = q.shape[1]`` is the number of query
+    positions scored per request (speculative/MTP draft depth; use 1 for plain
+    decode) -- a dimension of ``q``, not an argument; the kernel specialises on
+    it automatically.  Slot ``t = 0`` is the oldest draft position and
+    ``t = next_n - 1`` the newest; ``seq_lens[b]`` is the KV length visible
+    to the newest slot.
+
+    Example:
+        Two requests, three draft positions each, 32-token KV blocks::
+
+            B, next_n, num_heads, head_dim = 2, 3, 64, 128
+            block_size, max_seq_len = 32, 8000
+            device = "cuda"
+
+            # Per-request KV lengths and a block table into the shared KV pool.
+            seq_lens = torch.tensor([3000, 8000], dtype=torch.int32, device=device)
+            # Table width: ceil(8000/32) = 250 blocks per request -- the
+            # natural width (the helper keeps the rule in one place).
+            blocks_per_seq = flashinfer.min_block_table_width(
+                max_seq_len, block_size
+            )  # 250
+            num_blocks = B * blocks_per_seq
+            block_tables = torch.arange(
+                num_blocks, dtype=torch.int32, device=device
+            ).view(B, blocks_per_seq)
+
+            # Pack the fused KV pool: per block, ALL fp8 values first, then the
+            # per-token float32 scales (two contiguous regions, not per-token rows).
+            kv = torch.randn(num_blocks, block_size, head_dim, device=device).to(
+                torch.float8_e4m3fn
+            )
+            kv_scales = torch.ones(num_blocks, block_size, device=device)
+            kv_fused = torch.cat(
+                [kv.view(torch.uint8).flatten(1), kv_scales.view(torch.uint8).flatten(1)],
+                dim=1,
+            ).view(num_blocks, block_size, 1, head_dim + 4)
+
+            q = torch.randn(B, next_n, num_heads, head_dim, device=device).to(
+                torch.float8_e4m3fn
+            )
+            weights = torch.rand(B * next_n, num_heads, device=device)
+
+            logits = flashinfer.fp8_paged_mqa_logits(
+                q, kv_fused, weights, block_tables, seq_lens, max_seq_len
+            )
+            # logits: [B*next_n, max_seq_len] float32.  Row b*next_n + t is
+            # valid for positions 0 .. seq_lens[b] - next_n + t; mask the
+            # rest before use.
+
+            # CUDA graphs / steady-state serving: pass an address-stable
+            # pre-allocated output sized with padded_seq_len() -- here
+            # padded_seq_len(8000) = 8192 columns; the returned logits
+            # is its [6, 8000] view.
+            out = torch.empty(
+                B * next_n,
+                flashinfer.padded_seq_len(max_seq_len),
+                dtype=torch.float32,
+                device=device,
+            )
+            logits = flashinfer.fp8_paged_mqa_logits(
+                q, kv_fused, weights, block_tables, seq_lens, max_seq_len, out=out
+            )
+
+    Args:
+        q:               [batch_size, next_n, num_heads, head_dim]  float8_e4m3fn
+        kv_fused:        [num_blocks, block_size, 1, head_dim + 4]  uint8
+                         The paged KV pool; "fused" means each block stores its
+                         quantized values and their scale factors together in
+                         one uint8 buffer.  The 4-D shape is a size contract
+                         only -- the kernel reads each block's flattened
+                         block_size*(head_dim+4) bytes as two contiguous
+                         regions, NOT as per-token rows:
+                           bytes [0, block_size*head_dim): the FP8 values,
+                             token-major (token i at offset i*head_dim);
+                           bytes [block_size*head_dim, end): block_size
+                             little-endian float32 per-token scales (token i's
+                             scale at block_size*head_dim + 4*i).
+                         Byte offsets within one block, drawn with the
+                         Example's block_size=32, head_dim=128::
+
+                           0                                        4096            4224
+                           ├──────────────── REGION 1 ───────────────┤─── REGION 2 ───┤
+                           │           FP8 values, token-major       │  fp32 scales   │
+                           │ [tok0: 128B][tok1: 128B]...[tok31: 128B]│[s0][s1]...[s31]│
+                           └──────────────────────────────────────────────────────────┘
+
+                         Token i's 128 value bytes start at byte i*128; its
+                         4-byte little-endian float32 scale is at 4096 + 4*i.
+                         A token's data is split: its values sit in region 1,
+                         its scale in region 2 -- NOT 132-byte per-token rows,
+                         though that wrong layout has the same total size.
+                         Built in one expression from value/scale tensors --
+                         see the Example above.  (Per-token scaling; FP4 uses
+                         block scaling folded into dequantization instead.)
+        weights:         [batch_size*next_n, num_heads]  float32
+                         Per-head mixing weights, not model parameters:
+                         output[row, pos] = sum_h weights[row, h] * relu(score_h).
+                         Row b*next_n + t pairs with q[b, t] -- rows are
+                         ordered exactly like the output rows; pass a
+                         [batch_size, next_n, num_heads] tensor as
+                         w.view(batch_size * next_n, num_heads).  Cast
+                         internally when epi_dtype is float16.
+        block_tables:    [batch_size, max_blocks_per_seq]  int32, on q's
+                         device, each row's entries contiguous (stride(1) ==
+                         1).  The row stride is free, so a row-strided view
+                         such as block_tables[::next_n] (a per-draft-token
+                         table de-expanded without a copy) is accepted
+                         zero-copy.  Values are physical block indices
+                         into kv_fused's dim 0.  max_blocks_per_seq must be
+                         at least min_block_table_width(max(seq_lens),
+                         block_size) = ceil(max(seq_lens) / block_size) --
+                         the natural width, one entry per KV block a request
+                         occupies, i.e. the table a paged-KV serving stack
+                         already keeps.  The kernel never reads row b past
+                         its own ceil(seq_lens[b] / block_size) entries, so
+                         a shorter request's trailing entries may hold
+                         anything.  The width is a hard precondition, not a
+                         checked argument: too few columns is a device-side
+                         out-of-bounds READ, i.e. undefined behaviour -- it
+                         may return corrupt logits, or fault and poison the
+                         CUDA context.
+        seq_lens:        [batch_size]  int32, on q's device; any stride (a
+                         strided view such as seq_lens[::next_n] is accepted
+                         zero-copy).  Per-request KV length; no entry may exceed
+                         max_seq_len.  (The DeepGEMM paged-MQA API this module
+                         ports calls it ``context_lens``.)
+        max_seq_len:     int  maximum KV sequence length; must be >=
+                         max(seq_lens).  The output row is sized from this
+                         while the schedule follows seq_lens, so a smaller
+                         value is a device-side out-of-bounds WRITE, likewise
+                         undefined behaviour.
+
+                         Both preconditions above are the caller's to satisfy.
+                         FLASHINFER_VALIDATE_INPUTS=1 raises on a violation
+                         instead, but it is a development aid only: it is off by
+                         default, and it is skipped during CUDA-graph capture
+                         because the device-to-host copy it needs is illegal
+                         there.  Neither setting makes the kernel itself safe
+                         against a violated contract.
+        output_dtype:    float32 (default) or float16.  bfloat16 is
+                         deliberately unsupported: the FP8 epilogue has no bf16
+                         branch and would silently miscompute.  Note that
+                         fp4_paged_mqa_logits defaults to bfloat16 -- pass
+                         output_dtype explicitly in code that uses both.
+        epi_dtype:       epilogue accumulation dtype (float32 or float16).
+                         float16 halves the epilogue traffic but saturates at
+                         |logit| > 65504 -- long-sequence accumulations can
+                         overflow to inf where float32 would not.
+        acc_dtype:       MMA accumulator dtype (float32 or float16)
+        schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA
+                         schedule, contiguous, on q's device.  Omit it (None,
+                         recommended) unless profiling shows the per-call
+                         schedule computation (one small GPU kernel, a few
+                         microseconds) matters in your eager hot loop.  A
+                         caller-managed schedule is reusable only while the
+                         contents of seq_lens and the target device's SM
+                         count are unchanged -- a fixed batch size is not
+                         sufficient, since the schedule depends on the length
+                         values themselves.  Whenever seq_lens changes
+                         (including under CUDA-graph replay), recompute into
+                         the same buffer before launching.  A stale schedule
+                         can hang the kernel.  Use
+                         compute_paged_mqa_logits_schedule() to generate it.
+        out:             optional pre-allocated output storage, PyTorch
+                         out= style: the function writes into it and the
+                         returned logits is its [batch_size*next_n,
+                         max_seq_len] view (see Returns); if None, the same
+                         padded storage is allocated internally each call.
+                         Shape at least
+                         [batch_size*next_n, padded_seq_len(max_seq_len)]:
+                         the kernel pads the column count to an internal
+                         store granularity and writes the padding
+                         unconditionally, so a narrower buffer is an
+                         out-of-bounds write -- always size it with
+                         padded_seq_len() (see the Example).  Must be on q's
+                         device, dtype output_dtype, rows contiguous
+                         (stride(1) == 1) and non-overlapping (stride(0) >=
+                         padded_seq_len(max_seq_len): a row slice of a wider
+                         buffer is fine; an as_strided() pitch or an expand()ed
+                         row is rejected, since later rows would overwrite
+                         earlier ones).  Required for CUDA graph capture.
+                         Bigger is fine -- e.g. one address-stable max-batch
+                         buffer shared across captures; only the first
+                         batch_size*next_n rows are written.
+
+    Returns:
+        logits: [batch_size*next_n, max_seq_len]  output_dtype
+                Always a view of the padded storage described under ``out``:
+                of the caller's buffer when provided, else of the per-call
+                internal allocation.  Row ``b*next_n + t`` holds
+                scores for KV positions ``0 .. seq_lens[b] - next_n + t``
+                inclusive -- the newest slot sees the whole sequence, each
+                earlier slot one position fewer.  Columns past that limit, and
+                the padding columns of ``out`` beyond max_seq_len, are
+                UNSPECIFIED: slice or mask by the limit before consuming (e.g.
+                before a top-k).  Rows of a request with seq_lens[b] == 0
+                are never written.
+
+    CUDA graph capture:
+        Pass a pre-allocated, address-stable ``out`` sized with
+        padded_seq_len(); keep q / kv_fused / weights / seq_lens /
+        block_tables at static addresses; leave ``schedule_meta=None`` -- the
+        schedule is then
+        computed by a small GPU kernel inside the capture and re-derives itself
+        from seq_lens' current contents on every replay.  If you manage the
+        schedule yourself, recompute it into the same buffer before every
+        replay in which the contents of seq_lens changed; a stale schedule
+        can hang the kernel.
+
+    Restrictions of the current kernel:
+        The signature above is the general form.  This kernel is parametric in
+        num_heads and head_dim; the constraints below are enforced here, and a
+        future kernel may widen them without changing this signature.
+
+        head_dim         must be a multiple of 32.
+        num_heads        must be a multiple of 4.
+        next_n*num_heads must be a multiple of 8 in [8, 256].
+        block_size       (= kv_fused.shape[1]) must be 32, 64, or 128.
+        head_dim, num_heads and next_n together must fit per-CTA shared
+                         memory: on SM100, head_dim <= 192 fits at num_heads=64,
+                         next_n=1; 256 does not.
+        output size      batch_size*next_n * padded_seq_len(max_seq_len) must
+                         be < 2**31 elements -- the kernels index the output
+                         with 32-bit offsets.  With out=, batch_size*next_n *
+                         out.stride(0) must also be < 2**31 (a wider buffer
+                         widens the row stride the offsets multiply by).
+    """
+    _require_cute_dsl(q.device, "fp8_paged_mqa_logits")
+
+    B, next_n, H, D = q.shape
+    block_size = kv_fused.shape[1]
+    num_blocks = kv_fused.shape[0]
+    num_sms = _cached_num_sms(get_device_index(q.device))
+
+    cutlass_epi = _to_cutlass(epi_dtype)
+    cutlass_acc = _to_cutlass(acc_dtype)
+    cutlass_out = _to_cutlass(output_dtype)
+
+    q_3d = q.reshape(B, next_n * H, D).permute(1, 2, 0)  # [next_n*H, D, B]
+    if epi_dtype == torch.float16:
+        w_2d = weights.reshape(B, next_n * H).half().t()  # [next_n*H, B]
+    else:
+        w_2d = weights.reshape(B, next_n * H).t()  # [next_n*H, B]
+    kv_flat = kv_fused.flatten(1)  # [num_blocks, block_bytes]
+
+    _validate_paged_bounds(
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        block_size,
+        num_blocks,
+        "fp8_paged_mqa_logits",
+    )
+    padded_max_seq_len = ((max_seq_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    _validate_output_addressable(
+        B * next_n, padded_max_seq_len, out, "fp8_paged_mqa_logits"
+    )
+    if out is not None:
+        _validate_out(
+            out,
+            B * next_n,
+            padded_max_seq_len,
+            q.device,
+            output_dtype,
+            "fp8_paged_mqa_logits",
+        )
+        logits = out[: B * next_n, :max_seq_len]
+    else:
+        logits_full = torch.empty(
+            (B * next_n, padded_max_seq_len), device=q.device, dtype=output_dtype
+        )
+        logits = logits_full[:, :max_seq_len]
+
+    # Caller-supplied buffers are validated even for an empty batch, for the
+    # same reason as out= above: a malformed buffer is the caller's bug
+    # regardless of today's batch size.
+    if schedule_meta is not None:
+        _validate_schedule_meta(
+            schedule_meta, num_sms, q.device, "fp8_paged_mqa_logits"
+        )
+
+    # Not just an optimization: the persistent kernel launches num_sms CTAs
+    # whatever the batch size, and its min(start_q, batch_size - 1) clamp is -1
+    # here. After the buffer validation so a bad out/schedule still raises.
+    if B == 0:
+        return logits
+
+    if schedule_meta is None:
+        schedule_meta = compute_paged_mqa_logits_schedule(seq_lens, device=q.device)
+    else:
+        _validate_schedule_meta_fresh(
+            schedule_meta,
+            seq_lens,
+            "fp8_paged_mqa_logits",
+            next_n=next_n,
+            variant="fp8",
+        )
+
+    # FP8 tensor passed as uint8 view (DLPack lacks float8 support)
+    q_for_ffi = (
+        q_3d.view(torch.uint8)
+        if q_3d.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        else q_3d
+    )
+    dev_index = get_device_index(q.device)
+    num_epi_subtiles, w_cache_regs = _fp8_epilogue_policy(H, next_n, cutlass_epi)
+    with _on_device(dev_index):
+        compiled = _cached_compile_fp8_kernel(
+            block_size,
+            H,
+            D,
+            next_n,
+            num_sms,
+            cutlass_epi,
+            cutlass_acc,
+            cutlass_out,
+            num_epi_subtiles,
+            w_cache_regs,
+            _arch_for_launch(dev_index, "fp8_paged_mqa_logits"),
+        )
+        compiled(
+            kv_flat,
+            q_for_ffi,
+            w_2d,
+            logits,
+            block_tables,
+            seq_lens,
+            schedule_meta,
+            num_blocks,
+            B,
+        )
+    return logits
+
+
+@supported_compute_capability(_PAGED_MQA_CCS)
+def _check_fp4_paged_mqa_logits_supported(
+    q: torch.Tensor,
+    q_sf: torch.Tensor,
+    kv_fused: torch.Tensor,
+    weights: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    sf_vec_size: int = _FP4_SF_VEC_SIZE,
+    output_dtype: torch.dtype = torch.bfloat16,
+    epi_dtype: torch.dtype = torch.float32,
+    is_kv_sf_interleaved: bool = False,
+    schedule_meta: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> bool:
+    """Return True when the FP4 kernel supports this problem, else raise ``ValueError``.
+
+    This function is the single place that encodes what the *current* kernel
+    can run, keeping those limits out of the public signature.  It covers every
+    constraint FP4MQALogitsKernel asserts -- num_heads, head_dim, next_n, the
+    epilogue/output dtypes, block_kv % phys_block_kv and num_blocks_per_mma --
+    plus is_kv_sf_interleaved, which the kernel silently ignores rather than
+    rejecting.  The kernel's
+    remaining asserts (the SF K-mode split and the 512-column TMEM cap) are
+    implied once num_heads, head_dim and next_n are fixed.
+
+    Mirrors :func:`fp4_paged_mqa_logits`'s signature; see
+    :func:`_check_fp8_paged_mqa_logits_supported` for why ``schedule_meta`` and
+    ``out`` are validated in the API body rather than here.
+    """
+    if q.dim() != 4:
+        raise ValueError(
+            f"fp4_paged_mqa_logits: q must be 4-D [batch_size, next_n, num_heads, "
+            f"head_dim/2 packed]; got {q.dim()}-D {tuple(q.shape)}. next_n is a "
+            f"separate dimension even for plain decode -- pass q.unsqueeze(1) for "
+            f"next_n=1."
+        )
+    if kv_fused.dim() != 4:
+        raise ValueError(
+            f"fp4_paged_mqa_logits: kv_fused must be 4-D "
+            f"[num_blocks, block_size, 1, head_dim/2 + 4]; got {kv_fused.dim()}-D "
+            f"{tuple(kv_fused.shape)}."
+        )
+    if kv_fused.dtype != torch.uint8:
+        raise ValueError(
+            f"fp4_paged_mqa_logits: kv_fused must be uint8 (fused bytes: packed "
+            f"FP4 values then UE8M0 scales); view your cache with "
+            f".view(torch.uint8) if it is stored as {kv_fused.dtype}."
+        )
+    _validate_on_device(
+        q.device,
+        "fp4_paged_mqa_logits",
+        q_sf=q_sf,
+        kv_fused=kv_fused,
+        weights=weights,
+        seq_lens=seq_lens,
+        block_tables=block_tables,
+    )
+    B, next_n, H, half_D = q.shape
+    D = half_D * 2
+    block_size = kv_fused.shape[1]
+
+    _validate_weights(weights, B, next_n, H, "fp4_paged_mqa_logits")
+    if q.dtype != torch.uint8:
+        raise ValueError(
+            f"fp4_paged_mqa_logits requires q.dtype == uint8 (packed FP4 e2m1, two "
+            f"per byte); got {q.dtype}"
+        )
+    if q_sf.dtype != torch.int32 or tuple(q_sf.shape) != (B, next_n, H):
+        raise ValueError(
+            f"fp4_paged_mqa_logits: q_sf must be an int32 "
+            f"[B={B}, next_n={next_n}, H={H}] tensor; "
+            f"got dtype={q_sf.dtype}, shape={tuple(q_sf.shape)}"
+        )
+    if output_dtype not in _FP4_DTYPES or epi_dtype not in _FP4_DTYPES:
+        raise ValueError(
+            "fp4_paged_mqa_logits supports output/epi dtype in {float32, "
+            f"float16, bfloat16}}; got output_dtype={output_dtype}, "
+            f"epi_dtype={epi_dtype}."
+        )
+    # --- head_dim / num_heads supportedness --------------------------------
+    # Unlike FP8, the FP4 kernel hardcodes both (see FP4MQALogitsKernel.__init__:
+    # `assert head_dim == 128` / `assert num_heads == 64`). The scale-factor
+    # buffer-offset math bakes in head_dim // sf_vec_size == 128 // 32 == 4
+    # packed UE8M0 values per token, and the TMEM/SMEM budget is sized for
+    # num_heads=64. Check here so callers get a clear error at the API boundary
+    # rather than an assertion from inside JIT compilation.
+    if D != _FP4_REQUIRED_HEAD_DIM:
+        raise ValueError(
+            f"fp4_paged_mqa_logits requires head_dim == {_FP4_REQUIRED_HEAD_DIM}; got "
+            f"head_dim={D} (from q.shape[-1]*2). The FP4 kernel hardcodes this: its "
+            f"scale-factor layout assumes exactly {_FP4_REQUIRED_HEAD_DIM // 32} UE8M0 "
+            f"groups per token."
+        )
+    if H != _FP4_REQUIRED_NUM_HEADS:
+        raise ValueError(
+            f"fp4_paged_mqa_logits requires num_heads == {_FP4_REQUIRED_NUM_HEADS}; got "
+            f"num_heads={H}. The FP4 kernel hardcodes this for its TMEM/SMEM budget."
+        )
+    # head_dim is validated above, so the scale-factor count per token is now
+    # well-defined; kv_fused's row width is derived from it below.
+    scales_per_token = _validate_sf_vec_size(sf_vec_size, D, "fp4_paged_mqa_logits")
+
+    # Checked here so an unsupported next_n is an actionable error rather than
+    # a bare assertion from inside JIT compilation.
+    #
+    # This bound also subsumes the UMMA N-mode check that fp8 needs: with
+    # num_heads pinned to 64, the kernel's N tile is atom * 64 for atom <= 4,
+    # i.e. in {64, 128, 192, 256} -- 256 sits exactly at _MMA_N_MAX and is a
+    # multiple of _MMA_N_MULTIPLE, so every reachable tile is legal. Likewise
+    # no SMEM-budget check is needed: head_dim and num_heads are fixed, and the
+    # largest tile (atom=4, Rubin-only) adds only the wider Q stage (256x64B vs
+    # 192x64B) over next_n=3, far from the per-CTA limit on the parts that can
+    # run it.
+    if next_n < 1 or next_n > _FP4_MAX_NEXT_N:
+        raise ValueError(
+            f"fp4_paged_mqa_logits supports next_n in 1..{_FP4_MAX_NEXT_N}; "
+            f"got next_n={next_n}."
+        )
+    _validate_phys_block_kv(block_size, "fp4_paged_mqa_logits")
+    # is_kv_sf_interleaved shifts the KV scale-factor rearrangement from the
+    # kernel to whoever writes the KV cache, and is only implemented for
+    # block_size=128 (1 physical block == 1 UTCCP atom). The kernel silently
+    # forces the flag back to False otherwise and then interleaves SF that the
+    # caller had already interleaved -- wrong logits, no error. Reject instead.
+    if is_kv_sf_interleaved and block_size != _FP4_SF_INTERLEAVE_BLOCK_SIZE:
+        raise ValueError(
+            f"fp4_paged_mqa_logits: is_kv_sf_interleaved=True requires "
+            f"block_size == {_FP4_SF_INTERLEAVE_BLOCK_SIZE} (kv_fused.shape[1]); got "
+            f"{block_size}. The kernel would ignore the flag and interleave the "
+            f"KV scale factors itself, double-permuting SF that the caller already "
+            f"arranged for UTCCP."
+        )
+    kv_row_bytes = half_D + scales_per_token
+    if (
+        kv_fused.dim() != 4
+        or kv_fused.shape[2] != 1
+        or kv_fused.shape[-1] != kv_row_bytes
+    ):
+        raise ValueError(
+            f"fp4_paged_mqa_logits: kv_fused must be "
+            f"[num_blocks, block_size, 1, {kv_row_bytes}], i.e. "
+            f"(head_dim/2) + (head_dim/sf_vec_size) = {half_D} data bytes + "
+            f"{scales_per_token} scale-factor bytes (head_dim={D} from q, "
+            f"sf_vec_size={sf_vec_size}); got shape {tuple(kv_fused.shape)}"
+        )
+    _validate_paged_inputs(seq_lens, block_tables, B, "fp4_paged_mqa_logits")
+    return True
+
+
+@backend_requirement({}, common_check=_check_fp4_paged_mqa_logits_supported)
+@flashinfer_api(trace=fp4_paged_mqa_logits_trace)
+def fp4_paged_mqa_logits(
+    q: torch.Tensor,
+    q_sf: torch.Tensor,
+    kv_fused: torch.Tensor,
+    weights: torch.Tensor,
+    block_tables: torch.Tensor,
+    seq_lens: torch.Tensor,
+    max_seq_len: int,
+    *,
+    sf_vec_size: int = _FP4_SF_VEC_SIZE,
+    output_dtype: torch.dtype = torch.bfloat16,
+    epi_dtype: torch.dtype = torch.float32,
+    is_kv_sf_interleaved: bool = False,
+    schedule_meta: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """FP4 (MXFP4) paged MQA logits for Blackwell (SM100/SM103) and Rubin (SM107).
+
+    Computes weighted per-head ReLU attention scores against a paged MXFP4 KV
+    cache -- the DeepSeek-style sparse-attention indexer::
+
+        logits[b*next_n + t, pos] =          (stored as output_dtype)
+            sum_h weights[b*next_n + t, h] * relu(q[b,t,h,:] @ k[pos,:])
+            └──────── epilogue: epi_dtype ───────┘   └─ MMA: float32 ─────┘
+
+    The per-head dot product accumulates in float32 inside the tensor core
+    (not configurable here, unlike the FP8 variant's acc_dtype); ReLU, the
+    weights multiply, and the head sum run on CUDA cores in epi_dtype; the
+    result is converted to output_dtype on store.
+    The UE8M0 block scales are folded into dequantizing q and k, so unlike the
+    FP8 variant there is no trailing per-token scale -- a per-group scale does
+    not factor out of the 128-long dot product the way fp8's uniform per-token
+    scale does.  ReLU is applied per head, BEFORE the weighted sum, so
+    negative weights can make the output negative.  ``next_n = q.shape[1]`` is the number of query positions scored
+    per request (speculative/MTP draft depth; use 1 for plain decode) -- a
+    dimension of ``q``, not an argument.  Slot ``t = 0`` is the oldest draft
+    position, ``t = next_n - 1`` the newest; ``seq_lens[b]`` is the KV length
+    visible to the newest slot.  next_n may be 1..4: on Rubin (SM107+)
+    every next_n runs as a single pass over the KV; on SM100/SM103,
+    next_n=4 executes as two internal passes that each read the whole KV --
+    numerics identical, roughly 2x the KV-bandwidth cost (~1.3x measured
+    runtime at a 16K sequence length versus next_n=3), and a caller-supplied
+    schedule_meta must then be built with this call's next_n and
+    variant="fp4" (see schedule_meta below).
+
+    Example:
+        Two requests, three draft positions each, 32-token KV blocks.
+        Zero-filled quantized tensors are valid placeholders for a shape or
+        latency check -- real callers produce them with their MXFP4 quantizer
+        (see tests/attn_scores/test_attn_scores.py::_per_token_cast_to_fp4
+        for a reference implementation)::
+
+            B, next_n, num_heads, head_dim = 2, 3, 64, 128
+            block_size, max_seq_len = 32, 8000
+            device = "cuda"
+
+            # Per-request KV lengths and a block table into the shared KV pool.
+            seq_lens = torch.tensor([3000, 8000], dtype=torch.int32, device=device)
+            # Table width: ceil(8000/32) = 250 blocks per request -- the
+            # natural width (the helper keeps the rule in one place).
+            blocks_per_seq = flashinfer.min_block_table_width(
+                max_seq_len, block_size
+            )  # 250
+            num_blocks = B * blocks_per_seq
+            block_tables = torch.arange(
+                num_blocks, dtype=torch.int32, device=device
+            ).view(B, blocks_per_seq)
+            weights = torch.rand(B * next_n, num_heads, device=device)
+
+            # Packed FP4 inputs (placeholder-quantized; see note above).
+            q = torch.zeros(
+                B, next_n, num_heads, head_dim // 2, dtype=torch.uint8, device=device
+            )
+            q_sf = torch.zeros(B, next_n, num_heads, dtype=torch.int32, device=device)
+            kv_fused = torch.zeros(
+                num_blocks, block_size, 1, head_dim // 2 + 4,
+                dtype=torch.uint8, device=device,
+            )
+
+            logits = flashinfer.fp4_paged_mqa_logits(
+                q, q_sf, kv_fused, weights, block_tables, seq_lens, max_seq_len
+            )
+            # logits: [B*next_n, max_seq_len] = [6, 8000] bfloat16 (fp4's
+            # default).  Row b*next_n + t is valid for positions
+            # 0 .. seq_lens[b] - next_n + t; mask the rest before use.
+
+            # CUDA graphs / steady-state serving: same out= pattern as fp8,
+            # but the dtype must match fp4's output_dtype (bfloat16 here).
+            out = torch.empty(
+                B * next_n,
+                flashinfer.padded_seq_len(max_seq_len),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            logits = flashinfer.fp4_paged_mqa_logits(
+                q, q_sf, kv_fused, weights, block_tables, seq_lens,
+                max_seq_len, out=out,
+            )
+
+    Args:
+        q:               [batch_size, next_n, num_heads, head_dim/2]  uint8
+                         Two FP4 (E2M1) values packed per byte: byte j of a
+                         head's row holds element 2j in the LOW nibble and
+                         element 2j+1 in the HIGH nibble.
+        q_sf:            [batch_size, next_n, num_heads]  int32
+                         Packed UE8M0 scale factors for each (token, head):
+                         head_dim/sf_vec_size = 4 one-byte scales per int32.
+                         Byte k of each int32 (k-th least significant,
+                         little-endian) is the UE8M0 scale -- the raw float32
+                         exponent byte -- of that (token, head)'s elements
+                         [k*sf_vec_size, (k+1)*sf_vec_size).  Equivalent to a
+                         uint8 [batch_size, next_n, num_heads, 4] tensor viewed
+                         with .view(torch.int32).
+        kv_fused:        [num_blocks, block_size, 1, head_dim/2 + 4]  uint8
+                         The paged KV pool; "fused" means each block stores its
+                         packed FP4 values and their UE8M0 scale factors
+                         together in one uint8 buffer.  The 4-D shape is a size
+                         contract only -- the kernel reads each block's
+                         flattened bytes as two contiguous regions, NOT as
+                         per-token rows:
+                           bytes [0, block_size*head_dim/2): the packed FP4
+                             values, token-major, same nibble rule as q;
+                           bytes [block_size*head_dim/2, end): the UE8M0
+                             scales, head_dim/sf_vec_size = 4 bytes per token,
+                             token-major by default (see is_kv_sf_interleaved).
+                         Byte offsets within one block, drawn with the
+                         Example's block_size=32, head_dim=128 (default
+                         token-major scales)::
+
+                           0                                     2048            2176
+                           ├────────────── REGION 1 ─────────────┤─── REGION 2 ───┤
+                           │      packed FP4 values, token-major │  UE8M0 scales  │
+                           │[tok0: 64B][tok1: 64B]...[tok31: 64B]│[t0][t1]...[t31]│
+                           └──────────────────────────────────────────────────────┘
+
+                         Token i's 64 packed-value bytes start at byte i*64;
+                         its 4 UE8M0 scale bytes are at 2048 + 4*i.
+                         Zooming into one cell of each region::
+
+                           [tok_i: 64B] = [e1|e0][e3|e2][e5|e4] ... [e127|e126]
+                                           hi lo  hi lo  hi lo       hi    lo
+
+                             128 FP4 values squeezed two per byte: byte j
+                             holds element 2j in its LOW nibble (bits 0-3)
+                             and element 2j+1 in its HIGH nibble (bits 4-7)
+                             -- the same nibble rule as q.
+
+                           [t_i: 4B] = [sf e0-31][sf e32-63][sf e64-95][sf e96-127]
+                                        byte 0    byte 1     byte 2     byte 3
+
+                             4 UE8M0 scales squeezed into one little-endian
+                             int32, one per 32-element group: ascending byte
+                             offset = ascending group, so byte k (the k-th
+                             least significant of the int32) is the scale of
+                             elements [k*32, (k+1)*32).
+
+                         Build it like the fp8 example's torch.cat recipe, with
+                         the value/scale regions sized as above.
+        weights:         [batch_size*next_n, num_heads]  float32
+                         Per-head mixing weights, not model parameters:
+                         output[row, pos] = sum_h weights[row, h] * relu(score_h).
+                         Row b*next_n + t pairs with q[b, t] -- rows are
+                         ordered exactly like the output rows; pass a
+                         [batch_size, next_n, num_heads] tensor as
+                         w.view(batch_size * next_n, num_heads).  Cast
+                         internally when epi_dtype is float16/bfloat16.
+        block_tables:    [batch_size, max_blocks_per_seq]  int32, on q's
+                         device, each row's entries contiguous (stride(1) ==
+                         1).  The row stride is free, so a row-strided view
+                         such as block_tables[::next_n] (a per-draft-token
+                         table de-expanded without a copy) is accepted
+                         zero-copy.  Values are physical block indices
+                         into kv_fused's dim 0.  max_blocks_per_seq must be
+                         at least min_block_table_width(max(seq_lens),
+                         block_size) = ceil(max(seq_lens) / block_size) --
+                         the natural width, one entry per KV block a request
+                         occupies, i.e. the table a paged-KV serving stack
+                         already keeps.  The kernel never reads row b past
+                         its own ceil(seq_lens[b] / block_size) entries, so
+                         a shorter request's trailing entries may hold
+                         anything.  The width is a hard precondition, not a
+                         checked argument: too few columns is a device-side
+                         out-of-bounds READ, i.e. undefined behaviour -- it
+                         may return corrupt logits, or fault and poison the
+                         CUDA context.
+        seq_lens:        [batch_size]  int32, on q's device; any stride (a
+                         strided view such as seq_lens[::next_n] is accepted
+                         zero-copy).  Per-request KV length; no entry may exceed
+                         max_seq_len.  (The DeepGEMM paged-MQA API this module
+                         ports calls it ``context_lens``.)
+        max_seq_len:     int  maximum KV sequence length; must be >=
+                         max(seq_lens).  The output row is sized from this
+                         while the schedule follows seq_lens, so a smaller
+                         value is a device-side out-of-bounds WRITE, likewise
+                         undefined behaviour.
+
+                         Both preconditions above are the caller's to satisfy.
+                         FLASHINFER_VALIDATE_INPUTS=1 raises on a violation
+                         instead, but it is a development aid only: it is off by
+                         default, and it is skipped during CUDA-graph capture
+                         because the device-to-host copy it needs is illegal
+                         there.  Neither setting makes the kernel itself safe
+                         against a violated contract.
+        sf_vec_size:     number of FP4 values sharing one UE8M0 scale factor
+                         (32).  Determines both q_sf's packing and the
+                         scale-factor bytes of each fused KV row.
+        output_dtype:    bfloat16 (default), float32, or float16.  The default
+                         differs from fp8_paged_mqa_logits (float32) -- it
+                         mirrors what the upstream TensorRT-LLM integration
+                         binds for each variant; pass output_dtype explicitly
+                         in code that uses both.
+        epi_dtype:       epilogue accumulation dtype (float32, float16, or
+                         bfloat16).  float16 halves the epilogue traffic but
+                         saturates at |logit| > 65504 -- long-sequence
+                         accumulations can overflow to inf where float32 would
+                         not.  There is no acc_dtype knob: block-scaled FP4
+                         MMA always accumulates in float32.
+        is_kv_sf_interleaved: declares how the scale-factor tail of each
+                         kv_fused block is ordered.  False (the default) means
+                         token order.  True means the block's scale factors are
+                         split into 4 equal runs which are then round-robin
+                         interleaved, so slot k holds the scale factor of token
+                         (k % 4) * (block_size // 4) + k // 4.  This describes
+                         the KV cache you pass in, so set it to match how that
+                         cache was written; supplying the interleaved order can
+                         be faster.
+        schedule_meta:   optional pre-computed [num_sms+1, 2] int32 CTA
+                         schedule, contiguous, on q's device.  Omit it (None,
+                         recommended) unless profiling shows the per-call
+                         schedule computation (one small GPU kernel, a few
+                         microseconds) matters in your eager hot loop.
+                         Always generate it with
+                         compute_paged_mqa_logits_schedule(seq_lens,
+                         device=..., next_n=..., variant="fp4"), mirroring
+                         this call's arguments: for next_n=4 on SM100/SM103
+                         the kernel internally restructures the problem (the
+                         two-pass split described above), and the helper
+                         applies the same internal policy, so the returned
+                         schedule is the right one on every architecture.  A
+                         schedule built with mismatched arguments passes the
+                         always-on shape checks but can hang the kernel; the
+                         opt-in FLASHINFER_VALIDATE_INPUTS=1 freshness check
+                         catches it outside graph capture.
+                         A caller-managed schedule is reusable only while the
+                         contents of seq_lens and the target device's SM
+                         count are unchanged -- a fixed batch size is not
+                         sufficient, since the schedule depends on the length
+                         values themselves.  Whenever seq_lens changes
+                         (including under CUDA-graph replay), recompute into
+                         the same buffer before launching.  A stale schedule
+                         can hang the kernel.  Use
+                         compute_paged_mqa_logits_schedule() to generate it.
+        out:             optional pre-allocated output storage, PyTorch
+                         out= style: the function writes into it and the
+                         returned logits is its [batch_size*next_n,
+                         max_seq_len] view (see Returns); if None, the same
+                         padded storage is allocated internally each call.
+                         Shape at least
+                         [batch_size*next_n, padded_seq_len(max_seq_len)]:
+                         the kernel pads the column count to an internal
+                         store granularity and writes the padding
+                         unconditionally, so a narrower buffer is an
+                         out-of-bounds write -- always size it with
+                         padded_seq_len() (see the Example).  Must be on q's
+                         device, dtype output_dtype, rows contiguous
+                         (stride(1) == 1) and non-overlapping (stride(0) >=
+                         padded_seq_len(max_seq_len): a row slice of a wider
+                         buffer is fine; an as_strided() pitch or an expand()ed
+                         row is rejected, since later rows would overwrite
+                         earlier ones).  Required for CUDA graph capture.
+                         Bigger is fine -- e.g. one address-stable max-batch
+                         buffer shared across captures; only the first
+                         batch_size*next_n rows are written.
+
+    Returns:
+        logits: [batch_size*next_n, max_seq_len]  output_dtype
+                Always a view of the padded storage described under ``out``:
+                of the caller's buffer when provided, else of the per-call
+                internal allocation.  Row ``b*next_n + t`` holds
+                scores for KV positions ``0 .. seq_lens[b] - next_n + t``
+                inclusive -- the newest slot sees the whole sequence, each
+                earlier slot one position fewer.  Columns past that limit, and
+                the padding columns of ``out`` beyond max_seq_len, are
+                UNSPECIFIED: slice or mask by the limit before consuming (e.g.
+                before a top-k).  Rows of a request with seq_lens[b] == 0
+                are never written.
+
+    CUDA graph capture:
+        Pass a pre-allocated, address-stable ``out`` sized with
+        padded_seq_len(); keep q / q_sf / kv_fused / weights / seq_lens /
+        block_tables at static addresses; leave ``schedule_meta=None`` -- the
+        schedule is then computed by a small GPU kernel inside the capture and
+        re-derives itself from seq_lens' current contents on every replay
+        (including for the internal next_n=4 split on SM100/SM103).  If you
+        manage the schedule yourself, build it with this call's next_n and
+        variant="fp4", and recompute it into the same buffer before every
+        replay in which the contents of seq_lens changed; a stale schedule
+        can hang the kernel.
+
+    Restrictions of the current kernel:
+        The signature above is the general form.  This kernel is specialised for
+        a single problem shape; the constraints below are enforced here, and a
+        future kernel may widen them without changing this signature.
+
+        num_heads        must equal 64.
+        head_dim         must equal 128.
+        next_n           must be in 1..4.
+        schedule_meta    must be generated with this call's next_n and
+                         variant="fp4" (see schedule_meta above); on
+                         SM100/SM103 next_n=4 runs the internal two-pass
+                         split, which changes the schedule contents.
+        sf_vec_size      must equal 32 (so head_dim/sf_vec_size = 4 scales per
+                         token -- exactly one int32 in q_sf).
+        block_size       (= kv_fused.shape[1]) must be 32, 64, or 128.
+        is_kv_sf_interleaved may be True only when block_size == 128.
+        output size      batch_size*next_n * padded_seq_len(max_seq_len) must
+                         be < 2**31 elements -- the kernels index the output
+                         with 32-bit offsets.  With out=, batch_size*next_n *
+                         out.stride(0) must also be < 2**31 (a wider buffer
+                         widens the row stride the offsets multiply by).
+    """
+    _require_cute_dsl(q.device, "fp4_paged_mqa_logits")
+
+    B, next_n, H, half_D = q.shape
+    D = half_D * 2
+    block_size = kv_fused.shape[1]
+    num_blocks = kv_fused.shape[0]
+    num_sms = _cached_num_sms(get_device_index(q.device))
+
+    cutlass_epi = _to_cutlass(epi_dtype)
+    cutlass_out = _to_cutlass(output_dtype)
+
+    # Decomposition into per-launch atoms (the MMA/TMEM tile spans one atom):
+    # always direct, splitting minimally only when the arch cannot hold next_n
+    # in one atom -- an atom of 4 needs 544 TMEM columns and therefore Rubin,
+    # so next_n=4 on SM100/SM103 runs as two atoms of 2. Each atom re-reads
+    # the whole KV, so a split costs num_atoms x KV HBM traffic in exchange
+    # for num_atoms x more scheduler rows.
+    #
+    # Deliberately a fixed rule -- not a shape heuristic and not a user knob.
+    # A forced-decomposition sweep (batch 1..64, ctx {4K, 16K}, next_n {2, 4},
+    # graph-timed per the benchmarks/bench_paged_mqa_logits.py methodology)
+    # measured direct winning or tying every cell on both SM100 (B100) and
+    # Rubin: upstream DKG's wave-count heuristic would pick small-batch splits
+    # that run up to 1.26x slower than direct here (SM100, b=1, ctx=16K,
+    # next_n=2), and finer-than-minimal splits of the forced case are up to
+    # 1.37x slower at large batch (atoms of 1 vs 2, b=64, ctx=16K). The
+    # small-batch occupancy win that motivated upstream's heuristic does not
+    # materialise on this repo's kernels, so nothing here depends on shape.
+    atom, num_atoms = _fp4_atom_decomposition(next_n, q.device)
+    exp_B = B * num_atoms
+    N_atom = atom * H
+
+    # Reshape to kernel convention. The atom reshape (exp_B rows of one atom
+    # each) is free for contiguous q / q_sf, and weights [B*next_n, H] is
+    # already layout-equivalent to [exp_B*atom, H].
+    q_3d = q.reshape(exp_B, N_atom, half_D).permute(1, 2, 0)  # [atom*H, D//2, exp_B]
+    sf_q_2d = q_sf.reshape(exp_B, N_atom).t()  # [atom*H, exp_B]
+    if epi_dtype == torch.float16:
+        w_2d = weights.reshape(exp_B, N_atom).half().t()
+    elif epi_dtype == torch.bfloat16:
+        w_2d = weights.reshape(exp_B, N_atom).bfloat16().t()
+    else:
+        w_2d = weights.reshape(exp_B, N_atom).t()
+    kv_flat = kv_fused.flatten(1)
+
+    _validate_paged_bounds(
+        block_tables,
+        seq_lens,
+        max_seq_len,
+        block_size,
+        num_blocks,
+        "fp4_paged_mqa_logits",
+    )
+    padded_max_seq_len = ((max_seq_len + _SPLIT_KV - 1) // _SPLIT_KV) * _SPLIT_KV
+    _validate_output_addressable(
+        B * next_n, padded_max_seq_len, out, "fp4_paged_mqa_logits"
+    )
+    if out is not None:
+        _validate_out(
+            out,
+            B * next_n,
+            padded_max_seq_len,
+            q.device,
+            output_dtype,
+            "fp4_paged_mqa_logits",
+        )
+        logits = out[: B * next_n, :max_seq_len]
+    else:
+        logits_full = torch.empty(
+            (B * next_n, padded_max_seq_len), device=q.device, dtype=output_dtype
+        )
+        logits = logits_full[:, :max_seq_len]
+
+    # Caller-supplied buffers are validated even for an empty batch, for the
+    # same reason as out= above.
+    if schedule_meta is not None:
+        # Under the atom split the kernel schedules exp_B rows, so a valid
+        # caller schedule must come from compute_paged_mqa_logits_schedule
+        # called with this call's next_n and variant="fp4" -- the helper
+        # applies the same decomposition.  The always-on checks cannot tell a
+        # mismatched schedule apart (same shape), and a mismatch can hang the
+        # persistent kernel (commit 29ca0629); the opt-in freshness check
+        # below, run against the expanded lengths, is the detector.
+        _validate_schedule_meta(
+            schedule_meta, num_sms, q.device, "fp4_paged_mqa_logits"
+        )
+
+    # Not just an optimization: the persistent kernel launches num_sms CTAs
+    # whatever the batch size, and its min(start_q, batch_size - 1) clamp is -1
+    # here. After the buffer validation so a bad out/schedule still raises.
+    if B == 0:
+        return logits
+
+    if schedule_meta is None:
+        # The scheduler enumerates batch*num_atoms q_atom tasks, so it is
+        # built from the per-atom lengths (identity when num_atoms == 1).
+        # block_tables / seq_lens themselves stay native: the kernel maps
+        # q_atom_idx back onto them via _atom_seq / _atom_ctx_len.
+        schedule_meta = compute_paged_mqa_logits_schedule(
+            _expand_seq_lens(seq_lens, num_atoms, atom), device=q.device
+        )
+    else:
+        # Freshness check against the same per-atom lengths.  The expansion
+        # is a GPU kernel, so it runs inside the opt-in, non-capture check
+        # (via the public helper's next_n/variant) rather than here: with a
+        # caller schedule and validation off it would be dead work -- and
+        # under CUDA-graph capture a dead kernel node replayed every launch.
+        _validate_schedule_meta_fresh(
+            schedule_meta,
+            seq_lens,
+            "fp4_paged_mqa_logits",
+            next_n=next_n,
+            variant="fp4",
+        )
+
+    dev_index = get_device_index(q.device)
+    with _on_device(dev_index):
+        compiled = _cached_compile_fp4_kernel(
+            block_size,
+            H,
+            D,
+            next_n,
+            num_sms,
+            cutlass_epi,
+            cutlass_out,
+            1,  # num_epi_subtiles -- fixed; see the compile-layer parameter note
+            is_kv_sf_interleaved,
+            _arch_for_launch(dev_index, "fp4_paged_mqa_logits"),
+            num_atoms,
+        )
+        compiled(
+            kv_flat,
+            q_3d,
+            sf_q_2d,
+            w_2d,
+            logits,
+            # block_tables / seq_lens stay NATIVE [batch]; the kernel maps
+            # q_atom_idx back onto them via _atom_seq / _atom_ctx_len.
+            block_tables,
+            seq_lens,
+            schedule_meta,
+            num_blocks,
+            exp_B,  # kernel batch_size = q's L dim = batch * num_atoms
+        )
+    return logits
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Pre-compilation helper (Item 5: AOT warm-up for common configs)
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+def precompile_paged_mqa_logits(
+    device: Optional[torch.device] = None,
+    variants: Tuple[str, ...] = ("fp8", "fp4"),
+    output_dtypes: Optional[Tuple[torch.dtype, ...]] = None,
+    batch_sizes: Optional[Sequence[int]] = None,
+) -> None:
+    """Pre-compile paged MQA logits kernels for common static configs.
+
+    Populates the on-disk CuTe-DSL kernel cache so subsequent calls to
+    :func:`fp8_paged_mqa_logits` and :func:`fp4_paged_mqa_logits` skip
+    compilation on first use.  Call once during deployment setup or as part
+    of a package-build step.
+
+    The warmed set is exactly: fp8 -- num_heads=64, head_dim=128, block_size
+    in {32, 64, 128}, next_n 1..4, fp32 epilogue/accumulator (12 kernels);
+    fp4 -- num_heads=64, head_dim=128, block_size in {32, 64, 128}, next_n
+    1..4, fp32 epilogue (12 kernels per output dtype).  Anything else (fp16
+    epilogue, other head geometry) still compiles on first use.  Measured on
+    sm_100a: ~1s per fp8 kernel, ~3s per output dtype for the 12 fp4.  The
+    fp4 next_n=4 entry compiles the
+    decomposition the fixed policy picks on the target device (direct on
+    Rubin, two internal passes on Blackwell).
+
+    Args:
+        device:        CUDA device to target.  Defaults to the current CUDA
+                       device, so a worker that has set its per-rank device
+                       gets kernels for that device without passing anything.
+        variants:      Which precisions to build.  A deployment normally runs
+                       one indexer precision, so pass e.g. ``("fp8",)`` to
+                       avoid compiling kernels that will never be called.
+        output_dtypes: Which output dtypes to warm.  ``output_dtype`` is part
+                       of the compile cache key, so a dtype not warmed here
+                       still compiles on first use.  Defaults to each
+                       variant's common set: float32 for FP8, and both
+                       bfloat16 and float32 for FP4 -- the API default plus
+                       the dtype consumers with a float logits ABI require.
+                       Pass an explicit tuple to build only what you run.
+        batch_sizes:   Batch sizes whose GPU schedule kernel should be warmed,
+                       in caller units.  The schedule kernel specialises on
+                       the scheduler row count in 32-row buckets: the batch
+                       size for fp8 and unsplit fp4, but batch_size*num_atoms
+                       under the fp4 atom split (next_n=4 on SM100/SM103
+                       schedules twice the rows).  Every bucket the requested
+                       variants can reach from each size is warmed, then
+                       deduplicated; none of this is covered by the shape
+                       sweep above.  Defaults to None, which warms no schedule
+                       buckets -- a deployment that captures CUDA graphs for a
+                       known set of batch sizes should pass them, or the first
+                       capture of each bucket pays compilation.
+    """
+    if not _CUTE_DSL_AVAILABLE:
+        warnings.warn(
+            "precompile_paged_mqa_logits: nvidia-cutlass-dsl is not installed; "
+            "nothing was precompiled and the first fp8/fp4_paged_mqa_logits "
+            "call will fail. pip install nvidia-cutlass-dsl.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return
+    unknown = set(variants) - {"fp8", "fp4"}
+    if unknown:
+        raise ValueError(
+            f"precompile_paged_mqa_logits: unknown variants {sorted(unknown)}; "
+            f"supported values are 'fp8' and 'fp4'."
+        )
+    # Validate here rather than letting an unsupported dtype surface from
+    # inside a compile: the caller asked for a build that cannot happen.
+    if output_dtypes is not None:
+        for name, allowed in (("fp8", _FP8_DTYPES), ("fp4", _FP4_DTYPES)):
+            if name not in variants:
+                continue
+            bad = [d for d in output_dtypes if d not in allowed]
+            if bad:
+                raise ValueError(
+                    f"precompile_paged_mqa_logits: {name} does not support "
+                    f"output dtype(s) {bad}; supported are "
+                    f"{sorted(str(d) for d in allowed)}."
+                )
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device(device)
+    if device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    device_index = get_device_index(device)
+    # Fail the build step with the runtime APIs' curated message rather than a
+    # KeyError from deep inside cute.compile when the installed DSL predates
+    # the target device's architecture.
+    _require_cute_dsl(device, "precompile_paged_mqa_logits")
+    num_sms = _cached_num_sms(device_index)
+    arch = _cached_gpu_arch(device_index)
+    num_heads, head_dim = 64, 128
+
+    # JitSpecCuteDsl tags its on-disk cache from the *current* torch device, so
+    # the whole build runs under the target: otherwise a kernel compiled for the
+    # requested arch would be filed under a different one.
+    with torch.cuda.device(device_index):
+        if "fp8" in variants:
+            # block_size × next_n × output dtype, fp32 acc/epi
+            fp8_outs = output_dtypes or (torch.float32,)
+            for block_size in (32, 64, 128):
+                for nn in (1, 2, 3, 4):
+                    # Same policy routing as the launch path, so the warmed
+                    # artifact is the one the API will ask for.
+                    num_epi_subtiles, w_cache_regs = _fp8_epilogue_policy(
+                        num_heads, nn, _to_cutlass(torch.float32)
+                    )
+                    for out_dtype in fp8_outs:
+                        _cached_compile_fp8_kernel(
+                            block_size,
+                            num_heads,
+                            head_dim,
+                            nn,
+                            num_sms,
+                            _to_cutlass(torch.float32),
+                            _to_cutlass(torch.float32),
+                            _to_cutlass(out_dtype),
+                            num_epi_subtiles,
+                            w_cache_regs,
+                            arch,
+                        )
+
+        if "fp4" in variants:
+            # block_size × next_n × output dtype, fp32 epi. bfloat16 is the API
+            # default; float32 is what a consumer binding logits as C float
+            # needs, and without it that deployment still JITs on first request.
+            fp4_outs = output_dtypes or (torch.bfloat16, torch.float32)
+            # next_n=4 compiles the decomposition the fixed policy picks on
+            # this device: direct (one atom) where the TMEM holds it (Rubin),
+            # otherwise two atoms of 2 (Blackwell). No other decomposition is
+            # reachable through the API.
+            _max_atom = _fp4_max_atom_for_device(device)
+            for block_size in (32, 64, 128):
+                for nn in (1, 2, 3, 4):
+                    num_atoms = 1 if nn <= _max_atom else 2
+                    for out_dtype in fp4_outs:
+                        _cached_compile_fp4_kernel(
+                            block_size,
+                            num_heads,
+                            head_dim,
+                            nn,
+                            num_sms,
+                            _to_cutlass(torch.float32),
+                            _to_cutlass(out_dtype),
+                            1,
+                            False,
+                            arch,
+                            num_atoms,
+                        )
+
+        # The schedule kernel is keyed on the aligned *scheduler row count*,
+        # not on the shape tuple above, so it needs its own warm-up.  That row
+        # count is the caller's batch size for fp8 and unsplit fp4, but
+        # batch * num_atoms under the fp4 atom split (next_n=4 on SM100/SM103
+        # schedules 2 * batch rows) -- warm every bucket the requested variants
+        # can reach from each batch size, then dedup: every size inside a
+        # 32-row bucket compiles the same kernel.
+        from .kernels.schedule_kernel import _compile_schedule_kernel
+
+        for aligned_b in sorted(
+            _precompile_schedule_buckets(batch_sizes or (), variants, device)
+        ):
+            _compile_schedule_kernel(aligned_b, _SPLIT_KV, num_sms, arch)

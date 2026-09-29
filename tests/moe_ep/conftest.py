@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sys
+import tempfile
 
 import pytest
 
@@ -14,6 +16,12 @@ _MOE_EP_TEST_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path[:] = [
     p for p in sys.path if os.path.abspath(p or os.getcwd()) != _MOE_EP_TEST_ROOT
 ]
+
+
+def pytest_make_parametrize_id(config, val, argname):
+    from tests.moe.utils import parametrize_id
+
+    return parametrize_id(val)
 
 
 @pytest.fixture
@@ -30,12 +38,48 @@ def dist_not_initialized():
         yield
 
 
+@pytest.fixture(scope="session")
+def isolated_deep_gemm_cache():
+    """Provide one session cache when the caller did not configure DeepGEMM."""
+    configured_cache = os.environ.get("TRTLLM_DG_CACHE_DIR")
+    if configured_cache is not None:
+        yield configured_cache
+        return
+
+    cache_dir = tempfile.mkdtemp(prefix="flashinfer-deep-gemm-test-")
+    os.environ["TRTLLM_DG_CACHE_DIR"] = cache_dir
+    try:
+        yield cache_dir
+    finally:
+        if os.environ.get("TRTLLM_DG_CACHE_DIR") == cache_dir:
+            os.environ.pop("TRTLLM_DG_CACHE_DIR")
+        shutil.rmtree(cache_dir, ignore_errors=True)
+
+
 # NOTE: ``pytest_addoption`` (--backend), ``pytest_configure`` (nvep/gpu_*/
 # arch_blackwell markers), and ``pytest_collection_modifyitems`` (env/GPU/arch
 # auto-skips) are intentionally defined ONLY in the root ``tests/conftest.py``.
 # Re-declaring them here triggers a duplicate-option error
 # ("option names {'--backend'} already added") because pytest loads both the
 # parent and child conftests. Keep the shared fixtures below in this file.
+
+
+@pytest.fixture
+def require_split_backend(request):
+    """Gate split regressions before their first collective.
+
+    The graph tests parametrize ``backend``; unparametrized guard and memo
+    regressions exercise nccl_ep only.
+    """
+    from flashinfer.moe_ep import available_backends
+
+    callspec = getattr(request.node, "callspec", None)
+    backend = callspec.params.get("backend", "nccl_ep") if callspec else "nccl_ep"
+    selected = request.config.getoption("--backend")
+    if selected not in (None, "both", backend):
+        pytest.skip(f"requires {backend}; --backend={selected}")
+    if backend not in available_backends():
+        pytest.skip(f"{backend} backend is not available")
 
 
 @pytest.fixture

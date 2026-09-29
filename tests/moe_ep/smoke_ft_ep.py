@@ -162,8 +162,14 @@ def main() -> int:
             torch.cuda.synchronize()
 
     # Survivors: the victim vanishes mid-dispatch. Their kernels time out on
-    # it, mask it, and complete instead of trapping.
-    for _ in range(3):
+    # it, mask it, and complete instead of trapping. A fixed iteration count
+    # races the kill timer (warm identity forwards finish in ms, well before
+    # _KILL_AFTER_S), so keep forwarding until well past the kill + the FT
+    # timeout window.
+    import time
+
+    deadline = time.monotonic() + _KILL_AFTER_S + 3.0 * (_FT_TIMEOUT_MS / 1000.0)
+    while time.monotonic() < deadline:
         layer.forward(t)
         torch.cuda.synchronize()
         if fleet.query_fault():

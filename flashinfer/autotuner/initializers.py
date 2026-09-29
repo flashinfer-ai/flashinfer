@@ -3,7 +3,7 @@ Reusable tensor initializers for AutoTuner profiling.
 
 All functions follow the ``(shapes, dtype, device) -> torch.Tensor`` signature
 expected by ``OptimizationProfile.tensor_initializers`` and
-``DynamicTensorSpec.tensor_initializers``.
+``TuningConfig.tensor_initializers``.
 
 The public names carry an ``autotuner_initializer_`` prefix so that call sites
 can ``from flashinfer.autotuner.initializers import autotuner_initializer_ones``

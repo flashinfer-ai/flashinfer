@@ -1,0 +1,2194 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: BSD-3-Clause
+"""Autonomous SM90 WGMMA epilogue for the fused fc1+fc2 MegaMoE kernel."""
+
+from typing import Optional, Tuple, Type, Union
+import os
+
+import cutlass
+import cutlass.cute as cute
+try:
+    from cutlass.cute import iket  # type: ignore
+except ImportError:  # pragma: no cover -- fallback for wheels without cute.iket
+    from src.iket_compat import iket
+import cutlass.utils as utils
+import cutlass.pipeline as pipeline
+import cutlass.utils.hopper_helpers as sm90_utils
+
+from cutlass.cutlass_dsl import Int64
+
+from src.flag_batch import GpuReleaseFlagBatchTracker
+from src.ptx_helpers import red_add_relaxed_sys_v2_bf16x2
+from src.ptx_helpers import red_add_release_gpu_s32
+from moe_nvfp4_swapab.fc1_fc2_fuse_sched import BlockPhase
+from common.megamoe_constants import (
+    Fp8GateUpInterleave,
+    Fp8E4M3RcpLimit,
+)
+
+from common.moe_utils import fmax
+from cutlass.cute.typing import Float32
+from moe_hopper_fp8.epilogue_fp8_common import (
+    Fc2OutputDest,
+    bfly_transpose4_u32,
+    clamp_and_swiglu_sm90,
+    consume_initial_pingpong_work,
+    consume_next_pingpong_work,
+    pack_f32x2_to_bf16x2,
+    stg_128b_bf16x8,
+    stg_fc1_block_scale_row,
+    tma_store_fc1_output,
+)
+
+Fc1EpilogueStoreTileN = 64
+SwapABTileMChoices = (128, 256)
+# 8 is experimental (wgmma m64n8k32; every n-derived count divides): see TUNING.md.
+SwapABTokenTileNChoices = (8, 16, 32, 64, 128)
+SwapABBlockwiseFc1GroupChunkChoices = (1, 2, 4, 8)
+SwapABBlockwiseFc1GroupChunks = int(
+    os.environ.get("MEGA_SWAPAB_FC1_GROUP_CHUNKS", "1")
+)
+if SwapABBlockwiseFc1GroupChunks not in SwapABBlockwiseFc1GroupChunkChoices:
+    raise ValueError(
+        "MEGA_SWAPAB_FC1_GROUP_CHUNKS must be one of "
+        f"{SwapABBlockwiseFc1GroupChunkChoices}, got "
+        f"{SwapABBlockwiseFc1GroupChunks}."
+    )
+WarpThreadCount = 32
+EpiWarpCount = 4
+
+
+@cute.jit
+def transpose_token_group_bf16x8(r_pack: cute.Tensor, lane_group):
+    """Redistribute one swap-AB token group so every lane holds 8 consecutive
+    output columns of one row.
+
+    ``r_pack[2*v + b]`` is value ``v = 2*m_sub + token_sel`` at column
+    ``lane_group + 8*b``.  After two 32-bit butterfly levels (lane xor 16 / 8)
+    and a 16-bit exchange (xor 4) the lane holds columns ``[bit0*8, bit0*8+8)``
+    of value ``v = 2*bit2 + bit1`` (lane_group bits), low half first, for one
+    16-byte store at column ``bit2*64 + local_warp*16 + bit0*8`` of token
+    ``token0 + bit1``.  All 32 lanes must execute this."""
+    w_u32 = cute.recast_tensor(r_pack, cutlass.Uint32)
+    w0 = cutlass.Uint32(w_u32[0])
+    w1 = cutlass.Uint32(w_u32[1])
+    w2 = cutlass.Uint32(w_u32[2])
+    w3 = cutlass.Uint32(w_u32[3])
+
+    lane_group_bit2_set = (lane_group & cutlass.Int32(4)) != cutlass.Int32(0)
+    lane_group_bit1_set = (lane_group & cutlass.Int32(2)) != cutlass.Int32(0)
+    lane_group_bit0_set = (lane_group & cutlass.Int32(1)) != cutlass.Int32(0)
+
+    # 32-bit levels on lane_group bits 2 / 1 (lane xor 16 / 8): the lane then
+    # holds the (b=0, b=1) column pairs of the four lane groups sharing bit 0.
+    y0, y1, y2, y3 = bfly_transpose4_u32(
+        w0, w1, w2, w3, lane_group_bit2_set, lane_group_bit1_set, 16, 8,
+    )
+
+    # 16-bit level on lane_group bit 0 (xor 4): even groups keep the low halves,
+    # odd groups the high halves.  prmt selectors (nibble i = source byte of
+    # {b,a}): 0x5410 (a.lo,b.lo) 0x7632 (a.hi,b.hi) 0x7610 (a.lo,b.hi)
+    # 0x3254 (b.lo,a.hi) 0x3276 (b.hi,a.hi).
+    sel_send = (
+        cutlass.Uint32(0x5410) if lane_group_bit0_set else cutlass.Uint32(0x7632)
+    )
+    v0 = cutlass.Uint32(cute.arch.prmt(y0, y1, sel_send))
+    v1 = cutlass.Uint32(cute.arch.prmt(y2, y3, sel_send))
+    p0 = cute.arch.shuffle_sync_bfly(v0, 4)
+    p1 = cute.arch.shuffle_sync_bfly(v1, 4)
+    # Word j = (column 2j, 2j+1): even groups (mine, partner), odd (partner, mine).
+    sel_a = (
+        cutlass.Uint32(0x3254) if lane_group_bit0_set else cutlass.Uint32(0x5410)
+    )
+    sel_b = (
+        cutlass.Uint32(0x3276) if lane_group_bit0_set else cutlass.Uint32(0x7610)
+    )
+    o0 = cutlass.Uint32(cute.arch.prmt(y0, p0, sel_a))
+    o1 = cutlass.Uint32(cute.arch.prmt(y1, p0, sel_b))
+    o2 = cutlass.Uint32(cute.arch.prmt(y2, p1, sel_a))
+    o3 = cutlass.Uint32(cute.arch.prmt(y3, p1, sel_b))
+    return o0, o1, o2, o3
+
+
+# =============================================================================
+# SwapABFp8GluEpilogue
+# =============================================================================
+
+class SwapABFp8GluEpilogue:
+
+    def __init__(
+        self,
+        *,
+        mma_tiler_mnk: Tuple[int, int, int],
+        cluster_shape_mn: Tuple[int, int],
+        use_2cta_instrs: bool,
+        sf_vec_size: int,
+        fc1_output_dtype: Type[cutlass.Numeric],
+        fc1_output_layout: utils.LayoutEnum,
+        acc_dtype: Type[cutlass.Numeric] = cutlass.Float32,
+        sf_dtype: Type[cutlass.Numeric] = cutlass.Float8E8M0FNU,
+        fp8_scale_mode: str = "per_tensor",
+        fp8_output_rcp_limit: float = Fp8E4M3RcpLimit,
+        glu_clamp: Optional[float] = None,
+        epilog_sync_bar_id: int = 1,
+        fc1_store_sync_bar_id: int = 2,
+        fc1_amax_sync_bar_id: int = 4,
+        epilogue_warp_ids: Tuple[int, ...] = (0, 1, 2, 3),
+        static_expert_shape: Optional[Tuple[int, int, int]] = None,
+        fc2_in_kernel_topk_reduce: bool = False,
+        apply_topk_in_fc1: bool = False,
+        token_back_by_dispatch: bool = False,
+        fc1_early_done_publish: bool = False,
+        fc1_store_offload: bool = False,
+        epi_flag_batch: Union[int, Tuple[int, int]] = 1,
+        pingpong: bool = False,
+        generate_c: bool = False,
+        c_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+    ) -> None:
+        self.fc1_output_dtype = fc1_output_dtype
+        self.fc1_output_layout = fc1_output_layout
+        self.acc_dtype = acc_dtype
+        self.sf_dtype = sf_dtype
+        if fp8_scale_mode not in ("per_tensor", "blockwise"):
+            raise ValueError(
+                f"fp8_scale_mode must be 'per_tensor' or 'blockwise', "
+                f"got {fp8_scale_mode!r}."
+            )
+        self.fp8_scale_mode = fp8_scale_mode
+        self.fp8_output_rcp_limit = cutlass.Float32(fp8_output_rcp_limit)
+        self._sf_vec_size = sf_vec_size
+        self._epilog_sync_bar_id = epilog_sync_bar_id
+        self._fc1_store_sync_bar_id = fc1_store_sync_bar_id
+        self._fc1_amax_sync_bar_id = fc1_amax_sync_bar_id
+        self._epilogue_warp_ids = epilogue_warp_ids
+        self._pingpong = pingpong
+        # generate_c (training forward): also write the raw pre-SwiGLU fc1
+        # gate+up accumulator to ``fc1_c`` (BF16, kernel column order); the
+        # swap-AB tile is transposed, so the store scatters per element.
+        self._generate_c = generate_c
+        self._c_dtype = c_dtype
+        self._pingpong_order = pingpong
+        self._use_2cta_instrs = use_2cta_instrs
+        self._cluster_n = cluster_shape_mn[1]
+
+        self._atom_thr_size = 1
+        self._raw_cta_tile_m = mma_tiler_mnk[0]
+        self._token_tile_n = mma_tiler_mnk[1]
+        if len(epilogue_warp_ids) % EpiWarpCount != 0:
+            raise ValueError(
+                "Swap-AB epilogue warp count must be a multiple of one "
+                f"warpgroup ({EpiWarpCount}), got {len(epilogue_warp_ids)}."
+            )
+        self._epilogue_warpgroup_count = (
+            len(epilogue_warp_ids) // EpiWarpCount
+        )
+        self._wgmma_fragment_count = self._raw_cta_tile_m // 128
+        expected_warpgroup_count = (
+            2 if self._pingpong else self._wgmma_fragment_count
+        )
+        if self._epilogue_warpgroup_count != expected_warpgroup_count:
+            raise ValueError(
+                "Swap-AB epilogue warpgroup count does not match the selected "
+                f"scheduling mode; got {self._epilogue_warpgroup_count}, "
+                f"expected {expected_warpgroup_count}."
+            )
+        self._wg_raw_tile_m = 128
+        self._wg_output_tile_m = self._wg_raw_tile_m // 2
+        self._mma_tiler_k = mma_tiler_mnk[2]
+        self._token_group_count = self._token_tile_n // 8
+        self._accum_regs_per_m64 = self._token_tile_n // 2 # n // 8 * 4 = n // 2
+        self._folded_values_per_m64_thread = self._token_tile_n // 4
+        self._blockwise_fc1_group_chunks = (
+            SwapABBlockwiseFc1GroupChunks
+            if self.fp8_scale_mode == "blockwise"
+            else 1
+        )
+        if self._token_group_count % self._blockwise_fc1_group_chunks != 0:
+            raise ValueError(
+                "MEGA_SWAPAB_FC1_GROUP_CHUNKS must divide the swap-AB token "
+                f"group count {self._token_group_count}, got "
+                f"{self._blockwise_fc1_group_chunks}."
+            )
+        self._blockwise_fc1_groups_per_chunk = (
+            self._token_group_count // self._blockwise_fc1_group_chunks
+        )
+        self._static_expert_shape = static_expert_shape
+        if (
+            static_expert_shape is not None
+            and static_expert_shape[2]
+            % (self._raw_cta_tile_m * cluster_shape_mn[0])
+            == 0
+        ):
+            self._fc2_stg_needs_predicate: bool = False
+        else:
+            self._fc2_stg_needs_predicate: bool = True
+
+        if self._raw_cta_tile_m not in SwapABTileMChoices:
+            raise ValueError(
+                "Swap-AB Hopper FP8 epilogue requires CTA tile M in "
+                f"{SwapABTileMChoices}, "
+                f"got {self._raw_cta_tile_m}."
+            )
+        if self._wg_raw_tile_m != 128:
+            raise ValueError(
+                "Each swap-AB epilogue warpgroup must own raw M=128; "
+                f"got CTA M={self._raw_cta_tile_m} split across "
+                f"{self._epilogue_warpgroup_count} warpgroup(s)."
+            )
+        if self._token_tile_n not in SwapABTokenTileNChoices:
+            raise ValueError(
+                "Swap-AB Hopper FP8 epilogue requires token N in "
+                f"{SwapABTokenTileNChoices}, got {self._token_tile_n}."
+            )
+        self._epi_tile = (self._token_tile_n, self._wg_output_tile_m)
+        self._subtile_cnt = self._epilogue_warpgroup_count
+        self._iket_fc1_epilogue_pt_range = (
+            f"swapab_fc1_epi_m{self._token_tile_n}n64_pt"
+        )
+        self._iket_fc1_epilogue_bw_range = (
+            f"swapab_fc1_epi_m{self._token_tile_n}n64_bw"
+        )
+        self._iket_fc2_epilogue_range = (
+            f"swapab_fc2_epi_m{self._token_tile_n}n128"
+        )
+
+        self._fc2_in_kernel_topk_reduce = fc2_in_kernel_topk_reduce
+        self._apply_topk_in_fc1 = apply_topk_in_fc1
+        self._token_back_by_dispatch = token_back_by_dispatch
+        # Early fc1_done publication (non-pp only, gated kernel-side):
+        # drain this WG's FC1 bulk stores and release the tile flag right
+        # after the tile's store issues, ahead of consume_next / the
+        # boundary barrier / the tracker's batch deferral.
+        self._early_fc1_pub = fc1_early_done_publish
+        # Set by the ctor param; when True the empty warp runs the store
+        # server and the epilogue only R2S-stages + hands off (keeps the
+        # drain/consume overlap while hoisting publication).
+        self._fc1_store_offload = fc1_store_offload
+        if isinstance(epi_flag_batch, tuple):
+            self._epi_fc1_batch = max(1, epi_flag_batch[0])
+            self._epi_fc2_batch = max(1, epi_flag_batch[1])
+        else:
+            self._epi_fc1_batch = max(1, epi_flag_batch)
+            self._epi_fc2_batch = max(1, epi_flag_batch)
+
+        self.glu_clamp = (
+            cutlass.Float32(glu_clamp) if glu_clamp is not None else None
+        )
+
+    # -- Codegen-time queries  --
+
+    @property
+    def epi_tile(self) -> Tuple[int, int]:
+        return self._epi_tile
+
+    @property
+    def subtile_cnt(self) -> int:
+        return self._subtile_cnt
+
+    def staged_smem_layout(
+        self,
+        n_stages: int,
+    ) -> Union[cute.Layout, cute.ComposedLayout]:
+        return sm90_utils.make_smem_layout_epi(
+            self.fc1_output_dtype,
+            self.fc1_output_layout,
+            self._epi_tile,
+            n_stages,
+        )
+
+    @property
+    def smem_layout_one_stage(self) -> Union[cute.Layout, cute.ComposedLayout]:
+        staged = self.staged_smem_layout(1)
+        return cute.select(staged, mode=[0, 1])
+
+    @property
+    def bytes_per_stage(self) -> int:
+        return cute.size_in_bytes(self.fc1_output_dtype, self.smem_layout_one_stage)
+
+    @property
+    def fc1_amax_smem_layout(self) -> cute.Layout:
+        if self.fp8_scale_mode == "blockwise":
+            # Dense scratch is [epilogue WGs, 4 warps/WG, token N].
+            return cute.make_layout(
+                (self._epilogue_warpgroup_count, 4, self._token_tile_n),
+                stride=(4 * self._token_tile_n, self._token_tile_n, 1),
+            )
+        return cute.make_layout(1)
+
+    @property
+    def fc1_amax_smem_bytes(self) -> int:
+        return cute.size_in_bytes(cutlass.Float32, self.fc1_amax_smem_layout)
+
+
+    # -- FC1 epilogue consuming SM90 WGMMA accumulators --
+    @cute.jit
+    def _run_fc1_epilogue(
+        self,
+        work_tile_info,
+        accumulators: cute.Tensor,
+        n_half: cutlass.Constexpr,
+        smem_fc1_output_buffer: cute.Tensor,
+        smem_fc1_amax: cute.Tensor,
+        tma_atom_fc1_output: cute.CopyAtom,
+        sched_ext,
+        gmem_fc1_output: cute.Tensor,
+        gmem_fc1_output_sf: cute.Tensor,
+        gmem_topk_scores: cute.Tensor,
+        local_warp_idx: int,
+        tidx,
+        _iket_active,
+        fc1_act_weight_dequant_scale,
+        fc2_act_dequant_scale,
+        norm_const,
+        storage_group_idx,
+        gmem_fc1_c,
+    ) -> None:
+        """Dispatch the FC1 epilogue for one completed WGMMA task tile."""
+        if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+            self._run_fc1_epilogue_blockwise(
+                work_tile_info=work_tile_info,
+                accumulators=accumulators,
+                n_half=n_half,
+                smem_fc1_output_buffer=smem_fc1_output_buffer,
+                smem_fc1_amax=smem_fc1_amax,
+                tma_atom_fc1_output=tma_atom_fc1_output,
+                sched_ext=sched_ext,
+                gmem_fc1_output=gmem_fc1_output,
+                gmem_fc1_output_sf=gmem_fc1_output_sf,
+                gmem_topk_scores=gmem_topk_scores,
+                local_warp_idx=local_warp_idx,
+                tidx=tidx,
+                _iket_active=_iket_active,
+                storage_group_idx=storage_group_idx,
+                gmem_fc1_c=gmem_fc1_c,
+            )
+        else:
+            self._run_fc1_epilogue_per_tensor(
+                work_tile_info=work_tile_info,
+                accumulators=accumulators,
+                n_half=n_half,
+                smem_fc1_output_buffer=smem_fc1_output_buffer,
+                tma_atom_fc1_output=tma_atom_fc1_output,
+                sched_ext=sched_ext,
+                gmem_fc1_output=gmem_fc1_output,
+                gmem_fc1_output_sf=gmem_fc1_output_sf,
+                gmem_topk_scores=gmem_topk_scores,
+                local_warp_idx=local_warp_idx,
+                tidx=tidx,
+                _iket_active=_iket_active,
+                fc1_act_weight_dequant_scale=fc1_act_weight_dequant_scale,
+                fc2_act_dequant_scale=fc2_act_dequant_scale,
+                norm_const=norm_const,
+                storage_group_idx=storage_group_idx,
+                gmem_fc1_c=gmem_fc1_c,
+            )
+
+
+    @cute.jit
+    def _quantize_store_fc1_pair_swapab(
+        self,
+        values: cute.Tensor,
+        sC_stage: cute.Tensor,
+        token0,
+        token1,
+        local_warp_idx: int,
+        lane_group,
+    ) -> None:
+        r_fp8 = cute.make_rmem_tensor(
+            values.layout.shape, self.fc1_output_dtype
+        )
+        r_fp8.store(values.load().to(self.fc1_output_dtype))
+        for m_sub in cutlass.range_constexpr(2):
+            src = m_sub * 2
+            output_col = (
+                cutlass.Int32(m_sub * 32)
+                + cutlass.Int32(local_warp_idx * 8)
+                + lane_group
+            )
+            sC_stage[token0, output_col] = r_fp8[src + 0]
+            sC_stage[token1, output_col] = r_fp8[src + 1]
+
+    @cute.jit
+    def _run_fc1_token_group_swapab_per_tensor(
+        self,
+        token_group: cutlass.Constexpr,
+        accumulators: cute.Tensor,
+        sC_stage: cute.Tensor,
+        local_warp_idx: int,
+        tidx,
+        fc1_act_weight_dequant_scale,
+        output_rcp: Float32,
+        real_topk_scores: cute.Tensor,
+        token_tile_base,
+        c_ctx,
+    ) -> None:
+        thread_in_warp = tidx % WarpThreadCount
+        lane_group = thread_in_warp // 4
+        lane_mod = thread_in_warp % 4
+        token0 = cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
+        token1 = token0 + cutlass.Int32(1)
+        group_layout = cute.make_layout(4)
+        r_gate = cute.make_rmem_tensor(group_layout.shape, self.acc_dtype)
+        r_up = cute.make_rmem_tensor(group_layout.shape, self.acc_dtype)
+        for m_sub in cutlass.range_constexpr(2):
+            accum_base = m_sub * self._accum_regs_per_m64
+            src = accum_base + token_group * 4
+            dst = m_sub * 2
+            r_gate[dst + 0] = (
+                accumulators[src + 0] * fc1_act_weight_dequant_scale
+            )
+            r_gate[dst + 1] = (
+                accumulators[src + 1] * fc1_act_weight_dequant_scale
+            )
+            r_up[dst + 0] = (
+                accumulators[src + 2] * fc1_act_weight_dequant_scale
+            )
+            r_up[dst + 1] = (
+                accumulators[src + 3] * fc1_act_weight_dequant_scale
+            )
+        if cutlass.const_expr(self._generate_c):
+            self._store_fc1_c_group_swapab(
+                r_gate, r_up, c_ctx[0], c_ctx[1], c_ctx[2], token0, lane_group,
+                c_ctx[3], c_ctx[4],
+            )
+
+        r_swiglu = cute.make_rmem_tensor(group_layout.shape, self.acc_dtype)
+        clamp_and_swiglu_sm90(
+            r_swiglu, r_up, r_gate, self.glu_clamp, Float32(1.0)
+        )
+        self._apply_fc1_topk_swapab(
+            r_swiglu=r_swiglu,
+            real_topk_scores=real_topk_scores,
+            token_tile_base=token_tile_base,
+            token0=token0,
+            token1=token1,
+        )
+        for i in cutlass.range_constexpr(4):
+            r_swiglu[i] = r_swiglu[i] * output_rcp
+
+        self._quantize_store_fc1_pair_swapab(
+            values=r_swiglu,
+            sC_stage=sC_stage,
+            token0=token0,
+            token1=token1,
+            local_warp_idx=local_warp_idx,
+            lane_group=lane_group,
+        )
+
+    @cute.jit
+    def _run_fc1_epilogue_per_tensor(
+        self,
+        work_tile_info,
+        accumulators: cute.Tensor,
+        n_half: cutlass.Constexpr,
+        smem_fc1_output_buffer: cute.Tensor,
+        tma_atom_fc1_output: cute.CopyAtom,
+        sched_ext,
+        gmem_fc1_output: cute.Tensor,
+        gmem_fc1_output_sf: cute.Tensor,
+        gmem_topk_scores: cute.Tensor,
+        local_warp_idx: int,
+        tidx,
+        _iket_active,
+        fc1_act_weight_dequant_scale,
+        fc2_act_dequant_scale,
+        norm_const,
+        storage_group_idx,
+        gmem_fc1_c,
+    ) -> None:
+        """Fold two M64 fragments into one WG-private Nx64 FP8 tile."""
+        # Inner epilogue IKET range for swap-AB, FP8 per-tensor FC1. WGMMA has
+        # already finished. This covers both M=64 accumulator fragments,
+        # gate/up fold, scalar dequantization, SwiGLU, requantization, and
+        # RMEM-to-SMEM stores. Final TMA store issue remains in the enclosing
+        # swapab_fc1_task_pt range; its later async completion
+        # wait is outside the task-tile range.
+        if _iket_active:
+            iket.range_push(self._iket_fc1_epilogue_pt_range)
+        real_topk_scores, _ = sched_ext.get_gmem_tensor(
+            "topk", gmem_topk_scores, work_tile_info,
+        )
+        sC_stage = cute.slice_(
+            smem_fc1_output_buffer,
+            (None, None, cutlass.Int32(storage_group_idx)),
+        )
+        output_rcp = Float32(1.0) / fc2_act_dequant_scale
+        token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
+            self._token_tile_n
+        )
+        c_ctx = None
+        if cutlass.const_expr(self._generate_c):
+            c_ctx = self._fc1_c_context_swapab(
+                work_tile_info, n_half, gmem_fc1_c, token_tile_base,
+                local_warp_idx, tidx,
+            )
+
+        for token_group in cutlass.range_constexpr(self._token_group_count):
+            self._run_fc1_token_group_swapab_per_tensor(
+                token_group=token_group,
+                accumulators=accumulators,
+                sC_stage=sC_stage,
+                local_warp_idx=local_warp_idx,
+                tidx=tidx,
+                fc1_act_weight_dequant_scale=fc1_act_weight_dequant_scale,
+                output_rcp=output_rcp,
+                real_topk_scores=real_topk_scores,
+                token_tile_base=token_tile_base,
+                c_ctx=c_ctx,
+            )
+        if _iket_active:
+            iket.range_pop()  # swapab_fc1_epi_m{token_tile_n}n64_pt
+
+    @cute.jit
+    def _fill_fc1_swiglu_chunk_swapab_blockwise(
+        self,
+        chunk_idx: cutlass.Constexpr,
+        accumulators: cute.Tensor,
+        r_swiglu: cute.Tensor,
+        tidx,
+        c_ctx,
+    ) -> None:
+        groups_per_chunk = self._blockwise_fc1_groups_per_chunk
+        folded_values_per_chunk_m64 = 2 * groups_per_chunk
+        group_start = chunk_idx * groups_per_chunk
+        group_layout = cute.make_layout(4)
+        group_swiglu_layout = cute.make_layout(
+            (2, 2), stride=(1, folded_values_per_chunk_m64)
+        )
+        for local_group in cutlass.range_constexpr(groups_per_chunk):
+            token_group = group_start + local_group
+            pair_base = local_group * 2
+            r_gate = cute.make_rmem_tensor(group_layout.shape, self.acc_dtype)
+            r_up = cute.make_rmem_tensor(group_layout.shape, self.acc_dtype)
+            for m_sub in cutlass.range_constexpr(2):
+                src = (
+                    m_sub * (2 * self._folded_values_per_m64_thread)
+                    + token_group * 4
+                )
+                dst = m_sub * 2
+                r_gate[dst + 0] = accumulators[src + 0]
+                r_gate[dst + 1] = accumulators[src + 1]
+                r_up[dst + 0] = accumulators[src + 2]
+                r_up[dst + 1] = accumulators[src + 3]
+            if cutlass.const_expr(self._generate_c):
+                thread_in_warp = tidx % WarpThreadCount
+                token0 = (
+                    cutlass.Int32(token_group * 8)
+                    + (thread_in_warp % 4) * cutlass.Int32(2)
+                )
+                self._store_fc1_c_group_swapab(
+                    r_gate, r_up, c_ctx[0], c_ctx[1], c_ctx[2], token0,
+                    thread_in_warp // 4, c_ctx[3], c_ctx[4],
+                )
+            group_swiglu_view = cute.make_tensor(
+                r_swiglu.iterator + pair_base, group_swiglu_layout
+            )
+            clamp_and_swiglu_sm90(
+                group_swiglu_view,
+                r_up,
+                r_gate,
+                self.glu_clamp,
+                Float32(1.0),
+            )
+
+    @cute.jit
+    def _store_fc1_c_group_swapab(
+        self,
+        r_gate: cute.Tensor,
+        r_up: cute.Tensor,
+        g_c: cute.Tensor,
+        c_row_base,
+        c_col,
+        token0,
+        lane_group,
+        c_valid_tokens,
+        c_valid_gateup_n,
+    ) -> None:
+        """Store one token group of pre-SwiGLU gate/up values as BF16 (generate_c).
+
+        Fused into the SwiGLU pass so the accumulators are read once and die
+        group by group instead of staying live across a separate C pass.
+        """
+        r_pack = cute.make_rmem_tensor(8, cutlass.BFloat16)
+        w_u32 = cute.recast_tensor(r_pack, cutlass.Uint32)
+        for v in cutlass.range_constexpr(4):
+            w_u32[v] = pack_f32x2_to_bf16x2(r_gate[v], r_up[v])
+        o0, o1, o2, o3 = transpose_token_group_bf16x8(r_pack, lane_group)
+        token = token0 + ((lane_group >> cutlass.Int32(1)) & cutlass.Int32(1))
+        if token < c_valid_tokens and c_col < c_valid_gateup_n:
+            stg_128b_bf16x8(g_c, o0, o1, o2, o3, c_row_base + token, c_col)
+
+    @cute.jit
+    def _fc1_c_context_swapab(
+        self,
+        work_tile_info,
+        n_half: cutlass.Constexpr,
+        gmem_fc1_c: cute.Tensor,
+        token_tile_base,
+        local_warp_idx: int,
+        tidx,
+    ):
+        """Per-task constants of the generate_c store: pool slice, row base,
+        this lane's 8-column block (kernel gate/up-interleaved order), bounds."""
+        lane_group = (tidx % WarpThreadCount) // 4
+        g_c = cute.slice_(gmem_fc1_c, (None, None, 0))
+        c_row_base = work_tile_info.cumulative_data_physical_row + token_tile_base
+        c_col = (
+            (
+                work_tile_info.tile_m_idx * cutlass.Int32(self._wgmma_fragment_count)
+                + cutlass.Int32(n_half)
+            ) * cutlass.Int32(128)
+            + ((lane_group >> cutlass.Int32(2)) & cutlass.Int32(1)) * cutlass.Int32(64)
+            + cutlass.Int32(local_warp_idx * 16)
+            + (lane_group & cutlass.Int32(1)) * cutlass.Int32(8)
+        )
+        return (
+            g_c,
+            c_row_base,
+            c_col,
+            work_tile_info.valid_tokens_in_cta_tile,
+            cutlass.Int32(gmem_fc1_c.shape[1]),
+        )
+
+    @cute.jit
+    def _apply_fc1_topk_swapab(
+        self,
+        r_swiglu: cute.Tensor,
+        real_topk_scores: cute.Tensor,
+        token_tile_base,
+        token0,
+        token1,
+    ) -> None:
+        """Scale token0/token1 values across both M64 register fragments."""
+        if cutlass.const_expr(self._apply_topk_in_fc1):
+            topk_score = Float32(
+                real_topk_scores[token_tile_base + token0]
+            )
+            for m_sub in cutlass.range_constexpr(2):
+                base = m_sub * 2
+                r_swiglu[base + 0] = r_swiglu[base + 0] * topk_score
+            topk_score = Float32(
+                real_topk_scores[token_tile_base + token1]
+            )
+            for m_sub in cutlass.range_constexpr(2):
+                base = m_sub * 2
+                r_swiglu[base + 1] = r_swiglu[base + 1] * topk_score
+
+    @cute.jit
+    def _apply_fc1_topk_chunk_swapab(
+        self,
+        chunk_idx: cutlass.Constexpr,
+        tidx,
+        r_swiglu: cute.Tensor,
+        real_topk_scores: cute.Tensor,
+        token_tile_base,
+    ) -> None:
+        if cutlass.const_expr(self._apply_topk_in_fc1):
+            groups_per_chunk = self._blockwise_fc1_groups_per_chunk
+            folded_values_per_chunk_m64 = 2 * groups_per_chunk
+            group_start = chunk_idx * groups_per_chunk
+            lane_mod = (tidx % WarpThreadCount) % 4
+            for local_group in cutlass.range_constexpr(groups_per_chunk):
+                token_group = group_start + local_group
+                pair_base = local_group * 2
+                token0 = (
+                    cutlass.Int32(token_group * 8)
+                    + lane_mod * cutlass.Int32(2)
+                )
+                token1 = token0 + cutlass.Int32(1)
+                topk_score0 = Float32(
+                    real_topk_scores[token_tile_base + token0]
+                )
+                topk_score1 = Float32(
+                    real_topk_scores[token_tile_base + token1]
+                )
+                for m_sub in cutlass.range_constexpr(2):
+                    reg_base = (
+                        m_sub * folded_values_per_chunk_m64 + pair_base
+                    )
+                    r_swiglu[reg_base + 0] = (
+                        r_swiglu[reg_base + 0] * topk_score0
+                    )
+                    r_swiglu[reg_base + 1] = (
+                        r_swiglu[reg_base + 1] * topk_score1
+                    )
+
+    @cute.jit
+    def _publish_fc1_amax_chunk_swapab_blockwise(
+        self,
+        chunk_idx: cutlass.Constexpr,
+        n_half: cutlass.Constexpr,
+        local_warp_idx: int,
+        tidx,
+        r_swiglu: cute.Tensor,
+        smem_fc1_amax: cute.Tensor,
+    ) -> None:
+        groups_per_chunk = self._blockwise_fc1_groups_per_chunk
+        folded_values_per_chunk_m64 = 2 * groups_per_chunk
+        group_start = chunk_idx * groups_per_chunk
+        thread_in_warp = tidx % WarpThreadCount
+        lane_group = thread_in_warp // 4
+        lane_mod = thread_in_warp % 4
+        for local_group in cutlass.range_constexpr(groups_per_chunk):
+            token_group = group_start + local_group
+            idx0 = local_group * 2
+            idx1 = idx0 + 1
+            token0_max = fmax(
+                fmax(r_swiglu[idx0], -r_swiglu[idx0]),
+                fmax(
+                    r_swiglu[folded_values_per_chunk_m64 + idx0],
+                    -r_swiglu[folded_values_per_chunk_m64 + idx0],
+                ),
+            )
+            token1_max = fmax(
+                fmax(r_swiglu[idx1], -r_swiglu[idx1]),
+                fmax(
+                    r_swiglu[folded_values_per_chunk_m64 + idx1],
+                    -r_swiglu[folded_values_per_chunk_m64 + idx1],
+                ),
+            )
+            for delta in (4, 8, 16):
+                token0_max = fmax(
+                    token0_max,
+                    cute.arch.shuffle_sync_bfly(token0_max, offset=delta),
+                )
+                token1_max = fmax(
+                    token1_max,
+                    cute.arch.shuffle_sync_bfly(token1_max, offset=delta),
+                )
+            if lane_group == cutlass.Int32(0):
+                token0 = (
+                    cutlass.Int32(token_group * 8)
+                    + lane_mod * cutlass.Int32(2)
+                )
+                token1 = token0 + cutlass.Int32(1)
+                smem_fc1_amax[n_half, local_warp_idx, token0] = token0_max
+                smem_fc1_amax[n_half, local_warp_idx, token1] = token1_max
+
+    @cute.jit
+    def _finalize_fc1_scale_chunk_swapab_blockwise(
+        self,
+        work_tile_info,
+        chunk_idx: cutlass.Constexpr,
+        n_half: cutlass.Constexpr,
+        local_warp_idx: int,
+        tidx,
+        smem_fc1_amax: cute.Tensor,
+        gmem_fc1_output_sf: cute.Tensor,
+        r_scale: cute.Tensor,
+        scale_epsilon: Float32,
+        global_token_base,
+        scale_col_idx,
+    ) -> None:
+        groups_per_chunk = self._blockwise_fc1_groups_per_chunk
+        group_start = chunk_idx * groups_per_chunk
+        thread_in_warp = tidx % WarpThreadCount
+        lane_group = thread_in_warp // 4
+        lane_mod = thread_in_warp % 4
+        for local_group in cutlass.range_constexpr(groups_per_chunk):
+            token_group = group_start + local_group
+            pair_base = local_group * 2
+            token0 = (
+                cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
+            )
+            token1 = token0 + cutlass.Int32(1)
+            # Balanced 4-to-1 reduction keeps the FMAX dependency depth at 2.
+            token0_max = fmax(
+                fmax(
+                    smem_fc1_amax[n_half, 0, token0],
+                    smem_fc1_amax[n_half, 1, token0],
+                ),
+                fmax(
+                    smem_fc1_amax[n_half, 2, token0],
+                    smem_fc1_amax[n_half, 3, token0],
+                ),
+            )
+            token1_max = fmax(
+                fmax(
+                    smem_fc1_amax[n_half, 0, token1],
+                    smem_fc1_amax[n_half, 1, token1],
+                ),
+                fmax(
+                    smem_fc1_amax[n_half, 2, token1],
+                    smem_fc1_amax[n_half, 3, token1],
+                ),
+            )
+            scale0 = fmax(
+                token0_max * self.fp8_output_rcp_limit, scale_epsilon
+            )
+            scale1 = fmax(
+                token1_max * self.fp8_output_rcp_limit, scale_epsilon
+            )
+            r_scale[pair_base + 0] = scale0
+            r_scale[pair_base + 1] = scale1
+            if local_warp_idx == cutlass.Int32(0):
+                if lane_group == cutlass.Int32(0):
+                    if token0 < work_tile_info.valid_tokens_in_cta_tile:
+                        stg_fc1_block_scale_row(
+                            gmem_fc1_output_sf,
+                            scale_col_idx,
+                            global_token_base + token0,
+                            scale0,
+                        )
+                    if token1 < work_tile_info.valid_tokens_in_cta_tile:
+                        stg_fc1_block_scale_row(
+                            gmem_fc1_output_sf,
+                            scale_col_idx,
+                            global_token_base + token1,
+                            scale1,
+                        )
+
+    @cute.jit
+    def _quantize_store_fc1_chunk_swapab_blockwise(
+        self,
+        chunk_idx: cutlass.Constexpr,
+        local_warp_idx: int,
+        tidx,
+        r_swiglu: cute.Tensor,
+        r_scale: cute.Tensor,
+        sC_stage: cute.Tensor,
+    ) -> None:
+        groups_per_chunk = self._blockwise_fc1_groups_per_chunk
+        folded_values_per_chunk_m64 = 2 * groups_per_chunk
+        group_start = chunk_idx * groups_per_chunk
+        group_layout = cute.make_layout(4)
+        thread_in_warp = tidx % WarpThreadCount
+        lane_group = thread_in_warp // 4
+        lane_mod = thread_in_warp % 4
+        for local_group in cutlass.range_constexpr(groups_per_chunk):
+            token_group = group_start + local_group
+            pair_base = local_group * 2
+            token0 = (
+                cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
+            )
+            token1 = token0 + cutlass.Int32(1)
+            scale0 = r_scale[pair_base + 0]
+            scale1 = r_scale[pair_base + 1]
+            scale0_rcp = Float32(1.0) / scale0
+            scale1_rcp = Float32(1.0) / scale1
+            r_quant = cute.make_rmem_tensor(group_layout.shape, self.acc_dtype)
+            for m_sub in cutlass.range_constexpr(2):
+                reg_base = m_sub * folded_values_per_chunk_m64 + pair_base
+                dst = m_sub * 2
+                r_quant[dst + 0] = r_swiglu[reg_base + 0] * scale0_rcp
+                r_quant[dst + 1] = r_swiglu[reg_base + 1] * scale1_rcp
+            self._quantize_store_fc1_pair_swapab(
+                values=r_quant,
+                sC_stage=sC_stage,
+                token0=token0,
+                token1=token1,
+                local_warp_idx=local_warp_idx,
+                lane_group=lane_group,
+            )
+
+    @cute.jit
+    def _run_fc1_epilogue_blockwise(
+        self,
+        work_tile_info,
+        accumulators: cute.Tensor,
+        n_half: cutlass.Constexpr,
+        smem_fc1_output_buffer: cute.Tensor,
+        smem_fc1_amax: cute.Tensor,
+        tma_atom_fc1_output: cute.CopyAtom,
+        sched_ext,
+        gmem_fc1_output: cute.Tensor,
+        gmem_fc1_output_sf: cute.Tensor,
+        gmem_topk_scores: cute.Tensor,
+        local_warp_idx: int,
+        tidx,
+        _iket_active,
+        storage_group_idx,
+        gmem_fc1_c,
+    ) -> None:
+        """Process blockwise FC1 token groups in register-bounded chunks."""
+        # Inner epilogue IKET range for swap-AB, DeepGEMM-style blockwise FC1.
+        # WGMMA and blockwise accumulator scaling have already finished. This
+        # spans every register-bounded chunk, including gate/up fold, SwiGLU,
+        # warpgroup amax reduction, scale publication, blockwise quantization,
+        # and RMEM-to-SMEM stores. Final TMA store belongs to the outer task.
+        if _iket_active:
+            iket.range_push(self._iket_fc1_epilogue_bw_range)
+        real_topk_scores, _ = sched_ext.get_gmem_tensor(
+            "topk", gmem_topk_scores, work_tile_info,
+        )
+        groups_per_chunk = self._blockwise_fc1_groups_per_chunk
+        folded_values_per_chunk_m64 = 2 * groups_per_chunk
+        value_layout = cute.make_layout(2 * folded_values_per_chunk_m64)
+        scale_layout = cute.make_layout(folded_values_per_chunk_m64)
+        amax_bar = pipeline.NamedBarrier(
+            barrier_id=self._fc1_amax_sync_bar_id + storage_group_idx,
+            num_threads=EpiWarpCount * WarpThreadCount,
+        )
+        scale_epsilon = Float32(1.0e-30)
+        global_token_base = (
+            work_tile_info.cumulative_data_physical_row
+            + work_tile_info.tile_n_idx * cutlass.Int32(self._token_tile_n)
+        )
+        scale_col_idx = (
+            work_tile_info.tile_m_idx
+            * cutlass.Int32(self._wgmma_fragment_count)
+            + cutlass.Int32(n_half)
+        )
+        sC_stage = cute.slice_(
+            smem_fc1_output_buffer,
+            (None, None, cutlass.Int32(storage_group_idx)),
+        )
+        token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
+            self._token_tile_n
+        )
+        c_ctx = None
+        if cutlass.const_expr(self._generate_c):
+            c_ctx = self._fc1_c_context_swapab(
+                work_tile_info, n_half, gmem_fc1_c, token_tile_base,
+                local_warp_idx, tidx,
+            )
+
+        for chunk_idx in cutlass.range_constexpr(
+            self._blockwise_fc1_group_chunks
+        ):
+            r_swiglu = cute.make_rmem_tensor(value_layout.shape, self.acc_dtype)
+            self._fill_fc1_swiglu_chunk_swapab_blockwise(
+                chunk_idx=chunk_idx,
+                accumulators=accumulators,
+                r_swiglu=r_swiglu,
+                tidx=tidx,
+                c_ctx=c_ctx,
+            )
+            self._apply_fc1_topk_chunk_swapab(
+                chunk_idx=chunk_idx,
+                tidx=tidx,
+                r_swiglu=r_swiglu,
+                real_topk_scores=real_topk_scores,
+                token_tile_base=token_tile_base,
+            )
+            self._publish_fc1_amax_chunk_swapab_blockwise(
+                chunk_idx=chunk_idx,
+                n_half=storage_group_idx,
+                local_warp_idx=local_warp_idx,
+                tidx=tidx,
+                r_swiglu=r_swiglu,
+                smem_fc1_amax=smem_fc1_amax,
+            )
+
+            cute.arch.fence_proxy("async.shared", space="cta")
+            amax_bar.arrive_and_wait()
+
+            r_scale = cute.make_rmem_tensor(scale_layout.shape, cutlass.Float32)
+            self._finalize_fc1_scale_chunk_swapab_blockwise(
+                work_tile_info=work_tile_info,
+                chunk_idx=chunk_idx,
+                n_half=storage_group_idx,
+                local_warp_idx=local_warp_idx,
+                tidx=tidx,
+                smem_fc1_amax=smem_fc1_amax,
+                gmem_fc1_output_sf=gmem_fc1_output_sf,
+                r_scale=r_scale,
+                scale_epsilon=scale_epsilon,
+                global_token_base=global_token_base,
+                scale_col_idx=scale_col_idx,
+            )
+            self._quantize_store_fc1_chunk_swapab_blockwise(
+                chunk_idx=chunk_idx,
+                local_warp_idx=local_warp_idx,
+                tidx=tidx,
+                r_swiglu=r_swiglu,
+                r_scale=r_scale,
+                sC_stage=sC_stage,
+            )
+        if _iket_active:
+            iket.range_pop()  # swapab_fc1_epi_m{token_tile_n}n64_bw
+
+    @cute.jit
+    def _store_fc1_task_tile(
+        self,
+        work_tile_info,
+        smem_fc1_output_buffer: cute.Tensor,
+        tma_atom_fc1_output: cute.CopyAtom,
+        sched_ext,
+        gmem_fc1_output: cute.Tensor,
+        local_warp_idx: int,
+        n_half: cutlass.Constexpr,
+        storage_group_idx,
+        _iket_active,
+        gmem_fc1_done_counter=None,
+        fc1_offload_full_mbar_ptr=None,
+        fc1_offload_mbox=None,
+    ) -> None:
+        real_fc1_output, _ = sched_ext.get_gmem_tensor(
+            "c", gmem_fc1_output, work_tile_info,
+        )
+
+        # Each M=128 WG folds to one contiguous output-channel block of 64.
+        output_n_tile = (
+            work_tile_info.tile_m_idx
+            * cutlass.Int32(self._wgmma_fragment_count)
+            + cutlass.Int32(n_half)
+        )
+
+        cute.arch.fence_proxy("async.shared", space="cta")
+        fc1_store_bar = pipeline.NamedBarrier(
+            barrier_id=self._fc1_store_sync_bar_id + storage_group_idx,
+            num_threads=EpiWarpCount * WarpThreadCount,
+        )
+        if _iket_active:
+            iket.range_push("swapab_fc1_store_smem_barrier")
+        fc1_store_bar.arrive_and_wait()
+        if _iket_active:
+            iket.range_pop()
+
+        if cutlass.const_expr(self._fc1_store_offload):
+            # Hand off to the empty-warp server: the WG barrier above
+            # ordered every thread's R2S; lane 0 publishes the destination
+            # scalars, then all 128 threads arrive the full mbar.  The
+            # server drains while the epilogue moves into consume_next
+            # (overlap preserved).
+            _slot = cutlass.Int32(storage_group_idx)
+            _base = _slot * cutlass.Int32(5)
+            if local_warp_idx == cutlass.Int32(0):
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    fc1_offload_mbox[_base + 0] = Int64(
+                        work_tile_info.cumulative_data_physical_row
+                    )
+                    fc1_offload_mbox[_base + 1] = Int64(
+                        work_tile_info.tile_n_idx
+                    )
+                    fc1_offload_mbox[_base + 2] = Int64(output_n_tile)
+                    fc1_offload_mbox[_base + 3] = Int64(
+                        work_tile_info.valid_tokens_in_cta_tile
+                    )
+                    _slot_id = (
+                        cutlass.Int32(self._cluster_n)
+                        * work_tile_info.cumulative_token_block_count
+                        + work_tile_info.tile_n_idx
+                    )
+                    fc1_offload_mbox[_base + 4] = Int64(
+                        (
+                            gmem_fc1_done_counter.iterator + _slot_id
+                        ).toint()
+                    )
+            cute.arch.mbarrier_arrive(fc1_offload_full_mbar_ptr + _slot)
+            return
+
+        if local_warp_idx == cutlass.Int32(0):
+            stage_idx = cutlass.Int32(storage_group_idx)
+            g_fc1_output_wg_view = cute.local_tile(
+                real_fc1_output,
+                (self._token_tile_n, Fc1EpilogueStoreTileN, 1),
+                (work_tile_info.tile_n_idx, output_n_tile, 0),
+            )
+            if _iket_active:
+                iket.range_push("swapab_fc1_tma_store_issue")
+            tma_store_fc1_output(
+                smem_fc1_output_buffer,
+                stage_idx,
+                tma_atom_fc1_output,
+                g_fc1_output_wg_view,
+                work_tile_info.valid_tokens_in_cta_tile,
+            )
+            if _iket_active:
+                iket.range_pop()
+
+    @cute.jit
+    def _run_fc2_token_group_swapab(
+        self,
+        work_tile_info,
+        token_group: cutlass.Constexpr,
+        accumulators: cute.Tensor,
+        n_half: cutlass.Constexpr,
+        real_fc2_output: cute.Tensor,
+        valid_hidden,
+        token_tile_base,
+        pool_token_base,
+        local_warp_idx: int,
+        tidx,
+        fc2_act_weight_dequant_scale,
+        token_comm_args=None,
+    ) -> None:
+        thread_in_warp = tidx % WarpThreadCount
+        lane_group = thread_in_warp // 4
+        lane_mod = thread_in_warp % 4
+        valid_tokens = work_tile_info.valid_tokens_in_cta_tile
+        token0 = cutlass.Int32(token_group * 8) + lane_mod * cutlass.Int32(2)
+        token1 = token0 + cutlass.Int32(1)
+        hidden_base = (
+            work_tile_info.tile_m_idx * cutlass.Int32(self._raw_cta_tile_m)
+            + cutlass.Int32(n_half * self._wg_raw_tile_m)
+        )
+        use_mega_dest = cutlass.const_expr(
+            token_comm_args is not None and not self._token_back_by_dispatch
+        )
+        if cutlass.const_expr(use_mega_dest and self._fc2_in_kernel_topk_reduce):
+            metadata_u32 = cute.recast_tensor(
+                token_comm_args.token_src_metadata, cutlass.Uint32,
+            )
+            fc2_output_dest = Fc2OutputDest(
+                tensor=token_comm_args.combine_output,
+                metadata=metadata_u32,
+                peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
+                reduce_topk_in_kernel=True,
+            )
+            pair_layout = cute.make_layout(4)
+            for m_sub in cutlass.range_constexpr(2):
+                accum_base = m_sub * self._accum_regs_per_m64 + token_group * 4
+                r_fp32 = cute.make_rmem_tensor(pair_layout.shape, self.acc_dtype)
+                for i in cutlass.range_constexpr(4):
+                    r_fp32[i] = (
+                        accumulators[accum_base + i]
+                        * fc2_act_weight_dequant_scale
+                    )
+                r_bf16 = cute.make_rmem_tensor(pair_layout.shape, cutlass.BFloat16)
+                r_bf16.store(r_fp32.load().to(cutlass.BFloat16))
+                hidden0 = (
+                    hidden_base
+                    + cutlass.Int32(m_sub * 64)
+                    + cutlass.Int32(local_warp_idx * 16)
+                    + lane_group
+                )
+                hidden1 = hidden0 + cutlass.Int32(8)
+                # Four lane-groups own four adjacent hidden cells for the
+                # same token. Gather them into two packed bf16x2 registers
+                # so one vector REDG covers the full 8-byte segment.
+                r_bf16_u16 = cute.recast_tensor(r_bf16, cutlass.Uint16)
+                source_lane_base = (
+                    (lane_group // cutlass.Int32(4)) * cutlass.Int32(16)
+                    + lane_mod
+                )
+                for value_idx in cutlass.range_constexpr(4):
+                    raw = cutlass.Uint32(r_bf16_u16[value_idx])
+                    value0 = cute.arch.shuffle_sync(raw, source_lane_base)
+                    value1 = cute.arch.shuffle_sync(
+                        raw, source_lane_base + cutlass.Int32(4),
+                    )
+                    value2 = cute.arch.shuffle_sync(
+                        raw, source_lane_base + cutlass.Int32(8),
+                    )
+                    value3 = cute.arch.shuffle_sync(
+                        raw, source_lane_base + cutlass.Int32(12),
+                    )
+                    packed0 = value0 | (value1 << cutlass.Uint32(16))
+                    packed1 = value2 | (value3 << cutlass.Uint32(16))
+                    token = token0
+                    hidden = hidden0
+                    if cutlass.const_expr(value_idx % 2 == 1):
+                        token = token1
+                    if cutlass.const_expr(value_idx >= 2):
+                        hidden = hidden1
+                    if (
+                        lane_group % cutlass.Int32(4) == cutlass.Int32(0)
+                        and token < valid_tokens
+                        and hidden < valid_hidden
+                    ):
+                        dest_row = fc2_output_dest.resolve_token_row(
+                            pool_token_base + token
+                        )
+                        dest_ptr = cute.make_ptr(
+                            cutlass.BFloat16,
+                            dest_row.iterator.toint()
+                            + hidden * cutlass.Int64(2),
+                            cute.AddressSpace.gmem,
+                            assumed_align=8,
+                        )
+                        red_add_relaxed_sys_v2_bf16x2(
+                            dest_ptr, packed0, packed1,
+                        )
+        elif cutlass.const_expr(use_mega_dest):
+            # Scalar stores: the 16-byte variant regressed N16 / N8 token tiles on BF16.
+            metadata_u32 = cute.recast_tensor(
+                token_comm_args.token_src_metadata, cutlass.Uint32,
+            )
+            fc2_output_dest = Fc2OutputDest(
+                tensor=token_comm_args.combine_output,
+                metadata=metadata_u32,
+                peer_rank_ptr_mapper=token_comm_args.peer_rank_ptr_mapper,
+                reduce_topk_in_kernel=False,
+            )
+            pair_layout = cute.make_layout(4)
+            for m_sub in cutlass.range_constexpr(2):
+                accum_base = m_sub * self._accum_regs_per_m64 + token_group * 4
+                r_fp32 = cute.make_rmem_tensor(pair_layout.shape, self.acc_dtype)
+                for i in cutlass.range_constexpr(4):
+                    r_fp32[i] = (
+                        accumulators[accum_base + i]
+                        * fc2_act_weight_dequant_scale
+                    )
+                r_bf16 = cute.make_rmem_tensor(pair_layout.shape, cutlass.BFloat16)
+                r_bf16.store(r_fp32.load().to(cutlass.BFloat16))
+                hidden0 = (
+                    hidden_base
+                    + cutlass.Int32(m_sub * 64)
+                    + cutlass.Int32(local_warp_idx * 16)
+                    + lane_group
+                )
+                hidden1 = hidden0 + cutlass.Int32(8)
+                if token0 < valid_tokens:
+                    dest_row0 = fc2_output_dest.resolve_token_row(
+                        pool_token_base + token0
+                    )
+                    if hidden0 < valid_hidden:
+                        dest_row0[hidden0] = r_bf16[0]
+                    if hidden1 < valid_hidden:
+                        dest_row0[hidden1] = r_bf16[2]
+                if token1 < valid_tokens:
+                    dest_row1 = fc2_output_dest.resolve_token_row(
+                        pool_token_base + token1
+                    )
+                    if hidden0 < valid_hidden:
+                        dest_row1[hidden0] = r_bf16[1]
+                    if hidden1 < valid_hidden:
+                        dest_row1[hidden1] = r_bf16[3]
+        else:
+            # Local fc2 output: the lane's 8 scaled values (v = 2*m_sub + token_sel
+            # at columns lane_group / lane_group + 8) become 8 consecutive hidden
+            # columns of one token: one 16-byte store instead of eight 2-byte ones.
+            r_fp32 = cute.make_rmem_tensor(8, self.acc_dtype)
+            for m_sub in cutlass.range_constexpr(2):
+                accum_base = m_sub * self._accum_regs_per_m64 + token_group * 4
+                for token_sel in cutlass.range_constexpr(2):
+                    value_idx = 2 * m_sub + token_sel
+                    r_fp32[2 * value_idx] = (
+                        accumulators[accum_base + token_sel]
+                        * fc2_act_weight_dequant_scale
+                    )
+                    r_fp32[2 * value_idx + 1] = (
+                        accumulators[accum_base + 2 + token_sel]
+                        * fc2_act_weight_dequant_scale
+                    )
+            r_pack = cute.make_rmem_tensor(8, cutlass.BFloat16)
+            r_pack.store(r_fp32.load().to(cutlass.BFloat16))
+            o0, o1, o2, o3 = transpose_token_group_bf16x8(r_pack, lane_group)
+
+            # Lane-group bits: M64 fragment, token row, 8-column half.
+            lane_group_bit2 = (lane_group >> cutlass.Int32(2)) & cutlass.Int32(1)
+            lane_group_bit1 = (lane_group >> cutlass.Int32(1)) & cutlass.Int32(1)
+            lane_group_bit0 = lane_group & cutlass.Int32(1)
+            token = token0 + lane_group_bit1
+            hidden = (
+                hidden_base
+                + lane_group_bit2 * cutlass.Int32(64)
+                + cutlass.Int32(local_warp_idx * 16)
+                + lane_group_bit0 * cutlass.Int32(8)
+            )
+            g_out = cute.slice_(real_fc2_output, (None, None, 0))
+            if token < valid_tokens and hidden < valid_hidden:
+                stg_128b_bf16x8(
+                    g_out, o0, o1, o2, o3, token_tile_base + token, hidden,
+                )
+
+    @cute.jit
+    def _run_fc2_epilogue(
+        self,
+        work_tile_info,
+        accumulators: cute.Tensor,
+        n_half: cutlass.Constexpr,
+        sched_ext,
+        gmem_fc2_output: cute.Tensor,
+        valid_hidden,
+        local_warp_idx: int,
+        tidx,
+        _iket_active,
+        fc2_act_weight_dequant_scale,
+        token_comm_args=None,
+    ) -> None:
+        """Run the FC2 epilogue and store one swap-AB accumulator tile."""
+        real_fc2_output, _ = sched_ext.get_gmem_tensor(
+            "c", gmem_fc2_output, work_tile_info,
+        )
+        # Inner epilogue IKET range for swap-AB FC2. WGMMA and any blockwise
+        # accumulator scaling have already finished. This shared path converts
+        # all token-group fragments to BF16 and performs token-major GMEM STG.
+        if _iket_active:
+            iket.range_push(self._iket_fc2_epilogue_range)
+
+        token_tile_base = work_tile_info.tile_n_idx * cutlass.Int32(
+            self._token_tile_n
+        )
+        pool_token_base = (
+            work_tile_info.cumulative_data_physical_row + token_tile_base
+        )
+
+        for token_group in cutlass.range_constexpr(self._token_group_count):
+            self._run_fc2_token_group_swapab(
+                work_tile_info=work_tile_info,
+                token_group=token_group,
+                accumulators=accumulators,
+                n_half=n_half,
+                real_fc2_output=real_fc2_output,
+                valid_hidden=valid_hidden,
+                token_tile_base=token_tile_base,
+                pool_token_base=pool_token_base,
+                local_warp_idx=local_warp_idx,
+                tidx=tidx,
+                fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
+                token_comm_args=token_comm_args,
+            )
+
+        if _iket_active:
+            iket.range_pop()  # swapab_fc2_epi_m{token_tile_n}n128
+
+
+    @cute.jit
+    def _run_fc1_half_tile(
+        self,
+        work_tile_info,
+        local_warp_idx: int,
+        tiled_mma,
+        tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
+        accumulators: cute.Tensor,
+        accum_temp: cute.Tensor,
+        n_half: cutlass.Constexpr,
+        ab_pipeline,
+        weight_sf_pipeline,
+        ab_consumer_state,
+        k_tile_cnt_fc1,
+        k_tile_cnt_fc2,
+        _iket_active,
+        run_wgmma_task_tile: cutlass.Constexpr,
+        smem_fc1_output_buffer: cute.Tensor,
+        smem_fc1_amax: cute.Tensor,
+        tma_atom_fc1_output: cute.CopyAtom,
+        sched_ext,
+        gmem_fc1_output: cute.Tensor,
+        gmem_fc1_output_sf: cute.Tensor,
+        smem_activation_sf: cute.Tensor,
+        smem_weight_sf: cute.Tensor,
+        gmem_topk_scores: cute.Tensor,
+        tidx,
+        fc1_act_weight_dequant_scale,
+        fc2_act_dequant_scale,
+        norm_const,
+        storage_group_idx,
+        math_wg_order_barrier,
+        math_wg_order_state,
+        epi_wg_order_barrier,
+        epi_wg_order_state,
+        gmem_fc1_c,
+    ):
+        if cutlass.const_expr(self._pingpong_order):
+            if _iket_active:
+                iket.range_push("pp_swap_fc1_math_wait")
+            math_wg_order_barrier.wait(math_wg_order_state)
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc1_wgmma")
+        ab_consumer_state = run_wgmma_task_tile(
+            work_tile_info=work_tile_info,
+            local_warp_idx=local_warp_idx,
+            tiled_mma=tiled_mma,
+            tCrA=tCrA,
+            tCrB=tCrB,
+            accumulators=accumulators,
+            accum_temp=accum_temp,
+            n_half=n_half,
+            ab_pipeline=ab_pipeline,
+            weight_sf_pipeline=weight_sf_pipeline,
+            ab_consumer_state=ab_consumer_state,
+            smem_activation_sf=smem_activation_sf,
+            smem_weight_sf=smem_weight_sf,
+            k_tile_cnt_fc1=k_tile_cnt_fc1,
+            k_tile_cnt_fc2=k_tile_cnt_fc2,
+            _iket_active=_iket_active,
+            tidx=tidx,
+        )
+        if cutlass.const_expr(self._pingpong_order):
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc1_math_handoff")
+            math_wg_order_state = math_wg_order_barrier.arrive(
+                math_wg_order_state
+            )
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc1_epi_wait")
+            epi_wg_order_barrier.wait(epi_wg_order_state)
+            if _iket_active:
+                iket.range_pop()
+        self._run_fc1_epilogue(
+            work_tile_info=work_tile_info,
+            accumulators=accumulators,
+            n_half=n_half,
+            smem_fc1_output_buffer=smem_fc1_output_buffer,
+            smem_fc1_amax=smem_fc1_amax,
+            tma_atom_fc1_output=tma_atom_fc1_output,
+            sched_ext=sched_ext,
+            gmem_fc1_output=gmem_fc1_output,
+            gmem_fc1_output_sf=gmem_fc1_output_sf,
+            gmem_topk_scores=gmem_topk_scores,
+            local_warp_idx=local_warp_idx,
+            tidx=tidx,
+            _iket_active=_iket_active,
+            fc1_act_weight_dequant_scale=fc1_act_weight_dequant_scale,
+            fc2_act_dequant_scale=fc2_act_dequant_scale,
+            norm_const=norm_const,
+            storage_group_idx=storage_group_idx,
+            gmem_fc1_c=gmem_fc1_c,
+        )
+        return ab_consumer_state, math_wg_order_state, epi_wg_order_state
+
+    @cute.jit
+    def _run_fc2_half_tile(
+        self,
+        work_tile_info,
+        local_warp_idx: int,
+        tiled_mma,
+        tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
+        accumulators: cute.Tensor,
+        accum_temp: cute.Tensor,
+        n_half: cutlass.Constexpr,
+        ab_pipeline,
+        weight_sf_pipeline,
+        ab_consumer_state,
+        k_tile_cnt_fc1,
+        k_tile_cnt_fc2,
+        _iket_active,
+        run_wgmma_task_tile: cutlass.Constexpr,
+        sched_ext,
+        gmem_fc2_output: cute.Tensor,
+        smem_activation_sf: cute.Tensor,
+        smem_weight_sf: cute.Tensor,
+        valid_hidden,
+        tidx,
+        fc2_act_weight_dequant_scale,
+        math_wg_order_barrier,
+        math_wg_order_state,
+        epi_wg_order_barrier,
+        epi_wg_order_state,
+        token_comm_args=None,
+    ):
+        if cutlass.const_expr(self._pingpong_order):
+            if _iket_active:
+                iket.range_push("pp_swap_fc2_math_wait")
+            math_wg_order_barrier.wait(math_wg_order_state)
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc2_wgmma")
+        ab_consumer_state = run_wgmma_task_tile(
+            work_tile_info=work_tile_info,
+            local_warp_idx=local_warp_idx,
+            tiled_mma=tiled_mma,
+            tCrA=tCrA,
+            tCrB=tCrB,
+            accumulators=accumulators,
+            accum_temp=accum_temp,
+            n_half=n_half,
+            ab_pipeline=ab_pipeline,
+            weight_sf_pipeline=weight_sf_pipeline,
+            ab_consumer_state=ab_consumer_state,
+            smem_activation_sf=smem_activation_sf,
+            smem_weight_sf=smem_weight_sf,
+            k_tile_cnt_fc1=k_tile_cnt_fc1,
+            k_tile_cnt_fc2=k_tile_cnt_fc2,
+            _iket_active=_iket_active,
+            tidx=tidx,
+        )
+        if cutlass.const_expr(self._pingpong_order):
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc2_math_handoff")
+            math_wg_order_state = math_wg_order_barrier.arrive(
+                math_wg_order_state
+            )
+            if _iket_active:
+                iket.range_pop()
+                iket.range_push("pp_swap_fc2_epi_wait")
+            epi_wg_order_barrier.wait(epi_wg_order_state)
+            if _iket_active:
+                iket.range_pop()
+        self._run_fc2_epilogue(
+            work_tile_info=work_tile_info,
+            accumulators=accumulators,
+            n_half=n_half,
+            sched_ext=sched_ext,
+            gmem_fc2_output=gmem_fc2_output,
+            valid_hidden=valid_hidden,
+            local_warp_idx=local_warp_idx,
+            tidx=tidx,
+            _iket_active=_iket_active,
+            fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
+            token_comm_args=token_comm_args,
+        )
+        return ab_consumer_state, math_wg_order_state, epi_wg_order_state
+
+    @cute.jit
+    def fc1_store_offload_server_swapab(
+        self,
+        sC: cute.Tensor,
+        tma_atom_fc1_output: cute.CopyAtom,
+        gmem_fc1_output: cute.Tensor,
+        fc1_offload_full_mbar_ptr,
+        fc1_offload_empty_mbar_ptr,
+        fc1_offload_mbox,
+        *,
+        num_slots: cutlass.Constexpr,
+        num_wgs: cutlass.Constexpr,
+    ) -> None:
+        """Empty-warp FC1 store server (swap-AB).
+
+        One slot per epilogue WG (depth 1).  Blocks on each slot in
+        round-robin: rebuilds the destination from the mailbox, issues the
+        TMA store, waits FULL completion, release-publishes fc1_done, and
+        frees the slot.  Exits after one valid_tokens == -1 sentinel per
+        WG.  Because the epilogue only R2S-stages and hands off (never
+        waits the store), its consume_next overlaps this drain.
+        """
+        done_wgs = cutlass.Int32(0)
+        slot = cutlass.Int32(0)
+        phases = cutlass.Int32(0)
+        while done_wgs < cutlass.Int32(num_wgs):
+            cute.arch.mbarrier_wait(
+                fc1_offload_full_mbar_ptr + slot,
+                (phases >> slot) & cutlass.Int32(1),
+            )
+            base = slot * cutlass.Int32(5)
+            valid_tokens = cutlass.Int32(fc1_offload_mbox[base + 3])
+            if valid_tokens == cutlass.Int32(-1):
+                done_wgs = done_wgs + cutlass.Int32(1)
+            else:
+                token_off = cutlass.Int32(fc1_offload_mbox[base + 0])
+                tile_n_idx = cutlass.Int32(fc1_offload_mbox[base + 1])
+                output_n_tile = cutlass.Int32(fc1_offload_mbox[base + 2])
+                flag_addr = Int64(fc1_offload_mbox[base + 4])
+                real_fc1_output = cute.domain_offset(
+                    (token_off, 0, 0), gmem_fc1_output
+                )
+                g_view = cute.local_tile(
+                    real_fc1_output,
+                    (self._token_tile_n, Fc1EpilogueStoreTileN, 1),
+                    (tile_n_idx, output_n_tile, 0),
+                )
+                tma_store_fc1_output(
+                    sC,
+                    slot,
+                    tma_atom_fc1_output,
+                    g_view,
+                    valid_tokens,
+                )
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0)
+                cute.arch.sync_warp()
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    flag_ptr = cute.make_ptr(
+                        cutlass.Int32,
+                        flag_addr,
+                        cute.AddressSpace.gmem,
+                        assumed_align=4,
+                    )
+                    red_add_release_gpu_s32(flag_ptr, cutlass.Int32(1))
+            phases = phases ^ (cutlass.Int32(1) << slot)
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive(fc1_offload_empty_mbar_ptr + slot)
+            cute.arch.sync_warp()
+            slot = (slot + cutlass.Int32(1)) % cutlass.Int32(num_slots)
+
+    @cute.jit
+    def run(
+        self,
+        sched_consumer,
+        sched_ext,
+        smem_fc1_output_buffer: cute.Tensor,
+        smem_fc1_amax: cute.Tensor,
+        tma_atom_fc1_output: cute.CopyAtom,
+        gmem_fc1_output: cute.Tensor,
+        gmem_fc1_output_sf: cute.Tensor,
+        smem_activation_sf: cute.Tensor,
+        smem_weight_sf: cute.Tensor,
+        gmem_topk_scores: cute.Tensor,
+        gmem_fc2_output: cute.Tensor,
+        gmem_fc1_done_counter: cute.Tensor,
+        local_warp_idx: int,
+        tidx,
+        fc1_activation_dequant_scale: cute.Tensor,
+        fc1_weight_dequant_scale: cute.Tensor,
+        fc2_activation_dequant_scale: cute.Tensor,
+        fc2_weight_dequant_scale: cute.Tensor,
+        norm_const,
+        tiled_mma,
+        tCrA: cute.Tensor,
+        tCrB: cute.Tensor,
+        accumulators: cute.Tensor,
+        accum_temp: cute.Tensor,
+        run_wgmma_task_tile: cutlass.Constexpr,
+        ab_pipeline,
+        weight_sf_pipeline,
+        ab_consumer_state,
+        k_tile_cnt_fc1,
+        k_tile_cnt_fc2,
+        _iket_active,
+        n_half,
+        warpgroup_idx,
+        math_wg_order_barrier,
+        epi_wg_order_barrier,
+        fc1_offload_full_mbar_ptr=None,
+        fc1_offload_empty_mbar_ptr=None,
+        fc1_offload_mbox=None,
+        token_comm_args=None,
+        gmem_fc1_c=None,
+    ) -> None:
+        """
+        Run the full FP8 fc1+fc2 fused MMA+epilogue task-tile loop.
+
+        ``token_comm_args`` (MegaMoE path) is forwarded to the fc2 task tile so
+        the fc2 STG is routed to the source rank's combine output.
+        """
+        task_tile_boundary_bar = pipeline.NamedBarrier(
+            barrier_id=(
+                self._epilog_sync_bar_id + warpgroup_idx
+                if cutlass.const_expr(self._pingpong)
+                else self._epilog_sync_bar_id
+            ),
+            num_threads=(
+                EpiWarpCount * WarpThreadCount
+                if cutlass.const_expr(self._pingpong)
+                else WarpThreadCount * len(self._epilogue_warp_ids)
+            ),
+        )
+
+        valid_hidden = cutlass.Int32(gmem_fc2_output.shape[1])
+        if _iket_active:
+            iket.range_push("swapab_sched_consume_initial")
+        if cutlass.const_expr(self._pingpong):
+            (
+                sched_consumer,
+                work_tile_info,
+                ab_consumer_state,
+            ) = consume_initial_pingpong_work(
+                sched_consumer,
+                warpgroup_idx,
+                ab_consumer_state,
+                k_tile_cnt_fc1,
+                k_tile_cnt_fc2,
+            )
+        else:
+            work_tile_info = sched_consumer.consume_work()
+        if _iket_active:
+            iket.range_pop()
+
+        flag_tracker = GpuReleaseFlagBatchTracker(
+            flag_addr=Int64(0),
+            cumulated_flags=cutlass.Int32(0),
+            phase=cutlass.Int32(work_tile_info.phase),
+            tid=tidx % (
+                EpiWarpCount * WarpThreadCount
+                if self._pingpong
+                else len(self._epilogue_warp_ids) * WarpThreadCount
+            ),
+        )
+        if cutlass.const_expr(self._pingpong):
+            math_wg_order_state = math_wg_order_barrier.state.clone()
+            epi_wg_order_state = epi_wg_order_barrier.state.clone()
+        else:
+            math_wg_order_state = ab_consumer_state.clone()
+            epi_wg_order_state = ab_consumer_state.clone()
+
+        # Offload: one empty-mbar phase bit per warp (its WG's slot).
+        fc1_off_phase = cutlass.Int32(0)
+        while work_tile_info.is_valid_tile:
+            # Outer task-tile range, emitted by local warp 0 of each epilogue
+            # warpgroup. It starts
+            # before expert-scale setup and contains the representative WGMMA
+            # child range plus that warp's representative epilogue child
+            # ranges. FC1 also includes final TMA STG issue; async drain,
+            # task-boundary synchronization, and next-tile scheduling follow
+            # after the matching pop below.
+            if _iket_active:
+                if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                    if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                        iket.range_push("swapab_fc1_task_bw")
+                    else:
+                        iket.range_push("swapab_fc1_task_pt")
+                else:
+                    if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                        iket.range_push("swapab_fc2_task_bw")
+                    else:
+                        iket.range_push("swapab_fc2_task_pt")
+
+            expert_idx = work_tile_info.expert_idx
+            if cutlass.const_expr(self.fp8_scale_mode == "blockwise"):
+                fc1_act_weight_dequant_scale = Float32(1.0)
+                fc2_act_dequant_scale = Float32(1.0)
+                fc2_act_weight_dequant_scale = Float32(1.0)
+            else:
+                fc1_act_weight_dequant_scale = (
+                    Float32(fc1_activation_dequant_scale[0])
+                    * Float32(fc1_weight_dequant_scale[expert_idx])
+                )
+                fc2_act_dequant_scale = Float32(
+                    fc2_activation_dequant_scale[0]
+                )
+                fc2_act_weight_dequant_scale = (
+                    fc2_act_dequant_scale
+                    * Float32(fc2_weight_dequant_scale[expert_idx])
+                )
+
+            if work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1):
+                if cutlass.const_expr(self._fc1_store_offload):
+                    # Acquire this WG's store slot from the server before
+                    # the R2S reuses it (pre-armed once at init).
+                    cute.arch.mbarrier_wait(
+                        fc1_offload_empty_mbar_ptr + warpgroup_idx,
+                        fc1_off_phase & cutlass.Int32(1),
+                    )
+                    fc1_off_phase = fc1_off_phase + cutlass.Int32(1)
+                if cutlass.const_expr(self._wgmma_fragment_count == 1):
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc1_half_tile(
+                        work_tile_info=work_tile_info,
+                        local_warp_idx=local_warp_idx,
+                        tiled_mma=tiled_mma,
+                        tCrA=tCrA,
+                        tCrB=tCrB,
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        n_half=0,
+                        ab_pipeline=ab_pipeline,
+                        weight_sf_pipeline=weight_sf_pipeline,
+                        ab_consumer_state=ab_consumer_state,
+                        k_tile_cnt_fc1=k_tile_cnt_fc1,
+                        k_tile_cnt_fc2=k_tile_cnt_fc2,
+                        _iket_active=_iket_active,
+                        smem_fc1_output_buffer=smem_fc1_output_buffer,
+                        smem_fc1_amax=smem_fc1_amax,
+                        tma_atom_fc1_output=tma_atom_fc1_output,
+                        sched_ext=sched_ext,
+                        gmem_fc1_output=gmem_fc1_output,
+                        gmem_fc1_output_sf=gmem_fc1_output_sf,
+                        smem_activation_sf=smem_activation_sf,
+                        smem_weight_sf=smem_weight_sf,
+                        gmem_topk_scores=gmem_topk_scores,
+                        tidx=tidx,
+                        fc1_act_weight_dequant_scale=fc1_act_weight_dequant_scale,
+                        fc2_act_dequant_scale=fc2_act_dequant_scale,
+                        norm_const=norm_const,
+                        run_wgmma_task_tile=run_wgmma_task_tile,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 0
+                        ),
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
+                        gmem_fc1_c=gmem_fc1_c,
+                    )
+                    self._store_fc1_task_tile(
+                        work_tile_info=work_tile_info,
+                        smem_fc1_output_buffer=smem_fc1_output_buffer,
+                        tma_atom_fc1_output=tma_atom_fc1_output,
+                        sched_ext=sched_ext,
+                        gmem_fc1_output=gmem_fc1_output,
+                        local_warp_idx=local_warp_idx,
+                        n_half=0,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 0
+                        ),
+                        _iket_active=_iket_active,
+
+                        gmem_fc1_done_counter=gmem_fc1_done_counter,
+                        fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
+                        fc1_offload_mbox=fc1_offload_mbox,
+                    )
+                elif n_half == cutlass.Int32(0):
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc1_half_tile(
+                        work_tile_info=work_tile_info,
+                        local_warp_idx=local_warp_idx,
+                        tiled_mma=tiled_mma,
+                        tCrA=tCrA,
+                        tCrB=tCrB,
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        n_half=0,
+                        ab_pipeline=ab_pipeline,
+                        weight_sf_pipeline=weight_sf_pipeline,
+                        ab_consumer_state=ab_consumer_state,
+                        k_tile_cnt_fc1=k_tile_cnt_fc1,
+                        k_tile_cnt_fc2=k_tile_cnt_fc2,
+                        _iket_active=_iket_active,
+                        smem_fc1_output_buffer=smem_fc1_output_buffer,
+                        smem_fc1_amax=smem_fc1_amax,
+                        tma_atom_fc1_output=tma_atom_fc1_output,
+                        sched_ext=sched_ext,
+                        gmem_fc1_output=gmem_fc1_output,
+                        gmem_fc1_output_sf=gmem_fc1_output_sf,
+                        smem_activation_sf=smem_activation_sf,
+                        smem_weight_sf=smem_weight_sf,
+                        gmem_topk_scores=gmem_topk_scores,
+                        tidx=tidx,
+                        fc1_act_weight_dequant_scale=fc1_act_weight_dequant_scale,
+                        fc2_act_dequant_scale=fc2_act_dequant_scale,
+                        norm_const=norm_const,
+                        run_wgmma_task_tile=run_wgmma_task_tile,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 0
+                        ),
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
+                        gmem_fc1_c=gmem_fc1_c,
+                    )
+                    self._store_fc1_task_tile(
+                        work_tile_info=work_tile_info,
+                        smem_fc1_output_buffer=smem_fc1_output_buffer,
+                        tma_atom_fc1_output=tma_atom_fc1_output,
+                        sched_ext=sched_ext,
+                        gmem_fc1_output=gmem_fc1_output,
+                        local_warp_idx=local_warp_idx,
+                        n_half=0,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 0
+                        ),
+                        _iket_active=_iket_active,
+
+                        gmem_fc1_done_counter=gmem_fc1_done_counter,
+                        fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
+                        fc1_offload_mbox=fc1_offload_mbox,
+                    )
+                else:
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc1_half_tile(
+                        work_tile_info=work_tile_info,
+                        local_warp_idx=local_warp_idx,
+                        tiled_mma=tiled_mma,
+                        tCrA=tCrA,
+                        tCrB=tCrB,
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        n_half=1,
+                        ab_pipeline=ab_pipeline,
+                        weight_sf_pipeline=weight_sf_pipeline,
+                        ab_consumer_state=ab_consumer_state,
+                        k_tile_cnt_fc1=k_tile_cnt_fc1,
+                        k_tile_cnt_fc2=k_tile_cnt_fc2,
+                        _iket_active=_iket_active,
+                        smem_fc1_output_buffer=smem_fc1_output_buffer,
+                        smem_fc1_amax=smem_fc1_amax,
+                        tma_atom_fc1_output=tma_atom_fc1_output,
+                        sched_ext=sched_ext,
+                        gmem_fc1_output=gmem_fc1_output,
+                        gmem_fc1_output_sf=gmem_fc1_output_sf,
+                        smem_activation_sf=smem_activation_sf,
+                        smem_weight_sf=smem_weight_sf,
+                        gmem_topk_scores=gmem_topk_scores,
+                        tidx=tidx,
+                        fc1_act_weight_dequant_scale=fc1_act_weight_dequant_scale,
+                        fc2_act_dequant_scale=fc2_act_dequant_scale,
+                        norm_const=norm_const,
+                        run_wgmma_task_tile=run_wgmma_task_tile,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 1
+                        ),
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
+                        gmem_fc1_c=gmem_fc1_c,
+                    )
+                    self._store_fc1_task_tile(
+                        work_tile_info=work_tile_info,
+                        smem_fc1_output_buffer=smem_fc1_output_buffer,
+                        tma_atom_fc1_output=tma_atom_fc1_output,
+                        sched_ext=sched_ext,
+                        gmem_fc1_output=gmem_fc1_output,
+                        local_warp_idx=local_warp_idx,
+                        n_half=1,
+                        storage_group_idx=(
+                            warpgroup_idx if self._pingpong else 1
+                        ),
+                        _iket_active=_iket_active,
+
+                        gmem_fc1_done_counter=gmem_fc1_done_counter,
+                        fc1_offload_full_mbar_ptr=fc1_offload_full_mbar_ptr,
+                        fc1_offload_mbox=fc1_offload_mbox,
+                    )
+            else:
+                if cutlass.const_expr(self._wgmma_fragment_count == 1):
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc2_half_tile(
+                        work_tile_info=work_tile_info,
+                        local_warp_idx=local_warp_idx,
+                        tiled_mma=tiled_mma,
+                        tCrA=tCrA,
+                        tCrB=tCrB,
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        n_half=0,
+                        ab_pipeline=ab_pipeline,
+                        weight_sf_pipeline=weight_sf_pipeline,
+                        ab_consumer_state=ab_consumer_state,
+                        k_tile_cnt_fc1=k_tile_cnt_fc1,
+                        k_tile_cnt_fc2=k_tile_cnt_fc2,
+                        _iket_active=_iket_active,
+                        sched_ext=sched_ext,
+                        gmem_fc2_output=gmem_fc2_output,
+                        smem_activation_sf=smem_activation_sf,
+                        smem_weight_sf=smem_weight_sf,
+                        valid_hidden=valid_hidden,
+                        tidx=tidx,
+                        fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
+                        token_comm_args=token_comm_args,
+                        run_wgmma_task_tile=run_wgmma_task_tile,
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
+                    )
+                elif n_half == cutlass.Int32(0):
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc2_half_tile(
+                        work_tile_info=work_tile_info,
+                        local_warp_idx=local_warp_idx,
+                        tiled_mma=tiled_mma,
+                        tCrA=tCrA,
+                        tCrB=tCrB,
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        n_half=0,
+                        ab_pipeline=ab_pipeline,
+                        weight_sf_pipeline=weight_sf_pipeline,
+                        ab_consumer_state=ab_consumer_state,
+                        k_tile_cnt_fc1=k_tile_cnt_fc1,
+                        k_tile_cnt_fc2=k_tile_cnt_fc2,
+                        _iket_active=_iket_active,
+                        sched_ext=sched_ext,
+                        gmem_fc2_output=gmem_fc2_output,
+                        smem_activation_sf=smem_activation_sf,
+                        smem_weight_sf=smem_weight_sf,
+                        valid_hidden=valid_hidden,
+                        tidx=tidx,
+                        fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
+                        token_comm_args=token_comm_args,
+                        run_wgmma_task_tile=run_wgmma_task_tile,
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
+                    )
+                else:
+                    (
+                        ab_consumer_state,
+                        math_wg_order_state,
+                        epi_wg_order_state,
+                    ) = self._run_fc2_half_tile(
+                        work_tile_info=work_tile_info,
+                        local_warp_idx=local_warp_idx,
+                        tiled_mma=tiled_mma,
+                        tCrA=tCrA,
+                        tCrB=tCrB,
+                        accumulators=accumulators,
+                        accum_temp=accum_temp,
+                        n_half=1,
+                        ab_pipeline=ab_pipeline,
+                        weight_sf_pipeline=weight_sf_pipeline,
+                        ab_consumer_state=ab_consumer_state,
+                        k_tile_cnt_fc1=k_tile_cnt_fc1,
+                        k_tile_cnt_fc2=k_tile_cnt_fc2,
+                        _iket_active=_iket_active,
+                        sched_ext=sched_ext,
+                        gmem_fc2_output=gmem_fc2_output,
+                        smem_activation_sf=smem_activation_sf,
+                        smem_weight_sf=smem_weight_sf,
+                        valid_hidden=valid_hidden,
+                        tidx=tidx,
+                        fc2_act_weight_dequant_scale=fc2_act_weight_dequant_scale,
+                        token_comm_args=token_comm_args,
+                        run_wgmma_task_tile=run_wgmma_task_tile,
+                        math_wg_order_barrier=math_wg_order_barrier,
+                        math_wg_order_state=math_wg_order_state,
+                        epi_wg_order_barrier=epi_wg_order_barrier,
+                        epi_wg_order_state=epi_wg_order_state,
+                    )
+            # Matches the selected swapab_fc1/fc2_task_* range above.
+            if _iket_active:
+                iket.range_pop()
+
+            cur_was_linear1 = work_tile_info.phase == cutlass.Int32(BlockPhase.Linear1)
+            # The swap-AB token axis is GEMM N. Keep one FC1-done slot per CTA
+            # token tile because cluster peers produce independent workspace
+            # rows and do not form a cooperative two-CTA MMA.
+            cur_fc1_counter_slot = (
+                cutlass.Int32(self._cluster_n)
+                * work_tile_info.cumulative_token_block_count
+                + work_tile_info.tile_n_idx
+            )
+            cur_fc2_expert_idx = work_tile_info.expert_idx
+
+            if cutlass.const_expr(self._early_fc1_pub):
+                if cur_was_linear1:
+                    # Drain this WG's FC1 bulk stores and publish the tile
+                    # flag now -- the pre-consume hoist.  The per-WG +1 is
+                    # matched by the kernel's x2 fc2 spin threshold.
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    cute.arch.fence_acq_rel_gpu()
+                    if local_warp_idx == cutlass.Int32(0):
+                        if cute.arch.lane_idx() == cutlass.Int32(0):
+                            _early_ptr = (
+                                gmem_fc1_done_counter.iterator
+                                + cur_fc1_counter_slot
+                            )
+                            red_add_release_gpu_s32(
+                                _early_ptr, cutlass.Int32(1)
+                            )
+
+            if cutlass.const_expr(self._pingpong_order):
+                # Match CUTLASS ping-pong ordering: retire the current FC1
+                # bulk-store group and hand epilogue ownership to the peer WG
+                # before waiting for the descriptor two positions ahead.
+                if _iket_active:
+                    if cur_was_linear1:
+                        iket.range_push("pp_swap_fc1_retire_handoff")
+                    else:
+                        iket.range_push("pp_swap_fc2_retire_handoff")
+                if cur_was_linear1:
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    cute.arch.fence_acq_rel_gpu()
+                    flag_tracker = flag_tracker.accumulate(
+                        work_tile_info.phase,
+                        1,
+                        (
+                            gmem_fc1_done_counter.iterator
+                            + cur_fc1_counter_slot
+                        ).toint(),
+                    )
+                else:
+                    if cutlass.const_expr(self._token_back_by_dispatch):
+                        # All four warps must finish STG before the leader
+                        # publishes this task's FC2 completion counter.
+                        task_tile_boundary_bar.arrive_and_wait()
+                        cute.arch.fence_acq_rel_gpu()
+                        fc2_flag_addr = (
+                            token_comm_args.fc2_done_counter.iterator
+                            + cur_fc2_expert_idx
+                        ).toint()
+                    else:
+                        fc2_flag_addr = Int64(0)
+                    flag_tracker = flag_tracker.accumulate(
+                        work_tile_info.phase,
+                        1,
+                        fc2_flag_addr,
+                        not self._token_back_by_dispatch,
+                    )
+                epi_wg_order_state = epi_wg_order_barrier.arrive(
+                    epi_wg_order_state
+                )
+                if _iket_active:
+                    iket.range_pop()
+
+            if _iket_active:
+                iket.range_push("swapab_sched_consume_next")
+            if cutlass.const_expr(self._pingpong):
+                (
+                    sched_consumer,
+                    work_tile_info,
+                    ab_consumer_state,
+                ) = consume_next_pingpong_work(
+                    sched_consumer,
+                    ab_consumer_state,
+                    k_tile_cnt_fc1,
+                    k_tile_cnt_fc2,
+                )
+            else:
+                work_tile_info = sched_consumer.consume_work()
+            if _iket_active:
+                iket.range_pop()
+
+            # Drain fc1 TMA/STG stores before publishing the fc1-done counter.
+            # Offload: the empty-warp server owns the drain + publish, so the
+            # epilogue neither drains nor accumulates here.
+            if cur_was_linear1 and cutlass.const_expr(
+                not self._pingpong_order and not self._fc1_store_offload
+            ):
+                if _iket_active:
+                    iket.range_push("swapab_fc1_store_drain")
+                cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                cute.arch.fence_acq_rel_gpu()
+                if _iket_active:
+                    iket.range_pop()
+
+            if _iket_active:
+                iket.range_push("swapab_task_boundary_barrier")
+            if cutlass.const_expr(not self._pingpong):
+                task_tile_boundary_bar.arrive_and_wait()
+            if _iket_active:
+                iket.range_pop()
+
+            if cur_was_linear1 and cutlass.const_expr(
+                not self._pingpong_order
+            ):
+                if _iket_active:
+                    iket.range_push("swapab_fc1_done_flag_accumulate")
+                if cutlass.const_expr(
+                    not self._early_fc1_pub and not self._fc1_store_offload
+                ):
+                    flag_tracker = flag_tracker.accumulate(
+                        work_tile_info.phase,
+                        self._epi_fc1_batch,
+                        (
+                            gmem_fc1_done_counter.iterator
+                            + cur_fc1_counter_slot
+                        ).toint(),
+                    )
+                if _iket_active:
+                    iket.range_pop()
+            elif cutlass.const_expr(not self._pingpong_order):
+                if cutlass.const_expr(self._token_back_by_dispatch):
+                    # Fence before (deferred) counter release: make the fc2
+                    # pool-output STG writes device-visible.  The release
+                    # atomic in flag_tracker.fire() then signals completion.
+                    cute.arch.fence_acq_rel_gpu()
+                    fc2_flag_addr = (
+                        token_comm_args.fc2_done_counter.iterator + cur_fc2_expert_idx
+                    ).toint()
+                else:
+                    fc2_flag_addr = Int64(0)
+                no_fire: cutlass.Constexpr = not self._token_back_by_dispatch
+                if _iket_active:
+                    iket.range_push("swapab_fc2_done_flag_accumulate")
+                flag_tracker = flag_tracker.accumulate(
+                    work_tile_info.phase,
+                    self._epi_fc2_batch,
+                    fc2_flag_addr,
+                    no_fire,
+                )
+                if _iket_active:
+                    iket.range_pop()
+
+        if cutlass.const_expr(self._fc1_store_offload):
+            # Retire this WG's slot and send a sentinel so the server counts
+            # one finished WG (valid_tokens = -1).
+            cute.arch.mbarrier_wait(
+                fc1_offload_empty_mbar_ptr + warpgroup_idx,
+                fc1_off_phase & cutlass.Int32(1),
+            )
+            if local_warp_idx == cutlass.Int32(0):
+                if cute.arch.lane_idx() == cutlass.Int32(0):
+                    fc1_offload_mbox[
+                        warpgroup_idx * cutlass.Int32(5) + 3
+                    ] = Int64(-1)
+            cute.arch.mbarrier_arrive(
+                fc1_offload_full_mbar_ptr + warpgroup_idx
+            )
+
+        if _iket_active:
+            iket.range_push("swapab_done_flag_fire_tail")
+        flag_tracker.fire()
+        if _iket_active:
+            iket.range_pop()

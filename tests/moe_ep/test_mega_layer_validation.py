@@ -36,7 +36,7 @@ def _mega_layer(
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        DeepGemmMegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -44,7 +44,7 @@ def _mega_layer(
     )
 
     with mock.patch(
-        "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
     ):
         if transformed_weights is None:
             transformed_weights = _fake_deep_gemm_transformed()
@@ -60,7 +60,9 @@ def _mega_layer(
                 w2=torch.zeros(1, 128, 128),
             ),
             backend=MegaConfig(
-                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+                    intermediate_size=128, top_k=2
+                ),
                 quantize_input=quantize_input,
                 preprocess_weights=preprocess_weights,
                 transformed_weights=transformed_weights,
@@ -82,7 +84,7 @@ def _fake_symm_buffer(*, max_tokens: int = 64, hidden: int = 128, top_k: int = 2
 def test_mega_layer_requires_weights():
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        DeepGemmMegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -97,7 +99,9 @@ def test_mega_layer_requires_weights():
                 token_hidden_size=128,
             ),
             backend=MegaConfig(
-                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+                    intermediate_size=128, top_k=2
+                ),
                 transformed_weights=_fake_deep_gemm_transformed(),
             ),
         )
@@ -114,8 +118,18 @@ def test_mega_layer_forward_rejects_token_overflow():
         topk_ids=torch.zeros(65, 2, dtype=torch.int64),
         topk_weights=torch.zeros(65, 2),
     )
-    with pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"):
+    with (
+        mock.patch.object(layer, "_ensure_workspace") as ensure_workspace,
+        mock.patch.object(layer._kernel, "stage_inputs") as stage_inputs,
+        mock.patch.object(layer._kernel, "compute") as compute,
+        pytest.raises(MoEEpConfigError, match="max_tokens_per_rank"),
+    ):
         layer.forward(t)
+
+    ensure_workspace.assert_not_called()
+    stage_inputs.assert_not_called()
+    compute.assert_not_called()
+    assert layer._workspace is None  # type: ignore[attr-defined]
 
 
 def test_mega_layer_forward_accepts_partial_batch():
@@ -137,6 +151,46 @@ def test_mega_layer_forward_accepts_partial_batch():
     ):
         out = layer.forward(t)
     assert out.shape == (16, 128)
+
+
+def test_mega_layer_allocates_output_before_staging_round():
+    import torch
+
+    from flashinfer.moe_ep import MoEEpTensors
+
+    layer = _mega_layer()
+    layer._workspace = _fake_symm_buffer(max_tokens=64)  # type: ignore[attr-defined]
+    t = MoEEpTensors(
+        hidden_states=torch.zeros(8, 128, dtype=torch.bfloat16),
+        topk_ids=torch.zeros(8, 2, dtype=torch.int64),
+        topk_weights=torch.zeros(8, 2),
+    )
+    events: list[str] = []
+    real_empty = torch.empty
+
+    def allocate_output(*args, **kwargs):
+        events.append("allocate")
+        return real_empty(*args, **kwargs)
+
+    def stage_inputs(*args, **kwargs):
+        events.append("stage")
+
+    def compute(*args, output, **kwargs):
+        events.append("compute")
+        return output
+
+    with (
+        mock.patch(
+            "flashinfer.moe_ep.modes.mega_layer.torch.empty",
+            side_effect=allocate_output,
+        ),
+        mock.patch.object(layer._kernel, "stage_inputs", side_effect=stage_inputs),
+        mock.patch.object(layer._kernel, "compute", side_effect=compute),
+    ):
+        out = layer.forward(t)
+
+    assert events == ["allocate", "stage", "compute"]
+    assert out.shape == (8, 128)
 
 
 def test_mega_layer_forward_rejects_topk_mismatch():
@@ -238,7 +292,7 @@ def test_mega_layer_init_rejects_bootstrap_world_size_mismatch():
         _mega_layer()
 
 
-def test_mega_layer_forward_passes_quantize_input_to_kernel():
+def test_mega_layer_forward_passes_staging_context_to_kernel():
     import torch
 
     from flashinfer.moe_ep import MoEEpTensors
@@ -251,13 +305,20 @@ def test_mega_layer_forward_passes_quantize_input_to_kernel():
         topk_ids=torch.zeros(8, 2, dtype=torch.int64),
         topk_weights=torch.zeros(8, 2),
     )
+
+    def compute(*args, output, **kwargs):
+        return output
+
     with (
-        mock.patch.object(layer._kernel, "compute", return_value=t.hidden_states),
+        mock.patch.object(layer._kernel, "compute", side_effect=compute),
         mock.patch.object(layer._kernel, "stage_inputs") as stage_mock,
     ):
-        layer.forward(t)
+        out = layer.forward(t)
         stage_mock.assert_called_once()
         assert stage_mock.call_args.kwargs["quantize_input"] is True
+        assert "transformed_weights" not in stage_mock.call_args.kwargs
+        assert "output" not in stage_mock.call_args.kwargs
+        assert out.shape == (8, 128)
 
 
 def test_mega_layer_forward_skips_quantize_when_config_disabled():
@@ -310,7 +371,7 @@ def test_mega_layer_init_rejects_bad_fleet_weights(dist_not_initialized):
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        DeepGemmMegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpConfigError,
@@ -320,7 +381,7 @@ def test_mega_layer_init_rejects_bad_fleet_weights(dist_not_initialized):
 
     with (
         mock.patch(
-            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
         ),
         pytest.raises(MoEEpConfigError, match="num_experts // world_size"),
     ):
@@ -336,7 +397,9 @@ def test_mega_layer_init_rejects_bad_fleet_weights(dist_not_initialized):
                 w2=torch.zeros(4, 128, 128),
             ),
             backend=MegaConfig(
-                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+                    intermediate_size=128, top_k=2
+                ),
                 preprocess_weights=True,
             ),
         )
@@ -349,7 +412,7 @@ def test_mega_layer_init_skips_fleet_weights_when_transformed_supplied(
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        DeepGemmMegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -357,7 +420,7 @@ def test_mega_layer_init_skips_fleet_weights_when_transformed_supplied(
     )
 
     with mock.patch(
-        "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
     ):
         layer = MoEEpMegaLayer(
             bootstrap=BootstrapConfig(world_size=4, rank=0, auto_bootstrap=False),
@@ -371,7 +434,9 @@ def test_mega_layer_init_skips_fleet_weights_when_transformed_supplied(
                 w2=torch.zeros(4, 128, 128),
             ),
             backend=MegaConfig(
-                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+                    intermediate_size=128, top_k=2
+                ),
                 preprocess_weights=False,
                 transformed_weights=_fake_deep_gemm_transformed(num_experts=2),
             ),
@@ -417,15 +482,15 @@ def test_deep_gemm_stage_inputs_copy_path_stages_prequantized():
         pytest.skip("needs torch.float8_e4m3fn")
 
     from flashinfer.moe_ep import MoEEpTensors
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend import (
         DeepGemmMegaKernelBackend,
     )
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.config import (
-        DeepGemmMegaMoeConfig,
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.config import (
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
     )
 
     backend = DeepGemmMegaKernelBackend(
-        DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2)
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(intermediate_size=128, top_k=2)
     )
     num_tokens = 4
     hidden = 128
@@ -486,7 +551,7 @@ def test_deep_gemm_validate_transformed_weights_accepts_preprocess_output():
             f"deep_gemm transform requires sm_100a or sm_103a; got sm_{cap[0]}{cap[1]}"
         )
 
-    from flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.weights import (
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.weights import (
         preprocess_mega_weights,
         validate_transformed_mega_weights,
     )
@@ -522,7 +587,7 @@ def test_mega_layer_does_not_retain_pack_when_transformed_supplied():
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        DeepGemmMegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -535,7 +600,7 @@ def test_mega_layer_does_not_retain_pack_when_transformed_supplied():
     )
     ref = weakref.ref(pack)
     with mock.patch(
-        "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+        "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
     ):
         layer = MoEEpMegaLayer(
             bootstrap=BootstrapConfig(world_size=1, rank=0, auto_bootstrap=False),
@@ -546,7 +611,9 @@ def test_mega_layer_does_not_retain_pack_when_transformed_supplied():
             ),
             weights=pack,
             backend=MegaConfig(
-                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+                    intermediate_size=128, top_k=2
+                ),
                 preprocess_weights=False,
                 transformed_weights=_fake_deep_gemm_transformed(),
             ),
@@ -567,7 +634,7 @@ def test_mega_layer_releases_pack_after_preprocess(dist_not_initialized):
 
     from flashinfer.moe_ep import (
         BootstrapConfig,
-        DeepGemmMegaMoeConfig,
+        Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig,
         FleetParams,
         MegaConfig,
         MoEEpMegaLayer,
@@ -582,10 +649,10 @@ def test_mega_layer_releases_pack_after_preprocess(dist_not_initialized):
     sentinel = _fake_deep_gemm_transformed()
     with (
         mock.patch(
-            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend.validate_mega_arch"
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend.validate_mega_arch"
         ),
         mock.patch(
-            "flashinfer.moe_ep.backends.mega.kernel.deep_gemm_mega.backend."
+            "flashinfer.moe_ep.backends.mega.kernel.sm100.fp8_fp4_bf16_deepgemm.backend."
             "DeepGemmMegaKernelBackend.preprocess_weights",
             return_value=sentinel,
         ),
@@ -599,7 +666,9 @@ def test_mega_layer_releases_pack_after_preprocess(dist_not_initialized):
             ),
             weights=pack,
             backend=MegaConfig(
-                megakernel=DeepGemmMegaMoeConfig(intermediate_size=128, top_k=2),
+                megakernel=Sm100_Fp8_Fp4_Bf16_Deepgemm_MegaMoeConfig(
+                    intermediate_size=128, top_k=2
+                ),
                 preprocess_weights=True,
             ),
         )
@@ -632,9 +701,9 @@ def test_mega_layer_workspace_alloc_raises_during_capture():
 
 def test_shim_capture_guard_raises_when_capturing():
     """ensure_not_capturing raises with a warmup hint during capture."""
-    pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+    pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.comm import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         ensure_not_capturing,
     )
 
@@ -654,5 +723,189 @@ def test_mega_layer_warmup_requires_tensors_when_prestaged():
     from flashinfer.moe_ep import MoEEpConfigError
 
     layer = _mega_layer(quantize_input=False)
-    with pytest.raises(MoEEpConfigError, match="quantize_input=False"):
+    with (
+        mock.patch.object(layer, "_resolve_workspace") as resolve_workspace,
+        pytest.raises(MoEEpConfigError, match="quantize_input=False"),
+    ):
         layer.warmup()
+
+    resolve_workspace.assert_not_called()
+    assert layer._workspace is None  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("layout", ["fp32", "bf16", "broadcast", "strided", "mixed"])
+@pytest.mark.parametrize("mask", range(8))
+def test_nvfp4_stage_epilogues_preserve_copy_semantics(
+    monkeypatch, device, layout, mask
+):
+    import torch
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
+        backend as nvfp4_backend,
+    )
+
+    backend = nvfp4_backend.Nvfp4CutedslMegaKernelBackend(
+        nvfp4_backend.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=2
+        )
+    )
+    monkeypatch.setattr(nvfp4_backend, "stage_mega_moe_inputs", lambda *a, **kw: None)
+    names = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+    workspace = SimpleNamespace(
+        x=None,
+        x_sf=None,
+        topk_idx=None,
+        topk_weights=None,
+        **{name: torch.full((16,), -1.0, device=device) for name in names},
+    )
+    expected = {name: getattr(workspace, name).clone() for name in names}
+    sources = []
+    for i in range(3):
+        source = torch.arange(32, dtype=torch.float32, device=device) + i
+        if layout == "bf16" or (layout == "mixed" and i == 1):
+            source = source.to(torch.bfloat16)
+        if layout == "broadcast":
+            source = source[:1]
+        elif layout == "strided":
+            source = source[::2]
+        else:
+            source = source[:16]
+        sources.append(source)
+    t = MoEEpTensors(
+        hidden_states=torch.empty(0, 128, device=device),
+        topk_ids=None,
+        topk_weights=None,
+        **{
+            name: sources[i] if mask & (1 << i) else None
+            for i, name in enumerate(names)
+        },
+    )
+    for name in names:
+        source = getattr(t, name)
+        if source is not None:
+            expected[name].copy_(source)
+    backend.stage_inputs(t, workspace, quantize_input=True)
+    for source in sources:
+        source.add_(100)
+    for name in names:
+        torch.testing.assert_close(
+            getattr(workspace, name), expected[name], rtol=0, atol=0
+        )
+        setattr(t, name, None)
+    backend.stage_inputs(t, workspace, quantize_input=True)
+    for name in names:
+        torch.testing.assert_close(
+            getattr(workspace, name), expected[name], rtol=0, atol=0
+        )
+
+
+@pytest.mark.parametrize("layout", ["fp32", "bf16", "broadcast", "strided", "mixed"])
+def test_nvfp4_stage_epilogues_graph_shared_workspace(monkeypatch, layout):
+    import torch
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
+        backend as nvfp4_backend,
+    )
+
+    monkeypatch.setattr(nvfp4_backend, "stage_mega_moe_inputs", lambda *a, **kw: None)
+    names = ("fc1_alpha", "fc2_alpha", "fc1_norm_const")
+    workspace = SimpleNamespace(
+        x=None,
+        x_sf=None,
+        topk_idx=None,
+        topk_weights=None,
+        **{name: torch.zeros(16, device="cuda") for name in names},
+    )
+    layers = []
+    for layer in range(2):
+        backend = nvfp4_backend.Nvfp4CutedslMegaKernelBackend(
+            nvfp4_backend.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+                intermediate_size=128, top_k=2
+            )
+        )
+        sources = {}
+        for i, name in enumerate(names):
+            source = (
+                torch.arange(32, device="cuda", dtype=torch.float32) + 10 * layer + i
+            )
+            if layout == "bf16" or (layout == "mixed" and i == 1):
+                source = source.to(torch.bfloat16)
+            sources[name] = (
+                source[:1]
+                if layout == "broadcast"
+                else source[::2]
+                if layout == "strided"
+                else source[:16]
+            )
+        if layer == 1:
+            sources["fc2_alpha"] = None
+        t = MoEEpTensors(
+            hidden_states=torch.empty(0, 128, device="cuda"),
+            topk_ids=None,
+            topk_weights=None,
+            **sources,
+        )
+        backend.stage_inputs(t, workspace, quantize_input=True)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            backend.stage_inputs(t, workspace, quantize_input=True)
+        layers.append((graph, sources))
+    expected = {name: getattr(workspace, name).clone() for name in names}
+    for layer in (0, 1, 0, 1):
+        graph, sources = layers[layer]
+        for source in sources.values():
+            if source is not None:
+                source.add_(10)
+        graph.replay()
+        for name, source in sources.items():
+            if source is not None:
+                expected[name].copy_(source)
+            torch.testing.assert_close(
+                getattr(workspace, name), expected[name], rtol=0, atol=0
+            )
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_nvfp4_stage_epilogues_preserve_workspace_alias_order(monkeypatch, device):
+    import torch
+
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    from flashinfer.moe_ep import MoEEpTensors
+    from flashinfer.moe_ep.backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl import (
+        backend as nvfp4_backend,
+    )
+
+    backend = nvfp4_backend.Nvfp4CutedslMegaKernelBackend(
+        nvfp4_backend.Sm100_Nvfp4_Nvfp4_Bf16_Cutedsl_MegaMoeConfig(
+            intermediate_size=128, top_k=2
+        )
+    )
+    monkeypatch.setattr(nvfp4_backend, "stage_mega_moe_inputs", lambda *a, **kw: None)
+    workspace = SimpleNamespace(
+        x=None,
+        x_sf=None,
+        topk_idx=None,
+        topk_weights=None,
+        fc1_alpha=torch.ones(16, device=device),
+        fc2_alpha=torch.full((16,), 2.0, device=device),
+        fc1_norm_const=torch.ones(16, device=device),
+    )
+    t = MoEEpTensors(
+        hidden_states=torch.empty(0, 128, device=device),
+        topk_ids=None,
+        topk_weights=None,
+        fc1_alpha=workspace.fc2_alpha,
+        fc2_alpha=workspace.fc1_alpha,
+    )
+    backend.stage_inputs(t, workspace, quantize_input=True)
+    expected = torch.full((16,), 2.0, device=device)
+    torch.testing.assert_close(workspace.fc1_alpha, expected, rtol=0, atol=0)
+    torch.testing.assert_close(workspace.fc2_alpha, expected, rtol=0, atol=0)

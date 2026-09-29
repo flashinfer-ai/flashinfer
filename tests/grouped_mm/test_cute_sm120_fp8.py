@@ -25,6 +25,11 @@ import torch
 import torch.nn.functional as F
 
 from flashinfer.grouped_mm import moe_gemm_fp8_nt_groupwise
+from flashinfer.grouped_mm.cute_sm120_fp8_groupwise.core import (
+    _CuteSm120Fp8MoeRunner,
+    _FP8_MOE_GATED_TACTICS,
+    _FP8_MOE_PLAIN_TACTICS,
+)
 from flashinfer.testing.utils import per_block_cast_to_fp8, per_token_cast_to_fp8
 from flashinfer.utils import is_sm120a_supported
 
@@ -147,6 +152,28 @@ def test_moe_gemm_fp8_nt_groupwise_gated(num_experts, rows_per_expert, n, k):
     assert out.shape == (ref.shape[0], n)
     diff = calc_diff(out.float(), ref.float())
     assert diff < GATED_CALC_DIFF_THRESHOLD, f"gated calc_diff={diff:.6e}"
+
+
+@pytest.mark.parametrize(
+    "is_gated,tactic",
+    [(False, tactic) for tactic in _FP8_MOE_PLAIN_TACTICS]
+    + [(True, tactic) for tactic in _FP8_MOE_GATED_TACTICS],
+)
+@pytest.mark.parametrize("mpe", [1, 8, 12, 15, 16, 32, 64, 376])
+def test_moe_gemm_fp8_nt_groupwise_forced_tactic(tactic, is_gated, mpe):
+    skip_if_not_sm120()
+    a, b, a_scale, b_scale, m_indptr, ref = make_inputs(
+        [mpe] * 4, 256, 2176, is_gated=is_gated
+    )
+    out = torch.empty_like(ref)
+    runner = _CuteSm120Fp8MoeRunner(out, is_gated, (1, 128, 128), "MN")
+    runner(
+        [a, b, a_scale, b_scale, m_indptr],
+        tactic=tactic,
+    )
+    threshold = GATED_CALC_DIFF_THRESHOLD if is_gated else CALC_DIFF_THRESHOLD
+    diff = calc_diff(out.float(), ref.float())
+    assert diff < threshold, f"forced tactic calc_diff={diff:.6e}"
 
 
 @pytest.mark.parametrize(

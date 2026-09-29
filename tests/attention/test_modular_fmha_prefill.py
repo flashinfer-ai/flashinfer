@@ -881,6 +881,17 @@ def test_attention_prefill_mixed_v_dtype(
     )
     torch.testing.assert_close(o_uniform, o_ref_uniform, rtol=RTOL, atol=ATOL)
 
+    from flashinfer.cute_dsl.attention.wrappers.batch_prefill import (
+        _dsl_supports_expected_tx,
+    )
+
+    if not _dsl_supports_expected_tx():
+        # Pre-4.6 DSL: mixed V must be rejected with an actionable error
+        # (this asserts the version gate itself; uniform ran above).
+        with pytest.raises(NotImplementedError, match="nvidia-cutlass-dsl"):
+            wrapper.run(q, k, v, return_lse=True)
+        return
+
     o, lse = wrapper.run(q, k, v, return_lse=True)
     o_ref = attention_band_mask_ref(
         batch_size,

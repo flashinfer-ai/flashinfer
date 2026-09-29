@@ -202,12 +202,14 @@ class DSv3RoutingGroundTruth:
 
         for token_idx in range(self.num_tokens):
             # Create mask for selected groups
-            group_mask = torch.zeros(n_group, dtype=torch.float32, device=self.device)
-            group_mask[self.ref_group_indices[token_idx]] = 1.0
+            group_mask = torch.zeros(n_group, dtype=torch.bool, device=self.device)
+            group_mask[self.ref_group_indices[token_idx]] = True
             expert_mask = group_mask.repeat_interleave(self.experts_per_group)
 
             # Mask and select top-k experts
-            masked_biased_scores = self.biased_scores[token_idx] * expert_mask
+            masked_biased_scores = self.biased_scores[token_idx].masked_fill(
+                ~expert_mask, float("-inf")
+            )
             _, topk_idx = torch.topk(
                 masked_biased_scores, k=topk, dim=-1, largest=True, sorted=True
             )
@@ -318,18 +320,42 @@ class DSv3RoutingGroundTruth:
         This computes what experts SHOULD be selected if these groups were chosen.
         """
         # Create mask for specified groups
-        group_mask = torch.zeros(self.n_group, dtype=torch.float32, device=self.device)
+        group_mask = torch.zeros(self.n_group, dtype=torch.bool, device=self.device)
         for g in groups:
-            group_mask[g] = 1.0
+            group_mask[g] = True
         expert_mask = group_mask.repeat_interleave(self.experts_per_group)
 
         # Mask and select top-k experts
-        masked_biased_scores = self.biased_scores[token_idx] * expert_mask
+        masked_biased_scores = self.biased_scores[token_idx].masked_fill(
+            ~expert_mask, float("-inf")
+        )
         _, topk_idx = torch.topk(
             masked_biased_scores, k=self.topk, dim=-1, largest=True, sorted=True
         )
 
         return set(topk_idx.tolist())
+
+
+def test_ground_truth_excludes_unselected_groups_with_negative_scores():
+    scores = torch.zeros((1, 8), dtype=torch.float32)
+    bias = torch.tensor(
+        [[2.5, 1.5, 0.5, -1.5, 0.0, -0.1, -0.2, -0.3]],
+        dtype=torch.float32,
+    )
+
+    ground_truth = DSv3RoutingGroundTruth(
+        scores,
+        bias,
+        n_group=2,
+        topk_group=1,
+        topk=4,
+        routed_scaling_factor=1.0,
+        data_type=torch.float32,
+    )
+
+    expected = {0, 1, 2, 3}
+    assert set(ground_truth.ref_expert_indices[0].tolist()) == expected
+    assert ground_truth._get_topk_experts_from_groups(0, [0]) == expected
 
 
 def validate_expert_selection(ground_truth, topk_indices_kernel, topk_values_kernel):
@@ -418,6 +444,76 @@ def validate_values(ground_truth, topk_values_kernel, tokens_to_skip, data_type)
                 break
 
         raise
+
+
+@pytest.mark.parametrize("backend", ["default", "cake"])
+@pytest.mark.parametrize(
+    "num_experts,n_group,topk_group,topk",
+    [
+        pytest.param(256, 8, 4, 8, id="grouped-k8g4"),
+        pytest.param(128, 4, 2, 4, id="grouped-general"),
+        pytest.param(128, 1, 1, 1, id="single128"),
+        pytest.param(384, 1, 1, 1, id="single384"),
+    ],
+)
+@pytest.mark.parametrize("data_type", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("bias_type", [torch.float32, torch.float16, torch.bfloat16])
+def test_dsv3_fused_routing_backend_correctness(
+    backend, num_experts, n_group, topk_group, topk, data_type, bias_type
+):
+    """Exercise every Cake schedule and dtype pair alongside the default backend."""
+
+    if backend == "cake" and torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 3),
+    ):
+        pytest.skip("Cake fused routing requires SM100 or SM103")
+
+    num_tokens = 7
+    torch.manual_seed(42)
+    scores = torch.randn(num_tokens, num_experts, device="cuda", dtype=data_type)
+    bias = torch.randn(num_experts, device="cuda", dtype=bias_type)
+    routed_scaling_factor = 1.0
+    ground_truth = DSv3RoutingGroundTruth(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        data_type,
+    )
+
+    topk_values = torch.empty(num_tokens, topk, device="cuda", dtype=data_type)
+    topk_indices = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int32)
+    routing_replay_out = torch.empty(num_tokens, topk, device="cuda", dtype=torch.int16)
+    fused_topk_deepseek(
+        scores,
+        bias,
+        n_group,
+        topk_group,
+        topk,
+        routed_scaling_factor,
+        topk_values,
+        topk_indices,
+        routing_replay_out=routing_replay_out,
+        backend=backend,
+    )
+
+    for token_idx in range(num_tokens):
+        assert set(routing_replay_out[token_idx].tolist()) == set(
+            topk_indices[token_idx].tolist()
+        )
+
+    sorted_values, sorted_order = torch.sort(topk_values, dim=-1, descending=True)
+    sorted_indices = topk_indices.gather(1, sorted_order)
+    all_valid, tokens_with_different_experts = validate_expert_selection(
+        ground_truth, sorted_indices, sorted_values
+    )
+    assert all_valid
+    validate_values(
+        ground_truth, sorted_values, tokens_with_different_experts, data_type
+    )
 
 
 @pytest.mark.parametrize("num_tokens", [1, 8, 16, 64])

@@ -21,6 +21,11 @@ import torch
 from ..api_logging import flashinfer_api
 from ..trace.templates.msa import msa_sparse_attention_trace
 from ..utils import is_sm12x_supported
+from ._blackwell_sm100 import (
+    MSASparseAttentionWorkspace,
+    blackwell_msa_sparse_attention,
+    is_blackwell_msa_device,
+)
 from ._common import (
     _BLK_KV,
     _compile_cache,
@@ -51,8 +56,9 @@ def msa_sparse_attention(
     q_offset=None,
     return_temperature_lse: bool = False,
     lse_temperature_scale: float = 1.0,
+    workspace: Optional[MSASparseAttentionWorkspace] = None,
 ):
-    """Minimax Sparse Attention forward (prefill) for SM120/SM121.
+    """Minimax Sparse Attention forward for SM100/SM103 and SM120/SM121 GPUs.
 
     Each query attends only the top-K KV blocks selected in ``q2k_indices``.
     Query tokens are processed in tiles: each tile runs one online softmax over
@@ -64,6 +70,13 @@ def msa_sparse_attention(
     Packed NVFP4 stores two values per byte, so its K/V last dimension is
     ``head_dim // 2`` instead of ``head_dim``. ``q2k_indices`` is
     ``(num_kv_heads, total_q, topk)`` int32 (ascending, ``-1`` padded).
+    Compute capability 10.0/10.3 supports bf16/fp16 K/V and E4M3 K/V with bf16
+    Q, plus exactly one packed-NVFP4 route -- paged K/V read in place as strided
+    views of a planar page, with ``k_scale``/``v_scale`` and both global scales,
+    causal, without an LSE and with ``seqused_k`` rather than ``cu_seqlens_k``
+    (see the ``k``, ``k_scale``, ``seqused_k`` and ``k_global_scale``
+    parameters below) -- and requires ``topk == 16``. Every other packed-NVFP4
+    layout remains SM120/SM121-only.
 
     Parameters
     ----------
@@ -85,7 +98,11 @@ def msa_sparse_attention(
         Int32 cumulative query sequence lengths of shape ``(batch_size + 1,)``.
     cu_seqlens_k : Optional[torch.Tensor], default=None
         Int32 cumulative KV sequence lengths of shape ``(batch_size + 1,)`` for
-        the dense path. May be omitted when ``seqused_k`` is provided.
+        the dense path. May be omitted when ``seqused_k`` is provided. The
+        compute-capability 10.0/10.3 packed-NVFP4 paged route takes
+        ``seqused_k`` as the sole source of per-request KV length and declines a
+        call that also supplies ``cu_seqlens_k``, rather than silently
+        preferring one of two possibly disagreeing sources.
     causal : bool, default=False
         Whether to apply causal masking.
     softmax_scale : Optional[float], default=None
@@ -95,7 +112,16 @@ def msa_sparse_attention(
         ``(batch_size, max_pages)`` and maps batch-local KV block indices to
         pages. Requires ``seqused_k``. ``k``/``v`` may also be views split
         from a cache that packs K and V in one ``2 * head_dim`` content dim
-        per token (see ``SUPPORTS_PACKED_KV``).
+        per token on SM120/SM121 (see ``supports_packed_kv``). Compute
+        capability 10.0/10.3 requires separate contiguous K and V tensors and
+        never copies packed views implicitly, with one exception: packed NVFP4
+        paged K/V (uint8, ``(num_pages, 4, 128, 64)``) is consumed in place as
+        strided views of a planar ``[K data | K scale | V data | V scale]``
+        page, together with ``k_scale``/``v_scale`` and the two global scales.
+        On that route the block-table width is unconstrained in practice: the
+        per-tile block union is a hash table sized by ``8 * topk``, not a bitmap
+        indexed by block id, so a 2048-wide table costs the same per block as a
+        128-wide one.
     seqused_k : Optional[torch.Tensor], default=None
         Int32 tensor of shape ``(batch_size,)`` giving the valid KV length per
         sequence in the paged path.
@@ -108,16 +134,24 @@ def msa_sparse_attention(
         :func:`flashinfer.nvfp4_quantize` with ``sf_vec_size=16`` and the
         swizzled 128x4 layout (one scale per 16 elements, with rows padded to a
         multiple of 128). Scale rows follow ``(token, head)`` order for flat K
-        and ``(page, head, token)`` order for paged K.
+        and ``(page, head, token)`` order for paged K. SM120/SM121 only.
+        On compute capability 10.0/10.3 the paged NVFP4 prefill route instead
+        takes the block-scale regions of the packed page as
+        ``(num_pages, num_kv_heads, page_size, head_dim // 16)`` views, either
+        uint8 or float8_e4m3fn: K scales linear, V scales ``(4, 4)``-swizzled
+        inside ``(token, scale index)``.
     v_scale : Optional[torch.Tensor], default=None
         NVFP4 block scales for V, with the same dtype, layout, and row-order
         contract as ``k_scale``.
     k_global_scale : Optional[float], default=None
         Global dequant scale for K; folds into the softmax scale (NVFP4 K
-        only).
+        only). On SM100/SM103 it is supported by, and required for, the paged
+        NVFP4 KV prefill route, and by nothing else.
     v_global_scale : Optional[float], default=None
-        Global dequant scale applied to the output, for any KV dtype (e.g. an
-        fp8 per-tensor V descale).
+        Global dequant scale applied to the output on SM120/SM121, for any KV
+        dtype (e.g. an fp8 per-tensor V descale). On SM100/SM103 it is
+        supported by, and required for, the paged NVFP4 KV prefill route, and
+        by nothing else.
     q_offset : optional
         Optional per-query offset tensor used by specific MSA workflows.
     return_temperature_lse : bool, default=False
@@ -125,6 +159,11 @@ def msa_sparse_attention(
         value is ``(out, lse, lse_t)``.
     lse_temperature_scale : float, default=1.0
         Scale applied to the exponent when computing temperature LSE.
+    workspace : MSASparseAttentionWorkspace, optional
+        Caller-owned storage required for CUDA graph capture on compute
+        capability 10.0/10.3. Warm the workspace eagerly with the exact
+        tensors, options, and capture stream before capture. It is not used by
+        the SM120/SM121 backend.
 
     Returns
     -------
@@ -136,6 +175,33 @@ def msa_sparse_attention(
         false, returns ``out``. Each returned LSE tensor has shape
         ``(total_q, num_qo_heads)`` and dtype float32.
     """
+    if is_blackwell_msa_device(q.device):
+        return blackwell_msa_sparse_attention(
+            q,
+            k,
+            v,
+            q2k_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            causal=causal,
+            softmax_scale=softmax_scale,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            return_softmax_lse=return_softmax_lse,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            k_global_scale=k_global_scale,
+            v_global_scale=v_global_scale,
+            q_offset=q_offset,
+            return_temperature_lse=return_temperature_lse,
+            lse_temperature_scale=lse_temperature_scale,
+            workspace=workspace,
+        )
+    if workspace is not None:
+        raise ValueError(
+            "MSASparseAttentionWorkspace is only used by the compute "
+            "capability 10.0/10.3 backend"
+        )
     if not is_sm12x_supported(q.device):
         raise RuntimeError(
             "msa_sparse_attention requires SM120 or SM121 (Blackwell) and CUDA >= 12.8"

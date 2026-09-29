@@ -110,7 +110,7 @@ class SparseDecodeForwardSm12x:
         mSplitCounts: cute.Tensor,  # (total_q, Hkv) int32 (dummy if fused)
         mOut: cute.Tensor,  # (total_q, Hq, d) final output (dummy if not fused)
         mLseOut: cute.Tensor,  # (total_q, Hq) f32 natural-log LSE (dummy if not fused)
-        mCuK: cute.Tensor,  # (B + 1,) int32
+        mCuK: cute.Tensor,  # flat: (B+1,) prefix sum; paged: (B,) lengths
         mQOffset: cute.Tensor,  # (B,) int32 causal offset (MSA q_offset)
         softmax_scale: cutlass.Float32,
         out_scale: cutlass.Float32,  # fused: output value scale (v_global_scale)
@@ -312,8 +312,14 @@ class SparseDecodeForwardSm12x:
         if chunk_start < cnt:
             batch_idx = qi // seqlen_q
             tok_in_req = qi - batch_idx * seqlen_q
-            k_start = mCuK[batch_idx]
-            seqlen_k = mCuK[batch_idx + 1] - k_start
+            if cutlass.const_expr(self._paged):
+                # mCuK holds per-request lengths, not a prefix sum: page_table
+                # supplies every KV address, so there is no base offset to add.
+                k_start = cutlass.Int32(0)
+                seqlen_k = mCuK[batch_idx]
+            else:
+                k_start = mCuK[batch_idx]
+                seqlen_k = mCuK[batch_idx + 1] - k_start
 
             n_buf = 2 if cutlass.const_expr(self._pipeline) else 1
             sQ_layout = cute.make_layout(
@@ -863,8 +869,13 @@ class SparseDecodeForwardSm12x:
 
         batch_idx = qi // seqlen_q
         tok_in_req = qi - batch_idx * seqlen_q
-        k_start = mCuK[batch_idx]
-        seqlen_k = mCuK[batch_idx + 1] - k_start
+        if cutlass.const_expr(self._paged):
+            # Per-request lengths, not a prefix sum; see the split kernel above.
+            k_start = cutlass.Int32(0)
+            seqlen_k = mCuK[batch_idx]
+        else:
+            k_start = mCuK[batch_idx]
+            seqlen_k = mCuK[batch_idx + 1] - k_start
 
         # Valid-block count, as in the split kernel above.
         cnt = cutlass.Int32(0)

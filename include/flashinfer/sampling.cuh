@@ -98,10 +98,10 @@ constexpr BlockReduceAlgorithm REDUCE_ALGO = BLOCK_REDUCE_WARP_REDUCTIONS;
 
 // On SM107 (Rubin), ptxas can allocate >64 regs/thread for these 1024-thread
 // sampling kernels, which exceeds the 65536-register SM budget and fails with
-// "too many resources requested for launch" (internal MR !611 / feat_sm107).
+// "too many resources requested for launch".
 // Gate __launch_bounds__ to native sm_107* compiles only so other arches keep
-// unconstrained register allocation (avoids the B300/H100 spill regression in
-// NVBug 6517769). When SM107 is mapped to sm_100f at JIT time, this gate is
+// unconstrained register allocation (avoids a B300/H100 register-spill
+// regression). When SM107 is mapped to sm_100f at JIT time, this gate is
 // inactive; that path inherits sm_100 register counts which already fit.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1070)
 #define FLASHINFER_SAMPLING_LAUNCH_BOUNDS(block_threads) __launch_bounds__(block_threads)
@@ -339,7 +339,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFu
 
 #pragma unroll
       for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-        logits_vec[j] *= inv_temp;
+        // __fmul_rn, not *: it must not be contracted into an FMA.
+        // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
+        logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       }
 
       if constexpr (CACHE_INPUT) {
@@ -399,7 +401,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxFu
 
 #pragma unroll
         for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-          logits_vec[j] *= inv_temp;
+          // __fmul_rn, not *: it must not be contracted into an FMA.
+          // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
+          logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
         }
       }
     }
@@ -460,7 +464,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxMa
     float thread_max = -cuda::std::numeric_limits<float>::infinity();
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      logits_vec[j] *= inv_temp;
+      // __fmul_rn, not *: it must not be contracted into an FMA.
+      // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
+      logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       thread_max = max(thread_max, logits_vec[j]);
     }
 
@@ -560,7 +566,9 @@ __global__ FLASHINFER_SAMPLING_LAUNCH_BOUNDS(BLOCK_THREADS) void OnlineSoftmaxRe
 
 #pragma unroll
     for (uint32_t j = 0; j < VEC_SIZE; ++j) {
-      logits_vec[j] *= inv_temp;
+      // __fmul_rn, not *: it must not be contracted into an FMA.
+      // *= inv_temp can lead to probabilities exceeding 1 at low temperatures (see PR #5088).
+      logits_vec[j] = __fmul_rn(static_cast<float>(logits_vec[j]), inv_temp);
       float p = __expf(static_cast<float>(logits_vec[j]) - final_max) * inv_denominator;
       prob_vec[j] = static_cast<DType>(p);
     }

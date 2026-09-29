@@ -41,6 +41,25 @@ __device__ __forceinline__ void bar_sync_t() {
   asm volatile("barrier.cta.sync %0, %1;\n" ::"n"(ID), "n"(CNT) : "memory");
 }
 
+// Producer/consumer handshakes where the arriving side does not block must alternate
+// between two barrier ids: the non-blocking side may be one iteration ahead, and
+// arriving twice in one phase is invalid and desynchronizes the barrier (#3700).
+template <int ID_EVEN, int ID_ODD, int CNT>
+__device__ __forceinline__ void bar_arrive_alt(int parity) {
+  if (parity)
+    bar_arrive_t<ID_ODD, CNT>();
+  else
+    bar_arrive_t<ID_EVEN, CNT>();
+}
+
+template <int ID_EVEN, int ID_ODD, int CNT>
+__device__ __forceinline__ void bar_sync_alt(int parity) {
+  if (parity)
+    bar_sync_t<ID_ODD, CNT>();
+  else
+    bar_sync_t<ID_EVEN, CNT>();
+}
+
 // mbarrier (SM90+) for async copy tracking
 __device__ __forceinline__ void mbarrier_init(uint64_t* mbar, uint32_t count) {
   uint32_t addr = static_cast<uint32_t>(__cvta_generic_to_shared(mbar));

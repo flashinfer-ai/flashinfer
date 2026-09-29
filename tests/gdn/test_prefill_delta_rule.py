@@ -51,8 +51,15 @@ def _skip_if_unsupported():
 def _skip_if_cp_unsupported():
     """Skip test if context parallelism is unsupported."""
     device = torch.device("cuda")
+    if is_sm100a_supported(device):
+        cuda_major = int(torch.version.cuda.split(".")[0]) if torch.version.cuda else 0
+        if cuda_major < 13:
+            pytest.skip(
+                f"SM100 CP GDN prefill requires CUDA 13+, got {torch.version.cuda}"
+            )
+        return
     if not (is_sm90a_supported(device) or is_sm12x_supported(device)):
-        pytest.skip("CP GDN prefill requires SM90 or SM12x")
+        pytest.skip("CP GDN prefill requires SM90, SM100, or SM12x")
 
 
 def _skip_if_not_sm100():
@@ -131,10 +138,11 @@ def _test_prefill_kernel(
         None,
         True,
         cu_seq_lens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=our_o,
         output_state=our_state,
         use_cp=use_cp,
+        max_seqlen=max(seq_lens),
     )
 
     torch.cuda.synchronize()
@@ -210,7 +218,7 @@ def test_prefill_block_end_decay(qkv_factory, seed=0):
         None,
         True,
         cu_seqlens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=our_o,
         output_state=our_state,
         use_cp=False,
@@ -398,7 +406,7 @@ def test_prefill_kernel_zero_length_sequence(
         None,
         False,
         cu_seq_lens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=ref_o,
     )
     chunk_gated_delta_rule(
@@ -411,9 +419,10 @@ def test_prefill_kernel_zero_length_sequence(
         None,
         False,
         cu_seq_lens_with_empty,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=our_o,
         use_cp=use_cp,
+        max_seqlen=seq_len,
     )
     torch.cuda.synchronize()
 
@@ -471,10 +480,11 @@ def test_prefill_zero_length_sequence_state_untouched(
         None,
         True,
         cu_seq_lens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=our_o,
         output_state=our_state,
         use_cp=use_cp,
+        max_seqlen=seq_len,
     )
     torch.cuda.synchronize()
 
@@ -569,7 +579,7 @@ def _test_chunked_prefill(
         None,
         True,
         cu_seq_lens1,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=our_o1,
         output_state=our_state1,
         use_cp=False,
@@ -584,7 +594,7 @@ def _test_chunked_prefill(
         our_state1,
         True,
         cu_seq_lens2,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=our_o2,
         output_state=our_state2,
         use_cp=False,
@@ -712,6 +722,7 @@ def _test_checkpoint(
     scale: float,
     checkpoint_every_n_tokens: int,
     seed: int | None = None,
+    use_cp: bool = False,
 ):
     """Test state checkpointing by comparing against prefix-based reference runs."""
     _skip_if_unsupported()
@@ -774,13 +785,15 @@ def _test_checkpoint(
         None,
         True,
         cu_seq_lens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=our_o,
         output_state=our_state,
         state_checkpoints=state_checkpoints,
         checkpoint_cu_starts=checkpoint_cu_starts,
         checkpoint_every_n_tokens=checkpoint_every_n_tokens,
-        use_cp=False,
+        use_cp=use_cp,
+        _cp_chunk_len=checkpoint_every_n_tokens if use_cp else None,
+        max_seqlen=max(seq_lens),
     )
     torch.cuda.synchronize()
 
@@ -821,10 +834,11 @@ def _test_checkpoint(
                 None,
                 True,
                 prefix_cu,
-                True,
+                use_qk_l2norm_in_kernel=False,
                 output=prefix_o,
                 output_state=prefix_state,
-                use_cp=False,
+                use_cp=use_cp,
+                _cp_chunk_len=checkpoint_every_n_tokens if use_cp else None,
             )
             torch.cuda.synchronize()
 
@@ -832,12 +846,8 @@ def _test_checkpoint(
             actual_ckpt = state_checkpoints[ckpt_global_idx]
             expected_ckpt = prefix_state[0]
 
-            torch.testing.assert_close(
-                actual_ckpt,
-                expected_ckpt,
-                atol=1e-3,
-                rtol=1e-4,
-                msg=f"Checkpoint mismatch: seq={seq_idx}, ckpt={ckpt_idx}",
+            assert torch.equal(actual_ckpt, expected_ckpt), (
+                f"Checkpoint mismatch: seq={seq_idx}, ckpt={ckpt_idx}"
             )
 
 
@@ -849,6 +859,7 @@ def _test_checkpoint(
 )
 @pytest.mark.parametrize("seq_lens", [[256], [128, 256, 512]])
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@pytest.mark.parametrize("use_cp", [False, True])
 def test_checkpoint_correctness(
     qkv_factory,
     dtype: str,
@@ -858,8 +869,15 @@ def test_checkpoint_correctness(
     head_size: int,
     seq_lens: list[int],
     checkpoint_every_n_tokens: int,
+    use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
+    if use_cp and not (
+        is_sm90a_supported(torch.device("cuda"))
+        or is_sm100a_supported(torch.device("cuda"))
+        or is_sm12x_supported(torch.device("cuda"))
+    ):
+        pytest.skip("CP state checkpointing requires SM90, SM100, or SM120")
     scale = 1.0 / math.sqrt(head_size)
     _test_checkpoint(
         qkv_factory,
@@ -872,6 +890,7 @@ def test_checkpoint_correctness(
         scale,
         checkpoint_every_n_tokens,
         seed,
+        use_cp=use_cp,
     )
 
 
@@ -922,7 +941,7 @@ def test_checkpoint_noop(qkv_factory):
         None,
         True,
         cu_seq_lens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=o1,
         output_state=s1,
         use_cp=False,
@@ -941,7 +960,7 @@ def test_checkpoint_noop(qkv_factory):
         None,
         True,
         cu_seq_lens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=o2,
         output_state=s2,
         checkpoint_every_n_tokens=0,
@@ -1042,7 +1061,7 @@ def test_checkpoint_wrong_cu_starts_size(qkv_factory):
 
 
 # ---------------------------------------------------------------------------
-# State dtype tests (SM100 only)
+# State dtype tests
 # ---------------------------------------------------------------------------
 
 
@@ -1056,9 +1075,12 @@ def _test_prefill_kernel_state_dtype(
     head_size: int,
     seq_lens: list[int],
     scale: float,
+    use_cp: bool,
     seed: int | None = None,
 ):
-    _skip_if_not_sm100()
+    _skip_if_unsupported()
+    if use_cp:
+        _skip_if_cp_unsupported()
 
     random.seed(seed)
     torch.random.manual_seed(seed)
@@ -1112,10 +1134,11 @@ def _test_prefill_kernel_state_dtype(
         initial_state,
         True,
         cu_seq_lens,
-        True,
+        use_qk_l2norm_in_kernel=False,
         output=our_o,
         output_state=our_state,
-        use_cp=False,
+        use_cp=use_cp,
+        max_seqlen=max(seq_lens),
     )
 
     torch.cuda.synchronize()
@@ -1163,6 +1186,7 @@ def _test_prefill_kernel_state_dtype(
     "state_dtype",
     [torch.bfloat16, torch.float16, torch.float8_e4m3fn, torch.float8_e5m2],
 )
+@pytest.mark.parametrize("use_cp", [False, True])
 def test_prefill_kernel_state_dtype(
     qkv_factory,
     dtype: str,
@@ -1173,6 +1197,7 @@ def test_prefill_kernel_state_dtype(
     seq_lens: list[int],
     scale: float | str,
     state_dtype: torch.dtype,
+    use_cp: bool,
     seed: int = int(os.environ.get("SEED", "0")),
 ):
     scale = 1.0 / math.sqrt(head_size) if scale == "auto" else scale
@@ -1186,5 +1211,6 @@ def test_prefill_kernel_state_dtype(
         head_size,
         seq_lens,
         scale,
+        use_cp,
         seed=seed,
     )

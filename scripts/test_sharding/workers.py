@@ -22,6 +22,11 @@ from .progress import PYTEST_EVENT_PREFIX, decode_pytest_event
 from .summary import batch_directory, batch_xml_path
 
 
+_DEFAULT_MASTER_PORT = 29500
+_MASTER_PORT_STRIDE = 100
+_MAX_TCP_PORT = 65535
+
+
 @dataclass(frozen=True)
 class BatchExecution:
     status: str
@@ -31,6 +36,7 @@ class BatchExecution:
 @dataclass(frozen=True)
 class BatchExecutionRequest:
     repo_root: Path
+    pytest_root: Path
     junit_dir: Path
     unit: Unit
     batch: Batch
@@ -84,12 +90,67 @@ class _BatchProgress:
 
 
 _CONSOLE_LOCK = threading.Lock()
-_PROGRESS_INTERVAL_SECONDS = 30.0
+_OUTPUT_DRAIN_SECONDS = 5.0
+
+
+@dataclass(frozen=True)
+class _HostCpuTimes:
+    total: int
+    idle: int
+    iowait: int
+
+
+@dataclass(frozen=True)
+class _ProcessTreeStats:
+    worker_cpu_seconds: float
+    descendant_cpu_seconds: float
+    descendant_process_count: int
+    running_process_count: int
+    disk_sleep_process_count: int
+
+
+@dataclass(frozen=True)
+class _ProcessCpuStat:
+    state: str
+    own_cpu_seconds: float
+    children_cpu_seconds: float
+
+
+@dataclass(frozen=True)
+class _ResourceSample:
+    timestamp: float
+    host_rss_mib: float
+    gpu_memory_mib: float
+    host_cpu_percent: float | None
+    host_iowait_percent: float | None
+    load1: float
+    load5: float
+    load15: float
+    worker_cpu_seconds: float
+    descendant_cpu_seconds: float
+    descendant_process_count: int
+    running_process_count: int
+    disk_sleep_process_count: int
 
 
 def write_console(message: str) -> None:
     with _CONSOLE_LOCK:
         print(message, flush=True)
+
+
+@dataclass
+class _OutputDrainState:
+    error: str = ""
+    console_enabled: bool = True
+
+    def emit(self, message: str) -> None:
+        with _CONSOLE_LOCK:
+            if self.console_enabled:
+                print(message, flush=True)
+
+    def disable_console(self) -> None:
+        with _CONSOLE_LOCK:
+            self.console_enabled = False
 
 
 def _descendant_pids(root_pid: int) -> set[int]:
@@ -154,15 +215,115 @@ def _gpu_mib(pids: set[int]) -> float:
     return total
 
 
-def _monitor_memory(
+def _read_host_cpu_times() -> _HostCpuTimes | None:
+    try:
+        fields = Path("/proc/stat").read_text(encoding="utf-8").splitlines()[0].split()
+        if not fields or fields[0] != "cpu":
+            return None
+        values = [int(value) for value in fields[1:]]
+    except (OSError, ValueError):
+        return None
+    if len(values) < 5:
+        return None
+    # Linux reports guest time again inside user/nice, so only the first eight
+    # non-guest counters belong in the total.
+    return _HostCpuTimes(total=sum(values[:8]), idle=values[3], iowait=values[4])
+
+
+def _host_cpu_percentages(
+    previous: _HostCpuTimes | None, current: _HostCpuTimes | None
+) -> tuple[float | None, float | None]:
+    if previous is None or current is None:
+        return None, None
+    total = current.total - previous.total
+    if total <= 0:
+        return None, None
+    idle = max(0, current.idle - previous.idle)
+    iowait = max(0, current.iowait - previous.iowait)
+    busy = max(0, total - idle - iowait)
+    return 100 * busy / total, 100 * iowait / total
+
+
+def _parse_process_cpu_stat(stat: str, ticks_per_second: float) -> _ProcessCpuStat:
+    fields = stat[stat.rfind(")") + 2 :].split()
+    return _ProcessCpuStat(
+        state=fields[0],
+        own_cpu_seconds=(int(fields[11]) + int(fields[12])) / ticks_per_second,
+        children_cpu_seconds=(int(fields[13]) + int(fields[14])) / ticks_per_second,
+    )
+
+
+def _process_tree_stats(root_pid: int, pids: set[int]) -> _ProcessTreeStats:
+    try:
+        ticks_per_second = float(os.sysconf("SC_CLK_TCK"))
+    except (OSError, ValueError):
+        ticks_per_second = 100.0
+    cpu_stats: dict[int, _ProcessCpuStat] = {}
+    for pid in pids:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            cpu_stat = _parse_process_cpu_stat(stat, ticks_per_second)
+            cpu_stats[pid] = cpu_stat
+        except (IndexError, OSError, ValueError):
+            continue
+    return _summarize_process_tree(root_pid, cpu_stats)
+
+
+def _summarize_process_tree(
+    root_pid: int, cpu_stats: dict[int, _ProcessCpuStat]
+) -> _ProcessTreeStats:
+    states = Counter(stats.state for stats in cpu_stats.values())
+    root_stats = cpu_stats.get(root_pid)
+    return _ProcessTreeStats(
+        worker_cpu_seconds=root_stats.own_cpu_seconds if root_stats else 0.0,
+        descendant_cpu_seconds=(root_stats.children_cpu_seconds if root_stats else 0.0)
+        + sum(
+            stats.own_cpu_seconds + stats.children_cpu_seconds
+            for pid, stats in cpu_stats.items()
+            if pid != root_pid
+        ),
+        descendant_process_count=max(0, len(cpu_stats) - int(root_pid in cpu_stats)),
+        running_process_count=states["R"],
+        disk_sleep_process_count=states["D"],
+    )
+
+
+def _monitor_resources(
     pid: int,
     stop: threading.Event,
-    samples: list[tuple[float, float, float]],
+    samples: list[_ResourceSample],
     interval: float,
 ) -> None:
+    previous_cpu = _read_host_cpu_times()
     while not stop.is_set():
         pids = _descendant_pids(pid)
-        samples.append((time.time(), _rss_mib(pids), _gpu_mib(pids)))
+        current_cpu = _read_host_cpu_times()
+        host_cpu_percent, host_iowait_percent = _host_cpu_percentages(
+            previous_cpu, current_cpu
+        )
+        previous_cpu = current_cpu
+        try:
+            load1, load5, load15 = os.getloadavg()
+        except OSError:
+            load1 = load5 = load15 = 0.0
+        process_stats = _process_tree_stats(pid, pids)
+        samples.append(
+            _ResourceSample(
+                timestamp=time.time(),
+                host_rss_mib=_rss_mib(pids),
+                gpu_memory_mib=_gpu_mib(pids),
+                host_cpu_percent=host_cpu_percent,
+                host_iowait_percent=host_iowait_percent,
+                load1=load1,
+                load5=load5,
+                load15=load15,
+                worker_cpu_seconds=process_stats.worker_cpu_seconds,
+                descendant_cpu_seconds=process_stats.descendant_cpu_seconds,
+                descendant_process_count=process_stats.descendant_process_count,
+                running_process_count=process_stats.running_process_count,
+                disk_sleep_process_count=process_stats.disk_sleep_process_count,
+            )
+        )
         stop.wait(interval)
 
 
@@ -173,7 +334,13 @@ def _forward_pytest_output(
     *,
     worker_index: int,
     batch_id: str,
+    source_file: str,
+    log_path: Path,
+    junit_path: Path,
+    results_path: Path,
+    drain_state: _OutputDrainState | None = None,
 ) -> None:
+    state = drain_state or _OutputDrainState()
     for line in stream:
         event = decode_pytest_event(line)
         if event is None:
@@ -186,41 +353,67 @@ def _forward_pytest_output(
             log.flush()
         nodeid = str(event.get("nodeid", ""))
         if event.get("event") == "start":
-            function, should_print = progress.start(
+            _, should_print = progress.start(
                 nodeid, float(event.get("started_at", time.time()))
             )
             if should_print:
-                write_console(
-                    f"PYTEST START worker={worker_index} batch={batch_id} "
-                    f"function={function} node={nodeid}"
+                state.emit(
+                    f"PYTEST START worker={worker_index} batch={batch_id} node={nodeid}"
                 )
         elif event.get("event") == "finish":
             outcome = str(event.get("outcome", "unknown"))
             duration = float(event.get("duration_seconds", 0.0))
             progress.finish(nodeid, outcome)
             if outcome in {"failed", "unknown"}:
-                write_console(
+                state.emit(
                     f"PYTEST RESULT worker={worker_index} batch={batch_id} "
                     f"outcome={outcome} duration={duration:.3f}s node={nodeid}"
                 )
+        elif event.get("event") == "failure":
+            diagnostic = str(event.get("diagnostic", "pytest failure"))
+            state.emit(
+                "PYTEST FAILURE "
+                f"worker={worker_index} source={source_file} node={nodeid} "
+                f"phase={event.get('phase', 'unknown')}\n{diagnostic}"
+            )
+            if bool(event.get("diagnostic_truncated", False)):
+                state.emit("[diagnostic truncated at 32768 bytes]")
+            state.emit(
+                f"PYTEST FAILURE ARTIFACTS log={log_path} "
+                f"results={results_path} junit={junit_path}"
+            )
 
 
-def _progress_heartbeat(
-    stop: threading.Event,
+def _drain_pytest_output(
+    stream: TextIO,
+    log: TextIO,
     progress: _BatchProgress,
+    state: _OutputDrainState,
     *,
     worker_index: int,
     batch_id: str,
+    source_file: str,
+    log_path: Path,
+    junit_path: Path,
+    results_path: Path,
 ) -> None:
-    while not stop.wait(_PROGRESS_INTERVAL_SECONDS):
-        nodeid, started_at, completed = progress.current()
-        if nodeid is None or started_at is None:
-            continue
-        write_console(
-            f"PYTEST RUNNING worker={worker_index} batch={batch_id} "
-            f"elapsed={max(0.0, time.time() - started_at):.1f}s "
-            f"completed_in_batch={completed} node={nodeid}"
+    try:
+        _forward_pytest_output(
+            stream,
+            log,
+            progress,
+            worker_index=worker_index,
+            batch_id=batch_id,
+            source_file=source_file,
+            log_path=log_path,
+            junit_path=junit_path,
+            results_path=results_path,
+            drain_state=state,
         )
+    except Exception as error:
+        state.error = f"{type(error).__name__}: {error}"
+    finally:
+        stream.close()
 
 
 def _temporary(path: Path) -> Path:
@@ -242,6 +435,10 @@ class _BatchArtifacts:
     log: Path
 
     @property
+    def final_results(self) -> Path:
+        return self.final_xml.with_name(f"{self.final_xml.stem}.results.json")
+
+    @property
     def temporary(self) -> tuple[Path, ...]:
         return (
             self.temporary_xml,
@@ -259,7 +456,8 @@ class _ProcessOutcome:
     timed_out: bool
     aborted: bool
     termination_signal: str
-    samples: tuple[tuple[float, float, float], ...]
+    output_error: str
+    samples: tuple[_ResourceSample, ...]
     progress: _BatchProgress
 
 
@@ -286,6 +484,7 @@ def _pytest_command(
         sys.executable,
         "-m",
         "pytest",
+        f"--rootdir={request.pytest_root}",
         "--continue-on-collection-errors",
         "-p",
         "scripts.test_sharding.pytest_plugin",
@@ -295,6 +494,15 @@ def _pytest_command(
         f"--junitxml={artifacts.temporary_xml}",
         request.batch.source_file,
     ]
+
+
+def _worker_master_port(worker_index: int) -> str:
+    if worker_index < 0:
+        raise ValueError("worker index must be non-negative")
+    port = _DEFAULT_MASTER_PORT + worker_index * _MASTER_PORT_STRIDE
+    if port + _MASTER_PORT_STRIDE - 1 > _MAX_TCP_PORT:
+        raise ValueError(f"worker {worker_index} has no valid rendezvous port block")
+    return str(port)
 
 
 def _pytest_environment(request: BatchExecutionRequest) -> dict[str, str]:
@@ -307,6 +515,10 @@ def _pytest_environment(request: BatchExecutionRequest) -> dict[str, str]:
     )
     if request.device is not None:
         env["CUDA_VISIBLE_DEVICES"] = request.device
+    # Isolate each concurrent worker's rendezvous and sibling TCPStore ports.
+    # Preserve explicit launcher configuration.
+    if "MASTER_PORT" not in env:
+        env["MASTER_PORT"] = _worker_master_port(request.worker_index)
     return env
 
 
@@ -316,21 +528,29 @@ def _run_pytest(
     command: list[str],
 ) -> _ProcessOutcome:
     launched_at = time.time()
-    samples: list[tuple[float, float, float]] = []
+    environment = _pytest_environment(request)
+    samples: list[_ResourceSample] = []
     stop_monitor = threading.Event()
     monitor: threading.Thread | None = None
     termination_signal = ""
     progress = _BatchProgress()
-    progress_stop = threading.Event()
     timed_out = False
     aborted = False
+    exited_at: float | None = None
+    output_errors: list[str] = []
+    write_console(
+        f"PYTEST BATCH START worker={request.worker_index} "
+        f"batch={request.batch.id} source={request.batch.source_file} "
+        f"device={environment.get('CUDA_VISIBLE_DEVICES', 'all')} "
+        f"master_port={environment['MASTER_PORT']}"
+    )
     with artifacts.log.open("a", encoding="utf-8") as log:
         log.write(f"command: {' '.join(command)}\n")
         log.flush()
         process = subprocess.Popen(
             command,
-            cwd=request.repo_root,
-            env=_pytest_environment(request),
+            cwd=request.pytest_root,
+            env=environment,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             start_new_session=True,
@@ -339,29 +559,24 @@ def _run_pytest(
             errors="replace",
         )
         assert process.stdout is not None
+        drain_state = _OutputDrainState()
         output_thread = threading.Thread(
-            target=_forward_pytest_output,
-            args=(process.stdout, log, progress),
+            target=_drain_pytest_output,
+            args=(process.stdout, log, progress, drain_state),
             kwargs={
                 "worker_index": request.worker_index,
                 "batch_id": request.batch.id,
-            },
-            daemon=True,
-        )
-        heartbeat_thread = threading.Thread(
-            target=_progress_heartbeat,
-            args=(progress_stop, progress),
-            kwargs={
-                "worker_index": request.worker_index,
-                "batch_id": request.batch.id,
+                "source_file": request.batch.source_file,
+                "log_path": artifacts.log,
+                "junit_path": artifacts.final_xml,
+                "results_path": artifacts.final_results,
             },
             daemon=True,
         )
         output_thread.start()
-        heartbeat_thread.start()
         if request.monitor_memory:
             monitor = threading.Thread(
-                target=_monitor_memory,
+                target=_monitor_resources,
                 args=(process.pid, stop_monitor, samples, request.memory_interval),
                 daemon=True,
             )
@@ -392,32 +607,88 @@ def _run_pytest(
                 with suppress(subprocess.TimeoutExpired):
                     process.wait(timeout=wait_seconds)
             process.wait()
+            exited_at = time.time()
+            if not timed_out and not aborted:
+                try:
+                    terminate_process_group(process, request.grace_seconds)
+                except OSError as error:
+                    output_errors.append(
+                        "cannot clean residual pytest process group: "
+                        f"{type(error).__name__}: {error}"
+                    )
         finally:
             stop_monitor.set()
-            progress_stop.set()
             if monitor is not None:
                 monitor.join(timeout=max(1.0, request.memory_interval + 1))
-            output_thread.join(timeout=5)
-            heartbeat_thread.join(timeout=2)
+            output_thread.join(timeout=_OUTPUT_DRAIN_SECONDS)
+            if output_thread.is_alive():
+                drain_state.disable_console()
+                output_errors.append(
+                    f"pytest output did not reach EOF within {_OUTPUT_DRAIN_SECONDS:g} "
+                    "seconds after process exit; a descendant may still hold stdout; "
+                    f"log={artifacts.log}"
+                )
+            elif drain_state.error:
+                output_errors.append(
+                    f"pytest output reader failed: {drain_state.error}; "
+                    f"log={artifacts.log}"
+                )
     return _ProcessOutcome(
         returncode=int(process.returncode),
         launched_at=launched_at,
-        exited_at=time.time(),
+        exited_at=exited_at if exited_at is not None else time.time(),
         timed_out=timed_out,
         aborted=aborted,
         termination_signal=termination_signal,
+        output_error="; ".join(output_errors),
         samples=tuple(samples),
         progress=progress,
     )
 
 
-def _memory_csv(samples: tuple[tuple[float, float, float], ...]) -> str:
-    memory_stream = io.StringIO(newline="")
-    memory_writer = csv.writer(memory_stream, lineterminator="\n")
-    memory_writer.writerow(["timestamp", "host_rss_mib", "gpu_memory_mib"])
-    for timestamp, rss_mib, gpu_mib in samples:
-        memory_writer.writerow([f"{timestamp:.6f}", f"{rss_mib:.3f}", f"{gpu_mib:.3f}"])
-    return memory_stream.getvalue()
+def _resource_csv(samples: tuple[_ResourceSample, ...]) -> str:
+    resource_stream = io.StringIO(newline="")
+    resource_writer = csv.writer(resource_stream, lineterminator="\n")
+    resource_writer.writerow(
+        [
+            "timestamp",
+            "host_rss_mib",
+            "gpu_memory_mib",
+            "host_cpu_percent",
+            "host_iowait_percent",
+            "load1",
+            "load5",
+            "load15",
+            "worker_cpu_seconds",
+            "descendant_cpu_seconds",
+            "descendant_process_count",
+            "running_process_count",
+            "disk_sleep_process_count",
+        ]
+    )
+    for sample in samples:
+        resource_writer.writerow(
+            [
+                f"{sample.timestamp:.6f}",
+                f"{sample.host_rss_mib:.3f}",
+                f"{sample.gpu_memory_mib:.3f}",
+                ""
+                if sample.host_cpu_percent is None
+                else f"{sample.host_cpu_percent:.3f}",
+                ""
+                if sample.host_iowait_percent is None
+                else f"{sample.host_iowait_percent:.3f}",
+                f"{sample.load1:.3f}",
+                f"{sample.load5:.3f}",
+                f"{sample.load15:.3f}",
+                f"{sample.worker_cpu_seconds:.3f}",
+                f"{sample.descendant_cpu_seconds:.3f}",
+                sample.descendant_process_count,
+                sample.running_process_count,
+                sample.disk_sleep_process_count,
+            ]
+        )
+    return resource_stream.getvalue()
 
 
 def _timeout_result(
@@ -429,11 +700,12 @@ def _timeout_result(
     completed, outcomes = outcome.progress.totals()
     write_console(
         f"PYTEST KILLED worker={request.worker_index} batch={request.batch.id} "
+        f"source={request.batch.source_file} "
         f"reason={request.timeout_reason or 'timeout'} "
         f"signal={outcome.termination_signal} "
         f"completed_in_batch={completed} passed={outcomes['passed']} "
         f"failed={outcomes['failed']} skipped={outcomes['skipped']} "
-        f"node={active_nodeid or 'unknown'}"
+        f"node={active_nodeid or 'unknown'} log={artifacts.log}"
     )
     _discard_temporary_artifacts(*artifacts.temporary)
     return BatchExecution("timeout", "pytest batch exceeded its time budget")
@@ -474,10 +746,7 @@ def _promote_batch_artifacts(
         atomic_write_json(artifacts.temporary_telemetry, telemetry)
     os.replace(artifacts.temporary_xml, artifacts.final_xml)
     if artifacts.temporary_results.exists():
-        os.replace(
-            artifacts.temporary_results,
-            artifacts.final_xml.with_name(f"{batch.id}.results.json"),
-        )
+        os.replace(artifacts.temporary_results, artifacts.final_results)
     if artifacts.temporary_telemetry.exists():
         os.replace(
             artifacts.temporary_telemetry,
@@ -485,7 +754,7 @@ def _promote_batch_artifacts(
         )
     atomic_write_text(
         artifacts.final_xml.with_name(f"{batch.id}.memory.csv"),
-        _memory_csv(outcome.samples),
+        _resource_csv(outcome.samples),
     )
     atomic_write_json(
         artifacts.final_xml.with_name(f"{batch.id}.meta.json"),
@@ -498,6 +767,7 @@ def _promote_batch_artifacts(
             "launched_at": outcome.launched_at,
             "exited_at": outcome.exited_at,
             "synthetic": False,
+            "monitor_memory": request.monitor_memory,
         },
     )
     artifacts.selection.unlink(missing_ok=True)
@@ -507,11 +777,15 @@ def execute_batch(request: BatchExecutionRequest) -> BatchExecution:
     artifacts = _batch_artifacts(request)
     atomic_write_json(artifacts.selection, list(request.batch.nodeids))
     outcome = _run_pytest(request, artifacts, _pytest_command(request, artifacts))
+    if outcome.output_error:
+        _discard_temporary_artifacts(*artifacts.temporary)
+        return BatchExecution("infrastructure", outcome.output_error)
     if outcome.aborted:
         _discard_temporary_artifacts(*artifacts.temporary)
         return BatchExecution(
             "infrastructure",
-            "pytest stopped because the runner lease heartbeat failed",
+            "pytest stopped because the runner lease heartbeat failed; "
+            f"log={artifacts.log}",
         )
     if outcome.timed_out:
         return _timeout_result(request, artifacts, outcome)
@@ -519,15 +793,22 @@ def execute_batch(request: BatchExecutionRequest) -> BatchExecution:
         _discard_temporary_artifacts(*artifacts.temporary)
         return BatchExecution(
             "infrastructure",
-            f"pytest exited with infrastructure exit code {outcome.returncode}",
+            f"pytest exited with infrastructure exit code {outcome.returncode}; "
+            f"log={artifacts.log}",
         )
     if not artifacts.temporary_xml.exists():
         _discard_temporary_artifacts(*artifacts.temporary)
-        return BatchExecution("infrastructure", "pytest did not produce JUnit XML")
+        return BatchExecution(
+            "infrastructure",
+            f"pytest did not produce JUnit XML; log={artifacts.log}",
+        )
     validation = validate_batch_xml(artifacts.temporary_xml, request.batch.nodeids)
     if not validation.valid:
         _discard_temporary_artifacts(*artifacts.temporary)
-        return BatchExecution("infrastructure", "; ".join(validation.diagnostics))
+        return BatchExecution(
+            "infrastructure",
+            "; ".join(validation.diagnostics) + f"; log={artifacts.log}",
+        )
     _promote_batch_artifacts(request, artifacts, outcome)
     outcomes = Counter(case.outcome for case in validation.cases)
     write_console(

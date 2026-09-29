@@ -192,6 +192,15 @@ def test_fault_tolerance_detect_reconcile_degrade_readmit(comm_backend):
         with pytest.raises(MoEEpRankEvictedError):
             fleet.reconcile_active_mask()
         print(f"rank {rank}: correctly evicted")
+        # Mirror the survivors' tail exactly: barrier -> destroy -> barrier.
+        # Both halves matter. destroy() is collective over the nccl.ep group
+        # (all ranks, eviction mask notwithstanding), so the victim must enter
+        # it alongside the survivors, not before their degraded-forward
+        # checks. And default-PG barriers pair strictly by count, so the
+        # victim needs the same number as the survivors or the leftover
+        # barrier deadlocks the NEXT test's collective bootstrap (surfacing
+        # only as a 1h NCCL watchdog abort).
+        dist.barrier()
         layer.destroy()
         dist.barrier()
         return

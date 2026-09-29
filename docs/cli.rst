@@ -108,6 +108,11 @@ environment:
 
 This command installs from the flat FlashInfer wheel index.
 
+Wheel installs prefer ``uv pip`` when ``pyvenv.cfg`` identifies a uv-created
+environment, or when pip is unavailable, provided uv is on ``PATH``. Otherwise,
+they use ``python -m pip``. Both target the interpreter running FlashInfer;
+uv receives an explicit ``--python`` argument.
+
 Install JIT Cache Wheel
 -----------------------
 
@@ -136,7 +141,7 @@ not report a CUDA version.
 If the detected CUDA minor version is newer than the latest available
 ``flashinfer-jit-cache`` wheel in the same major version, the command uses the
 newest compatible wheel label. For example, CUDA 13.3 resolves to ``cu130``
-when ``cu130`` is the newest available CUDA 13 wheel.
+and CUDA 13.5 resolves to ``cu134``.
 
 Download Kernels
 ----------------

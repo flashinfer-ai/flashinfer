@@ -259,6 +259,7 @@ def _get_flashinfer_info():
         info["flashinfer"] = f"<import failed: {type(e).__name__}: {e}>"
         return info
     info["flashinfer"] = _guard(lambda: flashinfer.__version__, "?")
+    info["flashinfer commit"] = _guard(lambda: flashinfer.__git_commit__, "?")
     info["flashinfer file"] = _guard(lambda: flashinfer.__file__, "?")
 
     dists = _guard(_installed_distributions, None)

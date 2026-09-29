@@ -32,7 +32,7 @@ from flashinfer.utils import device_support_pdl
 
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
-from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout
+from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout, LOG2_E
 from flashinfer.cute_dsl.utils import (
     _as_cute_dsl_workspace_i8,
     get_max_active_clusters,
@@ -233,7 +233,7 @@ def _get_compiled_mla_kernel(
     Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
     page_table, o, lse, workspace, split_kv_scalar, cache_seqs,
     cum_seq_lens_q, causal_seqlens_kv_global, cp_rank_scalar,
-    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
+    block_split_kvs, softmax_scale_scalar, output_scale_scalar, lse_scale_scalar).
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
@@ -441,6 +441,7 @@ def _get_compiled_mla_kernel(
         block_split_kvs_fake,
         Float32(1.0),  # softmax_scale placeholder
         Float32(1.0),  # output_scale placeholder
+        Float32(1.0),  # lse_scale placeholder
         stream_fake,
         options="--enable-tvm-ffi --opt-level 2",
     )
@@ -466,6 +467,7 @@ def cute_dsl_mla_decode(
     enable_pdl: Optional[bool] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    lse_scale: float = 1 / LOG2_E,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     enable_dcp: bool = False,
@@ -539,6 +541,12 @@ def cute_dsl_mla_decode(
         Whether to return LSE values.  When True, the function returns
         ``(out, lse)`` (the ``lse`` tensor returned is in whatever shape
         the caller supplied).
+    lse_scale : float, default=1 / LOG2_E
+        Multiplier applied to the LSE at the store. This kernel computes LSE in
+        base 2, so the default ``1 / LOG2_E`` returns natural-log values and
+        ``1.0`` returns base-2. Set from ``return_lse_base`` by
+        ``flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla``. Has no effect
+        when ``return_lse`` is False.
     cum_seq_lens_q : Optional[torch.Tensor]
         Device-resident int32 cumulative query lengths with shape
         ``[B + 1]``. When provided, selects compact variable-Q input and
@@ -551,6 +559,8 @@ def cute_dsl_mla_decode(
     enable_dcp : bool
         Enable static cyclic decode context-parallel masking. DCP returns a
         rank-local attention state and therefore requires ``return_lse=True``.
+        Compact variable-Q input is supported when ``cum_seq_lens_q`` and
+        ``max_q_len`` are provided.
     cp_world : int
         Compile-time context-parallel world size. The local cache owns global
         token positions ``cp_world * local_k + cp_rank``.
@@ -604,8 +614,6 @@ def cute_dsl_mla_decode(
         raise TypeError(f"cp_rank must be an integer, got {type(cp_rank).__name__}")
 
     if enable_dcp:
-        if is_var_q:
-            raise ValueError("DCP does not support cum_seq_lens_q / max_q_len")
         if not 0 <= cp_rank < cp_world:
             raise ValueError(
                 f"cp_rank must satisfy 0 <= cp_rank < cp_world, got "
@@ -861,6 +869,7 @@ def cute_dsl_mla_decode(
         block_split_kvs,
         Float32(softmax_scale),
         Float32(output_scale),
+        Float32(lse_scale),
     )
 
     if return_lse:
