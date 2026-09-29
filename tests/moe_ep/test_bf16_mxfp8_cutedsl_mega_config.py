@@ -202,10 +202,7 @@ def test_mixed_factory_accepts_knobs_on_an_ikr_session(monkeypatch):
         assert config.in_kernel_fc2_reduce is True
         assert config.token_back_mode == "reuse_dispatch_warps"
         assert config.flag_batch == 4
-        # Both destinations exist either way, so the knob can flip later.
-        assert buf.combine_output.shape == (8, 2, 128)
-        assert buf.reduced_output.shape == (8, 1, 128)
-        assert buf.kernel_combine_output is buf.reduced_output
+        assert buf.output_activation.shape == (8, 128)
     finally:
         buf.destroy()
 
