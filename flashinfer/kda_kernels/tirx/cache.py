@@ -149,12 +149,14 @@ def get_kernel(kind, arch, heads, tuning=()):
         if kind == "fused":
             from .fused import build_kernel
 
-            (max_items,) = tuning
-            return build_kernel(heads, arch, max_items=max_items)
+            max_items, lower_bound = tuning
+            return build_kernel(
+                heads, arch, max_items=max_items, lower_bound=lower_bound
+            )
         from .split import make_front, make_chain
 
         if kind == "front":
-            return make_front(heads, arch)
+            return make_front(heads, arch, lower_bound=tuning[0])
         return make_chain(heads, arch, hpc=tuning[0])
 
     spec = _KdaTirxSpec((kind, arch, heads, tuning), factory)

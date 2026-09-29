@@ -45,7 +45,6 @@ NSLOT = 8
 TMEM1_COLS = 512
 TMEM2_COLS = 512
 LOG2E = 1.4426950408889634
-SIG_C1 = -2.5 * LOG2E
 VEC_F32 = 160
 TILE_BYTES = C * D * 2
 SMALL_BYTES = C * C * 2
@@ -201,7 +200,7 @@ def _tmem_preamble(s_tmem_addr, count):
     return tm
 
 
-def make_front(H: int, arch: str):
+def make_front(H: int, arch: str, lower_bound: float = -5.0):
     """Front-end kernel for a fixed head count: item it = c*H + h.  All per-item outputs are written
     straight to global memory with coalesced generic stores (row-major tiles, read back by K2 with TMA).
 
@@ -214,6 +213,10 @@ def make_front(H: int, arch: str):
     # flag traffic once 64+ heads load the front end, while fewer heads keep
     # the chain's wait short with four (H16-H48 vs H64-H128, B300).
     signal_batch = 8 if H >= 64 else SIG_BATCH
+    # log2 decay = lower_bound * sigmoid(2x) = SIG_C1 * (1 + tanh x); block products assume at most
+    # 5 nats of decay per token
+    assert -5.0 <= lower_bound < 0.0
+    SIG_C1 = 0.5 * lower_bound * LOG2E
 
     @txl.kernel(warps=20, arch=arch, min_blocks_per_sm=1, grid="num_ctas")
     def kda_front(

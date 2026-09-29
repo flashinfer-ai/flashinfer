@@ -51,7 +51,6 @@ from tvm.backend.cuda.cpp.descriptors import (
 
 BT, D = 64, 128
 RCP_LN2 = 1.0 / math.log(2.0)
-GATE_C = -2.5 * RCP_LN2
 EPS = 1e-6
 MAX_ITEMS = 160
 
@@ -112,12 +111,17 @@ def build_kernel(
     intra_regs=104,
     prep_regs=112,
     max_items=MAX_ITEMS,
+    lower_bound=-5.0,
 ):
     """Persistent CTAs, each walking its host-built item list (see _host_item_table).
 
     Item lists up to MAX_ITEMS long are staged in SMEM; longer ones (long sequences on few
     (sequence, head) units) are read from global memory in place."""
     assert H % 8 == 0
+    # The exponent budget (CLAMP_F, the half references) assumes at most 5 nats of decay per token.
+    assert -5.0 <= lower_bound < 0.0
+    # log2 decay = lower_bound * sigmoid(2x) = GATE_C * (1 + tanh x)
+    GATE_C = 0.5 * lower_bound * RCP_LN2
     global_items = max_items > MAX_ITEMS
 
     def kda_fwd(

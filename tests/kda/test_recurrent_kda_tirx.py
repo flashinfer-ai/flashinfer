@@ -266,8 +266,8 @@ def test_tirx_kda_rejects_invalid_contract(kind):
     elif kind == "bad_offsets":
         inputs["cu_seqlens"][-1] = 101
     if kind == "gate_bound":
-        with pytest.raises(ValueError, match="lower_bound=-5.0"):
-            _call(inputs, lower_bound=-1.0)
+        with pytest.raises(ValueError, match=r"lower_bound in \[-5, 0\)"):
+            _call(inputs, lower_bound=-6.0)
     elif kind == "unsupported":
         with pytest.raises(NotImplementedError, match="ssm_state_indices"):
             _call(
@@ -285,7 +285,7 @@ def test_tirx_kda_rejects_invalid_contract(kind):
             _call(inputs, **({"output": inputs["v"]} if kind == "alias_output" else {}))
 
 
-@pytest.mark.parametrize("lower_bound", [-5.0])
+@pytest.mark.parametrize("lower_bound", [-5.0, -1.0])
 def test_tirx_kda_weak_decay_and_zero_norm(lower_bound):
     inputs = _inputs((257,), 8, False)
     inputs["q"][:, ::5] = 0
@@ -475,3 +475,20 @@ def test_tirx_kda_fused_decoration_precision():
     for got, want, bound in zip(result, reference, (5e-3, 3.5e-3), strict=True):
         error = torch.linalg.vector_norm(got.float() - want.float())
         assert error <= bound * torch.linalg.vector_norm(want.float())
+
+
+@pytest.mark.parametrize(
+    "lengths, packed",
+    [((256,), False), ((1001,), False), ((300, 97, 640), True)],
+    ids=["split", "split+fused-tail", "fused-packed"],
+)
+@pytest.mark.parametrize("lower_bound", [-0.5, -2.5])
+def test_tirx_kda_lower_bound(lengths, packed, lower_bound):
+    """Each lower bound in [-5, 0) compiles its own gate constant on every route."""
+    inputs = _inputs(lengths, 16, packed=packed)
+    reference = _reference(
+        {**inputs, "initial_state": inputs["initial_state"].clone()},
+        lower_bound=lower_bound,
+    )
+    result = _call(inputs, output_final_state=True, lower_bound=lower_bound)
+    _assert_close(result, reference)

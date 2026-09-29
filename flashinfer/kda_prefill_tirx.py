@@ -91,8 +91,8 @@ def _run_tirx_kda(
         raise ValueError(
             "TIRx KDA requires fused Q/K normalization, gate and beta sigmoid"
         )
-    if lower_bound is None or float(lower_bound) != -5.0:
-        raise ValueError("TIRx KDA requires lower_bound=-5.0")
+    if lower_bound is None or not -5.0 <= float(lower_bound) < 0.0:
+        raise ValueError("TIRx KDA requires lower_bound in [-5, 0)")
     for name, tensor in (("q", q), ("k", k), ("v", v), ("g", g)):
         _validate_tensor(name, tensor, q.shape, torch.bfloat16, q.device)
     _validate_tensor("beta", beta, (B, T, H), torch.bfloat16, q.device)
@@ -268,6 +268,7 @@ def _launch_tirx_kda(
                     "A_log": A_log,
                     "dt_bias": dt_bias,
                     "scale": scale,
+                    "lower_bound": lower_bound,
                     "initial_state": zero_state,
                     "final_state": state,
                     "output": out,

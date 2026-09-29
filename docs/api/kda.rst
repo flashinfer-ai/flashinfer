@@ -604,7 +604,8 @@ The backend supports SM100/SM103 and requires:
 * contiguous FP32 ``A_log[H]`` and ``dt_bias[H*128]`` or ``dt_bias[H,128]``;
 * fused Q/K normalization, gate activation and beta sigmoid, with
   ``use_qk_l2norm_in_kernel=True``, ``use_gate_in_kernel=True``,
-  ``beta_is_logit=True`` and ``lower_bound=-5.0``;
+  ``beta_is_logit=True`` and ``lower_bound`` in ``[-5.0, 0.0)``; each lower
+  bound compiles its own gate constant;
 * optional contiguous, 32-byte-aligned FP32 value-first state
   ``[N,H,128,128]``, with ``N < 65536`` and ``N*H*128*128 < 2**31``;
 * fixed batches or packed ``B=1`` sequences with CUDA int32/int64

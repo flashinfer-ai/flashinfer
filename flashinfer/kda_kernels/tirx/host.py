@@ -123,7 +123,7 @@ def _fused_plan(data, offsets, T, H, arch):
         _TensorMap(data["beta"], (H, T), (H * 2,), (8, 64), 0, 2),
         activation_map(data["output"], rows=32),
     ]
-    executable = get_kernel("fused", arch, H, (max_items,))
+    executable = get_kernel("fused", arch, H, (max_items, data["lower_bound"]))
     args = _convert(
         (
             *(m.ptr for m in maps),
@@ -158,7 +158,7 @@ def _split_plan(data, T, H, arch):
     dev = data["q"].device
     sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
     hpc = 1 if sm_count // 2 >= H else 2
-    front = get_kernel("front", arch, H)
+    front = get_kernel("front", arch, H, (data["lower_bound"],))
     chain = get_kernel("chain", arch, H, (hpc,))
     C = 32
     NC = T // C
