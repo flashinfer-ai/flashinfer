@@ -39,7 +39,7 @@ PagedKVScaleFactors = tuple[torch.Tensor, torch.Tensor]
 if TYPE_CHECKING:
     from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
 
-_SUPPORTED_HEAD_DIMS = (64, 128, 256)
+_SUPPORTED_HEAD_DIMS = (64, 128, 256, 512)
 _SUPPORTED_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
 _MAX_INT32 = 2**31 - 1
 # Decode K/V masks form an exclusive tile endpoint as

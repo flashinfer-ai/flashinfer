@@ -4149,11 +4149,11 @@ def test_attention_ts_decode_d256_staged_tmem_p_has_overwrite_gate(
     _assert_decode_smem_within_capacity(cfg, smem_allocator)
 
 
-@pytest.mark.parametrize("headdim", (128, 256))
+@pytest.mark.parametrize("headdim", (128, 256, 512))
 def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
     headdim: int,
 ) -> None:
-    """FP8-Q/NVFP4 decode stores dequantized values in TMEM when H128/H256."""
+    """FP8-Q/NVFP4 decode stores dequantized values in TMEM for staged heads."""
 
     cfg = make_decode_config(
         headdim=headdim,
@@ -4173,6 +4173,8 @@ def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
 
     assert cfg.store_transformed_kv_in_tmem
     assert cfg.head_dim_kv_stage == 128
+    assert cfg.smem_kv_sf_bytes_per_token == headdim // 16
+    assert cfg.smem_kv_sf_tile_bytes == cfg.tile_size_kv * headdim // 16
     assert cfg.smem_kv_storage_tile_bytes == 2 * cfg.smem_kv_tile_bytes
     assert "tmemTransformedKv" in resources
     assert "smemTransformedKv" not in resources
@@ -4210,7 +4212,7 @@ def test_attention_ts_rejects_unsupported_fp16_q_fp8_kv():
         )
 
 
-@pytest.mark.parametrize("head_dim", (64, 128, 256))
+@pytest.mark.parametrize("head_dim", (64, 128, 256, 512))
 def test_attention_ts_decode_paged_mixed_matches_o_stages_to_kv_insts(head_dim):
     # When using paged KV, the transform task needs to take whole WG1.
     # num_insts_kv will be forced to 1.
@@ -4343,7 +4345,9 @@ def test_attention_ts_nvfp4_cache_contract():
     [1, 4, 8],
     ids=lambda value: f"q{value}",
 )
-@pytest.mark.parametrize("head_dim", [64, 128, 256], ids=lambda value: f"d{value}")
+@pytest.mark.parametrize(
+    "head_dim", [64, 128, 256, 512], ids=lambda value: f"d{value}"
+)
 @pytest.mark.parametrize(
     ("num_qo_heads", "num_kv_heads"),
     [(32, 4)],
