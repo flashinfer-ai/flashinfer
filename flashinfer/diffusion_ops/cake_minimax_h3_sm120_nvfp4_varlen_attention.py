@@ -607,8 +607,29 @@ def minimax_h3_sm120_varlen_attention_nvfp4_nodelta(
       short plans where pre-processing dominates.
 
     Use the default route unless the extra error has been validated for the model in question.  Inputs,
-    output, ``cu_seqlens`` handling, workspace and caching are exactly those of the default route; see
-    its documentation.
+    output, ``cu_seqlens`` handling, workspace and caching are exactly those of the default route.
+
+    Parameters
+    ----------
+    q, k, v : torch.Tensor
+        Contiguous ``bfloat16`` CUDA tensors of shape ``[tokens, heads, 128]`` (packed THD
+        layout; MiniMax-H3 uses 56 heads).
+    cu_seqlens : torch.Tensor
+        ``int32`` tensor of shape ``[segments + 1]`` on the same device with ``cu_seqlens[0] = 0``,
+        non-decreasing entries and ``cu_seqlens[-1] = tokens``.  Segments shorter than 8 tokens are
+        outside this route's FP4 tolerance (see above).
+    out : Optional[torch.Tensor]
+        Optional pre-allocated output of the same shape/dtype as ``q``; allocated when omitted.
+    cu_seqlens_host : Optional[Sequence[int]]
+        Host copy of ``cu_seqlens`` (avoids a synchronizing device-to-host copy).  The
+        segment plan is cached per ``(cu_seqlens, heads, device)`` and shared with the default route.
+    softmax_scale : Optional[float]
+        Softmax scale; defaults to ``1 / sqrt(128)``.
+
+    Returns
+    -------
+    torch.Tensor
+        ``bfloat16`` ``[tokens, heads, 128]`` attention output of the uncompensated route.
     """
 
     if q.ndim != 3:
