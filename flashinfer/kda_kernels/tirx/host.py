@@ -24,7 +24,6 @@ from .cache import get_kernel
 from .schedule import _host_item_table
 
 D = 128
-_MIXED = (1300, 547, 2048, 963, 271, 3063)
 
 
 class _TensorMap:
@@ -61,6 +60,27 @@ def make_plan(data, offsets, fixed):
     arch = "sm_%d%da" % torch.cuda.get_device_capability(q.device)
     if fixed and T % 32 == 0:
         return _split_plan(data, T, H, arch)
+    if fixed and T > 32:
+        # Run the full 32-token chunks on the split route, then continue the
+        # handed-off state through the short tail on the fused route.
+        body = T - T % 32
+        head = dict(data, final_state=data["final_state"])
+        tail = dict(data, initial_state=data["final_state"])
+        for name in ("q", "k", "v", "g", "beta", "output"):
+            head[name] = data[name][:, :body]
+            tail[name] = data[name][:, body:]
+        first = _split_plan(head, body, H, arch)
+        rest = _fused_plan(tail, [0, T - body], T - body, H, arch)
+
+        def launch():
+            first["launch"]()
+            rest["launch"]()
+
+        return {
+            "launch": launch,
+            "keep": (first, rest),
+            "route": "split+fused-tail",
+        }
     return _fused_plan(data, offsets, T, H, arch)
 
 
@@ -73,12 +93,13 @@ def _fused_plan(data, offsets, T, H, arch):
     nseq = len(lengths)
     sm_count = torch.cuda.get_device_properties(dev).multi_processor_count
     num_ctas = min(sm_count, H * nseq)
-    # Keep the imported INT21 choices; other shapes use whole chains and FP32 handoffs.
-    official = sm_count == 148 and H in (64, 96) and lengths in (_MIXED, (1024,) * 8)
-    force_lpt = not official or (H == 96 and lengths == _MIXED)
-    bf16_handoff = official and H == 64
-    lists = _host_item_table(offsets, H, num_ctas, force_lpt)
-    max_items = max(160, ((max(map(len, lists)) + 31) // 32) * 32)
+    # Every split schedule hands off FP32 state.
+    bf16_handoff = False
+    lists = _host_item_table(offsets, H, num_ctas)
+    # max_items is a compile-time per-CTA stride: bucket it so varied long
+    # work lists reuse a few kernels.
+    longest = max(map(len, lists))
+    max_items = 160 if longest <= 160 else 1 << (longest - 1).bit_length()
     items = torch.zeros(num_ctas, max_items, 2, dtype=torch.int64)
     for cta, entries in enumerate(lists):
         if entries:

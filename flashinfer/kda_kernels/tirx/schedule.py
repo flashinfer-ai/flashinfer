@@ -14,20 +14,23 @@ SNAP = 1
 START_COST = 0.9
 # cost of one fp32 state handoff between adjacent CTAs, in chunk-equivalents
 HANDOFF_COST = 0.4
+# Split ranges only when they lower the modelled makespan by this fraction;
+# smaller modelled gains measured slower than LPT on B300.
+MIN_SPLIT_GAIN = 0.05
 
 
 def _tok_bits(tok0):
     return (tok0 & 0xFFFF) | ((tok0 >> 16) << 23)
 
 
-def _host_item_table(cu_list, H, num_ctas, force_lpt):
+def _host_item_table(cu_list, H, num_ctas):
     """Per-CTA (word0, word1) item lists.
 
-    Sequences are ranked by length (ties by index).  When the longest sequence is short against the mean load
-    the (head, sequence, chunk) walk is cut into num_ctas equal-cost ranges (chunk cost 1, BETA per sequence
-    start, cuts snapped to a sequence end within SNAP chunks; a range starting inside a sequence continues
-    the state handed off by the previous CTA); otherwise whole (sequence, head) items go to the least loaded
-    CTA group (LPT).  word0 = tok0[15:0] | nvalid << 16 | tok0[20:16] << 23 | dst_hand << 28 | src_hand << 29 | first << 30 | last << 31,
+    Sequences are ranked by length (ties by index).  Whole (sequence, head) items go to the least loaded
+    CTA (LPT).  When the longest sequence is short against the mean load, the (head, sequence, chunk) walk
+    may instead be cut into num_ctas equal-cost ranges (chunk cost 1, BETA per sequence start, cuts snapped
+    to a sequence end within SNAP chunks; a range starting inside a sequence continues the state handed off
+    by the previous CTA); that layout is used when its modelled makespan beats LPT by MIN_SPLIT_GAIN.  word0 = tok0[15:0] | nvalid << 16 | tok0[20:16] << 23 | dst_hand << 28 | src_hand << 29 | first << 30 | last << 31,
     word1 = seq | head << 16."""
     nseq = len(cu_list) - 1
     start = [int(cu_list[n]) for n in range(nseq)]
@@ -52,9 +55,27 @@ def _host_item_table(cu_list, H, num_ctas, force_lpt):
     c_tot = ch_cost * H
     l_min = c_tot // num_ctas
     items = [[] for _ in range(num_ctas)]
-    if maxnch <= l_min - (2 * SNAP + BETA) and not force_lpt:
+    # unit-level LPT: every (sequence, head) chain is one unit of cost chunks + START_COST, placed longest-first on the least loaded CTA, then a move/swap local search on the most loaded CTA
+    units = sorted(
+        ((nch[r] + START_COST, r, hh) for r in range(nseq) for hh in range(H)),
+        key=lambda u: (-u[0], u[1], u[2]),
+    )
+    per = [[] for _ in range(num_ctas)]
+    load = [0.0] * num_ctas
+    heap = [(0.0, c) for c in range(num_ctas)]
+    for cost, r, hh in units:
+        l, c = heapq.heappop(heap)
+        per[c].append((r, hh))
+        load[c] = l + cost
+        heapq.heappush(heap, (load[c], c))
+    _balance_units(per, load, nch, START_COST)
+    cuts = None
+    if maxnch <= l_min - (2 * SNAP + BETA):
         # cut positions minimising the maximum modelled range cost (chunk 1, unit start or continuation START_COST, handoff HANDOFF_COST)
-        cuts = _optimal_cuts(nch, H, num_ctas)
+        cuts, split_span = _optimal_cuts(nch, H, num_ctas)
+        if split_span > max(load) * (1 - MIN_SPLIT_GAIN):
+            cuts = None
+    if cuts is not None:
 
         def cut_pos(p):
             return cuts[min(max(p, 0), num_ctas)]
@@ -87,20 +108,6 @@ def _host_item_table(cu_list, H, num_ctas, force_lpt):
                                 items[cta].append((word0 & 0xFFFFFFFF, n | (hh << 16)))
     else:
         assert num_ctas >= H, "whole-item scheduling needs at least one CTA per head"
-        # unit-level LPT: every (sequence, head) chain is one unit of cost chunks + START_COST, placed longest-first on the least loaded CTA, then a move/swap local search on the most loaded CTA
-        units = sorted(
-            ((nch[r] + START_COST, r, hh) for r in range(nseq) for hh in range(H)),
-            key=lambda u: (-u[0], u[1], u[2]),
-        )
-        per = [[] for _ in range(num_ctas)]
-        load = [0.0] * num_ctas
-        heap = [(0.0, c) for c in range(num_ctas)]
-        for cost, r, hh in units:
-            l, c = heapq.heappop(heap)
-            per[c].append((r, hh))
-            load[c] = l + cost
-            heapq.heappush(heap, (load[c], c))
-        _balance_units(per, load, nch, START_COST)
         for cta in range(num_ctas):
             for r, hh in per[cta]:
                 n = order[r]
@@ -119,7 +126,8 @@ def _host_item_table(cu_list, H, num_ctas, force_lpt):
 
 
 def _optimal_cuts(nch, H, num_ctas):
-    """num_ctas + 1 cut positions in the (head, sequence-rank, chunk) walk minimising the maximum range cost."""
+    """num_ctas + 1 cut positions in the (head, sequence-rank, chunk) walk minimising the maximum range cost,
+    and that cost."""
     walk = []
     for _ in range(H):
         for n in nch:
@@ -192,7 +200,12 @@ def _optimal_cuts(nch, H, num_ctas):
                 num_ctas - (len(best) - 1)
             )  # remaining CTAs get empty ranges
             break
-    return best
+    span = max(
+        range_cost(best[i], best[i + 1])
+        for i in range(len(best) - 1)
+        if best[i] < best[i + 1]
+    )
+    return best, span
 
 
 def _balance_units(per, load, nch, start_cost, max_rounds=400):
