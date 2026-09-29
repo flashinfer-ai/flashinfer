@@ -99,6 +99,11 @@ SWAP_TILED_WEIGHTS = int(os.environ.get("SWAPAB_TILED_W", "3"))
 # -2 to -7 %, single-wave rows unchanged); ``SWAPAB_REMAINDER_SPLIT=0``
 # keeps the grid-uniform rule (split only when every item fits half the CTAs).
 SWAP_REMAINDER_SPLIT = int(os.environ.get("SWAPAB_REMAINDER_SPLIT", "1"))
+# Device split-K of the finalize swap GEMM2 on the last partial wave only
+# (the full waves keep whole-K items; the additive ``red.global.add``
+# partials need no exchange); ``SWAPAB_GEMM2_REMAINDER_SPLIT=0`` keeps the
+# grid-uniform rule (split only when every item fits half the CTAs).
+SWAP_GEMM2_REMAINDER_SPLIT = int(os.environ.get("SWAPAB_GEMM2_REMAINDER_SPLIT", "1"))
 
 _tiled_weight_cache: "OrderedDict[Tuple, Tuple[torch.Tensor, torch.Tensor]]" = (
     OrderedDict()
@@ -760,6 +765,7 @@ def swapab_gemm2(
         pdl_trigger_after_wait=pdl_trigger_after_wait,
         split_k=split_k,
         split_max_items=split_max_items,
+        remainder_split=bool(SWAP_GEMM2_REMAINDER_SPLIT) and split_k > 1,
     )
     if _prepared_launches is not None:
         _prepared_launches["swap_gemm2"] = (compiled, args)

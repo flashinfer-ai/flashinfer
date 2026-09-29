@@ -161,9 +161,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # Device-side adaptive split-K (finalize epilogue only: its
         # ``red.global.add`` output makes K partials additive). Work items are
         # (m_chunk * split_k + split, row_group); the scheduler warp publishes
-        # each item's K range and splits only while the valid items
-        # (num_valid_groups * m_chunks) fit ``split_max_items`` CTAs, so a row
-        # with more tiles than SMs keeps whole-K items (split > 0 skipped).
+        # each item's K range. Grid-uniform rule: split only while the valid
+        # items (num_valid_groups * m_chunks) fit ``split_max_items`` CTAs, so
+        # a row with more tiles than SMs keeps whole-K items (split > 0
+        # skipped). With ``remainder_split`` the full waves keep whole-K items
+        # and only the last partial wave's items are split (see below).
         self.split_k = int(split_k)
         self.split_max_items = int(split_max_items)
         if self.split_k not in (1, 2, 3, 4):
@@ -177,11 +179,13 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         # only groups CTAs.
         self.cluster_split = bool(cluster_split)
         # Remainder-only split: the full waves of the unsplit raster run as
-        # they are; the items of the last partial wave are split across
-        # the two CTAs of a cluster pair when they fit the pairs (the
-        # single-wave launch is the special case of no full wave). Off: the
-        # grid-uniform rule (every item split or none).
-        self.remainder_split = bool(remainder_split) and self.cluster_split
+        # they are; the items of the last partial wave are split ``split_k``
+        # ways when they fit the CTA budget (the single-wave launch is the
+        # special case of no full wave). Cluster form: the two K halves run
+        # on the two CTAs of a cluster pair; finalize form: the parts are
+        # independent work items whose ``red.global.add`` partials add up.
+        # Off: the grid-uniform rule (every item split or none).
+        self.remainder_split = bool(remainder_split) and self.split_k > 1
         if self.cluster_split:
             if epilogue_kind != "situ_mxfp8" or self.split_k != 2:
                 raise ValueError(
@@ -1163,9 +1167,10 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
         sk_rem = cutlass.Int32(0)
         if cutlass.const_expr(self.split_k > 1 and self.remainder_split):
             # Items of the full waves run unsplit (round robin over the
-            # CTAs); the last partial wave's items are split across the
-            # cluster pairs when they fit them (the single-wave case of the
-            # grid-uniform rule is the special case of no full wave).
+            # CTAs); the last partial wave's items are split ``split_k`` ways
+            # (cluster pairs, or independent finalize items) when they fit
+            # the budget (the single-wave case of the grid-uniform rule is
+            # the special case of no full wave).
             # The CTA budget is the compile-time constant behind
             # ``split_max_items`` (the persistent grid is min(tiles, budget);
             # a smaller grid means fewer items than the budget, i.e. no full
@@ -1174,7 +1179,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
             # non-provably warp-uniform and push the whole kernel off the
             # uniform datapath (measured: +31 % on the single-tile chain);
             # the scheduler mapping below is branch-free for the same reason.
-            sk_ctas = self.split_max_items * 2
+            sk_ctas = self.split_max_items * self.split_k
             sk_items = cutlass.Int32(num_valid_groups * sk_m_chunks)
             sk_waves = sk_items // sk_ctas
             sk_full = sk_waves * sk_ctas
@@ -1208,11 +1213,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     if cutlass.const_expr(self.remainder_split):
                         # Remainder mapping (branch-free, see the decision
                         # above): items below ``sk_full`` keep the unsplit
-                        # raster; pair p = (lin - full) // 2 takes item
-                        # full + p, its two CTAs the two K halves; pairs past
-                        # ``sk_rem`` have no item.
+                        # raster; part group p = (lin - full) // split_k takes
+                        # item full + p, its ``split_k`` units the K parts;
+                        # groups past ``sk_rem`` have no item.
                         sk_off = sk_lin - sk_full
-                        sk_pair = sk_off // 2
+                        sk_pair = sk_off // self.split_k
                         sk_item = sk_full + sk_pair
                         sk_in_rem = cutlass.Int32(sk_do_split & (sk_lin >= sk_full))
                         sk_valid = sk_in_rem * cutlass.Int32(sk_pair < sk_rem)
@@ -1222,7 +1227,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         sk_chunk = sk_lin_item - sk_group * sk_m_chunks
                         sk_group = sk_group * (1 - sk_skip) + num_valid_groups * sk_skip
                         sk_cnt = k_tile_cnt - (k_tile_cnt - sk_cnt_split) * sk_valid
-                        sk_begin = (sk_off - sk_pair * 2) * sk_cnt_split * sk_valid
+                        sk_begin = (sk_off - sk_pair * self.split_k) * sk_cnt_split * sk_valid
                     elif sk_do_split:
                         sk_group = cur[1]
                         sk_chunk = cur[0] // self.split_k
@@ -1339,11 +1344,11 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                     if cutlass.const_expr(self.remainder_split):
                         # Remainder mapping (branch-free, see the decision
                         # above): items below ``sk_full`` keep the unsplit
-                        # raster; pair p = (lin - full) // 2 takes item
-                        # full + p, its two CTAs the two K halves; pairs past
-                        # ``sk_rem`` have no item.
+                        # raster; part group p = (lin - full) // split_k takes
+                        # item full + p, its ``split_k`` units the K parts;
+                        # groups past ``sk_rem`` have no item.
                         sk_off = sk_lin - sk_full
-                        sk_pair = sk_off // 2
+                        sk_pair = sk_off // self.split_k
                         sk_item = sk_full + sk_pair
                         sk_in_rem = cutlass.Int32(sk_do_split & (sk_lin >= sk_full))
                         sk_valid = sk_in_rem * cutlass.Int32(sk_pair < sk_rem)
@@ -1353,7 +1358,7 @@ class Sm100BlockScaledSwapAbGroupedGemmKernel:
                         sk_chunk = sk_lin_item - sk_group * sk_m_chunks
                         sk_group = sk_group * (1 - sk_skip) + num_valid_groups * sk_skip
                         sk_cnt = k_tile_cnt - (k_tile_cnt - sk_cnt_split) * sk_valid
-                        sk_begin = (sk_off - sk_pair * 2) * sk_cnt_split * sk_valid
+                        sk_begin = (sk_off - sk_pair * self.split_k) * sk_cnt_split * sk_valid
                     elif sk_do_split:
                         sk_group = cur[1]
                         sk_chunk = cur[0] // self.split_k

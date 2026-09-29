@@ -489,10 +489,13 @@ partial wait sound; the two flags are exclusive with the entry trigger of
 the split form's wide launches. On the same chain the finalize GEMM2
 splits its K loop on the device (``SWAPAB_GEMM2_SPLIT_K``, default 2; 1
 disables): its scheduler warp publishes a K range with every work item
-and hands out ``(m_chunk, split)`` halves of the resident tile only while
-the launch's valid work fits in half the SMs, otherwise the items map
-onto the original raster; the finalize epilogue's ``red.global.add``
-makes the partials additive, so no partial buffer or counter is needed.
+and hands out ``(m_chunk, split)`` halves of the resident tile: the full
+waves of the unsplit raster run as they are and the items of the last
+partial wave are split while they fit half the SMs
+(``SWAPAB_GEMM2_REMAINDER_SPLIT``, default 1; 0 keeps the grid-uniform
+rule, which splits every item or none and so only the launches whose whole
+work fits half the SMs); the finalize epilogue's ``red.global.add`` makes
+the partials additive, so no partial buffer or counter is needed.
 The shard's K = 384 GEMM2 (one stage) and the deferred form keep one
 split. Measured on B300 (same GPU, paired, FP64-checked): EP=8
 single-expert decode rows 1.03-1.04 x (21.9-22.2 -> 21.1-21.6 us), EP=8
