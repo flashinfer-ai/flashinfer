@@ -3271,8 +3271,13 @@ class TmemSPResource(MemoryResource):
                     rnd="rn",
                     ftz=False,
                 )
-                p0 = cute.math.exp2(fma_pair[0], fastmath=True)
-                p1 = cute.math.exp2(fma_pair[1], fastmath=True)
+                if cutlass.const_expr(
+                    elem_idx // 2 >= tmem_x // 2 - self.cfg.exp2_fma_pairs
+                ):
+                    p0, p1 = _exp2_fma_packed(fma_pair[0], fma_pair[1])
+                else:
+                    p0 = cute.math.exp2(fma_pair[0], fastmath=True)
+                    p1 = cute.math.exp2(fma_pair[1], fastmath=True)
                 if cutlass.const_expr(self.enable_early_tile_sum):
                     pair_idx = chunk_idx * (tmem_x // 2) + elem_idx // 2
                     if cutlass.const_expr(pair_idx % 2 == 0):
@@ -3994,8 +3999,7 @@ class TmemSPResource(MemoryResource):
                     ftz=False,
                 )
                 if cutlass.const_expr(
-                    self.cfg.v_dtype.width == 16
-                    and elem_idx // 2 >= tmem_x // 2 - self.cfg.exp2_fma_pairs
+                    elem_idx // 2 >= tmem_x // 2 - self.cfg.exp2_fma_pairs
                 ):
                     p0, p1 = _exp2_fma_packed(fma_pair[0], fma_pair[1])
                 else:

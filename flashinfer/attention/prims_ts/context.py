@@ -274,7 +274,6 @@ def _make_context_kernel(
     causal_single_kv_tile: bool,
     scheduler: _ContextScheduler,
     uses_ldtm_stat: bool,
-    exp2_fma_pairs: int,
     two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
@@ -328,7 +327,6 @@ def _make_context_kernel(
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
         **paged_kwargs,
     )
-    fmha.cfg.exp2_fma_pairs = exp2_fma_pairs
     return fmha
 
 
@@ -509,12 +507,19 @@ def _dsl_supports_ldtm_stat() -> bool:
         return False
 
 
-def _default_exp2_fma_pairs(device_index: int, v_dtype) -> int:
-    """FMA-pipe exp2 pairs per 16-pair softmax chunk: 4 for 16-bit V on SM100,
-    where MUFU bounds the softmax, 0 elsewhere."""
+def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
+    """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100 with 16-bit V.
+
+    Measured on B200. The paired D128 dense path is MUFU bound and takes 4.
+    Single-QKV dense takes 2. Causal is issue bound and takes 0. Callers can
+    set cfg.exp2_fma_pairs to any value on any path."""
     if torch.cuda.get_device_capability(device_index) != (10, 0):
         return 0
-    return 4 if v_dtype.width == 16 else 0
+    if cfg.v_dtype.width != 16 or cfg.is_causal:
+        return 0
+    if cfg.pv_half_overlap:
+        return 4
+    return 2 if cfg.single_qkv_instance else 0
 
 
 def _default_two_cta_umma(device_index: int) -> bool:
@@ -1495,9 +1500,6 @@ def _make_context_scheduler_probe(
         causal_single_kv_tile=causal_single_kv_tile,
         scheduler="static_persistent",
         uses_ldtm_stat=_default_uses_ldtm_stat(geometry.device_index),
-        exp2_fma_pairs=_default_exp2_fma_pairs(
-            geometry.device_index, dtype_map[geometry.pv_dtype]
-        ),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -1795,7 +1797,6 @@ def _get_compiled_context(
         scheduler=scheduler,
         two_cta_umma=two_cta_umma,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
-        exp2_fma_pairs=_default_exp2_fma_pairs(device_index, input_pv_dtype),
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -1812,6 +1813,7 @@ def _get_compiled_context(
     fmha.cfg.packed_dense_k_mask = packed_dense_k_mask
     if mask_type != "causal" and not packed:
         fmha.cfg.fixed_dense_k_tail = max_seq_len_k % fmha.cfg.kv_tile_n
+    fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
 
     @cute.jit
     def tensor_adapter(
@@ -2008,7 +2010,6 @@ def _get_compiled_paged_context(
         causal_single_kv_tile=False,
         scheduler=scheduler,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
-        exp2_fma_pairs=_default_exp2_fma_pairs(device_index, input_pv_dtype),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )
@@ -2026,6 +2027,7 @@ def _get_compiled_paged_context(
         )
     _validate_query_work_tile_span(fmha.cfg)
     fmha.cfg.packed_dense_k_mask = packed_dense_k_mask
+    fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
 
     @cute.jit
     def tensor_adapter(
