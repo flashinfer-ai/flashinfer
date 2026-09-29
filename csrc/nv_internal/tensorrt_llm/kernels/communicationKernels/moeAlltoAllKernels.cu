@@ -856,21 +856,21 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
         if (use_compact_ep4) {
           int shared_bytes = kEp4Size * (int)sizeof(int);
           auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, true, true>;
-          launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
-                                   block_size, shared_bytes, params.stream,
-                                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                                   params.max_tokens_per_rank, params.local_num_tokens,
-                                   params.ep_rank, params.ep_size, params.num_experts,
-                                   params.eplb_stats_num_experts, params.enable_pdl);
+          launchWithPdlWhenEnabled(
+              "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
+              shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+              params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
+              params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts,
+              params.enable_pdl, params.invalid_expert_id);
         } else {
           int shared_bytes = 2 * params.top_k * (int)sizeof(int);
           auto kernel_fn = moeA2ADispatchKernel<22, EPLB_STATS, ENABLE_RANK_MASK, false, true>;
-          launchWithPdlWhenEnabled("moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size,
-                                   block_size, shared_bytes, params.stream,
-                                   params.token_selected_experts, kernel_ptrs, params.num_payloads,
-                                   params.max_tokens_per_rank, params.local_num_tokens,
-                                   params.ep_rank, params.ep_size, params.num_experts,
-                                   params.eplb_stats_num_experts, params.enable_pdl);
+          launchWithPdlWhenEnabled(
+              "moeA2ADispatchKernel", params.enable_pdl, kernel_fn, grid_size, block_size,
+              shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
+              params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
+              params.ep_rank, params.ep_size, params.num_experts, params.eplb_stats_num_experts,
+              params.enable_pdl, params.invalid_expert_id);
         }
       } else if (phase_nvfp4_payloads) {
         if (use_compact_ep4) {
@@ -884,7 +884,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                     shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
                     params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
                     params.ep_rank, params.ep_size, params.num_experts,
-                    params.eplb_stats_num_experts, params.enable_pdl);
+                    params.eplb_stats_num_experts, params.enable_pdl, params.invalid_expert_id);
               })
         } else {
           int shared_bytes = 2 * params.top_k * (int)sizeof(int);
@@ -897,7 +897,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params) {
                     shared_bytes, params.stream, params.token_selected_experts, kernel_ptrs,
                     params.num_payloads, params.max_tokens_per_rank, params.local_num_tokens,
                     params.ep_rank, params.ep_size, params.num_experts,
-                    params.eplb_stats_num_experts, params.enable_pdl);
+                    params.eplb_stats_num_experts, params.enable_pdl, params.invalid_expert_id);
               })
         }
       } else if (use_compact_ep4) {
