@@ -22,6 +22,9 @@ within ``1.15x`` the default route's on the same inputs, the output is determini
 share their validation.  Every test needs an SM120 GPU.
 """
 
+import importlib.util
+import pathlib
+
 import pytest
 import torch
 
@@ -33,17 +36,22 @@ from flashinfer.diffusion_ops.cake_minimax_h3_sm120_quant_varlen_attention impor
     MINIMAX_H3_NUM_HEADS,
 )
 
-# tests/diffusion_ops is not a package: pytest's default import mode puts this directory on sys.path,
-# so the default route's fixtures import by module name.
-from test_minimax_h3_sm120_nvfp4_varlen_attention import (  # noqa: I001
-    ATOL,
-    RTOL,
-    CU_SEQLENS,
-    _check,
-    fp32_oracle,
-    requires_sm120,
-    synthetic_inputs,
+# tests/diffusion_ops is not a package and the CI collects with an import mode that does not put this
+# directory on sys.path, so the default route's fixtures are loaded from the sibling file by path.
+_DEFAULT_ROUTE_TESTS = importlib.util.spec_from_file_location(
+    "_minimax_h3_sm120_nvfp4_varlen_attention_default_route_tests",
+    pathlib.Path(__file__).with_name("test_minimax_h3_sm120_nvfp4_varlen_attention.py"),
 )
+assert _DEFAULT_ROUTE_TESTS is not None and _DEFAULT_ROUTE_TESTS.loader is not None
+_default_route_tests = importlib.util.module_from_spec(_DEFAULT_ROUTE_TESTS)
+_DEFAULT_ROUTE_TESTS.loader.exec_module(_default_route_tests)
+ATOL = _default_route_tests.ATOL
+RTOL = _default_route_tests.RTOL
+CU_SEQLENS = _default_route_tests.CU_SEQLENS
+_check = _default_route_tests._check
+fp32_oracle = _default_route_tests.fp32_oracle
+requires_sm120 = _default_route_tests.requires_sm120
+synthetic_inputs = _default_route_tests.synthetic_inputs
 
 # rel-L2(nodelta) / rel-L2(default) on the same inputs: measured 1.09 on Gaussian inputs at every
 # contract shape; the bound leaves headroom for the boundary shapes without accepting a broken kernel.
