@@ -50,6 +50,18 @@ freshly allocated outputs (`cake_backend.BINDING_CACHE`: no caller tensor
 pinned, workspace scratch owned per binding under a FIFO capacity and a byte
 budget; `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0` disables it).
 
+Host cost through the autograd wrapper: the `Function.backward` runs on
+PyTorch's autograd device thread, where the two thread handoffs (about 30 us
+each with an idle GPU, about 170 us each while kernels are queued on the
+stream) and the Python body (3-4x slower there than on the main thread) add
+roughly 400 us per backward at 4k tokens on B200 that are not in this package
+-- a trivial `autograd.Function` with the same saved tensors and gradient
+shapes shows the same cost, and no synchronization is involved.  In a
+GPU-bound training step this is hidden behind the backward kernels (6-8 ms at
+4k tokens).  Host-bound loops should call `cake_backend.forward` /
+`cake_backend.backward` directly (about 25 / 40 us per call with a remembered
+binding) or capture the prepared runner into a CUDA graph.
+
 ## Layout of this package
 
 * `cake_jit.py` -- `MODULES` registry (one record per architecture, filled by
