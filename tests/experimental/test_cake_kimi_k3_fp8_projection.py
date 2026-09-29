@@ -371,6 +371,38 @@ def test_decode_config_round6_rules(arch):
     assert cb.gemm_prefetch_distance(257, 12, 28, arch) == 0
 
 
+@pytest.mark.parametrize("arch", ARCHES)
+def test_decode_config_round6_continuation_rules(arch):
+    # Lever E1: ``tstore`` rows launch the TMA-store epilogue program (``_tso``) only on a 16-byte-aligned output view; the
+    # plain key (register epilogue) is the same instance otherwise.  Split-K / cluster rows never carry the flag.
+    n_tstore = 0
+    for key, entry in DECODE_TABLE[arch].items():
+        if entry["route"] != "decode":
+            continue
+        n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
+        cfg = decode_config(bucket, n_tiles128, num_k_iters, arch, SM_COUNT)
+        assert cfg.tstore == bool(entry.get("tstore", False))
+        assert not cfg.kernel_key.endswith("_tso")
+        if cfg.tstore:
+            n_tstore += 1
+            assert cfg.split == 1 and cfg.csplit == 1 and cfg.tok >= 32
+            assert cfg.kernel_key_for(True) == cfg.kernel_key + "_tso"
+        assert cfg.kernel_key_for(False) == cfg.kernel_key
+    assert n_tstore == 17
+    cfg = decode_config(256, 56, 6, arch, SM_COUNT)  # tp8 o_proj M = 256: 1.07x on both GPUs
+    assert cfg.tstore and cfg.kernel_key_for(True) == "decode:t128_p3_tso"
+    # Lever C16: the M <= 64 rows that used a 12-28-way global split-K now run one cluster per output tile (14 CTAs = two
+    # 256-K stages each; non-portable cluster), the 12-tile family a 7-CTA cluster (12 clusters <= capacity 15) and the
+    # 17-tile family a 4-CTA cluster; the grid is whole clusters within the measured co-resident capacity.
+    for (M, n_tiles, c, clusters) in ((1, 1, 14, 1), (64, 1, 14, 4), (1, 5, 14, 5), (1, 12, 7, 12), (1, 17, 4, 17)):
+        cfg = decode_config(M, n_tiles, 28, arch, SM_COUNT)
+        assert (cfg.tok, cfg.split, cfg.csplit, cfg.fused) == (16, c, c, True), (M, n_tiles, cfg)
+        assert clusters <= cb.decode_cluster_capacity(arch, c)
+        assert cfg.grid == c * clusters and cfg.total_work == cfg.grid
+        assert f"_cs{c}" in cfg.kernel_key and not cfg.tstore
+    assert cb.decode_cluster_capacity(arch, 14) == 7 and cb.decode_cluster_capacity(arch, 9) == 15
+
+
 def test_decode_module_stage_clamp():
     # 128-token unfused: 4 stages of 66 KB do not fit the pool -> 3.
     assert decode_module_stages(128, 4, False, False) == 3
