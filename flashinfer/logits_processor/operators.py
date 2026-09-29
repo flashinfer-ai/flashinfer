@@ -18,8 +18,10 @@ from typing import Any, Optional, Tuple, Union
 
 import torch
 
-import flashinfer.sampling as sampling
-from flashinfer.sampling import get_sampling_module
+from flashinfer.sampling import (
+    get_sampling_module,
+    softmax as sampling_softmax,
+)
 from flashinfer.utils import _get_cache_buf, device_support_pdl
 
 from .op import ParameterizedOp
@@ -398,7 +400,7 @@ class FusedTemperatureSoftmaxOp(ParameterizedOp):
 
         # Keep fused pipelines on the public dispatch path so architecture-
         # specific softmax routes match direct flashinfer.sampling.softmax.
-        probs = sampling.softmax(
+        probs = sampling_softmax(
             logits=tensor.data, temperature=temperature, enable_pdl=enable_pdl
         )
 
