@@ -261,7 +261,7 @@ def _check_forward(inp, out, lse, ref, *, valid_rows=None):
         assert (lse.double()[finite] - lse_ref[finite]).abs().max().item() <= GATE_LSE_ABS
     if (~finite).any():
         assert torch.all(lse[~finite] == float("-inf"))
-        rows = ~finite.all(-1) if valid_rows is None else ~valid_rows
+        rows = ~finite.any(-1) if valid_rows is None else ~valid_rows  # fully masked rows
         assert torch.all(out[rows] == 0)
 
 
