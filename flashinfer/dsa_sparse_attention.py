@@ -94,6 +94,13 @@ def dsa_sparse_attention(
     accumulation; the backward recomputes the scores from the BF16 inputs and
     forms the exact ``delta`` from the saved output residual.  The kernels
     apply no positional mask: the index rows define the key set.
+
+    Host side: the inputs are validated and bound on the first call for an
+    input binding (``data_ptr``, shape, stride and dtype of every input plus
+    the scale); later calls with the same binding launch from the remembered
+    argument plans with freshly allocated outputs
+    (``flashinfer.experimental.cake_dsa_train.cake_backend.BINDING_CACHE``;
+    ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0`` disables it).
     """
     return _backend(backend).dsa_sparse_attention(
         q_latent,

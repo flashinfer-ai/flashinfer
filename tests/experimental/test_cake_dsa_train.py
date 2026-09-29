@@ -16,6 +16,7 @@ limitations under the License.
 
 import contextlib
 import warnings
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -35,7 +36,11 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     SUPPORTED_ABIS,
     SUPPORTED_COMPUTE_CAPABILITIES,
     WORKSPACE_ALIGN,
+    BindingCache,
+    backward_binding_key,
     bind_stage,
+    default_softmax_scale,
+    forward_binding_key,
     generated_program_available,
     grid_dims,
     offset_gather_kv_indices,
@@ -261,6 +266,97 @@ def test_bind_stage_fails_closed_on_unknown_argument(monkeypatch):
         bind_stage("cake_dsa_h64_train_fake", "fwd", values, (1, 1, 1))
 
 
+def test_bind_stage_records_rebind_slots(monkeypatch):
+    record = {
+        "arch": "sm_100a",
+        "abi": ABI_CONTRACT,
+        "stages": ["fwd"],
+        "fwd": {
+            "module": "fake",
+            "sources": [],
+            "compile_flags": [],
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["tma_buffer", "q_latent"],
+                ["buffer", "k_rope"],
+                ["parameter", "k_rope_offset"],
+                ["parameter", "num_queries"],
+                ["buffer", "lengths"],
+                ["parameter", "scale_log2"],
+                ["grid", "grid_x"],
+            ],
+            "closure_sha256": "0" * 64,
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "0" * 64,
+    }
+    monkeypatch.setitem(cake_jit.MODULES, "cake_dsa_h64_train_fake", record)
+    calls = []
+    fake = SimpleNamespace(run=lambda *args: calls.append(args))
+    monkeypatch.setattr(cake_backend, "load_cake_dsa_train_module", lambda name, stage: fake)
+    kv = torch.zeros(4, D_QK, dtype=torch.bfloat16)
+    k_rope = kv[:, D_LATENT:]
+    storage, offset = cake_backend._pointer_alias(k_rope)
+    values = dict(
+        q_latent=torch.zeros(2, NUM_HEADS, D_LATENT, dtype=torch.bfloat16), k_rope=k_rope,
+        k_rope_storage=storage, k_rope_offset=offset, num_queries=2,
+        topk_length=torch.zeros(2, dtype=torch.int32), softmax_scale_log2=0.5,
+    )
+    launch = bind_stage("cake_dsa_h64_train_fake", "fwd", values, (2, 1, 1))
+    # the raw-pointer operand is bound through its storage alias; scalars derived from metadata are baked in
+    assert launch.slots == ((0, "q_latent"), (1, "k_rope_storage"), (2, "k_rope_offset"), (4, "topk_length"))
+    assert launch.arguments[1] is storage and launch.arguments[2] == offset == D_LATENT
+    assert launch.arguments[3:4] == (2,) and launch.arguments[5:] == (0.5, 2)
+    template = launch.templated()
+    assert [template.arguments[i] for i, _ in launch.slots] == [None] * 4
+    assert not any(isinstance(a, torch.Tensor) for a in template.arguments)
+    kv2 = torch.zeros(6, D_QK, dtype=torch.bfloat16)  # another packed buffer: alias and offset re-read
+    storage2, offset2 = cake_backend._pointer_alias(kv2[:, D_LATENT:])
+    rebound = template.arguments_for(
+        dict(q_latent=values["q_latent"], k_rope_storage=storage2, k_rope_offset=offset2, topk_length=values["topk_length"])
+    )
+    assert rebound[1] is storage2 and rebound[2] == offset2 and rebound[5:] == [0.5, 2]
+    with pytest.raises(RuntimeError, match="topk_length"):
+        template.arguments_for(dict(q_latent=values["q_latent"], k_rope_storage=storage2, k_rope_offset=offset2))
+
+
+def test_binding_keys_cover_pointer_shape_stride_dtype_scale_and_lengths():
+    q, kv, idx = _host_inputs()
+    ql, qr, kl, kr = q[..., :D_LATENT], q[..., D_LATENT:], kv[:, :D_LATENT], kv[:, D_LATENT:]
+    scale = default_softmax_scale()
+    base = forward_binding_key(ql, qr, kl, kr, idx, None, scale)
+    assert base == forward_binding_key(ql.view_as(ql), qr, kl, kr, idx, None, scale)  # another object, same binding
+    assert base != forward_binding_key(ql, qr, kl, kr, idx, None, scale * 0.5)  # scale
+    assert base != forward_binding_key(ql, qr, kl, kr, idx, torch.zeros(8, dtype=torch.int32), scale)  # lengths
+    assert base != forward_binding_key(ql, qr, kl, kr, idx.clone(), None, scale)  # pointer
+    assert base != forward_binding_key(ql, qr, kl[:4], kr, idx, None, scale)  # shape (same pointer, stride, dtype)
+    same_ptr_other_stride = kv.view(-1)[: 16 * D_LATENT].view(16, D_LATENT)
+    assert same_ptr_other_stride.data_ptr() == kl.data_ptr() and same_ptr_other_stride.shape == kl.shape
+    assert base != forward_binding_key(ql, qr, same_ptr_other_stride, kr, idx, None, scale)  # stride
+    assert base != forward_binding_key(ql, qr, kl.view(torch.float16), kr, idx, None, scale)  # dtype
+    out = torch.zeros(8, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
+    lse = torch.zeros(8, NUM_HEADS)
+    bwd = backward_binding_key(ql, qr, kl, kr, idx, out, out, lse, out, None, scale, False)
+    assert bwd != base and bwd[0] == "bwd"
+    assert bwd != backward_binding_key(ql, qr, kl, kr, idx, out, out, lse, out, None, scale, True)  # dkv_fp32
+    assert bwd != backward_binding_key(ql, qr, kl, kr, idx, out, out, lse, out.clone(), None, scale, False)  # dout
+
+
+def test_binding_cache_fifo_and_budget_eviction():
+    cache = BindingCache(capacity=2, budget_bytes=100)
+    assert cache.enabled and len(cache) == 0
+    for key in ("a", "b", "c"):
+        cache.remember(key, SimpleNamespace(owned_bytes=10))
+    assert cache.lookup("a") is None and cache.lookup("b") is not None and cache.lookup("c") is not None
+    assert (cache.hits, cache.misses) == (2, 1)
+    cache.remember("d", SimpleNamespace(owned_bytes=95))  # oldest evicted until the owned scratch fits the budget
+    assert len(cache) == 1 and cache.lookup("d") is not None
+    cache.remember("e", SimpleNamespace(owned_bytes=500))  # a single over-budget binding stays
+    assert len(cache) == 1 and cache.lookup("e") is not None and cache.lookup("d") is None
+    cache.clear()
+    assert len(cache) == 0 and cache.owned_bytes == 0
+
+
 # ---------------------------------------------------------------------------
 # Device tests (compute capability 10.0 / 10.3 with a registered program)
 # ---------------------------------------------------------------------------
@@ -472,3 +568,133 @@ def test_backward_dkv_fp32_returns_accumulators():
     # the FP32 accumulators are at least as close to the reference as their BF16 casts' floor
     assert rel_l2(dkv_latent, ref["dkv_latent"]) <= FLOOR_MARGIN * rel_l2(ref["dkv_latent_emu"], ref["dkv_latent"]) + FLOOR_ABS
     assert rel_l2(dk_rope, ref["dk_rope"]) <= FLOOR_MARGIN * rel_l2(ref["dk_rope_emu"], ref["dk_rope"]) + FLOOR_ABS
+
+
+# ---------------------------------------------------------------------------
+# Binding cache of the eager entry points (device)
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _cache(enabled: bool):
+    cache = cake_backend.BINDING_CACHE
+    was = cache.enabled
+    cache.enabled = enabled
+    try:
+        yield cache
+    finally:
+        cache.enabled = was
+
+
+def test_binding_cache_forward_hits_are_bitwise_and_pin_nothing():
+    _require_program()
+    _require_contract_abi()
+    scale = default_softmax_scale()
+    inp = make_inputs([128, 128], [256, 384], seed=SEED + 12, topk=96)
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
+    with _cache(True) as cache:
+        cache.clear()
+        hits0, misses0 = cache.hits, cache.misses
+        first = cake_backend.forward(*args)  # validating path, remembers the binding
+        second = cake_backend.forward(*args)  # remembered binding
+        assert (cache.misses, cache.hits) == (misses0 + 1, hits0 + 1)
+        with _cache(False):
+            fresh = cake_backend.forward(*args)
+        torch.cuda.synchronize()
+        for a, b, c in zip(first, second, fresh, strict=True):
+            assert torch.equal(a, b) and torch.equal(b, c)
+        assert second[0].data_ptr() != first[0].data_ptr()  # outputs are fresh allocations
+        binding = cache.lookup(forward_binding_key(*args, None, scale))
+        assert binding is not None and binding.holds_no_tensor()
+        assert set(binding.owned) <= {"topk_length", "tma_descriptor_workspace"}
+        # caller-provided lengths: another binding (misses once), then hits
+        lengths = torch.full((256,), 96, dtype=torch.int32, device=inp.q_latent.device)
+        third = cake_backend.forward(*args, topk_length=lengths, softmax_scale=scale)
+        fourth = cake_backend.forward(*args, topk_length=lengths, softmax_scale=scale)
+        torch.cuda.synchronize()
+        assert (cache.misses, cache.hits) == (misses0 + 2, hits0 + 2)
+        assert torch.equal(third[0], first[0]) and torch.equal(fourth[1], first[1])
+        # packed views (strided k_rope): a hit re-reads the storage alias and offset
+        q = torch.cat([inp.q_latent, inp.q_rope], dim=-1).contiguous()
+        kv = torch.cat([inp.kv_latent, inp.k_rope], dim=-1).contiguous()
+        pv = (q[..., :D_LATENT], q[..., D_LATENT:], kv[:, :D_LATENT], kv[:, D_LATENT:], inp.idx_global)
+        assert not pv[3].is_contiguous()
+        p1 = cake_backend.forward(*pv)
+        p2 = cake_backend.forward(*pv)
+        torch.cuda.synchronize()
+        assert cache.hits == hits0 + 3
+        for a, b, r in zip(p1, p2, first, strict=True):
+            assert torch.equal(a, b) and torch.equal(a, r)
+        packed = cache.lookup(forward_binding_key(*pv, None, scale))
+        kv2 = torch.cat([kv, kv], dim=0)  # another packed buffer bound to the same plan
+        values = packed.rebind_values(dict(k_rope=kv2[:, D_LATENT:], indices=inp.idx_global))
+        assert values["k_rope_offset"] == kv2[:, D_LATENT:].storage_offset() == D_LATENT
+        assert values["k_rope_storage"].data_ptr() == kv2.data_ptr() and values["indices_offset"] == 0
+        # an invalid topk_length never matches a remembered binding: the validating path raises
+        with pytest.raises(ValueError):
+            cake_backend.forward(*args, topk_length=lengths.to(torch.int64))
+        with pytest.raises(ValueError):
+            cake_backend.forward(*args, topk_length=lengths[:-1])
+        # a smaller problem allocated after freeing the first (same addresses likely): key differs by shape
+        del first, second, third, fourth, fresh, p1, p2, q, kv, kv2, pv, values, args, binding, packed
+        del inp
+        torch.cuda.synchronize()
+        small = make_inputs([64, 64], [128, 512], seed=SEED + 14, topk=64)
+        misses_before = cache.misses
+        out = cake_backend.forward(small.q_latent, small.q_rope, small.kv_latent, small.k_rope, small.idx_global)
+        torch.cuda.synchronize()
+        assert cache.misses == misses_before + 1
+        ref = reference_fp64(small.q_latent, small.q_rope, small.kv_latent, small.k_rope, small.idx_global)
+        _check_forward(small, out[0], out[1], ref)
+
+
+def test_binding_cache_backward_hits_are_bitwise_and_fresh():
+    _require_program(backward=True)
+    inp = make_inputs([256], [512], seed=SEED + 13, topk=128)
+    fwd_args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
+    with _cache(True) as cache:
+        cache.clear()
+        out, lse, o_lo = cake_backend.forward(*fwd_args)
+        args = fwd_args + (out, o_lo, lse, inp.dout)
+        hits0, misses0 = cache.hits, cache.misses
+        a = cake_backend.backward(*args)  # validating path
+        b = cake_backend.backward(*args)  # remembered binding
+        assert (cache.misses, cache.hits) == (misses0 + 1, hits0 + 1)
+        with _cache(False):
+            c = cake_backend.backward(*args)
+        torch.cuda.synchronize()
+        # dQ is computed once per row (bitwise); dK/dV accumulate with red.global (run-to-run spread)
+        for x, y, z in zip(a[:2], b[:2], c[:2], strict=True):
+            assert torch.equal(x, y) and torch.equal(y, z)
+        assert max(rel_l2(a[2], b[2]), rel_l2(b[2], c[2]), rel_l2(a[3], b[3]), rel_l2(b[3], c[3])) < 1e-2
+        assert len({t.data_ptr() for t in (a[2], b[2], c[2])}) == 3  # fresh outputs, not the cached accumulators
+        binding = cache.lookup(backward_binding_key(*args, None, default_softmax_scale(), False))
+        assert binding.holds_no_tensor() and "delta" in binding.owned and "dkv_latent_acc" in binding.owned
+        # the FP32 accumulators of dkv_fp32=True are outputs: fresh per call, never aliased between calls
+        f1 = cake_backend.backward(*args, dkv_fp32=True)
+        f2 = cake_backend.backward(*args, dkv_fp32=True)
+        torch.cuda.synchronize()
+        assert cache.misses == misses0 + 2 and cache.hits == hits0 + 2
+        assert f1[2].dtype == torch.float32 and f1[2].data_ptr() != f2[2].data_ptr()
+        snapshot = f2[2].clone()
+        f1[2].fill_(7.0)
+        assert torch.equal(f2[2], snapshot) and rel_l2(snapshot, a[2].float()) < 1e-2
+        fp32_binding = cache.lookup(backward_binding_key(*args, None, default_softmax_scale(), True))
+        assert fp32_binding is not binding and "dkv_latent_acc" not in fp32_binding.owned
+        # the autograd path: the forward of a repeated step hits; its backward hits when the allocator hands
+        # the freed forward outputs back at the same addresses (informational: the key is the binding)
+        leaves = [t.detach().clone().requires_grad_() for t in fwd_args[:4]]
+        grads = []
+        for repeat in range(2):
+            hits, misses = cache.hits, cache.misses
+            with _quiet_experimental():
+                o = dsa_sparse_attention(*leaves, inp.idx_global)
+            assert (cache.hits, cache.misses) == ((hits + 1, misses) if repeat else (hits, misses + 1))
+            hits, misses = cache.hits, cache.misses
+            grads.append(torch.autograd.grad(o, leaves, inp.dout))
+            assert cache.hits + cache.misses == hits + misses + 1
+            print(f"autograd backward repeat {repeat}: {'hit' if cache.hits > hits else 'miss'}")
+            del o
+        torch.cuda.synchronize()
+        assert torch.equal(grads[0][0], grads[1][0]) and torch.equal(grads[0][1], grads[1][1])
+        assert torch.equal(grads[1][0], a[0]) and torch.equal(grads[1][1], a[1])

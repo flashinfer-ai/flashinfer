@@ -33,23 +33,34 @@ a cold L2 between iterations (per-iteration GPU span); medians over
 ``--steps`` iterations.  ``--accuracy`` adds the relative-L2 comparison against
 the chunked FP64 reference (iid 4k x 4k and peaked-attention cases).
 
+``--host-us`` measures the host side of the eager entry points (``forward``,
+``backward``, the public ``dsa_sparse_attention`` forward / autograd backward /
+step) as wall-clock microseconds per call with the GPU running asynchronously,
+alternating the binding cache off / on inside one process (``--host-rounds``
+rounds of ``--host-calls`` calls each), and checks that both paths produce the
+same results and the same kernel-only time.
+
 Usage::
 
     python benchmarks/bench_cake_dsa_train.py [--rows doc_4096 ...] [--arms cake,flashmla_cudnn,fa4]
-        [--steps 20] [--accuracy] [--json out.json]
+        [--steps 20] [--accuracy] [--host-us] [--json out.json]
 """
 
 import argparse
 import json
 import statistics
 import sys
+import time
 import traceback
+import warnings
 from pathlib import Path
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from flashinfer.api_logging import ExperimentalWarning  # noqa: E402
+from flashinfer.dsa_sparse_attention import dsa_sparse_attention  # noqa: E402
 from flashinfer.experimental.cake_dsa_train import cake_backend  # noqa: E402
 from flashinfer.testing import bench_gpu_time  # noqa: E402
 from tests.test_helpers.cake_dsa_train_reference import (  # noqa: E402
@@ -345,6 +356,134 @@ def run_accuracy(args, results):
         torch.cuda.empty_cache()
 
 
+def _host_us_per_call(fn, calls):
+    """Wall-clock microseconds per call of ``fn`` (GPU asynchronous; results dropped as they come)."""
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(calls):
+        fn()
+    return (time.perf_counter() - t0) / calls * 1e6
+
+
+def measure_host_path(inp, *, calls, rounds, kernel_steps):
+    """Host microseconds per call of the eager entry points with the binding cache off / on.
+
+    Each round measures every entry point in both modes back to back (off
+    first), so the two modes see the same process state; the medians over the
+    rounds are reported.  Also checks that both modes give the same results
+    (``out``, ``lse``, ``dq_*`` bitwise; ``dkv_*`` within the ``red.global``
+    run-to-run spread) and reports the CUPTI kernel-only medians of both.
+    """
+    cache = cake_backend.BINDING_CACHE
+    was_enabled = cache.enabled
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
+    backward_available = cake_backend.generated_program_available(inp.q_latent.device, backward=True)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", ExperimentalWarning)
+        dsa_sparse_attention(*args)  # the experimental banner fires once per process
+    leaves = [t.detach().clone().requires_grad_() for t in args[:4]]
+    saved = cake_backend.forward(*args)
+    torch.cuda.synchronize()
+
+    def eager_forward():
+        return cake_backend.forward(*args)
+
+    def eager_backward():
+        return cake_backend.backward(*args, saved[0], saved[2], saved[1], inp.dout)
+
+    def public_forward():
+        return dsa_sparse_attention(*leaves, inp.idx_global)
+
+    graph_out = public_forward()
+
+    def public_backward():  # autograd backward of one retained graph (the saved forward outputs are fixed)
+        return torch.autograd.grad(graph_out, leaves, inp.dout, retain_graph=True)
+
+    def autograd_step():
+        out = dsa_sparse_attention(*leaves, inp.idx_global)
+        return torch.autograd.grad(out, leaves, inp.dout)
+
+    entry_points = [("forward", eager_forward), ("public_forward", public_forward)]
+    if backward_available:
+        entry_points += [("backward", eager_backward), ("public_backward", public_backward), ("autograd_step", autograd_step)]
+    samples = {name: {"off": [], "on": []} for name, _ in entry_points}
+    lookups = {name: [] for name, _ in entry_points}  # (hits, misses) of the measured cache-on calls
+    try:
+        for _ in range(rounds):
+            for mode in ("off", "on"):
+                cache.enabled = mode == "on"
+                for name, fn in entry_points:
+                    fn()  # the first call of a mode binds (a miss); measured calls follow
+                    hits, misses = cache.hits, cache.misses
+                    samples[name][mode].append(_host_us_per_call(fn, calls))
+                    if mode == "on":
+                        lookups[name].append((cache.hits - hits, cache.misses - misses))
+        # same results from both paths
+        cache.enabled = False
+        off_fwd = eager_forward()
+        off_bwd = eager_backward() if backward_available else None
+        cache.enabled = True
+        on_fwd = eager_forward()
+        on_bwd = eager_backward() if backward_available else None
+        torch.cuda.synchronize()
+        same = dict(out=torch.equal(off_fwd[0], on_fwd[0]), lse=torch.equal(off_fwd[1], on_fwd[1]))
+        if backward_available:
+            same.update(
+                dq_latent=torch.equal(off_bwd[0], on_bwd[0]),
+                dq_rope=torch.equal(off_bwd[1], on_bwd[1]),
+                dkv_latent_rel_l2=rel_l2(off_bwd[2], on_bwd[2]),
+                dk_rope_rel_l2=rel_l2(off_bwd[3], on_bwd[3]),
+            )
+        del off_fwd, off_bwd, on_fwd, on_bwd
+        # kernel-only time of both paths (CUPTI, per-iteration GPU span)
+        kernel_ms = {}
+        for mode in ("off", "on"):
+            cache.enabled = mode == "on"
+            kernel_ms[mode] = dict(forward=median_ms(eager_forward, kernel_steps))
+            if backward_available:
+                kernel_ms[mode]["backward"] = median_ms(eager_backward, kernel_steps)
+                kernel_ms[mode]["autograd_step"] = median_ms(autograd_step, kernel_steps)
+    finally:
+        cache.enabled = was_enabled
+    host_us = {
+        name: {mode: dict(median=float(statistics.median(v)), min=float(min(v)), rounds=[float(x) for x in v]) for mode, v in modes.items()}
+        for name, modes in samples.items()
+    }
+    for name, hm in lookups.items():
+        host_us[name]["on"]["lookups"] = dict(hits=sum(h for h, _ in hm), misses=sum(m for _, m in hm))
+    return dict(
+        calls=calls, rounds=rounds, host_us=host_us, same_results=same, kernel_ms=kernel_ms,
+        cache=dict(hits=cache.hits, misses=cache.misses, bindings=len(cache), owned_bytes=cache.owned_bytes),
+    )
+
+
+def run_host_path(args, results):
+    for row in args.rows:
+        seq_q, seq_k = ROWS[row]
+        inp = make_inputs(seq_q, seq_k, seed=SEED, topk=DEFAULT_TOPK, device=args.device)
+        try:
+            entry = measure_host_path(inp, calls=args.host_calls, rounds=args.host_rounds, kernel_steps=max(args.min_steps, args.steps_128k))
+        except Exception as exc:
+            entry = dict(error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+            print(f"{row:22s} host path failed: {entry['error']}", flush=True)
+        else:
+            for name, modes in entry["host_us"].items():
+                off, on = modes["off"]["median"], modes["on"]["median"]
+                lk = modes["on"]["lookups"]
+                print(
+                    f"{row:22s} {name:16s} host us/call  cache off {off:8.1f}  cache on {on:8.1f}  ({off / on:5.2f}x)"
+                    f"  lookups hit {lk['hits']} miss {lk['misses']}",
+                    flush=True,
+                )
+            print(f"{row:22s} same results: {json.dumps(entry['same_results'], default=str)}", flush=True)
+            for mode, ms in entry["kernel_ms"].items():
+                print(f"{row:22s} kernel-only ms (cache {mode}): {json.dumps(ms)}", flush=True)
+        entry["row"] = row
+        results["host_path"].append(entry)
+        del inp
+        torch.cuda.empty_cache()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--rows", nargs="*", default=list(ROWS), choices=list(ROWS))
@@ -353,6 +492,9 @@ def main():
     parser.add_argument("--steps-128k", type=int, default=13, help="iterations for the largest problems")
     parser.add_argument("--min-steps", type=int, default=5)
     parser.add_argument("--accuracy", action="store_true")
+    parser.add_argument("--host-us", action="store_true", help="host microseconds per call, binding cache off / on")
+    parser.add_argument("--host-calls", type=int, default=20)
+    parser.add_argument("--host-rounds", type=int, default=3)
     parser.add_argument("--no-perf", action="store_true")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--json", type=Path)
@@ -368,11 +510,14 @@ def main():
         torch=torch.__version__,
         rows=[],
         accuracy=[],
+        host_path=[],
     )
     if not args.no_perf:
         run_perf(args, results)
     if args.accuracy:
         run_accuracy(args, results)
+    if args.host_us:
+        run_host_path(args, results)
     if args.json:
         args.json.parent.mkdir(parents=True, exist_ok=True)
         args.json.write_text(json.dumps(results, indent=2, default=str) + "\n")

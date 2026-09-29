@@ -45,12 +45,20 @@ launches with no CUDA allocation and no host synchronization, so a runner
 tensors.  Kernels are reached through the argument plans of the registry
 records in ``cake_jit.MODULES``; the ``abi`` field of a record names the
 keyword set its kernels expect (see :data:`ABI_CONTRACT`).
+
+The eager entry points (:func:`forward`, :func:`backward`, the autograd
+``Function`` behind ``dsa_sparse_attention``) validate and bind once per
+*input binding* and remember the result in :data:`BINDING_CACHE` (see
+:class:`BindingCache`): a later call whose inputs have the same
+``(data_ptr, shape, stride, dtype)`` and scale slots the current tensors and
+freshly allocated outputs into the remembered argument plans and launches.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+import os
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
 import torch
@@ -462,6 +470,14 @@ def grid_dims(rule, scalars: dict[str, int], num_sms: int) -> tuple[int, int, in
     return max(1, x), max(1, y), max(1, z)
 
 
+# Host values that a remembered binding re-supplies at every launch: the
+# contract tensors (caller tensors, fresh outputs and cache-owned scratch) and
+# the storage alias / element offset pairs of the raw-pointer operands.
+REBIND_KEYS = frozenset(CONTRACT_TENSORS) | frozenset(
+    ("indices_storage", "indices_offset", "k_rope_storage", "k_rope_offset")
+)
+
+
 @dataclass(frozen=True)
 class _Launch:
     stage: str
@@ -471,9 +487,31 @@ class _Launch:
     grid: tuple[int, int, int]
     # Descriptor-preparation entry of a pointer-ABI module (same arguments).
     prepare: Optional[Callable[..., Any]] = field(default=None, repr=False)
+    # ``(argument index, host value name)`` of every argument in REBIND_KEYS.
+    slots: tuple[tuple[int, str], ...] = ()
 
     def __call__(self) -> None:
         self.entry(*self.arguments)
+
+    def templated(self) -> "_Launch":
+        """Copy whose re-bindable arguments are ``None`` placeholders (holds no tensor)."""
+        arguments = list(self.arguments)
+        for index, _ in self.slots:
+            arguments[index] = None
+        return replace(self, arguments=tuple(arguments))
+
+    def arguments_for(self, values: dict[str, Any]) -> list:
+        """The argument list with every slot filled from ``values`` (fails closed on a missing one)."""
+        arguments = list(self.arguments)
+        for index, key in self.slots:
+            value = values.get(key)
+            if value is None:
+                raise RuntimeError(
+                    f"stage {self.stage!r} of {self.module!r}: the remembered argument plan needs "
+                    f"{key!r} (argument {index}) and the call provides no value for it"
+                )
+            arguments[index] = value
+        return arguments
 
 
 def bind_stage(
@@ -482,11 +520,13 @@ def bind_stage(
     """Order ``values`` by the generated argument plan of ``stage`` and load its entry.
 
     Fails closed: a keyword the kernel expects that the host does not provide
-    raises ``KeyError`` naming both sides.
+    raises ``KeyError`` naming both sides.  The returned launch records which
+    argument positions hold re-bindable host values (:data:`REBIND_KEYS`).
     """
     physical = MODULES[module_name][stage]
     grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
     arguments = []
+    slots = []
     for kind, name in physical["arg_plan"]:
         # A profile may provide the kernel's own name (seed profile) or the contract name behind an alias.
         key = name if name in values else CONTRACT_ALIASES.get(name, name)
@@ -495,7 +535,10 @@ def bind_stage(
         elif key in values and values[key] is not None:  # buffer / tma_buffer / workspace / parameter
             value = values[key]
             if kind == "buffer" and f"{key}_storage" in values:
-                value = values[f"{key}_storage"]  # raw pointer: whole storage + <name>_offset elements
+                key = f"{key}_storage"  # raw pointer: whole storage + <name>_offset elements
+                value = values[key]
+            if key in REBIND_KEYS:
+                slots.append((len(arguments), key))
             arguments.append(value)
         else:
             raise KeyError(
@@ -505,7 +548,27 @@ def bind_stage(
     module = load_cake_dsa_train_module(module_name, stage)
     prepare_entry = physical.get("tma_prepare_entry")
     prepare = getattr(module, prepare_entry) if prepare_entry else None
-    return _Launch(stage, module_name, getattr(module, physical["ffi_entry"]), tuple(arguments), grid, prepare)
+    return _Launch(
+        stage, module_name, getattr(module, physical["ffi_entry"]), tuple(arguments), grid, prepare, tuple(slots)
+    )
+
+
+_FFI_DEVICES: dict[int, Any] = {}
+
+
+def _ffi_stream_context(index: int):
+    """tvm-ffi environment-stream context for torch's current stream on device ``index``.
+
+    Same effect as ``tvm_ffi.use_torch_stream()`` without its per-entry
+    ``torch.cuda.Stream`` wrapper and device-string parse: the raw handle comes
+    from ``torch._C._cuda_getCurrentRawStream`` and the FFI device is cached.
+    """
+    device = _FFI_DEVICES.get(index)
+    if device is None:
+        device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
+    getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+    raw = getter(index) if getter is not None else torch.cuda.current_stream(index).cuda_stream
+    return tvm_ffi.use_raw_stream(device, raw)
 
 
 # ---------------------------------------------------------------------------
@@ -536,6 +599,11 @@ class DSATrainRunner:
     launches: dict[str, _Launch] = field(repr=False)
     stages: tuple[str, ...]
     dkv_fp32: bool
+    has_topk_length: bool  # False: ``tensors["topk_length"]`` is the workspace vector filled with ``topk``
+    device_index: int
+    # The flat workspace the scratch regions of ``tensors`` are carved from, and their byte layout.
+    workspace: torch.Tensor = field(repr=False)
+    layout: dict = field(repr=False)
     _tma_prepared: bool = False
 
     @property
@@ -558,7 +626,7 @@ class DSATrainRunner:
         """Encode the descriptors of pointer-ABI stages once (idempotent)."""
         if self._tma_prepared:
             return
-        with tvm_ffi.use_torch_stream():
+        with _ffi_stream_context(self.device_index):
             for launch in self.launches.values():
                 if launch.prepare is not None:
                     launch.prepare(*launch.arguments)
@@ -566,7 +634,7 @@ class DSATrainRunner:
 
     def _run(self, stages: tuple[str, ...]) -> None:
         self.prepare_tma()
-        with tvm_ffi.use_torch_stream():
+        with _ffi_stream_context(self.device_index):
             for stage in stages:
                 launch = self.launches.get(stage)
                 if launch is not None:
@@ -815,7 +883,263 @@ def prepare_dsa_train(
         launches=launches,
         stages=stages,
         dkv_fp32=bool(dkv_fp32),
+        has_topk_length=bool(has_topk_length),
+        device_index=int(device.index if device.index is not None else torch.cuda.current_device()),
+        workspace=flat,
+        layout=layout,
     )
+
+
+# ---------------------------------------------------------------------------
+# Binding cache of the eager entry points
+# ---------------------------------------------------------------------------
+
+BINDING_CACHE_ENV = "FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE"  # "0" disables the cache at import
+# Scratch the cache owns per remembered backward binding is bounded by this many bytes in total.
+BINDING_CACHE_BUDGET_BYTES = 512 << 20
+
+
+def _meta(t: torch.Tensor) -> tuple:
+    return (t.data_ptr(), t.shape, t.stride(), t.dtype)
+
+
+def forward_binding_key(
+    q_latent: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv_latent: torch.Tensor,
+    k_rope: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    softmax_scale: float,
+) -> tuple:
+    """Cache key of a forward binding: ``(data_ptr, shape, stride, dtype)`` of
+    every input (``None`` for an absent ``topk_length``) plus the scale.  Two
+    tensors at one address with another shape, stride or dtype (a buffer freed
+    and re-allocated for another problem) never share a key."""
+    return (
+        "fwd",
+        _meta(q_latent),
+        _meta(q_rope),
+        _meta(kv_latent),
+        _meta(k_rope),
+        _meta(indices),
+        None if topk_length is None else _meta(topk_length),
+        float(softmax_scale),
+    )
+
+
+def backward_binding_key(
+    q_latent: torch.Tensor,
+    q_rope: torch.Tensor,
+    kv_latent: torch.Tensor,
+    k_rope: torch.Tensor,
+    indices: torch.Tensor,
+    out: torch.Tensor,
+    o_lo: torch.Tensor,
+    lse: torch.Tensor,
+    dout: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    softmax_scale: float,
+    dkv_fp32: bool,
+) -> tuple:
+    """Cache key of a backward binding: the forward key's inputs plus the saved
+    forward outputs, ``dout`` and the ``dkv_fp32`` option."""
+    return (
+        "bwd",
+        _meta(q_latent),
+        _meta(q_rope),
+        _meta(kv_latent),
+        _meta(k_rope),
+        _meta(indices),
+        _meta(out),
+        _meta(o_lo),
+        _meta(lse),
+        _meta(dout),
+        None if topk_length is None else _meta(topk_length),
+        float(softmax_scale),
+        bool(dkv_fp32),
+    )
+
+
+# Workspace regions a remembered binding keeps (the caller never sees them).
+_OWNED_SCRATCH = ("delta", "dkv_latent_acc", "dk_rope_acc", "workspace", "tma_descriptor_workspace")
+
+
+@dataclass
+class _Binding:
+    """One remembered input binding of the contract profile.
+
+    Holds the templated launches (argument plans with ``None`` at every
+    re-bindable position: no caller tensor is pinned), the workspace scratch
+    the binding owns and the plain facts a launch needs.  ``forward`` /
+    ``backward`` slot the current tensors and freshly allocated outputs into
+    the templates and launch; storage aliases and element offsets of the
+    raw-pointer operands are re-read from the current tensors every call.
+    """
+
+    num_queries: int
+    num_kv: int
+    topk: int
+    device: torch.device
+    device_index: int
+    dkv_fp32: bool
+    launches: dict[str, _Launch] = field(repr=False)
+    owned: dict[str, torch.Tensor] = field(repr=False)
+    acc_span: Optional[torch.Tensor] = field(repr=False)  # bytes covering both FP32 accumulators
+    owned_bytes: int = 0
+
+    @classmethod
+    def from_runner(cls, runner: DSATrainRunner) -> "_Binding":
+        if runner.abi != ABI_CONTRACT:
+            raise ValueError(f"only the {ABI_CONTRACT!r} profile can be remembered")
+        t = runner.tensors
+        owned = {name: t[name] for name in _OWNED_SCRATCH if name in t}
+        if runner.dkv_fp32:  # the accumulators are the outputs: fresh per call
+            owned.pop("dkv_latent_acc", None)
+            owned.pop("dk_rope_acc", None)
+        if not runner.has_topk_length:
+            owned["topk_length"] = t["topk_length"]
+        acc_span = None
+        if "dkv_latent_acc" in owned and "dk_rope_acc" in owned:
+            (o1, n1), (o2, n2) = runner.layout["dkv_latent_acc"], runner.layout["dk_rope_acc"]
+            acc_span = runner.workspace[min(o1, o2) : max(o1 + n1, o2 + n2)]
+        return cls(
+            num_queries=runner.num_queries,
+            num_kv=runner.num_kv,
+            topk=runner.topk,
+            device=t["q_latent"].device,
+            device_index=runner.device_index,
+            dkv_fp32=runner.dkv_fp32,
+            launches={stage: launch.templated() for stage, launch in runner.launches.items()},
+            owned=owned,
+            acc_span=acc_span,
+            owned_bytes=int(runner.workspace.numel()),
+        )
+
+    def holds_no_tensor(self) -> bool:
+        return not any(
+            isinstance(a, torch.Tensor) for launch in self.launches.values() for a in launch.arguments
+        )
+
+    def rebind_values(self, current: dict[str, torch.Tensor]) -> dict[str, Any]:
+        """Host values of one launch: owned scratch, the current tensors and the
+        storage alias / element offset of the raw-pointer operands, re-read now."""
+        values: dict[str, Any] = dict(self.owned)
+        values.update(current)
+        values["indices_storage"], values["indices_offset"] = _pointer_alias(current["indices"])
+        values["k_rope_storage"], values["k_rope_offset"] = _pointer_alias(current["k_rope"])
+        return values
+
+    def _launch(self, current: dict[str, torch.Tensor], stages: tuple[str, ...]) -> None:
+        values = self.rebind_values(current)
+        with _ffi_stream_context(self.device_index):
+            for stage in stages:
+                launch = self.launches.get(stage)
+                if launch is None:
+                    continue
+                arguments = launch.arguments_for(values)
+                if launch.prepare is not None:  # descriptors of a pointer-ABI stage see the fresh outputs
+                    launch.prepare(*arguments)
+                launch.entry(*arguments)
+
+    def forward(self, q_latent, q_rope, kv_latent, k_rope, indices, topk_length):
+        shape = (self.num_queries, NUM_HEADS, D_LATENT)
+        out = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+        o_lo = torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+        lse = torch.empty(shape[:2], dtype=torch.float32, device=self.device)
+        current = dict(
+            q_latent=q_latent, q_rope=q_rope, kv_latent=kv_latent, k_rope=k_rope, indices=indices,
+            out=out, o_lo=o_lo, lse=lse,
+        )
+        if topk_length is not None:
+            current["topk_length"] = topk_length
+        self._launch(current, FORWARD_STAGES)
+        return out, lse, o_lo
+
+    def backward(self, q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout, topk_length):
+        T, S, device = self.num_queries, self.num_kv, self.device
+        dq_latent = torch.empty((T, NUM_HEADS, D_LATENT), dtype=torch.bfloat16, device=device)
+        dq_rope = torch.empty((T, NUM_HEADS, D_ROPE), dtype=torch.bfloat16, device=device)
+        current = dict(
+            q_latent=q_latent, q_rope=q_rope, kv_latent=kv_latent, k_rope=k_rope, indices=indices,
+            out=out, o_lo=o_lo, lse=lse, dout=dout, dq_latent=dq_latent, dq_rope=dq_rope,
+        )
+        if topk_length is not None:
+            current["topk_length"] = topk_length
+        if self.dkv_fp32:
+            acc = torch.zeros((S * D_QK,), dtype=torch.float32, device=device)
+            current["dkv_latent_acc"] = acc[: S * D_LATENT].view(S, D_LATENT)
+            current["dk_rope_acc"] = acc[S * D_LATENT :].view(S, D_ROPE)
+            self._launch(current, BACKWARD_STAGES)
+            return dq_latent, dq_rope, current["dkv_latent_acc"], current["dk_rope_acc"]
+        self.acc_span.zero_()
+        dkv_latent = torch.empty((S, D_LATENT), dtype=torch.bfloat16, device=device)
+        dk_rope = torch.empty((S, D_ROPE), dtype=torch.bfloat16, device=device)
+        current["dkv_latent"] = dkv_latent
+        current["dk_rope"] = dk_rope
+        self._launch(current, BACKWARD_STAGES)
+        if "bwd_cast" not in self.launches:
+            dkv_latent.copy_(self.owned["dkv_latent_acc"])
+            dk_rope.copy_(self.owned["dk_rope_acc"])
+        return dq_latent, dq_rope, dkv_latent, dk_rope
+
+
+class BindingCache:
+    """Remembered input bindings of the eager entry points.
+
+    The first call for a binding goes through :func:`prepare_dsa_train` (full
+    validation, workspace allocation, argument-plan binding) and launches
+    through its runner; the runner's launches are then remembered as
+    templates keyed by :func:`forward_binding_key` /
+    :func:`backward_binding_key`.  A later call with the same key skips the
+    Python-level validation and binding: it allocates fresh outputs, slots
+    them and the current tensors into the templates and launches (the module,
+    its descriptor encoding and the cubin are those of the validating path).
+    A binding pins no caller tensor; it owns only its workspace scratch
+    (``delta``, the FP32 accumulators, a materialized ``topk_length``, the
+    descriptor workspace).  The cache keeps at most ``capacity`` bindings and
+    at most :data:`BINDING_CACHE_BUDGET_BYTES` of owned scratch (oldest
+    evicted first).  ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0`` or
+    ``enabled = False`` routes every call through the validating path.
+    """
+
+    def __init__(self, capacity: int = 32, budget_bytes: int = BINDING_CACHE_BUDGET_BYTES, enabled: bool = True):
+        self.capacity = int(capacity)
+        self.budget_bytes = int(budget_bytes)
+        self.enabled = bool(enabled)
+        self.hits = 0
+        self.misses = 0
+        self._bindings: dict[tuple, _Binding] = {}
+
+    def __len__(self) -> int:
+        return len(self._bindings)
+
+    @property
+    def owned_bytes(self) -> int:
+        return sum(b.owned_bytes for b in self._bindings.values())
+
+    def clear(self) -> None:
+        self._bindings.clear()
+
+    def lookup(self, key: tuple) -> Optional[_Binding]:
+        binding = self._bindings.get(key)
+        if binding is None:
+            self.misses += 1
+        else:
+            self.hits += 1
+        return binding
+
+    def remember(self, key: tuple, binding: _Binding) -> _Binding:
+        self._bindings.pop(key, None)
+        self._bindings[key] = binding
+        while len(self._bindings) > self.capacity or (
+            len(self._bindings) > 1 and self.owned_bytes > self.budget_bytes
+        ):
+            del self._bindings[next(iter(self._bindings))]
+        return binding
+
+
+BINDING_CACHE = BindingCache(enabled=os.environ.get(BINDING_CACHE_ENV, "1") != "0")
 
 
 # ---------------------------------------------------------------------------
@@ -833,12 +1157,28 @@ def forward(
     topk_length: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Forward pass: ``(out, lse, o_lo)``; ``o_lo`` is ``None`` for the placeholder program."""
+    """Forward pass: ``(out, lse, o_lo)``; ``o_lo`` is ``None`` for the placeholder program.
+
+    The first call for an input binding validates and binds through
+    :func:`prepare_dsa_train`; later calls with the same binding take the
+    remembered launch (:data:`BINDING_CACHE`).
+    """
+    scale = float(softmax_scale) if softmax_scale is not None else default_softmax_scale()
+    cache = BINDING_CACHE
+    key = None
+    if cache.enabled:
+        key = forward_binding_key(q_latent, q_rope, kv_latent, k_rope, indices, topk_length, scale)
+        binding = cache.lookup(key)
+        if binding is not None:
+            return binding.forward(q_latent, q_rope, kv_latent, k_rope, indices, topk_length)
     runner = prepare_dsa_train(
         q_latent, q_rope, kv_latent, k_rope, indices, topk_length=topk_length,
-        softmax_scale=softmax_scale, backward=False,
+        softmax_scale=scale, backward=False,
     )
-    return runner.forward()
+    result = runner.forward()
+    if key is not None and runner.abi == ABI_CONTRACT:
+        cache.remember(key, _Binding.from_runner(runner))
+    return result
 
 
 def backward(
@@ -856,20 +1196,37 @@ def backward(
     softmax_scale: Optional[float] = None,
     dkv_fp32: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Backward pass from the saved forward outputs: ``(dq_latent, dq_rope, dkv_latent, dk_rope)``."""
+    """Backward pass from the saved forward outputs: ``(dq_latent, dq_rope, dkv_latent, dk_rope)``.
+
+    Validates and binds once per input binding like :func:`forward`.
+    """
     if o_lo is None:
         raise NotImplementedError(
             "the forward produced no output residual (placeholder program); backward is unavailable"
         )
+    dout = dout.contiguous()
+    scale = float(softmax_scale) if softmax_scale is not None else default_softmax_scale()
+    cache = BINDING_CACHE
+    key = None
+    if cache.enabled:
+        key = backward_binding_key(
+            q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout, topk_length, scale, dkv_fp32
+        )
+        binding = cache.lookup(key)
+        if binding is not None:
+            return binding.backward(q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout, topk_length)
     _check_output(out, "out", (q_latent.shape[0], NUM_HEADS, D_LATENT), torch.bfloat16)
     _check_output(o_lo, "o_lo", (q_latent.shape[0], NUM_HEADS, D_LATENT), torch.bfloat16)
     _check_output(lse, "lse", (q_latent.shape[0], NUM_HEADS), torch.float32)
     runner = prepare_dsa_train(
         q_latent, q_rope, kv_latent, k_rope, indices, topk_length=topk_length,
-        dout=dout.contiguous(), softmax_scale=softmax_scale, out=out, lse=lse, o_lo=o_lo,
+        dout=dout, softmax_scale=scale, out=out, lse=lse, o_lo=o_lo,
         dkv_fp32=dkv_fp32, backward=True,
     )
-    return runner.backward()
+    result = runner.backward()
+    if key is not None and runner.abi == ABI_CONTRACT:
+        cache.remember(key, _Binding.from_runner(runner))
+    return result
 
 
 class DSASparseAttentionFunction(torch.autograd.Function):
@@ -916,8 +1273,10 @@ def dsa_sparse_attention(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
 ):
-    """Differentiable sparse attention over global key indices (see the module docstring)."""
-    validate_dsa_train_inputs(q_latent, q_rope, kv_latent, k_rope, indices, topk_length)
+    """Differentiable sparse attention over global key indices (see the module docstring).
+
+    Inputs are validated on the first call for a binding (see :class:`BindingCache`).
+    """
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
     out, lse = DSASparseAttentionFunction.apply(
