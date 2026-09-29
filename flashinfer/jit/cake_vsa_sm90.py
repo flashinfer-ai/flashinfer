@@ -43,6 +43,7 @@ _ARCH = "sm_90a"
 # cluster, merge through distributed shared memory).
 STAGES = (
     "attention",
+    "attention_queue",
     "small_k1",
     "small_k3",
     "small_k4",

@@ -52,6 +52,15 @@ signals ``launch_dependents`` so the successor's prologue overlaps its tail.
 The host only calls the bindings in order; under CUDA-graph capture the
 attribute becomes a programmatic dependency edge.  Programs exported with
 PDL off are ordinary serial launches.  The numerics are identical either way.
+Round 5: each GEMM tile has two PDL binaries -- the production one and the
+``PDL_EARLY`` one (``griddepcontrol.wait`` moved into the load / epilogue
+roles so the weight stages of the first ring fill stream before the wait,
+``launch_dependents`` at entry).  The host picks the early binary per launch
+from the form's census window (:func:`pdl_early_on`, Cake
+``kimi_k3_vision_gemm._pdl_early_on`` / ``PDL_EARLY_WINDOW``), never on the
+stream-K / tail / multicast / ``pos`` tiles (:func:`pdl_early_selected`); the
+registry names it ``gemm:<variant>:<tile>:pdle``.  Same numerics, same
+kernel parameters.
 
 Host work is split exactly like the Cake production launcher:
 
@@ -702,8 +711,12 @@ def _cfg(
 # ``w``, ``l_g8``, ``l_e8`` / ``s_e8`` eight epilogue warps) and the twins:
 # ``*_t`` tail split-K (opt-in in Cake; never selected by the production
 # policy), ``*_p`` / ``*_pf`` packed residual epilogue (+ pre-mainloop
-# residual / norm-weight prefetch), ``*_cs`` packed f16x2 RoPE table and
-# ``l_sk`` the pieces-first stream-K twin of the pair tile (round 4).
+# residual / norm-weight prefetch), ``*_cs`` packed f16x2 RoPE table,
+# ``l_sk`` the pieces-first stream-K twin of the pair tile (round 4), and
+# (round 5) ``m_sk`` the stream-K twin of the 256 x 128 pair tile for the FC1
+# census points and ``m_e8`` / ``m_e8_cs`` the eight-warp 256 x 128 pair
+# tile of the K = 1024 norm GEMMs where the 256-wide tile's round count is
+# worst.
 TILE_CONFIGS: dict[str, TileConfig] = {
     c.name: c
     for c in (
@@ -743,13 +756,20 @@ TILE_CONFIGS: dict[str, TileConfig] = {
         _cfg("m_tma1", 2, 128, 8, packed=True, tma_epi=True, tma_onebuf=True),
         # Round 4: the pieces-first stream-K twin of the 256 x 256 pair tile (projector GEMMs, census window).
         _cfg("l_sk", 2, 256, 7, sk=True),
+        # Round 5 (Cake ``CFG_M_SK``): the stream-K twin of the 256 x 128 pair tile (residual_fc1 at M <= MID_M_LIMIT
+        # where the 256 x 256 tile leaves a tiny extra round).
+        _cfg("m_sk", 2, 128, 9, sk=True),
+        # Round 5 (Cake ``CFG_M_E8`` / ``CFG_M_E8_CS``): the eight-warp 256 x 128 pair tile of norm_gelu /
+        # norm_qkv_rope for 1656 < M <= M_E8_MAX_M (bitwise identical to l_e8; paired > 1.00 at 2552).
+        _cfg("m_e8", 2, 128, 9, epi_warps=8),
+        _cfg("m_e8_cs", 2, 128, 9, epi_warps=8, rope=True),
     )
 }
 # norm_qkv_rope: the packed f16x2 cos/sin twin of each base tile (Cake
 # ``_ROPE_TWIN``; the pre-mainloop table prefetch only on the one-drain-group
 # ``xs`` tile) and the FP32-table config the launcher falls back to when no
 # table is passed (``_ROPE_BASE``).  The host always passes ``rope_cs``.
-ROPE_TWIN = {"l_e8": "l_e8_cs", "s": "s_cs", "xs": "xs_cs_pf"}
+ROPE_TWIN = {"l_e8": "l_e8_cs", "s": "s_cs", "xs": "xs_cs_pf", "m_e8": "m_e8_cs"}
 ROPE_BASE = {twin: base for base, twin in ROPE_TWIN.items()}
 ROPE_BASE["xs_cs"] = "xs"
 # residual / pos forms: the packed epilogue twin everywhere, with the residual
@@ -775,9 +795,48 @@ SK_TAIL_FRAC_MAX = (
     0.30  # stream-K twin only when the tail holds <= 30 % of the clusters
 )
 SK_MIN_SAVING = 0.065  # ... and removing that partial round is worth >= 6.5 % of the mainloop rounds
+# Round 5 (CAKE-749; Cake ``SK_MIN_SAVING_ANY`` / ``SK_TAIL_FRAC_ANY``): a removed partial round worth >= 9 % of the
+# rounds wins whatever the tail fraction up to 60 % (gelu_erf 2691 tail 28 / 74, rmsnorm 2835 tail 40 / 74 paired > 1.00 on
+# both arches); the round-4 window above stays as the second admission path.
+SK_MIN_SAVING_ANY = 0.09
+SK_TAIL_FRAC_ANY = 0.60
 DEFAULT_SM_COUNT = (
     148  # B200 / B300: the census device of the tile rule when no plan supplies one
 )
+# Round 5 (Cake ``M_E8_MAX_M`` / ``QKV_M_E8_MIN_M``, ``_m_e8_twin``, ``_M_E8_POLICY`` auto): the ``l_e8`` branch of the
+# K = 1024 norm GEMMs (norm_gelu, norm_qkv_rope) takes the 256 x 128 eight-warp pair tile up to M_E8_MAX_M rows,
+# norm_qkv_rope only above QKV_M_E8_MIN_M (2552: m_e8 1.074-1.098x, m_e8_cs 1.026-1.033x; 4784 loses; 1656 / 4144 unmeasured
+# stay on l_e8).
+M_E8_MAX_M = 4096
+QKV_M_E8_MIN_M = 2304
+# Round 5 (Cake ``FC1_SK_TINY_TAIL`` / ``FC1_SK_L_MIN_ROUNDS`` / ``FC1_SK_L_MAX_M`` / ``FC1_SK_TWIN_SMALL`` /
+# ``FC1_SK_TWIN_LARGE``, ``_fc1_sk_twin``, ``_FC1_SK_POLICY`` auto): residual_fc1 (N = 1024, K = 4096) above
+# FC1_S_E8_LIMIT takes a pair stream-K twin at its census points -- ``m_sk`` when M <= MID_M_LIMIT and the 256 x 256 tile
+# leaves 0 < tail <= FC1_SK_TINY_TAIL cluster tiles (4784: 1.18-1.20x), ``l_sk`` when M > MID_M_LIMIT, the ideal round
+# count is >= FC1_SK_L_MIN_ROUNDS and M <= FC1_SK_L_MAX_M (16576 / 19136 / 43056 / 66564 / 105984 paired > 1.00 in every
+# pass; 153088 unmeasured -> m_p).  The census is on the 256 x 256 tile (``tiles_l``) whatever the routed tile.
+FC1_SK_TINY_TAIL = 4
+FC1_SK_L_MIN_ROUNDS = 3.4
+FC1_SK_L_MAX_M = 105984
+FC1_SK_TWIN_SMALL = "m_sk"
+FC1_SK_TWIN_LARGE = "l_sk"
+# Round 5 (Cake ``PDL_EARLY_WINDOW`` / ``PDL_EARLY_DEFAULT_WINDOW`` / ``_pdl_early_on``; policy ``_PDL_EARLY_POLICY``
+# default auto): the PDL_EARLY binary of a form is launched only at the M where its paired effect was > 1.00 in every
+# pass on both arches (route-level tower A/B for T <= 10764, per-form 4-kernel chains at 10764 / 16576 / 19136 / 43056,
+# merger chains at merged N).  Inclusive (lo, hi) ranges per variant on the GEMM's own M (tokens T for the per-layer
+# forms, merged N for gelu_erf / rmsnorm); variants without an entry (the last layer's plain ``residual_fc1``, ``pos_sqxw``)
+# use the default window.  The stream-K / tail / multicast / pos tiles never take the early binary
+# (:func:`pdl_early_selected`; Cake ``gemm_ir``: ``PDL_EARLY = pdl_early and not (cfg.tail or cfg.sk or cfg.mcast > 1
+# or POS_SPLIT)``).
+PDL_EARLY_WINDOW: dict[str, tuple[tuple[int, int], ...]] = {
+    "norm_qkv_rope": ((1, 8192),),
+    "norm_gelu": ((1, 19136),),
+    "residual_wo_sqxw": ((1, 43056),),
+    "residual_fc1_sqxw": ((1, 43056),),
+    "gelu_erf": ((144, 638), (1196, 1196)),
+    "rmsnorm": ((144, 638), (1196, 1196)),
+}
+PDL_EARLY_DEFAULT_WINDOW: tuple[tuple[int, int], ...] = ((1, 43056),)
 for _name in (
     *ROPE_TWIN,
     *ROPE_TWIN.values(),
@@ -869,8 +928,41 @@ def _sk_twin(name: str, n_total: int, M: int, sm_count: int) -> str:
         return name
     frac = tail / clusters
     rounds = -(-tiles // clusters)
-    if frac <= SK_TAIL_FRAC_MAX and (1.0 - frac) / rounds >= SK_MIN_SAVING:
+    saving = (1.0 - frac) / rounds
+    # Round 5: the wide window (Cake ``_sk_twin`` auto branch) OR the round-4 window.
+    if (saving >= SK_MIN_SAVING_ANY and frac <= SK_TAIL_FRAC_ANY) or (
+        frac <= SK_TAIL_FRAC_MAX and saving >= SK_MIN_SAVING
+    ):
         return SK_TWIN[name]
+    return name
+
+
+def _m_e8_twin(name: str, n_total: int, M: int) -> str:
+    """The ``l_e8`` branch of the K = 1024 norm GEMMs takes ``m_e8`` up to ``M_E8_MAX_M`` rows, norm_qkv_rope only
+    above ``QKV_M_E8_MIN_M`` (Cake ``_m_e8_twin``; the RoPE twin ``m_e8_cs`` follows through :func:`_rope_twin`)."""
+    if name != "l_e8" or M > M_E8_MAX_M:
+        return name
+    if n_total == QKV_N and M <= QKV_M_E8_MIN_M:
+        return name
+    return "m_e8"
+
+
+def _fc1_sk_twin(name: str, M: int, sm_count: int) -> str:
+    """residual_fc1 (N = 1024, K = 4096) above ``FC1_S_E8_LIMIT``: the pair stream-K twin at the census points
+    (Cake ``_fc1_sk_twin``): ``m_sk`` when M <= MID_M_LIMIT and the 256 x 256 tile census leaves ``0 < tail <=
+    FC1_SK_TINY_TAIL`` cluster tiles, ``l_sk`` when M > MID_M_LIMIT, ``tiles / clusters >= FC1_SK_L_MIN_ROUNDS`` and
+    ``M <= FC1_SK_L_MAX_M``; otherwise ``name``."""
+    if M <= FC1_S_E8_LIMIT:
+        return name
+    clusters = int(sm_count) // 2
+    m_tiles = (M + GEMM_BLOCK_M - 1) // GEMM_BLOCK_M
+    m_tiles += m_tiles % 2
+    tiles_l = (m_tiles // 2) * (HIDDEN // 256)
+    tail_l = tiles_l % clusters if tiles_l > clusters else 0
+    if M <= MID_M_LIMIT:
+        return FC1_SK_TWIN_SMALL if 0 < tail_l <= FC1_SK_TINY_TAIL else name
+    if tiles_l / clusters >= FC1_SK_L_MIN_ROUNDS and M <= FC1_SK_L_MAX_M:
+        return FC1_SK_TWIN_LARGE
     return name
 
 
@@ -893,7 +985,11 @@ def select_tile_config(
     ``m_tma1``, and the K = 1024 norm GEMMs / projector GEMMs keep 128 x 64 to
     768 rows and 128 x 128 to 1536 / 1656 rows before the 256-wide pair tiles.
     Round 4 added the stream-K twin ``l_sk`` of the projector GEMMs' pair tile
-    where the tile census leaves a small tail (:func:`_sk_twin`).
+    where the tile census leaves a small tail (:func:`_sk_twin`).  Round 5
+    widened that window (:data:`SK_MIN_SAVING_ANY`), added the FC1 stream-K
+    twins ``m_sk`` / ``l_sk`` at the FC1 census points (:func:`_fc1_sk_twin`)
+    and the eight-warp 256 x 128 pair tile ``m_e8`` / ``m_e8_cs`` of the norm
+    GEMMs up to ``M_E8_MAX_M`` rows (:func:`_m_e8_twin`).
     """
     n_total, k_total, pos_split = GEMM_VARIANTS[variant]
     cfg = TILE_CONFIGS
@@ -907,12 +1003,16 @@ def select_tile_config(
         s_e8_limit = WO_S_E8_LIMIT if k_total == QKV_HIDDEN else FC1_S_E8_LIMIT
         if s_e8_limit >= M:
             return cfg[_packed_twin("s_e8", tma_ok=False)]
-        return cfg[
-            _packed_twin(
-                "l_e8" if (k_total == FFN and M <= MID_M_LIMIT) else "m",
-                tma_ok=(k_total == QKV_HIDDEN),
-            )
-        ]
+        if k_total == FFN:
+            # fc1: l_e8_pf up to MID_M_LIMIT, m_p above, or the stream-K twin at the census points (round 5).
+            return cfg[
+                _fc1_sk_twin(
+                    _packed_twin("l_e8" if M <= MID_M_LIMIT else "m", tma_ok=False),
+                    M,
+                    sm_count,
+                )
+            ]
+        return cfg[_packed_twin("m", tma_ok=True)]
     if M <= TINY_M_LIMIT:
         return cfg[_rope_twin("s" if n_total == TEXT_HIDDEN else "xs", n_total)]
     if n_total == QKV_N and M <= QKV_XS_LIMIT:
@@ -926,13 +1026,10 @@ def select_tile_config(
     if n_total == FFN and M <= NG_S_LIMIT:
         return cfg["s"]
     # The K = 1024 norm GEMMs (statistics handoff on the critical path) take the
-    # eight-warp epilogue; the projector GEMMs the four-warp pair tile.
-    return cfg[
-        _rope_twin(
-            _sk_twin("l_e8" if k_total == HIDDEN else "l", n_total, M, sm_count),
-            n_total,
-        )
-    ]
+    # eight-warp epilogue (``m_e8`` inside its window, round 5); the projector
+    # GEMMs the four-warp pair tile (stream-K twin inside the census window).
+    wide = _m_e8_twin("l_e8", n_total, M) if k_total == HIDDEN else "l"
+    return cfg[_rope_twin(_sk_twin(wide, n_total, M, sm_count), n_total)]
 
 
 def launch_tile_config(
@@ -949,6 +1046,46 @@ def launch_tile_config(
         if (PATCH_DIM_PAD // GEMM_BLOCK_K) % cfg.ksplit:
             cfg = TILE_CONFIGS["s_k2"] if cfg.acc_n == 128 else TILE_CONFIGS["xs_k2"]
     return cfg
+
+
+def pdl_early_on(variant: str, M: int) -> bool:
+    """Whether ``M`` lies inside the PDL_EARLY census window of ``variant`` (Cake ``_pdl_early_on`` with its
+    production policy ``auto``; variants without an entry use ``PDL_EARLY_DEFAULT_WINDOW``)."""
+    return any(
+        lo <= int(M) <= hi
+        for lo, hi in PDL_EARLY_WINDOW.get(variant, PDL_EARLY_DEFAULT_WINDOW)
+    )
+
+
+def pdl_early_selected(variant: str, cfg: TileConfig, M: int) -> bool:
+    """Whether the launch of ``variant`` on ``cfg`` at ``M`` runs the PDL_EARLY binary: inside the window AND
+    on a plain persistent tile -- the stream-K twins (``sk``), the tail split-K twins, the A-multicast tiles and
+    the ``pos`` pixel-row-map forms launch the production PDL binary whatever the window says (Cake ``gemm_ir``:
+    ``PDL_EARLY = pdl_early and not (cfg.tail or cfg.sk or cfg.mcast > 1 or POS_SPLIT)``)."""
+    if not pdl_early_on(variant, M):
+        return False
+    return not (cfg.tail or cfg.sk or cfg.mcast > 1 or GEMM_VARIANTS[variant][2])
+
+
+def gemm_stage_key(variant: str, M: int, sm_count: int = DEFAULT_SM_COUNT) -> str:
+    """The logical kernel key the Cake launcher resolves for ``(variant, M)`` on ``sm_count`` SMs: the launched
+    tile and its PDL form (``gemm:<variant>:<tile>[:pdle]``; mirrors the export adapter's ``gemm_stage_key``)."""
+    cfg = launch_tile_config(variant, select_tile_config(variant, M, sm_count))
+    return gemm_kernel_key(variant, cfg.name, pdl_early_selected(variant, cfg, M))
+
+
+def gemm_kernel_keys_for(
+    total_tokens: int, merged: int, sm_count: int = DEFAULT_SM_COUNT
+) -> dict[str, str]:
+    """Logical GEMM kernel key per launched variant for one ``(T, N)`` on ``sm_count`` SMs."""
+    return {
+        variant: gemm_stage_key(
+            variant,
+            total_tokens if variant not in ("gelu_erf", "rmsnorm") else merged,
+            sm_count,
+        )
+        for variant in PRODUCTION_GEMM_VARIANTS
+    }
 
 
 class GemmLaunchGeometry(NamedTuple):
@@ -1022,57 +1159,57 @@ def stream_k_workspace_ctas(sm_count: int) -> int:
     return (int(sm_count) // 2 + 1) * 2
 
 
-GEMM_BUCKET_COUNTS: tuple[int, ...] = (
-    1,
-    *sorted(
-        b + 1
-        for b in {
-            TINY_M_LIMIT,
-            SMALL_M_LIMIT,
-            MID_M_LIMIT,
-            WO_S_E8_LIMIT,
-            FC1_S_E8_LIMIT,
-            QKV_XS_LIMIT,
-            QKV_S_LIMIT,
-            NG_XS_LOW,
-            NG_XS_HIGH,
-            NG_S_LIMIT,
-        }
-    ),
+# Stream-K census bound of the merger forms (round 4): above 16 pair-grid rounds the twin's minimum saving
+# (SK_MIN_SAVING = 6.5 % of the rounds) can no longer be met, so a per-tile scan up to here is exhaustive for
+# ``_sk_twin``.  The other routing windows (``FC1_SK_L_MAX_M``, the PDL_EARLY windows) extend the census below.
+# Mirrors the Cake export's ``MERGER_STREAM_K_SCAN_LIMIT`` / ``gemm_census_limit``.
+MERGER_STREAM_K_SCAN_LIMIT = 65536
+GEMM_CENSUS_LIMIT = (
+    max(
+        MERGER_STREAM_K_SCAN_LIMIT,
+        FC1_SK_L_MAX_M,
+        *(hi for ranges in PDL_EARLY_WINDOW.values() for _lo, hi in ranges),
+        *(hi for _lo, hi in PDL_EARLY_DEFAULT_WINDOW),
+    )
+    + GEMM_BLOCK_M
 )
 
 
-# The stream-K twin is a census window inside the pair-tile range, not a token-count boundary: the
-# tile rule is scanned per 128-row tile (the census depends on the tile count only) up to this M.
-# Above it the pair grid runs >= 16 rounds and the twin's minimum saving (SK_MIN_SAVING = 6.5 % of
-# the rounds) can no longer be met, so the scan is exhaustive.  Mirrors the Cake export's
-# ``gemm_stream_k_counts``.
-STREAM_K_SCAN_LIMIT = 65536
-
-
-def gemm_stream_k_counts(
-    variant: str, sm_count: int = DEFAULT_SM_COUNT
-) -> tuple[int, ...]:
-    """The token counts (one per 128-row tile, ``SMALL_M_LIMIT`` < M <= ``STREAM_K_SCAN_LIMIT``) at
-    which the production rule selects a stream-K twin for ``variant``; empty for the forms without one."""
-    return tuple(
-        count
-        for count in range(SMALL_M_LIMIT + 1, STREAM_K_SCAN_LIMIT + 1, GEMM_BLOCK_M)
-        if launch_tile_config(variant, select_tile_config(variant, count, sm_count)).sk
-    )
+def gemm_census_counts(variant: str) -> tuple[int, ...]:
+    """Every token count at which the routing of ``variant`` can change (Cake export ``gemm_census_counts``):
+    one count per 128-row tile from 1 to ``GEMM_CENSUS_LIMIT`` (tile selection and the stream-K censuses depend
+    on the tile count), every token-count boundary of the tile rule and its neighbour, and every edge of the
+    form's PDL_EARLY window (the window is on M, not on the tile count)."""
+    counts = set(range(1, GEMM_CENSUS_LIMIT + 1, GEMM_BLOCK_M))
+    for bound in (
+        TINY_M_LIMIT,
+        SMALL_M_LIMIT,
+        MID_M_LIMIT,
+        WO_S_E8_LIMIT,
+        FC1_S_E8_LIMIT,
+        QKV_XS_LIMIT,
+        QKV_S_LIMIT,
+        NG_XS_LOW,
+        NG_XS_HIGH,
+        NG_S_LIMIT,
+        M_E8_MAX_M,
+        QKV_M_E8_MIN_M,
+        FC1_SK_L_MAX_M,
+    ):
+        counts.update((bound, bound + 1))
+    for lo, hi in PDL_EARLY_WINDOW.get(variant, PDL_EARLY_DEFAULT_WINDOW):
+        counts.update((lo - 1, lo, hi, hi + 1))
+    return tuple(sorted(c for c in counts if 1 <= c <= GEMM_CENSUS_LIMIT))
 
 
 def required_kernel_keys(arch: str) -> tuple[str, ...]:
-    """Every logical kernel the production plan can select on ``arch`` (one token count per interval
-    of the tile rule plus the stream-K census window of every form; both attention layouts; the
-    ring3 SPLIT_KV form where the arch table selects it)."""
+    """Every logical kernel the production plan can select on ``arch`` (the tile / PDL-form census of every
+    GEMM form on the default SM count; both attention layouts; the ring3 SPLIT_KV form where the arch table
+    selects it)."""
     keys: list[str] = []
     for variant in PRODUCTION_GEMM_VARIANTS:
-        for count in (*GEMM_BUCKET_COUNTS, *gemm_stream_k_counts(variant)):
-            key = gemm_kernel_key(
-                variant,
-                launch_tile_config(variant, select_tile_config(variant, count)).name,
-            )
+        for count in gemm_census_counts(variant):
+            key = gemm_stage_key(variant, count)
             if key not in keys:
                 keys.append(key)
     keys.append(attention_kernel_key(MODE_TWO_TILE))
@@ -1252,7 +1389,8 @@ class VisionTowerPlan:
     sm_count: int
     attention: AttentionPlan
     merge_table: torch.Tensor
-    gemm_configs: dict[str, str]
+    gemm_configs: dict[str, str]  # variant -> launched tile config name
+    gemm_kernel_keys: dict[str, str]  # variant -> logical kernel key (tile + PDL form)
     cos: torch.Tensor
     sin: torch.Tensor
     rope_cs: (
@@ -1397,6 +1535,7 @@ def build_kimi_k3_vision_plan(
         else 0
     )
     gemm_configs = gemm_configs_for(total, merged, sm_count)
+    gemm_kernel_keys = gemm_kernel_keys_for(total, merged, sm_count)
     stream_k_ctas = (
         stream_k_workspace_ctas(sm_count)
         if any(TILE_CONFIGS[name].sk for name in gemm_configs.values())
@@ -1420,6 +1559,7 @@ def build_kimi_k3_vision_plan(
         attention=attention,
         merge_table=build_merge_table(grids, device),
         gemm_configs=gemm_configs,
+        gemm_kernel_keys=gemm_kernel_keys,
         cos=cos,
         sin=sin,
         rope_cs=pack_rope_table(cos, sin),
@@ -1558,6 +1698,11 @@ class KimiK3VisionTowerRunner:
             attention_units=plan.attention.total_tiles,
             attention_clusters=plan.attention.num_clusters,
             gemm_configs=dict(plan.gemm_configs),
+            gemm_kernel_keys=dict(plan.gemm_kernel_keys),
+            gemm_pdl_early={
+                variant: key.endswith(":pdle")
+                for variant, key in plan.gemm_kernel_keys.items()
+            },
             launch_count=len(self.launches),
             sm_count=plan.sm_count,
         )
@@ -1639,7 +1784,10 @@ def _gemm_launch(
         grid=geometry.grid,
     )
     assert tuple(kwargs) == GEMM_KWARGS
-    module = kernel_module_name(plan.arch, gemm_kernel_key(variant, cfg.name))
+    # The plan's key carries the tile AND the PDL form (production vs PDL_EARLY binary) of this launch.
+    key = plan.gemm_kernel_keys[variant]
+    assert key.split(":")[2] == cfg.name, (key, cfg.name)
+    module = kernel_module_name(plan.arch, key)
     entry, arguments, prepare = _bind(module, kwargs)
     return _Launch(stage, layer, module, kwargs, entry, arguments, prepare)
 

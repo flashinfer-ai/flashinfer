@@ -22,15 +22,65 @@ from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, sm100a_nvcc_flags
 
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_grouped_fp8_fused_silu_quant_0979ff47de2f0a213b53": {
+    "cake_grouped_fp8_fused_silu_quant_17106c4a725cda131dad": {
+        "arch": "sm_100a",
+        "route": "gemm_then_silu_mul_group_quant_fp8_wide",
+        "stage": "main",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_17106c4a725cda131dad",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_17106c4a725cda131dad_sm_100a",
+        "sources": [
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_17106c4a725cda131dad_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_17106c4a725cda131dad_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            [
+                "buffer",
+                "y",
+            ],
+            [
+                "buffer",
+                "out_q",
+            ],
+            [
+                "buffer",
+                "out_s",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "H",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "tma_workspace_bytes": 0,
+        "pdl": False,
+        "closure_sha256": "12ed4010de50fe7844dde1237eec0be93b85fcf636df2ce9efbcfc15b33a18a2",
+    },
+    "cake_grouped_fp8_fused_silu_quant_6b90356750732078015e": {
         "arch": "sm_100a",
         "route": "fused_cg2_ab7_mixedsched_lpt_kg4",
         "stage": "main",
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_0979ff47de2f0a213b53",
-        "cache_name": "cake_grouped_fp8_fused_silu_quant_0979ff47de2f0a213b53_sm_100a",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_6b90356750732078015e",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_6b90356750732078015e_sm_100a",
         "sources": [
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_0979ff47de2f0a213b53_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_0979ff47de2f0a213b53_binding.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_6b90356750732078015e_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_6b90356750732078015e_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -102,17 +152,17 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "tma_workspace_bytes": 384,
         "pdl": False,
-        "closure_sha256": "d09234a0e4fa59fdd2448998f18a9415df636169a489adddaded25b2346fa09b",
+        "closure_sha256": "6d6666be08efdf06993484cbddad4cb80c938f4ca94f07de58aa3bf70ec67c1c",
     },
-    "cake_grouped_fp8_fused_silu_quant_83a61feba610b0fc82e6": {
+    "cake_grouped_fp8_fused_silu_quant_79f3c6728d9a934fc67e": {
         "arch": "sm_100a",
         "route": "gemm_then_silu_mul_group_quant_fp8",
         "stage": "main",
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_83a61feba610b0fc82e6",
-        "cache_name": "cake_grouped_fp8_fused_silu_quant_83a61feba610b0fc82e6_sm_100a",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_79f3c6728d9a934fc67e",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_79f3c6728d9a934fc67e_sm_100a",
         "sources": [
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_83a61feba610b0fc82e6_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_83a61feba610b0fc82e6_binding.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_79f3c6728d9a934fc67e_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_79f3c6728d9a934fc67e_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -152,17 +202,17 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "tma_workspace_bytes": 0,
         "pdl": False,
-        "closure_sha256": "6be1f67696ceecb891b734103e926f02c2c18f49449df0fab7088b19399558fa",
+        "closure_sha256": "276e323256df56bcf4c2a41111992ad6e46afa5a8dd404206327429f228531d0",
     },
-    "cake_grouped_fp8_fused_silu_quant_96b1c66b030aa5102196": {
+    "cake_grouped_fp8_fused_silu_quant_ab758f32f1a4c65b047c": {
         "arch": "sm_100a",
         "route": "fused_cg2_ab7_pairsched_solotail_kg4",
         "stage": "pair",
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_96b1c66b030aa5102196",
-        "cache_name": "cake_grouped_fp8_fused_silu_quant_96b1c66b030aa5102196_sm_100a",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_ab758f32f1a4c65b047c",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_ab758f32f1a4c65b047c_sm_100a",
         "sources": [
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_96b1c66b030aa5102196_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_96b1c66b030aa5102196_binding.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_ab758f32f1a4c65b047c_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_ab758f32f1a4c65b047c_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -230,67 +280,17 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "tma_workspace_bytes": 256,
         "pdl": False,
-        "closure_sha256": "f31036da65b828dc0ee8f5e7eaa281054610bbe6eec2665ee22d5e9bb6eec22e",
+        "closure_sha256": "07fc506870ce1fc5b43c9da7d6823fccfe35ae6b918cda094ab007822e5468c0",
     },
-    "cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405": {
-        "arch": "sm_100a",
-        "route": "gemm_then_silu_mul_group_quant_fp8_wide",
-        "stage": "main",
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405",
-        "cache_name": "cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405_sm_100a",
-        "sources": [
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            [
-                "buffer",
-                "y",
-            ],
-            [
-                "buffer",
-                "out_q",
-            ],
-            [
-                "buffer",
-                "out_s",
-            ],
-            [
-                "parameter",
-                "M",
-            ],
-            [
-                "parameter",
-                "H",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "tma_workspace_bytes": 0,
-        "pdl": False,
-        "closure_sha256": "e4abf5b231526af2adb292b7f7fd499aab210063f816b72146b8c9e4b59bddfe",
-    },
-    "cake_grouped_fp8_fused_silu_quant_ee44e6d5f77cb4105519": {
+    "cake_grouped_fp8_fused_silu_quant_f47a8009af8639c08f11": {
         "arch": "sm_100a",
         "route": "fused_cg2_ab7_pairsched_solotail_kg4",
         "stage": "tail",
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_ee44e6d5f77cb4105519",
-        "cache_name": "cake_grouped_fp8_fused_silu_quant_ee44e6d5f77cb4105519_sm_100a",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_f47a8009af8639c08f11",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_f47a8009af8639c08f11_sm_100a",
         "sources": [
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_ee44e6d5f77cb4105519_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_ee44e6d5f77cb4105519_binding.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_f47a8009af8639c08f11_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_f47a8009af8639c08f11_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -358,7 +358,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "tma_workspace_bytes": 256,
         "pdl": True,
-        "closure_sha256": "bc5c0c19f99380b8fa9a75a1a6607a7c1e46b379279f562f328347236c2e1da9",
+        "closure_sha256": "ef5d06f8e0d2c20c1adad9b5fea09b3ead0134ca6bfa9c8c54df299143f73d4a",
     },
 }
 
