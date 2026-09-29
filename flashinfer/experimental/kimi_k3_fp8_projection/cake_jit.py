@@ -1507,6 +1507,7 @@ def decode_kernel_key(
     cs_alias: bool = False,
     epi_chunk: int = 0,
     pf: int = 0,
+    mc: int = 1,
 ) -> str:
     key = f"decode:t{int(tok)}_p{int(stages)}"
     if fused:
@@ -1523,6 +1524,8 @@ def decode_kernel_key(
         key += f"_cs{int(csplit)}"  # round 5: K split across the CTAs of one cluster, DSM partial exchange
         if cs_alias:
             key += "a"  # the exchange inbox aliases the dead pipeline stages (one round; one work item per CTA)
+    if int(mc) > 1:
+        key += f"_mc{int(mc)}"  # round 6 (lever M): the C m tiles of one N tile run as a cluster and share the W stage (TMA multicast)
     if int(pf) > 0:
         key += f"_pf{int(pf)}"  # round 6 (lever P): weight tiles prefetched into L2 pf stages ahead of their TMA load
     return key

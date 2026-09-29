@@ -425,6 +425,7 @@ class DecodeConfig:
     cs_alias: bool = False  # round 5: the DSM inbox aliases the dead pipeline stages (one exchange round); only when every CTA owns one work item
     epi_chunk: int = 32  # round 6: epilogue staging rows per flush (table key ``epi_chunk``; 16 frees SMEM for the 5-stage t32 ring)
     pf: int = 0  # round 6 (lever P): weight-tile L2 prefetch distance in stages (table key ``pf``; 0 = off)
+    mc: int = 1  # round 6 (lever M): m tiles of one N tile per cluster sharing the W stage through TMA multicast (table key ``mc``; 1 = off)
 
     @property
     def tok_rows(self) -> int:
@@ -443,6 +444,7 @@ class DecodeConfig:
             cs_alias=self.cs_alias,
             epi_chunk=self.epi_chunk,
             pf=self.pf,
+            mc=self.mc,
         )
 
 
@@ -535,7 +537,15 @@ def decode_config(
     pf = int(entry.get("pf", 0))
     m_tiles = -(-M // tok)
     tiles = int(n_tiles128) * m_tiles
-    total_work = tiles * split
+    # Table key ``mc`` (round 6, lever M): the C m tiles of one N tile run as a cluster and share the W stage through
+    # TMA multicast (each rank streams 1 / C of the weight bytes).  Whole m-tile groups, an unsplit K, no cluster split-K;
+    # one work item = (N tile, m-tile group).  Host mirror of the Cake ``decode_config`` rule.
+    mc = int(entry.get("mc", 1))
+    if mc > 1 and (mc not in (2, 4, 8) or csplit > 1 or split != 1 or m_tiles % mc):
+        raise ValueError(
+            f"decode table entry mc {mc} needs C in (2, 4, 8), split 1, no csplit and m_tiles ({m_tiles}) % C == 0"
+        )
+    total_work = tiles * split if mc == 1 else int(n_tiles128) * (m_tiles // mc)
     # Table key ``grid`` (round 4): a balanced persistent CTA count (e.g. 128 CTAs for 256 work items) instead of one
     # CTA per SM; the round-4 A/B of the 16384-row buckets preferred 128 x 2 items over 148 x 1.73.
     grid = (
@@ -546,6 +556,11 @@ def decode_config(
         grid = csplit * max(
             1, min(grid // csplit, decode_cluster_capacity(arch, csplit))
         )
+    if mc > 1:
+        # Lever M: ``grid`` counted cluster items so far; C CTAs per cluster, no more clusters than co-schedule.
+        grid = mc * max(
+            1, min(grid, int(sm_count) // mc, decode_cluster_capacity(arch, mc))
+        )
     resident = (
         bool(entry.get("resident", False))
         and fused
@@ -554,6 +569,7 @@ def decode_config(
         and tok <= 64
         and -(-total_work // grid) <= DEC_RES_SLOTS
         and csplit == 1
+        and mc == 1
     )
     if resident:
         xb_stages = 0  # resident tiles are fetched once; no ring
@@ -582,6 +598,7 @@ def decode_config(
         csplit=csplit,
         epi_chunk=epi_chunk,
         pf=pf,
+        mc=mc,
         cs_alias=csplit > 1
         and grid == total_work
         and decode_cs_alias_fits(tok, stages, fused, resident, csplit, xb_stages)
