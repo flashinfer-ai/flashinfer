@@ -17,6 +17,16 @@ state scale) so every operand exponent stays within +-~122 bits.  Per chunk the
 recurrent chain is
    S_bf -> G = S k2^T -> (bf16) -> v_new = u - G T'^T -> (bf16) -> S += v_new kA -> decay -> S_bf
 
+The delta lands before the decay, so the pre-decay accumulator holds the state times
+2^-e_cl (up to 2^(CLAMP_F + 0.5)).  The TMEM state therefore lives at 2^-S_SHIFT: T' carries
+2^-S_SHIFT (so u, v_new and v_new_bf do too), q2 / k2 and the staged Aqk carry 2^S_SHIFT
+(so G and O come out unscaled).  A piece loaded from initial_state runs its first chunk's
+G / O_I on the unscaled image (q2 / k2 without 2^S_SHIFT) and rescales S_acc before that
+chunk's delta; a piece that ends in final_state leaves the frame through its last decay
+factor; handoffs stay in the frame.
+This centers the representable state range (about 2^-66 .. 2^66 times the true values)
+instead of leaving ~8 bits of headroom above the true state.
+
 Varlen: a one-warp prologue expands cu_seqlens into an SMEM item table (token offset,
 valid rows, sequence id, first/last flags); every role loops over the same flat item
 index so all barrier parities stay item-based.  Rows past a sequence end are masked in
@@ -26,10 +36,9 @@ each sequence's first chunk and writes final_state[seq] after its last chunk.  O
 rows are written with predicated 16-byte global stores from the transposed SMEM staging
 tile (no fixed-box TMA store can be clipped at an interior sequence boundary).
 
-Shape portfolio: H96 mixed-varlen forces whole-item LPT scheduling; H64 mixed and
-uniform retain chunk-linear splitting with a bf16 continuation buffer.  Initial-state
-loads and final-state stores use 256-bit streaming fp32 operations, while final_state
-itself remains fully materialized in fp32 and H96 uniform retains fp32 handoffs.
+Scheduling: the host picks whole-item LPT lists or chunk-linear splits with fp32
+continuation handoffs from a cost model (see _host_item_table).  Initial-state loads and
+final-state stores use 256-bit streaming fp32 operations.
 """
 
 import math
@@ -63,6 +72,8 @@ LD16x4 = "tcgen05.ld.sync.aligned.16x256b.x4.b32"
 
 
 CLAMP_F = 120.0
+# log2 scale of the TMEM state frame (see the module docstring)
+S_SHIFT = 60
 LD32x32 = "tcgen05.ld.sync.aligned.32x32b.x32.b32"
 LD32x16 = "tcgen05.ld.sync.aligned.32x32b.x16.b32"
 TMA_S2G3 = "cp.async.bulk.tensor.3d.global.shared::cta.tile.bulk_group.L2::cache_hint"
@@ -437,22 +448,6 @@ def build_kernel(
             txl.ptx.fma.rn.bf16x2(r, a, b, c)
             return r
 
-        def hrcp2(a):
-            """Packed bf16 reciprocal from a bit seed and one fused Newton step.
-
-            Positive normal inputs use the exponent/mantissa reflection seed
-            0x7ef2 - bits.  The constant minimizes the exhaustive bf16 maximum
-            relative error after r * (2 - a*r); the fused step keeps that
-            bound below 0.0063 for the range used by the scaled gate factors.
-            """
-            r0 = txl.uint32(0x7EF27EF2) - a
-            corr = hfma2(
-                txl.bitwise_xor(a, txl.uint32(0x80008000)),
-                r0,
-                txl.uint32(0x40004000),
-            )
-            return hmul2(r0, corr)
-
         def ex2(x):
             r = txl.local_scalar("float32")
             txl.ptx.ex2.approx.ftz.f32(r, x)
@@ -680,7 +675,11 @@ def build_kernel(
             n_items = n_items_local()
 
             def load_state_from(buf, base, external=False):
-                """[v][k] fp32 block at element offset `base` (V-first, lane = v row) -> S_acc fp32 and S_bf bf16 in TMEM, then S_ready."""
+                """[v][k] fp32 block at element offset `base` (V-first, lane = v row) -> S_acc fp32 and S_bf bf16 in TMEM, then S_ready.
+
+                Handoff slots hold the 2^-S_SHIFT frame.  initial_state loads unscaled (a multiply here sits on the
+                piece-boundary critical path); that piece's first chunk runs G / O_I unscaled and enter_frame() rescales
+                S_acc before its delta."""
 
                 for half_ in range(2):
                     if external:
@@ -762,7 +761,9 @@ def build_kernel(
                     load_state_from(hand, base)
 
             def store_state_to(buf, fbase, external=False):
-                """S_acc (after the piece's last decay) -> [v][k] fp32 block at element offset `fbase`, one v row per lane."""
+                """S_acc (after the piece's last decay) -> [v][k] fp32 block at element offset `fbase`, one v row per lane.
+
+                Handoff slots keep the 2^-S_SHIFT frame; a piece ending in final_state already left it in its last decay (prep's dvec)."""
                 for half_ in range(2):
                     txl.ptx[LD32x64](
                         *[regs[j] for j in range(64)], tmem(C_SACC + 64 * half_)
@@ -941,6 +942,29 @@ def build_kernel(
                 warrive(g_ready, 0)
                 iend(tok_g)
 
+            def enter_frame():
+                """S_acc (initial_state, unscaled) -> 2^-S_SHIFT frame, while the u / v_new MMAs run; the v_new
+                conversion's wait::st and fence order it before this chunk's delta."""
+                with txl.serial(2, unroll=False) as hf:
+                    txl.ptx[LD32x64](
+                        *[regs[j] for j in range(64)], tmem(C_SACC + 64 * hf)
+                    )
+                    txl.ptx.tcgen05.wait__ld.sync.aligned()
+                    for j in range(0, 64, 2):
+                        pair = txl.local_scalar("uint64")
+                        txl.ptx.mov.b64(pair, regs[j], regs[j + 1])
+                        txl.ptx.mul.rn.f32x2(
+                            pair,
+                            pair,
+                            txl.cuda.make_float2(
+                                txl.float32(2.0**-S_SHIFT), txl.float32(2.0**-S_SHIFT)
+                            ),
+                        )
+                        txl.ptx.mov.b64(regs[j], regs[j + 1], pair)
+                    txl.ptx[ST32x64](
+                        tmem(C_SACC + 64 * hf), *[regs[j] for j in range(64)]
+                    )
+
             def load_piece_state(idx):
                 """Item idx starts a piece: bring its state into TMEM (handoff slot or initial_state), arrive S_ready."""
                 iwn = item_word(idx)
@@ -977,6 +1001,11 @@ def build_kernel(
                                     h0.ptr_to([pf_base]), txl.uint32(D * D * 4)
                                 )
                 gconv(c)
+                with (
+                    txl.If(tvm.tirx.all(item_first(iw), txl.Not(item_src_hand(iw)))),
+                    txl.Then(),
+                ):
+                    enter_frame()
                 fwait(vnew_done, s, (c // 2) % 2, "st-wait-vnew")
                 tok_vn = irange("st-vnconv")
                 txl.ptx[FENCE_AFTER]()
@@ -1210,14 +1239,17 @@ def build_kernel(
                     )
 
             def beta_rows(sb, J, neg=True):
+                """Row scales of T' = T diag(beta), carrying the state frame's 2^-S_SHIFT."""
                 b0 = txl.local_scalar("float32")
                 b1 = txl.local_scalar("float32")
                 txl.ptx.ld.shared.f32(b0, bsig.ptr_to([sb * 64 + 16 * J + r16]))
                 txl.ptx.ld.shared.f32(b1, bsig.ptr_to([sb * 64 + 16 * J + r16 + 8]))
-                if not neg:
-                    return (b0, b1)
-                return (txl.float32(0.0) - b0, txl.float32(0.0) - b1)
+                f = txl.float32(-(2.0**-S_SHIFT) if neg else 2.0**-S_SHIFT)
+                return (b0 * f, b1 * f)
 
+            AQK_SHIFT2 = txl.uint32(
+                ((127 + S_SHIFT) << 7) * 0x10001
+            )  # bf16x2(2^S_SHIFT, 2^S_SHIFT)
             LT = LTT
             TT = LTT
             TpT = TpT_t
@@ -1330,7 +1362,10 @@ def build_kernel(
                                 )
                                 for cc in range(2)
                             ]
-                            txl.assign(aqk_pk[npk], bf16x2(av[0], av[1]))
+                            # staged Aqk carries 2^S_SHIFT against the scaled v_new_bf it multiplies (exact bf16 scaling)
+                            txl.assign(
+                                aqk_pk[npk], hmul2(bf16x2(av[0], av[1]), AQK_SHIFT2)
+                            )
                             npk += 1
                             continue
                         lv = []
@@ -1888,33 +1923,47 @@ def build_kernel(
                 ]
                 scal = [ca, cb, da, db]
                 lane_c = txl.alloc_local((4,), "uint32")
+                # the first chunk of a piece loaded from initial_state still sees an unscaled S_bf
+                shift = txl.Select(
+                    tvm.tirx.all(item_first(iw), txl.Not(item_src_hand(iw))),
+                    txl.uint32(0),
+                    txl.uint32(S_SHIFT),
+                )
                 for z in range(4):
                     nr = fadd2f(
                         scal[z][0], scal[z][1], txl.float32(RINT_C), txl.float32(RINT_C)
                     )
+                    # 2^ca also carries the state frame's 2^S_SHIFT (ca >= -126, so it stays normal)
                     power = [
                         txl.reinterpret(
                             "float32",
                             txl.shift_left(
                                 txl.reinterpret("uint32", nr[m])
-                                - txl.uint32(RINT_BITS - 127),
+                                - txl.uint32(RINT_BITS - 127)
+                                + (shift if z == 0 else txl.uint32(0)),
                                 txl.uint32(23),
                             ),
                         )
                         for m in range(2)
                     ]
                     txl.assign(lane_c[z], bf16x2(power[0], power[1]))
-                # the q2/k2 clamp product cc = 2^ca * 2^cb is per-channel, so it is formed once and broadcast; the kA factors 2^da, 2^db stay separate (their fused product can underflow where the staged one does not)
+                # the q2/k2 clamp product cc = 2^S_SHIFT * 2^ca * 2^cb is per-channel, so it is formed once and broadcast; the kA factors 2^da, 2^db stay separate (their fused product can underflow where the staged one does not)
                 cc_lane = txl.local_scalar("uint32", init=hmul2(lane_c[0], lane_c[1]))
                 lane_b = [cc_lane, lane_c[2], lane_c[3]]
 
                 with txl.If(I == 0), txl.Then():
                     with txl.If(c >= 3), txl.Then():
                         fwait(dvec_free, c % 3, ((c - 3) // 3) % 2, "pr-wait-dvecfree")
+                    # a piece ending in final_state leaves the 2^-S_SHIFT frame in its last decay
+                    unscale = txl.Select(
+                        tvm.tirx.all(item_last(iw), txl.Not(item_dst_hand(iw))),
+                        txl.float32(S_SHIFT),
+                        txl.float32(0.0),
+                    )
                     txl.ptx.st.shared.v2.f32(
                         dvec.ptr_to([(c % 3) * 128 + 2 * cp]),
-                        ex2(e_cl[0]),
-                        ex2(e_cl[1]),
+                        ex2(e_cl[0] + unscale),
+                        ex2(e_cl[1] + unscale),
                     )
                     warrive(dvec_ready, c % 3)
 
@@ -1980,10 +2029,22 @@ def build_kernel(
                         ld4u(qraw, 0, tptr_off(kqs, r + KQ_QQ_OFF))
                         ld4u(kraw, 0, tptr_off(kqs, r + KQ_K_OFF))
                         for p in range(4):
-                            ex0 = ex2(cX[a * 8 + 2 * p] + excl[2 * p])
-                            ex1 = ex2(cX[a * 8 + 2 * p + 1] + excl[2 * p + 1])
-                            txl.assign(Ex[p], bf16x2(ex0, ex1))
-                            txl.assign(Fp[p], hrcp2(Ex[p]))
+                            x0 = txl.local_scalar(
+                                "float32", init=cX[a * 8 + 2 * p] + excl[2 * p]
+                            )
+                            x1 = txl.local_scalar(
+                                "float32", init=cX[a * 8 + 2 * p + 1] + excl[2 * p + 1]
+                            )
+                            txl.assign(Ex[p], bf16x2(ex2(x0), ex2(x1)))
+                            # 1/Ex as its own ex2: kf feeds kA (the state update), and a one-step bf16 Newton
+                            # reciprocal is biased (mean -0.14%, max 0.63% over the used range)
+                            txl.assign(
+                                Fp[p],
+                                bf16x2(
+                                    ex2(txl.float32(0.0) - x0),
+                                    ex2(txl.float32(0.0) - x1),
+                                ),
+                            )
                         for p in range(4):
                             qn = hmul2(qraw[p], rq2[a])
                             kn = hmul2(kraw[p], rk2[a])

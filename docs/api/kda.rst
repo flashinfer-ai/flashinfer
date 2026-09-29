@@ -578,6 +578,12 @@ longest-processing-time, or equal-cost ranges that hand FP32 state between
 CTAs when that lowers the modelled makespan by at least 5%. TIRx is imported
 only when explicitly selecting this backend.
 
+The fused kernel accumulates each chunk's state update before applying the
+chunk decay (up to ``2**120.5``), so its TMEM state is kept at ``2**-60`` of
+the true value. For unit-order inputs, scaling V and the initial state by any
+power of two from ``2**-40`` to ``2**60`` scales outputs and final states
+exactly; the BT32 chain alone covers ``2**-60`` to ``2**100``.
+
 Install CUDA-enabled TVM, the TIRx Lite frontend and a CUDA 13 toolkit with
 ``nvcc`` available. The validated compiler packages are::
 

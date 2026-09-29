@@ -438,14 +438,19 @@ def test_tirx_kda_schedule_invariants(heads, lengths, num_ctas):
             assert seen[(seq, head)] == (length + BT - 1) // BT - 1
 
 
-def test_tirx_kda_large_values():
-    """KDA is linear in (v, state): exact power-of-two scaling must commute."""
-    inputs = _inputs((8192,), 64)
+@pytest.mark.parametrize(
+    "lengths, packed",
+    [((8192,), False), ((1001,), False), ((1300, 547, 2048), True)],
+    ids=["split", "split+fused-tail", "fused-packed"],
+)
+@pytest.mark.parametrize("scale", [2.0**-30, 2.0**30, 2.0**60])
+def test_tirx_kda_large_values(lengths, packed, scale):
+    """KDA is linear in (v, state): exact power-of-two scaling must commute on every route."""
+    inputs = _inputs(lengths, 64, packed=packed)
     base = _call(
         {**inputs, "initial_state": inputs["initial_state"].clone()},
         output_final_state=True,
     )
-    scale = 2.0**20
     scaled = {
         **inputs,
         "v": inputs["v"] * scale,
