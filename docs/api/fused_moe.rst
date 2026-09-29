@@ -32,7 +32,10 @@ Unified MoE API
 ---------------
 
 Backend-agnostic configuration and layer types. ``QuantConfig`` carries the MMA
-weight / activation formats and the layer output format as ``QuantFormat`` axes.
+weight / activation formats and the layer output format as ``QuantFormat`` axes,
+plus the NVFP4 4over6 recipe (``nvfp4_4over6``); passing a recipe there is the
+supported alternative to the process-wide ``FLASHINFER_NVFP4_4OVER6*``
+environment variables, described under :ref:`apiquantization`.
 
 .. autosummary::
     :toctree: ../generated

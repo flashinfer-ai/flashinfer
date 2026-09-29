@@ -92,7 +92,7 @@ All configs are frozen dataclasses registered with TVM's object system. The hier
 | Config | Owns |
 | --- | --- |
 | RoutingConfig | num_experts, top_k, routing method, grouping params, scaling factor |
-| QuantConfig | weight / activation / output QuantFormat axes |
+| QuantConfig | weight / activation / output QuantFormat axes; swizzled_scale_factors, per_token_scale, nvfp4_4over6 (NVFP4 4over6 recipe, §3.4) |
 | ExpertConfig | intermediate_size, local sharding params |
 | ActivationConfig | common base for typed activation values and their scalar parameters |
 | BackendOptions | ordered candidate set via \| operator |
@@ -162,6 +162,22 @@ fp8_config = dataclasses.replace(
     ),
 )
 ```
+
+### 3.4 QuantConfig.nvfp4_4over6 — the 4over6 recipe
+
+NVFP4 "4over6" is a two-candidate block-scale search inside the quantizer: next to the standard `amax / 6` E4M3 block scale it also tries `amax / 4`, quantizes the block both ways and keeps the one with less reconstruction error. It is a recipe for picking block scales, not a numeric format (the MMA operands stay NVFP4), so it is a knob on `QuantConfig`, not a `QuantFormat`. Before this field it was configured only by the process-wide `FLASHINFER_NVFP4_4OVER6*` variables, which cannot vary per layer or per model.
+
+| `nvfp4_4over6=` | Meaning |
+| --- | --- |
+| unset (the default) | Read `FLASHINFER_NVFP4_4OVER6*` on every call, byte-for-byte the pre-existing behaviour. A `FutureWarning` is emitted when the environment turns 4over6 on. |
+| `None` | 4over6 off. The environment is ignored. |
+| `NVFP44Over6Config(...)` | On with exactly this recipe. The environment is ignored, with no per-field merge. |
+
+- **One public type.** The field is `Optional[NVFP44Over6Config]`; "defer to the environment" is the default value (a private `_UNSET` sentinel that callers never spell), not a third public type. Retiring the shim later means flipping the default to `None` with no signature change.
+- **One resolution boundary.** `resolve_nvfp4_4over6()` is the only Python code that reads the variables. Below it every kernel driver takes the resolved value under the name `nvfp4_4over6_config`, so an unresolved value cannot reach a `@functools.cache`-d kernel getter unnoticed. The FFI receives a packed `int64`, decoded by `resolveNVFP4Recipe()` in `csrc/nv_internal/tensorrt_llm/kernels/nvfp4Recipe.h`.
+- **An explicit setting is never silently ignored.** Support is opt-in per runner via `MoERunner.supports_nvfp4_4over6`; `MoERunner._check_support()` rejects any explicit value (including `None`, which a runner that still reads the environment could not honour) on a runner that has not opted in. `CuteDslRunner` honours a pinned recipe only with `per_token_scale=True`, the one path where it quantizes the GEMM2 input itself. `MoELayer` names the runners that do support it in its "no usable backend" error.
+- **Activations only.** The field governs the runtime activation quantization; weights are quantized by the caller ahead of the call. `QuantConfig.__post_init__` rejects an explicit setting when `activation` is not `QuantFormat.NVFP4`, so the mistake is named where the config is written rather than swallowed by the candidate filter.
+- **Flat and unified APIs take the same value.** `nvfp4_quantize(..., nvfp4_4over6=...)`, `make_nvfp4_global_scale(..., nvfp4_4over6_config=...)`, `CuteDslConfig.prepare_weights(..., nvfp4_4over6=...)` and `QuantConfig.nvfp4_4over6` all accept one `NVFP44Over6Config` object.
 
 ## 4. Public API
 
