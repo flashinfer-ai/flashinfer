@@ -64,6 +64,7 @@ def _get_compiled(
     prep_peel: bool = False,
     gate_roll: bool = False,
     cluster_size: int = 1,
+    partial_tma: bool = True,
 ):
     key = (
         dev.index,
@@ -90,6 +91,7 @@ def _get_compiled(
         prep_peel,
         cluster_size,
         gate_roll,
+        partial_tma,
     )
     entry = _COMPILED.get(key)
     if entry is None:
@@ -189,6 +191,7 @@ def _get_compiled(
                 LOWER_BOUND_M5_=1 if lower_bound_m5 else 0,
                 CLUSTER_=int(cluster_size),
                 PREP_PEEL_=1 if prep_peel else 0,
+                PARTIAL_TMA_=1 if partial_tma else 0,
                 GATE_ROLL_=1 if gate_roll else 0,
                 options="--enable-tvm-ffi --opt-level 3",
             )
@@ -275,6 +278,7 @@ def _launch_forward(
     prep_peel=False,
     cluster_size=1,
     gate_roll=False,
+    partial_tma=True,
 ):
     dev = q.device
     B, T, H, K = q.shape
@@ -345,6 +349,7 @@ def _launch_forward(
         prep_peel=prep_peel,
         cluster_size=cluster_size,
         gate_roll=gate_roll,
+        partial_tma=partial_tma,
     )
     stream = cuda_driver.CUstream(torch.cuda.current_stream(dev).cuda_stream)
     tfn(
@@ -693,5 +698,8 @@ def fwd(
         # 0.17% in matched 5x100 bookends; full-chunk H64 still prefers the
         # scalar schedule.
         gate_roll=generic,
+        # Varlen routes load partial last chunks by TMA and mask them; the
+        # single-sequence route keeps its per-element tail (2% faster).
+        partial_tma=not fixed,
         **common,
     )

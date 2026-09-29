@@ -229,6 +229,7 @@ def _pkd(
     LOWER_BOUND_M5_: cutlass.Constexpr[int] = 0,
     WARM_SPLIT_: cutlass.Constexpr[int] = 0,
     PREP_PEEL_: cutlass.Constexpr[int] = 0,
+    PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -1863,6 +1864,23 @@ def _pkd(
                         full = peeled_full
                     else:
                         full = seq_len >= (ci + 1) * C
+                    # PARTIAL_TMA_ loads every chunk as a full 32-row tile and
+                    # masks rows past the sequence end, instead of the slow
+                    # per-element path for the partial last chunk.
+                    if cutlass.const_expr(PARTIAL_TMA_ == 1):
+                        tma = True
+                    else:
+                        tma = full
+                    # A peeled prep loop runs every chunk but the last as a
+                    # statically full chunk, with the full-chunk early
+                    # gate/beta schedule.
+                    static_full = FULL_CHUNKS_ == 1 or (
+                        PREP_PEEL_ == 1 and tail_phase == 0
+                    )
+                    # Only TMA-loaded partial chunks need row masks.
+                    may_be_partial = cutlass.const_expr(
+                        PARTIAL_TMA_ == 1 and not static_full
+                    )
 
                     # -- phase 0: raw g/k TMA (qd/kd slots free after MMA2(ci-5)) --
                     if cutlass.const_expr(BETA_TMA_ == 1):
@@ -1877,7 +1895,7 @@ def _pkd(
                                 b_d,
                                 tma_bar_ptr=mb + MB_BRAW + inst,
                             )
-                    if full:
+                    if tma:
                         cute.arch.mbarrier_wait(mb + MB_RFREE + inst, pp_rfree)
                         if plw == 0:
                             with cute.arch.elect_one():
@@ -1940,7 +1958,7 @@ def _pkd(
                     # scalars across the wait, matching the retained overlap schedule.
                     btv = cutlass.Float32(0.0)
                     early_gate0 = cutlass.Float32(0.0)
-                    if cutlass.const_expr((FULL_CHUNKS_ == 1) and (QK_ROWPAIR_ == 8)):
+                    if cutlass.const_expr(static_full and (QK_ROWPAIR_ == 8)):
                         if plw == 2:
                             if cutlass.const_expr(BETA_TMA_ == 1):
                                 cute.arch.mbarrier_wait(mb + MB_BRAW + inst, pp_braw)
@@ -1957,7 +1975,7 @@ def _pkd(
 
                     # -- phase 1: everything else waits MMA4(ci-5) --
                     cute.arch.mbarrier_wait(mb + MB_SFREE + inst, pp_sfree)
-                    if full:
+                    if tma:
                         if plw == 0:
                             f_qr = cute.make_tensor(
                                 cute.recast_ptr(
@@ -1987,7 +2005,7 @@ def _pkd(
                     # grams two barriers later and by compute after qk_full)
                     if plw == 2:
                         if cutlass.const_expr(
-                            (FULL_CHUNKS_ == 0) or (QK_ROWPAIR_ != 8)
+                            (not static_full) or (QK_ROWPAIR_ != 8)
                         ):
                             if cutlass.const_expr(BETA_TMA_ == 1):
                                 cute.arch.mbarrier_wait(mb + MB_BRAW + inst, pp_braw)
@@ -2010,12 +2028,12 @@ def _pkd(
                         # L1 wavefronts per chunk on the ~86%-busy LSU pipe).
                         # v99 note kept out: TMAs stay full-chunk-gated here.
                         if cutlass.const_expr(
-                            (FULL_CHUNKS_ == 0) or (QK_ROWPAIR_ != 8)
+                            (not static_full) or (QK_ROWPAIR_ != 8)
                         ):
-                            if full:
+                            if tma:
                                 cute.arch.mbarrier_wait(mb + MB_GRAW + inst, pp_graw)
                         accg = cutlass.Float32(0.0)
-                        if full:
+                        if tma:
                             if cutlass.const_expr(GATE_ROLL_ == 1):
                                 for rp in cutlass.range(C // 8):
                                     rw0 = rp * 8
@@ -2027,6 +2045,11 @@ def _pkd(
                                     for u in cutlass.range_constexpr(8):
                                         g8[u] = _tanhf(g8[u])
                                     g8.store(g8.load() * lb2h + lb2h)
+                                    if cutlass.const_expr(may_be_partial):
+                                        if cc < C:
+                                            for u in cutlass.range_constexpr(8):
+                                                if rw0 + u >= cc:
+                                                    g8[u] = cutlass.Float32(0.0)
                                     for u in cutlass.range_constexpr(8):
                                         accg += g8[u]
                                         v_gcs[rw0 + u, ptl, inst] = accg
@@ -2048,9 +2071,16 @@ def _pkd(
                                     g8.store(g8.load() * lb2h + lb2h)
                                     rf8.store(rf8.load() * lb2h + lb2h)
                                     if cutlass.const_expr(
-                                        (FULL_CHUNKS_ == 1) and (QK_ROWPAIR_ == 8)
+                                        static_full and (QK_ROWPAIR_ == 8)
                                     ):
                                         g8[0] = early_gate0 if rp == 0 else g8[0]
+                                    if cutlass.const_expr(may_be_partial):
+                                        if cc < C:
+                                            for u in cutlass.range_constexpr(8):
+                                                if rw0 + u >= cc:
+                                                    g8[u] = cutlass.Float32(0.0)
+                                                if rw0 + 8 + u >= cc:
+                                                    rf8[u] = cutlass.Float32(0.0)
                                     for u in cutlass.range_constexpr(8):
                                         accg += g8[u]
                                         v_gcs[rw0 + u, ptl, inst] = accg
@@ -2080,7 +2110,7 @@ def _pkd(
                     # -- phase 3: q/k load + l2norm + anchored decorations --
                     # (unroll=2 measured-closed: 1.569x -> 1.445x fixed_h96 —
                     # the 48-reg prep diet spills, reconfirming the v60 re-roll)
-                    if full:
+                    if tma:
                         cute.arch.mbarrier_wait(mb + MB_QKRAW + inst, pp_qkraw)
                     for wp in cutlass.range(4):
                         # Both retained fixed/varlen policies use the same
@@ -2088,11 +2118,16 @@ def _pkd(
                         # the surrounding gate pipeline now.
                         rw2 = wp * 8 + (ptl >> 5) + ((ptl >> 2) & 4)
                         sg2 = ptl & 15
-                        if full:
+                        if tma:
                             q8s = v_ki8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
                             cute.autovec_copy(q8s, qr)
                             k8s = v_kd8[(rw2, None, sg2 & 7, sg2 >> 3, inst)]
                             cute.autovec_copy(k8s, kr)
+                            if cutlass.const_expr(may_be_partial):
+                                if rw2 >= cc:
+                                    for u in cutlass.range_constexpr(8):
+                                        qr[u] = cutlass.BFloat16(0.0)
+                                        kr[u] = cutlass.BFloat16(0.0)
                         else:
                             if rw2 < cc:
                                 gq8 = cute.local_tile(
@@ -2398,7 +2433,7 @@ def _pkd(
                     # parities must advance 1:1 with actual completions or the
                     # NEXT chain in this persistent slot waits a stale phase
                     # (RFREE/SFREE are compute-armed every chunk -> uncond.)
-                    if full:
+                    if tma:
                         pp_graw ^= 1
                         pp_qkraw ^= 1
 
@@ -2460,6 +2495,7 @@ def _launch_pkd(
     LOWER_BOUND_M5_: cutlass.Constexpr[int] = 0,
     WARM_SPLIT_: cutlass.Constexpr[int] = 0,
     PREP_PEEL_: cutlass.Constexpr[int] = 0,
+    PARTIAL_TMA_: cutlass.Constexpr[int] = 0,
     GATE_ROLL_: cutlass.Constexpr[int] = 0,
     CLUSTER_: cutlass.Constexpr[int] = 1,
 ):
@@ -2681,6 +2717,7 @@ def _launch_pkd(
         LOWER_BOUND_M5_,
         WARM_SPLIT_,
         PREP_PEEL_,
+        PARTIAL_TMA_,
         GATE_ROLL_,
     ).launch(
         grid=(gcnt, 1, 1),
