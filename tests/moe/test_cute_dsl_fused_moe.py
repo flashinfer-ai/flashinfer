@@ -249,7 +249,12 @@ def test_w4a4_and_w4a8_use_distinct_tuner_cache_keys():
     [
         (ActivationType.Swiglu, None, 1.0, "requires situ_beta"),
         (ActivationType.Swiglu, 0.0, None, "positive and finite"),
-        (ActivationType.GegluTanh, 1.0, None, "require ActivationType.Swiglu"),
+        (
+            ActivationType.GegluTanh,
+            1.0,
+            None,
+            r"require ActivationType\.Situ or Swiglu",
+        ),
     ],
 )
 def test_invalid_situ_config(activation_type, situ_beta, situ_linear_beta, error: str):

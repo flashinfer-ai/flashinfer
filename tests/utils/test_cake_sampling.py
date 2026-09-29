@@ -22,6 +22,7 @@ not multiples of 4, identical rows, per-request tensors, bitwise replay across l
 CUDA graphs / every frozen kernel variant, and parity with ``top_k_first`` sampling.
 """
 
+import functools
 import math
 from dataclasses import dataclass
 
@@ -30,6 +31,8 @@ import pytest
 import torch
 
 from flashinfer.cake_sampling import (
+    _early_trigger_flag,
+    _stream_prepass_flag,
     _stage1_variants,
     cake_sampling_route,
     choose_stage1,
@@ -37,6 +40,7 @@ from flashinfer.cake_sampling import (
     top_k_probs_to_slab,
     top_k_top_p_sampling_from_probs,
 )
+import flashinfer.compilation_context as compilation_context
 import flashinfer.jit.cake_sampling as cake_sampling_jit
 from flashinfer.jit.cake_sampling import (
     load_cake_sampling_module,
@@ -46,6 +50,7 @@ from flashinfer.jit.cake_sampling import (
 )
 
 SLAB = 1024
+_FULL_SMEM_OPTIN = 232448  # 227 KB dynamic shared memory opt-in of 9.x-11.x devices
 INF_KEY = 0x7F800000
 _PHILOX_M0, _PHILOX_M1, _PHILOX_W0, _PHILOX_W1 = (
     0xD2511F53,
@@ -64,6 +69,36 @@ def _require_supported_device():
             "frozen radix sampling kernels need compute capability 9.0/10.0/10.3/10.7/11.0"
         )
     return capability
+
+
+def _device_streams() -> bool:
+    """Whether the current device opts in to enough dynamic shared memory for the streaming
+    stage-1 variants (145 KB).  9.x-11.x devices opt in to 227 KB; 12.x devices stop at 99 KB,
+    so a vocabulary beyond the register-resident capacity (196608 entries) takes the
+    ``fallback:vocab_too_large`` route to ``top_k_first`` there."""
+    optin = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).shared_memory_per_block_optin
+    return any(stream for _, _, stream in _stage1_variants(int(optin)))
+
+
+def _assert_fallback_matches_reference(probs, k, p, seed=7, offset=8):
+    """The public entry point serves a fallback request through the reference top_k_first path."""
+    from flashinfer.sampling import top_k_top_p_sampling_from_probs as reference
+
+    expected = reference(
+        probs,
+        k,
+        p,
+        filter_apply_order="top_k_first",
+        deterministic=True,
+        seed=seed,
+        offset=offset,
+    )
+    got = top_k_top_p_sampling_from_probs(
+        probs, k, p, philox_seed=seed, philox_offset=offset
+    )
+    assert got.dtype == torch.int32 and torch.equal(got.to(expected.dtype), expected)
 
 
 def _probs(batch, vocab, seed=536, scale=1.0):
@@ -209,7 +244,9 @@ def _ws(batch):
     )
 
 
-def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True) -> Run:
+def _run(
+    probs, k, p, seed, offset, *, variant=None, out=None, pdl=True, flags=0
+) -> Run:
     batch = probs.shape[0]
     ws = _ws(batch)
     renorm = torch.full((batch, SLAB), float("nan"), device="cuda")
@@ -251,6 +288,15 @@ def _run(probs, k, p, seed, offset, *, variant=None, out=None, pdl=True) -> Run:
             cluster,
             ept,
             stream_variant,
+            p_args[0],
+            p_args[1],
+            p_args[2],
+            out,
+            renorm,
+            seed,
+            offset,
+            1,
+            flags,  # explicit two-launch form (bit 0 clear): the fused tail is the pipeline route's
             stream,
         )
         module.sparse_topp_sample(
@@ -351,6 +397,12 @@ def _kept(run: Run, r: int):
 def test_support_matches_top_k_first_semantics(batch, vocab, k, p):
     _require_supported_device()
     probs = _probs(batch, vocab)
+    if cake_sampling_route(probs, k) == "fallback:vocab_too_large":
+        # 99 KB devices (12.x) have no streaming variant, so V = 262144 is served by the
+        # reference top_k_first path; the slab checks below need the pipeline route.
+        assert not _device_streams() and vocab > 196608
+        _assert_fallback_matches_reference(probs, k, p)
+        return
     run, _ = _run_and_check(probs, k, p, 0xC0FFEE, 3)
     pn = probs.cpu().numpy()
     for r in range(batch):
@@ -487,35 +539,91 @@ def test_per_request_tensors_and_routes():
     assert cake_sampling_route(probs, vocab) == "fallback:top_k_disabled"
     assert cake_sampling_route(probs, 1025) == "fallback:top_k_gt_slab"
     assert cake_sampling_route(probs.half(), 50) == "fallback:dtype"
-    assert (
-        cake_sampling_route(torch.empty(256, 262144, device="cuda"), 50) == "pipeline"
+    # V = 262144 needs a streaming variant (145 KB of dynamic shared memory): served on 227 KB
+    # devices, routed to top_k_first on 99 KB (12.x) devices.
+    assert cake_sampling_route(torch.empty(256, 262144, device="cuda"), 50) == (
+        "pipeline" if _device_streams() else "fallback:vocab_too_large"
     )
-    # B200 wave table (148 SMs).
-    assert choose_stage1(1, 128256, sm_count=148) == (8, 32, False)
-    assert choose_stage1(8, 65536, sm_count=148) == (8, 16, False)
-    assert choose_stage1(16, 128256, sm_count=148) == (4, 16, True)
-    assert choose_stage1(32, 128256, sm_count=148) == (4, 16, True)
-    assert choose_stage1(64, 128256, sm_count=148) == (2, 16, True)
-    assert choose_stage1(16, 262144, sm_count=148) == (4, 16, True)
-    assert choose_stage1(64, 262144, sm_count=148)[2]
-    assert choose_stage1(128, 151936, sm_count=148)[2]
-    # H100 wave table (132 SMs): 128 cluster-4 CTAs are two waves there, so B = 32 rows of a
-    # large vocabulary stream with clusters of 2 and B = 32 rows of 32768 stay register-resident
-    # on the 2-CTA variant; small batches and B >= 64 pick the same variants as on B200.
-    for b, v in ((1, 128256), (8, 65536), (16, 128256), (64, 128256), (16, 262144)):
-        assert choose_stage1(b, v, sm_count=132) == choose_stage1(b, v, sm_count=148)
-    assert choose_stage1(32, 128256, sm_count=132) == (2, 16, True)
-    assert choose_stage1(32, 262144, sm_count=132) == (2, 16, True)
-    assert choose_stage1(32, 32768, sm_count=132) == (2, 32, False)
-    assert choose_stage1(32, 32768, sm_count=148) == (4, 16, False)
+    # Dispatcher pins below describe the wave tables, so they use the full frozen variant set
+    # (227 KB opt-in) whatever the current device's dynamic-smem limit is.  Every pin is the
+    # measured-best variant of that cell in the round-4 per-variant sweeps (k = 50, 25 cells per
+    # table on B200, B300, H100 and R200).
+    pick = functools.partial(choose_stage1, smem_limit=_FULL_SMEM_OPTIN)
+    # Same on every table: the (8, 16) stream owns V = 151936 / 262144 at small batches (the (8, 48)
+    # resident is retired), streams of 2 / 1 own the large batches, V = 32768 small batches stay on (4, 16).
+    for sm in (148, 132, 212):
+        assert pick(1, 32768, sm_count=sm) == (4, 16, False)
+        assert pick(16, 32768, sm_count=sm) == (4, 16, False)
+        assert pick(8, 65536, sm_count=sm) == (8, 16, False)
+        assert pick(1, 151936, sm_count=sm) == (8, 16, True)
+        assert pick(8, 151936, sm_count=sm) == (8, 16, True)
+        assert pick(1, 262144, sm_count=sm) == (8, 16, True)
+        assert pick(8, 262144, sm_count=sm) == (8, 16, True)
+        assert pick(64, 128256, sm_count=sm) == (2, 16, True)
+        assert pick(64, 262144, sm_count=sm)[2]
+        assert pick(128, 32768, sm_count=sm) == (1, 16, True)
+        assert pick(128, 151936, sm_count=sm)[2]
+    # B200 / B300 wave table (148 SMs): the (8, 16) stream beats the (8, 32) resident at V = 128256,
+    # B <= 8 (12.5 vs 12.9 us) and B = 64 rows of 32768 stream on (2, 16) (11.3 vs 11.9 resident).
+    assert pick(1, 128256, sm_count=148) == (8, 16, True)
+    assert pick(8, 128256, sm_count=148) == (8, 16, True)
+    assert pick(16, 128256, sm_count=148) == (4, 16, True)
+    assert pick(32, 128256, sm_count=148) == (4, 16, True)
+    assert pick(16, 151936, sm_count=148) == (4, 16, True)
+    assert pick(16, 262144, sm_count=148) == (4, 16, True)
+    assert pick(32, 32768, sm_count=148) == (4, 16, False)
+    assert pick(64, 32768, sm_count=148) == (2, 16, True)
+    # H100 wave table (132 SMs): the (8, 32) resident wins V = 128256, B <= 8 (13.1 vs 13.9 us); 128
+    # cluster-4 CTAs are two waves, so B = 32 large-vocabulary rows stream with clusters of 2; B = 64
+    # rows of 32768 take the 64-CTA (1, 16) launch (13.2 vs 13.8 for 128 cluster-2 CTAs); at B = 32
+    # rows of 32768 the (2, 16) stream and the (2, 32) resident tie (12.16 us).
+    assert pick(1, 128256, sm_count=132) == (8, 32, False)
+    assert pick(8, 128256, sm_count=132) == (8, 32, False)
+    assert pick(16, 128256, sm_count=132) == (4, 16, True)
+    assert pick(32, 128256, sm_count=132) == (2, 16, True)
+    assert pick(32, 262144, sm_count=132) == (2, 16, True)
+    assert pick(32, 32768, sm_count=132) == (2, 16, True)
+    assert pick(64, 32768, sm_count=132) == (1, 16, True)
+    # Rubin R200 wave table (212 SMs): 128 cluster-8 CTAs are one wave (22 eight-CTA clusters fit),
+    # so V = 128256 stays on the (8, 32) resident up to B = 16 (11.1 vs 11.2 us) and V = 151936 /
+    # 262144 on the (8, 16) stream up to B = 16; B = 32 (256 CTAs) streams with clusters of 4 as on
+    # B200; B = 64 rows of 32768 stay register-resident on (2, 32) (9.1 vs 9.3).
+    assert pick(16, 128256, sm_count=212) == (8, 32, False)
+    assert pick(32, 128256, sm_count=212) == (4, 16, True)
+    assert pick(16, 151936, sm_count=212) == (8, 16, True)
+    assert pick(16, 262144, sm_count=212) == (8, 16, True)
+    assert pick(32, 262144, sm_count=212) == (4, 16, True)
+    assert pick(32, 32768, sm_count=212) == (4, 16, False)
+    assert pick(64, 32768, sm_count=212) == (2, 32, False)
+    # k > 64 (k = 1000 sweeps on all four architectures): the streaming template's per-bucket path
+    # loses to the register-resident candidate path, so V = 128256, B <= 8 stays on (8, 32) (B200
+    # 12.8 vs 16.5 us for the (8, 16) stream) and V = 32768, B = 64 on (2, 32) (12.7 vs 13.2).
+    for sm in (148, 132, 212):
+        assert pick(1, 128256, sm_count=sm, top_k_max=1000) == (8, 32, False)
+        assert pick(8, 128256, sm_count=sm, top_k_max=1000) == (8, 32, False)
+        assert pick(64, 32768, sm_count=sm, top_k_max=1000) == (2, 32, False)
+        assert pick(1, 262144, sm_count=sm, top_k_max=1000) == (8, 16, True)
+        assert pick(128, 32768, sm_count=sm, top_k_max=1000) == (1, 16, True)
+        assert pick(1, 128256, sm_count=sm, top_k_max=50) == pick(
+            1, 128256, sm_count=sm
+        )
+    assert pick(16, 128256, sm_count=148, top_k_max=1000) == (4, 16, True)
+    assert pick(16, 128256, sm_count=212, top_k_max=1000) == (8, 32, False)
+    # V = 151936 at k = 1000, B <= 8: every table takes the (8, 48) resident (H100 15.6 vs 16.9 us for the
+    # (8, 16) stream at B = 1; R200 12.4 vs 12.7; on B200 / B300 the kernels tie but the two-launch call is
+    # 2.6-3.6 % faster with the resident at B = 1); the (4, 16) stream owns B = 16 on the 148 / 132 tables.
+    assert pick(1, 151936, sm_count=148, top_k_max=1000) == (8, 48, False)
+    assert pick(8, 151936, sm_count=148, top_k_max=1000) == (8, 48, False)
+    assert pick(16, 151936, sm_count=148, top_k_max=1000) == (4, 16, True)
+    assert pick(1, 151936, sm_count=132, top_k_max=1000) == (8, 48, False)
+    assert pick(1, 151936, sm_count=212, top_k_max=1000) == (8, 48, False)
+    assert pick(16, 151936, sm_count=212, top_k_max=1000) == (8, 48, False)
+    assert pick(16, 151936, sm_count=132, top_k_max=1000) == (4, 16, True)
     # Other SM counts use the nearest measured table.
-    assert choose_stage1(32, 128256, sm_count=152) == choose_stage1(
-        32, 128256, sm_count=148
-    )
-    assert choose_stage1(32, 128256, sm_count=114) == choose_stage1(
-        32, 128256, sm_count=132
-    )
-    assert choose_stage1(32, 128256) in {(2, 16, True), (4, 16, True)}
+    assert pick(32, 128256, sm_count=152) == pick(32, 128256, sm_count=148)
+    assert pick(16, 128256, sm_count=200) == pick(16, 128256, sm_count=212)
+    assert pick(32, 128256, sm_count=114) == pick(32, 128256, sm_count=132)
+    assert pick(32, 128256) in {(2, 16, True), (4, 16, True)}
     assert choose_stage23(50) == (32, 2)
     res = top_k_top_p_sampling_from_probs(probs, vocab, 0.9)
     assert res.dtype == torch.int32 and res.shape == (batch,)
@@ -540,11 +648,15 @@ def _gencode(flags):
     return [f for f in flags if f.startswith("-gencode")]
 
 
-def test_build_targets_follow_flashinfer_cuda_arch_list(arch_list):
+def test_build_targets_follow_flashinfer_cuda_arch_list(arch_list, monkeypatch):
     # AOT builds run on hosts without a GPU and name their targets through
     # FLASHINFER_CUDA_ARCH_LIST; the module compiles one cubin per listed architecture into a
     # single fatbin and serves exactly those capabilities.  (Suffixed entries skip the toolkit
     # version probe of CompilationContext so this test also runs without nvcc.)
+    # get_nvcc_flags_list rewrites 10.7 to sm_100f whenever the local nvcc cannot emit
+    # compute_107 (every CUDA 12.x toolkit, e.g. the cu129 CI image). This test is about which
+    # targets are named, not about the toolkit on the test host, so pin the probe.
+    monkeypatch.setattr(compilation_context, "_nvcc_supports_sm107", lambda: True)
     arch_list("9.0 10.3 12.0f")
     assert supported_capabilities() == ((9, 0), (10, 3), (12, 0))
     assert supported_capability((9, 0)) == (9, 0)
@@ -1032,6 +1144,171 @@ def test_adv_bitwise_across_launch_graph_and_every_variant():
             base.renorm[:, :k].view(np.uint32),
         )
         assert np.array_equal(ws[1][:, :k].cpu().numpy(), base.idx[:, :k])
+
+
+def test_fused_tail_matches_two_launch_form():
+    """k <= fused_tail_kcap runs stage 2/3 inside the stage-1 kernel; outputs are bitwise identical to
+    the explicit two-launch form for every stage-1 variant, per-row p, renorm and adversarial rows."""
+    _require_supported_device()
+    man = load_manifest()
+    kcap = int(man["fused_tail_kcap"])
+    assert kcap >= 1
+    # The (8, 48) resident is the only variant built without the tail; no small-k pick may reach it.
+    assert [v["symbol"] for v in man["stage1"] if not v["fused_tail"]] == [
+        "kernel_cake_radix_topk_c8_e48"
+    ]
+    # Dispatch tables of the measured architectures (full 227 KB opt-in).  On 12.x devices (99 KB)
+    # the streaming variants drop out and (8, 48) can be the only cover of V > 131072: those calls take
+    # the two-launch form, which the dispatcher selects from the manifest's fused_tail flags.
+    for sm_count in (132, 148, 212):
+        for vocab in (32768, 50257, 128256, 151936, 152064, 202048, 262144):
+            for batch in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+                c, e, s = choose_stage1(
+                    vocab=vocab,
+                    batch=batch,
+                    sm_count=sm_count,
+                    top_k_max=kcap,
+                    smem_limit=_FULL_SMEM_OPTIN,
+                )
+                assert (c, e) != (8, 48), (sm_count, vocab, batch)
+    streams_ok = (
+        _device_streams()
+    )  # 12.x devices (99 KB opt-in) cannot launch the streaming variants
+    for vocab, batch in ((32768, 5), (128256, 3), (262144, 2)):
+        if vocab > 196608 and not streams_ok:
+            continue  # no frozen variant covers this vocabulary here; the dispatcher routes to top_k_first
+        probs = _probs(batch, vocab, seed=41 + vocab % 97)
+        pn = probs.cpu().numpy()
+        pn[0, (np.arange(300) * 13) % vocab] = np.float32(
+            2**-11
+        )  # ties across the k boundary
+        pn[1, [7, 4096]] = np.inf
+        probs.copy_(torch.tensor(pn, device="cuda"))
+        p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
+        k_row = torch.tensor(
+            [max(1, (kcap * (i + 1)) // batch) for i in range(batch)],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        s1 = [
+            (v["cluster"], v["ept"], bool(v.get("stream", 0)))
+            for v in man["stage1"]
+            if (
+                (v.get("stream", 0) and streams_ok)
+                or (not v.get("stream", 0) and 512 * v["cluster"] * v["ept"] >= vocab)
+            )
+        ]
+        assert s1
+        for k, p in ((kcap, 0.9), (max(1, kcap // 4), p_row), (k_row, 0.75), (1, 1.0)):
+            kmax = k if isinstance(k, int) else int(k.max().item())
+            assert kmax <= kcap
+            for pdl in (True, False):
+                fused, _ = _run_and_check(probs, k, p, 0xC0DE, 3, pdl=pdl)
+                for v1 in s1:
+                    two = _run(probs, k, p, 0xC0DE, 3, variant=(v1, (32, 2)), pdl=pdl)
+                    assert np.array_equal(two.samples, fused.samples), (
+                        vocab,
+                        k,
+                        v1,
+                        pdl,
+                    )
+                    assert np.array_equal(two.count, fused.count), (vocab, k, v1)
+                    for r in range(batch):
+                        kr = int(k if isinstance(k, int) else k[r])
+                        assert np.array_equal(two.idx[r, :kr], fused.idx[r, :kr]), (
+                            vocab,
+                            k,
+                            v1,
+                            r,
+                        )
+                        assert np.array_equal(
+                            two.vals[r, :kr].view(np.uint32),
+                            fused.vals[r, :kr].view(np.uint32),
+                        ), (vocab, k, v1, r)
+                        assert np.array_equal(
+                            two.renorm[r, :kr].view(np.uint32),
+                            fused.renorm[r, :kr].view(np.uint32),
+                        ), (vocab, k, v1, r)
+    # The boundary: kcap fuses, kcap + 1 takes the two-launch path; both check against the reference.
+    probs = _probs(2, 32768, seed=5)
+    _run_and_check(probs, kcap, 0.9, 1, 2)
+    _run_and_check(probs, kcap + 1, 0.9, 1, 2)
+
+
+def test_early_trigger_flag_and_bitwise_outputs():
+    """Stage-1 launch_flags bit 1 (early PDL trigger) is set only when the stage-2/3 CTAs fit on the
+    SMs the last stage-1 wave leaves free; bit 2 (stream pre-pass point) follows the compute capability;
+    every trigger point gives bitwise identical outputs."""
+    # 148 SMs: B=32 cluster 4 -> grid 128, 20 free SMs < 32 rows -> exit trigger; B=16 -> 84 free -> early.
+    assert _early_trigger_flag(32, 4, 148) == 0
+    assert _early_trigger_flag(16, 4, 148) == 2
+    assert _early_trigger_flag(1, 8, 148) == 2
+    # 212 SMs: B=32 cluster 4 -> 84 free SMs >= 32 -> early (the R200 cells the constant rule missed).
+    assert _early_trigger_flag(32, 4, 212) == 2
+    assert _early_trigger_flag(64, 2, 212) == 2
+    # B=128 cluster 1 -> grid 128, 84 free SMs < 128 rows -> exit trigger; cluster 2 -> grid 256,
+    # last wave 44 -> 168 free -> early.
+    assert _early_trigger_flag(128, 1, 212) == 0
+    assert _early_trigger_flag(128, 2, 212) == 2
+    # full waves leave no SM free; a grid larger than the device never fits.
+    assert _early_trigger_flag(148, 1, 148) == 0
+    assert _early_trigger_flag(37, 4, 148) == 0
+    assert _early_trigger_flag(160, 4, 148) == 0
+    _require_supported_device()
+    # streams: pre-pass point on Blackwell / Rubin (cc >= 10), the post-filter point on Hopper.
+    major = torch.cuda.get_device_capability(torch.cuda.current_device())[0]
+    assert _stream_prepass_flag(torch.cuda.current_device()) == (
+        4 if major >= 10 else 0
+    )
+    man = load_manifest()
+    probs = _probs(32, 32768, seed=17)
+    pn = probs.cpu().numpy()
+    streams_ok = _device_streams()
+    for k, p in ((1000, 0.9), (200, 0.5)):
+        base = _run_and_check(probs, k, p, 0xEA51, 4)[0]
+        for v in man["stage1"]:
+            if v.get("stream", 0) and not streams_ok:
+                continue  # 165 KB streaming variants exceed the 12.x opt-in
+            if not v.get("stream", 0) and 512 * v["cluster"] * v["ept"] < 32768:
+                continue
+            s1 = (v["cluster"], v["ept"], bool(v.get("stream", 0)))
+            for flags in (0, 2, 6, 4) if s1[2] else (0, 2):
+                run = _run(probs, k, p, 0xEA51, 4, variant=(s1, (256, 4)), flags=flags)
+                _check(run, pn, k, p, 0xEA51, 4)
+                assert np.array_equal(run.samples, base.samples), (s1, flags)
+                assert np.array_equal(
+                    run.vals[:, :k].view(np.uint32), base.vals[:, :k].view(np.uint32)
+                )
+                assert np.array_equal(run.idx[:, :k], base.idx[:, :k]), (s1, flags)
+    # bit 0 on the tail-less (8, 48) resident is rejected; bit 1 alone is accepted there.
+    vals, idxs, cnt = _ws(2)
+    probs2 = _probs(2, 32768, seed=3)
+    module = load_cake_sampling_module()
+    stream = torch.cuda.current_stream().cuda_stream
+    args = [
+        probs2,
+        cnt,
+        10,
+        1,
+        vals,
+        idxs,
+        cnt,
+        8,
+        48,
+        0,
+        probs2,
+        0.9,
+        1,
+        cnt,
+        vals,
+        0,
+        0,
+        0,
+    ]
+    module.radix_topk(*args, 2, stream)
+    torch.cuda.synchronize()
+    with pytest.raises(Exception, match="fused tail"):
+        module.radix_topk(*args, 1, stream)
 
 
 def test_adv_stage1_slab_is_deterministic_and_exact():

@@ -102,6 +102,7 @@ from .jit.fp8_quantization import gen_mxfp8_quantization_sm100_module
 from .jit.fused_moe import (
     gen_alphamoe_fused_router_module,
     gen_alphamoe_sm100_module,
+    gen_alphamoe_nvfp4_sm100_module,
     gen_cutlass_fused_moe_sm90_module,
     gen_cutlass_fused_moe_sm100_module,
     gen_cutlass_fused_moe_sm103_module,
@@ -142,6 +143,14 @@ from .jit.gemm import (
     gen_blackwell_bf16_bmm_module,
 )
 from .jit.gemm.cake_blackwell_bf16_bmm import BlackwellBf16BmmTarget
+from .jit.gemm.cake_grouped_fp8_gemm import (
+    MODULES as CAKE_GROUPED_FP8_GEMM_MODULES,
+    gen_cake_grouped_fp8_gemm_module,
+)
+from .jit.gemm.cake_grouped_fp8_fused_silu_quant import (
+    MODULES as CAKE_GROUPED_FP8_FUSED_SILU_QUANT_MODULES,
+    gen_cake_grouped_fp8_fused_silu_quant_module,
+)
 from .jit.mamba import (
     gen_selective_state_update_module,
     gen_selective_state_update_sm90_module,
@@ -150,6 +159,14 @@ from .jit.mhc import gen_mhc_module
 from .jit.cake_minimax_h3_mxfp8 import (
     MiniMaxH3Mxfp8Target,
     gen_minimax_h3_mxfp8_aot_modules,
+)
+from .jit.cake_minimax_h3_nvfp4 import (
+    MiniMaxH3Nvfp4Target,
+    gen_minimax_h3_nvfp4_aot_modules,
+)
+from .jit.cake_minimax_h3_qkv_pack import (
+    MiniMaxH3QkvPackTarget,
+    gen_minimax_h3_qkv_pack_aot_modules,
 )
 from .jit.mla import (
     gen_mla_module,
@@ -510,6 +527,30 @@ def gen_xqa(
             )
 
 
+def _gen_cake_grouped_fp8_gemm_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
+    """Generated contiguous grouped FP8 GEMM programs (SM100a only)."""
+    if not sm_capabilities.get("sm100a_exact", False):
+        return []
+    return [
+        gen_cake_grouped_fp8_gemm_module(name)
+        for name, record in sorted(CAKE_GROUPED_FP8_GEMM_MODULES.items())
+        if record["arch"] == "sm_100a"
+    ]
+
+
+def _gen_cake_grouped_fp8_fused_silu_quant_aot_specs(
+    sm_capabilities: dict,
+) -> List[JitSpec]:
+    """Generated fused grouped FP8 gate_up GEMM + SwiGLU + FP8 quant programs (SM100a only)."""
+    if not sm_capabilities.get("sm100a_exact", False):
+        return []
+    return [
+        gen_cake_grouped_fp8_fused_silu_quant_module(name)
+        for name, record in sorted(CAKE_GROUPED_FP8_FUSED_SILU_QUANT_MODULES.items())
+        if record["arch"] == "sm_100a"
+    ]
+
+
 def _gen_blackwell_bf16_bmm_aot_specs(sm_capabilities: dict) -> List[JitSpec]:
     targets: List[BlackwellBf16BmmTarget] = []
     if sm_capabilities.get("sm100a_exact", False):
@@ -575,6 +616,9 @@ def gen_all_modules(
     has_cake_megamoe_topk_reduce_sm100a = sm_capabilities.get(
         "cake_megamoe_topk_reduce_sm100a", False
     )
+    has_cake_megamoe_topk_reduce_sm103a = sm_capabilities.get(
+        "cake_megamoe_topk_reduce_sm103a", False
+    )
     has_sm100f = sm_capabilities.get("sm100f", False)
     has_sm103 = sm_capabilities.get("sm103", False)
     has_sm103a_exact = sm_capabilities.get("sm103a_exact", False)
@@ -625,6 +669,24 @@ def gen_all_modules(
     for minimax_h3_target, enabled in minimax_h3_targets:
         if enabled:
             jit_specs.extend(gen_minimax_h3_mxfp8_aot_modules(minimax_h3_target))
+
+    minimax_h3_nvfp4_targets: tuple[tuple[MiniMaxH3Nvfp4Target, bool], ...] = (
+        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
+        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
+    )
+    for minimax_h3_nvfp4_target, enabled in minimax_h3_nvfp4_targets:
+        if enabled:
+            jit_specs.extend(gen_minimax_h3_nvfp4_aot_modules(minimax_h3_nvfp4_target))
+
+    minimax_h3_qkv_pack_targets: tuple[tuple[MiniMaxH3QkvPackTarget, bool], ...] = (
+        ("sm100a", sm_capabilities.get("sm100a_exact", False)),
+        ("sm103a", sm_capabilities.get("sm103a_exact", False)),
+    )
+    for minimax_h3_qkv_pack_target, enabled in minimax_h3_qkv_pack_targets:
+        if enabled:
+            jit_specs.extend(
+                gen_minimax_h3_qkv_pack_aot_modules(minimax_h3_qkv_pack_target)
+            )
 
     # Register the physical source-closed portfolio independently for each
     # exact Blackwell target. Each JitSpec contains one generated selector TU.
@@ -733,6 +795,8 @@ def gen_all_modules(
 
     if add_moe:
         jit_specs.append(gen_gemm_module())
+        if has_sm100a_exact or has_sm103a_exact:
+            jit_specs.append(gen_alphamoe_nvfp4_sm100_module())
         # Multi-LoRA MoE BGMV kernel
         if has_bgmv_moe:
             jit_specs.append(gen_bgmv_moe_module())
@@ -746,7 +810,9 @@ def gen_all_modules(
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
         if has_cake_megamoe_topk_reduce_sm100a:
-            jit_specs.append(gen_cake_megamoe_topk_reduce_module())
+            jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_100a"))
+        if has_cake_megamoe_topk_reduce_sm103a:
+            jit_specs.append(gen_cake_megamoe_topk_reduce_module("sm_103a"))
         if has_sm90:
             jit_specs.append(gen_gemm_sm90_module())
             # fp8 blockscale GEMM (SM90)
@@ -789,6 +855,10 @@ def gen_all_modules(
         if has_sm100 or has_sm103:
             jit_specs.append(gen_mm_bf16_cublaslt_module())
         jit_specs.extend(_gen_blackwell_bf16_bmm_aot_specs(sm_capabilities))
+        jit_specs.extend(_gen_cake_grouped_fp8_gemm_aot_specs(sm_capabilities))
+        jit_specs.extend(
+            _gen_cake_grouped_fp8_fused_silu_quant_aot_specs(sm_capabilities)
+        )
         if has_sm100a_exact or has_sm103a_exact:
             jit_specs.append(gen_alphamoe_sm100_module())
         if has_sm103:
@@ -826,6 +896,7 @@ def gen_all_modules(
             gen_dcp_alltoall_module,
             gen_dcp_lse_reduce_module,
             gen_moe_alltoall_module,
+            gen_pcie_ipc_ag_rs_module,
             gen_pcie_ipc_comm_module,
             gen_trtllm_comm_module,
             gen_trtllm_mnnvl_comm_module,
@@ -871,6 +942,7 @@ def gen_all_modules(
         # and CUDA IPC, and target PCIe machines without NVLink, which is
         # orthogonal to the SM version.
         jit_specs.append(gen_pcie_ipc_comm_module())
+        jit_specs.append(gen_pcie_ipc_ag_rs_module())
 
     if add_misc:
         jit_specs += [
@@ -1294,6 +1366,10 @@ def detect_sm_capabilities():
             (10, "0a") in compilation_context.TARGET_CUDA_ARCHS
             and cuda_version >= Version("12.8")
         ),
+        "cake_megamoe_topk_reduce_sm103a": (
+            (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
+            and cuda_version >= Version("12.9")
+        ),
         "sm103": has_sm("compute_103", "12.9"),
         "sm103a_exact": (10, "3a") in compilation_context.TARGET_CUDA_ARCHS
         and cuda_version >= Version("12.9"),
@@ -1364,7 +1440,7 @@ def main():
     parser.add_argument(
         "--add-comm",
         type=parse_bool,
-        help="Add communication kernels (trtllm_comm, vllm_comm, pcie_ipc_comm)",
+        help="Add communication kernels (trtllm_comm, vllm_comm, pcie_ipc_comm, pcie_ipc_ag_rs)",
     )
     parser.add_argument(
         "--add-gemma",

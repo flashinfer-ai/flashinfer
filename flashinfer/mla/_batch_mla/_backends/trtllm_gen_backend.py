@@ -212,7 +212,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
     _plan_capabilities: ClassVar[MLAPlanCapabilities] = MLAPlanCapabilities(
         backend_name="trtllm-gen",
         lse_modes=frozenset({"none", "base2"}),
-        kv_layouts=frozenset({"combined"}),
+        kv_layouts=frozenset({"combined", "adjacent-split"}),
         output_scales=frozenset({"none"}),
         scale_modes=frozenset({"default", "bmm-scalar"}),
         supports_skip_softmax=True,
@@ -256,6 +256,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
             lse_mode=args.lse_mode,
             enable_pdl=args.enable_pdl,
             use_sinks=args.use_sinks,
+            skip_softmax=args.skip_softmax,
         )
         return backend
 
@@ -292,10 +293,6 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
             raise TypeError(
                 f"trtllm-gen backend expects use_sinks to be bool, got {args.use_sinks!r}."
             )
-        if args.causal:
-            raise _BackendPlanUnsupportedError(
-                "causal=True is not supported by the trtllm-gen backend."
-            )
         if reason := _trtllm_gen_mla_incompatibility_reason(
             args.num_heads, args.page_size
         ):
@@ -327,6 +324,7 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         lse_mode: str,
         enable_pdl: Optional[bool] = None,
         use_sinks: bool = False,
+        skip_softmax: bool = False,
     ) -> None:
         for name, tensor in (
             ("cum_seq_lens_q", cum_seq_lens_q),
@@ -341,6 +339,12 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         batch_size, total_q, actual_max_q_len, is_uniform, q_len = _get_q_layout(
             cum_seq_lens_q
         )
+        # The native launcher always applies bottom-right causality. For a
+        # single query this equals full attention, but multi-Q noncausal does not.
+        if not causal and actual_max_q_len > 1:
+            raise _BackendPlanUnsupportedError(
+                "trtllm-gen supports multi-Q only with causal=True."
+            )
         if not is_uniform and lse_mode != "none":
             raise _BackendPlanUnsupportedError(
                 "trtllm-gen backend does not support LSE with compact variable-Q."
@@ -373,6 +377,34 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
             raise _BackendPlanUnsupportedError(
                 "trtllm-gen backend expects block_tables width to be positive."
             )
+        # Match the initial native launch selection exactly. Uniform Q uses its
+        # actual length; ragged Q and KV use the declared dense capacities.
+        native_max_q_len = q_len if is_uniform else max_q_len
+        native_max_kv_len = int(block_tables.shape[-1] * page_size)
+        sm_count = get_device_sm_count(self.device)
+        module = get_trtllm_gen_fmha_module()
+        # A skip-softmax plan allows both zero and nonzero runtime thresholds,
+        # which select different native metadata. Preserve its existing behavior
+        # until that run-time variant is known. Limit the new planning check to
+        # SM100; other architectures retain their existing planning behavior.
+        if not skip_softmax and get_compute_capability(self.device) == (10, 0):
+            heads_per_cta = module._mla_plan_head_divisor(
+                self._float_workspace_buffer,
+                q_data_type == torch.float8_e4m3fn,
+                batch_size,
+                native_max_q_len,
+                native_max_kv_len,
+                num_heads,
+                head_dim_ckv + head_dim_kpe,
+                head_dim_ckv,
+                page_size,
+                sm_count,
+            )
+            if num_heads % heads_per_cta:
+                raise _BackendPlanUnsupportedError(
+                    f"trtllm-gen requires query heads ({num_heads}) to be divisible "
+                    f"by the initial native kernel's heads per CTA ({heads_per_cta})."
+                )
         (
             self._block_tables,
             self._seq_lens,
@@ -390,13 +422,13 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         self._use_sinks = use_sinks
         # Without query offsets, the native launcher uses this as the exact
         # per-request length rather than an upper bound.
-        self._max_q_len = q_len if is_uniform else max_q_len
+        self._max_q_len = native_max_q_len
         self._total_q = total_q
         self._num_heads = num_heads
         self._kv_lora_rank = head_dim_ckv
         self._qk_rope_head_dim = head_dim_kpe
         self._page_size = page_size
-        self._max_seq_len = int(block_tables.shape[-1] * page_size)
+        self._max_seq_len = native_max_kv_len
         self._bmm1_scale = float(sm_scale)
         self._bmm2_scale = 1.0
         self._q_data_type = q_data_type
@@ -404,8 +436,8 @@ class _BatchMLAPagedAttentionTrtllmGenBackend:
         self._enable_pdl = (
             device_support_pdl(self.device) if enable_pdl is None else enable_pdl
         )
-        self._sm_count = get_device_sm_count(self.device)
-        self._module = get_trtllm_gen_fmha_module()
+        self._sm_count = sm_count
+        self._module = module
         self._multi_ctas_kv_counter_buffer = (
             _get_trtllm_gen_multi_ctas_kv_counter_buffer(
                 batch_size, num_heads, self._sm_count, self.device

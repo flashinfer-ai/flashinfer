@@ -43,6 +43,7 @@ _MANIFEST_KEYS = {
     "buckets",
     "codegen_arch",
     "compile_flags",
+    "fused_tail_kcap",
     "kernel_count",
     "kernel_symbols",
     "min_compute_capability",
@@ -184,6 +185,8 @@ def load_manifest() -> dict[str, Any]:
     ]
     if symbols != stage_symbols or len(symbols) != manifest["kernel_count"]:
         raise RuntimeError("radix sampling manifest kernel inventory is inconsistent")
+    if any(not isinstance(v.get("fused_tail"), bool) for v in manifest["stage1"]):
+        raise RuntimeError("radix sampling manifest stage-1 entries lack fused_tail")
     for symbol in symbols:
         definitions = re.findall(
             rb"(?<![A-Za-z0-9_])" + re.escape(symbol.encode()) + rb"\(", source_bytes
@@ -199,7 +202,7 @@ def _binding_source(manifest: dict[str, Any]) -> str:
     min_major, min_minor = manifest["min_compute_capability"]
     stage1 = " ".join(
         f"X({v['symbol']}, {v['cluster']}, {v['ept']}, {1 if v['stream'] else 0}, "
-        f"{v['block_threads']}, {v['dynamic_smem_bytes']})"
+        f"{v['block_threads']}, {v['dynamic_smem_bytes']}, {1 if v['fused_tail'] else 0})"
         for v in manifest["stage1"]
     )
     stage23 = " ".join(
@@ -215,6 +218,7 @@ def _binding_source(manifest: dict[str, Any]) -> str:
 #define CAKE_SAMPLING_MIN_MAJOR {min_major}
 #define CAKE_SAMPLING_MIN_MINOR {min_minor}
 #define CAKE_SAMPLING_SLAB {manifest["slab_entries"]}
+#define CAKE_SAMPLING_FUSED_TAIL_KCAP {manifest["fused_tail_kcap"]}
 #define CAKE_SAMPLING_STAGE1_TABLE(X) {stage1}
 #define CAKE_SAMPLING_STAGE23_TABLE(X) {stage23}
 #include "{_BINDING_HEADER}"

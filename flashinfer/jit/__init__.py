@@ -204,6 +204,9 @@ from .monomoe import load_monomoe_module as load_monomoe_module
 from .fused_moe import (
     gen_alphamoe_fused_router_module as gen_alphamoe_fused_router_module,
 )
+from .fused_moe import (
+    gen_alphamoe_nvfp4_sm100_module as gen_alphamoe_nvfp4_sm100_module,
+)
 
 
 cuda_lib_path = os.environ.get(

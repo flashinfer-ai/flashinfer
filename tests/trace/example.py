@@ -15,6 +15,7 @@ Requires a CUDA-capable GPU.
 Results:
 - We would get these example json files under fi_trace_out directory:
 alphamoe_fused_router_e512_k8_bm16_shared0.json
+alphamoe_nvfp4_aligned_moe_topk2_e4_h256_n256_bm8.json
 bmm_mxfp8_N128_K128.json
 cute_dsl_fused_moe_bf16_h2048_e128_topk8.json
 dsv41_fp4_quantize_pack_sparse_mla_cache_3d_hnd_ps8.json
@@ -33,6 +34,7 @@ gdp_prefill_n2_qk4_v8_d128.json
 recurrent_kda_q8_v16_d128.json
 packed_kda_decode_h12_d128.json
 fused_kda_decode_h12_d128.json
+packed_fused_kda_decode_t3_h12_d128.json
 gemm_bf16_N256_K7168.json
 gemm_bf16_N4096_K4096.json
 gemm_fp4_N2048_K7168_block_size16.json
@@ -58,6 +60,8 @@ merge_state_h32_d128.json
 merge_state_in_place_h32_d128.json
 merge_states_h32_d128.json
 minimax_h3_mxfp8_pre_attention_p8_hdst7_d128.json
+minimax_h3_nvfp4_pre_attention_p8_hdst7_d128.json
+minimax_h3_qkv_quantize_pack_p8_hdst7_d128_pk64.json
 mla_paged_decode_h16_ckv512_kpe64_ps1.json
 mla_paged_decode_h16_ckv512_kpe64_ps64.json
 attention_ts_decode_tuple_multi_q_sq4_h32_kv4_d128_ps32.json
@@ -70,6 +74,7 @@ prims_ts_decode_mla_one_shot_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 prims_ts_decode_mla_wrapper_causal_maxq4_maxk2048_h128_d_qk576_ckv512_kpe64_ps32_sq4.json
 mm_bf16_fp4_cudnn_N2048_K7168_block_size16.json
 mm_bf16_fp4_cute_dsl_N2048_K7168_block_size16.json
+mm_bf16_fp4_cute_dsl_native_sf1d_N256_K1024_K_packed512_block_size16_SF_dim_016384.json
 mono_moe_topk8_h2048_i512.json
 moe_fp4_block_scale_default_routing_topk8_e32_h7168_i2048.json
 moe_fp4_block_scale_ds_routing_topk8_e32_h7168_i2048_ng8_kg4.json
@@ -95,6 +100,8 @@ msa_topk_select_h4_topk16.json
 mxfp8_grouped_quantize_k4096.json
 nvfp4_kv_dequantize_paged_h2_dk64_dv128_ps4.json
 nvfp4_kv_dequantize_paged_hnd_h2_dk64_dv128_ps4.json
+pcie_ipc_all_gather_tp4_h6144.json
+pcie_ipc_reduce_scatter_tp4_h6144.json
 prims_ts_block_sparse_h8_kv8_d128_qb64_kb64.json
 prims_ts_block_sparse_wrapper_h8_kv8_d128.json
 prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
@@ -157,7 +164,11 @@ import flashinfer.activation
 import flashinfer.cascade
 from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.utils import is_sm100a_supported
-from flashinfer.cake_minimax_h3 import MiniMaxH3Mxfp8PreAttention
+from flashinfer.cake_minimax_h3 import (
+    MiniMaxH3Mxfp8PreAttention,
+    MiniMaxH3Nvfp4PreAttention,
+    MiniMaxH3QkvQuantizePack,
+)
 from flashinfer.attention.prims_ts.block_sparse import (
     BlockSparsePagedTSWrapper,
     BlockSparseTSWrapper,
@@ -171,9 +182,28 @@ from flashinfer.prefill import (
     fmha_v2_prefill_sm120,
 )
 from flashinfer.mla import BatchMLAPagedAttentionWrapper
+from flashinfer.comm import (
+    PcieIpcAllGatherWorkspace,
+    PcieIpcReduceScatterWorkspace,
+)
+from flashinfer.fi_trace import fi_trace
 
 device = "cuda"
 WORKSPACE = 128 * 1024 * 1024  # 128 MB
+
+# PCIe traces need only world_size and tensor metadata, not an IPC allocation
+# or peer GPUs. Real collective execution must construct the workspace normally.
+for _workspace_type, _collective, _input_rows in (
+    (PcieIpcAllGatherWorkspace, "all_gather", 8),
+    (PcieIpcReduceScatterWorkspace, "reduce_scatter", 32),
+):
+    _workspace = object.__new__(_workspace_type)
+    _workspace._world_size = 4
+    fi_trace(
+        getattr(_workspace, _collective),
+        inp=torch.empty((_input_rows, 6144), dtype=torch.bfloat16, device="meta"),
+        save_dir=SAVE_DIR,
+    )
 
 # MiniMax-H3 uses a prepared, caller-owned API. Emit its definition from meta
 # tensors so generating the trace fixture does not compile all exact-shape CUDA
@@ -199,6 +229,49 @@ MiniMaxH3Mxfp8PreAttention.run.fi_trace(
         device="meta",
     ),
     out_sf=torch.empty((_mh_P, 512), dtype=torch.uint8, device="meta"),
+)
+
+# NVFP4 (W4A4) sibling: E2M1 nibble pairs are half-width uint8 rows and the
+# swizzled-128x4 E4M3 block-16 scale tile is 8 bytes per 128-wide head row.
+MiniMaxH3Nvfp4PreAttention.run.fi_trace(
+    save_dir=SAVE_DIR,
+    x=torch.empty((_mh_M, 5376), dtype=torch.bfloat16, device="meta"),
+    x_norm_weight=torch.empty((5376,), dtype=torch.bfloat16, device="meta"),
+    adaln_scale=torch.empty((9, 5376), dtype=torch.bfloat16, device="meta"),
+    adaln_shift=torch.empty((9, 5376), dtype=torch.bfloat16, device="meta"),
+    adaln_index=torch.empty((_mh_M,), dtype=torch.int32, device="meta"),
+    x_global_scale=torch.empty((1,), dtype=torch.float32, device="meta"),
+    qkv_weight_q=torch.empty((21504, 5376 // 2), dtype=torch.uint8, device="meta"),
+    qkv_weight_sf=torch.empty(
+        (21504 * (5376 // 16),), dtype=torch.uint8, device="meta"
+    ),
+    w_global_scale=torch.empty((1,), dtype=torch.float32, device="meta"),
+    q_norm_weight=torch.empty((128,), dtype=torch.bfloat16, device="meta"),
+    k_norm_weight=torch.empty((128,), dtype=torch.bfloat16, device="meta"),
+    rope_cos_sin=torch.empty((_mh_M, 96), dtype=torch.bfloat16, device="meta"),
+    out_global_scale=torch.empty((1,), dtype=torch.float32, device="meta"),
+    out_q=torch.empty(
+        (_mh_P, _mh_M, 56 // _mh_P, 3, 128 // 2),
+        dtype=torch.uint8,
+        device="meta",
+    ),
+    out_sf=torch.empty((_mh_P, 1024), dtype=torch.uint8, device="meta"),
+)
+
+# One-pass QKV quantize-and-pack helper (issue #4532 candidate 7): the NVFP4
+# send-buffer layout of the sibling above, produced directly from BF16 Q/K/V.
+MiniMaxH3QkvQuantizePack.run.fi_trace(
+    save_dir=SAVE_DIR,
+    q=torch.empty((_mh_M, 56, 128), dtype=torch.bfloat16, device="meta"),
+    k=torch.empty((_mh_M, 56, 128), dtype=torch.bfloat16, device="meta"),
+    v=torch.empty((_mh_M, 56, 128), dtype=torch.bfloat16, device="meta"),
+    out_global_scale=torch.empty((1,), dtype=torch.float32, device="meta"),
+    out_q=torch.empty(
+        (_mh_P, _mh_M, 56 // _mh_P, 3, 128 // 2),
+        dtype=torch.uint8,
+        device="meta",
+    ),
+    out_sf=torch.empty((_mh_P, 1024), dtype=torch.uint8, device="meta"),
 )
 
 print(f"\nAuto-dumping fi_trace JSON files to {SAVE_DIR}/\n")
@@ -639,6 +712,16 @@ try:
 except Exception:
     pass  # Requires Blackwell (SM100+)
 
+# Native W4A16 shares canonical weights and 128x4-swizzled scales.
+if torch.cuda.is_available() and torch.cuda.get_device_capability(device) in (
+    (12, 0),
+    (12, 1),
+):
+    a_native = torch.zeros(4, 1024, dtype=torch.bfloat16, device=device)
+    b_native = torch.zeros(256, 512, dtype=torch.uint8, device=device)
+    sf_native = torch.ones(256 * 64, dtype=torch.float8_e4m3fn, device=device)
+    flashinfer.mm_bf16_fp4(a_native, b_native, sf_native, backend="cute-dsl-native")
+
 # ── GQA paged decode (Llama-3.1-8B, h=32/kv=8/d=128) ────────────────────────
 num_qo, num_kv, head_dim, batch_size = 32, 8, 128, 32
 
@@ -1020,6 +1103,57 @@ flashinfer.recurrent_kda(
     beta_is_logit=True,
 )
 
+# ── AlphaMoE NVFP4 (SM100/SM103, pre-aligned route plan) ────────────────────
+# The trace is emitted before validation/JIT, so unsupported GPUs still dump
+# the definition while the actual call is suppressed.
+with contextlib.suppress(Exception):
+    _am_M, _am_N, _am_K, _am_E, _am_topk, _am_bm = 8, 256, 256, 4, 2, 8
+    _am_x = torch.zeros(_am_M, _am_K // 2, dtype=torch.uint8, device=device)
+    _am_x_sf = torch.ones(_am_M, _am_K // 16, dtype=torch.float8_e4m3fn, device=device)
+    _am_w1 = torch.zeros(_am_E, _am_N, _am_K // 2, dtype=torch.uint8, device=device)
+    _am_w1_sf = torch.ones(
+        _am_E,
+        _am_N,
+        _am_K // 16,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _am_w2 = torch.zeros(_am_E, _am_K, _am_N // 4, dtype=torch.uint8, device=device)
+    _am_w2_sf = torch.ones(
+        _am_E,
+        _am_K,
+        _am_N // 32,
+        dtype=torch.float8_e4m3fn,
+        device=device,
+    )
+    _am_sorted = torch.zeros(48, dtype=torch.int32, device=device)
+    _am_experts = torch.zeros(6, dtype=torch.int32, device=device)
+    _am_gate_scale = torch.ones(_am_E, dtype=torch.float32, device=device)
+    _am_up_scale = torch.ones(_am_E, dtype=torch.float32, device=device)
+    _am_down_scale = torch.ones(_am_E, dtype=torch.float32, device=device)
+    _am_extent = torch.zeros(1, dtype=torch.int32, device=device)
+    _am_weights = torch.zeros(_am_M, _am_topk, dtype=torch.float32, device=device)
+    _am_out = torch.zeros(_am_M, _am_K, dtype=torch.bfloat16, device=device)
+    flashinfer.fused_moe.alphamoe_nvfp4_aligned_moe(
+        _am_x,
+        _am_x_sf,
+        _am_w1,
+        _am_w1_sf,
+        _am_w2,
+        _am_w2_sf,
+        _am_gate_scale,
+        _am_up_scale,
+        _am_down_scale,
+        _am_sorted,
+        _am_experts,
+        _am_extent,
+        _am_weights,
+        _am_out,
+        _am_topk,
+        _am_bm,
+        2.5,
+    )
+
 # ── serving-native packed Kimi K3 KDA decode ────────────────────────────────
 # The trace is emitted before the exact-SM kernel is loaded, so suppressing an
 # unsupported-device/JIT error still leaves a useful definition JSON.
@@ -1074,6 +1208,40 @@ flashinfer.kda_decode.fused_kda_decode(
     fk_state,
     fk_output_gate,
     fk_norm_weight,
+)
+
+# ── packed fused Kimi K3 speculative decode (conv + KDA + gated RMSNorm) ────
+fkp_N, fkp_T = 2, 3
+fkp_rows = fkp_N * fkp_T
+fkp_slots = fkp_rows + 1
+fkp_x = torch.randn(fkp_rows, 3 * fk_hidden, dtype=torch.bfloat16, device=device)
+fkp_conv_storage = torch.zeros(
+    fkp_slots, fkp_T + 2, 3 * fk_hidden, dtype=torch.bfloat16, device=device
+)
+fkp_conv_state = fkp_conv_storage.transpose(1, 2)
+fkp_raw_gate = torch.randn(1, fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
+fkp_raw_beta = torch.randn(1, fkp_rows, fk_H, dtype=torch.bfloat16, device=device)
+fkp_indices = torch.arange(fkp_rows, 0, -1, dtype=torch.int32, device=device).reshape(
+    fkp_N, fkp_T
+)
+fkp_query_start = torch.arange(0, fkp_rows + 1, fkp_T, dtype=torch.int32, device=device)
+fkp_accepted = torch.ones(fkp_N, dtype=torch.int32, device=device)
+fkp_state = torch.zeros(fkp_slots, fk_H, fk_D, fk_D, dtype=torch.float32, device=device)
+fkp_output_gate = torch.randn(fkp_rows, fk_H, fk_D, dtype=torch.bfloat16, device=device)
+flashinfer.kda_decode.packed_fused_kda_decode(
+    fkp_x,
+    fk_weight,
+    fkp_conv_state,
+    fkp_raw_gate,
+    fkp_raw_beta,
+    fk_A_log,
+    fk_dt_bias,
+    fkp_indices,
+    fkp_state,
+    fkp_output_gate,
+    fk_norm_weight,
+    query_start_loc=fkp_query_start,
+    num_accepted_tokens=fkp_accepted,
 )
 
 # ── AlphaMoE fused router (SM100/SM103) ──────────────────────────────────────
