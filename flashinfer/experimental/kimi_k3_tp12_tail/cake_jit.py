@@ -1549,7 +1549,7 @@ POLL_SCHEDULES = ("grouped", "pinned")
 
 
 def required_kernel_keys() -> tuple[str, ...]:
-    """Every logical kernel the runtime can select on one architecture (twenty keys)."""
+    """Every logical kernel the runtime can select on one architecture (twenty-two keys)."""
     # Unreachable, hence not registered: ``k1_twoshot_ess:pinned`` and ``k3_ess:pinned``
     # (the ESS range ``M < 256`` is grouped-only), ``k3_persist:pinned`` and
     # ``k3_persist_bulk:grouped`` (the plain persistent K3 serves exactly 256 tokens,
@@ -1558,8 +1558,12 @@ def required_kernel_keys() -> tuple[str, ...]:
         *(f"k1_oneshot_ess:r{rank}" for rank in range(WORLD_SIZE)),
         "k1_twoshot_ess:grouped",
         *(f"k1_twoshot:{schedule}" for schedule in POLL_SCHEDULES),
-        "k23:n640",
-        "k23:n512",
+        # fused K23 per column width and accumulator capacity (round 6: the four-token module for M <= 4, the
+        # eight-token module for 5 <= M <= 8)
+        "k23:n640:c4",
+        "k23:n512:c4",
+        "k23:n640:c8",
+        "k23:n512:c8",
         "k3_ess:grouped",
         "k3_persist:grouped",
         "k3_persist_bulk:pinned",
