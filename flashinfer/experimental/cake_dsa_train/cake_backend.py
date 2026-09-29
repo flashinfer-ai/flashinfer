@@ -114,6 +114,7 @@ CONTRACT_SCALARS = (
     "softmax_scale",
     "softmax_scale_log2",
     "idx_stride",  # indices row stride (elements)
+    "indices_offset",  # element offset of indices inside the storage alias the host passes (0 when contiguous)
     "k_rope_stride",  # k_rope row stride (elements); k_rope is passed as its storage alias
     "k_rope_offset",  # element offset of k_rope inside that storage (0 when contiguous)
     "has_topk_length",  # 1 when the caller supplied topk_length
@@ -557,7 +558,8 @@ class DSATrainRunner:
         self._run(FORWARD_STAGES)
         if self.abi == ABI_SEED:
             lse = t["lse"]
-            lse.masked_fill_(torch.isinf(lse), float("-inf"))
+            torch.isposinf(lse, out=t["lse_mask"])  # empty rows; no temporaries (launch path allocates nothing)
+            lse.masked_fill_(t["lse_mask"], float("-inf"))
         return t["out"], t["lse"], t.get("o_lo")
 
     def backward(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -609,6 +611,7 @@ def _contract_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dic
     ):
         values[key] = int(t[name].stride(0))
     values["idx_stride"] = int(t["indices"].stride(0))
+    values["indices"], values["indices_offset"] = _pointer_alias(t["indices"])
     values["k_rope_stride"] = int(t["k_rope"].stride(0))
     values["k_rope"], values["k_rope_offset"] = _pointer_alias(t["k_rope"])
     return values
@@ -734,6 +737,7 @@ def prepare_dsa_train(
         t["packed_kv"] = _carve(flat, layout, "packed_kv", torch.bfloat16, (num_kv, D_QK))
         t["aux_logits"] = _carve(flat, layout, "aux_logits", torch.float32, (num_queries, NUM_HEADS))
         t["sinks"] = _carve(flat, layout, "sinks", torch.float32, (NUM_HEADS,))
+        t["lse_mask"] = torch.empty((num_queries, NUM_HEADS), dtype=torch.bool, device=device)  # +inf -> -inf rewrite scratch
     if backward:
         t["dout"] = dout
         t["delta"] = _carve(flat, layout, "delta", torch.float32, (num_queries, NUM_HEADS))
