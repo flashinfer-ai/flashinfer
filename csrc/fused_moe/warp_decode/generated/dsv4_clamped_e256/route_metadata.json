@@ -9020,41 +9020,11 @@
           }
         },
         "storage_1": {
-          "bytes": 1728,
+          "bytes": 216,
           "source_input_paths": [],
           "source_input_offsets": {}
         },
         "storage_2": {
-          "bytes": 216,
-          "source_input_paths": [],
-          "source_input_offsets": {}
-        },
-        "storage_3": {
-          "bytes": 216,
-          "source_input_paths": [],
-          "source_input_offsets": {}
-        },
-        "storage_4": {
-          "bytes": 216,
-          "source_input_paths": [],
-          "source_input_offsets": {}
-        },
-        "storage_5": {
-          "bytes": 4,
-          "source_input_paths": [],
-          "source_input_offsets": {}
-        },
-        "storage_6": {
-          "bytes": 4,
-          "source_input_paths": [],
-          "source_input_offsets": {}
-        },
-        "storage_7": {
-          "bytes": 4,
-          "source_input_paths": [],
-          "source_input_offsets": {}
-        },
-        "storage_8": {
           "bytes": 2147483648,
           "source_input_paths": [
             "inputs.gemm1_weights"
@@ -9063,7 +9033,7 @@
             "inputs.gemm1_weights": 0
           }
         },
-        "storage_9": {
+        "storage_3": {
           "bytes": 65536,
           "source_input_paths": [
             "inputs.hidden_states"
@@ -9072,7 +9042,7 @@
             "inputs.hidden_states": 0
           }
         },
-        "storage_10": {
+        "storage_4": {
           "bytes": 268435456,
           "source_input_paths": [
             "inputs.gemm1_weights_scale"
@@ -9081,7 +9051,7 @@
             "inputs.gemm1_weights_scale": 0
           }
         },
-        "storage_11": {
+        "storage_5": {
           "bytes": 8192,
           "source_input_paths": [
             "inputs.hidden_states_scale"
@@ -9090,17 +9060,37 @@
             "inputs.hidden_states_scale": 0
           }
         },
-        "storage_12": {
+        "storage_6": {
           "bytes": 442368,
           "source_input_paths": [],
           "source_input_offsets": {}
         },
-        "storage_13": {
+        "storage_7": {
           "bytes": 55296,
           "source_input_paths": [],
           "source_input_offsets": {}
         },
-        "storage_14": {
+        "storage_8": {
+          "bytes": 1728,
+          "source_input_paths": [],
+          "source_input_offsets": {}
+        },
+        "storage_9": {
+          "bytes": 216,
+          "source_input_paths": [],
+          "source_input_offsets": {}
+        },
+        "storage_10": {
+          "bytes": 4,
+          "source_input_paths": [],
+          "source_input_offsets": {}
+        },
+        "storage_11": {
+          "bytes": 4,
+          "source_input_paths": [],
+          "source_input_offsets": {}
+        },
+        "storage_12": {
           "bytes": 1024,
           "source_input_paths": [
             "inputs.output1_scale_scalar"
@@ -9109,7 +9099,7 @@
             "inputs.output1_scale_scalar": 0
           }
         },
-        "storage_15": {
+        "storage_13": {
           "bytes": 1024,
           "source_input_paths": [
             "inputs.output1_scale_gate_scalar"
@@ -9118,7 +9108,7 @@
             "inputs.output1_scale_gate_scalar": 0
           }
         },
-        "storage_16": {
+        "storage_14": {
           "bytes": 1024,
           "source_input_paths": [
             "inputs.gemm1_clamp_limit"
@@ -9127,7 +9117,7 @@
             "inputs.gemm1_clamp_limit": 0
           }
         },
-        "storage_17": {
+        "storage_15": {
           "bytes": 1024,
           "source_input_paths": [
             "inputs.gemm1_alpha"
@@ -9136,7 +9126,7 @@
             "inputs.gemm1_alpha": 0
           }
         },
-        "storage_18": {
+        "storage_16": {
           "bytes": 1024,
           "source_input_paths": [
             "inputs.gemm1_beta"
@@ -9145,7 +9135,7 @@
             "inputs.gemm1_beta": 0
           }
         },
-        "storage_19": {
+        "storage_17": {
           "bytes": 1073741824,
           "source_input_paths": [
             "inputs.gemm2_weights"
@@ -9154,7 +9144,7 @@
             "inputs.gemm2_weights": 0
           }
         },
-        "storage_20": {
+        "storage_18": {
           "bytes": 134217728,
           "source_input_paths": [
             "inputs.gemm2_weights_scale"
@@ -9163,12 +9153,12 @@
             "inputs.gemm2_weights_scale": 0
           }
         },
-        "storage_21": {
+        "storage_19": {
           "bytes": 3538944,
           "source_input_paths": [],
           "source_input_offsets": {}
         },
-        "storage_22": {
+        "storage_20": {
           "bytes": 1024,
           "source_input_paths": [
             "inputs.output2_scale_scalar"
@@ -9177,7 +9167,12 @@
             "inputs.output2_scale_scalar": 0
           }
         },
-        "storage_23": {
+        "storage_21": {
+          "bytes": 4,
+          "source_input_paths": [],
+          "source_input_offsets": {}
+        },
+        "storage_22": {
           "bytes": 384,
           "source_input_paths": [
             "inputs._route_weights",
@@ -9188,7 +9183,7 @@
             "inputs.topk_ids[1]": 0
           }
         },
-        "storage_24": {
+        "storage_23": {
           "bytes": 73728,
           "source_input_paths": [
             "inputs.out"
@@ -9217,7 +9212,7 @@
         },
         "tensor_1": {
           "shape": [
-            432
+            54
           ],
           "stride": [
             1
@@ -9225,88 +9220,10 @@
           "dtype": "torch.int32",
           "storage_id": "storage_1",
           "storage_offset_bytes": 0,
-          "logical_bytes": 1728,
+          "logical_bytes": 216,
           "source_input_aliases": []
         },
         "tensor_2": {
-          "shape": [
-            54
-          ],
-          "stride": [
-            1
-          ],
-          "dtype": "torch.int32",
-          "storage_id": "storage_2",
-          "storage_offset_bytes": 0,
-          "logical_bytes": 216,
-          "source_input_aliases": []
-        },
-        "tensor_3": {
-          "shape": [
-            54
-          ],
-          "stride": [
-            1
-          ],
-          "dtype": "torch.int32",
-          "storage_id": "storage_3",
-          "storage_offset_bytes": 0,
-          "logical_bytes": 216,
-          "source_input_aliases": []
-        },
-        "tensor_4": {
-          "shape": [
-            54
-          ],
-          "stride": [
-            1
-          ],
-          "dtype": "torch.int32",
-          "storage_id": "storage_4",
-          "storage_offset_bytes": 0,
-          "logical_bytes": 216,
-          "source_input_aliases": []
-        },
-        "tensor_5": {
-          "shape": [
-            1
-          ],
-          "stride": [
-            1
-          ],
-          "dtype": "torch.int32",
-          "storage_id": "storage_5",
-          "storage_offset_bytes": 0,
-          "logical_bytes": 4,
-          "source_input_aliases": []
-        },
-        "tensor_6": {
-          "shape": [
-            1
-          ],
-          "stride": [
-            1
-          ],
-          "dtype": "torch.int32",
-          "storage_id": "storage_6",
-          "storage_offset_bytes": 0,
-          "logical_bytes": 4,
-          "source_input_aliases": []
-        },
-        "tensor_7": {
-          "shape": [
-            1
-          ],
-          "stride": [
-            1
-          ],
-          "dtype": "torch.int32",
-          "storage_id": "storage_7",
-          "storage_offset_bytes": 0,
-          "logical_bytes": 4,
-          "source_input_aliases": []
-        },
-        "tensor_8": {
           "shape": [
             256,
             4096,
@@ -9318,14 +9235,14 @@
             1
           ],
           "dtype": "torch.uint8",
-          "storage_id": "storage_8",
+          "storage_id": "storage_2",
           "storage_offset_bytes": 0,
           "logical_bytes": 2147483648,
           "source_input_aliases": [
             "inputs.gemm1_weights"
           ]
         },
-        "tensor_9": {
+        "tensor_3": {
           "shape": [
             9,
             2048
@@ -9335,14 +9252,14 @@
             1
           ],
           "dtype": "torch.uint8",
-          "storage_id": "storage_9",
+          "storage_id": "storage_3",
           "storage_offset_bytes": 0,
           "logical_bytes": 18432,
           "source_input_aliases": [
             "inputs.hidden_states"
           ]
         },
-        "tensor_10": {
+        "tensor_4": {
           "shape": [
             8192,
             64,
@@ -9356,14 +9273,14 @@
             1
           ],
           "dtype": "torch.uint8",
-          "storage_id": "storage_10",
+          "storage_id": "storage_4",
           "storage_offset_bytes": 0,
           "logical_bytes": 268435456,
           "source_input_aliases": [
             "inputs.gemm1_weights_scale"
           ]
         },
-        "tensor_11": {
+        "tensor_5": {
           "shape": [
             9,
             256
@@ -9373,14 +9290,14 @@
             1
           ],
           "dtype": "torch.uint8",
-          "storage_id": "storage_11",
+          "storage_id": "storage_5",
           "storage_offset_bytes": 0,
           "logical_bytes": 2304,
           "source_input_aliases": [
             "inputs.hidden_states_scale"
           ]
         },
-        "tensor_12": {
+        "tensor_6": {
           "shape": [
             54,
             8,
@@ -9392,12 +9309,12 @@
             1
           ],
           "dtype": "torch.uint8",
-          "storage_id": "storage_12",
+          "storage_id": "storage_6",
           "storage_offset_bytes": 0,
           "logical_bytes": 442368,
           "source_input_aliases": []
         },
-        "tensor_13": {
+        "tensor_7": {
           "shape": [
             54,
             8,
@@ -9409,10 +9326,92 @@
             1
           ],
           "dtype": "torch.uint8",
-          "storage_id": "storage_13",
+          "storage_id": "storage_7",
           "storage_offset_bytes": 0,
           "logical_bytes": 55296,
           "source_input_aliases": []
+        },
+        "tensor_8": {
+          "shape": [
+            432
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.int32",
+          "storage_id": "storage_8",
+          "storage_offset_bytes": 0,
+          "logical_bytes": 1728,
+          "source_input_aliases": []
+        },
+        "tensor_9": {
+          "shape": [
+            54
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.int32",
+          "storage_id": "storage_9",
+          "storage_offset_bytes": 0,
+          "logical_bytes": 216,
+          "source_input_aliases": []
+        },
+        "tensor_10": {
+          "shape": [
+            1
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.int32",
+          "storage_id": "storage_10",
+          "storage_offset_bytes": 0,
+          "logical_bytes": 4,
+          "source_input_aliases": []
+        },
+        "tensor_11": {
+          "shape": [
+            1
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.int32",
+          "storage_id": "storage_11",
+          "storage_offset_bytes": 0,
+          "logical_bytes": 4,
+          "source_input_aliases": []
+        },
+        "tensor_12": {
+          "shape": [
+            256
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_id": "storage_12",
+          "storage_offset_bytes": 0,
+          "logical_bytes": 1024,
+          "source_input_aliases": [
+            "inputs.output1_scale_scalar"
+          ]
+        },
+        "tensor_13": {
+          "shape": [
+            256
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.float32",
+          "storage_id": "storage_13",
+          "storage_offset_bytes": 0,
+          "logical_bytes": 1024,
+          "source_input_aliases": [
+            "inputs.output1_scale_gate_scalar"
+          ]
         },
         "tensor_14": {
           "shape": [
@@ -9426,7 +9425,7 @@
           "storage_offset_bytes": 0,
           "logical_bytes": 1024,
           "source_input_aliases": [
-            "inputs.output1_scale_scalar"
+            "inputs.gemm1_clamp_limit"
           ]
         },
         "tensor_15": {
@@ -9441,7 +9440,7 @@
           "storage_offset_bytes": 0,
           "logical_bytes": 1024,
           "source_input_aliases": [
-            "inputs.output1_scale_gate_scalar"
+            "inputs.gemm1_alpha"
           ]
         },
         "tensor_16": {
@@ -9456,68 +9455,10 @@
           "storage_offset_bytes": 0,
           "logical_bytes": 1024,
           "source_input_aliases": [
-            "inputs.gemm1_clamp_limit"
-          ]
-        },
-        "tensor_17": {
-          "shape": [
-            256
-          ],
-          "stride": [
-            1
-          ],
-          "dtype": "torch.float32",
-          "storage_id": "storage_17",
-          "storage_offset_bytes": 0,
-          "logical_bytes": 1024,
-          "source_input_aliases": [
-            "inputs.gemm1_alpha"
-          ]
-        },
-        "tensor_18": {
-          "shape": [
-            256
-          ],
-          "stride": [
-            1
-          ],
-          "dtype": "torch.float32",
-          "storage_id": "storage_18",
-          "storage_offset_bytes": 0,
-          "logical_bytes": 1024,
-          "source_input_aliases": [
             "inputs.gemm1_beta"
           ]
         },
-        "tensor_19": {
-          "shape": [
-            268435456
-          ],
-          "stride": [
-            1
-          ],
-          "dtype": "torch.uint8",
-          "storage_id": "storage_10",
-          "storage_offset_bytes": 0,
-          "logical_bytes": 268435456,
-          "source_input_aliases": [
-            "inputs.gemm1_weights_scale"
-          ]
-        },
-        "tensor_20": {
-          "shape": [
-            442368
-          ],
-          "stride": [
-            1
-          ],
-          "dtype": "torch.uint8",
-          "storage_id": "storage_12",
-          "storage_offset_bytes": 0,
-          "logical_bytes": 442368,
-          "source_input_aliases": []
-        },
-        "tensor_21": {
+        "tensor_17": {
           "shape": [
             256,
             4096,
@@ -9529,14 +9470,14 @@
             1
           ],
           "dtype": "torch.uint8",
-          "storage_id": "storage_19",
+          "storage_id": "storage_17",
           "storage_offset_bytes": 0,
           "logical_bytes": 1073741824,
           "source_input_aliases": [
             "inputs.gemm2_weights"
           ]
         },
-        "tensor_22": {
+        "tensor_18": {
           "shape": [
             8192,
             32,
@@ -9550,14 +9491,14 @@
             1
           ],
           "dtype": "torch.uint8",
-          "storage_id": "storage_20",
+          "storage_id": "storage_18",
           "storage_offset_bytes": 0,
           "logical_bytes": 134217728,
           "source_input_aliases": [
             "inputs.gemm2_weights_scale"
           ]
         },
-        "tensor_23": {
+        "tensor_19": {
           "shape": [
             54,
             32,
@@ -9569,12 +9510,12 @@
             1
           ],
           "dtype": "torch.uint8",
-          "storage_id": "storage_13",
+          "storage_id": "storage_7",
           "storage_offset_bytes": 0,
           "logical_bytes": 55296,
           "source_input_aliases": []
         },
-        "tensor_24": {
+        "tensor_20": {
           "shape": [
             432,
             4096
@@ -9584,12 +9525,12 @@
             1
           ],
           "dtype": "torch.bfloat16",
-          "storage_id": "storage_21",
+          "storage_id": "storage_19",
           "storage_offset_bytes": 0,
           "logical_bytes": 3538944,
           "source_input_aliases": []
         },
-        "tensor_25": {
+        "tensor_21": {
           "shape": [
             256
           ],
@@ -9597,14 +9538,27 @@
             1
           ],
           "dtype": "torch.float32",
-          "storage_id": "storage_22",
+          "storage_id": "storage_20",
           "storage_offset_bytes": 0,
           "logical_bytes": 1024,
           "source_input_aliases": [
             "inputs.output2_scale_scalar"
           ]
         },
-        "tensor_26": {
+        "tensor_22": {
+          "shape": [
+            1
+          ],
+          "stride": [
+            1
+          ],
+          "dtype": "torch.int32",
+          "storage_id": "storage_21",
+          "storage_offset_bytes": 0,
+          "logical_bytes": 4,
+          "source_input_aliases": []
+        },
+        "tensor_23": {
           "shape": [
             54
           ],
@@ -9612,7 +9566,7 @@
             1
           ],
           "dtype": "torch.bfloat16",
-          "storage_id": "storage_23",
+          "storage_id": "storage_22",
           "storage_offset_bytes": 0,
           "logical_bytes": 108,
           "source_input_aliases": [
@@ -9620,7 +9574,7 @@
             "inputs.topk_ids[1]"
           ]
         },
-        "tensor_27": {
+        "tensor_24": {
           "shape": [
             9,
             4096
@@ -9630,7 +9584,7 @@
             1
           ],
           "dtype": "torch.bfloat16",
-          "storage_id": "storage_24",
+          "storage_id": "storage_23",
           "storage_offset_bytes": 0,
           "logical_bytes": 73728,
           "source_input_aliases": [
@@ -9641,7 +9595,7 @@
       "launches": [
         {
           "order": 0,
-          "module_id": "device_10",
+          "module_id": "device_08",
           "grid": [
             1,
             1,
@@ -9654,46 +9608,10 @@
                 "tensor_id": "tensor_0"
               }
             },
-            "route_map": {
+            "route_order": {
               "host_kind": "buffer",
               "value": {
                 "tensor_id": "tensor_1"
-              }
-            },
-            "tile_expert": {
-              "host_kind": "buffer",
-              "value": {
-                "tensor_id": "tensor_2"
-              }
-            },
-            "tile_mn_limit": {
-              "host_kind": "buffer",
-              "value": {
-                "tensor_id": "tensor_3"
-              }
-            },
-            "route_slots": {
-              "host_kind": "buffer",
-              "value": {
-                "tensor_id": "tensor_4"
-              }
-            },
-            "num_non_exiting_ctas": {
-              "host_kind": "buffer",
-              "value": {
-                "tensor_id": "tensor_5"
-              }
-            },
-            "fc1_work_counter": {
-              "host_kind": "buffer",
-              "value": {
-                "tensor_id": "tensor_6"
-              }
-            },
-            "fc2_work_counter": {
-              "host_kind": "buffer",
-              "value": {
-                "tensor_id": "tensor_7"
               }
             },
             "route_count": {
@@ -9701,45 +9619,15 @@
               "value": {
                 "scalar": 54
               }
-            },
-            "top_k": {
-              "host_kind": "parameter",
-              "value": {
-                "scalar": 6
-              }
-            },
-            "local_expert_offset": {
-              "host_kind": "parameter",
-              "value": {
-                "scalar": 0
-              }
-            },
-            "num_experts": {
-              "host_kind": "parameter",
-              "value": {
-                "scalar": 256
-              }
-            },
-            "fc1_initial_work": {
-              "host_kind": "parameter",
-              "value": {
-                "scalar": 0
-              }
-            },
-            "fc2_initial_work": {
-              "host_kind": "parameter",
-              "value": {
-                "scalar": 0
-              }
             }
           },
           "tma": {}
         },
         {
           "order": 1,
-          "module_id": "device_01",
+          "module_id": "device_02",
           "grid": [
-            64,
+            32,
             54,
             1
           ],
@@ -9747,97 +9635,97 @@
             "A": {
               "host_kind": "tma_buffer",
               "value": {
-                "tensor_id": "tensor_8"
+                "tensor_id": "tensor_2"
               }
             },
             "B": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_9"
+                "tensor_id": "tensor_3"
               }
             },
             "SFA": {
               "host_kind": "tma_buffer",
               "value": {
-                "tensor_id": "tensor_10"
+                "tensor_id": "tensor_4"
               }
             },
             "SFB": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_11"
+                "tensor_id": "tensor_5"
               }
             },
             "C": {
               "host_kind": "tma_buffer",
               "value": {
-                "tensor_id": "tensor_12"
+                "tensor_id": "tensor_6"
               }
             },
             "SFC": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_13"
+                "tensor_id": "tensor_7"
               }
             },
             "route_map": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_1"
+                "tensor_id": "tensor_8"
               }
             },
             "tile_expert": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_2"
+                "tensor_id": "tensor_0"
               }
             },
             "tile_mn_limit": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_3"
+                "tensor_id": "tensor_9"
               }
             },
             "num_non_exiting_ctas": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_5"
+                "tensor_id": "tensor_10"
               }
             },
             "work_counter": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_6"
+                "tensor_id": "tensor_11"
               }
             },
             "scale_c": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_14"
+                "tensor_id": "tensor_12"
               }
             },
             "scale_gate": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_15"
+                "tensor_id": "tensor_13"
               }
             },
             "clamp_limit": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_16"
+                "tensor_id": "tensor_14"
               }
             },
             "act_alpha": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_17"
+                "tensor_id": "tensor_15"
               }
             },
             "act_beta": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_18"
+                "tensor_id": "tensor_16"
               }
             },
             "M_out": {
@@ -9855,7 +9743,7 @@
             "grid_m": {
               "host_kind": "parameter",
               "value": {
-                "scalar": 64
+                "scalar": 32
               }
             },
             "grid_n": {
@@ -9870,16 +9758,10 @@
                 "scalar": 8
               }
             },
-            "SFA_raw": {
+            "route_order": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_19"
-              }
-            },
-            "C_raw": {
-              "host_kind": "buffer",
-              "value": {
-                "tensor_id": "tensor_20"
+                "tensor_id": "tensor_1"
               }
             }
           },
@@ -9905,8 +9787,8 @@
               ],
               "box_dim": [
                 128,
-                64,
-                2,
+                128,
+                1,
                 1
               ],
               "elem_strides": [
@@ -9952,7 +9834,7 @@
               "rank": 4,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
-              "swizzle": "CU_TENSOR_MAP_SWIZZLE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_32B",
               "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
               "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
               "base_offset_bytes": 0,
@@ -9968,7 +9850,7 @@
                 1024
               ],
               "box_dim": [
-                32,
+                64,
                 8,
                 1,
                 1
@@ -9984,7 +9866,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_07",
           "grid": [
             32,
             54,
@@ -9994,55 +9876,67 @@
             "A": {
               "host_kind": "tma_buffer",
               "value": {
-                "tensor_id": "tensor_21"
+                "tensor_id": "tensor_17"
               }
             },
             "B": {
               "host_kind": "tma_buffer",
               "value": {
-                "tensor_id": "tensor_12"
+                "tensor_id": "tensor_6"
               }
             },
             "SFA": {
               "host_kind": "tma_buffer",
               "value": {
-                "tensor_id": "tensor_22"
+                "tensor_id": "tensor_18"
               }
             },
             "SFB": {
-              "host_kind": "buffer",
+              "host_kind": "tma_buffer",
               "value": {
-                "tensor_id": "tensor_23"
+                "tensor_id": "tensor_19"
               }
             },
             "C_tma": {
               "host_kind": "tma_buffer",
               "value": {
-                "tensor_id": "tensor_24"
+                "tensor_id": "tensor_20"
               }
             },
             "C": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_24"
+                "tensor_id": "tensor_20"
               }
             },
             "scale_c": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_25"
+                "tensor_id": "tensor_21"
               }
             },
             "tile_expert": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_2"
+                "tensor_id": "tensor_0"
               }
             },
             "tile_mn_limit": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_3"
+                "tensor_id": "tensor_9"
+              }
+            },
+            "num_non_exiting_ctas": {
+              "host_kind": "buffer",
+              "value": {
+                "tensor_id": "tensor_10"
+              }
+            },
+            "work_counter": {
+              "host_kind": "buffer",
+              "value": {
+                "tensor_id": "tensor_22"
               }
             },
             "M": {
@@ -10073,12 +9967,6 @@
               "host_kind": "parameter",
               "value": {
                 "scalar": 4
-              }
-            },
-            "total_tiles": {
-              "host_kind": "buffer",
-              "value": {
-                "tensor_id": "tensor_5"
               }
             }
           },
@@ -10171,6 +10059,34 @@
                 1
               ]
             },
+            "SFB": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_NONE",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                32,
+                32,
+                54
+              ],
+              "global_strides": [
+                32,
+                1024
+              ],
+              "box_dim": [
+                32,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
             "C_tma": {
               "rank": 4,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
@@ -10207,7 +10123,7 @@
         },
         {
           "order": 3,
-          "module_id": "device_03",
+          "module_id": "device_04",
           "grid": [
             16,
             9,
@@ -10217,25 +10133,19 @@
             "route_outputs": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_24"
+                "tensor_id": "tensor_20"
               }
             },
             "route_weights": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_26"
-              }
-            },
-            "route_slots": {
-              "host_kind": "buffer",
-              "value": {
-                "tensor_id": "tensor_4"
+                "tensor_id": "tensor_23"
               }
             },
             "output": {
               "host_kind": "buffer",
               "value": {
-                "tensor_id": "tensor_27"
+                "tensor_id": "tensor_24"
               }
             },
             "num_tokens": {
@@ -10247,7 +10157,7 @@
             "route_stride": {
               "host_kind": "parameter",
               "value": {
-                "scalar": 4096
+                "scalar": 32768
               }
             },
             "M": {
@@ -13752,7 +13662,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             72,
@@ -13879,7 +13789,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                72
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                72
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                72
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                72
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                72
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                72
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                72
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -14665,7 +14771,7 @@
       "launches": [
         {
           "order": 0,
-          "module_id": "device_00",
+          "module_id": "device_05",
           "grid": [
             1,
             1,
@@ -16264,7 +16370,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             84,
@@ -16391,7 +16497,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                84
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                84
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                84
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                84
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                84
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                84
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                84
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -17520,7 +17822,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             90,
@@ -17647,7 +17949,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                90
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                90
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                90
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                90
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                90
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                90
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                90
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -20032,7 +20530,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             102,
@@ -20159,7 +20657,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                102
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                102
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                102
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                102
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                102
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                102
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                102
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -21288,7 +21982,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             108,
@@ -21415,7 +22109,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                108
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                108
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                108
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                108
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                108
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                108
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                108
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -22544,7 +23434,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             114,
@@ -22671,7 +23561,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                114
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                114
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                114
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                114
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                114
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                114
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                114
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -26312,7 +27398,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             132,
@@ -26439,7 +27525,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                132
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                132
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                132
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                132
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                132
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                132
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                132
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -28824,7 +30106,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             144,
@@ -28951,7 +30233,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                144
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                144
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                144
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                144
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                144
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                144
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                144
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -31336,7 +32814,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             156,
@@ -31463,7 +32941,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                156
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                156
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                156
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                156
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                156
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                156
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                156
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -32592,7 +34266,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             162,
@@ -32719,7 +34393,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                162
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                162
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                162
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                162
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                162
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                162
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                162
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -33848,7 +35718,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             168,
@@ -33975,7 +35845,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                168
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                168
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                168
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                168
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                168
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                168
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                168
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -37616,7 +39682,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             186,
@@ -37743,7 +39809,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                186
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                186
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                186
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                186
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                186
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                186
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                186
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
@@ -38529,7 +40791,7 @@
       "launches": [
         {
           "order": 0,
-          "module_id": "device_00",
+          "module_id": "device_05",
           "grid": [
             1,
             1,
@@ -38872,7 +41134,7 @@
         },
         {
           "order": 2,
-          "module_id": "device_09",
+          "module_id": "device_11",
           "grid": [
             32,
             192,
@@ -38999,7 +41261,203 @@
                 1
               ]
             },
-            "B": {
+            "tmap_b_rows_1": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                1,
+                192
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_2": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                2,
+                192
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_3": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                3,
+                192
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_4": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                4,
+                192
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_5": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                5,
+                192
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_6": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                6,
+                192
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_7": {
+              "rank": 3,
+              "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+              "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+              "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+              "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+              "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+              "base_offset_bytes": 0,
+              "global_dim": [
+                2048,
+                7,
+                192
+              ],
+              "global_strides": [
+                1024,
+                8192
+              ],
+              "box_dim": [
+                256,
+                8,
+                1
+              ],
+              "elem_strides": [
+                1,
+                1,
+                1
+              ]
+            },
+            "tmap_b_rows_8": {
               "rank": 3,
               "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
               "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",

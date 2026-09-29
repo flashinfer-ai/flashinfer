@@ -72,7 +72,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_RELAY_INBOX_STAGE_BYTES 16
 #define SMEM_RELAY_INBOX_STRIDE 16
 #define SMEM_TOTAL 64128
-#define THREADS 384
+#define THREADS 352
 #define BLOCK_M 64
 #define BLOCK_N 8
 #define BLOCK_K 512
@@ -435,8 +435,8 @@ __device__ __forceinline__ void tmem_ld_x8_wait(float* dst, int addr) {
 
 extern "C" {
 
-__global__ __launch_bounds__(384, 3) __cluster_dims__(2,1,1) void
-kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, uint8_t* __restrict__ SFA_raw, uint8_t* __restrict__ C_raw)
+__global__ __launch_bounds__(352, 3) __cluster_dims__(2,1,1) void
+kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles, uint8_t* __restrict__ SFA_raw, uint8_t* __restrict__ C_raw)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -505,8 +505,8 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
             // --- pipeline 'work_pipe' ---
             // work_full: 1 barriers, init_count=1
             mbarrier_init(smem + 0, 1);
-            // work_empty: 1 barriers, init_count=(cta_rank == 0 ? 384 : 256)
-            mbarrier_init(smem + 8, (cta_rank == 0 ? 384 : 256));
+            // work_empty: 1 barriers, init_count=(cta_rank == 0 ? 352 : 224)
+            mbarrier_init(smem + 8, (cta_rank == 0 ? 352 : 224));
             // --- pipeline 'relay_pipe' ---
             // relay_full: 1 barriers, init_count=1
             mbarrier_init(smem + 16, 1);
@@ -576,7 +576,7 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
 
     // TMEM alloc (64 columns, 64 used)
     volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 256);
-    if (warp == 10) {
+    if (warp == 9) {
         int _tmem_hold = smem + 256;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(64) : "memory");
         __syncwarp();
@@ -1050,6 +1050,16 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
             unsigned int issue_phase = 1;
             int local_thread = (warp - 6) * 32 + lane;
             int row_stride_bytes = K / 2;
+            unsigned int sfb_issue_stage = 0;
+            unsigned int sfb_issue_phase = 1;
+            unsigned int zero[1];
+            zero[0] = 0;
+            #pragma unroll 1
+            for (int i = 0; i < 10; i++) {
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sfb_addr + (unsigned int)((i * 64 + local_thread) * 4)), "r"((zero[0])));
+            }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            asm volatile("barrier.sync 1, 64;" ::: "memory");
             unsigned int cluster_work_4 = blockIdx.y * (64 / 2) + blockIdx.x / 2;
             unsigned int work_stage_4 = 0;
             unsigned int _phase_work_full_4 = 0;
@@ -1061,12 +1071,12 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                     unsigned int publish_stage = stage_3;
                     if (K_tiles >= 5) {
                         mbarrier_wait(k_done_addr + (stage_3) * 8, issue_phase);
+                        mbarrier_wait(sfb_free_addr + (sfb_issue_stage) * 8, sfb_issue_phase);
                         int dst_base = smem_b_addr + stage_3 * 2048;
                         int elt_offset = local_thread * 32;
                         int row = elt_offset / 256;
                         int col = elt_offset % 256;
-                        int routed = 0;
-                        routed = route_map[n_tile_1 * 8 + (unsigned int)row];
+                        int routed = route_map[n_tile_1 * 8 + (unsigned int)row];
                         int src_base = routed * row_stride_bytes + col / 2;
                         int dst_chunk = elt_offset / 2 ^ row % 8 * 16;
                         asm volatile(
@@ -1083,18 +1093,23 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                             "@p cp.async.ca.shared::cta.global [%1], [%2], 16;\n\t"
                             "}"
                             :: "r"((row < valid_rows_1) ? 1 : 0), "r"(dst_base + 1024 + dst_chunk), "l"(B + (src_base + 128)));
+                        int q = local_thread % 8;
+                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
+                            :: "r"(smem_sfb_addr + sfb_issue_stage * 1280 + (unsigned int)(q / 2 * 256) + (unsigned int)(row * 16) + (unsigned int)(q % 2 * 8)), "l"(SFB + (routed * (row_stride_bytes / 8) + q * 4)), "r"((row < valid_rows_1) ? 4 : 0));
                         asm volatile("cp.async.commit_group;");
                         stage_3 += 1;
                         if (stage_3 == 3) { stage_3 = 0; issue_phase ^= 1; }
+                        sfb_issue_stage += 1;
+                        if (sfb_issue_stage == 2) { sfb_issue_stage = 0; sfb_issue_phase ^= 1; }
                         #pragma unroll 1
                         for (int iter_k_3 = 1; iter_k_3 < K_tiles; iter_k_3++) {
                             mbarrier_wait(k_done_addr + (stage_3) * 8, issue_phase);
+                            mbarrier_wait(sfb_free_addr + (sfb_issue_stage) * 8, sfb_issue_phase);
                             int dst_base_0 = smem_b_addr + stage_3 * 2048;
                             int elt_offset_1 = local_thread * 32;
                             int row_2 = elt_offset_1 / 256;
                             int col_3 = elt_offset_1 % 256;
-                            int routed_4 = 0;
-                            routed_4 = route_map[n_tile_1 * 8 + (unsigned int)row_2];
+                            int routed_4 = route_map[n_tile_1 * 8 + (unsigned int)row_2];
                             int src_base_5 = routed_4 * row_stride_bytes + iter_k_3 * 256 + col_3 / 2;
                             int dst_chunk_6 = elt_offset_1 / 2 ^ row_2 % 8 * 16;
                             asm volatile(
@@ -1111,9 +1126,14 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                                 "@p cp.async.ca.shared::cta.global [%1], [%2], 16;\n\t"
                                 "}"
                                 :: "r"((row_2 < valid_rows_1) ? 1 : 0), "r"(dst_base_0 + 1024 + dst_chunk_6), "l"(B + (src_base_5 + 128)));
+                            int q_7 = local_thread % 8;
+                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
+                                :: "r"(smem_sfb_addr + sfb_issue_stage * 1280 + (unsigned int)(q_7 / 2 * 256) + (unsigned int)(row_2 * 16) + (unsigned int)(q_7 % 2 * 8)), "l"(SFB + (routed_4 * (row_stride_bytes / 8) + iter_k_3 * 32 + q_7 * 4)), "r"((row_2 < valid_rows_1) ? 4 : 0));
                             asm volatile("cp.async.commit_group;");
                             stage_3 += 1;
                             if (stage_3 == 3) { stage_3 = 0; issue_phase ^= 1; }
+                            sfb_issue_stage += 1;
+                            if (sfb_issue_stage == 2) { sfb_issue_stage = 0; sfb_issue_phase ^= 1; }
                             asm volatile("cp.async.wait_group 1;");
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             asm volatile("barrier.sync 1, 64;" ::: "memory");
@@ -1122,6 +1142,9 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                                     asm volatile(
                                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                                         :: "r"((b_full_addr + (publish_stage) * 8) & 0xFEFFFFFF) : "memory");
+                                    asm volatile(
+                                        "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+                                        :: "r"((sfb_full_addr + (sfb_issue_stage) * 8) & 0xFEFFFFFF) : "memory");
                                 }
                             }
                             publish_stage += 1;
@@ -1135,6 +1158,9 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                                 asm volatile(
                                     "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                                     :: "r"((b_full_addr + (publish_stage) * 8) & 0xFEFFFFFF) : "memory");
+                                asm volatile(
+                                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+                                    :: "r"((sfb_full_addr + (sfb_issue_stage ^ 1) * 8) & 0xFEFFFFFF) : "memory");
                             }
                         }
                         publish_stage += 1;
@@ -1143,12 +1169,12 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                         #pragma unroll 1
                         for (int iter_k_4 = 0; iter_k_4 < K_tiles; iter_k_4++) {
                             mbarrier_wait(k_done_addr + (stage_3) * 8, issue_phase);
+                            mbarrier_wait(sfb_free_addr + (sfb_issue_stage) * 8, sfb_issue_phase);
                             int dst_base_1 = smem_b_addr + stage_3 * 2048;
                             int elt_offset_2 = local_thread * 32;
                             int row_1 = elt_offset_2 / 256;
                             int col_1 = elt_offset_2 % 256;
-                            int routed_1 = 0;
-                            routed_1 = route_map[n_tile_1 * 8 + (unsigned int)row_1];
+                            int routed_1 = route_map[n_tile_1 * 8 + (unsigned int)row_1];
                             int src_base_1 = routed_1 * row_stride_bytes + iter_k_4 * 256 + col_1 / 2;
                             int dst_chunk_1 = elt_offset_2 / 2 ^ row_1 % 8 * 16;
                             asm volatile(
@@ -1165,9 +1191,14 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                                 "@p cp.async.ca.shared::cta.global [%1], [%2], 16;\n\t"
                                 "}"
                                 :: "r"((row_1 < valid_rows_1) ? 1 : 0), "r"(dst_base_1 + 1024 + dst_chunk_1), "l"(B + (src_base_1 + 128)));
+                            int q_1 = local_thread % 8;
+                            asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
+                                :: "r"(smem_sfb_addr + sfb_issue_stage * 1280 + (unsigned int)(q_1 / 2 * 256) + (unsigned int)(row_1 * 16) + (unsigned int)(q_1 % 2 * 8)), "l"(SFB + (routed_1 * (row_stride_bytes / 8) + iter_k_4 * 32 + q_1 * 4)), "r"((row_1 < valid_rows_1) ? 4 : 0));
                             asm volatile("cp.async.commit_group;");
                             stage_3 += 1;
                             if (stage_3 == 3) { stage_3 = 0; issue_phase ^= 1; }
+                            sfb_issue_stage += 1;
+                            if (sfb_issue_stage == 2) { sfb_issue_stage = 0; sfb_issue_phase ^= 1; }
                             asm volatile("cp.async.wait_group 0;");
                             asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                             asm volatile("barrier.sync 1, 64;" ::: "memory");
@@ -1176,6 +1207,9 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                                     asm volatile(
                                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
                                         :: "r"((b_full_addr + (publish_stage) * 8) & 0xFEFFFFFF) : "memory");
+                                    asm volatile(
+                                        "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+                                        :: "r"((sfb_full_addr + (sfb_issue_stage ^ 1) * 8) & 0xFEFFFFFF) : "memory");
                                 }
                             }
                             publish_stage += 1;
@@ -1195,68 +1229,31 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
             }
         }
     }
-    // ---- Role: load_sfb ----
+    // ---- Role: load_a ----
     if (warp == 8) {
-        { // load_sfb_main
+        { // load_a_main
             unsigned int stage_4 = 0;
-            unsigned int publish_stage_1 = 0;
-            unsigned int zero[1];
-            zero[0] = 0;
-            #pragma unroll 1
-            for (int i = 0; i < 20; i++) {
-                asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sfb_addr + (unsigned int)((i * 32 + lane) * 4)), "r"((zero[0])));
-            }
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            __syncwarp();
             unsigned int cluster_work_5 = blockIdx.y * (64 / 2) + blockIdx.x / 2;
             unsigned int work_stage_5 = 0;
-            unsigned int _phase_sfb_free = 1;
+            unsigned int _phase_k_done = 1;
             unsigned int _phase_work_full_5 = 0;
             #pragma unroll 1
             for (unsigned int _work_iter_5 = 0; _work_iter_5 < 64 / 2 * grid_n + 1; _work_iter_5++) {
                 if (cluster_work_5 < (unsigned int)(64 / 2 * num_non_exiting_ctas[0])) {
+                    unsigned int m_tile_1 = cluster_work_5 % (unsigned int)(64 / 2) * 2 + (unsigned int)cta_rank;
                     unsigned int n_tile_2 = cluster_work_5 / (unsigned int)(64 / 2);
-                    int valid_rows_2 = (unsigned int)tile_mn_limit[n_tile_2] - n_tile_2 * (unsigned int)BLOCK_N;
+                    int expert_1 = tile_expert[n_tile_2];
                     #pragma unroll 1
                     for (int iter_k_5 = 0; iter_k_5 < K_tiles; iter_k_5++) {
-                        mbarrier_wait(sfb_free_addr + (stage_4) * 8, _phase_sfb_free);
-                        int q = lane % 8;
-                        int row_3 = lane / 8;
-                        int routed_2 = route_map[n_tile_2 * 8 + (unsigned int)(row_3 % 8)];
-                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
-                            :: "r"(smem_sfb_addr + stage_4 * 1280 + (unsigned int)(q / 2 * 256) + (unsigned int)(row_3 * 16) + (unsigned int)(q % 2 * 8)), "l"(SFB + (routed_2 * (K / 16) + iter_k_5 * 32 + q * 4)), "r"((valid_rows_2 > row_3 % 8) ? 4 : 0));
-                        int q_0 = lane % 8;
-                        int row_1_1 = lane / 8 + 4;
-                        int routed_2_1 = route_map[n_tile_2 * 8 + (unsigned int)(row_1_1 % 8)];
-                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 4, %2;"
-                            :: "r"(smem_sfb_addr + stage_4 * 1280 + (unsigned int)(q_0 / 2 * 256) + (unsigned int)(row_1_1 * 16) + (unsigned int)(q_0 % 2 * 8)), "l"(SFB + (routed_2_1 * (K / 16) + iter_k_5 * 32 + q_0 * 4)), "r"((valid_rows_2 > row_1_1 % 8) ? 4 : 0));
-                        asm volatile("cp.async.commit_group;");
-                        stage_4 += 1;
-                        if (stage_4 == 2) { stage_4 = 0; _phase_sfb_free ^= 1; }
-                        if (iter_k_5 > 0) {
-                            asm volatile("cp.async.wait_group 1;");
-                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                            __syncwarp();
-                            if (elect_sync()) {
-                                asm volatile(
-                                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                                    :: "r"((sfb_full_addr + (publish_stage_1) * 8) & 0xFEFFFFFF) : "memory");
-                            }
-                            publish_stage_1 += 1;
-                            if (publish_stage_1 == 2) { publish_stage_1 = 0; }
-                        }
-                    }
-                    if (K_tiles > 0) {
-                        asm volatile("cp.async.wait_group 0;");
-                        asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                        __syncwarp();
+                        mbarrier_wait(k_done_addr + (stage_4) * 8, _phase_k_done);
                         if (elect_sync()) {
+                            tma_4d_gmem2smem_cta2(smem_a_addr + stage_4 * 16384, (&A), 0, m_tile_1 * 64, iter_k_5 * 2, expert_1, ((a_full_addr + (stage_4) * 8) & 0xFEFFFFFF));
                             asm volatile(
-                                "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                                :: "r"((sfb_full_addr + (publish_stage_1) * 8) & 0xFEFFFFFF) : "memory");
+                                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
+                                :: "r"((a_full_addr + (stage_4) * 8) & 0xFEFFFFFF), "r"((uint32_t)(16384)) : "memory");
                         }
-                        publish_stage_1 += 1;
-                        if (publish_stage_1 == 2) { publish_stage_1 = 0; }
+                        stage_4 += 1;
+                        if (stage_4 == 3) { stage_4 = 0; _phase_k_done ^= 1; }
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_5) * 8, _phase_work_full_5);
@@ -1271,31 +1268,68 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
             }
         }
     }
-    // ---- Role: load_a ----
-    if (warp == 9) {
-        { // load_a_main
+    // ---- Role: load_sfa ----
+    if (warp >= 9 && warp <= 10) {
+        { // load_sfa_main
+            int sfa_warp = warp - 9;
             unsigned int stage_5 = 0;
+            unsigned int publish_stage_1 = 0;
+            unsigned int pending = 0;
+            unsigned int zero_sfa[1];
+            zero_sfa[0] = 0;
+            #pragma unroll 1
+            for (int i_1 = 0; i_1 < 16; i_1++) {
+                asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sfa_addr + (unsigned int)(i_1 / 8 * 2048) + (unsigned int)(sfa_warp * 1024) + (unsigned int)(i_1 % 8 * 128) + (unsigned int)(lane * 4)), "r"((zero_sfa[0])));
+            }
+            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+            __syncwarp();
             unsigned int cluster_work_6 = blockIdx.y * (64 / 2) + blockIdx.x / 2;
             unsigned int work_stage_6 = 0;
-            unsigned int _phase_k_done = 1;
+            unsigned int _phase_sfa_free = 1;
             unsigned int _phase_work_full_6 = 0;
             #pragma unroll 1
             for (unsigned int _work_iter_6 = 0; _work_iter_6 < 64 / 2 * grid_n + 1; _work_iter_6++) {
                 if (cluster_work_6 < (unsigned int)(64 / 2 * num_non_exiting_ctas[0])) {
-                    unsigned int m_tile_1 = cluster_work_6 % (unsigned int)(64 / 2) * 2 + (unsigned int)cta_rank;
+                    unsigned int m_tile_2 = cluster_work_6 % (unsigned int)(64 / 2) * 2 + (unsigned int)cta_rank;
                     unsigned int n_tile_3 = cluster_work_6 / (unsigned int)(64 / 2);
-                    int expert_1 = tile_expert[n_tile_3];
+                    int expert_2 = tile_expert[n_tile_3];
+                    int sf_parent = (unsigned int)(expert_2 * (M_out / 64)) + m_tile_2 / 2;
                     #pragma unroll 1
                     for (int iter_k_6 = 0; iter_k_6 < K_tiles; iter_k_6++) {
-                        mbarrier_wait(k_done_addr + (stage_5) * 8, _phase_k_done);
-                        if (elect_sync()) {
-                            tma_4d_gmem2smem_cta2(smem_a_addr + stage_5 * 16384, (&A), 0, m_tile_1 * 64, iter_k_6 * 2, expert_1, ((a_full_addr + (stage_5) * 8) & 0xFEFFFFFF));
-                            asm volatile(
-                                "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
-                                :: "r"((a_full_addr + (stage_5) * 8) & 0xFEFFFFFF), "r"((uint32_t)(16384)) : "memory");
-                        }
+                        mbarrier_wait(sfa_free_addr + (stage_5) * 8, _phase_sfa_free);
+                        int q_2 = sfa_warp * 4;
+                        int sf_source = (unsigned int)((sf_parent * (K / 64) + iter_k_6 * 8 + q_2) * 512 + lane * 16) + m_tile_2 % 2 * 8;
+                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
+                            :: "r"(smem_sfa_addr + stage_5 * 2048 + (unsigned int)(q_2 / 2 * 512) + (unsigned int)(lane * 16) + (unsigned int)(q_2 % 2 * 8)), "l"(SFA_raw + sf_source));
+                        int q_0 = sfa_warp * 4 + 1;
+                        int sf_source_1 = (unsigned int)((sf_parent * (K / 64) + iter_k_6 * 8 + q_0) * 512 + lane * 16) + m_tile_2 % 2 * 8;
+                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
+                            :: "r"(smem_sfa_addr + stage_5 * 2048 + (unsigned int)(q_0 / 2 * 512) + (unsigned int)(lane * 16) + (unsigned int)(q_0 % 2 * 8)), "l"(SFA_raw + sf_source_1));
+                        int q_2_1 = sfa_warp * 4 + 2;
+                        int sf_source_3 = (unsigned int)((sf_parent * (K / 64) + iter_k_6 * 8 + q_2_1) * 512 + lane * 16) + m_tile_2 % 2 * 8;
+                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
+                            :: "r"(smem_sfa_addr + stage_5 * 2048 + (unsigned int)(q_2_1 / 2 * 512) + (unsigned int)(lane * 16) + (unsigned int)(q_2_1 % 2 * 8)), "l"(SFA_raw + sf_source_3));
+                        int q_4 = sfa_warp * 4 + 3;
+                        int sf_source_5 = (unsigned int)((sf_parent * (K / 64) + iter_k_6 * 8 + q_4) * 512 + lane * 16) + m_tile_2 % 2 * 8;
+                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
+                            :: "r"(smem_sfa_addr + stage_5 * 2048 + (unsigned int)(q_4 / 2 * 512) + (unsigned int)(lane * 16) + (unsigned int)(q_4 % 2 * 8)), "l"(SFA_raw + sf_source_5));
+                        asm volatile("cp.async.commit_group;");
                         stage_5 += 1;
-                        if (stage_5 == 3) { stage_5 = 0; _phase_k_done ^= 1; }
+                        if (stage_5 == 2) { stage_5 = 0; _phase_sfa_free ^= 1; }
+                        if (pending != 0) {
+                            asm volatile("cp.async.wait_group 1;");
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                            __syncwarp();
+                            if (elect_sync()) {
+                                asm volatile(
+                                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
+                                    :: "r"((sfa_full_addr + (publish_stage_1) * 8) & 0xFEFFFFFF) : "memory");
+                            }
+                            publish_stage_1 += 1;
+                            if (publish_stage_1 == 2) { publish_stage_1 = 0; }
+                        } else {
+                            pending = 1;
+                        }
                     }
                 }
                 mbarrier_wait(work_full_addr + (work_stage_6) * 8, _phase_work_full_6);
@@ -1308,82 +1342,6 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                 }
                 cluster_work_6 = next_linear_6;
             }
-        }
-    }
-    // ---- Role: load_sfa ----
-    if (warp >= 10 && warp <= 11) {
-        { // load_sfa_main
-            int sfa_warp = warp - 10;
-            unsigned int stage_6 = 0;
-            unsigned int publish_stage_2 = 0;
-            unsigned int pending = 0;
-            unsigned int zero_sfa[1];
-            zero_sfa[0] = 0;
-            #pragma unroll 1
-            for (int i_1 = 0; i_1 < 16; i_1++) {
-                asm volatile("st.shared.b32 [%0], %1;" :: "r"(smem_sfa_addr + (unsigned int)(i_1 / 8 * 2048) + (unsigned int)(sfa_warp * 1024) + (unsigned int)(i_1 % 8 * 128) + (unsigned int)(lane * 4)), "r"((zero_sfa[0])));
-            }
-            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-            __syncwarp();
-            unsigned int cluster_work_7 = blockIdx.y * (64 / 2) + blockIdx.x / 2;
-            unsigned int work_stage_7 = 0;
-            unsigned int _phase_sfa_free = 1;
-            unsigned int _phase_work_full_7 = 0;
-            #pragma unroll 1
-            for (unsigned int _work_iter_7 = 0; _work_iter_7 < 64 / 2 * grid_n + 1; _work_iter_7++) {
-                if (cluster_work_7 < (unsigned int)(64 / 2 * num_non_exiting_ctas[0])) {
-                    unsigned int m_tile_2 = cluster_work_7 % (unsigned int)(64 / 2) * 2 + (unsigned int)cta_rank;
-                    unsigned int n_tile_4 = cluster_work_7 / (unsigned int)(64 / 2);
-                    int expert_2 = tile_expert[n_tile_4];
-                    int sf_parent = (unsigned int)(expert_2 * (M_out / 64)) + m_tile_2 / 2;
-                    #pragma unroll 1
-                    for (int iter_k_7 = 0; iter_k_7 < K_tiles; iter_k_7++) {
-                        mbarrier_wait(sfa_free_addr + (stage_6) * 8, _phase_sfa_free);
-                        int q_1 = sfa_warp * 4;
-                        int sf_source = (unsigned int)((sf_parent * (K / 64) + iter_k_7 * 8 + q_1) * 512 + lane * 16) + m_tile_2 % 2 * 8;
-                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                            :: "r"(smem_sfa_addr + stage_6 * 2048 + (unsigned int)(q_1 / 2 * 512) + (unsigned int)(lane * 16) + (unsigned int)(q_1 % 2 * 8)), "l"(SFA_raw + sf_source));
-                        int q_0_1 = sfa_warp * 4 + 1;
-                        int sf_source_1 = (unsigned int)((sf_parent * (K / 64) + iter_k_7 * 8 + q_0_1) * 512 + lane * 16) + m_tile_2 % 2 * 8;
-                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                            :: "r"(smem_sfa_addr + stage_6 * 2048 + (unsigned int)(q_0_1 / 2 * 512) + (unsigned int)(lane * 16) + (unsigned int)(q_0_1 % 2 * 8)), "l"(SFA_raw + sf_source_1));
-                        int q_2 = sfa_warp * 4 + 2;
-                        int sf_source_3 = (unsigned int)((sf_parent * (K / 64) + iter_k_7 * 8 + q_2) * 512 + lane * 16) + m_tile_2 % 2 * 8;
-                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                            :: "r"(smem_sfa_addr + stage_6 * 2048 + (unsigned int)(q_2 / 2 * 512) + (unsigned int)(lane * 16) + (unsigned int)(q_2 % 2 * 8)), "l"(SFA_raw + sf_source_3));
-                        int q_4 = sfa_warp * 4 + 3;
-                        int sf_source_5 = (unsigned int)((sf_parent * (K / 64) + iter_k_7 * 8 + q_4) * 512 + lane * 16) + m_tile_2 % 2 * 8;
-                        asm volatile("cp.async.ca.shared::cta.global [%0], [%1], 8;"
-                            :: "r"(smem_sfa_addr + stage_6 * 2048 + (unsigned int)(q_4 / 2 * 512) + (unsigned int)(lane * 16) + (unsigned int)(q_4 % 2 * 8)), "l"(SFA_raw + sf_source_5));
-                        asm volatile("cp.async.commit_group;");
-                        stage_6 += 1;
-                        if (stage_6 == 2) { stage_6 = 0; _phase_sfa_free ^= 1; }
-                        if (pending != 0) {
-                            asm volatile("cp.async.wait_group 1;");
-                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                            __syncwarp();
-                            if (elect_sync()) {
-                                asm volatile(
-                                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                                    :: "r"((sfa_full_addr + (publish_stage_2) * 8) & 0xFEFFFFFF) : "memory");
-                            }
-                            publish_stage_2 += 1;
-                            if (publish_stage_2 == 2) { publish_stage_2 = 0; }
-                        } else {
-                            pending = 1;
-                        }
-                    }
-                }
-                mbarrier_wait(work_full_addr + (work_stage_7) * 8, _phase_work_full_7);
-                unsigned int valid_7 = work_response[0];
-                unsigned int next_linear_7 = work_response[1];
-                mbarrier_arrive(work_empty_addr + (work_stage_7) * 8);
-                _phase_work_full_7 ^= 1;
-                if (valid_7 == 0) {
-                    break;
-                }
-                cluster_work_7 = next_linear_7;
-            }
             if (pending != 0) {
                 asm volatile("cp.async.wait_group 0;");
                 asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -1391,10 +1349,10 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                 if (elect_sync()) {
                     asm volatile(
                         "mbarrier.arrive.release.cta.shared::cluster.b64 _, [%0];"
-                        :: "r"((sfa_full_addr + (publish_stage_2) * 8) & 0xFEFFFFFF) : "memory");
+                        :: "r"((sfa_full_addr + (publish_stage_1) * 8) & 0xFEFFFFFF) : "memory");
                 }
-                publish_stage_2 += 1;
-                if (publish_stage_2 == 2) { publish_stage_2 = 0; }
+                publish_stage_1 += 1;
+                if (publish_stage_1 == 2) { publish_stage_1 = 0; }
                 pending = 0;
             }
         }
@@ -1405,14 +1363,14 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
             unsigned int _phase_work_empty = 1;
             unsigned int _phase_private_full = 0;
             unsigned int _phase_relay_empty = 1;
-            unsigned int _phase_work_full_8 = 0;
+            unsigned int _phase_work_full_7 = 0;
             if (cta_rank == 0) {
-                unsigned int work_stage_8 = 0;
+                unsigned int work_stage_7 = 0;
                 unsigned int private_stage = 0;
                 unsigned int relay_stage = 0;
                 #pragma unroll 1
-                for (unsigned int _work_iter_8 = 0; _work_iter_8 < 64 / 2 * grid_n + 1; _work_iter_8++) {
-                    mbarrier_wait(work_empty_addr + (work_stage_8) * 8, _phase_work_empty);
+                for (unsigned int _work_iter_7 = 0; _work_iter_7 < 64 / 2 * grid_n + 1; _work_iter_7++) {
+                    mbarrier_wait(work_empty_addr + (work_stage_7) * 8, _phase_work_empty);
                     if (elect_sync()) {
                         mbarrier_arrive_expect_tx(private_full_addr + (private_stage) * 8, 16);
                         asm volatile(
@@ -1444,22 +1402,22 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                     __syncwarp();
                     _phase_private_full ^= 1;
                     unsigned int publish = 1;
-                    unsigned int next_linear_8 = 0;
+                    unsigned int next_linear_7 = 0;
                     if (_clc_valid_0 != 0) {
                         if (_clc_ctaid_y_0 >= (unsigned int)num_non_exiting_ctas[0]) {
                             publish = 0;
                         } else {
-                            next_linear_8 = _clc_ctaid_y_0 * (unsigned int)(64 / 2) + _clc_ctaid_x_0 / 2;
+                            next_linear_7 = _clc_ctaid_y_0 * (unsigned int)(64 / 2) + _clc_ctaid_x_0 / 2;
                         }
                     }
                     if (publish != 0) {
                         mbarrier_wait_cluster_hint(relay_empty_addr + (relay_stage) * 8, _phase_relay_empty, 10000000);
                         if (elect_sync()) {
                             work_response[0] = _clc_valid_0;
-                            work_response[1] = next_linear_8;
+                            work_response[1] = next_linear_7;
                             work_response[2] = 0;
                             work_response[3] = 0;
-                            mbarrier_arrive(work_full_addr + (work_stage_8) * 8);
+                            mbarrier_arrive(work_full_addr + (work_stage_7) * 8);
                             asm volatile(
                                 "{\n\t"
                                 ".reg .b32 remAddr32;\n\t"
@@ -1477,23 +1435,23 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                                 : "=r"(_mapa_1) : "r"(relay_full_addr + relay_stage * 8), "r"(1));
                             asm volatile(
                                 "st.async.weak.shared::cluster.mbarrier::complete_tx::bytes.v4.b32 [%0], {%1, %2, %3, %4}, [%5];"
-                                :: "r"(_mapa_0), "r"(_clc_valid_0), "r"(next_linear_8), "r"(0), "r"(0), "r"(_mapa_1) : "memory");
+                                :: "r"(_mapa_0), "r"(_clc_valid_0), "r"(next_linear_7), "r"(0), "r"(0), "r"(_mapa_1) : "memory");
                         }
                         _phase_relay_empty ^= 1;
-                        mbarrier_wait(work_full_addr + (work_stage_8) * 8, _phase_work_full_8);
-                        unsigned int valid_8 = work_response[0];
+                        mbarrier_wait(work_full_addr + (work_stage_7) * 8, _phase_work_full_7);
+                        unsigned int valid_7 = work_response[0];
                         unsigned int next_linear_0 = work_response[1];
-                        mbarrier_arrive(work_empty_addr + (work_stage_8) * 8);
+                        mbarrier_arrive(work_empty_addr + (work_stage_7) * 8);
                         _phase_work_empty ^= 1;
-                        _phase_work_full_8 ^= 1;
-                        if (valid_8 == 0) {
+                        _phase_work_full_7 ^= 1;
+                        if (valid_7 == 0) {
                             break;
                         }
                     }
                 }
-                mbarrier_wait(work_empty_addr + (work_stage_8) * 8, _phase_work_empty);
+                mbarrier_wait(work_empty_addr + (work_stage_7) * 8, _phase_work_empty);
                 _phase_work_empty ^= 1;
-                _phase_work_full_8 ^= 1;
+                _phase_work_full_7 ^= 1;
                 mbarrier_wait_cluster_hint(relay_empty_addr + (relay_stage) * 8, _phase_relay_empty, 10000000);
                 _phase_relay_empty ^= 1;
             }
@@ -1515,12 +1473,12 @@ kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100(const __grid_constant__ 
                         work_response[3] = 0;
                         mbarrier_arrive(work_full_addr + (local_stage) * 8);
                         _phase_work_empty ^= 1;
-                        _phase_work_full_8 ^= 1;
+                        _phase_work_full_7 ^= 1;
                         _phase_work_empty_1 ^= 1;
                         if (relay_valid == 0) {
                             mbarrier_wait(work_empty_addr + (local_stage) * 8, _phase_work_empty_1);
                             _phase_work_empty ^= 1;
-                            _phase_work_full_8 ^= 1;
+                            _phase_work_full_7 ^= 1;
                             _phase_work_empty_1 ^= 1;
                         }
                         asm volatile(

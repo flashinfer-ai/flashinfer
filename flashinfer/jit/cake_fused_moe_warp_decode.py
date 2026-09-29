@@ -411,8 +411,8 @@ def _load_clamped_e256_sources(
     if manifest.get("schema_version") != 1 or manifest.get("target") != "sm_100a":
         raise ValueError("Clamped E256 inventory requires schema 1 and exact sm_100a")
     modules = manifest.get("modules")
-    if not isinstance(modules, list) or len(modules) != 11:
-        raise ValueError("Clamped E256 inventory must contain its 11 selected modules")
+    if not isinstance(modules, list) or len(modules) != 12:
+        raise ValueError("Clamped E256 inventory must contain its 12 selected modules")
     paths: list[Path] = []
     identifiers: set[str] = set()
     for module in modules:

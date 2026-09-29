@@ -3,9 +3,9 @@
   "target": "sm_100a",
   "modules": [
     {
-      "id": "device_00",
-      "file": "device_00.cu",
-      "kernel_symbol": "kernel_dsv4_e256_route_pack",
+      "id": "device_10",
+      "file": "device_10.cu",
+      "kernel_symbol": "kernel_dsv4_sorted_short_route_pack",
       "parameters": [
         {
           "name": "route_experts",
@@ -113,7 +113,7 @@
         "template <int N>\nstruct __align__(128) Dsv4TensorMapPack { Dsv4TensorMap maps[N]; };"
       ],
       "block": [
-        256,
+        64,
         1,
         1
       ],
@@ -122,7 +122,7 @@
         1,
         1
       ],
-      "dynamic_shared_bytes": 6272,
+      "dynamic_shared_bytes": 128,
       "pdl": true,
       "cooperative": false,
       "cluster_scheduling_policy": "spread",
@@ -149,9 +149,9 @@
       }
     },
     {
-      "id": "device_01",
-      "file": "device_01.cu",
-      "kernel_symbol": "kernel_dsv4_flash_moe_5184_fc1_weight_pdl_overlap_sm100",
+      "id": "device_11",
+      "file": "device_11.cu",
+      "kernel_symbol": "kernel_dsv4_fc2_terminal_recycle_oob_v21_sm100",
       "parameters": [
         {
           "name": "A",
@@ -161,11 +161,60 @@
           "host_kind": "tma_buffer"
         },
         {
-          "name": "B",
-          "c_type": "uint8_t* __restrict__",
-          "host_c_type": "uint8_t*",
+          "name": "tmap_b_rows_1",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
           "host_name": "B",
-          "host_kind": "buffer"
+          "host_kind": "tma_buffer"
+        },
+        {
+          "name": "tmap_b_rows_2",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
+          "host_name": "B",
+          "host_kind": "tma_buffer"
+        },
+        {
+          "name": "tmap_b_rows_3",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
+          "host_name": "B",
+          "host_kind": "tma_buffer"
+        },
+        {
+          "name": "tmap_b_rows_4",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
+          "host_name": "B",
+          "host_kind": "tma_buffer"
+        },
+        {
+          "name": "tmap_b_rows_5",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
+          "host_name": "B",
+          "host_kind": "tma_buffer"
+        },
+        {
+          "name": "tmap_b_rows_6",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
+          "host_name": "B",
+          "host_kind": "tma_buffer"
+        },
+        {
+          "name": "tmap_b_rows_7",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
+          "host_name": "B",
+          "host_kind": "tma_buffer"
+        },
+        {
+          "name": "tmap_b_rows_8",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
+          "host_name": "B",
+          "host_kind": "tma_buffer"
         },
         {
           "name": "SFA",
@@ -182,24 +231,24 @@
           "host_kind": "buffer"
         },
         {
-          "name": "C",
+          "name": "C_tma",
           "c_type": "const __grid_constant__ CUtensorMap",
           "host_c_type": "const CUtensorMap",
-          "host_name": "C",
+          "host_name": "C_tma",
           "host_kind": "tma_buffer"
         },
         {
-          "name": "SFC",
-          "c_type": "uint8_t* __restrict__",
-          "host_c_type": "uint8_t*",
-          "host_name": "SFC",
+          "name": "C",
+          "c_type": "__nv_bfloat16* __restrict__",
+          "host_c_type": "__nv_bfloat16*",
+          "host_name": "C",
           "host_kind": "buffer"
         },
         {
-          "name": "route_map",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "route_map",
+          "name": "scale_c",
+          "c_type": "float* __restrict__",
+          "host_c_type": "float*",
+          "host_name": "scale_c",
           "host_kind": "buffer"
         },
         {
@@ -217,59 +266,10 @@
           "host_kind": "buffer"
         },
         {
-          "name": "num_non_exiting_ctas",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "num_non_exiting_ctas",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "work_counter",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "work_counter",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "scale_c",
-          "c_type": "float* __restrict__",
-          "host_c_type": "float*",
-          "host_name": "scale_c",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "scale_gate",
-          "c_type": "float* __restrict__",
-          "host_c_type": "float*",
-          "host_name": "scale_gate",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "clamp_limit",
-          "c_type": "float* __restrict__",
-          "host_c_type": "float*",
-          "host_name": "clamp_limit",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "act_alpha",
-          "c_type": "float* __restrict__",
-          "host_c_type": "float*",
-          "host_name": "act_alpha",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "act_beta",
-          "c_type": "float* __restrict__",
-          "host_c_type": "float*",
-          "host_name": "act_beta",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "M_out",
+          "name": "M",
           "c_type": "int",
           "host_c_type": "int",
-          "host_name": "M_out",
+          "host_name": "M",
           "host_kind": "parameter"
         },
         {
@@ -301,24 +301,17 @@
           "host_kind": "parameter"
         },
         {
-          "name": "SFA_raw",
-          "c_type": "uint8_t* __restrict__",
-          "host_c_type": "uint8_t*",
-          "host_name": "SFA_raw",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "C_raw",
-          "c_type": "uint8_t* __restrict__",
-          "host_c_type": "uint8_t*",
-          "host_name": "C_raw",
+          "name": "total_tiles",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "total_tiles",
           "host_kind": "buffer"
         }
       ],
       "tma_descriptors": {
         "A": {
-          "rank": 4,
-          "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+          "rank": 3,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
           "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
           "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
           "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
@@ -340,36 +333,28 @@
               ],
               [
                 "carrier_stride_0",
-                "d1"
+                "(2 * d1)"
               ],
               [
                 "carrier_stride_1",
-                "128"
-              ],
-              [
-                "carrier_stride_2",
-                "(d2 * d1)"
+                "(d2 * (2 * d1))"
               ]
             ],
             "global_dim": [
-              "(128)",
+              "((2 * d1))",
               "(d2)",
-              "((d1 / 128))",
               "(outer2)"
             ],
             "global_strides": [
-              "((carrier_stride_0 * 8) / 8)",
-              "((carrier_stride_1 * 8) / 8)",
-              "((carrier_stride_2 * 8) / 8)"
+              "((carrier_stride_0 * 4) / 8)",
+              "((carrier_stride_1 * 4) / 8)"
             ],
             "box_dim": [
+              "256",
               "128",
-              "64",
-              "2",
               "1"
             ],
             "elem_strides": [
-              "1",
               "1",
               "1",
               "1"
@@ -378,18 +363,534 @@
               "tensor.ndim() >= 2",
               "tensor.stride(-1) == 1",
               "d1 > 0 and d2 > 0",
-              "d1 % 128 == 0",
-              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0 and global_dim[3] > 0",
-              "128 <= global_dim[0] and 64 <= global_dim[1] and 2 <= global_dim[2] and 1 <= global_dim[3]",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0",
+              "128 <= global_dim[1] and 1 <= global_dim[2]",
               "carrier_stride_0 >= 0",
               "carrier_stride_0 != 0 or global_dim[1] == 1",
-              "(carrier_stride_0 * 8) % 8 == 0",
+              "(carrier_stride_0 * 4) % 8 == 0",
               "carrier_stride_1 >= 0",
               "carrier_stride_1 != 0 or global_dim[2] == 1",
-              "(carrier_stride_1 * 8) % 8 == 0",
-              "carrier_stride_2 >= 0",
-              "carrier_stride_2 != 0 or global_dim[3] == 1",
-              "(carrier_stride_2 * 8) % 8 == 0"
+              "(carrier_stride_1 * 4) % 8 == 0"
+            ]
+          }
+        },
+        "tmap_b_rows_1": {
+          "rank": 3,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "d2",
+                "tensor.size(tensor.ndim() - 2)"
+              ],
+              [
+                "outer2",
+                "tensor.numel() / (d1 * d2)"
+              ],
+              [
+                "carrier_stride_0",
+                "(2 * d1)"
+              ],
+              [
+                "carrier_stride_1",
+                "(d2 * (2 * d1))"
+              ]
+            ],
+            "global_dim": [
+              "((2 * d1))",
+              "(1)",
+              "(outer2)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 4) / 8)",
+              "((carrier_stride_1 * 4) / 8)"
+            ],
+            "box_dim": [
+              "256",
+              "8",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 2",
+              "tensor.stride(-1) == 1",
+              "d1 > 0 and d2 > 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0",
+              "1 <= global_dim[2]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 4) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 4) % 8 == 0"
+            ]
+          }
+        },
+        "tmap_b_rows_2": {
+          "rank": 3,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "d2",
+                "tensor.size(tensor.ndim() - 2)"
+              ],
+              [
+                "outer2",
+                "tensor.numel() / (d1 * d2)"
+              ],
+              [
+                "carrier_stride_0",
+                "(2 * d1)"
+              ],
+              [
+                "carrier_stride_1",
+                "(d2 * (2 * d1))"
+              ]
+            ],
+            "global_dim": [
+              "((2 * d1))",
+              "(2)",
+              "(outer2)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 4) / 8)",
+              "((carrier_stride_1 * 4) / 8)"
+            ],
+            "box_dim": [
+              "256",
+              "8",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 2",
+              "tensor.stride(-1) == 1",
+              "d1 > 0 and d2 > 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0",
+              "1 <= global_dim[2]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 4) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 4) % 8 == 0"
+            ]
+          }
+        },
+        "tmap_b_rows_3": {
+          "rank": 3,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "d2",
+                "tensor.size(tensor.ndim() - 2)"
+              ],
+              [
+                "outer2",
+                "tensor.numel() / (d1 * d2)"
+              ],
+              [
+                "carrier_stride_0",
+                "(2 * d1)"
+              ],
+              [
+                "carrier_stride_1",
+                "(d2 * (2 * d1))"
+              ]
+            ],
+            "global_dim": [
+              "((2 * d1))",
+              "(3)",
+              "(outer2)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 4) / 8)",
+              "((carrier_stride_1 * 4) / 8)"
+            ],
+            "box_dim": [
+              "256",
+              "8",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 2",
+              "tensor.stride(-1) == 1",
+              "d1 > 0 and d2 > 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0",
+              "1 <= global_dim[2]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 4) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 4) % 8 == 0"
+            ]
+          }
+        },
+        "tmap_b_rows_4": {
+          "rank": 3,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "d2",
+                "tensor.size(tensor.ndim() - 2)"
+              ],
+              [
+                "outer2",
+                "tensor.numel() / (d1 * d2)"
+              ],
+              [
+                "carrier_stride_0",
+                "(2 * d1)"
+              ],
+              [
+                "carrier_stride_1",
+                "(d2 * (2 * d1))"
+              ]
+            ],
+            "global_dim": [
+              "((2 * d1))",
+              "(4)",
+              "(outer2)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 4) / 8)",
+              "((carrier_stride_1 * 4) / 8)"
+            ],
+            "box_dim": [
+              "256",
+              "8",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 2",
+              "tensor.stride(-1) == 1",
+              "d1 > 0 and d2 > 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0",
+              "1 <= global_dim[2]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 4) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 4) % 8 == 0"
+            ]
+          }
+        },
+        "tmap_b_rows_5": {
+          "rank": 3,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "d2",
+                "tensor.size(tensor.ndim() - 2)"
+              ],
+              [
+                "outer2",
+                "tensor.numel() / (d1 * d2)"
+              ],
+              [
+                "carrier_stride_0",
+                "(2 * d1)"
+              ],
+              [
+                "carrier_stride_1",
+                "(d2 * (2 * d1))"
+              ]
+            ],
+            "global_dim": [
+              "((2 * d1))",
+              "(5)",
+              "(outer2)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 4) / 8)",
+              "((carrier_stride_1 * 4) / 8)"
+            ],
+            "box_dim": [
+              "256",
+              "8",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 2",
+              "tensor.stride(-1) == 1",
+              "d1 > 0 and d2 > 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0",
+              "1 <= global_dim[2]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 4) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 4) % 8 == 0"
+            ]
+          }
+        },
+        "tmap_b_rows_6": {
+          "rank": 3,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "d2",
+                "tensor.size(tensor.ndim() - 2)"
+              ],
+              [
+                "outer2",
+                "tensor.numel() / (d1 * d2)"
+              ],
+              [
+                "carrier_stride_0",
+                "(2 * d1)"
+              ],
+              [
+                "carrier_stride_1",
+                "(d2 * (2 * d1))"
+              ]
+            ],
+            "global_dim": [
+              "((2 * d1))",
+              "(6)",
+              "(outer2)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 4) / 8)",
+              "((carrier_stride_1 * 4) / 8)"
+            ],
+            "box_dim": [
+              "256",
+              "8",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 2",
+              "tensor.stride(-1) == 1",
+              "d1 > 0 and d2 > 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0",
+              "1 <= global_dim[2]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 4) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 4) % 8 == 0"
+            ]
+          }
+        },
+        "tmap_b_rows_7": {
+          "rank": 3,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "d2",
+                "tensor.size(tensor.ndim() - 2)"
+              ],
+              [
+                "outer2",
+                "tensor.numel() / (d1 * d2)"
+              ],
+              [
+                "carrier_stride_0",
+                "(2 * d1)"
+              ],
+              [
+                "carrier_stride_1",
+                "(d2 * (2 * d1))"
+              ]
+            ],
+            "global_dim": [
+              "((2 * d1))",
+              "(7)",
+              "(outer2)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 4) / 8)",
+              "((carrier_stride_1 * 4) / 8)"
+            ],
+            "box_dim": [
+              "256",
+              "8",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 2",
+              "tensor.stride(-1) == 1",
+              "d1 > 0 and d2 > 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0",
+              "1 <= global_dim[2]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 4) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 4) % 8 == 0"
+            ]
+          }
+        },
+        "tmap_b_rows_8": {
+          "rank": 3,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "d2",
+                "tensor.size(tensor.ndim() - 2)"
+              ],
+              [
+                "outer2",
+                "tensor.numel() / (d1 * d2)"
+              ],
+              [
+                "carrier_stride_0",
+                "(2 * d1)"
+              ],
+              [
+                "carrier_stride_1",
+                "(d2 * (2 * d1))"
+              ]
+            ],
+            "global_dim": [
+              "((2 * d1))",
+              "(8)",
+              "(outer2)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 4) / 8)",
+              "((carrier_stride_1 * 4) / 8)"
+            ],
+            "box_dim": [
+              "256",
+              "8",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 2",
+              "tensor.stride(-1) == 1",
+              "d1 > 0 and d2 > 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0",
+              "1 <= global_dim[2]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 4) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 4) % 8 == 0"
             ]
           }
         },
@@ -475,7 +976,7 @@
               "s3 > 0",
               "s4 > 0",
               "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0 and global_dim[3] > 0",
-              "256 <= global_dim[0] and 2 <= global_dim[1] and 8 <= global_dim[2] and 1 <= global_dim[3]",
+              "256 <= global_dim[0] and 2 <= global_dim[1] and 1 <= global_dim[3]",
               "carrier_stride_0 >= 0",
               "carrier_stride_0 != 0 or global_dim[1] == 1",
               "(carrier_stride_0 * 8) % 8 == 0",
@@ -488,9 +989,9 @@
             ]
           }
         },
-        "C": {
+        "C_tma": {
           "rank": 4,
-          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_BFLOAT16",
           "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
           "swizzle": "CU_TENSOR_MAP_SWIZZLE_NONE",
           "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
@@ -504,7 +1005,7 @@
               ],
               [
                 "s2",
-                "tensor.stride(tensor.ndim() - 2) * 2"
+                "tensor.stride(tensor.ndim() - 2) * 1"
               ],
               [
                 "carrier_stride_0",
@@ -520,18 +1021,18 @@
               ]
             ],
             "global_dim": [
-              "((2 * d1))",
+              "(d1)",
               "(8)",
               "(2147483648)",
               "(2147483648)"
             ],
             "global_strides": [
-              "((carrier_stride_0 * 4) / 8)",
-              "((carrier_stride_1 * 4) / 8)",
-              "((carrier_stride_2 * 4) / 8)"
+              "((carrier_stride_0 * 16) / 8)",
+              "((carrier_stride_1 * 16) / 8)",
+              "((carrier_stride_2 * 16) / 8)"
             ],
             "box_dim": [
-              "32",
+              "64",
               "8",
               "1",
               "1"
@@ -548,16 +1049,16 @@
               "d1 > 0",
               "s2 > 0",
               "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0 and global_dim[3] > 0",
-              "32 <= global_dim[0] and 8 <= global_dim[1] and 1 <= global_dim[2] and 1 <= global_dim[3]",
+              "64 <= global_dim[0] and 8 <= global_dim[1] and 1 <= global_dim[2] and 1 <= global_dim[3]",
               "carrier_stride_0 >= 0",
               "carrier_stride_0 != 0 or global_dim[1] == 1",
-              "(carrier_stride_0 * 4) % 8 == 0",
+              "(carrier_stride_0 * 16) % 8 == 0",
               "carrier_stride_1 >= 0",
               "carrier_stride_1 != 0 or global_dim[2] == 1",
-              "(carrier_stride_1 * 4) % 8 == 0",
+              "(carrier_stride_1 * 16) % 8 == 0",
               "carrier_stride_2 >= 0",
               "carrier_stride_2 != 0 or global_dim[3] == 1",
-              "(carrier_stride_2 * 4) % 8 == 0"
+              "(carrier_stride_2 * 16) % 8 == 0"
             ]
           }
         }
@@ -567,7 +1068,7 @@
         "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };"
       ],
       "block": [
-        384,
+        416,
         1,
         1
       ],
@@ -576,7 +1077,7 @@
         1,
         1
       ],
-      "dynamic_shared_bytes": 64128,
+      "dynamic_shared_bytes": 85120,
       "pdl": true,
       "cooperative": false,
       "cluster_scheduling_policy": "spread",
@@ -1060,342 +1561,9 @@
       }
     },
     {
-      "id": "device_03",
-      "file": "device_03.cu",
-      "kernel_symbol": "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100",
-      "parameters": [
-        {
-          "name": "route_outputs",
-          "c_type": "__nv_bfloat16* __restrict__",
-          "host_c_type": "__nv_bfloat16*",
-          "host_name": "route_outputs",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "route_weights",
-          "c_type": "__nv_bfloat16* __restrict__",
-          "host_c_type": "__nv_bfloat16*",
-          "host_name": "route_weights",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "route_slots",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "route_slots",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "output",
-          "c_type": "__nv_bfloat16* __restrict__",
-          "host_c_type": "__nv_bfloat16*",
-          "host_name": "output",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "num_tokens",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "num_tokens",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "route_stride",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "route_stride",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "M",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "M",
-          "host_kind": "parameter"
-        }
-      ],
-      "tma_descriptors": {},
-      "abi_type_definitions": [
-        "struct __align__(128) Dsv4TensorMap { uint64_t opaque[16]; };",
-        "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };",
-        "template <int N>\nstruct __align__(128) Dsv4TensorMapPack { Dsv4TensorMap maps[N]; };"
-      ],
-      "block": [
-        128,
-        1,
-        1
-      ],
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "dynamic_shared_bytes": 0,
-      "pdl": true,
-      "cooperative": false,
-      "cluster_scheduling_policy": "spread",
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "specializations": [],
-      "tma_abi": "pointer",
-      "tma_workspace_bytes": 0,
-      "preferred_shared_memory_carveout": null,
-      "dynamic_shared_memory_policy": {
-        "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
-        "normal_limit_device_attribute_id": 97,
-        "normal_action": "Set MAX_DYNAMIC_SHARED_SIZE_BYTES; oversized launch flag false",
-        "oversized_condition": "requested dynamic bytes exceed device opt-in maximum",
-        "oversized_supported_by_saved_host": true,
-        "oversized_limit_device_attribute_id": 150,
-        "oversized_function_attribute": "CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE",
-        "oversized_launch_attribute": "CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE",
-        "oversized_mode": "CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY",
-        "oversized_mode_value": 3,
-        "oversized_toolkit_minimum": 13040,
-        "nonportable_cluster_flag_emitted": false
-      }
-    },
-    {
-      "id": "device_04",
-      "file": "device_04.cu",
-      "kernel_symbol": "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100",
-      "parameters": [
-        {
-          "name": "route_outputs",
-          "c_type": "__nv_bfloat16* __restrict__",
-          "host_c_type": "__nv_bfloat16*",
-          "host_name": "route_outputs",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "route_weights",
-          "c_type": "__nv_bfloat16* __restrict__",
-          "host_c_type": "__nv_bfloat16*",
-          "host_name": "route_weights",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "output",
-          "c_type": "__nv_bfloat16* __restrict__",
-          "host_c_type": "__nv_bfloat16*",
-          "host_name": "output",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "num_tokens",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "num_tokens",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "route_stride",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "route_stride",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "M",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "M",
-          "host_kind": "parameter"
-        }
-      ],
-      "tma_descriptors": {},
-      "abi_type_definitions": [
-        "struct __align__(128) Dsv4TensorMap { uint64_t opaque[16]; };",
-        "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };",
-        "template <int N>\nstruct __align__(128) Dsv4TensorMapPack { Dsv4TensorMap maps[N]; };"
-      ],
-      "block": [
-        128,
-        1,
-        1
-      ],
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "dynamic_shared_bytes": 0,
-      "pdl": true,
-      "cooperative": false,
-      "cluster_scheduling_policy": "spread",
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "specializations": [],
-      "tma_abi": "pointer",
-      "tma_workspace_bytes": 0,
-      "preferred_shared_memory_carveout": null,
-      "dynamic_shared_memory_policy": {
-        "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
-        "normal_limit_device_attribute_id": 97,
-        "normal_action": "Set MAX_DYNAMIC_SHARED_SIZE_BYTES; oversized launch flag false",
-        "oversized_condition": "requested dynamic bytes exceed device opt-in maximum",
-        "oversized_supported_by_saved_host": true,
-        "oversized_limit_device_attribute_id": 150,
-        "oversized_function_attribute": "CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE",
-        "oversized_launch_attribute": "CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE",
-        "oversized_mode": "CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY",
-        "oversized_mode_value": 3,
-        "oversized_toolkit_minimum": 13040,
-        "nonportable_cluster_flag_emitted": false
-      }
-    },
-    {
-      "id": "device_05",
-      "file": "device_05.cu",
-      "kernel_symbol": "kernel_e256_route_tile_plan_count_rank_reuse",
-      "parameters": [
-        {
-          "name": "route_experts",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "route_experts",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "route_map",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "route_map",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "tile_expert",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "tile_expert",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "tile_mn_limit",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "tile_mn_limit",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "route_slots",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "route_slots",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "num_non_exiting_ctas",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "num_non_exiting_ctas",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "fc1_work_counter",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "fc1_work_counter",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "fc2_work_counter",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "fc2_work_counter",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "route_count",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "route_count",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "top_k",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "top_k",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "local_expert_offset",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "local_expert_offset",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "num_experts",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "num_experts",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "fc1_initial_work",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "fc1_initial_work",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "fc2_initial_work",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "fc2_initial_work",
-          "host_kind": "parameter"
-        }
-      ],
-      "tma_descriptors": {},
-      "abi_type_definitions": [
-        "struct __align__(128) Dsv4TensorMap { uint64_t opaque[16]; };",
-        "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };",
-        "template <int N>\nstruct __align__(128) Dsv4TensorMapPack { Dsv4TensorMap maps[N]; };"
-      ],
-      "block": [
-        256,
-        1,
-        1
-      ],
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "dynamic_shared_bytes": 6272,
-      "pdl": true,
-      "cooperative": false,
-      "cluster_scheduling_policy": "spread",
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "specializations": [],
-      "tma_abi": "pointer",
-      "tma_workspace_bytes": 0,
-      "preferred_shared_memory_carveout": null,
-      "dynamic_shared_memory_policy": {
-        "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
-        "normal_limit_device_attribute_id": 97,
-        "normal_action": "Set MAX_DYNAMIC_SHARED_SIZE_BYTES; oversized launch flag false",
-        "oversized_condition": "requested dynamic bytes exceed device opt-in maximum",
-        "oversized_supported_by_saved_host": true,
-        "oversized_limit_device_attribute_id": 150,
-        "oversized_function_attribute": "CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE",
-        "oversized_launch_attribute": "CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE",
-        "oversized_mode": "CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY",
-        "oversized_mode_value": 3,
-        "oversized_toolkit_minimum": 13040,
-        "nonportable_cluster_flag_emitted": false
-      }
-    },
-    {
-      "id": "device_06",
-      "file": "device_06.cu",
-      "kernel_symbol": "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready",
+      "id": "device_01",
+      "file": "device_01.cu",
+      "kernel_symbol": "kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100",
       "parameters": [
         {
           "name": "A",
@@ -1543,6 +1711,20 @@
           "host_c_type": "int",
           "host_name": "K_tiles",
           "host_kind": "parameter"
+        },
+        {
+          "name": "SFA_raw",
+          "c_type": "uint8_t* __restrict__",
+          "host_c_type": "uint8_t*",
+          "host_name": "SFA_raw",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "C_raw",
+          "c_type": "uint8_t* __restrict__",
+          "host_c_type": "uint8_t*",
+          "host_name": "C_raw",
+          "host_kind": "buffer"
         }
       ],
       "tma_descriptors": {
@@ -1594,8 +1776,8 @@
             ],
             "box_dim": [
               "128",
-              "128",
-              "1",
+              "64",
+              "2",
               "1"
             ],
             "elem_strides": [
@@ -1610,7 +1792,7 @@
               "d1 > 0 and d2 > 0",
               "d1 % 128 == 0",
               "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0 and global_dim[3] > 0",
-              "128 <= global_dim[0] and 128 <= global_dim[1] and 1 <= global_dim[2] and 1 <= global_dim[3]",
+              "128 <= global_dim[0] and 64 <= global_dim[1] and 2 <= global_dim[2] and 1 <= global_dim[3]",
               "carrier_stride_0 >= 0",
               "carrier_stride_0 != 0 or global_dim[1] == 1",
               "(carrier_stride_0 * 8) % 8 == 0",
@@ -1722,7 +1904,7 @@
           "rank": 4,
           "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
           "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
-          "swizzle": "CU_TENSOR_MAP_SWIZZLE_32B",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_NONE",
           "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
           "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
           "base_offset_bytes": 0,
@@ -1761,7 +1943,7 @@
               "((carrier_stride_2 * 4) / 8)"
             ],
             "box_dim": [
-              "64",
+              "32",
               "8",
               "1",
               "1"
@@ -1778,7 +1960,7 @@
               "d1 > 0",
               "s2 > 0",
               "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0 and global_dim[3] > 0",
-              "64 <= global_dim[0] and 8 <= global_dim[1] and 1 <= global_dim[2] and 1 <= global_dim[3]",
+              "32 <= global_dim[0] and 8 <= global_dim[1] and 1 <= global_dim[2] and 1 <= global_dim[3]",
               "carrier_stride_0 >= 0",
               "carrier_stride_0 != 0 or global_dim[1] == 1",
               "(carrier_stride_0 * 4) % 8 == 0",
@@ -1797,16 +1979,16 @@
         "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };"
       ],
       "block": [
-        512,
+        352,
         1,
         1
       ],
       "cluster": [
-        1,
+        2,
         1,
         1
       ],
-      "dynamic_shared_bytes": 199040,
+      "dynamic_shared_bytes": 64128,
       "pdl": true,
       "cooperative": false,
       "cluster_scheduling_policy": "spread",
@@ -1820,6 +2002,152 @@
         ]
       ],
       "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "preferred_shared_memory_carveout": 100,
+      "dynamic_shared_memory_policy": {
+        "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
+        "normal_limit_device_attribute_id": 97,
+        "normal_action": "Set MAX_DYNAMIC_SHARED_SIZE_BYTES; oversized launch flag false",
+        "oversized_condition": "requested dynamic bytes exceed device opt-in maximum",
+        "oversized_supported_by_saved_host": true,
+        "oversized_limit_device_attribute_id": 150,
+        "oversized_function_attribute": "CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE",
+        "oversized_launch_attribute": "CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE",
+        "oversized_mode": "CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY",
+        "oversized_mode_value": 3,
+        "oversized_toolkit_minimum": 13040,
+        "nonportable_cluster_flag_emitted": false
+      }
+    },
+    {
+      "id": "device_00",
+      "file": "device_00.cu",
+      "kernel_symbol": "kernel_dsv4_e256_route_pack",
+      "parameters": [
+        {
+          "name": "route_experts",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "route_experts",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "route_map",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "route_map",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "tile_expert",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "tile_expert",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "tile_mn_limit",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "tile_mn_limit",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "route_slots",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "route_slots",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "num_non_exiting_ctas",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "num_non_exiting_ctas",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "fc1_work_counter",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "fc1_work_counter",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "fc2_work_counter",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "fc2_work_counter",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "route_count",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "route_count",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "top_k",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "top_k",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "local_expert_offset",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "local_expert_offset",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "num_experts",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "num_experts",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "fc1_initial_work",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "fc1_initial_work",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "fc2_initial_work",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "fc2_initial_work",
+          "host_kind": "parameter"
+        }
+      ],
+      "tma_descriptors": {},
+      "abi_type_definitions": [
+        "struct __align__(128) Dsv4TensorMap { uint64_t opaque[16]; };",
+        "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };",
+        "template <int N>\nstruct __align__(128) Dsv4TensorMapPack { Dsv4TensorMap maps[N]; };"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_shared_bytes": 6272,
+      "pdl": true,
+      "cooperative": false,
+      "cluster_scheduling_policy": "spread",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "specializations": [],
+      "tma_abi": "pointer",
       "tma_workspace_bytes": 0,
       "preferred_shared_memory_carveout": null,
       "dynamic_shared_memory_policy": {
@@ -2366,6 +2694,784 @@
       }
     },
     {
+      "id": "device_06",
+      "file": "device_06.cu",
+      "kernel_symbol": "kernel_trtllm_moe_bmm_tile_n8_fc1_persistent_nvfp4_mma_u2_ready",
+      "parameters": [
+        {
+          "name": "A",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
+          "host_name": "A",
+          "host_kind": "tma_buffer"
+        },
+        {
+          "name": "B",
+          "c_type": "uint8_t* __restrict__",
+          "host_c_type": "uint8_t*",
+          "host_name": "B",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "SFA",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
+          "host_name": "SFA",
+          "host_kind": "tma_buffer"
+        },
+        {
+          "name": "SFB",
+          "c_type": "uint8_t* __restrict__",
+          "host_c_type": "uint8_t*",
+          "host_name": "SFB",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "C",
+          "c_type": "const __grid_constant__ CUtensorMap",
+          "host_c_type": "const CUtensorMap",
+          "host_name": "C",
+          "host_kind": "tma_buffer"
+        },
+        {
+          "name": "SFC",
+          "c_type": "uint8_t* __restrict__",
+          "host_c_type": "uint8_t*",
+          "host_name": "SFC",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "route_map",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "route_map",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "tile_expert",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "tile_expert",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "tile_mn_limit",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "tile_mn_limit",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "num_non_exiting_ctas",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "num_non_exiting_ctas",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "work_counter",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "work_counter",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "scale_c",
+          "c_type": "float* __restrict__",
+          "host_c_type": "float*",
+          "host_name": "scale_c",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "scale_gate",
+          "c_type": "float* __restrict__",
+          "host_c_type": "float*",
+          "host_name": "scale_gate",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "clamp_limit",
+          "c_type": "float* __restrict__",
+          "host_c_type": "float*",
+          "host_name": "clamp_limit",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "act_alpha",
+          "c_type": "float* __restrict__",
+          "host_c_type": "float*",
+          "host_name": "act_alpha",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "act_beta",
+          "c_type": "float* __restrict__",
+          "host_c_type": "float*",
+          "host_name": "act_beta",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "M_out",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "M_out",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "K",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "K",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "grid_m",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "grid_m",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "grid_n",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "grid_n",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "K_tiles",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "K_tiles",
+          "host_kind": "parameter"
+        }
+      ],
+      "tma_descriptors": {
+        "A": {
+          "rank": 4,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_128B",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "d2",
+                "tensor.size(tensor.ndim() - 2)"
+              ],
+              [
+                "outer2",
+                "tensor.numel() / (d1 * d2)"
+              ],
+              [
+                "carrier_stride_0",
+                "d1"
+              ],
+              [
+                "carrier_stride_1",
+                "128"
+              ],
+              [
+                "carrier_stride_2",
+                "(d2 * d1)"
+              ]
+            ],
+            "global_dim": [
+              "(128)",
+              "(d2)",
+              "((d1 / 128))",
+              "(outer2)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 8) / 8)",
+              "((carrier_stride_1 * 8) / 8)",
+              "((carrier_stride_2 * 8) / 8)"
+            ],
+            "box_dim": [
+              "128",
+              "128",
+              "1",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 2",
+              "tensor.stride(-1) == 1",
+              "d1 > 0 and d2 > 0",
+              "d1 % 128 == 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0 and global_dim[3] > 0",
+              "128 <= global_dim[0] and 128 <= global_dim[1] and 1 <= global_dim[2] and 1 <= global_dim[3]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 8) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 8) % 8 == 0",
+              "carrier_stride_2 >= 0",
+              "carrier_stride_2 != 0 or global_dim[3] == 1",
+              "(carrier_stride_2 * 8) % 8 == 0"
+            ]
+          }
+        },
+        "SFA": {
+          "rank": 4,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_UINT8",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_NONE",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "d2",
+                "tensor.size(tensor.ndim() - 2)"
+              ],
+              [
+                "d3",
+                "tensor.size(tensor.ndim() - 3)"
+              ],
+              [
+                "d4",
+                "tensor.size(tensor.ndim() - 4)"
+              ],
+              [
+                "s2",
+                "tensor.stride(tensor.ndim() - 2) * 1"
+              ],
+              [
+                "s3",
+                "tensor.stride(tensor.ndim() - 3) * 1"
+              ],
+              [
+                "s4",
+                "tensor.stride(tensor.ndim() - 4) * 1"
+              ],
+              [
+                "carrier_stride_0",
+                "s2"
+              ],
+              [
+                "carrier_stride_1",
+                "s3"
+              ],
+              [
+                "carrier_stride_2",
+                "s4"
+              ]
+            ],
+            "global_dim": [
+              "(d1)",
+              "(d2)",
+              "(d3)",
+              "(d4)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 8) / 8)",
+              "((carrier_stride_1 * 8) / 8)",
+              "((carrier_stride_2 * 8) / 8)"
+            ],
+            "box_dim": [
+              "256",
+              "2",
+              "8",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 4",
+              "tensor.stride(-1) == 1",
+              "d1 > 0 and d2 > 0 and d3 > 0 and d4 > 0",
+              "s2 > 0",
+              "s3 > 0",
+              "s4 > 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0 and global_dim[3] > 0",
+              "256 <= global_dim[0] and 2 <= global_dim[1] and 8 <= global_dim[2] and 1 <= global_dim[3]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 8) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 8) % 8 == 0",
+              "carrier_stride_2 >= 0",
+              "carrier_stride_2 != 0 or global_dim[3] == 1",
+              "(carrier_stride_2 * 8) % 8 == 0"
+            ]
+          }
+        },
+        "C": {
+          "rank": 4,
+          "data_type": "CU_TENSOR_MAP_DATA_TYPE_16U4_ALIGN8B",
+          "interleave": "CU_TENSOR_MAP_INTERLEAVE_NONE",
+          "swizzle": "CU_TENSOR_MAP_SWIZZLE_32B",
+          "l2_promotion": "CU_TENSOR_MAP_L2_PROMOTION_NONE",
+          "oob_fill": "CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE",
+          "base_offset_bytes": 0,
+          "expressions": {
+            "assignments": [
+              [
+                "d1",
+                "tensor.size(tensor.ndim() - 1)"
+              ],
+              [
+                "s2",
+                "tensor.stride(tensor.ndim() - 2) * 2"
+              ],
+              [
+                "carrier_stride_0",
+                "s2"
+              ],
+              [
+                "carrier_stride_1",
+                "(34359738368 - s2)"
+              ],
+              [
+                "carrier_stride_2",
+                "s2"
+              ]
+            ],
+            "global_dim": [
+              "((2 * d1))",
+              "(8)",
+              "(2147483648)",
+              "(2147483648)"
+            ],
+            "global_strides": [
+              "((carrier_stride_0 * 4) / 8)",
+              "((carrier_stride_1 * 4) / 8)",
+              "((carrier_stride_2 * 4) / 8)"
+            ],
+            "box_dim": [
+              "64",
+              "8",
+              "1",
+              "1"
+            ],
+            "elem_strides": [
+              "1",
+              "1",
+              "1",
+              "1"
+            ],
+            "checks": [
+              "tensor.ndim() >= 2",
+              "tensor.stride(-1) == 1",
+              "d1 > 0",
+              "s2 > 0",
+              "global_dim[0] > 0 and global_dim[1] > 0 and global_dim[2] > 0 and global_dim[3] > 0",
+              "64 <= global_dim[0] and 8 <= global_dim[1] and 1 <= global_dim[2] and 1 <= global_dim[3]",
+              "carrier_stride_0 >= 0",
+              "carrier_stride_0 != 0 or global_dim[1] == 1",
+              "(carrier_stride_0 * 4) % 8 == 0",
+              "carrier_stride_1 >= 0",
+              "carrier_stride_1 != 0 or global_dim[2] == 1",
+              "(carrier_stride_1 * 4) % 8 == 0",
+              "carrier_stride_2 >= 0",
+              "carrier_stride_2 != 0 or global_dim[3] == 1",
+              "(carrier_stride_2 * 4) % 8 == 0"
+            ]
+          }
+        }
+      },
+      "abi_type_definitions": [
+        "struct __align__(128) Dsv4TensorMap { uint64_t opaque[16]; };",
+        "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };"
+      ],
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_shared_bytes": 199040,
+      "pdl": true,
+      "cooperative": false,
+      "cluster_scheduling_policy": "spread",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "specializations": [
+        [
+          "WEIGHTS_SHUFFLED",
+          1
+        ]
+      ],
+      "tma_abi": "grid_constant",
+      "tma_workspace_bytes": 0,
+      "preferred_shared_memory_carveout": null,
+      "dynamic_shared_memory_policy": {
+        "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
+        "normal_limit_device_attribute_id": 97,
+        "normal_action": "Set MAX_DYNAMIC_SHARED_SIZE_BYTES; oversized launch flag false",
+        "oversized_condition": "requested dynamic bytes exceed device opt-in maximum",
+        "oversized_supported_by_saved_host": true,
+        "oversized_limit_device_attribute_id": 150,
+        "oversized_function_attribute": "CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE",
+        "oversized_launch_attribute": "CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE",
+        "oversized_mode": "CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY",
+        "oversized_mode_value": 3,
+        "oversized_toolkit_minimum": 13040,
+        "nonportable_cluster_flag_emitted": false
+      }
+    },
+    {
+      "id": "device_04",
+      "file": "device_04.cu",
+      "kernel_symbol": "kernel_dsv4_flash_moe_5184_direct_finalize_weight_preload_sm100",
+      "parameters": [
+        {
+          "name": "route_outputs",
+          "c_type": "__nv_bfloat16* __restrict__",
+          "host_c_type": "__nv_bfloat16*",
+          "host_name": "route_outputs",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "route_weights",
+          "c_type": "__nv_bfloat16* __restrict__",
+          "host_c_type": "__nv_bfloat16*",
+          "host_name": "route_weights",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "output",
+          "c_type": "__nv_bfloat16* __restrict__",
+          "host_c_type": "__nv_bfloat16*",
+          "host_name": "output",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "num_tokens",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "num_tokens",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "route_stride",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "route_stride",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "M",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "M",
+          "host_kind": "parameter"
+        }
+      ],
+      "tma_descriptors": {},
+      "abi_type_definitions": [
+        "struct __align__(128) Dsv4TensorMap { uint64_t opaque[16]; };",
+        "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };",
+        "template <int N>\nstruct __align__(128) Dsv4TensorMapPack { Dsv4TensorMap maps[N]; };"
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_shared_bytes": 0,
+      "pdl": true,
+      "cooperative": false,
+      "cluster_scheduling_policy": "spread",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "specializations": [],
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 0,
+      "preferred_shared_memory_carveout": null,
+      "dynamic_shared_memory_policy": {
+        "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
+        "normal_limit_device_attribute_id": 97,
+        "normal_action": "Set MAX_DYNAMIC_SHARED_SIZE_BYTES; oversized launch flag false",
+        "oversized_condition": "requested dynamic bytes exceed device opt-in maximum",
+        "oversized_supported_by_saved_host": true,
+        "oversized_limit_device_attribute_id": 150,
+        "oversized_function_attribute": "CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE",
+        "oversized_launch_attribute": "CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE",
+        "oversized_mode": "CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY",
+        "oversized_mode_value": 3,
+        "oversized_toolkit_minimum": 13040,
+        "nonportable_cluster_flag_emitted": false
+      }
+    },
+    {
+      "id": "device_05",
+      "file": "device_05.cu",
+      "kernel_symbol": "kernel_e256_route_tile_plan_count_rank_reuse_early_pdl",
+      "parameters": [
+        {
+          "name": "route_experts",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "route_experts",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "route_map",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "route_map",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "tile_expert",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "tile_expert",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "tile_mn_limit",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "tile_mn_limit",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "route_slots",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "route_slots",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "num_non_exiting_ctas",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "num_non_exiting_ctas",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "fc1_work_counter",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "fc1_work_counter",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "fc2_work_counter",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "fc2_work_counter",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "route_count",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "route_count",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "top_k",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "top_k",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "local_expert_offset",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "local_expert_offset",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "num_experts",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "num_experts",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "fc1_initial_work",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "fc1_initial_work",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "fc2_initial_work",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "fc2_initial_work",
+          "host_kind": "parameter"
+        }
+      ],
+      "tma_descriptors": {},
+      "abi_type_definitions": [
+        "struct __align__(128) Dsv4TensorMap { uint64_t opaque[16]; };",
+        "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };",
+        "template <int N>\nstruct __align__(128) Dsv4TensorMapPack { Dsv4TensorMap maps[N]; };"
+      ],
+      "block": [
+        256,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_shared_bytes": 6272,
+      "pdl": true,
+      "cooperative": false,
+      "cluster_scheduling_policy": "spread",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "specializations": [],
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 0,
+      "preferred_shared_memory_carveout": null,
+      "dynamic_shared_memory_policy": {
+        "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
+        "normal_limit_device_attribute_id": 97,
+        "normal_action": "Set MAX_DYNAMIC_SHARED_SIZE_BYTES; oversized launch flag false",
+        "oversized_condition": "requested dynamic bytes exceed device opt-in maximum",
+        "oversized_supported_by_saved_host": true,
+        "oversized_limit_device_attribute_id": 150,
+        "oversized_function_attribute": "CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE",
+        "oversized_launch_attribute": "CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE",
+        "oversized_mode": "CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY",
+        "oversized_mode_value": 3,
+        "oversized_toolkit_minimum": 13040,
+        "nonportable_cluster_flag_emitted": false
+      }
+    },
+    {
+      "id": "device_03",
+      "file": "device_03.cu",
+      "kernel_symbol": "kernel_dsv4_flash_moe_5184_finalize_weight_preload_sm100",
+      "parameters": [
+        {
+          "name": "route_outputs",
+          "c_type": "__nv_bfloat16* __restrict__",
+          "host_c_type": "__nv_bfloat16*",
+          "host_name": "route_outputs",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "route_weights",
+          "c_type": "__nv_bfloat16* __restrict__",
+          "host_c_type": "__nv_bfloat16*",
+          "host_name": "route_weights",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "route_slots",
+          "c_type": "int* __restrict__",
+          "host_c_type": "int*",
+          "host_name": "route_slots",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "output",
+          "c_type": "__nv_bfloat16* __restrict__",
+          "host_c_type": "__nv_bfloat16*",
+          "host_name": "output",
+          "host_kind": "buffer"
+        },
+        {
+          "name": "num_tokens",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "num_tokens",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "route_stride",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "route_stride",
+          "host_kind": "parameter"
+        },
+        {
+          "name": "M",
+          "c_type": "int",
+          "host_c_type": "int",
+          "host_name": "M",
+          "host_kind": "parameter"
+        }
+      ],
+      "tma_descriptors": {},
+      "abi_type_definitions": [
+        "struct __align__(128) Dsv4TensorMap { uint64_t opaque[16]; };",
+        "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };",
+        "template <int N>\nstruct __align__(128) Dsv4TensorMapPack { Dsv4TensorMap maps[N]; };"
+      ],
+      "block": [
+        128,
+        1,
+        1
+      ],
+      "cluster": [
+        1,
+        1,
+        1
+      ],
+      "dynamic_shared_bytes": 0,
+      "pdl": true,
+      "cooperative": false,
+      "cluster_scheduling_policy": "spread",
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "specializations": [],
+      "tma_abi": "pointer",
+      "tma_workspace_bytes": 0,
+      "preferred_shared_memory_carveout": null,
+      "dynamic_shared_memory_policy": {
+        "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
+        "normal_limit_device_attribute_id": 97,
+        "normal_action": "Set MAX_DYNAMIC_SHARED_SIZE_BYTES; oversized launch flag false",
+        "oversized_condition": "requested dynamic bytes exceed device opt-in maximum",
+        "oversized_supported_by_saved_host": true,
+        "oversized_limit_device_attribute_id": 150,
+        "oversized_function_attribute": "CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE",
+        "oversized_launch_attribute": "CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE",
+        "oversized_mode": "CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY",
+        "oversized_mode_value": 3,
+        "oversized_toolkit_minimum": 13040,
+        "nonportable_cluster_flag_emitted": false
+      }
+    },
+    {
       "id": "device_08",
       "file": "device_08.cu",
       "kernel_symbol": "kernel_dsv4_t7_direct_route_order",
@@ -2437,7 +3543,7 @@
     {
       "id": "device_09",
       "file": "device_09.cu",
-      "kernel_symbol": "kernel_dsv4_flash_moe_5184_packed_fc2_stg_v15_probe_sm100",
+      "kernel_symbol": "kernel_dsv4_fc2_terminal_recycle_v21_sm100",
       "parameters": [
         {
           "name": "A",
@@ -2889,155 +3995,9 @@
         "oversized_toolkit_minimum": 13040,
         "nonportable_cluster_flag_emitted": false
       }
-    },
-    {
-      "id": "device_10",
-      "file": "device_10.cu",
-      "kernel_symbol": "kernel_dsv4_sorted_short_route_pack",
-      "parameters": [
-        {
-          "name": "route_experts",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "route_experts",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "route_map",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "route_map",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "tile_expert",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "tile_expert",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "tile_mn_limit",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "tile_mn_limit",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "route_slots",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "route_slots",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "num_non_exiting_ctas",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "num_non_exiting_ctas",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "fc1_work_counter",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "fc1_work_counter",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "fc2_work_counter",
-          "c_type": "int* __restrict__",
-          "host_c_type": "int*",
-          "host_name": "fc2_work_counter",
-          "host_kind": "buffer"
-        },
-        {
-          "name": "route_count",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "route_count",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "top_k",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "top_k",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "local_expert_offset",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "local_expert_offset",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "num_experts",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "num_experts",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "fc1_initial_work",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "fc1_initial_work",
-          "host_kind": "parameter"
-        },
-        {
-          "name": "fc2_initial_work",
-          "c_type": "int",
-          "host_c_type": "int",
-          "host_name": "fc2_initial_work",
-          "host_kind": "parameter"
-        }
-      ],
-      "tma_descriptors": {},
-      "abi_type_definitions": [
-        "struct __align__(128) Dsv4TensorMap { uint64_t opaque[16]; };",
-        "struct __align__(64) Dsv4TensorMap64 { uint64_t opaque[16]; };",
-        "template <int N>\nstruct __align__(128) Dsv4TensorMapPack { Dsv4TensorMap maps[N]; };"
-      ],
-      "block": [
-        64,
-        1,
-        1
-      ],
-      "cluster": [
-        1,
-        1,
-        1
-      ],
-      "dynamic_shared_bytes": 128,
-      "pdl": true,
-      "cooperative": false,
-      "cluster_scheduling_policy": "spread",
-      "compile_options": [
-        "--use_fast_math"
-      ],
-      "specializations": [],
-      "tma_abi": "pointer",
-      "tma_workspace_bytes": 0,
-      "preferred_shared_memory_carveout": null,
-      "dynamic_shared_memory_policy": {
-        "normal_limit_device_attribute": "CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN",
-        "normal_limit_device_attribute_id": 97,
-        "normal_action": "Set MAX_DYNAMIC_SHARED_SIZE_BYTES; oversized launch flag false",
-        "oversized_condition": "requested dynamic bytes exceed device opt-in maximum",
-        "oversized_supported_by_saved_host": true,
-        "oversized_limit_device_attribute_id": 150,
-        "oversized_function_attribute": "CU_FUNC_ATTRIBUTE_SHARED_MEMORY_MODE",
-        "oversized_launch_attribute": "CU_LAUNCH_ATTRIBUTE_SHARED_MEMORY_MODE",
-        "oversized_mode": "CU_SHARED_MEMORY_MODE_ALLOW_OVERSIZED_SHARED_MEMORY",
-        "oversized_mode_value": 3,
-        "oversized_toolkit_minimum": 13040,
-        "nonportable_cluster_flag_emitted": false
-      }
     }
   ],
   "source_mode": "source_recompilation_required",
-  "kernel_symbols_unchanged": true,
+  "kernel_symbols_unchanged": false,
   "public_reference": "https://github.com/flashinfer-ai/flashinfer/issues/5184"
 }

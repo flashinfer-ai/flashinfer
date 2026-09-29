@@ -56,7 +56,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 extern "C" {
 
 __global__ __launch_bounds__(256) void
-kernel_e256_route_tile_plan_count_rank_reuse(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work)
+kernel_e256_route_tile_plan_count_rank_reuse_early_pdl(int* __restrict__ route_experts, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ route_slots, int* __restrict__ num_non_exiting_ctas, int* __restrict__ fc1_work_counter, int* __restrict__ fc2_work_counter, int route_count, int top_k, int local_expert_offset, int num_experts, int fc1_initial_work, int fc2_initial_work)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -79,6 +79,7 @@ kernel_e256_route_tile_plan_count_rank_reuse(int* __restrict__ route_experts, in
     const int scan_values_addr = smem + 6160;
 
     // === Task calls (dependency order) ===
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     int expert = tid;
     if (expert < num_experts) {
         expert_counts[expert] = 0;
@@ -139,44 +140,39 @@ kernel_e256_route_tile_plan_count_rank_reuse(int* __restrict__ route_experts, in
         scan_values[warp] = first_inclusive;
     }
     __syncthreads();
-    if (warp == 0) {
-        int chunk_prefix = 0;
-        if (lane < 8) {
-            chunk_prefix = scan_values[lane];
-        }
-        int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 1, 32);
-        int chunk_peer = _shfl_up_5;
-        if (lane >= 1) {
-            chunk_prefix = chunk_prefix + chunk_peer;
-        }
-        int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 2, 32);
-        int chunk_peer_0 = _shfl_up_6;
-        if (lane >= 2) {
-            chunk_prefix = chunk_prefix + chunk_peer_0;
-        }
-        int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 4, 32);
-        int chunk_peer_1 = _shfl_up_7;
-        if (lane >= 4) {
-            chunk_prefix = chunk_prefix + chunk_peer_1;
-        }
-        if (lane < 8) {
-            scan_values[lane] = chunk_prefix;
-        }
+    int chunk_prefix = 0;
+    if (lane < 8) {
+        chunk_prefix = scan_values[lane];
     }
-    __syncthreads();
-    int first_chunk_base = 0;
-    if (warp > 0) {
-        first_chunk_base = scan_values[warp - 1];
+    int _shfl_up_5 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 1, 32);
+    int chunk_peer = _shfl_up_5;
+    if (lane >= 1) {
+        chunk_prefix = chunk_prefix + chunk_peer;
+    }
+    int _shfl_up_6 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 2, 32);
+    int chunk_peer_4 = _shfl_up_6;
+    if (lane >= 2) {
+        chunk_prefix = chunk_prefix + chunk_peer_4;
+    }
+    int _shfl_up_7 = __shfl_up_sync(0xFFFFFFFF, chunk_prefix, 4, 32);
+    int chunk_peer_5 = _shfl_up_7;
+    if (lane >= 4) {
+        chunk_prefix = chunk_prefix + chunk_peer_5;
+    }
+    int _shfl_0 = __shfl_sync(0xFFFFFFFF, chunk_prefix, (warp + 7) % 8);
+    int first_chunk_base = _shfl_0;
+    if (warp == 0) {
+        first_chunk_base = 0;
     }
     if (first_expert < num_experts) {
         expert_tile_offsets[first_expert] = first_chunk_base + first_inclusive - first_tiles;
     }
-    int total_tiles = scan_values[7];
+    int _shfl_1 = __shfl_sync(0xFFFFFFFF, chunk_prefix, 7);
+    int total_tiles = _shfl_1;
     if (tid == 0) {
         num_non_exiting_ctas[0] = total_tiles;
         expert_tile_offsets[num_experts] = total_tiles;
     }
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
     __syncthreads();
     if (route_valid != 0) {
         int tile = expert_tile_offsets[route_expert] + count_rank / TILE_N;
