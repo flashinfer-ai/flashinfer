@@ -188,6 +188,7 @@ def test_gen_attention_aot_matrix_contains_equal_primaries_only(generated_source
             use_logits_soft_cap_=[False],
             has_sm90=False,
             has_sm100=False,
+            has_sm103=False,
             add_gemma=False,
             add_oai_oss=False,
         )
