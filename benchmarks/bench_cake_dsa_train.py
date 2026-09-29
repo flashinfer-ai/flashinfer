@@ -506,7 +506,10 @@ def main():
     unknown = sorted(set(args.arms) - set(ARMS))
     if unknown:
         parser.error(f"unknown arms {unknown}; choose from {sorted(ARMS)}")
-    torch.cuda.set_device(torch.device(args.device))
+    device = torch.device(args.device)
+    if device.index is None:  # torch >= 2.13 requires an index here
+        device = torch.device("cuda", torch.cuda.current_device())
+    torch.cuda.set_device(device)
     results = dict(
         device=torch.cuda.get_device_name(),
         capability=list(torch.cuda.get_device_capability()),

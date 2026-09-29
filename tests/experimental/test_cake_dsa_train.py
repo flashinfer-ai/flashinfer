@@ -604,7 +604,7 @@ def test_binding_cache_forward_hits_are_bitwise_and_pin_nothing():
         for a, b, c in zip(first, second, fresh, strict=True):
             assert torch.equal(a, b) and torch.equal(b, c)
         assert second[0].data_ptr() != first[0].data_ptr()  # outputs are fresh allocations
-        binding = cache.lookup(forward_binding_key(*args, None, scale))
+        binding = cache.peek(forward_binding_key(*args, None, scale))
         assert binding is not None and binding.holds_no_tensor()
         assert set(binding.owned) <= {"topk_length", "tma_descriptor_workspace"}
         # caller-provided lengths: another binding (misses once), then hits
@@ -625,7 +625,7 @@ def test_binding_cache_forward_hits_are_bitwise_and_pin_nothing():
         assert cache.hits == hits0 + 3
         for a, b, r in zip(p1, p2, first, strict=True):
             assert torch.equal(a, b) and torch.equal(a, r)
-        packed = cache.lookup(forward_binding_key(*pv, None, scale))
+        packed = cache.peek(forward_binding_key(*pv, None, scale))
         kv2 = torch.cat([kv, kv], dim=0)  # another packed buffer bound to the same plan
         values = packed.rebind_values(dict(k_rope=kv2[:, D_LATENT:], indices=inp.idx_global))
         assert values["k_rope_offset"] == kv2[:, D_LATENT:].storage_offset() == D_LATENT
@@ -668,7 +668,7 @@ def test_binding_cache_backward_hits_are_bitwise_and_fresh():
             assert torch.equal(x, y) and torch.equal(y, z)
         assert max(rel_l2(a[2], b[2]), rel_l2(b[2], c[2]), rel_l2(a[3], b[3]), rel_l2(b[3], c[3])) < 1e-2
         assert len({t.data_ptr() for t in (a[2], b[2], c[2])}) == 3  # fresh outputs, not the cached accumulators
-        binding = cache.lookup(backward_binding_key(*args, None, default_softmax_scale(), False))
+        binding = cache.peek(backward_binding_key(*args, None, default_softmax_scale(), False))
         assert binding.holds_no_tensor() and "delta" in binding.owned and "dkv_latent_acc" in binding.owned
         # the FP32 accumulators of dkv_fp32=True are outputs: fresh per call, never aliased between calls
         f1 = cake_backend.backward(*args, dkv_fp32=True)
@@ -679,7 +679,7 @@ def test_binding_cache_backward_hits_are_bitwise_and_fresh():
         snapshot = f2[2].clone()
         f1[2].fill_(7.0)
         assert torch.equal(f2[2], snapshot) and rel_l2(snapshot, a[2].float()) < 1e-2
-        fp32_binding = cache.lookup(backward_binding_key(*args, None, default_softmax_scale(), True))
+        fp32_binding = cache.peek(backward_binding_key(*args, None, default_softmax_scale(), True))
         assert fp32_binding is not binding and "dkv_latent_acc" not in fp32_binding.owned
         # the autograd path: the forward of a repeated step hits; its backward hits when the allocator hands
         # the freed forward outputs back at the same addresses (informational: the key is the binding)

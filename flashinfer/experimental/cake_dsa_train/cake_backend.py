@@ -1122,12 +1122,17 @@ class BindingCache:
         self._bindings.clear()
 
     def lookup(self, key: tuple) -> Optional[_Binding]:
+        """The binding remembered for ``key`` (counts a hit or a miss)."""
         binding = self._bindings.get(key)
         if binding is None:
             self.misses += 1
         else:
             self.hits += 1
         return binding
+
+    def peek(self, key: tuple) -> Optional[_Binding]:
+        """The binding remembered for ``key`` without touching the counters (inspection)."""
+        return self._bindings.get(key)
 
     def remember(self, key: tuple, binding: _Binding) -> _Binding:
         self._bindings.pop(key, None)

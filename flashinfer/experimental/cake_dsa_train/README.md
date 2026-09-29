@@ -42,7 +42,13 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
 
 Explicit forward / backward entry points without autograd, a prepared
 allocation-free runner (`prepare_dsa_train`, CUDA-graph capturable) and the
-workspace sizing helper live in `cake_backend.py`.
+workspace sizing helper live in `cake_backend.py`.  The eager entry points
+(and the autograd wrapper behind the public API) validate and bind once per
+input binding -- `(data_ptr, shape, stride, dtype)` of every input plus the
+scale -- and launch later calls from the remembered argument plans with
+freshly allocated outputs (`cake_backend.BINDING_CACHE`: no caller tensor
+pinned, workspace scratch owned per binding under a FIFO capacity and a byte
+budget; `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0` disables it).
 
 ## Layout of this package
 
