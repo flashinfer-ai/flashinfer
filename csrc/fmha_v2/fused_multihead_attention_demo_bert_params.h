@@ -156,6 +156,12 @@ struct Fused_multihead_attention_params_v2 {
   uint32_t num_tiles;
   uint32_t num_tiles_per_head;
   bool use_balanced_scheduling;
+  // If all Q sequence lengths in the batch are equal, enables O(1) tile-id decode.
+  bool is_uniform_q = false;
+  // Under balanced scheduling, emit the heaviest q tile of EVERY batch/head before any
+  // lighter one (globally reverse-Q, head-fastest). Set by host only when entire KV fits in L2,
+  // because this order interleaves many heads' KV streams across concurrent CTAs.
+  bool use_head_first_scheduling = false;
 
   // is input/output padded
   bool is_s_padded = false;

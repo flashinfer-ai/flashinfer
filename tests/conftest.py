@@ -1,16 +1,45 @@
 import json
 import os
+import traceback
 import types
 from pathlib import Path
 from typing import Any, Dict, Set
+
+
+def _configure_cute_dsl_cache_dir():
+    if "CUTE_DSL_CACHE_DIR" not in os.environ:
+        workspace_base = Path(
+            os.environ.get("FLASHINFER_WORKSPACE_BASE", Path.home().as_posix())
+        ).expanduser()
+        os.environ["CUTE_DSL_CACHE_DIR"] = str(
+            workspace_base / ".cache" / "flashinfer" / "cute_dsl"
+        )
+
+
+_configure_cute_dsl_cache_dir()
 
 import pytest
 import torch
 from torch.torch_version import TorchVersion
 from torch.torch_version import __version__ as torch_version
 
+
+def _patch_cutlass_dsl_operand_major_mode():
+    try:
+        import cutlass.cute as cute
+        from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
+    except ImportError:
+        return
+    if not hasattr(cute.nvgpu, "OperandMajorMode"):
+        cute.nvgpu.OperandMajorMode = OperandMajorMode
+
+
+_patch_cutlass_dsl_operand_major_mode()
+
 import flashinfer
 from flashinfer.jit import MissingJITCacheError
+
+pytest_plugins = ["tests.test_helpers.parametrize"]
 
 # Global tracking for JIT cache coverage
 # Store tuples of (test_name, module_name, spec_info)
@@ -143,20 +172,39 @@ def pytest_configure(config):
         for fn in TORCH_COMPILE_FNS:
             _monkeypatch_add_torch_compile(fn)
     # moe_ep markers (Part B of the EP API design integration).
-    config.addinivalue_line("markers", "nvep: requires BUILD_NVEP=1 install")
+    config.addinivalue_line(
+        "markers", "nvep: requires a moe_ep-enabled install (default)"
+    )
+    config.addinivalue_line("markers", "gpu: requires at least one CUDA GPU")
     config.addinivalue_line("markers", "gpu_2: requires >=2 GPUs")
     config.addinivalue_line("markers", "gpu_4: requires >=4 GPUs")
     config.addinivalue_line("markers", "gpu_8: requires >=8 GPUs")
     config.addinivalue_line("markers", "arch_blackwell: requires sm_100 or sm_103")
+    config.addinivalue_line("markers", "arch_hopper: requires sm_90 (Hopper)")
+    config.addinivalue_line("markers", "arch_rubin: requires sm_107 (Rubin)")
+    config.addinivalue_line(
+        "markers", "arch_sm120: requires sm_120/sm_121 (Blackwell-consumer)"
+    )
+    config.addinivalue_line(
+        "markers",
+        "long_running: front-load this test file at the start of the parallel CI queue",
+    )
+    config.addinivalue_line(
+        "markers", "solo: run this whole test file alone (memory-heavy)"
+    )
+    config.addinivalue_line(
+        "markers",
+        "shard_group(name): keep marked nodes from one source in one pytest batch",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
     """Skip moe_ep tests on hosts that lack the requisite env / GPUs / arch."""
     nvep_built = False
     try:
-        from flashinfer.moe_ep import available_backends
+        from importlib import import_module
 
-        nvep_built = bool(available_backends())
+        nvep_built = bool(import_module("flashinfer.moe_ep").available_backends())
     except ImportError:
         pass
 
@@ -171,18 +219,75 @@ def pytest_collection_modifyitems(config, items):
         if "nvep" in item.keywords and not nvep_built:
             item.add_marker(
                 pytest.mark.skip(
-                    reason="needs BUILD_NCCL_EP=1 / BUILD_NIXL_EP=1 install"
+                    reason="no moe_ep backend built (EP builds by default; "
+                    "check install log for skipped-backend warnings)"
                 )
             )
+        launched_ranks = int(os.environ.get("WORLD_SIZE", "0"))
         for mk, req in (("gpu_2", 2), ("gpu_4", 4), ("gpu_8", 8)):
-            if mk in item.keywords and ngpu < req:
+            if mk not in item.keywords:
+                continue
+            if "WORLD_SIZE" not in os.environ:
+                # Multi-rank tests must be launched via torchrun (see
+                # tests/moe_ep/run_tests.sh); under plain pytest auto-discovery
+                # (e.g. CI unit-test sweeps) they would hang on dist init.
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason="requires torchrun launch (WORLD_SIZE unset)"
+                    )
+                )
+            elif ngpu < req and launched_ranks < req:
+                # An explicit torchrun with WORLD_SIZE >= req overrides the
+                # physical GPU count: single-GPU sm_12x boxes (RTX/GB10,
+                # DGX-Spark style) run multirank with ranks sharing one GPU
+                # (the sm120 kernel drop's bootstrap maps
+                # local_rank % device_count and supports MEGA_SINGLE_GPU_GLOO).
                 item.add_marker(pytest.mark.skip(reason=f"needs >= {req} GPUs"))
-        if "arch_blackwell" in item.keywords and cc < (10, 0):
-            item.add_marker(pytest.mark.skip(reason="needs sm_100+"))
+        # SM100 kernels cannot compile for Rubin (10.7).
+        if "arch_blackwell" in item.keywords and (cc < (10, 0) or cc >= (10, 7)):
+            item.add_marker(pytest.mark.skip(reason="needs sm_100/sm_103 (Blackwell)"))
+        # Exactly sm_107: the Rubin mega kernels compile for sm_107a only.
+        if "arch_rubin" in item.keywords and cc != (10, 7):
+            item.add_marker(pytest.mark.skip(reason="needs sm_107 (Rubin)"))
+        # Exactly sm_90: the SM90 mega kernels are Hopper-only (Blackwell
+        # hosts use the sm_100 tree's kernels instead).
+        if "arch_hopper" in item.keywords and cc != (9, 0):
+            item.add_marker(pytest.mark.skip(reason="needs sm_90 (Hopper)"))
+        # Exactly the sm_12x family (Blackwell-consumer): the SM120 swap-AB
+        # mega kernel's warp-level MMA path targets sm_120/sm_121 only.
+        if "arch_sm120" in item.keywords and cc[0] != 12:
+            item.add_marker(pytest.mark.skip(reason="needs sm_120/sm_121"))
 
 
 def is_cuda_oom_error_str(e: str) -> bool:
     return "CUDA" in e and "out of memory" in e
+
+
+def _release_cuda_oom(e: BaseException) -> bool:
+    """Return whether ``e`` or a linked exception is a CUDA OOM; if so, free its frames.
+
+    torch.testing.assert_close re-raises an OOM from inside its comparison as a
+    RuntimeError caused by the OOM, so both ``__cause__`` and ``__context__`` are
+    followed. The skip exception keeps these exceptions alive, and their
+    tracebacks would keep the test's frames and GPU tensors allocated into the
+    tests that follow.
+    """
+    chain: list[BaseException] = []
+    pending: list[BaseException | None] = [e]
+    while pending:
+        x = pending.pop()
+        if x is None or any(x is seen for seen in chain):
+            continue
+        chain.append(x)
+        pending += [x.__cause__, x.__context__]
+    if not any(
+        isinstance(x, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(x))
+        for x in chain
+    ):
+        return False
+    for x in chain:
+        traceback.clear_frames(x.__traceback__)
+    return True
 
 
 @pytest.hookimpl(wrapper=True)
@@ -191,7 +296,9 @@ def pytest_runtest_call(item):
     try:
         yield
     except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
-        if isinstance(e, torch.cuda.OutOfMemoryError) or is_cuda_oom_error_str(str(e)):
+        if os.environ.get("FLASHINFER_STRICT_MOE_EP_TESTS") == "1":
+            raise
+        if _release_cuda_oom(e):
             pytest.skip("Skipping due to OOM")
         elif isinstance(e, MissingJITCacheError):
             # Record the test that was skipped due to missing JIT cache

@@ -287,7 +287,7 @@ struct Zeros<float2> {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 __device__ __inline__ uint8_t float_to_e8m0(float val) {
-  // CL-15277: use rounding-up mode for float -> e8m0 conversion
+  // Use rounding-up mode for float -> e8m0 conversion
 #if (defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000) &&                           \
     (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM101_ALL) || \
      defined(__CUDA_ARCH_FEAT_SM110_ALL) || defined(__CUDA_ARCH_FEAT_SM120_ALL))
@@ -1106,10 +1106,10 @@ struct Stats {
       // We need to check for the case where we are using CTA > 1 and WARP_M > 1 and N == 1
       // Because in this case we cannot rely on the __syncThreads in template<typename T, uint32_t
       // WARPS_M, uint32_t WARPS_N>::compute (because we will use the specialized template <typename
-      // T, uint32_t WARPS_M>::compute which does not have a sync) Bug 5221388: For WARPS_M > 1 and
+      // T, uint32_t WARPS_M>::compute which does not have a sync). Also, for WARPS_M > 1 and
       // WARPS_N > 1, we also need the sync here, otherwise the stats received in `workspace[lane_]`
-      // may be NaN (as if some stats from the other CTAs are not initialized). Reason unknown yet
-      // and tracked in CL-16775.
+      // may be NaN (as if some stats from the other CTAs are not initialized);
+      // reason unknown yet.
       if (CTAS_PER_ROW > 1 && WARPS_M > 1) {
         utils::namedBarrierSync(0, warps_m * WARPS_N * 32);
       }
@@ -1253,7 +1253,7 @@ struct Stats<T, 1, WARPS_M, 1, USE_CLUSTER, WHOLE_CTA> {
 
     T m = Zeros<T>::get();
     if (!isRMSNorm) {
-// CL-14115: The unroll factor 128 for LDGS was chosen based on the compilation/perf results for
+// The unroll factor 128 for LDGS was chosen based on the compilation/perf results for
 // APEX LN_fwd engines
 #pragma unroll(128 * NUM_ELTS)
       for (int it = 0; it < N; it++) {
@@ -1448,8 +1448,15 @@ struct Kernel_traits : public Base {
   enum { VEC_COLS_PER_LDG = CTAS_PER_ROW * THREADS_PER_ROW };
   // The total number of vectorized loads/stores per hidden vector.
   enum { VEC_COLS = COLS / ELTS_PER_LDG };
-  // The number of loads per thread for the input.
-  enum { LDGS = VEC_COLS / VEC_COLS_PER_LDG };
+  // Allow VEC_COLS not divisible by VEC_COLS_PER_LDG by emitting one
+  // partial tail LDG (predicated per lane). When VEC_COLS is an exact
+  // multiple, HAS_TAIL_LDG is 0 and the predicate degenerates to a
+  // compile-time true, so the original codegen is preserved.
+  enum { LDGS_FULL = VEC_COLS / VEC_COLS_PER_LDG };
+  enum { TAIL_VEC_COLS = VEC_COLS - LDGS_FULL * VEC_COLS_PER_LDG };
+  enum { HAS_TAIL_LDG = (TAIL_VEC_COLS > 0) ? 1 : 0 };
+  // The number of loads per thread for the input (full + optional tail).
+  enum { LDGS = LDGS_FULL + HAS_TAIL_LDG };
 
   using Stats = Stats<compute_t, CTAS_PER_ROW, WARPS_M, WARPS_N, USE_CLUSTER, WHOLE_CTA>;
   enum { SMEM_BYTES_FWD = Stats::SMEM_BYTES };

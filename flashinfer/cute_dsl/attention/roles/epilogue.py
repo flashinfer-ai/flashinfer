@@ -7,7 +7,7 @@ Reusable primitives (pipeline-unaware, for composing new kernel variants):
 - partition_output(): partition output global tensor for TMA stores
 - store_tile(): issue a single TMA store + commit group
 
-Orchestration (prefill-specific, uses raw CuTe ops for JIT compatibility):
+Orchestration (prefill-specific):
 - run(): O0/O1 double-buffered TMA stores with pipeline sync
 """
 
@@ -37,12 +37,6 @@ class EpilogueRole:
 
     # =========================================================================
     #  Reusable primitives — for composing new kernel variants
-    #
-    #  NOTE on CuTe DSL JIT limitations:
-    #  - partition_output(): Returns tensor tuples — CuTe DSL JIT does not
-    #    reliably handle returning tensors from @cute.jit methods.
-    #  - store_tile(): SAFE — takes pre-sliced tensors as arguments, no
-    #    runtime indexing or return values. Used in run() successfully.
     # =========================================================================
 
     @cute.jit
@@ -139,16 +133,8 @@ class EpilogueRole:
 
                 o0_coord = 2 * curr_block_coord_o[0]
                 o1_coord = o0_coord + 1
-                gO_qdl = cute.flat_divide(
-                    mO_qdl_, cute.select(self.pv_mma_tiler, mode=[0, 1])
-                )
-                gO = gO_qdl[None, None, None, 0, curr_block_coord_o[2]]
-                tOsO, tOgO = cute.nvgpu.cpasync.tma_partition(
-                    tma_atom_o,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sO, 0, 2),
-                    cute.group_modes(gO, 0, 2),
+                tOsO, tOgO = self.partition_output(
+                    tma_atom_o, mO_qdl_, sO, curr_block_coord_o
                 )
 
                 if cutlass.const_expr(corr_epi_consumer is not None):

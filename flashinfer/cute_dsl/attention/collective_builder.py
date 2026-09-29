@@ -61,6 +61,11 @@ def build_fmha_launch_params(
     """
     config = mainloop.config
 
+    # Paged KV shares the K/V smem ring layouts with ragged; only the TMA
+    # atoms (per-page box) and their smem partition views differ.  With
+    # mixed K/V dtypes the stage-stride padding below is replicated on the
+    # *_for_tma views so page copies land in the shared ring's slots.
+
     cta_group = tcgen05.CtaGroup.ONE
     p_major_mode = cute.nvgpu.OperandMajorMode.K
     p_source = tcgen05.OperandSource.TMEM
@@ -103,10 +108,12 @@ def build_fmha_launch_params(
         k_dtype,
         mainloop.kv_stages,
     )
+    # P is the A operand of the PV MMA, so its layout follows v_dtype
+    # (softmax converts P to v_dtype before the TMEM store).
     p_tmem_layout_staged = sm100_utils.make_smem_layout_a(
         pv_tiled_mma,
         config.pv_mma_tiler,
-        q_dtype,
+        v_dtype,
         mainloop.acc_stage,
     )
     v_smem_layout_staged = sm100_utils.make_smem_layout_b(
@@ -115,6 +122,28 @@ def build_fmha_launch_params(
         v_dtype,
         mainloop.kv_stages,
     )
+    # K and V share one smem allocation (sV is a recast view of sK), so a
+    # mixed-width V needs its stage stride padded to the larger operand's
+    # tile footprint, expressed in its own element units — the same scheme
+    # as the vendored FMHA kernel.
+    sK_cosize = cute.cosize(k_smem_layout_staged)
+    if k_dtype.width > v_dtype.width:
+        k_tile_cosize = cute.cosize(cute.select(k_smem_layout_staged, mode=[0, 1, 2]))
+        v_stage_stride = k_tile_cosize * k_dtype.width // v_dtype.width
+        v_smem_layout_staged = cute.append(
+            cute.select(v_smem_layout_staged, mode=[0, 1, 2]),
+            cute.make_layout(mainloop.kv_stages, stride=v_stage_stride),
+        )
+    elif v_dtype.width > k_dtype.width:
+        v_tile_cosize = cute.cosize(cute.select(v_smem_layout_staged, mode=[0, 1, 2]))
+        k_stage_stride = v_tile_cosize * v_dtype.width // k_dtype.width
+        k_smem_layout_staged = cute.append(
+            cute.select(k_smem_layout_staged, mode=[0, 1, 2]),
+            cute.make_layout(mainloop.kv_stages, stride=k_stage_stride),
+        )
+        # Every stage slot must also fit a full V tile, which is larger
+        # than the K tile the last slot's cosize accounts for.
+        sK_cosize = mainloop.kv_stages * k_stage_stride
     o_smem_layout_staged = sm100_utils.make_smem_layout_epi(
         o_dtype,
         o_layout,
@@ -136,23 +165,84 @@ def build_fmha_launch_params(
         cluster_layout_vmnk.shape,
     )
     k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
-    tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
-        tma_load_op,
-        k,
-        k_smem_layout,
-        config.qk_mma_tiler,
-        qk_tiled_mma,
-        cluster_layout_vmnk.shape,
-    )
     v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
-    tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
-        tma_load_op,
-        v,
-        v_smem_layout,
-        config.pv_mma_tiler,
-        pv_tiled_mma,
-        cluster_layout_vmnk.shape,
-    )
+    k_smem_layout_for_tma = None
+    v_smem_layout_for_tma = None
+    if config.page_size is not None:
+        # Paged: the TMA box shrinks to one page ((page_size, d) for K,
+        # (d, page_size) for V) and the loader issues pages_per_kv_tile
+        # copies per tile, indexing the page mode with a runtime page id.
+        # The *_for_tma layouts view the same physical smem ring divided
+        # into per-page sub-boxes — the MLA decode pairing
+        # (kc_smem_layout_for_tma / make_paged_tiled_tma_atom).
+        k_smem_layout_for_tma = sm100_utils.make_smem_layout(
+            OperandMajorMode.K,
+            (config.qk_mma_tiler[1], config.qk_mma_tiler[2]),
+            k_dtype,
+            mainloop.kv_stages,
+        )
+        if v_dtype.width > k_dtype.width:
+            # Mixed widths: the shared ring's slot pitch is the wider
+            # operand's tile footprint (see the staged padding above) —
+            # rebuild the stage mode with the same padded stride.
+            k_smem_layout_for_tma = cute.append(
+                cute.select(k_smem_layout_for_tma, mode=[0, 1]),
+                cute.make_layout(mainloop.kv_stages, stride=k_stage_stride),
+            )
+        k_smem_layout_for_tma = cute.tiled_divide(
+            k_smem_layout_for_tma, (config.page_size, config.qk_mma_tiler[2])
+        )
+        tma_atom_k, tma_tensor_k = make_paged_tiled_tma_atom(
+            tma_load_op,
+            k,
+            cute.select(k_smem_layout_for_tma, mode=[0]),
+            (config.qk_mma_tiler[1], config.qk_mma_tiler[2]),
+            qk_tiled_mma,
+            config.page_size,
+            is_k_load=True,
+        )
+        v_smem_layout_for_tma = sm100_utils.make_smem_layout(
+            OperandMajorMode.MN,
+            (config.pv_mma_tiler[1], config.pv_mma_tiler[2]),
+            v_dtype,
+            mainloop.kv_stages,
+        )
+        if k_dtype.width > v_dtype.width:
+            # Mixed widths: pad V's stage stride to K's tile footprint,
+            # mirroring the staged-layout padding above.
+            v_smem_layout_for_tma = cute.append(
+                cute.select(v_smem_layout_for_tma, mode=[0, 1]),
+                cute.make_layout(mainloop.kv_stages, stride=v_stage_stride),
+            )
+        v_smem_layout_for_tma = cute.tiled_divide(
+            v_smem_layout_for_tma, (config.pv_mma_tiler[1], config.page_size)
+        )
+        tma_atom_v, tma_tensor_v = make_paged_tiled_tma_atom(
+            tma_load_op,
+            v,
+            cute.select(v_smem_layout_for_tma, mode=[0]),
+            (config.pv_mma_tiler[1], config.pv_mma_tiler[2]),
+            pv_tiled_mma,
+            config.page_size,
+            is_k_load=False,
+        )
+    else:
+        tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_load_op,
+            k,
+            k_smem_layout,
+            config.qk_mma_tiler,
+            qk_tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
+        tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
+            tma_load_op,
+            v,
+            v_smem_layout,
+            config.pv_mma_tiler,
+            pv_tiled_mma,
+            cluster_layout_vmnk.shape,
+        )
     o_smem_layout = cute.select(o_smem_layout_staged, mode=[0, 1])
     tma_atom_o, tma_tensor_o = cute.nvgpu.cpasync.make_tiled_tma_atom(
         tma_store_op,
@@ -163,6 +253,7 @@ def build_fmha_launch_params(
 
     tma_copy_q_bytes = cute.size_in_bytes(q_dtype, q_smem_layout)
     tma_copy_kv_bytes = cute.size_in_bytes(k_dtype, k_smem_layout)
+    tma_copy_v_bytes = cute.size_in_bytes(v_dtype, v_smem_layout)
 
     # SharedStorage struct
     align = mainloop.buffer_align_bytes
@@ -176,6 +267,15 @@ def build_fmha_launch_params(
         mainloop.mma_corr_stage if not mainloop.has_logits_transform else 1
     )
     s0_epi_stages = mainloop.epi_stage if mainloop.has_logits_transform else 1
+
+    # Page-table ring (empty-warp pt producer).  Zero-length fields at the
+    # end of the struct keep every other offset and the total size
+    # bit-identical for builds without the ring.
+    pt_stages = mainloop.config.load_pt_stages
+    pt_barrier_slots = 2 * pt_stages if pt_stages is not None else 0
+    pt_ring_slots = (
+        pt_stages * mainloop.config.pages_per_kv_tile if pt_stages is not None else 0
+    )
 
     @cute.struct
     class SharedStorage:
@@ -203,9 +303,11 @@ def build_fmha_launch_params(
             align,
         ]
         sK: cute.struct.Align[
-            cute.struct.MemRange[k_dtype, cute.cosize(k_smem_layout_staged)],
+            cute.struct.MemRange[k_dtype, sK_cosize],
             align,
         ]
+        load_pt_mbar_ptr: cute.struct.MemRange[Int64, pt_barrier_slots]
+        smem_page_table: cute.struct.MemRange[cutlass.Int32, pt_ring_slots]
 
         @classmethod
         def size_in_bytes(cls) -> int: ...  # noqa: F811
@@ -226,9 +328,12 @@ def build_fmha_launch_params(
         p_tmem_layout_staged=p_tmem_layout_staged,
         v_smem_layout_staged=v_smem_layout_staged,
         o_smem_layout_staged=o_smem_layout_staged,
+        k_smem_layout_for_tma=k_smem_layout_for_tma,
+        v_smem_layout_for_tma=v_smem_layout_for_tma,
         SharedStorage=SharedStorage,
         tma_copy_q_bytes=tma_copy_q_bytes,
         tma_copy_kv_bytes=tma_copy_kv_bytes,
+        tma_copy_v_bytes=tma_copy_v_bytes,
         cluster_shape_mnk=cluster_shape_mnk,
         cluster_layout_vmnk=cluster_layout_vmnk,
         epi_tile=epi_tile,

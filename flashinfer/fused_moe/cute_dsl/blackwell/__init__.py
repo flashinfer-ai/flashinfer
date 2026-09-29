@@ -23,7 +23,7 @@ These kernels are adapted from TensorRT-LLM.
 from .blockscaled_contiguous_grouped_gemm_finalize_fusion import (
     Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
 )
-from .blockscaled_contiguous_gather_grouped_gemm_swiglu_fusion import (
+from .blockscaled_contiguous_gather_grouped_gemm_act_fusion import (
     BlockScaledContiguousGatherGroupedGemmKernel,
 )
 from .utils import (

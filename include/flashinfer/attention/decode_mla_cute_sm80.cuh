@@ -416,13 +416,13 @@ __global__ void BatchDecodeWithPagedKVCacheKernelMlaCuteSM80(Params params) {
         row_max = max(row_max, smem_att(tx, i));
       }
 
-      float row_o_scale = math::ptx_exp2(row_max_prev - row_max);
+      float row_o_scale = math::ptx_exp2(max(row_max_prev - row_max, -flashinfer::math::inf));
       smem_o_scale(tx) = row_o_scale;
 
       row_denom *= row_o_scale;
 #pragma unroll
       for (int i = 0; i < k_kv_tile_len; ++i) {
-        smem_att(tx, i) = math::ptx_exp2(smem_att(tx, i) - row_max);
+        smem_att(tx, i) = math::ptx_exp2(max(smem_att(tx, i) - row_max, -flashinfer::math::inf));
         row_denom += smem_att(tx, i);
       }
       smem_denom(tx) = row_denom;

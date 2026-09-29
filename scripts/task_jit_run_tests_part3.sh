@@ -10,7 +10,7 @@ set -x
 source "$(dirname "${BASH_SOURCE[0]}")/setup_test_env.sh"
 
 if [ "$SKIP_INSTALL" = "0" ]; then
-  pip install -e . -v
+  install_flashinfer_editable
 fi
 
 # Run each test file separately to isolate CUDA memory issues

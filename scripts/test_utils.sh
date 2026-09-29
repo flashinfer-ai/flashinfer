@@ -5,9 +5,10 @@
 # Default environment variables
 : "${JUNIT_DIR:=$(realpath ./junit)}"
 
-# Cap ninja parallelism by available RAM (~12 GB per nvcc process) to avoid OOM
-# during JIT compilation.  Exported because flashinfer/jit/cpp_ext.py reads it
-# from the environment (os.environ) inside the child Python process.
+# MAX_JOBS controls Ninja parallelism for JIT builds.  It is limited by
+# available RAM (~12 GB per nvcc process) to avoid OOM during JIT compilation.
+# Exported because flashinfer/jit/cpp_ext.py reads it from the environment
+# (os.environ) inside the child Python process.
 if [ -z "${MAX_JOBS:-}" ]; then
     _num_cpus=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
     _mem_gb=$(awk '/MemAvailable/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null)
@@ -19,9 +20,36 @@ if [ -z "${MAX_JOBS:-}" ]; then
     else
         MAX_JOBS=$_num_cpus
     fi
+    # signal that the computed MAX_JOBS is a host-wide quota to share between all workers
+    FLASHINFER_AUTO_MAX_JOBS=1
+    export FLASHINFER_AUTO_MAX_JOBS
     unset _num_cpus _mem_gb
 fi
 export MAX_JOBS
+
+# Pin the preinstalled CUDA torch for every job-time pip install. Branch
+# requirement synchronization below uses --no-deps to preserve the image's
+# validated cuda-python and cuDNN packages. Pinning those packages would contradict
+# torch's own exact dependency metadata. The +cuXXX local tag is stripped so
+# PEP-517 build environments can resolve the constraint from PyPI.
+if [ -z "${PIP_CONSTRAINT:-}" ]; then
+    if ! _torch_pin=$(python -c \
+        'import torch; print("torch==" + torch.__version__.split("+")[0])'); then
+        echo "ERROR: failed to inspect the image torch; refusing unpinned pip installs" >&2
+        return 1
+    fi
+    if [ -n "${_torch_pin}" ]; then
+        _constraint_file=$(mktemp /tmp/ci-torch-constraint.XXXXXX.txt)
+        printf '%s\n' "${_torch_pin}" > "${_constraint_file}"
+        export PIP_CONSTRAINT="${_constraint_file}"
+        echo "Pinning image torch for job-time pip installs: ${_torch_pin}"
+        unset _constraint_file
+    else
+        echo "ERROR: image torch inspection returned no package constraint" >&2
+        return 1
+    fi
+    unset _torch_pin
+fi
 
 # CUDA_VISIBLE_DEVICES: Not set by default - let detect_gpus() auto-detect via nvidia-smi
 : "${SAMPLE_RATE:=5}"  # Run every Nth test in sanity mode (5 = ~20% coverage)
@@ -31,6 +59,7 @@ export MAX_JOBS
 : "${MEMORY_MONITOR_LOG_INTERVAL:=0}"  # Emit periodic samples to the CI log when >0
 : "${PYTEST_FILE_TIMEOUT_SECONDS:=7200}"  # Per-test-file timeout; 0 disables
 : "${PYTEST_FILE_TIMEOUT_KILL_AFTER_SECONDS:=300}"  # Grace period before SIGKILL after timeout
+: "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS:=false}"  # Fail setup when CI artifacts are absent
 
 # Randomize starting offset (0 to SAMPLE_RATE-1) for sampling variety
 if [ -z "${SAMPLE_OFFSET:-}" ]; then
@@ -164,7 +193,21 @@ install_precompiled_kernels() {
         return
     fi
 
+    case "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}" in
+        true|false) ;;
+        *)
+            echo "ERROR: UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS must be true or false, got '${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}'." >&2
+            return 2
+            ;;
+    esac
+
+    if [ "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}" = "true" ] && [ -z "${JIT_ARCH:-}" ]; then
+        echo "ERROR: UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS=true requires JIT_ARCH." >&2
+        return 1
+    fi
+
     JIT_ARCH_EFFECTIVE=""
+    local missing_artifacts=false
     # Map CUDA_VERSION to CUDA_STREAM for artifact lookup
     if [[ "${CUDA_VERSION}" == cu* ]]; then
         CUDA_STREAM="${CUDA_VERSION}"
@@ -210,16 +253,32 @@ install_precompiled_kernels() {
             echo "Installing flashinfer-cubin from ${DIST_CUBIN_DIR} ..."
             pip install -q "${DIST_CUBIN_DIR}"/*.whl
         else
-            echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
+            missing_artifacts=true
+            if [ "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}" = "true" ]; then
+                echo "ERROR: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}. Ensure the CI build stage produced the artifact." >&2
+            else
+                echo "WARNING: flashinfer-cubin wheel not found in ${DIST_CUBIN_DIR}; tests will use JIT compilation." >&2
+            fi
         fi
 
         if [ -d "${DIST_JIT_CACHE_DIR}" ] && ls "${DIST_JIT_CACHE_DIR}"/*.whl >/dev/null 2>&1; then
             echo "Installing flashinfer-jit-cache from ${DIST_JIT_CACHE_DIR} ..."
             pip install -q "${DIST_JIT_CACHE_DIR}"/*.whl
         else
-            echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
+            missing_artifacts=true
+            if [ "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}" = "true" ]; then
+                echo "ERROR: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}. Ensure the CI build stage produced the artifact." >&2
+            else
+                echo "WARNING: flashinfer-jit-cache wheel not found in ${DIST_JIT_CACHE_DIR} for ${CUDA_VERSION}; tests will use JIT compilation." >&2
+            fi
         fi
         echo ""
+    else
+        echo "WARNING: JIT_ARCH is unset; skipping precompiled kernel artifact lookup and using JIT compilation." >&2
+    fi
+
+    if [ "${missing_artifacts}" = "true" ] && [ "${UNIT_TEST_REQUIRE_PRECOMPILED_KERNELS}" = "true" ]; then
+        return 1
     fi
 }
 
@@ -232,17 +291,30 @@ install_and_verify() {
         # Install precompiled kernels if enabled
         install_precompiled_kernels
 
-        # Sync dependencies from the branch's requirements.txt
-        pip install -r requirements.txt
+        # Sync the branch's direct dependencies without re-resolving the CUDA
+        # stack already selected and validated by the image build.
+        _dependency_args=(-r requirements.txt -r requirements-test.txt)
 
         # Install nvidia-cutlass-dsl with the correct CUDA extra to avoid
-        # version skew between libs-base and libs-cu13.
-        if [[ "${CUDA_VERSION}" == *"cu13"* ]]; then
-            pip install --upgrade "nvidia-cutlass-dsl[cu13]>=4.5.0"
+        # version skew between libs-base and libs-cu13.  requirements.txt
+        # cannot add the extra conditionally, hence the separate install.
+        #
+        # Keep this a floor, not an exact pin: an exact ==4.7.0 downgrades a
+        # newer CuTe DSL that the test image may ship (the Rubin image ships
+        # 4.8.0a0), which removes cutlass.utils.rubin_helpers and the sm_107a
+        # Arch member and so disables every SM107 path for the whole run.
+        # The a0 suffix is required for pip to consider pre-releases at all.
+        if [[ "${CUDA_VERSION}" == *"cu13"* || "${CUDA_VERSION}" == 13.* ]]; then
+            _dependency_args+=("nvidia-cutlass-dsl[cu13]>=4.7.0a0")
         fi
+        pip install --no-deps "${_dependency_args[@]}"
+        unset _dependency_args
+        python -c "import pytest_timeout"
 
-        # Install local python sources
-        pip install -e . -v --no-deps
+        # Install local python sources. The env var keeps --no-build-isolation
+        # from activating the build hooks' own downloads (see setup_test_env.sh).
+        FLASHINFER_BUILD_NO_PIP=1 \
+            pip install -e . -v --no-deps --no-build-isolation
         echo ""
 
         # Verify installation
@@ -1478,6 +1550,8 @@ print_execution_summary() {
 execute_dry_run() {
     local test_files=$1
 
+    derive_scheduling_patterns_from_markers
+
     echo "=========================================="
     echo "DRY RUN: Tests that would be executed"
     echo "=========================================="
@@ -1512,10 +1586,14 @@ SOLO_TEST_PATTERNS=(
 # Historically long-running tests. Keep these parallel, but put them at the
 # front of the queue so they start on separate GPUs before shorter tests.
 LONG_RUNNING_TEST_PATTERNS=(
+    "test_trtllm_gen_fused_moe_routing_renormalize_fp4.py"
+    "test_trtllm_gen_fused_moe_routing_renormalize_fp8.py"
+    "test_trtllm_gen_fused_moe_routing_renormalize_bf16.py"
     "test_trtllm_gen_fused_moe.py"
     "test_trtllm_gen_attention_decode.py"
     "test_trtllm_gen_attention_decode_xqa.py"
     "test_decode_delta_rule.py"
+    "test_fp4_quantize.py"
 )
 
 is_solo_test() {
@@ -1544,8 +1622,48 @@ is_long_running_test() {
     return 1
 }
 
+SCHEDULING_PATTERNS_DERIVED=false
+derive_scheduling_patterns_from_markers() {
+    [ "$SCHEDULING_PATTERNS_DERIVED" = "true" ] && return 0
+    SCHEDULING_PATTERNS_DERIVED=true
+
+    # scripts/test_utils.sh -> repo root is one level up.
+    local repo_root scanner py tests_root long_list solo_list
+    repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    scanner="${repo_root}/scripts/find_marked_tests.py"
+    tests_root="${repo_root}/tests"
+
+    if [ ! -f "$scanner" ] || [ ! -d "$tests_root" ]; then
+        echo "NOTE: marker scanner or tests/ dir not found; using built-in scheduling pattern defaults."
+        return 0
+    fi
+    py="$(command -v python3 || command -v python)" || {
+        echo "NOTE: python not found; using built-in scheduling pattern defaults."
+        return 0
+    }
+
+    long_list="$("$py" "$scanner" long_running "$tests_root" 2>/dev/null)"
+    solo_list="$("$py" "$scanner" solo "$tests_root" 2>/dev/null)"
+
+    if [ -n "$long_list" ]; then
+        mapfile -t LONG_RUNNING_TEST_PATTERNS <<< "$long_list"
+        echo "Derived ${#LONG_RUNNING_TEST_PATTERNS[@]} long-running test pattern(s) from @pytest.mark.long_running."
+    else
+        echo "NOTE: no @pytest.mark.long_running files found; keeping built-in long-running defaults."
+    fi
+    if [ -n "$solo_list" ]; then
+        mapfile -t SOLO_TEST_PATTERNS <<< "$solo_list"
+        echo "Derived ${#SOLO_TEST_PATTERNS[@]} solo test pattern(s) from @pytest.mark.solo."
+    else
+        echo "NOTE: no @pytest.mark.solo files found; keeping built-in solo defaults."
+    fi
+}
+
 execute_tests() {
     local test_files=$1
+
+    # Refresh scheduling buckets from the pytest markers in the test sources.
+    derive_scheduling_patterns_from_markers
 
     mkdir -p "${JUNIT_DIR}"
     if [ "$MONITOR_TEST_MEMORY" = "true" ]; then

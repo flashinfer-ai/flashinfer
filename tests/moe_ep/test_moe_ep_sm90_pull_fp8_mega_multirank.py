@@ -1,0 +1,1524 @@
+"""Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm90_fp8_fp8_bf16_pull_cutedsl).
+
+Launched via torchrun:
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_sm90_pull_fp8_mega_multirank.py -v -m "gpu_4 and arch_hopper"
+
+Requires Hopper (exactly sm_90), >=4 GPUs, and CuTeDSL runtime deps
+(``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
+``flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel``.
+
+Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
+:class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
+
+Parity methodology (mirrors the sm100_mxfp8_mxfp8_bf16_cutedsl twin): each layer test drives
+the SAME fused kernel twice — once through the full ``MoEEpLayer`` EP plumbing
+and once directly through the shim API (``hopper_fp8_mega_moe`` on a fresh
+symm buffer) with identical staged inputs, quantization, and preprocessed
+weights — and asserts bit-exact equality for the deterministic separate-reduce
+paths.  The ikr (REDG) test compares against the explicit-reduce reference
+within the bf16 K-term accumulation band instead.
+
+Torch-oracle anchor: parity alone cannot catch a kernel that is wrong but
+self-consistent at ``world_size > 1`` (peer-pull addressing, expert→rank
+ownership, peer-token dequant, cross-rank combine), because both sides run the
+same CUDA kernel.  ``test_moe_ep_sm90_pull_fp8_mega_multirank_torch_oracle``
+closes that gap: every rank all-gathers the ACTUAL staged fp8 payloads,
+routing, and preprocessed weight legs, runs the drop's multi-rank-native
+pure-torch ground truth (``compute_megamoe_reference_fp8``) on the global
+problem, and checks its own rank's slice against the real-EP kernel output.
+The single-GPU oracle (``test_sm90_pull_fp8_kernel_vs_reference.py``) remains
+the ``world_size == 1`` anchor.
+
+per_tensor contract: the activation dequant scales are STATIC config scalars
+identical on every EP rank (the kernel dequantizes peer tokens with the local
+copy), so both the layer config and the direct-shim reference use the same
+fixed calibration constants below.
+
+Process isolation: the SM90 and SM100 kernel trees share top-level module
+names and are mutually exclusive per process — this file is excluded from
+run_tests.sh's ``unit`` target and runs in its own torchrun pytest process via
+the ``mega_sm90`` target.
+"""
+
+from __future__ import annotations
+
+import os
+
+import pytest
+
+# This test verifies the mega path only through the pull_style_cutedsl_megakernel
+# shim public API (``flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel``);
+# it never imports the src/ kernel packages directly, so a new src/ drop can't
+# silently break it.
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel")
+
+E4M3_MAX = 448.0
+# Static per-tensor calibration (identical on all ranks by contract): randn
+# bf16 activations stay within |x| <= 8 for these sizes, and the 1/sqrt(K)
+# weight normalization keeps SwiGLU outputs O(1) (<= 8 with the topk softmax
+# weights).  Both scales carry the reference's 0.95 headroom margin.
+FC1_ACT_SCALE = 8.0 / (0.95 * E4M3_MAX)
+FC2_ACT_SCALE = 8.0 / (0.95 * E4M3_MAX)
+
+
+def _require_cuda():
+    import torch
+
+    from flashinfer.utils import is_sm90a_supported
+
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("Requires SM90a")
+
+
+def _launcher_ranks() -> tuple[int, int]:
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    return rank, world_size
+
+
+def _make_inputs(
+    rank: int,
+    world_size: int,
+    *,
+    num_tokens: int,
+    hidden: int,
+    num_experts: int,
+    topk: int,
+):
+    import torch
+
+    g = torch.Generator(device="cuda").manual_seed(7 + rank)
+    hidden_states = torch.randn(
+        num_tokens, hidden, dtype=torch.bfloat16, device="cuda", generator=g
+    )
+    scores = torch.randn(
+        num_tokens, num_experts, dtype=torch.float32, device="cuda", generator=g
+    )
+    topk_weights, topk_ids = torch.topk(
+        scores, topk, dim=-1, largest=True, sorted=False
+    )
+    topk_weights = torch.softmax(topk_weights, dim=-1)
+    topk_ids = topk_ids.to(torch.int64)
+
+    # Guarantee cross-rank traffic by construction (random routing makes it
+    # near-certain; this makes it certain): token 0 routes one expert per EP
+    # rank — with topk == world_size that is experts {0, L, 2L, 3L} (distinct,
+    # so no duplicate-expert rows).
+    num_local = num_experts // world_size
+    forced = (
+        torch.arange(min(topk, world_size), device="cuda", dtype=torch.int64)
+        * num_local
+    )
+    topk_ids[0, : forced.numel()] = forced
+
+    return hidden_states, topk_weights.to(torch.float32), topk_ids
+
+
+def _make_bf16_weights(
+    rank: int,
+    *,
+    num_local_experts: int,
+    hidden: int,
+    intermediate: int,
+):
+    """O(1)-output weights (1/sqrt(K) normalized, like the single-GPU oracle)."""
+    import torch
+
+    g = torch.Generator(device="cuda").manual_seed(13 + rank)
+    w13 = torch.randn(
+        num_local_experts,
+        2 * intermediate,
+        hidden,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=g,
+    ) * (hidden**-0.5)
+    w2 = torch.randn(
+        num_local_experts,
+        hidden,
+        intermediate,
+        dtype=torch.bfloat16,
+        device="cuda",
+        generator=g,
+    ) * (intermediate**-0.5)
+    return w13, w2
+
+
+def _mega_problem(
+    rank: int,
+    world_size: int,
+    *,
+    fp8_scale_mode: str,
+    swap_ab: bool = False,
+    num_tokens: int = 64,
+    max_tokens: int = 64,
+    num_experts: int = 8,
+    topk: int = 4,
+    hidden: int = 2048,
+):
+    intermediate = 1024
+    gate_up_clamp = 10.0
+    fast_math = True
+    kind = "fp8_e4m3"
+
+    assert hidden % 128 == 0
+    assert intermediate % 128 == 0
+    assert num_experts % world_size == 0
+    num_local_experts = num_experts // world_size
+
+    hidden_states, topk_weights, topk_ids = _make_inputs(
+        rank,
+        world_size,
+        num_tokens=num_tokens,
+        hidden=hidden,
+        num_experts=num_experts,
+        topk=topk,
+    )
+    w13, w2 = _make_bf16_weights(
+        rank,
+        num_local_experts=num_local_experts,
+        hidden=hidden,
+        intermediate=intermediate,
+    )
+    return dict(
+        hidden=hidden,
+        intermediate=intermediate,
+        num_tokens=num_tokens,
+        max_tokens=max_tokens,
+        num_experts=num_experts,
+        topk=topk,
+        gate_up_clamp=gate_up_clamp,
+        fast_math=fast_math,
+        kind=kind,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        hidden_states=hidden_states,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        w13=w13,
+        w2=w2,
+    )
+
+
+def _preprocess_weights(problem: dict):
+    from flashinfer.moe_ep import MoEWeightPack
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.weights import (
+        preprocess_mega_weights,
+    )
+
+    return preprocess_mega_weights(
+        MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+        intermediate_size=problem["intermediate"],
+        hidden_size=problem["hidden"],
+        kind=problem["kind"],
+        fp8_scale_mode=problem["fp8_scale_mode"],
+        fc1_activation_dequant_scale=FC1_ACT_SCALE,
+        fc2_activation_dequant_scale=FC2_ACT_SCALE,
+    )
+
+
+def _alloc_symm_buffer(
+    problem: dict, rank: int, world_size: int, *, generate_c: bool = False
+):
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        get_symm_buffer_for_hopper_fp8_mega_moe,
+    )
+
+    return get_symm_buffer_for_hopper_fp8_mega_moe(
+        problem["num_experts"],
+        problem["max_tokens"],
+        problem["topk"],
+        problem["hidden"],
+        problem["intermediate"],
+        rank,
+        world_size,
+        kind=problem["kind"],
+        fp8_scale_mode=problem["fp8_scale_mode"],
+        swap_ab=problem["swap_ab"],
+        gate_up_clamp=problem["gate_up_clamp"],
+        generate_c=generate_c,
+    )
+
+
+def _reference_sm90_fp8_mega_moe_staged(problem: dict, *, destroy_buffer: bool = True):
+    """Reference: direct shim launch with bf16 staged inside the symm buffer."""
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        hopper_fp8_mega_moe,
+    )
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    symm_buffer = _alloc_symm_buffer(problem, rank, world_size)
+    num_tokens = problem["num_tokens"]
+    stage_mega_moe_inputs(
+        problem["hidden_states"],
+        problem["topk_weights"],
+        problem["topk_ids"],
+        symm_buffer.x,
+        symm_buffer.x_sf,
+        symm_buffer.topk_idx,
+        symm_buffer.topk_weights,
+        kind=problem["kind"],
+        fp8_scale_mode=problem["fp8_scale_mode"],
+        fc1_activation_dequant_scale=FC1_ACT_SCALE,
+    )
+
+    transformed_l1, transformed_l2 = _preprocess_weights(problem)
+
+    y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
+    hopper_fp8_mega_moe(
+        y,
+        transformed_l1,
+        transformed_l2,
+        symm_buffer,
+        num_tokens=num_tokens,
+        gate_up_clamp=problem["gate_up_clamp"],
+        fast_math=problem["fast_math"],
+    )
+    torch.cuda.synchronize()
+    if destroy_buffer:
+        symm_buffer.destroy()
+    return y
+
+
+def _reference_sm90_fp8_mega_moe_prestaged(
+    problem: dict, x_fp8, x_sf, *, destroy_buffer: bool = True
+):
+    """Reference with caller-supplied FP8 activations + per-mode scales."""
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        hopper_fp8_mega_moe,
+    )
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    symm_buffer = _alloc_symm_buffer(problem, rank, world_size)
+    num_tokens = problem["num_tokens"]
+    symm_buffer.x[:num_tokens].view(torch.uint8).copy_(x_fp8.view(torch.uint8))
+    symm_buffer.x_sf[:num_tokens].view(torch.uint8).copy_(x_sf.view(torch.uint8))
+    symm_buffer.topk_idx[:num_tokens].copy_(problem["topk_ids"])
+    symm_buffer.topk_weights[:num_tokens].copy_(problem["topk_weights"])
+
+    transformed_l1, transformed_l2 = _preprocess_weights(problem)
+
+    y = torch.empty(num_tokens, problem["hidden"], dtype=torch.bfloat16, device="cuda")
+    hopper_fp8_mega_moe(
+        y,
+        transformed_l1,
+        transformed_l2,
+        symm_buffer,
+        num_tokens=num_tokens,
+        gate_up_clamp=problem["gate_up_clamp"],
+        fast_math=problem["fast_math"],
+    )
+    torch.cuda.synchronize()
+    if destroy_buffer:
+        symm_buffer.destroy()
+    return y
+
+
+def _assert_ikr_close(y, y_ref, *, topk):
+    """Scale-aware compare for the in-flight (REDG) top-k reduce.
+
+    Mirrors the mxfp8 twin: the ikr path accumulates the K per-topk bf16
+    terms in nondeterministic order vs the reference's explicit reduce, so
+    where large terms nearly cancel the achievable agreement is bounded by
+    the bf16 round-off of the largest TERM, not of the final value.  Bound
+    per row: K terms x bf16 eps (2^-8) x safety 8.  A missing per-launch
+    output zero (2x accumulation) overshoots this band by ~64x.
+    """
+    import torch
+
+    a = y.float()
+    b = y_ref.float()
+    diff = (a - b).abs()
+    row_scale = torch.maximum(a.abs(), b.abs()).amax(dim=1, keepdim=True)
+    tol = 5e-2 + (topk * 2.0**-8 * 8.0) * row_scale
+    worst = (diff - tol).max().item()
+    assert worst <= 0.0, (
+        f"ikr output outside the bf16 K-term accumulation band "
+        f"(worst overshoot {worst:.4f}, max diff {diff.max().item():.4f})"
+    )
+
+
+def _assert_grouped_close(y, ref, *, combine_format: str):
+    """Accuracy gate for the grouped (rank-slot) combine.
+
+    bf16 wire: the only deviation from the bit-exact baseline is one extra
+    bf16 rounding of the fp32 group partial sum -> tight tolerance.
+    Quantized wire: one per-32 e8m0+fp8 quantization of each group sum; gate
+    on SNR against the exact reference plus a loose elementwise band.
+    """
+    import torch
+
+    err = (y.float() - ref.float()).square().sum()
+    sig = ref.float().square().sum()
+    snr_db = float(10.0 * torch.log10(sig / err.clamp_min(1e-30)))
+    if combine_format == "bf16":
+        torch.testing.assert_close(y, ref, rtol=2e-2, atol=2e-2)
+        assert snr_db > 40.0, f"grouped bf16 combine SNR {snr_db:.1f} dB"
+    else:
+        assert snr_db > 20.0, f"quantized combine SNR {snr_db:.1f} dB"
+        torch.testing.assert_close(
+            y.float(),
+            ref.float(),
+            rtol=0.25,
+            atol=0.08,
+        )
+    print(f"grouped combine ({combine_format}) SNR vs exact ref: {snr_db:.1f} dB")
+
+
+def _megakernel_config(
+    problem: dict,
+    *,
+    in_kernel_fc2_reduce: bool = False,
+    token_back_mode: str | None = None,
+    dedup_dispatch: bool = False,
+    grouped_token_back: bool = False,
+    combine_format: str = "bf16",
+    active_dispatch_warps: int = 1,
+    fold_producer_warps: bool | None = None,
+    mma_tiler_mnk=None,
+    pingpong=None,
+    cluster_shape_mnk=None,
+    tail_split_pairs: bool | None = None,
+):
+    from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+
+    # fold_producer_warps None -> the config's default (True); the fold and
+    # old-layout tests pin it explicitly.
+    fold_kw = (
+        {}
+        if fold_producer_warps is None
+        else {"fold_producer_warps": fold_producer_warps}
+    )
+    return Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(
+        **fold_kw,
+        intermediate_size=problem["intermediate"],
+        top_k=problem["topk"],
+        kind=problem["kind"],
+        fp8_scale_mode=problem["fp8_scale_mode"],
+        swap_ab=problem["swap_ab"],
+        gate_up_clamp=problem["gate_up_clamp"],
+        fast_math=problem["fast_math"],
+        enable_in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+        token_back_mode=(
+            "reuse_dispatch_warps" if grouped_token_back else token_back_mode
+        ),
+        dedup_dispatch=dedup_dispatch,
+        grouped_token_back=grouped_token_back,
+        combine_format=combine_format,
+        active_dispatch_warps=active_dispatch_warps,
+        mma_tiler_mnk=mma_tiler_mnk,
+        pingpong=pingpong,
+        cluster_shape_mnk=cluster_shape_mnk,
+        tail_split_pairs=tail_split_pairs,
+        fc1_activation_dequant_scale=FC1_ACT_SCALE,
+        fc2_activation_dequant_scale=FC2_ACT_SCALE,
+    )
+
+
+def _run_mega_layer(
+    rank,
+    world_size,
+    *,
+    quantize_input: bool,
+    fp8_scale_mode: str,
+    swap_ab: bool = False,
+    num_tokens: int = 64,
+    max_tokens: int = 64,
+    in_kernel_fc2_reduce: bool = False,
+    token_back_mode: str | None = None,
+    dedup_dispatch: bool = False,
+    grouped_token_back: bool = False,
+    combine_format: str = "bf16",
+    active_dispatch_warps: int = 1,
+    fold_producer_warps: bool | None = None,
+    mma_tiler_mnk=None,
+    pingpong=None,
+    cluster_shape_mnk=None,
+    tail_split_pairs: bool | None = None,
+    num_experts: int = 8,
+    topk: int = 4,
+    hidden: int = 2048,
+):
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        FleetParams,
+        MegaConfig,
+        MoEEpLayer,
+        MoEEpMegaLayer,
+        MoEEpTensors,
+        MoEWeightPack,
+        bootstrap_moe_ep_runtime,
+        ensure_moe_ep_cuda_device,
+        finalize_moe_ep_runtime,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+
+    problem = _mega_problem(
+        rank,
+        world_size,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        num_tokens=num_tokens,
+        max_tokens=max_tokens,
+        num_experts=num_experts,
+        topk=topk,
+        hidden=hidden,
+    )
+    kernel = create_mega_kernel(
+        _megakernel_config(
+            problem,
+            in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+            token_back_mode=token_back_mode,
+            dedup_dispatch=dedup_dispatch,
+            grouped_token_back=grouped_token_back,
+            combine_format=combine_format,
+            active_dispatch_warps=active_dispatch_warps,
+            fold_producer_warps=fold_producer_warps,
+            mma_tiler_mnk=mma_tiler_mnk,
+            pingpong=pingpong,
+            cluster_shape_mnk=cluster_shape_mnk,
+            tail_split_pairs=tail_split_pairs,
+        )
+    )
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap,
+        kernel.runtime_requirements(bootstrap),
+    )
+
+    try:
+        if quantize_input:
+            t_hidden = problem["hidden_states"]
+            t_scales = None
+        else:
+            staging_buffer = _alloc_symm_buffer(problem, rank, world_size)
+            stage_mega_moe_inputs(
+                problem["hidden_states"],
+                problem["topk_weights"],
+                problem["topk_ids"],
+                staging_buffer.x,
+                staging_buffer.x_sf,
+                staging_buffer.topk_idx,
+                staging_buffer.topk_weights,
+                kind=problem["kind"],
+                fp8_scale_mode=problem["fp8_scale_mode"],
+                fc1_activation_dequant_scale=FC1_ACT_SCALE,
+            )
+            t_hidden = staging_buffer.x[: problem["num_tokens"]].clone()
+            t_scales = staging_buffer.x_sf[: problem["num_tokens"]].clone()
+            staging_buffer.destroy()
+
+        mega = MoEEpLayer(
+            bootstrap=BootstrapConfig(
+                world_size=world_size,
+                rank=rank,
+                auto_bootstrap=False,
+            ),
+            fleet_params=FleetParams(
+                num_experts=problem["num_experts"],
+                max_tokens_per_rank=problem["max_tokens"],
+                token_hidden_size=problem["hidden"],
+            ),
+            weights=MoEWeightPack(w13=problem["w13"], w2=problem["w2"]),
+            backend=MegaConfig(
+                megakernel=_megakernel_config(
+                    problem,
+                    in_kernel_fc2_reduce=in_kernel_fc2_reduce,
+                    token_back_mode=token_back_mode,
+                    dedup_dispatch=dedup_dispatch,
+                    grouped_token_back=grouped_token_back,
+                    combine_format=combine_format,
+                    active_dispatch_warps=active_dispatch_warps,
+                    fold_producer_warps=fold_producer_warps,
+                    mma_tiler_mnk=mma_tiler_mnk,
+                    pingpong=pingpong,
+                    cluster_shape_mnk=cluster_shape_mnk,
+                ),
+                quantize_input=quantize_input,
+                preprocess_weights=True,
+            ),
+        )
+        assert isinstance(mega, MoEEpMegaLayer)
+
+        t = MoEEpTensors(
+            hidden_states=t_hidden,
+            topk_ids=problem["topk_ids"],
+            topk_weights=problem["topk_weights"],
+            scales=t_scales,
+        )
+        y_layer = mega.forward(t).clone()
+        # Repeated forward on the same session: with no per-launch host reset
+        # (run() default reset_counters=False) the second launch relies on the
+        # kernel's tail cleanup of its workspace counters/flags AND on the
+        # launch-kwargs cache hitting (same buffers/stream) -- this is the
+        # regression guard for both contracts.
+        y_layer2 = mega.forward(t)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        if quantize_input:
+            y_ref = _reference_sm90_fp8_mega_moe_staged(problem, destroy_buffer=True)
+        else:
+            y_ref = _reference_sm90_fp8_mega_moe_prestaged(
+                problem, t_hidden, t_scales, destroy_buffer=True
+            )
+        dist.barrier()
+
+        assert y_layer.shape == (problem["num_tokens"], problem["hidden"])
+        assert y_layer.dtype == torch.bfloat16
+        assert torch.isfinite(y_layer).all()
+        if grouped_token_back:
+            _assert_grouped_close(y_layer, y_ref, combine_format=combine_format)
+            _assert_grouped_close(y_layer2, y_ref, combine_format=combine_format)
+        elif in_kernel_fc2_reduce:
+            # Tolerance verdict vs the explicit-reduce reference; see
+            # _assert_ikr_close.  The repeated forward doubles as the
+            # regression guard for the per-launch output_activation.zero_()
+            # (accumulate-from-zero contract): without it y_layer2 would be
+            # ~2x the reference and fail loudly.
+            _assert_ikr_close(y_layer, y_ref, topk=problem["topk"])
+            _assert_ikr_close(y_layer2, y_ref, topk=problem["topk"])
+        else:
+            # Same kernel, same staged operands, same static scales, and the
+            # separate-reduce path is deterministic -> bit-exact parity, like
+            # the mxfp8 twin.
+            torch.testing.assert_close(y_layer, y_ref, atol=0.0, rtol=0.0)
+            torch.testing.assert_close(y_layer2, y_ref, atol=0.0, rtol=0.0)
+        mega.destroy()
+        return rank
+    except BaseException:
+        # Print the real failure before finalize: a kernel fault poisons the
+        # CUDA context and nvshmem finalize then segfaults, which would
+        # otherwise swallow this traceback.
+        import sys
+        import traceback
+
+        traceback.print_exc()
+        sys.stdout.flush()
+        sys.stderr.flush()
+        raise
+    finally:
+        finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("fp8_scale_mode", ["per_tensor", "blockwise"])
+def test_moe_ep_sm90_pull_fp8_mega_layer_matches_reference(fp8_scale_mode):
+    """MoEEpMegaLayer (sm90_fp8_fp8_bf16_pull_cutedsl) with on-the-fly bf16→FP8 staging."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank, world_size, quantize_input=True, fp8_scale_mode=fp8_scale_mode
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer ({fp8_scale_mode}, staged inputs) "
+        "matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+def test_moe_ep_sm90_pull_fp8_mega_layer_swap_ab_matches_reference():
+    """Swap-AB geometry ((256, 32, 128) token-N tile) on the per_tensor mode."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="per_tensor",
+        swap_ab=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (swap_ab) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,token_back_mode",
+    [
+        ("per_tensor", "reuse_dispatch_warps"),
+        ("per_tensor", "standalone_warps"),
+        ("blockwise", "reuse_dispatch_warps"),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_token_back_matches_reference(
+    fp8_scale_mode, token_back_mode
+):
+    """Push-style fc2 write-back modes match the epi-warps-validated reference.
+
+    ``reuse_dispatch_warps`` is the heuristic table's pick at the GEMM-bound
+    token buckets and ``standalone_warps`` is a tuner candidate, so both
+    need the same bit-level gate as the ``epi_warps`` default.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=fp8_scale_mode,
+        token_back_mode=token_back_mode,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"({fp8_scale_mode}, token_back={token_back_mode}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab,token_back_mode",
+    [
+        ("per_tensor", False, None),
+        ("blockwise", False, None),
+        ("per_tensor", True, None),
+        ("per_tensor", False, "reuse_dispatch_warps"),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_dedup_dispatch_matches_reference(
+    fp8_scale_mode, swap_ab, token_back_mode
+):
+    """Wire-level top-k dedup is bit-exact with the reference.
+
+    The 8-expert/4-rank/top-4 problem routes most tokens to both experts of
+    at least one rank, so the duplicate (carrier-table) path is exercised
+    heavily; the payload bytes must match the non-dedup pull exactly.  The
+    reuse_dispatch_warps case covers dedup sharing the dispatch warps with
+    the push-back token path.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        token_back_mode=token_back_mode,
+        dedup_dispatch=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"({fp8_scale_mode}, swap_ab={swap_ab}, token_back={token_back_mode}, "
+        "dedup_dispatch) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,combine_format,dedup_dispatch",
+    [
+        ("per_tensor", "bf16", False),
+        ("per_tensor", "32e4m3xe8m0", False),
+        ("per_tensor", "32e4m3xe8m0", True),
+        ("blockwise", "32e4m3xe8m0", True),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_grouped_token_back(
+    fp8_scale_mode, combine_format, dedup_dispatch
+):
+    """Combine dedup (grouped token-back), bf16 and quantized fp8 wires.
+
+    The group pre-reduce is fp32 with weights folded into FC1, so the bf16
+    wire differs from the exact reference only by one bf16 rounding of each
+    partial sum; the fp8 wire adds one per-32 e8m0+e4m3 quantization and is
+    gated on SNR.  The dedup_dispatch combinations exercise both wire-dedup
+    directions together.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=fp8_scale_mode,
+        dedup_dispatch=dedup_dispatch,
+        grouped_token_back=True,
+        combine_format=combine_format,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"({fp8_scale_mode}, grouped_token_back, combine={combine_format}, "
+        f"dedup={dedup_dispatch}) within tolerance"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("combine_format", ["bf16", "32e4m3xe8m0"])
+def test_moe_ep_sm90_pull_fp8_mega_layer_grouped_token_back_small_hidden(
+    combine_format,
+):
+    """Grouped combine with hidden below the wire chunk and several pull warps.
+
+    The grouped reducer stages a fixed 512-element wire chunk per warp
+    (1024 B for bf16, 512 B + hidden/32 scale bytes for the fp8 wire), so at
+    hidden=512 a per-warp SMEM slot of one fp8 dispatch row (512 B) would
+    make adjacent active dispatch warps overwrite each other's chunk while
+    its TMA push is still reading it.  The slot is sized from the wire
+    chunk; this case runs two active pull warps to exercise the boundary.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="per_tensor",
+        grouped_token_back=True,
+        combine_format=combine_format,
+        active_dispatch_warps=2,
+        hidden=512,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(grouped_token_back, combine={combine_format}, hidden=512, "
+        "active_dispatch_warps=2) within tolerance"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("active_dispatch_warps", [2, 4])
+def test_moe_ep_sm90_pull_fp8_mega_layer_active_dispatch_warps(active_dispatch_warps):
+    """Non-default active pull-warp counts are bit-exact.
+
+    The knob only re-partitions which dispatch warps issue the NVLink pulls
+    (the default 2 is covered by every other case in this file), so all
+    three settings must reproduce the reference exactly.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="per_tensor",
+        active_dispatch_warps=active_dispatch_warps,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(active_dispatch_warps={active_dispatch_warps}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab",
+    [("per_tensor", False), ("blockwise", False), ("per_tensor", True)],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_fold_producer_warps(fp8_scale_mode, swap_ab):
+    """TMA-A/TMA-B/sched folded into the dispatch warpgroup (no epi_aux warp).
+
+    Exercises the merged warp layout with early fc1_done publication across
+    the 1-WG / 2-WG non-swap kernels and the swap-AB kernel.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        fold_producer_warps=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(fold_producer_warps, {fp8_scale_mode}, swap_ab={swap_ab}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize("cluster_shape_mnk", [(1, 1, 1), (2, 2, 1)])
+def test_moe_ep_sm90_pull_fp8_mega_layer_blockwise_coop_n256(cluster_shape_mnk):
+    """Blockwise non-swap cooperative M64N256 (2 epilogue WGs, no ping-pong).
+
+    The heuristic table never selected N256 for blockwise, so this geometry
+    (blockwise scale staging across two WGMMA fragments) was untested.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="blockwise",
+        swap_ab=False,
+        num_tokens=512,
+        max_tokens=512,
+        mma_tiler_mnk=(64, 256, 128),
+        pingpong=False,
+        cluster_shape_mnk=cluster_shape_mnk,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(blockwise coop M64N256, cga={cluster_shape_mnk}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "case",
+    [
+        # (scale, swap_ab, tile, pingpong, cga, token_back, num_tokens) -- the exact
+        # heuristic rows re-calibrated on 2026-09-02/03 (see TUNING.md).
+        ("per_tensor", True, (256, 16, 128), False, (2, 1, 1), "epi_warps", 8),
+        ("per_tensor", True, (128, 64, 128), False, (1, 2, 1), "epi_warps", 64),
+        # N=8 rows adopted 2026-09-10 (same-node interleaved A/B vs the N>=16
+        # rows: pt64 +13.5%, pt128 +4.6%; pt32 moved from non-swap M64N256 to
+        # cooperative swap M256N8, +6%).
+        ("per_tensor", True, (256, 8, 128), False, (2, 1, 1), "epi_warps", 32),
+        ("per_tensor", True, (128, 8, 128), False, (1, 2, 1), "epi_warps", 64),
+        ("per_tensor", True, (128, 8, 128), True, (1, 2, 1), "epi_warps", 128),
+        (
+            "blockwise",
+            False,
+            (64, 256, 128),
+            False,
+            (2, 2, 1),
+            "reuse_dispatch_warps",
+            2048,
+        ),
+        (
+            "blockwise",
+            False,
+            (64, 256, 128),
+            False,
+            (2, 1, 1),
+            "reuse_dispatch_warps",
+            2048,
+        ),
+        (
+            "blockwise",
+            False,
+            (64, 256, 128),
+            False,
+            (1, 2, 1),
+            "reuse_dispatch_warps",
+            2048,
+        ),
+    ],
+    ids=[
+        "pt8_coop_M256N16",
+        "pt64_basic_M128N64",
+        "pt32_coop_M256N8",
+        "pt64_basic_M128N8",
+        "pt128_pp_M128N8",
+        "bw_coop_N256_cga22_reuse",
+        "bw_coop_N256_cga21_reuse",
+        "bw_coop_N256_cga12_reuse",
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_recalibrated_heuristic_rows(case):
+    """Bit-exact check of every heuristic row changed by the fold re-calibration.
+
+    The multirank tests otherwise pass explicit geometry (manual mode), so the
+    table's new rows are pinned here with their exact tile / ping-pong /
+    cluster shape / token-back.
+    """
+    scale, swap_ab, tile, pingpong, cga, token_back, num_tokens = case
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=scale,
+        swap_ab=swap_ab,
+        num_tokens=num_tokens,
+        max_tokens=max(num_tokens, 64),
+        token_back_mode=token_back,
+        mma_tiler_mnk=tile,
+        pingpong=pingpong,
+        cluster_shape_mnk=cga,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(recalibrated row {scale} swap={swap_ab} tile={tile} pp={pingpong} "
+        f"cga={cga} tb={token_back} tokens={num_tokens}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "case",
+    [
+        # (scale, swap_ab, tile, pingpong, cga, token_back): the tail-split
+        # geometries of the 2026-09-18 heuristic rows (swap-AB ping-pong
+        # M128N128 cga(1,2,1) for per_tensor 1024-32768, non-swap cooperative
+        # M64N256 cga(2,1,1) for blockwise 8192), under both token-back
+        # placements (the dispatch-driven one gates on the fc2_done count the
+        # split tail changes).
+        ("per_tensor", True, (128, 128, 128), True, (1, 2, 1), "epi_warps"),
+        ("per_tensor", True, (128, 128, 128), True, (1, 2, 1), "reuse_dispatch_warps"),
+        ("blockwise", False, (64, 256, 128), False, (2, 1, 1), "epi_warps"),
+        ("blockwise", False, (64, 256, 128), False, (2, 1, 1), "reuse_dispatch_warps"),
+    ],
+    ids=[
+        "pt_pp_M128N128_cga12_epi",
+        "pt_pp_M128N128_cga12_reuse",
+        "bw_coop_N256_cga21_epi",
+        "bw_coop_N256_cga21_reuse",
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_tail_split_pairs(case):
+    """Bit-exact check of the tail-split pair tasks against the reference.
+
+    1088 tokens per rank over 8 experts / top-4 give ~544 rows per expert:
+    4.25 swap-AB N=128 token tiles and 8.5 non-swap M=64 tiles, so every
+    expert ends in an odd CTA-tile count and its tail cluster block runs as
+    pair tasks (both CTAs on the single valid token tile, adjacent weights).
+    """
+    scale, swap_ab, tile, pingpong, cga, token_back = case
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=scale,
+        swap_ab=swap_ab,
+        num_tokens=1088,
+        max_tokens=1088,
+        token_back_mode=token_back,
+        mma_tiler_mnk=tile,
+        pingpong=pingpong,
+        cluster_shape_mnk=cga,
+        tail_split_pairs=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        f"(tail-split pair tasks {scale} swap={swap_ab} tile={tile} "
+        f"pp={pingpong} cga={cga} tb={token_back}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "case",
+    [
+        ("per_tensor", (128, 8, 128), True, (2, 1, 1)),
+        ("per_tensor", (256, 8, 128), False, (2, 1, 1)),
+        # cga (2,1): B multicast splits the (8 x 4 fp32) token-scale box into
+        # 64 B sub-boxes, which the kernel now loads non-multicast (TMA needs a
+        # 128 B-aligned smem destination).  cga (1,1): the same tile without
+        # any cluster split.
+        ("blockwise", (256, 8, 128), False, (2, 1, 1)),
+        ("blockwise", (256, 8, 128), False, (1, 1, 1)),
+        ("blockwise", (128, 8, 128), True, (1, 2, 1)),
+    ],
+    ids=[
+        "pt_pp_M128N8",
+        "pt_coop_M256N8",
+        "bw_coop_M256N8",
+        "bw_coop_M256N8_cga1",
+        "bw_pp_M128N8",
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_layer_swapab_token_tile_8(case):
+    """Experimental swap-AB token tile N=8 (wgmma m64n8k32) bit-exact check."""
+    scale, tile, pingpong, cga = case
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode=scale,
+        swap_ab=True,
+        num_tokens=16,
+        mma_tiler_mnk=tile,
+        pingpong=pingpong,
+        cluster_shape_mnk=cga,
+    )
+    print(
+        f"rank {rank}: swap-AB token tile 8 ({scale} tile={tile} pp={pingpong} cga={cga}) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+def test_moe_ep_sm90_pull_fp8_mega_layer_dedup_dispatch_multi_waiter():
+    """Dedup with several waiters per carrier and a partial warp lane group.
+
+    12 experts / 4 ranks (3 local) / top-6 makes two-or-three routes to one
+    rank common (two duplicates waiting on one carrier) and 6 does not
+    divide 32, exercising the inactive-lane path of the carrier election.
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="per_tensor",
+        dedup_dispatch=True,
+        num_experts=12,
+        topk=6,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        "(dedup_dispatch, 12 experts top-6 multi-waiter) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+def test_moe_ep_sm90_pull_fp8_mega_layer_dedup_dispatch_in_kernel_reduce():
+    """Dedup composed with the REDG in-kernel fc2 reduce path."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="per_tensor",
+        in_kernel_fc2_reduce=True,
+        dedup_dispatch=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer "
+        "(dedup_dispatch + in_kernel_fc2_reduce) matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+def test_moe_ep_sm90_pull_fp8_mega_layer_prestaged_inputs_matches_reference():
+    """Pre-staged FP8 activations + blockwise fp32 scales through MoEEpTensors."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank, world_size, quantize_input=False, fp8_scale_mode="blockwise"
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (prestaged blockwise inputs) "
+        "matches reference"
+    )
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+def test_moe_ep_sm90_pull_fp8_mega_layer_in_kernel_fc2_reduce():
+    """In-flight top-k combine (``in_kernel_fc2_reduce=True``) for SM90 FP8.
+
+    The symm buffer allocates ``output_activation`` on the symmetric heap
+    unconditionally (cross-rank REDG atomic-add target) and the shim zeroes it
+    before every launch (accumulate-from-zero contract; the second forward
+    inside ``_run_mega_layer`` would come back ~2x without it).
+    """
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_layer(
+        rank,
+        world_size,
+        quantize_input=True,
+        fp8_scale_mode="per_tensor",
+        in_kernel_fc2_reduce=True,
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega layer (in_kernel_fc2_reduce) "
+        "matches reference within tolerance"
+    )
+
+
+def _all_gather_stack(t):
+    """all_gather a per-rank tensor and stack it on a new leading rank dim.
+
+    FP8 payloads and E8M0 scale planes travel as uint8 bytes (NCCL supports
+    neither dtype) and are reinterpreted after the stack.
+    """
+    import torch
+    import torch.distributed as dist
+
+    world_size = dist.get_world_size()
+    tc = t.contiguous()
+    byte_wire = tc.element_size() == 1 and tc.dtype != torch.uint8
+    wire = tc.view(torch.uint8) if byte_wire else tc
+    gathered = [torch.empty_like(wire) for _ in range(world_size)]
+    dist.all_gather(gathered, wire)
+    stacked = torch.stack(gathered)
+    return stacked.view(tc.dtype) if byte_wire else stacked
+
+
+def _check_generate_c_output(fc1_c, ref_map, idx_g, rank, num_local_experts):
+    """generate_c: compare the kernel's fc1_c pool with the reference gate+up.
+
+    Rows inside an expert segment follow the dispatch arrival order, so each
+    expert is compared as a sorted flat array (the drop runner's recipe); the
+    128-row segment offsets are rebuilt from the global routing, and the pad
+    rows must have stayed zero.
+    """
+    import torch
+
+    assert fc1_c is not None, "generate_c=True but fc1_c is None"
+    expert_start = rank * num_local_experts
+    counts = [
+        int((idx_g == expert_start + e).sum().item()) for e in range(num_local_experts)
+    ]
+    offsets = [0]
+    for v in counts:
+        offsets.append(offsets[-1] + ((v + 127) // 128) * 128)
+    assert offsets[-1] <= fc1_c.shape[0], (offsets[-1], fc1_c.shape)
+    checked = 0
+    for e in range(num_local_experts):
+        v = counts[e]
+        ref = ref_map.get(expert_start + e)
+        if v == 0 or ref is None:
+            continue
+        rows = fc1_c[offsets[e] : offsets[e] + v]
+        assert rows.shape == ref.shape, (e, tuple(rows.shape), tuple(ref.shape))
+        kernel_c = rows.float().flatten().sort().values
+        ref_c = ref.to(rows.device).float().flatten().sort().values
+        torch.testing.assert_close(kernel_c, ref_c, atol=1e-2, rtol=1e-2)
+        pad = fc1_c[offsets[e] + v : offsets[e + 1]]
+        assert pad.numel() == 0 or pad.abs().max().item() == 0.0, (
+            f"expert {e}: non-zero pad rows"
+        )
+        checked += 1
+    assert checked > 0, "no local expert received tokens"
+    return checked
+
+
+def _run_mega_torch_oracle(
+    rank, world_size, *, fp8_scale_mode, swap_ab=False, generate_c=False
+):
+    """Real-EP kernel launch vs the drop's pure-torch GLOBAL reference.
+
+    Every rank stages its own bf16 shard, runs the fused kernel with real
+    cross-rank NVSHMEM pulls, then all-gathers the ACTUAL staged fp8
+    activations + routing + preprocessed weight legs (no reliance on
+    cross-rank RNG determinism) and feeds the global problem to
+    ``compute_megamoe_reference_fp8`` — which is multi-rank native: it takes
+    ``(num_ranks, tokens_per_rank, ...)`` operands and computes
+    ``expert(topk_idx[r, t, k])`` across rank boundaries.  Each rank asserts
+    its own output slice within the single-GPU oracle's tolerances.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        bootstrap_moe_ep_runtime,
+        ensure_moe_ep_cuda_device,
+        finalize_moe_ep_runtime,
+    )
+    from flashinfer.moe_ep.backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.staging import (
+        stage_mega_moe_inputs,
+    )
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+    from flashinfer.moe_ep.kernel_src.sm90.pull_style_cutedsl_megakernel import (
+        Fp8BlockScaleK,
+        compute_megamoe_reference_fp8,
+        hopper_fp8_mega_moe,
+    )
+
+    bootstrap = BootstrapConfig(world_size=world_size, rank=rank)
+    ensure_moe_ep_cuda_device(bootstrap)
+    problem = _mega_problem(
+        rank, world_size, fp8_scale_mode=fp8_scale_mode, swap_ab=swap_ab
+    )
+    kernel = create_mega_kernel(_megakernel_config(problem))
+    runtime = bootstrap_moe_ep_runtime(
+        bootstrap,
+        kernel.runtime_requirements(bootstrap),
+    )
+    try:
+        n = problem["num_tokens"]
+        hidden = problem["hidden"]
+
+        symm_buffer = _alloc_symm_buffer(
+            problem, rank, world_size, generate_c=generate_c
+        )
+        try:
+            stage_mega_moe_inputs(
+                problem["hidden_states"],
+                problem["topk_weights"],
+                problem["topk_ids"],
+                symm_buffer.x,
+                symm_buffer.x_sf,
+                symm_buffer.topk_idx,
+                symm_buffer.topk_weights,
+                kind=problem["kind"],
+                fp8_scale_mode=fp8_scale_mode,
+                fc1_activation_dequant_scale=FC1_ACT_SCALE,
+            )
+            # Snapshot exactly what the kernel consumes (this rank's shard).
+            x_local = symm_buffer.x[:n].clone()
+            x_sf_local = symm_buffer.x_sf[:n].clone()
+
+            transformed_l1, transformed_l2 = _preprocess_weights(problem)
+
+            y_kernel = torch.empty(n, hidden, dtype=torch.bfloat16, device="cuda")
+            hopper_fp8_mega_moe(
+                y_kernel,
+                transformed_l1,
+                transformed_l2,
+                symm_buffer,
+                num_tokens=n,
+                gate_up_clamp=problem["gate_up_clamp"],
+                fast_math=problem["fast_math"],
+            )
+            torch.cuda.synchronize()
+            dist.barrier()
+
+            # Reassemble the global problem from the operands each rank staged.
+            x_g = _all_gather_stack(x_local)  # (R, n, hidden) fp8
+            idx_g = _all_gather_stack(problem["topk_ids"])  # (R, n, K) int64
+            w_g = _all_gather_stack(problem["topk_weights"])  # (R, n, K) fp32
+            # The per-tensor reference multiplies via torch._scaled_mm, which
+            # needs column-major B (K stride-1, as preprocess_mega_weights lays
+            # out); ship the contiguous transpose and transpose back so the
+            # gather does not silently re-stride the weights to row-major.
+            fc1_w_g = _all_gather_stack(transformed_l1[0].mT).mT  # (R, E_local, H, 2I)
+            fc2_w_g = _all_gather_stack(transformed_l2[0].mT).mT  # (R, E_local, I, H)
+            fc1_sf_g = _all_gather_stack(transformed_l1[1])
+            fc2_sf_g = _all_gather_stack(transformed_l2[1])
+
+            common_kwargs = dict(
+                input_activation=x_g,
+                input_topk_idx=idx_g,
+                input_topk_weights=w_g,
+                fc1_weight=fc1_w_g,
+                fc1_weight_sf=fc1_sf_g,
+                fc2_weight=fc2_w_g,
+                fc2_weight_sf=fc2_sf_g,
+                ab_dtype=torch.float8_e4m3fn,
+                ref_compute_graph="deepgemm",  # matches the shim's apply_topk_in_fc1
+                fp8_accum_mode="1xacc",
+                mma_tiler_k=128,
+                fc2_output_dtype=torch.bfloat16,
+                gate_up_clamp=problem["gate_up_clamp"],
+                fp8_scale_mode=fp8_scale_mode,
+                return_fc1_gateup=generate_c,
+            )
+            if fp8_scale_mode == "blockwise":
+                sf_cols = hidden // Fp8BlockScaleK
+                x_sf_g = _all_gather_stack(x_sf_local[:, :sf_cols].clone())
+                combine_ref = compute_megamoe_reference_fp8(
+                    input_activation_sf=x_sf_g,
+                    fc1_activation_block_scale=x_sf_g,
+                    fc1_weight_block_scale=fc1_sf_g,
+                    fc2_weight_block_scale=fc2_sf_g,
+                    fc2_activation_block_scale=None,  # derived per token, like the kernel
+                    **common_kwargs,
+                )
+            else:
+                # Static per-tensor activation scales are identical on every EP
+                # rank by contract, so the local (1,) legs stand in globally.
+                combine_ref = compute_megamoe_reference_fp8(
+                    input_activation_sf=_all_gather_stack(x_sf_local),  # unused (ABI)
+                    fc1_activation_dequant_scale=transformed_l1[2],
+                    fc1_weight_dequant_scale=_all_gather_stack(transformed_l1[3]),
+                    fc2_activation_dequant_scale=transformed_l2[2],
+                    fc2_weight_dequant_scale=_all_gather_stack(transformed_l2[3]),
+                    **common_kwargs,
+                )
+            # deepgemm graph folds topk weights before fc1-out quantization, so
+            # the per-topk terms reduce with a plain sum; compare this rank's slice.
+            fc1_gateup_ref = None
+            if generate_c:
+                combine_ref, fc1_gateup_ref = combine_ref
+            y_ref = combine_ref[rank].to(torch.float32).sum(dim=1)
+
+            assert torch.isfinite(y_kernel).all()
+            yk = y_kernel.to(torch.float32)
+            rel_l2 = (yk - y_ref).norm() / y_ref.norm().clamp_min(1e-6)
+            print(
+                f"[sm90 fp8 multirank oracle rank {rank} {fp8_scale_mode} "
+                f"swap_ab={swap_ab}] rel_l2={rel_l2.item():.4g} "
+                f"max|d|={(yk - y_ref).abs().max().item():.4g} "
+                f"amax(ref)={y_ref.abs().max().item():.4g}"
+            )
+            # Single-GPU oracle tolerances (drop mega_runner: atol=rtol=1e-2),
+            # valid because the problem is conditioned to O(1) outputs and kernel
+            # + reference share the same gathered fp8 operands.
+            torch.testing.assert_close(yk, y_ref, atol=1e-2, rtol=1e-2)
+            assert rel_l2.item() < 0.02
+            if generate_c:
+                checked = _check_generate_c_output(
+                    symm_buffer.fc1_c,
+                    fc1_gateup_ref,
+                    idx_g,
+                    rank,
+                    problem["num_experts"] // world_size,
+                )
+                print(
+                    f"[sm90 fp8 generate_c rank {rank} {fp8_scale_mode} "
+                    f"swap_ab={swap_ab}] fc1_c matches the reference gate+up "
+                    f"for {checked} local experts"
+                )
+            return rank
+        finally:
+            # A failing rank must still free its symmetric-heap slice;
+            # leaking it turns a clean failure into a multi-rank hang.
+            symm_buffer.destroy()
+    finally:
+        finalize_moe_ep_runtime(runtime)
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab",
+    [
+        ("per_tensor", False),
+        ("per_tensor", True),
+        ("blockwise", False),
+        ("blockwise", True),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_multirank_torch_oracle(fp8_scale_mode, swap_ab):
+    """Real cross-rank EP kernel vs pure-torch global math (see helper doc)."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    rank = _run_mega_torch_oracle(
+        rank, world_size, fp8_scale_mode=fp8_scale_mode, swap_ab=swap_ab
+    )
+    print(
+        f"rank {rank}: sm90_fp8_fp8_bf16_pull_cutedsl mega kernel ({fp8_scale_mode}, "
+        f"swap_ab={swap_ab}) matches the multi-rank torch oracle"
+    )
+
+
+@pytest.mark.arch_hopper
+def test_sm90_pull_fp8_preprocess_mega_weights_from_bf16():
+    _require_cuda()
+
+    import torch
+
+    rank, world_size = _launcher_ranks()
+    problem = _mega_problem(rank, world_size, fp8_scale_mode="per_tensor")
+    num_local_experts = problem["num_experts"] // world_size
+
+    transformed_l1, transformed_l2 = _preprocess_weights(problem)
+
+    fc1_weight, fc1_sf, fc1_act_scale, fc1_w_scale = transformed_l1
+    fc2_weight, fc2_sf, fc2_act_scale, fc2_w_scale = transformed_l2
+    assert fc1_weight.shape == (
+        num_local_experts,
+        problem["hidden"],
+        2 * problem["intermediate"],
+    )
+    assert fc2_weight.shape == (
+        num_local_experts,
+        problem["intermediate"],
+        problem["hidden"],
+    )
+    # K-major invariant: GEMM K must be the stride-1 axis (dim 1).
+    assert fc1_weight.stride(1) == 1
+    assert fc2_weight.stride(1) == 1
+    assert fc1_weight.dtype == torch.float8_e4m3fn
+    assert fc2_weight.dtype == torch.float8_e4m3fn
+    assert fc1_sf.shape[0] == num_local_experts
+    assert fc2_sf.shape[0] == num_local_experts
+    assert fc1_act_scale.shape == (1,) and fc1_act_scale.dtype == torch.float32
+    assert fc2_act_scale.shape == (1,) and fc2_act_scale.dtype == torch.float32
+    assert fc1_w_scale.shape == (num_local_experts,)
+    assert fc2_w_scale.shape == (num_local_experts,)
+
+
+def test_sm90_pull_fp8_mega_kernel_is_registered():
+    from flashinfer.moe_ep import Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
+    from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
+
+    kernel = create_mega_kernel(
+        Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig(intermediate_size=128, top_k=2)
+    )
+    assert kernel.kernel_name() == "sm90_fp8_fp8_bf16_pull_cutedsl"
+
+
+@pytest.mark.gpu_4
+@pytest.mark.arch_hopper
+@pytest.mark.parametrize(
+    "fp8_scale_mode,swap_ab",
+    [
+        ("per_tensor", False),
+        ("per_tensor", True),
+        ("blockwise", False),
+        ("blockwise", True),
+    ],
+)
+def test_moe_ep_sm90_pull_fp8_mega_multirank_generate_c(fp8_scale_mode, swap_ab):
+    """Training forward (generate_c=True): the raw pre-SwiGLU fc1 gate+up
+    pool written by the kernel matches the multi-rank torch reference for
+    every local expert, on both layouts and both scale modes, while the
+    combined output still matches the oracle."""
+    _require_cuda()
+    rank, world_size = _launcher_ranks()
+    if world_size < 4:
+        pytest.skip("needs >=4 ranks")
+    _run_mega_torch_oracle(
+        rank,
+        world_size,
+        fp8_scale_mode=fp8_scale_mode,
+        swap_ab=swap_ab,
+        generate_c=True,
+    )

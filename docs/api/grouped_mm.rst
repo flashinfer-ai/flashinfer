@@ -43,3 +43,19 @@ FP4 (NVFP4 / MXFP4)
     :toctree: ../generated
 
     grouped_mm_fp4
+
+MXFP8 MoE GEMM (SM120 cute backend)
+-----------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    moe_gemm_mxfp8_nt_groupwise
+
+FP8 MoE GEMM (SM120 cute backend)
+---------------------------------
+
+.. autosummary::
+    :toctree: ../generated
+
+    moe_gemm_fp8_nt_groupwise

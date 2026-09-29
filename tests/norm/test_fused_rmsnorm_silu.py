@@ -285,6 +285,13 @@ RANDOM_SHAPES = [
     (3000, 256),
     (50000, 512),
     (200000, 1024),
+    # C=48: exercises the partial-tail LDG path (VEC_COLS=24 < 32 threads).
+    # bf16 only — nvfp4 forbidden because C must be a multiple of 32.
+    (1, 48),
+    (1560, 48),
+    (24960, 48),
+    (399360, 48),
+    (901120, 48),
 ]
 
 
@@ -326,6 +333,9 @@ RANDOM_SHAPES_FP8 = [
     (2048, 1024),
     (4096, 128),
     (8192, 640),
+    # C=48: partial-tail LDG path with FP8 output.
+    (1560, 48),
+    (24960, 48),
 ]
 
 
@@ -549,6 +559,7 @@ def test_epsilon_sensitivity():
 
 
 def test_uniform_weight():
+    """RMSNorm+SiLU on bf16 with uniform (all-ones) gamma."""
     import flashinfer
 
     num_tokens, hidden_size = 1560, 256
@@ -564,6 +575,31 @@ def test_uniform_weight():
 
     mismatches = ~torch.isclose(out.float(), ref.float(), atol=2e-2, rtol=2e-2)
     assert mismatches.sum().item() == 0
+
+
+# ============================================================
+# C=48 partial-tail LDG path
+# ============================================================
+# C=48 exercises the kernel's partial-tail LDG codepath: with bf16 input and
+# bytes_per_ldg=4, VEC_COLS=24 < THREADS_PER_ROW=32, so LDGS_FULL=0 and a
+# single tail LDG runs with only 24 of 32 lanes active per warp. The bf16
+# and fp8 stores are predicated per-lane; nvfp4 is unsupported at C=48
+# because C must be a multiple of 32 (the BlockScale path uses warp-wide
+# cooperation that cannot tolerate inactive lanes).
+
+
+@pytest.mark.skipif(not has_fp4_dtype, reason="torch.float4_e2m1fn_x2 not available")
+def test_c48_nvfp4_unsupported():
+    """C=48 must be rejected for NVFP4 (C % 32 != 0)."""
+    import flashinfer
+
+    num_tokens, C = 1560, 48
+    x = torch.randn(num_tokens, C, dtype=torch.bfloat16, device="cuda")
+    weight = torch.rand(C, dtype=torch.bfloat16, device="cuda")
+    out = torch.empty(num_tokens, C // 2, dtype=torch.float4_e2m1fn_x2, device="cuda")
+
+    with pytest.raises((ValueError, RuntimeError)):
+        flashinfer.fused_rmsnorm_silu(x, weight, eps=1e-6, out=out)
 
 
 # ============================================================
