@@ -698,3 +698,17 @@ def test_binding_cache_backward_hits_are_bitwise_and_fresh():
         torch.cuda.synchronize()
         assert torch.equal(grads[0][0], grads[1][0]) and torch.equal(grads[0][1], grads[1][1])
         assert torch.equal(grads[1][0], a[0]) and torch.equal(grads[1][1], a[1])
+
+
+def test_autograd_lse_gradient_is_rejected_and_unused_out_gives_no_grad():
+    _require_program(backward=True)
+    inp = make_inputs([128], [256], seed=SEED + 15, topk=64)
+    leaves = [t.detach().clone().requires_grad_() for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)]
+    with _quiet_experimental():
+        out, lse = dsa_sparse_attention(*leaves, inp.idx_global, return_lse=True)
+    # only out is differentiable: a gradient arriving through lse fails loudly instead of being dropped
+    with pytest.raises(NotImplementedError, match="lse"):
+        torch.autograd.grad(lse.sum(), leaves)
+    g = torch.autograd.grad(out, leaves, inp.dout)
+    torch.cuda.synchronize()
+    assert all(t is not None and t.shape == leaf.shape for t, leaf in zip(g, leaves, strict=True))
