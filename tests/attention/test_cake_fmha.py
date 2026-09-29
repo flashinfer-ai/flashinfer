@@ -17,9 +17,13 @@ from flashinfer.jit.cake_fmha import (
     cake_fmha_smallm_component_name,
     gen_cake_fmha_decode_native_bf16_hd256_smallm_module,
     get_cake_fmha_decode_native_bf16_hd256_smallm_uri,
+    CAKE_FMHA_BALANCED_FP8_Q_DTYPES,
+    CAKE_FMHA_BALANCED_HD256_PAGE_SIZES,
     CAKE_FMHA_FLASHINFER_BINDINGS_SHA256,
     CAKE_FMHA_FLASHINFER_MATRIX_REVISION,
     CAKE_FMHA_MANIFEST_SHA256,
+    cake_fmha_balanced_fp8_component_name,
+    cake_fmha_balanced_hd256_component_name,
     gen_cake_fmha_compat_module,
     gen_cake_fmha_context_bf16_module,
     gen_cake_fmha_context_fp16_hd256_module,
@@ -27,6 +31,9 @@ from flashinfer.jit.cake_fmha import (
     gen_cake_fmha_context_fp8_hd256_module,
     gen_cake_fmha_context_nvfp4_module,
     gen_cake_fmha_decode_balanced_bf16_module,
+    gen_cake_fmha_decode_balanced_fp8_module,
+    gen_cake_fmha_decode_balanced_hd256_module,
+    gen_cake_fmha_decode_balanced_hd64_module,
     gen_cake_fmha_decode_balanced_module,
     gen_cake_fmha_decode_native_bf16_module,
     gen_cake_fmha_decode_native_fp16_hd512_module,
@@ -42,6 +49,9 @@ from flashinfer.jit.cake_fmha import (
     get_cake_fmha_context_fp8_hd256_uri,
     get_cake_fmha_context_nvfp4_uri,
     get_cake_fmha_decode_balanced_bf16_uri,
+    get_cake_fmha_decode_balanced_fp8_uri,
+    get_cake_fmha_decode_balanced_hd256_uri,
+    get_cake_fmha_decode_balanced_hd64_uri,
     get_cake_fmha_decode_balanced_uri,
     get_cake_fmha_decode_native_bf16_uri,
     get_cake_fmha_decode_native_fp16_hd512_uri,
@@ -69,18 +79,20 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
     assert manifest["capability"]["cake_coverage_ratio"] == 1.0
     assert manifest["capability"]["upstream_valid_cases"] == 57_280
     assert manifest["capability"]["cake_covered_cases"] == 57_280
-    assert manifest["capability"]["route_counts"]["cake_fmha_compat_v1"] == 55_470
-    # 29 pinned product probes plus the two correctness rows each balanced
-    # route (bf16, fp16) adds to the contract.
-    assert len(manifest["route_probes"]) == 33
+    assert manifest["capability"]["route_counts"]["cake_fmha_compat_v1"] == 55_374
+    # 29 pinned product probes plus the 19 correctness rows the balanced routes
+    # (bf16, fp16, fp8, bf16q, fp16q, bf16 hd64, bf16 hd256) add to the contract.
+    assert len(manifest["route_probes"]) == 48
     assert {probe["label"] for probe in manifest["route_probes"]} >= {
         "correctness_compat_decode_fp8_nhd_separate_group5",
         "correctness_compat_decode_fp8_hnd_shared_group8_partial",
         "correctness_decode_fp8_hnd_shared_group8_full_blocks",
     }
-    # 143 base/composed artifacts plus the six CAKE-459 small-M hd256 decode
-    # instances (two arch bodies + one launch binding each).
-    assert len(manifest["artifacts"]) == 179
+    # 143 base/composed artifacts, the six CAKE-459 small-M hd256 decode
+    # instances (two arch bodies + one launch binding each) and the seven
+    # round-2 balanced components (fp8, bf16q, fp16q, bf16 hd64, bf16 hd256
+    # p16/p32/p64: two arch programs + one launch binding each).
+    assert len(manifest["artifacts"]) == 200
     dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
     assert dcp_addon["installed"] is True
     assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
@@ -107,8 +119,8 @@ def test_cake_fmha_registry_accounts_for_manifest_routes_and_components() -> Non
     manifest_route_counts = manifest["capability"]["route_counts"]
     manifest_optimized_routes = set(manifest_route_counts) - {"cake_fmha_compat_v1"}
     assert manifest_optimized_routes <= set(cake_api._PRODUCT_ROUTE_COMPONENTS)
-    assert cake_api._manifest_optimized_route_accounting() == (1_810, 1_810)
-    assert cake_api._manifest_authenticated_route_accounting() == (1_810, 1_810)
+    assert cake_api._manifest_optimized_route_accounting() == (1_906, 1_906)
+    assert cake_api._manifest_authenticated_route_accounting() == (1_906, 1_906)
     for route_name, components in cake_api._PRODUCT_ROUTE_COMPONENTS.items():
         manifest_components = tuple(
             dict.fromkeys(
@@ -138,13 +150,13 @@ def test_cake_fmha_high_level_selectors_match_pinned_capability_corpus(
     assert PINNED_FLASHINFER_REVISION == CAKE_FMHA_FLASHINFER_MATRIX_REVISION
     assert report.raw_cases == 80_768
     assert report.valid_cases == 57_280
-    assert report.optimized_cases == 1_810
-    assert report.compat_cases == 55_470
+    assert report.optimized_cases == 1_906
+    assert report.compat_cases == 55_374
     assert report.route_counts == dict(
         sorted(manifest["capability"]["route_counts"].items())
     )
     assert report.digest == (
-        "c3c1e73cb08724c9938b6d38fba8a0338cc8db3be676ad0325343c63b11aa16c"
+        "bac35578d289126db5e078275890f6f87c5237895ae7750ca419b06be13feb9a"
     )
 
 
@@ -365,7 +377,7 @@ def test_cake_fmha_decode_native_bf16_exact_sink_grid_matches_selector(
     )
     assert launch_override["grid"] == ["Q_LEN", "NUM_KV_HEADS", "BATCH_SIZE"]
     assert launch_override["use_pdl"] is True
-    assert len(cake_jit._FLASHINFER_BINDINGS) == 14
+    assert len(cake_jit._FLASHINFER_BINDINGS) == 17
     assert sink_binding not in cake_jit._FLASHINFER_BINDINGS
     assert (
         cake_jit._sha256(get_cake_fmha_csrc_dir() / sink_binding)
@@ -883,6 +895,9 @@ def test_cake_fmha_optimized_context_adapters_require_signed_seq_lens(
         ("jit/cake_fmha_context_hd256_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_bf16_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_balanced_jit_binding.cu", 3),
+        ("jit/cake_fmha_decode_balanced_fp8_jit_binding.cu", 3),
+        ("jit/cake_fmha_decode_balanced_hd64_jit_binding.cu", 3),
+        ("jit/cake_fmha_decode_balanced_hd256_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_fp16_hd512_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_native_fp16_nhd_jit_binding.cu", 3),
         ("jit/cake_fmha_decode_quant_bf16q_jit_binding.cu", 2),
@@ -923,6 +938,18 @@ def test_cake_fmha_typed_launch_adapters_use_typed_tensor_maps(
         ),
         (
             "jit/cake_fmha_decode_balanced_jit_binding.cu",
+            ("{q_slot, k_slot, v_slot}",),
+        ),
+        (
+            "jit/cake_fmha_decode_balanced_fp8_jit_binding.cu",
+            ("{q_slot, k_slot, v_slot}", "{k_slot, v_slot}"),
+        ),
+        (
+            "jit/cake_fmha_decode_balanced_hd64_jit_binding.cu",
+            ("{q_slot, k_slot, v_slot}",),
+        ),
+        (
+            "jit/cake_fmha_decode_balanced_hd256_jit_binding.cu",
             ("{q_slot, k_slot, v_slot}",),
         ),
         (
@@ -3056,6 +3083,26 @@ def test_cake_decode_bf16_hd256_smallm_route_is_selected() -> None:
     torch.testing.assert_close(lse.float(), expected_lse, atol=1e-2, rtol=1e-2)
 
 
+_BALANCED_AGENTX = [
+    237569,
+    120001,
+    65536,
+    4097,
+    32768,
+    8192,
+    190000,
+    512,
+    100000,
+    76543,
+    2048,
+    150000,
+    33000,
+    64000,
+    12345,
+    200000,
+]
+
+
 def _balanced_decode_kwargs(
     *,
     batch_size: int,
@@ -3064,10 +3111,25 @@ def _balanced_decode_kwargs(
     seq_lens,
     sm_count: int = 148,
     dtype: torch.dtype = torch.bfloat16,
+    head_dim: int = 128,
+    page_size: int = 16,
+    group: int = 8,
+    q_dtype: torch.dtype | None = None,
+    kv_dtype: torch.dtype | None = None,
+    o_dtype: torch.dtype | None = None,
+    bmm1_scale: float | None = None,
+    bmm2_scale: float = 1.0,
 ):
-    num_q_heads = 8 * num_kv_heads
-    query = torch.empty((batch_size * q_len, num_q_heads, 128), dtype=dtype)
-    key = torch.empty((4, num_kv_heads, 16, 128), dtype=dtype)
+    """Host-side ``select_cake_fmha_decode_route`` inputs of the balanced
+    families.  ``dtype`` is the Q / KV / O default; ``q_dtype`` / ``kv_dtype`` /
+    ``o_dtype`` override it per tensor (E4M3 cache families)."""
+
+    q_dtype = dtype if q_dtype is None else q_dtype
+    kv_dtype = q_dtype if kv_dtype is None else kv_dtype
+    o_dtype = q_dtype if o_dtype is None else o_dtype
+    num_q_heads = group * num_kv_heads
+    query = torch.empty((batch_size * q_len, num_q_heads, head_dim), dtype=q_dtype)
+    key = torch.empty((4, num_kv_heads, page_size, head_dim), dtype=kv_dtype)
     value = torch.empty_like(key)
     seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
     max_seq_len = int(seq_lens.max())
@@ -3075,21 +3137,24 @@ def _balanced_decode_kwargs(
         query=query,
         key_cache=key,
         value_cache=value,
-        out=torch.empty_like(query),
+        out=torch.empty_like(query, dtype=o_dtype),
         workspace_buffer=torch.empty(
-            cake_api.cake_fmha_balanced_workspace_bytes(sm_count, q_len),
+            cake_api.cake_fmha_balanced_workspace_bytes(
+                sm_count, q_len, head_dim=head_dim
+            ),
             dtype=torch.uint8,
         ),
         block_tables=torch.zeros(
-            (batch_size, (max_seq_len + 15) // 16), dtype=torch.int32
+            (batch_size, (max_seq_len + page_size - 1) // page_size),
+            dtype=torch.int32,
         ),
         seq_lens=seq_lens,
         batch_size=batch_size,
         q_len=q_len,
         max_seq_len=max_seq_len,
         window_left=-1,
-        bmm1_scale=0.08838834764831845,
-        bmm2_scale=1.0,
+        bmm1_scale=head_dim**-0.5 if bmm1_scale is None else bmm1_scale,
+        bmm2_scale=bmm2_scale,
         o_scale=1.0,
         sinks=None,
         kv_layout="HND",
@@ -3100,7 +3165,8 @@ def _balanced_decode_kwargs(
         skip_softmax_threshold_scale_factor=None,
         enable_block_sparse_attention=False,
         multi_ctas_kv_counter_buffer=torch.zeros(
-            cake_api.cake_fmha_balanced_counter_bytes(sm_count), dtype=torch.uint8
+            cake_api.cake_fmha_balanced_counter_bytes(sm_count, head_dim=head_dim),
+            dtype=torch.uint8,
         ),
     )
 
@@ -3251,6 +3317,272 @@ def test_cake_fmha_balanced_decode_route_owns_long_ragged_gqa8_decode(
         assert selected is None or selected.component != component, mutation
 
 
+def _select_balanced_kwargs(kwargs):
+    return cake_api.select_cake_fmha_decode_route(kwargs["query"].device, **kwargs)
+
+
+@pytest.mark.parametrize("q_dtype_name", ["fp8", "bf16q", "fp16q"])
+def test_cake_fmha_balanced_fp8_kv_route_owns_gqa8_e4m3_decode(
+    monkeypatch, q_dtype_name
+) -> None:
+    q_dtype = {
+        "fp8": torch.float8_e4m3fn,
+        "bf16q": torch.bfloat16,
+        "fp16q": torch.float16,
+    }[q_dtype_name]
+    component = f"decode_balanced_{q_dtype_name}"
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    monkeypatch.setattr(cake_api, "_smallm_sm_count", lambda device: 148)
+
+    def build(**overrides):
+        params = dict(
+            batch_size=16,
+            q_len=1,
+            num_kv_heads=1,
+            seq_lens=_BALANCED_AGENTX,
+            q_dtype=q_dtype,
+            kv_dtype=torch.float8_e4m3fn,
+            bmm1_scale=0.02,
+            bmm2_scale=1.5,
+        )
+        params.update(overrides)
+        return _balanced_decode_kwargs(**params)
+
+    kwargs = build()
+    route = _select_balanced_kwargs(kwargs)
+    assert route == cake_api.CakeFmhaDecodeRoute(
+        target="sm100a",
+        batch_size=16,
+        q_len=1,
+        num_q_heads=8,
+        num_kv_heads=1,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=False,
+        retain_kv_l2=False,
+        component=component,
+        page_size=16,
+    )
+    assert cake_api.cake_fmha_route_is_optimized(route)
+    assert cake_api._route_components(route) == (component,)
+
+    # The band admits every shape: short KV bounds and few work tiles included.
+    for batch_size, seq_lens in ((1, [300]), (4, [512, 16, 4096, 1]), (8, [65536] * 8)):
+        short = _select_balanced_kwargs(build(batch_size=batch_size, seq_lens=seq_lens))
+        assert short is not None and short.component == component, (
+            batch_size,
+            seq_lens,
+        )
+
+    # q_len 1 only (no packed MTP tile), eight query heads per KV head only,
+    # 16-token pages only: everything else stays on the quantized routes or
+    # the compat kernel.
+    for overrides in (
+        dict(q_len=3),
+        dict(q_len=8),
+        dict(group=4),
+        dict(group=7),
+        dict(page_size=32),
+        dict(batch_size=1025, seq_lens=[4096] * 1025),
+    ):
+        other = _select_balanced_kwargs(build(**overrides))
+        assert other is None or other.component != component, overrides
+
+    # Host scalars only: device-tensor scales, non-positive scales and every
+    # extension the exported kernels do not serve fail closed.
+    for mutation in (
+        {"bmm1_scale": torch.ones(1, dtype=torch.float32)},
+        {"bmm2_scale": torch.ones(1, dtype=torch.float32)},
+        {"bmm1_scale": 0.0},
+        {"bmm2_scale": 0.0},
+        {"o_scale": 0.5},
+        {"sinks": torch.zeros(8, dtype=torch.float32)},
+        {"window_left": 1024},
+        {"uses_shared_paged_kv_idx": False},
+        {"kv_layout": "NHD"},
+        {"lse": torch.empty((16, 8), dtype=torch.float32)},
+        {
+            "key_block_scales": torch.empty((4, 1, 16, 8), dtype=torch.float8_e4m3fn),
+            "value_block_scales": torch.empty((4, 1, 16, 8), dtype=torch.float8_e4m3fn),
+        },
+        {"workspace_buffer": torch.empty(4096, dtype=torch.uint8)},
+        {"multi_ctas_kv_counter_buffer": torch.zeros(64, dtype=torch.uint8)},
+    ):
+        mutated = {**kwargs, **mutation}
+        selected = _select_balanced_kwargs(mutated)
+        assert selected is None or selected.component != component, mutation
+
+
+def test_cake_fmha_balanced_hd64_route_owns_bf16_gqa_decode(monkeypatch) -> None:
+    component = "decode_balanced_bf16_hd64"
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    monkeypatch.setattr(cake_api, "_smallm_sm_count", lambda device: 148)
+
+    def build(**overrides):
+        params = dict(
+            batch_size=16,
+            q_len=1,
+            num_kv_heads=1,
+            seq_lens=_BALANCED_AGENTX,
+            head_dim=64,
+        )
+        params.update(overrides)
+        return _balanced_decode_kwargs(**params)
+
+    kwargs = build()
+    route = _select_balanced_kwargs(kwargs)
+    assert route == cake_api.CakeFmhaDecodeRoute(
+        target="sm100a",
+        batch_size=16,
+        q_len=1,
+        num_q_heads=8,
+        num_kv_heads=1,
+        has_sink=False,
+        has_window=False,
+        use_scale_ptr=False,
+        retain_kv_l2=False,
+        component=component,
+        page_size=16,
+    )
+    assert cake_api.cake_fmha_route_is_optimized(route)
+    assert cake_api._route_components(route) == (component,)
+
+    # One to sixteen query heads per KV head, at every KV length and tile count.
+    for group, batch_size, seq_lens in (
+        (1, 16, _BALANCED_AGENTX),
+        (5, 2, [300, 4097]),
+        (16, 1, [65536]),
+        (16, 4, [1, 16, 17, 8000]),
+    ):
+        selected = _select_balanced_kwargs(
+            build(group=group, batch_size=batch_size, seq_lens=seq_lens)
+        )
+        assert selected is not None and selected.component == component, (
+            group,
+            batch_size,
+        )
+        assert selected.num_q_heads == group
+
+    # No other product route serves head_dim 64: group 17, MTP draft rows,
+    # other page sizes, a non-unit bmm2 scale and more than 1024 requests fall
+    # through to the compat kernel.
+    for overrides in (
+        dict(group=17),
+        dict(q_len=3),
+        dict(q_len=8),
+        dict(page_size=32),
+        dict(bmm2_scale=2.0),
+        dict(batch_size=1025, seq_lens=[4096] * 1025),
+    ):
+        assert _select_balanced_kwargs(build(**overrides)) is None, overrides
+    for mutation in (
+        {"sinks": torch.zeros(8, dtype=torch.float32)},
+        {"window_left": 1024},
+        {"bmm1_scale": torch.ones(1, dtype=torch.float32)},
+        {"o_scale": 0.5},
+        {"uses_shared_paged_kv_idx": False},
+        {"kv_layout": "NHD"},
+        {"lse": torch.empty((16, 8), dtype=torch.float32)},
+        {"workspace_buffer": torch.empty(4096, dtype=torch.uint8)},
+        {"multi_ctas_kv_counter_buffer": torch.zeros(64, dtype=torch.uint8)},
+    ):
+        assert _select_balanced_kwargs({**kwargs, **mutation}) is None, mutation
+
+
+def test_cake_fmha_balanced_hd256_route_owns_bf16_row_tiles_per_page_size(
+    monkeypatch,
+) -> None:
+    component = "decode_balanced_bf16_hd256"
+    monkeypatch.setattr(cake_api, "_cake_fmha_target", lambda device: "sm100a")
+    monkeypatch.setattr(cake_api, "_smallm_sm_count", lambda device: 148)
+
+    def build(**overrides):
+        params = dict(
+            batch_size=16,
+            q_len=1,
+            num_kv_heads=1,
+            seq_lens=_BALANCED_AGENTX,
+            head_dim=256,
+            page_size=16,
+        )
+        params.update(overrides)
+        return _balanced_decode_kwargs(**params)
+
+    for page_size in (16, 32, 64):
+        kwargs = build(page_size=page_size)
+        route = _select_balanced_kwargs(kwargs)
+        assert route == cake_api.CakeFmhaDecodeRoute(
+            target="sm100a",
+            batch_size=16,
+            q_len=1,
+            num_q_heads=8,
+            num_kv_heads=1,
+            has_sink=False,
+            has_window=False,
+            use_scale_ptr=False,
+            retain_kv_l2=False,
+            component=component,
+            page_size=page_size,
+        ), page_size
+        assert cake_api.cake_fmha_route_is_optimized(route)
+        assert cake_api._route_components(route) == (
+            "decode_balanced_bf16_hd256_p16",
+            "decode_balanced_bf16_hd256_p32",
+            "decode_balanced_bf16_hd256_p64",
+        )
+
+    # Uniform q_len 1..8 as per-row tiles wherever the resident small-M
+    # instance does not pack the rows (q_len * group <= 16, or more work tiles
+    # than SMs).
+    for q_len, group, batch_size, seq_lens in (
+        (2, 8, 16, [4096] * 16),
+        (4, 4, 4, [4097, 65536, 300, 33000]),
+        (8, 2, 2, [8192, 60000]),
+        (8, 8, 160, [2048] * 160),
+        (1, 5, 2, [4097, 65536]),
+    ):
+        selected = _select_balanced_kwargs(
+            build(q_len=q_len, group=group, batch_size=batch_size, seq_lens=seq_lens)
+        )
+        assert selected is not None and selected.component == component, (
+            q_len,
+            group,
+            batch_size,
+        )
+    # The small-M route keeps its packed tiles (17 <= q_len * group <= 64)
+    # ahead of this route.
+    for q_len, group in ((8, 4), (4, 8), (3, 8)):
+        packed = _select_balanced_kwargs(
+            build(q_len=q_len, group=group, batch_size=16, seq_lens=[4096] * 16)
+        )
+        assert packed is not None, (q_len, group)
+        assert packed.component == "decode_native_bf16_hd256_smallm", (q_len, group)
+
+    # q_len 9, 128-token pages, group 9, a non-unit bmm2 scale and more than
+    # 1024 requests fall through to the compat kernel.
+    for overrides in (
+        dict(q_len=9),
+        dict(page_size=128),
+        dict(group=9),
+        dict(bmm2_scale=2.0),
+        dict(batch_size=1025, seq_lens=[4096] * 1025),
+    ):
+        assert _select_balanced_kwargs(build(**overrides)) is None, overrides
+    kwargs = build()
+    for mutation in (
+        {"sinks": torch.zeros(8, dtype=torch.float32)},
+        {"window_left": 1024},
+        {"bmm1_scale": torch.ones(1, dtype=torch.float32)},
+        {"o_scale": 0.5},
+        {"uses_shared_paged_kv_idx": False},
+        {"kv_layout": "NHD"},
+        {"lse": torch.empty((16, 8), dtype=torch.float32)},
+        {"workspace_buffer": torch.empty(4096, dtype=torch.uint8)},
+        {"multi_ctas_kv_counter_buffer": torch.zeros(64, dtype=torch.uint8)},
+    ):
+        assert _select_balanced_kwargs({**kwargs, **mutation}) is None, mutation
+
+
 def test_cake_fmha_balanced_decode_buffer_sizing_is_shape_independent() -> None:
     from flashinfer.jit import cake_fmha as cake_jit
 
@@ -3272,6 +3604,33 @@ def test_cake_fmha_balanced_decode_buffer_sizing_is_shape_independent() -> None:
     assert (
         cake_api.cake_fmha_balanced_workspace_bytes(148, 4)
         == 2368 * 64 * 128 * 4 + (2368 + 1) * 128 * 4
+    )
+    # head_dim 64 (16 x 64 partial tile, 32 statistics) and head_dim 256
+    # (8 x 256, 16 statistics) are q_len independent: every query row is its
+    # own tile, so only the packed head_dim-128 MTP kernel needs four counter
+    # words per split tile.
+    assert (
+        cake_api.cake_fmha_balanced_workspace_bytes(148, 1, head_dim=64)
+        == 2368 * 16 * 64 * 4 + (2368 + 1) * 32 * 4
+    )
+    assert (
+        cake_api.cake_fmha_balanced_workspace_bytes(148, 1, head_dim=256)
+        == 2368 * 8 * 256 * 4 + (2368 + 1) * 16 * 4
+    )
+    assert cake_api.cake_fmha_balanced_workspace_bytes(
+        148, 8, head_dim=256
+    ) == cake_api.cake_fmha_balanced_workspace_bytes(148, 1, head_dim=256)
+    assert cake_api.cake_fmha_balanced_workspace_bytes(
+        148, 1, head_dim=128
+    ) == cake_api.cake_fmha_balanced_workspace_bytes(148, 1)
+    assert cake_api.cake_fmha_balanced_counter_bytes(148, 1, head_dim=64) == (
+        1184 * 4 + 16
+    )
+    assert cake_api.cake_fmha_balanced_counter_bytes(
+        148, 4, head_dim=256
+    ) == cake_api.cake_fmha_balanced_counter_bytes(148, 1)
+    assert cake_api.cake_fmha_balanced_counter_bytes(148, 4, head_dim=128) == (
+        1184 * 4 * 4 + 16
     )
     for q_len, n_rows, component in (
         (1, 0, "decode_balanced_bf16"),
@@ -3327,56 +3686,147 @@ def test_cake_fmha_decode_balanced_jit_selects_the_q_len_component(
         )
 
 
+@pytest.mark.parametrize(
+    ("q_dtype", "q_dtype_flag"), [("fp8", 0), ("bf16q", 1), ("fp16q", 2)]
+)
+def test_cake_fmha_decode_balanced_fp8_family_jit_selects_the_q_dtype_component(
+    monkeypatch, q_dtype, q_dtype_flag
+) -> None:
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    component = f"decode_balanced_{q_dtype}"
+    assert CAKE_FMHA_BALANCED_FP8_Q_DTYPES == ("fp8", "bf16q", "fp16q")
+    assert cake_fmha_balanced_fp8_component_name(q_dtype) == component
+    spec = gen_cake_fmha_decode_balanced_fp8_module("sm100a", q_dtype)
+    assert spec.name == get_cake_fmha_decode_balanced_fp8_uri("sm100a", q_dtype)
+    assert spec.name.startswith(f"cake_fmha_{component}_sm100a_")
+    assert {Path(source).name for source in spec.sources} == {
+        "default.cu",
+        f"cake_fmha_{component}_binding.cu",
+        "cake_fmha_decode_balanced_fp8_jit_binding.cu",
+    }
+    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert f"-DCAKE_FMHA_BALANCED_Q_DTYPE={q_dtype_flag}" in spec.extra_cuda_cflags
+    assert (
+        f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
+        in spec.extra_cuda_cflags
+    )
+    for bad_q_dtype in ("bf16", "fp16", "nvfp4"):
+        with pytest.raises(ValueError):
+            cake_fmha_balanced_fp8_component_name(bad_q_dtype)
+
+
+def test_cake_fmha_decode_balanced_hd64_jit_selects_the_component(monkeypatch) -> None:
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    component = "decode_balanced_bf16_hd64"
+    spec = gen_cake_fmha_decode_balanced_hd64_module("sm100a")
+    assert spec.name == get_cake_fmha_decode_balanced_hd64_uri("sm100a")
+    assert spec.name.startswith(f"cake_fmha_{component}_sm100a_")
+    assert {Path(source).name for source in spec.sources} == {
+        "default.cu",
+        f"cake_fmha_{component}_binding.cu",
+        "cake_fmha_decode_balanced_hd64_jit_binding.cu",
+    }
+    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert (
+        f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
+        in spec.extra_cuda_cflags
+    )
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64])
+def test_cake_fmha_decode_balanced_hd256_jit_selects_the_page_size_component(
+    monkeypatch, page_size
+) -> None:
+    import flashinfer.jit.core as jit_core
+
+    monkeypatch.setattr(jit_core, "check_cuda_arch", lambda: None)
+    component = f"decode_balanced_bf16_hd256_p{page_size}"
+    assert CAKE_FMHA_BALANCED_HD256_PAGE_SIZES == (16, 32, 64)
+    assert cake_fmha_balanced_hd256_component_name(page_size) == component
+    spec = gen_cake_fmha_decode_balanced_hd256_module("sm100a", page_size)
+    assert spec.name == get_cake_fmha_decode_balanced_hd256_uri("sm100a", page_size)
+    assert spec.name.startswith(f"cake_fmha_{component}_sm100a_")
+    assert {Path(source).name for source in spec.sources} == {
+        "default.cu",
+        f"cake_fmha_{component}_binding.cu",
+        "cake_fmha_decode_balanced_hd256_jit_binding.cu",
+    }
+    assert any(f"/cuda/{component}/sm_100a/" in str(source) for source in spec.sources)
+    assert f"-DCAKE_FMHA_BALANCED_PAGE_SIZE={page_size}" in spec.extra_cuda_cflags
+    assert (
+        f"-DCAKE_FMHA_BALANCED_LAUNCH=cake_fmha_launch_{component}"
+        in spec.extra_cuda_cflags
+    )
+    for bad_page_size in (8, 128):
+        with pytest.raises(ValueError):
+            cake_fmha_balanced_hd256_component_name(bad_page_size)
+
+
 def _balanced_reference_decode(
-    query, kv_cache, block_tables, seq_lens, *, q_len, scale
+    query, kv_cache, block_tables, seq_lens, *, q_len, scale, page_size=16
 ):
     """FP32 bottom-right-causal GQA decode over the paged HND cache (row j of a
-    request attends to ``S - (q_len - 1 - j)`` positions)."""
+    request attends to ``S - (q_len - 1 - j)`` positions).  ``head_dim`` follows
+    the tensors; E4M3 inputs are read at their stored (unscaled) values."""
 
     batch = int(seq_lens.numel())
     num_q_heads = query.shape[1]
+    head_dim = query.shape[2]
     num_kv_heads = kv_cache.shape[2]
     group = num_q_heads // num_kv_heads
-    out = torch.empty_like(query, dtype=torch.float32)
+    out = torch.empty(query.shape, dtype=torch.float32, device=query.device)
     for b in range(batch):
         length = int(seq_lens[b])
-        pages = block_tables[b, : (length + 15) // 16]
+        pages = block_tables[b, : (length + page_size - 1) // page_size]
         k = (
             kv_cache[pages, 0]
             .permute(1, 0, 2, 3)
-            .reshape(num_kv_heads, -1, 128)[:, :length]
+            .reshape(num_kv_heads, -1, head_dim)[:, :length]
             .float()
         )
         v = (
             kv_cache[pages, 1]
             .permute(1, 0, 2, 3)
-            .reshape(num_kv_heads, -1, 128)[:, :length]
+            .reshape(num_kv_heads, -1, head_dim)[:, :length]
             .float()
         )
         for j in range(q_len):
             visible = length - (q_len - 1 - j)
-            q = query[b * q_len + j].float().view(num_kv_heads, group, 128)
+            q = query[b * q_len + j].float().view(num_kv_heads, group, head_dim)
             logits = torch.einsum("hgd,hnd->hgn", q, k[:, :visible]) * scale
             probs = torch.softmax(logits, dim=-1)
             out[b * q_len + j] = torch.einsum(
                 "hgn,hnd->hgd", probs, v[:, :visible]
-            ).reshape(num_q_heads, 128)
-    return out.to(query.dtype)
+            ).reshape(num_q_heads, head_dim)
+    return out
 
 
 def _balanced_case(
-    device, *, q_len, num_kv_heads, seq_lens, seed, dtype=torch.bfloat16
+    device,
+    *,
+    q_len,
+    num_kv_heads,
+    seq_lens,
+    seed,
+    dtype=torch.bfloat16,
+    head_dim=128,
+    page_size=16,
+    group=8,
 ):
     generator = torch.Generator(device="cpu").manual_seed(seed)
     batch = len(seq_lens)
-    num_q_heads = 8 * num_kv_heads
-    pages_per_req = [(s + 15) // 16 for s in seq_lens]
+    num_q_heads = group * num_kv_heads
+    pages_per_req = [(s + page_size - 1) // page_size for s in seq_lens]
     total_pages = sum(pages_per_req)
-    query = torch.randn((batch * q_len, num_q_heads, 128), generator=generator).to(
+    query = torch.randn((batch * q_len, num_q_heads, head_dim), generator=generator).to(
         device=device, dtype=dtype
     )
     kv_cache = torch.randn(
-        (total_pages, 2, num_kv_heads, 16, 128), generator=generator
+        (total_pages, 2, num_kv_heads, page_size, head_dim), generator=generator
     ).to(device=device, dtype=dtype)
     max_pages = max(pages_per_req)
     block_tables = torch.zeros((batch, max_pages), dtype=torch.int32)
@@ -3393,24 +3843,102 @@ def _balanced_case(
     )
 
 
-_BALANCED_AGENTX = [
-    237569,
-    120001,
-    65536,
-    4097,
-    32768,
-    8192,
-    190000,
-    512,
-    100000,
-    76543,
-    2048,
-    150000,
-    33000,
-    64000,
-    12345,
-    200000,
-]
+def _e4m3_quantize(tensor):
+    """Per-tensor E4M3 quantization with an amax scale: ``(quantized, scale)``."""
+
+    scale = float(tensor.float().abs().amax()) / 448.0
+    quantized = (tensor.float() / scale).clamp_(-448.0, 448.0)
+    return quantized.to(torch.float8_e4m3fn), scale
+
+
+def _balanced_shorter_lengths(seq_lens, q_len):
+    """A second length vector under the same captured KV bound: the longest
+    request keeps its length, every other request loses a third."""
+
+    shorter = [max(q_len, s - (s // 3)) for s in seq_lens]
+    longest = max(range(len(seq_lens)), key=seq_lens.__getitem__)
+    shorter[longest] = seq_lens[longest]
+    return shorter
+
+
+def _select_balanced_route(
+    device,
+    *,
+    query,
+    kv_cache,
+    out,
+    workspace,
+    block_tables,
+    seq_lens_t,
+    q_len,
+    max_seq_len,
+    bmm1_scale,
+    bmm2_scale=1.0,
+):
+    return cake_api.select_cake_fmha_decode_route(
+        device,
+        query=query,
+        key_cache=kv_cache[:, 0],
+        value_cache=kv_cache[:, 1],
+        out=out,
+        workspace_buffer=workspace,
+        block_tables=block_tables,
+        seq_lens=seq_lens_t,
+        batch_size=int(seq_lens_t.numel()),
+        q_len=q_len,
+        max_seq_len=max_seq_len,
+        window_left=-1,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+        o_scale=1.0,
+        sinks=None,
+        kv_layout="HND",
+        uses_shared_paged_kv_idx=True,
+        cum_seq_lens_q=None,
+        key_block_scales=None,
+        value_block_scales=None,
+        skip_softmax_threshold_scale_factor=None,
+        enable_block_sparse_attention=False,
+    )
+
+
+def _check_balanced_graph_replay(
+    run,
+    *,
+    seq_lens,
+    seq_lens_t,
+    q_len,
+    expected,
+    expected_short,
+    dequant,
+    atol,
+    rtol,
+):
+    """Capture ``run`` in a CUDA graph and replay it under a shorter length
+    vector with the same KV bound: the plan is derived on device, so the
+    captured launch must follow the new lengths without a re-plan or a memset."""
+
+    device = seq_lens_t.device
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        run()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            replayed = run()
+    torch.cuda.synchronize()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dequant(replayed), expected, atol=atol, rtol=rtol)
+    shorter = _balanced_shorter_lengths(seq_lens, q_len)
+    seq_lens_t.copy_(torch.tensor(shorter, dtype=torch.int32, device=device))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dequant(replayed), expected_short, atol=atol, rtol=rtol)
+    seq_lens_t.copy_(torch.tensor(seq_lens, dtype=torch.int32, device=device))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(dequant(replayed), expected, atol=atol, rtol=rtol)
 
 
 @pytest.mark.skipif(
@@ -3522,3 +4050,311 @@ def test_cake_decode_balanced_route_matches_reference_and_replays(
     graph.replay()
     torch.cuda.synchronize()
     torch.testing.assert_close(replayed.float(), expected.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Cake FMHA requires SM100 or SM103",
+)
+@pytest.mark.parametrize(
+    ("num_kv_heads", "seq_lens"),
+    [
+        (1, _BALANCED_AGENTX),
+        (4, [65536] * 4 + [4097] * 4 + [33000] * 4 + [512] * 4),
+    ],
+)
+@pytest.mark.parametrize("q_dtype_name", ["fp8", "bf16q", "fp16q"])
+def test_cake_decode_balanced_fp8_family_matches_reference_and_replays(
+    q_dtype_name, num_kv_heads, seq_lens
+) -> None:
+    device = torch.device("cuda")
+    query, kv_cache, block_tables, seq_lens_t = _balanced_case(
+        device,
+        q_len=1,
+        num_kv_heads=num_kv_heads,
+        seq_lens=seq_lens,
+        seed=685_200 + num_kv_heads,
+        dtype=torch.bfloat16,
+    )
+    # Per-tensor E4M3 quantization with amax scales.  The reference reads the
+    # same E4M3 values, so only the kernel arithmetic is under test.
+    key_q, k_scale = _e4m3_quantize(kv_cache[:, 0])
+    value_q, v_scale = _e4m3_quantize(kv_cache[:, 1])
+    kv_cache_q = torch.empty(kv_cache.shape, dtype=torch.float8_e4m3fn, device=device)
+    kv_cache_q[:, 0] = key_q
+    kv_cache_q[:, 1] = value_q
+    del key_q, value_q, kv_cache
+    if q_dtype_name == "fp8":
+        query_q, q_scale = _e4m3_quantize(query)
+    else:
+        query_q = query.to(torch.bfloat16 if q_dtype_name == "bf16q" else torch.float16)
+        q_scale = 1.0
+    bmm1_scale = q_scale * k_scale / 128**0.5
+    max_seq_len = max(seq_lens)
+    kv_cache_f32 = kv_cache_q.float()
+    expected = (
+        _balanced_reference_decode(
+            query_q, kv_cache_f32, block_tables, seq_lens_t, q_len=1, scale=bmm1_scale
+        )
+        * v_scale
+    )
+    expected_short = (
+        _balanced_reference_decode(
+            query_q,
+            kv_cache_f32,
+            block_tables,
+            torch.tensor(
+                _balanced_shorter_lengths(seq_lens, 1), dtype=torch.int32, device=device
+            ),
+            q_len=1,
+            scale=bmm1_scale,
+        )
+        * v_scale
+    )
+    del kv_cache_f32
+    if q_dtype_name == "fp8":
+        # E4M3 output: one output scale must cover both length vectors the
+        # graph replays.
+        o_scale = (
+            max(float(expected.abs().amax()), float(expected_short.abs().amax()))
+            / 448.0
+        )
+        atol = rtol = 0.1
+    else:
+        o_scale = 1.0
+        atol = rtol = 2e-2
+    bmm2_scale = v_scale / o_scale
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    out = torch.empty_like(query_q)
+    route = _select_balanced_route(
+        device,
+        query=query_q,
+        kv_cache=kv_cache_q,
+        out=out,
+        workspace=workspace,
+        block_tables=block_tables,
+        seq_lens_t=seq_lens_t,
+        q_len=1,
+        max_seq_len=max_seq_len,
+        bmm1_scale=bmm1_scale,
+        bmm2_scale=bmm2_scale,
+    )
+    assert route is not None and route.component == f"decode_balanced_{q_dtype_name}"
+
+    def dequant(tensor):
+        return tensor.float() * o_scale
+
+    def run():
+        return cake_api.cake_batch_decode_with_kv_cache(
+            query_q,
+            kv_cache_q,
+            workspace,
+            block_tables,
+            seq_lens_t,
+            max_seq_len,
+            bmm1_scale=bmm1_scale,
+            bmm2_scale=bmm2_scale,
+            window_left=-1,
+            kv_layout="HND",
+            q_len_per_req=1,
+            out=out,
+        )
+
+    torch.testing.assert_close(dequant(run()), expected, atol=atol, rtol=rtol)
+    _check_balanced_graph_replay(
+        run,
+        seq_lens=seq_lens,
+        seq_lens_t=seq_lens_t,
+        q_len=1,
+        expected=expected,
+        expected_short=expected_short,
+        dequant=dequant,
+        atol=atol,
+        rtol=rtol,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Cake FMHA requires SM100 or SM103",
+)
+@pytest.mark.parametrize(
+    ("num_kv_heads", "group", "seq_lens"),
+    [
+        (1, 8, _BALANCED_AGENTX),
+        (2, 16, [4096, 300, 65536, 1, 777, 12345]),
+        (4, 4, [43, 200, 512, 1, 8000, 3000]),
+    ],
+)
+def test_cake_decode_balanced_hd64_matches_reference_and_replays(
+    num_kv_heads, group, seq_lens
+) -> None:
+    device = torch.device("cuda")
+    query, kv_cache, block_tables, seq_lens_t = _balanced_case(
+        device,
+        q_len=1,
+        num_kv_heads=num_kv_heads,
+        seq_lens=seq_lens,
+        seed=685_300 + group,
+        head_dim=64,
+        group=group,
+    )
+    scale = 64**-0.5
+    max_seq_len = max(seq_lens)
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    route = _select_balanced_route(
+        device,
+        query=query,
+        kv_cache=kv_cache,
+        out=torch.empty_like(query),
+        workspace=workspace,
+        block_tables=block_tables,
+        seq_lens_t=seq_lens_t,
+        q_len=1,
+        max_seq_len=max_seq_len,
+        bmm1_scale=scale,
+    )
+    assert route is not None and route.component == "decode_balanced_bf16_hd64"
+
+    def run():
+        return cake_api.cake_batch_decode_with_kv_cache(
+            query,
+            kv_cache,
+            workspace,
+            block_tables,
+            seq_lens_t,
+            max_seq_len,
+            bmm1_scale=scale,
+            bmm2_scale=1.0,
+            window_left=-1,
+            kv_layout="HND",
+            q_len_per_req=1,
+        )
+
+    expected = _balanced_reference_decode(
+        query, kv_cache, block_tables, seq_lens_t, q_len=1, scale=scale
+    )
+    expected_short = _balanced_reference_decode(
+        query,
+        kv_cache,
+        block_tables,
+        torch.tensor(
+            _balanced_shorter_lengths(seq_lens, 1), dtype=torch.int32, device=device
+        ),
+        q_len=1,
+        scale=scale,
+    )
+    torch.testing.assert_close(run().float(), expected, atol=1e-2, rtol=1e-2)
+    _check_balanced_graph_replay(
+        run,
+        seq_lens=seq_lens,
+        seq_lens_t=seq_lens_t,
+        q_len=1,
+        expected=expected,
+        expected_short=expected_short,
+        dequant=lambda tensor: tensor.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+    reason="Cake FMHA requires SM100 or SM103",
+)
+@pytest.mark.parametrize(
+    ("page_size", "q_len", "group", "num_kv_heads", "seq_lens"),
+    [
+        (16, 1, 8, 1, _BALANCED_AGENTX),
+        (32, 1, 5, 2, [4097, 65536, 300, 33000]),
+        (64, 8, 2, 2, [8192, 4160, 1000, 60000]),
+        (16, 4, 4, 1, [40004, 32771, 36000, 33000, 45000, 34000]),
+    ],
+)
+def test_cake_decode_balanced_hd256_matches_reference_and_replays(
+    page_size, q_len, group, num_kv_heads, seq_lens
+) -> None:
+    # q_len * group <= 16 rows: the resident small-M instance (packed 32/64-row
+    # tiles) does not claim these shapes, so the per-row balanced kernel owns
+    # them in production.
+    device = torch.device("cuda")
+    query, kv_cache, block_tables, seq_lens_t = _balanced_case(
+        device,
+        q_len=q_len,
+        num_kv_heads=num_kv_heads,
+        seq_lens=seq_lens,
+        seed=685_400 + page_size + q_len,
+        head_dim=256,
+        page_size=page_size,
+        group=group,
+    )
+    scale = 256**-0.5
+    max_seq_len = max(seq_lens)
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.uint8, device=device)
+    route = _select_balanced_route(
+        device,
+        query=query,
+        kv_cache=kv_cache,
+        out=torch.empty_like(query),
+        workspace=workspace,
+        block_tables=block_tables,
+        seq_lens_t=seq_lens_t,
+        q_len=q_len,
+        max_seq_len=max_seq_len,
+        bmm1_scale=scale,
+    )
+    assert route is not None and route.component == "decode_balanced_bf16_hd256"
+    assert route.page_size == page_size
+
+    def run():
+        return cake_api.cake_batch_decode_with_kv_cache(
+            query,
+            kv_cache,
+            workspace,
+            block_tables,
+            seq_lens_t,
+            max_seq_len,
+            bmm1_scale=scale,
+            bmm2_scale=1.0,
+            window_left=-1,
+            kv_layout="HND",
+            q_len_per_req=q_len,
+        )
+
+    expected = _balanced_reference_decode(
+        query,
+        kv_cache,
+        block_tables,
+        seq_lens_t,
+        q_len=q_len,
+        scale=scale,
+        page_size=page_size,
+    )
+    expected_short = _balanced_reference_decode(
+        query,
+        kv_cache,
+        block_tables,
+        torch.tensor(
+            _balanced_shorter_lengths(seq_lens, q_len),
+            dtype=torch.int32,
+            device=device,
+        ),
+        q_len=q_len,
+        scale=scale,
+        page_size=page_size,
+    )
+    torch.testing.assert_close(run().float(), expected, atol=1e-2, rtol=1e-2)
+    _check_balanced_graph_replay(
+        run,
+        seq_lens=seq_lens,
+        seq_lens_t=seq_lens_t,
+        q_len=q_len,
+        expected=expected,
+        expected_short=expected_short,
+        dequant=lambda tensor: tensor.float(),
+        atol=1e-2,
+        rtol=1e-2,
+    )
