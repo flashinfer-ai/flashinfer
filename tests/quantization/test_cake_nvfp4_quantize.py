@@ -39,12 +39,16 @@ def test_padding_rules():
 
 def test_cta_config_rules():
     # Few CTAs: widest CTA, one CTA per SM for a single row, 256 threads with
-    # two blocks per thread for K <= 8192, two CTAs per SM above 128 rows.
+    # two blocks per thread for K <= 8192, two CTAs per SM above 128 rows; a
+    # single wave of rows (128 < M <= 148) keeps the widest CTA, more than one
+    # wave with at most four blocks per 256-thread lane takes 256 x 2.
     assert cb.cta_config(7168, 1) == (512, 1)
     assert cb.cta_config(7168, 8) == (256, 3)
     assert cb.cta_config(7168, 130) == (256, 3)
     assert cb.cta_config(16384, 32) == (512, 1)
-    assert cb.cta_config(16384, 130) == (256, 2)
+    assert cb.cta_config(16384, 130) == (512, 2)
+    assert cb.cta_config(16384, 148) == (512, 2)
+    assert cb.cta_config(16384, 149) == (256, 2)
     assert cb.cta_config(16384, 257) == (256, 2)
     assert cb.cta_config(18432, 257) == (512, 2)
     assert cb.cta_config(28672, 257) == (512, 2)
