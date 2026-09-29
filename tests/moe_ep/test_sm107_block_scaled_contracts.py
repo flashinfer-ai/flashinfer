@@ -79,6 +79,20 @@ def test_mxfp4_weight_ingestion_rejects_nvfp4_scales():
         )
 
 
+@pytest.mark.parametrize("world", [-1, 0, 3, 5, 6])
+def test_k3_geometry_rejects_invalid_world_before_device_setup(monkeypatch, world):
+    from tests.moe_ep.sm107_test_utils import run_mxfp4_k3_geometry
+
+    def unexpected_device_setup(*args, **kwargs):
+        pytest.fail("Invalid K3 geometry reached device setup")
+
+    monkeypatch.setattr(
+        "flashinfer.moe_ep.ensure_moe_ep_cuda_device", unexpected_device_setup
+    )
+    with pytest.raises(ValueError, match="positive world size that divides 896"):
+        run_mxfp4_k3_geometry(0, world)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

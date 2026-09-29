@@ -160,6 +160,11 @@ def run_mxfp4_k3_geometry(rank, world):
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
 
     hidden, intermediate, experts, topk, tokens = 3584, 3072, 896, 16, 4
+    if world <= 0 or experts % world:
+        raise ValueError(
+            f"K3 geometry requires a positive world size that divides {experts}, "
+            f"got {world}"
+        )
     bootstrap = BootstrapConfig(rank=rank, world_size=world)
     ensure_moe_ep_cuda_device(bootstrap)
     cfg = Sm107_Mxfp8_Mxfp4_Bf16_Cutedsl_MegaMoeConfig(
