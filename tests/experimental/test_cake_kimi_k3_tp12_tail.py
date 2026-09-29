@@ -36,9 +36,9 @@ from flashinfer.experimental.kimi_k3_tp12_tail import cake_jit
 
 ATOL = RTOL = 1e-2
 SEED = 620
-# Fused K23 rows (M <= 4), K3-ESS rows with the one-shot / two-shot ESS K1, the plain
-# persistent K3 at 256 and one cp.async.bulk pinned row (M > 256).
-GPU_ROWS = (1, 4, 8, 16, 32, 128, 256, 300)
+# Fused K23 rows (M <= 8: the four-token module at 1 / 4, the eight-token module at 6 / 8), K3-ESS rows with the
+# one-shot / two-shot ESS K1, the plain persistent K3 at 256 and one cp.async.bulk pinned row (M > 256).
+GPU_ROWS = (1, 4, 6, 8, 16, 32, 128, 256, 300)
 GPU_MAX_TOKENS = 512
 
 
@@ -53,19 +53,25 @@ def test_partition_covers_hidden_in_128_column_blocks():
 
 
 def test_route_selection_by_token_count():
-    # fused K23 regime: ESS one-shot K1 + fused slice GEMM / tail, module by the rank's column width
-    assert cb.K23_MAX_TOKENS == 4 and cb.K23_ROWS == 8
-    for M in (1, 2, 3, 4):
+    # fused K23 regime: ESS one-shot K1 + fused slice GEMM / tail, module by the rank's column width and by the
+    # accumulator capacity ladder (the four-token module for M <= 4, the eight-token module for 5 <= M <= 8)
+    assert cb.K23_MAX_TOKENS == 8 and cb.K23_ROWS == 8 and cb.K23_LADDER == (4, 8)
+    for M in (1, 2, 3, 4, 5, 6, 7, 8):
+        capacity = 4 if M <= 4 else 8
+        assert cb.k23_capacity_for(M) == capacity
         for rank in range(cb.WORLD_SIZE):
             assert cb.route_kernel_keys(M, rank) == (
                 f"k1_oneshot_ess:r{rank}",
-                f"k23:n{cb.PARTITION[rank]}",
+                f"k23:n{cb.PARTITION[rank]}:c{capacity}",
             )
-    assert cb.up_proj_form_for(4) == "k23" and cb.up_proj_form_for(5) == "cublas"
-    assert cb.k3_kernel_key(4, 0) == "k23:n640"
-    assert cb.k3_kernel_key(4, 11) == "k23:n512"
+    assert cb.up_proj_form_for(8) == "k23" and cb.up_proj_form_for(9) == "cublas"
+    assert cb.k3_kernel_key(4, 0) == "k23:n640:c4"
+    assert cb.k3_kernel_key(5, 0) == "k23:n640:c8"
+    assert cb.k3_kernel_key(8, 11) == "k23:n512:c8"
+    with pytest.raises(ValueError):
+        cb.k23_capacity_for(9)
     # cuBLAS + K3-ESS regime: the ESS K1 scattered the shared partial, one CTA per token and column half
-    for M in (5, 8, 16):
+    for M in (9, 12, 16):
         for rank in range(cb.WORLD_SIZE):
             assert cb.route_kernel_keys(M, rank) == (
                 f"k1_oneshot_ess:r{rank}",
@@ -86,28 +92,31 @@ def test_route_selection_by_token_count():
         )
     for M in (1, 4, 5, 255, 256, 257, 4096):
         assert len(cb.route_kernel_keys(M, 0)) == 2
-    assert cb.k3_form_for(4) == "k23" and cb.k3_form_for(5) == "ess"
+    assert cb.k3_form_for(8) == "k23" and cb.k3_form_for(9) == "ess"
     assert cb.k3_form_for(255) == "ess" and cb.k3_form_for(256) == "persist"
     assert cb.k3_form_for(257) == "persist_bulk"
     # K23: one CTA per K23_ROWS output columns of the rank (80 for 640, 64 for 512)
     assert cb.k3_grid(1, 152, 0) == (80, 1, 1)
     assert cb.k3_grid(4, 148, 11) == (64, 1, 1)
+    assert cb.k3_grid(8, 152, 0) == (80, 1, 1)
     # K3-ESS: one CTA per token and column half; persistent forms: min(M, SM count)
-    assert cb.k3_grid(5, 152, 0) == (5, 2, 1)
+    assert cb.k3_grid(9, 152, 0) == (9, 2, 1)
     assert cb.k3_grid(100, 152, 3) == (100, 2, 1)
     assert cb.k3_grid(255, 152, 3) == (255, 2, 1)
     assert cb.k3_grid(256, 152, 3) == (152, 2, 1)
     assert cb.k3_grid(4096, 148, 3) == (148, 2, 1)
     with pytest.raises(ValueError):
         cb.k3_grid(4096, 0, 3)
-    assert len(cake_jit.required_kernel_keys()) == 20
+    assert len(cake_jit.required_kernel_keys()) == 22
     assert set(cake_jit.required_kernel_keys()) == {
         *(f"k1_oneshot_ess:r{r}" for r in range(12)),
         "k1_twoshot_ess:grouped",
         "k1_twoshot:grouped",
         "k1_twoshot:pinned",
-        "k23:n640",
-        "k23:n512",
+        "k23:n640:c4",
+        "k23:n512:c4",
+        "k23:n640:c8",
+        "k23:n512:c8",
         "k3_ess:grouped",
         "k3_persist:grouped",
         "k3_persist_bulk:pinned",
