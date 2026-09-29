@@ -29,6 +29,10 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass.cute.runtime import from_dlpack
 import cuda.bindings.driver as cuda
 
+from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+from .cute_dsl_cache_naming import make_kernel_name
+from .device_target import gdn_compile_options, gdn_device_target, target_arch
+
 # ============================================================================
 # Constants for NONTRANSPOSE version ([pool, HV, K, V])
 # ============================================================================
@@ -528,7 +532,6 @@ def run_gdn_decode_kernel_small_batch_nontranspose(
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
@@ -609,7 +612,6 @@ def run_gdn_decode_kernel_big_batch_nontranspose(
     softplus_beta: cutlass.Constexpr[float],
     softplus_threshold: cutlass.Constexpr[float],
     scale: cutlass.Constexpr[float],
-    B: cutlass.Constexpr[int],
     T: cutlass.Constexpr[int],
     H: cutlass.Constexpr[int],
     HV: cutlass.Constexpr[int],
@@ -677,9 +679,41 @@ def run_gdn_decode_kernel_big_batch_nontranspose(
 # ============================================================================
 
 
+_CUTE_DSL_MODULE = "gdn_decode_nontranspose"
+
+
+def _nontranspose_kernel_name(
+    target_key: tuple,
+    use_small_batch: bool,
+    T: int,
+    H: int,
+    HV: int,
+    K: int,
+    V: int,
+    dtype: torch.dtype,
+    scale: float,
+    use_qk_l2norm: bool,
+) -> str:
+    """Specialization name within the gdn_decode_nontranspose module, encoding
+    every parameter that affects codegen."""
+    return make_kernel_name(
+        target_arch(target_key),
+        "small" if use_small_batch else "big",
+        T,
+        H,
+        HV,
+        K,
+        V,
+        dtype,
+        scale,
+        use_qk_l2norm,
+    )
+
+
 @functools.cache
 def _get_compiled_decode_kernel_nontranspose(
-    B: int,
+    target_key: tuple,
+    use_small_batch: bool,
     T: int,
     H: int,
     HV: int,
@@ -723,75 +757,98 @@ def run_nontranspose_decode(
         scale: Query scale factor.
         use_qk_l2norm: Whether to apply L2 normalization.
     """
-    # Compile kernel with TVM FFI (cached)
-    cache_key = (B, T, H, HV, K, V, q.dtype, scale, use_qk_l2norm)
+    use_small_batch = B < SMALL_BATCH_THRESHOLD_NT
+    target = gdn_device_target(q.device)
+    cache_key = (
+        target.compile_key,
+        use_small_batch,
+        T,
+        H,
+        HV,
+        K,
+        V,
+        q.dtype,
+        scale,
+        use_qk_l2norm,
+    )
     cache = _get_compiled_decode_kernel_nontranspose(*cache_key)
 
-    # Get or create h0_indices and cu_seqlens (cached per config)
-    if "h0_indices" not in cache or cache["h0_indices"].device != q.device:
-        cache["h0_indices"] = torch.arange(B, dtype=torch.int32, device=q.device)
-        cache["cu_seqlens"] = torch.zeros(B + 1, dtype=torch.int32, device=q.device)
-    h0_indices = cache["h0_indices"]
-    cu_seqlens = cache["cu_seqlens"]
+    aux_map = cache.setdefault("aux", {})
+    aux_key = (B, q.device)
+    if aux_key not in aux_map:
+        aux_map[aux_key] = (
+            torch.arange(B, dtype=torch.int32, device=q.device),
+            torch.zeros(B + 1, dtype=torch.int32, device=q.device),
+        )
+    h0_indices, cu_seqlens = aux_map[aux_key]
 
     if "compiled" not in cache:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+        stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
 
         # Choose kernel based on batch size
-        use_small_batch = B < SMALL_BATCH_THRESHOLD_NT
-
         if use_small_batch:
             run_func = run_gdn_decode_kernel_small_batch_nontranspose
         else:
             run_func = run_gdn_decode_kernel_big_batch_nontranspose
 
-        # Convert tensors to CuTe format for compilation only
-        h0_source_tensor = from_dlpack(h0_source, assumed_align=16)
+        h0_source_tensor = from_dlpack(
+            h0_source, assumed_align=16
+        ).mark_compact_shape_dynamic(mode=0, stride_order=(0, 1, 2), divisibility=1)
         A_log_tensor = from_dlpack(A_log, assumed_align=16)
-        a_tensor = from_dlpack(a, assumed_align=16)
+        # mark_layout_dynamic accepts non-compact packed q/k/v (SGLang fused QKV).
+        a_tensor = from_dlpack(a, assumed_align=16).mark_layout_dynamic()
         dt_bias_tensor = from_dlpack(dt_bias, assumed_align=16)
-        q_tensor = from_dlpack(q, assumed_align=16)
-        k_tensor = from_dlpack(k, assumed_align=16)
-        v_tensor = from_dlpack(v, assumed_align=16)
-        b_tensor = from_dlpack(b, assumed_align=16)
-        o_tensor = from_dlpack(output, assumed_align=16)
-        h0_indices_tensor = from_dlpack(h0_indices, assumed_align=16)
-        cu_seqlens_tensor = from_dlpack(cu_seqlens, assumed_align=16)
+        q_tensor = from_dlpack(q, assumed_align=16).mark_layout_dynamic()
+        k_tensor = from_dlpack(k, assumed_align=16).mark_layout_dynamic()
+        v_tensor = from_dlpack(v, assumed_align=16).mark_layout_dynamic()
+        b_tensor = from_dlpack(b, assumed_align=16).mark_layout_dynamic()
+        o_tensor = from_dlpack(output, assumed_align=16).mark_layout_dynamic()
+        h0_indices_tensor = from_dlpack(
+            h0_indices, assumed_align=16
+        ).mark_layout_dynamic()
+        cu_seqlens_tensor = from_dlpack(
+            cu_seqlens, assumed_align=16
+        ).mark_layout_dynamic()
 
         # Use TVM FFI to reduce runtime overhead
-        compiled = cute.compile(
-            run_func,
-            cu_seqlens_tensor,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            a_tensor,
-            b_tensor,
-            A_log_tensor,
-            dt_bias_tensor,
-            h0_source_tensor,
-            h0_indices_tensor,
-            o_tensor,
-            softplus_beta=1.0,
-            softplus_threshold=20.0,
-            scale=scale,
-            B=B,
-            T=T,
-            H=H,
-            HV=HV,
-            K=K,
-            V=V,
-            use_initial_state=True,
-            use_qk_l2norm=use_qk_l2norm,
-            stream=stream,
-            options="--enable-tvm-ffi",
+        compiled = build_and_load_cute_dsl_kernel(
+            _CUTE_DSL_MODULE,
+            _nontranspose_kernel_name(*cache_key),
+            lambda: cute.compile[
+                gdn_compile_options(q.device, cute.EnableTVMFFI(True))
+            ](
+                run_func,
+                cu_seqlens_tensor,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                a_tensor,
+                b_tensor,
+                A_log_tensor,
+                dt_bias_tensor,
+                h0_source_tensor,
+                h0_indices_tensor,
+                o_tensor,
+                softplus_beta=1.0,
+                softplus_threshold=20.0,
+                scale=scale,
+                T=T,
+                H=H,
+                HV=HV,
+                K=K,
+                V=V,
+                use_initial_state=True,
+                use_qk_l2norm=use_qk_l2norm,
+                stream=stream,
+            ),
+            extra_key_files=(__file__,),
         )
         cache["compiled"] = compiled
     else:
         compiled = cache["compiled"]
 
     # Run kernel directly with PyTorch tensors (no from_dlpack needed)
-    stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    stream = cuda.CUstream(torch.cuda.current_stream(device=q.device).cuda_stream)
     compiled(
         cu_seqlens,
         q,

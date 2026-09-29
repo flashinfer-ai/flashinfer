@@ -11,21 +11,48 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""
-CuteDSL-based Fused MoE Kernels for NVFP4 on Blackwell GPUs.
-"""
+"""CuteDSL-based Fused MoE Kernels for block-scaled FP4 compute."""
 
-from ...cute_dsl.utils import is_cute_dsl_available
+from ...cute_dsl.availability import is_cute_dsl_available
 
 # Conditionally import CuTe-DSL kernels
 if is_cute_dsl_available():
+    from . import fused_moe as _fused_moe
+    from .fused_moe import (
+        cute_dsl_fused_moe,
+        CuteDslMoEWrapper,
+    )
     from .fused_moe import (
         cute_dsl_fused_moe_nvfp4,
-        CuteDslMoEWrapper,
+        cute_dsl_fused_moe_mxfp8_mxfp4,
+        CuteDslMxfp8Mxfp4MoEWrapper,
     )
     from .b12x_moe import (
         b12x_fused_moe,
         B12xMoEWrapper,
+    )
+    from .sm90_fused_moe import (
+        cute_dsl_fused_moe_bf16,
+        CuteDslBf16MoEWrapper,
+    )
+    from .mxfp4 import (
+        CuteDslMxfp4MoEWrapper,
+        Mxfp4MoEParallelLayout,
+        Mxfp4MoEPlan,
+        Mxfp4MoERankLayout,
+        mxfp4_moe_capability,
+        resolve_mxfp4_moe_layout,
+    )
+
+    from .blackwell_sm12x import (
+        cute_dsl_sm12x_moe_gemm_fp8,
+        cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc1_act_fp8,
+        cute_dsl_sm12x_fc1_act_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc1_act_q1_fp8,
+        cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4,
+        cute_dsl_sm12x_fc2_finalize_fp8,
+        cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4,
     )
 
 __all__ = [
@@ -34,8 +61,27 @@ __all__ = [
 
 if is_cute_dsl_available():
     __all__ += [
-        "cute_dsl_fused_moe_nvfp4",
+        "cute_dsl_fused_moe",
         "CuteDslMoEWrapper",
+        "cute_dsl_fused_moe_nvfp4",
+        "cute_dsl_fused_moe_mxfp8_mxfp4",
+        "CuteDslMxfp8Mxfp4MoEWrapper",
         "b12x_fused_moe",
         "B12xMoEWrapper",
+        "cute_dsl_fused_moe_bf16",
+        "CuteDslBf16MoEWrapper",
+        "CuteDslMxfp4MoEWrapper",
+        "Mxfp4MoEParallelLayout",
+        "Mxfp4MoEPlan",
+        "Mxfp4MoERankLayout",
+        "mxfp4_moe_capability",
+        "resolve_mxfp4_moe_layout",
+        "cute_dsl_sm12x_moe_gemm_fp8",
+        "cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc1_act_fp8",
+        "cute_dsl_sm12x_fc1_act_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc1_act_q1_fp8",
+        "cute_dsl_sm12x_fc1_act_q1_mxfp8_mxfp4",
+        "cute_dsl_sm12x_fc2_finalize_fp8",
+        "cute_dsl_sm12x_fc2_finalize_mxfp8_mxfp4",
     ]

@@ -17,6 +17,7 @@ limitations under the License.
 from .core import (
     gen_gemm_module,
     gen_gemm_sm100_module_cutlass_fp4,
+    gen_gemm_sm100_module_cutlass_nvfp4_svdquant,
     gen_gemm_sm103_module_cutlass_fp4,
     gen_gemm_sm120_module_cutlass_fp4,
     gen_gemm_sm100_module_cutlass_fp8,
@@ -33,10 +34,16 @@ from .core import (
 )
 from .deepgemm import gen_deepgemm_sm100_module
 from .fp8_blockscale import gen_fp8_blockscale_gemm_sm90_module
+from .cake_blackwell_bf16_bmm import gen_blackwell_bf16_bmm_module
+from .cake_grouped_fp8_gemm import gen_cake_grouped_fp8_gemm_module
+from .cake_grouped_fp8_fused_silu_quant import (
+    gen_cake_grouped_fp8_fused_silu_quant_module,
+)
 
 __all__ = [
     "gen_gemm_module",
     "gen_gemm_sm100_module_cutlass_fp4",
+    "gen_gemm_sm100_module_cutlass_nvfp4_svdquant",
     "gen_gemm_sm103_module_cutlass_fp4",
     "gen_gemm_sm120_module_cutlass_fp4",
     "gen_gemm_sm100_module_cutlass_fp8",
@@ -52,4 +59,7 @@ __all__ = [
     "gen_gemm_sm90_module",
     "gen_deepgemm_sm100_module",
     "gen_fp8_blockscale_gemm_sm90_module",
+    "gen_blackwell_bf16_bmm_module",
+    "gen_cake_grouped_fp8_gemm_module",
+    "gen_cake_grouped_fp8_fused_silu_quant_module",
 ]

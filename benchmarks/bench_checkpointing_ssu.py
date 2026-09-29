@@ -46,11 +46,12 @@ Example usage:
 
 import argparse
 import bisect
+import contextlib
 import os
 import re
 import statistics
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from functools import partial
 from pathlib import Path
@@ -62,7 +63,16 @@ from einops import repeat
 # Add tests/mamba to path for triton_reference imports
 sys.path.insert(0, str(Path(__file__).parent.parent / "tests" / "mamba"))
 
-from triton_reference.checkpointing_state_update import checkpointing_state_update
+
+# triton-replay uses the faithful, TMA-optimized standalone reference (the
+from triton_reference.replay_selective_state_update import (
+    REPLAY_WORK_CACHE_BUF_IDX,
+    REPLAY_WORK_CACHE_SLOT,
+    REPLAY_WORK_ITEM_WIDTH,
+    REPLAY_WORK_PNAT,
+    REPLAY_WORK_POSITION_IN_DECODE_BATCH,
+    replay_selective_state_update,
+)
 from triton_reference.selective_state_update import (
     selective_state_update_triton as selective_state_update,
 )
@@ -70,6 +80,14 @@ from flashinfer.mamba import selective_state_update as flashinfer_selective_stat
 from flashinfer.mamba.checkpointing_ssu import (
     checkpointing_ssu as cuda_checkpointing_ssu,
 )
+
+# Optional conv1d import for combined (conv1d + SSU) timing.
+# Standalone copy lives in tests/mamba/triton_reference/ (stripped of TRT-LLM deps).
+_causal_conv1d_update = None
+with contextlib.suppress(Exception):
+    from triton_reference.causal_conv1d_triton import (
+        causal_conv1d_update as _causal_conv1d_update,
+    )
 
 # ---------------------------------------------------------------------------
 # Model config defaults (Nemotron-3-Super-120B full model)
@@ -106,7 +124,7 @@ STATE_DTYPE_MAP: dict[str, torch.dtype] = {
 }
 
 # Dtypes for which Philox stochastic rounding on gmem state writeback is
-# supported (cuda-incr and Triton incremental paths only).
+# supported (CUDA and Triton replay paths).
 _PHILOX_STATE_DTYPES = (torch.float16, torch.int8, torch.float8_e4m3fn)
 
 
@@ -173,16 +191,27 @@ def _build_tensors(
 
     nheads/ngroups are already TP-split (i.e. full_nheads // tp_size).
 
-    Returns:
+    Returns (in tuple order); ring_len = max_window + mtp_len,
+    conv_dim = nheads*head_dim + 2*ngroups*d_state, d_conv = 4:
       state0                   : (batch, nheads, head_dim, d_state) – initial SSM state
+      state_scale              : (batch, nheads, head_dim) f32 decode-scale for
+                                 quantized state, else None
       intermediate_update_inputs: (batch, mtp_len, nheads*head_dim + nheads + ngroups*d_state)
-                                   packed [old_x | old_dt_base | old_B] for incremental kernel
+                                   packed [x | dt_base | B] baseline caches
+      x_cache                  : (batch, nheads, ring_len, head_dim) ring x cache
+      B_cache                  : (batch, ngroups, ring_len, d_state) ring B cache
+      dt_cache                 : (batch, nheads, ring_len) f32 ring dt cache
+      ring_start               : (batch,) int32 per-slot ring head (zeros here)
       x, dt, B, C              : (batch, mtp_len, ...) – token inputs for both kernels
       A, dt_bias, D            : SSM parameters (float32, tie_hdim strides)
       prev_tokens              : (batch,)
-      out_incr                 : pre-allocated output for incremental kernel (batch, mtp_len, nheads, head_dim)
+      out_incr                 : pre-allocated output for the CUDA kernels (batch, mtp_len, nheads, head_dim)
       out_base                 : pre-allocated output for baseline kernel   (batch, mtp_len, nheads, head_dim)
       intermediate_states_buffer: for baseline kernel (batch, mtp_len, nheads, head_dim, d_state)
+      xbc_input                : (batch, conv_dim, mtp_len) conv1d input (in_proj layout)
+      conv_state               : (batch, conv_dim, d_conv) conv1d state cache
+      conv_weight              : (conv_dim, d_conv) conv1d weight
+      conv_bias                : (conv_dim,) conv1d bias
     """
     device = "cuda"
 
@@ -226,39 +255,36 @@ def _build_tensors(
         )
         state_scale = None
 
-    # --- Cache tensors for incremental kernel ---
-    # T-axis = max_window (cache capacity), independent of mtp_len (per-step
-    # speculation depth).  must_checkpoint = (prev_k + mtp_len > max_window),
-    # so max_window > mtp_len leaves room for the no-checkpoint branch.
-    # old_x: single-buffered (cache, max_window, nheads, dim)
-    old_x = torch.randn(
-        batch, max_window, nheads, head_dim, device=device, dtype=act_dtype
+    # --- Ring caches (ReplaySSM contract) ---
+    # RING_BUFFER_LEN = max_window + mtp_len rows, head-major.  The write
+    # decision is per slot: (pnat + mtp_len > max_window).  ring_start = 0
+    # keeps the gathers single-segment — the closest apples-to-apples layout
+    # vs the pre-ring double-buffer baselines (wrap cost measured separately).
+    ring_len = max_window + mtp_len
+    x_cache = torch.randn(
+        batch, nheads, ring_len, head_dim, device=device, dtype=act_dtype
     )
-    # old_B: double-buffered (cache, 2, max_window, ngroups, dstate)
-    old_B = torch.randn(
-        batch, 2, max_window, ngroups, d_state, device=device, dtype=act_dtype
+    B_cache = torch.randn(
+        batch, ngroups, ring_len, d_state, device=device, dtype=act_dtype
     )
-    # old_dt: double-buffered (cache, 2, nheads, max_window) fp32
-    old_dt = torch.randn(
-        batch, 2, nheads, max_window, device=device, dtype=torch.float32
+    dt_cache = torch.randn(
+        batch, nheads, ring_len, device=device, dtype=torch.float32
+    ).abs()
+    ring_start = torch.zeros(batch, device=device, dtype=torch.int32)
+    # Legacy packed tensor (kept for baseline kernel only) — mtp_len rows of
+    # fresh data in the baseline's token-major shape.
+    old_x_flat = torch.randn(
+        batch, mtp_len, nheads * head_dim, device=device, dtype=act_dtype
     )
-    # old_cumAdt: double-buffered (cache, 2, nheads, max_window) fp32
-    old_cumAdt = torch.randn(
-        batch, 2, nheads, max_window, device=device, dtype=torch.float32
-    )
-    # cache_buf_idx: which buffer to read (0 or 1)
-    cache_buf_idx = torch.zeros(batch, device=device, dtype=torch.int32)
-    # Legacy packed tensor (kept for baseline kernel only) — uses mtp_len slice
-    # of the larger cache so the baseline shape (which is mtp_len-bound) stays
-    # unchanged.
-    old_x_flat = old_x[:, :mtp_len].reshape(batch, mtp_len, nheads * head_dim)
     old_dt_base = torch.randn(batch, mtp_len, nheads, device=device, dtype=act_dtype)
-    old_B_flat = old_B[:, 0, :mtp_len].reshape(batch, mtp_len, ngroups * d_state)
+    old_B_flat = torch.randn(
+        batch, mtp_len, ngroups * d_state, device=device, dtype=act_dtype
+    )
     intermediate_update_inputs = torch.cat(
         [old_x_flat, old_dt_base, old_B_flat], dim=-1
     ).contiguous()
 
-    # --- Token inputs (used by both incremental and baseline kernels) ---
+    # --- Token inputs ---
     x = torch.randn(batch, mtp_len, nheads, head_dim, device=device, dtype=act_dtype)
     # TODO: For now, dt has to match D (fp32) for flashifner, so always do that
     dt_base = torch.randn(batch, mtp_len, nheads, device=device, dtype=torch.float32)
@@ -280,15 +306,34 @@ def _build_tensors(
         batch, mtp_len, nheads, head_dim, d_state, device=device, dtype=state_dtype
     )
 
+    # --- Conv1d tensors ---
+    d_inner = nheads * head_dim
+    conv_dim = d_inner + 2 * ngroups * d_state
+    d_conv = 4  # conv kernel width for Nemotron/Mamba2
+
+    # xbc_input: (batch, conv_dim, mtp_len) — match production layout from in_proj
+    # Production: in_proj output is (batch*mtp_len, conv_dim) contiguous, then
+    # .view(batch, mtp_len, conv_dim).transpose(1, 2) gives strides
+    # (mtp_len*conv_dim, 1, conv_dim) — NOT standard 3D allocation.
+    xbc_input_flat = torch.randn(
+        batch * mtp_len, conv_dim, device=device, dtype=act_dtype
+    )
+    xbc_input = xbc_input_flat.view(batch, mtp_len, conv_dim).transpose(1, 2)
+    # conv_state: (batch, conv_dim, d_conv) — "cold" cache
+    conv_state = torch.randn(batch, conv_dim, d_conv, device=device, dtype=act_dtype)
+    # conv_weight: (conv_dim, d_conv) — parameter
+    conv_weight = torch.randn(conv_dim, d_conv, device=device, dtype=act_dtype)
+    # conv_bias: (conv_dim,) — parameter
+    conv_bias = torch.randn(conv_dim, device=device, dtype=act_dtype)
+
     return (
         state0,
         state_scale,
         intermediate_update_inputs,
-        old_x,
-        old_B,
-        old_dt,
-        old_cumAdt,
-        cache_buf_idx,
+        x_cache,
+        B_cache,
+        dt_cache,
+        ring_start,
         x,
         dt,
         B,
@@ -300,6 +345,10 @@ def _build_tensors(
         out_incr,
         out_base,
         intermediate_states_buffer,
+        xbc_input,
+        conv_state,
+        conv_weight,
+        conv_bias,
     )
 
 
@@ -313,8 +362,10 @@ def _build_tensors(
 
 
 KernelName = Literal[
-    "cuda-incr",  # cuda_checkpointing_ssu
-    "incremental",  # Triton checkpointing_state_update
+    "cuda-incr",  # cuda_checkpointing_ssu (monolithic)
+    "cuda-incr-2k",  # cuda_checkpointing_ssu, two-kernel split (precompute + main)
+    "triton-replay",  # Triton replay_selective_state_update — persistent_dynamic
+    "triton-replay-pm",  # Triton replay_selective_state_update — persistent_main
     "fi-dump",  # flashinfer_selective_state_update with dst_state_batch_indices
     "baseline-triton",  # Triton selective_state_update (disable_state_update)
     "baseline-flashinfer",  # flashinfer selective_state_update (disable_state_update)
@@ -337,22 +388,6 @@ class TimingOptions:
 
 
 @dataclass
-class TritonAutotune:
-    """Optional autotune overrides for the Triton incremental kernel.
-
-    ``None`` for any field means: let the kernel pick.  These are passed
-    straight through to ``checkpointing_state_update``.
-    """
-
-    block_size_m: int | None = None
-    num_warps: int | None = None
-    num_stages: int | None = None
-    precompute_num_warps: int | None = None
-    precompute_num_stages: int | None = None
-    internal_pdl: bool = True
-
-
-@dataclass
 class KernelInputs:
     """Pre-allocated tensor bundle for one (batch, mtp_len, dtype) config.
 
@@ -365,21 +400,19 @@ class KernelInputs:
     state0: torch.Tensor
     state_scale0: torch.Tensor | None
     intermediate_update_inputs: torch.Tensor
-    old_x0: torch.Tensor
-    old_B0: torch.Tensor
-    old_dt0: torch.Tensor
-    old_cumAdt0: torch.Tensor
-    cache_buf_idx0: torch.Tensor
+    x_cache0: torch.Tensor
+    B_cache0: torch.Tensor
+    dt_cache0: torch.Tensor
+    # Host-owned ring starts — read-only for every kernel, so no work copy.
+    ring_start: torch.Tensor
 
     # Working copies (mutated by kernels)
     state_work: torch.Tensor
     state_scale_work: torch.Tensor | None
     interm_work: torch.Tensor
-    old_x_work: torch.Tensor
-    old_B_work: torch.Tensor
-    old_dt_work: torch.Tensor
-    old_cumAdt_work: torch.Tensor
-    cache_buf_idx_work: torch.Tensor
+    x_cache_work: torch.Tensor
+    B_cache_work: torch.Tensor
+    dt_cache_work: torch.Tensor
 
     # Read-only inputs
     x: torch.Tensor
@@ -391,7 +424,7 @@ class KernelInputs:
     D: torch.Tensor
 
     # Per-slot accepted-tokens vector.  ``prev_tokens_i32`` feeds the
-    # cuda-incr / Triton incremental kernels.  Mutated by ``time_kernel`` to
+    # CUDA kernels.  Mutated by ``time_kernel`` to
     # the user-supplied vector before each timed batch.
     prev_tokens_i32: torch.Tensor
 
@@ -405,17 +438,86 @@ class KernelInputs:
     mtp_len: int
     max_window: int
 
+    # Conv1d tensors (for --with-conv1d combined timing)
+    xbc_input0: torch.Tensor | None = None  # (batch, conv_dim, mtp_len) pristine
+    xbc_input_work: torch.Tensor | None = (
+        None  # (batch, conv_dim, mtp_len) working copy
+    )
+    conv_state0: torch.Tensor | None = None  # (batch, conv_dim, d_conv) pristine
+    conv_state_work: torch.Tensor | None = (
+        None  # (batch, conv_dim, d_conv) working copy
+    )
+    conv_weight: torch.Tensor | None = None  # (conv_dim, d_conv) — parameter
+    conv_bias: torch.Tensor | None = None  # (conv_dim,) — parameter
+    d_inner: int = 0  # nheads * head_dim
+    conv_dim: int = 0  # d_inner + 2 * ngroups * d_state
+
+    # Two-kernel split scratch (None ⇒ monolithic).  The precompute overwrites
+    # them each iteration — graph-safe, no reset needed (like out_incr).
+    cb_scaled: torch.Tensor | None = None  # (batch, nheads, 32, 8) act_dtype
+    cumAdt_vec: torch.Tensor | None = None  # (batch, nheads, T_pad) f32
+    cb_old: torch.Tensor | None = None  # (batch, nheads, 32, K_old//2) act_dtype
+
+    # Varlen (packed) mode: x/dt/B/C/out_incr above are (1, batch*T, ...) VIEWS
+    # of the same dense buffers, plus this boundary vector — identical work to
+    # dense, only the kernels' VARLEN addressing path differs.  None ⇒ dense.
+    cu_seqlens: torch.Tensor | None = None  # (batch+1,) int32, uniform steps of T
+    max_seqlen: int | None = None  # = mtp_len (JIT NPREDICTED key)
+
     def reset(self) -> None:
         """Restore ``*_work`` tensors to their pristine state."""
         self.state_work.copy_(self.state0)
         if self.state_scale_work is not None:
             self.state_scale_work.copy_(self.state_scale0)
         self.interm_work.copy_(self.intermediate_update_inputs)
-        self.old_x_work.copy_(self.old_x0)
-        self.old_B_work.copy_(self.old_B0)
-        self.old_dt_work.copy_(self.old_dt0)
-        self.old_cumAdt_work.copy_(self.old_cumAdt0)
-        self.cache_buf_idx_work.copy_(self.cache_buf_idx0)
+        self.x_cache_work.copy_(self.x_cache0)
+        self.B_cache_work.copy_(self.B_cache0)
+        self.dt_cache_work.copy_(self.dt_cache0)
+
+    def reset_with_conv1d(self) -> None:
+        """Realistic reset for conv1d + SSU combined timing.
+
+        Production pipeline: cold cache → L2 flush → hot in_proj output.
+        1. Restore cold state (cache tensors, SSM state)
+        2. L2 flush (evicts cold state from cache)
+        3. Write hot xbc_input (simulates in_proj output landing in L2)
+        """
+        # 1. Cold state reset
+        self.state_work.copy_(self.state0)
+        if self.state_scale_work is not None:
+            self.state_scale_work.copy_(self.state_scale0)
+        self.interm_work.copy_(self.intermediate_update_inputs)
+        self.x_cache_work.copy_(self.x_cache0)
+        self.B_cache_work.copy_(self.B_cache0)
+        self.dt_cache_work.copy_(self.dt_cache0)
+        self.conv_state_work.copy_(self.conv_state0)
+        # 2. L2 flush
+        if _l2_flush is not None:
+            _l2_flush.fill_(0.0)
+        # 3. Hot in_proj output
+        self.xbc_input_work.copy_(self.xbc_input0)
+
+
+def _make_replay_work_items(prev_tokens, mtp_len, max_window, batch):
+    """Build (n_writes, replay_work_items) for the standalone persistent kernel,
+    write-first sorted — matches mamba2_metadata._prepare_replay_work_items.
+
+    The bench uses contiguous cache slots (state_batch_indices=None), so
+    cache_slot == position_in_decode_batch.  persistent_dynamic ignores the
+    ordering at runtime; persistent_main relies on the write-first split.
+    """
+    device = prev_tokens.device
+    pos = torch.arange(batch, device=device, dtype=torch.int32)
+    pnat = prev_tokens[:batch].to(torch.int32)
+    write_mask = (pnat + mtp_len) > max_window
+    n_writes = write_mask.sum().to(torch.int32).reshape(1)
+    order = torch.argsort((~write_mask).to(torch.int32), stable=True).to(torch.long)
+    work = torch.empty(batch, REPLAY_WORK_ITEM_WIDTH, device=device, dtype=torch.int32)
+    work[:, REPLAY_WORK_POSITION_IN_DECODE_BATCH] = pos[order]
+    work[:, REPLAY_WORK_CACHE_SLOT] = pos[order]
+    work[:, REPLAY_WORK_PNAT] = pnat[order]
+    work[:, REPLAY_WORK_CACHE_BUF_IDX] = 0
+    return n_writes, work.contiguous()
 
 
 def build_kernel_inputs(
@@ -429,17 +531,23 @@ def build_kernel_inputs(
     head_dim: int,
     d_state: int,
     ngroups: int,
+    two_kernel: bool = True,
+    varlen: bool = False,
 ) -> KernelInputs:
-    """Build a fresh tensor bundle for one benchmark configuration."""
+    """Build a fresh tensor bundle for one benchmark configuration.
+
+    ``varlen=True`` packs x/dt/B/C/out into the (1, batch*T, ...) cu_seqlens
+    layout as VIEWS of the dense build (uniform seq_len = T) — an exact A/B
+    against dense: same bytes and FLOPs, only the VARLEN addressing differs.
+    CUDA kernels only (the Triton references take no cu_seqlens)."""
     (
         state0,
         state_scale0,
         intermediate_update_inputs,
-        old_x0,
-        old_B0,
-        old_dt0,
-        old_cumAdt0,
-        cache_buf_idx0,
+        x_cache0,
+        B_cache0,
+        dt_cache0,
+        ring_start,
         x,
         dt,
         B,
@@ -451,6 +559,10 @@ def build_kernel_inputs(
         out_incr,
         out_base,
         intermediate_states_buffer,
+        xbc_input,
+        conv_state,
+        conv_weight,
+        conv_bias,
     ) = _build_tensors(
         batch,
         mtp_len,
@@ -462,23 +574,60 @@ def build_kernel_inputs(
         d_state,
         ngroups,
     )
+    d_inner = nheads * head_dim
+    _conv_dim = d_inner + 2 * ngroups * d_state
+
+    cu_seqlens = None
+    if varlen:
+        total = batch * mtp_len
+        assert dt.stride(0) == mtp_len * dt.stride(1), (
+            f"dt (b,T) dims not row-major packed: stride(0)={dt.stride(0)}, "
+            f"expected {mtp_len * dt.stride(1)} — can't view as (1, total, ...)"
+        )
+        x = x.reshape(1, total, nheads, head_dim)
+        B = B.reshape(1, total, ngroups, d_state)
+        C = C.reshape(1, total, ngroups, d_state)
+        # tie_hdim dt has stride[-1]=0 (einops expand) — .view() rejects it,
+        # as_strided merges (b, T) while preserving the 0-stride head_dim.
+        dt = dt.as_strided(
+            (1, total, nheads, head_dim),
+            (0, dt.stride(1), dt.stride(2), dt.stride(3)),
+        )
+        out_incr = out_incr.view(1, total, nheads, head_dim)
+        cu_seqlens = torch.arange(
+            0, total + 1, mtp_len, device=x.device, dtype=torch.int32
+        )
+
+    # Two-kernel split scratch (graph-safe; overwritten by the precompute each
+    # iter).  fragA-native: cb_scaled m16n8k16 (8 regs/lane); cb_old m16n8k{K_old}
+    # (K_old/2 regs/lane), K_old = next_multiple_of<8>(max_window); cumAdt_vec f32
+    # over T_pad = next_multiple_of<16>(mtp_len).  See .plans/ssu_split.md.
+    cb_scaled = cumAdt_vec = cb_old = None
+    if two_kernel:
+        t_pad = ((mtp_len + 15) // 16) * 16
+        k_old = ((max_window + 7) // 8) * 8
+        cb_scaled = torch.empty(batch, nheads, 32, 8, device=x.device, dtype=act_dtype)
+        cumAdt_vec = torch.empty(
+            batch, nheads, t_pad, device=x.device, dtype=torch.float32
+        )
+        cb_old = torch.empty(
+            batch, nheads, 32, k_old // 2, device=x.device, dtype=act_dtype
+        )
+
     return KernelInputs(
         state0=state0,
         state_scale0=state_scale0,
         intermediate_update_inputs=intermediate_update_inputs,
-        old_x0=old_x0,
-        old_B0=old_B0,
-        old_dt0=old_dt0,
-        old_cumAdt0=old_cumAdt0,
-        cache_buf_idx0=cache_buf_idx0,
+        x_cache0=x_cache0,
+        B_cache0=B_cache0,
+        dt_cache0=dt_cache0,
+        ring_start=ring_start,
         state_work=state0.clone(),
         state_scale_work=state_scale0.clone() if state_scale0 is not None else None,
         interm_work=intermediate_update_inputs.clone(),
-        old_x_work=old_x0.clone(),
-        old_B_work=old_B0.clone(),
-        old_dt_work=old_dt0.clone(),
-        old_cumAdt_work=old_cumAdt0.clone(),
-        cache_buf_idx_work=cache_buf_idx0.clone(),
+        x_cache_work=x_cache0.clone(),
+        B_cache_work=B_cache0.clone(),
+        dt_cache_work=dt_cache0.clone(),
         x=x,
         dt=dt,
         B=B,
@@ -493,6 +642,19 @@ def build_kernel_inputs(
         batch=batch,
         mtp_len=mtp_len,
         max_window=max_window,
+        xbc_input0=xbc_input,
+        xbc_input_work=xbc_input.clone(),
+        conv_state0=conv_state,
+        conv_state_work=conv_state.clone(),
+        conv_weight=conv_weight,
+        conv_bias=conv_bias,
+        d_inner=d_inner,
+        conv_dim=_conv_dim,
+        cb_scaled=cb_scaled,
+        cumAdt_vec=cumAdt_vec,
+        cb_old=cb_old,
+        cu_seqlens=cu_seqlens,
+        max_seqlen=mtp_len if varlen else None,
     )
 
 
@@ -505,7 +667,6 @@ def time_kernel(
     tag: str = "",
     philox_rounds: int = 0,
     rand_seed: torch.Tensor | None = None,
-    autotune: TritonAutotune | None = None,
 ) -> tuple[float, float, float]:
     """Time one kernel invocation against a (batch,) prev_tokens vector.
 
@@ -519,8 +680,6 @@ def time_kernel(
     """
     if timing is None:
         timing = TimingOptions()
-    if autotune is None:
-        autotune = TritonAutotune()
 
     assert prev_tokens.device.type == "cuda", (
         f"prev_tokens must be on CUDA, got {prev_tokens.device}"
@@ -546,9 +705,69 @@ def time_kernel(
         inputs=inputs,
         philox_rounds=philox_rounds,
         rand_seed=rand_seed,
-        autotune=autotune,
     )
     return _time_kernel(timing, run_fn, inputs.reset, tag)
+
+
+def time_kernel_with_conv1d(
+    *,
+    kernel: KernelName,
+    inputs: KernelInputs,
+    prev_tokens: torch.Tensor,
+    timing: TimingOptions | None = None,
+    tag: str = "",
+    philox_rounds: int = 0,
+    rand_seed: torch.Tensor | None = None,
+    external_pdl: bool = True,
+) -> tuple[float, float, float]:
+    """Time conv1d + kernel combined, measuring total span.
+
+    Same as time_kernel but prepends causal_conv1d_update and uses the
+    realistic reset (cold cache → L2 flush → hot xbc_input).
+    Captures PDL overlap between conv1d and SSU.
+    """
+    if _causal_conv1d_update is None:
+        raise RuntimeError(
+            "causal_conv1d_update not available — import from "
+            "tests/mamba/triton_reference/causal_conv1d_triton.py failed"
+        )
+    if timing is None:
+        timing = TimingOptions()
+
+    assert inputs.xbc_input_work is not None, (
+        "conv1d tensors not allocated in KernelInputs"
+    )
+    assert prev_tokens.device.type == "cuda", (
+        f"prev_tokens must be on CUDA, got {prev_tokens.device}"
+    )
+    assert prev_tokens.shape == (inputs.batch,), (
+        f"prev_tokens shape mismatch: got {tuple(prev_tokens.shape)}, "
+        f"expected ({inputs.batch},)"
+    )
+    pt_max = int(prev_tokens.max().item()) if prev_tokens.numel() > 0 else 0
+    pt_min = int(prev_tokens.min().item()) if prev_tokens.numel() > 0 else 0
+    assert pt_min >= 0 and pt_max <= inputs.max_window, (
+        f"prev_tokens values must be in [0, max_window={inputs.max_window}]; "
+        f"got [{pt_min}, {pt_max}]"
+    )
+    assert prev_tokens.dtype == torch.int32, (
+        f"prev_tokens dtype must be int32, got {prev_tokens.dtype}"
+    )
+    inputs.prev_tokens_i32.copy_(prev_tokens)
+
+    run_fn = _make_run_closure(
+        kernel=kernel,
+        inputs=inputs,
+        philox_rounds=philox_rounds,
+        rand_seed=rand_seed,
+        with_conv1d=True,
+        external_pdl=external_pdl,
+    )
+    # Disable the timing loop's own L2 flush — reset_with_conv1d already
+    # does a realistic flush (cold state → L2 evict → hot xbc_input write).
+    # Double-flushing would distort timings.
+    timing_no_flush = replace(timing, l2_flush=False)
+    return _time_kernel(timing_no_flush, run_fn, inputs.reset_with_conv1d, tag)
 
 
 def _make_run_closure(
@@ -557,134 +776,299 @@ def _make_run_closure(
     inputs: KernelInputs,
     philox_rounds: int,
     rand_seed: torch.Tensor | None,
-    autotune: TritonAutotune,
+    with_conv1d: bool = False,
+    external_pdl: bool = True,
 ) -> Callable[[], None]:
-    """Build the per-iteration kernel invocation closure for ``time_kernel``."""
+    """Build the per-iteration kernel invocation closure for ``time_kernel``.
+
+    When *with_conv1d* is True the closure prepends a causal_conv1d_update
+    call and feeds the conv1d outputs (x, B, C views) directly to the SSU
+    kernel — matching the production pipeline where conv1d and SSU overlap
+    on the GPU via PDL.
+    """
     mtp_len = inputs.mtp_len
     max_window = inputs.max_window
 
-    if kernel == "cuda-incr":
+    # --- Conv1d split helper (used when with_conv1d=True) ---
+    if with_conv1d:
+        assert _causal_conv1d_update is not None, (
+            "causal_conv1d_update not available — import from "
+            "tests/mamba/triton_reference/causal_conv1d_triton.py failed"
+        )
+        assert inputs.xbc_input_work is not None, (
+            "conv1d tensors not allocated in KernelInputs"
+        )
+        batch = inputs.batch
+        d_inner = inputs.d_inner
+        conv_dim = inputs.conv_dim
+        nheads = inputs.x.shape[2]  # from x: (batch, mtp_len, nheads, head_dim)
+        head_dim = inputs.x.shape[3]
+        ngroups = inputs.B.shape[2]  # from B: (batch, mtp_len, ngroups, d_state)
+        d_state = inputs.B.shape[3]
 
-        def _run():
-            cuda_checkpointing_ssu(
-                inputs.state_work,
-                inputs.old_x_work,
-                inputs.old_B_work,
-                inputs.old_dt_work,
-                inputs.old_cumAdt_work,
-                inputs.cache_buf_idx_work,
-                inputs.prev_tokens_i32,
-                x=inputs.x,
-                dt=inputs.dt,
-                A=inputs.A,
-                B=inputs.B,
-                C=inputs.C,
-                out=inputs.out_incr,
-                D=inputs.D,
-                dt_bias=inputs.dt_bias,
-                dt_softplus=True,
-                state_batch_indices=None,
-                state_scale=inputs.state_scale_work,
-                rand_seed=rand_seed,
-                philox_rounds=philox_rounds,
+        def _conv1d_split():
+            """Run conv1d update and split output into (x, B, C) views."""
+            xbc_result = _causal_conv1d_update(
+                inputs.xbc_input_work,
+                inputs.conv_state_work,
+                inputs.conv_weight,
+                inputs.conv_bias,
+                activation="silu",
+                launch_dependent_kernels=external_pdl,
             )
+            xbc_flat = xbc_result.transpose(1, 2).reshape(batch * mtp_len, conv_dim)
+            x_flat, B_flat, C_flat = torch.split(
+                xbc_flat, [d_inner, ngroups * d_state, ngroups * d_state], dim=-1
+            )
+            if inputs.cu_seqlens is not None:
+                # Uniform varlen: the conv1d runs in its dense per-slot layout
+                # (every row is full-length, so its output IS the packed layout)
+                # and the SSU consumes packed views of the same buffer.
+                x_conv = x_flat.view(1, batch * mtp_len, nheads, head_dim)
+                B_conv = B_flat.view(1, batch * mtp_len, ngroups, d_state)
+                C_conv = C_flat.view(1, batch * mtp_len, ngroups, d_state)
+            else:
+                x_conv = x_flat.view(batch, mtp_len, nheads, head_dim)
+                B_conv = B_flat.view(batch, mtp_len, ngroups, d_state)
+                C_conv = C_flat.view(batch, mtp_len, ngroups, d_state)
+            return x_conv, B_conv, C_conv
+
+    if kernel in ("cuda-incr", "cuda-incr-2k"):
+        # "cuda-incr-2k" passes the precompute scratch → the launcher routes to
+        # the two-kernel split; "cuda-incr" passes None → monolithic.  Both run
+        # in one bench for a direct comparison.
+        _two = kernel == "cuda-incr-2k"
+        _cb = inputs.cb_scaled if _two else None
+        _ca = inputs.cumAdt_vec if _two else None
+        _cbo = inputs.cb_old if _two else None
+        # Pin the path: "auto" would route small batches to the monolith even
+        # with scratch present, silently merging the two rows.
+        _algo = "two-kernel" if _two else "monolith"
+        # PRECOMPUTE head-tiling knob (two-kernel only): 0 = launcher co-residency heuristic;
+        # >0 overrides.  Driven via FLASHINFER_SSU_HEADS_PER_CTA, passed as the Python handle.
+        _phc = int(os.environ.get("FLASHINFER_SSU_HEADS_PER_CTA", "0")) if _two else 0
+        # D-split knob: splits each head's DIM across D_SPLIT CTAs.
+        # DS=1 (D_PER_CTA=64): the operand-swap output tiles M=DIM across all NUM_WARPS warps;
+        # DS=2 (D_PER_CTA=32) leaves half the warps idle in the output MMA → they stall at the shared
+        # __syncthreads (big barrier-stall regression at saturating batch, ncu v30).  At SMALL batch
+        # the monolith grid (d_split, batch, nheads) underfills the GPU (b1 = 16 CTAs on 148 SMs), so
+        # DS=2 trades idle-warp slack nobody else wants for 2× CTAs and half the per-CTA state load.
+        # Env unset → None → the wrapper's auto-heuristic decides (f32 small-batch monolith → 2).
+        _ds_env = os.environ.get("FLASHINFER_SSU_D_SPLIT")
+        _ds = int(_ds_env) if _ds_env is not None else None
+        if with_conv1d:
+
+            def _run():
+                x_conv, B_conv, C_conv = _conv1d_split()
+                cuda_checkpointing_ssu(
+                    inputs.state_work,
+                    inputs.x_cache_work,
+                    inputs.B_cache_work,
+                    inputs.dt_cache_work,
+                    inputs.ring_start,
+                    inputs.prev_tokens_i32,
+                    x=x_conv,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=B_conv,
+                    C=C_conv,
+                    out=inputs.out_incr,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=None,
+                    state_scale=inputs.state_scale_work,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                    # enable_pdl is the EXTERNAL (conv1d→kernel) chain only.  The
+                    # split's internal precompute→main PDL is unconditional in the
+                    # launcher, so it is NOT controlled here.
+                    enable_pdl=external_pdl,
+                    precompute_heads_per_cta=_phc,
+                    d_split=_ds,
+                    cb_scaled=_cb,
+                    cumAdt_vec=_ca,
+                    cb_old=_cbo,
+                    algorithm=_algo,
+                    cu_seqlens=inputs.cu_seqlens,
+                    max_seqlen=inputs.max_seqlen,
+                )
+        else:
+
+            def _run():
+                cuda_checkpointing_ssu(
+                    inputs.state_work,
+                    inputs.x_cache_work,
+                    inputs.B_cache_work,
+                    inputs.dt_cache_work,
+                    inputs.ring_start,
+                    inputs.prev_tokens_i32,
+                    x=inputs.x,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=inputs.B,
+                    C=inputs.C,
+                    out=inputs.out_incr,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=None,
+                    state_scale=inputs.state_scale_work,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                    # No conv1d here → no external PDL.  The split's internal
+                    # precompute→main PDL is unconditional in the launcher, so it
+                    # is active regardless of this flag.
+                    enable_pdl=False,
+                    precompute_heads_per_cta=_phc,
+                    d_split=_ds,
+                    cb_scaled=_cb,
+                    cumAdt_vec=_ca,
+                    cb_old=_cbo,
+                    algorithm=_algo,
+                    cu_seqlens=inputs.cu_seqlens,
+                    max_seqlen=inputs.max_seqlen,
+                )
 
         return _run
 
-    if kernel == "incremental":
-        # Triton's `write_checkpoint` is `tl.constexpr` — one kernel launch
-        # = one branch.  For a heterogeneous batch, production must launch
-        # both variants per step (one for no-write slots, one for write
-        # slots); the Triton kernels early-exit slots that don't match the
-        # launch's WRITE_CHECKPOINT, so each launch can run over the full
-        # batch without corrupting unrelated slots.  See the early-exit
-        # block in tests/mamba/triton_reference/checkpointing_state_update.py.
-        #
-        # Decision rule based on the user-supplied prev_tokens vector:
-        #   uniform-write    → 1 launch with write_checkpoint=True
-        #   uniform-nowrite  → 1 launch with write_checkpoint=False
-        #   heterogeneous    → 2 launches (False then True)
-        needs_write = (inputs.prev_tokens_i32 + mtp_len) > max_window
-        any_write = bool(needs_write.any().item())
-        all_write = bool(needs_write.all().item())
-        launches: list[bool]
-        if all_write:
-            launches = [True]
-        elif not any_write:
-            launches = [False]
+    if kernel in ("triton-replay", "triton-replay-pm"):
+        # Faithful 5D persistent path (standalone, TMA-optimized).  Both modes:
+        #   triton-replay     → persistent_dynamic (single launch, per-slot
+        #                        runtime write decision).
+        #   triton-replay-pm  → persistent_main (two launches: write half +
+        #                        nowrite half, work items pre-sorted write-first).
+        # Build the work-item plumbing once (write-first sorted) — pd ignores the
+        # ordering at runtime, pm relies on the n_writes split.  mtp_len /
+        # max_window are fixed for this call; prev_tokens_i32 is set by
+        # time_kernel before this closure is built.  Tuning knobs default to
+        # None → the standalone's _resolve_tuning picks the tuned (TMA) config.
+        replay_mode = (
+            "persistent_dynamic" if kernel == "triton-replay" else "persistent_main"
+        )
+        n_writes, replay_work_items = _make_replay_work_items(
+            inputs.prev_tokens_i32,
+            mtp_len,
+            max_window,
+            inputs.batch,
+        )
+
+        if with_conv1d:
+
+            def _run():
+                x_conv, B_conv, C_conv = _conv1d_split()
+                replay_selective_state_update(
+                    inputs.state_work,
+                    inputs.x_cache_work,
+                    inputs.B_cache_work,
+                    inputs.dt_cache_work,
+                    inputs.ring_start,
+                    inputs.prev_tokens_i32,
+                    x=x_conv,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=B_conv,
+                    C=C_conv,
+                    out=inputs.out_incr,
+                    n_writes=n_writes,
+                    replay_work_items=replay_work_items,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=None,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                    state_scales=inputs.state_scale_work,
+                    mode=replay_mode,
+                    launch_with_pdl=external_pdl,
+                )
         else:
-            launches = [False, True]
 
-        def _one_launch(wc: bool):
-            checkpointing_state_update(
-                inputs.state_work,
-                inputs.old_x_work,
-                inputs.old_B_work,
-                inputs.old_dt_work,
-                inputs.old_cumAdt_work,
-                inputs.cache_buf_idx_work,
-                inputs.prev_tokens_i32,
-                x=inputs.x,
-                dt=inputs.dt,
-                A=inputs.A,
-                B=inputs.B,
-                C=inputs.C,
-                out=inputs.out_incr,
-                D=inputs.D,
-                dt_bias=inputs.dt_bias,
-                dt_softplus=True,
-                state_batch_indices=None,
-                use_internal_pdl=autotune.internal_pdl,
-                rand_seed=rand_seed,
-                philox_rounds=philox_rounds,
-                state_scales=inputs.state_scale_work,
-                write_checkpoint=wc,
-                _block_size_m=autotune.block_size_m,
-                _num_warps=autotune.num_warps,
-                _num_stages=autotune.num_stages,
-                _precompute_num_warps=autotune.precompute_num_warps,
-                _precompute_num_stages=autotune.precompute_num_stages,
-            )
-
-        def _run(_launches=tuple(launches)):
-            for wc in _launches:
-                _one_launch(wc)
+            def _run():
+                replay_selective_state_update(
+                    inputs.state_work,
+                    inputs.x_cache_work,
+                    inputs.B_cache_work,
+                    inputs.dt_cache_work,
+                    inputs.ring_start,
+                    inputs.prev_tokens_i32,
+                    x=inputs.x,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=inputs.B,
+                    C=inputs.C,
+                    out=inputs.out_incr,
+                    n_writes=n_writes,
+                    replay_work_items=replay_work_items,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=None,
+                    rand_seed=rand_seed,
+                    philox_rounds=philox_rounds,
+                    state_scales=inputs.state_scale_work,
+                    mode=replay_mode,
+                )
 
         return _run
 
     if kernel == "fi-dump":
         # Write state only at the LAST in-window token for each slot.
-        # The CLI used a single scalar prev_k for the whole batch; with a
+        # The CLI used a single scalar pnat for the whole batch; with a
         # heterogeneous vector we set dst_indices per slot.
         sbi = torch.arange(inputs.batch, dtype=torch.int32, device="cuda")
         out_dump = torch.zeros_like(inputs.out_incr)
         dst_indices = torch.full(
             (inputs.batch, mtp_len), -1, dtype=torch.int32, device="cuda"
         )
-        # Per-slot last position: max(prev_k - 1, 0), clamped to mtp_len-1.
+        # Per-slot last position: max(pnat - 1, 0), clamped to mtp_len-1.
         last_pos = (inputs.prev_tokens_i32 - 1).clamp_(min=0, max=mtp_len - 1)
         row_ix = torch.arange(inputs.batch, dtype=torch.int64, device="cuda")
         dst_indices[row_ix, last_pos.to(torch.int64)] = sbi
 
-        def _run():
-            flashinfer_selective_state_update(
-                state=inputs.state_work,
-                x=inputs.x,
-                dt=inputs.dt,
-                A=inputs.A,
-                B=inputs.B,
-                C=inputs.C,
-                D=inputs.D,
-                dt_bias=inputs.dt_bias,
-                dt_softplus=True,
-                state_batch_indices=sbi,
-                dst_state_batch_indices=dst_indices,
-                pad_slot_id=-1,
-                state_scale=inputs.state_scale_work,
-                out=out_dump,
-                cache_steps=mtp_len,
-                algorithm="simple",
-            )
+        if with_conv1d:
+
+            def _run():
+                x_conv, B_conv, C_conv = _conv1d_split()
+                flashinfer_selective_state_update(
+                    state=inputs.state_work,
+                    x=x_conv,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=B_conv,
+                    C=C_conv,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=sbi,
+                    dst_state_batch_indices=dst_indices,
+                    pad_slot_id=-1,
+                    state_scale=inputs.state_scale_work,
+                    out=out_dump,
+                    cache_steps=mtp_len,
+                    algorithm="simple",
+                )
+        else:
+
+            def _run():
+                flashinfer_selective_state_update(
+                    state=inputs.state_work,
+                    x=inputs.x,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=inputs.B,
+                    C=inputs.C,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=sbi,
+                    dst_state_batch_indices=dst_indices,
+                    pad_slot_id=-1,
+                    state_scale=inputs.state_scale_work,
+                    out=out_dump,
+                    cache_steps=mtp_len,
+                    algorithm="simple",
+                )
 
         return _run
 
@@ -695,26 +1079,51 @@ def _make_run_closure(
         else:
             baseline_fn = selective_state_update
 
-        def _run():
-            extra = {"algorithm": "simple"} if is_fi else {}
-            if inputs.state_scale_work is not None:
-                extra["state_scale"] = inputs.state_scale_work
-            baseline_fn(
-                inputs.state_work,
-                x=inputs.x,
-                dt=inputs.dt,
-                A=inputs.A,
-                B=inputs.B,
-                C=inputs.C,
-                D=inputs.D,
-                dt_bias=inputs.dt_bias,
-                dt_softplus=True,
-                out=inputs.out_base,
-                disable_state_update=True,
-                intermediate_states_buffer=inputs.intermediate_states_buffer,
-                cache_steps=mtp_len,
-                **extra,
-            )
+        if with_conv1d:
+
+            def _run():
+                x_conv, B_conv, C_conv = _conv1d_split()
+                extra = {"algorithm": "simple"} if is_fi else {}
+                if inputs.state_scale_work is not None:
+                    extra["state_scale"] = inputs.state_scale_work
+                baseline_fn(
+                    inputs.state_work,
+                    x=x_conv,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=B_conv,
+                    C=C_conv,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    out=inputs.out_base,
+                    disable_state_update=True,
+                    intermediate_states_buffer=inputs.intermediate_states_buffer,
+                    cache_steps=mtp_len,
+                    **extra,
+                )
+        else:
+
+            def _run():
+                extra = {"algorithm": "simple"} if is_fi else {}
+                if inputs.state_scale_work is not None:
+                    extra["state_scale"] = inputs.state_scale_work
+                baseline_fn(
+                    inputs.state_work,
+                    x=inputs.x,
+                    dt=inputs.dt,
+                    A=inputs.A,
+                    B=inputs.B,
+                    C=inputs.C,
+                    D=inputs.D,
+                    dt_bias=inputs.dt_bias,
+                    dt_softplus=True,
+                    out=inputs.out_base,
+                    disable_state_update=True,
+                    intermediate_states_buffer=inputs.intermediate_states_buffer,
+                    cache_steps=mtp_len,
+                    **extra,
+                )
 
         return _run
 
@@ -830,6 +1239,21 @@ def _time_kernel_eager(
     return _compute_stats(latencies_us)
 
 
+def finalize_cupti() -> None:
+    """Detach CUPTI from the process — call ONCE, after the whole sweep.
+
+    cuptiFinalize() is once-per-process teardown; _time_kernel_cupti deliberately does
+    NOT call it per timing (per-call finalize cycled attach/detach into an illegal memory
+    access after ~40 calls).  Safe to call even when CUPTI was never used / not installed.
+    """
+    try:
+        from cupti import cupti
+
+        cupti.finalize()
+    except Exception:
+        pass
+
+
 def _time_kernel_cupti(
     args,
     run_fn,
@@ -851,7 +1275,12 @@ def _time_kernel_cupti(
                 cupti.ActivityKind.MEMCPY,
                 cupti.ActivityKind.MEMSET,
             ):
-                kernels.append((a.start, a.end, a.correlation_id))
+                # `name` is only present on CONCURRENT_KERNEL activities;
+                # MEMCPY/MEMSET have no kernel name (guard avoids attr error).
+                name = (
+                    a.name if a.kind == cupti.ActivityKind.CONCURRENT_KERNEL else None
+                )
+                kernels.append((a.start, a.end, a.correlation_id, name))
             elif a.kind in (cupti.ActivityKind.RUNTIME, cupti.ActivityKind.DRIVER):
                 launches.append((a.start, a.end, a.correlation_id))
 
@@ -910,7 +1339,11 @@ def _time_kernel_cupti(
     cupti.activity_disable(cupti.ActivityKind.DRIVER)
     cupti.activity_disable(cupti.ActivityKind.MEMCPY)
     cupti.activity_disable(cupti.ActivityKind.MEMSET)
-    cupti.finalize()
+    # NOTE: no cupti.finalize() here.  cuptiFinalize() is once-per-process teardown, and
+    # this runs per (kernel, batch); finalizing per call cycled attach/detach into a
+    # cudaErrorIllegalAddress after ~40 calls (a 5-kernel x 9-batch sweep died at the 43rd).
+    # activity_flush_all(0) above already drained the data — the driver calls
+    # finalize_cupti() ONCE after the whole sweep instead.
 
     # Build correlation_id → kernel list mapping
     corr_to_kernels: dict[int, list[tuple[int, int, int]]] = {}
@@ -938,6 +1371,19 @@ def _time_kernel_cupti(
         min_start = min(k[0] for k in iter_kernels)
         max_end = max(k[1] for k in iter_kernels)
         latencies_us.append((max_end - min_start) / 1e3)  # ns → µs
+
+        if os.environ.get("SSU_CUPTI_DEBUG") and idx == 0:
+            print(
+                f"\n[CUPTI-DEBUG] tag={tag} iter={idx} n_kernels={len(iter_kernels)}",
+                file=sys.stderr,
+            )
+            for k in sorted(iter_kernels, key=lambda r: r[0]):
+                nm = k[3] if len(k) > 3 and k[3] is not None else "<memcpy/memset>"
+                print(
+                    f"  start={(k[0] - min_start) / 1e3:8.3f}  "
+                    f"end={(k[1] - min_start) / 1e3:8.3f} µs  {nm}",
+                    file=sys.stderr,
+                )
 
     return _compute_stats(latencies_us)
 
@@ -978,7 +1424,7 @@ def _time_kernel(args, run_fn, reset_fn, tag: str) -> tuple[float, float, float]
 
 
 # ---------------------------------------------------------------------------
-# Per-config benchmark (consolidated baseline + incremental)
+# Per-config benchmark
 # ---------------------------------------------------------------------------
 
 
@@ -987,7 +1433,7 @@ def _bench_config(
     batch: int,
     mtp_len: int,
     max_window: int,
-    prev_ks: list[int],
+    pnats: list[int],
     state_dtype: torch.dtype,
     act_dtype: torch.dtype,
     baseline_fn,
@@ -998,7 +1444,7 @@ def _bench_config(
     Benchmark one (batch, mtp_len, dtype) configuration.
 
     Runs the baseline kernel (if baseline_fn is not None) followed by the
-    incremental kernel for each prev_k value.  Tensors are built once and
+    incremental kernel for each pnat value.  Tensors are built once and
     shared across all runs in this config.
 
     When ``philox_rounds > 0`` (f16 state only), the supporting kernels
@@ -1026,17 +1472,25 @@ def _bench_config(
         head_dim=args.head_dim,
         d_state=args.d_state,
         ngroups=args.tp_ngroups,
+        two_kernel=args.two_kernel,
+        varlen=args.varlen,
     )
 
     # Reuse args directly as the TimingOptions duck — it carries .warmup,
     # .iters, .cupti, .cuda_graph, .l2_flush.
     timing = args
 
-    show_kernel_col = baseline_fn is not None or args.flashinfer_dump or args.cuda_incr
+    show_kernel_col = (
+        baseline_fn is not None
+        or args.flashinfer_dump
+        or args.cuda_incr
+        or args.triton_replay
+        or args.triton_replay_pm
+    )
 
     pt_uniform_i32 = torch.zeros(batch, dtype=torch.int32, device="cuda")
 
-    # --- Baseline (no prev_k dependence; one row total) ---
+    # --- Baseline (no pnat dependence; one row total) ---
     if baseline_fn is not None:
         tag = f"base_b{batch}_mtp{mtp_len}_s{state_dtype_name}_a{act_dtype_name}"
         kernel_name = (
@@ -1067,86 +1521,59 @@ def _bench_config(
             p99_us,
         )
 
-    def _parse_sweep(val):
-        if val is None:
-            return [None]
-        return [int(x) for x in val.split(",")]
-
-    bsm_values = _parse_sweep(args.block_size_m)
-    nw_values = _parse_sweep(args.num_warps)
-    ns_values = _parse_sweep(args.num_stages)
-    pnw_values = _parse_sweep(args.precompute_num_warps)
-    pns_values = _parse_sweep(args.precompute_num_stages)
-
-    # --- Triton incremental kernel, one row per prev_k × autotune-point ---
-    for prev_k in prev_ks:
-        pt_uniform_i32.fill_(prev_k)
-        tag = (
-            f"incr_b{batch}_mtp{mtp_len}_k{prev_k}"
-            f"_s{state_dtype_name}_a{act_dtype_name}"
-        )
-        for bsm in bsm_values:
-            for nw in nw_values:
-                for ns in ns_values:
-                    for pnw in pnw_values:
-                        for pns in pns_values:
-                            autotune = TritonAutotune(
-                                block_size_m=bsm,
-                                num_warps=nw,
-                                num_stages=ns,
-                                precompute_num_warps=pnw,
-                                precompute_num_stages=pns,
-                                internal_pdl=args.internal_pdl,
-                            )
-                            parts = []
-                            if bsm is not None:
-                                parts.append(f"M={bsm}")
-                            if nw is not None:
-                                parts.append(f"W={nw}")
-                            if ns is not None:
-                                parts.append(f"S={ns}")
-                            if pnw is not None:
-                                parts.append(f"pW={pnw}")
-                            if pns is not None:
-                                parts.append(f"pS={pns}")
-                            sweep_suffix = (" " + ",".join(parts)) if parts else ""
-                            sweep_tag = tag + sweep_suffix.replace(" ", "_").replace(
-                                ",", "_"
-                            )
-                            median_us, p95_us, p99_us = time_kernel(
-                                kernel="incremental",
-                                inputs=inputs,
-                                prev_tokens=pt_uniform_i32,
-                                timing=timing,
-                                tag=sweep_tag,
-                                philox_rounds=philox_rounds,
-                                rand_seed=rand_seed,
-                                autotune=autotune,
-                            )
-                            _print_row(
-                                show_kernel_col,
-                                "incremental",
-                                batch,
-                                mtp_len,
-                                prev_k,
-                                state_dtype_name,
-                                act_dtype_name,
-                                median_us,
-                                p95_us,
-                                p99_us,
-                                sweep_suffix,
-                            )
-
     # --- CUDA checkpointing_ssu kernel ---
     if args.cuda_incr:
-        for prev_k in prev_ks:
-            pt_uniform_i32.fill_(prev_k)
+        # Monolithic ("cuda-incr") + the two-kernel split ("cuda-incr-2k", when
+        # --two-kernel) as separate rows in one run, for a direct comparison.
+        cuda_variants = ["cuda-incr"]
+        # Two-kernel split takes 2-byte (bf16/fp16, LDSM) and 4-byte (f32,
+        # LDS.64 + in-register narrow) state; skip the 2k row only for
+        # quantized (fp8/int8) state, which has no split.
+        if args.two_kernel and state_dtype in (
+            torch.float16,
+            torch.bfloat16,
+            torch.float32,
+        ):
+            cuda_variants.append("cuda-incr-2k")
+        for kname in cuda_variants:
+            for pnat in pnats:
+                pt_uniform_i32.fill_(pnat)
+                tag = (
+                    f"{kname.replace('-', '_')}_b{batch}_mtp{mtp_len}_k{pnat}"
+                    f"_s{state_dtype_name}_a{act_dtype_name}"
+                )
+                median_us, p95_us, p99_us = time_kernel(
+                    kernel=kname,
+                    inputs=inputs,
+                    prev_tokens=pt_uniform_i32,
+                    timing=timing,
+                    tag=tag,
+                    philox_rounds=philox_rounds,
+                    rand_seed=rand_seed,
+                )
+                _print_row(
+                    show_kernel_col,
+                    kname,
+                    batch,
+                    mtp_len,
+                    pnat,
+                    state_dtype_name,
+                    act_dtype_name,
+                    median_us,
+                    p95_us,
+                    p99_us,
+                )
+
+    # --- Triton replay (new 5D persistent path) ---
+    if args.triton_replay:
+        for pnat in pnats:
+            pt_uniform_i32.fill_(pnat)
             tag = (
-                f"cuda_incr_b{batch}_mtp{mtp_len}_k{prev_k}"
+                f"triton_replay_b{batch}_mtp{mtp_len}_k{pnat}"
                 f"_s{state_dtype_name}_a{act_dtype_name}"
             )
             median_us, p95_us, p99_us = time_kernel(
-                kernel="cuda-incr",
+                kernel="triton-replay",
                 inputs=inputs,
                 prev_tokens=pt_uniform_i32,
                 timing=timing,
@@ -1156,10 +1583,40 @@ def _bench_config(
             )
             _print_row(
                 show_kernel_col,
-                "cuda-incr",
+                "triton-replay",
                 batch,
                 mtp_len,
-                prev_k,
+                pnat,
+                state_dtype_name,
+                act_dtype_name,
+                median_us,
+                p95_us,
+                p99_us,
+            )
+
+    # --- Triton replay, persistent_main mode (write/nowrite two-launch split) ---
+    if args.triton_replay_pm:
+        for pnat in pnats:
+            pt_uniform_i32.fill_(pnat)
+            tag = (
+                f"triton_replay_pm_b{batch}_mtp{mtp_len}_k{pnat}"
+                f"_s{state_dtype_name}_a{act_dtype_name}"
+            )
+            median_us, p95_us, p99_us = time_kernel(
+                kernel="triton-replay-pm",
+                inputs=inputs,
+                prev_tokens=pt_uniform_i32,
+                timing=timing,
+                tag=tag,
+                philox_rounds=philox_rounds,
+                rand_seed=rand_seed,
+            )
+            _print_row(
+                show_kernel_col,
+                "triton-replay-pm",
+                batch,
+                mtp_len,
+                pnat,
                 state_dtype_name,
                 act_dtype_name,
                 median_us,
@@ -1169,10 +1626,10 @@ def _bench_config(
 
     # --- FlashInfer dynamic-dump ---
     if args.flashinfer_dump:
-        for prev_k in prev_ks:
-            pt_uniform_i32.fill_(prev_k)
+        for pnat in pnats:
+            pt_uniform_i32.fill_(pnat)
             tag = (
-                f"fi_dump_b{batch}_mtp{mtp_len}_k{prev_k}"
+                f"fi_dump_b{batch}_mtp{mtp_len}_k{pnat}"
                 f"_s{state_dtype_name}_a{act_dtype_name}"
             )
             median_us, p95_us, p99_us = time_kernel(
@@ -1187,7 +1644,7 @@ def _bench_config(
                 "fi-dump",
                 batch,
                 mtp_len,
-                prev_k,
+                pnat,
                 state_dtype_name,
                 act_dtype_name,
                 median_us,
@@ -1201,7 +1658,7 @@ def _print_row(
     kernel_name,
     batch,
     mtp_len,
-    prev_k,
+    pnat,
     state_dtype_name,
     act_dtype_name,
     median_us,
@@ -1211,7 +1668,7 @@ def _print_row(
 ):
     kernel_col = f"{kernel_name:>11} | " if show_kernel_col else ""
     print(
-        f"| {kernel_col}{batch:>5} | {mtp_len:>7} | {str(prev_k):>6} | "
+        f"| {kernel_col}{batch:>5} | {mtp_len:>7} | {str(pnat):>6} | "
         f"{state_dtype_name:>14} | {act_dtype_name:>9} | "
         f"{median_us:>9.2f} | {p95_us:>7.2f} | {p99_us:>7.2f} |"
         f"{sweep_suffix}"
@@ -1238,7 +1695,7 @@ def _run_benchmark(args) -> None:
     max_window = args.max_window
     assert max_window >= max(mtp_lengths), (
         f"--max-window ({max_window}) must be >= max(mtp_lengths) "
-        f"({max(mtp_lengths)}); the incremental kernel requires npredicted <= max_window"
+        f"({max(mtp_lengths)}); the kernels require npredicted <= max_window"
     )
 
     state_specs = [parse_state_spec(s) for s in args.state_dtypes.split(",")]
@@ -1266,10 +1723,16 @@ def _run_benchmark(args) -> None:
         torch.cuda.cudart().cudaProfilerStart()
 
     # Print header
-    show_kernel_col = baseline_fn is not None or args.flashinfer_dump or args.cuda_incr
+    show_kernel_col = (
+        baseline_fn is not None
+        or args.flashinfer_dump
+        or args.cuda_incr
+        or args.triton_replay
+        or args.triton_replay_pm
+    )
     if show_kernel_col:
         print(
-            f"| {'kernel':>11} | {'batch':>5} | {'mtp_len':>7} | {'prev_k':>6} | "
+            f"| {'kernel':>11} | {'batch':>5} | {'mtp_len':>7} | {'pnat':>6} | "
             f"{'state_dtype':>14} | {'act_dtype':>9} | "
             f"{'median_us':>9} | {'p95_us':>7} | {'p99_us':>7} |"
         )
@@ -1279,7 +1742,7 @@ def _run_benchmark(args) -> None:
         )
     else:
         print(
-            f"| {'batch':>5} | {'mtp_len':>7} | {'prev_k':>6} | "
+            f"| {'batch':>5} | {'mtp_len':>7} | {'pnat':>6} | "
             f"{'state_dtype':>14} | {'act_dtype':>9} | "
             f"{'median_us':>9} | {'p95_us':>7} | {'p99_us':>7} |"
         )
@@ -1290,13 +1753,11 @@ def _run_benchmark(args) -> None:
 
     for batch in batch_sizes:
         for mtp_len in mtp_lengths:
-            # Resolve prev_k fractions → clamped integers in [0, mtp_len]
-            prev_ks = sorted(
-                set(
-                    min(mtp_len, max(0, round(f * mtp_len)))
-                    for f in args.prev_tokens_fracs
-                )
-            )
+            # PNAT = previously-accepted-token count = window OCCUPANCY (∈ [0, max_window]), NOT
+            # last-step acceptance — so absolute values are clamped to [0, max_window].  A PNAT with
+            # pnat+mtp_len>max_window hits the write (checkpoint) path (e.g. mw=16, mtp=6 → pnat≥11);
+            # the kernel asserts the same [0, max_window] range.
+            pnats = sorted(set(min(max_window, max(0, p)) for p in args.pnat))
             for state_dtype, philox_rounds, state_label in state_specs:
                 for act_dtype in act_dtypes:
                     _bench_config(
@@ -1304,7 +1765,7 @@ def _run_benchmark(args) -> None:
                         batch,
                         mtp_len,
                         max_window,
-                        prev_ks,
+                        pnats,
                         state_dtype,
                         act_dtype,
                         baseline_fn,
@@ -1365,8 +1826,8 @@ def _parse_args() -> argparse.Namespace:
         "--max-window",
         type=int,
         default=16,
-        help="Cache capacity (T-axis size for old_x/old_B/old_dt/old_cumAdt). "
-        "The CUDA kernel triggers must_checkpoint when prev_k + mtp_len > max_window; "
+        help="Logical replay window MAX_WINDOW (ring rows = max_window + mtp_len). "
+        "The CUDA kernel triggers must_checkpoint when pnat + mtp_len > max_window; "
         "Triton receives a matching write_checkpoint flag for apples-to-apples timing. "
         "Must be >= max(mtp_lengths).",
     )
@@ -1404,6 +1865,14 @@ def _parse_args() -> argparse.Namespace:
         help="L2 eviction between iterations",
     )
     parser.add_argument(
+        "--two-kernel",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run the cuda-incr path as the two-kernel split (precompute + "
+        "main, caller-provided cb_scaled/cumAdt_vec/cb_old scratch). On by "
+        "default; --no-two-kernel runs the monolithic kernel instead.",
+    )
+    parser.add_argument(
         "--cuda-graph",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1420,12 +1889,13 @@ def _parse_args() -> argparse.Namespace:
         "CUDA events if CUPTI is unavailable.",
     )
     parser.add_argument(
-        "--prev-tokens-fracs",
-        default="0,0.5,1.0",
-        type=lambda s: [float(x) for x in s.split(",")],
-        help="Fractions of mtp_len to use as prev_num_accepted_tokens "
-        "for the incremental kernel sweep. Values are rounded "
-        "and clamped to [0, mtp_len].",
+        "--pnat",
+        default="0,4,8",
+        type=lambda s: [int(x) for x in s.split(",")],
+        help="Absolute PNAT (previously-accepted-token counts) to sweep as "
+        "prev_num_accepted_tokens.  Clamped to [0, max_window].  "
+        "pnat + mtp_len > max_window triggers the checkpoint (write) path. "
+        "Example: --pnat 0,1,4,8,12,14",
     )
     parser.add_argument(
         "--baseline",
@@ -1433,7 +1903,7 @@ def _parse_args() -> argparse.Namespace:
         nargs="?",
         const="triton",
         choices=[None, "triton", "flashinfer"],
-        help="Baseline to benchmark alongside the incremental kernel. "
+        help="Baseline to benchmark alongside the CUDA kernels. "
         "'triton': native Triton selective_state_update. "
         "'flashinfer': flashinfer selective_state_update (same signature). "
         "Pass --baseline alone for 'triton'. Default: no baseline.",
@@ -1442,43 +1912,8 @@ def _parse_args() -> argparse.Namespace:
         "--output",
         default=None,
         help="Path to save results (file or directory). "
-        "If a directory, writes bench_checkpointing_ssu_<timestamp>.txt inside it.",
-    )
-    parser.add_argument(
-        "--block-size-m",
-        type=str,
-        default=None,
-        help="Override BLOCK_SIZE_M: single value or comma-separated sweep (e.g. '4,8,16,32').",
-    )
-    parser.add_argument(
-        "--num-warps",
-        type=str,
-        default=None,
-        help="Override num_warps: single value or comma-separated sweep (e.g. '1,2,4').",
-    )
-    parser.add_argument(
-        "--internal-pdl",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Internal PDL between precompute and main kernels (default: on).",
-    )
-    parser.add_argument(
-        "--num-stages",
-        type=str,
-        default=None,
-        help="Override num_stages for the main kernel (comma-separated sweep).",
-    )
-    parser.add_argument(
-        "--precompute-num-warps",
-        type=str,
-        default=None,
-        help="Override num_warps for precompute kernel (comma-separated sweep).",
-    )
-    parser.add_argument(
-        "--precompute-num-stages",
-        type=str,
-        default=None,
-        help="Override num_stages for precompute kernel (comma-separated sweep).",
+        "If a directory, writes bench_checkpointing_ssu_[<SSU_TAG>_]b<batch>_<dtype>_mtp<mtp>_"
+        "pf<fracs>_<timestamp>.txt inside it (SSU_TAG env optional).",
     )
     parser.add_argument(
         "--cuda-incr",
@@ -1487,11 +1922,34 @@ def _parse_args() -> argparse.Namespace:
         help="Run CUDA checkpointing_ssu kernel (default: on).",
     )
     parser.add_argument(
+        "--triton-replay",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run Triton replay_selective_state_update, persistent_dynamic "
+        "(5D persistent path) (default: on).",
+    )
+    parser.add_argument(
+        "--triton-replay-pm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run Triton replay_selective_state_update, persistent_main "
+        "(write/nowrite two-launch split) (default: on).",
+    )
+    parser.add_argument(
         "--flashinfer-dump",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Run FlashInfer dynamic-dump scenario: write state only at prev_k "
+        help="Run FlashInfer dynamic-dump scenario: write state only at pnat "
         "via dst_state_batch_indices (default: on).",
+    )
+    parser.add_argument(
+        "--varlen",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Pack inputs into the varlen (1, batch*T, ...) + cu_seqlens layout "
+        "with uniform seq_len = T — exact A/B against dense (same work, only the "
+        "VARLEN addressing path differs).  Forces the CUDA rows only: the "
+        "Triton/dump/baseline impls take no cu_seqlens.",
     )
     return parser.parse_args()
 
@@ -1518,15 +1976,57 @@ class _Tee:
         self._file.close()
 
 
+def _spec_tag(args) -> str:
+    """Descriptive stem for the auto-generated results filename: an optional ``SSU_TAG``
+    env tag followed by the sweep params (batch / state-dtype / mtp / prev-token fracs), so
+    each run's file is self-identifying.  Lists collapse to ``-``-joined values."""
+
+    def _clean(s) -> str:
+        return str(s).replace(",", "-").replace(" ", "")
+
+    parts = []
+    tag = os.environ.get("SSU_TAG", "").strip()
+    if tag:
+        parts.append(_clean(tag))
+    parts.append("b" + _clean(args.batch_sizes))
+    parts.append(_clean(args.state_dtypes))
+    parts.append("mtp" + _clean(args.mtp_lengths))
+    parts.append("pnat" + "-".join(str(p) for p in args.pnat))
+    return "_".join(parts)
+
+
 if __name__ == "__main__":
     _args = _parse_args()
+
+    if _args.varlen:
+        _forced_off = [
+            f
+            for f, on in [
+                ("--triton-replay", _args.triton_replay),
+                ("--triton-replay-pm", _args.triton_replay_pm),
+                ("--flashinfer-dump", _args.flashinfer_dump),
+            ]
+            if on
+        ]
+        if _forced_off:
+            print(
+                f"NOTE: --varlen keeps only the CUDA rows (the other impls take no "
+                f"cu_seqlens); forcing off {_forced_off}.",
+                file=sys.stderr,
+            )
+        _args.triton_replay = _args.triton_replay_pm = _args.flashinfer_dump = False
+        assert _args.baseline is None, (
+            f"--varlen is incompatible with --baseline (got {_args.baseline!r})"
+        )
 
     _out_path = None
     if _args.output != "-":
         _ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        _fname = f"bench_checkpointing_ssu_{_ts}.txt"
+        _fname = f"bench_checkpointing_ssu_{_spec_tag(_args)}_{_ts}.txt"
         if _args.output is None:
-            _out_path = os.path.expanduser(f"~/nemo_logs/{_fname}")
+            # Default output dir: FLASHINFER_SSU_BENCH_OUTDIR if set, else cwd.
+            _out_dir = os.environ.get("FLASHINFER_SSU_BENCH_OUTDIR", ".")
+            _out_path = os.path.join(os.path.expanduser(_out_dir), _fname)
         elif os.path.isdir(_args.output) or _args.output.endswith("/"):
             _out_path = os.path.join(_args.output, _fname)
         else:
@@ -1541,6 +2041,9 @@ if __name__ == "__main__":
 
     try:
         _run_benchmark(_args)
+        # Finalize CUPTI ONCE, after the whole sweep — never per timing call.
+        if _args.cupti:
+            finalize_cupti()
     finally:
         if _tee is not None:
             sys.stdout = _tee._stdout

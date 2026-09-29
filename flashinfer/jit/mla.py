@@ -20,13 +20,54 @@ from .core import JitSpec, gen_jit_spec, current_compilation_context
 
 def gen_mla_module() -> JitSpec:
     nvcc_flags = current_compilation_context.get_nvcc_flags_list(
-        supported_major_versions=[10, 11]
+        supported_major_versions=[10, 11], map_sm107_to_100f=True
     )
     return gen_jit_spec(
         "mla",
         [
             jit_env.FLASHINFER_CSRC_DIR / "cutlass_mla.cu",
             jit_env.FLASHINFER_CSRC_DIR / "flashinfer_mla_binding.cu",
+        ],
+        extra_cuda_cflags=nvcc_flags,
+    )
+
+
+def gen_sparse_mla_nvfp4_sm120_module() -> JitSpec:
+    """Compatibility alias: the NVFP4 route lives in the unified SM120 module."""
+    return gen_sparse_mla_sm120_module()
+
+
+def gen_sparse_mla_nvfp4_sm120_tile_module() -> JitSpec:
+    """Compatibility alias: the MMA layout probes live in the unified module."""
+    return gen_sparse_mla_sm120_module()
+
+
+def gen_sparse_mla_sm120_module() -> JitSpec:
+    """Sparse-MLA paged attention for SM120.
+
+    Monolithic module: runtime dispatch on model type, head count, top-k,
+    page block size, and optional extra page block size happens inside the
+    orchestrator.
+    """
+    nvcc_flags = current_compilation_context.get_nvcc_flags_list(
+        supported_major_versions=[12]
+    )
+    return gen_jit_spec(
+        "sparse_mla_sm120",
+        [
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv32_decode_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/decode_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/prefill_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv41_fp4_cache_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/nvfp4_mma_layout_probe.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_cache_ops.cu",
+            jit_env.FLASHINFER_CSRC_DIR
+            / "sparse_mla_sm120/dsv4_nvfp4_attention_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_dispatch.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/dsv4_nvfp4_resolve.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/attention_binding.cu",
+            jit_env.FLASHINFER_CSRC_DIR / "sparse_mla_sm120/attention_resolve.cu",
         ],
         extra_cuda_cflags=nvcc_flags,
     )

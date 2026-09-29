@@ -16,7 +16,6 @@ limitations under the License.
 
 from .modules import gen_cudnn_fmha_module as gen_cudnn_fmha_module
 from .modules import gen_batch_attention_module as gen_batch_attention_module
-from .modules import gen_batch_decode_mla_module as gen_batch_decode_mla_module
 from .modules import gen_batch_decode_module as gen_batch_decode_module
 from .modules import gen_batch_mla_module as gen_batch_mla_module
 from .modules import gen_batch_prefill_module as gen_batch_prefill_module
@@ -38,7 +37,6 @@ from .modules import gen_pod_module as gen_pod_module
 from .modules import gen_single_decode_module as gen_single_decode_module
 from .modules import gen_single_prefill_module as gen_single_prefill_module
 from .modules import get_batch_attention_uri as get_batch_attention_uri
-from .modules import get_batch_decode_mla_uri as get_batch_decode_mla_uri
 from .modules import get_batch_decode_uri as get_batch_decode_uri
 from .modules import get_batch_mla_uri as get_batch_mla_uri
 from .modules import get_batch_prefill_uri as get_batch_prefill_uri
@@ -50,5 +48,6 @@ from .modules import gen_trtllm_fmha_v2_sm120_module as gen_trtllm_fmha_v2_sm120
 from .modules import gen_fmha_v2_module as gen_fmha_v2_module
 from .modules import (
     gen_batch_prefill_attention_sink_module as gen_batch_prefill_attention_sink_module,
+    gen_batch_prefill_bidirectional_ranges_module as gen_batch_prefill_bidirectional_ranges_module,
     get_batch_prefill_attention_sink_uri as get_batch_prefill_attention_sink_uri,
 )

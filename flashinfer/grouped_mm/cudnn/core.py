@@ -20,7 +20,12 @@ from typing import Optional
 
 import torch
 
-from ...gemm.gemm_base import _get_real_fp4_shape_from_packed_uint8
+from ...gemm.gemm_base import (
+    DEFAULT_WORKSPACE_SIZE,
+    _check_cudnn_plan_build_not_capturing,
+    _gemm_workspace_at_least,
+    _get_real_fp4_shape_from_packed_uint8,
+)
 from ...utils import _get_cache_buf
 
 # ---------------------------------------------------------------------------
@@ -45,8 +50,7 @@ except OSError as e:
 # Constants / enums
 # ---------------------------------------------------------------------------
 
-_CUDNN_MOE_MIN_VERSION = 91800  # 9.18.0
-_CUDNN_MOE_BLOCK_SCALE_MIN_VERSION = 92100  # 9.21.0
+_CUDNN_MOE_MIN_VERSION = 92100  # 9.21.0
 
 
 class _CUDNN_UIDs(Enum):
@@ -210,6 +214,7 @@ def _build_cudnn_moe_grouped_gemm_graph(
         output_cudnn_dtype
     )
 
+    _check_cudnn_plan_build_not_capturing("grouped GEMM")
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -284,7 +289,9 @@ def _run_cudnn_moe_grouped_gemm(
     if alpha is not None:
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
-    workspace = _get_cache_buf("grouped_mm_workspace", ws, a.device)
+    workspace = _gemm_workspace_at_least(
+        _get_cache_buf("grouped_mm_workspace", DEFAULT_WORKSPACE_SIZE, a.device), ws
+    )
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
@@ -408,6 +415,7 @@ def _build_cudnn_moe_block_scale_grouped_gemm_graph(
         output_cudnn_dtype
     )
 
+    _check_cudnn_plan_build_not_capturing("grouped GEMM")
     graph.validate()
     graph.build_operation_graph()
     graph.create_execution_plans([cudnn.heur_mode.A, cudnn.heur_mode.FALLBACK])
@@ -495,7 +503,10 @@ def _run_cudnn_moe_block_scale_grouped_gemm_mxfp8(
     if alpha is not None:
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
-    workspace = _get_cache_buf("grouped_mm_mxfp8_workspace", ws, a.device)
+    workspace = _gemm_workspace_at_least(
+        _get_cache_buf("grouped_mm_mxfp8_workspace", DEFAULT_WORKSPACE_SIZE, a.device),
+        ws,
+    )
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:
@@ -600,7 +611,9 @@ def _run_cudnn_moe_block_scale_grouped_gemm_fp4(
     if alpha is not None:
         variant_pack[_CUDNN_UIDs.ALPHA.value] = alpha_3d
 
-    workspace = _get_cache_buf("grouped_mm_fp4_workspace", ws, a.device)
+    workspace = _gemm_workspace_at_least(
+        _get_cache_buf("grouped_mm_fp4_workspace", DEFAULT_WORKSPACE_SIZE, a.device), ws
+    )
     if tactic == -1:
         graph.execute(variant_pack, workspace, handle=handle)
     else:

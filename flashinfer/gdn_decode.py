@@ -27,11 +27,20 @@ Three APIs are provided:
 - gated_delta_rule_mtp: Multi-token processing (T > 1) for speculative decoding
 """
 
-from typing import Optional, Tuple
+import os
+from typing import Literal, Optional, Tuple
 
 import torch
 
 from .jit.core import logger
+
+try:
+    from .jit import cake_gdn as _cake_gdn
+
+    _CAKE_GDN_AVAILABLE = True
+except (ImportError, RuntimeError):
+    _cake_gdn = None
+    _CAKE_GDN_AVAILABLE = False
 
 try:
     from .api_logging import flashinfer_api
@@ -109,6 +118,385 @@ except (ImportError, RuntimeError):
 TILE_V = 8  # pretranspose tile size
 
 
+# Per-call device-side slot validation for the Cake GDN decode adapters. Each
+# ``torch._assert_async`` chain below expands to five elementwise kernels, a
+# device-to-device copy and a ~10 us ``_assert_async_cuda_kernel``; the two
+# calls per decode add ~40 us of GPU time (and ~0.4 ms of eager launch span)
+# around a 5 us kernel, which made every ``backend="cake_gdn"`` decode row slower
+# than the CuTe path through the public API even under CUDA-graph replay. The
+# CuTe decode kernels trust caller-provided slots, so the Cake adapters now do
+# the same by default; set ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1`` to restore
+# the asynchronous fail-closed check (used by the invalid-slot tests).
+_CAKE_GDN_VALIDATE_SLOTS = (
+    os.environ.get("FLASHINFER_CAKE_GDN_VALIDATE_SLOTS", "0") == "1"
+)
+
+
+def _cake_gdn_assert_state_slots(
+    indices: torch.Tensor, pool_size: int, *, name: str, allow_minus_one: bool
+) -> None:
+    """Validate CUDA-resident state slots without a host synchronization.
+
+    Only active when ``FLASHINFER_CAKE_GDN_VALIDATE_SLOTS=1``; see the note above.
+    """
+
+    if not _CAKE_GDN_VALIDATE_SLOTS:
+        return
+    in_pool = (indices >= 0) & (indices < pool_size)
+    valid = ((indices == -1) | in_pool) if allow_minus_one else in_pool
+    torch._assert_async(
+        valid.all(),
+        f"{name} must contain "
+        + ("-1 or " if allow_minus_one else "")
+        + f"slots in [0, {pool_size})",
+    )
+
+
+def _run_cake_gdn_decode_pretranspose(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state_pool: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    scale: float,
+    use_qk_l2norm: bool,
+    output: Optional[torch.Tensor],
+    initial_state_indices: torch.Tensor,
+    output_state_indices: Optional[torch.Tensor],
+    intermediate_states_buffer: Optional[torch.Tensor],
+    disable_state_update: bool,
+) -> torch.Tensor:
+    """Launch one exact manifest-backed GDN non-CP decode row or fail closed."""
+
+    if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
+        raise RuntimeError("the source-only Cake GDN backend is not installed")
+    if q.device.type != "cuda":
+        raise _cake_gdn.CakeGDNUnsupportedError("Cake GDN requires CUDA tensors")
+    if q.dtype != torch.bfloat16:
+        raise _cake_gdn.CakeGDNUnsupportedError("GDN non-CP decode requires BF16 I/O")
+    if (
+        k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+        or a.dtype != torch.bfloat16
+        or b.dtype != torch.bfloat16
+        or A_log.dtype != torch.float32
+        or dt_bias.dtype != torch.float32
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires BF16 Q/K/V/gates and FP32 A_log/dt_bias"
+        )
+    if state_pool.dtype not in (torch.bfloat16, torch.float32):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires BF16 or FP32 state"
+        )
+    batch_size, seq_len, num_q_heads, head_size = q.shape
+    num_v_heads, value_size = int(v.shape[2]), int(v.shape[3])
+    if (
+        k.shape != q.shape
+        or v.shape != (batch_size, seq_len, num_v_heads, value_size)
+        or head_size != 128
+        or value_size != 128
+        or a.shape != (batch_size, seq_len, num_v_heads)
+        or b.shape != (batch_size, seq_len, num_v_heads)
+        or A_log.shape != (num_v_heads,)
+        or dt_bias.shape != (num_v_heads,)
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires exact [B,T,H,128] Q/K, [B,T,HV,128] V, "
+            "and [B,T,HV] gate shapes"
+        )
+    tensors = (q, k, v, state_pool, A_log, a, dt_bias, b, initial_state_indices)
+    if any(tensor.device != q.device for tensor in tensors):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires all tensors on one CUDA device"
+        )
+    if (
+        initial_state_indices.shape != (batch_size,)
+        or not initial_state_indices.is_contiguous()
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires contiguous [B] state indices"
+        )
+    if int(state_pool.shape[0]) <= 0 or state_pool.shape[1:] != (
+        num_v_heads,
+        128,
+        128,
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires a [pool, HV, 128, 128] state pool"
+        )
+    if state_pool.dtype == torch.bfloat16 and state_pool.stride()[1:] != (
+        128 * 128,
+        128,
+        1,
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP BF16 decode requires packed inner state dimensions"
+        )
+    if (
+        state_pool.dtype == torch.float32
+        and seq_len == 1
+        and not all(
+            tensor.is_contiguous()
+            for tensor in (q, k, v, state_pool, A_log, a, dt_bias, b)
+        )
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP FP32 T=1 decode requires contiguous inputs and state"
+        )
+    if initial_state_indices.dtype != torch.int32:
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires int32 state indices"
+        )
+    write_indices = (
+        initial_state_indices if output_state_indices is None else output_state_indices
+    )
+    if write_indices.dtype != torch.int32:
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires int32 output state indices"
+        )
+    if write_indices.shape != (batch_size,) or not write_indices.is_contiguous():
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires contiguous [B] output state indices"
+        )
+    if write_indices.device != q.device:
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires output state indices on the input CUDA device"
+        )
+    if output is None:
+        output = torch.empty(
+            (q.shape[0], q.shape[1], v.shape[2], v.shape[3]),
+            dtype=torch.bfloat16,
+            device=q.device,
+        )
+    elif output.dtype != torch.bfloat16 or not output.is_contiguous():
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires a contiguous BF16 output"
+        )
+    if output.device != q.device:
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP decode requires output on the input CUDA device"
+        )
+    if intermediate_states_buffer is not None:
+        if (
+            intermediate_states_buffer.dtype != state_pool.dtype
+            or not intermediate_states_buffer.is_contiguous()
+            or intermediate_states_buffer.ndim != 5
+            or intermediate_states_buffer.shape[0] != q.shape[0]
+            or intermediate_states_buffer.shape[1] < q.shape[1]
+            or intermediate_states_buffer.device != q.device
+        ):
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                "GDN non-CP checkpoint buffer must be contiguous [B, >=T, HV, V, K] "
+                "with the state dtype"
+            )
+        cache_steps = int(intermediate_states_buffer.shape[1])
+    else:
+        cache_steps = 0
+    pool_size = int(state_pool.shape[0])
+    _cake_gdn_assert_state_slots(
+        initial_state_indices,
+        pool_size,
+        name="GDN non-CP decode initial_state_indices",
+        allow_minus_one=True,
+    )
+    _cake_gdn_assert_state_slots(
+        write_indices,
+        pool_size,
+        name="GDN non-CP decode output_state_indices",
+        allow_minus_one=True,
+    )
+    strided_inputs = not all(tensor.is_contiguous() for tensor in (q, k, v, a, b))
+    major, minor = torch.cuda.get_device_capability(q.device)
+    arch = _cake_gdn.arch_for_compute_capability(major, minor)
+    route = _cake_gdn.select_cake_gdn_decode_variant(
+        arch=arch,
+        batch_size=int(q.shape[0]),
+        io_dtype="bfloat16",
+        state_dtype=("bfloat16" if state_pool.dtype == torch.bfloat16 else "float32"),
+        head_size=int(q.shape[3]),
+        layout="pretranspose",
+        num_k_heads=int(k.shape[2]),
+        num_q_heads=int(q.shape[2]),
+        num_v_heads=int(v.shape[2]),
+        scale=scale,
+        seq_len=int(q.shape[1]),
+        use_qk_l2norm=use_qk_l2norm,
+        strided_inputs=strided_inputs,
+        disable_state_update=disable_state_update,
+        cache_intermediate_states=intermediate_states_buffer is not None,
+        cache_steps=cache_steps,
+    )
+    entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
+    batch_size, seq_len = int(q.shape[0]), int(q.shape[1])
+    num_v_heads = int(v.shape[2])
+    if state_pool.dtype == torch.bfloat16:
+        state_heads = batch_size * num_v_heads
+        tile_v = (
+            16
+            if route.route_id.endswith(".tile16_fullwarp")
+            else 128
+            if state_heads >= 1024
+            else 64
+            if state_heads >= 512
+            else 32
+        )
+        entry(
+            q,
+            k,
+            v,
+            state_pool,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            output,
+            intermediate_states_buffer
+            if intermediate_states_buffer is not None
+            else output,
+            initial_state_indices,
+            write_indices,
+            batch_size * num_v_heads * (128 // tile_v),
+            1,
+            1,
+        )
+    elif seq_len == 1:
+        entry(
+            q,
+            k,
+            v,
+            state_pool,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            output,
+            initial_state_indices,
+            write_indices,
+            batch_size * num_v_heads * 8,
+            1,
+            1,
+        )
+    else:
+        if intermediate_states_buffer is None:
+            raise _cake_gdn.CakeGDNUnsupportedError(
+                "GDN non-CP FP32 MTP requires a caller-owned checkpoint buffer"
+            )
+        args = [
+            q,
+            k,
+            v,
+            state_pool,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            output,
+            intermediate_states_buffer,
+            initial_state_indices,
+        ]
+        if seq_len == 4:
+            args.append(write_indices)
+        grid_scale = 512 if seq_len == 2 else 256 if batch_size == 4 else 64
+        entry(*args, batch_size * grid_scale, 1, 1)
+    return output
+
+
+def _run_cake_gdn_decode_nontranspose(
+    *,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    state: torch.Tensor,
+    A_log: torch.Tensor,
+    a: torch.Tensor,
+    dt_bias: torch.Tensor,
+    b: torch.Tensor,
+    scale: float,
+    output: torch.Tensor,
+    use_qk_l2norm: bool,
+) -> torch.Tensor:
+    """Launch one exact manifest-backed GDN non-CP nontranspose T=1 row."""
+
+    if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
+        raise RuntimeError("the source-only Cake GDN backend is not installed")
+    batch_size, seq_len, num_q_heads, head_size = q.shape
+    num_v_heads, value_size = int(v.shape[2]), int(v.shape[3])
+    tensors = (q, k, v, state, A_log, a, dt_bias, b, output)
+    if q.device.type != "cuda" or any(tensor.device != q.device for tensor in tensors):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP nontranspose decode requires one CUDA device"
+        )
+    if (
+        q.dtype != torch.bfloat16
+        or k.dtype != torch.bfloat16
+        or v.dtype != torch.bfloat16
+        or a.dtype != torch.bfloat16
+        or b.dtype != torch.bfloat16
+        or state.dtype != torch.float32
+        or A_log.dtype != torch.float32
+        or dt_bias.dtype != torch.float32
+        or output.dtype != torch.bfloat16
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP nontranspose decode requires BF16 I/O/gates and FP32 state/decay"
+        )
+    if (
+        seq_len != 1
+        or head_size != 128
+        or value_size != 128
+        or k.shape != q.shape
+        or v.shape != (batch_size, 1, num_v_heads, 128)
+        or state.shape != (batch_size, num_v_heads, 128, 128)
+        or a.shape != (batch_size, 1, num_v_heads)
+        or b.shape != (batch_size, 1, num_v_heads)
+        or A_log.shape != (num_v_heads,)
+        or dt_bias.shape != (num_v_heads,)
+        or output.shape != (batch_size, 1, num_v_heads, 128)
+        or not all(tensor.is_contiguous() for tensor in tensors)
+    ):
+        raise _cake_gdn.CakeGDNUnsupportedError(
+            "GDN non-CP nontranspose decode requires exact contiguous T=1 tensors"
+        )
+    major, minor = torch.cuda.get_device_capability(q.device)
+    arch = _cake_gdn.arch_for_compute_capability(major, minor)
+    route = _cake_gdn.select_cake_gdn_decode_variant(
+        arch=arch,
+        batch_size=int(batch_size),
+        io_dtype="bfloat16",
+        state_dtype="float32",
+        head_size=128,
+        layout="nontranspose",
+        num_k_heads=int(k.shape[2]),
+        num_q_heads=int(num_q_heads),
+        num_v_heads=int(num_v_heads),
+        scale=scale,
+        seq_len=1,
+        use_qk_l2norm=use_qk_l2norm,
+    )
+    entry = _cake_gdn.load_cake_gdn_kernel(route.variant_name, arch)
+    blocks_per_state = 8 if batch_size < 32 else 1
+    entry(
+        q,
+        k,
+        v,
+        state,
+        A_log,
+        a,
+        dt_bias,
+        b,
+        output,
+        batch_size * num_v_heads * blocks_per_state,
+        1,
+        1,
+    )
+    return output
+
+
 # ============================================================================
 # API: Pretranspose Decode (V-major / K-last state layout)
 # ============================================================================
@@ -130,91 +518,120 @@ def gated_delta_rule_decode_pretranspose(
     initial_state: Optional[torch.Tensor] = None,
     initial_state_indices: Optional[torch.Tensor] = None,
     output_state_indices: Optional[torch.Tensor] = None,
+    intermediate_states_buffer: Optional[torch.Tensor] = None,
+    disable_state_update: bool = False,
+    backend: Literal["auto", "flashinfer", "cake_gdn"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel for single-token generation.
 
-    This implements the decode phase of gated delta rule linear attention,
+    Implements the decode phase of gated delta rule linear attention,
     processing one token at a time and updating the recurrent state.
 
-    Args:
-        q (torch.Tensor):
-            Current query of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
-        k (torch.Tensor):
-            Current key of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
-        v (torch.Tensor):
-            Current value of shape ``[B, 1, HV, V]``. Must be float16/bfloat16.
-        state (Optional[torch.Tensor]):
-            Current state of shape ``[B, HV, V, K]`` (v-major / K-last layout).
-            Float32: legacy kernel (T=1 only). Bfloat16: BF16 state backend
-            (T=1 or MTP for T>1) when K=V=128. Will be updated in-place.
-            Pass ``None`` when using ``initial_state`` / ``initial_state_indices`` instead.
-        A_log (torch.Tensor):
-            Log decay parameter of shape ``[HV]``. Must be float32.
-        a (torch.Tensor):
-            Input-dependent decay of shape ``[B, 1, HV]``. Must be float16/bfloat16.
-        dt_bias (torch.Tensor):
-            Decay bias of shape ``[HV]``. Must be bfloat16 or float32.
-        b (torch.Tensor):
-            Update gate (beta) input of shape ``[B, 1, HV]``. Must be float16/bfloat16.
-        scale (Optional[float]):
-            Scale factor for queries. If None, defaults to ``1 / sqrt(K)``.
-        output (Optional[torch.Tensor]):
-            Pre-allocated output tensor of shape ``[B, 1, HV, V]``.
-            If None, will be allocated automatically.
-        use_qk_l2norm (bool):
-            Whether to apply L2 normalization to q and k. Default: ``True``.
-        initial_state (Optional[torch.Tensor]):
-            State pool of shape ``[pool_size, HV, V, K]`` (K-last / K-contiguous,
-            same layout as the per-batch ``state`` argument).
-            When provided, the kernel gathers directly from the pool using
-            ``initial_state_indices`` and writes updates back in-place — eliminating
-            the caller-side gather/scatter overhead.
-            Requires bfloat16 state with K=V=128 (bf16 fast path).
-        initial_state_indices (Optional[torch.Tensor]):
-            Per-batch indices of shape ``[B]`` (int32 or int64) mapping each batch
-            entry to its slot in ``initial_state``.  Required when ``initial_state``
-            is provided.
-        output_state_indices (Optional[torch.Tensor]):
-            Per-batch indices of shape ``[B]`` (int32 or int64) specifying where to write the updated state for each batch entry in the pool.
-            Requires ``initial_state`` to be provided.
-            If None, the kernel will write the updated state back to the same slot it read from (i.e., ``initial_state_indices``).
+    Parameters
+    ----------
+    q : torch.Tensor
+        Current query of shape ``[B, 1, H, K]``.  Must be float16/bfloat16.
+    k : torch.Tensor
+        Current key of shape ``[B, 1, H, K]``.  Must be float16/bfloat16.
+    v : torch.Tensor
+        Current value of shape ``[B, 1, HV, V]``.  Must be float16/bfloat16.
+    state : torch.Tensor, optional
+        Current state of shape ``[B, HV, V, K]`` (v-major / K-last layout).
+        Float32: legacy kernel (T=1 only).  Bfloat16: BF16 state backend
+        (T=1 or MTP for T>1) when K=V=128.  Updated in-place.  Pass ``None``
+        when using ``initial_state`` / ``initial_state_indices`` instead.
+    A_log : torch.Tensor
+        Log decay parameter of shape ``[HV]``.  Must be float32.
+    a : torch.Tensor
+        Input-dependent decay of shape ``[B, 1, HV]``.  Must be
+        float16/bfloat16.
+    dt_bias : torch.Tensor
+        Decay bias of shape ``[HV]``.  Must be bfloat16 or float32.
+    b : torch.Tensor
+        Update gate (beta) input of shape ``[B, 1, HV]``.  Must be
+        float16/bfloat16.
+    scale : float, optional
+        Scale factor for queries.  If ``None``, defaults to
+        ``1 / sqrt(K)``.
+    output : torch.Tensor, optional
+        Pre-allocated output tensor of shape ``[B, 1, HV, V]``.  Allocated
+        automatically when ``None``.
+    use_qk_l2norm : bool
+        Whether to apply L2 normalization to q and k.  Default: ``True``.
+    initial_state : torch.Tensor, optional
+        State pool of shape ``[pool_size, HV, V, K]`` (K-last /
+        K-contiguous, same layout as the per-batch ``state`` argument).
+        When provided, the kernel gathers directly from the pool using
+        ``initial_state_indices`` and writes updates back in-place,
+        eliminating the caller-side gather/scatter overhead.  Requires
+        bfloat16 state with K=V=128 (bf16 fast path).
+    initial_state_indices : torch.Tensor, optional
+        Per-batch indices of shape ``[B]`` (int32 or int64) mapping each
+        batch entry to its slot in ``initial_state``.  Required when
+        ``initial_state`` is provided.
+    output_state_indices : torch.Tensor, optional
+        Per-batch indices of shape ``[B]`` (int32 or int64) specifying
+        where to write the updated state for each batch entry in the pool.
+        Requires ``initial_state`` to be provided.  If ``None``, the kernel
+        writes the updated state back to the same slot it read from (i.e.
+        ``initial_state_indices``).
+    intermediate_states_buffer : torch.Tensor, optional
+        Caller-owned checkpoint buffer of shape ``[B, >=T, HV, V, K]``.
+        Supported only for ``T > 1``; its dtype must match the state dtype.
+    disable_state_update : bool
+        Skip final-state writeback for verify calls. Supported only for
+        ``T > 1``. Default: ``False``.
+    backend : {"auto", "flashinfer", "cake_gdn"}
+        ``auto`` selects GDN non-CP only for an exact frozen manifest row and
+        otherwise uses the existing FlashInfer implementation. Explicit
+        ``cake_gdn`` requests fail closed when the contract is unsupported.
 
-            **Padding / inactive sequences**: set the index to ``-1`` for any batch
-            entry that should be treated as padding.  The two backends handle ``-1``
-            differently:
+        **Padding / inactive sequences**: set the index to ``-1`` for any
+        batch entry that should be treated as padding.  The two backends
+        handle ``-1`` differently:
 
-            - **bf16 fast path** (bfloat16 state, K=V=128): ``-1`` is redirected
-              to ``initial_state[0]``, which acts as a sacrificial *null buffer*.
-              The kernel reads from and writes back to slot 0; the output for that
-              batch entry is computed but **undefined** (caller should not use it).
-              The caller must therefore allocate the pool with an extra leading slot
-              (``pool_size = num_real_slots + 1``) and keep real slots at indices
-              ``1..pool_size-1``.
-            - **float32 legacy path** (T=1): ``-1`` entries are skipped entirely —
-              neither the state pool nor the output are touched for that batch entry;
-              the output slot is written as **zero**.
+        - **bf16 fast path** (bfloat16 state, K=V=128): ``-1`` is redirected
+          to ``initial_state[0]``, which acts as a sacrificial *null
+          buffer*.  The kernel reads from and writes back to slot 0; the
+          output for that batch entry is computed but **undefined** (caller
+          should not use it).  The caller must therefore allocate the pool
+          with an extra leading slot (``pool_size = num_real_slots + 1``)
+          and keep real slots at indices ``1..pool_size-1``.
+        - **float32 legacy path** (T=1): ``-1`` entries are skipped
+          entirely; neither the state pool nor the output are touched for
+          that batch entry; the output slot is written as **zero**.
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - output: Output tensor of shape ``[B, 1, HV, V]``
-            - state or initial_state: Updated state (in-place).
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(output, state_or_initial_state)`` where ``output`` has shape
+        ``[B, 1, HV, V]`` and the second element is the updated state
+        (mutated in place).
 
-    Note:
-        - Requires SM90+ (Hopper, Blackwell, etc.)
-        - State is always updated in-place; the pool path writes directly into
-          ``initial_state`` memory (no separate scatter step needed)
-        - State layout is v-major (K-last): [B, HV, V, K]. When state is bfloat16
-          and K=V=128, the BF16 state kernel is used (T=1 or MTP for T>1).
-          The pool+indices path routes through the MTP kernel.
-        - pool+indices (``initial_state``/``initial_state_indices``) supported on
-          both the bf16 fast path (K=V=128) and the float32 legacy path (T=1).
-          Both paths support ``-1`` padding indices (see ``initial_state_indices``
-          above for per-backend semantics).
-        - Legacy path (float32 state, T=1): K and V must be multiples of 4.
+    Notes
+    -----
+    - Requires SM90+ (Hopper, Blackwell, etc.).
+    - State is always updated in-place; the pool path writes directly into
+      ``initial_state`` memory (no separate scatter step needed).
+    - State layout is v-major (K-last): ``[B, HV, V, K]``.  When state is
+      bfloat16 and ``K = V = 128``, the BF16 state kernel is used (T=1 or
+      MTP for T>1); the pool+indices path routes through the MTP kernel.
+    - Pool+indices (``initial_state`` / ``initial_state_indices``) are
+      supported on both the bf16 fast path (K=V=128) and the float32 legacy
+      path (T=1).  Both paths support ``-1`` padding indices (see
+      ``initial_state_indices`` above for per-backend semantics).
+    - Legacy path (float32 state, T=1): ``K`` and ``V`` must each be
+      ``>= 128``, and ``V`` must be a multiple of 8 (the pretranspose tile
+      size ``TILE_V``).
     """
     # Validate input shapes
     B, T, H, K = q.shape
     _, _, HV, V = v.shape
+
+    if T == 1 and intermediate_states_buffer is not None:
+        raise ValueError("intermediate_states_buffer is supported only for T > 1")
+    if T == 1 and disable_state_update:
+        raise ValueError("disable_state_update is supported only for T > 1")
 
     use_pool = initial_state is not None
     assert use_pool == (initial_state_indices is not None), (
@@ -252,6 +669,40 @@ def gated_delta_rule_decode_pretranspose(
 
     # Backend: BF16 state kernel when bf16 state, K=V=128
     state_dtype = initial_state.dtype if use_pool else state.dtype
+    if backend not in ("auto", "flashinfer", "cake_gdn"):
+        raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if backend != "flashinfer":
+        if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
+            if backend == "cake_gdn":
+                raise RuntimeError("the source-only Cake GDN backend is not installed")
+        elif not use_pool:
+            if backend == "cake_gdn":
+                raise _cake_gdn.CakeGDNUnsupportedError(
+                    "GDN non-CP pretranspose decode requires an indexed state pool"
+                )
+        else:
+            try:
+                cake_gdn_output = _run_cake_gdn_decode_pretranspose(
+                    q=q,
+                    k=k,
+                    v=v,
+                    state_pool=initial_state,
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    b=b,
+                    scale=K**-0.5 if scale is None else scale,
+                    use_qk_l2norm=use_qk_l2norm,
+                    output=output,
+                    initial_state_indices=initial_state_indices,
+                    output_state_indices=output_state_indices,
+                    intermediate_states_buffer=intermediate_states_buffer,
+                    disable_state_update=disable_state_update,
+                )
+                return cake_gdn_output, initial_state
+            except _cake_gdn.CakeGDNUnsupportedError:
+                if backend == "cake_gdn":
+                    raise
     use_bf16_state = (
         _GDN_DECODE_BF16_STATE_AVAILABLE
         and state_dtype == torch.bfloat16
@@ -263,6 +714,14 @@ def gated_delta_rule_decode_pretranspose(
             f"q must be float16/bfloat16, got {q.dtype}"
         )
         assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+        assert dt_bias.dtype in (torch.bfloat16, torch.float32), (
+            f"dt_bias must be bfloat16 or float32, got {dt_bias.dtype}"
+        )
+        if use_pool:
+            assert initial_state_indices.dtype in (torch.int32, torch.int64), (
+                f"initial_state_indices must be int32 or int64, "
+                f"got {initial_state_indices.dtype}"
+            )
         scale_val = K**-0.5 if scale is None else scale
         # The BF16 path is pool-only. When the caller uses non-pool semantics
         # (passes ``state`` instead of ``initial_state``), treat ``state`` as
@@ -316,21 +775,25 @@ def gated_delta_rule_decode_pretranspose(
                 use_qk_l2norm_in_kernel=use_qk_l2norm,
                 scale=scale_val,
                 output=forward_output,
+                intermediate_states_buffer=intermediate_states_buffer,
+                disable_state_update=disable_state_update,
             )
         if forward_output is not None:
             # Kernel wrote directly into the user's buffer.
             output = forward_output
         elif output is None:
-            output = out
+            # The kernel writes bf16 regardless of `q.dtype`; keep the documented
+            # "result follows q.dtype" contract for fp16 callers.
+            output = out if out.dtype == target_dtype else out.to(target_dtype)
         else:
             # User wants a non-bf16 dtype; cast on the way back.
             output.copy_(out.to(target_dtype))
         return_state = initial_state if use_pool else state
         return output, return_state
 
-    # Legacy path: T=1 only, float32 state (supports pool+indices via CuTe DSL kernel)
+    # Legacy path: float32 state (T=1 via run_pretranspose_decode; T>1 routes
+    # through gated_delta_rule_mtp when a pool is provided).
     use_pool_indexing = initial_state_indices is not None
-    assert T == 1, f"Decode only supports T=1, got T={T}"
 
     if use_pool:
         assert initial_state.dtype == torch.float32, (
@@ -339,6 +802,36 @@ def gated_delta_rule_decode_pretranspose(
     else:
         assert state is not None, "Either state or initial_state must be provided"
         assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
+
+    # Route fp32 + T>1 through the MTP kernel (supports separate read/write
+    # indices via output_state_indices). Direct-state (non-pool) callers must
+    # still use T=1 — wrapping a per-batch state as a pool of size B is the
+    # caller's responsibility if they want T>1.
+    if T > 1:
+        assert use_pool, (
+            f"fp32 state with T={T} > 1 requires pool mode (pass initial_state "
+            f"and initial_state_indices instead of state)."
+        )
+        out, return_state = gated_delta_rule_mtp(
+            q=q,
+            k=k,
+            v=v,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            A_log=A_log,
+            a=a,
+            dt_bias=dt_bias,
+            b=b,
+            scale=scale,
+            output=output,
+            intermediate_states_buffer=intermediate_states_buffer,
+            disable_state_update=disable_state_update,
+            use_qk_l2norm=use_qk_l2norm,
+            output_state_indices=output_state_indices,
+        )
+        return out, return_state
+
+    assert T == 1, f"Decode only supports T=1, got T={T}"
 
     # Validate K and V constraints
     assert K >= 128, f"K must be at least 128, got K={K}"
@@ -352,6 +845,14 @@ def gated_delta_rule_decode_pretranspose(
         f"q must be float16/bfloat16, got {q.dtype}"
     )
     assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+    assert dt_bias.dtype in (torch.bfloat16, torch.float32), (
+        f"dt_bias must be bfloat16 or float32, got {dt_bias.dtype}"
+    )
+    if use_pool:
+        assert initial_state_indices.dtype in (torch.int32, torch.int64), (
+            f"initial_state_indices must be int32 or int64, "
+            f"got {initial_state_indices.dtype}"
+        )
 
     # Set default scale
     if scale is None:
@@ -434,50 +935,63 @@ def gated_delta_rule_decode(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     use_qk_l2norm: bool = True,
+    backend: Literal["auto", "flashinfer", "cake_gdn"] = "auto",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     r"""Gated Delta Rule Decode kernel (K-major layout, no transpose needed).
 
-    This implements the decode phase of gated delta rule linear attention,
-    processing one token at a time and updating the recurrent state.
-    This version uses K-major state layout [B, HV, K, V] which is more natural
-    and doesn't require transposition.
+    Implements the decode phase of gated delta rule linear attention,
+    processing one token at a time and updating the recurrent state.  This
+    variant uses K-major state layout ``[B, HV, K, V]`` (no transposition).
 
-    Args:
-        q (torch.Tensor):
-            Current query of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
-        k (torch.Tensor):
-            Current key of shape ``[B, 1, H, K]``. Must be float16/bfloat16.
-        v (torch.Tensor):
-            Current value of shape ``[B, 1, HV, V]``. Must be float16/bfloat16.
-        state (torch.Tensor):
-            Current state of shape ``[B, HV, K, V]`` (k-major layout).
-            Must be float32. Will be updated in-place.
-        A_log (torch.Tensor):
-            Log decay parameter of shape ``[HV]``. Must be float32.
-        a (torch.Tensor):
-            Input-dependent decay of shape ``[B, 1, HV]``. Must be float16/bfloat16.
-        dt_bias (torch.Tensor):
-            Decay bias of shape ``[HV]``. Must be bfloat16 or float32.
-        b (torch.Tensor):
-            Update gate (beta) input of shape ``[B, 1, HV]``. Must be float16/bfloat16.
-        scale (Optional[float]):
-            Scale factor for queries. If None, defaults to ``1 / sqrt(K)``.
-        output (Optional[torch.Tensor]):
-            Pre-allocated output tensor of shape ``[B, 1, HV, V]``.
-            If None, will be allocated automatically.
-        use_qk_l2norm (bool):
-            Whether to apply L2 normalization to q and k. Default: ``True``.
+    Parameters
+    ----------
+    q : torch.Tensor
+        Current query of shape ``[B, 1, H, K]``.  Must be float16/bfloat16.
+    k : torch.Tensor
+        Current key of shape ``[B, 1, H, K]``.  Must be float16/bfloat16.
+    v : torch.Tensor
+        Current value of shape ``[B, 1, HV, V]``.  Must be float16/bfloat16.
+    state : torch.Tensor
+        Current state of shape ``[B, HV, K, V]`` (k-major layout).  Must be
+        float32.  Updated in-place.
+    A_log : torch.Tensor
+        Log decay parameter of shape ``[HV]``.  Must be float32.
+    a : torch.Tensor
+        Input-dependent decay of shape ``[B, 1, HV]``.  Must be
+        float16/bfloat16.
+    dt_bias : torch.Tensor
+        Decay bias of shape ``[HV]``.  Must be bfloat16 or float32.
+    b : torch.Tensor
+        Update gate (beta) input of shape ``[B, 1, HV]``.  Must be
+        float16/bfloat16.
+    scale : float, optional
+        Scale factor for queries.  If ``None``, defaults to ``1 /
+        sqrt(K)``.
+    output : torch.Tensor, optional
+        Pre-allocated output tensor of shape ``[B, 1, HV, V]``.  Allocated
+        automatically when ``None``.
+    use_qk_l2norm : bool
+        Whether to apply L2 normalization to q and k.  Default: ``True``.
+    backend : {"auto", "flashinfer", "cake_gdn"}
+        ``auto`` selects GDN non-CP only for an exact frozen manifest row;
+        explicit ``cake_gdn`` requests fail closed.
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - output: Output tensor of shape ``[B, 1, HV, V]``
-            - state: Updated state tensor of shape ``[B, HV, K, V]``
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(output, state)`` where ``output`` has shape ``[B, 1, HV, V]``
+        and ``state`` has shape ``[B, HV, K, V]`` (updated in-place).
 
-    Note:
-        - Requires SM90 (Hopper) architecture
-        - State is updated in-place
-        - K and V must be multiples of 4 for vectorized loads
-        - State layout is k-major: [B, HV, K, V] (no transpose needed)
+    Notes
+    -----
+    - Requires SM90 (Hopper) architecture.
+    - State is updated in-place.
+    - ``K`` and ``V`` must each be ``>= 128``.  ``V`` must be a multiple
+      of 32 (``TILE_V_NT``): the launcher conservatively asserts the
+      large-batch tile size to cover both code paths, even though the
+      small-batch kernel could in principle accept ``V % 16 == 0``
+      (``TILE_V_SMALL_NT``).
+    - State layout is k-major: ``[B, HV, K, V]`` (no transpose needed).
     """
     # Validate input shapes
     B, T, H, K = q.shape
@@ -505,6 +1019,9 @@ def gated_delta_rule_decode(
     )
     assert state.dtype == torch.float32, f"state must be float32, got {state.dtype}"
     assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+    assert dt_bias.dtype in (torch.bfloat16, torch.float32), (
+        f"dt_bias must be bfloat16 or float32, got {dt_bias.dtype}"
+    )
 
     # Set default scale
     if scale is None:
@@ -517,6 +1034,32 @@ def gated_delta_rule_decode(
     if output is None:
         # Kernel outputs bfloat16, allocate in that dtype first
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
+
+    if backend not in ("auto", "flashinfer", "cake_gdn"):
+        raise ValueError(f"unsupported GDN backend: {backend!r}")
+    if backend != "flashinfer":
+        if not _CAKE_GDN_AVAILABLE or _cake_gdn is None:
+            if backend == "cake_gdn":
+                raise RuntimeError("the source-only Cake GDN backend is not installed")
+        else:
+            try:
+                cake_gdn_output = _run_cake_gdn_decode_nontranspose(
+                    q=q,
+                    k=k,
+                    v=v,
+                    state=state,
+                    A_log=A_log,
+                    a=a,
+                    dt_bias=dt_bias,
+                    b=b,
+                    scale=scale,
+                    output=output,
+                    use_qk_l2norm=use_qk_l2norm,
+                )
+                return cake_gdn_output, state
+            except _cake_gdn.CakeGDNUnsupportedError:
+                if backend == "cake_gdn":
+                    raise
 
     # State is in K-major layout [B, HV, K, V]
     # Flatten to [B*HV, K, V] to ensure proper alignment for SIMT async copy
@@ -576,64 +1119,102 @@ def gated_delta_rule_mtp(
     scale: Optional[float] = None,
     output: Optional[torch.Tensor] = None,
     intermediate_states_buffer: Optional[torch.Tensor] = None,
+    ssm_state_indices: Optional[torch.Tensor] = None,
     disable_state_update: Optional[bool] = None,
     use_qk_l2norm: bool = True,
+    output_state_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Gated Delta Rule MTP Kernel (Multiple Token Processing).
+    r"""Gated Delta Rule MTP kernel (Multiple Token Processing).
 
-    This function processes multiple tokens (T > 1) in sequence, typically used for
-    speculative decoding verification. It supports intermediate state caching for
-    potential rollback scenarios.
+    Processes multiple tokens (``T > 1``) per call, typically used for
+    speculative decoding verification.  Supports intermediate state caching
+    for potential rollback scenarios.
 
-    Args:
-        q (torch.Tensor):
-            Query tensor of shape ``[B, T, H, K]``.
-        k (torch.Tensor):
-            Key tensor of shape ``[B, T, H, K]``.
-        v (torch.Tensor):
-            Value tensor of shape ``[B, T, HV, V]``.
-        initial_state (torch.Tensor):
-            Initial state tensor of shape ``[pool_size, HV, V, K]`` (K-last layout).
-        initial_state_indices (torch.Tensor):
-            Indices mapping each batch to its initial state, shape ``[B]``.
-        A_log (torch.Tensor):
-            Log decay parameter of shape ``[HV]``.
-        a (torch.Tensor):
-            Input-dependent decay of shape ``[B, T, HV]``.
-        dt_bias (torch.Tensor):
-            Decay bias of shape ``[HV]``.
-        b (torch.Tensor):
-            Update gate input of shape ``[B, T, HV]``.
-        scale (Optional[float]):
-            Scaling factor for queries. If None, uses ``1/sqrt(K)``.
-        output (Optional[torch.Tensor]):
-            Pre-allocated output tensor of shape ``[B, T, HV, V]``.
-        intermediate_states_buffer (Optional[torch.Tensor]):
-            Buffer for caching intermediate states, shape ``[pool_size, T, HV, V, K]``.
-            If None, intermediate states are not cached.
-        disable_state_update (Optional[bool]):
-            If True, the initial state is not updated. Currently defaults to ``True``.
-            Please pass this argument explicitly — the default will change to ``False``
-            in FlashInfer 0.7.0.
+    Parameters
+    ----------
+    q : torch.Tensor
+        Query tensor of shape ``[B, T, H, K]``.
+    k : torch.Tensor
+        Key tensor of shape ``[B, T, H, K]``.
+    v : torch.Tensor
+        Value tensor of shape ``[B, T, HV, V]``.
+    initial_state : torch.Tensor
+        Initial state pool of shape ``[pool_size, HV, V, K]`` (K-last
+        layout). **Must be float32** — this standalone MTP entry point
+        does not support the BF16 fast path; for a BF16 K=V=128 state
+        pool, call :func:`gated_delta_rule_decode_pretranspose` instead
+        (which dispatches into the BF16 MTP kernel when ``T > 1``).
+        When contiguous the kernel reads/writes the pool in-place via the
+        free 4D→3D reshape view; a non-contiguous pool is dispatched
+        through the native 4D ``use_pool_indexing=True`` path and the
+        kernel writes the strided pool in place without densification.
+    initial_state_indices : torch.Tensor
+        Read indices mapping each batch to its slot in ``initial_state``,
+        shape ``[B]``. Negative entries are treated as padding — the
+        kernel skips both the read and the writeback for that batch and
+        the output slot is left as the caller-allocated value (zero when
+        ``output`` is ``None``).
+    A_log : torch.Tensor
+        Log decay parameter of shape ``[HV]``.
+    a : torch.Tensor
+        Input-dependent decay of shape ``[B, T, HV]``.
+    dt_bias : torch.Tensor
+        Decay bias of shape ``[HV]``.
+    b : torch.Tensor
+        Update gate input of shape ``[B, T, HV]``.
+    scale : float, optional
+        Scaling factor for queries.  If ``None``, uses ``1 / sqrt(K)``.
+    output : torch.Tensor, optional
+        Pre-allocated output tensor of shape ``[B, T, HV, V]``.
+    intermediate_states_buffer : torch.Tensor, optional
+        Buffer for caching intermediate states, shape ``[B, T, HV, V, K]``
+        (first dim is indexed per-batch, not per-pool-slot — buffer must
+        be at least ``B`` rows and contiguous; must be float32 when
+        provided). When ``None``, intermediate states are not cached.
+        Mutually exclusive with ``ssm_state_indices``.
+    ssm_state_indices : torch.Tensor, optional
+        Per-token pool scatter indices of shape ``[B, T]`` and dtype
+        ``torch.int32``.  When provided, the kernel writes each intermediate
+        hidden state ``h_{t+1}`` directly to
+        ``initial_state[ssm_state_indices[i, t]]`` instead of accumulating
+        into a dense ``intermediate_states_buffer``.  Useful for FLA-style
+        speculative-decoding flows where each draft token needs its own pool
+        slot.  Constraints: ``T >= 2``, ``disable_state_update=False``,
+        mutually exclusive with ``intermediate_states_buffer``.
+        Default: ``None``.
+    disable_state_update : bool, optional
+        If ``True``, the initial state is not updated.  Currently defaults
+        to ``True``; pass this argument explicitly to silence the
+        deprecation warning - the default will change to ``False`` in
+        FlashInfer 0.7.0.
 
-            .. deprecated::
-                The implicit default of ``True`` is deprecated and will change to
-                ``False`` in version 0.7.0. Pass ``disable_state_update=True`` or
-                ``disable_state_update=False`` explicitly to silence the warning.
-        use_qk_l2norm (bool):
-            Whether to apply L2 normalization to q and k. Default: ``True``.
+        .. deprecated::
+            The implicit default of ``True`` is deprecated and will change
+            to ``False`` in version 0.7.0.  Pass
+            ``disable_state_update=True`` or ``disable_state_update=False``
+            explicitly to silence the warning.
+    use_qk_l2norm : bool
+        Whether to apply L2 normalization to q and k.  Default: ``True``.
+    output_state_indices : torch.Tensor, optional
+        Write indices of shape ``[B]`` (int32 or int64) specifying the
+        destination pool slot for each batch's updated state.  Defaults
+        to ``initial_state_indices`` (read and write target the same
+        slot).  Negative entries skip the writeback for that batch
+        (the read still runs).
 
-    Returns:
-        Tuple[torch.Tensor, torch.Tensor]:
-            - output: Output tensor of shape ``[B, T, HV, V]``
-            - initial_state: Updated state tensor (unchanged if disable_state_update=True)
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor]
+        ``(output, initial_state)`` where ``output`` has shape
+        ``[B, T, HV, V]`` and ``initial_state`` is the updated state
+        (unchanged when ``disable_state_update=True``).
 
-    Note:
-        - Requires SM90 (Hopper) architecture
-        - Supports T > 1 (multiple token processing)
-        - State layout is K-last: [pool_size, HV, V, K]
-        - Optimized for speculative decoding verification scenarios
+    Notes
+    -----
+    - Requires SM90 (Hopper) architecture.
+    - Supports ``T > 1`` (multiple token processing).
+    - State layout is K-last: ``[pool_size, HV, V, K]``.
+    - Optimized for speculative decoding verification scenarios.
     """
     # Handle deprecation of disable_state_update default value
     if disable_state_update is None:
@@ -674,6 +1255,24 @@ def gated_delta_rule_mtp(
         f"initial_state must be float32, got {initial_state.dtype}"
     )
     assert A_log.dtype == torch.float32, f"A_log must be float32, got {A_log.dtype}"
+    assert dt_bias.dtype in (torch.bfloat16, torch.float32), (
+        f"dt_bias must be bfloat16 or float32, got {dt_bias.dtype}"
+    )
+    assert initial_state_indices.dtype in (torch.int32, torch.int64), (
+        f"initial_state_indices must be int32 or int64, "
+        f"got {initial_state_indices.dtype}"
+    )
+
+    # Validate output indices shape/dtype
+    if output_state_indices is not None:
+        assert output_state_indices.shape == (B,), (
+            f"Expected output_state_indices shape [{B}], "
+            f"got {output_state_indices.shape}"
+        )
+        assert output_state_indices.dtype in (torch.int32, torch.int64), (
+            f"output_state_indices must be int32 or int64, "
+            f"got {output_state_indices.dtype}"
+        )
 
     # Set default scale
     if scale is None:
@@ -686,28 +1285,82 @@ def gated_delta_rule_mtp(
     if output is None:
         output = torch.zeros((B, T, HV, V), dtype=torch.bfloat16, device=q.device)
 
-    # Reshape initial_state from [pool_size, HV, V, K] to [pool_size * HV, V, K]
-    h0_source = initial_state.to(torch.float32).reshape(pool_size * HV, V, K)
+    # Build h0_source for the kernel.
+    # - Contiguous 4D pool: `.reshape()` returns a free 3D view, kernel takes
+    #   the flat-mode `use_pool_indexing=False` path (existing fast path).
+    # - Non-contiguous 4D pool (e.g., vLLM page-strided SSM pool): pass the
+    #   4D tensor through unchanged and tell the kernel to use 4D indexing,
+    #   `use_pool_indexing=True`. The kernel reads/writes via the native
+    #   `[pool, HV, V, K]` layout — no densification copy.
+    pool_use_pool_indexing = not initial_state.is_contiguous()
+    if pool_use_pool_indexing:
+        h0_source = initial_state
+    else:
+        h0_source = initial_state.reshape(pool_size * HV, V, K)
 
-    # Handle intermediate states
+    # Handle intermediate states. The kernel indexes the buffer by batch (i_n),
+    # not by pool slot — see `flat_idx = i_n * T * HV + i_t * HV + i_hv` inside
+    # the kernel. So the buffer's first dim MUST be at least B, and the buffer
+    # MUST be contiguous so the reshape returns a free view. We make both
+    # contracts explicit here to fail loudly on caller mistakes (the pre-existing
+    # code silently did out-of-bounds writes when buffer.shape[0] < B).
     cache_intermediate_states = intermediate_states_buffer is not None
     if cache_intermediate_states:
         buffer_size = intermediate_states_buffer.shape[0]
         cache_steps = intermediate_states_buffer.shape[1]
 
-        # Validate buffer length matches query sequence length
+        assert buffer_size >= B, (
+            f"intermediate_states_buffer first dim ({buffer_size}) must be "
+            f"at least B={B}: the kernel indexes it by batch (i_n in [0, B)), "
+            f"so a smaller buffer causes out-of-bounds writes."
+        )
         assert cache_steps >= T, (
-            f"intermediate_states_buffer second dimension (cache_steps={cache_steps}) must be at least T={T} to prevent out-of-bounds indexing"
+            f"intermediate_states_buffer second dimension (cache_steps={cache_steps}) "
+            f"must be at least T={T} to prevent out-of-bounds indexing"
+        )
+        assert intermediate_states_buffer.dtype == torch.float32, (
+            f"intermediate_states_buffer must be float32, "
+            f"got {intermediate_states_buffer.dtype}"
+        )
+        assert intermediate_states_buffer.is_contiguous(), (
+            "intermediate_states_buffer must be contiguous so the kernel writes "
+            "land in the caller-owned tensor (reshape would otherwise materialize "
+            "a throwaway copy)."
         )
 
-        intermediate_states = (
-            intermediate_states_buffer.to(torch.float32)
-            .reshape(buffer_size * cache_steps * HV, V, K)
-            .contiguous()
+        intermediate_states = intermediate_states_buffer.view(
+            buffer_size * cache_steps * HV, V, K
         )
     else:
         cache_steps = T
         intermediate_states = torch.zeros(1, 1, 1, dtype=torch.float32, device=q.device)
+
+    # FLA-style per-token pool scatter. When provided, the kernel writes each
+    # h_{t+1} directly to initial_state[ssm_state_indices[i, t]] instead of
+    # to a dense intermediate_states_buffer. same_pool semantics only — the
+    # final-state writeback to initial_state_indices[i] is skipped to avoid
+    # clobbering h_0 (the per-token scatter at t=T-1 already wrote h_T to
+    # its assigned pool slot). Caller pre-allocates B*T fresh slots from
+    # the free-list and sizes the pool for at least B*(T+1) slots.
+    per_token_pool_scatter = ssm_state_indices is not None
+    if per_token_pool_scatter:
+        assert intermediate_states_buffer is None, (
+            "ssm_state_indices and intermediate_states_buffer are mutually exclusive"
+        )
+        assert not disable_state_update, (
+            "ssm_state_indices requires state writes; disable_state_update must be False"
+        )
+        assert T >= 2, f"ssm_state_indices requires T >= 2 (got T={T})"
+        assert ssm_state_indices.shape == (B, T), (
+            f"ssm_state_indices must have shape [B={B}, T={T}], "
+            f"got {tuple(ssm_state_indices.shape)}"
+        )
+        assert ssm_state_indices.dtype == torch.int32, (
+            f"ssm_state_indices must be int32, got {ssm_state_indices.dtype}"
+        )
+        assert ssm_state_indices.device == q.device, (
+            f"ssm_state_indices device {ssm_state_indices.device} != q device {q.device}"
+        )
 
     # Execute kernel
     run_mtp_decode(
@@ -736,13 +1389,15 @@ def gated_delta_rule_mtp(
         use_qk_l2norm,
         disable_state_update,
         cache_intermediate_states,
+        ssm_state_indices=ssm_state_indices,
+        output_state_indices=output_state_indices,
+        use_pool_indexing=pool_use_pool_indexing,
     )
 
-    # Copy state back if needed (no sync needed - PyTorch handles stream ordering)
-    # Only copy if state update is enabled AND initial_state was not contiguous
-    # (if contiguous, reshape returns a view and kernel updated state in-place)
-    if not disable_state_update and not initial_state.is_contiguous():
-        initial_state.copy_(h0_source.reshape(pool_size, HV, V, K))
+    # No post-kernel scatter step: the contiguity assert above guarantees
+    # `intermediate_states` is a view of `intermediate_states_buffer`, and the
+    # `use_pool_indexing=True` path makes the kernel write the strided pool
+    # in place. Writes are visible to the caller directly.
 
     # Convert output to target dtype if needed
     if output.dtype != target_dtype:

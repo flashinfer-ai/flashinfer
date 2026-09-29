@@ -1,3 +1,4 @@
+import functools
 from typing import Tuple
 
 import numpy as np
@@ -7,6 +8,72 @@ import torch
 
 import flashinfer
 from flashinfer.utils import is_sm90a_supported
+
+
+@functools.lru_cache(maxsize=2)
+def _workspace_buffer_on(device_index: int, size_mb: int) -> torch.Tensor:
+    return torch.zeros(
+        size_mb * 1024 * 1024, dtype=torch.uint8, device=f"cuda:{device_index}"
+    )
+
+
+def _workspace_buffer(size_mb: int = 128) -> torch.Tensor:
+    """Shared workspace buffer: allocating (and zeroing) 128 MB per test adds
+    up over thousands of parametrizations; the wrappers treat it as scratch.
+    Cached per current CUDA device.
+
+    INVARIANT for callers: when two wrappers share this buffer, fully finish
+    plan()+run() on one wrapper before calling plan() on the other. plan()
+    stores metadata in the workspace that the wrapper's run() reads, so an
+    interleaving like plan_a -> plan_b -> run_a would corrupt run_a.
+    """
+    return _workspace_buffer_on(torch.cuda.current_device(), size_mb)
+
+
+# Unbounded on purpose: pytest's parametrize execution order interleaves the
+# (M, N, R, C) patterns, so a small LRU thrashes (measured: full file 37s with
+# maxsize=8 vs 16s unbounded). All 144 patterns total ~430 MiB on an
+# SM90A-only file (80+ GB GPUs); the module-teardown fixture below releases
+# them as soon as the file finishes instead of holding them to process exit.
+@functools.lru_cache(maxsize=None)
+def _block_sparse_pattern_on(
+    device_index: int, M: int, N: int, R: int, C: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = f"cuda:{device_index}"
+    MB = M // R
+    NB = N // C
+    rng = np.random.default_rng(seed=0)
+    S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
+    indptr = torch.from_numpy(S.indptr).to(device)
+    indices = torch.from_numpy(S.indices).to(device)
+    data_mask = torch.ones((S.nnz, R, C), dtype=torch.bool, device=device)
+    bsr = sp.sparse.bsr_matrix(
+        (np.ones((S.nnz, R, C), dtype=bool), S.indices, S.indptr), shape=(M, N)
+    )
+    dense_mask = torch.from_numpy(bsr.toarray()).to(device=device, dtype=torch.bool)
+    return indptr, indices, data_mask, dense_mask
+
+
+def _block_sparse_pattern(
+    M: int, N: int, R: int, C: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Cached BSR pattern + dense mask for (M, N, R, C) on the current device.
+
+    The pattern is seeded (rng seed 0), so it depends only on the block-grid
+    shape; the same pattern is reused across num_heads/head_dim/dtype
+    parametrizations (24x reuse), avoiding a per-test scipy build and a dense
+    M x N numpy round-trip + H2D copy.
+    """
+    return _block_sparse_pattern_on(torch.cuda.current_device(), M, N, R, C)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _release_cached_gpu_buffers():
+    """Release the cached patterns/workspace when this module finishes so a
+    multi-file pytest session doesn't hold their GPU memory to process exit."""
+    yield
+    _block_sparse_pattern_on.cache_clear()
+    _workspace_buffer_on.cache_clear()
 
 
 def get_fp8_dtype_minmax(dtype: torch.dtype) -> Tuple[float, float]:
@@ -105,27 +172,6 @@ def broadcast_scale_to_per_head(scale: torch.Tensor, num_heads: int) -> torch.Te
         return scale
 
 
-def bsr_attention_ref(
-    q,
-    k,
-    v,
-    indptr,
-    indices,
-    mask_data,
-):
-    M = q.shape[0]
-    N = k.shape[0]
-    bsr = sp.sparse.bsr_matrix(
-        (mask_data.cpu().numpy(), indices.cpu().numpy(), indptr.cpu().numpy()),
-        shape=(M, N),
-    )
-    dense_mask = torch.tensor(bsr.toarray(), dtype=bool, device=q.device)
-    o = flashinfer.prefill.single_prefill_with_kv_cache(
-        q, k, v, custom_mask=dense_mask, backend="fa2"
-    )
-    return o
-
-
 # Test single_prefill correctness: MSE should be below threshold
 @pytest.mark.parametrize("seq_len", [117, 509, 1011, 2372, 7777, 12315])
 @pytest.mark.parametrize("num_heads", [24, 32])
@@ -195,18 +241,19 @@ def test_block_sparse_attention(
     # setup random seed for reproducibility
     torch.manual_seed(0)
     np.random.seed(0)
-    # Build sparse mask
-    MB = M // R
-    NB = N // C
-    rng = np.random.default_rng(seed=0)
-    S = sp.sparse.random(MB, NB, density=0.25, random_state=rng).tocsr()
-    indptr = torch.from_numpy(S.indptr).cuda()
-    indices = torch.from_numpy(S.indices).cuda()
-    nnz = S.nnz
+    # Build sparse mask (cached per block-grid shape; seeded identically to the
+    # previous inline construction)
     if mask_inside_block:
+        indptr, indices, _, _ = _block_sparse_pattern(M, N, R, C)
+        nnz = indices.numel()
         data_mask = (torch.rand((nnz, R, C)) > 0.5).to(torch.bool).cuda()
+        bsr = sp.sparse.bsr_matrix(
+            (data_mask.cpu().numpy(), indices.cpu().numpy(), indptr.cpu().numpy()),
+            shape=(M, N),
+        )
+        dense_mask = torch.tensor(bsr.toarray(), dtype=bool, device="cuda")
     else:
-        data_mask = torch.ones((nnz, R, C), dtype=torch.bool, device="cuda")
+        indptr, indices, data_mask, dense_mask = _block_sparse_pattern(M, N, R, C)
 
     # Random inputs
     q = torch.randn((M, num_heads, head_dim), dtype=torch.float16, device="cuda")
@@ -214,10 +261,12 @@ def test_block_sparse_attention(
     v = torch.randn((N, num_heads, head_dim), dtype=torch.float16, device="cuda")
 
     # Reference output via dense mask
-    o_ref = bsr_attention_ref(q, k, v, indptr, indices, data_mask)
+    o_ref = flashinfer.prefill.single_prefill_with_kv_cache(
+        q, k, v, custom_mask=dense_mask, backend="fa2"
+    )
 
     # Plan and run BlockSparseAttention
-    workspace_buffer = torch.zeros(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+    workspace_buffer = _workspace_buffer()
     sparse_wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(
         workspace_buffer, backend="fa3"
     )
@@ -299,7 +348,7 @@ def test_batch_prefill_ragged(batch_size, num_heads, head_dim, causal, dtype):
 
     # Get reference output using fp16
     wrapper_fp16 = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        _workspace_buffer(),
         "NHD",
         backend="fa3",
     )
@@ -321,7 +370,7 @@ def test_batch_prefill_ragged(batch_size, num_heads, head_dim, causal, dtype):
 
     # Run FP8 batch prefill with ragged KV cache
     wrapper_fp8 = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        _workspace_buffer(),
         "NHD",
         backend="fa3",
     )
@@ -469,7 +518,7 @@ def test_batch_prefill_paged(batch_size, num_heads, head_dim, causal, dtype):
 
     # Get reference output using fp16
     wrapper_fp16 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        _workspace_buffer(),
         "NHD",
         backend="fa3",
     )
@@ -498,7 +547,7 @@ def test_batch_prefill_paged(batch_size, num_heads, head_dim, causal, dtype):
 
     # Run FP8 batch prefill with paged KV cache
     wrapper_fp8 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        _workspace_buffer(),
         "NHD",
         backend="fa3",
     )
@@ -611,7 +660,7 @@ def test_batch_prefill_paged_gqa(
 
     # Get reference output using fp16
     wrapper_fp16 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        _workspace_buffer(),
         "NHD",
         backend="fa3",
     )
@@ -639,7 +688,7 @@ def test_batch_prefill_paged_gqa(
 
     # Run FP8 batch prefill with paged KV cache
     wrapper_fp8 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        _workspace_buffer(),
         "NHD",
         backend="fa3",
     )
@@ -734,7 +783,7 @@ def test_batch_decode_paged(batch_size, num_qo_heads, num_kv_heads, head_dim, dt
 
     # Get reference output using fp16
     wrapper_fp16 = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        _workspace_buffer(),
         kv_layout="NHD",
         use_tensor_cores=True,
         backend="fa3",
@@ -761,7 +810,7 @@ def test_batch_decode_paged(batch_size, num_qo_heads, num_kv_heads, head_dim, dt
 
     # Run FP8 batch decode with paged KV cache
     wrapper_fp8 = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        _workspace_buffer(),
         kv_layout="NHD",
         use_tensor_cores=True,
         backend="fa3",
@@ -865,7 +914,7 @@ def test_batch_prefill_paged_scale_types(scale_type, dtype):
 
     # Get reference output using fp16
     wrapper_fp16 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        _workspace_buffer(),
         "NHD",
         backend="fa3",
     )
@@ -907,7 +956,7 @@ def test_batch_prefill_paged_scale_types(scale_type, dtype):
 
     # Run FP8 batch prefill with paged KV cache
     wrapper_fp8 = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
-        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        _workspace_buffer(),
         "NHD",
         backend="fa3",
     )

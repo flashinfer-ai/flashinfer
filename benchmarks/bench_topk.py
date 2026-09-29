@@ -3,11 +3,15 @@ Benchmark for Top-K operations including:
 - top_k: Basic radix-based top-k selection
 - top_k_page_table_transform: Fused top-k + page table gather (for sparse attention)
 - top_k_ragged_transform: Fused top-k + offset addition (for sparse attention)
+- varlen: Variable-length segment transforms that model production sparse-attention
+  workloads, where each row selects top-k over a per-row valid window whose length is
+  drawn from a realistic decode/prefill distribution (rather than a fixed seq_len)
 
 Optional comparison with SGLang's sgl_kernel implementation.
 """
 
 import argparse
+import math
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -18,6 +22,7 @@ import torch
 import flashinfer
 from flashinfer.topk import TopKTieBreak
 from flashinfer.testing.utils import bench_gpu_time
+from flashinfer.utils import get_compute_capability
 
 
 def set_topk_algo(algo: str):
@@ -59,23 +64,25 @@ def torch_deterministic_algorithms(enabled: bool):
             torch.use_deterministic_algorithms(previous)
 
 
-def bench_median_ms(fn) -> float:
+def bench_median_ms(fn, use_cuda_graph: bool) -> float:
     measurements = bench_gpu_time(
         fn,
         enable_cupti=True,
         dry_run_iters=10,
         repeat_iters=100,
-        use_cuda_graph=True,
+        use_cuda_graph=use_cuda_graph,
     )
     return float(np.median(measurements))
 
 
 def bench_flashinfer_modes(
-    run_flashinfer, deterministic: bool
+    run_flashinfer, deterministic: bool, use_cuda_graph: bool
 ) -> tuple[float, float | None]:
-    selected_ms = bench_median_ms(lambda: run_flashinfer(deterministic))
+    selected_ms = bench_median_ms(lambda: run_flashinfer(deterministic), use_cuda_graph)
     nondeterministic_ms = (
-        bench_median_ms(lambda: run_flashinfer(False)) if deterministic else None
+        bench_median_ms(lambda: run_flashinfer(False), use_cuda_graph)
+        if deterministic
+        else None
     )
     return selected_ms, nondeterministic_ms
 
@@ -87,12 +94,22 @@ TIE_BREAK_VARIANTS: tuple[tuple[str, TopKTieBreak], ...] = (
 
 
 def bench_tie_break_variants(
-    run_flashinfer_with_tie_break, baseline_ms: float
+    run_flashinfer_with_tie_break, baseline_ms: float, use_cuda_graph: bool = False
 ) -> dict[str, float]:
+    """Time the native tie-break path (FlashInfer(tie-*) columns).
+
+    Callers must set_topk_algo("default") immediately before calling: under "auto" the
+    dispatcher routes non-deterministic tie-break calls to the CUB backend, which would
+    silently turn these columns into a second CUB measurement (the CUB tie timings have
+    their own columns via cub_topk_metrics).
+    """
     metrics: dict[str, float] = {}
     for suffix, tie_break in TIE_BREAK_VARIANTS:
         try:
-            tie_ms = bench_median_ms(lambda: run_flashinfer_with_tie_break(tie_break))
+            tie_ms = bench_median_ms(
+                lambda tb=tie_break: run_flashinfer_with_tie_break(tb),
+                use_cuda_graph,
+            )
             metrics[f"flashinfer_tie_{suffix}_us"] = tie_ms * 1e3
             metrics[f"tie_{suffix}_slowdown_vs_baseline"] = tie_ms / baseline_ms
         except RuntimeError as exc:
@@ -129,6 +146,117 @@ def append_tie_break_columns(line: str, result: dict, enabled: bool) -> str:
     return line + format_variant("small") + format_variant("large")
 
 
+CUB_TOPK_MAX_LEN = (
+    1 << 21
+)  # DeviceBatchedTopK's per-segment cap (cluster backend, SM90+)
+CUB_TOPK_PRE_SM90_MAX_LEN = 8192  # ceiling below SM90 (CUB's single-block backend)
+
+
+def cub_backend_supported(
+    scores: torch.Tensor, tie_break: TopKTieBreak = TopKTieBreak.NONE
+) -> bool:
+    """Whether the dispatcher's CUB backend would serve this page-table transform call.
+
+    Mirrors flashinfer.topk.can_use_cub_topk. A forced-cub measurement where the backend
+    declines would silently time the radix path relabeled, so gate host-side.
+    """
+    if scores.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    d = scores.size(1)
+    if d > CUB_TOPK_MAX_LEN:
+        return False
+    if (d > CUB_TOPK_PRE_SM90_MAX_LEN or tie_break != TopKTieBreak.NONE) and (
+        get_compute_capability(torch.device("cuda"))[0] < 9
+    ):
+        return False
+    return True
+
+
+def cub_topk_metrics(
+    run,
+    scores: torch.Tensor,
+    deterministic: bool,
+    compare_tie_break: bool,
+    fi_ms: float,
+    use_cuda_graph: bool = False,
+) -> dict:
+    """Time the same top-k call forced to the CUB backend.
+
+    ``run(tie_break)`` must invoke one of the CUB-backed public APIs (``top_k``,
+    ``top_k_page_table_transform``, or ``top_k_ragged_transform``). Skipped for
+    deterministic mode (the CUB backend declines it) and unsupported configurations.
+    """
+    metrics: dict[str, float] = {}
+    if deterministic or not cub_backend_supported(scores):
+        return metrics
+    set_topk_algo("cub")
+    try:
+        cub_ms = bench_median_ms(lambda: run(TopKTieBreak.NONE), use_cuda_graph)
+        metrics["cub_us"] = cub_ms * 1e3
+        metrics["speedup_cub_vs_flashinfer"] = fi_ms / cub_ms
+        if compare_tie_break:
+            for suffix, tie_break in TIE_BREAK_VARIANTS:
+                if cub_backend_supported(scores, tie_break):
+                    tie_ms = bench_median_ms(
+                        lambda tb=tie_break: run(tb), use_cuda_graph
+                    )
+                    metrics[f"cub_tie_{suffix}_us"] = tie_ms * 1e3
+    finally:
+        # The per-case RuntimeError handlers continue to the next case, so the
+        # forced-cub setting must not leak past an OOM/UNSUPPORTED measurement.
+        set_topk_algo("auto")
+    return metrics
+
+
+def append_cub_header(
+    header: str, tie_break_enabled: bool, show_clusters: bool = False
+) -> str:
+    header += f" {'CUB':>12} {'CUBvsFI':>10}"
+    if tie_break_enabled:
+        header += (
+            f" {'CUB(tie-small)':>15} {'CUBvsFI(tie-s)':>15}"
+            f" {'CUB(tie-large)':>15} {'CUBvsFI(tie-l)':>15}"
+        )
+    if show_clusters:
+        header += f" {'CUBvsClusters':>14}"
+    return header
+
+
+def append_cub_columns(
+    line: str, result: dict, tie_break_enabled: bool, show_clusters: bool = False
+) -> str:
+    if "cub_us" in result:
+        line += (
+            f" {result['cub_us']:>10.2f}us {result['speedup_cub_vs_flashinfer']:>9.2f}x"
+        )
+    else:
+        line += f" {'n/a':>12} {'n/a':>10}"
+    if tie_break_enabled:
+        for suffix in ("small", "large"):
+            cub_tie = result.get(f"cub_tie_{suffix}_us")
+            line += f" {cub_tie:>13.2f}us" if cub_tie is not None else f" {'n/a':>15}"
+            # Native tie time / CUB tie time (>= 1.0x means CUB wins); n/a when either
+            # side is missing (CUB declined, or the native tie path errored, e.g.
+            # UNSUPPORTED at k=4096).
+            fi_tie = result.get(f"flashinfer_tie_{suffix}_us")
+            if cub_tie is not None and fi_tie is not None:
+                line += f" {fi_tie / cub_tie:>14.2f}x"
+            else:
+                line += f" {'n/a':>15}"
+    if show_clusters:
+        # Clusters time / CUB time (>= 1.0x means CUB wins); n/a when either backend
+        # was not measured (pre-SM100, CUDA graphs, clusters-incompatible arguments).
+        # The grid sections store the clusters timing under the legacy "fast_topk_us"
+        # key; the varlen runner uses "clusters_us".
+        clusters_us = result.get("clusters_us", result.get("fast_topk_us"))
+        cub_us = result.get("cub_us")
+        if clusters_us is not None and cub_us is not None:
+            line += f" {clusters_us / cub_us:>13.2f}x"
+        else:
+            line += f" {'n/a':>14}"
+    return line
+
+
 def bench_top_k_from_scores(
     scores: torch.Tensor,
     k: int,
@@ -136,6 +264,7 @@ def bench_top_k_from_scores(
     compare_tie_break: bool = False,
     compare_torch_deterministic: bool = False,
     compare_sglang: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     """Benchmark top-k on a pre-generated score tensor."""
     batch_size, seq_len = scores.shape
@@ -147,8 +276,10 @@ def bench_top_k_from_scores(
             k,
             deterministic=deterministic_mode,
             tie_break=TopKTieBreak.NONE,
+            dsa_graph_safe=use_cuda_graph,
         ),
         deterministic,
+        use_cuda_graph,
     )
 
     result = {
@@ -165,37 +296,48 @@ def bench_top_k_from_scores(
         )
 
     with torch_deterministic_algorithms(deterministic):
-        torch_ms = bench_median_ms(lambda: torch.topk(scores, k, dim=-1))
+        torch_ms = bench_median_ms(
+            lambda: torch.topk(scores, k, dim=-1), use_cuda_graph
+        )
     result["torch_us"] = torch_ms * 1e3
     result["speedup_vs_torch"] = torch_ms / fi_ms
     if compare_tie_break:
-        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        # Use the same non-deterministic baseline as DetSlowdown when present.
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
                 lambda tie_break: flashinfer.top_k(
                     scores,
                     k,
-                    deterministic=True,
+                    deterministic=deterministic,
                     tie_break=tie_break,
+                    dsa_graph_safe=use_cuda_graph,
                 ),
                 baseline_ms,
+                use_cuda_graph,
             )
         )
+        set_topk_algo("auto")
 
     if compare_torch_deterministic and not deterministic:
         with torch_deterministic_algorithms(True):
-            torch_det_ms = bench_median_ms(lambda: torch.topk(scores, k, dim=-1))
+            torch_det_ms = bench_median_ms(
+                lambda: torch.topk(scores, k, dim=-1), use_cuda_graph
+            )
         result["torch_deterministic_us"] = torch_det_ms * 1e3
         result["speedup_vs_torch_deterministic"] = torch_det_ms / fi_ms
 
-    set_topk_algo("clusters")
-    fast_topk_ms = bench_median_ms(lambda: flashinfer.top_k(scores, k))
-    result["fast_topk_us"] = fast_topk_ms * 1e3
-    result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
-    set_topk_algo("auto")
+    if not use_cuda_graph:
+        set_topk_algo("clusters")
+        fast_topk_ms = bench_median_ms(
+            lambda: flashinfer.top_k(scores, k), use_cuda_graph
+        )
+        result["fast_topk_us"] = fast_topk_ms * 1e3
+        result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
+        set_topk_algo("auto")
 
     # SGLang comparison (only supports k=2048 and float32)
     if (
@@ -206,10 +348,25 @@ def bench_top_k_from_scores(
     ):
         lengths = torch.full((batch_size,), seq_len, dtype=torch.int32, device="cuda")
         sg_ms = bench_median_ms(
-            lambda: sgl_kernel.fast_topk_v2(scores, lengths, k, row_starts=None)
+            lambda: sgl_kernel.fast_topk_v2(scores, lengths, k, row_starts=None),
+            use_cuda_graph,
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
+
+    # The same call forced to the CUB backend
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: flashinfer.top_k(
+                scores, k, tie_break=tie_break, dsa_graph_safe=use_cuda_graph
+            ),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+            use_cuda_graph,
+        )
+    )
 
     return result
 
@@ -361,6 +518,7 @@ def bench_dsa_top_k(
     compare_torch_deterministic: bool = False,
     compare_sglang: bool = False,
     causal_chunk: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     scores = generate_dsa_scores(
         batch_size=batch_size,
@@ -377,6 +535,7 @@ def bench_dsa_top_k(
         compare_tie_break=compare_tie_break,
         compare_torch_deterministic=compare_torch_deterministic,
         compare_sglang=compare_sglang,
+        use_cuda_graph=use_cuda_graph,
     )
     result["rows"] = batch_size * q_len
     result["q_len"] = q_len
@@ -394,6 +553,7 @@ def bench_top_k(
     compare_tie_break: bool = False,
     compare_torch_deterministic: bool = False,
     compare_sglang: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     """Benchmark basic top_k operation."""
     scores = generate_scores(batch_size, seq_len, k, dtype, input_pattern)
@@ -404,6 +564,7 @@ def bench_top_k(
         compare_tie_break=compare_tie_break,
         compare_torch_deterministic=compare_torch_deterministic,
         compare_sglang=compare_sglang,
+        use_cuda_graph=use_cuda_graph,
     )
 
 
@@ -416,6 +577,7 @@ def bench_page_table_transform(
     deterministic: bool = False,
     compare_tie_break: bool = False,
     compare_sglang: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     """Benchmark fused top_k + page table transform."""
     scores = generate_scores(batch_size, seq_len, k, dtype, input_pattern)
@@ -426,9 +588,6 @@ def bench_page_table_transform(
         .expand(batch_size, -1)
         .contiguous()
     )
-    use_cuda_graph = True
-    enable_cupti = True
-
     set_topk_algo("default")
     fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
         lambda deterministic_mode: flashinfer.top_k_page_table_transform(
@@ -438,8 +597,10 @@ def bench_page_table_transform(
             k,
             deterministic=deterministic_mode,
             tie_break=TopKTieBreak.NONE,
+            dsa_graph_safe=use_cuda_graph,
         ),
         deterministic,
+        use_cuda_graph,
     )
 
     result = {
@@ -456,20 +617,17 @@ def bench_page_table_transform(
         )
 
     # FlashInfer clusters
-    set_topk_algo("clusters")
-    measurements = bench_gpu_time(
-        lambda: flashinfer.top_k_page_table_transform(
-            scores, src_page_table, lengths, k
-        ),
-        enable_cupti=enable_cupti,
-        dry_run_iters=10,
-        repeat_iters=100,
-        use_cuda_graph=use_cuda_graph,
-    )
-    fast_topk_ms = np.median(measurements)
-    result["fast_topk_us"] = fast_topk_ms * 1e3
-    result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
-    set_topk_algo("auto")
+    if not use_cuda_graph:
+        set_topk_algo("clusters")
+        fast_topk_ms = bench_median_ms(
+            lambda: flashinfer.top_k_page_table_transform(
+                scores, src_page_table, lengths, k
+            ),
+            use_cuda_graph,
+        )
+        result["fast_topk_us"] = fast_topk_ms * 1e3
+        result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
+        set_topk_algo("auto")
 
     # SGLang comparison (only supports k=2048 and float32)
     if compare_sglang and HAS_SGL_KERNEL and k == 2048 and dtype == torch.float32:
@@ -477,16 +635,18 @@ def bench_page_table_transform(
         sg_ms = bench_median_ms(
             lambda: sgl_kernel.fast_topk_transform_fused(
                 scores, lengths, src_page_table, cu_seqlens_q, k
-            )
+            ),
+            use_cuda_graph,
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
 
     if compare_tie_break:
-        # Align tie-break slowdowns with the DetSlowdown baseline when present.
+        # Use the same non-deterministic baseline as DetSlowdown when present.
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
                 lambda tie_break: flashinfer.top_k_page_table_transform(
@@ -494,12 +654,34 @@ def bench_page_table_transform(
                     src_page_table,
                     lengths,
                     k,
-                    deterministic=True,
+                    deterministic=deterministic,
                     tie_break=tie_break,
+                    dsa_graph_safe=use_cuda_graph,
                 ),
                 baseline_ms,
+                use_cuda_graph,
             )
         )
+        set_topk_algo("auto")
+
+    # The same fused call forced to the CUB backend (uniform lengths == seq_len).
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: flashinfer.top_k_page_table_transform(
+                scores,
+                src_page_table,
+                lengths,
+                k,
+                tie_break=tie_break,
+                dsa_graph_safe=use_cuda_graph,
+            ),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+            use_cuda_graph,
+        )
+    )
 
     return result
 
@@ -513,6 +695,7 @@ def bench_ragged_transform(
     deterministic: bool = False,
     compare_tie_break: bool = False,
     compare_sglang: bool = False,
+    use_cuda_graph: bool = False,
 ) -> dict:
     """Benchmark fused top_k + ragged index transform."""
     scores = generate_scores(batch_size, seq_len, k, dtype, input_pattern)
@@ -520,9 +703,6 @@ def bench_ragged_transform(
     offsets = torch.arange(
         0, batch_size * seq_len, seq_len, device="cuda", dtype=torch.int32
     )
-    use_cuda_graph = True
-    enable_cupti = True
-
     set_topk_algo("default")
     fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
         lambda deterministic_mode: flashinfer.top_k_ragged_transform(
@@ -532,8 +712,10 @@ def bench_ragged_transform(
             k,
             deterministic=deterministic_mode,
             tie_break=TopKTieBreak.NONE,
+            dsa_graph_safe=use_cuda_graph,
         ),
         deterministic,
+        use_cuda_graph,
     )
 
     result = {
@@ -550,25 +732,23 @@ def bench_ragged_transform(
         )
 
     # FlashInfer clusters
-    set_topk_algo("clusters")
-    measurements = bench_gpu_time(
-        lambda: flashinfer.top_k_ragged_transform(scores, offsets, lengths, k),
-        enable_cupti=enable_cupti,
-        dry_run_iters=10,
-        repeat_iters=100,
-        use_cuda_graph=use_cuda_graph,
-    )
-    fast_topk_ms = np.median(measurements)
-    result["fast_topk_us"] = fast_topk_ms * 1e3
-    result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
-    set_topk_algo("auto")
+    if not use_cuda_graph:
+        set_topk_algo("clusters")
+        fast_topk_ms = bench_median_ms(
+            lambda: flashinfer.top_k_ragged_transform(scores, offsets, lengths, k),
+            use_cuda_graph,
+        )
+        result["fast_topk_us"] = fast_topk_ms * 1e3
+        result["speedup_vs_flashinfer"] = fi_ms / fast_topk_ms
+        set_topk_algo("auto")
 
     # SGLang comparison (only supports k=2048 and float32)
     if compare_sglang and HAS_SGL_KERNEL and k == 2048 and dtype == torch.float32:
         sg_ms = bench_median_ms(
             lambda: sgl_kernel.fast_topk_transform_ragged_fused(
                 scores, lengths, offsets, k
-            )
+            ),
+            use_cuda_graph,
         )
         result["sglang_us"] = sg_ms * 1e3
         result["speedup_vs_sglang"] = sg_ms / fi_ms
@@ -576,6 +756,7 @@ def bench_ragged_transform(
         baseline_ms = (
             fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
         )
+        set_topk_algo("default")
         result.update(
             bench_tie_break_variants(
                 lambda tie_break: flashinfer.top_k_ragged_transform(
@@ -583,12 +764,398 @@ def bench_ragged_transform(
                     offsets,
                     lengths,
                     k,
-                    deterministic=True,
+                    deterministic=deterministic,
                     tie_break=tie_break,
+                    dsa_graph_safe=use_cuda_graph,
                 ),
                 baseline_ms,
+                use_cuda_graph,
             )
         )
+        set_topk_algo("auto")
+
+    # The same fused call forced to the CUB backend (uniform lengths == seq_len).
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: flashinfer.top_k_ragged_transform(
+                scores,
+                offsets,
+                lengths,
+                k,
+                tie_break=tie_break,
+                dsa_graph_safe=use_cuda_graph,
+            ),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+            use_cuda_graph,
+        )
+    )
+
+    return result
+
+
+# ===================== Variable-Length Segment Benchmark =====================
+#
+# Production sparse-attention top-k does NOT operate on fixed-size segments: each
+# row selects top-k over a per-row valid window described by ``lengths`` (and, for
+# the page-table case, a ``row_to_batch`` mapping). The transform benchmarks above
+# always pass ``lengths == seq_len`` for every row, which hides load imbalance, the
+# trivial ``length <= k`` short-circuit, and multi-CTA scheduling behavior.
+#
+# This section models two realistic regimes:
+#   - decode  : one row per request; ``lengths`` are independent context lengths
+#               drawn from a distribution (uniform / lognormal / bimodal).
+#   - prefill : ``q_len`` rows per request with causal-monotonic ``lengths`` that
+#               grow across query positions (the chunked-prefill pattern), wired via
+#               a ``row_to_batch`` mapping.
+
+
+@dataclass(frozen=True)
+class VarLenCase:
+    name: str
+    regime: str  # "decode" or "prefill"
+    length_dist: str  # "uniform" | "lognormal" | "bimodal" | "causal"
+    num_requests: int
+    q_len: int  # 1 for decode, >1 for prefill
+    max_len: int  # padded width of the dense scores matrix
+    k: int
+
+
+def sample_request_lengths(
+    num_requests: int,
+    max_len: int,
+    k: int,
+    length_dist: str,
+    generator: torch.Generator,
+    device: torch.device,
+) -> torch.Tensor:
+    """Sample per-request valid context lengths for the decode regime."""
+    if length_dist == "uniform":
+        lengths = torch.randint(
+            1,
+            max_len + 1,
+            (num_requests,),
+            generator=generator,
+            device=device,
+            dtype=torch.int64,
+        )
+    elif length_dist == "lognormal":
+        # Skewed toward shorter contexts with a long tail, typical of a serving
+        # mix; median ~ max_len / 8.
+        mu = math.log(max(2.0, max_len / 8.0))
+        samples = torch.empty(num_requests, device=device, dtype=torch.float32)
+        samples.log_normal_(mean=mu, std=1.0, generator=generator)
+        lengths = samples.to(torch.int64)
+    elif length_dist == "bimodal":
+        # Half short (< k, hits the trivial copy path) and half long (near
+        # max_len): stresses load imbalance and the trivial short-circuit.
+        short_high = max(2, k)
+        short = torch.randint(
+            1,
+            short_high,
+            (num_requests,),
+            generator=generator,
+            device=device,
+            dtype=torch.int64,
+        )
+        long_low = max(short_high, max_len // 2)
+        long_seq = torch.randint(
+            long_low,
+            max_len + 1,
+            (num_requests,),
+            generator=generator,
+            device=device,
+            dtype=torch.int64,
+        )
+        pick_short = torch.rand(num_requests, generator=generator, device=device) < 0.5
+        lengths = torch.where(pick_short, short, long_seq)
+    else:
+        raise ValueError(f"Unsupported decode length_dist: {length_dist}")
+    return lengths.clamp_(1, max_len).to(torch.int32)
+
+
+def build_causal_prefill_lengths(
+    num_requests: int,
+    q_len: int,
+    max_len: int,
+    generator: torch.Generator,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build causal-monotonic lengths for the prefill regime.
+
+    Each request contributes ``q_len`` consecutive rows; query position ``p``
+    attends to ``[0, ctx_start + p]`` so its valid length is ``ctx_start + p + 1``.
+    Returns ``(lengths, row_to_batch)`` flattened over ``num_requests * q_len`` rows.
+    """
+    high = max(q_len + 1, max_len - q_len + 1)
+    ctx_starts = torch.randint(
+        q_len,
+        high,
+        (num_requests,),
+        generator=generator,
+        device=device,
+        dtype=torch.int64,
+    )
+    positions = torch.arange(q_len, device=device, dtype=torch.int64)
+    lengths = (ctx_starts.unsqueeze(1) + positions.unsqueeze(0) + 1).clamp(1, max_len)
+    lengths = lengths.reshape(-1).to(torch.int32)
+    row_to_batch = torch.arange(
+        num_requests, device=device, dtype=torch.int32
+    ).repeat_interleave(q_len)
+    return lengths, row_to_batch
+
+
+def summarize_lengths(lengths: torch.Tensor, k: int) -> tuple[int, float, int, float]:
+    """Return ``(min, mean, max, fraction-of-rows-with-length<=k)``."""
+    len_min = int(lengths.min().item())
+    len_max = int(lengths.max().item())
+    len_mean = float(lengths.to(torch.float64).mean().item())
+    trivial_frac = float((lengths <= k).to(torch.float64).mean().item())
+    return len_min, len_mean, len_max, trivial_frac
+
+
+def build_masked_scores(scores: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    """Mask positions beyond each row's valid length with -inf.
+
+    Gives ``torch.topk`` (which has no length argument) the same valid window as the
+    length-aware kernel. Built once, outside the timed region, so the comparison is
+    selection-cost vs selection-cost.
+    """
+    max_len = scores.size(1)
+    col = torch.arange(max_len, device=scores.device).unsqueeze(0)
+    invalid = col >= lengths.unsqueeze(1)
+    if scores.dtype == torch.float32:
+        neg_inf = float("-inf")
+    else:
+        neg_inf = torch.finfo(scores.dtype).min
+    return scores.masked_fill(invalid, neg_inf)
+
+
+def generate_varlen_inputs(
+    case: VarLenCase,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+    device: torch.device,
+) -> dict:
+    """Build scores + length/offset/page-table tensors for a variable-length case."""
+    max_len = case.max_len
+    if case.regime == "decode":
+        num_requests = case.num_requests
+        lengths = sample_request_lengths(
+            num_requests, max_len, case.k, case.length_dist, generator, device
+        )
+        row_to_batch = None
+        num_rows = num_requests
+    elif case.regime == "prefill":
+        num_requests = case.num_requests
+        lengths, row_to_batch = build_causal_prefill_lengths(
+            num_requests, case.q_len, max_len, generator, device
+        )
+        num_rows = num_requests * case.q_len
+    else:
+        raise ValueError(f"Unsupported regime: {case.regime}")
+
+    scores = torch.randn(
+        num_rows, max_len, device=device, dtype=dtype, generator=generator
+    )
+
+    # Ragged offsets model a tightly packed KV buffer: offsets[i] = sum(lengths[:i]).
+    # The absolute offset value is perf-irrelevant (it is just added to the output
+    # index); the per-row ``lengths`` drive the actual work.
+    offsets = torch.zeros(num_rows, device=device, dtype=torch.int32)
+    if num_rows > 1:
+        offsets[1:] = torch.cumsum(lengths[:-1].to(torch.int64), dim=0).to(torch.int32)
+
+    # Page table is per request: (num_requests, max_len).
+    src_page_table = (
+        torch.arange(max_len, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .expand(num_requests, max_len)
+        .contiguous()
+    )
+    return {
+        "scores": scores,
+        "lengths": lengths,
+        "offsets": offsets,
+        "src_page_table": src_page_table,
+        "row_to_batch": row_to_batch,
+        "num_requests": num_requests,
+    }
+
+
+def build_varlen_cases(
+    length_dists: list[str],
+    max_lens: list[int],
+    k_values: list[int],
+    decode_batches: list[int],
+    prefill_requests: list[int],
+    q_len: int,
+) -> list[VarLenCase]:
+    cases: list[VarLenCase] = []
+    decode_dists = [d for d in length_dists if d in ("uniform", "lognormal", "bimodal")]
+    for dist in decode_dists:
+        for num_requests in decode_batches:
+            for max_len in max_lens:
+                for k in k_values:
+                    if k >= max_len:
+                        continue
+                    cases.append(
+                        VarLenCase(
+                            name=f"decode_{dist}_b{num_requests}_l{max_len}_k{k}",
+                            regime="decode",
+                            length_dist=dist,
+                            num_requests=num_requests,
+                            q_len=1,
+                            max_len=max_len,
+                            k=k,
+                        )
+                    )
+    if "causal" in length_dists:
+        for num_requests in prefill_requests:
+            for max_len in max_lens:
+                for k in k_values:
+                    if k >= max_len:
+                        continue
+                    cases.append(
+                        VarLenCase(
+                            name=f"prefill_causal_r{num_requests}_q{q_len}_l{max_len}_k{k}",
+                            regime="prefill",
+                            length_dist="causal",
+                            num_requests=num_requests,
+                            q_len=q_len,
+                            max_len=max_len,
+                            k=k,
+                        )
+                    )
+    return cases
+
+
+def bench_varlen_transform(
+    case: VarLenCase,
+    transform: str,
+    dtype: torch.dtype,
+    generator: torch.Generator,
+    has_clusters: bool,
+    deterministic: bool = False,
+    compare_tie_break: bool = False,
+    use_cuda_graph: bool = False,
+) -> dict:
+    """Benchmark a transform API on realistic variable-length segments."""
+    device = torch.device("cuda")
+    inputs = generate_varlen_inputs(case, dtype, generator, device)
+    scores = inputs["scores"]
+    lengths = inputs["lengths"]
+    offsets = inputs["offsets"]
+    src_page_table = inputs["src_page_table"]
+    row_to_batch = inputs["row_to_batch"]
+    num_rows = scores.size(0)
+    k = case.k
+
+    def run(deterministic_mode, tie_break=TopKTieBreak.NONE):
+        if transform == "page_table":
+            return flashinfer.top_k_page_table_transform(
+                scores,
+                src_page_table,
+                lengths,
+                k,
+                row_to_batch=row_to_batch,
+                deterministic=deterministic_mode,
+                tie_break=tie_break,
+                dsa_graph_safe=use_cuda_graph,
+            )
+        return flashinfer.top_k_ragged_transform(
+            scores,
+            offsets,
+            lengths,
+            k,
+            deterministic=deterministic_mode,
+            tie_break=tie_break,
+            dsa_graph_safe=use_cuda_graph,
+        )
+
+    set_topk_algo("default")
+    fi_ms, fi_nondeterministic_ms = bench_flashinfer_modes(
+        run, deterministic, use_cuda_graph
+    )
+
+    len_min, len_mean, len_max, trivial_frac = summarize_lengths(lengths, k)
+    result = {
+        "regime": case.regime,
+        "length_dist": case.length_dist,
+        "transform": transform,
+        "num_rows": num_rows,
+        "num_requests": inputs["num_requests"],
+        "max_len": case.max_len,
+        "k": k,
+        "len_min": len_min,
+        "len_mean": len_mean,
+        "len_max": len_max,
+        "trivial_frac": trivial_frac,
+        "flashinfer_us": fi_ms * 1e3,
+    }
+    if fi_nondeterministic_ms is not None:
+        result["flashinfer_nondeterministic_us"] = fi_nondeterministic_ms * 1e3
+        result["deterministic_slowdown_vs_nondeterministic"] = (
+            fi_ms / fi_nondeterministic_ms
+        )
+
+    # clusters is a non-deterministic SM100 path; it also only dispatches for
+    # page_table when row_to_batch is None (the prefill regime sets row_to_batch and
+    # falls back to the default path). Only measure/report it when it would actually
+    # run, otherwise the "clusters" timing would just be the default path relabeled.
+    can_run_clusters = (
+        has_clusters
+        and not use_cuda_graph
+        and not (deterministic or compare_tie_break)
+        and not (transform == "page_table" and row_to_batch is not None)
+    )
+    if can_run_clusters:
+        set_topk_algo("clusters")
+        clusters_ms = bench_median_ms(lambda: run(False), use_cuda_graph)
+        result["clusters_us"] = clusters_ms * 1e3
+        result["speedup_clusters_vs_default"] = fi_ms / clusters_ms
+    set_topk_algo("auto")
+
+    if compare_tie_break:
+        # Use the same non-deterministic baseline as DetSlowdown when present.
+        baseline_ms = (
+            fi_nondeterministic_ms if fi_nondeterministic_ms is not None else fi_ms
+        )
+        set_topk_algo("default")
+        result.update(
+            bench_tie_break_variants(
+                lambda tie_break: run(deterministic, tie_break),
+                baseline_ms,
+                use_cuda_graph,
+            )
+        )
+        set_topk_algo("auto")
+
+    # torch reference operates on a pre-masked tensor (mask built outside timing) so
+    # we compare selection cost against the length-aware kernel.
+    masked_scores = build_masked_scores(scores, lengths)
+    with torch_deterministic_algorithms(deterministic):
+        torch_ms = bench_median_ms(
+            lambda: torch.topk(masked_scores, k, dim=-1), use_cuda_graph
+        )
+    result["torch_us"] = torch_ms * 1e3
+    result["speedup_vs_torch"] = torch_ms / fi_ms
+
+    # The same fused call forced to the CUB backend. Both transforms are CUB-backed
+    # (page_table including row_to_batch rows, and ragged), so every varlen row gets
+    # a CUB column; cub_topk_metrics itself skips unsupported configurations.
+    result.update(
+        cub_topk_metrics(
+            lambda tie_break: run(False, tie_break),
+            scores,
+            deterministic,
+            compare_tie_break,
+            fi_ms,
+            use_cuda_graph,
+        )
+    )
 
     return result
 
@@ -617,7 +1184,7 @@ def main():
     )
     parser.add_argument(
         "--op",
-        choices=["all", "top_k", "dsa_topk", "page_table", "ragged"],
+        choices=["all", "top_k", "dsa_topk", "page_table", "ragged", "varlen"],
         default="all",
         help="Which operation to benchmark",
     )
@@ -641,8 +1208,20 @@ def main():
         "--tie-break",
         action="store_true",
         help=(
-            "Also benchmark deterministic tie-break variants and report "
-            "FlashInfer(tie-small/tie-large) columns with slowdown aligned to DetSlowdown baseline"
+            "Also benchmark tie-break variants and report "
+            "FlashInfer(tie-small/tie-large) columns with slowdown against "
+            "the non-deterministic baseline"
+        ),
+    )
+    parser.add_argument(
+        "--cuda-graph",
+        action="store_true",
+        help=(
+            "Capture each timed call in a CUDA graph and time the replays "
+            "(CUPTI hardware timestamps when available), matching production "
+            "CUDA-graph usage. FlashInfer calls pass dsa_graph_safe=True (as "
+            "SGLang's graphed calls do) and the Clusters column is skipped "
+            "(the clusters backend declines dsa_graph_safe)."
         ),
     )
     parser.add_argument(
@@ -683,23 +1262,56 @@ def main():
         default=2048,
         help="Top-k for DSA workload (default: 2048, matching DeepSeek DSA config)",
     )
+    parser.add_argument(
+        "--length-dist",
+        choices=["all", "uniform", "lognormal", "bimodal", "causal"],
+        default="all",
+        help=(
+            "Variable-length segment distribution for --op varlen: "
+            "uniform | lognormal | bimodal (decode regimes) | causal (prefill regime) | all"
+        ),
+    )
+    parser.add_argument(
+        "--varlen-k",
+        type=int,
+        default=2048,
+        help="Top-k for the varlen benchmark (default: 2048, matching DeepSeek DSA config)",
+    )
+    parser.add_argument(
+        "--varlen-q-len",
+        type=int,
+        default=128,
+        help="Query length per request for the varlen prefill (causal) regime (default: 128)",
+    )
     args = parser.parse_args()
 
-    dtype = parse_dtype(args.dtype)
+    if args.varlen_k <= 0:
+        parser.error("--varlen-k must be a positive integer")
+    if args.varlen_q_len <= 0:
+        parser.error("--varlen-q-len must be a positive integer")
 
-    if args.tie_break and not args.deterministic:
-        print(
-            "NOTE: --tie-break requires deterministic kernels; enabling --deterministic."
-        )
-        args.deterministic = True
+    dtype = parse_dtype(args.dtype)
 
     if args.compare_sglang and not HAS_SGL_KERNEL:
         print("WARNING: sgl_kernel not found, skipping SGLang comparison")
         args.compare_sglang = False
 
     # Test configurations
-    batch_sizes = [1, 16, 64, 256]
-    seq_lens = [256, 512, 1024, 2048, 4096, 16384, 65536, 131072, 262144, 524288]
+    batch_sizes = [1, 16, 32, 64, 128, 256]
+    seq_lens = [
+        256,
+        512,
+        1024,
+        2048,
+        4096,
+        8192,
+        16384,
+        32768,
+        65536,
+        131072,
+        262144,
+        524288,
+    ]
     k_values = [256, 512, 1024, 2048, 4096]
     top_k_cases = build_top_k_cases(
         batch_sizes=batch_sizes,
@@ -797,8 +1409,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print(
             "NOTE: default top-k sweep includes two extra large-batch/long-vocab "
@@ -824,6 +1436,7 @@ def main():
             header += f" {'torch.det':>12} {'Speedup':>10}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -839,6 +1452,7 @@ def main():
                     compare_tie_break=args.tie_break,
                     compare_torch_deterministic=args.compare_torch_deterministic,
                     compare_sglang=args.compare_sglang,
+                    use_cuda_graph=args.cuda_graph,
                 )
                 if show_det_or_tie:
                     nondet_us = result.get("flashinfer_nondeterministic_us")
@@ -887,6 +1501,9 @@ def main():
                     )
                 elif args.compare_sglang and case.k == 2048:
                     line += " (SGLang error)"
+                line = append_cub_columns(
+                    line, result, args.tie_break, not show_det_or_tie
+                )
                 print(line)
             except RuntimeError as e:
                 error_label = classify_benchmark_runtime_error(e)
@@ -923,8 +1540,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print("=" * 100)
 
@@ -944,6 +1561,7 @@ def main():
             )
         if args.compare_torch_deterministic and not show_det_or_tie:
             header += f" {'torch.det':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -978,6 +1596,7 @@ def main():
                     compare_torch_deterministic=args.compare_torch_deterministic,
                     compare_sglang=False,
                     causal_chunk=case.causal_chunk,
+                    use_cuda_graph=args.cuda_graph,
                 )
                 if show_det_or_tie:
                     nondet_us = result.get("flashinfer_nondeterministic_us")
@@ -1019,6 +1638,9 @@ def main():
                         f" {result['torch_deterministic_us']:>10.2f}us "
                         f"{result['speedup_vs_torch_deterministic']:>9.2f}x"
                     )
+                line = append_cub_columns(
+                    line, result, args.tie_break, not show_det_or_tie
+                )
                 print(line)
             except RuntimeError as e:
                 error_label = classify_benchmark_runtime_error(e)
@@ -1048,8 +1670,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print("=" * 100)
 
@@ -1063,6 +1685,7 @@ def main():
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -1081,6 +1704,7 @@ def main():
                             deterministic=args.deterministic,
                             compare_tie_break=args.tie_break,
                             compare_sglang=args.compare_sglang,
+                            use_cuda_graph=args.cuda_graph,
                         )
                         if show_det_or_tie:
                             nondet_us = result.get("flashinfer_nondeterministic_us")
@@ -1125,6 +1749,9 @@ def main():
                             )
                         elif args.compare_sglang and k == 2048:
                             line += " (SGLang error)"
+                        line = append_cub_columns(
+                            line, result, args.tie_break, not show_det_or_tie
+                        )
                         print(line)
                     except RuntimeError as e:
                         error_label = classify_benchmark_runtime_error(e)
@@ -1153,8 +1780,8 @@ def main():
             )
         if args.tie_break:
             print(
-                "NOTE: tie-break columns benchmark deterministic tie-small/tie-large; "
-                "slowdowns align with the same baseline as DetSlowdown"
+                f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                "slowdowns use the non-deterministic baseline"
             )
         print("=" * 100)
 
@@ -1168,6 +1795,7 @@ def main():
             header = f"{'batch':>6} {'seq_len':>10} {'k':>6} | {'FlashInfer':>12} {'Clusters':>12} {'Speedup Clusters vs. Default':>29}"
         if args.compare_sglang:
             header += f" {'SGLang':>12} {'Speedup':>10}"
+        header = append_cub_header(header, args.tie_break, not show_det_or_tie)
         print(header)
         print("-" * len(header))
 
@@ -1186,6 +1814,7 @@ def main():
                             deterministic=args.deterministic,
                             compare_tie_break=args.tie_break,
                             compare_sglang=args.compare_sglang,
+                            use_cuda_graph=args.cuda_graph,
                         )
                         if show_det_or_tie:
                             nondet_us = result.get("flashinfer_nondeterministic_us")
@@ -1230,6 +1859,9 @@ def main():
                             )
                         elif args.compare_sglang and k == 2048:
                             line += " (SGLang error)"
+                        line = append_cub_columns(
+                            line, result, args.tie_break, not show_det_or_tie
+                        )
                         print(line)
                     except RuntimeError as e:
                         error_label = classify_benchmark_runtime_error(e)
@@ -1240,6 +1872,181 @@ def main():
                             torch.cuda.empty_cache()
                         else:
                             raise
+
+    if args.op in ["all", "varlen"]:
+        device = torch.device("cuda")
+        cap = get_compute_capability(device)
+        has_clusters = cap[0] == 10
+        length_dists = (
+            ["uniform", "lognormal", "bimodal", "causal"]
+            if args.length_dist == "all"
+            else [args.length_dist]
+        )
+        varlen_max_lens = [16384, 65536, 131072]
+        varlen_k_values = [args.varlen_k]
+        varlen_decode_batches = [16, 128]
+        varlen_prefill_requests = [4, 16]
+        varlen_cases = build_varlen_cases(
+            length_dists,
+            varlen_max_lens,
+            varlen_k_values,
+            varlen_decode_batches,
+            varlen_prefill_requests,
+            args.varlen_q_len,
+        )
+        # A torch.Generator drives the (otherwise random) length/score draws. It is
+        # re-seeded per case in the loop below so the page_table and ragged runs for a
+        # given case use identical inputs (and stays reproducible across runs).
+        generator = torch.Generator(device=device)
+
+        show_det_or_tie = args.deterministic or args.tie_break
+        # clusters is a non-deterministic SM100 path; omit it under deterministic/tie-break.
+        show_clusters = has_clusters and not show_det_or_tie
+
+        print("\n" + "=" * 100)
+        print(
+            "varlen: Variable-length segment top-k transforms (production-realistic) "
+            f"(dtype={dtype_str}, length_dist={args.length_dist}, k={args.varlen_k}, "
+            f"deterministic={args.deterministic}, tie_break={args.tie_break})"
+        )
+        print(
+            "NOTE: lengths model per-row valid windows; decode = independent context "
+            f"lengths, prefill(causal) = monotonic growth within a request (q_len={args.varlen_q_len})"
+        )
+        print(
+            "NOTE: torch(mask) masks invalid positions once (outside timing) then "
+            "torch.topk, isolating selection cost vs the length-aware kernel"
+        )
+        if show_det_or_tie:
+            if args.deterministic:
+                print(
+                    "NOTE: deterministic mode also benchmarks FlashInfer(non-det) "
+                    "for direct comparison"
+                )
+            if args.tie_break:
+                print(
+                    f"NOTE: tie-break columns use deterministic={args.deterministic}; "
+                    "slowdowns use the non-deterministic baseline"
+                )
+            print(
+                "NOTE: Clusters column omitted under deterministic/tie-break "
+                "(clusters requires the non-deterministic path)"
+            )
+        elif not has_clusters:
+            print(
+                "NOTE: clusters path requires SM100 (Blackwell); omitting Clusters "
+                f"column on this device (SM{cap[0]}{cap[1]})"
+            )
+        print("=" * 100)
+
+        base_header = (
+            f"{'regime':>8} {'dist':>10} {'transform':>11} {'rows':>8} {'reqs':>6} "
+            f"{'max_len':>9} {'k':>6} | {'len_min':>8} {'len_mean':>9} {'len_max':>8} "
+            f"{'triv%':>6} | "
+        )
+        if show_det_or_tie:
+            header = (
+                base_header
+                + f"{'FlashInfer':>12} {'FlashInfer(det)':>14} {'DetSlowdown':>11}"
+            )
+            header = append_tie_break_header(header, args.tie_break)
+            header += f" {'torch(mask)':>13} {'Speedup':>9}"
+        else:
+            header = base_header + f"{'FlashInfer':>12}"
+            if show_clusters:
+                header += f" {'Clusters':>12} {'vsClusters':>10}"
+            header += f" {'torch(mask)':>13} {'Speedup':>9}"
+        header = append_cub_header(header, args.tie_break, show_clusters)
+        print(header)
+        print("-" * len(header))
+
+        for case_idx, case in enumerate(varlen_cases):
+            for transform in ["page_table", "ragged"]:
+                # Re-seed per case so page_table and ragged see identical inputs,
+                # keeping the per-case transform comparison and length stats equivalent.
+                generator.manual_seed(1234 + case_idx)
+                needs_cache_cleanup = False
+                try:
+                    result = bench_varlen_transform(
+                        case,
+                        transform,
+                        dtype,
+                        generator,
+                        has_clusters,
+                        deterministic=args.deterministic,
+                        compare_tie_break=args.tie_break,
+                        use_cuda_graph=args.cuda_graph,
+                    )
+                    base_line = (
+                        f"{result['regime']:>8} {result['length_dist']:>10} "
+                        f"{result['transform']:>11} {result['num_rows']:>8} "
+                        f"{result['num_requests']:>6} {result['max_len']:>9} "
+                        f"{result['k']:>6} | {result['len_min']:>8} "
+                        f"{result['len_mean']:>9.1f} {result['len_max']:>8} "
+                        f"{100.0 * result['trivial_frac']:>5.1f}% | "
+                    )
+                    if show_det_or_tie:
+                        nondet_us = result.get("flashinfer_nondeterministic_us")
+                        if nondet_us is None:
+                            nondet_us = result["flashinfer_us"]
+                        det_us = result["flashinfer_us"] if args.deterministic else None
+                        det_us_str = (
+                            f"{det_us:>12.2f}us"
+                            if det_us is not None
+                            else f"{'n/a':>14}"
+                        )
+                        det_slowdown = result.get(
+                            "deterministic_slowdown_vs_nondeterministic"
+                        )
+                        det_slowdown_str = (
+                            f"{det_slowdown:>10.2f}x"
+                            if det_slowdown is not None
+                            else f"{'n/a':>11}"
+                        )
+                        line = (
+                            base_line
+                            + f"{nondet_us:>10.2f}us {det_us_str} {det_slowdown_str}"
+                        )
+                        line = append_tie_break_columns(line, result, args.tie_break)
+                        line += (
+                            f" {result['torch_us']:>11.2f}us "
+                            f"{result['speedup_vs_torch']:>8.2f}x"
+                        )
+                    else:
+                        line = base_line + f"{result['flashinfer_us']:>10.2f}us"
+                        if show_clusters:
+                            # prefill page_table falls back to the default path, so it
+                            # has no clusters timing; pad to keep columns aligned.
+                            if "clusters_us" in result:
+                                line += (
+                                    f" {result['clusters_us']:>10.2f}us "
+                                    f"{result['speedup_clusters_vs_default']:>9.2f}x"
+                                )
+                            else:
+                                line += f" {'n/a':>12} {'n/a':>10}"
+                        line += (
+                            f" {result['torch_us']:>11.2f}us "
+                            f"{result['speedup_vs_torch']:>8.2f}x"
+                        )
+                    line = append_cub_columns(
+                        line, result, args.tie_break, show_clusters
+                    )
+                    print(line)
+                except RuntimeError as e:
+                    error_label = classify_benchmark_runtime_error(e)
+                    if error_label is None:
+                        raise
+                    print(
+                        f"{case.regime:>8} {case.length_dist:>10} "
+                        f"{transform:>11} {case.max_len:>9} {case.k:>6} | {error_label}"
+                    )
+                    needs_cache_cleanup = True
+                # Reclaim cached memory only after the except block exits. While the
+                # handler is active, the in-flight exception keeps bench_varlen_transform's
+                # frame (and its large GPU tensors) alive, so empty_cache() inside the
+                # handler would be a no-op; releasing here lets the next case start clean.
+                if needs_cache_cleanup:
+                    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

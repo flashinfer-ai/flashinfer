@@ -1300,6 +1300,47 @@ def mla_rope_quantize_fp8(
     k_nope_out: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    r"""Apply RoPE and quantize to FP8 for MLA attention.
+
+    Thin wrapper that forwards to :func:`rope_quantize_fp8` with the MLA
+    tensor layout: ``k_rope`` / ``k_nope`` are 2-D (no KV-head axis).  All
+    other parameters and behavior match :func:`rope_quantize_fp8`; see that
+    function for full parameter documentation.
+
+    Parameters
+    ----------
+    q_rope : torch.Tensor
+        Query rotary portion, ``(nnz, num_qo_heads, rope_dim)``, fp16/bf16.
+    k_rope : torch.Tensor
+        Key rotary portion in MLA layout, ``(nnz, rope_dim)``, fp16/bf16.
+    q_nope : torch.Tensor
+        Query non-rotary portion, ``(nnz, num_qo_heads, no_rope_dim)``.
+    k_nope : torch.Tensor
+        Key non-rotary portion in MLA layout, ``(nnz, no_rope_dim)``.
+    cos_sin_cache : torch.Tensor
+        ``(max_seq_len, rope_dim)`` precomputed cos/sin cache (fp32).
+    pos_ids : torch.Tensor
+        Per-token position indices, ``(nnz,)``.
+    is_neox : bool
+        ``True`` for NeoX (split-half) layout, ``False`` for interleaved.
+    quantize_dtype : torch.dtype, optional
+        Target quantization dtype (``float8_e4m3fn`` or ``float8_e5m2``).
+        Inferred from ``*_out`` tensors when ``None``.
+    quant_scale_q : float
+        Quantization scale applied to queries.
+    quant_scale_kv : float
+        Quantization scale applied to keys.
+    q_rope_out, k_rope_out, q_nope_out, k_nope_out : torch.Tensor, optional
+        Pre-allocated output tensors.  Allocated automatically when
+        ``None``.
+    enable_pdl : bool
+        Whether to enable Programmatic Dependent Launch.
+
+    Returns
+    -------
+    Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ``(q_rope_out, k_rope_out, q_nope_out, k_nope_out)``.
+    """
     return rope_quantize_fp8(
         q_rope,
         k_rope,
@@ -1336,6 +1377,7 @@ def rope_quantize_fp8(
     q_nope_out: Optional[torch.Tensor] = None,
     k_nope_out: Optional[torch.Tensor] = None,
     enable_pdl: bool = False,
+    backend: str = "cuda",
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     r"""Apply RoPE (Rotary Positional Embeddings) and quantize to FP8 format.
 
@@ -1382,12 +1424,61 @@ def rope_quantize_fp8(
         Pre-allocated output tensor for quantized key (non-rotary). If ``None``, allocated automatically.
     enable_pdl : bool
         Whether to enable PDL (Programmatic Dependent Launch). Default: ``False``.
+    backend : str
+        Implementation backend. ``"cuda"`` (default) uses the fused CUDA kernel;
+        ``"cutile"`` uses the cuda.tile Python kernel.
 
     Returns
     -------
     Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
         Quantized tensors: (q_rope_out, k_rope_out, q_nope_out, k_nope_out).
     """
+    if backend not in ("cuda", "cutile"):
+        raise ValueError(
+            f"Unsupported backend for rope_quantize_fp8: {backend!r}; "
+            "expected 'cuda' or 'cutile'."
+        )
+    if backend == "cutile":
+        if is_neox:
+            # The cuTile kernel implements only the interleaved (GPT-J) rotary
+            # layout. is_neox defaults to True, so surface a clear error instead
+            # of the kernel's bare AssertionError (which -O would also strip).
+            raise NotImplementedError(
+                "backend='cutile' supports is_neox=False (interleaved/GPT-J "
+                "rotary) only; got is_neox=True."
+            )
+        if k_rope.ndim != 2:
+            # The kernel addresses the key as 2D [tokens, rope_dim] (single
+            # shared latent K head, the MLA use case). A 3D GQA/MHA key would
+            # fail deep in autotune with an opaque TileTypeError.
+            raise NotImplementedError(
+                "backend='cutile' rope_quantize_fp8 supports MLA-style 2D key "
+                f"tensors (single shared K head) only; got {k_rope.ndim}D key "
+                "(GQA/MHA multi-head K is not supported)."
+            )
+        if cos_sin_cache.dtype != torch.float32:
+            raise ValueError("cos_sin_cache should be float32")
+        from .quantization.kernels.cutile.rope_quantize_fp8_cutile import (
+            rope_quantize_fp8_cutile,
+        )
+
+        return rope_quantize_fp8_cutile(
+            q_rope,
+            k_rope,
+            q_nope,
+            k_nope,
+            cos_sin_cache,
+            pos_ids,
+            is_neox=is_neox,
+            quantize_dtype=quantize_dtype,
+            quant_scale_q=quant_scale_q,
+            quant_scale_kv=quant_scale_kv,
+            q_rope_out=q_rope_out,
+            k_rope_out=k_rope_out,
+            q_nope_out=q_nope_out,
+            k_nope_out=k_nope_out,
+        )
+
     if cos_sin_cache.dtype != torch.float32:
         raise ValueError("cos_sin_cache should be float32")
 
