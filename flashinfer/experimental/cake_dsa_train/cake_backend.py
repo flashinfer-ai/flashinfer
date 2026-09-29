@@ -105,6 +105,7 @@ CONTRACT_TENSORS = (
     "dk_rope_acc",
     "dkv_latent",
     "dk_rope",
+    "workspace",  # kernel-private scratch of the backward main stage (record field workspace_bytes)
     "tma_descriptor_workspace",
 )
 CONTRACT_SCALARS = (
@@ -121,6 +122,9 @@ CONTRACT_SCALARS = (
     "q_latent_row_stride",
     "q_rope_row_stride",
     "kv_latent_row_stride",
+    "num_rows",  # bwd_delta: num_queries * 64 (token, head) rows
+    "latent_vecs",  # bwd_cast: num_kv * 512 / 16 sixteen-element vectors
+    "rope_vecs",  # bwd_cast: num_kv * 64 / 16
 )
 # Accepted spellings of the same host value (kernel side -> host side).
 CONTRACT_ALIASES = {
@@ -137,6 +141,12 @@ CONTRACT_ALIASES = {
     "k_rope_row_stride": "k_rope_stride",
     "dkv_latent_f32": "dkv_latent_acc",
     "dk_rope_f32": "dk_rope_acc",
+    "dkv_f32": "dkv_latent_acc",
+    "dkr_f32": "dk_rope_acc",
+    "src_latent": "dkv_latent_acc",
+    "src_rope": "dk_rope_acc",
+    "dst_latent": "dkv_latent",
+    "dst_rope": "dk_rope",
     "do": "dout",
     "d_out": "dout",
 }
@@ -264,6 +274,8 @@ def validate_dsa_train_inputs(
         _check_head_tensor(dout, "dout", D_LATENT)
         if int(dout.shape[0]) != num_queries:
             raise ValueError("dout must have T rows")
+        if not dout.is_contiguous():
+            raise ValueError("dout must be contiguous (call .contiguous() first)")
     return num_queries, num_kv, topk
 
 
@@ -291,6 +303,7 @@ def workspace_layout(
     abi: str = ABI_CONTRACT,
     backward: bool = True,
     tma_workspace_bytes: int = 0,
+    scratch_bytes: int = 0,
 ) -> dict:
     """Byte ``(offset, size)`` of every workspace region plus ``"total"``.
 
@@ -315,6 +328,8 @@ def workspace_layout(
             ("aux_logits", num_queries * NUM_HEADS * 4),
             ("sinks", NUM_HEADS * 4),
         ]
+    if backward and scratch_bytes:
+        sizes.append(("workspace", int(scratch_bytes)))
     if tma_workspace_bytes:
         sizes.append(("tma_descriptor_workspace", int(tma_workspace_bytes)))
     layout: dict = {}
@@ -328,6 +343,11 @@ def workspace_layout(
 
 def _record_tma_bytes(record: dict[str, Any], stages: tuple[str, ...]) -> int:
     return max((int(record[s].get("tma_workspace_bytes", 0)) for s in stages), default=0)
+
+
+def _record_scratch_bytes(record: dict[str, Any], stages: tuple[str, ...]) -> int:
+    """Kernel-private scratch declared by the backward stages (``workspace_bytes``; 0 when none)."""
+    return max((int(record[s].get("workspace_bytes", 0)) for s in stages), default=0)
 
 
 def dsa_train_workspace_size(
@@ -349,6 +369,7 @@ def dsa_train_workspace_size(
             abi=record_abi(record),
             backward=backward,
             tma_workspace_bytes=_record_tma_bytes(record, stages),
+            scratch_bytes=_record_scratch_bytes(record, stages) if backward else 0,
         )["total"]
     )
 
@@ -414,8 +435,10 @@ def offset_gather_kv_indices(
 def grid_dims(rule, scalars: dict[str, int], num_sms: int) -> tuple[int, int, int]:
     """Evaluate a registry grid rule.
 
-    Each of the three entries is an integer, a scalar name (``"num_queries"``),
-    ``"<name>/<n>"`` (ceiling division), ``"sms"`` or ``"sms*<n>"``.
+    Each of the three entries is an integer, ``"sms"``, ``"sms*<n>"`` or
+    ``"<name>[*<a>][/<b>]"``: a scalar name (``"num_queries"``) optionally
+    multiplied by ``a`` and then divided by ``b`` with rounding up
+    (``"num_kv*36/256"``).
     """
 
     def term(value) -> int:
@@ -428,10 +451,10 @@ def grid_dims(rule, scalars: dict[str, int], num_sms: int) -> tuple[int, int, in
             return int(num_sms)
         if text.startswith("sms*"):
             return int(num_sms) * int(text[4:])
-        if "/" in text:
-            name, divisor = text.split("/", 1)
-            return -(-int(scalars[name]) // int(divisor))
-        return int(scalars[text])
+        name, _, divisor = text.partition("/")
+        name, _, factor = name.partition("*")
+        value = int(scalars[name]) * (int(factor) if factor else 1)
+        return -(-value // int(divisor)) if divisor else value
 
     if len(rule) != 3:
         raise ValueError("grid rule must have three entries")
@@ -470,7 +493,10 @@ def bind_stage(
         if kind == "grid":
             arguments.append(grid_values[name])
         elif key in values and values[key] is not None:  # buffer / tma_buffer / workspace / parameter
-            arguments.append(values[key])
+            value = values[key]
+            if kind == "buffer" and f"{key}_storage" in values:
+                value = values[f"{key}_storage"]  # raw pointer: whole storage + <name>_offset elements
+            arguments.append(value)
         else:
             raise KeyError(
                 f"generated module {module_name!r} stage {stage!r} expects argument "
@@ -611,9 +637,12 @@ def _contract_values(t: dict[str, torch.Tensor], scalars: dict[str, Any]) -> dic
     ):
         values[key] = int(t[name].stride(0))
     values["idx_stride"] = int(t["indices"].stride(0))
-    values["indices"], values["indices_offset"] = _pointer_alias(t["indices"])
+    values["indices_storage"], values["indices_offset"] = _pointer_alias(t["indices"])
     values["k_rope_stride"] = int(t["k_rope"].stride(0))
-    values["k_rope"], values["k_rope_offset"] = _pointer_alias(t["k_rope"])
+    values["k_rope_storage"], values["k_rope_offset"] = _pointer_alias(t["k_rope"])
+    values["num_rows"] = int(scalars["num_queries"]) * NUM_HEADS
+    values["latent_vecs"] = int(scalars["num_kv"]) * D_LATENT // 16
+    values["rope_vecs"] = int(scalars["num_kv"]) * D_ROPE // 16
     return values
 
 
@@ -713,6 +742,7 @@ def prepare_dsa_train(
         abi=abi,
         backward=backward,
         tma_workspace_bytes=_record_tma_bytes(record, stages),
+        scratch_bytes=_record_scratch_bytes(record, stages) if backward else 0,
     )
     if workspace_buffer is None:
         workspace_buffer = torch.empty(layout["total"], dtype=torch.uint8, device=device)
@@ -748,6 +778,8 @@ def prepare_dsa_train(
         if not dkv_fp32:
             t["dkv_latent"] = dkv_latent if dkv_latent is not None else torch.empty((num_kv, D_LATENT), dtype=torch.bfloat16, device=device)
             t["dk_rope"] = dk_rope if dk_rope is not None else torch.empty((num_kv, D_ROPE), dtype=torch.bfloat16, device=device)
+    if layout.get("workspace"):
+        t["workspace"] = _carve(flat, layout, "workspace", torch.uint8, (layout["workspace"][1],))
     if layout.get("tma_descriptor_workspace"):
         t["tma_descriptor_workspace"] = _carve(
             flat, layout, "tma_descriptor_workspace", torch.uint8, (layout["tma_descriptor_workspace"][1],)
@@ -861,7 +893,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
                 "backward is unavailable: the registered program is forward-only (placeholder)"
             )
         dq_latent, dq_rope, dkv_latent, dk_rope = backward(
-            q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout,
+            q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout.contiguous(),
             topk_length=topk_length if ctx.has_topk_length else None,
             softmax_scale=ctx.softmax_scale,
         )
