@@ -291,6 +291,8 @@ def test_single_prefill_masked_key_never_dominates(dtype):
         (10, 27),  # more columns than kv_len
         (7, 20),  # fewer rows than qo_len
         (20, 10),  # transposed
+        (150,),  # flattened, fewer elements than qo_len * kv_len
+        (250,),  # flattened, more elements than qo_len * kv_len
         (1, 10, 20),  # rank 3: right element count, shape the API does not define
     ],
 )
