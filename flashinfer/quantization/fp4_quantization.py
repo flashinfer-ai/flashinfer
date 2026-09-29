@@ -1718,6 +1718,14 @@ def nvfp4_quantize(
                     "the cake per-token NVFP4 quantization writes the 128x4 scale "
                     "layout only (sfLayout=SfLayout.layout_128x4, do_shuffle=False)"
                 )
+            if nvfp4_4over6_config is not None:
+                raise ValueError(
+                    "the cake per-token NVFP4 quantization implements the plain "
+                    "NVFP4 recipe only (no 4over6 scale-candidate search); pass "
+                    "nvfp4_4over6=None or use backend='cute-dsl'"
+                )
+            if nvfp4_4over6_is_explicit and not isinstance(a_global_sf, torch.Tensor):
+                _check_per_token_global_scale(float(a_global_sf), nvfp4_4over6_config)
             from ..experimental.cake_nvfp4_per_token.cake_backend import (
                 nvfp4_quantize_per_token as _cake_nvfp4_quantize_per_token,
             )

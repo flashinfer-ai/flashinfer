@@ -17,7 +17,7 @@ limitations under the License.
 import pytest
 import torch
 
-from flashinfer import SfLayout, nvfp4_quantize
+from flashinfer import NVFP44Over6Config, SfLayout, nvfp4_quantize
 from flashinfer.experimental.cake_nvfp4_per_token import cake_backend as cb
 from flashinfer.experimental.cake_nvfp4_per_token.cake_jit import KERNELS, MODULES
 
@@ -298,6 +298,14 @@ def test_rejections():
     with pytest.raises(ValueError, match="dependent launch"):
         nvfp4_quantize(
             x, gs_inv, per_token_activation=True, backend="cake", enable_pdl=False
+        )
+    with pytest.raises(ValueError, match="4over6"):
+        nvfp4_quantize(
+            x,
+            gs_inv,
+            per_token_activation=True,
+            backend="cake",
+            nvfp4_4over6=NVFP44Over6Config(),
         )
     outputs = cb.allocate_nvfp4_per_token_quantize_outputs(4, 7168, device)
     with pytest.raises(ValueError, match="fp4"):
