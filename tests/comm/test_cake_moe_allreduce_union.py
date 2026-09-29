@@ -88,7 +88,9 @@ _COOPERATIVE_SPECIALIZATIONS = {
 # ``sm103_t1`` schedule variant applies at T=1 and composes with the
 # world-size-4 shape specializations (serial clear at BF16/T1/E8/no-PDL).
 _EXTRA_SPECIALIZATIONS = {
-    ("sm_100a", 2): frozenset({_WIDE, f"{_WIDE}_{union.SPECIALIZATION_CTA1}", "pipe2_u4", "pipe2_u4_b5"}),
+    ("sm_100a", 2): frozenset(
+        {_WIDE, f"{_WIDE}_{union.SPECIALIZATION_CTA1}", "pipe2_u4", "pipe2_u4_b5"}
+    ),
     ("sm_100a", 4): {key[4] for key in _SM100_WS4_ROUTE_KEYS}
     - {union.SPECIALIZATION_GENERIC},
     ("sm_100a", 8): frozenset({union.SPECIALIZATION_SM100_WS8_MID, "pipe1_u4_b5"}),
@@ -103,7 +105,13 @@ _EXTRA_SPECIALIZATIONS = {
         }
     ),
     ("sm_103a", 8): frozenset(
-        {union.SPECIALIZATION_SM103_T1, union.SPECIALIZATION_SM103_WS8_MID, "pipe1_u4_b5", "push_g", "pipe1"}
+        {
+            union.SPECIALIZATION_SM103_T1,
+            union.SPECIALIZATION_SM103_WS8_MID,
+            "pipe1_u4_b5",
+            "push_g",
+            "pipe1",
+        }
     ),
 }
 
@@ -305,14 +313,14 @@ def test_routes_cover_exactly_the_reviewed_specializations() -> None:
         ("sm_100a", 4, "bfloat16", False, 128, 16, "clrfirst"),
         ("sm_100a", 4, "bfloat16", False, 128, 8, union.SPECIALIZATION_GENERIC),
         ("sm_100a", 4, "bfloat16", False, 512, 8, union.SPECIALIZATION_GENERIC),
-        ("sm_100a", 4, "bfloat16", True, 2048, 12, union.SPECIALIZATION_GENERIC),
+        ("sm_100a", 4, "bfloat16", True, 2048, 12, "pipe2_u4_b5"),
         # The world-size-4 reviewed shapes do not leak into other world sizes;
         # every SM100 two-rank class runs wide_mlp (no generic program) and the
         # bfloat16 no-PDL T=1 row runs its single-CTA wide_mlp build.
         ("sm_100a", 2, "bfloat16", False, 1, 8, f"{_WIDE}_{union.SPECIALIZATION_CTA1}"),
         ("sm_100a", 2, "float16", False, 64, 12, _WIDE),
         ("sm_100a", 2, "float16", True, 128, 16, _WIDE),
-        ("sm_100a", 2, "bfloat16", True, 2048, 12, _WIDE),
+        ("sm_100a", 2, "bfloat16", True, 2048, 12, "pipe2_u4_b5"),
         ("sm_100a", 2, "bfloat16", True, 512, 8, _WIDE),
         ("sm_100a", 8, "bfloat16", False, 1, 8, union.SPECIALIZATION_GENERIC),
         ("sm_100a", 8, "float16", True, 1, 8, union.SPECIALIZATION_GENERIC),
