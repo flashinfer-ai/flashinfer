@@ -166,6 +166,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "stages": 5,
+            "epi_chunk": 16,
         },
         "17,28,1": {
             "route": "decode",
@@ -199,6 +201,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "stages": 5,
+            "epi_chunk": 16,
         },
         "18,6,1": {
             "route": "decode",
@@ -289,6 +293,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "pf": 2,
         },
         "48,28,256": {
             "route": "decode",
@@ -297,6 +302,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "pf": 3,
+            "mc": 2,
         },
         "50,28,1": {
             "route": "decode",
@@ -323,6 +330,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "pf": 2,
         },
         "50,28,256": {
             "route": "decode",
@@ -331,6 +339,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "pf": 3,
+            "mc": 2,
         },
         "56,6,1": {
             "route": "decode",
@@ -396,6 +406,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "pf": 3,
+            "mc": 2,
         },
         "96,1,1": {
             "route": "decode",
@@ -453,7 +465,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
         },
-        "96,28,256": {"route": "gemm"},
+        "96,28,256": {"route": "gemm", "gemm_pf": 2},
         "144,6,1": {
             "route": "decode",
             "tok": 16,
@@ -574,6 +586,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "resident": False,
             "xb_stages": "auto",
             "qlanes": 4,
+            "pf": 4,
         },
     },
     "sm_103a": {
@@ -710,6 +723,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "stages": 5,
+            "epi_chunk": 16,
         },
         "17,28,1": {
             "route": "decode",
@@ -743,6 +758,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "stages": 5,
+            "epi_chunk": 16,
         },
         "18,6,1": {
             "route": "decode",
@@ -833,6 +850,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "pf": 2,
         },
         "48,28,256": {
             "route": "decode",
@@ -841,6 +859,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "pf": 3,
+            "mc": 2,
         },
         "50,28,1": {
             "route": "decode",
@@ -867,6 +887,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "pf": 2,
         },
         "50,28,256": {
             "route": "decode",
@@ -875,6 +896,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "pf": 3,
+            "mc": 2,
         },
         "56,6,1": {
             "route": "decode",
@@ -940,6 +963,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "pf": 3,
+            "mc": 2,
         },
         "96,1,1": {
             "route": "decode",
@@ -997,7 +1022,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
         },
-        "96,28,256": {"route": "gemm"},
+        "96,28,256": {"route": "gemm", "gemm_pf": 2},
         "144,6,1": {
             "route": "decode",
             "tok": 16,
@@ -1118,6 +1143,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "resident": False,
             "xb_stages": "auto",
             "qlanes": 4,
+            "pf": 4,
         },
     },
 }
