@@ -14,6 +14,24 @@ or fp8/NVFP4 KV. A sink at ``q_len_per_req == 1`` is served when the cuDNN
 stack's SDPA engines accept it (cudnn-frontend 1.30+ with the FROST engines
 enabled); the backend engine raises a not-supported error at the first run.
 
+cuDNN's FROST (CuTe-DSL) SDPA engines are opt-in in cudnn-frontend and are what
+make cuDNN decode fast on Blackwell (the d128 / d256 decode tiles, multi-token
+rows, sinks at ``q_len_per_req == 1``). Set ``FLASHINFER_CUDNN_FROST_ENGINES=1``
+before importing flashinfer to switch them on for the process (FlashInfer forwards
+it to the frontend's ``CUDNN_FRONTEND_ENABLE_FROST_ENGINES`` before its first
+``import cudnn``; cudnn-frontend 1.30.0+). With the engines on, the decode
+wrapper's ``backend="auto"`` resolves to ``cudnn`` on SM100 for the d128 decode
+shapes where the decode tile measures at or ahead of fa2; ``FLASHINFER_DECODE_AUTO_CUDNN``
+overrides that choice.
+
+Compatible decode runs and replans retain the prepared cuDNN graph. Planning
+still stages changing KV lengths and, unless the caller supplies a dense GPU
+``block_tables``, constructs that table from CSR metadata. CUDA Graph replay
+does not include this host planning work. ``fast_decode_plan`` uses the regular
+cuDNN planner for these updates; its FA2/FA3 copy-elision does not apply to
+cuDNN. ``workspace_size`` currently raises for both explicit and auto-selected
+cuDNN, rather than returning another backend's workspace requirements.
+
 .. currentmodule:: flashinfer.cudnn
 
 .. autosummary::

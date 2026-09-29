@@ -1078,7 +1078,7 @@ def testBatchDecodeWithPagedKVCacheWrapper(args):
                 # run-time q_len_per_req only validates against it).
                 q_len_per_req=s_qo,
             )
-            resolved_backends[backend] = backend_wrappers[backend]._backend
+            resolved_backends[backend] = backend_wrappers[backend].resolved_backend
         else:
             resolved_backends[backend] = backend
 
