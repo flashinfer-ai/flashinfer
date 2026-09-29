@@ -464,7 +464,8 @@ def bind_stage(
     grid_values = dict(zip(("grid_x", "grid_y", "grid_z"), grid, strict=True))
     arguments = []
     for kind, name in physical["arg_plan"]:
-        key = CONTRACT_ALIASES.get(name, name)
+        # A profile may provide the kernel's own name (seed profile) or the contract name behind an alias.
+        key = name if name in values else CONTRACT_ALIASES.get(name, name)
         if kind == "grid":
             arguments.append(grid_values[name])
         elif key in values and values[key] is not None:  # buffer / tma_buffer / workspace / parameter
