@@ -320,7 +320,20 @@ def decode_module_stages(
 # B200 / B300; mirrors the source repository's table.
 DECODE_MAX_ACTIVE_CLUSTERS: dict[str, dict[int, int]] = {
     # 9..16 = non-portable clusters (round 6, lever C16), measured on the t16 fused small-inbox instance on both GPUs
-    "sm_100a": {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 7: 15, 8: 15, 9: 15, 10: 11, 12: 7, 14: 7, 16: 7},  # B200, 148 SMs
+    "sm_100a": {
+        2: 74,
+        3: 45,
+        4: 33,
+        5: 26,
+        6: 22,
+        7: 15,
+        8: 15,
+        9: 15,
+        10: 11,
+        12: 7,
+        14: 7,
+        16: 7,
+    },  # B200, 148 SMs
     "sm_103a": {
         2: 74,
         3: 45,
@@ -457,7 +470,10 @@ class DecodeConfig:
             epi_chunk=self.epi_chunk,
             pf=self.pf,
             mc=self.mc,
-            tstore=bool(tma_store) and self.tstore and self.split == 1 and self.csplit == 1,
+            tstore=bool(tma_store)
+            and self.tstore
+            and self.split == 1
+            and self.csplit == 1,
         )
 
 
@@ -1037,7 +1053,10 @@ def route_plan(
         key = cfg.kernel_key_for(bool(decode_tma_store))
         dec_ts = key != cfg.kernel_key
         if dec_ts and not route_available(arch, (key,)):
-            key, dec_ts = cfg.kernel_key, False  # the TMA-store program is not registered for this arch: register epilogue
+            key, dec_ts = (
+                cfg.kernel_key,
+                False,
+            )  # the TMA-store program is not registered for this arch: register epilogue
         kernels.append(key)
         grids.append(cfg.grid)
     return ProjectionPlan(
@@ -1327,7 +1346,9 @@ def prepare_kimi_k3_fp8_projection(
                         # clipped by the unit); the register-epilogue programs receive a placeholder map they never access.
                         OUT=out
                         if plan.decode_tma_store
-                        else torch.zeros((32, 128), dtype=torch.bfloat16, device=device),
+                        else torch.zeros(
+                            (32, 128), dtype=torch.bfloat16, device=device
+                        ),
                         grid=(plan.grids[stage], 1, 1),
                     ),
                 )

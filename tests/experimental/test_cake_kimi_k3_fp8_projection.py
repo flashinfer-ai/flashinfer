@@ -389,18 +389,33 @@ def test_decode_config_round6_continuation_rules(arch):
             assert cfg.kernel_key_for(True) == cfg.kernel_key + "_tso"
         assert cfg.kernel_key_for(False) == cfg.kernel_key
     assert n_tstore == 17
-    cfg = decode_config(256, 56, 6, arch, SM_COUNT)  # tp8 o_proj M = 256: 1.07x on both GPUs
+    cfg = decode_config(
+        256, 56, 6, arch, SM_COUNT
+    )  # tp8 o_proj M = 256: 1.07x on both GPUs
     assert cfg.tstore and cfg.kernel_key_for(True) == "decode:t128_p3_tso"
     # Lever C16: the M <= 64 rows that used a 12-28-way global split-K now run one cluster per output tile (14 CTAs = two
     # 256-K stages each; non-portable cluster), the 12-tile family a 7-CTA cluster (12 clusters <= capacity 15) and the
     # 17-tile family a 4-CTA cluster; the grid is whole clusters within the measured co-resident capacity.
-    for (M, n_tiles, c, clusters) in ((1, 1, 14, 1), (64, 1, 14, 4), (1, 5, 14, 5), (1, 12, 7, 12), (1, 17, 4, 17)):
+    for M, n_tiles, c, clusters in (
+        (1, 1, 14, 1),
+        (64, 1, 14, 4),
+        (1, 5, 14, 5),
+        (1, 12, 7, 12),
+        (1, 17, 4, 17),
+    ):
         cfg = decode_config(M, n_tiles, 28, arch, SM_COUNT)
-        assert (cfg.tok, cfg.split, cfg.csplit, cfg.fused) == (16, c, c, True), (M, n_tiles, cfg)
+        assert (cfg.tok, cfg.split, cfg.csplit, cfg.fused) == (16, c, c, True), (
+            M,
+            n_tiles,
+            cfg,
+        )
         assert clusters <= cb.decode_cluster_capacity(arch, c)
         assert cfg.grid == c * clusters and cfg.total_work == cfg.grid
         assert f"_cs{c}" in cfg.kernel_key and not cfg.tstore
-    assert cb.decode_cluster_capacity(arch, 14) == 7 and cb.decode_cluster_capacity(arch, 9) == 15
+    assert (
+        cb.decode_cluster_capacity(arch, 14) == 7
+        and cb.decode_cluster_capacity(arch, 9) == 15
+    )
 
 
 def test_decode_module_stage_clamp():
