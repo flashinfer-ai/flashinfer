@@ -286,6 +286,39 @@ def test_decode_matches_reference(num_householder, T, head_size, num_heads):
     )
 
 
+@pytest.mark.parametrize("batch_size", [1, 16])
+def test_decode_strided_pool_resize_matches_reference(batch_size):
+    """Profiling and serving pools can share strides but have different sizes."""
+    _skip_if_unsupported()
+    device, dtype = torch.device("cuda"), torch.bfloat16
+    q, k, v, A_log, a, dt_bias, b, pool, idx, _ = _gen_decode_inputs(
+        batch_size, 1, 3, 12, 12, 128, 64, dtype, device, seed=1
+    )
+    for pool_size in (pool.shape[0], pool.shape[0] + 7):
+        backing = torch.randn(pool_size, 13, 64, 128, device=device)
+        state = backing[:, :12]
+        state[: pool.shape[0]].copy_(pool)
+        expected = backing.clone()
+        ref_o, ref_state = _reference(q, k, v, A_log, a, dt_bias, b, state, idx)
+        expected[idx.long(), :12] = ref_state.transpose(-1, -2)
+
+        out, _ = gated_delta_product_mtp(
+            q,
+            k,
+            v,
+            state,
+            idx,
+            A_log,
+            a,
+            dt_bias,
+            b,
+            scale=1.0,
+            disable_state_update=False,
+        )
+        torch.testing.assert_close(out, ref_o.to(dtype), atol=1e-2, rtol=5e-3)
+        torch.testing.assert_close(backing, expected, atol=1e-2, rtol=5e-3)
+
+
 # --------------------------------------------------------------------------
 # 4. Batch rows must not contaminate one another.
 #
