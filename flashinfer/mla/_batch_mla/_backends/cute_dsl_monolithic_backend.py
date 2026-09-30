@@ -106,6 +106,7 @@ class _BatchMLAPagedAttentionCuteDslMonolithicBackend(
                     f"split-KV reducer: {error}"
                 ) from error
         compiled_kernel = implementation._get_compiled_mla_kernel(
+            implementation.get_current_arch(device),
             q_data_type,
             out_dtype,
             page_size,

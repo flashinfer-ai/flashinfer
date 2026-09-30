@@ -1138,6 +1138,97 @@ def test_mla_reducer_d_tile_selection():
     assert _get_reducer_d_tiles(148, 8, 96, 148, 32) == 1
 
 
+@pytest.mark.parametrize("native_sm107", [False, True])
+@pytest.mark.parametrize("device_index", [None, 0, 1])
+def test_mla_launch_arch_resolution(monkeypatch, native_sm107, device_index):
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+
+    from flashinfer.cute_dsl import availability
+    from flashinfer.cute_dsl.attention import compat
+
+    # The current device is SM107, but query tensors can live on SM100.
+    def capability(device):
+        return (10, 0) if device.index == 0 else (10, 7)
+
+    monkeypatch.setattr(compat, "get_compute_capability", capability)
+    monkeypatch.setattr(
+        availability,
+        "is_cute_dsl_arch_supported",
+        lambda major, minor, native_only=False: (
+            minor != 7 or not native_only or native_sm107
+        ),
+    )
+    device = None if device_index is None else torch.device("cuda", device_index)
+    expected = "sm_107" if device_index != 0 and native_sm107 else "sm_100"
+    assert compat.get_current_arch(device) == expected
+
+
+@pytest.mark.parametrize(
+    "arch, expected_stages", [("sm_100", (3, 2)), ("sm_107", (4, 4))]
+)
+def test_mla_fp8_load_stages_use_launch_arch(arch, expected_stages):
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode_fp8 import (
+        BlackwellMultiHeadLatentAttentionForwardFP8,
+    )
+
+    kernel = BlackwellMultiHeadLatentAttentionForwardFP8.__new__(
+        BlackwellMultiHeadLatentAttentionForwardFP8
+    )
+    kernel.arch = arch
+    kernel.mma_qk_tiler = (128, 128)
+    kernel.warps_in_n = 2
+    kernel.latent_dim = 512
+    kernel._setup_attributes()
+    assert (kernel.load_k_stage, kernel.load_v_stage) == expected_stages
+
+
+def test_mla_fp8_compile_cache_separates_launch_arch(monkeypatch):
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+
+    from unittest.mock import MagicMock
+    from flashinfer.cute_dsl.attention.monolithic import mla_decode
+
+    kernel_cls = MagicMock(side_effect=lambda **kwargs: kwargs)
+    fake_cute = MagicMock()
+    fake_cute.compile.side_effect = lambda kernel, *args, **kwargs: kernel
+    monkeypatch.setattr(mla_decode, "cute", fake_cute)
+    monkeypatch.setattr(
+        mla_decode, "BlackwellMultiHeadLatentAttentionForwardFP8", kernel_cls
+    )
+    monkeypatch.setattr(mla_decode, "get_max_active_clusters", lambda _: 1)
+    monkeypatch.setattr(mla_decode, "Int32", int)
+    monkeypatch.setattr(mla_decode, "Float32", float)
+    compile_kernel = mla_decode._get_compiled_mla_kernel
+    compile_kernel.cache_clear()
+    kwargs = dict(
+        torch_dtype=torch.float8_e4m3fn,
+        torch_out_dtype=torch.bfloat16,
+        page_size=64,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        num_heads=128,
+        seq_len_q=1,
+        is_persistent=True,
+        is_var_seq=False,
+        is_var_q=False,
+        is_var_split_kv=False,
+    )
+    try:
+        sm107 = compile_kernel(arch="sm_107", **kwargs)
+        sm100 = compile_kernel(arch="sm_100", **kwargs)
+        assert (sm107["arch"], sm100["arch"]) == ("sm_107", "sm_100")
+        assert compile_kernel(arch="sm_107", **kwargs) is sm107
+        assert compile_kernel(arch="sm_100", **kwargs) is sm100
+        assert fake_cute.compile.call_count == 2
+    finally:
+        compile_kernel.cache_clear()
+
+
 def test_mla_reducer_direct_class_capacity_defaults():
     """Direct class users keep the generic capacity unless opting into a cap."""
     if not is_cute_dsl_available():
