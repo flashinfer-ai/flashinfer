@@ -43,16 +43,73 @@ def _ceil_div(numerator: int, denominator: int) -> int:
     return -(-numerator // denominator)
 
 
+def _global_position(
+    local_key: int,
+    cp_world: int,
+    cp_rank: int,
+    cp_interleave_granularity: int = 1,
+) -> int:
+    """Map one rank-local key coordinate to its block-cyclic global index."""
+    local_block, block_offset = divmod(local_key, cp_interleave_granularity)
+    return (local_block * cp_world + cp_rank) * cp_interleave_granularity + block_offset
+
+
+def _local_prefix_length(
+    global_bound: int,
+    cp_world: int,
+    cp_rank: int,
+    cp_interleave_granularity: int = 1,
+) -> int:
+    """Count rank-owned global positions strictly below ``global_bound``."""
+    if global_bound <= 0:
+        return 0
+    global_cycle = cp_world * cp_interleave_granularity
+    full_cycles, cycle_remainder = divmod(global_bound, global_cycle)
+    rank_remainder = min(
+        max(cycle_remainder - cp_rank * cp_interleave_granularity, 0),
+        cp_interleave_granularity,
+    )
+    return full_cycles * cp_interleave_granularity + rank_remainder
+
+
+def _rank_global_positions(
+    global_length: int,
+    cp_world: int,
+    cp_rank: int,
+    cp_interleave_granularity: int = 1,
+) -> list[int]:
+    """Return the ordered global positions physically stored by one rank."""
+    return [
+        _global_position(
+            local_key,
+            cp_world,
+            cp_rank,
+            cp_interleave_granularity,
+        )
+        for local_key in range(
+            _local_prefix_length(
+                global_length,
+                cp_world,
+                cp_rank,
+                cp_interleave_granularity,
+            )
+        )
+    ]
+
+
 def _local_causal_bound(
     global_bound_newest: int,
     q_len: int,
     q_idx: int,
     cp_world: int,
     cp_rank: int,
+    cp_interleave_granularity: int = 1,
 ) -> int:
-    return _ceil_div(
-        global_bound_newest - cp_rank - (q_len - 1) + q_idx,
+    return _local_prefix_length(
+        global_bound_newest - (q_len - 1) + q_idx,
         cp_world,
+        cp_rank,
+        cp_interleave_granularity,
     )
 
 
@@ -64,14 +121,29 @@ def _flat_dcp_score_is_valid(
     global_bound_newest: int,
     cp_world: int,
     cp_rank: int,
+    cp_interleave_granularity: int = 1,
 ) -> bool:
-    return flat_q_row >= num_heads * (
-        cp_world * local_key + cp_rank - global_bound_newest + q_len
+    global_key = _global_position(
+        local_key,
+        cp_world,
+        cp_rank,
+        cp_interleave_granularity,
     )
+    return flat_q_row >= num_heads * (global_key - global_bound_newest + q_len)
 
 
-def _local_length(global_length: int, cp_world: int, cp_rank: int) -> int:
-    return max(_ceil_div(global_length - cp_rank, cp_world), 0)
+def _local_length(
+    global_length: int,
+    cp_world: int,
+    cp_rank: int,
+    cp_interleave_granularity: int = 1,
+) -> int:
+    return _local_prefix_length(
+        global_length,
+        cp_world,
+        cp_rank,
+        cp_interleave_granularity,
+    )
 
 
 def _make_inputs(
@@ -131,12 +203,19 @@ def _pack_cyclic_rank_pages(
     global_lens: torch.Tensor,
     cp_world: int,
     cp_rank: int,
+    cp_interleave_granularity: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-    """Pack ``g % cp_world == cp_rank`` tokens into a contiguous paged cache."""
+    """Pack one block-cyclic rank into a contiguous paged cache."""
     batch_size, _, d_qk = global_kv.shape
     global_lens_host = global_lens.tolist()
     local_lens_host = [
-        _local_length(global_len, cp_world, cp_rank) for global_len in global_lens_host
+        _local_length(
+            global_len,
+            cp_world,
+            cp_rank,
+            cp_interleave_granularity,
+        )
+        for global_len in global_lens_host
     ]
     pages_per_batch = [
         max(1, _ceil_div(local_len, _PAGE_SIZE)) for local_len in local_lens_host
@@ -175,7 +254,17 @@ def _pack_cyclic_rank_pages(
         )
         block_tables[batch_idx, :num_pages] = page_ids
         if local_len:
-            local_tokens = global_kv[batch_idx, cp_rank:global_len:cp_world]
+            global_positions = torch.tensor(
+                _rank_global_positions(
+                    global_len,
+                    cp_world,
+                    cp_rank,
+                    cp_interleave_granularity,
+                ),
+                dtype=torch.long,
+                device=global_kv.device,
+            )
+            local_tokens = global_kv[batch_idx].index_select(0, global_positions)
             local_cache[next_page : next_page + num_pages].view(-1, d_qk)[
                 :local_len
             ].copy_(local_tokens)
@@ -199,8 +288,9 @@ def _reference_attention(
     *,
     cp_world: int = 1,
     cp_rank: int = 0,
+    cp_interleave_granularity: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference one cyclic rank; world=1 is the full-context reference."""
+    """Reference one block-cyclic rank; world=1 is the full-context reference."""
     batch_size, q_len, num_heads, _ = query.shape
     out = torch.zeros(
         batch_size,
@@ -219,12 +309,22 @@ def _reference_attention(
     softmax_scale = 1.0 / math.sqrt(_LATENT_DIM)
 
     for batch_idx, global_len in enumerate(global_lens.tolist()):
-        keys = global_kv[batch_idx, cp_rank:global_len:cp_world].float()
-        global_positions = range(cp_rank, global_len, cp_world)
+        global_positions = _rank_global_positions(
+            global_len,
+            cp_world,
+            cp_rank,
+            cp_interleave_granularity,
+        )
+        position_indices = torch.tensor(
+            global_positions,
+            dtype=torch.long,
+            device=global_kv.device,
+        )
+        keys = global_kv[batch_idx].index_select(0, position_indices).float()
         for q_idx in range(q_len):
             global_bound = global_len - (q_len - 1) + q_idx
             # Count directly in global coordinates so this reference remains
-            # independent of the ceiling-divided kernel formula without
+            # independent of the block-cyclic local-prefix formula without
             # synchronizing on a CUDA predicate.
             visible_count = bisect_left(global_positions, global_bound)
             if visible_count == 0:
@@ -310,6 +410,7 @@ def _prepare_rank_call(
     *,
     cp_world: int,
     cp_rank: int,
+    cp_interleave_granularity: int = 1,
     is_var_seq: bool = False,
     enable_pdl: bool = False,
 ) -> tuple[dict, int]:
@@ -319,7 +420,11 @@ def _prepare_rank_call(
     from flashinfer.cute_dsl.utils import get_num_sm
 
     kv_cache, block_tables, local_lens, max_local_len = _pack_cyclic_rank_pages(
-        global_kv, global_lens, cp_world, cp_rank
+        global_kv,
+        global_lens,
+        cp_world,
+        cp_rank,
+        cp_interleave_granularity,
     )
     batch_size, q_len, num_heads, _ = query.shape
     split_kv, workspace_size = _get_split_kv_and_workspace_size(
@@ -359,6 +464,7 @@ def _launch_rank(
     cp_world: int,
     cp_rank: int,
     enable_dcp: bool,
+    cp_interleave_granularity: int = 1,
     causal_lens: torch.Tensor | None = None,
     is_var_seq: bool = False,
     enable_pdl: bool = False,
@@ -373,6 +479,7 @@ def _launch_rank(
         global_lens,
         cp_world=cp_world,
         cp_rank=cp_rank,
+        cp_interleave_granularity=cp_interleave_granularity,
         is_var_seq=is_var_seq,
         enable_pdl=enable_pdl,
     )
@@ -382,6 +489,7 @@ def _launch_rank(
             "enable_dcp": True,
             "cp_world": cp_world,
             "cp_rank": cp_rank,
+            "cp_interleave_granularity": cp_interleave_granularity,
             "causal_seqlens_kv_global": (
                 global_lens if causal_lens is None else causal_lens
             ),
@@ -472,6 +580,7 @@ def _assert_dcp_rank_merge_matches_reference(
     *,
     cp_world: int,
     dtype: torch.dtype,
+    cp_interleave_granularity: int = 1,
     is_var_seq: bool = False,
 ) -> list[int]:
     """Check every rank-local state and their final natural-log merge."""
@@ -486,6 +595,7 @@ def _assert_dcp_rank_merge_matches_reference(
             cp_world=cp_world,
             cp_rank=cp_rank,
             enable_dcp=True,
+            cp_interleave_granularity=cp_interleave_granularity,
             is_var_seq=is_var_seq,
         )
         ref_rank_out, ref_rank_lse = _reference_attention(
@@ -494,6 +604,7 @@ def _assert_dcp_rank_merge_matches_reference(
             global_lens,
             cp_world=cp_world,
             cp_rank=cp_rank,
+            cp_interleave_granularity=cp_interleave_granularity,
         )
         _assert_close_to_reference(out, lse, ref_rank_out, ref_rank_lse, dtype)
         rank_outputs.append(out)
@@ -551,34 +662,156 @@ def _assert_variable_q_dcp_rank_merge_matches_reference(
     return split_kvs
 
 
-def test_dcp_flat_mask_matches_ceiling_divided_bound():
-    """The division-free flattened predicate must match global coordinates."""
+def test_dcp_block_cyclic_granularity_three_layout_and_prefix_bounds():
+    """Pin the requested W2/G3 ownership layout and its causal boundaries."""
+    assert _rank_global_positions(12, 2, 0, 3) == [0, 1, 2, 6, 7, 8]
+    assert _rank_global_positions(12, 2, 1, 3) == [3, 4, 5, 9, 10, 11]
+
+    # Every prefix is partitioned exactly once, including partial rank chunks.
+    for global_length in range(20):
+        rank_positions = [
+            _rank_global_positions(global_length, 2, cp_rank, 3) for cp_rank in range(2)
+        ]
+        assert sorted(rank_positions[0] + rank_positions[1]) == list(
+            range(global_length)
+        )
+        for cp_rank, positions in enumerate(rank_positions):
+            assert len(positions) == _local_length(global_length, 2, cp_rank, 3)
+
+    # At global bound 12 with Sq=4, rank zero owns the complete earlier chunk,
+    # while the newest four-token causal tail enters rank one's final chunk.
+    assert [_local_causal_bound(12, 4, q_idx, 2, 0, 3) for q_idx in range(4)] == [
+        6,
+        6,
+        6,
+        6,
+    ]
+    assert [_local_causal_bound(12, 4, q_idx, 2, 1, 3) for q_idx in range(4)] == [
+        3,
+        4,
+        5,
+        6,
+    ]
+
+    # Exercise partial page and K-tile boundaries on different ranks.
+    assert [
+        [_local_length(global_length, 2, cp_rank, 3) for cp_rank in range(2)]
+        for global_length in (126, 127, 128, 130, 131, 132)
+    ] == [
+        [63, 63],
+        [64, 63],
+        [65, 63],
+        [66, 64],
+        [66, 65],
+        [66, 66],
+    ]
+    assert [
+        [_local_length(global_length, 2, cp_rank, 3) for cp_rank in range(2)]
+        for global_length in (252, 253, 254, 256, 257, 258)
+    ] == [
+        [126, 126],
+        [127, 126],
+        [128, 126],
+        [129, 127],
+        [129, 128],
+        [129, 129],
+    ]
+
+
+@pytest.mark.parametrize("bad_granularity", [0, -1, True, 1.5])
+def test_dcp_dispatch_rejects_invalid_interleave_granularity(bad_granularity):
+    """Layout validation is host-only and must reject bools as integers."""
+    from flashinfer.cute_dsl.attention.mla_dispatch import _resolve_impl
+
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        _resolve_impl(
+            requested="auto",
+            kwargs={
+                "enable_dcp": True,
+                "cp_world": 2,
+                "cp_rank": 0,
+                "cp_interleave_granularity": bad_granularity,
+            },
+        )
+
+
+def test_dcp_dispatch_requires_enable_for_nondefault_interleave_granularity():
+    from flashinfer.cute_dsl.attention.mla_dispatch import _resolve_impl
+
+    with pytest.raises(ValueError, match="DCP arguments require enable_dcp=True"):
+        _resolve_impl(
+            requested="auto",
+            kwargs={"cp_interleave_granularity": 3},
+        )
+    assert (
+        _resolve_impl(
+            requested="auto",
+            kwargs={
+                "enable_dcp": True,
+                "cp_world": 2,
+                "cp_rank": 0,
+                "cp_interleave_granularity": 3,
+            },
+        )
+        == "monolithic"
+    )
+
+
+def test_dcp_flat_mask_matches_block_cyclic_local_bound():
+    """The flattened predicate must match block-cyclic global coordinates."""
     for num_heads in (6, 12, 24, 48, 64, 96, 128):
         for q_len in (1, 2, 4, 8):
             for cp_world in (1, 2, 4):
-                for cp_rank in range(cp_world):
-                    for global_len in (q_len, q_len + 1, 127, 128, 129):
-                        local_len = _local_length(global_len, cp_world, cp_rank)
-                        for q_idx in range(q_len):
-                            for local_key in range(local_len):
-                                expected = (
-                                    local_key * cp_world + cp_rank
-                                    < global_len - (q_len - 1) + q_idx
-                                )
-                                for head in (0, num_heads - 1):
-                                    flat_q_row = q_idx * num_heads + head
-                                    assert (
-                                        _flat_dcp_score_is_valid(
-                                            flat_q_row,
-                                            num_heads,
+                for cp_interleave_granularity in (1, 3, 7):
+                    global_lengths = sorted(
+                        {
+                            q_len,
+                            q_len + 1,
+                            cp_interleave_granularity - 1,
+                            cp_interleave_granularity,
+                            cp_interleave_granularity + 1,
+                            cp_world * cp_interleave_granularity - 1,
+                            cp_world * cp_interleave_granularity,
+                            cp_world * cp_interleave_granularity + 1,
+                            127,
+                            128,
+                            129,
+                        }
+                    )
+                    for cp_rank in range(cp_world):
+                        for global_len in global_lengths:
+                            local_len = _local_length(
+                                global_len,
+                                cp_world,
+                                cp_rank,
+                                cp_interleave_granularity,
+                            )
+                            for q_idx in range(q_len):
+                                for local_key in range(local_len):
+                                    expected = (
+                                        _global_position(
                                             local_key,
-                                            q_len,
-                                            global_len,
                                             cp_world,
                                             cp_rank,
+                                            cp_interleave_granularity,
                                         )
-                                        == expected
+                                        < global_len - (q_len - 1) + q_idx
                                     )
+                                    for head in (0, num_heads - 1):
+                                        flat_q_row = q_idx * num_heads + head
+                                        assert (
+                                            _flat_dcp_score_is_valid(
+                                                flat_q_row,
+                                                num_heads,
+                                                local_key,
+                                                q_len,
+                                                global_len,
+                                                cp_world,
+                                                cp_rank,
+                                                cp_interleave_granularity,
+                                            )
+                                            == expected
+                                        )
 
 
 def test_dcp_per_query_tile_dense_boundary_is_conservative():
@@ -588,39 +821,51 @@ def test_dcp_per_query_tile_dense_boundary_is_conservative():
         for q_len in (2, 4, 8, 32):
             num_q_tiles = _ceil_div(q_len * num_heads, 128)
             for cp_world in (1, 2, 4):
-                for cp_rank in range(cp_world):
-                    global_len = max(q_len, 277)
-                    local_len = _local_length(global_len, cp_world, cp_rank)
-                    global_positions = range(cp_rank, global_len, cp_world)
-                    for q_tile_idx in range(num_q_tiles):
-                        first_flat_row = q_tile_idx * 128
-                        first_q = first_flat_row // num_heads
-                        earliest_bound = bisect_left(
-                            global_positions,
-                            global_len - (q_len - 1) + first_q,
+                for cp_interleave_granularity in (1, 3, 7):
+                    for cp_rank in range(cp_world):
+                        global_len = max(q_len, 277)
+                        local_len = _local_length(
+                            global_len,
+                            cp_world,
+                            cp_rank,
+                            cp_interleave_granularity,
                         )
-                        effective_bound = min(max(earliest_bound, 0), local_len)
-                        first_mask_k_tile = effective_bound // k_tile
-                        for k_tile_idx in range(first_mask_k_tile):
-                            local_begin = k_tile_idx * k_tile
-                            local_end = min(local_begin + k_tile, local_len)
-                            for flat_q_row in range(
-                                first_flat_row,
-                                min(
-                                    first_flat_row + 128,
-                                    q_len * num_heads,
-                                ),
-                            ):
-                                for local_key in range(local_begin, local_end):
-                                    assert _flat_dcp_score_is_valid(
-                                        flat_q_row,
-                                        num_heads,
-                                        local_key,
-                                        q_len,
-                                        global_len,
-                                        cp_world,
-                                        cp_rank,
-                                    )
+                        global_positions = _rank_global_positions(
+                            global_len,
+                            cp_world,
+                            cp_rank,
+                            cp_interleave_granularity,
+                        )
+                        for q_tile_idx in range(num_q_tiles):
+                            first_flat_row = q_tile_idx * 128
+                            first_q = first_flat_row // num_heads
+                            earliest_bound = bisect_left(
+                                global_positions,
+                                global_len - (q_len - 1) + first_q,
+                            )
+                            effective_bound = min(max(earliest_bound, 0), local_len)
+                            first_mask_k_tile = effective_bound // k_tile
+                            for k_tile_idx in range(first_mask_k_tile):
+                                local_begin = k_tile_idx * k_tile
+                                local_end = min(local_begin + k_tile, local_len)
+                                for flat_q_row in range(
+                                    first_flat_row,
+                                    min(
+                                        first_flat_row + 128,
+                                        q_len * num_heads,
+                                    ),
+                                ):
+                                    for local_key in range(local_begin, local_end):
+                                        assert _flat_dcp_score_is_valid(
+                                            flat_q_row,
+                                            num_heads,
+                                            local_key,
+                                            q_len,
+                                            global_len,
+                                            cp_world,
+                                            cp_rank,
+                                            cp_interleave_granularity,
+                                        )
 
 
 def test_cute_dsl_mla_dcp_rejects_incomplete_static_contract():
@@ -684,6 +929,14 @@ def test_cute_dsl_mla_dcp_rejects_incomplete_static_contract():
         )
     with pytest.raises(ValueError, match="require enable_dcp=True"):
         cute_dsl_mla_decode(**call_args, cp_world=2)
+    with pytest.raises(ValueError, match="require enable_dcp=True"):
+        cute_dsl_mla_decode(**call_args, cp_interleave_granularity=3)
+    for bad_granularity in (0, -1, True, 1.5):
+        with pytest.raises(ValueError, match="must be a positive integer"):
+            cute_dsl_mla_decode(
+                **call_args,
+                cp_interleave_granularity=bad_granularity,
+            )
 
 
 def test_cute_dsl_mla_dcp_dispatch_is_strictly_monolithic():
@@ -696,7 +949,12 @@ def test_cute_dsl_mla_dcp_dispatch_is_strictly_monolithic():
     assert (
         _resolve_impl(
             requested="auto",
-            kwargs={"enable_dcp": True, "cp_world": 2, "cp_rank": 0},
+            kwargs={
+                "enable_dcp": True,
+                "cp_world": 2,
+                "cp_rank": 0,
+                "cp_interleave_granularity": 3,
+            },
         )
         == "monolithic"
     )
@@ -937,7 +1195,14 @@ def test_cute_dsl_mla_variable_q_dcp_public_api():
     _assert_close_to_reference(out, lse, ref_out, ref_lse, torch.bfloat16)
 
 
-def test_cute_dsl_mla_dcp_public_api_autotune_profiles_causal_tensor():
+@pytest.mark.parametrize(
+    "cp_interleave_granularity",
+    [1, 3],
+    ids=["token-interleave", "block3-interleave"],
+)
+def test_cute_dsl_mla_dcp_public_api_autotune_profiles_causal_tensor(
+    cp_interleave_granularity,
+):
     """The public runner must batch-sweep DCP metadata and return caller B1."""
     _skip_if_unsupported()
     from flashinfer import autotune
@@ -950,7 +1215,7 @@ def test_cute_dsl_mla_dcp_public_api_autotune_profiles_causal_tensor():
     query, global_kv, global_lens = _make_inputs(
         # Two local pages satisfy the common public dispatcher's aligned
         # block-table contract for page_size=64.
-        global_length=256,
+        global_length=252,
         q_len=4,
         num_heads=96,
         dtype=torch.bfloat16,
@@ -961,6 +1226,7 @@ def test_cute_dsl_mla_dcp_public_api_autotune_profiles_causal_tensor():
         global_lens,
         cp_world=2,
         cp_rank=0,
+        cp_interleave_granularity=cp_interleave_granularity,
     )
     assert split_kv == 1
 
@@ -984,11 +1250,12 @@ def test_cute_dsl_mla_dcp_public_api_autotune_profiles_causal_tensor():
         "enable_dcp": True,
         "cp_world": 2,
         "cp_rank": 0,
+        "cp_interleave_granularity": cp_interleave_granularity,
     }
     with pytest.raises(TypeError, match="must be a torch.Tensor"):
         trtllm_batch_decode_with_kv_cache_mla(
             **public_args,
-            causal_seqlens_kv_global=[256],
+            causal_seqlens_kv_global=[252],
         )
 
     AutoTuner.get().clear_cache()
@@ -1013,6 +1280,7 @@ def test_cute_dsl_mla_dcp_public_api_autotune_profiles_causal_tensor():
         global_lens,
         cp_world=2,
         cp_rank=0,
+        cp_interleave_granularity=cp_interleave_granularity,
     )
     _assert_close_to_reference(
         out,
@@ -1049,6 +1317,219 @@ def test_cute_dsl_mla_dcp_rank_mask_and_merge(dtype):
 
     # In particular, query zero on rank one has local bound 62, not 63.
     assert _local_causal_bound(128, 4, 0, cp_world=2, cp_rank=1) == 62
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16, torch.float16, torch.float8_e4m3fn],
+    ids=["bf16", "fp16", "fp8"],
+)
+def test_cute_dsl_mla_dcp_granularity3_rank_mask_and_merge(dtype):
+    """Cover both kernel families with the requested three-token rank chunks."""
+    _skip_if_unsupported()
+    torch.manual_seed(142)
+    query, global_kv, global_lens = _make_inputs(
+        # Divisible by W*G, so both ranks own exactly 66 physical keys while
+        # the Sq4 causal tail walks through rank one's final three-token chunk.
+        global_length=132,
+        q_len=4,
+        num_heads=96,
+        dtype=dtype,
+    )
+    split_kvs = _assert_dcp_rank_merge_matches_reference(
+        query,
+        global_kv,
+        global_lens,
+        cp_world=2,
+        dtype=dtype,
+        cp_interleave_granularity=3,
+    )
+    assert split_kvs == [1, 1]
+
+
+def test_cute_dsl_mla_dcp_granularity3_dense_prefix_boundary():
+    """A block-cyclic boundary must not be promoted to a dense K tile."""
+    _skip_if_unsupported()
+    torch.manual_seed(146)
+    query, global_kv, physical_global_lens = _make_inputs(
+        global_length=258,
+        q_len=1,
+        num_heads=128,
+        dtype=torch.bfloat16,
+    )
+    # With zero scores, a stale dense path would average this excluded value
+    # into the output by 4 / 128, comfortably above the BF16 test tolerance.
+    query.zero_()
+    global_kv.zero_()
+    global_kv[0, 256, :_LATENT_DIM] = 4.0
+    causal_lens = torch.tensor([256], dtype=torch.int32, device=query.device)
+
+    # Rank one physically stores 129 keys, but only 127 precede the causal
+    # bound. Token-cyclic math would report 128 and incorrectly make the first
+    # K128 tile dense, bypassing the per-score block-cyclic mask for local k=127.
+    assert _local_length(258, 2, 1, 3) == 129
+    assert _local_prefix_length(256, 2, 1, 3) == 127
+    assert _ceil_div(256 - 1, 2) == 128
+    assert _global_position(127, 2, 1, 3) == 256
+
+    out, lse, _ = _launch_rank(
+        query,
+        global_kv,
+        physical_global_lens,
+        cp_world=2,
+        cp_rank=1,
+        enable_dcp=True,
+        cp_interleave_granularity=3,
+        causal_lens=causal_lens,
+    )
+    ref_out, ref_lse = _reference_attention(
+        query,
+        global_kv,
+        causal_lens,
+        cp_world=2,
+        cp_rank=1,
+        cp_interleave_granularity=3,
+    )
+    _assert_close_to_reference(
+        out,
+        lse,
+        ref_out,
+        ref_lse,
+        torch.bfloat16,
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8"],
+)
+def test_cute_dsl_mla_dcp_granularity64_page_block_rank_merge(dtype):
+    """Cover one-rank-per-page ownership used by inference deployments."""
+    _skip_if_unsupported()
+    torch.manual_seed(143)
+    query, global_kv, global_lens = _make_inputs(
+        # Two complete W2/G64 ownership cycles give each rank two full pages.
+        global_length=256,
+        q_len=4,
+        num_heads=96,
+        dtype=dtype,
+    )
+    split_kvs = _assert_dcp_rank_merge_matches_reference(
+        query,
+        global_kv,
+        global_lens,
+        cp_world=2,
+        dtype=dtype,
+        cp_interleave_granularity=64,
+    )
+    assert split_kvs == [1, 1]
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8"],
+)
+def test_cute_dsl_mla_dcp_granularity64_partial_page_rank_merge(dtype):
+    """G64 must support a global length ending within one rank-owned page."""
+    rank_positions = [
+        _rank_global_positions(500, 2, cp_rank, 64) for cp_rank in range(2)
+    ]
+    assert rank_positions == [
+        [
+            *range(0, 64),
+            *range(128, 192),
+            *range(256, 320),
+            *range(384, 448),
+        ],
+        [
+            *range(64, 128),
+            *range(192, 256),
+            *range(320, 384),
+            *range(448, 500),
+        ],
+    ]
+    assert [len(positions) for positions in rank_positions] == [256, 244]
+    assert [_ceil_div(len(positions), _PAGE_SIZE) for positions in rank_positions] == [
+        4,
+        4,
+    ]
+    assert [4 * _PAGE_SIZE - len(positions) for positions in rank_positions] == [0, 12]
+    assert [
+        [_local_causal_bound(500, 4, q_idx, 2, cp_rank, 64) for q_idx in range(4)]
+        for cp_rank in range(2)
+    ] == [[256, 256, 256, 256], [241, 242, 243, 244]]
+
+    _skip_if_unsupported()
+    torch.manual_seed(145)
+    query, global_kv, global_lens = _make_inputs(
+        global_length=500,
+        q_len=4,
+        num_heads=96,
+        dtype=dtype,
+    )
+    assert [_local_length(500, 2, cp_rank, 64) for cp_rank in range(2)] == [256, 244]
+    split_kvs = _assert_dcp_rank_merge_matches_reference(
+        query,
+        global_kv,
+        global_lens,
+        cp_world=2,
+        dtype=dtype,
+        cp_interleave_granularity=64,
+    )
+    assert split_kvs == [2, 2]
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16, torch.float8_e4m3fn],
+    ids=["bf16", "fp8"],
+)
+def test_cute_dsl_mla_dcp_granularity64_padded_page_single_query(dtype):
+    """Q1 masks the unused suffix of a physically complete G64 page."""
+    _skip_if_unsupported()
+    torch.manual_seed(148)
+    query, global_kv, physical_global_lens = _make_inputs(
+        global_length=512,
+        q_len=1,
+        num_heads=96,
+        dtype=dtype,
+    )
+    query.zero_()
+    global_kv.zero_()
+    global_kv[0, 500:512, :_LATENT_DIM] = 4.0
+    causal_lens = torch.tensor([500], dtype=torch.int32, device=query.device)
+
+    # Rank one owns one complete physical page [448, 512), but only its first
+    # 52 entries precede the global bound. The final 12 values must not leak.
+    assert _local_length(512, 2, 1, 64) == 256
+    assert _local_prefix_length(500, 2, 1, 64) == 244
+    out, lse, _ = _launch_rank(
+        query,
+        global_kv,
+        physical_global_lens,
+        cp_world=2,
+        cp_rank=1,
+        enable_dcp=True,
+        cp_interleave_granularity=64,
+        causal_lens=causal_lens,
+    )
+    ref_out, ref_lse = _reference_attention(
+        query,
+        global_kv,
+        causal_lens,
+        cp_world=2,
+        cp_rank=1,
+        cp_interleave_granularity=64,
+    )
+    _assert_close_to_reference(
+        out,
+        lse,
+        ref_out,
+        ref_lse,
+        dtype,
+    )
 
 
 @pytest.mark.parametrize(
@@ -1304,6 +1785,75 @@ def test_cute_dsl_mla_dcp_split_kv_rank_merge(dtype):
         ref_empty_out,
         ref_empty_lse,
         dtype,
+    )
+
+
+def test_cute_dsl_mla_dcp_granularity3_split_kv_rank_merge():
+    """Three-token chunks must retain mergeable LSE through split reduction."""
+    _skip_if_unsupported()
+    torch.manual_seed(144)
+    query, global_kv, global_lens = _make_inputs(
+        global_length=4098,
+        q_len=4,
+        num_heads=96,
+        dtype=torch.bfloat16,
+    )
+    split_kvs = _assert_dcp_rank_merge_matches_reference(
+        query,
+        global_kv,
+        global_lens,
+        cp_world=2,
+        dtype=torch.bfloat16,
+        cp_interleave_granularity=3,
+    )
+    assert all(split_kv > 1 for split_kv in split_kvs)
+
+
+def test_cute_dsl_mla_dcp_granularity3_all_empty_split_reduction():
+    """Block-cyclic split validity must emit the neutral empty rank state."""
+    _skip_if_unsupported()
+    torch.manual_seed(147)
+    query, global_kv, physical_global_lens = _make_inputs(
+        global_length=4098,
+        q_len=4,
+        num_heads=96,
+        dtype=torch.bfloat16,
+    )
+    empty_causal_lens = torch.tensor([3], dtype=torch.int32, device=query.device)
+
+    # Rank one's first block-cyclic key is global token 3, so an exclusive
+    # bound of 3 makes every physical key causally invisible. Stale token-level
+    # mapping would place local key zero at global token 1 and mark it valid.
+    assert _global_position(0, 2, 1, 3) == 3
+    assert _local_prefix_length(3, 2, 1, 3) == 0
+    empty_out, empty_lse, split_kv = _launch_rank(
+        query,
+        global_kv,
+        physical_global_lens,
+        cp_world=2,
+        cp_rank=1,
+        enable_dcp=True,
+        cp_interleave_granularity=3,
+        causal_lens=empty_causal_lens,
+    )
+    assert split_kv > 1
+    assert torch.equal(empty_out, torch.zeros_like(empty_out))
+    assert torch.isneginf(empty_lse).all()
+
+    ref_empty_out, ref_empty_lse = _reference_attention(
+        query,
+        global_kv,
+        empty_causal_lens,
+        cp_world=2,
+        cp_rank=1,
+        cp_interleave_granularity=3,
+    )
+    _assert_close_to_reference(
+        empty_out,
+        empty_lse,
+        ref_empty_out,
+        ref_empty_lse,
+        torch.bfloat16,
     )
 
 
