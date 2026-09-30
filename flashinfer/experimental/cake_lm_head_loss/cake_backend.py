@@ -512,7 +512,7 @@ def workspace_layout(
         ("stats", rows * tiles * 2 * 4),
         ("d", rows * 4),
         ("term", rows * 4),
-        ("loss_acc", 4),
+        ("loss_acc", 8),  # FP64 accumulator of the fixed-order loss sum
         ("grad_scale", 4),
     ]
     if scratch_bytes:
@@ -828,8 +828,9 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
         values.update(A=x_chunk, B=t["W"], C=logits, STATS_OUT=t["stats"], M=int(rows_c), m_tiles=g.row_tiles(rows_c), k_iters=1,
                       first_chunk=0)
     elif stage == "gemm_dx":
+        # every token chunk writes its own rows of dX_acc: the first K chunk of the GEMM always stores (first_chunk=1)
         values.update(A=dz_chunk, B=t["W"], C=t["dx_acc"][row0:stop], STATS_OUT=t["stats"], M=int(rows_c),
-                      m_tiles=g.row_tiles(rows_c), k_iters=1, first_chunk=0)
+                      m_tiles=g.row_tiles(rows_c), k_iters=1, first_chunk=1)
     elif stage == "gemm_dw_acc":
         values.update(A=dz_chunk, B=x_chunk, C=t["dw_acc"], STATS_OUT=t["stats"], M=int(p.vocab), m_tiles=g.row_tiles(p.vocab),
                       k_iters=g.k_iters(rows_c), first_chunk=first)
@@ -976,7 +977,7 @@ class ReferenceEngine:
     @staticmethod
     def loss_reduce(values: dict[str, Any]) -> None:
         rows_c = int(values["rows_c"])
-        total = values["term"][:rows_c].sum().reshape(1)
+        total = values["term"][:rows_c].double().sum().reshape(1)  # FP64 accumulation of the FP32 terms
         acc = values["loss_acc"]
         if int(values["first_chunk"]):
             acc.copy_(total)
@@ -984,7 +985,7 @@ class ReferenceEngine:
             acc.add_(total)
         if int(values["last_chunk"]):
             neg = -acc
-            values["loss_out"].copy_(neg / float(values["loss_div"]) if int(values["mode"]) == MODE_CE else neg)
+            values["loss_out"].copy_(neg / float(values["loss_div"]) if int(values["mode"]) == MODE_CE else neg)  # one FP64 -> FP32 rounding
 
     @staticmethod
     def row_grad(values: dict[str, Any]) -> None:
@@ -1135,9 +1136,11 @@ class LmHeadLossRunner:
         tensor; ``grad`` must be ``None`` (the cast scale is 1).
         """
         t = self.tensors
-        if self.problem.entry == "logprob" and grad is not None:
-            raise ValueError("the log-probability runner takes its gradient from the bound dlogp tensor")
-        if grad is None:
+        if self.problem.entry == "logprob":
+            if grad is not None:
+                raise ValueError("the log-probability runner takes its gradient from the bound dlogp tensor")
+            # the cast scale of this entry is the constant 1, written once at prepare time
+        elif grad is None:
             t["grad_scale"].fill_(1.0)
         else:
             t["grad_scale"].copy_(grad.reshape(1).to(torch.float32))
@@ -1266,8 +1269,9 @@ def prepare_lm_head_loss(
     t["stats"] = _carve(flat, layout, "stats", torch.float32, (rows, plan.num_tiles, 2))
     t["d"] = _carve(flat, layout, "d", torch.float32, (rows,))
     t["term"] = _carve(flat, layout, "term", torch.float32, (rows,))
-    t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float32, (1,))
+    t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float64, (1,))
     t["grad_scale"] = _carve(flat, layout, "grad_scale", torch.float32, (1,))
+    t["grad_scale"].fill_(1.0)  # the log-probability entry's cast scale; the loss entry's backward rewrites it
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
     t["lse"] = output(lse, "lse", (T,), torch.float32)
@@ -1395,7 +1399,7 @@ class _Binding:
         t["stats"] = torch.empty((rows, self.plan.num_tiles, 2), dtype=torch.float32, device=self.device)
         t["d"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
         t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
-        t["loss_acc"] = torch.empty((1,), dtype=torch.float32, device=self.device)
+        t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
         t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
         t["grad_scale"] = torch.ones((1,), dtype=torch.float32, device=self.device)
         for name, tensor in self.owned.items():

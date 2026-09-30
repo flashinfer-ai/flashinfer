@@ -27,14 +27,6 @@ from .api_logging import flashinfer_experimental_api
 _FEATURE = "chunked LM-head + loss training kernels (SM100/SM103)"
 
 
-def _backend(backend: str):
-    if backend != "cake":
-        raise ValueError("the chunked LM-head + loss kernels currently support backend='cake'")
-    from .experimental.cake_lm_head_loss import cake_backend
-
-    return cake_backend
-
-
 @flashinfer_experimental_api(feature=_FEATURE)
 def chunked_lm_head_loss(
     X: torch.Tensor,
@@ -132,7 +124,11 @@ def chunked_lm_head_loss(
     temporary memory is reported separately from the weights, the outputs and
     the FP32 accumulators by ``cake_backend.memory_report``.
     """
-    return _backend(backend).chunked_lm_head_loss(
+    if backend != "cake":
+        raise ValueError("the chunked LM-head + loss kernels currently support backend='cake'")
+    from .experimental.cake_lm_head_loss import cake_backend
+
+    return cake_backend.chunked_lm_head_loss(
         X,
         W,
         labels,
@@ -144,7 +140,7 @@ def chunked_lm_head_loss(
         return_logp=return_logp,
         grad_weight_dtype=grad_weight_dtype,
         deterministic=deterministic,
-        backend=backend,
+        backend="cake",
     )
 
 
@@ -169,11 +165,15 @@ def chunked_lm_head_logprob(
     ``dX`` and ``dW`` through FP32 accumulators with one cast each.  Arguments
     as in :func:`chunked_lm_head_loss`; ``dW`` is returned in BF16.
     """
-    return _backend(backend).chunked_lm_head_logprob(
+    if backend != "cake":
+        raise ValueError("the chunked LM-head + loss kernels currently support backend='cake'")
+    from .experimental.cake_lm_head_loss import cake_backend
+
+    return cake_backend.chunked_lm_head_logprob(
         X,
         W,
         labels,
         chunk_size=chunk_size,
         deterministic=deterministic,
-        backend=backend,
+        backend="cake",
     )
