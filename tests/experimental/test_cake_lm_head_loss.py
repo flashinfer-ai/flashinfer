@@ -1318,6 +1318,26 @@ def test_device_grad_weight_dtype_fp32(glm_weight):
     _check_against_references(result, inp, grad_weight_dtype=torch.float32, ceiling=True)
 
 
+def test_device_binding_scratch_binds_constant_cells(glm_weight):
+    """A remembered binding's per-call scratch binds the device's constant cells (``grad_scale`` / ``unit_scale`` /
+    ``f32_dummy``), not fresh ``ones`` / ``zeros``: no fill launches ride along on every remembered call."""
+    _require_program(entry="loss")
+    inp = _device_inputs(4097, W=glm_weight)
+    with _cache(True) as cache:
+        cache.clear()
+        cake_backend.forward_loss(inp.X, inp.W, inp.labels, objective="ce", loss_div=inp.loss_div, chunk_size=4096, backend="cake")
+        assert len(cache) == 1
+        binding = next(iter(cache._bindings.values()))
+    constants = cake_backend._device_constants(binding.device_index)
+    assert constants is cake_backend._device_constants(binding.device_index)
+    t = {}
+    binding._scratch(t)
+    assert all(t[name] is constants[name] for name in ("grad_scale", "unit_scale", "f32_dummy"))
+    torch.cuda.synchronize()
+    assert float(t["grad_scale"]) == 1.0 == float(t["unit_scale"]) and not bool(t["f32_dummy"].any())
+    assert tuple(t["f32_dummy"].shape) == (16,) and t["f32_dummy"].dtype == torch.float32
+
+
 def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
     _require_program(entry="loss")
     inp = _device_inputs(4097, W=glm_weight)

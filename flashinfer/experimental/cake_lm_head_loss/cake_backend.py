@@ -1078,6 +1078,21 @@ def bind_stage(module_name: str, stage: str, values: dict[str, Any], grid: tuple
 _FFI_DEVICES: dict[int, Any] = {}
 
 
+@functools.lru_cache(maxsize=None)
+def _device_constants(index: int) -> dict[str, torch.Tensor]:
+    """The constant cells a remembered binding binds on every call, allocated once per device:
+    ``grad_scale`` / ``unit_scale`` (``[1] = 1.0``; read-only here -- the loss entry's backward
+    casts through :func:`backward_loss`, the log-probability entry's cast scale is 1) and the
+    unused fp32 ``WS`` of the unsliced GEMMs.  Per-call ``torch.ones`` / ``torch.zeros`` would add
+    three fill launches to every remembered forward and backward."""
+    device = torch.device("cuda", int(index))
+    return {
+        "grad_scale": torch.ones((1,), dtype=torch.float32, device=device),
+        "unit_scale": torch.ones((1,), dtype=torch.float32, device=device),
+        "f32_dummy": torch.zeros((16,), dtype=torch.float32, device=device),
+    }
+
+
 def _ffi_stream_context(index: int):
     """tvm-ffi environment-stream context for torch's current stream on device ``index``."""
     import tvm_ffi
@@ -1840,9 +1855,7 @@ class _Binding:
         t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
         t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
         t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
-        t["grad_scale"] = torch.ones((1,), dtype=torch.float32, device=self.device)
-        t["unit_scale"] = torch.ones((1,), dtype=torch.float32, device=self.device)
-        t["f32_dummy"] = torch.zeros((16,), dtype=torch.float32, device=self.device)
+        t.update(_device_constants(self.device_index))  # constant cells: no per-call fill launches
         if self.plan.dx_ws_slabs:
             t["dx_ws"] = torch.empty((self.plan.dx_ws_slabs, rows, p.hidden), dtype=torch.float32, device=self.device)
         if self.plan.compact:
