@@ -226,6 +226,19 @@ def test_allowlist_guards_are_gpu_free():
     )
 
 
+def test_rejects_non_fp8_output_buffers():
+    """Caller-provided outputs must honour the float8_e4m3fn contract; a wrong
+    dtype is an error, never a silent fallback into that buffer."""
+    kv, pe = _inputs(8, 12)
+    key = torch.empty(8, 12, NOPE + ROPE, dtype=torch.float8_e4m3fn, device="cuda")
+    value_e5m2 = torch.empty(8, 12, V, dtype=torch.float8_e5m2, device="cuda")
+    with pytest.raises(ValueError, match="float8_e4m3fn"):
+        flashinfer.concat_mla_kv_quant_fp8(kv, pe, key=key, value=value_e5m2)
+    key_bf16 = torch.empty(8, 12, NOPE + ROPE, dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="float8_e4m3fn"):
+        flashinfer.concat_mla_kv_quant_fp8(kv, pe, key=key_bf16)
+
+
 def test_pre_blackwell_device_takes_fallback(monkeypatch):
     """The fused kernel is dispatched on compute capability 10.0+ only."""
     monkeypatch.setattr(mla_kv_pack, "get_compute_capability", lambda device: (9, 0))
