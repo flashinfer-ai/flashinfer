@@ -62,9 +62,22 @@ ARCH_NVCC_FLAGS = {
 TRACKING_ISSUE = "flashinfer-ai/flashinfer#5677"
 
 
+@functools.cache
 def toolchain_supports(arch: str) -> bool:
-    """Can the nvcc this checkout invokes emit ``arch``?  (SM100 / SM103 / SM107 only.)"""
-    return arch in ARCH_NVCC_FLAGS
+    """Can the nvcc this checkout invokes emit ``arch``?  (SM100 / SM103 / SM107 only.)
+
+    ``compute_107a`` (Rubin) needs a CUDA toolkit that lists it; a toolkit without it
+    must decline the sm_107a programs up front instead of failing inside the JIT build,
+    so a checkout that registers sm_107a programs stays importable and testable on a
+    toolkit that only knows 10.0 / 10.3 (same rule as ``msa_nvfp4_decode.cake_jit``).
+    """
+    if arch not in ARCH_NVCC_FLAGS:
+        return False
+    if arch == "sm_107a":
+        from ...compilation_context import _nvcc_supports_sm107
+
+        return bool(_nvcc_supports_sm107())
+    return True
 
 
 def registered_templates(arch: str) -> tuple[str, ...]:
