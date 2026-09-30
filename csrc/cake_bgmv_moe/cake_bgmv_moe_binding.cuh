@@ -127,8 +127,8 @@ void Configure() {
       << " bytes of dynamic shared memory, but device " << device_id << " supports "
       << max_dynamic_smem;
   CheckCuda(
-      cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_DECODE,
-                           cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkDecodeSmemBytes),
+      cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_DECODE, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           kShrinkDecodeSmemBytes),
       "cudaFuncSetAttribute(Cake BGMV MoE decode shrink)");
 }
 
@@ -235,9 +235,9 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
         num_tokens);
   } else {
     const dim3 shrink_grid(num_pairs, kRank / 8, 1);
-    CAKE_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes,
-                                        stream>>>(shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr,
-                                                  lora_ptr, num_pairs, num_experts, num_tokens);
+    CAKE_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes, stream>>>(
+        shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
+        num_tokens);
   }
   CheckCuda(cudaGetLastError(), "Cake BGMV MoE shrink launch");
 

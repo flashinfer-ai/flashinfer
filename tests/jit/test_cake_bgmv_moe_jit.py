@@ -133,12 +133,12 @@ def test_arch_modules_do_not_share_a_uri():
 
 
 def test_binding_preserves_graph_and_tensor_contracts():
-    binding = (
-        cake_bgmv_moe._get_csrc_dir() / "cake_bgmv_moe_binding.cuh"
-    ).read_text()
+    binding = (cake_bgmv_moe._get_csrc_dir() / "cake_bgmv_moe_binding.cuh").read_text()
     assert "CheckCompiledArch" in binding
     assert "CheckExactSM100" not in binding
-    assert "major == CAKE_BGMV_MOE_CC_MAJOR && minor == CAKE_BGMV_MOE_CC_MINOR" in binding
+    assert (
+        "major == CAKE_BGMV_MOE_CC_MAJOR && minor == CAKE_BGMV_MOE_CC_MINOR" in binding
+    )
     assert "kShrinkDecodeSmemBytes = 221696" in binding
     assert "kShrinkPrefillSmemBytes = 36992" in binding
     assert "cudaDevAttrMaxSharedMemoryPerBlockOptin" in binding

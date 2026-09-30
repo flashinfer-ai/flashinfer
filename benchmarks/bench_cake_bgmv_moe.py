@@ -195,7 +195,9 @@ def main():
         (10, 0),
         (10, 3),
     ):
-        raise RuntimeError("this benchmark requires an exact SM100 or SM103 CUDA device")
+        raise RuntimeError(
+            "this benchmark requires an exact SM100 or SM103 CUDA device"
+        )
 
     rows = [
         _run_shape(hidden_size, num_tokens, args.repeat_time_ms)

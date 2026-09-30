@@ -16,7 +16,7 @@ limitations under the License.
 
 import functools
 import threading
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import torch
 
@@ -407,13 +407,14 @@ def prepare_bgmv_moe(
         )
     from ..jit.cake_bgmv_moe import cake_bgmv_moe_arch_for_capability
 
-    capability = (
-        tuple(int(v) for v in torch.cuda.get_device_capability(x.device))
-        if torch.cuda.is_available() and x.is_cuda
-        else None
-    )
+    capability: Optional[Tuple[int, int]] = None
+    if torch.cuda.is_available() and x.is_cuda:
+        major, minor = torch.cuda.get_device_capability(x.device)
+        capability = (int(major), int(minor))
     arch = (
-        cake_bgmv_moe_arch_for_capability(capability) if capability is not None else None
+        cake_bgmv_moe_arch_for_capability(capability)
+        if capability is not None
+        else None
     )
     if arch is None:
         raise ValueError(

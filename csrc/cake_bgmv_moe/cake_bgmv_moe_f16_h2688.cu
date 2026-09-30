@@ -15,7 +15,7 @@
  */
 // Generated source for FlashInfer.
 // Bundle: Blackwell BGMV MoE shrink and deterministic expand portfolio.
-// Target: sm_100a and sm_103a (same instruction surface: cp.async, shuffles, FMA); compile flags: none.
+// Target: sm_100a and sm_103a (cp.async, shuffles, FMA only); compile flags: none.
 // Generated file; do not edit manually.
 typedef signed char int8_t;
 typedef unsigned char uint8_t;
