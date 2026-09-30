@@ -79,6 +79,7 @@ def decode_kernel_key(
     pf: int = 0,
     mc: int = 1,
     tstore: bool = False,
+    pfx: int = 0,
 ) -> str:
     key = f"decode:t{int(tok)}_p{int(stages)}"
     if fused:
@@ -99,6 +100,8 @@ def decode_kernel_key(
         key += f"_mc{int(mc)}"  # round 6 (lever M): the C m tiles of one N tile run as a cluster and share the W stage (TMA multicast)
     if int(pf) > 0:
         key += f"_pf{int(pf)}"  # round 6 (lever P): weight tiles prefetched into L2 pf stages ahead of their TMA load
+    if int(pfx) > 0:
+        key += f"_px{int(pfx)}"  # round 6 next loop (lever PX): the BF16 token tile prefetched into L2 pfx stages ahead of its TMA load
     if tstore:
         key += "_tso"  # round 6 (lever E1): the split-1 epilogue stores BF16 through TMA (16-byte-aligned output views)
     return key

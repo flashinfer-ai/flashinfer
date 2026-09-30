@@ -280,6 +280,8 @@ def test_decode_config_rules(arch):
         assert cfg.tiles == n_tiles128 * -(-bucket // cfg.tok)
         # Round 6 (lever M): at the bucket's M every N tile's m tiles fill whole clusters; one cluster item per N tile.
         assert cfg.mc == int(entry.get("mc", 1)) and cfg.pf == int(entry.get("pf", 0))
+        # Round-6 next loop (lever PX): the BF16 token-tile L2 prefetch applies to fused, non-resident rows only.
+        assert cfg.pfx == (int(entry.get("pfx", 0)) if (cfg.fused and not cfg.resident) else 0)
         if cfg.mc > 1:
             assert cfg.split == 1 and cfg.csplit == 1 and not cfg.resident
             assert cfg.m_tiles % cfg.mc == 0 and cfg.total_work == cfg.tiles // cfg.mc
@@ -322,7 +324,8 @@ def test_decode_config_rules(arch):
         # Round 6: ``_mc<C>`` / ``_pf<D>`` close the key (after the cluster split-K field); strip them for the older checks.
         assert (f"_mc{cfg.mc}" in cfg.kernel_key) == (cfg.mc > 1)
         assert (f"_pf{cfg.pf}" in cfg.kernel_key) == (cfg.pf > 0)
-        core_key = re.sub(r"(_mc\d+)?(_pf\d+)?$", "", cfg.kernel_key)
+        assert (f"_px{cfg.pfx}" in cfg.kernel_key) == (cfg.pfx > 0)
+        core_key = re.sub(r"(_mc\d+)?(_pf\d+)?(_px\d+)?$", "", cfg.kernel_key)
         # Round-3 fused knobs: a decoupled ring only for fused, non-resident rows; narrow units divide evenly.
         if entry.get("xb_stages"):
             assert (
@@ -422,6 +425,19 @@ def test_decode_config_round6_continuation_rules(arch):
             assert cfg.kernel_key_for(True) == cfg.kernel_key + "_tso"
         assert cfg.kernel_key_for(False) == cfg.kernel_key
     assert n_tstore == 17
+    # Round-6 next loop (lever PX-S): eight small fused buckets per architecture prefetch their BF16 token tile one stage
+    # ahead of its TMA load (``pfx: 1`` -> the ``_px1`` program); a prefetch changes no data path and no launch argument.
+    n_pfx = 0
+    for key, entry in DECODE_TABLE[arch].items():
+        if entry["route"] != "decode" or not entry.get("pfx"):
+            continue
+        n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
+        cfg = decode_config(bucket, n_tiles128, num_k_iters, arch, SM_COUNT)
+        assert cfg.fused and not cfg.resident and cfg.pfx == 1 and cfg.kernel_key.endswith("_px1")
+        n_pfx += 1
+    assert n_pfx == 8
+    assert decode_config(8, 24, 2, arch, SM_COUNT).kernel_key.endswith("_px1")  # tp8 kv_b M = 8: 1.076-1.083x B200 / 1.034-1.042x B300
+    assert not decode_config(1, 24, 2, arch, SM_COUNT).kernel_key.endswith("_px1")  # tp8 kv_b M = 1 keeps the plain instance (B300-only win)
     cfg = decode_config(
         256, 56, 6, arch, SM_COUNT
     )  # tp8 o_proj M = 256: 1.07x on both GPUs

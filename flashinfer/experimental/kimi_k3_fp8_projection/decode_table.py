@@ -41,6 +41,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
             "csplit": 14,
+            "pfx": 1,
         },
         "1,28,8": {
             "route": "decode",
@@ -50,6 +51,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
             "csplit": 14,
+            "pfx": 1,
         },
         "1,28,64": {
             "route": "decode",
@@ -86,6 +88,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
             "csplit": 14,
+            "pfx": 1,
         },
         "5,28,64": {
             "route": "decode",
@@ -128,6 +131,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pfx": 1,
         },
         "12,1,256": {
             "route": "decode",
@@ -193,6 +197,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
             "csplit": 4,
+            "pfx": 1,
         },
         "17,28,64": {
             "route": "decode",
@@ -228,6 +233,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pfx": 1,
         },
         "18,6,64": {
             "route": "decode",
@@ -261,6 +267,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pfx": 1,
         },
         "24,2,64": {
             "route": "decode",
@@ -269,6 +276,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pfx": 1,
         },
         "24,2,256": {
             "route": "decode",
@@ -625,6 +633,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
             "csplit": 14,
+            "pfx": 1,
         },
         "1,28,8": {
             "route": "decode",
@@ -634,6 +643,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
             "csplit": 14,
+            "pfx": 1,
         },
         "1,28,64": {
             "route": "decode",
@@ -670,6 +680,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
             "csplit": 14,
+            "pfx": 1,
         },
         "5,28,64": {
             "route": "decode",
@@ -712,6 +723,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pfx": 1,
         },
         "12,1,256": {
             "route": "decode",
@@ -777,6 +789,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
             "csplit": 4,
+            "pfx": 1,
         },
         "17,28,64": {
             "route": "decode",
@@ -812,6 +825,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pfx": 1,
         },
         "18,6,64": {
             "route": "decode",
@@ -845,6 +859,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pfx": 1,
         },
         "24,2,64": {
             "route": "decode",
@@ -853,6 +868,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pfx": 1,
         },
         "24,2,256": {
             "route": "decode",
