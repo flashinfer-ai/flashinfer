@@ -748,19 +748,20 @@ def _test_trtllm_batch_prefill(
 
     if (
         o_dtype != "nvfp4"
-        and kv_dtype != "nvfp4"
         and uses_shared_paged_kv_idx
         and not use_fp16_softmax
         and not uses_spcompress
         and not variable_window
         and window_right < 0
-    ):  # wrapper api does not support fp4 output/kv, two-sided/variable windows, or variant flags.
+    ):  # wrapper api does not support fp4 output, two-sided/variable windows, or variant flags.
         # test wrapper with trtllm-gen backend
         wrapper_trtllm_gen = flashinfer.prefill.BatchPrefillWithPagedKVCacheWrapper(
             workspace_buffer, kv_layout, backend="trtllm-gen"
         )
         plan_params["q_data_type"] = q.dtype
-        plan_params["kv_data_type"] = kv_cache.dtype
+        plan_params["kv_data_type"] = (
+            kv_cache[0] if isinstance(kv_cache, tuple) else kv_cache
+        ).dtype
         plan_params["o_data_type"] = DTYPE_MAP[o_dtype]
         wrapper_trtllm_gen.plan(**plan_params)
         output_wrapper = wrapper_trtllm_gen.run(
@@ -772,13 +773,17 @@ def _test_trtllm_batch_prefill(
             enable_pdl=enable_pdl,
             sinks=(sink if enable_sink else None),
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            kv_cache_sf=kv_cache_sf,
         )
         # v_scale, o_scale in wrapper is emulated by multiplying output by v_scale instead of fused into kernel.
         if v_scale == o_scale == 1.0:
             assert (output_wrapper == output).all()
         else:
+            # FP8 output is re-rounded after the emulated scale: allow one
+            # E4M3 step (2**-3 relative).
+            rtol = 2**-3 if o_dtype == "fp8" else 1e-1
             torch.testing.assert_close(
-                output.float(), output_wrapper.float(), rtol=1e-1, atol=1e-1
+                output.float(), output_wrapper.float(), rtol=rtol, atol=1e-1
             )
 
 
@@ -1347,6 +1352,8 @@ def test_trtllm_batch_prefill_dynamic_page_size_gqa(
         ("fp16", "fp16", "fp16"),
         ("fp8", "fp8", "fp8"),
         ("fp8", "fp8", "bf16"),
+        # Materialized to FP8: trtllm-gen has no NVFP4-KV kernel at 512.
+        ("fp8", "nvfp4", "fp8"),
     ],
 )
 @pytest.mark.parametrize("enable_pdl", [None])
