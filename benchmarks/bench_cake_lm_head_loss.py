@@ -86,7 +86,14 @@ from tests.test_helpers.cake_lm_head_loss_reference import (  # noqa: E402
 
 # name -> (T, chunk, objective, entry)
 ROWS: dict[str, tuple[int, int, str, str]] = {}
-_SHAPES = ((16231, 4096), (16172, 4096), (16231, 2048), (16231, 8192), (4096, 4096), (32463, 4096))
+_SHAPES = (
+    (16231, 4096),
+    (16172, 4096),
+    (16231, 2048),
+    (16231, 8192),
+    (4096, 4096),
+    (32463, 4096),
+)
 for _T, _C in _SHAPES:
     ROWS[f"t{_T}_c{_C}_ce"] = (_T, _C, "ce", "loss")
 for _T, _C in _SHAPES:
@@ -102,7 +109,9 @@ LOSS_DIV = DEFAULT_LOSS_DIV
 
 
 def median_ms(fn, steps):
-    times = bench_gpu_time(fn, dry_run_iters=3, repeat_iters=steps, enable_cupti=True, cold_l2_cache=True)
+    times = bench_gpu_time(
+        fn, dry_run_iters=3, repeat_iters=steps, enable_cupti=True, cold_l2_cache=True
+    )
     return float(statistics.median(times))
 
 
@@ -148,7 +157,11 @@ def _liger_internal_chunk(T, H, V):
         from liger_kernel.ops import fused_linear_cross_entropy as module
 
         src = inspect.getsource(module)
-        lines = [line.strip() for line in src.splitlines() if "inc_factor" in line or "chunk_size" in line][:8]
+        lines = [
+            line.strip()
+            for line in src.splitlines()
+            if "inc_factor" in line or "chunk_size" in line
+        ][:8]
         match = re.search(r"inc_factor\s*=\s*triton\.cdiv\(\s*V\s*,\s*([^)]+)\)", src)
         expr = match.group(1).replace(" ", "") if match else ""
         if expr == "H":
@@ -162,7 +175,9 @@ def _liger_internal_chunk(T, H, V):
         inc_factor = -(-V // (k * H))
         n = max(1, -(-T // inc_factor))
         chunk = min(1 << (n - 1).bit_length(), T)
-        return dict(chunk=chunk, num_chunks=-(-T // chunk), inc_factor=inc_factor, source=lines)
+        return dict(
+            chunk=chunk, num_chunks=-(-T // chunk), inc_factor=inc_factor, source=lines
+        )
     except Exception as exc:
         return dict(chunk="n/a", error=f"{type(exc).__name__}: {exc}")
 
@@ -201,7 +216,11 @@ class ArmAutograd:
         return dict(loss=st["loss"].detach(), logp=st["logp"].detach())
 
     def _finish(self, logp):
-        loss = _downstream_loss(logp, self.inp) if self.entry == "logprob" else _objective_loss(logp, self.inp)
+        loss = (
+            _downstream_loss(logp, self.inp)
+            if self.entry == "logprob"
+            else _objective_loss(logp, self.inp)
+        )
         return dict(loss=loss, logp=logp)
 
 
@@ -242,11 +261,17 @@ class ArmTorchChunked:
     def versions(self):
         probe = torch.zeros((8, 8), dtype=torch.float32, device=self.inp.X.device)
         a = torch.zeros((8, 8), dtype=torch.bfloat16, device=probe.device)
-        return dict(torch=torch.__version__, dw_accumulate=_addmm_fp32(probe, a.t(), a), dx_out=("out_dtype" if _mm_fp32(a, a).dtype == torch.float32 else "?"))
+        return dict(
+            torch=torch.__version__,
+            dw_accumulate=_addmm_fp32(probe, a.t(), a),
+            dx_out=("out_dtype" if _mm_fp32(a, a).dtype == torch.float32 else "?"),
+        )
 
     def _chunk_stats(self, r0, r1):
         inp = self.inp
-        zf = torch.mm(inp.X[r0:r1], inp.W.t()).float()  # BF16 GEMM output promoted to FP32
+        zf = torch.mm(
+            inp.X[r0:r1], inp.W.t()
+        ).float()  # BF16 GEMM output promoted to FP32
         lse = torch.logsumexp(zf, dim=-1)
         labels = inp.labels[r0:r1]
         valid = labels >= 0
@@ -288,7 +313,9 @@ class ArmTorchChunked:
                 ratio = torch.exp(logp - inp.infer_logp[r0:r1])
                 w = inp.loss_weights[r0:r1]
                 d = torch.where(valid & (ratio <= RATIO_CLIP), -w * ratio, zero)
-                total += torch.where(valid, w * torch.clamp_max(ratio, RATIO_CLIP), zero).sum()
+                total += torch.where(
+                    valid, w * torch.clamp_max(ratio, RATIO_CLIP), zero
+                ).sum()
             self._accumulate(r0, r1, self._dlogits(zf, lse, index, d), i == 0)
         if self.entry == "logprob":
             loss = total
@@ -305,9 +332,15 @@ class ArmTorchChunked:
                 labels = inp.labels[r0:r1]
                 valid = labels >= 0
                 index = torch.where(valid, labels, torch.zeros_like(labels))
-                d = torch.where(valid, inp.dlogp[r0:r1], torch.zeros_like(st["lse"][r0:r1]))
-                self._accumulate(r0, r1, self._dlogits(zf, st["lse"][r0:r1], index, d), i == 0)
-        return dict(dX=self.dx_acc.to(torch.bfloat16), dW=self.dw_acc.to(torch.bfloat16))
+                d = torch.where(
+                    valid, inp.dlogp[r0:r1], torch.zeros_like(st["lse"][r0:r1])
+                )
+                self._accumulate(
+                    r0, r1, self._dlogits(zf, st["lse"][r0:r1], index, d), i == 0
+                )
+        return dict(
+            dX=self.dx_acc.to(torch.bfloat16), dW=self.dw_acc.to(torch.bfloat16)
+        )
 
     def outputs(self, st):
         return dict(loss=st["loss"], logp=st["logp"])
@@ -323,18 +356,34 @@ class ArmLiger(ArmAutograd):
         super().__init__(inp, entry=entry, chunk=chunk)
         if entry != "loss" or inp.objective != "ce":
             raise NotImplementedError("liger: cross-entropy loss rows only")
-        from liger_kernel.ops.fused_linear_cross_entropy import LigerFusedLinearCrossEntropyFunction
+        from liger_kernel.ops.fused_linear_cross_entropy import (
+            LigerFusedLinearCrossEntropyFunction,
+        )
 
         self.function = LigerFusedLinearCrossEntropyFunction
-        params = list(inspect.signature(self.function.forward).parameters.values())[1:]  # drop ctx
-        overrides = {params[0].name: self.X, params[1].name: self.W, params[2].name: inp.labels, "ignore_index": IGNORE_INDEX, "reduction": "sum"}
+        params = list(inspect.signature(self.function.forward).parameters.values())[
+            1:
+        ]  # drop ctx
+        overrides = {
+            params[0].name: self.X,
+            params[1].name: self.W,
+            params[2].name: inp.labels,
+            "ignore_index": IGNORE_INDEX,
+            "reduction": "sum",
+        }
         if not {"ignore_index", "reduction"} <= {p.name for p in params}:
-            raise RuntimeError(f"unexpected LigerFusedLinearCrossEntropyFunction.forward signature: {[p.name for p in params]}")
-        self.args = [overrides[p.name] if p.name in overrides else p.default for p in params]
+            raise RuntimeError(
+                f"unexpected LigerFusedLinearCrossEntropyFunction.forward signature: {[p.name for p in params]}"
+            )
+        self.args = [overrides.get(p.name, p.default) for p in params]
         self.internal_chunk = _liger_internal_chunk(inp.T, H, V)
 
     def versions(self):
-        return dict(liger_kernel=_version("liger-kernel"), internal_chunk=self.internal_chunk, torch=torch.__version__)
+        return dict(
+            liger_kernel=_version("liger-kernel"),
+            internal_chunk=self.internal_chunk,
+            torch=torch.__version__,
+        )
 
     def forward(self):
         loss = self.function.apply(*self.args)
@@ -362,11 +411,24 @@ class ArmCCE(ArmAutograd):
         self.fn = linear_cross_entropy
 
     def versions(self):
-        return dict(cut_cross_entropy=_version("cut-cross-entropy"), impl="cce", filter_eps=self.filter_eps,
-                    informational=self.informational, torch=torch.__version__)
+        return dict(
+            cut_cross_entropy=_version("cut-cross-entropy"),
+            impl="cce",
+            filter_eps=self.filter_eps,
+            informational=self.informational,
+            torch=torch.__version__,
+        )
 
     def _cce(self, reduction):
-        return self.fn(self.X, self.W, self.inp.labels, ignore_index=IGNORE_INDEX, reduction=reduction, impl="cce", filter_eps=self.filter_eps)
+        return self.fn(
+            self.X,
+            self.W,
+            self.inp.labels,
+            ignore_index=IGNORE_INDEX,
+            reduction=reduction,
+            impl="cce",
+            filter_eps=self.filter_eps,
+        )
 
     def forward(self):
         inp = self.inp
@@ -377,7 +439,10 @@ class ArmCCE(ArmAutograd):
         return self._finish(logp)
 
     def outputs(self, st):
-        return dict(loss=st["loss"].detach(), logp=None if st["logp"] is None else st["logp"].detach())
+        return dict(
+            loss=st["loss"].detach(),
+            logp=None if st["logp"] is None else st["logp"].detach(),
+        )
 
 
 class ArmCCEDefault(ArmCCE):
@@ -407,22 +472,46 @@ class ArmCake(ArmAutograd):
         self.abi = cake_backend.record_abi(record)
 
     def versions(self):
-        return dict(module=self.module_name, abi=self.abi, stages=list(cake_backend.stages_for_entry(self.entry)),
-                    compact_rows=cake_backend.compact_rows_default())  # valid-row compaction (the labels carry ignored rows)
+        return dict(
+            module=self.module_name,
+            abi=self.abi,
+            stages=list(cake_backend.stages_for_entry(self.entry)),
+            compact_rows=cake_backend.compact_rows_default(),
+        )  # valid-row compaction (the labels carry ignored rows)
 
     def forward(self):
         inp = self.inp
         if self.entry == "logprob":
-            logp = chunked_lm_head_logprob(self.X, self.W, inp.labels, chunk_size=self.chunk, backend="cake")
+            logp = chunked_lm_head_logprob(
+                self.X, self.W, inp.labels, chunk_size=self.chunk, backend="cake"
+            )
             return dict(loss=_downstream_loss(logp, inp), logp=logp)
         loss, logp = chunked_lm_head_loss(
-            self.X, self.W, inp.labels, objective=inp.objective, loss_div=inp.loss_div if inp.objective == "ce" else None,
-            infer_logp=inp.infer_logp, loss_weights=inp.loss_weights, chunk_size=self.chunk, return_logp=True, backend="cake",
+            self.X,
+            self.W,
+            inp.labels,
+            objective=inp.objective,
+            loss_div=inp.loss_div if inp.objective == "ce" else None,
+            infer_logp=inp.infer_logp,
+            loss_weights=inp.loss_weights,
+            chunk_size=self.chunk,
+            return_logp=True,
+            backend="cake",
         )
         return dict(loss=loss, logp=logp)
 
 
-ARMS = {cls.name: cls for cls in (ArmTorchUnchunked, ArmTorchChunked, ArmLiger, ArmCCE, ArmCCEDefault, ArmCake)}
+ARMS = {
+    cls.name: cls
+    for cls in (
+        ArmTorchUnchunked,
+        ArmTorchChunked,
+        ArmLiger,
+        ArmCCE,
+        ArmCCEDefault,
+        ArmCake,
+    )
+}
 
 
 # ---------------------------------------------------------------------------
@@ -433,17 +522,19 @@ ARMS = {cls.name: cls for cls in (ArmTorchUnchunked, ArmTorchChunked, ArmLiger, 
 def measure_perf(arm, steps):
     """Median forward / backward / step milliseconds, the peak allocation above the live tensors during
     the forward and during the backward, and the bytes the forward leaves alive for the backward."""
-    st = arm.forward()
+    saved = [
+        arm.forward()
+    ]  # the forward state the timed backward consumes; released before the memory probes
     torch.cuda.synchronize()
     fwd_ms = median_ms(arm.forward, steps)
-    bwd_ms = median_ms(lambda: arm.backward(st), steps)
+    bwd_ms = median_ms(lambda: arm.backward(saved[0]), steps)
 
     def full():
         s = arm.forward()
         arm.backward(s)
 
     step_ms = median_ms(full, steps)
-    del st
+    saved.clear()
     torch.cuda.synchronize()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -459,7 +550,12 @@ def measure_perf(arm, steps):
     bwd_peak = torch.cuda.max_memory_allocated() - base_bwd
     del grads, st
     return dict(
-        fwd_ms=fwd_ms, bwd_ms=bwd_ms, step_ms=step_ms, fwd_peak_gib=gib(fwd_peak), bwd_peak_gib=gib(bwd_peak), saved_gib=gib(saved),
+        fwd_ms=fwd_ms,
+        bwd_ms=bwd_ms,
+        step_ms=step_ms,
+        fwd_peak_gib=gib(fwd_peak),
+        bwd_peak_gib=gib(bwd_peak),
+        saved_gib=gib(saved),
     )
 
 
@@ -469,7 +565,9 @@ def measure_accuracy(arm, inp, oracle, b0_errors):
     torch.cuda.synchronize()
     outs = arm.outputs(st)
     result = dict(loss=outs["loss"], logp=outs["logp"], dX=grads["dX"], dW=grads["dW"])
-    if result["logp"] is None:  # arms without per-token output: the row metrics fall away
+    if (
+        result["logp"] is None
+    ):  # arms without per-token output: the row metrics fall away
         result["logp"] = oracle["logp"].float()
     errors = error_report(result, oracle, inp.labels)
     if outs["logp"] is None:
@@ -477,27 +575,52 @@ def measure_accuracy(arm, inp, oracle, b0_errors):
             errors[key] = None
     ratios = gate_ratios({k: v for k, v in errors.items() if v is not None}, b0_errors)
     informational = bool(getattr(arm, "informational", False))
-    passes = None if informational else all(r <= 1.05 or b0_errors.get(k, 0) == 0 for k, r in ratios.items())
-    return dict(errors=errors, vs_unchunked=ratios, passes_1p05x=passes, informational=informational)
+    passes = (
+        None
+        if informational
+        else all(r <= 1.05 or b0_errors.get(k, 0) == 0 for k, r in ratios.items())
+    )
+    return dict(
+        errors=errors,
+        vs_unchunked=ratios,
+        passes_1p05x=passes,
+        informational=informational,
+    )
 
 
 def _arm_or_error(cls, inp, entry, chunk):
     try:
         return cls(inp, entry=entry, chunk=chunk), None
-    except Exception as exc:  # optional dependency missing or arm unavailable on this device
+    except (
+        Exception
+    ) as exc:  # optional dependency missing or arm unavailable on this device
         return None, f"{type(exc).__name__}: {exc}"
 
 
 def _row_inputs(row, args, W):
     T, C, objective, entry = ROWS[row]
-    return make_inputs(T, objective=objective, seed=SEED_BASE + T, device=args.device, W=W), C, entry
+    return (
+        make_inputs(
+            T, objective=objective, seed=SEED_BASE + T, device=args.device, W=W
+        ),
+        C,
+        entry,
+    )
 
 
 def run_perf(args, results, W):
     fmt = lambda v: "   n/a" if v is None else f"{v:8.3f}"
     for row in args.rows:
         inp, C, entry = _row_inputs(row, args, W)
-        record = dict(row=row, T=inp.T, chunk=C, objective=inp.objective, entry=entry, inputs_gib=gib(inp.bytes_inputs()), arms={})
+        record = dict(
+            row=row,
+            T=inp.T,
+            chunk=C,
+            objective=inp.objective,
+            entry=entry,
+            inputs_gib=gib(inp.bytes_inputs()),
+            arms={},
+        )
         for name in args.arms:
             arm, error = _arm_or_error(ARMS[name], inp, entry, C)
             if arm is None:
@@ -508,7 +631,10 @@ def run_perf(args, results, W):
                 perf = measure_perf(arm, max(args.min_steps, args.steps))
                 perf["versions"] = arm.versions()
             except Exception as exc:
-                perf = dict(error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
+                perf = dict(
+                    error=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc(),
+                )
             record["arms"][name] = perf
             if "error" in perf:
                 print(f"{row:22s} {name:16s} failed: {perf['error']}", flush=True)
@@ -533,8 +659,19 @@ def run_accuracy(args, results, W):
         b0_errors = error_report(b0, oracle, inp.labels)
         del b0
         torch.cuda.empty_cache()
-        record = dict(row=row, T=inp.T, chunk=C, objective=inp.objective, entry=entry, unchunked_errors=b0_errors, arms={})
-        print(f"{row:22s} {'unchunked (B0)':16s} {json.dumps(b0_errors, default=str)}", flush=True)
+        record = dict(
+            row=row,
+            T=inp.T,
+            chunk=C,
+            objective=inp.objective,
+            entry=entry,
+            unchunked_errors=b0_errors,
+            arms={},
+        )
+        print(
+            f"{row:22s} {'unchunked (B0)':16s} {json.dumps(b0_errors, default=str)}",
+            flush=True,
+        )
         for name in args.arms:
             arm, error = _arm_or_error(ARMS[name], inp, entry, C)
             if arm is None:
@@ -544,8 +681,14 @@ def run_accuracy(args, results, W):
             try:
                 record["arms"][name] = measure_accuracy(arm, inp, oracle, b0_errors)
             except Exception as exc:
-                record["arms"][name] = dict(error=f"{type(exc).__name__}: {exc}", traceback=traceback.format_exc())
-            print(f"{row:22s} {name:16s} {json.dumps(record['arms'][name], default=str)}", flush=True)
+                record["arms"][name] = dict(
+                    error=f"{type(exc).__name__}: {exc}",
+                    traceback=traceback.format_exc(),
+                )
+            print(
+                f"{row:22s} {name:16s} {json.dumps(record['arms'][name], default=str)}",
+                flush=True,
+            )
             del arm
             torch.cuda.empty_cache()
         results["accuracy"].append(record)
@@ -554,9 +697,15 @@ def run_accuracy(args, results, W):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--rows", nargs="*", default=list(ROWS), choices=list(ROWS))
-    parser.add_argument("--arms", default="torch_unchunked,torch_chunked,liger,cce,cake", help=f"comma-separated subset of {sorted(ARMS)}")
+    parser.add_argument(
+        "--arms",
+        default="torch_unchunked,torch_chunked,liger,cce,cake",
+        help=f"comma-separated subset of {sorted(ARMS)}",
+    )
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--min-steps", type=int, default=5)
     parser.add_argument("--accuracy", action="store_true")
@@ -573,10 +722,13 @@ def main():
         device = torch.device("cuda", torch.cuda.current_device())
     torch.cuda.set_device(device)
     args.device = device
-    warnings.simplefilter("ignore", ExperimentalWarning)  # the experimental banner of the public API
+    warnings.simplefilter(
+        "ignore", ExperimentalWarning
+    )  # the experimental banner of the public API
     env = dict(
         torch=torch.__version__,
-        flashinfer=getattr(flashinfer, "__version__", None) or _version("flashinfer-python"),
+        flashinfer=getattr(flashinfer, "__version__", None)
+        or _version("flashinfer-python"),
         liger_kernel=_version("liger-kernel"),
         cut_cross_entropy=_version("cut-cross-entropy"),
         device=torch.cuda.get_device_name(),
@@ -588,12 +740,16 @@ def main():
         capability=env["capability"],
         torch=torch.__version__,
         geometry=dict(H=H, V=V, loss_div=LOSS_DIV, seed_base=SEED_BASE),
-        program_available=dict(loss=cake_backend.generated_program_available(device, entry="loss"),
-                               logprob=cake_backend.generated_program_available(device, entry="logprob")),
+        program_available=dict(
+            loss=cake_backend.generated_program_available(device, entry="loss"),
+            logprob=cake_backend.generated_program_available(device, entry="logprob"),
+        ),
         rows=[],
         accuracy=[],
     )
-    W = make_weight(V, H, seed=SEED_BASE + 1000003, device=device)  # shared by every row of the process
+    W = make_weight(
+        V, H, seed=SEED_BASE + 1000003, device=device
+    )  # shared by every row of the process
     if not args.no_perf:
         run_perf(args, results, W)
     if args.accuracy:

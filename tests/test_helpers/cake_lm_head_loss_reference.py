@@ -77,8 +77,12 @@ class Inputs:
     loss_div: float
     infer_logp: Optional[torch.Tensor]
     loss_weights: Optional[torch.Tensor]
-    dlogp: torch.Tensor  # FP32 [T] incoming gradient of the log-probability entry (0 on ignored rows)
-    regime: Optional[torch.Tensor]  # policy: int8 [T]; -1 ignored, 0 below the clip, 2 above, 3 random (with margin)
+    dlogp: (
+        torch.Tensor
+    )  # FP32 [T] incoming gradient of the log-probability entry (0 on ignored rows)
+    regime: Optional[
+        torch.Tensor
+    ]  # policy: int8 [T]; -1 ignored, 0 below the clip, 2 above, 3 random (with margin)
     seed: int
 
     @property
@@ -98,7 +102,14 @@ class Inputs:
         return self.labels >= 0
 
     def bytes_inputs(self) -> int:
-        tensors = [self.X, self.W, self.labels, self.dlogp, self.infer_logp, self.loss_weights]
+        tensors = [
+            self.X,
+            self.W,
+            self.labels,
+            self.dlogp,
+            self.infer_logp,
+            self.loss_weights,
+        ]
         return sum(t.numel() * t.element_size() for t in tensors if t is not None)
 
 
@@ -106,11 +117,15 @@ def _randn_rows(shape, gen, device, scale: float) -> torch.Tensor:
     out = torch.empty(*shape, dtype=torch.bfloat16, device=device)
     for r0 in range(0, shape[0], _ROW_CHUNK):
         r1 = min(shape[0], r0 + _ROW_CHUNK)
-        out[r0:r1].copy_(torch.randn(r1 - r0, *shape[1:], device=device, generator=gen) * scale)
+        out[r0:r1].copy_(
+            torch.randn(r1 - r0, *shape[1:], device=device, generator=gen) * scale
+        )
     return out
 
 
-def make_weight(V: int = DEFAULT_V, H: int = DEFAULT_H, *, seed: int, device) -> torch.Tensor:
+def make_weight(
+    V: int = DEFAULT_V, H: int = DEFAULT_H, *, seed: int, device
+) -> torch.Tensor:
     """``W [V, H]`` BF16 ~ ``N(0, 1/H)`` from its own generator (shareable between problems)."""
     device = torch.device(device)
     gen = torch.Generator(device=device)
@@ -163,30 +178,50 @@ def make_inputs(
         labels[order[:num_ignored]] = IGNORE_INDEX
     valid = labels >= 0
     zero = torch.zeros((T,), dtype=torch.float32, device=device)
-    dlogp = torch.where(valid, torch.randn(T, generator=gen, device=device) * 0.05, zero)
+    dlogp = torch.where(
+        valid, torch.randn(T, generator=gen, device=device) * 0.05, zero
+    )
     if W is None:
         W = make_weight(V, H, seed=seed + 1000003, device=device)
-    elif tuple(W.shape) != (V, H) or W.dtype != torch.bfloat16 or W.device != zero.device:
+    elif (
+        tuple(W.shape) != (V, H) or W.dtype != torch.bfloat16 or W.device != zero.device
+    ):
         raise ValueError(f"W must be a BF16 [{V}, {H}] tensor on {device}")
     infer_logp = loss_weights = regime = None
     if objective == "policy":
         logp32 = _logp_fp64(X, W, labels).float()
         # random rows: delta = logp - infer ~ 0.5 N(0, 1), pushed out of the band |delta - ln 2| < KNEE_MARGIN
         delta = torch.randn(T, generator=gen, device=device) * 0.5
-        edge = LN2 + torch.where(delta >= LN2, torch.full_like(delta, KNEE_MARGIN), torch.full_like(delta, -KNEE_MARGIN))
+        edge = LN2 + torch.where(
+            delta >= LN2,
+            torch.full_like(delta, KNEE_MARGIN),
+            torch.full_like(delta, -KNEE_MARGIN),
+        )
         delta = torch.where((delta - LN2).abs() < KNEE_MARGIN, edge, delta)
         u = torch.rand(T, generator=gen, device=device)
         below = valid & (u < _BOUNDARY_FRACTION)  # ratio e^-1
-        above = valid & (u >= _BOUNDARY_FRACTION) & (u < 2 * _BOUNDARY_FRACTION)  # ratio e
+        above = (
+            valid & (u >= _BOUNDARY_FRACTION) & (u < 2 * _BOUNDARY_FRACTION)
+        )  # ratio e
         delta = torch.where(below, torch.full_like(delta, -1.0), delta)
         delta = torch.where(above, torch.full_like(delta, 1.0), delta)
         infer_logp = torch.where(valid, logp32 - delta, zero).contiguous()
         regime = torch.full((T,), 3, dtype=torch.int8, device=device)
         regime[below], regime[above], regime[~valid] = 0, 2, -1
-        loss_weights = torch.where(valid, torch.randn(T, generator=gen, device=device), zero).contiguous()
+        loss_weights = torch.where(
+            valid, torch.randn(T, generator=gen, device=device), zero
+        ).contiguous()
     return Inputs(
-        X=X, W=W, labels=labels, objective=objective, loss_div=float(loss_div), infer_logp=infer_logp,
-        loss_weights=loss_weights, dlogp=dlogp.contiguous(), regime=regime, seed=int(seed),
+        X=X,
+        W=W,
+        labels=labels,
+        objective=objective,
+        loss_div=float(loss_div),
+        infer_logp=infer_logp,
+        loss_weights=loss_weights,
+        dlogp=dlogp.contiguous(),
+        regime=regime,
+        seed=int(seed),
     )
 
 
@@ -207,7 +242,9 @@ def _row_stats_fp64(x64: torch.Tensor, W64: torch.Tensor, labels: torch.Tensor):
 
 
 @torch.no_grad()
-def _logp_fp64(X: torch.Tensor, W: torch.Tensor, labels: torch.Tensor, chunk_rows: int = 512) -> torch.Tensor:
+def _logp_fp64(
+    X: torch.Tensor, W: torch.Tensor, labels: torch.Tensor, chunk_rows: int = 512
+) -> torch.Tensor:
     T = int(X.shape[0])
     logp = torch.empty((T,), dtype=torch.float64, device=X.device)
     W64 = W.double()
@@ -267,7 +304,11 @@ def reference_fp64(
             d = torch.where(valid & (ratio <= RATIO_CLIP), -w * ratio, zero)
         if need_dx or need_dw:
             dz = torch.exp(z - l[:, None]).neg_()  # -softmax
-            dz.scatter_add_(1, index[:, None], torch.ones((r1 - r0, 1), dtype=torch.float64, device=device))
+            dz.scatter_add_(
+                1,
+                index[:, None],
+                torch.ones((r1 - r0, 1), dtype=torch.float64, device=device),
+            )
             dz.mul_(d[:, None])  # ignored rows: d = 0
             if need_dx:
                 dX[r0:r1] = dz @ W64
@@ -275,7 +316,9 @@ def reference_fp64(
                 dW.add_(dz.t() @ x64)
             del dz
         del z
-    loss = total / inp.loss_div if (entry == "loss" and inp.objective == "ce") else total
+    loss = (
+        total / inp.loss_div if (entry == "loss" and inp.objective == "ce") else total
+    )
     return dict(loss=loss, logp=logp, lse=lse, dX=dX, dW=dW)
 
 
@@ -319,7 +362,12 @@ def reference_unchunked(
         if need_dx or need_dw:
             loss.backward()
     dW = None if W.grad is None else W.grad.detach().to(grad_weight_dtype)
-    return dict(loss=loss.detach().float(), logp=logp.detach(), dX=None if X.grad is None else X.grad.detach(), dW=dW)
+    return dict(
+        loss=loss.detach().float(),
+        logp=logp.detach(),
+        dX=None if X.grad is None else X.grad.detach(),
+        dW=dW,
+    )
 
 
 # ---------------------------------------------------------------------------

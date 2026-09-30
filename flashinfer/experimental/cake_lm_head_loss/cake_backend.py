@@ -132,7 +132,7 @@ SUPPORTED_ABIS = (ABI_CONTRACT,)
 
 # Geometry the kernels of a record were built for (record field ``geometry``;
 # the defaults are the GLM-class contract).
-GEOMETRY_DEFAULTS = dict(
+GEOMETRY_DEFAULTS: dict[str, Any] = dict(
     stats_tile=256,  # vocabulary columns per (max, sum-exp) partial: stats[C, V / stats_tile, 2]
     row_tile=128,  # output rows per CTA of the GEMMs (m_tiles = ceil(rows / row_tile), rounded to the CTA pair)
     cta_group=2,  # CTAs per GEMM cluster (the pair takes adjacent row tiles)
@@ -173,14 +173,39 @@ STAGE_TENSORS = {
     "gemm_dx_s3": ("A", "B", "C", "STATS_OUT", "WS"),
     "gemm_dx_s4": ("A", "B", "C", "STATS_OUT", "WS"),
     "gemm_dw_acc": ("A", "B", "C", "STATS_OUT", "WS"),
-    "row_finalize": ("stats", "z", "labels", "infer_logp", "loss_weights", "d_in", "lse", "logp", "d", "term"),
+    "row_finalize": (
+        "stats",
+        "z",
+        "labels",
+        "infer_logp",
+        "loss_weights",
+        "d_in",
+        "lse",
+        "logp",
+        "d",
+        "term",
+    ),
     "loss_reduce": ("term", "loss_acc", "loss_out"),
     "row_grad": ("z", "labels", "lse", "d"),
     "scale_cast_bf16": ("acc", "g", "out"),
     "scale_cast_f32": ("acc", "g", "out"),
 }
 COMMON_TENSORS = ("workspace", "tma_descriptor_workspace")
-COMMON_SCALARS = ("rows_c", "row0", "T", "H", "V", "chunk", "num_tiles", "mode", "loss_div", "first_chunk", "last_chunk", "d_off", "ws_slab")
+COMMON_SCALARS = (
+    "rows_c",
+    "row0",
+    "T",
+    "H",
+    "V",
+    "chunk",
+    "num_tiles",
+    "mode",
+    "loss_div",
+    "first_chunk",
+    "last_chunk",
+    "d_off",
+    "ws_slab",
+)
 # K-sliced forms of the dX GEMM: ``gemm_dx_s<S>`` runs ``S`` K-slice work items per output tile (a
 # persistent grid with ``S`` x more items fills the last wave); slice 0 writes ``dX_acc``, slice ``s >= 1``
 # writes slab ``s - 1`` of the FP32 workspace ``WS [S - 1, rows, H]`` (``ws_slab`` = elements between
@@ -244,14 +269,24 @@ class Geometry:
                 raise ValueError(f"registry record: unknown geometry fields {unknown}")
             raw.update(declared)
         for name in GEOMETRY_DEFAULTS:
-            if name == "labels_dtype" or (name in _GEOMETRY_OPTIONAL and raw[name] is None):
+            if name == "labels_dtype" or (
+                name in _GEOMETRY_OPTIONAL and raw[name] is None
+            ):
                 continue
             if isinstance(raw[name], bool) or int(raw[name]) < 1:
-                raise ValueError(f"registry record: geometry {name} must be a positive integer")
+                raise ValueError(
+                    f"registry record: geometry {name} must be a positive integer"
+                )
         if raw["labels_dtype"] not in LABEL_DTYPES:
-            raise ValueError(f"registry record: geometry labels_dtype must be one of {sorted(LABEL_DTYPES)}")
+            raise ValueError(
+                f"registry record: geometry labels_dtype must be one of {sorted(LABEL_DTYPES)}"
+            )
         return cls(
-            **{name: int(raw[name]) for name in GEOMETRY_DEFAULTS if name != "labels_dtype" and name not in _GEOMETRY_OPTIONAL},
+            **{
+                name: int(raw[name])
+                for name in GEOMETRY_DEFAULTS
+                if name != "labels_dtype" and name not in _GEOMETRY_OPTIONAL
+            },
             labels_dtype=LABEL_DTYPES[raw["labels_dtype"]],
             hidden=None if raw["hidden"] is None else int(raw["hidden"]),
             vocab=None if raw["vocab"] is None else int(raw["vocab"]),
@@ -301,7 +336,9 @@ def record_for(device: Optional[torch.device] = None) -> tuple[str, dict[str, An
     """``(module_name, record)`` registered for ``device``; raises when absent."""
     arch = arch_for(device)
     if arch is None:
-        raise ValueError("the chunked LM-head + loss kernels require compute capability 10.0 or 10.3")
+        raise ValueError(
+            "the chunked LM-head + loss kernels require compute capability 10.0 or 10.3"
+        )
     name = select_module(arch)
     return name, MODULES[name]
 
@@ -328,23 +365,48 @@ def dx_max_slices(stages) -> int:
     return count
 
 
-def wave_efficiency(rows_c: int, hidden: int, num_sms: int, k_slices: int, geometry: "Geometry", resident: Optional[int] = None) -> float:
+def wave_efficiency(
+    rows_c: int,
+    hidden: int,
+    num_sms: int,
+    k_slices: int,
+    geometry: "Geometry",
+    resident: Optional[int] = None,
+) -> float:
     """Fraction of the last persistent wave of the dX GEMM that carries work: ``items / (ceil(items / clusters) * clusters)``
     with ``clusters`` = the co-resident ``dx_cluster_ctas``-wide clusters (``resident``; ``None`` = one per SM group of
     that width, the rule of the two-CTA cluster)."""
     ctas = geometry.dx_cluster_ctas
-    clusters = max(1, int(num_sms) // ctas) if resident is None else max(1, int(resident))
-    items = (geometry.row_tiles(rows_c, ctas) // ctas) * (int(hidden) // geometry.hidden_multiple) * int(k_slices)
+    clusters = (
+        max(1, int(num_sms) // ctas) if resident is None else max(1, int(resident))
+    )
+    items = (
+        (geometry.row_tiles(rows_c, ctas) // ctas)
+        * (int(hidden) // geometry.hidden_multiple)
+        * int(k_slices)
+    )
     return items / (-(-items // clusters) * clusters)
 
 
-def recommended_k_slices(rows_c: int, hidden: int, num_sms: int, max_slices: int, geometry: "Geometry", resident: Optional[int] = None) -> int:
+def recommended_k_slices(
+    rows_c: int,
+    hidden: int,
+    num_sms: int,
+    max_slices: int,
+    geometry: "Geometry",
+    resident: Optional[int] = None,
+) -> int:
     """Slice count of the dX GEMM for a chunk of ``rows_c`` rows: the ``S`` in ``[1, max_slices]`` with the best
     wave efficiency net of ``K_SLICE_PENALTY`` per extra slab.  Deterministic in the shapes, the SM count and the
     device's co-resident cluster count (:func:`cluster_resident`)."""
-    best, best_score = 1, wave_efficiency(rows_c, hidden, num_sms, 1, geometry, resident)
+    best, best_score = (
+        1,
+        wave_efficiency(rows_c, hidden, num_sms, 1, geometry, resident),
+    )
     for s in range(2, max(1, int(max_slices)) + 1):
-        score = wave_efficiency(rows_c, hidden, num_sms, s, geometry, resident) - K_SLICE_PENALTY * (s - 1)
+        score = wave_efficiency(
+            rows_c, hidden, num_sms, s, geometry, resident
+        ) - K_SLICE_PENALTY * (s - 1)
         if score > best_score + 1e-9:
             best, best_score = s, score
     return best
@@ -366,7 +428,9 @@ def _probe_cluster_capacity(device_index: int, cluster_ctas: int) -> int:
     with torch.cuda.device(device_index):
         torch.empty(1, device="cuda")  # primary context
         major, minor = torch.cuda.get_device_capability(device_index)
-        prog = checkCudaErrors(nvrtc.nvrtcCreateProgram(_PROBE_SOURCE.encode(), b"probe.cu", 0, [], []))
+        prog = checkCudaErrors(
+            nvrtc.nvrtcCreateProgram(_PROBE_SOURCE.encode(), b"probe.cu", 0, [], [])
+        )
         opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
         checkCudaErrors(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
         size = checkCudaErrors(nvrtc.nvrtcGetCUBINSize(prog))
@@ -378,13 +442,26 @@ def _probe_cluster_capacity(device_index: int, cluster_ctas: int) -> int:
             checkCudaErrors(driver.cuCtxSetCurrent(ctx))
             module = checkCudaErrors(driver.cuModuleLoadData(cubin))
             try:
-                func = checkCudaErrors(driver.cuModuleGetFunction(module, _PROBE_KERNEL.encode()))
-                smem = checkCudaErrors(
-                    driver.cuDeviceGetAttribute(driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device_index)
+                func = checkCudaErrors(
+                    driver.cuModuleGetFunction(module, _PROBE_KERNEL.encode())
                 )
-                checkCudaErrors(driver.cuFuncSetAttribute(func, driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem))
+                smem = checkCudaErrors(
+                    driver.cuDeviceGetAttribute(
+                        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                        device_index,
+                    )
+                )
+                checkCudaErrors(
+                    driver.cuFuncSetAttribute(
+                        func,
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem,
+                    )
+                )
                 attr = driver.CUlaunchAttribute()
-                attr.id = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                attr.id = (
+                    driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                )
                 attr.value.clusterDim.x = int(cluster_ctas)
                 attr.value.clusterDim.y = 1
                 attr.value.clusterDim.z = 1
@@ -398,7 +475,9 @@ def _probe_cluster_capacity(device_index: int, cluster_ctas: int) -> int:
                 config.sharedMemBytes = smem
                 config.attrs = [attr]
                 config.numAttrs = 1
-                count = int(checkCudaErrors(driver.cuOccupancyMaxActiveClusters(func, config)))
+                count = int(
+                    checkCudaErrors(driver.cuOccupancyMaxActiveClusters(func, config))
+                )
             finally:
                 checkCudaErrors(driver.cuModuleUnload(module))
         finally:
@@ -406,7 +485,9 @@ def _probe_cluster_capacity(device_index: int, cluster_ctas: int) -> int:
     return max(1, count)
 
 
-def cluster_resident(device: Optional[torch.device], cluster_ctas: int, num_sms: int) -> int:
+def cluster_resident(
+    device: Optional[torch.device], cluster_ctas: int, num_sms: int
+) -> int:
     """Co-resident clusters of ``cluster_ctas`` CTAs at one CTA per SM on ``device``: the SM pairs for the two-CTA
     cluster (the source launcher's rule), the driver's occupancy answer (:func:`_probe_cluster_capacity`) for wider
     clusters.  The persistent GEMM grids and the dX slice rule take it as ``resident``."""
@@ -414,14 +495,21 @@ def cluster_resident(device: Optional[torch.device], cluster_ctas: int, num_sms:
     if cluster_ctas <= 2:
         return max(1, int(num_sms) // max(1, cluster_ctas))
     if device is None or device.type != "cuda":
-        raise ValueError(f"the co-resident count of {cluster_ctas}-CTA clusters needs a CUDA device")
+        raise ValueError(
+            f"the co-resident count of {cluster_ctas}-CTA clusters needs a CUDA device"
+        )
     index = device.index if device.index is not None else torch.cuda.current_device()
     return _probe_cluster_capacity(int(index), cluster_ctas)
 
 
 def _dx_reduce(values: dict[str, Any]) -> None:
     """Add the K-slice slabs into the chunk's rows of ``dX_acc`` in fixed slab order (host side, in place)."""
-    out, ws, rows_c, k = values["acc"], values["ws"], int(values["rows_c"]), int(values["k_slices"])
+    out, ws, rows_c, k = (
+        values["acc"],
+        values["ws"],
+        int(values["rows_c"]),
+        int(values["k_slices"]),
+    )
     for slab in range(k - 1):
         out.add_(ws[slab, :rows_c])
 
@@ -450,12 +538,16 @@ def valid_row_index(labels: torch.Tensor) -> Optional[torch.Tensor]:
     return valid.nonzero().squeeze(1)
 
 
-def scatter_rows(rows: torch.Tensor, idx: Optional[torch.Tensor], num_rows: int) -> torch.Tensor:
+def scatter_rows(
+    rows: torch.Tensor, idx: Optional[torch.Tensor], num_rows: int
+) -> torch.Tensor:
     """Rows of a compacted ``[T_v, ...]`` tensor back into a fresh ``[num_rows, ...]`` tensor with exact zeros
     elsewhere (``idx=None``: the identity, the tensor itself)."""
     if idx is None:
         return rows
-    out = torch.zeros((int(num_rows),) + tuple(rows.shape[1:]), dtype=rows.dtype, device=rows.device)
+    out = torch.zeros(
+        (int(num_rows),) + tuple(rows.shape[1:]), dtype=rows.dtype, device=rows.device
+    )
     if idx.numel():
         out.index_copy_(0, idx, rows)
     return out
@@ -468,10 +560,19 @@ def _gather_rows(values: dict[str, Any]) -> None:
 
 
 # Host-side steps of the chunk loop (torch operators over the bound tensors, no kernel of the program, no allocation).
-HOST_STAGES: dict[str, Callable[[dict[str, Any]], None]] = {"dx_reduce": _dx_reduce, "gather_rows": _gather_rows}
+HOST_STAGES: dict[str, Callable[[dict[str, Any]], None]] = {
+    "dx_reduce": _dx_reduce,
+    "gather_rows": _gather_rows,
+}
 
 
-def stages_for_entry(entry: str, *, need_dx: bool = True, need_dw: bool = True, grad_weight_dtype=torch.bfloat16) -> tuple[str, ...]:
+def stages_for_entry(
+    entry: str,
+    *,
+    need_dx: bool = True,
+    need_dw: bool = True,
+    grad_weight_dtype=torch.bfloat16,
+) -> tuple[str, ...]:
     """Stages an entry point launches (``need_dx`` / ``need_dw`` drop the GEMMs of frozen inputs)."""
     if entry not in ENTRIES:
         raise ValueError(f"entry must be one of {ENTRIES}")
@@ -485,11 +586,18 @@ def stages_for_entry(entry: str, *, need_dx: bool = True, need_dw: bool = True, 
     if need_dx:
         stages += ["gemm_dx", "scale_cast_bf16"]
     if need_dw:
-        stages += ["gemm_dw_acc", "scale_cast_f32" if (entry == "loss" and grad_weight_dtype == torch.float32) else "scale_cast_bf16"]
+        stages += [
+            "gemm_dw_acc",
+            "scale_cast_f32"
+            if (entry == "loss" and grad_weight_dtype == torch.float32)
+            else "scale_cast_bf16",
+        ]
     return tuple(s for s in STAGES if s in stages)
 
 
-def generated_program_available(device: Optional[torch.device] = None, *, entry: str = "loss") -> bool:
+def generated_program_available(
+    device: Optional[torch.device] = None, *, entry: str = "loss"
+) -> bool:
     """True when this checkout registers a contract program for ``device`` with every stage the entry point needs."""
     arch = arch_for(device)
     if arch is None:
@@ -501,7 +609,9 @@ def generated_program_available(device: Optional[torch.device] = None, *, entry:
     if str(record.get("abi", ABI_CONTRACT)) != ABI_CONTRACT:
         return False
     stages = registered_stages(names[0])
-    needed = set(stages_for_entry(entry)) | set(stages_for_entry(entry, grad_weight_dtype=torch.float32))
+    needed = set(stages_for_entry(entry)) | set(
+        stages_for_entry(entry, grad_weight_dtype=torch.float32)
+    )
     return all(stage in stages for stage in needed)
 
 
@@ -538,7 +648,9 @@ def _positive_scalar(value, name: str) -> float:
         if value.numel() != 1:
             raise ValueError(f"{name} must be a scalar")
         if value.is_cuda:
-            raise ValueError(f"{name} must be a Python number or a CPU scalar (a device value would synchronize)")
+            raise ValueError(
+                f"{name} must be a Python number or a CPU scalar (a device value would synchronize)"
+            )
         value = value.item()
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{name} must be a positive number")
@@ -572,7 +684,9 @@ def validate_lm_head_inputs(
     if entry not in ENTRIES:
         raise ValueError(f"entry must be one of {ENTRIES}")
     if deterministic is not True:
-        raise NotImplementedError("only deterministic=True is available: fixed chunk order, no atomics")
+        raise NotImplementedError(
+            "only deterministic=True is available: fixed chunk order, no atomics"
+        )
     if X.ndim != 2 or X.dtype != torch.bfloat16:
         raise ValueError("X must be a BF16 [T, H] tensor")
     if W.ndim != 2 or W.dtype != torch.bfloat16:
@@ -582,43 +696,81 @@ def validate_lm_head_inputs(
     num_rows, hidden = (int(s) for s in X.shape)
     vocab, w_hidden = (int(s) for s in W.shape)
     if w_hidden != hidden:
-        raise ValueError(f"W has {w_hidden} columns, X has {hidden}: the hidden sizes differ")
+        raise ValueError(
+            f"W has {w_hidden} columns, X has {hidden}: the hidden sizes differ"
+        )
     if hidden < 1 or hidden % geometry.hidden_multiple:
-        raise ValueError(f"H must be a positive multiple of {geometry.hidden_multiple}, got {hidden}")
+        raise ValueError(
+            f"H must be a positive multiple of {geometry.hidden_multiple}, got {hidden}"
+        )
     if vocab < 1 or vocab % geometry.vocab_multiple:
-        raise ValueError(f"V must be a positive multiple of {geometry.vocab_multiple}, got {vocab}")
+        raise ValueError(
+            f"V must be a positive multiple of {geometry.vocab_multiple}, got {vocab}"
+        )
     if geometry.hidden is not None and hidden != geometry.hidden:
-        raise ValueError(f"the registered program is specialized to H = {geometry.hidden}, got {hidden}")
+        raise ValueError(
+            f"the registered program is specialized to H = {geometry.hidden}, got {hidden}"
+        )
     if geometry.vocab is not None and vocab != geometry.vocab:
-        raise ValueError(f"the registered program is specialized to V = {geometry.vocab}, got {vocab}")
+        raise ValueError(
+            f"the registered program is specialized to V = {geometry.vocab}, got {vocab}"
+        )
     if X.stride(1) != 1:
         raise ValueError("X rows must be contiguous (stride(1) == 1)")
     ld_x = int(X.stride(0))
     if num_rows > 1 and ld_x < hidden:
         raise ValueError("X must be row-major with a leading stride of at least H")
     # The TMA operands need a 16 B row pitch and base; otherwise X is materialized contiguously (reported).
-    x_copy = bool(num_rows and (ld_x < hidden or ld_x % geometry.ld_multiple or X.data_ptr() % 16))
+    x_copy = bool(
+        num_rows and (ld_x < hidden or ld_x % geometry.ld_multiple or X.data_ptr() % 16)
+    )
     if x_copy or num_rows == 0:
         ld_x = hidden
     if labels.ndim != 1 or int(labels.shape[0]) != num_rows:
         raise ValueError("labels must be a [T] tensor")
     if labels.dtype != torch.int64:
         raise ValueError("labels must be int64 (-100 marks ignored rows)")
-    if isinstance(chunk_size, bool) or int(chunk_size) != chunk_size or int(chunk_size) < 1:
+    if (
+        isinstance(chunk_size, bool)
+        or int(chunk_size) != chunk_size
+        or int(chunk_size) < 1
+    ):
         raise ValueError("chunk_size must be a positive integer")
     if int(chunk_size) > 65535:
-        raise ValueError("chunk_size must not exceed 65535 (the row kernels index the chunk row by blockIdx.y)")
+        raise ValueError(
+            "chunk_size must not exceed 65535 (the row kernels index the chunk row by blockIdx.y)"
+        )
     if grad_weight_dtype not in GRAD_WEIGHT_DTYPES:
         raise ValueError("grad_weight_dtype must be torch.bfloat16 or torch.float32")
     if entry == "logprob":
-        if objective != "ce" or loss_div is not None or infer_logp is not None or loss_weights is not None:
-            raise ValueError("the log-probability entry point takes no objective arguments")
-        return Problem(num_rows, hidden, vocab, int(chunk_size), ld_x, x_copy, "ce", None, grad_weight_dtype, entry)
+        if (
+            objective != "ce"
+            or loss_div is not None
+            or infer_logp is not None
+            or loss_weights is not None
+        ):
+            raise ValueError(
+                "the log-probability entry point takes no objective arguments"
+            )
+        return Problem(
+            num_rows,
+            hidden,
+            vocab,
+            int(chunk_size),
+            ld_x,
+            x_copy,
+            "ce",
+            None,
+            grad_weight_dtype,
+            entry,
+        )
     if objective not in OBJECTIVES:
         raise ValueError(f"objective must be one of {OBJECTIVES}, got {objective!r}")
     if objective == "ce":
         if loss_div is None:
-            raise ValueError("objective='ce' needs loss_div (a caller-supplied positive scalar)")
+            raise ValueError(
+                "objective='ce' needs loss_div (a caller-supplied positive scalar)"
+            )
         if infer_logp is not None or loss_weights is not None:
             raise ValueError("infer_logp and loss_weights belong to objective='policy'")
         loss_div = _positive_scalar(loss_div, "loss_div")
@@ -632,7 +784,18 @@ def validate_lm_head_inputs(
                 raise ValueError(f"{name} must be an FP32 [T] tensor")
             if not t.is_contiguous():
                 raise ValueError(f"{name} must be contiguous")
-    return Problem(num_rows, hidden, vocab, int(chunk_size), ld_x, x_copy, objective, loss_div, grad_weight_dtype, entry)
+    return Problem(
+        num_rows,
+        hidden,
+        vocab,
+        int(chunk_size),
+        ld_x,
+        x_copy,
+        objective,
+        loss_div,
+        grad_weight_dtype,
+        entry,
+    )
 
 
 def plan_chunks(num_rows: int, chunk: int) -> tuple[tuple[int, int], ...]:
@@ -640,7 +803,10 @@ def plan_chunks(num_rows: int, chunk: int) -> tuple[tuple[int, int], ...]:
     tail (``T % C``) last, never dropped, never padded; empty for ``T == 0``."""
     if int(chunk) < 1:
         raise ValueError("chunk must be positive")
-    return tuple((row0, min(int(chunk), int(num_rows) - row0)) for row0 in range(0, int(num_rows), int(chunk)))
+    return tuple(
+        (row0, min(int(chunk), int(num_rows) - row0))
+        for row0 in range(0, int(num_rows), int(chunk))
+    )
 
 
 @dataclass(frozen=True)
@@ -652,8 +818,12 @@ class Plan:
     need_dx: bool
     need_dw: bool
     geometry: Geometry = DEFAULT_GEOMETRY
-    dx_slices: tuple[int, ...] = ()  # K-slice count of the dX GEMM per chunk (empty = one slice everywhere)
-    valid_rows: Optional[int] = None  # rows of the compacted chunk loop (the valid rows); None = every row of the caller
+    dx_slices: tuple[
+        int, ...
+    ] = ()  # K-slice count of the dX GEMM per chunk (empty = one slice everywhere)
+    valid_rows: Optional[int] = (
+        None  # rows of the compacted chunk loop (the valid rows); None = every row of the caller
+    )
 
     @property
     def compact(self) -> bool:
@@ -679,35 +849,65 @@ class Plan:
     @property
     def dx_ws_slabs(self) -> int:
         """FP32 ``[rows, H]`` slabs of the K-slice workspace the plan needs (largest slice count - 1)."""
-        return max((int(k) for k in self.dx_slices), default=1) - 1 if self.need_dx else 0
+        return (
+            max((int(k) for k in self.dx_slices), default=1) - 1 if self.need_dx else 0
+        )
 
     @property
     def stages(self) -> tuple[str, ...]:
         base = stages_for_entry(
-            self.problem.entry, need_dx=self.need_dx, need_dw=self.need_dw, grad_weight_dtype=self.problem.grad_weight_dtype
+            self.problem.entry,
+            need_dx=self.need_dx,
+            need_dw=self.need_dw,
+            grad_weight_dtype=self.problem.grad_weight_dtype,
         )
-        used = set(base) | ({dx_stage(k) for k in self.dx_slices} if self.need_dx else set())
+        used = set(base) | (
+            {dx_stage(k) for k in self.dx_slices} if self.need_dx else set()
+        )
         return tuple(s for s in STAGES if s in used)
 
     @property
     def dw_cast_stage(self) -> str:
-        fp32 = self.problem.entry == "loss" and self.problem.grad_weight_dtype == torch.float32
+        fp32 = (
+            self.problem.entry == "loss"
+            and self.problem.grad_weight_dtype == torch.float32
+        )
         return "scale_cast_f32" if fp32 else "scale_cast_bf16"
 
 
 def make_plan(
-    problem: Problem, *, need_dx: bool, need_dw: bool, geometry: Geometry = DEFAULT_GEOMETRY, dx_max_slices: int = 1, num_sms: int = 1,
-    valid_rows: Optional[int] = None, dx_resident: Optional[int] = None,
+    problem: Problem,
+    *,
+    need_dx: bool,
+    need_dw: bool,
+    geometry: Geometry = DEFAULT_GEOMETRY,
+    dx_max_slices: int = 1,
+    num_sms: int = 1,
+    valid_rows: Optional[int] = None,
+    dx_resident: Optional[int] = None,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count
     (``dx_resident`` = the device's co-resident dX clusters, :func:`cluster_resident`); ``valid_rows`` (compaction)
     chunks that many rows instead of ``T``."""
     rows = problem.num_rows if valid_rows is None else int(valid_rows)
     chunks = plan_chunks(rows, problem.chunk)
-    slices = ()
+    slices: tuple[int, ...] = ()
     if need_dx and int(dx_max_slices) > 1:
-        slices = tuple(recommended_k_slices(rows_c, problem.hidden, num_sms, dx_max_slices, geometry, dx_resident) for _, rows_c in chunks)
-    return Plan(problem, chunks, bool(need_dx), bool(need_dw), geometry, slices, None if valid_rows is None else int(valid_rows))
+        slices = tuple(
+            recommended_k_slices(
+                rows_c, problem.hidden, num_sms, dx_max_slices, geometry, dx_resident
+            )
+            for _, rows_c in chunks
+        )
+    return Plan(
+        problem,
+        chunks,
+        bool(need_dx),
+        bool(need_dw),
+        geometry,
+        slices,
+        None if valid_rows is None else int(valid_rows),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +950,9 @@ def workspace_layout(
     allocated separately so that no returned or saved tensor pins the
     vocabulary buffer.
     """
-    rows = min(int(chunk), max(int(num_rows), 1))  # the logits workspace never exceeds T rows either
+    rows = min(
+        int(chunk), max(int(num_rows), 1)
+    )  # the logits workspace never exceeds T rows either
     tiles = -(-int(vocab) // int(stats_tile))
     sizes = [
         ("logits", rows * int(vocab) * 2),
@@ -762,11 +964,15 @@ def workspace_layout(
     ]
     if dx_ws_slabs:
         if int(hidden) < 1:
-            raise ValueError("workspace_layout needs hidden > 0 for the K-slice workspace")
+            raise ValueError(
+                "workspace_layout needs hidden > 0 for the K-slice workspace"
+            )
         sizes.append(("dx_ws", int(dx_ws_slabs) * rows * int(hidden) * 4))
     if compact:
         if int(hidden) < 1:
-            raise ValueError("workspace_layout needs hidden > 0 for the gather buffer of the compacted rows")
+            raise ValueError(
+                "workspace_layout needs hidden > 0 for the gather buffer of the compacted rows"
+            )
         sizes.append(("x_c", rows * int(hidden) * 2))
     if scratch_bytes:
         sizes.append(("workspace", int(scratch_bytes)))
@@ -782,7 +988,9 @@ def workspace_layout(
 
 
 def _record_tma_bytes(record: dict[str, Any], stages) -> int:
-    return max((int(record[s].get("tma_workspace_bytes", 0)) for s in stages), default=0)
+    return max(
+        (int(record[s].get("tma_workspace_bytes", 0)) for s in stages), default=0
+    )
 
 
 def _record_scratch_bytes(record: dict[str, Any], stages) -> int:
@@ -830,16 +1038,30 @@ def memory_report(
     ``X`` is never needed (the gather output is contiguous).
     """
     compact = valid_rows is not None
-    rows = int(valid_rows) if compact else int(num_rows)  # rows the chunk loop processes
+    rows = (
+        int(valid_rows) if compact else int(num_rows)
+    )  # rows the chunk loop processes
     layout = workspace_layout(
-        rows, vocab, chunk, stats_tile=stats_tile, entry=entry,
-        tma_workspace_bytes=tma_workspace_bytes, scratch_bytes=scratch_bytes,
-        dx_ws_slabs=dx_ws_slabs if need_dx else 0, hidden=hidden, compact=compact,
+        rows,
+        vocab,
+        chunk,
+        stats_tile=stats_tile,
+        entry=entry,
+        tma_workspace_bytes=tma_workspace_bytes,
+        scratch_bytes=scratch_bytes,
+        dx_ws_slabs=dx_ws_slabs if need_dx else 0,
+        hidden=hidden,
+        compact=compact,
     )
-    temporary = {name: size for name, (_, size) in ((k, v) for k, v in layout.items() if k != "total")}
+    temporary = {
+        name: size
+        for name, (_, size) in ((k, v) for k, v in layout.items() if k != "total")
+    }
     temporary["lse"] = rows * 4
     if entry == "loss" and (compact or not return_logp):
-        temporary["logp"] = rows * 4  # compacted: the [T_v] rows before the scatter into the returned [T] logp
+        temporary["logp"] = (
+            rows * 4
+        )  # compacted: the [T_v] rows before the scatter into the returned [T] logp
     if entry == "logprob":
         temporary["dlogp"] = int(num_rows) * 4
     if compact:
@@ -847,14 +1069,23 @@ def memory_report(
         if entry == "logprob":
             temporary["dlogp_compact"] = rows * 4
         if need_dx:
-            temporary["dx_compact"] = rows * int(hidden) * 2  # the cast compact rows, transient before the scatter into dX
+            temporary["dx_compact"] = (
+                rows * int(hidden) * 2
+            )  # the cast compact rows, transient before the scatter into dX
     if x_copy and not compact:
         temporary["x_copy"] = int(num_rows) * int(hidden) * 2
-    outputs = {"loss": 4 if entry == "loss" else 0, "logp": int(num_rows) * 4 if (return_logp or entry == "logprob") else 0}
+    outputs = {
+        "loss": 4 if entry == "loss" else 0,
+        "logp": int(num_rows) * 4 if (return_logp or entry == "logprob") else 0,
+    }
     if need_dx:
         outputs["dX"] = int(num_rows) * int(hidden) * 2
     if need_dw:
-        outputs["dW"] = int(vocab) * int(hidden) * (4 if (entry == "loss" and grad_weight_dtype == torch.float32) else 2)
+        outputs["dW"] = (
+            int(vocab)
+            * int(hidden)
+            * (4 if (entry == "loss" and grad_weight_dtype == torch.float32) else 2)
+        )
     accumulators = {}
     if need_dx:
         accumulators["dX_acc"] = rows * int(hidden) * 4
@@ -897,9 +1128,20 @@ def lm_head_loss_workspace_size(
     defaults to the registered program's pinned hidden size).  ``compact_rows`` adds the gather buffer of the
     compacted path; sized for ``T`` rows it bounds every valid-row count."""
     if compact_rows and not hidden and backend == "reference":
-        raise ValueError("lm_head_loss_workspace_size needs hidden= for the compacted path")
+        raise ValueError(
+            "lm_head_loss_workspace_size needs hidden= for the compacted path"
+        )
     if backend == "reference":
-        return int(workspace_layout(num_rows, vocab, chunk, entry=entry, hidden=hidden or 0, compact=compact_rows)["total"])
+        return int(
+            workspace_layout(
+                num_rows,
+                vocab,
+                chunk,
+                entry=entry,
+                hidden=hidden or 0,
+                compact=compact_rows,
+            )["total"]
+        )
     name, record = record_for(device)
     stages = registered_stages(name)
     geometry = Geometry.from_record(record)
@@ -907,19 +1149,46 @@ def lm_head_loss_workspace_size(
     slabs = 0
     if need_dx and dx_max_slices(stages) > 1:
         if hidden is None:
-            raise ValueError("lm_head_loss_workspace_size needs hidden= for a program with K-sliced dX stages")
+            raise ValueError(
+                "lm_head_loss_workspace_size needs hidden= for a program with K-sliced dX stages"
+            )
         num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
-        resident = cluster_resident(torch.device("cuda", torch.cuda.current_device()) if device is None else torch.device(device),
-                                    geometry.dx_cluster_ctas, num_sms)
-        slabs = max(
-            (recommended_k_slices(rows_c, hidden, num_sms, dx_max_slices(stages), geometry, resident) for _, rows_c in plan_chunks(num_rows, chunk)),
-            default=1,
-        ) - 1
+        resident = cluster_resident(
+            torch.device("cuda", torch.cuda.current_device())
+            if device is None
+            else torch.device(device),
+            geometry.dx_cluster_ctas,
+            num_sms,
+        )
+        slabs = (
+            max(
+                (
+                    recommended_k_slices(
+                        rows_c,
+                        hidden,
+                        num_sms,
+                        dx_max_slices(stages),
+                        geometry,
+                        resident,
+                    )
+                    for _, rows_c in plan_chunks(num_rows, chunk)
+                ),
+                default=1,
+            )
+            - 1
+        )
     return int(
         workspace_layout(
-            num_rows, vocab, chunk, stats_tile=geometry.stats_tile, entry=entry,
-            tma_workspace_bytes=_record_tma_bytes(record, stages), scratch_bytes=_record_scratch_bytes(record, stages),
-            dx_ws_slabs=slabs, hidden=hidden or 0, compact=bool(compact_rows),
+            num_rows,
+            vocab,
+            chunk,
+            stats_tile=geometry.stats_tile,
+            entry=entry,
+            tma_workspace_bytes=_record_tma_bytes(record, stages),
+            scratch_bytes=_record_scratch_bytes(record, stages),
+            dx_ws_slabs=slabs,
+            hidden=hidden or 0,
+            compact=bool(compact_rows),
         )["total"]
     )
 
@@ -928,7 +1197,9 @@ def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape) -> torch.T
     offset, nbytes = layout[name]
     needed = math.prod(shape) * torch.empty((), dtype=dtype).element_size()
     if needed > nbytes:
-        raise ValueError(f"workspace region {name!r} holds {nbytes} bytes, {needed} needed")
+        raise ValueError(
+            f"workspace region {name!r} holds {nbytes} bytes, {needed} needed"
+        )
     return flat[offset : offset + needed].view(dtype).view(shape)
 
 
@@ -939,7 +1210,9 @@ def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape) -> torch.T
 _GRID_FUNCTIONS = {"min": min, "max": max}
 
 
-def grid_dims(rule, scalars: dict[str, Any], num_sms: int, resident: Optional[int] = None) -> tuple[int, int, int]:
+def grid_dims(
+    rule, scalars: dict[str, Any], num_sms: int, resident: Optional[int] = None
+) -> tuple[int, int, int]:
     """Evaluate a registry grid rule.
 
     Each of the three entries is an integer or an integer expression over the
@@ -958,7 +1231,11 @@ def grid_dims(rule, scalars: dict[str, Any], num_sms: int, resident: Optional[in
     # Only the integer host values take part; tensors and None never enter the evaluation environment, and the
     # evaluator is a plain module-level function -- a nested recursive closure would form a reference cycle that
     # keeps every captured host value (the accumulators / outputs of a scale_cast call) alive until the cyclic GC.
-    names = {key: int(value) for key, value in scalars.items() if isinstance(value, int) and not isinstance(value, bool)}
+    names = {
+        key: int(value)
+        for key, value in scalars.items()
+        if isinstance(value, int) and not isinstance(value, bool)
+    }
     names["sms"] = int(num_sms)
     if resident is not None:
         names["resident"] = int(resident)
@@ -983,7 +1260,9 @@ def _grid_eval(node, names: dict[str, int]) -> int:
         return _grid_eval(node.body, names)
     if isinstance(node, ast.Constant):
         if isinstance(node.value, bool) or not isinstance(node.value, int):
-            raise ValueError(f"grid rule constants must be integers, got {node.value!r}")
+            raise ValueError(
+                f"grid rule constants must be integers, got {node.value!r}"
+            )
         return int(node.value)
     if isinstance(node, ast.Name):
         if node.id not in names:
@@ -1003,11 +1282,17 @@ def _grid_eval(node, names: dict[str, int]) -> int:
             return -(-left // right) if isinstance(node.op, ast.Div) else left // right
         raise ValueError(f"grid rule operator {type(node.op).__name__} is not allowed")
     if isinstance(node, ast.Call):
-        if not isinstance(node.func, ast.Name) or node.func.id not in _GRID_FUNCTIONS or node.keywords:
+        if (
+            not isinstance(node.func, ast.Name)
+            or node.func.id not in _GRID_FUNCTIONS
+            or node.keywords
+        ):
             raise ValueError("grid rule calls must be min(...) or max(...)")
         if len(node.args) < 2:
             raise ValueError("grid rule min()/max() take at least two terms")
-        return _GRID_FUNCTIONS[node.func.id](_grid_eval(arg, names) for arg in node.args)
+        return _GRID_FUNCTIONS[node.func.id](
+            _grid_eval(arg, names) for arg in node.args
+        )
     raise ValueError(f"grid rule syntax {type(node).__name__} is not allowed")
 
 
@@ -1047,7 +1332,9 @@ class _Launch:
         return arguments
 
 
-def bind_stage(module_name: str, stage: str, values: dict[str, Any], grid: tuple[int, int, int]) -> _Launch:
+def bind_stage(
+    module_name: str, stage: str, values: dict[str, Any], grid: tuple[int, int, int]
+) -> _Launch:
     """Order ``values`` by the generated argument plan of ``stage`` and load its entry.
 
     Fails closed: a keyword the kernel expects that the host does not provide
@@ -1062,7 +1349,9 @@ def bind_stage(module_name: str, stage: str, values: dict[str, Any], grid: tuple
         key = name if name in values else CONTRACT_ALIASES.get(name, name)
         if kind == "grid":
             arguments.append(grid_values[name])
-        elif key in values and values[key] is not None:  # buffer / tma_buffer / workspace / parameter
+        elif (
+            key in values and values[key] is not None
+        ):  # buffer / tma_buffer / workspace / parameter
             value = values[key]
             if isinstance(value, torch.Tensor):
                 slots.append((len(arguments), key))
@@ -1075,7 +1364,15 @@ def bind_stage(module_name: str, stage: str, values: dict[str, Any], grid: tuple
     module = load_cake_lm_head_loss_module(module_name, stage)
     prepare_entry = physical.get("tma_prepare_entry")
     prepare = getattr(module, prepare_entry) if prepare_entry else None
-    return _Launch(stage, module_name, getattr(module, physical["ffi_entry"]), tuple(arguments), grid, prepare, tuple(slots))
+    return _Launch(
+        stage,
+        module_name,
+        getattr(module, physical["ffi_entry"]),
+        tuple(arguments),
+        grid,
+        prepare,
+        tuple(slots),
+    )
 
 
 _FFI_DEVICES: dict[int, Any] = {}
@@ -1104,7 +1401,11 @@ def _ffi_stream_context(index: int):
     if device is None:
         device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
     getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    raw = getter(index) if getter is not None else torch.cuda.current_stream(index).cuda_stream
+    raw = (
+        getter(index)
+        if getter is not None
+        else torch.cuda.current_stream(index).cuda_stream
+    )
     return tvm_ffi.use_raw_stream(device, raw)
 
 
@@ -1113,7 +1414,9 @@ def _ffi_stream_context(index: int):
 # ---------------------------------------------------------------------------
 
 
-def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order_key: Any = None) -> dict[str, Any]:
+def stage_values(
+    stage: str, t: dict[str, Any], plan: Plan, index: int, *, order_key: Any = None
+) -> dict[str, Any]:
     """Host values of ``stage`` for chunk ``index`` (the kernel's own argument names).
 
     ``t`` holds the bound tensors: ``X`` (as launched), ``W``, ``labels``,
@@ -1135,70 +1438,165 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
     """
     p, g = plan.problem, plan.geometry
     values: dict[str, Any] = {name: t.get(name) for name in COMMON_TENSORS}
-    values.update(T=int(plan.rows), H=int(p.hidden), V=int(p.vocab), chunk=int(p.chunk), num_tiles=int(plan.num_tiles),
-                  mode=int(p.mode), loss_div=float(p.loss_div) if p.loss_div is not None else 1.0, ws_slab=0)
-    if stage == "gather_rows":  # host-side row gather of the compacted path (no kernel of the program)
+    values.update(
+        T=int(plan.rows),
+        H=int(p.hidden),
+        V=int(p.vocab),
+        chunk=int(p.chunk),
+        num_tiles=int(plan.num_tiles),
+        mode=int(p.mode),
+        loss_div=float(p.loss_div) if p.loss_div is not None else 1.0,
+        ws_slab=0,
+    )
+    if (
+        stage == "gather_rows"
+    ):  # host-side row gather of the compacted path (no kernel of the program)
         if not plan.compact:
             raise ValueError("gather_rows belongs to a compacted plan")
         if isinstance(index, str):
-            values.update(src=t[index + "_full"], idx=t["row_index"], out=t[index], rows_c=int(plan.rows), row0=0,
-                          first_chunk=0, last_chunk=0, d_off=0)
+            values.update(
+                src=t[index + "_full"],
+                idx=t["row_index"],
+                out=t[index],
+                rows_c=int(plan.rows),
+                row0=0,
+                first_chunk=0,
+                last_chunk=0,
+                d_off=0,
+            )
             return values
         row0, rows_c = plan.chunks[index]
-        values.update(src=t["X"], idx=t["row_index"][row0:row0 + rows_c], out=t["x_c"][:rows_c], rows_c=int(rows_c), row0=int(row0),
-                      first_chunk=int(index == 0), last_chunk=int(index == plan.num_chunks - 1), d_off=0)
+        values.update(
+            src=t["X"],
+            idx=t["row_index"][row0 : row0 + rows_c],
+            out=t["x_c"][:rows_c],
+            rows_c=int(rows_c),
+            row0=int(row0),
+            first_chunk=int(index == 0),
+            last_chunk=int(index == plan.num_chunks - 1),
+            d_off=0,
+        )
         return values
     if stage in ("scale_cast_bf16", "scale_cast_f32"):
         acc = t["dx_acc"] if index == "dx" else t["dw_acc"]
         out = t["dx_out"] if index == "dx" else t["dw_out"]
         if acc.numel() != out.numel() or acc.numel() % g.cast_vec:
-            raise ValueError("scale-cast operands must match in size and hold whole vectors")
+            raise ValueError(
+                "scale-cast operands must match in size and hold whole vectors"
+            )
         # loss entry: the backward writes the incoming scalar gradient into the ``grad_scale`` workspace cell;
         # log-probability entry: the scale is the constant 1, held outside the workspace (a caller may poison
         # the workspace between steps; ``dlogp`` carries the gradient)
         scale = t["grad_scale"] if p.entry == "loss" else t["unit_scale"]
-        values.update(acc=acc.reshape(-1), g=scale, out=out.reshape(-1), num_vecs=int(acc.numel() // g.cast_vec),
-                      rows_c=0, row0=0, first_chunk=0, last_chunk=0, d_off=0)
+        values.update(
+            acc=acc.reshape(-1),
+            g=scale,
+            out=out.reshape(-1),
+            num_vecs=int(acc.numel() // g.cast_vec),
+            rows_c=0,
+            row0=0,
+            first_chunk=0,
+            last_chunk=0,
+            d_off=0,
+        )
         return values
     row0, rows_c = plan.chunks[index]
     stop = row0 + rows_c
     first, last = int(index == 0), int(index == plan.num_chunks - 1)
-    values.update(rows_c=int(rows_c), row0=int(row0), first_chunk=first, last_chunk=last, d_off=0)
-    x_chunk = t["x_c"][:rows_c] if plan.compact else t["X"][row0:stop]  # compacted: the chunk's gathered valid rows
+    values.update(
+        rows_c=int(rows_c), row0=int(row0), first_chunk=first, last_chunk=last, d_off=0
+    )
+    x_chunk = (
+        t["x_c"][:rows_c] if plan.compact else t["X"][row0:stop]
+    )  # compacted: the chunk's gathered valid rows
     logits = t["logits"]
     dz_chunk = logits[:rows_c]
     if stage in ("gemm_logits", "gemm_logits_nostats"):
         # ``C`` is the chunk's [rows_c, V] rows of the logits workspace: the TMA-store epilogue's tensor map takes its
         # row extent from it (rows >= rows_c are clipped, never written); a pointer store sees the same base address
-        values.update(A=x_chunk, B=t["W"], C=logits[:rows_c], STATS_OUT=t["stats"], WS=t["f32_dummy"], M=int(rows_c),
-                      m_tiles=g.row_tiles(rows_c, g.logits_cluster_ctas), k_iters=1, first_chunk=0)
+        values.update(
+            A=x_chunk,
+            B=t["W"],
+            C=logits[:rows_c],
+            STATS_OUT=t["stats"],
+            WS=t["f32_dummy"],
+            M=int(rows_c),
+            m_tiles=g.row_tiles(rows_c, g.logits_cluster_ctas),
+            k_iters=1,
+            first_chunk=0,
+        )
     elif stage == "gemm_dx" or stage in DX_SLICE_STAGES:
         # every token chunk writes its own rows of dX_acc: the first K chunk of the GEMM always stores (first_chunk=1);
         # the K-sliced forms write slices >= 1 into the ``dx_ws`` slabs (added by ``dx_reduce`` afterwards)
         k = plan.dx_slices_of(index)
         if stage != dx_stage(k):
-            raise ValueError(f"chunk {index} plans {k} dX slice(s); stage {stage!r} was requested")
+            raise ValueError(
+                f"chunk {index} plans {k} dX slice(s); stage {stage!r} was requested"
+            )
         ws = t["dx_ws"] if k > 1 else t["f32_dummy"]
-        values.update(A=dz_chunk, B=t["W"], C=t["dx_acc"][row0:stop], STATS_OUT=t["stats"], WS=ws, M=int(rows_c),
-                      m_tiles=g.row_tiles(rows_c, g.dx_cluster_ctas), k_iters=1, first_chunk=1, ws_slab=int(ws.stride(0)) if k > 1 else 0)
-    elif stage == "dx_reduce":  # host-side slab reduction of the K-sliced dX GEMM (no kernel of the program)
-        values.update(acc=t["dx_acc"][row0:stop], ws=t["dx_ws"], k_slices=plan.dx_slices_of(index))
+        values.update(
+            A=dz_chunk,
+            B=t["W"],
+            C=t["dx_acc"][row0:stop],
+            STATS_OUT=t["stats"],
+            WS=ws,
+            M=int(rows_c),
+            m_tiles=g.row_tiles(rows_c, g.dx_cluster_ctas),
+            k_iters=1,
+            first_chunk=1,
+            ws_slab=int(ws.stride(0)) if k > 1 else 0,
+        )
+    elif (
+        stage == "dx_reduce"
+    ):  # host-side slab reduction of the K-sliced dX GEMM (no kernel of the program)
+        values.update(
+            acc=t["dx_acc"][row0:stop], ws=t["dx_ws"], k_slices=plan.dx_slices_of(index)
+        )
     elif stage == "gemm_dw_acc":
-        values.update(A=dz_chunk, B=x_chunk, C=t["dw_acc"], STATS_OUT=t["stats"], WS=t["f32_dummy"], M=int(p.vocab),
-                      m_tiles=g.row_tiles(p.vocab, g.dw_cluster_ctas), k_iters=g.k_iters(rows_c), first_chunk=first)
+        values.update(
+            A=dz_chunk,
+            B=x_chunk,
+            C=t["dw_acc"],
+            STATS_OUT=t["stats"],
+            WS=t["f32_dummy"],
+            M=int(p.vocab),
+            m_tiles=g.row_tiles(p.vocab, g.dw_cluster_ctas),
+            k_iters=g.k_iters(rows_c),
+            first_chunk=first,
+        )
     elif stage == "row_finalize":
         d = t["d"]
 
-        def present(name):  # policy / external operands: the chunk-local ``d`` stands in when the mode never reads them
+        def present(
+            name,
+        ):  # policy / external operands: the chunk-local ``d`` stands in when the mode never reads them
             return d if t.get(name) is None else t[name]
 
-        values.update(stats=t["stats"], z=logits, labels=t["labels"], infer_logp=present("infer_logp"),
-                      loss_weights=present("loss_weights"), d_in=present("d_in"), lse=t["lse"], logp=t["logp"], d=d, term=t["term"])
+        values.update(
+            stats=t["stats"],
+            z=logits,
+            labels=t["labels"],
+            infer_logp=present("infer_logp"),
+            loss_weights=present("loss_weights"),
+            d_in=present("d_in"),
+            lse=t["lse"],
+            logp=t["logp"],
+            d=d,
+            term=t["term"],
+        )
     elif stage == "loss_reduce":
         values.update(term=t["term"], loss_acc=t["loss_acc"], loss_out=t["loss"])
     elif stage == "row_grad":
-        external = p.entry == "logprob"  # the recompute reads the caller's [T] dlogp at d[row0 + r]
-        values.update(z=logits, labels=t["labels"], lse=t["lse"], d=t["d_in"] if external else t["d"], d_off=int(row0) if external else 0)
+        external = (
+            p.entry == "logprob"
+        )  # the recompute reads the caller's [T] dlogp at d[row0 + r]
+        values.update(
+            z=logits,
+            labels=t["labels"],
+            lse=t["lse"],
+            d=t["d_in"] if external else t["d"],
+            d_off=int(row0) if external else 0,
+        )
     else:
         raise ValueError(f"unknown stage {stage!r}")
     return values
@@ -1206,8 +1604,12 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
 
 def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     """Launch keys ``(stage, chunk index)`` of the forward chunk loop (compacted plan: the host gathers first)."""
-    keys = []
-    if plan.compact and plan.problem.entry == "loss" and plan.problem.objective == "policy":
+    keys: list[tuple[str, Any]] = []
+    if (
+        plan.compact
+        and plan.problem.entry == "loss"
+        and plan.problem.objective == "policy"
+    ):
         keys += [("gather_rows", "infer_logp"), ("gather_rows", "loss_weights")]
     for index in range(plan.num_chunks):
         if plan.compact:
@@ -1232,7 +1634,7 @@ def _dx_keys(plan: Plan, index: int) -> list:
 
 def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     """Launch keys of the log-probability backward (recompute the logits, then the gradient GEMMs)."""
-    keys = []
+    keys: list[tuple[str, Any]] = []
     if plan.compact:
         keys.append(("gather_rows", "d_in"))
     for index in range(plan.num_chunks):
@@ -1247,7 +1649,7 @@ def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
 
 
 def cast_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
-    keys = []
+    keys: list[tuple[str, Any]] = []
     if plan.need_dx:
         keys.append(("scale_cast_bf16", "dx"))
     if plan.need_dw:
@@ -1296,7 +1698,9 @@ class ReferenceEngine:
     def gemm_logits(values: dict[str, Any], stats: bool = True) -> None:
         rows = int(values["M"])
         z = values["C"][:rows]
-        torch.mm(values["A"], values["B"].t(), out=z)  # BF16 result of an FP32 accumulation
+        torch.mm(
+            values["A"], values["B"].t(), out=z
+        )  # BF16 result of an FP32 accumulation
         if stats:
             tiles = int(values["num_tiles"])
             zf = z.float().view(rows, tiles, -1)
@@ -1319,7 +1723,9 @@ class ReferenceEngine:
         m = pmax.amax(-1)
         lse = m + torch.log((psum * torch.exp(pmax - m[:, None])).sum(-1))
         labels, valid = ReferenceEngine._valid(values)
-        index = torch.where(valid, labels, torch.zeros_like(labels)).clamp_max(int(values["V"]) - 1)
+        index = torch.where(valid, labels, torch.zeros_like(labels)).clamp_max(
+            int(values["V"]) - 1
+        )
         zy = values["z"][:rows_c].gather(1, index[:, None]).squeeze(1).float()
         zero = torch.zeros_like(lse)
         logp = torch.where(valid, zy - lse, zero)
@@ -1328,7 +1734,9 @@ class ReferenceEngine:
         mode = int(values["mode"])
         d, term = zero, zero
         if mode == MODE_CE:
-            d = torch.where(valid, torch.full_like(lse, -1.0 / float(values["loss_div"])), zero)
+            d = torch.where(
+                valid, torch.full_like(lse, -1.0 / float(values["loss_div"])), zero
+            )
             term = logp
         elif mode == MODE_POLICY:
             ratio = torch.exp(logp - values["infer_logp"][row0:stop])
@@ -1343,7 +1751,9 @@ class ReferenceEngine:
     @staticmethod
     def loss_reduce(values: dict[str, Any]) -> None:
         rows_c = int(values["rows_c"])
-        total = values["term"][:rows_c].double().sum().reshape(1)  # FP64 accumulation of the FP32 terms
+        total = (
+            values["term"][:rows_c].double().sum().reshape(1)
+        )  # FP64 accumulation of the FP32 terms
         acc = values["loss_acc"]
         if int(values["first_chunk"]):
             acc.copy_(total)
@@ -1351,7 +1761,11 @@ class ReferenceEngine:
             acc.add_(total)
         if int(values["last_chunk"]):
             neg = -acc
-            values["loss_out"].copy_(neg / float(values["loss_div"]) if int(values["mode"]) == MODE_CE else neg)  # one FP64 -> FP32 rounding
+            values["loss_out"].copy_(
+                neg / float(values["loss_div"])
+                if int(values["mode"]) == MODE_CE
+                else neg
+            )  # one FP64 -> FP32 rounding
 
     @staticmethod
     def row_grad(values: dict[str, Any]) -> None:
@@ -1360,9 +1774,13 @@ class ReferenceEngine:
         labels, valid = ReferenceEngine._valid(values)
         lse = values["lse"][row0 : row0 + rows_c]
         d_off = int(values["d_off"])
-        d = torch.where(valid, values["d"][d_off : d_off + rows_c], torch.zeros_like(lse))
+        d = torch.where(
+            valid, values["d"][d_off : d_off + rows_c], torch.zeros_like(lse)
+        )
         p = torch.exp(z.float() - lse[:, None])
-        index = torch.where(valid, labels, torch.zeros_like(labels)).clamp_max(int(values["V"]) - 1)
+        index = torch.where(valid, labels, torch.zeros_like(labels)).clamp_max(
+            int(values["V"]) - 1
+        )
         onehot = torch.zeros_like(p)
         onehot.scatter_(1, index[:, None], 1.0)
         dz = d[:, None] * (onehot - p)
@@ -1373,7 +1791,9 @@ class ReferenceEngine:
     def gemm_dx(values: dict[str, Any]) -> None:
         values["C"].copy_(_mm_fp32(values["A"], values["B"]))
 
-    gemm_dx_s2 = gemm_dx_s3 = gemm_dx_s4 = gemm_dx  # the reference path never slices K (one product per chunk)
+    gemm_dx_s2 = gemm_dx_s3 = gemm_dx_s4 = (
+        gemm_dx  # the reference path never slices K (one product per chunk)
+    )
 
     @staticmethod
     def dx_reduce(values: dict[str, Any]) -> None:
@@ -1526,7 +1946,11 @@ class LmHeadLossRunner:
         """Loss entry: ``(loss [1], logp [T])``; log-probability entry: ``(logp, lse)``."""
         t = self.tensors
         self._run(self.forward_order)
-        return (t["loss"], t["logp"]) if self.problem.entry == "loss" else (t["logp"], t["lse"])
+        return (
+            (t["loss"], t["logp"])
+            if self.problem.entry == "loss"
+            else (t["logp"], t["lse"])
+        )
 
     def backward(self, grad: Optional[torch.Tensor] = None):
         """``(dx_out, dw_out)`` (``None`` for a frozen input).
@@ -1539,7 +1963,9 @@ class LmHeadLossRunner:
         t = self.tensors
         if self.problem.entry == "logprob":
             if grad is not None:
-                raise ValueError("the log-probability runner takes its gradient from the bound dlogp tensor")
+                raise ValueError(
+                    "the log-probability runner takes its gradient from the bound dlogp tensor"
+                )
             # the cast scale of this entry is the constant 1 (``unit_scale``, outside the workspace)
         elif grad is None:
             t["grad_scale"].fill_(1.0)
@@ -1559,26 +1985,42 @@ def _check_output(t: Optional[torch.Tensor], name: str, shape: tuple, dtype) -> 
     if t is None:
         return
     if tuple(t.shape) != tuple(shape) or t.dtype != dtype or not t.is_contiguous():
-        raise ValueError(f"{name} must be a contiguous {dtype} tensor of shape {tuple(shape)}")
+        raise ValueError(
+            f"{name} must be a contiguous {dtype} tensor of shape {tuple(shape)}"
+        )
 
 
-def _prepare_x(X: torch.Tensor, problem: Problem, compact: bool = False) -> torch.Tensor:
-    return X.contiguous() if (problem.x_copy and not compact) else X  # the per-chunk gather yields contiguous rows
+def _prepare_x(
+    X: torch.Tensor, problem: Problem, compact: bool = False
+) -> torch.Tensor:
+    return (
+        X.contiguous() if (problem.x_copy and not compact) else X
+    )  # the per-chunk gather yields contiguous rows
 
 
-def _prepare_labels(labels: torch.Tensor, geometry: Geometry, row_index: Optional[torch.Tensor] = None) -> torch.Tensor:
-    labels = labels.contiguous() if row_index is None else labels.index_select(0, row_index)
+def _prepare_labels(
+    labels: torch.Tensor, geometry: Geometry, row_index: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    labels = (
+        labels.contiguous() if row_index is None else labels.index_select(0, row_index)
+    )
     if geometry.labels_dtype != labels.dtype:
-        labels = labels.to(geometry.labels_dtype)  # one O(T) cast per call when the kernels read int32
+        labels = labels.to(
+            geometry.labels_dtype
+        )  # one O(T) cast per call when the kernels read int32
     return labels
 
 
-def _bind_all(record, module_name, keys, values, device, geometry: Geometry) -> dict[Any, _Launch]:
+def _bind_all(
+    record, module_name, keys, values, device, geometry: Geometry
+) -> dict[Any, _Launch]:
     num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     launches: dict[Any, _Launch] = {}
     for key in keys:
         stage = key[0]
-        if stage in HOST_STAGES:  # host-side step (slab reduction, row gather), no kernel
+        if (
+            stage in HOST_STAGES
+        ):  # host-side step (slab reduction, row gather), no kernel
             continue
         physical = record[stage]
         cluster = physical.get("launch", {}).get("cluster") or (1, 1, 1)
@@ -1588,8 +2030,17 @@ def _bind_all(record, module_name, keys, values, device, geometry: Geometry) -> 
             raise ValueError(
                 f"stage {stage!r}: the record's geometry declares {declared}-CTA clusters, its module launches {tuple(cluster)}"
             )
-        resident = cluster_resident(device, cluster_ctas, num_sms) if cluster_ctas > 1 else None
-        grid = grid_dims(physical.get("grid", ["rows_c", 1, 1]), values[key], num_sms, resident=resident)
+        resident = (
+            cluster_resident(device, cluster_ctas, num_sms)
+            if cluster_ctas > 1
+            else None
+        )
+        grid = grid_dims(
+            physical.get("grid", ["rows_c", 1, 1]),
+            values[key],
+            num_sms,
+            resident=resident,
+        )
         if cluster_ctas > 1 and any(g % c for g, c in zip(grid, cluster, strict=True)):
             raise ValueError(
                 f"stage {stage!r}: grid {grid} is not a multiple of the cluster shape {tuple(cluster)} baked into the module"
@@ -1654,53 +2105,127 @@ def prepare_lm_head_loss(
         record_abi(record)
     geometry = Geometry.from_record(record)
     problem = validate_lm_head_inputs(
-        X, W, labels, objective=objective, loss_div=loss_div, infer_logp=infer_logp, loss_weights=loss_weights,
-        chunk_size=chunk_size, grad_weight_dtype=grad_weight_dtype, deterministic=deterministic, entry=entry, geometry=geometry,
+        X,
+        W,
+        labels,
+        objective=objective,
+        loss_div=loss_div,
+        infer_logp=infer_logp,
+        loss_weights=loss_weights,
+        chunk_size=chunk_size,
+        grad_weight_dtype=grad_weight_dtype,
+        deterministic=deterministic,
+        entry=entry,
+        geometry=geometry,
     )
     if problem.num_rows == 0:
-        raise ValueError("a prepared runner needs at least one row (T > 0); the eager entry points return zeros for T == 0")
-    given = [t for t in (W, labels, infer_logp, loss_weights, dlogp, workspace_buffer, dx_acc, dw_acc, dx_out, dw_out, logp, lse) if t is not None]
+        raise ValueError(
+            "a prepared runner needs at least one row (T > 0); the eager entry points return zeros for T == 0"
+        )
+    given = [
+        t
+        for t in (
+            W,
+            labels,
+            infer_logp,
+            loss_weights,
+            dlogp,
+            workspace_buffer,
+            dx_acc,
+            dw_acc,
+            dx_out,
+            dw_out,
+            logp,
+            lse,
+        )
+        if t is not None
+    ]
     if not all(t.device == device for t in given):
         raise ValueError("Expected all tensors on one device")
     stages = registered_stages(module_name) if record is not None else tuple(STAGES)
-    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count) if device.type == "cuda" else 1
+    num_sms = (
+        int(torch.cuda.get_device_properties(device).multi_processor_count)
+        if device.type == "cuda"
+        else 1
+    )
     row_index = None
     if isinstance(compact_rows, torch.Tensor):
         row_index = compact_rows
-        if row_index.dtype != torch.int64 or row_index.ndim != 1 or row_index.device != device:
-            raise ValueError("compact_rows given as a tensor must be the int64 [T_v] valid-row index on X's device")
+        if (
+            row_index.dtype != torch.int64
+            or row_index.ndim != 1
+            or row_index.device != device
+        ):
+            raise ValueError(
+                "compact_rows given as a tensor must be the int64 [T_v] valid-row index on X's device"
+            )
     elif compact_rows:
         row_index = valid_row_index(labels)
     if row_index is not None and row_index.numel() == 0:
-        raise ValueError("a prepared runner needs at least one valid row (every label is ignored); the eager entry points return zeros for it")
-    dx_resident = cluster_resident(device, geometry.dx_cluster_ctas, num_sms) if record is not None else None
+        raise ValueError(
+            "a prepared runner needs at least one valid row (every label is ignored); the eager entry points return zeros for it"
+        )
+    dx_resident = (
+        cluster_resident(device, geometry.dx_cluster_ctas, num_sms)
+        if record is not None
+        else None
+    )
     plan = make_plan(
-        problem, need_dx=need_dx, need_dw=need_dw, geometry=geometry,
-        dx_max_slices=dx_max_slices(stages) if record is not None else 1, num_sms=num_sms,
-        valid_rows=None if row_index is None else int(row_index.numel()), dx_resident=dx_resident,
+        problem,
+        need_dx=need_dx,
+        need_dw=need_dw,
+        geometry=geometry,
+        dx_max_slices=dx_max_slices(stages) if record is not None else 1,
+        num_sms=num_sms,
+        valid_rows=None if row_index is None else int(row_index.numel()),
+        dx_resident=dx_resident,
     )
     missing = [s for s in plan.stages if s not in stages]
     if missing:
-        raise NotImplementedError(f"the registered program {module_name!r} lacks the stages {missing} (registered: {stages})")
+        raise NotImplementedError(
+            f"the registered program {module_name!r} lacks the stages {missing} (registered: {stages})"
+        )
     T, H, V, C = problem.num_rows, problem.hidden, problem.vocab, problem.chunk
-    rows_loop = plan.rows  # rows the chunk loop processes (the valid rows when compacted)
+    rows_loop = (
+        plan.rows
+    )  # rows the chunk loop processes (the valid rows when compacted)
     tma_bytes = _record_tma_bytes(record, stages) if record is not None else 0
     scratch_bytes = _record_scratch_bytes(record, stages) if record is not None else 0
     layout = workspace_layout(
-        rows_loop, V, C, stats_tile=geometry.stats_tile, entry=entry, tma_workspace_bytes=tma_bytes, scratch_bytes=scratch_bytes,
-        dx_ws_slabs=plan.dx_ws_slabs, hidden=H, compact=plan.compact,
+        rows_loop,
+        V,
+        C,
+        stats_tile=geometry.stats_tile,
+        entry=entry,
+        tma_workspace_bytes=tma_bytes,
+        scratch_bytes=scratch_bytes,
+        dx_ws_slabs=plan.dx_ws_slabs,
+        hidden=H,
+        compact=plan.compact,
     )
     if workspace_buffer is None:
-        workspace_buffer = torch.empty(layout["total"], dtype=torch.uint8, device=device)
+        workspace_buffer = torch.empty(
+            layout["total"], dtype=torch.uint8, device=device
+        )
     flat = workspace_buffer.view(-1).view(torch.uint8)
     if flat.numel() < layout["total"]:
-        raise ValueError(f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}")
+        raise ValueError(
+            f"workspace_buffer needs {layout['total']} bytes, got {flat.numel()}"
+        )
 
     def output(given, name, shape, dtype):
         _check_output(given, name, shape, dtype)
-        return given if given is not None else torch.empty(shape, dtype=dtype, device=device)
+        return (
+            given
+            if given is not None
+            else torch.empty(shape, dtype=dtype, device=device)
+        )
 
-    t: dict[str, Any] = dict(X=_prepare_x(X, problem, plan.compact), W=W, labels=_prepare_labels(labels, geometry, row_index))
+    t: dict[str, Any] = dict(
+        X=_prepare_x(X, problem, plan.compact),
+        W=W,
+        labels=_prepare_labels(labels, geometry, row_index),
+    )
     rows = layout["logits"][1] // (V * 2)
     t["logits"] = _carve(flat, layout, "logits", torch.bfloat16, (rows, V))
     t["stats"] = _carve(flat, layout, "stats", torch.float32, (rows, plan.num_tiles, 2))
@@ -1708,13 +2233,21 @@ def prepare_lm_head_loss(
     t["term"] = _carve(flat, layout, "term", torch.float32, (rows,))
     t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float64, (1,))
     t["grad_scale"] = _carve(flat, layout, "grad_scale", torch.float32, (1,))
-    t["unit_scale"] = torch.ones((1,), dtype=torch.float32, device=device)  # the log-probability entry's cast scale
-    t["f32_dummy"] = torch.zeros((16,), dtype=torch.float32, device=device)  # unused ``WS`` of the unsliced GEMMs
+    t["unit_scale"] = torch.ones(
+        (1,), dtype=torch.float32, device=device
+    )  # the log-probability entry's cast scale
+    t["f32_dummy"] = torch.zeros(
+        (16,), dtype=torch.float32, device=device
+    )  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
-        t["dx_ws"] = _carve(flat, layout, "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H))
+        t["dx_ws"] = _carve(
+            flat, layout, "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H)
+        )
     if plan.compact:
         t["row_index"] = row_index
-        t["x_c"] = _carve(flat, layout, "x_c", torch.bfloat16, (rows, H))  # the chunk's valid X rows, gathered per chunk
+        t["x_c"] = _carve(
+            flat, layout, "x_c", torch.bfloat16, (rows, H)
+        )  # the chunk's valid X rows, gathered per chunk
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
     t["lse"] = output(lse, "lse", (rows_loop,), torch.float32)
@@ -1722,10 +2255,16 @@ def prepare_lm_head_loss(
     t["loss"] = torch.empty((1,), dtype=torch.float32, device=device)
     if entry == "loss":
         if infer_logp is not None:
-            if plan.compact:  # gathered into their compact [T_v] forms at the start of every step
+            if (
+                plan.compact
+            ):  # gathered into their compact [T_v] forms at the start of every step
                 t["infer_logp_full"], t["loss_weights_full"] = infer_logp, loss_weights
-                t["infer_logp"] = torch.empty((rows_loop,), dtype=torch.float32, device=device)
-                t["loss_weights"] = torch.empty((rows_loop,), dtype=torch.float32, device=device)
+                t["infer_logp"] = torch.empty(
+                    (rows_loop,), dtype=torch.float32, device=device
+                )
+                t["loss_weights"] = torch.empty(
+                    (rows_loop,), dtype=torch.float32, device=device
+                )
             else:
                 t["infer_logp"], t["loss_weights"] = infer_logp, loss_weights
     else:
@@ -1740,11 +2279,24 @@ def prepare_lm_head_loss(
         t["dx_out"] = output(dx_out, "dx_out", (rows_loop, H), torch.bfloat16)
     if plan.need_dw:
         t["dw_acc"] = output(dw_acc, "dw_acc", (V, H), torch.float32)
-        t["dw_out"] = output(dw_out, "dw_out", (V, H), torch.float32 if plan.dw_cast_stage == "scale_cast_f32" else torch.bfloat16)
+        t["dw_out"] = output(
+            dw_out,
+            "dw_out",
+            (V, H),
+            torch.float32 if plan.dw_cast_stage == "scale_cast_f32" else torch.bfloat16,
+        )
     if layout.get("workspace"):
-        t["workspace"] = _carve(flat, layout, "workspace", torch.uint8, (layout["workspace"][1],))
+        t["workspace"] = _carve(
+            flat, layout, "workspace", torch.uint8, (layout["workspace"][1],)
+        )
     if layout.get("tma_descriptor_workspace"):
-        t["tma_descriptor_workspace"] = _carve(flat, layout, "tma_descriptor_workspace", torch.uint8, (layout["tma_descriptor_workspace"][1],))
+        t["tma_descriptor_workspace"] = _carve(
+            flat,
+            layout,
+            "tma_descriptor_workspace",
+            torch.uint8,
+            (layout["tma_descriptor_workspace"][1],),
+        )
 
     fwd = forward_keys(plan)
     bwd = (recompute_keys(plan) if entry == "logprob" else ()) + cast_keys(plan)
@@ -1756,17 +2308,42 @@ def prepare_lm_head_loss(
     else:
         engine = ReferenceEngine()
     memory = memory_report(
-        T, H, V, C, stats_tile=geometry.stats_tile, entry=entry, need_dx=plan.need_dx, need_dw=plan.need_dw,
-        grad_weight_dtype=problem.grad_weight_dtype, return_logp=True, x_copy=problem.x_copy and not plan.compact,
-        tma_workspace_bytes=tma_bytes, scratch_bytes=scratch_bytes, dx_ws_slabs=plan.dx_ws_slabs, valid_rows=plan.valid_rows,
+        T,
+        H,
+        V,
+        C,
+        stats_tile=geometry.stats_tile,
+        entry=entry,
+        need_dx=plan.need_dx,
+        need_dw=plan.need_dw,
+        grad_weight_dtype=problem.grad_weight_dtype,
+        return_logp=True,
+        x_copy=problem.x_copy and not plan.compact,
+        tma_workspace_bytes=tma_bytes,
+        scratch_bytes=scratch_bytes,
+        dx_ws_slabs=plan.dx_ws_slabs,
+        valid_rows=plan.valid_rows,
     )
     if device.type == "cuda":
-        device_index = int(device.index if device.index is not None else torch.cuda.current_device())
+        device_index = int(
+            device.index if device.index is not None else torch.cuda.current_device()
+        )
     else:
         device_index = 0
     return LmHeadLossRunner(
-        backend=backend, module_name=module_name, plan=plan, tensors=t, values=values, launches=launches,
-        forward_order=fwd, backward_order=bwd, device_index=device_index, workspace=flat, layout=layout, memory=memory, engine=engine,
+        backend=backend,
+        module_name=module_name,
+        plan=plan,
+        tensors=t,
+        values=values,
+        launches=launches,
+        forward_order=fwd,
+        backward_order=bwd,
+        device_index=device_index,
+        workspace=flat,
+        layout=layout,
+        memory=memory,
+        engine=engine,
     )
 
 
@@ -1774,7 +2351,9 @@ def prepare_lm_head_loss(
 # Binding cache of the eager entry points (cake backend)
 # ---------------------------------------------------------------------------
 
-BINDING_CACHE_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE"  # "0" disables the cache at import
+BINDING_CACHE_ENV = (
+    "FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE"  # "0" disables the cache at import
+)
 BINDING_CACHE_CAPACITY_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_BINDING_CACHE_CAPACITY"
 BINDING_CACHE_DEFAULT_CAPACITY = 64
 
@@ -1788,27 +2367,73 @@ def binding_cache_capacity() -> int:
     except ValueError:
         capacity = 0
     if capacity < 1:
-        raise ValueError(f"{BINDING_CACHE_CAPACITY_ENV} must be a positive integer, got {raw!r}")
+        raise ValueError(
+            f"{BINDING_CACHE_CAPACITY_ENV} must be a positive integer, got {raw!r}"
+        )
     return capacity
 
 
 def _meta(t: Optional[torch.Tensor]):
-    return None if t is None else (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+    return (
+        None
+        if t is None
+        else (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
+    )
 
 
-def forward_binding_key(X, W, labels, *, objective, loss_div, infer_logp, loss_weights, chunk_size, need_dx, need_dw, grad_weight_dtype, entry,
-                        valid_rows=None) -> tuple:
+def forward_binding_key(
+    X,
+    W,
+    labels,
+    *,
+    objective,
+    loss_div,
+    infer_logp,
+    loss_weights,
+    chunk_size,
+    need_dx,
+    need_dw,
+    grad_weight_dtype,
+    entry,
+    valid_rows=None,
+) -> tuple:
     """Cache key of a forward binding: ``(data_ptr, shape, stride, dtype)`` of every
     input plus every option that shapes the argument plans; ``valid_rows`` is the
     compacted row count (a label-dependent fact of the plan; ``None`` = uncompacted)."""
-    return ("fwd", entry, _meta(X), _meta(W), _meta(labels), _meta(infer_logp), _meta(loss_weights), objective,
-            None if loss_div is None else float(loss_div), int(chunk_size), bool(need_dx), bool(need_dw), grad_weight_dtype,
-            None if valid_rows is None else int(valid_rows))
+    return (
+        "fwd",
+        entry,
+        _meta(X),
+        _meta(W),
+        _meta(labels),
+        _meta(infer_logp),
+        _meta(loss_weights),
+        objective,
+        None if loss_div is None else float(loss_div),
+        int(chunk_size),
+        bool(need_dx),
+        bool(need_dw),
+        grad_weight_dtype,
+        None if valid_rows is None else int(valid_rows),
+    )
 
 
-def logprob_backward_binding_key(X, W, labels, lse, dlogp, *, chunk_size, need_dx, need_dw, valid_rows=None) -> tuple:
-    return ("bwd", "logprob", _meta(X), _meta(W), _meta(labels), _meta(lse), _meta(dlogp), int(chunk_size), bool(need_dx), bool(need_dw),
-            None if valid_rows is None else int(valid_rows))
+def logprob_backward_binding_key(
+    X, W, labels, lse, dlogp, *, chunk_size, need_dx, need_dw, valid_rows=None
+) -> tuple:
+    return (
+        "bwd",
+        "logprob",
+        _meta(X),
+        _meta(W),
+        _meta(labels),
+        _meta(lse),
+        _meta(dlogp),
+        int(chunk_size),
+        bool(need_dx),
+        bool(need_dw),
+        None if valid_rows is None else int(valid_rows),
+    )
 
 
 # Values a remembered binding owns: the descriptor workspace of pointer-ABI stages and kernel-private scratch (a few
@@ -1839,38 +2464,66 @@ class _Binding:
         t = runner.tensors
         owned = {name: torch.empty_like(t[name]) for name in _OWNED_VALUES if name in t}
         return cls(
-            plan=runner.plan, device=t["X"].device, device_index=runner.device_index,
-            launches={key: launch.templated() for key, launch in runner.launches.items()},
-            forward_order=runner.forward_order, backward_order=runner.backward_order, owned=owned,
-            owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()), layout=runner.layout, memory=runner.memory,
+            plan=runner.plan,
+            device=t["X"].device,
+            device_index=runner.device_index,
+            launches={
+                key: launch.templated() for key, launch in runner.launches.items()
+            },
+            forward_order=runner.forward_order,
+            backward_order=runner.backward_order,
+            owned=owned,
+            owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
+            layout=runner.layout,
+            memory=runner.memory,
         )
 
     def holds_no_tensor(self) -> bool:
-        return not any(isinstance(a, torch.Tensor) for launch in self.launches.values() for a in launch.arguments)
+        return not any(
+            isinstance(a, torch.Tensor)
+            for launch in self.launches.values()
+            for a in launch.arguments
+        )
 
     def _scratch(self, t: dict[str, Any]) -> None:
         """Per-call temporaries from the caching allocator into ``t`` (the runner's regions, minus the owned ones)."""
         p = self.plan.problem
         rows = self.layout["logits"][1] // (p.vocab * 2)
-        t["logits"] = torch.empty((rows, p.vocab), dtype=torch.bfloat16, device=self.device)
-        t["stats"] = torch.empty((rows, self.plan.num_tiles, 2), dtype=torch.float32, device=self.device)
+        t["logits"] = torch.empty(
+            (rows, p.vocab), dtype=torch.bfloat16, device=self.device
+        )
+        t["stats"] = torch.empty(
+            (rows, self.plan.num_tiles, 2), dtype=torch.float32, device=self.device
+        )
         t["d"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
         t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
         t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
         t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
-        t.update(_device_constants(self.device_index))  # constant cells: no per-call fill launches
+        t.update(
+            _device_constants(self.device_index)
+        )  # constant cells: no per-call fill launches
         if self.plan.dx_ws_slabs:
-            t["dx_ws"] = torch.empty((self.plan.dx_ws_slabs, rows, p.hidden), dtype=torch.float32, device=self.device)
+            t["dx_ws"] = torch.empty(
+                (self.plan.dx_ws_slabs, rows, p.hidden),
+                dtype=torch.float32,
+                device=self.device,
+            )
         if self.plan.compact:
-            t["x_c"] = torch.empty((rows, p.hidden), dtype=torch.bfloat16, device=self.device)
+            t["x_c"] = torch.empty(
+                (rows, p.hidden), dtype=torch.bfloat16, device=self.device
+            )
         for name, tensor in self.owned.items():
             t[name] = tensor
 
     def _compact(self, t: dict[str, Any], row_index: Optional[torch.Tensor]) -> None:
         """Check the call's valid-row index against the remembered plan and bind it."""
         plan = self.plan
-        if plan.compact != (row_index is not None) or (plan.compact and int(row_index.numel()) != plan.rows):
-            raise ValueError("the remembered binding was planned for another set of valid rows")
+        if plan.compact != (row_index is not None) or (
+            plan.compact and int(row_index.numel()) != plan.rows
+        ):
+            raise ValueError(
+                "the remembered binding was planned for another set of valid rows"
+            )
         if plan.compact:
             t["row_index"] = row_index
 
@@ -1882,15 +2535,27 @@ class _Binding:
                     host(stage_values(key[0], t, self.plan, key[1]))
                     continue
                 launch = self.launches[key]
-                arguments = launch.arguments_for(stage_values(key[0], t, self.plan, key[1]))
-                if launch.prepare is not None:  # descriptors of a pointer-ABI stage see the fresh tensors
+                arguments = launch.arguments_for(
+                    stage_values(key[0], t, self.plan, key[1])
+                )
+                if (
+                    launch.prepare is not None
+                ):  # descriptors of a pointer-ABI stage see the fresh tensors
                     launch.prepare(*arguments)
                 launch.entry(*arguments)
 
     def forward(self, X, W, labels, infer_logp, loss_weights, row_index=None):
         p, plan = self.plan.problem, self.plan
-        T, H, V = plan.rows, p.hidden, p.vocab  # rows of the chunk loop (the valid rows when compacted)
-        t: dict[str, Any] = dict(X=_prepare_x(X, p, plan.compact), W=W, labels=_prepare_labels(labels, plan.geometry, row_index))
+        T, H, V = (
+            plan.rows,
+            p.hidden,
+            p.vocab,
+        )  # rows of the chunk loop (the valid rows when compacted)
+        t: dict[str, Any] = dict(
+            X=_prepare_x(X, p, plan.compact),
+            W=W,
+            labels=_prepare_labels(labels, plan.geometry, row_index),
+        )
         self._compact(t, row_index)
         self._scratch(t)
         t["lse"] = torch.empty((T,), dtype=torch.float32, device=self.device)
@@ -1898,15 +2563,26 @@ class _Binding:
         if p.entry == "loss":
             if infer_logp is not None:
                 if plan.compact:
-                    t["infer_logp_full"], t["loss_weights_full"] = infer_logp, loss_weights
-                    t["infer_logp"] = torch.empty((T,), dtype=torch.float32, device=self.device)
-                    t["loss_weights"] = torch.empty((T,), dtype=torch.float32, device=self.device)
+                    t["infer_logp_full"], t["loss_weights_full"] = (
+                        infer_logp,
+                        loss_weights,
+                    )
+                    t["infer_logp"] = torch.empty(
+                        (T,), dtype=torch.float32, device=self.device
+                    )
+                    t["loss_weights"] = torch.empty(
+                        (T,), dtype=torch.float32, device=self.device
+                    )
                 else:
                     t["infer_logp"], t["loss_weights"] = infer_logp, loss_weights
             if plan.need_dx:
-                t["dx_acc"] = torch.empty((T, H), dtype=torch.float32, device=self.device)
+                t["dx_acc"] = torch.empty(
+                    (T, H), dtype=torch.float32, device=self.device
+                )
             if plan.need_dw:
-                t["dw_acc"] = torch.empty((V, H), dtype=torch.float32, device=self.device)
+                t["dw_acc"] = torch.empty(
+                    (V, H), dtype=torch.float32, device=self.device
+                )
         self._launch(self.forward_order, t)
         if p.entry == "loss":
             return t["loss"], t["logp"], t.get("dx_acc"), t.get("dw_acc")
@@ -1915,7 +2591,12 @@ class _Binding:
     def backward_logprob(self, X, W, labels, lse, dlogp, row_index=None):
         p, plan = self.plan.problem, self.plan
         T, H, V = plan.rows, p.hidden, p.vocab
-        t: dict[str, Any] = dict(X=_prepare_x(X, p, plan.compact), W=W, labels=_prepare_labels(labels, plan.geometry, row_index), lse=lse)
+        t: dict[str, Any] = dict(
+            X=_prepare_x(X, p, plan.compact),
+            W=W,
+            labels=_prepare_labels(labels, plan.geometry, row_index),
+            lse=lse,
+        )
         self._compact(t, row_index)
         if plan.compact:
             t["d_in_full"] = dlogp
@@ -1939,7 +2620,9 @@ class BindingCache:
     def __init__(self, capacity: Optional[int] = None, enabled: bool = True):
         self.capacity = binding_cache_capacity() if capacity is None else int(capacity)
         if self.capacity < 1:
-            raise ValueError("BindingCache needs a capacity of at least one binding (use enabled=False to bypass it)")
+            raise ValueError(
+                "BindingCache needs a capacity of at least one binding (use enabled=False to bypass it)"
+            )
         self.enabled = bool(enabled)
         self.hits = 0
         self.misses = 0
@@ -1986,31 +2669,72 @@ BINDING_CACHE = BindingCache(enabled=os.environ.get(BINDING_CACHE_ENV, "1") != "
 @dataclass
 class ForwardResult:
     loss: Optional[torch.Tensor]  # FP32 [] (loss entry)
-    logp: torch.Tensor  # FP32 [T] (0 on ignored rows; scattered back when the rows were compacted)
-    lse: Optional[torch.Tensor] = None  # FP32 (log-probability entry: the saved statistic; compact [T_v] rows of ``row_index`` when compacted)
-    dx_acc: Optional[torch.Tensor] = None  # FP32 [T, H] (loss entry, X trainable); compact [T_v, H] rows of ``row_index`` when compacted
+    logp: (
+        torch.Tensor
+    )  # FP32 [T] (0 on ignored rows; scattered back when the rows were compacted)
+    lse: Optional[torch.Tensor] = (
+        None  # FP32 (log-probability entry: the saved statistic; compact [T_v] rows of ``row_index`` when compacted)
+    )
+    dx_acc: Optional[torch.Tensor] = (
+        None  # FP32 [T, H] (loss entry, X trainable); compact [T_v, H] rows of ``row_index`` when compacted
+    )
     dw_acc: Optional[torch.Tensor] = None  # FP32 [V, H] (loss entry, W trainable)
     memory: Optional[dict] = None
     backend: str = "cake"
-    row_index: Optional[torch.Tensor] = None  # int64 [T_v] valid-row index when the chunk loop was compacted (None otherwise)
+    row_index: Optional[torch.Tensor] = (
+        None  # int64 [T_v] valid-row index when the chunk loop was compacted (None otherwise)
+    )
     num_rows: int = 0  # T, the caller's row count
 
 
-def _empty_forward(problem: Problem, X: torch.Tensor, *, need_dx: bool, need_dw: bool, row_index: Optional[torch.Tensor] = None) -> ForwardResult:
+def _empty_forward(
+    problem: Problem,
+    X: torch.Tensor,
+    *,
+    need_dx: bool,
+    need_dw: bool,
+    row_index: Optional[torch.Tensor] = None,
+) -> ForwardResult:
     """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty)."""
     device = X.device
     T = int(problem.num_rows)
-    memory = memory_report(T, problem.hidden, problem.vocab, problem.chunk, entry=problem.entry, need_dx=need_dx, need_dw=need_dw,
-                           grad_weight_dtype=problem.grad_weight_dtype, return_logp=True, valid_rows=None if row_index is None else 0)
+    memory = memory_report(
+        T,
+        problem.hidden,
+        problem.vocab,
+        problem.chunk,
+        entry=problem.entry,
+        need_dx=need_dx,
+        need_dw=need_dw,
+        grad_weight_dtype=problem.grad_weight_dtype,
+        return_logp=True,
+        valid_rows=None if row_index is None else 0,
+    )
     zeros = torch.zeros((T,), dtype=torch.float32, device=device)
     if problem.entry == "loss":
         return ForwardResult(
-            loss=torch.zeros((), dtype=torch.float32, device=device), logp=zeros,
-            dx_acc=torch.zeros((0, problem.hidden), dtype=torch.float32, device=device) if need_dx else None,
-            dw_acc=torch.zeros((problem.vocab, problem.hidden), dtype=torch.float32, device=device) if need_dw else None, memory=memory,
-            row_index=row_index, num_rows=T,
+            loss=torch.zeros((), dtype=torch.float32, device=device),
+            logp=zeros,
+            dx_acc=torch.zeros((0, problem.hidden), dtype=torch.float32, device=device)
+            if need_dx
+            else None,
+            dw_acc=torch.zeros(
+                (problem.vocab, problem.hidden), dtype=torch.float32, device=device
+            )
+            if need_dw
+            else None,
+            memory=memory,
+            row_index=row_index,
+            num_rows=T,
         )
-    return ForwardResult(loss=None, logp=zeros, lse=zeros.clone(), memory=memory, row_index=row_index, num_rows=T)
+    return ForwardResult(
+        loss=None,
+        logp=zeros,
+        lse=zeros.clone(),
+        memory=memory,
+        row_index=row_index,
+        num_rows=T,
+    )
 
 
 def _resolve_compact(compact_rows) -> bool:
@@ -2050,37 +2774,90 @@ def forward_loss(
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(
-        X, W, labels, objective=objective, loss_div=loss_div, infer_logp=infer_logp, loss_weights=loss_weights,
-        chunk_size=chunk_size, grad_weight_dtype=grad_weight_dtype, deterministic=deterministic, entry="loss",
+        X,
+        W,
+        labels,
+        objective=objective,
+        loss_div=loss_div,
+        infer_logp=infer_logp,
+        loss_weights=loss_weights,
+        chunk_size=chunk_size,
+        grad_weight_dtype=grad_weight_dtype,
+        deterministic=deterministic,
+        entry="loss",
     )
     T = problem.num_rows
     if T == 0:
         return _empty_forward(problem, X, need_dx=need_dx, need_dw=need_dw)
     row_index = valid_row_index(labels) if _resolve_compact(compact_rows) else None
     if row_index is not None and row_index.numel() == 0:  # every row ignored
-        return _empty_forward(problem, X, need_dx=need_dx, need_dw=need_dw, row_index=row_index)
+        return _empty_forward(
+            problem, X, need_dx=need_dx, need_dw=need_dw, row_index=row_index
+        )
     valid_rows = None if row_index is None else int(row_index.numel())
-    common = dict(objective=objective, loss_div=problem.loss_div, infer_logp=infer_logp, loss_weights=loss_weights,
-                  chunk_size=chunk_size, need_dx=need_dx, need_dw=need_dw, grad_weight_dtype=grad_weight_dtype)
+    common = dict(
+        objective=objective,
+        loss_div=problem.loss_div,
+        infer_logp=infer_logp,
+        loss_weights=loss_weights,
+        chunk_size=chunk_size,
+        need_dx=need_dx,
+        need_dw=need_dw,
+        grad_weight_dtype=grad_weight_dtype,
+    )
     cache = BINDING_CACHE
     key = None
     if backend == "cake" and cache.enabled:
-        key = forward_binding_key(X, W, labels, entry="loss", valid_rows=valid_rows, **common)
+        key = forward_binding_key(
+            X, W, labels, entry="loss", valid_rows=valid_rows, **common
+        )
         binding = cache.lookup(key)
         if binding is not None:
-            loss, logp, dx_acc, dw_acc = binding.forward(X, W, labels, infer_logp, loss_weights, row_index)
-            return ForwardResult(loss=loss.reshape(()), logp=scatter_rows(logp, row_index, T), dx_acc=dx_acc, dw_acc=dw_acc,
-                                 memory=binding.memory, backend=backend, row_index=row_index, num_rows=T)
-    runner = prepare_lm_head_loss(X, W, labels, deterministic=deterministic, entry="loss", backend=backend,
-                                  compact_rows=False if row_index is None else row_index, **common)
+            loss, logp, dx_acc, dw_acc = binding.forward(
+                X, W, labels, infer_logp, loss_weights, row_index
+            )
+            return ForwardResult(
+                loss=loss.reshape(()),
+                logp=scatter_rows(logp, row_index, T),
+                dx_acc=dx_acc,
+                dw_acc=dw_acc,
+                memory=binding.memory,
+                backend=backend,
+                row_index=row_index,
+                num_rows=T,
+            )
+    runner = prepare_lm_head_loss(
+        X,
+        W,
+        labels,
+        deterministic=deterministic,
+        entry="loss",
+        backend=backend,
+        compact_rows=False if row_index is None else row_index,
+        **common,
+    )
     loss, logp = runner.forward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
-    return ForwardResult(loss=loss.reshape(()), logp=scatter_rows(logp, row_index, T), dx_acc=runner.dx_acc, dw_acc=runner.dw_acc,
-                         memory=runner.memory, backend=backend, row_index=row_index, num_rows=T)
+    return ForwardResult(
+        loss=loss.reshape(()),
+        logp=scatter_rows(logp, row_index, T),
+        dx_acc=runner.dx_acc,
+        dw_acc=runner.dw_acc,
+        memory=runner.memory,
+        backend=backend,
+        row_index=row_index,
+        num_rows=T,
+    )
 
 
-def scale_cast(acc: torch.Tensor, grad: Optional[torch.Tensor], out_dtype: torch.dtype, *, backend: str = "cake") -> torch.Tensor:
+def scale_cast(
+    acc: torch.Tensor,
+    grad: Optional[torch.Tensor],
+    out_dtype: torch.dtype,
+    *,
+    backend: str = "cake",
+) -> torch.Tensor:
     """``cast(g * acc)`` into a new tensor of ``out_dtype`` (one rounding); ``acc`` is never written.
 
     The single fp32 -> output cast of the backward, for ``dW`` and ``dX`` alike
@@ -2093,7 +2870,11 @@ def scale_cast(acc: torch.Tensor, grad: Optional[torch.Tensor], out_dtype: torch
     out = torch.empty(acc.shape, dtype=out_dtype, device=acc.device)
     if acc.numel() == 0:
         return out
-    g = torch.ones((1,), dtype=torch.float32, device=acc.device) if grad is None else grad.detach().reshape(1).to(device=acc.device, dtype=torch.float32)
+    g = (
+        torch.ones((1,), dtype=torch.float32, device=acc.device)
+        if grad is None
+        else grad.detach().reshape(1).to(device=acc.device, dtype=torch.float32)
+    )
     if backend == "reference":
         out.reshape(-1).copy_(acc.reshape(-1) * g)
         return out
@@ -2105,10 +2886,27 @@ def scale_cast(acc: torch.Tensor, grad: Optional[torch.Tensor], out_dtype: torch
         raise ValueError(f"the cast needs a multiple of {geometry.cast_vec} elements")
     values: dict[str, Any] = {name: None for name in COMMON_TENSORS}
     values.update({name: 0 for name in COMMON_SCALARS})
-    values.update(acc=acc.reshape(-1), g=g, out=out.reshape(-1), num_vecs=int(acc.numel() // geometry.cast_vec), loss_div=1.0)
-    launches = _bind_all(record, module_name, ((stage, "eager"),), {(stage, "eager"): values}, acc.device, geometry)
+    values.update(
+        acc=acc.reshape(-1),
+        g=g,
+        out=out.reshape(-1),
+        num_vecs=int(acc.numel() // geometry.cast_vec),
+        loss_div=1.0,
+    )
+    launches = _bind_all(
+        record,
+        module_name,
+        ((stage, "eager"),),
+        {(stage, "eager"): values},
+        acc.device,
+        geometry,
+    )
     launch = launches[(stage, "eager")]
-    index = acc.device.index if acc.device.index is not None else torch.cuda.current_device()
+    index = (
+        acc.device.index
+        if acc.device.index is not None
+        else torch.cuda.current_device()
+    )
     with _ffi_stream_context(int(index)):
         if launch.prepare is not None:
             launch.prepare(*launch.arguments)
@@ -2130,12 +2928,22 @@ def backward_loss(
     ``cast(g * dW_acc)``; the accumulators are read, never written (repeatable).  A compacted forward
     (``ForwardResult.row_index`` / ``num_rows``): the compact rows are cast once, then scattered into a
     zero BF16 ``[T, H]``."""
-    dx = None if dx_acc is None else scale_cast(dx_acc, grad, torch.bfloat16, backend=backend)
+    dx = (
+        None
+        if dx_acc is None
+        else scale_cast(dx_acc, grad, torch.bfloat16, backend=backend)
+    )
     if dx is not None and row_index is not None:
         if num_rows is None:
-            raise ValueError("backward_loss needs num_rows (the caller's T) with row_index")
+            raise ValueError(
+                "backward_loss needs num_rows (the caller's T) with row_index"
+            )
         dx = scatter_rows(dx, row_index, int(num_rows))
-    dw = None if dw_acc is None else scale_cast(dw_acc, grad, grad_weight_dtype, backend=backend)
+    dw = (
+        None
+        if dw_acc is None
+        else scale_cast(dw_acc, grad, grad_weight_dtype, backend=backend)
+    )
     return dx, dw
 
 
@@ -2153,31 +2961,77 @@ def forward_logprob(
     ``lse`` (compacted: the ``[T_v]`` rows of ``row_index``, exactly what :func:`backward_logprob` expects back)."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    problem = validate_lm_head_inputs(X, W, labels, chunk_size=chunk_size, deterministic=deterministic, entry="logprob")
+    problem = validate_lm_head_inputs(
+        X,
+        W,
+        labels,
+        chunk_size=chunk_size,
+        deterministic=deterministic,
+        entry="logprob",
+    )
     T = problem.num_rows
     if T == 0:
         return _empty_forward(problem, X, need_dx=False, need_dw=False)
     row_index = valid_row_index(labels) if _resolve_compact(compact_rows) else None
     if row_index is not None and row_index.numel() == 0:  # every row ignored
-        return _empty_forward(problem, X, need_dx=False, need_dw=False, row_index=row_index)
+        return _empty_forward(
+            problem, X, need_dx=False, need_dw=False, row_index=row_index
+        )
     valid_rows = None if row_index is None else int(row_index.numel())
     cache = BINDING_CACHE
     key = None
     if backend == "cake" and cache.enabled:
-        key = forward_binding_key(X, W, labels, objective="ce", loss_div=None, infer_logp=None, loss_weights=None, chunk_size=chunk_size,
-                                  need_dx=False, need_dw=False, grad_weight_dtype=torch.bfloat16, entry="logprob", valid_rows=valid_rows)
+        key = forward_binding_key(
+            X,
+            W,
+            labels,
+            objective="ce",
+            loss_div=None,
+            infer_logp=None,
+            loss_weights=None,
+            chunk_size=chunk_size,
+            need_dx=False,
+            need_dw=False,
+            grad_weight_dtype=torch.bfloat16,
+            entry="logprob",
+            valid_rows=valid_rows,
+        )
         binding = cache.lookup(key)
         if binding is not None:
             logp, lse = binding.forward(X, W, labels, None, None, row_index)
-            return ForwardResult(loss=None, logp=scatter_rows(logp, row_index, T), lse=lse, memory=binding.memory, backend=backend,
-                                 row_index=row_index, num_rows=T)
-    runner = prepare_lm_head_loss(X, W, labels, chunk_size=chunk_size, need_dx=False, need_dw=False, deterministic=deterministic,
-                                  entry="logprob", backend=backend, compact_rows=False if row_index is None else row_index)
+            return ForwardResult(
+                loss=None,
+                logp=scatter_rows(logp, row_index, T),
+                lse=lse,
+                memory=binding.memory,
+                backend=backend,
+                row_index=row_index,
+                num_rows=T,
+            )
+    runner = prepare_lm_head_loss(
+        X,
+        W,
+        labels,
+        chunk_size=chunk_size,
+        need_dx=False,
+        need_dw=False,
+        deterministic=deterministic,
+        entry="logprob",
+        backend=backend,
+        compact_rows=False if row_index is None else row_index,
+    )
     logp, lse = runner.forward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
-    return ForwardResult(loss=None, logp=scatter_rows(logp, row_index, T), lse=lse, memory=runner.memory, backend=backend,
-                         row_index=row_index, num_rows=T)
+    return ForwardResult(
+        loss=None,
+        logp=scatter_rows(logp, row_index, T),
+        lse=lse,
+        memory=runner.memory,
+        backend=backend,
+        row_index=row_index,
+        num_rows=T,
+    )
 
 
 def backward_logprob(
@@ -2202,28 +3056,65 @@ def backward_logprob(
     scattered to ``[T, H]``; every row ignored returns zeros without launching."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    problem = validate_lm_head_inputs(X, W, labels, chunk_size=chunk_size, deterministic=deterministic, entry="logprob")
+    problem = validate_lm_head_inputs(
+        X,
+        W,
+        labels,
+        chunk_size=chunk_size,
+        deterministic=deterministic,
+        entry="logprob",
+    )
     if not (need_dx or need_dw):
         return None, None
     T, H, V = problem.num_rows, problem.hidden, problem.vocab
-    row_index = valid_row_index(labels) if (T and _resolve_compact(compact_rows)) else None
+    row_index = (
+        valid_row_index(labels) if (T and _resolve_compact(compact_rows)) else None
+    )
     rows = T if row_index is None else int(row_index.numel())
     if rows == 0:  # no rows, or every row ignored
-        return (torch.zeros((T, H), dtype=torch.bfloat16, device=X.device) if need_dx else None,
-                torch.zeros((V, H), dtype=torch.bfloat16, device=X.device) if need_dw else None)
+        return (
+            torch.zeros((T, H), dtype=torch.bfloat16, device=X.device)
+            if need_dx
+            else None,
+            torch.zeros((V, H), dtype=torch.bfloat16, device=X.device)
+            if need_dw
+            else None,
+        )
     _check_output(lse, "lse", (rows,), torch.float32)
     dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
     cache = BINDING_CACHE
     key = None
     valid_rows = None if row_index is None else rows
     if backend == "cake" and cache.enabled:
-        key = logprob_backward_binding_key(X, W, labels, lse, dlogp, chunk_size=chunk_size, need_dx=need_dx, need_dw=need_dw, valid_rows=valid_rows)
+        key = logprob_backward_binding_key(
+            X,
+            W,
+            labels,
+            lse,
+            dlogp,
+            chunk_size=chunk_size,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            valid_rows=valid_rows,
+        )
         binding = cache.lookup(key)
         if binding is not None:
             dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index)
             return (None if dx is None else scatter_rows(dx, row_index, T)), dw
-    runner = prepare_lm_head_loss(X, W, labels, chunk_size=chunk_size, need_dx=need_dx, need_dw=need_dw, deterministic=deterministic,
-                                  entry="logprob", dlogp=dlogp, lse=lse, backend=backend, compact_rows=False if row_index is None else row_index)
+    runner = prepare_lm_head_loss(
+        X,
+        W,
+        labels,
+        chunk_size=chunk_size,
+        need_dx=need_dx,
+        need_dw=need_dw,
+        deterministic=deterministic,
+        entry="logprob",
+        dlogp=dlogp,
+        lse=lse,
+        backend=backend,
+        compact_rows=False if row_index is None else row_index,
+    )
     dx, dw = runner.backward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
@@ -2239,20 +3130,53 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
     """Entry (a): the forward produces the FP32 gradient accumulators; the backward scales and casts them."""
 
     @staticmethod
-    def forward(ctx, X, W, labels, objective, loss_div, infer_logp, loss_weights, chunk_size, return_logp, grad_weight_dtype, deterministic, backend,
-                compact_rows):
+    def forward(
+        ctx,
+        X,
+        W,
+        labels,
+        objective,
+        loss_div,
+        infer_logp,
+        loss_weights,
+        chunk_size,
+        return_logp,
+        grad_weight_dtype,
+        deterministic,
+        backend,
+        compact_rows,
+    ):
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         result = forward_loss(
-            X, W, labels, objective=objective, loss_div=loss_div, infer_logp=infer_logp, loss_weights=loss_weights,
-            chunk_size=chunk_size, need_dx=need_dx, need_dw=need_dw, grad_weight_dtype=grad_weight_dtype,
-            deterministic=deterministic, backend=backend, compact_rows=compact_rows,
+            X,
+            W,
+            labels,
+            objective=objective,
+            loss_div=loss_div,
+            infer_logp=infer_logp,
+            loss_weights=loss_weights,
+            chunk_size=chunk_size,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            grad_weight_dtype=grad_weight_dtype,
+            deterministic=deterministic,
+            backend=backend,
+            compact_rows=compact_rows,
         )
         ctx.set_materialize_grads(False)
-        ctx.dx_acc, ctx.dw_acc = result.dx_acc, result.dw_acc  # saved state, never mutated
-        ctx.row_index, ctx.num_rows = result.row_index, int(X.shape[0])  # compacted: dx_acc holds the rows of row_index
+        ctx.dx_acc, ctx.dw_acc = (
+            result.dx_acc,
+            result.dw_acc,
+        )  # saved state, never mutated
+        ctx.row_index, ctx.num_rows = (
+            result.row_index,
+            int(X.shape[0]),
+        )  # compacted: dx_acc holds the rows of row_index
         ctx.grad_weight_dtype = grad_weight_dtype
         ctx.backend = backend
-        ctx.empty = X.shape[0] == 0 or (result.row_index is not None and result.row_index.numel() == 0)
+        ctx.empty = X.shape[0] == 0 or (
+            result.row_index is not None and result.row_index.numel() == 0
+        )
         ctx.mark_non_differentiable(result.logp)
         return result.loss, result.logp
 
@@ -2262,11 +3186,34 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
         if grad_loss is None:
             return none
         if ctx.empty:  # T == 0 or every row ignored: zero gradients without binding or launching a program
-            dx = None if ctx.dx_acc is None else torch.zeros((ctx.num_rows, ctx.dx_acc.shape[1]), dtype=torch.bfloat16, device=ctx.dx_acc.device)
-            dw = None if ctx.dw_acc is None else torch.zeros(ctx.dw_acc.shape, dtype=ctx.grad_weight_dtype, device=ctx.dw_acc.device)
+            dx = (
+                None
+                if ctx.dx_acc is None
+                else torch.zeros(
+                    (ctx.num_rows, ctx.dx_acc.shape[1]),
+                    dtype=torch.bfloat16,
+                    device=ctx.dx_acc.device,
+                )
+            )
+            dw = (
+                None
+                if ctx.dw_acc is None
+                else torch.zeros(
+                    ctx.dw_acc.shape,
+                    dtype=ctx.grad_weight_dtype,
+                    device=ctx.dw_acc.device,
+                )
+            )
             return (dx, dw) + none[2:]
-        dx, dw = backward_loss(ctx.dx_acc, ctx.dw_acc, grad_loss, grad_weight_dtype=ctx.grad_weight_dtype, backend=ctx.backend,
-                               row_index=ctx.row_index, num_rows=ctx.num_rows)
+        dx, dw = backward_loss(
+            ctx.dx_acc,
+            ctx.dw_acc,
+            grad_loss,
+            grad_weight_dtype=ctx.grad_weight_dtype,
+            backend=ctx.backend,
+            row_index=ctx.row_index,
+            num_rows=ctx.num_rows,
+        )
         return (dx, dw) + none[2:]
 
 
@@ -2275,11 +3222,26 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, X, W, labels, chunk_size, deterministic, backend, compact_rows):
-        compact = _resolve_compact(compact_rows)  # resolved once: the backward recomputes the same valid-row index
-        result = forward_logprob(X, W, labels, chunk_size=chunk_size, deterministic=deterministic, backend=backend, compact_rows=compact)
+        compact = _resolve_compact(
+            compact_rows
+        )  # resolved once: the backward recomputes the same valid-row index
+        result = forward_logprob(
+            X,
+            W,
+            labels,
+            chunk_size=chunk_size,
+            deterministic=deterministic,
+            backend=backend,
+            compact_rows=compact,
+        )
         ctx.set_materialize_grads(False)
         ctx.save_for_backward(X, W, labels, result.lse)
-        ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = chunk_size, deterministic, backend, compact
+        ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = (
+            chunk_size,
+            deterministic,
+            backend,
+            compact,
+        )
         return result.logp
 
     @staticmethod
@@ -2288,8 +3250,19 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
             return None, None, None, None, None, None, None
         X, W, labels, lse = ctx.saved_tensors
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
-        dx, dw = backward_logprob(X, W, labels, lse, dlogp, chunk_size=ctx.chunk_size, need_dx=need_dx, need_dw=need_dw,
-                                  deterministic=ctx.deterministic, backend=ctx.backend, compact_rows=ctx.compact)
+        dx, dw = backward_logprob(
+            X,
+            W,
+            labels,
+            lse,
+            dlogp,
+            chunk_size=ctx.chunk_size,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            deterministic=ctx.deterministic,
+            backend=ctx.backend,
+            compact_rows=ctx.compact,
+        )
         return dx, dw, None, None, None, None, None
 
 
@@ -2332,7 +3305,18 @@ def chunked_lm_head_loss(
             "backward_loss(dx_acc, dw_acc, g, grad_weight_dtype=torch.float32, row_index=..., num_rows=...) for an FP32 dW"
         )
     loss, logp = ChunkedLmHeadLossFunction.apply(
-        X, W, labels, objective, loss_div, infer_logp, loss_weights, int(chunk_size), bool(return_logp), grad_weight_dtype, deterministic, backend,
+        X,
+        W,
+        labels,
+        objective,
+        loss_div,
+        infer_logp,
+        loss_weights,
+        int(chunk_size),
+        bool(return_logp),
+        grad_weight_dtype,
+        deterministic,
+        backend,
         compact_rows,
     )
     return (loss, logp.detach()) if return_logp else loss
@@ -2352,4 +3336,6 @@ def chunked_lm_head_logprob(
     ``compact_rows`` as in :func:`chunked_lm_head_loss`."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    return ChunkedLmHeadLogprobFunction.apply(X, W, labels, int(chunk_size), deterministic, backend, compact_rows)
+    return ChunkedLmHeadLogprobFunction.apply(
+        X, W, labels, int(chunk_size), deterministic, backend, compact_rows
+    )

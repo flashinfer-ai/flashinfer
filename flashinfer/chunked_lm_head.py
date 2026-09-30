@@ -137,7 +137,9 @@ def chunked_lm_head_loss(
     the FP32 accumulators by ``cake_backend.memory_report``.
     """
     if backend != "cake":
-        raise ValueError("the chunked LM-head + loss kernels currently support backend='cake'")
+        raise ValueError(
+            "the chunked LM-head + loss kernels currently support backend='cake'"
+        )
     from .experimental.cake_lm_head_loss import cake_backend
 
     return cake_backend.chunked_lm_head_loss(
@@ -180,7 +182,9 @@ def chunked_lm_head_logprob(
     as in :func:`chunked_lm_head_loss`; ``dW`` is returned in BF16.
     """
     if backend != "cake":
-        raise ValueError("the chunked LM-head + loss kernels currently support backend='cake'")
+        raise ValueError(
+            "the chunked LM-head + loss kernels currently support backend='cake'"
+        )
     from .experimental.cake_lm_head_loss import cake_backend
 
     return cake_backend.chunked_lm_head_logprob(
