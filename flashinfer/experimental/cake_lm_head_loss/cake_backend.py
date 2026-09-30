@@ -2187,7 +2187,8 @@ def chunked_lm_head_loss(
     casts every gradient to its leaf's dtype, so an FP32 ``dW`` cannot leave
     this entry through ``W.grad`` for a BF16 ``W``.  Use ``forward_loss(...,
     need_dw=True)`` + ``backward_loss(dx_acc, dw_acc, g, grad_weight_dtype=
-    torch.float32)`` for an FP32 weight gradient.  ``compact_rows`` (default
+    torch.float32, row_index=result.row_index, num_rows=result.num_rows)`` for
+    an FP32 weight gradient.  ``compact_rows`` (default
     :func:`compact_rows_default`): chunk over the valid rows only; the ``dX``
     rows of ignored tokens are exact zeros either way.
     """
@@ -2199,7 +2200,7 @@ def chunked_lm_head_loss(
         raise ValueError(
             f"grad_weight_dtype={grad_weight_dtype} differs from W.dtype={W.dtype}: the autograd engine casts "
             "every gradient to its leaf's dtype, so this entry cannot return it; use forward_loss(..., need_dw=True) + "
-            "backward_loss(dx_acc, dw_acc, g, grad_weight_dtype=torch.float32) for an FP32 dW"
+            "backward_loss(dx_acc, dw_acc, g, grad_weight_dtype=torch.float32, row_index=..., num_rows=...) for an FP32 dW"
         )
     loss, logp = ChunkedLmHeadLossFunction.apply(
         X, W, labels, objective, loss_div, infer_logp, loss_weights, int(chunk_size), bool(return_logp), grad_weight_dtype, deterministic, backend,

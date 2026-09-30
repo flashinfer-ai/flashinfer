@@ -46,7 +46,9 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   `dW` BF16 by default or FP32 with `grad_weight_dtype=torch.float32` (the
   FP32 form is served by the explicit `cake_backend.forward_loss` /
   `backward_loss` pair: the autograd entry casts every gradient to its leaf's
-  dtype and therefore requires `grad_weight_dtype == W.dtype`).
+  dtype and therefore requires `grad_weight_dtype == W.dtype`; a compacted
+  forward hands its `row_index` / `num_rows` to `backward_loss`, which casts
+  the compact `dX` rows and scatters them into the `[T, H]` output).
   Gradients are produced only for inputs that require them (a frozen `X` or
   `W` skips its GEMM); the upstream scalar gradient is applied once, in the
   cast.  The saved FP32 accumulators are re-scaled, never mutated, so a

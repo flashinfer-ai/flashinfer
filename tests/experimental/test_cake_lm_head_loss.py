@@ -771,13 +771,18 @@ def test_logprob_entry_matches_unchunked():
     _check_dtypes(result, inp)
     _check_against_references(result, inp, entry="logprob")
     assert torch.all(result["dX"][~inp.valid] == 0)
-    # the eager forward exposes the saved row statistic
+    # the eager forward exposes the saved row statistic (compacted by default: the valid rows of row_index)
+    T_v = int(inp.valid.sum())
     fr = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=64, backend="reference")
-    assert fr.loss is None and torch.equal(fr.logp, result["logp"]) and tuple(fr.lse.shape) == (inp.T,)
+    assert fr.loss is None and torch.equal(fr.logp, result["logp"]) and tuple(fr.lse.shape) == (T_v,) and fr.num_rows == inp.T
     oracle = reference_fp64(inp, entry="logprob")
-    assert (fr.lse.double() - oracle["lse"]).abs().max().item() <= 1e-2
+    assert (fr.lse.double() - oracle["lse"][inp.valid]).abs().max().item() <= 1e-2
     dx, dw = cake_backend.backward_logprob(inp.X, inp.W, inp.labels, fr.lse, inp.dlogp, chunk_size=64, backend="reference")
     assert torch.equal(dx, result["dX"]) and torch.equal(dw, result["dW"])
+    plain = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=64, backend="reference", compact_rows=False)
+    assert tuple(plain.lse.shape) == (inp.T,) and plain.row_index is None and torch.equal(plain.lse[inp.valid], fr.lse)
+    with pytest.raises(ValueError, match="lse"):  # the uncompacted statistic does not fit a compacted backward
+        cake_backend.backward_logprob(inp.X, inp.W, inp.labels, plain.lse, inp.dlogp, chunk_size=64, backend="reference", compact_rows=True)
     assert cake_backend.backward_logprob(inp.X, inp.W, inp.labels, fr.lse, inp.dlogp, chunk_size=64, need_dx=False, need_dw=False, backend="reference") == (None, None)
 
 
@@ -792,8 +797,9 @@ def test_grad_weight_dtype_fp32():
     # the explicit pair: FP32 accumulators, one cast to the requested dtype
     fr = cake_backend.forward_loss(inp.X, inp.W, inp.labels, objective="ce", loss_div=inp.loss_div, chunk_size=64, need_dx=True, need_dw=True,
                                    grad_weight_dtype=torch.float32, backend="reference")
-    dX, dW32 = cake_backend.backward_loss(fr.dx_acc, fr.dw_acc, None, grad_weight_dtype=torch.float32, backend="reference")
-    assert dW32.dtype == torch.float32 and dX.dtype == torch.bfloat16
+    dX, dW32 = cake_backend.backward_loss(fr.dx_acc, fr.dw_acc, None, grad_weight_dtype=torch.float32, backend="reference",
+                                          row_index=fr.row_index, num_rows=fr.num_rows)  # the compacted forward's rows
+    assert dW32.dtype == torch.float32 and dX.dtype == torch.bfloat16 and tuple(dX.shape) == (inp.T, H_HOST)
     assert torch.equal(fr.loss, bf16["loss"]) and torch.equal(fr.logp, bf16["logp"]) and torch.equal(dX, bf16["dX"])
     assert torch.equal(dW32.to(torch.bfloat16), bf16["dW"])  # the same accumulator, cast once
     assert torch.equal(dW32, fr.dw_acc) and dW32.data_ptr() != fr.dw_acc.data_ptr()
@@ -839,14 +845,19 @@ def test_upstream_scale_is_applied_once():
     inp = _host_inputs(65)
     scaled = _run(inp, 64, scale=3.0)
     fr = cake_backend.forward_loss(inp.X, inp.W, inp.labels, objective="ce", loss_div=inp.loss_div, chunk_size=64, backend="reference")
-    assert fr.backend == "reference" and fr.loss.shape == () and fr.memory["num_chunks"] == 2
+    T_v = int(inp.valid.sum())  # the compacted loop: 62 of the 65 rows, one chunk
+    assert fr.backend == "reference" and fr.loss.shape == () and fr.memory["num_chunks"] == -(-T_v // 64) == 1
     assert torch.equal(scaled["loss"], fr.loss)
-    assert torch.equal(scaled["dX"], (3.0 * fr.dx_acc).to(torch.bfloat16))
+    scatter = lambda rows: cake_backend.scatter_rows(rows, fr.row_index, fr.num_rows)
+    assert torch.equal(scaled["dX"], scatter((3.0 * fr.dx_acc).to(torch.bfloat16)))
     assert torch.equal(scaled["dW"], (3.0 * fr.dw_acc).to(torch.bfloat16))
-    dx, dw = cake_backend.backward_loss(fr.dx_acc, fr.dw_acc, torch.tensor(3.0), backend="reference")
+    dx, dw = cake_backend.backward_loss(fr.dx_acc, fr.dw_acc, torch.tensor(3.0), backend="reference", row_index=fr.row_index, num_rows=fr.num_rows)
     assert torch.equal(dx, scaled["dX"]) and torch.equal(dw, scaled["dW"])
-    dx32, dw32 = cake_backend.backward_loss(fr.dx_acc, fr.dw_acc, torch.tensor(3.0), grad_weight_dtype=torch.float32, backend="reference")
+    dx32, dw32 = cake_backend.backward_loss(fr.dx_acc, fr.dw_acc, torch.tensor(3.0), grad_weight_dtype=torch.float32, backend="reference",
+                                            row_index=fr.row_index, num_rows=fr.num_rows)
     assert dw32.dtype == torch.float32 and torch.equal(dw32, 3.0 * fr.dw_acc) and torch.equal(dx32, dx)
+    with pytest.raises(ValueError, match="num_rows"):
+        cake_backend.backward_loss(fr.dx_acc, fr.dw_acc, None, backend="reference", row_index=fr.row_index)
     # the log-probability entry scales through dlogp
     plain = _run(inp, 64, entry="logprob")
     twice = _run(inp, 64, entry="logprob", scale=2.0)
@@ -940,8 +951,11 @@ def test_noncontiguous_x_strides(ld_pad, copied):
         assert torch.equal(strided[key], contiguous[key]), key
     assert tuple(strided["dX"].shape) == (37, H_HOST)
     _check_against_references(strided, inp)
-    fr = cake_backend.forward_loss(inp.X, inp.W, inp.labels, objective="ce", loss_div=inp.loss_div, chunk_size=16, backend="reference")
+    fr = cake_backend.forward_loss(inp.X, inp.W, inp.labels, objective="ce", loss_div=inp.loss_div, chunk_size=16, backend="reference", compact_rows=False)
     assert ("x_copy" in fr.memory["temporary"]) is copied
+    # the compacted loop gathers the chunk's rows into a contiguous buffer: no copy of X whatever its stride
+    compact = cake_backend.forward_loss(inp.X, inp.W, inp.labels, objective="ce", loss_div=inp.loss_div, chunk_size=16, backend="reference", compact_rows=True)
+    assert compact.memory["compact_rows"] and "x_copy" not in compact.memory["temporary"] and torch.equal(compact.logp, strided["logp"])
 
 
 def test_reference_deterministic_three_runs():
@@ -961,7 +975,10 @@ def test_chunk_size_changes_only_rounding():
         _check_against_references(r, inp)
     for r in (small, single):
         assert abs(r["loss"].item() - large["loss"].item()) <= 1e-5 * abs(large["loss"].item())
-    assert cake_backend.forward_loss(inp.X, inp.W, inp.labels, objective="ce", loss_div=inp.loss_div, chunk_size=16, backend="reference").memory["num_chunks"] == 13
+    kw = dict(objective="ce", loss_div=inp.loss_div, chunk_size=16, backend="reference")
+    T_v = int(inp.valid.sum())  # the default compacted loop chunks the valid rows (190 of 200): 12 chunks, not 13
+    assert cake_backend.forward_loss(inp.X, inp.W, inp.labels, **kw).memory["num_chunks"] == -(-T_v // 16) == 12
+    assert cake_backend.forward_loss(inp.X, inp.W, inp.labels, compact_rows=False, **kw).memory["num_chunks"] == 13
     # the row statistics do not depend on the chunking at all
     assert torch.equal(small["logp"], large["logp"]) or (small["logp"] - large["logp"]).abs().max().item() <= 1e-5
 
@@ -1109,7 +1126,7 @@ def test_compacted_runner_binds_the_valid_rows():
         assert v["T"] == T_v and v["A"].data_ptr() == t["x_c"].data_ptr() and tuple(v["A"].shape) == (rows_c, H_HOST)
         assert stage_values("gemm_dw_acc", t, plan, index)["B"].data_ptr() == t["x_c"].data_ptr()
     op = stage_values("gather_rows", t, plan, "infer_logp")
-    assert op["src"] is inp.infer_logp and op["out"] is t["infer_logp"] and op["idx"] is idx
+    assert op["src"] is inp.infer_logp and op["out"] is t["infer_logp"] and torch.equal(op["idx"], idx)
     runner.step()
     assert torch.equal(t["infer_logp"], inp.infer_logp[idx]) and torch.equal(t["x_c"][: plan.chunks[-1][1]], inp.X[idx[plan.chunks[-1][0]:]])
     autograd = _run(inp, C, compact_rows=True)
