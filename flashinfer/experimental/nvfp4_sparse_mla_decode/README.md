@@ -93,9 +93,9 @@ The cluster size is chosen per launch: the largest of 8, 6, 5, 4 and 3 whose clu
 device at once, from `cudaOccupancyMaxActiveClusters`. On GB200 (152 SMs) that is 8 CTAs up to 15 tokens, 6 up to 23,
 5 up to 28, 4 up to 36 and 3 up to 46; on B300 (148 SMs) 8 up to 15, 6 up to 22, 5 up to 26, 4 up to 33 and 3 up to 45.
 
-Nsight Compute on the 3-CTA plan at 35 tokens: L1/shared 69 %, tensor pipe 24 %, DRAM 16 %. Shared-memory traffic
-bounds the kernel, 63 % of it the f16 key tile. A tcgen05 version that keeps keys in tensor memory is the natural
-successor.
+Nsight Compute on a GB200 with 4-CTA clusters at 35 tokens: L1/shared 69 %, tensor pipe 24 %, DRAM 16 %. Shared-memory
+traffic bounds the kernel, 63 % of its wavefronts the f16 key tile (written once, read by QK and by PV). A tcgen05
+version that keeps keys in tensor memory is the natural successor.
 
 ## Measurements
 
