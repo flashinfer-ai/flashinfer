@@ -673,6 +673,19 @@ def _cake_situ_stage_bindings(options, prepared):
             ),
         }
     )
+    if "fused_router" in stages and any(
+        name == "quant_route.s2b_num_tokens"
+        for _, name in PROGRAMS[prepared["program_key"]]["arg_plan"]
+    ):  # SmallS2b (inc16, R64): the routed program fuses quant into the router ->
+        stages["quant_route"] = dict(
+            stages["fused_router"],
+            grid=(num_tokens + 1, 1, 1),
+            s2b_x=x,
+            s2b_qx=qx,  # ONE launch: block 0 routes, blocks 1..num_tokens quantize; the quant / fused_router dicts stay unbound
+            s2b_packed=views["x_packed"],
+            s2b_scales=views["x_scales"],
+            s2b_num_tokens=num_tokens,
+        )
     return stages
 
 
