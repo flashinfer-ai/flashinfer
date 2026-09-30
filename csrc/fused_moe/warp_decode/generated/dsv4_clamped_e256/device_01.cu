@@ -629,7 +629,6 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                     float _tmem_load_0[8];
                     tmem_ld_x8(&_tmem_load_0[0], taddr + (unsigned int)(cta_rank * 64 + warp_0 * 32 << 16) + acc_stage * 8);
                     asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    asm volatile("barrier.sync 7, 64;" ::: "memory");
                     for (int token_pair = 0; token_pair < 4; token_pair++) {
                         if (valid_rows > token_pair * 2) {
                             float _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, _tmem_load_0[token_pair * 2], 8);
@@ -1511,4 +1510,3 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
 }
 
 } // extern "C"
-
