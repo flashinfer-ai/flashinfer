@@ -308,6 +308,8 @@ def concat_mla_kv_quant_fp8(
         raise ValueError("key has the wrong shape")
     if value.shape != (num_tokens, num_heads, v_dim):
         raise ValueError("value has the wrong shape")
+    if key.dtype != fp8 or value.dtype != fp8:
+        raise ValueError("key and value must have dtype torch.float8_e4m3fn")
 
     _stats["calls"] += 1
     reason = _specialized_supported(kv_nope, k_pe, key, value, nope_dim)
