@@ -518,9 +518,13 @@ def _assert_mirrors_cake(plan, cake_template, where):
     back (swap and / or rule dropped) onto a generated program."""
     if cake_template in EXPORTED_TEMPLATES:
         assert plan.template == cake_template, (*where, plan.template)
-        assert not plan.swap_fallback and not plan.rule_fallback, where
+        assert not (plan.swap_fallback or plan.rule_fallback or plan.knob_fallback), where
     else:
-        assert plan.swap_fallback or plan.rule_fallback, (*where, cake_template, plan.template)
+        assert plan.swap_fallback or plan.rule_fallback or plan.knob_fallback, (
+            *where,
+            cake_template,
+            plan.template,
+        )
         assert plan.template in EXPORTED_TEMPLATES, (*where, cake_template, plan.template)
 
 

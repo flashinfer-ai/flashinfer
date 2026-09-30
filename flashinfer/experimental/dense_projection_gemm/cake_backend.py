@@ -84,6 +84,7 @@ after its first call.  The eager entry points (:func:`dense_projection_gemm`,
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -784,6 +785,9 @@ class GemmPlan:
     # (the Cake host JIT-compiles it)
     swap_fallback: bool = False
     rule_fallback: bool = False
+    # ... and the plan landed on the nearest registered knob variant (tile height, raster group, epilogue path,
+    # BLOCK_N) because no generated program serves the row's default tail-T instance either
+    knob_fallback: bool = False
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -1041,7 +1045,54 @@ def plan_dense_projection_gemm(
             )
             if candidate[0].template in KERNELS.get(arch, {}):
                 return candidate
+        # last resort: the nearest registered knob variant of the same layout / output kind (every knob set
+        # computes the same GEMM; only the tile walk and the store path differ)
+        for allow_swap in ((True, False) if swapped else (False,)):
+            for knobs in _FALLBACK_KNOB_VARIANTS:
+                merged = dict(_caller_knobs)
+                for name, value in knobs.items():
+                    if merged.get(name) is None:
+                        merged[name] = value
+                if merged == _caller_knobs:
+                    continue
+                try:
+                    candidate = plan_dense_projection_gemm(
+                        A,
+                        B,
+                        out,
+                        sm_count=sm_count,
+                        l2_bytes=l2_bytes,
+                        _fallback=False,
+                        _allow_swap=allow_swap,
+                        _use_rules=False,
+                        **merged,
+                    )
+                except ValueError:
+                    continue  # a knob the row cannot take (e.g. epi="tma" with a transposed store)
+                if candidate[0].template in KERNELS.get(arch, {}):
+                    return (dataclasses.replace(candidate[0], knob_fallback=True), *candidate[1:])
     return plan, a_desc, b_desc, O3
+
+
+# Knob variants the registry fallback tries, nearest first (see ``plan_dense_projection_gemm``): the tall tile and the
+# raster groups the measured rules use, the register epilogue (the canonical-T templates), then BLOCK_N = 128.
+_FALLBACK_KNOB_VARIANTS = (
+    dict(cta_rows=256),
+    dict(group_m=8),
+    dict(cta_rows=256, group_m=8),
+    dict(group_m=4),
+    dict(group_m=32),
+    dict(epi="reg"),
+    dict(epi="reg", f32_v8=True),
+    dict(epi="reg", cta_rows=256),
+    dict(epi="reg", group_m=8),
+    dict(epi="reg", group_m=8, f32_v8=True),
+    dict(epi="reg", group_m=32, f32_v8=True),
+    dict(epi="reg", cta_rows=256, group_m=8),
+    dict(epi="reg", group_m=4),
+    dict(block_n=128),
+    dict(block_n=128, epi="reg"),
+)
 
 
 # ---------------------------------------------------------------------------
