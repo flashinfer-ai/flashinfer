@@ -83,10 +83,8 @@ def _get_workspace_state(workspace: torch.Tensor) -> _WorkspaceState:
     return state
 
 
-def _dcp_lse_reduce_payload_offset(cp_size: int) -> int:
-    # 16-byte epoch metadata plus two uint32 readiness arrays, rounded so the
-    # vectorized payload remains 16-byte aligned.
-    return (16 + 2 * cp_size * 4 + 15) // 16 * 16
+# Epoch metadata, padded so every 128-byte payload line is aligned.
+_PAYLOAD_OFFSET = 128
 
 
 @functools.cache
@@ -112,10 +110,14 @@ def decode_cp_a2a_lse_reduce_workspace_size(
     itemsize = torch.empty((), dtype=dtype).element_size()
     if head_dim * itemsize % 16 != 0:
         raise ValueError("head_dim rows must be 16-byte aligned")
-    payload_offset = _dcp_lse_reduce_payload_offset(cp_size)
-    return payload_offset + 2 * cp_size * max_tokens * local_heads * (
-        head_dim * itemsize + 4
-    )
+    # Each row is sent as 128-byte lines of 15 eight-byte data words plus a flag
+    # word, and its LSE as one 16-byte line per group of four data lines.
+    lines = (head_dim * itemsize // 8 + 14) // 15
+    groups = (lines + 3) // 4
+    if groups > 32:
+        raise ValueError("head_dim rows must not exceed 15360 bytes")
+    row_bytes = lines * 128 + groups * 16
+    return _PAYLOAD_OFFSET + 2 * cp_size * max_tokens * local_heads * row_bytes
 
 
 @flashinfer_api
@@ -172,11 +174,11 @@ def decode_cp_a2a_lse_reduce_create_workspace(
     # group's ``cuda:<local_rank>`` communicator.
     device = torch.device("cuda", torch.cuda.current_device())
     workspace = symm_mem.empty(size_bytes, dtype=torch.uint8, device=device)
-    # Initialize the local epoch and readiness words. The payload is fully
-    # overwritten before every read; clearing it could race a peer's first put.
-    workspace[: _dcp_lse_reduce_payload_offset(cp_size)].zero_()
+    # Data lines are ready when their flag word matches the (nonzero) per-call
+    # flag, so the whole workspace, not only the epoch, must start zeroed.
+    workspace.zero_()
     # Initialization must complete before rendezvous; afterwards any peer may
-    # enter the first fused kernel and publish a remote readiness value.
+    # enter the first fused kernel and write lines into this workspace.
     torch.cuda.current_stream().synchronize()
     handle = symm_mem.rendezvous(workspace, group)
     state = _WorkspaceState(handle=handle, group_name=group_name, device=device)
@@ -198,7 +200,8 @@ def decode_cp_a2a_lse_reduce(
     """Fuse an NCCL LSA DCP A2A exchange with the LSE-weighted reduce.
 
     Send, receive synchronization, and reduction execute in one cooperative
-    CUDA kernel.
+    CUDA kernel. Data moves in 128-byte lines that carry their own readiness
+    flag (NCCL's LL128 protocol), so no fence or grid-wide barrier is needed.
 
     This is a collective operation. Every rank must invoke it in the same order
     and the same number of times, including CUDA graph replays. All ranks must
@@ -210,9 +213,14 @@ def decode_cp_a2a_lse_reduce(
         ``[batch, heads, cp_size, head_dim]`` CUDA tensor (fp16 or bf16), or
         more generally ``[..., cp_size, head_dim]``.
         ``partial_o[..., peer, :]`` is the slice destined for that CP rank.
+        A 4-D input may be any strided view whose last dimension is contiguous,
+        e.g. an attention output ``[batch, cp_size * heads, head_dim]`` viewed as
+        ``out.unflatten(1, (cp_size, heads)).permute(0, 2, 1, 3)``, so no packing
+        copy is needed. Inputs of any other dimensionality must be contiguous.
     partial_lse : torch.Tensor
         ``[batch, heads, cp_size]`` CUDA float32 tensor, or more generally
         ``[..., cp_size]``. Its leading dimensions must match ``partial_o``.
+        Like ``partial_o``, a 3-D input may be a strided view.
         ``heads`` is simply the number of heads present in the input; it may
         be local or total because this operation does not shard the head axis.
     workspace : torch.Tensor
