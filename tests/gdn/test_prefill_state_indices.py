@@ -590,6 +590,7 @@ def test_prefill_initial_state_without_final_state(use_cp):
         output=out_ref,
         output_state=ref_state,
         use_cp=use_cp,
+        max_seqlen=max(seq_lens),
     )
     out = torch.empty(total, H, D, dtype=q.dtype, device=device)
     got = chunk_gated_delta_rule(
@@ -605,6 +606,7 @@ def test_prefill_initial_state_without_final_state(use_cp):
         use_qk_l2norm_in_kernel=False,
         output=out,
         use_cp=use_cp,
+        max_seqlen=max(seq_lens),
     )
     torch.testing.assert_close(got, ref, atol=1e-2, rtol=5e-3)
 
@@ -657,6 +659,7 @@ def test_prefill_state_indices_pools_of_different_sizes(use_cp):
         output=packed_out,
         output_state=packed_state,
         use_cp=use_cp,
+        max_seqlen=max(seq_lens),
     )
 
     perm = [3, 1]
@@ -694,6 +697,7 @@ def test_prefill_state_indices_pools_of_different_sizes(use_cp):
         output_state=out_pool,
         state_indices=idx,
         use_cp=use_cp,
+        max_seqlen=max(seq_lens),
     )
     torch.cuda.synchronize()
 
@@ -735,7 +739,7 @@ def _run_invalid_slot_child(case_name):
     pool = _make_pool(init_state, perm, 3, 0, torch.float32, device)
     idx = torch.tensor(perm, dtype=torch.int32, device=device)
     idx[0] = -1 if case_name == "negative" else int(pool.shape[0])
-    _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, use_cp=False)
+    _run(q, k, v, g, beta, cu_seqlens, pool, pool, idx, False, "flashinfer")
     torch.cuda.synchronize()
 
 
