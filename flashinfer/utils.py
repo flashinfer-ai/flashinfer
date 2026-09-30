@@ -731,10 +731,6 @@ def is_cvt_rs_supported(device: torch.device = None) -> bool:
     return get_compute_capability(device) in ((10, 0), (10, 3))
 
 
-def determine_mla_backend(device: torch.device) -> str:
-    return "fa3" if is_sm90a_supported(device) else "fa2"
-
-
 def _check_block_tables_shape(
     block_tables: torch.Tensor,
     uses_shared_paged_kv_idx: bool,

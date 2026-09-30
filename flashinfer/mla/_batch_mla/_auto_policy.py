@@ -20,8 +20,8 @@ from ...api_logging import (
     experimental_auto_backends_allowed,
 )
 from ...utils import (
-    determine_mla_backend,
     get_compute_capability as _get_compute_capability,
+    is_sm90a_supported,
 )
 from ._backends._capabilities import _BackendPlanUnsupportedError
 from ._backends.cutile_backend import _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES
@@ -37,9 +37,7 @@ class _BatchMLAPagedAttentionAutoBackend:
     _blackwell_auto_fallback_warned: bool = False
 
     @classmethod
-    def _maybe_warn_blackwell_auto_fallback(
-        cls, device: torch.device, selected_backend: str
-    ) -> None:
+    def _maybe_warn_blackwell_auto_fallback(cls, device: torch.device) -> None:
         if cls._blackwell_auto_fallback_warned:
             return
         major, minor = _get_compute_capability(device)
@@ -57,7 +55,7 @@ class _BatchMLAPagedAttentionAutoBackend:
             )
         _warn_from_external_caller(
             f"BatchMLAPagedAttentionWrapper: backend='auto' selected "
-            f"'{selected_backend}' on SM{major}{minor}, which is not Blackwell-native "
+            f"'fa2' on SM{major}{minor}, which is not Blackwell-native "
             f"and gives poor MLA decode performance. For decode, use "
             f"flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla "
             f"(Blackwell-native trtllm-gen); {in_wrapper_alternative}",
@@ -71,16 +69,21 @@ class _BatchMLAPagedAttentionAutoBackend:
         from ._wrapper import _BACKEND_TYPES
 
         plan_args.csr()  # Malformed metadata is never a candidate support refusal.
-        device = plan_args._float_workspace_buffer.device
+
+        # Retain the executable family used by the existing graph plan.
         if plan_args._use_cuda_graph and plan_args._previous_backend_name is not None:
-            # Retain the executable family used by the existing graph plan.
             candidates: tuple[str, ...] = (plan_args._previous_backend_name,)
-        elif _get_compute_capability(device) == (10, 0):
-            candidates = ordered_sm100_backends(plan_args)
         else:
-            backend = determine_mla_backend(device)
-            cls._maybe_warn_blackwell_auto_fallback(device, backend)
-            candidates = (backend,)
+            device = plan_args._float_workspace_buffer.device
+            if _get_compute_capability(device) == (8, 0):
+                candidates = ordered_sm80_backends(plan_args)
+            elif is_sm90a_supported(device):
+                candidates = ordered_sm90_backends(plan_args)
+            elif _get_compute_capability(device) == (10, 0):
+                candidates = ordered_sm100_backends(plan_args)
+            else:
+                candidates = ("fa2",)
+                cls._maybe_warn_blackwell_auto_fallback(device)
         rejections: list[str] = []
         for candidate in candidates:
             try:
@@ -117,6 +120,16 @@ _AUTO_BACKEND_CANDIDATES = (
 
 def _prefer(*backends):
     return backends + tuple(b for b in _AUTO_BACKEND_CANDIDATES if b not in backends)
+
+
+def ordered_sm80_backends(args: _MLAPlanArguments) -> tuple[str, ...]:
+    """Use FA2 on SM80."""
+    return ("fa2",)
+
+
+def ordered_sm90_backends(args: _MLAPlanArguments) -> tuple[str, ...]:
+    """Prefer FA3 on supported SM90 toolchains, with FA2 as fallback."""
+    return ("fa3", "fa2")
 
 
 # SM100 warmed planned-wrapper measurements favor monolithic CuTe at larger

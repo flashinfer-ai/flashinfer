@@ -316,11 +316,11 @@ def _cpu_planners(monkeypatch):
     monkeypatch.setattr(_wrapper, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(_wrapper, "_get_compute_capability", lambda device: (10, 0))
 
-    def legacy_selection(device):
-        assert not state.forbidden, "run invoked legacy backend selection"
-        return "fa2"
+    def fa3_supported(device):
+        assert not state.forbidden, "run invoked backend support selection"
+        return False
 
-    monkeypatch.setattr(_auto_policy, "determine_mla_backend", legacy_selection)
+    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", fa3_supported)
     monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda device: (10, 0))
     # Warnings are separately covered by test_mla_auto_backend_warning.py.
     monkeypatch.setattr(
@@ -450,7 +450,7 @@ def test_cpu_auto_defers_backend_resolution_until_plan(_cpu_planners, monkeypatc
             "auto resolved the legacy backend before request facts were available"
         )
 
-    monkeypatch.setattr(_auto_policy, "determine_mla_backend", premature_selection)
+    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", premature_selection)
     monkeypatch.setattr(_auto_policy, "_get_compute_capability", premature_selection)
     wrapper, _, _ = _cpu_request()
     assert wrapper._backend == "auto"
@@ -495,6 +495,54 @@ def test_cpu_all_rejected_diagnostics_and_order_are_deterministic(_cpu_planners)
 
 
 @pytest.mark.parametrize(
+    "cuda_version,target,attempts",
+    [
+        ("12.2", None, ("fa2",)),
+        ("12.3", "fa3", ("fa3",)),
+        ("12.3", "fa2", ("fa3", "fa2")),
+        ("12.3", None, ("fa3", "fa2")),
+    ],
+)
+def test_cpu_sm90_candidates_reachable_and_rejections_ordered(
+    _cpu_planners, monkeypatch, cuda_version, target, attempts
+):
+    import flashinfer.utils as utils
+
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: (9, 0))
+    monkeypatch.setattr(utils, "get_compute_capability", lambda _: (9, 0))
+    monkeypatch.setattr(torch.version, "cuda", cuda_version)
+    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", utils.is_sm90a_supported)
+
+    def support(name, args):
+        if name != target:
+            _reject(name, args)
+
+    _cpu_planners.handler = support
+    wrapper, kwargs, _ = _cpu_request()
+    if target is None:
+        with pytest.raises(_BackendPlanUnsupportedError) as caught:
+            wrapper.plan(**kwargs)
+        expected_error = (
+            "fa2: deliberate support rejection"
+            if len(attempts) == 1
+            else "No supported planned MLA backend: "
+            + "; ".join(
+                f"{name}: {name}: deliberate support rejection" for name in attempts
+            )
+        )
+        assert str(caught.value) == expected_error
+        assert wrapper._planned_backend is None
+        with pytest.raises(RuntimeError, match="before plan"):
+            _cpu_run(wrapper)
+    else:
+        wrapper.plan(**kwargs)
+        assert wrapper._planned_backend_name == target
+        _cpu_planners.forbidden = True
+        _cpu_run(wrapper)
+    assert _cpu_planners.calls == list(attempts)
+
+
+@pytest.mark.parametrize(
     "heads,kv_len,graph,first_three",
     [
         (3, 1, False, ("fa2", "trtllm-gen", "cute-dsl-monolithic")),
@@ -522,8 +570,15 @@ def test_cpu_public_auto_uses_request_specific_policy_order(
     assert wrapper._planned_backend is None
 
 
+@pytest.mark.parametrize("capability", [(10, 0), (9, 0)])
 @pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
-def test_cpu_auto_propagates_fatal_planner_errors(_cpu_planners, error_type):
+def test_cpu_auto_propagates_fatal_planner_errors(
+    _cpu_planners, monkeypatch, capability, error_type
+):
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
+    monkeypatch.setattr(
+        _auto_policy, "is_sm90a_supported", lambda _: capability == (9, 0)
+    )
     failure = error_type("deliberate compiler or caller error")
 
     def fail(name, args):
@@ -538,13 +593,15 @@ def test_cpu_auto_propagates_fatal_planner_errors(_cpu_planners, error_type):
     assert wrapper._planned_backend is None
 
 
-def test_cpu_explicit_backend_is_strict(_cpu_planners):
+@pytest.mark.parametrize("backend", ["trtllm-gen", "fa2", "fa3"])
+def test_cpu_explicit_backend_is_strict(_cpu_planners, monkeypatch, backend):
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: (9, 0))
     _cpu_planners.handler = _reject
-    wrapper, kwargs, _ = _cpu_request("trtllm-gen")
+    wrapper, kwargs, _ = _cpu_request(backend)
     with pytest.raises(ValueError, match="deliberate support rejection") as error:
         wrapper.plan(**kwargs)
     assert isinstance(error.value, _BackendPlanUnsupportedError)
-    assert _cpu_planners.calls == ["trtllm-gen"]
+    assert _cpu_planners.calls == [backend]
     assert wrapper._planned_backend is None
 
 
@@ -677,13 +734,12 @@ def test_cpu_auto_replans_reselect_only_outside_graphs(
         orders.append(desired[0])
         return (desired[0],)
 
-    def legacy(device):
-        orders.append(desired[0])
-        return desired[0]
-
     monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
+    monkeypatch.setattr(_auto_policy, "ordered_sm90_backends", order)
     monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", order)
-    monkeypatch.setattr(_auto_policy, "determine_mla_backend", legacy)
+    monkeypatch.setattr(
+        _auto_policy, "is_sm90a_supported", lambda _: capability == (9, 0)
+    )
     wrapper, kwargs, _ = _cpu_request(graph=graph)
     wrapper.plan(**kwargs)
     desired[0] = "fa2" if capability == (9, 0) else "fa3"
@@ -695,8 +751,9 @@ def test_cpu_auto_replans_reselect_only_outside_graphs(
         monkeypatch.setattr(
             _auto_policy, "_get_compute_capability", forbidden_selection
         )
+        monkeypatch.setattr(_auto_policy, "ordered_sm90_backends", forbidden_selection)
         monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", forbidden_selection)
-        monkeypatch.setattr(_auto_policy, "determine_mla_backend", forbidden_selection)
+        monkeypatch.setattr(_auto_policy, "is_sm90a_supported", forbidden_selection)
     wrapper.plan(**kwargs)
     expected = initial if graph else desired[0]
     assert orders == ([initial] if graph else [initial, expected])
@@ -751,7 +808,7 @@ def test_cpu_auto_graph_replan_preserves_experimental_eligibility(
         ((12, 0), "13.0", "fa2"),
     ],
 )
-def test_cpu_off_sm100_keeps_legacy_dispatch(
+def test_cpu_off_sm100_keeps_original_first_preference(
     _cpu_planners, monkeypatch, capability, cuda_version, expected
 ):
     import flashinfer.utils as utils
@@ -760,14 +817,16 @@ def test_cpu_off_sm100_keeps_legacy_dispatch(
     monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
     monkeypatch.setattr(utils, "get_compute_capability", lambda _: capability)
     monkeypatch.setattr(torch.version, "cuda", cuda_version)
-    monkeypatch.setattr(
-        _auto_policy, "determine_mla_backend", utils.determine_mla_backend
-    )
+    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", utils.is_sm90a_supported)
 
     def forbidden_policy(args):
-        pytest.fail("Legacy auto must not consult the SM100 ranking")
+        pytest.fail("Off-SM100 auto must not consult the SM100 ranking")
 
     monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", forbidden_policy)
+    if capability != (8, 0):
+        monkeypatch.setattr(_auto_policy, "ordered_sm80_backends", forbidden_policy)
+    if capability != (9, 0) or cuda_version == "12.2":
+        monkeypatch.setattr(_auto_policy, "ordered_sm90_backends", forbidden_policy)
     wrapper, kwargs, _ = _cpu_request()
     assert wrapper._backend == "auto"
     wrapper.plan(**kwargs)
@@ -778,20 +837,22 @@ def test_cpu_off_sm100_keeps_legacy_dispatch(
 
 
 @pytest.mark.parametrize("graph", [False, True])
+@pytest.mark.parametrize("capability", [(8, 0), (9, 0)])
 @pytest.mark.parametrize("error_type", [_BackendPlanUnsupportedError, RuntimeError])
-def test_cpu_legacy_auto_failed_replan_preserves_executable(
-    _cpu_planners, monkeypatch, graph, error_type
+def test_cpu_fa_auto_failed_replan_preserves_executable(
+    _cpu_planners, monkeypatch, graph, capability, error_type
 ):
     state = _cpu_planners
-    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: (9, 0))
-    monkeypatch.setattr(_auto_policy, "determine_mla_backend", lambda _: "fa3")
-    wrapper, kwargs, buffers = _cpu_request(graph=graph)
+    initial = "fa3" if capability == (9, 0) else "fa2"
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
+    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", lambda _: initial == "fa3")
+    wrapper, kwargs, _ = _cpu_request(graph=graph)
     wrapper.plan(**kwargs)
     previous = wrapper._planned_backend
     contract = wrapper._input_contract
     output = _cpu_run(wrapper).clone()
     state.calls.clear()
-    failure = error_type("legacy planner failure after writes")
+    failure = error_type("planner failure")
 
     if graph:
 
@@ -799,11 +860,13 @@ def test_cpu_legacy_auto_failed_replan_preserves_executable(
             pytest.fail("Graph replan must retain its prepared backend")
 
         monkeypatch.setattr(_auto_policy, "_get_compute_capability", forbidden_order)
+        monkeypatch.setattr(_auto_policy, "ordered_sm80_backends", forbidden_order)
+        monkeypatch.setattr(_auto_policy, "ordered_sm90_backends", forbidden_order)
         monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", forbidden_order)
-        monkeypatch.setattr(_auto_policy, "determine_mla_backend", forbidden_order)
+        monkeypatch.setattr(_auto_policy, "is_sm90a_supported", forbidden_order)
 
     def fail(name, args):
-        assert name == "fa3"
+        assert name in ("fa2", "fa3")
         if graph:
             assert (
                 args._graph_plan_int_workspace_buffer is previous._int_workspace_buffer
@@ -813,11 +876,19 @@ def test_cpu_legacy_auto_failed_replan_preserves_executable(
     state.handler = fail
     with pytest.raises(error_type) as caught:
         wrapper.plan(**kwargs)
-    assert caught.value is failure
-    assert state.calls == ["fa3"], "Legacy auto must not fall back to FA2"
+    fallback = (
+        capability == (9, 0)
+        and not graph
+        and error_type is _BackendPlanUnsupportedError
+    )
+    assert state.calls == (["fa3", "fa2"] if fallback else [initial])
+    if fallback:
+        assert "fa3: planner failure; fa2: planner failure" in str(caught.value)
+    else:
+        assert caught.value is failure
     assert wrapper._planned_backend is previous
     assert wrapper._input_contract is contract
-    assert wrapper._backend == "fa3"
+    assert wrapper._backend == initial
     state.forbidden = True
     torch.testing.assert_close(_cpu_run(wrapper), output)
 
@@ -872,11 +943,20 @@ def test_cpu_invalid_backend_still_fails_in_constructor(_cpu_planners, monkeypat
 
 
 @pytest.mark.parametrize(
-    "key,value", [("num_heads", 0), ("page_size", 0), ("sm_scale", float("nan"))]
+    "key,value",
+    [
+        ("num_heads", 0),
+        ("page_size", 0),
+        ("sm_scale", float("nan")),
+        ("qo_indptr", 1),
+    ],
 )
 def test_cpu_invalid_request_is_not_candidate_fallback(_cpu_planners, key, value):
     wrapper, kwargs, _ = _cpu_request()
-    kwargs[key] = value
+    if key == "qo_indptr":
+        kwargs["metadata"].qo_indptr[0] = value
+    else:
+        kwargs[key] = value
     with pytest.raises(ValueError):
         wrapper.plan(**kwargs)
     assert not _cpu_planners.calls
@@ -1610,6 +1690,173 @@ def test_auto_empty_kv_split_falls_back_and_returns_zero():
     assert torch.equal(out, torch.zeros_like(out))
 
 
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_sm90_native_fallback_preserves_executable_and_graph_replay(
+    monkeypatch, graph_mode
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("SM90 fallback acceptance requires a Hopper GPU")
+    from flashinfer.mla._batch_mla._backends import fa2_backend
+    from flashinfer.utils import is_sm90a_supported
+
+    if not is_sm90a_supported(torch.device("cuda")):
+        pytest.skip("FA3-first fallback requires CUDA >= 12.3")
+    attempts, policy_calls, rejections = [], [], []
+    original_policy = _auto_policy.ordered_sm90_backends
+
+    def policy(args):
+        order = original_policy(args)
+        policy_calls.append(order)
+        return order
+
+    class ObservedFA3(_wrapper._BACKEND_TYPES["fa3"]):
+        @classmethod
+        def plan_from_wrapper(cls, args):
+            attempts.append("fa3")
+            try:
+                return super().plan_from_wrapper(args)
+            except _BackendPlanUnsupportedError as error:
+                rejections.append(str(error))
+                raise
+
+    class ObservedFA2(_wrapper._BACKEND_TYPES["fa2"]):
+        @classmethod
+        def plan_from_wrapper(cls, args):
+            attempts.append("fa2")
+            return super().plan_from_wrapper(args)
+
+    monkeypatch.setattr(_auto_policy, "ordered_sm90_backends", policy)
+    monkeypatch.setitem(_wrapper._BACKEND_TYPES, "fa3", ObservedFA3)
+    monkeypatch.setitem(_wrapper._BACKEND_TYPES, "fa2", ObservedFA2)
+    torch.manual_seed(4031)
+    head_dim_ckv, dtype = 384, torch.bfloat16
+    width, heads, page_size = head_dim_ckv + 64, 16, 64
+    query = torch.randn(2, heads, width, device="cuda", dtype=dtype)
+    cache = torch.randn(2, page_size, width, device="cuda", dtype=dtype)
+    scale = width**-0.5
+    metadata = MLAPlanMetadata.csr(
+        qo_indptr=torch.tensor([0, 2], device="cuda", dtype=torch.int32),
+        kv_indptr=torch.tensor([0, 2], device="cuda", dtype=torch.int32),
+        kv_indices=torch.tensor([1, 0], device="cuda", dtype=torch.int32),
+        kv_len_arr=torch.tensor([128], device="cuda", dtype=torch.int32),
+    )
+    buffers = {
+        name: torch.empty_like(getattr(metadata, name))
+        for name in ("qo_indptr", "kv_indptr", "kv_indices", "kv_len_arr")
+    }
+    wrapper = BatchMLAPagedAttentionWrapper(
+        torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
+        backend="auto",
+        use_cuda_graph=graph_mode,
+        **buffers,
+    )
+    kwargs = dict(
+        metadata=metadata,
+        num_heads=heads,
+        head_dim_ckv=head_dim_ckv,
+        head_dim_kpe=64,
+        page_size=page_size,
+        causal=True,
+        sm_scale=scale,
+        q_data_type=dtype,
+        kv_data_type=dtype,
+        output_dtype=dtype,
+        query_layout="packed",
+        kv_cache_layout="packed",
+        lse_mode="none",
+    )
+    wrapper.plan(**kwargs)
+    assert attempts == ["fa3", "fa2"]
+    assert policy_calls == [("fa3", "fa2")]
+    assert "head_dim_ckv in (128, 256, 512)" in rejections[0]
+    selected, contract = wrapper._planned_backend, wrapper._input_contract
+    assert wrapper._planned_backend_name == "fa2"
+    pointers = [buffer.data_ptr() for buffer in buffers.values()]
+    snapshots = [buffer.clone() for buffer in buffers.values()]
+    workspace_pointer = selected._int_workspace_buffer.data_ptr()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail(
+            "execution or graph capture entered policy, planning or compilation"
+        )
+
+    # Graph replans retain FA2 and skip policy selection.
+    if graph_mode:
+        monkeypatch.setattr(_auto_policy, "ordered_sm90_backends", forbidden)
+        monkeypatch.setattr(_auto_policy, "is_sm90a_supported", forbidden)
+        monkeypatch.setattr(_auto_policy, "_get_compute_capability", forbidden)
+    attempts.clear()
+    with pytest.raises(_BackendPlanUnsupportedError):
+        wrapper.plan(**dict(kwargs, use_sinks=True))
+    assert attempts == (["fa2"] if graph_mode else ["fa3", "fa2"])
+    assert wrapper._planned_backend is selected
+    assert wrapper._input_contract is contract
+    assert selected._int_workspace_buffer.data_ptr() == workspace_pointer
+    assert [buffer.data_ptr() for buffer in buffers.values()] == pointers
+    if graph_mode:
+        for actual, expected in zip(buffers.values(), snapshots, strict=True):
+            torch.testing.assert_close(actual, expected)
+
+    monkeypatch.setattr(_auto_policy, "ordered_sm90_backends", forbidden)
+    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", forbidden)
+    monkeypatch.setattr(wrapper, "plan", forbidden)
+    monkeypatch.setattr(selected, "plan", forbidden)
+    monkeypatch.setattr(fa2_backend, "get_batch_mla_module", forbidden)
+    for backend_type in set(_wrapper._BACKEND_TYPES.values()):
+        monkeypatch.setattr(backend_type, "plan_from_wrapper", classmethod(forbidden))
+        if hasattr(backend_type, "preflight_plan_from_wrapper"):
+            monkeypatch.setattr(
+                backend_type, "preflight_plan_from_wrapper", classmethod(forbidden)
+            )
+
+    def reference():
+        # Independent FP32 reference with nontrivial page order and a causal mask.
+        kv = cache[metadata.kv_indices.long()].reshape(128, width).float()
+        scores = torch.einsum("qhd,kd->qhk", query.float(), kv) * scale
+        scores[0, :, -1] = -torch.inf
+        return torch.einsum("qhk,kd->qhd", scores.softmax(-1), kv[:, :head_dim_ckv])
+
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        expected = reference()
+        out = torch.empty((2, heads, head_dim_ckv), device="cuda", dtype=dtype)
+        output_pointer = out.data_ptr()
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            for _ in range(3):
+                assert wrapper.run(query=query, kv_cache=cache, out=out) is out
+        torch.cuda.current_stream().wait_stream(side_stream)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
+        if graph_mode:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                assert wrapper.run(query=query, kv_cache=cache, out=out) is out
+            out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
+            query.add_(0.125)
+            cache.mul_(0.5)
+            changed_expected = reference()
+            assert not torch.allclose(changed_expected, expected, rtol=1e-2, atol=1e-2)
+            out.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                out.float(), changed_expected, rtol=1e-2, atol=1e-2
+            )
+        assert out.data_ptr() == output_pointer
+        assert [buffer.data_ptr() for buffer in buffers.values()] == pointers
+        assert selected._int_workspace_buffer.data_ptr() == workspace_pointer
+        assert wrapper._planned_backend is selected
+        assert wrapper._planned_backend_name == "fa2"
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
 @pytest.mark.usefixtures("_sm100_reference_precision")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_auto_graph_typed_fallback_freezes_selection_and_replays_correctly(
@@ -1695,7 +1942,7 @@ def test_auto_graph_typed_fallback_freezes_selection_and_replays_correctly(
 
     # Install guards immediately after plan, before even the first warmup run.
     monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", forbidden)
-    monkeypatch.setattr(_auto_policy, "determine_mla_backend", forbidden)
+    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", forbidden)
     monkeypatch.setattr(wrapper, "plan", forbidden)
     monkeypatch.setattr(selected, "plan", forbidden)
     monkeypatch.setattr(fa2_backend, "get_batch_mla_module", forbidden)

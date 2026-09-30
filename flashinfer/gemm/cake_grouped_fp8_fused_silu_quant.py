@@ -21,29 +21,41 @@ FP8 E4M3).  Every route reproduces the chain's rounding points exactly:
   of three).  The GEMM kernel is chosen by :func:`small_m_gemm_backend`.
 * Routing-aware rule (:func:`select_route`): when the routing is known —
   ``validate_indices=True`` derives the 128-row block count of every expert
-  from ``m_indices`` inside its synchronizing check — a large problem whose
-  odd-tail blocks (experts with an odd block count) x N256 tiles outnumber the
-  SMs the 128-CTA pair grid leaves free leaves the pair + tail route: an
-  odd tail runs as a single-CTA tile that ingests a whole B slab and costs
-  ~1.5x a pair tile, so beyond the free SMs it waits for a retiring cluster.
-  Without the routing the plan is shape-only.
-* Mixed-schedule route (``FUSED_MIXED_ROUTE``): a diverted problem with more
-  pair tiles than the grid's clusters (``min(sm_count, 128) // 2``) that do not
-  divide evenly over them runs one persistent ``cta_group::2`` kernel whose
-  clusters process the complete block pairs as 256-row tiles and every odd
-  tail block as a two-CTA M=128 solo unit (no tail kernel, no BF16
-  intermediate).  The heavy clusters hold one pair more, so the light clusters
-  take the first two solo units each and the remaining solo units round-robin
-  over every cluster (longest-processing-time first).  Measured on B200 at
-  ``[M=4096, 2H=2048, K=4096]``: 1.066x the GEMM + wide act route on the
-  random 128-aligned and mixed-tail routings, a tie where every cluster holds
-  the same pair count, which is why only that envelope selects it.
-* Every other diverted problem runs the GEMM + act route; with at least
-  ``ACT_WIDE_MIN_ITEMS`` (row, 128-column group) items it takes the wide act
-  kernel (eight lanes per group, four groups per warp, 64 B per lane in
-  flight: 1.09-1.43x the one-warp-per-group kernel from M = 2048, H = 1024 on,
-  bitwise-identical outputs); smaller problems keep the one-warp-per-group
-  kernel, which is faster on latency-bound problems.
+  from ``m_indices`` inside its synchronizing check — a large problem's three
+  candidate routes (pair + tail, mixed schedule, GEMM + act) are ranked by a
+  makespan model fitted on B200 route measurements (``ROUTE_MODEL_B200``: pair
+  tiles grid-striding over the clusters plus list-scheduled odd-tail units,
+  the mixed kernel's LPT assignment, an affine GEMM + act time; ties resolve
+  in that order), and the model's pick replaces the route of the legacy
+  odd-tail rule (:func:`_legacy_route`: pair + tail while the odd-tail blocks
+  x N256 tiles fit on the SMs the 128-CTA pair grid leaves free — an odd tail
+  runs as a single-CTA tile that ingests a whole B slab and costs ~1.5x a pair
+  tile — else the mixed schedule when the pair tiles outnumber the clusters
+  without dividing evenly, else GEMM + act) only when the model predicts the
+  legacy route more than ``ROUTE_MODEL_MARGIN`` (5 %) slower.  The model is
+  calibrated at ``2H = 2048, K = 4096`` (``ROUTE_MODEL_GEOMETRY``; its pair-tile
+  time does not scale with K), so the prepared launch passes ``k`` and the
+  model applies only at that geometry; every other geometry, and a call
+  without ``k``, keeps the legacy rule until measured.  Without the routing
+  the plan is shape-only.
+* Mixed-schedule route (``FUSED_MIXED_ROUTE``): one persistent ``cta_group::2``
+  kernel whose clusters (``min(pair_tiles + odd_units, min(sm_count, 128) // 2)``)
+  process the complete block pairs as 256-row tiles and every odd tail block
+  as a two-CTA M=128 solo unit (no tail kernel, no BF16 intermediate).  The
+  ``pair_tiles % clusters`` heavy clusters hold one pair more, so the light
+  clusters take the first two solo units each and the remaining solo units
+  round-robin over every cluster (longest-processing-time first).  Measured on
+  B200 at ``2H=2048, K=4096``: 1.066x the GEMM + wide act route on the random
+  128-aligned and mixed-tail routings (M = 4096) and 1.03-1.15x on the
+  all-odd, all-one-block and odd-heavy M = 2048/3072 routings the model sends
+  here.
+* A diverted problem the model keeps on the GEMM + act route (many odd-tail
+  units at large M) takes, with at least ``ACT_WIDE_MIN_ITEMS`` (row,
+  128-column group) items, the wide act kernel (eight lanes per group, four
+  groups per warp, 64 B per lane in flight: 1.09-1.43x the one-warp-per-group
+  kernel from M = 2048, H = 1024 on, bitwise-identical outputs); smaller
+  problems keep the one-warp-per-group kernel, which is faster on
+  latency-bound problems.
 
 Routing contract (the same as the CuTe-DSL contiguous grouped GEMM): rows are
 sorted by expert through ``m_indices``; every *internal* expert boundary is a
@@ -66,9 +78,10 @@ launches only submit work on the current stream and may be captured.
 
 from __future__ import annotations
 
+import heapq
 import math
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import torch
 import tvm_ffi
@@ -195,10 +208,13 @@ def fused_tile_counts(n2: int, group_blocks: Sequence[int]) -> tuple[int, int]:
 # B slab (1.5 MiB per 128 rows against a pair CTA's 1.0 MiB) and takes ~1.5x a
 # pair tile; the units that start on the SMs the 128-CTA pair grid leaves free
 # finish inside the pair phase, every further unit waits for a retiring cluster
-# and adds its full latency.  With at most that many odd-tail units the fused
-# route wins; beyond it a diverted problem takes the mixed-schedule route on
-# the measured envelope (more pair tiles than clusters, not dividing evenly)
-# and the CuTe GEMM + act route otherwise.  ``False`` keeps the shape-only rule.
+# and adds its full latency.  With at most that many odd-tail units the legacy
+# rule (:func:`_legacy_route`) keeps the fused route; beyond it a diverted
+# problem takes the mixed-schedule route on its measured envelope (more pair
+# tiles than clusters, not dividing evenly) and the CuTe GEMM + act route
+# otherwise.  At the model's calibration geometry :func:`select_route` ranks the
+# three candidates with the fitted makespan model below and keeps the legacy
+# rule's route within ``ROUTE_MODEL_MARGIN``.  ``False`` keeps the shape-only rule.
 ROUTING_AWARE_RULE = True
 
 
@@ -217,32 +233,133 @@ def mixed_clusters(pair_tiles: int, odd_units: int, *, sm_count: int) -> int:
     return min(pair_tiles + odd_units, min(sm_count, CTA_CAP) // cluster_ctas)
 
 
-def select_route(
-    m: int, n2: int, *, sm_count: int, group_blocks: Optional[Sequence[int]] = None
+# Makespan model of the three large-M routes.  Verbatim copy of the Cake
+# dispatcher's route-model module (the export tool compares both hosts' route on
+# every export row; keep the constants and functions identical).
+# Fitted on the round-12 route probes of this op: 20 routings x three arms (pair + tail,
+# mixed LPT, GEMM + wide act) at [2H = 2048, K = 4096] on B200 (148 SMs, cold-L2
+# CUPTI active-union medians), coordinate descent on the squared log error,
+# rms-log 5 %.  Microseconds; T = one pair tile at full concurrency.
+ROUTE_MODEL_B200 = {
+    "T": 16.6953125,  # one pair tile on one cluster, us
+    "s_tail": 1.552734375,  # odd-tail unit of the tail kernel, in pair tiles
+    "o_pair": 6.5859375,  # pair + tail route overhead, us
+    "o_empty": 11.28125,  # pair + tail route overhead without a pair tile, us
+    "s_v5": 0.6519531249999999,  # solo unit of the mixed kernel, in pair tiles
+    "o_v5": 8.60546875,  # mixed route overhead, us
+    "a0": 15.6953125,  # GEMM + wide act: intercept, us
+    "a1": 7.9265625,  # GEMM + wide act: us per 1024 rows
+    "a2": 2.357421875,  # GEMM + wide act: us per 1024 padded rows
+}
+# No-regression guard: the model's pick replaces the legacy rule's route only when
+# the legacy route is predicted more than this fraction slower (the fit's rms-log
+# error).  On the 20 fitted routings the guarded pick never measures slower than
+# the legacy pick and matches the measured best on 17 (legacy: 10).
+ROUTE_MODEL_MARGIN = 0.05
+# Calibration geometry (2H, K) of ROUTE_MODEL_B200: T is one K=4096 pair tile and
+# does not scale with K.  select_route applies the guarded decision only when the
+# caller passes this geometry and keeps the legacy rule elsewhere until measured.
+ROUTE_MODEL_GEOMETRY = (2048, 4096)
+
+
+def act_pad_rows(group_blocks: Sequence[int]) -> int:
+    """Padding feature of the act-route model: rows added when every expert's
+    128-row blocks are rounded up to a 256-row multiple (128 per odd expert)."""
+    return sum(-(-int(b) // 2) * 256 - int(b) * 128 for b in group_blocks)
+
+
+def fused_makespan_us(
+    pair_tiles: int,
+    odd_units: int,
+    *,
+    sm_count: int,
+    cta_cap: int,
+    params: Mapping[str, float] = ROUTE_MODEL_B200,
+) -> float:
+    """Predicted time of the pair + tail route (see the module docstring)."""
+    t = params["T"]
+    clusters = min(sm_count, cta_cap) // 2
+    slots = [0.0] * (sm_count - 2 * clusters)  # SMs free from t = 0
+    pair_end = 0.0
+    for c in range(clusters):
+        tiles = (pair_tiles - c + clusters - 1) // clusters if pair_tiles > c else 0
+        end = tiles * t
+        pair_end = max(pair_end, end)
+        slots += [end, end]
+    heapq.heapify(slots)
+    tail_end = 0.0
+    for _ in range(odd_units):
+        start = heapq.heappop(slots)
+        end = start + params["s_tail"] * t
+        tail_end = max(tail_end, end)
+        heapq.heappush(slots, end)
+    overhead = params["o_empty"] if pair_tiles == 0 else params["o_pair"]
+    return max(pair_end, tail_end) + overhead
+
+
+def mixed_makespan_us(
+    pair_tiles: int,
+    odd_units: int,
+    *,
+    sm_count: int,
+    cta_cap: int,
+    params: Mapping[str, float] = ROUTE_MODEL_B200,
+) -> float:
+    """Predicted time of the mixed-schedule route: the worst cluster of the v5
+    kernel's LPT assignment (see the module docstring)."""
+    t = params["T"]
+    clusters = min(pair_tiles + odd_units, min(sm_count, cta_cap) // 2)
+    if clusters < 1:
+        raise ValueError("the mixed-schedule route needs at least one cluster")
+    heavy = pair_tiles % clusters
+    light = clusters - heavy
+    phase1 = min(2 * light, odd_units)
+    rest = odd_units - phase1
+    worst = 0.0
+    for c in range(clusters):
+        pairs = (pair_tiles - c + clusters - 1) // clusters if pair_tiles > c else 0
+        off1 = c - heavy
+        if off1 >= 0 and phase1 > off1:
+            solos1 = (phase1 - off1 + light - 1) // light
+        else:
+            solos1 = 0
+        solos2 = (rest - c + clusters - 1) // clusters if rest > c else 0
+        worst = max(worst, pairs * t + (solos1 + solos2) * params["s_v5"] * t)
+    return worst + params["o_v5"]
+
+
+def act_makespan_us(
+    m: int, pad_rows: int, *, params: Mapping[str, float] = ROUTE_MODEL_B200
+) -> float:
+    """Predicted time of the GEMM + act route (affine in M and the padded rows)."""
+    return params["a0"] + params["a1"] * m / 1024 + params["a2"] * pad_rows / 1024
+
+
+def guarded_route(
+    legacy: str, predicted: Mapping[str, float], *, margin: float = ROUTE_MODEL_MARGIN
 ) -> str:
-    """Route of a problem: ``M < SMALL_M_MAX`` takes the GEMM + act route; larger
-    problems take the pair + tail route unless the routing is known
-    (``group_blocks``, 128-row blocks per expert) and its odd-tail units outnumber
-    the SMs the pair grid leaves free.  Such a diverted problem takes the
-    mixed-schedule route when it has more pair tiles than the grid's clusters and
-    they do not divide evenly (:func:`mixed_clusters`), otherwise the GEMM + wide
-    act route (the small-M act route below ``ACT_WIDE_MIN_ITEMS`` items).
+    """The route with the smallest prediction (ties: the first in ``predicted``'s
+    iteration order), unless ``legacy`` is predicted within ``margin`` of it."""
+    if legacy not in predicted:
+        raise ValueError(f"legacy route {legacy!r} has no prediction")
+    best = min(predicted, key=predicted.__getitem__)
+    if predicted[legacy] > (1.0 + margin) * predicted[best]:
+        return best
+    return legacy
+
+
+def _legacy_route(
+    m: int, n2: int, pair_tiles: int, odd_units: int, *, sm_count: int
+) -> str:
+    """Legacy routing-aware rule, the reference the makespan model is guarded
+    against: the pair + tail route while the odd-tail units fit on the SMs the
+    pair grid leaves free; else the mixed-schedule route when the pair tiles
+    outnumber the grid's clusters without dividing evenly
+    (:func:`mixed_clusters`); else the GEMM + wide act route (the small-M act
+    route below ``ACT_WIDE_MIN_ITEMS`` items).
     """
-    if sm_count <= 0:
-        raise ValueError("sm_count must be positive")
-    if m <= 0 or n2 <= 0:
-        raise ValueError("select_route requires positive M and 2H")
-    if m < SMALL_M_MAX:
-        return ACT_ROUTE
-    if group_blocks is None or not ROUTING_AWARE_RULE:
-        return FUSED_ROUTE
-    if sum(int(b) for b in group_blocks) != -(-m // ROW_BLOCK):
-        raise ValueError(
-            f"group_blocks {list(group_blocks)} do not cover M={m} ({-(-m // ROW_BLOCK)} blocks)"
-        )
     _, _, cluster_ctas = route_geometry(FUSED_ROUTE)
     pair_ctas = (min(sm_count, CTA_CAP) // cluster_ctas) * cluster_ctas
-    pair_tiles, odd_units = fused_tile_counts(n2, group_blocks)
     if odd_units <= sm_count - pair_ctas:
         return FUSED_ROUTE
     clusters = mixed_clusters(pair_tiles, odd_units, sm_count=sm_count)
@@ -251,14 +368,74 @@ def select_route(
     return _diverted_act_route(m, n2)
 
 
+def select_route(
+    m: int,
+    n2: int,
+    *,
+    sm_count: int,
+    group_blocks: Optional[Sequence[int]] = None,
+    k: Optional[int] = None,
+) -> str:
+    """Route of a problem: ``M < SMALL_M_MAX`` takes the GEMM + act route; larger
+    problems take the pair + tail route unless the routing is known
+    (``group_blocks``, 128-row blocks per expert).  With the routing and ``k`` at
+    the model's calibration geometry (``(n2, k) == ROUTE_MODEL_GEOMETRY``:
+    2H = 2048, K = 4096) the three candidates -- pair + tail, mixed schedule
+    (when :func:`mixed_clusters` gives at least one cluster) and the act route
+    of :func:`_diverted_act_route` -- are ranked by the fitted makespan model
+    (``ROUTE_MODEL_B200``; ties resolve in that order), and the model's pick
+    replaces the route of :func:`_legacy_route` only when the model predicts
+    the legacy route more than ``ROUTE_MODEL_MARGIN`` slower.  Any other
+    geometry, or ``k=None``, returns the legacy route unchanged (unmeasured;
+    the model's pair-tile time does not scale with K).
+    """
+    if sm_count <= 0:
+        raise ValueError("sm_count must be positive")
+    if m <= 0 or n2 <= 0:
+        raise ValueError("select_route requires positive M and 2H")
+    if k is not None and (k <= 0 or k % K_MULTIPLE):
+        raise ValueError(f"K must be a positive multiple of {K_MULTIPLE}, got {k}")
+    if m < SMALL_M_MAX:
+        return ACT_ROUTE
+    if group_blocks is None or not ROUTING_AWARE_RULE:
+        return FUSED_ROUTE
+    if sum(int(b) for b in group_blocks) != -(-m // ROW_BLOCK):
+        raise ValueError(
+            f"group_blocks {list(group_blocks)} do not cover M={m} ({-(-m // ROW_BLOCK)} blocks)"
+        )
+    pair_tiles, odd_units = fused_tile_counts(n2, group_blocks)
+    legacy = _legacy_route(m, n2, pair_tiles, odd_units, sm_count=sm_count)
+    if k is None or (n2, k) != ROUTE_MODEL_GEOMETRY:
+        return legacy
+    predicted = {
+        FUSED_ROUTE: fused_makespan_us(
+            pair_tiles, odd_units, sm_count=sm_count, cta_cap=CTA_CAP
+        )
+    }
+    if mixed_clusters(pair_tiles, odd_units, sm_count=sm_count) >= 1:
+        predicted[FUSED_MIXED_ROUTE] = mixed_makespan_us(
+            pair_tiles, odd_units, sm_count=sm_count, cta_cap=CTA_CAP
+        )
+    predicted[_diverted_act_route(m, n2)] = act_makespan_us(
+        m, act_pad_rows(group_blocks)
+    )
+    return guarded_route(legacy, predicted, margin=ROUTE_MODEL_MARGIN)
+
+
 def launch_plan(
-    m: int, n2: int, *, sm_count: int, group_blocks: Optional[Sequence[int]] = None
+    m: int,
+    n2: int,
+    *,
+    sm_count: int,
+    group_blocks: Optional[Sequence[int]] = None,
+    k: Optional[int] = None,
 ) -> tuple[str, tuple[int, int, int]]:
     """Resolve ``(route, grid)`` for ``A[M, K]`` and ``B[G, 2H, K]`` on ``sm_count`` SMs.
 
     The route follows :func:`select_route` (``group_blocks`` = 128-row blocks
-    per expert enables the routing-aware rule; ``prepare_...`` derives them
-    when ``validate_indices=True``).  The GEMM + act route launches one warp
+    per expert enables the routing-aware rule, ``k`` its makespan model at the
+    calibration geometry; ``prepare_...`` passes both when
+    ``validate_indices=True``).  The GEMM + act route launches one warp
     per (row, 128-column group) item, ``ACT_WARPS_PER_CTA`` warps per CTA, at
     most ``ACT_CTAS_PER_SM`` CTAs per SM; the wide act route one warp per
     ``ACT_WIDE_GROUPS_PER_WARP`` items, at most ``ACT_WIDE_CTAS_PER_SM`` CTAs
@@ -267,7 +444,7 @@ def launch_plan(
     and the 128-CTA cap is the measured B200 policy of the parent gate_up route
     (148 CTAs measured slower on every routing).
     """
-    route = select_route(m, n2, sm_count=sm_count, group_blocks=group_blocks)
+    route = select_route(m, n2, sm_count=sm_count, group_blocks=group_blocks, k=k)
     if route in ACT_ROUTES:
         route_geometry(route)  # the registry must carry the route
         items = act_items(m, n2)
@@ -545,7 +722,7 @@ def prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
         group_blocks = _validate_indices(m_indices, groups)
 
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=group_blocks)
+    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=group_blocks, k=k)
     stage_grids: dict[str, tuple[int, int, int]] = {ROUTE_STAGES[route][0]: grid}
     if route == FUSED_ROUTE:
         stage_grids[FUSED_TAIL_STAGE] = tail_launch_grid(m, n2, sm_count=sm_count)
