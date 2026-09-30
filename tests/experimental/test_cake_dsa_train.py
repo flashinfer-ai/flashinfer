@@ -746,13 +746,18 @@ def test_bind_stage_serves_key_pass_plans(monkeypatch):
     )
     values = cake_backend._contract_values(t, scalars, key_passes=3)
     assert values["num_tokens"] == T and values["idx_stride"] == 2 * topk
-    assert values["indices_storage"] is packed and values["indices_offset"] == topk
+    # the strided view is passed as its whole storage viewed flat plus the element offset
+    storage = values["indices_storage"]
+    assert storage.dim() == 1 and storage.numel() == packed.numel()
+    assert storage.data_ptr() == packed.data_ptr() and values["indices_offset"] == topk
     # the pass regions are the carved tensors, not the single-pass placeholders
     assert values["dq_partial"] is t["dq_partial"]
     assert values["key_scratch"] is t["key_scratch"]
     assert "pass_lo" not in values and "dq_mode" not in values
     single = cake_backend._contract_values(t, scalars)
-    assert single["dq_partial"] is t["delta"] and single["key_scratch"] is packed
+    assert single["dq_partial"] is t["delta"]
+    assert single["key_scratch"] is single["indices_storage"]
+    assert single["indices_storage"].data_ptr() == packed.data_ptr()
     assert (single["pass_lo"], single["pass_hi"], single["dq_mode"]) == (0, S, 0)
     ranges = key_pass_ranges(S, 3)
     assert ranges == ((0, 6), (6, 12), (12, 16))
@@ -762,7 +767,7 @@ def test_bind_stage_serves_key_pass_plans(monkeypatch):
         cake_backend._pass_values(values, 1, 3, ranges[1]),
         (2, 1, 1),
     )
-    assert compact.arguments[0] is packed
+    assert compact.arguments[0] is storage
     assert compact.arguments[1] is t["topk_length"]
     assert compact.arguments[2] is t["key_scratch"]
     assert compact.arguments[3] is t["pass_counts"]
@@ -781,7 +786,7 @@ def test_bind_stage_serves_key_pass_plans(monkeypatch):
             cake_backend._pass_values(values, index, 3, (lo, hi)),
             (T, 1, 1),
         )
-        assert main.arguments[1] is packed and main.arguments[2:4] == (T, S)
+        assert main.arguments[1] is storage and main.arguments[2:4] == (T, S)
         assert main.arguments[4:7] == (lo, hi, key_pass_dq_mode(index, 3))
         assert main.arguments[7] is t["dq_partial"]
         assert main.arguments[9] is t["pass_counts"]
