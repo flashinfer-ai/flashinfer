@@ -1836,7 +1836,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
 
     The implementation is selected from the query device architecture.
 
-    On SM100/SM103, this calls the TRTLLM-GEN DeepSeek V4 sparse MLA kernels.
+    On SM100/SM103/SM107, this calls the prebuilt DeepSeek V4 sparse MLA cubins.
     The query and both KV pools use head dim 512. The query may be BF16 or
     per-tensor FP8 E4M3 and the default output is BF16. When
     ``dsv4_inv_rope_cos_sin_cache`` is provided, the fixed TRTLLM-GEN
@@ -1907,8 +1907,8 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     query : torch.Tensor
         Dense query input ``[batch_size, q_len_per_request, num_heads, 512]``
         or varlen query input ``[sum_q, num_heads, 512]`` when
-        ``cum_seq_lens_q`` is provided. SM100/SM103 accepts BF16 or FP8 E4M3;
-        SM120/SM121 accepts BF16.
+        ``cum_seq_lens_q`` is provided. SM100/SM103/SM107 accept BF16 or FP8
+        E4M3; SM120/SM121 accepts BF16.
     swa_kv_cache : torch.Tensor
         SWA KV cache. TRTLLM-GEN uses head dim 512; SM120 sparse uses an opaque
         packed uint8 record with last dimension 584 (FP8), 528 (DSV4.1 FP8) or
@@ -2000,7 +2000,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
         ``sparse_topk_lens_offset``).
     backend : {"auto", "trtllm-gen", "cute-dsl", "sparse", "cake"}
         Backend selection. ``"auto"`` preserves the architecture-based default:
-        TRTLLM-GEN on SM100/SM103 and sparse on SM120/SM121. HCA is selected
+        the prebuilt cubins on SM100/SM103/SM107 and sparse on SM120/SM121. HCA is selected
         only when ``"cute-dsl"`` is requested explicitly. Source-level CAKE
         kernels are selected only when ``"cake"`` is requested explicitly: on
         SM100/SM103 the FP8/BF16 DSv4 family, on SM120/SM121 the NVFP4 DSv4
