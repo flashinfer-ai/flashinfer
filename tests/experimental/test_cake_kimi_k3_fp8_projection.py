@@ -64,6 +64,10 @@ GPU_ROWS = [
     ("tp8", "f_b", 256, 0),
     ("tp1", "f_b", 256, 0),
     ("tp8", "kv_a", 64, 0),
+    # Round 6 (lever L5): the N = 576 family at M > 256 takes the 192-wide GEMM N tile (TMA-store epilogue on the
+    # aligned view; the 8-byte-aligned row stride 580 takes its staged register epilogue, padding untouched)
+    ("tp8", "kv_a", 4096, 0),
+    ("tp1", "kv_a", 4097, 4),
     ("tp8", "fused_qkvg", 256, 0),
     ("tp8", "b_proj", 3, 0),
     ("tp8", "kv_b", 129, 4),
@@ -187,6 +191,30 @@ def test_scale_swizzle_roundtrip():
     assert torch.equal(unswizzle_sf_128x4(swizzled, 300, 6), sf)
 
 
+def test_weight_scale_tiles_bn_layout():
+    # Round 6 (lever L5): the 192-wide GEMM instance reads B scales per 192-row tile in logical N order across the two
+    # 128-lane TMEM blocks (rows 96..127 of a tile sit in block 0, lanes 96..127); 256 reproduces the CTA-pair layout.
+    torch.manual_seed(622)
+    K, n_pad = 7168, 768
+    sf = torch.randint(100, 140, (n_pad // 128, K // 128), dtype=torch.uint8)
+    assert torch.equal(
+        cb.weight_scale_tiles_bn(sf, K, 256), cb.weight_scale_tiles(sf, K)
+    )
+    ks, n_tiles = cb.k_sets(K), -(-n_pad // 192)
+    t192 = cb.weight_scale_tiles_bn(sf, K, 192)
+    assert t192.numel() == n_tiles * ks * 2 * cb.SF_TILE_BYTES
+    flat = t192.view(n_tiles, ks, 2, cb.SF_TILE_BYTES).permute(0, 2, 1, 3).reshape(-1)
+    per_row = cb.unswizzle_sf_128x4(flat, n_tiles * 256, ks * 4)
+    rows = sf.repeat_interleave(128, dim=0).repeat_interleave(4, dim=1)
+    for t in range(n_tiles):
+        expect = torch.zeros((256, ks * 4), dtype=torch.uint8)
+        lo, hi = t * 192, min(t * 192 + 192, n_pad)
+        expect[: hi - lo, : rows.shape[1]] = rows[lo:hi]
+        assert torch.equal(per_row[t * 256 : (t + 1) * 256], expect), t
+    with pytest.raises(ValueError):
+        cb.weight_scale_tiles_bn(sf, K, 100)
+
+
 def test_padding_and_k_sets():
     assert n_padded(12) == 256 and n_padded(6284) == 6400 and n_padded(1536) == 1536
     assert cb.n_padded_128(12) == 128 and cb.n_padded_128(6284) == 6400
@@ -222,8 +250,13 @@ def test_decode_table_covers_every_family(arch):
             for bucket in DECODE_TABLE_BUCKETS:
                 entry = cb.decode_table_entry(bucket, n_tiles128, num_k_iters, arch)
                 if bucket > DECODE_MAX_M:
-                    # Large buckets list only the families measured faster on the decode kernel.
-                    assert entry is None or entry["route"] == "decode"
+                    # Large buckets list only the families measured faster on the decode kernel, plus (round 6,
+                    # lever L5) the GEMM-routed rows that pin the 192-wide N tile.
+                    assert (
+                        entry is None
+                        or entry["route"] == "decode"
+                        or (entry["route"] == "gemm" and entry.get("gemm_bn") == 192)
+                    )
                     continue
                 assert entry is not None, f"{arch} {tp}:{name} bucket {bucket}"
                 assert entry["route"] in ("decode", "gemm")
@@ -433,6 +466,22 @@ def test_decode_config_round6_continuation_rules(arch):
         if k.endswith("_tso") and k.removesuffix("_tso") not in required
     }
     assert "decode:t16_p4_fused_cs14" not in required
+    # Lever L5: the N = 576 kv_a rows at M > 256 (buckets 4096 and 16384) take the 192-wide GEMM N tile: three 192-column
+    # tiles stream and multiply no padded columns (1.04-1.09x on both GPUs, bit-exact with the 256-wide output); the
+    # fused_qkv_a family (N = 2112) measured slower with it and stays 256-wide, as does every untabulated shape.
+    narrow = {k: e for k, e in DECODE_TABLE[arch].items() if "gemm_bn" in e}
+    assert sorted(narrow) == ["5,28,16384", "5,28,4096"]
+    assert all(e["route"] == "gemm" and e["gemm_bn"] == 192 for e in narrow.values())
+    for M in (257, 4096, 4097, 16384):
+        assert cb.gemm_block_n(M, 5, 28, arch, 576, 768) == 192
+    assert cb.gemm_block_n(256, 5, 28, arch, 576, 768) == 256  # tabulated decode row
+    assert (
+        cb.gemm_block_n(4096, 17, 28, arch, 2112, 2304) == 256
+    )  # fused_qkv_a keeps 256
+    assert cb.gemm_block_n(4096, 96, 28, arch, 12288, 12288) == 256
+    # the narrow tile is refused when its padded N would read past the stored 256-padded rows
+    assert cb.gemm_block_n(4096, 5, 28, arch, 250, 256) == 256
+    assert {"gemm_tstore_n192", "gemm_rstaged_n192"} <= required
 
 
 def test_decode_module_stage_clamp():
@@ -531,7 +580,31 @@ def test_projection_matches_reference(tp, module, M, stride_pad):
         expected_kernel = (
             "gemm_tstore" if aligned else ("gemm_rstaged" if staged else "gemm")
         )
-        assert plan.kernels[-1] == expected_kernel
+        # Round 6 (lever L5): the tabulated ``gemm_bn`` rows launch the 192-wide instance of the same epilogue over
+        # ceil(n_valid / 192) N tiles; lever GP adds the prefetch distance of the tabulated aligned rows.
+        bn = cb.gemm_block_n(
+            M,
+            _prepared.n_tiles128,
+            _prepared.num_k_iters,
+            plan.arch,
+            _prepared.n_valid,
+            _prepared.n_pad,
+        )
+        gpf = (
+            cb.gemm_prefetch_distance(
+                M, _prepared.n_tiles128, _prepared.num_k_iters, plan.arch
+            )
+            if aligned
+            else 0
+        )
+        assert plan.kernels[-1] == cb.gemm_kernel_key(
+            expected_kernel + ("_n192" if bn == 192 else ""), gpf
+        )
+        assert (plan.gemm_bn, plan.gemm_n_tiles) == (
+            bn,
+            _prepared.n_tiles if bn == 256 else -(-_prepared.n_valid // 192),
+        )
+        assert plan.grids[-1] == cb._gemm_grid(cb._m_tiles(M), plan.gemm_n_tiles)
     if plan.route == "decode" and plan.decode.fused:
         assert runner.launch_count == 1
     else:

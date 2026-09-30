@@ -496,7 +496,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_fp8_projection_1bf157cb11123d8f0fa6(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K)
+kernel_cake_kimi_k3_fp8_projection_6464822f24481afe10d9(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, __nv_bfloat16* __restrict__ out, const __grid_constant__ CUtensorMap OUT, int M, int m_tiles, int n_tiles, int n_valid, int ldo, int store_vec, int num_k_iters, int sf_k_tiles, __nv_bfloat16* __restrict__ x, int K)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -654,8 +654,8 @@ kernel_cake_kimi_k3_fp8_projection_1bf157cb11123d8f0fa6(const __grid_constant__ 
                     int bid_m = first_m + local % group_size;
                     int bid_n = local / group_size;
                     int off_m = bid_m * BLOCK_M;
-                    int off_n = bid_n * BLOCK_N;
-                    int weight_tile0 = (off_n + cta_rank * B_HALF_N) / 128 * (2 * num_k_iters);
+                    int off_n = bid_n * 256;
+                    int weight_tile0 = (off_n + cta_rank * 128) / 128 * (2 * num_k_iters);
                     int sfa_tile_row = bid_m * sf_k_tiles;
                     int sfb_tile_row = bid_n * sf_k_tiles;
                     #pragma unroll 1
@@ -858,7 +858,7 @@ kernel_cake_kimi_k3_fp8_projection_1bf157cb11123d8f0fa6(const __grid_constant__ 
                 int bid_m_1 = first_m_1 + local_1 % group_size_1;
                 int bid_n_1 = local_1 / group_size_1;
                 int off_m_1 = bid_m_1 * BLOCK_M;
-                int off_n_1 = bid_n_1 * BLOCK_N;
+                int off_n_1 = bid_n_1 * 256;
                 int global_row = off_m_1 + local_row;
                 int col0 = col_part * 128;
                 int lane_addr = taddr + (unsigned int)(epi_warp * 32 << 16) + (unsigned int)col0;

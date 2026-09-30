@@ -33,7 +33,9 @@ runs as one or two generated Cake programs on the current stream:
 * ``gemm_tstore`` / ``gemm`` -- the persistent 2-CTA block-scaled tcgen05 GEMM
   (M > 256 unless tabulated below) with the TMA-store epilogue for a 16-byte
   aligned output view whose row stride is a multiple of 8 elements, or the
-  register epilogue for other strides, or
+  register epilogue for other strides (``_n192``: the 192-wide N-tile instance
+  of the tabulated ``gemm_bn`` rows, e.g. the N = 576 ``kv_a`` family at
+  M > 256, whose three 192-column tiles stream no padded columns), or
 * ``decode:t<tok>_p<stages>[_fused][_res]`` -- the swap-AB split-K decode kernel
   (M <= 256, and the single-N-tile families the measured table routes here up
   to 16384 rows; the ``_fused`` instances quantize the token tile in-CTA, so
@@ -90,6 +92,12 @@ from .decode_table import DECODE_TABLE
 BLOCK = 128  # scale granularity along K (activations) and along N x K (weights)
 BLOCK_M = 128  # activation rows per GEMM CTA (256 per CTA pair)
 BLOCK_N = 256  # output columns per GEMM CTA pair
+GEMM_BLOCK_N_NARROW = (
+    192  # round 6 (lever L5): the narrow N-tile GEMM instance (table key ``gemm_bn``)
+)
+GEMM_N192_SUFFIX = (
+    "_n192"  # kernel-key suffix of the 192-wide instance of any GEMM epilogue program
+)
 BLOCK_K = 256  # E4M3 elements per pipeline stage = two 128-K scale sets
 CTA_GROUP = 2
 WEIGHT_TILE_ROWS = 2 * BLOCK  # one CTA-pair N tile
@@ -247,6 +255,39 @@ def weight_scale_tiles(sf_bytes_128: torch.Tensor, K: int) -> torch.Tensor:
     tiles = swizzle_sf_128x4(cols)  # flat (128-row tile, k_set, 512 B)
     return (
         tiles.reshape(n_blocks // 2, 2, ks, SF_TILE_BYTES)
+        .permute(0, 2, 1, 3)
+        .contiguous()
+        .reshape(-1)
+    )
+
+
+def weight_scale_tiles_bn(sf_bytes_128: torch.Tensor, K: int, bn: int) -> torch.Tensor:
+    """Round 6 (lever L5): CTA-pair scale tiles of the GEMM instance with ``bn`` output columns per pair
+    (192; 256 reproduces :func:`weight_scale_tiles`): ``[n_tiles][k_sets][2 blocks][512 B]``.
+
+    The block-scaled MMA reads the B scales of logical N rows ``[128 b, 128 b + 128)`` from TMEM column block
+    ``b``, so tile ``t`` carries the per-row bytes of weight rows ``[t bn, t bn + bn)`` in N order across its two
+    128-lane blocks (lanes past ``bn`` zero); rows past the stored ``N_pad`` are zero, ``n_tiles = ceil(N_pad / bn)``."""
+    if bn <= 0 or bn > WEIGHT_TILE_ROWS or bn % 32:
+        raise ValueError(
+            f"bn must be a positive multiple of 32 up to {WEIGHT_TILE_ROWS}, got {bn}"
+        )
+    n_blocks, kb = sf_bytes_128.shape
+    n_rows = n_blocks * BLOCK
+    ks = k_sets(K)
+    n_tiles = -(-n_rows // bn)
+    rows = sf_bytes_128.repeat_interleave(BLOCK, dim=0)  # [N_pad, K/128]
+    per_row = torch.zeros((n_tiles * bn, ks * 4), dtype=torch.uint8, device=rows.device)
+    per_row[:n_rows, : kb * 4] = rows.repeat_interleave(4, dim=1)
+    tiles_rows = torch.zeros(
+        (n_tiles, WEIGHT_TILE_ROWS, ks * 4), dtype=torch.uint8, device=rows.device
+    )
+    tiles_rows[:, :bn] = per_row.view(n_tiles, bn, ks * 4)
+    tiles = swizzle_sf_128x4(
+        tiles_rows.reshape(n_tiles * WEIGHT_TILE_ROWS, ks * 4)
+    )  # flat (128-lane block, k_set, 512 B)
+    return (
+        tiles.reshape(n_tiles, 2, ks, SF_TILE_BYTES)
         .permute(0, 2, 1, 3)
         .contiguous()
         .reshape(-1)
@@ -705,6 +746,29 @@ def gemm_prefetch_distance(M: int, n_tiles128: int, num_k_iters: int, arch: str)
     return int(entry.get("gemm_pf", 0))
 
 
+def gemm_block_n(
+    M: int, n_tiles128: int, num_k_iters: int, arch: str, n_valid: int, n_pad: int
+) -> int:
+    """Round 6 (lever L5): output columns per CTA pair of the GEMM route, from the shape's table row (key
+    ``gemm_bn``: 192 on the tabulated N = 576 ``kv_a`` rows at M > 256, whose 256-wide tiles stream and multiply
+    768 padded columns; 256 otherwise).  192 is only taken when the 192-padded N fits the stored 256-padded
+    weight rows, so no weight box reads past the storage."""
+    entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
+    if entry is None or entry.get("route") != "gemm":
+        return BLOCK_N
+    bn = int(entry.get("gemm_bn", BLOCK_N))
+    if bn not in (GEMM_BLOCK_N_NARROW, BLOCK_N):
+        raise ValueError(f"decode table entry gemm_bn must be 192 or 256 (got {entry})")
+    if bn != BLOCK_N and -(-int(n_valid) // bn) * bn > int(n_pad):
+        return BLOCK_N
+    return bn
+
+
+def gemm_n_tiles(prepared: "PreparedProjectionWeight", bn: int) -> int:
+    """CTA-pair N tiles of the GEMM instance with ``bn`` output columns per pair over ``prepared``."""
+    return prepared.n_tiles if int(bn) == BLOCK_N else -(-prepared.n_valid // int(bn))
+
+
 def required_kernel_keys(arch: str, sm_count: int = 148) -> tuple[str, ...]:
     """Every logical kernel the dispatch table can select on ``arch`` (all buckets of every tabulated family)
     plus the GEMM and the quantization widths the large-M rule can pick (``u8`` needs a K-block count divisible
@@ -719,12 +783,21 @@ def required_kernel_keys(arch: str, sm_count: int = 148) -> tuple[str, ...]:
     ]
     for key, entry in DECODE_TABLE.get(arch, {}).items():
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
-        if entry.get("route") == "gemm" and int(entry.get("gemm_pf", 0)) > 0:
-            # round 6 (lever GP): the prefetching GEMM program of the tabulated row's production epilogue (16-byte
-            # aligned views: TMA store); other views fall back to the non-prefetching program (``route_plan``)
-            gkey = gemm_kernel_key(GEMM_TSTORE_KERNEL_KEY, int(entry["gemm_pf"]))
-            if gkey not in keys:
-                keys.append(gkey)
+        if entry.get("route") == "gemm":
+            gpf, gbn = int(entry.get("gemm_pf", 0)), int(entry.get("gemm_bn", BLOCK_N))
+            sfx = GEMM_N192_SUFFIX if gbn != BLOCK_N else ""
+            gkeys: list[str] = []
+            if gpf > 0:
+                # round 6 (lever GP): the prefetching GEMM program of the tabulated row's production epilogue (16-byte
+                # aligned views: TMA store); other views fall back to the non-prefetching program (``route_plan``)
+                gkeys.append(gemm_kernel_key(GEMM_TSTORE_KERNEL_KEY + sfx, gpf))
+            if sfx:
+                # round 6 (lever L5): the 192-wide programs of the row's production epilogues (16-byte aligned views:
+                # TMA store; 8-byte aligned rows: staged register epilogue); other views fall back to the 256-wide program
+                gkeys += [GEMM_TSTORE_KERNEL_KEY + sfx, GEMM_RSTAGED_KERNEL_KEY + sfx]
+            for gkey in gkeys:
+                if gkey not in keys:
+                    keys.append(gkey)
         for M in _bucket_rows(bucket):
             cfg = decode_config(M, n_tiles128, num_k_iters, arch, sm_count)
             if cfg is None:
@@ -779,11 +852,30 @@ class PreparedProjectionWeight:
     weight_scale_ue8m0: torch.Tensor = field(
         repr=False
     )  # fp32 [N_pad128/128, K/128] power-of-two scales
+    sf_bytes: torch.Tensor = field(
+        repr=False
+    )  # uint8 [n_pad/128, K/128] stored UE8M0 bytes (source of the per-instance scale tiles)
     splits: Optional[tuple[int, ...]] = None
+    _scale_tiles_by_bn: dict[int, torch.Tensor] = field(
+        default_factory=dict, repr=False, compare=False
+    )  # round 6 (lever L5): scale tiles of the narrow GEMM instance, built on first use
 
     @property
     def device(self) -> torch.device:
         return self.weight_tiles.device
+
+    def scale_tiles_for(self, bn: int) -> torch.Tensor:
+        """Flat swizzled weight scale tiles of the GEMM instance with ``bn`` output columns per CTA pair:
+        ``scale_tiles`` for 256; the 192-wide layout (round 6, lever L5) is built once per prepared weight from the
+        stored UE8M0 bytes when a binding first routes to it (a preparation-time allocation, never a launch-time one)."""
+        bn = int(bn)
+        if bn == BLOCK_N:
+            return self.scale_tiles
+        tiles = self._scale_tiles_by_bn.get(bn)
+        if tiles is None:
+            tiles = weight_scale_tiles_bn(self.sf_bytes, self.K, bn)
+            self._scale_tiles_by_bn[bn] = tiles
+        return tiles
 
     @property
     def weight_q(self) -> torch.Tensor:
@@ -895,6 +987,7 @@ def prepare_kimi_k3_fp8_projection_weights(
         weight_tiles=w_tiles.reshape(-1, BLOCK, BLOCK).contiguous(),
         scale_tiles=weight_scale_tiles(sf_bytes, K),
         weight_scale_ue8m0=s2,
+        sf_bytes=sf_bytes,
         splits=splits,
     )
 
@@ -1043,6 +1136,8 @@ class ProjectionPlan:
     gemm_tma_store: bool  # GEMM route: TMA-store epilogue (aligned output view) instead of the register epilogue
     gemm_reg_staged: bool  # GEMM route: staged row-coalesced register epilogue (8-byte aligned rows the TMA store cannot address)
     decode_tma_store: bool  # decode route: the row's ``tstore`` instance on a 16-byte-aligned output view (round 6, lever E1)
+    gemm_bn: int  # GEMM route: output columns per CTA pair of the launched program (256, or 192 on the tabulated ``gemm_bn`` rows; round 6, lever L5)
+    gemm_n_tiles: int  # GEMM route: CTA-pair N tiles of the launched program (``n_pad / 256`` or ``ceil(n_valid / 192)``)
     quant_units: Optional[int]  # None when the decode instance quantizes in-CTA
     sf_rows: int
     kernels: tuple[str, ...]  # logical kernel key per launch, in launch order
@@ -1094,10 +1189,32 @@ def route_plan(
             if gemm_tma_store
             else 0
         )
-        # round 6 (lever GP): the prefetching program ships with the TMA-store epilogue only (Cake rule); use it when registered
-        key = gemm_kernel_key(base, gpf)
-        kernels.append(key if gpf and route_available(arch, (key,)) else base)
-        grids.append(_gemm_grid(_m_tiles(M), prepared.n_tiles))
+        gbn = gemm_block_n(
+            M,
+            prepared.n_tiles128,
+            prepared.num_k_iters,
+            arch,
+            prepared.n_valid,
+            prepared.n_pad,
+        )
+        # round 6 (lever GP): the prefetching program ships with the TMA-store epilogue only (Cake rule); use it when
+        # registered.  Round 6 (lever L5): the 192-wide instance of the row's epilogue program when the table row asks
+        # for it and the program is registered; every fallback keeps the row on a registered program.
+        candidates: list[tuple[str, int]] = []
+        if gbn != BLOCK_N:
+            candidates.append((gemm_kernel_key(base + GEMM_N192_SUFFIX, gpf), gbn))
+            if gpf:
+                candidates.append((base + GEMM_N192_SUFFIX, gbn))
+        if gpf:
+            candidates.append((gemm_kernel_key(base, gpf), BLOCK_N))
+        key, gbn = next(
+            ((k, b) for k, b in candidates if route_available(arch, (k,))),
+            (base, BLOCK_N),
+        )
+        kernels.append(key)
+        grids.append(_gemm_grid(_m_tiles(M), gemm_n_tiles(prepared, gbn)))
+    else:
+        gbn = BLOCK_N
     dec_ts = False
     if cfg is not None:
         key = cfg.kernel_key_for(bool(decode_tma_store))
@@ -1118,6 +1235,8 @@ def route_plan(
         gemm_tma_store=cfg is None and bool(gemm_tma_store),
         gemm_reg_staged=cfg is None and not gemm_tma_store and bool(gemm_reg_staged),
         decode_tma_store=dec_ts,
+        gemm_bn=gbn,
+        gemm_n_tiles=gemm_n_tiles(prepared, gbn),
         quant_units=units,
         sf_rows=cfg.tok if cfg is not None else SF_TILE_ROWS,
         kernels=tuple(kernels),
@@ -1347,14 +1466,14 @@ def prepare_kimi_k3_fp8_projection(
                         A=a_u8,
                         B=b_u8,
                         SFA=sfa,
-                        SFB=prepared.scale_tiles.view(-1, 8, 128),
+                        SFB=prepared.scale_tiles_for(plan.gemm_bn).view(-1, 8, 128),
                         OUT=out_map,
                         x=x,
                         K=prepared.K,
                         out=out_flat,
                         M=M,
                         m_tiles=_m_tiles(M),
-                        n_tiles=prepared.n_tiles,
+                        n_tiles=plan.gemm_n_tiles,
                         n_valid=prepared.n_valid,
                         ldo=ldo,
                         store_vec=_store_vec(out.data_ptr(), ldo),
