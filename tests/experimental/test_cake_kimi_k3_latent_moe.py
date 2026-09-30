@@ -33,7 +33,9 @@ from flashinfer.experimental.kimi_k3_latent_moe.cake_backend import (
     decode_kernel_key,
     decode_symbol,
     decode_tail_plan,
+    front_split_plan,
     i_local_for_tp,
+    prefill_front_plan,
     prefill_tail_plan,
     required_kernel_keys,
     route_kernel_keys,
@@ -78,12 +80,20 @@ def test_decode_plan_rules():
     assert (tp8["tiles"], tp8["grid"], tp8["cluster"], tp8["n_pad"]) == (47, 94, 2, 8)
     assert decode_front_plan(9, i_local_for_tp(8))["n_pad"] == 16
     assert decode_front_plan(128, i_local_for_tp(1))["n_pad"] == 128
+    # Front K depth 2 while its ring keeps >= 4 (one CTA per tile) / 6 (cluster pairs) stages: TP1 T <= 64, TP8 T <= 16.
     for plan in (tp1, tp8):
         assert (
-            plan["kdepth"] == 1
+            plan["kdepth"] == 2
             and 1 <= plan["stages"] <= cb.MAX_STAGES
             and not plan["fused"]
         )
+    assert decode_front_plan(64, i_local_for_tp(1))["kdepth"] == 2
+    assert decode_front_plan(128, i_local_for_tp(1))["kdepth"] == 1
+    assert decode_front_plan(16, i_local_for_tp(8))["kdepth"] == 2
+    assert decode_front_plan(32, i_local_for_tp(8))["kdepth"] == 1
+    assert decode_front_plan(32, i_local_for_tp(8))["stages"] == cb.plan_stages(
+        n_pad=32, kdepth=1, cluster=2
+    )
     # Tail: 56 output tiles -> 112 cluster-pair CTAs; the fused norm is always on.
     for tp in SUPPORTED_TP:
         for tokens in (1, 8, 16, 128):
@@ -96,12 +106,45 @@ def test_decode_plan_rules():
             )
             if plan["rows_smem"]:
                 assert plan["smem_b1"]
-    # The resident B operand with staged rows serves the smallest TP8 tails; T16 falls back to the global-y protocol.
+    # The resident B operand with staged rows serves the TP8 tails up to T16 (5 ring stages left); T32 falls back to
+    # the global-y protocol, and so does TP1 (long shared-down window).
     assert decode_tail_plan(1, i_local_for_tp(8), 8)["smem_b1"]
     assert decode_tail_plan(1, i_local_for_tp(8), 8)["rows_smem"]
     assert decode_tail_plan(8, i_local_for_tp(8), 8)["smem_b1"]
-    assert not decode_tail_plan(16, i_local_for_tp(8), 8)["smem_b1"]
+    t16 = decode_tail_plan(16, i_local_for_tp(8), 8)
+    assert t16["smem_b1"] and t16["rows_smem"] and t16["stages"] == 5
+    assert (
+        not t16["tmap_prefetch"]
+        and decode_tail_plan(8, i_local_for_tp(8), 8)["tmap_prefetch"]
+    )
+    # Round-7 lever 3b: the same instance defers the cluster rendezvous to its epilogue warps.
+    assert (
+        t16["wait_warps"]
+        and not decode_tail_plan(8, i_local_for_tp(8), 8)["wait_warps"]
+    )
+    assert not decode_tail_plan(32, i_local_for_tp(8), 8)["wait_warps"]
+    assert not decode_front_plan(16, i_local_for_tp(8))["wait_warps"]
+    # one ring stage fewer than the smem budget for the small-T tail (T16 keeps its 5)
+    assert decode_tail_plan(1, i_local_for_tp(8), 8)["stages"] == 8
+    assert decode_tail_plan(8, i_local_for_tp(8), 8)["stages"] == 8
+    assert decode_tail_plan(1, i_local_for_tp(1), 1)["stages"] == 10
+    assert not decode_tail_plan(32, i_local_for_tp(8), 8)["smem_b1"]
     assert not decode_tail_plan(32, i_local_for_tp(1), 1)["smem_b1"]
+    assert not decode_tail_plan(16, i_local_for_tp(1), 1)["rows_smem"]
+    # Round-7 landing-zone alias (lever 6a): only the N_PAD 128 cluster instances streaming >= 32 chunk units per CTA
+    # (tail TP1 T=128: 76 units, front TP8 T=128: 56) alias the DSMEM landing zone on the drained A ring and gain two
+    # ring stages (5 -> 7); the short TP8 tail (9 units) and the single-CTA TP1 front keep their own zone.
+    la_tail = decode_tail_plan(128, i_local_for_tp(1), 1)
+    assert la_tail["land_alias"] and la_tail["cluster"] == 2 and la_tail["stages"] == 7
+    la_front = decode_front_plan(128, i_local_for_tp(8))
+    assert (
+        la_front["land_alias"] and la_front["cluster"] == 2 and la_front["stages"] == 7
+    )
+    assert not decode_tail_plan(128, i_local_for_tp(8), 8)["land_alias"]
+    assert not decode_tail_plan(64, i_local_for_tp(1), 1)["land_alias"]
+    assert not decode_front_plan(128, i_local_for_tp(1))["land_alias"]
+    assert cb.land_alias_auto(128, 152) and not cb.land_alias_auto(128, 19)
+    assert not cb.land_alias_auto(64, 152)
     # A second routed partial disables the staged rows (P == 1 only).
     assert not decode_tail_plan(1, i_local_for_tp(8), 8, num_partials=2)["rows_smem"]
     with pytest.raises(ValueError):
@@ -116,6 +159,16 @@ def test_decode_symbol_encodes_the_plan():
     assert decode_kernel_key(plan) == "decode:" + symbol
     front = decode_symbol(decode_front_plan(1, i_local_for_tp(1)))
     assert "_t7_28_96_k112_0_o3584_c1" in front and "_f" not in front
+    assert decode_symbol(decode_tail_plan(128, i_local_for_tp(1), 1)).endswith(
+        "_c2_f_la"
+    )
+    assert decode_symbol(decode_front_plan(128, i_local_for_tp(8))).endswith("_c2_la")
+    assert not decode_symbol(decode_tail_plan(128, i_local_for_tp(8), 8)).endswith(
+        "_la"
+    )
+    assert decode_symbol(decode_tail_plan(16, i_local_for_tp(8), 8)).endswith(
+        "_sb_rs_np_ww"
+    )
 
 
 def test_split_plan_rules():
@@ -126,6 +179,13 @@ def test_split_plan_rules():
     )
     assert split_plan(56, 19, SM_COUNT, 1)["sk_tiles"] == 0
     assert split_plan(60, 152, SM_COUNT, 4)["sk_tiles"] == 0
+    # Partial reuse (2-4 pair rows per column): only a remainder wave after a full wave is split, and only
+    # when it fills at most 55 % of the clusters (TP1 T=1024: 74 whole + 38 tiles as 74 x 79 iterations).
+    rem = split_plan(112, 152, SM_COUNT, 4)
+    assert rem["full_items"] == 74 and rem["sk_tiles"] == 38
+    assert rem["sk_ipc"] == 79 and rem["num_items"] == 148
+    assert split_plan(56, 152, SM_COUNT, 2)["sk_tiles"] == 0
+    assert split_plan(140, 152, SM_COUNT, 5)["sk_tiles"] == 0
     # TP1 T=2048 (224 pair tiles on 74 resident clusters): 2 x 74 whole + one stream-K wave (module docstring).
     sk = split_plan(224, 152, SM_COUNT, 8)
     assert sk["full_items"] == 148 and sk["sk_tiles"] == 76 and sk["sk_ipc"] == 157
@@ -133,6 +193,60 @@ def test_split_plan_rules():
         sk["num_items"] == 148 + -(-76 * 152 // 157)
         and 1 < sk["sk_max_seg"] <= cb.MAX_SEG
     )
+
+
+def test_front_split_plan_rules():
+    # Round-8 rule: the trailing wave's tiles become two aligned K halves when the halves fit one wave of the
+    # 74 resident clusters and the modelled saving is >= 4 % of the whole-tile cost; every other shape runs whole.
+    whole = dict(
+        num_items=48, full_items=48, sk_ipc=112, sk_max_seg=1, sk_total=0, sk_tiles=0
+    )
+    assert (
+        front_split_plan(48, SM_COUNT) == whole
+    )  # TP8 T=512: 96 halves would need two waves
+    assert front_split_plan(24, SM_COUNT) == dict(
+        num_items=48,
+        full_items=0,
+        sk_ipc=56,
+        sk_max_seg=2,
+        sk_total=24 * 112,
+        sk_tiles=24,
+    )  # TP8 T=256
+    assert front_split_plan(96, SM_COUNT) == dict(
+        num_items=118,
+        full_items=74,
+        sk_ipc=56,
+        sk_max_seg=2,
+        sk_total=22 * 112,
+        sk_tiles=22,
+    )  # TP8 T=1024
+    assert (
+        front_split_plan(384, SM_COUNT)["sk_tiles"] == 14
+    )  # TP8 T=4096: 370 whole + 14 x 2
+    assert (
+        front_split_plan(528, SM_COUNT)["sk_tiles"] == 10
+    )  # TP1 T=2048: 518 whole + 10 x 2
+    assert (
+        front_split_plan(768, SM_COUNT)["sk_tiles"] == 0
+    )  # TP8 T=8192: 3.1 % modelled -> whole
+    assert (
+        front_split_plan(1056, SM_COUNT)["sk_tiles"] == 0
+    )  # TP1 T=4096: 2.3 % modelled -> whole
+    for tiles in (66, 132, 264, 192, 1536, 2112, 4224):
+        assert front_split_plan(tiles, SM_COUNT)["sk_max_seg"] == 1
+    plan = prefill_front_plan(1024, i_local_for_tp(8))
+    assert (
+        plan["cluster_tiles"] == 96
+        and plan["grid"] == 118 * 2
+        and not plan["evict_first"]
+    )
+    assert prefill_front_plan(256, i_local_for_tp(1))["evict_first"]
+    assert prefill_front_plan(512, i_local_for_tp(8))["evict_first"]
+    assert not prefill_front_plan(1024, i_local_for_tp(1))["evict_first"]
+    assert prefill_front_plan(256, i_local_for_tp(1))["grid"] == cb.front_grid(
+        cb.m_tiles_for(256), i_local_for_tp(1)
+    )
+    assert cb.front_evict_first(4) and not cb.front_evict_first(6)
 
 
 def test_prefill_tail_plan_and_trigger():
@@ -147,6 +261,29 @@ def test_prefill_tail_plan_and_trigger():
     assert tp1["gemm_grid"] == (tp1["num_items"]) * 2 and not tp1["early_trigger"]
     assert plan["weights_evict_first"] and tp1["weights_evict_first"]
     assert not prefill_tail_plan(2048, 1)["weights_evict_first"]
+    # Round-7 N128 rule (TP8 T=512): 128-wide pair tile, 56 column tiles, 224 CTAs, 9-deep ring, no stream-K region.
+    n128 = prefill_tail_plan(512, 8)
+    assert (n128["block_n"], n128["n_tiles"], n128["num_stages"]) == (128, 56, 9)
+    assert (
+        n128["cluster_tiles"] == 112
+        and n128["gemm_grid"] == 224
+        and n128["sk_tiles"] == 0
+    )
+    assert (
+        not n128["weights_evict_first"]
+        and n128["early_trigger"]
+        and not n128["fused_norm"]
+    )
+    assert (
+        prefill_tail_plan(256, 8)["block_n"] == 256
+        and prefill_tail_plan(256, 8)["n_tiles"] == 28
+    )
+    # Fused norm: TP1 T = 256 / 512 (single wave, K2 = 96 blocks); TP8 (K2 = 12) and multi-wave grids do not fuse.
+    assert tp1["fused_norm"] and prefill_tail_plan(512, 1)["fused_norm"]
+    assert not plan["fused_norm"] and not prefill_tail_plan(1024, 1)["fused_norm"]
+    assert cb.use_fused_norm(256, 112, SM_COUNT, 96) and not cb.use_fused_norm(
+        256, 56, SM_COUNT, 12
+    )
     assert cb.weights_evict_first(112, SM_COUNT) and not cb.weights_evict_first(
         224, SM_COUNT
     )
@@ -166,20 +303,47 @@ def test_route_keys_cover_the_row_set():
         "tail_norm",
         "tail_gemm",
     }
-    assert "front:i6144" in keys and "front:i768" in keys
+    assert {k for k in keys if k.startswith("front:")} == {
+        "front:i6144",
+        "front:i6144e1",
+        "front:i768",
+        "front:i768e1",
+    }
     assert {k for k in keys if k.startswith("tail_gemm:")} == {
-        "tail_gemm:tp1e0",
-        "tail_gemm:tp1e1",
-        "tail_gemm:tp8e0",
-        "tail_gemm:tp8e1",
+        "tail_gemm:tp1e0f0",
+        "tail_gemm:tp1e1f1",
+        "tail_gemm:tp1e1f1s6",
+        "tail_gemm:tp8e0f0",
+        "tail_gemm:tp8e0f0s9n128",
+        "tail_gemm:tp8e1f0",
     }
     assert route_kernel_keys("front", 1, 128)[0].startswith("decode:")
-    assert route_kernel_keys("front", 1, 256) == ("front:i6144",)
-    assert route_kernel_keys("tail", 8, 256) == ("tail_norm:e1", "tail_gemm:tp8e1")
+    # Round-8 lever 13b: T <= 512 (<= 2 pair rows per weight column) takes the evict_first front instance.
+    assert route_kernel_keys("front", 1, 256) == ("front:i6144e1",)
+    assert route_kernel_keys("front", 8, 512) == ("front:i768e1",)
+    assert route_kernel_keys("front", 1, 1024) == ("front:i6144",)
+    assert route_kernel_keys("tail", 8, 256) == ("tail_norm:e1", "tail_gemm:tp8e1f0")
+    # Round-7 N128 rule: TP8 T=512 takes the 128-wide pair tile (56 column tiles, 224 CTAs, 9-deep ring); its
+    # multi-wave grid drops the evict_first weight policy and fires the norm trigger early, so the late-trigger norm
+    # instance (``tail_norm:e0``) leaves the production route set.
+    assert route_kernel_keys("tail", 8, 512) == (
+        "tail_norm:e1",
+        "tail_gemm:tp8e0f0s9n128",
+    )
+    assert (
+        cb.tail_gemm_config(512, 8) == (9, 128) and cb.tail_gemm_block_n(512, 1) == 256
+    )
+    assert cb.tail_gemm_block_n(1024, 8) == 256 and cb.tail_gemm_num_stages(512, 8) == 9
+    assert "tail_norm:e0" not in keys
+    # TP1 single-wave rows fuse the norm into the GEMM launch (no tail_norm kernel); the T <= 256 row
+    # takes the 6-deep ring instance (round-6 rule), T = 512 the default 7-deep ring.
+    assert route_kernel_keys("tail", 1, 256) == ("tail_gemm:tp1e1f1s6",)
+    assert cb.tail_gemm_num_stages(256, 1) == 6 and cb.tail_gemm_num_stages(512, 1) == 7
+    assert cb.tail_gemm_num_stages(256, 8) == 7
     # Single-wave grids (T = 256 / 512) stream the weights evict_first; persistent grids keep the default policy.
-    assert route_kernel_keys("tail", 1, 512)[1] == "tail_gemm:tp1e1"
-    assert route_kernel_keys("tail", 1, 1024)[1] == "tail_gemm:tp1e0"
-    assert route_kernel_keys("tail", 8, 1024)[1] == "tail_gemm:tp8e0"
+    assert route_kernel_keys("tail", 1, 512) == ("tail_gemm:tp1e1f1",)
+    assert route_kernel_keys("tail", 1, 1024)[1] == "tail_gemm:tp1e0f0"
+    assert route_kernel_keys("tail", 8, 1024)[1] == "tail_gemm:tp8e0f0"
     assert len(route_kernel_keys("tail", 1, 16384)) == 2
     for stage in ("front", "tail"):
         for tp in SUPPORTED_TP:
@@ -455,7 +619,9 @@ def test_tail_matches_reference(tp, tokens):
     )
     assert runner.route == ("decode" if tokens <= DECODE_MAX_T else "prefill")
     assert runner.kernel_keys == route_kernel_keys("tail", tp, tokens)
-    assert runner.launch_count == (1 if tokens <= DECODE_MAX_T else 2)
+    assert runner.launch_count == (
+        1 if tokens <= DECODE_MAX_T or runner.plan.get("fused_norm") else 2
+    )
     runner()
     torch.cuda.synchronize()
     expected = tail_reference(routed, shared_act, w, tp, rank)

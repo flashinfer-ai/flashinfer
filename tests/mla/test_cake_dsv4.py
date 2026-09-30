@@ -919,7 +919,37 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             id="case-84",
         ),
         pytest.param(
-            torch.bfloat16, 64, 2, 5, False, 640, 64, "bf16_h64_fixed_q", id="case-85"
+            torch.bfloat16,
+            64,
+            2,
+            5,
+            False,
+            640,
+            64,
+            "bf16_h64_compressed_q8_v38",
+            id="case-85",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            64,
+            2,
+            5,
+            False,
+            128,
+            1,
+            "bf16_swa128_single_cta",
+            id="case-85-swa",
+        ),
+        pytest.param(
+            torch.bfloat16,
+            64,
+            6,
+            4,
+            False,
+            640,
+            64,
+            "bf16_h64_prefill",
+            id="case-85-dense24",
         ),
         pytest.param(
             torch.bfloat16, 64, 2, 257, True, 640, 64, "bf16_h64_prefill", id="case-86"
@@ -1223,13 +1253,23 @@ def _combined_metadata(rows: int, compressed: int, *, value_base: int = 0):
     return table, lens
 
 
+# Tensors run_cake_dsv4 places in the host value table that a generated TMA
+# descriptor may alias (see cake._TMA_SOURCE_ALIASES).
+_HOST_TMA_SOURCE_TENSORS = frozenset({"Q", "SWA_cache", "compressed_KV_cache", "O"})
+
+
 @pytest.mark.parametrize("arch", _ARCHES)
 def test_registered_arg_plans_use_known_names(arch):
     """Every generated argument is either bindable by name or a documented retired name."""
     unknown = []
+    unaliased_tma = []
     for variant, spec in _ARCH_REGISTRATIONS[arch]["variants"].items():
         for kind, name in spec["arg_plan"]:
             canonical = cake.canonical_arg_name(kind, name)
+            if kind == "tma_buffer" and canonical not in _HOST_TMA_SOURCE_TENSORS:
+                # A descriptor name the host binds only by vocabulary would still
+                # fail at launch: ``_bind_argument`` needs a tensor value for it.
+                unaliased_tma.append((variant, name, canonical))
             if (
                 cake.is_bindable_arg(kind, name)
                 or canonical in cake._RETIRED_ARG_REASONS
@@ -1237,6 +1277,39 @@ def test_registered_arg_plans_use_known_names(arch):
                 continue
             unknown.append((variant, kind, name))
     assert unknown == []
+    assert unaliased_tma == []
+
+
+_PUBLIC_COMPILE_FLAGS = {
+    "-std=c++17",
+    "--use_fast_math",
+    "-Xptxas=--register-usage-level=10",
+}
+
+
+@pytest.mark.parametrize("arch", _ARCHES)
+def test_registered_compile_flags_are_public(arch):
+    """Exported programs must build with public nvcc/ptxas options only.
+
+    The FP8/H128 persistent prefill variant additionally pins the ptxas
+    register-usage level: without it ptxas re-orders the softmax exp2/convert
+    chains across the P-publication fence and the exported build runs 3-5 %
+    slower than the source build on the 16-tile prefill shapes.  The uniform
+    (sub-128-token decode) variant of the same body ships without the pin:
+    its softmax chain is not what paces the item and the pinned build reads
+    1-2 % slower on the uniform decode rows, so the flag must stay off there.
+    """
+    pin = "-Xptxas=--register-usage-level=10"
+    variants = _ARCH_REGISTRATIONS[arch]["variants"]
+    assert "fp8_h128_prefill_source_persistent" in variants
+    assert "fp8_h128_prefill_source_persistent_uniform" in variants
+    for variant, spec in variants.items():
+        flags = set(spec["compile_flags"])
+        assert flags <= _PUBLIC_COMPILE_FLAGS, (variant, sorted(flags))
+        if variant == "fp8_h128_prefill_source_persistent":
+            assert pin in flags, variant
+        elif variant == "fp8_h128_prefill_source_persistent_uniform":
+            assert pin not in flags, variant
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
@@ -1259,7 +1332,13 @@ def test_metadata_param_vocabulary_is_bindable():
     for name in KERNEL_METADATA_PARAMS:
         kind = "buffer" if name.endswith(("indices", "lens")) else "parameter"
         assert cake.is_bindable_arg(kind, name), name
-    for tma_name in ("tmap_q", "tmap_swa_k", "tmap_swa_kv", "tmap_compressed_v"):
+    for tma_name in (
+        "tmap_q",
+        "tmap_swa_k",
+        "tmap_swa_kv",
+        "tmap_compressed_v",
+        "tmap_o",
+    ):
         assert cake.is_bindable_arg("tma_buffer", tma_name)
     assert cake.canonical_arg_name("parameter", "num_q_heads") == "num_heads"
     assert cake.canonical_arg_name("parameter", "num_split") == "num_splits"
@@ -1483,7 +1562,10 @@ def _run_fake_dense_h64(monkeypatch, *, query_rows, metadata, workspace, out=Non
     """Drive run_cake_dsv4 on CPU tensors through the bf16 H64 dense split route."""
     recorder = _install_fake_variants(
         monkeypatch,
-        {"bf16_h64_fixed_q": _MAIN_PLAN, "bf16_h64_fixed_q_reduce": _REDUCE_PLAN},
+        {
+            "bf16_h64_compressed_q8_v38": _MAIN_PLAN,
+            "bf16_h64_compressed_reduce": _REDUCE_PLAN,
+        },
     )
     monkeypatch.setattr(cake, "_target_arch", lambda device: "sm_103a")
     monkeypatch.setattr(cake, "_stream_ptr", lambda device: 0)
@@ -2090,8 +2172,10 @@ class _RecordingLauncher:
 @pytest.mark.parametrize(
     "num_query_tokens,sparse_topk,expected_program,expected_splits",
     [
-        (12, 260, "bf16_h128_topk128x_split3_sm100", 3),
-        (16, 260, "bf16_h128_topk128x_split3_sm100", 3),
+        # Three live KV tiles run the four-owner program (fourth tile fully
+        # masked): 14.8 -> 12.7 us on GB300, 15.7 -> 13.6 us on B200.
+        (12, 260, "bf16_h128_topk128x_split4_sm100", 4),
+        (16, 260, "bf16_h128_topk128x_split4_sm100", 4),
         (12, 388, "bf16_h128_topk128x_split4_sm100", 4),
         (16, 388, "bf16_h128_topk128x_split4_sm100", 4),
         # CAKE-624 W12: above the token bound one row-first owner per token.

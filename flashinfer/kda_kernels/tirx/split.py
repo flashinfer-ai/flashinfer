@@ -1,7 +1,7 @@
 # Copyright (c) 2026 KDA Team
 # SPDX-FileCopyrightText: Copyright TIRx authors
 # SPDX-License-Identifier: MIT AND Apache-2.0
-# Adapted from humanfia/kda-for-kda-release; see licenses/LICENSE.kda-for-kda.
+# Adapted from NVlabs/kda; see licenses/LICENSE.kda-for-kda.
 
 # ruff: noqa: SIM117
 # Keep the imported TIRx builder contexts and trace-time assignments intact.

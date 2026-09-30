@@ -1422,7 +1422,7 @@ def test_sm90_moe_runner_rejects_bad_activation_config():
             make(swiglu_limit=bad_limit)
     with pytest.raises(ValueError, match="requires situ_beta"):
         make(situ_linear_beta=25.0)
-    with pytest.raises(ValueError, match="require ActivationType.Swiglu"):
+    with pytest.raises(ValueError, match=r"require ActivationType\.Situ or Swiglu"):
         make(activation_type=ActivationType.GegluTanh.value, situ_beta=4.0)
     with pytest.raises(ValueError, match="positive and finite"):
         make(situ_beta=-1.0)

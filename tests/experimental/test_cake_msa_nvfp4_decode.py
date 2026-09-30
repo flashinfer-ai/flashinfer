@@ -19,26 +19,28 @@ import torch
 
 from flashinfer.experimental.msa_nvfp4_decode import cake_jit
 from flashinfer.experimental.msa_nvfp4_decode.cake_backend import (
+    arch_for,
     DATA_DIM,
+    generated_program_available,
     HEAD_DIM,
     MAIN_KWARGS,
-    PAGE_SIZE,
-    SCALE_DIM,
-    SHORT_KWARGS,
-    SPLIT_FACTORS,
-    STATS_PER_SLOT,
-    SUPPORTED_COMPUTE_CAPABILITIES,
-    WORKSPACE_ALIGN,
-    arch_for,
-    generated_program_available,
     msa_nvfp4_decode_workspace_size,
+    PAGE_SIZE,
     persistent_cta_capacity,
     prepare_msa_nvfp4_sparse_decode as prepare_backend,
+    SCALE_DIM,
     short_grid,
+    SHORT_KWARGS,
     short_program_record,
     short_route_applies,
     split_factor,
+    SPLIT_FACTORS,
+    STATS_PER_SLOT,
+    SUPPORTED_COMPUTE_CAPABILITIES,
+    tail_plan,
+    TOPK,
     validate_msa_nvfp4_decode_inputs,
+    WORKSPACE_ALIGN,
     workspace_layout,
 )
 from flashinfer.msa_ops import _nvfp4_decode_sm100 as upstream
@@ -81,9 +83,18 @@ def _supported_device() -> bool:
 
 def _require_program():
     if not _supported_device():
-        pytest.skip("requires a compute capability 10.0/10.3 device")
+        pytest.skip("requires a compute capability 10.0/10.3/10.7 device")
     if not generated_program_available(torch.device("cuda")):
         pytest.skip("generated NVFP4 MSA decode program not registered for this device")
+
+
+def _require_existing_route():
+    """The peer checks below need the existing ``msa_ops`` NVFP4 route on this
+    device. That route is gated by its own capability map, separately from the
+    generated programs of the ``cake`` backend, so a device the backend serves
+    may still be one the route declines."""
+    if upstream._target_for(torch.device("cuda")) is None:
+        pytest.skip("the existing NVFP4 route is not enabled on this device")
 
 
 # ---------------------------------------------------------------------------
@@ -302,6 +313,32 @@ EXPECTED_SHORT_ARG_PLAN = (
 )
 
 
+def test_toolchain_guard_declines_programs_the_toolkit_cannot_compile(monkeypatch):
+    """A checkout may register sm_107a programs on a toolkit without compute_107a:
+    the JIT declines them up front and the backend reports no program for 10.7."""
+    import flashinfer.compilation_context as compilation_context
+
+    monkeypatch.setattr(compilation_context, "_nvcc_supports_sm107", lambda: False)
+    cake_jit.toolchain_supports.cache_clear()
+    try:
+        assert cake_jit.toolchain_supports("sm_100a")
+        assert cake_jit.toolchain_supports("sm_103a")
+        assert not cake_jit.toolchain_supports("sm_107a")
+        assert not cake_jit.toolchain_supports("sm_120a")
+        for name, record in cake_jit.MODULES.items():
+            if record["arch"] != "sm_107a":
+                continue
+            cake_jit.gen_cake_msa_nvfp4_decode_module.cache_clear()
+            with pytest.raises(RuntimeError, match="compute_107a"):
+                cake_jit.gen_cake_msa_nvfp4_decode_module(name, cake_jit.STAGES[0])
+            break
+        if torch.cuda.is_available() and torch.cuda.get_device_capability(0) == (10, 7):
+            assert not generated_program_available(torch.device("cuda"))
+    finally:
+        cake_jit.toolchain_supports.cache_clear()
+        cake_jit.gen_cake_msa_nvfp4_decode_module.cache_clear()
+
+
 def test_registry_records_match_the_host_binding():
     if not cake_jit.MODULES:
         pytest.skip("no generated program registered in this checkout")
@@ -319,9 +356,22 @@ def test_registry_records_match_the_host_binding():
             per_arch_ctas.setdefault(record["arch"], set()).add(
                 int(record["ctas_per_sm"])
             )
-            key = (record["arch"], int(record["splits"]))
+            tail = bool(record.get("tail", False))
+            key = (record["arch"], int(record["splits"]), tail)
             expected_plan = EXPECTED_ARG_PLAN
-            assert cake_jit.select_module(record["arch"], int(record["splits"])) == name
+            assert (
+                cake_jit.select_module(record["arch"], int(record["splits"]), tail=tail)
+                == name
+            )
+            if tail:
+                # A last-round-split program names the parts it was frozen for.
+                assert int(record["splits"]) > 1
+                capacity = record["cluster_capacity"]
+                assert capacity and all(
+                    int(sms) > 0 and int(ctas) >= int(record["splits"])
+                    for sms, ctas in capacity.items()
+                )
+                assert record in cake_jit.tail_records(record["arch"])
         else:
             assert int(record["max_pages"]) >= 1
             assert int(record["cluster"]) >= 2
@@ -350,6 +400,23 @@ def test_registry_records_match_the_host_binding():
     with pytest.raises(NotImplementedError):
         cake_jit.select_module("sm_90a", 1)
     assert cake_jit.select_short_module("sm_90a") is None
+    assert cake_jit.tail_records("sm_90a") == []
+
+
+def test_tail_plan_rule():
+    if not cake_jit.tail_records("sm_107a"):
+        pytest.skip("no last-round-split program registered for sm_107a")
+    # 212 resident CTAs: 256 items are 1.21 -> 2 rounds plain, 1.5 with a two-way last round on a
+    # 212-CTA grid; 512 items 2.42 -> 3 plain, 2.5 split.
+    assert tail_plan("sm_107a", 256, 212, TOPK) == (2, 212)
+    assert tail_plan("sm_107a", 512, 212, TOPK) == (2, 212)
+    # One round already; 176 remainder items x 2 do not fit the grid; fewer than four page pairs
+    # never split; an unknown part has no capacity entry; Blackwell registers no tail program.
+    assert tail_plan("sm_107a", 128, 212, TOPK) is None
+    assert tail_plan("sm_107a", 1024, 212, TOPK) is None
+    assert tail_plan("sm_107a", 256, 212, 6) is None
+    assert tail_plan("sm_107a", 256, 200, TOPK) is None
+    assert tail_plan("sm_100a", 512, 148, TOPK) is None
 
 
 # ---------------------------------------------------------------------------
@@ -431,9 +498,22 @@ def _run_and_check(seq_lens, num_kv_heads, *, group_size=16, seqlen_q=1, seed):
         assert runner.num_ctas == short_grid(items, sms, record)[0]
     else:
         assert runner.route == "swap_tsk"
-        assert runner.splits == split_factor(
-            items, persistent_cta_capacity(device), inputs["max_pages"]
+        capacity = persistent_cta_capacity(device)
+        expected_splits = split_factor(items, capacity, inputs["max_pages"])
+        # A part that registers a last-round-split program (sm_107a) turns a
+        # plain persistent launch whose last round is short into S-way cluster
+        # units for the remainder items; the plan is the production rule.
+        plan = (
+            tail_plan(arch, items, capacity, inputs["max_pages"])
+            if expected_splits == 1
+            else None
         )
+        if plan is None:
+            assert runner.splits == expected_splits
+            assert runner.tail is False
+        else:
+            assert runner.tail is True
+            assert (runner.splits, runner.num_ctas) == plan
     runner.out.fill_(float("nan"))
     out = runner()
     torch.cuda.synchronize()
@@ -492,6 +572,7 @@ def test_matches_the_existing_nvfp4_route(seq_lens, num_kv_heads):
     existing route is checked at its own peer tolerance.
     """
     _require_program()
+    _require_existing_route()
     inputs, runner, _ = _run_and_check(seq_lens, num_kv_heads, seed=41)
     route_out = torch.empty_like(inputs["q"])
     msa_sparse_decode_attention(
@@ -512,6 +593,7 @@ def test_serves_a_geometry_the_existing_route_declines():
     """Eight query heads per KV head is outside the route's allowlist; the
     generated program serves it from the same pages."""
     _require_program()
+    _require_existing_route()
     inputs, _, _ = _run_and_check([4096] * 3, 1, group_size=8, seed=43)
     with pytest.raises(NotImplementedError):
         msa_sparse_decode_attention(
@@ -637,6 +719,40 @@ def test_launch_makes_no_allocation():
     torch.cuda.synchronize()
     after = torch.cuda.memory_stats()
     assert after["allocation.all.allocated"] - before["allocation.all.allocated"] == 0
+
+
+def test_multi_round_batches_take_the_last_round_split():
+    _require_program()
+    device = torch.device("cuda")
+    arch = arch_for(device)
+    if not cake_jit.tail_records(arch):
+        pytest.skip(f"no last-round-split program registered for {arch}")
+    capacity = persistent_cta_capacity(device)
+    # More items than resident CTAs (256 on the 212-SM part) with eight page pairs each.
+    inputs = build_decode_inputs([1024] * 64, num_kv_heads=4, device="cuda", seed=12)
+    items = 64 * 4
+    plan = tail_plan(arch, items, capacity, inputs["max_pages"])
+    assert plan is not None and items > capacity
+    runner = prepare_msa_nvfp4_sparse_decode(
+        inputs["q"],
+        inputs["k"],
+        inputs["v"],
+        inputs["q2k_indices"],
+        k_scale=inputs["k_scale"],
+        v_scale=inputs["v_scale"],
+        page_table=inputs["page_table"],
+        seqused_k=inputs["seqused_k"],
+        k_global_scale=inputs["k_global_scale"],
+        v_global_scale=inputs["v_global_scale"],
+    )
+    # The tail program merges through distributed shared memory: no workspace was needed.
+    assert runner.tail and runner.route == "swap_tsk"
+    assert (runner.splits, runner.num_ctas) == plan
+    assert cake_jit.MODULES[runner.module_name]["tail"] is True
+    runner()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(runner.out, _oracle(inputs), atol=ATOL, rtol=RTOL)
+    assert torch.isfinite(runner.lse).all()
 
 
 def test_split_batches_require_a_sized_workspace():

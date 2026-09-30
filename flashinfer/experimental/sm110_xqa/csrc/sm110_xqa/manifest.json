@@ -31,6 +31,33 @@
     "sm_110a/sm110_xqa_tree_fp16_contiguous_mma_kernel.cu": {
       "sha256": "3435e1351208b58bd38dbec71acb51b5d45d4cede7b540e75db046441d68ddf6"
     },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_binding.cu": {
+      "sha256": "c7cc8a9e72f6c8f97bd30904e997ebf39be300c095ed20afe470bf66952e23e2"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_kernel.cu": {
+      "sha256": "3b5853923c92baaca65216843cc39722aeda1db48c70381b0cf8bdfaae91739d"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_q_kernel.cu": {
+      "sha256": "daa1ce6d8d50218a07b03bae93088da6bd64a078f760dd83396ce59480a915a0"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r16_kernel.cu": {
+      "sha256": "effce09ad9ab725b32c94dd57c32573204342d40e6434edf6211cc721091ef78"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r16_q_kernel.cu": {
+      "sha256": "6f5ab58dbdf213b82c939c9ee2eace98add0e73831682b7b7078c40e2650fc65"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r2_kernel.cu": {
+      "sha256": "58f368c7036a322b7f90af61eac50d56664ebb439c20f2734a80d776003c357c"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r2_q_kernel.cu": {
+      "sha256": "63b457a8b01e29a2755aa02dda275c3e6af19d0d44abce499e2a4f6db2c983a7"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r4_kernel.cu": {
+      "sha256": "280e0d7e257ec5406692ca80903a79e02400c6b2bb50241721a353d352cf2c4d"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r4_q_kernel.cu": {
+      "sha256": "30f79127b7731e64fd6fea68582386a1c8f1174739e0fd5f8199863590d50ac3"
+    },
     "sm_110a/sm110_xqa_tree_fp16_paged_binding.cu": {
       "sha256": "a291f25e709abbd60aa74f60eb6bc9c11b508ef352184fd3f4a0803ca026dc48"
     },
@@ -49,6 +76,33 @@
     "sm_110a/sm110_xqa_tree_fp16_paged_mma_split_kernel.cu": {
       "sha256": "827afd309cb292597a029b6e9fd760eee490a6ea160350b1960a6029b00ca1d1"
     },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_binding.cu": {
+      "sha256": "ff9d48cdc028b01a2ecb3fa26124fe4fe476bb23a0487ba10c9bfc6279cea370"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_kernel.cu": {
+      "sha256": "ac9b89cc81dadc265746dedbfcf3327980e753a6276bb6d76775494c9473c044"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_q_kernel.cu": {
+      "sha256": "c3e4b968f0725d9e384dcad4c69322205835e356921a45281fb8c9a9b54a07ff"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r16_kernel.cu": {
+      "sha256": "a289e2f1c214045d575ef876887a526be1cbc3f8e28b60c1cc50ce70304b9c6f"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r16_q_kernel.cu": {
+      "sha256": "8b5538bb2babd733752e37592d83086c0e292831591074866463d356435bac31"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r2_kernel.cu": {
+      "sha256": "190abff690360f5970bdd871712b5f850f3edec0a4ec326e6937820a6a06663d"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r2_q_kernel.cu": {
+      "sha256": "2e028b3aa8bd602c7edc7777cb206f7cd608e4727ca244dbedfcf83df88459ea"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r4_kernel.cu": {
+      "sha256": "5cc0496cb392318b63bd9cc1d21f1360cd8782ad8eead2ad3ec414307c8d6d25"
+    },
+    "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r4_q_kernel.cu": {
+      "sha256": "69048cb895b89e95db02772ea40b8f3c00852e8398a07494c589bf22307181bf"
+    },
     "sm_110a/sm110_xqa_tree_fp8_contiguous_binding.cu": {
       "sha256": "f114800fff81ec7092824080927b505326be0472842ab159d13fc7e331a6be76"
     },
@@ -61,6 +115,48 @@
     "sm_110a/sm110_xqa_tree_fp8_contiguous_mma_kernel.cu": {
       "sha256": "5e28b7d80817db1cf8007ace12ed5645c7eee530fee18eb314542a96273b57a6"
     },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_pair_binding.cu": {
+      "sha256": "d9dd2a5fe24f84d7748fbd4abf2bf108045e48ef3f74d32cd8ee4110e54fa49d"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_pair_r16_kernel.cu": {
+      "sha256": "8dc10c4d65fa771d54ec759445acbce605f652c8a05cce51887a2ac8b71695b4"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_pair_r2_kernel.cu": {
+      "sha256": "1811b17d19cb0bb47590782dcfae366fd2086d3f4c71376aeb3acb5865e37b2e"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_pair_r4_kernel.cu": {
+      "sha256": "69f9406be68ee023f4f4754cc8340a7b61a52d305739aaaedd20ca2c43877e8b"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_pair_r8_kernel.cu": {
+      "sha256": "8a988067277ab4db7a8ae4454752d6f30bca8bb24a57977d4ea17f7b375a1bc7"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_binding.cu": {
+      "sha256": "ab4ebdf099e058ffb592ac0d40e7e3cd3e3131c68412ea2f2422b4bb29e1622b"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_kernel.cu": {
+      "sha256": "0f33c34b348245d8e26e092175b117fcc39acd51dadff632025a562b9cec9695"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_q_kernel.cu": {
+      "sha256": "d018bf8dae149e3a7bc4e10c37405b11211c5045d10af60976bf86a8e2fdd9b0"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r16_kernel.cu": {
+      "sha256": "64bd18888a50add225dd8eb62e0698210444c79cde30b3a10cc48f872a859738"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r16_q_kernel.cu": {
+      "sha256": "a260706464fa4bacd0aef9589b493fac5ab5f4a51fb501fbd321d6a9db4cd442"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r2_kernel.cu": {
+      "sha256": "816566c60580c282ed1c7e1a9a115022f05faf514061377037bd20f6faa50021"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r2_q_kernel.cu": {
+      "sha256": "ccc01575f2863523494890d527742f6ddeff0eb1040ca227963ea2dba81cc8dd"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r4_kernel.cu": {
+      "sha256": "99e457226fc621e605fd1991fb12c8009f4c40dfcf2703502ea4bbc45f61a858"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r4_q_kernel.cu": {
+      "sha256": "7775274e3727c3facfdafcf8507797648ce1e63d13067a5e3c31b5031c7b3f78"
+    },
     "sm_110a/sm110_xqa_tree_fp8_paged_binding.cu": {
       "sha256": "59a4b291c580b8b3a423c06db4038ce0af9dd7d9875bd9524954d2b6601941b1"
     },
@@ -72,6 +168,48 @@
     },
     "sm_110a/sm110_xqa_tree_fp8_paged_mma_kernel.cu": {
       "sha256": "f3a53f957ece731f3c60e6c2054ae2e520bc9c14e323bff43f8508c02242f0d1"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_pair_binding.cu": {
+      "sha256": "d0d35e7d78a550aaa436e04416b6e4113a239fc7941644e07c3b12d367079651"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_pair_r16_kernel.cu": {
+      "sha256": "a9b5939e5ddfbca118f243acf51424c33cbf46cc3711cdcec9d865766b843d61"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_pair_r2_kernel.cu": {
+      "sha256": "dc872d7475939ab1c1637dcf0d8a7f69c427b5804035ca706f7df7261d3e5254"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_pair_r4_kernel.cu": {
+      "sha256": "193aa066233cf3d584fa6a38ee7598356cb61dc6b7dc67f98a50c27202d927be"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_pair_r8_kernel.cu": {
+      "sha256": "5698104d73d7ee9dd0f23813c0df9e06844247fa3658ba71f0b831453faa55ba"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_binding.cu": {
+      "sha256": "a9c7b311b40693cc397a9a86c47a6656573252007d173b6d03840763329279e2"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_kernel.cu": {
+      "sha256": "41da00ad9663c6059e3da94cb1bd94b5fb3365d48179a07dbc914969a1bda6b2"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_q_kernel.cu": {
+      "sha256": "2a5d4d10be4143df9ff63cff112f0cccab46d5d55092d3d0f4cb2eb2b817a614"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r16_kernel.cu": {
+      "sha256": "ba5ed81e6279b749357edb17ca0a6976a7e55bcb2982b8aca6c9fb46de4bf66f"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r16_q_kernel.cu": {
+      "sha256": "948f698304d24afcfea3ab019d77c38ee5ba9ca7a11ac87cce3385e0dfdcc11b"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r2_kernel.cu": {
+      "sha256": "d250c19a9fc8cf5cd5130e28282946808de426cb06994c9a0554e30f77f78b21"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r2_q_kernel.cu": {
+      "sha256": "ccc6b28ecf3f275edbad993d6ee78503e363f6533fc5efff5670a966801109cf"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r4_kernel.cu": {
+      "sha256": "a21f06eb9893195de20e98bc0575fc18412da4adefb4bd945948c217c1d97b39"
+    },
+    "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r4_q_kernel.cu": {
+      "sha256": "f3e83e8d211afbd9e8887be583010178fb145ee0af39c4d272d513c87b4f084c"
     }
   },
   "routes": {
@@ -539,6 +677,159 @@
         }
       ]
     },
+    "tree_fp16_contiguous_tmem": {
+      "kernel": "tmem",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r2_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r2_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r4_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r4_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r16_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_r16_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_contiguous_tmem_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp16_contiguous_tmem",
+      "fallback_kernel_symbol": "kernel_sm110_xqa_tree_fp16_contiguous_tmem_q",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        2,
+        2,
+        1
+      ],
+      "fallback_cluster": [
+        2,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 230400,
+      "tile_rows": 128,
+      "output_tile_columns": 256,
+      "threads_per_cta": 512,
+      "tma_multicast": {
+        "q": true,
+        "kv": true
+      },
+      "fallback_tma_multicast": {
+        "q": true,
+        "kv": false
+      },
+      "source_cubin_sha256": "2e8662c075ee9c6b02863da747b471a37beef3ec27fe369299755cc80485131d",
+      "fallback_source_cubin_sha256": "a2a44ab758846df9b298c16ba11cba0ea800a1c9339388784211593eba1a53d0",
+      "device_parameters": [
+        {
+          "name": "Q",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* data; const int* sequence_lengths; uint32_t capacity;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        }
+      ],
+      "gqa_ratios": [
+        2,
+        4,
+        8,
+        16
+      ],
+      "kernel_symbols": {
+        "2": {
+          "even": "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r2",
+          "odd": "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r2_q"
+        },
+        "4": {
+          "even": "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r4",
+          "odd": "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r4_q"
+        },
+        "8": {
+          "even": "kernel_sm110_xqa_tree_fp16_contiguous_tmem",
+          "odd": "kernel_sm110_xqa_tree_fp16_contiguous_tmem_q"
+        },
+        "16": {
+          "even": "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r16",
+          "odd": "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r16_q"
+        }
+      },
+      "source_cubin_sha256s": {
+        "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r2": "a13ad78478a338f798f002fda4be4246ab206309a1e63d1b9b5d179ead5d8671",
+        "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r2_q": "1b7ff085c35a656f65e36b341270b4a2b12d75ba9c807c7b6f9b4b8aecde4afb",
+        "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r4": "1fdbd974ab20db6caa73da681afc9e028940ffd9def50dba0a5a1268de5ae7d7",
+        "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r4_q": "201a9e7dbd3185d919c78e588dba425fecf5079b7bbb6e7b4ff8a4c401e1f813",
+        "kernel_sm110_xqa_tree_fp16_contiguous_tmem": "2e8662c075ee9c6b02863da747b471a37beef3ec27fe369299755cc80485131d",
+        "kernel_sm110_xqa_tree_fp16_contiguous_tmem_q": "a2a44ab758846df9b298c16ba11cba0ea800a1c9339388784211593eba1a53d0",
+        "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r16": "f178c205eb49f605f0fb47c1008af14fe6e9767bcccb0936c631c2e9ba821455",
+        "kernel_sm110_xqa_tree_fp16_contiguous_tmem_r16_q": "558d076eb7cd6cc4e79287a4b7db5ba1324b304d19b339e1b6538e0465846716"
+      },
+      "form_selection": "kernel_symbols[ratio].even when ceil(q_len * ratio / 128) is even, else kernel_symbols[ratio].odd"
+    },
     "tree_fp16_paged": {
       "block": [
         256,
@@ -869,6 +1160,159 @@
       "kv_l2_prefetch": true,
       "merge": "in_cta_smem"
     },
+    "tree_fp16_paged_tmem": {
+      "kernel": "tmem",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r2_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r2_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r4_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r4_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r16_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_r16_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp16_paged_tmem_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp16_paged_tmem",
+      "fallback_kernel_symbol": "kernel_sm110_xqa_tree_fp16_paged_tmem_q",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        2,
+        2,
+        1
+      ],
+      "fallback_cluster": [
+        2,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 230400,
+      "tile_rows": 128,
+      "output_tile_columns": 256,
+      "threads_per_cta": 512,
+      "tma_multicast": {
+        "q": true,
+        "kv": true
+      },
+      "fallback_tma_multicast": {
+        "q": true,
+        "kv": false
+      },
+      "source_cubin_sha256": "f1f8f090b341615acd4ffac5e02df86d83f7483fe2f8d35cafa121f33580bec0",
+      "fallback_source_cubin_sha256": "6c134187cf8868e30fc9b95358a070bd4733f7979532bf008fb5985db479892f",
+      "device_parameters": [
+        {
+          "name": "Q",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* pool; const int* page_list; const int* sequence_lengths; uint32_t max_pages;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        }
+      ],
+      "gqa_ratios": [
+        2,
+        4,
+        8,
+        16
+      ],
+      "kernel_symbols": {
+        "2": {
+          "even": "kernel_sm110_xqa_tree_fp16_paged_tmem_r2",
+          "odd": "kernel_sm110_xqa_tree_fp16_paged_tmem_r2_q"
+        },
+        "4": {
+          "even": "kernel_sm110_xqa_tree_fp16_paged_tmem_r4",
+          "odd": "kernel_sm110_xqa_tree_fp16_paged_tmem_r4_q"
+        },
+        "8": {
+          "even": "kernel_sm110_xqa_tree_fp16_paged_tmem",
+          "odd": "kernel_sm110_xqa_tree_fp16_paged_tmem_q"
+        },
+        "16": {
+          "even": "kernel_sm110_xqa_tree_fp16_paged_tmem_r16",
+          "odd": "kernel_sm110_xqa_tree_fp16_paged_tmem_r16_q"
+        }
+      },
+      "source_cubin_sha256s": {
+        "kernel_sm110_xqa_tree_fp16_paged_tmem_r2": "0dc8f4597b9f42027eb80421ad9540686cefe2c29516c5435812e26b31981343",
+        "kernel_sm110_xqa_tree_fp16_paged_tmem_r2_q": "2ac1a8d21777957a9faebff21e2835398a621d995a0d7ef4422dd8516ce60581",
+        "kernel_sm110_xqa_tree_fp16_paged_tmem_r4": "48f86d48c876b95133b88dda0eb179988ac20db5a3915e03f12f9eed6352250d",
+        "kernel_sm110_xqa_tree_fp16_paged_tmem_r4_q": "2ca64e997e8abe976a982d90290de6cabb549cf652e8b088898b57febba48d0b",
+        "kernel_sm110_xqa_tree_fp16_paged_tmem": "f1f8f090b341615acd4ffac5e02df86d83f7483fe2f8d35cafa121f33580bec0",
+        "kernel_sm110_xqa_tree_fp16_paged_tmem_q": "6c134187cf8868e30fc9b95358a070bd4733f7979532bf008fb5985db479892f",
+        "kernel_sm110_xqa_tree_fp16_paged_tmem_r16": "edac5fc3e97a1094245170aee934cd4e3582aa87ff65543a475adb936b1fdd08",
+        "kernel_sm110_xqa_tree_fp16_paged_tmem_r16_q": "7de60fe1cf321766279aa607d28dd0195664cd6b17306876aeaeca7b7a05422c"
+      },
+      "form_selection": "kernel_symbols[ratio].even when ceil(q_len * ratio / 128) is even, else kernel_symbols[ratio].odd"
+    },
     "tree_fp8_contiguous": {
       "block": [
         256,
@@ -1089,6 +1533,287 @@
         }
       ]
     },
+    "tree_fp8_contiguous_pair": {
+      "kernel": "pair",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_pair_r2_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_pair_r4_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_pair_r8_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_pair_r16_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_pair_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "gqa_ratios": [
+        2,
+        4,
+        8,
+        16
+      ],
+      "kernel_symbols": {
+        "2": "kernel_sm110_xqa_tree_fp8_contiguous_pair_r2",
+        "4": "kernel_sm110_xqa_tree_fp8_contiguous_pair_r4",
+        "8": "kernel_sm110_xqa_tree_fp8_contiguous_pair_r8",
+        "16": "kernel_sm110_xqa_tree_fp8_contiguous_pair_r16"
+      },
+      "source_cubin_sha256s": {
+        "kernel_sm110_xqa_tree_fp8_contiguous_pair_r2": "90abdee29c53a8b4a83fb3a16902551a767c17cd8e5f4039ca7ee7545e401962",
+        "kernel_sm110_xqa_tree_fp8_contiguous_pair_r4": "817cc02640cad41eace810ee455e1b1e698c56503a083948d5b5554c5fd76052",
+        "kernel_sm110_xqa_tree_fp8_contiguous_pair_r8": "06c67f0999200ca1a9cbe08fc032ed0ad387ce6e085fc2cefbf2a9448fcb103e",
+        "kernel_sm110_xqa_tree_fp8_contiguous_pair_r16": "8525251de2541d43a17d1ca30508aeaa6b0c01a5bb03753156bbbedbf780ad1c"
+      },
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        4,
+        1,
+        1
+      ],
+      "cta_group": 2,
+      "q_tiles_per_cluster": 2,
+      "form_selection": "kernel_symbols[ratio]; the Q-tile count per KV head must be even (the auto selection uses the tmem route otherwise)",
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 230400,
+      "tile_rows": 128,
+      "output_tile_columns": 256,
+      "threads_per_cta": 512,
+      "tma_multicast": {
+        "q": true,
+        "kv": true,
+        "v_raw_row": true
+      },
+      "device_parameters": [
+        {
+          "name": "Q",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KVV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* data; const int* sequence_lengths; uint32_t capacity;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        }
+      ]
+    },
+    "tree_fp8_contiguous_tmem": {
+      "kernel": "tmem",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r2_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r2_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r4_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r4_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r16_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_r16_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_contiguous_tmem_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp8_contiguous_tmem",
+      "fallback_kernel_symbol": "kernel_sm110_xqa_tree_fp8_contiguous_tmem_q",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        2,
+        2,
+        1
+      ],
+      "fallback_cluster": [
+        2,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 230400,
+      "tile_rows": 128,
+      "output_tile_columns": 256,
+      "threads_per_cta": 512,
+      "tma_multicast": {
+        "q": true,
+        "kv": true
+      },
+      "fallback_tma_multicast": {
+        "q": true,
+        "kv": false
+      },
+      "source_cubin_sha256": "59856f72a657307e385b602a6484eba03a8bf3ca4095adfab46ef3a4b1162998",
+      "fallback_source_cubin_sha256": "ba3b7561104bc6d498c8e581ac4e1ca5add91af619d5dd0cb1c84e7ca86236ca",
+      "device_parameters": [
+        {
+          "name": "Q",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* data; const int* sequence_lengths; uint32_t capacity;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        }
+      ],
+      "gqa_ratios": [
+        2,
+        4,
+        8,
+        16
+      ],
+      "kernel_symbols": {
+        "2": {
+          "even": "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r2",
+          "odd": "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r2_q"
+        },
+        "4": {
+          "even": "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r4",
+          "odd": "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r4_q"
+        },
+        "8": {
+          "even": "kernel_sm110_xqa_tree_fp8_contiguous_tmem",
+          "odd": "kernel_sm110_xqa_tree_fp8_contiguous_tmem_q"
+        },
+        "16": {
+          "even": "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r16",
+          "odd": "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r16_q"
+        }
+      },
+      "source_cubin_sha256s": {
+        "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r2": "cd41f47ba67a1ec64ddbd5d3b3cba2650aeae648a4d5a4a82776b92271797158",
+        "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r2_q": "019d25841a2fe23c32a69dc9c99335396b9193affd9d08f7f90e479dcc94ae07",
+        "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r4": "2c219cd2b2d726c618e83021efab006ebc942516bf0601829ae0dcc9313229fd",
+        "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r4_q": "dcff2b8623d1d095c1c47f7b5d0917ba3164c3477af03045f0d7efbfa89288ef",
+        "kernel_sm110_xqa_tree_fp8_contiguous_tmem": "59856f72a657307e385b602a6484eba03a8bf3ca4095adfab46ef3a4b1162998",
+        "kernel_sm110_xqa_tree_fp8_contiguous_tmem_q": "ba3b7561104bc6d498c8e581ac4e1ca5add91af619d5dd0cb1c84e7ca86236ca",
+        "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r16": "fe026a988f33a75e1ea6491d63e1728b66196dfec79969508312e491adf57f73",
+        "kernel_sm110_xqa_tree_fp8_contiguous_tmem_r16_q": "16607c95c70dd031901165073e3097b257c4428e6d9d4ea5d68150960339651e"
+      },
+      "form_selection": "kernel_symbols[ratio].even when ceil(q_len * ratio / 128) is even, else kernel_symbols[ratio].odd"
+    },
     "tree_fp8_paged": {
       "block": [
         256,
@@ -1308,10 +2033,291 @@
           "kind": "pointer"
         }
       ]
+    },
+    "tree_fp8_paged_pair": {
+      "kernel": "pair",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp8_paged_pair_r2_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_pair_r4_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_pair_r8_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_pair_r16_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_pair_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "gqa_ratios": [
+        2,
+        4,
+        8,
+        16
+      ],
+      "kernel_symbols": {
+        "2": "kernel_sm110_xqa_tree_fp8_paged_pair_r2",
+        "4": "kernel_sm110_xqa_tree_fp8_paged_pair_r4",
+        "8": "kernel_sm110_xqa_tree_fp8_paged_pair_r8",
+        "16": "kernel_sm110_xqa_tree_fp8_paged_pair_r16"
+      },
+      "source_cubin_sha256s": {
+        "kernel_sm110_xqa_tree_fp8_paged_pair_r2": "daeb55c5b4b86959217628b26422503d4f66e1fe615e31c2707558f212ada122",
+        "kernel_sm110_xqa_tree_fp8_paged_pair_r4": "a6eba47005d9ad9956e0a2227fbcf693d28d7a30f9dfbe22db6def418c681a44",
+        "kernel_sm110_xqa_tree_fp8_paged_pair_r8": "e1b1be196463b931a387057a8b3da0c727995ca8385e1bb9f6c5938855dedc91",
+        "kernel_sm110_xqa_tree_fp8_paged_pair_r16": "c87cdf7071b6c2311e4458472d1beaa13061e0fa317f8fda48349ef1fbf896bb"
+      },
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        4,
+        1,
+        1
+      ],
+      "cta_group": 2,
+      "q_tiles_per_cluster": 2,
+      "form_selection": "kernel_symbols[ratio]; the Q-tile count per KV head must be even (the auto selection uses the tmem route otherwise)",
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 230400,
+      "tile_rows": 128,
+      "output_tile_columns": 256,
+      "threads_per_cta": 512,
+      "tma_multicast": {
+        "q": true,
+        "kv": true,
+        "v_raw_row": true
+      },
+      "device_parameters": [
+        {
+          "name": "Q",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KVV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* pool; const int* page_list; const int* sequence_lengths; uint32_t max_pages;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        }
+      ]
+    },
+    "tree_fp8_paged_tmem": {
+      "kernel": "tmem",
+      "ffi_entry": "run_tree",
+      "sources": [
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r2_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r2_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r4_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r4_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r16_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_r16_q_kernel.cu",
+        "sm_110a/sm110_xqa_tree_fp8_paged_tmem_binding.cu"
+      ],
+      "nvcc_options": [
+        "--use_fast_math"
+      ],
+      "kernel_symbol": "kernel_sm110_xqa_tree_fp8_paged_tmem",
+      "fallback_kernel_symbol": "kernel_sm110_xqa_tree_fp8_paged_tmem_q",
+      "block": [
+        512,
+        1,
+        1
+      ],
+      "cluster": [
+        2,
+        2,
+        1
+      ],
+      "fallback_cluster": [
+        2,
+        1,
+        1
+      ],
+      "cooperative": false,
+      "use_pdl": false,
+      "dynamic_smem_bytes": 230400,
+      "tile_rows": 128,
+      "output_tile_columns": 256,
+      "threads_per_cta": 512,
+      "tma_multicast": {
+        "q": true,
+        "kv": true
+      },
+      "fallback_tma_multicast": {
+        "q": true,
+        "kv": false
+      },
+      "source_cubin_sha256": "3146887da213d3ef9e3f82431bf8f3246922a081fbffbd765325d8966881da57",
+      "fallback_source_cubin_sha256": "5ba1beea24f50db2ae0be490ba83703e6f98bd250d704d0b914f25a5e037d478",
+      "device_parameters": [
+        {
+          "name": "Q",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "KV",
+          "ctype": "const __grid_constant__ Sm110XqaTensorMap64{uint64_t opaque[16];}",
+          "kind": "tensor_map"
+        },
+        {
+          "name": "q_seq_len",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "num_kv_heads",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "head_group_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "q_cu_seq_lens",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "attention_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "output",
+          "ctype": "__half*",
+          "kind": "pointer"
+        },
+        {
+          "name": "mask",
+          "ctype": "const uint32_t*",
+          "kind": "pointer"
+        },
+        {
+          "name": "kv_cache_list",
+          "ctype": "KVCacheList{void* pool; const int* page_list; const int* sequence_lengths; uint32_t max_pages;}",
+          "kind": "struct"
+        },
+        {
+          "name": "batch_size",
+          "ctype": "uint32_t",
+          "kind": "value"
+        },
+        {
+          "name": "k_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        },
+        {
+          "name": "v_cache_scale",
+          "ctype": "float",
+          "kind": "value"
+        }
+      ],
+      "gqa_ratios": [
+        2,
+        4,
+        8,
+        16
+      ],
+      "kernel_symbols": {
+        "2": {
+          "even": "kernel_sm110_xqa_tree_fp8_paged_tmem_r2",
+          "odd": "kernel_sm110_xqa_tree_fp8_paged_tmem_r2_q"
+        },
+        "4": {
+          "even": "kernel_sm110_xqa_tree_fp8_paged_tmem_r4",
+          "odd": "kernel_sm110_xqa_tree_fp8_paged_tmem_r4_q"
+        },
+        "8": {
+          "even": "kernel_sm110_xqa_tree_fp8_paged_tmem",
+          "odd": "kernel_sm110_xqa_tree_fp8_paged_tmem_q"
+        },
+        "16": {
+          "even": "kernel_sm110_xqa_tree_fp8_paged_tmem_r16",
+          "odd": "kernel_sm110_xqa_tree_fp8_paged_tmem_r16_q"
+        }
+      },
+      "source_cubin_sha256s": {
+        "kernel_sm110_xqa_tree_fp8_paged_tmem_r2": "dcc794ac0e70d5385c07b04ec0f1c83cdc09e3622b2a0585314e5fdf2c51264d",
+        "kernel_sm110_xqa_tree_fp8_paged_tmem_r2_q": "ada29236acb406f0e41c857449365fbadcc17128658f6a9cedb08c7fa33640de",
+        "kernel_sm110_xqa_tree_fp8_paged_tmem_r4": "47d968220e132ab200c17b7898f7a26f5a0c4cd613f42605224ca9b6b1cbe73c",
+        "kernel_sm110_xqa_tree_fp8_paged_tmem_r4_q": "2e83b08c87a1c96deb12fd35bccc3bc880130f1464c89ea5372bc0c2546b27b1",
+        "kernel_sm110_xqa_tree_fp8_paged_tmem": "3146887da213d3ef9e3f82431bf8f3246922a081fbffbd765325d8966881da57",
+        "kernel_sm110_xqa_tree_fp8_paged_tmem_q": "5ba1beea24f50db2ae0be490ba83703e6f98bd250d704d0b914f25a5e037d478",
+        "kernel_sm110_xqa_tree_fp8_paged_tmem_r16": "0b31c6cc76083832ed62d8db66f78eff8fa1a8e046f86e5f30ee9837a2d4b8d0",
+        "kernel_sm110_xqa_tree_fp8_paged_tmem_r16_q": "14e89481e97eadb02049b5d5e1df94e0698a5c0c89801c710ead58b0e8bc1414"
+      },
+      "form_selection": "kernel_symbols[ratio].even when ceil(q_len * ratio / 128) is even, else kernel_symbols[ratio].odd"
     }
   },
   "schema": "flashinfer.sm110_xqa.v1",
-  "shape_count": 12,
+  "shape_count": 18,
   "shape_denominator": [
     "tree_fp16_contiguous",
     "tree_fp16_paged",
@@ -1322,10 +2328,16 @@
     "tree_fp16_paged_mma_split",
     "tree_fp8_contiguous_mma",
     "tree_fp8_paged_mma",
+    "tree_fp16_contiguous_tmem",
+    "tree_fp16_paged_tmem",
+    "tree_fp8_contiguous_tmem",
+    "tree_fp8_paged_tmem",
+    "tree_fp8_contiguous_pair",
+    "tree_fp8_paged_pair",
     "decode_b1_c1024",
     "decode_b2_c512",
     "decode_b4_c256"
   ],
-  "shape_ledger_sha256": "e644edf9091922eceee831e2f69175bc89a3d751f27dadb8f1bbd60f6ad479f8",
+  "shape_ledger_sha256": "6ecbe26b531d2b0b7b8ae70f80185928394bdad7eb21d3d4b4f5b619b429dc8c",
   "validation_status": "source_only_unvalidated"
 }

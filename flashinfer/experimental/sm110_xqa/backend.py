@@ -14,7 +14,9 @@ import torch
 from ...utils import register_custom_op, register_fake_op
 from .jit import (
     MMA_ROUTE_SUFFIX,
+    PAIR_ROUTE_SUFFIX,
     SPLIT_ROUTE_SUFFIX,
+    TMEM_ROUTE_SUFFIX,
     TREE_KERNELS,
     gen_sm110_xqa_module,
     get_manifest,
@@ -272,7 +274,14 @@ def prepare(
     ``"register_mma_split"`` (the same Q tile, two eight-warp groups over the two
     KV halves with an in-CTA merge; frozen for FP16 page128 KV only) or
     ``"register_mma_auto"`` (``register_mma_split`` for FP16 page128 KV, the
-    ``register_mma`` route for every other D512 cache mode).
+    ``register_mma`` route for every other D512 cache mode), ``"tmem"`` (the
+    tcgen05/TMEM-accumulator schedule: 128-row Q tile x 256-column output half per
+    CTA, Q and K/V fetched once per thread-block cluster by TMA multicast; every
+    D512 cache mode, one frozen trace per GQA ratio 2/4/8/16), ``"pair"`` (the
+    ``cta_group::2`` pair schedule: a (4, 1, 1) cluster issues one MMA stream for
+    the two 128-row Q tiles of a KV head; E4M3 KV only, even Q-tile counts per
+    head, GQA ratios 2/4/8/16) or ``"auto"`` (``pair`` for E4M3 KV with an even
+    Q-tile count per head, ``tmem`` otherwise).
     Preparation performs compilation and may allocate output/scratch; call it
     before graph capture. D128 counters are zeroed once on the current stream;
     another launch stream must explicitly wait for that preparation stream.
@@ -280,9 +289,9 @@ def prepare(
     """
     _tensor(q, "q", dtype=torch.float16)
     require_sm110(q.device)
-    if kernel not in TREE_KERNELS + ("register_mma_auto",):
+    if kernel not in TREE_KERNELS + ("register_mma_auto", "auto"):
         raise ValueError(
-            f"kernel must be one of {TREE_KERNELS + ('register_mma_auto',)}"
+            f"kernel must be one of {TREE_KERNELS + ('register_mma_auto', 'auto')}"
         )
     if q.ndim not in (3, 4) or q.shape[-1] not in (128, 512):
         raise ValueError("q must be rank 3 or 4 with head dimension 128 or 512")
@@ -502,9 +511,27 @@ def prepare(
     layout = "paged" if page_table is not None else "contiguous"
     route = f"tree_{precision}_{layout}"
     fp16_paged = precision == "fp16" and layout == "paged"
+    q_tiles = (q_len * ratio + 127) // 128
+    if kernel == "auto":
+        # The cta_group::2 pair schedule for E4M3 KV when every KV head has an even number of
+        # 128-row Q tiles; the tcgen05/TMEM cluster-multicast schedule otherwise.
+        kernel = "pair" if precision == "fp8" and q_tiles % 2 == 0 else "tmem"
     if kernel == "register_mma_auto":
         kernel = "register_mma_split" if fp16_paged else "register_mma"
-    if kernel == "register_mma_split":
+    if kernel == "pair":
+        if precision != "fp8":
+            raise ValueError(
+                "pair is frozen for E4M3 KV (contiguous or page128); use tmem or auto for FP16 KV"
+            )
+        if q_tiles % 2:
+            raise ValueError(
+                "pair needs an even number of 128-row Q tiles per KV head "
+                "(ceil(q_len * ratio / 128)); use tmem or auto"
+            )
+        route += PAIR_ROUTE_SUFFIX
+    elif kernel == "tmem":
+        route += TMEM_ROUTE_SUFFIX
+    elif kernel == "register_mma_split":
         if not fp16_paged:
             raise ValueError(
                 "register_mma_split is frozen for FP16 page128 KV only; use "
@@ -514,9 +541,12 @@ def prepare(
     elif kernel == "register_mma":
         route += MMA_ROUTE_SUFFIX
     metadata = manifest["routes"][route]
+    # One CTA per (Q tile, output half); the pair route's (4, 1, 1) cluster covers two Q tiles.
+    tiles_per_cluster = metadata.get("q_tiles_per_cluster", 1)
+    route_tiles = (q_len * ratio + metadata["tile_rows"] - 1) // metadata["tile_rows"]
     grid = (
-        512 // metadata["output_tile_columns"],
-        heads * ((q_len * ratio + metadata["tile_rows"] - 1) // metadata["tile_rows"]),
+        (512 // metadata["output_tile_columns"]) * tiles_per_cluster,
+        heads * (route_tiles // tiles_per_cluster),
         batch,
     )
     run = _tree_op(route)

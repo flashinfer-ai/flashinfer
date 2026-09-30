@@ -70,6 +70,7 @@ def workspace_bytes_nvfp4(tokens: int, num_heads: int, num_segments: int) -> int
     num_tiles = _ceil_div(tokens, _BLOCK_M) + max(1, num_segments)
     partials = num_tiles * num_heads * MINIMAX_H3_HEAD_DIM
     counters = max(1, num_segments) * num_heads
+    barrier = 4  # grid-barrier word of the fused pre-processing launch
     return (
         q4
         + k4
@@ -78,7 +79,7 @@ def workspace_bytes_nvfp4(tokens: int, num_heads: int, num_segments: int) -> int
         + v_sf
         + vt4
         + qm
-        + 4 * (q_mean + mean_k + partials + counters)
+        + 4 * (q_mean + mean_k + partials + counters + barrier)
     )
 
 
@@ -199,6 +200,7 @@ def _zero_workspace(
         "mean_k",
         "partials",
         "counters",
+        "barrier",
     ),
 )
 def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
@@ -223,6 +225,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
     mean_k: torch.Tensor,
     partials: torch.Tensor,
     counters: torch.Tensor,
+    barrier: torch.Tensor,
     num_segments: int,
     num_tiles: int,
     num_qtiles: int,
@@ -252,6 +255,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_impl(
         mean_k,
         partials,
         counters,
+        barrier,
         num_segments,
         num_tiles,
         num_qtiles,
@@ -284,6 +288,7 @@ def _minimax_h3_sm120_varlen_attention_nvfp4_fake(
     mean_k: torch.Tensor,
     partials: torch.Tensor,
     counters: torch.Tensor,
+    barrier: torch.Tensor,
     num_segments: int,
     num_tiles: int,
     num_qtiles: int,
@@ -329,6 +334,19 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     route is an experimental precision/latency trade-off and is validated against the FP32 oracle
     with the FP4 block-scaled tolerance ``atol = 1.0, rtol = 0.1`` (see the tests), not the FP8
     operator's ``0.1``.
+
+    Performance ceiling of the attention launch (measured on RTX 5090 and RTX PRO 6000 Blackwell,
+    both GB202): the kernel needs 246 registers per thread, so one 8-warp CTA is resident per SM
+    (two warps per SM sub-partition) and each warp alternates a ~1400-cycle ``mxf4nvf4`` MMA burst
+    with a ~2700-cycle FP32 softmax / P-quantization phase that only the other warp's burst can
+    overlap.  The tensor pipe is therefore active ~58 % of the time and the launch runs at ~60 %
+    of the tensor-pipe floor on production plans (~55 % on 4096-token plans), against 84-88 % for
+    the MMA-only skeleton; L2 and DRAM are idle (L2 hit > 99 %).  Ping-pong barrier placement,
+    softmax emission order, FMA-pipe exp2, power-of-two P block scales, packed f16x2 P conversions,
+    a precomputed ``qm K^T`` compensation table, K/V multicast / DSM sharing, a 64-key 3-CTA
+    geometry and split-KV were each measured or bounded on both SKUs and none is faster within the
+    FP4 error budget, so the attention kernel is unchanged; the softmax dependency chain under the
+    two-warps-per-sub-partition register budget is the binding resource.
 
     Parameters
     ----------
@@ -401,6 +419,7 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
     counters = _zero_workspace(
         index, "counters", max(1, plan.num_segments) * heads, torch.uint32
     )
+    barrier = _zero_workspace(index, "barrier", 4, torch.uint32)
     _minimax_h3_sm120_varlen_attention_nvfp4_impl(
         q,
         k,
@@ -423,6 +442,7 @@ def minimax_h3_sm120_varlen_attention_nvfp4(
         mean_k,
         partials,
         counters,
+        barrier,
         plan.num_segments,
         num_stats_tiles,
         plan.num_tiles,

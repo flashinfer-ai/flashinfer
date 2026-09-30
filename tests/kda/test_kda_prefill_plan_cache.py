@@ -214,6 +214,49 @@ def test_hit_with_a_fresh_output_only_repoints_the_output_and_stays_bitwise():
     _assert_same(got, _snapshot(d))
 
 
+@pytest.mark.parametrize("fresh", ["out", "out+rows"])
+def test_apply_route_hit_with_a_fresh_output_re_encodes_its_tail_descriptors(fresh):
+    """The apply-route kernels TMA-store the output tail and in-place checkpoint
+    rows through prepared descriptors of CALLER storage.  A hit that moves the
+    output (serving allocates it per call) must land the tail in the new buffer
+    and leave the previous call's buffer untouched; before the fix the stale
+    descriptors kept writing into the old storage (an intermittent illegal
+    memory access in serving once that block was unmapped, silent stale output
+    otherwise)."""
+    cache = KDAPrefillPlanCache(8)
+    # one sequence with a 200-token tail after the 8192-token main window takes
+    # the split-sequence affine composite with the apply route
+    d = _inputs([8392], 16, seed=17)
+    d["state_checkpoints"] = torch.zeros_like(
+        d["state_checkpoints"], dtype=torch.float32
+    )
+    pool = d["pool"].clone()
+    miss = _run(d, cache)
+    assert "affine" in str(miss.schedule) and "apply" in str(miss.schedule)
+    previous = d
+    for _ in range(3):
+        previous["out"].zero_()
+        previous["state_checkpoints"].zero_()
+        d = dict(d, out=torch.empty_like(d["out"]))
+        if fresh == "out+rows":
+            d = dict(d, state_checkpoints=torch.zeros_like(d["state_checkpoints"]))
+        _run(d, cache)
+        torch.cuda.synchronize()
+        assert not previous["out"].any(), "the previous call's output received rows"
+        if fresh == "out+rows":
+            assert not previous["state_checkpoints"].any(), (
+                "the previous call's checkpoint rows received rows"
+            )
+        previous = d
+    assert (cache.misses, cache.hits) == (1, 3)
+    got = _snapshot(d)
+    d["pool"].copy_(pool)
+    d["state_checkpoints"].zero_()
+    for _ in range(4):
+        _run(d)
+    _assert_same(got, _snapshot(d))
+
+
 def test_deferred_part_rebinds_flush_before_another_hit_and_land_in_the_newest_output():
     """A composite hit defers its map/correction rebinds past the first chain kernel.
 
@@ -437,6 +480,41 @@ def test_packed_calls_take_the_affine_split_and_cache_bitwise(lengths):
     _run(d, cache)
     assert cache.hits == 1
     _assert_same(got, _snapshot(d))
+
+
+@pytest.mark.parametrize(
+    "lengths,heads", [([16384], 16), ([16384], 12), ([8192, 8192], 16)]
+)
+def test_strided_qkv_views_take_the_same_route_as_dense_bitwise(lengths, heads):
+    # Serving hands q / k / v over as split(dim=-1) views of one packed qkv row
+    # (token pitch > heads * 128).  The affine split gate must see the same
+    # route as the dense copies it used to receive, and the composite must
+    # produce the same bits from the views as from dense operands.
+    dense = _inputs(lengths, heads, seed=23)
+    pool = dense["pool"].clone()
+    dense_call = _run(dense)
+    dense_got = _snapshot(dense)
+    if len(lengths) == 1:
+        assert "affine" in str(dense_call.schedule)
+
+    strided = dict(dense)
+    tokens = sum(lengths)
+    packed = torch.zeros(
+        1, tokens, 4 * heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16
+    )
+    packed[:, :, 0:heads].copy_(dense["q"])
+    packed[:, :, heads : 2 * heads].copy_(dense["k"])
+    packed[:, :, 2 * heads : 3 * heads].copy_(dense["v"])
+    strided["q"] = packed[:, :, 0:heads]
+    strided["k"] = packed[:, :, heads : 2 * heads]
+    strided["v"] = packed[:, :, 2 * heads : 3 * heads]
+    assert not strided["q"].is_contiguous()
+    strided["out"] = torch.empty_like(dense["out"])
+    strided["state_checkpoints"] = torch.zeros_like(dense["state_checkpoints"])
+    dense["pool"].copy_(pool)
+    strided_call = _run(strided)
+    assert str(strided_call.schedule) == str(dense_call.schedule)
+    _assert_same(_snapshot(strided), dense_got)
 
 
 @pytest.mark.parametrize(

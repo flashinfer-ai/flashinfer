@@ -1,6 +1,6 @@
 # Copyright (c) 2026 KDA Team
 # SPDX-License-Identifier: MIT
-# Adapted from humanfia/kda-for-kda-release; see licenses/LICENSE.kda-for-kda.
+# Adapted from NVlabs/kda; see licenses/LICENSE.kda-for-kda.
 
 """Host work lists for persistent BT64 KDA CTAs."""
 

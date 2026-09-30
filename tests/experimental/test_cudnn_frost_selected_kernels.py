@@ -1173,9 +1173,15 @@ def _assert_block_scale_geometry_roundtrip(
             geometry = ast.literal_eval(constants[name])
             assert len(geometry) == 3 and all(value > 0 for value in geometry)
         assert "sm_107a" in constants["frost_compile_options"]
+        if (
+            record["contract"]["output_dtype"] in ("float4_e2m1fn_x2", "float8_e4m3fn")
+            and record["tactic"]["store_mode"] == "tma"
+        ):
+            assert constants["epi_chunk_elems"] == "32"
         family = (
             record["arch"],
             record["op"],
+            record["contract"]["output_dtype"],
             record["tactic"]["swap_ab"],
             record["tactic"]["store_mode"],
         )
@@ -1206,7 +1212,7 @@ def _assert_block_scale_geometry_roundtrip(
     # source paths must not accidentally mix activations or launch ABIs.
     assert all(len(paths) == 1 for paths in families.values())
     assert all(len(variants) == 1 for variants in source_families.values())
-    assert len(by_source) <= len(ACTIVATIONS) * 4 + 4
+    assert len(by_source) <= len(ACTIVATIONS) * 6 + 4
     assert sum(len(digests) for digests in by_source.values()) == len(records)
 
 
@@ -1506,7 +1512,7 @@ def test_mxfp8_reject_incompatible_scale_contract(tmp_path):
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("index", range(len(MXFP8_RECORDS)))
+@pytest.mark.parametrize("index", range(len(mxfp8.discover())))
 def test_mxfp8_grouped_kernel_and_graph_replay(index, monkeypatch):
     if torch.cuda.get_device_capability() != (10, 7):
         pytest.skip("packaged block-scale templates target SM107a")
@@ -1689,11 +1695,16 @@ def _pick_stage_pair(pool):
 @supported_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
-def test_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch):
-    _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch)
+@pytest.mark.parametrize("fc1_output", ["bf16", "fp8_stg", "fp8_tma"])
+def test_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, fc1_output):
+    _assert_mxfp8_moe_full_pipeline_and_graph(
+        name, swizzled, monkeypatch, fc1_output=fc1_output
+    )
 
 
-def _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, mixed=False):
+def _assert_mxfp8_moe_full_pipeline_and_graph(
+    name, swizzled, monkeypatch, mixed=False, fc1_output="bf16"
+):
     from flashinfer.fused_moe import (
         CutlassMxfp8Config,
         CutlassMxfp8Mxfp4Config,
@@ -1752,6 +1763,15 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, mixed
     weights = MoEWeightPack({f"cutlass_{dtype}": view})
     first, second = moe._kernels(t * k, h, i, e, xq.device, activation)
 
+    if fc1_output != "bf16":
+        first, _ = moe._kernels(
+            t * k, h, i, e, xq.device, activation, quantized_output=True
+        )
+        first = tuple(
+            kernel
+            for kernel in first
+            if kernel.tactic_metadata["store_mode"] == fc1_output.removeprefix("fp8_")
+        )
     selected = _pick_stage_pair(first), _pick_stage_pair(second)
     # Test full launch mechanics on small allocations independently of the
     # measured model-size shortlist. Admission is covered separately below.
@@ -1823,7 +1843,7 @@ def _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, mixed
 @supported_gpu
 def test_mxfp8_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
-        test_mxfp8_moe_full_pipeline_and_graph("swiglu", False, monkeypatch)
+        test_mxfp8_moe_full_pipeline_and_graph("swiglu", False, monkeypatch, "fp8_stg")
 
 
 def test_mxfp8_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
@@ -1836,10 +1856,19 @@ def test_mxfp8_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
 
 def _assert_moe_shortlist_buckets(moe, monkeypatch):
     key = ("sm_107a", "swiglu", 8, 4096, 14336, 2)
-    first = tuple(SimpleNamespace(artifact_id=f"first{j}") for j in range(3))
+    first = tuple(
+        SimpleNamespace(artifact_id=f"first{j}", tactic_metadata={"tile": f"tile{j}"})
+        for j in range(3)
+    )
     second = tuple(SimpleNamespace(artifact_id=f"second{j}") for j in range(3))
     monkeypatch.setattr(moe.common, "_arch_for", lambda device: "sm_107a")
-    monkeypatch.setattr(moe, "_kernels", lambda *args: (first, second))
+    monkeypatch.setattr(
+        moe,
+        "_kernels",
+        lambda *args, **kwargs: ((), ())
+        if kwargs.get("quantized_output")
+        else (first, second),
+    )
     table = {key: {128: (("first2", "first0"), ("second1", "second2"))}}
     monkeypatch.setattr(moe, "_read", lambda roots: table)
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm import (
@@ -1968,6 +1997,33 @@ def test_nvfp4_reject_incompatible_numerical_contract(change, tmp_path):
     (tmp_path / nvfp4.runtime._MANIFEST).write_text(json.dumps(payload))
     with pytest.raises(RuntimeError, match="numerical contract"):
         nvfp4.discover(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"intermediate_dtype": "float32"},
+        {"output_scale_layout": "F8_128x4"},
+        {"quant_scale_dtype": "bfloat16"},
+    ],
+)
+@pytest.mark.parametrize("store", ["stg", "tma"])
+def test_nvfp4_fused_manifest_rejects_changed_quantization(change, store, tmp_path):
+    root = nvfp4.runtime.artifact_root("nvfp4")
+    records = json.loads((root / nvfp4.runtime._MANIFEST).read_text())["kernels"]
+    record = next(
+        r
+        for r in records
+        if r["contract"]["output_dtype"] == "float4_e2m1fn_x2"
+        and r["tactic"]["store_mode"] == store
+    )
+    payload = {
+        "schema_version": 2,
+        "kernels": [record | {"contract": record["contract"] | change}],
+    }
+    (tmp_path / nvfp4.runtime._MANIFEST).write_text(json.dumps(payload))
+    with pytest.raises(RuntimeError, match="numerical contract"):
+        nvfp4.discover(tmp_path, quantized_output=True)
 
 
 @pytest.mark.parametrize("name", ACTIVATIONS)
@@ -2191,7 +2247,10 @@ def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
 @supported_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
-def test_nvfp4_moe_full_pipeline_and_dynamic_graph(name, swizzled, monkeypatch):
+@pytest.mark.parametrize("fc1_output", ["bf16", "fp4_stg", "fp4_tma"])
+def test_nvfp4_moe_full_pipeline_and_dynamic_graph(
+    name, swizzled, fc1_output, monkeypatch
+):
     from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
         moe,
     )
@@ -2252,6 +2311,15 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(name, swizzled, monkeypatch):
     act = MoEActivationPack(xq, xsf, ids, scores)
     weights = MoEWeightPack({"cutlass_nvfp4": view})
     first, second = moe._kernels(t * k, h, i, e, xq.device, activation)
+    if fc1_output != "bf16":
+        first, _ = moe._kernels(
+            t * k, h, i, e, xq.device, activation, quantized_output=True
+        )
+        first = tuple(
+            kernel
+            for kernel in first
+            if kernel.tactic_metadata["store_mode"] == fc1_output.removeprefix("fp4_")
+        )
     selected = _pick_stage_pair(first), _pick_stage_pair(second)
     monkeypatch.setattr(moe, "_selected_kernels", lambda *args: selected)
     runner = moe.CudnnFrostNvfp4MoeRunner(config, "cuda")
@@ -2301,9 +2369,248 @@ def test_nvfp4_moe_full_pipeline_and_dynamic_graph(name, swizzled, monkeypatch):
 
 
 @supported_gpu
-def test_nvfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
+@pytest.mark.parametrize("store", ["stg", "tma"])
+def test_nvfp4_moe_inference_mode_preparation_and_graph(store, monkeypatch):
     with torch.inference_mode():
-        test_nvfp4_moe_full_pipeline_and_dynamic_graph("swiglu", False, monkeypatch)
+        test_nvfp4_moe_full_pipeline_and_dynamic_graph(
+            "swiglu", False, f"fp4_{store}", monkeypatch
+        )
+
+
+@supported_gpu
+@pytest.mark.parametrize("tokens", [1, 17, 129])
+@pytest.mark.parametrize("mixed", [False, True])
+@pytest.mark.parametrize("store", ["stg", "tma"])
+def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
+    tokens, store, mixed, monkeypatch
+):
+    from flashinfer.fused_moe import (
+        CutlassMxfp8Config,
+        CutlassMxfp8Mxfp4Config,
+        QuantFormat,
+    )
+
+    dtype = "mxfp8_mxfp4" if mixed else "mxfp8"
+    moe = importlib.import_module(
+        f"flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.{dtype}.moe"
+    )
+    backend = CutlassMxfp8Mxfp4Config if mixed else CutlassMxfp8Config
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    torch.manual_seed(131)
+    h, i, e, k = 256, 256, 8, 2
+    activation = SwiGLU()
+    quant = QuantConfig(
+        QuantFormat.MXFP4 if mixed else QuantFormat.MXFP8, QuantFormat.MXFP8
+    )
+    config = replace(
+        bf16_config(topk=k, experts=e, intermediate=i),
+        quant=quant,
+        backend=BackendOptions((backend(),)),
+    )
+    x = torch.randn(tokens, h, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.randn(e, 2 * i, h, device="cuda", dtype=torch.bfloat16) * 0.1
+    w2 = torch.randn(e, h, i, device="cuda", dtype=torch.bfloat16) * 0.1
+    xq, xsf = backend.prepare_activations(x, quant=quant)
+    view = backend.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=e,
+        hidden_size=h,
+        intermediate_size=i,
+        activation=activation,
+    )
+    ids = torch.randint(0, e // 2, (tokens, k), device="cuda", dtype=torch.int32)
+    ids[::7, 0] = -1
+    scores = torch.rand(tokens, k, device="cuda")
+    act = MoEActivationPack(xq, xsf, ids, scores)
+    weights = MoEWeightPack({f"cutlass_{dtype}": view})
+    first, second = moe._kernels(tokens * k, h, i, e, xq.device, activation)
+    fused, _ = moe._kernels(
+        tokens * k, h, i, e, xq.device, activation, quantized_output=True
+    )
+    fused = next(
+        kernel for kernel in fused if kernel.tactic_metadata["store_mode"] == store
+    )
+    original = next(
+        kernel
+        for kernel in first
+        if kernel.tactic_metadata["tile"] == fused.tactic_metadata["tile"]
+    )
+    monkeypatch.setattr(
+        moe, "_selected_kernels", lambda *args: ((original, fused), second[:2])
+    )
+    runner_type = (
+        moe.CudnnFrostMxfp8Mxfp4MoeRunner if mixed else moe.CudnnFrostMxfp8MoeRunner
+    )
+    runner = runner_type(config, "cuda")
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(act, weights)
+    tactics = runner.get_valid_tactics(inputs, None)
+    baseline_tactic, fused_tactic = tactics[0], tactics[2]
+    plans = inputs.launch_state.plans
+    assert plans[baseline_tactic]["workspace_size"]() - plans[fused_tactic][
+        "workspace_size"
+    ]() == tokens * k * i * 2 + max(
+        original.workspace_bytes, second[0].workspace_bytes
+    ) - max(fused.workspace_bytes, second[0].workspace_bytes)
+
+    for input_scale_byte in (127, 60, 0):
+        # Include zero blocks and tiny values with E8M0 scale byte zero.
+        xsf.view(torch.uint8).fill_(input_scale_byte)
+        baseline = {
+            name: tensor.clone()
+            for name, tensor in moe.prepared_stage_inputs(
+                inputs, tactic=baseline_tactic
+            ).items()
+        }
+        actual = moe.prepared_stage_inputs(inputs, tactic=fused_tactic)
+        assert "fc1_output" not in actual
+        assert torch.equal(actual["offsets"], baseline["offsets"])
+        rows, columns = tokens * k, i // 32
+        logical_sf = []
+        for stage in (baseline, actual):
+            unpacked = torch.empty(rows, columns, device="cuda", dtype=torch.uint8)
+            starts = stage["offsets"].tolist() + [rows]
+            sf_start = 0
+            for begin, end in zip(starts, starts[1:], strict=False):
+                row = torch.arange(end - begin, device="cuda")[:, None]
+                col = torch.arange(columns, device="cuda")[None, :]
+                index = (
+                    sf_start * columns
+                    + (row // 128) * 128 * columns
+                    + (col // 4) * 512
+                    + (row % 32) * 16
+                    + ((row % 128) // 32) * 4
+                    + col % 4
+                )
+                unpacked[begin:end] = stage["fc2_token_scales"][index]
+                sf_start += (end - begin + 127) // 128 * 128
+            logical_sf.append(unpacked)
+        blocks = baseline["fc1_output"].cpu().double().reshape(rows, columns, 32)
+        exponents = torch.ceil(torch.log2(blocks.abs().amax(-1) / 448)).clamp(-127, 127)
+        expected_sf = (exponents + 127).to(torch.uint8)
+        assert torch.equal(logical_sf[0].cpu(), expected_sf)
+        reference = (
+            (blocks / torch.exp2(exponents).unsqueeze(-1))
+            .float()
+            .to(torch.float8_e4m3fn)
+            .reshape(rows, i)
+        )
+        torch.testing.assert_close(
+            baseline["fc2_tokens"].cpu().float(), reference.float(), rtol=0, atol=0
+        )
+        assert torch.equal(*logical_sf)
+        torch.testing.assert_close(
+            actual["fc2_tokens"].float(), baseline["fc2_tokens"].float(), rtol=0, atol=0
+        )
+
+
+@supported_gpu
+@pytest.mark.parametrize("tokens", [1, 17, 129])
+@pytest.mark.parametrize("store", ["stg", "tma"])
+def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
+    tokens, store, monkeypatch
+):
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.nvfp4 import (
+        moe,
+    )
+    from flashinfer.fused_moe import CutlassNvfp4Config, QuantFormat
+
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    monkeypatch.setenv("FLASHINFER_NVFP4_4OVER6", "0")
+    torch.manual_seed(131)
+    h, i, e, k = 256, 256, 8, 2
+    activation = SwiGLU()
+    quant = QuantConfig(QuantFormat.NVFP4, QuantFormat.NVFP4)
+    config = replace(
+        bf16_config(topk=k, experts=e, intermediate=i),
+        quant=quant,
+        backend=BackendOptions((CutlassNvfp4Config(),)),
+    )
+    x = torch.randn(tokens, h, device="cuda", dtype=torch.bfloat16)
+    w1 = torch.randn(e, 2 * i, h, device="cuda", dtype=torch.bfloat16) * 0.1
+    w2 = torch.randn(e, h, i, device="cuda", dtype=torch.bfloat16) * 0.1
+    xq, xsf = CutlassNvfp4Config.prepare_activations(x, quant=quant)
+    view = CutlassNvfp4Config.prepare_weights(
+        w1,
+        w2,
+        num_local_experts=e,
+        hidden_size=h,
+        intermediate_size=i,
+        activation=activation,
+    )
+    ids = torch.randint(0, e // 2, (tokens, k), device="cuda", dtype=torch.int32)
+    ids[::7, 0] = -1
+    scores = torch.rand(tokens, k, device="cuda")
+    act = MoEActivationPack(xq, xsf, ids, scores)
+    weights = MoEWeightPack({"cutlass_nvfp4": view})
+    first, second = moe._kernels(tokens * k, h, i, e, xq.device, activation)
+    fused, _ = moe._kernels(
+        tokens * k, h, i, e, xq.device, activation, quantized_output=True
+    )
+    fused = next(
+        kernel for kernel in fused if kernel.tactic_metadata["store_mode"] == store
+    )
+    original = next(
+        kernel
+        for kernel in first
+        if kernel.tactic_metadata["tile"] == fused.tactic_metadata["tile"]
+        and kernel.tactic_metadata["store_mode"] == "stg"
+    )
+    monkeypatch.setattr(
+        moe, "_selected_kernels", lambda *args: ((original, fused), second[:2])
+    )
+    runner = moe.CudnnFrostNvfp4MoeRunner(config, "cuda")
+    runner.check_support()
+    runner.build()
+    inputs = runner.pack_inputs(act, weights)
+    tactics = runner.get_valid_tactics(inputs, None)
+    baseline_tactic, fused_tactic = tactics[0], tactics[2]
+    plans = inputs.launch_state.plans
+    assert plans[baseline_tactic]["workspace_size"]() - plans[fused_tactic][
+        "workspace_size"
+    ]() == tokens * k * i * 2 + max(
+        original.workspace_bytes, second[0].workspace_bytes
+    ) - max(fused.workspace_bytes, second[0].workspace_bytes)
+
+    for global_scale in (1.0, 1.3, 3.7, 0.03125):
+        view["fc2_act_global_scale"].fill_(global_scale)
+        baseline = {
+            name: tensor.clone()
+            for name, tensor in moe.prepared_stage_inputs(
+                inputs, tactic=baseline_tactic
+            ).items()
+        }
+        actual = moe.prepared_stage_inputs(inputs, tactic=fused_tactic)
+        assert "fc1_output" not in actual
+        assert torch.equal(actual["offsets"], baseline["offsets"])
+        rows, columns = tokens * k, i // 16
+        logical_sf = []
+        for stage in (baseline, actual):
+            unpacked = torch.empty(rows, columns, device="cuda", dtype=torch.uint8)
+            starts = stage["offsets"].tolist() + [rows]
+            sf_start = 0
+            for begin, end in zip(starts, starts[1:], strict=False):
+                row = torch.arange(end - begin, device="cuda")[:, None]
+                col = torch.arange(columns, device="cuda")[None, :]
+                index = (
+                    sf_start * columns
+                    + (row // 128) * 128 * columns
+                    + (col // 4) * 512
+                    + (row % 32) * 16
+                    + ((row % 128) // 32) * 4
+                    + col % 4
+                )
+                unpacked[begin:end] = stage["fc2_token_scales"][index]
+                sf_start += (end - begin + 127) // 128 * 128
+            logical_sf.append(unpacked)
+        assert torch.equal(*logical_sf)
+        # Underflowed scales can produce different FP4 codes for zero values;
+        # those blocks dequantize to zero in both paths.
+        expected = _nvfp4_dequant(baseline["fc2_tokens"], logical_sf[0])
+        result = _nvfp4_dequant(actual["fc2_tokens"], logical_sf[1])
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
 def test_nvfp4_moe_shortlist_uses_measured_two_by_two_buckets(monkeypatch):
@@ -2348,12 +2655,39 @@ def _assert_packaged_shortlists_resolve_all_profiles(moe, monkeypatch):
                     "cpu",
                     ACTIVATIONS[name](),
                 )
-                assert len(first) == len(second) == 2
-                assert tuple(k.artifact_id for k in first) == identities[0]
+                assert 2 <= len(first) <= 6 and len(second) == 2
+                assert tuple(k.artifact_id for k in first[:2]) == identities[0]
                 assert tuple(k.artifact_id for k in second) == identities[1]
+                for kernel in first[2:]:
+                    assert kernel.quantizes_output and not kernel.swap_ab
+                    assert kernel.tactic_metadata["tile"] in {
+                        original.tactic_metadata["tile"] for original in first[:2]
+                    }
+                if first[2:]:
+                    variants = {
+                        (
+                            kernel.tactic_metadata["tile"],
+                            kernel.tactic_metadata["store_mode"],
+                        )
+                        for kernel in first[2:]
+                    }
+                    normal_tiles = {
+                        original.tactic_metadata["tile"]
+                        for original in first[:2]
+                        if not original.swap_ab
+                    }
+                    assert {(tile, "stg") for tile in normal_tiles} <= variants
+                    assert variants <= {
+                        (tile, store)
+                        for tile in normal_tiles
+                        for store in ("stg", "tma")
+                    }
                 assert all(k.fc1 and k.activation == name for k in first)
                 assert all(not k.fc1 for k in second)
-                assert len({(a.tactic, b.tactic) for a in first for b in second}) == 4
+                assert (
+                    len({(a.tactic, b.tactic) for a in first for b in second})
+                    == len(first) * 2
+                )
             previous = tokens
 
 
@@ -2448,15 +2782,20 @@ def test_mxfp8_mxfp4_grouped_kernel_extremes_and_graph(
 @supported_gpu
 @pytest.mark.parametrize("name", ACTIVATIONS)
 @pytest.mark.parametrize("swizzled", [False, True])
-def test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(name, swizzled, monkeypatch):
-    _assert_mxfp8_moe_full_pipeline_and_graph(name, swizzled, monkeypatch, mixed=True)
+@pytest.mark.parametrize("fc1_output", ["bf16", "fp8_stg", "fp8_tma"])
+def test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(
+    name, swizzled, monkeypatch, fc1_output
+):
+    _assert_mxfp8_moe_full_pipeline_and_graph(
+        name, swizzled, monkeypatch, mixed=True, fc1_output=fc1_output
+    )
 
 
 @supported_gpu
 def test_mxfp8_mxfp4_moe_inference_mode_preparation_and_graph(monkeypatch):
     with torch.inference_mode():
         test_mxfp8_mxfp4_moe_full_pipeline_and_dynamic_graph(
-            "swiglu", False, monkeypatch
+            "swiglu", False, monkeypatch, "fp8_tma"
         )
 
 

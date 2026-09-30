@@ -184,7 +184,7 @@ def test_decode_q1(num_heads, kv_lens):
         (12, [1, 5, 8, 3], [300, 1500, 64, 129]),
         (12, [5, 2], [1500, 2600]),  # 60 query rows -> the 64-row tile
         (96, [4, 4], [2048, 333]),
-        (96, [4, 3], [20000, 16385]),  # two-CTA wide route (rows > 64, KV >= 16384)
+        (96, [4, 3], [20000, 16385]),  # two-CTA wide route (rows > 64, KV >= 8192)
     ],
 )
 def test_mtp_variable_q(num_heads, q_lens, kv_lens):
@@ -206,7 +206,8 @@ def test_incremental_prefill_prefix_reuse():
         2, [384, 97], [4096 + 384, 97 + 1000], 12, seed=645006, device=device
     )
     out = _run(case)
-    _check(out, _reference(case), atol=5e-3, rtol=2e-2)
+    # Uniform-profile contract tolerance of the Cake route (FP32 reference): atol 0.01 / rtol 0.02.
+    _check(out, _reference(case), atol=1e-2, rtol=2e-2)
 
 
 def test_prefill_wide_route():
@@ -216,7 +217,7 @@ def test_prefill_wide_route():
     # wide route with per-row causal tails (bottom-right aligned) and a planned KV split.
     case = _make_case(1, [512], [32768], 12, seed=645402, device=device)
     out = _run(case)
-    _check(out, _reference(case), atol=5e-3, rtol=2e-2)
+    _check(out, _reference(case), atol=1e-2, rtol=2e-2)
 
 
 def test_route_selection():
@@ -248,13 +249,15 @@ def test_route_selection():
             max_seq_len=int(case["block_tables"].shape[1]) * PAGE,
         )
 
-    # 96 rows, longest KV 20000 -> wide route: one two-CTA cluster per (split, tile, request).
+    # 96 rows, longest KV 20000 -> wide route: a flat grid of two-CTA clusters, num_split per (tile, request) item
+    # (two items, fewer than the SM pairs: nothing runs unsplit).
     wide = runner(_make_case(2, [1, 1], [20000, 300], 96, seed=1, device=device))
     assert wide.route_metadata["route"] == "wide" and wide.rt is None
-    assert wide.plan["grid_main"] == (2 * wide.num_split, 1, 2)
-    # 96 rows but longest KV below 16384 -> row tiles (lazy-E4M3 precision gate of the wide route).
-    # max_seq_len is the page-rounded table width, so the longest KV must stay below 16384 pages-wise.
-    short = runner(_make_case(2, [1, 1], [16000, 300], 96, seed=2, device=device))
+    assert wide.plan["n_full_items"] == 0
+    assert wide.plan["grid_main"] == (2 * 2 * wide.num_split, 1, 1)
+    # 96 rows but longest KV below 8192 -> row tiles (lazy-E4M3 precision gate of the wide route).
+    # max_seq_len is the page-rounded table width, so the longest KV must stay below 8192 pages-wise.
+    short = runner(_make_case(2, [1, 1], [8000, 300], 96, seed=2, device=device))
     assert short.route_metadata["route"] == "swapped" and short.rt == 96
     # 12 rows -> the 16-row tile whatever the KV.
     small = runner(_make_case(1, [1], [40000], 12, seed=3, device=device))
@@ -347,6 +350,12 @@ def test_unsupported_options_rejected():
         # B300 (160 SMs = 80 pairs).
         (6, 467751, 160, 13),
         (8, 342305, 160, 10),
+        # GB300 NVL72 (152 SMs = 76 pairs): 19 splits = two full waves ran 286 us against 9 splits =
+        # one wave at 278 us on the 8-request H96 decode row; the 16-cluster MTP row 14 -> 9 splits
+        # (528 -> 516 us) and the 48-cluster MTP row 11 -> 3 splits (1552 -> 1486 us).
+        (8, 342305, 152, 9),
+        (16, 342305, 152, 9),
+        (48, 342305, 152, 3),
     ],
 )
 def test_wide_split_plan_fills_one_wave(clusters, max_seq_len, sm_count, expected):
@@ -356,9 +365,33 @@ def test_wide_split_plan_fills_one_wave(clusters, max_seq_len, sm_count, expecte
         plan_num_split_wide,
     )
 
-    assert WIDE_WAVE_COST_TILES == 8
+    assert WIDE_WAVE_COST_TILES == 16
     splits = plan_num_split_wide(clusters, max_seq_len, sm_count)
     assert splits == expected
     assert -(-(clusters * splits) // (sm_count // WIDE_CLUSTER)) <= 2
     # Without the per-wave term the pure wave model prefers three waves of 99 tiles on this row.
     assert plan_num_split_wide(6, 467751, 148, wave_cost_tiles=0) == 37
+    # The former 8-tile term let two full waves of 141 tiles beat one wave of 298 on 152 SMs.
+    assert plan_num_split_wide(8, 342305, 152, wave_cost_tiles=8) == 19
+
+
+@pytest.mark.parametrize(
+    ("clusters", "max_seq_len", "sm_count", "expected"),
+    [
+        # prefill_h12_b1 on 148 SMs: two full waves of 74 unsplit items, the 44 tail items split five ways
+        # (the r50 forced-split sweep measured uniform 3 splits flat and 5 splits 3.5 % slower than unsplit).
+        (192, 131072, 148, (148, 5)),
+        # prefill_h96_b2: ten full waves, the 28 tail items split in two (one wave of 56).
+        (768, 32768, 148, (740, 2)),
+        # prefill_h96_b1: the last wave holds 56 of 74 pairs; the predicted gain is under the 2 % margin.
+        (1536, 131072, 148, (0, 1)),
+        # Decode rows (fewer items than pairs) keep the uniform one-wave plan.
+        (8, 342305, 148, (0, 9)),
+        (48, 342305, 148, (0, 3)),
+    ],
+)
+def test_wide_tail_plan(clusters, max_seq_len, sm_count, expected):
+    from flashinfer.mla.cake_kimi_k3_mla import plan_wide_work
+
+    assert plan_wide_work(clusters, max_seq_len, sm_count) == expected
+    assert plan_wide_work(clusters, max_seq_len, sm_count, forced_split=3) == (0, 3)

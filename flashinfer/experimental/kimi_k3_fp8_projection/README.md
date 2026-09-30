@@ -24,12 +24,14 @@ Every launch of the call is a generated Cake program:
 
 | Route (host dispatch) | Programs | When |
 | --- | --- | --- |
-| quantization launch + persistent 2-CTA GEMM | `quant:u<units>`, `gemm` | `M > 256`, and the tabulated `(N, K)` families whose measured best route is the GEMM |
-| quantization launch + decode | `quant:u1`, `decode:t<tok>_p<stages>` | `M <= 256`, measured table entry with `fused = false` |
-| fused decode | `decode:t<tok>_p<stages>_fused[_res]` | `M <= 256`, measured table entry with `fused = true` (the token tile is quantized in-CTA; `_res` keeps the quantized token tiles resident for `K <= 256`) |
+| quantization launch + persistent 2-CTA GEMM | `quant:u<units>`, `gemm_tstore` (16-byte aligned output base and a row stride that is a multiple of 8 elements: TMA-store epilogue) or `gemm` (other strides: register epilogue) | `M > 256` unless the family is tabulated for the decode kernel at that row count, and the tabulated `(N, K)` families whose measured best route is the GEMM |
+| quantization launch + decode | `quant:u1`, `decode:t<tok>_p<stages>` | measured table entry with `fused = false` |
+| fused decode | `decode:t<tok>_p<stages>_fused[_res]` | measured table entry with `fused = true` (the token tile is quantized in-CTA; `_res` keeps the quantized token tiles resident for `K <= 256`); above 256 rows only the single-N-tile families (`f_a`, `b_proj`) are tabulated |
 
 `decode_table.py` is the measured per-architecture dispatch table
-(`"<n_tiles128>,<num_k_iters>,<m_bucket>"`, buckets `M <= 1 / 8 / 64 / 256`)
+(`"<n_tiles128>,<num_k_iters>,<m_bucket>"`, buckets `M <= 1 / 8 / 64 / 256` for
+every family and `M <= 4096 / 16384` for the families measured faster on the
+decode kernel than on the GEMM)
 over the 22 representative families (TP8 and TP1 `q_proj`, `fused_qkvg`,
 `in_proj_qkvgfab`, `f_a`, `f_b`, `b_proj`, `kv_a`, `fused_qkv_a`, `q_b`,
 `kv_b`, `o_proj`); it is generated from the Cake sweeps and mirrors the

@@ -16,7 +16,7 @@ sequence of generated tcgen05 programs:
 | --- | --- | --- |
 | `patch_embed` | `gemm:pos_sqxw:*` | `x = bf16(pixels[T, 588] @ Wpe^T) + pos_rows` (Conv2d 14x14/14 as a GEMM, bilinear-resized 64x64 positional table + sincos time rows) + handoff `xw = bf16(x * norm0[0])`, `stats = rowsumsq(x)` |
 | `layer_norm_qkv_rope` (x27) | `gemm:norm_qkv_rope:*_cs` | `q, k, v = RoPE2D(bf16((xw @ Wqkv^T) * rstd(x)))`: the RMSNorm weight applied on the activation side by the producer (`xw`), row `rstd` from the FP32 `stats` handoff, original `Wqkv`, interleaved-pair 2-D RoPE in the epilogue from the packed f16x2 `(cos, sin)` table of the plan (`pack_rope_table`; FP32 rotation), head-split outputs |
-| `layer_attention` (x27) | `attention:tiles2` / `attention:tiles1` | packed-varlen noncausal attention per `grid_thw` segment, 12 heads x 128, FP32 softmax, one BF16 rounding |
+| `layer_attention` (x27) | `attention:tiles2` / `attention:tiles1` / `attention:ring3` | packed-varlen noncausal attention per `grid_thw` segment, 12 heads x 128, FP32 softmax, one BF16 rounding; `ring3` = the one-tile layout with the shared-O three-deep score ring (`cake_backend.ring3_selected`: every one-tile row on SM100, 576..10764-token segments on SM103) |
 | `layer_out_proj` (x27) | `gemm:residual_wo_sqxw:*` | `x += bf16(a @ Wo^T)` + handoff `xw = bf16(x * norm1)`, `stats` |
 | `layer_norm_fc0_gelu` (x27) | `gemm:norm_gelu:*` | `f = bf16(gelu_tanh(bf16((xw @ Wfc0^T) * rstd(x))))`, original `Wfc0` |
 | `layer_fc1` (x26) / `layer_fc1_last` (x1) | `gemm:residual_fc1_sqxw:*` / `gemm:residual_fc1:*` | `x += bf16(f @ Wfc1^T)` + handoff `xw = bf16(x * norm0[l+1])`, `stats`; the last layer runs the plain form (the merge reads `x` directly) |
@@ -28,11 +28,16 @@ sequence of generated tcgen05 programs:
 projector's post norm (`1e-5`). `*` is the production tile configuration the
 host selects per token count (`cake_backend.select_tile_config`, the Cake
 `kimi_k3_vision_gemm` policy: 128x64 / 128x128 single-CTA tiles and a split-K
-cluster for small `T`, 256x256 / 256x128 2-CTA pair tiles above 1024 rows; the
-residual / pos forms run their packed bf16x2-epilogue twins `*_p` / `*_pf`
-with the pre-mainloop residual prefetch, the QKV GEMM its packed-RoPE-table
-twins `*_cs`); the attention unit layout is chosen per `grid_thws` batch from
-the LPT makespans of both layouts (`cake_backend.select_tiles_per_cta`).
+cluster for small `T`, the single-CTA 128x128 eight-warp tile `s_e8_pf` for
+the residual GEMMs while the pair grid underfills the machine (out-proj to
+6144 rows, FC1 to 2304), 256x256 / 256x128 2-CTA pair tiles above (the
+out-proj pair tile is the TMA-epilogue twin `m_tma1`); the residual / pos
+forms run their packed bf16x2-epilogue twins `*_p` / `*_pf` with the
+pre-mainloop residual prefetch, the QKV GEMM its packed-RoPE-table twins
+`*_cs`); the attention unit layout is chosen per `grid_thws` batch from the
+LPT makespans of both layouts (`cake_backend.select_tiles_per_cta`) and the
+one-tile layout's kernel form per architecture and longest segment
+(`cake_backend.ring3_selected`).
 
 Programmatic dependent launch: the registered programs follow the Cake
 production PDL default (`KIMI_K3_VISION_TOWER_PDL`, on since the round-2

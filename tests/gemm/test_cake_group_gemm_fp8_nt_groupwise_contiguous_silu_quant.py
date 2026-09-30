@@ -12,13 +12,24 @@ from flashinfer.gemm import (
 )
 from flashinfer.gemm.cake_grouped_fp8_fused_silu_quant import (
     ACT_ROUTE,
+    ACT_ROUTES,
+    ACT_WIDE_MIN_ITEMS,
+    ACT_WIDE_ROUTE,
+    FUSED_MIXED_ROUTE,
     FUSED_ROUTE,
+    FUSED_ROUTES,
     GEMM_BACKEND_CAKE,
     GEMM_BACKEND_CUTE,
     SMALL_M_MAX,
+    act_items,
+    fused_tile_counts,
     is_group_gemm_fp8_nt_groupwise_contiguous_silu_quant_prepared_available,
     launch_plan,
+    mixed_clusters,
+    routing_blocks,
+    select_route,
     small_m_gemm_backend,
+    tail_launch_grid,
 )
 from flashinfer.quantization import per_token_group_quant_8bit
 
@@ -105,19 +116,53 @@ def _reference_gemm(a, b, a_scale, b_scale, m_indices):
     return out.to(torch.bfloat16)
 
 
-def _reference_activation(y_bf16):
-    """FlashInfer chain arithmetic in torch: BF16 gate/up halves, FP32 SwiGLU, BF16 activation."""
+def _reference_halves(y_bf16):
+    """The BF16 gate and up halves of the reference GEMM output, as FP32 tensors."""
     h = y_bf16.shape[1] // 2
-    g = y_bf16[:, :h].float()
-    u = y_bf16[:, h:].float()
-    act = (g * torch.sigmoid(g) * u).to(torch.bfloat16).float()
-    return g, u, act
+    return y_bf16[:, :h].float(), y_bf16[:, h:].float()
 
 
-def _reference_group_scales(act):
-    m, h = act.shape
-    absmax = act.reshape(m, h // GROUP_SIZE, GROUP_SIZE).abs().amax(dim=-1)
-    return (absmax.clamp_min(EPS) / 448.0).contiguous()
+def _bf16_step(x, direction):
+    """The BF16 neighbour of every element of ``x`` (bfloat16, finite) one ulp
+    toward +inf (``direction`` 1) or -inf (``direction`` -1)."""
+    bits = x.contiguous().view(torch.int16)
+    if direction > 0:
+        stepped = torch.where(bits >= 0, bits + 1, bits - 1)
+        # -0.0 steps to the smallest positive value
+        stepped = torch.where(bits == -(2**15), torch.ones_like(bits), stepped)
+    else:
+        stepped = torch.where(bits > 0, bits - 1, bits + 1)
+        # +0.0 steps to the smallest negative value
+        stepped = torch.where(bits == 0, torch.full_like(bits, -(2**15 - 1)), stepped)
+    return stepped.view(torch.bfloat16)
+
+
+def _activation_envelope(g, u):
+    """Per element, the BF16 interval ``[lo, hi]`` of activations a kernel can
+    produce whose gate and up halves each lie within one BF16 ulp of the
+    reference halves ``g`` and ``u``.
+
+    The kernel accumulates its FP32 dot products in a different order from
+    :func:`_reference_gemm`, so each of its BF16 halves is the reference value
+    or one of its two BF16 neighbours (nine gate/up candidates).  Its FP32
+    SwiGLU (``ex2.approx`` / ``rcp.approx``) can round a candidate's product to
+    a neighbouring BF16 activation, so the envelope extends one BF16 ulp
+    beyond the candidates' extremes.  (A half that is tiny through cancellation
+    can differ by more ulps of its own magnitude, but it lies far below the
+    group's quantization step and cannot set the group's absmax.)
+    """
+    g16, u16 = g.to(torch.bfloat16), u.to(torch.bfloat16)
+    gates = (_bf16_step(g16, -1), g16, _bf16_step(g16, 1))
+    ups = (_bf16_step(u16, -1), u16, _bf16_step(u16, 1))
+    lo = hi = None
+    for gate in gates:
+        gate = gate.float()
+        silu = gate * torch.sigmoid(gate)
+        for up in ups:
+            act = (silu * up.float()).to(torch.bfloat16)
+            lo = act if lo is None else torch.minimum(lo, act)
+            hi = act if hi is None else torch.maximum(hi, act)
+    return _bf16_step(lo, -1).float(), _bf16_step(hi, 1).float()
 
 
 def _e4m3_spacing(q):
@@ -126,34 +171,43 @@ def _e4m3_spacing(q):
     return torch.pow(2.0, exponent.float() - 4.0)
 
 
-def _assert_quantizes_reference(out_q, out_s, g, u, act):
+def _assert_quantizes_reference(out_q, out_s, g, u):
     """Definition check against the torch reference, independent of any FlashInfer kernel.
 
-    The reference GEMM accumulates in a different order, so its BF16 gate/up halves may differ
-    from the kernel's by one BF16 ulp: the group scales move by at most 2**-7 relative and the
-    activation by 2**-6 * |g| * |u| + 2**-7 * |act|.  Round-to-nearest quantization then places
-    the dequantized value within half an E4M3 spacing of the activation, whichever side of a
-    rounding boundary the kernel lands on.
+    :func:`_activation_envelope` encloses every BF16 activation of a kernel whose
+    gate and up halves are within one BF16 ulp of the reference halves.  The
+    group scale ``max(absmax, EPS) / 448`` (an FP32 division, as in the kernel)
+    therefore lies between the scales of the envelope's smallest and largest
+    magnitudes, and round-to-nearest quantization ``q = act * (1 / scale)``
+    places the dequantized value within half an E4M3 spacing of the envelope
+    plus the two FP32 roundings of the reciprocal-multiply.
     """
     m, h = out_q.shape
-    ref_s = _reference_group_scales(act)
+    lo, hi = _activation_envelope(g, u)
+    straddles_zero = (lo <= 0) & (hi >= 0)
+    magnitude_lo = torch.where(
+        straddles_zero, torch.zeros_like(lo), torch.minimum(lo.abs(), hi.abs())
+    )
+    magnitude_hi = torch.maximum(lo.abs(), hi.abs())
+    grouped = (m, h // GROUP_SIZE, GROUP_SIZE)
+    scale_lo = magnitude_lo.reshape(grouped).amax(dim=-1).clamp_min(EPS) / 448.0
+    scale_hi = magnitude_hi.reshape(grouped).amax(dim=-1).clamp_min(EPS) / 448.0
     assert torch.isfinite(out_s).all()
-    torch.testing.assert_close(
-        out_s, ref_s.reshape(out_s.shape), atol=0.0, rtol=2.0**-7
+    s = out_s.reshape(m, h // GROUP_SIZE)
+    outside = (s < scale_lo) | (s > scale_hi)
+    excess_rel = torch.maximum((scale_lo - s) / scale_lo, (s - scale_hi) / scale_hi)
+    assert not bool(outside.any()), (
+        f"{int(outside.sum())} group scales outside the one-ulp envelope "
+        f"(max relative excess {float(excess_rel.max()):.3e})"
     )
-    s = (
-        out_s.reshape(m, h // GROUP_SIZE, 1)
-        .expand(m, h // GROUP_SIZE, GROUP_SIZE)
-        .reshape(m, h)
-    )
+    s = s.reshape(m, h // GROUP_SIZE, 1).expand(grouped).reshape(m, h)
     dequantized = out_q.float() * s
     assert torch.isfinite(dequantized).all()
-    bound = (
-        0.5 * _e4m3_spacing(out_q) * s
-        + 2.0**-6 * g.abs() * u.abs()
-        + 2.0**-7 * act.abs()
+    distance = torch.clamp(lo - dequantized, min=0.0) + torch.clamp(
+        dequantized - hi, min=0.0
     )
-    excess = (dequantized - act).abs() - bound
+    bound = (0.5 * _e4m3_spacing(out_q) + 2.0**-22 * out_q.float().abs()) * s
+    excess = distance - bound
     violations = int((excess > 0).sum())
     assert violations == 0, (
         f"{violations} elements exceed the quantization bound "
@@ -242,17 +296,32 @@ ROUTING_CASES = [
         [384] * 8 + [128] * 8, 2048, 4096, False, id="wide_ep32_gate_up_all_odd"
     ),
     pytest.param([512] * 16, 2048, 4096, False, id="m8192_max"),
+    # odd-tail coverage: every expert one block (all odd tails, M = 2048 route boundary) and a mixed routing with
+    # twelve odd-block experts plus two empty experts
+    pytest.param([128] * 16, 2048, 4096, False, id="wide_ep32_gate_up_all_one_block"),
+    pytest.param(
+        [640, 128, 384, 0, 896, 128, 384, 256, 128, 0, 384, 128, 256, 128, 128, 128],
+        2048,
+        4096,
+        True,
+        id="wide_ep32_gate_up_mixed_tail",
+    ),
+    # two odd-block experts: 16 odd-tail units fit on the free SMs, so the fused route (pair + tail kernels) keeps the row
+    pytest.param(
+        [128, 384] + [256] * 14, 2048, 4096, False, id="wide_ep32_gate_up_two_odd"
+    ),
 ]
 
 
 @pytest.mark.parametrize("group_counts,n2,k,arbitrary_scales", ROUTING_CASES)
 def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_scales):
     device = torch.device("cuda")
+    seed = 662 + len(group_counts) + n2 + k
     a, b, a_scale, b_scale, m_indices = _make_inputs(
         group_counts,
         n2,
         k,
-        seed=662 + len(group_counts) + n2 + k,
+        seed=seed,
         device=device,
         arbitrary_scales=arbitrary_scales,
     )
@@ -260,34 +329,47 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
         a, b, a_scale, b_scale, m_indices, validate_indices=True
     )
     m = sum(group_counts)
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    # validate_indices=True hands the routing to the routing-aware rule: large rows take the route the fitted makespan
+    # model picks (pair + tail, mixed schedule or GEMM + wide act) unless the legacy odd-tail rule's route is within
+    # ROUTE_MODEL_MARGIN of it
+    expected_route = select_route(
+        m, n2, sm_count=sm_count, group_blocks=routing_blocks(group_counts), k=k
+    )
+    assert prepared.route == expected_route
+    # GEMM + act kernel, or pair kernel + PDL tail kernel; the mixed-schedule route is one kernel
+    assert prepared.num_kernels == (1 if prepared.route == FUSED_MIXED_ROUTE else 2)
     if m < SMALL_M_MAX:
         assert prepared.route == ACT_ROUTE
-        assert prepared.num_kernels == 2
+    if prepared.route in ACT_ROUTES:
         assert prepared.gemm_backend == small_m_gemm_backend(m, n2, k)
         assert prepared.gemm_backend == (
             GEMM_BACKEND_CAKE if (m % 128 and k >= 1024) else GEMM_BACKEND_CUTE
         )
-    else:
-        assert prepared.route == FUSED_ROUTE
-        assert prepared.num_kernels == 1
+        assert prepared.tail_grid is None
+    elif prepared.route == FUSED_ROUTE:
         assert prepared.gemm_backend is None
+        assert prepared.tail_grid is not None and prepared.tail_grid[0] >= 1
+    else:
+        assert prepared.route == FUSED_MIXED_ROUTE
+        assert prepared.gemm_backend is None
+        assert prepared.tail_grid is None and set(prepared.stage_grids) == {"main"}
     out_q, out_s = prepared.launch()
     torch.cuda.synchronize()
-    g, u, act = _reference_activation(
-        _reference_gemm(a, b, a_scale, b_scale, m_indices)
-    )
-    _assert_quantizes_reference(out_q, out_s, g, u, act)
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q, out_s, g, u)
     # Contents may change between launches of the same prepared object.
-    a.copy_(torch.randn(a.shape, device=device).to(torch.float8_e4m3fn))
+    refill = torch.Generator(device=device).manual_seed(seed + 1)
+    a.copy_(
+        torch.randn(a.shape, generator=refill, device=device).to(torch.float8_e4m3fn)
+    )
     out_q2, out_s2 = prepared()
     torch.cuda.synchronize()
     assert (
         out_q2.data_ptr() == out_q.data_ptr() and out_s2.data_ptr() == out_s.data_ptr()
     )
-    g, u, act = _reference_activation(
-        _reference_gemm(a, b, a_scale, b_scale, m_indices)
-    )
-    _assert_quantizes_reference(out_q2, out_s2, g, u, act)
+    g, u = _reference_halves(_reference_gemm(a, b, a_scale, b_scale, m_indices))
+    _assert_quantizes_reference(out_q2, out_s2, g, u)
 
 
 @pytest.mark.parametrize("group_counts,n2,k,arbitrary_scales", ROUTING_CASES)
@@ -307,6 +389,12 @@ def test_prepared_matches_flashinfer_chain(group_counts, n2, k, arbitrary_scales
     ).launch()
     torch.cuda.synchronize()
     _assert_matches(out_q, out_s, chain_q, chain_s)
+    # with the routing known, the routing-aware rule may pick the GEMM + act or the mixed-schedule route instead
+    out_q, out_s = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    ).launch()
+    torch.cuda.synchronize()
+    _assert_matches(out_q, out_s, chain_q, chain_s)
 
 
 @pytest.mark.parametrize(
@@ -315,6 +403,40 @@ def test_prepared_matches_flashinfer_chain(group_counts, n2, k, arbitrary_scales
         pytest.param([256] * 16, 2048, 4096, FUSED_ROUTE, id="fused_wide"),
         pytest.param([256] * 8, 256, 512, FUSED_ROUTE, id="fused_at_threshold"),
         pytest.param([256] * 4 + [128, 100], 512, 1024, ACT_ROUTE, id="small_m"),
+        # routing-aware rule: the expected route is whatever the makespan-model rule selects
+        pytest.param(
+            [256, 0, 512, 0, 384, 640, 128, 384, 256, 0, 128, 128, 384, 384, 512, 0],
+            2048,
+            4096,
+            None,
+            id="wide_random_aligned",
+        ),
+        pytest.param([384] * 8 + [128] * 8, 2048, 4096, None, id="wide_all_odd"),
+        pytest.param([128] * 16, 2048, 4096, None, id="wide_all_one_block"),
+        pytest.param(
+            [
+                640,
+                128,
+                384,
+                0,
+                896,
+                128,
+                384,
+                256,
+                128,
+                0,
+                384,
+                128,
+                256,
+                128,
+                128,
+                128,
+            ],
+            2048,
+            4096,
+            None,
+            id="wide_mixed_tail",
+        ),
     ],
 )
 def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
@@ -322,20 +444,160 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     a, b, a_scale, b_scale, m_indices = _make_inputs(
         group_counts, n2, k, seed=664, device=device
     )
-    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
-        a, b, a_scale, b_scale, m_indices
-    )
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     m = sum(group_counts)
-    route, grid = launch_plan(m, n2, sm_count=sm_count)
-    assert route == expected_route
+    blocks = routing_blocks(group_counts)
+    # without the routing the plan is shape-only; with it (and K) the routing-aware rule applies
+    shape_route, _ = launch_plan(m, n2, sm_count=sm_count, k=k)
+    assert shape_route == select_route(m, n2, sm_count=sm_count, k=k)
+    if expected_route is not None:
+        assert shape_route == expected_route
+    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
+    assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
+    if m < SMALL_M_MAX:
+        assert route == ACT_ROUTE
+    prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices, validate_indices=True
+    )
     assert (prepared.route, prepared.grid) == (route, grid)
+    unvalidated = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
+        a, b, a_scale, b_scale, m_indices
+    )
+    assert (unvalidated.route, unvalidated.grid) == launch_plan(
+        m, n2, sm_count=sm_count, k=k
+    )
     if route == FUSED_ROUTE:
         assert grid[0] % 2 == 0 and grid[0] <= 128
+        tail = tail_launch_grid(m, n2, sm_count=sm_count)
+        assert prepared.tail_grid == tail and 1 <= tail[0] <= sm_count
+        assert set(prepared.stage_grids) == {"pair", "tail"}
+    elif route == FUSED_MIXED_ROUTE:
+        pair_tiles, odd_units = fused_tile_counts(n2, blocks)
+        clusters = mixed_clusters(pair_tiles, odd_units, sm_count=sm_count)
+        assert clusters >= 1  # one cluster per pair tile or solo unit up to the cap
+        assert grid == (2 * clusters, 1, 1) and grid[0] <= 128
+        assert prepared.tail_grid is None
+        assert set(prepared.stage_grids) == {"main"}
+        assert prepared.num_kernels == 1
     else:
-        items = m * (n2 // 2 // GROUP_SIZE)
-        assert 1 <= grid[0] <= max(1, -(-items // 4))
-        assert grid[0] <= 16 * sm_count
+        assert prepared.tail_grid is None
+        assert route in ACT_ROUTES
+        items = act_items(m, n2)
+        if route == ACT_WIDE_ROUTE:
+            assert m >= SMALL_M_MAX and items >= ACT_WIDE_MIN_ITEMS
+            assert 1 <= grid[0] <= max(1, -(-items // 16))
+            assert grid[0] <= 10 * sm_count
+        else:
+            assert 1 <= grid[0] <= max(1, -(-items // 4))
+            assert grid[0] <= 16 * sm_count
+
+
+def test_routing_blocks_and_fused_tile_counts():
+    counts = [256, 0, 512, 0, 384, 640, 128, 384, 256, 0, 128, 128, 384, 384, 512, 0]
+    blocks = routing_blocks(counts)
+    assert blocks == (2, 0, 4, 0, 3, 5, 1, 3, 2, 0, 1, 1, 3, 3, 4, 0)
+    assert sum(blocks) == sum(counts) // 128
+    # N2 = 2048 -> eight N256 tiles: 12 complete pairs and 8 odd tail blocks
+    assert fused_tile_counts(2048, blocks) == (96, 64)
+    assert fused_tile_counts(2048, routing_blocks([256] * 16)) == (128, 0)
+    assert fused_tile_counts(2048, routing_blocks([128] * 16)) == (0, 128)
+    assert routing_blocks([100]) == (1,)  # a partial final block counts as one block
+    with pytest.raises(ValueError):
+        routing_blocks([128, -1])
+    with pytest.raises(ValueError):
+        select_route(4096, 2048, sm_count=148, group_blocks=(1, 1))
+    assert (
+        select_route(1024, 2048, sm_count=148, group_blocks=routing_blocks([128] * 8))
+        == ACT_ROUTE
+    )
+    assert select_route(4096, 2048, sm_count=148) == FUSED_ROUTE
+    # B200 rule at the model's calibration geometry (2H = 2048, K = 4096): the fitted makespan model ranks pair + tail,
+    # mixed schedule and GEMM + act, guarded by the legacy odd-tail rule (units beyond the 20 SMs the 128-CTA pair grid
+    # leaves free leave the pair + tail route)
+    wide = dict(sm_count=148, k=4096)
+    assert (
+        select_route(4096, 2048, group_blocks=routing_blocks([256] * 16), **wide)
+        == FUSED_ROUTE
+    )
+    two_odd = routing_blocks(
+        [128, 384] + [256] * 14
+    )  # 16 odd-tail units <= 20 free SMs
+    assert select_route(4096, 2048, group_blocks=two_odd, **wide) == FUSED_ROUTE
+    # diverted wide rows: the mixed-schedule route (random_aligned: 96 pair tiles + 64 solo units over 64 clusters,
+    # mixed_tail: 80 + 96), as under the legacy rule
+    assert fused_tile_counts(2048, blocks) == (96, 64)
+    assert mixed_clusters(96, 64, sm_count=148) == 64
+    assert select_route(4096, 2048, group_blocks=blocks, **wide) == FUSED_MIXED_ROUTE
+    mixed_tail = routing_blocks(
+        [640, 128, 384, 0, 896, 128, 384, 256, 128, 0, 384, 128, 256, 128, 128, 128]
+    )
+    assert fused_tile_counts(2048, mixed_tail) == (80, 96)
+    assert (
+        select_route(4096, 2048, group_blocks=mixed_tail, **wide) == FUSED_MIXED_ROUTE
+    )
+    # all_odd (64 pair tiles = one per cluster) and all_one_block (no pair tile at all) left the legacy rule's
+    # round-10 envelope on the GEMM + wide act route; the makespan model sends them to the mixed schedule (measured
+    # 0.97x and 0.87x the act route on B200)
+    all_odd = routing_blocks([384] * 8 + [128] * 8)
+    assert fused_tile_counts(2048, all_odd) == (64, 128)
+    assert select_route(4096, 2048, group_blocks=all_odd, **wide) == FUSED_MIXED_ROUTE
+    all_one_block = routing_blocks([128] * 16)
+    assert fused_tile_counts(2048, all_one_block) == (0, 128)
+    assert (
+        select_route(2048, 2048, group_blocks=all_one_block, **wide)
+        == FUSED_MIXED_ROUTE
+    )
+    # the margin guard keeps the legacy route where the model is within 5 % of its pick: twelve odd experts at
+    # M = 3072 stay on the wide act route; the four-odd M = 8192 routing goes back to pair + tail (legacy: mixed)
+    twelve_odd_3072 = routing_blocks([384] * 6 + [128] * 6 + [0] * 4)
+    assert fused_tile_counts(2048, twelve_odd_3072) == (48, 96)
+    assert (
+        select_route(3072, 2048, group_blocks=twelve_odd_3072, **wide) == ACT_WIDE_ROUTE
+    )
+    four_odd_8192 = routing_blocks([640, 640, 384, 384] + [512] * 12)
+    assert fused_tile_counts(2048, four_odd_8192) == (240, 32)
+    assert select_route(8192, 2048, group_blocks=four_odd_8192, **wide) == FUSED_ROUTE
+    assert {FUSED_ROUTE, FUSED_MIXED_ROUTE} == FUSED_ROUTES
+    assert act_items(2048, 2048) == ACT_WIDE_MIN_ITEMS
+    # outside the calibration geometry the legacy rule applies unchanged: 16 odd-tail units (<= 20 free SMs) stay on
+    # the pair + tail route, 32 units below the item threshold take the one-warp-per-group act kernel
+    assert (
+        select_route(2048, 256, group_blocks=all_one_block, sm_count=148, k=512)
+        == FUSED_ROUTE
+    )
+    assert act_items(2048, 512) < ACT_WIDE_MIN_ITEMS
+    assert (
+        select_route(2048, 512, group_blocks=all_one_block, sm_count=148, k=1024)
+        == ACT_ROUTE
+    )
+    # without K (existing callers) or at another K the same routing keeps the legacy route
+    assert (
+        select_route(4096, 2048, group_blocks=all_odd, sm_count=148) == ACT_WIDE_ROUTE
+    )
+    assert (
+        select_route(4096, 2048, group_blocks=all_odd, sm_count=148, k=2048)
+        == ACT_WIDE_ROUTE
+    )
+    # grids: the mixed-schedule route on the wide random_aligned row and on all_one_block (solo units only), the two
+    # act routes on the twelve-odd M = 3072 row and a small row
+    _, mixed_grid = launch_plan(4096, 2048, group_blocks=blocks, **wide)
+    assert mixed_grid == (
+        128,
+        1,
+        1,
+    )  # 64 clusters of two CTAs (160 units capped at the 128-CTA grid)
+    _, solo_grid = launch_plan(2048, 2048, group_blocks=all_one_block, **wide)
+    assert solo_grid == (128, 1, 1)  # 128 solo units capped at the 64 clusters
+    _, wide_grid = launch_plan(3072, 2048, group_blocks=twelve_odd_3072, **wide)
+    assert wide_grid == (
+        1480,
+        1,
+        1,
+    )  # ceil(24576 / 16) = 1536 warps-of-four capped at 10 CTAs x 148 SMs
+    _, small_grid = launch_plan(
+        1024, 2048, group_blocks=routing_blocks([128] * 8), **wide
+    )
+    assert small_grid == (2048, 1, 1)  # 8192 items, one warp each, four per CTA
 
 
 @pytest.mark.parametrize(

@@ -29,6 +29,8 @@ _TAIL_SLOTS = {
     "gate_alpha": 4,
     "up_alpha": 5,
     "alpha": 4,
+    "output_scale": 6,
+    "quant_scale": 7,
 }
 
 
@@ -61,6 +63,10 @@ class Nvfp4Kernel:
         return self.tactic_metadata.get("swap_ab", False)
 
     @property
+    def quantizes_output(self):
+        return self.contract["output_dtype"] == "float4_e2m1fn_x2"
+
+    @property
     def tactic(self):
         return (
             "cudnn_frost-nvfp4-v1",
@@ -70,8 +76,10 @@ class Nvfp4Kernel:
 
 
 @functools.lru_cache(maxsize=8)
-def discover(root: Path | None = None) -> tuple[Nvfp4Kernel, ...]:
-    """Load explicitly selected NVFP4 artifacts, separate from the BF16 pool."""
+def discover(
+    root: Path | None = None, *, quantized_output: bool = False
+) -> tuple[Nvfp4Kernel, ...]:
+    """Load BF16 grouped kernels or FC1 kernels with fused output quantization."""
     root = runtime.artifact_root("nvfp4") if root is None else Path(root)
     path = root / runtime._MANIFEST
     payload = json.loads(path.read_text())
@@ -87,12 +95,13 @@ def discover(root: Path | None = None) -> tuple[Nvfp4Kernel, ...]:
         if not isinstance(identity, str) or not identity or identity in seen:
             raise RuntimeError("NVFP4 artifact ids must be non-empty and unique")
         seen.add(identity)
-        runtime._validate_abi(raw, op)
         contract = raw.get("contract", {})
+        fused = contract.get("output_dtype") == "float4_e2m1fn_x2"
+        runtime._validate_abi(raw, f"{op}_quantized" if fused else op)
         expected = dict(
             token_dtype="float4_e2m1fn_x2",
             weight_dtype="float4_e2m1fn_x2",
-            output_dtype="bfloat16",
+            output_dtype="float4_e2m1fn_x2" if fused else "bfloat16",
             scale_dtype="float8_e4m3fn",
             block_size=16,
             elements_per_byte=2,
@@ -105,6 +114,14 @@ def discover(root: Path | None = None) -> tuple[Nvfp4Kernel, ...]:
             if op == _FC2
             else op.removeprefix("block_scale_grouped_gemm1_"),
         )
+        if fused:
+            expected.update(
+                intermediate_dtype="bfloat16",
+                output_scale_layout="segmented_F8_128x4",
+                quant_scale_dtype="float32",
+            )
+            if op == _FC2 or raw.get("tactic", {}).get("swap_ab"):
+                raise RuntimeError("fused NVFP4 output requires normal FC1")
         if any(contract.get(k) != v for k, v in expected.items()):
             raise RuntimeError(f"invalid NVFP4 numerical contract: {identity}")
         tail = tuple(raw.get("launch", {}).get("tail", ()))
@@ -116,6 +133,11 @@ def discover(root: Path | None = None) -> tuple[Nvfp4Kernel, ...]:
             expected_tail.add("up_alpha")
         if expected["activation"] == "situ":
             expected_tail |= {"gate_scale", "linear_scale"}
+        if fused:
+            expected_tail |= {"output_scale", "quant_scale"}
+            prefix = ("output_scale",) if store == "tma" else ("output", "output_scale")
+            if tail[: len(prefix)] != prefix:
+                raise RuntimeError(f"invalid fused NVFP4 launch tail: {identity}")
         if (
             store not in ("stg", "tma")
             or set(tail) != expected_tail
@@ -126,6 +148,8 @@ def discover(root: Path | None = None) -> tuple[Nvfp4Kernel, ...]:
         size = raw.get("workspace_bytes")
         if type(size) is not int or size <= 0 or size % 128:
             raise RuntimeError("NVFP4 workspace must be a positive multiple of 128")
+        if fused != quantized_output:
+            continue
         source, digest = runtime._read_source(root, raw)
         result.append(
             Nvfp4Kernel(
@@ -308,6 +332,8 @@ class PreparedNvfp4GroupedGemm:
         gemm_scales: tuple[torch.Tensor, ...] | None = None,
         workspace: torch.Tensor | None = None,
     ):
+        if kernel.quantizes_output:
+            raise ValueError("quantized FC1 kernels are launched by the MoE runner")
         if tokens.device.type != "cuda":
             raise ValueError("NVFP4 grouped GEMM requires CUDA tensors")
         with torch.cuda.device(tokens.device):

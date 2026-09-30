@@ -13,7 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-Cake backend: NVFP4 paged-KV MiniMax Sparse Attention decode (SM100/SM103).
+Cake backend: NVFP4 paged-KV MiniMax Sparse Attention decode (SM100/SM103/SM107).
+
+The sm_107a (Rubin) programs are registered unconditionally but built only
+when the CUDA toolkit of this checkout can emit ``compute_107a``
+(``cake_jit.toolchain_supports``); on an older toolkit a 10.7 device has no
+generated program and the routes decline it with that reason.
 
 One persistent launch of the generated program serves a whole decode step over
 the planar NVFP4 page pool described in
@@ -48,6 +53,8 @@ from .cake_jit import (
     route_of,
     select_module,
     select_short_module,
+    tail_records,
+    toolchain_supports,
 )
 
 HEAD_DIM = 128
@@ -63,7 +70,11 @@ STATS_PER_SLOT = PAGE_SIZE  # partial max/sum entries per (item, split) slot
 PARTIAL_O_PER_SLOT = STATS_PER_SLOT * HEAD_DIM
 WORKSPACE_ALIGN = 256
 TMA_ALIGN = 16
-SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+SUPPORTED_COMPUTE_CAPABILITIES = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+}
 LN2 = math.log(2.0)
 
 # Semantic argument names of the single stage, in the order the generated
@@ -143,9 +154,14 @@ def arch_for(device: torch.device) -> Optional[str]:
 
 
 def generated_program_available(device: torch.device) -> bool:
-    """True when this checkout registers a generated program for ``device``."""
+    """True when this checkout registers a generated program for ``device``
+    and its CUDA toolkit can compile that program (``cake_jit.toolchain_supports``)."""
     arch = arch_for(device)
-    return arch is not None and any(r["arch"] == arch for r in MODULES.values())
+    return (
+        arch is not None
+        and toolchain_supports(arch)
+        and any(r["arch"] == arch for r in MODULES.values())
+    )
 
 
 def ctas_per_sm(arch: str) -> int:
@@ -166,7 +182,9 @@ def persistent_cta_capacity(device: torch.device) -> int:
     """Number of CTAs the persistent grid may hold on ``device``."""
     arch = arch_for(device)
     if arch is None:
-        raise ValueError("NVFP4 MSA decode requires compute capability 10.0 or 10.3")
+        raise ValueError(
+            "NVFP4 MSA decode requires compute capability 10.0, 10.3 or 10.7"
+        )
     sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     return sms * ctas_per_sm(arch)
 
@@ -197,6 +215,49 @@ def split_factor(total_work_items: int, cta_capacity: int, max_pages: int) -> in
 
 def persistent_grid(total_work_items: int, splits: int, cta_capacity: int) -> int:
     return max(1, min(int(total_work_items) * int(splits), int(cta_capacity)))
+
+
+def tail_plan(
+    arch: str, total_work_items: int, cta_capacity: int, max_pages: int
+) -> Optional[tuple[int, int]]:
+    """``(splits, grid)`` of a last-round split, or ``None`` for the plain persistent launch.
+
+    Persistent rounds quantise a batch of N items on G resident CTAs to
+    ceil(N / G) item-times.  A registered tail program (``tail_records``) runs
+    every full round unsplit and only the M = N - floor(N / G) G remainder
+    items as S-way cluster units merged through distributed shared memory, on
+    the largest S-aligned grid the part co-schedules as S-CTA clusters (the
+    record's ``cluster_capacity`` for this SM count); the split round must fit
+    that grid (M S <= G).  S minimises floor(N / G) + 1 / S below the plain
+    makespan.  Items with fewer than four page pairs never split, a batch that
+    already fits one round never splits, and a part without a capacity entry
+    keeps the plain launch.
+    """
+    items = max(1, int(total_work_items))
+    capacity = int(cta_capacity)
+    max_pairs = (min(max(int(max_pages), 0), TOPK) + 1) // 2
+    if max_pairs < 4 or items <= capacity:
+        return None
+    sms = str(capacity // ctas_per_sm(arch))
+    best, best_cost = None, float(math.ceil(items / capacity))
+    for record in tail_records(arch):
+        s = int(record["splits"])
+        if s > max_pairs:
+            continue
+        cluster_ctas = record.get("cluster_capacity", {}).get(sms)
+        if cluster_ctas is None:
+            continue
+        grid = min((capacity // s) * s, int(cluster_ctas))
+        if grid < s:
+            continue
+        full = items // grid
+        rem = items - full * grid
+        if rem == 0 or rem * s > grid:
+            continue
+        cost = full + 1.0 / s
+        if cost < best_cost - 1e-9:
+            best, best_cost = (s, grid), cost
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +402,7 @@ class MSANvfp4DecodeRunner:
     route: str = (
         "swap_tsk"  # ``swap_tsk`` persistent program or ``short`` cluster program
     )
+    tail: bool = False  # last-round split: the persistent program's cluster units on the remainder items
 
     def launch(self) -> torch.Tensor:
         # Tensor maps are encoded by the host binding and passed by value.
@@ -364,15 +426,17 @@ def bind_decode_payload(
     *,
     module_name: Optional[str] = None,
     route: str = "swap_tsk",
+    tail: bool = False,
 ) -> MSANvfp4DecodeRunner:
     """Bind the prepared buffers to the generated physical argument order.
 
     Without ``module_name`` the persistent program of ``arch`` and ``splits``
-    is bound; the short-item program passes its record name and
-    ``route="short"`` (``splits`` is then one).
+    (its last-round-split variant when ``tail``) is bound; the short-item
+    program passes its record name and ``route="short"`` (``splits`` is then
+    one).
     """
     if module_name is None:
-        module_name = select_module(arch, splits)
+        module_name = select_module(arch, splits, tail=tail)
     physical = MODULES[module_name]["main"]
     grid = dict(zip(("grid_x", "grid_y", "grid_z"), main_kwargs["grid"], strict=True))
     arguments = tuple(
@@ -382,7 +446,15 @@ def bind_decode_payload(
     module = load_cake_msa_nvfp4_decode_module(module_name, "main")
     entry = getattr(module, physical["ffi_entry"])
     return MSANvfp4DecodeRunner(
-        module_name, int(splits), main_kwargs, out, lse, entry, arguments, route
+        module_name,
+        int(splits),
+        main_kwargs,
+        out,
+        lse,
+        entry,
+        arguments,
+        route,
+        bool(tail),
     )
 
 
@@ -549,7 +621,11 @@ def prepare_msa_nvfp4_sparse_decode(
     the split factor is decided from the batch geometry and the device's
     resident-CTA capacity; when it is greater than one the FP32 partials and
     completion counters are carved out of ``workspace_buffer`` and the
-    counters are zeroed once (the kernel resets them after every merge).
+    counters are zeroed once (the kernel resets them after every merge).  A
+    batch of more items than resident CTAs takes the registered last-round
+    split program instead when that shortens the makespan (``tail_plan``;
+    ``runner.tail``); it merges through distributed shared memory and needs
+    no workspace.
     """
     if backend != "cake":
         raise ValueError("NVFP4 MSA decode supports backend='cake'")
@@ -579,7 +655,7 @@ def prepare_msa_nvfp4_sparse_decode(
     if arch is None:
         capability = torch.cuda.get_device_capability(device)
         raise ValueError(
-            "NVFP4 MSA decode requires compute capability 10.0 or 10.3 "
+            "NVFP4 MSA decode requires compute capability 10.0, 10.3 or 10.7 "
             f"(got {capability[0]}.{capability[1]})"
         )
     total_q = batch * int(seqlen_q)
@@ -641,9 +717,20 @@ def prepare_msa_nvfp4_sparse_decode(
 
     capacity = persistent_cta_capacity(device)
     splits = split_factor(total_work_items, capacity, max_pages)
-    grid = (persistent_grid(total_work_items, splits, capacity), 1, 1)
+    tail = (
+        tail_plan(arch, total_work_items, capacity, max_pages) if splits == 1 else None
+    )
+    if tail is not None:
+        # Last-round split: every full persistent round runs whole items and
+        # only the remainder items of the last round run as ``splits``-CTA
+        # cluster units merged through distributed shared memory, on the
+        # largest cluster-aligned grid the part co-schedules.  The cluster
+        # merge never touches the partial buffers: no workspace is needed.
+        splits, grid = tail[0], (tail[1], 1, 1)
+    else:
+        grid = (persistent_grid(total_work_items, splits, capacity), 1, 1)
 
-    if splits > 1:
+    if splits > 1 and tail is None:
         layout = workspace_layout(total_work_items, splits)
         if workspace_buffer is None:
             raise ValueError(
@@ -672,7 +759,8 @@ def prepare_msa_nvfp4_sparse_decode(
         # Completion counters start at zero once; the merge CTA resets them.
         split_completion.zero_()
     else:
-        # Unsplit launches never touch the partial buffers: bind valid dummies.
+        # Unsplit and last-round-split launches never touch the partial
+        # buffers: bind valid dummies.
         partial_o = partial_m = partial_d = lse.view(-1)
         split_completion = q2k_indices.view(-1)
 
@@ -706,4 +794,6 @@ def prepare_msa_nvfp4_sparse_decode(
         grid=grid,
     )
     assert tuple(main_kwargs) == MAIN_KWARGS
-    return bind_decode_payload(arch, splits, main_kwargs, out, lse)
+    return bind_decode_payload(
+        arch, splits, main_kwargs, out, lse, tail=tail is not None
+    )

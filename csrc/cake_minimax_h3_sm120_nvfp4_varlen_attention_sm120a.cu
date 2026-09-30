@@ -16,14 +16,18 @@
 // clang-format off
 // MiniMax-H3 experimental NVFP4 non-causal packed-varlen self-attention for SM120 (GB202: RTX 5090 /
 // RTX PRO 6000 Blackwell) following the SageAttention3 FP4 recipe, generated from the Cake kernel schedules.
-// One operator call = three PDL-chained launches over packed THD tensors q, k, v [T, H, 128] BF16 (segments
-// from int32 cu_seqlens):
+// One operator call = two or three PDL-chained launches over packed THD tensors q, k, v [T, H, 128] BF16
+// (segments from int32 cu_seqlens):
 //   1. stats:      per (segment, head) K channel mean (fixed-order fold over the segment's tiles, device-scope
 //                  arrival counter, self-resetting) and per 128-row Q block channel mean (q_mean rows),
 //   2. quantize:   K rows centred by the segment mean and Q rows by their block mean -> E2M1 codes with one
 //                  UE4M3 scale per 16 channels (block amax / 6, round-to-nearest E4M3, x * (1 / decoded));
 //                  the quantized block-mean row per (Q block, head); V transposed into [H, 128, T_pad / 2]
 //                  E2M1 tiles with one UE4M3 scale per (channel, 16 keys) in the FA3 key permutation,
+//   1+2 fused:     for plans routed by kPreprocFusedMaxTokens, one persistent launch runs the statistics work
+//                  items, a self-resetting software grid barrier (grid bounded by the driver's co-resident
+//                  CTA capacity; launch_dependents only after the barrier) and the quantizer work items with
+//                  the same device code, so the operands are bit-identical to the two-launch form,
 //   3. attention:  persistent 256-thread CTA per SM, 8 warps x 16 query rows in two ping-pong warp groups,
 //                  128-key K / K-scale / V^T / V-scale tiles through a two-stage TMA ring; QK^T and PV both run
 //                  mma.sync m16n8k64 kind::mxf4nvf4.block_scale.scale_vec::4X; the block-mean compensation
@@ -94,7 +98,9 @@ kernel_minimax_h3_sm120_varlen_stats_sage(__nv_bfloat16* __restrict__ Q, __nv_bf
     int col = (tid & 15) * 8;
     int rgrp = tid >> 4;
     asm volatile("griddepcontrol.wait;" ::: "memory");
-    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    {
+        asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    }
     #pragma unroll 1
     for (int work = bid; work < num_tiles * num_heads; work += num_bids) {
         int tile = work / num_heads;
@@ -1374,6 +1380,1352 @@ kernel_minimax_h3_sm120_varlen_quantize_sage(__nv_bfloat16* __restrict__ Q, __nv
 #undef NUM_MAIN_STAGES
 #undef THREADS
 
+namespace h3_varlen_preproc_sage_sm120a {
+
+__device__ __forceinline__ int make_warp_uniform(int x) {
+    int result;
+    asm volatile("shfl.sync.idx.b32 %0, %1, 0, 0x1F, 0xFFFFFFFF;"
+                 : "=r"(result) : "r"(x));
+    return result;
+}
+
+#define H3_VARLEN_INF CUDART_INF_F
+#define NUM_MAIN_STAGES 1
+#define SMEM_RED_SUM_OFF 0
+#define SMEM_RED_SUM_STAGE_BYTES 8192
+#define SMEM_RED_SUM_STRIDE 8192
+#define SMEM_RED_Q_OFF 8192
+#define SMEM_RED_Q_STAGE_BYTES 8192
+#define SMEM_RED_Q_STRIDE 8192
+#define SMEM_FLAG_OFF 16384
+#define SMEM_FLAG_STAGE_BYTES 16
+#define SMEM_FLAG_STRIDE 16
+#define SMEM_TOTAL 16512
+#define THREADS 256
+
+#include <math_constants.h>
+
+
+__global__ __launch_bounds__(256, 2) void
+kernel_minimax_h3_sm120_varlen_preproc2_sage(__nv_bfloat16* __restrict__ Q, __nv_bfloat16* __restrict__ K, __nv_bfloat16* __restrict__ V, int* __restrict__ tile_table, int* __restrict__ seg_tile_begin, int* __restrict__ tok_seg, int* __restrict__ cu_seqlens, float* __restrict__ partials, unsigned int* __restrict__ counters, float* __restrict__ mean_k, float* __restrict__ q_mean, unsigned int* __restrict__ q4, unsigned int* __restrict__ k4, uint8_t* __restrict__ q_sf, uint8_t* __restrict__ k_sf, unsigned int* __restrict__ qm4, uint8_t* __restrict__ qm_sf, unsigned int* __restrict__ vt4, uint8_t* __restrict__ v_sf, unsigned int* __restrict__ barrier, int num_tiles, int total_tokens, int total_padded, int num_heads, int num_kblocks)
+{
+    const int tid = threadIdx.x;
+    const int warp = make_warp_uniform(tid / 32);
+    const int lane = tid % 32;
+
+    extern __shared__ __align__(1024) char smem_raw[];
+    int smem;
+    smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+
+    const int bid = blockIdx.x;
+    const int num_bids = gridDim.x;
+
+    const int cta_rank = 0;
+
+    // Kernel setup ops
+    float* red_sum = reinterpret_cast<float*>(smem_raw + 0);
+    const int red_sum_addr = smem + 0;
+    float* red_q = reinterpret_cast<float*>(smem_raw + 8192);
+    const int red_q_addr = smem + 8192;
+    int* flag = reinterpret_cast<int*>(smem_raw + 16384);
+    const int flag_addr = smem + 16384;
+
+    // === Task calls (dependency order) ===
+    int col = (tid & 15) * 8;
+    int rgrp = tid >> 4;
+    int sub = tid & 7;
+    int trow = tid >> 3;
+    int col16 = sub * 16;
+    int num_tblk = total_padded / 32;
+    int vwarp = tid >> 5;
+    int vlane = tid & 31;
+    int vblk = vwarp & 1;
+    int vdp = (vwarp >> 1) * 16 + (vlane & 15);
+    int vhalf = vlane >> 4;
+    asm volatile("griddepcontrol.wait;" ::: "memory");
+    #pragma unroll 1
+    for (int work = bid; work < num_tiles * num_heads; work += num_bids) {
+        int tile = work / num_heads;
+        int head = work % num_heads;
+        int _vec_load_0[4];
+        {
+            const int4* _ivptr_0 = reinterpret_cast<const int4*>(tile_table + (8 * tile) + 0);
+            int4 _ivld_0;
+            _ivld_0 = *_ivptr_0;
+            _vec_load_0[0 + 0] = _ivld_0.x;
+            _vec_load_0[0 + 1] = _ivld_0.y;
+            _vec_load_0[0 + 2] = _ivld_0.z;
+            _vec_load_0[0 + 3] = _ivld_0.w;
+        }
+        int seg = _vec_load_0[0];
+        int row_begin = _vec_load_0[1];
+        int row_end = _vec_load_0[2];
+        int t0 = _vec_load_0[3];
+        int qt_base = seg_tile_begin[seg] + (tile - t0);
+        float qsum[8];
+        float qf8[8];
+        #pragma unroll 1
+        for (int batch = 0; batch < (row_end - row_begin + 128 - 1) / 128; batch++) {
+            for (int e = 0; e < 8; e++) {
+                qsum[e] = 0.0f;
+            }
+            int brow = row_begin + batch * 128;
+            float _vec_load_1[8];
+            {
+                const uint4* _vptr_1 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + rgrp) ? brow + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
+                uint4 _vld_1[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_1[_blk] = _vptr_1[_blk];
+                    uint32_t* _vpairs_1 = reinterpret_cast<uint32_t*>(&_vld_1[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_1[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_1[_pair]));
+                    }
+                }
+            }
+            float _vec_load_2[8];
+            {
+                const uint4* _vptr_2 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 16 + rgrp) ? brow + 16 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
+                uint4 _vld_2[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_2[_blk] = _vptr_2[_blk];
+                    uint32_t* _vpairs_2 = reinterpret_cast<uint32_t*>(&_vld_2[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_2[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_2[_pair]));
+                    }
+                }
+            }
+            float _vec_load_3[8];
+            {
+                const uint4* _vptr_3 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 32 + rgrp) ? brow + 32 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
+                uint4 _vld_3[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_3[_blk] = _vptr_3[_blk];
+                    uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_3[_pair]));
+                    }
+                }
+            }
+            float _vec_load_4[8];
+            {
+                const uint4* _vptr_4 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 48 + rgrp) ? brow + 48 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
+                uint4 _vld_4[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_4[_blk] = _vptr_4[_blk];
+                    uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_4[_pair]));
+                    }
+                }
+            }
+            float _vec_load_5[8];
+            {
+                const uint4* _vptr_5 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 64 + rgrp) ? brow + 64 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
+                uint4 _vld_5[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_5[_blk] = _vptr_5[_blk];
+                    uint32_t* _vpairs_5 = reinterpret_cast<uint32_t*>(&_vld_5[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_5[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_5[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_5[_pair]));
+                    }
+                }
+            }
+            float _vec_load_6[8];
+            {
+                const uint4* _vptr_6 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 80 + rgrp) ? brow + 80 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
+                uint4 _vld_6[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_6[_blk] = _vptr_6[_blk];
+                    uint32_t* _vpairs_6 = reinterpret_cast<uint32_t*>(&_vld_6[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_6[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_6[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_6[_pair]));
+                    }
+                }
+            }
+            float _vec_load_7[8];
+            {
+                const uint4* _vptr_7 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 96 + rgrp) ? brow + 96 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
+                uint4 _vld_7[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_7[_blk] = _vptr_7[_blk];
+                    uint32_t* _vpairs_7 = reinterpret_cast<uint32_t*>(&_vld_7[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_7[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_7[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_7[_pair]));
+                    }
+                }
+            }
+            float _vec_load_8[8];
+            {
+                const uint4* _vptr_8 = reinterpret_cast<const uint4*>(Q + ((((row_end > brow + 112 + rgrp) ? brow + 112 + rgrp : row_end - 1) * num_heads + head) * 128 + col) + 0);
+                uint4 _vld_8[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_8[_blk] = _vptr_8[_blk];
+                    uint32_t* _vpairs_8 = reinterpret_cast<uint32_t*>(&_vld_8[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_8[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_8[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_8[_pair]));
+                    }
+                }
+            }
+            qf8[0] = _vec_load_1[0];
+            qf8[1] = _vec_load_1[1];
+            qf8[2] = _vec_load_1[2];
+            qf8[3] = _vec_load_1[3];
+            qf8[4] = _vec_load_1[4];
+            qf8[5] = _vec_load_1[5];
+            qf8[6] = _vec_load_1[6];
+            qf8[7] = _vec_load_1[7];
+            qsum[0] = qsum[0] + ((row_end > brow + rgrp) ? qf8[0] : 0.0f);
+            qsum[1] = qsum[1] + ((row_end > brow + rgrp) ? qf8[1] : 0.0f);
+            qsum[2] = qsum[2] + ((row_end > brow + rgrp) ? qf8[2] : 0.0f);
+            qsum[3] = qsum[3] + ((row_end > brow + rgrp) ? qf8[3] : 0.0f);
+            qsum[4] = qsum[4] + ((row_end > brow + rgrp) ? qf8[4] : 0.0f);
+            qsum[5] = qsum[5] + ((row_end > brow + rgrp) ? qf8[5] : 0.0f);
+            qsum[6] = qsum[6] + ((row_end > brow + rgrp) ? qf8[6] : 0.0f);
+            qsum[7] = qsum[7] + ((row_end > brow + rgrp) ? qf8[7] : 0.0f);
+            qf8[0] = _vec_load_2[0];
+            qf8[1] = _vec_load_2[1];
+            qf8[2] = _vec_load_2[2];
+            qf8[3] = _vec_load_2[3];
+            qf8[4] = _vec_load_2[4];
+            qf8[5] = _vec_load_2[5];
+            qf8[6] = _vec_load_2[6];
+            qf8[7] = _vec_load_2[7];
+            qsum[0] = qsum[0] + ((row_end > brow + 16 + rgrp) ? qf8[0] : 0.0f);
+            qsum[1] = qsum[1] + ((row_end > brow + 16 + rgrp) ? qf8[1] : 0.0f);
+            qsum[2] = qsum[2] + ((row_end > brow + 16 + rgrp) ? qf8[2] : 0.0f);
+            qsum[3] = qsum[3] + ((row_end > brow + 16 + rgrp) ? qf8[3] : 0.0f);
+            qsum[4] = qsum[4] + ((row_end > brow + 16 + rgrp) ? qf8[4] : 0.0f);
+            qsum[5] = qsum[5] + ((row_end > brow + 16 + rgrp) ? qf8[5] : 0.0f);
+            qsum[6] = qsum[6] + ((row_end > brow + 16 + rgrp) ? qf8[6] : 0.0f);
+            qsum[7] = qsum[7] + ((row_end > brow + 16 + rgrp) ? qf8[7] : 0.0f);
+            qf8[0] = _vec_load_3[0];
+            qf8[1] = _vec_load_3[1];
+            qf8[2] = _vec_load_3[2];
+            qf8[3] = _vec_load_3[3];
+            qf8[4] = _vec_load_3[4];
+            qf8[5] = _vec_load_3[5];
+            qf8[6] = _vec_load_3[6];
+            qf8[7] = _vec_load_3[7];
+            qsum[0] = qsum[0] + ((row_end > brow + 32 + rgrp) ? qf8[0] : 0.0f);
+            qsum[1] = qsum[1] + ((row_end > brow + 32 + rgrp) ? qf8[1] : 0.0f);
+            qsum[2] = qsum[2] + ((row_end > brow + 32 + rgrp) ? qf8[2] : 0.0f);
+            qsum[3] = qsum[3] + ((row_end > brow + 32 + rgrp) ? qf8[3] : 0.0f);
+            qsum[4] = qsum[4] + ((row_end > brow + 32 + rgrp) ? qf8[4] : 0.0f);
+            qsum[5] = qsum[5] + ((row_end > brow + 32 + rgrp) ? qf8[5] : 0.0f);
+            qsum[6] = qsum[6] + ((row_end > brow + 32 + rgrp) ? qf8[6] : 0.0f);
+            qsum[7] = qsum[7] + ((row_end > brow + 32 + rgrp) ? qf8[7] : 0.0f);
+            qf8[0] = _vec_load_4[0];
+            qf8[1] = _vec_load_4[1];
+            qf8[2] = _vec_load_4[2];
+            qf8[3] = _vec_load_4[3];
+            qf8[4] = _vec_load_4[4];
+            qf8[5] = _vec_load_4[5];
+            qf8[6] = _vec_load_4[6];
+            qf8[7] = _vec_load_4[7];
+            qsum[0] = qsum[0] + ((row_end > brow + 48 + rgrp) ? qf8[0] : 0.0f);
+            qsum[1] = qsum[1] + ((row_end > brow + 48 + rgrp) ? qf8[1] : 0.0f);
+            qsum[2] = qsum[2] + ((row_end > brow + 48 + rgrp) ? qf8[2] : 0.0f);
+            qsum[3] = qsum[3] + ((row_end > brow + 48 + rgrp) ? qf8[3] : 0.0f);
+            qsum[4] = qsum[4] + ((row_end > brow + 48 + rgrp) ? qf8[4] : 0.0f);
+            qsum[5] = qsum[5] + ((row_end > brow + 48 + rgrp) ? qf8[5] : 0.0f);
+            qsum[6] = qsum[6] + ((row_end > brow + 48 + rgrp) ? qf8[6] : 0.0f);
+            qsum[7] = qsum[7] + ((row_end > brow + 48 + rgrp) ? qf8[7] : 0.0f);
+            qf8[0] = _vec_load_5[0];
+            qf8[1] = _vec_load_5[1];
+            qf8[2] = _vec_load_5[2];
+            qf8[3] = _vec_load_5[3];
+            qf8[4] = _vec_load_5[4];
+            qf8[5] = _vec_load_5[5];
+            qf8[6] = _vec_load_5[6];
+            qf8[7] = _vec_load_5[7];
+            qsum[0] = qsum[0] + ((row_end > brow + 64 + rgrp) ? qf8[0] : 0.0f);
+            qsum[1] = qsum[1] + ((row_end > brow + 64 + rgrp) ? qf8[1] : 0.0f);
+            qsum[2] = qsum[2] + ((row_end > brow + 64 + rgrp) ? qf8[2] : 0.0f);
+            qsum[3] = qsum[3] + ((row_end > brow + 64 + rgrp) ? qf8[3] : 0.0f);
+            qsum[4] = qsum[4] + ((row_end > brow + 64 + rgrp) ? qf8[4] : 0.0f);
+            qsum[5] = qsum[5] + ((row_end > brow + 64 + rgrp) ? qf8[5] : 0.0f);
+            qsum[6] = qsum[6] + ((row_end > brow + 64 + rgrp) ? qf8[6] : 0.0f);
+            qsum[7] = qsum[7] + ((row_end > brow + 64 + rgrp) ? qf8[7] : 0.0f);
+            qf8[0] = _vec_load_6[0];
+            qf8[1] = _vec_load_6[1];
+            qf8[2] = _vec_load_6[2];
+            qf8[3] = _vec_load_6[3];
+            qf8[4] = _vec_load_6[4];
+            qf8[5] = _vec_load_6[5];
+            qf8[6] = _vec_load_6[6];
+            qf8[7] = _vec_load_6[7];
+            qsum[0] = qsum[0] + ((row_end > brow + 80 + rgrp) ? qf8[0] : 0.0f);
+            qsum[1] = qsum[1] + ((row_end > brow + 80 + rgrp) ? qf8[1] : 0.0f);
+            qsum[2] = qsum[2] + ((row_end > brow + 80 + rgrp) ? qf8[2] : 0.0f);
+            qsum[3] = qsum[3] + ((row_end > brow + 80 + rgrp) ? qf8[3] : 0.0f);
+            qsum[4] = qsum[4] + ((row_end > brow + 80 + rgrp) ? qf8[4] : 0.0f);
+            qsum[5] = qsum[5] + ((row_end > brow + 80 + rgrp) ? qf8[5] : 0.0f);
+            qsum[6] = qsum[6] + ((row_end > brow + 80 + rgrp) ? qf8[6] : 0.0f);
+            qsum[7] = qsum[7] + ((row_end > brow + 80 + rgrp) ? qf8[7] : 0.0f);
+            qf8[0] = _vec_load_7[0];
+            qf8[1] = _vec_load_7[1];
+            qf8[2] = _vec_load_7[2];
+            qf8[3] = _vec_load_7[3];
+            qf8[4] = _vec_load_7[4];
+            qf8[5] = _vec_load_7[5];
+            qf8[6] = _vec_load_7[6];
+            qf8[7] = _vec_load_7[7];
+            qsum[0] = qsum[0] + ((row_end > brow + 96 + rgrp) ? qf8[0] : 0.0f);
+            qsum[1] = qsum[1] + ((row_end > brow + 96 + rgrp) ? qf8[1] : 0.0f);
+            qsum[2] = qsum[2] + ((row_end > brow + 96 + rgrp) ? qf8[2] : 0.0f);
+            qsum[3] = qsum[3] + ((row_end > brow + 96 + rgrp) ? qf8[3] : 0.0f);
+            qsum[4] = qsum[4] + ((row_end > brow + 96 + rgrp) ? qf8[4] : 0.0f);
+            qsum[5] = qsum[5] + ((row_end > brow + 96 + rgrp) ? qf8[5] : 0.0f);
+            qsum[6] = qsum[6] + ((row_end > brow + 96 + rgrp) ? qf8[6] : 0.0f);
+            qsum[7] = qsum[7] + ((row_end > brow + 96 + rgrp) ? qf8[7] : 0.0f);
+            qf8[0] = _vec_load_8[0];
+            qf8[1] = _vec_load_8[1];
+            qf8[2] = _vec_load_8[2];
+            qf8[3] = _vec_load_8[3];
+            qf8[4] = _vec_load_8[4];
+            qf8[5] = _vec_load_8[5];
+            qf8[6] = _vec_load_8[6];
+            qf8[7] = _vec_load_8[7];
+            qsum[0] = qsum[0] + ((row_end > brow + 112 + rgrp) ? qf8[0] : 0.0f);
+            qsum[1] = qsum[1] + ((row_end > brow + 112 + rgrp) ? qf8[1] : 0.0f);
+            qsum[2] = qsum[2] + ((row_end > brow + 112 + rgrp) ? qf8[2] : 0.0f);
+            qsum[3] = qsum[3] + ((row_end > brow + 112 + rgrp) ? qf8[3] : 0.0f);
+            qsum[4] = qsum[4] + ((row_end > brow + 112 + rgrp) ? qf8[4] : 0.0f);
+            qsum[5] = qsum[5] + ((row_end > brow + 112 + rgrp) ? qf8[5] : 0.0f);
+            qsum[6] = qsum[6] + ((row_end > brow + 112 + rgrp) ? qf8[6] : 0.0f);
+            qsum[7] = qsum[7] + ((row_end > brow + 112 + rgrp) ? qf8[7] : 0.0f);
+            for (int e_1 = 0; e_1 < 8; e_1++) {
+                red_q[rgrp * 128 + col + e_1] = qsum[e_1];
+            }
+            __syncthreads();
+            int qt = qt_base + batch;
+            if (tid < 128) {
+                float qtot = 0.0f;
+                for (int g = 0; g < 16; g++) {
+                    qtot = qtot + red_q[g * 128 + tid];
+                }
+                int brows = ((row_end - brow < 128) ? row_end - brow : 128);
+                float _fdiv_rn_0 = __fdiv_rn(qtot, (float)brows);
+                *(reinterpret_cast<float*>(q_mean + ((qt * num_heads + head) * 128 + tid)) + (0)) = _fdiv_rn_0;
+            }
+            __syncthreads();
+            #pragma unroll 1
+            for (int blk = 0; blk < 4; blk++) {
+                int tok = brow + blk * 32 + trow;
+                int valid = ((tok < row_end) ? 1 : 0);
+                int tok_c = ((tok < row_end) ? tok : row_end - 1);
+                int is_first = ((valid == 1 && tok == brow) ? 1 : 0);
+                float _vec_load_9[16];
+                {
+                    const uint4* _vptr_9 = reinterpret_cast<const uint4*>(Q + ((tok_c * num_heads + head) * 128 + col16) + 0);
+                    uint4 _vld_9[2];
+                    #pragma unroll
+                    for (int _blk = 0; _blk < 2; _blk++) {
+                        _vld_9[_blk] = _vptr_9[_blk];
+                        uint32_t* _vpairs_9 = reinterpret_cast<uint32_t*>(&_vld_9[_blk]);
+                        #pragma unroll
+                        for (int _pair = 0; _pair < 4; _pair++) {
+                            asm volatile(
+                                "{\n\t"
+                                "shl.b32 %0, %2, 16;\n\t"
+                                "and.b32 %1, %2, 0xffff0000;\n\t"
+                                "}\n"
+                                : "=f"((&_vec_load_9[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_9[0 + _blk * 8 + _pair * 2])[1])
+                                : "r"(_vpairs_9[_pair]));
+                        }
+                    }
+                }
+                int qmbase = (qt * num_heads + head) * 128 + col16;
+                float qmv[16];
+                float qc[16];
+                for (int quad = 0; quad < 4; quad++) {
+                    float _vec_load_10[4];
+                    {
+                        float4 _v4 = *reinterpret_cast<const float4*>(q_mean + (qmbase + quad * 4) + 0);
+                        _vec_load_10[0 + 0] = _v4.x;
+                        _vec_load_10[0 + 1] = _v4.y;
+                        _vec_load_10[0 + 2] = _v4.z;
+                        _vec_load_10[0 + 3] = _v4.w;
+                    }
+                    for (int e_2 = 0; e_2 < 4; e_2++) {
+                        qmv[quad * 4 + e_2] = _vec_load_10[e_2];
+                        float qf = _vec_load_9[quad * 4 + e_2];
+                        qc[quad * 4 + e_2] = ((valid == 1) ? qf - _vec_load_10[e_2] : 0.0f);
+                    }
+                }
+                unsigned int qw[2];
+                float qsf_a[1];
+                float _fabs_0 = fabsf(qc[0]);
+                float _fabs_1 = fabsf(qc[1]);
+                float _fmax_0 = fmaxf(_fabs_0, _fabs_1);
+                float _fabs_2 = fabsf(qc[2]);
+                float _fmax_1 = fmaxf(_fmax_0, _fabs_2);
+                float _fabs_3 = fabsf(qc[3]);
+                float _fmax_2 = fmaxf(_fmax_1, _fabs_3);
+                float _fabs_4 = fabsf(qc[4]);
+                float _fmax_3 = fmaxf(_fmax_2, _fabs_4);
+                float _fabs_5 = fabsf(qc[5]);
+                float _fmax_4 = fmaxf(_fmax_3, _fabs_5);
+                float _fabs_6 = fabsf(qc[6]);
+                float _fmax_5 = fmaxf(_fmax_4, _fabs_6);
+                float _fabs_7 = fabsf(qc[7]);
+                float _fmax_6 = fmaxf(_fmax_5, _fabs_7);
+                float _fabs_8 = fabsf(qc[8]);
+                float _fmax_7 = fmaxf(_fmax_6, _fabs_8);
+                float _fabs_9 = fabsf(qc[9]);
+                float _fmax_8 = fmaxf(_fmax_7, _fabs_9);
+                float _fabs_10 = fabsf(qc[10]);
+                float _fmax_9 = fmaxf(_fmax_8, _fabs_10);
+                float _fabs_11 = fabsf(qc[11]);
+                float _fmax_10 = fmaxf(_fmax_9, _fabs_11);
+                float _fabs_12 = fabsf(qc[12]);
+                float _fmax_11 = fmaxf(_fmax_10, _fabs_12);
+                float _fabs_13 = fabsf(qc[13]);
+                float _fmax_12 = fmaxf(_fmax_11, _fabs_13);
+                float _fabs_14 = fabsf(qc[14]);
+                float _fmax_13 = fmaxf(_fmax_12, _fabs_14);
+                float _fabs_15 = fabsf(qc[15]);
+                float _fmax_14 = fmaxf(_fmax_13, _fabs_15);
+                uint16_t _e4m3x2_f32_0;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_0) : "f"(0.0f), "f"(_fmax_14 * 0.16666666666666666f));
+                uint16_t _e4m3x2_decode_11 = (uint16_t)((unsigned int)_e4m3x2_f32_0 & 0xFFu);
+                uint32_t _f16x2_decode_11;
+                float _fp8_decode_0;
+                asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_11) : "h"(_e4m3x2_decode_11));
+                uint16_t _f16_decode_11 = (uint16_t)_f16x2_decode_11;
+                asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_decode_0) : "h"(_f16_decode_11));
+                float _fdiv_rn_1 = __fdiv_rn(1.0f, _fp8_decode_0);
+                qc[0] = qc[0] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[1] = qc[1] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[2] = qc[2] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[3] = qc[3] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[4] = qc[4] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[5] = qc[5] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[6] = qc[6] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[7] = qc[7] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[8] = qc[8] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[9] = qc[9] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[10] = qc[10] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[11] = qc[11] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[12] = qc[12] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[13] = qc[13] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[14] = qc[14] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                qc[15] = qc[15] * ((_fp8_decode_0 != 0.0f) ? _fdiv_rn_1 : 0.0f);
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(qw[0]) : "f"(qc[0]), "f"(qc[1]), "f"(qc[2]), "f"(qc[3]), "f"(qc[4]), "f"(qc[5]), "f"(qc[6]), "f"(qc[7]));
+                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(qw[1]) : "f"(qc[8]), "f"(qc[9]), "f"(qc[10]), "f"(qc[11]), "f"(qc[12]), "f"(qc[13]), "f"(qc[14]), "f"(qc[15]));
+                qsf_a[0] = _fmax_14 * 0.16666666666666666f;
+                unsigned int qstore[4];
+                qstore[0] = qw[0];
+                qstore[1] = qw[1];
+                unsigned int _shfl_xor_0 = __shfl_xor_sync(0xFFFFFFFF, qw[0], 1);
+                qstore[2] = _shfl_xor_0;
+                unsigned int _shfl_xor_1 = __shfl_xor_sync(0xFFFFFFFF, qw[1], 1);
+                qstore[3] = _shfl_xor_1;
+                if (valid == 1) {
+                    {
+                        unsigned short _sf_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(qsf_a[0]));
+                        *(reinterpret_cast<unsigned char*>(q_sf + ((tok * num_heads + head) * 8 + sub)) + (0)) = (unsigned char)(_sf_pair & 0x7F);
+                    }
+                    if ((sub & 1) == 0) {
+                        reinterpret_cast<int4*>(q4 + (((tok * num_heads + head) * 64 + sub * 8) / 4))[0] = reinterpret_cast<int4*>(qstore)[0];
+                    }
+                }
+                if (is_first == 1) {
+                    unsigned int mw[2];
+                    float msf_a[1];
+                    float _fabs_16 = fabsf(qmv[0]);
+                    float _fabs_17 = fabsf(qmv[1]);
+                    float _fmax_15 = fmaxf(_fabs_16, _fabs_17);
+                    float _fabs_18 = fabsf(qmv[2]);
+                    float _fmax_16 = fmaxf(_fmax_15, _fabs_18);
+                    float _fabs_19 = fabsf(qmv[3]);
+                    float _fmax_17 = fmaxf(_fmax_16, _fabs_19);
+                    float _fabs_20 = fabsf(qmv[4]);
+                    float _fmax_18 = fmaxf(_fmax_17, _fabs_20);
+                    float _fabs_21 = fabsf(qmv[5]);
+                    float _fmax_19 = fmaxf(_fmax_18, _fabs_21);
+                    float _fabs_22 = fabsf(qmv[6]);
+                    float _fmax_20 = fmaxf(_fmax_19, _fabs_22);
+                    float _fabs_23 = fabsf(qmv[7]);
+                    float _fmax_21 = fmaxf(_fmax_20, _fabs_23);
+                    float _fabs_24 = fabsf(qmv[8]);
+                    float _fmax_22 = fmaxf(_fmax_21, _fabs_24);
+                    float _fabs_25 = fabsf(qmv[9]);
+                    float _fmax_23 = fmaxf(_fmax_22, _fabs_25);
+                    float _fabs_26 = fabsf(qmv[10]);
+                    float _fmax_24 = fmaxf(_fmax_23, _fabs_26);
+                    float _fabs_27 = fabsf(qmv[11]);
+                    float _fmax_25 = fmaxf(_fmax_24, _fabs_27);
+                    float _fabs_28 = fabsf(qmv[12]);
+                    float _fmax_26 = fmaxf(_fmax_25, _fabs_28);
+                    float _fabs_29 = fabsf(qmv[13]);
+                    float _fmax_27 = fmaxf(_fmax_26, _fabs_29);
+                    float _fabs_30 = fabsf(qmv[14]);
+                    float _fmax_28 = fmaxf(_fmax_27, _fabs_30);
+                    float _fabs_31 = fabsf(qmv[15]);
+                    float _fmax_29 = fmaxf(_fmax_28, _fabs_31);
+                    uint16_t _e4m3x2_f32_1;
+                    asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_1) : "f"(0.0f), "f"(_fmax_29 * 0.16666666666666666f));
+                    uint16_t _e4m3x2_decode_12 = (uint16_t)((unsigned int)_e4m3x2_f32_1 & 0xFFu);
+                    uint32_t _f16x2_decode_12;
+                    float _fp8_decode_1;
+                    asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_12) : "h"(_e4m3x2_decode_12));
+                    uint16_t _f16_decode_12 = (uint16_t)_f16x2_decode_12;
+                    asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_decode_1) : "h"(_f16_decode_12));
+                    float _fdiv_rn_2 = __fdiv_rn(1.0f, _fp8_decode_1);
+                    qmv[0] = qmv[0] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[1] = qmv[1] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[2] = qmv[2] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[3] = qmv[3] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[4] = qmv[4] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[5] = qmv[5] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[6] = qmv[6] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[7] = qmv[7] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[8] = qmv[8] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[9] = qmv[9] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[10] = qmv[10] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[11] = qmv[11] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[12] = qmv[12] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[13] = qmv[13] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[14] = qmv[14] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    qmv[15] = qmv[15] * ((_fp8_decode_1 != 0.0f) ? _fdiv_rn_2 : 0.0f);
+                    asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(mw[0]) : "f"(qmv[0]), "f"(qmv[1]), "f"(qmv[2]), "f"(qmv[3]), "f"(qmv[4]), "f"(qmv[5]), "f"(qmv[6]), "f"(qmv[7]));
+                    asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(mw[1]) : "f"(qmv[8]), "f"(qmv[9]), "f"(qmv[10]), "f"(qmv[11]), "f"(qmv[12]), "f"(qmv[13]), "f"(qmv[14]), "f"(qmv[15]));
+                    msf_a[0] = _fmax_29 * 0.16666666666666666f;
+                    int qmrow = qt * num_heads + head;
+                    *(reinterpret_cast<unsigned int*>(qm4 + (qmrow * 16 + sub * 2)) + (0)) = mw[0];
+                    *(reinterpret_cast<unsigned int*>(qm4 + (qmrow * 16 + sub * 2 + 1)) + (0)) = mw[1];
+                    {
+                        unsigned short _sf_pair;
+                        asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(msf_a[0]));
+                        *(reinterpret_cast<unsigned char*>(qm_sf + (qmrow * 8 + sub)) + (0)) = (unsigned char)(_sf_pair & 0x7F);
+                    }
+                }
+            }
+        }
+    }
+    int items_a = num_tiles * num_heads;
+    int n_a = ((items_a < num_bids) ? items_a : num_bids);
+    int b_first = bid;
+    int b_step = num_bids;
+    #pragma unroll 1
+    for (int work_1 = b_first; work_1 < num_tblk * num_heads; work_1 += b_step) {
+        int tblk = work_1 / num_heads;
+        int head_1 = work_1 % num_heads;
+        int vlive[8];
+        vlive[0] = ((tblk * 32 + (vblk * 4 + vhalf * 2) < total_tokens) ? 1 : 0);
+        float _vec_load_11[2];
+        {
+            uint32_t _bf16x2_bits_13;
+            _bf16x2_bits_13 = *reinterpret_cast<const uint32_t*>(V + ((((tblk * 32 + (vblk * 4 + vhalf * 2) < total_tokens) ? tblk * 32 + (vblk * 4 + vhalf * 2) : total_tokens - 1) * num_heads + head_1) * 128 + vdp * 2) + 0);
+            asm volatile(
+                "{\n\t"
+                "shl.b32 %0, %2, 16;\n\t"
+                "and.b32 %1, %2, 0xffff0000;\n\t"
+                "}\n"
+                : "=f"((&_vec_load_11[0])[0]), "=f"((&_vec_load_11[0])[1])
+                : "r"(_bf16x2_bits_13));
+        }
+        vlive[1] = ((tblk * 32 + (vblk * 4 + vhalf * 2 + 1) < total_tokens) ? 1 : 0);
+        float _vec_load_12[2];
+        {
+            uint32_t _bf16x2_bits_14;
+            _bf16x2_bits_14 = *reinterpret_cast<const uint32_t*>(V + ((((tblk * 32 + (vblk * 4 + vhalf * 2 + 1) < total_tokens) ? tblk * 32 + (vblk * 4 + vhalf * 2 + 1) : total_tokens - 1) * num_heads + head_1) * 128 + vdp * 2) + 0);
+            asm volatile(
+                "{\n\t"
+                "shl.b32 %0, %2, 16;\n\t"
+                "and.b32 %1, %2, 0xffff0000;\n\t"
+                "}\n"
+                : "=f"((&_vec_load_12[0])[0]), "=f"((&_vec_load_12[0])[1])
+                : "r"(_bf16x2_bits_14));
+        }
+        vlive[2] = ((tblk * 32 + (8 + vblk * 4 + vhalf * 2) < total_tokens) ? 1 : 0);
+        float _vec_load_13[2];
+        {
+            uint32_t _bf16x2_bits_15;
+            _bf16x2_bits_15 = *reinterpret_cast<const uint32_t*>(V + ((((tblk * 32 + (8 + vblk * 4 + vhalf * 2) < total_tokens) ? tblk * 32 + (8 + vblk * 4 + vhalf * 2) : total_tokens - 1) * num_heads + head_1) * 128 + vdp * 2) + 0);
+            asm volatile(
+                "{\n\t"
+                "shl.b32 %0, %2, 16;\n\t"
+                "and.b32 %1, %2, 0xffff0000;\n\t"
+                "}\n"
+                : "=f"((&_vec_load_13[0])[0]), "=f"((&_vec_load_13[0])[1])
+                : "r"(_bf16x2_bits_15));
+        }
+        vlive[3] = ((tblk * 32 + (8 + vblk * 4 + vhalf * 2 + 1) < total_tokens) ? 1 : 0);
+        float _vec_load_14[2];
+        {
+            uint32_t _bf16x2_bits_16;
+            _bf16x2_bits_16 = *reinterpret_cast<const uint32_t*>(V + ((((tblk * 32 + (8 + vblk * 4 + vhalf * 2 + 1) < total_tokens) ? tblk * 32 + (8 + vblk * 4 + vhalf * 2 + 1) : total_tokens - 1) * num_heads + head_1) * 128 + vdp * 2) + 0);
+            asm volatile(
+                "{\n\t"
+                "shl.b32 %0, %2, 16;\n\t"
+                "and.b32 %1, %2, 0xffff0000;\n\t"
+                "}\n"
+                : "=f"((&_vec_load_14[0])[0]), "=f"((&_vec_load_14[0])[1])
+                : "r"(_bf16x2_bits_16));
+        }
+        vlive[4] = ((tblk * 32 + (16 + vblk * 4 + vhalf * 2) < total_tokens) ? 1 : 0);
+        float _vec_load_15[2];
+        {
+            uint32_t _bf16x2_bits_17;
+            _bf16x2_bits_17 = *reinterpret_cast<const uint32_t*>(V + ((((tblk * 32 + (16 + vblk * 4 + vhalf * 2) < total_tokens) ? tblk * 32 + (16 + vblk * 4 + vhalf * 2) : total_tokens - 1) * num_heads + head_1) * 128 + vdp * 2) + 0);
+            asm volatile(
+                "{\n\t"
+                "shl.b32 %0, %2, 16;\n\t"
+                "and.b32 %1, %2, 0xffff0000;\n\t"
+                "}\n"
+                : "=f"((&_vec_load_15[0])[0]), "=f"((&_vec_load_15[0])[1])
+                : "r"(_bf16x2_bits_17));
+        }
+        vlive[5] = ((tblk * 32 + (16 + vblk * 4 + vhalf * 2 + 1) < total_tokens) ? 1 : 0);
+        float _vec_load_16[2];
+        {
+            uint32_t _bf16x2_bits_18;
+            _bf16x2_bits_18 = *reinterpret_cast<const uint32_t*>(V + ((((tblk * 32 + (16 + vblk * 4 + vhalf * 2 + 1) < total_tokens) ? tblk * 32 + (16 + vblk * 4 + vhalf * 2 + 1) : total_tokens - 1) * num_heads + head_1) * 128 + vdp * 2) + 0);
+            asm volatile(
+                "{\n\t"
+                "shl.b32 %0, %2, 16;\n\t"
+                "and.b32 %1, %2, 0xffff0000;\n\t"
+                "}\n"
+                : "=f"((&_vec_load_16[0])[0]), "=f"((&_vec_load_16[0])[1])
+                : "r"(_bf16x2_bits_18));
+        }
+        vlive[6] = ((tblk * 32 + (24 + vblk * 4 + vhalf * 2) < total_tokens) ? 1 : 0);
+        float _vec_load_17[2];
+        {
+            uint32_t _bf16x2_bits_19;
+            _bf16x2_bits_19 = *reinterpret_cast<const uint32_t*>(V + ((((tblk * 32 + (24 + vblk * 4 + vhalf * 2) < total_tokens) ? tblk * 32 + (24 + vblk * 4 + vhalf * 2) : total_tokens - 1) * num_heads + head_1) * 128 + vdp * 2) + 0);
+            asm volatile(
+                "{\n\t"
+                "shl.b32 %0, %2, 16;\n\t"
+                "and.b32 %1, %2, 0xffff0000;\n\t"
+                "}\n"
+                : "=f"((&_vec_load_17[0])[0]), "=f"((&_vec_load_17[0])[1])
+                : "r"(_bf16x2_bits_19));
+        }
+        vlive[7] = ((tblk * 32 + (24 + vblk * 4 + vhalf * 2 + 1) < total_tokens) ? 1 : 0);
+        float _vec_load_18[2];
+        {
+            uint32_t _bf16x2_bits_20;
+            _bf16x2_bits_20 = *reinterpret_cast<const uint32_t*>(V + ((((tblk * 32 + (24 + vblk * 4 + vhalf * 2 + 1) < total_tokens) ? tblk * 32 + (24 + vblk * 4 + vhalf * 2 + 1) : total_tokens - 1) * num_heads + head_1) * 128 + vdp * 2) + 0);
+            asm volatile(
+                "{\n\t"
+                "shl.b32 %0, %2, 16;\n\t"
+                "and.b32 %1, %2, 0xffff0000;\n\t"
+                "}\n"
+                : "=f"((&_vec_load_18[0])[0]), "=f"((&_vec_load_18[0])[1])
+                : "r"(_bf16x2_bits_20));
+        }
+        float va[8];
+        float vb[8];
+        va[0] = _vec_load_11[0];
+        vb[0] = _vec_load_11[1];
+        va[1] = _vec_load_12[0];
+        vb[1] = _vec_load_12[1];
+        va[2] = _vec_load_13[0];
+        vb[2] = _vec_load_13[1];
+        va[3] = _vec_load_14[0];
+        vb[3] = _vec_load_14[1];
+        va[4] = _vec_load_15[0];
+        vb[4] = _vec_load_15[1];
+        va[5] = _vec_load_16[0];
+        vb[5] = _vec_load_16[1];
+        va[6] = _vec_load_17[0];
+        vb[6] = _vec_load_17[1];
+        va[7] = _vec_load_18[0];
+        vb[7] = _vec_load_18[1];
+        va[0] = ((vlive[0] == 1) ? va[0] : 0.0f);
+        vb[0] = ((vlive[0] == 1) ? vb[0] : 0.0f);
+        va[1] = ((vlive[1] == 1) ? va[1] : 0.0f);
+        vb[1] = ((vlive[1] == 1) ? vb[1] : 0.0f);
+        va[2] = ((vlive[2] == 1) ? va[2] : 0.0f);
+        vb[2] = ((vlive[2] == 1) ? vb[2] : 0.0f);
+        va[3] = ((vlive[3] == 1) ? va[3] : 0.0f);
+        vb[3] = ((vlive[3] == 1) ? vb[3] : 0.0f);
+        va[4] = ((vlive[4] == 1) ? va[4] : 0.0f);
+        vb[4] = ((vlive[4] == 1) ? vb[4] : 0.0f);
+        va[5] = ((vlive[5] == 1) ? va[5] : 0.0f);
+        vb[5] = ((vlive[5] == 1) ? vb[5] : 0.0f);
+        va[6] = ((vlive[6] == 1) ? va[6] : 0.0f);
+        vb[6] = ((vlive[6] == 1) ? vb[6] : 0.0f);
+        va[7] = ((vlive[7] == 1) ? va[7] : 0.0f);
+        vb[7] = ((vlive[7] == 1) ? vb[7] : 0.0f);
+        float amax_a = 0.0f;
+        float amax_b = 0.0f;
+        for (int ii = 0; ii < 8; ii++) {
+            float _fabs_32 = fabsf(va[ii]);
+            float _fmax_30 = fmaxf(amax_a, _fabs_32);
+            amax_a = _fmax_30;
+            float _fabs_33 = fabsf(vb[ii]);
+            float _fmax_31 = fmaxf(amax_b, _fabs_33);
+            amax_b = _fmax_31;
+        }
+        float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, amax_a, 16);
+        float _fmax_32 = fmaxf(amax_a, _shfl_xor_2);
+        amax_a = _fmax_32;
+        float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, amax_b, 16);
+        float _fmax_33 = fmaxf(amax_b, _shfl_xor_3);
+        amax_b = _fmax_33;
+        float vsf_a = amax_a * 0.16666666666666666f;
+        float vsf_b = amax_b * 0.16666666666666666f;
+        uint16_t _e4m3x2_f32_2;
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_2) : "f"(vsf_b), "f"(vsf_a));
+        uint16_t _e4m3x2_decode_21 = (uint16_t)((unsigned int)_e4m3x2_f32_2 & 0xFFu);
+        uint32_t _f16x2_decode_21;
+        float _fp8_decode_2;
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_21) : "h"(_e4m3x2_decode_21));
+        uint16_t _f16_decode_21 = (uint16_t)_f16x2_decode_21;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_decode_2) : "h"(_f16_decode_21));
+        float vdec_a = _fp8_decode_2;
+        uint16_t _e4m3x2_decode_22 = (uint16_t)((unsigned int)_e4m3x2_f32_2 >> 8 & 0xFFu);
+        uint32_t _f16x2_decode_22;
+        float _fp8_decode_3;
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_22) : "h"(_e4m3x2_decode_22));
+        uint16_t _f16_decode_22 = (uint16_t)_f16x2_decode_22;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_decode_3) : "h"(_f16_decode_22));
+        float vdec_b = _fp8_decode_3;
+        float _fdiv_rn_3 = __fdiv_rn(1.0f, vdec_a);
+        float vinv_a = ((vdec_a != 0.0f) ? _fdiv_rn_3 : 0.0f);
+        float _fdiv_rn_4 = __fdiv_rn(1.0f, vdec_b);
+        float vinv_b = ((vdec_b != 0.0f) ? _fdiv_rn_4 : 0.0f);
+        for (int ii_1 = 0; ii_1 < 8; ii_1++) {
+            va[ii_1] = va[ii_1] * vinv_a;
+            vb[ii_1] = vb[ii_1] * vinv_b;
+        }
+        unsigned int vwa[1];
+        unsigned int vwb[1];
+        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(vwa[0]) : "f"(va[0]), "f"(va[1]), "f"(va[2]), "f"(va[3]), "f"(va[4]), "f"(va[5]), "f"(va[6]), "f"(va[7]));
+        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(vwb[0]) : "f"(vb[0]), "f"(vb[1]), "f"(vb[2]), "f"(vb[3]), "f"(vb[4]), "f"(vb[5]), "f"(vb[6]), "f"(vb[7]));
+        int row_words = total_padded >> 3;
+        int vt_word = (head_1 * 128 + vdp * 2) * row_words + (tblk * 32 >> 3) + vblk * 2 + vhalf;
+        *(reinterpret_cast<unsigned int*>(vt4 + vt_word) + (0)) = vwa[0];
+        *(reinterpret_cast<unsigned int*>(vt4 + (vt_word + row_words)) + (0)) = vwb[0];
+        if (vhalf == 0) {
+            int vsf_base = ((head_1 * num_kblocks + (tblk * 32 >> 7)) * 128 + vdp * 2) * 8 + (((tblk * 32 & 127) >> 4) + vblk);
+            {
+                unsigned short _sf_pair;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(vsf_a));
+                *(reinterpret_cast<unsigned char*>(v_sf + vsf_base) + (0)) = (unsigned char)(_sf_pair & 0x7F);
+            }
+            {
+                unsigned short _sf_pair;
+                asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(vsf_b));
+                *(reinterpret_cast<unsigned char*>(v_sf + (vsf_base + 8)) + (0)) = (unsigned char)(_sf_pair & 0x7F);
+            }
+        }
+    }
+    #pragma unroll 1
+    for (int work_2 = bid; work_2 < num_tiles * num_heads; work_2 += num_bids) {
+        int tile_1 = work_2 / num_heads;
+        int head_2 = work_2 % num_heads;
+        int _vec_load_19[4];
+        {
+            const int4* _ivptr_23 = reinterpret_cast<const int4*>(tile_table + (8 * tile_1) + 0);
+            int4 _ivld_23;
+            _ivld_23 = *_ivptr_23;
+            _vec_load_19[0 + 0] = _ivld_23.x;
+            _vec_load_19[0 + 1] = _ivld_23.y;
+            _vec_load_19[0 + 2] = _ivld_23.z;
+            _vec_load_19[0 + 3] = _ivld_23.w;
+        }
+        int _vec_load_20[4];
+        {
+            const int4* _ivptr_24 = reinterpret_cast<const int4*>(tile_table + (8 * tile_1 + 4) + 0);
+            int4 _ivld_24;
+            _ivld_24 = *_ivptr_24;
+            _vec_load_20[0 + 0] = _ivld_24.x;
+            _vec_load_20[0 + 1] = _ivld_24.y;
+            _vec_load_20[0 + 2] = _ivld_24.z;
+            _vec_load_20[0 + 3] = _ivld_24.w;
+        }
+        int seg_1 = _vec_load_19[0];
+        int row_begin_1 = _vec_load_19[1];
+        int row_end_1 = _vec_load_19[2];
+        int t0_1 = _vec_load_19[3];
+        int t1 = _vec_load_20[0];
+        int length = _vec_load_20[1];
+        float ksum[8];
+        for (int e_3 = 0; e_3 < 8; e_3++) {
+            ksum[e_3] = 0.0f;
+        }
+        float kf8[8];
+        #pragma unroll 1
+        for (int batch_1 = 0; batch_1 < (row_end_1 - row_begin_1 + 128 - 1) / 128; batch_1++) {
+            int brow_1 = row_begin_1 + batch_1 * 128;
+            float _vec_load_21[8];
+            {
+                const uint4* _vptr_25 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + rgrp) ? brow_1 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
+                uint4 _vld_25[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_25[_blk] = _vptr_25[_blk];
+                    uint32_t* _vpairs_25 = reinterpret_cast<uint32_t*>(&_vld_25[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_21[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_21[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_25[_pair]));
+                    }
+                }
+            }
+            float _vec_load_22[8];
+            {
+                const uint4* _vptr_26 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 16 + rgrp) ? brow_1 + 16 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
+                uint4 _vld_26[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_26[_blk] = _vptr_26[_blk];
+                    uint32_t* _vpairs_26 = reinterpret_cast<uint32_t*>(&_vld_26[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_22[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_22[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_26[_pair]));
+                    }
+                }
+            }
+            float _vec_load_23[8];
+            {
+                const uint4* _vptr_27 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 32 + rgrp) ? brow_1 + 32 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
+                uint4 _vld_27[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_27[_blk] = _vptr_27[_blk];
+                    uint32_t* _vpairs_27 = reinterpret_cast<uint32_t*>(&_vld_27[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_23[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_23[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_27[_pair]));
+                    }
+                }
+            }
+            float _vec_load_24[8];
+            {
+                const uint4* _vptr_28 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 48 + rgrp) ? brow_1 + 48 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
+                uint4 _vld_28[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_28[_blk] = _vptr_28[_blk];
+                    uint32_t* _vpairs_28 = reinterpret_cast<uint32_t*>(&_vld_28[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_24[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_24[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_28[_pair]));
+                    }
+                }
+            }
+            float _vec_load_25[8];
+            {
+                const uint4* _vptr_29 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 64 + rgrp) ? brow_1 + 64 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
+                uint4 _vld_29[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_29[_blk] = _vptr_29[_blk];
+                    uint32_t* _vpairs_29 = reinterpret_cast<uint32_t*>(&_vld_29[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_25[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_25[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_29[_pair]));
+                    }
+                }
+            }
+            float _vec_load_26[8];
+            {
+                const uint4* _vptr_30 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 80 + rgrp) ? brow_1 + 80 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
+                uint4 _vld_30[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_30[_blk] = _vptr_30[_blk];
+                    uint32_t* _vpairs_30 = reinterpret_cast<uint32_t*>(&_vld_30[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_26[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_26[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_30[_pair]));
+                    }
+                }
+            }
+            float _vec_load_27[8];
+            {
+                const uint4* _vptr_31 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 96 + rgrp) ? brow_1 + 96 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
+                uint4 _vld_31[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_31[_blk] = _vptr_31[_blk];
+                    uint32_t* _vpairs_31 = reinterpret_cast<uint32_t*>(&_vld_31[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_27[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_27[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_31[_pair]));
+                    }
+                }
+            }
+            float _vec_load_28[8];
+            {
+                const uint4* _vptr_32 = reinterpret_cast<const uint4*>(K + ((((row_end_1 > brow_1 + 112 + rgrp) ? brow_1 + 112 + rgrp : row_end_1 - 1) * num_heads + head_2) * 128 + col) + 0);
+                uint4 _vld_32[1];
+                #pragma unroll
+                for (int _blk = 0; _blk < 1; _blk++) {
+                    _vld_32[_blk] = _vptr_32[_blk];
+                    uint32_t* _vpairs_32 = reinterpret_cast<uint32_t*>(&_vld_32[_blk]);
+                    #pragma unroll
+                    for (int _pair = 0; _pair < 4; _pair++) {
+                        asm volatile(
+                            "{\n\t"
+                            "shl.b32 %0, %2, 16;\n\t"
+                            "and.b32 %1, %2, 0xffff0000;\n\t"
+                            "}\n"
+                            : "=f"((&_vec_load_28[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_28[0 + _blk * 8 + _pair * 2])[1])
+                            : "r"(_vpairs_32[_pair]));
+                    }
+                }
+            }
+            kf8[0] = _vec_load_21[0];
+            kf8[1] = _vec_load_21[1];
+            kf8[2] = _vec_load_21[2];
+            kf8[3] = _vec_load_21[3];
+            kf8[4] = _vec_load_21[4];
+            kf8[5] = _vec_load_21[5];
+            kf8[6] = _vec_load_21[6];
+            kf8[7] = _vec_load_21[7];
+            ksum[0] = ksum[0] + ((row_end_1 > brow_1 + rgrp) ? kf8[0] : 0.0f);
+            ksum[1] = ksum[1] + ((row_end_1 > brow_1 + rgrp) ? kf8[1] : 0.0f);
+            ksum[2] = ksum[2] + ((row_end_1 > brow_1 + rgrp) ? kf8[2] : 0.0f);
+            ksum[3] = ksum[3] + ((row_end_1 > brow_1 + rgrp) ? kf8[3] : 0.0f);
+            ksum[4] = ksum[4] + ((row_end_1 > brow_1 + rgrp) ? kf8[4] : 0.0f);
+            ksum[5] = ksum[5] + ((row_end_1 > brow_1 + rgrp) ? kf8[5] : 0.0f);
+            ksum[6] = ksum[6] + ((row_end_1 > brow_1 + rgrp) ? kf8[6] : 0.0f);
+            ksum[7] = ksum[7] + ((row_end_1 > brow_1 + rgrp) ? kf8[7] : 0.0f);
+            kf8[0] = _vec_load_22[0];
+            kf8[1] = _vec_load_22[1];
+            kf8[2] = _vec_load_22[2];
+            kf8[3] = _vec_load_22[3];
+            kf8[4] = _vec_load_22[4];
+            kf8[5] = _vec_load_22[5];
+            kf8[6] = _vec_load_22[6];
+            kf8[7] = _vec_load_22[7];
+            ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[0] : 0.0f);
+            ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[1] : 0.0f);
+            ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[2] : 0.0f);
+            ksum[3] = ksum[3] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[3] : 0.0f);
+            ksum[4] = ksum[4] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[4] : 0.0f);
+            ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[5] : 0.0f);
+            ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[6] : 0.0f);
+            ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 16 + rgrp) ? kf8[7] : 0.0f);
+            kf8[0] = _vec_load_23[0];
+            kf8[1] = _vec_load_23[1];
+            kf8[2] = _vec_load_23[2];
+            kf8[3] = _vec_load_23[3];
+            kf8[4] = _vec_load_23[4];
+            kf8[5] = _vec_load_23[5];
+            kf8[6] = _vec_load_23[6];
+            kf8[7] = _vec_load_23[7];
+            ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[0] : 0.0f);
+            ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[1] : 0.0f);
+            ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[2] : 0.0f);
+            ksum[3] = ksum[3] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[3] : 0.0f);
+            ksum[4] = ksum[4] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[4] : 0.0f);
+            ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[5] : 0.0f);
+            ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[6] : 0.0f);
+            ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 32 + rgrp) ? kf8[7] : 0.0f);
+            kf8[0] = _vec_load_24[0];
+            kf8[1] = _vec_load_24[1];
+            kf8[2] = _vec_load_24[2];
+            kf8[3] = _vec_load_24[3];
+            kf8[4] = _vec_load_24[4];
+            kf8[5] = _vec_load_24[5];
+            kf8[6] = _vec_load_24[6];
+            kf8[7] = _vec_load_24[7];
+            ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[0] : 0.0f);
+            ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[1] : 0.0f);
+            ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[2] : 0.0f);
+            ksum[3] = ksum[3] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[3] : 0.0f);
+            ksum[4] = ksum[4] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[4] : 0.0f);
+            ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[5] : 0.0f);
+            ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[6] : 0.0f);
+            ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 48 + rgrp) ? kf8[7] : 0.0f);
+            kf8[0] = _vec_load_25[0];
+            kf8[1] = _vec_load_25[1];
+            kf8[2] = _vec_load_25[2];
+            kf8[3] = _vec_load_25[3];
+            kf8[4] = _vec_load_25[4];
+            kf8[5] = _vec_load_25[5];
+            kf8[6] = _vec_load_25[6];
+            kf8[7] = _vec_load_25[7];
+            ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[0] : 0.0f);
+            ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[1] : 0.0f);
+            ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[2] : 0.0f);
+            ksum[3] = ksum[3] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[3] : 0.0f);
+            ksum[4] = ksum[4] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[4] : 0.0f);
+            ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[5] : 0.0f);
+            ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[6] : 0.0f);
+            ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 64 + rgrp) ? kf8[7] : 0.0f);
+            kf8[0] = _vec_load_26[0];
+            kf8[1] = _vec_load_26[1];
+            kf8[2] = _vec_load_26[2];
+            kf8[3] = _vec_load_26[3];
+            kf8[4] = _vec_load_26[4];
+            kf8[5] = _vec_load_26[5];
+            kf8[6] = _vec_load_26[6];
+            kf8[7] = _vec_load_26[7];
+            ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[0] : 0.0f);
+            ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[1] : 0.0f);
+            ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[2] : 0.0f);
+            ksum[3] = ksum[3] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[3] : 0.0f);
+            ksum[4] = ksum[4] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[4] : 0.0f);
+            ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[5] : 0.0f);
+            ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[6] : 0.0f);
+            ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 80 + rgrp) ? kf8[7] : 0.0f);
+            kf8[0] = _vec_load_27[0];
+            kf8[1] = _vec_load_27[1];
+            kf8[2] = _vec_load_27[2];
+            kf8[3] = _vec_load_27[3];
+            kf8[4] = _vec_load_27[4];
+            kf8[5] = _vec_load_27[5];
+            kf8[6] = _vec_load_27[6];
+            kf8[7] = _vec_load_27[7];
+            ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[0] : 0.0f);
+            ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[1] : 0.0f);
+            ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[2] : 0.0f);
+            ksum[3] = ksum[3] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[3] : 0.0f);
+            ksum[4] = ksum[4] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[4] : 0.0f);
+            ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[5] : 0.0f);
+            ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[6] : 0.0f);
+            ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 96 + rgrp) ? kf8[7] : 0.0f);
+            kf8[0] = _vec_load_28[0];
+            kf8[1] = _vec_load_28[1];
+            kf8[2] = _vec_load_28[2];
+            kf8[3] = _vec_load_28[3];
+            kf8[4] = _vec_load_28[4];
+            kf8[5] = _vec_load_28[5];
+            kf8[6] = _vec_load_28[6];
+            kf8[7] = _vec_load_28[7];
+            ksum[0] = ksum[0] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[0] : 0.0f);
+            ksum[1] = ksum[1] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[1] : 0.0f);
+            ksum[2] = ksum[2] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[2] : 0.0f);
+            ksum[3] = ksum[3] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[3] : 0.0f);
+            ksum[4] = ksum[4] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[4] : 0.0f);
+            ksum[5] = ksum[5] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[5] : 0.0f);
+            ksum[6] = ksum[6] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[6] : 0.0f);
+            ksum[7] = ksum[7] + ((row_end_1 > brow_1 + 112 + rgrp) ? kf8[7] : 0.0f);
+        }
+        for (int e_4 = 0; e_4 < 8; e_4++) {
+            red_sum[rgrp * 128 + col + e_4] = ksum[e_4];
+        }
+        __syncthreads();
+        int direct = ((t1 - t0_1 == 1) ? 1 : 0);
+        if (direct == 0) {
+            if (tid < 128) {
+                float total = 0.0f;
+                for (int g_1 = 0; g_1 < 16; g_1++) {
+                    total = total + red_sum[g_1 * 128 + tid];
+                }
+                *(reinterpret_cast<float*>(partials + (work_2 * 128 + tid)) + (0)) = total;
+            }
+            __syncthreads();
+            if (tid == 0) {
+                unsigned int _atomic_old_0;
+                asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                    : "=r"(_atomic_old_0) : "l"(&counters[seg_1 * num_heads + head_2]), "r"(static_cast<uint32_t>(1)) : "memory");
+                unsigned int old = _atomic_old_0;
+                int last = (((int)old == t1 - t0_1 - 1) ? 1 : 0);
+                flag[0] = last;
+                if (last == 1) {
+                    *(reinterpret_cast<unsigned int*>(counters + (seg_1 * num_heads + head_2)) + (0)) = (unsigned int)0;
+                }
+            }
+            __syncthreads();
+        }
+        int is_last = ((direct == 0) ? flag[0] : 1);
+        if (is_last == 1) {
+            if (tid < 128) {
+                float acc_a[1];
+                float fold_v[4];
+                acc_a[0] = 0.0f;
+                if (direct == 1) {
+                    for (int g_2 = 0; g_2 < 16; g_2++) {
+                        acc_a[0] = acc_a[0] + red_sum[g_2 * 128 + tid];
+                    }
+                } else {
+                    #pragma unroll 1
+                    for (int tt = t0_1; tt < t1; tt += 4) {
+                        for (int j = 0; j < 4; j++) {
+                            int ttj = ((t1 > tt + j) ? tt + j : t1 - 1);
+                            fold_v[j] = partials[(ttj * num_heads + head_2) * 128 + tid];
+                        }
+                        for (int j_1 = 0; j_1 < 4; j_1++) {
+                            float fv = ((t1 > tt + j_1) ? fold_v[j_1] : 0.0f);
+                            acc_a[0] = acc_a[0] + fv;
+                        }
+                    }
+                }
+                if (length > 0) {
+                    float lenf = (float)length;
+                    float _fdiv_rn_5 = __fdiv_rn(acc_a[0], lenf);
+                    *(reinterpret_cast<float*>(mean_k + ((seg_1 * num_heads + head_2) * 128 + tid)) + (0)) = _fdiv_rn_5;
+                }
+            }
+        }
+        __syncthreads();
+    }
+    int items_d = num_tblk * num_heads;
+    int d_first = bid;
+    __syncthreads();
+    if (tid == 0) {
+        unsigned int gridu = (unsigned int)num_bids;
+        unsigned int increment = 1;
+        if (bid == 0) {
+            increment = 2147483649u - gridu;
+        }
+        unsigned int _atomic_old_1;
+        asm volatile("atom.release.gpu.global.add.u32 %0, [%1], %2;"
+            : "=r"(_atomic_old_1) : "l"(&barrier[0]), "r"(static_cast<uint32_t>(increment)) : "memory");
+        unsigned int old_1 = _atomic_old_1;
+        unsigned int _wait_acquire_mask_0;
+        do {
+        asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(_wait_acquire_mask_0) : "l"((reinterpret_cast<unsigned int*>(barrier) + (0))) : "memory");
+        } while (((_wait_acquire_mask_0 ^ static_cast<unsigned int>((old_1 ^ 2147483648u) & 2147483648u)) & static_cast<unsigned int>(2147483648)) != 0);
+    }
+    __syncthreads();
+    asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
+    #pragma unroll 1
+    for (int work_3 = d_first; work_3 < items_d; work_3 += num_bids) {
+        int tblk_1 = work_3 / num_heads;
+        int head_3 = work_3 % num_heads;
+        int tok_1 = tblk_1 * 32 + trow;
+        int valid_1 = ((tok_1 < total_tokens) ? 1 : 0);
+        int tok_c_1 = ((tok_1 < total_tokens) ? tok_1 : total_tokens - 1);
+        float _vec_load_29[16];
+        {
+            const uint4* _vptr_33 = reinterpret_cast<const uint4*>(K + ((tok_c_1 * num_heads + head_3) * 128 + col16) + 0);
+            uint4 _vld_33[2];
+            #pragma unroll
+            for (int _blk = 0; _blk < 2; _blk++) {
+                _vld_33[_blk] = _vptr_33[_blk];
+                uint32_t* _vpairs_33 = reinterpret_cast<uint32_t*>(&_vld_33[_blk]);
+                #pragma unroll
+                for (int _pair = 0; _pair < 4; _pair++) {
+                    asm volatile(
+                        "{\n\t"
+                        "shl.b32 %0, %2, 16;\n\t"
+                        "and.b32 %1, %2, 0xffff0000;\n\t"
+                        "}\n"
+                        : "=f"((&_vec_load_29[0 + _blk * 8 + _pair * 2])[0]), "=f"((&_vec_load_29[0 + _blk * 8 + _pair * 2])[1])
+                        : "r"(_vpairs_33[_pair]));
+                }
+            }
+        }
+        int seg_2 = tok_seg[tok_c_1];
+        int mbase = (seg_2 * num_heads + head_3) * 128 + col16;
+        float kc[16];
+        for (int quad_1 = 0; quad_1 < 4; quad_1++) {
+            float _vec_load_30[4];
+            {
+                float4 _v4 = *reinterpret_cast<const float4*>(mean_k + (mbase + quad_1 * 4) + 0);
+                _vec_load_30[0 + 0] = _v4.x;
+                _vec_load_30[0 + 1] = _v4.y;
+                _vec_load_30[0 + 2] = _v4.z;
+                _vec_load_30[0 + 3] = _v4.w;
+            }
+            for (int e_5 = 0; e_5 < 4; e_5++) {
+                float kf = _vec_load_29[quad_1 * 4 + e_5];
+                kc[quad_1 * 4 + e_5] = ((valid_1 == 1) ? kf - _vec_load_30[e_5] : 0.0f);
+            }
+        }
+        unsigned int kw[2];
+        float ksf_a[1];
+        float _fabs_34 = fabsf(kc[0]);
+        float _fabs_35 = fabsf(kc[1]);
+        float _fmax_34 = fmaxf(_fabs_34, _fabs_35);
+        float _fabs_36 = fabsf(kc[2]);
+        float _fmax_35 = fmaxf(_fmax_34, _fabs_36);
+        float _fabs_37 = fabsf(kc[3]);
+        float _fmax_36 = fmaxf(_fmax_35, _fabs_37);
+        float _fabs_38 = fabsf(kc[4]);
+        float _fmax_37 = fmaxf(_fmax_36, _fabs_38);
+        float _fabs_39 = fabsf(kc[5]);
+        float _fmax_38 = fmaxf(_fmax_37, _fabs_39);
+        float _fabs_40 = fabsf(kc[6]);
+        float _fmax_39 = fmaxf(_fmax_38, _fabs_40);
+        float _fabs_41 = fabsf(kc[7]);
+        float _fmax_40 = fmaxf(_fmax_39, _fabs_41);
+        float _fabs_42 = fabsf(kc[8]);
+        float _fmax_41 = fmaxf(_fmax_40, _fabs_42);
+        float _fabs_43 = fabsf(kc[9]);
+        float _fmax_42 = fmaxf(_fmax_41, _fabs_43);
+        float _fabs_44 = fabsf(kc[10]);
+        float _fmax_43 = fmaxf(_fmax_42, _fabs_44);
+        float _fabs_45 = fabsf(kc[11]);
+        float _fmax_44 = fmaxf(_fmax_43, _fabs_45);
+        float _fabs_46 = fabsf(kc[12]);
+        float _fmax_45 = fmaxf(_fmax_44, _fabs_46);
+        float _fabs_47 = fabsf(kc[13]);
+        float _fmax_46 = fmaxf(_fmax_45, _fabs_47);
+        float _fabs_48 = fabsf(kc[14]);
+        float _fmax_47 = fmaxf(_fmax_46, _fabs_48);
+        float _fabs_49 = fabsf(kc[15]);
+        float _fmax_48 = fmaxf(_fmax_47, _fabs_49);
+        uint16_t _e4m3x2_f32_3;
+        asm("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_f32_3) : "f"(0.0f), "f"(_fmax_48 * 0.16666666666666666f));
+        uint16_t _e4m3x2_decode_35 = (uint16_t)((unsigned int)_e4m3x2_f32_3 & 0xFFu);
+        uint32_t _f16x2_decode_35;
+        float _fp8_decode_4;
+        asm("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_decode_35) : "h"(_e4m3x2_decode_35));
+        uint16_t _f16_decode_35 = (uint16_t)_f16x2_decode_35;
+        asm("cvt.f32.f16 %0, %1;" : "=f"(_fp8_decode_4) : "h"(_f16_decode_35));
+        float _fdiv_rn_6 = __fdiv_rn(1.0f, _fp8_decode_4);
+        kc[0] = kc[0] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[1] = kc[1] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[2] = kc[2] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[3] = kc[3] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[4] = kc[4] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[5] = kc[5] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[6] = kc[6] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[7] = kc[7] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[8] = kc[8] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[9] = kc[9] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[10] = kc[10] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[11] = kc[11] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[12] = kc[12] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[13] = kc[13] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[14] = kc[14] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        kc[15] = kc[15] * ((_fp8_decode_4 != 0.0f) ? _fdiv_rn_6 : 0.0f);
+        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(kw[0]) : "f"(kc[0]), "f"(kc[1]), "f"(kc[2]), "f"(kc[3]), "f"(kc[4]), "f"(kc[5]), "f"(kc[6]), "f"(kc[7]));
+        asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(kw[1]) : "f"(kc[8]), "f"(kc[9]), "f"(kc[10]), "f"(kc[11]), "f"(kc[12]), "f"(kc[13]), "f"(kc[14]), "f"(kc[15]));
+        ksf_a[0] = _fmax_48 * 0.16666666666666666f;
+        unsigned int kstore[4];
+        unsigned int _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, kw[0], 1);
+        kstore[0] = _shfl_xor_4;
+        unsigned int _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, kw[1], 1);
+        kstore[1] = _shfl_xor_5;
+        kstore[2] = kw[0];
+        kstore[3] = kw[1];
+        {
+            unsigned short _sf_pair;
+            asm("cvt.rn.satfinite.e4m3x2.f32 %0, 0f00000000, %1;" : "=h"(_sf_pair) : "f"(ksf_a[0]));
+            *(reinterpret_cast<unsigned char*>(k_sf + (((head_3 * num_kblocks + (tok_1 >> 7)) * 128 + (tok_1 & 127)) * 8 + sub)) + (0)) = (unsigned char)(_sf_pair & 0x7F);
+        }
+        if (valid_1 == 1) {
+            if ((sub & 1) == 1) {
+                reinterpret_cast<int4*>(k4 + (((tok_1 * num_heads + head_3) * 64 + (sub - 1) * 8) / 4))[0] = reinterpret_cast<int4*>(kstore)[0];
+            }
+        }
+    }
+}
+
+}  // namespace h3_varlen_preproc_sage_sm120a
+#undef H3_VARLEN_INF
+#undef NUM_MAIN_STAGES
+#undef SMEM_FLAG_OFF
+#undef SMEM_FLAG_STAGE_BYTES
+#undef SMEM_FLAG_STRIDE
+#undef SMEM_RED_Q_OFF
+#undef SMEM_RED_Q_STAGE_BYTES
+#undef SMEM_RED_Q_STRIDE
+#undef SMEM_RED_SUM_OFF
+#undef SMEM_RED_SUM_STAGE_BYTES
+#undef SMEM_RED_SUM_STRIDE
+#undef SMEM_TOTAL
+#undef THREADS
+
 namespace h3_varlen_attention_sage_sm120a {
 
 __device__ __forceinline__ int make_warp_uniform(int x) {
@@ -1430,7 +2782,7 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
 
 __device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
     asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
+        :: "l"(mbar_addr), "r"(count) : "memory");
 }
 
 
@@ -3861,13 +5213,21 @@ constexpr int64_t kBlockN = 128;
 constexpr int64_t kMaxHeads = 32768;
 constexpr int kStatsThreads = 256;
 constexpr int kQuantThreads = 256;
+constexpr int kPreprocThreads = 256;
 constexpr int kAttentionThreads = 256;
 constexpr int kStatsSmemBytes = 16512;
 constexpr int kQuantSmemBytes = 0;
+constexpr int kPreprocSmemBytes = 16512;
 constexpr int64_t kQuantTokens = 32;      // tokens per quantizer CTA
 constexpr int kAttentionSmemBytes = 48128;  // Q tile + two-stage K / K-scale / V^T / V-scale ring + mbarriers
 constexpr int64_t kStatsCtasPerSm = 4;
 constexpr int64_t kQuantCtasPerSm = 8;
+constexpr int64_t kPreprocMaxCtasPerSm = 8;
+// Pre-processing route (measured window): the fused launch when kPreprocFusedMinTokens <= padded tokens
+// <= kPreprocFusedMaxTokens (max < 0 = no upper bound, max == 0 = never fused); other plans run the
+// statistics + quantizer launches.
+constexpr int64_t kPreprocFusedMinTokens = 2048;
+constexpr int64_t kPreprocFusedMaxTokens = 16384;
 constexpr int64_t kRowBytes4 = kHeadDim / 2;          // packed E2M1 bytes per (token, head) row
 constexpr int64_t kBlocksPerRow = kHeadDim / 16;      // UE4M3 block scales per row
 constexpr int64_t kScaleTileBytes = kBlockN * kBlocksPerRow;  // 1 KiB K- or V-scale tile per (head, key block)
@@ -3877,6 +5237,7 @@ constexpr int64_t kPartialFloats = kHeadDim;
 
 struct DeviceInfo {
   int num_sms;
+  int preproc_ctas_per_sm;  // driver co-resident capacity of the fused pre-processing kernel (grid barrier)
 };
 
 DeviceInfo ConfigureKernels() {
@@ -3900,7 +5261,14 @@ DeviceInfo ConfigureKernels() {
                                 cudaFuncAttributeMaxDynamicSharedMemorySize, kAttentionSmemBytes);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "failed to opt in to dynamic shared memory: " << cudaGetErrorString(status);
-  DeviceInfo info{properties.multiProcessorCount};
+  int preproc_ctas_per_sm = 0;
+  status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+      &preproc_ctas_per_sm, h3_varlen_preproc_sage_sm120a::kernel_minimax_h3_sm120_varlen_preproc2_sage,
+      kPreprocThreads, kPreprocSmemBytes);
+  TVM_FFI_CHECK(status == cudaSuccess && preproc_ctas_per_sm >= 1, RuntimeError)
+      << "failed to query the fused pre-processing kernel occupancy: " << cudaGetErrorString(status);
+  DeviceInfo info{properties.multiProcessorCount,
+                  static_cast<int>(std::min<int64_t>(preproc_ctas_per_sm, kPreprocMaxCtasPerSm))};
   configured.emplace_back(device, info);
   return info;
 }
@@ -4007,14 +5375,15 @@ CUtensorMap EncodeTransposedTile(const TensorView& vt, int64_t padded_tokens, in
 //   [>= heads * num_kblocks * 1024], qm4 uint8 [>= num_qtiles * heads * 64], qm_sf uint8 [>= num_qtiles * heads * 8],
 //   vt4 uint8 [>= heads * 128 * padded_tokens / 2], q_mean f32 [>= num_qtiles * heads * 128], mean_k f32
 //   [>= segments * heads * 128], partials f32 [>= num_tiles * heads * 128], counters uint32 [>= segments * heads]
-//   (zero before the first call; the kernel resets them).
+//   (zero before the first call; the kernel resets them), barrier uint32 [>= 1] (zero before the first call;
+//   the fused pre-processing launch's self-resetting grid-barrier word, never reused as a counter).
 void minimax_h3_sm120_varlen_attention_nvfp4(TensorView q, TensorView k, TensorView v, TensorView tok_seg,
                                              TensorView cu_seqlens, TensorView seg_tile_begin, TensorView out,
                                              TensorView tile_table, TensorView unit_table, TensorView q4,
                                              TensorView k4, TensorView q_sf, TensorView k_sf, TensorView qm4,
                                              TensorView qm_sf, TensorView vt4, TensorView v_sf, TensorView q_mean,
                                              TensorView mean_k, TensorView partials, TensorView counters,
-                                             int64_t num_segments, int64_t num_tiles, int64_t num_qtiles,
+                                             TensorView barrier, int64_t num_segments, int64_t num_tiles, int64_t num_qtiles,
                                              int64_t num_units, int64_t attention_grid, double softmax_scale) {
   TVM_FFI_CHECK(q.ndim() == 3, ValueError) << "q must be [tokens, heads, 128]";
   const int64_t tokens = q.size(0);
@@ -4049,6 +5418,7 @@ void minimax_h3_sm120_varlen_attention_nvfp4(TensorView q, TensorView k, TensorV
   CheckFlat(mean_k, "mean_k", dl_float32, "float32", num_segments * heads * kHeadDim, device);
   CheckFlat(partials, "partials", dl_float32, "float32", std::max<int64_t>(1, num_tiles * heads * kPartialFloats), device);
   CheckFlat(counters, "counters", dl_uint32, "uint32", std::max<int64_t>(1, num_segments) * heads, device);
+  CheckFlat(barrier, "barrier", dl_uint32, "uint32", 1, device);
 
   ffi::CUDADeviceGuard device_guard(device.device_id);
   const cudaStream_t stream = get_stream(device);
@@ -4056,30 +5426,54 @@ void minimax_h3_sm120_varlen_attention_nvfp4(TensorView q, TensorView k, TensorV
   if (tokens == 0 || num_units == 0) return;  // no rows to write (all segments empty)
   const int heads_i = static_cast<int>(heads);
 
-  if (num_tiles > 0) {
-    const int stats_grid = static_cast<int>(
-        std::max<int64_t>(1, std::min<int64_t>(num_tiles * heads, kStatsCtasPerSm * static_cast<int64_t>(info.num_sms))));
-    LaunchPdl(&h3_varlen_stats_sage_sm120a::kernel_minimax_h3_sm120_varlen_stats_sage, stats_grid, kStatsThreads,
-        kStatsSmemBytes, stream,
+  const bool fused_preproc = kPreprocFusedMaxTokens != 0 && padded_tokens >= kPreprocFusedMinTokens &&
+                             (kPreprocFusedMaxTokens < 0 || padded_tokens <= kPreprocFusedMaxTokens);
+  if (fused_preproc) {
+    // One persistent launch: statistics work items, software grid barrier, quantizer work items.  Every CTA
+    // must be co-resident for the barrier: the grid never exceeds the driver's occupancy x SM count.
+    const int64_t items = std::max<int64_t>(num_tiles * heads, (padded_tokens / kQuantTokens) * heads);
+    const int preproc_grid = static_cast<int>(std::max<int64_t>(
+        1, std::min<int64_t>(items, static_cast<int64_t>(info.preproc_ctas_per_sm) * info.num_sms)));
+    LaunchPdl(&h3_varlen_preproc_sage_sm120a::kernel_minimax_h3_sm120_varlen_preproc2_sage, preproc_grid,
+        kPreprocThreads, kPreprocSmemBytes, stream,
         static_cast<__nv_bfloat16*>(q.data_ptr()), static_cast<__nv_bfloat16*>(k.data_ptr()),
-        static_cast<int*>(tile_table.data_ptr()), static_cast<int*>(seg_tile_begin.data_ptr()),
-        static_cast<float*>(partials.data_ptr()), static_cast<unsigned int*>(counters.data_ptr()),
-        static_cast<float*>(mean_k.data_ptr()), static_cast<float*>(q_mean.data_ptr()), static_cast<int>(num_tiles),
-        heads_i);
+        static_cast<__nv_bfloat16*>(v.data_ptr()), static_cast<int*>(tile_table.data_ptr()),
+        static_cast<int*>(seg_tile_begin.data_ptr()), static_cast<int*>(tok_seg.data_ptr()),
+        static_cast<int*>(cu_seqlens.data_ptr()), static_cast<float*>(partials.data_ptr()),
+        static_cast<unsigned int*>(counters.data_ptr()), static_cast<float*>(mean_k.data_ptr()),
+        static_cast<float*>(q_mean.data_ptr()), static_cast<unsigned int*>(q4.data_ptr()),
+        static_cast<unsigned int*>(k4.data_ptr()), static_cast<uint8_t*>(q_sf.data_ptr()),
+        static_cast<uint8_t*>(k_sf.data_ptr()), static_cast<unsigned int*>(qm4.data_ptr()),
+        static_cast<uint8_t*>(qm_sf.data_ptr()), static_cast<unsigned int*>(vt4.data_ptr()),
+        static_cast<uint8_t*>(v_sf.data_ptr()), static_cast<unsigned int*>(barrier.data_ptr()),
+        static_cast<int>(num_tiles), static_cast<int>(tokens), static_cast<int>(padded_tokens), heads_i,
+        static_cast<int>(num_kblocks));
+  } else {
+    if (num_tiles > 0) {
+      const int stats_grid = static_cast<int>(
+          std::max<int64_t>(1, std::min<int64_t>(num_tiles * heads, kStatsCtasPerSm * static_cast<int64_t>(info.num_sms))));
+      LaunchPdl(&h3_varlen_stats_sage_sm120a::kernel_minimax_h3_sm120_varlen_stats_sage, stats_grid, kStatsThreads,
+          kStatsSmemBytes, stream,
+          static_cast<__nv_bfloat16*>(q.data_ptr()), static_cast<__nv_bfloat16*>(k.data_ptr()),
+          static_cast<int*>(tile_table.data_ptr()), static_cast<int*>(seg_tile_begin.data_ptr()),
+          static_cast<float*>(partials.data_ptr()), static_cast<unsigned int*>(counters.data_ptr()),
+          static_cast<float*>(mean_k.data_ptr()), static_cast<float*>(q_mean.data_ptr()), static_cast<int>(num_tiles),
+          heads_i);
+    }
+    const int quant_grid = static_cast<int>(std::max<int64_t>(
+        1, std::min<int64_t>((padded_tokens / kQuantTokens) * heads, kQuantCtasPerSm * static_cast<int64_t>(info.num_sms))));
+    LaunchPdl(&h3_varlen_quantize_sage_sm120a::kernel_minimax_h3_sm120_varlen_quantize_sage, quant_grid, kQuantThreads,
+        kQuantSmemBytes, stream,
+        static_cast<__nv_bfloat16*>(q.data_ptr()), static_cast<__nv_bfloat16*>(k.data_ptr()),
+        static_cast<__nv_bfloat16*>(v.data_ptr()), static_cast<int*>(tok_seg.data_ptr()),
+        static_cast<int*>(cu_seqlens.data_ptr()), static_cast<int*>(seg_tile_begin.data_ptr()),
+        static_cast<float*>(mean_k.data_ptr()), static_cast<float*>(q_mean.data_ptr()),
+        static_cast<unsigned int*>(q4.data_ptr()), static_cast<unsigned int*>(k4.data_ptr()),
+        static_cast<uint8_t*>(q_sf.data_ptr()), static_cast<uint8_t*>(k_sf.data_ptr()),
+        static_cast<unsigned int*>(qm4.data_ptr()), static_cast<uint8_t*>(qm_sf.data_ptr()),
+        static_cast<unsigned int*>(vt4.data_ptr()), static_cast<uint8_t*>(v_sf.data_ptr()),
+        static_cast<int>(tokens), static_cast<int>(padded_tokens), heads_i, static_cast<int>(num_kblocks));
   }
-  const int quant_grid = static_cast<int>(std::max<int64_t>(
-      1, std::min<int64_t>((padded_tokens / kQuantTokens) * heads, kQuantCtasPerSm * static_cast<int64_t>(info.num_sms))));
-  LaunchPdl(&h3_varlen_quantize_sage_sm120a::kernel_minimax_h3_sm120_varlen_quantize_sage, quant_grid, kQuantThreads,
-      kQuantSmemBytes, stream,
-      static_cast<__nv_bfloat16*>(q.data_ptr()), static_cast<__nv_bfloat16*>(k.data_ptr()),
-      static_cast<__nv_bfloat16*>(v.data_ptr()), static_cast<int*>(tok_seg.data_ptr()),
-      static_cast<int*>(cu_seqlens.data_ptr()), static_cast<int*>(seg_tile_begin.data_ptr()),
-      static_cast<float*>(mean_k.data_ptr()), static_cast<float*>(q_mean.data_ptr()),
-      static_cast<unsigned int*>(q4.data_ptr()), static_cast<unsigned int*>(k4.data_ptr()),
-      static_cast<uint8_t*>(q_sf.data_ptr()), static_cast<uint8_t*>(k_sf.data_ptr()),
-      static_cast<unsigned int*>(qm4.data_ptr()), static_cast<uint8_t*>(qm_sf.data_ptr()),
-      static_cast<unsigned int*>(vt4.data_ptr()), static_cast<uint8_t*>(v_sf.data_ptr()),
-      static_cast<int>(tokens), static_cast<int>(padded_tokens), heads_i, static_cast<int>(num_kblocks));
 
   const CUtensorMap q_map = EncodeRowsTile(q4, tokens, heads, static_cast<uint32_t>(kBlockM), "q4");
   const CUtensorMap k_map = EncodeRowsTile(k4, tokens, heads, static_cast<uint32_t>(kBlockN), "k4");

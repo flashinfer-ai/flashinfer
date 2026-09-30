@@ -293,7 +293,7 @@ def test_cute_dsl_bf16_gather_grouped_gemm_out_handling():
 
 
 @cute_dsl_available
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires a CUDA GPU")
+@sm90_required
 def test_situ_f32_constant_and_runtime_beta():
     """``situ_f32`` folds ``1 / beta`` for a trace-time Python beta and divides
     for a runtime ``cutlass.Float32`` beta; both paths match the float32
@@ -483,7 +483,7 @@ def test_cute_dsl_bf16_gather_grouped_gemm_rejects_bad_activation_config():
         make(swiglu_limit=0.0)
     with pytest.raises(ValueError, match="requires situ_beta"):
         make(situ_linear_beta=25.0)
-    with pytest.raises(ValueError, match="require ActivationType.Swiglu"):
+    with pytest.raises(ValueError, match=r"require ActivationType\.Situ or Swiglu"):
         make(activation_type=ActivationType.GegluTanh.value, situ_beta=4.0)
     with pytest.raises(ValueError, match="swiglu_limit must be positive"):
         make(swiglu_limit=0.0, situ_linear_beta=25.0)

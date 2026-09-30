@@ -53,9 +53,10 @@ byte-identical to them.
 
 from __future__ import annotations
 
+import functools
 import heapq
 import math
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import numpy as np
 import torch
@@ -68,6 +69,11 @@ NUM_CONSUMER_WGS = 2
 MAX_SEQ = 136
 MAX_SELECTED = 64
 TILE_FIXED_COST = 0.3
+# A tile's load time also carries a fixed part (Q lift, epilogue, inter-tile gap: ~ one
+# position's load) and a split tile the merge of its two warpgroups' partials; in ring
+# positions.  Mirrors ``vsa_sm90_bf16``.
+TILE_FIXED_LOAD = 1.0
+SPLIT_MERGE_LOAD = 1.0
 LOAD_COST = 1.0
 # By-value first-tile header of the persistent kernel: per CTA ``[head, qb0,
 # qb1, mode, n_hdr, (blk_a, blk_b) x HDR_POS, pad]`` (int16) so the first Q
@@ -88,6 +94,15 @@ _FP32_MAX = 3.4028234663852886e38
 META_NSEQ = 4
 META_NOWN = 5
 META_NTILES = 7
+# Queue kernel (``attention_queue``): the last POOL_ROUNDS tiles of every CTA's
+# static list are handed out at run time; used only for uniform plans whose
+# every CTA has at least POOL_MIN_TILES tiles.  Both values match the kernel.
+POOL_ROUNDS = 2
+POOL_MIN_TILES = 12  # 8-tile rows measured 1 % slower on the CuTe route
+POOL_SMALL_MIN_TILES = (
+    8  # ... or this many tiles of at most POOL_SMALL_TILE_POS positions
+)
+POOL_SMALL_TILE_POS = 0  # 0 disables the tiny-tile exception
 META_SEQ_OFF = 8
 META_SEQ_WORDS = MAX_SEQ // 2
 MAX_OWN = MAX_SEQ // 2
@@ -131,7 +146,19 @@ CLUSTER_VARIANTS = (
     (4, 4),
     (6, 2),
 )  # (6, 3): receive buffers exceed the 227 KB SMEM
-CLUSTER_GPC_SMS = 16
+# One-wave cluster placement uses the device's co-resident cluster capacity
+# ``{csize: clusters}`` resolved from ``cuOccupancyMaxActiveClusters`` at one
+# CTA per SM (:func:`cluster_capacity`).  A per-GPC model (8 GPCs x 16 SMs)
+# over-counted four-CTA clusters on the 132-SM H100 (32 vs 30) and sent
+# 31-32-tile problems into a second cluster wave.  The reference table below
+# is that device's measured capacity, for tests only — planning resolves it.
+REFERENCE_CLUSTER_CAPACITY_H100_SXM: dict[int, int] = {
+    2: 66,
+    3: 39,
+    4: 30,
+    6: 17,
+    8: 15,
+}
 CLUSTER_MERGE_COST = 0.3
 CLUSTER_PAD_COST = 0.15
 
@@ -207,16 +234,25 @@ def cluster_cost(counts: list[int], kmax: int, csize: int) -> float:
 
 
 def cluster_variant_for(
-    counts: list[int], *, sms: Optional[int] = None
+    counts: list[int],
+    *,
+    sms: Optional[int] = None,
+    cluster_capacity: Optional[Mapping[int, int]] = None,
 ) -> Optional[tuple[int, int]]:
     """``(kmax, csize)`` of the cheapest cluster variant for ``counts``, or ``None``.
 
     Candidates hold the largest selection (``kmax * csize >= capacity``), fit
-    the plan parameter and, when ``sms`` is given, run as one wave of clusters
-    at one CTA per SM (``sms // CLUSTER_GPC_SMS`` GPCs each place
-    ``CLUSTER_GPC_SMS // csize`` clusters).  Ranked by :func:`cluster_cost`.
-    Mirrors ``vsa_sm90_small.cluster_variant_for``.
+    the plan parameter and, when ``sms`` is given, run as one wave of clusters:
+    ``tiles <= cluster_capacity[csize]``, the device's co-resident cluster
+    count at one CTA per SM (:func:`cluster_capacity`).  Ranked by
+    :func:`cluster_cost`.  Mirrors ``vsa_sm90_small.cluster_variant_for``.
     """
+    if sms is not None and cluster_capacity is None:
+        raise ValueError(
+            "[cluster_capacity_unresolved] cluster_variant_for(sms=...) needs "
+            "cluster_capacity={csize: co-resident clusters} resolved from the device "
+            "(cluster_capacity(device))"
+        )
     capacity = max(counts)
     tiles = len(counts)
     best = None
@@ -226,18 +262,104 @@ def cluster_variant_for(
             or tiles * csize * (kmax + PLAN_META_SPLIT) > PLAN_HALFWORDS
         ):
             continue
-        if sms is not None and tiles > (sms // CLUSTER_GPC_SMS) * (
-            CLUSTER_GPC_SMS // csize
-        ):
-            continue
+        if sms is not None:
+            assert cluster_capacity is not None
+            if csize not in cluster_capacity:
+                raise ValueError(
+                    f"[cluster_capacity_missing] no co-resident cluster count for cluster size {csize}"
+                )
+            if tiles > int(cluster_capacity[csize]):
+                continue
         cost = cluster_cost(counts, kmax, csize)
         if best is None or cost < best[0]:
             best = (cost, kmax, csize)
     return None if best is None else (best[1], best[2])
 
 
+_PROBE_KERNEL = "cake_vsa_sm90_cluster_capacity_probe"
+_PROBE_SOURCE = f'extern "C" __global__ void {_PROBE_KERNEL}() {{}}\n'
+CLUSTER_SIZES: tuple[int, ...] = tuple(
+    sorted({csize for _kmax, csize in CLUSTER_VARIANTS})
+)
+
+
+@functools.lru_cache(maxsize=None)
+def cluster_capacity(device_index: int) -> dict[int, int]:
+    """``{cluster size: max co-resident clusters}`` of ``device_index`` at one CTA per SM.
+
+    ``cuOccupancyMaxActiveClusters`` on an empty probe kernel launched with the
+    device's maximum opt-in dynamic shared memory (one CTA per SM).  The answer
+    follows the part's GPC topology after floorsweeping, not ``SMs // csize``:
+    a 132-SM H100 SXM holds 66 two-CTA clusters but 30 four-CTA clusters.
+    """
+    from .cuda_utils import checkCudaErrors, driver, nvrtc
+
+    with torch.cuda.device(device_index):
+        torch.empty(1, device="cuda")  # primary context
+        major, minor = torch.cuda.get_device_capability(device_index)
+        prog = checkCudaErrors(
+            nvrtc.nvrtcCreateProgram(_PROBE_SOURCE.encode(), b"probe.cu", 0, [], [])
+        )
+        opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
+        checkCudaErrors(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
+        size = checkCudaErrors(nvrtc.nvrtcGetCUBINSize(prog))
+        cubin = b" " * size
+        checkCudaErrors(nvrtc.nvrtcGetCUBIN(prog, cubin))
+        checkCudaErrors(nvrtc.nvrtcDestroyProgram(prog))
+        ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(device_index))
+        try:
+            checkCudaErrors(driver.cuCtxSetCurrent(ctx))
+            module = checkCudaErrors(driver.cuModuleLoadData(cubin))
+            try:
+                func = checkCudaErrors(
+                    driver.cuModuleGetFunction(module, _PROBE_KERNEL.encode())
+                )
+                smem = checkCudaErrors(
+                    driver.cuDeviceGetAttribute(
+                        driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+                        device_index,
+                    )
+                )
+                checkCudaErrors(
+                    driver.cuFuncSetAttribute(
+                        func,
+                        driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        smem,
+                    )
+                )
+                result = {}
+                for csize in CLUSTER_SIZES:
+                    attr = driver.CUlaunchAttribute()
+                    attr.id = (
+                        driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                    )
+                    attr.value.clusterDim.x = csize
+                    attr.value.clusterDim.y = 1
+                    attr.value.clusterDim.z = 1
+                    config = driver.CUlaunchConfig()
+                    config.gridDimX = csize
+                    config.gridDimY = 1
+                    config.gridDimZ = 1
+                    config.blockDimX = 128
+                    config.blockDimY = 1
+                    config.blockDimZ = 1
+                    config.sharedMemBytes = smem
+                    config.attrs = [attr]
+                    config.numAttrs = 1
+                    result[int(csize)] = int(
+                        checkCudaErrors(
+                            driver.cuOccupancyMaxActiveClusters(func, config)
+                        )
+                    )
+            finally:
+                checkCudaErrors(driver.cuModuleUnload(module))
+        finally:
+            checkCudaErrors(driver.cuDevicePrimaryCtxRelease(device_index))
+    return result
+
+
 def small_route(
-    block_mask: torch.Tensor, *, sms: int
+    block_mask: torch.Tensor, *, sms: int, cluster_capacity: Mapping[int, int]
 ) -> Optional[tuple[int, bool, int]]:
     """``(kmax, split, cluster)`` when the problem should take a small-kernel route, else ``None``.
 
@@ -247,7 +369,8 @@ def small_route(
     (tried when the unsplit rule fails): the grid is too small for the
     persistent kernel's two consumer warpgroups per CTA (``2 * tiles <= SMs``);
     the split-KV variant of :func:`split_kmax` and the cluster variant of
-    :func:`cluster_variant_for` are compared by their modelled costs and the
+    :func:`cluster_variant_for` (one wave of clusters by the device's
+    :func:`cluster_capacity`) are compared by their modelled costs and the
     cheaper one wins.  Everything larger goes to the persistent pair/split
     kernel.  Mirrors ``vsa_sm90_small.small_route``.
     """
@@ -268,7 +391,9 @@ def small_route(
             split: Optional[int] = split_kmax(counts, sms=sms)
         except ValueError:
             split = None
-        cluster = cluster_variant_for(counts, sms=sms)
+        cluster = cluster_variant_for(
+            counts, sms=sms, cluster_capacity=cluster_capacity
+        )
         if cluster is not None and (
             split is None or cluster_cost(counts, *cluster) < split_cost(counts, split)
         ):
@@ -532,28 +657,106 @@ def _tile_cost(owns_t) -> float:
     return max(len(o) for o in owns_t) + TILE_FIXED_COST
 
 
-def _assign_tiles(
-    costs: list[float], lens: list[int], sms: int
-) -> tuple[list[list[int]], float]:
-    """List-schedule the tiles onto ``min(T, sms)`` persistent CTAs.
+def _tile_load(kind: int, len_t: int) -> float:
+    return len_t + TILE_FIXED_LOAD + (SPLIT_MERGE_LOAD if kind == 1 else 0.0)
 
-    A CTA's key is the larger of its consumer time (sum of tile costs) and its
-    load time (positions loaded x ``LOAD_COST`` x occupancy ``g / sms``).
-    """
-    n = len(costs)
-    g = max(1, min(n, sms))
-    load_unit = LOAD_COST * g / sms
+
+GRID_MIN_FRACTION = (
+    0.9  # a smaller, uniform persistent grid only while >= 90 % of the SMs stay busy
+)
+# Grid model (H100 SXM, forced-grid measurements on h7-m32768-k64): the per-SM
+# stream rate is 3 % higher with at most 128 of the 132 SMs streaming and then
+# rises only slowly (~(g/128) ** -0.25), so a CTA's load time is scaled
+# accordingly and a uniform 128-CTA grid beats 132 CTAs carrying the same
+# maximum tile count.  Mirrors ``vsa_sm90_bf16``.
+GRID_MODEL = 1
+# The refined load model (per-tile fixed load, split-merge load, grid knee credit) is
+# calibrated on long tiles (>= 32 KV blocks per query block); on short tiles the pair plans
+# it prefers measured 8-14 % slower than the split plans of the previous model, so below this
+# mean number of KV blocks per query block the previous model (raw positions, flat grid) decides.
+REFINED_LOAD_MIN_K = 28.0
+GRID_RATE_FULL_PENALTY = 0.03
+GRID_RATE_EXP = 0.25
+GRID_RATE_KNEE = 128
+
+
+def _grid_load_scale(g: int, sms: int) -> float:
+    if GRID_MODEL == 0 or sms <= GRID_RATE_KNEE or g >= sms:
+        return 1.0
+    if g > GRID_RATE_KNEE:
+        # Grids between the knee and the full machine measured 0.2-1.3 % slower
+        # on the CuTe route when chosen for a sub-1 % model credit; only the
+        # measured knee (<= 128 CTAs) takes the credit.
+        return 1.0
+    knee = 1.0 - GRID_RATE_FULL_PENALTY
+    return knee * (g / GRID_RATE_KNEE) ** GRID_RATE_EXP
+
+
+def _list_schedule(
+    costs: list[float], lens: list[float], g: int, load_scale: float = 1.0
+) -> tuple[list[list[int]], float]:
+    """``load_scale`` is the grid's per-position load time relative to the full machine."""
     cons = [0.0] * g
     load = [0.0] * g
     heap = [(0.0, c) for c in range(g)]
     lists: list[list[int]] = [[] for _ in range(g)]
-    for t in range(n):
+    for t in range(len(costs)):
         _, c = heapq.heappop(heap)
         lists[c].append(t)
         cons[c] += costs[t]
-        load[c] += lens[t] * load_unit
+        load[c] += lens[t] * LOAD_COST * load_scale
         heapq.heappush(heap, (max(cons[c], load[c]), c))
     return lists, max(key for key, _ in heap)
+
+
+def _grid_candidates(n_tiles: int, sms: int) -> list[int]:
+    """Persistent grid sizes worth trying: the full machine and the largest
+    grids that spread ``n_tiles`` uniformly (``ceil(n / k)`` CTAs for k tiles
+    each) while keeping at least ``GRID_MIN_FRACTION`` of the SMs busy.
+    Mirrors ``vsa_sm90_bf16._grid_candidates``."""
+    g_max = max(1, min(n_tiles, sms))
+    cands = {g_max}
+    for k in range(1, n_tiles + 1):  # k tiles per CTA
+        g = -(-n_tiles // k)
+        if g < GRID_MIN_FRACTION * g_max:
+            break
+        if g <= g_max:
+            cands.add(g)
+        if g == 1:
+            break
+    return sorted(cands, reverse=True)
+
+
+def _assign_tiles(
+    costs: list[float], lens: list[float], sms: int, refined: bool = True
+) -> tuple[list[list[int]], float]:
+    """List-schedule the tiles onto ``g`` persistent CTAs.
+
+    A CTA's key is the larger of its consumer time (sum of tile costs) and its
+    load time (positions loaded x ``LOAD_COST``; the chip's memory bandwidth
+    bounds a streaming iteration, so the term does not scale with the grid).
+    The grid is chosen among :func:`_grid_candidates` by makespan; a tie goes
+    to the grid with the most uniform tile counts (128 x 2 rather than
+    124 x 2 + 8 x 1 for 256 tiles), then to the larger grid.  Mirrors
+    ``vsa_sm90_bf16._assign_tiles``.
+    """
+    best = None
+    max_full = None
+    for g in _grid_candidates(len(costs), sms):  # descending: the full grid first
+        lists, makespan = _list_schedule(
+            costs, lens, g, _grid_load_scale(g, sms) if refined else 1.0
+        )
+        max_tiles = max(len(lst) for lst in lists)
+        if max_full is None:
+            max_full = max_tiles
+        elif max_tiles > max_full:
+            # only grids with the full grid's maximum tile count take the knee's rate credit
+            continue
+        spread = max_tiles - min(len(lst) for lst in lists)
+        key = (round(makespan, 9), spread, -g)
+        if best is None or key < best[0]:
+            best = (key, lists, makespan)
+    return best[1], best[2]
 
 
 def _pairs_for_head(
@@ -690,6 +893,10 @@ def plan_vsa_sm90(
         raise ValueError("sms must be positive")
     rows = [[m.nonzero().flatten().tolist() for m in mask[hh]] for hh in range(h)]
     ragged = int(counts.min()) != int(counts.max())
+    # The refined load model is calibrated on uniform plans; on ragged plans it
+    # only re-orders and re-balances the list schedule and measured slower on
+    # the 32k-token K=64 ragged rows, so ragged plans keep the previous model.
+    refined = (not ragged) and float(counts.sum()) / (h * mb) >= REFINED_LOAD_MIN_K
 
     def build(mode: str):
         infos: list[tuple[int, int, int, int]] = []
@@ -701,65 +908,114 @@ def plan_vsa_sm90(
             for qb, partner in pairs:
                 _emit_tile(hh, qb, partner, mode, rows, infos, seqs, owns, lens)
         costs = [_tile_cost(owns[t]) for t in range(len(infos))]
+        loads = [
+            _tile_load(infos[t][3], lens[t]) if refined else float(lens[t])
+            for t in range(len(infos))
+        ]
         if not ragged:
             order = list(range(len(infos)))
         elif h * nb * BLOCK * HEAD_DIM * 2 * 2 <= TILE_ORDER_L2_BUDGET:
-            g_est = max(1, min(len(infos), sms))
-            lu = LOAD_COST * g_est / sms
             order = sorted(
                 range(len(infos)),
-                key=lambda i: (-max(costs[i], lens[i] * lu), infos[i][0], infos[i][1]),
+                key=lambda i: (
+                    -max(costs[i], loads[i] * LOAD_COST),
+                    infos[i][0],
+                    infos[i][1],
+                ),
             )
         else:
             order = sorted(range(len(infos)), key=lambda i: (infos[i][0], -costs[i]))
-        return tuple([x[i] for i in order] for x in (infos, seqs, owns, lens, costs))
+        return tuple(
+            [x[i] for i in order] for x in (infos, seqs, owns, lens, costs, loads)
+        )
 
     if mode is None:
         best = None
         for cand in ("split", "pair"):  # ties go to split
             built = build(cand)
-            _, makespan = _assign_tiles(built[4], built[3], sms)
+            _, makespan = _assign_tiles(built[4], built[5], sms, refined)
             if best is None or makespan < best[0]:
                 best = (makespan, cand, built)
-        _, mode, (infos, seqs, owns, lens, costs) = best
+        _, mode, (infos, seqs, owns, lens, costs, loads) = best
     else:
-        infos, seqs, owns, lens, costs = build(mode)
-    lists, makespan = _assign_tiles(costs, lens, sms)
+        infos, seqs, owns, lens, costs, loads = build(mode)
+    lists, makespan = _assign_tiles(costs, loads, sms, refined)
     g = len(lists)
-    stride = max(len(lst) for lst in lists)
     if g > HDR_CTAS:
         raise ValueError(
             f"persistent grid {g} exceeds the {HDR_CTAS}-CTA by-value header"
         )
+    # Uniform plans with enough rounds run the queue kernel (``attention_queue``):
+    # every CTA keeps its static list (the list schedule, so concurrent CTAs
+    # stream one head in lock step) except its last POOL_ROUNDS tiles, which
+    # form a pool handed out at run time in the lists' round order (the tail
+    # then balances on measured, not modelled, tile times).  Ragged plans and
+    # short lists keep the static kernel: a big tile taken late costs up to one
+    # tile of tail, and a round boundary's simultaneous fetches need several
+    # rounds to amortise.
+    min_tiles = min(len(lst) for lst in lists)
+    queue = (not ragged) and (
+        min_tiles >= POOL_MIN_TILES
+        or (
+            POOL_SMALL_TILE_POS > 0
+            and min_tiles >= POOL_SMALL_MIN_TILES
+            and max(lens) <= POOL_SMALL_TILE_POS
+        )
+    )
+    pool_rounds = POOL_ROUNDS if queue else 0
+    static = [lst[: max(1, len(lst) - pool_rounds)] for lst in lists]
+    pool_order = sorted(
+        (i, c, t)
+        for c, lst in enumerate(lists)
+        for i, t in enumerate(lst)
+        if i >= len(static[c])
+    )
+    pool = [t for _, _, t in pool_order]
+    stride = max(len(st) for st in static)
+    # Queue layout: static rows, the pool rows, then one all-zero sentinel row
+    # per CTA (a fetch past the pool stages a slot whose word META_NTILES is 0).
+    n_rows = g * stride + len(pool) + (g if queue else 0)
     hdr = np.zeros((HDR_HALFWORDS,), dtype=np.int16)
-    for c, lst in enumerate(lists):
-        t = lst[0]
+    for c, st in enumerate(static):
+        t = st[0]
         n_hdr = min(HDR_ISSUE, lens[t])
         hdr[c * HDR_WORDS : c * HDR_WORDS + 5] = (*infos[t], n_hdr)
         hdr[c * HDR_WORDS + 5 : c * HDR_WORDS + 5 + 2 * n_hdr] = seqs[t][: 2 * n_hdr]
-    meta = np.zeros((g * stride, META_WORDS), dtype=np.uint32)
-    for c, lst in enumerate(lists):
-        for i, t in enumerate(lst):
-            r = c * stride + i
-            meta[r, 0:4] = infos[t]
-            meta[r, META_NSEQ] = lens[t]
-            sq = np.asarray(seqs[t], dtype=np.int64) & 0xFFFF
-            meta[r, META_SEQ_OFF : META_SEQ_OFF + len(sq) // 2] = sq[0::2] | (
-                sq[1::2] << 16
-            )
-            for w in range(NUM_CONSUMER_WGS):
-                ol = owns[t][w]
-                meta[r, META_NOWN + w] = len(ol)
-                if len(ol) > MAX_OWN:
-                    raise ValueError("own list exceeds MAX_OWN")
-                ow = np.asarray(ol + [0] * (len(ol) & 1), dtype=np.int64)
-                base = META_OWN_OFF + w * OWN_WORDS
-                meta[r, base : base + len(ow) // 2] = ow[0::2] | (ow[1::2] << 16)
-        meta[c * stride, META_NTILES] = len(lst)
+    # Plan rows laid out per CTA: row c * stride + i is CTA c's i-th (static)
+    # tile; the first row of each CTA also carries its (static) tile count
+    # (word META_NTILES).  Queue layout: the other static rows and the pool
+    # rows carry 1 in that word (valid), the sentinel rows 0.
+    meta = np.zeros((n_rows, META_WORDS), dtype=np.uint32)
+
+    def fill(r, t, nt):
+        meta[r, 0:4] = infos[t]
+        meta[r, META_NSEQ] = lens[t]
+        sq = np.asarray(seqs[t], dtype=np.int64) & 0xFFFF
+        meta[r, META_SEQ_OFF : META_SEQ_OFF + len(sq) // 2] = sq[0::2] | (
+            sq[1::2] << 16
+        )
+        for w in range(NUM_CONSUMER_WGS):
+            ol = owns[t][w]
+            meta[r, META_NOWN + w] = len(ol)
+            if len(ol) > MAX_OWN:
+                raise ValueError("own list exceeds MAX_OWN")
+            ow = np.asarray(ol + [0] * (len(ol) & 1), dtype=np.int64)
+            base = META_OWN_OFF + w * OWN_WORDS
+            meta[r, base : base + len(ow) // 2] = ow[0::2] | (ow[1::2] << 16)
+        meta[r, META_NTILES] = nt
+
+    for c, st in enumerate(static):
+        for i, t in enumerate(st):
+            fill(c * stride + i, t, len(st) if i == 0 else int(queue))
+    for j, tp in enumerate(pool):
+        fill(g * stride + j, tp, 1)
     return {
         "meta": torch.from_numpy(meta.view(np.int32).copy()),
         "hdr": torch.from_numpy(hdr),
         "tile_stride": stride,
+        "queue": queue,
+        "pool": pool,
+        "num_rows": n_rows,
         "mode": mode,
         "makespan": makespan,
         "num_ctas": g,
@@ -827,8 +1083,21 @@ class CakeVsaSm90Plan:
         kv_data_type: Optional[torch.dtype] = None,
         non_blocking: bool = True,
         route: Optional[str] = None,
+        engine: str = "cuda",
     ):
-        """``route`` ``None`` applies :func:`small_route`; ``"small"`` / ``"smallsplit"`` / ``"smallcluster"`` / ``"persistent"`` force one kernel."""
+        """``route`` ``None`` applies :func:`small_route`; ``"small"`` / ``"smallsplit"`` / ``"smallcluster"`` / ``"persistent"`` force one kernel.
+
+        ``engine`` selects the kernel build: ``"cuda"`` (generated CUDA C++,
+        ``backend="cake"``) or ``"cute"`` (the same kernels rendered as CuTe DSL
+        modules, ``backend="cake_cute"``; see
+        :mod:`flashinfer.experimental.cake_vsa_sm90_cute`).  Plans, routes and
+        launch geometry are identical; both builds take the plan / header
+        tables by value (the CuTe build as 8-byte scalar launch arguments read
+        from the kernel parameter space).
+        """
+        if engine not in ("cuda", "cute"):
+            raise ValueError(f"unknown engine {engine!r}; expected 'cuda' or 'cute'")
+        self.engine = engine
         self.device = torch.device(device)
         if self.device.type != "cuda":
             raise ValueError("cake (SM90) requires a CUDA device")
@@ -869,7 +1138,11 @@ class CakeVsaSm90Plan:
             )
         small: Optional[tuple[int, bool, int]] = None
         if route is None:
-            small = small_route(block_mask_map, sms=sms)
+            small = small_route(
+                block_mask_map,
+                sms=sms,
+                cluster_capacity=cluster_capacity(self.device.index),
+            )
         elif route == "small":
             small = (
                 small_kmax_for(int(block_mask_map.to("cpu").sum(dim=-1).max())),
@@ -913,6 +1186,8 @@ class CakeVsaSm90Plan:
             # whose arrival counters must be zero before the first run
             # (``ready``); the kernel leaves them zero, so replays need no host
             # reset.  One run per split plan may be in flight at a time.
+            # Both builds take the plan by value (the CuTe DSL build as 8-byte
+            # scalar launch arguments read from the kernel parameter space).
             self.plan_param = plan["plan"].contiguous()
             if self.small_split:
                 with torch.cuda.device(self.device):
@@ -940,6 +1215,8 @@ class CakeVsaSm90Plan:
         self.num_ctas = plan["num_ctas"]
         self.num_tiles = plan["num_tiles"]
         self.tile_stride = plan["tile_stride"]
+        self.queue = plan["queue"]
+        self.num_rows = plan["num_rows"]
         self.num_heads = plan["H"]
         self.qo_len = plan["MB"] * BLOCK
         self.kv_len = plan["NB"] * BLOCK
@@ -948,10 +1225,13 @@ class CakeVsaSm90Plan:
             if non_blocking:
                 host_meta = host_meta.pin_memory()
             self.meta = host_meta.to(self.device, non_blocking=non_blocking)
-            # By-value kernel parameter: stays on the host.
+            # By-value kernel parameter in both builds: stays on the host.
             self.hdr = plan["hdr"].contiguous()
-            # The kernel's debug/timeline buffers are inert in the exported
-            # build; they only have to exist on the device.
+            # The timeline buffer is inert in the exported build; ``dbg`` holds
+            # the queue kernel's two tile-queue words (zero between launches:
+            # the last CTA to drain the pool resets them, so a captured graph
+            # replays without a memset).  Like the split-KV counters, the words
+            # belong to this plan: two launches of one plan must not overlap.
             self.dbg = torch.zeros((64,), dtype=torch.int32, device=self.device)
             self.tl = torch.zeros((8,), dtype=torch.uint64, device=self.device)
             # Capture must retain an external wait node for the metadata
@@ -1024,83 +1304,124 @@ class CakeVsaSm90Plan:
                 if begin < tensor_end and tensor_begin < end:
                     raise ValueError("out must not overlap Q/K/V storage")
 
-        import tvm_ffi
-
-        from .jit.cake_vsa_sm90 import load_cake_vsa_sm90_module
-
         if self.small_kmax is None:
-            stage = "attention"
+            stage = "attention_queue" if self.queue else "attention"
         elif self.small_cluster:
             stage = f"small_k{self.small_kmax}c{self.small_cluster}"
         else:
             stage = f"small_k{self.small_kmax}{'s' if self.small_split else ''}"
-        module, _record = load_cake_vsa_sm90_module(stage)
+        if self.engine == "cute":
+            from .experimental.cake_vsa_sm90_cute import load_stage
+
+            cute_stage = load_stage(stage)
+            module = None
+        else:
+            from .jit.cake_vsa_sm90 import load_cake_vsa_sm90_module
+
+            module, _record = load_cake_vsa_sm90_module(stage)
         with torch.cuda.device(self.device):
             stream = torch.cuda.current_stream(self.device)
             if torch.cuda.is_current_stream_capturing():
                 self.captured = True
             if self.small_kmax is None or self.small_split:
-                # The plan (or the split workspace) may have been built on
-                # another stream: an event wait enqueues the dependency without
-                # a CPU synchronization.
+                # The device meta table (persistent route) or the split
+                # workspace may have been built on another stream: an event
+                # wait enqueues the dependency without a CPU synchronization.
+                # Unsplit / cluster plans are by-value launch arguments in
+                # both builds and need no wait.
                 stream.wait_event(self.ready)
             aligned_q = self._aligned(q)
             aligned_k = self._aligned(k)
             aligned_v = self._aligned(v)
             target = result if result.data_ptr() % 16 == 0 else torch.empty_like(result)
-            with tvm_ffi.use_torch_stream():
-                if self.small_split:
-                    module.run(
-                        aligned_q,
-                        aligned_k,
-                        aligned_v,
-                        target,
-                        self.plan_param,
-                        int(self.qo_len),
-                        int(self.kv_len),
-                        float(self.scale_log2),
-                        self.partial_o,
-                        self.partial_stats,
-                        self.counters_u32,
-                        int(self.num_items),
-                        1,
-                        1,
-                    )
-                elif self.small_kmax is not None:
-                    module.run(
-                        aligned_q,
-                        aligned_k,
-                        aligned_v,
-                        target,
-                        self.plan_param,
-                        int(self.qo_len),
-                        int(self.kv_len),
-                        float(self.scale_log2),
-                        int(self.num_items),
-                        1,
-                        1,
-                    )
-                else:
-                    module.run(
-                        aligned_q,
-                        aligned_k,
-                        aligned_v,
-                        target,
-                        self.meta,
-                        self.hdr,
-                        int(self.tile_stride),
-                        int(self.qo_len),
-                        int(self.kv_len),
-                        float(self.scale_log2),
-                        self.dbg,
-                        self.tl,
-                        int(self.num_ctas),
-                        1,
-                        1,
-                    )
+            if self.engine == "cute":
+                self._run_cute(cute_stage, aligned_q, aligned_k, aligned_v, target)
+            else:
+                self._run_cuda(module, aligned_q, aligned_k, aligned_v, target)
             if target is not result:
                 result.copy_(target)
         return result
+
+    def _run_cute(self, cute_stage, aligned_q, aligned_k, aligned_v, target) -> None:
+        """Launch the CuTe DSL build with the same plan rows and grid as the CUDA build."""
+        bindings = {
+            "Q": aligned_q,
+            "K": aligned_k,
+            "Vt": aligned_v,
+            "O": target,
+            "seqlen_q": int(self.qo_len),
+            "seqlen_k": int(self.kv_len),
+            "scale_log2": float(self.scale_log2),
+        }
+        if self.small_kmax is not None:
+            bindings["plan"] = self.plan_param
+            if self.small_split:
+                bindings["Wo"] = self.partial_o
+                bindings["Ws"] = self.partial_stats
+                bindings["Wc"] = self.counters_u32
+            grid = (int(self.num_items), 1, 1)
+        else:
+            bindings["meta"] = self.meta
+            bindings["hdr"] = self.hdr
+            bindings["tile_stride"] = int(self.tile_stride)
+            bindings["dbg"] = self.dbg
+            bindings["tl"] = self.tl
+            grid = (int(self.num_ctas), 1, 1)
+        cute_stage.run(bindings, grid)
+
+    def _run_cuda(self, module, aligned_q, aligned_k, aligned_v, target) -> None:
+        import tvm_ffi
+
+        with tvm_ffi.use_torch_stream():
+            if self.small_split:
+                module.run(
+                    aligned_q,
+                    aligned_k,
+                    aligned_v,
+                    target,
+                    self.plan_param,
+                    int(self.qo_len),
+                    int(self.kv_len),
+                    float(self.scale_log2),
+                    self.partial_o,
+                    self.partial_stats,
+                    self.counters_u32,
+                    int(self.num_items),
+                    1,
+                    1,
+                )
+            elif self.small_kmax is not None:
+                module.run(
+                    aligned_q,
+                    aligned_k,
+                    aligned_v,
+                    target,
+                    self.plan_param,
+                    int(self.qo_len),
+                    int(self.kv_len),
+                    float(self.scale_log2),
+                    int(self.num_items),
+                    1,
+                    1,
+                )
+            else:
+                module.run(
+                    aligned_q,
+                    aligned_k,
+                    aligned_v,
+                    target,
+                    self.meta,
+                    self.hdr,
+                    int(self.tile_stride),
+                    int(self.qo_len),
+                    int(self.kv_len),
+                    float(self.scale_log2),
+                    self.dbg,
+                    self.tl,
+                    int(self.num_ctas),
+                    1,
+                    1,
+                )
 
 
 def create_plan(device, *args, **kwargs) -> CakeVsaSm90Plan:
@@ -1116,6 +1437,7 @@ def create_plan(device, *args, **kwargs) -> CakeVsaSm90Plan:
 
 __all__ = [
     "CakeVsaSm90Plan",
+    "cluster_capacity",
     "cluster_variant_for",
     "create_plan",
     "plan_small",

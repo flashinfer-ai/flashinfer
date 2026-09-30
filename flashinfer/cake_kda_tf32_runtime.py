@@ -242,6 +242,26 @@ INDEPENDENT_DVSPLIT_MIN_SEQ_LEN = 512
 # Architectures whose one-wave BF16 grid sweep selected the M64 value split over
 # every direct M128 tile (see _should_use_bf16_one_wave_dvsplit).
 BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
+# The M64 value split's BF16-pool body carries the recurrent state between
+# 32-token chunks in BF16 (the chunk state is re-derived as an MMA of the BF16
+# projection copy with a BF16 decay diagonal).  With a bounded gate that
+# rounding accumulates under trained Kimi-K3 deep-layer statistics (beta ~ 1,
+# exp(A_log) ~ 1): worst-head final-state rrmse against FP32 Triton 0.011 at
+# 384 tokens, 0.014 at 512, 0.051 at 2241, 0.19 at 8192 (CAKE-736 rounds 7-8,
+# B200 and GB300, H12 and H16), while the direct M128 N32/N16 bodies carry FP32
+# chunk state and stay below 0.01 at every length.  Only single-chunk
+# residuals (no chunk-to-chunk carrier) keep the split's measured preference on
+# a BF16 pool.  Since CAKE-736 round 9 the split's decay panels accumulate
+# bf16(S) * (D - I) onto the FP32 TMEM state instead of re-deriving bf16(S) * D
+# into it ("delta decay"): the state is never rounded between chunks and the
+# rounding of the correction is scaled by |1 - d|, so the accumulated error is
+# bounded by one BF16 ulp of |S| at every length.  The FP32-pool route is
+# validated on that body (worst-head state rrmse <= 0.008 at 8192 tokens, B200
+# and GB300) and keeps the split at every length.  The same body measures
+# 0.0071-0.0086 on a BF16 pool (B200, T 512-8192), but no BF16-pool split module
+# is exported, so lifting the guard below is an export-inventory change kept for
+# a separate round; the guard stays for BF16 pools only.
+BF16_DVSPLIT_STATE_CARRIER_MAX_SEQ_LEN = 64
 BT16_CHUNK = 16
 BT16_VALUE_SPLITS = 2
 TF32_BT16_PREP_RESIDENT_CTAS = 6
@@ -961,6 +981,29 @@ def _should_use_independent_dvsplit(
     )
 
 
+def _dvsplit_carrier_precision_ok(
+    *,
+    compute_dtype: str,
+    bounded_gate: bool,
+    max_seq_len: int,
+    state_dtype_is_fp32: bool,
+) -> bool:
+    """Return whether the M64 value split may carry this sequence's state.
+
+    The FP32-pool split carries FP32 chunk state (delta decay onto the FP32
+    TMEM state; CAKE-736 round 9) and is admissible at every length.  The
+    BF16-pool route keeps the round-8 guard: a bounded gate beyond
+    ``BF16_DVSPLIT_STATE_CARRIER_MAX_SEQ_LEN`` tokens needs the FP32 chunk
+    carrier of the direct M128 family instead (see the constant's note).
+    Unbounded gates never reach the split, and TF32 keeps its own BT16 policy.
+    """
+    return state_dtype_is_fp32 or not (
+        compute_dtype == "bf16"
+        and bounded_gate
+        and max_seq_len > BF16_DVSPLIT_STATE_CARRIER_MAX_SEQ_LEN
+    )
+
+
 def _should_use_bf16_one_wave_dvsplit(
     *,
     gpu_arch: str,
@@ -1255,6 +1298,7 @@ def build_affine_apply_items(
     rows_enabled: bool,
     sm_count: int = 148,
     pairmap: bool = False,
+    owns_final: bool = True,
 ) -> list[list[int]]:
     """Work items for the apply kernel, one per (window, head, block run).
 
@@ -1277,7 +1321,7 @@ def build_affine_apply_items(
         for head in range(num_heads):
             for p_begin in range(0, blocks, per_run):
                 p_end = min(blocks, p_begin + per_run)
-                owns_final = p_end == blocks and not pairmap
+                owns_final_run = owns_final and p_end == blocks and not pairmap
                 items.append(
                     [
                         w * num_heads + head,
@@ -1288,7 +1332,7 @@ def build_affine_apply_items(
                         chunks,
                         tail_offsets[w],
                         w + 1,
-                        (w * num_heads + head) if owns_final else -1,
+                        (w * num_heads + head) if owns_final_run else -1,
                         head,
                         length,
                         1 if (rows_enabled and not pairmap) else 0,
@@ -2302,6 +2346,42 @@ def _require_tensor(
         raise ValueError(f"{name} must be contiguous")
 
 
+def _validate_qkv_layout(q, k, v) -> bool:
+    """Accept dense ``[B, T, H, 128]`` BF16 q / k / v or strided views of one packed row.
+
+    Returns ``True`` for dense operands.  A strided operand must keep a dense
+    ``[num_heads, 128]`` token payload, a token stride that is a multiple of 8
+    elements and at least ``num_heads * 128``, and a plain batch stride
+    (``shape[1] * token stride``) so ``[B, T]`` folds to ``[1, B*T]``.  The
+    fused M128 body reads each operand's token pitch from its TensorView, so
+    q, k and v may carry different pitches (e.g. a dense zero ``v``).
+    """
+    import torch
+
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        _require_tensor(
+            tensor, name=name, dtype=torch.bfloat16, ndim=4, contiguous=False
+        )
+    if q.is_contiguous() and k.is_contiguous() and v.is_contiguous():
+        return True
+    heads_x_dim = q.shape[2] * HEAD_DIM
+    for name, tensor in (("q", q), ("k", k), ("v", v)):
+        if tensor.stride(3) != 1 or tensor.stride(2) != HEAD_DIM:
+            raise ValueError(
+                f"{name} must keep a dense [num_heads, {HEAD_DIM}] token payload"
+            )
+        if tensor.stride(1) < heads_x_dim or tensor.stride(1) % 8 != 0:
+            raise ValueError(
+                f"{name} token stride must be a multiple of 8 elements and at least "
+                f"num_heads * {HEAD_DIM}; got {tensor.stride(1)}"
+            )
+        if tensor.shape[0] > 1 and tensor.stride(0) != tensor.shape[1] * tensor.stride(
+            1
+        ):
+            raise ValueError(f"{name} batch stride must be shape[1] * token stride")
+    return False
+
+
 class FlashKDABlackwellBF16FusedLaunch:
     """Preallocated single-kernel launch for the production BF16 path."""
 
@@ -2376,8 +2456,14 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (not self._affine_main_indexed_initial_bf16),
         )
         self.compute_dtype = compute_dtype
-        for name, tensor in (("q", q), ("k", k), ("v", v), ("out", out)):
-            _require_tensor(tensor, name=name, dtype=torch.bfloat16, ndim=4)
+        _require_tensor(out, name="out", dtype=torch.bfloat16, ndim=4)
+        # Round-5 lever 5b: q / k / v may be strided views of a packed qkv row
+        # (token pitch > num_heads * HEAD_DIM) as long as each token's
+        # [num_heads, HEAD_DIM] payload is dense and the three share one pitch;
+        # the fused M128 body reads them in place, every other body gets a
+        # dense copy below.
+        qkv_dense = _validate_qkv_layout(q, k, v)
+        qkv_strided_ok = False
         _require_tensor(g, name="g", dtype=torch.bfloat16, ndim=4, contiguous=False)
         _require_tensor(
             beta,
@@ -2766,6 +2852,35 @@ class FlashKDABlackwellBF16FusedLaunch:
             # policy above resolved, including the checkpoint-constrained and
             # active-beta direct families; forced tiles were excluded above.
             route = BF16_ROUTE_M64
+        if (
+            route == BF16_ROUTE_M64
+            and not self._force_independent_dvsplit
+            # Active FP32 beta has no direct body beyond 256 tokens (the
+            # direct active-beta family is the short H12 indexed schedule);
+            # its value split keeps the BF16 carrier, documented in the
+            # constant's note.
+            and not self._active_beta_f32
+            and not _dvsplit_carrier_precision_ok(
+                compute_dtype=compute_dtype,
+                bounded_gate=gate_kind == KDAGateKind.LOWER_BOUND,
+                max_seq_len=max_seq_len,
+                state_dtype_is_fp32=self._state_dtype_is_fp32,
+            )
+        ):
+            # Every automatic M64 selection above (one-wave split, H12
+            # active-beta split, H64 fixed-layout split) on a BF16 pool shares
+            # the BF16 chunk carrier; bounded sequences beyond one chunk take
+            # the FP32 carrier of the direct family instead.  The N32 tile is
+            # the measured preference wherever the checkpoint cadence allows it
+            # (CAKE-736 round 8: N16 is 1.75x slower than the split at H12
+            # 8192 tokens, N32 1.10x); explicit M64 requests keep their body.
+            # FP32 pools keep the split: its body carries FP32 chunk state
+            # (CAKE-736 round 9).
+            route = (
+                BF16_ROUTE_DIRECT_M128
+                if checkpoint_fits_n32 and not self._force_direct_m128
+                else BF16_ROUTE_DIRECT_M128_N16
+            )
         if compute_dtype == "tf32":
             if route in {
                 BF16_ROUTE_SMALL_BH_M128,
@@ -3488,6 +3603,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 raise ValueError(
                     "checkpoint accumulation requires FP32 checkpoint rows"
                 )
+            qkv_strided_ok = True
             self.module = _build_kda_module(
                 partial(_factory, "compiled_bf16_fused_m128"),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
@@ -3895,6 +4011,16 @@ class FlashKDABlackwellBF16FusedLaunch:
         if n32_value_rows == 64:
             self.grid = (2 * self.grid[0], 1, 1)
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
+        if not qkv_dense and not qkv_strided_ok:
+            # Only the fused M128 body carries the q / k / v token pitch; the
+            # other bodies read a dense layout, so densify here (one copy per
+            # operand, the cost the caller used to pay unconditionally).
+            q = q.contiguous()
+            k = k.contiguous()
+            v = v.contiguous()
+            q_flat = q.reshape(total_tokens, num_heads, HEAD_DIM)
+            k_flat = k.reshape(total_tokens, num_heads, HEAD_DIM)
+            v_flat = v.reshape(total_tokens, num_heads, HEAD_DIM)
         self.args = {
             "q": q_flat,
             "q_tma": q_flat,
@@ -4631,10 +4757,11 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self.active_beta_f32 = active_beta_f32
         if active_beta_f32 and (compute_dtype != "tf32" or lower_bound is None):
             raise ValueError("active-beta affine requires bounded TF32 compute")
-        if q.ndim != 4 or any(
-            (not tensor.is_contiguous() for tensor in (q, k, v, out))
-        ):
-            raise ValueError("affine q/k/v/out require contiguous [B,T,H,128] tensors")
+        if q.ndim != 4 or not out.is_contiguous():
+            raise ValueError("affine out requires a contiguous [B,T,H,128] tensor")
+        # Strided q / k / v views (lever 5b) reach the fused M128 main pass in
+        # place; the map / apply kernels read only the exported operators.
+        _validate_qkv_layout(q, k, v)
         if any((tensor.shape != q.shape for tensor in (k, v, out))):
             raise ValueError("affine q/k/v/out shapes must match")
         if initial_state is None or final_state is None or state_indices is None:
@@ -4811,7 +4938,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._final_correction_selected = None
         self._zero_v = torch.zeros_like(v[:, first_part_tokens:])
         self._map_out = torch.empty_like(out[:, first_part_tokens:])
-        self._correction_out = torch.empty_like(out[:, first_part_tokens:])
+        # The correction output buffer is allocated below, once the route is
+        # known: the apply route reduce-adds its correction into the output
+        # tail and never touches it (kernel round 3, host lever).
+        self._correction_out: torch.Tensor | None = None
         main_checkpoint_kwargs = {}
         correction_checkpoint_kwargs = {}
         self._checkpoint_in_place = False
@@ -4952,6 +5082,8 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             and not self._use_output_projection
             and (state_checkpoints is None or self._checkpoint_in_place)
         )
+        if not self._apply_route:
+            self._correction_out = torch.empty_like(out[:, first_part_tokens:])
         main_launch_cls: type[
             FlashKDABlackwellFP32SlabM128PDLIndexedInitialProducerLaunch
         ]
@@ -5009,6 +5141,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 if self._checkpoint_in_place
                 else FlashKDABlackwellFP32SlabM128PDLConsumerLaunch
             )
+            assert self._correction_out is not None
             self._correction = correction_cls(
                 q[:, first_part_tokens:],
                 k[:, first_part_tokens:],
@@ -5112,6 +5245,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 num_heads=heads,
                 rows_enabled=self._checkpoint_in_place,
                 sm_count=_device_sm_count(q.device),
+                # Kernel round 4 (lever 8b): the scan kernel stores every
+                # sequence's final state and the row-0 carries itself; no
+                # apply run evaluates S_w^in x M_final.
+                owns_final=False,
             )
             self._apply_items = torch.tensor(
                 items, dtype=torch.int32, device=q.device
@@ -5176,12 +5313,20 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             self._apply_dummy_dpair = torch.zeros(
                 (1, heads, HEAD_DIM), dtype=torch.float32, device=q.device
             )
-            self._apply_head_offsets = torch.arange(
-                heads, dtype=torch.int64, device=q.device
-            )
-            self._apply_row0_index = torch.empty(
-                (num_parts - 1) * heads, dtype=torch.int64, device=q.device
-            )
+            # The scan kernel scatters the final state into the caller's pool
+            # slots and stores the FP32 carry into row 0 of every tail window,
+            # so the composite has no torch epilogue on this route.
+            if self._final_pool.ndim != 4 or not self._final_pool[0].is_contiguous():
+                raise ValueError(
+                    "affine apply route requires a [slots,H,128,128] state pool with contiguous slots"
+                )
+            if (
+                self._checkpoint_in_place
+                and not self._checkpoint_output[0].is_contiguous()
+            ):
+                raise ValueError(
+                    "affine apply route requires contiguous FP32 checkpoint rows"
+                )
             # The apply kernel reduce-adds the correction into the output tail
             # itself (no correction buffer, no host add).
             self._apply_out_fused = True
@@ -5207,6 +5352,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
         self._out_tail = out[:, first_part_tokens:]
         self._projection_module = None
         if self._use_output_projection:
+            assert self._correction_out is not None
             self._projection_module = _build_kda_module(
                 partial(_factory, "compiled_affine_output_projection")
             )
@@ -5292,8 +5438,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 if sub is not None:
                     sub._descriptors_stale = True
             # The apply-route kernels hold prepared TMA descriptors of caller
-            # storage (output tail, checkpoint rows): re-prepare them too.
+            # storage (output tail, checkpoint rows): re-prepare them too,
+            # including the prefix chain whose descriptors are launch-owned.
             self._apply_descriptors_stale = bool(self._apply_route)
+            self._apply_prefix_stale = bool(self._apply_route)
             self._descriptors_stale = False
         with _ffi_stream_context(self._launch_device):
             for destination, source in self._affine_input_refreshes:
@@ -5330,17 +5478,26 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             # The map/correction rebinds of a plan-cache hit were deferred
             # past the first chain kernel; apply them while it runs.
             flush_deferred_rebind(self)
-            if self._fused_epilogue is None:
+            if self._fused_epilogue is None and not self._apply_route:
                 # The int64 index copy is only consumed by the final-state
                 # scatter, so it follows the first chain kernel.
                 self._state_indices_long.copy_(self._state_indices)
             if self._apply_route and getattr(self, "_apply_descriptors_stale", False):
-                self._pairmap_module.prepare(
-                    grid=self._pairmap_grid, **self._pairmap_bindings()
-                )
-                self._prefix_module.prepare(
-                    grid=self._prefix_grid, **self._prefix_bindings()
-                )
+                if getattr(self, "_apply_prefix_stale", False):
+                    # Only the fused apply kernel stores through the caller's
+                    # out_tma / rows_tma (the pair-map producer runs the same
+                    # ABI in PAIRMAP mode and writes launch-owned maps only;
+                    # the prefix chain addresses launch-owned buffers), so a
+                    # plan-cache rebind re-uploads one descriptor set and the
+                    # pair-map / prefix sets re-prepare only on the capture /
+                    # full-stale path.
+                    self._pairmap_module.prepare(
+                        grid=self._pairmap_grid, **self._pairmap_bindings()
+                    )
+                    self._prefix_module.prepare(
+                        grid=self._prefix_grid, **self._prefix_bindings()
+                    )
+                    self._apply_prefix_stale = False
                 self._apply_module.prepare(
                     grid=self._apply_grid, **self._apply_bindings()
                 )
@@ -5358,8 +5515,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 carry_lo=self._carry_lo,
                 num_heads=int(self._main_final.shape[1]),
                 part_cu_seqlens=self._part_cu_seqlens,
-                final_state=self._final_compact,
-                write_final_state=int(self._use_output_projection),
+                **self._scan_epilogue_bindings(),
             )
             if self._use_output_projection:
                 self._projection_module.launch(
@@ -5369,6 +5525,10 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                 self._launch_apply()
             else:
                 self._correction._launch_in_stream()
+            if self._apply_route:
+                # The scan kernel wrote the final states into the pool and the
+                # row-0 carries into the checkpoint rows: no epilogue launch.
+                return
             if self._fused_epilogue is not None:
                 self._launch_fused_epilogue()
                 return
@@ -5397,6 +5557,7 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
                     0, self._checkpoint_indices, self._checkpoint_merged
                 )
             if not (self._apply_route and self._apply_out_fused):
+                assert self._correction_out is not None
                 self._out_tail.add_(self._correction_out)
             if not self._use_output_projection:
                 if self._num_sequences == 1:
@@ -5465,7 +5626,12 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             fused.first_rows,
             fused.num_rows,
             self._out_tail,
-            self._correction_out,
+            # The apply route passes zero tail elements (the apply kernel
+            # already reduce-added its correction), so any tensor of the
+            # right kind stands in for the absent correction buffer.
+            self._correction_out
+            if self._correction_out is not None
+            else self._out_tail,
             self._main_final,
             self._correction_final,
             self._last_parts,
@@ -5547,25 +5713,56 @@ class FlashKDABlackwellAffineSplitLaunch(FlashKDABlackwellBF16FusedLaunch):
             map_final_tma=map_final,
         )
 
-    def _launch_apply(self) -> None:
-        """Fused apply kernel: S_w^in (BF16 hi/lo) x prefix maps x exported chunk operators."""
-        import torch
+    def _scan_epilogue_bindings(self) -> dict:
+        """Scan-kernel arguments of the state epilogue (kernel round 4, lever 8b).
 
-        heads = int(self._carry.shape[1])
-        if self._checkpoint_in_place:
-            rows = self._checkpoint_output
-            # Row 0 of every tail window is the state entering the window: the
-            # main window wrote its zero start, the correction adds the exact
-            # FP32 carry (the chain added its initial state the same way).
-            starts = self._part_row_starts[1 : self.num_parts]
-            torch.add(
-                starts.unsqueeze(1) * heads,
-                self._apply_head_offsets,
-                out=self._apply_row0_index.view(-1, heads),
+        On the apply route the scan scatters each sequence's final state into
+        the caller's pool slot and stores the FP32 carry entering every tail
+        window into row 0 of its checkpoint rows (the main window wrote that
+        row as zeros).  Other routes keep their epilogue; the FP32 map
+        schedule keeps its ``final_state[seq]`` output for the projection.
+        The caller tensors are read at launch time, so a plan-cache rebind
+        that moves the pool, the rows or the state indices needs no
+        descriptor refresh here.
+        """
+
+        if not self._apply_route:
+            return dict(
+                final_state=self._final_compact,
+                write_final_state=int(self._use_output_projection),
+                final_indices=self._part_cu_seqlens,
+                final_slot_stride=0,
+                final_state_bf16=self._carry_hi,
+                rows=self._main_final,
+                row_starts=self._first_parts,
+                write_rows=0,
             )
-            rows.view(-1, HEAD_DIM, HEAD_DIM).index_add_(
-                0, self._apply_row0_index, self._carry.view(-1, HEAD_DIM, HEAD_DIM)
-            )
+        fp32_pool = self._external_state_is_fp32
+        # A pool sliced out of a larger buffer is not contiguous as a whole
+        # (slot stride > slot size); the kernel indexes it by slot stride from
+        # its data pointer, so hand the shim a pointer carrier (as the main
+        # kernel's indexed initial-state pool already does).
+        pool = _ffi_raw_pointer_carrier(self._final_pool)
+        return dict(
+            final_state=pool if fp32_pool else self._final_compact,
+            write_final_state=1 if fp32_pool else 2,
+            final_indices=self._state_indices,
+            final_slot_stride=int(self._final_pool.stride(0)),
+            final_state_bf16=self._carry_hi if fp32_pool else pool,
+            rows=self._checkpoint_output
+            if self._checkpoint_in_place
+            else self._apply_dummy_rows,
+            row_starts=self._part_row_starts,
+            write_rows=int(self._checkpoint_in_place),
+        )
+
+    def _launch_apply(self) -> None:
+        """Fused apply kernel: S_w^in (BF16 hi/lo) x prefix maps x exported chunk operators.
+
+        Row 0 of every tail window (the state entering it) and the sequence
+        final states are written by the scan kernel.
+        """
+
         self._apply_module.launch(grid=self._apply_grid, **self._apply_bindings())
 
     def _apply_bindings(self) -> dict:
@@ -5783,12 +5980,18 @@ def _supports_affine_split_launch(args, kwargs) -> bool:
         or (state_indices is None)
     ):
         return False
-    if any(
-        (
-            tensor is None or not tensor.is_contiguous()
-            for tensor in (q, argument(1, "k"), argument(2, "v"), argument(6, "out"))
-        )
-    ):
+    k = argument(1, "k")
+    v = argument(2, "v")
+    out = argument(6, "out")
+    if any(tensor is None for tensor in (k, v, out)) or not out.is_contiguous():
+        return False
+    # Round-5 lever 5b: serving hands q / k / v over as strided views of one
+    # packed qkv row.  The split's main pass accepts every layout
+    # ``_validate_qkv_layout`` accepts (dense, or in place / one dense copy),
+    # so the gate must not send such calls to the sequential body.
+    try:
+        _validate_qkv_layout(q, k, v)
+    except (TypeError, ValueError):
         return False
     checkpoint_request = (
         state_checkpoints is not None
@@ -6060,6 +6263,12 @@ AFFINE_REBIND_ATTRIBUTES = (
     "_checkpoint_start",
     "_out_tail",
 )
+# Composite attributes that the apply-route kernels (pair-map producer and
+# fused apply) address through prepared TMA descriptors of CALLER storage:
+# the output tail (``out_tma``) and, for in-place checkpoint rows, the caller's
+# checkpoint buffer (``rows_tma``).  When a plan-cache rebind moves one of
+# them the composite must re-encode those descriptors before its next launch.
+APPLY_ROUTE_DESCRIPTOR_ATTRIBUTES = ("_out_tail", "_checkpoint_output")
 
 
 def _rebind_owner(impl, container_name: str):
@@ -6377,6 +6586,23 @@ def _apply_rebind_specs(
                 owner, _ = _rebind_owner(impl, spec.container)
                 if owner not in stale_owners:
                     stale_owners.append(owner)
+        elif (
+            spec.container == "attributes"
+            and spec.key in APPLY_ROUTE_DESCRIPTOR_ATTRIBUTES
+        ):
+            # The apply-route kernels hold prepared TMA descriptors of these
+            # caller tensors (see _apply_bindings / _pairmap_bindings); a moved
+            # source means the descriptors still address the previous call's
+            # storage, so mark them for re-encoding in the launch stream.
+            moved = (
+                spec.input_name in changed
+                if changed is not None
+                else container[spec.key].data_ptr() != replacement.data_ptr()
+            )
+            if moved and getattr(impl, "_apply_route", False):
+                if spec.key == "_out_tail" or impl._checkpoint_in_place:
+                    tma_moved = True
+                    impl._apply_descriptors_stale = True
         container[spec.key] = replacement
     for address in address_specs:
         touched.add(address.container)
