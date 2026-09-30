@@ -56,7 +56,10 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
   natural-layout FP32 tensors instead; the kernels' internal accumulator layout
   (registry field `dkv_acc_layout`, `natural` or `permuted`) never crosses the
   API boundary -- a permuted program serves the FP32 mode through its cast
-  stage.
+  stage.  With a caller-provided `dkv_acc` (see "Packed fp32 dKV accumulation
+  and destination mapping" below) the dK/dV gradients are accumulated into that
+  packed FP32 buffer instead, no `dkv_latent` / `dk_rope` tensors are produced
+  and the autograd wrapper returns no gradient for `kv_latent` / `k_rope`.
 
 ### Packed and strided inputs
 
@@ -117,6 +120,42 @@ remembered binding on B200 -- the backward figure grows with the per-call
 scratch of the key-range-pass rows) or capture the prepared runner into a CUDA
 graph.
 
+### Packed fp32 dKV accumulation and destination mapping
+
+`cake_backend.backward(..., dkv_acc=, dkv_dst_map=)`, `prepare_dsa_train(...,
+dkv_acc=, dkv_dst_map=)` and the autograd `Function`
+(`DSASparseAttentionFunction.apply(q_latent, q_rope, kv_latent, k_rope, indices,
+topk_length, softmax_scale, key_passes, dkv_acc, dkv_dst_map)`) accumulate the
+dK/dV gradients directly into a caller-provided FP32 buffer instead of
+returning `dkv_latent` / `dk_rope` (flashinfer-ai/flashinfer#5675: the packed
+dKV of a trainer, with the repeated / remapped rows of a context-parallel window):
+
+* `dkv_acc`: FP32 `[S_dst, >= 576]` -- the latent gradient is added into columns
+  `0:512`, the rope gradient into columns `512:576`; further columns are never
+  touched (a `[S_dst, 704]` buffer holding a frozen 128-channel indexer key next
+  to the 576 channels is fine).  Row stride `>= 576` elements and a multiple of
+  4, 16-byte-aligned base; the 576-column view of a wider buffer is accepted.
+  Accumulation is `+=`: the caller zeroes the buffer when it wants fresh
+  gradients, and two backward calls into the same buffer sum.
+* `dkv_dst_map`: optional contiguous int32 `[S]` giving the destination row of
+  every source key row (values in `[0, S_dst)`, not checked on device;
+  duplicates allowed and summed).  Without a map the identity is used, which
+  needs `S_dst >= S`.
+* With `dkv_acc` the backward returns `(dq_latent, dq_rope, None, None)`, the
+  autograd wrapper returns `None` gradients for `kv_latent` / `k_rope`, and
+  `dkv_fp32=True` is rejected.  The kernels' permuted FP32 accumulators remain
+  per-call scratch; `bwd_cast` un-permutes, remaps and adds in one pass
+  (`accumulate = 1`).  With a map the adds are `red.global.add.v4.f32`, whose
+  order is not fixed for repeated destination rows (an injective map is still
+  exactly one add per element); without a map every 16-byte vector is a
+  load-add-store, bitwise `previous + value`.
+* Requires a registered program whose `bwd_cast` argument plan declares
+  `dst_packed, dst_row_stride, dst_map, has_dst_map, accumulate`
+  (`cake_backend.record_cast_accumulates`); an older program raises
+  `NotImplementedError`.  The binding cache keys the backward on `(data_ptr,
+  shape, stride, dtype)` of `dkv_acc` and `dkv_dst_map` as well (the row stride
+  and the presence of a map are baked into the cast's launch).
+
 ## Kernel structure of one training step
 
 * `fwd`: one CTA per query token gathers its top-k keys once (TMA gather) and
@@ -136,7 +175,9 @@ graph.
   partial in `dq_partial` between passes (`dq_mode` 1: store, 2: load-add-
   store, 3: load-add and BF16 output).
 * `bwd_cast`: converts the FP32 accumulators to the natural `[S, 512]` /
-  `[S, 64]` BF16 outputs (or FP32 in the `dkv_fp32` mode).
+  `[S, 64]` BF16 outputs (or FP32 in the `dkv_fp32` mode), or adds them into
+  the caller's packed FP32 rows through the optional destination-row map
+  (`dkv_acc` / `dkv_dst_map`).
 
 Grid rules live in the registry record (`num_queries` CTAs for `fwd`,
 `bwd_main` and `bwd_main_pass`, `num_queries*8` for `bwd_delta`,
