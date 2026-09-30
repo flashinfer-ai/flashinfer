@@ -20,6 +20,145 @@
           "requires_non_null": "causal_seqlens_kv_global"
         },
         "families": {
+          "dcp_spec_bf16_balanced": {
+            "binding_sha256": "7d8c1947cfdb6cc3bff804f5a8b3dbe61962b82db496f9741d5f663ef9499769",
+            "binding_source": "bindings/cake_fmha_dcp_spec_bf16_balanced_binding.cu",
+            "dynamic_shared_memory_bytes": 226304,
+            "launch_binding": "cake_fmha_launch_dcp_spec_bf16_balanced",
+            "parameters": [
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "Q"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "K"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "V"
+              },
+              {
+                "ctype": "__nv_bfloat16*",
+                "kind": "pointer",
+                "name": "O_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "LSE_ptr"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "page_table"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "causal_seqlens_kv_global"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "partial_o"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "partial_stats"
+              },
+              {
+                "ctype": "uint32_t*",
+                "kind": "pointer",
+                "name": "tile_counters"
+              },
+              {
+                "ctype": "uint32_t*",
+                "kind": "pointer",
+                "name": "queue_counters"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_pages_per_seq"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "softmax_scale_log2"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_q_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_kv_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "batch_size"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "q_len"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "cp_rank"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "cp_world_log2"
+              },
+              {
+                "ctype": "uint32_t",
+                "kind": "value",
+                "name": "max_items"
+              }
+            ],
+            "parametric_macros": [],
+            "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_balanced",
+            "source_family": [
+              {
+                "selector": {
+                  "n_rows": 32
+                },
+                "sha256": {
+                  "sm_100a": "92c5295c8c602c227b04758d2fc16820c3fdc77f3878bd3e028218e6834bc122",
+                  "sm_103a": "3198afd316bbb258b804f71af37c6883bedfbb0a85edac52a8a4fc2371ab4aae"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_100a/n_rows32.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_103a/n_rows32.cu"
+                }
+              },
+              {
+                "selector": {
+                  "n_rows": 64
+                },
+                "sha256": {
+                  "sm_100a": "e61bbac768355d85f26567790fc73cdc8a2ce33c6eb0fb67e6f26337ae043895",
+                  "sm_103a": "e64909c3c862c8de4c437b431721ba9dde7ab0e31234cfb9ebc5a9c50cd1e352"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_100a/n_rows64.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_103a/n_rows64.cu"
+                }
+              }
+            ],
+            "threads": 384
+          },
           "dcp_spec_bf16_fp8": {
             "binding_sha256": "9f4366bae2304215b57551cddb85186ddcb21286ab056daa6d20122835d0ff9d",
             "binding_source": "bindings/cake_fmha_dcp_spec_bf16_fp8_binding.cu",
@@ -245,6 +384,294 @@
               }
             ],
             "threads": 512
+          },
+          "dcp_spec_bf16_fp8_balanced": {
+            "binding_sha256": "f00edc25cf341ba233f00b60f19ca2e724b648e2f03c41040ecd0c8f97990965",
+            "binding_source": "bindings/cake_fmha_dcp_spec_bf16_fp8_balanced_binding.cu",
+            "dynamic_shared_memory_bytes": 160768,
+            "launch_binding": "cake_fmha_launch_dcp_spec_bf16_fp8_balanced",
+            "parameters": [
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "Q"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "K"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "V"
+              },
+              {
+                "ctype": "__nv_bfloat16*",
+                "kind": "pointer",
+                "name": "O_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "LSE_ptr"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "page_table"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "causal_seqlens_kv_global"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "partial_o"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "partial_stats"
+              },
+              {
+                "ctype": "uint32_t*",
+                "kind": "pointer",
+                "name": "tile_counters"
+              },
+              {
+                "ctype": "uint32_t*",
+                "kind": "pointer",
+                "name": "queue_counters"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_pages_per_seq"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "softmax_scale_log2"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "output_scale"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_q_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_kv_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "batch_size"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "q_len"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "cp_rank"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "cp_world_log2"
+              },
+              {
+                "ctype": "uint32_t",
+                "kind": "value",
+                "name": "max_items"
+              }
+            ],
+            "parametric_macros": [],
+            "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8_balanced",
+            "source_family": [
+              {
+                "selector": {
+                  "n_rows": 32
+                },
+                "sha256": {
+                  "sm_100a": "feb31e7c7dddd66fb831594219601d5085cef329ce19cc4b5869857934bac06e",
+                  "sm_103a": "775b7918eefeea5c237e0bb0a1bfd3b05813ab3218456668d10044b0db93941b"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_100a/n_rows32.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_103a/n_rows32.cu"
+                }
+              },
+              {
+                "selector": {
+                  "n_rows": 64
+                },
+                "sha256": {
+                  "sm_100a": "cd3e5c1662cfd13314a8947cb032f38b4e88bcf4a7e077461b118ff6b24d15cd",
+                  "sm_103a": "619717d9804c574bc28301037e99f7fe69fadbdcf9f6a1c314c451ae5f5717fa"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_100a/n_rows64.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_103a/n_rows64.cu"
+                }
+              }
+            ],
+            "threads": 384
+          },
+          "dcp_spec_bf16_fp8_d256_balanced": {
+            "binding_sha256": "740f09b4f74a30dcc6d70263ce408102eb8fcf4bab045112bdf5e653e2e7477f",
+            "binding_source": "bindings/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_binding.cu",
+            "dynamic_shared_memory_bytes": 226304,
+            "launch_binding": "cake_fmha_launch_dcp_spec_bf16_fp8_d256_balanced",
+            "parameters": [
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "Q"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "K"
+              },
+              {
+                "ctype": "CakeFmhaTensorMap const*",
+                "kind": "pointer",
+                "name": "V"
+              },
+              {
+                "ctype": "__nv_bfloat16*",
+                "kind": "pointer",
+                "name": "O_ptr"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "LSE_ptr"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "page_table"
+              },
+              {
+                "ctype": "int*",
+                "kind": "pointer",
+                "name": "causal_seqlens_kv_global"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "partial_o"
+              },
+              {
+                "ctype": "float*",
+                "kind": "pointer",
+                "name": "partial_stats"
+              },
+              {
+                "ctype": "uint32_t*",
+                "kind": "pointer",
+                "name": "tile_counters"
+              },
+              {
+                "ctype": "uint32_t*",
+                "kind": "pointer",
+                "name": "queue_counters"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "max_pages_per_seq"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "softmax_scale_log2"
+              },
+              {
+                "ctype": "float",
+                "kind": "value",
+                "name": "output_scale"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_q_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "num_kv_heads"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "batch_size"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "q_len"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "cp_rank"
+              },
+              {
+                "ctype": "int",
+                "kind": "value",
+                "name": "cp_world_log2"
+              },
+              {
+                "ctype": "uint32_t",
+                "kind": "value",
+                "name": "max_items"
+              }
+            ],
+            "parametric_macros": [],
+            "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced",
+            "source_family": [
+              {
+                "selector": {
+                  "n_rows": 32
+                },
+                "sha256": {
+                  "sm_100a": "57b8e8922fcbc22b593d6aa54e9b87d38a39c2d6f232c8d276cc4731e23707eb",
+                  "sm_103a": "83a6fc3acffcd30ce1145e7573b19b931deff88b1aed779072efc7b5bd9e3e81"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_100a/n_rows32.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_103a/n_rows32.cu"
+                }
+              },
+              {
+                "selector": {
+                  "n_rows": 64
+                },
+                "sha256": {
+                  "sm_100a": "7c8f6ea7b15b193d95dca4a4f918926ded3eb559b0eff06bc87ba8feedfd6ab7",
+                  "sm_103a": "e6dd0ec7be6cafedef62ecae5d5b6653a11f079d21604c982cf17d7965bf342e"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_100a/n_rows64.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_103a/n_rows64.cu"
+                }
+              }
+            ],
+            "threads": 384
           },
           "dcp_spec_bf16_v1": {
             "binding_sha256": "48472f3684b0b307094f734e2d07970185d35e09d4e876c09fe90770fcd5acc6",
@@ -763,8 +1190,473 @@
             }
           }
         },
-        "source_package_file_count": 30,
-        "source_package_sha256": "b702f0173a3d49274b60db3cc649f475f78d40c465c05301d888d122f6624624"
+        "source_package_file_count": 52,
+        "source_package_sha256": "90c75782861a66f6ab0040ffeeb39ea1259dbd1087073e4beafdc724e2ad5e80",
+        "balanced_routes": {
+          "dcp_spec_bf16_balanced": {
+            "arguments": {
+              "K": "TMA map of the HND K cache [pages, num_kv_heads, page_size, head_dim] (bfloat16; e4m3 caches are bound as uint8 views)",
+              "LSE_ptr": "caller-owned float32 base-2 [batch_size * q_len, num_q_heads]; -inf on empty rows",
+              "O_ptr": "caller-owned bfloat16 [batch_size * q_len, num_q_heads, head_dim]; exact zero on empty rows",
+              "Q": "TMA map of Q viewed as [batch_size * q_len, num_q_heads, head_dim] (bfloat16; row = request * q_len + speculative row)",
+              "V": "TMA map of the HND V cache [pages, num_kv_heads, page_size, head_dim] (bfloat16; e4m3 caches are bound as uint8 views)",
+              "batch_size": "requests per launch (<= launch.max_requests)",
+              "causal_seqlens_kv_global": "int32 [batch_size]: global context length ahead of the q_len speculative rows",
+              "cp_rank": "0 <= cp_rank < cp_world",
+              "cp_world_log2": "log2(cp_world); cp_world in {1, 2, 4, 8}",
+              "max_items": "workspace.max_items",
+              "max_pages_per_seq": "page_table.shape[1]",
+              "num_kv_heads": "host metadata",
+              "num_q_heads": "host metadata",
+              "page_table": "int32 [batch_size, max_pages_per_seq]",
+              "partial_o": "workspace (see workspace)",
+              "partial_stats": "workspace (see workspace)",
+              "q_len": "speculative rows per request",
+              "queue_counters": "workspace (see workspace)",
+              "softmax_scale_log2": "sm_scale * log2(e)",
+              "tile_counters": "workspace (see workspace)"
+            },
+            "dispatch_band": {
+              "band": {
+                "chunk_tokens": 256,
+                "long_tile_blocks": 16,
+                "min_items": 128
+              },
+              "contract": {
+                "head_dim": 128,
+                "max_q_len": 8,
+                "max_requests": 1024,
+                "min_q_len": 3,
+                "q_heads_per_kv_head": 8,
+                "q_tiles": 1
+              },
+              "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items)",
+              "family": "dcp_spec_bf16_balanced",
+              "incumbent_family": "dcp_spec_bf16_v4",
+              "incumbent_shape": {
+                "block_n": 128,
+                "blocks_per_cta": "ceil(local_blocks / num_split)",
+                "local_blocks": "max(1, ceil(max_local_seq_len / block_n))",
+                "logical_tiles": "batch_size * q_len * num_kv_heads",
+                "max_num_split": 16,
+                "min_split_local_blocks": 16,
+                "num_split": "1 if local_blocks < min_split_local_blocks else min(max_num_split, total_pairs, work_cap, sm_count // logical_tiles), collapsed to 1 below 2",
+                "target_pairs_per_split": 3,
+                "total_pairs": "ceil(local_blocks / 2)",
+                "waves": "ceil(logical_tiles * num_split / sm_count)",
+                "work_cap": "ceil(total_pairs / target_pairs_per_split)"
+              },
+              "items_bound": "batch_size * num_kv_heads * max(1, ceil(max_local_seq_len / chunk_tokens)) * q_tiles"
+            },
+            "launch": {
+              "grid": "(sm_count, 1, 1): one persistent CTA per multiprocessor of the launch device",
+              "max_requests": 1024,
+              "shared_mem_bytes": 226304,
+              "threads": 384
+            },
+            "profile": {
+              "causal": true,
+              "cp_world": [
+                1,
+                2,
+                4,
+                8
+              ],
+              "empty_row_policy": {
+                "LSE": "negative_infinity",
+                "O": "exact_zero"
+              },
+              "head_dim": 128,
+              "kv_dtype": "bfloat16",
+              "kv_layout": "HND",
+              "lse": "float32_base2",
+              "o_dtype": "bfloat16",
+              "page_size": 16,
+              "q_dtype": "bfloat16",
+              "q_heads_per_kv_head": 8,
+              "q_len": [
+                3,
+                4,
+                5,
+                6,
+                7,
+                8
+              ]
+            },
+            "public_name": "cake_fmha_dcp_spec_bf16_balanced",
+            "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_balanced",
+            "selector": {
+              "by_q_len": {
+                "3": 32,
+                "4": 32,
+                "5": 64,
+                "6": 64,
+                "7": 64,
+                "8": 64
+              },
+              "key": "n_rows",
+              "q_box_rows": 8,
+              "q_heads_per_kv_head": 8,
+              "rule": "smallest supported n_rows with min(q_len, q_box_rows) * q_heads_per_kv_head <= n_rows",
+              "supported": [
+                32,
+                64
+              ]
+            },
+            "workspace": {
+              "max_balance_factor": 8,
+              "max_items": "batch_size * num_kv_heads * q_tiles + max_split_items + max_split_tiles * reduce_slices_max",
+              "max_split_items": "2 * max_balance_factor * sm_count",
+              "max_split_tiles": "max_balance_factor * sm_count",
+              "partial_o": {
+                "dtype": "float32",
+                "elements": "max_split_items * slot_elements",
+                "slot_elements": 8192
+              },
+              "partial_stats": {
+                "dtype": "float32",
+                "elements": "(max_split_items + 1) * slot_elements",
+                "slot_elements": 128
+              },
+              "q_tiles": "ceil(q_len / q_box_rows)",
+              "queue_counters": {
+                "dtype": "uint32",
+                "elements": 4,
+                "initial_state": "zero; every launch leaves it zero"
+              },
+              "reduce_slices_max": 8,
+              "tile_counters": {
+                "counters_per_tile": 4,
+                "dtype": "uint32",
+                "elements": "max_split_tiles * counters_per_tile",
+                "initial_state": "zero; every launch leaves it zero"
+              }
+            }
+          },
+          "dcp_spec_bf16_fp8_balanced": {
+            "arguments": {
+              "K": "TMA map of the HND K cache [pages, num_kv_heads, page_size, head_dim] (float8_e4m3fn; e4m3 caches are bound as uint8 views)",
+              "LSE_ptr": "caller-owned float32 base-2 [batch_size * q_len, num_q_heads]; -inf on empty rows",
+              "O_ptr": "caller-owned bfloat16 [batch_size * q_len, num_q_heads, head_dim]; exact zero on empty rows",
+              "Q": "TMA map of Q viewed as [batch_size * q_len, num_q_heads, head_dim] (bfloat16; row = request * q_len + speculative row)",
+              "V": "TMA map of the HND V cache [pages, num_kv_heads, page_size, head_dim] (float8_e4m3fn; e4m3 caches are bound as uint8 views)",
+              "batch_size": "requests per launch (<= launch.max_requests)",
+              "causal_seqlens_kv_global": "int32 [batch_size]: global context length ahead of the q_len speculative rows",
+              "cp_rank": "0 <= cp_rank < cp_world",
+              "cp_world_log2": "log2(cp_world); cp_world in {1, 2, 4, 8}",
+              "max_items": "workspace.max_items",
+              "max_pages_per_seq": "page_table.shape[1]",
+              "num_kv_heads": "host metadata",
+              "num_q_heads": "host metadata",
+              "output_scale": "v_scale, applied after the softmax normalisation",
+              "page_table": "int32 [batch_size, max_pages_per_seq]",
+              "partial_o": "workspace (see workspace)",
+              "partial_stats": "workspace (see workspace)",
+              "q_len": "speculative rows per request",
+              "queue_counters": "workspace (see workspace)",
+              "softmax_scale_log2": "sm_scale * k_scale * log2(e)",
+              "tile_counters": "workspace (see workspace)"
+            },
+            "dispatch_band": {
+              "band": {
+                "chunk_tokens": 256,
+                "long_tile_blocks": 24,
+                "min_items": 160,
+                "two_wave_min_items": {
+                  "sm_100a": 384,
+                  "sm_103a": 160
+                },
+                "two_wave_min_items_default": 160
+              },
+              "contract": {
+                "head_dim": 128,
+                "max_q_len": 8,
+                "max_requests": 1024,
+                "min_q_len": 3,
+                "q_heads_per_kv_head": 8,
+                "q_tiles": 1
+              },
+              "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items and (waves >= 3 or items >= two_wave_min_items[arch]))",
+              "family": "dcp_spec_bf16_fp8_balanced",
+              "incumbent_family": "dcp_spec_bf16_fp8",
+              "incumbent_shape": {
+                "block_n": 128,
+                "blocks_per_cta": "ceil(local_blocks / num_split)",
+                "dcp_max_num_split": 3,
+                "local_blocks": "max(1, ceil(max_local_seq_len / block_n))",
+                "logical_tiles": "batch_size * q_len * num_kv_heads",
+                "max_num_split": 4,
+                "min_split_local_blocks": 4,
+                "num_split": "1 if logical_tiles >= sm_count or local_blocks < min_split_local_blocks else min(split_cap, total_pairs, work_cap, sm_count // logical_tiles), collapsed to 1 below 2",
+                "split_cap": "dcp_max_num_split if cp_world > 1 else max_num_split",
+                "total_pairs": "ceil(local_blocks / 2)",
+                "waves": "ceil(logical_tiles * num_split / sm_count)",
+                "work_cap": "ceil(total_pairs / 2)"
+              },
+              "items_bound": "batch_size * num_kv_heads * max(1, ceil(max_local_seq_len / chunk_tokens)) * q_tiles"
+            },
+            "launch": {
+              "grid": "(sm_count, 1, 1): one persistent CTA per multiprocessor of the launch device",
+              "max_requests": 1024,
+              "shared_mem_bytes": 160768,
+              "threads": 384
+            },
+            "profile": {
+              "causal": true,
+              "cp_world": [
+                1,
+                2,
+                4,
+                8
+              ],
+              "empty_row_policy": {
+                "LSE": "negative_infinity",
+                "O": "exact_zero"
+              },
+              "head_dim": 128,
+              "k_scale": "per_tensor_folded_into_bmm1",
+              "kv_dtype": "float8_e4m3fn",
+              "kv_layout": "HND",
+              "lse": "float32_base2",
+              "o_dtype": "bfloat16",
+              "page_size": 64,
+              "q_dtype": "bfloat16",
+              "q_heads_per_kv_head": 8,
+              "q_len": [
+                3,
+                4,
+                5,
+                6,
+                7,
+                8
+              ],
+              "v_scale": "per_tensor_folded_into_output"
+            },
+            "public_name": "cake_fmha_dcp_spec_bf16_fp8_balanced",
+            "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8_balanced",
+            "selector": {
+              "by_q_len": {
+                "3": 32,
+                "4": 32,
+                "5": 64,
+                "6": 64,
+                "7": 64,
+                "8": 64
+              },
+              "key": "n_rows",
+              "q_box_rows": 8,
+              "q_heads_per_kv_head": 8,
+              "rule": "smallest supported n_rows with min(q_len, q_box_rows) * q_heads_per_kv_head <= n_rows",
+              "supported": [
+                32,
+                64
+              ]
+            },
+            "workspace": {
+              "max_balance_factor": 8,
+              "max_items": "batch_size * num_kv_heads * q_tiles + max_split_items + max_split_tiles * reduce_slices_max",
+              "max_split_items": "2 * max_balance_factor * sm_count",
+              "max_split_tiles": "max_balance_factor * sm_count",
+              "partial_o": {
+                "dtype": "float32",
+                "elements": "max_split_items * slot_elements",
+                "slot_elements": 8192
+              },
+              "partial_stats": {
+                "dtype": "float32",
+                "elements": "(max_split_items + 1) * slot_elements",
+                "slot_elements": 128
+              },
+              "q_tiles": "ceil(q_len / q_box_rows)",
+              "queue_counters": {
+                "dtype": "uint32",
+                "elements": 4,
+                "initial_state": "zero; every launch leaves it zero"
+              },
+              "reduce_slices_max": 8,
+              "tile_counters": {
+                "counters_per_tile": 4,
+                "dtype": "uint32",
+                "elements": "max_split_tiles * counters_per_tile",
+                "initial_state": "zero; every launch leaves it zero"
+              }
+            }
+          },
+          "dcp_spec_bf16_fp8_d256_balanced": {
+            "arguments": {
+              "K": "TMA map of the HND K cache [pages, num_kv_heads, page_size, head_dim] (float8_e4m3fn; e4m3 caches are bound as uint8 views)",
+              "LSE_ptr": "caller-owned float32 base-2 [batch_size * q_len, num_q_heads]; -inf on empty rows",
+              "O_ptr": "caller-owned bfloat16 [batch_size * q_len, num_q_heads, head_dim]; exact zero on empty rows",
+              "Q": "TMA map of Q viewed as [batch_size * q_len, num_q_heads, head_dim] (bfloat16; row = request * q_len + speculative row)",
+              "V": "TMA map of the HND V cache [pages, num_kv_heads, page_size, head_dim] (float8_e4m3fn; e4m3 caches are bound as uint8 views)",
+              "batch_size": "requests per launch (<= launch.max_requests)",
+              "causal_seqlens_kv_global": "int32 [batch_size]: global context length ahead of the q_len speculative rows",
+              "cp_rank": "0 <= cp_rank < cp_world",
+              "cp_world_log2": "log2(cp_world); cp_world in {1, 2, 4, 8}",
+              "max_items": "workspace.max_items",
+              "max_pages_per_seq": "page_table.shape[1]",
+              "num_kv_heads": "host metadata",
+              "num_q_heads": "host metadata",
+              "output_scale": "v_scale, applied after the softmax normalisation",
+              "page_table": "int32 [batch_size, max_pages_per_seq]",
+              "partial_o": "workspace (see workspace)",
+              "partial_stats": "workspace (see workspace)",
+              "q_len": "speculative rows per request",
+              "queue_counters": "workspace (see workspace)",
+              "softmax_scale_log2": "sm_scale * k_scale * log2(e)",
+              "tile_counters": "workspace (see workspace)"
+            },
+            "dispatch_band": {
+              "band": {
+                "chunk_tokens": 256,
+                "long_tile_blocks": 96,
+                "min_items": 160
+              },
+              "contract": {
+                "head_dim": 256,
+                "max_q_len": 8,
+                "max_requests": 1024,
+                "min_q_len": 1,
+                "q_box_rows": 4,
+                "q_heads_per_kv_head": 16,
+                "q_tiles": "ceil(q_len / q_box_rows)"
+              },
+              "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items)",
+              "family": "dcp_spec_bf16_fp8_d256_balanced",
+              "incumbent_family": "cake_fmha_dcp_spec_bf16_fp8_d256 (static split family, carried downstream in csrc/dcp)",
+              "incumbent_shape": {
+                "block_n": 128,
+                "blocks_per_cta": "ceil(local_blocks / num_split)",
+                "d256_cp4_high_split_min_local_blocks": 64,
+                "d256_cp4_max_num_split": 8,
+                "d256_high_split_min_local_blocks": 128,
+                "dcp_max_num_split": 3,
+                "discrete_splits": [
+                  16,
+                  8,
+                  4,
+                  3,
+                  2
+                ],
+                "local_blocks": "max(1, ceil(max_local_seq_len / block_n))",
+                "logical_tiles": "batch_size * q_len * num_kv_heads",
+                "max_d256_num_split": 16,
+                "max_num_split": 4,
+                "min_split_local_blocks": 4,
+                "num_split": "1 if logical_tiles >= sm_count or local_blocks < min_split_local_blocks else min(split_cap, total_pairs, work_cap, sm_count // logical_tiles); when split_cap > max_num_split the value rounds down to the largest of discrete_splits it reaches (else 1), otherwise it collapses to 1 below 2",
+                "split_cap": "max_d256_num_split if cp_world == 1 and local_blocks >= d256_high_split_min_local_blocks else d256_cp4_max_num_split if cp_world == 4 and local_blocks >= d256_cp4_high_split_min_local_blocks else dcp_max_num_split if cp_world > 1 else max_num_split",
+                "total_pairs": "ceil(local_blocks / 2)",
+                "waves": "ceil(logical_tiles * num_split / sm_count)",
+                "work_cap": "ceil(total_pairs / 2)"
+              },
+              "items_bound": "batch_size * num_kv_heads * max(1, ceil(max_local_seq_len / chunk_tokens)) * q_tiles"
+            },
+            "launch": {
+              "grid": "(sm_count, 1, 1): one persistent CTA per multiprocessor of the launch device",
+              "max_requests": 1024,
+              "shared_mem_bytes": 226304,
+              "threads": 384
+            },
+            "profile": {
+              "causal": true,
+              "cp_world": [
+                1,
+                2,
+                4,
+                8
+              ],
+              "empty_row_policy": {
+                "LSE": "negative_infinity",
+                "O": "exact_zero"
+              },
+              "head_dim": 256,
+              "k_scale": "per_tensor_folded_into_bmm1",
+              "kv_dtype": "float8_e4m3fn",
+              "kv_layout": "HND",
+              "lse": "float32_base2",
+              "o_dtype": "bfloat16",
+              "page_size": 64,
+              "q_dtype": "bfloat16",
+              "q_heads_per_kv_head": 16,
+              "q_len": [
+                1,
+                2,
+                3,
+                4,
+                5,
+                6,
+                7,
+                8
+              ],
+              "v_scale": "per_tensor_folded_into_output"
+            },
+            "public_name": "cake_fmha_dcp_spec_bf16_fp8_d256_balanced",
+            "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced",
+            "selector": {
+              "by_q_len": {
+                "1": 32,
+                "2": 32,
+                "3": 64,
+                "4": 64,
+                "5": 64,
+                "6": 64,
+                "7": 64,
+                "8": 64
+              },
+              "key": "n_rows",
+              "q_box_rows": 4,
+              "q_heads_per_kv_head": 16,
+              "rule": "smallest supported n_rows with min(q_len, q_box_rows) * q_heads_per_kv_head <= n_rows",
+              "supported": [
+                32,
+                64
+              ]
+            },
+            "workspace": {
+              "max_balance_factor": 8,
+              "max_items": "batch_size * num_kv_heads * q_tiles + max_split_items + max_split_tiles * reduce_slices_max",
+              "max_split_items": "2 * max_balance_factor * sm_count",
+              "max_split_tiles": "max_balance_factor * sm_count",
+              "partial_o": {
+                "dtype": "float32",
+                "elements": "max_split_items * slot_elements",
+                "slot_elements": 16384
+              },
+              "partial_stats": {
+                "dtype": "float32",
+                "elements": "(max_split_items + 1) * slot_elements",
+                "slot_elements": 128
+              },
+              "q_tiles": "ceil(q_len / q_box_rows)",
+              "queue_counters": {
+                "dtype": "uint32",
+                "elements": 4,
+                "initial_state": "zero; every launch leaves it zero"
+              },
+              "reduce_slices_max": 8,
+              "tile_counters": {
+                "counters_per_tile": 4,
+                "dtype": "uint32",
+                "elements": "max_split_tiles * counters_per_tile",
+                "initial_state": "zero; every launch leaves it zero"
+              }
+            }
+          }
+        },
+        "pass_through": {
+          "d256_route": {
+            "files": {
+              "cake_fmha_dcp_spec_bf16_fp8_d256_binding.cu": "621715c4628d8e8fab1367f4a4fc9d8a9b61817b278b7ac5a6dc8e28dbc7f084",
+              "cake_fmha_dcp_spec_bf16_fp8_d256_split16_retain0.cu": "55d22b3d92170a9c93d10393a16980e7f916ec62220ffb5dcec60e2170dca98b",
+              "cake_fmha_dcp_spec_bf16_fp8_d256_split1_retain0.cu": "31c7d8063e504ea014f4cb6707de8e1d821ca1e5a83a09a36e717ce69345db58",
+              "cake_fmha_dcp_spec_bf16_fp8_d256_split2_retain0.cu": "ab236febf1eec006af53dcd7e7e6de792ddb45581dd0183da3f21352e7291e26",
+              "cake_fmha_dcp_spec_bf16_fp8_d256_split3_retain0.cu": "89cac41e18c72d2419c824b3272d03fe81bca21060df334ef960b97a334870f0",
+              "cake_fmha_dcp_spec_bf16_fp8_d256_split4_retain0.cu": "f41d2a22e02c00f149ff68fb0c458907edf29c16897a08c916f4bad25c463896",
+              "cake_fmha_dcp_spec_bf16_fp8_d256_split8_retain0.cu": "a1ad6787089be98d486d9d79ee3d22d8095cd61e402214c8bb25467f8e168b8f"
+            },
+            "reason": "static D256 split family compiled downstream from its csrc/dcp copy with the producer binding; authenticated in the package digest, not an add-on family"
+          }
+        }
       },
       "selection_key": "causal_seqlens_kv_global"
     }
@@ -798,13 +1690,25 @@
       "bytes": 3077,
       "sha256": "43fc1d963f7fc1904920ad935384aa74a94663933d5671a7d22472c2f8c48d9c"
     },
+    "bindings/cake_fmha_dcp_spec_bf16_balanced_binding.cu": {
+      "bytes": 3250,
+      "sha256": "7d8c1947cfdb6cc3bff804f5a8b3dbe61962b82db496f9741d5f663ef9499769"
+    },
     "bindings/cake_fmha_dcp_spec_bf16_binding.cu": {
       "bytes": 2532,
       "sha256": "48472f3684b0b307094f734e2d07970185d35e09d4e876c09fe90770fcd5acc6"
     },
+    "bindings/cake_fmha_dcp_spec_bf16_fp8_balanced_binding.cu": {
+      "bytes": 3383,
+      "sha256": "f00edc25cf341ba233f00b60f19ca2e724b648e2f03c41040ecd0c8f97990965"
+    },
     "bindings/cake_fmha_dcp_spec_bf16_fp8_binding.cu": {
       "bytes": 3170,
       "sha256": "9f4366bae2304215b57551cddb85186ddcb21286ab056daa6d20122835d0ff9d"
+    },
+    "bindings/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_binding.cu": {
+      "bytes": 3403,
+      "sha256": "740f09b4f74a30dcc6d70263ce408102eb8fcf4bab045112bdf5e653e2e7477f"
     },
     "bindings/cake_fmha_dcp_spec_bf16_v4_binding.cu": {
       "bytes": 2937,
@@ -1046,6 +1950,22 @@
       "bytes": 238377,
       "sha256": "03cfc35e253a91a9675d2e3da75d60b15be3f04ca97465c9c656183c3a943ba7"
     },
+    "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_100a/n_rows32.cu": {
+      "bytes": 219227,
+      "sha256": "92c5295c8c602c227b04758d2fc16820c3fdc77f3878bd3e028218e6834bc122"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_100a/n_rows64.cu": {
+      "bytes": 219227,
+      "sha256": "e61bbac768355d85f26567790fc73cdc8a2ce33c6eb0fb67e6f26337ae043895"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_103a/n_rows32.cu": {
+      "bytes": 219130,
+      "sha256": "3198afd316bbb258b804f71af37c6883bedfbb0a85edac52a8a4fc2371ab4aae"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_103a/n_rows64.cu": {
+      "bytes": 219130,
+      "sha256": "e64909c3c862c8de4c437b431721ba9dde7ab0e31234cfb9ebc5a9c50cd1e352"
+    },
     "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l20.cu": {
       "bytes": 116857,
       "sha256": "268d2a6888d25de5d4f3c39d4849981a44e98c1ee91f93ec6edc1dc69f970c02"
@@ -1077,6 +1997,38 @@
     "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split4_retain_kv_l21.cu": {
       "bytes": 127094,
       "sha256": "07240d76baaf7adea6ca1929fe354d32a16d9369470c0071ae6d3ad917fafb91"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_100a/n_rows32.cu": {
+      "bytes": 242133,
+      "sha256": "feb31e7c7dddd66fb831594219601d5085cef329ce19cc4b5869857934bac06e"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_100a/n_rows64.cu": {
+      "bytes": 242133,
+      "sha256": "cd3e5c1662cfd13314a8947cb032f38b4e88bcf4a7e077461b118ff6b24d15cd"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_103a/n_rows32.cu": {
+      "bytes": 242036,
+      "sha256": "775b7918eefeea5c237e0bb0a1bfd3b05813ab3218456668d10044b0db93941b"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_103a/n_rows64.cu": {
+      "bytes": 242036,
+      "sha256": "619717d9804c574bc28301037e99f7fe69fadbdcf9f6a1c314c451ae5f5717fa"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_100a/n_rows32.cu": {
+      "bytes": 284597,
+      "sha256": "57b8e8922fcbc22b593d6aa54e9b87d38a39c2d6f232c8d276cc4731e23707eb"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_100a/n_rows64.cu": {
+      "bytes": 284597,
+      "sha256": "7c8f6ea7b15b193d95dca4a4f918926ded3eb559b0eff06bc87ba8feedfd6ab7"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_103a/n_rows32.cu": {
+      "bytes": 284500,
+      "sha256": "83a6fc3acffcd30ce1145e7573b19b931deff88b1aed779072efc7b5bd9e3e81"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_103a/n_rows64.cu": {
+      "bytes": 284500,
+      "sha256": "e6dd0ec7be6cafedef62ecae5d5b6653a11f079d21604c982cf17d7965bf342e"
     },
     "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l20.cu": {
       "bytes": 95503,
@@ -1559,8 +2511,8 @@
       "sha256": "14388bf51cabd8e32ba47fe6f1d767b55f716795a80246fa33e95f1148059f72"
     },
     "include/cake_fmha.h": {
-      "bytes": 21315,
-      "sha256": "5a2394d1a418dcd5d54c27728cb850394e31c02eaf700640d266a97c40534491"
+      "bytes": 23389,
+      "sha256": "43e3a3c82819e21d304f97e57a9dec35c61a2d4bd37798ee42a9e271cd5b99c6"
     },
     "include/cake_fmha_hd256_support.h": {
       "bytes": 1964,

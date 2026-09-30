@@ -91,13 +91,18 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
     # 143 base/composed artifacts, the six CAKE-459 small-M hd256 decode
     # instances (two arch bodies + one launch binding each) and the seven
     # round-2 balanced components (fp8, bf16q, fp16q, bf16 hd64, bf16 hd256
-    # p16/p32/p64: two arch programs + one launch binding each).
-    assert len(manifest["artifacts"]) == 200
+    # p16/p32/p64: two arch programs + one launch binding each), plus the
+    # round-3 balanced DCP speculative-decode families (three launch bindings
+    # and two packed-row instances x two arch programs each).
+    assert len(manifest["artifacts"]) == 215
     dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
     assert dcp_addon["installed"] is True
     assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
     assert set(dcp_addon["manifest"]["families"]) == {
+        "dcp_spec_bf16_balanced",
         "dcp_spec_bf16_fp8",
+        "dcp_spec_bf16_fp8_balanced",
+        "dcp_spec_bf16_fp8_d256_balanced",
         "dcp_spec_bf16_v1",
         "dcp_spec_bf16_v4",
     }

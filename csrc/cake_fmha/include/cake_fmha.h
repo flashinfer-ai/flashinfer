@@ -736,6 +736,89 @@ extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8(
     cudaStream_t stream
 );
 
+extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_balanced(
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    int* page_table,
+    int* causal_seqlens_kv_global,
+    float* partial_o,
+    float* partial_stats,
+    uint32_t* tile_counters,
+    uint32_t* queue_counters,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    int num_q_heads,
+    int num_kv_heads,
+    int batch_size,
+    int q_len,
+    int cp_rank,
+    int cp_world_log2,
+    uint32_t max_items,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8_balanced(
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    int* page_table,
+    int* causal_seqlens_kv_global,
+    float* partial_o,
+    float* partial_stats,
+    uint32_t* tile_counters,
+    uint32_t* queue_counters,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    float output_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int batch_size,
+    int q_len,
+    int cp_rank,
+    int cp_world_log2,
+    uint32_t max_items,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
+extern "C" cudaError_t cake_fmha_launch_dcp_spec_bf16_fp8_d256_balanced(
+    CakeFmhaTensorMap const* Q,
+    CakeFmhaTensorMap const* K,
+    CakeFmhaTensorMap const* V,
+    __nv_bfloat16* O_ptr,
+    float* LSE_ptr,
+    int* page_table,
+    int* causal_seqlens_kv_global,
+    float* partial_o,
+    float* partial_stats,
+    uint32_t* tile_counters,
+    uint32_t* queue_counters,
+    int max_pages_per_seq,
+    float softmax_scale_log2,
+    float output_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int batch_size,
+    int q_len,
+    int cp_rank,
+    int cp_world_log2,
+    uint32_t max_items,
+    unsigned int grid_x,
+    unsigned int grid_y,
+    unsigned int grid_z,
+    cudaStream_t stream
+);
+
 // CAKE-459 small-M BF16 head-dim-256 speculative decode (packed rows).
 extern "C" cudaError_t cake_fmha_launch_decode_native_bf16_hd256_smallm_n32_p16(
     CakeFmhaTensorMap const* Q,
