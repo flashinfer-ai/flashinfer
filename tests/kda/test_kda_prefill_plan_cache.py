@@ -152,6 +152,66 @@ def test_cache_hit_matches_fresh_preparation_bitwise(lengths, heads, storage_ext
     _assert_same(got_first, _snapshot(first))
 
 
+def _packed_qkv(d, heads):
+    """Replace dense q / k / v with split views of one packed [T, 3*H*128] row.
+
+    Serving hands the export the ``split(dim=-1)`` views of the fused
+    projection's conv output (token pitch 3 * H * 128, dense per-token
+    payload); only the fused M128 body reads that pitch in place, every other
+    body densifies into launch-owned staging copies.
+    """
+    tokens = d["q"].shape[1]
+    width = heads * HEAD_DIM
+    packed = torch.empty(tokens, 3 * width, device="cuda", dtype=torch.bfloat16)
+    views = []
+    for index, name in enumerate(("q", "k", "v")):
+        packed[:, index * width : (index + 1) * width] = d[name][0].reshape(
+            tokens, width
+        )
+        views.append(
+            packed[:, index * width : (index + 1) * width]
+            .unflatten(-1, (heads, HEAD_DIM))
+            .unsqueeze(0)
+        )
+    d = dict(d, q=views[0], k=views[1], v=views[2])
+    d["_packed"] = packed  # keep the storage alive
+    return d
+
+
+@pytest.mark.parametrize("heads,lengths", [(12, [512]), (12, [447]), (16, [1024])])
+def test_hit_refreshes_densified_packed_qkv_copies(heads, lengths):
+    """Bodies that cannot read the packed token pitch densify q / k / v at
+    preparation.  Those copies are launch-owned, so a plan-cache hit must
+    refresh them from the rebound views: before the fix every hit replayed the
+    first call's q / k / v (CAKE-736 round 6: Kimi-K3 TP8 single-sequence
+    prefill returned layer 0's projections on every later layer while the
+    dense-input replay of the same operands was correct)."""
+    cache = KDAPrefillPlanCache(8)
+    first = _packed_qkv(_inputs(lengths, heads, seed=21), heads)
+    second = _packed_qkv(_inputs(lengths, heads, seed=22), heads)
+    pool_second = second["pool"].clone()
+    miss = _run(first, cache, checkpoints=False, lower_bound=-1.0)
+    assert "dvsplit" in str(miss.schedule), miss.schedule
+    hit = _run(second, cache, checkpoints=False, lower_bound=-1.0)
+    assert hit is miss and (cache.misses, cache.hits) == (1, 1)
+    got = _snapshot(second)
+    second["pool"].copy_(pool_second)
+    _run(second, checkpoints=False, lower_bound=-1.0)
+    _assert_same(got, _snapshot(second))
+    # The same buffers refilled with new tokens (static serving buffers) must
+    # be re-read as well: the memo path skips the rebind but not the refresh.
+    third = _inputs(lengths, heads, seed=23)
+    for name in ("q", "k", "v"):
+        second[name].copy_(third[name])
+    pool_third = second["pool"].clone()
+    _run(second, cache, checkpoints=False, lower_bound=-1.0)
+    assert cache.fast_hits == 1
+    got = _snapshot(second)
+    second["pool"].copy_(pool_third)
+    _run(second, checkpoints=False, lower_bound=-1.0)
+    _assert_same(got, _snapshot(second))
+
+
 def test_cache_keys_on_sequence_lengths_and_interleaves_entries():
     cache = KDAPrefillPlanCache(8)
     short = _inputs([64] * 4, 12, seed=3)

@@ -4011,13 +4011,27 @@ class FlashKDABlackwellBF16FusedLaunch:
         if n32_value_rows == 64:
             self.grid = (2 * self.grid[0], 1, 1)
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
+        qkv_refreshes: tuple[tuple[torch.Tensor, torch.Tensor], ...] = ()
         if not qkv_dense and not qkv_strided_ok:
             # Only the fused M128 body carries the q / k / v token pitch; the
             # other bodies read a dense layout, so densify here (one copy per
-            # operand, the cost the caller used to pay unconditionally).
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
+            # operand, the cost the caller used to pay unconditionally).  The
+            # dense carriers are launch-owned staging buffers refreshed from
+            # the caller's strided views on every launch, like the g / beta
+            # staging copies: a plan-cache hit re-points the views and the
+            # next launch copies the new tokens.  A one-shot ``.contiguous()``
+            # here would pin the first call's q / k / v into every rebound
+            # launch (CAKE-736 round 6: K3 TP8 single-sequence prefill read
+            # layer 0's projections on all later layers).
+            dense = []
+            for source in (q, k, v):
+                staging = torch.empty(
+                    source.shape, dtype=source.dtype, device=source.device
+                )
+                staging.copy_(source)
+                dense.append((staging, source))
+            qkv_refreshes = tuple(dense)
+            q, k, v = (staging for staging, _ in dense)
             q_flat = q.reshape(total_tokens, num_heads, HEAD_DIM)
             k_flat = k.reshape(total_tokens, num_heads, HEAD_DIM)
             v_flat = v.reshape(total_tokens, num_heads, HEAD_DIM)
@@ -4343,8 +4357,15 @@ class FlashKDABlackwellBF16FusedLaunch:
             self.args["map_output_f32"] = empty_f32
         self._beta_tma_source = beta_flat
         self._beta_tma_valid = beta_tma_valid
-        self._token_storage_refreshes = tuple(
-            (refresh for refresh in (g_refresh, beta_refresh) if refresh is not None)
+        self._token_storage_refreshes = (
+            tuple(
+                (
+                    refresh
+                    for refresh in (g_refresh, beta_refresh)
+                    if refresh is not None
+                )
+            )
+            + qkv_refreshes
         )
         self._launch_device = q.device
         self._use_cuda_graph = use_bt16_prepare_chain or beta_tma_valid is not None
