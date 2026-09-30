@@ -217,8 +217,8 @@ def _trtllm_reference(x, ids, route_weights, prepared):
 
 @pytest.mark.parametrize(
     "num_tokens",
-    [64, 256, 512, 2048],
-    ids=["n8", "n16", "n32", "n128"],
+    [1, 8, 16, 64, 256, 512, 2048],
+    ids=["m1", "m8", "m16", "n8", "n16", "n32", "n128"],
 )
 def test_cake_situ_output_workspace_and_external_graph(
     num_tokens,
