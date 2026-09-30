@@ -56,6 +56,13 @@ _DCP_JIT_BINDINGS = {
     "dcp_spec_bf16_v1": "jit/cake_fmha_dcp_spec_bf16_v1_jit_binding.cu",
     "dcp_spec_bf16_v4": "jit/cake_fmha_dcp_spec_bf16_v4_jit_binding.cu",
     "dcp_spec_bf16_fp8": "jit/cake_fmha_dcp_spec_bf16_fp8_jit_binding.cu",
+    "dcp_spec_bf16_balanced": "jit/cake_fmha_dcp_spec_bf16_balanced_jit_binding.cu",
+    "dcp_spec_bf16_fp8_balanced": (
+        "jit/cake_fmha_dcp_spec_bf16_fp8_balanced_jit_binding.cu"
+    ),
+    "dcp_spec_bf16_fp8_d256_balanced": (
+        "jit/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_jit_binding.cu"
+    ),
 }
 _SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
 _FP8_SUPPORTED_Q_LENS = (1, 2, 3, 4, 5, 6, 8)
@@ -518,7 +525,117 @@ def load_dcp_spec_fp8_d256_module(
     return module
 
 
+# ---------------------------------------------------------------------------
+# On-device load-balanced DCP families (CAKE-685 round 3)
+# ---------------------------------------------------------------------------
+#
+# Each family ships two shape-independent programs per architecture, the
+# 32- and 64-row packed instances (``cuda/dcp_spec/<family>/n32.cu`` /
+# ``n64.cu``), selected by the packed-row tile the request's speculative rows
+# need; batch, heads, lengths, rank and world are runtime kernel arguments.
+
+DcpBalancedFamily = Literal[
+    "dcp_spec_bf16_balanced",
+    "dcp_spec_bf16_fp8_balanced",
+    "dcp_spec_bf16_fp8_d256_balanced",
+]
+DCP_BALANCED_FAMILIES: tuple[str, ...] = (
+    "dcp_spec_bf16_balanced",
+    "dcp_spec_bf16_fp8_balanced",
+    "dcp_spec_bf16_fp8_d256_balanced",
+)
+DCP_BALANCED_N_ROWS: tuple[int, ...] = (32, 64)
+# Manifest selector of one packed-row instance inside a balanced family.
+_DCP_BALANCED_SELECTOR_KEY = "n_rows"
+
+
+def _validate_balanced_specialization(
+    family: str, target: DcpSpecTarget, n_rows: int
+) -> None:
+    if family not in DCP_BALANCED_FAMILIES:
+        raise ValueError(f"unsupported balanced DCP family: {family}")
+    if target not in _DCP_SPEC_NVCC_FLAGS:
+        raise ValueError(f"unsupported DCP speculative FMHA target: {target}")
+    if n_rows not in DCP_BALANCED_N_ROWS:
+        raise ValueError(
+            f"balanced DCP n_rows must be one of {DCP_BALANCED_N_ROWS}, got {n_rows}"
+        )
+
+
+def get_dcp_spec_balanced_uri(
+    family: DcpBalancedFamily, target: DcpSpecTarget, n_rows: int
+) -> str:
+    _validate_balanced_specialization(family, target, n_rows)
+    return (
+        f"cake_fmha_{family}_n{n_rows}_{target}"
+        f"_{CAKE_FMHA_MANIFEST_SHA256[:12]}_{CAKE_FMHA_FLASHINFER_BINDINGS_SHA256[:12]}"
+    )
+
+
+def _get_dcp_balanced_sources(
+    family: DcpBalancedFamily, target: DcpSpecTarget, n_rows: int
+) -> tuple[Path, Path, Path]:
+    """``(program body, exported launch binding, FlashInfer adapter)`` of one instance."""
+
+    body, api_binding = _get_dcp_sources(
+        family, target, {_DCP_BALANCED_SELECTOR_KEY: n_rows}
+    )
+    launch_binding = (
+        get_cake_fmha_csrc_dir() / _get_dcp_family(family)["binding_source"]
+    )
+    if not launch_binding.is_file():
+        raise FileNotFoundError(f"Cake FMHA DCP source not found: {launch_binding}")
+    return body, launch_binding, api_binding
+
+
+@functools.cache
+def gen_dcp_spec_balanced_module(
+    family: DcpBalancedFamily, target: DcpSpecTarget, n_rows: int
+) -> JitSpec:
+    """Generate one shape-independent balanced DCP module (one per packed tile).
+
+    The exported launch binding owns the kernel's thread count and dynamic
+    shared memory; the FlashInfer adapter encodes the tensor maps, carves the
+    caller-owned scratch and calls it as ``CAKE_FMHA_DCP_BALANCED_LAUNCH``.
+    """
+
+    uri = get_dcp_spec_balanced_uri(family, target, n_rows)
+    body, launch_binding, api_binding = _get_dcp_balanced_sources(
+        family, target, n_rows
+    )
+    manifest_family = _get_dcp_family(family)
+    csrc_dir = get_cake_fmha_csrc_dir()
+
+    spec = gen_jit_spec(
+        name=uri,
+        sources=[body, launch_binding, api_binding],
+        extra_cuda_cflags=[
+            *_DCP_SPEC_NVCC_FLAGS[target],
+            f"-DCAKE_FMHA_DCP_BALANCED_LAUNCH={manifest_family['launch_binding']}",
+        ],
+        extra_include_paths=[csrc_dir, jit_env.FLASHINFER_CSRC_DIR],
+        extra_ldflags=["-lcuda"],
+    )
+    logger.info(f"Generated balanced DCP speculative FMHA JIT spec: {spec.name}")
+    return spec
+
+
+@functools.cache
+def load_dcp_spec_balanced_module(
+    family: DcpBalancedFamily, target: DcpSpecTarget, n_rows: int
+):
+    module = gen_dcp_spec_balanced_module(family, target, n_rows).build_and_load()
+    logger.info(f"Loaded balanced DCP speculative FMHA module: {module}")
+    return module
+
+
 __all__ = [
+    "DCP_BALANCED_FAMILIES",
+    "DCP_BALANCED_N_ROWS",
+    "DcpBalancedFamily",
+    "gen_dcp_spec_balanced_module",
+    "get_dcp_spec_balanced_uri",
+    "load_dcp_spec_balanced_module",
     "gen_dcp_spec_fp8_d256_module",
     "get_dcp_spec_fp8_d256_uri",
     "load_dcp_spec_fp8_d256_module",

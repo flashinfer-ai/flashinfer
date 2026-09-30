@@ -26,7 +26,7 @@ CAKE_FMHA_MANIFEST_SHA256 = (
 )
 CAKE_FMHA_FLASHINFER_MATRIX_REVISION = "5b8da12050f80a5b5cb2bab9e87d9635a8872e5b"
 CAKE_FMHA_FLASHINFER_BINDINGS_SHA256 = (
-    "366c40dfe00916d5d801d7bda1c467f02f513dc1fbd2e1ac7ff107bb7ce8ab82"
+    "48d627ad25ca192b4606630f6a6b4db803208ff930197acb34143c26dc8129ba"
 )
 
 _FLASHINFER_BINDINGS = (
@@ -47,6 +47,9 @@ _FLASHINFER_BINDINGS = (
     "jit/cake_fmha_dcp_spec_bf16_v1_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_v4_jit_binding.cu",
     "jit/cake_fmha_dcp_spec_bf16_fp8_jit_binding.cu",
+    "jit/cake_fmha_dcp_spec_bf16_balanced_jit_binding.cu",
+    "jit/cake_fmha_dcp_spec_bf16_fp8_balanced_jit_binding.cu",
+    "jit/cake_fmha_dcp_spec_bf16_fp8_d256_balanced_jit_binding.cu",
 )
 
 _TARGET_FLAGS = {
