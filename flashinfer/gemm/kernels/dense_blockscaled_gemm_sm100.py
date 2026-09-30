@@ -1940,7 +1940,7 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         # Narrow (< 64) N tiles address the 128-token SFB tile per sub-tile,
         # which covers at most 32 columns of the kernel N (the swap_ab token
         # dimension); wider N with a narrow tile faults with
-        # cudaErrorMisalignedAddress (seen with MXFP8 on SM100).
+        # cudaErrorMisalignedAddress (MXFP8 and NVFP4, SM100 and SM103).
         if mma_tiler_mn[1] < 64 and (n > 32 or cluster_shape_mn[1] > 1):
             can_implement = False
         return can_implement
