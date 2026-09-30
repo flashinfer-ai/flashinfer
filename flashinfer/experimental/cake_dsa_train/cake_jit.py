@@ -532,7 +532,10 @@ MODULES: dict[str, dict[str, Any]] = {
 # range, carrying dQ through an FP32 partial) that the host selects instead of
 # ``bwd_main`` when the record's ``key_pass_policy`` yields more than one
 # pass; ``bwd_cast`` turns the FP32 dK/dV accumulators into natural-layout
-# BF16 (or FP32) outputs.  A record registers the subset its program uses
+# BF16 (or FP32) outputs or, when its argument plan declares the
+# packed-accumulate operands (``cake_backend.CAST_ACCUMULATE_OPERANDS``), adds
+# them into a caller-provided packed FP32 buffer with an optional
+# destination-row map.  A record registers the subset its program uses
 # (``bwd_dq``, the pass stages and ``bwd_cast`` are optional; a ``permuted``
 # accumulator layout requires ``bwd_cast``).
 STAGES = (
