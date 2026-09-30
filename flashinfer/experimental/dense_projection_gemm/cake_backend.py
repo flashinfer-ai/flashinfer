@@ -779,6 +779,9 @@ class GemmPlan:
     sk_units: int
     iters_per_unit: int
     template: str
+    # FlashInfer-only: the batched small-M swap was undone because the swapped instance is not a
+    # generated program of this architecture (the Cake host JIT-compiles it; see ``plan_dense_projection_gemm``)
+    swap_fallback: bool = False
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -844,6 +847,7 @@ def plan_dense_projection_gemm(
     group_m: Optional[int] = None,
     f32_v8: Optional[bool] = None,
     arch: str = "sm_100a",
+    _allow_swap: bool = True,
 ) -> tuple[GemmPlan, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Validate the views exactly as the Cake launcher does and plan the launch for a device
     with ``sm_count`` SMs and an L2 of ``l2_bytes`` (the two device facts the plan depends on:
@@ -851,7 +855,29 @@ def plan_dense_projection_gemm(
     through the L2).  Returns ``(plan, a_desc, b_desc, out3)`` with the ``[L, outer, inner]``
     operand views the TMA descriptors span and the batched output view.  The knob defaults
     (``sk="auto"``, ``pf`` / ``promo`` / ``group_m`` / ``hints`` from ``default_*``, resolved in
-    the launcher's order) are the launcher's.  [Cake ``dense_projection_gemm`` L898-L990]"""
+    the launcher's order) are the launcher's.  [Cake ``dense_projection_gemm`` L898-L990]
+
+    One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
+    the swapped instance on demand, while this package can only launch the generated programs registered for
+    ``arch``.  When the swapped plan resolves to an unregistered instance (batched forward / input gradient
+    with a tiny T outside the export contract), the plan is redone without the swap (``plan.swap_fallback``)
+    so the call still runs; the result is identical, only the tile walk differs."""
+    _caller_knobs = dict(
+        transposed_out=transposed_out,
+        sk=sk,
+        block_n=block_n,
+        stages=stages,
+        epi=epi,
+        slots=slots,
+        cta_rows=cta_rows,
+        pf=pf,
+        sk_max_units=sk_max_units,
+        promo=promo,
+        hints=hints,
+        group_m=group_m,
+        f32_v8=f32_v8,
+        arch=arch,
+    )
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
         raise ValueError("dense_projection_gemm: A and B must be bf16")
     if out.dtype not in (torch.bfloat16, torch.float32):
@@ -882,7 +908,8 @@ def plan_dense_projection_gemm(
             "dense_projection_gemm: out needs unit inner stride, 16-byte aligned rows / batches "
             f"and base; strides {tuple(O3.stride())}"
         )
-    if swap_small_m(L, M, N, transposed_out):
+    swapped = _allow_swap and swap_small_m(L, M, N, transposed_out)
+    if swapped:
         A3, B3 = B3.transpose(1, 2), A3.transpose(1, 2)
         M, N = N, M
         transposed_out = True
@@ -983,7 +1010,12 @@ def plan_dense_projection_gemm(
         sk_units=sk_units,
         iters_per_unit=iters_per_unit,
         template=instance_symbol(key),
+        swap_fallback=not _allow_swap,
     )
+    if swapped and plan.template not in KERNELS.get(arch, {}):
+        return plan_dense_projection_gemm(
+            A, B, out, sm_count=sm_count, l2_bytes=l2_bytes, _allow_swap=False, **_caller_knobs
+        )
     return plan, a_desc, b_desc, O3
 
 
