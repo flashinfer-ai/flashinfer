@@ -3676,7 +3676,12 @@ def test_borrowed_dense_method_self_deps(path_name, cls, borrowed, target):
 
 
 def _mask_routing(tensors: dict, pattern: str) -> tuple[torch.Tensor, torch.Tensor]:
-    """Mark unrouted slots with expert id -1 and routing weight 0.
+    """Mark unrouted slots with expert id -1, keeping a non-zero routing weight.
+
+    The masked slots keep weight 0.5 so a pass proves the kernels skip them by
+    id alone (the references skip ``expert_idx < 0`` regardless of weight); a
+    kernel that routed the slot to a stale or substituted expert and applied
+    the caller's weight would fail.
 
     ``tail`` masks every slot of the last quarter of the tokens (CUDA-graph
     padding), ``all`` masks every slot, and ``mixed`` masks alternating slots
@@ -3698,7 +3703,7 @@ def _mask_routing(tensors: dict, pattern: str) -> tuple[torch.Tensor, torch.Tens
     else:
         raise ValueError(pattern)
     ids[masked] = -1
-    weights[masked] = 0.0
+    weights[masked] = 0.5
     return ids, weights
 
 
