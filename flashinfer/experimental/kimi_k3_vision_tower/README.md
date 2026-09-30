@@ -51,13 +51,17 @@ architecture and the longest segment (`cake_backend.ring3_selected`).
 Registered programs and the contract denominator: `REQUIRED_KERNEL_KEYS`
 lists every logical kernel the plan rule can select per architecture (the
 GEMM tile / PDL census, the attention-form census over single segments up to
-70016 tokens and the 22 contract rows, the merge kernels).  The export
-registers the programs its 22-row evaluation contract launches; the reachable
-keys no contract row exercises are declared in `UNCOVERED_KERNEL_KEYS` (half-N
-twins at token counts outside the rows, the plain two-tile form on SM100, the
-plain / split one-tile forms on SM103) and a `grid_thws` batch whose plan
-resolves to one of them raises `NotImplementedError` naming the missing keys
--- it is never served by another binary.
+70016 tokens and the exported rows, the merge kernels).  The export registers
+the programs its rows launch: the 22 rows of the evaluation contract (the
+acceptance denominator) plus six export-only *coverage* rows
+(`COVERAGE_ROW_GRIDS`; validated bitwise against the source tower, not part
+of the acceptance geomean) that reach the keys no contract row exercises
+(half-N twins at token counts outside the rows, the plain two-tile form on
+SM100, the plain / split one-tile forms on SM103) -- so every reachable key is
+registered and `UNCOVERED_KERNEL_KEYS` is empty.  The check stays: a
+`grid_thws` batch whose plan resolves to an unregistered key raises
+`NotImplementedError` naming the missing keys -- it is never served by another
+binary.
 
 Programmatic dependent launch: the registered programs follow the Cake
 production PDL default (`KIMI_K3_VISION_TOWER_PDL`, on since the round-2

@@ -1185,6 +1185,11 @@ HALF_TWIN = {
     "m_tma1": "m_tma1_h",
 }
 HALF_ROUND_MARGIN = 4
+# Round-6 routing limits from the paired B300 / B200 A/B (Cake ``HALF_MAX_ROUNDS`` / ``HALF_ROUTE_EXCLUDE``): no half twin past
+# 24 persistent rounds (the half-round saving is inside the twin's full-item overhead: out-proj 66564) and never for the
+# gelu_erf ``xs`` tile (measured tie / loss at M = 638 on both arches).
+HALF_MAX_ROUNDS = 24
+HALF_ROUTE_EXCLUDE = frozenset({("gelu_erf", "xs")})
 
 
 def half_tail_split(cluster_tiles: int, clusters: int) -> int:
@@ -1194,15 +1199,18 @@ def half_tail_split(cluster_tiles: int, clusters: int) -> int:
     return tail if 0 < 2 * tail <= clusters - HALF_ROUND_MARGIN else 0
 
 
-def _half_twin(name: str, n_total: int, M: int, sm_count: int) -> str:
-    """The half-N twin of ``name`` where the census tail fits one half-round (Cake ``_half_twin``)."""
-    if name not in HALF_TWIN:
+def _half_twin(name: str, n_total: int, M: int, sm_count: int, variant: str) -> str:
+    """The half-N twin of ``name`` where the census tail fits one half-round, the grid runs at most
+    ``HALF_MAX_ROUNDS`` rounds and ``(variant, tile)`` is not excluded (Cake ``_half_twin``)."""
+    if name not in HALF_TWIN or (variant, name) in HALF_ROUTE_EXCLUDE:
         return name
     cfg = TILE_CONFIGS[name]
     m_tiles = (M + GEMM_BLOCK_M - 1) // GEMM_BLOCK_M
     m_tiles += m_tiles % cfg.cta_group
     tiles = (m_tiles // cfg.cta_group) * (n_total // cfg.acc_n)
     clusters = min(tiles, int(sm_count) // cfg.cluster_x)
+    if -(-tiles // clusters) > HALF_MAX_ROUNDS:
+        return name
     return HALF_TWIN[name] if half_tail_split(tiles, clusters) else name
 
 
@@ -1426,7 +1434,7 @@ def select_tile_config(
     n_total, _k_total, pos_split = GEMM_VARIANTS[variant]
     if pos_split:
         return cfg  # gemm_pos streams row pairs: no half-N tail
-    return TILE_CONFIGS[_half_twin(cfg.name, n_total, M, sm_count)]
+    return TILE_CONFIGS[_half_twin(cfg.name, n_total, M, sm_count, variant)]
 
 
 def _select_tile_config_base(
@@ -1701,6 +1709,18 @@ CONTRACT_ROW_GRIDS: dict[str, tuple[tuple[int, int, int], ...]] = {
     "smoke_ragged": ((1, 2, 6), (1, 10, 4), (2, 4, 4), (1, 6, 30)),
     "smoke_t3": ((3, 8, 8), (1, 12, 14)),
 }
+# Export-only coverage rows of the Cake export (``COVERAGE_GRIDS``, tag ``coverage``): the minimal grid_thws set reaching
+# every kernel key the 22 contract rows do not (half-N twins at token counts no row has, the plain two-tile form on
+# SM100, the plain / split one-tile forms on SM103).  Exported and validated bitwise; not part of the acceptance geomean.
+COVERAGE_ROW_GRIDS: dict[str, tuple[tuple[int, int, int], ...]] = {
+    "cov_batch11_224": ((1, 16, 16),) * 11,
+    "cov_img_476x476": ((1, 34, 34),),
+    "cov_img_2436x392": ((1, 28, 174),),
+    "cov_img_3948x700": ((1, 50, 282),),
+    "cov_img_2324x140": ((1, 10, 166),),
+    "cov_img_4060x924": ((1, 66, 290),),
+    "cov_img_3108x2716": ((1, 194, 222),),
+}
 
 
 def attention_census_cu_seqlens() -> list[tuple[int, ...]]:
@@ -1715,6 +1735,7 @@ def attention_census_cu_seqlens() -> list[tuple[int, ...]]:
             tokens.update((int(limit) - 1, int(limit), int(limit) + 1))
     census: list[tuple[int, ...]] = [(0, t) for t in sorted(tokens)]
     census.extend(cu_seqlens_of(grids) for grids in CONTRACT_ROW_GRIDS.values())
+    census.extend(cu_seqlens_of(grids) for grids in COVERAGE_ROW_GRIDS.values())
     return census
 
 
@@ -1779,30 +1800,13 @@ def required_kernel_keys(arch: str) -> tuple[str, ...]:
 REQUIRED_KERNEL_KEYS: dict[str, tuple[str, ...]] = {
     arch: required_kernel_keys(arch) for arch in SUPPORTED_COMPUTE_CAPABILITIES.values()
 }
-# Reachable keys the export's 22-row contract denominator does not exercise (Cake export ``UNCOVERED_KERNEL_KEYS``,
-# round 6): the half-N twins (and the displaced ``norm_gelu:m_e8:pdle``) at token counts no contract row has, the plain
-# two-tile attention form on sm_100a (single segments of 1657..2308 tokens) and the plain / tail-split SPLIT_KV forms
-# above 10764 tokens on sm_103a.  A route exports only what a contract shape launches, so these modules are NOT
-# registered: a request whose plan resolves to one of them is refused by name (:func:`prepare_kimi_k3_vision_tower`,
+# Reachable keys no exported route exercises (Cake export ``UNCOVERED_KERNEL_KEYS``).  The round-6 routing leaves the
+# 22 contract rows short of 12 GEMM half-twin / displaced-PDL keys per arch, ``attention:tiles2`` on sm_100a and
+# ``attention:tiles1`` / ``attention:tiles1:split`` on sm_103a; the export's coverage rows (``COVERAGE_ROW_GRIDS``) reach
+# exactly those, so the declaration is EMPTY at delivery and every reachable key is registered.  The machinery stays as
+# the loud check: a plan resolving to an unregistered key is refused by name (:func:`prepare_kimi_k3_vision_tower`,
 # ``NotImplementedError``) -- never served by another binary.
-_UNCOVERED_GEMM_KEYS = (
-    "gemm:gelu_erf:s_h",
-    "gemm:gelu_erf:xs_h",
-    "gemm:norm_gelu:m_e8:pdle",
-    "gemm:norm_gelu:s_h:pdle",
-    "gemm:norm_qkv_rope:m_e8_cs_h:pdle",
-    "gemm:norm_qkv_rope:s_cs_h:pdle",
-    "gemm:residual_fc1:l_e8_pf_h:pdle",
-    "gemm:residual_fc1:m_p_h:pdle",
-    "gemm:residual_fc1_sqxw:l_e8_pf_h:pdle",
-    "gemm:residual_fc1_sqxw:m_p_h:pdle",
-    "gemm:rmsnorm:s_h",
-    "gemm:rmsnorm:s_h:pdle",
-)
-UNCOVERED_KERNEL_KEYS: dict[str, tuple[str, ...]] = {
-    "sm_100a": _UNCOVERED_GEMM_KEYS + ("attention:tiles2",),
-    "sm_103a": _UNCOVERED_GEMM_KEYS + ("attention:tiles1", "attention:tiles1:split"),
-}
+UNCOVERED_KERNEL_KEYS: dict[str, tuple[str, ...]] = {"sm_100a": (), "sm_103a": ()}
 for _arch, _uncovered in UNCOVERED_KERNEL_KEYS.items():
     assert set(_uncovered) <= set(REQUIRED_KERNEL_KEYS[_arch]), _arch
 # The keys the delivery registers per arch (= every route's keys of the export round).

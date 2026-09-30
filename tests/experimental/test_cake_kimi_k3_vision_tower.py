@@ -367,7 +367,18 @@ def test_select_tile_config_buckets():
         ("norm_qkv_rope", 256, "xs_cs_pf"),
         ("rmsnorm", 4144, "l_h"),
         ("gelu_erf", 1196, "s_h"),
-        ("gelu_erf", 638, "xs_h"),
+        (
+            "gelu_erf",
+            638,
+            "xs",
+        ),  # HALF_ROUTE_EXCLUDE: (gelu_erf, xs) never takes its twin
+        ("residual_wo_sqxw", 66564, "m_tma1"),  # 33 rounds > HALF_MAX_ROUNDS
+        ("residual_wo_sqxw", 43056, "m_tma1_h"),  # 20 rounds: twin kept
+        ("norm_gelu", 66564, "l_e8"),
+        ("norm_gelu", 153088, "l_e8"),
+        ("norm_gelu", 19140, "l_e8_h"),
+        ("norm_qkv_rope", 43056, "l_e8_cs"),
+        ("norm_qkv_rope", 153088, "l_e8_cs"),
         ("residual_fc1_sqxw", 4144, "l_e8_pf"),
         ("pos_sqxw", 2552, "s_e8_pf"),
         ("pos_sqxw", 19136, "s_e8_pf"),
@@ -398,6 +409,18 @@ def test_select_tile_config_buckets():
             getattr(b, f) for f in fields
         ), name
     assert not any(select_tile_config("pos_sqxw", m).half for m in range(1, 65537, 128))
+    # Final-head limits (Cake HALF_MAX_ROUNDS / HALF_ROUTE_EXCLUDE): no twin past 24 persistent rounds, never (gelu_erf, xs).
+    assert cb.HALF_MAX_ROUNDS == 24 and set(cb.HALF_ROUTE_EXCLUDE) == {
+        ("gelu_erf", "xs")
+    }
+    assert not any(
+        select_tile_config("gelu_erf", m).name == "xs_h" for m in range(1, 20001)
+    )
+    assert all(
+        not select_tile_config(variant, m).half
+        for variant in ("residual_wo_sqxw", "norm_gelu", "norm_qkv_rope")
+        for m in (66564, 105984, 153088)
+    )
     assert not any(
         cfg.half and (cfg.sk or cfg.tail or cfg.ksplit > 1)
         for cfg in TILE_CONFIGS.values()
@@ -486,6 +509,11 @@ def test_required_kernel_keys():
     # limit, the split build (+ ``attention_merge``) wherever the automatic tail split fires.
     for arch, keys in REQUIRED_KERNEL_KEYS.items():
         assert cb.ATTENTION_FORM_KEYS[arch] == cb.attention_census_keys(arch), arch
+        # With the export's coverage rows every reachable key is registered: the declaration is empty.
+        assert (
+            cb.UNCOVERED_KERNEL_KEYS[arch] == ()
+            and cb.REGISTERED_KERNEL_KEYS[arch] == keys
+        ), arch
         assert "attention:ring3" in keys
         assert "attention:tiles2" in keys
         assert "attention:ring3:wide" in keys and "attention:tiles2:wide" in keys
@@ -510,12 +538,7 @@ def test_required_kernel_keys():
     assert (
         len(REQUIRED_KERNEL_KEYS["sm_100a"]),
         len(REQUIRED_KERNEL_KEYS["sm_103a"]),
-    ) == (76, 80)
-    assert cb.UNCOVERED_KERNEL_KEYS["sm_100a"][-1:] == ("attention:tiles2",)
-    assert cb.UNCOVERED_KERNEL_KEYS["sm_103a"][-2:] == (
-        "attention:tiles1",
-        "attention:tiles1:split",
-    )
+    ) == (74, 78)
     for keys in REQUIRED_KERNEL_KEYS.values():
         gemm_keys = [k for k in keys if k.startswith("gemm:")]
         # Small-M tiles of the per-layer forms are always inside their PDL_EARLY window: only the pdle
@@ -551,10 +574,11 @@ def test_required_kernel_keys():
         # plain PDL binary of a tile is registered only where it is reachable (e.g. norm_qkv_rope s_cs at
         # 769..1536 is always inside the window -> only its pdle form exists).
         pdle = [k for k in gemm_keys if k.endswith(":pdle")]
-        # Round 6: + 25 half-N twin keys (13 twins in their reachable PDL forms) = 68 GEMM keys, 42 of them pdle.
+        # Round 6 (final head, rounds cap 24 / gelu_erf xs excluded): + 23 half-N twin keys (12 twins in their reachable
+        # PDL forms; xs_h only via norm_gelu) = 66 GEMM keys, 41 of them pdle.
         half = [k for k in gemm_keys if TILE_CONFIGS[k.split(":")[2]].half]
-        assert len(pdle) == 42 and len(gemm_keys) == len(set(gemm_keys)) == 68
-        assert len(half) == 25 and {k.split(":")[2] for k in half} == set(
+        assert len(pdle) == 41 and len(gemm_keys) == len(set(gemm_keys)) == 66
+        assert len(half) == 23 and {k.split(":")[2] for k in half} == set(
             cb.HALF_TWIN.values()
         )
         assert (
@@ -564,6 +588,14 @@ def test_required_kernel_keys():
         assert (
             "gemm:norm_qkv_rope:xs_cs_pf_h:pdle" in half
             and "gemm:norm_qkv_rope:xs_cs_pf_h" not in gemm_keys
+        )
+        assert (
+            "gemm:gelu_erf:xs_h" not in gemm_keys
+            and "gemm:gelu_erf:xs_h:pdle" not in gemm_keys
+        )
+        assert (
+            "gemm:residual_wo_sqxw:m_tma1_h" in half
+            and "gemm:residual_wo_sqxw:m_tma1" in gemm_keys
         )
         assert (
             "gemm:norm_gelu:m_e8:pdle" in pdle
@@ -627,7 +659,6 @@ def test_pdl_early_window_and_exclusions():
 # ``stage_kernels`` on ``kimi_k3_vision_gemm`` with the half-N tail routing on; arch-independent).  The mirror
 # must reproduce it exactly: a disagreement here means the host launches another binary than the source route.
 CONTRACT_ROW_GEMM_KEYS = {
-    # label: (T, N, tiles per CONTRACT_ROW_VARIANTS)
     "img_224": (
         256,
         64,
@@ -694,7 +725,7 @@ CONTRACT_ROW_GEMM_KEYS = {
             "m_e8_h:pdle",
             "l_e8_pf:pdle",
             "l_e8_pf:pdle",
-            "xs_h:pdle",
+            "xs:pdle",
             "s:pdle",
         ),
     ),
@@ -771,21 +802,12 @@ CONTRACT_ROW_GEMM_KEYS = {
     "img_3840x2160": (
         43056,
         10764,
-        (
-            "s_e8_pf",
-            "l_e8_cs_h",
-            "m_tma1_h:pdle",
-            "l_e8",
-            "l_sk",
-            "l_sk",
-            "l_sk",
-            "l_h",
-        ),
+        ("s_e8_pf", "l_e8_cs", "m_tma1_h:pdle", "l_e8", "l_sk", "l_sk", "l_sk", "l_h"),
     ),
     "img_max_4096sq": (
         66564,
         16641,
-        ("s_e8_pf", "l_e8_cs", "m_tma1_h", "l_e8_h", "l_sk", "l_sk", "l_h", "l"),
+        ("s_e8_pf", "l_e8_cs", "m_tma1", "l_e8", "l_sk", "l_sk", "l_h", "l"),
     ),
     "batch4_1024x768": (
         16576,
@@ -846,21 +868,12 @@ CONTRACT_ROW_GEMM_KEYS = {
     "video_1080p_4f": (
         43056,
         2691,
-        (
-            "s_e8_pf",
-            "l_e8_cs_h",
-            "m_tma1_h:pdle",
-            "l_e8",
-            "l_sk",
-            "l_sk",
-            "l_sk",
-            "l_sk",
-        ),
+        ("s_e8_pf", "l_e8_cs", "m_tma1_h:pdle", "l_e8", "l_sk", "l_sk", "l_sk", "l_sk"),
     ),
     "video_720p_32f": (
         153088,
         9568,
-        ("s_e8_pf", "l_e8_cs_h", "m_tma1", "l_e8_h", "m_p", "m_p", "l_sk", "l_h"),
+        ("s_e8_pf", "l_e8_cs", "m_tma1", "l_e8", "m_p", "m_p", "l_sk", "l_h"),
     ),
     "video_480p_64f": (
         105984,
@@ -1450,6 +1463,275 @@ CONTRACT_ROW_ATTENTION = {
     },
 }
 
+# Export-only coverage rows of the Cake export (tag ``coverage``; ``cake_backend.COVERAGE_ROW_GRIDS``): the minimal
+# grid_thws set reaching every key the 22 contract rows do not.  Same fields as the contract tables, copied ONCE from
+# the round-6 export protocol at the final head (half-N routing with HALF_MAX_ROUNDS / HALF_ROUTE_EXCLUDE).
+COVERAGE_ROW_GEMM_KEYS = {
+    "cov_batch11_224": (
+        2816,
+        704,
+        (
+            "s_e8_pf",
+            "m_e8_cs_h:pdle",
+            "s_e8_pf_h:pdle",
+            "m_e8:pdle",
+            "l_e8_pf:pdle",
+            "l_e8_pf:pdle",
+            "xs",
+            "s_h",
+        ),
+    ),
+    "cov_img_476x476": (
+        1156,
+        289,
+        (
+            "s_e8_pf",
+            "s_cs_h:pdle",
+            "s_e8_pf:pdle",
+            "s_h:pdle",
+            "s_e8_pf:pdle",
+            "s_e8_pf:pdle",
+            "s:pdle",
+            "s_h:pdle",
+        ),
+    ),
+    "cov_img_2436x392": (
+        4872,
+        1218,
+        (
+            "s_e8_pf",
+            "l_e8_cs:pdle",
+            "s_e8_pf_h:pdle",
+            "l_e8_h:pdle",
+            "l_e8_pf_h:pdle",
+            "l_e8_pf_h:pdle",
+            "s_h",
+            "l",
+        ),
+    ),
+    "cov_img_3948x700": (
+        14100,
+        3525,
+        (
+            "s_e8_pf",
+            "l_e8_cs",
+            "m_tma1_h:pdle",
+            "l_e8_h:pdle",
+            "m_p_h:pdle",
+            "m_p_h:pdle",
+            "l_sk",
+            "l_sk",
+        ),
+    ),
+    "cov_img_2324x140": (
+        1660,
+        415,
+        (
+            "s_e8_pf",
+            "l_e8_cs:pdle",
+            "s_e8_pf:pdle",
+            "m_e8_h:pdle",
+            "s_e8_pf:pdle",
+            "s_e8_pf:pdle",
+            "s:pdle",
+            "s:pdle",
+        ),
+    ),
+    "cov_img_4060x924": (
+        19140,
+        4785,
+        (
+            "s_e8_pf",
+            "l_e8_cs_h",
+            "m_tma1_h:pdle",
+            "l_e8_h",
+            "l_sk",
+            "l_sk",
+            "l_sk",
+            "l_sk",
+        ),
+    ),
+    "cov_img_3108x2716": (
+        43068,
+        10767,
+        ("s_e8_pf", "l_e8_cs", "m_tma1_h", "l_e8", "l_sk", "l_sk", "l_sk", "l_h"),
+    ),
+}
+COVERAGE_ROW_ATTENTION = {
+    "sm_100a": {
+        "cov_batch11_224": (
+            "attention:ring3",
+            74,
+            74,
+            0,
+            0,
+            0,
+            0,
+            132,
+            "3f6de94edb8864a1",
+            "374708fff7719dd5",
+        ),
+        "cov_img_476x476": (
+            "attention:ring3:wide",
+            60,
+            60,
+            0,
+            0,
+            0,
+            0,
+            60,
+            "1fc6f659ea0252a3",
+            "374708fff7719dd5",
+        ),
+        "cov_img_2436x392": (
+            "attention:ring3:split",
+            74,
+            74,
+            4,
+            18,
+            18,
+            72,
+            294,
+            "12d73246532b0940",
+            "f9e1fdf2f536ad8d",
+        ),
+        "cov_img_3948x700": (
+            "attention:ring3:split",
+            74,
+            74,
+            8,
+            6,
+            6,
+            48,
+            714,
+            "108060c6dd410ccb",
+            "8889695a6129acbb",
+        ),
+        "cov_img_2324x140": (
+            "attention:tiles2",
+            48,
+            48,
+            0,
+            0,
+            0,
+            0,
+            48,
+            "c9c3ccc504a09214",
+            "374708fff7719dd5",
+        ),
+        "cov_img_4060x924": (
+            "attention:ring3:split",
+            74,
+            74,
+            6,
+            12,
+            12,
+            72,
+            960,
+            "57a0037136a9ef45",
+            "c356a03d75341001",
+        ),
+        "cov_img_3108x2716": (
+            "attention:ring3",
+            74,
+            74,
+            0,
+            0,
+            0,
+            0,
+            2028,
+            "edfcd398d98ca384",
+            "374708fff7719dd5",
+        ),
+    },
+    "sm_103a": {
+        "cov_batch11_224": (
+            "attention:tiles1",
+            74,
+            74,
+            0,
+            0,
+            0,
+            0,
+            132,
+            "3f6de94edb8864a1",
+            "374708fff7719dd5",
+        ),
+        "cov_img_476x476": (
+            "attention:ring3:wide",
+            60,
+            60,
+            0,
+            0,
+            0,
+            0,
+            60,
+            "1fc6f659ea0252a3",
+            "374708fff7719dd5",
+        ),
+        "cov_img_2436x392": (
+            "attention:ring3:split",
+            74,
+            74,
+            4,
+            18,
+            18,
+            72,
+            294,
+            "12d73246532b0940",
+            "f9e1fdf2f536ad8d",
+        ),
+        "cov_img_3948x700": (
+            "attention:tiles1:split",
+            74,
+            74,
+            8,
+            6,
+            6,
+            48,
+            714,
+            "108060c6dd410ccb",
+            "8889695a6129acbb",
+        ),
+        "cov_img_2324x140": (
+            "attention:tiles2:wide",
+            48,
+            48,
+            0,
+            0,
+            0,
+            0,
+            48,
+            "1ae2f65026fab5b7",
+            "374708fff7719dd5",
+        ),
+        "cov_img_4060x924": (
+            "attention:tiles2:split",
+            74,
+            74,
+            6,
+            12,
+            12,
+            72,
+            516,
+            "f0bb3cf1cb1403ee",
+            "c356a03d75341001",
+        ),
+        "cov_img_3108x2716": (
+            "attention:tiles2",
+            74,
+            74,
+            0,
+            0,
+            0,
+            0,
+            1020,
+            "6be5feeab5bd8689",
+            "374708fff7719dd5",
+        ),
+    },
+}
+
 CONTRACT_ROW_VARIANTS = (
     "pos_sqxw",
     "norm_qkv_rope",
@@ -1464,7 +1746,12 @@ CONTRACT_ROW_VARIANTS = (
 
 def test_contract_row_kernel_keys_match_cake_protocol():
     assert set(CONTRACT_ROW_VARIANTS) == set(cb.PRODUCTION_GEMM_VARIANTS)
-    for label, (total, merged, tiles) in CONTRACT_ROW_GEMM_KEYS.items():
+    assert set(COVERAGE_ROW_GEMM_KEYS) == set(cb.COVERAGE_ROW_GRIDS)
+    assert not (set(COVERAGE_ROW_GEMM_KEYS) & set(CONTRACT_ROW_GEMM_KEYS))
+    for label, (total, merged, tiles) in {
+        **CONTRACT_ROW_GEMM_KEYS,
+        **COVERAGE_ROW_GEMM_KEYS,
+    }.items():
         expected = {
             variant: f"gemm:{variant}:{tile}"
             for variant, tile in zip(CONTRACT_ROW_VARIANTS, tiles, strict=True)
@@ -1476,24 +1763,31 @@ def test_contract_row_kernel_keys_match_cake_protocol():
                 label,
                 arch,
             )
+
     # ... and the census names nothing the rows cannot reach (the exporter refuses both directions).
-    reachable = {
-        key
-        for _t, _n, tiles in CONTRACT_ROW_GEMM_KEYS.values()
-        for key in (
+    def gemm_keys(tables):
+        return {
             f"gemm:{variant}:{tile}"
+            for _t, _n, tiles in tables.values()
             for variant, tile in zip(CONTRACT_ROW_VARIANTS, tiles, strict=True)
-        )
-    }
-    # Round 6: the census reaches half-N twins at token counts no contract row has; the export declares exactly
-    # those as uncovered (``UNCOVERED_KERNEL_KEYS``: not registered, refused by name at ``prepare``).
+        }
+
+    contract, coverage = (
+        gemm_keys(CONTRACT_ROW_GEMM_KEYS),
+        gemm_keys(COVERAGE_ROW_GEMM_KEYS),
+    )
+    # Round 6: the census reaches half-N twin / displaced-PDL keys at token counts no contract row has; the export's
+    # coverage rows reach exactly those, so the declared gap (``UNCOVERED_KERNEL_KEYS``) is empty and the census
+    # equals the union of both row sets.
     for arch in SUPPORTED_COMPUTE_CAPABILITIES.values():
         census = {k for k in REQUIRED_KERNEL_KEYS[arch] if k.startswith("gemm:")}
-        assert reachable <= census, arch
-        assert census - reachable == {
-            k for k in cb.UNCOVERED_KERNEL_KEYS[arch] if k.startswith("gemm:")
-        }, arch
-        assert not (reachable & set(cb.UNCOVERED_KERNEL_KEYS[arch])), arch
+        assert contract <= census, arch
+        assert census - contract and census - contract <= coverage, (
+            arch,
+            sorted(census - contract),
+        )
+        assert census == contract | coverage, arch
+        assert cb.UNCOVERED_KERNEL_KEYS[arch] == ()
 
 
 def _int32_sha256(values):
@@ -1504,10 +1798,16 @@ def _int32_sha256(values):
 def test_contract_row_attention_match_cake_protocol(arch):
     labels = set(CONTRACT_ROW_ATTENTION[arch])
     assert labels == set(cb.CONTRACT_ROW_GRIDS) == set(CONTRACT_ROW_GEMM_KEYS)
+    assert set(COVERAGE_ROW_ATTENTION[arch]) == set(cb.COVERAGE_ROW_GRIDS)
+    assert set(COVERAGE_ROW_ATTENTION[arch]) == set(COVERAGE_ROW_GEMM_KEYS)
+    grids_of = {**cb.CONTRACT_ROW_GRIDS, **cb.COVERAGE_ROW_GRIDS}
+    totals = {**CONTRACT_ROW_GEMM_KEYS, **COVERAGE_ROW_GEMM_KEYS}
     covered = set()
-    for label, expected in CONTRACT_ROW_ATTENTION[arch].items():
-        grids = cb.CONTRACT_ROW_GRIDS[label]
-        total, _n, _tiles = CONTRACT_ROW_GEMM_KEYS[label]
+    contract_forms = set()
+    rows = {**CONTRACT_ROW_ATTENTION[arch], **COVERAGE_ROW_ATTENTION[arch]}
+    for label, expected in rows.items():
+        grids = grids_of[label]
+        total, _n, _tiles = totals[label]
         cu = cu_seqlens_of(grids)
         assert cu[-1] == total, label
         plan = build_attention_plan(
@@ -1547,9 +1847,20 @@ def test_contract_row_attention_match_cake_protocol(arch):
         covered.add(plan.kernel_key)
         if plan.num_merge_units:
             covered.add(cb.ATTENTION_MERGE_KERNEL_KEY)
-    # The attention forms the rows exercise are exactly the registered ones (census minus uncovered).
+        if label in CONTRACT_ROW_ATTENTION[arch]:
+            contract_forms.add(plan.kernel_key)
+    # The attention forms the rows exercise are exactly the registered ones (= the census with the coverage rows).
     forms = {k for k in cb.REGISTERED_KERNEL_KEYS[arch] if k.startswith("attention")}
     assert covered == forms, (arch, covered ^ forms)
+    # ... and the coverage rows exist for the forms the contract rows miss.
+    missing = forms - contract_forms - {cb.ATTENTION_MERGE_KERNEL_KEY}
+    assert (
+        missing
+        == {
+            "sm_100a": {"attention:tiles2"},
+            "sm_103a": {"attention:tiles1", "attention:tiles1:split"},
+        }[arch]
+    ), (arch, missing)
 
 
 @pytest.mark.parametrize("label,grids", list(CONTRACT_GRIDS.items()))
