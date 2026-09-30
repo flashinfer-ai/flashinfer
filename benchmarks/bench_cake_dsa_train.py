@@ -381,7 +381,8 @@ def _arm_or_error(cls, inp):
 def run_perf(args, results):
     steps_for = lambda inp: max(
         args.min_steps,
-        args.steps if inp.total_q * inp.total_k <= 2**34 else args.steps_128k,
+        # the largest problems (doc_131072 is exactly 2**34 query x key pairs) take --steps-128k
+        args.steps if inp.total_q * inp.total_k < 2**34 else args.steps_128k,
     )
     for row in args.rows:
         seq_q, seq_k = ROWS[row]

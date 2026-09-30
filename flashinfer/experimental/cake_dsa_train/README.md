@@ -52,11 +52,18 @@ workspace sizing helper live in `cake_backend.py`.  The eager entry points
 (and the autograd wrapper behind the public API) validate and bind once per
 input binding -- `(data_ptr, shape, stride, dtype)` of every input plus the
 scale -- and launch later calls from the remembered argument plans with
-freshly allocated outputs (`cake_backend.BINDING_CACHE`: no caller tensor
-pinned, workspace scratch owned per binding under a FIFO capacity and a byte
-budget that never evict the latest forward / backward pair, so a training
-loop binds once per shape; `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0`
-disables it).
+freshly allocated outputs and per-call scratch (`cake_backend.BINDING_CACHE`).
+A remembered binding pins no caller tensor and holds no problem-sized
+scratch: `delta`, the FP32 dK/dV accumulators and the key-range-pass regions
+come from the caching allocator on every call like the outputs, and the
+binding owns only the descriptor workspace and a materialized `topk_length`
+(kilobytes).  The cache keeps up to 256 bindings
+(`FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY` sets the capacity) and
+evicts the least recently used one, so a model whose layers cycle through up
+to that many forward / backward bindings per step binds each of them once;
+`FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0` disables it.  A call without
+query rows (`T == 0`) returns empty outputs and zero gradients without binding
+or launching; `S == 0` is rejected.
 
 Host cost through the autograd wrapper: the `Function.backward` runs on
 PyTorch's autograd device thread, where the two thread handoffs (about 30 us
@@ -110,9 +117,10 @@ only when `P > 1` and the whole row fits the pass workspace budget
 (`T <= 4224` tokens at top-k 2048; there is no token chunking); otherwise the
 single-pass `bwd_main` runs unchanged.  At top-k 2048 that is `T <= 4224` and
 `S >= 45,512`: two passes at `S = 65,536`, three at `131,072`; 4k x 4k rows
-and 32k-token rows stay single-pass.  The passes add `T * (147,456 + 4 * topk
-+ 4)` B to the workspace (`dq_partial`, `key_scratch`, `pass_counts`; 608 MiB
-at `T = 4096`, top-k 2048; `dsa_train_workspace_size` includes them).  dQ is
+and 32k-token rows stay single-pass.  The passes add
+`T * (147,456 + 4 * topk + 4)` B to the workspace (`dq_partial`,
+`key_scratch`, `pass_counts`; 608 MiB at `T = 4096`, top-k 2048;
+`dsa_train_workspace_size` includes them).  dQ is
 still written once per row from the carried FP32 partial (bitwise
 deterministic run to run; its partial sums are re-associated, so it differs
 from the single pass in the last FP32 places), and the dK/dV reductions are
