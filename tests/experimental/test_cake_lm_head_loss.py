@@ -207,7 +207,7 @@ def test_public_api_is_marked_experimental():
 def test_registry_records_are_well_formed():
     assert cake_jit.STAGES == (
         "gemm_logits", "gemm_logits_nostats", "row_finalize", "loss_reduce", "row_grad", "gemm_dx", "gemm_dx_s2",
-        "gemm_dx_s3", "gemm_dw_acc", "scale_cast_bf16", "scale_cast_f32",
+        "gemm_dx_s3", "gemm_dx_s4", "gemm_dw_acc", "scale_cast_bf16", "scale_cast_f32",
     )
     assert set(STAGE_TENSORS) == set(cake_jit.STAGES)
     assert set(CONTRACT_ALIASES.values()) <= set().union(*_STAGE_VALUES.values())

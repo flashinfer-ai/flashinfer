@@ -102,8 +102,9 @@ Per chunk of `rows_c <= chunk_size` rows the host launches, in this order:
 * `row_grad`: `dz_c = d_t * (1[v = y_t] - exp(z - lse_t))` in BF16, in place
   over `z_c`; ignored rows become zero.
 * `gemm_dx`: `dX_acc[rows] = fp32(dz_c @ W)`.  A record may also register
-  `gemm_dx_s2` / `gemm_dx_s3`, the same GEMM as 2 / 3 K-slice work items per
-  output tile (the persistent grid fills its last wave): slice 0 writes
+  `gemm_dx_s2` / `gemm_dx_s3` / `gemm_dx_s4`, the same GEMM as 2 / 3 / 4
+  K-slice work items per output tile (the persistent grid fills its last
+  wave; a record registers a contiguous prefix of them): slice 0 writes
   `dX_acc`, slices `>= 1` write FP32 workspace slabs (`dx_ws`, temporary
   bucket) that the host adds into `dX_acc` in fixed slab order (one RN add per
   element per slab, no atomics).  The slice count of a chunk follows from its

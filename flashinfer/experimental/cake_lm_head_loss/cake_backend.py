@@ -151,6 +151,7 @@ STAGE_TENSORS = {
     "gemm_dx": ("A", "B", "C", "STATS_OUT", "WS"),
     "gemm_dx_s2": ("A", "B", "C", "STATS_OUT", "WS"),
     "gemm_dx_s3": ("A", "B", "C", "STATS_OUT", "WS"),
+    "gemm_dx_s4": ("A", "B", "C", "STATS_OUT", "WS"),
     "gemm_dw_acc": ("A", "B", "C", "STATS_OUT", "WS"),
     "row_finalize": ("stats", "z", "labels", "infer_logp", "loss_weights", "d_in", "lse", "logp", "d", "term"),
     "loss_reduce": ("term", "loss_acc", "loss_out"),
@@ -167,7 +168,7 @@ COMMON_SCALARS = ("rows_c", "row0", "T", "H", "V", "chunk", "num_tiles", "mode",
 # slab, no atomics).  A record registers a contiguous prefix of these; the slice count of a chunk is
 # chosen from its row count and the SM count (:func:`recommended_k_slices`).  ``WS`` of the other
 # GEMMs is an unused 16-float dummy (``ws_slab`` 0).
-DX_SLICE_STAGES = ("gemm_dx_s2", "gemm_dx_s3")
+DX_SLICE_STAGES = ("gemm_dx_s2", "gemm_dx_s3", "gemm_dx_s4")
 K_SLICE_PENALTY = 0.01  # wave-efficiency score penalty per extra slab (the kernels' fitted per-slab cost share)
 # Accepted spellings of the same host value (kernel side -> host side).
 CONTRACT_ALIASES = {
@@ -1117,7 +1118,7 @@ class ReferenceEngine:
     def gemm_dx(values: dict[str, Any]) -> None:
         values["C"].copy_(_mm_fp32(values["A"], values["B"]))
 
-    gemm_dx_s2 = gemm_dx_s3 = gemm_dx  # the reference path never slices K (one product per chunk)
+    gemm_dx_s2 = gemm_dx_s3 = gemm_dx_s4 = gemm_dx  # the reference path never slices K (one product per chunk)
 
     @staticmethod
     def dx_reduce(values: dict[str, Any]) -> None:
