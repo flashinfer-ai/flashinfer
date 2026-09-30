@@ -142,6 +142,12 @@ dKV of a trainer, with the repeated / remapped rows of a context-parallel window
   every source key row (values in `[0, S_dst)`, not checked on device;
   duplicates allowed and summed).  Without a map the identity is used, which
   needs `S_dst >= S`.
+* The kernel does not range-check `dkv_dst_map`: every value must lie in
+  `[0, S_dst)` (the rows of `dkv_acc`), and a value outside that range would
+  add into memory outside the buffer.  Setting
+  `FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1` validates the values on every call
+  (one device synchronization) and raises `ValueError` on a violation; leave
+  it unset in production.
 * With `dkv_acc` the backward returns `(dq_latent, dq_rope, None, None)`, the
   autograd wrapper returns `None` gradients for `kv_latent` / `k_rope`, and
   `dkv_fp32=True` is rejected.  The kernels' permuted FP32 accumulators remain

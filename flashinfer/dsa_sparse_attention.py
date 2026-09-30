@@ -121,7 +121,10 @@ def dsa_sparse_attention(
         int32 ``[S]`` destination row of ``dkv_acc`` for every key row
         (default identity).  Repeated destinations are allowed (the rows of a
         context-parallel window that map onto one parameter row) and are
-        combined with FP32 atomics.
+        combined with FP32 atomics.  Every value must lie in ``[0, S_dst)``;
+        the kernel does not range-check the map.  Setting
+        ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1`` validates the values on every
+        call (one device synchronization) and raises ``ValueError`` otherwise.
 
     Returns
     -------
