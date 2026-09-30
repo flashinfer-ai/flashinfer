@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Persistent knob cache for the SM90 Hopper FP8 MegaMoE frontend.
 
-Sibling-fork mirror of ``kernel_src/cutedsl_megamoe/shim/knob_cache.py``:
+Sibling-fork mirror of ``kernel_src/sm100/cutedsl_megamoe/shim/knob_cache.py``:
 offline-tuned winners land in a small JSON file and
 ``get_symm_buffer_for_hopper_fp8_mega_moe`` resolves ``knobs=None`` through
 :func:`lookup_knobs` before falling back to the built-in

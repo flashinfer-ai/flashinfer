@@ -13,7 +13,8 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Install for development | `pip install --no-build-isolation -e . -v` |
 | Initialize submodules | `git submodule update --init --recursive` |
 | Install CUPTI for benchmarking | `pip install -U cupti-python` |
-| Run all tests | `pytest tests/` |
+| Run regular tests | `pytest tests/` |
+| Run full parameter matrices | `pytest tests/ --full` |
 | Run specific test | `pytest tests/path/test_file.py::test_function` |
 | Run multi-GPU test | `mpirun -np 4 pytest tests/comm/test_allreduce_unified_api.py` |
 | Run benchmark | `python benchmarks/flashinfer_benchmark.py --routine <name> <flags>` |
@@ -39,9 +40,11 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Skip MoE EP CuTe-DSL import/version guard | `export FLASHINFER_MOE_EP_SKIP_DSL_CHECK=1` |
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
+| Enable MoE EP EXPERT_MAJOR padding-row exclusion (opt-in; shape-dependent) | `export FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1` |
 | Enable distribution-aware MoE autotune and kernel dispatch (experimental; TRT-LLM MoE only) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
 | Override Prims-TS CuTe-DSL compile options | `export FLASHINFER_PRIMS_TS_COMPILE_OPTIONS="--opt-level 2"` |
+| Configure NVFP4 4over6 quantization (preferred over the env vars) | `nvfp4_quantize(..., nvfp4_4over6=NVFP44Over6Config(e4m3_max=256))` |
 
 The minimum Python version used by CI and build tooling is defined in
 `.python-version`. CI Docker images use a stable Conda environment name and
@@ -95,10 +98,16 @@ FlashInfer provides optional pre-compiled packages for users who want faster ini
 
 ## Testing
 
-Run all tests:
+Run the regular test suite:
 
 ```bash
 pytest tests/
+```
+
+Run full parameter matrices (used by nightly testing):
+
+```bash
+pytest tests/ --full
 ```
 
 Run specific test file:
@@ -185,7 +194,7 @@ times = bench_gpu_time(
 median_time_ms = statistics.median(times)
 ```
 
-→ **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/skill.md`](.claude/skills/benchmark-kernel/skill.md)**
+→ **For complete benchmarking guide, see [`.claude/skills/benchmark-kernel/SKILL.md`](.claude/skills/benchmark-kernel/SKILL.md)**
 
 `flashinfer.gemm.group_gemm_fp8_nt_groupwise_contiguous` is the standalone
 CuTe-DSL grouped FP8 API; `group_deepgemm_fp8_nt_groupwise` keeps its original
@@ -201,6 +210,14 @@ Concurrent misses share one compilation; warm hits do not acquire the compile lo
 The standalone API's optional `validate_indices=True` checks expert-index values
 and synchronizes with the CPU. Validate new routing data before CUDA graph
 capture; the default path assumes valid indices and performs metadata checks only.
+
+Prims-TS decode keeps raw storage dtypes (`q_dtype`, `k_dtype`, `v_dtype`)
+separate from effective MMA dtypes (`qk_dtype`, `pv_dtype`). Transformed
+FP8/NVFP4 K/V uses Q's compute dtype; BF16 Q/K with FP8 V uses FP8 PV without
+that transform. Kernel predicates, P packing, and attention-sink scaling must
+follow effective compute precision; TMA descriptors and raw allocations must
+follow storage precision. The public plan accepts separate `k_data_type` and
+`v_data_type`, with `kv_data_type` retained as a common-KV compatibility alias.
 
 ## Code Linting
 
@@ -230,6 +247,13 @@ missed:
   a reproducible benchmark (e.g. `benchmarks/flashinfer_benchmark.py`), naming the GPU and the
   problem sizes. Speedup ratios without absolute numbers, or numbers without a named GPU, are
   not enough.
+
+When preparing changes for a PR, a self-review is strongly recommended: follow
+[`.claude/skills/self-review/SKILL.md`](.claude/skills/self-review/SKILL.md), which walks the
+diff through the repository's review guidance and PR rules. It is informal and not required —
+its purpose is to make review easier for reviewers and contributors alike by catching common
+issues before a human looks. Changes made only to test something locally, with no PR intended,
+do not need one.
 
 → **For the complete contribution rules, see [`CONTRIBUTING.md`](CONTRIBUTING.md)**
 
@@ -281,7 +305,7 @@ FlashInfer uses `CompilationContext` to manage CUDA architecture targets. Some k
 - JIT modules specify `supported_major_versions=[9, 10, 11, 12]` to limit compilation to specific SM versions
 - If GPU not supported → `RuntimeError: No supported CUDA architectures found`
 
-→ **See [`.claude/skills/add-cuda-kernel/skill.md`](.claude/skills/add-cuda-kernel/skill.md) for usage examples**
+→ **See [`.claude/skills/add-cuda-kernel/SKILL.md`](.claude/skills/add-cuda-kernel/SKILL.md) for usage examples**
 
 ### Layer 2: Code Generation
 
@@ -402,7 +426,7 @@ flashinfer/
 
 ## Adding a New Operation
 
-→ **For complete step-by-step tutorial, see [`.claude/skills/add-cuda-kernel/skill.md`](.claude/skills/add-cuda-kernel/skill.md)**
+→ **For complete step-by-step tutorial, see [`.claude/skills/add-cuda-kernel/SKILL.md`](.claude/skills/add-cuda-kernel/SKILL.md)**
 
 **Quick overview of the process:**
 1. Write kernel in `include/flashinfer/new_op.cuh` (framework-agnostic, raw pointers)
@@ -525,7 +549,7 @@ python my_script.py
 - Track tensor shapes/dtypes through pipeline
 - Detect NaN/Inf issues (level 5)
 
-→ **For complete debugging guide, see [`.claude/skills/debug-cuda-crash/skill.md`](.claude/skills/debug-cuda-crash/skill.md)**
+→ **For complete debugging guide, see [`.claude/skills/debug-cuda-crash/SKILL.md`](.claude/skills/debug-cuda-crash/SKILL.md)**
 
 ## Debugging
 
@@ -580,8 +604,10 @@ match what the code uses today; values are strings unless noted.
 |----------|---------|---------|--------|
 | `FLASHINFER_DISABLE_JIT` | unset | `flashinfer/jit/core.py` | If set (any non-empty value), JIT compilation is refused and modules must already exist in the cache or be provided via AOT packages. |
 | `FLASHINFER_CUTE_DSL_DISABLE_CACHE` | `0` | `flashinfer/jit/cute_dsl_core.py` | `1` disables the on-disk cache for JIT-compiled CuTe-DSL kernels (every process recompiles via `cute.compile`). |
+| `FLASHINFER_CUDNN_FROST_PTXAS` | unset | `flashinfer/experimental/cudnn_frost_selected_kernels_moe_grouped_gemm/compiler.py` | Select an external PTXAS executable path for all Frost dtypes; unset or empty uses the bundled assembler. The executable path, version, and SHA-256 participate in compiler and tactic cache identities. |
 | `FLASHINFER_DISABLE_VERSION_CHECK` | unset | `flashinfer/jit/env.py` | Skip the AOT/JIT-cache version check that pins flashinfer-jit-cache to the installed flashinfer-python. Bypass only when you intentionally mix versions. |
 | `FLASHINFER_JIT_LINEINFO` | `0` | `flashinfer/jit/core.py` | `1` adds `-lineinfo` to nvcc so profiler / `cuda-gdb` can map PTX back to CUDA source. |
+| `FLASHINFER_JIT_PREBUILD_MAX_JOBS` | unset (uses `MAX_JOBS`) | `flashinfer/jit/core.py` | Maximum parallel Ninja jobs for a bulk `build_jit_specs()` prebuild. This does not control ordinary on-demand module builds. The sharded test runner sets it to the host-wide automatic build budget before reducing each worker's `MAX_JOBS`; an explicit value is preserved. |
 | `FLASHINFER_NVCC` | `$cuda_home/bin/nvcc` | `flashinfer/jit/cpp_ext.py` | Override the nvcc binary used by the JIT (useful for sccache wrappers or non-default CUDA installs). |
 | `FLASHINFER_NVCC_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Optional launcher prefix for nvcc (e.g. `ccache`, `sccache`). Combined with `FLASHINFER_NVCC`. |
 | `FLASHINFER_CXX_LAUNCHER` | `""` | `flashinfer/jit/cpp_ext.py` | Same idea as `FLASHINFER_NVCC_LAUNCHER` but for the host C++ compiler. |
@@ -589,8 +615,18 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_EXTRA_CFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to the host C++ compiler. |
 | `FLASHINFER_EXTRA_CUDAFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra compiler flags passed to `nvcc`. |
 | `FLASHINFER_EXTRA_LDFLAGS` | unset | `flashinfer/jit/cpp_ext.py` | Extra linker flags passed to the linker. |
+| `FLASHINFER_CAKE_GDN_VALIDATE_SLOTS` | `0` | `flashinfer/gdn_decode.py` | `1` enables extra slot-validation checks in the CAKE GDN path for debugging or invariant validation. Leave disabled in normal runs to avoid extra validation overhead. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCHS` | required | `flashinfer-jit-cache/build_backend.py` | Space-separated provider architectures added to a shim wheel's exact `Requires-Dist` metadata. |
 | `FLASHINFER_JIT_CACHE_PROVIDER_ARCH` | required | `flashinfer-jit-cache-provider/package_config.py` | Select exactly one architecture, such as `9.0a` or `sm120f`, when building a binary provider wheel. |
+
+Release/nightly JIT-cache provider builds run sccache in server-side mode and
+wrap the complete wheel build with a no-output watchdog. After 90 minutes with
+no build output, the watchdog captures system, process, compiler, and sccache
+state; terminates the wrapped build process group (TERM, then KILL after a
+two-minute grace period); and exits with status 124. Compiler discovery scans
+the whole build container, so diagnostics include compiler processes owned by
+the sccache daemon even though they are outside the wrapped process group. The
+CI `docker run --rm` boundary provides final cleanup for those processes.
 
 ##### Cubin / Artifact Loader
 
@@ -600,6 +636,7 @@ match what the code uses today; values are strings unless noted.
 | `FLASHINFER_CUBINS_REPOSITORY` | `https://edge.urm.nvidia.com/artifactory/sw-kernelinferencelibrary-public-generic-local` | `flashinfer/jit/cubin_loader.py` | Base URL the loader downloads cubins from. Point to a mirror for offline or air-gapped setups. |
 | `FLASHINFER_CUBIN_CHECKSUM_DISABLED` | unset | `flashinfer/jit/cubin_loader.py` | If set, skip SHA checksum verification of downloaded cubins. Debug aid only. |
 | `FLASHINFER_CUBIN_DOWNLOAD_THREADS` | `4` | `flashinfer/artifacts.py` | Thread-pool size used by `flashinfer artifacts download`. |
+| `FLASHINFER_CUBIN_RETRY_WINDOW_SECONDS` | `0` | `flashinfer/artifacts.py` | Total wall-clock retry window for `download_artifacts()`. A failed artifact keeps re-attempting, with capped exponential backoff, until the window closes (e.g. `86400` for a 24-hour nightly window). `0` keeps only `download_file()`'s own per-call retry budget. |
 | `FLASHINFER_NO_DOWNLOAD` | unset | `flashinfer/jit/cubin_loader.py` | Hard-fail if a cubin is missing locally instead of attempting to download. Useful in CI / locked-down environments. |
 | `FLASHINFER_DSL_FMHA_LOCAL_DIR` | unset | `flashinfer/attention/cute_dsl/fmha.py` | Path to a local checkout of the CuTe-DSL FMHA kernel sources. The loader checks here before downloading. |
 | `FLASHINFER_LOGGING_LEVEL` | `INFO` | `flashinfer/artifacts.py`, `flashinfer/jit/core.py` | Python logging level for the artifacts/cubin loader and the JIT compiler (`DEBUG`/`INFO`/`WARNING`/`ERROR`). Distinct from `FLASHINFER_LOGLEVEL`. |
@@ -653,7 +690,12 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_MSA_FP8_Q1_SCHEDULE` | unset | `flashinfer/msa_ops/_blackwell_sm100.py` | Force an eligible FP8 Q1 MSA decode route: `batch_attention`, `q1_exact`, `q1_flat_xform2`, `q1_paged_xform2`, or `paged_uniform_fp8`. Leave unset for automatic routing. |
 | `FLASHINFER_AUTOTUNE_CACHE_DIR` | `FLASHINFER_CACHE_DIR/autotune` | `flashinfer/autotune_cache.py` | Root **directory** of the managed v2 autotune store used by `autotune_v2()` (placement only; distinct from the MLA-specific `FLASHINFER_AUTOTUNE_DIR` above). |
 | `FLASHINFER_RAGGED_AUTO_BACKEND_ORDER` | unset | `flashinfer/prefill.py` | Comma-separated backend order for `BatchPrefillWithRaggedKVCacheWrapper` under `backend="auto"` on Blackwell (e.g. `cutlass,cudnn`, or a single name to pin one). Overrides both the per-shape table and the global default; eligibility is still enforced, so a backend that cannot serve the problem is skipped rather than forced. For benchmarking and regression bisection on hardware whose ranking differs from the measured B200 defaults. |
-| `FLASHINFER_NVFP4_QUANTIZE_USE_TMA` | unset | `flashinfer/quantization/kernels/nvfp4_quantize.py` | Overrides the NVFP4 CuTe-DSL TMA-kernel heuristic: `0` forces the vectorized-load kernel, `1` enables the shape heuristic on every architecture and input dtype. Unset, TMA is used only where it was measured to win (SM107 with FP16/BF16 input, layout-specific M/K crossovers). For benchmarking and re-tuning on new hardware. |
+| `FLASHINFER_NVFP4_QUANTIZE_USE_TMA` | unset | `flashinfer/quantization/kernels/nvfp4_quantize.py` | Overrides the NVFP4 CuTe-DSL TMA-kernel heuristic: `0` forces the vectorized-load kernel, `1` enables the shape heuristic on every architecture and input dtype. Unset, TMA is used only where it was measured to win (SM107 with FP16/BF16 input, layout-specific M/K crossovers). Never taken for fp8 input or an active 4over6 recipe, whatever the setting. For benchmarking and re-tuning on new hardware. |
+| `FLASHINFER_NVFP4_PER_TOKEN_THREADS` | shape-dependent (`128`-`512`) | `flashinfer/quantization/kernels/nvfp4_quantize.py` | Override the CTA thread count for per-token NVFP4 quantization. Intended for benchmarking; invalid or unsupported values can make kernel compilation or launch fail. |
+| `FLASHINFER_KDA_AFFINE_POLICY` | `model` | `flashinfer/cake_kda_tf32_runtime.py` | Set to `legacy` to restore the pre-2026-09-23 BF16 affine-split gate for A/B measurements. `model`, `packed`, and unrecognized values use the measured cost model. |
+| `FLASHINFER_KDA_AFFINE_WINDOW_WAVES` | `auto` | `flashinfer/cake_kda_tf32_runtime.py` | Override resident affine-composite windows in CTA waves. Integer values are clamped to `1`-`3`; unset, `auto`, and invalid values let the cost model choose. |
+| `FLASHINFER_KDA_AFFINE_FUSED_EPILOGUE` | `1` | `flashinfer/cake_kda_tf32_runtime.py` | `0` restores the equivalent PyTorch checkpoint/tail/final-state epilogue for A/B testing; any other value keeps the fused epilogue. |
+| `FLASHINFER_KDA_PLAN_CACHE_MAX_BYTES` | `8589934592` (8 GiB) | `flashinfer/kda_prefill.py` | Maximum workspace bytes retained by the KDA prefill plan cache. Must parse as a positive integer. |
 | `FLASHINFER_TOPK_ALGO` | unset | `flashinfer/topk.py` | Force a specific top-k backend (otherwise the dispatcher chooses based on shape/dtype/mode via benefit gates): `default` (radix), `clusters` (SM100), `cub` (cub::DeviceBatchedTopK; bypasses the benefit gates). Used for benchmarking / regression bisection. |
 | `FLASHINFER_USE_CUDA_NORM` | `0` | `flashinfer/norm/__init__.py` | `1` switches the norm path from the default backend to the legacy CUDA-only kernels. Diagnostic toggle. |
 | `FLASHINFER_ROUTING_FORCE_BLOCK_PER_TOKEN` | unset | `csrc/fused_moe/trtllm_backend/trtllm_fused_moe_routing_custom.cuh` | Forces the TRT-LLM MoE custom-routing kernel into "one-block-per-token" mode regardless of the active routing policy. Mainly used to reproduce specific perf points. |
@@ -662,6 +704,11 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_TACTICS_BLOCKLIST` | unset | `flashinfer/autotuner/autotuner.py` | Path to a JSON tactics-blocklist file generated by `flashinfer tactics-blocklist generate` (or `python -m flashinfer tactics-blocklist generate`). When set, the autotuner loads the file at startup and skips any kernel tactics listed as invalid for the current GPU/driver environment, preventing hang or crash on known-bad tactics. |
 | `FLASHINFER_CUDNN_PREFILL_SHAPE_OVERRIDE` | `1` | `flashinfer/cudnn/prefill.py` (ragged token-indptr path) | `0` makes the cuDNN ragged prefill graph declare the exact `(batch, max_seq_len)` per call instead of building one override-enabled graph per length class (declared max_len 128 or 65536+, batch 4096+) and passing the real shapes at execute time via cuDNN's shape override. Override exists because cuDNN finalizes one execution plan per declared shape (55-70 ms, ~1 s with a kernel compile) and serving changes the shape every step; needs cuDNN 9.22+ and cudnn-frontend 1.29+, otherwise the exact declaration is used. Disable only to bisect a suspected override regression. |
 | `FLASHINFER_ALLOW_CUDNN_PLAN_BUILD_IN_CAPTURE` | `0` | `flashinfer/gemm/gemm_base.py` (read once at import) | `1` downgrades the refusal to build a cuDNN execution plan during CUDA graph capture from a `CudnnPlanBuildInCaptureError` to a warning. Set it only if you have verified your cuDNN version tolerates plan build under capture; the supported alternative is to run each shape once eagerly outside the capture region, which populates the per-shape plan cache the captured call then reuses. |
+| `FLASHINFER_NVFP4_4OVER6` | unset | `flashinfer/quantization/nvfp4_quantization_utils.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | **Legacy.** `1` enables the NVFP4 "4over6" block-scale search. Standard NVFP4 gives each 16-element block the single E4M3 scale implied by its absolute max (`amax / 6`, because 6 is the E2M1 max). 4over6 additionally tries the 1.5x tighter `amax / 4`, quantizes the block both ways, dequantizes both, and keeps whichever reconstructs the block with less error — a little more quantizer work for lower quantization error. Requires fp16/bf16 input and E4M3 (not UE8M0) block scales. Consulted **only** when the public `nvfp4_4over6=` parameter is omitted (its default); a `FutureWarning` is emitted only when this variable actually enables 4over6 (unset or `0` stays silent). An explicit `None` (off) or `NVFP44Over6Config(...)` ignores this variable and the three below, with no per-field merge. Prefer the parameter. |
+| `FLASHINFER_NVFP4_4OVER6_ERR_MODE` | `MAE` | `flashinfer/quantization/nvfp4_quantization_utils.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | **Legacy.** Metric used to choose between the two 4over6 candidates: `MAE` (sum of absolute errors) or `MSE` (sum of squared errors). The `amax / 4` candidate buys resolution for the bulk of the block by clipping its largest magnitudes, and MSE penalizes those few large residuals much harder than MAE does, so MSE selects it less often — prefer MSE when a handful of outlier activations dominate downstream accuracy. Read only when `FLASHINFER_NVFP4_4OVER6=1` and `nvfp4_4over6=` is omitted. Parameter spelling: `NVFP44Over6Config(err_mode="MSE")`. |
+| `FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH` | unset | `flashinfer/quantization/nvfp4_quantization_utils.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | **Legacy.** `1` evaluates the 4over6 candidate error in fp16 (a packed `f16x2` dequant of each candidate) instead of exactly in fp32. Cheaper, and on near-ties it can pick the other candidate, so it is a distinct recipe rather than a pure speed knob. Same gating as `FLASHINFER_NVFP4_4OVER6_ERR_MODE`. Parameter spelling: `NVFP44Over6Config(err_use_fast_math=True)`. |
+| `FLASHINFER_NVFP4_4OVER6_E4M3_USE_256` | unset | `flashinfer/quantization/nvfp4_quantization_utils.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | **Legacy.** `1` treats 256, not the full-range 448, as the top of the E4M3 block-scale range: the per-tensor global scale becomes `256 * 6 / amax` (per-token: `1 / (256 * 6)`) and the kernel's error normalization follows. This is what keeps the 1.5x-larger `amax / 4` candidate representable — `256 * 1.5 = 384` still fits E4M3, whereas a 448-based scale would need `672` and saturate for blocks near the tensor amax. The global scale **must** be built from the same recipe (`make_nvfp4_global_scale(..., nvfp4_4over6_config=...)`); a mismatch silently rescales the whole tensor. Same gating as `FLASHINFER_NVFP4_4OVER6_ERR_MODE`. Parameter spelling: `NVFP44Over6Config(e4m3_max=256)`. |
+| `FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH` | unset | `flashinfer/quantization/kernels/nvfp4_quantize.py`, `csrc/nv_internal/cpp/common/envUtils.cpp` | `1` makes the NVFP4 quantizer derive its block/global scales with IEEE round-to-nearest arithmetic (`fdiv_rn`, `nvfp4_scale_from_amax_rn`) instead of the default fast approximate reciprocal (`rcp_approx_ftz`). Slower, but reproduces a reference implementation bit-exactly — use it when bisecting an NVFP4 accuracy mismatch. The flag is part of the CuTe-DSL specialization name (`_nofastmath` suffix), so toggling it compiles a separate kernel rather than reusing the cached one. The C++ side (`getEnvDisableFP4QuantFastMath()`) also accepts TRT-LLM's `TRTLLM_DISABLE_FP4_QUANT_FAST_MATH` as an alias. |
 
 ##### Experimental KDA Output-Only Decode Tuning
 

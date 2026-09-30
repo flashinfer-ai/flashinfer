@@ -1677,9 +1677,16 @@ void msa_prefill_nvfp4_specialized(TensorView q, TensorView k_data, TensorView v
                     cudaSuccess);
   TVM_FFI_ICHECK_EQ(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
                     cudaSuccess);
-  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3))
-      << "the specialized NVFP4 MSA prefill kernel requires compute capability 10.0 or 10.3, got "
-      << major << "." << minor;
+#if defined(__CUDACC_VER_MAJOR__) && \
+    (__CUDACC_VER_MAJOR__ > 13 || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 4))
+  constexpr bool kSupportsSm107 = true;
+#else
+  constexpr bool kSupportsSm107 = false;
+#endif
+  TVM_FFI_ICHECK(major == 10 && (minor == 0 || minor == 3 || (minor == 7 && kSupportsSm107)))
+      << "the specialized NVFP4 MSA prefill kernel requires compute capability 10.0 or 10.3, or "
+         "10.7 "
+      << "(Rubin) built with a CUDA 13.4+ toolkit, got " << major << "." << minor;
 
   const cudaStream_t stream = get_stream(q.device());
   const cudaError_t status = flashinfer::msa_prefill_nvfp4::launch(

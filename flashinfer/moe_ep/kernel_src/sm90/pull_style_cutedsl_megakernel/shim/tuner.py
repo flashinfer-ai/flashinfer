@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: BSD-3-Clause
 """Kernel tuning knobs for the SM90 Hopper FP8 MegaMoE frontend.
 
-Sibling-fork mirror of ``kernel_src/cutedsl_megamoe/shim/tuner.py``,
+Sibling-fork mirror of ``kernel_src/sm100/cutedsl_megamoe/shim/tuner.py``,
 retargeted at ``Sm90MegaMoE(SwapAB)Fp8Kernel``.  Exposes the SM90 tuning
 surface so callers -- or an autotuner -- can enumerate valid tactics and
 apply them to a :class:`.hopper_fp8.MegaMoEHopperFp8Config`.

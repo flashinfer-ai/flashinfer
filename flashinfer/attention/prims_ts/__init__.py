@@ -27,7 +27,6 @@ from .decode import (
     get_prims_ts_batch_decode_workspace_size,
     make_q_token_kv_block_sparse_qo_indptr,
     prepare_prims_ts_batch_decode_with_kv_cache,
-    prims_ts_batch_decode_with_kv_cache,
     suggest_q_token_kv_block_sparse_group_size,
     validate_q_token_kv_block_sparse_group_size,
 )
@@ -41,7 +40,6 @@ from .mla_decode import (
     BatchMLADecodePagedTSWrapper,
     batch_mla_decode_with_paged_kv_cache,
     get_prims_ts_batch_mla_decode_workspace_size,
-    prims_ts_batch_mla_decode_with_kv_cache,
 )
 from .q_token_kv_block_sparse_metadata import (
     QTokenKvBlockSparsePagedTSWrapper,
@@ -64,7 +62,6 @@ __all__ = [
     "get_prims_ts_batch_decode_workspace_size",
     "make_q_token_kv_block_sparse_qo_indptr",
     "prepare_prims_ts_batch_decode_with_kv_cache",
-    "prims_ts_batch_decode_with_kv_cache",
     "suggest_q_token_kv_block_sparse_group_size",
     "validate_q_token_kv_block_sparse_group_size",
     "QTokenKvBlockSparsePagedTSWrapper",
@@ -73,5 +70,4 @@ __all__ = [
     "BatchMLADecodePagedTSWrapper",
     "batch_mla_decode_with_paged_kv_cache",
     "get_prims_ts_batch_mla_decode_workspace_size",
-    "prims_ts_batch_mla_decode_with_kv_cache",
 ]

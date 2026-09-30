@@ -135,7 +135,7 @@ def run_tuning(
     import torch
 
     if pkg is None:
-        from ....kernel_src import cutedsl_megamoe as _default_pkg
+        from ....kernel_src.sm100 import cutedsl_megamoe as _default_pkg
 
         pkg = _default_pkg
 

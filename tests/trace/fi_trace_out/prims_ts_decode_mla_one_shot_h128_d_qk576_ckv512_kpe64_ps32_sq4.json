@@ -10,6 +10,10 @@
     "mla"
   ],
   "axes": {
+    "workspace_size": {
+      "type": "var",
+      "description": "Optional caller scratch size in bytes."
+    },
     "batch_size": {
       "type": "var",
       "description": "Number of MLA decode requests."
@@ -114,6 +118,18 @@
     "max_kv_len": {
       "shape": null,
       "dtype": "int32",
+      "optional": true
+    },
+    "workspace_buffer": {
+      "shape": [
+        "workspace_size"
+      ],
+      "dtype": "uint8",
+      "optional": true
+    },
+    "validate": {
+      "shape": null,
+      "dtype": "bool",
       "optional": true
     },
     "bmm1_scale": {
