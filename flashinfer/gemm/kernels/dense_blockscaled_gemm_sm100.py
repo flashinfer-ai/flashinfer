@@ -1961,7 +1961,8 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         # Shifts >= 1 (kernel N > 32) fault with cudaErrorMisalignedAddress:
         # MXFP8 under autotune (#5725), and forced NVFP4 / MXFP4 tactics at
         # N = 40 and 64 on SM100 and SM103. That the nonzero column shift is
-        # the hardware cause is a hypothesis; the bound is uniform per dtype.
+        # the hardware cause is a hypothesis; the bound is the same for every
+        # dtype.
         if not cls.narrow_tile_ok(mma_tiler_mn[1], n) or (
             mma_tiler_mn[1] < 64 and cluster_shape_mn[1] > 1
         ):
