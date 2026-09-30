@@ -20,7 +20,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 
-from ..api_logging import flashinfer_api
+from ..api_logging import flashinfer_api, warn_experimental_backend_once
 from ..trace.templates.quantize import (
     fp4_quantize_trace,
     mxfp4_quantize_trace,
@@ -1574,6 +1574,10 @@ def nvfp4_quantize(
           (``layout_128x4`` / ``layout_8x4`` / ``layout_linear``)
           and input dtypes fp16/bf16/float8_e4m3fn, but only
           ``sf_vec_size == 16``.
+        - ``"cake"``: generated Cake per-token kernel (SM100/SM103,
+          **experimental**, explicit opt-in); ``per_token_activation=True``
+          with ``layout_128x4``, no shuffle and fp16/bf16 input only, outputs
+          bitwise equal to ``"cute-dsl"``.
     per_token_activation : bool
         Whether to use per-token NVFP4 activation scaling.  In this mode
         ``a_global_sf`` is the inverse base scale multiplier (typically
@@ -1584,8 +1588,8 @@ def nvfp4_quantize(
         quantization.
     out_scale : torch.Tensor, optional
         Scalar the returned per-token scales are multiplied by.  Only for
-        ``per_token_activation=True`` with ``backend="cute-dsl"``.  Does not
-        change the quantized values.
+        ``per_token_activation=True`` with ``backend="cute-dsl"`` or
+        ``backend="cake"``.  Does not change the quantized values.
     nvfp4_4over6 : NVFP44Over6Config or None
         NVFP4 "4over6" scale-candidate search. Requires fp16 / bf16 input.
 
@@ -1625,8 +1629,10 @@ def nvfp4_quantize(
             raise ValueError(
                 "Per-token NVFP4 quantization only supports sf_vec_size=16"
             )
-        if out_scale is not None and backend != "cute-dsl":
-            raise ValueError("out_scale is only supported with backend='cute-dsl'")
+        if out_scale is not None and backend not in ("cute-dsl", "cake"):
+            raise ValueError(
+                "out_scale is only supported with backend='cute-dsl' or 'cake'"
+            )
 
         sf_layout = SfLayout.layout_linear if do_shuffle else sfLayout
         if do_shuffle:
@@ -1700,9 +1706,40 @@ def nvfp4_quantize(
                 out_scale=out_scale,
                 nvfp4_4over6=nvfp4_4over6_config,
             )
+        elif backend == "cake":
+            # Experimental generated-program backend (explicit opt-in).
+            if expanded_idx_to_permuted_idx is not None:
+                raise ValueError(
+                    "the cake per-token NVFP4 quantization does not support "
+                    "expanded_idx_to_permuted_idx"
+                )
+            if do_shuffle or sf_layout != SfLayout.layout_128x4:
+                raise ValueError(
+                    "the cake per-token NVFP4 quantization writes the 128x4 scale "
+                    "layout only (sfLayout=SfLayout.layout_128x4, do_shuffle=False)"
+                )
+            if nvfp4_4over6_config is not None:
+                raise ValueError(
+                    "the cake per-token NVFP4 quantization implements the plain "
+                    "NVFP4 recipe only (no 4over6 scale-candidate search); pass "
+                    "nvfp4_4over6=None or use backend='cute-dsl'"
+                )
+            if nvfp4_4over6_is_explicit and not isinstance(a_global_sf, torch.Tensor):
+                _check_per_token_global_scale(float(a_global_sf), nvfp4_4over6_config)
+            from ..experimental.cake_nvfp4_per_token.cake_backend import (
+                nvfp4_quantize_per_token as _cake_nvfp4_quantize_per_token,
+            )
+
+            warn_experimental_backend_once("nvfp4_quantize", "cake")
+            a_fp4, a_sf, per_token_scale = _cake_nvfp4_quantize_per_token(
+                a.cuda(),
+                a_global_sf,
+                out_scale=out_scale,
+                enable_pdl=enable_pdl,
+            )
         else:
             raise ValueError(
-                f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'."
+                f"Unknown backend: {backend}. Must be 'cuda', 'cute-dsl' or 'cake'."
             )
     elif out_scale is not None:
         raise ValueError("out_scale is only supported with per_token_activation=True")
@@ -1769,8 +1806,15 @@ def nvfp4_quantize(
             enable_pdl=enable_pdl,
             nvfp4_4over6=nvfp4_4over6_config,
         )
+    elif backend == "cake":
+        raise ValueError(
+            "backend='cake' implements per_token_activation=True only; use "
+            "'cuda' or 'cute-dsl' for the global-scale quantization"
+        )
     else:
-        raise ValueError(f"Unknown backend: {backend}. Must be 'cuda' or 'cute-dsl'.")
+        raise ValueError(
+            f"Unknown backend: {backend}. Must be 'cuda', 'cute-dsl' or 'cake'."
+        )
 
     if do_shuffle:
         epilogue_tile_m = 128
