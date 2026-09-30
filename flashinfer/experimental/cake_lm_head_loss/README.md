@@ -101,7 +101,14 @@ Per chunk of `rows_c <= chunk_size` rows the host launches, in this order:
   the loss accumulator; the last chunk writes the finished loss.
 * `row_grad`: `dz_c = d_t * (1[v = y_t] - exp(z - lse_t))` in BF16, in place
   over `z_c`; ignored rows become zero.
-* `gemm_dx`: `dX_acc[rows] = fp32(dz_c @ W)`.
+* `gemm_dx`: `dX_acc[rows] = fp32(dz_c @ W)`.  A record may also register
+  `gemm_dx_s2` / `gemm_dx_s3`, the same GEMM as 2 / 3 K-slice work items per
+  output tile (the persistent grid fills its last wave): slice 0 writes
+  `dX_acc`, slices `>= 1` write FP32 workspace slabs (`dx_ws`, temporary
+  bucket) that the host adds into `dX_acc` in fixed slab order (one RN add per
+  element per slab, no atomics).  The slice count of a chunk follows from its
+  row count and the SM count (`cake_backend.recommended_k_slices`), so it is
+  deterministic in the shapes.
 * `gemm_dw_acc`: `dW_acc = fp32(dz_c^T @ X_c)` on the first chunk,
   `dW_acc += ...` afterwards (the chunk order is the reduction order).
 * `scale_cast_bf16` / `scale_cast_f32`: `out = g * acc` over the flat FP32

@@ -54,6 +54,12 @@ MODULES: dict[str, dict[str, Any]] = {}
 # ``row_grad``             dz_c = d_t * (1[v = y_t] - exp(z - lse_t)) in bf16,
 #                          in place over ``z_c``; ignored rows become zero.
 # ``gemm_dx``              dX_acc[rows] = fp32(dz_c @ W).
+# ``gemm_dx_s2`` / ``_s3``  the same GEMM as 2 / 3 K-slice work items per output
+#                          tile (slice 0 writes dX_acc, slices >= 1 write FP32
+#                          workspace slabs the host adds in fixed order); the
+#                          host picks the slice count per chunk from its row
+#                          count and the SM count.  Optional (a contiguous
+#                          prefix may be registered).
 # ``gemm_dw_acc``          dW_acc (=|+=) fp32(dz_c^T @ X_c): store on the first
 #                          chunk, accumulate afterwards (chunk order = the
 #                          reduction order, no atomics).
@@ -70,11 +76,13 @@ STAGES = (
     "loss_reduce",
     "row_grad",
     "gemm_dx",
+    "gemm_dx_s2",
+    "gemm_dx_s3",
     "gemm_dw_acc",
     "scale_cast_bf16",
     "scale_cast_f32",
 )
-GEMM_STAGES = ("gemm_logits", "gemm_logits_nostats", "gemm_dx", "gemm_dw_acc")
+GEMM_STAGES = ("gemm_logits", "gemm_logits_nostats", "gemm_dx", "gemm_dx_s2", "gemm_dx_s3", "gemm_dw_acc")
 ROW_STAGES = ("row_finalize", "loss_reduce", "row_grad", "scale_cast_bf16", "scale_cast_f32")
 ARCH_NVCC_FLAGS = {
     "sm_100a": sm100a_nvcc_flags,

@@ -146,10 +146,12 @@ _GEOMETRY_OPTIONAL = ("hidden", "vocab")
 # ``last_chunk`` / ``d_off`` of the row kernels, ``num_vecs`` of the casts, and
 # ``T`` / ``H`` / ``C`` for grid rules.
 STAGE_TENSORS = {
-    "gemm_logits": ("A", "B", "C", "STATS_OUT"),
-    "gemm_logits_nostats": ("A", "B", "C", "STATS_OUT"),
-    "gemm_dx": ("A", "B", "C", "STATS_OUT"),
-    "gemm_dw_acc": ("A", "B", "C", "STATS_OUT"),
+    "gemm_logits": ("A", "B", "C", "STATS_OUT", "WS"),
+    "gemm_logits_nostats": ("A", "B", "C", "STATS_OUT", "WS"),
+    "gemm_dx": ("A", "B", "C", "STATS_OUT", "WS"),
+    "gemm_dx_s2": ("A", "B", "C", "STATS_OUT", "WS"),
+    "gemm_dx_s3": ("A", "B", "C", "STATS_OUT", "WS"),
+    "gemm_dw_acc": ("A", "B", "C", "STATS_OUT", "WS"),
     "row_finalize": ("stats", "z", "labels", "infer_logp", "loss_weights", "d_in", "lse", "logp", "d", "term"),
     "loss_reduce": ("term", "loss_acc", "loss_out"),
     "row_grad": ("z", "labels", "lse", "d"),
@@ -157,7 +159,16 @@ STAGE_TENSORS = {
     "scale_cast_f32": ("acc", "g", "out"),
 }
 COMMON_TENSORS = ("workspace", "tma_descriptor_workspace")
-COMMON_SCALARS = ("rows_c", "row0", "T", "H", "V", "chunk", "num_tiles", "mode", "loss_div", "first_chunk", "last_chunk", "d_off")
+COMMON_SCALARS = ("rows_c", "row0", "T", "H", "V", "chunk", "num_tiles", "mode", "loss_div", "first_chunk", "last_chunk", "d_off", "ws_slab")
+# K-sliced forms of the dX GEMM: ``gemm_dx_s<S>`` runs ``S`` K-slice work items per output tile (a
+# persistent grid with ``S`` x more items fills the last wave); slice 0 writes ``dX_acc``, slice ``s >= 1``
+# writes slab ``s - 1`` of the FP32 workspace ``WS [S - 1, rows, H]`` (``ws_slab`` = elements between
+# slabs) and the host adds the slabs into ``dX_acc`` in fixed slab order (one RN add per element per
+# slab, no atomics).  A record registers a contiguous prefix of these; the slice count of a chunk is
+# chosen from its row count and the SM count (:func:`recommended_k_slices`).  ``WS`` of the other
+# GEMMs is an unused 16-float dummy (``ws_slab`` 0).
+DX_SLICE_STAGES = ("gemm_dx_s2", "gemm_dx_s3")
+K_SLICE_PENALTY = 0.01  # wave-efficiency score penalty per extra slab (the kernels' fitted per-slab cost share)
 # Accepted spellings of the same host value (kernel side -> host side).
 CONTRACT_ALIASES = {
     "num_rows": "T",
@@ -264,6 +275,46 @@ def record_abi(record: dict[str, Any]) -> str:
     if abi not in SUPPORTED_ABIS:
         raise NotImplementedError(f"unsupported host binding profile {abi!r}")
     return abi
+
+
+def dx_stage(k_slices: int) -> str:
+    """Stage name of the dX GEMM with ``k_slices`` K-slice work items per output tile."""
+    return "gemm_dx" if int(k_slices) == 1 else f"gemm_dx_s{int(k_slices)}"
+
+
+def dx_max_slices(stages) -> int:
+    """Largest slice count the registered stages serve (``1`` + the contiguous prefix of ``DX_SLICE_STAGES``)."""
+    count = 1
+    for stage in DX_SLICE_STAGES:
+        if stage not in stages:
+            break
+        count += 1
+    return count
+
+
+def wave_efficiency(rows_c: int, hidden: int, num_sms: int, k_slices: int, geometry: "Geometry") -> float:
+    """Fraction of the last persistent wave of the dX GEMM that carries work: ``items / (ceil(items / clusters) * clusters)``."""
+    clusters = max(1, int(num_sms) // geometry.cta_group)
+    items = (geometry.row_tiles(rows_c) // geometry.cta_group) * (int(hidden) // geometry.hidden_multiple) * int(k_slices)
+    return items / (-(-items // clusters) * clusters)
+
+
+def recommended_k_slices(rows_c: int, hidden: int, num_sms: int, max_slices: int, geometry: "Geometry") -> int:
+    """Slice count of the dX GEMM for a chunk of ``rows_c`` rows: the ``S`` in ``[1, max_slices]`` with the best
+    wave efficiency net of ``K_SLICE_PENALTY`` per extra slab.  Deterministic in the shapes and the SM count."""
+    best, best_score = 1, wave_efficiency(rows_c, hidden, num_sms, 1, geometry)
+    for s in range(2, max(1, int(max_slices)) + 1):
+        score = wave_efficiency(rows_c, hidden, num_sms, s, geometry) - K_SLICE_PENALTY * (s - 1)
+        if score > best_score + 1e-9:
+            best, best_score = s, score
+    return best
+
+
+def _dx_reduce(values: dict[str, Any]) -> None:
+    """Add the K-slice slabs into the chunk's rows of ``dX_acc`` in fixed slab order (host side, in place)."""
+    out, ws, rows_c, k = values["acc"], values["ws"], int(values["rows_c"]), int(values["k_slices"])
+    for slab in range(k - 1):
+        out.add_(ws[slab, :rows_c])
 
 
 def stages_for_entry(entry: str, *, need_dx: bool = True, need_dw: bool = True, grad_weight_dtype=torch.bfloat16) -> tuple[str, ...]:
@@ -447,6 +498,7 @@ class Plan:
     need_dx: bool
     need_dw: bool
     geometry: Geometry = DEFAULT_GEOMETRY
+    dx_slices: tuple[int, ...] = ()  # K-slice count of the dX GEMM per chunk (empty = one slice everywhere)
 
     @property
     def num_chunks(self) -> int:
@@ -456,11 +508,21 @@ class Plan:
     def num_tiles(self) -> int:
         return -(-self.problem.vocab // self.geometry.stats_tile)
 
+    def dx_slices_of(self, index: int) -> int:
+        return int(self.dx_slices[index]) if self.dx_slices else 1
+
+    @property
+    def dx_ws_slabs(self) -> int:
+        """FP32 ``[rows, H]`` slabs of the K-slice workspace the plan needs (largest slice count - 1)."""
+        return max((int(k) for k in self.dx_slices), default=1) - 1 if self.need_dx else 0
+
     @property
     def stages(self) -> tuple[str, ...]:
-        return stages_for_entry(
+        base = stages_for_entry(
             self.problem.entry, need_dx=self.need_dx, need_dw=self.need_dw, grad_weight_dtype=self.problem.grad_weight_dtype
         )
+        used = set(base) | ({dx_stage(k) for k in self.dx_slices} if self.need_dx else set())
+        return tuple(s for s in STAGES if s in used)
 
     @property
     def dw_cast_stage(self) -> str:
@@ -468,8 +530,15 @@ class Plan:
         return "scale_cast_f32" if fp32 else "scale_cast_bf16"
 
 
-def make_plan(problem: Problem, *, need_dx: bool, need_dw: bool, geometry: Geometry = DEFAULT_GEOMETRY) -> Plan:
-    return Plan(problem, plan_chunks(problem.num_rows, problem.chunk), bool(need_dx), bool(need_dw), geometry)
+def make_plan(
+    problem: Problem, *, need_dx: bool, need_dw: bool, geometry: Geometry = DEFAULT_GEOMETRY, dx_max_slices: int = 1, num_sms: int = 1
+) -> Plan:
+    """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count."""
+    chunks = plan_chunks(problem.num_rows, problem.chunk)
+    slices = ()
+    if need_dx and int(dx_max_slices) > 1:
+        slices = tuple(recommended_k_slices(rows_c, problem.hidden, num_sms, dx_max_slices, geometry) for _, rows_c in chunks)
+    return Plan(problem, chunks, bool(need_dx), bool(need_dw), geometry, slices)
 
 
 # ---------------------------------------------------------------------------
@@ -490,8 +559,13 @@ def workspace_layout(
     entry: str = "loss",
     tma_workspace_bytes: int = 0,
     scratch_bytes: int = 0,
+    dx_ws_slabs: int = 0,
+    hidden: int = 0,
 ) -> dict:
     """Byte ``(offset, size)`` of every workspace region plus ``"total"``.
+
+    ``dx_ws_slabs`` > 0 adds the FP32 ``dx_ws [slabs, min(T, C), H]`` slabs of
+    the K-sliced dX GEMM (``hidden`` = ``H``).
 
     The workspace holds the temporaries only the launches read: the
     vocabulary buffer ``logits`` (``min(T, C) x V`` BF16, ``z_c`` then ``dz_c``
@@ -514,6 +588,10 @@ def workspace_layout(
         ("loss_acc", 8),  # FP64 accumulator of the fixed-order loss sum
         ("grad_scale", 4),
     ]
+    if dx_ws_slabs:
+        if int(hidden) < 1:
+            raise ValueError("workspace_layout needs hidden > 0 for the K-slice workspace")
+        sizes.append(("dx_ws", int(dx_ws_slabs) * rows * int(hidden) * 4))
     if scratch_bytes:
         sizes.append(("workspace", int(scratch_bytes)))
     if tma_workspace_bytes:
@@ -550,6 +628,7 @@ def memory_report(
     x_copy: bool = False,
     tma_workspace_bytes: int = 0,
     scratch_bytes: int = 0,
+    dx_ws_slabs: int = 0,
 ) -> dict[str, Any]:
     """The reporting buckets of the memory rule (bytes).
 
@@ -568,6 +647,7 @@ def memory_report(
     layout = workspace_layout(
         num_rows, vocab, chunk, stats_tile=stats_tile, entry=entry,
         tma_workspace_bytes=tma_workspace_bytes, scratch_bytes=scratch_bytes,
+        dx_ws_slabs=dx_ws_slabs if need_dx else 0, hidden=hidden,
     )
     temporary = {name: size for name, (_, size) in ((k, v) for k, v in layout.items() if k != "total")}
     temporary["lse"] = int(num_rows) * 4
@@ -613,17 +693,31 @@ def lm_head_loss_workspace_size(
     *,
     entry: str = "loss",
     backend: str = "cake",
+    hidden: Optional[int] = None,
+    need_dx: bool = True,
 ) -> int:
-    """Workspace bytes :func:`prepare_lm_head_loss` needs for ``(T, V, C)`` on ``device``."""
+    """Workspace bytes :func:`prepare_lm_head_loss` needs for ``(T, V, C)`` on ``device`` (``hidden`` = ``H``;
+    defaults to the registered program's pinned hidden size)."""
     if backend == "reference":
         return int(workspace_layout(num_rows, vocab, chunk, entry=entry)["total"])
     name, record = record_for(device)
     stages = registered_stages(name)
     geometry = Geometry.from_record(record)
+    hidden = geometry.hidden if hidden is None else int(hidden)
+    slabs = 0
+    if need_dx and dx_max_slices(stages) > 1:
+        if hidden is None:
+            raise ValueError("lm_head_loss_workspace_size needs hidden= for a program with K-sliced dX stages")
+        num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+        slabs = max(
+            (recommended_k_slices(rows_c, hidden, num_sms, dx_max_slices(stages), geometry) for _, rows_c in plan_chunks(num_rows, chunk)),
+            default=1,
+        ) - 1
     return int(
         workspace_layout(
             num_rows, vocab, chunk, stats_tile=geometry.stats_tile, entry=entry,
             tma_workspace_bytes=_record_tma_bytes(record, stages), scratch_bytes=_record_scratch_bytes(record, stages),
+            dx_ws_slabs=slabs, hidden=hidden or 0,
         )["total"]
     )
 
@@ -807,7 +901,7 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
     p, g = plan.problem, plan.geometry
     values: dict[str, Any] = {name: t.get(name) for name in COMMON_TENSORS}
     values.update(T=int(p.num_rows), H=int(p.hidden), V=int(p.vocab), chunk=int(p.chunk), num_tiles=int(plan.num_tiles),
-                  mode=int(p.mode), loss_div=float(p.loss_div) if p.loss_div is not None else 1.0)
+                  mode=int(p.mode), loss_div=float(p.loss_div) if p.loss_div is not None else 1.0, ws_slab=0)
     if stage in ("scale_cast_bf16", "scale_cast_f32"):
         acc = t["dx_acc"] if index == "dx" else t["dw_acc"]
         out = t["dx_out"] if index == "dx" else t["dw_out"]
@@ -828,15 +922,22 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
     logits = t["logits"]
     dz_chunk = logits[:rows_c]
     if stage in ("gemm_logits", "gemm_logits_nostats"):
-        values.update(A=x_chunk, B=t["W"], C=logits, STATS_OUT=t["stats"], M=int(rows_c), m_tiles=g.row_tiles(rows_c), k_iters=1,
-                      first_chunk=0)
-    elif stage == "gemm_dx":
-        # every token chunk writes its own rows of dX_acc: the first K chunk of the GEMM always stores (first_chunk=1)
-        values.update(A=dz_chunk, B=t["W"], C=t["dx_acc"][row0:stop], STATS_OUT=t["stats"], M=int(rows_c),
-                      m_tiles=g.row_tiles(rows_c), k_iters=1, first_chunk=1)
+        values.update(A=x_chunk, B=t["W"], C=logits, STATS_OUT=t["stats"], WS=t["f32_dummy"], M=int(rows_c),
+                      m_tiles=g.row_tiles(rows_c), k_iters=1, first_chunk=0)
+    elif stage == "gemm_dx" or stage in DX_SLICE_STAGES:
+        # every token chunk writes its own rows of dX_acc: the first K chunk of the GEMM always stores (first_chunk=1);
+        # the K-sliced forms write slices >= 1 into the ``dx_ws`` slabs (added by ``dx_reduce`` afterwards)
+        k = plan.dx_slices_of(index)
+        if stage != dx_stage(k):
+            raise ValueError(f"chunk {index} plans {k} dX slice(s); stage {stage!r} was requested")
+        ws = t["dx_ws"] if k > 1 else t["f32_dummy"]
+        values.update(A=dz_chunk, B=t["W"], C=t["dx_acc"][row0:stop], STATS_OUT=t["stats"], WS=ws, M=int(rows_c),
+                      m_tiles=g.row_tiles(rows_c), k_iters=1, first_chunk=1, ws_slab=int(ws.stride(0)) if k > 1 else 0)
+    elif stage == "dx_reduce":  # host-side slab reduction of the K-sliced dX GEMM (no kernel of the program)
+        values.update(acc=t["dx_acc"][row0:stop], ws=t["dx_ws"], k_slices=plan.dx_slices_of(index))
     elif stage == "gemm_dw_acc":
-        values.update(A=dz_chunk, B=x_chunk, C=t["dw_acc"], STATS_OUT=t["stats"], M=int(p.vocab), m_tiles=g.row_tiles(p.vocab),
-                      k_iters=g.k_iters(rows_c), first_chunk=first)
+        values.update(A=dz_chunk, B=x_chunk, C=t["dw_acc"], STATS_OUT=t["stats"], WS=t["f32_dummy"], M=int(p.vocab),
+                      m_tiles=g.row_tiles(p.vocab), k_iters=g.k_iters(rows_c), first_chunk=first)
     elif stage == "row_finalize":
         d = t["d"]
 
@@ -865,10 +966,16 @@ def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
             if plan.need_dx or plan.need_dw:
                 keys.append(("row_grad", index))
             if plan.need_dx:
-                keys.append(("gemm_dx", index))
+                keys += _dx_keys(plan, index)
             if plan.need_dw:
                 keys.append(("gemm_dw_acc", index))
     return tuple(keys)
+
+
+def _dx_keys(plan: Plan, index: int) -> list:
+    """The dX GEMM of chunk ``index`` (its K-sliced form plus the host slab reduction when the plan slices it)."""
+    k = plan.dx_slices_of(index)
+    return [(dx_stage(k), index)] + ([("dx_reduce", index)] if k > 1 else [])
 
 
 def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
@@ -877,7 +984,7 @@ def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     for index in range(plan.num_chunks):
         keys += [("gemm_logits_nostats", index), ("row_grad", index)]
         if plan.need_dx:
-            keys.append(("gemm_dx", index))
+            keys += _dx_keys(plan, index)
         if plan.need_dw:
             keys.append(("gemm_dw_acc", index))
     return tuple(keys)
@@ -1010,6 +1117,12 @@ class ReferenceEngine:
     def gemm_dx(values: dict[str, Any]) -> None:
         values["C"].copy_(_mm_fp32(values["A"], values["B"]))
 
+    gemm_dx_s2 = gemm_dx_s3 = gemm_dx  # the reference path never slices K (one product per chunk)
+
+    @staticmethod
+    def dx_reduce(values: dict[str, Any]) -> None:
+        _dx_reduce(values)
+
     @staticmethod
     def gemm_dw_acc(values: dict[str, Any]) -> None:
         product = _mm_fp32(values["A"].t(), values["B"])
@@ -1119,7 +1232,10 @@ class LmHeadLossRunner:
             self.prepare_tma()
             with _ffi_stream_context(self.device_index):
                 for key in keys:
-                    self.launches[key]()
+                    if key[0] == "dx_reduce":
+                        _dx_reduce(self.values[key])
+                    else:
+                        self.launches[key]()
         else:
             for key in keys:
                 self.engine.run(key[0], self.values[key])
@@ -1180,6 +1296,8 @@ def _bind_all(record, module_name, keys, values, device) -> dict[Any, _Launch]:
     launches: dict[Any, _Launch] = {}
     for key in keys:
         stage = key[0]
+        if stage == "dx_reduce":  # host-side slab reduction, no kernel
+            continue
         physical = record[stage]
         grid = grid_dims(physical.get("grid", ["rows_c", 1, 1]), values[key], num_sms)
         cluster = physical.get("launch", {}).get("cluster")
@@ -1247,15 +1365,22 @@ def prepare_lm_head_loss(
     given = [t for t in (W, labels, infer_logp, loss_weights, dlogp, workspace_buffer, dx_acc, dw_acc, dx_out, dw_out, logp, lse) if t is not None]
     if not all(t.device == device for t in given):
         raise ValueError("Expected all tensors on one device")
-    plan = make_plan(problem, need_dx=need_dx, need_dw=need_dw, geometry=geometry)
     stages = registered_stages(module_name) if record is not None else tuple(STAGES)
+    num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count) if device.type == "cuda" else 1
+    plan = make_plan(
+        problem, need_dx=need_dx, need_dw=need_dw, geometry=geometry,
+        dx_max_slices=dx_max_slices(stages) if record is not None else 1, num_sms=num_sms,
+    )
     missing = [s for s in plan.stages if s not in stages]
     if missing:
         raise NotImplementedError(f"the registered program {module_name!r} lacks the stages {missing} (registered: {stages})")
     T, H, V, C = problem.num_rows, problem.hidden, problem.vocab, problem.chunk
     tma_bytes = _record_tma_bytes(record, stages) if record is not None else 0
     scratch_bytes = _record_scratch_bytes(record, stages) if record is not None else 0
-    layout = workspace_layout(T, V, C, stats_tile=geometry.stats_tile, entry=entry, tma_workspace_bytes=tma_bytes, scratch_bytes=scratch_bytes)
+    layout = workspace_layout(
+        T, V, C, stats_tile=geometry.stats_tile, entry=entry, tma_workspace_bytes=tma_bytes, scratch_bytes=scratch_bytes,
+        dx_ws_slabs=plan.dx_ws_slabs, hidden=H,
+    )
     if workspace_buffer is None:
         workspace_buffer = torch.empty(layout["total"], dtype=torch.uint8, device=device)
     flat = workspace_buffer.view(-1).view(torch.uint8)
@@ -1275,6 +1400,9 @@ def prepare_lm_head_loss(
     t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float64, (1,))
     t["grad_scale"] = _carve(flat, layout, "grad_scale", torch.float32, (1,))
     t["unit_scale"] = torch.ones((1,), dtype=torch.float32, device=device)  # the log-probability entry's cast scale
+    t["f32_dummy"] = torch.zeros((16,), dtype=torch.float32, device=device)  # unused ``WS`` of the unsliced GEMMs
+    if plan.dx_ws_slabs:
+        t["dx_ws"] = _carve(flat, layout, "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H))
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
     t["lse"] = output(lse, "lse", (T,), torch.float32)
@@ -1308,7 +1436,7 @@ def prepare_lm_head_loss(
     memory = memory_report(
         T, H, V, C, stats_tile=geometry.stats_tile, entry=entry, need_dx=plan.need_dx, need_dw=plan.need_dw,
         grad_weight_dtype=problem.grad_weight_dtype, return_logp=True, x_copy=problem.x_copy,
-        tma_workspace_bytes=tma_bytes, scratch_bytes=scratch_bytes,
+        tma_workspace_bytes=tma_bytes, scratch_bytes=scratch_bytes, dx_ws_slabs=plan.dx_ws_slabs,
     )
     if device.type == "cuda":
         device_index = int(device.index if device.index is not None else torch.cuda.current_device())
@@ -1406,12 +1534,18 @@ class _Binding:
         t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
         t["grad_scale"] = torch.ones((1,), dtype=torch.float32, device=self.device)
         t["unit_scale"] = torch.ones((1,), dtype=torch.float32, device=self.device)
+        t["f32_dummy"] = torch.zeros((16,), dtype=torch.float32, device=self.device)
+        if self.plan.dx_ws_slabs:
+            t["dx_ws"] = torch.empty((self.plan.dx_ws_slabs, rows, p.hidden), dtype=torch.float32, device=self.device)
         for name, tensor in self.owned.items():
             t[name] = tensor
 
     def _launch(self, keys: tuple, t: dict[str, Any]) -> None:
         with _ffi_stream_context(self.device_index):
             for key in keys:
+                if key[0] == "dx_reduce":
+                    _dx_reduce(stage_values("dx_reduce", t, self.plan, key[1]))
+                    continue
                 launch = self.launches[key]
                 arguments = launch.arguments_for(stage_values(key[0], t, self.plan, key[1]))
                 if launch.prepare is not None:  # descriptors of a pointer-ABI stage see the fresh tensors
