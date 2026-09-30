@@ -278,6 +278,12 @@ def test_prefill_tail_plan_and_trigger():
         prefill_tail_plan(256, 8)["block_n"] == 256
         and prefill_tail_plan(256, 8)["n_tiles"] == 28
     )
+    # Round-10 rule: every 256-wide instance stages the CTA's final item through a TMA store (``final_ts``, a
+    # separate kernel instance that binds the ``out`` tensor map beside the pointer); the 128-wide TP8 T=512
+    # instance keeps the direct stores.
+    assert plan["final_ts"] and tp1["final_ts"] and prefill_tail_plan(2048, 1)["final_ts"]
+    assert not n128["final_ts"]
+    assert cb.tail_gemm_final_ts(1024, 8) and not cb.tail_gemm_final_ts(512, 8)
     # Fused norm: TP1 T = 256 / 512 (single wave, K2 = 96 blocks); TP8 (K2 = 12) and multi-wave grids do not fuse.
     assert tp1["fused_norm"] and prefill_tail_plan(512, 1)["fused_norm"]
     assert not plan["fused_norm"] and not prefill_tail_plan(1024, 1)["fused_norm"]
@@ -309,20 +315,31 @@ def test_route_keys_cover_the_row_set():
         "front:i768",
         "front:i768e1",
     }
+    # Round-10 rule: the 256-wide tail GEMM instances carry the ``t1`` final-item staged-store suffix; the 128-wide
+    # TP8 T=512 instance keeps its round-7 key (the same program as before).
     assert {k for k in keys if k.startswith("tail_gemm:")} == {
-        "tail_gemm:tp1e0f0",
-        "tail_gemm:tp1e1f1",
-        "tail_gemm:tp1e1f1s6",
-        "tail_gemm:tp8e0f0",
+        "tail_gemm:tp1e0f0t1",
+        "tail_gemm:tp1e1f1t1",
+        "tail_gemm:tp1e1f1s6t1",
+        "tail_gemm:tp8e0f0t1",
         "tail_gemm:tp8e0f0s9n128",
-        "tail_gemm:tp8e1f0",
+        "tail_gemm:tp8e1f0t1",
     }
+    assert (
+        cb.tail_gemm_kernel_key(8, False, False, 9, 128, False)
+        == "tail_gemm:tp8e0f0s9n128"
+    )
+    assert cb.tail_gemm_kernel_key(1, True, True, 6, 256, True) == "tail_gemm:tp1e1f1s6t1"
+    assert cb.tail_gemm_kernel_key(8, True) == "tail_gemm:tp8e1f0"
     assert route_kernel_keys("front", 1, 128)[0].startswith("decode:")
     # Round-8 lever 13b: T <= 512 (<= 2 pair rows per weight column) takes the evict_first front instance.
     assert route_kernel_keys("front", 1, 256) == ("front:i6144e1",)
     assert route_kernel_keys("front", 8, 512) == ("front:i768e1",)
     assert route_kernel_keys("front", 1, 1024) == ("front:i6144",)
-    assert route_kernel_keys("tail", 8, 256) == ("tail_norm:e1", "tail_gemm:tp8e1f0")
+    assert route_kernel_keys("tail", 8, 256) == (
+        "tail_norm:e1",
+        "tail_gemm:tp8e1f0t1",
+    )
     # Round-7 N128 rule: TP8 T=512 takes the 128-wide pair tile (56 column tiles, 224 CTAs, 9-deep ring); its
     # multi-wave grid drops the evict_first weight policy and fires the norm trigger early, so the late-trigger norm
     # instance (``tail_norm:e0``) leaves the production route set.
@@ -330,20 +347,20 @@ def test_route_keys_cover_the_row_set():
         "tail_norm:e1",
         "tail_gemm:tp8e0f0s9n128",
     )
-    assert (
-        cb.tail_gemm_config(512, 8) == (9, 128) and cb.tail_gemm_block_n(512, 1) == 256
-    )
+    assert cb.tail_gemm_config(512, 8) == (9, 128, False)
+    assert cb.tail_gemm_config(512, 1) == (7, 256, True)
+    assert cb.tail_gemm_block_n(512, 1) == 256
     assert cb.tail_gemm_block_n(1024, 8) == 256 and cb.tail_gemm_num_stages(512, 8) == 9
     assert "tail_norm:e0" not in keys
     # TP1 single-wave rows fuse the norm into the GEMM launch (no tail_norm kernel); the T <= 256 row
     # takes the 6-deep ring instance (round-6 rule), T = 512 the default 7-deep ring.
-    assert route_kernel_keys("tail", 1, 256) == ("tail_gemm:tp1e1f1s6",)
+    assert route_kernel_keys("tail", 1, 256) == ("tail_gemm:tp1e1f1s6t1",)
     assert cb.tail_gemm_num_stages(256, 1) == 6 and cb.tail_gemm_num_stages(512, 1) == 7
     assert cb.tail_gemm_num_stages(256, 8) == 7
     # Single-wave grids (T = 256 / 512) stream the weights evict_first; persistent grids keep the default policy.
-    assert route_kernel_keys("tail", 1, 512) == ("tail_gemm:tp1e1f1",)
-    assert route_kernel_keys("tail", 1, 1024)[1] == "tail_gemm:tp1e0f0"
-    assert route_kernel_keys("tail", 8, 1024)[1] == "tail_gemm:tp8e0f0"
+    assert route_kernel_keys("tail", 1, 512) == ("tail_gemm:tp1e1f1t1",)
+    assert route_kernel_keys("tail", 1, 1024)[1] == "tail_gemm:tp1e0f0t1"
+    assert route_kernel_keys("tail", 8, 1024)[1] == "tail_gemm:tp8e0f0t1"
     assert len(route_kernel_keys("tail", 1, 16384)) == 2
     for stage in ("front", "tail"):
         for tp in SUPPORTED_TP:
