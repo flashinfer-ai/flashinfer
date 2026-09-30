@@ -813,7 +813,11 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
         out = t["dx_out"] if index == "dx" else t["dw_out"]
         if acc.numel() != out.numel() or acc.numel() % g.cast_vec:
             raise ValueError("scale-cast operands must match in size and hold whole vectors")
-        values.update(acc=acc.reshape(-1), g=t["grad_scale"], out=out.reshape(-1), num_vecs=int(acc.numel() // g.cast_vec),
+        # loss entry: the backward writes the incoming scalar gradient into the ``grad_scale`` workspace cell;
+        # log-probability entry: the scale is the constant 1, held outside the workspace (a caller may poison
+        # the workspace between steps; ``dlogp`` carries the gradient)
+        scale = t["grad_scale"] if p.entry == "loss" else t["unit_scale"]
+        values.update(acc=acc.reshape(-1), g=scale, out=out.reshape(-1), num_vecs=int(acc.numel() // g.cast_vec),
                       rows_c=0, row0=0, first_chunk=0, last_chunk=0, d_off=0)
         return values
     row0, rows_c = plan.chunks[index]
@@ -1138,7 +1142,7 @@ class LmHeadLossRunner:
         if self.problem.entry == "logprob":
             if grad is not None:
                 raise ValueError("the log-probability runner takes its gradient from the bound dlogp tensor")
-            # the cast scale of this entry is the constant 1, written once at prepare time
+            # the cast scale of this entry is the constant 1 (``unit_scale``, outside the workspace)
         elif grad is None:
             t["grad_scale"].fill_(1.0)
         else:
@@ -1270,7 +1274,7 @@ def prepare_lm_head_loss(
     t["term"] = _carve(flat, layout, "term", torch.float32, (rows,))
     t["loss_acc"] = _carve(flat, layout, "loss_acc", torch.float64, (1,))
     t["grad_scale"] = _carve(flat, layout, "grad_scale", torch.float32, (1,))
-    t["grad_scale"].fill_(1.0)  # the log-probability entry's cast scale; the loss entry's backward rewrites it
+    t["unit_scale"] = torch.ones((1,), dtype=torch.float32, device=device)  # the log-probability entry's cast scale
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
     t["lse"] = output(lse, "lse", (T,), torch.float32)
@@ -1401,6 +1405,7 @@ class _Binding:
         t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
         t["loss"] = torch.empty((1,), dtype=torch.float32, device=self.device)
         t["grad_scale"] = torch.ones((1,), dtype=torch.float32, device=self.device)
+        t["unit_scale"] = torch.ones((1,), dtype=torch.float32, device=self.device)
         for name, tensor in self.owned.items():
             t[name] = tensor
 
