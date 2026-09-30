@@ -281,7 +281,9 @@ def test_prefill_tail_plan_and_trigger():
     # Round-10 rule: every 256-wide instance stages the CTA's final item through a TMA store (``final_ts``, a
     # separate kernel instance that binds the ``out`` tensor map beside the pointer); the 128-wide TP8 T=512
     # instance keeps the direct stores.
-    assert plan["final_ts"] and tp1["final_ts"] and prefill_tail_plan(2048, 1)["final_ts"]
+    assert (
+        plan["final_ts"] and tp1["final_ts"] and prefill_tail_plan(2048, 1)["final_ts"]
+    )
     assert not n128["final_ts"]
     assert cb.tail_gemm_final_ts(1024, 8) and not cb.tail_gemm_final_ts(512, 8)
     # Fused norm: TP1 T = 256 / 512 (single wave, K2 = 96 blocks); TP8 (K2 = 12) and multi-wave grids do not fuse.
@@ -329,7 +331,9 @@ def test_route_keys_cover_the_row_set():
         cb.tail_gemm_kernel_key(8, False, False, 9, 128, False)
         == "tail_gemm:tp8e0f0s9n128"
     )
-    assert cb.tail_gemm_kernel_key(1, True, True, 6, 256, True) == "tail_gemm:tp1e1f1s6t1"
+    assert (
+        cb.tail_gemm_kernel_key(1, True, True, 6, 256, True) == "tail_gemm:tp1e1f1s6t1"
+    )
     assert cb.tail_gemm_kernel_key(8, True) == "tail_gemm:tp8e1f0"
     assert route_kernel_keys("front", 1, 128)[0].startswith("decode:")
     # Round-8 lever 13b: T <= 512 (<= 2 pair rows per weight column) takes the evict_first front instance.
