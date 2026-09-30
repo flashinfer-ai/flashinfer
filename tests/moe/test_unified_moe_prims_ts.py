@@ -614,13 +614,16 @@ class TestPrimsTsUnifiedGpu:
                 device=device,
             )
         if quant.pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
-            assert not torch.equal(
-                prims_view["gemm1_weights"].view(torch.uint8),
-                trtllm_view["gemm1_weights"].view(torch.uint8),
-            )
-            torch.testing.assert_close(
-                prims_view["gemm1_weights_scale"], trtllm_view["gemm1_weights_scale"]
-            )
+            # Both GEMM payloads are shuffled; both block scales stay TRT-LLM.
+            for name in ("gemm1", "gemm2"):
+                assert not torch.equal(
+                    prims_view[f"{name}_weights"].view(torch.uint8),
+                    trtllm_view[f"{name}_weights"].view(torch.uint8),
+                )
+                torch.testing.assert_close(
+                    prims_view[f"{name}_weights_scale"],
+                    trtllm_view[f"{name}_weights_scale"],
+                )
         else:
             assert prims_view.keys() == trtllm_view.keys()
             for key, tensor in prims_view.items():
