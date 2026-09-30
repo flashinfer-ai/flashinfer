@@ -211,6 +211,62 @@ def test_autotuner_gemm_cross_bucket_m(backend):
     assert stored_profile is not None
 
 
+@pytest.mark.parametrize("backend", ["cudnn", "cublas"])
+def test_autotuner_gemm_tuned_under_bucket_override_is_reused_after_it(backend):
+    """Tune under ``autotune(tuning_buckets=...)``, then look up without the override.
+
+    Frameworks tune inside a ``tuning_buckets`` override and serve outside it. The
+    effective bucket mapper is a new object under an override, so a runner that
+    stored it as an instance attribute hashed differently after tuning: its
+    in-process winner was never found again and the op fell back to tactic -1.
+    The override buckets here equal the default power-of-two buckets, so the
+    profile keys match and only runner identity is under test.
+    """
+    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    cc = compute_capability[0] * 10 + compute_capability[1]
+    if not bmm_fp8.is_compute_capability_supported(cc):
+        pytest.skip(f"bmm_fp8 not supported on sm{cc}.")
+    if not bmm_fp8.is_backend_supported(backend, cc):
+        pytest.skip(f"{backend} backend not supported on sm{cc}.")
+
+    autotuner = AutoTuner.get()
+    autotuner.clear_cache()
+
+    input_dtype = torch.float8_e4m3fn
+    res_dtype = torch.bfloat16
+    b, m, n, k = 1, 64, 256, 512
+    inp = torch.randn([b, m, k], device="cuda", dtype=torch.bfloat16)
+    a8, a_s = to_float8(inp, dtype=input_dtype)
+    mat2 = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
+    b8, b_s = to_float8(mat2, dtype=input_dtype)
+
+    with autotune(tune_mode=True, tuning_buckets=(1, 2, 4, 8, 16, 32, 64)):
+        res = bmm_fp8(a8, b8, a_s, b_s, res_dtype, backend=backend)
+
+    # Outside the override, as a serving framework runs: build the runner anew.
+    runner = (
+        _cudnn_gemm_fp8_runner()
+        if backend == "cudnn"
+        else get_gemm_module().cublas_fp8_gemm_runner()
+    )
+    workspace_buffer = _get_cache_buf(
+        "bmm_fp8_workspace", DEFAULT_WORKSPACE_SIZE, a8.device
+    )
+    inputs = [a8, b8, a_s, b_s, res, workspace_buffer]
+    is_cache_hit, _, tactic, _ = autotuner.search_cache(
+        "fp8_gemm",
+        [runner],
+        tuple(t.shape for t in inputs),
+        _FP8_GEMM_SM100_TUNING_CONFIG,
+        inputs=inputs,
+    )
+    assert is_cache_hit
+    if backend == "cudnn":
+        _assert_engine_knob_tactic(tactic)
+    else:
+        assert tactic >= 0
+
+
 def test_bmm_fp8_heuristic_gates_cudnn_on_sm12x_without_override_shape(monkeypatch):
     """On SM12x, cuDNN must be excluded from the ``auto`` candidate list when
     ``override_shape`` is unavailable (cuDNN backend < 9.23.1): the cuDNN FP8
