@@ -4400,6 +4400,7 @@ def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
         (torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16),
         (torch.bfloat16, torch.uint8, torch.bfloat16),
         (torch.float8_e4m3fn, torch.uint8, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.uint8, torch.bfloat16),
     ),
 )
 def test_attention_ts_mixed_dtype_contract(q_dtype, kv_dtype, out_dtype):
