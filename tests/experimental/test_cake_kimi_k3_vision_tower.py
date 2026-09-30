@@ -359,6 +359,8 @@ def test_select_tile_config_buckets():
         ("norm_gelu", 2552, "m_e8_h"),
         ("residual_wo_sqxw", 2552, "s_e8_pf_h"),
         ("residual_wo_sqxw", 19136, "m_tma1_h"),
+        ("residual_wo_sqxw", 8192, "m_tma1"),  # HALF_MIN_ROUNDS: 4 rounds
+        ("residual_wo_sqxw", 12288, "m_tma1_h"),  # 6 rounds
         ("residual_wo_sqxw", 10764, "m_tma1"),
         ("residual_wo_sqxw", 4144, "s_e8_pf"),
         ("norm_qkv_rope", 4144, "l_e8_cs_h"),
@@ -420,6 +422,10 @@ def test_select_tile_config_buckets():
         ("norm_gelu", "xs"),
         ("norm_qkv_rope", "xs_cs_pf"),
     }
+    # m_tma1_h needs >= 6 persistent rounds (8192 = 4 rounds regressed the batch8_448 tower row on B200); 12288 keeps it.
+    assert cb.HALF_MIN_ROUNDS == {"m_tma1": 6}
+    assert select_tile_config("residual_wo_sqxw", 8192).name == "m_tma1"
+    assert select_tile_config("residual_wo_sqxw", 12288).name == "m_tma1_h"
     assert not any(
         select_tile_config(variant, m).name in ("xs_h", "xs_cs_pf_h")
         for variant in ("gelu_erf", "norm_gelu", "norm_qkv_rope")
@@ -835,7 +841,7 @@ CONTRACT_ROW_GEMM_KEYS = {
         (
             "s_e8_pf",
             "l_e8_cs:pdle",
-            "m_tma1_h:pdle",
+            "m_tma1:pdle",
             "l_e8:pdle",
             "l_e8_pf:pdle",
             "l_e8_pf:pdle",

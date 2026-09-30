@@ -1193,6 +1193,10 @@ HALF_MAX_ROUNDS = 24
 HALF_ROUTE_EXCLUDE = frozenset(
     {("gelu_erf", "xs"), ("norm_gelu", "xs"), ("norm_qkv_rope", "xs_cs_pf")}
 )
+# Per-config minimum round count (Cake ``HALF_MIN_ROUNDS``): the TMA-epilogue twin m_tma1_h at the out-proj 8192 point
+# (4 rounds, tail 34 / 74) wins per kernel but costs the batch8_448 tower row 0.13 % on B200; 12288 (6 rounds) and the
+# 16508 .. 43056 points keep it.
+HALF_MIN_ROUNDS = {"m_tma1": 6}
 
 
 def half_tail_split(cluster_tiles: int, clusters: int) -> int:
@@ -1212,7 +1216,8 @@ def _half_twin(name: str, n_total: int, M: int, sm_count: int, variant: str) -> 
     m_tiles += m_tiles % cfg.cta_group
     tiles = (m_tiles // cfg.cta_group) * (n_total // cfg.acc_n)
     clusters = min(tiles, int(sm_count) // cfg.cluster_x)
-    if -(-tiles // clusters) > HALF_MAX_ROUNDS:
+    rounds = -(-tiles // clusters)
+    if rounds > HALF_MAX_ROUNDS or rounds < HALF_MIN_ROUNDS.get(name, 0):
         return name
     return HALF_TWIN[name] if half_tail_split(tiles, clusters) else name
 
