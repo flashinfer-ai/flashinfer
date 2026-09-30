@@ -95,7 +95,7 @@ def _device_supported() -> bool:
 
 def _require_program(*, backward: bool = False):
     if not _device_supported():
-        pytest.skip("requires a compute capability 10.0 / 10.3 device")
+        pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
     if not generated_program_available(torch.device("cuda"), backward=backward):
         pytest.skip(
             "generated DSA training program"

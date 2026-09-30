@@ -21,7 +21,12 @@ from pathlib import Path
 from typing import Any
 
 from ...jit import env as jit_env
-from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from ...jit.core import (
+    gen_jit_spec,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
+)
 
 # Explicit target-owned registration of the generated training programs.  One
 # record per architecture.  A record carries ``arch``, the host binding
@@ -551,12 +556,23 @@ BACKWARD_STAGES = (
 ARCH_NVCC_FLAGS = {
     "sm_100a": sm100a_nvcc_flags,
     "sm_103a": sm103a_nvcc_flags,
+    "sm_107a": sm107a_nvcc_flags,
 }
 
 
 def toolchain_supports(arch: str) -> bool:
-    """Can the nvcc this checkout invokes emit ``arch``?  (SM100 / SM103 only.)"""
-    return arch in ARCH_NVCC_FLAGS
+    """Can the nvcc this checkout invokes emit ``arch``?
+
+    SM100 / SM103 compile with any CUDA 12.8+ toolkit; ``sm_107a`` needs an nvcc that
+    lists ``compute_107`` (public CUDA 13.x toolkits do not), so it is probed once.
+    """
+    if arch not in ARCH_NVCC_FLAGS:
+        return False
+    if arch == "sm_107a":
+        from ...compilation_context import _nvcc_supports_sm107
+
+        return _nvcc_supports_sm107()
+    return True
 
 
 def select_module(arch: str) -> str:

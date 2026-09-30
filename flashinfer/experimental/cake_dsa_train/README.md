@@ -1,4 +1,4 @@
-# Cake DSA sparse-attention training backend (SM100 / SM103)
+# Cake DSA sparse-attention training backend (SM100 / SM103 / SM107)
 
 Experimental backend for the native 64-query-head DeepSeek Sparse Attention
 training kernels (top-k sparse MLA with absorbed queries; GLM-5.2 geometry:
@@ -6,8 +6,10 @@ training kernels (top-k sparse MLA with absorbed queries; GLM-5.2 geometry:
 top-k 2048).  Tracking issue: flashinfer-ai/flashinfer#5657.
 
 Both the API and the backend are experimental: no compatibility guarantee,
-SM100 (B200 / GB200) is the acceptance architecture and SM103 (B300 / GB300)
-is compiled from the same sources.  The feature is JIT-only and does not
+SM100 (B200 / GB200) is the acceptance architecture of the native kernels and
+SM103 (B300 / GB300) is compiled from the same sources; SM107 (Rubin R200) is the
+acceptance architecture of the packed / strided-layout extension (flashinfer-ai/flashinfer#5675)
+and is compiled from the same sources with an nvcc that emits `compute_107a`.  The feature is JIT-only and does not
 participate in automatic backend selection, autotuning or trace-apply.
 
 ## Public entry points (`flashinfer/dsa_sparse_attention.py`)
@@ -143,7 +145,7 @@ pass stages serves the single pass only.
 
 ## Status
 
-The registry holds one record per architecture (`sm_100a`, `sm_103a`) with the
+The registry holds one record per architecture (`sm_100a`, `sm_103a`, `sm_107a`) with the
 forward, backward preprocess, backward main (single-pass and key-range-pass
 form with its compaction) and cast stages plus the key-range-pass policy,
 exported from the kernel snapshot named in the pull request.  The host
@@ -153,5 +155,5 @@ forward-only FlashMLA-derived prefill program used to exercise the export
 pipeline; it produces no output residual, so backward is unavailable with it).
 
 Tests: `tests/experimental/test_cake_dsa_train.py` (skips without a registered
-program or a compute capability 10.0 / 10.3 device).  Benchmark:
+program or a compute capability 10.0 / 10.3 / 10.7 device).  Benchmark:
 `benchmarks/bench_cake_dsa_train.py`.

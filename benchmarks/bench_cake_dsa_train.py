@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Benchmark the experimental Cake DSA sparse-attention training kernels (SM100 / SM103).
+"""Benchmark the experimental Cake DSA sparse-attention training kernels (SM100 / SM103 / SM107).
 
 Times the forward, the backward and the whole training step (forward +
 backward, wrapper-inclusive) of ``flashinfer.experimental.cake_dsa_train`` on

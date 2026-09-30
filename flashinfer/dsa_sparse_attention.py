@@ -24,7 +24,7 @@ from .api_logging import flashinfer_experimental_api
 # workspace, launch binding, autograd wrapper and JIT registration live in
 # flashinfer.experimental.cake_dsa_train.
 
-_FEATURE = "DSA sparse-attention training (64 query heads, SM100/SM103)"
+_FEATURE = "DSA sparse-attention training (64 query heads, SM100/SM103/SM107)"
 
 
 def _backend(backend: str):
@@ -52,7 +52,7 @@ def dsa_sparse_attention(
     backend: str = "cake",
 ):
     r"""Differentiable top-k sparse MLA attention with absorbed queries (DeepSeek
-    Sparse Attention) for training, 64 query heads, SM100 / SM103 only.
+    Sparse Attention) for training, 64 query heads, SM100 / SM103 / SM107 only.
 
     ``O = softmax(softmax_scale * (q_rope . k_rope^T + q_latent . kv_latent^T)) . kv_latent``
     over the keys a row's ``indices`` select (K = V = the latent).

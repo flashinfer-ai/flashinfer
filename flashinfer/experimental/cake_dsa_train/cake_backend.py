@@ -86,7 +86,11 @@ D_ROPE = 64
 D_QK = D_LATENT + D_ROPE
 LOG2E = 1.4426950408889634
 WORKSPACE_ALIGN = 256
-SUPPORTED_COMPUTE_CAPABILITIES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+SUPPORTED_COMPUTE_CAPABILITIES = {
+    (10, 0): "sm_100a",
+    (10, 3): "sm_103a",
+    (10, 7): "sm_107a",
+}
 
 # Host binding profiles.  ``ABI_CONTRACT`` is the keyword set of the native
 # training kernels (the names below are what the host provides; a kernel's
@@ -340,7 +344,7 @@ def record_for(device: Optional[torch.device] = None) -> tuple[str, dict[str, An
     arch = arch_for(device)
     if arch is None:
         raise ValueError(
-            "DSA sparse-attention training requires compute capability 10.0 or 10.3"
+            "DSA sparse-attention training requires compute capability 10.0, 10.3 or 10.7"
         )
     name = select_module(arch)
     return name, MODULES[name]
