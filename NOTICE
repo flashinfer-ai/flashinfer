@@ -9,3 +9,6 @@ See licenses/ for text of these licenses.
 
 The persistent CuTe DSL KDA kernels are adapted from humanfia/kda-for-kda-release,
 Copyright (c) 2026 KDA Team, under the MIT License (licenses/LICENSE.kda-for-kda).
+
+The static PTX KDA kernels are adapted from NVlabs/kda (260927-kda-for-kda),
+Copyright (c) 2026 KDA Team, under the MIT License (LICENSE.kda-for-kda.txt).
