@@ -25,6 +25,16 @@ urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
 license-files = ["LICENSE", "LICENSE*.txt"]
 
 [project.optional-dependencies]
+b12x = [
+  "torch>=2.12.0",
+  "nvidia-cutlass-dsl==4.7.1",
+  "nvidia-cutlass-dsl-libs-base==4.7.1",
+  "nvidia-cutlass-dsl-libs-core==4.7.1",
+  "nvidia-cutlass-dsl-libs-cu12==4.7.1",
+  "nvidia-cutlass-dsl-libs-cu13==4.7.1",
+  "rich>=13",
+  "safetensors>=0.6",
+]
 # Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
 cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
@@ -42,6 +52,9 @@ nvep = []
 
 [project.scripts]
 flashinfer = "flashinfer.__main__:cli"
+
+[project.entry-points."vllm.general_plugins"]
+b12x_loader = "b12x._vllm_plugins:register_loader"
 
 [build-system]
 requires = ["setuptools>=77", "packaging>=24", "apache-tvm-ffi>=0.1.11,<0.2"]
@@ -61,17 +74,20 @@ version = { attr = "flashinfer._build_meta.__version__" }
 dependencies = { file = ["requirements.txt"] }
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["flashinfer*"]
-exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*"]
+where = [".", "flashinfer/experimental/b12x/_compat"]
+include = ["flashinfer*", "b12x"]
+exclude = ["flashinfer-jit-cache*", "flashinfer-cubin*", "flashinfer.experimental.b12x._compat*"]
 
 [tool.setuptools.package-dir]
+"b12x" = "flashinfer/experimental/b12x/_compat/b12x"
 "flashinfer.data" = "."
 "flashinfer.data.cutlass" = "3rdparty/cutlass"
 "flashinfer.data.spdlog" = "3rdparty/spdlog"
 "flashinfer.data.cccl" = "3rdparty/cccl"
 
 [tool.setuptools.package-data]
+"flashinfer.experimental.b12x.comm.roce" = ["*.c"]
+"flashinfer.experimental.b12x.loader" = ["*.c", "*.h"]
 "flashinfer.experimental.nvfp4_attention" = ["csrc/**"]
 "flashinfer" = ["_build_meta.py"]
 "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe" = ["*.md"]
