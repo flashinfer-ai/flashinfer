@@ -351,6 +351,107 @@ def test_paged_prefill_default_scale_layout_lse(layout, lse_base, explicit_metad
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+@pytest.mark.parametrize("force_legacy", [False, True])
+@pytest.mark.parametrize("length_device", ["cpu", "cuda"])
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+def test_paged_replan_stages_lengths_without_device_to_host(
+    monkeypatch, use_cuda_graph, force_legacy, length_device, length_dtype
+):
+    if force_legacy:
+        for module in (flashinfer.prefill, prefill):
+            monkeypatch.setattr(
+                module, "_cudnn_supports_direct_seqlens", lambda *a, **k: False
+            )
+    q, k, v, qo, ip, ix, last = _paged_inputs()
+    last = last + 4
+    ix_gpu = ix.to(q.device)
+    buffers = {}
+    if use_cuda_graph:
+        buffers = dict(
+            use_cuda_graph=True,
+            qo_indptr_buf=qo.to(q.device),
+            paged_kv_indptr_buf=ip.to(q.device),
+            paged_kv_indices_buf=ix_gpu.clone(),
+            paged_kv_last_page_len_buf=last.to(q.device),
+        )
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, dtype=torch.uint8, device=q.device),
+        "NHD",
+        backend="cudnn",
+        **buffers,
+    )
+    table = torch.tensor([[3, 0, 4], [2, 1, 0]], device=q.device, dtype=torch.int32)
+    original_cpu = torch.Tensor.cpu
+
+    def checked_cpu(tensor, *args, **kwargs):
+        if tensor.is_cuda:
+            pytest.fail("plan copied device sequence lengths to CPU")
+        return original_cpu(tensor, *args, **kwargs)
+
+    graph = None
+    for step in range(2):
+        if step:
+            qo = torch.tensor([0, 2, 5], dtype=torch.int32)
+            last = last - 2
+        # Strided integer sources also have to be copied into the owned,
+        # contiguous int32 metadata, without staging device data through CPU.
+        q_lengths = torch.tensor(
+            [[2 if step else 3, 0], [3 if step else 2, 0]],
+            device=length_device,
+            dtype=length_dtype,
+        )[:, 0]
+        kv_lengths = torch.tensor(
+            [[35 if step else 37, 0], [19 if step else 21, 0]],
+            device=length_device,
+            dtype=length_dtype,
+        )[:, 0]
+        previous_sync_mode = torch.cuda.get_sync_debug_mode()
+        try:
+            torch.cuda.set_sync_debug_mode("error")
+            with monkeypatch.context() as guarded:
+                guarded.setattr(torch.Tensor, "cpu", checked_cpu)
+                w.plan(
+                    qo,
+                    ip,
+                    ix_gpu,
+                    last,
+                    8,
+                    2,
+                    128,
+                    16,
+                    causal=True,
+                    q_data_type=q.dtype,
+                    seq_lens=kv_lengths,
+                    seq_lens_q=q_lengths,
+                    block_tables=table,
+                    max_token_per_sequence=3,
+                    max_sequence_kv=48,
+                )
+        finally:
+            torch.cuda.set_sync_debug_mode(previous_sync_mode)
+        if force_legacy:
+            assert w._cudnn_plan is None
+        # The plan must retain its own snapshot, not borrow these inputs.
+        torch.cuda.synchronize()
+        q_lengths.zero_()
+        kv_lengths.zero_()
+        if graph is None:
+            out, lse = w.run(q, (k, v), return_lse=True, lse_base="ln")
+        else:
+            out.fill_(torch.nan)
+            lse.fill_(torch.nan)
+            graph.replay()
+        ref, stats = _reference(q, k, v, qo, ip, ix, last, causal=True, scale=128**-0.5)
+        torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+        torch.testing.assert_close(lse, stats, atol=0.003, rtol=0.003)
+        if not step and use_cuda_graph:
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                w.run(q, (k, v), out=out, lse=lse, return_lse=True, lse_base="ln")
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 def test_decode_capture_replan_keeps_metadata_alive():
     q, k, v, _, ip, ix, last = _paged_inputs()
     q = q[:2].contiguous()
