@@ -55,6 +55,25 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   arbitrary downstream losses; its forward saves only the FP32 row statistics
   (`lse` and the selected logit) and the backward recomputes each chunk's
   logits from the saved inputs (four GEMMs per chunk).
+* Valid-row compaction (`compact_rows`, default on unless
+  `FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS=0`): when some labels are `-100`
+  the chunk loop runs over the valid rows only.  The int64 row index
+  `(labels >= 0).nonzero()` is formed once per call (one device
+  synchronization for the count, one for the index), every chunk gathers its
+  rows of `X` into one reusable BF16 `[chunk_size, H]` buffer (`x_c`, a
+  workspace region; a strided `X` then needs no contiguous copy), the row
+  operands (`labels`, `infer_logp`, `loss_weights`, `dlogp`) are compacted to
+  `[T_v]`, the FP32 `dX` accumulator is `[T_v, H]`, and `logp` / `dX` are
+  scattered back to `[T]` / `[T, H]` with exact zeros on the ignored rows.
+  Ignored rows contribute exactly zero to the loss and both gradients, so this
+  is the same computation over fewer rows: per row, `logp` / `lse` are bitwise
+  those of the uncompacted path, `dX` rows too whenever the containing chunk's
+  K-slice count agrees; `loss` and `dW` are fixed-order reductions over
+  different chunk boundaries and differ by FP32 rounding (deterministic run to
+  run).  All rows valid: the uncompacted path (no gather, no scatter).  Every
+  row ignored: zeros without a launch.  The prepared runner
+  (`prepare_lm_head_loss(..., compact_rows=True)`) fixes the valid-row set at
+  preparation and returns the compact forms (`runner.scatter` restores `[T]`).
 * Memory rule: no logits, probability or `dlogits` buffer ever spans more than
   `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
@@ -85,7 +104,10 @@ any device (the host-layer tests use it); the public API accepts
 
 ## Kernel structure of one token chunk
 
-Per chunk of `rows_c <= chunk_size` rows the host launches, in this order:
+Per chunk of `rows_c <= chunk_size` rows the host launches, in this order
+(a compacted plan first gathers the chunk's valid rows of `X` into the `x_c`
+workspace buffer with a torch `index_select`, `gather_rows`; the row operands
+are gathered once per step):
 
 * `gemm_logits`: `z_c = bf16(X_c @ W^T)` (2-CTA tensor-core GEMM, 128-row
   tiles, 256 vocabulary columns per accumulator) together with the

@@ -42,6 +42,7 @@ def chunked_lm_head_loss(
     grad_weight_dtype: torch.dtype = torch.bfloat16,
     deterministic: bool = True,
     backend: str = "cake",
+    compact_rows: Optional[bool] = None,
 ):
     r"""Differentiable chunked LM-head projection + loss with a memory-bounded
     backward, SM100 / SM103 only.
@@ -99,6 +100,17 @@ def chunked_lm_head_loss(
         bitwise reproducible ``loss``, ``logp``, ``dX`` and ``dW``.
     backend : str
         Only ``"cake"``.
+    compact_rows : bool, optional
+        Chunk over the valid rows only (rows whose label is not ``-100``):
+        the valid-row index is formed once per call, each chunk's rows of
+        ``X`` are gathered into one reusable ``[chunk_size, H]`` buffer and
+        ``logp`` / ``dX`` are scattered back with exact zeros on the ignored
+        rows -- the same computation over fewer rows (per-row ``logp`` is
+        bitwise that of the uncompacted path; the ``loss`` / ``dW`` reductions
+        run over different chunk boundaries and differ by FP32 rounding).
+        ``None`` (default) reads ``FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS``
+        (on unless set to ``0``).  Compaction costs two device
+        synchronizations per call.
 
     Returns
     -------
@@ -141,6 +153,7 @@ def chunked_lm_head_loss(
         grad_weight_dtype=grad_weight_dtype,
         deterministic=deterministic,
         backend="cake",
+        compact_rows=compact_rows,
     )
 
 
@@ -153,6 +166,7 @@ def chunked_lm_head_logprob(
     chunk_size: int = 4096,
     deterministic: bool = True,
     backend: str = "cake",
+    compact_rows: Optional[bool] = None,
 ) -> torch.Tensor:
     r"""Differentiable chunked selected-token log-probability, SM100 / SM103 only.
 
@@ -176,4 +190,5 @@ def chunked_lm_head_logprob(
         chunk_size=chunk_size,
         deterministic=deterministic,
         backend="cake",
+        compact_rows=compact_rows,
     )

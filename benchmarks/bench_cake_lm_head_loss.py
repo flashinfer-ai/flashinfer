@@ -407,7 +407,8 @@ class ArmCake(ArmAutograd):
         self.abi = cake_backend.record_abi(record)
 
     def versions(self):
-        return dict(module=self.module_name, abi=self.abi, stages=list(cake_backend.stages_for_entry(self.entry)))
+        return dict(module=self.module_name, abi=self.abi, stages=list(cake_backend.stages_for_entry(self.entry)),
+                    compact_rows=cake_backend.compact_rows_default())  # valid-row compaction (the labels carry ignored rows)
 
     def forward(self):
         inp = self.inp

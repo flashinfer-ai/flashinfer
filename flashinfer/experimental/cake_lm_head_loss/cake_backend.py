@@ -52,6 +52,20 @@ Contract
   tokens (a batch smaller than ``C`` is one chunk).  :func:`memory_report`
   states the peak temporary bytes separately from the model weights, the
   required outputs and the FP32 gradient accumulators.
+* Valid-row compaction (``compact_rows``, default on unless
+  ``FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS=0``): when some labels are
+  ``-100`` the chunk loop runs over the valid rows only -- the row index
+  ``idx = (labels >= 0).nonzero()`` is formed once per call (one device
+  synchronization for the count, one for the index), each chunk's rows of
+  ``X`` are gathered into one reusable BF16 ``[C, H]`` buffer, the row operands
+  are compacted to ``[T_v]``, the FP32 ``dX`` accumulator is ``[T_v, H]`` and
+  ``logp`` / ``dX`` are scattered back to ``[T]`` with exact zeros on the
+  ignored rows.  Ignored rows contribute exactly zero to the loss and both
+  gradients, so the result is the same computation over fewer rows: per row
+  ``logp`` / ``lse`` are bitwise those of the uncompacted path, ``dX`` rows too
+  whenever the chunk's K-slice count agrees; the ``loss`` and ``dW``
+  reductions run over different chunk boundaries, hence differ by FP32
+  rounding.  All rows valid: the uncompacted path (no gather, no scatter).
 * ``deterministic=True`` (the only mode this backend serves): fixed sequential
   chunk order, no atomics -- bitwise reproducible ``loss``, ``logp``, ``dX``
   and ``dW`` across runs.
@@ -318,6 +332,51 @@ def _dx_reduce(values: dict[str, Any]) -> None:
         out.add_(ws[slab, :rows_c])
 
 
+# --------------------------------------------------------------------------- valid-row compaction
+
+COMPACT_ROWS_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS"  # "0" turns the compaction off (the before / after switch)
+
+
+def compact_rows_default() -> bool:
+    """Default of ``compact_rows``: chunk over the valid rows only unless ``$FLASHINFER_CAKE_LM_HEAD_LOSS_COMPACT_ROWS`` is ``0``."""
+    return os.environ.get(COMPACT_ROWS_ENV, "1") != "0"
+
+
+def valid_row_index(labels: torch.Tensor) -> Optional[torch.Tensor]:
+    """``None`` when every row is valid (or ``T == 0``: the uncompacted path, no gather cost), else the ascending int64
+    index of the valid rows (``labels >= 0``; ``-100`` is the ignore index).  Rows with a negative label contribute
+    exactly zero to the loss, ``dX`` and ``dW``, so skipping them is exact.  One device synchronization (the count) plus
+    the ``nonzero`` synchronization when rows are ignored."""
+    T = int(labels.numel())
+    if T == 0:
+        return None
+    valid = labels >= 0
+    if int(valid.sum().item()) == T:
+        return None
+    return valid.nonzero().squeeze(1)
+
+
+def scatter_rows(rows: torch.Tensor, idx: Optional[torch.Tensor], num_rows: int) -> torch.Tensor:
+    """Rows of a compacted ``[T_v, ...]`` tensor back into a fresh ``[num_rows, ...]`` tensor with exact zeros
+    elsewhere (``idx=None``: the identity, the tensor itself)."""
+    if idx is None:
+        return rows
+    out = torch.zeros((int(num_rows),) + tuple(rows.shape[1:]), dtype=rows.dtype, device=rows.device)
+    if idx.numel():
+        out.index_copy_(0, idx, rows)
+    return out
+
+
+def _gather_rows(values: dict[str, Any]) -> None:
+    """Gather ``src[idx]`` into the preallocated ``out`` (host side; a chunk's ``X`` rows into the reusable ``x_c``
+    buffer, or a caller's ``[T]`` operand into its compact ``[T_v]`` form)."""
+    torch.index_select(values["src"], 0, values["idx"], out=values["out"])
+
+
+# Host-side steps of the chunk loop (torch operators over the bound tensors, no kernel of the program, no allocation).
+HOST_STAGES: dict[str, Callable[[dict[str, Any]], None]] = {"dx_reduce": _dx_reduce, "gather_rows": _gather_rows}
+
+
 def stages_for_entry(entry: str, *, need_dx: bool = True, need_dw: bool = True, grad_weight_dtype=torch.bfloat16) -> tuple[str, ...]:
     """Stages an entry point launches (``need_dx`` / ``need_dw`` drop the GEMMs of frozen inputs)."""
     if entry not in ENTRIES:
@@ -500,6 +559,17 @@ class Plan:
     need_dw: bool
     geometry: Geometry = DEFAULT_GEOMETRY
     dx_slices: tuple[int, ...] = ()  # K-slice count of the dX GEMM per chunk (empty = one slice everywhere)
+    valid_rows: Optional[int] = None  # rows of the compacted chunk loop (the valid rows); None = every row of the caller
+
+    @property
+    def compact(self) -> bool:
+        """The chunk loop runs over the valid rows only (gather / scatter around the kernels)."""
+        return self.valid_rows is not None
+
+    @property
+    def rows(self) -> int:
+        """Rows the chunk loop processes: the valid rows when compacted, else ``T``."""
+        return int(self.valid_rows) if self.compact else int(self.problem.num_rows)
 
     @property
     def num_chunks(self) -> int:
@@ -532,14 +602,17 @@ class Plan:
 
 
 def make_plan(
-    problem: Problem, *, need_dx: bool, need_dw: bool, geometry: Geometry = DEFAULT_GEOMETRY, dx_max_slices: int = 1, num_sms: int = 1
+    problem: Problem, *, need_dx: bool, need_dw: bool, geometry: Geometry = DEFAULT_GEOMETRY, dx_max_slices: int = 1, num_sms: int = 1,
+    valid_rows: Optional[int] = None,
 ) -> Plan:
-    """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count."""
-    chunks = plan_chunks(problem.num_rows, problem.chunk)
+    """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count;
+    ``valid_rows`` (compaction) chunks that many rows instead of ``T``."""
+    rows = problem.num_rows if valid_rows is None else int(valid_rows)
+    chunks = plan_chunks(rows, problem.chunk)
     slices = ()
     if need_dx and int(dx_max_slices) > 1:
         slices = tuple(recommended_k_slices(rows_c, problem.hidden, num_sms, dx_max_slices, geometry) for _, rows_c in chunks)
-    return Plan(problem, chunks, bool(need_dx), bool(need_dw), geometry, slices)
+    return Plan(problem, chunks, bool(need_dx), bool(need_dw), geometry, slices, None if valid_rows is None else int(valid_rows))
 
 
 # ---------------------------------------------------------------------------
@@ -562,11 +635,14 @@ def workspace_layout(
     scratch_bytes: int = 0,
     dx_ws_slabs: int = 0,
     hidden: int = 0,
+    compact: bool = False,
 ) -> dict:
     """Byte ``(offset, size)`` of every workspace region plus ``"total"``.
 
     ``dx_ws_slabs`` > 0 adds the FP32 ``dx_ws [slabs, min(T, C), H]`` slabs of
-    the K-sliced dX GEMM (``hidden`` = ``H``).
+    the K-sliced dX GEMM (``hidden`` = ``H``); ``compact`` adds the BF16
+    ``x_c [min(T, C), H]`` buffer the valid rows of ``X`` are gathered into
+    (``num_rows`` is then the valid-row count).
 
     The workspace holds the temporaries only the launches read: the
     vocabulary buffer ``logits`` (``min(T, C) x V`` BF16, ``z_c`` then ``dz_c``
@@ -593,6 +669,10 @@ def workspace_layout(
         if int(hidden) < 1:
             raise ValueError("workspace_layout needs hidden > 0 for the K-slice workspace")
         sizes.append(("dx_ws", int(dx_ws_slabs) * rows * int(hidden) * 4))
+    if compact:
+        if int(hidden) < 1:
+            raise ValueError("workspace_layout needs hidden > 0 for the gather buffer of the compacted rows")
+        sizes.append(("x_c", rows * int(hidden) * 2))
     if scratch_bytes:
         sizes.append(("workspace", int(scratch_bytes)))
     if tma_workspace_bytes:
@@ -630,6 +710,7 @@ def memory_report(
     tma_workspace_bytes: int = 0,
     scratch_bytes: int = 0,
     dx_ws_slabs: int = 0,
+    valid_rows: Optional[int] = None,
 ) -> dict[str, Any]:
     """The reporting buckets of the memory rule (bytes).
 
@@ -644,19 +725,35 @@ def memory_report(
     statistic the log-probability entry saves; ``weights``: the model tensors
     (``W``, ``X``).  ``vocab_rows_max`` is the largest token extent of any
     vocabulary-sized buffer (``min(T, C)``).
+
+    ``valid_rows`` (compaction): the chunk loop, the workspace, ``lse``, the
+    ``dX`` accumulator and the saved statistic span the valid rows ``T_v``;
+    the temporaries gain the BF16 ``x_c`` gather buffer (``gather_bytes``),
+    the int64 row index, the compact ``[T_v]`` ``logp`` / ``dlogp`` before and
+    after the scatter and the compact BF16 ``dX`` rows the backward casts
+    before scattering them into the ``[T, H]`` output; a contiguous copy of
+    ``X`` is never needed (the gather output is contiguous).
     """
+    compact = valid_rows is not None
+    rows = int(valid_rows) if compact else int(num_rows)  # rows the chunk loop processes
     layout = workspace_layout(
-        num_rows, vocab, chunk, stats_tile=stats_tile, entry=entry,
+        rows, vocab, chunk, stats_tile=stats_tile, entry=entry,
         tma_workspace_bytes=tma_workspace_bytes, scratch_bytes=scratch_bytes,
-        dx_ws_slabs=dx_ws_slabs if need_dx else 0, hidden=hidden,
+        dx_ws_slabs=dx_ws_slabs if need_dx else 0, hidden=hidden, compact=compact,
     )
     temporary = {name: size for name, (_, size) in ((k, v) for k, v in layout.items() if k != "total")}
-    temporary["lse"] = int(num_rows) * 4
-    if entry == "loss" and not return_logp:
-        temporary["logp"] = int(num_rows) * 4
+    temporary["lse"] = rows * 4
+    if entry == "loss" and (compact or not return_logp):
+        temporary["logp"] = rows * 4  # compacted: the [T_v] rows before the scatter into the returned [T] logp
     if entry == "logprob":
         temporary["dlogp"] = int(num_rows) * 4
-    if x_copy:
+    if compact:
+        temporary["row_index"] = rows * 8  # int64 valid-row index
+        if entry == "logprob":
+            temporary["dlogp_compact"] = rows * 4
+        if need_dx:
+            temporary["dx_compact"] = rows * int(hidden) * 2  # the cast compact rows, transient before the scatter into dX
+    if x_copy and not compact:
         temporary["x_copy"] = int(num_rows) * int(hidden) * 2
     outputs = {"loss": 4 if entry == "loss" else 0, "logp": int(num_rows) * 4 if (return_logp or entry == "logprob") else 0}
     if need_dx:
@@ -665,11 +762,11 @@ def memory_report(
         outputs["dW"] = int(vocab) * int(hidden) * (4 if (entry == "loss" and grad_weight_dtype == torch.float32) else 2)
     accumulators = {}
     if need_dx:
-        accumulators["dX_acc"] = int(num_rows) * int(hidden) * 4
+        accumulators["dX_acc"] = rows * int(hidden) * 4
     if need_dw:
         accumulators["dW_acc"] = int(vocab) * int(hidden) * 4
     if entry == "logprob":
-        accumulators["saved_lse"] = int(num_rows) * 4
+        accumulators["saved_lse"] = rows * 4
     weights = {"W": int(vocab) * int(hidden) * 2, "X": int(num_rows) * int(hidden) * 2}
     return dict(
         temporary_bytes=sum(temporary.values()),
@@ -680,9 +777,12 @@ def memory_report(
         accumulators=accumulators,
         weights_bytes=sum(weights.values()),
         weights=weights,
-        vocab_rows_max=min(int(chunk), max(int(num_rows), 1)),
+        vocab_rows_max=min(int(chunk), max(rows, 1)),
         chunk=int(chunk),
-        num_chunks=len(plan_chunks(num_rows, chunk)),
+        num_chunks=len(plan_chunks(rows, chunk)),
+        compact_rows=compact,
+        valid_rows=rows,
+        gather_bytes=int(layout["x_c"][1]) if compact else 0,
     )
 
 
@@ -696,11 +796,15 @@ def lm_head_loss_workspace_size(
     backend: str = "cake",
     hidden: Optional[int] = None,
     need_dx: bool = True,
+    compact_rows: bool = False,
 ) -> int:
     """Workspace bytes :func:`prepare_lm_head_loss` needs for ``(T, V, C)`` on ``device`` (``hidden`` = ``H``;
-    defaults to the registered program's pinned hidden size)."""
+    defaults to the registered program's pinned hidden size).  ``compact_rows`` adds the gather buffer of the
+    compacted path; sized for ``T`` rows it bounds every valid-row count."""
+    if compact_rows and not hidden and backend == "reference":
+        raise ValueError("lm_head_loss_workspace_size needs hidden= for the compacted path")
     if backend == "reference":
-        return int(workspace_layout(num_rows, vocab, chunk, entry=entry)["total"])
+        return int(workspace_layout(num_rows, vocab, chunk, entry=entry, hidden=hidden or 0, compact=compact_rows)["total"])
     name, record = record_for(device)
     stages = registered_stages(name)
     geometry = Geometry.from_record(record)
@@ -718,7 +822,7 @@ def lm_head_loss_workspace_size(
         workspace_layout(
             num_rows, vocab, chunk, stats_tile=geometry.stats_tile, entry=entry,
             tma_workspace_bytes=_record_tma_bytes(record, stages), scratch_bytes=_record_scratch_bytes(record, stages),
-            dx_ws_slabs=slabs, hidden=hidden or 0,
+            dx_ws_slabs=slabs, hidden=hidden or 0, compact=bool(compact_rows),
         )["total"]
     )
 
@@ -898,11 +1002,31 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
     ``grad_scale``, ``loss`` (the finished-loss cell), ``dx_acc`` / ``dw_acc``
     and the cast outputs ``dx_out`` / ``dw_out``.  For the casts ``index`` is
     ``"dx"`` or ``"dw"``.
+
+    Compacted plan: the row-indexed tensors (``labels``, ``lse``, ``logp``,
+    ``infer_logp``, ``loss_weights``, ``d_in``, ``dx_acc``, ``dx_out``) hold the
+    valid rows only (``T`` is the valid-row count), ``t["row_index"]`` is the
+    int64 valid-row index, ``t["x_c"]`` the BF16 ``[C, H]`` gather buffer the
+    GEMMs read the chunk's ``X`` rows from, and the host stage ``gather_rows``
+    fills them: chunk ``index`` gathers the chunk's rows of ``X``; a string
+    ``index`` (``"infer_logp"``, ``"loss_weights"``, ``"d_in"``) gathers the
+    caller's ``[T]`` operand ``t[index + "_full"]`` into ``t[index]``.
     """
     p, g = plan.problem, plan.geometry
     values: dict[str, Any] = {name: t.get(name) for name in COMMON_TENSORS}
-    values.update(T=int(p.num_rows), H=int(p.hidden), V=int(p.vocab), chunk=int(p.chunk), num_tiles=int(plan.num_tiles),
+    values.update(T=int(plan.rows), H=int(p.hidden), V=int(p.vocab), chunk=int(p.chunk), num_tiles=int(plan.num_tiles),
                   mode=int(p.mode), loss_div=float(p.loss_div) if p.loss_div is not None else 1.0, ws_slab=0)
+    if stage == "gather_rows":  # host-side row gather of the compacted path (no kernel of the program)
+        if not plan.compact:
+            raise ValueError("gather_rows belongs to a compacted plan")
+        if isinstance(index, str):
+            values.update(src=t[index + "_full"], idx=t["row_index"], out=t[index], rows_c=int(plan.rows), row0=0,
+                          first_chunk=0, last_chunk=0, d_off=0)
+            return values
+        row0, rows_c = plan.chunks[index]
+        values.update(src=t["X"], idx=t["row_index"][row0:row0 + rows_c], out=t["x_c"][:rows_c], rows_c=int(rows_c), row0=int(row0),
+                      first_chunk=int(index == 0), last_chunk=int(index == plan.num_chunks - 1), d_off=0)
+        return values
     if stage in ("scale_cast_bf16", "scale_cast_f32"):
         acc = t["dx_acc"] if index == "dx" else t["dw_acc"]
         out = t["dx_out"] if index == "dx" else t["dw_out"]
@@ -919,7 +1043,7 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
     stop = row0 + rows_c
     first, last = int(index == 0), int(index == plan.num_chunks - 1)
     values.update(rows_c=int(rows_c), row0=int(row0), first_chunk=first, last_chunk=last, d_off=0)
-    x_chunk = t["X"][row0:stop]
+    x_chunk = t["x_c"][:rows_c] if plan.compact else t["X"][row0:stop]  # compacted: the chunk's gathered valid rows
     logits = t["logits"]
     dz_chunk = logits[:rows_c]
     if stage in ("gemm_logits", "gemm_logits_nostats"):
@@ -958,9 +1082,13 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
 
 
 def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
-    """Launch keys ``(stage, chunk index)`` of the forward chunk loop."""
+    """Launch keys ``(stage, chunk index)`` of the forward chunk loop (compacted plan: the host gathers first)."""
     keys = []
+    if plan.compact and plan.problem.entry == "loss" and plan.problem.objective == "policy":
+        keys += [("gather_rows", "infer_logp"), ("gather_rows", "loss_weights")]
     for index in range(plan.num_chunks):
+        if plan.compact:
+            keys.append(("gather_rows", index))
         keys += [("gemm_logits", index), ("row_finalize", index)]
         if plan.problem.entry == "loss":
             keys.append(("loss_reduce", index))
@@ -982,7 +1110,11 @@ def _dx_keys(plan: Plan, index: int) -> list:
 def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     """Launch keys of the log-probability backward (recompute the logits, then the gradient GEMMs)."""
     keys = []
+    if plan.compact:
+        keys.append(("gather_rows", "d_in"))
     for index in range(plan.num_chunks):
+        if plan.compact:
+            keys.append(("gather_rows", index))
         keys += [("gemm_logits_nostats", index), ("row_grad", index)]
         if plan.need_dx:
             keys += _dx_keys(plan, index)
@@ -1161,6 +1293,13 @@ class LmHeadLossRunner:
     synchronizes; capture into a CUDA graph belongs to the caller.  Prepare a
     new runner when a shape, dtype, stride, option or tensor binding changes;
     values may change freely.
+
+    Compacted runner (``compact_rows``): the chunk loop covers the valid rows
+    of the labels as of preparation (``row_index``, ``valid_rows``); ``logp``,
+    ``lse``, ``dx_acc`` and ``dx_out`` are the compact ``[T_v]`` / ``[T_v, H]``
+    forms (:meth:`scatter` restores ``[T]``), ``dlogp`` stays the caller's
+    ``[T]`` tensor (gathered per step).  Label values decide the compaction,
+    so a runner must be re-prepared when the set of ignored rows changes.
     """
 
     backend: str
@@ -1212,7 +1351,21 @@ class LmHeadLossRunner:
 
     @property
     def dlogp(self) -> Optional[torch.Tensor]:
-        return self.tensors.get("d_in")
+        return self.tensors.get("d_in_full", self.tensors.get("d_in"))
+
+    @property
+    def row_index(self) -> Optional[torch.Tensor]:
+        """Int64 ``[T_v]`` index of the valid rows the compacted chunk loop processes (``None`` when uncompacted)."""
+        return self.tensors.get("row_index")
+
+    @property
+    def valid_rows(self) -> int:
+        return self.plan.rows
+
+    def scatter(self, rows: torch.Tensor) -> torch.Tensor:
+        """A compact ``[T_v, ...]`` result (``logp``, ``lse``, ``dx_acc``, ``dx_out``) as the caller's ``[T, ...]`` tensor
+        with exact zeros on the ignored rows (the tensor itself when the runner is not compacted)."""
+        return scatter_rows(rows, self.row_index, self.problem.num_rows)
 
     @property
     def stages(self) -> tuple[str, ...]:
@@ -1233,13 +1386,18 @@ class LmHeadLossRunner:
             self.prepare_tma()
             with _ffi_stream_context(self.device_index):
                 for key in keys:
-                    if key[0] == "dx_reduce":
-                        _dx_reduce(self.values[key])
+                    host = HOST_STAGES.get(key[0])
+                    if host is not None:
+                        host(self.values[key])
                     else:
                         self.launches[key]()
         else:
             for key in keys:
-                self.engine.run(key[0], self.values[key])
+                host = HOST_STAGES.get(key[0])
+                if host is not None:
+                    host(self.values[key])
+                else:
+                    self.engine.run(key[0], self.values[key])
 
     def forward(self):
         """Loss entry: ``(loss [1], logp [T])``; log-probability entry: ``(logp, lse)``."""
@@ -1281,12 +1439,12 @@ def _check_output(t: Optional[torch.Tensor], name: str, shape: tuple, dtype) -> 
         raise ValueError(f"{name} must be a contiguous {dtype} tensor of shape {tuple(shape)}")
 
 
-def _prepare_x(X: torch.Tensor, problem: Problem) -> torch.Tensor:
-    return X.contiguous() if problem.x_copy else X
+def _prepare_x(X: torch.Tensor, problem: Problem, compact: bool = False) -> torch.Tensor:
+    return X.contiguous() if (problem.x_copy and not compact) else X  # the per-chunk gather yields contiguous rows
 
 
-def _prepare_labels(labels: torch.Tensor, geometry: Geometry) -> torch.Tensor:
-    labels = labels.contiguous()
+def _prepare_labels(labels: torch.Tensor, geometry: Geometry, row_index: Optional[torch.Tensor] = None) -> torch.Tensor:
+    labels = labels.contiguous() if row_index is None else labels.index_select(0, row_index)
     if geometry.labels_dtype != labels.dtype:
         labels = labels.to(geometry.labels_dtype)  # one O(T) cast per call when the kernels read int32
     return labels
@@ -1297,7 +1455,7 @@ def _bind_all(record, module_name, keys, values, device) -> dict[Any, _Launch]:
     launches: dict[Any, _Launch] = {}
     for key in keys:
         stage = key[0]
-        if stage == "dx_reduce":  # host-side slab reduction, no kernel
+        if stage in HOST_STAGES:  # host-side step (slab reduction, row gather), no kernel
             continue
         physical = record[stage]
         grid = grid_dims(physical.get("grid", ["rows_c", 1, 1]), values[key], num_sms)
@@ -1334,6 +1492,7 @@ def prepare_lm_head_loss(
     logp: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     backend: str = "cake",
+    compact_rows=False,
 ) -> LmHeadLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -1345,6 +1504,13 @@ def prepare_lm_head_loss(
     forward writes / the backward reads.  ``T == 0`` is rejected here (the
     eager entry points return zeros for it without a runner).
     ``backend="reference"`` builds the same runner over PyTorch operators.
+
+    ``compact_rows=True`` compacts the chunk loop to the valid rows of
+    ``labels`` (:func:`valid_row_index`; an int64 index tensor is accepted in
+    place of ``True``): ``lse`` / ``logp`` / ``dx_acc`` / ``dx_out`` are then
+    bound or allocated as compact ``[T_v]`` / ``[T_v, H]`` tensors, the row
+    operands are gathered per step and every row ignored is rejected (the
+    eager entry points return zeros for it).
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -1368,19 +1534,30 @@ def prepare_lm_head_loss(
         raise ValueError("Expected all tensors on one device")
     stages = registered_stages(module_name) if record is not None else tuple(STAGES)
     num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count) if device.type == "cuda" else 1
+    row_index = None
+    if isinstance(compact_rows, torch.Tensor):
+        row_index = compact_rows
+        if row_index.dtype != torch.int64 or row_index.ndim != 1 or row_index.device != device:
+            raise ValueError("compact_rows given as a tensor must be the int64 [T_v] valid-row index on X's device")
+    elif compact_rows:
+        row_index = valid_row_index(labels)
+    if row_index is not None and row_index.numel() == 0:
+        raise ValueError("a prepared runner needs at least one valid row (every label is ignored); the eager entry points return zeros for it")
     plan = make_plan(
         problem, need_dx=need_dx, need_dw=need_dw, geometry=geometry,
         dx_max_slices=dx_max_slices(stages) if record is not None else 1, num_sms=num_sms,
+        valid_rows=None if row_index is None else int(row_index.numel()),
     )
     missing = [s for s in plan.stages if s not in stages]
     if missing:
         raise NotImplementedError(f"the registered program {module_name!r} lacks the stages {missing} (registered: {stages})")
     T, H, V, C = problem.num_rows, problem.hidden, problem.vocab, problem.chunk
+    rows_loop = plan.rows  # rows the chunk loop processes (the valid rows when compacted)
     tma_bytes = _record_tma_bytes(record, stages) if record is not None else 0
     scratch_bytes = _record_scratch_bytes(record, stages) if record is not None else 0
     layout = workspace_layout(
-        T, V, C, stats_tile=geometry.stats_tile, entry=entry, tma_workspace_bytes=tma_bytes, scratch_bytes=scratch_bytes,
-        dx_ws_slabs=plan.dx_ws_slabs, hidden=H,
+        rows_loop, V, C, stats_tile=geometry.stats_tile, entry=entry, tma_workspace_bytes=tma_bytes, scratch_bytes=scratch_bytes,
+        dx_ws_slabs=plan.dx_ws_slabs, hidden=H, compact=plan.compact,
     )
     if workspace_buffer is None:
         workspace_buffer = torch.empty(layout["total"], dtype=torch.uint8, device=device)
@@ -1392,7 +1569,7 @@ def prepare_lm_head_loss(
         _check_output(given, name, shape, dtype)
         return given if given is not None else torch.empty(shape, dtype=dtype, device=device)
 
-    t: dict[str, Any] = dict(X=_prepare_x(X, problem), W=W, labels=_prepare_labels(labels, geometry))
+    t: dict[str, Any] = dict(X=_prepare_x(X, problem, plan.compact), W=W, labels=_prepare_labels(labels, geometry, row_index))
     rows = layout["logits"][1] // (V * 2)
     t["logits"] = _carve(flat, layout, "logits", torch.bfloat16, (rows, V))
     t["stats"] = _carve(flat, layout, "stats", torch.float32, (rows, plan.num_tiles, 2))
@@ -1404,19 +1581,32 @@ def prepare_lm_head_loss(
     t["f32_dummy"] = torch.zeros((16,), dtype=torch.float32, device=device)  # unused ``WS`` of the unsliced GEMMs
     if plan.dx_ws_slabs:
         t["dx_ws"] = _carve(flat, layout, "dx_ws", torch.float32, (plan.dx_ws_slabs, rows, H))
+    if plan.compact:
+        t["row_index"] = row_index
+        t["x_c"] = _carve(flat, layout, "x_c", torch.bfloat16, (rows, H))  # the chunk's valid X rows, gathered per chunk
     # O(T) row vectors and the loss cell are separate allocations: a caller (or the autograd graph) keeping
     # ``loss`` / ``logp`` / ``lse`` alive must not pin the vocabulary workspace.
-    t["lse"] = output(lse, "lse", (T,), torch.float32)
-    t["logp"] = output(logp, "logp", (T,), torch.float32)
+    t["lse"] = output(lse, "lse", (rows_loop,), torch.float32)
+    t["logp"] = output(logp, "logp", (rows_loop,), torch.float32)
     t["loss"] = torch.empty((1,), dtype=torch.float32, device=device)
     if entry == "loss":
         if infer_logp is not None:
-            t["infer_logp"], t["loss_weights"] = infer_logp, loss_weights
+            if plan.compact:  # gathered into their compact [T_v] forms at the start of every step
+                t["infer_logp_full"], t["loss_weights_full"] = infer_logp, loss_weights
+                t["infer_logp"] = torch.empty((rows_loop,), dtype=torch.float32, device=device)
+                t["loss_weights"] = torch.empty((rows_loop,), dtype=torch.float32, device=device)
+            else:
+                t["infer_logp"], t["loss_weights"] = infer_logp, loss_weights
     else:
-        t["d_in"] = output(dlogp, "dlogp", (T,), torch.float32)
+        d_in = output(dlogp, "dlogp", (T,), torch.float32)
+        if plan.compact:
+            t["d_in_full"] = d_in
+            t["d_in"] = torch.empty((rows_loop,), dtype=torch.float32, device=device)
+        else:
+            t["d_in"] = d_in
     if plan.need_dx:
-        t["dx_acc"] = output(dx_acc, "dx_acc", (T, H), torch.float32)
-        t["dx_out"] = output(dx_out, "dx_out", (T, H), torch.bfloat16)
+        t["dx_acc"] = output(dx_acc, "dx_acc", (rows_loop, H), torch.float32)
+        t["dx_out"] = output(dx_out, "dx_out", (rows_loop, H), torch.bfloat16)
     if plan.need_dw:
         t["dw_acc"] = output(dw_acc, "dw_acc", (V, H), torch.float32)
         t["dw_out"] = output(dw_out, "dw_out", (V, H), torch.float32 if plan.dw_cast_stage == "scale_cast_f32" else torch.bfloat16)
@@ -1436,8 +1626,8 @@ def prepare_lm_head_loss(
         engine = ReferenceEngine()
     memory = memory_report(
         T, H, V, C, stats_tile=geometry.stats_tile, entry=entry, need_dx=plan.need_dx, need_dw=plan.need_dw,
-        grad_weight_dtype=problem.grad_weight_dtype, return_logp=True, x_copy=problem.x_copy,
-        tma_workspace_bytes=tma_bytes, scratch_bytes=scratch_bytes, dx_ws_slabs=plan.dx_ws_slabs,
+        grad_weight_dtype=problem.grad_weight_dtype, return_logp=True, x_copy=problem.x_copy and not plan.compact,
+        tma_workspace_bytes=tma_bytes, scratch_bytes=scratch_bytes, dx_ws_slabs=plan.dx_ws_slabs, valid_rows=plan.valid_rows,
     )
     if device.type == "cuda":
         device_index = int(device.index if device.index is not None else torch.cuda.current_device())
@@ -1475,15 +1665,19 @@ def _meta(t: Optional[torch.Tensor]):
     return None if t is None else (t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype)
 
 
-def forward_binding_key(X, W, labels, *, objective, loss_div, infer_logp, loss_weights, chunk_size, need_dx, need_dw, grad_weight_dtype, entry) -> tuple:
+def forward_binding_key(X, W, labels, *, objective, loss_div, infer_logp, loss_weights, chunk_size, need_dx, need_dw, grad_weight_dtype, entry,
+                        valid_rows=None) -> tuple:
     """Cache key of a forward binding: ``(data_ptr, shape, stride, dtype)`` of every
-    input plus every option that shapes the argument plans."""
+    input plus every option that shapes the argument plans; ``valid_rows`` is the
+    compacted row count (a label-dependent fact of the plan; ``None`` = uncompacted)."""
     return ("fwd", entry, _meta(X), _meta(W), _meta(labels), _meta(infer_logp), _meta(loss_weights), objective,
-            None if loss_div is None else float(loss_div), int(chunk_size), bool(need_dx), bool(need_dw), grad_weight_dtype)
+            None if loss_div is None else float(loss_div), int(chunk_size), bool(need_dx), bool(need_dw), grad_weight_dtype,
+            None if valid_rows is None else int(valid_rows))
 
 
-def logprob_backward_binding_key(X, W, labels, lse, dlogp, *, chunk_size, need_dx, need_dw) -> tuple:
-    return ("bwd", "logprob", _meta(X), _meta(W), _meta(labels), _meta(lse), _meta(dlogp), int(chunk_size), bool(need_dx), bool(need_dw))
+def logprob_backward_binding_key(X, W, labels, lse, dlogp, *, chunk_size, need_dx, need_dw, valid_rows=None) -> tuple:
+    return ("bwd", "logprob", _meta(X), _meta(W), _meta(labels), _meta(lse), _meta(dlogp), int(chunk_size), bool(need_dx), bool(need_dw),
+            None if valid_rows is None else int(valid_rows))
 
 
 # Values a remembered binding owns: the descriptor workspace of pointer-ABI stages and kernel-private scratch (a few
@@ -1538,14 +1732,25 @@ class _Binding:
         t["f32_dummy"] = torch.zeros((16,), dtype=torch.float32, device=self.device)
         if self.plan.dx_ws_slabs:
             t["dx_ws"] = torch.empty((self.plan.dx_ws_slabs, rows, p.hidden), dtype=torch.float32, device=self.device)
+        if self.plan.compact:
+            t["x_c"] = torch.empty((rows, p.hidden), dtype=torch.bfloat16, device=self.device)
         for name, tensor in self.owned.items():
             t[name] = tensor
+
+    def _compact(self, t: dict[str, Any], row_index: Optional[torch.Tensor]) -> None:
+        """Check the call's valid-row index against the remembered plan and bind it."""
+        plan = self.plan
+        if plan.compact != (row_index is not None) or (plan.compact and int(row_index.numel()) != plan.rows):
+            raise ValueError("the remembered binding was planned for another set of valid rows")
+        if plan.compact:
+            t["row_index"] = row_index
 
     def _launch(self, keys: tuple, t: dict[str, Any]) -> None:
         with _ffi_stream_context(self.device_index):
             for key in keys:
-                if key[0] == "dx_reduce":
-                    _dx_reduce(stage_values("dx_reduce", t, self.plan, key[1]))
+                host = HOST_STAGES.get(key[0])
+                if host is not None:
+                    host(stage_values(key[0], t, self.plan, key[1]))
                     continue
                 launch = self.launches[key]
                 arguments = launch.arguments_for(stage_values(key[0], t, self.plan, key[1]))
@@ -1553,16 +1758,22 @@ class _Binding:
                     launch.prepare(*arguments)
                 launch.entry(*arguments)
 
-    def forward(self, X, W, labels, infer_logp, loss_weights):
+    def forward(self, X, W, labels, infer_logp, loss_weights, row_index=None):
         p, plan = self.plan.problem, self.plan
-        T, H, V = p.num_rows, p.hidden, p.vocab
-        t: dict[str, Any] = dict(X=_prepare_x(X, p), W=W, labels=_prepare_labels(labels, plan.geometry))
+        T, H, V = plan.rows, p.hidden, p.vocab  # rows of the chunk loop (the valid rows when compacted)
+        t: dict[str, Any] = dict(X=_prepare_x(X, p, plan.compact), W=W, labels=_prepare_labels(labels, plan.geometry, row_index))
+        self._compact(t, row_index)
         self._scratch(t)
         t["lse"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         t["logp"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         if p.entry == "loss":
             if infer_logp is not None:
-                t["infer_logp"], t["loss_weights"] = infer_logp, loss_weights
+                if plan.compact:
+                    t["infer_logp_full"], t["loss_weights_full"] = infer_logp, loss_weights
+                    t["infer_logp"] = torch.empty((T,), dtype=torch.float32, device=self.device)
+                    t["loss_weights"] = torch.empty((T,), dtype=torch.float32, device=self.device)
+                else:
+                    t["infer_logp"], t["loss_weights"] = infer_logp, loss_weights
             if plan.need_dx:
                 t["dx_acc"] = torch.empty((T, H), dtype=torch.float32, device=self.device)
             if plan.need_dw:
@@ -1572,10 +1783,16 @@ class _Binding:
             return t["loss"], t["logp"], t.get("dx_acc"), t.get("dw_acc")
         return t["logp"], t["lse"]
 
-    def backward_logprob(self, X, W, labels, lse, dlogp):
+    def backward_logprob(self, X, W, labels, lse, dlogp, row_index=None):
         p, plan = self.plan.problem, self.plan
-        T, H, V = p.num_rows, p.hidden, p.vocab
-        t: dict[str, Any] = dict(X=_prepare_x(X, p), W=W, labels=_prepare_labels(labels, plan.geometry), lse=lse, d_in=dlogp)
+        T, H, V = plan.rows, p.hidden, p.vocab
+        t: dict[str, Any] = dict(X=_prepare_x(X, p, plan.compact), W=W, labels=_prepare_labels(labels, plan.geometry, row_index), lse=lse)
+        self._compact(t, row_index)
+        if plan.compact:
+            t["d_in_full"] = dlogp
+            t["d_in"] = torch.empty((T,), dtype=torch.float32, device=self.device)
+        else:
+            t["d_in"] = dlogp
         self._scratch(t)
         if plan.need_dx:
             t["dx_acc"] = torch.empty((T, H), dtype=torch.float32, device=self.device)
@@ -1640,26 +1857,35 @@ BINDING_CACHE = BindingCache(enabled=os.environ.get(BINDING_CACHE_ENV, "1") != "
 @dataclass
 class ForwardResult:
     loss: Optional[torch.Tensor]  # FP32 [] (loss entry)
-    logp: torch.Tensor  # FP32 [T]
-    lse: Optional[torch.Tensor] = None  # FP32 [T] (log-probability entry: the saved statistic)
-    dx_acc: Optional[torch.Tensor] = None  # FP32 [T, H] (loss entry, X trainable)
+    logp: torch.Tensor  # FP32 [T] (0 on ignored rows; scattered back when the rows were compacted)
+    lse: Optional[torch.Tensor] = None  # FP32 (log-probability entry: the saved statistic; compact [T_v] rows of ``row_index`` when compacted)
+    dx_acc: Optional[torch.Tensor] = None  # FP32 [T, H] (loss entry, X trainable); compact [T_v, H] rows of ``row_index`` when compacted
     dw_acc: Optional[torch.Tensor] = None  # FP32 [V, H] (loss entry, W trainable)
     memory: Optional[dict] = None
     backend: str = "cake"
+    row_index: Optional[torch.Tensor] = None  # int64 [T_v] valid-row index when the chunk loop was compacted (None otherwise)
+    num_rows: int = 0  # T, the caller's row count
 
 
-def _empty_forward(problem: Problem, X: torch.Tensor, *, need_dx: bool, need_dw: bool) -> ForwardResult:
+def _empty_forward(problem: Problem, X: torch.Tensor, *, need_dx: bool, need_dw: bool, row_index: Optional[torch.Tensor] = None) -> ForwardResult:
+    """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty)."""
     device = X.device
-    memory = memory_report(0, problem.hidden, problem.vocab, problem.chunk, entry=problem.entry, need_dx=need_dx, need_dw=need_dw,
-                           grad_weight_dtype=problem.grad_weight_dtype, return_logp=True)
-    empty = torch.zeros((0,), dtype=torch.float32, device=device)
+    T = int(problem.num_rows)
+    memory = memory_report(T, problem.hidden, problem.vocab, problem.chunk, entry=problem.entry, need_dx=need_dx, need_dw=need_dw,
+                           grad_weight_dtype=problem.grad_weight_dtype, return_logp=True, valid_rows=None if row_index is None else 0)
+    zeros = torch.zeros((T,), dtype=torch.float32, device=device)
     if problem.entry == "loss":
         return ForwardResult(
-            loss=torch.zeros((), dtype=torch.float32, device=device), logp=empty,
+            loss=torch.zeros((), dtype=torch.float32, device=device), logp=zeros,
             dx_acc=torch.zeros((0, problem.hidden), dtype=torch.float32, device=device) if need_dx else None,
             dw_acc=torch.zeros((problem.vocab, problem.hidden), dtype=torch.float32, device=device) if need_dw else None, memory=memory,
+            row_index=row_index, num_rows=T,
         )
-    return ForwardResult(loss=None, logp=empty, lse=empty.clone(), memory=memory)
+    return ForwardResult(loss=None, logp=zeros, lse=zeros.clone(), memory=memory, row_index=row_index, num_rows=T)
+
+
+def _resolve_compact(compact_rows) -> bool:
+    return compact_rows_default() if compact_rows is None else bool(compact_rows)
 
 
 def forward_loss(
@@ -1677,6 +1903,7 @@ def forward_loss(
     grad_weight_dtype: torch.dtype = torch.bfloat16,
     deterministic: bool = True,
     backend: str = "cake",
+    compact_rows: Optional[bool] = None,
 ) -> ForwardResult:
     """Forward of the loss entry: ``loss`` (FP32 scalar), ``logp`` (FP32 ``[T]``) and the
     FP32 gradient accumulators ``dx_acc`` / ``dw_acc`` of the trainable inputs.
@@ -1685,6 +1912,11 @@ def forward_loss(
     :func:`prepare_lm_head_loss`; later calls with the same binding take the
     remembered launches (:data:`BINDING_CACHE`).  A call without rows returns
     loss 0, an empty ``logp`` and zero accumulators without binding or launching.
+    ``compact_rows`` (default :func:`compact_rows_default`) chunks over the valid
+    rows only: ``logp`` comes back scattered to ``[T]``, ``dx_acc`` is the compact
+    ``[T_v, H]`` (``row_index`` / ``num_rows`` of the result restore ``[T, H]``
+    through :func:`backward_loss`); every row ignored returns zeros without
+    binding or launching.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -1692,23 +1924,31 @@ def forward_loss(
         X, W, labels, objective=objective, loss_div=loss_div, infer_logp=infer_logp, loss_weights=loss_weights,
         chunk_size=chunk_size, grad_weight_dtype=grad_weight_dtype, deterministic=deterministic, entry="loss",
     )
-    if problem.num_rows == 0:
+    T = problem.num_rows
+    if T == 0:
         return _empty_forward(problem, X, need_dx=need_dx, need_dw=need_dw)
+    row_index = valid_row_index(labels) if _resolve_compact(compact_rows) else None
+    if row_index is not None and row_index.numel() == 0:  # every row ignored
+        return _empty_forward(problem, X, need_dx=need_dx, need_dw=need_dw, row_index=row_index)
+    valid_rows = None if row_index is None else int(row_index.numel())
     common = dict(objective=objective, loss_div=problem.loss_div, infer_logp=infer_logp, loss_weights=loss_weights,
                   chunk_size=chunk_size, need_dx=need_dx, need_dw=need_dw, grad_weight_dtype=grad_weight_dtype)
     cache = BINDING_CACHE
     key = None
     if backend == "cake" and cache.enabled:
-        key = forward_binding_key(X, W, labels, entry="loss", **common)
+        key = forward_binding_key(X, W, labels, entry="loss", valid_rows=valid_rows, **common)
         binding = cache.lookup(key)
         if binding is not None:
-            loss, logp, dx_acc, dw_acc = binding.forward(X, W, labels, infer_logp, loss_weights)
-            return ForwardResult(loss=loss.reshape(()), logp=logp, dx_acc=dx_acc, dw_acc=dw_acc, memory=binding.memory, backend=backend)
-    runner = prepare_lm_head_loss(X, W, labels, deterministic=deterministic, entry="loss", backend=backend, **common)
+            loss, logp, dx_acc, dw_acc = binding.forward(X, W, labels, infer_logp, loss_weights, row_index)
+            return ForwardResult(loss=loss.reshape(()), logp=scatter_rows(logp, row_index, T), dx_acc=dx_acc, dw_acc=dw_acc,
+                                 memory=binding.memory, backend=backend, row_index=row_index, num_rows=T)
+    runner = prepare_lm_head_loss(X, W, labels, deterministic=deterministic, entry="loss", backend=backend,
+                                  compact_rows=False if row_index is None else row_index, **common)
     loss, logp = runner.forward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
-    return ForwardResult(loss=loss.reshape(()), logp=logp, dx_acc=runner.dx_acc, dw_acc=runner.dw_acc, memory=runner.memory, backend=backend)
+    return ForwardResult(loss=loss.reshape(()), logp=scatter_rows(logp, row_index, T), dx_acc=runner.dx_acc, dw_acc=runner.dw_acc,
+                         memory=runner.memory, backend=backend, row_index=row_index, num_rows=T)
 
 
 def scale_cast(acc: torch.Tensor, grad: Optional[torch.Tensor], out_dtype: torch.dtype, *, backend: str = "cake") -> torch.Tensor:
@@ -1754,10 +1994,18 @@ def backward_loss(
     *,
     grad_weight_dtype: torch.dtype = torch.bfloat16,
     backend: str = "cake",
+    row_index: Optional[torch.Tensor] = None,
+    num_rows: Optional[int] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the loss entry from the saved accumulators: ``(dX, dW)`` = ``bf16(g * dX_acc)``,
-    ``cast(g * dW_acc)``; the accumulators are read, never written (repeatable)."""
+    ``cast(g * dW_acc)``; the accumulators are read, never written (repeatable).  A compacted forward
+    (``ForwardResult.row_index`` / ``num_rows``): the compact rows are cast once, then scattered into a
+    zero BF16 ``[T, H]``."""
     dx = None if dx_acc is None else scale_cast(dx_acc, grad, torch.bfloat16, backend=backend)
+    if dx is not None and row_index is not None:
+        if num_rows is None:
+            raise ValueError("backward_loss needs num_rows (the caller's T) with row_index")
+        dx = scatter_rows(dx, row_index, int(num_rows))
     dw = None if dw_acc is None else scale_cast(dw_acc, grad, grad_weight_dtype, backend=backend)
     return dx, dw
 
@@ -1770,28 +2018,37 @@ def forward_logprob(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     deterministic: bool = True,
     backend: str = "cake",
+    compact_rows: Optional[bool] = None,
 ) -> ForwardResult:
-    """Forward of the log-probability entry: ``logp`` (FP32 ``[T]``, 0 on ignored rows) plus the saved statistic ``lse``."""
+    """Forward of the log-probability entry: ``logp`` (FP32 ``[T]``, 0 on ignored rows) plus the saved statistic
+    ``lse`` (compacted: the ``[T_v]`` rows of ``row_index``, exactly what :func:`backward_logprob` expects back)."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(X, W, labels, chunk_size=chunk_size, deterministic=deterministic, entry="logprob")
-    if problem.num_rows == 0:
+    T = problem.num_rows
+    if T == 0:
         return _empty_forward(problem, X, need_dx=False, need_dw=False)
+    row_index = valid_row_index(labels) if _resolve_compact(compact_rows) else None
+    if row_index is not None and row_index.numel() == 0:  # every row ignored
+        return _empty_forward(problem, X, need_dx=False, need_dw=False, row_index=row_index)
+    valid_rows = None if row_index is None else int(row_index.numel())
     cache = BINDING_CACHE
     key = None
     if backend == "cake" and cache.enabled:
         key = forward_binding_key(X, W, labels, objective="ce", loss_div=None, infer_logp=None, loss_weights=None, chunk_size=chunk_size,
-                                  need_dx=False, need_dw=False, grad_weight_dtype=torch.bfloat16, entry="logprob")
+                                  need_dx=False, need_dw=False, grad_weight_dtype=torch.bfloat16, entry="logprob", valid_rows=valid_rows)
         binding = cache.lookup(key)
         if binding is not None:
-            logp, lse = binding.forward(X, W, labels, None, None)
-            return ForwardResult(loss=None, logp=logp, lse=lse, memory=binding.memory, backend=backend)
+            logp, lse = binding.forward(X, W, labels, None, None, row_index)
+            return ForwardResult(loss=None, logp=scatter_rows(logp, row_index, T), lse=lse, memory=binding.memory, backend=backend,
+                                 row_index=row_index, num_rows=T)
     runner = prepare_lm_head_loss(X, W, labels, chunk_size=chunk_size, need_dx=False, need_dw=False, deterministic=deterministic,
-                                  entry="logprob", backend=backend)
+                                  entry="logprob", backend=backend, compact_rows=False if row_index is None else row_index)
     logp, lse = runner.forward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
-    return ForwardResult(loss=None, logp=logp, lse=lse, memory=runner.memory, backend=backend)
+    return ForwardResult(loss=None, logp=scatter_rows(logp, row_index, T), lse=lse, memory=runner.memory, backend=backend,
+                         row_index=row_index, num_rows=T)
 
 
 def backward_logprob(
@@ -1806,34 +2063,42 @@ def backward_logprob(
     need_dw: bool = True,
     deterministic: bool = True,
     backend: str = "cake",
+    compact_rows: Optional[bool] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the log-probability entry: recompute each chunk's logits, ``dz = dlogp_t *
     (1[v = y_t] - softmax)`` (ignored rows zero), then ``dX`` (BF16) and ``dW`` (BF16) through
-    the FP32 accumulators.  ``(None, None)`` when neither input is trainable."""
+    the FP32 accumulators.  ``(None, None)`` when neither input is trainable.  ``compact_rows``
+    must match the forward's: the valid-row index is recomputed from ``labels`` (identical to the
+    forward's), ``lse`` is then the forward's compact ``[T_v]`` statistic and ``dX`` comes back
+    scattered to ``[T, H]``; every row ignored returns zeros without launching."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
     problem = validate_lm_head_inputs(X, W, labels, chunk_size=chunk_size, deterministic=deterministic, entry="logprob")
     if not (need_dx or need_dw):
         return None, None
     T, H, V = problem.num_rows, problem.hidden, problem.vocab
-    if T == 0:
-        return (torch.zeros((0, H), dtype=torch.bfloat16, device=X.device) if need_dx else None,
+    row_index = valid_row_index(labels) if (T and _resolve_compact(compact_rows)) else None
+    rows = T if row_index is None else int(row_index.numel())
+    if rows == 0:  # no rows, or every row ignored
+        return (torch.zeros((T, H), dtype=torch.bfloat16, device=X.device) if need_dx else None,
                 torch.zeros((V, H), dtype=torch.bfloat16, device=X.device) if need_dw else None)
-    _check_output(lse, "lse", (T,), torch.float32)
+    _check_output(lse, "lse", (rows,), torch.float32)
     dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
     cache = BINDING_CACHE
     key = None
+    valid_rows = None if row_index is None else rows
     if backend == "cake" and cache.enabled:
-        key = logprob_backward_binding_key(X, W, labels, lse, dlogp, chunk_size=chunk_size, need_dx=need_dx, need_dw=need_dw)
+        key = logprob_backward_binding_key(X, W, labels, lse, dlogp, chunk_size=chunk_size, need_dx=need_dx, need_dw=need_dw, valid_rows=valid_rows)
         binding = cache.lookup(key)
         if binding is not None:
-            return binding.backward_logprob(X, W, labels, lse, dlogp)
+            dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index)
+            return (None if dx is None else scatter_rows(dx, row_index, T)), dw
     runner = prepare_lm_head_loss(X, W, labels, chunk_size=chunk_size, need_dx=need_dx, need_dw=need_dw, deterministic=deterministic,
-                                  entry="logprob", dlogp=dlogp, lse=lse, backend=backend)
-    result = runner.backward()
+                                  entry="logprob", dlogp=dlogp, lse=lse, backend=backend, compact_rows=False if row_index is None else row_index)
+    dx, dw = runner.backward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
-    return result
+    return (None if dx is None else scatter_rows(dx, row_index, T)), dw
 
 
 # ---------------------------------------------------------------------------
@@ -1845,31 +2110,34 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
     """Entry (a): the forward produces the FP32 gradient accumulators; the backward scales and casts them."""
 
     @staticmethod
-    def forward(ctx, X, W, labels, objective, loss_div, infer_logp, loss_weights, chunk_size, return_logp, grad_weight_dtype, deterministic, backend):
+    def forward(ctx, X, W, labels, objective, loss_div, infer_logp, loss_weights, chunk_size, return_logp, grad_weight_dtype, deterministic, backend,
+                compact_rows):
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         result = forward_loss(
             X, W, labels, objective=objective, loss_div=loss_div, infer_logp=infer_logp, loss_weights=loss_weights,
             chunk_size=chunk_size, need_dx=need_dx, need_dw=need_dw, grad_weight_dtype=grad_weight_dtype,
-            deterministic=deterministic, backend=backend,
+            deterministic=deterministic, backend=backend, compact_rows=compact_rows,
         )
         ctx.set_materialize_grads(False)
         ctx.dx_acc, ctx.dw_acc = result.dx_acc, result.dw_acc  # saved state, never mutated
+        ctx.row_index, ctx.num_rows = result.row_index, int(X.shape[0])  # compacted: dx_acc holds the rows of row_index
         ctx.grad_weight_dtype = grad_weight_dtype
         ctx.backend = backend
-        ctx.empty = X.shape[0] == 0
+        ctx.empty = X.shape[0] == 0 or (result.row_index is not None and result.row_index.numel() == 0)
         ctx.mark_non_differentiable(result.logp)
         return result.loss, result.logp
 
     @staticmethod
     def backward(ctx, grad_loss, grad_logp=None):
-        none = (None,) * 12
+        none = (None,) * 13
         if grad_loss is None:
             return none
-        if ctx.empty:  # T == 0: zero gradients without binding or launching a program
-            dx = None if ctx.dx_acc is None else torch.zeros(ctx.dx_acc.shape, dtype=torch.bfloat16, device=ctx.dx_acc.device)
+        if ctx.empty:  # T == 0 or every row ignored: zero gradients without binding or launching a program
+            dx = None if ctx.dx_acc is None else torch.zeros((ctx.num_rows, ctx.dx_acc.shape[1]), dtype=torch.bfloat16, device=ctx.dx_acc.device)
             dw = None if ctx.dw_acc is None else torch.zeros(ctx.dw_acc.shape, dtype=ctx.grad_weight_dtype, device=ctx.dw_acc.device)
             return (dx, dw) + none[2:]
-        dx, dw = backward_loss(ctx.dx_acc, ctx.dw_acc, grad_loss, grad_weight_dtype=ctx.grad_weight_dtype, backend=ctx.backend)
+        dx, dw = backward_loss(ctx.dx_acc, ctx.dw_acc, grad_loss, grad_weight_dtype=ctx.grad_weight_dtype, backend=ctx.backend,
+                               row_index=ctx.row_index, num_rows=ctx.num_rows)
         return (dx, dw) + none[2:]
 
 
@@ -1877,22 +2145,23 @@ class ChunkedLmHeadLogprobFunction(torch.autograd.Function):
     """Entry (b): the forward saves the row statistic; the backward recomputes the logits."""
 
     @staticmethod
-    def forward(ctx, X, W, labels, chunk_size, deterministic, backend):
-        result = forward_logprob(X, W, labels, chunk_size=chunk_size, deterministic=deterministic, backend=backend)
+    def forward(ctx, X, W, labels, chunk_size, deterministic, backend, compact_rows):
+        compact = _resolve_compact(compact_rows)  # resolved once: the backward recomputes the same valid-row index
+        result = forward_logprob(X, W, labels, chunk_size=chunk_size, deterministic=deterministic, backend=backend, compact_rows=compact)
         ctx.set_materialize_grads(False)
         ctx.save_for_backward(X, W, labels, result.lse)
-        ctx.chunk_size, ctx.deterministic, ctx.backend = chunk_size, deterministic, backend
+        ctx.chunk_size, ctx.deterministic, ctx.backend, ctx.compact = chunk_size, deterministic, backend, compact
         return result.logp
 
     @staticmethod
     def backward(ctx, dlogp):
         if dlogp is None:
-            return None, None, None, None, None, None
+            return None, None, None, None, None, None, None
         X, W, labels, lse = ctx.saved_tensors
         need_dx, need_dw = bool(ctx.needs_input_grad[0]), bool(ctx.needs_input_grad[1])
         dx, dw = backward_logprob(X, W, labels, lse, dlogp, chunk_size=ctx.chunk_size, need_dx=need_dx, need_dw=need_dw,
-                                  deterministic=ctx.deterministic, backend=ctx.backend)
-        return dx, dw, None, None, None, None
+                                  deterministic=ctx.deterministic, backend=ctx.backend, compact_rows=ctx.compact)
+        return dx, dw, None, None, None, None, None
 
 
 def chunked_lm_head_loss(
@@ -1909,6 +2178,7 @@ def chunked_lm_head_loss(
     grad_weight_dtype: torch.dtype = torch.bfloat16,
     deterministic: bool = True,
     backend: str = "cake",
+    compact_rows: Optional[bool] = None,
 ):
     """Differentiable chunked LM-head + loss (see the module docstring); returns the FP32 scalar
     ``loss`` and, with ``return_logp``, the detached FP32 ``logp [T]``.
@@ -1917,7 +2187,9 @@ def chunked_lm_head_loss(
     casts every gradient to its leaf's dtype, so an FP32 ``dW`` cannot leave
     this entry through ``W.grad`` for a BF16 ``W``.  Use ``forward_loss(...,
     need_dw=True)`` + ``backward_loss(dx_acc, dw_acc, g, grad_weight_dtype=
-    torch.float32)`` for an FP32 weight gradient.
+    torch.float32)`` for an FP32 weight gradient.  ``compact_rows`` (default
+    :func:`compact_rows_default`): chunk over the valid rows only; the ``dX``
+    rows of ignored tokens are exact zeros either way.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -1931,6 +2203,7 @@ def chunked_lm_head_loss(
         )
     loss, logp = ChunkedLmHeadLossFunction.apply(
         X, W, labels, objective, loss_div, infer_logp, loss_weights, int(chunk_size), bool(return_logp), grad_weight_dtype, deterministic, backend,
+        compact_rows,
     )
     return (loss, logp.detach()) if return_logp else loss
 
@@ -1943,8 +2216,10 @@ def chunked_lm_head_logprob(
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     deterministic: bool = True,
     backend: str = "cake",
+    compact_rows: Optional[bool] = None,
 ) -> torch.Tensor:
-    """Differentiable FP32 ``logp [T]`` (0 on ignored rows) for arbitrary downstream losses."""
+    """Differentiable FP32 ``logp [T]`` (0 on ignored rows) for arbitrary downstream losses;
+    ``compact_rows`` as in :func:`chunked_lm_head_loss`."""
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
-    return ChunkedLmHeadLogprobFunction.apply(X, W, labels, int(chunk_size), deterministic, backend)
+    return ChunkedLmHeadLogprobFunction.apply(X, W, labels, int(chunk_size), deterministic, backend, compact_rows)

@@ -16,6 +16,10 @@ limitations under the License.
 
 import contextlib
 import math
+import os
+import subprocess
+import sys
+import threading
 import warnings
 from dataclasses import replace
 from types import SimpleNamespace
@@ -124,7 +128,8 @@ def _host_inputs(T, objective="ce", *, seed=SEED, **kw):
     return make_inputs(T, objective=objective, seed=seed + T, H=H_HOST, V=V_HOST, device=DEV, **kw)
 
 
-def _run(inp, C, *, entry="loss", grad_weight_dtype=torch.bfloat16, train_x=True, train_w=True, backend="reference", scale=None):
+def _run(inp, C, *, entry="loss", grad_weight_dtype=torch.bfloat16, train_x=True, train_w=True, backend="reference", scale=None,
+         compact_rows=None):
     """One forward + backward through the autograd entry points; ``backend="cake"`` goes
     through the public module.  Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the leaves."""
     X = inp.X.detach().requires_grad_(train_x)
@@ -136,12 +141,12 @@ def _run(inp, C, *, entry="loss", grad_weight_dtype=torch.bfloat16, train_x=True
             loss, logp = loss_fn(
                 X, W, inp.labels, objective=inp.objective, loss_div=inp.loss_div if inp.objective == "ce" else None,
                 infer_logp=inp.infer_logp, loss_weights=inp.loss_weights, chunk_size=C, return_logp=True,
-                grad_weight_dtype=grad_weight_dtype, backend=backend,
+                grad_weight_dtype=grad_weight_dtype, backend=backend, compact_rows=compact_rows,
             )
             if train_x or train_w:
                 (loss if scale is None else loss * scale).backward()
         else:
-            logp = logprob_fn(X, W, inp.labels, chunk_size=C, backend=backend)
+            logp = logprob_fn(X, W, inp.labels, chunk_size=C, backend=backend, compact_rows=compact_rows)
             loss = (logp.detach() * inp.dlogp)[inp.valid].sum()
             if train_x or train_w:
                 logp.backward(inp.dlogp if scale is None else inp.dlogp * scale)
@@ -610,6 +615,10 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_and_options():
     assert bwd != logprob_backward_binding_key(X, W, labels, lse.clone(), dlogp, chunk_size=4096, need_dx=True, need_dw=True)
     assert bwd != logprob_backward_binding_key(X, W, labels, lse, dlogp, chunk_size=4096, need_dx=True, need_dw=False)
     assert bwd != logprob_backward_binding_key(X, W, labels, lse, dlogp, chunk_size=2048, need_dx=True, need_dw=True)
+    # the compacted row count is a label-dependent fact of the plan
+    assert base != forward_binding_key(X, W, labels, valid_rows=4, **common)
+    assert forward_binding_key(X, W, labels, valid_rows=4, **common) != forward_binding_key(X, W, labels, valid_rows=5, **common)
+    assert bwd != logprob_backward_binding_key(X, W, labels, lse, dlogp, chunk_size=4096, need_dx=True, need_dw=True, valid_rows=4)
 
 
 def test_binding_cache_is_lru_and_bounded():
@@ -970,6 +979,191 @@ def test_t_changes_between_calls():
 
 
 # ---------------------------------------------------------------------------
+# Valid-row compaction (the chunk loop over the rows with labels >= 0 only)
+# ---------------------------------------------------------------------------
+
+
+def test_valid_row_index_and_scatter():
+    labels = torch.tensor([3, IGNORE_INDEX, 5, 7, IGNORE_INDEX], device=DEV)
+    idx = cake_backend.valid_row_index(labels)
+    assert idx.dtype == torch.int64 and idx.tolist() == [0, 2, 3]
+    assert cake_backend.valid_row_index(torch.tensor([1, 2], device=DEV)) is None  # every row valid: the uncompacted path
+    assert cake_backend.valid_row_index(torch.zeros(0, dtype=torch.int64, device=DEV)) is None
+    assert cake_backend.valid_row_index(torch.full((4,), IGNORE_INDEX, device=DEV)).numel() == 0
+    rows = torch.arange(6, dtype=torch.float32, device=DEV).view(3, 2)
+    out = cake_backend.scatter_rows(rows, idx, 5)
+    assert tuple(out.shape) == (5, 2) and torch.equal(out[idx], rows) and torch.all(out[[1, 4]] == 0)
+    assert cake_backend.scatter_rows(rows, None, 5) is rows
+    empty = cake_backend.scatter_rows(rows[:0], idx[:0], 5)
+    assert tuple(empty.shape) == (5, 2) and torch.all(empty == 0)
+
+
+def test_compact_rows_default_env(monkeypatch):
+    monkeypatch.delenv(cake_backend.COMPACT_ROWS_ENV, raising=False)
+    assert cake_backend.compact_rows_default() is True
+    monkeypatch.setenv(cake_backend.COMPACT_ROWS_ENV, "0")
+    assert cake_backend.compact_rows_default() is False
+    monkeypatch.setenv(cake_backend.COMPACT_ROWS_ENV, "1")
+    assert cake_backend.compact_rows_default() is True
+
+
+def test_memory_report_compaction():
+    V, H, C, T, T_v = DEFAULT_V, DEFAULT_H, 4096, 4097, 3892
+    align = lambda n: (n + WORKSPACE_ALIGN - 1) // WORKSPACE_ALIGN * WORKSPACE_ALIGN
+    plain = memory_report(T, H, V, C)
+    assert not plain["compact_rows"] and plain["valid_rows"] == T and plain["gather_bytes"] == 0 and "x_c" not in plain["temporary"]
+    m = memory_report(T, H, V, C, valid_rows=T_v)
+    assert m["compact_rows"] and m["valid_rows"] == T_v and m["num_chunks"] == 1 and m["vocab_rows_max"] == T_v
+    assert m["gather_bytes"] == m["temporary"]["x_c"] == T_v * H * 2
+    assert m["temporary"]["logits"] == T_v * V * 2 < plain["temporary"]["logits"]
+    assert m["temporary"]["row_index"] == T_v * 8 and m["temporary"]["dx_compact"] == T_v * H * 2
+    assert m["temporary"]["lse"] == T_v * 4 and m["temporary"]["logp"] == T_v * 4  # the compact rows before the scatter
+    assert m["accumulators"]["dX_acc"] == T_v * H * 4 and m["outputs"]["dX"] == T * H * 2  # accumulate compact, return [T, H]
+    assert m["outputs"] == plain["outputs"] and m["weights"] == plain["weights"]
+    assert "x_copy" not in memory_report(T, H, V, C, x_copy=True, valid_rows=T_v)["temporary"]  # the gather output is contiguous
+    lp = memory_report(T, H, V, C, entry="logprob", valid_rows=T_v)
+    assert lp["temporary"]["dlogp"] == T * 4 and lp["temporary"]["dlogp_compact"] == T_v * 4 and lp["accumulators"]["saved_lse"] == T_v * 4
+    assert memory_report(T, H, V, C, valid_rows=0)["num_chunks"] == 0
+    layout = workspace_layout(T_v, V, C, hidden=H, compact=True)
+    assert layout["x_c"][1] == T_v * H * 2 and layout["total"] == workspace_layout(T_v, V, C)["total"] + align(T_v * H * 2)
+    with pytest.raises(ValueError, match="hidden"):
+        workspace_layout(T_v, V, C, compact=True)
+    assert lm_head_loss_workspace_size(T, V, C, backend="reference", hidden=H, compact_rows=True) == workspace_layout(T, V, C, hidden=H, compact=True)["total"]
+    with pytest.raises(ValueError, match="hidden"):
+        lm_head_loss_workspace_size(T, V, C, backend="reference", compact_rows=True)
+
+
+COMPACTION_CASES = [("ce", "loss"), ("policy", "loss"), ("ce", "logprob")]
+
+
+@pytest.mark.parametrize("frac", ["none", "five_percent", "half", "all_but_one"])
+@pytest.mark.parametrize("objective, entry", COMPACTION_CASES, ids=["ce", "policy", "logprob"])
+def test_compaction_matches_uncompacted(objective, entry, frac):
+    T, C = 37, 16
+    ignore = {"none": 0.0, "five_percent": 0.05, "half": 0.5, "all_but_one": (T - 1) / T}[frac]
+    inp = _host_inputs(T, objective, ignore_frac=ignore)
+    num_ignored = int((~inp.valid).sum())
+    assert num_ignored == (T - 1 if frac == "all_but_one" else round(ignore * T))
+    T_v = T - num_ignored
+    compact = _run(inp, C, entry=entry, compact_rows=True)
+    plain = _run(inp, C, entry=entry, compact_rows=False)
+    for result in (compact, plain):
+        _check_dtypes(result, inp)
+        _check_against_references(result, inp, entry=entry)
+        assert torch.all(result["logp"][~inp.valid] == 0) and torch.all(result["dX"][~inp.valid] == 0)
+    if num_ignored == 0:  # every row valid: the very same (uncompacted) path
+        for key in ("loss", "logp", "dX", "dW"):
+            assert torch.equal(compact[key], plain[key]), key
+    else:
+        # the same per-row work over fewer rows; the reference GEMMs may round differently for another M, and
+        # the loss / dW reductions run over different chunk boundaries -- the same precision level, not bitwise
+        assert torch.allclose(compact["logp"], plain["logp"], rtol=1e-5, atol=2e-5)
+        assert rel_l2(compact["dX"].float(), plain["dX"].float()) <= 1e-3
+        assert rel_l2(compact["dW"].float(), plain["dW"].float()) <= 1e-3
+        assert torch.allclose(compact["loss"], plain["loss"], rtol=1e-5, atol=1e-6)
+    # the plan of the compacted forward covers the valid rows only; the outputs keep the caller's [T]
+    kw = dict(objective=objective, loss_div=inp.loss_div if objective == "ce" else None, infer_logp=inp.infer_logp,
+              loss_weights=inp.loss_weights)
+    if entry == "loss":
+        fr = cake_backend.forward_loss(inp.X, inp.W, inp.labels, chunk_size=C, backend="reference", compact_rows=True, **kw)
+        assert tuple(fr.dx_acc.shape) == (T_v, H_HOST)
+    else:
+        fr = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, chunk_size=C, backend="reference", compact_rows=True)
+        assert tuple(fr.lse.shape) == (T_v,)  # the saved statistic stays compact
+    assert tuple(fr.logp.shape) == (T,) and fr.num_rows == T and torch.equal(fr.logp, compact["logp"])
+    assert (fr.row_index is None) == (num_ignored == 0)
+    assert fr.memory["compact_rows"] == (num_ignored > 0) and fr.memory["valid_rows"] == T_v
+    assert fr.memory["num_chunks"] == -(-T_v // C) and fr.memory["vocab_rows_max"] == min(T_v, C)
+    if num_ignored:
+        assert torch.equal(fr.row_index, inp.valid.nonzero().squeeze(1))
+        assert fr.memory["gather_bytes"] == min(T_v, C) * H_HOST * 2
+    plain_fr = cake_backend.forward_loss(inp.X, inp.W, inp.labels, chunk_size=C, backend="reference", compact_rows=False, **kw) if entry == "loss" else None
+    if plain_fr is not None:
+        assert plain_fr.row_index is None and not plain_fr.memory["compact_rows"] and plain_fr.memory["num_chunks"] == -(-T // C)
+
+
+def test_compacted_runner_binds_the_valid_rows():
+    T, C = 37, 16
+    inp = _host_inputs(T, "policy", ignore_frac=0.5)
+    idx = cake_backend.valid_row_index(inp.labels)
+    T_v = int(idx.numel())
+    runner = prepare_lm_head_loss(inp.X, inp.W, inp.labels, objective="policy", infer_logp=inp.infer_logp, loss_weights=inp.loss_weights,
+                                  chunk_size=C, backend="reference", compact_rows=True)
+    plan, t = runner.plan, runner.tensors
+    assert plan.compact and plan.rows == T_v and runner.valid_rows == T_v and torch.equal(runner.row_index, idx)
+    assert plan.chunks == plan_chunks(T_v, C) and runner.problem.num_rows == T
+    assert runner.stages == stages_for_entry("loss")  # the host gathers are not stages of the program
+    # the row operands are gathered once per step, the chunk's X rows before each chunk
+    assert runner.forward_order[:3] == (("gather_rows", "infer_logp"), ("gather_rows", "loss_weights"), ("gather_rows", 0))
+    assert runner.forward_order[3:5] == (("gemm_logits", 0), ("row_finalize", 0))
+    assert [k for k in runner.forward_order if k[0] == "gather_rows" and isinstance(k[1], int)] == [("gather_rows", i) for i in range(plan.num_chunks)]
+    assert tuple(t["labels"].shape) == (T_v,) and torch.equal(t["labels"].long(), inp.labels[idx])
+    assert tuple(t["x_c"].shape) == (min(T_v, C), H_HOST) and t["x_c"].dtype == torch.bfloat16
+    assert tuple(t["lse"].shape) == tuple(t["logp"].shape) == (T_v,) and tuple(t["dx_acc"].shape) == tuple(t["dx_out"].shape) == (T_v, H_HOST)
+    assert t["infer_logp_full"] is inp.infer_logp and tuple(t["infer_logp"].shape) == (T_v,)
+    for index, (row0, rows_c) in enumerate(plan.chunks):
+        g = stage_values("gather_rows", t, plan, index)
+        assert g["src"] is t["X"] and tuple(g["out"].shape) == (rows_c, H_HOST) and g["out"].data_ptr() == t["x_c"].data_ptr()
+        assert torch.equal(g["idx"], idx[row0:row0 + rows_c])
+        v = stage_values("gemm_logits", t, plan, index)
+        assert v["T"] == T_v and v["A"].data_ptr() == t["x_c"].data_ptr() and tuple(v["A"].shape) == (rows_c, H_HOST)
+        assert stage_values("gemm_dw_acc", t, plan, index)["B"].data_ptr() == t["x_c"].data_ptr()
+    op = stage_values("gather_rows", t, plan, "infer_logp")
+    assert op["src"] is inp.infer_logp and op["out"] is t["infer_logp"] and op["idx"] is idx
+    runner.step()
+    assert torch.equal(t["infer_logp"], inp.infer_logp[idx]) and torch.equal(t["x_c"][: plan.chunks[-1][1]], inp.X[idx[plan.chunks[-1][0]:]])
+    autograd = _run(inp, C, compact_rows=True)
+    assert torch.equal(runner.scatter(runner.logp), autograd["logp"]) and torch.equal(runner.scatter(runner.dx_out), autograd["dX"])
+    assert torch.equal(runner.loss.reshape(()), autograd["loss"]) and torch.equal(runner.dw_out, autograd["dW"])
+    assert torch.all(runner.scatter(runner.logp)[~inp.valid] == 0)
+    with pytest.raises(ValueError, match="gather_rows"):
+        stage_values("gather_rows", t, cake_backend.make_plan(runner.problem, need_dx=True, need_dw=True), 0)
+    # the log-probability runner gathers the caller's [T] dlogp at the start of its backward
+    lp = prepare_lm_head_loss(inp.X, inp.W, inp.labels, chunk_size=C, entry="logprob", dlogp=inp.dlogp, backend="reference", compact_rows=idx)
+    assert lp.backward_order[:2] == (("gather_rows", "d_in"), ("gather_rows", 0)) and lp.dlogp is inp.dlogp
+    assert tuple(lp.tensors["d_in"].shape) == (T_v,) and tuple(lp.lse.shape) == (T_v,)
+    lp.forward()
+    dx, dw = lp.backward()
+    assert torch.equal(lp.tensors["d_in"], inp.dlogp[idx]) and tuple(dx.shape) == (T_v, H_HOST)
+    ref = _run(inp, C, entry="logprob", compact_rows=True)
+    assert torch.equal(lp.scatter(dx), ref["dX"]) and torch.equal(dw, ref["dW"]) and torch.equal(lp.scatter(lp.logp), ref["logp"])
+    # a runner cannot be prepared over no valid rows; a mismatching index is rejected
+    with pytest.raises(ValueError, match="valid row"):
+        prepare_lm_head_loss(inp.X, inp.W, torch.full_like(inp.labels, IGNORE_INDEX), objective="ce", loss_div=1.0, chunk_size=C,
+                             backend="reference", compact_rows=True)
+    with pytest.raises(ValueError, match="int64"):
+        prepare_lm_head_loss(inp.X, inp.W, inp.labels, objective="ce", loss_div=1.0, chunk_size=C, backend="reference", compact_rows=idx.int())
+
+
+@pytest.mark.parametrize("entry", ["loss", "logprob"])
+def test_all_ignored_rows_compacted_return_zeros_without_binding(entry, monkeypatch):
+    def refuse(*args, **kwargs):
+        raise AssertionError("a call whose every row is ignored must neither bind nor launch")
+
+    monkeypatch.setattr(cake_backend, "prepare_lm_head_loss", refuse)
+    monkeypatch.setattr(cake_backend, "record_for", refuse)
+    inp = _host_inputs(37, ignore_frac=1.0)
+    cache = cake_backend.BINDING_CACHE
+    hits, misses = cache.hits, cache.misses
+    if entry == "loss":
+        fr = cake_backend.forward_loss(inp.X, inp.W, inp.labels, objective="ce", loss_div=inp.loss_div, backend="reference", compact_rows=True)
+        assert fr.loss.item() == 0.0 and tuple(fr.logp.shape) == (37,) and torch.all(fr.logp == 0)
+        assert tuple(fr.dx_acc.shape) == (0, H_HOST) and torch.all(fr.dw_acc == 0) and fr.row_index.numel() == 0
+        assert fr.memory["compact_rows"] and fr.memory["valid_rows"] == 0 and fr.memory["num_chunks"] == 0
+        dx, dw = cake_backend.backward_loss(fr.dx_acc, fr.dw_acc, None, backend="reference", row_index=fr.row_index, num_rows=fr.num_rows)
+        assert tuple(dx.shape) == (37, H_HOST) and torch.all(dx == 0) and torch.all(dw == 0)
+    else:
+        fr = cake_backend.forward_logprob(inp.X, inp.W, inp.labels, backend="reference", compact_rows=True)
+        assert tuple(fr.logp.shape) == tuple(fr.lse.shape) == (37,) and torch.all(fr.logp == 0) and torch.all(fr.lse == 0)
+        dx, dw = cake_backend.backward_logprob(inp.X, inp.W, inp.labels, fr.lse, inp.dlogp, backend="reference", compact_rows=True)
+        assert tuple(dx.shape) == (37, H_HOST) and torch.all(dx == 0) and torch.all(dw == 0)
+    result = _run(inp, 16, entry=entry, compact_rows=True)
+    _check_dtypes(result, inp)
+    assert result["loss"].item() == 0.0 and torch.all(result["logp"] == 0) and torch.all(result["dX"] == 0) and torch.all(result["dW"] == 0)
+    assert (cache.hits, cache.misses) == (hits, misses)
+
+
+# ---------------------------------------------------------------------------
 # Device tests (compute capability 10.0 / 10.3 with a registered program; the pinned
 # GLM-class geometry H = 6144, V = 154880 with small T)
 # ---------------------------------------------------------------------------
@@ -1109,6 +1303,113 @@ def test_device_t_changes_between_calls(glm_weight):
             assert torch.equal(a[key], b[key]), key
     assert torch.equal(fresh[0]["loss"], fresh[2]["loss"])
     _check_against_references(again[1], inputs[1], ceiling=True)
+
+
+def test_device_compaction_parity(glm_weight):
+    """Compacted and uncompacted chunk loops over the same kernels: per-row logp bitwise, dX rows bitwise when the
+    chunk's K-slice count agrees, loss / dW at the same precision (different chunk boundaries); the compacted
+    runner's step allocates nothing and equals the autograd path."""
+    _require_program(entry="loss")
+    inp = _device_inputs(4097, W=glm_weight)  # five percent of the rows ignored
+    T_v = int(inp.valid.sum())
+    assert 0 < T_v < inp.T
+    compact = _run(inp, 4096, backend="cake", compact_rows=True)
+    plain = _run(inp, 4096, backend="cake", compact_rows=False)
+    _check_dtypes(compact, inp)
+    _check_against_references(compact, inp, ceiling=True)
+    assert torch.equal(compact["logp"], plain["logp"])
+    assert torch.all(compact["dX"][~inp.valid] == 0)
+    assert rel_l2(compact["dW"].float(), plain["dW"].float()) <= GATE_TINY["dW_rel_l2"]
+    assert torch.allclose(compact["loss"], plain["loss"], rtol=1e-5, atol=1e-6)
+    kw = dict(objective="ce", loss_div=inp.loss_div, chunk_size=4096, backend="cake")
+    rc = prepare_lm_head_loss(inp.X, inp.W, inp.labels, compact_rows=True, **kw)
+    rp = prepare_lm_head_loss(inp.X, inp.W, inp.labels, compact_rows=False, **kw)
+    assert rc.plan.compact and rc.plan.rows == T_v and rc.plan.chunks == plan_chunks(T_v, 4096) and rp.plan.chunks == ((0, 4096), (4096, 1))
+    assert tuple(rc.logp.shape) == (T_v,) and tuple(rc.dx_out.shape) == (T_v, DEFAULT_H)
+    rc.step()
+    rp.step()
+    torch.cuda.synchronize()
+    logp_c = rc.scatter(rc.logp)
+    assert torch.equal(logp_c, plain["logp"]) and torch.equal(logp_c, compact["logp"])
+    assert torch.equal(rc.scatter(rc.dx_out), compact["dX"]) and torch.equal(rc.dw_out, compact["dW"]) and torch.equal(rc.loss.reshape(()), compact["loss"])
+    if rc.plan.dx_slices_of(0) == rp.plan.dx_slices_of(0):  # same K-slice count: the rows of the first plain chunk are bitwise
+        assert torch.equal(rc.scatter(rc.dx_out)[:4096], rp.dx_out[:4096])
+    assert rc.memory["compact_rows"] and rc.memory["valid_rows"] == T_v and rc.memory["gather_bytes"] == T_v * DEFAULT_H * 2
+    before = torch.cuda.memory_stats()
+    rc.step()
+    torch.cuda.synchronize()
+    after = torch.cuda.memory_stats()
+    assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
+    # the log-probability entry: compact saved statistic, scattered gradients
+    lp_c = _run(inp, 4096, entry="logprob", backend="cake", compact_rows=True)
+    lp_p = _run(inp, 4096, entry="logprob", backend="cake", compact_rows=False)
+    _check_against_references(lp_c, inp, entry="logprob", ceiling=True)
+    assert torch.equal(lp_c["logp"], lp_p["logp"]) and torch.all(lp_c["dX"][~inp.valid] == 0)
+    assert rel_l2(lp_c["dW"].float(), lp_p["dW"].float()) <= GATE_TINY["dW_rel_l2"]
+
+
+_FRESH_PROCESS_SCRIPT = """
+import sys, torch
+sys.path.insert(0, {root!r})
+from flashinfer.chunked_lm_head import chunked_lm_head_logprob
+from tests.test_helpers.cake_lm_head_loss_reference import make_inputs
+W = make_inputs(1, seed={seed_w}, device="cuda", ignore_frac=0.0).W  # the module fixture's weight
+inp = make_inputs({T}, seed={seed}, device="cuda", W=W, ignore_frac=0.05)
+X = inp.X.detach().requires_grad_(True)
+W = inp.W.detach().requires_grad_(True)
+import warnings
+warnings.simplefilter("ignore")
+logp = chunked_lm_head_logprob(X, W, inp.labels, chunk_size={C}, backend="cake")
+dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
+torch.cuda.synchronize()
+torch.save(dict(logp=logp.detach().cpu(), dX=dX.cpu(), dW=dW.cpu()), {out!r})
+"""
+
+
+def test_device_logprob_grad_from_fresh_thread_and_process(glm_weight, tmp_path):
+    """The log-probability backward recomputes the logits on PyTorch's autograd worker thread under
+    ``torch.autograd.grad``: a thread whose first CUDA work is the generated launch has no current CUDA
+    context, so the generated host shim must bind the device's primary context itself.  The result must be
+    bitwise the main-thread path's, from a fresh thread and from a fresh process."""
+    _require_program(entry="logprob")
+    T, C = 4097, 4096
+    inp = _device_inputs(T, W=glm_weight)
+
+    def grad_path():
+        X = inp.X.detach().requires_grad_(True)
+        W = inp.W.detach().requires_grad_(True)
+        with _quiet_experimental():
+            logp = chunked_lm_head_logprob(X, W, inp.labels, chunk_size=C, backend="cake")
+            dX, dW = torch.autograd.grad(logp, (X, W), inp.dlogp)
+        torch.cuda.synchronize()
+        return dict(logp=logp.detach(), dX=dX, dW=dW)
+
+    main = grad_path()
+    _check_against_references(main, inp, entry="logprob", ceiling=True)
+    outcome = {}
+
+    def worker():
+        try:
+            outcome["result"] = grad_path()
+        except BaseException as exc:  # surfaced by the assertion below
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=worker, name="fresh-launch-thread")
+    thread.start()
+    thread.join()
+    assert "error" not in outcome, f"launch from a fresh thread failed: {outcome.get('error')!r}"
+    for key in ("logp", "dX", "dW"):
+        assert torch.equal(outcome["result"][key], main[key]), key
+    # a fresh process: the same seeded inputs, the same entry, bitwise the same result
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    out = tmp_path / "fresh_process.pt"
+    script = _FRESH_PROCESS_SCRIPT.format(root=root, T=T, seed=SEED + T, seed_w=SEED, C=C, out=str(out))
+    env = dict(os.environ, PYTHONPATH=root + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=env, cwd=root, timeout=1800)
+    assert proc.returncode == 0, f"fresh process failed ({proc.returncode}):\n{proc.stdout[-2000:]}\n{proc.stderr[-4000:]}"
+    fresh = torch.load(out)
+    for key in ("logp", "dX", "dW"):
+        assert torch.equal(fresh[key].to(main[key].device), main[key]), key
 
 
 def test_device_memory_rule(glm_weight):
