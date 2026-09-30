@@ -136,8 +136,13 @@ def cake_situ_weights(cake_situ_device):
 
 @pytest.fixture(scope="module")
 def cake_situ_workspace(cake_situ_device):
-    # A single maximum-size allocation is reused across all four token sizes.
-    return torch.empty(_workspace_size(), dtype=torch.uint8, device=cake_situ_device)
+    # A single maximum-size allocation is reused across all parametrized token
+    # sizes; the 16384-token shape needs the largest layout.
+    return torch.empty(
+        _workspace_size(max_num_tokens=16384),
+        dtype=torch.uint8,
+        device=cake_situ_device,
+    )
 
 
 @pytest.mark.parametrize(
@@ -217,8 +222,8 @@ def _trtllm_reference(x, ids, route_weights, prepared):
 
 @pytest.mark.parametrize(
     "num_tokens",
-    [64, 256, 512, 2048],
-    ids=["n8", "n16", "n32", "n128"],
+    [64, 256, 512, 2048, 16384],
+    ids=["n8", "n16", "n32", "n128", "m16384"],
 )
 def test_cake_situ_output_workspace_and_external_graph(
     num_tokens,

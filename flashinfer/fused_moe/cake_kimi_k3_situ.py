@@ -33,6 +33,8 @@ _LAYOUT = "trtllm_shuffled_nvfp4_group16"
 _STATE_ATTR = "_flashinfer_cake_situ_workspace"
 _N32_CLAIM8_ARCHES = ("sm_100a", "sm_103a")
 _M256_C12_ARCHES = ("sm_100a",)
+_LARGE_C7_ARCHES = ("sm_103a", "sm_100a")
+_LARGE_C7_TOKENS = (16384,)
 
 
 def _tile_n(num_tokens):
@@ -89,6 +91,8 @@ def _workspace_layout(num_tokens, arch=None):
         or (num_tokens in (512, 1024) and arch in (None, *_N32_CLAIM8_ARCHES))
     ):
         fields += (("fc2_work_counter", torch.int32, (1,), 4),)
+    if num_tokens in _LARGE_C7_TOKENS and arch in (None, *_LARGE_C7_ARCHES):
+        fields += (("sfb_shuffled", torch.uint8, (max_tiles * (_H // 512) * 4096,), 1),)
     layout, offset = {}, 0
     for name, dtype, shape, element_bytes in fields:
         offset = (offset + 127) // 128 * 128
@@ -259,6 +263,7 @@ def cake_fused_moe_prepare_workspace(
         mid_work5fd = arch in ("sm_100a", "sm_103a") and num_tokens in (2048, 4096)
         n32_claim8 = arch in _N32_CLAIM8_ARCHES and num_tokens in (512, 1024)
         m256_c12 = arch in _M256_C12_ARCHES and num_tokens == 256
+        large_c7 = arch in _LARGE_C7_ARCHES and num_tokens in _LARGE_C7_TOKENS
         tile_n, total_pairs, max_tiles = _geometry(num_tokens, arch)
         fc2_device_workfeed = num_tokens in (8, 16) or m64_claim8 or n32_claim8
         fc2_grid_n = max_tiles
@@ -283,6 +288,7 @@ def cake_fused_moe_prepare_workspace(
             mid_work5fd,
             n32_claim8,
             m256_c12,
+            large_c7,
         )
         module = get_cake_situ_module(program_key)
         state["shapes"][num_tokens] = {
@@ -297,6 +303,7 @@ def cake_fused_moe_prepare_workspace(
             "mid_work5fd": mid_work5fd,
             "n32_claim8": n32_claim8,
             "m256_c12": m256_c12,
+            "large_c7": large_c7,
             "fc2_device_workfeed": fc2_device_workfeed,
             "fc2_grid_n": fc2_grid_n,
             "fc2_pool_ctas": (_H // 128) * fc2_grid_n,
@@ -551,6 +558,19 @@ def _cake_situ_stage_bindings(options, prepared):
                 tile_n_shift=tile_n.bit_length() - 1,
             ),
         }
+    if prepared["large_c7"]:
+        stages["sfb_shuffle"] = dict(
+            grid=(max_tiles, 1, 1),
+            SFB=views["x_scales"],
+            **{
+                name: views[name]
+                for name in ("route_map", "tile_mn_limit", "total_tiles")
+            },
+            SFBS=views["sfb_shuffled"],
+            K=_H,
+            K_tiles=_H // 512,
+            grid_n=max_tiles,
+        )
     stages.update(
         {
             "fc1": dict(
@@ -580,6 +600,11 @@ def _cake_situ_stage_bindings(options, prepared):
                 grid_m=_I // 64,
                 grid_n=max_tiles,
                 K_tiles=_H // 512,
+                **(
+                    {"SFBS": views["sfb_shuffled"].view(max_tiles, _H // 64, 2, 256)}
+                    if prepared["large_c7"]
+                    else {}
+                ),
             ),
             "fc2": dict(
                 grid=(_H // 128, prepared["fc2_grid_n"], 1),
