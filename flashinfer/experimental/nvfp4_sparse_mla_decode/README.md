@@ -1,4 +1,4 @@
-# NVFP4 sparse MLA decode (SM100, experimental)
+# NVFP4 sparse MLA decode (SM100/SM103, experimental)
 
 Owner: @stu-cao · Tracking issue: to be opened with the upstream PR · Status: experimental, JIT-only
 
@@ -13,15 +13,18 @@ out[t, h] = bmm2_scale * sum_k softmax_k(bmm1_scale * query[t, h] . K[i_tk]) * V
 
 ## Why
 
-On SM100 an NVFP4 cache otherwise reaches sparse MLA in one of two slower ways:
+FlashInfer has no SM100 sparse MLA decode that reads an NVFP4 cache. An engine that stores `nvfp4_ds_mla` rows
+reaches sparse MLA on SM100 in one of two ways:
 
-- FlashMLA's NVFP4 sparse decode pads 16 heads per rank to 64. At 5-15 tokens per step it took 26 us per layer in our
-  measurements, against about 14 us for FP8 TRTLLM-gen.
-- A gather that restages the selected rows as FP8 for TRTLLM-gen adds 5.3 us per layer at 15 tokens (17.7 against
-  12.4 us) plus the staging traffic, and re-rounding every dequantized value to e4m3 costs 3.0-4.7 % relative error.
+- FlashMLA's NVFP4 sparse decode, which pads the 16 heads per rank to 64.
+- A gather that restages the selected rows as FP8 for TRTLLM-gen. On GB200 at 15 tokens per step the gather costs
+  5.3 us per layer on top of TRTLLM-gen's 12.4 us, plus its traffic through global memory, and re-rounding every
+  dequantized value to e4m3 costs 3.0-4.7 % relative error.
 
-This kernel reads the 352-byte rows directly (39 % fewer bytes per key than FP8's 576) and stays within 0.26 % of an
-exact FP32 result.
+This kernel reads the 352-byte rows directly, 39 % fewer bytes per key than FP8's 576 (an NVFP4 cache holds 1.6x the
+tokens), and stays within 0.3 % of an exact FP32 result. It is faster than FP8 TRTLLM-gen only in a band of batch sizes
+(see Measurements): the reason to store NVFP4 is capacity, and this kernel keeps decode from paying for the staging
+gather.
 
 ## Usage
 
@@ -35,7 +38,8 @@ import torch
 import flashinfer
 
 rows = 64 * 1024
-kv_cache = torch.zeros(rows, 352, dtype=torch.uint8, device="cuda")  # nvfp4_ds_mla rows, written by the engine
+kv_cache = torch.randint(0, 256, (rows, 352), dtype=torch.uint8, device="cuda")  # nvfp4_ds_mla rows, written by the engine
+kv_cache[:, 256:] = torch.rand(rows, 96, device="cuda").to(torch.float8_e4m3fn).view(torch.uint8)  # RoPE values and scales
 query = torch.randn(4, 16, 576, device="cuda").to(torch.float8_e4m3fn)
 indices = torch.randint(0, rows, (4, 2048), dtype=torch.int32, device="cuda")
 indices[:, 1500:] = -1  # empty slots
@@ -45,6 +49,8 @@ print(out.shape, out.dtype)  # torch.Size([4, 16, 512]) torch.bfloat16
 
 `bmm1_scale` is the softmax scale times the query's dequantization scale. `indices` holds flat row ids
 (`block_id * block_size + offset`), so a `[num_blocks, block_size, 352]` cache can be passed as is.
+`examples/experimental/nvfp4_sparse_mla_decode.py` runs the same call and checks the result against a PyTorch
+reference.
 
 ## Cache row layout (`nvfp4_ds_mla`, 352 bytes per token)
 
@@ -65,7 +71,8 @@ A NoPE value is `e2m1 * scale`, with no per-tensor factor.
 - `topk` is a multiple of 32 that gives each CTA of a cluster 3 to 32 stages of 32 keys. Tested widths: 512, 1024, 2048.
 - `kv_cache` rows are contiguous; `indices` values are not range-checked (`-1` is the only special value).
 - Tuned for up to 45-46 query tokens per launch, what one wave of 3-CTA clusters holds on B300 and GB200. Larger
-  batches run in several waves and fall behind FP8 TRTLLM-gen.
+  batches run in several waves. Against FP8 TRTLLM-gen the kernel is ahead only in a band of batch sizes (10 to 25
+  tokens per launch on B300) and behind below and above it; see Measurements.
 
 ## Design
 
@@ -94,15 +101,17 @@ successor.
 
 Microseconds per launch, top-k 2048, 16 heads, request-shaped indices, CUDA-graph replay.
 
-B300, CUDA 13.0, this module (`benchmarks/bench_nvfp4_sparse_mla_decode.py`):
+B300 SXM6 (compute capability 10.3), CUDA 13.0, driver 580.173.02, torch 2.14.0+cu130, this module
+(`python benchmarks/bench_nvfp4_sparse_mla_decode.py`, tokens per launch = 5 x requests):
 
 | tokens per launch | 5 | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 |
 |---|---|---|---|---|---|---|---|---|---|
-| FP8 TRTLLM-gen sparse MLA | 10.6 | 11.9 | 13.0 | 16.7 | 16.9 | 16.8 | 18.9 | 19.5 | 22.0 |
-| this kernel | 12.2 | 12.4 | 12.4 | 15.0 | 17.1 | 19.5 | 25.5 | 25.5 | 25.5 |
+| FP8 TRTLLM-gen sparse MLA | 11.0 | 12.4 | 12.8 | 16.5 | 19.0 | 16.7 | 19.2 | 19.8 | 22.3 |
+| this kernel | 12.0 | 12.2 | 12.4 | 14.9 | 17.0 | 19.6 | 25.4 | 25.3 | 25.3 |
 
-From 34 tokens B300 fits no more than 33 4-CTA clusters in a wave, so the plan drops to 3-CTA clusters, where each CTA
-walks more key stages.
+The kernel is ahead of FP8 TRTLLM-gen at 10 to 25 tokens per launch (by 2 to 10 %) and behind at 5 tokens and from 30
+(by 9 % at 5, 14 to 33 % from 30). From 34 tokens B300 fits no more than 33 4-CTA clusters in a wave, so the plan drops
+to 3-CTA clusters, where each CTA walks more key stages.
 
 GB200, CUDA 13.0, the same kernel body built outside FlashInfer:
 
@@ -118,9 +127,11 @@ slower than this one): 15.6 against 17.0 us at 20 tokens, 17.8 against 17.3 at 2
 
 ## Validation status
 
-- B300 (SM103, CUDA 13.0, driver 580): all 93 tests in `tests/experimental/test_nvfp4_sparse_mla_decode.py` pass,
-  including every cluster size, padded indices and CUDA-graph replay. The largest relative error against the exact
-  FP32 reference is 0.29 % over 5 to 64 tokens and three padding patterns.
+- B300 (SM103, CUDA 13.0, driver 580.173.02): on a fresh JIT build of this module on top of FlashInfer `main`
+  (13122fcf), all 93 tests in `tests/experimental/test_nvfp4_sparse_mla_decode.py` pass, including every cluster size,
+  padded indices and CUDA-graph replay, and `examples/experimental/nvfp4_sparse_mla_decode.py` reports 0.25 %
+  relative error. The largest relative error against the exact FP32 reference is 0.29 % over 5 to 64 tokens and three
+  padding patterns.
 - SM100: the kernel body is the one validated on GB200 inside vLLM, end to end, and in an exact-reference harness at
   0.26 % relative error, including padded indices. For `sm_100a` this module's kernel compiles to the same SASS as that
   build with its debug timestamps removed: 2,160 instructions with identical encodings, 128 registers, no spills. The
