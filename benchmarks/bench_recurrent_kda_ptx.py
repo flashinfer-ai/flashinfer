@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Input generation and correctness metric adapted from humanfia/kda-for-kda-release
+# Input generation and correctness metric adapted from NVlabs/kda (260927-kda-for-kda)
 # Copyright (c) 2026 KDA Team; MIT License, see LICENSE.kda-for-kda.txt.
 
 """INT21 KDA prefill: static PTX versus MoonshotAI/FlashKDA.

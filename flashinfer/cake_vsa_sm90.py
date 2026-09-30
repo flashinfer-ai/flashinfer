@@ -94,6 +94,15 @@ _FP32_MAX = 3.4028234663852886e38
 META_NSEQ = 4
 META_NOWN = 5
 META_NTILES = 7
+# Queue kernel (``attention_queue``): the last POOL_ROUNDS tiles of every CTA's
+# static list are handed out at run time; used only for uniform plans whose
+# every CTA has at least POOL_MIN_TILES tiles.  Both values match the kernel.
+POOL_ROUNDS = 2
+POOL_MIN_TILES = 12  # 8-tile rows measured 1 % slower on the CuTe route
+POOL_SMALL_MIN_TILES = (
+    8  # ... or this many tiles of at most POOL_SMALL_TILE_POS positions
+)
+POOL_SMALL_TILE_POS = 0  # 0 disables the tiny-tile exception
 META_SEQ_OFF = 8
 META_SEQ_WORDS = MAX_SEQ // 2
 MAX_OWN = MAX_SEQ // 2
@@ -932,40 +941,81 @@ def plan_vsa_sm90(
         infos, seqs, owns, lens, costs, loads = build(mode)
     lists, makespan = _assign_tiles(costs, loads, sms, refined)
     g = len(lists)
-    stride = max(len(lst) for lst in lists)
     if g > HDR_CTAS:
         raise ValueError(
             f"persistent grid {g} exceeds the {HDR_CTAS}-CTA by-value header"
         )
+    # Uniform plans with enough rounds run the queue kernel (``attention_queue``):
+    # every CTA keeps its static list (the list schedule, so concurrent CTAs
+    # stream one head in lock step) except its last POOL_ROUNDS tiles, which
+    # form a pool handed out at run time in the lists' round order (the tail
+    # then balances on measured, not modelled, tile times).  Ragged plans and
+    # short lists keep the static kernel: a big tile taken late costs up to one
+    # tile of tail, and a round boundary's simultaneous fetches need several
+    # rounds to amortise.
+    min_tiles = min(len(lst) for lst in lists)
+    queue = (not ragged) and (
+        min_tiles >= POOL_MIN_TILES
+        or (
+            POOL_SMALL_TILE_POS > 0
+            and min_tiles >= POOL_SMALL_MIN_TILES
+            and max(lens) <= POOL_SMALL_TILE_POS
+        )
+    )
+    pool_rounds = POOL_ROUNDS if queue else 0
+    static = [lst[: max(1, len(lst) - pool_rounds)] for lst in lists]
+    pool_order = sorted(
+        (i, c, t)
+        for c, lst in enumerate(lists)
+        for i, t in enumerate(lst)
+        if i >= len(static[c])
+    )
+    pool = [t for _, _, t in pool_order]
+    stride = max(len(st) for st in static)
+    # Queue layout: static rows, the pool rows, then one all-zero sentinel row
+    # per CTA (a fetch past the pool stages a slot whose word META_NTILES is 0).
+    n_rows = g * stride + len(pool) + (g if queue else 0)
     hdr = np.zeros((HDR_HALFWORDS,), dtype=np.int16)
-    for c, lst in enumerate(lists):
-        t = lst[0]
+    for c, st in enumerate(static):
+        t = st[0]
         n_hdr = min(HDR_ISSUE, lens[t])
         hdr[c * HDR_WORDS : c * HDR_WORDS + 5] = (*infos[t], n_hdr)
         hdr[c * HDR_WORDS + 5 : c * HDR_WORDS + 5 + 2 * n_hdr] = seqs[t][: 2 * n_hdr]
-    meta = np.zeros((g * stride, META_WORDS), dtype=np.uint32)
-    for c, lst in enumerate(lists):
-        for i, t in enumerate(lst):
-            r = c * stride + i
-            meta[r, 0:4] = infos[t]
-            meta[r, META_NSEQ] = lens[t]
-            sq = np.asarray(seqs[t], dtype=np.int64) & 0xFFFF
-            meta[r, META_SEQ_OFF : META_SEQ_OFF + len(sq) // 2] = sq[0::2] | (
-                sq[1::2] << 16
-            )
-            for w in range(NUM_CONSUMER_WGS):
-                ol = owns[t][w]
-                meta[r, META_NOWN + w] = len(ol)
-                if len(ol) > MAX_OWN:
-                    raise ValueError("own list exceeds MAX_OWN")
-                ow = np.asarray(ol + [0] * (len(ol) & 1), dtype=np.int64)
-                base = META_OWN_OFF + w * OWN_WORDS
-                meta[r, base : base + len(ow) // 2] = ow[0::2] | (ow[1::2] << 16)
-        meta[c * stride, META_NTILES] = len(lst)
+    # Plan rows laid out per CTA: row c * stride + i is CTA c's i-th (static)
+    # tile; the first row of each CTA also carries its (static) tile count
+    # (word META_NTILES).  Queue layout: the other static rows and the pool
+    # rows carry 1 in that word (valid), the sentinel rows 0.
+    meta = np.zeros((n_rows, META_WORDS), dtype=np.uint32)
+
+    def fill(r, t, nt):
+        meta[r, 0:4] = infos[t]
+        meta[r, META_NSEQ] = lens[t]
+        sq = np.asarray(seqs[t], dtype=np.int64) & 0xFFFF
+        meta[r, META_SEQ_OFF : META_SEQ_OFF + len(sq) // 2] = sq[0::2] | (
+            sq[1::2] << 16
+        )
+        for w in range(NUM_CONSUMER_WGS):
+            ol = owns[t][w]
+            meta[r, META_NOWN + w] = len(ol)
+            if len(ol) > MAX_OWN:
+                raise ValueError("own list exceeds MAX_OWN")
+            ow = np.asarray(ol + [0] * (len(ol) & 1), dtype=np.int64)
+            base = META_OWN_OFF + w * OWN_WORDS
+            meta[r, base : base + len(ow) // 2] = ow[0::2] | (ow[1::2] << 16)
+        meta[r, META_NTILES] = nt
+
+    for c, st in enumerate(static):
+        for i, t in enumerate(st):
+            fill(c * stride + i, t, len(st) if i == 0 else int(queue))
+    for j, tp in enumerate(pool):
+        fill(g * stride + j, tp, 1)
     return {
         "meta": torch.from_numpy(meta.view(np.int32).copy()),
         "hdr": torch.from_numpy(hdr),
         "tile_stride": stride,
+        "queue": queue,
+        "pool": pool,
+        "num_rows": n_rows,
         "mode": mode,
         "makespan": makespan,
         "num_ctas": g,
@@ -1165,6 +1215,8 @@ class CakeVsaSm90Plan:
         self.num_ctas = plan["num_ctas"]
         self.num_tiles = plan["num_tiles"]
         self.tile_stride = plan["tile_stride"]
+        self.queue = plan["queue"]
+        self.num_rows = plan["num_rows"]
         self.num_heads = plan["H"]
         self.qo_len = plan["MB"] * BLOCK
         self.kv_len = plan["NB"] * BLOCK
@@ -1175,8 +1227,11 @@ class CakeVsaSm90Plan:
             self.meta = host_meta.to(self.device, non_blocking=non_blocking)
             # By-value kernel parameter in both builds: stays on the host.
             self.hdr = plan["hdr"].contiguous()
-            # The kernel's debug/timeline buffers are inert in the exported
-            # build; they only have to exist on the device.
+            # The timeline buffer is inert in the exported build; ``dbg`` holds
+            # the queue kernel's two tile-queue words (zero between launches:
+            # the last CTA to drain the pool resets them, so a captured graph
+            # replays without a memset).  Like the split-KV counters, the words
+            # belong to this plan: two launches of one plan must not overlap.
             self.dbg = torch.zeros((64,), dtype=torch.int32, device=self.device)
             self.tl = torch.zeros((8,), dtype=torch.uint64, device=self.device)
             # Capture must retain an external wait node for the metadata
@@ -1250,7 +1305,7 @@ class CakeVsaSm90Plan:
                     raise ValueError("out must not overlap Q/K/V storage")
 
         if self.small_kmax is None:
-            stage = "attention"
+            stage = "attention_queue" if self.queue else "attention"
         elif self.small_cluster:
             stage = f"small_k{self.small_kmax}c{self.small_cluster}"
         else:

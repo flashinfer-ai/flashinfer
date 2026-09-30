@@ -43,6 +43,8 @@ _TRACE_REGISTRATION_MODULES = (
     "flashinfer.comm.dcp_alltoall",
     "flashinfer.comm.dcp_lse_reduce",
     "flashinfer.comm.pcie_ipc_ar",
+    "flashinfer.comm.pcie_ipc_collectives.all_gather",
+    "flashinfer.comm.pcie_ipc_collectives.reduce_scatter",
     "flashinfer.concat_ops",
     "flashinfer.cudnn.decode",
     "flashinfer.cudnn.prefill",

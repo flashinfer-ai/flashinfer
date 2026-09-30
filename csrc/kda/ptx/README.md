@@ -1,8 +1,8 @@
 # Static PTX Kimi Delta Attention
 
 These four SM103a programs and their TVM FFI shims are imported from
-[`humanfia/kda-for-kda-release`](https://github.com/humanfia/kda-for-kda-release),
-`kda-cake-ptxver/kda_ptx/shims/`. `manifest.json` records the exact release
+[`NVlabs/kda`, branch `260927-kda-for-kda`](https://github.com/NVlabs/kda/tree/ea37ebaff74c88a2545751dcb8ea8ef6c6251b67),
+`ptx/kda_ptx/shims/`. `manifest.json` records the exact source
 revision and SHA-256 of each retained file. Their bytes are unchanged.
 The original kernel lineage is `humanfia/kda-for-kda` branch
 `yahui-2.89x-ptx`, revision `82a6a79`, including its slow-decay FTZ fix.

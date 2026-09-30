@@ -1,7 +1,7 @@
 {
-  "repository": "https://github.com/humanfia/kda-for-kda-release",
-  "revision": "e4fcf0efaea6b6ac4d76ec1a0c137dc04532c925",
-  "source_directory": "kda-cake-ptxver/kda_ptx/shims",
+  "repository": "https://github.com/NVlabs/kda",
+  "revision": "ea37ebaff74c88a2545751dcb8ea8ef6c6251b67",
+  "source_directory": "ptx/kda_ptx/shims",
   "upstream_kernel_revision": "82a6a79",
   "target": "sm_103a",
   "ptx_version": "9.2",

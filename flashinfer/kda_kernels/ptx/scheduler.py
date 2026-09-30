@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 # See LICENSE.kda-for-kda.txt for the full license.
 
-"""Persistent KDA scheduler imported from kda-for-kda-release.
+"""Persistent KDA scheduler imported from NVlabs/kda.
 
 Whole sequence/head chains are packed across physical SMs. Long chains may be
 split only with an exact FP32 state handoff (within one launch or across two

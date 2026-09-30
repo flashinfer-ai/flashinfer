@@ -559,6 +559,9 @@ _TMA_SOURCE_ALIASES: Mapping[str, str] = {
     "tmap_compressed_k": "compressed_KV_cache",
     "tmap_compressed_v": "compressed_KV_cache",
     "tmap_compressed_kv": "compressed_KV_cache",
+    # The FP8 persistent bodies (round 5) store O through a TMA descriptor over
+    # the same [tokens, heads, 512] rows the plain ``O`` pointer argument sees.
+    "tmap_o": "O",
 }
 _SCALAR_ALIASES: Mapping[str, str] = {
     "num_q_heads": "num_heads",

@@ -14,8 +14,8 @@ import torch
 from ...utils import register_custom_op, register_fake_op
 from .jit import (
     MMA_ROUTE_SUFFIX,
+    PAIR_ROUTE_SUFFIX,
     SPLIT_ROUTE_SUFFIX,
-    TMEM_GQA_RATIO,
     TMEM_ROUTE_SUFFIX,
     TREE_KERNELS,
     gen_sm110_xqa_module,
@@ -277,8 +277,11 @@ def prepare(
     ``register_mma`` route for every other D512 cache mode), ``"tmem"`` (the
     tcgen05/TMEM-accumulator schedule: 128-row Q tile x 256-column output half per
     CTA, Q and K/V fetched once per thread-block cluster by TMA multicast; every
-    D512 cache mode, frozen for GQA ratio 8) or ``"auto"`` (the ``tmem`` route at
-    GQA ratio 8, the ``register_mma_auto`` selection for the other ratios).
+    D512 cache mode, one frozen trace per GQA ratio 2/4/8/16), ``"pair"`` (the
+    ``cta_group::2`` pair schedule: a (4, 1, 1) cluster issues one MMA stream for
+    the two 128-row Q tiles of a KV head; E4M3 KV only, even Q-tile counts per
+    head, GQA ratios 2/4/8/16) or ``"auto"`` (``pair`` for E4M3 KV with an even
+    Q-tile count per head, ``tmem`` otherwise).
     Preparation performs compilation and may allocate output/scratch; call it
     before graph capture. D128 counters are zeroed once on the current stream;
     another launch stream must explicitly wait for that preparation stream.
@@ -508,16 +511,25 @@ def prepare(
     layout = "paged" if page_table is not None else "contiguous"
     route = f"tree_{precision}_{layout}"
     fp16_paged = precision == "fp16" and layout == "paged"
+    q_tiles = (q_len * ratio + 127) // 128
     if kernel == "auto":
-        kernel = "tmem" if ratio == TMEM_GQA_RATIO else "register_mma_auto"
+        # The cta_group::2 pair schedule for E4M3 KV when every KV head has an even number of
+        # 128-row Q tiles; the tcgen05/TMEM cluster-multicast schedule otherwise.
+        kernel = "pair" if precision == "fp8" and q_tiles % 2 == 0 else "tmem"
     if kernel == "register_mma_auto":
         kernel = "register_mma_split" if fp16_paged else "register_mma"
-    if kernel == "tmem":
-        if ratio != TMEM_GQA_RATIO:
+    if kernel == "pair":
+        if precision != "fp8":
             raise ValueError(
-                f"tmem is frozen for GQA ratio {TMEM_GQA_RATIO} (query heads = "
-                f"{TMEM_GQA_RATIO} x KV heads); use register_mma_auto for other ratios"
+                "pair is frozen for E4M3 KV (contiguous or page128); use tmem or auto for FP16 KV"
             )
+        if q_tiles % 2:
+            raise ValueError(
+                "pair needs an even number of 128-row Q tiles per KV head "
+                "(ceil(q_len * ratio / 128)); use tmem or auto"
+            )
+        route += PAIR_ROUTE_SUFFIX
+    elif kernel == "tmem":
         route += TMEM_ROUTE_SUFFIX
     elif kernel == "register_mma_split":
         if not fp16_paged:
@@ -529,9 +541,12 @@ def prepare(
     elif kernel == "register_mma":
         route += MMA_ROUTE_SUFFIX
     metadata = manifest["routes"][route]
+    # One CTA per (Q tile, output half); the pair route's (4, 1, 1) cluster covers two Q tiles.
+    tiles_per_cluster = metadata.get("q_tiles_per_cluster", 1)
+    route_tiles = (q_len * ratio + metadata["tile_rows"] - 1) // metadata["tile_rows"]
     grid = (
-        512 // metadata["output_tile_columns"],
-        heads * ((q_len * ratio + metadata["tile_rows"] - 1) // metadata["tile_rows"]),
+        (512 // metadata["output_tile_columns"]) * tiles_per_cluster,
+        heads * (route_tiles // tiles_per_cluster),
         batch,
     )
     run = _tree_op(route)

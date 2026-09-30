@@ -5,31 +5,7 @@
 #   - scripts/build_jit_cache_provider_wheelhouse.sh    (provider experiment)
 #   - scripts/task_test_jit_cache_package_build_import.sh (PR tests)
 
-SCCACHE_VERSION="0.17.0"
-SCCACHE_CUDA_134_REVISION="e9b15a35f7240a7edd1b9644583edb388c6cb5f9"
-SCCACHE_CUDA_134_SOURCE_SHA256="9e444cc5097a839f03c81c59c5cadebc20090aad1fc699e398d5c1c18c44118c"
-
-# Compare CUDA major/minor versions supplied as either 13.4 or compact 134.
-cuda_version_at_least() {
-  local version=$1
-  local minimum_major=$2
-  local minimum_minor=$3
-  local major
-  local minor
-
-  if [[ "${version}" =~ ^([0-9]+)\.([0-9]+)$ ]]; then
-    major=${BASH_REMATCH[1]}
-    minor=${BASH_REMATCH[2]}
-  elif [[ "${version}" =~ ^([0-9]{2})([0-9]+)$ ]]; then
-    major=${BASH_REMATCH[1]}
-    minor=${BASH_REMATCH[2]}
-  else
-    return 1
-  fi
-
-  (( 10#${major} > minimum_major ||
-     (10#${major} == minimum_major && 10#${minor} >= minimum_minor) ))
-}
+SCCACHE_VERSION="0.18.0"
 
 # Compute MAX_JOBS and FLASHINFER_NVCC_THREADS from system memory/CPU,
 # clamping FLASHINFER_NVCC_THREADS to a sane range and budgeting per-job
@@ -273,79 +249,9 @@ install_released_sccache() {
   echo "sccache install duration: $((SECONDS - sccache_install_started_at)) seconds"
 }
 
-# Build a pinned sccache revision natively. Building inside each manylinux
-# builder produces the matching x86_64 or aarch64 binary without relying on an
-# unpublished binary artifact.
-build_patched_sccache() {
-  local sccache_revision=$1
-  local expected_sha256=$2
-  local output_path=$3
-  local sccache_package="sccache-${sccache_revision}"
-  local sccache_archive="${sccache_package}.tar.gz"
-  local sccache_url="https://github.com/mozilla/sccache/archive/${sccache_revision}.tar.gz"
-  local sccache_tmpdir
-  local required_command
-  local sccache_build_started_at=${SECONDS}
-
-  for required_command in cargo curl env install make perl sha256sum tar; do
-    if ! command -v "${required_command}" >/dev/null 2>&1; then
-      echo "ERROR: ${required_command} is required to build patched sccache"
-      exit 1
-    fi
-  done
-
-  sccache_tmpdir=$(mktemp -d)
-  curl -fsSL "${sccache_url}" -o "${sccache_tmpdir}/${sccache_archive}"
-  printf '%s  %s\n' "${expected_sha256}" "${sccache_tmpdir}/${sccache_archive}" | sha256sum -c -
-  tar xzf "${sccache_tmpdir}/${sccache_archive}" -C "${sccache_tmpdir}"
-
-  echo "Building sccache revision ${sccache_revision} for $(uname -m)"
-  # Do not expose cache credentials to third-party Cargo build scripts.
-  env \
-    -u AWS_ACCESS_KEY_ID \
-    -u AWS_SECRET_ACCESS_KEY \
-    -u AWS_SESSION_TOKEN \
-    CARGO_INCREMENTAL=0 \
-    cargo build \
-    --locked \
-    --release \
-    --no-default-features \
-    --features s3,vendored-openssl \
-    --bin sccache \
-    --manifest-path "${sccache_tmpdir}/${sccache_package}/Cargo.toml"
-  mkdir -p "$(dirname "${output_path}")"
-  install -m 0755 \
-    "${sccache_tmpdir}/${sccache_package}/target/release/sccache" \
-    "${output_path}"
-  rm -rf "${sccache_tmpdir}"
-  echo "patched sccache build duration: $((SECONDS - sccache_build_started_at)) seconds"
-}
-
-# Install the pinned source build, reusing a binary produced by a dedicated
-# workflow step when available. Other call sites retain a self-contained
-# fallback that builds directly into /usr/local/bin.
-install_patched_sccache() {
-  local sccache_revision=$1
-  local expected_sha256=$2
-
-  if [ -n "${SCCACHE_PATCHED_BINARY_PATH:-}" ]; then
-    if [ ! -x "${SCCACHE_PATCHED_BINARY_PATH}" ]; then
-      echo "ERROR: Prebuilt patched sccache not found: ${SCCACHE_PATCHED_BINARY_PATH}"
-      exit 1
-    fi
-    echo "Installing prebuilt patched sccache from ${SCCACHE_PATCHED_BINARY_PATH}"
-    install -m 0755 "${SCCACHE_PATCHED_BINARY_PATH}" /usr/local/bin/sccache
-  else
-    build_patched_sccache \
-      "${sccache_revision}" \
-      "${expected_sha256}" \
-      /usr/local/bin/sccache
-  fi
-}
-
-# Install the official release by default. CUDA 13.4 and newer use the first
-# upstream revision containing the CUDA 13.3+ dry-run parser fix while that fix
-# remains unreleased: https://github.com/mozilla/sccache/pull/2722
+# Install the official sccache release. v0.18.0 is the first release that
+# includes the CUDA 13.3+ nvcc dry-run parser fix required for CUDA 13.4:
+# https://github.com/mozilla/sccache/pull/2722
 install_sccache() {
   local sccache_version=$1
   local sccache_arch=$2
@@ -359,17 +265,9 @@ install_sccache() {
       ;;
   esac
 
-  if cuda_version_at_least "${CUDA_VERSION:-}" 13 4; then
-    install_patched_sccache \
-      "${SCCACHE_CUDA_134_REVISION}" \
-      "${SCCACHE_CUDA_134_SOURCE_SHA256}"
-    export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-source"
-    export FLASHINFER_SCCACHE_REVISION="${SCCACHE_CUDA_134_REVISION}"
-  else
-    install_released_sccache "${sccache_version}" "${sccache_arch}"
-    export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
-    export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
-  fi
+  install_released_sccache "${sccache_version}" "${sccache_arch}"
+  export FLASHINFER_SCCACHE_INSTALL_SOURCE="github-release"
+  export FLASHINFER_SCCACHE_REVISION="v${sccache_version}"
 }
 
 # Install sccache (if missing), configure environment, and start the server.
