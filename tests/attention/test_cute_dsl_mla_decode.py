@@ -1138,34 +1138,9 @@ def test_mla_reducer_d_tile_selection():
     assert _get_reducer_d_tiles(148, 8, 96, 148, 32) == 1
 
 
-@pytest.mark.parametrize("native_sm107", [False, True])
-@pytest.mark.parametrize("device_index", [None, 0, 1])
-def test_mla_launch_arch_resolution(monkeypatch, native_sm107, device_index):
-    if not is_cute_dsl_available():
-        pytest.skip("CuTe DSL not available")
-
-    from flashinfer.cute_dsl import availability
-    from flashinfer.cute_dsl.attention import compat
-
-    # The current device is SM107, but query tensors can live on SM100.
-    def capability(device):
-        return (10, 0) if device.index == 0 else (10, 7)
-
-    monkeypatch.setattr(compat, "get_compute_capability", capability)
-    monkeypatch.setattr(
-        availability,
-        "is_cute_dsl_arch_supported",
-        lambda major, minor, native_only=False: (
-            minor != 7 or not native_only or native_sm107
-        ),
-    )
-    device = None if device_index is None else torch.device("cuda", device_index)
-    expected = "sm_107" if device_index != 0 and native_sm107 else "sm_100"
-    assert compat.get_current_arch(device) == expected
-
-
 @pytest.mark.parametrize(
-    "arch, expected_stages", [("sm_100", (3, 2)), ("sm_107", (4, 4))]
+    "arch, expected_stages",
+    [("sm_100a", (3, 2)), ("sm_100f", (3, 2)), ("sm_107", (4, 4)), ("sm_107a", (4, 4))],
 )
 def test_mla_fp8_load_stages_use_launch_arch(arch, expected_stages):
     if not is_cute_dsl_available():
@@ -1186,7 +1161,8 @@ def test_mla_fp8_load_stages_use_launch_arch(arch, expected_stages):
     assert (kernel.load_k_stage, kernel.load_v_stage) == expected_stages
 
 
-def test_mla_fp8_compile_cache_separates_launch_arch(monkeypatch):
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_mla_compile_cache_separates_launch_arch(monkeypatch, dtype):
     if not is_cute_dsl_available():
         pytest.skip("CuTe DSL not available")
 
@@ -1200,13 +1176,16 @@ def test_mla_fp8_compile_cache_separates_launch_arch(monkeypatch):
     monkeypatch.setattr(
         mla_decode, "BlackwellMultiHeadLatentAttentionForwardFP8", kernel_cls
     )
+    monkeypatch.setattr(
+        mla_decode, "BlackwellMultiHeadLatentAttentionForwardFP16", kernel_cls
+    )
     monkeypatch.setattr(mla_decode, "get_max_active_clusters", lambda _: 1)
     monkeypatch.setattr(mla_decode, "Int32", int)
     monkeypatch.setattr(mla_decode, "Float32", float)
     compile_kernel = mla_decode._get_compiled_mla_kernel
     compile_kernel.cache_clear()
     kwargs = dict(
-        torch_dtype=torch.float8_e4m3fn,
+        torch_dtype=dtype,
         torch_out_dtype=torch.bfloat16,
         page_size=64,
         kv_lora_rank=512,
@@ -1219,12 +1198,19 @@ def test_mla_fp8_compile_cache_separates_launch_arch(monkeypatch):
         is_var_split_kv=False,
     )
     try:
-        sm107 = compile_kernel(arch="sm_107", **kwargs)
-        sm100 = compile_kernel(arch="sm_100", **kwargs)
-        assert (sm107["arch"], sm100["arch"]) == ("sm_107", "sm_100")
-        assert compile_kernel(arch="sm_107", **kwargs) is sm107
-        assert compile_kernel(arch="sm_100", **kwargs) is sm100
+        sm107 = compile_kernel(arch="sm_107a", **kwargs)
+        sm100 = compile_kernel(arch="sm_100a", **kwargs)
+        if dtype == torch.float8_e4m3fn:
+            assert (sm107["arch"], sm100["arch"]) == ("sm_107a", "sm_100a")
+        assert compile_kernel(arch="sm_107a", **kwargs) is sm107
+        assert compile_kernel(arch="sm_100a", **kwargs) is sm100
         assert fake_cute.compile.call_count == 2
+        assert [
+            call.kwargs["options"] for call in fake_cute.compile.call_args_list
+        ] == [
+            f"--enable-tvm-ffi --opt-level 2 --gpu-arch {arch}"
+            for arch in ("sm_107a", "sm_100a")
+        ]
     finally:
         compile_kernel.cache_clear()
 
