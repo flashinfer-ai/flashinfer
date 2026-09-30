@@ -276,7 +276,7 @@ def _get_compiled_mla_kernel(
         reducer_max_splits=reducer_max_splits,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
-        **({"arch": arch} if is_fp8 else {}),
+        arch=arch,
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of

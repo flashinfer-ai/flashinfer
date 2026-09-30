@@ -1161,7 +1161,39 @@ def test_mla_fp8_load_stages_use_launch_arch(arch, expected_stages):
     assert (kernel.load_k_stage, kernel.load_v_stage) == expected_stages
 
 
-@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+@pytest.mark.parametrize(
+    "arch, multi_query_stages",
+    [
+        ("sm_100a", 7),
+        ("sm_100f", 7),
+        ("sm_103a", 7),
+        ("sm_103f", 7),
+        ("sm_107", 8),
+        ("sm_107a", 8),
+    ],
+)
+@pytest.mark.parametrize("seq_len_q", [1, 2, 8])
+def test_mla_fp16_load_stages_use_launch_arch(arch, multi_query_stages, seq_len_q):
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode_fp16 import (
+        BlackwellMultiHeadLatentAttentionForwardFP16,
+    )
+
+    kernel = BlackwellMultiHeadLatentAttentionForwardFP16.__new__(
+        BlackwellMultiHeadLatentAttentionForwardFP16
+    )
+    kernel.arch = arch
+    kernel.seq_len_q = seq_len_q
+    kernel.mma_qk_tiler = (128, 128)
+    kernel.warps_in_n = 2
+    kernel.latent_dim = 512
+    kernel._setup_attributes()
+    assert kernel.load_kv_stage == (15 if seq_len_q == 1 else multi_query_stages)
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16, torch.float16])
 def test_mla_compile_cache_separates_launch_arch(monkeypatch, dtype):
     if not is_cute_dsl_available():
         pytest.skip("CuTe DSL not available")
@@ -1200,8 +1232,7 @@ def test_mla_compile_cache_separates_launch_arch(monkeypatch, dtype):
     try:
         sm107 = compile_kernel(arch="sm_107a", **kwargs)
         sm100 = compile_kernel(arch="sm_100a", **kwargs)
-        if dtype == torch.float8_e4m3fn:
-            assert (sm107["arch"], sm100["arch"]) == ("sm_107a", "sm_100a")
+        assert (sm107["arch"], sm100["arch"]) == ("sm_107a", "sm_100a")
         assert compile_kernel(arch="sm_107a", **kwargs) is sm107
         assert compile_kernel(arch="sm_100a", **kwargs) is sm100
         assert fake_cute.compile.call_count == 2
