@@ -220,7 +220,9 @@ class IndependentSmall:
         out: cute.Tensor,
     ):
         tx, _, _ = cute.arch.thread_idx()
-        bx, by, _ = cute.arch.block_idx()
+        tile, _, _ = cute.arch.block_idx()
+        bx = tile % (self.n // 64)
+        by = tile // (self.n // 64)
         lane = tx % 32
         warp = tx // 32
         group = lane // 4
@@ -363,8 +365,8 @@ class IndependentSmall:
     ):
         self.kernel(a, b, sfa, sfb, alpha, out).launch(
             grid=(
-                self.n // 64,
-                cute.ceil_div(cute.size(a, mode=[0]), self.tile_m),
+                (self.n // 64) * cute.ceil_div(cute.size(a, mode=[0]), self.tile_m),
+                1,
                 1,
             ),
             block=(128, 1, 1),

@@ -220,8 +220,9 @@ class IndependentMedium:
         )
         self.kernel(atom_a, ta, atom_b, tb, sfa, sfb, alpha, out, la, lb).launch(
             grid=(
-                cute.ceil_div(cute.size(out, mode=[0]), self.tile_m),
-                (self.n + self.tile_n - 1) // self.tile_n,
+                cute.ceil_div(cute.size(out, mode=[0]), self.tile_m)
+                * ((self.n + self.tile_n - 1) // self.tile_n),
+                1,
                 1,
             ),
             block=(self.threads, 1, 1),
@@ -298,7 +299,10 @@ class IndependentMedium:
         lb: cute.ComposedLayout,
     ):
         tx, _, _ = cute.arch.thread_idx()
-        bx, by, _ = cute.arch.block_idx()
+        tile, _, _ = cute.arch.block_idx()
+        tiles_m = cute.ceil_div(cute.size(out, mode=[0]), self.tile_m)
+        bx = tile % tiles_m
+        by = tile // tiles_m
         lane = tx % 32
         warp = tx // 32
         group = lane // 4

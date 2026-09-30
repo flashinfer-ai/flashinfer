@@ -40,7 +40,6 @@ import cutlass.utils.blockscaled_layout as blockscaled_utils
 import cutlass.utils.blackwell_helpers as sm120_utils
 
 from .blockscaled_gemm_dispatch import (
-    FP4_SHIFT_BITS,
     make_ldmatrix_atom,
     make_sm120_blockscaled_mma_op,
 )
@@ -119,18 +118,6 @@ class Sm120BlockScaledGemmKernel:
             self.sf_dtype,
             self.sf_vec_size,
         )
-        self.mixed_mode = self.a_dtype != self.b_dtype
-        # a_fp4_in_mixed / b_fp4_in_mixed: this side carries an FP4 operand in the
-        # mixed FP4 x FP8 mode, so SMEM/TMA see Int8 storage and the mma.sync
-        # consumer needs the LDSM b4x16_p64 unpack + register `<< FP4_SHIFT_BITS`.
-        a_fp4_in_mixed = self.mixed_mode and self.a_dtype.width < 8
-        b_fp4_in_mixed = self.mixed_mode and self.b_dtype.width < 8
-        self.smem_alloc_a_dtype = cutlass.Int8 if a_fp4_in_mixed else self.a_dtype
-        self.smem_alloc_b_dtype = cutlass.Int8 if b_fp4_in_mixed else self.b_dtype
-        # `internal_type` for `_make_tma_atoms_and_tensors`; None when the dtype
-        # already matches (TMA sees the native dtype), Int8 when we recast for FP4.
-        self.tma_internal_a_dtype = cutlass.Int8 if a_fp4_in_mixed else None
-        self.tma_internal_b_dtype = cutlass.Int8 if b_fp4_in_mixed else None
         atom_shape = self.mma_atom_shape
         atom_layout = cute.make_layout(atom_shape)
         permutation_mnk = sm120_utils.get_permutation_mnk(
@@ -162,8 +149,8 @@ class Sm120BlockScaledGemmKernel:
         # Compute stage before compute smem layout
         self.ab_stage, self.epi_stage = self._compute_stages(
             self.tile_shape_mnk,
-            self.smem_alloc_a_dtype,
-            self.smem_alloc_b_dtype,
+            self.a_dtype,
+            self.b_dtype,
             self.sf_dtype,
             sfa_smem_layout_per_stage,
             sfb_smem_layout_per_stage,
@@ -187,9 +174,9 @@ class Sm120BlockScaledGemmKernel:
         ) = self._make_smem_layouts(
             self.tile_shape_mnk,
             self.epi_tile,
-            self.smem_alloc_a_dtype,
+            self.a_dtype,
             self.a_layout,
-            self.smem_alloc_b_dtype,
+            self.b_dtype,
             self.b_layout,
             self.ab_stage,
             self.c_dtype,
@@ -257,7 +244,6 @@ class Sm120BlockScaledGemmKernel:
             self.a_smem_layout_staged,
             (self.tile_shape_mnk[0], self.tile_shape_mnk[2]),
             1,
-            internal_type=self.tma_internal_a_dtype,
         )
 
         tma_atom_b, tma_tensor_b = self._make_tma_atoms_and_tensors(
@@ -265,7 +251,6 @@ class Sm120BlockScaledGemmKernel:
             self.b_smem_layout_staged,
             (self.tile_shape_mnk[1], self.tile_shape_mnk[2]),
             1,
-            internal_type=self.tma_internal_b_dtype,
         )
 
         tma_atom_sfa, tma_tensor_sfa = self._make_tma_atoms_and_tensors(
@@ -306,13 +291,13 @@ class Sm120BlockScaledGemmKernel:
             math_wg_order_barrier_array_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             sA: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.smem_alloc_a_dtype, cute.cosize(self.a_smem_layout_staged)
+                    self.a_dtype, cute.cosize(self.a_smem_layout_staged)
                 ],
                 self.buffer_align_bytes,
             ]
             sB: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.smem_alloc_b_dtype, cute.cosize(self.b_smem_layout_staged)
+                    self.b_dtype, cute.cosize(self.b_smem_layout_staged)
                 ],
                 self.buffer_align_bytes,
             ]
@@ -733,13 +718,11 @@ class Sm120BlockScaledGemmKernel:
                 self.a_dtype,
                 transpose=self.a_layout.is_m_major_a(),
                 num_matrices=4,
-                mixed_mode=self.mixed_mode,
             )
             atom_copy_ldmatrix_B = make_ldmatrix_atom(
                 self.b_dtype,
                 transpose=self.b_layout.is_n_major_b(),
                 num_matrices=4,
-                mixed_mode=self.mixed_mode,
             )
             smem_tiled_copy_A = cute.make_tiled_copy_A(atom_copy_ldmatrix_A, tiled_mma)
             smem_tiled_copy_B = cute.make_tiled_copy_B(atom_copy_ldmatrix_B, tiled_mma)
@@ -920,27 +903,6 @@ class Sm120BlockScaledGemmKernel:
                                 tCsSFB_p_filtered[None, None, k_block_next],
                                 tCrSFB_copy_view_filtered[None, None, k_block_next],
                             )
-                        # Mixed FP4 x FP8 register-side bit shift before mma.sync to
-                        # move the FP4 nibble (loaded into the LOW half of each Int8
-                        # register byte by ldsm.b4x16_p64) into the MIDDLE of the byte
-                        # where mma.sync.kind::mxf8f6f4 reads it. See
-                        # blockscaled_gemm_dispatch.FP4_SHIFT_BITS.
-                        if cutlass.const_expr(
-                            self.mixed_mode and self.a_dtype.width < 8
-                        ):
-                            a_view = cute.recast_tensor(
-                                tCrA[None, None, k_block_idx], cutlass.Int8
-                            )
-                            for _i in cutlass.range_constexpr(cute.size(a_view)):
-                                a_view[_i] = cutlass.Int8(a_view[_i] << FP4_SHIFT_BITS)
-                        if cutlass.const_expr(
-                            self.mixed_mode and self.b_dtype.width < 8
-                        ):
-                            b_view = cute.recast_tensor(
-                                tCrB[None, None, k_block_idx], cutlass.Int8
-                            )
-                            for _i in cutlass.range_constexpr(cute.size(b_view)):
-                                b_view[_i] = cutlass.Int8(b_view[_i] << FP4_SHIFT_BITS)
                         for mma_n in cutlass.range_constexpr(
                             cute.size(accumulators, mode=[2])
                         ):
@@ -1047,20 +1009,6 @@ class Sm120BlockScaledGemmKernel:
                             tCsSFB_p_filtered[None, None, k_block_next],
                             tCrSFB_copy_view_filtered[None, None, k_block_next],
                         )
-                    # Mixed FP4 x FP8 register-side bit shift before mma.sync (hoisted
-                    # tail).
-                    if cutlass.const_expr(self.mixed_mode and self.a_dtype.width < 8):
-                        a_view_h = cute.recast_tensor(
-                            tCrA[None, None, k_block_idx], cutlass.Int8
-                        )
-                        for _i in cutlass.range_constexpr(cute.size(a_view_h)):
-                            a_view_h[_i] = cutlass.Int8(a_view_h[_i] << FP4_SHIFT_BITS)
-                    if cutlass.const_expr(self.mixed_mode and self.b_dtype.width < 8):
-                        b_view_h = cute.recast_tensor(
-                            tCrB[None, None, k_block_idx], cutlass.Int8
-                        )
-                        for _i in cutlass.range_constexpr(cute.size(b_view_h)):
-                            b_view_h[_i] = cutlass.Int8(b_view_h[_i] << FP4_SHIFT_BITS)
                     for mma_n in cutlass.range_constexpr(
                         cute.size(accumulators, mode=[2])
                     ):
@@ -1507,62 +1455,3 @@ class Sm120BlockScaledGemmKernel:
         )
 
         return tma_atom, tma_tensor
-
-    @staticmethod
-    def is_valid_tensor_alignment(
-        m: int,
-        n: int,
-        k: int,
-        batch_count: int,
-        ab_dtype: Type[cutlass.Numeric],
-        c_dtype: Type[cutlass.Numeric],
-        a_major: str,
-        b_major: str,
-        c_major: str,
-    ) -> bool:
-        """
-        Check if the tensor alignment is valid
-
-        :param m: The number of rows in the A tensor
-        :type m: int
-        :param n: The number of columns in the B tensor
-        :type n: int
-        :param k: The number of columns in the A tensor
-        :type k: int
-        :param batch_count: The number of columns in the C tensor
-        :type batch_count: int
-        :param ab_dtype: The data type of the A and B operands
-        :type ab_dtype: Type[cutlass.Numeric]
-        :param c_dtype: The data type of the output tensor
-        :type c_dtype: Type[cutlass.Numeric]
-        :param a_major: The major axis of the A tensor
-        :type a_major: str
-        :param b_major: The major axis of the B tensor
-        :type b_major: str
-        :param c_major: The major axis of the C tensor
-        :type c_major: str
-
-        :return: True if the problem shape is valid, False otherwise
-        :rtype: bool
-        """
-        is_valid = True
-
-        def check_contigous_16B_alignment(dtype, is_mode0_major, tensor_shape):
-            major_mode_idx = 0 if is_mode0_major else 1
-            num_major_elements = tensor_shape[major_mode_idx]
-            num_contiguous_elements = 16 * 8 // dtype.width
-            return num_major_elements % num_contiguous_elements == 0
-
-        if (
-            not check_contigous_16B_alignment(
-                ab_dtype, a_major == "m", (m, k, batch_count)
-            )
-            or not check_contigous_16B_alignment(
-                ab_dtype, b_major == "n", (n, k, batch_count)
-            )
-            or not check_contigous_16B_alignment(
-                c_dtype, c_major == "m", (m, n, batch_count)
-            )
-        ):
-            is_valid = False
-        return is_valid

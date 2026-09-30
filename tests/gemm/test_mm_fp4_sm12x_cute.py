@@ -612,3 +612,47 @@ def test_compiled_kernel_reuses_unseen_m_in_graph(monkeypatch, rows, n, k, tacti
         graph.replay()
         _assert_bits(out, expected)
         assert len(native._COMPILED) == 1
+
+
+def test_raw_tactics_carry_their_complete_configuration():
+    """Codegen choices live in the policy tactic, never in runner shape checks."""
+    from flashinfer.gemm.kernels.sm12x_cute import runner as native
+
+    tactics = {*policy.RAW_TACTICS, *policy._SM121_RAW.values()}
+    for tactic in tactics:
+        assert tuple(policy.raw_config(tactic)) == tactic[1:]
+    for (m, n, k), tactic in policy._SM121_RAW.items():
+        assert tactic in policy.valid_tactics(m, n, k, compute_capability=(12, 1))
+        assert native._compile_config(m, n, k, tactic, (12, 1)) == ()
+    with pytest.raises(ValueError):
+        policy.raw_config(("raw", 64, 32, 8, False, True))
+
+
+@pytest.mark.parametrize(
+    "m,n,tactic",
+    [
+        (65, 65535 * 128, policy.TMA),
+        (65, 65536 * 128, policy.TMA),
+        (65535 * 64, 64, policy.SMALL),
+        (65536 * 64, 64, policy.SMALL),
+    ],
+)
+def test_independent_launch_beyond_65535_tiles(m, n, tactic):
+    """Tile counts above the grid-Y limit must launch and stay correct."""
+    k = 64
+    # Repeat one 128-row block so the expected output is a tiled small reference.
+    full, _ = make_inputs(128, 128, k, 42)
+    a, b, sfa, sfb = full
+    alpha = torch.tensor(1.25, dtype=torch.float32, device="cuda")
+    block = _reference(*full, alpha)
+    rep_m, rep_n = (m + 127) // 128, (n + 127) // 128
+    a = a.repeat(rep_m, 1)[:m].contiguous()
+    sfa = sfa.repeat(rep_m, 1).contiguous()
+    b = b.T.repeat(rep_n, 1)[:n].contiguous().T
+    sfb = sfb.T.repeat(rep_n, 1).contiguous().T
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    inputs = [a, b, sfa, sfb, alpha, out.dtype, out, 16, True, None]
+    assert get_runner().validate_tactic(inputs, tactic)
+    get_runner()(inputs, tactic=tactic)
+    torch.cuda.synchronize()
+    _assert_bits(out, block.repeat(rep_m, rep_n)[:m, :n])

@@ -87,27 +87,8 @@ def _compile_config(m, n, k, tactic, compute_capability):
             64 if m <= 64 and k % 256 == 0 else 128,
             256 if m <= 128 and k % 256 == 0 else 128,
         )
-    extra_stage = (
-        compute_capability == (12, 1)
-        and m in (4096, 8192)
-        and (n, k) == (5120, 17408)
-        and tactic == ("raw", 64, 32, 8, False, True)
-    )
-    registers = compute_capability == (12, 1) and (
-        (
-            (m, n, k) == (256, 9216, 7168)
-            and tactic == ("raw", 64, 32, 2, False, True, 256, True)
-        )
-        or (
-            (m, n, k) == (512, 8192, 2048)
-            and tactic == ("raw", 64, 32, 4, False, True, 256, True)
-        )
-        or (
-            (m, n, k) == (512, 7168, 5120)
-            and tactic == ("raw", 64, 32, 8, False, True, 256, False)
-        )
-    )
-    return extra_stage, extra_stage and m == 8192, registers
+    # Raw tactics carry their complete configuration; see policy.RawConfig.
+    return ()
 
 
 def _compile(m, n, k, tactic, *, compute_capability=None):
@@ -176,32 +157,20 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
         )
     mac = cute_dsl_utils.get_max_active_clusters(1)
     if family == "raw":
-        if len(tactic) == 6:
-            _, epi_m, epi_n, swizzle, elected, raster_m = tactic
-            tile_k, internal_swap = 128, False
-        elif (
-            len(tactic) == 8
-            and compute_capability == (12, 1)
-            and policy.compatible(
-                m, n, k, tactic, compute_capability=compute_capability
-            )
-        ):
-            _, epi_m, epi_n, swizzle, elected, raster_m, tile_k, internal_swap = tactic
-        else:
-            raise ValueError("Invalid SM12x raw tactic")
-        extra_stage, half_stage, register_redistribution = config
+        config = policy.raw_config(tactic)
+        tile_k, internal_swap = config.tile_k, config.internal_swap
         gemm = raw.Sm120BlockScaledGemmKernel(
             cutlass.Float32,
             16,
             (128, 128, tile_k),
-            (epi_m, epi_n),
-            swizzle_size=swizzle,
-            elected_release=elected,
-            raster_along_m=raster_m,
-            half_stage_wait=half_stage,
-            extra_mainloop_stage=extra_stage,
+            (config.epi_m, config.epi_n),
+            swizzle_size=config.swizzle,
+            elected_release=config.elected_release,
+            raster_along_m=config.raster_along_m,
+            half_stage_wait=config.half_stage_wait,
+            extra_mainloop_stage=config.extra_mainloop_stage,
         )
-        if register_redistribution:
+        if config.register_redistribution:
             gemm.load_register_requirement = 24
             gemm.mma_register_requirement = 240
 
@@ -266,7 +235,7 @@ def _compile(m, n, k, tactic, *, compute_capability=None):
             f"dynamic_n{n}_k{k}_"
             f"ab5{int(gemm.extra_mainloop_stage)}_half{int(gemm.half_stage_wait)}_"
         )
-        if register_redistribution:
+        if config.register_redistribution:
             shape_name += "regs24_240_"
         module = raw
     compile_fn = helpers._make_blockscaled_gemm_compile_fn(
