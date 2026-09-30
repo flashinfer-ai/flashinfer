@@ -112,8 +112,8 @@ EXPECTED_TEMPLATES = {
     ('q_a', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
     ('q_a', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
     ('q_a', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('q_a', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256_g4', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_g4_tma1'},
-    ('q_a', 'wgrad', 'f32'): {(2049, 148): 'dense_proj_gemm_nn_n256_f32_tma1', (2049, 212): 'dense_proj_gemm_nn_n256_g4_f32_tma1', (1001, 148): 'dense_proj_gemm_nn_n256_f32_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_g4_f32_tma1'},
+    ('q_a', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
+    ('q_a', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
     ('q_b', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
     ('q_b', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
     ('q_b', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
@@ -127,8 +127,8 @@ EXPECTED_TEMPLATES = {
     ('shared_gate_up', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
     ('shared_gate_up', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
     ('shared_gate_up', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('shared_gate_up', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256_g4', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_g4_tma1'},
-    ('shared_gate_up', 'wgrad', 'f32'): {(2049, 148): 'dense_proj_gemm_nn_n256_f32_tma1', (2049, 212): 'dense_proj_gemm_nn_n256_g4_f32_tma1', (1001, 148): 'dense_proj_gemm_nn_n256_f32_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_g4_f32_tma1'},
+    ('shared_gate_up', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
+    ('shared_gate_up', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
     ('shared_down', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
     ('shared_down', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
     ('shared_down', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
@@ -182,12 +182,6 @@ EXPORTED_TEMPLATES = frozenset({
     'dense_proj_gemm_nn_n128_t',
     'dense_proj_gemm_nn_n256',
     'dense_proj_gemm_nn_n256_f32_tma1',
-    'dense_proj_gemm_nn_n256_hen',
-    'dense_proj_gemm_nn_n256_hen_f32_tma1',
-    'dense_proj_gemm_nn_n256_hne',
-    'dense_proj_gemm_nn_n256_hne_f32_tma1',
-    'dense_proj_gemm_nn_n256_hne_g4',
-    'dense_proj_gemm_nn_n256_hne_g4_f32_tma1',
     'dense_proj_gemm_nn_n256_tma1',
 })
 # --- END GENERATED TABLES ---
@@ -363,32 +357,28 @@ def test_wave_working_set_and_hint_rule():
     assert default_hints(False, False, 128, 24, 16384, 16, 74, L2_BYTES) == ("none", "none")  # o_proj fwd
     assert default_hints(False, True, 128, 64, 16384, 16, 74, L2_BYTES) == ("none", "none")  # o_proj dgrad
     assert default_hints(False, True, 2, 3, 6144, 16, 74, 1 << 20) == ("none", "none")
-    # ... and on the wgrad class (both MN-major) the operand shared by fewer tiles (A by the column tiles,
-    # B by the pair rows) streams evict_first when its reuse is below half of the other's
-    assert default_hints(True, True, 16, 24, 16231, 16, 74, L2_BYTES) == ("none", "evict_first")  # q_a wgrad: A 24 > 2 x B 8
-    assert default_hints(True, True, 16, 24, 16231, 4, 106, L2_BYTES) == ("none", "evict_first")  # ... also at group 4 on R200
-    assert default_hints(True, True, 48, 8, 16231, 16, 74, L2_BYTES) == ("evict_first", "none")  # shared_down wgrad: B 24 > 2 x A 8
-    assert default_hints(True, True, 32, 24, 16231, 16, 74, L2_BYTES) == ("none", "none")  # A 24 vs B 16: neither dominates
-    assert default_hints(True, True, 2, 3, 6144, 16, 74, 1 << 20) == ("none", "evict_first")
+    # ... and neither does the weight-gradient class (both MN-major): the reuse-ratio hints are not applied
+    assert default_hints(True, True, 16, 24, 16231, 16, 74, L2_BYTES) == ("none", "none")  # q_a wgrad
+    assert default_hints(True, True, 48, 8, 16231, 16, 74, L2_BYTES) == ("none", "none")  # shared_down wgrad
+    assert default_hints(True, True, 32, 24, 16231, 16, 74, L2_BYTES) == ("none", "none")
+    assert default_hints(True, True, 2, 3, 6144, 16, 74, 1 << 20) == ("none", "none")
 
 
 def test_default_group_m_rule():
-    # 16 row tiles per raster group everywhere, except wgrad rows (both operands MN-major) with 3..8 pair
-    # rows (4 < m_tiles <= 16: the whole M is one 16-row group) whose tiles form between one and two waves
-    # of CTA pairs: 4 (two pair rows per group)
-    assert default_group_m(True, True, 16, 192, 106) == 4  # q_a wgrad on 212 SMs: 106 < 192 <= 212
-    assert default_group_m(True, True, 16, 192, 74) == 16  # ... but 192 > 2 x 74 on 148 SMs
-    assert default_group_m(True, True, 32, 192, 106) == 16  # indexer_q wgrad: 16 pair rows -> no small group
-    assert default_group_m(True, True, 18, 192, 106) == 16
-    assert default_group_m(True, True, 6, 148, 74) == 4
-    assert default_group_m(True, True, 16, 148, 74) == 4
-    assert default_group_m(True, True, 4, 148, 74) == 16  # <= 2 pair rows raster identically at either group
-    assert default_group_m(True, True, 2, 128, 74) == 16  # the MLA weight gradients (64 heads x 2 tiles)
-    assert default_group_m(True, True, 2, 75, 74) == 16
-    assert default_group_m(True, True, 16, 74, 74) == 16  # exactly one wave
-    assert default_group_m(True, True, 16, 24, 74) == 16
-    assert default_group_m(False, True, 16, 100, 74) == 16  # not the wgrad class
-    assert default_group_m(False, False, 16, 100, 74) == 16
+    # 16 row tiles per raster group on every row: the one-to-two-wave wgrad small-group rule is not applied
+    for a_mn, b_mn, m_tiles, pair_tiles, pairs in (
+        (True, True, 16, 192, 106),  # q_a wgrad on 212 SMs (one to two waves)
+        (True, True, 16, 192, 74),
+        (True, True, 32, 192, 106),  # indexer_q wgrad
+        (True, True, 6, 148, 74),
+        (True, True, 16, 148, 74),
+        (True, True, 4, 148, 74),
+        (True, True, 2, 128, 74),  # the MLA weight gradients (64 heads x 2 tiles)
+        (True, True, 16, 74, 74),  # exactly one wave
+        (False, True, 16, 100, 74),  # not the wgrad class
+        (False, False, 16, 100, 74),
+    ):
+        assert default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs) == 16
 
 
 def test_instance_key_rejects_bad_configurations():
@@ -549,10 +539,8 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 assert a_desc.stride(2) == 1 and b_desc.stride(2) == 1
                 # the knob defaults of the launcher: stage depth by tile shape, raster group, working-set-gated hints
                 assert plan.cta_rows == 128 and plan.pf == 0 and plan.promo == "none"
-                assert plan.group_m == default_group_m(plan.a_mn, plan.b_mn, plan.m_tiles, plan.pair_tiles, plan.sm_pairs) in (4, 16)
-                if plan.group_m == 4:
-                    assert plan.a_mn and plan.b_mn and 4 < plan.m_tiles <= 16 and plan.sm_pairs < plan.pair_tiles <= 2 * plan.sm_pairs
-                    assert "_g4" in plan.template
+                assert plan.group_m == default_group_m(plan.a_mn, plan.b_mn, plan.m_tiles, plan.pair_tiles, plan.sm_pairs) == 16
+                assert "_g" not in plan.template
                 assert plan.stages == default_stages(plan.slots, plan.cta_rows, plan.block_n)
                 assert plan.stages == {(256, 0): 7, (256, 1): 6, (128, 0): 9, (128, 1): 8}[(plan.block_n, plan.slots)]
                 assert plan.l2_bytes == L2_BYTES

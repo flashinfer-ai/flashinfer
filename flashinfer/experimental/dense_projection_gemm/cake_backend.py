@@ -125,7 +125,7 @@ K_TWO_SLOTS = 0  # K at or below this: two staging slots per warp (off)  [Cake L
 # 16), so the host asserts tail_tiles * 16 <= SK_DUMMY_BASE and allocates at least
 # SK_DUMMY_BASE + 16 * 32 = 4608 counters (the Cake host allocates max(8192, tail_tiles * 16)).  [Cake L105-L106]
 SK_DUMMY_BASE = 4096
-SK_COUNTERS_MIN = 8192  # ``_sk_counters``: zeros of max(8192, needed) u32  [Cake L1040-L1047]
+SK_COUNTERS_MIN = 8192  # ``_sk_counters``: zeros of max(8192, needed) u32  [Cake L1027-L1034]
 SMEM_OPT_IN_BYTES = 232448  # 227 KiB dynamic shared memory opt-in  [Cake L711]
 L2_PROMOS = ("none", "l2_64b", "l2_128b", "l2_256b")  # TMA descriptor L2 promotion  [Cake L621]
 L2_HINTS = ("none", "evict_normal", "evict_first", "evict_last")  # TMA load L2 eviction policy  [Cake L622]
@@ -185,7 +185,7 @@ def device_sm_count(device: torch.device) -> int:
 
 
 def sm_pairs(sm_count: int) -> int:
-    """CTA pairs the persistent grid can hold at once (one pair per two SMs).  [Cake ``_sm_pairs`` L1010-L1019]"""
+    """CTA pairs the persistent grid can hold at once (one pair per two SMs).  [Cake ``_sm_pairs`` L997-L1006]"""
     return max(1, int(sm_count) // CTA_GROUP)
 
 
@@ -196,7 +196,7 @@ def device_l2_bytes(device: torch.device) -> int:
     """L2 size of ``device`` from the driver (no per-SKU table): resolves the hint working-set
     gate exactly as the Cake host's ``_l2_bytes`` does (``torch.cuda.get_device_properties``
     ``L2_cache_size``, falling back to ``cuDeviceGetAttribute(CU_DEVICE_ATTRIBUTE_L2_CACHE_SIZE)``).
-    [Cake ``_l2_bytes`` L1022-L1037]"""
+    [Cake ``_l2_bytes`` L1009-L1024]"""
     key = str(device)
     if key not in _L2_BYTES:
         l2 = getattr(torch.cuda.get_device_properties(device), "L2_cache_size", None)
@@ -478,43 +478,31 @@ def default_hints(
     l2_bytes: int,
 ) -> tuple[str, str]:
     """TMA load L2 eviction policy of (A, B).  No hint while one wave's operand panels fit the
-    L2 (a hint on a resident operand costs 3..23 percent).  Otherwise a panel used by exactly
-    one tile (A when there is one column tile) streams as ``evict_first``.  On the weight
-    gradient class (both operands MN-major, streamed along the strided T axis) the operand
-    shared by fewer tiles (A by ``n_tiles`` column tiles, B by the pair rows) streams as
-    ``evict_first`` when its reuse is less than half of the other's, so the reused operand
-    keeps the L2; K-major forward / input-gradient rows get no hint.
-    [Cake ``default_hints`` L869-L890]"""
+    L2 (a hint on a resident operand costs 3..23 percent).  Otherwise only a panel used by
+    exactly one tile (A when there is one column tile) streams as ``evict_first``.  Reuse-ratio
+    hints on the weight-gradient class measured 0..-4 percent in the production stream-K
+    configuration and are not applied; ``a_mn`` / ``b_mn`` stay in the signature so a
+    layout-class rule can be re-added without touching the call site.
+    [Cake ``default_hints`` L869-L881]"""
     if wave_working_set(m_tiles, n_tiles, k_len, group_m, pairs) <= l2_bytes:
         return ("none", "none")
     if n_tiles == 1:
         return ("evict_first", "none")
-    if not (a_mn and b_mn):
-        return ("none", "none")
-    reuse_a, reuse_b = n_tiles, max(1, m_tiles // CTA_GROUP)
-    if reuse_b > 2 * reuse_a:
-        return ("evict_first", "none")
-    if reuse_a > 2 * reuse_b:
-        return ("none", "evict_first")
     return ("none", "none")
 
 
 def default_group_m(a_mn: bool, b_mn: bool, m_tiles: int, pair_tiles: int, pairs: int) -> int:
-    """CTA row tiles per raster group (even): 16 everywhere except weight-gradient rows (both
-    operands MN-major) with 3..8 pair rows (``4 < m_tiles <= 16``: the whole M is one 16-row
-    group, and rows with at most two pair rows raster identically at either group) whose tiles
-    form between one and two waves of CTA pairs, where 4 (two pair rows per group) is measured
-    13.5 percent faster; small groups cost 3..30 percent on many-wave rows and 12 percent on
-    16-pair-row rows, hence the M bounds.
-    [Cake ``default_group_m`` L893-L902]"""
-    if a_mn and b_mn and 2 * CTA_GROUP < m_tiles <= 8 * CTA_GROUP and pairs < pair_tiles <= 2 * pairs:
-        return 4
+    """CTA row tiles per raster group (even): 16 on every row (16 is fastest or within 1 percent
+    on every projection row; small groups cost 3..30 percent on the many-wave rows).  A 4-row
+    group for one-to-two-wave weight-gradient rows measured 0..+2 percent in the production
+    configuration and is not applied.  The knob stays per instance.
+    [Cake ``default_group_m`` L884-L889]"""
     return 16
 
 
 def default_cta_rows(M: int, N: int, K: int) -> int:
     """Output rows per CTA (128 = double-buffered TMEM tiles; 256 is selected per row by
-    measurement).  [Cake ``default_cta_rows`` L905-L908]"""
+    measurement).  [Cake ``default_cta_rows`` L892-L895]"""
     return 128
 
 
@@ -540,7 +528,7 @@ def stream_k_plan(
       steps; no stream-K when that cannot create more units than tail tiles.
     * ``sk="tiles"``: diagnostic -- the tail tiles go through the unit path as whole tiles.
 
-    [Cake ``stream_k_plan`` L1050-L1079]"""
+    [Cake ``stream_k_plan`` L1037-L1066]"""
     if not sk or pair_tiles == 0:
         return pair_tiles, 0, 0, k_blocks
     tail = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
@@ -704,7 +692,7 @@ def plan_dense_projection_gemm(
     through the L2).  Returns ``(plan, a_desc, b_desc, out3)`` with the ``[L, outer, inner]``
     operand views the TMA descriptors span and the batched output view.  The knob defaults
     (``sk="auto"``, ``pf`` / ``promo`` / ``group_m`` / ``hints`` from ``default_*``, resolved in
-    the launcher's order) are the launcher's.  [Cake ``dense_projection_gemm`` L911-L1003]"""
+    the launcher's order) are the launcher's.  [Cake ``dense_projection_gemm`` L898-L990]"""
     if A.dtype != torch.bfloat16 or B.dtype != torch.bfloat16:
         raise ValueError("dense_projection_gemm: A and B must be bf16")
     if out.dtype not in (torch.bfloat16, torch.float32):
@@ -1086,7 +1074,7 @@ def wgrad_views(
     """``(A, B, transposed_out)`` of the weight gradient ``G[T, N].T @ X[T, K] -> dW[N, K]``:
     fewer than 256 output rows run the swapped GEMM ``X.T @ G`` with the transposed store
     (the result lands directly in ``[N, K]``), otherwise ``G.T @ X``.
-    [Cake ``projection_wgrad`` L1131-L1147]"""
+    [Cake ``projection_wgrad`` L1118-L1134]"""
     N = int(G.shape[1])
     if N < 256:
         return X.t(), G, True
