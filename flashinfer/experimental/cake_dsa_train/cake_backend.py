@@ -135,9 +135,9 @@ CONTRACT_SCALARS = (
     "softmax_scale",
     "softmax_scale_log2",
     "idx_stride",  # indices row stride (elements)
-    "indices_offset",  # element offset of indices inside the storage alias the host passes (0 when contiguous)
+    "indices_offset",  # element offset of indices inside the storage alias the host passes (0 when the tensor starts its storage)
     "k_rope_stride",  # k_rope row stride (elements); k_rope is passed as its storage alias
-    "k_rope_offset",  # element offset of k_rope inside that storage (0 when contiguous)
+    "k_rope_offset",  # element offset of k_rope inside that storage (0 when the tensor starts its storage)
     "has_topk_length",  # 1 when the caller supplied topk_length
     "q_latent_row_stride",
     "q_rope_row_stride",
@@ -922,11 +922,17 @@ class DSATrainRunner:
 def _pointer_alias(tensor: torch.Tensor) -> tuple[torch.Tensor, int]:
     """Contiguous zero-copy alias of ``tensor``'s storage plus its element offset.
 
-    Raw pointer arguments are checked for contiguity at the FFI boundary; a
-    strided view (the rope columns of a packed ``[S, 576]`` tensor) is passed
-    as the whole storage viewed flat plus the element offset the kernel adds.
+    Raw pointer arguments are checked for contiguity at the FFI boundary, and
+    the kernels take the pointer they receive for the aligned base of the
+    storage: their vector index-tile loads are gated on ``((idx_stride |
+    indices_offset) & 7) == 0``, not on the pointer itself.  A contiguous
+    tensor that starts its storage is therefore passed as is with offset 0;
+    a strided view (the rope columns of a packed ``[S, 576]`` tensor) or a
+    contiguous view that starts inside its storage (a slice of a larger
+    buffer) is passed as the whole storage viewed flat plus the element offset
+    the kernel adds.
     """
-    if tensor.is_contiguous():
+    if tensor.is_contiguous() and tensor.storage_offset() == 0:
         return tensor, 0
     flat = torch.empty(0, dtype=tensor.dtype, device=tensor.device)
     flat.set_(tensor.untyped_storage())

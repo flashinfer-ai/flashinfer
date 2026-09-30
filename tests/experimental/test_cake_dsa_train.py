@@ -428,6 +428,49 @@ def test_validate_rejects(mutate, match):
         validate_dsa_train_inputs(*mutate(q, kv, idx))
 
 
+def test_pointer_alias_reports_the_storage_base_of_views_inside_a_storage():
+    """A contiguous view that starts inside its storage (a slice of a larger buffer) is passed as the
+    whole storage viewed flat plus its element offset, like a strided view; a tensor that starts
+    its storage is passed as is.  A remembered binding re-reads the alias from the current tensors."""
+    buf = torch.arange(1000, dtype=torch.int32)
+    for offset in (1, 8, 13):
+        view = buf[offset : offset + 8 * 96].view(8, 96)
+        assert view.is_contiguous() and view.storage_offset() == offset
+        storage, element_offset = cake_backend._pointer_alias(view)
+        assert element_offset == offset
+        assert storage.dim() == 1 and storage.is_contiguous()
+        assert storage.dtype == torch.int32 and storage.numel() == buf.numel()
+        assert storage.data_ptr() == buf.data_ptr() != view.data_ptr()
+        assert torch.equal(storage[offset : offset + 8 * 96].view(8, 96), view)
+    storage, element_offset = cake_backend._pointer_alias(buf)
+    assert storage is buf and element_offset == 0
+    head = buf[:100]  # starts its storage: passed as is
+    storage, element_offset = cake_backend._pointer_alias(head)
+    assert storage is head and element_offset == 0
+    kv = torch.zeros(20 * D_QK + 3, dtype=torch.bfloat16)
+    k_rope = kv[3 : 3 + 16 * D_ROPE].view(16, D_ROPE)  # contiguous, offset 3
+    binding = cake_backend._Binding(
+        num_queries=8,
+        num_kv=16,
+        topk=96,
+        device=buf.device,
+        device_index=0,
+        dkv_fp32=False,
+        launches={},
+        owned={},
+        acc_span=None,
+    )
+    values = binding.rebind_values(
+        dict(indices=buf[13 : 13 + 8 * 96].view(8, 96), k_rope=k_rope)
+    )
+    assert values["indices_storage"].data_ptr() == buf.data_ptr()
+    assert values["indices_offset"] == 13
+    assert values["k_rope_storage"].data_ptr() == kv.data_ptr()
+    assert values["k_rope_offset"] == 3
+    # the single-pass placeholders alias the same storage
+    assert values["key_scratch"] is values["indices_storage"]
+
+
 def test_validate_rejects_bad_topk_length():
     q, kv, idx = _host_inputs()
     with pytest.raises(ValueError, match="topk_length"):
@@ -1359,6 +1402,71 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
     _check_backward(single, ref, canonical=True)
     assert rel_l2(grads[0], single[0]) < 1e-3 and rel_l2(grads[1], single[1]) < 1e-3
     assert max(rel_l2(grads[2], single[2]), rel_l2(grads[3], single[3])) < 1e-2
+
+
+def _indices_view_inside_storage(indices: torch.Tensor, offset: int) -> torch.Tensor:
+    """A contiguous copy of ``indices`` that starts ``offset`` elements inside a larger buffer."""
+    n = indices.numel()
+    buf = torch.full((n + offset + 64,), -1, dtype=indices.dtype, device=indices.device)
+    view = buf[offset : offset + n].view(indices.shape)
+    view.copy_(indices)
+    assert view.is_contiguous() and view.storage_offset() == offset
+    return view
+
+
+@pytest.mark.parametrize("offset", [1, 8, 13])
+def test_indices_view_inside_a_storage_matches_the_plain_tensor(offset):
+    """A contiguous ``indices`` view that starts inside its storage (a slice of a larger buffer)
+    reaches the kernels as the storage base plus the element offset, so their aligned index-tile
+    loads (gated on the offset, not the pointer) stay valid: forward, backward and the autograd
+    path agree with the plain tensor (bitwise where the kernels are deterministic)."""
+    _require_program(backward=True)
+    inp = make_inputs([256], [512], seed=SEED + 18, topk=128)
+    view = _indices_view_inside_storage(inp.idx_global, offset)
+    storage, element_offset = cake_backend._pointer_alias(view)
+    assert element_offset == offset
+    assert storage.data_ptr() == view.data_ptr() - 4 * offset
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    plain = cake_backend.forward(*args, inp.idx_global)
+    got = cake_backend.forward(*args, view)
+    torch.cuda.synchronize()
+    for a, b in zip(plain, got, strict=True):
+        assert torch.equal(a, b)
+    out, lse, o_lo = plain
+    g_plain = cake_backend.backward(*args, inp.idx_global, out, o_lo, lse, inp.dout)
+    g_view = cake_backend.backward(*args, view, out, o_lo, lse, inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(g_plain[0], g_view[0]) and torch.equal(g_plain[1], g_view[1])
+    assert max(rel_l2(g_plain[2], g_view[2]), rel_l2(g_plain[3], g_view[3])) < 1e-3
+    leaves = [t.detach().clone().requires_grad_() for t in args]
+    with _quiet_experimental():
+        out_pub, lse_pub = dsa_sparse_attention(*leaves, view, return_lse=True)
+    grads = torch.autograd.grad(out_pub, leaves, inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out_pub, out) and torch.equal(lse_pub, lse)
+    assert torch.equal(grads[0], g_plain[0]) and torch.equal(grads[1], g_plain[1])
+    assert max(rel_l2(grads[2], g_plain[2]), rel_l2(grads[3], g_plain[3])) < 1e-3
+
+
+@pytest.mark.parametrize("offset", [1, 4, 8, 13])
+def test_key_pass_compaction_accepts_an_indices_view_inside_a_storage(offset):
+    """The compaction stage's 8-wide index loads (whole 256-slot blocks, so top-k 256) see the
+    storage base plus the element offset: two forced key-range passes with a view inside a
+    larger buffer match the plain tensor and the reference."""
+    _require_key_pass_program()
+    inp = make_inputs([128], [1024], seed=SEED + 19, topk=256)
+    view = _indices_view_inside_storage(inp.idx_global, offset)
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    out, lse, o_lo = cake_backend.forward(*args, inp.idx_global)
+    plain = cake_backend.backward(
+        *args, inp.idx_global, out, o_lo, lse, inp.dout, key_passes=2
+    )
+    got = cake_backend.backward(*args, view, out, o_lo, lse, inp.dout, key_passes=2)
+    torch.cuda.synchronize()
+    assert torch.equal(plain[0], got[0]) and torch.equal(plain[1], got[1])
+    assert max(rel_l2(plain[2], got[2]), rel_l2(plain[3], got[3])) < 1e-3
+    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
+    _check_backward(got, ref)
 
 
 def test_autograd_function_matches_explicit_backward():
