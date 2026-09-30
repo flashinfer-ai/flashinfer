@@ -779,9 +779,11 @@ class GemmPlan:
     sk_units: int
     iters_per_unit: int
     template: str
-    # FlashInfer-only: the batched small-M swap was undone because the swapped instance is not a
-    # generated program of this architecture (the Cake host JIT-compiles it; see ``plan_dense_projection_gemm``)
+    # FlashInfer-only (see ``plan_dense_projection_gemm``): the batched small-M swap was undone / the row's
+    # measured rule was dropped because the planned instance is not a generated program of this architecture
+    # (the Cake host JIT-compiles it)
     swap_fallback: bool = False
+    rule_fallback: bool = False
 
     @property
     def num_cluster_tiles(self) -> int:
@@ -847,7 +849,9 @@ def plan_dense_projection_gemm(
     group_m: Optional[int] = None,
     f32_v8: Optional[bool] = None,
     arch: str = "sm_100a",
+    _fallback: bool = True,
     _allow_swap: bool = True,
+    _use_rules: bool = True,
 ) -> tuple[GemmPlan, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Validate the views exactly as the Cake launcher does and plan the launch for a device
     with ``sm_count`` SMs and an L2 of ``l2_bytes`` (the two device facts the plan depends on:
@@ -859,9 +863,11 @@ def plan_dense_projection_gemm(
 
     One FlashInfer-only deviation: the Cake host applies ``swap_small_m`` unconditionally because it compiles
     the swapped instance on demand, while this package can only launch the generated programs registered for
-    ``arch``.  When the swapped plan resolves to an unregistered instance (batched forward / input gradient
-    with a tiny T outside the export contract), the plan is redone without the swap (``plan.swap_fallback``)
-    so the call still runs; the result is identical, only the tile walk differs."""
+    ``arch``.  When the plan resolves to an unregistered instance (a batched forward / input gradient with a
+    tiny T that engages the swap, or a per-row rule whose template was only generated for the contract's T),
+    the plan is redone without the swap and / or without the rule (``plan.swap_fallback`` /
+    ``plan.rule_fallback``) so the call still runs; the result is identical, only the tile walk differs.
+    ``_fallback=False`` returns the pure mirror (unit tests of the planner)."""
     _caller_knobs = dict(
         transposed_out=transposed_out,
         sk=sk,
@@ -915,8 +921,10 @@ def plan_dense_projection_gemm(
         transposed_out = True
     a_mn, a_desc = operand_view(A3, "A", k_axis=2)
     b_mn, b_desc = operand_view(B3, "B", k_axis=1)
-    rule = row_rule(
-        arch, a_mn, b_mn, out.dtype == torch.float32, transposed_out, L > 1, N, K, M
+    rule = (
+        row_rule(arch, a_mn, b_mn, out.dtype == torch.float32, transposed_out, L > 1, N, K, M)
+        if _use_rules
+        else {}
     )
     if block_n is None:
         block_n = rule.get("block_n", default_block_n(N, b_mn))
@@ -1011,11 +1019,28 @@ def plan_dense_projection_gemm(
         iters_per_unit=iters_per_unit,
         template=instance_symbol(key),
         swap_fallback=not _allow_swap,
+        rule_fallback=not _use_rules,
     )
-    if swapped and plan.template not in KERNELS.get(arch, {}):
-        return plan_dense_projection_gemm(
-            A, B, out, sm_count=sm_count, l2_bytes=l2_bytes, _allow_swap=False, **_caller_knobs
-        )
+    if _fallback and plan.template not in KERNELS.get(arch, {}):
+        # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
+        for allow_swap, use_rules in ((False, True), (True, False), (False, False)):
+            if (allow_swap, use_rules) == (_allow_swap, _use_rules):
+                continue  # the plan just made
+            if (not allow_swap and not swapped) or (not use_rules and not rule):
+                continue  # dropping a swap not taken / an empty rule changes nothing
+            candidate = plan_dense_projection_gemm(
+                A,
+                B,
+                out,
+                sm_count=sm_count,
+                l2_bytes=l2_bytes,
+                _fallback=False,
+                _allow_swap=allow_swap,
+                _use_rules=use_rules,
+                **_caller_knobs,
+            )
+            if candidate[0].template in KERNELS.get(arch, {}):
+                return candidate
     return plan, a_desc, b_desc, O3
 
 

@@ -494,7 +494,10 @@ ARCH_OF_SM = {148: "sm_100a", 212: "sm_107a"}
 
 
 def _rule_of(plan, sm_count):
-    """The measured per-row rule the planner applied to ``plan`` (empty when the row has none)."""
+    """The measured per-row rule the planner applied to ``plan`` (empty when the row has none or the
+    registry fallback dropped it)."""
+    if plan.rule_fallback:
+        return {}
     return row_rule(
         ARCH_OF_SM[sm_count],
         plan.a_mn,
@@ -510,16 +513,15 @@ def _rule_of(plan, sm_count):
 
 def _assert_mirrors_cake(plan, cake_template, where):
     """The plan is the Cake launcher's plan when that instance is a generated program; otherwise (the batched
-    small-M swap on a tiny T outside the export contract, which the Cake host JIT-compiles) the FlashInfer
-    planner must have fallen back to the direct layout and landed on a generated program."""
+    small-M swap on a tiny T outside the export contract, or a measured rule whose template exists only for
+    the contract's T -- both of which the Cake host JIT-compiles) the FlashInfer planner must have fallen
+    back (swap and / or rule dropped) onto a generated program."""
     if cake_template in EXPORTED_TEMPLATES:
-        assert plan.template == cake_template and not plan.swap_fallback, (*where, plan.template)
+        assert plan.template == cake_template, (*where, plan.template)
+        assert not plan.swap_fallback and not plan.rule_fallback, where
     else:
-        assert plan.swap_fallback and plan.template in EXPORTED_TEMPLATES, (
-            *where,
-            cake_template,
-            plan.template,
-        )
+        assert plan.swap_fallback or plan.rule_fallback, (*where, cake_template, plan.template)
+        assert plan.template in EXPORTED_TEMPLATES, (*where, cake_template, plan.template)
 
 
 def _device_supported() -> bool:
@@ -1095,18 +1097,11 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     arch=ARCH_OF_SM[sm_count],
                 )
                 rule = _rule_of(plan, sm_count)
-                expected = _expected(
-                    EXPECTED_TEMPLATES, (row, op, out_dtype), T, sm_count
+                _assert_mirrors_cake(
+                    plan,
+                    _expected(EXPECTED_TEMPLATES, (row, op, out_dtype), T, sm_count),
+                    (row, op, out_dtype, T, sm_count),
                 )
-                assert plan.template == expected, (
-                    row,
-                    op,
-                    out_dtype,
-                    T,
-                    sm_count,
-                    plan.template,
-                )
-                assert plan.template in EXPORTED_TEMPLATES and not plan.swap_fallback
                 assert plan.sm_pairs == sm_count // 2
                 assert plan.grid == ((plan.num_full + plan.sk_units) * CTA_GROUP, 1, 1)
                 assert plan.m_tiles % CTA_GROUP == 0
@@ -1378,6 +1373,7 @@ def test_wgrad_swap_rule():
 
 
 def test_batched_small_m_swap_and_row_rules():
+    # pure planner mirror (_fallback=False): synthetic rules may name instances the export never generated
     # MLA weight gradient dW[h] = A_h^T B_h with M = 192, N = 512 (K = T = 1001): the planner runs the transposed GEMM
     # (A' = B^T [H, 512, T], B' = A^T [H, T, 192], transposed store into the caller's [H, 192, 512] view)
     H, T, M, N = 4, 1001, 192, 512
@@ -1387,7 +1383,7 @@ def test_batched_small_m_swap_and_row_rules():
     assert swap_small_m(H, M, N, False) and not swap_small_m(1, M, N, False)
     assert not swap_small_m(H, 512, 192, False) and not swap_small_m(H, M, N, True)
     plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(
-        Q.permute(1, 2, 0), dL.permute(1, 0, 2), out, sm_count=148, l2_bytes=L2_BYTES
+        Q.permute(1, 2, 0), dL.permute(1, 0, 2), out, sm_count=148, l2_bytes=L2_BYTES, _fallback=False
     )
     assert (plan.L, plan.M, plan.N, plan.K) == (H, N, M, T)
     assert plan.a_mn and plan.b_mn and plan.transposed_out and plan.block_n == 256
@@ -1421,7 +1417,7 @@ def test_batched_small_m_swap_and_row_rules():
             dL.permute(1, 0, 2),
             out,
             sm_count=148,
-            l2_bytes=L2_BYTES,
+            l2_bytes=L2_BYTES, _fallback=False,
             arch="sm_100a",
         )
         assert (
@@ -1435,7 +1431,7 @@ def test_batched_small_m_swap_and_row_rules():
             dL.permute(1, 0, 2),
             out,
             sm_count=148,
-            l2_bytes=L2_BYTES,
+            l2_bytes=L2_BYTES, _fallback=False,
             arch="sm_100a",
             cta_rows=128,
         )
