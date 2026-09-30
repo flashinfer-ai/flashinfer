@@ -3,7 +3,7 @@
   "arches": {
     "sm_100a": {
       "programs": {
-        "deepgemm_mega_gate_sm100a_396c9cef0ad50289749f_kernel": {
+        "deepgemm_mega_gate_sm100a_08639c00da58843ccc14_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -102,18 +102,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "18c0f873588cb9757b9791089d1afec33478c674f6a58ab4266d37f485ae71af",
+          "closure_sha256": "1bfab106f5599447a79e1268663ab201fda6854d10f14c0e7788c3b5c2c1d2a6",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_396c9cef0ad50289749f",
+          "name": "deepgemm_mega_gate_sm100a_08639c00da58843ccc14",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_396c9cef0ad50289749f_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_396c9cef0ad50289749f_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_08639c00da58843ccc14_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_08639c00da58843ccc14_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm100a_3cc09297fc56df4d8b15_kernel": {
+        "deepgemm_mega_gate_sm100a_20a99ba684dfbfb84eeb_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -212,18 +212,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "028e50d383ecfff36dda76ee5acb99b031a888028e95da231be5ab39f4e519e7",
+          "closure_sha256": "96d2c9aabe107046419d897eda3f017e3df2514809e6bc9cad82d724c91d3f37",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_3cc09297fc56df4d8b15",
+          "name": "deepgemm_mega_gate_sm100a_20a99ba684dfbfb84eeb",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_3cc09297fc56df4d8b15_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_3cc09297fc56df4d8b15_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_20a99ba684dfbfb84eeb_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_20a99ba684dfbfb84eeb_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm100a_3f4e9c00cff0b27e8f71_kernel": {
+        "deepgemm_mega_gate_sm100a_2294d2f56204f2164381_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -322,18 +322,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "fa052829a7e51570ece2d737f6b4b24d07a5c085a086d71508cf86beda12d7ab",
+          "closure_sha256": "c1bf49999fb9f56c4aa53bf3100b3a2b68246e88a4f407aacae4eb10745aab20",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_3f4e9c00cff0b27e8f71",
+          "name": "deepgemm_mega_gate_sm100a_2294d2f56204f2164381",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_3f4e9c00cff0b27e8f71_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_3f4e9c00cff0b27e8f71_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_2294d2f56204f2164381_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_2294d2f56204f2164381_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm100a_45636578e7df6eaab3cd_kernel": {
+        "deepgemm_mega_gate_sm100a_5f5c79e6b4ff6788b65b_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -432,18 +432,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "50a4cd0bf9201144e6e3b5030fa95cd187ffe4c1bd68c769a2d5643d4d320100",
+          "closure_sha256": "f9f6a8d8fdd295759f502a5bfa64dabd048f4a711bd1183a46ec647901da32ac",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_45636578e7df6eaab3cd",
+          "name": "deepgemm_mega_gate_sm100a_5f5c79e6b4ff6788b65b",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_45636578e7df6eaab3cd_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_45636578e7df6eaab3cd_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_5f5c79e6b4ff6788b65b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_5f5c79e6b4ff6788b65b_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm100a_546bc95392f19257504b_kernel": {
+        "deepgemm_mega_gate_sm100a_6eb6cb0e2bff46a41361_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -542,18 +542,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "98e2131d2f05235f0175a1bddb563fadbe0f3352c022e03467bd09083b98e22e",
+          "closure_sha256": "f8cef3cf916a4a4300e375083e928c9bc6a8b8cd6630eaa0d77dfe1dc746a5b4",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_546bc95392f19257504b",
+          "name": "deepgemm_mega_gate_sm100a_6eb6cb0e2bff46a41361",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_546bc95392f19257504b_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_546bc95392f19257504b_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_6eb6cb0e2bff46a41361_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_6eb6cb0e2bff46a41361_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm100a_63c5b222f08135647618_kernel": {
+        "deepgemm_mega_gate_sm100a_a4d24d6e2084da538a0f_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -652,18 +652,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "fc7a4874f5973879a92154afb46f694cbf231089913be5b965a1539c4b18a1b5",
+          "closure_sha256": "11c26e7a1776fc88b64c83249eb6b540dafd24b3d2dac6e244f0fa60f785a836",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_63c5b222f08135647618",
+          "name": "deepgemm_mega_gate_sm100a_a4d24d6e2084da538a0f",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_63c5b222f08135647618_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_63c5b222f08135647618_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_a4d24d6e2084da538a0f_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_a4d24d6e2084da538a0f_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm100a_6a3827c168fcb006c295_kernel": {
+        "deepgemm_mega_gate_sm100a_caa07a6b6b30013db792_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -762,18 +762,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "445e2e116b890edd10f60fb79b2e547ec9ec2664502a5254f682fa34f594cafd",
+          "closure_sha256": "de7038ed0cb10c07e2077027cf0eb19d3466a28f861bd0a601c1d8b6886e43da",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_6a3827c168fcb006c295",
+          "name": "deepgemm_mega_gate_sm100a_caa07a6b6b30013db792",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_6a3827c168fcb006c295_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_6a3827c168fcb006c295_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_caa07a6b6b30013db792_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_caa07a6b6b30013db792_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm100a_904c7185083dd808397e_kernel": {
+        "deepgemm_mega_gate_sm100a_d01cb8a230c2127475ce_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -872,18 +872,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "ae75e29df95635459470a890218c2559ee3b51f92cd81320acfa8f52b7e20661",
+          "closure_sha256": "cca1934c33af2b258f026c74b2587551a23092295e103c9efee2c4598935c842",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_904c7185083dd808397e",
+          "name": "deepgemm_mega_gate_sm100a_d01cb8a230c2127475ce",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_904c7185083dd808397e_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_904c7185083dd808397e_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_d01cb8a230c2127475ce_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_d01cb8a230c2127475ce_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm100a_a91a696c6370577834d1_kernel": {
+        "deepgemm_mega_gate_sm100a_d7efc8e6977842bbc248_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -982,18 +982,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "22a4192f25f0b3323c4b17df12daf31ebe39587816069f7dd18dd0a78c30f41d",
+          "closure_sha256": "d7ae55962932da63ed702bfabd420e8bf0f0605b40f353c89e9d0defa9271d31",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_a91a696c6370577834d1",
+          "name": "deepgemm_mega_gate_sm100a_d7efc8e6977842bbc248",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_a91a696c6370577834d1_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_a91a696c6370577834d1_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_d7efc8e6977842bbc248_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_d7efc8e6977842bbc248_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm100a_b008b7b2f649044663ca_kernel": {
+        "deepgemm_mega_gate_sm100a_e7cca4222bce6f96a515_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -1092,18 +1092,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "d0337c3c0481cbaa77c2a35bd5923fc85c6dfdd4a9280a99cca6413d4c70fb55",
+          "closure_sha256": "aecb2d2dd00aaad03a8a1aa3bae42a9801e954532270a46f884686cd20d2d94e",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_b008b7b2f649044663ca",
+          "name": "deepgemm_mega_gate_sm100a_e7cca4222bce6f96a515",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_b008b7b2f649044663ca_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_b008b7b2f649044663ca_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_e7cca4222bce6f96a515_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_e7cca4222bce6f96a515_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm100a_cbbdd5eef13a75aae9c6_kernel": {
+        "deepgemm_mega_gate_sm100a_eeecf97abf2a9d44b4b3_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -1202,14 +1202,14 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "21b72e701316674bf0cb4cd875ec67fda8385b5c5305e815fbf66322aa093c17",
+          "closure_sha256": "2373d3f17a2ba96b036ff5ec4815eec117f690b46762e595eb4085f9f201fccb",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm100a_cbbdd5eef13a75aae9c6",
+          "name": "deepgemm_mega_gate_sm100a_eeecf97abf2a9d44b4b3",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_cbbdd5eef13a75aae9c6_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_cbbdd5eef13a75aae9c6_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_eeecf97abf2a9d44b4b3_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_100a/deepgemm_mega_gate_sm100a_eeecf97abf2a9d44b4b3_binding.cu"
           ],
           "tma_workspace_bytes": 0
         }
@@ -1226,7 +1226,7 @@
             "num_stages": 11,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm100a_a91a696c6370577834d1_kernel"
+          "program": "deepgemm_mega_gate_sm100a_eeecf97abf2a9d44b4b3_kernel"
         },
         "128:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -1239,7 +1239,7 @@
             "num_stages": 11,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm100a_904c7185083dd808397e_kernel"
+          "program": "deepgemm_mega_gate_sm100a_5f5c79e6b4ff6788b65b_kernel"
         },
         "16:5120:384:6:148:sqrtsoftplus:True:False:False:False:False:False:True:False": {
           "config": {
@@ -1252,7 +1252,7 @@
             "num_stages": 12,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm100a_63c5b222f08135647618_kernel"
+          "program": "deepgemm_mega_gate_sm100a_20a99ba684dfbfb84eeb_kernel"
         },
         "16:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -1265,7 +1265,7 @@
             "num_stages": 12,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm100a_3cc09297fc56df4d8b15_kernel"
+          "program": "deepgemm_mega_gate_sm100a_6eb6cb0e2bff46a41361_kernel"
         },
         "16:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:True:True": {
           "config": {
@@ -1278,7 +1278,7 @@
             "num_stages": 12,
             "num_workers": 8
           },
-          "program": "deepgemm_mega_gate_sm100a_396c9cef0ad50289749f_kernel"
+          "program": "deepgemm_mega_gate_sm100a_08639c00da58843ccc14_kernel"
         },
         "1:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -1291,7 +1291,7 @@
             "num_stages": 12,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm100a_b008b7b2f649044663ca_kernel"
+          "program": "deepgemm_mega_gate_sm100a_e7cca4222bce6f96a515_kernel"
         },
         "2048:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -1304,7 +1304,7 @@
             "num_stages": 11,
             "num_workers": 12
           },
-          "program": "deepgemm_mega_gate_sm100a_3f4e9c00cff0b27e8f71_kernel"
+          "program": "deepgemm_mega_gate_sm100a_d01cb8a230c2127475ce_kernel"
         },
         "3:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -1317,7 +1317,7 @@
             "num_stages": 12,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm100a_cbbdd5eef13a75aae9c6_kernel"
+          "program": "deepgemm_mega_gate_sm100a_a4d24d6e2084da538a0f_kernel"
         },
         "4096:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -1330,7 +1330,7 @@
             "num_stages": 11,
             "num_workers": 12
           },
-          "program": "deepgemm_mega_gate_sm100a_6a3827c168fcb006c295_kernel"
+          "program": "deepgemm_mega_gate_sm100a_2294d2f56204f2164381_kernel"
         },
         "512:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -1343,7 +1343,7 @@
             "num_stages": 7,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm100a_45636578e7df6eaab3cd_kernel"
+          "program": "deepgemm_mega_gate_sm100a_caa07a6b6b30013db792_kernel"
         },
         "8192:5120:384:6:148:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -1356,13 +1356,13 @@
             "num_stages": 11,
             "num_workers": 24
           },
-          "program": "deepgemm_mega_gate_sm100a_546bc95392f19257504b_kernel"
+          "program": "deepgemm_mega_gate_sm100a_d7efc8e6977842bbc248_kernel"
         }
       }
     },
     "sm_103a": {
       "programs": {
-        "deepgemm_mega_gate_sm103a_1e948061563961abcb3e_kernel": {
+        "deepgemm_mega_gate_sm103a_2c9c430c924b85331759_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -1461,18 +1461,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "8499d3ab2a303fb83909a05413293ed0be527a978a739336ddedbb67902a25e0",
+          "closure_sha256": "81eebc18d725af7ae6564a12095bf335b451abf923d6213cda10fd4591cf2997",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_1e948061563961abcb3e",
+          "name": "deepgemm_mega_gate_sm103a_2c9c430c924b85331759",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_1e948061563961abcb3e_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_1e948061563961abcb3e_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_2c9c430c924b85331759_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_2c9c430c924b85331759_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm103a_2cf8dc5e2f442ad1de14_kernel": {
+        "deepgemm_mega_gate_sm103a_32f800130e2c3233e0c6_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -1571,18 +1571,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "35a4e68c9addfdbc2f5aeac6479544066daa6a1004c329832624e8ee307820a3",
+          "closure_sha256": "b9302689441cba5db9e6540a73012c81e6940cb0e19c6b0e73e6e03c4b9a8e4f",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_2cf8dc5e2f442ad1de14",
+          "name": "deepgemm_mega_gate_sm103a_32f800130e2c3233e0c6",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_2cf8dc5e2f442ad1de14_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_2cf8dc5e2f442ad1de14_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_32f800130e2c3233e0c6_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_32f800130e2c3233e0c6_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm103a_5d86fcb53b23fc0c23b0_kernel": {
+        "deepgemm_mega_gate_sm103a_3b193c5055cbaccb8611_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -1681,18 +1681,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "c3ce7217ba48086f54b4ca591b3d956b9dcf084bd352b6c49b2d8b7c3b938270",
+          "closure_sha256": "f672153af32d5d50dbefd678f82542301e06b889ecb4f15c6d0e487a51b1ea04",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_5d86fcb53b23fc0c23b0",
+          "name": "deepgemm_mega_gate_sm103a_3b193c5055cbaccb8611",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_5d86fcb53b23fc0c23b0_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_5d86fcb53b23fc0c23b0_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_3b193c5055cbaccb8611_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_3b193c5055cbaccb8611_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm103a_65403f651b464c11cde2_kernel": {
+        "deepgemm_mega_gate_sm103a_59d2b02400794a4055cb_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -1791,18 +1791,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "73ccc505bd8c84d2a62d509ccc252155aae1ba9014e206510722256cfd5c1317",
+          "closure_sha256": "00bf7e9ba492018ae35211ed869f3e3d4f79f3be05e38e41a7ce9ca3ed76b581",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_65403f651b464c11cde2",
+          "name": "deepgemm_mega_gate_sm103a_59d2b02400794a4055cb",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_65403f651b464c11cde2_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_65403f651b464c11cde2_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_59d2b02400794a4055cb_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_59d2b02400794a4055cb_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm103a_82b6a57abb5eec0e555e_kernel": {
+        "deepgemm_mega_gate_sm103a_7f9f10feae568fcfac75_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -1901,18 +1901,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "4e5b5e6e01cea7c80e9744017ca6a903bd4f91c0360ff204485d049b43adf485",
+          "closure_sha256": "5ff8343186cb6d95670aee0ab865040846c8e17d36e3faa61addaa5b0750f994",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_82b6a57abb5eec0e555e",
+          "name": "deepgemm_mega_gate_sm103a_7f9f10feae568fcfac75",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_82b6a57abb5eec0e555e_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_82b6a57abb5eec0e555e_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_7f9f10feae568fcfac75_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_7f9f10feae568fcfac75_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm103a_a8e37a62f102ec4d0fbb_kernel": {
+        "deepgemm_mega_gate_sm103a_8eddb7d82910edbbfe1b_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -2011,18 +2011,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "08d1bbe55e36dc28875ac085c1a46feabc34f613f9d23d0c71938132406790cc",
+          "closure_sha256": "9b7fa40b3030d086b1070a858d1b5507557f595810b8b176aaf6932da5cd60a4",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_a8e37a62f102ec4d0fbb",
+          "name": "deepgemm_mega_gate_sm103a_8eddb7d82910edbbfe1b",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_a8e37a62f102ec4d0fbb_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_a8e37a62f102ec4d0fbb_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_8eddb7d82910edbbfe1b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_8eddb7d82910edbbfe1b_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm103a_af7e8072c9fe50f21f90_kernel": {
+        "deepgemm_mega_gate_sm103a_99430c7dc484039cd05a_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -2121,18 +2121,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "3df8d6d7631e0d97c94f3b45c6e00af81e2342f4195b040f627c35e618779528",
+          "closure_sha256": "e3e497f0f3a4f25a7183d7474de03384df322ef591ae70f98e82be9b5905f361",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_af7e8072c9fe50f21f90",
+          "name": "deepgemm_mega_gate_sm103a_99430c7dc484039cd05a",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_af7e8072c9fe50f21f90_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_af7e8072c9fe50f21f90_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_99430c7dc484039cd05a_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_99430c7dc484039cd05a_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm103a_bb4612a6dc68ab0392af_kernel": {
+        "deepgemm_mega_gate_sm103a_b45a37f0fd9d40e47e8c_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -2231,18 +2231,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "0ce2db2e7b54ae421fbeb9c1d056cd3073a0ffe6d94ecaf5bdbbd9aad5400fd8",
+          "closure_sha256": "0b9895abf9df3e7b33d04a05303297db87b756701c78a799188a44b6db1a71b7",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_bb4612a6dc68ab0392af",
+          "name": "deepgemm_mega_gate_sm103a_b45a37f0fd9d40e47e8c",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_bb4612a6dc68ab0392af_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_bb4612a6dc68ab0392af_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_b45a37f0fd9d40e47e8c_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_b45a37f0fd9d40e47e8c_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm103a_c81927fa6ba2ab390128_kernel": {
+        "deepgemm_mega_gate_sm103a_cae0735dd0c83fd155a5_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -2341,18 +2341,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "7e017f5e161956d1d53e6716b7f2feebe4a33fdd745d5fe8d382e11d57be6351",
+          "closure_sha256": "31488d701ac0abe847c871035f628a1a029675ecb6a5e93165189e00a68f41b0",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_c81927fa6ba2ab390128",
+          "name": "deepgemm_mega_gate_sm103a_cae0735dd0c83fd155a5",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_c81927fa6ba2ab390128_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_c81927fa6ba2ab390128_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_cae0735dd0c83fd155a5_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_cae0735dd0c83fd155a5_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm103a_f1dceb098f7edba95c95_kernel": {
+        "deepgemm_mega_gate_sm103a_eb6535b366fc1b93e77b_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -2451,18 +2451,18 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "325250a4f69420e931a401ac355d819a59aad3e48f180e4850c74a3c1a74d003",
+          "closure_sha256": "0133a6c0e98aad19502923151d45550dca33c41ec4bd5ad70e2d50b093ca9fc0",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_f1dceb098f7edba95c95",
+          "name": "deepgemm_mega_gate_sm103a_eb6535b366fc1b93e77b",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_f1dceb098f7edba95c95_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_f1dceb098f7edba95c95_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_eb6535b366fc1b93e77b_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_eb6535b366fc1b93e77b_binding.cu"
           ],
           "tma_workspace_bytes": 0
         },
-        "deepgemm_mega_gate_sm103a_feb0c4b700d1d6d6025f_kernel": {
+        "deepgemm_mega_gate_sm103a_ec5a34b5707e10649969_kernel": {
           "arg_plan": [
             [
               "tma_buffer",
@@ -2561,14 +2561,14 @@
               "grid_z"
             ]
           ],
-          "closure_sha256": "fadfd0ae513d704bc153768fa70ef9c1cda894c35c28d41e50ee8c1950d3369d",
+          "closure_sha256": "c1778411384ee904272fc2221e58b6ea329a4c60e6b8315a2750dfcca102a59a",
           "compile_flags": [],
           "ffi_entry": "run",
-          "name": "deepgemm_mega_gate_sm103a_feb0c4b700d1d6d6025f",
+          "name": "deepgemm_mega_gate_sm103a_ec5a34b5707e10649969",
           "role": "kernel",
           "sources": [
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_feb0c4b700d1d6d6025f_kernel.cu",
-            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_feb0c4b700d1d6d6025f_binding.cu"
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_ec5a34b5707e10649969_kernel.cu",
+            "csrc/experimental/deepgemm_mega_gate/generated/sm_103a/deepgemm_mega_gate_sm103a_ec5a34b5707e10649969_binding.cu"
           ],
           "tma_workspace_bytes": 0
         }
@@ -2585,7 +2585,7 @@
             "num_stages": 11,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm103a_5d86fcb53b23fc0c23b0_kernel"
+          "program": "deepgemm_mega_gate_sm103a_cae0735dd0c83fd155a5_kernel"
         },
         "128:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -2598,7 +2598,7 @@
             "num_stages": 11,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm103a_65403f651b464c11cde2_kernel"
+          "program": "deepgemm_mega_gate_sm103a_3b193c5055cbaccb8611_kernel"
         },
         "16:5120:384:6:152:sqrtsoftplus:True:False:False:False:False:False:True:False": {
           "config": {
@@ -2611,7 +2611,7 @@
             "num_stages": 12,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm103a_a8e37a62f102ec4d0fbb_kernel"
+          "program": "deepgemm_mega_gate_sm103a_99430c7dc484039cd05a_kernel"
         },
         "16:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -2624,7 +2624,7 @@
             "num_stages": 12,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm103a_1e948061563961abcb3e_kernel"
+          "program": "deepgemm_mega_gate_sm103a_eb6535b366fc1b93e77b_kernel"
         },
         "16:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:True:True": {
           "config": {
@@ -2637,7 +2637,7 @@
             "num_stages": 12,
             "num_workers": 8
           },
-          "program": "deepgemm_mega_gate_sm103a_f1dceb098f7edba95c95_kernel"
+          "program": "deepgemm_mega_gate_sm103a_59d2b02400794a4055cb_kernel"
         },
         "1:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -2650,7 +2650,7 @@
             "num_stages": 12,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm103a_c81927fa6ba2ab390128_kernel"
+          "program": "deepgemm_mega_gate_sm103a_8eddb7d82910edbbfe1b_kernel"
         },
         "2048:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -2663,7 +2663,7 @@
             "num_stages": 11,
             "num_workers": 12
           },
-          "program": "deepgemm_mega_gate_sm103a_82b6a57abb5eec0e555e_kernel"
+          "program": "deepgemm_mega_gate_sm103a_2c9c430c924b85331759_kernel"
         },
         "3:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -2676,7 +2676,7 @@
             "num_stages": 12,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm103a_2cf8dc5e2f442ad1de14_kernel"
+          "program": "deepgemm_mega_gate_sm103a_b45a37f0fd9d40e47e8c_kernel"
         },
         "4096:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -2689,7 +2689,7 @@
             "num_stages": 11,
             "num_workers": 12
           },
-          "program": "deepgemm_mega_gate_sm103a_af7e8072c9fe50f21f90_kernel"
+          "program": "deepgemm_mega_gate_sm103a_ec5a34b5707e10649969_kernel"
         },
         "512:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -2702,7 +2702,7 @@
             "num_stages": 7,
             "num_workers": 6
           },
-          "program": "deepgemm_mega_gate_sm103a_bb4612a6dc68ab0392af_kernel"
+          "program": "deepgemm_mega_gate_sm103a_32f800130e2c3233e0c6_kernel"
         },
         "8192:5120:384:6:152:sqrtsoftplus:True:False:False:True:False:False:False:False": {
           "config": {
@@ -2715,7 +2715,7 @@
             "num_stages": 11,
             "num_workers": 25
           },
-          "program": "deepgemm_mega_gate_sm103a_feb0c4b700d1d6d6025f_kernel"
+          "program": "deepgemm_mega_gate_sm103a_7f9f10feae568fcfac75_kernel"
         }
       }
     }
