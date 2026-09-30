@@ -47,7 +47,7 @@ Caller-owned execution
 
    from flashinfer.fused_moe import (
        cutlass_fused_moe, cutlass_fused_moe_workspace_size,
-       cutlass_fused_moe_prepare_workspace,
+       cake_fused_moe_prepare_workspace,
    )
    import torch
    from flashinfer.tllm_enums import ActivationType
@@ -60,7 +60,7 @@ Caller-owned execution
    )
    workspace = torch.empty(nbytes, dtype=torch.uint8, device=x.device)
    output = torch.empty_like(x)
-   cutlass_fused_moe_prepare_workspace(workspace, x.shape[0], backend="cake")
+   cake_fused_moe_prepare_workspace(workspace, x.shape[0], backend="cake")
    cutlass_fused_moe(
        x, expert_ids, route_weights, w13, w2, torch.bfloat16, quant_scales,
        activation_type=ActivationType.Situ, tp_size=8, backend="cake",

@@ -7093,4 +7093,4 @@ def trtllm_mxint4_block_scale_routed_moe(
     )
 
 
-from .cake_kimi_k3_situ import cutlass_fused_moe_prepare_workspace  # noqa: E402,F401
+from .cake_kimi_k3_situ import cake_fused_moe_prepare_workspace  # noqa: E402,F401

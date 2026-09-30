@@ -193,7 +193,7 @@ def _workspace_key(workspace):
     return (workspace.data_ptr(), workspace.numel(), workspace.device)
 
 
-def cutlass_fused_moe_prepare_workspace(
+def cake_fused_moe_prepare_workspace(
     workspace_buffer,
     num_tokens,
     *,
@@ -312,9 +312,7 @@ def _prepared(workspace, num_tokens):
         )
     state = getattr(workspace, _STATE_ATTR, None)
     if state is None or state["buffer_key"] != _workspace_key(workspace):
-        raise ValueError(
-            "call cutlass_fused_moe_prepare_workspace before submitting SiTU"
-        )
+        raise ValueError("call cake_fused_moe_prepare_workspace before submitting SiTU")
     if num_tokens not in state["shapes"]:
         raise ValueError(f"workspace is not prepared for {num_tokens} tokens")
     return state["shapes"][num_tokens]
