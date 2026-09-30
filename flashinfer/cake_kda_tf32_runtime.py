@@ -257,8 +257,10 @@ BF16_ONE_WAVE_DVSPLIT_ARCHES = ("sm_100a", "sm_103a")
 # rounding of the correction is scaled by |1 - d|, so the accumulated error is
 # bounded by one BF16 ulp of |S| at every length.  The FP32-pool route is
 # validated on that body (worst-head state rrmse <= 0.008 at 8192 tokens, B200
-# and GB300) and keeps the split at every length; the BF16-pool guard below is
-# kept until that pool's rows are measured on the same body.
+# and GB300) and keeps the split at every length.  The same body measures
+# 0.0071-0.0086 on a BF16 pool (B200, T 512-8192), but no BF16-pool split module
+# is exported, so lifting the guard below is an export-inventory change kept for
+# a separate round; the guard stays for BF16 pools only.
 BF16_DVSPLIT_STATE_CARRIER_MAX_SEQ_LEN = 64
 BT16_CHUNK = 16
 BT16_VALUE_SPLITS = 2
