@@ -332,10 +332,10 @@ MODULES: dict[str, dict[str, Any]] = {
             "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
         },
         "gemm_dw_acc": {
-            "module": "cake_lm_head_loss_f7fe5807de393243c5a5",
+            "module": "cake_lm_head_loss_a6baf2d4cb7ab09d54cb",
             "sources": [
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_f7fe5807de393243c5a5_kernel.cu",
-                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_f7fe5807de393243c5a5_binding.cu",
+                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_a6baf2d4cb7ab09d54cb_kernel.cu",
+                "cake_lm_head_loss/sm_100a/cake_lm_head_loss_a6baf2d4cb7ab09d54cb_binding.cu",
             ],
             "compile_flags": [],
             "ffi_entry": "run",
@@ -354,11 +354,11 @@ MODULES: dict[str, dict[str, Any]] = {
                 ["grid", "grid_y"],
                 ["grid", "grid_z"],
             ],
-            "closure_sha256": "9d72b7aebbbbd37009d43b8df6c1646c42c196f57adf677306742b152f58b787",
+            "closure_sha256": "b1a7c4ef5c44b46d2ac1f40c0deb2f5ce9715449d090f8d420299cf7593015d5",
             "tma_workspace_bytes": 0,
             "workspace_bytes": 0,
-            "grid": ["max(1, min(m_tiles//2*24, resident))*2", 1, 1],
-            "launch": {"block": [192, 1, 1], "cluster": [2, 1, 1]},
+            "grid": ["max(1, m_tiles//2*24)*2", 1, 1],
+            "launch": {"block": [224, 1, 1], "cluster": [2, 1, 1]},
         },
         "scale_cast_bf16": {
             "module": "cake_lm_head_loss_2fbdae03f8d282f1b6ea",
@@ -406,7 +406,7 @@ MODULES: dict[str, dict[str, Any]] = {
             "grid": ["max(1, min(num_vecs/2048, 65535))", 1, 1],
             "launch": {"block": [256, 1, 1], "cluster": [1, 1, 1]},
         },
-        "closure_sha256": "c3100e9ec03f3c08d8ddec765f8ac8b75c647c0569416fa87fb8b7ccfc309d7b",
+        "closure_sha256": "b1442c09583f3b710f57e98156947b1c7ed00eef1bf410ba08e245ebfd982c0f",
     },
     "cake_lm_head_loss_sm_103a": {
         "arch": "sm_103a",

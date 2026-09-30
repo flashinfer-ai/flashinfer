@@ -55,6 +55,8 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define NUM_TMA_PIPE_STAGES 6
 #define NUM_MAINLOOP_PIPE_STAGES 2
 #define NUM_EPI_STORE_PIPE_STAGES 2
+#define NUM_CLC_PIPE_STAGES 2
+#define NUM_THR_PIPE_STAGES 2
 #define SMEM_SMEM_V0_OFF 1024
 #define SMEM_SMEM_V0_STAGE_BYTES 16384
 #define SMEM_SMEM_V0_STRIDE 32768
@@ -64,11 +66,14 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SMEM_EPI_OFF 197632
 #define SMEM_SMEM_EPI_STAGE_BYTES 16384
 #define SMEM_SMEM_EPI_STRIDE 16384
-#define SMEM_TOTAL 230400
-#define THREADS 192
+#define SMEM_CLC_RESP_OFF 230400
+#define SMEM_CLC_RESP_STAGE_BYTES 16
+#define SMEM_CLC_RESP_STRIDE 16
+#define SMEM_TOTAL 230528
+#define THREADS 224
 #define num_pair_items ((m_tiles / 2) * 24)
 #define num_items num_pair_items
-#define tiles_per_group 48
+#define tiles_per_group 192
 
 #include <math_constants.h>
 
@@ -425,8 +430,8 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 
 extern "C" {
 
-__global__ __launch_bounds__(192) __cluster_dims__(2,1,1) void
-kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ C, float* __restrict__ STATS_OUT, int M, int m_tiles, int k_iters, int first_chunk, float* __restrict__ WS, int ws_slab)
+__global__ __launch_bounds__(224) __cluster_dims__(2,1,1) void
+kernel_cake_lm_head_loss_a6baf2d4cb7ab09d54cb(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ C, float* __restrict__ STATS_OUT, int M, int m_tiles, int k_iters, int first_chunk, float* __restrict__ WS, int ws_slab)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -442,6 +447,10 @@ kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMa
     #define mma_done_addr (mbar_base + 48)
     #define mainloop_done_addr (mbar_base + 96)
     #define epilogue_done_addr (mbar_base + 112)
+    #define clc_full_addr (mbar_base + 128)
+    #define clc_empty_addr (mbar_base + 144)
+    #define thr_full_addr (mbar_base + 160)
+    #define thr_empty_addr (mbar_base + 176)
 
     const int bid = blockIdx.x;
     const int num_bids = gridDim.x;
@@ -459,9 +468,11 @@ kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMa
     const int smem_v1_addr = smem + 17408;
     float* smem_epi = reinterpret_cast<float*>(smem_raw + 197632);
     const int smem_epi_addr = smem + 197632;
+    unsigned int* clc_resp = reinterpret_cast<unsigned int*>(smem_raw + 230400);
+    const int clc_resp_addr = smem + 230400;
 
-    // Mbarrier init (4 pipeline groups, 0 ordered-sequence groups, 16 barriers)
-    // Mbarriers at smem_raw[0..128)
+    // Mbarrier init (8 pipeline groups, 0 ordered-sequence groups, 24 barriers)
+    // Mbarriers at smem_raw[0..192)
 
     if (warp == 0) {
         uint32_t leader = elect_sync();
@@ -488,6 +499,20 @@ kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMa
             // epilogue_done: 2 barriers, init_count=8
             mbarrier_init(smem + 112, 8);
             mbarrier_init(smem + 120, 8);
+            // --- pipeline 'clc_pipe' ---
+            // clc_full: 2 barriers, init_count=1
+            mbarrier_init(smem + 128, 1);
+            mbarrier_init(smem + 136, 1);
+            // clc_empty: 2 barriers, init_count=416
+            mbarrier_init(smem + 144, 416);
+            mbarrier_init(smem + 152, 416);
+            // --- pipeline 'thr_pipe' ---
+            // thr_full: 2 barriers, init_count=32
+            mbarrier_init(smem + 160, 32);
+            mbarrier_init(smem + 168, 32);
+            // thr_empty: 2 barriers, init_count=32
+            mbarrier_init(smem + 176, 32);
+            mbarrier_init(smem + 184, 32);
             asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
         }
     }
@@ -498,9 +523,9 @@ kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMa
     asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
 
     // TMEM alloc (512 columns, 512 used)
-    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 128);
+    volatile int* tmem_addr_storage = (volatile int*)(smem_raw + 192);
     if (warp == 0) {
-        int _tmem_hold = smem + 128;
+        int _tmem_hold = smem + 192;
         asm volatile("tcgen05.alloc.cta_group::2.sync.aligned.shared::cta.b32 [%0], %1;" :: "r"(_tmem_hold), "r"(512) : "memory");
         __syncwarp();
         asm volatile("tcgen05.relinquish_alloc_permit.cta_group::2.sync.aligned;");
@@ -522,20 +547,31 @@ kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMa
             unsigned int load_stage = 0;
             unsigned int ld_cluster_id = bid / 2;
             unsigned int ld_num_clusters = num_bids / 2;
+            unsigned int load_clc_stage = 0;
+            unsigned int load_thr_stage = 0;
+            unsigned int ld_tile = ld_cluster_id;
+            unsigned int _phase_thr_empty = 1;
             unsigned int _phase_mma_done = 1;
-            if (elect_sync()) {
-                #pragma unroll 1
-                for (unsigned int ld_item = ld_cluster_id; ld_item < num_items; ld_item += ld_num_clusters) {
-                    int ld_item_i = ld_item;
+            unsigned int _phase_clc_full = 0;
+            #pragma unroll 1
+            for (unsigned int _lp = 0; _lp < num_items; _lp++) {
+                if (cta_rank == 0) {
+                    mbarrier_wait(thr_empty_addr + (load_thr_stage) * 8, _phase_thr_empty);
+                    mbarrier_arrive(thr_full_addr + (load_thr_stage) * 8);
+                    load_thr_stage += 1;
+                    if (load_thr_stage == 2) { load_thr_stage = 0; _phase_thr_empty ^= 1; }
+                }
+                if (elect_sync()) {
+                    int ld_item_i = ld_tile;
                     int ld_slice = ld_item_i / num_pair_items;
                     int ld_pair_item = ld_item_i % num_pair_items;
                     int ld_k_base = ld_slice;
                     int ld_k_count = ((ld_slice < 0) ? 1 : 1);
                     int ld_pair_bid = ld_item_i * 2 + cta_rank;
                     int group = ld_pair_bid / tiles_per_group;
-                    int first_m = group * 2;
+                    int first_m = group * 8;
                     int remaining = m_tiles - first_m;
-                    int group_size = ((remaining >= 2) ? 2 : remaining);
+                    int group_size = ((remaining >= 8) ? 8 : remaining);
                     int local = ld_pair_bid % tiles_per_group;
                     int bid_m = first_m + local % group_size;
                     int bid_n = local / group_size;
@@ -557,6 +593,45 @@ kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMa
                         if (load_stage == 6) { load_stage = 0; _phase_mma_done ^= 1; }
                     }
                 }
+                mbarrier_wait(clc_full_addr + (load_clc_stage) * 8, _phase_clc_full);
+                uint32_t _clc_valid_1 = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "selp.u32 %0, 1, 0, p1;\n\t"
+                    "}\n"
+                    : "=r"(_clc_valid_1)
+                    : "r"(clc_resp_addr + load_clc_stage * 16 + 0 * 16)
+                    : "memory");
+                uint32_t _clc_ctaid_0 = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
+                    "}\n"
+                    : "=r"(_clc_ctaid_0)
+                    : "r"(clc_resp_addr + load_clc_stage * 16 + 0 * 16)
+                    : "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b32 remAddr32;\n\t"
+                    "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
+                    "}"
+                    :: "r"(clc_empty_addr + load_clc_stage * 8), "r"(0) : "memory");
+                load_clc_stage += 1;
+                if (load_clc_stage == 2) { load_clc_stage = 0; _phase_clc_full ^= 1; }
+                if (_clc_valid_1 == 0) {
+                    break;
+                }
+                ld_tile = _clc_ctaid_0 / 2;
             }
         }
     }
@@ -567,12 +642,15 @@ kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMa
             unsigned int mma_epi_stage = 0;
             unsigned int mma_cluster_id = bid / 2;
             unsigned int mma_num_clusters = num_bids / 2;
+            unsigned int mma_clc_stage = 0;
+            unsigned int mm_tile = mma_cluster_id;
             unsigned int _phase_epilogue_done = 1;
             unsigned int _phase_tma_full = 0;
-            if (cta_rank == 0) {
-                #pragma unroll 1
-                for (unsigned int mm_item = mma_cluster_id; mm_item < num_items; mm_item += mma_num_clusters) {
-                    int mm_item_i = mm_item;
+            unsigned int _phase_clc_full_1 = 0;
+            #pragma unroll 1
+            for (unsigned int _mp = 0; _mp < num_items; _mp++) {
+                if (cta_rank == 0) {
+                    int mm_item_i = mm_tile;
                     int mm_slice = mm_item_i / num_pair_items;
                     int mm_k_last = ((mm_slice < 0) ? 1 : 1);
                     #pragma unroll 1
@@ -629,6 +707,45 @@ kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMa
                         if (mma_epi_stage == 2) { mma_epi_stage = 0; _phase_epilogue_done ^= 1; }
                     }
                 }
+                mbarrier_wait(clc_full_addr + (mma_clc_stage) * 8, _phase_clc_full_1);
+                uint32_t _clc_valid_2 = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "selp.u32 %0, 1, 0, p1;\n\t"
+                    "}\n"
+                    : "=r"(_clc_valid_2)
+                    : "r"(clc_resp_addr + mma_clc_stage * 16 + 0 * 16)
+                    : "memory");
+                uint32_t _clc_ctaid_1 = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
+                    "}\n"
+                    : "=r"(_clc_ctaid_1)
+                    : "r"(clc_resp_addr + mma_clc_stage * 16 + 0 * 16)
+                    : "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b32 remAddr32;\n\t"
+                    "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
+                    "}"
+                    :: "r"(clc_empty_addr + mma_clc_stage * 8), "r"(0) : "memory");
+                mma_clc_stage += 1;
+                if (mma_clc_stage == 2) { mma_clc_stage = 0; _phase_clc_full_1 ^= 1; }
+                if (_clc_valid_2 == 0) {
+                    break;
+                }
+                mm_tile = _clc_ctaid_1 / 2;
             }
         }
     }
@@ -641,17 +758,55 @@ kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMa
             const int epi_col0 = (warp - 2) / 4 * 256;
             unsigned int ep_cluster_id = bid / 2;
             unsigned int ep_num_clusters = num_bids / 2;
+            unsigned int epi_clc_stage = 0;
+            unsigned int ep_tile = ep_cluster_id;
+            unsigned int _phase_clc_full_2 = 0;
             unsigned int _phase_mainloop_done = 0;
             #pragma unroll 1
-            for (unsigned int ep_item = ep_cluster_id; ep_item < num_items; ep_item += ep_num_clusters) {
-                int ep_item_i = ep_item;
+            for (unsigned int _ep = 0; _ep < num_items; _ep++) {
+                mbarrier_wait(clc_full_addr + (epi_clc_stage) * 8, _phase_clc_full_2);
+                uint32_t _clc_valid_3 = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "selp.u32 %0, 1, 0, p1;\n\t"
+                    "}\n"
+                    : "=r"(_clc_valid_3)
+                    : "r"(clc_resp_addr + epi_clc_stage * 16 + 0 * 16)
+                    : "memory");
+                uint32_t _clc_ctaid_2 = 0;
+                asm volatile(
+                    "{\n\t"
+                    ".reg .pred p1;\n\t"
+                    ".reg .b128 clc_r;\n\t"
+                    "ld.shared.b128 clc_r, [%1];\n\t"
+                    "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                    "@p1 clusterlaunchcontrol.query_cancel.get_first_ctaid::x.b32.b128 %0, clc_r;\n\t"
+                    "}\n"
+                    : "=r"(_clc_ctaid_2)
+                    : "r"(clc_resp_addr + epi_clc_stage * 16 + 0 * 16)
+                    : "memory");
+                asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                asm volatile(
+                    "{\n\t"
+                    ".reg .b32 remAddr32;\n\t"
+                    "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                    "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
+                    "}"
+                    :: "r"(clc_empty_addr + epi_clc_stage * 8), "r"(0) : "memory");
+                epi_clc_stage += 1;
+                if (epi_clc_stage == 2) { epi_clc_stage = 0; _phase_clc_full_2 ^= 1; }
+                int ep_item_i = ep_tile;
                 int ep_slice = ep_item_i / num_pair_items;
                 int ep_pair_item = ep_item_i % num_pair_items;
                 int ep_pair_bid = ep_item_i * 2 + cta_rank;
                 int group_1 = ep_pair_bid / tiles_per_group;
-                int first_m_1 = group_1 * 2;
+                int first_m_1 = group_1 * 8;
                 int remaining_1 = m_tiles - first_m_1;
-                int group_size_1 = ((remaining_1 >= 2) ? 2 : remaining_1);
+                int group_size_1 = ((remaining_1 >= 8) ? 8 : remaining_1);
                 int local_1 = ep_pair_bid % tiles_per_group;
                 int bid_m_1 = first_m_1 + local_1 % group_size_1;
                 int bid_n_1 = local_1 / group_size_1;
@@ -726,6 +881,80 @@ kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMa
                     }
                     epi_stage += 1;
                     if (epi_stage == 2) { epi_stage = 0; _phase_mainloop_done ^= 1; }
+                }
+                if (_clc_valid_3 == 0) {
+                    break;
+                }
+                ep_tile = _clc_ctaid_2 / 2;
+            }
+        }
+    }
+    // ---- Role: sched ----
+    if (warp == 6) {
+        { // sched_main
+            unsigned int _phase_thr_full = 0;
+            unsigned int _phase_clc_empty = 1;
+            unsigned int _phase_clc_full_3 = 0;
+            if (cta_rank == 0) {
+                unsigned int sched_clc_stage = 0;
+                unsigned int sched_thr_stage = 0;
+                #pragma unroll 1
+                for (unsigned int _sp = 0; _sp < num_items; _sp++) {
+                    mbarrier_wait(thr_full_addr + (sched_thr_stage) * 8, _phase_thr_full);
+                    mbarrier_arrive(thr_empty_addr + (sched_thr_stage) * 8);
+                    sched_thr_stage += 1;
+                    if (sched_thr_stage == 2) { sched_thr_stage = 0; _phase_thr_full ^= 1; }
+                    mbarrier_wait(clc_empty_addr + (sched_clc_stage) * 8, _phase_clc_empty);
+                    if (lane < 2) {
+                        asm volatile(
+                            "{\n\t"
+                            ".reg .b32 remAddr32;\n\t"
+                            "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                            "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [remAddr32], %2;\n\t"
+                            "}"
+                            :: "r"(clc_full_addr + sched_clc_stage * 8), "r"(lane), "r"((uint32_t)(16)) : "memory");
+                    }
+                    if (elect_sync()) {
+                        asm volatile(
+                            "fence.proxy.async.shared::cta;\n\t"
+                            "clusterlaunchcontrol.try_cancel.async.shared::cta"
+                                ".mbarrier::complete_tx::bytes.multicast::cluster::all.b128"
+                                " [%0], [%1];"
+                            :: "r"(clc_resp_addr + sched_clc_stage * 16 + 0 * 16), "r"(clc_full_addr + sched_clc_stage * 8)
+                            : "memory");
+                    }
+                    mbarrier_wait(clc_full_addr + (sched_clc_stage) * 8, _phase_clc_full_3);
+                    uint32_t _clc_valid_0 = 0;
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .pred p1;\n\t"
+                        ".reg .b128 clc_r;\n\t"
+                        "ld.shared.b128 clc_r, [%1];\n\t"
+                        "clusterlaunchcontrol.query_cancel.is_canceled.pred.b128 p1, clc_r;\n\t"
+                        "selp.u32 %0, 1, 0, p1;\n\t"
+                        "}\n"
+                        : "=r"(_clc_valid_0)
+                        : "r"(clc_resp_addr + sched_clc_stage * 16 + 0 * 16)
+                        : "memory");
+                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                    asm volatile(
+                        "{\n\t"
+                        ".reg .b32 remAddr32;\n\t"
+                        "mapa.shared::cluster.u32 remAddr32, %0, %1;\n\t"
+                        "mbarrier.arrive.release.cta.shared::cluster.b64 _, [remAddr32];\n\t"
+                        "}"
+                        :: "r"(clc_empty_addr + sched_clc_stage * 8), "r"(0) : "memory");
+                    sched_clc_stage += 1;
+                    if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; _phase_clc_full_3 ^= 1; }
+                    if (_clc_valid_0 == 0) {
+                        break;
+                    }
+                }
+                #pragma unroll
+                for (int _st = 0; _st < 2; _st++) {
+                    mbarrier_wait(clc_empty_addr + (sched_clc_stage) * 8, _phase_clc_empty);
+                    sched_clc_stage += 1;
+                    if (sched_clc_stage == 2) { sched_clc_stage = 0; _phase_clc_empty ^= 1; _phase_clc_full_3 ^= 1; }
                 }
             }
         }
