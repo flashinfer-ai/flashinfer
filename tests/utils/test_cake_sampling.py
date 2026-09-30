@@ -37,6 +37,7 @@ from flashinfer.cake_sampling import (
     cake_sampling_route,
     choose_stage1,
     choose_stage23,
+    stage23_variant_flags,
     top_k_probs_to_slab,
     top_k_top_p_sampling_from_probs,
 )
@@ -313,6 +314,7 @@ def _run(
             1,
             threads,
             items,
+            stage23_variant_flags(probs.device),
             1 if pdl else 0,
             stream,
         )
@@ -549,81 +551,387 @@ def test_per_request_tensors_and_routes():
     # measured-best variant of that cell in the round-4 per-variant sweeps (k = 50, 25 cells per
     # table on B200, B300, H100 and R200).
     pick = functools.partial(choose_stage1, smem_limit=_FULL_SMEM_OPTIN)
-    # Same on every table: the (8, 16) stream owns V = 151936 / 262144 at small batches (the (8, 48)
-    # resident is retired), streams of 2 / 1 own the large batches, V = 32768 small batches stay on (4, 16).
-    for sm in (148, 132, 212):
-        assert pick(1, 32768, sm_count=sm) == (4, 16, False)
-        assert pick(16, 32768, sm_count=sm) == (4, 16, False)
-        assert pick(8, 65536, sm_count=sm) == (8, 16, False)
-        assert pick(1, 151936, sm_count=sm) == (8, 16, True)
-        assert pick(8, 151936, sm_count=sm) == (8, 16, True)
-        assert pick(1, 262144, sm_count=sm) == (8, 16, True)
-        assert pick(8, 262144, sm_count=sm) == (8, 16, True)
-        assert pick(64, 128256, sm_count=sm) == (2, 16, True)
-        assert pick(64, 262144, sm_count=sm)[2]
-        assert pick(128, 32768, sm_count=sm) == (1, 16, True)
-        assert pick(128, 151936, sm_count=sm)[2]
-    # B200 / B300 wave table (148 SMs): the (8, 16) stream beats the (8, 32) resident at V = 128256,
-    # B <= 8 (12.5 vs 12.9 us) and B = 64 rows of 32768 stream on (2, 16) (11.3 vs 11.9 resident).
-    assert pick(1, 128256, sm_count=148) == (8, 16, True)
-    assert pick(8, 128256, sm_count=148) == (8, 16, True)
-    assert pick(16, 128256, sm_count=148) == (4, 16, True)
-    assert pick(32, 128256, sm_count=148) == (4, 16, True)
-    assert pick(16, 151936, sm_count=148) == (4, 16, True)
-    assert pick(16, 262144, sm_count=148) == (4, 16, True)
-    assert pick(32, 32768, sm_count=148) == (4, 16, False)
-    assert pick(64, 32768, sm_count=148) == (2, 16, True)
-    # H100 wave table (132 SMs): the (8, 32) resident wins V = 128256, B <= 8 (13.1 vs 13.9 us); 128
-    # cluster-4 CTAs are two waves, so B = 32 large-vocabulary rows stream with clusters of 2; B = 64
-    # rows of 32768 take the 64-CTA (1, 16) launch (13.2 vs 13.8 for 128 cluster-2 CTAs); at B = 32
-    # rows of 32768 the (2, 16) stream and the (2, 32) resident tie (12.16 us).
-    assert pick(1, 128256, sm_count=132) == (8, 32, False)
-    assert pick(8, 128256, sm_count=132) == (8, 32, False)
-    assert pick(16, 128256, sm_count=132) == (4, 16, True)
-    assert pick(32, 128256, sm_count=132) == (2, 16, True)
-    assert pick(32, 262144, sm_count=132) == (2, 16, True)
-    assert pick(32, 32768, sm_count=132) == (2, 16, True)
-    assert pick(64, 32768, sm_count=132) == (1, 16, True)
-    # Rubin R200 wave table (212 SMs): 128 cluster-8 CTAs are one wave (22 eight-CTA clusters fit),
-    # so V = 128256 stays on the (8, 32) resident up to B = 16 (11.1 vs 11.2 us) and V = 151936 /
-    # 262144 on the (8, 16) stream up to B = 16; B = 32 (256 CTAs) streams with clusters of 4 as on
-    # B200; B = 64 rows of 32768 stay register-resident on (2, 32) (9.1 vs 9.3).
-    assert pick(16, 128256, sm_count=212) == (8, 32, False)
-    assert pick(32, 128256, sm_count=212) == (4, 16, True)
-    assert pick(16, 151936, sm_count=212) == (8, 16, True)
-    assert pick(16, 262144, sm_count=212) == (8, 16, True)
-    assert pick(32, 262144, sm_count=212) == (4, 16, True)
-    assert pick(32, 32768, sm_count=212) == (4, 16, False)
-    assert pick(64, 32768, sm_count=212) == (2, 32, False)
-    # k > 64 (k = 1000 sweeps on all four architectures): the streaming template's per-bucket path
-    # loses to the register-resident candidate path, so V = 128256, B <= 8 stays on (8, 32) (B200
-    # 12.8 vs 16.5 us for the (8, 16) stream) and V = 32768, B = 64 on (2, 32) (12.7 vs 13.2).
-    for sm in (148, 132, 212):
-        assert pick(1, 128256, sm_count=sm, top_k_max=1000) == (8, 32, False)
-        assert pick(8, 128256, sm_count=sm, top_k_max=1000) == (8, 32, False)
-        assert pick(64, 32768, sm_count=sm, top_k_max=1000) == (2, 32, False)
-        assert pick(1, 262144, sm_count=sm, top_k_max=1000) == (8, 16, True)
-        assert pick(128, 32768, sm_count=sm, top_k_max=1000) == (1, 16, True)
-        assert pick(1, 128256, sm_count=sm, top_k_max=50) == pick(
-            1, 128256, sm_count=sm
+    # Round-5 pins: the dispatcher's pick for every cell of the round-5 per-variant sweeps (25 (V, B) cells x
+    # k = 50 / 1000 per table, every frozen variant incl. the ept-32 streams, on B200 + B300 (148), H100 (132)
+    # and R200 (212)); every pick is the measured-best variant of its cell or within the noted regret (< 3 %).
+    # 148-SM table: worst regret 1.7 % against the measured-best variant of each cell
+    for (pb, pv, pk), want in {
+        (1, 32768, 50): (4, 16, False),
+        (4, 32768, 50): (4, 16, False),
+        (8, 32768, 50): (4, 16, False),
+        (16, 32768, 50): (1, 32, True),
+        (32, 32768, 50): (1, 32, True),
+        (64, 32768, 50): (1, 32, True),
+        (128, 32768, 50): (1, 32, True),
+        (1, 128256, 50): (8, 32, True),  # +1.5 % vs best
+        (4, 128256, 50): (8, 32, True),  # +1.7 % vs best
+        (8, 128256, 50): (8, 32, True),  # +1.7 % vs best
+        (16, 128256, 50): (4, 32, True),
+        (32, 128256, 50): (4, 32, True),
+        (64, 128256, 50): (2, 32, True),
+        (128, 128256, 50): (1, 32, True),
+        (1, 151936, 50): (8, 16, True),  # +0.8 % vs best
+        (8, 151936, 50): (8, 16, True),  # +1.4 % vs best
+        (16, 151936, 50): (4, 32, True),
+        (64, 151936, 50): (2, 32, True),
+        (128, 151936, 50): (1, 32, True),
+        (1, 262144, 50): (8, 32, True),
+        (8, 262144, 50): (8, 32, True),
+        (16, 262144, 50): (4, 32, True),
+        (32, 262144, 50): (4, 32, True),
+        (64, 262144, 50): (2, 32, True),
+        (128, 262144, 50): (1, 32, True),
+    }.items():
+        assert pick(pb, pv, sm_count=148, top_k_max=pk) == want, (pb, pv, pk, 148)
+    # 148-SM table, fused block-tail regime (B200 k = 1000 sweep): worst regret 2.8 %, 0 cells over 3 %
+    for (pb, pv, pk, two), want in {
+        (1, 32768, 1000, False): (4, 16, False),
+        (4, 32768, 1000, False): (4, 16, False),
+        (8, 32768, 1000, False): (4, 16, False),
+        (16, 32768, 1000, False): (4, 16, False),
+        (32, 32768, 1000, False): (4, 16, False),
+        (64, 32768, 1000, False): (2, 32, False),
+        (128, 32768, 1000, False): (1, 16, True),
+        (1, 128256, 1000, False): (8, 32, False),
+        (4, 128256, 1000, False): (8, 32, False),
+        (8, 128256, 1000, False): (8, 32, False),
+        (16, 128256, 1000, False): (
+            4,
+            16,
+            True,
+        ),  # +0.7 % vs best (4, 32, 1) (23.74 vs 23.58 us)
+        (32, 128256, 1000, False): (4, 16, True),
+        (64, 128256, 1000, False): (2, 32, True),
+        (128, 128256, 1000, False): (1, 32, True),
+        (1, 151936, 1000, False): (8, 16, True),
+        (8, 151936, 1000, False): (8, 16, True),
+        (16, 151936, 1000, False): (4, 16, True),
+        (64, 151936, 1000, False): (
+            2,
+            32,
+            True,
+        ),  # +2.8 % vs best (2, 16, 1) (33.25 vs 32.35 us)
+        (128, 151936, 1000, False): (1, 32, True),
+        (1, 262144, 1000, False): (8, 16, True),
+        (4, 262144, 1000, False): (8, 16, True),
+        (8, 262144, 1000, False): (8, 16, True),
+        (16, 262144, 1000, False): (4, 32, True),
+        (32, 262144, 1000, False): (4, 32, True),
+        (64, 262144, 1000, False): (2, 32, True),
+        (128, 262144, 1000, False): (1, 32, True),
+    }.items():
+        assert pick(pb, pv, sm_count=148, top_k_max=pk, two_launch=two) == want, (
+            pb,
+            pv,
+            pk,
+            two,
+            148,
         )
-    assert pick(16, 128256, sm_count=148, top_k_max=1000) == (4, 16, True)
-    assert pick(16, 128256, sm_count=212, top_k_max=1000) == (8, 32, False)
-    # V = 151936 at k = 1000, B <= 8: every table takes the (8, 48) resident (H100 15.6 vs 16.9 us for the
-    # (8, 16) stream at B = 1; R200 12.4 vs 12.7; on B200 / B300 the kernels tie but the two-launch call is
-    # 2.6-3.6 % faster with the resident at B = 1); the (4, 16) stream owns B = 16 on the 148 / 132 tables.
-    assert pick(1, 151936, sm_count=148, top_k_max=1000) == (8, 48, False)
-    assert pick(8, 151936, sm_count=148, top_k_max=1000) == (8, 48, False)
-    assert pick(16, 151936, sm_count=148, top_k_max=1000) == (4, 16, True)
-    assert pick(1, 151936, sm_count=132, top_k_max=1000) == (8, 48, False)
-    assert pick(1, 151936, sm_count=212, top_k_max=1000) == (8, 48, False)
-    assert pick(16, 151936, sm_count=212, top_k_max=1000) == (8, 48, False)
-    assert pick(16, 151936, sm_count=132, top_k_max=1000) == (4, 16, True)
+    # 148-SM table, two-launch chain regime (GB300 graph k = 1000 sweep): worst regret 4.5 %, 1 cells over 3 %
+    for (pb, pv, pk, two), want in {
+        (1, 32768, 1000, True): (4, 16, False),
+        (4, 32768, 1000, True): (4, 16, False),
+        (8, 32768, 1000, True): (4, 16, False),
+        (16, 32768, 1000, True): (4, 16, False),
+        (32, 32768, 1000, True): (4, 16, False),
+        (64, 32768, 1000, True): (2, 32, False),
+        (128, 32768, 1000, True): (1, 16, True),
+        (1, 128256, 1000, True): (8, 32, False),
+        (4, 128256, 1000, True): (8, 32, False),
+        (8, 128256, 1000, True): (8, 32, False),
+        (16, 128256, 1000, True): (4, 16, True),
+        (32, 128256, 1000, True): (4, 16, True),
+        (64, 128256, 1000, True): (
+            2,
+            32,
+            True,
+        ),  # +4.5 % vs best (2, 16, 1) (53.02 vs 50.75 us)
+        (128, 128256, 1000, True): (1, 32, True),
+        (1, 151936, 1000, True): (8, 16, True),
+        (8, 151936, 1000, True): (8, 16, True),
+        (16, 151936, 1000, True): (4, 16, True),
+        (64, 151936, 1000, True): (2, 32, True),
+        (128, 151936, 1000, True): (1, 32, True),
+        (1, 262144, 1000, True): (8, 16, True),
+        (4, 262144, 1000, True): (8, 16, True),
+        (8, 262144, 1000, True): (8, 16, True),
+        (16, 262144, 1000, True): (4, 32, True),
+        (32, 262144, 1000, True): (4, 32, True),
+        (64, 262144, 1000, True): (2, 32, True),
+        (128, 262144, 1000, True): (1, 32, True),
+    }.items():
+        assert pick(pb, pv, sm_count=148, top_k_max=pk, two_launch=two) == want, (
+            pb,
+            pv,
+            pk,
+            two,
+            148,
+        )
+    # 132-SM table: worst regret 3.1 % against the measured-best variant of each cell
+    for (pb, pv, pk), want in {
+        (1, 32768, 50): (4, 16, False),
+        (4, 32768, 50): (4, 16, False),
+        (8, 32768, 50): (4, 16, False),
+        (16, 32768, 50): (4, 16, False),
+        (32, 32768, 50): (1, 16, True),
+        (64, 32768, 50): (1, 16, True),
+        (128, 32768, 50): (1, 16, True),
+        (1, 128256, 50): (8, 16, True),  # +0.6 % vs best
+        (4, 128256, 50): (8, 16, True),
+        (8, 128256, 50): (8, 16, True),  # +2.0 % vs best
+        (16, 128256, 50): (4, 16, True),
+        (32, 128256, 50): (2, 16, True),  # +1.4 % vs best
+        (64, 128256, 50): (2, 16, True),  # +3.1 % vs best
+        (128, 128256, 50): (1, 32, True),  # +0.5 % vs best
+        (1, 151936, 50): (8, 16, True),
+        (8, 151936, 50): (8, 16, True),
+        (16, 151936, 50): (4, 16, True),  # +0.8 % vs best
+        (64, 151936, 50): (2, 16, True),  # +2.7 % vs best
+        (128, 151936, 50): (1, 16, True),
+        (1, 262144, 50): (8, 16, True),  # +2.5 % vs best
+        (8, 262144, 50): (8, 16, True),  # +1.5 % vs best
+        (16, 262144, 50): (4, 16, True),  # +2.8 % vs best
+        (32, 262144, 50): (2, 32, True),
+        (64, 262144, 50): (2, 32, True),
+        (128, 262144, 50): (1, 32, True),
+    }.items():
+        assert pick(pb, pv, sm_count=132, top_k_max=pk) == want, (pb, pv, pk, 132)
+    # 132-SM table, fused block-tail regime (H100 k = 1000 sweep): worst regret 8.0 %, 2 cells over 3 %
+    for (pb, pv, pk, two), want in {
+        (1, 32768, 1000, False): (4, 16, False),
+        (4, 32768, 1000, False): (4, 16, False),
+        (8, 32768, 1000, False): (4, 16, False),
+        (16, 32768, 1000, False): (4, 16, False),
+        (32, 32768, 1000, False): (1, 16, True),
+        (64, 32768, 1000, False): (
+            1,
+            16,
+            True,
+        ),  # +8.0 % vs best (2, 32, 0) (21.60 vs 20.00 us)
+        (128, 32768, 1000, False): (1, 16, True),
+        (1, 128256, 1000, False): (8, 32, False),
+        (4, 128256, 1000, False): (8, 32, False),
+        (8, 128256, 1000, False): (8, 32, False),
+        (16, 128256, 1000, False): (4, 16, True),
+        (32, 128256, 1000, False): (2, 16, True),
+        (64, 128256, 1000, False): (2, 16, True),
+        (128, 128256, 1000, False): (1, 16, True),
+        (1, 151936, 1000, False): (8, 16, True),
+        (8, 151936, 1000, False): (8, 16, True),
+        (16, 151936, 1000, False): (4, 16, True),
+        (64, 151936, 1000, False): (2, 16, True),
+        (128, 151936, 1000, False): (1, 16, True),
+        (1, 262144, 1000, False): (8, 16, True),
+        (4, 262144, 1000, False): (8, 16, True),
+        (8, 262144, 1000, False): (8, 16, True),
+        (16, 262144, 1000, False): (4, 16, True),
+        (32, 262144, 1000, False): (
+            2,
+            16,
+            True,
+        ),  # +4.0 % vs best (2, 32, 1) (38.37 vs 36.90 us)
+        (64, 262144, 1000, False): (2, 16, True),
+        (128, 262144, 1000, False): (
+            1,
+            16,
+            True,
+        ),  # +0.7 % vs best (1, 32, 1) (82.66 vs 82.08 us)
+    }.items():
+        assert pick(pb, pv, sm_count=132, top_k_max=pk, two_launch=two) == want, (
+            pb,
+            pv,
+            pk,
+            two,
+            132,
+        )
+    # 132-SM table, two-launch chain regime (H100 k = 1000 sweep): worst regret 3.0 %, 1 cells over 3 %
+    for (pb, pv, pk, two), want in {
+        (1, 32768, 1000, True): (4, 16, False),
+        (4, 32768, 1000, True): (4, 16, False),
+        (8, 32768, 1000, True): (4, 16, False),
+        (16, 32768, 1000, True): (4, 16, False),
+        (32, 32768, 1000, True): (1, 16, True),
+        (64, 32768, 1000, True): (
+            1,
+            16,
+            True,
+        ),  # +3.0 % vs best (2, 32, 0) (21.86 vs 21.22 us)
+        (128, 32768, 1000, True): (1, 16, True),
+        (1, 128256, 1000, True): (8, 32, False),
+        (4, 128256, 1000, True): (8, 32, False),
+        (8, 128256, 1000, True): (8, 32, False),
+        (16, 128256, 1000, True): (4, 16, True),
+        (32, 128256, 1000, True): (2, 16, True),
+        (64, 128256, 1000, True): (2, 16, True),
+        (128, 128256, 1000, True): (1, 16, True),
+        (1, 151936, 1000, True): (8, 16, True),
+        (8, 151936, 1000, True): (8, 16, True),
+        (16, 151936, 1000, True): (4, 16, True),
+        (64, 151936, 1000, True): (2, 16, True),
+        (128, 151936, 1000, True): (1, 16, True),
+        (1, 262144, 1000, True): (8, 16, True),
+        (4, 262144, 1000, True): (8, 16, True),
+        (8, 262144, 1000, True): (8, 16, True),
+        (16, 262144, 1000, True): (4, 16, True),
+        (32, 262144, 1000, True): (
+            2,
+            16,
+            True,
+        ),  # +0.8 % vs best (2, 32, 1) (39.87 vs 39.55 us)
+        (64, 262144, 1000, True): (2, 16, True),
+        (128, 262144, 1000, True): (1, 16, True),
+    }.items():
+        assert pick(pb, pv, sm_count=132, top_k_max=pk, two_launch=two) == want, (
+            pb,
+            pv,
+            pk,
+            two,
+            132,
+        )
+    # 212-SM table: worst regret 2.5 % against the measured-best variant of each cell
+    for (pb, pv, pk), want in {
+        (1, 32768, 50): (4, 16, False),
+        (4, 32768, 50): (4, 16, False),
+        (8, 32768, 50): (4, 16, False),
+        (16, 32768, 50): (4, 16, False),
+        (32, 32768, 50): (4, 16, False),
+        (64, 32768, 50): (1, 32, True),
+        (128, 32768, 50): (1, 32, True),
+        (1, 128256, 50): (8, 32, True),
+        (4, 128256, 50): (8, 32, True),
+        (8, 128256, 50): (8, 32, True),  # +0.7 % vs best
+        (16, 128256, 50): (8, 32, True),
+        (32, 128256, 50): (4, 32, True),
+        (64, 128256, 50): (2, 32, True),
+        (128, 128256, 50): (1, 32, True),
+        (1, 151936, 50): (8, 16, True),
+        (8, 151936, 50): (8, 16, True),
+        (16, 151936, 50): (8, 16, True),
+        (64, 151936, 50): (2, 32, True),
+        (128, 151936, 50): (1, 32, True),
+        (1, 262144, 50): (8, 32, True),
+        (8, 262144, 50): (8, 32, True),
+        (16, 262144, 50): (8, 32, True),
+        (32, 262144, 50): (4, 32, True),
+        (64, 262144, 50): (2, 32, True),
+        (128, 262144, 50): (1, 32, True),
+    }.items():
+        assert pick(pb, pv, sm_count=212, top_k_max=pk) == want, (pb, pv, pk, 212)
+    # 212-SM table, fused block-tail regime (R200 k = 1000 sweep): worst regret 5.1 %, 4 cells over 3 %
+    for (pb, pv, pk, two), want in {
+        (1, 32768, 1000, False): (4, 16, False),
+        (4, 32768, 1000, False): (4, 16, False),
+        (8, 32768, 1000, False): (4, 16, False),
+        (16, 32768, 1000, False): (4, 16, False),
+        (32, 32768, 1000, False): (4, 16, False),
+        (64, 32768, 1000, False): (2, 32, False),
+        (128, 32768, 1000, False): (1, 16, True),
+        (1, 128256, 1000, False): (8, 32, False),
+        (4, 128256, 1000, False): (8, 32, False),
+        (8, 128256, 1000, False): (8, 32, False),
+        (16, 128256, 1000, False): (8, 32, False),
+        (32, 128256, 1000, False): (4, 16, True),
+        (64, 128256, 1000, False): (2, 16, True),
+        (128, 128256, 1000, False): (1, 32, True),
+        (1, 151936, 1000, False): (
+            8,
+            16,
+            True,
+        ),  # +1.7 % vs best (4, 16, 1) (17.76 vs 17.47 us)
+        (8, 151936, 1000, False): (8, 16, True),
+        (16, 151936, 1000, False): (8, 16, True),
+        (64, 151936, 1000, False): (2, 16, True),
+        (128, 151936, 1000, False): (
+            1,
+            32,
+            True,
+        ),  # +0.8 % vs best (1, 16, 1) (37.09 vs 36.80 us)
+        (1, 262144, 1000, False): (
+            8,
+            16,
+            True,
+        ),  # +3.5 % vs best (4, 32, 1) (18.98 vs 18.34 us)
+        (4, 262144, 1000, False): (
+            8,
+            16,
+            True,
+        ),  # +4.5 % vs best (4, 32, 1) (19.46 vs 18.62 us)
+        (8, 262144, 1000, False): (
+            8,
+            16,
+            True,
+        ),  # +2.0 % vs best (4, 32, 1) (19.55 vs 19.17 us)
+        (16, 262144, 1000, False): (
+            8,
+            16,
+            True,
+        ),  # +4.0 % vs best (4, 32, 1) (20.58 vs 19.78 us)
+        (32, 262144, 1000, False): (
+            4,
+            16,
+            True,
+        ),  # +5.1 % vs best (4, 32, 1) (23.65 vs 22.50 us)
+        (64, 262144, 1000, False): (2, 32, True),
+        (128, 262144, 1000, False): (1, 32, True),
+    }.items():
+        assert pick(pb, pv, sm_count=212, top_k_max=pk, two_launch=two) == want, (
+            pb,
+            pv,
+            pk,
+            two,
+            212,
+        )
+    # 212-SM table, two-launch chain regime (R200 k = 1000 sweep): worst regret 6.8 %, 1 cells over 3 %
+    for (pb, pv, pk, two), want in {
+        (1, 32768, 1000, True): (4, 16, False),
+        (4, 32768, 1000, True): (4, 16, False),
+        (8, 32768, 1000, True): (4, 16, False),
+        (16, 32768, 1000, True): (4, 16, False),
+        (32, 32768, 1000, True): (4, 16, False),
+        (64, 32768, 1000, True): (2, 32, False),
+        (128, 32768, 1000, True): (1, 16, True),
+        (1, 128256, 1000, True): (8, 32, False),
+        (4, 128256, 1000, True): (8, 32, False),
+        (8, 128256, 1000, True): (8, 32, False),
+        (16, 128256, 1000, True): (8, 32, False),
+        (32, 128256, 1000, True): (4, 16, True),
+        (64, 128256, 1000, True): (2, 16, True),
+        (128, 128256, 1000, True): (1, 32, True),
+        (1, 151936, 1000, True): (8, 16, True),
+        (8, 151936, 1000, True): (8, 16, True),
+        (16, 151936, 1000, True): (8, 16, True),
+        (64, 151936, 1000, True): (2, 16, True),
+        (128, 151936, 1000, True): (
+            1,
+            32,
+            True,
+        ),  # +0.6 % vs best (1, 16, 1) (36.03 vs 35.81 us)
+        (1, 262144, 1000, True): (8, 16, True),
+        (4, 262144, 1000, True): (8, 16, True),
+        (8, 262144, 1000, True): (8, 16, True),
+        (16, 262144, 1000, True): (8, 16, True),
+        (32, 262144, 1000, True): (
+            4,
+            16,
+            True,
+        ),  # +6.8 % vs best (4, 32, 1) (23.81 vs 22.30 us)
+        (64, 262144, 1000, True): (2, 32, True),
+        (128, 262144, 1000, True): (1, 32, True),
+    }.items():
+        assert pick(pb, pv, sm_count=212, top_k_max=pk, two_launch=two) == want, (
+            pb,
+            pv,
+            pk,
+            two,
+            212,
+        )
     # Other SM counts use the nearest measured table.
     assert pick(32, 128256, sm_count=152) == pick(32, 128256, sm_count=148)
     assert pick(16, 128256, sm_count=200) == pick(16, 128256, sm_count=212)
     assert pick(32, 128256, sm_count=114) == pick(32, 128256, sm_count=132)
-    assert pick(32, 128256) in {(2, 16, True), (4, 16, True)}
+    assert pick(32, 128256)[
+        2
+    ]  # every table streams B = 32 rows of 128256 (cluster 2 or 4, ept 16 or 32)
     assert choose_stage23(50) == (32, 2)
     res = top_k_top_p_sampling_from_probs(probs, vocab, 0.9)
     assert res.dtype == torch.int32 and res.shape == (batch,)
@@ -1022,7 +1330,7 @@ def test_adv_vocab_not_multiple_of_chunk(vocab):
     variants = [
         (v["cluster"], v["ept"])
         for v in load_manifest()["stage1"]
-        if 512 * v["cluster"] * v["ept"] >= vocab
+        if 512 * v["cluster"] * v["ept"] >= vocab and not v["fused_block_tail"]
     ][:4]
     first = None
     for v in variants:
@@ -1082,13 +1390,15 @@ def test_adv_bitwise_across_launch_graph_and_every_variant():
     s1 = [
         (v["cluster"], v["ept"])
         for v in man["stage1"]
-        if 512 * v["cluster"] * v["ept"] >= vocab
+        if 512 * v["cluster"] * v["ept"] >= vocab and not v["fused_block_tail"]
     ]
-    s23 = [
-        (v["threads"], v["items"])
-        for v in man["stage23"]
-        if v["threads"] * v["items"] >= k
-    ]
+    s23 = sorted(
+        {
+            (v["threads"], v["items"])
+            for v in man["stage23"]
+            if v["threads"] * v["items"] >= k
+        }
+    )  # one entry per slab: the static forms of a slab are dispatched by device, not by variant
     assert len(s1) >= 4 and len(s23) >= 2
     for v1 in s1:
         for v23 in s23:
@@ -1146,6 +1456,107 @@ def test_adv_bitwise_across_launch_graph_and_every_variant():
         assert np.array_equal(ws[1][:, :k].cpu().numpy(), base.idx[:, :k])
 
 
+def test_block_tail_matches_two_launch_form(monkeypatch):
+    """64 < k <= fused_block_tail_kcap on a one-wave stage-1 grid runs the whole-CTA stage 2/3 inside the stage-1
+    kernel (launch_flags bit 3) on the capabilities that fuse it; outputs are bitwise identical to the explicit
+    two-launch form on adversarial rows, per-row k (mixing k <= 64 rows) and per-row p, and multi-wave grids keep
+    the chain."""
+    _require_supported_device()
+    import flashinfer.cake_sampling as cs
+
+    man = load_manifest()
+    kcap = int(man["fused_block_tail_kcap"])
+    assert kcap == int(man["slab_entries"])
+    # The whole-CTA tail is a separate build (`_bt` twin) of every variant with the two-warp tail; the default
+    # build (taken by every launch without bit 3) never carries it.
+    defaults = [v for v in man["stage1"] if not v["fused_block_tail"]]
+    twins = [v for v in man["stage1"] if v["fused_block_tail"]]
+    default_keys = {(v["cluster"], v["ept"], v["stream"]) for v in defaults}
+    assert len(default_keys) == len(defaults)
+    assert all(
+        (v["cluster"], v["ept"], v["stream"]) in default_keys
+        and v["fused_tail"]
+        and v["symbol"].endswith("_bt")
+        for v in twins
+    )
+    sm = cs._sm_count(0)
+    fused_device = cs._block_tail_enabled(0)
+    streams_ok = _device_streams()
+    # the fused-vs-chain identity check needs a `_bt` build to launch; round 5 ships none (see the policy asserts below)
+    for vocab, batch in ((32768, 5), (128256, 3), (262144, 2)) if twins else ():
+        if vocab > 196608 and not streams_ok:
+            continue
+        probs = _probs(batch, vocab, seed=748 + vocab % 97)
+        pn = probs.cpu().numpy()
+        pn[0, (np.arange(1200) * 13) % vocab] = np.float32(
+            2**-11
+        )  # ties across the k cut and the p boundary
+        pn[1, [7, 4096]] = np.inf
+        probs.copy_(torch.tensor(pn, device="cuda"))
+        k_row = torch.randint(1, kcap + 1, (batch,), device="cuda", dtype=torch.int32)
+        k_row[0] = kcap
+        k_row[-1] = 32
+        p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
+        c, e, st = cs.choose_stage1(batch, vocab, top_k_max=kcap)
+        if fused_device:
+            assert cs._fuse_block_tail(batch, c, e, bool(st), sm, kcap, False), (
+                vocab,
+                batch,
+                c,
+                e,
+                st,
+            )
+        for k, p in ((kcap, 0.9), (65, 0.5), (200, 1e-6), (k_row, p_row)):
+            with monkeypatch.context() as m:
+                m.setattr(cs, "_fuse_block_tail", lambda *a, **kw: False)
+                two, _ = _run_and_check(probs, k, p, 0x748, 3)
+            with monkeypatch.context() as m:
+                m.setattr(cs, "_block_tail_enabled", lambda index: True)
+                fused, _ = _run_and_check(probs, k, p, 0x748, 3)
+            kk = k if isinstance(k, int) else kcap
+            assert np.array_equal(two.samples, fused.samples), (
+                vocab,
+                batch,
+                k if isinstance(k, int) else "row",
+            )
+            assert np.array_equal(two.count, fused.count)
+            for r in range(batch):
+                kr = int(two.count[r])
+                assert np.array_equal(two.idx[r, :kr], fused.idx[r, :kr])
+                assert np.array_equal(
+                    two.vals[r, :kr].view(np.uint32), fused.vals[r, :kr].view(np.uint32)
+                )
+                assert np.array_equal(
+                    two.renorm[r, :kr].view(np.uint32),
+                    fused.renorm[r, :kr].view(np.uint32),
+                )
+            del kk
+    # the one-wave rule and the tail-less (8, 48) never fuse; a small top-k or one above the slab is not a
+    # block-tail launch
+    assert not cs._fuse_block_tail(1024, 8, 16, True, 148, 1000, False)
+    assert not cs._fuse_block_tail(1, 8, 48, False, 148, 1000, False)
+    assert not cs._fuse_block_tail(1, 4, 16, False, 148, 64, False)
+    assert not cs._fuse_block_tail(1, 4, 16, False, 148, kcap + 1, False)
+    assert not cs._fuse_block_tail(1, 4, 16, False, 148, 1000, True)
+    # round 5 ships no whole-CTA-tail build: no capability fuses k > 64 and no variant reports a `_bt` twin
+    assert not any(v["fused_block_tail"] for v in man["stage1"])
+    assert not cs._fuse_block_tail(1, 4, 16, False, 148, 1000, False)
+    assert {
+        cc: cs._block_tail_for_capability(cc)
+        for cc in ((9, 0), (10, 0), (10, 3), (10, 7), (12, 0))
+    } == {
+        (9, 0): False,
+        (10, 0): False,
+        (10, 3): False,
+        (10, 7): False,
+        (12, 0): False,
+    }
+    # a multi-wave launch through the public API takes the chain and stays exact
+    if streams_ok:
+        probs = _probs(600, 32768, seed=7)
+        _run_and_check(probs, 1000, 0.9, 0x748, 3)
+
+
 def test_fused_tail_matches_two_launch_form():
     """k <= fused_tail_kcap runs stage 2/3 inside the stage-1 kernel; outputs are bitwise identical to
     the explicit two-launch form for every stage-1 variant, per-row p, renorm and adversarial rows."""
@@ -1193,7 +1604,8 @@ def test_fused_tail_matches_two_launch_form():
         s1 = [
             (v["cluster"], v["ept"], bool(v.get("stream", 0)))
             for v in man["stage1"]
-            if (
+            if not v["fused_block_tail"]
+            and (
                 (v.get("stream", 0) and streams_ok)
                 or (not v.get("stream", 0) and 512 * v["cluster"] * v["ept"] >= vocab)
             )
@@ -1267,6 +1679,8 @@ def test_early_trigger_flag_and_bitwise_outputs():
     for k, p in ((1000, 0.9), (200, 0.5)):
         base = _run_and_check(probs, k, p, 0xEA51, 4)[0]
         for v in man["stage1"]:
+            if v["fused_block_tail"]:
+                continue  # the `_bt` twin is the same variant (taken by bit 3, exercised by the block-tail test)
             if v.get("stream", 0) and not streams_ok:
                 continue  # 165 KB streaming variants exceed the 12.x opt-in
             if not v.get("stream", 0) and 512 * v["cluster"] * v["ept"] < 32768:
@@ -1393,3 +1807,36 @@ def test_adv_top_k_first_parity():
             support = set(_kept(ours_run, r)) | set(np.nonzero(topp_ren[r])[0].tolist())
             assert int(fi[r]) in support and int(ours_run.samples[r]) in support
     assert torch.equal(g1.get_state(), g2.get_state())
+
+
+def test_manifest_seals_every_source_file():
+    """The root .cu includes the body parts the manifest lists; each file is size- and digest-sealed and under 5 MiB."""
+    import hashlib
+    import re
+
+    man = load_manifest()
+    csrc = cake_sampling_jit._get_csrc_dir()
+    files = cake_sampling_jit._verified_source_files(csrc, man)
+    names = list(files)
+    assert names[0] == "cake_sampling_kernels.cu" and len(names) >= 2
+    assert names[1:] == [
+        f"cake_sampling_kernels_part{i}.cuh" for i in range(1, len(names))
+    ]
+    for entry in man["source_files"]:
+        data = files[entry["path"]]
+        assert len(data) == entry["bytes"] < 5 * 1024 * 1024
+        assert hashlib.sha256(data).hexdigest() == entry["sha256"]
+    assert hashlib.sha256(b"".join(files.values())).hexdigest() == man["source_sha256"]
+    root = files[names[0]].decode()
+    assert re.findall(r'^#include "([^"]+)"$', root, flags=re.MULTILINE) == names[1:]
+    body = b"".join(files[n] for n in names[1:])
+    for symbol in man["kernel_symbols"]:
+        assert (
+            len(re.findall(rb"(?<![A-Za-z0-9_])" + symbol.encode() + rb"\(", body)) == 1
+        )
+    # a corrupted part is rejected before anything is compiled
+    bad = dict(man)
+    bad["source_files"] = [dict(e) for e in man["source_files"]]
+    bad["source_files"][-1]["sha256"] = "0" * 64
+    with pytest.raises(RuntimeError, match="source identity"):
+        cake_sampling_jit._verified_source_files(csrc, bad)
