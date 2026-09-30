@@ -90,6 +90,7 @@ def _backend_configs(args: argparse.Namespace) -> Dict[str, Callable[[], Any]]:
     """Benchmarkable backends: name -> factory of its MoEEpCommunication config."""
     from flashinfer.moe_ep import (
         NCCLEPConfig,
+        NVLinkOneSidedCakeConfig,
         NVLinkOneSidedConfig,
         NVLinkTwoSidedConfig,
     )
@@ -97,10 +98,10 @@ def _backend_configs(args: argparse.Namespace) -> Dict[str, Callable[[], Any]]:
     low_precision = bool(args.use_low_precision_combine)
     return {
         "nvlink_one_sided": lambda: NVLinkOneSidedConfig(
-            kernel="trtllm", use_low_precision_combine=low_precision
+            use_low_precision_combine=low_precision
         ),
-        "nvlink_one_sided_cake": lambda: NVLinkOneSidedConfig(
-            kernel="cake", use_low_precision_combine=low_precision
+        "nvlink_one_sided_cake": lambda: NVLinkOneSidedCakeConfig(
+            use_low_precision_combine=low_precision
         ),
         "nvlink_two_sided": NVLinkTwoSidedConfig,
         "nccl_ep": NCCLEPConfig,

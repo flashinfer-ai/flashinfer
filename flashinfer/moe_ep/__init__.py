@@ -6,8 +6,9 @@ Package layout::
       core/                 shared comm + kernel abstractions and validation
       backends/
         split/
-          comm/             MoE communication backends (NVLink one-/two-sided,
-                            NCCL-EP) and the NCCL-EP / NIXL-EP Fleet transports
+          comm/             MoE communication backends (NVLink one-sided with
+                            TRT-LLM or Cake kernels, NVLink two-sided, NCCL-EP)
+                            and the NCCL-EP / NIXL-EP Fleet transports
           kernel/           post-dispatch inner kernels
         mega/
           kernel/           fused comm + local MoE kernels
@@ -183,6 +184,7 @@ from .modes import (
     MoEEpSplitGraphState,
     MoEEpSplitLayer,
     NCCLEPConfig,
+    NVLinkOneSidedCakeConfig,
     NVLinkOneSidedConfig,
     NVLinkTwoSidedConfig,
     NcclEpConfig,
@@ -263,6 +265,8 @@ __all__ = [
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "NCCLEPConfig",
     "NVLinkOneSidedAlltoAll",
+    "NVLinkOneSidedCakeAlltoAll",
+    "NVLinkOneSidedCakeConfig",
     "NVLinkOneSidedConfig",
     "NVLinkTwoSidedAlltoAll",
     "NVLinkTwoSidedConfig",
@@ -440,6 +444,9 @@ from .backends.split.comm.nccl_ep.communication import (  # noqa: E402
 )
 from .backends.split.comm.nvlink_one_sided.communication import (  # noqa: E402
     NVLinkOneSidedAlltoAll,
+)
+from .backends.split.comm.nvlink_one_sided_cake.communication import (  # noqa: E402
+    NVLinkOneSidedCakeAlltoAll,
 )
 from .backends.split.comm.nvlink_two_sided.communication import (  # noqa: E402
     NVLinkTwoSidedAlltoAll,

@@ -81,7 +81,8 @@ Communication has two levels:
 
 | Backend | Config | Level | Transport |
 |---|---|---|---|
-| `nvlink_one_sided` | `NVLinkOneSidedConfig(kernel="trtllm" \| "cake", ...)` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back (`flashinfer.comm.MoeAlltoAll`). `kernel="cake"` selects the generated SM100/SM103 kernels |
+| `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back (`flashinfer.comm.MoeAlltoAll`, TRT-LLM kernels) |
+| `nvlink_one_sided_cake` | `NVLinkOneSidedCakeConfig` | `MoEEpCommunication` | `nvlink_one_sided` running the generated Cake kernels (`MoeAlltoAll` with `backend="cake"`); SM100/SM103 only |
 | `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`flashinfer.comm.MnnvlMoe`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | `MoEEpCommunication` (LL `RANK_MAJOR`) and Fleet/Handle | see below |
 | `nixl_ep` | `NvepConfig` | Fleet/Handle | see below |
@@ -368,6 +369,7 @@ classDiagram
 | Kind | Name | Config |
 |------|------|--------|
 | Comm | `nvlink_one_sided` | `NVLinkOneSidedConfig` |
+| Comm | `nvlink_one_sided_cake` | `NVLinkOneSidedCakeConfig` |
 | Comm | `nvlink_two_sided` | `NVLinkTwoSidedConfig` |
 | Comm | `nccl_ep` | `NcclEpConfig` (`NCCLEPConfig` alias) |
 | Comm | `nixl_ep` | `NvepConfig` (needs `tcp_store`) |

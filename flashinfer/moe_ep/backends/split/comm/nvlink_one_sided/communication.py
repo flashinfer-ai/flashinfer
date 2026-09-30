@@ -9,7 +9,7 @@ workspace grows with ``ep_size * max_tokens_per_rank``.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, ClassVar, Optional
 
 from .....core.comm.communication import (
     MoEEpCommParams,
@@ -23,7 +23,7 @@ from .config import NVLinkOneSidedConfig
 if TYPE_CHECKING:
     import torch
 
-    from ......comm.trtllm_moe_alltoall import MoeAlltoAll
+    from ......comm.trtllm_moe_alltoall import MoeAlltoAll, MoeAlltoAllBackend
     from .....config import BootstrapConfig
 
 
@@ -35,6 +35,9 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
     ``topk_weights`` travel as payloads of a single dispatch. Received rows
     beyond each source rank's token count get ``invalid_expert_id`` routing.
     """
+
+    # Kernel implementation of the MoeAlltoAll primitive (its ``backend``).
+    alltoall_backend: ClassVar["MoeAlltoAllBackend"] = "trtllm"
 
     def __init__(
         self,
@@ -74,7 +77,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             dispatch_bytes_per_token,
             combine_bytes_per_token,
             self.config.eplb_stats_num_experts,
-            backend=self.config.kernel,
+            backend=self.alltoall_backend,
         )
 
         self._alltoall: Optional[MoeAlltoAll] = MoeAlltoAll(
@@ -86,7 +89,7 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             mnnvl_config=mnnvl_config,
             eplb_stats_num_experts=self.config.eplb_stats_num_experts,
             enable_rank_mask=self.config.enable_rank_mask,
-            backend=self.config.kernel,
+            backend=self.alltoall_backend,
         )
         self._tokens_per_rank: Optional[int] = None
         self._combine_buffer: "torch.Tensor | None" = None

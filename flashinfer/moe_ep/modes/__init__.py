@@ -2,6 +2,7 @@
 
 from ..backends.split.comm import (
     NCCLEPConfig,
+    NVLinkOneSidedCakeConfig,
     NVLinkOneSidedConfig,
     NVLinkTwoSidedConfig,
     NcclEpConfig,
@@ -23,6 +24,7 @@ __all__ = [
     "MoEEpSplitGraphState",
     "MoEEpSplitLayer",
     "NCCLEPConfig",
+    "NVLinkOneSidedCakeConfig",
     "NVLinkOneSidedConfig",
     "NVLinkTwoSidedConfig",
     "NcclEpConfig",

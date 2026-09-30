@@ -913,9 +913,10 @@ class MoeAlltoAll:
 
     This class provides the throughput-optimized backend that supports multiple payloads
     per collective operation, explicit dispatch/combine phases, and workspace-backed tensors.
-    :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll` builds the MoE-level
-    dispatch/combine interface shared by all expert-parallel communication
-    backends on top of it.
+    :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll` (and, for
+    ``backend="cake"``, :class:`flashinfer.moe_ep.NVLinkOneSidedCakeAlltoAll`)
+    builds the MoE-level dispatch/combine interface shared by all
+    expert-parallel communication backends on top of it.
 
     ``backend="trtllm"`` is the default, including on Blackwell. To opt in to
     the generated Blackwell kernels, pass ``backend="cake"`` at construction

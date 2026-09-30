@@ -20,7 +20,8 @@ class SplitConfig:
 
     ``comm`` selects a Fleet transport (``NcclEpConfig``, ``NvepConfig``) or a
     :class:`~flashinfer.moe_ep.core.comm.communication.MoEEpCommunication`
-    backend (``NVLinkOneSidedConfig``, ``NVLinkTwoSidedConfig``).
+    backend (``NVLinkOneSidedConfig``, ``NVLinkOneSidedCakeConfig``,
+    ``NVLinkTwoSidedConfig``).
     """
 
     comm: object = field(default_factory=NcclEpConfig)

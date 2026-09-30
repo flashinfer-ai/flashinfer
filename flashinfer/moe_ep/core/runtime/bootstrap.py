@@ -314,6 +314,7 @@ def split_comm_runtime_requirements(comm_backend_name: str) -> FrozenSet[str]:
         "nccl_ep",
         "nixl_ep",
         "nvlink_one_sided",
+        "nvlink_one_sided_cake",
         "nvlink_two_sided",
     ):
         return frozenset({TORCH_DIST})

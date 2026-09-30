@@ -2,6 +2,7 @@
 
 from .comm import (
     NCCLEPConfig,
+    NVLinkOneSidedCakeConfig,
     NVLinkOneSidedConfig,
     NVLinkTwoSidedConfig,
     NcclEpConfig,
@@ -11,6 +12,7 @@ from . import kernel
 
 __all__ = [
     "NCCLEPConfig",
+    "NVLinkOneSidedCakeConfig",
     "NVLinkOneSidedConfig",
     "NVLinkTwoSidedConfig",
     "NcclEpConfig",

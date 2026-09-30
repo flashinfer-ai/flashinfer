@@ -31,6 +31,8 @@ from flashinfer.moe_ep import (
     NCCLEPConfig,
     NcclEpCommunication,
     NVLinkOneSidedAlltoAll,
+    NVLinkOneSidedCakeAlltoAll,
+    NVLinkOneSidedCakeConfig,
     NVLinkOneSidedConfig,
     NVLinkTwoSidedAlltoAll,
     SplitConfig,
@@ -146,9 +148,15 @@ class TestCommParams:
 
 class TestRegistry:
     def test_builtin_backends_are_registered(self) -> None:
-        for name in ("nccl_ep", "nvlink_one_sided", "nvlink_two_sided"):
+        for name in (
+            "nccl_ep",
+            "nvlink_one_sided",
+            "nvlink_one_sided_cake",
+            "nvlink_two_sided",
+        ):
             assert is_communication_backend(name)
         assert is_communication_backend(NVLinkOneSidedConfig())
+        assert is_communication_backend(NVLinkOneSidedCakeConfig())
         assert not is_communication_backend("nixl_ep")
         assert not is_communication_backend(object())
 
@@ -456,11 +464,8 @@ def fake_one_sided(monkeypatch):
             None,
         ),
     )
-    monkeypatch.setattr(
-        NVLinkOneSidedAlltoAll,
-        "is_platform_supported",
-        classmethod(lambda cls: True),
-    )
+    for cls in (NVLinkOneSidedAlltoAll, NVLinkOneSidedCakeAlltoAll):
+        monkeypatch.setattr(cls, "is_platform_supported", classmethod(lambda cls: True))
 
 
 def test_nvlink_one_sided_sizes_dispatch_by_format(fake_one_sided) -> None:
@@ -469,6 +474,7 @@ def test_nvlink_one_sided_sizes_dispatch_by_format(fake_one_sided) -> None:
         _params(hidden_size=64, dispatch_format=QuantFormat.NVFP4),
         "nvlink_one_sided",
     )
+    assert _FakeMoeAlltoAll.instances[-1].kwargs["backend"] == "trtllm"
     _, _, dispatch_bytes, combine_bytes, _ = _FakeMoeAlltoAll.workspace_args
     # NVFP4 values and scales, then int32 ids and FP32 weights for top_k=2.
     assert dispatch_bytes == 32 + 4 + 2 * 4 * 2
@@ -479,8 +485,9 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
     comm = create_communication(
         BootstrapConfig(world_size=2, rank=0),
         _params(),
-        NVLinkOneSidedConfig(kernel="cake", use_low_precision_combine=True),
+        NVLinkOneSidedCakeConfig(use_low_precision_combine=True),
     )
+    assert isinstance(comm, NVLinkOneSidedCakeAlltoAll)
     a2a = _FakeMoeAlltoAll.instances[-1]
     assert a2a.kwargs["backend"] == "cake"
     assert a2a.kwargs["max_num_tokens"] == 3
@@ -523,6 +530,16 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
 
     with pytest.raises(ValueError, match="max_tokens_per_rank"):
         comm.dispatch(hidden, ids, weights, max_tokens_per_rank=4)
+
+
+def test_cake_needs_compute_capability_10_0_or_10_3(monkeypatch) -> None:
+    monkeypatch.setattr(
+        NVLinkOneSidedAlltoAll, "is_platform_supported", classmethod(lambda cls: True)
+    )
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (9, 0))
+    assert not NVLinkOneSidedCakeAlltoAll.is_platform_supported()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (10, 3))
+    assert NVLinkOneSidedCakeAlltoAll.is_platform_supported()
 
 
 def test_nvlink_two_sided_marks_padding_rows_invalid(monkeypatch) -> None:

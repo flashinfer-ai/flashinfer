@@ -18,12 +18,7 @@ from datetime import timedelta
 import pytest
 
 _PG_TIMEOUT = timedelta(minutes=60)
-_BACKENDS = [
-    ("nvlink_one_sided", "trtllm"),
-    ("nvlink_one_sided", "cake"),
-    ("nvlink_two_sided", None),
-    ("nccl_ep", None),
-]
+_BACKENDS = ["nvlink_one_sided", "nvlink_one_sided_cake", "nvlink_two_sided", "nccl_ep"]
 
 
 def _init_dist():
@@ -41,11 +36,10 @@ def _init_dist():
     return dist.get_rank(), dist.get_world_size()
 
 
-def _backend_config(name, kernel):
-    import torch
-
+def _backend_config(name):
     from flashinfer.moe_ep import (
         NCCLEPConfig,
+        NVLinkOneSidedCakeConfig,
         NVLinkOneSidedConfig,
         NVLinkTwoSidedConfig,
         available_communication_backends,
@@ -53,16 +47,12 @@ def _backend_config(name, kernel):
 
     if name not in available_communication_backends():
         pytest.skip(f"{name} is not available on this machine")
-    if name == "nvlink_one_sided":
-        if kernel == "cake" and torch.cuda.get_device_capability() not in (
-            (10, 0),
-            (10, 3),
-        ):
-            pytest.skip("the cake kernels need compute capability 10.0 or 10.3")
-        return NVLinkOneSidedConfig(kernel=kernel)
-    if name == "nvlink_two_sided":
-        return NVLinkTwoSidedConfig()
-    return NCCLEPConfig()
+    return {
+        "nvlink_one_sided": NVLinkOneSidedConfig,
+        "nvlink_one_sided_cake": NVLinkOneSidedCakeConfig,
+        "nvlink_two_sided": NVLinkTwoSidedConfig,
+        "nccl_ep": NCCLEPConfig,
+    }[name]()
 
 
 def _random_routing(num_tokens, num_experts, top_k, generator):
@@ -87,15 +77,15 @@ def _identity_round_trip_reference(x, topk_ids, world_size, experts_per_rank):
 
 
 @pytest.mark.gpu_2
-@pytest.mark.parametrize(("backend", "kernel"), _BACKENDS)
-def test_dispatch_combine_matches_local_reference(backend, kernel):
+@pytest.mark.parametrize("backend", _BACKENDS)
+def test_dispatch_combine_matches_local_reference(backend):
     import torch
     import torch.distributed as dist
 
     from flashinfer.moe_ep import BootstrapConfig, MoEEpCommParams, create_communication
 
     rank, world_size = _init_dist()
-    config = _backend_config(backend, kernel)
+    config = _backend_config(backend)
     num_experts = 4 * world_size
     top_k = 4
     hidden = 2048
@@ -181,7 +171,7 @@ def test_split_layer_identity_round_trip_over_nvlink_one_sided():
     )
 
     rank, world_size = _init_dist()
-    config = _backend_config("nvlink_one_sided", "trtllm")
+    config = _backend_config("nvlink_one_sided")
     num_experts = 4 * world_size
     hidden = 1024
     generator = torch.Generator().manual_seed(99 + rank)
@@ -217,10 +207,8 @@ def test_split_layer_identity_round_trip_over_nvlink_one_sided():
 
 
 @pytest.mark.gpu_2
-@pytest.mark.parametrize(
-    ("backend", "kernel"), [b for b in _BACKENDS if b[0].startswith("nvlink")]
-)
-def test_split_layer_cuda_graph_replays_new_inputs(backend, kernel):
+@pytest.mark.parametrize("backend", [b for b in _BACKENDS if b.startswith("nvlink")])
+def test_split_layer_cuda_graph_replays_new_inputs(backend):
     """A captured MoEEpSplitLayer forward serves inputs rewritten in place."""
     import torch
     import torch.distributed as dist
@@ -238,7 +226,7 @@ def test_split_layer_cuda_graph_replays_new_inputs(backend, kernel):
     )
 
     rank, world_size = _init_dist()
-    config = _backend_config(backend, kernel)
+    config = _backend_config(backend)
     num_tokens, hidden, top_k = 16, 1024, 2
     num_experts = 4 * world_size
     generator = torch.Generator().manual_seed(7 + rank)
