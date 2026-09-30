@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -10,22 +11,41 @@ if TYPE_CHECKING:
     from .....comm.mnnvl import MnnvlConfig
     from ....config import BootstrapConfig
 
+logger = logging.getLogger(__name__)
+
 
 def nvlink_platform_supported() -> bool:
-    """Whether this GPU meets :meth:`MnnvlMemory.supports_mnnvl` (all NVLinks up)."""
+    """Whether this rank can run the NVLink backends; logs the reason if not.
+
+    The rank needs CUDA and must meet :meth:`MnnvlMemory.supports_mnnvl`, i.e.
+    its GPU has P2P-capable NVLinks and all of them are up.
+    """
     try:
         import pynvml
         import torch
-
-        if not torch.cuda.is_available():
-            return False
+    except ImportError as exc:
+        logger.error("NVLink backends unavailable: %s", exc)
+        return False
+    if not torch.cuda.is_available():
+        logger.error("NVLink backends unavailable: CUDA is not available")
+        return False
+    try:
         from .....comm.mnnvl import MnnvlMemory
 
-        return bool(MnnvlMemory.supports_mnnvl())
-    except ImportError:
+        supported = bool(MnnvlMemory.supports_mnnvl())
+    except pynvml.NVMLError as exc:
+        logger.error("NVLink backends unavailable: NVML query failed: %s", exc)
         return False
-    except (RuntimeError, OSError, pynvml.NVMLError):
+    except (ImportError, RuntimeError, OSError) as exc:
+        logger.error("NVLink backends unavailable: %s: %s", type(exc).__name__, exc)
         return False
+    if not supported:
+        logger.error(
+            "NVLink backends unavailable: GPU %d has no P2P-capable NVLink or "
+            "not all of its NVLinks are up",
+            torch.cuda.current_device(),
+        )
+    return supported
 
 
 def mnnvl_mapping_and_config(
@@ -38,6 +58,11 @@ def mnnvl_mapping_and_config(
     ``comm_backend`` defaults to torch.distributed over
     ``bootstrap.process_group`` (the default group when unset), which must
     already be initialized.
+
+    Collective: every rank reports whether it can run the NVLink backends,
+    and all ranks raise if any cannot, so an unsupported rank never fails alone
+    while its peers wait in the symmetric-memory setup. Each unsupported rank
+    logs its own reason.
     """
     from .....comm.comm_backend import TorchDistBackend
     from .....comm.mapping import Mapping
@@ -54,6 +79,13 @@ def mnnvl_mapping_and_config(
         raise ValueError(
             f"MNNVL communicator rank {comm_backend.Get_rank()} does not match "
             f"the EP rank {bootstrap.rank}"
+        )
+    verdicts = comm_backend.allgather(nvlink_platform_supported())
+    unsupported = [rank for rank, supported in enumerate(verdicts) if not supported]
+    if unsupported:
+        raise RuntimeError(
+            f"NVLink backends are not supported on EP ranks {unsupported}; see "
+            "their logs for the reason"
         )
     mapping = Mapping(
         world_size=bootstrap.world_size,

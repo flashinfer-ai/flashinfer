@@ -40,6 +40,12 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
         params: MoEEpCommParams,
         config: Optional[NVLinkTwoSidedConfig] = None,
     ) -> None:
+        self.config = NVLinkTwoSidedConfig() if config is None else config
+        # Collective platform check across the EP group; it runs before the
+        # base class's local check so that no rank fails alone.
+        mapping, mnnvl_config = mnnvl_mapping_and_config(
+            bootstrap, self.config.comm_backend
+        )
         super().__init__(bootstrap, params)
         from ......comm.mnnvl import MnnvlMemory
         from ......comm.trtllm_alltoall import MnnvlMoe
@@ -49,10 +55,6 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
                 "NVLinkTwoSidedAlltoAll requires num_experts divisible by 4, "
                 f"got {params.num_experts}"
             )
-        self.config = NVLinkTwoSidedConfig() if config is None else config
-        mapping, mnnvl_config = mnnvl_mapping_and_config(
-            bootstrap, self.config.comm_backend
-        )
         MnnvlMemory.initialize()
         self._workspace = MnnvlMoe.get_moe_workspaces(mapping, mnnvl_config)
         self._prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(

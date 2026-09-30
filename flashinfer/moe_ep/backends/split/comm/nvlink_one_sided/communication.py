@@ -42,13 +42,18 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         params: MoEEpCommParams,
         config: Optional[NVLinkOneSidedConfig] = None,
     ) -> None:
+        self.config = NVLinkOneSidedConfig() if config is None else config
+        # Collective platform check across the EP group; it runs before the
+        # base class's local check so that no rank fails alone.
+        mapping, mnnvl_config = mnnvl_mapping_and_config(
+            bootstrap, self.config.comm_backend
+        )
         super().__init__(bootstrap, params)
         from ......comm.trtllm_moe_alltoall import (
             MoeAlltoAll,
             moe_a2a_get_workspace_size_per_rank,
         )
 
-        self.config = NVLinkOneSidedConfig() if config is None else config
         if self.config.extra_payload_bytes_per_token < 0:
             raise ValueError("extra_payload_bytes_per_token must be non-negative")
 
@@ -71,9 +76,6 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             backend=self.config.kernel,
         )
 
-        mapping, mnnvl_config = mnnvl_mapping_and_config(
-            bootstrap, self.config.comm_backend
-        )
         self._alltoall: Optional[MoeAlltoAll] = MoeAlltoAll(
             mapping,
             max_num_tokens=params.max_tokens_per_rank,
