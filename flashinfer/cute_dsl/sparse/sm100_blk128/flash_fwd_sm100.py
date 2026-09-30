@@ -103,7 +103,9 @@ class FlashAttentionForwardSm100:
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
-        assert _is_supported_arch(self.arch), "Only SM100, SM103 and SM107 are supported"
+        assert _is_supported_arch(self.arch), (
+            "Only SM100, SM103 and SM107 are supported"
+        )
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
