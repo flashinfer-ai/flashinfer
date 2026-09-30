@@ -518,13 +518,8 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         # 128-wide persistent tile (two waves) beats the scorer's single-wave wide tile.
         if sm_count < TWO_CTA_PER_SM_MIN_SMS:
             tactic["tile_n"] = tile_n = 128
-    elif (
-        m <= BLOCK_M
-        and tile_m == BLOCK_M
-        and tile_n == 128
-        and sm_count >= TWO_CTA_PER_SM_MIN_SMS
-    ):
-        # One token tile, one wave of 128-wide tiles on the 152-SM part: no L2 promotion.
+    elif m <= BLOCK_M and tile_m == BLOCK_M and tile_n == 128:
+        # One token tile, one wave of 128-wide tiles (both parts): no L2 promotion.
         tactic["l2_promo"] = None
     if tile_m == 256:
         tactic["two_cta"] = True
