@@ -890,9 +890,12 @@ class KDAPiecesLaunch:
                 0 if has_split else 1,
             )
             if use_fixed_h64_m64:
+                # The retained fixed_h64 program is laid out for a 138-CTA
+                # split-major grid; it needs the grid resident, not exactly
+                # 148 SMs (152-SM GB300 parts otherwise silently fall back).
                 use_split_major = (
                     final_state is not None
-                    and num_sms == 148
+                    and num_sms >= 138
                     and self._grid == (64, 1, 1)
                 )
                 self._module = (
@@ -1022,6 +1025,12 @@ class KDAPiecesLaunch:
                 if has_split
                 else "exact_unsplit_native_fp32"
             )
+            if self._module is None:
+                # No retained static program covers this route; launch()
+                # runs the exact fallback, so report that instead of the
+                # stream schedule that was not bound.
+                self.schedule = f"no_static_program_{self._fallback.schedule}"
+                self.state_input_mode = "timed_fp32_bf16_boundary_conversions"
         if self._windows and any(
             start - walk != K2_CHUNK for walk, start in self._windows
         ):
