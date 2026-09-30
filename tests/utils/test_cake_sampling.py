@@ -1479,48 +1479,101 @@ def test_coarse_sample_build_matches_default_build():
     streams = [(c, e) for (c, e, st) in defaults if st]
     assert [(v["cluster"], v["ept"]) for v in coarse] == streams
     assert all(
-        v["stream"] and v["fused_tail"] and not v["fused_block_tail"] and v["symbol"].endswith("s_cs")
+        v["stream"]
+        and v["fused_tail"]
+        and not v["fused_block_tail"]
+        and v["symbol"].endswith("s_cs")
         for v in coarse
     )
-    assert all(not v["symbol"].endswith("_cs") for v in man["stage1"] if not v["coarse_sample"])
+    assert all(
+        not v["symbol"].endswith("_cs") for v in man["stage1"] if not v["coarse_sample"]
+    )
     assert all(cs._stage1_has_coarse_sample(c, e, True) for c, e in streams)
-    assert not any(cs._stage1_has_coarse_sample(c, e, False) for (c, e, st) in defaults if not st)
+    assert not any(
+        cs._stage1_has_coarse_sample(c, e, False) for (c, e, st) in defaults if not st
+    )
     kcap = int(man["fused_tail_kcap"])
-    assert cs._coarse_sample_flag(streams[0][0], streams[0][1], True, kcap) == cs._FLAG_COARSE_SAMPLE
+    assert (
+        cs._coarse_sample_flag(streams[0][0], streams[0][1], True, kcap)
+        == cs._FLAG_COARSE_SAMPLE
+    )
     assert cs._coarse_sample_flag(streams[0][0], streams[0][1], True, kcap + 1) == 0
     assert cs._coarse_sample_flag(4, 16, False, 10) == 0
     if not _device_streams():
-        pytest.skip("165 KB streaming variants exceed this device's shared-memory opt-in")
+        pytest.skip(
+            "165 KB streaming variants exceed this device's shared-memory opt-in"
+        )
     for vocab, batch in ((32768, 5), (128256, 3), (151937, 2), (262144, 2)):
         probs = _probs(batch, vocab, seed=776 + vocab % 89)
         pn = probs.cpu().numpy()
-        pn[0, (np.arange(1500) * 11) % vocab] = np.float32(2**-12)  # ties across the k cut
+        pn[0, (np.arange(1500) * 11) % vocab] = np.float32(
+            2**-12
+        )  # ties across the k cut
         pn[1, [3, 5000]] = np.inf
         pn[-1, : vocab // 2] = 0.0  # a half-zero row (a huge low bucket)
         probs.copy_(torch.tensor(pn, device="cuda"))
-        k_row = torch.tensor([max(1, (64 * (i + 1)) // batch) for i in range(batch)], device="cuda", dtype=torch.int32)
+        k_row = torch.tensor(
+            [max(1, (64 * (i + 1)) // batch) for i in range(batch)],
+            device="cuda",
+            dtype=torch.int32,
+        )
         for c, e in streams:
             s1 = (c, e, True)
             for k, p in ((10, 0.9), (64, 0.5), (k_row, 1e-6), (1000, 0.9), (200, 1.0)):
                 base = _run(probs, k, p, 0x776, 5, variant=(s1, (256, 4)), flags=0)
-                coarse_run = _run(probs, k, p, 0x776, 5, variant=(s1, (256, 4)), flags=cs._FLAG_COARSE_SAMPLE)
-                assert np.array_equal(base.count, coarse_run.count), (vocab, c, e, k if isinstance(k, int) else "row")
+                coarse_run = _run(
+                    probs,
+                    k,
+                    p,
+                    0x776,
+                    5,
+                    variant=(s1, (256, 4)),
+                    flags=cs._FLAG_COARSE_SAMPLE,
+                )
+                assert np.array_equal(base.count, coarse_run.count), (
+                    vocab,
+                    c,
+                    e,
+                    k if isinstance(k, int) else "row",
+                )
                 for r in range(batch):
                     kr = int(base.count[r])
-                    assert np.array_equal(base.idx[r, :kr], coarse_run.idx[r, :kr]), (vocab, c, e, r)
+                    assert np.array_equal(base.idx[r, :kr], coarse_run.idx[r, :kr]), (
+                        vocab,
+                        c,
+                        e,
+                        r,
+                    )
                     assert np.array_equal(
-                        base.vals[r, :kr].view(np.uint32), coarse_run.vals[r, :kr].view(np.uint32)
+                        base.vals[r, :kr].view(np.uint32),
+                        coarse_run.vals[r, :kr].view(np.uint32),
                     )
                 # the fused two-warp tail on both builds: samples and renorm bitwise equal
                 if isinstance(k, int) and k <= kcap:
-                    base_f = _run(probs, k, p, 0x776, 5, variant=(s1, (256, 4)), flags=1)
-                    coarse_f = _run(probs, k, p, 0x776, 5, variant=(s1, (256, 4)), flags=1 | cs._FLAG_COARSE_SAMPLE)
+                    base_f = _run(
+                        probs, k, p, 0x776, 5, variant=(s1, (256, 4)), flags=1
+                    )
+                    coarse_f = _run(
+                        probs,
+                        k,
+                        p,
+                        0x776,
+                        5,
+                        variant=(s1, (256, 4)),
+                        flags=1 | cs._FLAG_COARSE_SAMPLE,
+                    )
                     _check(base_f, pn, k, p, 0x776, 5)
-                    assert np.array_equal(base_f.samples, coarse_f.samples), (vocab, c, e, k)
+                    assert np.array_equal(base_f.samples, coarse_f.samples), (
+                        vocab,
+                        c,
+                        e,
+                        k,
+                    )
                     for r in range(batch):
                         kr = int(base_f.count[r])
                         assert np.array_equal(
-                            base_f.renorm[r, :kr].view(np.uint32), coarse_f.renorm[r, :kr].view(np.uint32)
+                            base_f.renorm[r, :kr].view(np.uint32),
+                            coarse_f.renorm[r, :kr].view(np.uint32),
                         )
     # bit 4 on a register-resident variant and together with bit 3 is rejected
     module = load_cake_sampling_module()
@@ -1528,16 +1581,45 @@ def test_coarse_sample_build_matches_default_build():
     vals, idxs, cnt = _ws(2)
     out2 = torch.empty(2, device="cuda", dtype=torch.int32)
     stream = torch.cuda.current_stream().cuda_stream
-    for flags, c, e, st in ((cs._FLAG_COARSE_SAMPLE, 4, 16, 0), (cs._FLAG_COARSE_SAMPLE | 8, streams[0][0], streams[0][1], 1)):
-        with pytest.raises(Exception):
+    for flags, c, e, st in (
+        (cs._FLAG_COARSE_SAMPLE, 4, 16, 0),
+        (cs._FLAG_COARSE_SAMPLE | 8, streams[0][0], streams[0][1], 1),
+    ):
+        with pytest.raises(Exception, match="launch_flags bit"):
             module.radix_topk(
-                probs2, cnt, 50, 1, vals, idxs, cnt, c, e, st, probs2, 0.9, 1, out2, vals, 1, 0, 0, flags, stream
+                probs2,
+                cnt,
+                50,
+                1,
+                vals,
+                idxs,
+                cnt,
+                c,
+                e,
+                st,
+                probs2,
+                0.9,
+                1,
+                out2,
+                vals,
+                1,
+                0,
+                0,
+                flags,
+                stream,
             )
     # the pipeline route: bit 4 exactly for small-top-k launches that land on a stream
     for vocab, batch, k in ((262144, 64, 50), (262144, 64, 1000), (32768, 4, 50)):
         c, e, st = cs.choose_stage1(batch, vocab, top_k_max=k)
         want = cs._FLAG_COARSE_SAMPLE if (st and k <= kcap) else 0
-        assert cs._coarse_sample_flag(c, e, bool(st), k) == want, (vocab, batch, k, c, e, st)
+        assert cs._coarse_sample_flag(c, e, bool(st), k) == want, (
+            vocab,
+            batch,
+            k,
+            c,
+            e,
+            st,
+        )
 
 
 def test_row_span_diet_flag_matches_default_build():
@@ -1551,7 +1633,11 @@ def test_row_span_diet_flag_matches_default_build():
 
     man = load_manifest()
     streams = sorted(
-        {(v["cluster"], v["ept"]) for v in man["stage1"] if v["stream"] and not v["fused_block_tail"] and not v["coarse_sample"]}
+        {
+            (v["cluster"], v["ept"])
+            for v in man["stage1"]
+            if v["stream"] and not v["fused_block_tail"] and not v["coarse_sample"]
+        }
     )
     kcap = int(man["fused_tail_kcap"])
     dev = torch.cuda.current_device()
@@ -1563,42 +1649,108 @@ def test_row_span_diet_flag_matches_default_build():
     assert cs._row_span_diet_flag(4, True, 1000, dev) == 0
     assert cs._row_span_diet_flag(8, False, 1000, dev) == 0
     if not _device_streams():
-        pytest.skip("165 KB streaming variants exceed this device's shared-memory opt-in")
+        pytest.skip(
+            "165 KB streaming variants exceed this device's shared-memory opt-in"
+        )
     for vocab, batch in ((32768, 5), (128256, 3), (151937, 2), (262144, 2)):
         probs = _probs(batch, vocab, seed=776 + vocab % 89)
         pn = probs.cpu().numpy()
-        pn[0, (np.arange(1500) * 11) % vocab] = np.float32(2**-12)  # ties across the k cut
+        pn[0, (np.arange(1500) * 11) % vocab] = np.float32(
+            2**-12
+        )  # ties across the k cut
         pn[1, [3, 5000]] = np.inf
-        pn[-1, : vocab // 2] = 0.0  # a half-zero row (a huge low bucket: dense candidates)
+        pn[-1, : vocab // 2] = (
+            0.0  # a half-zero row (a huge low bucket: dense candidates)
+        )
         probs.copy_(torch.tensor(pn, device="cuda"))
-        k_row = torch.tensor([50 + 450 * i for i in range(batch)], device="cuda", dtype=torch.int32)
+        k_row = torch.tensor(
+            [50 + 450 * i for i in range(batch)], device="cuda", dtype=torch.int32
+        )
         for c, e in streams:
             s1 = (c, e, True)
             for k, p in ((1000, 0.9), (200, 1.0), (k_row, 1e-6), (50, 0.9)):
                 base = _run(probs, k, p, 0x776, 5, variant=(s1, (256, 4)), flags=0)
-                span = _run(probs, k, p, 0x776, 5, variant=(s1, (256, 4)), flags=cs._FLAG_ROW_SPAN_DIET)
-                assert np.array_equal(base.count, span.count), (vocab, c, e, k if isinstance(k, int) else "row")
+                span = _run(
+                    probs,
+                    k,
+                    p,
+                    0x776,
+                    5,
+                    variant=(s1, (256, 4)),
+                    flags=cs._FLAG_ROW_SPAN_DIET,
+                )
+                assert np.array_equal(base.count, span.count), (
+                    vocab,
+                    c,
+                    e,
+                    k if isinstance(k, int) else "row",
+                )
                 for r in range(batch):
                     kr = int(base.count[r])
-                    assert np.array_equal(base.idx[r, :kr], span.idx[r, :kr]), (vocab, c, e, r)
-                    assert np.array_equal(base.vals[r, :kr].view(np.uint32), span.vals[r, :kr].view(np.uint32))
+                    assert np.array_equal(base.idx[r, :kr], span.idx[r, :kr]), (
+                        vocab,
+                        c,
+                        e,
+                        r,
+                    )
+                    assert np.array_equal(
+                        base.vals[r, :kr].view(np.uint32),
+                        span.vals[r, :kr].view(np.uint32),
+                    )
                 if isinstance(k, int) and k <= kcap:
-                    base_f = _run(probs, k, p, 0x776, 5, variant=(s1, (256, 4)), flags=1)
-                    span_f = _run(probs, k, p, 0x776, 5, variant=(s1, (256, 4)), flags=1 | cs._FLAG_ROW_SPAN_DIET)
+                    base_f = _run(
+                        probs, k, p, 0x776, 5, variant=(s1, (256, 4)), flags=1
+                    )
+                    span_f = _run(
+                        probs,
+                        k,
+                        p,
+                        0x776,
+                        5,
+                        variant=(s1, (256, 4)),
+                        flags=1 | cs._FLAG_ROW_SPAN_DIET,
+                    )
                     _check(base_f, pn, k, p, 0x776, 5)
-                    assert np.array_equal(base_f.samples, span_f.samples), (vocab, c, e, k)
+                    assert np.array_equal(base_f.samples, span_f.samples), (
+                        vocab,
+                        c,
+                        e,
+                        k,
+                    )
                     for r in range(batch):
                         kr = int(base_f.count[r])
-                        assert np.array_equal(base_f.renorm[r, :kr].view(np.uint32), span_f.renorm[r, :kr].view(np.uint32))
+                        assert np.array_equal(
+                            base_f.renorm[r, :kr].view(np.uint32),
+                            span_f.renorm[r, :kr].view(np.uint32),
+                        )
     # bit 5 on a register-resident variant is rejected
     module = load_cake_sampling_module()
     probs2 = _probs(2, 32768, seed=5)
     vals, idxs, cnt = _ws(2)
     out2 = torch.empty(2, device="cuda", dtype=torch.int32)
     stream = torch.cuda.current_stream().cuda_stream
-    with pytest.raises(Exception):
+    with pytest.raises(Exception, match="row-span filter arm"):
         module.radix_topk(
-            probs2, cnt, 50, 1, vals, idxs, cnt, 4, 16, 0, probs2, 0.9, 1, out2, vals, 1, 0, 0, cs._FLAG_ROW_SPAN_DIET, stream
+            probs2,
+            cnt,
+            50,
+            1,
+            vals,
+            idxs,
+            cnt,
+            4,
+            16,
+            0,
+            probs2,
+            0.9,
+            1,
+            out2,
+            vals,
+            1,
+            0,
+            0,
+            cs._FLAG_ROW_SPAN_DIET,
+            stream,
         )
 
 

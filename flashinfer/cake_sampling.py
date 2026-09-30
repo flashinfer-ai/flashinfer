@@ -447,7 +447,10 @@ def _coarse_sample_flag(cluster: int, ept: int, stream: bool, top_k_max: int) ->
 
 @functools.cache
 def _row_span_diet_capability(device_index: int) -> bool:
-    return tuple(torch.cuda.get_device_capability(device_index)) in _ROW_SPAN_DIET_CAPABILITIES
+    return (
+        tuple(torch.cuda.get_device_capability(device_index))
+        in _ROW_SPAN_DIET_CAPABILITIES
+    )
 
 
 def _row_span_diet_flag(
@@ -1045,7 +1048,9 @@ def top_k_probs_to_slab(
         # no fused tail, no PDL dependent follows; the coarse-sample build for a small top-k on a stream,
         # the row-span filter arm for a large one on a cluster-8 stream
         _coarse_sample_flag(cluster, ept, bool(stream_variant), kmax)
-        | _row_span_diet_flag(cluster, bool(stream_variant), kmax, probs.device.index or 0),
+        | _row_span_diet_flag(
+            cluster, bool(stream_variant), kmax, probs.device.index or 0
+        ),
         stream,
     )
     return vals, idxs, cnt
