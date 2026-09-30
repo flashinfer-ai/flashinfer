@@ -92,6 +92,14 @@ ARCHES = tuple(sorted(set(SUPPORTED_COMPUTE_CAPABILITIES.values())))
 # :func:`required_kernel_keys` enumerates the registered kernels for these
 # counts.
 ARCH_SM_COUNT = {"sm_100a": 148, "sm_103a": 152}
+# Co-resident clusters per cluster size on each part (``cuOccupancyMaxActiveClusters`` of the split-K
+# kernel at one CTA per SM), keyed by SM count.  A split-K launch is ``weight tiles x token tiles``
+# clusters and must fit in one wave; the capacity is the GPC placement limit, not ``sm_count // size``.
+CLUSTER_CAPACITY_BY_SM_COUNT = {
+    148: {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 8: 15},
+    152: {2: 76, 3: 46, 4: 36, 5: 28, 6: 23, 8: 15},
+}
+SPLITK3_CLUSTER = 3
 
 # Validated problem matrix (kernel keys enumerated by :func:`required_kernel_keys`).
 # GEMM families are ``(K, N)`` of the per-token quantize + GEMM chains the backend was
@@ -416,7 +424,15 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
             split_k = 4
         elif n_tiles <= 20:
             tile_n, split_k = 8, 2
-        if split_k > 1 and k % (K_TILE * split_k) == 0:
+            # Three K slices when every cluster of the launch is co-resident (7168x1536 M = 17:
+            # 36 clusters, +6 % on both parts); 48 or more clusters of 3 need a second cluster
+            # wave (-27..-30 %) and keep two slices.
+            capacity = CLUSTER_CAPACITY_BY_SM_COUNT.get(sm_count, {}).get(SPLITK3_CLUSTER)
+            token_tiles = (m + tile_n - 1) // tile_n
+            if capacity is not None and n_tiles * token_tiles <= capacity and k // K_TILE >= SPLITK3_CLUSTER:
+                split_k = SPLITK3_CLUSTER
+        # Even K slices for split-K 2 / 4; the three-way split uses the kernel's owner-remainder partition.
+        if split_k > 1 and k % K_TILE == 0 and (split_k == SPLITK3_CLUSTER or k % (K_TILE * split_k) == 0):
             return {
                 "tile_n": tile_n,
                 "deep_k": False,
