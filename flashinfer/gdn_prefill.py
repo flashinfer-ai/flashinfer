@@ -1159,7 +1159,7 @@ def chunk_gated_delta_rule(
 
     if (
         use_qk_l2norm_in_kernel
-        and _arch_major in (9, 10, 12)
+        and _arch_major in (8, 9, 10, 12)
         and (_arch_major != 10 or _cuda_major >= 13)
         and is_cute_dsl_arch_supported(*_device_capability)
     ):

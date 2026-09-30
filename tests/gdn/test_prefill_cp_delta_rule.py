@@ -232,9 +232,9 @@ def _run_non_cp_prefill(q, k, v, alpha, beta, cu_seqlens, scale, initial_state=N
     )
     # Keywords past `scale`: the two bare `True`s here were
     # `output_final_state` and `use_qk_l2norm_in_kernel`, and the second one is
-    # not what this reference wants -- no GDN prefill entry on any
-    # architecture reads that flag, so it was accepted and dropped, and a
-    # reader had to count positions to find that out.
+    # not what this reference wants -- it normalizes Q and K before the kernel,
+    # and the CP side of these comparisons gets them unnormalized. A reader had
+    # to count positions to find that out.
     chunk_gated_delta_rule(
         q,
         k,
