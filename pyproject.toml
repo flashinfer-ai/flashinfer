@@ -22,7 +22,7 @@ authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "LICENSE*.txt"]
+license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda"]
 
 [project.optional-dependencies]
 # Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
