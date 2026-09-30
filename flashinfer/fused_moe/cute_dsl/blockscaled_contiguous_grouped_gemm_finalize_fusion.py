@@ -47,7 +47,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 
-from .localized_moe_debug import localized_moe_trace
 import cuda.bindings.driver as cuda
 import torch
 
@@ -637,7 +636,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
     # Scale full-device occupancy to the green context's SM allocation.
-    max_active_clusters_full = max_active_clusters
     if sm_count < total_sm:
         max_active_clusters = max(1, max_active_clusters * sm_count // total_sm)
 
@@ -648,16 +646,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     else:
         c_stride_row_val = cutlass.Int64(0)
         c_data_ptr = out.data_ptr()
-
-    localized_moe_trace(
-        f"fc2-domain-{domain_id}",
-        f"FC2 domain_id={domain_id} localized_half_gemm={localized_half_gemm} is_rubin={is_rubin} | "
-        f"b.shape[1]={n} out.shape={tuple(out.shape)} expected_n={expected_n} | "
-        f"sm_count={sm_count}/{total_sm} "
-        f"max_active_clusters={max_active_clusters_full}->{max_active_clusters} | "
-        f"c_stride_row={int(c_stride_row_val)} "
-        f"c_byte_offset={c_data_ptr - out.data_ptr()}",
-    )
 
     tile_size = mma_tiler[0] if is_rubin else mma_tiler_mn[0]
 
