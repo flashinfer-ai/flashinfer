@@ -144,8 +144,12 @@ def select_cake_bgmv_moe_schedule(
 ) -> CakeBGMVMoESchedule:
     """Return the measured selector for the supported rank-32 portfolio.
 
-    The table was measured on B200 (SM100, 148 SMs) and re-validated on GB300
-    (SM103) and H100 (SM90) with the same winners; all targets share it.
+    The table was measured on B200 (SM100, 148 SMs); all targets share it.
+    Sweeping the three expand schedules over the serving shapes (hidden
+    2688/3072, 1..1024 tokens, BF16, CUPTI cold-L2) puts them within 1.2 % of
+    each other on B200 and within 3.5 % on H100 (SM90), where
+    ``token_owned_dual_col`` trails ``token_owned`` by about 3 % at 1024
+    tokens. A per-target table is deliberately not introduced for that gap.
     """
 
     _check_hidden_size(hidden_size)
