@@ -1248,9 +1248,10 @@ def test_device_grad_weight_dtype_fp32(glm_weight):
         chunked_lm_head_loss(inp.X.detach().requires_grad_(), inp.W, inp.labels, loss_div=inp.loss_div, grad_weight_dtype=torch.float32, backend="cake")
     fr = cake_backend.forward_loss(inp.X, inp.W, inp.labels, objective="ce", loss_div=inp.loss_div, chunk_size=4096, need_dx=True, need_dw=True,
                                    grad_weight_dtype=torch.float32, backend="cake")
-    dX, dW32 = cake_backend.backward_loss(fr.dx_acc, fr.dw_acc, None, grad_weight_dtype=torch.float32, backend="cake")
+    dX, dW32 = cake_backend.backward_loss(fr.dx_acc, fr.dw_acc, None, grad_weight_dtype=torch.float32, backend="cake",
+                                          row_index=fr.row_index, num_rows=fr.num_rows)  # the compacted forward's rows
     torch.cuda.synchronize()
-    assert dW32.dtype == torch.float32 and dX.dtype == torch.bfloat16
+    assert dW32.dtype == torch.float32 and dX.dtype == torch.bfloat16 and tuple(dX.shape) == (inp.T, DEFAULT_H)
     assert torch.equal(fr.loss, bf16["loss"]) and torch.equal(dX, bf16["dX"])
     assert torch.equal(dW32.to(torch.bfloat16), bf16["dW"]) and torch.equal(dW32, fr.dw_acc)
     result = dict(loss=fr.loss, logp=fr.logp, dX=dX, dW=dW32)
@@ -1276,9 +1277,9 @@ def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
             assert torch.equal(a, b) and torch.equal(b, c), name
         assert second.loss.data_ptr() != first.loss.data_ptr()  # outputs are fresh allocations
         key = forward_binding_key(inp.X, inp.W, inp.labels, infer_logp=None, loss_weights=None, need_dx=True, need_dw=True,
-                                  grad_weight_dtype=torch.bfloat16, entry="loss", **kw)
+                                  grad_weight_dtype=torch.bfloat16, entry="loss", valid_rows=int(inp.valid.sum()), **kw)
         binding = cache.peek(key)
-        assert binding is not None and binding.holds_no_tensor()
+        assert binding is not None and binding.holds_no_tensor() and binding.plan.compact
         assert set(binding.owned) <= {"workspace", "tma_descriptor_workspace"}
         assert cache.owned_bytes == sum(t.numel() * t.element_size() for t in binding.owned.values())
         # another chunk size is another binding (misses once), then hits
@@ -1289,14 +1290,15 @@ def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
         assert torch.equal(third.logp, fourth.logp) and torch.equal(third.dw_acc, fourth.dw_acc)
         # the autograd path reuses the forward binding
         result = _run(inp, 4096, backend="cake")
-        assert cache.hits == hits0 + 3 and torch.equal(result["loss"], first.loss) and torch.equal(result["dX"], first.dx_acc.to(torch.bfloat16))
+        assert cache.hits == hits0 + 3 and torch.equal(result["loss"], first.loss)
+        assert torch.equal(result["dX"], cake_backend.scatter_rows(first.dx_acc.to(torch.bfloat16), first.row_index, inp.T))
 
 
 def test_device_runner_launches_without_allocation(glm_weight):
     _require_program(entry="loss")
     inp = _device_inputs(4097, "policy", W=glm_weight)
     runner = prepare_lm_head_loss(inp.X, inp.W, inp.labels, objective="policy", infer_logp=inp.infer_logp, loss_weights=inp.loss_weights,
-                                  chunk_size=4096, backend="cake")
+                                  chunk_size=4096, backend="cake", compact_rows=True)  # the autograd entries' default plan
     runner.step()
     torch.cuda.synchronize()
     before = torch.cuda.memory_stats()
@@ -1306,8 +1308,8 @@ def test_device_runner_launches_without_allocation(glm_weight):
     assert after["allocation.all.allocated"] == before["allocation.all.allocated"]
     assert dx is runner.dx_out and dw is runner.dw_out
     result = _run(inp, 4096, backend="cake")
-    assert torch.equal(runner.loss.reshape(()), result["loss"]) and torch.equal(runner.logp, result["logp"])
-    assert torch.equal(dx, result["dX"]) and torch.equal(dw, result["dW"])
+    assert torch.equal(runner.loss.reshape(()), result["loss"]) and torch.equal(runner.scatter(runner.logp), result["logp"])
+    assert torch.equal(runner.scatter(dx), result["dX"]) and torch.equal(dw, result["dW"])
 
 
 def test_device_t_changes_between_calls(glm_weight):
@@ -1444,7 +1446,10 @@ def test_device_memory_rule(glm_weight):
     assert m["vocab_rows_max"] == 4096 and m["num_chunks"] == 2
     assert m["temporary"]["logits"] == 4096 * DEFAULT_V * 2  # never the full [T, V]
     assert peak <= m["temporary_bytes"] + m["accumulator_bytes"] + m["outputs_bytes"] + (256 << 20)
-    assert peak < inp.T * DEFAULT_V * 2 + m["accumulator_bytes"] + m["outputs_bytes"]  # below an unchunked logits buffer
+    # the vocabulary-sized part of the peak is the reported chunk workspace (logits + statistics + K-slice slabs), never a
+    # [T, V] buffer: the unchunked path at the contract's boundaries holds BF16 z plus its FP32 promotion (T * V * 6 bytes)
+    assert peak - m["accumulator_bytes"] - m["outputs_bytes"] <= m["temporary_bytes"] + (256 << 20)
+    assert m["temporary_bytes"] < inp.T * DEFAULT_V * 6 and m["temporary"]["logits"] < inp.T * DEFAULT_V * 2
     # a step through the prepared runner allocates nothing more
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
