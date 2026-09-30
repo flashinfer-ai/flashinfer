@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -292,7 +293,8 @@ def test_epilogue_rules():
         (dict(a_mn=False, b_mn=False, block_n=128, epi="tma", slots=1, stages=8), "dense_proj_gemm_kk_n128_tma1"),
         # TMA L2 eviction hints (A, B): first letters after ``_h``; L2 promotion and prefetch distance
         (dict(a_mn=False, b_mn=False, block_n=128, hints=("evict_first", "none")), "dense_proj_gemm_kk_n128_hen"),
-        (dict(a_mn=False, b_mn=False, hints=("evict_first", "evict_last")), "dense_proj_gemm_kk_n256_hel"),
+        # first letters only, as the Cake host writes them: evict_first / evict_last -> ``_hee``
+        (dict(a_mn=False, b_mn=False, hints=("evict_first", "evict_last")), "dense_proj_gemm_kk_n256_hee"),
         (dict(a_mn=False, b_mn=False, hints=("none", "evict_normal")), "dense_proj_gemm_kk_n256_hne"),
         (dict(a_mn=False, b_mn=False, promo="l2_128b"), "dense_proj_gemm_kk_n256_l2_128b"),
         (dict(a_mn=False, b_mn=False, pf=4), "dense_proj_gemm_kk_n256_pf4"),
@@ -540,7 +542,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 # the knob defaults of the launcher: stage depth by tile shape, raster group, working-set-gated hints
                 assert plan.cta_rows == 128 and plan.pf == 0 and plan.promo == "none"
                 assert plan.group_m == default_group_m(plan.a_mn, plan.b_mn, plan.m_tiles, plan.pair_tiles, plan.sm_pairs) == 16
-                assert "_g" not in plan.template
+                assert re.search(r"_g\d+", plan.template) is None  # no raster-group suffix ("_gemm" is not one)
                 assert plan.stages == default_stages(plan.slots, plan.cta_rows, plan.block_n)
                 assert plan.stages == {(256, 0): 7, (256, 1): 6, (128, 0): 9, (128, 1): 8}[(plan.block_n, plan.slots)]
                 assert plan.l2_bytes == L2_BYTES
@@ -608,7 +610,11 @@ def test_operand_view_classification_and_rejections():
     A = torch.empty(4, 16, 64, dtype=torch.bfloat16)
     mn, desc = operand_view(A, "A", k_axis=2)
     assert not mn and desc.shape == A.shape
+    # the transposed view keeps K contiguous: with K on axis 1 it is still K-major, with the
+    # contraction on axis 2 (stride 64) and M unit-strided it is MN-major and desc = [L, M, K]
     mn, desc = operand_view(A.transpose(1, 2), "A", k_axis=1)
+    assert not mn and tuple(desc.shape) == (4, 16, 64)
+    mn, desc = operand_view(A.transpose(1, 2), "A", k_axis=2)
     assert mn and tuple(desc.shape) == (4, 16, 64)
     with pytest.raises(ValueError, match="unit stride"):
         operand_view(torch.empty(4, 16, 64, dtype=torch.bfloat16)[:, :, ::2], "A", k_axis=2)
