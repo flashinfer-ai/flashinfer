@@ -370,13 +370,6 @@ FLASHINFER_JIT_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "cached_ops"
 FLASHINFER_GEN_SRC_DIR: pathlib.Path = FLASHINFER_WORKSPACE_DIR / "generated"
 FLASHINFER_DATA: pathlib.Path = _package_root / "data"
 FLASHINFER_INCLUDE_DIR: pathlib.Path = _package_root / "data" / "include"
-# Wheels and editable installs materialize ``data/include``.  A source checkout
-# imported directly through PYTHONPATH has the project-level ``include`` tree
-# instead, which is needed by JIT extensions that include ``flashinfer/*.cuh``.
-if not FLASHINFER_INCLUDE_DIR.is_dir():
-    _checkout_include_dir = _package_root.parent / "include"
-    if _checkout_include_dir.is_dir():
-        FLASHINFER_INCLUDE_DIR = _checkout_include_dir
 FLASHINFER_CSRC_DIR: pathlib.Path = _package_root / "data" / "csrc"
 # FLASHINFER_SRC_DIR = _package_root / "data" / "src"
 CUTLASS_INCLUDE_DIRS: list[pathlib.Path] = [
