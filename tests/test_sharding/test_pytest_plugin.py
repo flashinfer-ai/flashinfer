@@ -7,25 +7,15 @@ import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-import pytest
-
 from scripts.test_sharding.progress import decode_pytest_event
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-@pytest.fixture(autouse=True)
-def _parent_pytest_addopts(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Nightly package tests set this globally, but the isolated child pytest
-    # does not load the FlashInfer plugin that registers ``--full``.
-    monkeypatch.setenv("PYTEST_ADDOPTS", "--full")
-
-
 def _pytest(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
-    env.pop("PYTEST_ADDOPTS", None)
     return subprocess.run(
         [
             sys.executable,
