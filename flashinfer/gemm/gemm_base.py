@@ -3086,7 +3086,7 @@ def tgv_gemm_sm100(
         - torch.float8_e5m2
 
     Note:
-        - Requires SM100 or SM103 architecture.
+        - Requires SM100, SM103 or SM107 architecture.
         - Dense inputs must have the same dtype and do not use scale factors.
         - Tensor b is expected to be in column-major layout (transposed from typical PyTorch row-major).
         - Block-scaled inputs require ``M <= 8`` and flattened 128x4 scale-factor layouts.
