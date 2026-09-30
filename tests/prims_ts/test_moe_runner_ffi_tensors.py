@@ -27,6 +27,7 @@ from flashinfer.prims_ts.moe.tensor_adapter import _get_expert_scale_ones
 from flashinfer.prims_ts.moe.runner import (
     PrimsTsBf16MoERunner,
     PrimsTsMxfp4Mxfp8MoERunner,
+    _decode_routing_outputs,
     _moe_topk_ids_init_for_routing,
     _pad_mxfp8_linear_scale_for_prims,
     _routed_token_capacity,
@@ -331,3 +332,61 @@ def test_select_expert_weights_ignores_1d_autotune_placeholder():
         {"routing_input_mode": RoutingInputMode.PackedPrecomputed},
     )
     assert picked is routed
+
+
+@pytest.mark.parametrize("mode", tuple(RoutingInputMode))
+@pytest.mark.parametrize("ffi_outputs", (False, True))
+def test_decode_routing_outputs_honors_explicit_mode(mode, ffi_outputs):
+    """DA decoding must not infer unpacked routing from autotune placeholders."""
+    caller_weights = torch.full((4, 2), 3.0, dtype=torch.bfloat16)
+    inputs = _routing_inputs(
+        ids=torch.zeros(4, 2, dtype=torch.int32), weights=caller_weights
+    )
+    routed_weights = torch.ones_like(caller_weights)
+    workspace = torch.arange(4, dtype=torch.int32)
+    routing_out = [routed_weights, workspace, None]
+    if ffi_outputs:
+        routing_out = [
+            tvm_ffi.from_dlpack(t) if t is not None else None for t in routing_out
+        ]
+    expected_weights = (
+        caller_weights
+        if mode == RoutingInputMode.UnpackedPrecomputed
+        else routed_weights
+    )
+
+    for _ in range(2):
+        weights, decoded_workspace, optional = _decode_routing_outputs(
+            inputs, routing_out, {"routing_input_mode": mode}
+        )
+        assert weights.data_ptr() == expected_weights.data_ptr()
+        torch.testing.assert_close(weights, expected_weights)
+        if mode == RoutingInputMode.UnpackedPrecomputed:
+            assert weights is caller_weights
+        assert decoded_workspace.data_ptr() == workspace.data_ptr()
+        assert optional is None
+        expected_weights.add_(1)
+
+
+@pytest.mark.parametrize(
+    "ids_shape,weights_shape,use_caller_weights",
+    [
+        (None, None, False),
+        ((0,), (0,), False),
+        ((4, 2), (0,), False),
+        ((4, 2), (4,), False),
+        ((4, 2), (4, 2), True),
+    ],
+)
+def test_decode_routing_outputs_without_explicit_mode(
+    ids_shape, weights_shape, use_caller_weights
+):
+    """BF16/direct callers retain tensor-rank inference without a mode kwarg."""
+    ids = None if ids_shape is None else torch.zeros(ids_shape, dtype=torch.int32)
+    caller_weights = None if weights_shape is None else torch.ones(weights_shape)
+    inputs = _routing_inputs(ids=ids, weights=caller_weights)
+    routed_weights = torch.full((4, 2), 2.0)
+
+    (weights,) = _decode_routing_outputs(inputs, [routed_weights])
+
+    assert weights is (caller_weights if use_caller_weights else routed_weights)

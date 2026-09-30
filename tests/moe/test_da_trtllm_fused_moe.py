@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
-import ctypes
 import json
 from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
 import torch
+from cuda.bindings import runtime as cudart
 
 from benchmarks.bench_moe_da import (
     _canonical_inputs,
@@ -51,10 +51,6 @@ from tests.moe.da_acceptance_utils import (
     require_sm100,
     run_matched_public_graphs,
 )
-
-
-_CUDA_SUCCESS = 0
-_CUDA_GRAPH_NODE_TYPE_KERNEL = 0
 
 
 # Shared-plan capture ownership
@@ -132,36 +128,28 @@ def _assert_routing_metadata_slots_bit_exact(actual, expected) -> None:
 def _capture_kernel_node_count(invoke) -> int:
     """Capture one invocation and count kernel nodes without timing it."""
     graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with torch.cuda.graph(graph):
-        invoke()
+    try:
+        with torch.cuda.graph(graph):
+            invoke()
 
-    raw_graph = getattr(graph, "raw_cuda_graph", None)
-    if raw_graph is None:
-        pytest.skip("This PyTorch build does not expose raw CUDA Graph handles")
-    graph_handle = ctypes.c_void_p(int(raw_graph()))
-    cudart = ctypes.CDLL("libcudart.so")
-    get_nodes = cudart.cudaGraphGetNodes
-    get_nodes.argtypes = (
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(ctypes.c_size_t),
-    )
-    get_nodes.restype = ctypes.c_int
-    get_node_type = cudart.cudaGraphNodeGetType
-    get_node_type.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int))
-    get_node_type.restype = ctypes.c_int
-
-    node_count = ctypes.c_size_t()
-    assert get_nodes(graph_handle, None, ctypes.byref(node_count)) == _CUDA_SUCCESS
-    nodes = (ctypes.c_void_p * node_count.value)()
-    assert get_nodes(graph_handle, nodes, ctypes.byref(node_count)) == _CUDA_SUCCESS
-    kernel_count = 0
-    for node in nodes:
-        node_type = ctypes.c_int()
-        assert get_node_type(node, ctypes.byref(node_type)) == _CUDA_SUCCESS
-        kernel_count += node_type.value == _CUDA_GRAPH_NODE_TYPE_KERNEL
-    graph.reset()
-    return kernel_count
+        raw_graph = getattr(graph, "raw_cuda_graph", None)
+        if raw_graph is None:
+            pytest.skip("This PyTorch build does not expose raw CUDA Graph handles")
+        graph_handle = cudart.cudaGraph_t(int(raw_graph()))
+        status, _, node_count = cudart.cudaGraphGetNodes(graph_handle)
+        assert status == cudart.cudaError_t.cudaSuccess
+        status, nodes, _ = cudart.cudaGraphGetNodes(graph_handle, node_count)
+        assert status == cudart.cudaError_t.cudaSuccess
+        kernel_count = 0
+        for node in nodes:
+            status, node_type = cudart.cudaGraphNodeGetType(node)
+            assert status == cudart.cudaError_t.cudaSuccess
+            kernel_count += (
+                node_type == cudart.cudaGraphNodeType.cudaGraphNodeTypeKernel
+            )
+        return kernel_count
+    finally:
+        graph.reset()
 
 
 # Fused routing capacity and exactness

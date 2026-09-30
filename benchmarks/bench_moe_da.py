@@ -213,6 +213,12 @@ def _prepare_precision(
         raise ValueError(f"Unsupported MoE backend {backend!r}")
     if routing_input_mode not in ("routed", "logits"):
         raise ValueError(f"Unsupported routing input mode {routing_input_mode!r}")
+    if (
+        backend == "trtllm"
+        and name == "fp8_per_tensor"
+        and routing_input_mode == "logits"
+    ):
+        raise ValueError("TRTLLM FP8 per-tensor benchmarking requires routed inputs")
     if routing_input_mode == "logits" and name not in ("nvfp4", "fp8_per_tensor"):
         raise ValueError(
             "FromLogits benchmarking currently targets NVFP4 and FP8 per-tensor"
@@ -749,61 +755,69 @@ def _benchmark_precision(
         no_da_autotune_ms = (time.perf_counter() - no_da_autotune_start) * 1e3
         no_da_graph = _capture(prepared.invoke)
 
-    distribution_text = ",".join(distributions)
-    # Tune, prepare, and capture DA through the same public invocation contract.
-    with _temporary_environment(
-        FLASHINFER_DIST_AWARE_AUTOTUNE="1",
-        FLASHINFER_DA_DISTRIBUTIONS=distribution_text,
-    ):
-        torch.cuda.synchronize()
-        da_autotune_start = time.perf_counter()
-        with (
-            torch.cuda.nvtx.range(f"DA_AUTOTUNE_{precision}"),
-            autotune(
-                tune,
-                cache=cache,
-                tuning_buckets=buckets,
-            ),
-        ):
-            prepared.invoke()
-        torch.cuda.synchronize()
-        da_autotune_ms = (time.perf_counter() - da_autotune_start) * 1e3
-        prepared.invoke()
-        torch.cuda.synchronize()
-        da_graph = _capture(prepared.invoke)
-        leases = da_moe_acquire_graph_leases(da_graph)
-
-    # Validate capture policy and graph-lease ownership before collecting performance rows.
-    captured_diagnostic = _matching_diagnostic(precision, shape, distributions, backend)
-    captured_policy = captured_diagnostic.get("policy")
-    capture_fallback_reason = captured_diagnostic.get("capture_fallback_reason")
-    if captured_policy == "da_switch" and not leases and not capture_fallback_reason:
-        raise RuntimeError(
-            f"{precision} did not acquire its DA switch graph lease or record a "
-            "pristine capture fallback"
-        )
-    if captured_policy not in (
-        "da_switch",
-        "da_single_body",
-        "da_fallback",
-    ):
-        raise RuntimeError(
-            f"{precision} published unexpected benchmark policy {captured_policy!r}"
-        )
-    if captured_policy != "da_switch" and leases:
-        raise RuntimeError(
-            f"{precision} acquired a graph lease for non-switch policy "
-            f"{captured_policy!r}"
-        )
-    capture_policy = (
-        "noda_capture_fallback"
-        if captured_policy == "da_switch" and not leases
-        else captured_policy
-    )
-    flush_buffers = _cold_l2_buffers()
-    rows: list[dict[str, object]] = []
-    # Replay identical live routing contents through NoDA and DA, then time each on cold L2.
+    da_graph = None
+    leases = ()
     try:
+        distribution_text = ",".join(distributions)
+        # Tune, prepare, and capture DA through the same public invocation contract.
+        with _temporary_environment(
+            FLASHINFER_DIST_AWARE_AUTOTUNE="1",
+            FLASHINFER_DA_DISTRIBUTIONS=distribution_text,
+        ):
+            torch.cuda.synchronize()
+            da_autotune_start = time.perf_counter()
+            with (
+                torch.cuda.nvtx.range(f"DA_AUTOTUNE_{precision}"),
+                autotune(
+                    tune,
+                    cache=cache,
+                    tuning_buckets=buckets,
+                ),
+            ):
+                prepared.invoke()
+            torch.cuda.synchronize()
+            da_autotune_ms = (time.perf_counter() - da_autotune_start) * 1e3
+            prepared.invoke()
+            torch.cuda.synchronize()
+            da_graph = _capture(prepared.invoke)
+            leases = da_moe_acquire_graph_leases(da_graph)
+
+        # Validate capture policy and graph-lease ownership before collecting performance rows.
+        captured_diagnostic = _matching_diagnostic(
+            precision, shape, distributions, backend
+        )
+        captured_policy = captured_diagnostic.get("policy")
+        capture_fallback_reason = captured_diagnostic.get("capture_fallback_reason")
+        if (
+            captured_policy == "da_switch"
+            and not leases
+            and not capture_fallback_reason
+        ):
+            raise RuntimeError(
+                f"{precision} did not acquire its DA switch graph lease or record a "
+                "pristine capture fallback"
+            )
+        if captured_policy not in (
+            "da_switch",
+            "da_single_body",
+            "da_fallback",
+        ):
+            raise RuntimeError(
+                f"{precision} published unexpected benchmark policy {captured_policy!r}"
+            )
+        if captured_policy != "da_switch" and leases:
+            raise RuntimeError(
+                f"{precision} acquired a graph lease for non-switch policy "
+                f"{captured_policy!r}"
+            )
+        capture_policy = (
+            "noda_capture_fallback"
+            if captured_policy == "da_switch" and not leases
+            else captured_policy
+        )
+        flush_buffers = _cold_l2_buffers()
+        rows: list[dict[str, object]] = []
+        # Replay identical live routing contents through NoDA and DA, then time each on cold L2.
         for distribution in distributions:
             ids, weights = _realization(factory, shape, distribution)
             prepared.stage(ids, weights)
@@ -874,7 +888,8 @@ def _benchmark_precision(
     finally:
         torch.cuda.synchronize()
         no_da_graph.reset()
-        da_graph.reset()
+        if da_graph is not None:
+            da_graph.reset()
         for lease in leases:
             lease.release()
         da_moe_release_resources()
