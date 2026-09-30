@@ -475,9 +475,6 @@ def test_adaptive_localization_executes_autotuner_selected_runner(monkeypatch):
     monkeypatch.setattr(
         fused_moe_module, "_require_cute_dsl_arch_for", lambda *args, **kwargs: None
     )
-    monkeypatch.setattr(
-        fused_moe_module, "localized_moe_trace", lambda *args, **kwargs: None
-    )
 
     tensor = torch.empty((1, 1), dtype=torch.uint8)
     selected_runner = fused_moe_module.cute_dsl_fused_moe_nvfp4(

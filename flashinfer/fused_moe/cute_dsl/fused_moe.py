@@ -72,7 +72,6 @@ from ...tllm_enums import (
 )
 from ...autotuner import AutoTuner
 from ...cute_dsl.utils import convert_sf_to_mma_layout
-from .localized_moe_debug import localized_moe_trace
 from ...cute_dsl.utils import require_cute_dsl_arch as _require_cute_dsl_arch_for
 from ...quantization.kernels.nvfp4_quantize import (
     SF_LAYOUT_128x4,
@@ -643,17 +642,6 @@ def _moe_core_impl(
                 moe_output_memset_inplace(moe_output)
                 localized_memset_done.record(localized_memset_stream)
 
-        localized_moe_trace(
-            "core",
-            f"_moe_core_impl locality-domain branch: dies={len(localized_weights)} "
-            f"sm_count={sm_count} streams={len(localized_streams)} | "
-            f"per-die w1={tuple(localized_weights[0]['w1_weight'].shape)} "
-            f"w2={tuple(localized_weights[0]['w2_weight'].shape)} | "
-            f"shared gemm1_out={tuple(gemm1_out.shape)} "
-            f"gemm1_out_scale={tuple(gemm1_out_scale.shape)} "
-            f"intermediate_size={localized_intermediate_size} permuted_m={permuted_m} | "
-            f"async_memset={use_async_memset} fused_finalize={use_fused_finalize}",
-        )
         execute_in_green_contexts(localized_streams, _fc1_die)
         if localized_memset_done is not None:
             localization_main_stream.wait_event(localized_memset_done)
@@ -1736,17 +1724,6 @@ def cute_dsl_fused_moe(
         inputs,
         aux_stream=aux_stream,
     )
-    if localized_weights is not None:
-        selected_path = (
-            "localized"
-            if getattr(best_runner, "localized_weights", None) is not None
-            else "full"
-        )
-        localized_moe_trace(
-            f"policy-{num_tokens}",
-            f"adaptive policy tokens={num_tokens} selected={selected_path} "
-            f"tactic={best_tactic}",
-        )
     call_kwargs = {"aux_stream": aux_stream}
     if quant_mode != "w4a16":
         call_kwargs["use_async_memset"] = not tuner.is_tuning_mode
