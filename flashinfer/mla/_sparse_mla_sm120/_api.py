@@ -310,6 +310,7 @@ def supported_sparse_mla_sm120_configs(
                 head_counts=frozenset(facts["heads"]),
                 topk_is_runtime=False,
                 extra_page_block_sizes=frozenset(facts["extra_page_sizes"]),
+                page_block_size_is_runtime=True,
             )
         }
 
