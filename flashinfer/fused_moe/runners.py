@@ -6839,6 +6839,17 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 raise ValueError(
                     f"{type(self).__name__} requires top_k=1 for Llama4 routing."
                 )
+            # Mirror the inner support check so MoELayer filters the runner
+            # instead of failing in pack_inputs.
+            method = self.config.routing.method
+            if method is RoutingMethodType.Sigmoid or (
+                method is RoutingMethodType.DeepSeekV3 and not activation.is_gated
+            ):
+                raise NotImplementedError(
+                    f"{type(self).__name__} does not support {method.name} routing "
+                    f"with {type(activation).__name__} for "
+                    "FP8PerTensor×FP8PerTensor."
+                )
         if pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
             # OA tensors are stripped before the inner support check, which
             # only rejects them when they are still present. Reject here so a
@@ -7063,6 +7074,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         self, act: MoEActivationPack, weights: MoEWeightPack
     ) -> List[torch.Tensor]:
         self._require_built()
+        from flashinfer.tllm_enums import RoutingMethodType
         from flashinfer.prims_ts.moe.support import (
             is_prims_ts_bf16_supported,
             is_prims_ts_fp8_block_scale_supported,
@@ -7073,13 +7085,25 @@ class PrimsTsRunner(_TrtllmRunnerBase):
         )
         from .core import MoeRunnerInputs
 
+        routing = self.config.routing
+        pair = self._pair
+        # The Llama4 routing-scales-on-input kernel reads the logits, so the
+        # precomputed modes have nothing to feed it.
+        if (
+            pair == (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor)
+            and routing.method is RoutingMethodType.Llama4
+            and act.routing_input_mode is not RoutingInputMode.FromLogits
+        ):
+            raise NotImplementedError(
+                f"{type(self).__name__} supports Llama4 routing only with "
+                f"routing_input_mode=FromLogits, got {act.routing_input_mode!r}."
+            )
+
         v = weights.get_view(self.backend_key)
         _validate_prepared_activation_params(
             v, self.config.activation, type(self).__name__
         )
-        routing = self.config.routing
         num_tokens = act.hidden_states_q.shape[0]
-        pair = self._pair
         is_nvfp4 = pair == (QuantFormat.NVFP4, QuantFormat.NVFP4)
         is_fp4 = pair[0] in (QuantFormat.NVFP4, QuantFormat.MXFP4)
         is_fp8_block = pair in (

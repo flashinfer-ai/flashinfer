@@ -255,6 +255,53 @@ class TestPrimsTsUnifiedValidation:
         with pytest.raises(NotImplementedError, match="Sigmoid"):
             runner.check_support()
 
+    @pytest.mark.parametrize(
+        "method,activation",
+        [
+            (RoutingMethodType.Sigmoid, SwiGLU()),
+            (RoutingMethodType.DeepSeekV3, ReLU2()),
+        ],
+        ids=["sigmoid", "deepseekv3-relu2"],
+    )
+    def test_fp8_per_tensor_rejects_inner_routing_limits(self, method, activation):
+        runner = self._runner(
+            _config(
+                variant=QuantConfig(
+                    weight=QuantFormat.FP8PerTensor,
+                    activation=QuantFormat.FP8PerTensor,
+                ),
+                routing=RoutingConfig(num_experts=32, top_k=2, method=method),
+                activation=activation,
+            )
+        )
+        with pytest.raises(NotImplementedError, match=method.name):
+            runner.check_support()
+
+    def test_fp8_per_tensor_llama4_requires_from_logits(self):
+        runner = self._runner(
+            _config(
+                variant=QuantConfig(
+                    weight=QuantFormat.FP8PerTensor,
+                    activation=QuantFormat.FP8PerTensor,
+                ),
+                routing=RoutingConfig(
+                    num_experts=32, top_k=1, method=RoutingMethodType.Llama4
+                ),
+            )
+        )
+        runner._built = True
+        runner._pair = runner.config.quant.pair
+        hidden = torch.zeros(4, 8, dtype=torch.float8_e4m3fn)
+        act = MoEActivationPack(
+            hidden,
+            None,
+            torch.zeros(4, 1, dtype=torch.int32),
+            torch.ones(4, 1, dtype=torch.float32),
+            routing_input_mode=RoutingInputMode.PackedPrecomputed,
+        )
+        with pytest.raises(NotImplementedError, match="FromLogits"):
+            runner.pack_inputs(act, weights=None)
+
     def test_deepseek_rejects_nondefault_swiglu(self):
         runner = self._runner(
             _config(
