@@ -41,9 +41,15 @@ def test_default_tactic_rules():
     # Single-wave deep-K rows run three mainloop stages.
     t = cb.default_tactic(8, 18432, 7168, 148)
     assert t["alpha_n"] and t["deep_k"] and t["num_stages"] == 3
-    # Wide-N low-M rows stay unsplit (unlike the cute-dsl rule at K >= 16384).
+    # Deep-K rows whose weight tiles fill at most half the SMs split K in two; the
+    # 8 / 16-token tiles of the deeper rows stay unsplit, as do the wide-N rows.
     t = cb.default_tactic(17, 7168, 16384, 152)
-    assert t["alpha_n"] and t["tile_n"] == 32 and "split_k" not in t
+    assert t["alpha_n"] and t["tile_n"] == 32 and t["split_k"] == 2
+    assert t["a_hint"] == "evict_first" and not t["deep_k"]
+    assert cb.default_tactic(1, 7168, 16384, 148)["split_k"] == 2
+    assert cb.default_tactic(32, 7168, 18432, 148)["split_k"] == 2
+    assert "split_k" not in cb.default_tactic(8, 7168, 18432, 148)
+    assert "split_k" not in cb.default_tactic(32, 18432, 7168, 148)
     # More weight tiles than SMs: shallow K; two CTAs per SM on the 8-token tile or on
     # the 152-SM part, one CTA per SM for the 32-token tile on 148 SMs.
     t = cb.default_tactic(8, 28672, 8192, 148)
@@ -104,8 +110,24 @@ def test_default_tactic_rules():
     # and only past one 8-tile group of token tiles.
     assert cb.default_tactic(8192, 8192, 28672, 148)["raster_group"] == 8
     assert cb.default_tactic(8192, 8192, 8192, 152)["raster_group"] == 16
-    assert cb.default_tactic(2048, 8192, 8192, 148)["raster_group"] == 8
     assert cb.default_tactic(8192, 1536, 7168, 148)["raster_group"] == 8
+    # Multi-wave rows re-pick the 2-CTA width from the measured wave model: 3.4 waves of
+    # 256-wide tiles become 5 cheaper waves of 192-wide tiles (43 weight tiles: no group);
+    # 3.03 waves on 148 SMs likewise, while 152 SMs fit the same grid in 3 full waves.
+    for sms in (148, 152):
+        t = cb.default_tactic(2048, 8192, 8192, sms)
+        assert t["two_cta"] and t["tile_n"] == 192 and "raster_group" not in t
+        assert cb.default_tactic(8192, 8192, 8192, sms)["tile_n"] == 256
+    assert cb.default_tactic(2048, 7168, 16384, 148)["tile_n"] == 192
+    assert cb.default_tactic(2048, 7168, 16384, 152)["tile_n"] == 256
+    assert cb.default_tactic(257, 28672, 8192, 148)["tile_n"] == 192
+    assert cb.default_tactic(257, 28672, 8192, 152)["tile_n"] == 256
+    # A grid that fits one wave runs ungrouped (every tile is resident at once).
+    for sms in (148, 152):
+        t = cb.default_tactic(2048, 1536, 7168, sms)
+        assert t["two_cta"] and t["tile_n"] == 192 and "raster_group" not in t
+        assert "raster_group" not in cb.default_tactic(512, 8192, 8192, sms)
+        assert cb.default_tactic(2048, 8192, 28672, sms)["tile_n"] == 192
     t = cb.default_tactic(2048, 18432, 7168, 148)
     assert t["two_cta"] and "raster_group" not in t and "sched" not in t
     t = cb.default_tactic(8192, 18432, 7168, 148)
