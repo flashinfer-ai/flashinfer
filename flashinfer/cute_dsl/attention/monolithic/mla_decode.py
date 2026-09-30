@@ -28,13 +28,14 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
 
-from flashinfer.utils import device_support_pdl
+from flashinfer.utils import device_support_pdl, get_compute_capability
 
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
 from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout, LOG2_E
 from flashinfer.cute_dsl.utils import (
     _as_cute_dsl_workspace_i8,
+    cute_dsl_compile_arch,
     get_max_active_clusters,
     get_num_sm,
     torch_to_cutlass_dtype,
@@ -209,6 +210,7 @@ def _check_can_implement(
 
 @functools.cache
 def _get_compiled_mla_kernel(
+    arch: str,
     torch_dtype: torch.dtype,
     torch_out_dtype: torch.dtype,
     page_size: int,
@@ -274,6 +276,7 @@ def _get_compiled_mla_kernel(
         reducer_max_splits=reducer_max_splits,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        arch=arch,
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -443,7 +446,7 @@ def _get_compiled_mla_kernel(
         Float32(1.0),  # output_scale placeholder
         Float32(1.0),  # lse_scale placeholder
         stream_fake,
-        options="--enable-tvm-ffi --opt-level 2",
+        options=f"--enable-tvm-ffi --opt-level 2 --gpu-arch {arch}",
     )
 
     return compiled_kernel
@@ -831,6 +834,7 @@ def cute_dsl_mla_decode(
     # Note: when is_workspace_size_zero is True, workspace_bytes is None and it will launch one kernel without workspace.
     # Otherwise, workspace_bytes is not None and it will launch two kernels.
     compiled_kernel = _get_compiled_mla_kernel(
+        arch=cute_dsl_compile_arch(*get_compute_capability(query.device)),
         torch_dtype=q_dtype,
         torch_out_dtype=o_dtype,
         page_size=page_size,
