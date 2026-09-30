@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Cold-L2 CUPTI benchmark for the prepared Cake SM100/SM103 BGMV MoE backend."""
+"""Cold-L2 CUPTI benchmark for the prepared Cake SM90/SM100/SM103 BGMV MoE backend."""
 
 import argparse
 import json
@@ -192,11 +192,12 @@ def main():
     parser.add_argument("--repeat-time-ms", type=int, default=1000)
     args = parser.parse_args()
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (9, 0),
         (10, 0),
         (10, 3),
     ):
         raise RuntimeError(
-            "this benchmark requires an exact SM100 or SM103 CUDA device"
+            "this benchmark requires an exact SM90, SM100 or SM103 CUDA device"
         )
 
     rows = [

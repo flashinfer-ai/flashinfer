@@ -21,11 +21,18 @@ from pathlib import Path
 from typing import Literal, NamedTuple, Optional, Sequence, Tuple
 
 from . import env as jit_env
-from .core import JitSpec, gen_jit_spec, logger, sm100a_nvcc_flags, sm103a_nvcc_flags
+from .core import (
+    JitSpec,
+    gen_jit_spec,
+    logger,
+    sm90a_nvcc_flags,
+    sm100a_nvcc_flags,
+    sm103a_nvcc_flags,
+)
 from .utils import write_if_different
 
 CakeBGMVMoEDType = Literal["bfloat16", "float16"]
-CakeBGMVMoEArch = Literal["sm100a", "sm103a"]
+CakeBGMVMoEArch = Literal["sm90a", "sm100a", "sm103a"]
 CakeBGMVMoESchedule = Literal[
     "token_owned_t64",
     "token_owned",
@@ -51,9 +58,11 @@ class CakeBGMVMoEArchTarget(NamedTuple):
 
 
 # The generated programs use cp.async, warp shuffles and FMA only, so one
-# source body serves both Blackwell data-center targets; each target gets its
-# own cubin and module so the binding can fail closed on a mismatched device.
+# source body serves Hopper and both Blackwell data-center targets; each
+# target gets its own cubin and module so the binding can fail closed on a
+# mismatched device.
 CAKE_BGMV_MOE_ARCH_TARGETS: dict[CakeBGMVMoEArch, CakeBGMVMoEArchTarget] = {
+    "sm90a": CakeBGMVMoEArchTarget("sm90a", (9, 0), tuple(sm90a_nvcc_flags)),
     "sm100a": CakeBGMVMoEArchTarget("sm100a", (10, 0), tuple(sm100a_nvcc_flags)),
     "sm103a": CakeBGMVMoEArchTarget("sm103a", (10, 3), tuple(sm103a_nvcc_flags)),
 }
@@ -136,7 +145,7 @@ def select_cake_bgmv_moe_schedule(
     """Return the measured selector for the supported rank-32 portfolio.
 
     The table was measured on B200 (SM100, 148 SMs) and re-validated on GB300
-    (SM103); both targets currently share one selector.
+    (SM103) and H100 (SM90) with the same winners; all targets share it.
     """
 
     _check_hidden_size(hidden_size)

@@ -98,8 +98,8 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
-// Each module is compiled for exactly one Blackwell target (sm_100a for
-// B200/GB200, sm_103a for B300/GB300). The device must match that target;
+// Each module is compiled for exactly one target (sm_90a for H100/H200,
+// sm_100a for B200/GB200, sm_103a for B300/GB300). The device must match it;
 // anything else fails closed instead of silently running another cubin.
 inline void CheckCompiledArch(int32_t device_id) {
   int major = 0;

@@ -807,6 +807,7 @@ def gen_all_modules(
         if has_bgmv_moe:
             jit_specs.append(gen_bgmv_moe_module())
         for cake_bgmv_arch, cake_bgmv_flag in (
+            ("sm90a", "sm90a_exact"),
             ("sm100a", "sm100a_exact"),
             ("sm103a", "sm103a_exact"),
         ):

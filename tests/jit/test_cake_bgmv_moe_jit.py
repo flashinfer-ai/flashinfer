@@ -63,9 +63,10 @@ def test_selector_rejects_unsupported_shapes():
 @pytest.mark.parametrize(
     ("capability", "expected"),
     [
+        ((9, 0), "sm90a"),
         ((10, 0), "sm100a"),
         ((10, 3), "sm103a"),
-        ((9, 0), None),
+        ((8, 0), None),
         ((10, 1), None),
         ((12, 0), None),
         ((12, 1), None),
@@ -78,6 +79,7 @@ def test_arch_for_capability(capability, expected):
 @pytest.mark.parametrize(
     ("arch", "cuda_arch", "gencode", "cc"),
     [
+        ("sm90a", (9, "0a"), "-gencode=arch=compute_90a,code=sm_90a", (9, 0)),
         ("sm100a", (10, "0a"), "-gencode=arch=compute_100a,code=sm_100a", (10, 0)),
         ("sm103a", (10, "3a"), "-gencode=arch=compute_103a,code=sm_103a", (10, 3)),
     ],
