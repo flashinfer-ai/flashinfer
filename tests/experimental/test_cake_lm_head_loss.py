@@ -434,6 +434,26 @@ def test_workspace_layout_and_memory_rule():
     assert lm_head_loss_workspace_size(16231, V, C, entry="logprob", backend="reference") == workspace_layout(16231, V, C, entry="logprob")["total"]
 
 
+def test_grid_dims_holds_no_reference_to_the_host_values():
+    """The grid evaluator must not capture the stage's host values: scale_cast binds a fresh launch per call, and a
+    recursive closure over ``scalars`` formed a reference cycle that kept every call's accumulator and output alive
+    until the cyclic GC (about 5.4 GiB per training step at the GLM geometry -- OOM within one benchmark campaign)."""
+    import gc
+    import weakref
+
+    gc.collect()
+    gc.disable()
+    try:
+        acc = torch.zeros(8)  # rides along in the host values like scale_cast's accumulator
+        ref = weakref.ref(acc)
+        scalars = {"rows_c": 4097, "m_tiles": 33, "num_vecs": 9, "acc": acc, "out": None}
+        assert grid_dims(["max(1, min(m_tiles//4*24, resident))*4", "rows_c/8", "num_vecs"], scalars, 148, resident=30) == (120, 513, 9)
+        del scalars, acc
+        assert ref() is None, "grid_dims left a reference cycle over the host values (freed only by the cyclic GC)"
+    finally:
+        gc.enable()
+
+
 def test_grid_dims():
     scalars = {"m_tiles": 32, "rows_c": 4097, "V": DEFAULT_V, "num_vecs": 24}
     assert grid_dims(["max(1, min(m_tiles//2*605, sms//2))*2", "rows_c/8", 1], scalars, 148) == (148, 513, 1)

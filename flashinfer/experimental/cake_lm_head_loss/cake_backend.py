@@ -953,59 +953,62 @@ def grid_dims(rule, scalars: dict[str, Any], num_sms: int, resident: Optional[in
     ``"max(1, m_tiles//2*605)*2"`` (the whole work-item domain of a dynamically
     scheduled kernel).
     """
-    names = {"sms": int(num_sms)}
-    if resident is not None:
-        names["resident"] = int(resident)
-
-    def evaluate(node) -> int:
-        if isinstance(node, ast.Expression):
-            return evaluate(node.body)
-        if isinstance(node, ast.Constant):
-            if isinstance(node.value, bool) or not isinstance(node.value, int):
-                raise ValueError(f"grid rule constants must be integers, got {node.value!r}")
-            return int(node.value)
-        if isinstance(node, ast.Name):
-            if node.id in names:
-                return names[node.id]
-            if node.id not in scalars or scalars[node.id] is None or isinstance(scalars[node.id], torch.Tensor):
-                raise KeyError(f"grid rule names the unknown scalar {node.id!r}")
-            return int(scalars[node.id])
-        if isinstance(node, ast.BinOp):
-            left, right = evaluate(node.left), evaluate(node.right)
-            if isinstance(node.op, ast.Add):
-                return left + right
-            if isinstance(node.op, ast.Sub):
-                return left - right
-            if isinstance(node.op, ast.Mult):
-                return left * right
-            if isinstance(node.op, (ast.Div, ast.FloorDiv)):
-                if right == 0:
-                    raise ValueError("grid rule divides by zero")
-                return -(-left // right) if isinstance(node.op, ast.Div) else left // right
-            raise ValueError(f"grid rule operator {type(node.op).__name__} is not allowed")
-        if isinstance(node, ast.Call):
-            if not isinstance(node.func, ast.Name) or node.func.id not in _GRID_FUNCTIONS or node.keywords:
-                raise ValueError("grid rule calls must be min(...) or max(...)")
-            if len(node.args) < 2:
-                raise ValueError("grid rule min()/max() take at least two terms")
-            return _GRID_FUNCTIONS[node.func.id](evaluate(arg) for arg in node.args)
-        raise ValueError(f"grid rule syntax {type(node).__name__} is not allowed")
-
-    def term(value) -> int:
-        if isinstance(value, bool):
-            raise ValueError("grid rule entries must be integers or expressions")
-        if isinstance(value, int):
-            return int(value)
-        try:
-            tree = ast.parse(str(value).strip(), mode="eval")
-        except SyntaxError as exc:
-            raise ValueError(f"grid rule entry {value!r} is not an expression") from exc
-        return evaluate(tree)
-
     if len(rule) != 3:
         raise ValueError("grid rule must have three entries")
-    x, y, z = (term(v) for v in rule)
+    # Only the integer host values take part; tensors and None never enter the evaluation environment, and the
+    # evaluator is a plain module-level function -- a nested recursive closure would form a reference cycle that
+    # keeps every captured host value (the accumulators / outputs of a scale_cast call) alive until the cyclic GC.
+    names = {key: int(value) for key, value in scalars.items() if isinstance(value, int) and not isinstance(value, bool)}
+    names["sms"] = int(num_sms)
+    if resident is not None:
+        names["resident"] = int(resident)
+    x, y, z = (_grid_term(value, names) for value in rule)
     return max(1, x), max(1, y), max(1, z)
+
+
+def _grid_term(value, names: dict[str, int]) -> int:
+    if isinstance(value, bool):
+        raise ValueError("grid rule entries must be integers or expressions")
+    if isinstance(value, int):
+        return int(value)
+    try:
+        tree = ast.parse(str(value).strip(), mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"grid rule entry {value!r} is not an expression") from exc
+    return _grid_eval(tree, names)
+
+
+def _grid_eval(node, names: dict[str, int]) -> int:
+    if isinstance(node, ast.Expression):
+        return _grid_eval(node.body, names)
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, bool) or not isinstance(node.value, int):
+            raise ValueError(f"grid rule constants must be integers, got {node.value!r}")
+        return int(node.value)
+    if isinstance(node, ast.Name):
+        if node.id not in names:
+            raise KeyError(f"grid rule names the unknown scalar {node.id!r}")
+        return names[node.id]
+    if isinstance(node, ast.BinOp):
+        left, right = _grid_eval(node.left, names), _grid_eval(node.right, names)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, (ast.Div, ast.FloorDiv)):
+            if right == 0:
+                raise ValueError("grid rule divides by zero")
+            return -(-left // right) if isinstance(node.op, ast.Div) else left // right
+        raise ValueError(f"grid rule operator {type(node.op).__name__} is not allowed")
+    if isinstance(node, ast.Call):
+        if not isinstance(node.func, ast.Name) or node.func.id not in _GRID_FUNCTIONS or node.keywords:
+            raise ValueError("grid rule calls must be min(...) or max(...)")
+        if len(node.args) < 2:
+            raise ValueError("grid rule min()/max() take at least two terms")
+        return _GRID_FUNCTIONS[node.func.id](_grid_eval(arg, names) for arg in node.args)
+    raise ValueError(f"grid rule syntax {type(node).__name__} is not allowed")
 
 
 @dataclass(frozen=True)
