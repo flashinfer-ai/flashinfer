@@ -49,12 +49,22 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 #   never on the stream-K / tail / multicast / ``pos`` tiles
 #   (``cake_backend.pdl_early_selected``); same kernel parameters, same
 #   numerics;
-# * ``attention:tiles2`` / ``attention:tiles1`` / ``attention:ring3``   the
-#   packed-varlen BF16 attention kernel in its two-tile and SPLIT_KV unit
-#   layouts (the host plan rule ``select_tiles_per_cta`` chooses per
-#   ``grid_thws`` batch); ``ring3`` is the SPLIT_KV form with the shared-O
-#   three-deep score ring, selected per architecture and longest segment
-#   (``cake_backend.ring3_selected``);
+# * ``gemm:<variant>:<tile>`` with a ``*_h`` tile (round 6): the half-N tail
+#   twin of a plain persistent tile, routed where the tile census leaves a
+#   tail that fits one half-round (``cake_backend.half_tail_split``); its
+#   ``:pdle`` form exists like the base tile's;
+# * ``attention:<layout>[:wide][:split]``   the packed-varlen BF16 attention
+#   kernel: ``<layout>`` = ``tiles2`` / ``tiles1`` / ``ring3`` (two-tile and
+#   SPLIT_KV unit layouts, the host plan rule chooses per ``grid_thws`` batch;
+#   ``ring3`` is the SPLIT_KV form with the shared-O three-deep score ring,
+#   selected per architecture and longest segment,
+#   ``cake_backend.ring3_selected``); ``:wide`` (round 6) = the build reading
+#   the four-word unit table with the next-unit prefetch, selected on short
+#   rows (``cake_backend.unit_prefetch_selected``); ``:split`` (round 6) = the
+#   partial-output build of the rows whose tail-round units the plan splits
+#   into K/V ranges (``cake_backend.select_layout_and_split``), followed by
+# * ``attention_merge``           the exact fixed-order merge of those split
+#   units (one launch after every attention launch of a split row);
 # * ``merge``                     final RMSNorm + 2x2 spatial / temporal-mean merge;
 # * ``rmsnorm_apply``             the post-projector RMSNorm apply pass.
 #
@@ -4052,18 +4062,58 @@ def gemm_kernel_key(variant: str, tile: str, pdl_early: bool = False) -> str:
     return f"{key}:{PDL_EARLY_KEY_SUFFIX}" if pdl_early else key
 
 
-def attention_kernel_key(tiles_per_cta: int, ring3: bool = False) -> str:
-    """``attention:tiles<n>`` for the plain layouts; ``attention:ring3`` for the production
-    SPLIT_KV form with the shared-O score ring (selected per arch / longest segment by the plan)."""
+ATTENTION_WIDE_KEY_SUFFIX = (
+    "wide"  # UNIT_PREFETCH build (wide unit table, next-unit prefetch)
+)
+ATTENTION_SPLIT_KEY_SUFFIX = (
+    "split"  # KV_PARTIAL build (partial O / (m, l) workspace, merge launch)
+)
+
+
+def attention_kernel_key(
+    tiles_per_cta: int, ring3: bool = False, *, wide: bool = False, split: bool = False
+) -> str:
+    """``attention:<layout>[:wide][:split]`` (mirrors the Cake export adapter's ``attention_kernel_key``):
+    ``tiles<n>`` for the plain layouts, ``ring3`` for the production SPLIT_KV form with the shared-O score
+    ring (selected per arch / longest segment by the plan), ``:wide`` for the prefetching wide-table build
+    of the short rows, ``:split`` for the partial-output build of the rows with split units."""
     if ring3:
         if int(tiles_per_cta) != 1:
             raise ValueError(
                 "the ring3 attention form is the SPLIT_KV (one-tile) layout"
             )
-        return "attention:ring3"
-    return f"attention:tiles{int(tiles_per_cta)}"
+        key = "attention:ring3"
+    else:
+        key = f"attention:tiles{int(tiles_per_cta)}"
+    if wide:
+        key += f":{ATTENTION_WIDE_KEY_SUFFIX}"
+    if split:
+        key += f":{ATTENTION_SPLIT_KEY_SUFFIX}"
+    return key
 
 
+def parse_attention_kernel_key(key: str) -> dict[str, Any]:
+    """``dict(tiles_per_cta, ring3, wide, split)`` of an ``attention:`` key."""
+    parts = key.split(":")
+    if (
+        parts[0] != "attention"
+        or len(parts) < 2
+        or parts[1] not in ("tiles2", "tiles1", "ring3")
+    ):
+        raise ValueError(f"not an attention kernel key: {key!r}")
+    flags = parts[2:]
+    allowed = [ATTENTION_WIDE_KEY_SUFFIX, ATTENTION_SPLIT_KEY_SUFFIX]
+    if flags != [f for f in allowed if f in flags] or len(set(flags)) != len(flags):
+        raise ValueError(f"malformed attention kernel key: {key!r}")
+    return dict(
+        tiles_per_cta=1 if parts[1] in ("tiles1", "ring3") else 2,
+        ring3=parts[1] == "ring3",
+        wide=ATTENTION_WIDE_KEY_SUFFIX in flags,
+        split=ATTENTION_SPLIT_KEY_SUFFIX in flags,
+    )
+
+
+ATTENTION_MERGE_KERNEL_KEY = "attention_merge"
 MERGE_KERNEL_KEY = "merge"
 RMSNORM_APPLY_KERNEL_KEY = "rmsnorm_apply"
 
