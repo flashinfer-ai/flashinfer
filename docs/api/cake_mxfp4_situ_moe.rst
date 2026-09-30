@@ -127,6 +127,18 @@ not on a contract row).
      - gemm2_swapab
      - cake, cake_cute
      - ``e2e_registry``
+   * - ``gemm2_swapab_partial_n8_m2``
+     - gemm2_swapab_partial
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_swapab_partial_n16_m2``
+     - gemm2_swapab_partial
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_swapab_partial_n32_m2``
+     - gemm2_swapab_partial
+     - cake, cake_cute
+     - ``e2e_registry``
    * - ``gemm1_swapab_situ_n32``
      - gemm1_swapab
      - cake, cake_cute
@@ -151,7 +163,31 @@ not on a contract row).
      - gemm2_dense
      - cake, cake_cute
      - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_c12``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n192_c12``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
    * - ``gemm1_dense_situ_m128_n256``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m128_n256_rowgroup``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m128_n128_rowgroup``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m128_n256_zero_fill``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``e2e_registry``
+   * - ``gemm1_dense_situ_m256_n256_2cta_zero_fill_secondary``
      - gemm1_dense
      - cake, cake_cute
      - ``e2e_registry``
@@ -183,11 +219,35 @@ not on a contract row).
      - dispatch_mixed
      - cake, cake_cute
      - ``e2e_registry``
-   * - ``moe_sort_init``
+   * - ``moe_sort_init_t384``
      - moe_sort_init
      - cake
      - ``e2e_registry``
-   * - ``moe_sort_coop_dual_mixed``
+   * - ``moe_sort_coop_t384_dual_mixed``
+     - moe_sort_coop
+     - cake
+     - ``e2e_registry``
+   * - ``moe_sort_init_t896``
+     - moe_sort_init
+     - cake
+     - ``e2e_registry``
+   * - ``moe_sort_coop_t896_bounded``
+     - moe_sort_coop
+     - cake
+     - ``e2e_registry``
+   * - ``moe_sort_coop_t896_bounded_dual``
+     - moe_sort_coop
+     - cake
+     - ``e2e_registry``
+   * - ``moe_sort_coop_t896_dual``
+     - moe_sort_coop
+     - cake
+     - ``e2e_registry``
+   * - ``moe_sort_coop_t896_bounded_dual_mixed``
+     - moe_sort_coop
+     - cake
+     - ``e2e_registry``
+   * - ``moe_sort_coop_t896_dual_mixed``
      - moe_sort_coop
      - cake
      - ``e2e_registry``
@@ -275,8 +335,10 @@ Manifest
 
 ``contract`` of each manifest records the operator, the backend, the Cake
 revision, the architecture, the PDL launch state, the form table (with
-``gate`` and ``backends`` per form), the served geometry and contract rows of
-the plan, the unsupported forms, and the SHA-256 of every integration file of
+``gate`` and ``backends`` per form), the served geometry, the contract rows the
+plan's decision table serves (with the hand-written path of each, which of them
+each package carries with every launch form, and the ``EXECUTABLE_PATHS`` the
+shipped chain runs; ``plan()`` refuses decision-served rows outside them), the unsupported forms, and the SHA-256 of every integration file of
 the package (plan, kernel loader, ``__init__``, tests, this page).  The kernel
 loaders authenticate every generated source against the manifest before it is
 compiled.

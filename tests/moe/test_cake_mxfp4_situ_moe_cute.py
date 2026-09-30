@@ -108,13 +108,16 @@ def test_unsupported_forms_are_declared_not_faked():
     unsupported = kernels.unsupported_forms()
     stages = {item["route"]["stage"] for item in kernels.modules()}
     assert not (set(unsupported) & stages)
+    moe_sort = {"moe_sort_init_t384", "moe_sort_coop_t384_dual_mixed", "moe_sort_init_t896",
+                "moe_sort_coop_t896_bounded"}
     if BACKEND == "cake_cute":
-        assert {"moe_sort_init", "moe_sort_coop_dual_mixed"} <= set(unsupported)
+        assert moe_sort <= set(unsupported)
         assert all("grid.sync" in reason for reason in unsupported.values())
     else:
         assert unsupported == {}
-        assert {"moe_sort_init", "moe_sort_coop_dual_mixed"} <= stages
-        assert kernels.load("moe_sort_coop_dual_mixed").cooperative
+        assert moe_sort <= stages
+        assert kernels.load("moe_sort_coop_t896_bounded").cooperative
+        assert kernels.load("moe_sort_coop_t896_bounded").block[0] == 896
 
 
 # --- decision table (hand-written plan facts) ----------------------------------------
@@ -159,14 +162,75 @@ def test_decision_table_pins_the_hand_written_plan(
 
 
 @pytest.mark.parametrize(
+    "layout, T, path, launches",
+    [
+        (
+            EP8,
+            1025,
+            "dense",
+            (
+                "route_preprocess",
+                "moe_sort_init",
+                "moe_sort_coop",
+                "gemm1_dense",
+                "gemm2_dense_finalize",
+            ),
+        ),
+        (EP8, 2048, "dense", None),
+        (EP8, 4096, "dense", None),
+        (
+            TP8,
+            17,
+            "two_stage",
+            (
+                "routing_fused",
+                "gemm1_swapab_situ",
+                "gemm2_swapab_partial",
+                "finalize_rows",
+            ),
+        ),
+        (TP8, 128, "split_two_stage", None),
+        (TP8, 1024, "split_two_stage", None),
+    ],
+)
+def test_decision_served_rows_outside_the_executable_chain(layout, T, path, launches):
+    """Rows the decision table serves with a traced form per launch but whose chain the shipped executable does
+    not run: ``decide`` reports them, the manifest lists the forms each package carries, ``plan`` refuses them."""
+    runner = _runner(layout)
+    decision = runner.decide(T)
+    assert decision.supported and decision.path == path and not decision.missing_forms
+    assert path not in plan.EXECUTABLE_PATHS
+    if launches is not None:
+        assert decision.launches == launches
+    assert all(launch.traced for launch in decision.launch_plan)
+    contract = kernels.manifest()["contract"]
+    # The plan names a launch by the module's stage (its registered IR name) or by its registry id.
+    carried_forms = set(contract["forms"])
+    carried_forms |= {
+        form["registry"] for form in contract["forms"].values() if form.get("registry")
+    }
+    lacking = sorted(
+        launch.form
+        for launch in decision.launch_plan
+        if launch.form not in carried_forms
+    )
+    prefix = f"{'ep8_r3' if layout is EP8 else 'tp8_r0'}_t{T:05d}_"
+    for label in (
+        label for label in contract["decision_served_rows"] if label.startswith(prefix)
+    ):
+        assert contract["decision_served_rows"][label] == path
+        if lacking:
+            assert contract["uncarried_rows"][BACKEND][label] == lacking
+        else:
+            assert label in contract["carried_rows"][BACKEND]
+
+
+@pytest.mark.parametrize(
     "layout, T, needle",
     [
-        (EP8, 1025, "dense grouped-GEMM"),
-        (EP8, 4096, "dense grouped-GEMM"),
-        (TP8, 17, "two-stage finalize"),
-        (TP8, 128, "split form"),
-        (TP8, 1024, "split form"),
         (TP8, 1025, "hybrid form"),
+        (TP8, 2048, "hybrid form"),
+        (TP8, 8192, "mixed192"),
     ],
 )
 def test_refused_rows_carry_the_hand_written_reason(layout, T, needle):
@@ -209,12 +273,31 @@ def test_wrapper_refuses_the_other_backend():
 
 
 def _served_decisions():
+    """The decisions of the executable chain over the sweep (``EXECUTABLE_PATHS`` rows)."""
     for layout in (EP8, TP8):
         runner = _runner(layout)
         for T in range(1, runner.swapab_max_tokens + 1):
             decision = runner.decide(T)
-            if decision.supported:
+            if decision.supported and decision.path in plan.EXECUTABLE_PATHS:
                 yield runner, decision
+
+
+def test_manifest_row_coverage_is_consistent():
+    contract = kernels.manifest()["contract"]
+    assert contract["executable_paths"] == list(plan.EXECUTABLE_PATHS) == ["plain"]
+    served = contract["decision_served_rows"]
+    carried, uncarried = (
+        contract["carried_rows"][BACKEND],
+        contract["uncarried_rows"][BACKEND],
+    )
+    assert set(carried) | set(uncarried) == set(served) and not set(carried) & set(
+        uncarried
+    )
+    assert set(contract["executable_rows"]) <= set(carried)
+    assert all(served[label] == "plain" for label in contract["executable_rows"])
+    stages = set(contract["forms"])
+    for label, forms in uncarried.items():
+        assert served[label] != "plain" and forms and not set(forms) & stages
 
 
 def test_every_plan_selection_resolves_to_a_module():

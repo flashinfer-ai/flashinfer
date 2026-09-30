@@ -28,10 +28,10 @@ The plan reproduces the hand-written CuTe DSL MXFP4 swap-AB plan of FlashInfer's
 ``fused_moe.cute_dsl.mxfp4`` module decision for decision (every ``:N`` reference below
 is a line of that module): ``swapab_max_tokens``, the tile policy, group rows, stage
 depths, weight grouping, the fused-routing cap, the PDL chain, the workspace layout and
-the launch sequence.  Rows whose hand-written selection is not built by the Cake chain
-(two-stage finalize, split, hybrid, mixed, wide-192, dense path, generic ``moe_sort``
-routing) are refused by :meth:`CakeSwapAbPolicy.decide` with the reason, never
-substituted.
+the launch sequence.  Rows whose hand-written selection has no traced Cake form (hybrid, mixed-192) are refused
+by :meth:`CakeSwapAbPolicy.decide` with the reason, never substituted; rows whose
+selection is traced but not run by the shipped executable chain (dense path, two-stage
+finalize, split) are refused by :meth:`CakeMxfp4MoEWrapper.plan` (``EXECUTABLE_PATHS``).
 
 Numerics are the hand-written ones: FP32 accumulation, the SiTU FP32 sequence, UE8M0
 round-up requantization and BF16 route-weight scaling before the reduce-add.  The
@@ -60,6 +60,10 @@ from math import prod
 from typing import Any
 
 PACKAGE_BACKEND = "cake_cute"
+# The hand-written paths the shipped executable chain (``CakeSwapAbPlan.run``: routing -> swap-AB GEMM1 -> swap-AB
+# GEMM2 finalize) runs; ``plan()`` refuses rows whose decision selects another path, although every launch of
+# such a row has a generated form in this package (see the manifest's ``carried_rows`` / ``uncarried_rows``).
+EXECUTABLE_PATHS = ("plain",)
 
 
 SWAP_ATOMIC_FINALIZE_MAX_TOKENS = 16        # mxfp4.py:63-65
@@ -324,7 +328,31 @@ MOE_SORT_EXPERT_COUNTS_MIN_TOKENS = 1024    # moe_utils.py:205-227
 MOE_SORT_EXPERT_TIERS = (128, 160, 256, 384, 512, 576, 896, 1024)   # RoutingCustomPolicy.cuh:748-770
 
 
-MOE_SORT_CAKE_TIERS = (128, 160, 256, 384, 512, 576)                # kimi_k3_mxfp4_situ_moe_sort.EXPERT_TIERS
+MOE_SORT_CAKE_TIERS = (128, 160, 256, 384, 512, 576, 896, 1024)     # kimi_k3_mxfp4_situ_moe_sort.EXPERT_TIERS
+
+
+MOE_SORT_RESERVED_SMS = 8                   # RoutingKernel.cuh:49 (numBlocksCoop = SMs - 8, getCoopLaunchSMCounts)
+
+
+MOE_SORT_GENERIC_PER_THREAD = 64            # RoutingKernel.cuh:1205-1207 MaxExpandedIdxPerThread (NumTop8Experts kernel)
+
+
+MOE_SORT_BOUNDED_PER_THREAD = 4             # ... of the NumTop16Experts kernel of the 512..1024 tiers
+
+
+MOE_SORT_HIGH_EXPERT_TIERS = (512, 1024)    # RoutingKernelTopK.cuh:326-337 isInHighExpertLaneOwnedTopKRange
+
+
+MOE_SORT_HIGH_EXPERT_TOPK = (9, 16)
+
+
+MOE_SORT_CLUSTER_MAX_TOKENS = 1024          # routing_common.cu:98 ClusterKernelPreferredMaxNumTokens (single-cluster kernel)
+
+
+MOE_SORT_CONTIGUOUS_WINDOW_MIN_TOKENS = 65536   # mUseContiguousRouteWindows (kimi_k3_mxfp4_situ_moe_sort.CONTIGUOUS_WINDOW_MIN_TOKENS)
+
+
+CONTRACT_SM_COUNT = 148                     # B300 (sm_103a): the contract's device; the K6 grid / state selection take it explicitly
 
 
 ROUTE_PREPROCESS_THREADS = 256              # mxfp4_routing.py:908 (_plan_route_preprocess default)
@@ -548,6 +576,21 @@ SWAPAB_TWO_CTA_FORMS = (192,)                                       # gemm2_swap
 GEMM2_DENSE_TRACED_N = (128, 192, 256)                              # gemm2_dense.TRACED_FORMS (cta_group 1)
 
 
+GEMM1_DENSE_FORMS = {
+    "gemm1_dense_situ_m128_n256": (128, 256, False, False, False),
+    "gemm1_dense_situ_m128_n256_rowgroup": (128, 256, False, False, True),
+    "gemm1_dense_situ_m128_n128_rowgroup": (128, 128, False, False, True),
+    "gemm1_dense_situ_m128_n256_zero_fill": (128, 256, True, False, False),
+    "gemm1_dense_situ_m256_n256_2cta_zero_fill_secondary": (256, 256, True, True, False),
+}
+
+
+GEMM2_DENSE_CLUSTER12_N = (256, 192)                                # gemm2_dense.CLUSTER12_FORMS ((128, N) / cluster (1, 2))
+
+
+SWAPAB_PARTIAL_FORMS = ((8, 4, 2), (16, 4, 2), (32, 4, 2))         # gemm2_swapab.PARTIAL_FORMS ((n_tile, kbps, m_group))
+
+
 def swapab_situ_form(n_tile: int, kbps: int, *, row_group_list: bool = False, sf_blocked: bool = False,
                      two_cta: bool = False) -> Launch:
     """GEMM1 SiTU swap-AB launch (hand-written ``swapab_gemm1_situ``, swapab_moe.py:665-835)."""
@@ -585,10 +628,19 @@ def swapab_gemm2_form(n_tile: int, kbps: int, m_group: int, *, finalize: bool, r
         hw += " two_cta"
     step = f"gemm2_swapab_{kind}"
     if not finalize:
-        return Launch(step, hw, None, GEMM2_SWAPAB_MODULE, BOTH,
-                      missing="gemm2_swapab partial epilogue (hand-written epilogue_kind='partial', swapab_gemm2("
-                              "finalize=False): alpha * acc BF16 rows stored in permuted order into partial_rows, "
-                              "st_bf16_pred, no route weight, mxfp4.py:1957-1961) not traced")
+        # The deferred epilogue (hand-written ``epilogue_kind="partial"``: alpha * acc BF16 rows stored in
+        # permuted order into ``partial_rows`` [>= R, H] BF16 (mxfp4.py:1957-1961, :2743), no route weight) is traced
+        # for the narrow cta_group-1 forms of the two-stage chain, ``build_gemm2_swapab_finalize_ir(n, 4, m_group=2,
+        # partial=True)`` -> ``gemm2_swapab_partial_n<N>_m2``.
+        if row_group_list or sf_blocked or two_cta:
+            return Launch(step, hw, None, GEMM2_SWAPAB_MODULE, BOTH,
+                          missing="gemm2_swapab partial epilogue with tile_idx_to_row_group / sf_blocked / two_cta "
+                                  "(form_config refuses partial with two_cta or the wide epilogue) not traced")
+        if (n_tile, kbps, m_group) not in SWAPAB_PARTIAL_FORMS:
+            return Launch(step, hw, None, GEMM2_SWAPAB_MODULE, BOTH,
+                          missing=f"gemm2_swapab partial epilogue form n{n_tile} kbps {kbps} m_group {m_group} not "
+                                  f"traced (traced: {SWAPAB_PARTIAL_FORMS} as (n_tile, kbps, m_group))")
+        return Launch(step, hw, f"gemm2_swapab_partial_n{n_tile}_m{m_group}", GEMM2_SWAPAB_MODULE, BOTH)
     if two_cta:
         if n_tile not in SWAPAB_TWO_CTA_FORMS or kbps != 4 or m_group != 1 or not (row_group_list and sf_blocked):
             return Launch(step, hw, None, GEMM2_SWAPAB_MODULE, BOTH,
@@ -610,10 +662,28 @@ def swapab_gemm2_form(n_tile: int, kbps: int, m_group: int, *, finalize: bool, r
                   missing=f"gemm2_swapab finalize form n{n_tile} kbps {kbps} m_group {m_group} not traced")
 
 
+def gemm1_dense_form_symbol(tile_m: int, n_tile: int, *, zero_fill: bool, zero_fill_secondary: bool,
+                            row_group_list: bool) -> str:
+    """``kimi_k3_mxfp4_situ_gemm1_dense.form_symbol``: ``gemm1_dense_situ_m<M>_n<N>[_2cta][_rowgroup][_zero_fill[_secondary]]``."""
+    sym = f"gemm1_dense_situ_m{tile_m}_n{n_tile}" + ("_2cta" if tile_m == 256 else "")
+    if row_group_list:
+        sym += "_rowgroup"
+    if zero_fill:
+        sym += "_zero_fill" + ("_secondary" if zero_fill_secondary else "")
+    return sym
+
+
 def gemm1_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, cluster_split_k: bool = False,
                      zero_fill: bool = False, zero_fill_secondary: bool = False, row_group_list: bool = False,
                      pdl_trigger_early: bool = False) -> Launch:
-    """Dense gather GEMM1 SiTU launch (hand-written ``blockscaled_contiguous_gather_grouped_gemm_act_fusion``)."""
+    """Dense gather GEMM1 SiTU launch (hand-written ``blockscaled_contiguous_gather_grouped_gemm_act_fusion``).
+
+    Traced forms = ``GEMM1_DENSE_FORMS``: the (128, 256) / (1, 1) plain, row-group and zero-fill forms,
+    the (128, 128) / (1, 1) row-group form (``SWAP_SPLIT_GEMM1_N_POLICY`` at T <= 512) and the 2-CTA (256, 256) /
+    (2, 1) ``zero_fill_secondary`` alternate. Flag combinations without a traced form (row-group list together with
+    zero fill, the 2-CTA tile with a row-group list or without the secondary fill, ...) are refused by name.
+    ``cluster_split_k`` (form (c)) is recorded as a deviation on the traced form it decorates.
+    """
     hw = f"dense gather GEMM1 mma_tiler {mma_tiler} cluster {cluster}"
     flags = [name for flag, name in ((zero_fill, "zero_fill_output"), (zero_fill_secondary, "zero_fill_secondary"),
                                      (row_group_list, "tile_idx_to_row_group"), (cluster_split_k, "cluster_split_k"),
@@ -622,15 +692,24 @@ def gemm1_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, cl
         hw += " " + ", ".join(flags)
     deviations = ()
     missing = []
-    if mma_tiler == (256, 256) and cluster == (2, 1):
-        missing.append("gemm1_dense form (d): M256 2-CTA (256, 256) / cluster (2, 1)"
-                       + (" zero_fill_secondary" if zero_fill_secondary else "") + " (form_config(tile_m=256) raises)")
-    elif mma_tiler != (128, 256) or cluster != (1, 1):
-        missing.append(f"gemm1_dense form with mma_tiler {mma_tiler} cluster {cluster} (only (128, 256) / (1, 1) traced)")
-    if zero_fill and not (mma_tiler == (256, 256)):
-        missing.append("gemm1_dense form (b): zero_fill_output bulk fill over the tile-less CTAs (form_config(zero_fill=True) raises)")
-    if row_group_list:
-        missing.append("gemm1_dense row-group list (tile_idx_to_row_group slot -> 128-row sort group; form_config(row_group_list=True) raises)")
+    tile_m, n = mma_tiler
+    expected_cluster = (2, 1) if tile_m == 256 else (1, 1)
+    if tile_m not in (128, 256) or n not in (128, 256) or cluster != expected_cluster:
+        missing.append(f"gemm1_dense form with mma_tiler {mma_tiler} cluster {cluster} (traced tiles: (128, 256) / (1, 1), "
+                       "(128, 128) / (1, 1), (256, 256) / (2, 1))")
+    else:
+        sym = gemm1_dense_form_symbol(tile_m, n, zero_fill=zero_fill, zero_fill_secondary=zero_fill_secondary,
+                                      row_group_list=row_group_list)
+        if sym not in GEMM1_DENSE_FORMS:
+            letters = []
+            if zero_fill and tile_m == 128:
+                letters.append("form (b) zero_fill_output")
+            if tile_m == 256:
+                letters.append("form (d) M256 2-CTA")
+            if row_group_list:
+                letters.append("row-group list")
+            missing.append(f"gemm1_dense form {sym} ({', '.join(letters)} together) not traced; traced forms: "
+                           f"{tuple(GEMM1_DENSE_FORMS)}")
     if cluster_split_k:
         # Same class as the swap-AB GEMM1 cluster split-K recorded by the plain chain:
         # a device-side split decided per launch inside the (1, 1, 2) cluster launch; recorded, not a refusal.
@@ -639,12 +718,20 @@ def gemm1_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, cl
         deviations += ("pdl_trigger_early (launch_dependents at kernel entry; Cake triggers after the epilogue)",)
     if missing:
         return Launch("gemm1_dense", hw, None, GEMM1_DENSE_MODULE, BOTH, missing="; ".join(missing), deviations=deviations)
-    return Launch("gemm1_dense", hw, "gemm1_dense_situ_m128_n256", GEMM1_DENSE_MODULE, BOTH, deviations=deviations)
+    return Launch("gemm1_dense", hw, sym, GEMM1_DENSE_MODULE, BOTH, deviations=deviations)
 
 
 def gemm2_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, raster_along_m=False, swizzle: int = 1,
-                     c_stages: int = 1, row_group_list: bool = False, pdl_trigger_early: bool = False) -> Launch:
-    """Dense grouped GEMM2 finalize launch (hand-written ``blockscaled_contiguous_grouped_gemm_finalize_fusion``)."""
+                     c_stages: int = 1, row_group_list: bool = False, pdl_trigger_early: bool = False,
+                     hidden_size: int | None = None) -> Launch:
+    """Dense grouped GEMM2 finalize launch (hand-written ``blockscaled_contiguous_grouped_gemm_finalize_fusion``).
+
+    ``hidden_size`` (the GEMM2 N extent) is required for the cluster (1, 2) tactics: the form
+    (``build_gemm2_dense_finalize_ir(n_tile, cluster_n=2)`` -> ``gemm2_dense_finalize_n<N>_c12``) refuses an odd
+    weight-tile count ``ceil(H / N)`` (the out-of-range rank-1 CTA arm of the hand-written scheduler is untraced), and
+    lays the pair along x: ``cluster_dims (2, 1, 1)``, grid ``(2 * min(cap * ceil(n_tiles / 2), SMs // 2), 1, 1)``
+    (recorded geometry divergence vs the hand-written ``(1, 2, Z)``).
+    """
     hw = (f"dense finalize GEMM2 mma_tiler {mma_tiler} cluster {cluster} raster_along_m={raster_along_m} "
           f"swizzle={swizzle} c_stages={c_stages}")
     if row_group_list:
@@ -654,9 +741,23 @@ def gemm2_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, ra
     missing = []
     n = mma_tiler[1]
     cta_group = 2 if mma_tiler[0] == 256 else 1
+    deviations = ()
     if cluster == (1, 2):
-        missing.append(f"gemm2_dense (128, {n}) cluster (1, 2) A-multicast form (C3 / C4; cta_group-1 TMA multicast "
-                       "rejected by the CuTe backend _supports_tma_load)")
+        if cta_group != 1 or n not in GEMM2_DENSE_CLUSTER12_N:
+            missing.append(f"gemm2_dense {mma_tiler} cluster (1, 2) (traced for (128, N), N in "
+                           f"{GEMM2_DENSE_CLUSTER12_N} only)")
+        elif row_group_list:
+            missing.append(f"gemm2_dense (128, {n}) cluster (1, 2) with the tile_idx_to_row_group list (only the "
+                           "plain _c12 forms are traced / registered)")
+        elif hidden_size is None:
+            raise ValueError("gemm2_dense_form(cluster=(1, 2)) needs hidden_size to resolve the weight-tile count")
+        elif -(-hidden_size // n) % 2:
+            missing.append(f"gemm2_dense (128, {n}) cluster (1, 2): odd weight-tile count {-(-hidden_size // n)} "
+                           f"(H={hidden_size}); the form refuses it (the hand-written scheduler's out-of-range rank-1 "
+                           "CTA arm is untraced)")
+        else:
+            deviations += (f"cluster (1, 2) laid along x: Cake cluster_dims (2, 1, 1), grid (2 * min(cap * "
+                           f"ceil({-(-hidden_size // n)} / 2), SMs // 2), 1, 1) vs hand-written (1, 2, Z) (recorded)",)
     elif cta_group == 2 and (mma_tiler, cluster) != ((256, 256), (2, 1)):
         missing.append(f"gemm2_dense 2-CTA form {mma_tiler} / {cluster} (only (256, 256) / (2, 1) traced)")
     elif cta_group == 1 and (cluster != (1, 1) or n not in GEMM2_DENSE_TRACED_N):
@@ -666,31 +767,73 @@ def gemm2_dense_form(mma_tiler: tuple[int, int], cluster: tuple[int, int], *, ra
                        "vote / M-fastest raster not traced)")
     if c_stages != 1:
         missing.append(f"gemm2_dense c_stages {c_stages} (form_config allows 1)")
-    deviations = ()
     if pdl_trigger_early:
-        deviations = ("pdl_trigger_early (launch_dependents at kernel entry; Cake triggers after the epilogue)",)
+        deviations += ("pdl_trigger_early (launch_dependents at kernel entry; Cake triggers after the epilogue)",)
     if missing:
         return Launch("gemm2_dense_finalize", hw, None, GEMM2_DENSE_MODULE, BOTH, missing="; ".join(missing),
                       deviations=deviations)
-    sym = f"gemm2_dense_finalize_n{n}" + ("_2cta" if cta_group == 2 else "") + ("_rg" if row_group_list else "")
+    sym = (f"gemm2_dense_finalize_n{n}" + ("_2cta" if cta_group == 2 else "") + ("_c12" if cluster == (1, 2) else "")
+           + ("_rg" if row_group_list else ""))
     return Launch("gemm2_dense_finalize", hw, sym, GEMM2_DENSE_MODULE, BOTH, deviations=deviations)
 
 
-def moe_sort_forms(num_experts: int, *, dual: bool, mixed: bool, pdl: bool) -> tuple[Launch, Launch]:
-    """K6 ``moe_sort`` (init + cooperative kernel) of the generic routing path (mxfp4.py:1251-1313)."""
+def moe_sort_bounded_state(num_tokens: int, top_k: int, tier: int, sm_count: int) -> bool:
+    """``launchCoopKernelTier<Tier>`` (trtllm_fused_moe_routing_custom.cuh:1426-1451): the NumTop16Experts kernel
+    (four expanded indices per thread) when the tier is in the high-expert range, ``9 <= top_k <= 16`` and
+    ``T * top_k <= 4 * numBlocksCoop * Tier``; the generic 64-entry NumTop8Experts kernel otherwise."""
+    lo, hi = MOE_SORT_HIGH_EXPERT_TIERS
+    if not lo <= tier <= hi:
+        return False
+    klo, khi = MOE_SORT_HIGH_EXPERT_TOPK
+    capacity = MOE_SORT_BOUNDED_PER_THREAD * (sm_count - MOE_SORT_RESERVED_SMS) * tier
+    return klo <= top_k <= khi and num_tokens * top_k <= capacity
+
+
+def moe_sort_max_tokens_coop(tier: int, top_k: int, sm_count: int) -> int:
+    """``maxTokensCoop = numBlocksCoop * numThreadsHist * 64 / topK`` (routing_common.cu:136-141)."""
+    return (sm_count - MOE_SORT_RESERVED_SMS) * min(tier, 1024) * MOE_SORT_GENERIC_PER_THREAD // top_k
+
+
+def moe_sort_form_names(tier: int, *, bounded: bool, dual: bool, mixed: bool) -> tuple[str, str]:
+    """The K6 module's IR export names (``kimi_k3_mxfp4_situ_moe_sort.init_form_name`` / ``coop_form_name``)."""
+    coop = f"moe_sort_coop_t{tier}" + ("_bounded" if bounded else "") + ("_dual" if dual else "") + ("_mixed" if mixed else "")
+    return f"moe_sort_init_t{tier}", coop
+
+
+def moe_sort_forms(num_experts: int, *, num_tokens: int, top_k: int, sm_count: int, tile: int,
+                   alt_tile: int | None, mixed: bool, pdl: bool) -> tuple[Launch, Launch]:
+    """K6 ``moe_sort`` (init + cooperative kernel) of the generic routing path (mxfp4.py:1251-1313) exactly as
+    ``runPostTopKPipeline`` (routing_common.cu:64-150) launches it on ``sm_count`` SMs: expert tier by
+    ``getMaxNumExperts``, ``min(tier, 1024)`` threads, ``SMs - 8`` CTAs, and the per-thread state of
+    ``launchCoopKernelTier``. ``alt_tile`` is the dual-tile alternate (``tile_tokens_dim_alt``) or None."""
     tier = moe_sort_expert_tier(num_experts)
-    hw_init = f"routingInitExpertCounts tier {tier} (trtllm_fused_moe_routing_custom.cuh:1499)"
-    hw_coop = (f"routingIndicesCoopKernel<{tier}, NumTop16Experts bounded state> tile 128"
-               + (" dual 256" if dual else "") + (" mixed192 lists" if mixed else "") + f" pdl={pdl}"
-               " (launchCoopKernelTier :1433-1451)")
+    threads = min(tier, 1024)
+    blocks = sm_count - MOE_SORT_RESERVED_SMS
+    dual = alt_tile is not None
+    bounded = moe_sort_bounded_state(num_tokens, top_k, tier, sm_count)
+    state = (f"NumTop16Experts bounded {MOE_SORT_BOUNDED_PER_THREAD}/thread" if bounded
+             else f"NumTop8Experts {MOE_SORT_GENERIC_PER_THREAD}/thread")
+    hw_init = f"routingInitExpertCounts tier {tier} threads {threads} (trtllm_fused_moe_routing_custom.cuh:1499)"
+    hw_coop = (f"routingIndicesCoopKernel<{tier}, {state}> grid {blocks} x {threads} tile {tile}"
+               + (f" dual {alt_tile}" if dual else "") + (" mixed192 lists" if mixed else "") + f" pdl={pdl}"
+               f" (launchCoopKernelTier :1426-1451, {sm_count} SMs)")
+    missing = None
     if tier not in MOE_SORT_CAKE_TIERS:
-        missing = (f"moe_sort expert tier {tier} (E={num_experts}): kimi_k3_mxfp4_situ_moe_sort traces the 64-entry "
-                   f"NumTop8Experts tiers {MOE_SORT_CAKE_TIERS} only; the {tier}-tier cooperative kernel runs the "
-                   "bounded 4-entry NumTop16Experts state for top_k 9..16 (trtllm_fused_moe_routing_custom.cuh:1426-1451)")
+        missing = f"moe_sort expert tier {tier} (E={num_experts}) is not traced by kimi_k3_mxfp4_situ_moe_sort"
+    elif num_tokens <= MOE_SORT_CLUSTER_MAX_TOKENS:
+        missing = (f"moe_sort T={num_tokens} <= {MOE_SORT_CLUSTER_MAX_TOKENS}: the hand-written pipeline launches the "
+                   "single-cluster kernel routingIndicesClusterKernel (routing_common.cu:98-101), not the cooperative "
+                   "pair; not reproduced")
+    elif num_tokens > moe_sort_max_tokens_coop(tier, top_k, sm_count):
+        missing = (f"moe_sort T={num_tokens} above maxTokensCoop={moe_sort_max_tokens_coop(tier, top_k, sm_count)} "
+                   f"({blocks} x {threads} x 64 / {top_k}): the multi-kernel histogram / offsets path "
+                   "(routing_common.cu:150-) is not reproduced")
+    if missing is not None:
         return (Launch("moe_sort_init", hw_init, None, MOE_SORT_MODULE, CUDA_ONLY, missing=missing),
                 Launch("moe_sort_coop", hw_coop, None, MOE_SORT_MODULE, CUDA_ONLY, missing=missing))
-    return (Launch("moe_sort_init", hw_init, "kimi_k3_mxfp4_situ_sort_init", MOE_SORT_MODULE, CUDA_ONLY),
-            Launch("moe_sort_coop", hw_coop, "kimi_k3_mxfp4_situ_sort_coop", MOE_SORT_MODULE, CUDA_ONLY))
+    init_form, coop_form = moe_sort_form_names(tier, bounded=bounded, dual=dual, mixed=mixed)
+    return (Launch("moe_sort_init", hw_init, init_form, MOE_SORT_MODULE, CUDA_ONLY),
+            Launch("moe_sort_coop", hw_coop, coop_form, MOE_SORT_MODULE, CUDA_ONLY))
 
 
 @dataclass(frozen=True)
@@ -754,9 +897,12 @@ class CakeSwapAbPolicy:
 
     def __init__(self, layout: RankLayout, *, top_k: int, hidden_size: int, enable_pdl: bool = False,
                  swapab_n_tile: int = SWAP_ROW_TILE, swapab_max_tokens: int | None = None,
-                 swapab_tile_policy: tuple[tuple[int, int], ...] | None = None):
+                 swapab_tile_policy: tuple[tuple[int, int], ...] | None = None, sm_count: int = CONTRACT_SM_COUNT):
         if not 1 <= top_k <= min(32, layout.num_experts):
             raise ValueError("require 1 <= top_k <= min(32, num_experts)")
+        if sm_count <= MOE_SORT_RESERVED_SMS:
+            raise ValueError("sm_count must exceed the 8 SMs the cooperative routing kernel reserves")
+        self.sm_count = int(sm_count)            # the device's SM count (K6 grid + per-thread state selection)
         if hidden_size <= 0 or hidden_size % 128:
             raise ValueError("hidden size must be a positive multiple of 128")
         if swapab_n_tile not in (8, 16, 32, 64, 128):
@@ -1151,7 +1297,9 @@ class CakeSwapAbPolicy:
                                f"_RoutePreprocess threads={ROUTE_PREPROCESS_THREADS} clear_output={clear_output} "
                                f"({mode_note}; mxfp4.py:1254-1261, mxfp4_routing.py:64-160)",
                                "kimi_k3_mxfp4_situ_route_preprocess", ROUTING_MODULE, BOTH))
-            init, coop = moe_sort_forms(self.layout.num_experts, dual=mixed192_dual is not None,
+            init, coop = moe_sort_forms(self.layout.num_experts, num_tokens=T, top_k=self.top_k,
+                                        sm_count=self.sm_count, tile=group,
+                                        alt_tile=mixed192_dual[0] if mixed192_dual is not None else None,
                                         mixed=bool(mixed192 and SWAP_WIDE192_LISTS == "sort"), pdl=pdl)
             plan += [init, coop]
         # ---- dispatch -----------------------------------------------------------------------------------------
@@ -1203,7 +1351,7 @@ class CakeSwapAbPolicy:
                 gemm2_tactic = self.tactic(T)[2]
                 gemm2_n = gemm2_tactic[0][1]
                 cl = gemm2_tactic[1] if gemm2_tactic[0] == (SWAP_SPLIT_WIDE_TILE, gemm2_n) else (1, 1)
-                wide_plan.append(gemm2_dense_form((SWAP_SPLIT_WIDE_TILE, gemm2_n), cl, row_group_list=True,
+                wide_plan.append(gemm2_dense_form((SWAP_SPLIT_WIDE_TILE, gemm2_n), cl, hidden_size=self.hidden_size, row_group_list=True,
                                                   pdl_trigger_early=pdl and SWAP_SPLIT_EARLY_TRIGGER))
             else:
                 wide_plan.append(swapab_gemm2_form(SWAP_SPLIT_WIDE_TILE, gemm2_k_blocks_per_stage(shard, SWAP_SPLIT_WIDE_TILE),
@@ -1235,11 +1383,11 @@ class CakeSwapAbPolicy:
             if mixed192_dense_gemm2 and g2_tactic[0][0] != group:
                 g2_tactic = ((group, 192), (1, 2), False)
             raster = self.gemm2_raster(T, g2_tactic[0][1]) if mixed192_dense_gemm2 else (False, 1)
-            g2_main.append(gemm2_dense_form(g2_tactic[0], g2_tactic[1], raster_along_m=raster[0], swizzle=raster[1],
+            g2_main.append(gemm2_dense_form(g2_tactic[0], g2_tactic[1], hidden_size=self.hidden_size, raster_along_m=raster[0], swizzle=raster[1],
                                             c_stages=DENSE_GEMM2_C_STAGES if mixed192_dense_gemm2 else 1))
             if mixed192_dense_gemm2 and mixed192_dual is not None:                           # :1796-1801
                 raster_b = self.gemm2_raster(T, self.tactic(T)[2][0][1])
-                g2_main.append(gemm2_dense_form(mixed192_dual[2][0], mixed192_dual[2][1], raster_along_m=raster_b[0],
+                g2_main.append(gemm2_dense_form(mixed192_dual[2][0], mixed192_dual[2][1], hidden_size=self.hidden_size, raster_along_m=raster_b[0],
                                                 swizzle=raster_b[1], c_stages=DENSE_GEMM2_C_STAGES))
         else:                                                                                # _prepare_swap_gemm2 :1897-1990
             kb2 = None
@@ -1288,11 +1436,11 @@ class CakeSwapAbPolicy:
             if g2_tactic[0][0] != group:
                 g2_tactic = ((group, 192), (1, 2), False)
             raster = self.gemm2_raster(T, g2_tactic[0][1])
-            g2_wide.append(gemm2_dense_form(g2_tactic[0], g2_tactic[1], raster_along_m=raster[0], swizzle=raster[1],
+            g2_wide.append(gemm2_dense_form(g2_tactic[0], g2_tactic[1], hidden_size=self.hidden_size, raster_along_m=raster[0], swizzle=raster[1],
                                             c_stages=DENSE_GEMM2_C_STAGES, row_group_list=True))
             if mixed192_dual is not None:                                                    # :1851-1862, :1820-1861
                 raster_b = self.gemm2_raster(T, self.tactic(T)[2][0][1])
-                g2_wide.append(gemm2_dense_form(mixed192_dual[2][0], mixed192_dual[2][1], raster_along_m=raster_b[0],
+                g2_wide.append(gemm2_dense_form(mixed192_dual[2][0], mixed192_dual[2][1], hidden_size=self.hidden_size, raster_along_m=raster_b[0],
                                                 swizzle=raster_b[1], c_stages=DENSE_GEMM2_C_STAGES,
                                                 row_group_list=not mixed192_alt_gemm2))
         # ---- finalize rows (two-stage) --------------------------------------------------------------------------
@@ -1345,9 +1493,9 @@ class CakeSwapAbPolicy:
                            f"_RoutePreprocess threads={ROUTE_PREPROCESS_THREADS} clear_output={clears} ({mode_note}; "
                            "mxfp4.py:912-935: T > 16, ROUTE_PREPROCESS_PDL)",
                            "kimi_k3_mxfp4_situ_route_preprocess", ROUTING_MODULE, BOTH))
-        init, coop = moe_sort_forms(self.layout.num_experts, dual=sel.dual is not None, mixed=False, pdl=pdl)
-        coop = Launch(coop.step, coop.hw.replace("tile 128", f"tile {sel.tile}"), coop.form, coop.module, coop.backends,
-                      coop.missing)
+        init, coop = moe_sort_forms(self.layout.num_experts, num_tokens=T, top_k=self.top_k, sm_count=self.sm_count,
+                                    tile=sel.tile, alt_tile=sel.dual[0] if sel.dual is not None else None, mixed=False,
+                                    pdl=pdl)
         plan += [init, coop]
         if DENSE_GEMM1_A_TMA:
             plan.append(Launch("token_index", "fill_permuted_token_index (DENSE_GEMM1_A_TMA)",
@@ -1359,10 +1507,10 @@ class CakeSwapAbPolicy:
         if sel.dual is not None:                                                             # fused_moe.py:481-541
             plan.append(gemm1_dense_form(sel.dual[1][0], sel.dual[1][1], zero_fill=sel.fill_in_gemm1,
                                          zero_fill_secondary=sel.fill_in_gemm1))
-        plan.append(gemm2_dense_form(sel.gemm2[0], sel.gemm2[1], raster_along_m=sel.gemm2_raster[0],
+        plan.append(gemm2_dense_form(sel.gemm2[0], sel.gemm2[1], hidden_size=self.hidden_size, raster_along_m=sel.gemm2_raster[0],
                                      swizzle=sel.gemm2_raster[1], c_stages=DENSE_GEMM2_C_STAGES))
         if sel.dual is not None:                                                             # fused_moe.py:697-736
-            plan.append(gemm2_dense_form(sel.dual[2][0], sel.dual[2][1], raster_along_m=sel.gemm2_raster[0],
+            plan.append(gemm2_dense_form(sel.dual[2][0], sel.dual[2][1], hidden_size=self.hidden_size, raster_along_m=sel.gemm2_raster[0],
                                          swizzle=sel.gemm2_raster[1], c_stages=DENSE_GEMM2_C_STAGES))
         if sel.two_stage:
             plan.append(Launch("finalize_rows", "plan_finalize_rows expanded_rows=True (:890-897)",
@@ -1412,11 +1560,12 @@ class CakeSwapAbPolicy:
 
 def plan_decision(*, num_tokens: int, top_k: int, hidden_size: int, num_experts: int, intermediate_size: int,
                   num_local_experts: int, local_expert_offset: int, intermediate_shard: int | None = None,
-                  do_finalize: bool = True) -> PlanDecision:
-    """Host-only decision for one problem (no torch, no CUDA)."""
+                  do_finalize: bool = True, sm_count: int = CONTRACT_SM_COUNT) -> PlanDecision:
+    """Host-only decision for one problem (no torch, no CUDA); ``sm_count`` = the target device's SMs."""
     layout = resolve_layout(num_experts, intermediate_size, num_local_experts=num_local_experts,
                             local_expert_offset=local_expert_offset, intermediate_shard=intermediate_shard)
-    return CakeSwapAbPolicy(layout, top_k=top_k, hidden_size=hidden_size).decide(num_tokens, do_finalize)
+    return CakeSwapAbPolicy(layout, top_k=top_k, hidden_size=hidden_size, sm_count=sm_count).decide(num_tokens,
+                                                                                                    do_finalize)
 
 
 def interleave_up_gate(x: Any, group_size: int = 64, dim: int = 1) -> Any:
@@ -1499,6 +1648,13 @@ UNUSED_ROUTING_LISTS = ("wide_list", "wide_count", "narrow_list", "narrow_count"
                         "wide_expert", "wide_limit")
 
 
+UNUSED_SORT_OPERANDS = ("alt_expert", "alt_limit", "alt_active", "base_active", "alt_wide_list", "alt_wide_count",
+                        "narrow_count_base")
+
+
+UNUSED_GEMM1_DENSE_OPERANDS = ("zero_fill_words", "zero_fill_other_tiles")
+
+
 def unused_launch_operands(device, *, group_capacity: int) -> dict[str, Any]:
     """Operands of the kernel ABI the plain chain never dereferences.
 
@@ -1509,9 +1665,13 @@ def unused_launch_operands(device, *, group_capacity: int) -> dict[str, Any]:
     """
     import torch
 
-    ops = {name: torch.zeros(1, dtype=torch.int32, device=device) for name in UNUSED_ROUTING_LISTS}
+    ops = {name: torch.zeros(1, dtype=torch.int32, device=device)
+           for name in UNUSED_ROUTING_LISTS + UNUSED_SORT_OPERANDS}
     ops["tile_idx_to_row_group"] = torch.arange(group_capacity, dtype=torch.int32, device=device)
     ops["zero_buf"] = torch.zeros(2, dtype=torch.float32, device=device)   # GEMM1 zero source (zero_words = 0)
+    for name in UNUSED_GEMM1_DENSE_OPERANDS:
+        ops[name] = torch.zeros(1, dtype=torch.int32, device=device)
+    ops["zero_fill_counters"] = torch.zeros(2, dtype=torch.int32, device=device)
     return ops
 
 
@@ -1541,6 +1701,41 @@ def routing_launch_bindings(b: dict[str, Any], *, topk_ids, weights_src, w_strid
         w_stride1=w_strides[1])
 
 
+def moe_sort_launch_bindings(b: dict[str, Any], *, topk_ids, num_tokens: int, top_k: int, num_experts: int,
+                             local_experts: int, local_offset: int, tile: int, alt_tile: int | None,
+                             permille: int, mixed: bool, narrow_tile: int,
+                             unused: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Named bindings ``(init, coop)`` of the K6 launch pair, the hand-written ``moe_sort`` call (mxfp4.py:1269-
+    1313): ``sort_buffers`` = the ``out_*`` workspace fields, the mixed lists = the ``swap_*`` dispatch fields
+    (``SWAP_WIDE192_LISTS == "sort"``), ``tile_tokens_dim`` = the padding tile, ``tile_tokens_dim_alt`` /
+    ``dual_tile_threshold_permille`` of the dual form. Same operand order as the module's ``coop_kwargs``."""
+    dual = alt_tile is not None
+    init = dict(expert_counts=b["out_expert_counts"], num_experts=num_experts)
+    coop = dict(
+        topk_ids=topk_ids, expert_counts=b["out_expert_counts"], tile_expert=b["out_tile_idx_to_expert_idx"],
+        tile_limit=b["out_tile_idx_to_mn_limit"], expanded=b["out_expanded_idx_to_permuted_idx"].reshape(-1),
+        permuted=b["out_permuted_idx_to_expanded_idx"], padded_total=b["out_total_num_padded_tokens"],
+        active_total=b["out_num_non_exiting_tiles"],
+        alt_expert=b["out_alt_tile_idx_to_expert_idx"] if dual else unused["alt_expert"],
+        alt_limit=b["out_alt_tile_idx_to_mn_limit"] if dual else unused["alt_limit"],
+        alt_active=b["out_alt_num_non_exiting_tiles"] if dual else unused["alt_active"],
+        base_active=b["out_base_active_num_non_exiting_tiles"] if dual else unused["base_active"],
+        wide_list=b["swap_wide_list"] if mixed else unused["wide_list"],
+        wide_count=b["swap_wide_count"] if mixed else unused["wide_count"],
+        alt_wide_list=b["swap_alt_wide_list"] if mixed else unused["alt_wide_list"],
+        alt_wide_count=b["swap_alt_wide_count"] if mixed else unused["alt_wide_count"],
+        narrow_list=b["swap_row_groups"] if mixed else unused["narrow_list"],
+        narrow_count=b["swap_row_group_count"] if mixed else unused["narrow_count"],
+        narrow_count_base=b["swap_row_group_count_base"] if mixed else unused["narrow_count_base"],
+        num_tokens=num_tokens, num_experts=num_experts, top_k=top_k, local_offset=local_offset,
+        local_experts=local_experts, stride_log2=0, padding_log2=tile.bit_length() - 1,
+        padding_log2_alt=alt_tile.bit_length() - 1 if dual else 0, permille=permille if dual else 0,
+        mixed_narrow_tile=narrow_tile if mixed else 0, mixed_row_unit=SWAP_WIDE192_ROW_UNIT if mixed else 0,
+        mixed_max_rows=SWAP_WIDE192_MAX_ROWS, mixed_min_total_rows=SWAP_WIDE192_MIN_ROWS,
+        contiguous_windows=1 if num_tokens >= MOE_SORT_CONTIGUOUS_WINDOW_MIN_TOKENS else 0)
+    return init, coop
+
+
 def _gemm_common_bindings(b: dict[str, Any], *, route_weights, tiles: int, top_k: int, dbg, unused) -> dict[str, Any]:
     return dict(
         tile_idx_to_expert_idx=b["out_tile_idx_to_expert_idx"], tile_idx_to_mn_limit=b["out_tile_idx_to_mn_limit"],
@@ -1562,6 +1757,48 @@ def gemm1_launch_bindings(b: dict[str, Any], *, weights: dict[str, Any], x, x_sf
         situ_beta=beta, situ_linear_beta=linear_beta, act_sf=b["gemm1_out_scale"], zero_buf=unused["zero_buf"],
         zero_words=0, num_rows_b=num_tokens, act_cols=shard, act_sf_cols=shard // 32,
         out=b["gemm1_out"].view(torch.uint8))
+
+
+def gemm1_dense_launch_bindings(b: dict[str, Any], *, weights: dict[str, Any], x, x_sf, hidden: int, shard: int,
+                                top_k: int, num_tokens: int, rows: int, tile_m: int, n_tile: int, row_group_list: bool,
+                                zero_fill: bool, secondary: bool, output, beta, linear_beta, beta_stride: int,
+                                linear_beta_stride: int, unused: dict[str, Any]) -> dict[str, Any]:
+    """Named bindings of a dense gather GEMM1 launch (hand-written
+    ``blockscaled_contiguous_gather_grouped_gemm_act_fusion`` operands, mxfp4.py / fused_moe.py:481-541).
+
+    Tile lists: the base launch reads ``out_tile_idx_to_*`` / ``out_num_non_exiting_tiles``; the 2-CTA secondary
+    (dual alternate) launch reads ``out_alt_tile_idx_to_*`` / ``out_alt_num_non_exiting_tiles`` (256-row groups) and
+    ``zero_fill_other_tiles = out_base_active_num_non_exiting_tiles``; the base launch of a dual pair fills the
+    other tiles of ``out_alt_num_non_exiting_tiles``. Row-group forms (split / hybrid / mixed192) take the compacted
+    ``swap_wide_list`` / ``swap_wide_count``; plain forms take the identity list and the zero-fill dummies.
+    """
+    import torch
+
+    if row_group_list:
+        tile_expert, tile_limit = b["out_tile_idx_to_expert_idx"], b["out_tile_idx_to_mn_limit"]
+        row_group, valid = b["swap_wide_list"], b["swap_wide_count"]
+    elif secondary:
+        tile_expert, tile_limit = b["out_alt_tile_idx_to_expert_idx"], b["out_alt_tile_idx_to_mn_limit"]
+        row_group, valid = unused["tile_idx_to_row_group"], b["out_alt_num_non_exiting_tiles"]
+    else:
+        tile_expert, tile_limit = b["out_tile_idx_to_expert_idx"], b["out_tile_idx_to_mn_limit"]
+        row_group, valid = unused["tile_idx_to_row_group"], b["out_num_non_exiting_tiles"]
+    if zero_fill:
+        zf_words = output.view(torch.uint32).reshape(-1)
+        zf_num = num_tokens * hidden // 2
+        zf_other = b["out_base_active_num_non_exiting_tiles"] if secondary else (
+            b["out_alt_num_non_exiting_tiles"] if "out_alt_num_non_exiting_tiles" in b else b["out_num_non_exiting_tiles"])
+    else:
+        zf_words, zf_num, zf_other = unused["zero_fill_words"], 0, unused["zero_fill_other_tiles"]
+    return dict(
+        X=x.view(torch.uint8), XSF=x_sf, W=weights["w1"], WSF=weights["w1_sf"], C=b["gemm1_out"].view(torch.uint8),
+        CSF=b["gemm1_out_scale"], alpha=b["w1_alpha"], situ_beta=beta, situ_linear_beta=linear_beta, tile_idx_to_expert_idx=tile_expert,
+        tile_idx_to_mn_limit=tile_limit, tile_idx_to_row_group=row_group,
+        token_id_mapping=b["out_permuted_idx_to_expanded_idx"], num_non_exiting_tiles=valid,
+        zero_fill_words=zf_words, zero_fill_counters=unused["zero_fill_counters"], zero_fill_other_tiles=zf_other,
+        zero_fill_num_words=zf_num, num_m_tiles=rows // tile_m, n_tiles=2 * shard // n_tile, k_tiles=hidden // 128,
+        k_cols=hidden, sf_cols=hidden // 32, top_k=top_k, sf_n_blocks=-(-shard // 128), beta_stride=beta_stride,
+        linear_beta_stride=linear_beta_stride)
 
 
 def gemm2_launch_bindings(b: dict[str, Any], *, weights: dict[str, Any], route_weights, hidden: int, shard: int,
@@ -1690,7 +1927,7 @@ class CakeMxfp4MoEWrapper:
                  num_local_experts: int | None = None, local_expert_offset: int | None = None,
                  intermediate_shard: int | None = None, backend: str = PACKAGE_BACKEND, enable_pdl: bool = False,
                  swapab_n_tile: int = SWAP_ROW_TILE, swapab_max_tokens: int | None = None,
-                 swapab_tile_policy=None):
+                 swapab_tile_policy=None, sm_count: int = CONTRACT_SM_COUNT):
         if backend != PACKAGE_BACKEND:
             raise ValueError(f"this package serves backend={PACKAGE_BACKEND!r}, got {backend!r}")
         self.backend = backend
@@ -1710,7 +1947,7 @@ class CakeMxfp4MoEWrapper:
         self.intermediate_shard = self.layout.intermediate_shard
         self.policy = CakeSwapAbPolicy(self.layout, top_k=top_k, hidden_size=hidden_size, enable_pdl=enable_pdl,
                                        swapab_n_tile=swapab_n_tile, swapab_max_tokens=swapab_max_tokens,
-                                       swapab_tile_policy=swapab_tile_policy)
+                                       swapab_tile_policy=swapab_tile_policy, sm_count=sm_count)
         self.swapab_max_tokens = self.policy.swapab_max_tokens
         self.swapab_tile_policy = self.policy.swapab_tile_policy
 
@@ -1742,6 +1979,12 @@ class CakeMxfp4MoEWrapper:
         decision = self.decide(T)
         if not decision.supported:
             raise NotImplementedError(f"T={T} on {self.layout.mode} (shard {I}, {L} local experts): {decision.reason}")
+        if decision.path not in EXECUTABLE_PATHS:
+            raise NotImplementedError(
+                f"T={T} on {self.layout.mode} (shard {I}, {L} local experts): the plan selects the "
+                f"{decision.path!r} path ({', '.join(decision.launches)}); this package's executable chain runs "
+                f"the {EXECUTABLE_PATHS} path(s) only (every launch of the row has a generated form; the "
+                f"chain that enqueues them is not shipped)")
         expected = {
             "x": (x, (T, H), torch.float8_e4m3fn),
             "x_sf": (x_sf, (T, H // 32), torch.uint8),
