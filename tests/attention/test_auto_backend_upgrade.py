@@ -39,6 +39,61 @@ from flashinfer.utils import is_sm100a_supported, is_sm110a_supported
 DTYPE = torch.bfloat16
 
 
+@pytest.mark.parametrize(
+    "order,cudnn_available,work_items,graph,expected,expected_counts",
+    [
+        ("cudnn,cutlass", True, 131073, False, "cudnn", 0),
+        ("cutlass,cudnn", True, 131072, False, "cutlass", 1),
+        ("cutlass,cudnn", True, 131073, False, "cudnn", 1),
+        ("cudnn,cutlass", False, 131072, False, "cutlass", 1),
+        ("cudnn,cutlass", False, 131073, False, None, 1),
+        ("cutlass", False, 1, True, None, 0),
+        ("cutlass,cudnn", True, 1, True, "cudnn", 0),
+        ("cutlass,cutlass", False, 131073, False, None, 1),
+    ],
+)
+def test_lazy_cutlass_work_count_preserves_eligibility(
+    monkeypatch, order, cudnn_available, work_items, graph, expected, expected_counts
+):
+    import flashinfer.prefill as prefill_mod
+
+    monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", order)
+    monkeypatch.setattr(prefill_mod, "is_sm100a_supported", lambda _: True)
+    monkeypatch.setattr(
+        prefill_mod, "_cudnn_supports_direct_seqlens", lambda _: cudnn_available
+    )
+    counts = []
+
+    def count_work():
+        counts.append(work_items)
+        return work_items
+
+    options = dict(
+        has_custom_mask=False,
+        window_left=-1,
+        logits_soft_cap=0.0,
+        has_multi_item_scoring=False,
+        has_sinks=False,
+        cudnn_indptr_is_int32=True,
+        cuda_graph_enabled=graph,
+        cutlass_indptr_is_int32=True,
+    )
+    args = (torch.device("cuda"), "NHD", 128, 128, DTYPE, DTYPE, DTYPE, 0)
+    assert (
+        prefill_mod._blackwell_ragged_auto_upgrade(
+            *args, cutlass_work_items=work_items, **options
+        )
+        == expected
+    )
+    assert (
+        prefill_mod._blackwell_ragged_auto_upgrade(
+            *args, cutlass_work_items=count_work, **options
+        )
+        == expected
+    )
+    assert len(counts) == expected_counts
+
+
 def _cutlass_upgrade_arch() -> bool:
     if not torch.cuda.is_available():
         return False
@@ -894,3 +949,16 @@ def test_cudnn_single_token_gqa_lse_is_correct():
     _, lse_fa2 = wf.run(q, k, v, return_lse=True)
     assert torch.isfinite(lse).all()
     torch.testing.assert_close(lse, lse_fa2, atol=1e-2, rtol=1e-2)
+
+
+@requires_cudnn_upgrade
+def test_cudnn_auto_plan_does_not_count_cutlass_work(monkeypatch):
+    import flashinfer.prefill as prefill_mod
+
+    monkeypatch.setenv("FLASHINFER_RAGGED_AUTO_BACKEND_ORDER", "cudnn,cutlass")
+
+    def unexpected_count(*args):
+        raise AssertionError("cuDNN auto plan counted CUTLASS work")
+
+    monkeypatch.setattr(prefill_mod, "_cutlass_plan_work_items", unexpected_count)
+    assert _plan_only("auto", 2, 32, 128, 8, 8, 128, 128) == "cudnn"

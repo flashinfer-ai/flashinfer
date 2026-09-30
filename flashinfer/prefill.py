@@ -19,7 +19,18 @@ import logging
 import math
 import os
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence, Tuple, Union, overload
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+    overload,
+)
 
 import torch
 
@@ -1547,9 +1558,11 @@ def single_prefill_with_kv_cache(
         TensorLayout[kv_layout].value,
         window_left,
         packed_custom_mask,
-        get_alibi_slopes(q.shape[1], device=q.device)
-        if pos_encoding_mode == "ALIBI"
-        else None,
+        (
+            get_alibi_slopes(q.shape[1], device=q.device)
+            if pos_encoding_mode == "ALIBI"
+            else None
+        ),
         logits_soft_cap,
         sm_scale,
         scale_q,
@@ -1799,7 +1812,7 @@ def _blackwell_ragged_auto_upgrade(
     has_multi_item_scoring: bool,
     has_sinks: bool,
     cudnn_indptr_is_int32: bool,
-    cutlass_work_items: int,
+    cutlass_work_items: Union[int, Callable[[], int]],
     cuda_graph_enabled: bool,
     cutlass_indptr_is_int32: bool = False,
     single_token_gqa: bool = False,
@@ -1878,14 +1891,18 @@ def _blackwell_ragged_auto_upgrade(
                 # indices on a compatible backend instead of reinterpreting them.
                 and cutlass_indptr_is_int32
                 and (head_dim_qk, head_dim_vo) in _CUTLASS_RAGGED_AUTO_HEAD_DIMS
-                and cutlass_work_items <= _CUTLASS_PLAN_WORK_CAPACITY
                 # `fmha_varlen_plan` allocates fresh work-index buffers on every
                 # call, so a re-plan silently leaves a captured graph pointing at
                 # the previous allocation. Until those buffers are updated in
                 # place, CUTLASS is not graph-safe and `auto` stays away.
                 and not cuda_graph_enabled
             ):
-                return backend
+                # Work counting is only needed if CUTLASS remains eligible.
+                # cuDNN-first plans avoid these CPU tensor reductions entirely.
+                if callable(cutlass_work_items):
+                    cutlass_work_items = cutlass_work_items()
+                if cutlass_work_items <= _CUTLASS_PLAN_WORK_CAPACITY:
+                    return backend
     return None
 
 
@@ -4673,9 +4690,9 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     causal=causal,
                     sm_scale=_sm_scale,
                     q_data_type=q_data_type,
-                    kv_data_type=kv_data_type
-                    if kv_data_type is not None
-                    else q_data_type,
+                    kv_data_type=(
+                        kv_data_type if kv_data_type is not None else q_data_type
+                    ),
                     window_left=window_left,
                     variant=variant,
                 )
@@ -4822,7 +4839,7 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                                 )
                             )
                         ),
-                        cutlass_work_items=_cutlass_plan_work_items(
+                        cutlass_work_items=lambda: _cutlass_plan_work_items(
                             qo_indptr_host, num_qo_heads
                         ),
                         cuda_graph_enabled=self.is_cuda_graph_enabled,
