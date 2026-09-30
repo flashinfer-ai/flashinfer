@@ -427,12 +427,22 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
             # Three K slices when every cluster of the launch is co-resident (7168x1536 M = 17:
             # 36 clusters, +6 % on both parts); 48 or more clusters of 3 need a second cluster
             # wave (-27..-30 %) and keep two slices.
-            capacity = CLUSTER_CAPACITY_BY_SM_COUNT.get(sm_count, {}).get(SPLITK3_CLUSTER)
+            capacity = CLUSTER_CAPACITY_BY_SM_COUNT.get(sm_count, {}).get(
+                SPLITK3_CLUSTER
+            )
             token_tiles = (m + tile_n - 1) // tile_n
-            if capacity is not None and n_tiles * token_tiles <= capacity and k // K_TILE >= SPLITK3_CLUSTER:
+            if (
+                capacity is not None
+                and n_tiles * token_tiles <= capacity
+                and k // K_TILE >= SPLITK3_CLUSTER
+            ):
                 split_k = SPLITK3_CLUSTER
         # Even K slices for split-K 2 / 4; the three-way split uses the kernel's owner-remainder partition.
-        if split_k > 1 and k % K_TILE == 0 and (split_k == SPLITK3_CLUSTER or k % (K_TILE * split_k) == 0):
+        if (
+            split_k > 1
+            and k % K_TILE == 0
+            and (split_k == SPLITK3_CLUSTER or k % (K_TILE * split_k) == 0)
+        ):
             return {
                 "tile_n": tile_n,
                 "deep_k": False,
