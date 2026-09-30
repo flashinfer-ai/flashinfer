@@ -4333,13 +4333,17 @@ def test_attention_ts_nvfp4_cache_contract():
         logical_head_dim=64,
     )
     assert normalized[5] == 64
-    k_sf, v_sf = decode_module._normalize_paged_kv_scale_factors(
-        (scales, scales),
-        k_cache=packed,
-        logical_head_dim=64,
+    k_sf, v_sf, k_sf_page_stride, v_sf_page_stride = (
+        decode_module._normalize_paged_kv_scale_factors(
+            (scales, scales),
+            k_cache=packed,
+            logical_head_dim=64,
+        )
     )
     assert k_sf is scales
     assert v_sf is scales
+    assert k_sf_page_stride == scales.stride(0)
+    assert v_sf_page_stride == scales.stride(0)
     with pytest.raises(ValueError, match="requires kv_scale_factors"):
         decode_module._normalize_paged_kv_scale_factors(
             None,
@@ -4361,9 +4365,7 @@ def test_attention_ts_nvfp4_cache_contract():
     [1, 4, 8],
     ids=lambda value: f"q{value}",
 )
-@pytest.mark.parametrize(
-    "head_dim", [64, 128, 256, 512], ids=lambda value: f"d{value}"
-)
+@pytest.mark.parametrize("head_dim", [64, 128, 256, 512], ids=lambda value: f"d{value}")
 @pytest.mark.parametrize(
     ("num_qo_heads", "num_kv_heads"),
     [(32, 4)],
@@ -4439,6 +4441,64 @@ def test_attention_ts_decode_mixed_precision(
     )
     _assert_case_correct(one_shot, case)
 
+
+@pytest.mark.arch_blackwell
+@_REQUIRES_PRIMTS_GPU
+def test_attention_ts_decode_nvfp4_padded_scale_page_stride():
+    """Consume zero-copy scale views embedded in a larger physical page."""
+    batch_size = 2
+    seq_len_kv = 1024
+    num_qo_heads = 32
+    num_kv_heads = 4
+    head_dim = 512
+    seq_len_q = 1
+    page_size = 64
+    q_dtype = _FP8
+    kv_dtype = torch.uint8
+    output_dtype = torch.bfloat16
+
+    case, kv_scale_factors = _make_mixed_precision_decode_case(
+        batch_size=batch_size,
+        seq_len_kv=seq_len_kv,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        seq_len_q=seq_len_q,
+        page_size=page_size,
+        q_dtype=q_dtype,
+        kv_dtype=kv_dtype,
+        output_dtype=output_dtype,
+        device="cuda",
+        seed=20260806,
+    )
+    assert kv_scale_factors is not None
+
+    def with_padded_outer_stride(scale: torch.Tensor) -> torch.Tensor:
+        compact_page_elements = scale[0].numel()
+        padded_page_stride = compact_page_elements + 16
+        storage = scale.new_empty((scale.shape[0] * padded_page_stride,))
+        padded = storage.as_strided(
+            scale.shape,
+            (padded_page_stride, *scale.stride()[1:]),
+        )
+        padded.copy_(scale)
+        return padded
+
+    padded_scales = tuple(with_padded_outer_stride(sf) for sf in kv_scale_factors)
+    assert padded_scales[0].stride(0) > padded_scales[0][0].numel()
+
+    wrapper = _plan_case(case, max_kv_len=1024)
+    output = wrapper.run(
+        case.q,
+        case.paged_kv_cache,
+        None,
+        case.block_tables,
+        kv_scale_factors=padded_scales,
+        bmm1_scale=case.bmm1_scale,
+        bmm2_scale=case.bmm2_scale,
+    )
+    _assert_case_correct(output, case)
+
     # The unified API also serves caller-owned scratch and trusted graph calls.
     seq_lens = _seq_lens_from_csr(
         case.paged_kv_indptr, case.paged_kv_last_page_len, page_size
@@ -4466,7 +4526,7 @@ def test_attention_ts_decode_mixed_precision(
             case.paged_kv_cache,
             case.block_tables,
             seq_lens,
-            kv_scale_factors=kv_scale_factors,
+            kv_scale_factors=padded_scales,
             seq_len_q=seq_len_q,
             bmm1_scale=case.bmm1_scale,
             bmm2_scale=case.bmm2_scale,
