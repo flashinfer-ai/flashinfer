@@ -3,13 +3,15 @@
 Both this API and its Cake backend are experimental and may change or be
 removed without compatibility guarantees. Calling one of the helpers is the
 explicit opt-in and emits FlashInfer's experimental API warning once. There is no automatic
-backend selection. Tracking: a FlashInfer issue is linked when the pull
-request opens.
+backend selection. Tracking: FlashInfer issue #5678.
 
 Three operations over `E` groups of rows, described by an int32 **device**
 tensor `offs[E]` of cumulative end offsets (`offs[-1] == sum_m`; groups may be
-imbalanced, empty, one row long, or any size that is not a tile multiple).
-The kernels read `offs` on the device; the host never synchronises on it.
+imbalanced, empty, one row long, or any size that is not a tile multiple) or,
+equivalently, an `m_indptr[E + 1]` with a leading 0 (`torch._grouped_mm` /
+`grouped_mm_bf16` form; `grouped_gemm_wgrad` needs `num_groups=E` to tell the
+two forms apart). The kernels read the offsets on the device; the host never
+synchronises on them.
 
 | helper | computation | inputs | output |
 | --- | --- | --- | --- |
@@ -60,6 +62,23 @@ descriptors once (outside CUDA Graph capture) and returns a
 `GroupedGemmLaunch`. `launch()` performs no allocation and no host
 synchronisation. Prepare a new launch when a shape, dtype or tensor binding
 changes; the one-shot helpers prepare on every call.
+
+## Stable API opt-in and autograd
+
+The forward projection is also reachable from the stable grouped GEMM API:
+`flashinfer.grouped_mm.grouped_mm_bf16(a, b, m_indptr, backend="cake")`
+(bfloat16 outputs only, no tactic index, `N % 256 == 0`, `K % 64 == 0`; rows
+of `a` past `m_indptr[-1]` are left untouched). Naming the backend is the
+opt-in and emits the experimental-backend warning once.
+
+`cake_grouped_mm(x, w, offs, deterministic=True)` is a `torch.autograd.Function`
+wrapper (`CakeGroupedMm`): `backward` produces `x.grad` with the `dgrad`
+program and `w.grad` with the `wgrad` program in the dtype of `w`. The
+programs always reduce in a fixed order, so `deterministic=False` currently
+runs the same deterministic programs; `grouped_gemm_wgrad(..., out_dtype=torch.float32)`
+gives an fp32 weight gradient. `cake_autograd.py` also registers the three
+programs as FlashInfer custom ops (`flashinfer::cake_moe_grouped_gemm_{fwd,dgrad,wgrad}`)
+with fake implementations.
 
 ## Host plan
 

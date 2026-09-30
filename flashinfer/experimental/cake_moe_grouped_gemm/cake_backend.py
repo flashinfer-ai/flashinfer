@@ -41,6 +41,7 @@ from typing import Any, Callable, Optional
 import torch
 import tvm_ffi
 
+from ...api_logging import warn_experimental_backend_once
 from .cake_jit import (
     HOST_PLAN_CONSTANTS,
     MODULES,
@@ -391,11 +392,24 @@ def _span_view(t: torch.Tensor) -> torch.Tensor:
     return t.as_strided((span,), (1,))
 
 
+def _end_offsets(offs: torch.Tensor, num_groups: int) -> torch.Tensor:
+    """Accept ``offs[E]`` (cumulative end offsets) or ``m_indptr[E + 1]`` (leading 0).
+
+    Both forms are the ``torch._grouped_mm`` / ``grouped_mm_bf16`` conventions;
+    the ``[E + 1]`` form is reduced to its ``[E]`` end-offset view on the device
+    (no copy, no host read).
+    """
+    if offs.dtype == torch.int32 and offs.ndim == 1 and offs.numel() == num_groups + 1:
+        return offs[1:]
+    return offs
+
+
 def _check_offs(offs: torch.Tensor, num_groups: int) -> None:
     if offs.dtype != torch.int32 or offs.ndim != 1 or offs.numel() != num_groups:
         raise ValueError(
             f"offs must be a one-dimensional int32 tensor of {num_groups} cumulative "
-            f"end offsets (got {offs.dtype}, shape {tuple(offs.shape)})"
+            f"end offsets, or an m_indptr of {num_groups + 1} entries "
+            f"(got {offs.dtype}, shape {tuple(offs.shape)})"
         )
 
 
@@ -539,6 +553,7 @@ def _prepare_row_op(
                 f"dgrad needs K % {block_n} == 0 and N % {block_k} == 0 (got N={n}, K={k})"
             )
         out_cols = k
+    offs = _end_offsets(offs, num_groups)
     _check_offs(offs, num_groups)
     device = _check_device({a_name: a, "w": w, "offs": offs})
     if out is None:
@@ -621,14 +636,16 @@ def prepare_grouped_gemm_wgrad(
     offs: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    num_groups: Optional[int] = None,
 ) -> GroupedGemmLaunch:
     """Prepare ``dW[E, N, K] = grouped G[e].T @ X[e]`` (bf16 in; bf16 or fp32 out), deterministic.
 
     ``g``: ``[sum_m, N]`` bf16; ``x``: ``[sum_m, K]`` bf16; ``offs``: int32
-    ``[E]`` device end offsets (``E = offs.numel()``); ``N % 256 == 0`` and
-    ``K`` a multiple of the selected k tile (256, or 512 when it is chosen).
-    Empty groups produce exact zeros.  ``out_dtype`` defaults to the dtype of
-    ``out`` (bf16 when neither is given).
+    ``[E]`` device end offsets (``E = offs.numel()`` unless ``num_groups`` is
+    given, in which case an ``m_indptr`` of ``E + 1`` entries is accepted too);
+    ``N % 256 == 0`` and ``K`` a multiple of the selected k tile (256, or 512
+    when it is chosen).  Empty groups produce exact zeros.  ``out_dtype``
+    defaults to the dtype of ``out`` (bf16 when neither is given).
     """
     c = host_plan_constants()
     block_n = int(c["block_n"])
@@ -643,7 +660,10 @@ def prepare_grouped_gemm_wgrad(
     sum_mx, k = (int(v) for v in x.shape)
     if sum_mx != sum_m:
         raise ValueError(f"g has {sum_m} rows but x has {sum_mx}")
-    num_groups = int(offs.numel())
+    if num_groups is None:
+        num_groups = int(offs.numel())
+    else:
+        offs = _end_offsets(offs, int(num_groups))
     _check_offs(offs, num_groups)
     device = _check_device({"g": g, "x": x, "offs": offs})
     out_dtype = out_dtype or (out.dtype if out is not None else torch.bfloat16)
@@ -746,3 +766,40 @@ def prepare_grouped_gemm_wgrad(
         launches.append(reduce_launch)
         workspaces.extend(retained)
     return _finish("wgrad", name, plan, out, launches, workspaces)
+
+
+# ---------------------------------------------------------------------------
+# Stable-API handoff: flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")
+# ---------------------------------------------------------------------------
+
+
+def grouped_mm_bf16_cake(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    m_indptr: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    tactic: int = -1,
+) -> torch.Tensor:
+    """``grouped_mm_bf16`` forward projection on the Cake backend.
+
+    ``out[m_indptr[e]:m_indptr[e + 1]] = a[m_indptr[e]:m_indptr[e + 1]] @ b[e].T``
+    with ``a`` ``[cum_m, K]`` bf16, ``b`` ``[E, N, K]`` bf16 and ``m_indptr``
+    ``[E + 1]`` int32 on the device (read by the kernel, never on the host).
+    Only bfloat16 outputs are produced and there is no tactic index; rows of
+    ``a`` past ``m_indptr[-1]`` are left untouched in ``out``.
+    """
+    warn_experimental_backend_once("grouped_mm_bf16", "cake")
+    if out is not None:
+        out_dtype = out.dtype
+    if out_dtype != torch.bfloat16:
+        raise ValueError(
+            "the cake backend of grouped_mm_bf16 produces bfloat16 outputs only "
+            f"(got out_dtype={out_dtype})"
+        )
+    if tactic != -1:
+        raise ValueError(
+            "the cake backend of grouped_mm_bf16 has a single generated program "
+            f"per architecture; tactic must be -1 (got {tactic})"
+        )
+    return prepare_grouped_gemm_fwd(a, b, m_indptr, out=out).launch()

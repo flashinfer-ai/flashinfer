@@ -306,3 +306,93 @@ def test_rejects_misaligned_shapes():
         prepare_grouped_gemm_fwd(x, w, offs)
     with pytest.raises(ValueError):
         prepare_grouped_gemm_fwd(x, w, offs.to(torch.int64))
+
+
+# ---------------------------------------------------------------------------
+# Stable-API opt-in, the m_indptr form and the autograd wrapper
+# ---------------------------------------------------------------------------
+
+
+def _m_indptr(sizes, device):
+    ends = [sum(sizes[: i + 1]) for i in range(len(sizes))]
+    return torch.tensor([0] + ends, dtype=torch.int32, device=device)
+
+
+def test_grouped_mm_bf16_cake_backend_matches_reference():
+    device = _require_program("fwd")
+    from flashinfer.grouped_mm import grouped_mm_bf16
+
+    x, w, _g, _offs = _inputs(RAGGED_E6, 1024, 512, device)
+    out = grouped_mm_bf16(x, w, _m_indptr(RAGGED_E6, device), backend="cake")
+    assert out.shape == (sum(RAGGED_E6), 1024) and out.dtype == torch.bfloat16
+    _assert_bf16_close(out, _reference("fwd", x, w, RAGGED_E6))
+    # rows past m_indptr[-1] belong to no group and are left untouched
+    padded_x = torch.cat([x, torch.zeros(37, 512, dtype=x.dtype, device=device)])
+    out = torch.full(
+        (sum(RAGGED_E6) + 37, 1024), float("nan"), dtype=torch.bfloat16, device=device
+    )
+    grouped_mm_bf16(padded_x, w, _m_indptr(RAGGED_E6, device), out=out, backend="cake")
+    _assert_bf16_close(out[: sum(RAGGED_E6)], _reference("fwd", x, w, RAGGED_E6))
+    assert torch.isnan(out[sum(RAGGED_E6) :]).all()
+
+
+def test_grouped_mm_bf16_cake_backend_rejects_unsupported_options():
+    device = _require_program("fwd")
+    from flashinfer.grouped_mm import grouped_mm_bf16
+
+    x, w, _g, _offs = _inputs(RAGGED_E4, 512, 256, device)
+    m_indptr = _m_indptr(RAGGED_E4, device)
+    with pytest.raises(ValueError):
+        grouped_mm_bf16(x, w, m_indptr, out_dtype=torch.float32, backend="cake")
+    with pytest.raises(ValueError):
+        grouped_mm_bf16(x, w, m_indptr, backend="cake", tactic=0)
+
+
+def test_m_indptr_form_matches_offs_form():
+    device = _require_program("fwd")
+    device = _require_program("dgrad")
+    device = _require_program("wgrad", torch.bfloat16)
+    x, w, g, offs = _inputs(RAGGED_E6, 512, 256, device)
+    m_indptr = _m_indptr(RAGGED_E6, device)
+    assert torch.equal(grouped_gemm_fwd(x, w, m_indptr), grouped_gemm_fwd(x, w, offs))
+    assert torch.equal(
+        grouped_gemm_dgrad(g, w, m_indptr), grouped_gemm_dgrad(g, w, offs)
+    )
+    assert torch.equal(
+        grouped_gemm_wgrad(g, x, m_indptr, num_groups=len(RAGGED_E6)),
+        grouped_gemm_wgrad(g, x, offs),
+    )
+    with pytest.raises(ValueError):  # neither E nor E + 1 entries
+        grouped_gemm_wgrad(g, x, m_indptr[:-2], num_groups=len(RAGGED_E6))
+
+
+def test_autograd_wrapper_matches_reference_and_is_deterministic():
+    device = _require_program("fwd")
+    device = _require_program("dgrad")
+    device = _require_program("wgrad", torch.bfloat16)
+    from flashinfer.experimental.cake_moe_grouped_gemm import cake_grouped_mm
+
+    x, w, g, offs = _inputs(RAGGED_E6, 512, 256, device)
+    x = x.clone().requires_grad_(True)
+    w = w.clone().requires_grad_(True)
+    y = cake_grouped_mm(x, w, offs)
+    assert y.shape == (sum(RAGGED_E6), 512) and y.dtype == torch.bfloat16
+    _assert_bf16_close(y.detach(), _reference("fwd", x.detach(), w.detach(), RAGGED_E6))
+    y.backward(g)
+    assert x.grad.dtype == torch.bfloat16 and w.grad.dtype == torch.bfloat16
+    _assert_bf16_close(x.grad, _reference("dgrad", g, w.detach(), RAGGED_E6))
+    _assert_bf16_close(w.grad, _reference("wgrad", g, x.detach(), RAGGED_E6))
+    for e, (s, t) in enumerate(_bounds(RAGGED_E6)):
+        if t == s:
+            assert torch.equal(w.grad[e], torch.zeros_like(w.grad[e])), (
+                f"empty group {e} must receive an exactly zero weight gradient"
+            )
+    dx, dw = x.grad.clone(), w.grad.clone()
+    x.grad = None
+    w.grad = None
+    # Same gradients from the m_indptr form; bitwise reproducible.
+    cake_grouped_mm(x, w, _m_indptr(RAGGED_E6, device), deterministic=True).backward(g)
+    torch.cuda.synchronize()
+    assert torch.equal(x.grad, dx) and torch.equal(w.grad, dw)
+    with pytest.raises(ValueError):
+        cake_grouped_mm(x.float(), w, offs)

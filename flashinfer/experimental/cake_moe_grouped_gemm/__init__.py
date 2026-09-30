@@ -24,9 +24,13 @@ limitations under the License.
 # The one-shot helpers below are the public opt-in (they warn once as an
 # experimental API).  The prepare-once / launch-many surface
 # (``prepare_grouped_gemm_*`` returning a ``GroupedGemmLaunch``) lives in
-# ``cake_backend`` and is re-exported lazily; the JIT registry filled by the
-# generated-program export lives in ``cake_jit``.  Both stay unimported until
-# first use so importing this package is cheap.
+# ``cake_backend`` and is re-exported lazily, as are the ``torch.autograd``
+# wrapper ``cake_grouped_mm`` / ``CakeGroupedMm`` of ``cake_autograd``; the
+# JIT registry filled by the generated-program export lives in ``cake_jit``.
+# All stay unimported until first use so importing this package is cheap.
+# The stable API ``flashinfer.grouped_mm.grouped_mm_bf16(..., backend="cake")``
+# routes the forward projection to ``cake_backend.grouped_mm_bf16_cake``.
+# ``offs`` may be given as ``[E]`` end offsets or as ``m_indptr`` ``[E + 1]``.
 
 from __future__ import annotations
 
@@ -37,7 +41,9 @@ import torch
 from ...api_logging import flashinfer_experimental_api
 
 __all__ = [
+    "CakeGroupedMm",
     "GroupedGemmLaunch",
+    "cake_grouped_mm",
     "grouped_gemm_dgrad",
     "grouped_gemm_fwd",
     "grouped_gemm_wgrad",
@@ -54,6 +60,7 @@ _BACKEND_EXPORTS = frozenset(
         "prepare_grouped_gemm_wgrad",
     }
 )
+_AUTOGRAD_EXPORTS = frozenset({"CakeGroupedMm", "cake_grouped_mm"})
 
 
 @flashinfer_experimental_api(feature="cake_moe_grouped_gemm.grouped_gemm_fwd")
@@ -72,8 +79,9 @@ def grouped_gemm_fwd(
     w : torch.Tensor
         ``[E, N, K]`` bfloat16 weights, one ``[N, K]`` matrix per group.
     offs : torch.Tensor
-        ``[E]`` int32 cumulative end offsets on the device (``offs[-1] == sum_m``);
-        read by the kernel, never on the host.
+        ``[E]`` int32 cumulative end offsets on the device (``offs[-1] == sum_m``),
+        or ``m_indptr`` ``[E + 1]`` with a leading 0; read by the kernel, never
+        on the host.
     out : Optional[torch.Tensor]
         ``[sum_m, N]`` bfloat16 output (allocated when omitted); may be row-padded.
 
@@ -104,7 +112,7 @@ def grouped_gemm_dgrad(
 
     ``g`` is ``[sum_m, N]`` bfloat16, ``w`` is ``[E, N, K]`` bfloat16 and is
     read in place (no transpose copy), ``offs`` is ``[E]`` int32 device end
-    offsets and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
+    offsets (or ``m_indptr`` ``[E + 1]``) and ``out`` is ``[sum_m, K]`` bfloat16.  ``K % 256 == 0`` and
     ``N % 64 == 0`` are required.  See ``grouped_gemm_fwd`` for the prepared form.
     """
     from .cake_backend import prepare_grouped_gemm_dgrad
@@ -119,20 +127,24 @@ def grouped_gemm_wgrad(
     offs: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    num_groups: Optional[int] = None,
 ) -> torch.Tensor:
     """``dW[e] = G[offs[e-1]:offs[e]].T @ X[offs[e-1]:offs[e]]`` for every group ``e``.
 
     ``g`` is ``[sum_m, N]`` bfloat16, ``x`` is ``[sum_m, K]`` bfloat16,
-    ``offs`` is ``[E]`` int32 device end offsets and ``out`` is ``[E, N, K]`` in
-    ``out_dtype`` (bfloat16 or float32; defaults to the dtype of ``out``, else
-    bfloat16).  fp32 accumulation, bitwise deterministic, exact zeros for empty
+    ``offs`` is ``[E]`` int32 device end offsets (``E = offs.numel()``; pass
+    ``num_groups=E`` to hand in ``m_indptr`` ``[E + 1]`` instead) and ``out``
+    is ``[E, N, K]`` in ``out_dtype`` (bfloat16 or float32; defaults to the
+    dtype of ``out``, else bfloat16).  fp32 accumulation, bitwise deterministic, exact zeros for empty
     groups.  ``N % 256 == 0`` and ``K`` a multiple of the selected k tile (256,
     or 512 when chosen) are required.  See ``grouped_gemm_fwd`` for the
     prepared form.
     """
     from .cake_backend import prepare_grouped_gemm_wgrad
 
-    return prepare_grouped_gemm_wgrad(g, x, offs, out=out, out_dtype=out_dtype).launch()
+    return prepare_grouped_gemm_wgrad(
+        g, x, offs, out=out, out_dtype=out_dtype, num_groups=num_groups
+    ).launch()
 
 
 def __getattr__(name: str) -> Any:
@@ -140,4 +152,8 @@ def __getattr__(name: str) -> Any:
         from . import cake_backend
 
         return getattr(cake_backend, name)
+    if name in _AUTOGRAD_EXPORTS:
+        from . import cake_autograd
+
+        return getattr(cake_autograd, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
