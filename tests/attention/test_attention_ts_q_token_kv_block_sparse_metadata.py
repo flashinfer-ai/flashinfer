@@ -767,7 +767,7 @@ def _make_case(group_size: int, block_topk: int, storage_page_size: int = 16):
     return blocks, block_table, requests, positions, storage_page_size
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMS_TS_ATTENTION
 @pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float8_e4m3fn))
 def test_q1_page_prefix_and_causal_tail_graph(dtype):
@@ -1551,6 +1551,7 @@ def _run_private_q_token_kv_block_sparse_decode(
         group_size,
         query.dtype,
         k_cache.dtype,
+        v_cache.dtype,
         out.dtype,
         "HND",
         "causal",
@@ -1634,6 +1635,7 @@ def test_grouped_split_q_token_kv_block_sparse_memberships_cross_kv128_boundarie
         sparse_page_size,
         max_seq_len,
         group_size,
+        "bfloat16",
         "bfloat16",
         "bfloat16",
         "bfloat16",
@@ -2809,6 +2811,7 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
         "bfloat16",
         "bfloat16",
         "bfloat16",
+        "bfloat16",
         "HND",
         "causal",
         False,
@@ -2835,6 +2838,7 @@ def test_prepared_q_token_kv_block_sparse_bf16_q1_tileq8_split8_matches_oracle_a
         sparse_block_size,
         context_length,
         1,
+        "bfloat16",
         "bfloat16",
         "bfloat16",
         "bfloat16",
@@ -3697,6 +3701,7 @@ def test_packed_q_token_kv_block_sparse_groups_match_packed_q1_attention(
             4,
             group_size * (block_topk + 1) * 4,
             group_size,
+            "bfloat16",
             "bfloat16",
             "bfloat16",
             "bfloat16",

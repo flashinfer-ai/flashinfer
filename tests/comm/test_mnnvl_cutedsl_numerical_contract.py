@@ -36,8 +36,6 @@ from flashinfer.comm.mnnvl_cutedsl_ar import (
 from flashinfer.utils import is_sm100a_supported
 
 
-HIDDEN_SIZE = 8192
-TOP_K = 10
 RMS_EPS = 1e-6
 WEIGHT_BIAS = 1.0
 PROTOCOL_CONFIGS = {
@@ -45,7 +43,7 @@ PROTOCOL_CONFIGS = {
     "bt": BT_ONLY_CONFIG,
     "ht": HT_ONLY_CONFIG,
 }
-pytestmark = [pytest.mark.gpu_8, pytest.mark.arch_sm10x]
+pytestmark = [pytest.mark.gpu_4, pytest.mark.arch_blackwell]
 
 
 @pytest.fixture(scope="module")
@@ -53,8 +51,8 @@ def distributed_group():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
-    if world_size not in (8, 16):
-        pytest.skip("Run this test with eight or sixteen distributed ranks")
+    if world_size not in (4, 8, 16):
+        pytest.skip("Run this test with four, eight, or sixteen distributed ranks")
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     device = torch.device("cuda", local_rank)
@@ -173,8 +171,8 @@ def _local_finalize(
     shared: torch.Tensor,
 ) -> torch.Tensor:
     m = weights.shape[0]
-    local = torch.zeros((m, HIDDEN_SIZE), dtype=torch.float32, device="cuda")
-    for route in range(TOP_K):
+    local = torch.zeros((m, routed.shape[1]), dtype=torch.float32, device="cuda")
+    for route in range(weights.shape[1]):
         rows = indices[:, route].to(torch.int64)
         torch.addcmul(
             local,
@@ -186,11 +184,13 @@ def _local_finalize(
     return _sanitize_negative_zero(local.to(torch.bfloat16))
 
 
-def _order_sensitive_local(m: int, rank: int, world_size: int) -> torch.Tensor:
+def _order_sensitive_local(
+    m: int, rank: int, world_size: int, hidden_size: int
+) -> torch.Tensor:
     generator = torch.Generator(device="cuda").manual_seed(3100 + rank)
     local = torch.randn(
         m,
-        HIDDEN_SIZE,
+        hidden_size,
         generator=generator,
         dtype=torch.bfloat16,
         device="cuda",
@@ -206,15 +206,15 @@ def _order_sensitive_local(m: int, rank: int, world_size: int) -> torch.Tensor:
     return local
 
 
-def _workspace(protocol: str, capacity_m: int, group):
+def _workspace(protocol: str, capacity_m: int, group, hidden_size: int, top_k: int):
     workspace = MNNVLCuteDSLAllReduceFusionWorkspace(
         tp_size=dist.get_world_size(group),
         tp_rank=dist.get_rank(group),
         max_token_num=capacity_m,
-        hidden_dim=HIDDEN_SIZE,
+        hidden_dim=hidden_size,
         dtype=torch.bfloat16,
         group=group,
-        top_k=TOP_K,
+        top_k=top_k,
         rms_eps=RMS_EPS,
         weight_bias=WEIGHT_BIAS,
         config=PROTOCOL_CONFIGS[protocol],
@@ -225,37 +225,47 @@ def _workspace(protocol: str, capacity_m: int, group):
 
 
 @pytest.mark.parametrize(
-    "protocol,large_bt",
-    (("ll", False), ("bt", False), ("bt", True), ("ht", False)),
+    "protocol,large_bt,hidden_size,top_k",
+    [
+        ("ll", False, 8192, 10),
+        ("bt", False, 8192, 10),
+        ("bt", True, 8192, 10),
+        ("ht", False, 8192, 10),
+        pytest.param("ht", False, 3584, 16, id="ht-k3"),
+    ],
 )
 @torch.inference_mode()
-def test_protocol_numerical_contract(distributed_group, protocol, large_bt):
+def test_protocol_numerical_contract(
+    distributed_group, protocol, large_bt, hidden_size, top_k
+):
     group = distributed_group
     rank = dist.get_rank(group)
     world_size = dist.get_world_size(group)
+    if hidden_size == 8192 and world_size == 4:
+        pytest.skip("The H8192 presets require TP8 or TP16")
     m = {8: 257, 16: 513}[world_size] if large_bt else world_size
-    workspace = _workspace(protocol, m, group)
+    workspace = _workspace(protocol, m, group, hidden_size, top_k)
     symmetric_reference = (
-        _make_symmetric_reference((m, HIDDEN_SIZE), group) if protocol == "ht" else None
+        _make_symmetric_reference((m, hidden_size), group) if protocol == "ht" else None
     )
 
     common_generator = torch.Generator(device="cuda").manual_seed(3200)
     residual = torch.randn(
         m,
-        HIDDEN_SIZE,
+        hidden_size,
         generator=common_generator,
         dtype=torch.bfloat16,
         device="cuda",
     )
     gamma = torch.randn(
-        HIDDEN_SIZE,
+        hidden_size,
         generator=common_generator,
         dtype=torch.bfloat16,
         device="cuda",
     )
 
     try:
-        local = _order_sensitive_local(m, rank, world_size)
+        local = _order_sensitive_local(m, rank, world_size, hidden_size)
         residual_out = torch.empty_like(local)
         norm_out = torch.empty_like(local)
         allreduce_fusion(
@@ -279,19 +289,19 @@ def test_protocol_numerical_contract(distributed_group, protocol, large_bt):
         )
 
         routed = torch.zeros(
-            m * TOP_K,
-            HIDDEN_SIZE,
+            m * top_k,
+            hidden_size,
             dtype=torch.bfloat16,
             device="cuda",
         )
-        weights = torch.zeros(m, TOP_K, dtype=torch.bfloat16, device="cuda")
-        shared = torch.zeros(m, HIDDEN_SIZE, dtype=torch.bfloat16, device="cuda")
+        weights = torch.zeros(m, top_k, dtype=torch.bfloat16, device="cuda")
+        shared = torch.zeros(m, hidden_size, dtype=torch.bfloat16, device="cuda")
         rank_generator = torch.Generator(device="cuda").manual_seed(3300 + rank)
-        routed[rank * TOP_K : (rank + 1) * TOP_K].normal_(generator=rank_generator)
+        routed[rank * top_k : (rank + 1) * top_k].normal_(generator=rank_generator)
         weights[rank].normal_(generator=rank_generator)
         shared[rank].normal_(generator=rank_generator)
-        indices = torch.arange(m * TOP_K, dtype=torch.int32, device="cuda").reshape(
-            m, TOP_K
+        indices = torch.arange(m * top_k, dtype=torch.int32, device="cuda").reshape(
+            m, top_k
         )
         zero_residual = torch.zeros_like(residual)
         residual_out.zero_()

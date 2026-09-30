@@ -9,11 +9,13 @@ import pytest
 from flashinfer.moe_ep.backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.config import (
     Sm100_Bf16_Bf16_Bf16_Cutedsl_MegaMoeConfig,
 )
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import MegaMoEBf16Config
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.autotune import (
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+    MegaMoEBf16Config,
+)
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.autotune import (
     bf16_candidates,
 )
-from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.tuner import (
+from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.tuner import (
     default_knobs,
     is_valid_bf16,
 )
@@ -64,7 +66,7 @@ def test_bf16_frontend_rejects_unsupported_shapes(
 def test_bf16_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16
 
     def fake_zeros(shape, dtype):
         tensor = torch.zeros(shape, dtype=dtype)
@@ -94,7 +96,7 @@ def test_bf16_factory_accepts_session_compatible_pinned_knobs(monkeypatch):
 def test_bf16_factory_rejects_unpermitted_pinned_ikr(monkeypatch):
     import torch
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16
 
     monkeypatch.setattr(
         bf16, "sym_zeros", lambda shape, dtype: torch.zeros(shape, dtype=dtype)
@@ -116,7 +118,7 @@ def test_bf16_factory_resolves_ikr_from_knobs_when_permitted(monkeypatch):
     """The permission is a ceiling: either knob value is now servable."""
     import torch
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import bf16
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import bf16
 
     def fake_zeros(shape, dtype):
         tensor = torch.zeros(shape, dtype=dtype)
@@ -147,7 +149,7 @@ def test_bf16_factory_resolves_ikr_from_knobs_when_permitted(monkeypatch):
 
 
 def test_bf16_frontend_rejects_unpermitted_ikr_knobs():
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
         MegaMoEBf16Frontend,
     )
 
@@ -175,8 +177,8 @@ def test_bf16_frontend_rejects_unpermitted_ikr_knobs():
 
 
 def test_bf16_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import autotune
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
         MegaMoEBf16Frontend,
     )
 
@@ -212,8 +214,8 @@ def test_bf16_autotune_filters_unpermitted_ikr_candidates(monkeypatch):
 
 def test_bf16_autotune_sweeps_the_ikr_axis_when_permitted(monkeypatch):
     """A permitted session times both ikr modes; both must be runnable as-is."""
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim import autotune
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim import autotune
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
         MegaMoEBf16Frontend,
     )
 

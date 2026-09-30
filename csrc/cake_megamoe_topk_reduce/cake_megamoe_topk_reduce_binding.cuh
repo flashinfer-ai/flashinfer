@@ -28,6 +28,9 @@
 #ifndef CAKE_MEGAMOE_TOPK_REDUCE_SMEM_BYTES
 #error "CAKE_MEGAMOE_TOPK_REDUCE_SMEM_BYTES must describe dynamic shared memory"
 #endif
+#if !defined(CAKE_MEGAMOE_TOPK_REDUCE_CC_MAJOR) || !defined(CAKE_MEGAMOE_TOPK_REDUCE_CC_MINOR)
+#error "CAKE_MEGAMOE_TOPK_REDUCE_CC_MAJOR/MINOR must name the exact target compute capability"
+#endif
 
 // The frozen body is a self-contained CUDA translation-unit fragment.  Keep
 // its fixed-width types intact: rewriting names such as uint32_t here would
@@ -68,9 +71,13 @@ inline void CheckTarget(int32_t device_id) {
             "cudaDeviceGetAttribute(major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
-  TVM_FFI_ICHECK(major == 10 && minor == 0)
-      << "the frozen MegaMoE TopK reducer requires exact compute capability 10.0, got " << major
-      << "." << minor;
+  // Each frozen export is compiled with a single arch-specific -gencode
+  // (sm_100a or sm_103a); the module only runs on that exact target.
+  TVM_FFI_ICHECK(major == CAKE_MEGAMOE_TOPK_REDUCE_CC_MAJOR &&
+                 minor == CAKE_MEGAMOE_TOPK_REDUCE_CC_MINOR)
+      << "this frozen MegaMoE TopK reducer module requires exact compute capability "
+      << CAKE_MEGAMOE_TOPK_REDUCE_CC_MAJOR << "." << CAKE_MEGAMOE_TOPK_REDUCE_CC_MINOR << ", got "
+      << major << "." << minor;
 }
 
 inline std::pair<uintptr_t, uintptr_t> TensorByteRange(const TensorView& tensor, const char* name) {

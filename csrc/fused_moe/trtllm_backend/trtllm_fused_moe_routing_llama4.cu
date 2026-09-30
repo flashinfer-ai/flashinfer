@@ -224,6 +224,10 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
     }
 
     auto expertIdx = threadIdx.x * ExpertsPerThread + ii;
+    auto localExpertIdx = static_cast<int32_t>(expertIdx) - params.mLocalExpertsStartIdx;
+    auto localExpertExtent = params.mNumLocalExperts << params.mLocalExpertsStrideLog2;
+    auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent &&
+                         (localExpertIdx & ((1 << params.mLocalExpertsStrideLog2) - 1)) == 0;
     // during the scan for expert offsets, we can already write out
     // both `mPtrCtaIdxXyToBatchIdx` and `mPtrCtaIdxXyToMnLimit`
     for (int cta = 0; cta < finalNumCta; ++cta) {
@@ -239,6 +243,10 @@ __global__ void __launch_bounds__(WarpSize) routingIndicesWarpKernel(KernelParam
         mnLimit2 = mulTileN<int32_t>(ctaOffsetExp, params.mTileTokensDim) + count;
       }
       params.mPtrCtaIdxXyToMnLimit[ctaOffsetExp + cta] = min(mnLimit1, mnLimit2);
+      // This warp path reserves remote-expert tiles but writes no live rows to them.
+      int32_t paddingBegin =
+          isLocalExpert ? min(mnLimit1, mnLimit2) : mnLimit1 - params.mTileTokensDim;
+      initRoutingTilePadding(params.mPtrPermutedIdxToTokenIdx, paddingBegin, mnLimit1);
     }
     ctaOffsetExp += finalNumCta;
   }

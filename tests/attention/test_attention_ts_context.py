@@ -2895,7 +2895,7 @@ def test_attention_ts_context_public_plan_rejects_unsupported_arch(monkeypatch):
     ),
     ids=("dtype", "head-dim", "head-ratio", "packed-offset", "mask-window"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_plan_rejects_critical_public_contracts(
     invalid_contract,
@@ -2962,7 +2962,7 @@ def test_attention_ts_context_rejects_unsupported_page_sizes(page_size: int):
         pytest.param(256, _FP8, id="d256-fp8"),
     ),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_paged_supported_page_sizes_accuracy(
     page_size: int,
@@ -2992,7 +2992,7 @@ def test_attention_ts_context_paged_supported_page_sizes_accuracy(
     _assert_context_correct(out, case.reference)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_paged_zero_fills_nan_v_tail():
     """Unused V rows must not poison PV after the score mask makes P zero."""
@@ -3021,7 +3021,7 @@ def test_attention_ts_context_paged_zero_fills_nan_v_tail():
 
 
 @pytest.mark.parametrize("paged", (False, True), ids=("packed", "paged"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_run_rejects_causal_q_longer_than_kv(paged: bool):
     """Bottom-right causal attention requires Sq <= Sk for every request."""
@@ -3536,7 +3536,7 @@ _CONTEXT_SMOKE_CASES = (
     ),
     _CONTEXT_SMOKE_CASES,
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_bounded_public_correctness_matrix(
     qkv_dtype: torch.dtype,
@@ -3573,7 +3573,7 @@ def test_attention_ts_context_bounded_public_correctness_matrix(
 
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_variable_window_t1_i1_t2_i2(
     head_dim: int,
@@ -3652,7 +3652,7 @@ def test_attention_ts_context_variable_window_t1_i1_t2_i2(
 
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_variable_window_uses_cta_minimum_start(head_dim: int):
     """A later Q row may extend into a K tile earlier than the CTA's first row."""
@@ -3693,7 +3693,7 @@ def test_attention_ts_context_variable_window_uses_cta_minimum_start(head_dim: i
 
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int):
     """Padded Q rows must not read past flattened per-row window bounds."""
@@ -3732,7 +3732,7 @@ def test_attention_ts_context_variable_window_clamps_padded_q_rows(head_dim: int
     _assert_context_correct(actual, case, expected=expected)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 @pytest.mark.parametrize("packed", (False, True), ids=("fixed", "packed"))
 def test_attention_ts_context_reuses_compiled_topology_across_batch_sizes(
@@ -3767,7 +3767,7 @@ def test_attention_ts_context_reuses_compiled_topology_across_batch_sizes(
     assert first_state.compiled is second_state.compiled
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_paged_context_reuses_compiled_topology_across_batch_sizes():
     """One paged-context topology accepts different batch extents."""
@@ -3798,7 +3798,7 @@ def test_attention_ts_paged_context_reuses_compiled_topology_across_batch_sizes(
     assert first_state.compiled is second_state.compiled
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_variable_window_graph_reloads_runtime_bounds():
     """Graph replay refreshes CTA minima from in-place-updated window bounds."""
@@ -3859,7 +3859,7 @@ def test_attention_ts_context_variable_window_graph_reloads_runtime_bounds():
     _assert_context_correct(graph_out, case, expected=expected)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_fixed_dense_k_tail_excludes_tma_padding():
     # With zero Q/K, every real key has score zero. A missing right-edge mask
@@ -3892,7 +3892,62 @@ def test_attention_ts_context_fixed_dense_k_tail_excludes_tma_padding():
     )
 
 
-@pytest.mark.arch_sm10x
+# Fixed dense K tails. The tail size S % 128 selects the partial-tile path.
+# D128 runs the query-paired softmax schedule, which masks the last tile after
+# the loop. D256 runs the single-QKV schedule, which masks it inside the loop.
+# Lengths with two or more K/V tiles run unmasked iterations before the tail.
+_FIXED_DENSE_K_TAIL_CASES = (
+    pytest.param((272,), id="two-tiles-tail16"),
+    pytest.param((336,), id="two-tiles-tail80"),
+    pytest.param((1040,), id="nine-tiles-tail16"),
+    pytest.param((4112,), id="thirty-three-tiles-tail16"),
+    pytest.param((4176,), id="thirty-three-tiles-tail80"),
+    pytest.param((4096,), id="aligned-control-no-tail"),
+)
+
+
+@pytest.mark.parametrize("k_lengths", _FIXED_DENSE_K_TAIL_CASES)
+@pytest.mark.parametrize(
+    "pv_dtype",
+    (torch.bfloat16, _FP8),
+    ids=("pv-bf16", "pv-fp8"),
+)
+@pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
+@pytest.mark.arch_blackwell
+@_REQUIRES_CONTEXT_GPU
+def test_attention_ts_context_fixed_dense_k_tail_accuracy(
+    k_lengths: tuple[int, ...],
+    pv_dtype: torch.dtype,
+    head_dim: int,
+):
+    """Random data on the fixed dense tail path against the torch reference.
+
+    Unpacked BSHD with equal Q and K lengths is the contiguous no-KV-cache
+    layout that diffusion workloads use. The last K/V tile is masked to its
+    valid keys, so the output matches the reference for PV bf16 and PV fp8.
+    """
+    (k_length,) = k_lengths
+    case = _make_context_case(
+        q_lengths=(k_length, k_length),
+        k_lengths=(k_length, k_length),
+        num_qo_heads=4,
+        num_kv_heads=4,
+        qkv_dtype=torch.bfloat16,
+        packed=False,
+        mask_type="dense",
+        head_dim=head_dim,
+        output_dtype=torch.bfloat16,
+        device="cuda",
+        seed=2026091602 + k_length + head_dim,
+    )
+    if pv_dtype is _FP8:
+        case = replace(case, v=case.v.to(_FP8))
+    wrapper = BatchPrefillTSWrapper()
+    _plan_wrapper(wrapper, case)
+    _assert_context_correct(_run_wrapper(wrapper, case), case)
+
+
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_packed_dense_k_bounds_exclude_peer_requests():
     # The first request owns only 65 K/V rows while the shared domain has
@@ -3932,7 +3987,7 @@ def test_attention_ts_context_packed_dense_k_bounds_exclude_peer_requests():
     )
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_uniform_aligned_packed_dense_accuracy():
     case = _make_context_case(
@@ -3955,7 +4010,7 @@ def test_attention_ts_context_uniform_aligned_packed_dense_accuracy():
     _assert_context_correct(_run_wrapper(wrapper, case), case)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_uniform_packed_offsets_accuracy():
     case = _make_context_case(
@@ -3978,7 +4033,7 @@ def test_attention_ts_context_uniform_packed_offsets_accuracy():
     _assert_context_correct(_run_wrapper(wrapper, case), case)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_uniform_packed_window_offsets_accuracy():
     case = _make_context_case(
@@ -4004,7 +4059,7 @@ def test_attention_ts_context_uniform_packed_window_offsets_accuracy():
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
 @pytest.mark.parametrize("mask_type", ("dense", "causal"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_qkbf16_pvfp8_accuracy(head_dim: int, mask_type: str):
     """QK-BF16/PV-FP8 stays accurate on both D topologies and both masks.
@@ -4033,7 +4088,7 @@ def test_attention_ts_context_qkbf16_pvfp8_accuracy(head_dim: int, mask_type: st
 
 @pytest.mark.parametrize("head_dim", (128, 256), ids=("d128", "d256"))
 @pytest.mark.parametrize("mask_type", ("dense", "causal"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_paged_qkbf16_pvfp8_accuracy(
     head_dim: int, mask_type: str
@@ -4067,7 +4122,7 @@ def test_attention_ts_context_paged_qkbf16_pvfp8_accuracy(
         pytest.param((65, 257), id="mixed-partial-short"),
     ),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_paged_dense_k_mask_accuracy(
     head_dim: int,
@@ -4100,7 +4155,7 @@ def test_attention_ts_context_paged_dense_k_mask_accuracy(
         pytest.param(256, True, id="d256-staged-page-ids"),
     ),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_paged_invalid_padding_ids_are_not_dereferenced(
     head_dim: int,
@@ -4160,7 +4215,7 @@ def test_attention_ts_context_paged_invalid_padding_ids_are_not_dereferenced(
     _assert_context_correct(output, case.reference)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 @pytest.mark.parametrize(
     "qkv_dtype",
@@ -4203,7 +4258,7 @@ def test_attention_ts_context_d128_paged_s16k_runtime(qkv_dtype: torch.dtype):
     _assert_context_correct(output, case.reference)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_fixed_window_tail_excludes_left_marker():
     # This shape has exactly one K/V tile in the head-paired window domain.
@@ -4235,7 +4290,7 @@ def test_attention_ts_context_fixed_window_tail_excludes_left_marker():
     assert torch.count_nonzero(actual) == 0
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_fixed_window_loop_excludes_right_marker():
     # The non-tile-aligned bottom-right offset makes K tile 0 a LOOP tile even
@@ -4265,7 +4320,7 @@ def test_attention_ts_context_fixed_window_loop_excludes_right_marker():
     assert torch.count_nonzero(actual[0, 0]) == 0
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_d256_fixed_head_paired_window_runtime():
     case = _make_context_case(
@@ -4295,7 +4350,7 @@ def test_attention_ts_context_d256_fixed_head_paired_window_runtime():
     assert torch.count_nonzero(output[0, 0]) == 0
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
     # BF16 D256 is the largest fixed-input footprint and therefore guards the
@@ -4321,7 +4376,7 @@ def test_attention_ts_context_d256_bf16_fixed_dense_runtime():
         _assert_context_correct(output, case)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 @pytest.mark.parametrize(
     ("qk_dtype", "output_dtype", "kv_length", "v_dtype"),
@@ -4396,7 +4451,7 @@ def test_attention_ts_context_d256_paged_dense_persistent_capacity_runtime(
     _assert_context_correct(output, case.reference)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_d256_fp8_paged_dense_crosses_page_windows():
     """A persistent launch consumes two complete 64-ID windows per request."""
@@ -4424,7 +4479,7 @@ def test_attention_ts_context_d256_fp8_paged_dense_crosses_page_windows():
     _assert_context_correct(output, case.reference)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_d256_paged_head_paired_window_runtime():
     case = _make_paged_context_case(
@@ -4464,7 +4519,7 @@ def test_attention_ts_context_d256_paged_head_paired_window_runtime():
     (torch.bfloat16, _FP8),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_d256_paged_dynamic_causal_runtime(
     q_lengths: tuple[int, ...],
@@ -4517,7 +4572,7 @@ def test_attention_ts_context_d256_paged_dynamic_causal_runtime(
     _assert_context_correct(graph_out, case.reference)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 @pytest.mark.parametrize(
     ("head_dim", "plan_k_lengths"),
@@ -4660,7 +4715,7 @@ def test_attention_ts_context_paged_graph_replay_reads_updated_fixed_metadata(
     _assert_context_correct(one_shot_out, runtime_reference, expected=expected)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_d256_fixed_causal_single_tile_runtime():
     case = _make_context_case(
@@ -4684,7 +4739,7 @@ def test_attention_ts_context_d256_fixed_causal_single_tile_runtime():
     _assert_context_correct(output, case)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
     case = _make_paged_context_case(
@@ -4729,7 +4784,7 @@ def test_attention_ts_context_paged_one_shot_causal_partial_tail_d256():
     (torch.bfloat16, _FP8),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_replay(
     paged: bool,
@@ -4886,7 +4941,7 @@ def test_attention_ts_context_live_q_offsets_expand_causal_domain_on_graph_repla
     _assert_context_correct(direct_out, runtime_reference, expected=expected)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
     """Live Q/K redistribution preserves D128 zero-offset paired semantics."""
@@ -4959,7 +5014,7 @@ def test_attention_ts_context_live_zero_offset_qk_redistribution_graph_replay():
     _assert_context_correct(direct_out, runtime_reference, expected=expected)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_live_k_redistribution_graph_replay():
     """Live K offsets independently update causal domains and right bounds."""
@@ -5024,7 +5079,7 @@ def test_attention_ts_context_live_k_redistribution_graph_replay():
     _assert_context_correct(direct_out, runtime_reference, expected=expected)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_paged_window_live_q_redistribution_graph_replay():
     """Finite-window start and right masks follow live packed Q offsets."""
@@ -5073,7 +5128,7 @@ def test_attention_ts_context_paged_window_live_q_redistribution_graph_replay():
     _assert_context_correct(direct_out, runtime_reference, expected=expected)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_paged_window_graph_replay_writes_fresh_output():
     case = _make_paged_context_case(
@@ -5108,7 +5163,7 @@ def test_attention_ts_context_paged_window_graph_replay_writes_fresh_output():
     _assert_context_correct(output, case.reference)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     first = _make_context_case(
@@ -5195,7 +5250,7 @@ def test_attention_ts_context_supplied_out_stream_and_cuda_graph():
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_mla_prefill(
     dtype, out_dtype, packed, q_lens, k_lens, large_masked_scores, causal

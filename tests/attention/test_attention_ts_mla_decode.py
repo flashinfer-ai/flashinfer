@@ -65,7 +65,6 @@ from flashinfer.attention.prims_ts.kernels.mla_decode.throughput_latency_1cta.co
 )
 from flashinfer.mla import (
     get_prims_ts_batch_mla_decode_workspace_size,
-    prims_ts_batch_mla_decode_with_kv_cache,
 )
 import flashinfer.attention.prims_ts.mla_decode as mla_decode_module
 
@@ -815,15 +814,15 @@ def _run_standalone(
         if out is None
         else out
     )
-    result = prims_ts_batch_mla_decode_with_kv_cache(
+    result = batch_mla_decode_with_paged_kv_cache(
         case.query,
         case.kv_cache,
-        workspace,
-        _LATENT_DIM,
-        _ROPE_DIM,
         case.block_tables,
         case.seq_lens,
-        case.max_seq_len,
+        workspace_buffer=workspace,
+        max_kv_len=case.max_seq_len,
+        kv_lora_rank=_LATENT_DIM,
+        qk_rope_head_dim=_ROPE_DIM,
         qo_indptr=qo_indptr,
         max_seq_len_q=resolved_max_seq_len_q,
         out=output,
@@ -1141,7 +1140,6 @@ def test_attention_ts_mla_public_surfaces_hide_internal_tuning_policy():
         BatchMLADecodePagedTSWrapper.run,
         batch_mla_decode_with_paged_kv_cache,
         get_prims_ts_batch_mla_decode_workspace_size,
-        prims_ts_batch_mla_decode_with_kv_cache,
     )
     violations = []
     for surface in surfaces:
@@ -1195,6 +1193,7 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
         "o_data_type",
         "mask_type",
         "workspace_buffer",
+        "validate",
     )
     for name in (
         "device",
@@ -1238,12 +1237,18 @@ def test_attention_ts_mla_wrapper_uses_compile_oriented_contract():
     assert run_parameters["validate"].default is True
 
 
+@pytest.mark.parametrize("validate", (True, False))
 def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
     monkeypatch,
+    validate,
 ):
     """Keep plan publication atomic and compilation after workspace checks."""
 
     events = []
+    device_calls = []
+    expected_events = (
+        ["spec"] + (["validate_workspace"] if validate else []) + ["bind_workspace"]
+    )
     policy = (("source", "auto"), ("split_kv", 1))
     spec = mla_decode_module._MLADecodeLaunchSpec(
         kernel=object(),
@@ -1255,6 +1260,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
 
     def resolve_device(device):
         assert device == "cuda:0"
+        device_calls.append("resolve")
         return torch.device("cpu"), 0
 
     def resolve_spec(*args):
@@ -1271,11 +1277,16 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         return original_bind(workspace_buffer, layout)
 
     def compile_plan(*args):
-        assert events == ["spec", "validate_workspace", "bind_workspace"]
+        assert events == expected_events
         events.append("compile")
         return lambda *launch_args: None
 
     monkeypatch.setattr(mla_decode_module, "_resolve_cuda_device", resolve_device)
+    monkeypatch.setattr(
+        mla_decode_module,
+        "_validate_runtime_device",
+        lambda _device: device_calls.append("validate"),
+    )
     monkeypatch.setattr(
         mla_decode_module, "_resolve_mla_decode_launch_spec", resolve_spec
     )
@@ -1306,9 +1317,11 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
         kv_data_type=torch.bfloat16,
         o_data_type=torch.bfloat16,
         workspace_buffer=workspace,
+        validate=validate,
     )
 
-    assert events == ["spec", "validate_workspace", "bind_workspace", "compile"]
+    assert events == [*expected_events, "compile"]
+    assert device_calls == (["resolve", "validate"] if validate else ["resolve"])
     assert tuple(vars(wrapper)) == ("_plan_state",)
     state = wrapper._plan_state
     assert state is not None
@@ -1335,6 +1348,7 @@ def test_attention_ts_mla_plan_publishes_frozen_state_after_workspace_binding(
             q_data_type=torch.bfloat16,
             kv_data_type=torch.bfloat16,
             o_data_type=torch.bfloat16,
+            validate=validate,
             workspace_buffer=workspace,
         )
     assert wrapper._plan_state is state
@@ -1684,7 +1698,7 @@ def test_attention_ts_mla_workspace_rejects_unsafe_int32_kv_bound():
         )
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_block_table_stride_contract():
     """Accept padded rows and reject non-unit inner or overlapping strides."""
@@ -1729,7 +1743,7 @@ def test_attention_ts_mla_block_table_stride_contract():
     ),
     ids=("zero-length", "negative-length", "exceeds-explicit-bound"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_run_rejects_invalid_kv_lengths(
     seq_lens,
@@ -1769,7 +1783,7 @@ def test_attention_ts_mla_run_rejects_invalid_kv_lengths(
         )
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_run_rejects_invalid_active_page_id():
     """Validate every active page reference against runtime cache storage."""
@@ -1798,7 +1812,7 @@ def test_attention_ts_mla_run_rejects_invalid_active_page_id():
 
 
 @pytest.mark.parametrize("packed_q", (False, True), ids=("fixed", "packed"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
     packed_q: bool,
@@ -1858,10 +1872,10 @@ def test_attention_ts_mla_rejects_per_request_causal_q_longer_than_kv(
         )
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
-def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
-    """The standalone ABI cannot derive a packed-Q JIT bound on its hot path."""
+def test_attention_ts_mla_packed_query_requires_trusted_static_bound():
+    """The trusted caller-workspace path requires an explicit packed-Q bound."""
 
     case = _make_mla_case(
         batch_size=2,
@@ -1874,21 +1888,22 @@ def test_attention_ts_mla_packed_query_requires_standalone_static_bound():
     )
     case, qo_indptr = _pack_mla_case(case, (1, 1))
     workspace = torch.empty(1, dtype=torch.uint8, device="cuda")
-    with pytest.raises(ValueError, match="max_seq_len_q is required"):
-        prims_ts_batch_mla_decode_with_kv_cache(
+    with pytest.raises(ValueError, match="requires max_seq_len_q"):
+        batch_mla_decode_with_paged_kv_cache(
             case.query,
             case.kv_cache,
-            workspace,
-            _LATENT_DIM,
-            _ROPE_DIM,
             case.block_tables,
             case.seq_lens,
-            case.max_seq_len,
+            workspace_buffer=workspace,
+            max_kv_len=case.max_seq_len,
+            kv_lora_rank=_LATENT_DIM,
+            qk_rope_head_dim=_ROPE_DIM,
             qo_indptr=qo_indptr,
+            validate=False,
         )
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_fp8_reference_uses_p448():
     case = _make_mla_case(
@@ -1930,7 +1945,7 @@ def test_attention_ts_mla_fp8_reference_uses_p448():
         ),
     ),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_fp8_fully_masked_split_partials(
     case_kwargs,
@@ -1970,7 +1985,7 @@ def test_attention_ts_mla_speculative_mask_oracle_distinguishes_tail_visibility(
     torch.testing.assert_close(causal_reference[:, -1], dense_reference[:, -1])
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_packed_q_public_parity():
     """Define variable and empty runtime Q lengths with cumulative offsets."""
@@ -2046,7 +2061,7 @@ def test_attention_ts_mla_decode_packed_q_public_parity():
     torch.testing.assert_close(derived_bound_one_shot, eager, rtol=0, atol=0)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_packed_q_clc_empty_tile_progress():
     """Advance CLC bookkeeping when a packed request has no row in a Q tile."""
@@ -2079,7 +2094,7 @@ def test_attention_ts_mla_decode_packed_q_clc_empty_tile_progress():
 
 
 @pytest.mark.parametrize("table_layout", ("compact", "trt-plane0"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_row_strided_page_table_metadata_mutation(
     table_layout: str,
@@ -2167,7 +2182,7 @@ def test_attention_ts_mla_row_strided_page_table_metadata_mutation(
     ),
     _MLA_CASES,
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_compact_variable_k_acceptance(
     case_kwargs,
@@ -2215,7 +2230,7 @@ def test_attention_ts_mla_decode_compact_variable_k_acceptance(
     )
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_2cta_graph_reloads_remapped_page_window():
     """Graph replay reloads a 33-page table through the 2CTA page window."""
@@ -2273,7 +2288,7 @@ def test_attention_ts_mla_2cta_graph_reloads_remapped_page_window():
     assert not torch.allclose(graph_out.float(), eager.float(), rtol=1e-3, atol=1e-3)
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
     """One replay reloads packed Q offsets, K lengths, and every page-table row."""
@@ -2357,7 +2372,7 @@ def test_attention_ts_mla_decode_graph_reloads_all_live_metadata():
     (torch.bfloat16, torch.float8_e4m3fn),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_page_size_dtype_product(
     page_size: int,
@@ -2399,7 +2414,7 @@ def test_attention_ts_mla_decode_page_size_dtype_product(
     (torch.bfloat16, torch.float8_e4m3fn),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_2cta_page_size_dtype_product(
     page_size: int,
@@ -2442,7 +2457,7 @@ def test_attention_ts_mla_decode_2cta_page_size_dtype_product(
     (torch.bfloat16, torch.float8_e4m3fn),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_head_dtype_product(
     num_qo_heads: int,
@@ -2463,7 +2478,7 @@ def test_attention_ts_mla_decode_head_dtype_product(
 
 @pytest.mark.parametrize("num_qo_heads", (12, 96), ids=("h12", "h96"))
 @pytest.mark.parametrize("packed_query", (False, True), ids=("fixed", "packed"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
     num_qo_heads: int,
@@ -2515,7 +2530,7 @@ def test_attention_ts_mla_decode_reuses_compiled_topology_across_batch_sizes(
     (torch.bfloat16, torch.float8_e4m3fn),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
     num_qo_heads: int,
@@ -2544,7 +2559,7 @@ def test_attention_ts_mla_decode_non_power_of_two_heads_1cta_auto(
     (torch.bfloat16, torch.float8_e4m3fn),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_non_power_heads_1cta_split_reduction(
     qkv_dtype: torch.dtype,
@@ -2574,7 +2589,7 @@ def test_attention_ts_mla_decode_non_power_heads_1cta_split_reduction(
         pytest.param(320, 8, 1, 40508, id="persistent-grid"),
     ),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_one_cta_multiwave_progress(
     batch_size: int,
@@ -2613,7 +2628,7 @@ def test_attention_ts_mla_decode_one_cta_multiwave_progress(
     (torch.bfloat16, torch.float8_e4m3fn),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_non_power_of_two_heads_2cta_matched_rows(
     num_qo_heads: int,
@@ -2646,7 +2661,7 @@ def test_attention_ts_mla_decode_non_power_of_two_heads_2cta_matched_rows(
     (torch.bfloat16, torch.float8_e4m3fn),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_non_power_heads_2cta_split_reduction(
     qkv_dtype: torch.dtype,
@@ -2676,7 +2691,7 @@ def test_attention_ts_mla_decode_non_power_heads_2cta_split_reduction(
     ids=("bf16", "fp8"),
 )
 @pytest.mark.parametrize("mask_type", ("dense", "causal"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_sq2_head_dtype_mask_product(
     num_qo_heads: int,
@@ -2706,7 +2721,7 @@ def test_attention_ts_mla_decode_sq2_head_dtype_mask_product(
     ids=("bf16", "fp8"),
 )
 @pytest.mark.parametrize("mask_type", ("dense", "causal"))
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_packed_dtype_mask_page_product(
     page_size: int,
@@ -2752,7 +2767,7 @@ def test_attention_ts_mla_decode_packed_dtype_mask_page_product(
     (torch.bfloat16, torch.float8_e4m3fn),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
     num_qo_heads: int,
@@ -2820,7 +2835,7 @@ def test_attention_ts_mla_decode_packed_non_power_of_two_heads(
         pytest.param(96, "throughput_2cta", id="h96-2cta"),
     ),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     num_qo_heads: int,
@@ -2914,7 +2929,7 @@ def test_attention_ts_mla_decode_all_empty_packed_query_noop(
     (torch.bfloat16, torch.float8_e4m3fn),
     ids=("bf16", "fp8"),
 )
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @_REQUIRES_PRIMTS_GPU
 def test_attention_ts_mla_decode_runtime_k_pruning_product(
     num_qo_heads: int,

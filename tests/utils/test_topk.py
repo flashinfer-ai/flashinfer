@@ -24,6 +24,7 @@ import flashinfer
 import flashinfer.utils as flashinfer_utils
 from flashinfer.topk import can_implement_filtered_topk
 from flashinfer.utils import get_compute_capability
+from tests.test_helpers.parametrize import parametrize_product
 
 
 @pytest.fixture
@@ -107,17 +108,42 @@ def _build_strictly_descending_logits(
     return base.unsqueeze(0).repeat(num_rows, 1).contiguous()
 
 
-@pytest.mark.parametrize("batch_size", [1, 16, 64])
-@pytest.mark.parametrize("vocab_size", [32000, 65536, 128512])
-@pytest.mark.parametrize("k", [256, 512, 1024])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize(
-    "tie_break",
-    [
-        flashinfer.TopKTieBreak.NONE,
-        flashinfer.TopKTieBreak.SMALL,
-        flashinfer.TopKTieBreak.LARGE,
+def _top_k_case_id(case):
+    batch_size, vocab_size, k, dtype, tie_break = case
+    dtype_name = str(dtype).removeprefix("torch.")
+    return f"b{batch_size}-v{vocab_size}-k{k}-{dtype_name}-{tie_break.name.lower()}"
+
+
+@parametrize_product(
+    {
+        "batch_size": [1, 16, 64],
+        "vocab_size": [32000, 65536, 128512],
+        "k": [256, 512, 1024],
+        "dtype": [torch.float32, torch.float16, torch.bfloat16],
+        "tie_break": [
+            flashinfer.TopKTieBreak.NONE,
+            flashinfer.TopKTieBreak.SMALL,
+            flashinfer.TopKTieBreak.LARGE,
+        ],
+    },
+    regular=[
+        (1, 32000, 256, torch.float32, flashinfer.TopKTieBreak.NONE),
+        (1, 65536, 512, torch.bfloat16, flashinfer.TopKTieBreak.NONE),
+        (1, 128512, 1024, torch.float16, flashinfer.TopKTieBreak.NONE),
+        (16, 32000, 512, torch.float16, flashinfer.TopKTieBreak.NONE),
+        (16, 65536, 1024, torch.float32, flashinfer.TopKTieBreak.NONE),
+        (16, 128512, 256, torch.bfloat16, flashinfer.TopKTieBreak.NONE),
+        (64, 32000, 1024, torch.bfloat16, flashinfer.TopKTieBreak.NONE),
+        (64, 65536, 256, torch.float16, flashinfer.TopKTieBreak.NONE),
+        (64, 128512, 512, torch.float32, flashinfer.TopKTieBreak.NONE),
+        (1, 32000, 256, torch.float32, flashinfer.TopKTieBreak.SMALL),
+        (16, 65536, 512, torch.float16, flashinfer.TopKTieBreak.SMALL),
+        (64, 128512, 1024, torch.bfloat16, flashinfer.TopKTieBreak.SMALL),
+        (1, 128512, 1024, torch.bfloat16, flashinfer.TopKTieBreak.LARGE),
+        (16, 65536, 512, torch.float16, flashinfer.TopKTieBreak.LARGE),
+        (64, 32000, 256, torch.float32, flashinfer.TopKTieBreak.LARGE),
     ],
+    ids=_top_k_case_id,
 )
 def test_top_k(batch_size, vocab_size, k, dtype, tie_break):
     """Test top_k returns correct values and indices."""

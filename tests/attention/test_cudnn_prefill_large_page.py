@@ -214,7 +214,7 @@ def test_cudnn_prefill_large_page_wrapper():
         max_sequence_kv=max(kv_lens),
         block_tables=block_tables,
     )
-    output = wrapper.run(q, (k_cache, v_cache))
+    output = wrapper.run(q, (k_cache.transpose(1, 2), v_cache.transpose(1, 2)))
 
     ref = _dense_reference(q, k_cache, v_cache, block_tables, q_lens, kv_lens, scale)
     torch.testing.assert_close(output.float(), ref, atol=2e-2, rtol=2e-2)

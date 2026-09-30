@@ -19,11 +19,18 @@ from flashinfer.fused_moe import (
     B12xNvfp4Config,
     B12xW4A16Config,
     CutlassBf16Config,
+    CutlassFp8PerTensorConfig,
+    CutlassMxfp8Mxfp4Config,
     CutlassNvfp4Config,
     CutlassW4A16Config,
     CuTileBf16Config,
+    CuTileFp8PerTensorBf16Config,
+    CuTileFp8PerTensorConfig,
     CuTileMxfp4Bf16Config,
     CuTileMxfp4Config,
+    CuTileMxfp4Mxfp8Config,
+    CuTileMxfp8Bf16Config,
+    CuTileMxfp8Config,
     CuTileNvfp4Bf16Config,
     CuTileNvfp4Config,
     ExecutionConfig,
@@ -78,6 +85,13 @@ _BACKEND_CONFIGS = {
     ("mxfp4", "cutile"): CuTileMxfp4Config,
     ("mxfp4_w4a16", "cutlass"): CutlassW4A16Config,
     ("mxfp4_w4a16", "cutile"): CuTileMxfp4Bf16Config,
+    ("fp8", "cutile"): CuTileFp8PerTensorConfig,
+    ("fp8", "cutlass"): CutlassFp8PerTensorConfig,
+    ("fp8_w8a16", "cutile"): CuTileFp8PerTensorBf16Config,
+    ("mxfp8", "cutile"): CuTileMxfp8Config,
+    ("mxfp8_w8a16", "cutile"): CuTileMxfp8Bf16Config,
+    ("mxfp4_w4a8", "cutile"): CuTileMxfp4Mxfp8Config,
+    ("mxfp4_w4a8", "cutlass"): CutlassMxfp8Mxfp4Config,
 }
 
 _ACTIVATIONS = {
@@ -109,7 +123,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
         "--quant-variant",
         "--quant_variant",
         dest="quant_variant",
-        choices=("bf16", "nvfp4", "nvfp4_w4a16", "mxfp4", "mxfp4_w4a16"),
+        choices=tuple(dict.fromkeys(mode for mode, _ in _BACKEND_CONFIGS)),
         default="bf16",
         help="Precision mode: mxfp4 means MXFP4 weights and MXFP4 activations.",
     )
@@ -238,6 +252,33 @@ def _quantize_cutile_mxfp4_source(weight: torch.Tensor):
     )
 
 
+def _quantize_cutile_fp8_source(weight: torch.Tensor, *, block_scaled: bool):
+    """Create checkpoint-style E4M3 weights, bounded to one expert at a time."""
+    q = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+    scale = torch.empty(
+        (*weight.shape[:-1], weight.shape[-1] // 32)
+        if block_scaled
+        else (weight.shape[0],),
+        device=weight.device,
+        dtype=torch.float8_e8m0fnu if block_scaled else torch.float32,
+    )
+    for expert in range(weight.shape[0]):
+        x = weight[expert].float()
+        if block_scaled:
+            x = x.reshape(x.shape[0], -1, 32)
+            s = torch.exp2(
+                torch.ceil(torch.log2((x.abs().amax(-1) / 448).clamp_min(2.0**-127)))
+            )
+            scale[expert].copy_(s)
+            x = x / s.unsqueeze(-1)
+        else:
+            s = (x.abs().amax() / 448).clamp_min(2.0**-126)
+            scale[expert].copy_(s)
+            x = x / s
+        q[expert].copy_(x.clamp(-448, 448).reshape(weight.shape[1:]))
+    return q, scale
+
+
 def _prepare_weight_view(
     backend: str,
     quant_variant: str,
@@ -257,6 +298,12 @@ def _prepare_weight_view(
     }
     if quant_variant == "bf16" or backend == "cutlass":
         return config_type.prepare_weights(w1, w2, **common)
+
+    if quant_variant.startswith(("fp8", "mxfp8")):
+        block_scaled = quant_variant.startswith("mxfp8")
+        q1, s1 = _quantize_cutile_fp8_source(w1, block_scaled=block_scaled)
+        q2, s2 = _quantize_cutile_fp8_source(w2, block_scaled=block_scaled)
+        return config_type.prepare_weights(q1, s1, q2, s2, **common)
 
     if quant_variant.startswith("nvfp4"):
         w1_q, w1_scale, w1_global = _quantize_cutile_nvfp4_source(w1)
@@ -400,6 +447,11 @@ def _config_for_backend(args, activation, backend_config) -> MoEConfig:
         "nvfp4_w4a16": (QuantFormat.NVFP4, QuantFormat.BF16),
         "mxfp4": (QuantFormat.MXFP4, QuantFormat.MXFP4),
         "mxfp4_w4a16": (QuantFormat.MXFP4, QuantFormat.BF16),
+        "fp8": (QuantFormat.FP8PerTensor, QuantFormat.FP8PerTensor),
+        "fp8_w8a16": (QuantFormat.FP8PerTensor, QuantFormat.BF16),
+        "mxfp8": (QuantFormat.MXFP8, QuantFormat.MXFP8),
+        "mxfp8_w8a16": (QuantFormat.MXFP8, QuantFormat.BF16),
+        "mxfp4_w4a8": (QuantFormat.MXFP4, QuantFormat.MXFP8),
     }[args.quant_variant]
     return MoEConfig(
         routing=RoutingConfig(num_experts=args.num_experts, top_k=args.top_k),
@@ -428,13 +480,30 @@ def _choose_tactic(args, runner, inputs: list[torch.Tensor]):
     return tactic
 
 
-def _measure_runner(args, runner, inputs: list[torch.Tensor], tactic: Any):
+def _measure_runner(
+    args,
+    runner,
+    inputs: list[torch.Tensor],
+    tactic: Any,
+    *,
+    input_quantizer=None,
+    bf16_input=None,
+):
     runner.forward(inputs, tactic=tactic, do_preparation=True)
     torch.cuda.synchronize()
-    output = runner.forward(inputs, tactic=tactic).detach().clone()
 
     def run(*profile_inputs):
-        return runner.forward(list(profile_inputs), tactic=tactic)
+        if input_quantizer is None:
+            packed = list(profile_inputs)
+        else:
+            # CUTLASS FP8 takes prequantized input. Include its public BF16
+            # conversion in the timed graph to match cuTile's API boundary.
+            packed = list(profile_inputs[1:])
+            packed[1], packed[-1] = input_quantizer(profile_inputs[0])
+        return runner.forward(packed, tactic=tactic)
+
+    profile_inputs = tuple(inputs) if input_quantizer is None else (bf16_input, *inputs)
+    output = run(*profile_inputs).detach().clone()
 
     times = bench_gpu_time(
         fn=run,
@@ -445,7 +514,7 @@ def _measure_runner(args, runner, inputs: list[torch.Tensor], tactic: Any):
         use_cuda_graph=not args.no_cuda_graph,
         num_iters_within_graph=1,
         cold_l2_cache=True,
-        input_args=tuple(inputs),
+        input_args=profile_inputs,
     )
     return output, float(np.median(times)), float(np.std(times))
 
@@ -501,6 +570,21 @@ def run_unified_moe_test(args):
         backend_config = config_type()
         config = _config_for_backend(args, activation, backend_config)
         try:
+            backend_activations = activations
+            if config_type is CutlassNvfp4Config:
+                # CUTLASS NVFP4 consumes the TRT-LLM canonical pre-quantized
+                # pack; b12x / cuTile NVFP4 quantize BF16 in-kernel. Inside the
+                # guard so an unaligned hidden_size skips this backend like any
+                # other unsupported configuration.
+                x_q, x_sf = CutlassNvfp4Config.prepare_activations(
+                    activations.hidden_states_q
+                )
+                backend_activations = MoEActivationPack(
+                    hidden_states_q=x_q,
+                    hidden_states_scale=x_sf,
+                    topk_ids=activations.topk_ids,
+                    topk_weights=activations.topk_weights,
+                )
             layer = MoELayer(config, device=device)
             runner = layer.runners[0]
             view = _prepare_weight_view(
@@ -515,7 +599,17 @@ def run_unified_moe_test(args):
             )
             weights = MoEWeightPack()
             weights.prepare_for(runner.backend_key, view)
-            inputs = runner.pack_inputs(activations, weights)
+            input_quantizer = None
+            if backend == "cutlass" and args.quant_variant in ("fp8", "mxfp4_w4a8"):
+                input_quantizer = config_type.prepare_activations
+                quantized, scale = input_quantizer(activations.hidden_states_q)
+                backend_activations = MoEActivationPack(
+                    hidden_states_q=quantized,
+                    hidden_states_scale=scale,
+                    topk_ids=activations.topk_ids,
+                    topk_weights=activations.topk_weights,
+                )
+            inputs = runner.pack_inputs(backend_activations, weights)
             # Like mm_fp4, execute the fallback once to reject configurations
             # that pass the coarse architecture check but fail at runtime.
             runner.forward(inputs, tactic=-1, do_preparation=True)
@@ -528,7 +622,20 @@ def run_unified_moe_test(args):
             continue
 
         tactic = _choose_tactic(args, runner, inputs)
-        output, median_time, std_time = _measure_runner(args, runner, inputs, tactic)
+        prequantized_median: float | str = ""
+        prequantized_std: float | str = ""
+        if input_quantizer is not None:
+            _, prequantized_median, prequantized_std = _measure_runner(
+                args, runner, inputs, tactic
+            )
+        output, median_time, std_time = _measure_runner(
+            args,
+            runner,
+            inputs,
+            tactic,
+            input_quantizer=input_quantizer,
+            bf16_input=activations.hidden_states_q,
+        )
         backend_label = f"{backend}_autotune" if args.autotune else backend
 
         refcheck_passed: bool | str = ""
@@ -559,6 +666,8 @@ def run_unified_moe_test(args):
             if args.quant_variant == "bf16"
             else ("nvfp4" if args.quant_variant.startswith("nvfp4") else "mxfp4")
         )
+        if args.quant_variant.startswith(("fp8", "mxfp8")):
+            weight_format = "mxfp8" if args.quant_variant.startswith("mxfp8") else "fp8"
         weight_dtype = torch.uint8 if weight_format else torch.bfloat16
         tb_per_sec = calculate_moe_kernel_bandwidth(
             args.num_tokens,
@@ -569,7 +678,9 @@ def run_unified_moe_test(args):
             median_time,
             torch.bfloat16,
             weight_dtype,
-            input_format=None,
+            # CUTLASS NVFP4 reads a pre-quantized FP4 + E4M3-scale pack; the
+            # other NVFP4 backends read BF16 and quantize in-kernel.
+            input_format="nvfp4" if config_type is CutlassNvfp4Config else None,
             weight_format=weight_format,
             routing_logits_dtype=None,
             active_experts=active_experts,
@@ -602,6 +713,8 @@ def run_unified_moe_test(args):
             refcheck_passed=refcheck_passed,
             fp4_mode=weight_format or "",
             cold_l2_cache=True,
+            prequantized_median_time=prequantized_median,
+            prequantized_std_time=prequantized_std,
         )
         results.append(current)
 

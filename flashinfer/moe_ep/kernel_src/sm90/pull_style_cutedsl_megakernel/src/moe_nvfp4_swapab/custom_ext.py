@@ -11,7 +11,7 @@ from cutlass.cutlass_dsl import Int32, extract_mlir_values, new_from_mlir_values
 from cutlass._mlir import ir
 
 from cutlass.utils.blockscaled_layout import tile_atom_to_shape_SF
-from .fc1_fc2_fuse_sched import BlockPhase
+from .fc1_fc2_fuse_sched import BlockPhase, TailSplitBit
 from .moe_utils import rewrite_tensor_shape, spin_wait
 from .moe_persistent_scheduler import MoESchedExtension, MoEWorkTileInfo
 
@@ -62,6 +62,13 @@ class SwapABSwigluFp4Fc12WorkTileInfo(MoEWorkTileInfo):
 
         """Decode the BlockPhase from slot 7's low 16 bits."""
         return self.phase_and_peek & Int32(PhaseMask)
+
+    @property
+    def is_tail_split(self):
+        """Slot 7 bit 17: tail-split pair task (both CTAs of the cluster work
+        on the same token tile and adjacent weight tiles; the weight operand
+        must be loaded without multicast).  See ``fc1_fc2_fuse_sched``."""
+        return (self.phase_and_peek & Int32(TailSplitBit)) != Int32(0)
 
     @property
     def peek_ready(self):
@@ -181,6 +188,13 @@ class GluMxFp8WorkTileInfo(MoEWorkTileInfo):
     @property
     def phase(self) -> Int32:
         return self.phase_and_peek & Int32(PhaseMask)
+
+    @property
+    def is_tail_split(self):
+        """Slot 7 bit 17: tail-split pair task (both CTAs of the cluster work
+        on the same token tile and adjacent weight tiles; the weight operand
+        must be loaded without multicast).  See ``fc1_fc2_fuse_sched``."""
+        return (self.phase_and_peek & Int32(TailSplitBit)) != Int32(0)
 
     @property
     def peek_ready(self):

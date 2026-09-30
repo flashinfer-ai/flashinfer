@@ -27,6 +27,7 @@ struct PrefillColdParams {
   int page_block_size = 64;
   flashinfer::uint_fastdiv main_div;
   flashinfer::uint_fastdiv extra_div;
+  float lse_scale = 1.f;
 };
 
 struct Dsv4PageDivisors {
@@ -57,6 +58,7 @@ struct Dsv4Nvfp4AttentionParams {
   int num_tokens;
   float sm_scale;
   size_t page_stride_bytes;
+  float lse_scale = 1.f;
 };
 
 }  // namespace flashinfer::sparse_mla_sm120::nvfp4
@@ -91,6 +93,7 @@ struct AttentionParams {
   size_t out_lse_stride_elems;
   int page_size;
   bool extra_fp4;
+  float lse_scale = 1.f;
 };
 
 }  // namespace flashinfer::sparse_mla_sm120::execution

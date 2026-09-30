@@ -1,7 +1,7 @@
 """Multi-rank fused-launch tests for MoEEpMegaLayer (sm100_bf16_bf16_bf16_cutedsl).
 
 Launched via torchrun:
-    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_sm10x"
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_bf16_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 """
 
 from __future__ import annotations
@@ -10,7 +10,7 @@ import os
 
 import pytest
 
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -166,7 +166,7 @@ def _reference_bf16_mega_moe(
     from flashinfer.moe_ep.backends.mega.kernel.sm100.common.bf16_staging import (
         stage_mega_moe_inputs,
     )
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         bf16_mega_moe,
         get_symm_buffer_for_bf16_mega_moe,
     )
@@ -318,7 +318,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         stage_mega_moe_inputs,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         bf16_mega_moe,
         compute_megamoe_reference_bf16,
         get_symm_buffer_for_bf16_mega_moe,
@@ -416,14 +416,16 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("load_balance_mode", ("static", "atomic_counter"))
 @pytest.mark.parametrize(
     "token_back_mode",
     ("epi_warps", "standalone_warps", "reuse_dispatch_warps"),
 )
 def test_bf16_multirank_modes_are_constructible(load_balance_mode, token_back_mode):
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.bf16 import MegaMoEBf16Config
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.bf16 import (
+        MegaMoEBf16Config,
+    )
 
     config = MegaMoEBf16Config(
         rank=0,
@@ -440,7 +442,7 @@ def test_bf16_multirank_modes_are_constructible(load_balance_mode, token_back_mo
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 def test_moe_ep_bf16_cutedsl_mega_layer_matches_reference():
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -451,7 +453,7 @@ def test_moe_ep_bf16_cutedsl_mega_layer_matches_reference():
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 def test_moe_ep_bf16_cutedsl_mega_layer_in_kernel_fc2_reduce():
     _require_cuda()
     rank, world_size = _launcher_ranks()
@@ -465,7 +467,7 @@ def test_moe_ep_bf16_cutedsl_mega_layer_in_kernel_fc2_reduce():
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
 def test_moe_ep_bf16_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     _require_cuda()

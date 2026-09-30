@@ -40,6 +40,11 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..tllm_enums import ActivationType
+from ..quantization.nvfp4_quantization_utils import (
+    NVFP44Over6Config,
+    make_nvfp4_global_scale,
+    resolve_nvfp4_4over6,
+)
 from ..trace.templates.moe import (
     sm90_mixed_gemm_humming_weight_preprocess_trace_dispatch,
     sm90_mixed_gemm_scale_interleave_trace,
@@ -1683,6 +1688,74 @@ def prepare_cutile_mxfp4_weights(
     }
 
 
+def prepare_cutile_fp8_weights(
+    w1_fp8: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2_fp8: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    num_local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    block_scaled: bool,
+    activation_type: ActivationType = ActivationType.Swiglu,
+    device: Optional[torch.device] = None,
+) -> Dict[str, torch.Tensor]:
+    """Prepare checkpoint E4M3 weights without requantizing or expanding them.
+
+    Per-tensor scales are FP32, one per expert GEMM (shape ``[E]``).
+    MXFP8 scales are E8M0 bytes in logical ``[E, N, K/32]`` order.
+    Both A16 and A8 consume the same prepared tensors on every supported GPU.
+    Canonical gated GEMM1 rows arrive as ``[up, gate]`` and are prepared in the
+    kernel-consumed ``[gate, up]`` order.
+    """
+    from .api import _CUTILE_SUPPORTED_ACTIVATIONS
+
+    activation_type = ActivationType(activation_type)
+    if activation_type not in _CUTILE_SUPPORTED_ACTIVATIONS:
+        raise ValueError(f"unsupported cuTile FP8 activation {activation_type!r}.")
+    if (
+        min(hidden_size, intermediate_size) <= 0
+        or hidden_size % 32
+        or intermediate_size % 32
+    ):
+        raise ValueError(
+            "cuTile FP8 requires positive hidden/intermediate sizes divisible by 32."
+        )
+    if device is None:
+        device = w1_fp8.device
+    device = torch.device(device)
+    rows = intermediate_size * (2 if activation_type.is_gated else 1)
+    result = {}
+    for name, weight, scale, n, k in (
+        ("w1", w1_fp8, w1_scale, rows, hidden_size),
+        ("w2", w2_fp8, w2_scale, hidden_size, intermediate_size),
+    ):
+        if weight.dtype != torch.float8_e4m3fn:
+            raise TypeError("cuTile FP8 weights must use torch.float8_e4m3fn.")
+        if tuple(weight.shape) != (num_local_experts, n, k):
+            raise ValueError(f"{name} must have shape {(num_local_experts, n, k)}.")
+        shape = (
+            (num_local_experts, n, k // 32) if block_scaled else (num_local_experts,)
+        )
+        if tuple(scale.shape) != shape:
+            raise ValueError(f"{name}_scale must have shape {shape}.")
+        dtype = torch.float8_e8m0fnu if block_scaled else torch.float32
+        if scale.dtype not in ((dtype, torch.uint8) if block_scaled else (dtype,)):
+            raise TypeError(f"{name}_scale must use {dtype}.")
+        weight = weight.to(device).contiguous()
+        scale = scale.to(device).contiguous().view(dtype)
+        if name == "w1" and activation_type.is_gated:
+            up, gate = weight.view(torch.uint8).chunk(2, dim=1)
+            weight = torch.cat((gate, up), dim=1).view(torch.float8_e4m3fn)
+            if block_scaled:
+                up, gate = scale.view(torch.uint8).chunk(2, dim=1)
+                scale = torch.cat((gate, up), dim=1).view(dtype)
+        result[name] = weight
+        result[f"{name}_scale"] = scale
+    return result
+
+
 def prepare_cutile_bf16_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
@@ -1846,6 +1919,10 @@ def prepare_cutlass_w4a16_weights(
 
 
 _NVFP4_SF_VEC_SIZE = 16
+# MinKDimAlignmentNVFP4 of the CUTLASS expand kernel: the row stride of the
+# linear activation block scale is padded to hidden_size / 16 rounded up to
+# this alignment / 16, so hidden_size itself must be a multiple of it.
+_CUTLASS_NVFP4_HIDDEN_ALIGNMENT = 64
 _NVFP4_SF_SWIZZLE_ROWS = 128
 
 
@@ -1887,13 +1964,20 @@ def prepare_cutlass_nvfp4_weights(
             "prepare_cutlass_nvfp4_weights expects BF16 weights, got "
             f"w1={w1_bf16.dtype}, w2={w2_bf16.dtype}."
         )
-    if (
-        hidden_size % _NVFP4_SF_VEC_SIZE != 0
-        or intermediate_size % _NVFP4_SF_VEC_SIZE != 0
-    ):
+    # The expand kernel reads the canonical linear input_sf with a row stride
+    # padded to MinKDimAlignmentNVFP4 (64), so a compact [M, H / 16] pack is
+    # only correct for H % 64 == 0. GEMM2's input is quantized in-kernel, so
+    # I only needs the 16-element block. Reject here, at load time, rather
+    # than on the first forward.
+    if hidden_size % _CUTLASS_NVFP4_HIDDEN_ALIGNMENT != 0:
         raise ValueError(
-            "Cutlass NVFP4 requires hidden_size and intermediate_size "
-            f"divisible by {_NVFP4_SF_VEC_SIZE}."
+            "Cutlass NVFP4 requires hidden_size divisible by "
+            f"{_CUTLASS_NVFP4_HIDDEN_ALIGNMENT}, got {hidden_size}."
+        )
+    if intermediate_size % _NVFP4_SF_VEC_SIZE != 0:
+        raise ValueError(
+            "Cutlass NVFP4 requires intermediate_size divisible by "
+            f"{_NVFP4_SF_VEC_SIZE}, got {intermediate_size}."
         )
     activation = _normalize_activation(activation)
     gemm1_rows = _gemm1_rows(intermediate_size, activation)
@@ -2056,8 +2140,10 @@ def prepare_cutlass_fp8_per_tensor_weights(
         # Calibration metadata; the runner ignores these keys.
         "fc1_dequant": fc1_dequant,
         "fc2_dequant": fc2_dequant,
-        "hidden_states_scale_global": act_scale,
-        "intermediate_scale_global": inter_scale,
+        # Copies, so the view never aliases a caller tensor that may be written
+        # in place after preparation.
+        "hidden_states_scale_global": act_scale.clone(),
+        "intermediate_scale_global": inter_scale.clone(),
     }
 
 
@@ -2407,6 +2493,204 @@ def _interleave_linear_and_gate(
     return x
 
 
+def prepare_cute_dsl_mxfp4_weights(
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare native packed MXFP4 weights for CuTe-DSL W4A8 without requantizing.
+
+    The canonical inputs are contiguous uint8 tensors on the same device:
+
+    * ``w1``: ``[E, 2 * I, H // 2]``, with the up rows followed by gate rows.
+    * ``w1_scale``: ``[E, 2 * I, H // 32]`` linear UE8M0 scale bytes.
+    * ``w2``: ``[E, H, I // 2]`` packed E2M1 down-projection weights.
+    * ``w2_scale``: ``[E, H, I // 32]`` linear UE8M0 scale bytes.
+
+    ``H`` and ``I`` must be positive multiples of 128. Each byte stores two
+    E2M1 values in their original nibble order; one scale covers 32 values.
+    Scale bytes encode UE8M0 directly, so unity is byte 127, not an E4M3 one.
+
+    Returns ``(w1_prepared, w1_sf_mma, w2, w2_sf_mma)``. W1 rows and their
+    scales are interleaved in 64-row up/gate groups. Scale outputs use the
+    strided six-dimensional MMA layout expected by the W4A8 kernels. All
+    payload and scale bytes are preserved exactly; W2 storage is reused.
+
+    This load-time operation allocates the prepared W1 and scale storage.
+    It does not cache or retain the source tensors: callers may release the
+    original W1 and linear scales after preparation. Run before graph capture.
+    """
+    for name, tensor in (
+        ("w1", w1),
+        ("w1_scale", w1_scale),
+        ("w2", w2),
+        ("w2_scale", w2_scale),
+    ):
+        if tensor.dtype != torch.uint8 or tensor.ndim != 3:
+            raise ValueError(f"{name} must be a three-dimensional uint8 tensor")
+        if tensor.device != w1.device or not tensor.is_contiguous():
+            raise ValueError(f"{name} must be contiguous and on the W1 device")
+
+    experts, hidden, packed_intermediate = w2.shape
+    intermediate = packed_intermediate * 2
+    if experts <= 0 or min(hidden, intermediate) <= 0:
+        raise ValueError("expert count and matrix dimensions must be positive")
+    if hidden % 128 or intermediate % 128:
+        raise ValueError(
+            "MXFP4 hidden and intermediate dimensions must be multiples of 128"
+        )
+    expected = (
+        ("w1", w1, (experts, 2 * intermediate, hidden // 2)),
+        ("w1_scale", w1_scale, (experts, 2 * intermediate, hidden // 32)),
+        ("w2_scale", w2_scale, (experts, hidden, intermediate // 32)),
+    )
+    for name, tensor, shape in expected:
+        if tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+            )
+
+    def to_mma_layout(scale: torch.Tensor) -> torch.Tensor:
+        # Linear [E, M, K/32] -> physical [E, M/128, K/128, 32, 4, 4].
+        # Within a 128-row tile, the row index is inner_m * 32 + outer_m.
+        groups, rows, blocks = scale.shape
+        physical = (
+            scale.view(groups, rows // 128, 4, 32, blocks // 4, 4)
+            .permute(0, 1, 4, 3, 2, 5)
+            .contiguous()
+        )
+        # Logical MMA axes: [outer_m, inner_m, M/128, inner_k, K/128, E].
+        return physical.permute(3, 4, 1, 5, 2, 0)
+
+    w1_prepared = _interleave_linear_and_gate(w1, group_size=64, dim=1)
+    w1_scale_interleaved = _interleave_linear_and_gate(w1_scale, group_size=64, dim=1)
+    return (
+        w1_prepared,
+        to_mma_layout(w1_scale_interleaved),
+        w2,
+        to_mma_layout(w2_scale),
+    )
+
+
+def _check_canonical_cute_dsl_mxfp4_weights(w1, w1_scale, w2, w2_scale):
+    """Validate the canonical unsharded layout; return (E, H, I)."""
+    for name, tensor in (
+        ("w1", w1),
+        ("w1_scale", w1_scale),
+        ("w2", w2),
+        ("w2_scale", w2_scale),
+    ):
+        if tensor.dtype != torch.uint8 or tensor.ndim != 3:
+            raise ValueError(f"{name} must be a three-dimensional uint8 tensor")
+        if tensor.device != w1.device:
+            raise ValueError(f"{name} must be on the W1 device")
+    experts, hidden, packed_intermediate = w2.shape
+    intermediate = packed_intermediate * 2
+    if experts <= 0 or min(hidden, intermediate) <= 0:
+        raise ValueError("expert count and matrix dimensions must be positive")
+    if hidden % 128 or intermediate % 128:
+        raise ValueError(
+            "MXFP4 hidden and intermediate dimensions must be multiples of 128"
+        )
+    expected = (
+        ("w1", w1, (experts, 2 * intermediate, hidden // 2)),
+        ("w1_scale", w1_scale, (experts, 2 * intermediate, hidden // 32)),
+        ("w2_scale", w2_scale, (experts, hidden, intermediate // 32)),
+    )
+    for name, tensor, shape in expected:
+        if tuple(tensor.shape) != shape:
+            raise ValueError(
+                f"{name} must have shape {shape}, got {tuple(tensor.shape)}"
+            )
+    return experts, hidden, intermediate
+
+
+def shard_cute_dsl_mxfp4_weights(
+    w1: torch.Tensor,
+    w1_scale: torch.Tensor,
+    w2: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    ep_size: int = 1,
+    ep_rank: int = 0,
+    moe_tp_size: int = 1,
+    moe_tp_rank: int = 0,
+    copy: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Slice canonical unsharded MXFP4 weights into one rank's shard.
+
+    Inputs are the canonical ``prepare_cute_dsl_mxfp4_weights`` layouts for
+    all ``E`` experts with the global intermediate size ``I``: ``w1``
+    ``[E, 2*I, H//2]`` in [up, gate] row order, ``w1_scale`` ``[E, 2*I, H//32]``,
+    ``w2`` ``[E, H, I//2]`` and ``w2_scale`` ``[E, H, I//32]``. The returned
+    tuple has the same order and is the canonical input of
+    ``prepare_cute_dsl_mxfp4_weights`` for the rank-local runner layout.
+
+    Expert parallelism (``ep_size > 1``) returns experts
+    ``[ep_rank*E/ep_size, (ep_rank+1)*E/ep_size)`` with the full intermediate
+    dimension. MoE tensor parallelism (``moe_tp_size > 1``) returns every
+    expert with ``Is = I/moe_tp_size`` intermediate columns: W1 up rows
+    ``[r*Is, (r+1)*Is)`` followed by gate rows ``[I + r*Is, I + (r+1)*Is)``,
+    W2 packed columns ``[r*Is/2, (r+1)*Is/2)`` and W2 scale columns
+    ``[r*Is/32, (r+1)*Is/32)``. Both sizes above one is a hybrid layout and
+    raises. Selection is deterministic and depends only on these explicit
+    arguments, never on tensor contents.
+
+    Memory: expert-parallel shards are contiguous views of the input storage
+    (no bytes are copied, and the views keep the full bank alive) unless
+    ``copy=True``, which clones only the shard. Tensor-parallel shards are
+    always new shard-sized allocations because their rows/columns are not
+    contiguous in the bank; no full-size duplicate is created. Release the
+    canonical bank afterwards if no other rank on this device needs it.
+    """
+    experts, hidden, intermediate = _check_canonical_cute_dsl_mxfp4_weights(
+        w1, w1_scale, w2, w2_scale
+    )
+    for name, size, rank in (
+        ("ep", ep_size, ep_rank),
+        ("moe_tp", moe_tp_size, moe_tp_rank),
+    ):
+        if size < 1 or not 0 <= rank < size:
+            raise ValueError(f"require {name}_size >= 1 and 0 <= {name}_rank < size")
+    if ep_size > 1 and moe_tp_size > 1:
+        raise ValueError(
+            "hybrid expert/tensor parallelism is unsupported: "
+            f"ep_size={ep_size} and moe_tp_size={moe_tp_size} both exceed 1"
+        )
+    if moe_tp_size > 1:
+        if intermediate % moe_tp_size or (intermediate // moe_tp_size) % 128:
+            raise ValueError(
+                f"intermediate size {intermediate} must split into moe_tp_size="
+                f"{moe_tp_size} shards that are multiples of 128"
+            )
+        shard = intermediate // moe_tp_size
+        up = moe_tp_rank * shard
+        gate = intermediate + up
+
+        def rows(tensor):
+            return torch.cat(
+                (tensor.narrow(1, up, shard), tensor.narrow(1, gate, shard)), dim=1
+            )
+
+        return (
+            rows(w1),
+            rows(w1_scale),
+            w2.narrow(2, up // 2, shard // 2).contiguous(),
+            w2_scale.narrow(2, up // 32, shard // 32).contiguous(),
+        )
+    if experts % ep_size:
+        raise ValueError(
+            f"expert count {experts} must be divisible by ep_size={ep_size}"
+        )
+    local = experts // ep_size
+    shards = tuple(
+        tensor.narrow(0, ep_rank * local, local).contiguous()
+        for tensor in (w1, w1_scale, w2, w2_scale)
+    )
+    return tuple(t.clone() for t in shards) if copy else shards
+
+
 def prepare_cute_dsl_weights(
     w1_bf16: torch.Tensor,
     w2_bf16: torch.Tensor,
@@ -2417,6 +2701,7 @@ def prepare_cute_dsl_weights(
     intermediate_size: int,
     activation=None,
     device: Optional[torch.device] = None,
+    nvfp4_4over6: Optional[NVFP44Over6Config] = None,
 ) -> Dict[str, torch.Tensor]:
     """Build the CuteDSL FP4 ``cute_dsl`` weight view.
 
@@ -2426,6 +2711,21 @@ def prepare_cute_dsl_weights(
     Starts from the same canonical bf16 expert weights as
     :func:`prepare_trtllm_fp4_weights`, so a single weight set can feed both
     backends and a shared reference.
+
+    Parameters
+    ----------
+    w1_bf16, w2_bf16 : torch.Tensor
+        Canonical BF16 expert weights.
+    num_local_experts, hidden_size, intermediate_size : int
+        Expert geometry.
+    device : torch.device, optional
+        Target device; defaults to ``w1_bf16.device``.
+    nvfp4_4over6 : NVFP44Over6Config or None
+        The 4over6 recipe the runtime activation quantizer will be given.
+        Selects ``fc2_input_scale`` only (``1 / (6 * e4m3_max)``, the value
+        the GEMM2-input candidate search requires). The weights are quantized
+        standard-NVFP4 either way. ``None`` keeps the historical
+        ``fc2_input_scale = 1.0``.
 
     Returns
     -------
@@ -2512,7 +2812,18 @@ def prepare_cute_dsl_weights(
         "w2_alpha": ones,
     }
     if not is_mxfp4:
-        view["fc2_input_scale"] = gs
+        # A pinned recipe fixes the GEMM2-input scale to 1 / (6 * e4m3_max).
+        # w2_bf16 is passed for its device only.
+        nvfp4_4over6_config = resolve_nvfp4_4over6(nvfp4_4over6)
+        view["fc2_input_scale"] = (
+            gs
+            if nvfp4_4over6_config is None
+            else make_nvfp4_global_scale(
+                w2_bf16,
+                per_token_activation=True,
+                nvfp4_4over6_config=nvfp4_4over6_config,
+            )
+        )
     return view
 
 

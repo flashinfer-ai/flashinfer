@@ -1,11 +1,11 @@
 """Multi-rank smoke + correctness tests for MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl).
 
 Launched via torchrun:
-    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_sm10x"
+    torchrun --nproc_per_node=4 -m pytest tests/moe_ep/test_moe_ep_mxfp8_cutedsl_mega_multirank.py -v -m "gpu_4 and arch_blackwell"
 
 Requires Blackwell (sm_100+), >=4 GPUs, and CuTeDSL runtime deps
 (``nvidia-cutlass-dsl[cu13]``, ``nvshmem4py-cu13``).  Kernels ship in-tree under
-``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``.
+``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``.
 
 Runtime bootstrap (``torch.distributed`` + NVSHMEM) is handled by
 :class:`flashinfer.moe_ep.MoEEpMegaLayer` via :func:`bootstrap_moe_ep_runtime`.
@@ -33,9 +33,9 @@ import os
 import pytest
 
 # This test verifies the mega path only through the cutedsl_megamoe shim public
-# API (``flashinfer.moe_ep.kernel_src.cutedsl_megamoe``); it never imports the
+# API (``flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe``); it never imports the
 # src/ kernel packages directly, so a new src/ drop can't silently break it.
-pytest.importorskip("flashinfer.moe_ep.kernel_src.cutedsl_megamoe")
+pytest.importorskip("flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe")
 
 
 def _require_cuda():
@@ -161,7 +161,7 @@ def _reference_mxfp8_mega_moe_staged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
@@ -231,7 +231,7 @@ def _reference_mxfp8_mega_moe_prestaged(
     import torch
     import torch.distributed as dist
 
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
     )
@@ -378,7 +378,7 @@ def _run_mega_layer(
             t_hidden = problem["hidden_states"]
             t_scales = None
         else:
-            from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+            from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
                 get_symm_buffer_for_mxfp8_mega_moe,
             )
 
@@ -479,7 +479,7 @@ def _run_mega_layer(
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_matches_reference():
     """MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl) with on-the-fly bf16→MXFP8 staging."""
     _require_cuda()
@@ -493,7 +493,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_matches_reference():
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
     """MoEEpMegaLayer (sm100_mxfp8_mxfp8_bf16_cutedsl) with pre-staged MXFP8 activations."""
     _require_cuda()
@@ -507,7 +507,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_prestaged_inputs_matches_reference():
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce():
     """In-flight top-k combine (``in_kernel_fc2_reduce=True``) for MXFP8.
 
@@ -563,7 +563,7 @@ def _run_mega_layer_zero_token_ikr_regression(
     loop drives it) AND some rank legitimately hits num_tokens==0 (SGLang's own
     idle-batch mechanism for keeping DP ranks in lockstep) while its peers have
     real work -- light/symmetric/all-nonzero testing never exercises it. See
-    kernel_src/cutedsl_megamoe/shim/mxfp8.py::mxfp8_mega_moe.
+    kernel_src/sm100/cutedsl_megamoe/shim/mxfp8.py::mxfp8_mega_moe.
 
     Shapes/scale intentionally match the real repro (hidden=2048,
     intermediate=768, num_experts=128, top_k=8, max_tokens_per_rank=16384 --
@@ -713,7 +713,7 @@ def _run_mega_layer_zero_token_ikr_regression(
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce_zero_token_regression():
     """Zero-token / in_kernel_fc2_reduce livelock regression guard (MXFP8).
 
@@ -734,7 +734,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_layer_in_kernel_fc2_reduce_zero_token_regress
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 def test_moe_ep_mxfp8_cutedsl_mega_layer_large_tokens_matches_reference():
     """Large-token (>=2048) dispatch-warp token-back for MXFP8.
 
@@ -828,7 +828,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
         preprocess_mega_weights,
     )
     from flashinfer.moe_ep.core.kernel.registry import create_mega_kernel
-    from flashinfer.moe_ep.kernel_src.cutedsl_megamoe import (
+    from flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe import (
         compute_megamoe_reference_mxfp8,
         get_symm_buffer_for_mxfp8_mega_moe,
         mxfp8_mega_moe,
@@ -963,7 +963,7 @@ def _run_mega_torch_oracle(rank, world_size, *, in_kernel_fc2_reduce: bool = Fal
 
 
 @pytest.mark.gpu_4
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 @pytest.mark.parametrize("in_kernel_fc2_reduce", [False, True])
 def test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     """Real cross-rank EP kernel vs the drop's torch global math (see helper doc)."""
@@ -980,7 +980,7 @@ def test_moe_ep_mxfp8_cutedsl_mega_multirank_torch_oracle(in_kernel_fc2_reduce):
     )
 
 
-@pytest.mark.arch_sm10x
+@pytest.mark.arch_blackwell
 def test_mxfp8_cutedsl_preprocess_mega_weights_from_bf16():
     _require_cuda()
 

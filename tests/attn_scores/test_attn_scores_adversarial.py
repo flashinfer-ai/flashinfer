@@ -289,6 +289,133 @@ def test_adv_degenerate_values_fp8(mode):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# D2) fp32 relu epilogue at the float range boundary
+# ─────────────────────────────────────────────────────────────────────────────
+# The public API bounds neither the weights nor the KV / UE8M0 scales, so a
+# valid call can put a head's score x in [2^127, 2^128) or a weight at
+# FLT_MAX. relu must not widen the finite range: relu(x) = (x + |x|) / 2 with
+# the /2 folded into the weights or the store scale overflowed both cases.
+# Expected values are exact (all products are powers of two times small
+# integers), so the checks are tight.
+
+
+def test_adv_fp8_relu_weight_boundary():
+    """One head: dot score 1, weight FLT_MAX, KV scale 0.5 -> FLT_MAX / 2, finite."""
+    _skip_if_no_paged_mqa_support()
+    from flashinfer import fp8_paged_mqa_logits
+
+    B, next_n, block_size, H, D, ctx = 1, 1, 64, 64, 128, 64
+    cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
+    max_ml = ctx
+    block_tables, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
+    q = torch.zeros(B, next_n, H, D, device=DEVICE)
+    q[..., 0, 0] = 1.0
+    q = q.to(torch.float8_e4m3fn)
+    kv_fp8 = torch.zeros(ntb, block_size, D, device=DEVICE)
+    kv_fp8[..., 0] = 1.0
+    kv_fp8 = kv_fp8.to(torch.float8_e4m3fn)
+    scale = torch.full((ntb, block_size), 0.5, device=DEVICE)
+    weights = torch.zeros(B * next_n, H, device=DEVICE)
+    weights[:, 0] = torch.finfo(torch.float32).max
+    kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, D)
+    ref = _ref_fp8_paged_mqa_logits(
+        q, kv_fp8, scale, weights, cl, block_tables, max_ml, block_size
+    )
+    out = fp8_paged_mqa_logits(q, kv_fused, weights, block_tables, cl, max_ml)
+    valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
+    assert torch.isfinite(out.float()[valid]).all(), "FLT_MAX weight overflowed"
+    torch.testing.assert_close(
+        out.float()[valid], ref.float()[valid], rtol=1e-6, atol=0
+    )
+    expected = torch.finfo(torch.float32).max / 2
+    assert torch.all(out.float()[valid] == expected), out.float()[valid][:4]
+
+
+def test_adv_fp8_relu_exponent_boundary():
+    """One head: dot 448 * 448 * 128 (exactly representable) times KV scale 2^103
+    puts the logit at 2^127.6, finite; weight 0.5 keeps the output finite. The
+    fp8 kernel applies the KV scale at the store, so this pins the output range
+    of that path (the weight case above is the one the fold overflowed)."""
+    _skip_if_no_paged_mqa_support()
+    from flashinfer import fp8_paged_mqa_logits
+
+    B, next_n, block_size, H, D, ctx = 1, 1, 64, 64, 128, 64
+    cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
+    max_ml = ctx
+    block_tables, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
+    q = torch.zeros(B, next_n, H, D, device=DEVICE)
+    q[..., 0, :] = 448.0
+    q = q.to(torch.float8_e4m3fn)
+    kv_fp8 = torch.full((ntb, block_size, D), 448.0, device=DEVICE).to(
+        torch.float8_e4m3fn
+    )
+    scale = torch.full((ntb, block_size), 2.0**103, device=DEVICE)
+    weights = torch.zeros(B * next_n, H, device=DEVICE)
+    weights[:, 0] = 0.5
+    kv_fused = _make_fused_kv_fp8(kv_fp8, scale, block_size, D)
+    ref = _ref_fp8_paged_mqa_logits(
+        q, kv_fp8, scale, weights, cl, block_tables, max_ml, block_size
+    )
+    out = fp8_paged_mqa_logits(q, kv_fused, weights, block_tables, cl, max_ml)
+    valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
+    x = 448.0 * 448.0 * D * 2.0**103
+    assert 2.0**127 < x < 2.0**128
+    assert torch.isfinite(ref.float()[valid]).all()
+    assert torch.isfinite(out.float()[valid]).all(), "x >= 2^127 overflowed in relu"
+    torch.testing.assert_close(
+        out.float()[valid], ref.float()[valid], rtol=1e-6, atol=0
+    )
+
+
+def test_adv_fp4_relu_exponent_boundary():
+    """One head: e2m1 values 6 (q) and 4 (kv) with UE8M0 scales 2^58 each put the
+    head-dim-128 dot at 3072 * 2^116 = 2^127.58, finite; weight 0.5."""
+    _skip_if_no_paged_mqa_support()
+    from flashinfer import fp4_paged_mqa_logits
+
+    B, next_n, block_size, H, D, ctx = 1, 1, 64, 64, 128, 64
+    cl = torch.full((B,), ctx, dtype=torch.int32, device=DEVICE)
+    max_ml = 512
+    block_tables, ntb = _make_paged_kv(B, block_size, cl, DEVICE)
+    q_bf = torch.zeros(B, next_n, H, D, device=DEVICE, dtype=torch.bfloat16)
+    q_bf[..., 0, :] = 6.0 * 2.0**58
+    kv_cache = torch.full(
+        (ntb, block_size, 1, D), 4.0 * 2.0**58, device=DEVICE, dtype=torch.bfloat16
+    )
+    weights = torch.zeros(B * next_n, H, device=DEVICE)
+    weights[:, 0] = 0.5
+    q_pk, sf_qp = _per_token_cast_to_fp4(q_bf.view(-1, D), gran_k=32)
+    q_fp4 = q_pk.view(torch.uint8).view(B, next_n, H, D // 2)
+    q_sf = sf_qp.view(torch.int32).view(B, next_n, H)
+    kv_fused, kv_sim = _kv_cache_cast_to_fp4(kv_cache)
+    q_sim = (
+        _cast_back_from_fp4(q_pk, sf_qp, gran_k=32)
+        .view(B, next_n, H, D)
+        .to(torch.bfloat16)
+    )
+    assert torch.all(q_sim[..., 0, :].float() == 6.0 * 2.0**58), "q quantization"
+    ref = _ref_fp4_paged_mqa_logits(
+        q_sim.float(), kv_sim.float(), weights, cl, block_tables, max_ml
+    )
+    out = fp4_paged_mqa_logits(
+        q_fp4,
+        q_sf,
+        kv_fused,
+        weights,
+        block_tables,
+        cl,
+        max_ml,
+        output_dtype=torch.float32,
+    )
+    valid = _valid_causal_mask(cl, next_n, max_ml, DEVICE)
+    assert torch.isfinite(ref.float()[valid]).all()
+    assert torch.isfinite(out.float()[valid]).all(), "x >= 2^127 overflowed in relu"
+    torch.testing.assert_close(
+        out.float()[valid], ref.float()[valid], rtol=1e-3, atol=0
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # E) Determinism (required for CUDA-graph replay correctness)
 # ─────────────────────────────────────────────────────────────────────────────
 

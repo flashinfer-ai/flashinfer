@@ -57,11 +57,29 @@ def isolated_deep_gemm_cache():
 
 
 # NOTE: ``pytest_addoption`` (--backend), ``pytest_configure`` (nvep/gpu_*/
-# arch_sm10x markers), and ``pytest_collection_modifyitems`` (env/GPU/arch
+# arch_blackwell markers), and ``pytest_collection_modifyitems`` (env/GPU/arch
 # auto-skips) are intentionally defined ONLY in the root ``tests/conftest.py``.
 # Re-declaring them here triggers a duplicate-option error
 # ("option names {'--backend'} already added") because pytest loads both the
 # parent and child conftests. Keep the shared fixtures below in this file.
+
+
+@pytest.fixture
+def require_split_backend(request):
+    """Gate split regressions before their first collective.
+
+    The graph tests parametrize ``backend``; unparametrized guard and memo
+    regressions exercise nccl_ep only.
+    """
+    from flashinfer.moe_ep import available_backends
+
+    callspec = getattr(request.node, "callspec", None)
+    backend = callspec.params.get("backend", "nccl_ep") if callspec else "nccl_ep"
+    selected = request.config.getoption("--backend")
+    if selected not in (None, "both", backend):
+        pytest.skip(f"requires {backend}; --backend={selected}")
+    if backend not in available_backends():
+        pytest.skip(f"{backend} backend is not available")
 
 
 @pytest.fixture
