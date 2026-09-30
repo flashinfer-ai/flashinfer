@@ -1258,7 +1258,9 @@ def _resolve_dsv4_sparse_mla_backend(
             f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )
     if requested_backend == "cute-dsl" and not is_sm100_or_sm103:
-        raise ValueError(f"backend='cute-dsl' requires SM100/SM103, got SM{cc[0]}{cc[1]}")
+        raise ValueError(
+            f"backend='cute-dsl' requires SM100/SM103, got SM{cc[0]}{cc[1]}"
+        )
     if requested_backend == "sparse" and not is_sm120_family:
         raise ValueError(f"backend='sparse' requires SM120/SM121, got SM{cc[0]}{cc[1]}")
     if requested_backend == "cake" and not (is_sm100_or_sm103 or is_sm120_family):

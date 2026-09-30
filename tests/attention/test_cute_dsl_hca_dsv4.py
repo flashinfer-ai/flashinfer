@@ -195,7 +195,9 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
         == "trtllm-gen"
     )
-    sm100_default = mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
+    sm100_default = mla_core._resolve_dsv4_sparse_mla_backend(
+        torch.device("cpu"), "auto"
+    )
     assert (
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
         == "cute-dsl"
@@ -216,7 +218,9 @@ def test_dsv4_backend_resolution_is_explicit(monkeypatch):
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "cute-dsl")
 
     monkeypatch.setattr(mla_core, "get_compute_capability", lambda _device: (10, 7))
-    sm107_default = mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), "auto")
+    sm107_default = mla_core._resolve_dsv4_sparse_mla_backend(
+        torch.device("cpu"), "auto"
+    )
     assert sm107_default == sm100_default
     assert (
         mla_core._resolve_dsv4_sparse_mla_backend(torch.device("cpu"), sm100_default)
