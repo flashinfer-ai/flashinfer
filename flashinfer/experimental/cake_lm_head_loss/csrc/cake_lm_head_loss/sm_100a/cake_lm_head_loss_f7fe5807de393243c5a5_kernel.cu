@@ -393,36 +393,6 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
 }
 
 
-__device__ __forceinline__ void tma_2d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3}], [%4];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y),
-           "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tma_store_2d(
-    const void *tmap, int x, int y, unsigned smem_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.tile.bulk_group"
-        " [%0, {%1, %2}], [%3];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(smem_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void tma_reduce_add_2d(
-    const void* tmap, int x, int y, unsigned smem_addr) {
-    asm volatile(
-        "cp.reduce.async.bulk.tensor.2d.global.shared::cta.add.tile.bulk_group"
-        " [%0, {%1, %2}], [%3];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(smem_addr)
-        : "memory");
-}
-
-
 __device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
     asm volatile(
         "{\n\t"
@@ -456,7 +426,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(192) __cluster_dims__(2,1,1) void
-kernel_cake_lm_head_loss_00b98724312438cdd894(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap C, float* __restrict__ STATS_OUT, int M, int m_tiles, int k_iters, int first_chunk, float* __restrict__ WS, int ws_slab)
+kernel_cake_lm_head_loss_f7fe5807de393243c5a5(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, float* __restrict__ C, float* __restrict__ STATS_OUT, int M, int m_tiles, int k_iters, int first_chunk, float* __restrict__ WS, int ws_slab)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -702,11 +672,6 @@ kernel_cake_lm_head_loss_00b98724312438cdd894(const __grid_constant__ CUtensorMa
                     for (int box = 0; box < 8; box++) {
                         int stage_row_f = epi_store_stage * 128 + (unsigned int)local_row;
                         int w_staging = smem_epi_addr + epi_store_stage * 16384;
-                        if (warp == 2) {
-                            if (elect_sync()) {
-                                asm volatile("cp.async.bulk.wait_group.read 1;");
-                            }
-                        }
                         asm volatile("barrier.sync 8, 128;" ::: "memory");
                         unsigned int s_abs = smem_epi_addr + (unsigned int)(stage_row_f * 128);
                         unsigned int s_swz = s_abs / 8 & 112;
@@ -723,14 +688,32 @@ kernel_cake_lm_head_loss_00b98724312438cdd894(const __grid_constant__ CUtensorMa
                         }
                         asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
                         asm volatile("barrier.sync 8, 128;" ::: "memory");
-                        if (warp == 2) {
-                            if (elect_sync()) {
+                        #pragma unroll
+                        for (int rp = 0; rp < 8; rp++) {
+                            int rr = rp * 16 + local_row / 8;
+                            int rc = local_row % 8;
+                            unsigned int r_abs = smem_epi_addr + (epi_store_stage * 128 + (unsigned int)rr) * 128;
+                            unsigned int r_swz = r_abs / 8 & 112;
+                            unsigned int rw[4];
+                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                : "=r"(*reinterpret_cast<uint32_t*>(&rw[0])), "=r"(*reinterpret_cast<uint32_t*>(&rw[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&rw[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&rw[(0) + 3]))
+                                : "r"(r_abs + ((unsigned int)(rc * 16) ^ r_swz)));
+                            float rf[4];
+                            #pragma unroll
+                            for (int j4 = 0; j4 < 4; j4++) {
+                                rf[j4] = __uint_as_float(rw[j4]);
+                            }
+                            int g_row = ep_row0f + rr;
+                            if (g_row < M) {
+                                unsigned long long g_idx = (unsigned long long)g_row * 6144 + (unsigned long long)(ep_off_n + epi_col0 + box * 32 + rc * 4);
                                 if (do_store == 1) {
-                                    tma_store_2d((&C), ep_off_n + epi_col0 + box * 32, ep_row0f, w_staging);
+                                    {
+                                        float4 _v4 = make_float4(rf[0 + 0], rf[0 + 1], rf[0 + 2], rf[0 + 3]);
+                                        *reinterpret_cast<float4*>(C + g_idx + 0) = _v4;
+                                    }
                                 } else {
-                                    tma_reduce_add_2d((&C), ep_off_n + epi_col0 + box * 32, ep_row0f, w_staging);
+                                    asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};" :: "l"(reinterpret_cast<uint64_t>(&C[g_idx])), "f"(rf[0]), "f"(rf[1]), "f"(rf[2]), "f"(rf[3]) : "memory");
                                 }
-                                asm volatile("cp.async.bulk.commit_group;");
                             }
                         }
                         epi_store_stage += 1;
@@ -743,11 +726,6 @@ kernel_cake_lm_head_loss_00b98724312438cdd894(const __grid_constant__ CUtensorMa
                     }
                     epi_stage += 1;
                     if (epi_stage == 2) { epi_stage = 0; _phase_mainloop_done ^= 1; }
-                }
-            }
-            if (warp == 2) {
-                if (elect_sync()) {
-                    asm volatile("cp.async.bulk.wait_group 0;");
                 }
             }
         }
