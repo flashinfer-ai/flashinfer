@@ -1308,13 +1308,16 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
             ("bwd_compact", 1),
             ("bwd_main_pass", 1),
         ]
+        misses = cache.misses
         with _quiet_experimental():
             out_single = dsa_sparse_attention(*leaves, inp.idx_global, key_passes=1)
         single = torch.autograd.grad(out_single, leaves, inp.dout)
         torch.cuda.synchronize()
-        assert (
-            len([b for b in cache._bindings.values() if b.backward_order]) == 2
-        )  # the override is part of the binding key
+        # the override is part of the binding key: the backward binds anew (the two-pass binding, whose
+        # 790 MB of owned scratch exceed the cache's byte budget, leaves the cache once another binding
+        # is remembered)
+        assert cache.misses > misses
+        assert 1 in [b.key_passes for b in cache._bindings.values() if b.backward_order]
     assert torch.equal(out.detach(), out_single.detach())  # the forward is untouched
     ref = reference_fp64(
         inp.q_latent,
