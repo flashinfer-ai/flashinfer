@@ -153,6 +153,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         reducer_max_splits: int = MAX_SPLITS,
         enable_dcp: bool = False,
         cp_world: int = 1,
+        arch: str = "sm_100a",
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -199,8 +200,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         :param cp_world: Compile-time DCP world size. Rank-local key ``k`` maps
             to global key ``k * cp_world + cp_rank``.
         :type cp_world: int
+        :param arch: Resolved launch architecture; defaults to family-safe staging.
+        :type arch: str
         """
 
+        self.arch = arch
         self.latent_dim = 512
         self.rope_dim = 64
         self.acc_dtype = acc_dtype
@@ -370,8 +374,10 @@ class BlackwellMultiHeadLatentAttentionForwardFP8:
         """
 
         self.load_q_stage = 1
-        self.load_k_stage = 3
-        self.load_v_stage = 2
+        # sm_107 has 327 KB of shared memory per CTA, enough for 4 K / 4 V stages (~324 KB).
+        sm107 = self.arch in ("sm_107", "sm_107a")
+        self.load_k_stage = 4 if sm107 else 3
+        self.load_v_stage = 4 if sm107 else 2
         self.mma_s_stage = 2
         self.p_mma_stage = 2
         self.p_cor_stage = 2
