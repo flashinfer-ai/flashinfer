@@ -96,6 +96,16 @@ def main():
         )
     if max(args.requests) * (args.context // BLOCK) > args.blocks:
         raise SystemExit("not enough KV blocks for the requested contexts")
+    # Rows a request's index pool draws from: 1100 recent ones plus older ones (see request_shaped_indices).
+    context_rows, min_rows = (
+        args.context // BLOCK * BLOCK,
+        4096 + max(args.topk - 1100, 1900),
+    )
+    if context_rows < min_rows:
+        raise SystemExit(
+            f"--context {args.context} gives {context_rows} rows per request, "
+            f"--topk {args.topk} needs at least {min_rows}"
+        )
     g = torch.Generator(device=dev).manual_seed(0)
     rows = args.blocks * BLOCK
     kv = torch.randint(
