@@ -54,16 +54,18 @@ The eager entry points (:func:`forward`, :func:`backward`, the autograd
 ``Function`` behind ``dsa_sparse_attention``) validate and bind once per
 *input binding* and remember the result in :data:`BINDING_CACHE` (see
 :class:`BindingCache`): a later call whose inputs have the same
-``(data_ptr, shape, stride, dtype)`` and scale slots the current tensors and
-freshly allocated outputs into the remembered argument plans and launches.
-A call without query rows (``T == 0``) returns empty outputs and zero
-gradients from the eager entry points without binding or launching anything.
+``(data_ptr, shape, stride, dtype)`` and scale slots the current tensors,
+freshly allocated outputs and per-call scratch into the remembered argument
+plans and launches.  A call without query rows (``T == 0``) returns empty
+outputs and zero gradients from the eager entry points without binding or
+launching anything.
 """
 
 from __future__ import annotations
 
 import math
 import os
+from collections import OrderedDict
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
@@ -1357,9 +1359,26 @@ def prepare_dsa_train(
 BINDING_CACHE_ENV = (
     "FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE"  # "0" disables the cache at import
 )
-# Scratch the cache owns across remembered bindings is bounded by this many bytes in total, the most recently
-# remembered forward and backward binding excepted (see BindingCache).
-BINDING_CACHE_BUDGET_BYTES = 512 << 20
+BINDING_CACHE_CAPACITY_ENV = "FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY"  # bindings kept (a positive integer)
+# Enough for the forward and the backward binding of every layer of a deep model (a binding holds a few kilobytes).
+BINDING_CACHE_DEFAULT_CAPACITY = 256
+
+
+def binding_cache_capacity() -> int:
+    """Capacity of :data:`BINDING_CACHE`: ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY`` when set, else
+    :data:`BINDING_CACHE_DEFAULT_CAPACITY`."""
+    raw = os.environ.get(BINDING_CACHE_CAPACITY_ENV)
+    if raw is None or not raw.strip():
+        return BINDING_CACHE_DEFAULT_CAPACITY
+    try:
+        capacity = int(raw)
+    except ValueError:
+        capacity = 0
+    if capacity < 1:
+        raise ValueError(
+            f"{BINDING_CACHE_CAPACITY_ENV} must be a positive integer, got {raw!r}"
+        )
+    return capacity
 
 
 def _meta(t: torch.Tensor) -> tuple:
@@ -1427,17 +1446,12 @@ def backward_binding_key(
     )
 
 
-# Workspace regions a remembered binding keeps (the caller never sees them).
-_OWNED_SCRATCH = (
-    "delta",
-    "dkv_latent_acc",
-    "dk_rope_acc",
-    "dq_partial",
-    "key_scratch",
-    "pass_counts",
-    "workspace",
-    "tma_descriptor_workspace",
-)
+# Values a remembered binding owns (the caller never sees them): the caller-owned descriptor workspace of the
+# pointer-ABI stages (every launch re-encodes its tensor maps into it), kernel-private scratch a record declares
+# (``workspace_bytes``) and, when the caller passes no ``topk_length``, the materialized full-length vector.  Every
+# other scratch of a launch -- ``delta``, the FP32 dK/dV accumulators, the key-range-pass regions -- is allocated
+# per call from the caching allocator like the outputs, so a binding holds a few kilobytes whatever the problem size.
+_OWNED_VALUES = ("workspace", "tma_descriptor_workspace")
 
 
 @dataclass
@@ -1445,11 +1459,13 @@ class _Binding:
     """One remembered input binding of the contract profile.
 
     Holds the templated launches (argument plans with ``None`` at every
-    re-bindable position: no caller tensor is pinned), the workspace scratch
-    the binding owns and the plain facts a launch needs.  ``forward`` /
-    ``backward`` slot the current tensors and freshly allocated outputs into
-    the templates and launch; storage aliases and element offsets of the
-    raw-pointer operands are re-read from the current tensors every call.
+    re-bindable position: no caller tensor is pinned), the few values the
+    binding owns (:data:`_OWNED_VALUES` and a materialized ``topk_length``;
+    no problem-sized scratch) and the plain facts a launch needs.  ``forward``
+    / ``backward`` allocate the outputs and the per-call scratch, slot them
+    and the current tensors into the templates and launch; storage aliases
+    and element offsets of the raw-pointer operands are re-read from the
+    current tensors every call.
     """
 
     num_queries: int
@@ -1460,9 +1476,6 @@ class _Binding:
     dkv_fp32: bool
     launches: dict[Any, _Launch] = field(repr=False)
     owned: dict[str, torch.Tensor] = field(repr=False)
-    acc_span: Optional[torch.Tensor] = field(
-        repr=False
-    )  # bytes covering both FP32 accumulators
     owned_bytes: int = 0
     dkv_acc_permuted: bool = False
     key_passes: int = 1
@@ -1473,30 +1486,15 @@ class _Binding:
         if runner.abi != ABI_CONTRACT:
             raise ValueError(f"only the {ABI_CONTRACT!r} profile can be remembered")
         t = runner.tensors
-        owned = {name: t[name] for name in _OWNED_SCRATCH if name in t}
-        if (
-            runner.dkv_fp32 and not runner.dkv_acc_permuted
-        ):  # the accumulators are the outputs: fresh per call
-            owned.pop("dkv_latent_acc", None)
-            owned.pop("dk_rope_acc", None)
-        if runner.has_backward and not runner.dkv_fp32:
-            # the cast's FP32 output pointers alias the accumulators (not dereferenced when out_f32 = 0)
-            for name in ("dkv_latent_fp32", "dk_rope_fp32"):
-                if name in t:
-                    owned[name] = t[name]
+        # Own separate allocations, never views of the runner's workspace: a view would keep the whole
+        # workspace alive.  The descriptor workspace needs no content (every launch encodes into it).
+        owned = {name: torch.empty_like(t[name]) for name in _OWNED_VALUES if name in t}
+        if not runner.has_topk_length:
+            owned["topk_length"] = t["topk_length"].clone()
         if runner.dkv_fp32 and runner.dkv_acc_permuted:
-            # zero-element BF16 placeholders of the cast (not dereferenced when out_f32 = 1); the accumulators stay owned scratch
+            # zero-element BF16 placeholders of the cast (not dereferenced when out_f32 = 1)
             for name in ("dkv_latent", "dk_rope"):
                 owned[name] = t[name]
-        if not runner.has_topk_length:
-            owned["topk_length"] = t["topk_length"]
-        acc_span = None
-        if "dkv_latent_acc" in owned and "dk_rope_acc" in owned:
-            (o1, n1), (o2, n2) = (
-                runner.layout["dkv_latent_acc"],
-                runner.layout["dk_rope_acc"],
-            )
-            acc_span = runner.workspace[min(o1, o2) : max(o1 + n1, o2 + n2)]
         return cls(
             num_queries=runner.num_queries,
             num_kv=runner.num_kv,
@@ -1508,8 +1506,7 @@ class _Binding:
                 key: launch.templated() for key, launch in runner.launches.items()
             },
             owned=owned,
-            acc_span=acc_span,
-            owned_bytes=int(runner.workspace.numel()),
+            owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
             dkv_acc_permuted=runner.dkv_acc_permuted,
             key_passes=runner.key_passes,
             backward_order=runner.backward_order,
@@ -1523,8 +1520,9 @@ class _Binding:
         )
 
     def rebind_values(self, current: dict[str, torch.Tensor]) -> dict[str, Any]:
-        """Host values of one launch: owned scratch, the current tensors and the
-        storage alias / element offset of the raw-pointer operands, re-read now."""
+        """Host values of one launch: the owned values, the current tensors (inputs,
+        outputs and per-call scratch) and the storage alias / element offset of the
+        raw-pointer operands, re-read now."""
         values: dict[str, Any] = dict(self.owned)
         values.update(current)
         values["indices_storage"], values["indices_offset"] = _pointer_alias(
@@ -1591,6 +1589,12 @@ class _Binding:
         dq_rope = torch.empty(
             (T, NUM_HEADS, D_ROPE), dtype=torch.bfloat16, device=device
         )
+        # Per-call scratch from the caching allocator: the FP32 dK/dV accumulators are one zero-filled span
+        # (a single fill kernel, as on the prepared runner's path); delta and the key-range-pass regions are
+        # fully written before they are read.
+        acc = torch.zeros((S * D_QK,), dtype=torch.float32, device=device)
+        acc_latent = acc[: S * D_LATENT].view(S, D_LATENT)
+        acc_rope = acc[S * D_LATENT :].view(S, D_ROPE)
         current = dict(
             q_latent=q_latent,
             q_rope=q_rope,
@@ -1603,12 +1607,24 @@ class _Binding:
             dout=dout,
             dq_latent=dq_latent,
             dq_rope=dq_rope,
+            delta=torch.empty((T, NUM_HEADS), dtype=torch.float32, device=device),
+            dkv_latent_acc=acc_latent,
+            dk_rope_acc=acc_rope,
         )
         if topk_length is not None:
             current["topk_length"] = topk_length
+        if self.key_passes > 1:
+            current["dq_partial"] = torch.empty(
+                (T, DQ_PARTIAL_BYTES_PER_TOKEN // 4), dtype=torch.float32, device=device
+            )
+            current["key_scratch"] = torch.empty(
+                (T, self.topk), dtype=torch.int32, device=device
+            )
+            current["pass_counts"] = torch.empty((T,), dtype=torch.int32, device=device)
         if self.dkv_fp32:
-            if self.dkv_acc_permuted:  # fresh natural-layout FP32 outputs from the cast; owned accumulators zeroed
-                self.acc_span.zero_()
+            if (
+                self.dkv_acc_permuted
+            ):  # fresh natural-layout FP32 outputs from the cast (out_f32 = 1)
                 current["dkv_latent_fp32"] = torch.empty(
                     (S, D_LATENT), dtype=torch.float32, device=device
                 )
@@ -1622,20 +1638,20 @@ class _Binding:
                     current["dkv_latent_fp32"],
                     current["dk_rope_fp32"],
                 )
-            acc = torch.zeros((S * D_QK,), dtype=torch.float32, device=device)
-            current["dkv_latent_acc"] = acc[: S * D_LATENT].view(S, D_LATENT)
-            current["dk_rope_acc"] = acc[S * D_LATENT :].view(S, D_ROPE)
-            self._launch(current, self.backward_order)
-            return dq_latent, dq_rope, current["dkv_latent_acc"], current["dk_rope_acc"]
-        self.acc_span.zero_()
+            self._launch(
+                current, self.backward_order
+            )  # natural layout: the accumulators are the outputs
+            return dq_latent, dq_rope, acc_latent, acc_rope
         dkv_latent = torch.empty((S, D_LATENT), dtype=torch.bfloat16, device=device)
         dk_rope = torch.empty((S, D_ROPE), dtype=torch.bfloat16, device=device)
         current["dkv_latent"] = dkv_latent
         current["dk_rope"] = dk_rope
+        # the cast's FP32 output pointers are not dereferenced when out_f32 = 0: alias the accumulators
+        current["dkv_latent_fp32"], current["dk_rope_fp32"] = acc_latent, acc_rope
         self._launch(current, self.backward_order)
         if "bwd_cast" not in self.launches:
-            dkv_latent.copy_(self.owned["dkv_latent_acc"])
-            dk_rope.copy_(self.owned["dk_rope_acc"])
+            dkv_latent.copy_(acc_latent)
+            dk_rope.copy_(acc_rope)
         return dq_latent, dq_rope, dkv_latent, dk_rope
 
 
@@ -1650,32 +1666,30 @@ class BindingCache:
     Python-level validation and binding: it allocates fresh outputs, slots
     them and the current tensors into the templates and launches (the module,
     its descriptor encoding and the cubin are those of the validating path).
-    A binding pins no caller tensor; it owns only its workspace scratch
-    (``delta``, the FP32 accumulators, a materialized ``topk_length``, the
-    descriptor workspace and, for a multi-pass backward, the key-range-pass
-    regions ``dq_partial`` / ``key_scratch`` / ``pass_counts``).  The cache
-    keeps at most ``capacity`` bindings and at most
-    :data:`BINDING_CACHE_BUDGET_BYTES` of owned scratch, evicting the oldest
-    first -- except the most recently remembered forward and backward
-    binding, which stay whatever their size: the pair one training step uses
-    is never re-bound step after step, even when its backward scratch (the
-    FP32 accumulators of a long key sequence, the key-range-pass regions)
-    exceeds the budget.  ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0`` or
+    A binding pins no caller tensor and holds no problem-sized scratch: the
+    outputs, ``delta``, the FP32 dK/dV accumulators and the key-range-pass
+    regions are allocated per call from the caching allocator, and a binding
+    owns only the descriptor workspace of the pointer-ABI stages and, when the
+    caller passes no ``topk_length``, the materialized vector (a few
+    kilobytes; see :class:`_Binding`).  The cache keeps at most ``capacity``
+    bindings (:data:`BINDING_CACHE_DEFAULT_CAPACITY`, or the value of
+    ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE_CAPACITY``) and evicts the least
+    recently used one first -- a hit refreshes its binding -- so a model whose
+    layers cycle through up to ``capacity`` bindings per step binds each of
+    them once.  ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0`` or
     ``enabled = False`` routes every call through the validating path.
     """
 
-    def __init__(
-        self,
-        capacity: int = 32,
-        budget_bytes: int = BINDING_CACHE_BUDGET_BYTES,
-        enabled: bool = True,
-    ):
-        self.capacity = int(capacity)
-        self.budget_bytes = int(budget_bytes)
+    def __init__(self, capacity: Optional[int] = None, enabled: bool = True):
+        self.capacity = binding_cache_capacity() if capacity is None else int(capacity)
+        if self.capacity < 1:
+            raise ValueError(
+                "BindingCache needs a capacity of at least one binding (use enabled=False to bypass it)"
+            )
         self.enabled = bool(enabled)
         self.hits = 0
         self.misses = 0
-        self._bindings: dict[tuple, _Binding] = {}
+        self._bindings: OrderedDict[tuple, _Binding] = OrderedDict()
 
     def __len__(self) -> int:
         return len(self._bindings)
@@ -1688,37 +1702,25 @@ class BindingCache:
         self._bindings.clear()
 
     def lookup(self, key: tuple) -> Optional[_Binding]:
-        """The binding remembered for ``key`` (counts a hit or a miss)."""
+        """The binding remembered for ``key`` (counts a hit or a miss); a hit becomes the most recently used."""
         binding = self._bindings.get(key)
         if binding is None:
             self.misses += 1
         else:
             self.hits += 1
+            self._bindings.move_to_end(key)
         return binding
 
     def peek(self, key: tuple) -> Optional[_Binding]:
-        """The binding remembered for ``key`` without touching the counters (inspection)."""
+        """The binding remembered for ``key`` without touching the counters or the recency order (inspection)."""
         return self._bindings.get(key)
 
-    def _evictable(self) -> list:
-        """Keys the capacity and the budget may evict, oldest first: every binding but the most
-        recently remembered one of each kind (``key[0]``: ``"fwd"`` / ``"bwd"``)."""
-        latest: dict[Any, tuple] = {}
-        for key in self._bindings:
-            latest[key[0] if isinstance(key, tuple) and key else None] = key
-        protected = set(latest.values())
-        return [key for key in self._bindings if key not in protected]
-
     def remember(self, key: tuple, binding: _Binding) -> _Binding:
+        """Remember ``binding`` as the most recently used; evict the least recently used beyond ``capacity``."""
         self._bindings.pop(key, None)
         self._bindings[key] = binding
-        while (
-            len(self._bindings) > self.capacity or self.owned_bytes > self.budget_bytes
-        ):
-            evictable = self._evictable()
-            if not evictable:
-                break  # the latest forward / backward pair stays whatever its size
-            del self._bindings[evictable[0]]
+        while len(self._bindings) > self.capacity:
+            self._bindings.popitem(last=False)
         return binding
 
 

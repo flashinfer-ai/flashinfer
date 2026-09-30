@@ -558,7 +558,6 @@ def test_pointer_alias_reports_the_storage_base_of_views_inside_a_storage():
         dkv_fp32=False,
         launches={},
         owned={},
-        acc_span=None,
     )
     values = binding.rebind_values(
         dict(indices=buf[13 : 13 + 8 * 96].view(8, 96), k_rope=k_rope)
@@ -997,36 +996,68 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_scale_and_lengths():
     )  # dout
 
 
-def test_binding_cache_keeps_the_latest_pair_and_evicts_the_rest():
-    """Capacity and byte budget evict the oldest bindings first, but never the most recently
-    remembered forward and backward binding: the pair a training step uses stays whatever
-    its size (a whole-row key-range-pass backward owns more scratch than the budget)."""
-    cache = BindingCache(capacity=3, budget_bytes=100)
+def test_binding_cache_is_least_recently_used_and_bounded_by_capacity():
+    """A hit refreshes its binding; beyond the capacity the least recently used binding goes,
+    so a model whose layers cycle through up to ``capacity`` bindings per step binds each once."""
+    cache = BindingCache(capacity=3)
     assert cache.enabled and len(cache) == 0
 
     def keys():
         return list(cache._bindings)
 
-    for kind, tag in (("fwd", "a"), ("bwd", "a"), ("fwd", "b"), ("bwd", "b")):
-        cache.remember((kind, tag), SimpleNamespace(owned_bytes=10))
-    # capacity 3: the oldest binding that is not the latest of its kind goes
-    assert keys() == [("bwd", "a"), ("fwd", "b"), ("bwd", "b")]
-    assert cache.lookup(("fwd", "a")) is None and cache.lookup(("bwd", "b")) is not None
+    for tag in ("a", "b", "c"):
+        cache.remember(("fwd", tag), SimpleNamespace(owned_bytes=10))
+    assert keys() == [("fwd", "a"), ("fwd", "b"), ("fwd", "c")]
+    assert cache.owned_bytes == 30
+    # a hit moves the binding to the most recently used end; a miss changes nothing
+    assert cache.lookup(("fwd", "a")) is not None
+    assert keys() == [("fwd", "b"), ("fwd", "c"), ("fwd", "a")]
+    assert cache.lookup(("fwd", "z")) is None and (cache.hits, cache.misses) == (1, 1)
+    # beyond the capacity the least recently used binding goes (b, not the refreshed a)
+    cache.remember(("bwd", "d"), SimpleNamespace(owned_bytes=10))
+    assert keys() == [("fwd", "c"), ("fwd", "a"), ("bwd", "d")]
+    # re-remembering a key makes it the most recently used without duplicating it
+    cache.remember(("fwd", "c"), SimpleNamespace(owned_bytes=10))
+    assert keys() == [("fwd", "a"), ("bwd", "d"), ("fwd", "c")] and len(cache) == 3
+    # peek neither counts nor refreshes
+    assert cache.peek(("fwd", "a")) is not None and keys()[0] == ("fwd", "a")
     assert (cache.hits, cache.misses) == (1, 1)
-    # over budget: older bindings go until the scratch fits, the latest forward stays
-    cache.remember(("bwd", "c"), SimpleNamespace(owned_bytes=95))
-    assert keys() == [("fwd", "b"), ("bwd", "c")] and cache.owned_bytes == 105
-    # a backward far above the budget replaces the previous backward and keeps the forward
-    cache.remember(("bwd", "d"), SimpleNamespace(owned_bytes=500))
-    assert keys() == [("fwd", "b"), ("bwd", "d")]
-    cache.remember(("fwd", "d"), SimpleNamespace(owned_bytes=500))
-    assert keys() == [("bwd", "d"), ("fwd", "d")]
-    # re-remembering a key moves it to the front without duplicating it
-    cache.remember(("bwd", "d"), SimpleNamespace(owned_bytes=500))
-    assert keys() == [("fwd", "d"), ("bwd", "d")] and len(cache) == 2
-    assert cache.peek(("fwd", "d")) is not None and (cache.hits, cache.misses) == (1, 1)
     cache.clear()
     assert len(cache) == 0 and cache.owned_bytes == 0
+    # a cyclic pattern of forward + backward bindings of four layers (eight keys) in an
+    # eight-binding cache: one miss per binding in the first step, hits from the second step on
+    layer_keys = [(kind, layer) for layer in range(4) for kind in ("fwd", "bwd")]
+
+    def run_steps(capacity, steps=3):
+        cache = BindingCache(capacity=capacity)
+        for _ in range(steps):
+            for key in layer_keys:
+                if cache.lookup(key) is None:
+                    cache.remember(key, SimpleNamespace(owned_bytes=1))
+        return cache.hits, cache.misses, len(cache)
+
+    assert run_steps(8) == (16, 8, 8)
+    assert run_steps(256) == (16, 8, 8)
+    # one binding more than the capacity thrashes under a cyclic pattern (the boundary)
+    assert run_steps(7) == (0, 24, 7)
+    with pytest.raises(ValueError, match="capacity"):
+        BindingCache(capacity=0)
+
+
+def test_binding_cache_capacity_from_environment(monkeypatch):
+    env = cake_backend.BINDING_CACHE_CAPACITY_ENV
+    monkeypatch.delenv(env, raising=False)
+    assert BindingCache().capacity == cake_backend.BINDING_CACHE_DEFAULT_CAPACITY == 256
+    assert cake_backend.BINDING_CACHE.capacity >= 1
+    monkeypatch.setenv(env, "5")
+    assert cake_backend.binding_cache_capacity() == 5 and BindingCache().capacity == 5
+    assert BindingCache(capacity=3).capacity == 3  # an explicit capacity wins
+    monkeypatch.setenv(env, " ")
+    assert BindingCache().capacity == 256
+    for bad in ("0", "-1", "many", "2.5"):
+        monkeypatch.setenv(env, bad)
+        with pytest.raises(ValueError, match="positive integer"):
+            BindingCache()
 
 
 # ---------------------------------------------------------------------------
@@ -1410,7 +1441,17 @@ def test_backward_forced_key_passes_masked_matches_reference_and_is_deterministi
     assert binding is not None and binding.key_passes == 3
     assert binding.holds_no_tensor()
     assert ("bwd_main_pass", 2) in binding.launches
-    assert {"dq_partial", "key_scratch", "pass_counts"} <= set(binding.owned)
+    # the pass regions, delta and the FP32 accumulators are per-call scratch: the binding owns kilobytes
+    assert not {
+        "delta",
+        "dkv_latent_acc",
+        "dk_rope_acc",
+        "dq_partial",
+        "key_scratch",
+        "pass_counts",
+    } & set(binding.owned)
+    assert set(binding.owned) <= {"topk_length", "tma_descriptor_workspace"}
+    assert binding.owned_bytes < (1 << 20)
     # dq is written once per row from the carried FP32 partial: bitwise across runs and paths
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
     for grads in (
@@ -1463,10 +1504,11 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
             ("bwd_compact", 1),
             ("bwd_main_pass", 1),
         ]
-        assert remembered[0].owned_bytes > cake_backend.BINDING_CACHE_BUDGET_BYTES
-        # steady state: repeating the step with the same binding re-binds nothing -- the forward and the
-        # two-pass backward binding (~790 MB of owned scratch, above the cache's byte budget) are the
-        # latest pair and stay remembered
+        # the two-pass backward's ~790 MB of scratch (dq_partial, key_scratch, the FP32 accumulators) is
+        # per-call allocator memory; the remembered binding itself owns kilobytes
+        assert remembered[0].owned_bytes < (1 << 20)
+        assert cache.owned_bytes < len(cache) << 20
+        # steady state: repeating the step with the same binding re-binds nothing
         fwd_args = tuple(t.detach() for t in leaves) + (inp.idx_global,)
         o1, l1, olo1 = cake_backend.forward(
             *fwd_args
@@ -1826,11 +1868,16 @@ def test_binding_cache_backward_hits_are_bitwise_and_fresh():
         binding = cache.peek(
             backward_binding_key(*args, None, default_softmax_scale(), False)
         )
-        assert (
-            binding.holds_no_tensor()
-            and "delta" in binding.owned
-            and "dkv_latent_acc" in binding.owned
-        )
+        # delta and the FP32 accumulators are per-call scratch, not owned by the binding
+        assert binding.holds_no_tensor()
+        assert set(binding.owned) <= {"topk_length", "tma_descriptor_workspace"}
+        assert binding.owned_bytes < (1 << 20)
+        # ... and are released with the results: repeated hits leave no allocation behind
+        live = torch.cuda.memory_allocated()
+        for _ in range(3):
+            cake_backend.backward(*args)
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_allocated() == live
         # the FP32 accumulators of dkv_fp32=True are outputs: fresh per call, never aliased between calls
         f1 = cake_backend.backward(*args, dkv_fp32=True)
         f2 = cake_backend.backward(*args, dkv_fp32=True)
@@ -1844,11 +1891,9 @@ def test_binding_cache_backward_hits_are_bitwise_and_fresh():
             backward_binding_key(*args, None, default_softmax_scale(), True)
         )
         assert fp32_binding is not binding and fp32_binding.holds_no_tensor()
-        permuted = (
-            record_dkv_acc_layout(record_for(torch.device("cuda"))[1]) == "permuted"
-        )
-        # natural accumulators are the fresh outputs (not owned); permuted ones stay owned scratch behind the cast
-        assert ("dkv_latent_acc" in fp32_binding.owned) == permuted
+        # the accumulators are per-call scratch in both layouts (a permuted program serves the FP32
+        # mode through its cast): never owned, never the returned gradients
+        assert not {"dkv_latent_acc", "dk_rope_acc"} & set(fp32_binding.owned)
         assert f1[2].data_ptr() not in {
             t.data_ptr() for t in fp32_binding.owned.values()
         }
