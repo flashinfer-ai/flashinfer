@@ -40,8 +40,9 @@ def _load_cake_benchmark_module():
 def _assert_cute_parity(actual, expected):
     for index in (0, 1):
         reference = expected[index]
-        # Cancellation makes the absolute error track the tensor scale, not the entry.
-        atol = max(1e-2, 1e-3 * reference.abs().amax().item())
+        # Cancellation ties the error to the head's magnitude rather than the
+        # entry's; the tensor max is a coarse bound on that.
+        atol = max(1e-2, 5e-4 * reference.abs().amax().item())
         torch.testing.assert_close(actual[index], reference, atol=atol, rtol=1e-2)
 
 
