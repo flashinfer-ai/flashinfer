@@ -2012,7 +2012,9 @@ def _non_causal_local_indices(inp, gen, *, masked_docs=()):
         picks = torch.rand(
             lq, max(lk, topk), device=local.device, generator=gen
         ).argsort(dim=-1)[:, :topk]
-        rows = torch.where(picks < lk, picks, torch.full_like(picks, -1)).to(torch.int32)
+        rows = torch.where(picks < lk, picks, torch.full_like(picks, -1)).to(
+            torch.int32
+        )
         if d in masked_docs:
             rows.fill_(-1)
         local[cu_q[d] : cu_q[d + 1]] = rows
@@ -2035,12 +2037,24 @@ def test_offset_gather_kv_indices_causal_tail_of_prefix():
             [0, 1, 2, -1, 4],  # doc 0, position (5 - 3) + 0 = 2: 4 beyond the bound
             [1, 0, 3, 4, -1],  # position 3: 4 beyond
             [2, 1, 0, 4, 5],  # position 4: 5 >= seqlen_k
-            [4, 5, 3, -1, 6],  # doc 1, position (6 - 2) + 0 = 4: 5 beyond, 6 >= seqlen_k
+            [
+                4,
+                5,
+                3,
+                -1,
+                6,
+            ],  # doc 1, position (6 - 2) + 0 = 4: 5 beyond, 6 >= seqlen_k
             [5, 4, 0, 6, -1],  # position 5: every key <= 5 is causal
             [0, 1, 2, 3, -1],  # doc 3, position 0
             [3, 2, 1, 0, 4],  # position 1: 3, 2 beyond, 4 >= seqlen_k
             [-1, -1, -1, -1, -1],  # fully masked row
-            [3, 0, 1, 2, 3],  # position 3: all causal (a repeated key is a repeated slot)
+            [
+                3,
+                0,
+                1,
+                2,
+                3,
+            ],  # position 3: all causal (a repeated key is a repeated slot)
         ],
         dtype=torch.int32,
     )
@@ -2106,7 +2120,11 @@ def test_validate_accepts_trainer_strided_layouts():
     q80 = torch.zeros(8, NUM_HEADS, 80, dtype=torch.bfloat16)
     kv520 = torch.zeros(16, 520, dtype=torch.bfloat16)
     assert validate_dsa_train_inputs(
-        q576[..., :D_LATENT], q80[:, :, 8:72], kv520[:, 8:520], kv704[:, D_LATENT:D_QK], idx
+        q576[..., :D_LATENT],
+        q80[:, :, 8:72],
+        kv520[:, 8:520],
+        kv704[:, D_LATENT:D_QK],
+        idx,
     ) == (8, 16, 5)
 
 
@@ -2130,12 +2148,20 @@ def _with(q_latent=None, q_rope=None, kv_latent=None, k_rope=None):
     [
         # head stride 68 elements = 136 B: not a 16-byte multiple
         (
-            _with(q_rope=lambda q256, q576, kv704: torch.zeros(8, NUM_HEADS, 68, dtype=torch.bfloat16)[..., :D_ROPE]),
+            _with(
+                q_rope=lambda q256, q576, kv704: torch.zeros(
+                    8, NUM_HEADS, 68, dtype=torch.bfloat16
+                )[..., :D_ROPE]
+            ),
             "head stride",
         ),
         # base 8 B into the row: the TMA global address must be 16-byte aligned
         (
-            _with(q_rope=lambda q256, q576, kv704: torch.zeros(8, NUM_HEADS, 80, dtype=torch.bfloat16)[:, :, 4:68]),
+            _with(
+                q_rope=lambda q256, q576, kv704: torch.zeros(
+                    8, NUM_HEADS, 80, dtype=torch.bfloat16
+                )[:, :, 4:68]
+            ),
             "16-byte aligned",
         ),
         # head stride below the slice width: heads would overlap
@@ -2151,26 +2177,40 @@ def _with(q_latent=None, q_rope=None, kv_latent=None, k_rope=None):
         (
             _with(
                 q_latent=lambda q256, q576, kv704: torch.as_strided(
-                    torch.zeros(65536, dtype=torch.bfloat16), (8, NUM_HEADS, D_LATENT), (4100, D_LATENT, 1)
+                    torch.zeros(65536, dtype=torch.bfloat16),
+                    (8, NUM_HEADS, D_LATENT),
+                    (4100, D_LATENT, 1),
                 )
             ),
             "token stride",
         ),
         # channel stride 2: the innermost dimension is not contiguous
         (
-            _with(q_latent=lambda q256, q576, kv704: torch.zeros(8, NUM_HEADS, 2 * D_LATENT, dtype=torch.bfloat16)[..., ::2]),
+            _with(
+                q_latent=lambda q256, q576, kv704: torch.zeros(
+                    8, NUM_HEADS, 2 * D_LATENT, dtype=torch.bfloat16
+                )[..., ::2]
+            ),
             "last dimension",
         ),
         # key row stride 700 elements = 1400 B: not a 16-byte multiple
         (
-            _with(kv_latent=lambda q256, q576, kv704: torch.zeros(16, 700, dtype=torch.bfloat16)[:, :D_LATENT]),
+            _with(
+                kv_latent=lambda q256, q576, kv704: torch.zeros(
+                    16, 700, dtype=torch.bfloat16
+                )[:, :D_LATENT]
+            ),
             "row stride",
         ),
         # key base 8 B into the row
         (_with(kv_latent=lambda q256, q576, kv704: kv704[:, 4:516]), "16-byte aligned"),
         # key row stride below the slice width: rows would overlap
         (
-            _with(k_rope=lambda q256, q576, kv704: torch.as_strided(kv704, (16, D_ROPE), (32, 1))),
+            _with(
+                k_rope=lambda q256, q576, kv704: torch.as_strided(
+                    kv704, (16, D_ROPE), (32, 1)
+                )
+            ),
             "row stride",
         ),
     ],
@@ -2195,16 +2235,26 @@ def test_forward_backward_strided_q_rope_256_bitwise():
     q256, q_rope = _q_rope_as_q256_slice(inp.q_rope)
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     ref = _forward_backward(*args, inp.idx_global, inp.dout)
-    got = _forward_backward(inp.q_latent, q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, inp.dout)
+    got = _forward_backward(
+        inp.q_latent, q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, inp.dout
+    )
     _assert_same_step(got, ref)
-    assert q_rope.data_ptr() == q256.data_ptr() + 384 and q_rope.stride() == (16384, 256, 1)
-    again = cake_backend.forward(inp.q_latent, q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
+    assert q_rope.data_ptr() == q256.data_ptr() + 384 and q_rope.stride() == (
+        16384,
+        256,
+        1,
+    )
+    again = cake_backend.forward(
+        inp.q_latent, q_rope, inp.kv_latent, inp.k_rope, inp.idx_global
+    )
     torch.cuda.synchronize()
     for a, b in zip(again, got[0], strict=True):
         assert torch.equal(a, b)
     leaf = q256.detach().clone().requires_grad_()
     with _quiet_experimental():
-        out = dsa_sparse_attention(inp.q_latent, leaf[:, :, 192:256], inp.kv_latent, inp.k_rope, inp.idx_global)
+        out = dsa_sparse_attention(
+            inp.q_latent, leaf[:, :, 192:256], inp.kv_latent, inp.k_rope, inp.idx_global
+        )
     (grad,) = torch.autograd.grad(out, [leaf], inp.dout)
     torch.cuda.synchronize()
     assert torch.equal(out, ref[0][0]) and torch.equal(grad[:, :, 192:256], ref[1][1])
@@ -2217,22 +2267,36 @@ def test_kv_row_stride_704_bitwise():
     descriptor / rope pointer stride only); the ``[S, 704]`` autograd leaf gets its gradient in columns 0:576 only."""
     _require_program(backward=True)
     inp = make_inputs([128, 128], [128, 384], seed=SEED + 757, topk=96)
-    ref = _forward_backward(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, inp.dout)
+    ref = _forward_backward(
+        inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, inp.dout
+    )
     got = {}
     for row_stride in (576, 704):
         kv, lat, rope = _kv_as_packed_row(inp.kv_latent, inp.k_rope, row_stride)
-        got[row_stride] = _forward_backward(inp.q_latent, inp.q_rope, lat, rope, inp.idx_global, inp.dout)
+        got[row_stride] = _forward_backward(
+            inp.q_latent, inp.q_rope, lat, rope, inp.idx_global, inp.dout
+        )
         _assert_same_step(got[row_stride], ref)
     _assert_same_step(got[704], got[576])
     leaf = kv.detach().clone().requires_grad_()  # the [S, 704] buffer
     with _quiet_experimental():
         out = dsa_sparse_attention(
-            inp.q_latent, inp.q_rope, leaf[:, :D_LATENT], leaf[:, D_LATENT:D_QK], inp.idx_global
+            inp.q_latent,
+            inp.q_rope,
+            leaf[:, :D_LATENT],
+            leaf[:, D_LATENT:D_QK],
+            inp.idx_global,
         )
     (grad,) = torch.autograd.grad(out, [leaf], inp.dout)
     torch.cuda.synchronize()
     assert torch.equal(out, ref[0][0]) and torch.all(grad[:, D_QK:] == 0)
-    assert max(rel_l2(grad[:, :D_LATENT], ref[1][2]), rel_l2(grad[:, D_LATENT:D_QK], ref[1][3])) < 1e-3
+    assert (
+        max(
+            rel_l2(grad[:, :D_LATENT], ref[1][2]),
+            rel_l2(grad[:, D_LATENT:D_QK], ref[1][3]),
+        )
+        < 1e-3
+    )
 
 
 def test_varlen_causal_tail_of_prefix_matches_reference():
@@ -2242,7 +2306,10 @@ def test_varlen_causal_tail_of_prefix_matches_reference():
     contributes no rows, and a segment whose every slot is ``-1`` gives ``out = 0``, ``lse = -inf``, ``dq = 0`` and
     exact zeros in dK / dV for its keys."""
     _require_program(backward=True)
-    seq_q, seq_k = [40, 48, 0, 56, 32], [40, 200, 64, 320, 96]  # full, tail, keys only, tail, tail (all -1)
+    seq_q, seq_k = (
+        [40, 48, 0, 56, 32],
+        [40, 200, 64, 320, 96],
+    )  # full, tail, keys only, tail, tail (all -1)
     inp = make_inputs(seq_q, seq_k, seed=SEED + 758, topk=64)
     gen = torch.Generator(device="cuda").manual_seed(1)
     local = _non_causal_local_indices(inp, gen, masked_docs=(4,))
@@ -2250,14 +2317,25 @@ def test_varlen_causal_tail_of_prefix_matches_reference():
     expected = globalize_gather_indices_loop(local, cu_q, cu_k, causal=True).cuda()
     assert torch.equal(offset_gather_kv_indices(local, cu_q, cu_k), expected)
     loose = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
-    assert torch.equal(loose, globalize_gather_indices_loop(local, cu_q, cu_k, causal=False).cuda())
-    assert ((expected == -1) & (loose != -1)).any(), "the case must select keys beyond the causal bound"
+    assert torch.equal(
+        loose, globalize_gather_indices_loop(local, cu_q, cu_k, causal=False).cuda()
+    )
+    assert ((expected == -1) & (loose != -1)).any(), (
+        "the case must select keys beyond the causal bound"
+    )
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     (out, lse, _), grads = _forward_backward(*args, expected, inp.dout)
     leaves = [t.detach().clone().requires_grad_() for t in args]
     with _quiet_experimental():
         out_v, lse_v = dsa_sparse_attention_varlen(
-            *leaves, local, cu_q, cu_k, inp.max_seqlen_q, inp.max_seqlen_k, causal=True, return_lse=True
+            *leaves,
+            local,
+            cu_q,
+            cu_k,
+            inp.max_seqlen_q,
+            inp.max_seqlen_k,
+            causal=True,
+            return_lse=True,
         )
     grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
     torch.cuda.synchronize()
@@ -2270,11 +2348,15 @@ def test_varlen_causal_tail_of_prefix_matches_reference():
     masked = slice(int(cu_q[-2]), int(cu_q[-1]))
     assert torch.all(lse_v[masked] == float("-inf")) and torch.all(out_v[masked] == 0)
     assert torch.all(grads_v[0][masked] == 0) and torch.all(grads_v[1][masked] == 0)
-    assert torch.all(grads_v[2][int(cu_k[-2]) :] == 0) and torch.all(grads_v[3][int(cu_k[-2]) :] == 0)
+    assert torch.all(grads_v[2][int(cu_k[-2]) :] == 0) and torch.all(
+        grads_v[3][int(cu_k[-2]) :] == 0
+    )
     with _quiet_experimental():
         out_nc = dsa_sparse_attention_varlen(*args, local, cu_q, cu_k, causal=False)
     torch.cuda.synchronize()
-    assert not torch.equal(out_nc, out_v), "without the causal term the same picks attend keys after the query"
+    assert not torch.equal(out_nc, out_v), (
+        "without the causal term the same picks attend keys after the query"
+    )
 
 
 def test_varlen_segment_with_every_slot_masked_gives_zero_outputs():
@@ -2290,15 +2372,21 @@ def test_varlen_segment_with_every_slot_masked_gives_zero_outputs():
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     leaves = [t.detach().clone().requires_grad_() for t in args]
     with _quiet_experimental():
-        out, lse = dsa_sparse_attention_varlen(*leaves, local, cu_q, cu_k, return_lse=True)
+        out, lse = dsa_sparse_attention_varlen(
+            *leaves, local, cu_q, cu_k, return_lse=True
+        )
     grads = torch.autograd.grad(out, leaves, inp.dout)
-    (out_flat, lse_flat, _), grads_flat = _forward_backward(*args, inp.idx_global, inp.dout)
+    (out_flat, lse_flat, _), grads_flat = _forward_backward(
+        *args, inp.idx_global, inp.dout
+    )
     torch.cuda.synchronize()
     assert torch.all(lse[64:] == float("-inf")) and torch.all(out[64:] == 0)
     assert torch.all(grads[0][64:] == 0) and torch.all(grads[1][64:] == 0)
     assert torch.all(grads[2][64:] == 0) and torch.all(grads[3][64:] == 0)
     assert torch.equal(out[:64], out_flat[:64]) and torch.equal(lse[:64], lse_flat[:64])
-    assert torch.equal(grads[0][:64], grads_flat[0][:64]) and torch.equal(grads[1][:64], grads_flat[1][:64])
+    assert torch.equal(grads[0][:64], grads_flat[0][:64]) and torch.equal(
+        grads[1][:64], grads_flat[1][:64]
+    )
     ref = reference_fp64(*args, glob, dout=inp.dout)
     _check_forward(inp, out, lse, ref)
     _check_backward(grads, ref)
@@ -2313,14 +2401,20 @@ def test_varlen_packed_glm_structure_small():
     seq_k = [177, 5684, 212, 6792, 212, 6792, 212, 6792]
     inp = make_inputs(seq_q, seq_k, seed=SEED + 760, topk=128)
     assert torch.equal(
-        offset_gather_kv_indices(inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k), inp.idx_global
+        offset_gather_kv_indices(inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k),
+        inp.idx_global,
     )
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     (out, lse, _), grads = _forward_backward(*args, inp.idx_global, inp.dout)
     leaves = [t.detach().clone().requires_grad_() for t in args]
     with _quiet_experimental():
         out_v, lse_v = dsa_sparse_attention_varlen(
-            *leaves, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k, inp.max_seqlen_q, inp.max_seqlen_k,
+            *leaves,
+            inp.idx_local,
+            inp.cu_seqlens_q,
+            inp.cu_seqlens_k,
+            inp.max_seqlen_q,
+            inp.max_seqlen_k,
             return_lse=True,
         )
     grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
@@ -2400,12 +2494,16 @@ def _cast_operand_tensors(S: int) -> dict:
 def test_record_cast_accumulates_reads_the_plan():
     assert cake_backend.record_cast_accumulates(_acc_plan_record(True))
     assert not cake_backend.record_cast_accumulates(_acc_plan_record(False))
-    assert not cake_backend.record_cast_accumulates({"arch": "sm_100a", "stages": ["fwd"]})
-    assert set(cake_backend.CAST_ACCUMULATE_OPERANDS) <= set(cake_backend.CONTRACT_ALIASES) | set(
-        cake_backend.CONTRACT_SCALARS
+    assert not cake_backend.record_cast_accumulates(
+        {"arch": "sm_100a", "stages": ["fwd"]}
     )
+    assert set(cake_backend.CAST_ACCUMULATE_OPERANDS) <= set(
+        cake_backend.CONTRACT_ALIASES
+    ) | set(cake_backend.CONTRACT_SCALARS)
     for name in cake_jit.MODULES:
-        assert isinstance(cake_backend.record_cast_accumulates(cake_jit.MODULES[name]), bool)
+        assert isinstance(
+            cake_backend.record_cast_accumulates(cake_jit.MODULES[name]), bool
+        )
 
 
 def test_check_dkv_acc_accepts_the_contract_layouts():
@@ -2413,15 +2511,24 @@ def test_check_dkv_acc_accepts_the_contract_layouts():
     acc576 = torch.zeros(S, D_QK)
     operand, stride = cake_backend._check_dkv_acc(acc576, None, S)
     assert operand is acc576 and stride == D_QK
-    acc704 = torch.zeros(S + 4, 704)  # a frozen 128-channel indexer key stored alongside the 576 channels
+    acc704 = torch.zeros(
+        S + 4, 704
+    )  # a frozen 128-channel indexer key stored alongside the 576 channels
     operand, stride = cake_backend._check_dkv_acc(acc704, None, S)
     assert operand is acc704 and stride == 704
-    view = acc704[:, :D_QK]  # the 576 columns as a strided view: a flat alias from its first element
+    view = acc704[
+        :, :D_QK
+    ]  # the 576 columns as a strided view: a flat alias from its first element
     operand, stride = cake_backend._check_dkv_acc(view, None, S)
     assert stride == 704 and operand.is_contiguous() and operand.dim() == 1
-    assert operand.data_ptr() == view.data_ptr() and operand.numel() == (S + 4 - 1) * 704 + D_QK
+    assert (
+        operand.data_ptr() == view.data_ptr()
+        and operand.numel() == (S + 4 - 1) * 704 + D_QK
+    )
     dst_map = torch.zeros(S, dtype=torch.int32)
-    operand, stride = cake_backend._check_dkv_acc(torch.zeros(3, D_QK), dst_map, S)  # fewer rows than S with a map
+    operand, stride = cake_backend._check_dkv_acc(
+        torch.zeros(3, D_QK), dst_map, S
+    )  # fewer rows than S with a map
     assert stride == D_QK
 
 
@@ -2436,8 +2543,16 @@ def test_check_dkv_acc_accepts_the_contract_layouts():
         (lambda: torch.zeros(16, 580)[:, 1:], None, "16-byte"),
         (lambda: torch.zeros(8, D_QK), None, "at least S"),
         (lambda: torch.zeros(16, D_QK), torch.zeros(16, dtype=torch.int64), "int32"),
-        (lambda: torch.zeros(16, D_QK), torch.zeros(15, dtype=torch.int32), r"int32 \[S\]"),
-        (lambda: torch.zeros(16, D_QK), torch.zeros(32, dtype=torch.int32)[::2], "contiguous"),
+        (
+            lambda: torch.zeros(16, D_QK),
+            torch.zeros(15, dtype=torch.int32),
+            r"int32 \[S\]",
+        ),
+        (
+            lambda: torch.zeros(16, D_QK),
+            torch.zeros(32, dtype=torch.int32)[::2],
+            "contiguous",
+        ),
     ],
 )
 def test_check_dkv_acc_rejects(acc, dst_map, match):
@@ -2470,7 +2585,9 @@ def test_backward_binding_key_covers_dkv_acc_and_map():
     acc = torch.zeros(S, 704)
     with_acc = backward_binding_key(*args, dkv_acc=acc)
     assert plain != with_acc and with_acc == backward_binding_key(*args, dkv_acc=acc)
-    assert with_acc != backward_binding_key(*args, dkv_acc=acc[:, :D_QK])  # another row layout of the same storage
+    assert with_acc != backward_binding_key(
+        *args, dkv_acc=acc[:, :D_QK]
+    )  # another row layout of the same storage
     dst_map = torch.zeros(S, dtype=torch.int32)
     assert with_acc != backward_binding_key(*args, dkv_acc=acc, dkv_dst_map=dst_map)
 
@@ -2478,7 +2595,9 @@ def test_backward_binding_key_covers_dkv_acc_and_map():
 def test_bind_stage_serves_the_accumulating_cast_plan(monkeypatch):
     """The packed-accumulate operands bind from ``dkv_acc`` / ``dkv_dst_map`` (aliases ``dst_packed`` / ``dst_map``) and
     the three scalars; without them the host binds inert placeholders of the right dtypes, as the production launcher does."""
-    monkeypatch.setitem(cake_jit.MODULES, "cake_dsa_h64_train_fake_acc", _acc_plan_record(True))
+    monkeypatch.setitem(
+        cake_jit.MODULES, "cake_dsa_h64_train_fake_acc", _acc_plan_record(True)
+    )
     monkeypatch.setattr(
         cake_backend,
         "load_cake_dsa_train_module",
@@ -2511,7 +2630,10 @@ def test_bind_stage_serves_the_accumulating_cast_plan(monkeypatch):
         t, dict(scalars, dst_row_stride=0, has_dst_map=0, accumulate=0)
     )
     launch = bind_stage("cake_dsa_h64_train_fake_acc", "bwd_cast", inert, (3, 1, 1))
-    assert launch.arguments[9] is t["dkv_latent_acc"] and launch.arguments[11] is t["indices"]
+    assert (
+        launch.arguments[9] is t["dkv_latent_acc"]
+        and launch.arguments[11] is t["indices"]
+    )
     assert launch.arguments[10] == 0 and launch.arguments[12:14] == (0, 0)
     # a remembered binding re-supplies both per call (placeholders when the call accumulates nothing)
     rebound = launch.templated().arguments_for(
@@ -2519,7 +2641,9 @@ def test_bind_stage_serves_the_accumulating_cast_plan(monkeypatch):
     )
     assert rebound[9] is t["dkv_latent_acc"] and rebound[11] is t["indices"]
     # the old plan (no accumulate operands) still binds from the same values
-    monkeypatch.setitem(cake_jit.MODULES, "cake_dsa_h64_train_fake_old", _acc_plan_record(False))
+    monkeypatch.setitem(
+        cake_jit.MODULES, "cake_dsa_h64_train_fake_old", _acc_plan_record(False)
+    )
     old = bind_stage("cake_dsa_h64_train_fake_old", "bwd_cast", values, (3, 1, 1))
     assert len(old.arguments) == 12 and old.arguments[0] is t["dkv_latent_acc"]
 
@@ -2591,9 +2715,13 @@ def test_backward_dkv_acc_identity_accumulates_in_place():
     assert torch.equal(aq_l, dq_l) and torch.equal(aq_r, dq_r)
     torch.testing.assert_close(acc[:, :D_QK], pre[:, :D_QK] + nat, rtol=1e-4, atol=1e-4)
     assert torch.equal(acc[:, D_QK:], pre[:, D_QK:])
-    cake_backend.backward(*args, dkv_acc=acc[:, :D_QK])  # second call, through the strided view: keeps adding
+    cake_backend.backward(
+        *args, dkv_acc=acc[:, :D_QK]
+    )  # second call, through the strided view: keeps adding
     torch.cuda.synchronize()
-    torch.testing.assert_close(acc[:, :D_QK], pre[:, :D_QK] + 2 * nat, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(
+        acc[:, :D_QK], pre[:, :D_QK] + 2 * nat, rtol=1e-4, atol=1e-4
+    )
     assert torch.equal(acc[:, D_QK:], pre[:, D_QK:])
 
 
@@ -2617,7 +2745,9 @@ def test_bwd_cast_accumulate_without_map_is_one_fp32_add_bitwise():
     _, _, nat_l, nat_r = runner.backward()
     torch.cuda.synchronize()
     S = inp.total_k
-    pre = torch.randn(S, 704, device="cuda", generator=torch.Generator(device="cuda").manual_seed(2))
+    pre = torch.randn(
+        S, 704, device="cuda", generator=torch.Generator(device="cuda").manual_seed(2)
+    )
     acc = pre.clone()
     t = dict(runner.tensors, dkv_acc=acc)
     scalars = dict(
@@ -2634,7 +2764,9 @@ def test_bwd_cast_accumulate_without_map_is_one_fp32_add_bitwise():
     values = cake_backend._contract_values(t, scalars, key_passes=runner.key_passes)
     physical = record_for(torch.device("cuda"))[1]["bwd_cast"]
     grid = grid_dims(
-        physical["grid"], scalars, torch.cuda.get_device_properties(0).multi_processor_count
+        physical["grid"],
+        scalars,
+        torch.cuda.get_device_properties(0).multi_processor_count,
     )
     launch = bind_stage(runner.module_name, "bwd_cast", values, grid)
     with cake_backend._ffi_stream_context(runner.device_index):
@@ -2654,12 +2786,18 @@ def test_backward_dkv_acc_destination_map_with_duplicates_matches_index_add():
     args, _, _, nat = _forward_and_natural_dkv(inp)
     S, S_dst = inp.total_k, 300
     gen = torch.Generator(device="cuda").manual_seed(3)
-    dst_map = torch.randint(0, S_dst, (S,), device="cuda", generator=gen).to(torch.int32)
+    dst_map = torch.randint(0, S_dst, (S,), device="cuda", generator=gen).to(
+        torch.int32
+    )
     acc = torch.zeros(S_dst, 704, device="cuda")
-    _, _, none_l, none_r = cake_backend.backward(*args, dkv_acc=acc, dkv_dst_map=dst_map)
+    _, _, none_l, none_r = cake_backend.backward(
+        *args, dkv_acc=acc, dkv_dst_map=dst_map
+    )
     torch.cuda.synchronize()
     assert none_l is None and none_r is None
-    expect = torch.zeros(S_dst, D_QK, device="cuda").index_add_(0, dst_map.to(torch.int64), nat)
+    expect = torch.zeros(S_dst, D_QK, device="cuda").index_add_(
+        0, dst_map.to(torch.int64), nat
+    )
     assert rel_l2(acc[:, :D_QK], expect) < ACC_REL_L2
     assert torch.all(acc[:, D_QK:] == 0)
     untouched = torch.ones(S_dst, dtype=torch.bool, device="cuda")
@@ -2684,20 +2822,30 @@ def test_binding_cache_serves_dkv_acc_bindings_per_buffer():
         pytest.skip("binding cache disabled")
     acc = torch.zeros(S, D_QK, device="cuda")
     dst_map = torch.arange(S, device="cuda", dtype=torch.int32)
-    key = backward_binding_key(*args, None, default_softmax_scale(), False, None, acc, dst_map)
+    key = backward_binding_key(
+        *args, None, default_softmax_scale(), False, None, acc, dst_map
+    )
     cake_backend.backward(*args, dkv_acc=acc, dkv_dst_map=dst_map)
     binding = cache.peek(key)
     assert binding is not None and binding.accumulate_dkv and binding.holds_no_tensor()
     hits = cache.hits
-    cake_backend.backward(*args, dkv_acc=acc, dkv_dst_map=dst_map)  # same binding: a hit, adds again
+    cake_backend.backward(
+        *args, dkv_acc=acc, dkv_dst_map=dst_map
+    )  # same binding: a hit, adds again
     torch.cuda.synchronize()
     assert cache.hits == hits + 1
     assert rel_l2(acc, 2 * nat) < ACC_REL_L2
-    acc2 = torch.zeros(S + 2, 704, device="cuda")  # another layout: another binding (miss), row stride 704 baked
+    acc2 = torch.zeros(
+        S + 2, 704, device="cuda"
+    )  # another layout: another binding (miss), row stride 704 baked
     cake_backend.backward(*args, dkv_acc=acc2)
     torch.cuda.synchronize()
     assert cache.hits == hits + 1
-    assert rel_l2(acc2[:S, :D_QK], nat) < ACC_REL_L2 and torch.all(acc2[S:] == 0) and torch.all(acc2[:, D_QK:] == 0)
+    assert (
+        rel_l2(acc2[:S, :D_QK], nat) < ACC_REL_L2
+        and torch.all(acc2[S:] == 0)
+        and torch.all(acc2[:, D_QK:] == 0)
+    )
 
 
 def test_autograd_function_with_dkv_acc_returns_no_kv_grads_and_accumulates():
@@ -2720,7 +2868,9 @@ def test_autograd_function_with_dkv_acc_returns_no_kv_grads_and_accumulates():
     assert leaves[2].grad is None and leaves[3].grad is None
     assert torch.equal(leaves[0].grad, dq_l) and torch.equal(leaves[1].grad, dq_r)
     assert rel_l2(acc, nat) < ACC_REL_L2
-    perm = torch.randperm(S, device="cuda", generator=torch.Generator(device="cuda").manual_seed(5)).to(torch.int32)
+    perm = torch.randperm(
+        S, device="cuda", generator=torch.Generator(device="cuda").manual_seed(5)
+    ).to(torch.int32)
     acc_p = torch.zeros(S, D_QK, device="cuda")
     out2, _ = cake_backend.DSASparseAttentionFunction.apply(
         *leaves, inp.idx_global, None, default_softmax_scale(), None, acc_p, perm
@@ -2729,4 +2879,6 @@ def test_autograd_function_with_dkv_acc_returns_no_kv_grads_and_accumulates():
     torch.cuda.synchronize()
     assert leaves[2].grad is None and leaves[3].grad is None
     assert rel_l2(acc_p[perm.long()], nat) < ACC_REL_L2
+
+
 # --- end of the packed fp32 dK/dV block ---

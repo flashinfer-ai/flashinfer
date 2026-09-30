@@ -1718,7 +1718,9 @@ class _Binding:
     dkv_acc_permuted: bool = False
     key_passes: int = 1
     backward_order: tuple = ()
-    accumulate_dkv: bool = False  # the cast adds into the caller's dkv_acc rows (re-supplied per call)
+    accumulate_dkv: bool = (
+        False  # the cast adds into the caller's dkv_acc rows (re-supplied per call)
+    )
 
     @classmethod
     def from_runner(cls, runner: DSATrainRunner) -> "_Binding":
@@ -2157,7 +2159,9 @@ def backward(
         )
         if dkv_acc is None:
             return empty
-        _check_dkv_acc(dkv_acc, dkv_dst_map, int(kv_latent.shape[0]))  # nothing to accumulate
+        _check_dkv_acc(
+            dkv_acc, dkv_dst_map, int(kv_latent.shape[0])
+        )  # nothing to accumulate
         return empty[0], empty[1], None, None
     scale = (
         float(softmax_scale) if softmax_scale is not None else default_softmax_scale()
@@ -2306,7 +2310,18 @@ class DSASparseAttentionFunction(torch.autograd.Function):
             dkv_dst_map=ctx.dkv_dst_map,
         )
         # dkv_latent / dk_rope are None when the gradients went into dkv_acc; no gradient for the six other inputs
-        return dq_latent, dq_rope, dkv_latent, dk_rope, None, None, None, None, None, None
+        return (
+            dq_latent,
+            dq_rope,
+            dkv_latent,
+            dk_rope,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
 
 
 def dsa_sparse_attention(
