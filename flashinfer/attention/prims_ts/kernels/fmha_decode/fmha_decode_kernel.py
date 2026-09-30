@@ -3424,9 +3424,9 @@ def fmha_decode_launch(
     # as the packed K/V. The SF tensor is logically
     # (headdim // 16, storage_tokens_per_page, h_k, total_pages) E4M3. K uses
     # token-major layout and V uses TRT-LLM's 4-token interleaved layout. The
-    # inner SF box (headdim // 16 = 8 B) is below TMA's
-    # 16 B minimum, so fold `r` tokens into dim0 for up to a 128 B inner box,
-    # without spanning semantic page fragments.
+    # When one scale row is below TMA's 16 B minimum, fold `r` complete token
+    # rows into dim0 for up to a 128 B inner box without spanning semantic page
+    # fragments.
     # This reshape is a pure reinterpretation of the same contiguous bytes.
     tma_desc_k_sf = tma_desc_k
     tma_desc_v_sf = tma_desc_v
@@ -3443,6 +3443,8 @@ def fmha_decode_launch(
         sf_box_tokens_outer = cfg.num_tokens_per_page // sf_r
         sf_page_elems = Int32(sf_per_token * sf_storage_tokens_per_page)
         compact_sf_page_stride = sf_page_elems * h_k
+        # Native paged launches use the caller's scale-factor page strides;
+        # other launches use compact scale-factor pages.
         k_sf_tma_page_stride = (
             k_sf_page_stride
             if cutlass.const_expr(use_native_paged_kv)

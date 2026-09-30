@@ -52,6 +52,8 @@ from cutlass.experimental.task_scheduling.schedule_builder import (
 from cutlass.experimental.task_scheduling.resources import StageInfo
 from cutlass.experimental.task_scheduling.task import Task
 
+from ......cute_dsl.utils import task_context_kwargs
+
 from .resources import (
     MlaWorkQueue,
     WorkThrottleBarrierResource,
@@ -161,7 +163,7 @@ class MlaTask(Task):
         # Keep task bodies on that cached value so page-offset/TMA/MMA/softmax
         # paths do not each rebuild the same split-KV arithmetic.
         self.domain = work_tile.k_tile_count
-        self._run_task_body_impl(work_tile, context=context)
+        self._run_task_body_impl(work_tile, **task_context_kwargs(context))
 
     @cute.jit
     def _drain_mla_work_tile_tails(self) -> None:
@@ -281,7 +283,7 @@ class MlaInterleavedTask(MlaTask):
         ) // cutlass.Int32(2)
         self._fixed_loop_end = fixed_lane + lane_iterations * cutlass.Int32(2)
         self.domain = self._fixed_loop_end
-        self._run_task_body_impl(work_tile, context=context)
+        self._run_task_body_impl(work_tile, **task_context_kwargs(context))
         self._cumulative_k_parity = (
             self._cumulative_k_parity + self._actual_domain
         ) % cutlass.Int32(2)
