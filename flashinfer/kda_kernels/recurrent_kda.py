@@ -2068,6 +2068,7 @@ def run_recurrent_kda(
     auto_unbounded_softplus_candidate = (
         backend == "auto"
         and num_spec_tokens is None
+        and cu_seqlens is None
         and H > 0
         and HV == H
         and K == 128
