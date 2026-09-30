@@ -319,9 +319,9 @@ def fused_topk_deepseek(
     Notes
     -----
     The kernel uses ``float32`` internally for numerical precision regardless
-    of the input dtype.  Supported on Ada (SM89), Hopper (SM90), and
-    Blackwell (SM100/SM103/SM120/SM121).  In the underlying CUDA kernel name
-    ``NoAuxTc``, the ``NoAux`` prefix indicates the absence of auxiliary
+    of the input dtype.  Supported on Ada (SM89), Hopper (SM90), Blackwell
+    (SM100/SM103/SM120/SM121) and Rubin (SM107).  In the underlying CUDA
+    kernel name ``NoAuxTc``, the ``NoAux`` prefix indicates the absence of auxiliary
     load-balancing losses and the ``Tc`` suffix indicates Tensor-Core
     utilization.
     """

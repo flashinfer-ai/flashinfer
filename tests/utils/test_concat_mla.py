@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from flashinfer.concat_ops import concat_mla_k
+from flashinfer.jit.cpp_ext import is_cuda_version_at_least
 from flashinfer.utils import get_compute_capability
 
 NUM_LOCAL_HEADS = 128
@@ -175,8 +176,11 @@ def _make_cake_tensors(
 def _require_cake_concat_mla_k() -> None:
     if not torch.cuda.is_available():
         pytest.skip("Cake concat MLA K requires CUDA")
-    if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("Cake concat MLA K requires SM100 or SM103")
+    capability = get_compute_capability(torch.device("cuda"))
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip("Cake concat MLA K requires SM100, SM103 or SM107")
+    if capability == (10, 7) and not is_cuda_version_at_least("13.0"):
+        pytest.skip("Cake concat MLA K on SM107 requires CUDA 13.0 or newer")
 
 
 # ────────────────────────── Core correctness tests ──────────────────────────

@@ -512,7 +512,10 @@ def prepare_bgmv_moe(
     )
 
     schedule = select_cake_bgmv_moe_schedule(hidden_size, num_tokens, arch)
-    module = get_cake_bgmv_moe_module(hidden_size, dtype_name, arch)
+    # Configure() reads the CUDA current device, so load the module under
+    # x.device in case the caller's current device differs from it.
+    with torch.cuda.device(x.device):
+        module = get_cake_bgmv_moe_module(hidden_size, dtype_name, arch)
     return BGMVMoECakePlan(
         module,
         y_accum=y_accum,
