@@ -65,6 +65,8 @@ void nvfp4_sparse_mla_decode_run(TensorView kv_cache, TensorView query, TensorVi
       << ", num_ctas_per_token=" << num_ctas_per_token;
   TVM_FFI_ICHECK_LE(num_tokens * num_ctas_per_token, INT32_MAX) << "too many query tokens";
 
+  // The shared-memory attribute is set on, and the kernel launched from, the current device.
+  tvm::ffi::CUDADeviceGuard device_guard(query.device().device_id);
   cudaStream_t stream = get_stream(out.device());
   cudaError_t status = kernel::launch(
       static_cast<const uint8_t*>(kv_cache.data_ptr()),
