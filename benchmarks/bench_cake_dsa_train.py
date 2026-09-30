@@ -1150,12 +1150,17 @@ def main():
         parser.error(f"unknown arms {unknown}; choose from {sorted(ARMS)}")
     if args.rows is None:
         args.rows = PRESETS[args.preset]["rows"] if args.preset else list(ROWS)
-    if args.dkv_dst_map not in (None, "none") and not (
-        args.dkv_acc
-        or args.preset
-        or any(ROW_LAYOUTS.get(r, {}).get("dkv_acc") for r in args.rows)
-    ):
-        parser.error("--dkv-dst-map needs --dkv-acc")
+    # every layout the run will build (one per perf row, plus the accuracy layout) must carry dkv_acc when a
+    # destination map is set -- Layout() raises otherwise, which would abort the run after the first rows
+    planned = [(row, resolve_layout(row, args)) for row in args.rows]
+    if args.accuracy:
+        planned.append(("accuracy", resolve_layout(None, args)))
+    for name, layout in planned:
+        if layout.get("dkv_dst_map", "none") != "none" and not layout.get("dkv_acc"):
+            parser.error(
+                f"--dkv-dst-map needs dkv_acc, but the layout of {name!r} resolves without it "
+                "(add --dkv-acc or pick rows / a preset that enable it)"
+            )
     device = torch.device(args.device)
     if device.index is None:  # torch >= 2.13 requires an index here
         device = torch.device("cuda", torch.cuda.current_device())

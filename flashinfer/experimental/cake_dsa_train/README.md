@@ -35,11 +35,12 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
   run.  `cu_seqlens_q` and `cu_seqlens_k` are independent: a query segment
   may be shorter than its key segment, in which case it is the tail of that
   key prefix -- query `local_q` of document `d` sits at key position
-  `(seqlen_k[d] - seqlen_q[d]) + local_q`.  With `causal=True` (the default)
-  the offsetting also drops selected keys after that position (the rule of
-  the Cake facade: `offset_gather_kv_indices(..., causal=True)` keeps a slot
-  iff `0 <= idx < seqlen_k[d]` and `idx <= (seqlen_k[d] - seqlen_q[d]) +
-  local_q`); with `causal=False` a query's key set is exactly its index row.
+  `(seqlen_k[d] - seqlen_q[d]) + local_q`.  With `causal=True` the
+  offsetting also drops selected keys after that position (the rule of the
+  Cake facade: `offset_gather_kv_indices(..., causal=True)` keeps a slot iff
+  `0 <= idx < seqlen_k[d]` and `idx <= (seqlen_k[d] - seqlen_q[d]) +
+  local_q`); with `causal=False` (the default, unchanged from the first
+  release) a query's key set is exactly its index row.
   Either way the kernels apply no positional mask of their own: the offset
   index rows define the key sets.  A zero-length query segment contributes
   no rows; a row whose every slot ends up `-1` gives `out = 0`, `lse = -inf`

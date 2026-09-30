@@ -2027,8 +2027,9 @@ def _non_causal_local_indices(inp, gen, *, masked_docs=()):
 
 def test_offset_gather_kv_indices_causal_tail_of_prefix():
     """The varlen rule of the Cake facade: query ``local_q`` of document ``d`` sits at key position
-    ``(seqlen_k[d] - seqlen_q[d]) + local_q`` and, with ``causal`` (the default), attends selected keys ``<=``
-    that position only; ``causal=False`` is the plain offsetting; a zero-query document contributes no rows."""
+    ``(seqlen_k[d] - seqlen_q[d]) + local_q`` and, with ``causal=True``, attends selected keys ``<=`` that
+    position only; ``causal=False`` (the default, as in the first release) is the plain offsetting; a zero-query
+    document contributes no rows."""
     # documents: tail (3 queries, 5 keys), tail (2 queries, 6 keys), keys without queries, full (4 x 4)
     cu_q = torch.tensor([0, 3, 5, 5, 9], dtype=torch.int32)
     cu_k = torch.tensor([0, 5, 11, 14, 18], dtype=torch.int32)
@@ -2080,17 +2081,18 @@ def test_offset_gather_kv_indices_causal_tail_of_prefix():
         [-1, -1, -1, -1, -1],
         [17, 14, 15, 16, 17],
     ]
-    strict = offset_gather_kv_indices(local, cu_q, cu_k)
+    strict = offset_gather_kv_indices(local, cu_q, cu_k, causal=True)
     assert strict.dtype == torch.int32 and strict.tolist() == strict_expected
-    assert torch.equal(strict, offset_gather_kv_indices(local, cu_q, cu_k, causal=True))
     loose = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
     assert loose.tolist() == loose_expected
+    # the default is the plain offsetting of the first release
+    assert torch.equal(offset_gather_kv_indices(local, cu_q, cu_k), loose)
     for causal, expected in ((True, strict), (False, loose)):
         assert torch.equal(
             globalize_gather_indices_loop(local, cu_q, cu_k, causal=causal), expected
         )
     out = torch.empty_like(local)
-    assert offset_gather_kv_indices(local, cu_q, cu_k, out=out) is out
+    assert offset_gather_kv_indices(local, cu_q, cu_k, causal=True, out=out) is out
     assert torch.equal(out, strict)
 
 
@@ -2299,6 +2301,27 @@ def test_kv_row_stride_704_bitwise():
     )
 
 
+def test_dkv_dst_map_value_check_is_opt_in(monkeypatch):
+    """``_check_dkv_acc`` validates dtype / shape / contiguity / device of ``dkv_dst_map`` but not its values
+    (the kernel does not range-check the map); with ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1`` an out-of-range
+    destination row raises ``ValueError`` and an in-range map passes."""
+    dkv_acc = torch.zeros(4, D_QK, dtype=torch.float32)
+    good = torch.tensor([3, 0, 3], dtype=torch.int32)
+    bad = torch.tensor([0, 4, 1], dtype=torch.int32)  # 4 == S_dst is outside [0, S_dst)
+    monkeypatch.delenv("FLASHINFER_CAKE_DSA_CHECK_DST_MAP", raising=False)
+    for dst_map in (good, bad):
+        operand, row_stride = cake_backend._check_dkv_acc(dkv_acc, dst_map, num_kv=3)
+        assert operand is dkv_acc and row_stride == D_QK
+    monkeypatch.setenv("FLASHINFER_CAKE_DSA_CHECK_DST_MAP", "1")
+    assert cake_backend._check_dkv_acc(dkv_acc, good, num_kv=3)[1] == D_QK
+    with pytest.raises(ValueError, match=r"dkv_dst_map values must lie in \[0, 4\)"):
+        cake_backend._check_dkv_acc(dkv_acc, bad, num_kv=3)
+    with pytest.raises(ValueError, match="dkv_dst_map values must lie in"):
+        cake_backend._check_dkv_acc(
+            dkv_acc, torch.tensor([-1, 0, 0], dtype=torch.int32), num_kv=3
+        )
+
+
 def test_varlen_causal_tail_of_prefix_matches_reference():
     """Query segments that are the tail of their key prefix (seqlen_q < seqlen_k) with gather indices that
     deliberately select keys beyond the causal bound ``(seqlen_k - seqlen_q) + local_q``: the varlen entry masks
@@ -2315,7 +2338,9 @@ def test_varlen_causal_tail_of_prefix_matches_reference():
     local = _non_causal_local_indices(inp, gen, masked_docs=(4,))
     cu_q, cu_k = inp.cu_seqlens_q, inp.cu_seqlens_k
     expected = globalize_gather_indices_loop(local, cu_q, cu_k, causal=True).cuda()
-    assert torch.equal(offset_gather_kv_indices(local, cu_q, cu_k), expected)
+    assert torch.equal(
+        offset_gather_kv_indices(local, cu_q, cu_k, causal=True), expected
+    )
     loose = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
     assert torch.equal(
         loose, globalize_gather_indices_loop(local, cu_q, cu_k, causal=False).cuda()

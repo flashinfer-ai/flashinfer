@@ -171,7 +171,7 @@ def dsa_sparse_attention_varlen(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     *,
-    causal: bool = True,
+    causal: bool = False,
     topk_length: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
@@ -204,11 +204,13 @@ def dsa_sparse_attention_varlen(
     Parameters
     ----------
     causal : bool
-        With ``True`` (default) a slot that selects a key after the query's
-        own position (``idx > (seqlen_k[d] - seqlen_q[d]) + local_q``) is
-        invalid, so a top-k selector need not enforce causality itself; with
-        ``False`` the index row is taken as is (only ``-1`` / out-of-range
-        slots are dropped).
+        With ``False`` (default) the index row is taken as is -- only ``-1`` /
+        out-of-range slots are dropped -- exactly as in the first release.
+        With ``True`` a slot that selects a key after the query's own position
+        (``idx > (seqlen_k[d] - seqlen_q[d]) + local_q``) is invalid too, so a
+        top-k selector need not enforce causality itself (the rule GLM-style
+        trainers with query segments that are tails of their key prefix rely
+        on).
     """
     return _backend(backend).dsa_sparse_attention_varlen(
         q_latent,

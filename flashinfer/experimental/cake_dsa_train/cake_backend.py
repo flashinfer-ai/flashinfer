@@ -581,7 +581,10 @@ def _check_dkv_acc(
     into ``512:576``; further columns are never touched), ``stride(1) == 1``, row stride >= 576 elements and a multiple
     of 4 (16-byte vectors), 16-byte-aligned base; without a map at least ``num_kv`` rows.  ``dkv_dst_map``: ``None``
     (identity) or a contiguous int32 ``[num_kv]`` tensor on the device of ``dkv_acc`` -- the destination row of every
-    source key row, values in ``[0, S_dst)`` (not checked on device), duplicates allowed.  Returns ``(operand,
+    source key row, values in ``[0, S_dst)``, duplicates allowed.  The kernel does not range-check the map (a value
+    outside ``[0, S_dst)`` would add into memory outside ``dkv_acc``); the caller owns that invariant.  Setting the
+    environment variable ``FLASHINFER_CAKE_DSA_CHECK_DST_MAP=1`` validates the values on every call (a device
+    synchronization) and raises ``ValueError`` on a violation.  Returns ``(operand,
     row_stride)``: the raw-pointer operand of ``bwd_cast`` (``dkv_acc`` itself when contiguous, else a flat stride-1
     alias from its first element over ``(S_dst - 1) * row_stride + cols`` elements -- the FFI boundary takes contiguous
     tensors only, and the kernel addresses ``row * row_stride + col``) and the row stride.  Device placement is checked
@@ -620,6 +623,13 @@ def _check_dkv_acc(
         raise ValueError(
             f"dkv_dst_map must be a contiguous int32 [S] tensor (S = {num_kv}) on the device of dkv_acc"
         )
+    elif os.environ.get("FLASHINFER_CAKE_DSA_CHECK_DST_MAP", "0") not in ("", "0"):
+        num_rows = int(dkv_acc.shape[0])
+        if bool(((dkv_dst_map < 0) | (dkv_dst_map >= num_rows)).any().item()):
+            raise ValueError(
+                f"dkv_dst_map values must lie in [0, {num_rows}) (the rows of dkv_acc); "
+                f"got min {int(dkv_dst_map.min())}, max {int(dkv_dst_map.max())}"
+            )
     if dkv_acc.is_contiguous():
         return dkv_acc, row_stride
     span = (int(dkv_acc.shape[0]) - 1) * row_stride + int(dkv_acc.shape[1])
@@ -755,7 +765,7 @@ def offset_gather_kv_indices(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     *,
-    causal: bool = True,
+    causal: bool = False,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Turn per-document key indices into global key rows.
@@ -765,10 +775,13 @@ def offset_gather_kv_indices(
     (``cu_seqlens_k[d]``); ``-1`` or a position ``>= seqlen_k[d]`` is invalid.
     Query and key lengths of a document may differ: the query segment is the
     tail of its key prefix, query ``local_q = t - cu_seqlens_q[d]`` sitting at
-    key position ``(seqlen_k[d] - seqlen_q[d]) + local_q``.  With ``causal``
-    a slot is also invalid when it selects a key after that position
-    (``idx <= (seqlen_k[d] - seqlen_q[d]) + local_q`` is required); the rule
-    is the one of the Cake facade (``globalize_topk_indices``).  The result
+    key position ``(seqlen_k[d] - seqlen_q[d]) + local_q``.  With
+    ``causal=True`` a slot is also invalid when it selects a key after that
+    position (``idx <= (seqlen_k[d] - seqlen_q[d]) + local_q`` is required);
+    the rule is the one of the Cake facade (``globalize_topk_indices``).  The
+    default ``causal=False`` is the plain offsetting of the first release: the
+    index row is taken as is and only ``-1`` / out-of-range slots are dropped.
+    The result
     addresses the packed ``kv_*`` tensors; invalid slots become ``-1``.  A
     zero-length query segment contributes no rows.  Runs on device without a
     host synchronization.
@@ -2378,7 +2391,7 @@ def dsa_sparse_attention_varlen(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     *,
-    causal: bool = True,
+    causal: bool = False,
     topk_length: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
@@ -2389,9 +2402,11 @@ def dsa_sparse_attention_varlen(
     """Packed multi-document form: per-document ``gather_kv_indices`` are offset by
     ``cu_seqlens_k`` on device (this glue counts in the step time), then the flat
     kernels run over the packed rows.  Query and key segment lengths may differ
-    (the query segment is the tail of its key prefix); with ``causal`` the
-    offsetting drops selected keys after the query's own position
-    ``(seqlen_k - seqlen_q) + local_q`` (:func:`offset_gather_kv_indices`).
+    (the query segment is the tail of its key prefix); with ``causal=True`` the
+    offsetting also drops selected keys after the query's own position
+    ``(seqlen_k - seqlen_q) + local_q`` (:func:`offset_gather_kv_indices`); the
+    default ``causal=False`` keeps the index rows as is (the behaviour of the
+    first release).
     ``max_seqlen_q/k`` are accepted for signature parity and not used on the
     host.  ``dkv_acc`` / ``dkv_dst_map`` as in :func:`dsa_sparse_attention`."""
     del max_seqlen_q, max_seqlen_k
