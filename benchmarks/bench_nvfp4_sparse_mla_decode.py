@@ -13,14 +13,14 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 
-NVFP4 sparse MLA decode (flashinfer.mla.nvfp4_sparse_mla_decode, SM100) against FP8 TRTLLM-gen sparse MLA
+NVFP4 sparse MLA decode (flashinfer.mla.nvfp4_sparse_mla_decode, SM100/SM103) against FP8 TRTLLM-gen sparse MLA
 (flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla) at DSA decode shapes: 16 heads per rank, top-k 2048,
 speculative decoding with q_len query tokens per request.
 
 Both kernels attend to the same selected rows, NVFP4 from 352-byte nvfp4_ds_mla rows and FP8 from 576-byte e4m3
 rows. The indices are request-shaped: a request's q_len tokens pick their keys from one pool of that request's
-context (recent rows over-represented), as a sparse indexer does. Uniformly random indices over the whole cache
-make TRTLLM-gen up to ~20x slower than it runs in an engine. Times are CUDA-graph replays with warm L2.
+context (recent rows over-represented), as a sparse indexer does. Uniformly random indices over the whole cache are
+harder on TRTLLM-gen (1.1-1.4x slower on a B300 with the default cache). Times are CUDA-graph replays with warm L2.
 
     python benchmarks/bench_nvfp4_sparse_mla_decode.py --requests 1 2 3 4 5 6 7 8 9
 """
