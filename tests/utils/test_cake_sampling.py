@@ -554,7 +554,7 @@ def test_per_request_tensors_and_routes():
     # Round-5 pins: the dispatcher's pick for every cell of the round-5 per-variant sweeps (25 (V, B) cells x
     # k = 50 / 1000 per table, every frozen variant incl. the ept-32 streams, on B200 + B300 (148), H100 (132)
     # and R200 (212)); every pick is the measured-best variant of its cell or within the noted regret (< 3 %).
-    # 148-SM table: worst regret 1.7 % against the measured-best variant of each cell
+    # 148-SM table (round-6 re-fit, CAKE-776): worst regret 2.8 % against the measured-best variant of each cell
     for (pb, pv, pk), want in {
         (1, 32768, 50): (4, 16, False),
         (4, 32768, 50): (4, 16, False),
@@ -570,8 +570,8 @@ def test_per_request_tensors_and_routes():
         (32, 128256, 50): (4, 32, True),
         (64, 128256, 50): (2, 32, True),
         (128, 128256, 50): (1, 32, True),
-        (1, 151936, 50): (8, 16, True),  # +0.8 % vs best
-        (8, 151936, 50): (8, 16, True),  # +1.4 % vs best
+        (1, 151936, 50): (8, 32, True),
+        (8, 151936, 50): (8, 32, True),
         (16, 151936, 50): (4, 32, True),
         (64, 151936, 50): (2, 32, True),
         (128, 151936, 50): (1, 32, True),
@@ -788,7 +788,7 @@ def test_per_request_tensors_and_routes():
             two,
             132,
         )
-    # 212-SM table: worst regret 2.5 % against the measured-best variant of each cell
+    # 212-SM table (round-6 re-fit, CAKE-776): worst regret 1.7 % against the measured-best variant of each cell
     for (pb, pv, pk), want in {
         (1, 32768, 50): (4, 16, False),
         (4, 32768, 50): (4, 16, False),
@@ -797,16 +797,16 @@ def test_per_request_tensors_and_routes():
         (32, 32768, 50): (4, 16, False),
         (64, 32768, 50): (1, 32, True),
         (128, 32768, 50): (1, 32, True),
-        (1, 128256, 50): (8, 32, True),
-        (4, 128256, 50): (8, 32, True),
-        (8, 128256, 50): (8, 32, True),  # +0.7 % vs best
-        (16, 128256, 50): (8, 32, True),
+        (1, 128256, 50): (4, 32, True),
+        (4, 128256, 50): (4, 32, True),
+        (8, 128256, 50): (4, 32, True),
+        (16, 128256, 50): (4, 32, True),
         (32, 128256, 50): (4, 32, True),
         (64, 128256, 50): (2, 32, True),
         (128, 128256, 50): (1, 32, True),
-        (1, 151936, 50): (8, 16, True),
-        (8, 151936, 50): (8, 16, True),
-        (16, 151936, 50): (8, 16, True),
+        (1, 151936, 50): (4, 32, True),  # +1.7 % vs best (8, 32, 1)
+        (8, 151936, 50): (4, 32, True),
+        (16, 151936, 50): (4, 32, True),
         (64, 151936, 50): (2, 32, True),
         (128, 151936, 50): (1, 32, True),
         (1, 262144, 50): (8, 32, True),

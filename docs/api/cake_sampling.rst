@@ -154,6 +154,16 @@ fused 5.4 % on five cells (``V = 262144 B <= 32``: the (4,32) stream beats the (
 ept-32 form that no chunk- or cluster-linear term of this model expresses without moving cells that are
 right today (design doc, round 5, "Dispatch regimes"); they remain 1.6-3.6x faster than ``top_k_first``.
 
+Round 6 re-fitted the k <= 64 stream constants of the 148 and 212 tables on policy-aware sweeps (every frozen
+variant timed as the host launches it: the coarse-sample twin at k <= 64, launch flag bit 5 on the cluster >= 8
+streams above it; B200, GB300 and R200, k = 50, 25 cells per table).  The grid search was constrained so that no
+k > 64 pick changes (those stay chain-fitted) and no cell's pick gets slower: 148 ``stream_chunk_us`` 0.2 -> 0.25
+with ``stream_large_k_chunk_us`` 0.4 -> 0.35 (the large-k per-chunk sum is unchanged) moves V = 151936 B <= 8 from
+the (8,16) to the (8,32) stream (2.5-4.3 % faster), worst regret 4.5 -> 2.8 %; 212 ``stream_chunk_us`` 0.15,
+``stream_chunk32_us`` 0.15, ``stream_cluster_us`` 0.25, ``stream_cluster_cta_us`` 0.05,
+``stream_large_k_chunk32_us`` 0.05 move V = 128256 / 151936 B <= 16 to the (4,32) stream (2.3-3.7 % faster), worst
+4.1 -> 1.7 %; 132 is unchanged.  The kernels and the frozen bundle are untouched by this change.
+
 Measured performance
 --------------------
 

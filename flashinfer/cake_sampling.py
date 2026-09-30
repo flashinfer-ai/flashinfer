@@ -126,6 +126,12 @@ _Stage1CostRow: TypeAlias = tuple[
     float,
     float,
 ]
+# Round 6 (CAKE-776) re-fitted the k <= 64 stream constants of the 148 and 212 tables on policy-aware sweeps
+# (coarse-sample twins at k <= 64; B200 / GB300 / R200, k = 50) under two constraints -- no k > 64 pick changes and no
+# cell's pick gets slower: 148 stream_chunk_us 0.25 with stream_large_k_chunk_us 0.35 (large-k per-chunk sum unchanged;
+# V = 151936 B <= 8 -> the (8, 32) stream, worst regret 4.5 -> 2.8 %); 212 stream_chunk_us 0.15, stream_chunk32_us 0.15,
+# stream_cluster_us 0.25, stream_cluster_cta_us 0.05, stream_large_k_chunk32_us 0.05 (V = 128256 / 151936 B <= 16 -> the
+# (4, 32) stream, worst 4.1 -> 1.7 %); 132 unchanged.  Kernels and bundle untouched.
 _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
     # (resident_base_us, resident_per_ept_us, stream_wave_base_us, stream_chunk_us,
     #  stream_cluster_cta_us, launch_cta_us, stream_large_k_us, stream_chunk32_us, stream_cluster_us,
@@ -158,7 +164,7 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         2.0,
         0.15,
         4.0,
-        0.2,
+        0.25,
         0.0,
         1.0,
         1.0,
@@ -172,7 +178,7 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         0.0,
         0.0,
         0.0,
-        0.4,
+        0.35,
         0.6,
         0.0,
         0.2,
@@ -206,12 +212,12 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         1.5,
         0.15,
         4.0,
-        0.2,
-        0.0,
+        0.15,
+        0.05,
         0.0,
         2.0,
-        0.3,
-        0.5,
+        0.15,
+        0.25,
         0.0,
         3.0,
         8.0,
@@ -221,7 +227,7 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         0.0,
         0.0,
         0.0,
-        0.0,
+        0.05,
         0.0,
         0.0,
         0.0,
