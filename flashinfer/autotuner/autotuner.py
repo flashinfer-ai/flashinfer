@@ -2734,6 +2734,9 @@ class AutoTuner:
             # Populate the choose_one cache with the winner so stage lookups
             # remain consistent between rank_tactics and choose_one.
             self.profiling_cache[cache_key] = (ranked[0], profile)
+            self._profiling_cache_policies[cache_key] = self._profiling_policy(
+                tuning_config
+            )
             self._ranked_tactics_cache[cache_key] = tuple(ranked)
             self._dirty = True
             self._dirty_seq += 1
