@@ -256,9 +256,7 @@ def _get_compiled_finalize_kernel(
         sf_dtype,
         out_dtype,
         final_scale_dtype,
-        # max_active_clusters is a cute.compile constexpr sizing the persistent
-        # grid. Under a green context it is scaled to the node-local SM fraction,
-        # so the full-device and per-die variants must not alias.
+        # The persistent grid size is a compile-time constant.
         max_active_clusters,
         enable_pdl,
         use_a_per_token_scale,
@@ -352,12 +350,7 @@ def _get_compiled_finalize_kernel(
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
             stream=stream,
-            # The Rubin wrapper accepts a trailing runtime Int64 c_stride_row for
-            # the locality-domain strided write; the Blackwell wrapper does not, so only pass
-            # it for Rubin. Traced with cutlass.Int64(0) -- the Int64 wrapping is
-            # what makes it a runtime argument; a bare Python 0 would trace as a
-            # constexpr and be baked in, silently ignoring the per-die value at
-            # the call site. The kernel reads 0 as "natural contiguous stride".
+            # Rubin strides must be runtime Int64s, not Python constexprs.
             **({"c_stride_row": cutlass.Int64(0)} if is_rubin else {}),
         )
 
@@ -389,11 +382,6 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     cluster_shape_mn: Tuple[int, int] = (2, 1),
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
-    # locality-domain hidden-shard (Rubin only): domain_id >= 0 makes this die write its
-    # hidden-column half into the caller-provided shared full-width `out` at a
-    # column offset, using a full-hidden row stride (c_stride_row). Each die owns
-    # a disjoint set of output columns and contracts the full intermediate, so no
-    # reduction is needed. domain_id < 0 -> normal contiguous output.
     domain_id: int = -1,
     # Rubin-specific parameters (optional; when set, use SM107 kernel)
     mma_tiler: Optional[Tuple[int, int, int]] = None,
@@ -421,7 +409,8 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         token_final_scales: Router scaling factors, shape (seq_len, topk), float32/bf16/fp16
         out: Optional output tensor. Shape is ``(seq_len, n)`` in fused mode
              and ``(seq_len * topk, n)`` in deterministic mode. In fused mode,
-             a provided buffer must already be zero-initialized.
+             a provided buffer must already be zero-initialized. Caller-provided
+             buffers must be contiguous and on the same device as A.
         a_per_token_scale: Optional per-row operand-A scale, shape (permuted_m,).
              Used when GEMM1 output is quantized by a standalone per-token
              W4A4 quantizer instead of the fused GEMM1 epilogue.
@@ -434,6 +423,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         cluster_shape_mn: Cluster shape (ClusterM, ClusterN). Default: (2, 1)
         raster_along_m: If True, raster tiles along M dimension. Default: False
         sm_count: Number of SMs to use. Default: max available.
+        domain_id: Locality-domain index (0 or 1), or -1 for ordinary output.
+             Rubin localized execution writes this shard's hidden columns into
+             a caller-provided output with twice the shard's output width.
         use_fused_finalize: Use atomic fused finalize; otherwise write expanded
              rows for deterministic reduction. Default: True.
 
@@ -595,9 +587,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
 
     output_rows = seq_len if use_fused_finalize else seq_len * topk
 
-    # locality-domain hidden-shard (Rubin only). `n` here is b.shape[1] == THIS die's slice of
-    # the hidden dimension, while the shared `out` spans the full hidden width, so
-    # the expected-shape check below has to widen by the die count.
+    # Both domains write disjoint column ranges of one full-width output.
     localized_half_gemm = domain_id >= 0
     if localized_half_gemm:
         if not is_rubin:
@@ -632,6 +622,10 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
             raise TypeError(
                 f"out must have dtype {expected_out_dtype}, got {out.dtype}"
             )
+        if out.device != a.device:
+            raise ValueError(f"out must be on {a.device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError("out must be contiguous")
 
     # Get SM count
     total_sm = get_num_sm(a.device)
@@ -642,19 +636,12 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
-    # get_max_active_clusters() is queried on the FULL device. When this launch is
-    # confined to a green-context partition (sm_count < total_sm), the persistent
-    # grid must be scaled to the node-local SM fraction or it oversizes and spills
-    # into an extra wave (the penalty grows with tile count). Mirrors TRT-LLM's
-    # node_local_max_active_clusters: max_active_full * node_sm // total_sm.
+    # Scale full-device occupancy to the green context's SM allocation.
     max_active_clusters_full = max_active_clusters
     if sm_count < total_sm:
         max_active_clusters = max(1, max_active_clusters * sm_count // total_sm)
 
-    # locality-domain strided write: stride each row by the FULL hidden width while filling
-    # only this die's half, and start at this die's column. Unlike FC1 the output
-    # is bf16 (not packed fp4), so the offset scales by element_size(). The kernel
-    # reads c_stride_row == 0 as "natural contiguous stride" (non-localized).
+    # Each domain writes its own columns with the full output row stride.
     if localized_half_gemm:
         c_stride_row_val = cutlass.Int64(n * 2)
         c_data_ptr = out.data_ptr() + domain_id * n * out.element_size()
@@ -792,9 +779,7 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion(
         seq_len,
         topk,
         stream=stream,
-        # Rubin-only trailing runtime Int64 (0 outside locality-domain mode, which the kernel reads
-        # as "natural contiguous stride"). Must match the set traced at the compile
-        # site above.
+        # Match the runtime stride traced by the Rubin wrapper.
         **({"c_stride_row": c_stride_row_val} if is_rubin else {}),
     )
 
