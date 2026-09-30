@@ -6539,11 +6539,16 @@ def _cute_dsl_gemm_mxfp8_runner(
                         split_k_slices,
                     ) = tactic
                     is_split_k = False
-            elif mma_tiler_mn[1] < 64 and (m if swap_ab else n) > 32:
-                # Narrow (< 64) N tiles cover at most 32 kernel-N columns (see
-                # Sm100BlockScaledPersistentDenseGemmKernel.can_implement). A
-                # swap-AB tactic tuned for a low-M bucket replayed at a larger
-                # runtime M faults with cudaErrorMisalignedAddress; fall back.
+
+            # Re-check whatever is about to launch against the narrow-tile
+            # envelope (Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok):
+            # a swap-AB tactic tuned for a low-M bucket and replayed at a larger
+            # runtime M (floor mapping, clamp above the top bucket, stale cache)
+            # faults with cudaErrorMisalignedAddress. fallback_tactic always
+            # passes: its narrow tile covers M <= 32, otherwise it is 128x128.
+            if not Sm100BlockScaledPersistentDenseGemmKernel.narrow_tile_ok(
+                mma_tiler_mn[1], m if swap_ab else n
+            ):
                 tactic = fallback_tactic
                 (
                     mma_tiler_mn,
@@ -6552,6 +6557,7 @@ def _cute_dsl_gemm_mxfp8_runner(
                     use_prefetch,
                     split_k_slices,
                 ) = tactic
+                is_split_k = False
 
             if swap_ab:
                 kernel_m, kernel_n = n, m

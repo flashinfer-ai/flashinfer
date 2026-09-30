@@ -152,6 +152,23 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         >>> gemm(a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor, max_active_clusters, stream)
     """
 
+    # Largest kernel N a narrow (< 64) N tile may run at. A narrow tile is a
+    # sub-tile of the 128-token SFB tile: the mainloop shifts the MMA's SFB
+    # TMEM column by tok_off // 32, and only column shift 0 (every sub-tile
+    # within the first 32 tokens) is validated. See can_implement.
+    NARROW_TILE_MAX_N = 32
+
+    @classmethod
+    def narrow_tile_ok(cls, tile_n: int, kernel_n: int) -> bool:
+        """Whether an MMA N tile of width ``tile_n`` may run at ``kernel_n``.
+
+        Tiles of 64 or wider are unrestricted; narrow tiles must stay within
+        ``NARROW_TILE_MAX_N`` kernel-N columns (kernel N is the token count
+        under swap_ab). Shared by can_implement and by the mm_mxfp8 / mm_fp4
+        runners, which re-check a tactic before launching it.
+        """
+        return tile_n >= 64 or kernel_n <= cls.NARROW_TILE_MAX_N
+
     def __init__(
         self,
         sf_vec_size: int,
@@ -1937,10 +1954,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         ):
             can_implement = False
 
-        # Narrow (< 64) N tiles address the 128-token SFB tile per sub-tile,
-        # which covers at most 32 columns of the kernel N (the swap_ab token
-        # dimension); wider N with a narrow tile faults with
-        # cudaErrorMisalignedAddress (MXFP8 and NVFP4, SM100 and SM103).
-        if mma_tiler_mn[1] < 64 and (n > 32 or cluster_shape_mn[1] > 1):
+        # Narrow (< 64) N tiles: restore the M/N <= 32 envelope that #5609
+        # documents for its SFB sub-tile addressing (an 8/16-wide token tile
+        # covers up to 32 tokens). Each sub-tile shifts the MMA's SFB TMEM
+        # column by tok_off // 32, and only column shift 0 is validated.
+        # Shifts >= 1 (kernel N > 32) fault with cudaErrorMisalignedAddress:
+        # MXFP8 under autotune (#5725), and forced NVFP4 / MXFP4 tactics at
+        # N = 40 and 64 on SM100 and SM103. That the nonzero column shift is
+        # the hardware cause is a hypothesis; the bound is uniform per dtype.
+        if not cls.narrow_tile_ok(mma_tiler_mn[1], n) or (
+            mma_tiler_mn[1] < 64 and cluster_shape_mn[1] > 1
+        ):
             can_implement = False
         return can_implement
