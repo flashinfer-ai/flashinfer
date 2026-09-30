@@ -196,7 +196,7 @@ def fill_w_ptr(
     return weights.stride(0)
 
 
-def _blackwell_tensor_signature(tensor: torch.Tensor) -> tuple:
+def _cake_tensor_signature(tensor: torch.Tensor) -> tuple:
     return (
         int(tensor.data_ptr()),
         tuple(int(dim) for dim in tensor.shape),
@@ -206,16 +206,16 @@ def _blackwell_tensor_signature(tensor: torch.Tensor) -> tuple:
     )
 
 
-def _blackwell_dtype_name(dtype: torch.dtype) -> Literal["bfloat16", "float16"]:
+def _cake_dtype_name(dtype: torch.dtype) -> Literal["bfloat16", "float16"]:
     if dtype == torch.bfloat16:
         return "bfloat16"
     if dtype == torch.float16:
         return "float16"
-    raise ValueError(f"Blackwell BGMV MoE requires BF16 or FP16, got {dtype}")
+    raise ValueError(f"Cake BGMV MoE requires BF16 or FP16, got {dtype}")
 
 
-class BGMVMoEBlackwellPlan:
-    """Pointer-stable SM100 BGMV MoE shrink+expand execution plan.
+class BGMVMoECakePlan:
+    """Pointer-stable SM100/SM103 Cake BGMV MoE shrink+expand execution plan.
 
     The plan owns caller-visible FP32 accumulation and shrink workspaces. Its
     first eager ``run`` captures the exact launch sequence into a CUDA Graph;
@@ -250,7 +250,7 @@ class BGMVMoEBlackwellPlan:
         self.topk_weights = topk_weights
         self.schedule_id = schedule_id
         self._bound_signatures = tuple(
-            _blackwell_tensor_signature(tensor)
+            _cake_tensor_signature(tensor)
             for tensor in (
                 y_accum,
                 shrink_out,
@@ -270,7 +270,7 @@ class BGMVMoEBlackwellPlan:
 
     def _validate_binding(self) -> None:
         current = tuple(
-            _blackwell_tensor_signature(tensor)
+            _cake_tensor_signature(tensor)
             for tensor in (
                 self.y_accum,
                 self.shrink_out,
@@ -285,7 +285,7 @@ class BGMVMoEBlackwellPlan:
         )
         if current != self._bound_signatures:
             raise RuntimeError(
-                "BGMVMoEBlackwellPlan tensor storage, shape, stride, dtype, or "
+                "BGMVMoECakePlan tensor storage, shape, stride, dtype, or "
                 "device changed after preparation"
             )
 
@@ -332,7 +332,7 @@ class BGMVMoEBlackwellPlan:
                 self._owner_stream = replay_stream
             elif replay_stream != self._owner_stream:
                 raise RuntimeError(
-                    "BGMVMoEBlackwellPlan must replay on its original CUDA stream"
+                    "BGMVMoECakePlan must replay on its original CUDA stream"
                 )
             graph.replay()
         return self.y_accum
@@ -352,6 +352,10 @@ class BGMVMoEBlackwellPlan:
             self._owner_stream = None
 
 
+# Compatible alias for the name exported by the first release of this backend.
+BGMVMoEBlackwellPlan = BGMVMoECakePlan
+
+
 @flashinfer_api
 def prepare_bgmv_moe(
     x: torch.Tensor,
@@ -363,14 +367,15 @@ def prepare_bgmv_moe(
     topk_weights: torch.Tensor,
     num_experts: int,
     *,
-    backend: Literal["blackwell"] = "blackwell",
+    backend: Literal["cake", "blackwell"] = "cake",
     shrink_out: Optional[torch.Tensor] = None,
     y_accum: Optional[torch.Tensor] = None,
-) -> BGMVMoEBlackwellPlan:
-    """Prepare the generated SM100 BGMV MoE pipeline for graph replay.
+) -> BGMVMoECakePlan:
+    """Prepare the generated Cake SM100/SM103 BGMV MoE pipeline for graph replay.
 
     This optimized path currently supports one LoRA slice, rank 32, hidden
-    sizes 2688 or 3072, BF16/FP16 inputs, and exact SM100 devices. Routing may
+    sizes 2688 or 3072, BF16/FP16 inputs, and exact SM100 (B200/GB200) or
+    SM103 (B300/GB300) devices; each target runs its own cubin. Routing may
     be arbitrary; each output has one owner that accumulates routes in fixed
     input order, so identical prepared replays are bitwise reproducible. The
     contiguous top-k=2 layout takes the optimized fast path.
@@ -386,7 +391,8 @@ def prepare_bgmv_moe(
         lora_indices: LoRA index for each input token.
         topk_weights: FP32 routing weight for each routed pair.
         num_experts: Number of experts in both LoRA tensors.
-        backend: Backend selector. Only ``"blackwell"`` is supported.
+        backend: Backend selector. ``"cake"`` selects the generated Cake
+            programs; ``"blackwell"`` is accepted as a compatible alias.
         shrink_out: Optional pointer-stable FP32 shrink workspace.
         y_accum: Optional pointer-stable FP32 output accumulator.
 
@@ -395,30 +401,31 @@ def prepare_bgmv_moe(
         the FP32 accumulated output.
     """
 
-    if backend != "blackwell":
+    if backend not in ("cake", "blackwell"):
         raise ValueError(
-            f"prepare_bgmv_moe only supports backend='blackwell', got {backend}"
+            f"prepare_bgmv_moe only supports backend='cake' (alias 'blackwell'), got {backend}"
         )
-    if (
-        not torch.cuda.is_available()
-        or not x.is_cuda
-        or torch.cuda.get_device_capability(x.device) != (10, 0)
-    ):
-        capability = (
-            torch.cuda.get_device_capability(x.device)
-            if torch.cuda.is_available() and x.is_cuda
-            else None
-        )
+    from ..jit.cake_bgmv_moe import cake_bgmv_moe_arch_for_capability
+
+    capability = (
+        tuple(int(v) for v in torch.cuda.get_device_capability(x.device))
+        if torch.cuda.is_available() and x.is_cuda
+        else None
+    )
+    arch = (
+        cake_bgmv_moe_arch_for_capability(capability) if capability is not None else None
+    )
+    if arch is None:
         raise ValueError(
-            "Blackwell BGMV MoE requires an exact SM100 CUDA device; "
+            "Cake BGMV MoE requires an exact SM100 or SM103 CUDA device; "
             f"got capability={capability}"
         )
     if len(lora_a_weights) != 1 or len(lora_b_weights) != 1:
-        raise ValueError("Blackwell BGMV MoE currently requires exactly one LoRA slice")
+        raise ValueError("Cake BGMV MoE currently requires exactly one LoRA slice")
     if x.ndim != 2:
         raise ValueError(f"x must have shape [tokens, hidden], got {tuple(x.shape)}")
     num_tokens, hidden_size = (int(dim) for dim in x.shape)
-    dtype_name = _blackwell_dtype_name(x.dtype)
+    dtype_name = _cake_dtype_name(x.dtype)
     lora_a = lora_a_weights[0]
     lora_b = lora_b_weights[0]
     if lora_a.ndim != 4 or lora_b.ndim != 4:
@@ -496,15 +503,15 @@ def prepare_bgmv_moe(
         ):
             raise ValueError(f"{name} must be a contiguous tensor on {x.device}")
 
-    from ..jit.blackwell_bgmv_moe import (
-        BLACKWELL_BGMV_MOE_SCHEDULE_IDS,
-        get_blackwell_bgmv_moe_module,
-        select_blackwell_bgmv_moe_schedule,
+    from ..jit.cake_bgmv_moe import (
+        CAKE_BGMV_MOE_SCHEDULE_IDS,
+        get_cake_bgmv_moe_module,
+        select_cake_bgmv_moe_schedule,
     )
 
-    schedule = select_blackwell_bgmv_moe_schedule(hidden_size, num_tokens)
-    module = get_blackwell_bgmv_moe_module(hidden_size, dtype_name)
-    return BGMVMoEBlackwellPlan(
+    schedule = select_cake_bgmv_moe_schedule(hidden_size, num_tokens, arch)
+    module = get_cake_bgmv_moe_module(hidden_size, dtype_name, arch)
+    return BGMVMoECakePlan(
         module,
         y_accum=y_accum,
         shrink_out=shrink_out,
@@ -515,7 +522,7 @@ def prepare_bgmv_moe(
         expert_ids=expert_ids,
         lora_indices=lora_indices,
         topk_weights=topk_weights,
-        schedule_id=BLACKWELL_BGMV_MOE_SCHEDULE_IDS[schedule],
+        schedule_id=CAKE_BGMV_MOE_SCHEDULE_IDS[schedule],
     )
 
 

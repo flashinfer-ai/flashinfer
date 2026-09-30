@@ -16,29 +16,35 @@
 
 #pragma once
 
-#ifndef BLACKWELL_BGMV_MOE_BODY_FILE
-#error "BLACKWELL_BGMV_MOE_BODY_FILE must name one generated BGMV MoE body"
+#ifndef CAKE_BGMV_MOE_BODY_FILE
+#error "CAKE_BGMV_MOE_BODY_FILE must name one generated BGMV MoE body"
 #endif
-#ifndef BLACKWELL_BGMV_MOE_HIDDEN
-#error "BLACKWELL_BGMV_MOE_HIDDEN must describe the generated hidden size"
+#ifndef CAKE_BGMV_MOE_HIDDEN
+#error "CAKE_BGMV_MOE_HIDDEN must describe the generated hidden size"
 #endif
-#ifndef BLACKWELL_BGMV_MOE_INPUT_DTYPE
-#error "BLACKWELL_BGMV_MOE_INPUT_DTYPE must describe the generated input dtype"
+#ifndef CAKE_BGMV_MOE_INPUT_DTYPE
+#error "CAKE_BGMV_MOE_INPUT_DTYPE must describe the generated input dtype"
 #endif
-#ifndef BLACKWELL_BGMV_MOE_SHRINK_DECODE
-#error "BLACKWELL_BGMV_MOE_SHRINK_DECODE must name the generated kernel symbol"
+#ifndef CAKE_BGMV_MOE_CC_MAJOR
+#error "CAKE_BGMV_MOE_CC_MAJOR must name the compiled compute-capability major"
 #endif
-#ifndef BLACKWELL_BGMV_MOE_SHRINK_PREFILL
-#error "BLACKWELL_BGMV_MOE_SHRINK_PREFILL must name the generated kernel symbol"
+#ifndef CAKE_BGMV_MOE_CC_MINOR
+#error "CAKE_BGMV_MOE_CC_MINOR must name the compiled compute-capability minor"
 #endif
-#ifndef BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64
-#error "BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64 must name the generated kernel symbol"
+#ifndef CAKE_BGMV_MOE_SHRINK_DECODE
+#error "CAKE_BGMV_MOE_SHRINK_DECODE must name the generated kernel symbol"
 #endif
-#ifndef BLACKWELL_BGMV_MOE_EXPAND_TOKEN
-#error "BLACKWELL_BGMV_MOE_EXPAND_TOKEN must name the generated kernel symbol"
+#ifndef CAKE_BGMV_MOE_SHRINK_PREFILL
+#error "CAKE_BGMV_MOE_SHRINK_PREFILL must name the generated kernel symbol"
 #endif
-#ifndef BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL
-#error "BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL must name the generated kernel symbol"
+#ifndef CAKE_BGMV_MOE_EXPAND_TOKEN_T64
+#error "CAKE_BGMV_MOE_EXPAND_TOKEN_T64 must name the generated kernel symbol"
+#endif
+#ifndef CAKE_BGMV_MOE_EXPAND_TOKEN
+#error "CAKE_BGMV_MOE_EXPAND_TOKEN must name the generated kernel symbol"
+#endif
+#ifndef CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL
+#error "CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL must name the generated kernel symbol"
 #endif
 
 #include <cuda.h>
@@ -51,16 +57,16 @@
 
 // The generated source owns private fixed-width aliases and a tensor-map
 // stand-in. Rename them at the include boundary to avoid CUDA-header clashes.
-#define uint8_t blackwell_bgmv_generated_uint8_t
-#define uint16_t blackwell_bgmv_generated_uint16_t
-#define uint32_t blackwell_bgmv_generated_uint32_t
-#define uint64_t blackwell_bgmv_generated_uint64_t
-#define int32_t blackwell_bgmv_generated_int32_t
-#define int16_t blackwell_bgmv_generated_int16_t
-#define BlackwellTensorMap blackwell_bgmv_generated_BlackwellTensorMap
-#define BlackwellTensorMapPack blackwell_bgmv_generated_BlackwellTensorMapPack
-#define CUtensorMap blackwell_bgmv_generated_CUtensorMap
-#include BLACKWELL_BGMV_MOE_BODY_FILE
+#define uint8_t cake_bgmv_generated_uint8_t
+#define uint16_t cake_bgmv_generated_uint16_t
+#define uint32_t cake_bgmv_generated_uint32_t
+#define uint64_t cake_bgmv_generated_uint64_t
+#define int32_t cake_bgmv_generated_int32_t
+#define int16_t cake_bgmv_generated_int16_t
+#define BlackwellTensorMap cake_bgmv_generated_BlackwellTensorMap
+#define BlackwellTensorMapPack cake_bgmv_generated_BlackwellTensorMapPack
+#define CUtensorMap cake_bgmv_generated_CUtensorMap
+#include CAKE_BGMV_MOE_BODY_FILE
 #undef uint8_t
 #undef uint16_t
 #undef uint32_t
@@ -72,9 +78,9 @@
 #undef CUtensorMap
 
 namespace flashinfer {
-namespace blackwell_bgmv_moe {
+namespace cake_bgmv_moe {
 
-constexpr int32_t kHidden = BLACKWELL_BGMV_MOE_HIDDEN;
+constexpr int32_t kHidden = CAKE_BGMV_MOE_HIDDEN;
 constexpr int32_t kRank = 32;
 constexpr int32_t kShrinkThreads = 128;
 constexpr int32_t kShrinkDecodePairsPerBlock = 4;
@@ -92,34 +98,38 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
-inline void CheckExactSM100(int32_t device_id) {
+// Each module is compiled for exactly one Blackwell target (sm_100a for
+// B200/GB200, sm_103a for B300/GB300). The device must match that target;
+// anything else fails closed instead of silently running another cubin.
+inline void CheckCompiledArch(int32_t device_id) {
   int major = 0;
   int minor = 0;
   CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
             "cudaDeviceGetAttribute(major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
-  TVM_FFI_ICHECK(major == 10 && minor == 0)
-      << "Blackwell BGMV MoE requires exact compute capability 10.0, got " << major << "." << minor;
+  TVM_FFI_ICHECK(major == CAKE_BGMV_MOE_CC_MAJOR && minor == CAKE_BGMV_MOE_CC_MINOR)
+      << "Cake BGMV MoE module was compiled for compute capability " << CAKE_BGMV_MOE_CC_MAJOR
+      << "." << CAKE_BGMV_MOE_CC_MINOR << ", got " << major << "." << minor;
 }
 
 void Configure() {
   int32_t device_id = 0;
   CheckCuda(cudaGetDevice(&device_id), "cudaGetDevice");
-  CheckExactSM100(device_id);
+  CheckCompiledArch(device_id);
 
   int32_t max_dynamic_smem = 0;
   CheckCuda(
       cudaDeviceGetAttribute(&max_dynamic_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device_id),
       "cudaDeviceGetAttribute(max opt-in shared memory)");
   TVM_FFI_ICHECK(max_dynamic_smem >= kShrinkDecodeSmemBytes)
-      << "Blackwell BGMV MoE decode shrink requires " << kShrinkDecodeSmemBytes
+      << "Cake BGMV MoE decode shrink requires " << kShrinkDecodeSmemBytes
       << " bytes of dynamic shared memory, but device " << device_id << " supports "
       << max_dynamic_smem;
   CheckCuda(
-      cudaFuncSetAttribute(BLACKWELL_BGMV_MOE_SHRINK_DECODE,
+      cudaFuncSetAttribute(CAKE_BGMV_MOE_SHRINK_DECODE,
                            cudaFuncAttributeMaxDynamicSharedMemorySize, kShrinkDecodeSmemBytes),
-      "cudaFuncSetAttribute(Blackwell BGMV MoE decode shrink)");
+      "cudaFuncSetAttribute(Cake BGMV MoE decode shrink)");
 }
 
 inline void CheckCompact(const TensorView& tensor, const char* name) {
@@ -136,7 +146,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CHECK_CUDA(x);
   const int32_t device_id = x.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckExactSM100(device_id);
+  CheckCompiledArch(device_id);
 
   CHECK_CUDA(y_accum);
   CHECK_CUDA(shrink_out);
@@ -155,10 +165,10 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CHECK_DEVICE(x, lora_indices);
   CHECK_DEVICE(x, topk_weights);
 
-  CHECK_INPUT_TYPE(x, BLACKWELL_BGMV_MOE_INPUT_DTYPE);
-  CHECK_INPUT_TYPE(shrink_out, BLACKWELL_BGMV_MOE_INPUT_DTYPE);
-  CHECK_INPUT_TYPE(lora_a, BLACKWELL_BGMV_MOE_INPUT_DTYPE);
-  CHECK_INPUT_TYPE(lora_b, BLACKWELL_BGMV_MOE_INPUT_DTYPE);
+  CHECK_INPUT_TYPE(x, CAKE_BGMV_MOE_INPUT_DTYPE);
+  CHECK_INPUT_TYPE(shrink_out, CAKE_BGMV_MOE_INPUT_DTYPE);
+  CHECK_INPUT_TYPE(lora_a, CAKE_BGMV_MOE_INPUT_DTYPE);
+  CHECK_INPUT_TYPE(lora_b, CAKE_BGMV_MOE_INPUT_DTYPE);
   CHECK_INPUT_TYPE(y_accum, dl_float32);
   CHECK_INPUT_TYPE(topk_weights, dl_float32);
   CHECK_INPUT_TYPE(sorted_token_ids, dl_int64);
@@ -203,7 +213,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
 
   TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kTokenOwnedT64) &&
                  schedule_value <= static_cast<int64_t>(Schedule::kTokenOwnedDualCol))
-      << "invalid Blackwell BGMV MoE schedule id: " << schedule_value;
+      << "invalid Cake BGMV MoE schedule id: " << schedule_value;
   const auto schedule = static_cast<Schedule>(schedule_value);
   const auto stream = reinterpret_cast<cudaStream_t>(cuda_stream);
   auto* y_ptr = static_cast<float*>(y_accum.data_ptr());
@@ -220,40 +230,40 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   if (num_pairs <= 32) {
     const dim3 shrink_grid(
         (num_pairs + kShrinkDecodePairsPerBlock - 1) / kShrinkDecodePairsPerBlock, kRank / 8, 1);
-    BLACKWELL_BGMV_MOE_SHRINK_DECODE<<<shrink_grid, shrink_block, kShrinkDecodeSmemBytes, stream>>>(
+    CAKE_BGMV_MOE_SHRINK_DECODE<<<shrink_grid, shrink_block, kShrinkDecodeSmemBytes, stream>>>(
         shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
         num_tokens);
   } else {
     const dim3 shrink_grid(num_pairs, kRank / 8, 1);
-    BLACKWELL_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes,
+    CAKE_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes,
                                         stream>>>(shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr,
                                                   lora_ptr, num_pairs, num_experts, num_tokens);
   }
-  CheckCuda(cudaGetLastError(), "Blackwell BGMV MoE shrink launch");
+  CheckCuda(cudaGetLastError(), "Cake BGMV MoE shrink launch");
 
   const int32_t output_stride = kHidden;
   const int32_t output_offset = 0;
   if (schedule == Schedule::kTokenOwnedT64) {
     const dim3 grid(num_tokens, (kHidden + 63) / 64, 1);
-    BLACKWELL_BGMV_MOE_EXPAND_TOKEN_T64<<<grid, 64, kExpandSmemBytes, stream>>>(
+    CAKE_BGMV_MOE_EXPAND_TOKEN_T64<<<grid, 64, kExpandSmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
         num_experts, num_tokens, output_stride, output_offset);
   } else if (schedule == Schedule::kTokenOwned) {
     const dim3 grid(num_tokens, (kHidden + 127) / 128, 1);
-    BLACKWELL_BGMV_MOE_EXPAND_TOKEN<<<grid, 128, kExpandSmemBytes, stream>>>(
+    CAKE_BGMV_MOE_EXPAND_TOKEN<<<grid, 128, kExpandSmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
         num_experts, num_tokens, output_stride, output_offset);
   } else {
     const dim3 grid(num_tokens, (kHidden + 255) / 256, 1);
-    BLACKWELL_BGMV_MOE_EXPAND_TOKEN_DUAL<<<grid, 128, kExpandSmemBytes, stream>>>(
+    CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL<<<grid, 128, kExpandSmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
         num_experts, num_tokens, output_stride, output_offset);
   }
-  CheckCuda(cudaGetLastError(), "Blackwell BGMV MoE expand launch");
+  CheckCuda(cudaGetLastError(), "Cake BGMV MoE expand launch");
 }
 
-}  // namespace blackwell_bgmv_moe
+}  // namespace cake_bgmv_moe
 }  // namespace flashinfer
 
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure, flashinfer::blackwell_bgmv_moe::Configure);
-TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::blackwell_bgmv_moe::Run);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure, flashinfer::cake_bgmv_moe::Configure);
+TVM_FFI_DLL_EXPORT_TYPED_FUNC(run, flashinfer::cake_bgmv_moe::Run);

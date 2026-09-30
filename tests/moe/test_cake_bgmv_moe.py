@@ -31,11 +31,14 @@ _FP16_SHAPES = [
 ]
 
 
-def _require_sm100():
+_SUPPORTED_CAPABILITIES = ((10, 0), (10, 3))
+
+
+def _require_cake_arch():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
-    if torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("generated Blackwell BGMV MoE tests require exact SM100")
+    if torch.cuda.get_device_capability() not in _SUPPORTED_CAPABILITIES:
+        pytest.skip("generated Cake BGMV MoE tests require exact SM100 or SM103")
 
 
 def _make_inputs(hidden_size, num_tokens, dtype, *, arbitrary_routes=False):
@@ -146,10 +149,10 @@ def _reference(inputs):
     ("hidden_size", "num_tokens", "dtype"), _PERF_SHAPES + _FP16_SHAPES
 )
 def test_prepared_pipeline_matches_reference(hidden_size, num_tokens, dtype):
-    _require_sm100()
+    _require_cake_arch()
     inputs = _make_inputs(hidden_size, num_tokens, dtype)
     expected = _reference(inputs)
-    plan = prepare_bgmv_moe(*inputs, backend="blackwell")
+    plan = prepare_bgmv_moe(*inputs, backend="cake")
     actual = plan.run()
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
@@ -163,12 +166,12 @@ def test_prepared_pipeline_matches_reference(hidden_size, num_tokens, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [4, 32])
 def test_arbitrary_route_order_and_nondefault_stream(dtype, num_tokens):
-    _require_sm100()
+    _require_cake_arch()
     inputs = _make_inputs(2688, num_tokens, dtype, arbitrary_routes=True)
     expected = _reference(inputs)
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
-        plan = prepare_bgmv_moe(*inputs, backend="blackwell")
+        plan = prepare_bgmv_moe(*inputs, backend="cake")
         actual = plan.run()
     stream.synchronize()
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
@@ -176,10 +179,10 @@ def test_arbitrary_route_order_and_nondefault_stream(dtype, num_tokens):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_prepared_pipeline_is_bitwise_reproducible(dtype):
-    _require_sm100()
+    _require_cake_arch()
     inputs = _make_inputs(2688, 4, dtype, arbitrary_routes=True)
     expected = _reference(inputs)
-    plan = prepare_bgmv_moe(*inputs, backend="blackwell")
+    plan = prepare_bgmv_moe(*inputs, backend="cake")
     first = plan.run().clone()
     torch.cuda.synchronize()
     torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
@@ -191,7 +194,7 @@ def test_prepared_pipeline_is_bitwise_reproducible(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_invalid_pair_padding_and_outer_graph_capture(dtype):
-    _require_sm100()
+    _require_cake_arch()
     inputs = list(_make_inputs(3072, 8, dtype))
     device = inputs[0].device
     inputs[3] = torch.cat(
@@ -203,7 +206,7 @@ def test_invalid_pair_padding_and_outer_graph_capture(dtype):
     )
     inputs = tuple(inputs)
     expected = _reference(inputs)
-    plan = prepare_bgmv_moe(*inputs, backend="blackwell")
+    plan = prepare_bgmv_moe(*inputs, backend="cake")
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         actual = plan.run()
@@ -214,7 +217,7 @@ def test_invalid_pair_padding_and_outer_graph_capture(dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_extra_valid_route_uses_general_path(dtype):
-    _require_sm100()
+    _require_cake_arch()
     inputs = list(_make_inputs(2688, 32, dtype))
     device = inputs[0].device
     inputs[3] = torch.cat(
@@ -228,7 +231,7 @@ def test_extra_valid_route_uses_general_path(dtype):
     )
     inputs = tuple(inputs)
     expected = _reference(inputs)
-    actual = prepare_bgmv_moe(*inputs, backend="blackwell").run()
+    actual = prepare_bgmv_moe(*inputs, backend="cake").run()
     torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
 
 
@@ -236,7 +239,7 @@ def test_cpu_input_reports_device_requirement():
     x = torch.empty((1, 2688), dtype=torch.bfloat16)
     empty_i64 = torch.empty((1,), dtype=torch.int64)
     empty_f32 = torch.empty((1,), dtype=torch.float32)
-    with pytest.raises(ValueError, match="exact SM100 CUDA device"):
+    with pytest.raises(ValueError, match="exact SM100 or SM103 CUDA device"):
         prepare_bgmv_moe(
             x,
             [],
@@ -246,7 +249,7 @@ def test_cpu_input_reports_device_requirement():
             empty_i64,
             empty_f32,
             1,
-            backend="blackwell",
+            backend="cake",
         )
 
 
@@ -258,8 +261,30 @@ def test_cpu_input_reports_device_requirement():
     ],
 )
 def test_invalid_routing_indices_rejected(tensor_index, value, message):
-    _require_sm100()
+    _require_cake_arch()
     inputs = list(_make_inputs(2688, 4, torch.bfloat16))
     inputs[tensor_index][0] = value
     with pytest.raises(ValueError, match=message):
-        prepare_bgmv_moe(*inputs, backend="blackwell")
+        prepare_bgmv_moe(*inputs, backend="cake")
+
+
+def test_blackwell_backend_alias_and_plan_alias():
+    _require_cake_arch()
+    from flashinfer.fused_moe import BGMVMoEBlackwellPlan, BGMVMoECakePlan
+
+    assert BGMVMoEBlackwellPlan is BGMVMoECakePlan
+    inputs = _make_inputs(3072, 4, torch.bfloat16)
+    expected = _reference(inputs)
+    plan = prepare_bgmv_moe(*inputs, backend="blackwell")
+    assert isinstance(plan, BGMVMoECakePlan)
+    torch.testing.assert_close(plan.run(), expected, atol=1e-2, rtol=1e-2)
+
+
+def test_unknown_backend_rejected():
+    x = torch.empty((1, 2688), dtype=torch.bfloat16)
+    empty_i64 = torch.empty((1,), dtype=torch.int64)
+    empty_f32 = torch.empty((1,), dtype=torch.float32)
+    with pytest.raises(ValueError, match="backend"):
+        prepare_bgmv_moe(
+            x, [], [], empty_i64, empty_i64, empty_i64, empty_f32, 1, backend="cuda"
+        )

@@ -119,10 +119,10 @@ from .jit.bgmv_moe import (
     BGMV_MOE_SUPPORTED_MAJOR_VERSIONS,
     gen_bgmv_moe_module,
 )
-from .jit.blackwell_bgmv_moe import (
-    BLACKWELL_BGMV_MOE_DTYPES,
-    BLACKWELL_BGMV_MOE_HIDDEN_SIZES,
-    gen_blackwell_bgmv_moe_module,
+from .jit.cake_bgmv_moe import (
+    CAKE_BGMV_MOE_DTYPES,
+    CAKE_BGMV_MOE_HIDDEN_SIZES,
+    gen_cake_bgmv_moe_module,
 )
 from .jit.monomoe import gen_monomoe_module
 from .jit.cute_sm12x_gemm import gen_gemm_sm120_module_cute
@@ -806,12 +806,17 @@ def gen_all_modules(
         # Multi-LoRA MoE BGMV kernel
         if has_bgmv_moe:
             jit_specs.append(gen_bgmv_moe_module())
+        for cake_bgmv_arch, cake_bgmv_flag in (
+            ("sm100a", "sm100a_exact"),
+            ("sm103a", "sm103a_exact"),
+        ):
+            if sm_capabilities.get(cake_bgmv_flag, False):
+                jit_specs.extend(
+                    gen_cake_bgmv_moe_module(hidden_size, dtype, cake_bgmv_arch)
+                    for hidden_size in CAKE_BGMV_MOE_HIDDEN_SIZES
+                    for dtype in CAKE_BGMV_MOE_DTYPES
+                )
         if sm_capabilities.get("sm100a_exact", False):
-            jit_specs.extend(
-                gen_blackwell_bgmv_moe_module(hidden_size, dtype)
-                for hidden_size in BLACKWELL_BGMV_MOE_HIDDEN_SIZES
-                for dtype in BLACKWELL_BGMV_MOE_DTYPES
-            )
             jit_specs.append(gen_cake_fused_moe_warp_decode_module("sm100a"))
         # DSv4 hash-based MoE routing (SM-portable)
         jit_specs.append(gen_hash_topk_module())
