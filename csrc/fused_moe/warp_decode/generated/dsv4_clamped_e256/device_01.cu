@@ -613,6 +613,10 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                 if (cluster_work < (unsigned int)(64 / 2 * num_non_exiting_ctas[0])) {
                     unsigned int m_tile = cluster_work % (unsigned int)(64 / 2) * 2 + (unsigned int)cta_rank;
                     unsigned int n_tile = cluster_work / (unsigned int)(64 / 2);
+                    if (cluster_work < (unsigned int)(num_non_exiting_ctas[0] / 8 * 256)) {
+                        m_tile = cluster_work % 256 / 8 * 2 + (unsigned int)cta_rank;
+                        n_tile = cluster_work / 256 * 8 + cluster_work % 8;
+                    }
                     int expert = tile_expert[n_tile];
                     int valid_rows = (unsigned int)tile_mn_limit[n_tile] - n_tile * (unsigned int)BLOCK_N;
                     float sc = scale_c[expert];
@@ -1029,6 +1033,9 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
             for (unsigned int _work_iter_4 = 0; _work_iter_4 < 64 / 2 * grid_n + 1; _work_iter_4++) {
                 if (cluster_work_4 < (unsigned int)(64 / 2 * num_non_exiting_ctas[0])) {
                     unsigned int n_tile_1 = cluster_work_4 / (unsigned int)(64 / 2);
+                    if (cluster_work_4 < (unsigned int)(num_non_exiting_ctas[0] / 8 * 256)) {
+                        n_tile_1 = cluster_work_4 / 256 * 8 + cluster_work_4 % 8;
+                    }
                     int valid_rows_1 = (unsigned int)tile_mn_limit[n_tile_1] - n_tile_1 * (unsigned int)BLOCK_N;
                     unsigned int publish_stage = stage_3;
                     if (K_tiles >= 5) {
@@ -1204,6 +1211,10 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                 if (cluster_work_5 < (unsigned int)(64 / 2 * num_non_exiting_ctas[0])) {
                     unsigned int m_tile_1 = cluster_work_5 % (unsigned int)(64 / 2) * 2 + (unsigned int)cta_rank;
                     unsigned int n_tile_2 = cluster_work_5 / (unsigned int)(64 / 2);
+                    if (cluster_work_5 < (unsigned int)(num_non_exiting_ctas[0] / 8 * 256)) {
+                        m_tile_1 = cluster_work_5 % 256 / 8 * 2 + (unsigned int)cta_rank;
+                        n_tile_2 = cluster_work_5 / 256 * 8 + cluster_work_5 % 8;
+                    }
                     int expert_1 = tile_expert[n_tile_2];
                     #pragma unroll 1
                     for (int iter_k_5 = 0; iter_k_5 < K_tiles; iter_k_5++) {
@@ -1254,6 +1265,10 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                 if (cluster_work_6 < (unsigned int)(64 / 2 * num_non_exiting_ctas[0])) {
                     unsigned int m_tile_2 = cluster_work_6 % (unsigned int)(64 / 2) * 2 + (unsigned int)cta_rank;
                     unsigned int n_tile_3 = cluster_work_6 / (unsigned int)(64 / 2);
+                    if (cluster_work_6 < (unsigned int)(num_non_exiting_ctas[0] / 8 * 256)) {
+                        m_tile_2 = cluster_work_6 % 256 / 8 * 2 + (unsigned int)cta_rank;
+                        n_tile_3 = cluster_work_6 / 256 * 8 + cluster_work_6 % 8;
+                    }
                     int expert_2 = tile_expert[n_tile_3];
                     int sf_parent = (unsigned int)(expert_2 * (M_out / 64)) + m_tile_2 / 2;
                     #pragma unroll 1
