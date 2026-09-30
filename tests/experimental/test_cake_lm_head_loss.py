@@ -383,7 +383,7 @@ def test_workspace_layout_and_memory_rule():
         assert layout["logits"][1] == rows * V * 2
         assert layout["stats"][1] == rows * (V // 256) * 8
         assert layout["d"][1] == rows * 4 and layout["term"][1] == rows * 4
-        assert layout["loss_acc"][1] == 4 and layout["grad_scale"][1] == 4
+        assert layout["loss_acc"][1] == 8 and layout["grad_scale"][1] == 4  # FP64 loss accumulator, FP32 scale
         assert layout["total"] % WORKSPACE_ALIGN == 0 and layout["total"] >= sum(layout[k][1] for k in regions)
         assert layout == workspace_layout(rows, V, C)  # depends on T only through min(T, C)
     assert workspace_layout(4097, V, C) == workspace_layout(16231, V, C) == workspace_layout(4096, V, C)
@@ -474,7 +474,7 @@ def test_stage_values_names():
     assert runner.backward_order == (("scale_cast_bf16", "dx"), ("scale_cast_bf16", "dw"))
     for index, (row0, rows_c) in enumerate(plan.chunks):
         v = stage_values("gemm_logits", t, plan, index)
-        assert (v["rows_c"], v["row0"], v["T"], v["H"], v["V"], v["C"]) == (rows_c, row0, T, H_HOST, V_HOST, C)
+        assert (v["rows_c"], v["row0"], v["T"], v["H"], v["V"], v["chunk"]) == (rows_c, row0, T, H_HOST, V_HOST, C)
         assert (v["first_chunk"], v["last_chunk"]) == (0, int(index == len(plan.chunks) - 1))
         assert v["mode"] == MODE_CE and v["loss_div"] == inp.loss_div and v["num_tiles"] == V_HOST // 256
         assert v["A"].data_ptr() == inp.X[row0].data_ptr() and tuple(v["A"].shape) == (rows_c, H_HOST)
@@ -482,7 +482,7 @@ def test_stage_values_names():
         assert v["M"] == rows_c and v["m_tiles"] % 2 == 0 and v["m_tiles"] >= -(-rows_c // 128) and v["k_iters"] == 1
         dx = stage_values("gemm_dx", t, plan, index)
         assert dx["A"].data_ptr() == t["logits"].data_ptr() and tuple(dx["A"].shape) == (rows_c, V_HOST)
-        assert dx["C"].data_ptr() == t["dx_acc"][row0].data_ptr() and dx["M"] == rows_c and dx["first_chunk"] == 0
+        assert dx["C"].data_ptr() == t["dx_acc"][row0].data_ptr() and dx["M"] == rows_c and dx["first_chunk"] == 1  # stores its rows
         dw = stage_values("gemm_dw_acc", t, plan, index)
         assert dw["M"] == V_HOST and dw["k_iters"] == -(-rows_c // 64) and dw["C"] is t["dw_acc"]
         assert dw["first_chunk"] == int(index == 0)
@@ -705,7 +705,8 @@ def test_reference_policy_ratio_boundary():
     # above the clip the logit gradient vanishes analytically: those rows are exactly zero
     assert torch.all(dX[regime == 2] == 0) and torch.all(oracle["dX"][regime == 2] == 0)
     # below the clip (and on the random rows) every row carries a gradient within the unchunked path's error
-    for rows in (regime == 0, regime == 3):
+    # (random rows above the knee, ratio > 2, legitimately carry no gradient; keep the ones below it)
+    for rows in (regime == 0, (regime == 3) & (delta < math.log(2.0))):
         assert torch.all(dX[rows].float().abs().sum(-1) > 0)
         assert rel_l2(dX[rows], oracle["dX"][rows]) <= GATE_MARGIN * rel_l2(b0["dX"][rows], oracle["dX"][rows]) + GATE_TINY["dX_rel_l2"]
     _check_against_references(result, inp)

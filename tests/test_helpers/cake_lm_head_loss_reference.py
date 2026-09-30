@@ -166,7 +166,7 @@ def make_inputs(
     dlogp = torch.where(valid, torch.randn(T, generator=gen, device=device) * 0.05, zero)
     if W is None:
         W = make_weight(V, H, seed=seed + 1000003, device=device)
-    elif tuple(W.shape) != (V, H) or W.dtype != torch.bfloat16 or W.device != device:
+    elif tuple(W.shape) != (V, H) or W.dtype != torch.bfloat16 or W.device != zero.device:
         raise ValueError(f"W must be a BF16 [{V}, {H}] tensor on {device}")
     infer_logp = loss_weights = regime = None
     if objective == "policy":

@@ -157,15 +157,14 @@ STAGE_TENSORS = {
     "scale_cast_f32": ("acc", "g", "out"),
 }
 COMMON_TENSORS = ("workspace", "tma_descriptor_workspace")
-COMMON_SCALARS = ("rows_c", "row0", "T", "H", "V", "C", "num_tiles", "mode", "loss_div", "first_chunk", "last_chunk", "d_off")
+COMMON_SCALARS = ("rows_c", "row0", "T", "H", "V", "chunk", "num_tiles", "mode", "loss_div", "first_chunk", "last_chunk", "d_off")
 # Accepted spellings of the same host value (kernel side -> host side).
 CONTRACT_ALIASES = {
     "num_rows": "T",
     "total_rows": "T",
     "hidden": "H",
     "vocab": "V",
-    "chunk": "C",
-    "chunk_size": "C",
+    "chunk_size": "chunk",
     "num_vocab_tiles": "num_tiles",
     "vocab_tiles": "num_tiles",
     "objective": "mode",
@@ -807,7 +806,7 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
     """
     p, g = plan.problem, plan.geometry
     values: dict[str, Any] = {name: t.get(name) for name in COMMON_TENSORS}
-    values.update(T=int(p.num_rows), H=int(p.hidden), V=int(p.vocab), C=int(p.chunk), num_tiles=int(plan.num_tiles),
+    values.update(T=int(p.num_rows), H=int(p.hidden), V=int(p.vocab), chunk=int(p.chunk), num_tiles=int(plan.num_tiles),
                   mode=int(p.mode), loss_div=float(p.loss_div) if p.loss_div is not None else 1.0)
     if stage in ("scale_cast_bf16", "scale_cast_f32"):
         acc = t["dx_acc"] if index == "dx" else t["dw_acc"]
@@ -1717,6 +1716,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
         ctx.dx_acc, ctx.dw_acc = result.dx_acc, result.dw_acc  # saved state, never mutated
         ctx.grad_weight_dtype = grad_weight_dtype
         ctx.backend = backend
+        ctx.empty = X.shape[0] == 0
         ctx.mark_non_differentiable(result.logp)
         return result.loss, result.logp
 
@@ -1725,6 +1725,10 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
         none = (None,) * 12
         if grad_loss is None:
             return none
+        if ctx.empty:  # T == 0: zero gradients without binding or launching a program
+            dx = None if ctx.dx_acc is None else torch.zeros(ctx.dx_acc.shape, dtype=torch.bfloat16, device=ctx.dx_acc.device)
+            dw = None if ctx.dw_acc is None else torch.zeros(ctx.dw_acc.shape, dtype=ctx.grad_weight_dtype, device=ctx.dw_acc.device)
+            return (dx, dw) + none[2:]
         dx, dw = backward_loss(ctx.dx_acc, ctx.dw_acc, grad_loss, grad_weight_dtype=ctx.grad_weight_dtype, backend=ctx.backend)
         return (dx, dw) + none[2:]
 
