@@ -158,10 +158,10 @@ __device__ __forceinline__ uint32_t philox_randint(int64_t seed, int64_t offset)
 }
 
 // Hardware `cvt.rs.*` (stochastic-rounding convert) is available ONLY on the
-// datacenter Blackwell "a" targets that actually carry the `.rs` PTX feature:
-// sm_100a (B200) and sm_103a (B300).  There is NO generic CUDA feature macro for
-// it — `__CUDA_ARCH_SPECIFIC__` is too broad (sm_120a defines it but ptxas
-// rejects `.rs`), so the arches are enumerated here in ONE place.
+// datacenter Blackwell and Rubin "a" targets that carry the `.rs` PTX feature:
+// sm_100a (B200), sm_103a (B300), and sm_107a (Rubin). There is NO generic CUDA
+// feature macro for it — `__CUDA_ARCH_SPECIFIC__` is too broad (sm_120a defines
+// it but ptxas rejects `.rs`), so the arches are enumerated here in ONE place.
 //
 // The trap this guard exists to avoid: B300 is sm_103a and does NOT define
 // `__CUDA_ARCH_FEAT_SM100_ALL`, so a SM100-only guard silently compiled the
@@ -169,8 +169,10 @@ __device__ __forceinline__ uint32_t philox_randint(int64_t seed, int64_t offset)
 // +24% on B200 (2026-07-13).  sm_110a / sm_120a lack `.rs` (ptxas errors) → they
 // correctly fall to the software path below.  Extend the list only after
 // confirming `cvt.rs.f16x2.f32` assembles for the new arch.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
-    (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL))
+// Keep this list in sync with CVT_RS_SUPPORTED_ARCHES in flashinfer/utils.py.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 &&                             \
+    (defined(__CUDA_ARCH_FEAT_SM100_ALL) || defined(__CUDA_ARCH_FEAT_SM103_ALL) || \
+     defined(__CUDA_ARCH_FEAT_SM107_ALL))
 #define FLASHINFER_MAMBA_HAS_CVT_RS 1
 #else
 #define FLASHINFER_MAMBA_HAS_CVT_RS 0
@@ -216,7 +218,7 @@ __device__ __forceinline__ uint16_t cvt_rs_f16_sw(float x, uint32_t rand13) {
 __device__ __forceinline__ uint32_t cvt_rs_f16x2_f32(float a, float b, uint32_t rbits);
 
 // Stochastic rounding: convert one fp32 value to fp16 using 13 random bits.
-// On sm_100a+: uses PTX cvt.rs.f16x2.f32 with a dummy zero second input.
+// On sm_100a/sm_103a/sm_107a: uses PTX cvt.rs.f16x2.f32 with a dummy zero second input.
 // On other archs: software emulation.
 __device__ __forceinline__ __half cvt_rs_f16_f32(float x, uint32_t rand13) {
 #if FLASHINFER_MAMBA_HAS_CVT_RS
@@ -231,7 +233,7 @@ __device__ __forceinline__ __half cvt_rs_f16_f32(float x, uint32_t rand13) {
 }
 
 // Stochastic rounding: convert two fp32 values to packed fp16x2 using random bits.
-// On sm_100a+: uses PTX cvt.rs.f16x2.f32 instruction.
+// On sm_100a/sm_103a/sm_107a: uses PTX cvt.rs.f16x2.f32 instruction.
 // On other archs: software emulation matching the hardware behavior.
 //
 // rbits layout (from PTX docs):
