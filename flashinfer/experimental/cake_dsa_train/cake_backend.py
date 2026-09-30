@@ -1336,7 +1336,8 @@ def prepare_dsa_train(
 BINDING_CACHE_ENV = (
     "FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE"  # "0" disables the cache at import
 )
-# Scratch the cache owns per remembered backward binding is bounded by this many bytes in total.
+# Scratch the cache owns across remembered bindings is bounded by this many bytes in total, the most recently
+# remembered forward and backward binding excepted (see BindingCache).
 BINDING_CACHE_BUDGET_BYTES = 512 << 20
 
 
@@ -1631,9 +1632,14 @@ class BindingCache:
     A binding pins no caller tensor; it owns only its workspace scratch
     (``delta``, the FP32 accumulators, a materialized ``topk_length``, the
     descriptor workspace and, for a multi-pass backward, the key-range-pass
-    regions ``dq_partial`` / ``key_scratch`` / ``pass_counts``).  The cache keeps at most ``capacity`` bindings and
-    at most :data:`BINDING_CACHE_BUDGET_BYTES` of owned scratch (oldest
-    evicted first).  ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0`` or
+    regions ``dq_partial`` / ``key_scratch`` / ``pass_counts``).  The cache
+    keeps at most ``capacity`` bindings and at most
+    :data:`BINDING_CACHE_BUDGET_BYTES` of owned scratch, evicting the oldest
+    first -- except the most recently remembered forward and backward
+    binding, which stay whatever their size: the pair one training step uses
+    is never re-bound step after step, even when its backward scratch (the
+    FP32 accumulators of a long key sequence, the key-range-pass regions)
+    exceeds the budget.  ``FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0`` or
     ``enabled = False`` routes every call through the validating path.
     """
 
@@ -1673,13 +1679,25 @@ class BindingCache:
         """The binding remembered for ``key`` without touching the counters (inspection)."""
         return self._bindings.get(key)
 
+    def _evictable(self) -> list:
+        """Keys the capacity and the budget may evict, oldest first: every binding but the most
+        recently remembered one of each kind (``key[0]``: ``"fwd"`` / ``"bwd"``)."""
+        latest: dict[Any, tuple] = {}
+        for key in self._bindings:
+            latest[key[0] if isinstance(key, tuple) and key else None] = key
+        protected = set(latest.values())
+        return [key for key in self._bindings if key not in protected]
+
     def remember(self, key: tuple, binding: _Binding) -> _Binding:
         self._bindings.pop(key, None)
         self._bindings[key] = binding
-        while len(self._bindings) > self.capacity or (
-            len(self._bindings) > 1 and self.owned_bytes > self.budget_bytes
+        while (
+            len(self._bindings) > self.capacity or self.owned_bytes > self.budget_bytes
         ):
-            del self._bindings[next(iter(self._bindings))]
+            evictable = self._evictable()
+            if not evictable:
+                break  # the latest forward / backward pair stays whatever its size
+            del self._bindings[evictable[0]]
         return binding
 
 

@@ -849,27 +849,34 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_scale_and_lengths():
     )  # dout
 
 
-def test_binding_cache_fifo_and_budget_eviction():
-    cache = BindingCache(capacity=2, budget_bytes=100)
+def test_binding_cache_keeps_the_latest_pair_and_evicts_the_rest():
+    """Capacity and byte budget evict the oldest bindings first, but never the most recently
+    remembered forward and backward binding: the pair a training step uses stays whatever
+    its size (a whole-row key-range-pass backward owns more scratch than the budget)."""
+    cache = BindingCache(capacity=3, budget_bytes=100)
     assert cache.enabled and len(cache) == 0
-    for key in ("a", "b", "c"):
-        cache.remember(key, SimpleNamespace(owned_bytes=10))
-    assert (
-        cache.lookup("a") is None
-        and cache.lookup("b") is not None
-        and cache.lookup("c") is not None
-    )
-    assert (cache.hits, cache.misses) == (2, 1)
-    cache.remember(
-        "d", SimpleNamespace(owned_bytes=95)
-    )  # oldest evicted until the owned scratch fits the budget
-    assert len(cache) == 1 and cache.lookup("d") is not None
-    cache.remember(
-        "e", SimpleNamespace(owned_bytes=500)
-    )  # a single over-budget binding stays
-    assert (
-        len(cache) == 1 and cache.lookup("e") is not None and cache.lookup("d") is None
-    )
+
+    def keys():
+        return list(cache._bindings)
+
+    for kind, tag in (("fwd", "a"), ("bwd", "a"), ("fwd", "b"), ("bwd", "b")):
+        cache.remember((kind, tag), SimpleNamespace(owned_bytes=10))
+    # capacity 3: the oldest binding that is not the latest of its kind goes
+    assert keys() == [("bwd", "a"), ("fwd", "b"), ("bwd", "b")]
+    assert cache.lookup(("fwd", "a")) is None and cache.lookup(("bwd", "b")) is not None
+    assert (cache.hits, cache.misses) == (1, 1)
+    # over budget: older bindings go until the scratch fits, the latest forward stays
+    cache.remember(("bwd", "c"), SimpleNamespace(owned_bytes=95))
+    assert keys() == [("fwd", "b"), ("bwd", "c")] and cache.owned_bytes == 105
+    # a backward far above the budget replaces the previous backward and keeps the forward
+    cache.remember(("bwd", "d"), SimpleNamespace(owned_bytes=500))
+    assert keys() == [("fwd", "b"), ("bwd", "d")]
+    cache.remember(("fwd", "d"), SimpleNamespace(owned_bytes=500))
+    assert keys() == [("bwd", "d"), ("fwd", "d")]
+    # re-remembering a key moves it to the front without duplicating it
+    cache.remember(("bwd", "d"), SimpleNamespace(owned_bytes=500))
+    assert keys() == [("fwd", "d"), ("bwd", "d")] and len(cache) == 2
+    assert cache.peek(("fwd", "d")) is not None and (cache.hits, cache.misses) == (1, 1)
     cache.clear()
     assert len(cache) == 0 and cache.owned_bytes == 0
 
@@ -1308,14 +1315,30 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
             ("bwd_compact", 1),
             ("bwd_main_pass", 1),
         ]
+        assert remembered[0].owned_bytes > cake_backend.BINDING_CACHE_BUDGET_BYTES
+        # steady state: repeating the step with the same binding re-binds nothing -- the forward and the
+        # two-pass backward binding (~790 MB of owned scratch, above the cache's byte budget) are the
+        # latest pair and stay remembered
+        fwd_args = tuple(t.detach() for t in leaves) + (inp.idx_global,)
+        o1, l1, olo1 = cake_backend.forward(
+            *fwd_args
+        )  # the autograd step's forward binding: a hit
+        g1 = cake_backend.backward(
+            *fwd_args, o1, olo1, l1, inp.dout
+        )  # fresh saved outputs: binds anew
+        hits, misses, size = cache.hits, cache.misses, len(cache)
+        g2 = cake_backend.backward(*fwd_args, o1, olo1, l1, inp.dout)
+        o2, l2, olo2 = cake_backend.forward(*fwd_args)
+        torch.cuda.synchronize()
+        assert (cache.hits, cache.misses, len(cache)) == (hits + 2, misses, size)
+        assert torch.equal(g1[0], g2[0]) and torch.equal(g1[1], g2[1])
+        assert torch.equal(g1[0], grads[0]) and torch.equal(o2, out.detach())
         misses = cache.misses
         with _quiet_experimental():
             out_single = dsa_sparse_attention(*leaves, inp.idx_global, key_passes=1)
         single = torch.autograd.grad(out_single, leaves, inp.dout)
         torch.cuda.synchronize()
-        # the override is part of the binding key: the backward binds anew (the two-pass binding, whose
-        # 790 MB of owned scratch exceed the cache's byte budget, leaves the cache once another binding
-        # is remembered)
+        # the override is part of the binding key: the backward binds anew
         assert cache.misses > misses
         assert 1 in [b.key_passes for b in cache._bindings.values() if b.backward_order]
     assert torch.equal(out.detach(), out_single.detach())  # the forward is untouched

@@ -54,7 +54,9 @@ input binding -- `(data_ptr, shape, stride, dtype)` of every input plus the
 scale -- and launch later calls from the remembered argument plans with
 freshly allocated outputs (`cake_backend.BINDING_CACHE`: no caller tensor
 pinned, workspace scratch owned per binding under a FIFO capacity and a byte
-budget; `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0` disables it).
+budget that never evict the latest forward / backward pair, so a training
+loop binds once per shape; `FLASHINFER_CAKE_DSA_TRAIN_BINDING_CACHE=0`
+disables it).
 
 Host cost through the autograd wrapper: the `Function.backward` runs on
 PyTorch's autograd device thread, where the two thread handoffs (about 30 us
