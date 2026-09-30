@@ -523,6 +523,7 @@ class DecodeConfig:
     epi_chunk: int = 32  # round 6: epilogue staging rows per flush (table key ``epi_chunk``; 16 frees SMEM for the 5-stage t32 ring)
     pf: int = 0  # round 6 (lever P): weight-tile L2 prefetch distance in stages (table key ``pf``; 0 = off)
     mc: int = 1  # round 6 (lever M): m tiles of one N tile per cluster sharing the W stage through TMA multicast (table key ``mc``; 1 = off)
+    pfx: int = 0  # round 6 next loop (lever PX): BF16 token-tile L2 prefetch distance in stages (table key ``pfx``; fused, non-resident rows only; 0 = off)
     tstore: bool = False  # round 6 (lever E1): the split-1 epilogue stores BF16 through TMA (table key ``tstore``; the launch still needs a 16-byte-aligned output view)
 
     @property
@@ -548,6 +549,7 @@ class DecodeConfig:
             epi_chunk=self.epi_chunk,
             pf=self.pf,
             mc=self.mc,
+            pfx=self.pfx,
             tstore=bool(tma_store)
             and self.tstore
             and self.split == 1
@@ -698,6 +700,10 @@ def decode_config(
         raise ValueError(
             f"decode table entry tstore needs split 1 and no cluster split-K (got {entry})"
         )
+    # Table key ``pfx`` (round 6 next loop, lever PX): the BF16 token tile of the fused variant is prefetched into L2
+    # ``pfx`` stages ahead of its TMA load (its DRAM access then precedes the weight burst instead of queueing behind
+    # it); fused, non-resident rows only (host mirror of the Cake ``decode_config`` rule).
+    pfx = int(entry.get("pfx", 0)) if (fused and not resident) else 0
     cs_alias = (
         csplit > 1
         and grid == total_work
@@ -732,6 +738,7 @@ def decode_config(
         epi_chunk=epi_chunk,
         pf=pf,
         mc=mc,
+        pfx=pfx,
         cs_alias=cs_alias,
     )
 
