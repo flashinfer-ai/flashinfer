@@ -50,6 +50,17 @@ def test_default_tactic_rules():
     assert cb.default_tactic(32, 7168, 18432, 148)["split_k"] == 2
     assert "split_k" not in cb.default_tactic(8, 7168, 18432, 148)
     assert "split_k" not in cb.default_tactic(32, 18432, 7168, 148)
+    # Three K slices when the whole cluster grid (weight tiles x token tiles) is co-resident:
+    # 7168x1536 M = 17 needs 36 clusters of 3 (capacity 45 on 148 SMs, 46 on 152); the
+    # 48- and 51-cluster launches of M = 32 / N = 2112 keep two slices, as does a part
+    # without a measured capacity table.
+    for sm_count in (148, 152):
+        t = cb.default_tactic(17, 1536, 7168, sm_count)
+        assert t["tile_n"] == 8 and t["split_k"] == 3
+        assert cb.default_tactic(32, 1536, 7168, sm_count)["split_k"] == 2
+        assert cb.default_tactic(17, 2112, 7168, sm_count)["split_k"] == 2
+    assert cb.default_tactic(17, 1536, 7168, 132)["split_k"] == 2
+    assert set(cb.CLUSTER_CAPACITY_BY_SM_COUNT) == {148, 152}
     # More weight tiles than SMs: shallow K; two CTAs per SM on the 8-token tile or on
     # the 152-SM part, one CTA per SM for the 32-token tile on 148 SMs.
     t = cb.default_tactic(8, 28672, 8192, 148)
