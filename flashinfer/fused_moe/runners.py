@@ -31,7 +31,7 @@ from contextlib import suppress
 import dataclasses
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, ClassVar, List, Literal, Mapping, Optional
+from typing import Any, ClassVar, List, Literal, Mapping, Optional, cast
 
 import torch
 
@@ -6839,6 +6839,15 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 raise ValueError(
                     f"{type(self).__name__} requires top_k=1 for Llama4 routing."
                 )
+        if pair == (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8):
+            # OA tensors are stripped before the inner support check, which
+            # only rejects them when they are still present. Reject here so a
+            # non-default SwiGLU is not silently launched as the default.
+            if isinstance(activation, SwiGLU) and activation != SwiGLU():
+                raise NotImplementedError(
+                    f"{type(self).__name__} cannot represent non-default "
+                    "SwiGLU scalars for DeepSeekFp8×DeepSeekFp8."
+                )
 
     def __init__(self, config: MoEConfig, device: torch.device):
         super().__init__()
@@ -7006,8 +7015,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             _validate_logits_inputs(
                 act, num_tokens, routing.num_experts, type(self).__name__
             )
+            pair = self.config.quant.pair
             if (
-                self._pair
+                pair
                 in (
                     (QuantFormat.MXFP4, QuantFormat.MXFP8),
                     (QuantFormat.MXFP4, QuantFormat.BF16),
@@ -7015,7 +7025,7 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                 and act.routing_logits.dtype != torch.bfloat16
             ):
                 raise TypeError(
-                    f"{self._pair[0].name}×{self._pair[1].name} FromLogits requires "
+                    f"{pair[0].name}×{pair[1].name} FromLogits requires "
                     f"bfloat16 routing_logits, got {act.routing_logits.dtype}."
                 )
             topk_ids = hidden.new_empty((num_tokens, routing.top_k), dtype=torch.int32)
@@ -7092,6 +7102,9 @@ class PrimsTsRunner(_TrtllmRunnerBase):
             if pair == (QuantFormat.MXFP4, QuantFormat.MXFP8):
                 # TRT-LLM stores a compact linear UE8M0 row. The Prims-TS
                 # MXFP8 activation GEMM reads K-blocks rounded up to 16.
+                # Padding happens on every pack_inputs, including the hot
+                # forward path: one allocation, fill, and copy per call, so
+                # the public activation pack can stay the shared TRT-LLM layout.
                 from flashinfer.prims_ts.moe.runner import (
                     _pad_mxfp8_linear_scale_for_prims,
                 )
@@ -7109,11 +7122,15 @@ class PrimsTsRunner(_TrtllmRunnerBase):
                     )
                 per_token_scale = act.per_token_scale
         elif is_fp8_block:
+            # Same fields as TrtllmFp8BlockRunner; the validator is not on the
+            # shared base, so the cast is only for the type checker.
             hidden_states_scale = TrtllmFp8BlockRunner._validate_fp8_tensors(
-                self, act, v, hidden_size
+                cast(TrtllmFp8BlockRunner, self), act, v, hidden_size
             )
         elif is_fp8_per_tensor:
-            TrtllmFp8PerTensorRunner._validate_tensors(self, act, v, hidden_size)
+            TrtllmFp8PerTensorRunner._validate_tensors(
+                cast(TrtllmFp8PerTensorRunner, self), act, v, hidden_size
+            )
             hidden_states_scale = None
         else:
             _validate_optional_gemm1_activation_params(

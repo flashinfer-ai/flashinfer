@@ -255,6 +255,19 @@ class TestPrimsTsUnifiedValidation:
         with pytest.raises(NotImplementedError, match="Sigmoid"):
             runner.check_support()
 
+    def test_deepseek_rejects_nondefault_swiglu(self):
+        runner = self._runner(
+            _config(
+                variant=QuantConfig(
+                    weight=QuantFormat.DeepSeekFp8,
+                    activation=QuantFormat.DeepSeekFp8,
+                ),
+                activation=SwiGLU(alpha=1.5),
+            )
+        )
+        with pytest.raises(NotImplementedError, match="non-default"):
+            runner.check_support()
+
     def test_geglu_does_not_forward_prepare_alpha(self):
         alpha = torch.ones(32, dtype=torch.float32)
         view = {"gemm1_alpha": alpha, "gemm1_beta": None, "gemm1_clamp_limit": None}
@@ -614,11 +627,16 @@ class TestPrimsTsUnifiedGpu:
                 other = trtllm_view[key]
                 assert tensor.dtype == other.dtype and tensor.shape == other.shape
                 # MXFP4 stores UE8M0 bytes in float8_e4m3fn. assert_close
-                # rejects those encodings even when the bytes match.
-                assert torch.equal(
-                    tensor.contiguous().view(torch.uint8),
-                    other.contiguous().view(torch.uint8),
-                )
+                # rejects those encodings even when the bytes match. 0-dim
+                # calibration scalars in the per-tensor view cannot be viewed
+                # as uint8.
+                if tensor.ndim == 0:
+                    assert torch.equal(tensor, other)
+                else:
+                    assert torch.equal(
+                        tensor.contiguous().view(torch.uint8),
+                        other.contiguous().view(torch.uint8),
+                    )
 
         act = MoEActivationPack(
             x_q,
