@@ -21,8 +21,10 @@ out = mm_fp4(fp4, w_fp4.T, sf, w_sf.T, scale * w_scale, torch.bfloat16, backend=
 
 The GEMM tactic is the rule of the Cake launcher (`cake_backend.default_tactic`):
 `M <= 32` runs the swapped orientation (8 / 16 / 32 tokens per tile; cluster split-K
-while the tile grid leaves most SMs idle, and split-K 2 on the deep-K rows whose weight
-tiles fill at most half the SMs; two CTAs per SM or three mainloop stages on the rows
+while the tile grid leaves most SMs idle - three K slices instead of two on the 8-token rows
+with several token tiles when the whole cluster grid is co-resident per the part's
+driver-measured cluster capacity (`cake_backend.CLUSTER_CAPACITY_BY_SM_COUNT`) - and
+split-K 2 on the deep-K rows whose weight tiles fill at most half the SMs; two CTAs per SM or three mainloop stages on the rows
 whose weight-tile count exceeds or fills one wave, chosen per SM count); larger `M`
 runs the tile the bucket scorer picks (1-CTA 128-token tiles, or 2-CTA 256-token tiles
 whose width is re-picked on multi-wave grids from the measured per-wave cost of the
@@ -32,7 +34,9 @@ single-token-tile overrides: a 2-CTA
 256x64 pair for `M <= 128` over at most 40 narrow weight tiles, the 128-wide two-wave tile
 on the 148-SM part when more 128-wide weight tiles than SMs exist, and no L2 promotion on
 the 152-SM part when one wave of 128-wide tiles covers the row.  The quantizer's CTA
-width and occupancy follow `cake_backend.cta_config`.  Every rule is a
+width and occupancy follow `cake_backend.cta_config`; for row sets of 512 tokens or more its fp4 and
+scale stores carry the L2 evict-last policy, so the outputs the dependent GEMM reads next stay
+resident instead of being written back into the quantizer's own read stream.  Every rule is a
 documented pure-Python port; the generated-program export checks route and bitwise
 output parity against the Cake launchers on every validated shape.
 
