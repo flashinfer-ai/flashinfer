@@ -19,9 +19,10 @@ class NVLinkOneSidedConfig:
     ``kernel`` selects the kernel implementation: ``"trtllm"`` (default, every
     architecture) or ``"cake"`` (generated Blackwell kernels, compute
     capability 10.0 / 10.3). All ranks must select the same kernel.
-    ``extra_payload_bytes_per_token`` reserves dispatch workspace beyond the
-    BF16 token row and routing payloads (e.g. for scale factors that do not
-    fit in the space quantization frees). ``eplb_stats_num_experts`` enables
+    The dispatch workspace holds each token's activations as described by
+    ``MoEEpCommParams.dispatch_format`` plus its routing;
+    ``extra_payload_bytes_per_token`` reserves room for anything else sent
+    per token. ``eplb_stats_num_experts`` enables
     all-gathering EPLB statistics of that many experts during dispatch.
     ``enable_rank_mask`` compiles in rank-mask support for
     ``active_rank_mask``. ``use_low_precision_combine`` sends combine payloads

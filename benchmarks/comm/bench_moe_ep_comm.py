@@ -40,7 +40,15 @@ import torch.distributed as dist
 
 FP8_E4M3_MAX = 448.0
 FP4_E2M1_MAX = 6.0
-QUANT_FORMATS = ("bf16", "fp8", "mxfp8", "nvfp4")
+# The flashinfer.fused_moe.QuantFormat each --quant choice dispatches in;
+# bf16 dispatches the unquantized token row.
+DISPATCH_FORMATS = {
+    "bf16": None,
+    "fp8": "FP8PerTensor",
+    "mxfp8": "MXFP8",
+    "nvfp4": "NVFP4",
+}
+QUANT_FORMATS = tuple(DISPATCH_FORMATS)
 
 
 @dataclass(frozen=True)
@@ -819,6 +827,7 @@ def main() -> None:
     rank, ep_size = dist.get_rank(), dist.get_world_size()
     cupti_ctx, cupti_warning = _agree_on_cupti(cupti_ctx, cupti_error)
 
+    from flashinfer.fused_moe import QuantFormat
     from flashinfer.moe_ep import (
         BootstrapConfig,
         MoEEpCommParams,
@@ -884,11 +893,15 @@ def main() -> None:
     torch.manual_seed(int(args.random_seed) + rank)
     torch.cuda.manual_seed_all(int(args.random_seed) + rank)
     bootstrap = BootstrapConfig(world_size=ep_size, rank=rank, device=local_rank)
+    dispatch_format = DISPATCH_FORMATS[quant]
     params = MoEEpCommParams(
         num_experts=num_experts,
         top_k=top_k,
         max_tokens_per_rank=max_num_tokens_per_rank,
         hidden_size=hidden_size,
+        dispatch_format=None
+        if dispatch_format is None
+        else QuantFormat[dispatch_format],
     )
     results: List[Dict[str, Any]] = []
 

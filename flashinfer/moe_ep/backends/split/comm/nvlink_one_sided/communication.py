@@ -57,16 +57,17 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
         if self.config.extra_payload_bytes_per_token < 0:
             raise ValueError("extra_payload_bytes_per_token must be non-negative")
 
-        itemsize = params.token_dtype.itemsize
-        # Dispatch carries the token row, int32 expert ids and FP32 weights.
+        # Dispatch carries the activations, int32 expert ids and FP32 weights.
         dispatch_bytes_per_token = (
-            params.hidden_size * itemsize
+            params.dispatch_bytes_per_token
             + params.top_k * 4
             + params.top_k * 4
             + self.config.extra_payload_bytes_per_token
         )
         # Expert outputs come back unquantized, at least 16 bits wide.
-        combine_bytes_per_token = params.hidden_size * max(itemsize, 2)
+        combine_bytes_per_token = params.hidden_size * max(
+            params.token_dtype.itemsize, 2
+        )
         workspace_size_per_rank = moe_a2a_get_workspace_size_per_rank(
             self.ep_size,
             params.max_tokens_per_rank,

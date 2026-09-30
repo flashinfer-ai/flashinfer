@@ -67,6 +67,10 @@ Communication has two levels:
   on its source rank. Create one with `create_communication(bootstrap,
   MoEEpCommParams(...), backend=<config>)`, or let `MoEEpSplitLayer` create it
   (requires `FleetParams(algorithm=LOW_LATENCY, layout=RANK_MAJOR)`).
+  `MoEEpCommParams.dispatch_format` names the `QuantFormat` the activations
+  are dispatched in (unquantized `dtype` rows when unset); backends that
+  reserve buffers per dispatched byte, such as `nvlink_one_sided`, size them
+  from it.
 - **`Fleet` / `Handle`** (`core/comm/fleet.py`, `handle.py`) is the
   transport-level API of the NCCL-EP and NIXL-EP backends. It mirrors those
   libraries' group / per-step-handle model and exposes their full surface

@@ -34,10 +34,29 @@ from typing import TYPE_CHECKING, Any, Callable, ClassVar, Optional
 if TYPE_CHECKING:
     import torch
 
+    from ....fused_moe.api import QuantFormat
     from ...config import BootstrapConfig
 
 
 _COMMUNICATION_REGISTRY: "dict[str, type[MoEEpCommunication]]" = {}
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+# Bytes one token's activations occupy on the wire in each QuantFormat a
+# dispatch can carry: the values plus their per-block scale factors. A
+# per-tensor scale is a scalar and does not travel with the tokens.
+_DISPATCH_BYTES_PER_TOKEN: "dict[str, Callable[[int], int]]" = {
+    "BF16": lambda hidden: 2 * hidden,
+    "FP16": lambda hidden: 2 * hidden,
+    "FP8PerTensor": lambda hidden: hidden,
+    "DeepSeekFp8": lambda hidden: hidden + 4 * _ceil_div(hidden, 128),
+    "MXFP8": lambda hidden: hidden + _ceil_div(hidden, 32),
+    "NVFP4": lambda hidden: _ceil_div(hidden, 2) + _ceil_div(hidden, 16),
+    "MXFP4": lambda hidden: _ceil_div(hidden, 2) + _ceil_div(hidden, 32),
+}
 
 
 @dataclass(frozen=True)
@@ -46,8 +65,12 @@ class MoEEpCommParams:
 
     ``max_tokens_per_rank`` bounds the number of tokens any rank dispatches in
     one call and sizes the backend's receive buffers. ``hidden_size`` and
-    ``dtype`` describe the unquantized token row; backends size their payload
-    buffers for it, which also bounds quantized rows plus their scale factors.
+    ``dtype`` describe the unquantized token row, which is also what the
+    expert computation hands to ``combine``. ``dispatch_format`` is the
+    :class:`~flashinfer.fused_moe.QuantFormat` of the activations as
+    dispatched, values plus per-token scale factors; ``None`` dispatches
+    unquantized ``dtype`` rows. Backends that reserve buffers per dispatched
+    byte size them from :attr:`dispatch_bytes_per_token`.
     """
 
     num_experts: int
@@ -55,6 +78,7 @@ class MoEEpCommParams:
     max_tokens_per_rank: int
     hidden_size: int
     dtype: "torch.dtype | None" = None
+    dispatch_format: "QuantFormat | None" = None
     invalid_expert_id: int = -1
 
     def __post_init__(self) -> None:
@@ -72,6 +96,18 @@ class MoEEpCommParams:
                 "MoEEpCommParams.invalid_expert_id must lie outside "
                 f"[0, num_experts={self.num_experts}), got {self.invalid_expert_id}"
             )
+        if self.dispatch_format is not None:
+            from ....fused_moe.api import QuantFormat
+
+            if (
+                not isinstance(self.dispatch_format, QuantFormat)
+                or self.dispatch_format.name not in _DISPATCH_BYTES_PER_TOKEN
+            ):
+                raise ValueError(
+                    "MoEEpCommParams.dispatch_format must be one of QuantFormat."
+                    f"{{{', '.join(_DISPATCH_BYTES_PER_TOKEN)}}} or None, got "
+                    f"{self.dispatch_format!r}"
+                )
 
     @property
     def token_dtype(self) -> "torch.dtype":
@@ -79,6 +115,13 @@ class MoEEpCommParams:
         import torch
 
         return torch.bfloat16 if self.dtype is None else self.dtype
+
+    @property
+    def dispatch_bytes_per_token(self) -> int:
+        """Bytes of one token's dispatched activations, scale factors included."""
+        if self.dispatch_format is None:
+            return self.hidden_size * self.token_dtype.itemsize
+        return _DISPATCH_BYTES_PER_TOKEN[self.dispatch_format.name](self.hidden_size)
 
 
 @dataclass(frozen=True)

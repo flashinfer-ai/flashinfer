@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from flashinfer.fused_moe import QuantFormat
 from flashinfer.moe_ep import (
     BootstrapConfig,
     CombineOutput,
@@ -130,6 +131,17 @@ class TestCommParams:
     def test_token_dtype_defaults_to_bf16(self) -> None:
         assert _params().token_dtype == torch.bfloat16
         assert _params(dtype=torch.float32).token_dtype == torch.float32
+
+    def test_dispatch_bytes_follow_the_dispatch_format(self) -> None:
+        def dispatch_bytes(**overrides):
+            return _params(hidden_size=7168, **overrides).dispatch_bytes_per_token
+
+        assert dispatch_bytes() == 2 * 7168
+        assert dispatch_bytes(dtype=torch.float32) == 4 * 7168
+        assert dispatch_bytes(dispatch_format=QuantFormat.MXFP8) == 7168 + 224
+        assert dispatch_bytes(dispatch_format=QuantFormat.NVFP4) == 3584 + 448
+        with pytest.raises(ValueError, match="dispatch_format"):
+            _params(dispatch_format=QuantFormat.INT4)
 
 
 class TestRegistry:
@@ -376,6 +388,7 @@ def test_nccl_ep_communication_rejects_unsupported_inputs(stub_nccl_fleet) -> No
 
 class _FakeMoeAlltoAll:
     instances: list = []
+    workspace_args: tuple = ()
 
     def __init__(self, mapping, **kwargs):
         self.kwargs = kwargs
@@ -409,10 +422,14 @@ def fake_one_sided(monkeypatch):
         communication as one_sided,
     )
 
+    def workspace_size_per_rank(*args, **kwargs):
+        _FakeMoeAlltoAll.workspace_args = args
+        return 1 << 20
+
     _FakeMoeAlltoAll.instances = []
     monkeypatch.setattr(a2a, "MoeAlltoAll", _FakeMoeAlltoAll)
     monkeypatch.setattr(
-        a2a, "moe_a2a_get_workspace_size_per_rank", lambda *a, **k: 1 << 20
+        a2a, "moe_a2a_get_workspace_size_per_rank", workspace_size_per_rank
     )
     monkeypatch.setattr(
         one_sided,
@@ -432,6 +449,18 @@ def fake_one_sided(monkeypatch):
         "is_platform_supported",
         classmethod(lambda cls: True),
     )
+
+
+def test_nvlink_one_sided_sizes_dispatch_by_format(fake_one_sided) -> None:
+    create_communication(
+        BootstrapConfig(world_size=2, rank=0),
+        _params(hidden_size=64, dispatch_format=QuantFormat.NVFP4),
+        "nvlink_one_sided",
+    )
+    _, _, dispatch_bytes, combine_bytes, _ = _FakeMoeAlltoAll.workspace_args
+    # NVFP4 values and scales, then int32 ids and FP32 weights for top_k=2.
+    assert dispatch_bytes == 32 + 4 + 2 * 4 * 2
+    assert combine_bytes == 64 * 2
 
 
 def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
