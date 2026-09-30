@@ -603,6 +603,92 @@ def test_localized_gather_validates_shared_buffers_before_allocation(
 
 
 @cute_dsl_available
+@pytest.mark.parametrize("domain_id", [-1, 0, 1])
+@pytest.mark.parametrize(
+    "invalid_kind,exception,match",
+    [
+        ("shape", ValueError, "must have shape"),
+        ("dtype", TypeError, "must have dtype"),
+        ("device", ValueError, "must be on cuda:0"),
+        ("other_gpu", ValueError, "must be on cuda:0"),
+        ("contiguous", ValueError, "must be contiguous"),
+        (None, None, None),
+    ],
+)
+def test_finalize_rejects_invalid_output_before_launch(
+    monkeypatch, domain_id, invalid_kind, exception, match
+):
+    """Raw-pointer output writes require a contiguous buffer on the input device."""
+    import importlib
+    from types import SimpleNamespace
+
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    module = importlib.import_module(
+        "flashinfer.fused_moe.cute_dsl."
+        "blockscaled_contiguous_grouped_gemm_finalize_fusion"
+    )
+    width = 256 if domain_id >= 0 else 128
+    with FakeTensorMode():
+        kwargs = {
+            "a": torch.empty((128, 64), dtype=torch.uint8, device="cuda:0"),
+            "b": torch.empty((2, 128, 64), dtype=torch.uint8, device="cuda:0"),
+            "token_final_scales": torch.empty(
+                (4, 1), dtype=torch.float32, device="cuda:0"
+            ),
+            "out": torch.empty((4, width), dtype=torch.bfloat16, device="cuda:0"),
+        }
+        if invalid_kind == "shape":
+            kwargs["out"] = kwargs["out"][:, : width // 2]
+        elif invalid_kind == "dtype":
+            kwargs["out"] = torch.empty(
+                (4, width), dtype=torch.float32, device="cuda:0"
+            )
+        elif invalid_kind in ("device", "other_gpu"):
+            kwargs["out"] = torch.empty(
+                (4, width),
+                dtype=torch.bfloat16,
+                device="cpu" if invalid_kind == "device" else "cuda:1",
+            )
+        elif invalid_kind == "contiguous":
+            kwargs["out"] = torch.empty(
+                (4, width * 2), dtype=torch.bfloat16, device="cuda:0"
+            )[:, ::2]
+
+    monkeypatch.setattr(module, "get_compute_capability", lambda device: (10, 7))
+    monkeypatch.setattr(
+        module,
+        "_sm107_finalize_kernel_cls",
+        lambda: SimpleNamespace(can_implement=lambda **kwargs: True),
+    )
+
+    class ValidationPassed(Exception):
+        pass
+
+    def stop_before_kernel_setup(*args, **kwargs):
+        raise ValidationPassed
+
+    # Stop valid inputs before hardware queries; malformed pointers never launch.
+    monkeypatch.setattr(module, "get_num_sm", stop_before_kernel_setup)
+    kwargs.update(
+        a_scale=None,
+        b_scale=None,
+        alpha=None,
+        tile_idx_to_expert_idx=None,
+        num_non_exiting_tiles=None,
+        tile_idx_to_mn_limit=None,
+        permuted_idx_to_expanded_idx=None,
+        a_dtype="float4_e2m1fn",
+        b_dtype="float4_e2m1fn",
+        domain_id=domain_id,
+        mma_tiler=(128, 128, 128),
+        mma_inst_shape=(128, 128, 64),
+    )
+    with pytest.raises(exception or ValidationPassed, match=match):
+        module.blockscaled_contiguous_grouped_gemm_finalize_fusion(**kwargs)
+
+
+@cute_dsl_available
 @sm100_required
 class TestKernelInputValidation:
     @staticmethod

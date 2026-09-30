@@ -445,10 +445,7 @@ def _moe_core_impl(
             )
         from torch.cuda.green_contexts import execute_in_green_contexts
 
-        # The shared GEMM1 output has to be allocated ABOVE the fan-out. Left to
-        # the dispatcher, each die would allocate its own buffer, and would size it
-        # from its own (half-width) weight -- whereas the point of the split is
-        # that both dies fill ONE full-width buffer at different column offsets.
+        # Allocate once: both domains fill disjoint columns of this buffer.
         permuted_m = permuted_idx_to_expanded_idx.shape[0]
         sf_vec_size = 16  # NVFP4
         # Captured before any fork: both fan-outs and the memset between them are
@@ -512,23 +509,11 @@ def _moe_core_impl(
     )
     intermediate_per_token_scale = None
     if use_localized_path:
-        # Fan out over the dies. execute_in_green_contexts forks the current
-        # stream to the per-die green-context streams, runs the callback on each,
-        # and joins them back on return -- so this is both a barrier against the
-        # moe_sort above and against every later reader of gemm1_out, with no
-        # explicit events, and it still captures into a CUDA graph.
-        #
-        # Do NOT call record_stream(green_stream) on any of these buffers. The
-        # join already orders later frees/reuse on the main stream, so it is
-        # redundant -- and harmful: it adds the green streams to the block's
-        # use-set, so at teardown the caching allocator's free() tries to
-        # cudaEventRecord on a stream whose GreenContext is already collected,
-        # which segfaults.
-        #
-        # w1_alpha / fc2_input_scale are per-expert or global, invariant under a
-        # split on N, so both dies read the same unsharded tensors. Localization
-        # forbids per-token activation, so both launches carry the shared
-        # gemm1_out_scale.
+        # execute_in_green_contexts forks and joins the main stream, ordering
+        # both domains after moe_sort and before consumers of the shared output.
+        # The join also orders buffer reuse; record_stream is unnecessary and
+        # could leave allocator events referencing destroyed green streams.
+        # Per-expert/global scales are shared because only N is partitioned.
         def _fc1_die(i, _ctx):
             shard = localized_weights[i]
             blockscaled_contiguous_gather_grouped_gemm_act_fusion(
@@ -676,11 +661,8 @@ def _moe_core_impl(
 
     # Step 3: GEMM2 with optional atomic finalize
     if use_localized_path:
-        # Each die reads the FULL assembled intermediate and writes its own
-        # disjoint half of the hidden output columns, so the contraction is
-        # complete on each side and no cross-die reduction is needed. The fork
-        # orders every die after both the joined FC1 and the zeroing above; the
-        # join on return means gemm2_output is complete for the caller.
+        # Both domains read the joined FC1 output and write disjoint hidden
+        # columns. Each contracts the full intermediate, so no reduction is needed.
         def _fc2_die(i, _ctx):
             shard = localized_weights[i]
             blockscaled_contiguous_grouped_gemm_finalize_fusion(

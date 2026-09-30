@@ -315,9 +315,7 @@ def _get_compiled_gather_kernel(
         raster_along_m,
         # locality-domain half-GEMM is a kernel constexpr: True/False are distinct binaries.
         (localized_half_gemm if is_rubin else False),
-        # max_active_clusters is a cute.compile constexpr sizing the persistent
-        # grid. Under a green context it is scaled to the node-local SM fraction,
-        # so the full-device and per-die variants must not alias.
+        # The persistent grid size is a compile-time constant.
         max_active_clusters,
         enable_pdl,
         normalized_activation_type.value,
@@ -424,12 +422,7 @@ def _get_compiled_gather_kernel(
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
             stream=stream,
-            # The Rubin wrapper accepts trailing runtime Int64 c_stride_m /
-            # c_sf_n_tile_offset for the locality-domain strided write; the Blackwell
-            # wrapper does not, so only pass them for Rubin. Traced with
-            # cutlass.Int64(0) -- the Int64 wrapping is what makes them runtime
-            # arguments; a bare Python 0 would trace as a constexpr and be baked
-            # in, silently ignoring the per-partition values at the call site.
+            # Rubin strides must be runtime Int64s, not Python constexprs.
             **(
                 {
                     "c_stride_m": cutlass.Int64(0),
@@ -472,11 +465,6 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     vectorized_f32: bool = True,
     raster_along_m: bool = False,
     sm_count: Optional[int] = None,
-    # locality-domain half-GEMM (Rubin only): domain_id >= 0 makes this partition write
-    # its N-half (this die's slice of the intermediate dimension) into the
-    # caller-provided shared full-width `out` at a column offset, using a
-    # full-width row stride -- two dies fill one buffer with no copy-back and no
-    # reduction. domain_id < 0 -> normal contiguous output.
     domain_id: int = -1,
     # Rubin-specific parameters (optional; when set, use SM107 kernel)
     mma_tiler: Optional[Tuple[int, int, int]] = None,
@@ -826,22 +814,13 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     max_active_clusters = get_max_active_clusters(
         cluster_shape_mn[0] * cluster_shape_mn[1]
     )
-    # get_max_active_clusters() is queried on the FULL device. When this launch is
-    # confined to a green-context partition (sm_count < total_sm), the persistent
-    # grid must be scaled to the node-local SM fraction or it oversizes and spills
-    # into an extra wave (the penalty grows with tile count). Mirrors TRT-LLM's
-    # node_local_max_active_clusters: max_active_full * node_sm // total_sm.
+    # Scale full-device occupancy to the green context's SM allocation.
     max_active_clusters_full = max_active_clusters
     if sm_count < total_sm:
         max_active_clusters = max(1, max_active_clusters * sm_count // total_sm)
 
-    # locality-domain half-GEMM (Rubin only). Two dies each compute half of the N
-    # (intermediate) dimension and write into ONE caller-provided full-width
-    # out/out_scale: c_stride_m makes each die stride by the full row width while
-    # filling only its half, c_byte_offset moves this die to its column start, and
-    # c_sf_n_tile_offset does the same for the tiled SF buffer -- whose layout is
-    # indexed by subtile, so a byte offset would not work there. No copy-back and
-    # no reduction: the split is exact.
+    # Use the full output row stride and this domain's column offset.
+    # Scale-factor offsets count 64-column tiles, not bytes.
     if localized_half_gemm:
         c_stride_m_val = cutlass.Int64(out.shape[1] * 2)
         c_sf_n_tile_offset_val = cutlass.Int64(domain_id * intermediate_size // 64)
@@ -1018,9 +997,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         k,
         num_experts,
         stream=stream,
-        # Rubin-only trailing runtime Int64s (both 0 outside locality-domain mode, which the
-        # kernel reads as "natural contiguous output"). Must match the set traced
-        # at the compile site above.
+        # Match the runtime stride arguments traced by the Rubin wrapper.
         **(
             {
                 "c_stride_m": c_stride_m_val,
