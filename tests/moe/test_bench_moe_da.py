@@ -7,7 +7,9 @@ import math
 import os
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -15,6 +17,85 @@ import torch
 
 from benchmarks.bench_moe_da import _time_graphs_counterbalanced
 from flashinfer.utils import get_compute_capability
+
+
+def test_trtllm_fp8_logits_rejected_before_allocation(monkeypatch) -> None:
+    from benchmarks import bench_moe_da as bench
+
+    monkeypatch.setattr(
+        bench, "_canonical_inputs", lambda *_: pytest.fail("allocated unsupported mode")
+    )
+    with pytest.raises(ValueError, match="requires routed inputs"):
+        bench._prepare_precision("fp8_per_tensor", None, "trtllm", "logits")
+
+
+@pytest.mark.parametrize("failure", ["acquire", "diagnostic", "policy", "flush"])
+def test_benchmark_releases_graph_resources_on_setup_failure(monkeypatch, failure):
+    from benchmarks import bench_moe_da as bench
+
+    events = []
+    graphs = [
+        SimpleNamespace(reset=lambda: events.append("reset_noda")),
+        SimpleNamespace(reset=lambda: events.append("reset_da")),
+    ]
+    captures = iter(graphs)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("injected failure")
+
+    monkeypatch.setattr(
+        bench,
+        "_prepare_precision",
+        lambda *_: SimpleNamespace(stage=lambda *_: None, invoke=lambda: None),
+    )
+    monkeypatch.setattr(bench, "_realization", lambda *_: (None, None))
+    monkeypatch.setattr(bench, "_capture", lambda *_: next(captures))
+    monkeypatch.setattr(bench, "autotune", lambda *a, **kw: nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    monkeypatch.setattr(torch.cuda.nvtx, "range", lambda *_: nullcontext())
+    monkeypatch.setattr(
+        bench,
+        "da_moe_acquire_graph_leases",
+        fail
+        if failure == "acquire"
+        else lambda *_: (
+            SimpleNamespace(release=lambda: events.append("release_lease")),
+        ),
+    )
+    monkeypatch.setattr(
+        bench,
+        "_matching_diagnostic",
+        fail
+        if failure == "diagnostic"
+        else lambda *_: {"policy": "invalid" if failure == "policy" else "da_switch"},
+    )
+    monkeypatch.setattr(bench, "_cold_l2_buffers", fail)
+    monkeypatch.setattr(
+        bench, "da_moe_release_resources", lambda: events.append("release_resources")
+    )
+    with pytest.raises(RuntimeError):
+        bench._benchmark_precision(
+            "nvfp4", SimpleNamespace(num_tokens=5), ("uniform",), None, False, 0, 2
+        )
+    assert events == ["reset_noda", "reset_da"] + (
+        [] if failure == "acquire" else ["release_lease"]
+    ) + ["release_resources"]
+
+
+@pytest.mark.parametrize(
+    "mode,backends",
+    [("logits", ("prims-ts-nvfp4",)), ("routed", None), ("routed", ("cutedsl",))],
+)
+def test_deepseek_rejects_unconsumed_distribution_sweeps(mode, backends) -> None:
+    from benchmarks.bench_moe_deepseek import run_benchmark
+
+    with pytest.raises(ValueError, match="Distribution sweeps require"):
+        run_benchmark(
+            token_counts=[5],
+            routing_input_mode=mode,
+            backends=backends,
+            distributions=("uniform", "ddist:4"),
+        )
 
 
 class _FakeGraph:

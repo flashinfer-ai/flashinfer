@@ -50,11 +50,13 @@ class BalancedEPWorkload:
     are cross-checked against that geometry. The default two-times multiplier
     was selected empirically from PrimsTS DA MoE measurements across EP sizes;
     callers can request exact balanced occupancy with a multiplier of one.
+    Remainder assignments go to the first ranks so small token batches remain
+    valid when their assignment count is not divisible by the EP size.
     """
 
     ep_size: int | None = None
     ep_rank: int | None = None
-    require_equal: bool = True
+    require_equal: bool = False
     assignment_multiplier: int = 2
 
     def __post_init__(self) -> None:
@@ -82,7 +84,7 @@ class BalancedEPWorkload:
         num_local_experts: int,
         local_expert_offset: int = 0,
     ) -> int:
-        """Return this rank's synthetic work, capped at the input capacity."""
+        """Return this rank's synthetic work, capped at its distinct local capacity."""
         _validate_capacity_and_top_k(capacity_tokens, top_k)
         if num_experts <= 0 or num_local_experts <= 0:
             raise ValueError("global and local expert counts must be positive")
@@ -136,7 +138,9 @@ class BalancedEPWorkload:
                     "balanced work has a remainder"
                 )
             balanced += int(ep_rank < remainder)
-        return min(capacity_tokens * top_k, balanced * self.assignment_multiplier)
+        # Each token can select a local expert only once, even in an oversampled profile.
+        local_capacity = capacity_tokens * min(top_k, num_local_experts)
+        return min(local_capacity, balanced * self.assignment_multiplier)
 
 
 MoeWorkload: TypeAlias = FullWorkload | BalancedEPWorkload

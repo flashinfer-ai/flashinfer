@@ -138,18 +138,66 @@ def test_unaligned_remainder_requires_explicit_ep_rank() -> None:
     )
 
 
-def test_balanced_workload_requires_equal_division_by_default() -> None:
+def test_balanced_workload_distributes_remainder_by_default() -> None:
     with pytest.raises(ValueError, match="must be divisible"):
-        BalancedEPWorkload(assignment_multiplier=1).local_assignments(3, 2, 4, 1)
+        BalancedEPWorkload(
+            require_equal=True, assignment_multiplier=1
+        ).local_assignments(3, 2, 4, 1)
 
     targets = [
-        BalancedEPWorkload(
-            require_equal=False, assignment_multiplier=1
-        ).local_assignments(3, 2, 4, 1, rank)
+        BalancedEPWorkload(assignment_multiplier=1).local_assignments(3, 2, 4, 1, rank)
         for rank in range(4)
     ]
     assert targets == [2, 2, 1, 1]
     assert sum(targets) == 6
+
+
+def test_default_profiling_workload_fits_small_expert_shards() -> None:
+    counts = []
+    for rank in range(4):
+        key = RoutingRealizationKey(
+            device=torch.device("cpu"),
+            num_tokens=3,
+            distribution="uniform",
+            sample_index=0,
+            local_expert_offset=rank,
+            num_experts=4,
+            num_local_experts=1,
+            top_k=2,
+            routing_rule_fingerprint="test",
+            routed_scaling_factor=1.0,
+            num_local_assignments_hint=get_workload().local_assignments(
+                3, 2, 4, 1, rank
+            ),
+        )
+        ids = RoutingRealizationFactory().get_or_create(key).expert_ids
+        counts.append(int((ids == rank).sum()))
+        assert all(len(set(row)) == 2 for row in ids.tolist())
+    assert counts == [3, 3, 2, 2]
+
+
+@pytest.mark.parametrize("distribution", ["uniform", "ddist:4"])
+def test_replay_realizations_distribute_small_batch_remainder(distribution) -> None:
+    counts = []
+    for rank in range(8):
+        key = RoutingRealizationKey(
+            device=torch.device("cpu"),
+            num_tokens=5,
+            distribution=distribution,
+            sample_index=0,
+            local_expert_offset=rank * 32,
+            num_experts=256,
+            num_local_experts=32,
+            top_k=6,
+            routing_rule_fingerprint="test",
+            routed_scaling_factor=1.0,
+        )
+        realized = RoutingRealizationFactory().get_or_create(key)
+        ids = realized.expert_ids
+        counts.append(int(((ids >= rank * 32) & (ids < (rank + 1) * 32)).sum()))
+        assert all(len(set(row)) == 6 for row in ids.tolist())
+    assert counts == [4, 4, 4, 4, 4, 4, 3, 3]
+    assert sum(counts) == 30
 
 
 @pytest.mark.parametrize("num_local_assignments_hint", [None, 0, 4])
@@ -225,15 +273,16 @@ def test_da_runtime_falls_back_when_topk_exceeds_local_shard() -> None:
 
 @pytest.mark.parametrize("backend", ["prims_ts", "trtllm"])
 @pytest.mark.parametrize(
-    "workload,expected",
+    "workload,num_tokens,top_k,expected",
     [
-        (BalancedEPWorkload(), 64),
-        (BalancedEPWorkload(assignment_multiplier=1), 32),
-        (FullWorkload(), 256),
+        (BalancedEPWorkload(), 32, 8, 64),
+        (BalancedEPWorkload(assignment_multiplier=1), 32, 8, 32),
+        (FullWorkload(), 32, 8, 256),
+        (BalancedEPWorkload(), 5, 6, 8),
     ],
 )
 def test_da_runtime_derives_assignment_hint_from_context(
-    monkeypatch, backend, workload, expected
+    monkeypatch, backend, workload, num_tokens, top_k, expected
 ):
     """The shared runtime resolves workload metadata before partitioning its plan cache."""
     from flashinfer.fused_moe import da_runtime
@@ -249,7 +298,7 @@ def test_da_runtime_derives_assignment_hint_from_context(
 
     monkeypatch.setattr(da_runtime, "make_da_moe_operation_key", capture_key)
     inputs: list[Any] = [None] * len(MoeRunnerInputs._FIELDS)
-    inputs[MoeRunnerInputs.idx("hidden_states")] = torch.empty(32, 8)
+    inputs[MoeRunnerInputs.idx("hidden_states")] = torch.empty(num_tokens, 8)
     with moe_workload(workload), pytest.raises(KeyReached):
         run_dist_aware_tactic(
             backend=backend,
@@ -268,7 +317,7 @@ def test_da_runtime_derives_assignment_hint_from_context(
             num_experts=256,
             local_expert_offset=96,
             num_local_experts=32,
-            top_k=8,
+            top_k=top_k,
             routing_method_type=0,
             routed_scaling_factor=1.0,
             run_fixed_tactic=lambda tactic: pytest.fail("unexpected fallback"),

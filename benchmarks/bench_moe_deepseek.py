@@ -1092,6 +1092,7 @@ def run_benchmark(
         profile_backend: Backend to run when profile_cuda is enabled.
         distributions: Runtime routing profiles. Tuning uses the complete list
             configured by ``FLASHINFER_DA_DISTRIBUTIONS``.
+            Synthetic profile sweeps require routed TRTLLM/PrimsTS backends.
 
     Returns:
         List of BenchResult objects
@@ -1099,6 +1100,18 @@ def run_benchmark(
     if tp_config < 1 or BASE_INTERMEDIATE_SIZE % tp_config != 0:
         raise ValueError(
             f"tp_config must be a positive divisor of {BASE_INTERMEDIATE_SIZE}"
+        )
+
+    # Only routed TRTLLM/PrimsTS calls consume synthetic distribution profiles.
+    # Other backends retain their native DeepSeek logits and cannot label them as ddist rows.
+    if tuple(distributions) != ("uniform",) and (
+        routing_input_mode != "routed"
+        or not backends
+        or not set(backends) <= {"trtllm-nvfp4", "trtllm-bf16", "prims-ts-nvfp4"}
+    ):
+        raise ValueError(
+            "Distribution sweeps require --routing-input-mode routed and explicit "
+            "--backends from trtllm-nvfp4,trtllm-bf16,prims-ts-nvfp4"
         )
 
     if CFG.num_experts % ep_config != 0:
@@ -1652,13 +1665,17 @@ def main():
         type=str,
         help=(
             "Comma-separated subset of cutedsl,cutlass,trtllm-nvfp4,"
-            "trtllm-bf16,prims-ts-nvfp4 (default: all)"
+            "trtllm-bf16,prims-ts-nvfp4 "
+            "(default: cutedsl,cutlass,trtllm-nvfp4,trtllm-bf16)"
         ),
     )
     parser.add_argument(
         "--distributions",
         type=str,
-        help="Comma-separated DA tuner distributions",
+        help=(
+            "Comma-separated runtime distributions; sweeps require routed inputs "
+            "and explicit TRTLLM/PrimsTS backends"
+        ),
     )
     parser.add_argument(
         "--routing-input-mode",
