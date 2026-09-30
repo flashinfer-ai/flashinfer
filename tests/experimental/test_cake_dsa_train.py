@@ -335,7 +335,7 @@ def test_offset_gather_kv_indices_matches_loop():
                 if 0 <= v < seq_k[d]:
                     expected[row, j] = v + int(cu_k[d])
             row += 1
-    # causal=False: plain offsetting (the causal term has its own tests in the W-B/C block)
+    # causal=False: plain offsetting (the causal term has its own tests in the packed / strided layout block)
     got = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
     assert got.dtype == torch.int32
     assert torch.equal(got, expected)
@@ -1948,7 +1948,7 @@ def test_autograd_lse_gradient_is_rejected_and_unused_out_gives_no_grad():
     )
 
 
-# --- CAKE-756 W-B/C ---
+# --- Packed / strided trainer layouts and causal varlen offsetting (flashinfer-ai/flashinfer#5675) ---
 # Packed / strided trainer layouts and the causal tail-of-prefix varlen rule (flashinfer-ai/flashinfer#5675).  The
 # kernels take the head / token strides of the query operands and the key row stride from the tensors (TMA descriptors
 # encoded from the view; k_rope as storage alias + element offset + row stride), so a view changes descriptor fields
@@ -2333,8 +2333,8 @@ def test_varlen_packed_glm_structure_small():
     _check_backward(grads_v, ref)
 
 
-# --- end W-B/C ---
-# --- CAKE-756 W-D ---
+# --- end of the packed / strided layout block ---
+# --- Packed fp32 dK/dV accumulation and destination mapping (flashinfer-ai/flashinfer#5675) ---
 # Packed FP32 dK/dV accumulation into a caller-provided buffer with an optional destination-row map (issue #5675).
 # Comparisons across two backward calls use a tolerance: their FP32 reductions run in another order.
 ACC_REL_L2 = 1e-4
@@ -2729,4 +2729,4 @@ def test_autograd_function_with_dkv_acc_returns_no_kv_grads_and_accumulates():
     torch.cuda.synchronize()
     assert leaves[2].grad is None and leaves[3].grad is None
     assert rel_l2(acc_p[perm.long()], nat) < ACC_REL_L2
-# --- end W-D ---
+# --- end of the packed fp32 dK/dV block ---
