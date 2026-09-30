@@ -56,6 +56,8 @@ The eager entry points (:func:`forward`, :func:`backward`, the autograd
 :class:`BindingCache`): a later call whose inputs have the same
 ``(data_ptr, shape, stride, dtype)`` and scale slots the current tensors and
 freshly allocated outputs into the remembered argument plans and launches.
+A call without query rows (``T == 0``) returns empty outputs and zero
+gradients from the eager entry points without binding or launching anything.
 """
 
 from __future__ import annotations
@@ -417,11 +419,17 @@ def validate_dsa_train_inputs(
     topk_length: Optional[torch.Tensor] = None,
     *,
     dout: Optional[torch.Tensor] = None,
+    allow_empty_queries: bool = False,
 ) -> tuple[int, int, int]:
     """Shape / dtype validation shared by the entry points.
 
     Returns ``(T, S, topk)``.  Device placement is checked separately so this
-    runs on host tensors.
+    runs on host tensors.  Zero key rows (``S == 0``) are rejected: the
+    kernels index at least one key row and the FP32 dK/dV accumulators would
+    be empty.  Zero query rows (``T == 0``) are rejected unless
+    ``allow_empty_queries``: the launch grids clamp to one CTA that would read
+    a query row that does not exist, so only the eager entry points, which
+    return empty outputs for ``T == 0`` without launching, accept it.
     """
     _check_head_tensor(q_latent, "q_latent", D_LATENT)
     _check_head_tensor(q_rope, "q_rope", D_ROPE)
@@ -433,6 +441,13 @@ def validate_dsa_train_inputs(
         raise ValueError("q_latent and q_rope must have the same number of rows")
     if int(k_rope.shape[0]) != num_kv:
         raise ValueError("kv_latent and k_rope must have the same number of rows")
+    if num_kv == 0:
+        raise ValueError("kv_latent and k_rope must hold at least one key row (S > 0)")
+    if num_queries == 0 and not allow_empty_queries:
+        raise ValueError(
+            "q_latent holds no query rows (T == 0): a prepared runner needs at least one "
+            "query row; the eager entry points return empty outputs for T == 0"
+        )
     if (
         indices.ndim != 2
         or indices.dtype != torch.int32
@@ -1715,6 +1730,67 @@ BINDING_CACHE = BindingCache(enabled=os.environ.get(BINDING_CACHE_ENV, "1") != "
 # ---------------------------------------------------------------------------
 
 
+def _no_query_rows(q_latent: torch.Tensor) -> bool:
+    return q_latent.ndim >= 1 and int(q_latent.shape[0]) == 0
+
+
+def _empty_forward(
+    q_latent, q_rope, kv_latent, k_rope, indices, topk_length
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``(out, lse, o_lo)`` of a call without query rows: validated, empty, neither bound nor launched."""
+    validate_dsa_train_inputs(
+        q_latent,
+        q_rope,
+        kv_latent,
+        k_rope,
+        indices,
+        topk_length,
+        allow_empty_queries=True,
+    )
+    out = torch.empty(
+        (0, NUM_HEADS, D_LATENT), dtype=torch.bfloat16, device=q_latent.device
+    )
+    lse = torch.empty((0, NUM_HEADS), dtype=torch.float32, device=q_latent.device)
+    return out, lse, torch.empty_like(out)
+
+
+def _empty_backward(
+    q_latent,
+    q_rope,
+    kv_latent,
+    k_rope,
+    indices,
+    out,
+    o_lo,
+    lse,
+    dout,
+    topk_length,
+    dkv_fp32: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Gradients of a call without query rows: empty ``dq``, zero ``dkv`` in the requested dtype; nothing launched."""
+    validate_dsa_train_inputs(
+        q_latent,
+        q_rope,
+        kv_latent,
+        k_rope,
+        indices,
+        topk_length,
+        dout=dout,
+        allow_empty_queries=True,
+    )
+    _check_output(out, "out", (0, NUM_HEADS, D_LATENT), torch.bfloat16)
+    _check_output(o_lo, "o_lo", (0, NUM_HEADS, D_LATENT), torch.bfloat16)
+    _check_output(lse, "lse", (0, NUM_HEADS), torch.float32)
+    device, num_kv = q_latent.device, int(kv_latent.shape[0])
+    dtype = torch.float32 if dkv_fp32 else torch.bfloat16
+    return (
+        torch.empty((0, NUM_HEADS, D_LATENT), dtype=torch.bfloat16, device=device),
+        torch.empty((0, NUM_HEADS, D_ROPE), dtype=torch.bfloat16, device=device),
+        torch.zeros((num_kv, D_LATENT), dtype=dtype, device=device),
+        torch.zeros((num_kv, D_ROPE), dtype=dtype, device=device),
+    )
+
+
 def forward(
     q_latent: torch.Tensor,
     q_rope: torch.Tensor,
@@ -1729,8 +1805,11 @@ def forward(
 
     The first call for an input binding validates and binds through
     :func:`prepare_dsa_train`; later calls with the same binding take the
-    remembered launch (:data:`BINDING_CACHE`).
+    remembered launch (:data:`BINDING_CACHE`).  A call without query rows
+    returns empty outputs without binding or launching.
     """
+    if _no_query_rows(q_latent):
+        return _empty_forward(q_latent, q_rope, kv_latent, k_rope, indices, topk_length)
     scale = (
         float(softmax_scale) if softmax_scale is not None else default_softmax_scale()
     )
@@ -1783,13 +1862,29 @@ def backward(
     ``dkv_fp32=True`` the dK/dV gradients are natural-layout FP32 tensors
     (fresh per call, never the kernels' internal accumulators).  ``key_passes``
     overrides the key-range-pass policy of the main stage (``None`` = the
-    registered policy; see :func:`plan_key_passes`).
+    registered policy; see :func:`plan_key_passes`).  A call without query
+    rows returns empty ``dq`` and zero ``dkv`` gradients without binding or
+    launching.
     """
     if o_lo is None:
         raise NotImplementedError(
             "the forward produced no output residual (placeholder program); backward is unavailable"
         )
     dout = dout.contiguous()
+    if _no_query_rows(q_latent):
+        return _empty_backward(
+            q_latent,
+            q_rope,
+            kv_latent,
+            k_rope,
+            indices,
+            out,
+            o_lo,
+            lse,
+            dout,
+            topk_length,
+            dkv_fp32,
+        )
     scale = (
         float(softmax_scale) if softmax_scale is not None else default_softmax_scale()
     )

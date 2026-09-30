@@ -420,12 +420,112 @@ def test_validate_accepts_packed_views():
             ),
             r"\[T, 64, 512\]",
         ),
+        (
+            lambda q, kv, idx: (
+                q[..., :D_LATENT],
+                q[..., D_LATENT:],
+                kv[:0, :D_LATENT],
+                kv[:0, D_LATENT:],
+                idx,
+            ),
+            r"S > 0",
+        ),
+        (
+            lambda q, kv, idx: (
+                q[:0, :, :D_LATENT],
+                q[:0, :, D_LATENT:],
+                kv[:, :D_LATENT],
+                kv[:, D_LATENT:],
+                idx[:0],
+            ),
+            r"T == 0",
+        ),
     ],
 )
 def test_validate_rejects(mutate, match):
     q, kv, idx = _host_inputs()
     with pytest.raises(ValueError, match=match):
         validate_dsa_train_inputs(*mutate(q, kv, idx))
+
+
+def test_validate_zero_length_inputs():
+    """``S == 0`` is always rejected; ``T == 0`` only where a launch would follow (the runner path)."""
+    q, kv, idx = _host_inputs(total_q=0)
+    ql, qr, kl, kr = (
+        q[..., :D_LATENT],
+        q[..., D_LATENT:],
+        kv[:, :D_LATENT],
+        kv[:, D_LATENT:],
+    )
+    with pytest.raises(ValueError, match="T == 0"):
+        validate_dsa_train_inputs(ql, qr, kl, kr, idx)
+    assert validate_dsa_train_inputs(ql, qr, kl, kr, idx, allow_empty_queries=True) == (
+        0,
+        16,
+        5,
+    )
+    with pytest.raises(ValueError, match="S > 0"):
+        validate_dsa_train_inputs(ql, qr, kl[:0], kr[:0], idx, allow_empty_queries=True)
+    # the prepared runner (explicit path) names the condition before anything is allocated or bound
+    with pytest.raises(ValueError, match="T == 0"):
+        prepare_dsa_train(ql, qr, kl, kr, idx, backward=False)
+
+
+def test_zero_query_rows_return_empty_outputs_without_binding(monkeypatch):
+    """``T == 0``: the eager entry points and the autograd path return empty outputs and zero
+    gradients without consulting the registry, loading a module, binding or launching."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("a call without query rows must neither bind nor launch")
+
+    monkeypatch.setattr(cake_backend, "prepare_dsa_train", refuse)
+    monkeypatch.setattr(cake_backend, "load_cake_dsa_train_module", refuse)
+    monkeypatch.setattr(cake_backend, "record_for", refuse)
+    q, kv, idx = _host_inputs(total_q=0, total_k=16, topk=5)
+    ql, qr, kl, kr = (
+        q[..., :D_LATENT],
+        q[..., D_LATENT:],
+        kv[:, :D_LATENT],
+        kv[:, D_LATENT:],
+    )
+    cache = cake_backend.BINDING_CACHE
+    hits, misses = cache.hits, cache.misses
+    out, lse, o_lo = cake_backend.forward(ql, qr, kl, kr, idx)
+    assert tuple(out.shape) == (0, NUM_HEADS, D_LATENT) and out.dtype == torch.bfloat16
+    assert tuple(lse.shape) == (0, NUM_HEADS) and lse.dtype == torch.float32
+    assert tuple(o_lo.shape) == tuple(out.shape) and o_lo.dtype == torch.bfloat16
+    dout = torch.zeros(0, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
+    grads = cake_backend.backward(ql, qr, kl, kr, idx, out, o_lo, lse, dout)
+    assert [tuple(g.shape) for g in grads] == [
+        (0, NUM_HEADS, D_LATENT),
+        (0, NUM_HEADS, D_ROPE),
+        (16, D_LATENT),
+        (16, D_ROPE),
+    ]
+    assert all(g.dtype == torch.bfloat16 for g in grads)
+    assert torch.all(grads[2] == 0) and torch.all(grads[3] == 0)
+    f32 = cake_backend.backward(
+        ql, qr, kl, kr, idx, out, o_lo, lse, dout, dkv_fp32=True
+    )
+    assert f32[2].dtype == f32[3].dtype == torch.float32
+    assert tuple(f32[2].shape) == (16, D_LATENT) and torch.all(f32[2] == 0)
+    # the shape / dtype checks still apply to an empty call
+    with pytest.raises(ValueError, match="int32"):
+        cake_backend.forward(ql, qr, kl, kr, idx.long())
+    with pytest.raises(ValueError, match="S > 0"):
+        cake_backend.forward(ql, qr, kl[:0], kr[:0], idx)
+    with pytest.raises(ValueError, match="lse"):
+        cake_backend.backward(ql, qr, kl, kr, idx, out, o_lo, lse[:, :8], dout)
+    # the autograd path
+    leaves = [t.detach().clone().requires_grad_() for t in (ql, qr, kl, kr)]
+    with _quiet_experimental():
+        out_pub, lse_pub = dsa_sparse_attention(*leaves, idx, return_lse=True)
+    assert tuple(out_pub.shape) == (0, NUM_HEADS, D_LATENT)
+    assert tuple(lse_pub.shape) == (0, NUM_HEADS)
+    g = torch.autograd.grad(out_pub, leaves, dout)
+    assert [tuple(t.shape) for t in g] == [tuple(leaf.shape) for leaf in leaves]
+    assert torch.all(g[2] == 0) and torch.all(g[3] == 0)
+    assert (cache.hits, cache.misses) == (hits, misses)  # never consulted
 
 
 def test_pointer_alias_reports_the_storage_base_of_views_inside_a_storage():
