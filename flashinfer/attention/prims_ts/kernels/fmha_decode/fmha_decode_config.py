@@ -640,7 +640,8 @@ class FmhaDecodeConfig:
     # ------------------------------------------------------------------
     # Problem shape
     # ------------------------------------------------------------------
-    # Per-head embedding dimension D. Supported profiles use 64, 128, or 256.
+    # Per-head embedding dimension D. Generic profiles use 64, 128, 192, or 256;
+    # dense paged FP8-Q/NVFP4-KV additionally supports staged H512.
     headdim: int = 128
     # Number of KV tiles in the launch (= ceil(seq_len_kv / tile_size_kv)).
     # Populated by the launcher once seq_len_kv is known.
@@ -4923,6 +4924,16 @@ def _validate_profile_support(
     cfg.validate_boolean_fields()
     cfg.validate_dtypes()
     _validate_mixed_kv_dtype_profile(cfg)
+    if headdim == 512 and not (
+        cfg.q_dtype == Float8E4M3FN
+        and cfg.use_nvfp4_kv
+        and cfg.use_paged_kv
+        and not cfg.use_block_sparse
+    ):
+        raise ValueError(
+            "PrimTS head_dim=512 is currently supported only for dense paged "
+            "FP8-E4M3 Q with NVFP4 K/V"
+        )
     if cfg.o_stages != cfg.num_insts_kv:
         raise ValueError("fmha_decode requires o_stages == num_insts_kv")
     _validate_kv256_static_config(cfg)
