@@ -295,6 +295,11 @@ class MnnvlMemory:  # type: ignore[no-redef]
         if MnnvlMemory._fabric_supported is not None:
             return MnnvlMemory._fabric_supported
 
+        # Local peers can share POSIX handles without access to an IMEX channel.
+        if len(set(comm.allgather(socket.gethostname()))) == 1:
+            MnnvlMemory._fabric_supported = False
+            return False
+
         local_supported = MnnvlMemory._probe_fabric_supported(dev_id)
         agreed = all_ranks_agree(comm, local_supported)
 
@@ -679,8 +684,13 @@ class HandleExchanger:
 def make_handle_exchanger(
     comm: CommBackend, rank: int, size: int, dev_id: int
 ) -> HandleExchanger:
-    """Pick FABRIC vs POSIX-fd handles based on the device's fabric support."""
-    if is_mnnvl_fabric_supported(dev_id):
+    """Use POSIX fds locally; FABRIC handles are needed across hosts."""
+    single_node = len(set(comm.allgather(socket.gethostname()))) == 1
+    if not single_node:
+        if not all_ranks_agree(comm, is_mnnvl_fabric_supported(dev_id)):
+            raise RuntimeError(
+                "Multi-node memory sharing requires FABRIC support on every rank."
+            )
         handle_type = cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
     else:
         handle_type = (

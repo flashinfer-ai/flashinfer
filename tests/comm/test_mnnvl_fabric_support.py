@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 
@@ -52,3 +52,41 @@ def test_is_mnnvl_fabric_supported(fabric_uuid, state, supported, expected):
         else:
             init.assert_not_called()
             shutdown.assert_not_called()
+
+
+@pytest.mark.parametrize("hosts", [["host-a", "host-a"], ["host-a", "host-b"]])
+def test_handle_exchanger_uses_posix_for_local_peers(hosts):
+    comm = Mock()
+    comm.allgather.side_effect = [hosts, [True, True]]
+    with patch.object(mnnvl, "is_mnnvl_fabric_supported", return_value=True) as probe:
+        exchanger = mnnvl.make_handle_exchanger(comm, 0, 2, 0)
+    types = mnnvl.cuda.CUmemAllocationHandleType
+    if len(set(hosts)) == 1:
+        assert exchanger.handle_type == types.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        probe.assert_not_called()
+    else:
+        assert exchanger.handle_type == types.CU_MEM_HANDLE_TYPE_FABRIC
+        probe.assert_called_once_with(0)
+
+
+def test_handle_exchanger_rejects_mixed_multinode_fabric_support():
+    comm = Mock()
+    comm.allgather.side_effect = [["host-a", "host-b"], [True, False]]
+    with (
+        patch.object(mnnvl, "is_mnnvl_fabric_supported", return_value=True),
+        pytest.raises(RuntimeError, match="FABRIC support on every rank"),
+    ):
+        mnnvl.make_handle_exchanger(comm, 0, 2, 0)
+
+
+def test_mnnvl_memory_uses_posix_for_local_peers(monkeypatch):
+    monkeypatch.setattr(mnnvl.MnnvlMemory, "_fabric_supported", None)
+    comm = Mock()
+    comm.allgather.return_value = ["host-a", "host-a"]
+    with patch.object(mnnvl.MnnvlMemory, "_probe_fabric_supported") as probe:
+        assert not mnnvl.MnnvlMemory._resolve_fabric_support(comm, 0)
+        prop = mnnvl.MnnvlMemory.get_allocation_prop(0)
+        assert prop.requestedHandleTypes == (
+            mnnvl.cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+        )
+        probe.assert_not_called()
