@@ -2334,3 +2334,399 @@ def test_varlen_packed_glm_structure_small():
 
 
 # --- end W-B/C ---
+# --- CAKE-756 W-D ---
+# Packed FP32 dK/dV accumulation into a caller-provided buffer with an optional destination-row map (issue #5675).
+# Comparisons across two backward calls use a tolerance: their FP32 reductions run in another order.
+ACC_REL_L2 = 1e-4
+
+
+def _acc_plan_record(with_accumulate: bool) -> dict:
+    """A fake record whose bwd_cast plan does (not) declare the packed-accumulate operands."""
+    plan = [
+        ["buffer", "src_latent"],
+        ["buffer", "src_rope"],
+        ["buffer", "dst_latent"],
+        ["buffer", "dst_rope"],
+        ["buffer", "dst_latent_f32"],
+        ["buffer", "dst_rope_f32"],
+        ["parameter", "latent_groups"],
+        ["parameter", "rope_groups"],
+        ["parameter", "out_f32"],
+    ]
+    if with_accumulate:
+        plan += [
+            ["buffer", "dst_packed"],
+            ["parameter", "dst_row_stride"],
+            ["buffer", "dst_map"],
+            ["parameter", "has_dst_map"],
+            ["parameter", "accumulate"],
+        ]
+    plan += [["grid", "grid_x"], ["grid", "grid_y"], ["grid", "grid_z"]]
+    return {
+        "arch": "sm_100a",
+        "abi": ABI_CONTRACT,
+        "stages": ["fwd", "bwd_delta", "bwd_main", "bwd_cast"],
+        "dkv_acc_layout": "permuted",
+        "bwd_cast": {
+            "module": "fake",
+            "sources": [],
+            "compile_flags": [],
+            "ffi_entry": "run",
+            "arg_plan": plan,
+            "closure_sha256": "0" * 64,
+            "tma_workspace_bytes": 0,
+        },
+        "closure_sha256": "0" * 64,
+    }
+
+
+def _cast_operand_tensors(S: int) -> dict:
+    return dict(
+        q_latent=torch.zeros(2, NUM_HEADS, D_LATENT, dtype=torch.bfloat16),
+        q_rope=torch.zeros(2, NUM_HEADS, D_ROPE, dtype=torch.bfloat16),
+        kv_latent=torch.zeros(S, D_LATENT, dtype=torch.bfloat16),
+        k_rope=torch.zeros(S, D_ROPE, dtype=torch.bfloat16),
+        indices=torch.zeros(2, 4, dtype=torch.int32),
+        delta=torch.zeros(2, NUM_HEADS),
+        dkv_latent_acc=torch.zeros(S, D_LATENT),
+        dk_rope_acc=torch.zeros(S, D_ROPE),
+        dkv_latent=torch.empty(0, dtype=torch.bfloat16),
+        dk_rope=torch.empty(0, dtype=torch.bfloat16),
+        dkv_latent_fp32=torch.zeros(S, D_LATENT),
+        dk_rope_fp32=torch.zeros(S, D_ROPE),
+    )
+
+
+def test_record_cast_accumulates_reads_the_plan():
+    assert cake_backend.record_cast_accumulates(_acc_plan_record(True))
+    assert not cake_backend.record_cast_accumulates(_acc_plan_record(False))
+    assert not cake_backend.record_cast_accumulates({"arch": "sm_100a", "stages": ["fwd"]})
+    assert set(cake_backend.CAST_ACCUMULATE_OPERANDS) <= set(cake_backend.CONTRACT_ALIASES) | set(
+        cake_backend.CONTRACT_SCALARS
+    )
+    for name in cake_jit.MODULES:
+        assert isinstance(cake_backend.record_cast_accumulates(cake_jit.MODULES[name]), bool)
+
+
+def test_check_dkv_acc_accepts_the_contract_layouts():
+    S = 16
+    acc576 = torch.zeros(S, D_QK)
+    operand, stride = cake_backend._check_dkv_acc(acc576, None, S)
+    assert operand is acc576 and stride == D_QK
+    acc704 = torch.zeros(S + 4, 704)  # a frozen 128-channel indexer key stored alongside the 576 channels
+    operand, stride = cake_backend._check_dkv_acc(acc704, None, S)
+    assert operand is acc704 and stride == 704
+    view = acc704[:, :D_QK]  # the 576 columns as a strided view: a flat alias from its first element
+    operand, stride = cake_backend._check_dkv_acc(view, None, S)
+    assert stride == 704 and operand.is_contiguous() and operand.dim() == 1
+    assert operand.data_ptr() == view.data_ptr() and operand.numel() == (S + 4 - 1) * 704 + D_QK
+    dst_map = torch.zeros(S, dtype=torch.int32)
+    operand, stride = cake_backend._check_dkv_acc(torch.zeros(3, D_QK), dst_map, S)  # fewer rows than S with a map
+    assert stride == D_QK
+
+
+@pytest.mark.parametrize(
+    "acc, dst_map, match",
+    [
+        (lambda: torch.zeros(16, D_QK, dtype=torch.bfloat16), None, "float32"),
+        (lambda: torch.zeros(16 * D_QK), None, "2-D"),
+        (lambda: torch.zeros(16, D_LATENT), None, ">= 576"),
+        (lambda: torch.zeros(D_QK, 16).t(), None, r"stride\(1\)"),
+        (lambda: torch.zeros(16, 578), None, "multiple of 4"),
+        (lambda: torch.zeros(16, 580)[:, 1:], None, "16-byte"),
+        (lambda: torch.zeros(8, D_QK), None, "at least S"),
+        (lambda: torch.zeros(16, D_QK), torch.zeros(16, dtype=torch.int64), "int32"),
+        (lambda: torch.zeros(16, D_QK), torch.zeros(15, dtype=torch.int32), r"int32 \[S\]"),
+        (lambda: torch.zeros(16, D_QK), torch.zeros(32, dtype=torch.int32)[::2], "contiguous"),
+    ],
+)
+def test_check_dkv_acc_rejects(acc, dst_map, match):
+    with pytest.raises(ValueError, match=match):
+        cake_backend._check_dkv_acc(acc(), dst_map, 16)
+
+
+def test_backward_binding_key_covers_dkv_acc_and_map():
+    T, S = 4, 8
+    q = torch.zeros(T, NUM_HEADS, D_QK, dtype=torch.bfloat16)
+    kv = torch.zeros(S, D_QK, dtype=torch.bfloat16)
+    idx = torch.zeros(T, 5, dtype=torch.int32)
+    out = torch.zeros(T, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
+    lse = torch.zeros(T, NUM_HEADS)
+    args = (
+        q[..., :D_LATENT],
+        q[..., D_LATENT:],
+        kv[:, :D_LATENT],
+        kv[:, D_LATENT:],
+        idx,
+        out,
+        out,
+        lse,
+        out,
+        None,
+        1.0,
+        False,
+    )
+    plain = backward_binding_key(*args)
+    acc = torch.zeros(S, 704)
+    with_acc = backward_binding_key(*args, dkv_acc=acc)
+    assert plain != with_acc and with_acc == backward_binding_key(*args, dkv_acc=acc)
+    assert with_acc != backward_binding_key(*args, dkv_acc=acc[:, :D_QK])  # another row layout of the same storage
+    dst_map = torch.zeros(S, dtype=torch.int32)
+    assert with_acc != backward_binding_key(*args, dkv_acc=acc, dkv_dst_map=dst_map)
+
+
+def test_bind_stage_serves_the_accumulating_cast_plan(monkeypatch):
+    """The packed-accumulate operands bind from ``dkv_acc`` / ``dkv_dst_map`` (aliases ``dst_packed`` / ``dst_map``) and
+    the three scalars; without them the host binds inert placeholders of the right dtypes, as the production launcher does."""
+    monkeypatch.setitem(cake_jit.MODULES, "cake_dsa_h64_train_fake_acc", _acc_plan_record(True))
+    monkeypatch.setattr(
+        cake_backend,
+        "load_cake_dsa_train_module",
+        lambda name, stage: SimpleNamespace(run=lambda *a: None),
+    )
+    S = 8
+    t = _cast_operand_tensors(S)
+    acc = torch.zeros(S, 704)
+    dst_map = torch.arange(S, dtype=torch.int32)
+    t["dkv_acc"], t["dkv_dst_map"] = acc, dst_map
+    scalars = dict(
+        num_queries=2,
+        num_kv=S,
+        topk=4,
+        softmax_scale=1.0,
+        has_topk_length=0,
+        out_f32=0,
+        dst_row_stride=704,
+        has_dst_map=1,
+        accumulate=1,
+    )
+    values = cake_backend._contract_values(t, scalars)
+    launch = bind_stage("cake_dsa_h64_train_fake_acc", "bwd_cast", values, (3, 1, 1))
+    assert launch.arguments[9] is acc and launch.arguments[10] == 704
+    assert launch.arguments[11] is dst_map and launch.arguments[12:14] == (1, 1)
+    assert {key for _, key in launch.slots} >= {"dkv_acc", "dkv_dst_map"}
+    t.pop("dkv_acc")
+    t.pop("dkv_dst_map")
+    inert = cake_backend._contract_values(
+        t, dict(scalars, dst_row_stride=0, has_dst_map=0, accumulate=0)
+    )
+    launch = bind_stage("cake_dsa_h64_train_fake_acc", "bwd_cast", inert, (3, 1, 1))
+    assert launch.arguments[9] is t["dkv_latent_acc"] and launch.arguments[11] is t["indices"]
+    assert launch.arguments[10] == 0 and launch.arguments[12:14] == (0, 0)
+    # a remembered binding re-supplies both per call (placeholders when the call accumulates nothing)
+    rebound = launch.templated().arguments_for(
+        cake_backend._inert_cast_values(dict(t, indices_storage=t["indices"]))
+    )
+    assert rebound[9] is t["dkv_latent_acc"] and rebound[11] is t["indices"]
+    # the old plan (no accumulate operands) still binds from the same values
+    monkeypatch.setitem(cake_jit.MODULES, "cake_dsa_h64_train_fake_old", _acc_plan_record(False))
+    old = bind_stage("cake_dsa_h64_train_fake_old", "bwd_cast", values, (3, 1, 1))
+    assert len(old.arguments) == 12 and old.arguments[0] is t["dkv_latent_acc"]
+
+
+def test_backward_rejects_dkv_acc_with_dkv_fp32_and_a_map_without_acc():
+    q, kv, idx = _host_inputs()
+    out = torch.zeros(8, NUM_HEADS, D_LATENT, dtype=torch.bfloat16)
+    lse = torch.zeros(8, NUM_HEADS)
+    args = (
+        q[..., :D_LATENT],
+        q[..., D_LATENT:],
+        kv[:, :D_LATENT],
+        kv[:, D_LATENT:],
+        idx,
+        out,
+        out,
+        lse,
+        out,
+    )
+    with pytest.raises(ValueError, match="dkv_fp32"):
+        cake_backend.backward(*args, dkv_fp32=True, dkv_acc=torch.zeros(16, D_QK))
+    with pytest.raises(ValueError, match="dkv_dst_map"):
+        cake_backend.backward(*args, dkv_dst_map=torch.zeros(16, dtype=torch.int32))
+
+
+def _require_accumulating_cast():
+    _, record = record_for(torch.device("cuda"))
+    if not cake_backend.record_cast_accumulates(record):
+        pytest.skip(
+            "the registered program's bwd_cast predates the packed-accumulate operands (re-export needed)"
+        )
+
+
+def _forward_and_natural_dkv(inp):
+    """Forward outputs, the explicit backward's dq and the natural FP32 dK/dV as one packed ``[S, 576]`` reference."""
+    out, lse, o_lo = cake_backend.forward(
+        inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global
+    )
+    args = (
+        inp.q_latent,
+        inp.q_rope,
+        inp.kv_latent,
+        inp.k_rope,
+        inp.idx_global,
+        out,
+        o_lo,
+        lse,
+        inp.dout,
+    )
+    dq_l, dq_r, nat_l, nat_r = cake_backend.backward(*args, dkv_fp32=True)
+    torch.cuda.synchronize()
+    return args, dq_l, dq_r, torch.cat([nat_l, nat_r], dim=1)
+
+
+def test_backward_dkv_acc_identity_accumulates_in_place():
+    """``dkv_acc`` without a map: ``+= dkv`` into a pre-filled ``[S, 704]`` buffer (twice over two calls), columns 576:
+    untouched, no dK/dV outputs, dq unchanged; the strided 576-column view of the buffer is accepted as well."""
+    _require_program(backward=True)
+    _require_accumulating_cast()
+    inp = make_inputs([256], [512], seed=SEED + 20, topk=128)
+    args, dq_l, dq_r, nat = _forward_and_natural_dkv(inp)
+    S = inp.total_k
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    pre = torch.randn(S, 704, device="cuda", generator=gen)
+    acc = pre.clone()
+    aq_l, aq_r, none_l, none_r = cake_backend.backward(*args, dkv_acc=acc)
+    torch.cuda.synchronize()
+    assert none_l is None and none_r is None
+    assert torch.equal(aq_l, dq_l) and torch.equal(aq_r, dq_r)
+    torch.testing.assert_close(acc[:, :D_QK], pre[:, :D_QK] + nat, rtol=1e-4, atol=1e-4)
+    assert torch.equal(acc[:, D_QK:], pre[:, D_QK:])
+    cake_backend.backward(*args, dkv_acc=acc[:, :D_QK])  # second call, through the strided view: keeps adding
+    torch.cuda.synchronize()
+    torch.testing.assert_close(acc[:, :D_QK], pre[:, :D_QK] + 2 * nat, rtol=1e-4, atol=1e-4)
+    assert torch.equal(acc[:, D_QK:], pre[:, D_QK:])
+
+
+def test_bwd_cast_accumulate_without_map_is_one_fp32_add_bitwise():
+    """From the SAME permuted accumulators (a prepared runner's), the accumulating cast without a map equals
+    ``previous + natural`` bitwise: one FP32 add per element on both sides."""
+    _require_program(backward=True)
+    _require_accumulating_cast()
+    inp = make_inputs([128], [256], seed=SEED + 21, topk=64)
+    runner = prepare_dsa_train(
+        inp.q_latent,
+        inp.q_rope,
+        inp.kv_latent,
+        inp.k_rope,
+        inp.idx_global,
+        dout=inp.dout,
+        backward=True,
+        dkv_fp32=True,
+    )
+    runner.forward()
+    _, _, nat_l, nat_r = runner.backward()
+    torch.cuda.synchronize()
+    S = inp.total_k
+    pre = torch.randn(S, 704, device="cuda", generator=torch.Generator(device="cuda").manual_seed(2))
+    acc = pre.clone()
+    t = dict(runner.tensors, dkv_acc=acc)
+    scalars = dict(
+        num_queries=runner.num_queries,
+        num_kv=S,
+        topk=runner.topk,
+        softmax_scale=runner.softmax_scale,
+        has_topk_length=int(runner.has_topk_length),
+        out_f32=0,
+        dst_row_stride=704,
+        has_dst_map=0,
+        accumulate=1,
+    )
+    values = cake_backend._contract_values(t, scalars, key_passes=runner.key_passes)
+    physical = record_for(torch.device("cuda"))[1]["bwd_cast"]
+    grid = grid_dims(
+        physical["grid"], scalars, torch.cuda.get_device_properties(0).multi_processor_count
+    )
+    launch = bind_stage(runner.module_name, "bwd_cast", values, grid)
+    with cake_backend._ffi_stream_context(runner.device_index):
+        launch()
+    torch.cuda.synchronize()
+    assert torch.equal(acc[:, :D_LATENT], pre[:, :D_LATENT] + nat_l)
+    assert torch.equal(acc[:, D_LATENT:D_QK], pre[:, D_LATENT:D_QK] + nat_r)
+    assert torch.equal(acc[:, D_QK:], pre[:, D_QK:])
+
+
+def test_backward_dkv_acc_destination_map_with_duplicates_matches_index_add():
+    """A many-to-few map (512 source rows into 300 destination rows) sums like ``index_add_`` of the natural dK/dV;
+    unmapped destination rows stay zero; a permutation lands every source row on its own destination row."""
+    _require_program(backward=True)
+    _require_accumulating_cast()
+    inp = make_inputs([256], [512], seed=SEED + 22, topk=128)
+    args, _, _, nat = _forward_and_natural_dkv(inp)
+    S, S_dst = inp.total_k, 300
+    gen = torch.Generator(device="cuda").manual_seed(3)
+    dst_map = torch.randint(0, S_dst, (S,), device="cuda", generator=gen).to(torch.int32)
+    acc = torch.zeros(S_dst, 704, device="cuda")
+    _, _, none_l, none_r = cake_backend.backward(*args, dkv_acc=acc, dkv_dst_map=dst_map)
+    torch.cuda.synchronize()
+    assert none_l is None and none_r is None
+    expect = torch.zeros(S_dst, D_QK, device="cuda").index_add_(0, dst_map.to(torch.int64), nat)
+    assert rel_l2(acc[:, :D_QK], expect) < ACC_REL_L2
+    assert torch.all(acc[:, D_QK:] == 0)
+    untouched = torch.ones(S_dst, dtype=torch.bool, device="cuda")
+    untouched[dst_map.long()] = False
+    assert untouched.any() and torch.all(acc[untouched] == 0)
+    perm = torch.randperm(S, device="cuda", generator=gen).to(torch.int32)
+    acc_p = torch.zeros(S, D_QK, device="cuda")
+    cake_backend.backward(*args, dkv_acc=acc_p, dkv_dst_map=perm)
+    torch.cuda.synchronize()
+    assert rel_l2(acc_p[perm.long()], nat) < ACC_REL_L2
+
+
+def test_binding_cache_serves_dkv_acc_bindings_per_buffer():
+    """A remembered dkv_acc binding re-supplies the caller's buffer and map per call; another buffer layout binds anew."""
+    _require_program(backward=True)
+    _require_accumulating_cast()
+    inp = make_inputs([128], [256], seed=SEED + 24, topk=64)
+    args, _, _, nat = _forward_and_natural_dkv(inp)
+    S = inp.total_k
+    cache = cake_backend.BINDING_CACHE
+    if not cache.enabled:
+        pytest.skip("binding cache disabled")
+    acc = torch.zeros(S, D_QK, device="cuda")
+    dst_map = torch.arange(S, device="cuda", dtype=torch.int32)
+    key = backward_binding_key(*args, None, default_softmax_scale(), False, None, acc, dst_map)
+    cake_backend.backward(*args, dkv_acc=acc, dkv_dst_map=dst_map)
+    binding = cache.peek(key)
+    assert binding is not None and binding.accumulate_dkv and binding.holds_no_tensor()
+    hits = cache.hits
+    cake_backend.backward(*args, dkv_acc=acc, dkv_dst_map=dst_map)  # same binding: a hit, adds again
+    torch.cuda.synchronize()
+    assert cache.hits == hits + 1
+    assert rel_l2(acc, 2 * nat) < ACC_REL_L2
+    acc2 = torch.zeros(S + 2, 704, device="cuda")  # another layout: another binding (miss), row stride 704 baked
+    cake_backend.backward(*args, dkv_acc=acc2)
+    torch.cuda.synchronize()
+    assert cache.hits == hits + 1
+    assert rel_l2(acc2[:S, :D_QK], nat) < ACC_REL_L2 and torch.all(acc2[S:] == 0) and torch.all(acc2[:, D_QK:] == 0)
+
+
+def test_autograd_function_with_dkv_acc_returns_no_kv_grads_and_accumulates():
+    _require_program(backward=True)
+    _require_accumulating_cast()
+    inp = make_inputs([128], [256], seed=SEED + 23, topk=64)
+    args, dq_l, dq_r, nat = _forward_and_natural_dkv(inp)
+    leaves = [
+        t.detach().clone().requires_grad_()
+        for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    ]
+    S = inp.total_k
+    acc = torch.zeros(S, D_QK, device="cuda")
+    out, lse = cake_backend.DSASparseAttentionFunction.apply(
+        *leaves, inp.idx_global, None, default_softmax_scale(), None, acc, None
+    )
+    out.backward(inp.dout)
+    torch.cuda.synchronize()
+    assert leaves[0].grad is not None and leaves[1].grad is not None
+    assert leaves[2].grad is None and leaves[3].grad is None
+    assert torch.equal(leaves[0].grad, dq_l) and torch.equal(leaves[1].grad, dq_r)
+    assert rel_l2(acc, nat) < ACC_REL_L2
+    perm = torch.randperm(S, device="cuda", generator=torch.Generator(device="cuda").manual_seed(5)).to(torch.int32)
+    acc_p = torch.zeros(S, D_QK, device="cuda")
+    out2, _ = cake_backend.DSASparseAttentionFunction.apply(
+        *leaves, inp.idx_global, None, default_softmax_scale(), None, acc_p, perm
+    )
+    out2.backward(inp.dout)
+    torch.cuda.synchronize()
+    assert leaves[2].grad is None and leaves[3].grad is None
+    assert rel_l2(acc_p[perm.long()], nat) < ACC_REL_L2
+# --- end W-D ---
