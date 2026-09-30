@@ -14,8 +14,17 @@ if str(REPO_ROOT) not in sys.path:
 
 
 @pytest.fixture(autouse=True)
-def _isolate_child_pytest_addopts(monkeypatch: pytest.MonkeyPatch) -> None:
-    # Nightly package tests export PYTEST_ADDOPTS="--full", but the child pytest
-    # processes spawned here run isolated suites that do not load the FlashInfer
-    # plugin registering ``--full``. Tests needing specific options set them.
-    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+def _nightly_pytest_addopts(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Nightly package tests export PYTEST_ADDOPTS="--full", but the isolated
+    # child pytest processes spawned here do not load the FlashInfer plugin
+    # that registers ``--full``. Always simulate it so a child that inherits
+    # the variable fails in every CI run instead of only in nightly.
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--full")
+
+
+@pytest.fixture
+def isolated_pytest_addopts(
+    _nightly_pytest_addopts: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clear PYTEST_ADDOPTS for tests whose runner spawns pytest in-process."""
+    monkeypatch.delenv("PYTEST_ADDOPTS")

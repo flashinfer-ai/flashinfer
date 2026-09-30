@@ -315,6 +315,7 @@ def _run(
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
+    env.pop("PYTEST_ADDOPTS", None)
     env.update(env_override or {})
     return subprocess.run(
         [
@@ -454,6 +455,7 @@ def test_run_streams_current_pytest_node_before_it_finishes(tmp_path: Path) -> N
     )
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
+    env.pop("PYTEST_ADDOPTS", None)
     process = subprocess.Popen(
         [
             sys.executable,
@@ -502,6 +504,7 @@ def test_run_streams_current_pytest_node_before_it_finishes(tmp_path: Path) -> N
     assert saw_running_node, "".join(captured)
 
 
+@pytest.mark.usefixtures("isolated_pytest_addopts")
 def test_slow_collection_reports_a_live_heartbeat(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -521,6 +524,7 @@ def test_slow_collection_reports_a_live_heartbeat(
     assert f"test_path={suite}" in output
 
 
+@pytest.mark.usefixtures("isolated_pytest_addopts")
 def test_collection_isolates_sm90_pull_multirank_modules(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
@@ -579,6 +583,7 @@ def test_sm90():
     assert [node["order"] for node in isolated_nodes] == [0]
 
 
+@pytest.mark.usefixtures("isolated_pytest_addopts")
 def test_collection_isolates_sm120_swapab_multirank_modules(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
@@ -641,6 +646,7 @@ def test_pytest_root_is_stable_for_repository_and_external_scopes(
     assert runner._pytest_root(REPO_ROOT, test_file) == suite.resolve()
 
 
+@pytest.mark.usefixtures("isolated_pytest_addopts")
 def test_collection_preserves_external_pytest_config(tmp_path: Path) -> None:
     suite = tmp_path / "suite"
     suite.mkdir()
@@ -1102,11 +1108,10 @@ def test_collection_deadline_reports_that_pytest_was_killed(tmp_path: Path) -> N
 
 def test_plan_run_and_completed_reuse_publish_resumable_artifacts(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Pytest 9 may otherwise inherit the repository root for this external
     # temporary suite, which used to leak pytest-of-*/... prefixes into node IDs.
-    monkeypatch.setenv("PYTEST_ADDOPTS", f"--rootdir={REPO_ROOT}")
+    rootdir = {"PYTEST_ADDOPTS": f"--rootdir={REPO_ROOT}"}
     suite = tmp_path / "suite"
     suite.mkdir()
     (suite / "conftest.py").write_text(
@@ -1130,7 +1135,7 @@ def test_fails():
         encoding="utf-8",
     )
 
-    planned = _run(tmp_path, "plan", suite)
+    planned = _run(tmp_path, "plan", suite, env_override=rootdir)
     assert planned.returncode == 0, planned.stdout + planned.stderr
     manifest_path = tmp_path / "junit" / "manifest.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -1145,6 +1150,7 @@ def test_fails():
         "60",
         "--timeout-grace-seconds",
         "0",
+        env_override=rootdir,
     )
     assert executed.returncode == 1, executed.stdout + executed.stderr
     failure_detail_at = executed.stdout.index("FAILED TEST NODES")
@@ -1198,7 +1204,7 @@ def test_fails():
         "0",
         "--deadline-seconds",
         "1",
-        env_override={"SLOW_COLLECTION": "1"},
+        env_override={**rootdir, "SLOW_COLLECTION": "1"},
     )
     assert repeated.returncode == 1
     assert "Using plan" in repeated.stdout
@@ -1934,6 +1940,7 @@ def test_missing_test_path_fails_closed(tmp_path: Path) -> None:
         runner._validate_selection(selection)
 
 
+@pytest.mark.usefixtures("isolated_pytest_addopts")
 def test_collect_nodes_unions_multiple_directories(tmp_path: Path) -> None:
     first = tmp_path / "a"
     second = tmp_path / "b"
