@@ -47,7 +47,8 @@ PagedKVScaleFactors = tuple[torch.Tensor, torch.Tensor]
 if TYPE_CHECKING:
     from .kernels.fmha_decode.fmha_decode_config import FmhaDecodeConfig
 
-_SUPPORTED_HEAD_DIMS = (64, 128, 192, 256, 512)
+_GENERIC_HEAD_DIMS = (64, 128, 192, 256)
+_SUPPORTED_HEAD_DIMS = (*_GENERIC_HEAD_DIMS, 512)
 _SUPPORTED_PAGE_SIZES = (4, 8, 16, 32, 64, 128)
 _MAX_INT32 = 2**31 - 1
 # Decode K/V masks form an exclusive tile endpoint as
@@ -401,6 +402,27 @@ def _validate_head_dim(head_dim: int) -> int:
             f"{_SUPPORTED_HEAD_DIMS}, got {head_dim}"
         )
     return head_dim
+
+
+def _validate_h512_decode_route(
+    head_dim: int,
+    q_dtype_key: str,
+    k_dtype_key: str,
+    v_dtype_key: str,
+    *,
+    use_q_token_kv_block_sparse_route: bool,
+) -> None:
+    """Restrict H512 to the mixed-precision route qualified by this backend."""
+
+    if head_dim == 512 and not (
+        q_dtype_key == "float8_e4m3fn"
+        and k_dtype_key == v_dtype_key == "float4_e2m1fn"
+        and not use_q_token_kv_block_sparse_route
+    ):
+        raise ValueError(
+            "PrimTS head_dim=512 is currently supported only for dense paged "
+            "FP8-E4M3 Q with NVFP4 K/V"
+        )
 
 
 def _validate_seq_len_q(seq_len_q: int) -> int:
@@ -1263,6 +1285,13 @@ def _resolve_decode_launch_spec(
     storage_page_size = _validate_storage_page_size(
         page_size,
         page_size if storage_page_size is None else storage_page_size,
+    )
+    _validate_h512_decode_route(
+        head_dim,
+        q_dtype_key,
+        k_dtype_key,
+        v_dtype_key,
+        use_q_token_kv_block_sparse_route=use_q_token_kv_block_sparse_route,
     )
 
     from .kernels.fmha_decode.fmha_decode_config import (
@@ -2663,6 +2692,8 @@ class PrimsTSBatchDecodePlan:
     _cache: _NativePagedKVCache
     _k_sf_cache: torch.Tensor
     _v_sf_cache: torch.Tensor
+    _k_sf_page_stride: int
+    _v_sf_page_stride: int
     _seq_lens_kv: torch.Tensor
     _qo_indptr: Optional[torch.Tensor]
     _block_table: torch.Tensor
@@ -2803,6 +2834,8 @@ class PrimsTSBatchDecodePlan:
             self._cache.v_page_stride,
             self._cache.v_head_stride,
             self._cache.v_token_stride,
+            self._k_sf_page_stride,
+            self._v_sf_page_stride,
             softmax_scale,
             output_scale,
             self._requested_splits,
@@ -3150,7 +3183,7 @@ def _resolve_q_token_kv_block_sparse_decode_config(
     )
     if not (
         page_size in _SUPPORTED_PAGE_SIZES
-        and head_dim in _SUPPORTED_HEAD_DIMS
+        and head_dim in _GENERIC_HEAD_DIMS
         and q_token_kv_block_sparse_dtype_supported
         and mask_type == "causal"
         and window_left < 0
@@ -3699,7 +3732,12 @@ def _prepare_prims_ts_batch_decode_plan(
         v_cache.dtype,
         out_dtype,
     )
-    k_sf_cache, v_sf_cache, _, _ = _normalize_paged_kv_scale_factors(
+    (
+        k_sf_cache,
+        v_sf_cache,
+        k_sf_page_stride,
+        v_sf_page_stride,
+    ) = _normalize_paged_kv_scale_factors(
         kv_scale_factors,
         k_cache=k_cache,
         logical_head_dim=head_dim,
@@ -3849,6 +3887,8 @@ def _prepare_prims_ts_batch_decode_plan(
         _cache=normalized_cache,
         _k_sf_cache=k_sf_cache,
         _v_sf_cache=v_sf_cache,
+        _k_sf_page_stride=k_sf_page_stride,
+        _v_sf_page_stride=v_sf_page_stride,
         _seq_lens_kv=seq_lens_kv,
         _qo_indptr=(
             qo_indptr
