@@ -1474,6 +1474,9 @@ class MoEMicroKernel:
                         weight_expert_idx = weight_expert_ids[local_expert_idx]
                     valid_rows = Int32(1)
                     # Unrouted pair: compute expert 0 with a zero routing weight.
+                    # Assumes its FC2 output is finite: 0.0 * inf/NaN would poison
+                    # the token row. Skipping unrouted pairs' tiles (follow-up)
+                    # drops this.
                     if weight_expert_idx < Int32(0):
                         route_masked = Int32(1)
                         weight_expert_idx = Int32(0)

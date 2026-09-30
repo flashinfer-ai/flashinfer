@@ -767,6 +767,8 @@ class MoEDirectMicroKernel:
             eid = Int32(topk_ids[eid_addr])
             router_w = topk_weights[eid_addr]
             # Unrouted pair: read expert 0 with a zero routing weight.
+            # Assumes fc2(expert 0) is finite: 0.0 * inf/NaN would poison the
+            # token row. Skipping unrouted pairs' tiles (follow-up) drops this.
             if eid < Int32(0):
                 eid = Int32(0)
                 router_w = Float32(0.0)
