@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
-"""Cold-L2 CUPTI benchmark for the prepared SM100 BGMV MoE backend."""
+"""Cold-L2 CUPTI benchmark for the prepared Cake SM90/SM100/SM103 BGMV MoE backend."""
 
 import argparse
 import json
@@ -160,7 +160,7 @@ def _run_shape(hidden_size: int, num_tokens: int, repeat_time_ms: int):
             lora_stride_b,
         )
 
-    plan = prepare_bgmv_moe(*inputs, backend="blackwell")
+    plan = prepare_bgmv_moe(*inputs, backend="cake")
     candidate_output = plan.run()
     baseline()
     torch.cuda.synchronize()
@@ -191,8 +191,14 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--repeat-time-ms", type=int, default=1000)
     args = parser.parse_args()
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        raise RuntimeError("this benchmark requires an exact SM100 CUDA device")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (9, 0),
+        (10, 0),
+        (10, 3),
+    ):
+        raise RuntimeError(
+            "this benchmark requires an exact SM90, SM100 or SM103 CUDA device"
+        )
 
     rows = [
         _run_shape(hidden_size, num_tokens, args.repeat_time_ms)

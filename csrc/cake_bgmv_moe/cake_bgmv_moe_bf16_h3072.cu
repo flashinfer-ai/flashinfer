@@ -15,7 +15,7 @@
  */
 // Generated source for FlashInfer.
 // Bundle: Blackwell BGMV MoE shrink and deterministic expand portfolio.
-// Target: sm_100a; compile flags: none.
+// Target: sm_90a, sm_100a, sm_103a (cp.async, shuffles, FMA only); compile flags: none.
 // Generated file; do not edit manually.
 typedef signed char int8_t;
 typedef unsigned char uint8_t;
@@ -62,7 +62,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16_h2688_r32_p4_s3(
+__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16_h3072_r32_p4_s3(
     uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
     uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices, int num_pairs,
@@ -120,18 +120,18 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
     for (int pp_1 = 0; pp_1 < 4; pp_1++) {
       if (valid[pp_1] != 0) {
-        if (k_base < 2688) {
+        if (k_base < 3072) {
           asm volatile(
               "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                   x_smem_addr + (unsigned int)((tile % 3 * 4 * 1024 + pp_1 * 1024 + tid * 8) * 2)),
               "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                  (tokens[pp_1] * 2688 + (long long)k_base)));
+                  (tokens[pp_1] * 3072 + (long long)k_base)));
 #pragma unroll
           for (int rr = 0; rr < 8; rr++) {
             int rank_row = rank_base + rr;
             long long weight_index = ((loras[pp_1] * (long long)num_experts + experts[pp_1]) * 32 +
                                       (long long)rank_row) *
-                                         2688 +
+                                         3072 +
                                      (long long)k_base;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              w_smem_addr + (unsigned int)((tile % 3 * 4 * 8 * 1024 +
@@ -164,7 +164,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
     for (int pp_2 = 0; pp_2 < 4; pp_2++) {
       int x_thread_base = tile_1 % 3 * 4 * 1024 + pp_2 * 1024 + tid * 8;
       if (valid[pp_2] != 0) {
-        if (k_base_1 < 2688) {
+        if (k_base_1 < 3072) {
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[0])),
                          "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[(0) + 1])),
@@ -189,7 +189,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
       for (int rr_1 = 0; rr_1 < 8; rr_1++) {
         float partial = 0.0f;
         if (valid[pp_2] != 0) {
-          if (k_base_1 < 2688) {
+          if (k_base_1 < 3072) {
             int w_thread_base = tile_1 % 3 * 4 * 8 * 1024 + pp_2 * 8 * 1024 + rr_1 * 1024 + tid * 8;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                          : "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[0])),
@@ -244,20 +244,20 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
       for (int pp_3 = 0; pp_3 < 4; pp_3++) {
         if (valid[pp_3] != 0) {
-          if (refill_k < 2688) {
+          if (refill_k < 3072) {
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              x_smem_addr + (unsigned int)(((tile_1 + ((1) ? 3 : 3)) % 3 * 4 * 1024 +
                                                            pp_3 * 1024 + tid * 8) *
                                                           2)),
                          "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                             (tokens[pp_3] * 2688 + (long long)refill_k)));
+                             (tokens[pp_3] * 3072 + (long long)refill_k)));
 #pragma unroll
             for (int rr_2 = 0; rr_2 < 8; rr_2++) {
               int rank_row_1 = rank_base + rr_2;
               long long weight_index_1 =
                   ((loras[pp_3] * (long long)num_experts + experts[pp_3]) * 32 +
                    (long long)rank_row_1) *
-                      2688 +
+                      3072 +
                   (long long)refill_k;
               asm volatile(
                   "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
@@ -321,7 +321,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16_h2688_r32_p1_s2(
+__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16_h3072_r32_p1_s2(
     uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
     uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices, int num_pairs,
@@ -379,18 +379,18 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
     for (int pp_1 = 0; pp_1 < 1; pp_1++) {
       if (valid[pp_1] != 0) {
-        if (k_base < 2688) {
+        if (k_base < 3072) {
           asm volatile(
               "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                   x_smem_addr + (unsigned int)((tile % 2 * 1024 + pp_1 * 1024 + tid * 8) * 2)),
               "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                  (tokens[pp_1] * 2688 + (long long)k_base)));
+                  (tokens[pp_1] * 3072 + (long long)k_base)));
 #pragma unroll
           for (int rr = 0; rr < 8; rr++) {
             int rank_row = rank_base + rr;
             long long weight_index = ((loras[pp_1] * (long long)num_experts + experts[pp_1]) * 32 +
                                       (long long)rank_row) *
-                                         2688 +
+                                         3072 +
                                      (long long)k_base;
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              w_smem_addr + (unsigned int)((tile % 2 * 8 * 1024 + pp_1 * 8 * 1024 +
@@ -423,7 +423,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
     for (int pp_2 = 0; pp_2 < 1; pp_2++) {
       int x_thread_base = tile_1 % 2 * 1024 + pp_2 * 1024 + tid * 8;
       if (valid[pp_2] != 0) {
-        if (k_base_1 < 2688) {
+        if (k_base_1 < 3072) {
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[0])),
                          "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[(0) + 1])),
@@ -448,7 +448,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
       for (int rr_1 = 0; rr_1 < 8; rr_1++) {
         float partial = 0.0f;
         if (valid[pp_2] != 0) {
-          if (k_base_1 < 2688) {
+          if (k_base_1 < 3072) {
             int w_thread_base = tile_1 % 2 * 8 * 1024 + pp_2 * 8 * 1024 + rr_1 * 1024 + tid * 8;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                          : "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[0])),
@@ -503,20 +503,20 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 #pragma unroll
       for (int pp_3 = 0; pp_3 < 1; pp_3++) {
         if (valid[pp_3] != 0) {
-          if (refill_k < 2688) {
+          if (refill_k < 3072) {
             asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                              x_smem_addr + (unsigned int)(((tile_1 + ((1) ? 2 : 3)) % 2 * 1024 +
                                                            pp_3 * 1024 + tid * 8) *
                                                           2)),
                          "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                             (tokens[pp_3] * 2688 + (long long)refill_k)));
+                             (tokens[pp_3] * 3072 + (long long)refill_k)));
 #pragma unroll
             for (int rr_2 = 0; rr_2 < 8; rr_2++) {
               int rank_row_1 = rank_base + rr_2;
               long long weight_index_1 =
                   ((loras[pp_3] * (long long)num_experts + experts[pp_3]) * 32 +
                    (long long)rank_row_1) *
-                      2688 +
+                      3072 +
                   (long long)refill_k;
               asm volatile(
                   "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
@@ -574,7 +574,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
 
 extern "C" {
 
-__global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token_t64_bf16_h2688_r32(
+__global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token_t64_bf16_h3072_r32(
     float* __restrict__ y_accum, uint16_t* __restrict__ shrink_raw,
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
@@ -627,7 +627,7 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
         asm volatile("cp.async.commit_group;");
         asm volatile("cp.async.wait_group 0;");
         __syncthreads();
-        if (output_col < 2688) {
+        if (output_col < 3072) {
           float total = 0.0f;
 #pragma unroll
           for (int route = 0; route < 2; route++) {
@@ -657,7 +657,7 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
                 }
               }
               long long weight_index =
-                  ((lora_id * (long long)num_experts + expert) * 2688 + (long long)output_col) *
+                  ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col) *
                       32 +
                   (long long)rank_col;
               float _vec_load_0[8];
@@ -696,7 +696,7 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
                                      (token * output_stride + output_offset + output_col)) +
             (0)) = total;
         }
-      } else if (output_col < 2688) {
+      } else if (output_col < 3072) {
         float total_1 = 0.0f;
 #pragma unroll 1
         for (int pair_1 = 0; pair_1 < num_pairs; pair_1++) {
@@ -730,7 +730,7 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
                 }
               }
               long long weight_index_1 =
-                  ((lora_id * (long long)num_experts + expert_1) * 2688 + (long long)output_col) *
+                  ((lora_id * (long long)num_experts + expert_1) * 3072 + (long long)output_col) *
                       32 +
                   (long long)rank_col_1;
               float _vec_load_2[8];
@@ -769,7 +769,7 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
         *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
           (0)) = total_1;
       }
-    } else if (output_col < 2688) {
+    } else if (output_col < 3072) {
       *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
         (0)) = 0.0f;
     }
@@ -797,7 +797,7 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
 
 extern "C" {
 
-__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_bf16_h2688_r32(
+__global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_bf16_h3072_r32(
     float* __restrict__ y_accum, uint16_t* __restrict__ shrink_raw,
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
@@ -824,7 +824,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
   unsigned int activation_carriers[4];
   float activation_values[8];
   if (token < num_tokens) {
-    if (output_col < 2688) {
+    if (output_col < 3072) {
       long long lora_id = lora_indices[token];
       if (lora_id >= 0) {
         int pair_base = token * 2;
@@ -880,7 +880,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
                 }
               }
               long long weight_index =
-                  ((lora_id * (long long)num_experts + expert) * 2688 + (long long)output_col) *
+                  ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col) *
                       32 +
                   (long long)rank_col;
               float _vec_load_0[8];
@@ -948,7 +948,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
                   }
                 }
                 long long weight_index_1 =
-                    ((lora_id * (long long)num_experts + expert_1) * 2688 + (long long)output_col) *
+                    ((lora_id * (long long)num_experts + expert_1) * 3072 + (long long)output_col) *
                         32 +
                     (long long)rank_col_1;
                 float _vec_load_2[8];
@@ -1017,7 +1017,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
 extern "C" {
 
 __global__
-__launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_bf16_h2688_r32(
+__launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_bf16_h3072_r32(
     float* __restrict__ y_accum, uint16_t* __restrict__ shrink_raw,
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
@@ -1060,10 +1060,10 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
       }
       int valid0 = 0;
       int valid1 = 0;
-      if (output_col0 < 2688) {
+      if (output_col0 < 3072) {
         valid0 = 1;
       }
-      if (output_col1 < 2688) {
+      if (output_col1 < 3072) {
         valid1 = 1;
       }
       float total0 = 0.0f;
@@ -1111,7 +1111,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
             }
             if (valid0 != 0) {
               long long weight_index0 =
-                  ((lora_id * (long long)num_experts + expert) * 2688 + (long long)output_col0) *
+                  ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col0) *
                       32 +
                   (long long)rank_col;
               float _vec_load_0[8];
@@ -1145,7 +1145,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
             }
             if (valid1 != 0) {
               long long weight_index1 =
-                  ((lora_id * (long long)num_experts + expert) * 2688 + (long long)output_col1) *
+                  ((lora_id * (long long)num_experts + expert) * 3072 + (long long)output_col1) *
                       32 +
                   (long long)rank_col;
               float _vec_load_1[8];
@@ -1221,7 +1221,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
                 }
               }
               if (valid0 != 0) {
-                long long weight_index0_1 = ((lora_id * (long long)num_experts + expert_1) * 2688 +
+                long long weight_index0_1 = ((lora_id * (long long)num_experts + expert_1) * 3072 +
                                              (long long)output_col0) *
                                                 32 +
                                             (long long)rank_col_1;
@@ -1255,7 +1255,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
                 }
               }
               if (valid1 != 0) {
-                long long weight_index1_1 = ((lora_id * (long long)num_experts + expert_1) * 2688 +
+                long long weight_index1_1 = ((lora_id * (long long)num_experts + expert_1) * 3072 +
                                              (long long)output_col1) *
                                                 32 +
                                             (long long)rank_col_1;
@@ -1311,12 +1311,12 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
           (0)) = total1;
       }
     } else {
-      if (output_col0 < 2688) {
+      if (output_col0 < 3072) {
         *(reinterpret_cast<float*>(y_accum +
                                    (token * output_stride + output_offset + output_col0)) +
           (0)) = 0.0f;
       }
-      if (output_col1 < 2688) {
+      if (output_col1 < 3072) {
         *(reinterpret_cast<float*>(y_accum +
                                    (token * output_stride + output_offset + output_col1)) +
           (0)) = 0.0f;
