@@ -45,7 +45,7 @@ def _fold_scales(q, out_scale, softmax_scale, head_dim):
     """
     if softmax_scale is None:
         return q
-    default = head_dim ** -0.5
+    default = head_dim**-0.5
     if abs(softmax_scale - default) <= 1e-9 * max(1.0, abs(default)):
         return q
     return q * (softmax_scale / default)
@@ -67,7 +67,11 @@ def proxy_score_sm90(
     """MSA proxy score on Hopper. Writes ``per_head`` (Hq, max_k_tiles, total_q)."""
     total_q = q.shape[0]
     sq = total_q // batch_size if batch_size else 0
-    decode = max_seqlen_q <= 4 and batch_size * max_seqlen_q == total_q and sq == max_seqlen_q
+    decode = (
+        max_seqlen_q <= 4
+        and batch_size * max_seqlen_q == total_q
+        and sq == max_seqlen_q
+    )
 
     cu = cu_seqlens_q.to(torch.int32).contiguous()
     pt = page_table.to(torch.int32).contiguous()
@@ -93,7 +97,11 @@ def proxy_score_sm90(
         )
     from .cute_dsl.proxy_score_prefill_sm90 import run as _prefill
 
-    pfx = q_offset.to(torch.int32).contiguous() if q_offset is not None else _prefix_lens(cu, sk)
+    pfx = (
+        q_offset.to(torch.int32).contiguous()
+        if q_offset is not None
+        else _prefix_lens(cu, sk)
+    )
     _prefill(q, k, cu, pt, sk, pfx, per_head)
     return per_head
 
@@ -113,7 +121,9 @@ def topk_select_sm90(
     writes, so it needs no sequence-length arguments.
     """
     if topk != 16:
-        raise NotImplementedError(f"SM90 msa_topk_select supports topk=16 only, got {topk}")
+        raise NotImplementedError(
+            f"SM90 msa_topk_select supports topk=16 only, got {topk}"
+        )
     from .cute_dsl.topk_select_sm90 import run as _topk
 
     # Forced blocks and per-token validity are applied inside the kernel at the
@@ -230,7 +240,11 @@ def sparse_prefill_sm90(
     q = _fold_scales(q, v_global_scale, softmax_scale, q.shape[-1])
     cu = cu_seqlens_q.to(torch.int32).contiguous()
     sk = seqused_k.to(torch.int32).contiguous()
-    pfx = q_offset.to(torch.int32).contiguous() if q_offset is not None else _prefix_lens(cu, sk)
+    pfx = (
+        q_offset.to(torch.int32).contiguous()
+        if q_offset is not None
+        else _prefix_lens(cu, sk)
+    )
     _prefill(
         q,
         kv,

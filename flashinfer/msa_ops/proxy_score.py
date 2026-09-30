@@ -439,8 +439,15 @@ def msa_proxy_score(
         from ._sm90_dispatch import proxy_score_sm90
 
         proxy_score_sm90(
-            q, k, cu_seqlens_q, pt_dev, k_len_or_cu, per_head,
-            max_seqlen_q=max_seqlen_q, batch_size=batch_size, kv_fp8=kv_fp8,
+            q,
+            k,
+            cu_seqlens_q,
+            pt_dev,
+            k_len_or_cu,
+            per_head,
+            max_seqlen_q=max_seqlen_q,
+            batch_size=batch_size,
+            kv_fp8=kv_fp8,
             q_offset=q_offset if isinstance(q_offset, torch.Tensor) else None,
         )
         if not reduce_heads:

@@ -16,7 +16,7 @@ import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
 import cutlass.cute.nvgpu.cpasync as cpasync
-from cutlass.cute.nvgpu import warpgroup, OperandMajorMode
+from cutlass.cute.nvgpu import OperandMajorMode
 from cutlass.cute.runtime import from_dlpack
 
 
@@ -189,9 +189,20 @@ class MsaProxyScore:
     # ------------------------------------------------------------------
     @cute.jit
     def __call__(
-        self, stream, mQ, mK4, mO, mCuQ, mPT, mSeqK, mPfx,
-        total_q: cutlass.Int32, nkt: cutlass.Int32, batch_size: cutlass.Int32,
-        nkchunk: cutlass.Int32, n_mtiles: cutlass.Int32,
+        self,
+        stream,
+        mQ,
+        mK4,
+        mO,
+        mCuQ,
+        mPT,
+        mSeqK,
+        mPfx,
+        total_q: cutlass.Int32,
+        nkt: cutlass.Int32,
+        batch_size: cutlass.Int32,
+        nkchunk: cutlass.Int32,
+        n_mtiles: cutlass.Int32,
     ):
         # rebuild K as (page, d, num_pages) with STATIC tile modes (TMA needs it)
         npages = mK4.shape[0]
@@ -374,9 +385,7 @@ class MsaProxyScore:
                 cute.struct.MemRange[self.ab_dtype, cute.cosize(q_smem_layout)], 1024
             ]
             sK: cute.struct.Align[
-                cute.struct.MemRange[
-                    self.ab_dtype, cute.cosize(k_smem_layout_staged)
-                ],
+                cute.struct.MemRange[self.ab_dtype, cute.cosize(k_smem_layout_staged)],
                 1024,
             ]
             mbar: cute.struct.MemRange[cutlass.Int64, self.nstage * 2]
@@ -488,8 +497,7 @@ class MsaProxyScore:
                     )
                     thr_copy_q = tiled_copy_q.get_slice(tidx)
                     for s in cutlass.range_constexpr(self.nsub):
-                        q_off = ((qlo + m0 + 128 * s) * (self.hq * self.d)
-                                 + h * self.d)
+                        q_off = (qlo + m0 + 128 * s) * (self.hq * self.d) + h * self.d
                         gQ = cute.make_tensor(
                             (mQ.iterator + q_off).align(16),
                             cute.make_layout(
@@ -578,9 +586,24 @@ class MsaProxyScore:
                     rel_state.advance()
                     peek_next = kv_pipeline.consumer_try_wait(read_state)
                     mma_epilogue(
-                        acc0, tCcS, acc_mn_layout, n_rows, red_target, red_rank,
-                        s_max, own, rows, mO, o_row_base, 0, t0,
-                        m0 + pfx - k0, sk - k0 - 1, self.page, total_q, False,
+                        acc0,
+                        tCcS,
+                        acc_mn_layout,
+                        n_rows,
+                        red_target,
+                        red_rank,
+                        s_max,
+                        own,
+                        rows,
+                        mO,
+                        o_row_base,
+                        0,
+                        t0,
+                        m0 + pfx - k0,
+                        sk - k0 - 1,
+                        self.page,
+                        total_q,
+                        False,
                     )
                     t1 = t0 + nkchunk
                     k1 = t1 * self.page
@@ -591,9 +614,24 @@ class MsaProxyScore:
                     kv_pipeline.consumer_release(rel_state)
                     rel_state.advance()
                     mma_epilogue(
-                        acc1, tCcS, acc_mn_layout, n_rows, red_target, red_rank,
-                        s_max, own, rows, mO, o_row_base, 0, t1,
-                        m0 + pfx - k1, sk - k1 - 1, self.page, total_q, False,
+                        acc1,
+                        tCcS,
+                        acc_mn_layout,
+                        n_rows,
+                        red_target,
+                        red_rank,
+                        s_max,
+                        own,
+                        rows,
+                        mO,
+                        o_row_base,
+                        0,
+                        t1,
+                        m0 + pfx - k1,
+                        sk - k1 - 1,
+                        self.page,
+                        total_q,
+                        False,
                     )
 
                 for j in cutlass.range(npair_safe, npair, unroll=1):
@@ -607,9 +645,23 @@ class MsaProxyScore:
                     rel_state.advance()
                     peek_next = kv_pipeline.consumer_try_wait(read_state)
                     mma_epilogue(
-                        acc0, tCcS, acc_mn_layout, n_rows, red_target, red_rank,
-                        s_max, own, rows, mO, o_row_base, 0, t0,
-                        m0 + pfx - k0, sk - k0 - 1, self.page, total_q,
+                        acc0,
+                        tCcS,
+                        acc_mn_layout,
+                        n_rows,
+                        red_target,
+                        red_rank,
+                        s_max,
+                        own,
+                        rows,
+                        mO,
+                        o_row_base,
+                        0,
+                        t0,
+                        m0 + pfx - k0,
+                        sk - k0 - 1,
+                        self.page,
+                        total_q,
                     )
                     t1 = t0 + nkchunk
                     k1 = t1 * self.page
@@ -620,9 +672,23 @@ class MsaProxyScore:
                     kv_pipeline.consumer_release(rel_state)
                     rel_state.advance()
                     mma_epilogue(
-                        acc1, tCcS, acc_mn_layout, n_rows, red_target, red_rank,
-                        s_max, own, rows, mO, o_row_base, 0, t1,
-                        m0 + pfx - k1, sk - k1 - 1, self.page, total_q,
+                        acc1,
+                        tCcS,
+                        acc_mn_layout,
+                        n_rows,
+                        red_target,
+                        red_rank,
+                        s_max,
+                        own,
+                        rows,
+                        mO,
+                        o_row_base,
+                        0,
+                        t1,
+                        m0 + pfx - k1,
+                        sk - k1 - 1,
+                        self.page,
+                        total_q,
                     )
 
                 tt = byy + 2 * npair * nkchunk
@@ -635,9 +701,23 @@ class MsaProxyScore:
                     kv_pipeline.consumer_release(rel_state)
                     rel_state.advance()
                     mma_epilogue(
-                        acc0, tCcS, acc_mn_layout, n_rows, red_target, red_rank,
-                        s_max, own, rows, mO, o_row_base, 0, tt,
-                        m0 + pfx - kt, sk - kt - 1, self.page, total_q,
+                        acc0,
+                        tCcS,
+                        acc_mn_layout,
+                        n_rows,
+                        red_target,
+                        red_rank,
+                        s_max,
+                        own,
+                        rows,
+                        mO,
+                        o_row_base,
+                        0,
+                        tt,
+                        m0 + pfx - kt,
+                        sk - kt - 1,
+                        self.page,
+                        total_q,
                     )
                     tt2 = tt + nkchunk
                     kt2 = tt2 * self.page
@@ -645,18 +725,46 @@ class MsaProxyScore:
                     kv_pipeline.consumer_release(rel_state)
                     rel_state.advance()
                     mma_epilogue(
-                        acc1, tCcS, acc_mn_layout, n_rows, red_target, red_rank,
-                        s_max, own, rows, mO, o_row_base, 0, tt2,
-                        m0 + pfx - kt2, sk - kt2 - 1, self.page, total_q,
+                        acc1,
+                        tCcS,
+                        acc_mn_layout,
+                        n_rows,
+                        red_target,
+                        red_rank,
+                        s_max,
+                        own,
+                        rows,
+                        mO,
+                        o_row_base,
+                        0,
+                        tt2,
+                        m0 + pfx - kt2,
+                        sk - kt2 - 1,
+                        self.page,
+                        total_q,
                     )
                 else:
                     cute.nvgpu.warpgroup.wait_group(0)
                     kv_pipeline.consumer_release(rel_state)
                     rel_state.advance()
                     mma_epilogue(
-                        acc0, tCcS, acc_mn_layout, n_rows, red_target, red_rank,
-                        s_max, own, rows, mO, o_row_base, 0, tt,
-                        m0 + pfx - kt, sk - kt - 1, self.page, total_q,
+                        acc0,
+                        tCcS,
+                        acc_mn_layout,
+                        n_rows,
+                        red_target,
+                        red_rank,
+                        s_max,
+                        own,
+                        rows,
+                        mO,
+                        o_row_base,
+                        0,
+                        tt,
+                        m0 + pfx - kt,
+                        sk - kt - 1,
+                        self.page,
+                        total_q,
                     )
 
             # ---- -inf tail (blocks past the sequence / fully masked) ----
@@ -670,16 +778,49 @@ class MsaProxyScore:
                     gO[tidx] = -cutlass.Float32.inf
 
 
-
 def select_split_k(total_q, hq, batch_size, nkt):
     n_mtiles = (total_q // batch_size + 127) // 128
     base_ctas = n_mtiles * hq * batch_size
     best_cost = 0x7FFFFFFF
     best_nk = 1
     for cand in [
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 16, 20, 24, 32,
-        40, 48, 64, 96, 128, -1, -2, -3, -4, -5, -6, -8, -10, -12,
-        -16, -20, -24, -32, -40, -48,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        14,
+        16,
+        20,
+        24,
+        32,
+        40,
+        48,
+        64,
+        96,
+        128,
+        -1,
+        -2,
+        -3,
+        -4,
+        -5,
+        -6,
+        -8,
+        -10,
+        -12,
+        -16,
+        -20,
+        -24,
+        -32,
+        -40,
+        -48,
     ]:
         nk = cand if cand > 0 else (-cand * 132) // base_ctas
         nk = max(1, min(nk, nkt))
@@ -692,13 +833,11 @@ def select_split_k(total_q, hq, batch_size, nkt):
     return best_nk
 
 
-
-
 # --- CUDA-graph stream plumbing (see proxy_score_decode_sm90 for rationale) ---
 import torch
 import cuda.bindings.driver as _kf_cuda
 
-_KF_STREAMS = {}
+_KF_STREAMS: dict = {}
 
 
 def _kf_stream():
@@ -710,7 +849,7 @@ def _kf_stream():
     return s
 
 
-_CACHE = {}
+_CACHE: dict = {}
 
 
 def run(q, k, cu_seqlens_q, page_table, seqused_k, prefix_lens, max_score):

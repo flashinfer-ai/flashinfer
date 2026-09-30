@@ -79,56 +79,56 @@ from cutlass.cute.runtime import from_dlpack
 # ---------------------------------------------------------------------------
 
 TOPK = 16
-TILES = (8, 16, 32)           # register-tile widths the kernel can use
-TOPK2 = 2 * TOPK              # shared rows the reduction tree needs
-NT_MAX = 256                  # CTA size ceiling
-FILL_BLOCK = 128              # 8 output rows/CTA, one half-warp per row
+TILES = (8, 16, 32)  # register-tile widths the kernel can use
+TOPK2 = 2 * TOPK  # shared rows the reduction tree needs
+NT_MAX = 256  # CTA size ceiling
+FILL_BLOCK = 128  # 8 output rows/CTA, one half-warp per row
 LOG_NT = 8
-NSM = 132                     # SMs on an H100 SXM
-WARPS_SM = 24                 # warps resident per SM at this register count
-LINE = 128                    # L1 line, bytes
-SECT = 32                     # L1 sector, bytes: the unit a miss actually moves
-SCHED = 4.0                   # warp instructions an SM issues per cycle
-L1_WF = 2.0                   # L1 wavefronts an SM retires per cycle: the
-                              # tag stage takes four lookups a cycle and the
-                              # return path one 128B line, so sector-sized
-                              # requests from distinct lines pair up
-IPC1 = 0.8                    # what one dependency-limited warp sustains
-TREE_W = 1.0                  # reduction rounds cost what they issue
-DRAM_BPC = 2100.0             # device DRAM bytes per SM clock (3 TB/s @ 1.41 GHz)
-LAT = 500                     # cycles of memory latency to hide per chunk
+NSM = 132  # SMs on an H100 SXM
+WARPS_SM = 24  # warps resident per SM at this register count
+LINE = 128  # L1 line, bytes
+SECT = 32  # L1 sector, bytes: the unit a miss actually moves
+SCHED = 4.0  # warp instructions an SM issues per cycle
+L1_WF = 2.0  # L1 wavefronts an SM retires per cycle: the
+# tag stage takes four lookups a cycle and the
+# return path one 128B line, so sector-sized
+# requests from distinct lines pair up
+IPC1 = 0.8  # what one dependency-limited warp sustains
+TREE_W = 1.0  # reduction rounds cost what they issue
+DRAM_BPC = 2100.0  # device DRAM bytes per SM clock (3 TB/s @ 1.41 GHz)
+LAT = 500  # cycles of memory latency to hide per chunk
 MAX_LOG = 10
-SMEM_CAP = 232448           # bytes a CTA may hold on SM90
-BAR = 60                   # cycles a CTA barrier costs
-OVERLAP = 0.35             # share of the hidden limit that still shows up
+SMEM_CAP = 232448  # bytes a CTA may hold on SM90
+BAR = 60  # cycles a CTA barrier costs
+OVERLAP = 0.35  # share of the hidden limit that still shows up
 # Instruction counts one warp issues, read off the SASS the kernel emits
 # (NCU "Instructions Executed" per source line, divided by the warps that ran).
-FIRST_INST = {8: 175, 16: 344, 32: 712}   # load+mask+pack+sort+gather
-CHUNK_INST = {8: 175, 16: 536, 32: 904}   # plus the 16-maxima/bitonic fold
-FILTER_GROUP_INST = 160      # one eight-score compact/prefix group
-FILTER_DRAIN_INST = 600      # one 16-candidate drain into the reservoir
-MERGE_INST = 240           # scalar 16-way merge: 16 maxima + a 32 bitonic
-PUBLISH_INST = 34          # re-publishing 16 values + 16 indices to smem
-COOP_INST = {1: 34, 2: 60, 4: 110, 8: 210}     # the same spread over lanes
-COOP_MIN = 8               # narrowest lane group worth spreading a merge over.
-                           # Below eight lanes each thread has to carry four or
-                           # eight slots, and the round then issues twice the
-                           # instructions on twice the warps to save a third of
-                           # one merge's latency.  Measured both ways: two-lane
-                           # rounds cost 9-15% on the deep C=1 trees and return
-                           # only 2-3% on the shallow ones, so the scalar merge
-                           # stays until a whole half-list fits in lanes.
-FINAL_INST = 75            # fused merge + ascending index sort + store
-MERGE_CP = 230             # serial 16-way merge, in latency
-COOP_CP = 70               # the same merge spread over 8/16 lanes
-FINAL_CP = 120             # fused merge + ascending index sort + store
-EPI_CP = 120               # scalar ascending sort in the fallback epilogue
-NEG_BIG = -3.0e38             # finite empty-slot sentinel: -inf would turn
-                              # into a NaN once a position is OR-ed into the
-                              # mantissa.  PAD_LIM is the decode threshold; it
-                              # sits above the sentinel (packing perturbs its
-                              # low mantissa bits) and far below any real
-                              # proxy score, which is O(1).
+FIRST_INST = {8: 175, 16: 344, 32: 712}  # load+mask+pack+sort+gather
+CHUNK_INST = {8: 175, 16: 536, 32: 904}  # plus the 16-maxima/bitonic fold
+FILTER_GROUP_INST = 160  # one eight-score compact/prefix group
+FILTER_DRAIN_INST = 600  # one 16-candidate drain into the reservoir
+MERGE_INST = 240  # scalar 16-way merge: 16 maxima + a 32 bitonic
+PUBLISH_INST = 34  # re-publishing 16 values + 16 indices to smem
+COOP_INST = {1: 34, 2: 60, 4: 110, 8: 210}  # the same spread over lanes
+COOP_MIN = 8  # narrowest lane group worth spreading a merge over.
+# Below eight lanes each thread has to carry four or
+# eight slots, and the round then issues twice the
+# instructions on twice the warps to save a third of
+# one merge's latency.  Measured both ways: two-lane
+# rounds cost 9-15% on the deep C=1 trees and return
+# only 2-3% on the shallow ones, so the scalar merge
+# stays until a whole half-list fits in lanes.
+FINAL_INST = 75  # fused merge + ascending index sort + store
+MERGE_CP = 230  # serial 16-way merge, in latency
+COOP_CP = 70  # the same merge spread over 8/16 lanes
+FINAL_CP = 120  # fused merge + ascending index sort + store
+EPI_CP = 120  # scalar ascending sort in the fallback epilogue
+NEG_BIG = -3.0e38  # finite empty-slot sentinel: -inf would turn
+# into a NaN once a position is OR-ed into the
+# mantissa.  PAD_LIM is the decode threshold; it
+# sits above the sentinel (packing perturbs its
+# low mantissa bits) and far below any real
+# proxy score, which is O(1).
 PAD_LIM = -1.0e30
 # Forced-block bias, applied at the score load. Distinct per tile: two tiles
 # carrying an identical score can take the same rank in the strict-< ranking
@@ -143,23 +143,73 @@ PAD_LIM = -1.0e30
 FORCE_BEGIN_BASE = 1.0e16
 FORCE_END_BASE = 1.0e14
 FORCE_STEP = 1.0e10
-SENT = 16777216.0             # 2^24: empty slot, sorts last, decodes to -1
-IDX_BIAS_BITS = 1258291200    # 0x4b000000: monotone fp32 key for index 0
+SENT = 16777216.0  # 2^24: empty slot, sorts last, decodes to -1
+IDX_BIAS_BITS = 1258291200  # 0x4b000000: monotone fp32 key for index 0
 FULL = 0xFFFFFFFF
 
 
 def _mk_net():
     net = (
-        (0, 13), (1, 12), (2, 15), (3, 14), (4, 8), (5, 6), (7, 11), (9, 10),
-        (0, 5), (1, 7), (2, 9), (3, 4), (6, 13), (8, 14), (10, 15), (11, 12),
-        (0, 1), (2, 3), (4, 5), (6, 8), (7, 9), (10, 11), (12, 13), (14, 15),
-        (0, 2), (1, 3), (4, 10), (5, 11), (6, 7), (8, 9), (12, 14), (13, 15),
-        (1, 2), (3, 12), (4, 6), (5, 7), (8, 10), (9, 11), (13, 14),
-        (1, 4), (2, 6), (5, 8), (7, 10), (9, 13), (11, 14),
-        (2, 4), (3, 6), (9, 12), (11, 13),
-        (3, 5), (6, 8), (7, 9), (10, 12),
-        (3, 4), (5, 6), (7, 8), (9, 10), (11, 12),
-        (6, 7), (8, 9),
+        (0, 13),
+        (1, 12),
+        (2, 15),
+        (3, 14),
+        (4, 8),
+        (5, 6),
+        (7, 11),
+        (9, 10),
+        (0, 5),
+        (1, 7),
+        (2, 9),
+        (3, 4),
+        (6, 13),
+        (8, 14),
+        (10, 15),
+        (11, 12),
+        (0, 1),
+        (2, 3),
+        (4, 5),
+        (6, 8),
+        (7, 9),
+        (10, 11),
+        (12, 13),
+        (14, 15),
+        (0, 2),
+        (1, 3),
+        (4, 10),
+        (5, 11),
+        (6, 7),
+        (8, 9),
+        (12, 14),
+        (13, 15),
+        (1, 2),
+        (3, 12),
+        (4, 6),
+        (5, 7),
+        (8, 10),
+        (9, 11),
+        (13, 14),
+        (1, 4),
+        (2, 6),
+        (5, 8),
+        (7, 10),
+        (9, 13),
+        (11, 14),
+        (2, 4),
+        (3, 6),
+        (9, 12),
+        (11, 13),
+        (3, 5),
+        (6, 8),
+        (7, 9),
+        (10, 12),
+        (3, 4),
+        (5, 6),
+        (7, 8),
+        (9, 10),
+        (11, 12),
+        (6, 7),
+        (8, 9),
     )
     return tuple(p[0] for p in net), tuple(p[1] for p in net)
 
@@ -214,16 +264,17 @@ def _mk_asc_stages():
     return tuple(out)
 
 
-_SA, _SB = _mk_net()          # 60 comparators, depth 10 (16 elements)
-_C16A, _C16B = _SA, _SB       # 60 comparators for a 16-element chunk
-_C8A, _C8B = _batcher(8)      # 19 comparators for an 8-element chunk
-_MA, _MB = _mk_bmerge()       # 32 comparators, bitonic merge of 16
-_ASC = _mk_asc_stages()        # 10 lane-parallel stages, ascending
+_SA, _SB = _mk_net()  # 60 comparators, depth 10 (16 elements)
+_C16A, _C16B = _SA, _SB  # 60 comparators for a 16-element chunk
+_C8A, _C8B = _batcher(8)  # 19 comparators for an 8-element chunk
+_MA, _MB = _mk_bmerge()  # 32 comparators, bitonic merge of 16
+_ASC = _mk_asc_stages()  # 10 lane-parallel stages, ascending
 
 
 @cute.kernel
-def _fill_kernel(mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
-                 MASK: cutlass.Constexpr):
+def _fill_kernel(
+    mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor, MASK: cutlass.Constexpr
+):
     tidx, _, _ = cute.arch.thread_idx()
     bx, _, _ = cute.arch.block_idx()
     lane = tidx & Int32(31)
@@ -323,9 +374,17 @@ def _bmerge(av: cute.Tensor, ai: cute.Tensor):
 
 
 @cute.jit
-def _foldp(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
-           bvi: cute.Tensor, sscr: cute.Tensor, tid: Int32,
-           it0: Int32, istep: Int32, TL: cutlass.Constexpr):
+def _foldp(
+    av: cute.Tensor,
+    ai: cute.Tensor,
+    bv: cute.Tensor,
+    bvi: cute.Tensor,
+    sscr: cute.Tensor,
+    tid: Int32,
+    it0: Int32,
+    istep: Int32,
+    TL: cutlass.Constexpr,
+):
     """Sort the 16 packed fresh keys, then merge them into the running
     top-16.  Value and index are rebuilt from the surviving key's low bits
     only where they are needed - the 16 maxima - instead of being carried
@@ -350,9 +409,16 @@ def _foldp(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
 
 
 @cute.jit
-def _filter_drain(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
-                  bvi: cute.Tensor, cbv: cute.Tensor, cbi: cute.Tensor,
-                  tid: Int32, REARM: cutlass.Constexpr):
+def _filter_drain(
+    av: cute.Tensor,
+    ai: cute.Tensor,
+    bv: cute.Tensor,
+    bvi: cute.Tensor,
+    cbv: cute.Tensor,
+    cbi: cute.Tensor,
+    tid: Int32,
+    REARM: cutlass.Constexpr,
+):
     """Merge the compacted threshold candidates and re-arm the buffer."""
     for u in cutlass.range_constexpr(TOPK):
         v = cute.arch.fmax(cbv[u, tid], Float32(NEG_BIG))
@@ -372,10 +438,17 @@ def _filter_drain(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
 
 
 @cute.jit
-def _filter_push(cbv: cute.Tensor, cbi: cute.Tensor,
-                 xs: cute.Tensor, slots: cute.Tensor,
-                 count: cute.Tensor, tau: Float32,
-                 tid: Int32, it0: Int32, istep: Int32):
+def _filter_push(
+    cbv: cute.Tensor,
+    cbi: cute.Tensor,
+    xs: cute.Tensor,
+    slots: cute.Tensor,
+    count: cute.Tensor,
+    tau: Float32,
+    tid: Int32,
+    it0: Int32,
+    istep: Int32,
+):
     """Append eight threshold survivors using a depth-three prefix tree."""
     n = count[0]
     q = cute.make_rmem_tensor((8,), Int32)
@@ -391,17 +464,30 @@ def _filter_push(cbv: cute.Tensor, cbi: cute.Tensor,
     count[0] = n + p03 + p45 + p67
     for u in cutlass.range_constexpr(8):
         cbv[slots[u], tid] = xs[u]
-        cbi[slots[u], tid] = (
-            Int32(IDX_BIAS_BITS) + it0 + istep * Int32(u)).bitcast(Float32)
+        cbi[slots[u], tid] = (Int32(IDX_BIAS_BITS) + it0 + istep * Int32(u)).bitcast(
+            Float32
+        )
 
 
 @cute.jit
-def _filter_scan(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
-                 bvi: cute.Tensor, cbv: cute.Tensor, cbi: cute.Tensor,
-                 gcol: cute.Tensor, tid: Int32, n: Int32,
-                 t00: Int32, istep: Int32, nvp_c: Int32, fb_c: Int32,
-                 hi_c: Int32, TL: cutlass.Constexpr,
-                 MASK: cutlass.Constexpr):
+def _filter_scan(
+    av: cute.Tensor,
+    ai: cute.Tensor,
+    bv: cute.Tensor,
+    bvi: cute.Tensor,
+    cbv: cute.Tensor,
+    cbi: cute.Tensor,
+    gcol: cute.Tensor,
+    tid: Int32,
+    n: Int32,
+    t00: Int32,
+    istep: Int32,
+    nvp_c: Int32,
+    fb_c: Int32,
+    hi_c: Int32,
+    TL: cutlass.Constexpr,
+    MASK: cutlass.Constexpr,
+):
     """Scan in eight-score groups, merging only threshold survivors."""
     # The compact view aliases the first-tile scratch.  Every thread must
     # finish gathering its exact first-tile values before the overwrite.
@@ -422,10 +508,13 @@ def _filter_scan(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
             if cutlass.const_expr(MASK):
                 _tf = Float32(FORCE_STEP) * (_t).to(Float32)
                 _xf = (
-                    Float32(NEG_BIG) if (_t) >= nvp_c
-                    else (Float32(FORCE_BEGIN_BASE) - _tf if (_t) < fb_c
-                          else (Float32(FORCE_END_BASE) - _tf if (_t) >= hi_c
-                                else _xf))
+                    Float32(NEG_BIG)
+                    if (_t) >= nvp_c
+                    else (
+                        Float32(FORCE_BEGIN_BASE) - _tf
+                        if (_t) < fb_c
+                        else (Float32(FORCE_END_BASE) - _tf if (_t) >= hi_c else _xf)
+                    )
                 )
             xs[u] = _xf
         # Blocked order makes n warp-uniform; the vote keeps every lane on
@@ -433,8 +522,7 @@ def _filter_scan(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
         if cute.arch.vote_any_sync(count[0] >= Int32(8)):
             _filter_drain(av, ai, bv, bvi, cbv, cbi, tid, True)
             count[0] = Int32(0)
-        _filter_push(cbv, cbi, xs, slots, count, av[TOPK - 1],
-                     tid, t0, istep)
+        _filter_push(cbv, cbi, xs, slots, count, av[TOPK - 1], tid, t0, istep)
 
     utail = Int32(TL) + (ngrp << 3)
     if utail < n:
@@ -447,28 +535,37 @@ def _filter_scan(av: cute.Tensor, ai: cute.Tensor, bv: cute.Tensor,
             if cutlass.const_expr(MASK):
                 _tf = Float32(FORCE_STEP) * (_t).to(Float32)
                 _xf = (
-                    Float32(NEG_BIG) if (_t) >= nvp_c
-                    else (Float32(FORCE_BEGIN_BASE) - _tf if (_t) < fb_c
-                          else (Float32(FORCE_END_BASE) - _tf if (_t) >= hi_c
-                                else _xf))
+                    Float32(NEG_BIG)
+                    if (_t) >= nvp_c
+                    else (
+                        Float32(FORCE_BEGIN_BASE) - _tf
+                        if (_t) < fb_c
+                        else (Float32(FORCE_END_BASE) - _tf if (_t) >= hi_c else _xf)
+                    )
                 )
             xf = _xf
             xs[u] = xf if ok else Float32(NEG_BIG)
         if cute.arch.vote_any_sync(count[0] >= Int32(8)):
             _filter_drain(av, ai, bv, bvi, cbv, cbi, tid, True)
             count[0] = Int32(0)
-        _filter_push(cbv, cbi, xs, slots, count, av[TOPK - 1],
-                     tid, t0, istep)
+        _filter_push(cbv, cbi, xs, slots, count, av[TOPK - 1], tid, t0, istep)
     # The terminal reservoir is never reused before the allocation changes
     # lifetime into the reduction tree, so its 16-slot clear is dead.
     _filter_drain(av, ai, bv, bvi, cbv, cbi, tid, False)
 
 
-
 @cute.jit
-def _lmerge2(V: cute.Tensor, X: cute.Tensor, k: cutlass.Constexpr,
-             a: Float32, ia: Float32, b: Float32, ib: Float32,
-             ln: Int32, CLEAN: cutlass.Constexpr):
+def _lmerge2(
+    V: cute.Tensor,
+    X: cute.Tensor,
+    k: cutlass.Constexpr,
+    a: Float32,
+    ia: Float32,
+    b: Float32,
+    ib: Float32,
+    ln: Int32,
+    CLEAN: cutlass.Constexpr,
+):
     """Half-cleaner plus bitonic clean on two descending 16-lists held one
     slot per lane, with `b` already reversed (slot 15-l in lane l).
 
@@ -496,9 +593,14 @@ def _lmerge2(V: cute.Tensor, X: cute.Tensor, k: cutlass.Constexpr,
 
 
 @cute.jit
-def _lmerge(V: cute.Tensor, X: cute.Tensor, k: cutlass.Constexpr,
-            j: cutlass.Constexpr, ln: Int32,
-            CLEAN: cutlass.Constexpr = True):
+def _lmerge(
+    V: cute.Tensor,
+    X: cute.Tensor,
+    k: cutlass.Constexpr,
+    j: cutlass.Constexpr,
+    ln: Int32,
+    CLEAN: cutlass.Constexpr = True,
+):
     """Merge lists k and j of a lane group.  Slot 15-l of the partner lives in
     lane l^15, so the reversal is a single butterfly."""
     ov = cute.arch.shuffle_sync_bfly(V[j], offset=15, mask=FULL)
@@ -507,8 +609,16 @@ def _lmerge(V: cute.Tensor, X: cute.Tensor, k: cutlass.Constexpr,
 
 
 @cute.jit
-def _rank_store(v: Float32, x: Float32, mO: cute.Tensor, ln: Int32,
-                h: Int32, col: Int32, Nq: Int32, gp: Int32):
+def _rank_store(
+    v: Float32,
+    x: Float32,
+    mO: cute.Tensor,
+    ln: Int32,
+    h: Int32,
+    col: Int32,
+    Nq: Int32,
+    gp: Int32,
+):
     """Ascending-index scatter of one 16-lane list (see _coop_final_store)."""
     xx = x if v > Float32(PAD_LIM) else Float32(SENT)
     d = xx.bitcast(Int32) - Int32(IDX_BIAS_BITS)
@@ -523,9 +633,14 @@ def _rank_store(v: Float32, x: Float32, mO: cute.Tensor, ln: Int32,
 
 
 @cute.jit
-def _merge_smem(av: cute.Tensor, ai: cute.Tensor,
-                sbv: cute.Tensor, sbi: cute.Tensor, base: Int32,
-                CLEAN: cutlass.Constexpr):
+def _merge_smem(
+    av: cute.Tensor,
+    ai: cute.Tensor,
+    sbv: cute.Tensor,
+    sbi: cute.Tensor,
+    base: Int32,
+    CLEAN: cutlass.Constexpr,
+):
     """Fold an already-sorted partial list (smem column `base`) into ours.
 
     The half-cleaner alone already leaves the sixteen largest of the union in
@@ -544,9 +659,16 @@ def _merge_smem(av: cute.Tensor, ai: cute.Tensor,
 
 
 @cute.jit
-def _coop_round(sbv: cute.Tensor, sbi: cute.Tensor,
-                bv: cute.Tensor, bi: cute.Tensor, tid: Int32,
-                C: Int32, st: Int32, SLOTS: cutlass.Constexpr):
+def _coop_round(
+    sbv: cute.Tensor,
+    sbi: cute.Tensor,
+    bv: cute.Tensor,
+    bi: cute.Tensor,
+    tid: Int32,
+    C: Int32,
+    st: Int32,
+    SLOTS: cutlass.Constexpr,
+):
     """Merge each live list pair with 16/SLOTS lanes."""
     L = TOPK // SLOTS
     ln = tid & Int32(L - 1)
@@ -593,9 +715,16 @@ def _coop_round(sbv: cute.Tensor, sbi: cute.Tensor,
 
 
 @cute.jit
-def _coop_final_store(sbv: cute.Tensor, sbi: cute.Tensor, mO: cute.Tensor,
-                      tid: Int32, bq: Int32, h: Int32,
-                      C: Int32, Nq: Int32):
+def _coop_final_store(
+    sbv: cute.Tensor,
+    sbi: cute.Tensor,
+    mO: cute.Tensor,
+    tid: Int32,
+    bq: Int32,
+    h: Int32,
+    C: Int32,
+    Nq: Int32,
+):
     """Final 16-lane merge, ascending-index sort, and direct output store."""
     ln = tid & Int32(15)
     grp = tid >> 4
@@ -653,12 +782,13 @@ def _topk_kernel(
     TL: cutlass.Constexpr,
     FILTER: cutlass.Constexpr,
     C0: cutlass.Constexpr,
-    MASK: cutlass.Constexpr,):
+    MASK: cutlass.Constexpr,
+):
     c, w, _ = cute.arch.thread_idx()
     bq, h, _ = cute.arch.block_idx()
 
-    W = 1 << LW                      # compile time: folds every tile stride
-    C = Int32(C0)                    # compile time: folds row/group addressing
+    W = 1 << LW  # compile time: folds every tile stride
+    C = Int32(C0)  # compile time: folds row/group addressing
     # When one very long column is split at least 128 ways and each register
     # tile already carries a full top-k, selecting the 16 partial lists with
     # the greatest maxima is cheaper than merging the whole reduction tree.
@@ -686,11 +816,16 @@ def _topk_kernel(
     # column tile, because the cost that used to gate the cascade - the second
     # stage's shuffle issue - does not exist there.
     NEWT = cutlass.const_expr(
-        LW >= 4 and ((_NS1 == 1)
-                     or (_NS1 <= 4 and (C0 << LW) <= 256)
-                     or (C0 == 1 and TL >= TOPK and not FILTER and _NS1 <= 8)))
+        LW >= 4
+        and (
+            (_NS1 == 1)
+            or (_NS1 <= 4 and (C0 << LW) <= 256)
+            or (C0 == 1 and TL >= TOPK and not FILTER and _NS1 <= 8)
+        )
+    )
     HEADSEL = cutlass.const_expr(
-        C0 == 1 and LW >= 7 and TL >= TOPK and not FILTER and not NEWT)
+        C0 == 1 and LW >= 7 and TL >= TOPK and not FILTER and not NEWT
+    )
     smem = cutlass_utils.SmemAllocator()
     # one buffer, two lives: the 32-row chunk scratch while streaming, then
     # the value/index halves of the reduction tree.  They never overlap in
@@ -705,17 +840,18 @@ def _topk_kernel(
     # parity instead.  Both keep the publish (lane-consecutive) conflict-free.
     RP = NT + (1 if (NEWT and C0 == 1) else 2)
     ssc = smem.allocate_tensor(
-        Float32, cute.make_layout((TOPK2, NT), stride=(RP, 1)),
-        byte_alignment=16)
+        Float32, cute.make_layout((TOPK2, NT), stride=(RP, 1)), byte_alignment=16
+    )
     sbv = ssc
-    sbi = cute.make_tensor(ssc.iterator + TOPK * RP,
-                           cute.make_layout((TOPK, NT), stride=(RP, 1)))
+    sbi = cute.make_tensor(
+        ssc.iterator + TOPK * RP, cute.make_layout((TOPK, NT), stride=(RP, 1))
+    )
     # Compact views of the same allocation.  FILTER has two CTA barriers
     # around this alias lifetime before the padded reduction-tree view is used.
-    cbv = cute.make_tensor(ssc.iterator,
-                           cute.make_layout((TOPK, NT), stride=(NT, 1)))
-    cbi = cute.make_tensor(ssc.iterator + TOPK * NT,
-                           cute.make_layout((TOPK, NT), stride=(NT, 1)))
+    cbv = cute.make_tensor(ssc.iterator, cute.make_layout((TOPK, NT), stride=(NT, 1)))
+    cbi = cute.make_tensor(
+        ssc.iterator + TOPK * NT, cute.make_layout((TOPK, NT), stride=(NT, 1))
+    )
     if cutlass.const_expr(NEWT and _NS1 > 1):
         # Landing zone for the first cascade's results.  A separate allocation
         # (NT/16 lists) means the second cascade's sources are never the
@@ -723,32 +859,33 @@ def _topk_kernel(
         NG = NT // TOPK
         RQ = NG + 2
         qsc = smem.allocate_tensor(
-            Float32, cute.make_layout((TOPK2, NG), stride=(RQ, 1)),
-            byte_alignment=16)
+            Float32, cute.make_layout((TOPK2, NG), stride=(RQ, 1)), byte_alignment=16
+        )
         qbv = qsc
-        qbi = cute.make_tensor(qsc.iterator + TOPK * RQ,
-                               cute.make_layout((TOPK, NG), stride=(RQ, 1)))
+        qbi = cute.make_tensor(
+            qsc.iterator + TOPK * RQ, cute.make_layout((TOPK, NG), stride=(RQ, 1))
+        )
     if cutlass.const_expr(HEADSEL):
         # Keep scalar heads/owners separate from the source lists, and land
         # the first eight indirect list merges in disjoint scratch so no
         # selected source can be overwritten before it is read.
         sH = smem.allocate_tensor(
-            Float32, cute.make_layout((NT,), stride=(1,)),
-            byte_alignment=16)
+            Float32, cute.make_layout((NT,), stride=(1,)), byte_alignment=16
+        )
         sP = smem.allocate_tensor(
-            Float32, cute.make_layout((NT,), stride=(1,)),
-            byte_alignment=16)
+            Float32, cute.make_layout((NT,), stride=(1,)), byte_alignment=16
+        )
         rsc = smem.allocate_tensor(
-            Float32, cute.make_layout((TOPK2, 8), stride=(10, 1)),
-            byte_alignment=16)
+            Float32, cute.make_layout((TOPK2, 8), stride=(10, 1)), byte_alignment=16
+        )
         rbv = rsc
         rbi = cute.make_tensor(
-            rsc.iterator + TOPK * 10,
-            cute.make_layout((TOPK, 8), stride=(10, 1)))
+            rsc.iterator + TOPK * 10, cute.make_layout((TOPK, 8), stride=(10, 1))
+        )
 
     tid = w * C + c
     col = bq * C + c
-    colr = min(col, Nq - Int32(1))   # clamp so the ragged last CTA stays in bounds
+    colr = min(col, Nq - Int32(1))  # clamp so the ragged last CTA stays in bounds
 
     av = cute.make_rmem_tensor((TOPK,), Float32)
     ai = cute.make_rmem_tensor((TOPK,), Float32)
@@ -767,7 +904,7 @@ def _topk_kernel(
         t00 = w
     else:
         step = 1
-        A = ((T + Int32(W - 1)) >> LW)
+        A = (T + Int32(W - 1)) >> LW
         A = (A + Int32(TL - 1)) & Int32(-TL)
         n = min(max(T - w * A, Int32(0)), A)
         t00 = w * A
@@ -803,10 +940,13 @@ def _topk_kernel(
         if cutlass.const_expr(MASK):
             _tf = Float32(FORCE_STEP) * (t_u).to(Float32)
             _xf = (
-                Float32(NEG_BIG) if (t_u) >= nvp_c
-                else (Float32(FORCE_BEGIN_BASE) - _tf if (t_u) < fb_c
-                      else (Float32(FORCE_END_BASE) - _tf if (t_u) >= hi_c
-                            else _xf))
+                Float32(NEG_BIG)
+                if (t_u) >= nvp_c
+                else (
+                    Float32(FORCE_BEGIN_BASE) - _tf
+                    if (t_u) < fb_c
+                    else (Float32(FORCE_END_BASE) - _tf if (t_u) >= hi_c else _xf)
+                )
             )
         xf = _xf
         bv[u] = xf if ok else Float32(NEG_BIG)
@@ -834,8 +974,24 @@ def _topk_kernel(
     # left reachable.
     if cutlass.const_expr(TL >= TOPK):
         if cutlass.const_expr(FILTER):
-            _filter_scan(av, ai, bv, bvi, cbv, cbi, gcol, tid,
-                         n, t00, Int32(step), nvp_c, fb_c, hi_c, TL, MASK)
+            _filter_scan(
+                av,
+                ai,
+                bv,
+                bvi,
+                cbv,
+                cbi,
+                gcol,
+                tid,
+                n,
+                t00,
+                Int32(step),
+                nvp_c,
+                fb_c,
+                hi_c,
+                TL,
+                MASK,
+            )
         else:
             rem = max(n - Int32(TL), Int32(0))
             nfull = rem // Int32(TL)
@@ -847,10 +1003,17 @@ def _topk_kernel(
                     if cutlass.const_expr(MASK):
                         _tf = Float32(FORCE_STEP) * (_t).to(Float32)
                         _xf = (
-                            Float32(NEG_BIG) if (_t) >= nvp_c
-                            else (Float32(FORCE_BEGIN_BASE) - _tf if (_t) < fb_c
-                                  else (Float32(FORCE_END_BASE) - _tf if (_t) >= hi_c
-                                        else _xf))
+                            Float32(NEG_BIG)
+                            if (_t) >= nvp_c
+                            else (
+                                Float32(FORCE_BEGIN_BASE) - _tf
+                                if (_t) < fb_c
+                                else (
+                                    Float32(FORCE_END_BASE) - _tf
+                                    if (_t) >= hi_c
+                                    else _xf
+                                )
+                            )
                         )
                     bv[u] = _xf
                 for u in cutlass.range_constexpr(TL):
@@ -868,18 +1031,24 @@ def _topk_kernel(
                     if cutlass.const_expr(MASK):
                         _tf = Float32(FORCE_STEP) * (_t).to(Float32)
                         _xf = (
-                            Float32(NEG_BIG) if (_t) >= nvp_c
-                            else (Float32(FORCE_BEGIN_BASE) - _tf if (_t) < fb_c
-                                  else (Float32(FORCE_END_BASE) - _tf if (_t) >= hi_c
-                                        else _xf))
+                            Float32(NEG_BIG)
+                            if (_t) >= nvp_c
+                            else (
+                                Float32(FORCE_BEGIN_BASE) - _tf
+                                if (_t) < fb_c
+                                else (
+                                    Float32(FORCE_END_BASE) - _tf
+                                    if (_t) >= hi_c
+                                    else _xf
+                                )
+                            )
                         )
                     xf = _xf
                     bv[u] = xf if ok else Float32(NEG_BIG)
                 for u in cutlass.range_constexpr(TL):
                     ssc[u, tid] = bv[u]
                     bvi[u] = (bvi[u] & Int32(-TL)) | Int32(u)
-                _foldp(av, ai, bv, bvi, ssc, tid,
-                       t0, Int32(step), TL)
+                _foldp(av, ai, bv, bvi, ssc, tid, t0, Int32(step), TL)
 
     # ---- reduce the W tile groups of this CTA through shared memory -------
     # Round `st` folds list w into w+st, so it has st*C independent merges and
@@ -899,18 +1068,21 @@ def _topk_kernel(
     # reliably carry.
     NTC = C0 << LW
     _sts = [1 << (LW - 1 - r) for r in range(LW)]
-    _lane = [min(16, 1 << max(0, (NTC // (s * C0)).bit_length() - 1))
-             for s in _sts]
+    _lane = [min(16, 1 << max(0, (NTC // (s * C0)).bit_length() - 1)) for s in _sts]
     # a round only needs lane*st*C threads; rounded up to whole warps so the
     # full-mask shuffles still see every lane, the rest of the CTA skips it.
     # The tail rounds move two or four lists and used to cost every warp in
     # the CTA an issue slot to do it.
-    _act = [min(NTC, ((_lane[e] * _sts[e] * C0 + 31) // 32) * 32)
-            for e in range(LW)]
+    _act = [min(NTC, ((_lane[e] * _sts[e] * C0 + 31) // 32) * 32) for e in range(LW)]
     _fin = min(NTC, ((16 * C0 + 31) // 32) * 32)
     COOP = cutlass.const_expr(
-        LW > 0 and C0 <= 16 and NTC >= 32 and NTC % 32 == 0
-        and NTC >= 16 * C0 and _lane[-1] >= 8)
+        LW > 0
+        and C0 <= 16
+        and NTC >= 32
+        and NTC % 32 == 0
+        and NTC >= 16 * C0
+        and _lane[-1] >= 8
+    )
 
     if cutlass.const_expr(LW > 0):
         # End the compact-pitch alias lifetime before any warp seeds the
@@ -925,7 +1097,7 @@ def _topk_kernel(
             # groups (g//C)*16 .. +15 of it.  Each lane pulls slot `ln` of all
             # sixteen source lists, so the group holds sixteen sorted lists one
             # slot per lane, and four shuffle-only merge levels leave one.
-            NS1 = (1 << LW) // TOPK          # partial results per column
+            NS1 = (1 << LW) // TOPK  # partial results per column
             _NL2 = NS1.bit_length() - 1
             _a2 = min(NT, ((TOPK * C0 + 31) // 32) * 32)
             ln = tid & Int32(TOPK - 1)
@@ -943,16 +1115,24 @@ def _topk_kernel(
             for k in cutlass.range_constexpr(8):
                 s0 = base + Int32(k * C0)
                 s1 = base + Int32((k + 8) * C0)
-                _lmerge2(V, X, k, sbv[ln, s0], sbi[ln, s0],
-                         sbv[lnr, s1], sbi[lnr, s1], ln, True)
+                _lmerge2(
+                    V,
+                    X,
+                    k,
+                    sbv[ln, s0],
+                    sbi[ln, s0],
+                    sbv[lnr, s1],
+                    sbi[lnr, s1],
+                    ln,
+                    True,
+                )
             for lv in cutlass.range_constexpr(3):
                 h2 = 4 >> lv
                 for k in cutlass.range_constexpr(h2):
                     # the last level of a single-stage cascade feeds the
                     # ascending-index scatter, which ranks lanes by index and
                     # so does not need the four clean stages
-                    _lmerge(V, X, k, k + h2, ln,
-                            not (NS1 == 1 and h2 == 1))
+                    _lmerge(V, X, k, k + h2, ln, not (NS1 == 1 and h2 == 1))
             if cutlass.const_expr(NS1 == 1):
                 # one lane group per column already holds the whole reduction
                 _rank_store(V[0], X[0], mO, ln, h, bq * C + cg, Nq, sg)
@@ -969,8 +1149,17 @@ def _topk_kernel(
                     for k in cutlass.range_constexpr(_h0):
                         s0 = Int32(k * C0) + cg
                         s1 = Int32((k + _h0) * C0) + cg
-                        _lmerge2(V, X, k, qbv[ln, s0], qbi[ln, s0],
-                                 qbv[lnr, s1], qbi[lnr, s1], ln, _h0 > 1)
+                        _lmerge2(
+                            V,
+                            X,
+                            k,
+                            qbv[ln, s0],
+                            qbi[ln, s0],
+                            qbv[lnr, s1],
+                            qbi[lnr, s1],
+                            ln,
+                            _h0 > 1,
+                        )
                     for lv in cutlass.range_constexpr(_NL2 - 1):
                         h2 = NS1 >> (lv + 2)
                         for k in cutlass.range_constexpr(h2):
@@ -1020,10 +1209,8 @@ def _topk_kernel(
                         op = cute.arch.shuffle_sync_bfly(hp, dd, mask=FULL)
                         q = hv >= ov
                         lower = (ln & Int32(dd)) == Int32(0)
-                        hv = (cute.arch.fmax(hv, ov) if lower
-                              else cute.arch.fmin(hv, ov))
-                        hp = ((hp if q else op) if lower
-                              else (op if q else hp))
+                        hv = cute.arch.fmax(hv, ov) if lower else cute.arch.fmin(hv, ov)
+                        hp = (hp if q else op) if lower else (op if q else hp)
                     if grp < st:
                         sH[(grp << 4) + ln] = hv
                         sP[(grp << 4) + ln] = hp
@@ -1048,8 +1235,7 @@ def _topk_kernel(
                     oi = cute.arch.shuffle_sync_bfly(xx, dd, mask=FULL)
                     q = v >= ov
                     lower = (ln & Int32(dd)) == Int32(0)
-                    v = (cute.arch.fmax(v, ov) if lower
-                         else cute.arch.fmin(v, ov))
+                    v = cute.arch.fmax(v, ov) if lower else cute.arch.fmin(v, ov)
                     xx = (xx if q else oi) if lower else (oi if q else xx)
                 rbv[ln, grp] = v
                 rbi[ln, grp] = xx
@@ -1061,12 +1247,10 @@ def _topk_kernel(
             for r in cutlass.range_constexpr(2):
                 cute.arch.barrier()
                 if tid < Int32(64 >> r):
-                    _coop_round(rbv, rbi, bv, ai, tid, Int32(1),
-                                Int32(4 >> r), 1)
+                    _coop_round(rbv, rbi, bv, ai, tid, Int32(1), Int32(4 >> r), 1)
             if tid < Int32(32):
                 cute.arch.sync_warp()
-                _coop_final_store(rbv, rbi, mO, tid, bq, h,
-                                  Int32(1), Nq)
+                _coop_final_store(rbv, rbi, mO, tid, bq, h, Int32(1), Nq)
         elif cutlass.const_expr(not COOP):
             for r in cutlass.range_constexpr(LW):
                 st = Int32(1 << (LW - 1 - r))
@@ -1075,8 +1259,7 @@ def _topk_kernel(
                     # The scalar epilogue consumes av/ai directly after the
                     # st=1 merge; only earlier rounds have a shared consumer,
                     # and only they need the merged list left sorted.
-                    _merge_smem(av, ai, sbv, sbi, tid + st * C,
-                                r + 1 < LW)
+                    _merge_smem(av, ai, sbv, sbi, tid + st * C, r + 1 < LW)
                     if cutlass.const_expr(r + 1 < LW):
                         for j in cutlass.range_constexpr(TOPK):
                             sbv[j, tid] = av[j]
@@ -1086,12 +1269,21 @@ def _topk_kernel(
                 cute.arch.barrier()
                 if cutlass.const_expr(_lane[e] >= COOP_MIN):
                     if cutlass.const_expr(_act[e] >= NTC):
-                        _coop_round(sbv, sbi, bv, ai, tid, C, Int32(_sts[e]),
-                                    TOPK // _lane[e])
+                        _coop_round(
+                            sbv, sbi, bv, ai, tid, C, Int32(_sts[e]), TOPK // _lane[e]
+                        )
                     else:
                         if tid < Int32(_act[e]):
-                            _coop_round(sbv, sbi, bv, ai, tid, C,
-                                        Int32(_sts[e]), TOPK // _lane[e])
+                            _coop_round(
+                                sbv,
+                                sbi,
+                                bv,
+                                ai,
+                                tid,
+                                C,
+                                Int32(_sts[e]),
+                                TOPK // _lane[e],
+                            )
                 else:
                     st = Int32(_sts[e])
                     if w < st:
@@ -1119,8 +1311,11 @@ def _topk_kernel(
     _nstep = (C0 * TOPK + NTC - 1) // NTC
     _rate = min(SCHED, IPC1 * _wpc)
     _direct = TOPK * min(C0, 32) * ((C0 + 31) // 32) / L1_WF
-    _flat = (max(1.0, C0 * TOPK / 32.0) / L1_WF
-             + (TOPK * ((C0 + 31) // 32) + _nstep * 10 * _wpc) / _rate + BAR)
+    _flat = (
+        max(1.0, C0 * TOPK / 32.0) / L1_WF
+        + (TOPK * ((C0 + 31) // 32) + _nstep * 10 * _wpc) / _rate
+        + BAR
+    )
     SPLIT = cutlass.const_expr((not COOP) and _flat < _direct)
     if cutlass.const_expr(not COOP):
         if w == Int32(0):
@@ -1163,8 +1358,9 @@ def _topk_kernel(
 
 
 @cute.jit
-def _launch_fill(stream, mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
-                 MASK: cutlass.Constexpr):
+def _launch_fill(
+    stream, mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor, MASK: cutlass.Constexpr
+):
     rows = mS.shape[0] * mS.shape[2]
     _fill_kernel(mS, mO, mNVP, MASK).launch(
         grid=[(rows + Int32(7)) // Int32(8), 1, 1],
@@ -1174,16 +1370,26 @@ def _launch_fill(stream, mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
 
 
 @cute.jit
-def _launch(stream, mS: cute.Tensor, mO: cute.Tensor, mNVP: cute.Tensor,
-            FB: Int32, FE: Int32, LW: cutlass.Constexpr,
-            DENSE: cutlass.Constexpr, TL: cutlass.Constexpr,
-            FILTER: cutlass.Constexpr,
-            C0: cutlass.Constexpr, MASK: cutlass.Constexpr):
+def _launch(
+    stream,
+    mS: cute.Tensor,
+    mO: cute.Tensor,
+    mNVP: cute.Tensor,
+    FB: Int32,
+    FE: Int32,
+    LW: cutlass.Constexpr,
+    DENSE: cutlass.Constexpr,
+    TL: cutlass.Constexpr,
+    FILTER: cutlass.Constexpr,
+    C0: cutlass.Constexpr,
+    MASK: cutlass.Constexpr,
+):
     Hq = mS.shape[0]
     Nq = mS.shape[2]
     C = Int32(C0)
-    _topk_kernel(mS, mO, mNVP, FB, FE, mS.shape[1], Nq,
-                 LW, DENSE, TL, FILTER, C0, MASK).launch(
+    _topk_kernel(
+        mS, mO, mNVP, FB, FE, mS.shape[1], Nq, LW, DENSE, TL, FILTER, C0, MASK
+    ).launch(
         grid=[(Nq + C - Int32(1)) // C, Hq, 1],
         block=[C0, 1 << LW, 1],
         stream=stream,
@@ -1269,10 +1475,17 @@ def _plan(Hq, T, Nq):
                 wpc = (NT + 31) // 32
                 smem = TOPK2 * (NT + 2) * 4
                 sts = [1 << (lw - 1 - r) for r in range(lw)]
-                lane = [min(16, 1 << max(0, (NT // (s * C)).bit_length() - 1))
-                        for s in sts]
-                coop = (lw > 0 and C <= 16 and NT >= 32 and NT % 32 == 0
-                        and NT >= 16 * C and lane[-1] >= 8)
+                lane = [
+                    min(16, 1 << max(0, (NT // (s * C)).bit_length() - 1)) for s in sts
+                ]
+                coop = (
+                    lw > 0
+                    and C <= 16
+                    and NT >= 32
+                    and NT % 32 == 0
+                    and NT >= 16 * C
+                    and lane[-1] >= 8
+                )
                 # ---- instructions this CTA issues -------------------------
                 i_cta = wpc * (FIRST_INST[TL] + (chunks - 1) * CHUNK_INST[TL])
                 i_tree = 0.0
@@ -1284,17 +1497,17 @@ def _plan(Hq, T, Nq):
                                 aw = min(wpc, (lane[e] * sts[e] * C + 31) // 32)
                                 i_tree += aw * COOP_INST[16 // lane[e]]
                             else:
-                                i_tree += (((sts[e] * C + 31) // 32)
-                                           * (MERGE_INST + PUBLISH_INST))
+                                i_tree += ((sts[e] * C + 31) // 32) * (
+                                    MERGE_INST + PUBLISH_INST
+                                )
                         i_tree += min(wpc, (16 * C + 31) // 32) * FINAL_INST
                     else:
                         for e, s in enumerate(sts):
-                            i_tree += (((s * C + 31) // 32)
-                                       * (MERGE_INST +
-                                          (PUBLISH_INST if e + 1 < lw else 0)))
+                            i_tree += ((s * C + 31) // 32) * (
+                                MERGE_INST + (PUBLISH_INST if e + 1 < lw else 0)
+                            )
                 # ---- how fast the SM can retire them ----------------------
-                res = max(1, min(32, WARPS_SM // wpc,
-                                 SMEM_CAP // max(smem, 1)))
+                res = max(1, min(32, WARPS_SM // wpc, SMEM_CAP // max(smem, 1)))
                 res = min(res, max(1, q))
                 warps = min(64, res * wpc)
                 # ---- L1 wavefronts, output stores, DRAM ------------------
@@ -1310,8 +1523,11 @@ def _plan(Hq, T, Nq):
                 # the scalar epilogue puts its 16 stores 64B apart per lane,
                 # so every one of them is a wavefront per lane; the fused
                 # 16-lane store writes one contiguous 64B row per column
-                t_out = (q * (16.0 * min(C, 32) * ((C + 31) // 32))
-                         if not coop else q * max(1.0, C / 2.0))
+                t_out = (
+                    q * (16.0 * min(C, 32) * ((C + 31) // 32))
+                    if not coop
+                    else q * max(1.0, C / 2.0)
+                )
                 # the shared-memory tree also sits on one thread's critical
                 # path, which a single resident CTA cannot hide.
                 #
@@ -1324,24 +1540,29 @@ def _plan(Hq, T, Nq):
                 # geometries with the barrier-per-round schedule is what kept
                 # the search on shallow trees that then had to run the
                 # barrier-heavy path.
-                newt = (lw >= 4 and ((W // TOPK == 1)
-                                     or (W // TOPK <= 4 and NT <= NT_MAX)
-                                     or (C == 1 and TL >= TOPK
-                                         and W // TOPK <= 8)))
+                newt = lw >= 4 and (
+                    (W // TOPK == 1)
+                    or (W // TOPK <= 4 and NT <= NT_MAX)
+                    or (C == 1 and TL >= TOPK and W // TOPK <= 8)
+                )
                 nl2 = max(0, (W // TOPK).bit_length() - 1)
                 # head preselection is not a barrier-per-round tree either: it
                 # sorts the W maxima, folds them down to sixteen, and then
                 # merges only the sixteen source lists it selected.
                 hsel = C == 1 and lw >= 7 and TL >= TOPK and not newt
                 if newt:
-                    cp = ((1 if nl2 == 0 else 2) * BAR
-                          + (4 + nl2) * COOP_CP)
+                    cp = (1 if nl2 == 0 else 2) * BAR + (4 + nl2) * COOP_CP
                 elif hsel:
                     cp = (lw - 4) * (COOP_CP + BAR) + 4 * COOP_CP + 3 * BAR
                 elif coop:
-                    cp = BAR + FINAL_CP + sum(
-                        (COOP_CP if lane[e] >= 8 else MERGE_CP) + BAR
-                        for e in range(lw - 1))
+                    cp = (
+                        BAR
+                        + FINAL_CP
+                        + sum(
+                            (COOP_CP if lane[e] >= 8 else MERGE_CP) + BAR
+                            for e in range(lw - 1)
+                        )
+                    )
                 else:
                     cp = lw * (MERGE_CP + BAR) + EPI_CP
                 t_tree = cp * q / max(1, min(res, q))
@@ -1367,13 +1588,14 @@ def _plan(Hq, T, Nq):
                 # walk's contiguous per-thread stream wins instead (measured
                 # the other way, up to 12%), and it is also what the threshold
                 # compactor needs to keep its counts warp-uniform.
-                order = (((True, wf_den), (False, wf_blk))
-                         if (chunks == 1 and nrow > 1)
-                         else ((False, wf_blk), (True, wf_den)))
+                order = (
+                    ((True, wf_den), (False, wf_blk))
+                    if (chunks == 1 and nrow > 1)
+                    else ((False, wf_blk), (True, wf_den))
+                )
                 for dense, wf in order:
                     mem = q * w_load * wf / L1_WF + t_out + t_dram
-                    t = (max(mem, t_alu) + OVERLAP * min(mem, t_alu)
-                         + t_tree + t_lat)
+                    t = max(mem, t_alu) + OVERLAP * min(mem, t_alu) + t_tree + t_lat
                     if best is None or t < best[0]:
                         best = (t, lw, dense, TL, C)
     lw, dense, TL, C = best[1], best[2], best[3], best[4]
@@ -1386,22 +1608,26 @@ def _plan(Hq, T, Nq):
     # record candidates. This conservative bound prices one drain per
     # doubling; both algorithms remain exact regardless of the estimate.
     drains = max(1, ((rows + TOPK - 1) // TOPK).bit_length())
-    filter_cost = (groups * FILTER_GROUP_INST
-                   + drains * FILTER_DRAIN_INST + 2 * BAR)
+    filter_cost = groups * FILTER_GROUP_INST + drains * FILTER_DRAIN_INST + 2 * BAR
     # C being a multiple of one warp makes n/count and every vote uniform.
     # Four or more resident warps are required to hide the compactor's larger
     # live-register set; on a two-warp CTA it reduces latency hiding more than
     # the skipped sort work saves. BLOCKED keeps each group scan contiguous.
-    filt = (not dense and (C * W) // 32 >= SCHED and TL >= TOPK
-            and C >= 32 and C % 32 == 0
-            and filter_cost < normal_cost)
+    filt = (
+        not dense
+        and (C * W) // 32 >= SCHED
+        and TL >= TOPK
+        and C >= 32
+        and C % 32 == 0
+        and filter_cost < normal_cost
+    )
     return lw, dense, TL, filt, C
 
 
 # --- CUDA-graph stream plumbing (see proxy_score_decode_sm90 for rationale) ---
 import cuda.bindings.driver as _kf_cuda
 
-_KF_STREAMS = {}
+_KF_STREAMS: dict = {}
 
 
 def _kf_stream():
@@ -1413,13 +1639,20 @@ def _kf_stream():
     return s
 
 
-_cache = {}
+_cache: dict = {}
 _compiled_fill = None
 
 
 @torch.no_grad()
-def run(max_score, cu_seqlens_q, context_lens, topk_idx,
-        num_valid_pages=None, force_begin=0, force_end=0):
+def run(
+    max_score,
+    cu_seqlens_q,
+    context_lens,
+    topk_idx,
+    num_valid_pages=None,
+    force_begin=0,
+    force_end=0,
+):
     """Top-k KV-block selection.
 
     ``num_valid_pages`` is a per-token int32 tensor of causal extents;
@@ -1435,15 +1668,23 @@ def run(max_score, cu_seqlens_q, context_lens, topk_idx,
         nvp = torch.empty(0, dtype=torch.int32, device=max_score.device)
 
     def _dyn(t, ld):
-        return from_dlpack(t, enable_tvm_ffi=True,
-                           use_32bit_stride=True).mark_layout_dynamic(leading_dim=ld)
+        return from_dlpack(
+            t, enable_tvm_ffi=True, use_32bit_stride=True
+        ).mark_layout_dynamic(leading_dim=ld)
 
     if T <= TOPK:
         key = ("fill", mask)
         fn = _cache.get(key)
         if fn is None:
-            fn = cute.compile(_launch_fill, _kf_stream(), _dyn(max_score, 2), _dyn(topk_idx, 2),
-                              _dyn(nvp, 0), mask, options="--enable-tvm-ffi")
+            fn = cute.compile(
+                _launch_fill,
+                _kf_stream(),
+                _dyn(max_score, 2),
+                _dyn(topk_idx, 2),
+                _dyn(nvp, 0),
+                mask,
+                options="--enable-tvm-ffi",
+            )
             _cache[key] = fn
         fn(_kf_stream(), max_score, topk_idx, nvp)
         return
@@ -1455,9 +1696,21 @@ def run(max_score, cu_seqlens_q, context_lens, topk_idx,
     key = plan + (mask,)
     fn = _cache.get(key)
     if fn is None:
-        fn = cute.compile(_launch, _kf_stream(), _dyn(max_score, 2), _dyn(topk_idx, 2),
-                          _dyn(nvp, 0), Int32(force_begin), Int32(force_end),
-                          plan[0], plan[1], plan[2], plan[3], plan[4], mask,
-                          options="--enable-tvm-ffi")
+        fn = cute.compile(
+            _launch,
+            _kf_stream(),
+            _dyn(max_score, 2),
+            _dyn(topk_idx, 2),
+            _dyn(nvp, 0),
+            Int32(force_begin),
+            Int32(force_end),
+            plan[0],
+            plan[1],
+            plan[2],
+            plan[3],
+            plan[4],
+            mask,
+            options="--enable-tvm-ffi",
+        )
         _cache[key] = fn
     fn(_kf_stream(), max_score, topk_idx, nvp, force_begin, force_end)

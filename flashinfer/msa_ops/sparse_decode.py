@@ -394,7 +394,9 @@ def msa_sparse_decode_attention(
 
     if sm90:
         if return_softmax_lse:
-            raise NotImplementedError("SM90 msa_sparse_decode_attention does not return an LSE")
+            raise NotImplementedError(
+                "SM90 msa_sparse_decode_attention does not return an LSE"
+            )
         if page_table is None or seqused_k is None:
             raise NotImplementedError(
                 "SM90 msa_sparse_decode_attention requires the paged KV layout"
@@ -413,8 +415,15 @@ def msa_sparse_decode_attention(
             (total_q, num_qo_heads, head_dim), dtype=compute_dtype, device=q.device
         )
         return sparse_decode_sm90(
-            q, k, v, q2k_indices, page_table, seqused_k, out,
-            softmax_scale=softmax_scale, v_global_scale=v_global_scale,
+            q,
+            k,
+            v,
+            q2k_indices,
+            page_table,
+            seqused_k,
+            out,
+            softmax_scale=softmax_scale,
+            v_global_scale=v_global_scale,
         )
     topk = q2k_indices.shape[2]
     if topk <= 0:

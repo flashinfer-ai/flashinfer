@@ -280,7 +280,6 @@ def _msa_host(
         )
 
 
-
 # --- CUDA-graph stream plumbing -------------------------------------------
 # Without an explicit stream these launches go to the CuTe default stream, so
 # torch.cuda.graph records NOTHING: the kernel runs eagerly during capture and
@@ -289,7 +288,8 @@ def _msa_host(
 # Same pattern the sparse kernels already use.
 import torch
 import cuda.bindings.driver as _kf_cuda
-_KF_STREAMS = {}
+
+_KF_STREAMS: dict = {}
 
 
 def _kf_stream():
@@ -301,7 +301,7 @@ def _kf_stream():
     return s
 
 
-_CACHE = {}
+_CACHE: dict = {}
 
 
 def run(q, k, cu_seqlens_q, page_table, seqused_k, max_score):
