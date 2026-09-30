@@ -82,8 +82,9 @@ _ARCH_SM107 = getattr(Arch, "sm_107", Arch.sm_103f)
 _ARCH_SM107F = getattr(Arch, "sm_107f", Arch.sm_103f)
 
 
+from .mla_reducer import MLAReducer
+
 from .mla_helpers import (
-    MLAReducerMixin,
     ceil_div,
     compute_q_tile_layout,
     MAX_SPLITS,
@@ -135,7 +136,7 @@ Constraints:
 """
 
 
-class BlackwellMultiHeadLatentAttentionForwardFP16(MLAReducerMixin):
+class BlackwellMultiHeadLatentAttentionForwardFP16:
     def __init__(
         self,
         acc_dtype: Type[cutlass.Numeric],
@@ -263,8 +264,19 @@ class BlackwellMultiHeadLatentAttentionForwardFP16(MLAReducerMixin):
         if reducer_d_tiles not in (1, 2, 4):
             raise ValueError(f"unsupported reducer_d_tiles={reducer_d_tiles}")
         self.reducer_d_tiles = reducer_d_tiles
-        self.reducer_d_tile = self.latent_dim // reducer_d_tiles
-        self._init_reducer(reducer_max_splits)
+        self.reducer = MLAReducer(
+            acc_dtype=acc_dtype,
+            lse_dtype=lse_dtype,
+            qk_tile_shape=mma_qk_tiler_mn,
+            num_heads=num_heads,
+            seq_len_q=seq_len_q,
+            max_splits=reducer_max_splits,
+            d_tiles=reducer_d_tiles,
+            is_var_q=is_var_q,
+            is_var_split_kv=is_var_split_kv,
+            enable_dcp=enable_dcp,
+            enable_pdl=enable_pdl,
+        )
         mma_qk_tiler_k = self.rope_dim if self.seq_len_q == 1 else self.rope_dim * 2
         self.mma_qk_tiler = (
             self.mma_qk_tiler_mn[0],
@@ -919,7 +931,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16(MLAReducerMixin):
             use_pdl=self.enable_pdl,
         )
         if cutlass.const_expr(acc_o is not None):
-            self.reduction_kernel(
+            self.reducer(
                 o_unpacked,
                 lse_unpacked,
                 acc_o,
@@ -929,17 +941,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16(MLAReducerMixin):
                 cum_seq_lens_q,
                 block_split_kvs,
                 lse_scale,
-            ).launch(
-                grid=(
-                    o_unpacked.shape[0] * self.reducer_d_tiles,
-                    self.seq_len_q,
-                    runtime_batch_size,
-                ),
-                block=[self.threads_per_warp * self.num_compute_warps, 1, 1],
-                smem=self.reducer_scale_slots * self.acc_dtype.width // 8,
-                stream=stream,
-                min_blocks_per_mp=1,
-                use_pdl=self.enable_pdl,
+                stream,
             )
 
     @cute.jit

@@ -905,10 +905,20 @@ def test_cute_dsl_mla_decode_fp8_variable_seq_order_boundaries():
     "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
 )
 def test_cute_dsl_mla_decode_h96_max_split_reducer_capacity(dtype):
-    """Reference-check output and LSE at the static reducer's 32-split cap."""
+    """Reference-check output and LSE at the static reducer's 48-split cap."""
+    skip_if_unsupported()
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode import (
+        _get_split_kv_and_workspace_size,
+    )
+    from flashinfer.cute_dsl.utils import get_num_sm
+
+    num_sms = get_num_sm(torch.device("cuda"))
+    if num_sms < 96:
+        pytest.skip("48 splits require at least 96 SMs")
+    assert _get_split_kv_and_workspace_size(1, 1, 96, 512, num_sms, 6144)[0] == 48
     _run_padded_q_tile_case(
         batch_size=1,
-        seq_len_k=8192,
+        seq_len_k=6144,
         num_heads=96,
         q_len=1,
         dtype=dtype,
@@ -930,7 +940,7 @@ def test_cute_dsl_mla_decode_h96_sq8_nonempty_split_reducer():
     "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
 )
 def test_cute_dsl_mla_decode_h96_odd_split_reducer_pdl_off(dtype):
-    """Cover adaptive D4 with an odd 17-split prefix and PDL disabled."""
+    """Cover an odd split prefix with PDL disabled."""
     _run_padded_q_tile_case(
         batch_size=1,
         seq_len_k=4097,
@@ -1148,7 +1158,15 @@ def test_mla_split_kv_cap():
 
     assert _STATIC_REDUCER_MAX_SPLITS == 48
     assert [_get_reducer_max_splits(s) for s in (1, 2, 3, 5, 13, 26, 32, 33, 48)] == [
-        4, 4, 4, 8, 16, 32, 32, 48, 48,
+        4,
+        4,
+        4,
+        8,
+        16,
+        32,
+        32,
+        48,
+        48,
     ]
     assert _get_split_kv_and_workspace_size(1, 8, 12, 512, 212)[0] == 48
     assert _get_split_kv_and_workspace_size(2, 1, 128, 512, 212)[0] == 48
@@ -1157,6 +1175,130 @@ def test_mla_split_kv_cap():
     assert (
         _get_split_kv_and_workspace_size(1, 1, 12, 512, 212, max_seq_len=4096)[0] == 32
     )
+
+
+@pytest.mark.parametrize("d_tiles", [1, 2, 4])
+@pytest.mark.parametrize(
+    "split_kv,capacity,enable_dcp",
+    [
+        (3, 4, False),
+        (5, 8, False),
+        (33, 48, False),
+        (48, 48, False),
+        (65, 256, False),
+        (255, 256, False),
+        (65, 256, True),
+    ],
+)
+@pytest.mark.parametrize("is_var_q", [False, True])
+def test_mla_reducer_standalone(split_kv, capacity, enable_dcp, d_tiles, is_var_q):
+    """Reduce poisoned workspaces across partial groups, batches, and query tiles."""
+    skip_if_unsupported()
+    import math
+
+    import cuda.bindings.driver as cuda
+    import cutlass
+    import cutlass.cute as cute
+    from cutlass.cute.runtime import from_dlpack
+
+    from flashinfer.cute_dsl.attention.monolithic.mla_reducer import MLAReducer
+
+    torch.manual_seed(42)
+    device = torch.device("cuda")
+    heads, q_len, dim, batches, tiles = 48, 3, 512, 2, 2
+    # The second request uses fewer splits than the compiled/allocated capacity.
+    # NaN tails expose any unpredicated reads, including in the last load set.
+    counts = [0 if enable_dcp else split_kv, max(1, split_kv - 2)]
+    partials = torch.full(
+        (batches, tiles, 128, split_kv, dim), float("nan"), device=device
+    )
+    partial_lse = torch.full(
+        (batches, tiles, 128, split_kv), float("nan"), device=device
+    )
+    ref_out, ref_lse = [], []
+    for b, count in enumerate(counts):
+        if count == 0:
+            # An empty DCP rank publishes one zero partial with LSE=-inf.
+            partials[b, :, :, 0] = 0.0
+            partial_lse[b, :, :, 0] = -float("inf")
+            ref_out.append(torch.zeros(q_len, heads, dim, device=device))
+            ref_lse.append(torch.full((q_len, heads), -float("inf"), device=device))
+            continue
+        values = torch.randn(tiles, 128, count, dim, device=device)
+        logs = torch.randn(tiles, 128, count, device=device)
+        partials[b, :, :, :count] = values
+        partial_lse[b, :, :, :count] = logs
+        weights = torch.softmax(logs * math.log(2.0), dim=-1)
+        ref_out.append(
+            (values * weights[..., None])
+            .sum(-2)
+            .reshape(-1, dim)[: heads * q_len]
+            .reshape(q_len, heads, dim)
+        )
+        ref_lse.append(
+            torch.logsumexp(logs * math.log(2.0), dim=-1)
+            .reshape(-1)[: heads * q_len]
+            .reshape(q_len, heads)
+        )
+
+    # Empty first request exercises inactive CTAs without touching compact output.
+    if is_var_q:
+        out = torch.full(
+            (q_len, heads, dim), float("nan"), dtype=torch.bfloat16, device=device
+        )
+        lse = torch.full((q_len, heads), float("nan"), device=device)
+        out_view, lse_view = out.permute(1, 2, 0), lse.permute(1, 0)
+        cum_q = torch.tensor([0, 0, q_len], dtype=torch.int32, device=device)
+        expected_out, expected_lse = ref_out[1], ref_lse[1]
+    else:
+        out = torch.full(
+            (batches, q_len, heads, dim),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        lse = torch.full((batches, q_len, heads), float("nan"), device=device)
+        out_view, lse_view = out.permute(2, 3, 1, 0), lse.permute(2, 1, 0)
+        cum_q = None
+        expected_out, expected_lse = torch.stack(ref_out), torch.stack(ref_lse)
+    cache_seqs = torch.tensor(
+        [c * 128 for c in counts], dtype=torch.int32, device=device
+    )
+    block_splits = (
+        torch.tensor([split_kv, split_kv - 1], dtype=torch.int32, device=device)
+        if enable_dcp
+        else None
+    )
+    reducer = MLAReducer(
+        acc_dtype=cutlass.Float32,
+        lse_dtype=cutlass.Float32,
+        qk_tile_shape=(128, 128),
+        num_heads=heads,
+        seq_len_q=q_len,
+        max_splits=capacity,
+        d_tiles=d_tiles,
+        is_var_q=is_var_q,
+        enable_dcp=enable_dcp,
+        is_var_split_kv=enable_dcp,
+    )
+    args = (
+        from_dlpack(out_view, assumed_align=16),
+        from_dlpack(lse_view, assumed_align=4),
+        from_dlpack(partials.permute(2, 3, 4, 1, 0), assumed_align=16),
+        from_dlpack(partial_lse.permute(2, 3, 1, 0), assumed_align=4),
+        cutlass.Int32(split_kv),
+        from_dlpack(cache_seqs, assumed_align=4),
+        from_dlpack(cum_q, assumed_align=4) if cum_q is not None else None,
+        from_dlpack(block_splits, assumed_align=4)
+        if block_splits is not None
+        else None,
+        cutlass.Float32(math.log(2.0)),
+        cuda.CUstream(torch.cuda.current_stream().cuda_stream),
+    )
+    compiled = cute.compile(reducer, *args)
+    compiled(*args)
+    torch.testing.assert_close(out, expected_out.to(out.dtype), atol=2e-3, rtol=1e-2)
+    torch.testing.assert_close(lse, expected_lse, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize(

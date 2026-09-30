@@ -66,7 +66,7 @@ def _get_reducer_d_tiles(
     num_sms: int,
     effective_split_kv: int,
 ) -> int:
-    """Reducer D bands: two while the doubled row grid fits a quarter of the SMs, else one.
+    """Reducer D bands: two while the row count fits a quarter of the SMs, else one.
 
     Each reducer thread keeps its band columns for a set of splits in
     registers; a four-band thread would hold a single column.
@@ -87,6 +87,7 @@ def _get_reducer_max_splits(split_kv: int) -> int:
     return min(_STATIC_REDUCER_MAX_SPLITS, max(4, 1 << (split_kv - 1).bit_length()))
 
 
+@functools.cache
 def _get_split_kv_and_workspace_size(
     B: int,
     q_len: int,
