@@ -1186,10 +1186,13 @@ HALF_TWIN = {
 }
 HALF_ROUND_MARGIN = 4
 # Round-6 routing limits from the paired B300 / B200 A/B (Cake ``HALF_MAX_ROUNDS`` / ``HALF_ROUTE_EXCLUDE``): no half twin past
-# 24 persistent rounds (the half-round saving is inside the twin's full-item overhead: out-proj 66564) and never for the
-# gelu_erf ``xs`` tile (measured tie / loss at M = 638 on both arches).
+# 24 persistent rounds (the half-round saving is inside the twin's full-item overhead: out-proj 66564) and never at the
+# ``xs`` tile: gelu_erf 638 is a tie / loss on both arches, and the norm_gelu / norm_qkv_rope 576 twins, a per-kernel win,
+# cost the img_336 tower row ~1.6 % inside the PDL chain on B300 (the tower row is the acceptance unit).
 HALF_MAX_ROUNDS = 24
-HALF_ROUTE_EXCLUDE = frozenset({("gelu_erf", "xs")})
+HALF_ROUTE_EXCLUDE = frozenset(
+    {("gelu_erf", "xs"), ("norm_gelu", "xs"), ("norm_qkv_rope", "xs_cs_pf")}
+)
 
 
 def half_tail_split(cluster_tiles: int, clusters: int) -> int:

@@ -362,8 +362,13 @@ def test_select_tile_config_buckets():
         ("residual_wo_sqxw", 10764, "m_tma1"),
         ("residual_wo_sqxw", 4144, "s_e8_pf"),
         ("norm_qkv_rope", 4144, "l_e8_cs_h"),
-        ("norm_qkv_rope", 576, "xs_cs_pf_h"),
-        ("norm_qkv_rope", 264, "xs_cs_pf_h"),
+        ("norm_qkv_rope", 1152, "s_cs_h"),
+        (
+            "norm_qkv_rope",
+            576,
+            "xs_cs_pf",
+        ),  # HALF_ROUTE_EXCLUDE: the xs tile never takes its twin
+        ("norm_gelu", 576, "xs"),
         ("norm_qkv_rope", 256, "xs_cs_pf"),
         ("rmsnorm", 4144, "l_h"),
         ("gelu_erf", 1196, "s_h"),
@@ -409,12 +414,16 @@ def test_select_tile_config_buckets():
             getattr(b, f) for f in fields
         ), name
     assert not any(select_tile_config("pos_sqxw", m).half for m in range(1, 65537, 128))
-    # Final-head limits (Cake HALF_MAX_ROUNDS / HALF_ROUTE_EXCLUDE): no twin past 24 persistent rounds, never (gelu_erf, xs).
+    # Final-head limits (Cake HALF_MAX_ROUNDS / HALF_ROUTE_EXCLUDE): no twin past 24 persistent rounds, never at the xs tile.
     assert cb.HALF_MAX_ROUNDS == 24 and set(cb.HALF_ROUTE_EXCLUDE) == {
-        ("gelu_erf", "xs")
+        ("gelu_erf", "xs"),
+        ("norm_gelu", "xs"),
+        ("norm_qkv_rope", "xs_cs_pf"),
     }
     assert not any(
-        select_tile_config("gelu_erf", m).name == "xs_h" for m in range(1, 20001)
+        select_tile_config(variant, m).name in ("xs_h", "xs_cs_pf_h")
+        for variant in ("gelu_erf", "norm_gelu", "norm_qkv_rope")
+        for m in range(1, 20001)
     )
     assert all(
         not select_tile_config(variant, m).half
@@ -538,7 +547,7 @@ def test_required_kernel_keys():
     assert (
         len(REQUIRED_KERNEL_KEYS["sm_100a"]),
         len(REQUIRED_KERNEL_KEYS["sm_103a"]),
-    ) == (74, 78)
+    ) == (72, 76)  # xs twins never routed (xs-tile HALF_ROUTE_EXCLUDE)
     for keys in REQUIRED_KERNEL_KEYS.values():
         gemm_keys = [k for k in keys if k.startswith("gemm:")]
         # Small-M tiles of the per-layer forms are always inside their PDL_EARLY window: only the pdle
@@ -574,21 +583,18 @@ def test_required_kernel_keys():
         # plain PDL binary of a tile is registered only where it is reachable (e.g. norm_qkv_rope s_cs at
         # 769..1536 is always inside the window -> only its pdle form exists).
         pdle = [k for k in gemm_keys if k.endswith(":pdle")]
-        # Round 6 (final head, rounds cap 24 / gelu_erf xs excluded): + 23 half-N twin keys (12 twins in their reachable
-        # PDL forms; xs_h only via norm_gelu) = 66 GEMM keys, 41 of them pdle.
+        # Round 6 (final head, rounds cap 24 / xs tile excluded): + 21 half-N twin keys (10 twins in their reachable
+        # PDL forms; the xs twins are never routed) = 64 GEMM keys, 39 of them pdle.
         half = [k for k in gemm_keys if TILE_CONFIGS[k.split(":")[2]].half]
-        assert len(pdle) == 41 and len(gemm_keys) == len(set(gemm_keys)) == 66
-        assert len(half) == 23 and {k.split(":")[2] for k in half} == set(
+        assert len(pdle) == 39 and len(gemm_keys) == len(set(gemm_keys)) == 64
+        assert len(half) == 21 and {k.split(":")[2] for k in half} == set(
             cb.HALF_TWIN.values()
-        )
+        ) - {"xs_h", "xs_cs_pf_h"}
         assert (
             "gemm:residual_wo_sqxw:m_tma1_h:pdle" in half
             and "gemm:residual_wo_sqxw:m_tma1_h" in half
         )
-        assert (
-            "gemm:norm_qkv_rope:xs_cs_pf_h:pdle" in half
-            and "gemm:norm_qkv_rope:xs_cs_pf_h" not in gemm_keys
-        )
+        assert not any(k.split(":")[2] in ("xs_h", "xs_cs_pf_h") for k in gemm_keys)
         assert (
             "gemm:gelu_erf:xs_h" not in gemm_keys
             and "gemm:gelu_erf:xs_h:pdle" not in gemm_keys
@@ -678,9 +684,9 @@ CONTRACT_ROW_GEMM_KEYS = {
         144,
         (
             "xs_pf",
-            "xs_cs_pf_h:pdle",
+            "xs_cs_pf:pdle",
             "xs_pf:pdle",
-            "xs_h:pdle",
+            "xs:pdle",
             "xs_pf:pdle",
             "xs_pf:pdle",
             "xs:pdle",
@@ -899,7 +905,7 @@ CONTRACT_ROW_GEMM_KEYS = {
         62,
         (
             "xs_pf",
-            "xs_cs_pf_h:pdle",
+            "xs_cs_pf:pdle",
             "xs_pf:pdle",
             "s:pdle",
             "xs_pf:pdle",
@@ -913,7 +919,7 @@ CONTRACT_ROW_GEMM_KEYS = {
         58,
         (
             "xs_pf",
-            "xs_cs_pf_h:pdle",
+            "xs_cs_pf:pdle",
             "xs_pf:pdle",
             "s:pdle",
             "xs_pf:pdle",
@@ -2178,7 +2184,7 @@ def test_plan_on_cpu_device_needs_sm_count():
     assert plan.total_tokens == 264 and plan.merged_tokens == 62
     assert plan.gemm_configs == {
         "pos_sqxw": "xs_pf",
-        "norm_qkv_rope": "xs_cs_pf_h",
+        "norm_qkv_rope": "xs_cs_pf",
         "residual_wo_sqxw": "xs_pf",
         "norm_gelu": "s",
         "residual_fc1_sqxw": "xs_pf",
@@ -2224,7 +2230,7 @@ def test_plan_on_cpu_device_needs_sm_count():
     )
     assert plan.gemm_kernel_keys == {
         "pos_sqxw": "gemm:pos_sqxw:xs_pf",
-        "norm_qkv_rope": "gemm:norm_qkv_rope:xs_cs_pf_h:pdle",
+        "norm_qkv_rope": "gemm:norm_qkv_rope:xs_cs_pf:pdle",
         "residual_wo_sqxw": "gemm:residual_wo_sqxw:xs_pf:pdle",
         "norm_gelu": "gemm:norm_gelu:s:pdle",
         "residual_fc1_sqxw": "gemm:residual_fc1_sqxw:xs_pf:pdle",
