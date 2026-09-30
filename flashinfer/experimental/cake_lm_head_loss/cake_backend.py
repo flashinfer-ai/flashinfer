@@ -1763,9 +1763,24 @@ def chunked_lm_head_loss(
     backend: str = "cake",
 ):
     """Differentiable chunked LM-head + loss (see the module docstring); returns the FP32 scalar
-    ``loss`` and, with ``return_logp``, the detached FP32 ``logp [T]``."""
+    ``loss`` and, with ``return_logp``, the detached FP32 ``logp [T]``.
+
+    ``grad_weight_dtype`` must equal ``W.dtype`` here: PyTorch's autograd engine
+    casts every gradient to its leaf's dtype, so an FP32 ``dW`` cannot leave
+    this entry through ``W.grad`` for a BF16 ``W``.  Use ``forward_loss(...,
+    need_dw=True)`` + ``backward_loss(dx_acc, dw_acc, g, grad_weight_dtype=
+    torch.float32)`` for an FP32 weight gradient.
+    """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
+    if grad_weight_dtype not in GRAD_WEIGHT_DTYPES:
+        raise ValueError("grad_weight_dtype must be torch.bfloat16 or torch.float32")
+    if grad_weight_dtype != W.dtype:
+        raise ValueError(
+            f"grad_weight_dtype={grad_weight_dtype} differs from W.dtype={W.dtype}: the autograd engine casts "
+            "every gradient to its leaf's dtype, so this entry cannot return it; use forward_loss(..., need_dw=True) + "
+            "backward_loss(dx_acc, dw_acc, g, grad_weight_dtype=torch.float32) for an FP32 dW"
+        )
     loss, logp = ChunkedLmHeadLossFunction.apply(
         X, W, labels, objective, loss_div, infer_logp, loss_weights, int(chunk_size), bool(return_logp), grad_weight_dtype, deterministic, backend,
     )

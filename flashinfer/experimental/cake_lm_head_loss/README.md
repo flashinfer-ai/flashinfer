@@ -43,7 +43,10 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
 * Backward: `dz = d_t * (1[v = y_t] - softmax(z_t))` in BF16 (the `dlogits`
   boundary), `dX = dz @ W` and `dW = dz^T @ X` accumulated in FP32 across the
   chunks in a fixed order (no atomics) and cast once at the output: `dX` BF16,
-  `dW` BF16 by default or FP32 with `grad_weight_dtype=torch.float32`.
+  `dW` BF16 by default or FP32 with `grad_weight_dtype=torch.float32` (the
+  FP32 form is served by the explicit `cake_backend.forward_loss` /
+  `backward_loss` pair: the autograd entry casts every gradient to its leaf's
+  dtype and therefore requires `grad_weight_dtype == W.dtype`).
   Gradients are produced only for inputs that require them (a frozen `X` or
   `W` skips its GEMM); the upstream scalar gradient is applied once, in the
   cast.  The saved FP32 accumulators are re-scaled, never mutated, so a

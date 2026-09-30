@@ -98,7 +98,10 @@ def chunked_lm_head_loss(
     grad_weight_dtype : torch.dtype
         dtype of the weight gradient: ``torch.bfloat16`` (default) or
         ``torch.float32``.  ``dW`` is accumulated in FP32 across chunks and
-        cast once at the output boundary.
+        cast once at the output boundary.  Through this autograd entry the
+        value must equal ``W.dtype`` (the autograd engine casts every gradient
+        to its leaf's dtype); an FP32 ``dW`` for a BF16 ``W`` is available from
+        the explicit ``cake_backend.forward_loss`` / ``backward_loss`` pair.
     deterministic : bool
         Only ``True`` is available: fixed sequential chunk order, no atomics,
         bitwise reproducible ``loss``, ``logp``, ``dX`` and ``dW``.
