@@ -65,6 +65,16 @@ from .gemm_svdquant import (
     svdquant_linear as svdquant_linear,
 )
 
+# Dense PrimsTS FP8/NVFP4 GEMMs are imported lazily enough that installations
+# without the experimental CuTe DSL can still import flashinfer.gemm.  The DSL
+# is required only when one of these APIs is launched.
+from ..prims_ts.gemm import fp4_linear as fp4_linear
+from ..prims_ts.gemm import fp4_linear_swiglu as fp4_linear_swiglu
+from ..prims_ts.gemm import fp4_qkv_qknorm_rope as fp4_qkv_qknorm_rope
+from ..prims_ts.gemm import fp8_linear as fp8_linear
+from ..prims_ts.gemm import fp8_linear_swiglu as fp8_linear_swiglu
+from ..prims_ts.gemm import fp8_qkv_qknorm_rope as fp8_qkv_qknorm_rope
+
 from .routergemm import (
     mm_M1_16_K6144_N256 as mm_M1_16_K6144_N256,
     mm_M1_16_K7168_N128 as mm_M1_16_K7168_N128,
@@ -179,6 +189,12 @@ __all__ = (
         "fp8_blockscale_gemm_sm90",
         "mm_bf16_fp4",
         "prepare_bf16_fp4_weights",
+        "fp8_linear",
+        "fp8_linear_swiglu",
+        "fp8_qkv_qknorm_rope",
+        "fp4_linear",
+        "fp4_linear_swiglu",
+        "fp4_qkv_qknorm_rope",
         "mm_M1_16_K6144_N256",
         "mm_M1_16_K7168_N128",
         "mm_M1_16_K7168_N256",
