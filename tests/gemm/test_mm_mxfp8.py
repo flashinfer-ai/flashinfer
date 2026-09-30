@@ -389,6 +389,81 @@ def test_mm_mxfp8_cute_dsl_stale_narrow_tile_tactic_falls_back(m, tile_n):
     _assert_cosine_similarity(torch.mm(input, weight.T), out)
 
 
+@pytest.mark.parametrize(
+    "ab_dtype_name,sf_dtype_name,sf_vec_size",
+    [
+        ("Float4E2M1FN", "Float8E4M3FN", 16),  # NVFP4
+        ("Float4E2M1FN", "Float8E8M0FNU", 32),  # MXFP4
+        ("Float8E4M3FN", "Float8E8M0FNU", 32),  # MXFP8
+    ],
+)
+@pytest.mark.parametrize("tile_n", [8, 16, 32])
+def test_narrow_tile_can_implement_boundary(
+    ab_dtype_name, sf_dtype_name, sf_vec_size, tile_n
+):
+    """CPU-only: a narrow N tile is accepted at kernel N = 32, rejected at 33."""
+    cutlass = pytest.importorskip("cutlass")
+    from flashinfer.gemm.kernels.dense_blockscaled_gemm_sm100 import (
+        Sm100BlockScaledPersistentDenseGemmKernel,
+    )
+
+    def can_implement(tile_n, kernel_n):
+        # swap_ab orientation: kernel M = weight N, kernel N = tokens.
+        return Sm100BlockScaledPersistentDenseGemmKernel.can_implement(
+            getattr(cutlass, ab_dtype_name),
+            getattr(cutlass, sf_dtype_name),
+            sf_vec_size,
+            cutlass.BFloat16,
+            (128, tile_n),
+            (1, 1),
+            256,
+            kernel_n,
+            2048,
+            1,
+            "k",
+            "k",
+            "m",
+        )
+
+    assert can_implement(tile_n, 32)
+    assert not can_implement(tile_n, 33)
+    # Control: a 64-wide tile at N = 33 is accepted, so the rejection above
+    # comes from the narrow-tile bound, not from a dtype or alignment check.
+    assert can_implement(64, 33)
+
+
+def test_mm_mxfp8_cute_dsl_valid_tactics_respect_narrow_tile_bound(monkeypatch):
+    """CPU-only: the tactic list never runs a narrow N tile past 32 kernel-N."""
+    pytest.importorskip("cutlass")
+    from types import SimpleNamespace
+
+    # Only the prefetch heuristic reads the SM count; keep this off the GPU.
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *_: SimpleNamespace(multi_processor_count=148),
+    )
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
+        10, 0, True, torch.bfloat16
+    )
+    n, k = 256, 2048
+
+    def tactics_for(m):
+        a = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="meta")
+        b = torch.empty((n, k), dtype=torch.float8_e4m3fn, device="meta").T
+        out = torch.empty((m, n), dtype=torch.bfloat16, device="meta")
+        return runner.get_valid_tactics(
+            [a, b, None, None, torch.bfloat16, out, None], None
+        )
+
+    tactics = tactics_for(64)
+    assert tactics
+    too_wide = [t for t in tactics if t[0][1] < 64 and (64 if t[2] else n) > 32]
+    assert not too_wide, too_wide
+    # Control: within the envelope (M = 32) narrow swap-AB tiles are offered.
+    assert any(t[0][1] < 64 and t[2] for t in tactics_for(32))
+
+
 def test_mm_mxfp8_invalid_input_dtype():
     _skip_if_unsupported()
     m, n, k = 128, 128, 128
