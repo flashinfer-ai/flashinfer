@@ -392,20 +392,52 @@ def record_dkv_acc_layout(record: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 
+# Layout rules of the model operands (packed / strided trainer inputs, flashinfer-ai/flashinfer#5675).
+#
+# The head-dimension operands (q_latent, q_rope, dout, dq_*) reach the kernels through 4-D TMA descriptors whose
+# global strides are the tensor's own head stride and token stride (the generated ``EncodeTma_*`` reads
+# ``t.stride(ndim - 2)`` / ``t.stride(ndim - 3)`` of the TensorView); the key operands are 2-D TMA gather maps over the
+# row stride (kv_latent, and k_rope in the backward) or 16-byte ``cp.async`` row loads at ``base + offset + row *
+# stride`` (k_rope in the forward).  ``cuTensorMapEncodeTiled`` requires every global stride to be a positive
+# multiple of 16 bytes below 2^40 and the global address to be 16-byte aligned; for BF16 that is a multiple of 8
+# elements.  Nothing else is assumed about the layout: a head stride of 576 (a packed [T, 64, 576] query), 256 (the
+# 192:256 rope channels of the [T, 64, 256] pre-absorption query) or any other admissible value and key row strides
+# of 576 or 704 (a frozen 128-channel indexer key stored alongside) are consumed in place, without a host copy.
+TMA_STRIDE_ELEMENTS = 8  # 16 bytes of BF16: the descriptor stride granule
+TMA_ADDRESS_ALIGN = 16  # bytes: the descriptor's global address
+
+
 def _check_head_tensor(t: torch.Tensor, name: str, last: int) -> None:
+    """``[T, 64, last]`` BF16 with a unit channel stride, TMA-admissible head and token strides and base address."""
     if t.ndim != 3 or t.shape[1] != NUM_HEADS or t.shape[2] != last:
         raise ValueError(f"{name} must be a BF16 [T, {NUM_HEADS}, {last}] tensor")
     if t.dtype != torch.bfloat16:
         raise ValueError(f"{name} must be bfloat16")
-    # Heads are ``last`` apart in a contiguous tensor and ``D_QK`` apart in a view of a packed [T, 64, 576] tensor.
-    if t.stride(2) != 1 or t.stride(1) not in (last, D_QK):
+    if t.stride(2) != 1:
         raise ValueError(
-            f"{name} must be contiguous within a token row (a view of a packed "
-            f"[T, {NUM_HEADS}, {D_QK}] tensor is allowed)"
+            f"{name} must be contiguous along its last dimension, got strides {tuple(t.stride())}"
+        )
+    head, token = int(t.stride(1)), int(t.stride(0))
+    if head < last or head % TMA_STRIDE_ELEMENTS:
+        raise ValueError(
+            f"{name} head stride must be >= {last} elements and a multiple of {TMA_STRIDE_ELEMENTS} elements "
+            f"(16 bytes: TMA descriptor stride), got {head}; slices of a packed [T, {NUM_HEADS}, {D_QK}] query "
+            f"or of the [T, {NUM_HEADS}, 256] pre-absorption query are admitted"
+        )
+    if token <= 0 or token % TMA_STRIDE_ELEMENTS:
+        raise ValueError(
+            f"{name} token stride must be a positive multiple of {TMA_STRIDE_ELEMENTS} elements "
+            f"(16 bytes: TMA descriptor stride), got {token}"
+        )
+    if t.data_ptr() % TMA_ADDRESS_ALIGN:
+        raise ValueError(
+            f"{name} base address must be {TMA_ADDRESS_ALIGN}-byte aligned (TMA global address), "
+            f"got {t.data_ptr() % TMA_ADDRESS_ALIGN} bytes past an aligned address"
         )
 
 
 def _check_key_tensor(t: torch.Tensor, name: str, last: int) -> None:
+    """``[S, last]`` BF16 with a unit column stride, a TMA-admissible row stride and base address."""
     if t.ndim != 2 or t.shape[1] != last:
         raise ValueError(f"{name} must be a BF16 [S, {last}] tensor")
     if t.dtype != torch.bfloat16:
@@ -413,6 +445,18 @@ def _check_key_tensor(t: torch.Tensor, name: str, last: int) -> None:
     if t.stride(1) != 1:
         raise ValueError(
             f"{name} rows must be contiguous (a view of a packed [S, {D_QK}] tensor is allowed)"
+        )
+    row = int(t.stride(0))
+    if row < last or row % TMA_STRIDE_ELEMENTS:
+        raise ValueError(
+            f"{name} row stride must be >= {last} elements and a multiple of {TMA_STRIDE_ELEMENTS} elements "
+            f"(16 bytes: TMA gather descriptor stride / 16-byte rope loads), got {row}; column slices of a "
+            f"packed [S, {D_QK}] or [S, 704] row are admitted"
+        )
+    if t.data_ptr() % TMA_ADDRESS_ALIGN:
+        raise ValueError(
+            f"{name} base address must be {TMA_ADDRESS_ALIGN}-byte aligned (TMA global address), "
+            f"got {t.data_ptr() % TMA_ADDRESS_ALIGN} bytes past an aligned address"
         )
 
 
@@ -427,10 +471,12 @@ def validate_dsa_train_inputs(
     dout: Optional[torch.Tensor] = None,
     allow_empty_queries: bool = False,
 ) -> tuple[int, int, int]:
-    """Shape / dtype validation shared by the entry points.
+    """Shape / dtype / layout validation shared by the entry points.
 
     Returns ``(T, S, topk)``.  Device placement is checked separately so this
-    runs on host tensors.  Zero key rows (``S == 0``) are rejected: the
+    runs on host tensors.  Layouts: see :func:`_check_head_tensor` and
+    :func:`_check_key_tensor` (strided query slices and packed key rows are
+    consumed in place); ``indices`` and ``topk_length`` are contiguous.  Zero key rows (``S == 0``) are rejected: the
     kernels index at least one key row and the FP32 dK/dV accumulators would
     be empty.  Zero query rows (``T == 0``) are rejected unless
     ``allow_empty_queries``: the launch grids clamp to one CTA that would read
@@ -475,6 +521,11 @@ def validate_dsa_train_inputs(
         _check_head_tensor(dout, "dout", D_LATENT)
         if int(dout.shape[0]) != num_queries:
             raise ValueError("dout must have T rows")
+        # ``bwd_delta`` addresses dout as a flat pointer of T * 64 contiguous 512-element rows (one (token, head)
+        # row per warp, 16-byte vector loads at row * 512 + column), so a strided dout would be mis-read there;
+        # it therefore stays contiguous although the main stage reads it through a TMA descriptor.  The eager
+        # ``backward`` and the autograd Function call ``dout.contiguous()`` before validating; only
+        # ``prepare_dsa_train`` callers see this error.
         if not dout.is_contiguous():
             raise ValueError("dout must be contiguous (call .contiguous() first)")
     return num_queries, num_kv, topk
@@ -618,6 +669,7 @@ def offset_gather_kv_indices(
     cu_seqlens_q: torch.Tensor,
     cu_seqlens_k: torch.Tensor,
     *,
+    causal: bool = True,
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Turn per-document key indices into global key rows.
@@ -625,8 +677,15 @@ def offset_gather_kv_indices(
     ``gather_kv_indices [T, topk]`` holds, for query row ``t`` of document
     ``d``, key positions relative to the document's first key
     (``cu_seqlens_k[d]``); ``-1`` or a position ``>= seqlen_k[d]`` is invalid.
-    The result addresses the packed ``kv_*`` tensors; invalid slots become
-    ``-1``.  Runs on device without a host synchronization.
+    Query and key lengths of a document may differ: the query segment is the
+    tail of its key prefix, query ``local_q = t - cu_seqlens_q[d]`` sitting at
+    key position ``(seqlen_k[d] - seqlen_q[d]) + local_q``.  With ``causal``
+    a slot is also invalid when it selects a key after that position
+    (``idx <= (seqlen_k[d] - seqlen_q[d]) + local_q`` is required); the rule
+    is the one of the Cake facade (``globalize_topk_indices``).  The result
+    addresses the packed ``kv_*`` tensors; invalid slots become ``-1``.  A
+    zero-length query segment contributes no rows.  Runs on device without a
+    host synchronization.
     """
     if gather_kv_indices.ndim != 2 or gather_kv_indices.dtype != torch.int32:
         raise ValueError("gather_kv_indices must be an int32 [T, topk] tensor")
@@ -650,6 +709,13 @@ def offset_gather_kv_indices(
     ]
     local = gather_kv_indices.to(torch.int64)
     valid = (local >= 0) & (local < key_len)
+    if causal:
+        # Own key position of row t: (seqlen_k[d] - seqlen_q[d]) + (t - cu_seqlens_q[d]).
+        query_base = cu_seqlens_q[:-1].to(torch.int64)[doc_of_row]
+        own_position = (key_len[:, 0] - seqlens_q[doc_of_row]) + (
+            torch.arange(total_q, device=device, dtype=torch.int64) - query_base
+        )
+        valid &= local <= own_position[:, None]
     result = torch.where(valid, local + key_base, torch.full_like(local, -1)).to(
         torch.int32
     )
@@ -2033,12 +2099,20 @@ def dsa_sparse_attention(
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
+    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_dst_map: Optional[torch.Tensor] = None,
 ):
     """Differentiable sparse attention over global key indices (see the module docstring).
 
-    Inputs are validated on the first call for a binding (see :class:`BindingCache`).
-    ``key_passes`` overrides the backward's key-range-pass policy (``None`` =
-    the registered policy, 1 = single pass; see :func:`plan_key_passes`).
+    Inputs are validated on the first call for a binding (see :class:`BindingCache`);
+    strided query slices and packed key rows are consumed in place (see
+    :func:`_check_head_tensor` / :func:`_check_key_tensor`).  ``key_passes``
+    overrides the backward's key-range-pass policy (``None`` = the registered
+    policy, 1 = single pass; see :func:`plan_key_passes`).  ``dkv_acc`` (caller
+    FP32 ``[S_dst, >= 576]`` accumulated in place: latent columns ``0:512``,
+    rope ``512:576``) and ``dkv_dst_map`` (int32 ``[S]`` destination row per
+    key row, default identity) are handed to the backward; with ``dkv_acc``
+    the ``kv_latent`` / ``k_rope`` gradients are ``None``.
     """
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
@@ -2051,6 +2125,8 @@ def dsa_sparse_attention(
         topk_length,
         float(softmax_scale),
         key_passes,
+        dkv_acc,
+        dkv_dst_map,
     )
     return (out, lse) if return_lse else out
 
@@ -2066,17 +2142,26 @@ def dsa_sparse_attention_varlen(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     *,
+    causal: bool = True,
     topk_length: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
     key_passes: Optional[int] = None,
+    dkv_acc: Optional[torch.Tensor] = None,
+    dkv_dst_map: Optional[torch.Tensor] = None,
 ):
     """Packed multi-document form: per-document ``gather_kv_indices`` are offset by
     ``cu_seqlens_k`` on device (this glue counts in the step time), then the flat
-    kernels run over the packed rows.  ``max_seqlen_q/k`` are accepted for
-    signature parity and not used on the host."""
+    kernels run over the packed rows.  Query and key segment lengths may differ
+    (the query segment is the tail of its key prefix); with ``causal`` the
+    offsetting drops selected keys after the query's own position
+    ``(seqlen_k - seqlen_q) + local_q`` (:func:`offset_gather_kv_indices`).
+    ``max_seqlen_q/k`` are accepted for signature parity and not used on the
+    host.  ``dkv_acc`` / ``dkv_dst_map`` as in :func:`dsa_sparse_attention`."""
     del max_seqlen_q, max_seqlen_k
-    indices = offset_gather_kv_indices(gather_kv_indices, cu_seqlens_q, cu_seqlens_k)
+    indices = offset_gather_kv_indices(
+        gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal=causal
+    )
     return dsa_sparse_attention(
         q_latent,
         q_rope,
@@ -2087,4 +2172,6 @@ def dsa_sparse_attention_varlen(
         softmax_scale=softmax_scale,
         return_lse=return_lse,
         key_passes=key_passes,
+        dkv_acc=dkv_acc,
+        dkv_dst_map=dkv_dst_map,
     )

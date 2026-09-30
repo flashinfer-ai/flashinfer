@@ -24,16 +24,26 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
                                   topk_length=None, softmax_scale=None, return_lse=False)
 ```
 
-* `q_latent [T, 64, 512]`, `q_rope [T, 64, 64]` BF16 (views of a packed
-  `q [T, 64, 576]` are accepted); `kv_latent [S, 512]` (K = V) and
-  `k_rope [S, 64]` BF16 (views of a packed `kv [S, 576]` are accepted).
+* `q_latent [T, 64, 512]`, `q_rope [T, 64, 64]` BF16; `kv_latent [S, 512]`
+  (K = V) and `k_rope [S, 64]` BF16.  Strided views are consumed in place --
+  see "Packed and strided inputs" below.
 * `indices [T, topk]` int32 hold **global** key rows; `-1` or `>= S` marks an
   invalid slot anywhere in the row; `topk_length [T]` int32 optionally
   invalidates slots `>= topk_length[t]`; any positive `topk`.
 * The varlen form takes per-document indices (`gather_kv_indices`, relative
   to `cu_seqlens_k[d]`) and offsets them on device before the flat kernels
-  run; a query's key set is fully described by its index row (the kernels
-  apply no positional mask -- causality is the top-k selector's job).
+  run.  `cu_seqlens_q` and `cu_seqlens_k` are independent: a query segment
+  may be shorter than its key segment, in which case it is the tail of that
+  key prefix -- query `local_q` of document `d` sits at key position
+  `(seqlen_k[d] - seqlen_q[d]) + local_q`.  With `causal=True` (the default)
+  the offsetting also drops selected keys after that position (the rule of
+  the Cake facade: `offset_gather_kv_indices(..., causal=True)` keeps a slot
+  iff `0 <= idx < seqlen_k[d]` and `idx <= (seqlen_k[d] - seqlen_q[d]) +
+  local_q`); with `causal=False` a query's key set is exactly its index row.
+  Either way the kernels apply no positional mask of their own: the offset
+  index rows define the key sets.  A zero-length query segment contributes
+  no rows; a row whose every slot ends up `-1` gives `out = 0`, `lse = -inf`
+  and zero gradients.
 * Forward: `out [T, 64, 512]` BF16 and (with `return_lse=True`) the natural-log
   `lse [T, 64]` FP32 over the valid keys; fully masked rows give `out = 0` and
   `lse = -inf`.  The autograd wrapper also keeps the BF16 output residual
@@ -47,6 +57,32 @@ out = dsa_sparse_attention_varlen(q_latent, q_rope, kv_latent, k_rope, gather_kv
   (registry field `dkv_acc_layout`, `natural` or `permuted`) never crosses the
   API boundary -- a permuted program serves the FP32 mode through its cast
   stage.
+
+### Packed and strided inputs
+
+The kernels read the query operands through TMA descriptors encoded from the
+tensor's own strides and gather the key operands by row stride, so the
+trainer's packed layouts (flashinfer-ai/flashinfer#5675) are consumed in place
+-- no `.contiguous()`, `cat` or copy on the host:
+
+* `q_rope` may be the `192:256` channel slice of the pre-absorption
+  `[T, 64, 256]` query (head stride 256, token stride 16384, storage offset
+  192 elements = 384 B), `q_latent` a view of a packed `[T, 64, 576]` query,
+  or both contiguous.  Rule (`cake_backend._check_head_tensor`): unit channel
+  stride; head and token strides positive multiples of 8 elements (16 bytes,
+  the granule of `cuTensorMapEncodeTiled`'s global strides); head stride at
+  least the slice width; base address 16-byte aligned.
+* `kv_latent` / `k_rope` may be the `0:512` / `512:576` column slices of a
+  packed `[S, 576]` or `[S, 704]` row (a frozen 128-channel indexer key stored
+  alongside).  Rule (`cake_backend._check_key_tensor`): unit column stride;
+  row stride at least the slice width and a multiple of 8 elements; base
+  16-byte aligned (the TMA gather descriptors and the 16-byte rope loads).
+* `indices` stay contiguous int32 `[T, topk]`; `dout` is made contiguous by
+  the eager backward and the autograd wrapper (`bwd_delta` addresses it as
+  flat `[T * 64, 512]` rows).
+* A strided view yields bitwise the same `out`, `lse` and `dq` as the
+  contiguous copy (only descriptor fields and pointer offsets change); dK/dV
+  agree within the FP32 `red.global` reduction spread.
 
 Explicit forward / backward entry points without autograd, a prepared
 allocation-free runner (`prepare_dsa_train`, CUDA-graph capturable) and the

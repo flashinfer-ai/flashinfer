@@ -62,6 +62,7 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
 )
 from tests.test_helpers.cake_dsa_train_reference import (
     calibrate_beta,
+    globalize_gather_indices_loop,
     make_inputs,
     reference_fp64,
     rel_l2,
@@ -334,11 +335,12 @@ def test_offset_gather_kv_indices_matches_loop():
                 if 0 <= v < seq_k[d]:
                     expected[row, j] = v + int(cu_k[d])
             row += 1
-    got = offset_gather_kv_indices(local, cu_q, cu_k)
+    # causal=False: plain offsetting (the causal term has its own tests in the W-B/C block)
+    got = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
     assert got.dtype == torch.int32
     assert torch.equal(got, expected)
     out = torch.empty_like(local)
-    assert offset_gather_kv_indices(local, cu_q, cu_k, out=out) is out
+    assert offset_gather_kv_indices(local, cu_q, cu_k, causal=False, out=out) is out
     assert torch.equal(out, expected)
 
 
@@ -1944,3 +1946,391 @@ def test_autograd_lse_gradient_is_rejected_and_unused_out_gives_no_grad():
         t is not None and t.shape == leaf.shape
         for t, leaf in zip(g, leaves, strict=True)
     )
+
+
+# --- CAKE-756 W-B/C ---
+# Packed / strided trainer layouts and the causal tail-of-prefix varlen rule (flashinfer-ai/flashinfer#5675).  The
+# kernels take the head / token strides of the query operands and the key row stride from the tensors (TMA descriptors
+# encoded from the view; k_rope as storage alias + element offset + row stride), so a view changes descriptor fields
+# only: out, lse, o_lo and dQ must be bitwise identical to the contiguous path; dK / dV are FP32 reductions whose order
+# is not fixed (FP32 tolerance).
+
+
+def _q_rope_as_q256_slice(q_rope):
+    """``q_rope`` as the ``192:256`` channel slice of a ``[T, 64, 256]`` pre-absorption query: head stride 256, token
+    stride 16384, storage offset 192 elements (384 B); the other channels are noise the kernels must not read."""
+    gen = torch.Generator(device=q_rope.device).manual_seed(756)
+    q256 = torch.randn(
+        q_rope.shape[0], NUM_HEADS, 256, device=q_rope.device, generator=gen
+    ).to(torch.bfloat16)
+    q256[:, :, 192:256].copy_(q_rope)
+    view = q256[:, :, 192:256]
+    assert view.stride() == (16384, 256, 1) and view.storage_offset() == 192
+    assert view.data_ptr() == q256.data_ptr() + 384 and view.data_ptr() % 16 == 0
+    return q256, view
+
+
+def _kv_as_packed_row(kv_latent, k_rope, row_stride):
+    """``kv_latent`` / ``k_rope`` as the ``0:512`` / ``512:576`` column slices of a packed ``[S, row_stride]`` row
+    (576 = latent + rope; 704 = with a frozen 128-channel indexer key stored alongside)."""
+    gen = torch.Generator(device=kv_latent.device).manual_seed(row_stride)
+    kv = torch.randn(
+        kv_latent.shape[0], row_stride, device=kv_latent.device, generator=gen
+    ).to(torch.bfloat16)
+    kv[:, :D_LATENT].copy_(kv_latent)
+    kv[:, D_LATENT:D_QK].copy_(k_rope)
+    lat, rope = kv[:, :D_LATENT], kv[:, D_LATENT:D_QK]
+    assert lat.stride() == (row_stride, 1) and rope.stride() == (row_stride, 1)
+    assert rope.storage_offset() == D_LATENT
+    return kv, lat, rope
+
+
+def _forward_backward(q_latent, q_rope, kv_latent, k_rope, indices, dout):
+    out, lse, o_lo = cake_backend.forward(q_latent, q_rope, kv_latent, k_rope, indices)
+    grads = cake_backend.backward(
+        q_latent, q_rope, kv_latent, k_rope, indices, out, o_lo, lse, dout
+    )
+    torch.cuda.synchronize()
+    return (out, lse, o_lo), grads
+
+
+def _assert_same_step(got, ref):
+    """out / lse / o_lo / dq bitwise; dK / dV within the FP32 reduction spread."""
+    for a, b in zip(got[0], ref[0], strict=True):
+        assert torch.equal(a, b)
+    assert torch.equal(got[1][0], ref[1][0]) and torch.equal(got[1][1], ref[1][1])
+    assert max(rel_l2(got[1][2], ref[1][2]), rel_l2(got[1][3], ref[1][3])) < 1e-3
+
+
+def _non_causal_local_indices(inp, gen, *, masked_docs=()):
+    """Distinct uniform picks over the whole document (deliberately including keys after the query), 10 % of the
+    slots ``-1`` anywhere, and every slot ``-1`` for the documents in ``masked_docs``."""
+    local = torch.empty_like(inp.idx_local)
+    cu_q = inp.cu_seqlens_q.tolist()
+    topk = inp.topk
+    for d, (lq, lk) in enumerate(zip(inp.seq_q, inp.seq_k, strict=True)):
+        picks = torch.rand(
+            lq, max(lk, topk), device=local.device, generator=gen
+        ).argsort(dim=-1)[:, :topk]
+        rows = torch.where(picks < lk, picks, torch.full_like(picks, -1)).to(torch.int32)
+        if d in masked_docs:
+            rows.fill_(-1)
+        local[cu_q[d] : cu_q[d + 1]] = rows
+    drop = torch.rand(local.shape, device=local.device, generator=gen) < 0.1
+    return torch.where(drop, torch.full_like(local, -1), local)
+
+
+# Host layer
+
+
+def test_offset_gather_kv_indices_causal_tail_of_prefix():
+    """The varlen rule of the Cake facade: query ``local_q`` of document ``d`` sits at key position
+    ``(seqlen_k[d] - seqlen_q[d]) + local_q`` and, with ``causal`` (the default), attends selected keys ``<=``
+    that position only; ``causal=False`` is the plain offsetting; a zero-query document contributes no rows."""
+    # documents: tail (3 queries, 5 keys), tail (2 queries, 6 keys), keys without queries, full (4 x 4)
+    cu_q = torch.tensor([0, 3, 5, 5, 9], dtype=torch.int32)
+    cu_k = torch.tensor([0, 5, 11, 14, 18], dtype=torch.int32)
+    local = torch.tensor(
+        [
+            [0, 1, 2, -1, 4],  # doc 0, position (5 - 3) + 0 = 2: 4 beyond the bound
+            [1, 0, 3, 4, -1],  # position 3: 4 beyond
+            [2, 1, 0, 4, 5],  # position 4: 5 >= seqlen_k
+            [4, 5, 3, -1, 6],  # doc 1, position (6 - 2) + 0 = 4: 5 beyond, 6 >= seqlen_k
+            [5, 4, 0, 6, -1],  # position 5: every key <= 5 is causal
+            [0, 1, 2, 3, -1],  # doc 3, position 0
+            [3, 2, 1, 0, 4],  # position 1: 3, 2 beyond, 4 >= seqlen_k
+            [-1, -1, -1, -1, -1],  # fully masked row
+            [3, 0, 1, 2, 3],  # position 3: all causal (a repeated key is a repeated slot)
+        ],
+        dtype=torch.int32,
+    )
+    strict_expected = [
+        [0, 1, 2, -1, -1],
+        [1, 0, 3, -1, -1],
+        [2, 1, 0, 4, -1],
+        [9, -1, 8, -1, -1],
+        [10, 9, 5, -1, -1],
+        [14, -1, -1, -1, -1],
+        [-1, -1, 15, 14, -1],
+        [-1, -1, -1, -1, -1],
+        [17, 14, 15, 16, 17],
+    ]
+    loose_expected = [
+        [0, 1, 2, -1, 4],
+        [1, 0, 3, 4, -1],
+        [2, 1, 0, 4, -1],
+        [9, 10, 8, -1, -1],
+        [10, 9, 5, -1, -1],
+        [14, 15, 16, 17, -1],
+        [17, 16, 15, 14, -1],
+        [-1, -1, -1, -1, -1],
+        [17, 14, 15, 16, 17],
+    ]
+    strict = offset_gather_kv_indices(local, cu_q, cu_k)
+    assert strict.dtype == torch.int32 and strict.tolist() == strict_expected
+    assert torch.equal(strict, offset_gather_kv_indices(local, cu_q, cu_k, causal=True))
+    loose = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
+    assert loose.tolist() == loose_expected
+    for causal, expected in ((True, strict), (False, loose)):
+        assert torch.equal(
+            globalize_gather_indices_loop(local, cu_q, cu_k, causal=causal), expected
+        )
+    out = torch.empty_like(local)
+    assert offset_gather_kv_indices(local, cu_q, cu_k, out=out) is out
+    assert torch.equal(out, strict)
+
+
+def _trainer_host_inputs(total_q=8, total_k=16, topk=5):
+    q256 = torch.zeros(total_q, NUM_HEADS, 256, dtype=torch.bfloat16)
+    q576 = torch.zeros(total_q, NUM_HEADS, D_QK, dtype=torch.bfloat16)
+    kv704 = torch.zeros(total_k, 704, dtype=torch.bfloat16)
+    idx = torch.zeros(total_q, topk, dtype=torch.int32)
+    return q256, q576, kv704, idx
+
+
+def test_validate_accepts_trainer_strided_layouts():
+    """The GLM-5.2 trainer layouts: q_rope as the 192:256 slice of the [T, 64, 256] pre-absorption query (head
+    stride 256, 384 B storage offset), q_latent contiguous or a view of [T, 64, 576], kv_latent / k_rope as column
+    slices of a [S, 704] (indexer key alongside) or [S, 576] row -- and in general any 16-byte-multiple head / row
+    stride with a 16-byte-aligned base."""
+    q256, q576, kv704, idx = _trainer_host_inputs()
+    q_rope = q256[:, :, 192:256]
+    assert q_rope.stride() == (16384, 256, 1) and q_rope.storage_offset() == 192
+    kv576 = kv704[:, :D_QK].contiguous()
+    for q_latent in (q576[..., :D_LATENT], q576[..., :D_LATENT].contiguous()):
+        for kv in (kv704, kv576):
+            assert validate_dsa_train_inputs(
+                q_latent, q_rope, kv[:, :D_LATENT], kv[:, D_LATENT:D_QK], idx
+            ) == (8, 16, 5)
+    # head stride 80 elements (160 B) sliced at channel 8 (16 B); key row stride 520 elements sliced at column 8
+    q80 = torch.zeros(8, NUM_HEADS, 80, dtype=torch.bfloat16)
+    kv520 = torch.zeros(16, 520, dtype=torch.bfloat16)
+    assert validate_dsa_train_inputs(
+        q576[..., :D_LATENT], q80[:, :, 8:72], kv520[:, 8:520], kv704[:, D_LATENT:D_QK], idx
+    ) == (8, 16, 5)
+
+
+def _with(q_latent=None, q_rope=None, kv_latent=None, k_rope=None):
+    """Validator arguments of the trainer layouts with one operand replaced by ``fn(q256, q576, kv704)``."""
+
+    def mutate(q256, q576, kv704, idx):
+        return (
+            q576[..., :D_LATENT] if q_latent is None else q_latent(q256, q576, kv704),
+            q256[:, :, 192:256] if q_rope is None else q_rope(q256, q576, kv704),
+            kv704[:, :D_LATENT] if kv_latent is None else kv_latent(q256, q576, kv704),
+            kv704[:, D_LATENT:D_QK] if k_rope is None else k_rope(q256, q576, kv704),
+            idx,
+        )
+
+    return mutate
+
+
+@pytest.mark.parametrize(
+    "mutate, match",
+    [
+        # head stride 68 elements = 136 B: not a 16-byte multiple
+        (
+            _with(q_rope=lambda q256, q576, kv704: torch.zeros(8, NUM_HEADS, 68, dtype=torch.bfloat16)[..., :D_ROPE]),
+            "head stride",
+        ),
+        # base 8 B into the row: the TMA global address must be 16-byte aligned
+        (
+            _with(q_rope=lambda q256, q576, kv704: torch.zeros(8, NUM_HEADS, 80, dtype=torch.bfloat16)[:, :, 4:68]),
+            "16-byte aligned",
+        ),
+        # head stride below the slice width: heads would overlap
+        (
+            _with(
+                q_rope=lambda q256, q576, kv704: torch.as_strided(
+                    q576, (8, NUM_HEADS, D_ROPE), (NUM_HEADS * D_QK, 32, 1)
+                )
+            ),
+            "head stride",
+        ),
+        # token stride 4100 elements: not a 16-byte multiple
+        (
+            _with(
+                q_latent=lambda q256, q576, kv704: torch.as_strided(
+                    torch.zeros(65536, dtype=torch.bfloat16), (8, NUM_HEADS, D_LATENT), (4100, D_LATENT, 1)
+                )
+            ),
+            "token stride",
+        ),
+        # channel stride 2: the innermost dimension is not contiguous
+        (
+            _with(q_latent=lambda q256, q576, kv704: torch.zeros(8, NUM_HEADS, 2 * D_LATENT, dtype=torch.bfloat16)[..., ::2]),
+            "last dimension",
+        ),
+        # key row stride 700 elements = 1400 B: not a 16-byte multiple
+        (
+            _with(kv_latent=lambda q256, q576, kv704: torch.zeros(16, 700, dtype=torch.bfloat16)[:, :D_LATENT]),
+            "row stride",
+        ),
+        # key base 8 B into the row
+        (_with(kv_latent=lambda q256, q576, kv704: kv704[:, 4:516]), "16-byte aligned"),
+        # key row stride below the slice width: rows would overlap
+        (
+            _with(k_rope=lambda q256, q576, kv704: torch.as_strided(kv704, (16, D_ROPE), (32, 1))),
+            "row stride",
+        ),
+    ],
+)
+def test_validate_rejects_unsupported_strides(mutate, match):
+    q256, q576, kv704, idx = _trainer_host_inputs()
+    with pytest.raises(ValueError, match=match):
+        validate_dsa_train_inputs(*mutate(q256, q576, kv704, idx))
+
+
+# Device tests
+
+
+def test_forward_backward_strided_q_rope_256_bitwise():
+    """``q_rope`` as the ``192:256`` channel slice of a ``[T, 64, 256]`` query (head stride 256, token stride 16384,
+    384 B storage offset) with a contiguous ``q_latent``: forward and backward equal the contiguous path bitwise (the
+    TMA descriptor takes the view's strides; the computation order is unchanged), dK / dV within the FP32 reduction
+    spread; the view is consumed in place, the remembered binding serves it, and the autograd path puts the rope
+    gradient into channels 192:256 of the [T, 64, 256] leaf."""
+    _require_program(backward=True)
+    inp = make_inputs([160, 96], [160, 320], seed=SEED + 756, topk=96)
+    q256, q_rope = _q_rope_as_q256_slice(inp.q_rope)
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    ref = _forward_backward(*args, inp.idx_global, inp.dout)
+    got = _forward_backward(inp.q_latent, q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, inp.dout)
+    _assert_same_step(got, ref)
+    assert q_rope.data_ptr() == q256.data_ptr() + 384 and q_rope.stride() == (16384, 256, 1)
+    again = cake_backend.forward(inp.q_latent, q_rope, inp.kv_latent, inp.k_rope, inp.idx_global)
+    torch.cuda.synchronize()
+    for a, b in zip(again, got[0], strict=True):
+        assert torch.equal(a, b)
+    leaf = q256.detach().clone().requires_grad_()
+    with _quiet_experimental():
+        out = dsa_sparse_attention(inp.q_latent, leaf[:, :, 192:256], inp.kv_latent, inp.k_rope, inp.idx_global)
+    (grad,) = torch.autograd.grad(out, [leaf], inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref[0][0]) and torch.equal(grad[:, :, 192:256], ref[1][1])
+    assert torch.all(grad[:, :, :192] == 0)
+
+
+def test_kv_row_stride_704_bitwise():
+    """``kv_latent = kv[:, :512]`` / ``k_rope = kv[:, 512:576]`` of a packed ``[S, 704]`` row (indexer key alongside)
+    and of a ``[S, 576]`` row: forward and backward equal the contiguous path and each other bitwise (gather
+    descriptor / rope pointer stride only); the ``[S, 704]`` autograd leaf gets its gradient in columns 0:576 only."""
+    _require_program(backward=True)
+    inp = make_inputs([128, 128], [128, 384], seed=SEED + 757, topk=96)
+    ref = _forward_backward(inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, inp.idx_global, inp.dout)
+    got = {}
+    for row_stride in (576, 704):
+        kv, lat, rope = _kv_as_packed_row(inp.kv_latent, inp.k_rope, row_stride)
+        got[row_stride] = _forward_backward(inp.q_latent, inp.q_rope, lat, rope, inp.idx_global, inp.dout)
+        _assert_same_step(got[row_stride], ref)
+    _assert_same_step(got[704], got[576])
+    leaf = kv.detach().clone().requires_grad_()  # the [S, 704] buffer
+    with _quiet_experimental():
+        out = dsa_sparse_attention(
+            inp.q_latent, inp.q_rope, leaf[:, :D_LATENT], leaf[:, D_LATENT:D_QK], inp.idx_global
+        )
+    (grad,) = torch.autograd.grad(out, [leaf], inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out, ref[0][0]) and torch.all(grad[:, D_QK:] == 0)
+    assert max(rel_l2(grad[:, :D_LATENT], ref[1][2]), rel_l2(grad[:, D_LATENT:D_QK], ref[1][3])) < 1e-3
+
+
+def test_varlen_causal_tail_of_prefix_matches_reference():
+    """Query segments that are the tail of their key prefix (seqlen_q < seqlen_k) with gather indices that
+    deliberately select keys beyond the causal bound ``(seqlen_k - seqlen_q) + local_q``: the varlen entry masks
+    exactly those slots (loop reference of the rule; the FP64 reference sees the same set), a zero-query segment
+    contributes no rows, and a segment whose every slot is ``-1`` gives ``out = 0``, ``lse = -inf``, ``dq = 0`` and
+    exact zeros in dK / dV for its keys."""
+    _require_program(backward=True)
+    seq_q, seq_k = [40, 48, 0, 56, 32], [40, 200, 64, 320, 96]  # full, tail, keys only, tail, tail (all -1)
+    inp = make_inputs(seq_q, seq_k, seed=SEED + 758, topk=64)
+    gen = torch.Generator(device="cuda").manual_seed(1)
+    local = _non_causal_local_indices(inp, gen, masked_docs=(4,))
+    cu_q, cu_k = inp.cu_seqlens_q, inp.cu_seqlens_k
+    expected = globalize_gather_indices_loop(local, cu_q, cu_k, causal=True).cuda()
+    assert torch.equal(offset_gather_kv_indices(local, cu_q, cu_k), expected)
+    loose = offset_gather_kv_indices(local, cu_q, cu_k, causal=False)
+    assert torch.equal(loose, globalize_gather_indices_loop(local, cu_q, cu_k, causal=False).cuda())
+    assert ((expected == -1) & (loose != -1)).any(), "the case must select keys beyond the causal bound"
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    (out, lse, _), grads = _forward_backward(*args, expected, inp.dout)
+    leaves = [t.detach().clone().requires_grad_() for t in args]
+    with _quiet_experimental():
+        out_v, lse_v = dsa_sparse_attention_varlen(
+            *leaves, local, cu_q, cu_k, inp.max_seqlen_q, inp.max_seqlen_k, causal=True, return_lse=True
+        )
+    grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out_v, out) and torch.equal(lse_v, lse)
+    assert torch.equal(grads_v[0], grads[0]) and torch.equal(grads_v[1], grads[1])
+    assert max(rel_l2(grads_v[2], grads[2]), rel_l2(grads_v[3], grads[3])) < 1e-3
+    ref = reference_fp64(*args, expected, dout=inp.dout)
+    _check_forward(inp, out_v, lse_v, ref)
+    _check_backward(grads_v, ref)
+    masked = slice(int(cu_q[-2]), int(cu_q[-1]))
+    assert torch.all(lse_v[masked] == float("-inf")) and torch.all(out_v[masked] == 0)
+    assert torch.all(grads_v[0][masked] == 0) and torch.all(grads_v[1][masked] == 0)
+    assert torch.all(grads_v[2][int(cu_k[-2]) :] == 0) and torch.all(grads_v[3][int(cu_k[-2]) :] == 0)
+    with _quiet_experimental():
+        out_nc = dsa_sparse_attention_varlen(*args, local, cu_q, cu_k, causal=False)
+    torch.cuda.synchronize()
+    assert not torch.equal(out_nc, out_v), "without the causal term the same picks attend keys after the query"
+
+
+def test_varlen_segment_with_every_slot_masked_gives_zero_outputs():
+    """A packed segment whose gather rows are all ``-1``: ``out = 0``, ``lse = -inf``, ``dq = 0`` for its rows and
+    exact zeros in dK / dV for its keys; the other segment's row-local results are those of the flat call."""
+    _require_program(backward=True)
+    inp = make_inputs([64, 48], [64, 160], seed=SEED + 759, topk=64)
+    local = inp.idx_local.clone()
+    local[64:] = -1
+    cu_q, cu_k = inp.cu_seqlens_q, inp.cu_seqlens_k
+    glob = offset_gather_kv_indices(local, cu_q, cu_k)
+    assert torch.all(glob[64:] == -1) and torch.equal(glob[:64], inp.idx_global[:64])
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    leaves = [t.detach().clone().requires_grad_() for t in args]
+    with _quiet_experimental():
+        out, lse = dsa_sparse_attention_varlen(*leaves, local, cu_q, cu_k, return_lse=True)
+    grads = torch.autograd.grad(out, leaves, inp.dout)
+    (out_flat, lse_flat, _), grads_flat = _forward_backward(*args, inp.idx_global, inp.dout)
+    torch.cuda.synchronize()
+    assert torch.all(lse[64:] == float("-inf")) and torch.all(out[64:] == 0)
+    assert torch.all(grads[0][64:] == 0) and torch.all(grads[1][64:] == 0)
+    assert torch.all(grads[2][64:] == 0) and torch.all(grads[3][64:] == 0)
+    assert torch.equal(out[:64], out_flat[:64]) and torch.equal(lse[:64], lse_flat[:64])
+    assert torch.equal(grads[0][:64], grads_flat[0][:64]) and torch.equal(grads[1][:64], grads_flat[1][:64])
+    ref = reference_fp64(*args, glob, dout=inp.dout)
+    _check_forward(inp, out, lse, ref)
+    _check_backward(grads, ref)
+
+
+def test_varlen_packed_glm_structure_small():
+    """Scaled-down GLM-5.2 packed batch: 8 segments alternating a full document and the tail of a ~32x longer key
+    prefix, top-k 128, through the varlen entry -- equals the flat call on the generator's global indices (bitwise
+    for out / lse / dq) and the FP64 reference; the generator's causal picks are left untouched by the rule."""
+    _require_program(backward=True)
+    seq_q = [177, 175, 212, 211, 212, 211, 212, 211]
+    seq_k = [177, 5684, 212, 6792, 212, 6792, 212, 6792]
+    inp = make_inputs(seq_q, seq_k, seed=SEED + 760, topk=128)
+    assert torch.equal(
+        offset_gather_kv_indices(inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k), inp.idx_global
+    )
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    (out, lse, _), grads = _forward_backward(*args, inp.idx_global, inp.dout)
+    leaves = [t.detach().clone().requires_grad_() for t in args]
+    with _quiet_experimental():
+        out_v, lse_v = dsa_sparse_attention_varlen(
+            *leaves, inp.idx_local, inp.cu_seqlens_q, inp.cu_seqlens_k, inp.max_seqlen_q, inp.max_seqlen_k,
+            return_lse=True,
+        )
+    grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out_v, out) and torch.equal(lse_v, lse)
+    assert torch.equal(grads_v[0], grads[0]) and torch.equal(grads_v[1], grads[1])
+    assert max(rel_l2(grads_v[2], grads[2]), rel_l2(grads_v[3], grads[3])) < 1e-3
+    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
+    _check_forward(inp, out_v, lse_v, ref)
+    _check_backward(grads_v, ref)
+
+
+# --- end W-B/C ---
