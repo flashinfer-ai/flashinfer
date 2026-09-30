@@ -108,8 +108,12 @@ def test_unsupported_forms_are_declared_not_faked():
     unsupported = kernels.unsupported_forms()
     stages = {item["route"]["stage"] for item in kernels.modules()}
     assert not (set(unsupported) & stages)
-    moe_sort = {"moe_sort_init_t384", "moe_sort_coop_t384_dual_mixed", "moe_sort_init_t896",
-                "moe_sort_coop_t896_bounded"}
+    moe_sort = {
+        "moe_sort_init_t384",
+        "moe_sort_coop_t384_dual_mixed",
+        "moe_sort_init_t896",
+        "moe_sort_coop_t896_bounded",
+    }
     if BACKEND == "cake_cute":
         assert moe_sort <= set(unsupported)
         assert all("grid.sync" in reason for reason in unsupported.values())

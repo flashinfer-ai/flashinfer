@@ -16,7 +16,7 @@
   "contract": {
     "arch": "sm_103a",
     "backend": "cake",
-    "cake_revision": "5d39c6b8c724f50cc92691ce821507a801bb5840",
+    "cake_revision": "0b91f48256ab5b67090b6a89e2abc5694b499eec",
     "carried_rows": {
       "cake": [
         "ep8_r3_t00001_uniform_cycle",
@@ -1954,10 +1954,10 @@
         "sha256": "d6f4222142ed25eb12b0c557d85a02d33eaff68b81caef95deee0347fd5ceb49"
       },
       {
-        "bytes": 37066,
+        "bytes": 37089,
         "kind": "integration",
         "path": "tests/moe/test_cake_mxfp4_situ_moe.py",
-        "sha256": "7d3bd413bf8c25e4e598599ef005c7e4f1bf294b39686ba229075c2126ee75ad"
+        "sha256": "c5a75042c1a4f03fef93b816d66af5418958037567abcd4f9e2bbffa75aa131d"
       }
     ],
     "integration_status": "complete: kernel modules, host plan, kernel loader, tests and docs page rendered; plan parity and coverage checked",
@@ -15379,7 +15379,7 @@
   ],
   "name": "cake_mxfp4_situ_moe",
   "producer": "cake",
-  "producer_revision": "5d39c6b8c724f50cc92691ce821507a801bb5840",
+  "producer_revision": "0b91f48256ab5b67090b6a89e2abc5694b499eec",
   "schema": "cake.library_export.v5",
   "sequences": []
 }
