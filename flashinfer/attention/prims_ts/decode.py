@@ -1043,12 +1043,34 @@ def _normalize_paged_kv_scale_factors(
             )
         if scale.device != k_cache.device:
             raise ValueError(f"{name} must be on {k_cache.device}, got {scale.device}")
-        _validate_exact_compact_strides(
-            scale,
-            name,
-            "[pages, Hkv, page_size, D/16]",
-        )
+        inner_strides = (logical_head_dim // 16, 1)
+        if scale.stride()[2:] != inner_strides:
+            raise ValueError(
+                f"{name} must have contiguous token/scale strides {inner_strides}, "
+                f"got {scale.stride()[2:]}"
+            )
         _validate_16byte_alignment(scale, name)
+        # Scales are byte-sized. Each head's token/scale slab is contiguous,
+        # but K and V may have independent padding between heads and pages.
+        span = int(scale.shape[2]) * int(scale.shape[3])
+        for stride, extent, dimension in sorted(
+            (int(scale.stride(i)), int(scale.shape[i]), label)
+            for i, label in ((0, "page"), (1, "head"))
+        ):
+            if stride <= 0:
+                raise ValueError(f"{name} {dimension} stride must be positive")
+            if stride > 2**63 - 1:
+                raise ValueError(f"{name} {dimension} stride exceeds signed int64")
+            if stride % 16:
+                raise ValueError(f"{name} {dimension} stride must be 16-byte aligned")
+            if extent > 1:
+                if stride < span:
+                    raise ValueError(
+                        f"{name} {dimension} dimension overlaps another dimension"
+                    )
+                span += (extent - 1) * stride
+        if span - 1 > 2**63 - 1:
+            raise ValueError(f"{name} address span exceeds signed int64")
     return k_sf_cache, v_sf_cache
 
 
@@ -1650,6 +1672,16 @@ def _get_compiled_decode(
                 lengths=False,
             )
 
+        k_sf_head_stride = None
+        k_sf_page_stride = None
+        v_sf_head_stride = None
+        v_sf_page_stride = None
+        if cutlass.const_expr(static_cfg.use_nvfp4_kv):
+            k_sf_head_stride = Int64(k_sf_cache.stride[1])
+            k_sf_page_stride = Int64(k_sf_cache.stride[0])
+            v_sf_head_stride = Int64(v_sf_cache.stride[1])
+            v_sf_page_stride = Int64(v_sf_cache.stride[0])
+
         fmha_decode_launch(
             (
                 batch_size,
@@ -1694,6 +1726,10 @@ def _get_compiled_decode(
             v_token_stride,
             static_full_split_prefix,
             static_native_uniform_kv,
+            k_sf_head_stride=k_sf_head_stride,
+            k_sf_page_stride=k_sf_page_stride,
+            v_sf_head_stride=v_sf_head_stride,
+            v_sf_page_stride=v_sf_page_stride,
         )
 
     reduction_tensor_adapter = None
@@ -1868,8 +1904,24 @@ def _get_compiled_decode(
     attention_sinks_fake = fake_compact(Float32, (1,), 4)
     if cfg.use_nvfp4_kv:
         sf_shape = (physical_pages, num_kv_heads, storage_page_size, head_dim // 16)
-        k_sf_fake = fake_compact(cutlass.Float8E4M3FN, sf_shape, 16)
-        v_sf_fake = fake_compact(cutlass.Float8E4M3FN, sf_shape, 16)
+
+        def fake_scales():
+            # Independent runtime strides let compact and packed caches share
+            # a specialization without copying their scale tensors.
+            return cute.runtime.make_fake_tensor(
+                cutlass.Float8E4M3FN,
+                sf_shape,
+                stride=(
+                    cute.sym_int64(divisibility=1),
+                    cute.sym_int64(divisibility=1),
+                    head_dim // 16,
+                    1,
+                ),
+                assumed_align=16,
+            )
+
+        k_sf_fake = fake_scales()
+        v_sf_fake = fake_scales()
     else:
         k_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
         v_sf_fake = fake_compact(cutlass.Uint8, (1,), 1)
@@ -3628,8 +3680,12 @@ def prepare_prims_ts_batch_decode_with_kv_cache(
         Caller-owned output tensor whose storage remains stable across replays.
     kv_scale_factors : tuple[torch.Tensor, torch.Tensor], optional
         Required for packed NVFP4 K/V stored as uint8. K and V scales are
-        FP8 tensors with width ``D / 16``; V scales use the TRTLLM-GEN
-        4-token interleaved layout. The plan retains these tensors.
+        FP8 tensors shaped ``[pages, Hkv, storage_page_size, D/16]`` with
+        contiguous token/scale dimensions. Head/page strides may be independent,
+        positive, 16-byte aligned, and non-overlapping. K scales are token-major;
+        V scales use the TRTLLM-GEN 4-token interleaved layout. The plan retains
+        the original views, including per-page
+        ``[K_data | K_scale | V_data | V_scale]`` storage.
     seq_len_q : int
         Fixed query length when ``qo_indptr`` is omitted.
     qo_indptr : torch.Tensor, optional
@@ -4096,10 +4152,13 @@ class BatchDecodePagedTSWrapper:
             must be contiguous within each row; the row stride may be any value
             at least ``C``. Inactive tail entries are ignored.
         kv_scale_factors : tuple[torch.Tensor, torch.Tensor], optional
-            Required for packed NVFP4 K/V. Compact FP8 ``(K_SF, V_SF)`` tensors
+            Required for packed NVFP4 K/V. FP8 ``(K_SF, V_SF)`` tensors
             have shape ``[pages, Hkv, storage_page_size, D/16]``; K scales are token-major
-            and V scales use the 4-token interleaved layout. Omit for other
-            dtypes. Scale tensors must not overlap output or workspace storage.
+            and V scales use the 4-token interleaved layout. Token/scale dimensions
+            must be contiguous; head/page strides may be independent, positive,
+            16-byte aligned, and non-overlapping. Original views are used without
+            copying. Omit for other dtypes. Scale tensors must not overlap output
+            or workspace storage.
         qo_indptr : torch.Tensor, optional
             Per-run cumulative query offsets with shape ``[B + 1]``. Required for
             a packed-query plan and rejected for a fixed-query plan.
@@ -4278,9 +4337,13 @@ def batch_decode_with_paged_kv_cache(
     seq_lens_kv : torch.Tensor
         Per-request K/V sequence lengths with shape ``[B]``.
     kv_scale_factors : tuple[torch.Tensor, torch.Tensor], optional
-        Required for packed NVFP4 K/V. Compact FP8 ``(K_SF, V_SF)`` tensors
+        Required for packed NVFP4 K/V. FP8 ``(K_SF, V_SF)`` tensors
         have shape ``[pages, Hkv, storage_page_size, D/16]``; K scales are token-major
-        and V scales use the 4-token interleaved layout. Omit for other dtypes.
+        and V scales use the 4-token interleaved layout. Token/scale dimensions
+        must be contiguous; head/page strides may be independent, positive,
+        16-byte aligned, and non-overlapping. Original views are used without
+        copying, including per-page ``[K_data | K_scale | V_data | V_scale]``
+        storage. Omit for other dtypes.
     seq_len_q : int
         Fixed query length when ``qo_indptr`` is omitted. In packed-query mode,
         a non-default value is a backward-compatible alias for
