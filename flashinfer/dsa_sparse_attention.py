@@ -48,6 +48,7 @@ def dsa_sparse_attention(
     topk_length: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
+    key_passes: Optional[int] = None,
     backend: str = "cake",
 ):
     r"""Differentiable top-k sparse MLA attention with absorbed queries (DeepSeek
@@ -80,6 +81,17 @@ def dsa_sparse_attention(
     return_lse : bool
         Also return the natural-log logsumexp ``[T, 64]`` FP32 of the scaled
         scores over the valid keys (``-inf`` for fully masked rows).
+    key_passes : Optional[int]
+        Number of key-range passes of the backward's main stage.  ``None``
+        (default) applies the registered policy: the key range is split into
+        ``ceil(S * 2304 B / 100 MiB)`` passes when that exceeds one and the
+        whole row fits the pass workspace budget (``T <= 4224`` at top-k 2048),
+        so that each pass's FP32 dK/dV accumulator slice stays L2-resident;
+        otherwise a single pass runs.  ``1`` forces the single pass; a larger
+        value forces that many passes (``<= S``).  The passes carry dQ through
+        an FP32 partial in the workspace (``T * 147,456`` B plus ``T * (4 *
+        topk + 4)`` B, ~608 MiB at ``T = 4096``, top-k 2048); dQ stays bitwise
+        deterministic and the dK/dV accumulation is unchanged.
     backend : str
         Only ``"cake"``.
 
@@ -113,6 +125,7 @@ def dsa_sparse_attention(
         topk_length=topk_length,
         softmax_scale=softmax_scale,
         return_lse=return_lse,
+        key_passes=key_passes,
     )
 
 
@@ -131,6 +144,7 @@ def dsa_sparse_attention_varlen(
     topk_length: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     return_lse: bool = False,
+    key_passes: Optional[int] = None,
     backend: str = "cake",
 ):
     r"""Packed multi-document form of :func:`dsa_sparse_attention`.
@@ -158,4 +172,5 @@ def dsa_sparse_attention_varlen(
         topk_length=topk_length,
         softmax_scale=softmax_scale,
         return_lse=return_lse,
+        key_passes=key_passes,
     )

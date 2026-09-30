@@ -28,9 +28,11 @@ from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 # profile ``abi`` (the keyword set its kernels expect, see ``cake_backend``),
 # the list of kernel ``stages`` it registers, for a backward the layout of its
 # FP32 dK/dV accumulators (``dkv_acc_layout``: ``"natural"`` row-major or
-# ``"permuted"``, internal to the kernels and un-permuted by ``bwd_cast``), and
-# one physical entry per stage (translation units, compile flags, FFI entry,
-# argument plan, grid rule and closure identity).  Populated verbatim by the
+# ``"permuted"``, internal to the kernels and un-permuted by ``bwd_cast``),
+# for a program with key-range passes the host policy that selects them
+# (``key_pass_policy``, see ``cake_backend.KeyPassPolicy``), and one physical
+# entry per stage (translation units, compile flags, FFI entry, argument
+# plan, grid rule and closure identity).  Populated verbatim by the
 # generated-program export; do not edit by hand.
 MODULES: dict[str, dict[str, Any]] = {
     "cake_dsa_h64_train_sm_100a": {
@@ -331,13 +333,33 @@ MODULES: dict[str, dict[str, Any]] = {
 # output, the natural-log LSE and the output residual; ``bwd_delta`` forms
 # delta = rowsum(dO * (O + O_lo)); ``bwd_main`` recomputes P, accumulates the
 # FP32 dK/dV partials and, when ``bwd_dq`` is absent, also dQ; ``bwd_dq`` is
-# the separate dQ pass of a two-pass backward; ``bwd_cast`` turns the FP32
-# dK/dV accumulators into natural-layout BF16 (or FP32) outputs.  A record
-# registers the subset its program uses (``bwd_dq`` and ``bwd_cast`` are
-# optional; a ``permuted`` accumulator layout requires ``bwd_cast``).
-STAGES = ("fwd", "bwd_delta", "bwd_main", "bwd_dq", "bwd_cast")
+# the separate dQ pass of a two-pass backward; ``bwd_compact`` and
+# ``bwd_main_pass`` are the key-range-pass form of the main stage (per pass:
+# compact each row's keys of the pass range, then the main stage over that
+# range, carrying dQ through an FP32 partial) that the host selects instead of
+# ``bwd_main`` when the record's ``key_pass_policy`` yields more than one
+# pass; ``bwd_cast`` turns the FP32 dK/dV accumulators into natural-layout
+# BF16 (or FP32) outputs.  A record registers the subset its program uses
+# (``bwd_dq``, the pass stages and ``bwd_cast`` are optional; a ``permuted``
+# accumulator layout requires ``bwd_cast``).
+STAGES = (
+    "fwd",
+    "bwd_delta",
+    "bwd_main",
+    "bwd_dq",
+    "bwd_compact",
+    "bwd_main_pass",
+    "bwd_cast",
+)
 FORWARD_STAGES = ("fwd",)
-BACKWARD_STAGES = ("bwd_delta", "bwd_main", "bwd_dq", "bwd_cast")
+BACKWARD_STAGES = (
+    "bwd_delta",
+    "bwd_main",
+    "bwd_dq",
+    "bwd_compact",
+    "bwd_main_pass",
+    "bwd_cast",
+)
 ARCH_NVCC_FLAGS = {
     "sm_100a": sm100a_nvcc_flags,
     "sm_103a": sm103a_nvcc_flags,

@@ -34,18 +34,25 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     D_QK,
     D_ROPE,
     DKV_ACC_LAYOUTS,
+    DQ_PARTIAL_BYTES_PER_TOKEN,
+    KEY_PASS_STAGES,
     NUM_HEADS,
     SUPPORTED_ABIS,
     SUPPORTED_COMPUTE_CAPABILITIES,
     WORKSPACE_ALIGN,
     BindingCache,
+    KeyPassPolicy,
     backward_binding_key,
     bind_stage,
     default_softmax_scale,
+    dsa_train_workspace_size,
     forward_binding_key,
     generated_program_available,
     grid_dims,
+    key_pass_dq_mode,
+    key_pass_ranges,
     offset_gather_kv_indices,
+    plan_key_passes,
     prepare_dsa_train,
     record_abi,
     record_dkv_acc_layout,
@@ -132,6 +139,15 @@ def test_registry_records_are_well_formed():
         assert "fwd" in stages
         if "bwd_main" in stages:
             assert record_dkv_acc_layout(record) in DKV_ACC_LAYOUTS
+        if any(stage in stages for stage in KEY_PASS_STAGES):
+            # the key-range-pass form comes as a pair, next to the single-pass stage, with its host policy
+            assert set(KEY_PASS_STAGES) <= set(stages) and "bwd_main" in stages
+            policy = KeyPassPolicy.from_record(record)
+            assert policy is not None
+            assert policy.token_chunk(2048) % policy.token_chunk_multiple == 0
+            assert policy.passes(1, 1, 2048) == 1
+        else:
+            assert plan_key_passes(record, stages, 4096, 65536, 2048) == 1
         for stage in stages:
             physical = record[stage]
             assert len(physical["sources"]) == 2
@@ -168,6 +184,107 @@ def test_workspace_layout(abi, backward):
     assert ("packed_q" in layout) == (abi == ABI_SEED)
     assert layout["tma_descriptor_workspace"][1] == 1024
     assert layout["topk_length"][1] == 300 * 4
+
+
+def test_workspace_layout_key_pass_regions():
+    T, S, topk = 300, 70000, 96
+    kw = dict(abi=ABI_CONTRACT, backward=True, tma_workspace_bytes=896)
+    single = workspace_layout(T, S, topk, **kw)
+    multi = workspace_layout(T, S, topk, key_passes=3, **kw)
+    pass_regions = {"dq_partial", "key_scratch", "pass_counts"}
+    assert not pass_regions & set(single)
+    assert pass_regions <= set(multi)
+    assert multi["dq_partial"][1] == T * DQ_PARTIAL_BYTES_PER_TOKEN
+    assert multi["key_scratch"][1] == T * topk * 4
+    assert multi["pass_counts"][1] == T * 4
+    regions = [k for k in multi if k != "total"]
+    offsets = [multi[k][0] for k in regions]
+    assert offsets == sorted(offsets)
+    assert all(o % WORKSPACE_ALIGN == 0 for o in offsets)
+    assert multi["total"] >= sum(multi[k][1] for k in regions)
+    assert multi["total"] - single["total"] >= T * (
+        DQ_PARTIAL_BYTES_PER_TOKEN + 4 * topk + 4
+    )
+    forward = workspace_layout(
+        T,
+        S,
+        topk,
+        abi=ABI_CONTRACT,
+        backward=False,
+        tma_workspace_bytes=896,
+        key_passes=3,
+    )
+    assert not pass_regions & set(forward)
+
+
+# The policy of the registered programs: one pass per 100 MiB of FP32 dK/dV accumulator
+# (2304 B per key), taken only when the whole row's pass scratch fits 640 MiB.
+_POLICY = dict(
+    l2_budget_bytes=100 << 20,
+    key_bytes=2304,
+    workspace_budget_bytes=640 << 20,
+    token_chunk_multiple=128,
+)
+_ALL_STAGES = (
+    "fwd",
+    "bwd_delta",
+    "bwd_main",
+    "bwd_compact",
+    "bwd_main_pass",
+    "bwd_cast",
+)
+_SINGLE_PASS_STAGES = ("fwd", "bwd_delta", "bwd_main", "bwd_cast")
+
+
+def test_key_pass_policy_rule():
+    policy = KeyPassPolicy(**_POLICY)
+    assert policy.token_chunk(2048) == 4224
+    assert [
+        policy.formula_passes(s)
+        for s in (4096, 45511, 45512, 65536, 91022, 91023, 131072)
+    ] == [1, 1, 2, 2, 2, 3, 3]
+    expected = {
+        (4096, 65536): 2,
+        (4096, 131072): 3,
+        (512, 65536): 2,
+        (4224, 131072): 3,
+        (4225, 131072): 1,  # the whole row exceeds the pass workspace budget
+        (32768, 131072): 1,
+        (65536, 65536): 1,
+        (4096, 45511): 1,
+        (4096, 45512): 2,
+    }
+    assert {k: policy.passes(k[0], k[1], 2048) for k in expected} == expected
+    assert key_pass_ranges(65536, 2) == ((0, 32768), (32768, 65536))
+    assert key_pass_ranges(131072, 3) == ((0, 43691), (43691, 87382), (87382, 131072))
+    assert key_pass_ranges(10, 1) == ((0, 10),)
+    assert key_pass_dq_mode(0, 1) == 0
+    assert [key_pass_dq_mode(i, 3) for i in range(3)] == [1, 2, 3]
+    assert [key_pass_dq_mode(i, 2) for i in range(2)] == [1, 3]
+    assert KeyPassPolicy.from_record({"arch": "sm_100a"}) is None
+    with pytest.raises(ValueError, match="key_bytes"):
+        KeyPassPolicy.from_record(
+            {"key_pass_policy": {k: v for k, v in _POLICY.items() if k != "key_bytes"}}
+        )
+    with pytest.raises(ValueError, match="positive"):
+        KeyPassPolicy.from_record({"key_pass_policy": dict(_POLICY, key_bytes=0)})
+
+
+def test_plan_key_passes_override_and_policy():
+    record = {"key_pass_policy": dict(_POLICY)}
+    assert plan_key_passes(record, _ALL_STAGES, 4096, 65536, 2048) == 2
+    assert plan_key_passes(record, _ALL_STAGES, 4096, 4096, 2048) == 1
+    # no registered policy, or no pass stages: the single-pass stage
+    assert plan_key_passes({}, _ALL_STAGES, 4096, 65536, 2048) == 1
+    assert plan_key_passes(record, _SINGLE_PASS_STAGES, 4096, 65536, 2048) == 1
+    # explicit override
+    assert plan_key_passes(record, _ALL_STAGES, 4096, 65536, 2048, key_passes=1) == 1
+    assert plan_key_passes(record, _ALL_STAGES, 4096, 4096, 2048, key_passes=5) == 5
+    for bad in (0, -1, True, 2.5, 4097):
+        with pytest.raises(ValueError):
+            plan_key_passes(record, _ALL_STAGES, 4096, 4096, 2048, key_passes=bad)
+    with pytest.raises(NotImplementedError, match="bwd_compact"):
+        plan_key_passes(record, _SINGLE_PASS_STAGES, 4096, 65536, 2048, key_passes=2)
 
 
 def test_grid_dims():
@@ -548,6 +665,140 @@ def test_bind_stage_serves_permuted_cast_plan(monkeypatch):
     assert record_dkv_acc_layout(record) == "permuted"
     with pytest.raises(ValueError, match="dkv_acc_layout"):
         record_dkv_acc_layout({"arch": "sm_100a", "stages": ["fwd", "bwd_main"]})
+
+
+def test_bind_stage_serves_key_pass_plans(monkeypatch):
+    """The compaction and the pass form of the main stage draw every operand from the
+    contract profile: the pass regions carved from the workspace, ``num_tokens`` = the
+    whole row, the raw indices storage with its element offset, and the key range /
+    ``dq_mode`` of each pass baked into its launch (a remembered binding re-supplies
+    only the tensors)."""
+    record = {
+        "arch": "sm_100a",
+        "abi": ABI_CONTRACT,
+        "stages": list(_ALL_STAGES),
+        "dkv_acc_layout": "permuted",
+        "key_pass_policy": dict(_POLICY),
+        "bwd_compact": {
+            "module": "fake",
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["buffer", "indices"],
+                ["buffer", "topk_length"],
+                ["buffer", "key_scratch"],
+                ["buffer", "pass_counts"],
+                ["parameter", "num_tokens"],
+                ["parameter", "topk"],
+                ["parameter", "idx_stride"],
+                ["parameter", "indices_offset"],
+                ["parameter", "has_topk_length"],
+                ["parameter", "token_base"],
+                ["parameter", "token_step"],
+                ["parameter", "pass_lo"],
+                ["parameter", "pass_hi"],
+                ["grid", "grid_x"],
+            ],
+        },
+        "bwd_main_pass": {
+            "module": "fake",
+            "ffi_entry": "run",
+            "arg_plan": [
+                ["buffer", "delta"],
+                ["buffer", "indices"],
+                ["parameter", "num_queries"],
+                ["parameter", "num_kv"],
+                ["parameter", "pass_lo"],
+                ["parameter", "pass_hi"],
+                ["parameter", "dq_mode"],
+                ["buffer", "dq_partial"],
+                ["buffer", "key_scratch"],
+                ["buffer", "pass_counts"],
+                ["grid", "grid_x"],
+            ],
+        },
+        "closure_sha256": "0" * 64,
+    }
+    monkeypatch.setitem(cake_jit.MODULES, "cake_dsa_h64_train_fake", record)
+    monkeypatch.setattr(
+        cake_backend,
+        "load_cake_dsa_train_module",
+        lambda name, stage: SimpleNamespace(run=lambda *a: None),
+    )
+    T, S, topk = 6, 16, 4
+    packed = torch.zeros(T, 2 * topk, dtype=torch.int32)
+    indices = packed[
+        :, topk:
+    ]  # a strided view: bound as its storage alias + element offset
+    t = dict(
+        q_latent=torch.zeros(T, NUM_HEADS, D_LATENT, dtype=torch.bfloat16),
+        q_rope=torch.zeros(T, NUM_HEADS, D_ROPE, dtype=torch.bfloat16),
+        kv_latent=torch.zeros(S, D_LATENT, dtype=torch.bfloat16),
+        k_rope=torch.zeros(S, D_ROPE, dtype=torch.bfloat16),
+        indices=indices,
+        topk_length=torch.full((T,), topk, dtype=torch.int32),
+        delta=torch.zeros(T, NUM_HEADS),
+        dq_partial=torch.zeros(T, DQ_PARTIAL_BYTES_PER_TOKEN // 4),
+        key_scratch=torch.zeros(T, topk, dtype=torch.int32),
+        pass_counts=torch.zeros(T, dtype=torch.int32),
+    )
+    scalars = dict(
+        num_queries=T, num_kv=S, topk=topk, softmax_scale=1.0, has_topk_length=0
+    )
+    values = cake_backend._contract_values(t, scalars, key_passes=3)
+    assert values["num_tokens"] == T and values["idx_stride"] == 2 * topk
+    assert values["indices_storage"] is packed and values["indices_offset"] == topk
+    # the pass regions are the carved tensors, not the single-pass placeholders
+    assert values["dq_partial"] is t["dq_partial"]
+    assert values["key_scratch"] is t["key_scratch"]
+    assert "pass_lo" not in values and "dq_mode" not in values
+    single = cake_backend._contract_values(t, scalars)
+    assert single["dq_partial"] is t["delta"] and single["key_scratch"] is packed
+    assert (single["pass_lo"], single["pass_hi"], single["dq_mode"]) == (0, S, 0)
+    ranges = key_pass_ranges(S, 3)
+    assert ranges == ((0, 6), (6, 12), (12, 16))
+    compact = bind_stage(
+        "cake_dsa_h64_train_fake",
+        "bwd_compact",
+        cake_backend._pass_values(values, 1, 3, ranges[1]),
+        (2, 1, 1),
+    )
+    assert compact.arguments[0] is packed
+    assert compact.arguments[1] is t["topk_length"]
+    assert compact.arguments[2] is t["key_scratch"]
+    assert compact.arguments[3] is t["pass_counts"]
+    assert compact.arguments[4:] == (T, topk, 2 * topk, topk, 0, 0, 1, 6, 12, 2)
+    assert {key for _, key in compact.slots} == {
+        "indices_storage",
+        "indices_offset",
+        "topk_length",
+        "key_scratch",
+        "pass_counts",
+    }
+    for index, (lo, hi) in enumerate(ranges):
+        main = bind_stage(
+            "cake_dsa_h64_train_fake",
+            "bwd_main_pass",
+            cake_backend._pass_values(values, index, 3, (lo, hi)),
+            (T, 1, 1),
+        )
+        assert main.arguments[1] is packed and main.arguments[2:4] == (T, S)
+        assert main.arguments[4:7] == (lo, hi, key_pass_dq_mode(index, 3))
+        assert main.arguments[7] is t["dq_partial"]
+        assert main.arguments[9] is t["pass_counts"]
+    assert [m for m in (1, 2, 3)] == [key_pass_dq_mode(i, 3) for i in range(3)]
+    # a remembered pass launch keeps its key range and dq_mode; the tensors are re-supplied
+    template = main.templated()
+    assert template.arguments[4:7] == (12, 16, 3) and template.arguments[7] is None
+    rebound = template.arguments_for(
+        dict(
+            delta=t["delta"],
+            indices_storage=packed,
+            dq_partial=t["dq_partial"],
+            key_scratch=t["key_scratch"],
+            pass_counts=t["pass_counts"],
+        )
+    )
+    assert rebound[7] is t["dq_partial"] and rebound[4:7] == [12, 16, 3]
 
 
 def test_binding_keys_cover_pointer_shape_stride_dtype_scale_and_lengths():
@@ -937,6 +1188,146 @@ def test_backward_deterministic_dq_and_dkv_spread():
     assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
     spread = max(rel_l2(a[2], b[2]), rel_l2(a[3], b[3]))
     assert spread < 1e-2, f"dkv run-to-run spread {spread}"
+
+
+def _require_key_pass_program():
+    """The registered backward program with the key-range-pass stages (skip otherwise)."""
+    _require_program(backward=True)
+    name, record = record_for(torch.device("cuda"))
+    stages = cake_jit.registered_stages(name)
+    if not set(KEY_PASS_STAGES) <= set(stages):
+        pytest.skip("the registered program has no key-range-pass stages")
+    return record, stages
+
+
+def _masked_indices(inp):
+    """Invalid slots anywhere in the row (-1 and out-of-range interleaved, a run in the
+    middle), fully masked rows, and rows whose valid set ``topk_length`` cuts."""
+    S = inp.kv_latent.shape[0]
+    idx = inp.idx_global.clone()
+    idx[3::11] = -1
+    idx[4::11, ::7] = S + 5
+    idx[5::11, 100:164] = -1
+    topk_length = inp.topk_length.clone()
+    topk_length[6::11] = 0
+    topk_length[7::11] = 65
+    return idx, topk_length
+
+
+def test_backward_forced_key_passes_masked_matches_reference_and_is_deterministic():
+    """Three forced key-range passes over 65,536 keys (T = 256) with the masking cases:
+    the plan, the workspace regions, the launch order, the reference gates, bitwise dq
+    across the validating and the remembered path, and agreement with the single pass."""
+    _require_key_pass_program()
+    inp = make_inputs([256], [65536], seed=SEED + 16, topk=2048)
+    idx, topk_length = _masked_indices(inp)
+    fwd_args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope, idx)
+    out, lse, o_lo = cake_backend.forward(*fwd_args, topk_length=topk_length)
+    args = fwd_args + (out, o_lo, lse, inp.dout)
+    runner = prepare_dsa_train(
+        *fwd_args, topk_length=topk_length, dout=inp.dout, backward=True, key_passes=3
+    )
+    assert runner.key_passes == 3
+    expected_order = ["bwd_delta"]
+    for index in range(3):
+        expected_order += [(stage, index) for stage in KEY_PASS_STAGES]
+    if "bwd_cast" in runner.launches:
+        expected_order.append("bwd_cast")
+    assert list(runner.backward_order) == expected_order
+    assert "bwd_main" not in runner.launches
+    assert runner.tensors["dq_partial"].shape == (256, DQ_PARTIAL_BYTES_PER_TOKEN // 4)
+    assert runner.tensors["key_scratch"].shape == (256, 2048)
+    assert runner.tensors["pass_counts"].shape == (256,)
+    assert runner.layout["dq_partial"][1] == 256 * DQ_PARTIAL_BYTES_PER_TOKEN
+    assert runner.workspace.numel() == dsa_train_workspace_size(
+        256, 65536, 2048, inp.q_latent.device, key_passes=3
+    )
+    with _cache(True) as cache:
+        cache.clear()
+        a = cake_backend.backward(*args, topk_length=topk_length, key_passes=3)
+        b = cake_backend.backward(*args, topk_length=topk_length, key_passes=3)
+        single = cake_backend.backward(*args, topk_length=topk_length, key_passes=1)
+        torch.cuda.synchronize()
+        assert cache.misses >= 2 and cache.hits >= 1
+        binding = cache.peek(
+            backward_binding_key(*args, topk_length, default_softmax_scale(), False, 3)
+        )
+    assert binding is not None and binding.key_passes == 3
+    assert binding.holds_no_tensor()
+    assert ("bwd_main_pass", 2) in binding.launches
+    assert {"dq_partial", "key_scratch", "pass_counts"} <= set(binding.owned)
+    # dq is written once per row from the carried FP32 partial: bitwise across runs and paths
+    assert torch.equal(a[0], b[0]) and torch.equal(a[1], b[1])
+    for grads in (
+        a,
+        single,
+    ):  # fully masked rows (by -1 and by topk_length 0) give zero dq
+        assert torch.all(grads[0][3::11] == 0) and torch.all(grads[0][6::11] == 0)
+    ref = reference_fp64(*fwd_args, dout=inp.dout, topk_length=topk_length)
+    _check_backward(a, ref)
+    _check_backward(single, ref)
+    # the passes re-associate the FP32 dq partial sums (agreement well inside the BF16 output);
+    # the dK/dV reductions are the same reds in another order
+    assert rel_l2(a[0], single[0]) < 1e-3 and rel_l2(a[1], single[1]) < 1e-3
+    assert max(rel_l2(a[2], single[2]), rel_l2(a[3], single[3])) < 1e-2
+
+
+def test_backward_whole_row_policy_two_passes_through_public_entry():
+    """The registered policy takes two passes at T = 4096 x S = 65,536 (top-k 2048), through
+    the public entry, against the canonical gates; the 4k x 4k and 32k-token rows stay single-pass."""
+    record, stages = _require_key_pass_program()
+    device = torch.device("cuda")
+    assert plan_key_passes(record, stages, 4096, 65536, 2048) == 2
+    assert plan_key_passes(record, stages, 4096, 131072, 2048) == 3
+    assert plan_key_passes(record, stages, 4096, 4096, 2048) == 1
+    assert plan_key_passes(record, stages, 32768, 131072, 2048) == 1
+    policy_size = dsa_train_workspace_size(4096, 65536, 2048, device)
+    single_size = dsa_train_workspace_size(4096, 65536, 2048, device, key_passes=1)
+    assert policy_size - single_size >= 4096 * (
+        DQ_PARTIAL_BYTES_PER_TOKEN + 4 * 2048 + 4
+    )
+    assert policy_size == dsa_train_workspace_size(
+        4096, 65536, 2048, device, key_passes=2
+    )
+    inp = make_inputs([4096], [65536], seed=SEED + 17, topk=2048)
+    leaves = [
+        t.detach().clone().requires_grad_()
+        for t in (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    ]
+    with _cache(True) as cache:
+        cache.clear()
+        with _quiet_experimental():
+            out = dsa_sparse_attention(*leaves, inp.idx_global)
+        grads = torch.autograd.grad(out, leaves, inp.dout)
+        torch.cuda.synchronize()
+        remembered = [b for b in cache._bindings.values() if b.backward_order]
+        assert len(remembered) == 1 and remembered[0].key_passes == 2
+        assert [k for k in remembered[0].backward_order if isinstance(k, tuple)] == [
+            ("bwd_compact", 0),
+            ("bwd_main_pass", 0),
+            ("bwd_compact", 1),
+            ("bwd_main_pass", 1),
+        ]
+        with _quiet_experimental():
+            out_single = dsa_sparse_attention(*leaves, inp.idx_global, key_passes=1)
+        single = torch.autograd.grad(out_single, leaves, inp.dout)
+        torch.cuda.synchronize()
+        assert (
+            len([b for b in cache._bindings.values() if b.backward_order]) == 2
+        )  # the override is part of the binding key
+    assert torch.equal(out.detach(), out_single.detach())  # the forward is untouched
+    ref = reference_fp64(
+        inp.q_latent,
+        inp.q_rope,
+        inp.kv_latent,
+        inp.k_rope,
+        inp.idx_global,
+        dout=inp.dout,
+    )
+    _check_backward(grads, ref, canonical=True)
+    _check_backward(single, ref, canonical=True)
+    assert rel_l2(grads[0], single[0]) < 1e-3 and rel_l2(grads[1], single[1]) < 1e-3
+    assert max(rel_l2(grads[2], single[2]), rel_l2(grads[3], single[3])) < 1e-2
 
 
 def test_autograd_function_matches_explicit_backward():
