@@ -16,6 +16,9 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 def _pytest(tmp_path: Path, *args: str) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)
+    # The parent run may set PYTEST_ADDOPTS (e.g. "--full"), which the child
+    # pytest cannot parse because it does not load the FlashInfer plugin.
+    env.pop("PYTEST_ADDOPTS", None)
     return subprocess.run(
         [
             sys.executable,
