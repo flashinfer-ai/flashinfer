@@ -24,7 +24,7 @@ Every launch of the call is a generated Cake program:
 
 | Route (host dispatch) | Programs | When |
 | --- | --- | --- |
-| quantization launch + persistent 2-CTA GEMM | `quant:u<units>`, `gemm_tstore` (16-byte aligned output base and a row stride that is a multiple of 8 elements: TMA-store epilogue) or `gemm` (other strides: register epilogue) | `M > 256` unless the family is tabulated for the decode kernel at that row count, and the tabulated `(N, K)` families whose measured best route is the GEMM |
+| quantization launch + persistent 2-CTA GEMM | `quant:u<units>`, `gemm_tstore` (16-byte aligned output base and a row stride that is a multiple of 8 elements: TMA-store epilogue) or `gemm` (other strides: register epilogue); the `_n192` instances of the same epilogues on the tabulated `gemm_bn` rows (the N = 576 `kv_a` family at M > 256: three 192-column tiles instead of 768 padded columns) | `M > 256` unless the family is tabulated for the decode kernel at that row count, and the tabulated `(N, K)` families whose measured best route is the GEMM |
 | quantization launch + decode | `quant:u1`, `decode:t<tok>_p<stages>` | measured table entry with `fused = false` |
 | fused decode | `decode:t<tok>_p<stages>_fused[_res]` | measured table entry with `fused = true` (the token tile is quantized in-CTA; `_res` keeps the quantized token tiles resident for `K <= 256`); above 256 rows only the single-N-tile families (`f_a`, `b_proj`) are tabulated |
 

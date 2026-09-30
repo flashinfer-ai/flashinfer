@@ -613,6 +613,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "qlanes": 4,
             "pf": 4,
         },
+        "5,28,4096": {"route": "gemm", "gemm_bn": 192},
+        "5,28,16384": {"route": "gemm", "gemm_bn": 192},
     },
     "sm_103a": {
         "1,28,1": {
@@ -1195,5 +1197,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "qlanes": 4,
             "pf": 4,
         },
+        "5,28,4096": {"route": "gemm", "gemm_bn": 192},
+        "5,28,16384": {"route": "gemm", "gemm_bn": 192},
     },
 }
