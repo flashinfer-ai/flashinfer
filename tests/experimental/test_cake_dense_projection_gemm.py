@@ -42,6 +42,9 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     operand_view,
     plan_dense_projection_gemm,
     plan_router_fp32_gemm,
+    ROW_RULES,
+    row_rule,
+    swap_small_m,
     prepare_dense_projection_gemm,
     prepare_projection_wgrad,
     prepare_router_fp32_gemm,
@@ -1122,6 +1125,93 @@ def test_wgrad_swap_rule():
     G = torch.empty(100, 256, dtype=torch.bfloat16)
     A, B, transposed = wgrad_views(G, X)
     assert not transposed and A.shape == (256, 100) and B is X
+
+
+def test_batched_small_m_swap_and_row_rules():
+    # MLA weight gradient dW[h] = A_h^T B_h with M = 192, N = 512 (K = T = 1001): the planner runs the transposed GEMM
+    # (A' = B^T [H, 512, T], B' = A^T [H, T, 192], transposed store into the caller's [H, 192, 512] view)
+    H, T, M, N = 4, 1001, 192, 512
+    Q = torch.empty(T, H, M, dtype=torch.bfloat16)
+    dL = torch.empty(T, H, N, dtype=torch.bfloat16)
+    out = torch.empty(H, M, N, dtype=torch.bfloat16)
+    assert swap_small_m(H, M, N, False) and not swap_small_m(1, M, N, False)
+    assert not swap_small_m(H, 512, 192, False) and not swap_small_m(H, M, N, True)
+    plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(
+        Q.permute(1, 2, 0), dL.permute(1, 0, 2), out, sm_count=148, l2_bytes=L2_BYTES
+    )
+    assert (plan.L, plan.M, plan.N, plan.K) == (H, N, M, T)
+    assert plan.a_mn and plan.b_mn and plan.transposed_out and plan.block_n == 256
+    assert plan.template.startswith(
+        "dense_proj_gemm_nn_n256"
+    ) and plan.template.endswith("_t")
+    assert tuple(out3.shape) == (H, M, N)
+    # the rule table: exact (N, K, M) first, then the ragged-M (N, K, None) key, then the ragged-K (N, None, M) key
+    ident = ("sm_100a", True, True, False, True, True)
+    saved = dict(ROW_RULES)
+    try:
+        ROW_RULES.clear()
+        ROW_RULES[ident + (M, None, N)] = {"cta_rows": 256}
+        assert row_rule("sm_100a", True, True, False, True, True, M, T, N) == {
+            "cta_rows": 256
+        }
+        assert row_rule("sm_107a", True, True, False, True, True, M, T, N) == {}
+        ROW_RULES[ident + (M, T, None)] = {"group_m": 8}
+        assert row_rule("sm_100a", True, True, False, True, True, M, T, N) == {
+            "group_m": 8
+        }
+        ROW_RULES[ident + (M, T, N)] = {"group_m": 4}
+        assert row_rule("sm_100a", True, True, False, True, True, M, T, N) == {
+            "group_m": 4
+        }
+        # a rule fills only the knobs the caller left unset
+        ROW_RULES.clear()
+        ROW_RULES[ident + (M, None, N)] = {"cta_rows": 256, "group_m": 8}
+        ruled, *_ = plan_dense_projection_gemm(
+            Q.permute(1, 2, 0),
+            dL.permute(1, 0, 2),
+            out,
+            sm_count=148,
+            l2_bytes=L2_BYTES,
+            arch="sm_100a",
+        )
+        assert (
+            ruled.cta_rows == 256
+            and ruled.group_m == 8
+            and "_m256" in ruled.template
+            and "_g8" in ruled.template
+        )
+        pinned, *_ = plan_dense_projection_gemm(
+            Q.permute(1, 2, 0),
+            dL.permute(1, 0, 2),
+            out,
+            sm_count=148,
+            l2_bytes=L2_BYTES,
+            arch="sm_100a",
+            cta_rows=128,
+        )
+        assert pinned.cta_rows == 128 and pinned.group_m == 8
+    finally:
+        ROW_RULES.clear()
+        ROW_RULES.update(saved)
+
+
+def test_f32_v8_symbol_only_on_the_fp32_register_epilogue():
+    assert (
+        instance_symbol(
+            instance_key(a_mn=False, b_mn=True, out_f32=True, epi="reg", f32_v8=True)
+        )
+        == "dense_proj_gemm_kn_n256_f32_v8"
+    )
+    # the knob is inert on the TMA-store, bf16 and transposed epilogues (same key and symbol as without it)
+    assert instance_key(
+        a_mn=False, b_mn=True, out_f32=True, f32_v8=True
+    ) == instance_key(a_mn=False, b_mn=True, out_f32=True)
+    assert instance_key(a_mn=False, b_mn=True, f32_v8=True) == instance_key(
+        a_mn=False, b_mn=True
+    )
+    assert instance_key(
+        a_mn=True, b_mn=True, out_f32=True, out_t=True, f32_v8=True
+    ) == instance_key(a_mn=True, b_mn=True, out_f32=True, out_t=True)
 
 
 def test_router_layout_classification_and_swap():

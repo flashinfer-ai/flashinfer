@@ -342,6 +342,7 @@ def instance_key(
     promo: str = "none",
     hints: tuple = ("none", "none"),
     group_m: int = 16,
+    f32_v8: bool = False,
 ) -> tuple:
     """The instance tuple the Cake kernel module traces one program per (validation included):
     ``(a_mn, b_mn, out_f32, out_t, block_n, stages, diag, epi, slots, box_rows, cta_rows, pf,
@@ -397,6 +398,10 @@ def instance_key(
         promo,
         hints,
         group_m,
+        bool(f32_v8)
+        and out_f32
+        and epi == "reg"
+        and not out_t,  # only the row-major fp32 register epilogue has the knob
     )
 
 
@@ -404,7 +409,7 @@ def instance_symbol(key: tuple) -> str:
     """Kernel symbol / registry template of an instance key (``dense_proj_gemm_<a><b>_n<N>``
     followed by ``_m256`` for tall tiles, ``_pf<n>`` for a prefetch distance, ``_<promo>`` for an
     L2 promotion, ``_h<a><b>`` for non-default (A, B) eviction hints (first letters, e.g.
-    ``_hen`` = A evict_first / B none), ``_g<n>`` for a non-default raster group, ``_f32``, ``_t``,
+    ``_hen`` = A evict_first / B none), ``_g<n>`` for a non-default raster group, ``_f32``, ``_v8`` for the 256-bit fp32 register stores, ``_t``,
     ``_<epi><slots>`` for the TMA-store epilogue, ``_s<stages>`` for a non-default stage count and
     ``_box<rows>``).  [Cake ``instance_symbol`` L716-L720]"""
     (
@@ -423,6 +428,7 @@ def instance_symbol(key: tuple) -> str:
         promo,
         hints,
         group_m,
+        f32_v8,
     ) = key
     return (
         "dense_proj_gemm_"
@@ -435,12 +441,143 @@ def instance_symbol(key: tuple) -> str:
         + (f"_h{hints[0][0]}{hints[1][0]}" if hints != ("none", "none") else "")
         + (f"_g{group_m}" if group_m != 16 else "")
         + ("_f32" if out_f32 else "")
+        + ("_v8" if f32_v8 else "")
         + ("_t" if out_t else "")
         + (f"_{epi}{slots}" if epi != "reg" else "")
         + (f"_s{stages}" if stages != default_stages(slots, cta_rows, block_n) else "")
         + (f"_box{box_rows}" if box_rows else "")
         + "".join(f"_{d}" for d in diag)
     )
+
+
+def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
+    """Batched rows with M <= 256 and N >= 2 M (the MLA weight gradients: heads = batch, M = head
+    dim, N = latent dim) are computed as the transposed GEMM ``out^T[l] = B[l]^T A[l]^T`` with the
+    transposed store.  [Cake ``swap_small_m``]"""
+    return L > 1 and not transposed_out and M <= 256 and N >= 2 * M
+
+
+# Per-architecture, per-row knob overrides measured in Cake round 2, keyed by the static row identity
+# (arch, A MN-major, B MN-major, fp32 output, transposed output, batched, N, K, M); the ragged token
+# count never keys a rule (M = None for forward / input gradients, K = None for weight gradients).
+# Byte-identical to Cake ``ROW_RULES``.
+ROW_RULES: dict[tuple, dict] = {
+    ("sm_100a", False, False, False, False, False, 576, 6144, None): {"block_n": 128},
+    ("sm_100a", False, False, False, False, False, 2048, 6144, None): {"group_m": 8},
+    ("sm_100a", False, False, False, False, False, 6144, 12288, None): {
+        "cta_rows": 256
+    },
+    ("sm_100a", False, False, False, False, False, 6144, 16384, None): {
+        "cta_rows": 256,
+        "group_m": 8,
+    },
+    ("sm_100a", False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
+    ("sm_100a", False, True, False, False, False, 6144, 32, None): {"cta_rows": 256},
+    ("sm_100a", False, True, False, False, False, 6144, 128, None): {"cta_rows": 256},
+    ("sm_100a", False, True, False, False, False, 6144, 576, None): {
+        "group_m": 8,
+        "stages": 6,
+    },
+    ("sm_100a", False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
+    ("sm_100a", False, True, False, False, False, 6144, 12288, None): {
+        "cta_rows": 256,
+        "group_m": 8,
+    },
+    ("sm_100a", False, True, True, False, False, 2048, 4096, None): {
+        "group_m": 8,
+        "epi": "reg",
+        "f32_v8": True,
+    },
+    ("sm_100a", False, True, True, False, False, 2048, 6144, None): {
+        "group_m": 8,
+        "epi": "reg",
+        "f32_v8": True,
+    },
+    ("sm_100a", False, True, True, False, False, 2048, 16384, None): {
+        "group_m": 8,
+        "epi": "reg",
+        "f32_v8": True,
+    },
+    ("sm_100a", False, True, True, False, False, 6144, 32, None): {"block_n": 128},
+    ("sm_100a", False, True, True, False, False, 6144, 128, None): {"block_n": 128},
+    ("sm_100a", False, True, True, False, False, 6144, 2048, None): {
+        "group_m": 8,
+        "epi": "reg",
+        "f32_v8": True,
+    },
+    ("sm_100a", False, True, True, False, False, 6144, 12288, None): {
+        "epi": "reg",
+        "f32_v8": True,
+    },
+    ("sm_100a", False, True, True, False, False, 16384, 6144, None): {
+        "epi": "reg",
+        "f32_v8": True,
+    },
+    ("sm_100a", True, True, False, False, False, 2048, None, 4096): {"cta_rows": 256},
+    ("sm_100a", True, True, False, False, False, 2048, None, 6144): {"group_m": 4},
+    ("sm_100a", True, True, False, False, False, 6144, None, 12288): {
+        "cta_rows": 256,
+        "group_m": 8,
+    },
+    ("sm_100a", True, True, False, False, False, 12288, None, 6144): {
+        "cta_rows": 256,
+        "group_m": 8,
+    },
+    ("sm_100a", True, True, False, False, False, 16384, None, 6144): {
+        "cta_rows": 256,
+        "group_m": 8,
+    },
+    ("sm_100a", True, True, False, True, False, 32, None, 6144): {"block_n": 128},
+    ("sm_100a", True, True, False, True, False, 128, None, 6144): {"block_n": 128},
+    ("sm_100a", True, True, False, True, True, 192, None, 512): {"cta_rows": 256},
+    ("sm_100a", True, True, False, True, True, 256, None, 512): {"cta_rows": 256},
+    ("sm_100a", True, True, True, False, False, 2048, None, 4096): {"cta_rows": 256},
+    ("sm_100a", True, True, True, False, False, 2048, None, 6144): {
+        "group_m": 8,
+        "epi": "reg",
+        "f32_v8": True,
+    },
+    ("sm_100a", True, True, True, False, False, 2048, None, 16384): {
+        "group_m": 8,
+        "epi": "reg",
+        "f32_v8": True,
+    },
+    ("sm_100a", True, True, True, False, False, 6144, None, 2048): {
+        "group_m": 32,
+        "epi": "reg",
+        "f32_v8": True,
+    },
+    ("sm_100a", True, True, True, False, False, 6144, None, 12288): {"cta_rows": 256},
+    ("sm_100a", True, True, True, False, False, 12288, None, 6144): {"cta_rows": 256},
+    ("sm_100a", True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256},
+    ("sm_100a", True, True, True, True, False, 32, None, 6144): {"block_n": 128},
+    ("sm_100a", True, True, True, True, False, 128, None, 6144): {"block_n": 128},
+}
+
+
+def row_rule(
+    arch: str,
+    a_mn: bool,
+    b_mn: bool,
+    out_f32: bool,
+    out_t: bool,
+    batched: bool,
+    N: int,
+    K: int,
+    M: int,
+) -> dict:
+    """The measured knob overrides of one row identity: the exact (N, K, M) rule, else the
+    ragged-M (N, K, None) rule, else the ragged-K (N, None, M) rule, else empty.  [Cake ``row_rule``]"""
+    ident = (arch, bool(a_mn), bool(b_mn), bool(out_f32), bool(out_t), bool(batched))
+    for tail in (
+        (int(N), int(K), int(M)),
+        (int(N), int(K), None),
+        (int(N), None, int(M)),
+    ):
+        rule = ROW_RULES.get(ident + tail)
+        if rule is not None:
+            return dict(rule)
+    return {}
 
 
 def default_block_n(N: int, b_mn: bool) -> int:
@@ -705,6 +842,8 @@ def plan_dense_projection_gemm(
     promo: Optional[str] = None,
     hints: Optional[tuple] = None,
     group_m: Optional[int] = None,
+    f32_v8: Optional[bool] = None,
+    arch: str = "sm_100a",
 ) -> tuple[GemmPlan, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Validate the views exactly as the Cake launcher does and plan the launch for a device
     with ``sm_count`` SMs and an L2 of ``l2_bytes`` (the two device facts the plan depends on:
@@ -743,12 +882,29 @@ def plan_dense_projection_gemm(
             "dense_projection_gemm: out needs unit inner stride, 16-byte aligned rows / batches "
             f"and base; strides {tuple(O3.stride())}"
         )
+    if swap_small_m(L, M, N, transposed_out):
+        A3, B3 = B3.transpose(1, 2), A3.transpose(1, 2)
+        M, N = N, M
+        transposed_out = True
     a_mn, a_desc = operand_view(A3, "A", k_axis=2)
     b_mn, b_desc = operand_view(B3, "B", k_axis=1)
+    rule = row_rule(
+        arch, a_mn, b_mn, out.dtype == torch.float32, transposed_out, L > 1, N, K, M
+    )
     if block_n is None:
-        block_n = default_block_n(N, b_mn)
+        block_n = rule.get("block_n", default_block_n(N, b_mn))
     if cta_rows is None:
-        cta_rows = default_cta_rows(M, N, K)
+        cta_rows = rule.get("cta_rows", default_cta_rows(M, N, K))
+    if stages is None:
+        stages = rule.get("stages")
+    if epi is None:
+        epi = rule.get("epi")
+    if slots is None:
+        slots = rule.get("slots")
+    if sk == "auto" and "sk" in rule:
+        sk = rule["sk"]
+    if f32_v8 is None:
+        f32_v8 = rule.get("f32_v8", False)
     m_tiles = _ceil_div(M, cta_rows)
     m_tiles += m_tiles % CTA_GROUP
     n_tiles = _ceil_div(N, block_n)
@@ -766,14 +922,19 @@ def plan_dense_projection_gemm(
     mode = epi_mode(out_f32, transposed_out, K, epi)
     nslots = epi_slots(mode, out_f32, block_n, K, slots)
     if pf is None:
-        pf = default_pf(M, N, K)
+        pf = rule.get("pf", default_pf(M, N, K))
     if promo is None:
-        promo = default_promo(m_tiles, n_tiles)
+        promo = rule.get("promo", default_promo(m_tiles, n_tiles))
     if group_m is None:
-        group_m = default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)
+        group_m = rule.get(
+            "group_m", default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)
+        )
     if hints is None:
-        hints = default_hints(
-            a_mn, b_mn, m_tiles, n_tiles, K, group_m, pairs, int(l2_bytes)
+        hints = rule.get(
+            "hints",
+            default_hints(
+                a_mn, b_mn, m_tiles, n_tiles, K, group_m, pairs, int(l2_bytes)
+            ),
         )
     key = instance_key(
         a_mn=a_mn,
@@ -791,6 +952,7 @@ def plan_dense_projection_gemm(
         promo=promo,
         hints=hints,
         group_m=group_m,
+        f32_v8=f32_v8,
     )
     plan = GemmPlan(
         L=L,
@@ -995,6 +1157,7 @@ def prepare_dense_projection_gemm(
     promo: Optional[str] = None,
     hints: Optional[tuple] = None,
     group_m: Optional[int] = None,
+    f32_v8: Optional[bool] = None,
 ) -> PreparedGemm:
     """Validate one binding, plan it for the device and prepare its launch (the only
     allocations of the K1 backend: the stream-K partial slabs, the slice counters and the
@@ -1026,6 +1189,8 @@ def prepare_dense_projection_gemm(
         promo=promo,
         hints=hints,
         group_m=group_m,
+        f32_v8=f32_v8,
+        arch=arch,
     )
     module_name = select_module(arch, plan.template)
     if plan.ws_f32_elems:
