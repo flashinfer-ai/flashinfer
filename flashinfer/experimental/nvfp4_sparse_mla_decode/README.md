@@ -1,6 +1,6 @@
 # NVFP4 sparse MLA decode (SM100/SM103, experimental)
 
-Owner: @stu-cao · Tracking issue: to be opened with the upstream PR · Status: experimental, JIT-only
+Owner: @stu-cao · Tracking issue: [#5716](https://github.com/flashinfer-ai/flashinfer/issues/5716) · Status: experimental, JIT-only
 
 Decode attention for DSA-style sparse MLA (DeepSeek-V3.2, GLM-5) over an NVFP4 KV cache, reading vLLM's
 `nvfp4_ds_mla` rows as stored. Each query token attends to the rows its sparse indexer selected:
