@@ -88,6 +88,9 @@ class MoEEpSplitGraphState:
     ``create_handle``) runs here, outside the capture, and the per-step half
     (``Handle.update``) is recorded inside it.
 
+    A :class:`MoEEpCommunication` backend is already long-lived and needs no
+    handle; for it the state carries ``handle=None``.
+
     It also pins the tensors the graph binds. ``topk_weights`` is bound into
     the handle at creation and ``out`` is the address combine writes, so both
     must be stable buffers whose *contents* the caller overwrites between
@@ -113,11 +116,11 @@ class MoEEpSplitGraphState:
     def __init__(
         self,
         layer: "MoEEpSplitLayer",
-        handle: "Handle",
+        handle: "Handle | None",
         t: "MoEEpTensors",
         out: torch.Tensor,
     ) -> None:
-        """Bind one layer, one persistent handle and one static buffer set.
+        """Bind one layer, its persistent handle (if any) and one static buffer set.
 
         Not public: everything the graph will record has to be established
         outside a capture, which is what
@@ -186,20 +189,19 @@ class MoEEpSplitGraphState:
             # for a second layer that no longer exists.
             raise MoEEpConfigError(
                 "the MoEEpSplitLayer that created this MoEEpSplitGraphState "
-                "has been garbage collected, so its persistent handle refers "
-                "to a destroyed fleet. Keep the layer alive for at least as "
+                "has been garbage collected, so the transport it is bound to "
+                "has been destroyed. Keep the layer alive for at least as "
                 "long as the state and any graph captured from it."
             )
         if owner is not layer:
             raise MoEEpConfigError(
                 "this MoEEpSplitGraphState belongs to a different "
-                "MoEEpSplitLayer. Its persistent handle was created by that "
-                "layer's fleet -- a different communicator and a different set "
-                "of transport buffers -- so running this layer's round trip on "
-                "it would send this layer's tokens over the other layer's "
-                "transport and write the result into the other state's `out` "
-                "buffer. Pass the state returned by THIS layer's "
-                "create_graph_state()."
+                "MoEEpSplitLayer. It is bound to that layer's transport -- a "
+                "different communicator and a different set of transport "
+                "buffers -- so running this layer's round trip on it would "
+                "send this layer's tokens over the other layer's transport and "
+                "write the result into the other state's `out` buffer. Pass "
+                "the state returned by THIS layer's create_graph_state()."
             )
         for name, bound, got in (
             ("hidden_states", self._hidden_states, t.hidden_states),
@@ -242,7 +244,8 @@ class MoEEpSplitGraphState:
         # it would permanently skip the fleet and the comm-runtime teardown
         # below it and leak both. A stranded handle is the smaller leak.
         try:
-            self._handle.destroy()
+            if self._handle is not None:
+                self._handle.destroy()
         except Exception as exc:  # noqa: BLE001
             _logger.warning(
                 "moe_ep split graph-state handle release failed: %s",
@@ -540,11 +543,6 @@ class MoEEpSplitLayer(nn.Module):
                 "buffers and cannot run during CUDA graph capture; call it "
                 "(and one warmup forward) on all EP ranks before capturing."
             )
-        if self._uses_communication():
-            raise MoEEpConfigError(
-                f"comm backend {self._comm_backend_name()!r} does not support "
-                "MoEEpSplitLayer graph states yet."
-            )
         ensure_bootstrap_dist_validated(self._bootstrap)
         validate_split_forward_inputs(
             t.hidden_states,
@@ -575,6 +573,20 @@ class MoEEpSplitLayer(nn.Module):
                 f"device {t.hidden_states.device}, got shape {tuple(out.shape)} "
                 f"dtype {out.dtype} device {out.device} strides {out.stride()}."
             )
+
+        if self._uses_communication():
+            # The communication outlives every forward, so the state only
+            # pins the buffers; creating it here keeps its collective setup
+            # outside the capture.
+            comm = self._ensure_communication(t.topk_ids.shape[1])
+            if not comm.supports_cuda_graph:
+                raise MoEEpConfigError(
+                    f"comm backend {self._comm_backend_name()!r} cannot be "
+                    "captured into a CUDA graph."
+                )
+            state = MoEEpSplitGraphState(self, None, t, out)
+            self._graph_state = state
+            return state
 
         fleet = self._ensure_fleet()
         handle = fleet.create_handle(
@@ -733,6 +745,13 @@ class MoEEpSplitLayer(nn.Module):
                     "same fleet and kernel -- outside the capture, on every EP "
                     "rank, first."
                 )
+            if self._uses_communication():
+                # The communication is persistent and the state owns `out`,
+                # so the round trip records as is.
+                out = self._communication_round_trip(t, graph_state._out)
+                if not capturing:
+                    self._warmed = True
+                return out
             handle = graph_state._handle
             # The per-step half: recompute routing from the (rewritten) ids
             # into the handle's existing buffers. Recorded inside the capture.
@@ -752,8 +771,9 @@ class MoEEpSplitLayer(nn.Module):
         if self._uses_communication():
             if _is_capturing():
                 raise MoEEpConfigError(
-                    f"comm backend {self._comm_backend_name()!r} does not "
-                    "support CUDA graph capture of MoEEpSplitLayer yet."
+                    "capturing MoEEpSplitLayer.forward() needs "
+                    "graph_state=layer.create_graph_state(t), built outside the "
+                    "capture, to pin the buffers the graph binds."
                 )
             out = self._communication_round_trip(t, torch.empty_like(t.hidden_states))
             self._warmed = True

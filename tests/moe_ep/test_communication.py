@@ -246,13 +246,12 @@ class TestSplitLayerRouting:
 
         layer._kernel.compute = capture
         x = torch.arange(16, dtype=torch.float32).view(2, 8)
-        out = layer(
-            MoEEpTensors(
-                hidden_states=x,
-                topk_ids=torch.tensor([[0, 3], [2, 1]]),
-                topk_weights=torch.full((2, 2), 0.5),
-            )
+        t = MoEEpTensors(
+            hidden_states=x,
+            topk_ids=torch.tensor([[0, 3], [2, 1]]),
+            topk_weights=torch.full((2, 2), 0.5),
         )
+        out = layer(t)
 
         torch.testing.assert_close(out, x)
         ctx = seen["ctx"]
@@ -261,16 +260,29 @@ class TestSplitLayerRouting:
         # Padding row carries the invalid id, which is never local.
         assert ctx.recv_topk_idx.tolist() == [[0, 3], [2, 1], [-1, -1]]
 
-        with pytest.raises(MoEEpConfigError, match="graph states"):
-            layer.create_graph_state(
-                MoEEpTensors(
-                    hidden_states=x,
-                    topk_ids=torch.zeros(2, 2, dtype=torch.int64),
-                    topk_weights=torch.ones(2, 2),
-                )
-            )
+        state = layer.create_graph_state(t)
+        out = layer(t, graph_state=state)
+        assert out is state.out
+        torch.testing.assert_close(out, x)
         layer.destroy()
+        assert state.destroyed
         assert loopback_backend["destroyed"]
+
+    def test_graph_state_requires_a_capturable_backend(
+        self, loopback_backend, isolated_single_rank_gloo, monkeypatch
+    ) -> None:
+        layer = _split_layer(_LoopbackConfig())
+        t = MoEEpTensors(
+            hidden_states=torch.zeros(2, 8),
+            topk_ids=torch.zeros(2, 2, dtype=torch.int64),
+            topk_weights=torch.ones(2, 2),
+        )
+        monkeypatch.setattr(
+            _COMMUNICATION_REGISTRY["test_loopback"], "supports_cuda_graph", False
+        )
+        with pytest.raises(MoEEpConfigError, match="CUDA graph"):
+            layer.create_graph_state(t)
+        layer.destroy()
 
 
 class _StubFleetHandle:

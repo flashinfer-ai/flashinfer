@@ -697,7 +697,9 @@ outright and points at the API below.
 
 Capture with `create_graph_state()`, which holds one long-lived handle across
 forwards (the allocating half outside the capture, `Handle.update()` recorded
-inside it):
+inside it). `MoEEpCommunication` backends (e.g. `nvlink_one_sided`) are
+long-lived already; their graph state carries no handle and only pins the
+bound buffers, and the same capture recipe applies:
 
 ```python
 state = layer.create_graph_state(t)          # outside any capture, ALL ranks

@@ -74,6 +74,18 @@ def _random_routing(num_tokens, num_experts, top_k, generator):
     return topk_ids.cuda(), topk_weights.cuda()
 
 
+def _identity_round_trip_reference(x, topk_ids, world_size, experts_per_rank):
+    """Split-layer output with the identity kernel: combine sums one unchanged
+    copy of each token per distinct rank its experts live on."""
+    import torch
+
+    target_ranks = topk_ids.long() // experts_per_rank
+    num_target_ranks = torch.stack(
+        [(target_ranks == r).any(-1) for r in range(world_size)], -1
+    ).sum(-1, keepdim=True)
+    return x.float() * num_target_ranks.float()
+
+
 @pytest.mark.gpu_2
 @pytest.mark.parametrize(("backend", "kernel"), _BACKENDS)
 def test_dispatch_combine_matches_local_reference(backend, kernel):
@@ -196,11 +208,88 @@ def test_split_layer_identity_round_trip_over_nvlink_one_sided():
                 topk_weights=topk_weights,
             )
         )
-        target_ranks = topk_ids.long() // 4
-        num_target_ranks = torch.stack(
-            [(target_ranks == r).any(-1) for r in range(world_size)], -1
-        ).sum(-1, keepdim=True)
-        torch.testing.assert_close(out.float(), x.float() * num_target_ranks.float())
+        torch.testing.assert_close(
+            out.float(), _identity_round_trip_reference(x, topk_ids, world_size, 4)
+        )
     finally:
+        dist.barrier()
+        layer.destroy()
+
+
+@pytest.mark.gpu_2
+@pytest.mark.parametrize(
+    ("backend", "kernel"), [b for b in _BACKENDS if b[0].startswith("nvlink")]
+)
+def test_split_layer_cuda_graph_replays_new_inputs(backend, kernel):
+    """A captured MoEEpSplitLayer forward serves inputs rewritten in place."""
+    import torch
+    import torch.distributed as dist
+
+    from flashinfer.moe_ep import (
+        BootstrapConfig,
+        EpAlgorithm,
+        EpLayout,
+        FleetParams,
+        IdentityConfig,
+        MoEEpLayer,
+        MoEEpTensors,
+        SplitConfig,
+        dummy_moe_weights,
+    )
+
+    rank, world_size = _init_dist()
+    config = _backend_config(backend, kernel)
+    num_tokens, hidden, top_k = 16, 1024, 2
+    num_experts = 4 * world_size
+    generator = torch.Generator().manual_seed(7 + rank)
+    t = MoEEpTensors(
+        hidden_states=torch.empty(
+            num_tokens, hidden, dtype=torch.bfloat16, device="cuda"
+        ),
+        topk_ids=torch.empty(num_tokens, top_k, dtype=torch.int64, device="cuda"),
+        topk_weights=torch.empty(num_tokens, top_k, dtype=torch.float32, device="cuda"),
+    )
+
+    def load_next_step():
+        topk_ids, topk_weights = _random_routing(
+            num_tokens, num_experts, top_k, generator
+        )
+        t.hidden_states.copy_(torch.randn(num_tokens, hidden, generator=generator))
+        t.topk_ids.copy_(topk_ids)
+        t.topk_weights.copy_(topk_weights)
+
+    layer = MoEEpLayer(
+        BootstrapConfig(world_size=world_size, rank=rank),
+        FleetParams(
+            num_experts=num_experts,
+            max_tokens_per_rank=num_tokens,
+            token_hidden_size=hidden,
+            algorithm=EpAlgorithm.LOW_LATENCY,
+            layout=EpLayout.RANK_MAJOR,
+        ),
+        dummy_moe_weights(num_local_experts=4, hidden=hidden),
+        backend=SplitConfig(comm=config, kernel=IdentityConfig()),
+    )
+    try:
+        load_next_step()
+        state = layer.create_graph_state(t)
+        layer.forward(t, graph_state=state)  # eager warmup
+        torch.cuda.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            out = layer.forward(t, graph_state=state)
+        for _ in range(3):
+            load_next_step()
+            graph.replay()
+            torch.cuda.synchronize()
+            torch.testing.assert_close(
+                out.float(),
+                _identity_round_trip_reference(
+                    t.hidden_states, t.topk_ids, world_size, 4
+                ),
+            )
+    finally:
+        torch.cuda.synchronize()
         dist.barrier()
         layer.destroy()
