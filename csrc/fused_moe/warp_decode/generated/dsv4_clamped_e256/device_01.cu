@@ -374,6 +374,20 @@ __device__ __forceinline__ uint32_t mapa_to_rank(uint32_t local_addr, uint32_t r
 }
 
 
+__device__ __forceinline__ float approx_exp2(float x) {
+    float y;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+
+__device__ __forceinline__ float approx_rcp(float x) {
+    float y;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(y) : "f"(x));
+    return y;
+}
+
+
 __device__ __forceinline__ float max_noftz(float a, float b) {
     float c;
     asm("max.f32 %0, %1, %2;" : "=f"(c) : "f"(a), "f"(b));
@@ -625,8 +639,15 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                     float al = act_alpha[expert];
                     float be = act_beta[expert];
                     float neg_cl = -cl;
-                    float beta_sg = be * sg;
-                    float alpha_sg = al * sg;
+                    float _mul_0;
+                    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_0) : "f"(be), "f"(sg));
+                    float beta_sg = _mul_0;
+                    float _mul_1;
+                    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_1) : "f"(al), "f"(1.4426950408889634f));
+                    float alpha_log2 = _mul_1;
+                    float _mul_2;
+                    asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_2) : "f"(sg), "f"(alpha_log2));
+                    float alpha_log2_sg = _mul_2;
                     mbarrier_wait(mma_full_addr + (acc_stage) * 8, _phase_mma_full);
                     asm volatile("tcgen05.fence::after_thread_sync;");
                     float _tmem_load_0[8];
@@ -646,14 +667,24 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                             float lin = _min_0;
                             float _min_1 = fminf(gate_raw, cl);
                             float gate = _min_1;
-                            float _expf_0 = __expf(-(alpha_sg * gate));
-                            float value = (lin * sc * sg + beta_sg) * gate / (1.0f + _expf_0);
+                            float _fma_0 = __fmaf_rn(lin, sg, beta_sg);
+                            float _mul_3;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_3) : "f"(gate), "f"(alpha_log2_sg));
+                            float _exp2_0 = approx_exp2(-_mul_3);
+                            float _rcp_0 = approx_rcp(1.0f + _exp2_0);
+                            float _mul_4;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_4) : "f"(gate), "f"(_rcp_0));
+                            float _mul_5;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_5) : "f"(_fma_0), "f"(_mul_4));
+                            float value = _mul_5;
                             float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, value, 16);
                             float other = _shfl_xor_2;
                             float _fabs_0 = fabsf(value);
                             float _fabs_1 = fabsf(other);
                             float _max_1 = max_noftz(_fabs_0, _fabs_1);
-                            float block_max = _max_1;
+                            float _mul_6;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_6) : "f"(_max_1), "f"(sc));
+                            float block_max = _mul_6;
                             float _shfl_xor_3 = __shfl_xor_sync(0xFFFFFFFF, block_max, 1);
                             float _max_2 = max_noftz(block_max, _shfl_xor_3);
                             block_max = _max_2;
@@ -663,21 +694,32 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                             float _shfl_xor_5 = __shfl_xor_sync(0xFFFFFFFF, block_max, 4);
                             float _max_4 = max_noftz(block_max, _shfl_xor_5);
                             block_max = _max_4;
+                            float _mul_7;
+                            asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_7) : "f"(block_max), "f"(0.16666666666666666f));
                             float _fp8_rt_0;
                             uint16_t _e4m3x2_0;
                             uint32_t _f16x2_0;
-                            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_0) : "f"(0.0f), "f"(block_max * 0.16666666666666666f));
+                            asm volatile("cvt.rn.satfinite.e4m3x2.f32 %0, %1, %2;" : "=h"(_e4m3x2_0) : "f"(0.0f), "f"(_mul_7));
                             asm volatile("cvt.rn.f16x2.e4m3x2 %0, %1;" : "=r"(_f16x2_0) : "h"(_e4m3x2_0));
                             uint16_t _fp8_h0_0 = (uint16_t)(_f16x2_0 & 0xFFFFu);
                             asm volatile("cvt.f32.f16 %0, %1;" : "=f"(_fp8_rt_0) : "h"(_fp8_h0_0));
                             float scale = _fp8_rt_0;
                             float inv_scale = 0.0f;
                             if (scale != 0.0f) {
-                                inv_scale = 1.0f / scale;
+                                float _rcp_1 = approx_rcp(scale);
+                                inv_scale = _rcp_1;
                             }
                             if (lane_1 < 16) {
+                                float _mul_8;
+                                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_8) : "f"(value), "f"(inv_scale));
+                                float _mul_9;
+                                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_9) : "f"(_mul_8), "f"(sc));
+                                float _mul_10;
+                                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_10) : "f"(other), "f"(inv_scale));
+                                float _mul_11;
+                                asm("mul.rn.ftz.f32 %0, %1, %2;" : "=f"(_mul_11) : "f"(_mul_10), "f"(sc));
                                 uint32_t _fp4_pair_0;
-                                asm volatile("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(value * inv_scale), "f"(other * inv_scale));
+                                asm volatile("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(_mul_9), "f"(_mul_11));
                                 if (token < valid_rows) {
                                     int output_byte = (n_tile * 8 + (unsigned int)token) * (unsigned int)(M_out / 2) + m_tile * 16 + (unsigned int)(warp_0 * 8) + (unsigned int)(lane_1 & 7);
                                     C_raw[output_byte] = _fp4_pair_0;

@@ -1,55 +1,72 @@
-# DeepSeek-V4-Flash-0731 routed NVFP4 decode: B200 results
+# Clamped NVFP4 activation rounding — measured results
 
-The public API passes strict BF16 correctness and beats `flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe` at every integer T=1..32. Public/FlashInfer geometric-mean speedup is **1.023236704395×**, with a minimum of **1.003166005574× at T14**. The source launcher also wins every shape: **1.023174595913×** geometric mean, minimum **1.001675704624× at T12**. Neither comparison has ties or baseline regressions.
+**Fresh public qualification passed all 32 shapes. Hardware-limit evidence remains incomplete.**
 
-Geometry is H=4096, I=2048, E=256 routed experts, top-k=6 and clamped SwiGLU limit=10, with BF16 output. The shared expert is outside this routed kernel. Baseline and candidate consume identical physical NVFP4 shuffled MajorK/R128c4 weights and activation representations, routes, scales and equivalent clamped-activation parameters.
+The repair preserves the matched clamped-SwiGLU instruction sequence before FP4 quantization. Up is clamped symmetrically and gate is capped above in the raw accumulator domain. Explicit float32 multiplication boundaries preserve alpha/log2/gate-scale association, FMA, approximate base-2 exponential and reciprocal, and gate-times-reciprocal ordering. ScaleC scales the pairwise maxima before their reduction and is applied after inverse block scaling before FP4 conversion. These instructions reproduce the named baseline globally; they do not introduce input-dependent approximation or corrections for specific values.
 
-Packed FC1 now transposes logical tile order within each complete eight-group stripe. The partial final stripe keeps its original order. Constant shifts and masks implement the permutation; each tile retains its exact arithmetic, quantization, clamp, scale association and output address. Raw work-stealing identities, phases, synchronization, launch ABI and all other device units remain unchanged. The change applies to packed FC1 at T10..32, preserving the existing T1..9 dispatch. Resources remain 352 threads, 48 registers and 64,128 bytes of dynamic shared memory.
+At one observed T4 boundary,13.999999046325684 versus14.0 changed the normalized activation across the FP4 midpoint1.75, producing1.5 versus2.0. The selected kernel and FlashInfer agreed there; the prior independent reference differed. A separate T17 case showed agreement between the old kernel and reference but disagreement with FlashInfer. Recomputing both complete saved cases with the globally matched activation/ScaleC sequence produced BF16 output byte-identical to FlashInfer. This diagnostic motivated the repair and does not replace fresh exported-kernel qualification.
 
-Validation covers 112 CPU feature tests, 13-module source/JIT and loaded-binding closure, 32 strict numerical/source-bitwise cases at atol=rtol=0.01, 576 strict timing postchecks, seven API/graph cases and eight routing fixtures. Eager and graph public outputs match the source launcher bitwise. A separate registered source benchmark also passed all 32 shapes with unchanged thresholds. Its initial current-run attempt timed out after 30 sealed shapes; those exact rows were retained, and a continuation measured T31/T32 afresh. This is a resumed current run, not an uninterrupted run or reuse of historical qualification.
+This arithmetic update changes three generated FC1 device files. The public ABI and13-module dispatch remain unchanged, and the other 10 device units are identical. The public benchmark already uses the named FlashInfer implementation as its clamped-SwiGLU reference.
 
-Eight disjoint four-shape timing shards use six balanced captures per arm, CUPTI and cold L2. Each shape's source, public and FlashInfer arms use the same GPU and physical inputs. The timing boundary includes all required per-call planning, FC1, FC2, routing-weighted finalization and synchronization. Reported times are geometric means of the six capture medians.
+## Validation snapshot
 
-Source/public geometric mean is **1.000060701744×**; a ratio above 1 favors the public API. The public API is slower than source at T=1, 7, 10, 14, 15, 16, 17, 18, 19, 20, 21, 24, 25, 26, 31. All 15 such regressions are included below. These measurements compare the current source and exported implementation against FlashInfer; they are not an all 32 causal A/B comparison against the preceding pair-pack kernel. The earlier matched T15 pilot showed a small source regression, which remains part of the optimization record; no threshold was selected to hide it.
+| Check | Status |
+|---|---|
+| Public CPU tests |112 passed;GPU tests excluded from this count|
+| Independent source primitive and two rounding-block GPU tests |Passed|
+| Focused source/reference/FlashInfer eager and graph checks |Passed|
+| Source-only32-shape measurements |Separate source-only qualification passed; no public credit|
+| Default source registered benchmark |Fresh uninterrupted run passed; distinct from exported-public results|
+| Fresh public/source bitwise and API/graph checks |Passed: 32 strict/source-bitwise rows, 7 API/graph cases and 8 routing cases|
+| Fresh public 32-shape comparison |Independent eight-shard union passed; 576 strict timing postchecks|
+| Synccheck |Skipped after hard 20 s timeout; no reported errors before termination|
+| Racecheck |Skipped after hard 20 s timeout; no reported errors before termination|
 
-| T | Public (µs) | FlashInfer (µs) | FlashInfer/public | Source (µs) | FlashInfer/source | Source/public |
+A separate source-side physical-test module still cannot collect because three inherited regression manifests are absent. Isolated unchanged functions passed only as diagnostics. Source-generator classification coverage retains98 inherited gaps; targeted passing checks do not close that gate. Prior evidence retains its original measured-revision and binary-association limits. Hardware-limit evidence is still incomplete.
+
+## Measurement scope
+
+Target: NVIDIA B200, T1..32, H4096, I2048,256routed experts, top-k6, logical clamp10, BF16 output. The shared expert is outside this routed-expert kernel. All arms consume identical matched NVFP4 physical inputs, routes, scales and equivalent clamp parameters. GPU time uses CUPTI with cold L2 and the same complete-call boundary, retaining all six captures per arm and every shape, including ties or regressions. Per-shape qualification requires speedup strictly greater than1.0 against `flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe`.
+
+The source-only measurements and exported public measurements are separate cohorts. The public table below contains the repaired source, exported public kernel and baseline measured together in this fresh cohort. The source-only results and historical measurements are separate. The fixtures are synthetic matched NVFP4 inputs; full actual-checkpoint pipeline performance is not claimed.
+
+Public geometric-mean speedup **1.022945505290×**, source control **1.023093566763×**; all 32 shapes beat FlashInfer, with no shape-level ties or regressions. Minimum public win: T14, 161.733106057487 vs 162.415976097617 µs, **1.004222203214×**. Maximum: T1, 24.949130388465 vs 28.994138921309 µs, **1.162130241410×**. Public was slower than its source control at 18 shapes: **1, 5, 6, 7, 10, 14, 15, 18, 21, 22, 24, 25, 26, 27, 28, 30, 31, 32**; every comparison is retained.
+
+Capture-level counts across the retained 192 captures (wins/ties/losses): public speedup 192/0/0; source speedup 192/0/0; source over public 77/5/110. Fixed six-capture descriptive variation is not a confidence interval; marginal order positions are balanced but are not independent factorial trials.
+
+Successful r1 public GPU cohort physical turnaround: **3264.050982952 s** (earliest controller submission to latest completion); aggregate wrapper worker duration: **5573.945842369 s**. This span includes scheduler queues and the profiling interleave, but excludes failed r0 identity-guard attempts, preparation/JIT and later CPU reductions. It is separate from measured complete-call GPU latency.
+
+| T | Source µs | Public µs | FlashInfer µs | Public speedup | Source speedup | Source/public |
 |---:|---:|---:|---:|---:|---:|---:|
-| 1 | 25.140630 | 29.309442 | 1.165819713× | 25.012054 | 1.171812667× | 0.994885741× |
-| 2 | 41.231592 | 44.613083 | 1.082012131× | 41.237215 | 1.081864610× | 1.000136358× |
-| 3 | 55.924570 | 59.999018 | 1.072856144× | 56.074261 | 1.069992133× | 1.002676665× |
-| 4 | 67.845123 | 72.543520 | 1.069251807× | 68.175605 | 1.064068589× | 1.004871132× |
-| 5 | 79.935599 | 83.119246 | 1.039827648× | 79.988789 | 1.039136188× | 1.000665419× |
-| 6 | 91.583283 | 93.962133 | 1.025974718× | 91.620982 | 1.025552560× | 1.000411640× |
-| 7 | 100.820792 | 103.631304 | 1.027876319× | 100.719751 | 1.028907473× | 0.998997817× |
-| 8 | 109.732649 | 111.369506 | 1.014916770× | 109.855410 | 1.013782623× | 1.001118727× |
-| 9 | 121.668812 | 123.012721 | 1.011045635× | 121.679314 | 1.010958368× | 1.000086321× |
-| 10 | 128.516425 | 129.343341 | 1.006434322× | 128.495290 | 1.006599864× | 0.999835543× |
-| 11 | 135.972942 | 137.146476 | 1.008630643× | 136.079152 | 1.007843406× | 1.000781111× |
-| 12 | 145.919108 | 146.655458 | 1.005046290× | 146.410118 | 1.001675705× | 1.003364947× |
-| 13 | 155.215640 | 156.727345 | 1.009739386× | 155.535819 | 1.007660777× | 1.002062806× |
-| 14 | 161.897580 | 162.410148 | 1.003166006× | 161.780948 | 1.003889212× | 0.999279595× |
-| 15 | 169.753923 | 170.409592 | 1.003862465× | 169.716446 | 1.004084141× | 0.999779226× |
-| 16 | 179.385980 | 180.452385 | 1.005944753× | 179.338151 | 1.006213035× | 0.999733375× |
-| 17 | 185.599653 | 189.145753 | 1.019106180× | 185.092475 | 1.021898668× | 0.997267353× |
-| 18 | 189.375291 | 191.940283 | 1.013544493× | 189.092490 | 1.015060320× | 0.998506662× |
-| 19 | 194.996793 | 197.700431 | 1.013865042× | 194.783160 | 1.014977023× | 0.998904428× |
-| 20 | 202.868631 | 205.081861 | 1.010909673× | 202.735323 | 1.011574391× | 0.999342888× |
-| 21 | 210.841967 | 213.220362 | 1.011280463× | 210.303428 | 1.013870120× | 0.997445771× |
-| 22 | 221.796818 | 225.252734 | 1.015581448× | 221.924637 | 1.014996519× | 1.000576287× |
-| 23 | 225.428287 | 229.236077 | 1.016891356× | 225.449791 | 1.016794363× | 1.000095391× |
-| 24 | 237.694963 | 241.070886 | 1.014202756× | 237.241795 | 1.016140037× | 0.998093490× |
-| 25 | 245.470947 | 248.490010 | 1.012299064× | 245.417975 | 1.012517562× | 0.999784203× |
-| 26 | 250.943159 | 253.961973 | 1.012029870× | 250.820485 | 1.012524843× | 0.999511149× |
-| 27 | 256.863321 | 259.802145 | 1.011441195× | 257.103324 | 1.010497029× | 1.000934358× |
-| 28 | 264.532330 | 267.337781 | 1.010605323× | 264.590951 | 1.010381421× | 1.000221602× |
-| 29 | 272.127320 | 274.660244 | 1.009307866× | 272.564485 | 1.007689042× | 1.001606472× |
-| 30 | 281.689660 | 284.260596 | 1.009126837× | 281.860288 | 1.008515949× | 1.000605730× |
-| 31 | 285.684274 | 288.169482 | 1.008699141× | 285.476324 | 1.009433912× | 0.999272096× |
-| 32 | 289.769800 | 294.804113 | 1.017373489× | 290.100254 | 1.016214598× | 1.001140400× |
-
-
-Timings use matched synthetic NVFP4 fixtures, not full actual-checkpoint pipeline timings. Checkpoint packing/conversion and clamp semantics were verified separately. The separate synchronization and race sanitizer invocations each timed out after 20 seconds and remain skipped, not passes; they were not retried. Hardware-limit evidence remains unfinished.
-
-GPU timing-batch physical turnaround was 3978.445475 seconds from first submission to last completion, including scheduling and orchestration gaps. Aggregate worker runtime was 5595.750496 seconds; independent raw reduction used 69.460126 worker seconds. These durations are separate from the GPU timings in the table.
-
-Related: [FlashInfer issue #5184](https://github.com/flashinfer-ai/flashinfer/issues/5184).
+| 1 | 24.916853497 | 24.949130388 | 28.994138921 | 1.162130241410× | 1.163635646255× | 0.998706291914× |
+| 2 | 41.088108903 | 40.997406600 | 44.479939659 | 1.084945203805× | 1.082550179274× | 1.002212391237× |
+| 3 | 56.085264332 | 55.888036205 | 59.989135346 | 1.073380627051× | 1.069606001876× | 1.003528986532× |
+| 4 | 67.439808452 | 67.290632619 | 71.535364670 | 1.063080578754× | 1.060729060647× | 1.002216888548× |
+| 5 | 79.279968237 | 79.338631133 | 82.469447278 | 1.039461433859× | 1.040230579194× | 0.999260601110× |
+| 6 | 91.642475134 | 91.818624510 | 93.535797501 | 1.018701793892× | 1.020659878123× | 0.998081550698× |
+| 7 | 99.690428753 | 99.893127867 | 102.170367233 | 1.022796757039× | 1.024876394959× | 0.997970840259× |
+| 8 | 108.778934345 | 108.624144982 | 110.324987087 | 1.015658048266× | 1.014212795436× | 1.001424999602× |
+| 9 | 120.501650255 | 120.373469133 | 121.935770862 | 1.012978787935× | 1.011901252840× | 1.001064861905× |
+| 10 | 126.901316302 | 127.036992477 | 127.839617428 | 1.006318041186× | 1.007393943208× | 0.998931994747× |
+| 11 | 136.031955112 | 135.951962663 | 136.746649409 | 1.005845349562× | 1.005253870648× | 1.000588387602× |
+| 12 | 144.693258245 | 144.325738380 | 145.210815248 | 1.006132494991× | 1.003576925483× | 1.002546461006× |
+| 13 | 153.695626740 | 153.343651122 | 154.874079472 | 1.009980382877× | 1.007667444789× | 1.002295338705× |
+| 14 | 161.637104021 | 161.733106057 | 162.415976098 | 1.004222203214× | 1.004818646568× | 0.999406416913× |
+| 15 | 167.680443028 | 167.695933099 | 168.586891897 | 1.005312942194× | 1.005405811513× | 0.999907630016× |
+| 16 | 177.077115062 | 177.039141950 | 178.244728266 | 1.006809716219× | 1.006593811988× | 1.000214489924× |
+| 17 | 182.746465127 | 182.725145782 | 185.482437967 | 1.015089834373× | 1.014971413198× | 1.000116674395× |
+| 18 | 186.944326057 | 187.077465023 | 189.712229168 | 1.014083813592× | 1.014806028988× | 0.999288321733× |
+| 19 | 194.853325961 | 194.730307394 | 197.557450103 | 1.014518247039× | 1.013877741777× | 1.000631738162× |
+| 20 | 200.207439319 | 200.106293516 | 203.226346551 | 1.015591978544× | 1.015078896378× | 1.000505460382× |
+| 21 | 207.477943525 | 208.037619620 | 211.077882481 | 1.014614005229× | 1.017350947744× | 0.997309736113× |
+| 22 | 221.839982498 | 222.005133183 | 224.549412359 | 1.011460452014× | 1.012213442458× | 0.999256095195× |
+| 23 | 222.511655302 | 222.458333021 | 226.665975254 | 1.018914293638× | 1.018670122904× | 1.000239695589× |
+| 24 | 234.155119011 | 234.528475284 | 237.403362303 | 1.012258157635× | 1.013872185697× | 0.998408055685× |
+| 25 | 241.856623078 | 242.027612606 | 244.790074026 | 1.011413827499× | 1.012128884092× | 0.999293512315× |
+| 26 | 247.300799866 | 247.626439363 | 251.106107685 | 1.014052087213× | 1.015387365596× | 0.998684956670× |
+| 27 | 255.770801786 | 256.554796993 | 259.143951703 | 1.010092014418× | 1.013188174308× | 0.996944141308× |
+| 28 | 260.454281395 | 260.811656416 | 264.507419915 | 1.014170238975× | 1.015561804164× | 0.998629758246× |
+| 29 | 268.410287202 | 268.394457534 | 271.898001586 | 1.013053712377× | 1.012993966886× | 1.000058979118× |
+| 30 | 281.397122493 | 281.573325200 | 284.021081691 | 1.008693140548× | 1.009324754904× | 0.999374220881× |
+| 31 | 281.472322457 | 281.802797313 | 284.672669119 | 1.010183972031× | 1.011370022581× | 0.998827283266× |
+| 32 | 286.010163499 | 286.158981661 | 289.807710400 | 1.012750704933× | 1.013277664173× | 0.999479945864× |
