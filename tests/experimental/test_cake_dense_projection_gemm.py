@@ -80,20 +80,59 @@ PROJECTION_ROWS = {
 }
 # The bounded GPU subset: one row per instance class, at small T.
 GPU_ROWS = [
-    ("kv_a", "fwd", "bf16", 257),  # kk, K = 6144 > 1024 -> register epilogue: dense_proj_gemm_kk_n256
-    ("indexer_k", "fwd", "bf16", 1001),  # N = 128 -> the 128-column instance (dense_proj_gemm_kk_n128*)
-    ("indexer_hw", "fwd", "bf16", 129),  # N = 32: masked columns of the 128-column instance
+    (
+        "kv_a",
+        "fwd",
+        "bf16",
+        257,
+    ),  # kk, K = 6144 > 1024 -> register epilogue: dense_proj_gemm_kk_n256
+    (
+        "indexer_k",
+        "fwd",
+        "bf16",
+        1001,
+    ),  # N = 128 -> the 128-column instance (dense_proj_gemm_kk_n128*)
+    (
+        "indexer_hw",
+        "fwd",
+        "bf16",
+        129,
+    ),  # N = 32: masked columns of the 128-column instance
     ("q_a", "dgrad", "bf16", 257),  # kn, K = N_feat = 2048 > 1024 -> register epilogue
-    ("kv_a", "dgrad", "bf16", 1001),  # kn, K = N_feat = 576 <= 1024 -> TMA-store epilogue
+    (
+        "kv_a",
+        "dgrad",
+        "bf16",
+        1001,
+    ),  # kn, K = N_feat = 576 <= 1024 -> TMA-store epilogue
     ("q_a", "dgrad", "f32", 257),  # kn, fp32 output: dense_proj_gemm_kn_n256_f32_tma1
-    ("shared_down", "wgrad", "bf16", 1001),  # nn, K = T = 1001 <= 1024 -> dense_proj_gemm_nn_n256_tma1
+    (
+        "shared_down",
+        "wgrad",
+        "bf16",
+        1001,
+    ),  # nn, K = T = 1001 <= 1024 -> dense_proj_gemm_nn_n256_tma1
     ("kv_a", "wgrad", "f32", 257),  # nn, fp32 output: dense_proj_gemm_nn_n256_f32_tma1
-    ("indexer_hw", "wgrad", "bf16", 1001),  # swapped X.T @ G, transposed store, stream-K "auto" split (dense_proj_gemm_nn_n128*_t)
-    ("indexer_k", "wgrad", "f32", 257),  # swapped, transposed fp32 store (dense_proj_gemm_nn_n128*_f32_t)
+    (
+        "indexer_hw",
+        "wgrad",
+        "bf16",
+        1001,
+    ),  # swapped X.T @ G, transposed store, stream-K "auto" split (dense_proj_gemm_nn_n128*_t)
+    (
+        "indexer_k",
+        "wgrad",
+        "f32",
+        257,
+    ),  # swapped, transposed fp32 store (dense_proj_gemm_nn_n128*_f32_t)
 ]
 MLA_ROWS = {
-    "qabs": dict(H=64, D_in=192, D_out=512, act_stride_head=256, weight_layout="in_out"),
-    "vproj": dict(H=64, D_in=512, D_out=256, act_stride_head=512, weight_layout="out_in"),
+    "qabs": dict(
+        H=64, D_in=192, D_out=512, act_stride_head=256, weight_layout="in_out"
+    ),
+    "vproj": dict(
+        H=64, D_in=512, D_out=256, act_stride_head=512, weight_layout="out_in"
+    ),
 }
 # CPU planner inputs: the two device facts the plan depends on are the SM count (stream-K split)
 # and the L2 size (TMA eviction-hint working-set gate); B200 SXM (148 SMs) and Rubin R200 (212 SMs)
@@ -105,86 +144,147 @@ SM_COUNTS = (148, 212)
 # --- BEGIN GENERATED TABLES ---
 L2_BYTES = 132120576
 EXPECTED_TEMPLATES = {
-    ('o_proj', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
-    ('o_proj', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
-    ('o_proj', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('o_proj', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
-    ('o_proj', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
-    ('q_a', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
-    ('q_a', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
-    ('q_a', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('q_a', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
-    ('q_a', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
-    ('q_b', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
-    ('q_b', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
-    ('q_b', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('q_b', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
-    ('q_b', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
-    ('kv_a', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
-    ('kv_a', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_tma1',
-    ('kv_a', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('kv_a', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
-    ('kv_a', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
-    ('shared_gate_up', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
-    ('shared_gate_up', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
-    ('shared_gate_up', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('shared_gate_up', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
-    ('shared_gate_up', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
-    ('shared_down', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
-    ('shared_down', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
-    ('shared_down', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('shared_down', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
-    ('shared_down', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
-    ('dense_gate_up', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
-    ('dense_gate_up', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
-    ('dense_gate_up', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('dense_gate_up', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
-    ('dense_gate_up', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
-    ('dense_down', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
-    ('dense_down', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
-    ('dense_down', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('dense_down', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
-    ('dense_down', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
-    ('indexer_q', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n256',
-    ('indexer_q', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256',
-    ('indexer_q', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('indexer_q', 'wgrad', 'bf16'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1'},
-    ('indexer_q', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n256_f32_tma1',
-    ('indexer_k', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n128',
-    ('indexer_k', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_tma1',
-    ('indexer_k', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('indexer_k', 'wgrad', 'bf16'): 'dense_proj_gemm_nn_n128_t',
-    ('indexer_k', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n128_f32_t',
-    ('indexer_hw', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n128',
-    ('indexer_hw', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_tma1',
-    ('indexer_hw', 'dgrad', 'f32'): 'dense_proj_gemm_kn_n256_f32_tma1',
-    ('indexer_hw', 'wgrad', 'bf16'): 'dense_proj_gemm_nn_n128_t',
-    ('indexer_hw', 'wgrad', 'f32'): 'dense_proj_gemm_nn_n128_f32_t',
+    ("o_proj", "fwd", "bf16"): "dense_proj_gemm_kk_n256",
+    ("o_proj", "dgrad", "bf16"): "dense_proj_gemm_kn_n256",
+    ("o_proj", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("o_proj", "wgrad", "bf16"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
+    ("o_proj", "wgrad", "f32"): "dense_proj_gemm_nn_n256_f32_tma1",
+    ("q_a", "fwd", "bf16"): "dense_proj_gemm_kk_n256",
+    ("q_a", "dgrad", "bf16"): "dense_proj_gemm_kn_n256",
+    ("q_a", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("q_a", "wgrad", "bf16"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
+    ("q_a", "wgrad", "f32"): "dense_proj_gemm_nn_n256_f32_tma1",
+    ("q_b", "fwd", "bf16"): "dense_proj_gemm_kk_n256",
+    ("q_b", "dgrad", "bf16"): "dense_proj_gemm_kn_n256",
+    ("q_b", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("q_b", "wgrad", "bf16"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
+    ("q_b", "wgrad", "f32"): "dense_proj_gemm_nn_n256_f32_tma1",
+    ("kv_a", "fwd", "bf16"): "dense_proj_gemm_kk_n256",
+    ("kv_a", "dgrad", "bf16"): "dense_proj_gemm_kn_n256_tma1",
+    ("kv_a", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("kv_a", "wgrad", "bf16"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
+    ("kv_a", "wgrad", "f32"): "dense_proj_gemm_nn_n256_f32_tma1",
+    ("shared_gate_up", "fwd", "bf16"): "dense_proj_gemm_kk_n256",
+    ("shared_gate_up", "dgrad", "bf16"): "dense_proj_gemm_kn_n256",
+    ("shared_gate_up", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("shared_gate_up", "wgrad", "bf16"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
+    ("shared_gate_up", "wgrad", "f32"): "dense_proj_gemm_nn_n256_f32_tma1",
+    ("shared_down", "fwd", "bf16"): "dense_proj_gemm_kk_n256",
+    ("shared_down", "dgrad", "bf16"): "dense_proj_gemm_kn_n256",
+    ("shared_down", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("shared_down", "wgrad", "bf16"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
+    ("shared_down", "wgrad", "f32"): "dense_proj_gemm_nn_n256_f32_tma1",
+    ("dense_gate_up", "fwd", "bf16"): "dense_proj_gemm_kk_n256",
+    ("dense_gate_up", "dgrad", "bf16"): "dense_proj_gemm_kn_n256",
+    ("dense_gate_up", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("dense_gate_up", "wgrad", "bf16"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
+    ("dense_gate_up", "wgrad", "f32"): "dense_proj_gemm_nn_n256_f32_tma1",
+    ("dense_down", "fwd", "bf16"): "dense_proj_gemm_kk_n256",
+    ("dense_down", "dgrad", "bf16"): "dense_proj_gemm_kn_n256",
+    ("dense_down", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("dense_down", "wgrad", "bf16"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
+    ("dense_down", "wgrad", "f32"): "dense_proj_gemm_nn_n256_f32_tma1",
+    ("indexer_q", "fwd", "bf16"): "dense_proj_gemm_kk_n256",
+    ("indexer_q", "dgrad", "bf16"): "dense_proj_gemm_kn_n256",
+    ("indexer_q", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("indexer_q", "wgrad", "bf16"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
+    ("indexer_q", "wgrad", "f32"): "dense_proj_gemm_nn_n256_f32_tma1",
+    ("indexer_k", "fwd", "bf16"): "dense_proj_gemm_kk_n128",
+    ("indexer_k", "dgrad", "bf16"): "dense_proj_gemm_kn_n256_tma1",
+    ("indexer_k", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("indexer_k", "wgrad", "bf16"): "dense_proj_gemm_nn_n128_t",
+    ("indexer_k", "wgrad", "f32"): "dense_proj_gemm_nn_n128_f32_t",
+    ("indexer_hw", "fwd", "bf16"): "dense_proj_gemm_kk_n128",
+    ("indexer_hw", "dgrad", "bf16"): "dense_proj_gemm_kn_n256_tma1",
+    ("indexer_hw", "dgrad", "f32"): "dense_proj_gemm_kn_n256_f32_tma1",
+    ("indexer_hw", "wgrad", "bf16"): "dense_proj_gemm_nn_n128_t",
+    ("indexer_hw", "wgrad", "f32"): "dense_proj_gemm_nn_n128_f32_t",
 }
 MLA_TEMPLATES = {
-    ('qabs', 'fwd'): 'dense_proj_gemm_kn_n256_tma1',
-    ('qabs', 'dgrad'): 'dense_proj_gemm_kk_n256_tma1',
-    ('qabs', 'wgrad'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1', (33, 148): 'dense_proj_gemm_nn_n256_tma1', (33, 212): 'dense_proj_gemm_nn_n256_tma1'},
-    ('vproj', 'fwd'): 'dense_proj_gemm_kk_n256_tma1',
-    ('vproj', 'dgrad'): 'dense_proj_gemm_kn_n256_tma1',
-    ('vproj', 'wgrad'): {(2049, 148): 'dense_proj_gemm_nn_n256', (2049, 212): 'dense_proj_gemm_nn_n256', (1001, 148): 'dense_proj_gemm_nn_n256_tma1', (1001, 212): 'dense_proj_gemm_nn_n256_tma1', (33, 148): 'dense_proj_gemm_nn_n256_tma1', (33, 212): 'dense_proj_gemm_nn_n256_tma1'},
+    ("qabs", "fwd"): "dense_proj_gemm_kn_n256_tma1",
+    ("qabs", "dgrad"): "dense_proj_gemm_kk_n256_tma1",
+    ("qabs", "wgrad"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+        (33, 148): "dense_proj_gemm_nn_n256_tma1",
+        (33, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
+    ("vproj", "fwd"): "dense_proj_gemm_kk_n256_tma1",
+    ("vproj", "dgrad"): "dense_proj_gemm_kn_n256_tma1",
+    ("vproj", "wgrad"): {
+        (2049, 148): "dense_proj_gemm_nn_n256",
+        (2049, 212): "dense_proj_gemm_nn_n256",
+        (1001, 148): "dense_proj_gemm_nn_n256_tma1",
+        (1001, 212): "dense_proj_gemm_nn_n256_tma1",
+        (33, 148): "dense_proj_gemm_nn_n256_tma1",
+        (33, 212): "dense_proj_gemm_nn_n256_tma1",
+    },
 }
-EXPORTED_TEMPLATES = frozenset({
-    'dense_proj_gemm_kk_n128',
-    'dense_proj_gemm_kk_n128_hen',
-    'dense_proj_gemm_kk_n256',
-    'dense_proj_gemm_kk_n256_tma1',
-    'dense_proj_gemm_kn_n256',
-    'dense_proj_gemm_kn_n256_f32_tma1',
-    'dense_proj_gemm_kn_n256_tma1',
-    'dense_proj_gemm_nn_n128_f32_t',
-    'dense_proj_gemm_nn_n128_hen_f32_t',
-    'dense_proj_gemm_nn_n128_hen_t',
-    'dense_proj_gemm_nn_n128_t',
-    'dense_proj_gemm_nn_n256',
-    'dense_proj_gemm_nn_n256_f32_tma1',
-    'dense_proj_gemm_nn_n256_tma1',
-})
+EXPORTED_TEMPLATES = frozenset(
+    {
+        "dense_proj_gemm_kk_n128",
+        "dense_proj_gemm_kk_n128_hen",
+        "dense_proj_gemm_kk_n256",
+        "dense_proj_gemm_kk_n256_tma1",
+        "dense_proj_gemm_kn_n256",
+        "dense_proj_gemm_kn_n256_f32_tma1",
+        "dense_proj_gemm_kn_n256_tma1",
+        "dense_proj_gemm_nn_n128_f32_t",
+        "dense_proj_gemm_nn_n128_hen_f32_t",
+        "dense_proj_gemm_nn_n128_hen_t",
+        "dense_proj_gemm_nn_n128_t",
+        "dense_proj_gemm_nn_n256",
+        "dense_proj_gemm_nn_n256_f32_tma1",
+        "dense_proj_gemm_nn_n256_tma1",
+    }
+)
 # --- END GENERATED TABLES ---
 
 
@@ -230,9 +330,13 @@ def test_registry_records_are_well_formed():
         assert record["arch"] in cake_jit.ARCH_NVCC_FLAGS
         assert cake_jit.KERNELS[record["arch"]][record["template"]] == name
         assert len(record["sources"]) == 2
-        assert all(s.startswith("cake_dense_projection_gemm/") for s in record["sources"])
+        assert all(
+            s.startswith("cake_dense_projection_gemm/") for s in record["sources"]
+        )
         assert len(record["closure_sha256"]) == 64
-        assert int(record["tma_workspace_bytes"]) > 0  # pointer TMA ABI: caller-owned descriptors
+        assert (
+            int(record["tma_workspace_bytes"]) > 0
+        )  # pointer TMA ABI: caller-owned descriptors
         kinds = {kind for kind, _ in record["arg_plan"]}
         assert kinds <= {"buffer", "tma_buffer", "workspace", "parameter", "grid"}
         assert ["workspace", "tma_descriptor_workspace"] in [
@@ -248,9 +352,13 @@ def test_registry_records_are_well_formed():
 def test_epilogue_rules():
     assert epi_mode(False, True) == "reg"
     assert epi_mode(True, True) == "reg"
-    assert epi_mode(True, False) == "tma"  # row-major fp32: TMA-store epilogue by default
+    assert (
+        epi_mode(True, False) == "tma"
+    )  # row-major fp32: TMA-store epilogue by default
     assert epi_mode(True, False, K=64) == "tma"
-    assert epi_mode(True, False, epi="reg") == "reg"  # the float4 register path is an opt-in
+    assert (
+        epi_mode(True, False, epi="reg") == "reg"
+    )  # the float4 register path is an opt-in
     assert epi_mode(False, False, K=1024) == "tma"
     assert epi_mode(False, False, K=1025) == "reg"
     assert epi_mode(False, False) == "reg"
@@ -261,8 +369,12 @@ def test_epilogue_rules():
     assert epi_slots("reg", False, 256) == 0
     assert epi_slots("tma", False, 256, K=6144) == 1
     assert epi_slots("tma", True, 256, K=6144) == 1
-    assert epi_slots("tma", True, 128) == 2  # K unknown: two slots when the chunk count allows
-    assert epi_slots("tma", True, 128, K=64) == 1  # any K above K_TWO_SLOTS = 0: one slot
+    assert (
+        epi_slots("tma", True, 128) == 2
+    )  # K unknown: two slots when the chunk count allows
+    assert (
+        epi_slots("tma", True, 128, K=64) == 1
+    )  # any K above K_TWO_SLOTS = 0: one slot
     with pytest.raises(ValueError, match="slots"):
         epi_slots("tma", False, 128, slots=3)
 
@@ -273,14 +385,32 @@ def test_epilogue_rules():
         (dict(a_mn=False, b_mn=False), "dense_proj_gemm_kk_n256"),
         (dict(a_mn=False, b_mn=False, block_n=128), "dense_proj_gemm_kk_n128"),
         # the launcher resolves the slot count from K (1 for every K > K_TWO_SLOTS = 0) and passes it
-        (dict(a_mn=False, b_mn=False, epi="tma", slots=1), "dense_proj_gemm_kk_n256_tma1"),
+        (
+            dict(a_mn=False, b_mn=False, epi="tma", slots=1),
+            "dense_proj_gemm_kk_n256_tma1",
+        ),
         (dict(a_mn=False, b_mn=False, epi="tma"), "dense_proj_gemm_kk_n256_tma2"),
-        (dict(a_mn=False, b_mn=True, out_f32=True, slots=1), "dense_proj_gemm_kn_n256_f32_tma1"),
-        (dict(a_mn=False, b_mn=True, out_f32=True, epi="reg"), "dense_proj_gemm_kn_n256_f32"),
+        (
+            dict(a_mn=False, b_mn=True, out_f32=True, slots=1),
+            "dense_proj_gemm_kn_n256_f32_tma1",
+        ),
+        (
+            dict(a_mn=False, b_mn=True, out_f32=True, epi="reg"),
+            "dense_proj_gemm_kn_n256_f32",
+        ),
         (dict(a_mn=True, b_mn=True), "dense_proj_gemm_nn_n256"),
-        (dict(a_mn=True, b_mn=True, epi="tma", slots=1), "dense_proj_gemm_nn_n256_tma1"),
-        (dict(a_mn=True, b_mn=True, out_f32=True, slots=1), "dense_proj_gemm_nn_n256_f32_tma1"),
-        (dict(a_mn=True, b_mn=True, out_t=True, block_n=128), "dense_proj_gemm_nn_n128_t"),
+        (
+            dict(a_mn=True, b_mn=True, epi="tma", slots=1),
+            "dense_proj_gemm_nn_n256_tma1",
+        ),
+        (
+            dict(a_mn=True, b_mn=True, out_f32=True, slots=1),
+            "dense_proj_gemm_nn_n256_f32_tma1",
+        ),
+        (
+            dict(a_mn=True, b_mn=True, out_t=True, block_n=128),
+            "dense_proj_gemm_nn_n128_t",
+        ),
         (
             dict(a_mn=True, b_mn=True, out_t=True, out_f32=True, block_n=128),
             "dense_proj_gemm_nn_n128_f32_t",
@@ -288,34 +418,92 @@ def test_epilogue_rules():
         (dict(a_mn=False, b_mn=False, cta_rows=256), "dense_proj_gemm_kk_n256_m256"),
         (dict(a_mn=False, b_mn=False, stages=5), "dense_proj_gemm_kk_n256_s5"),
         # BLOCK_N = 128 defaults to 9 stages (8 with one staging slot): 9 carries no suffix, 7 does
-        (dict(a_mn=False, b_mn=False, block_n=128, stages=9), "dense_proj_gemm_kk_n128"),
-        (dict(a_mn=False, b_mn=False, block_n=128, stages=7), "dense_proj_gemm_kk_n128_s7"),
-        (dict(a_mn=False, b_mn=False, block_n=128, epi="tma", slots=1, stages=8), "dense_proj_gemm_kk_n128_tma1"),
+        (
+            dict(a_mn=False, b_mn=False, block_n=128, stages=9),
+            "dense_proj_gemm_kk_n128",
+        ),
+        (
+            dict(a_mn=False, b_mn=False, block_n=128, stages=7),
+            "dense_proj_gemm_kk_n128_s7",
+        ),
+        (
+            dict(a_mn=False, b_mn=False, block_n=128, epi="tma", slots=1, stages=8),
+            "dense_proj_gemm_kk_n128_tma1",
+        ),
         # TMA L2 eviction hints (A, B): first letters after ``_h``; L2 promotion and prefetch distance
-        (dict(a_mn=False, b_mn=False, block_n=128, hints=("evict_first", "none")), "dense_proj_gemm_kk_n128_hen"),
+        (
+            dict(a_mn=False, b_mn=False, block_n=128, hints=("evict_first", "none")),
+            "dense_proj_gemm_kk_n128_hen",
+        ),
         # first letters only, as the Cake host writes them: evict_first / evict_last -> ``_hee``
-        (dict(a_mn=False, b_mn=False, hints=("evict_first", "evict_last")), "dense_proj_gemm_kk_n256_hee"),
-        (dict(a_mn=False, b_mn=False, hints=("none", "evict_normal")), "dense_proj_gemm_kk_n256_hne"),
-        (dict(a_mn=False, b_mn=False, promo="l2_128b"), "dense_proj_gemm_kk_n256_l2_128b"),
+        (
+            dict(a_mn=False, b_mn=False, hints=("evict_first", "evict_last")),
+            "dense_proj_gemm_kk_n256_hee",
+        ),
+        (
+            dict(a_mn=False, b_mn=False, hints=("none", "evict_normal")),
+            "dense_proj_gemm_kk_n256_hne",
+        ),
+        (
+            dict(a_mn=False, b_mn=False, promo="l2_128b"),
+            "dense_proj_gemm_kk_n256_l2_128b",
+        ),
         (dict(a_mn=False, b_mn=False, pf=4), "dense_proj_gemm_kk_n256_pf4"),
         # raster group: 16 CTA row tiles per group is the default; other even counts carry ``_g<n>``
         (dict(a_mn=False, b_mn=False, group_m=16), "dense_proj_gemm_kk_n256"),
         (dict(a_mn=False, b_mn=False, group_m=8), "dense_proj_gemm_kk_n256_g8"),
-        (dict(a_mn=True, b_mn=True, out_f32=True, slots=1, hints=("evict_first", "none"), group_m=4), "dense_proj_gemm_nn_n256_hen_g4_f32_tma1"),
         (
-            dict(a_mn=False, b_mn=False, pf=2, promo="l2_256b", hints=("evict_first", "none"), epi="tma", slots=1),
+            dict(
+                a_mn=True,
+                b_mn=True,
+                out_f32=True,
+                slots=1,
+                hints=("evict_first", "none"),
+                group_m=4,
+            ),
+            "dense_proj_gemm_nn_n256_hen_g4_f32_tma1",
+        ),
+        (
+            dict(
+                a_mn=False,
+                b_mn=False,
+                pf=2,
+                promo="l2_256b",
+                hints=("evict_first", "none"),
+                epi="tma",
+                slots=1,
+            ),
             "dense_proj_gemm_kk_n256_pf2_l2_256b_hen_tma1",
         ),
         (
-            dict(a_mn=False, b_mn=False, epi="tma", slots=1, hints=("evict_first", "none")),
+            dict(
+                a_mn=False,
+                b_mn=False,
+                epi="tma",
+                slots=1,
+                hints=("evict_first", "none"),
+            ),
             "dense_proj_gemm_kk_n256_hen_tma1",
         ),
         (
-            dict(a_mn=True, b_mn=True, out_t=True, block_n=128, hints=("evict_first", "none")),
+            dict(
+                a_mn=True,
+                b_mn=True,
+                out_t=True,
+                block_n=128,
+                hints=("evict_first", "none"),
+            ),
             "dense_proj_gemm_nn_n128_hen_t",
         ),
         (
-            dict(a_mn=True, b_mn=True, out_t=True, out_f32=True, block_n=128, hints=("evict_first", "none")),
+            dict(
+                a_mn=True,
+                b_mn=True,
+                out_t=True,
+                out_f32=True,
+                block_n=128,
+                hints=("evict_first", "none"),
+            ),
             "dense_proj_gemm_nn_n128_hen_f32_t",
         ),
     ],
@@ -349,20 +537,50 @@ def test_wave_working_set_and_hint_rule():
     assert wave_working_set(128, 24, 16384, 16, 74, elt_bytes=1) == 18 * 256 * 16384
     # hints only when the wave does not fit the L2 ...
     assert wave_working_set(128, 24, 16384, 16, 74) > L2_BYTES
-    assert default_hints(False, False, 128, 24, 16384, 16, 74, 1 << 40) == ("none", "none")  # fits a huge L2
-    assert default_hints(False, False, 8, 1, 6144, 16, 74, L2_BYTES) == ("none", "none")  # 15.7 MB working set fits
+    assert default_hints(False, False, 128, 24, 16384, 16, 74, 1 << 40) == (
+        "none",
+        "none",
+    )  # fits a huge L2
+    assert default_hints(False, False, 8, 1, 6144, 16, 74, L2_BYTES) == (
+        "none",
+        "none",
+    )  # 15.7 MB working set fits
     # ... then a single-use A (one column tile) streams evict_first on every layout class
-    assert default_hints(False, False, 128, 1, 6144, 16, 74, L2_BYTES) == ("evict_first", "none")  # indexer_k fwd
-    assert default_hints(True, True, 48, 1, 16231, 16, 74, L2_BYTES) == ("evict_first", "none")  # swapped small-N wgrad
-    assert default_hints(False, False, 8, 1, 6144, 16, 74, 1 << 20) == ("evict_first", "none")  # tiny L2
+    assert default_hints(False, False, 128, 1, 6144, 16, 74, L2_BYTES) == (
+        "evict_first",
+        "none",
+    )  # indexer_k fwd
+    assert default_hints(True, True, 48, 1, 16231, 16, 74, L2_BYTES) == (
+        "evict_first",
+        "none",
+    )  # swapped small-N wgrad
+    assert default_hints(False, False, 8, 1, 6144, 16, 74, 1 << 20) == (
+        "evict_first",
+        "none",
+    )  # tiny L2
     # ... K-major forward / input-gradient rows get no other hint
-    assert default_hints(False, False, 128, 24, 16384, 16, 74, L2_BYTES) == ("none", "none")  # o_proj fwd
-    assert default_hints(False, True, 128, 64, 16384, 16, 74, L2_BYTES) == ("none", "none")  # o_proj dgrad
+    assert default_hints(False, False, 128, 24, 16384, 16, 74, L2_BYTES) == (
+        "none",
+        "none",
+    )  # o_proj fwd
+    assert default_hints(False, True, 128, 64, 16384, 16, 74, L2_BYTES) == (
+        "none",
+        "none",
+    )  # o_proj dgrad
     assert default_hints(False, True, 2, 3, 6144, 16, 74, 1 << 20) == ("none", "none")
     # ... and neither does the weight-gradient class (both MN-major): the reuse-ratio hints are not applied
-    assert default_hints(True, True, 16, 24, 16231, 16, 74, L2_BYTES) == ("none", "none")  # q_a wgrad
-    assert default_hints(True, True, 48, 8, 16231, 16, 74, L2_BYTES) == ("none", "none")  # shared_down wgrad
-    assert default_hints(True, True, 32, 24, 16231, 16, 74, L2_BYTES) == ("none", "none")
+    assert default_hints(True, True, 16, 24, 16231, 16, 74, L2_BYTES) == (
+        "none",
+        "none",
+    )  # q_a wgrad
+    assert default_hints(True, True, 48, 8, 16231, 16, 74, L2_BYTES) == (
+        "none",
+        "none",
+    )  # shared_down wgrad
+    assert default_hints(True, True, 32, 24, 16231, 16, 74, L2_BYTES) == (
+        "none",
+        "none",
+    )
     assert default_hints(True, True, 2, 3, 6144, 16, 74, 1 << 20) == ("none", "none")
 
 
@@ -391,7 +609,9 @@ def test_instance_key_rejects_bad_configurations():
     with pytest.raises(ValueError, match="SMEM"):
         instance_key(a_mn=False, b_mn=False, stages=8)
     with pytest.raises(ValueError, match="SMEM"):
-        instance_key(a_mn=False, b_mn=False, block_n=128, stages=10)  # 9 is the deepest 24 KiB pipeline
+        instance_key(
+            a_mn=False, b_mn=False, block_n=128, stages=10
+        )  # 9 is the deepest 24 KiB pipeline
     with pytest.raises(ValueError, match="diagnostic"):
         instance_key(a_mn=False, b_mn=False, diag=("no_mma",))
     with pytest.raises(ValueError, match="promo"):
@@ -401,7 +621,9 @@ def test_instance_key_rejects_bad_configurations():
     with pytest.raises(ValueError, match="prefetch"):
         instance_key(a_mn=False, b_mn=False, pf=17)
     with pytest.raises(ValueError, match="group_m"):
-        instance_key(a_mn=False, b_mn=False, group_m=7)  # CTA pairs are adjacent row tiles: even groups only
+        instance_key(
+            a_mn=False, b_mn=False, group_m=7
+        )  # CTA pairs are adjacent row tiles: even groups only
     with pytest.raises(ValueError, match="group_m"):
         instance_key(a_mn=False, b_mn=False, group_m=0)
     key = instance_key(a_mn=False, b_mn=False)
@@ -414,16 +636,46 @@ def test_stream_k_plan_rules(pairs):
     # every tile has exactly two parts (unit u = tile u // 2, K half u % 2), so tiles that share an A / B
     # panel stay K-synchronised and the fixup reads one slab
     assert stream_k_plan(24, 96, pairs, sk="auto") == (0, 24, 48, 48)
-    assert stream_k_plan(pairs // 2, 96, pairs, sk="auto") == (0, pairs // 2, 2 * (pairs // 2), 48)
-    assert stream_k_plan(10, 17, pairs, sk="auto") == (0, 10, 20, 9)  # odd K steps: ceil(k / 2)
-    assert stream_k_plan(10, 2 * SK_MIN_ITERS, pairs, sk="auto") == (0, 10, 20, SK_MIN_ITERS)
+    assert stream_k_plan(pairs // 2, 96, pairs, sk="auto") == (
+        0,
+        pairs // 2,
+        2 * (pairs // 2),
+        48,
+    )
+    assert stream_k_plan(10, 17, pairs, sk="auto") == (
+        0,
+        10,
+        20,
+        9,
+    )  # odd K steps: ceil(k / 2)
+    assert stream_k_plan(10, 2 * SK_MIN_ITERS, pairs, sk="auto") == (
+        0,
+        10,
+        20,
+        SK_MIN_ITERS,
+    )
     # the halves must fit the pairs, K needs 2 * SK_MIN_ITERS steps, and multi-wave problems keep a
     # data-parallel tail: otherwise every work item is a whole tile
-    assert stream_k_plan(pairs // 2 + 1, 96, pairs, sk="auto") == (pairs // 2 + 1, 0, 0, 96)
-    assert stream_k_plan(10, 2 * SK_MIN_ITERS - 1, pairs, sk="auto") == (10, 0, 0, 2 * SK_MIN_ITERS - 1)
+    assert stream_k_plan(pairs // 2 + 1, 96, pairs, sk="auto") == (
+        pairs // 2 + 1,
+        0,
+        0,
+        96,
+    )
+    assert stream_k_plan(10, 2 * SK_MIN_ITERS - 1, pairs, sk="auto") == (
+        10,
+        0,
+        0,
+        2 * SK_MIN_ITERS - 1,
+    )
     assert stream_k_plan(pairs + 1, 256, pairs, sk="auto") == (pairs + 1, 0, 0, 256)
     assert stream_k_plan(pairs + 10, 256, pairs, sk="auto") == (pairs + 10, 0, 0, 256)
-    assert stream_k_plan(pairs, 256, pairs, sk="auto") == (pairs, 0, 0, 256)  # exactly one full wave
+    assert stream_k_plan(pairs, 256, pairs, sk="auto") == (
+        pairs,
+        0,
+        0,
+        256,
+    )  # exactly one full wave
     assert stream_k_plan(pairs * 3, 96, pairs, sk="auto") == (pairs * 3, 0, 0, 96)
     assert stream_k_plan(0, 96, pairs, sk="auto") == (0, 0, 0, 96)
     # --- sk=False: every tile is a work item ---
@@ -435,10 +687,23 @@ def test_stream_k_plan_rules(pairs):
     # fewer tiles than pairs: every tile is a tail tile shared by up to `pairs` units of >= SK_MIN_ITERS steps
     num_full, tail, units, iters = stream_k_plan(24, 96, pairs, sk=True)
     assert (num_full, tail) == (0, 24) and tail < units <= pairs
-    assert iters >= SK_MIN_ITERS and units * iters >= tail * 96 and (units - 1) * iters < tail * 96
+    assert (
+        iters >= SK_MIN_ITERS
+        and units * iters >= tail * 96
+        and (units - 1) * iters < tail * 96
+    )
     num_full, tail, units, iters = stream_k_plan(24, 96, pairs, sk=True, max_units=30)
-    assert (num_full, tail) == (0, 24) and tail < units <= 30 and iters == -(-24 * 96 // 30)
-    assert stream_k_plan(24, 96, pairs, sk=True, max_units=24) == (24, 0, 0, 96)  # no more units than tiles
+    assert (
+        (num_full, tail) == (0, 24)
+        and tail < units <= 30
+        and iters == -(-24 * 96 // 30)
+    )
+    assert stream_k_plan(24, 96, pairs, sk=True, max_units=24) == (
+        24,
+        0,
+        0,
+        96,
+    )  # no more units than tiles
     # a partial last wave
     num_full, tail, units, iters = stream_k_plan(pairs + 10, 256, pairs, sk=True)
     assert (num_full, tail) == (pairs, 10) and units > tail
@@ -452,15 +717,44 @@ def test_stream_k_plan_rules(pairs):
 def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
     # the 24-tile swapped weight gradient (indexer_hw, T = 1001): one partial wave, K = 16 steps -> split
     v = _views("proj", "indexer_hw", "wgrad", "bf16", 1001)
-    plan, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], sm_count=148, l2_bytes=L2_BYTES, transposed_out=v["transposed"])
+    plan, *_ = plan_dense_projection_gemm(
+        v["A"],
+        v["B"],
+        v["out"],
+        sm_count=148,
+        l2_bytes=L2_BYTES,
+        transposed_out=v["transposed"],
+    )
     assert (plan.pair_tiles, plan.k_blocks) == (24, 16)
-    assert (plan.num_full, plan.tail_tiles, plan.sk_units, plan.iters_per_unit) == (0, 24, 48, 8)
+    assert (plan.num_full, plan.tail_tiles, plan.sk_units, plan.iters_per_unit) == (
+        0,
+        24,
+        48,
+        8,
+    )
     assert plan.grid == (96, 1, 1) and plan.sk_iters == 24 * 16
     assert plan.ws_f32_elems == (48 + 24) * 2 * 128 * 128
     assert plan.counters_u32 == 24 * 16 and plan.counters_alloc_u32 == 8192
-    off, *_ = plan_dense_projection_gemm(v["A"], v["B"], v["out"], sm_count=148, l2_bytes=L2_BYTES, transposed_out=v["transposed"], sk=False)
-    assert (off.num_full, off.tail_tiles, off.sk_units, off.iters_per_unit) == (24, 0, 0, 16)
-    assert off.ws_f32_elems == 0 and off.counters_alloc_u32 == 8192 and off.template == plan.template
+    off, *_ = plan_dense_projection_gemm(
+        v["A"],
+        v["B"],
+        v["out"],
+        sm_count=148,
+        l2_bytes=L2_BYTES,
+        transposed_out=v["transposed"],
+        sk=False,
+    )
+    assert (off.num_full, off.tail_tiles, off.sk_units, off.iters_per_unit) == (
+        24,
+        0,
+        0,
+        16,
+    )
+    assert (
+        off.ws_f32_elems == 0
+        and off.counters_alloc_u32 == 8192
+        and off.template == plan.template
+    )
     # stride-0 rows keep these planner-only views tiny: 300 tiles of 256 x 256 on a 1000-SM device (500 pairs)
     # with the linearised policy put 300 tail tiles in flight -> 4800 slice counters exceed SK_DUMMY_BASE
     A = torch.empty(1024, dtype=torch.bfloat16).as_strided((300 * 256, 1024), (0, 1))
@@ -468,8 +762,12 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
     out = torch.empty(256, dtype=torch.bfloat16).as_strided((300 * 256, 256), (0, 1))
     assert SK_DUMMY_BASE == 4096
     with pytest.raises(ValueError, match="slice-counter budget"):
-        plan_dense_projection_gemm(A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES, sk=True)
-    plan, *_ = plan_dense_projection_gemm(A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES)  # auto: 2 * 300 > 500 pairs -> whole tiles
+        plan_dense_projection_gemm(
+            A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES, sk=True
+        )
+    plan, *_ = plan_dense_projection_gemm(
+        A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES
+    )  # auto: 2 * 300 > 500 pairs -> whole tiles
     assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (300, 0, 0)
 
 
@@ -482,12 +780,27 @@ def _views(family, row, op, out_dtype, T, device="cpu"):
         W = torch.empty(N, K, dtype=torch.bfloat16, device=device)
         G = torch.empty(T, N, dtype=torch.bfloat16, device=device)
         if op == "fwd":
-            return dict(A=X, B=W.t(), out=torch.empty(T, N, dtype=dt, device=device), X=X, W=W, G=G)
+            return dict(
+                A=X,
+                B=W.t(),
+                out=torch.empty(T, N, dtype=dt, device=device),
+                X=X,
+                W=W,
+                G=G,
+            )
         if op == "dgrad":
-            return dict(A=G, B=W, out=torch.empty(T, K, dtype=dt, device=device), X=X, W=W, G=G)
+            return dict(
+                A=G, B=W, out=torch.empty(T, K, dtype=dt, device=device), X=X, W=W, G=G
+            )
         A, B, transposed = wgrad_views(G, X)
         return dict(
-            A=A, B=B, out=torch.empty(N, K, dtype=dt, device=device), transposed=transposed, X=X, W=W, G=G
+            A=A,
+            B=B,
+            out=torch.empty(N, K, dtype=dt, device=device),
+            transposed=transposed,
+            X=X,
+            W=W,
+            G=G,
         )
     spec = MLA_ROWS[row]
     H, Din, Dout, slot = spec["H"], spec["D_in"], spec["D_out"], spec["act_stride_head"]
@@ -501,7 +814,14 @@ def _views(family, row, op, out_dtype, T, device="cpu"):
     d_out = torch.empty(T, H, Dout, dtype=torch.bfloat16, device=device)
     if op == "fwd":
         out = torch.empty(T, H, Dout, dtype=dt, device=device).permute(1, 0, 2)
-        return dict(A=act.permute(1, 0, 2), B=w_in_out, out=out, act=act, weight=weight, d_out=d_out)
+        return dict(
+            A=act.permute(1, 0, 2),
+            B=w_in_out,
+            out=out,
+            act=act,
+            weight=weight,
+            d_out=d_out,
+        )
     if op == "dgrad":
         buf = torch.empty(T, H, slot, dtype=dt, device=device)
         return dict(
@@ -517,37 +837,93 @@ def _views(family, row, op, out_dtype, T, device="cpu"):
         A, B = act.permute(1, 2, 0), d_out.permute(1, 0, 2)
     else:
         A, B = d_out.permute(1, 2, 0), act.permute(1, 0, 2)
-    return dict(A=A, B=B, out=torch.empty_like(weight, dtype=dt), act=act, weight=weight, d_out=d_out)
+    return dict(
+        A=A,
+        B=B,
+        out=torch.empty_like(weight, dtype=dt),
+        act=act,
+        weight=weight,
+        d_out=d_out,
+    )
 
 
 @pytest.mark.parametrize("sm_count", SM_COUNTS)
-@pytest.mark.parametrize("T", [2049, 1001])  # K = T above / at or below the TMA-store epilogue bound
+@pytest.mark.parametrize(
+    "T", [2049, 1001]
+)  # K = T above / at or below the TMA-store epilogue bound
 def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
     for row, (K, N) in PROJECTION_ROWS.items():
         for op in ("fwd", "dgrad", "wgrad"):
             for out_dtype in ("bf16", "f32") if op != "fwd" else ("bf16",):
                 v = _views("proj", row, op, out_dtype, T)
                 plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(
-                    v["A"], v["B"], v["out"], sm_count=sm_count, l2_bytes=L2_BYTES, transposed_out=v.get("transposed", False)
+                    v["A"],
+                    v["B"],
+                    v["out"],
+                    sm_count=sm_count,
+                    l2_bytes=L2_BYTES,
+                    transposed_out=v.get("transposed", False),
                 )
-                expected = _expected(EXPECTED_TEMPLATES, (row, op, out_dtype), T, sm_count)
-                assert plan.template == expected, (row, op, out_dtype, T, sm_count, plan.template)
+                expected = _expected(
+                    EXPECTED_TEMPLATES, (row, op, out_dtype), T, sm_count
+                )
+                assert plan.template == expected, (
+                    row,
+                    op,
+                    out_dtype,
+                    T,
+                    sm_count,
+                    plan.template,
+                )
                 assert plan.template in EXPORTED_TEMPLATES
                 assert plan.sm_pairs == sm_count // 2
                 assert plan.grid == ((plan.num_full + plan.sk_units) * CTA_GROUP, 1, 1)
                 assert plan.m_tiles % CTA_GROUP == 0
                 assert plan.k_blocks == -(-plan.K // BLOCK_K)
-                assert plan.pair_tiles == plan.L * (plan.m_tiles // CTA_GROUP) * plan.n_tiles
+                assert (
+                    plan.pair_tiles
+                    == plan.L * (plan.m_tiles // CTA_GROUP) * plan.n_tiles
+                )
                 assert a_desc.stride(2) == 1 and b_desc.stride(2) == 1
                 # the knob defaults of the launcher: stage depth by tile shape, raster group, working-set-gated hints
                 assert plan.cta_rows == 128 and plan.pf == 0 and plan.promo == "none"
-                assert plan.group_m == default_group_m(plan.a_mn, plan.b_mn, plan.m_tiles, plan.pair_tiles, plan.sm_pairs) == 16
-                assert re.search(r"_g\d+", plan.template) is None  # no raster-group suffix ("_gemm" is not one)
-                assert plan.stages == default_stages(plan.slots, plan.cta_rows, plan.block_n)
-                assert plan.stages == {(256, 0): 7, (256, 1): 6, (128, 0): 9, (128, 1): 8}[(plan.block_n, plan.slots)]
+                assert (
+                    plan.group_m
+                    == default_group_m(
+                        plan.a_mn,
+                        plan.b_mn,
+                        plan.m_tiles,
+                        plan.pair_tiles,
+                        plan.sm_pairs,
+                    )
+                    == 16
+                )
+                assert (
+                    re.search(r"_g\d+", plan.template) is None
+                )  # no raster-group suffix ("_gemm" is not one)
+                assert plan.stages == default_stages(
+                    plan.slots, plan.cta_rows, plan.block_n
+                )
+                assert (
+                    plan.stages
+                    == {(256, 0): 7, (256, 1): 6, (128, 0): 9, (128, 1): 8}[
+                        (plan.block_n, plan.slots)
+                    ]
+                )
                 assert plan.l2_bytes == L2_BYTES
-                assert plan.wave_working_set_bytes == wave_working_set(plan.m_tiles, plan.n_tiles, plan.K, plan.group_m, plan.sm_pairs)
-                assert plan.hints == default_hints(plan.a_mn, plan.b_mn, plan.m_tiles, plan.n_tiles, plan.K, plan.group_m, plan.sm_pairs, L2_BYTES)
+                assert plan.wave_working_set_bytes == wave_working_set(
+                    plan.m_tiles, plan.n_tiles, plan.K, plan.group_m, plan.sm_pairs
+                )
+                assert plan.hints == default_hints(
+                    plan.a_mn,
+                    plan.b_mn,
+                    plan.m_tiles,
+                    plan.n_tiles,
+                    plan.K,
+                    plan.group_m,
+                    plan.sm_pairs,
+                    L2_BYTES,
+                )
                 if plan.wave_working_set_bytes <= L2_BYTES:
                     assert plan.hints == ("none", "none")
                 if not (plan.a_mn and plan.b_mn) and plan.n_tiles > 1:
@@ -555,25 +931,62 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 assert (plan.n_tiles == 1) == (plan.N <= 256)
                 # stream-K "auto": a two-part K-aligned split of a single partial wave, else whole tiles
                 if plan.sk_units:
-                    assert plan.pair_tiles <= plan.sm_pairs and 2 * plan.tail_tiles <= plan.sm_pairs
+                    assert (
+                        plan.pair_tiles <= plan.sm_pairs
+                        and 2 * plan.tail_tiles <= plan.sm_pairs
+                    )
                     assert plan.k_blocks >= 2 * SK_MIN_ITERS
-                    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (0, plan.pair_tiles, 2 * plan.pair_tiles)
+                    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (
+                        0,
+                        plan.pair_tiles,
+                        2 * plan.pair_tiles,
+                    )
                     assert plan.iters_per_unit == -(-plan.k_blocks // 2)
-                    assert plan.ws_f32_elems == (plan.sk_units + plan.tail_tiles) * 2 * plan.cta_rows * plan.block_n
+                    assert (
+                        plan.ws_f32_elems
+                        == (plan.sk_units + plan.tail_tiles)
+                        * 2
+                        * plan.cta_rows
+                        * plan.block_n
+                    )
                 else:
-                    assert (plan.num_full, plan.tail_tiles, plan.iters_per_unit) == (plan.pair_tiles, 0, plan.k_blocks)
-                    assert plan.pair_tiles > plan.sm_pairs or 2 * plan.pair_tiles > plan.sm_pairs or plan.k_blocks < 2 * SK_MIN_ITERS
+                    assert (plan.num_full, plan.tail_tiles, plan.iters_per_unit) == (
+                        plan.pair_tiles,
+                        0,
+                        plan.k_blocks,
+                    )
+                    assert (
+                        plan.pair_tiles > plan.sm_pairs
+                        or 2 * plan.pair_tiles > plan.sm_pairs
+                        or plan.k_blocks < 2 * SK_MIN_ITERS
+                    )
                     assert plan.ws_f32_elems == 0
                 assert plan.tail_tiles * 16 <= SK_DUMMY_BASE
-                assert plan.counters_alloc_u32 == max(8192, plan.tail_tiles * 16) >= SK_DUMMY_BASE + 16 * 32
+                assert (
+                    plan.counters_alloc_u32
+                    == max(8192, plan.tail_tiles * 16)
+                    >= SK_DUMMY_BASE + 16 * 32
+                )
                 if op == "fwd":
-                    assert (plan.M, plan.N, plan.K) == (T, N, K) and not plan.a_mn and not plan.b_mn
+                    assert (
+                        (plan.M, plan.N, plan.K) == (T, N, K)
+                        and not plan.a_mn
+                        and not plan.b_mn
+                    )
                 elif op == "dgrad":
-                    assert (plan.M, plan.N, plan.K) == (T, K, N) and not plan.a_mn and plan.b_mn
+                    assert (
+                        (plan.M, plan.N, plan.K) == (T, K, N)
+                        and not plan.a_mn
+                        and plan.b_mn
+                    )
                 elif N < 256:  # swapped: X.T @ G with the transposed store
                     assert (plan.M, plan.N, plan.K) == (K, N, T) and plan.transposed_out
                 else:
-                    assert (plan.M, plan.N, plan.K) == (N, K, T) and plan.a_mn and plan.b_mn
+                    assert (
+                        (plan.M, plan.N, plan.K) == (N, K, T)
+                        and plan.a_mn
+                        and plan.b_mn
+                    )
                 assert plan.block_n == default_block_n(plan.N, plan.b_mn)
 
 
@@ -588,22 +1001,45 @@ def test_mla_rows_plan_as_batched_views(T, sm_count):
     for row in MLA_ROWS:
         for op in ("fwd", "dgrad", "wgrad"):
             v = _views("mla", row, op, "bf16", T)
-            plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(v["A"], v["B"], v["out"], sm_count=sm_count, l2_bytes=L2_BYTES)
+            plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(
+                v["A"], v["B"], v["out"], sm_count=sm_count, l2_bytes=L2_BYTES
+            )
             assert plan.L == 64 and out3.shape[0] == 64
-            assert plan.template == _expected(MLA_TEMPLATES, (row, op), T, sm_count), (row, op, T, sm_count, plan.template)
+            assert plan.template == _expected(MLA_TEMPLATES, (row, op), T, sm_count), (
+                row,
+                op,
+                T,
+                sm_count,
+                plan.template,
+            )
             assert plan.template in EXPORTED_TEMPLATES
             assert not plan.transposed_out
-            assert plan.hints == default_hints(plan.a_mn, plan.b_mn, plan.m_tiles, plan.n_tiles, plan.K, plan.group_m, plan.sm_pairs, L2_BYTES)
-            assert plan.group_m == default_group_m(plan.a_mn, plan.b_mn, plan.m_tiles, plan.pair_tiles, plan.sm_pairs)
+            assert plan.hints == default_hints(
+                plan.a_mn,
+                plan.b_mn,
+                plan.m_tiles,
+                plan.n_tiles,
+                plan.K,
+                plan.group_m,
+                plan.sm_pairs,
+                L2_BYTES,
+            )
+            assert plan.group_m == default_group_m(
+                plan.a_mn, plan.b_mn, plan.m_tiles, plan.pair_tiles, plan.sm_pairs
+            )
     # qabs dgrad writes the first 192 columns of a 256-wide slot of a token-major [T, H, 256] buffer:
     # the [H, T, D] output view has batch stride 256 (heads) and row stride 64 * 256 (tokens)
     v = _views("mla", "qabs", "dgrad", "bf16", 33)
-    plan, _, _, out3 = plan_dense_projection_gemm(v["A"], v["B"], v["out"], sm_count=148, l2_bytes=L2_BYTES)
+    plan, _, _, out3 = plan_dense_projection_gemm(
+        v["A"], v["B"], v["out"], sm_count=148, l2_bytes=L2_BYTES
+    )
     assert (out3.stride(0), out3.stride(1), out3.stride(2)) == (256, 64 * 256, 1)
     # A = d_out [H, T, 512] K-major, B = the in_out weight transposed ([H, 512, 192], k contiguous) K-major;
     # K = D_out = 512 <= 1024: TMA-store epilogue
     assert plan.template == _expected(MLA_TEMPLATES, ("qabs", "dgrad"), 33, 148)
-    assert plan.template.startswith("dense_proj_gemm_kk_n256") and plan.template.endswith("_tma1")
+    assert plan.template.startswith(
+        "dense_proj_gemm_kk_n256"
+    ) and plan.template.endswith("_tma1")
 
 
 def test_operand_view_classification_and_rejections():
@@ -617,27 +1053,64 @@ def test_operand_view_classification_and_rejections():
     mn, desc = operand_view(A.transpose(1, 2), "A", k_axis=2)
     assert mn and tuple(desc.shape) == (4, 16, 64)
     with pytest.raises(ValueError, match="unit stride"):
-        operand_view(torch.empty(4, 16, 64, dtype=torch.bfloat16)[:, :, ::2], "A", k_axis=2)
+        operand_view(
+            torch.empty(4, 16, 64, dtype=torch.bfloat16)[:, :, ::2], "A", k_axis=2
+        )
     with pytest.raises(ValueError, match="multiples of 8"):
-        operand_view(torch.empty(1, 16, 68, dtype=torch.bfloat16)[:, :, :64], "A", k_axis=2)
+        operand_view(
+            torch.empty(1, 16, 68, dtype=torch.bfloat16)[:, :, :64], "A", k_axis=2
+        )
     with pytest.raises(ValueError, match="16-byte aligned"):
-        operand_view(torch.empty(1, 16, 72, dtype=torch.bfloat16)[:, :, 4:68], "A", k_axis=2)
+        operand_view(
+            torch.empty(1, 16, 72, dtype=torch.bfloat16)[:, :, 4:68], "A", k_axis=2
+        )
     A2 = torch.empty(16, 64, dtype=torch.bfloat16)
     B2 = torch.empty(64, 24, dtype=torch.bfloat16)
     with pytest.raises(ValueError, match="bf16"):
-        plan_dense_projection_gemm(A2.float(), B2, torch.empty(16, 24), sm_count=148, l2_bytes=L2_BYTES)
+        plan_dense_projection_gemm(
+            A2.float(), B2, torch.empty(16, 24), sm_count=148, l2_bytes=L2_BYTES
+        )
     with pytest.raises(ValueError, match="bf16 or fp32"):
-        plan_dense_projection_gemm(A2, B2, torch.empty(16, 24, dtype=torch.float16), sm_count=148, l2_bytes=L2_BYTES)
+        plan_dense_projection_gemm(
+            A2,
+            B2,
+            torch.empty(16, 24, dtype=torch.float16),
+            sm_count=148,
+            l2_bytes=L2_BYTES,
+        )
     with pytest.raises(ValueError, match=r"B must be \[L=1, K=64, N\]"):
-        plan_dense_projection_gemm(A2, torch.empty(32, 24, dtype=torch.bfloat16), torch.empty(16, 24), sm_count=148, l2_bytes=L2_BYTES)
+        plan_dense_projection_gemm(
+            A2,
+            torch.empty(32, 24, dtype=torch.bfloat16),
+            torch.empty(16, 24),
+            sm_count=148,
+            l2_bytes=L2_BYTES,
+        )
     with pytest.raises(ValueError, match="out must be"):
-        plan_dense_projection_gemm(A2, B2, torch.empty(24, 16), sm_count=148, l2_bytes=L2_BYTES)
+        plan_dense_projection_gemm(
+            A2, B2, torch.empty(24, 16), sm_count=148, l2_bytes=L2_BYTES
+        )
     with pytest.raises(ValueError, match="multiple of 8"):
-        plan_dense_projection_gemm(A2, torch.empty(64, 20, dtype=torch.bfloat16), torch.empty(16, 20), sm_count=148, l2_bytes=L2_BYTES)
+        plan_dense_projection_gemm(
+            A2,
+            torch.empty(64, 20, dtype=torch.bfloat16),
+            torch.empty(16, 20),
+            sm_count=148,
+            l2_bytes=L2_BYTES,
+        )
     with pytest.raises(ValueError, match="unit inner stride"):
-        plan_dense_projection_gemm(A2, B2, torch.empty(24, 16).t(), sm_count=148, l2_bytes=L2_BYTES)
+        plan_dense_projection_gemm(
+            A2, B2, torch.empty(24, 16).t(), sm_count=148, l2_bytes=L2_BYTES
+        )
     # transposed output: [N, M] with unit stride on m
-    plan, *_ = plan_dense_projection_gemm(A2, B2, torch.empty(24, 16), sm_count=148, l2_bytes=L2_BYTES, transposed_out=True)
+    plan, *_ = plan_dense_projection_gemm(
+        A2,
+        B2,
+        torch.empty(24, 16),
+        sm_count=148,
+        l2_bytes=L2_BYTES,
+        transposed_out=True,
+    )
     assert plan.transposed_out and plan.epi == "reg" and plan.template.endswith("_t")
 
 
@@ -657,17 +1130,31 @@ def test_router_layout_classification_and_swap():
     W = torch.empty(N, K)
     G = torch.empty(T, N)
     plan, A_eff, B_eff = plan_router_fp32_gemm(X, W.t(), torch.empty(T, N))
-    assert (plan.layout, plan.template, plan.splits) == ("kk", "router_fp32_gemm_kk", ROUTER_SPLITS["kk"])
+    assert (plan.layout, plan.template, plan.splits) == (
+        "kk",
+        "router_fp32_gemm_kk",
+        ROUTER_SPLITS["kk"],
+    )
     assert not plan.swapped and (plan.M, plan.N, plan.K) == (T, N, K)
     plan, A_eff, B_eff = plan_router_fp32_gemm(G, W, torch.empty(T, K))
     assert (plan.layout, plan.template, plan.splits) == ("kn", "router_fp32_gemm_kn", 1)
     assert (plan.M, plan.N, plan.K) == (T, K, N) and plan.b_mn
     plan, A_eff, B_eff = plan_router_fp32_gemm(G.t(), X, torch.empty(N, K))
-    assert (plan.layout, plan.template, plan.splits) == ("nn_t", "router_fp32_gemm_nn_t", 11)
-    assert plan.swapped and plan.transposed_out and (plan.M, plan.N, plan.K) == (K, N, T)
+    assert (plan.layout, plan.template, plan.splits) == (
+        "nn_t",
+        "router_fp32_gemm_nn_t",
+        11,
+    )
+    assert (
+        plan.swapped and plan.transposed_out and (plan.M, plan.N, plan.K) == (K, N, T)
+    )
     assert A_eff.data_ptr() == X.data_ptr() and B_eff.data_ptr() == G.data_ptr()
     assert plan.a_mn and plan.b_mn
-    assert plan.grid == (plan.splits * (plan.m_tiles // CTA_GROUP) * plan.n_tiles * CTA_GROUP, 1, 1)
+    assert plan.grid == (
+        plan.splits * (plan.m_tiles // CTA_GROUP) * plan.n_tiles * CTA_GROUP,
+        1,
+        1,
+    )
     plan, *_ = plan_router_fp32_gemm(X, W.t(), torch.empty(T, N), splits=2)
     assert plan.splits == 2 and plan.k_iters_split == -(-plan.k_blocks // 2)
     with pytest.raises(NotImplementedError, match="MN-major A"):
@@ -679,7 +1166,9 @@ def test_router_layout_classification_and_swap():
     with pytest.raises(ValueError, match="out must be"):
         plan_router_fp32_gemm(X, W.t(), torch.empty(N, T))
     with pytest.raises(ValueError, match="multiple of 8"):
-        plan_router_fp32_gemm(X, torch.empty(K, 20).t().contiguous().t(), torch.empty(T, 20))
+        plan_router_fp32_gemm(
+            X, torch.empty(K, 20).t().contiguous().t(), torch.empty(T, 20)
+        )
     with pytest.raises(ValueError, match="unit stride"):
         plan_router_fp32_gemm(torch.empty(T, 2 * K)[:, ::2], W.t(), torch.empty(T, N))
 
@@ -691,7 +1180,9 @@ def test_split_fp32_to_bf16x3_is_exact_and_allocation_free_in_place():
     resid = torch.empty(64, 96)
     split_fp32_to_bf16x3_(src, parts, resid)
     total = parts[0].double() + parts[1].double() + parts[2].double()
-    assert torch.equal(total, src.double())  # 3 x 8 significant bits cover the 24 of an fp32
+    assert torch.equal(
+        total, src.double()
+    )  # 3 x 8 significant bits cover the 24 of an fp32
     assert torch.equal(parts[0], src.to(torch.bfloat16))
     # the split of a transposed source view (K-major parts come from B.T): same values, transposed
     parts_t = torch.empty(3, 96, 64, dtype=torch.bfloat16)
@@ -722,21 +1213,42 @@ def test_bind_launch_fails_closed_and_checks_the_cluster(monkeypatch):
         "launch": {"block": [320, 1, 1], "cluster": [2, 1, 1]},
     }
     monkeypatch.setitem(cake_jit.MODULES, "cake_dense_projection_gemm_fake", record)
-    monkeypatch.setitem(cake_jit.KERNELS, "sm_100a", {"dense_proj_gemm_kk_n256": "cake_dense_projection_gemm_fake"})
+    monkeypatch.setitem(
+        cake_jit.KERNELS,
+        "sm_100a",
+        {"dense_proj_gemm_kk_n256": "cake_dense_projection_gemm_fake"},
+    )
     calls = []
     fake = SimpleNamespace(run=lambda *args: calls.append(args))
-    monkeypatch.setattr(cake_backend, "load_cake_dense_projection_gemm_module", lambda name: fake)
+    monkeypatch.setattr(
+        cake_backend, "load_cake_dense_projection_gemm_module", lambda name: fake
+    )
     A = torch.zeros(1, 8, 64, dtype=torch.bfloat16)
     ws = torch.zeros(512, dtype=torch.uint8)
-    launch = bind_launch("cake_dense_projection_gemm_fake", dict(A=A, M=8, tma_descriptor_workspace=ws), (4, 1, 1))
+    launch = bind_launch(
+        "cake_dense_projection_gemm_fake",
+        dict(A=A, M=8, tma_descriptor_workspace=ws),
+        (4, 1, 1),
+    )
     assert launch.arguments == (A, 8, ws, 4, 1, 1)
     launch()
     assert calls == [(A, 8, ws, 4, 1, 1)]
     with pytest.raises(KeyError, match="'M'"):
-        bind_launch("cake_dense_projection_gemm_fake", dict(A=A, tma_descriptor_workspace=ws), (4, 1, 1))
+        bind_launch(
+            "cake_dense_projection_gemm_fake",
+            dict(A=A, tma_descriptor_workspace=ws),
+            (4, 1, 1),
+        )
     with pytest.raises(ValueError, match="cluster"):
-        bind_launch("cake_dense_projection_gemm_fake", dict(A=A, M=8, tma_descriptor_workspace=ws), (3, 1, 1))
-    assert cake_jit.select_module("sm_100a", "dense_proj_gemm_kk_n256") == "cake_dense_projection_gemm_fake"
+        bind_launch(
+            "cake_dense_projection_gemm_fake",
+            dict(A=A, M=8, tma_descriptor_workspace=ws),
+            (3, 1, 1),
+        )
+    assert (
+        cake_jit.select_module("sm_100a", "dense_proj_gemm_kk_n256")
+        == "cake_dense_projection_gemm_fake"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -750,7 +1262,11 @@ def _make_inputs(family, row, op, out_dtype, T, seed, device="cuda"):
     v = _views(family, row, op, out_dtype, T, device=device)
 
     def fill(t, scale=1.0):
-        t.copy_((torch.randn(t.shape, device=device, generator=g) * scale).to(torch.bfloat16))
+        t.copy_(
+            (torch.randn(t.shape, device=device, generator=g) * scale).to(
+                torch.bfloat16
+            )
+        )
 
     if family == "proj":
         K, N = PROJECTION_ROWS[row]
@@ -773,7 +1289,9 @@ def _check(actual, expected_f64, *, untouched=None):
     assert bool(torch.isfinite(actual).all())
     if actual.dtype == torch.bfloat16:
         violations = int((diff > BF16_ATOL + BF16_RTOL * expected_f64.abs()).sum())
-        assert violations == 0, f"{violations} bf16 elements outside atol=rtol=1e-2 (max abs {float(diff.max()):.4g})"
+        assert violations == 0, (
+            f"{violations} bf16 elements outside atol=rtol=1e-2 (max abs {float(diff.max()):.4g})"
+        )
     else:
         tiny = torch.finfo(torch.float64).tiny
         rel_fro = float(diff.norm() / max(float(expected_f64.norm()), tiny))
@@ -786,7 +1304,12 @@ def _check(actual, expected_f64, *, untouched=None):
 
 def _plan_template(v):
     plan, *_ = plan_dense_projection_gemm(
-        v["A"], v["B"], v["out"], sm_count=_sm_count(), l2_bytes=_l2_bytes(), transposed_out=v.get("transposed", False)
+        v["A"],
+        v["B"],
+        v["out"],
+        sm_count=_sm_count(),
+        l2_bytes=_l2_bytes(),
+        transposed_out=v.get("transposed", False),
     )
     return plan.template
 
@@ -834,28 +1357,43 @@ def test_strided_views_and_storage_offsets_match_fp64_reference():
     # weight; out: a slice inside a larger buffer with a padded row stride
     a_buf = (torch.randn(T, K + 64, device=device, generator=g)).to(torch.bfloat16)
     A = a_buf[:, 8 : 8 + K]
-    w_buf = (torch.randn(N + 16, K, device=device, generator=g) * K**-0.5).to(torch.bfloat16)
+    w_buf = (torch.randn(N + 16, K, device=device, generator=g) * K**-0.5).to(
+        torch.bfloat16
+    )
     W = w_buf[16:]
-    out_buf = torch.full((T + 3, N + 24), float("nan"), device=device, dtype=torch.bfloat16)
+    out_buf = torch.full(
+        (T + 3, N + 24), float("nan"), device=device, dtype=torch.bfloat16
+    )
     out = out_buf[3:, 8 : 8 + N]
     _require_program(_plan_template(dict(A=A, B=W.t(), out=out)))
     prepared = prepare_dense_projection_gemm(A, W.t(), out)
     prepared.launch()
     torch.cuda.synchronize()
     _check(out, torch.matmul(A.double(), W.double().t()))
-    assert bool(torch.isnan(out_buf[:3].float()).all()) and bool(torch.isnan(out_buf[3:, :8].float()).all())
+    assert bool(torch.isnan(out_buf[:3].float()).all()) and bool(
+        torch.isnan(out_buf[3:, :8].float()).all()
+    )
     assert bool(torch.isnan(out_buf[3:, 8 + N :].float()).all())
     # the swapped small-N weight gradient X.T @ G (both operands MN-major) with the transposed fp32
     # store into a [N, K] output that sits inside a wider buffer (padded row stride)
     Nf = 96
     Gs = torch.randn(T, Nf, device=device, generator=g).to(torch.bfloat16)
-    out_t_buf = torch.full((Nf, K + 8), float("nan"), device=device, dtype=torch.float32)
+    out_t_buf = torch.full(
+        (Nf, K + 8), float("nan"), device=device, dtype=torch.float32
+    )
     out_t = out_t_buf[:, :K]
     _require_program(_plan_template(dict(A=A.t(), B=Gs, out=out_t, transposed=True)))
     prepared = prepare_projection_wgrad(Gs, A, out_t)
-    assert prepared.plan.transposed_out and prepared.template == _plan_template(dict(A=A.t(), B=Gs, out=out_t, transposed=True))
-    assert prepared.template.startswith("dense_proj_gemm_nn_n128") and prepared.template.endswith("_f32_t")
-    assert prepared.plan.l2_bytes == _l2_bytes() and prepared.plan.sm_pairs == _sm_count() // 2
+    assert prepared.plan.transposed_out and prepared.template == _plan_template(
+        dict(A=A.t(), B=Gs, out=out_t, transposed=True)
+    )
+    assert prepared.template.startswith(
+        "dense_proj_gemm_nn_n128"
+    ) and prepared.template.endswith("_f32_t")
+    assert (
+        prepared.plan.l2_bytes == _l2_bytes()
+        and prepared.plan.sm_pairs == _sm_count() // 2
+    )
     prepared.launch()
     torch.cuda.synchronize()
     _check(out_t, torch.matmul(Gs.double().t(), A.double()))
@@ -894,7 +1432,9 @@ def _router_inputs(op, T, seed, K=6144, N=256, device="cuda"):
     return dict(A=G.t(), B=X, out=torch.empty(N, K, device=device), X=X, W=W, G=G)
 
 
-@pytest.mark.parametrize("op, T", [("fwd", 257), ("dgrad", 257), ("wgrad", 1001), ("fwd", 129)])
+@pytest.mark.parametrize(
+    "op, T", [("fwd", 257), ("dgrad", 257), ("wgrad", 1001), ("fwd", 129)]
+)
 def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
     if not _device_supported():
         pytest.skip("requires a compute capability 10.0 / 10.3 / 10.7 device")
@@ -914,12 +1454,20 @@ def test_router_rows_match_fp64_reference_and_rerun_bit_exact(op, T):
     expected = torch.matmul(v["A"].double(), v["B"].double())
     diff = (v["out"].double() - expected).abs()
     rel_fro = float(diff.norm() / expected.norm())
-    assert bool(torch.isfinite(v["out"]).all()) and rel_fro <= ROUTER_REL_FRO_MAX, rel_fro
-    if op == "fwd":  # top-8 routing agreement with the FP64 reference on the forward rows
+    assert bool(torch.isfinite(v["out"]).all()) and rel_fro <= ROUTER_REL_FRO_MAX, (
+        rel_fro
+    )
+    if (
+        op == "fwd"
+    ):  # top-8 routing agreement with the FP64 reference on the forward rows
         ref_top = torch.topk(expected, 8, dim=1).indices.sort(dim=1).values
         top = torch.topk(v["out"].double(), 8, dim=1).indices.sort(dim=1).values
         assert int((top != ref_top).any(dim=1).sum()) == 0
     # the eager entry point of the row gives the same bits
-    eager = dict(fwd=lambda: cake_backend.router_forward(v["X"], v["W"]), dgrad=lambda: cake_backend.router_dgrad(v["G"], v["W"]), wgrad=lambda: cake_backend.router_wgrad(v["G"], v["X"]))[op]()
+    eager = dict(
+        fwd=lambda: cake_backend.router_forward(v["X"], v["W"]),
+        dgrad=lambda: cake_backend.router_dgrad(v["G"], v["W"]),
+        wgrad=lambda: cake_backend.router_wgrad(v["G"], v["X"]),
+    )[op]()
     torch.cuda.synchronize()
     assert torch.equal(eager, v["out"])

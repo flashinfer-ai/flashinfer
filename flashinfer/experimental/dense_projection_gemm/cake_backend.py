@@ -125,10 +125,22 @@ K_TWO_SLOTS = 0  # K at or below this: two staging slots per warp (off)  [Cake L
 # 16), so the host asserts tail_tiles * 16 <= SK_DUMMY_BASE and allocates at least
 # SK_DUMMY_BASE + 16 * 32 = 4608 counters (the Cake host allocates max(8192, tail_tiles * 16)).  [Cake L105-L106]
 SK_DUMMY_BASE = 4096
-SK_COUNTERS_MIN = 8192  # ``_sk_counters``: zeros of max(8192, needed) u32  [Cake L1027-L1034]
+SK_COUNTERS_MIN = (
+    8192  # ``_sk_counters``: zeros of max(8192, needed) u32  [Cake L1027-L1034]
+)
 SMEM_OPT_IN_BYTES = 232448  # 227 KiB dynamic shared memory opt-in  [Cake L711]
-L2_PROMOS = ("none", "l2_64b", "l2_128b", "l2_256b")  # TMA descriptor L2 promotion  [Cake L621]
-L2_HINTS = ("none", "evict_normal", "evict_first", "evict_last")  # TMA load L2 eviction policy  [Cake L622]
+L2_PROMOS = (
+    "none",
+    "l2_64b",
+    "l2_128b",
+    "l2_256b",
+)  # TMA descriptor L2 promotion  [Cake L621]
+L2_HINTS = (
+    "none",
+    "evict_normal",
+    "evict_first",
+    "evict_last",
+)  # TMA load L2 eviction policy  [Cake L622]
 EPI_MODES = ("reg", "tma")  # [Cake L626]
 BLOCK_N_CHOICES = (128, 256)
 CTA_ROWS_CHOICES = (128, 256)
@@ -491,7 +503,9 @@ def default_hints(
     return ("none", "none")
 
 
-def default_group_m(a_mn: bool, b_mn: bool, m_tiles: int, pair_tiles: int, pairs: int) -> int:
+def default_group_m(
+    a_mn: bool, b_mn: bool, m_tiles: int, pair_tiles: int, pairs: int
+) -> int:
     """CTA row tiles per raster group (even): 16 on every row (16 is fastest or within 1 percent
     on every projection row; small groups cost 3..30 percent on the many-wave rows).  A 4-row
     group for one-to-two-wave weight-gradient rows measured 0..+2 percent in the production
@@ -534,7 +548,9 @@ def stream_k_plan(
     tail = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
     if tail == 0:
         return pair_tiles, 0, 0, k_blocks
-    if sk == "tiles":  # diagnostic: the tail tiles go through the unit path as whole tiles (no partials, no fixup)
+    if (
+        sk == "tiles"
+    ):  # diagnostic: the tail tiles go through the unit path as whole tiles (no partials, no fixup)
         return pair_tiles - tail, tail, tail, k_blocks
     if sk == "auto":
         if pair_tiles > pairs or 2 * tail > pairs or k_blocks < 2 * SK_MIN_ITERS:
@@ -566,7 +582,9 @@ def as_batched(t: torch.Tensor, name: str) -> torch.Tensor:
     raise ValueError(f"{name} must be a 2-D or 3-D view, got {t.dim()}-D")
 
 
-def operand_view(t: torch.Tensor, name: str, *, k_axis: int) -> tuple[bool, torch.Tensor]:
+def operand_view(
+    t: torch.Tensor, name: str, *, k_axis: int
+) -> tuple[bool, torch.Tensor]:
     """Classify a ``[L, rows, cols]`` matrix view as K-major (contraction axis contiguous) or
     MN-major and return ``(mn_major, desc)`` with ``desc`` the ``[L, outer, inner]`` view
     (inner stride 1) the TMA descriptor spans.  [Cake ``_operand_view`` L820-L836]"""
@@ -632,7 +650,9 @@ class GemmPlan:
     @property
     def wave_working_set_bytes(self) -> int:
         """Operand bytes one wave of CTA pairs touches (the hint gate compares it with ``l2_bytes``)."""
-        return wave_working_set(self.m_tiles, self.n_tiles, self.K, self.group_m, self.sm_pairs)
+        return wave_working_set(
+            self.m_tiles, self.n_tiles, self.K, self.group_m, self.sm_pairs
+        )
 
     @property
     def grid(self) -> tuple[int, int, int]:
@@ -752,7 +772,9 @@ def plan_dense_projection_gemm(
     if group_m is None:
         group_m = default_group_m(a_mn, b_mn, m_tiles, pair_tiles, pairs)
     if hints is None:
-        hints = default_hints(a_mn, b_mn, m_tiles, n_tiles, K, group_m, pairs, int(l2_bytes))
+        hints = default_hints(
+            a_mn, b_mn, m_tiles, n_tiles, K, group_m, pairs, int(l2_bytes)
+        )
     key = instance_key(
         a_mn=a_mn,
         b_mn=b_mn,
@@ -819,7 +841,9 @@ class _Launch:
         self.entry(*self.arguments)
 
 
-def bind_launch(module_name: str, values: dict[str, Any], grid: tuple[int, int, int]) -> _Launch:
+def bind_launch(
+    module_name: str, values: dict[str, Any], grid: tuple[int, int, int]
+) -> _Launch:
     """Order ``values`` by the generated argument plan of ``module_name`` and load its entry.
 
     Fails closed: a keyword the kernel expects that the host does not provide raises
@@ -845,7 +869,9 @@ def bind_launch(module_name: str, values: dict[str, Any], grid: tuple[int, int, 
                 f"the host binding provides {sorted(k for k, v in values.items() if v is not None)}"
             )
     module = load_cake_dense_projection_gemm_module(module_name)
-    return _Launch(module_name, getattr(module, record["ffi_entry"]), tuple(arguments), grid)
+    return _Launch(
+        module_name, getattr(module, record["ffi_entry"]), tuple(arguments), grid
+    )
 
 
 _FFI_DEVICES: dict[int, Any] = {}
@@ -858,12 +884,18 @@ def _ffi_stream_context(index: int):
     if device is None:
         device = _FFI_DEVICES[index] = tvm_ffi.device(f"cuda:{index}")
     getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
-    raw = getter(index) if getter is not None else torch.cuda.current_stream(index).cuda_stream
+    raw = (
+        getter(index)
+        if getter is not None
+        else torch.cuda.current_stream(index).cuda_stream
+    )
     return tvm_ffi.use_raw_stream(device, raw)
 
 
 def _device_index(device: torch.device) -> int:
-    return int(device.index if device.index is not None else torch.cuda.current_device())
+    return int(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
 
 
 def _tma_workspace(module_name: str, device: torch.device) -> Optional[torch.Tensor]:
@@ -899,7 +931,9 @@ def flat_alias(t: torch.Tensor) -> torch.Tensor:
     """Contiguous 1-D view over the storage span of ``t`` (same data pointer), for pointer
     parameters: the kernel addresses rows / batches through ``ldo`` / ``out_l``."""
     span = 1 + sum(
-        (int(s) - 1) * int(st) for s, st in zip(t.shape, t.stride(), strict=True) if int(s) > 0
+        (int(s) - 1) * int(st)
+        for s, st in zip(t.shape, t.stride(), strict=True)
+        if int(s) > 0
     )
     return torch.as_strided(t, (span,), (1,))
 
@@ -967,7 +1001,11 @@ def prepare_dense_projection_gemm(
     descriptor workspace).  See the module docstring for the view contract; the keyword
     knobs default to the Cake launcher's choices."""
     device = out.device
-    if not (A.is_cuda and B.is_cuda and out.is_cuda) or A.device != device or B.device != device:
+    if (
+        not (A.is_cuda and B.is_cuda and out.is_cuda)
+        or A.device != device
+        or B.device != device
+    ):
         raise ValueError("Expected A, B and out on one CUDA device")
     arch = require_arch(device)
     plan, a_desc, b_desc, O3 = plan_dense_projection_gemm(
@@ -1000,7 +1038,9 @@ def prepare_dense_projection_gemm(
     dummy16, dummy32 = _dummy(device, torch.bfloat16), _dummy(device, torch.float32)
     o_alias = flat_alias(O3)
     tma_out, out_f32 = plan.tma_out, plan.out_f32
-    tensors = dict(A=a_desc, B=b_desc, out3=O3, ws=ws, counters=counters, o_alias=o_alias)
+    tensors = dict(
+        A=a_desc, B=b_desc, out3=O3, ws=ws, counters=counters, o_alias=o_alias
+    )
     values: dict[str, Any] = dict(
         A=a_desc,
         B=b_desc,
@@ -1025,7 +1065,9 @@ def prepare_dense_projection_gemm(
     )
     tma_ws = _tma_workspace(module_name, device)
     if tma_ws is not None:
-        values["tma_descriptor_workspace"] = tensors["tma_descriptor_workspace"] = tma_ws
+        values["tma_descriptor_workspace"] = tensors["tma_descriptor_workspace"] = (
+            tma_ws
+        )
     launch = bind_launch(module_name, values, plan.grid)
     return PreparedGemm(
         module_name=module_name,
@@ -1042,7 +1084,9 @@ def dense_projection_gemm(
     A: torch.Tensor, B: torch.Tensor, out: torch.Tensor, *, transposed_out: bool = False
 ) -> torch.Tensor:
     """``out[l, m, n] = sum_k A[l, m, k] B[l, k, n]`` for strided views (prepare + launch)."""
-    return prepare_dense_projection_gemm(A, B, out, transposed_out=transposed_out).launch()
+    return prepare_dense_projection_gemm(
+        A, B, out, transposed_out=transposed_out
+    ).launch()
 
 
 # --- the training operations as thin wrappers (the Cake entry points) ---------------------
@@ -1058,7 +1102,11 @@ def projection_forward(
 
 
 def projection_dgrad(
-    G: torch.Tensor, W: torch.Tensor, out: Optional[torch.Tensor] = None, *, out_dtype=None
+    G: torch.Tensor,
+    W: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    out_dtype=None,
 ) -> torch.Tensor:
     """``out[T, K] = G[T, N] @ W[N, K]``."""
     if out is None:
@@ -1091,7 +1139,9 @@ def prepare_projection_wgrad(
 ) -> PreparedGemm:
     """Prepared ``out[N, K] = G[T, N].T @ X[T, K]`` with the small-``N`` swap rule of the Cake launcher."""
     A, B, transposed = wgrad_views(G, X)
-    return prepare_dense_projection_gemm(A, B, out, transposed_out=transposed, sk=sk, cta_rows=cta_rows)
+    return prepare_dense_projection_gemm(
+        A, B, out, transposed_out=transposed, sk=sk, cta_rows=cta_rows
+    )
 
 
 def projection_wgrad(
@@ -1194,7 +1244,11 @@ def plan_router_fp32_gemm(
     Returns ``(plan, A_eff, B_eff)``: the operands of the launched (possibly swapped) GEMM;
     ``B_eff`` is the operand the host splits into BF16x3 parts.  ``splits`` overrides the
     production split-K count of the layout class (:data:`ROUTER_SPLITS`)."""
-    if A.dtype != torch.float32 or B.dtype != torch.float32 or out.dtype != torch.float32:
+    if (
+        A.dtype != torch.float32
+        or B.dtype != torch.float32
+        or out.dtype != torch.float32
+    ):
         raise ValueError("router_fp32_gemm: A, B and out must be fp32")
     if A.dim() != 2 or B.dim() != 2 or out.dim() != 2:
         raise ValueError("router_fp32_gemm: A, B and out must be 2-D views")
@@ -1205,7 +1259,9 @@ def plan_router_fp32_gemm(
             f"router_fp32_gemm: A is [M={M}, K={K}] but B is [{Kb}, {N}]; K must agree"
         )
     if tuple(out.shape) != (M, N):
-        raise ValueError(f"router_fp32_gemm: out must be [{M}, {N}], got {tuple(out.shape)}")
+        raise ValueError(
+            f"router_fp32_gemm: out must be [{M}, {N}], got {tuple(out.shape)}"
+        )
     a_mn, b_mn = _router_a_layout(A), _router_b_layout(B)
     layout = router_layout_class(a_mn, b_mn)
     swapped = layout == "nn_t"
@@ -1304,7 +1360,9 @@ class PreparedRouterGemm:
         with _ffi_stream_context(self.device_index):
             self._launch()
         if self.plan.splits > 1:
-            torch.sum(t["workspace"], dim=0, out=self.out)  # fixed-order reduction of the partials
+            torch.sum(
+                t["workspace"], dim=0, out=self.out
+            )  # fixed-order reduction of the partials
         return self.out
 
     __call__ = launch
@@ -1321,7 +1379,11 @@ def prepare_router_fp32_gemm(
     K2 backend: the BF16x3 stack and its fp32 residual scratch, the split-K workspace and the
     descriptor workspace)."""
     device = out.device
-    if not (A.is_cuda and B.is_cuda and out.is_cuda) or A.device != device or B.device != device:
+    if (
+        not (A.is_cuda and B.is_cuda and out.is_cuda)
+        or A.device != device
+        or B.device != device
+    ):
         raise ValueError("Expected A, B and out on one CUDA device")
     arch = require_arch(device)
     plan, A_eff, B_eff = plan_router_fp32_gemm(A, B, out, splits=splits)
@@ -1330,11 +1392,15 @@ def prepare_router_fp32_gemm(
     split_src = B_eff if plan.b_mn else B_eff.t()
     parts = torch.empty((3, *split_src.shape), device=device, dtype=torch.bfloat16)
     resid = torch.empty(split_src.shape, device=device, dtype=torch.float32)
-    a_view = A_eff.unsqueeze(0) if not plan.a_mn else A_eff.t().unsqueeze(0)  # [1, M, K] or [1, K, M]
+    a_view = (
+        A_eff.unsqueeze(0) if not plan.a_mn else A_eff.t().unsqueeze(0)
+    )  # [1, M, K] or [1, K, M]
     expect = (plan.N, plan.M) if plan.transposed_out else (plan.M, plan.N)
     tensors = dict(A=a_view, split_src=split_src, parts=parts, resid=resid)
     if plan.splits > 1:
-        workspace = torch.empty((plan.splits, *expect), device=device, dtype=torch.float32)
+        workspace = torch.empty(
+            (plan.splits, *expect), device=device, dtype=torch.float32
+        )
         tensors["workspace"] = workspace
         target = workspace
         ldo, out_l = expect[1], expect[0] * expect[1]
@@ -1357,7 +1423,9 @@ def prepare_router_fp32_gemm(
     )
     tma_ws = _tma_workspace(module_name, device)
     if tma_ws is not None:
-        values["tma_descriptor_workspace"] = tensors["tma_descriptor_workspace"] = tma_ws
+        values["tma_descriptor_workspace"] = tensors["tma_descriptor_workspace"] = (
+            tma_ws
+        )
     launch = bind_launch(module_name, values, plan.grid)
     return PreparedRouterGemm(
         module_name=module_name,
@@ -1378,7 +1446,11 @@ def router_fp32_gemm(
 
 
 def router_forward(
-    X: torch.Tensor, W: torch.Tensor, out: Optional[torch.Tensor] = None, *, splits: int = 4
+    X: torch.Tensor,
+    W: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    splits: int = 4,
 ) -> torch.Tensor:
     """``out[T, N] = X[T, K] @ W[N, K].T`` in FP32 through the emulation."""
     if out is None:
@@ -1396,7 +1468,11 @@ def router_dgrad(
 
 
 def router_wgrad(
-    G: torch.Tensor, X: torch.Tensor, out: Optional[torch.Tensor] = None, *, splits: int = 11
+    G: torch.Tensor,
+    X: torch.Tensor,
+    out: Optional[torch.Tensor] = None,
+    *,
+    splits: int = 11,
 ) -> torch.Tensor:
     """``out[N, K] = G[T, N].T @ X[T, K]`` in FP32: the swapped GEMM ``X.T @ G`` with a transposed store."""
     if out is None:

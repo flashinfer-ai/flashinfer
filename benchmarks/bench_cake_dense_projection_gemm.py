@@ -69,8 +69,12 @@ PROJECTION_ROWS = {
     "indexer_hw": (6144, 32),
 }
 MLA_ROWS = {
-    "qabs": dict(H=64, D_in=192, D_out=512, act_stride_head=256, weight_layout="in_out"),
-    "vproj": dict(H=64, D_in=512, D_out=256, act_stride_head=512, weight_layout="out_in"),
+    "qabs": dict(
+        H=64, D_in=192, D_out=512, act_stride_head=256, weight_layout="in_out"
+    ),
+    "vproj": dict(
+        H=64, D_in=512, D_out=256, act_stride_head=512, weight_layout="out_in"
+    ),
 }
 ROUTER_K, ROUTER_N = 6144, 256
 OPS = ("fwd", "dgrad", "wgrad")
@@ -115,7 +119,9 @@ def make_inputs(spec, seed, device):
     out_dt = {"bf16": torch.bfloat16, "f32": torch.float32}[spec["out_dtype"]]
 
     def rnd(*shape, scale=1.0):
-        return (torch.randn(*shape, device=device, generator=g) * scale).to(torch.bfloat16)
+        return (torch.randn(*shape, device=device, generator=g) * scale).to(
+            torch.bfloat16
+        )
 
     if fam == "proj":
         K, N = PROJECTION_ROWS[spec["row"]]
@@ -143,11 +149,21 @@ def make_inputs(spec, seed, device):
             out = torch.empty(T, H, Dout, device=device, dtype=out_dt).permute(1, 0, 2)
         elif op == "dgrad":
             A, B = d_out.permute(1, 0, 2), w_in_out.transpose(1, 2)
-            out = torch.empty(T, H, slot, device=device, dtype=out_dt)[..., :Din].permute(1, 0, 2)
+            out = torch.empty(T, H, slot, device=device, dtype=out_dt)[
+                ..., :Din
+            ].permute(1, 0, 2)
         elif r["weight_layout"] == "in_out":
-            A, B, out = act.permute(1, 2, 0), d_out.permute(1, 0, 2), torch.empty_like(weight, dtype=out_dt)
+            A, B, out = (
+                act.permute(1, 2, 0),
+                d_out.permute(1, 0, 2),
+                torch.empty_like(weight, dtype=out_dt),
+            )
         else:
-            A, B, out = d_out.permute(1, 2, 0), act.permute(1, 0, 2), torch.empty_like(weight, dtype=out_dt)
+            A, B, out = (
+                d_out.permute(1, 2, 0),
+                act.permute(1, 0, 2),
+                torch.empty_like(weight, dtype=out_dt),
+            )
         return dict(A=A, B=B, out=out, flops=2.0 * T * H * Din * Dout)
     K, N = ROUTER_K, ROUTER_N
     X = torch.randn(T, K, device=device, generator=g)
@@ -174,7 +190,9 @@ def cake_arm(spec, inp):
     elif spec["family"] == "proj" and spec["op"] == "wgrad":
         prepared = cake_backend.prepare_projection_wgrad(inp["G"], inp["X"], inp["out"])
     else:
-        prepared = cake_backend.prepare_dense_projection_gemm(inp["A"], inp["B"], inp["out"])
+        prepared = cake_backend.prepare_dense_projection_gemm(
+            inp["A"], inp["B"], inp["out"]
+        )
     return prepared
 
 
@@ -231,7 +249,11 @@ def measure_row(label, spec, args):
     entry = dict(row=label, spec=spec, flops=inp["flops"])
     try:
         prepared = cake_arm(spec, inp)
-        entry.update(template=prepared.template, module=prepared.module_name, grid=list(prepared.grid))
+        entry.update(
+            template=prepared.template,
+            module=prepared.module_name,
+            grid=list(prepared.grid),
+        )
         if spec["family"] == "router":
             entry["splits"] = prepared.splits
         prepared.launch()  # initializes the descriptor workspace outside the timed region
@@ -260,7 +282,9 @@ def measure_row(label, spec, args):
             f"  torch {torch_ms:8.4f} ms  x{entry['speedup_vs_torch']:5.2f}",
             flush=True,
         )
-    except Exception as exc:  # a missing instance or a failing row is recorded, not hidden
+    except (
+        Exception
+    ) as exc:  # a missing instance or a failing row is recorded, not hidden
         entry["error"] = f"{type(exc).__name__}: {exc}"
         entry["traceback"] = traceback.format_exc()
         print(f"{label:34s} failed: {entry['error']}", flush=True)
@@ -273,10 +297,14 @@ def main():
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--rows", nargs="*", default=None, help="row labels (default: every row)")
+    parser.add_argument(
+        "--rows", nargs="*", default=None, help="row labels (default: every row)"
+    )
     parser.add_argument("--ops", default="fwd,dgrad,wgrad")
     parser.add_argument("--T", default=",".join(str(t) for t in CANONICAL_T))
-    parser.add_argument("--f32-grads", action="store_true", help="add the FP32-output gradient rows")
+    parser.add_argument(
+        "--f32-grads", action="store_true", help="add the FP32-output gradient rows"
+    )
     parser.add_argument("--no-mla", action="store_true")
     parser.add_argument("--no-router", action="store_true")
     parser.add_argument("--steps", type=int, default=20)

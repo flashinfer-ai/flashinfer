@@ -1476,7 +1476,11 @@ def select_module(arch: str, template: str) -> str:
             f"see {TRACKING_ISSUE})"
         )
     record = MODULES.get(name)
-    if record is None or record.get("arch") != arch or record.get("template") != template:
+    if (
+        record is None
+        or record.get("arch") != arch
+        or record.get("template") != template
+    ):
         raise ValueError(
             f"registry record {name!r} does not serve template {template!r} on {arch}"
         )
