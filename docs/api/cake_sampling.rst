@@ -45,7 +45,24 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    (compute capability 10.x); on Hopper it signals after its filter pass, once the whole row
    has been read, where the round-3 kernels did.  All three decisions travel in the stage-1
    ``launch_flags`` argument (bit 0 one-warp tail, bit 1 early trigger, bit 2 stream pre-pass
-   point, bit 3 whole-CTA tail) and none changes any output.
+   point, bit 3 whole-CTA tail, bit 4 coarse sample, bit 5 row-span filter arm) and none changes
+   any output.  Bit 4 selects a
+   streaming variant's coarse-sample build (manifest entries with ``coarse_sample``, symbol suffix
+   ``_cs``): its sampled first pass reads one 64-byte block per 512 bytes of the row (1/8) instead of
+   one per 256 (1/4), with the lower-bucket margin, the sampled-mass cap and the filter-arm density
+   switch scaled to the rate, so only the sample's DRAM traffic changes and every output is
+   bit-identical to the default build.  The host sets it for launches whose largest top-k is at most
+   ``fused_tail_kcap`` (round 6, lever S4: the V = 262144 streams at B >= 64 run 7-9 % faster on
+   B200 / GB300 / R200); a k ~ 1000 row's candidate list sits at the gather capacity, where the
+   coarser estimate sends 3-12 % of the rows down the slower path, so larger top-k launches keep the
+   default build, which is byte-identical to round 5.  Bit 5 makes a streaming variant's filter pass
+   choose its float-threshold arm from the expected candidate density of the whole row (the
+   cluster-wide sampled mass against the cluster's span, seven 16-entry groups per candidate)
+   instead of one CTA's span, which the round-5 test compared the cluster-wide mass with (a
+   cluster-8 row at k ~ 1000 never took the arm); both arms build identical candidate segments.  The
+   host sets it for cluster >= 8 streams whose largest top-k exceeds ``fused_tail_kcap`` on Hopper,
+   B200 and GB300 (round 6, lever FD5: the V = 262144 cluster-8 k = 1000 cells run 2-5 % faster);
+   a cluster-1 row that takes the arm can lose 5 % and Rubin measures neutral, so nothing else.
 
 The stage-2/3 kernel exists in three static forms that differ only in instruction selection,
 never in output: the base form (f64 top-p cut / sample tests, max-min bitonic exchange), a form

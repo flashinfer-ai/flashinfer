@@ -407,6 +407,58 @@ _FLAG_FUSE_TAIL = 1
 _FLAG_EARLY_TRIGGER = 2
 _FLAG_STREAM_PREPASS = 4
 _FLAG_FUSE_BLOCK_TAIL = 8
+_FLAG_COARSE_SAMPLE = 16
+_FLAG_ROW_SPAN_DIET = 32
+_ROW_SPAN_DIET_MIN_CLUSTER = 8
+_ROW_SPAN_DIET_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
+
+
+@functools.cache
+def _stage1_has_coarse_sample(cluster: int, ept: int, stream: bool) -> bool:
+    """Whether the frozen variant ships a coarse-sample build (a manifest entry with ``coarse_sample``): the kernel taken
+    by launch_flags bit 4, whose sampled first pass reads 1/8 of the row instead of 1/4 (every streaming variant;
+    residents take no sample).  The exact passes are the same and every output is bit-identical."""
+    found = False
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            found = True
+            if v["coarse_sample"]:
+                return True
+    if not found:
+        raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+    return False
+
+
+def _coarse_sample_flag(cluster: int, ept: int, stream: bool, top_k_max: int) -> int:
+    """Stage-1 ``launch_flags`` bit that selects the coarse-sample build: a streaming variant that ships it, for a
+    launch whose largest top-k fits the two-warp fused tail (``fused_tail_kcap``).  Above that the candidate count
+    of a k ~ 1000 row sits at the gather capacity and the coarser estimate sends 3-12 % of the rows down the
+    slower path (round 6, lever S4: +5-14 % on the k = 1000 streams), so those launches keep the 1/4 sample."""
+    if not stream or int(top_k_max) > _fused_tail_kcap():
+        return 0
+    return _FLAG_COARSE_SAMPLE if _stage1_has_coarse_sample(cluster, ept, True) else 0
+
+
+@functools.cache
+def _row_span_diet_capability(device_index: int) -> bool:
+    return tuple(torch.cuda.get_device_capability(device_index)) in _ROW_SPAN_DIET_CAPABILITIES
+
+
+def _row_span_diet_flag(
+    cluster: int, stream: bool, top_k_max: int, device_index: int
+) -> int:
+    """Stage-1 ``launch_flags`` bit that makes a streaming variant's filter pass choose its arm from the
+    whole row's expected candidate density instead of one CTA's span (identical candidate segments,
+    identical outputs).  Set for cluster >= 8 streams whose largest top-k exceeds the two-warp tail
+    on Hopper, B200 and GB300 (round 6, lever FD5: those k ~ 1000 cells run 2-5 % faster); a
+    cluster-1 row that takes the arm can lose 5 % and Rubin measures neutral, so nothing else."""
+    if (
+        not stream
+        or int(cluster) < _ROW_SPAN_DIET_MIN_CLUSTER
+        or int(top_k_max) <= _fused_tail_kcap()
+    ):
+        return 0
+    return _FLAG_ROW_SPAN_DIET if _row_span_diet_capability(device_index) else 0
 
 
 def _early_trigger_flag(batch: int, cluster: int, sm_count: int) -> int:
@@ -837,7 +889,9 @@ def top_k_top_p_sampling_from_probs(
     # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
     # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
     if fused:
-        launch_flags = _FLAG_FUSE_TAIL
+        launch_flags = _FLAG_FUSE_TAIL | _coarse_sample_flag(
+            cluster, ept, bool(stream_variant), kmax
+        )
     elif fused_block:
         launch_flags = _FLAG_FUSE_BLOCK_TAIL
     else:
@@ -846,6 +900,9 @@ def top_k_top_p_sampling_from_probs(
         )
         if stream_variant:
             launch_flags |= _stream_prepass_flag(probs.device.index)
+            launch_flags |= _row_span_diet_flag(
+                cluster, True, kmax, probs.device.index or 0
+            )
     module.radix_topk(
         probs,
         k_arr,
@@ -979,7 +1036,10 @@ def top_k_probs_to_slab(
         0,
         0,
         0,
-        0,  # launch_flags: no fused tail, no PDL dependent follows
+        # no fused tail, no PDL dependent follows; the coarse-sample build for a small top-k on a stream,
+        # the row-span filter arm for a large one on a cluster-8 stream
+        _coarse_sample_flag(cluster, ept, bool(stream_variant), kmax)
+        | _row_span_diet_flag(cluster, bool(stream_variant), kmax, probs.device.index or 0),
         stream,
     )
     return vals, idxs, cnt

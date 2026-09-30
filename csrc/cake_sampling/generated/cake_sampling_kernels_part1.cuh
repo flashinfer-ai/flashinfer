@@ -61089,7 +61089,8 @@ kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk
     unsigned int mass_lo = scal[7];
     unsigned int n_w = 0;
     bool diet_ok = (vocab & 3) == 0 && b_lo >= 4;
-    bool sparse = mass_lo * 128 < (unsigned int)(nchunks * 8192);
+    bool row_span = (launch_flags & 32) != 0;
+    bool sparse = ((row_span) ? mass_lo * 448 < (unsigned int)(nchunks * 8192) : mass_lo * 128 < (unsigned int)(nchunks * 8192));
     if (diet_ok && sparse) {
         unsigned int thr_bits = ((b_lo <= 1020) ? b_lo << 21 : 2143289344);
         float thr = __uint_as_float(thr_bits);
@@ -68354,7 +68355,8 @@ kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk
     unsigned int mass_lo = scal[7];
     unsigned int n_w = 0;
     bool diet_ok = (vocab & 3) == 0 && b_lo >= 4;
-    bool sparse = mass_lo * 128 < (unsigned int)(nchunks * 8192);
+    bool row_span = (launch_flags & 32) != 0;
+    bool sparse = ((row_span) ? mass_lo * 448 < (unsigned int)(2 * nchunks * 8192) : mass_lo * 128 < (unsigned int)(nchunks * 8192));
     if (diet_ok && sparse) {
         unsigned int thr_bits = ((b_lo <= 1020) ? b_lo << 21 : 2143289344);
         float thr = __uint_as_float(thr_bits);
@@ -75932,7 +75934,8 @@ kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk
     unsigned int mass_lo = scal[7];
     unsigned int n_w = 0;
     bool diet_ok = (vocab & 3) == 0 && b_lo >= 4;
-    bool sparse = mass_lo * 128 < (unsigned int)(nchunks * 8192);
+    bool row_span = (launch_flags & 32) != 0;
+    bool sparse = ((row_span) ? mass_lo * 448 < (unsigned int)(4 * nchunks * 8192) : mass_lo * 128 < (unsigned int)(nchunks * 8192));
     if (diet_ok && sparse) {
         unsigned int thr_bits = ((b_lo <= 1020) ? b_lo << 21 : 2143289344);
         float thr = __uint_as_float(thr_bits);
