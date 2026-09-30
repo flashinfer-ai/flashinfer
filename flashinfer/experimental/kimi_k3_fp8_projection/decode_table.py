@@ -44,12 +44,12 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         },
         "1,28,8": {
             "route": "decode",
-            "tok": 32,
-            "split": 8,
+            "tok": 16,
+            "split": 14,
             "fused": True,
             "persist": True,
             "resident": False,
-            "csplit": 8,
+            "csplit": 14,
         },
         "1,28,64": {
             "route": "decode",
@@ -81,11 +81,11 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         "5,28,8": {
             "route": "decode",
             "tok": 16,
-            "split": 4,
+            "split": 14,
             "fused": True,
             "persist": True,
             "resident": False,
-            "csplit": 4,
+            "csplit": 14,
         },
         "5,28,64": {
             "route": "decode",
@@ -98,11 +98,12 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         },
         "5,28,256": {
             "route": "decode",
-            "tok": 64,
-            "split": 4,
+            "tok": 32,
+            "split": 2,
             "fused": False,
             "persist": True,
             "resident": False,
+            "csplit": 2,
         },
         "12,1,1": {
             "route": "decode",
@@ -149,11 +150,11 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         "12,28,8": {
             "route": "decode",
             "tok": 16,
-            "split": 4,
+            "split": 7,
             "fused": True,
             "persist": True,
             "resident": False,
-            "csplit": 4,
+            "csplit": 7,
         },
         "12,28,64": {
             "route": "decode",
@@ -391,10 +392,11 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         "56,48,1": {
             "route": "decode",
             "tok": 16,
-            "split": 4,
+            "split": 2,
             "fused": True,
             "persist": True,
             "resident": False,
+            "csplit": 2,
         },
         "56,48,8": {
             "route": "decode",
@@ -408,10 +410,11 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         "56,48,64": {
             "route": "decode",
             "tok": 64,
-            "split": 4,
+            "split": 2,
             "fused": False,
             "persist": True,
             "resident": False,
+            "csplit": 2,
         },
         "56,48,256": {
             "route": "decode",
@@ -623,12 +626,12 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         },
         "1,28,8": {
             "route": "decode",
-            "tok": 32,
-            "split": 8,
+            "tok": 16,
+            "split": 14,
             "fused": True,
             "persist": True,
             "resident": False,
-            "csplit": 8,
+            "csplit": 14,
         },
         "1,28,64": {
             "route": "decode",
@@ -660,11 +663,11 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         "5,28,8": {
             "route": "decode",
             "tok": 16,
-            "split": 4,
+            "split": 14,
             "fused": True,
             "persist": True,
             "resident": False,
-            "csplit": 4,
+            "csplit": 14,
         },
         "5,28,64": {
             "route": "decode",
@@ -677,11 +680,12 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         },
         "5,28,256": {
             "route": "decode",
-            "tok": 64,
-            "split": 4,
+            "tok": 32,
+            "split": 2,
             "fused": False,
             "persist": True,
             "resident": False,
+            "csplit": 2,
         },
         "12,1,1": {
             "route": "decode",
@@ -728,11 +732,11 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         "12,28,8": {
             "route": "decode",
             "tok": 16,
-            "split": 4,
+            "split": 7,
             "fused": True,
             "persist": True,
             "resident": False,
-            "csplit": 4,
+            "csplit": 7,
         },
         "12,28,64": {
             "route": "decode",
@@ -970,10 +974,11 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         "56,48,1": {
             "route": "decode",
             "tok": 16,
-            "split": 4,
+            "split": 2,
             "fused": True,
             "persist": True,
             "resident": False,
+            "csplit": 2,
         },
         "56,48,8": {
             "route": "decode",
@@ -991,6 +996,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": False,
             "persist": True,
             "resident": False,
+            "csplit": 2,
         },
         "56,48,256": {
             "route": "decode",
