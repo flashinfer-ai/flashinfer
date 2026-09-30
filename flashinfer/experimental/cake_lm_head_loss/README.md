@@ -141,7 +141,7 @@ are gathered once per step):
   with the upstream gradient `g` read from a device scalar.
 
 Grid rules live in the registry record (e.g. `rows_c/8` CTAs for
-`row_finalize`, `V/8/2048 x rows_c` for `row_grad`) and are evaluated by the
+`row_finalize`, `V/8/1024 x rows_c` for `row_grad`) and are evaluated by the
 host from the chunk scalars.  A GEMM stage runs in thread-block clusters whose
 CTA count the record's geometry declares per GEMM (`logits_cluster_ctas`,
 `dx_cluster_ctas`, `dw_cluster_ctas`; the host rounds `m_tiles` up to it and
