@@ -206,13 +206,13 @@ class MlaTask(Task):
         if cutlass.const_expr(not params.is_persistent):
             work_tile = self.work_queue._work_tile_from_block_idx(cute.arch.block_idx())
             self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
-            self._run_pre_work_loop_entries(work_tile, context)
+            self._run_pre_work_loop_entries(work_tile, **task_context_kwargs(context))
             # Runtime K/Q metadata can make a statically launched split empty.
             # Keep the CTA on the ordinary initialized-pipeline path, but skip
             # its captured HEAD/LOOP/TAIL data work when the domain is zero.
             if work_tile.k_tile_count > cutlass.Int32(0):
                 self._run_one_mla_work_tile(work_tile, context)
-            self._run_post_work_loop_entries(work_tile, context)
+            self._run_post_work_loop_entries(work_tile, **task_context_kwargs(context))
             self._drain_mla_work_tile_tails()
             return
 
@@ -226,7 +226,7 @@ class MlaTask(Task):
         work_tile = self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
 
-        self._run_pre_work_loop_entries(work_tile, context)
+        self._run_pre_work_loop_entries(work_tile, **task_context_kwargs(context))
         while current_work_linear_idx < num_blocks:
             work_tile.update_from(
                 self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
@@ -249,7 +249,7 @@ class MlaTask(Task):
             self.work_queue._work_tile_from_linear_idx(current_work_linear_idx)
         )
         self.work_queue._set_consumer_var_from_ts("work_tile", work_tile)
-        self._run_post_work_loop_entries(work_tile, context)
+        self._run_post_work_loop_entries(work_tile, **task_context_kwargs(context))
         self._drain_mla_work_tile_tails()
 
 
@@ -313,7 +313,7 @@ class MlaInterleavedTask(MlaTask):
             label,
             schedule_stage,
             routing_slot,
-            context=context,
+            **task_context_kwargs(context),
         )
         actual_loop_offset = self._mapped_domain_start + (
             cutlass.Int32(base_info.loop_offset) - cutlass.Int32(self.domain_start)
