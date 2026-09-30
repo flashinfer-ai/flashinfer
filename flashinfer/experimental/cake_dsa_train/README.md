@@ -74,8 +74,10 @@ roughly 400 us per backward at 4k tokens on B200 that are not in this package
 shapes shows the same cost, and no synchronization is involved.  In a
 GPU-bound training step this is hidden behind the backward kernels (6-8 ms at
 4k tokens).  Host-bound loops should call `cake_backend.forward` /
-`cake_backend.backward` directly (about 25 / 40 us per call with a remembered
-binding) or capture the prepared runner into a CUDA graph.
+`cake_backend.backward` directly (about 25 / 55-90 us per call with a
+remembered binding on B200 -- the backward figure grows with the per-call
+scratch of the key-range-pass rows) or capture the prepared runner into a CUDA
+graph.
 
 ## Kernel structure of one training step
 
