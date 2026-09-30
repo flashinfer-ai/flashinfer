@@ -32,6 +32,77 @@ dispatch unchanged.
 
     recurrent_kda
 
+Static PTX prefill on B300
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects four
+retained PTX programs from `NVlabs/kda (260927-kda-for-kda)
+<https://github.com/NVlabs/kda/tree/ea37ebaff74c88a2545751dcb8ea8ef6c6251b67/ptx>`_.
+The programs target SM103a (B300) and use persistent recurrence scheduling
+with exact FP32 state handoff between pieces. The default backend selection
+is unchanged.
+
+Install ``nvidia-cuda-nvcc>=13.2`` and ``apache-tvm-ffi>=0.1.12`` in addition
+to FlashInfer's regular dependencies. The retained PTX uses ISA 9.2. It is
+assembled once with ptxas >= 13.2 and embedded as a cubin, allowing execution
+with a CUDA 13 driver that cannot JIT PTX 9.2 directly. A C++17 host compiler
+and CUDA driver headers (provided by Triton) are needed for the FFI shims.
+``FLASHINFER_KDA_PTXAS`` selects the assembler;
+``FLASHINFER_KDA_PTX_CACHE_DIR`` overrides the default FlashInfer JIT cubin
+cache directory. No build output is written into the installed package. This backend is
+JIT-only and is unavailable with ``FLASHINFER_DISABLE_JIT=1`` in a fresh
+process.
+
+Supported inputs are contiguous CUDA BF16 ``q/k/v/g [1, T, H, 128]`` with
+``T >= 32`` and ``H`` equal to 64 or 96, BF16 beta logits ``[1, T, H]``, FP32
+``A_log [H]`` and ``dt_bias [H, 128]`` (or flattened). All tensors must share
+a device. Q/K L2 normalization, the gate
+``-5 * sigmoid(exp(A_log) * (g + dt_bias))``, and beta sigmoid are fused.
+The normalization denominator is ``sqrt(sum(x*x) + 1e-6)``.
+
+Use either one fixed sequence or strictly increasing int32/int64 packed
+``cu_seqlens [N+1]`` starting at zero and ending at ``T``. Each sequence must
+have 1 through 16384 tokens. State is FP32 V-first ``[N, H, 128, 128]``;
+when provided, it is updated in place even if ``output_final_state=False``.
+Omitted initial state means zero initialization. Output is BF16. The retained
+MMA kernels require finite initial state with absolute values <= 4096;
+callers must preserve this value constraint when changing graph inputs.
+Unsupported hardware, shapes, gate modes, strided inputs, indexed state
+pools, speculative decode and checkpoints are rejected explicitly.
+
+Planning reads packed offsets and validates the state range on the host.
+For CUDA Graph capture, warm an explicit ``RecurrentKDAPrefillWorkspace``
+with the exact tensors, preallocate ``output``, and capture on the same
+stream. Retain the workspace for the graph lifetime. Packed offsets must
+remain unchanged during capture/replay; activations and state values may
+change within the documented contract. A captured workspace cannot be
+replanned or used for another capture. Separate workspaces isolate streams.
+
+.. code-block:: python
+
+    workspace = flashinfer.RecurrentKDAPrefillWorkspace(device=q.device)
+    out = torch.empty_like(v)
+    # Warm this call before capturing it on the same CUDA stream.
+    out, state = flashinfer.recurrent_kda(
+        q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias,
+        initial_state=state, output_final_state=True,
+        use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+        beta_is_logit=True, lower_bound=-5.0, cu_seqlens=cu_seqlens,
+        output=out, prefill_workspace=workspace, backend="ptx",
+    )
+
+The reproducible INT21 benchmark compares the complete captured public call
+with raw MoonshotAI/FlashKDA, including final-state writeback. Both use evolving
+FP32 state, reset before each trial. Timing is cold-L2 CUPTI GPU activity;
+planning, allocation, compilation and capture are excluded. The JSON report
+includes per-shape latencies, correctness, trial medians and baseline identity.
+
+.. code-block:: bash
+
+    python benchmarks/bench_recurrent_kda_ptx.py \
+        --flash-kda-source-dir /path/to/FlashKDA --output ptx-results.json
+    pytest tests/kda/test_recurrent_kda_ptx.py
+
 .. _apikda_decode:
 
 flashinfer.kda_decode

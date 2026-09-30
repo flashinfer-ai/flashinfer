@@ -79,6 +79,9 @@ constexpr int64_t kFlagFuseTail = 1;
 constexpr int64_t kFlagEarlyTrigger = 2;
 constexpr int64_t kFlagStreamPrepass = 4;
 constexpr int64_t kFlagFuseBlockTail = 8;
+constexpr int64_t kFlagCoarseSample =
+    16;  // host-side build selection; never forwarded to the kernel
+constexpr int64_t kFlagRowSpanDiet = 32;  // streaming variants: row-span filter-arm density switch
 constexpr int32_t kTopKScalar = 1;
 constexpr int32_t kTopKPerRow = 2;
 constexpr int32_t kTopPScalar = 1;
@@ -121,6 +124,7 @@ struct Stage1Variant {
   int32_t smem_bytes;
   int32_t fused_tail;        // 1: built with the fused stage-2/3 tail (accepts launch_flags bit 0)
   int32_t fused_block_tail;  // 1: built with the whole-CTA tail (accepts launch_flags bit 3)
+  int32_t coarse_sample;  // 1: the coarse-sample build (1/8 sampled first pass; launch_flags bit 4)
 };
 
 struct Stage23Variant {
@@ -132,21 +136,31 @@ struct Stage23Variant {
 };
 
 #define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem, fused, \
-                                   fused_block)                                        \
-  {reinterpret_cast<const void*>(&symbol), cluster, ept, stream, threads, smem, fused, fused_block},
+                                   fused_block, wide)                                  \
+  {reinterpret_cast<const void*>(&symbol),                                             \
+   cluster,                                                                            \
+   ept,                                                                                \
+   stream,                                                                             \
+   threads,                                                                            \
+   smem,                                                                               \
+   fused,                                                                              \
+   fused_block,                                                                        \
+   wide},
 #define CAKE_SAMPLING_STAGE23_ENTRY(symbol, threads, items, variant_flags, smem) \
   {reinterpret_cast<const void*>(&symbol), threads, items, variant_flags, smem},
 
-// Each variant ships a default build (fused_block_tail = 0: two-warp tail only) and, when it
-// carries the two-warp tail, a whole-CTA-tail twin (fused_block_tail = 1) taken only by
-// launch_flags bit 3 -- the extra code slowed every k <= 64 launch of a single build on sm_103a /
-// sm_107a.
+// Each variant ships a default build (fused_block_tail = 0, coarse_sample = 0: two-warp tail only,
+// 1/4 sampled first pass) and, when it carries the two-warp tail, a whole-CTA-tail twin
+// (fused_block_tail = 1) taken only by launch_flags bit 3 -- the extra code slowed every k <= 64
+// launch of a single build on sm_103a / sm_107a.  Streaming variants also ship a coarse-sample twin
+// (coarse_sample = 1: the first pass reads 1/8 of the row) taken only by launch_flags bit 4 -- a
+// runtime rate switch cost the k > 64 launches 1-2 %.
 inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept, int32_t stream,
-                                       int32_t block_tail) {
+                                       int32_t block_tail, int32_t wide) {
   static const Stage1Variant kTable[] = {CAKE_SAMPLING_STAGE1_TABLE(CAKE_SAMPLING_STAGE1_ENTRY)};
   for (const Stage1Variant& v : kTable) {
     if (v.cluster == cluster && v.ept == ept && v.stream == stream &&
-        v.fused_block_tail == block_tail)
+        v.fused_block_tail == block_tail && v.coarse_sample == wide)
       return &v;
   }
   return nullptr;
@@ -241,7 +255,19 @@ inline void CheckSlab(const TensorView& vals, const TensorView& idx, const Tenso
 //   (rows with k <= CAKE_SAMPLING_FUSED_TAIL_KCAP on the two-warp tail, larger rows on rank 0's
 //   whole CTA), with the same outputs as SparseTopPSample; exclusive with bit 0, and the host sets
 //   it only when the largest top-k fits and the stage-1 grid is a single wave (see
-//   cake_sampling.py). Other bits are ignored.
+//   cake_sampling.py).
+//   launch_flags bit 4 (coarse sample): selects a streaming variant's coarse-sample build (manifest
+//   coarse_sample), whose sampled first pass reads 1/8 of the row instead of 1/4; the exact passes
+//   are the same and every output is bit-identical.  The host sets it for launches whose largest
+//   top-k fits the two-warp tail (rows at the gather capacity lose with the coarser estimate); the
+//   kernel itself never sees the bit.
+//   launch_flags bit 5 (row-span filter arm): a streaming variant's filter pass picks its
+//   float-threshold arm from the expected candidate density of the whole row (cluster-wide sampled
+//   mass vs the cluster's span) instead of one CTA's span; both arms build identical candidate
+//   segments, so every output is bit-identical.  The host sets it for cluster >= 8 streams whose
+//   largest top-k exceeds the two-warp tail on compute capability 9.0 / 10.0 / 10.3 (round 6, lever
+//   FD5: those k ~ 1000 cells run 2-5 % faster; cluster-1 rows can lose with the arm, Rubin is
+//   neutral).  Rejected on register-resident variants.  Other bits are ignored.
 void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64_t topk_kind,
                TensorView out_vals, TensorView out_idx, TensorView out_count, int64_t cluster,
                int64_t ept, int64_t stream_variant, TensorView topp_arr, double topp_scalar,
@@ -276,13 +302,21 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   TVM_FFI_ICHECK(stream_variant == 0 || stream_variant == 1) << "stream_variant must be 0 or 1";
   TVM_FFI_ICHECK(launch_flags >= 0) << "launch_flags must be non-negative";
   const int32_t want_block_tail = (launch_flags & kFlagFuseBlockTail) != 0 ? 1 : 0;
-  const Stage1Variant* v = FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
-                                      static_cast<int32_t>(stream_variant), want_block_tail);
-  TVM_FFI_ICHECK(v != nullptr) << "no frozen stage-1 variant for cluster=" << cluster
-                               << " ept=" << ept << " stream=" << stream_variant
-                               << (want_block_tail
-                                       ? " with the whole-CTA tail build (launch_flags bit 3)"
-                                       : "");
+  const int32_t want_coarse = (launch_flags & kFlagCoarseSample) != 0 ? 1 : 0;
+  TVM_FFI_ICHECK(!(want_coarse && stream_variant == 0))
+      << "the coarse-sample build (launch_flags bit 4) exists for streaming variants only";
+  TVM_FFI_ICHECK(!(want_coarse && want_block_tail))
+      << "launch_flags bits 3 and 4 (whole-CTA tail and coarse sample) are exclusive";
+  TVM_FFI_ICHECK(!((launch_flags & kFlagRowSpanDiet) != 0 && stream_variant == 0))
+      << "the row-span filter arm (launch_flags bit 5) exists for streaming variants only";
+  const Stage1Variant* v =
+      FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
+                 static_cast<int32_t>(stream_variant), want_block_tail, want_coarse);
+  TVM_FFI_ICHECK(v != nullptr)
+      << "no frozen stage-1 variant for cluster=" << cluster << " ept=" << ept
+      << " stream=" << stream_variant
+      << (want_block_tail ? " with the whole-CTA tail build (launch_flags bit 3)" : "")
+      << (want_coarse ? " with the coarse-sample build (launch_flags bit 4)" : "");
   PrepareKernel(device_id, v->kernel, v->smem_bytes, v->cluster);
   TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept
@@ -356,8 +390,9 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   unsigned int offset_lo = static_cast<unsigned int>(offset_u & 0xFFFFFFFFu);
   unsigned int offset_hi = static_cast<unsigned int>(offset_u >> 32);
   int renorm_i = emit_renorm != 0 ? 1 : 0;
-  int flags_i = static_cast<int>(
-      launch_flags & (kFlagFuseTail | kFlagEarlyTrigger | kFlagStreamPrepass | kFlagFuseBlockTail));
+  int flags_i =
+      static_cast<int>(launch_flags & (kFlagFuseTail | kFlagEarlyTrigger | kFlagStreamPrepass |
+                                       kFlagFuseBlockTail | kFlagRowSpanDiet));
   // Argument order = the frozen kernel signature (see the generated source).
   void* args[] = {&probs_ptr, &topk_ptr,  &vals_ptr,    &idx_ptr,    &count_ptr, &vocab_i, &topk_i,
                   &kind_i,    &topp_ptr,  &samples_ptr, &renorm_ptr, &topp_f,    &pkind_i, &seed_lo,

@@ -201,15 +201,34 @@ def load_manifest() -> dict[str, Any]:
         raise RuntimeError(
             "radix sampling manifest: a whole-CTA tail without the two-warp tail"
         )
+    if any(not isinstance(v.get("coarse_sample"), bool) for v in manifest["stage1"]):
+        raise RuntimeError("radix sampling manifest stage-1 entries lack coarse_sample")
+    if any(v["coarse_sample"] and not v["stream"] for v in manifest["stage1"]):
+        raise RuntimeError(
+            "radix sampling manifest: a coarse-sample build of a register-resident variant"
+        )
+    if any(v["coarse_sample"] and v["fused_block_tail"] for v in manifest["stage1"]):
+        raise RuntimeError(
+            "radix sampling manifest: a build with both the coarse sample and the whole-CTA tail"
+        )
     builds = [
-        (v["cluster"], v["ept"], bool(v["stream"]), bool(v["fused_block_tail"]))
+        (
+            v["cluster"],
+            v["ept"],
+            bool(v["stream"]),
+            bool(v["fused_block_tail"]),
+            bool(v["coarse_sample"]),
+        )
         for v in manifest["stage1"]
     ]
     if len(set(builds)) != len(builds):
         raise RuntimeError("radix sampling manifest stage-1 builds are not unique")
-    if any(bt and (c, e, s, False) not in set(builds) for c, e, s, bt in builds):
+    if any(
+        (bt or ws) and (c, e, s, False, False) not in set(builds)
+        for c, e, s, bt, ws in builds
+    ):
         raise RuntimeError(
-            "radix sampling manifest: a whole-CTA tail build without its default build"
+            "radix sampling manifest: a twin build without its default build"
         )
     for v in manifest["stage23"]:
         feats = v.get("features")
@@ -295,7 +314,7 @@ def _binding_source(manifest: dict[str, Any]) -> str:
     stage1 = " ".join(
         f"X({v['symbol']}, {v['cluster']}, {v['ept']}, {1 if v['stream'] else 0}, "
         f"{v['block_threads']}, {v['dynamic_smem_bytes']}, {1 if v['fused_tail'] else 0}, "
-        f"{1 if v['fused_block_tail'] else 0})"
+        f"{1 if v['fused_block_tail'] else 0}, {1 if v['coarse_sample'] else 0})"
         for v in manifest["stage1"]
     )
     stage23 = " ".join(

@@ -92,6 +92,14 @@ ARCHES = tuple(sorted(set(SUPPORTED_COMPUTE_CAPABILITIES.values())))
 # :func:`required_kernel_keys` enumerates the registered kernels for these
 # counts.
 ARCH_SM_COUNT = {"sm_100a": 148, "sm_103a": 152}
+# Co-resident clusters per cluster size on each part (``cuOccupancyMaxActiveClusters`` of the split-K
+# kernel at one CTA per SM), keyed by SM count.  A split-K launch is ``weight tiles x token tiles``
+# clusters and must fit in one wave; the capacity is the GPC placement limit, not ``sm_count // size``.
+CLUSTER_CAPACITY_BY_SM_COUNT = {
+    148: {2: 74, 3: 45, 4: 33, 5: 26, 6: 22, 8: 15},
+    152: {2: 76, 3: 46, 4: 36, 5: 28, 6: 23, 8: 15},
+}
+SPLITK3_CLUSTER = 3
 
 # Validated problem matrix (kernel keys enumerated by :func:`required_kernel_keys`).
 # GEMM families are ``(K, N)`` of the per-token quantize + GEMM chains the backend was
@@ -327,6 +335,38 @@ TWO_CTA_PER_SM_MIN_SMS = 152
 # weight tile it sweeps) fit the 126 MiB L2 and the group sweeps at least 24 weight tiles.
 RASTER16_MIN_W_TILES = 24
 RASTER16_L2_BYTES = 126 << 20
+# Measured cost of one wave of 2-CTA 256 x tile_n tiles relative to a wave of 256 x 256
+# tiles (paired sweeps on B200 and GB300); the tile width is re-picked on multi-wave
+# rows when ceil(units / pairs) x cost improves by at least TWO_CTA_TILE_MIN_GAIN.
+_TWO_CTA_TILE_WAVE_COST = {128: 0.575, 192: 0.787, 256: 1.0}
+TWO_CTA_TILE_MIN_GAIN = 0.015
+# Cluster split-K 2 for the unsplit swapped-orientation rows whose 128-row weight-tile
+# grid fills at most half the SMs at K >= SPLITK2_MIN_K.
+SPLITK2_MIN_K = 16384
+
+
+def _two_cta_wave_time(m: int, n: int, sm_count: int, tile_n: int) -> float:
+    """Waves of the persistent 2-CTA grid x the measured relative cost of one wave."""
+    pairs = max(1, sm_count // 2)
+    units = ((m + 255) // 256) * ((n + tile_n - 1) // tile_n)
+    return -(-units // pairs) * _TWO_CTA_TILE_WAVE_COST[tile_n]
+
+
+def _two_cta_tile_n(m: int, n: int, sm_count: int, tile_n: int) -> int:
+    """Re-pick the 2-CTA tile width from the measured wave model on multi-wave rows
+    (port of ``_two_cta_tile_n``)."""
+    if tile_n not in _TWO_CTA_TILE_WAVE_COST:
+        return tile_n
+    pairs = max(1, sm_count // 2)
+    if ((m + 255) // 256) * ((n + tile_n - 1) // tile_n) <= pairs:
+        return tile_n
+    base = _two_cta_wave_time(m, n, sm_count, tile_n)
+    best_n, best_t = tile_n, base
+    for cand in (256, 192, 128):
+        t = _two_cta_wave_time(m, n, sm_count, cand)
+        if t < best_t:
+            best_n, best_t = cand, t
+    return best_n if best_t <= base * (1.0 - TWO_CTA_TILE_MIN_GAIN) else tile_n
 
 
 def _score_m_tactic(
@@ -360,11 +400,14 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
     ``M <= 32`` (``N % 8 == 0``) takes the swapped orientation with 8 / 16 / 32
     tokens per tile and cluster split-K while the tile grid leaves most SMs idle;
     otherwise the tile the scorer picks for the ``M`` bucket (next power of two):
-    1-CTA 128 x {64, 128, 192, 256} or 2-CTA 256 x {64, 128, 192, 256}.  2-CTA tiles
-    use the grouped raster (``raster_group`` 8, or 16 when a 16-tile group's fp4
+    1-CTA 128 x {64, 128, 192, 256} or 2-CTA 256 x {64, 128, 192, 256}, the 2-CTA width
+    re-picked on multi-wave rows by the measured wave model (``_two_cta_tile_n``).  2-CTA
+    tiles use the grouped raster (``raster_group`` 8, or 16 when a 16-tile group's fp4
     operands fit L2 and the group sweeps at least 24 weight tiles) when the weight
-    dimension has at most 32 tiles and the cluster-launch-control scheduler when the persistent pairs
-    average at least :data:`CLC_MIN_TILES_PER_PAIR` tiles.  Single-token-tile
+    dimension has at most 32 tiles and the grid needs more than one wave, and the
+    cluster-launch-control scheduler when the persistent pairs average at least
+    :data:`CLC_MIN_TILES_PER_PAIR` tiles.  Unsplit deep-K swapped-orientation rows whose
+    weight tiles fill at most half the SMs take cluster split-K 2.  Single-token-tile
     rows (``M <= 128``) override the scorer three times: a 2-CTA 256x64 pair over at
     most :data:`TWO_CTA_SINGLE_TILE_MAX_W_TILES` narrow weight tiles (the pair loads
     the 128 real token rows once), the 128-wide two-wave tile on the 148-SM part when
@@ -381,7 +424,25 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
             split_k = 4
         elif n_tiles <= 20:
             tile_n, split_k = 8, 2
-        if split_k > 1 and k % (K_TILE * split_k) == 0:
+            # Three K slices when every cluster of the launch is co-resident (7168x1536 M = 17:
+            # 36 clusters, +6 % on both parts); 48 or more clusters of 3 need a second cluster
+            # wave (-27..-30 %) and keep two slices.
+            capacity = CLUSTER_CAPACITY_BY_SM_COUNT.get(sm_count, {}).get(
+                SPLITK3_CLUSTER
+            )
+            token_tiles = (m + tile_n - 1) // tile_n
+            if (
+                capacity is not None
+                and n_tiles * token_tiles <= capacity
+                and k // K_TILE >= SPLITK3_CLUSTER
+            ):
+                split_k = SPLITK3_CLUSTER
+        # Even K slices for split-K 2 / 4; the three-way split uses the kernel's owner-remainder partition.
+        if (
+            split_k > 1
+            and k % K_TILE == 0
+            and (split_k == SPLITK3_CLUSTER or k % (K_TILE * split_k) == 0)
+        ):
             return {
                 "tile_n": tile_n,
                 "deep_k": False,
@@ -409,6 +470,16 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         elif deep_k:
             # Single-wave deep-K rows run three mainloop stages.
             tactic["num_stages"] = 3
+        elif (
+            k >= SPLITK2_MIN_K
+            and k % 512 == 0
+            and 2 * n_tiles <= sm_count
+            and (k == SPLITK2_MIN_K or tile_n == 32)
+        ):
+            # Unsplit deep-K rows that leave more than half the SMs idle: two K halves per
+            # weight tile double the streaming CTAs (the 8 / 16-token tiles of the deeper
+            # rows lose with the split and stay unsplit).
+            tactic["split_k"] = 2
         return tactic
     bucket = m if m <= 0 else min(1 << (m - 1).bit_length(), _M_BUCKETS[-1])
     best = None
@@ -418,6 +489,8 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
             best = (score, tile_m, tile_n)
     assert best is not None
     _, tile_m, tile_n = best
+    if tile_m == 256:
+        tile_n = _two_cta_tile_n(m, n, sm_count, tile_n)
     tactic = {
         "tile_n": tile_n,
         "deep_k": False,
@@ -445,18 +518,16 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         # 128-wide persistent tile (two waves) beats the scorer's single-wave wide tile.
         if sm_count < TWO_CTA_PER_SM_MIN_SMS:
             tactic["tile_n"] = tile_n = 128
-    elif (
-        m <= BLOCK_M
-        and tile_m == BLOCK_M
-        and tile_n == 128
-        and sm_count >= TWO_CTA_PER_SM_MIN_SMS
-    ):
-        # One token tile, one wave of 128-wide tiles on the 152-SM part: no L2 promotion.
+    elif m <= BLOCK_M and tile_m == BLOCK_M and tile_n == 128:
+        # One token tile, one wave of 128-wide tiles (both parts): no L2 promotion.
         tactic["l2_promo"] = None
     if tile_m == 256:
         tactic["two_cta"] = True
+        pairs = max(1, sm_count // 2)
         w_tiles = (n + tile_n - 1) // tile_n
-        if w_tiles <= 32:
+        # The grouped raster costs 1-2 % on a grid that fits one wave (every tile runs
+        # concurrently), so it applies to multi-wave grids only.
+        if w_tiles <= 32 and ((m + 255) // 256) * w_tiles > pairs:
             tactic["raster_group"] = 8
             group16_bytes = (16 * 256 + w_tiles * tile_n) * (k // 2)
             if (
@@ -465,7 +536,6 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
                 and group16_bytes <= RASTER16_L2_BYTES
             ):
                 tactic["raster_group"] = 16
-        pairs = max(1, sm_count // 2)
         if ((m + 255) // 256) * (
             (n + tile_n - 1) // tile_n
         ) >= CLC_MIN_TILES_PER_PAIR * pairs:

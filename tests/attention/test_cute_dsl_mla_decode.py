@@ -1138,6 +1138,114 @@ def test_mla_reducer_d_tile_selection():
     assert _get_reducer_d_tiles(148, 8, 96, 148, 32) == 1
 
 
+@pytest.mark.parametrize(
+    "arch, expected_stages",
+    [("sm_100a", (3, 2)), ("sm_100f", (3, 2)), ("sm_107", (4, 4)), ("sm_107a", (4, 4))],
+)
+def test_mla_fp8_load_stages_use_launch_arch(arch, expected_stages):
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode_fp8 import (
+        BlackwellMultiHeadLatentAttentionForwardFP8,
+    )
+
+    kernel = BlackwellMultiHeadLatentAttentionForwardFP8.__new__(
+        BlackwellMultiHeadLatentAttentionForwardFP8
+    )
+    kernel.arch = arch
+    kernel.mma_qk_tiler = (128, 128)
+    kernel.warps_in_n = 2
+    kernel.latent_dim = 512
+    kernel._setup_attributes()
+    assert (kernel.load_k_stage, kernel.load_v_stage) == expected_stages
+
+
+@pytest.mark.parametrize(
+    "arch, multi_query_stages",
+    [
+        ("sm_100a", 7),
+        ("sm_100f", 7),
+        ("sm_103a", 7),
+        ("sm_103f", 7),
+        ("sm_107", 8),
+        ("sm_107a", 8),
+    ],
+)
+@pytest.mark.parametrize("seq_len_q", [1, 2, 8])
+def test_mla_fp16_load_stages_use_launch_arch(arch, multi_query_stages, seq_len_q):
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+
+    from flashinfer.cute_dsl.attention.monolithic.mla_decode_fp16 import (
+        BlackwellMultiHeadLatentAttentionForwardFP16,
+    )
+
+    kernel = BlackwellMultiHeadLatentAttentionForwardFP16.__new__(
+        BlackwellMultiHeadLatentAttentionForwardFP16
+    )
+    kernel.arch = arch
+    kernel.seq_len_q = seq_len_q
+    kernel.mma_qk_tiler = (128, 128)
+    kernel.warps_in_n = 2
+    kernel.latent_dim = 512
+    kernel._setup_attributes()
+    assert kernel.load_kv_stage == (15 if seq_len_q == 1 else multi_query_stages)
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16, torch.float16])
+def test_mla_compile_cache_separates_launch_arch(monkeypatch, dtype):
+    if not is_cute_dsl_available():
+        pytest.skip("CuTe DSL not available")
+
+    from unittest.mock import MagicMock
+    from flashinfer.cute_dsl.attention.monolithic import mla_decode
+
+    kernel_cls = MagicMock(side_effect=lambda **kwargs: kwargs)
+    fake_cute = MagicMock()
+    fake_cute.compile.side_effect = lambda kernel, *args, **kwargs: kernel
+    monkeypatch.setattr(mla_decode, "cute", fake_cute)
+    monkeypatch.setattr(
+        mla_decode, "BlackwellMultiHeadLatentAttentionForwardFP8", kernel_cls
+    )
+    monkeypatch.setattr(
+        mla_decode, "BlackwellMultiHeadLatentAttentionForwardFP16", kernel_cls
+    )
+    monkeypatch.setattr(mla_decode, "get_max_active_clusters", lambda _: 1)
+    monkeypatch.setattr(mla_decode, "Int32", int)
+    monkeypatch.setattr(mla_decode, "Float32", float)
+    compile_kernel = mla_decode._get_compiled_mla_kernel
+    compile_kernel.cache_clear()
+    kwargs = dict(
+        torch_dtype=dtype,
+        torch_out_dtype=torch.bfloat16,
+        page_size=64,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        num_heads=128,
+        seq_len_q=1,
+        is_persistent=True,
+        is_var_seq=False,
+        is_var_q=False,
+        is_var_split_kv=False,
+    )
+    try:
+        sm107 = compile_kernel(arch="sm_107a", **kwargs)
+        sm100 = compile_kernel(arch="sm_100a", **kwargs)
+        assert (sm107["arch"], sm100["arch"]) == ("sm_107a", "sm_100a")
+        assert compile_kernel(arch="sm_107a", **kwargs) is sm107
+        assert compile_kernel(arch="sm_100a", **kwargs) is sm100
+        assert fake_cute.compile.call_count == 2
+        assert [
+            call.kwargs["options"] for call in fake_cute.compile.call_args_list
+        ] == [
+            f"--enable-tvm-ffi --opt-level 2 --gpu-arch {arch}"
+            for arch in ("sm_107a", "sm_100a")
+        ]
+    finally:
+        compile_kernel.cache_clear()
+
+
 def test_mla_reducer_direct_class_capacity_defaults():
     """Direct class users keep the generic capacity unless opting into a cap."""
     if not is_cute_dsl_available():
