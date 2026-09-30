@@ -1882,7 +1882,8 @@ def test_binding_cache_backward_hits_are_bitwise_and_fresh():
         f1 = cake_backend.backward(*args, dkv_fp32=True)
         f2 = cake_backend.backward(*args, dkv_fp32=True)
         torch.cuda.synchronize()
-        assert cache.misses == misses0 + 2 and cache.hits == hits0 + 2
+        # one more binding (dkv_fp32) and one more hit on it, after the three repeated hits above
+        assert cache.misses == misses0 + 2 and cache.hits == hits0 + 5
         assert f1[2].dtype == torch.float32 and f1[2].data_ptr() != f2[2].data_ptr()
         snapshot = f2[2].clone()
         f1[2].fill_(7.0)
