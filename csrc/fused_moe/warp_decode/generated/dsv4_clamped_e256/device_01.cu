@@ -604,7 +604,6 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
             const int warp_0 = warp;
             const int lane_1 = lane;
             unsigned int acc_stage = 0;
-            float quant_pair[8] = {0};
             unsigned int cluster_work = blockIdx.y * (64 / 2) + blockIdx.x / 2;
             unsigned int work_stage = 0;
             unsigned int _phase_mma_full = 0;
@@ -673,47 +672,11 @@ kernel_dsv4_flash_moe_fc1_joint_sfb_cursor_v20_sm100(const __grid_constant__ CUt
                                 inv_scale = 1.0f / scale;
                             }
                             if (lane_1 < 16) {
-                                quant_pair[0] = value * inv_scale;
-                                quant_pair[1] = other * inv_scale;
-                                uint32_t _slice_lo_mask_0;
-                                {
-                                    int _lim_1 = 2;
-                                    if (_lim_1 <= 0) { _slice_lo_mask_0 = 0u; }
-                                    else if (_lim_1 >= 8) { _slice_lo_mask_0 = ((1u << 8) - 1u); }
-                                    else {
-                                        asm volatile("{"
-                                            ".reg .u32 t;\n\t"
-                                            "shl.b32 t, 1, %1;\n\t"
-                                            "add.u32 %0, t, -1;\n\t"
-                                            "}" : "=r"(_slice_lo_mask_0) : "r"(_lim_1));
-                                    }
-                                }
-                                uint32_t _slice_hi_mask_0;
-                                {
-                                    int _lim_2 = 8;
-                                    if (_lim_2 <= 0) { _slice_hi_mask_0 = 0u; }
-                                    else if (_lim_2 >= 8) { _slice_hi_mask_0 = ((1u << 8) - 1u); }
-                                    else {
-                                        asm volatile("{"
-                                            ".reg .u32 t;\n\t"
-                                            "shl.b32 t, 1, %1;\n\t"
-                                            "add.u32 %0, t, -1;\n\t"
-                                            "}" : "=r"(_slice_hi_mask_0) : "r"(_lim_2));
-                                    }
-                                }
-                                if (!(_slice_lo_mask_0 | ~_slice_hi_mask_0 & (1u << 0))) quant_pair[0] = 0.0f;
-                                if (!(_slice_lo_mask_0 | ~_slice_hi_mask_0 & (1u << 1))) quant_pair[1] = 0.0f;
-                                if (!(_slice_lo_mask_0 | ~_slice_hi_mask_0 & (1u << 2))) quant_pair[2] = 0.0f;
-                                if (!(_slice_lo_mask_0 | ~_slice_hi_mask_0 & (1u << 3))) quant_pair[3] = 0.0f;
-                                if (!(_slice_lo_mask_0 | ~_slice_hi_mask_0 & (1u << 4))) quant_pair[4] = 0.0f;
-                                if (!(_slice_lo_mask_0 | ~_slice_hi_mask_0 & (1u << 5))) quant_pair[5] = 0.0f;
-                                if (!(_slice_lo_mask_0 | ~_slice_hi_mask_0 & (1u << 6))) quant_pair[6] = 0.0f;
-                                if (!(_slice_lo_mask_0 | ~_slice_hi_mask_0 & (1u << 7))) quant_pair[7] = 0.0f;
-                                uint32_t _fp4_0[1];
-                                asm volatile(" { .reg .b8 __b0, __b1, __b2, __b3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b0, %2, %1; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b1, %4, %3; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b2, %6, %5; \n"             " cvt.rn.satfinite.e2m1x2.f32 __b3, %8, %7; \n"             " mov.b32 %0, {__b0, __b1, __b2, __b3}; \n"             " } \n"             : "=r"(_fp4_0[0]) : "f"(quant_pair[0]), "f"(quant_pair[1]), "f"(quant_pair[2]), "f"(quant_pair[3]), "f"(quant_pair[4]), "f"(quant_pair[5]), "f"(quant_pair[6]), "f"(quant_pair[7]));
+                                uint32_t _fp4_pair_0;
+                                asm volatile("{\n"             ".reg .b8 byte0;\n"             "cvt.rn.satfinite.e2m1x2.f32 byte0, %2, %1;\n"             "mov.b32 %0, {byte0, 0, 0, 0};\n"             "}\n"             : "=r"(_fp4_pair_0) : "f"(value * inv_scale), "f"(other * inv_scale));
                                 if (token < valid_rows) {
                                     int output_byte = (n_tile * 8 + (unsigned int)token) * (unsigned int)(M_out / 2) + m_tile * 16 + (unsigned int)(warp_0 * 8) + (unsigned int)(lane_1 & 7);
-                                    C_raw[output_byte] = _fp4_0[0];
+                                    C_raw[output_byte] = _fp4_pair_0;
                                 }
                             }
                             if ((lane_1 & 23) == 0) {
