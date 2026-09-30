@@ -94,6 +94,7 @@ launching anything.
 from __future__ import annotations
 
 import ast
+import functools
 import math
 import os
 from collections import OrderedDict
@@ -143,6 +144,11 @@ GEOMETRY_DEFAULTS = dict(
     labels_dtype="int64",  # element type the row kernels read (``int32`` = one host cast per call)
     hidden=None,  # the GEMM instances are specialized to one H (None = any multiple of hidden_multiple)
     vocab=None,  # ... and one V (None = any multiple of vocab_multiple)
+    # CTAs per thread-block cluster of each GEMM (the cluster takes adjacent row tiles, so ``m_tiles`` rounds up to it;
+    # 2 = the CTA pair, 4 = two pairs sharing the B operand by multicast).  Checked against the module's launch cluster.
+    logits_cluster_ctas=2,
+    dx_cluster_ctas=2,
+    dw_cluster_ctas=2,
 )
 LABEL_DTYPES = {"int64": torch.int64, "int32": torch.int32}
 _GEOMETRY_OPTIONAL = ("hidden", "vocab")
@@ -224,6 +230,9 @@ class Geometry:
     labels_dtype: torch.dtype
     hidden: Optional[int] = None
     vocab: Optional[int] = None
+    logits_cluster_ctas: int = 2
+    dx_cluster_ctas: int = 2
+    dw_cluster_ctas: int = 2
 
     @classmethod
     def from_record(cls, record: Optional[dict[str, Any]]) -> "Geometry":
@@ -248,10 +257,22 @@ class Geometry:
             vocab=None if raw["vocab"] is None else int(raw["vocab"]),
         )
 
-    def row_tiles(self, rows: int) -> int:
-        """``ceil(rows / row_tile)`` rounded up to a multiple of ``cta_group`` (the pair takes adjacent row tiles)."""
+    def row_tiles(self, rows: int, cluster_ctas: Optional[int] = None) -> int:
+        """``ceil(rows / row_tile)`` rounded up to a multiple of the cluster's CTA count (default ``cta_group``: the
+        pair takes adjacent row tiles; a wider cluster takes as many)."""
+        ctas = self.cta_group if cluster_ctas is None else int(cluster_ctas)
         tiles = -(-int(rows) // self.row_tile)
-        return -(-tiles // self.cta_group) * self.cta_group
+        return -(-tiles // ctas) * ctas
+
+    def cluster_ctas_of(self, stage: str) -> Optional[int]:
+        """CTAs per cluster of a GEMM stage (``None`` for the row kernels and the casts)."""
+        if stage in ("gemm_logits", "gemm_logits_nostats"):
+            return self.logits_cluster_ctas
+        if stage == "gemm_dx" or stage in DX_SLICE_STAGES:
+            return self.dx_cluster_ctas
+        if stage == "gemm_dw_acc":
+            return self.dw_cluster_ctas
+        return None
 
     def k_iters(self, rows_c: int) -> int:
         return -(-int(rows_c) // self.k_block)
@@ -307,22 +328,95 @@ def dx_max_slices(stages) -> int:
     return count
 
 
-def wave_efficiency(rows_c: int, hidden: int, num_sms: int, k_slices: int, geometry: "Geometry") -> float:
-    """Fraction of the last persistent wave of the dX GEMM that carries work: ``items / (ceil(items / clusters) * clusters)``."""
-    clusters = max(1, int(num_sms) // geometry.cta_group)
-    items = (geometry.row_tiles(rows_c) // geometry.cta_group) * (int(hidden) // geometry.hidden_multiple) * int(k_slices)
+def wave_efficiency(rows_c: int, hidden: int, num_sms: int, k_slices: int, geometry: "Geometry", resident: Optional[int] = None) -> float:
+    """Fraction of the last persistent wave of the dX GEMM that carries work: ``items / (ceil(items / clusters) * clusters)``
+    with ``clusters`` = the co-resident ``dx_cluster_ctas``-wide clusters (``resident``; ``None`` = one per SM group of
+    that width, the rule of the two-CTA cluster)."""
+    ctas = geometry.dx_cluster_ctas
+    clusters = max(1, int(num_sms) // ctas) if resident is None else max(1, int(resident))
+    items = (geometry.row_tiles(rows_c, ctas) // ctas) * (int(hidden) // geometry.hidden_multiple) * int(k_slices)
     return items / (-(-items // clusters) * clusters)
 
 
-def recommended_k_slices(rows_c: int, hidden: int, num_sms: int, max_slices: int, geometry: "Geometry") -> int:
+def recommended_k_slices(rows_c: int, hidden: int, num_sms: int, max_slices: int, geometry: "Geometry", resident: Optional[int] = None) -> int:
     """Slice count of the dX GEMM for a chunk of ``rows_c`` rows: the ``S`` in ``[1, max_slices]`` with the best
-    wave efficiency net of ``K_SLICE_PENALTY`` per extra slab.  Deterministic in the shapes and the SM count."""
-    best, best_score = 1, wave_efficiency(rows_c, hidden, num_sms, 1, geometry)
+    wave efficiency net of ``K_SLICE_PENALTY`` per extra slab.  Deterministic in the shapes, the SM count and the
+    device's co-resident cluster count (:func:`cluster_resident`)."""
+    best, best_score = 1, wave_efficiency(rows_c, hidden, num_sms, 1, geometry, resident)
     for s in range(2, max(1, int(max_slices)) + 1):
-        score = wave_efficiency(rows_c, hidden, num_sms, s, geometry) - K_SLICE_PENALTY * (s - 1)
+        score = wave_efficiency(rows_c, hidden, num_sms, s, geometry, resident) - K_SLICE_PENALTY * (s - 1)
         if score > best_score + 1e-9:
             best, best_score = s, score
     return best
+
+
+# --------------------------------------------------------------------------- co-resident clusters
+
+_PROBE_KERNEL = "cake_lm_head_loss_cluster_probe"
+_PROBE_SOURCE = f'extern "C" __global__ void {_PROBE_KERNEL}() {{}}\n'
+
+
+@functools.lru_cache(maxsize=None)
+def _probe_cluster_capacity(device_index: int, cluster_ctas: int) -> int:
+    """``cuOccupancyMaxActiveClusters`` of an empty probe kernel launched with the device's maximum opt-in dynamic shared
+    memory (one CTA per SM) in ``cluster_ctas``-wide clusters.  The part's GPC topology after floorsweeping decides the
+    answer, not ``SMs // cluster_ctas`` (a 148-SM B200 holds 33 four-CTA clusters, a 152-SM GB300 36)."""
+    from ...cuda_utils import checkCudaErrors, driver, nvrtc
+
+    with torch.cuda.device(device_index):
+        torch.empty(1, device="cuda")  # primary context
+        major, minor = torch.cuda.get_device_capability(device_index)
+        prog = checkCudaErrors(nvrtc.nvrtcCreateProgram(_PROBE_SOURCE.encode(), b"probe.cu", 0, [], []))
+        opts = [f"--gpu-architecture=sm_{major}{minor}".encode()]
+        checkCudaErrors(nvrtc.nvrtcCompileProgram(prog, len(opts), opts))
+        size = checkCudaErrors(nvrtc.nvrtcGetCUBINSize(prog))
+        cubin = b" " * size
+        checkCudaErrors(nvrtc.nvrtcGetCUBIN(prog, cubin))
+        checkCudaErrors(nvrtc.nvrtcDestroyProgram(prog))
+        ctx = checkCudaErrors(driver.cuDevicePrimaryCtxRetain(device_index))
+        try:
+            checkCudaErrors(driver.cuCtxSetCurrent(ctx))
+            module = checkCudaErrors(driver.cuModuleLoadData(cubin))
+            try:
+                func = checkCudaErrors(driver.cuModuleGetFunction(module, _PROBE_KERNEL.encode()))
+                smem = checkCudaErrors(
+                    driver.cuDeviceGetAttribute(driver.CUdevice_attribute.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN, device_index)
+                )
+                checkCudaErrors(driver.cuFuncSetAttribute(func, driver.CUfunction_attribute.CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, smem))
+                attr = driver.CUlaunchAttribute()
+                attr.id = driver.CUlaunchAttributeID.CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
+                attr.value.clusterDim.x = int(cluster_ctas)
+                attr.value.clusterDim.y = 1
+                attr.value.clusterDim.z = 1
+                config = driver.CUlaunchConfig()
+                config.gridDimX = int(cluster_ctas)
+                config.gridDimY = 1
+                config.gridDimZ = 1
+                config.blockDimX = 128
+                config.blockDimY = 1
+                config.blockDimZ = 1
+                config.sharedMemBytes = smem
+                config.attrs = [attr]
+                config.numAttrs = 1
+                count = int(checkCudaErrors(driver.cuOccupancyMaxActiveClusters(func, config)))
+            finally:
+                checkCudaErrors(driver.cuModuleUnload(module))
+        finally:
+            checkCudaErrors(driver.cuDevicePrimaryCtxRelease(device_index))
+    return max(1, count)
+
+
+def cluster_resident(device: Optional[torch.device], cluster_ctas: int, num_sms: int) -> int:
+    """Co-resident clusters of ``cluster_ctas`` CTAs at one CTA per SM on ``device``: the SM pairs for the two-CTA
+    cluster (the source launcher's rule), the driver's occupancy answer (:func:`_probe_cluster_capacity`) for wider
+    clusters.  The persistent GEMM grids and the dX slice rule take it as ``resident``."""
+    cluster_ctas = int(cluster_ctas)
+    if cluster_ctas <= 2:
+        return max(1, int(num_sms) // max(1, cluster_ctas))
+    if device is None or device.type != "cuda":
+        raise ValueError(f"the co-resident count of {cluster_ctas}-CTA clusters needs a CUDA device")
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    return _probe_cluster_capacity(int(index), cluster_ctas)
 
 
 def _dx_reduce(values: dict[str, Any]) -> None:
@@ -603,15 +697,16 @@ class Plan:
 
 def make_plan(
     problem: Problem, *, need_dx: bool, need_dw: bool, geometry: Geometry = DEFAULT_GEOMETRY, dx_max_slices: int = 1, num_sms: int = 1,
-    valid_rows: Optional[int] = None,
+    valid_rows: Optional[int] = None, dx_resident: Optional[int] = None,
 ) -> Plan:
-    """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count;
-    ``valid_rows`` (compaction) chunks that many rows instead of ``T``."""
+    """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count
+    (``dx_resident`` = the device's co-resident dX clusters, :func:`cluster_resident`); ``valid_rows`` (compaction)
+    chunks that many rows instead of ``T``."""
     rows = problem.num_rows if valid_rows is None else int(valid_rows)
     chunks = plan_chunks(rows, problem.chunk)
     slices = ()
     if need_dx and int(dx_max_slices) > 1:
-        slices = tuple(recommended_k_slices(rows_c, problem.hidden, num_sms, dx_max_slices, geometry) for _, rows_c in chunks)
+        slices = tuple(recommended_k_slices(rows_c, problem.hidden, num_sms, dx_max_slices, geometry, dx_resident) for _, rows_c in chunks)
     return Plan(problem, chunks, bool(need_dx), bool(need_dw), geometry, slices, None if valid_rows is None else int(valid_rows))
 
 
@@ -814,8 +909,10 @@ def lm_head_loss_workspace_size(
         if hidden is None:
             raise ValueError("lm_head_loss_workspace_size needs hidden= for a program with K-sliced dX stages")
         num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+        resident = cluster_resident(torch.device("cuda", torch.cuda.current_device()) if device is None else torch.device(device),
+                                    geometry.dx_cluster_ctas, num_sms)
         slabs = max(
-            (recommended_k_slices(rows_c, hidden, num_sms, dx_max_slices(stages), geometry) for _, rows_c in plan_chunks(num_rows, chunk)),
+            (recommended_k_slices(rows_c, hidden, num_sms, dx_max_slices(stages), geometry, resident) for _, rows_c in plan_chunks(num_rows, chunk)),
             default=1,
         ) - 1
     return int(
@@ -842,17 +939,23 @@ def _carve(flat: torch.Tensor, layout: dict, name: str, dtype, shape) -> torch.T
 _GRID_FUNCTIONS = {"min": min, "max": max}
 
 
-def grid_dims(rule, scalars: dict[str, Any], num_sms: int) -> tuple[int, int, int]:
+def grid_dims(rule, scalars: dict[str, Any], num_sms: int, resident: Optional[int] = None) -> tuple[int, int, int]:
     """Evaluate a registry grid rule.
 
     Each of the three entries is an integer or an integer expression over the
     scalar names of the stage's host values (``rows_c``, ``m_tiles``, ``V``,
-    ``num_vecs``, ...) and ``sms`` (the SM count) with ``+``, ``-``, ``*``,
-    ``/`` (rounds up), ``//`` (rounds down), parentheses and ``min`` / ``max``:
-    ``"rows_c/8"`` (one CTA per eight rows), ``"max(1, min(m_tiles//2*605,
-    sms//2))*2"`` (a persistent cluster grid capped by the SM pairs).
+    ``num_vecs``, ...), ``sms`` (the SM count) and ``resident`` (the co-resident
+    clusters of the stage's cluster width, :func:`cluster_resident`; only a
+    clustered stage provides it) with ``+``, ``-``, ``*``, ``/`` (rounds up),
+    ``//`` (rounds down), parentheses and ``min`` / ``max``: ``"rows_c/8"`` (one
+    CTA per eight rows), ``"max(1, min(m_tiles//4*24, resident))*4"`` (a
+    persistent four-CTA cluster grid capped by the co-resident clusters),
+    ``"max(1, m_tiles//2*605)*2"`` (the whole work-item domain of a dynamically
+    scheduled kernel).
     """
     names = {"sms": int(num_sms)}
+    if resident is not None:
+        names["resident"] = int(resident)
 
     def evaluate(node) -> int:
         if isinstance(node, ast.Expression):
@@ -1047,8 +1150,10 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
     logits = t["logits"]
     dz_chunk = logits[:rows_c]
     if stage in ("gemm_logits", "gemm_logits_nostats"):
-        values.update(A=x_chunk, B=t["W"], C=logits, STATS_OUT=t["stats"], WS=t["f32_dummy"], M=int(rows_c),
-                      m_tiles=g.row_tiles(rows_c), k_iters=1, first_chunk=0)
+        # ``C`` is the chunk's [rows_c, V] rows of the logits workspace: the TMA-store epilogue's tensor map takes its
+        # row extent from it (rows >= rows_c are clipped, never written); a pointer store sees the same base address
+        values.update(A=x_chunk, B=t["W"], C=logits[:rows_c], STATS_OUT=t["stats"], WS=t["f32_dummy"], M=int(rows_c),
+                      m_tiles=g.row_tiles(rows_c, g.logits_cluster_ctas), k_iters=1, first_chunk=0)
     elif stage == "gemm_dx" or stage in DX_SLICE_STAGES:
         # every token chunk writes its own rows of dX_acc: the first K chunk of the GEMM always stores (first_chunk=1);
         # the K-sliced forms write slices >= 1 into the ``dx_ws`` slabs (added by ``dx_reduce`` afterwards)
@@ -1057,12 +1162,12 @@ def stage_values(stage: str, t: dict[str, Any], plan: Plan, index: int, *, order
             raise ValueError(f"chunk {index} plans {k} dX slice(s); stage {stage!r} was requested")
         ws = t["dx_ws"] if k > 1 else t["f32_dummy"]
         values.update(A=dz_chunk, B=t["W"], C=t["dx_acc"][row0:stop], STATS_OUT=t["stats"], WS=ws, M=int(rows_c),
-                      m_tiles=g.row_tiles(rows_c), k_iters=1, first_chunk=1, ws_slab=int(ws.stride(0)) if k > 1 else 0)
+                      m_tiles=g.row_tiles(rows_c, g.dx_cluster_ctas), k_iters=1, first_chunk=1, ws_slab=int(ws.stride(0)) if k > 1 else 0)
     elif stage == "dx_reduce":  # host-side slab reduction of the K-sliced dX GEMM (no kernel of the program)
         values.update(acc=t["dx_acc"][row0:stop], ws=t["dx_ws"], k_slices=plan.dx_slices_of(index))
     elif stage == "gemm_dw_acc":
         values.update(A=dz_chunk, B=x_chunk, C=t["dw_acc"], STATS_OUT=t["stats"], WS=t["f32_dummy"], M=int(p.vocab),
-                      m_tiles=g.row_tiles(p.vocab), k_iters=g.k_iters(rows_c), first_chunk=first)
+                      m_tiles=g.row_tiles(p.vocab, g.dw_cluster_ctas), k_iters=g.k_iters(rows_c), first_chunk=first)
     elif stage == "row_finalize":
         d = t["d"]
 
@@ -1450,7 +1555,7 @@ def _prepare_labels(labels: torch.Tensor, geometry: Geometry, row_index: Optiona
     return labels
 
 
-def _bind_all(record, module_name, keys, values, device) -> dict[Any, _Launch]:
+def _bind_all(record, module_name, keys, values, device, geometry: Geometry) -> dict[Any, _Launch]:
     num_sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
     launches: dict[Any, _Launch] = {}
     for key in keys:
@@ -1458,9 +1563,16 @@ def _bind_all(record, module_name, keys, values, device) -> dict[Any, _Launch]:
         if stage in HOST_STAGES:  # host-side step (slab reduction, row gather), no kernel
             continue
         physical = record[stage]
-        grid = grid_dims(physical.get("grid", ["rows_c", 1, 1]), values[key], num_sms)
-        cluster = physical.get("launch", {}).get("cluster")
-        if cluster and any(g % c for g, c in zip(grid, cluster, strict=True)):
+        cluster = physical.get("launch", {}).get("cluster") or (1, 1, 1)
+        cluster_ctas = int(math.prod(int(c) for c in cluster))
+        declared = geometry.cluster_ctas_of(stage)
+        if declared is not None and declared != cluster_ctas:
+            raise ValueError(
+                f"stage {stage!r}: the record's geometry declares {declared}-CTA clusters, its module launches {tuple(cluster)}"
+            )
+        resident = cluster_resident(device, cluster_ctas, num_sms) if cluster_ctas > 1 else None
+        grid = grid_dims(physical.get("grid", ["rows_c", 1, 1]), values[key], num_sms, resident=resident)
+        if cluster_ctas > 1 and any(g % c for g, c in zip(grid, cluster, strict=True)):
             raise ValueError(
                 f"stage {stage!r}: grid {grid} is not a multiple of the cluster shape {tuple(cluster)} baked into the module"
             )
@@ -1543,10 +1655,11 @@ def prepare_lm_head_loss(
         row_index = valid_row_index(labels)
     if row_index is not None and row_index.numel() == 0:
         raise ValueError("a prepared runner needs at least one valid row (every label is ignored); the eager entry points return zeros for it")
+    dx_resident = cluster_resident(device, geometry.dx_cluster_ctas, num_sms) if record is not None else None
     plan = make_plan(
         problem, need_dx=need_dx, need_dw=need_dw, geometry=geometry,
         dx_max_slices=dx_max_slices(stages) if record is not None else 1, num_sms=num_sms,
-        valid_rows=None if row_index is None else int(row_index.numel()),
+        valid_rows=None if row_index is None else int(row_index.numel()), dx_resident=dx_resident,
     )
     missing = [s for s in plan.stages if s not in stages]
     if missing:
@@ -1621,7 +1734,7 @@ def prepare_lm_head_loss(
     launches: dict[Any, _Launch] = {}
     engine = None
     if backend == "cake":
-        launches = _bind_all(record, module_name, fwd + bwd, values, device)
+        launches = _bind_all(record, module_name, fwd + bwd, values, device, geometry)
     else:
         engine = ReferenceEngine()
     memory = memory_report(
@@ -1977,7 +2090,7 @@ def scale_cast(acc: torch.Tensor, grad: Optional[torch.Tensor], out_dtype: torch
     values: dict[str, Any] = {name: None for name in COMMON_TENSORS}
     values.update({name: 0 for name in COMMON_SCALARS})
     values.update(acc=acc.reshape(-1), g=g, out=out.reshape(-1), num_vecs=int(acc.numel() // geometry.cast_vec), loss_div=1.0)
-    launches = _bind_all(record, module_name, ((stage, "eager"),), {(stage, "eager"): values}, acc.device)
+    launches = _bind_all(record, module_name, ((stage, "eager"),), {(stage, "eager"): values}, acc.device, geometry)
     launch = launches[(stage, "eager")]
     index = acc.device.index if acc.device.index is not None else torch.cuda.current_device()
     with _ffi_stream_context(int(index)):

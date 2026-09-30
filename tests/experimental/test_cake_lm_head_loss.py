@@ -45,6 +45,7 @@ from flashinfer.experimental.cake_lm_head_loss.cake_backend import (
     BindingCache,
     Geometry,
     bind_stage,
+    cluster_resident,
     forward_binding_key,
     generated_program_available,
     grid_dims,
@@ -53,10 +54,12 @@ from flashinfer.experimental.cake_lm_head_loss.cake_backend import (
     memory_report,
     plan_chunks,
     prepare_lm_head_loss,
+    recommended_k_slices,
     record_abi,
     stage_values,
     stages_for_entry,
     validate_lm_head_inputs,
+    wave_efficiency,
     workspace_layout,
 )
 from tests.test_helpers.cake_lm_head_loss_reference import (
@@ -468,6 +471,61 @@ def test_grid_dims():
         grid_dims(["rows_c", 1], scalars, 148)
 
 
+def test_grid_dims_resident():
+    scalars = {"m_tiles": 32}
+    # a persistent four-CTA cluster grid is capped by the co-resident clusters (the occupancy answer, not sms // 4)
+    assert grid_dims(["max(1, min(m_tiles//4*24, resident))*4", 1, 1], scalars, 148, resident=33) == (132, 1, 1)
+    assert grid_dims(["max(1, min(m_tiles//4*24, resident))*4", 1, 1], {"m_tiles": 4}, 148, resident=33) == (96, 1, 1)
+    assert grid_dims(["max(1, min(m_tiles//2*24, resident))*2", 1, 1], scalars, 148, resident=74) == (148, 1, 1)
+    # a dynamically scheduled kernel launches its whole work-item domain
+    assert grid_dims(["max(1, m_tiles//2*605)*2", 1, 1], scalars, 148) == (19360, 1, 1)
+    with pytest.raises(KeyError, match="unknown"):  # only a clustered stage provides ``resident``
+        grid_dims(["min(m_tiles, resident)", 1, 1], scalars, 148)
+
+
+def test_geometry_cluster_ctas():
+    g = Geometry.from_record({"geometry": {"logits_cluster_ctas": 2, "dx_cluster_ctas": 4, "dw_cluster_ctas": 2}})
+    assert (g.logits_cluster_ctas, g.dx_cluster_ctas, g.dw_cluster_ctas) == (2, 4, 2)
+    assert g.row_tiles(4097) == 34 and g.row_tiles(4097, 4) == 36 and g.row_tiles(1, 4) == 4 and g.row_tiles(4096, 4) == 32
+    assert g.cluster_ctas_of("gemm_logits") == 2 and g.cluster_ctas_of("gemm_logits_nostats") == 2
+    assert g.cluster_ctas_of("gemm_dx") == 4 and g.cluster_ctas_of("gemm_dx_s3") == 4 and g.cluster_ctas_of("gemm_dw_acc") == 2
+    assert g.cluster_ctas_of("row_grad") is None and g.cluster_ctas_of("scale_cast_bf16") is None
+    default = Geometry.from_record(None)
+    assert (default.logits_cluster_ctas, default.dx_cluster_ctas, default.dw_cluster_ctas) == (2, 2, 2)
+    with pytest.raises(ValueError):
+        Geometry.from_record({"geometry": {"dx_cluster_ctas": 0}})
+
+
+def test_cluster_resident_rule():
+    assert cluster_resident(None, 2, 148) == 74 and cluster_resident(None, 2, 152) == 76 and cluster_resident(None, 1, 5) == 5
+    with pytest.raises(ValueError):  # wider clusters take the device's occupancy answer
+        cluster_resident(None, 4, 148)
+    with pytest.raises(ValueError):
+        cluster_resident(torch.device("cpu"), 4, 148)
+
+
+def test_wave_efficiency_uses_the_dx_cluster():
+    g4 = Geometry.from_record({"geometry": {"dx_cluster_ctas": 4}})
+    g2 = Geometry.from_record(None)
+    # 4096 rows: 32 row tiles = 8 four-CTA clusters x 24 column tiles = 192 items over 33 co-resident clusters
+    assert wave_efficiency(4096, 6144, 148, 1, g4, resident=33) == pytest.approx(192 / (6 * 33))
+    assert wave_efficiency(4096, 6144, 148, 1, g2) == pytest.approx((16 * 24) / (6 * 74))
+    assert 1 <= recommended_k_slices(4096, 6144, 148, 4, g4, resident=33) <= 4
+    assert recommended_k_slices(4096, 6144, 148, 4, g2) == recommended_k_slices(4096, 6144, 148, 4, g2, resident=74)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the cluster occupancy probe needs a CUDA device")
+def test_device_cluster_resident_probe():
+    device = torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.get_device_capability(device) not in SUPPORTED_COMPUTE_CAPABILITIES:
+        pytest.skip("thread-block clusters of four CTAs are probed on the supported parts only")
+    sms = int(torch.cuda.get_device_properties(device).multi_processor_count)
+    four = cluster_resident(device, 4, sms)
+    assert 1 <= four <= sms // 4
+    assert cluster_resident(device, 4, sms) == four  # cached per (device, width)
+    assert cluster_resident(device, 2, sms) == sms // 2
+
+
 def test_stage_values_names():
     T, C = 37, 16
     inp = _host_inputs(T)
@@ -483,7 +541,8 @@ def test_stage_values_names():
         assert (v["first_chunk"], v["last_chunk"]) == (0, int(index == len(plan.chunks) - 1))
         assert v["mode"] == MODE_CE and v["loss_div"] == inp.loss_div and v["num_tiles"] == V_HOST // 256
         assert v["A"].data_ptr() == inp.X[row0].data_ptr() and tuple(v["A"].shape) == (rows_c, H_HOST)
-        assert v["B"] is inp.W and v["C"] is t["logits"] and v["STATS_OUT"] is t["stats"]
+        assert v["B"] is inp.W and v["STATS_OUT"] is t["stats"]
+        assert v["C"].data_ptr() == t["logits"].data_ptr() and tuple(v["C"].shape) == (rows_c, V_HOST)  # the chunk's rows
         assert v["M"] == rows_c and v["m_tiles"] % 2 == 0 and v["m_tiles"] >= -(-rows_c // 128) and v["k_iters"] == 1
         dx = stage_values("gemm_dx", t, plan, index)
         assert dx["A"].data_ptr() == t["logits"].data_ptr() and tuple(dx["A"].shape) == (rows_c, V_HOST)

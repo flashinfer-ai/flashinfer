@@ -141,10 +141,18 @@ are gathered once per step):
   with the upstream gradient `g` read from a device scalar.
 
 Grid rules live in the registry record (e.g. `rows_c/8` CTAs for
-`row_finalize`, a persistent CTA-pair grid bounded by the SM count for the
-GEMMs, `V/8/2048 x rows_c` for `row_grad`) and are evaluated by the host from
-the chunk scalars; the GEMM operands are described by TMA descriptors the
-host prepares in a per-runner descriptor workspace.
+`row_finalize`, `V/8/2048 x rows_c` for `row_grad`) and are evaluated by the
+host from the chunk scalars.  A GEMM stage runs in thread-block clusters whose
+CTA count the record's geometry declares per GEMM (`logits_cluster_ctas`,
+`dx_cluster_ctas`, `dw_cluster_ctas`; the host rounds `m_tiles` up to it and
+checks it against the module's launch cluster): a statically scheduled
+instance launches a persistent grid capped by `resident`, the device's
+co-resident clusters of that width (`cluster_resident`: the SM pairs for a
+two-CTA cluster, the driver's occupancy answer for wider ones), while a
+dynamically scheduled instance launches its whole work-item domain.  The
+`dX` K-slice rule uses the same co-resident count.  The GEMM operands are
+described by TMA descriptors the host prepares in a per-runner descriptor
+workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 
 ## Layout of this package
 
