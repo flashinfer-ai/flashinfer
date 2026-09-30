@@ -14,8 +14,6 @@
  * limitations under the License.
  */
 
-#define N_ROWS 32
-
 typedef signed char        int8_t;
 typedef unsigned char      uint8_t;
 typedef unsigned short     uint16_t;
@@ -112,6 +110,9 @@ static_assert(alignof(CakeFmhaTensorMap) >= alignof(CUtensorMap), "CakeFmhaTenso
 #define SMEM_SMEM_V_G1_STRIDE 16384
 #define SMEM_TOTAL 226304
 #define THREADS 384
+#ifndef N_ROWS
+#define N_ROWS 64
+#endif
 #define BLOCK_N 128
 #define HEAD_DIM 256
 #define PAGE_SIZE 64
@@ -1120,7 +1121,12 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define q_raw_full_addr (mbar_base + 0)
@@ -1317,7 +1323,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
             int half = lane / 16;
             int tok_base = half * 64;
             int my_s_base = taddr + (unsigned int)(s_warp * 32 << 16);
-            int rows_live = ((s_warp * 16 < 32) ? 1 : 0);
+            int rows_live = ((s_warp * 16 < N_ROWS) ? 1 : 0);
             int row_j = my_row / 16;
             unsigned int sm_stage = 0;
             unsigned int sm_phase = 0;
@@ -1397,7 +1403,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                                 : "r"((unsigned int)my_s_base + sm_stage * (unsigned int)BLOCK_N));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             int n_vis = vis_col - blk_pos;
-                            if (my_row >= 32) {
+                            if (my_row >= N_ROWS) {
                                 n_vis = 0;
                             }
                             if (n_vis < 32) {
@@ -1859,7 +1865,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
             int o_row_base_g1 = taddr + 384 + (unsigned int)corr_row;
             int my_s_base_c = taddr + (unsigned int)corr_row;
             int tok_base_c = half_c * 64 + 32;
-            int rows_live_c = ((warp_in_wg_c * 16 < 32) ? 1 : 0);
+            int rows_live_c = ((warp_in_wg_c * 16 < N_ROWS) ? 1 : 0);
             int row_j_c = my_row_c / 16;
             float _rcp_13 = approx_rcp(softmax_scale_log2);
             float thr_raw_c = 8.0f * _rcp_13;
@@ -1981,7 +1987,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                                 : "r"((unsigned int)my_s_base_c + sm_stage_c * (unsigned int)BLOCK_N + 32));
                             asm volatile("tcgen05.wait::ld.sync.aligned;");
                             int n_vis_c = vis_col_c - blk_pos_c;
-                            if (my_row_c >= 32) {
+                            if (my_row_c >= N_ROWS) {
                                 n_vis_c = 0;
                             }
                             if (n_vis_c < 32) {
@@ -2365,7 +2371,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                     int d_g0 = half_c * 64;
                     if (publish_split == 0) {
                         float row_sum_c = 1.0f;
-                        if (my_row_c < 32) {
+                        if (my_row_c < N_ROWS) {
                             row_sum_c = smem_sum[st_off + my_row_c];
                         }
                         float _rcp_14 = approx_rcp(row_sum_c);
@@ -2493,7 +2499,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                             : "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[32])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[33])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[34])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[35])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[36])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[37])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[38])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[39])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[40])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[41])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[42])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[43])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[44])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[45])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[46])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[47])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[48])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[49])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[50])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[51])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[52])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[53])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[54])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[55])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[56])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[57])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[58])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[59])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[60])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[61])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[62])), "=r"(*reinterpret_cast<uint32_t*>(&_tmem_load_4[63]))
                             : "r"(o_row_base + 32));
                         asm volatile("tcgen05.wait::ld.sync.aligned;");
-                        if (my_row_c < 32) {
+                        if (my_row_c < N_ROWS) {
                             #pragma unroll
                             for (int off_1 = 0; off_1 < 64; off_1 += 4) {
                                 {
@@ -2521,7 +2527,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                                 "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0], %1;"
                                 :: "r"(o_empty_addr), "r"((uint32_t)(32)) : "memory");
                         }
-                        if (my_row_c < 32) {
+                        if (my_row_c < N_ROWS) {
                             #pragma unroll
                             for (int off1_1 = 0; off1_1 < 64; off1_1 += 4) {
                                 {
@@ -2530,7 +2536,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                                 }
                             }
                         }
-                        if (wg_tid_c < 32) {
+                        if (wg_tid_c < N_ROWS) {
                             *(reinterpret_cast<float*>(partial_stats + (my_slot * 128 + wg_tid_c)) + (0)) = smem_max[st_off + wg_tid_c];
                             *(reinterpret_cast<float*>(partial_stats + (my_slot * 128 + 64 + wg_tid_c)) + (0)) = smem_sum[st_off + wg_tid_c];
                         }
@@ -2554,7 +2560,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced(CakeFmhaTensorMap const* Q, Cak
                                 float w_s_c = 0.0f;
                                 float w_o_c = 0.0f;
                                 float lse_i = -CAKE_INF;
-                                if (my_row_c < 32) {
+                                if (my_row_c < N_ROWS) {
                                     float m_o = partial_stats[other_slot * 128 + my_row_c];
                                     float l_o = partial_stats[other_slot * 128 + 64 + my_row_c];
                                     float m_s = smem_max[st_off + my_row_c];

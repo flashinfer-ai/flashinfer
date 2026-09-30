@@ -651,7 +651,7 @@ _KIND_MANIFEST_BAND = {
 }
 
 
-def test_balanced_families_ship_both_packed_instances_for_both_arches() -> None:
+def test_balanced_families_ship_one_program_with_both_packed_instances() -> None:
     families = get_cake_fmha_manifest()["add_ons"]["cake_fmha_dcp_spec"]["manifest"][
         "families"
     ]
@@ -663,14 +663,18 @@ def test_balanced_families_ship_both_packed_instances_for_both_arches() -> None:
             member["selector"]["n_rows"] for member in entry["source_family"]
         )
         assert selectors == [32, 64], family
+        program = f"cuda/dcp_spec/{family}/kernel.cu"
+        assert (csrc_dir / program).is_file(), program
+        assert [
+            path.name for path in (csrc_dir / "cuda" / "dcp_spec" / family).iterdir()
+        ] == ["kernel.cu"]
+        program_text = (csrc_dir / program).read_text()
+        assert program_text.count("#ifndef N_ROWS\n#define N_ROWS 64\n#endif\n") == 1
+        assert "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)" in program_text
         for member in entry["source_family"]:
-            assert set(member["sources"]) == {"sm_100a", "sm_103a"}
-            for arch, source in member["sources"].items():
-                assert (
-                    source
-                    == f"cuda/dcp_spec/{family}/{arch}/n_rows{member['selector']['n_rows']}.cu"
-                )
-                assert (csrc_dir / source).is_file(), source
+            assert member["sources"] == {"sm_100a": program, "sm_103a": program}
+            assert member["sha256"]["sm_100a"] == member["sha256"]["sm_103a"]
+            assert member["defines"] == {"N_ROWS": member["selector"]["n_rows"]}
         assert entry["binding_source"] == f"bindings/cake_fmha_{family}_binding.cu"
         assert (csrc_dir / entry["binding_source"]).is_file()
         assert entry["launch_binding"] == f"cake_fmha_launch_{family}"
@@ -678,7 +682,7 @@ def test_balanced_families_ship_both_packed_instances_for_both_arches() -> None:
         assert entry["public_symbol"].endswith(f"cake_fmha_{family}")
         assert entry["threads"] == 384
         assert entry["dynamic_shared_memory_bytes"] == _FAMILY_SMEM[family]
-        assert entry["parametric_macros"] == []
+        assert entry["parametric_macros"] == ["N_ROWS"]
         expected = list(_LAUNCH_PARAMETERS)
         if family == "dcp_spec_bf16_balanced":
             expected.remove("output_scale")
@@ -746,9 +750,6 @@ def test_balanced_jit_selects_the_packed_instance_and_launch_binding(
     jit_dcp.gen_dcp_spec_balanced_module.cache_clear()
     try:
         arch = target.replace("sm", "", 1)
-        manifest_arch = {"sm100a": "sm_100a", "sm103a": "sm_103a", "sm100f": "sm_100a"}[
-            target
-        ]
         for family in DCP_BALANCED_FAMILIES:
             for n_rows in DCP_BALANCED_N_ROWS:
                 spec = jit_dcp.gen_dcp_spec_balanced_module(family, target, n_rows)
@@ -760,11 +761,9 @@ def test_balanced_jit_selects_the_packed_instance_and_launch_binding(
                 body, launch_binding, api_binding = (
                     Path(source) for source in spec.sources
                 )
-                assert body.name == f"n_rows{n_rows}.cu"
-                assert (
-                    body.parent.name == manifest_arch
-                    and body.parent.parent.name == family
-                )
+                assert body.name == "kernel.cu" and body.parent.name == family
+                assert body.parent.parent.name == "dcp_spec"
+                assert f"-DN_ROWS={n_rows}" in spec.extra_cuda_cflags
                 assert launch_binding.name == f"cake_fmha_{family}_binding.cu"
                 assert launch_binding.parent.name == "bindings"
                 assert api_binding.name == f"cake_fmha_{family}_jit_binding.cu"

@@ -127,33 +127,41 @@
                 "name": "max_items"
               }
             ],
-            "parametric_macros": [],
+            "parametric_macros": [
+              "N_ROWS"
+            ],
             "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_balanced",
             "source_family": [
               {
+                "defines": {
+                  "N_ROWS": 32
+                },
                 "selector": {
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "92c5295c8c602c227b04758d2fc16820c3fdc77f3878bd3e028218e6834bc122",
-                  "sm_103a": "3198afd316bbb258b804f71af37c6883bedfbb0a85edac52a8a4fc2371ab4aae"
+                  "sm_100a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e",
+                  "sm_103a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e"
                 },
                 "sources": {
-                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_100a/n_rows32.cu",
-                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_103a/n_rows32.cu"
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu"
                 }
               },
               {
+                "defines": {
+                  "N_ROWS": 64
+                },
                 "selector": {
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "e61bbac768355d85f26567790fc73cdc8a2ce33c6eb0fb67e6f26337ae043895",
-                  "sm_103a": "e64909c3c862c8de4c437b431721ba9dde7ab0e31234cfb9ebc5a9c50cd1e352"
+                  "sm_100a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e",
+                  "sm_103a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e"
                 },
                 "sources": {
-                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_100a/n_rows64.cu",
-                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_103a/n_rows64.cu"
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu"
                 }
               }
             ],
@@ -497,33 +505,41 @@
                 "name": "max_items"
               }
             ],
-            "parametric_macros": [],
+            "parametric_macros": [
+              "N_ROWS"
+            ],
             "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8_balanced",
             "source_family": [
               {
+                "defines": {
+                  "N_ROWS": 32
+                },
                 "selector": {
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "feb31e7c7dddd66fb831594219601d5085cef329ce19cc4b5869857934bac06e",
-                  "sm_103a": "775b7918eefeea5c237e0bb0a1bfd3b05813ab3218456668d10044b0db93941b"
+                  "sm_100a": "52025e3183116725bdb106ef89061c66d6f537649b928c258b76f02ba6461bec",
+                  "sm_103a": "52025e3183116725bdb106ef89061c66d6f537649b928c258b76f02ba6461bec"
                 },
                 "sources": {
-                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_100a/n_rows32.cu",
-                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_103a/n_rows32.cu"
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
                 }
               },
               {
+                "defines": {
+                  "N_ROWS": 64
+                },
                 "selector": {
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "cd3e5c1662cfd13314a8947cb032f38b4e88bcf4a7e077461b118ff6b24d15cd",
-                  "sm_103a": "619717d9804c574bc28301037e99f7fe69fadbdcf9f6a1c314c451ae5f5717fa"
+                  "sm_100a": "52025e3183116725bdb106ef89061c66d6f537649b928c258b76f02ba6461bec",
+                  "sm_103a": "52025e3183116725bdb106ef89061c66d6f537649b928c258b76f02ba6461bec"
                 },
                 "sources": {
-                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_100a/n_rows64.cu",
-                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_103a/n_rows64.cu"
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
                 }
               }
             ],
@@ -641,33 +657,41 @@
                 "name": "max_items"
               }
             ],
-            "parametric_macros": [],
+            "parametric_macros": [
+              "N_ROWS"
+            ],
             "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8_d256_balanced",
             "source_family": [
               {
+                "defines": {
+                  "N_ROWS": 32
+                },
                 "selector": {
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "57b8e8922fcbc22b593d6aa54e9b87d38a39c2d6f232c8d276cc4731e23707eb",
-                  "sm_103a": "83a6fc3acffcd30ce1145e7573b19b931deff88b1aed779072efc7b5bd9e3e81"
+                  "sm_100a": "8a187794175bcf37d60388e93bf0e9addcfb1ffea949163b953d7a25f02a9287",
+                  "sm_103a": "8a187794175bcf37d60388e93bf0e9addcfb1ffea949163b953d7a25f02a9287"
                 },
                 "sources": {
-                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_100a/n_rows32.cu",
-                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_103a/n_rows32.cu"
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu"
                 }
               },
               {
+                "defines": {
+                  "N_ROWS": 64
+                },
                 "selector": {
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "7c8f6ea7b15b193d95dca4a4f918926ded3eb559b0eff06bc87ba8feedfd6ab7",
-                  "sm_103a": "e6dd0ec7be6cafedef62ecae5d5b6653a11f079d21604c982cf17d7965bf342e"
+                  "sm_100a": "8a187794175bcf37d60388e93bf0e9addcfb1ffea949163b953d7a25f02a9287",
+                  "sm_103a": "8a187794175bcf37d60388e93bf0e9addcfb1ffea949163b953d7a25f02a9287"
                 },
                 "sources": {
-                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_100a/n_rows64.cu",
-                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_103a/n_rows64.cu"
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu"
                 }
               }
             ],
@@ -1190,8 +1214,8 @@
             }
           }
         },
-        "source_package_file_count": 52,
-        "source_package_sha256": "90c75782861a66f6ab0040ffeeb39ea1259dbd1087073e4beafdc724e2ad5e80",
+        "source_package_file_count": 43,
+        "source_package_sha256": "8e811d5b34e079979b6905360a654c6c15018dafb2bbbf45f71521b875949d00",
         "balanced_routes": {
           "dcp_spec_bf16_balanced": {
             "arguments": {
@@ -1950,21 +1974,9 @@
       "bytes": 238377,
       "sha256": "03cfc35e253a91a9675d2e3da75d60b15be3f04ca97465c9c656183c3a943ba7"
     },
-    "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_100a/n_rows32.cu": {
-      "bytes": 219227,
-      "sha256": "92c5295c8c602c227b04758d2fc16820c3fdc77f3878bd3e028218e6834bc122"
-    },
-    "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_100a/n_rows64.cu": {
-      "bytes": 219227,
-      "sha256": "e61bbac768355d85f26567790fc73cdc8a2ce33c6eb0fb67e6f26337ae043895"
-    },
-    "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_103a/n_rows32.cu": {
-      "bytes": 219130,
-      "sha256": "3198afd316bbb258b804f71af37c6883bedfbb0a85edac52a8a4fc2371ab4aae"
-    },
-    "cuda/dcp_spec/dcp_spec_bf16_balanced/sm_103a/n_rows64.cu": {
-      "bytes": 219130,
-      "sha256": "e64909c3c862c8de4c437b431721ba9dde7ab0e31234cfb9ebc5a9c50cd1e352"
+    "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu": {
+      "bytes": 219427,
+      "sha256": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l20.cu": {
       "bytes": 116857,
@@ -1998,37 +2010,13 @@
       "bytes": 127094,
       "sha256": "07240d76baaf7adea6ca1929fe354d32a16d9369470c0071ae6d3ad917fafb91"
     },
-    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_100a/n_rows32.cu": {
-      "bytes": 242133,
-      "sha256": "feb31e7c7dddd66fb831594219601d5085cef329ce19cc4b5869857934bac06e"
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu": {
+      "bytes": 242333,
+      "sha256": "52025e3183116725bdb106ef89061c66d6f537649b928c258b76f02ba6461bec"
     },
-    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_100a/n_rows64.cu": {
-      "bytes": 242133,
-      "sha256": "cd3e5c1662cfd13314a8947cb032f38b4e88bcf4a7e077461b118ff6b24d15cd"
-    },
-    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_103a/n_rows32.cu": {
-      "bytes": 242036,
-      "sha256": "775b7918eefeea5c237e0bb0a1bfd3b05813ab3218456668d10044b0db93941b"
-    },
-    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/sm_103a/n_rows64.cu": {
-      "bytes": 242036,
-      "sha256": "619717d9804c574bc28301037e99f7fe69fadbdcf9f6a1c314c451ae5f5717fa"
-    },
-    "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_100a/n_rows32.cu": {
-      "bytes": 284597,
-      "sha256": "57b8e8922fcbc22b593d6aa54e9b87d38a39c2d6f232c8d276cc4731e23707eb"
-    },
-    "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_100a/n_rows64.cu": {
-      "bytes": 284597,
-      "sha256": "7c8f6ea7b15b193d95dca4a4f918926ded3eb559b0eff06bc87ba8feedfd6ab7"
-    },
-    "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_103a/n_rows32.cu": {
-      "bytes": 284500,
-      "sha256": "83a6fc3acffcd30ce1145e7573b19b931deff88b1aed779072efc7b5bd9e3e81"
-    },
-    "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/sm_103a/n_rows64.cu": {
-      "bytes": 284500,
-      "sha256": "e6dd0ec7be6cafedef62ecae5d5b6653a11f079d21604c982cf17d7965bf342e"
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu": {
+      "bytes": 284793,
+      "sha256": "8a187794175bcf37d60388e93bf0e9addcfb1ffea949163b953d7a25f02a9287"
     },
     "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l20.cu": {
       "bytes": 95503,
