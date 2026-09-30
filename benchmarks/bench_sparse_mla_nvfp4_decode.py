@@ -27,7 +27,7 @@ import numpy as np
 import torch
 
 from flashinfer.mla import nvfp4_quantize_pack_sparse_mla_cache
-from flashinfer.mla._sparse_mla_nvfp4_sm120 import (
+from flashinfer.mla._sparse_mla_sm120._dsv4_nvfp4 import (
     get_sparse_mla_nvfp4_sm120_module,
 )
 from flashinfer.mla._sparse_mla_sm120 import sparse_mla_sm120_decode_dsv4
@@ -293,6 +293,7 @@ def main() -> None:
                 extra_topk_length,
                 cpb,
                 stage1_only,
+                1.0,
             )
 
         if args.probe_prefill_kernel:
@@ -312,6 +313,7 @@ def main() -> None:
                     nvfp4_extra_cache,
                     extra_indices,
                     None,
+                    1.0,
                 )
 
             prefill_cta_us = _median_us(
@@ -378,6 +380,7 @@ def main() -> None:
                         None,
                         section_splits,
                         False,
+                        1.0,
                     )
                     return section_out, section_lse
 

@@ -3,7 +3,7 @@
 """Thin adapters over the SM90 (Hopper) ``src/`` kernel drop.
 
 Mirrors the SM100 package's shim layer
-(``kernel_src/cutedsl_megamoe/shim``): all adaptation over the verbatim
+(``kernel_src/sm100/cutedsl_megamoe/shim``): all adaptation over the verbatim
 ``src/`` drop lives here, and the package ``__init__`` re-exports only from
 this layer.  ``comm`` holds dist / symmetric-heap / compile helpers;
 ``hopper_fp8`` holds the SM90 FP8 lazy-compile frontend plus the
@@ -28,6 +28,23 @@ from .comm import (
     resolve_gate_up_clamp,
     sym_zeros,
 )
+from .autotune import (
+    autotune_hopper_fp8_mega_moe,
+    autotune_knobs,
+    hopper_fp8_candidates,
+)
+from .knob_cache import (
+    knob_cache_path,
+    lookup_knobs,
+    record_knobs,
+    resolve_knobs,
+)
+from .tuner import (
+    default_knobs,
+    is_valid,
+    iter_candidates,
+    with_knobs,
+)
 from .hopper_fp8 import (
     MegaMoEHopperFp8Config,
     MegaMoEHopperFp8Frontend,
@@ -51,6 +68,18 @@ __all__ = [
     "reset_compiled_mega_workspaces",
     "resolve_gate_up_clamp",
     "sym_zeros",
+    # tuner / knob cache / autotune
+    "autotune_hopper_fp8_mega_moe",
+    "autotune_knobs",
+    "default_knobs",
+    "hopper_fp8_candidates",
+    "is_valid",
+    "iter_candidates",
+    "knob_cache_path",
+    "lookup_knobs",
+    "record_knobs",
+    "resolve_knobs",
+    "with_knobs",
     # hopper_fp8
     "MegaMoEHopperFp8Config",
     "MegaMoEHopperFp8Frontend",

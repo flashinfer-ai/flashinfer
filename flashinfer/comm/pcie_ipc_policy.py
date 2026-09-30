@@ -37,10 +37,11 @@ from enum import IntEnum
 from functools import lru_cache
 from typing import Optional
 
+from .pcie_ipc_collectives._constants import AR_MAX_BLOCKS, PACK_BYTES
 
-# Block counts above this are never useful on either fabric and the workspace
-# is sized for it.
-MAX_BLOCKS = 128
+
+# Preserve the existing AllReduce policy name and configurable workspace default.
+MAX_BLOCKS = AR_MAX_BLOCKS
 
 
 class IpcVariant(IntEnum):
@@ -69,6 +70,8 @@ class IpcVariant(IntEnum):
     # candidate list on fabrics it does not describe, where it lost to both
     # the flat ring and the SM path.
     COPY_ENGINE_ISLAND = 5
+    # Single-piece flat ring with CE stream publication, enabled jointly on SM120.
+    COPY_ENGINE_RING_MEMOP = 6
 
 
 @dataclass(frozen=True)
@@ -101,7 +104,7 @@ def _admits(world_size: int, numel: int, elem_size: int) -> bool:
     """
     if world_size not in (2, 4, 8):
         return False
-    pack_elems = 16 // elem_size
+    pack_elems = PACK_BYTES // elem_size
     # Matches the launcher's own check; the kernels address whole 16-byte packs.
     if numel % pack_elems != 0:
         return False
@@ -173,7 +176,11 @@ def _is_launchable(
     candidate that reaches the launcher and fails its hard check raises on one
     rank while its peers spin with no timeout.
     """
-    if config.variant in (IpcVariant.COPY_ENGINE_RING, IpcVariant.COPY_ENGINE_ISLAND):
+    if config.variant in (
+        IpcVariant.COPY_ENGINE_RING,
+        IpcVariant.COPY_ENGINE_ISLAND,
+        IpcVariant.COPY_ENGINE_RING_MEMOP,
+    ):
         if config.variant == IpcVariant.COPY_ENGINE_ISLAND and world_size != 8:
             return False
         # A copy-engine variant is not exempt from the world-size-2 rule just
@@ -192,7 +199,7 @@ def _is_launchable(
         if config.threads != CE_THREADS:
             return False
         if numel is not None:
-            pack_elems = 16 // elem_size
+            pack_elems = PACK_BYTES // elem_size
             # The island schedule splits into four chunks whatever the world size.
             shards = (
                 4 if config.variant == IpcVariant.COPY_ENGINE_ISLAND else world_size

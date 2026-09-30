@@ -56,10 +56,35 @@ def mnnvl_available() -> bool:
     return MnnvlMemory.supports_mnnvl()
 
 
+def _default_dist_init_method() -> str:
+    value = os.environ.get("MASTER_PORT", "29500")
+    try:
+        master_port = int(value)
+    except ValueError as error:
+        raise pytest.UsageError(
+            f"MASTER_PORT must be an integer between 1 and 65534; got {value!r}"
+        ) from error
+    if not 1 <= master_port < 65535:
+        raise pytest.UsageError(
+            "MASTER_PORT must be between 1 and 65534 because tests/comm also "
+            f"uses MASTER_PORT + 1; got {master_port}"
+        )
+    return f"tcp://localhost:{master_port + 1}"
+
+
 def pytest_addoption(parser):
     parser.addoption("--num_nodes", type=int, default=1)
     parser.addoption("--node_id", type=int, default=0)
-    parser.addoption("--dist_init_method", type=str, default="tcp://localhost:29501")
+    parser.addoption(
+        "--dist_init_method",
+        type=str,
+        default=None,
+    )
+
+
+def pytest_configure(config):
+    if config.getoption("dist_init_method") is None:
+        config.option.dist_init_method = _default_dist_init_method()
 
 
 @pytest.fixture
