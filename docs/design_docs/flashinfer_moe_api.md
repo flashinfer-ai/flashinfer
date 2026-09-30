@@ -779,14 +779,20 @@ Key mechanisms (and where they live):
 
 The unreleased enum-wrapper/singleton spelling was replaced by frozen values:
 `SwiGLU(alpha, beta, limit)`, `SiTU(gate_scale, linear_scale, clamp_limit)`,
-`GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, `Identity()`,
-`GELU()`, `ReLU()`, and `SiLU()`.
+`GeGLU()`, `ReLU2()`, `GeGLUTanh()`, `SwiGLUStep(limit)`, `PowLU(m, limit)`,
+`Identity()`, `GELU()`, `ReLU()`, and `SiLU()`.
 Every value exposes `.type` and `.is_gated`; scalar fields participate in
 equality, hashing, repr serialization, and tactic-cache identity. Per-expert
 controls remain in backend-native `MoEWeightPack` views: TRT-LLM uses
 `gemm1_alpha` / `gemm1_beta` / `gemm1_clamp_limit`, while CUTLASS SiTU uses
 `situ_beta` / `situ_linear_beta`. Where supported, these tensors override the
 config-derived values.
+
+`PowLU` (CUTLASS only) rides the generic slots with changed meaning:
+`gemm1_alpha` carries the exponent `m` (not a sigmoid slope) and
+`gemm1_clamp_limit` the post-activation clamp on the gate plus the symmetric
+clamp on the linear branch; `gemm1_beta` has no PowLU meaning and per-expert
+overrides naming it are rejected.
 
 `SiTU.linear_scale` is the linear-branch soft-clamp scale, applied as
 `linear_scale * tanh(linear / linear_scale)`. It accepts `None` for the
@@ -824,15 +830,15 @@ python scripts/generate_moe_activation_matrix.py --write
 | `cutile_mxfp8` | `CuTileMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutile_nvfp4` | `CuTileNvfp4Bf16Config` | `NVFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `cutile_nvfp4` | `CuTileNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_bf16` | `CutlassBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_fp8_block` | `CutlassFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_fp8_per_tensor` | `CutlassFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_humming` | `CutlassHummingConfig` | `MXFP4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_mxfp8` | `CutlassMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_mxfp8_mxfp4` | `CutlassMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
-| `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_bf16` | `CutlassBf16Config` | `BF16×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_fp8_block` | `CutlassFp8BlockConfig` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_fp8_per_tensor` | `CutlassFp8PerTensorConfig` | `FP8PerTensor×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_humming` | `CutlassHummingConfig` | `MXFP4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_mxfp8` | `CutlassMxfp8Config` | `MXFP8×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_mxfp8_mxfp4` | `CutlassMxfp8Mxfp4Config` | `MXFP4×MXFP8` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_nvfp4` | `CutlassNvfp4Config` | `NVFP4×NVFP4` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_w4a16` | `CutlassW4A16Config` | `MXFP4×BF16` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
+| `cutlass_w4a8` | `CutlassW4A8Config` | `INT4×FP8PerTensor` | `SwiGLU`, `SwiGLUStep`, `GeGLU`, `GeGLUTanh`, `ReLU2`, `SiTU`, `PowLU`, `Identity`, `GELU`, `ReLU`, `SiLU` |
 | `prims_ts` | `PrimsTsConfig` | `BF16×BF16` | `SwiGLU`, `ReLU2` |
 | `prims_ts` | `PrimsTsConfig` | `NVFP4×NVFP4` | `SwiGLU`, `GeGLU`, `SiTU`, `ReLU2` |
 | `sm12x_fp8` | `SM12xFp8Config` | `DeepSeekFp8×DeepSeekFp8` | `SwiGLU` |

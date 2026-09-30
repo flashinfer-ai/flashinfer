@@ -36,6 +36,7 @@ import torch
 from torch import Tensor
 
 from ..tllm_enums import (
+    DEFAULT_POWLU_M,
     DEFAULT_SITU_BETA,
     DEFAULT_SITU_LINEAR_BETA,
     DEFAULT_SWIGLU_ALPHA,
@@ -333,6 +334,33 @@ class SiTU(ActivationConfig):
             _validate_finite("linear_scale", self.linear_scale, positive=True)
         if self.clamp_limit is not None:
             _validate_finite("clamp_limit", self.clamp_limit, positive=True)
+
+
+@dataclass(frozen=True)
+class PowLU(ActivationConfig):
+    """PowLU-GLU, the power-adaptive activation.
+
+    The gate branch is ``gate ** (m / (sqrt(gate) + 1)) * sigmoid(gate)`` where
+    ``gate > 0`` and ``silu(gate)`` elsewhere; the two halves meet at ``0`` and
+    at ``1``. ``limit`` then clamps the gate branch to ``(-inf, limit]`` and the
+    linear branch to ``[-limit, limit]``; ``None`` leaves both unclamped.
+
+    PowLU saturates on its own -- with the default ``m`` it peaks at ``4.02``
+    and decays toward ``1`` -- so a ``limit`` above that peak clamps only the
+    linear branch. Per-expert limits (a model may use one for the routed experts and
+    another for the fused shared expert) go through the backend-native weight
+    view, like the other gated activations.
+    """
+
+    type: ClassVar[ActivationType] = ActivationType.PowLU
+    m: float = DEFAULT_POWLU_M
+    limit: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _validate_finite("m", self.m, positive=True)
+        if self.limit is not None:
+            _validate_finite("limit", self.limit, positive=True)
 
 
 @dataclass(frozen=True)

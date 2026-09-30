@@ -25,6 +25,7 @@ from .api import (  # noqa: F401
     GeGLU,
     GeGLUTanh,
     Identity,
+    PowLU,
     ReLU,
     ReLU2,
     SiLU,
@@ -306,6 +307,7 @@ __all__ = [
     "SiLU",
     "GeGLUTanh",
     "SwiGLUStep",
+    "PowLU",
     "Identity",
     # Unified configs, packs, and runners
     "B12xNvfp4Config",
