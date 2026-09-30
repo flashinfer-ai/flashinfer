@@ -702,6 +702,20 @@ def _dtype_key(dtype: torch.dtype) -> str:
         ) from error
 
 
+def _cutlass_dtype(dtype_key: str):
+    """Return the cutlass numeric type named by a dtype key."""
+
+    import cutlass
+
+    return {
+        "float16": cutlass.Float16,
+        "bfloat16": cutlass.BFloat16,
+        "float8_e4m3fn": cutlass.Float8E4M3FN,
+        "float4_e2m1fn": cutlass.Float4E2M1FN,
+        "int8": cutlass.Int8,
+    }[dtype_key]
+
+
 def _validate_dtype_pair(
     q_dtype: torch.dtype,
     k_dtype: torch.dtype,
@@ -1287,8 +1301,6 @@ def _resolve_decode_launch_spec(
         use_q_token_kv_block_sparse_route=use_q_token_kv_block_sparse_route,
     )
 
-    import cutlass
-
     from .kernels.fmha_decode.fmha_decode_config import (
         MIN_LOOP_ITERS_PER_SPLIT,
         get_max_active_clusters_for_cluster_size,
@@ -1298,16 +1310,10 @@ def _resolve_decode_launch_spec(
 
     if kv_layout != "HND":
         raise ValueError("the cached TS decode compiler accepts HND only")
-    dtype_map = {
-        "float16": cutlass.Float16,
-        "bfloat16": cutlass.BFloat16,
-        "float8_e4m3fn": cutlass.Float8E4M3FN,
-        "float4_e2m1fn": cutlass.Float4E2M1FN,
-    }
-    q_dtype = dtype_map[q_dtype_key]
-    k_dtype = dtype_map[k_dtype_key]
-    v_dtype = dtype_map[v_dtype_key]
-    output_dtype = dtype_map[output_dtype_key]
+    q_dtype = _cutlass_dtype(q_dtype_key)
+    k_dtype = _cutlass_dtype(k_dtype_key)
+    v_dtype = _cutlass_dtype(v_dtype_key)
+    output_dtype = _cutlass_dtype(output_dtype_key)
 
     def make_config(
         args: object | None = None,
@@ -1568,16 +1574,10 @@ def _get_compiled_decode(
 
     direct_q1_spec = compile_spec.direct_q1_spec
 
-    dtype_map = {
-        "float16": cutlass.Float16,
-        "bfloat16": cutlass.BFloat16,
-        "float8_e4m3fn": cutlass.Float8E4M3FN,
-        "float4_e2m1fn": cutlass.Float4E2M1FN,
-    }
-    q_dtype = dtype_map[q_dtype_key]
-    k_dtype = dtype_map[k_dtype_key]
-    v_dtype = dtype_map[v_dtype_key]
-    output_dtype = dtype_map[output_dtype_key]
+    q_dtype = _cutlass_dtype(q_dtype_key)
+    k_dtype = _cutlass_dtype(k_dtype_key)
+    v_dtype = _cutlass_dtype(v_dtype_key)
+    output_dtype = _cutlass_dtype(output_dtype_key)
     cfg = FmhaDecodeConfig(**dict(compile_spec.config_items))
     k_storage_dtype = cutlass.Uint8 if k_dtype == cutlass.Float4E2M1FN else k_dtype
     v_storage_dtype = cutlass.Uint8 if v_dtype == cutlass.Float4E2M1FN else v_dtype

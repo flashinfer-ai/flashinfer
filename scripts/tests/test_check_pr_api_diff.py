@@ -140,6 +140,21 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "def api(value: Tensor) -> None",
                 "def api(value: Tensor | None = None) -> None",
             ),
+            (
+                "Literal gains a member",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b', 'c'] = 'a') -> None",
+            ),
+            (
+                "Literal gains a member, reordered and qualified",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: typing.Literal['c', 'b', 'a'] = 'a') -> None",
+            ),
+            (
+                "single-member Literal widens",
+                "def api(backend: Literal['a'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+            ),
         )
 
         for name, before, after in cases:
@@ -172,6 +187,26 @@ class SignatureCompatibilityTest(unittest.TestCase):
                 "positional parameters reordered",
                 "def api(first: int, second: str) -> None",
                 "def api(second: str, first: int) -> None",
+            ),
+            (
+                "Literal loses a member",
+                "def api(backend: Literal['a', 'b', 'c'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+            ),
+            (
+                "Literal member replaced",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: Literal['a', 'c'] = 'a') -> None",
+            ),
+            (
+                "Literal default changes",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: Literal['a', 'b', 'c'] = 'c') -> None",
+            ),
+            (
+                "Literal replaced by str",
+                "def api(backend: Literal['a', 'b'] = 'a') -> None",
+                "def api(backend: str = 'a') -> None",
             ),
             (
                 "positional parameter inserted",

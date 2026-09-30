@@ -330,10 +330,11 @@ def test_prepared_matches_torch_reference_chain(group_counts, n2, k, arbitrary_s
     )
     m = sum(group_counts)
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    # validate_indices=True hands the routing to the routing-aware rule: large rows whose odd-tail units exceed the
-    # SMs the pair grid leaves free take the GEMM + (wide) act route instead of the fused route
+    # validate_indices=True hands the routing to the routing-aware rule: large rows take the route the fitted makespan
+    # model picks (pair + tail, mixed schedule or GEMM + wide act) unless the legacy odd-tail rule's route is within
+    # ROUTE_MODEL_MARGIN of it
     expected_route = select_route(
-        m, n2, sm_count=sm_count, group_blocks=routing_blocks(group_counts)
+        m, n2, sm_count=sm_count, group_blocks=routing_blocks(group_counts), k=k
     )
     assert prepared.route == expected_route
     # GEMM + act kernel, or pair kernel + PDL tail kernel; the mixed-schedule route is one kernel
@@ -402,7 +403,7 @@ def test_prepared_matches_flashinfer_chain(group_counts, n2, k, arbitrary_scales
         pytest.param([256] * 16, 2048, 4096, FUSED_ROUTE, id="fused_wide"),
         pytest.param([256] * 8, 256, 512, FUSED_ROUTE, id="fused_at_threshold"),
         pytest.param([256] * 4 + [128, 100], 512, 1024, ACT_ROUTE, id="small_m"),
-        # routing-aware rule: the expected route is whatever the measured odd-tail crossover selects
+        # routing-aware rule: the expected route is whatever the makespan-model rule selects
         pytest.param(
             [256, 0, 512, 0, 384, 640, 128, 384, 256, 0, 128, 128, 384, 384, 512, 0],
             2048,
@@ -446,13 +447,13 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     m = sum(group_counts)
     blocks = routing_blocks(group_counts)
-    # without the routing the plan is shape-only; with it the routing-aware rule applies
-    shape_route, _ = launch_plan(m, n2, sm_count=sm_count)
-    assert shape_route == select_route(m, n2, sm_count=sm_count)
+    # without the routing the plan is shape-only; with it (and K) the routing-aware rule applies
+    shape_route, _ = launch_plan(m, n2, sm_count=sm_count, k=k)
+    assert shape_route == select_route(m, n2, sm_count=sm_count, k=k)
     if expected_route is not None:
         assert shape_route == expected_route
-    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=blocks)
-    assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks)
+    route, grid = launch_plan(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
+    assert route == select_route(m, n2, sm_count=sm_count, group_blocks=blocks, k=k)
     if m < SMALL_M_MAX:
         assert route == ACT_ROUTE
     prepared = prepare_group_gemm_fp8_nt_groupwise_contiguous_silu_quant(
@@ -463,7 +464,7 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
         a, b, a_scale, b_scale, m_indices
     )
     assert (unvalidated.route, unvalidated.grid) == launch_plan(
-        m, n2, sm_count=sm_count
+        m, n2, sm_count=sm_count, k=k
     )
     if route == FUSED_ROUTE:
         assert grid[0] % 2 == 0 and grid[0] <= 128
@@ -473,7 +474,7 @@ def test_launch_plan_matches_prepared(group_counts, n2, k, expected_route):
     elif route == FUSED_MIXED_ROUTE:
         pair_tiles, odd_units = fused_tile_counts(n2, blocks)
         clusters = mixed_clusters(pair_tiles, odd_units, sm_count=sm_count)
-        assert pair_tiles > clusters and pair_tiles % clusters
+        assert clusters >= 1  # one cluster per pair tile or solo unit up to the cap
         assert grid == (2 * clusters, 1, 1) and grid[0] <= 128
         assert prepared.tail_grid is None
         assert set(prepared.stage_grids) == {"main"}
@@ -510,8 +511,10 @@ def test_routing_blocks_and_fused_tile_counts():
         == ACT_ROUTE
     )
     assert select_route(4096, 2048, sm_count=148) == FUSED_ROUTE
-    # measured B200 rule: odd-tail units beyond the 20 SMs the 128-CTA pair grid leaves free -> GEMM + act
-    wide = dict(sm_count=148)
+    # B200 rule at the model's calibration geometry (2H = 2048, K = 4096): the fitted makespan model ranks pair + tail,
+    # mixed schedule and GEMM + act, guarded by the legacy odd-tail rule (units beyond the 20 SMs the 128-CTA pair grid
+    # leaves free leave the pair + tail route)
+    wide = dict(sm_count=148, k=4096)
     assert (
         select_route(4096, 2048, group_blocks=routing_blocks([256] * 16), **wide)
         == FUSED_ROUTE
@@ -520,8 +523,8 @@ def test_routing_blocks_and_fused_tile_counts():
         [128, 384] + [256] * 14
     )  # 16 odd-tail units <= 20 free SMs
     assert select_route(4096, 2048, group_blocks=two_odd, **wide) == FUSED_ROUTE
-    # diverted wide rows: the mixed-schedule route when the pair tiles outnumber the 64 clusters without dividing
-    # evenly (random_aligned: 96 pair tiles + 64 solo units), else the wide act kernel (>= ACT_WIDE_MIN_ITEMS items)
+    # diverted wide rows: the mixed-schedule route (random_aligned: 96 pair tiles + 64 solo units over 64 clusters,
+    # mixed_tail: 80 + 96), as under the legacy rule
     assert fused_tile_counts(2048, blocks) == (96, 64)
     assert mixed_clusters(96, 64, sm_count=148) == 64
     assert select_route(4096, 2048, group_blocks=blocks, **wide) == FUSED_MIXED_ROUTE
@@ -532,41 +535,65 @@ def test_routing_blocks_and_fused_tile_counts():
     assert (
         select_route(4096, 2048, group_blocks=mixed_tail, **wide) == FUSED_MIXED_ROUTE
     )
-    all_odd = routing_blocks(
-        [384] * 8 + [128] * 8
-    )  # 64 pair tiles = one per cluster: nothing to balance
+    # all_odd (64 pair tiles = one per cluster) and all_one_block (no pair tile at all) left the legacy rule's
+    # round-10 envelope on the GEMM + wide act route; the makespan model sends them to the mixed schedule (measured
+    # 0.97x and 0.87x the act route on B200)
+    all_odd = routing_blocks([384] * 8 + [128] * 8)
     assert fused_tile_counts(2048, all_odd) == (64, 128)
-    assert select_route(4096, 2048, group_blocks=all_odd, **wide) == ACT_WIDE_ROUTE
+    assert select_route(4096, 2048, group_blocks=all_odd, **wide) == FUSED_MIXED_ROUTE
+    all_one_block = routing_blocks([128] * 16)
+    assert fused_tile_counts(2048, all_one_block) == (0, 128)
     assert (
-        select_route(2048, 2048, group_blocks=routing_blocks([128] * 16), **wide)
-        == ACT_WIDE_ROUTE
-    )  # no pair tile at all
+        select_route(2048, 2048, group_blocks=all_one_block, **wide)
+        == FUSED_MIXED_ROUTE
+    )
+    # the margin guard keeps the legacy route where the model is within 5 % of its pick: twelve odd experts at
+    # M = 3072 stay on the wide act route; the four-odd M = 8192 routing goes back to pair + tail (legacy: mixed)
+    twelve_odd_3072 = routing_blocks([384] * 6 + [128] * 6 + [0] * 4)
+    assert fused_tile_counts(2048, twelve_odd_3072) == (48, 96)
+    assert (
+        select_route(3072, 2048, group_blocks=twelve_odd_3072, **wide) == ACT_WIDE_ROUTE
+    )
+    four_odd_8192 = routing_blocks([640, 640, 384, 384] + [512] * 12)
+    assert fused_tile_counts(2048, four_odd_8192) == (240, 32)
+    assert select_route(8192, 2048, group_blocks=four_odd_8192, **wide) == FUSED_ROUTE
     assert {FUSED_ROUTE, FUSED_MIXED_ROUTE} == FUSED_ROUTES
     assert act_items(2048, 2048) == ACT_WIDE_MIN_ITEMS
-    # 16 odd-tail units fit on the 20 SMs the pair grid leaves free: the problem stays fused
+    # outside the calibration geometry the legacy rule applies unchanged: 16 odd-tail units (<= 20 free SMs) stay on
+    # the pair + tail route, 32 units below the item threshold take the one-warp-per-group act kernel
     assert (
-        select_route(2048, 256, group_blocks=routing_blocks([128] * 16), **wide)
+        select_route(2048, 256, group_blocks=all_one_block, sm_count=148, k=512)
         == FUSED_ROUTE
     )
-    # a diverted problem (32 units) below the item threshold keeps the one-warp-per-group act kernel
     assert act_items(2048, 512) < ACT_WIDE_MIN_ITEMS
     assert (
-        select_route(2048, 512, group_blocks=routing_blocks([128] * 16), **wide)
+        select_route(2048, 512, group_blocks=all_one_block, sm_count=148, k=1024)
         == ACT_ROUTE
     )
-    # grids: the mixed-schedule route on the wide random_aligned row, the two act routes on all_odd and a small row
+    # without K (existing callers) or at another K the same routing keeps the legacy route
+    assert (
+        select_route(4096, 2048, group_blocks=all_odd, sm_count=148) == ACT_WIDE_ROUTE
+    )
+    assert (
+        select_route(4096, 2048, group_blocks=all_odd, sm_count=148, k=2048)
+        == ACT_WIDE_ROUTE
+    )
+    # grids: the mixed-schedule route on the wide random_aligned row and on all_one_block (solo units only), the two
+    # act routes on the twelve-odd M = 3072 row and a small row
     _, mixed_grid = launch_plan(4096, 2048, group_blocks=blocks, **wide)
     assert mixed_grid == (
         128,
         1,
         1,
     )  # 64 clusters of two CTAs (160 units capped at the 128-CTA grid)
-    _, wide_grid = launch_plan(4096, 2048, group_blocks=all_odd, **wide)
+    _, solo_grid = launch_plan(2048, 2048, group_blocks=all_one_block, **wide)
+    assert solo_grid == (128, 1, 1)  # 128 solo units capped at the 64 clusters
+    _, wide_grid = launch_plan(3072, 2048, group_blocks=twelve_odd_3072, **wide)
     assert wide_grid == (
         1480,
         1,
         1,
-    )  # ceil(32768 / 16) = 2048 warps-of-four capped at 10 CTAs x 148 SMs
+    )  # ceil(24576 / 16) = 1536 warps-of-four capped at 10 CTAs x 148 SMs
     _, small_grid = launch_plan(
         1024, 2048, group_blocks=routing_blocks([128] * 8), **wide
     )

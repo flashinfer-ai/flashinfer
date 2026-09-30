@@ -2,8 +2,9 @@
   "buckets": 2048,
   "codegen_arch": "sm_100a",
   "compile_flags": [],
+  "fused_block_tail_kcap": 1024,
   "fused_tail_kcap": 64,
-  "kernel_count": 22,
+  "kernel_count": 46,
   "kernel_symbols": [
     "kernel_cake_radix_topk_c1_e4",
     "kernel_cake_radix_topk_c1_e8",
@@ -21,12 +22,36 @@
     "kernel_cake_radix_topk_c2_e16s",
     "kernel_cake_radix_topk_c4_e16s",
     "kernel_cake_radix_topk_c8_e16s",
+    "kernel_cake_radix_topk_c1_e32s",
+    "kernel_cake_radix_topk_c2_e32s",
+    "kernel_cake_radix_topk_c4_e32s",
+    "kernel_cake_radix_topk_c8_e32s",
+    "kernel_cake_radix_topk_c1_e16s_cs",
+    "kernel_cake_radix_topk_c2_e16s_cs",
+    "kernel_cake_radix_topk_c4_e16s_cs",
+    "kernel_cake_radix_topk_c8_e16s_cs",
+    "kernel_cake_radix_topk_c1_e32s_cs",
+    "kernel_cake_radix_topk_c2_e32s_cs",
+    "kernel_cake_radix_topk_c4_e32s_cs",
+    "kernel_cake_radix_topk_c8_e32s_cs",
     "kernel_cake_sparse_topp_sample_t32_i2",
     "kernel_cake_sparse_topp_sample_t64_i2",
     "kernel_cake_sparse_topp_sample_t128_i2",
     "kernel_cake_sparse_topp_sample_t256_i2",
     "kernel_cake_sparse_topp_sample_t256_i4",
-    "kernel_cake_sparse_topp_sample_t512_i2"
+    "kernel_cake_sparse_topp_sample_t512_i2",
+    "kernel_cake_sparse_topp_sample_t32_i2_sel1",
+    "kernel_cake_sparse_topp_sample_t64_i2_sel1",
+    "kernel_cake_sparse_topp_sample_t128_i2_sel1",
+    "kernel_cake_sparse_topp_sample_t256_i2_sel1",
+    "kernel_cake_sparse_topp_sample_t256_i4_sel1",
+    "kernel_cake_sparse_topp_sample_t512_i2_sel1",
+    "kernel_cake_sparse_topp_sample_t32_i2_int_sel1",
+    "kernel_cake_sparse_topp_sample_t64_i2_int_sel1",
+    "kernel_cake_sparse_topp_sample_t128_i2_int_sel1",
+    "kernel_cake_sparse_topp_sample_t256_i2_int_sel1",
+    "kernel_cake_sparse_topp_sample_t256_i4_int_sel1",
+    "kernel_cake_sparse_topp_sample_t512_i2_int_sel1"
   ],
   "min_compute_capability": [
     9,
@@ -34,6 +59,7 @@
   ],
   "schema_version": 1,
   "semantics": {
+    "coarse_sample": "launch_flags bit 4 selects a streaming variant's coarse-sample build (manifest entries with coarse_sample true, symbol suffix _cs): its sampled first pass reads one 64-byte block per 512 bytes of the row (1/8) instead of one per 256 (1/4), with the lower-bucket margin, the sampled-mass cap and the filter-arm density switch scaled to the rate; the exact passes and the fallbacks are unchanged, so every output is bit-identical to the default build; the host sets it for launches whose largest top-k is at most fused_tail_kcap (rows at the gather capacity, k ~ 1000, lose with the coarser estimate)",
     "determinism": "strict: no atomics decide any output; slab (vals, idx) is rewritten in sorted order and renorm_out is emitted in that order, bitwise identical across launches, CUDA-graph replay and every kernel variant",
     "early_trigger": "launch_flags bit 1 makes stage 1 issue griddepcontrol.launch_dependents early (register-resident variants: once the row is in registers; streaming variants: see stream_prepass) so a PDL-chained stage-2/3 launch starts on the SMs this grid leaves free; the host sets it only when batch <= sm_count - (batch * cluster mod sm_count, or sm_count) so the dependent CTAs are not packed onto a few SMs; otherwise the trigger is left to CTA exit",
     "fused_tail": "stage 1 takes the stage-2/3 parameters and a host launch_flags word (bit 0 = fuse the tail, bit 1 = early PDL trigger, bit 2 = stream pre-pass trigger point); on a variant whose entry has fused_tail true, bit 0 set and max top-k <= fused_tail_kcap runs every row's stage 2/3 inside the stage-1 kernel (warp 0 of rank 0 after one cluster barrier) with the same outputs, and the stage-2/3 kernel is not launched; variants with fused_tail false (the ept = 48 resident, a large-k pick) are built without the tail and reject bit 0",
@@ -44,14 +70,38 @@
     "top_p": "shortest sorted prefix whose exclusive exact fixed-point mass is below p * mass(top-k), renormalized in float64; p clamped to (0, 1] (p <= 0 -> argmax, NaN -> 1)"
   },
   "slab_entries": 1024,
-  "source_sha256": "f15224d1e67432b2880ac141186a238fd5e4125c551439858f2aadced91f3115",
+  "source_files": [
+    {
+      "bytes": 1318,
+      "path": "cake_sampling_kernels.cu",
+      "sha256": "5ac32320f1490c01e9756f1b116729a9ce41eae7eb7e17348e4155850db95c23"
+    },
+    {
+      "bytes": 4022327,
+      "path": "cake_sampling_kernels_part1.cuh",
+      "sha256": "696f7a2550efd3a9acf76b110b5675c744cbff5c92d094d5632c9642e6d09175"
+    },
+    {
+      "bytes": 3938593,
+      "path": "cake_sampling_kernels_part2.cuh",
+      "sha256": "6a2764a8ee53628453726ea2268a9fc7452396069d901197ac26ced33c24b341"
+    },
+    {
+      "bytes": 3519663,
+      "path": "cake_sampling_kernels_part3.cuh",
+      "sha256": "d469c6c96da0252a3f46717544c4220c605a1403c5554a17103735b6b081f7d7"
+    }
+  ],
+  "source_sha256": "b9772a6551fb5338a04fbb2cb7b2da93e30683d747dd90411fe5b51b2403551e",
   "stage1": [
     {
       "block_threads": 512,
       "chunk": 2048,
       "cluster": 1,
-      "dynamic_smem_bytes": 33152,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 33664,
       "ept": 4,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e4"
@@ -60,8 +110,10 @@
       "block_threads": 512,
       "chunk": 4096,
       "cluster": 1,
-      "dynamic_smem_bytes": 33408,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 33920,
       "ept": 8,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e8"
@@ -70,8 +122,10 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 1,
-      "dynamic_smem_bytes": 33920,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 34432,
       "ept": 16,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e16"
@@ -80,8 +134,10 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 1,
-      "dynamic_smem_bytes": 34944,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 35456,
       "ept": 32,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c1_e32"
@@ -90,8 +146,10 @@
       "block_threads": 512,
       "chunk": 2048,
       "cluster": 2,
-      "dynamic_smem_bytes": 33152,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 33664,
       "ept": 4,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e4"
@@ -100,8 +158,10 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 2,
-      "dynamic_smem_bytes": 33920,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 34432,
       "ept": 16,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e16"
@@ -110,8 +170,10 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 2,
-      "dynamic_smem_bytes": 34944,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 35456,
       "ept": 32,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c2_e32"
@@ -120,8 +182,10 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 4,
-      "dynamic_smem_bytes": 33920,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 34432,
       "ept": 16,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e16"
@@ -130,8 +194,10 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 4,
-      "dynamic_smem_bytes": 34944,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 35456,
       "ept": 32,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c4_e32"
@@ -140,8 +206,10 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 8,
-      "dynamic_smem_bytes": 33920,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 34432,
       "ept": 16,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e16"
@@ -150,8 +218,10 @@
       "block_threads": 512,
       "chunk": 16384,
       "cluster": 8,
-      "dynamic_smem_bytes": 34944,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 35456,
       "ept": 32,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e32"
@@ -160,8 +230,10 @@
       "block_threads": 512,
       "chunk": 24576,
       "cluster": 8,
-      "dynamic_smem_bytes": 35968,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 36480,
       "ept": 48,
+      "fused_block_tail": false,
       "fused_tail": false,
       "stream": false,
       "symbol": "kernel_cake_radix_topk_c8_e48"
@@ -170,8 +242,10 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 1,
-      "dynamic_smem_bytes": 165248,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 165760,
       "ept": 16,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": true,
       "symbol": "kernel_cake_radix_topk_c1_e16s"
@@ -180,8 +254,10 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 2,
-      "dynamic_smem_bytes": 165248,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 165760,
       "ept": 16,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": true,
       "symbol": "kernel_cake_radix_topk_c2_e16s"
@@ -190,8 +266,10 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 4,
-      "dynamic_smem_bytes": 165248,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 165760,
       "ept": 16,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": true,
       "symbol": "kernel_cake_radix_topk_c4_e16s"
@@ -200,11 +278,157 @@
       "block_threads": 512,
       "chunk": 8192,
       "cluster": 8,
-      "dynamic_smem_bytes": 165248,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 165760,
       "ept": 16,
+      "fused_block_tail": false,
       "fused_tail": true,
       "stream": true,
       "symbol": "kernel_cake_radix_topk_c8_e16s"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 16384,
+      "cluster": 1,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 166784,
+      "ept": 32,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c1_e32s"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 16384,
+      "cluster": 2,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 166784,
+      "ept": 32,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c2_e32s"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 16384,
+      "cluster": 4,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 166784,
+      "ept": 32,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c4_e32s"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 16384,
+      "cluster": 8,
+      "coarse_sample": false,
+      "dynamic_smem_bytes": 166784,
+      "ept": 32,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c8_e32s"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 8192,
+      "cluster": 1,
+      "coarse_sample": true,
+      "dynamic_smem_bytes": 165760,
+      "ept": 16,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c1_e16s_cs"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 8192,
+      "cluster": 2,
+      "coarse_sample": true,
+      "dynamic_smem_bytes": 165760,
+      "ept": 16,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c2_e16s_cs"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 8192,
+      "cluster": 4,
+      "coarse_sample": true,
+      "dynamic_smem_bytes": 165760,
+      "ept": 16,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c4_e16s_cs"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 8192,
+      "cluster": 8,
+      "coarse_sample": true,
+      "dynamic_smem_bytes": 165760,
+      "ept": 16,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c8_e16s_cs"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 16384,
+      "cluster": 1,
+      "coarse_sample": true,
+      "dynamic_smem_bytes": 166784,
+      "ept": 32,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c1_e32s_cs"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 16384,
+      "cluster": 2,
+      "coarse_sample": true,
+      "dynamic_smem_bytes": 166784,
+      "ept": 32,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c2_e32s_cs"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 16384,
+      "cluster": 4,
+      "coarse_sample": true,
+      "dynamic_smem_bytes": 166784,
+      "ept": 32,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c4_e32s_cs"
+    },
+    {
+      "block_threads": 512,
+      "chunk": 16384,
+      "cluster": 8,
+      "coarse_sample": true,
+      "dynamic_smem_bytes": 166784,
+      "ept": 32,
+      "fused_block_tail": false,
+      "fused_tail": true,
+      "stream": true,
+      "symbol": "kernel_cake_radix_topk_c8_e32s_cs"
     }
   ],
   "stage23": [
@@ -212,49 +436,211 @@
       "block_threads": 32,
       "capacity": 64,
       "dynamic_smem_bytes": 1152,
+      "features": [],
       "items": 2,
       "symbol": "kernel_cake_sparse_topp_sample_t32_i2",
-      "threads": 32
+      "threads": 32,
+      "variant_flags": 0
     },
     {
       "block_threads": 64,
       "capacity": 128,
       "dynamic_smem_bytes": 2176,
+      "features": [],
       "items": 2,
       "symbol": "kernel_cake_sparse_topp_sample_t64_i2",
-      "threads": 64
+      "threads": 64,
+      "variant_flags": 0
     },
     {
       "block_threads": 128,
       "capacity": 256,
       "dynamic_smem_bytes": 4224,
+      "features": [],
       "items": 2,
       "symbol": "kernel_cake_sparse_topp_sample_t128_i2",
-      "threads": 128
+      "threads": 128,
+      "variant_flags": 0
     },
     {
       "block_threads": 256,
       "capacity": 512,
       "dynamic_smem_bytes": 8320,
+      "features": [],
       "items": 2,
       "symbol": "kernel_cake_sparse_topp_sample_t256_i2",
-      "threads": 256
+      "threads": 256,
+      "variant_flags": 0
     },
     {
       "block_threads": 256,
       "capacity": 1024,
       "dynamic_smem_bytes": 16512,
+      "features": [],
       "items": 4,
       "symbol": "kernel_cake_sparse_topp_sample_t256_i4",
-      "threads": 256
+      "threads": 256,
+      "variant_flags": 0
     },
     {
       "block_threads": 512,
       "capacity": 1024,
       "dynamic_smem_bytes": 16640,
+      "features": [],
       "items": 2,
       "symbol": "kernel_cake_sparse_topp_sample_t512_i2",
-      "threads": 512
+      "threads": 512,
+      "variant_flags": 0
+    },
+    {
+      "block_threads": 32,
+      "capacity": 64,
+      "dynamic_smem_bytes": 1152,
+      "features": [
+        "one_cmp_select"
+      ],
+      "items": 2,
+      "symbol": "kernel_cake_sparse_topp_sample_t32_i2_sel1",
+      "threads": 32,
+      "variant_flags": 2
+    },
+    {
+      "block_threads": 64,
+      "capacity": 128,
+      "dynamic_smem_bytes": 2176,
+      "features": [
+        "one_cmp_select"
+      ],
+      "items": 2,
+      "symbol": "kernel_cake_sparse_topp_sample_t64_i2_sel1",
+      "threads": 64,
+      "variant_flags": 2
+    },
+    {
+      "block_threads": 128,
+      "capacity": 256,
+      "dynamic_smem_bytes": 4224,
+      "features": [
+        "one_cmp_select"
+      ],
+      "items": 2,
+      "symbol": "kernel_cake_sparse_topp_sample_t128_i2_sel1",
+      "threads": 128,
+      "variant_flags": 2
+    },
+    {
+      "block_threads": 256,
+      "capacity": 512,
+      "dynamic_smem_bytes": 8320,
+      "features": [
+        "one_cmp_select"
+      ],
+      "items": 2,
+      "symbol": "kernel_cake_sparse_topp_sample_t256_i2_sel1",
+      "threads": 256,
+      "variant_flags": 2
+    },
+    {
+      "block_threads": 256,
+      "capacity": 1024,
+      "dynamic_smem_bytes": 16512,
+      "features": [
+        "one_cmp_select"
+      ],
+      "items": 4,
+      "symbol": "kernel_cake_sparse_topp_sample_t256_i4_sel1",
+      "threads": 256,
+      "variant_flags": 2
+    },
+    {
+      "block_threads": 512,
+      "capacity": 1024,
+      "dynamic_smem_bytes": 16640,
+      "features": [
+        "one_cmp_select"
+      ],
+      "items": 2,
+      "symbol": "kernel_cake_sparse_topp_sample_t512_i2_sel1",
+      "threads": 512,
+      "variant_flags": 2
+    },
+    {
+      "block_threads": 32,
+      "capacity": 64,
+      "dynamic_smem_bytes": 1152,
+      "features": [
+        "int_tests",
+        "one_cmp_select"
+      ],
+      "items": 2,
+      "symbol": "kernel_cake_sparse_topp_sample_t32_i2_int_sel1",
+      "threads": 32,
+      "variant_flags": 3
+    },
+    {
+      "block_threads": 64,
+      "capacity": 128,
+      "dynamic_smem_bytes": 2176,
+      "features": [
+        "int_tests",
+        "one_cmp_select"
+      ],
+      "items": 2,
+      "symbol": "kernel_cake_sparse_topp_sample_t64_i2_int_sel1",
+      "threads": 64,
+      "variant_flags": 3
+    },
+    {
+      "block_threads": 128,
+      "capacity": 256,
+      "dynamic_smem_bytes": 4224,
+      "features": [
+        "int_tests",
+        "one_cmp_select"
+      ],
+      "items": 2,
+      "symbol": "kernel_cake_sparse_topp_sample_t128_i2_int_sel1",
+      "threads": 128,
+      "variant_flags": 3
+    },
+    {
+      "block_threads": 256,
+      "capacity": 512,
+      "dynamic_smem_bytes": 8320,
+      "features": [
+        "int_tests",
+        "one_cmp_select"
+      ],
+      "items": 2,
+      "symbol": "kernel_cake_sparse_topp_sample_t256_i2_int_sel1",
+      "threads": 256,
+      "variant_flags": 3
+    },
+    {
+      "block_threads": 256,
+      "capacity": 1024,
+      "dynamic_smem_bytes": 16512,
+      "features": [
+        "int_tests",
+        "one_cmp_select"
+      ],
+      "items": 4,
+      "symbol": "kernel_cake_sparse_topp_sample_t256_i4_int_sel1",
+      "threads": 256,
+      "variant_flags": 3
+    },
+    {
+      "block_threads": 512,
+      "capacity": 1024,
+      "dynamic_smem_bytes": 16640,
+      "features": [
+        "int_tests",
+        "one_cmp_select"
+      ],
+      "items": 2,
+      "symbol": "kernel_cake_sparse_topp_sample_t512_i2_int_sel1",
+      "threads": 512,
+      "variant_flags": 3
     }
   ],
   "tma_abi": "pointer"

@@ -22,9 +22,11 @@ authors = [{ name = "FlashInfer team" }]
 license = "Apache-2.0"
 readme = "README.md"
 urls = { Homepage = "https://github.com/flashinfer-ai/flashinfer" }
-license-files = ["LICENSE", "LICENSE*.txt"]
+license-files = ["LICENSE", "LICENSE*.txt", "licenses/LICENSE.kda-for-kda"]
 
 [project.optional-dependencies]
+# Static SM103a KDA PTX uses ISA 9.2 and embedded-cubin TVM FFI shims.
+ptx = ["nvidia-cuda-nvcc>=13.2", "apache-tvm-ffi>=0.1.12,<0.2"]
 # Keep these CUDA-extra floors in sync with ci/cuda-versions.json.
 cu12 = ["nvidia-cutlass-dsl>=4.7.0a0"]
 cu13 = ["nvidia-cutlass-dsl[cu13]>=4.7.0a0"]
