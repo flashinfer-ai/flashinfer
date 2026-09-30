@@ -7,9 +7,9 @@ output happen outside the timed phases.
 dispatch_us and combine_us report CUPTI kernel spans (first kernel start to
 last kernel end of each phase), using CUDA graph replay by default or eager
 execution with --no_cuda_graph. Backends that cannot be captured run eagerly.
-If CUPTI is unavailable, timing falls back to CUDA events and
-benchmark_metadata.warning records the reason. --kernel_breakdown additionally
-reports per-kernel statistics.
+Kernel spans need cupti-python>=13.4; without it, timing falls back to CUDA
+events and benchmark_metadata.warning records the reason. --kernel_breakdown
+additionally reports per-kernel statistics.
 
 Launch on one node, for example:
 
@@ -371,6 +371,12 @@ def _build_kernel_stats_cupti(
 def _init_cupti() -> Tuple[Any, List[Tuple[str, int, int]], List[Tuple[int, int]]]:
     """Enable kernel and CUDA-event activity tracing; call before CUDA context creation."""
     from cupti import cupti
+
+    # Phase attribution needs CUDA-event IDs, added in cupti-python 13.4.
+    if not hasattr(cupti, "get_cuda_event_id"):
+        raise RuntimeError(
+            "cupti-python lacks get_cuda_event_id; install cupti-python>=13.4"
+        )
 
     cupti_kernels: List[Tuple[str, int, int]] = []
     cupti_events: List[Tuple[int, int]] = []
