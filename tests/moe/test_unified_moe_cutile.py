@@ -2668,6 +2668,54 @@ def test_sm12x_nvfp4_bf16_matches_reference(
 
 
 @sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("num_tokens", (1, 4, 16, 128))
+def test_sm12x_nvfp4_bf16_ignores_out_of_range_expert_ids(num_tokens):
+    # Serving frameworks route padding rows to expert -1 and expert-parallel
+    # non-local slots to num_experts; such slots contribute nothing. With one
+    # token, every row is padding, as in a CUDA-graph warmup forward.
+    activation = SwiGLU()
+    num_experts, top_k = 128, 8
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    weights = MoEWeightPack()
+    weights.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=768,
+            max_num_tokens=num_tokens,
+        ),
+        torch.device("cuda"),
+    )
+    act = make_activations(0)
+    num_valid = num_tokens // 2
+    act.topk_ids[num_valid:] = -1
+    act.topk_ids[:num_valid, -1] = num_experts
+
+    actual = layer(act, weights)
+    torch.cuda.synchronize()
+
+    assert torch.count_nonzero(actual[num_valid:]) == 0
+    if num_valid:
+        ids = act.topk_ids[:num_valid].clone()
+        ids[:, -1] = 0
+        topk_weights = act.topk_weights[:num_valid].clone()
+        topk_weights[:, -1] = 0
+        expected = reference(
+            MoEActivationPack(act.hidden_states_q[:num_valid], None, ids, topk_weights)
+        )
+        _assert_moe_close(actual[:num_valid], expected)
+
+
+@sm12x_nvfp4_bf16_required
 @pytest.mark.parametrize(
     "num_tokens,hidden_size,intermediate_size,num_experts,top_k,activation",
     (

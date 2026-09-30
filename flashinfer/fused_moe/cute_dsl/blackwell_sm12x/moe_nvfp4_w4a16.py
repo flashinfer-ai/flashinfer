@@ -112,7 +112,8 @@ def k_route(
         for j in cutlass.range(NIT, unroll=1):
             s = j * RTPB + tid
             if s < S:
-                cute.arch.atomic_add(cnt.iterator + gIds[s], cutlass.Int32(1))
+                e, _ = _live_expert(gIds[s], E)
+                cute.arch.atomic_add(cnt.iterator + e, cutlass.Int32(1))
         cute.arch.barrier()
 
         ls = cutlass.Int32(0)
@@ -164,9 +165,10 @@ def k_route(
         for j in cutlass.range(NIT, unroll=1):
             s = j * RTPB + tid
             if s < S:
-                p = cute.arch.atomic_add(cnt.iterator + gIds[s], cutlass.Int32(1))
+                e, live = _live_expert(gIds[s], E)
+                p = cute.arch.atomic_add(cnt.iterator + e, cutlass.Int32(1))
                 gStok[p] = s // TOPK
-                gSwt[p] = gWts[s]
+                gSwt[p] = gWts[s] * live
     else:
         z = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
         for q in cutlass.range_constexpr(4):
@@ -270,6 +272,15 @@ def _shifts(tpr):
     return [1 << i for i in range(tpr.bit_length() - 1)]
 
 
+def _live_expert(e, E):
+    # a routing slot whose id is outside [0, E) (padding / non-local slot) reads expert 0
+    # under a zero router weight, so tile schedules and completion counters are unchanged
+    ec = cutlass.min(cutlass.max(e, cutlass.Int32(0)), cutlass.Int32(E - 1))
+    d = e - ec
+    dead = cutlass.min(cutlass.max(d, cutlass.Int32(0) - d), cutlass.Int32(1))
+    return ec, (cutlass.Int32(1) - dead).to(cutlass.Float32)
+
+
 # ======================================================================================
 # GEMM 1 : h[slot, 0:N13] = x @ W13[e].T in FP32.
 # ======================================================================================
@@ -298,6 +309,7 @@ def k_gemm1(
     TNR: cutlass.Constexpr,
     NOROUTE: cutlass.Constexpr,
     TOPK: cutlass.Constexpr,
+    E: cutlass.Constexpr,
     S: cutlass.Constexpr,
     GX: cutlass.Constexpr,
     GY: cutlass.Constexpr,
@@ -327,7 +339,7 @@ def k_gemm1(
         MG = max(1, BM // 8)  # row-group granularity of the partial-block guard
 
         if cutlass.const_expr(NOROUTE):
-            e = gIds[by]
+            e, _ = _live_expert(gIds[by], E)
             m0 = by
             mc = cutlass.Int32(1)
         else:
@@ -548,6 +560,7 @@ def k_gemm2(
     TNR: cutlass.Constexpr,
     NOROUTE: cutlass.Constexpr,
     TOPK: cutlass.Constexpr,
+    E: cutlass.Constexpr,
     S: cutlass.Constexpr,
     AFUSE: cutlass.Constexpr,
     SWIG2: cutlass.Constexpr,
@@ -574,8 +587,9 @@ def k_gemm2(
         NSUB = 128 // TNR
         MG = max(1, BM // 8)
 
+        live = cutlass.Float32(1.0)
         if cutlass.const_expr(NOROUTE):
-            e = gIds[by]
+            e, live = _live_expert(gIds[by], E)
             m0 = by
             mc = cutlass.Int32(1)
         else:
@@ -740,7 +754,7 @@ def k_gemm2(
                         if cutlass.const_expr(NOROUTE):
                             cute.arch.atomic_add(
                                 gOF.iterator + ((by // TOPK) * H + n),
-                                acc[m] * gs * gWts[by],
+                                acc[m] * gs * (gWts[by] * live),
                             )
                         else:
                             cute.arch.atomic_add(
@@ -816,6 +830,7 @@ def k_fused(
     H: cutlass.Constexpr,
     I: cutlass.Constexpr,
     N13: cutlass.Constexpr,
+    E: cutlass.Constexpr,
     SWIGLU: cutlass.Constexpr,
     CP13: cutlass.Constexpr,
     NSF13: cutlass.Constexpr,
@@ -919,7 +934,7 @@ def k_fused(
         bx = r % cutlass.Int32(NT1)
         bz = r // cutlass.Int32(NT1)
         row = by // cutlass.Int32(TOPK)
-        e = gIds[(row, by - row * cutlass.Int32(TOPK))]
+        e, _ = _live_expert(gIds[(row, by - row * cutlass.Int32(TOPK))], E)
         n = (bx // NSUB1) * 128 + (nr1 // TQ1) * 32 + (bx % NSUB1) * TQ1 + (nr1 % TQ1)
         nsafe = cutlass.min(n, cutlass.Int32(N13 - 1))
         acc = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Float32)
@@ -1055,7 +1070,7 @@ def k_fused(
         bz = r // cutlass.Int32(NT2)
         tok = by // cutlass.Int32(TOPK)
         ksl = by - tok * cutlass.Int32(TOPK)
-        e = gIds[(tok, ksl)]
+        e, live2 = _live_expert(gIds[(tok, ksl)], E)
         n = (bx // NSUB2) * 128 + (nr2 // TQ2) * 32 + (bx % NSUB2) * TQ2 + (nr2 % TQ2)
         nsafe = cutlass.min(n, cutlass.Int32(H - 1))
         acc2 = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Float32)
@@ -1177,7 +1192,7 @@ def k_fused(
             if n < H:
                 cute.arch.atomic_add(
                     gOF.iterator + (tok * cutlass.Int32(H) + n),
-                    acc2[0] * gs2 * gWts[(tok, ksl)],
+                    acc2[0] * gs2 * (gWts[(tok, ksl)] * live2),
                 )
         cute.arch.barrier()
         if tid == 0:
@@ -1253,6 +1268,7 @@ def moe_jitA(
     H: cutlass.Constexpr,
     I: cutlass.Constexpr,
     N13: cutlass.Constexpr,
+    E: cutlass.Constexpr,
     SWIGLU: cutlass.Constexpr,
     CP13: cutlass.Constexpr,
     NSF13: cutlass.Constexpr,
@@ -1300,6 +1316,7 @@ def moe_jitA(
         H,
         I,
         N13,
+        E,
         SWIGLU,
         CP13,
         NSF13,
@@ -1422,6 +1439,7 @@ def moe_jit(
         TN1,
         NOROUTE,
         TOPK,
+        E,
         S,
         BMAX,
         NT13,
@@ -1462,6 +1480,7 @@ def moe_jit(
         TN2,
         NOROUTE,
         TOPK,
+        E,
         S,
         AFUSE,
         SWIGLU,
@@ -1623,6 +1642,7 @@ def _persistent_plan(T, H, I, N13, TOPK, S, dev, w13_sf, w2_sf):
         H=H,
         I=I,
         N13=N13,
+        E=w13_sf.shape[0],
         SWIGLU=N13 == 2 * I,
         CP13=w13_sf.shape[2],
         NSF13=w13_sf.shape[1] * w13_sf.shape[2],
@@ -1724,7 +1744,8 @@ def run_moe_w4a16(
 
     Args:
         hidden_states: BF16 ``[T, H]``.
-        topk_ids: int32 ``[T, TOPK]`` expert ids.
+        topk_ids: int32 ``[T, TOPK]`` expert ids; slots with an id outside
+            ``[0, E)`` contribute nothing.
         topk_weights: FP32 ``[T, TOPK]`` router weights.
         w13: uint8 ``[E, N13, H/2]``; ``N13 == 2*I`` is SwiGLU with gate rows
             first, ``N13 == I`` is ReLU2.
