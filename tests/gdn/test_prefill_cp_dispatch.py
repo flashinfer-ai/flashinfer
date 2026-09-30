@@ -268,15 +268,15 @@ def test_the_private_maximum_does_not_change_dispatch_above_sm80(monkeypatch):
     which is the regression this file was written for.
     """
     for arch in (9, 10, 12):
-        base = _dispatch(monkeypatch, arch=arch, **_inputs([4096], 1))
-        for mx in (None, 1, 4096):
+        base = _dispatch(monkeypatch, arch=arch, **_inputs([2048, 2048], 1))
+        for mx in (None, 2048, 4096):
             got = _dispatch(
-                monkeypatch, arch=arch, _max_seq_len=mx, **_inputs([4096], 1)
+                monkeypatch, arch=arch, _max_seq_len=mx, **_inputs([2048, 2048], 1)
             )
             assert got == base, f"arch {arch}, _max_seq_len={mx}"
 
 
-@pytest.mark.parametrize("bad", [0, -1, 4097, 1.0, True, "4096"])
+@pytest.mark.parametrize("bad", [0, -1, 4095, 4097, 1.0, True, "4096"])
 def test_the_private_maximum_is_validated(bad):
     """A value below the real maximum under-sizes indexing, so it is checked."""
     call = _inputs([4096], 1)
@@ -284,9 +284,37 @@ def test_the_private_maximum_is_validated(bad):
         gp.chunk_gated_delta_rule(_max_seq_len=bad, **call)
 
 
-@pytest.mark.parametrize("mx", [1, 4096])
+@pytest.mark.parametrize("use_cp", ["auto", True])
+def test_sm80_cp_launch_is_sized_by_the_private_maximum(monkeypatch, use_cp):
+    """The rule picks CP from `_max_seq_len`, so the launch must use it too.
+
+    With no public `max_seqlen` the wrapper would otherwise size the grids
+    from the packed length: 8193 here, where the long sequence needs 8192.
+    """
+    seen: dict = {}
+    call = _inputs([8192, 1], 1)
+    got = _dispatch(
+        monkeypatch,
+        arch=8,
+        kwargs_out=seen,
+        use_cp=use_cp,
+        _max_seq_len=8192,
+        **call,
+    )
+    assert got == "cp_delta_rule_dsl_sm80"
+    assert seen["max_seqlen"] == 8192
+
+
+def test_a_public_maximum_below_the_private_one_is_rejected():
+    """The two maxima describe one batch; a contradiction is an error."""
+    call = _inputs([8192, 1], 1)
+    with pytest.raises(ValueError, match="_max_seq_len"):
+        gp.chunk_gated_delta_rule(max_seqlen=4097, _max_seq_len=8192, **call)
+
+
+@pytest.mark.parametrize("mx", [2048, 4096])
 def test_the_private_maximum_accepts_the_edges(monkeypatch, mx):
-    """1 and `total_seq_len` are both legal, and neither reaches a kernel.
+    """The batch mean and `total_seq_len` are both legal; neither reaches a kernel.
 
     This used to call the public entry with nothing mocked and assert the
     output's shape, which reached the real architecture-specific entry and
@@ -295,7 +323,7 @@ def test_the_private_maximum_accepts_the_edges(monkeypatch, mx):
     `NotImplementedError` rather than skipping on an architecture with no GDN
     prefill kernel.
     """
-    call = _inputs([4096], 1)
+    call = _inputs([2048, 2048], 1)
     got = _dispatch(monkeypatch, arch=8, _max_seq_len=mx, use_cp=False, **call)
     assert got == "chunk_gated_delta_rule_sm80"
 

@@ -987,6 +987,56 @@ def test_cp_delta_rule_public_wrapper_matches_non_cp_prefill(
 
 
 @torch.inference_mode()
+@pytest.mark.parametrize("seq_lens", [[8192, 1], [1, 8192]])
+def test_cp_delta_rule_public_wrapper_sizes_the_launch_by_the_private_maximum(
+    qkv_factory,
+    seq_lens,
+    seed=int(os.environ.get("SEED", "0")),
+):
+    """Only `_max_seq_len` is given, and the batch is far from balanced.
+
+    The launch is sized from `_max_seq_len`, 8192 here, rather than the
+    packed length. A launch below the long sequence has no blocks for its
+    tail, so its output and final state would go missing rather than out of
+    tolerance.
+    """
+    _skip_if_cp_unsupported("cp_delta_rule_prefill_dsl")
+    _seed_all(seed)
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    head_size = 128
+    num_heads = 1
+    total_seqlen = sum(seq_lens)
+    cu_seqlens = _make_cu_seqlens(seq_lens, device)
+
+    with torch.device(device):
+        q, k, v = qkv_factory(
+            seq_lens, num_heads, num_heads, num_heads, head_size, dtype=dtype
+        )
+    q = q.contiguous()
+    k = torch.nn.functional.normalize(k.float(), p=2.0, dim=-1).to(dtype).contiguous()
+    v = v.contiguous()
+    alpha = _make_gates(total_seqlen, num_heads, 0.99, device)
+    beta = _make_gates(total_seqlen, num_heads, 0.99, device)
+
+    kwargs = dict(
+        initial_state=None,
+        output_final_state=True,
+        cu_seqlens=cu_seqlens,
+    )
+    our_o, our_state = chunk_gated_delta_rule(
+        q, k, v, alpha, beta, 1.0, use_cp=True, _max_seq_len=max(seq_lens), **kwargs
+    )
+    ref_o, ref_state = chunk_gated_delta_rule(
+        q, k, v, alpha, beta, 1.0, use_cp=False, **kwargs
+    )
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(our_o, ref_o, atol=4e-2, rtol=4e-2)
+    torch.testing.assert_close(our_state, ref_state, atol=4e-2, rtol=4e-2)
+
+
+@torch.inference_mode()
 @pytest.mark.parametrize("state_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("seq_lens", [[128], [256, 64]])
 def test_cp_delta_rule_external_state_dtype(

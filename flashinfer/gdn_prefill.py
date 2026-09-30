@@ -590,8 +590,6 @@ def _cp_delta_rule_rejection_reason(
     message about the thing the caller is most likely to fix.
     """
     if arch_major == 8:
-        # Reachable only with `use_cp=True`. The heuristic that picks CP on its
-        # own still lists 9, 10 and 12, so nothing dispatches here by itself.
         if cp_delta_rule_dsl_sm80 is None:
             return "CP delta rule SM8x DSL kernel is unavailable"
     elif arch_major == 9:
@@ -809,21 +807,22 @@ def chunk_gated_delta_rule(
         Safe upper bound on the maximum logical sequence length, no larger
         than ``total_seq_len``. CP kernels use this host-side hint to
         bound their per-sequence launch grids without reading ``cu_seqlens``
-        back from the GPU. When omitted, CP uses ``total_seq_len``, which is
-        correct for any batch; passing the exact maximum of a batched call
-        lets CP launch smaller grids.
+        back from the GPU. When omitted, CP uses ``_max_seq_len`` if that is
+        given and ``total_seq_len`` otherwise, both correct for any batch;
+        passing the exact maximum of a batched call lets CP launch smaller
+        grids.
 
     _max_seq_len : int, optional
         The longest sequence in this batch, from the caller's host-side data.
-        Internal, and not a performance hint: it sizes ``max_t_blocks_per_seq``
-        and ``max_cp_chunks_per_seq``, and the SM8x dispatch rules read it, so a
-        value below the real maximum under-sizes per-sequence indexing. Caller
-        precondition: if given it must equal ``max(seq_lens)`` for this batch.
-        Only type and range are checked -- verifying the value would need a
-        device synchronization, which is the cost this argument exists to
-        avoid. ``None`` (default) means the SM8x rules that need an exact
-        maximum decline, and ``total_seq_len`` is used where a safe
-        over-estimate is enough.
+        Internal, and not a performance hint: the SM8x dispatch rules read it,
+        and when ``max_seqlen`` is omitted it sizes the CP launch grids in its
+        place, so a value below the real maximum under-sizes per-sequence
+        indexing. Caller precondition: if given it must equal
+        ``max(seq_lens)`` for this batch, and a ``max_seqlen`` smaller than it
+        is rejected. Only type and range are checked -- verifying the value
+        would need a device synchronization, which is the cost this argument
+        exists to avoid. ``None`` (default) means the SM8x rules that need an
+        exact maximum decline.
 
     Returns
     -------
@@ -906,21 +905,7 @@ def chunk_gated_delta_rule(
     total_seq_len = q.size(0)
     if num_seqs <= 0:
         raise ValueError("cu_seqlens must contain at least two entries")
-    # Without a hint, only the packed length is a bound that holds for
-    # every batch; a smaller one leaves the tail of the longest sequence
-    # unprocessed.
-    cp_max_seqlen = max_seqlen if max_seqlen is not None else total_seq_len
-    if type(cp_max_seqlen) is not int or cp_max_seqlen < 0:
-        raise ValueError("max_seqlen must be a nonnegative integer")
-    if total_seq_len and cp_max_seqlen == 0:
-        raise ValueError("max_seqlen must be positive when q is nonempty")
     minimum_cp_max_seqlen = (total_seq_len + num_seqs - 1) // num_seqs
-    if cp_max_seqlen < minimum_cp_max_seqlen:
-        raise ValueError(
-            "max_seqlen cannot be smaller than ceil(total_seq_len / num_seqs)"
-        )
-    if cp_max_seqlen > total_seq_len:
-        raise ValueError("max_seqlen cannot exceed total_seq_len")
     if _max_seq_len is not None:
         # Type and range sanity, nothing more.  Correctness rests entirely
         # on the caller precondition: a positive value below the real maximum
@@ -928,16 +913,43 @@ def chunk_gated_delta_rule(
         # `max_cp_chunks_per_seq`.  Catching that would mean reading
         # `cu_seqlens`, which is a device tensor, and the point of taking this
         # argument is to avoid that synchronisation.  What the bounds do catch
-        # is a value that cannot be a sequence length in this batch at all.
+        # is a value that cannot be the longest sequence in this batch at all.
         if not isinstance(_max_seq_len, int) or isinstance(_max_seq_len, bool):
             raise ValueError(
                 f"_max_seq_len must be an int, got {type(_max_seq_len).__name__}"
             )
-        if not 1 <= _max_seq_len <= total_seq_len:
+        minimum_max_seq_len = max(1, minimum_cp_max_seqlen)
+        if not minimum_max_seq_len <= _max_seq_len <= total_seq_len:
             raise ValueError(
-                f"_max_seq_len must be in [1, total_seq_len={total_seq_len}], "
-                f"got {_max_seq_len}"
+                f"_max_seq_len must be in [{minimum_max_seq_len}, "
+                f"total_seq_len={total_seq_len}], got {_max_seq_len}"
             )
+    # The SM8x rule selects CP from `_max_seq_len`, so the grids are sized
+    # from it too when no hint is given. Without either, only the packed
+    # length is a bound that holds for every batch; a smaller one leaves the
+    # tail of the longest sequence unprocessed.
+    cp_max_seqlen = (
+        max_seqlen
+        if max_seqlen is not None
+        else _max_seq_len
+        if _max_seq_len is not None
+        else total_seq_len
+    )
+    if type(cp_max_seqlen) is not int or cp_max_seqlen < 0:
+        raise ValueError("max_seqlen must be a nonnegative integer")
+    if total_seq_len and cp_max_seqlen == 0:
+        raise ValueError("max_seqlen must be positive when q is nonempty")
+    if cp_max_seqlen < minimum_cp_max_seqlen:
+        raise ValueError(
+            "max_seqlen cannot be smaller than ceil(total_seq_len / num_seqs)"
+        )
+    if cp_max_seqlen > total_seq_len:
+        raise ValueError("max_seqlen cannot exceed total_seq_len")
+    if _max_seq_len is not None and cp_max_seqlen < _max_seq_len:
+        raise ValueError(
+            f"max_seqlen={cp_max_seqlen} cannot be smaller than "
+            f"_max_seq_len={_max_seq_len}, the longest sequence in the batch"
+        )
     num_q_heads = q.size(1)
     num_v_heads = v.size(1)
     head_size = q.size(2)
@@ -1050,10 +1062,10 @@ def chunk_gated_delta_rule(
             device_capability=_device_capability,
         )
     ) or should_use_cp_sm80_host(
-        # The exact longest sequence, or nothing. `total_seq_len` is what the
-        # chunk chooser falls back to and it is a safe over-estimate there;
-        # here it would select CP for multi-sequence batches whose real maximum
-        # is short, which is where CP loses. So an unknown maximum means fused.
+        # The exact longest sequence, or nothing. `cp_max_seqlen` can be a
+        # caller's upper bound or the packed length, and either would
+        # select CP for multi-sequence batches whose real maximum is short,
+        # which is where CP loses. So an unknown maximum means fused.
         _max_seq_len,
         _parallel_work,
         _device_capability,
