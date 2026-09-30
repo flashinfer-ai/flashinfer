@@ -1759,6 +1759,21 @@ def _assert_case_correct(output, case):
             f"match ratio {match_ratio} is below {threshold}"
         )
         return
+    elif (
+        case.q.dtype == _FP8
+        and case.k_cache.dtype == torch.uint8
+        and case.output_dtype == torch.bfloat16
+    ):
+        # FP8-Q quantizes softmax probabilities to E4M3 before BMM2. Validate
+        # the native BF16 epilogue against that modeled stream with a
+        # ratio-style oracle that permits a small number of long-KV outliers.
+        close = torch.isclose(actual, expected, rtol=1e-2, atol=3.125e-2)
+        match_ratio = close.float().mean()
+        threshold = 0.999
+        assert match_ratio > threshold, (
+            f"match ratio {match_ratio} is below {threshold}"
+        )
+        return
     elif case.output_dtype == _FP8:
         rtol, atol = 5e-2, 2e-3
     elif case.q.dtype == _FP8:
@@ -4192,6 +4207,7 @@ def test_attention_ts_decode_nvfp4_defaults_to_transformed_tmem(
         (torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16),
         (torch.bfloat16, torch.uint8, torch.bfloat16),
         (torch.float8_e4m3fn, torch.uint8, torch.float8_e4m3fn),
+        (torch.float8_e4m3fn, torch.uint8, torch.bfloat16),
     ),
 )
 def test_attention_ts_mixed_dtype_contract(q_dtype, kv_dtype, output_dtype):

@@ -683,8 +683,6 @@ def _validate_dtype_pair(
     k_dtype: torch.dtype,
     v_dtype: torch.dtype,
     output_dtype: torch.dtype,
-    *,
-    allow_fp8_bf16_output: bool = False,
 ) -> None:
     _dtype_key(q_dtype)
     _dtype_key(k_dtype)
@@ -712,23 +710,14 @@ def _validate_dtype_pair(
             q_dtype == torch.float8_e4m3fn
             and matching_kv
             and k_dtype in (torch.float8_e4m3fn, torch.uint8)
-            and output_dtype
-            in (
-                (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
-                if allow_fp8_bf16_output
-                else (torch.float16, torch.float8_e4m3fn)
-            )
+            and output_dtype in (torch.float16, torch.bfloat16, torch.float8_e4m3fn)
         )
     )
     if not supported:
         raise NotImplementedError(
             "attention-ts decode supports FP16->FP16, BF16->BF16, "
-            + (
-                "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; "
-                if allow_fp8_bf16_output
-                else "FP8-E4M3->FP16, and FP8-E4M3->FP8-E4M3; "
-            )
-            + "BF16 Q + FP8 K/V, BF16/FP8-E4M3 Q + NVFP4 K/V, "
+            "FP8-E4M3->FP16/BF16, and FP8-E4M3->FP8-E4M3; "
+            "BF16 Q + FP8 K/V, BF16/FP8-E4M3 Q + NVFP4 K/V, "
             + "and BF16 Q/K + FP8 V; got "
             + f"Q_{q_dtype}_K_{k_dtype}_V_{v_dtype}->{output_dtype}"
         )
@@ -3428,13 +3417,7 @@ def _prepare_prims_ts_batch_decode_plan(
         output_dtype = out.dtype if out is not None else query.dtype
     elif not isinstance(output_dtype, torch.dtype):
         raise TypeError("out_dtype must be a torch.dtype")
-    _validate_dtype_pair(
-        query.dtype,
-        k_cache.dtype,
-        v_cache.dtype,
-        output_dtype,
-        allow_fp8_bf16_output=use_q_token_kv_block_sparse_route,
-    )
+    _validate_dtype_pair(query.dtype, k_cache.dtype, v_cache.dtype, output_dtype)
     k_sf_cache, v_sf_cache = _normalize_paged_kv_scale_factors(
         kv_scale_factors,
         k_cache=k_cache,
