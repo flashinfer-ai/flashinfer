@@ -149,30 +149,22 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
     }
     asm volatile("cp.async.commit_group;");
   }
+  int route_parity = 0;
+  unsigned int route_old[4];
+  unsigned int route_base[4];
   if (route_build != 0) {
     if (blockIdx.y == 0) {
       if (tid == 0) {
-        int route_parity = (int)(route_index_raw[0] & 1);
-        if (blockIdx.x == 0) {
-          *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) + 1) +
-            (0)) = (unsigned int)route_parity;
-        }
+        route_parity = (int)(route_index_raw[0] & 1);
 #pragma unroll
         for (int pp_2 = 0; pp_2 < 4; pp_2++) {
           if (valid[pp_2] != 0) {
             int route_token = (int)tokens[pp_2];
-            unsigned int route_base =
-                route_index_raw[4 + num_tokens + route_parity * num_tokens + route_token];
             unsigned int _atomic_old_0 =
                 atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[4 + route_token], 1);
-            unsigned int route_old = _atomic_old_0;
-            unsigned int route_slot = route_old - route_base;
-            if (route_slot < 16) {
-              *(reinterpret_cast<unsigned int*>(
-                    reinterpret_cast<unsigned int*>(route_index_raw) +
-                    (4 + 3 * num_tokens + route_token * 16 + (int)route_slot)) +
-                (0)) = (unsigned int)(pair_block * 4 + pp_2);
-            }
+            route_old[pp_2] = _atomic_old_0;
+            route_base[pp_2] =
+                route_index_raw[4 + num_tokens + route_parity * num_tokens + route_token];
           }
         }
       }
@@ -318,6 +310,29 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
       }
     }
   }
+  if (route_build != 0) {
+    if (blockIdx.y == 0) {
+      if (tid == 0) {
+        if (blockIdx.x == 0) {
+          *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) + 1) +
+            (0)) = (unsigned int)route_parity;
+        }
+#pragma unroll
+        for (int pp_5 = 0; pp_5 < 4; pp_5++) {
+          if (valid[pp_5] != 0) {
+            int publish_token = (int)tokens[pp_5];
+            unsigned int route_slot = route_old[pp_5] - route_base[pp_5];
+            if (route_slot < 16) {
+              *(reinterpret_cast<unsigned int*>(
+                    reinterpret_cast<unsigned int*>(route_index_raw) +
+                    (4 + 3 * num_tokens + publish_token * 16 + (int)route_slot)) +
+                (0)) = (unsigned int)(pair_block * 4 + pp_5);
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 }  // extern "C"
@@ -439,30 +454,22 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
     }
     asm volatile("cp.async.commit_group;");
   }
+  int route_parity = 0;
+  unsigned int route_old[1];
+  unsigned int route_base[1];
   if (route_build != 0) {
     if (blockIdx.y == 0) {
       if (tid == 0) {
-        int route_parity = (int)(route_index_raw[0] & 1);
-        if (blockIdx.x == 0) {
-          *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) + 1) +
-            (0)) = (unsigned int)route_parity;
-        }
+        route_parity = (int)(route_index_raw[0] & 1);
 #pragma unroll
         for (int pp_2 = 0; pp_2 < 1; pp_2++) {
           if (valid[pp_2] != 0) {
             int route_token = (int)tokens[pp_2];
-            unsigned int route_base =
-                route_index_raw[4 + num_tokens + route_parity * num_tokens + route_token];
             unsigned int _atomic_old_0 =
                 atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[4 + route_token], 1);
-            unsigned int route_old = _atomic_old_0;
-            unsigned int route_slot = route_old - route_base;
-            if (route_slot < 16) {
-              *(reinterpret_cast<unsigned int*>(
-                    reinterpret_cast<unsigned int*>(route_index_raw) +
-                    (4 + 3 * num_tokens + route_token * 16 + (int)route_slot)) +
-                (0)) = (unsigned int)(pair_block + pp_2);
-            }
+            route_old[pp_2] = _atomic_old_0;
+            route_base[pp_2] =
+                route_index_raw[4 + num_tokens + route_parity * num_tokens + route_token];
           }
         }
       }
@@ -608,6 +615,29 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_bf16
       }
     }
   }
+  if (route_build != 0) {
+    if (blockIdx.y == 0) {
+      if (tid == 0) {
+        if (blockIdx.x == 0) {
+          *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) + 1) +
+            (0)) = (unsigned int)route_parity;
+        }
+#pragma unroll
+        for (int pp_5 = 0; pp_5 < 1; pp_5++) {
+          if (valid[pp_5] != 0) {
+            int publish_token = (int)tokens[pp_5];
+            unsigned int route_slot = route_old[pp_5] - route_base[pp_5];
+            if (route_slot < 16) {
+              *(reinterpret_cast<unsigned int*>(
+                    reinterpret_cast<unsigned int*>(route_index_raw) +
+                    (4 + 3 * num_tokens + publish_token * 16 + (int)route_slot)) +
+                (0)) = (unsigned int)(pair_block + pp_5);
+            }
+          }
+        }
+      }
+    }
+  }
 }
 
 }  // extern "C"
@@ -674,18 +704,15 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
   unsigned int activation_carriers[4];
   float activation_values[8];
   if (token < num_tokens) {
+    int advance_parity = 0;
+    unsigned int advance_count = 0;
+    unsigned int advance_launch = 0;
     if (route_advance != 0) {
       if (blockIdx.y == 0) {
         if (tid == 0) {
-          int advance_parity = (int)route_index_raw[1];
-          *(reinterpret_cast<unsigned int*>(
-                reinterpret_cast<unsigned int*>(route_index_raw) +
-                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
-            (0)) = route_index_raw[4 + token];
-          if (token == 0) {
-            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
-              (0)) = route_index_raw[0] + 1;
-          }
+          advance_parity = (int)route_index_raw[1];
+          advance_count = route_index_raw[4 + token];
+          advance_launch = route_index_raw[0];
         }
       }
     }
@@ -893,6 +920,20 @@ __global__ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_token
       *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
         (0)) = 0.0f;
     }
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          *(reinterpret_cast<unsigned int*>(
+                reinterpret_cast<unsigned int*>(route_index_raw) +
+                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
+            (0)) = advance_count;
+          if (token == 0) {
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
+              (0)) = advance_launch + 1;
+          }
+        }
+      }
+    }
   }
 }
 
@@ -957,18 +998,15 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
   unsigned int activation_carriers[4];
   float activation_values[8];
   if (token < num_tokens) {
+    int advance_parity = 0;
+    unsigned int advance_count = 0;
+    unsigned int advance_launch = 0;
     if (route_advance != 0) {
       if (blockIdx.y == 0) {
         if (tid == 0) {
-          int advance_parity = (int)route_index_raw[1];
-          *(reinterpret_cast<unsigned int*>(
-                reinterpret_cast<unsigned int*>(route_index_raw) +
-                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
-            (0)) = route_index_raw[4 + token];
-          if (token == 0) {
-            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
-              (0)) = route_index_raw[0] + 1;
-          }
+          advance_parity = (int)route_index_raw[1];
+          advance_count = route_index_raw[4 + token];
+          advance_launch = route_index_raw[0];
         }
       }
     }
@@ -1172,6 +1210,20 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_toke
           (0)) = 0.0f;
       }
     }
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          *(reinterpret_cast<unsigned int*>(
+                reinterpret_cast<unsigned int*>(route_index_raw) +
+                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
+            (0)) = advance_count;
+          if (token == 0) {
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
+              (0)) = advance_launch + 1;
+          }
+        }
+      }
+    }
   }
 }
 
@@ -1238,18 +1290,15 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
   unsigned int activation_carriers[4];
   float activation_values[8];
   if (token < num_tokens) {
+    int advance_parity = 0;
+    unsigned int advance_count = 0;
+    unsigned int advance_launch = 0;
     if (route_advance != 0) {
       if (blockIdx.y == 0) {
         if (tid == 0) {
-          int advance_parity = (int)route_index_raw[1];
-          *(reinterpret_cast<unsigned int*>(
-                reinterpret_cast<unsigned int*>(route_index_raw) +
-                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
-            (0)) = route_index_raw[4 + token];
-          if (token == 0) {
-            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
-              (0)) = route_index_raw[0] + 1;
-          }
+          advance_parity = (int)route_index_raw[1];
+          advance_count = route_index_raw[4 + token];
+          advance_launch = route_index_raw[0];
         }
       }
     }
@@ -1560,6 +1609,20 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_token_dual_col_
         *(reinterpret_cast<float*>(y_accum +
                                    (token * output_stride + output_offset + output_col1)) +
           (0)) = 0.0f;
+      }
+    }
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          *(reinterpret_cast<unsigned int*>(
+                reinterpret_cast<unsigned int*>(route_index_raw) +
+                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
+            (0)) = advance_count;
+          if (token == 0) {
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
+              (0)) = advance_launch + 1;
+          }
+        }
       }
     }
   }
