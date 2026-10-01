@@ -511,12 +511,19 @@ def _rule_of(plan, sm_count):
     )
 
 
-def _assert_mirrors_cake(plan, cake_template, where):
-    """The plan is the Cake launcher's plan when that instance is a generated program; otherwise (the batched
-    small-M swap on a tiny T outside the export contract, or a measured rule whose template exists only for
-    the contract's T -- both of which the Cake host JIT-compiles) the FlashInfer planner must have fallen
-    back (swap and / or rule dropped) onto a generated program."""
-    if cake_template in EXPORTED_TEMPLATES:
+def _registered(arch):
+    """The K1 templates that are generated programs of ``arch`` in this tree (the export registers per architecture)."""
+    return frozenset(t for t in cake_jit.KERNELS.get(arch, {}) if t.startswith("dense_proj_gemm_"))
+
+
+def _assert_mirrors_cake(plan, cake_template, where, arch):
+    """The plan is the Cake launcher's plan when that instance is a generated program of ``arch``; otherwise (the
+    batched small-M swap on a tiny T outside the export contract, a measured rule whose template exists only for
+    the contract's T, or a default tail-T instance no contract row of this architecture produced -- all of which
+    the Cake host JIT-compiles) the FlashInfer planner must have fallen back onto a generated program."""
+    registered = _registered(arch)
+    assert registered <= EXPORTED_TEMPLATES, (arch, sorted(registered - EXPORTED_TEMPLATES))
+    if cake_template in registered:
         assert plan.template == cake_template, (*where, plan.template)
         assert not (plan.swap_fallback or plan.rule_fallback or plan.knob_fallback), where
     else:
@@ -525,7 +532,7 @@ def _assert_mirrors_cake(plan, cake_template, where):
             cake_template,
             plan.template,
         )
-        assert plan.template in EXPORTED_TEMPLATES, (*where, cake_template, plan.template)
+        assert plan.template in registered, (*where, cake_template, plan.template)
 
 
 def _device_supported() -> bool:
@@ -950,6 +957,7 @@ def test_stream_k_plan_rules(pairs):
 
 
 def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
+    # pure planner mirror (_fallback=False): synthetic shapes may name instances the export never generated
     # the 24-tile swapped weight gradient (indexer_hw, T = 1001): one partial wave, K = 16 steps -> split
     v = _views("proj", "indexer_hw", "wgrad", "bf16", 1001)
     plan, *_ = plan_dense_projection_gemm(
@@ -957,7 +965,7 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
         v["B"],
         v["out"],
         sm_count=148,
-        l2_bytes=L2_BYTES,
+        l2_bytes=L2_BYTES, _fallback=False,
         transposed_out=v["transposed"],
     )
     assert (plan.pair_tiles, plan.k_blocks) == (24, 16)
@@ -975,7 +983,7 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
         v["B"],
         v["out"],
         sm_count=148,
-        l2_bytes=L2_BYTES,
+        l2_bytes=L2_BYTES, _fallback=False,
         transposed_out=v["transposed"],
         sk=False,
     )
@@ -998,10 +1006,10 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
     assert SK_DUMMY_BASE == 4096
     with pytest.raises(ValueError, match="slice-counter budget"):
         plan_dense_projection_gemm(
-            A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES, sk=True
+            A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES, _fallback=False, sk=True
         )
     plan, *_ = plan_dense_projection_gemm(
-        A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES
+        A, W.t(), out, sm_count=1000, l2_bytes=L2_BYTES, _fallback=False
     )  # auto: 2 * 300 > 500 pairs -> whole tiles
     assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (300, 0, 0)
 
@@ -1105,6 +1113,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     plan,
                     _expected(EXPECTED_TEMPLATES, (row, op, out_dtype), T, sm_count),
                     (row, op, out_dtype, T, sm_count),
+                    ARCH_OF_SM[sm_count],
                 )
                 assert plan.sm_pairs == sm_count // 2
                 assert plan.grid == ((plan.num_full + plan.sk_units) * CTA_GROUP, 1, 1)
@@ -1251,7 +1260,10 @@ def test_mla_rows_plan_as_batched_views(T, sm_count):
             )
             assert plan.L == 64 and out3.shape[0] == 64
             _assert_mirrors_cake(
-                plan, _expected(MLA_TEMPLATES, (row, op), T, sm_count), (row, op, T, sm_count)
+                plan,
+                _expected(MLA_TEMPLATES, (row, op), T, sm_count),
+                (row, op, T, sm_count),
+                ARCH_OF_SM[sm_count],
             )
             # the swapped plans (weight gradients; the tiny-T forward / input gradient) store transposed
             assert plan.transposed_out == plan.template.endswith("_t")
@@ -1287,7 +1299,10 @@ def test_mla_rows_plan_as_batched_views(T, sm_count):
     # A = d_out [H, T, 512] K-major, B = the in_out weight transposed ([H, 512, 192], k contiguous) K-major;
     # K = D_out = 512 <= 1024: TMA-store epilogue
     _assert_mirrors_cake(
-        plan, _expected(MLA_TEMPLATES, ("qabs", "dgrad"), 33, 148), ("qabs", "dgrad", 33, 148)
+        plan,
+        _expected(MLA_TEMPLATES, ("qabs", "dgrad"), 33, 148),
+        ("qabs", "dgrad", 33, 148),
+        "sm_100a",
     )
     assert plan.template.startswith(
         "dense_proj_gemm_kk_n256"
