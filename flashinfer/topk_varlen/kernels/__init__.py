@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""GVR and radix Top-K CuTe DSL kernels for Blackwell (sm_100+)."""
+"""Top-K CuTe DSL kernels: GVR (Blackwell, sm_100+) and the radix / walk-first
+primitives family (Ampere and newer, sm_80+)."""
 
 from .config import GvrTopKConfig, GvrTopKLBConfig
 from .gvr_topk_decode import GvrTopKKernel
 from .gvr_topk_decode_lb import GvrTopKLBKernel, GvrTopKLBPrepareKernel
 from .radix_topk import SinglePassMultiCTARadixTopKKernel
+from .radix_topk_primitives import CoarseHistTopKPrimitivesKernel
 
 __all__ = [
     "GvrTopKConfig",
@@ -25,4 +27,5 @@ __all__ = [
     "GvrTopKLBKernel",
     "GvrTopKLBPrepareKernel",
     "SinglePassMultiCTARadixTopKKernel",
+    "CoarseHistTopKPrimitivesKernel",
 ]
