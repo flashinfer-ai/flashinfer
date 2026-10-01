@@ -432,6 +432,7 @@ sf_tile_k = 64
 schedule_tile_k = 64
 use_tma_store = False
 use_fused_qknorm_rope = False
+separate_qkv_output = False
 # Experimental NVFP4 tile-N=256 layout that ping-pongs two accumulator windows
 # through all 512 TMEM columns and reuses each retired first epilogue subtile for
 # the opposite window's scale factors.
@@ -2286,6 +2287,14 @@ class GmemDResource(MemoryResource):
         num_cols = self.mC_mn.shape[1]
         gC_ptr = self.mC_mn.iterator.raw_ptr()
         row_offset = cutlass.Int64(row) * cutlass.Int64(num_cols)
+        if cutlass.const_expr(separate_qkv_output):
+            group_n = num_cols // 3
+            group = col // group_n
+            row_offset = (
+                cutlass.Int64(group) * cutlass.Int64(num_rows * group_n)
+                + cutlass.Int64(row) * cutlass.Int64(group_n)
+                - cutlass.Int64(group * group_n)
+            )
         bias_ptr = self.bias.iterator.raw_ptr() if self.bias is not None else None
         scale_gate_value = cutlass.Float32(self.scale)
         scale_c_value = cutlass.Float32(self.scale)

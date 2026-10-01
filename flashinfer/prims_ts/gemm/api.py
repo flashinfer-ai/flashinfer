@@ -228,6 +228,11 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
         module.use_per_token_channel_scale = config.operand_format == "fp8_e4m3"
         module.use_gated_activation = config.epilogue == "swiglu"
         module.use_fused_qknorm_rope = config.epilogue == "qkv_qknorm_rope"
+        if config.separate_qkv_output and (
+            config.epilogue != "qkv_qknorm_rope" or config.use_tma_store
+        ):
+            raise ValueError("separate QKV output requires direct QKV epilogue stores")
+        module.separate_qkv_output = config.separate_qkv_output
         module.use_block_major_k = False
         module.use_tma_store = config.use_tma_store
         if config.tmem_overlap and (
@@ -409,6 +414,7 @@ def _compile(
                 f"epiw{field(config.epilogue_warps)}",
                 f"overlap{int(config.tmem_overlap)}",
                 f"tma{int(config.use_tma_store)}",
+                f"splitqkv{int(config.separate_qkv_output)}",
                 f"abs{module.ab_stages}",
                 f"cluster{field(config.cluster_shape)}",
                 config.scheduler,
@@ -931,6 +937,7 @@ def prepare_fp4_qkv_qknorm_rope(
     mma_k: int = 64,
     tile_k: int = 256,
     qkv_scale=None,
+    config=None,
 ) -> PreparedFp4Linear:
     """Prepare a fixed packed-NVFP4 QKV+QKNorm+RoPE projection."""
     if num_q_heads != num_kv_heads:
@@ -950,6 +957,7 @@ def prepare_fp4_qkv_qknorm_rope(
         is_neox=is_neox,
         mma_k=mma_k,
         tile_k=tile_k,
+        config=config,
     )
 
 
