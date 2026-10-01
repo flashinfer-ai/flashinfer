@@ -778,8 +778,8 @@ def sweep(args, file):
             order = ids.flatten().argsort()
             grouped = x[order // topk].contiguous()
             counts = torch.bincount(ids.flatten().long(), minlength=e)
-            offsets = (counts.cumsum(0) - counts).int()
-            offsets_cpu = offsets.tolist() + [rows]
+            offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0))).int()
+            offsets_cpu = offsets.tolist()
             emit(file, dict(kind="inputs", **case, offsets=offsets_cpu))
             mid = torch.empty(rows, i, device=device, dtype=torch.bfloat16)
             down = torch.empty(rows, h, device=device, dtype=torch.bfloat16)
