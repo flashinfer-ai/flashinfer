@@ -577,7 +577,6 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
             "tstore": True,
-            "pf": 1,
         },
         "384,28,256": {"route": "gemm"},
         "386,28,1": {
@@ -1178,7 +1177,6 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "persist": True,
             "resident": False,
             "tstore": True,
-            "pf": 1,
         },
         "384,28,256": {"route": "gemm"},
         "386,28,1": {
