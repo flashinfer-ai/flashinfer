@@ -109,7 +109,7 @@ top of a Mixture-of-Experts layer (shrink + expand).
 
     bgmv_moe
     prepare_bgmv_moe
-    BGMVMoEBlackwellPlan
+    BGMVMoECakePlan
     bgmv_moe_shrink
     bgmv_moe_expand
     bgmv_moe_gemm1_lora_delta
