@@ -113,6 +113,7 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
 
 BLOCK_M = 128  # A rows per MMA instruction per CTA (256 per CTA pair)  [Cake L48]
 BLOCK_K = 64  # K elements per stage (128-byte swizzle rows)  [Cake L54]
+PANEL_BYTES = BLOCK_K * 128  # one MN-major B panel: 64 K rows x 128 B = 8192  [Cake L56]
 CTA_GROUP = 2  # CTAs per cluster / MMA pair  [Cake L55]
 EPI_WARPS = 8  # [Cake L63]
 WORK_STAGES = 4  # cluster-launch-control work-ring depth  [Cake L64]
