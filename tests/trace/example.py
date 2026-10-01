@@ -119,6 +119,8 @@ silu_and_mul_nvfp4_quantize_k16384.json
 top_k_sampling_v128256.json
 top_k_top_p_sampling_v128256.json
 top_k_top_p_sampling_v151936.json
+top_k_varlen_n16384_k512_ps64.json
+top_k_varlen_n8192_k1024_ps1.json
 top_p_sampling_v128256.json
 top_p_sampling_v151936.json
 trtllm_bf16_moe_topk2_e8_h1024_i512.json
@@ -1281,7 +1283,7 @@ _alpha_router_logits = torch.randn(32, 512, dtype=torch.float32, device=device)
 _alpha_router_cc = torch.cuda.get_device_capability(device)
 if (
     _alpha_router_cc in {(10, 0), (10, 3)}
-    and is_sm100a_supported(device)
+    and is_sm100a_supported(torch.device(device))
     and is_cuda_version_at_least("12.9" if _alpha_router_cc == (10, 3) else "12.8")
 ):
     flashinfer.fused_moe.alphamoe_fused_router(
@@ -2169,6 +2171,32 @@ with contextlib.suppress(Exception):
     flashinfer.top_k_mask_logits(_sp_logits, 50)
 with contextlib.suppress(Exception):
     flashinfer.top_k_top_p_sampling_from_logits(_sp_logits, 50, 0.9)
+
+# top_k_varlen: decode-step indexer top-k over varlen rows, unpaged (logical
+# columns) and with the fused paged output (physical KV slots via page_table).
+with contextlib.suppress(Exception):
+    _tv_rows, _tv_n, _tv_k = 16, 8192, 1024
+    _tv_logits = torch.randn(_tv_rows, _tv_n, dtype=torch.float32, device=device)
+    _tv_lens = torch.randint(
+        _tv_k + 1, _tv_n + 1, (_tv_rows,), dtype=torch.int32, device=device
+    )
+    flashinfer.top_k_varlen(_tv_logits, _tv_lens, _tv_k)
+with contextlib.suppress(Exception):
+    _tv_rows, _tv_n, _tv_k, _tv_ps = 16, 16384, 512, 64
+    _tv_logits = torch.randn(_tv_rows, _tv_n, dtype=torch.float32, device=device)
+    _tv_lens = torch.randint(
+        _tv_k + 1, _tv_n + 1, (_tv_rows,), dtype=torch.int32, device=device
+    )
+    _tv_pages = _tv_n // _tv_ps
+    _tv_pt = torch.randperm(_tv_rows * _tv_pages, device=device).to(torch.int32)
+    flashinfer.top_k_varlen(
+        _tv_logits,
+        _tv_lens,
+        _tv_k,
+        backend="walkfirst_primitives",
+        page_table=_tv_pt.view(_tv_rows, _tv_pages),
+        page_size=_tv_ps,
+    )
 
 # chain_speculative_sampling.
 with contextlib.suppress(Exception):
