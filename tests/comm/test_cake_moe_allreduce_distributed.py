@@ -13,20 +13,20 @@ import torch
 import torch.distributed as dist
 
 import flashinfer.comm as comm
-from flashinfer.jit import cake_trtllm_moe_allreduce
 from flashinfer.jit import cake_trtllm_moe_allreduce_union as union
 
 
 HIDDEN_SIZE = 7168
 MAX_TOKEN_NUM = 2048
 ACTIVE_EXPERTS = 8
+_NO_OUTPUT_ROWS = {(1, ACTIVE_EXPERTS), (64, ACTIVE_EXPERTS), (2048, ACTIVE_EXPERTS)}
 _DTYPE_NAME = {torch.float16: "float16", torch.bfloat16: "bfloat16"}
 
 
 def _reduction_rows(
     arch: str | None, world_size: int, dtype: torch.dtype
 ) -> list[tuple[int, int]]:
-    """(token_num, num_experts) rows: the legacy rows plus every reviewed union shape.
+    """(token_num, num_experts) rows: the original rows plus every reviewed union shape.
 
     T=512 with 8 experts is reviewed nowhere, so it reaches the class program
     (``generic`` or ``wide_mlp``) of every (world size, dtype, PDL) class.
@@ -279,7 +279,6 @@ def _reduction_worker(
     ipc_handles = None
     phase_probe_complete = world_size != 8
     try:
-        cake_trtllm_moe_allreduce.load(rank)
         dist.barrier(group=group)
         ipc_handles, workspace_tensor = (
             comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
@@ -357,13 +356,13 @@ def _reduction_worker(
                 * rms_gamma.float()
             ).to(dtype)
 
-            # Without the all-reduce output the call stays on the isolated source
-            # bundle: 64 tokens cover its generic kernels, one token its SM103
-            # single-token kernels.
+            # Calls without the all-reduce output run the same kernels against
+            # the loader-owned scratch tensor; the rows below cover its first
+            # allocation (one token), reuse and growth up to the largest row,
+            # in eager mode and under CUDA-graph capture.
             emit_allreduce_options = (
                 (True, False)
-                if (token_num, active_experts)
-                in ((1, ACTIVE_EXPERTS), (64, ACTIVE_EXPERTS))
+                if (token_num, active_experts) in _NO_OUTPUT_ROWS
                 else (True,)
             )
             for emit_allreduce in emit_allreduce_options:
