@@ -2213,7 +2213,9 @@ def create_softmax_task(
             with the half overlap the leading half is published behind ``pr``, else P goes
             to the TMEM S/P stage."""
             if p_in_smem:
-                p_chunk = sp.exp2_p(
+                # The S stage is released already, so exp2 and the P store are
+                # auxiliary work on the loaded S and the SMEM P tile.
+                p_chunk = sp.exp2_p_smem(
                     row_max=row_max, scale_softmax_log2=scale_softmax_log2
                 )
                 pb.acquire()
@@ -2405,14 +2407,19 @@ def create_softmax_task(
                     sp.release()
                 if s0s1_seq is not None:
                     seq.acquire()
-                p_chunk = sp.masked_exp2_p(
-                    row_max=row_max,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
                 if p_in_smem:
+                    p_chunk = sp.masked_exp2_p_smem(
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                     pb.acquire()
                     sp.store_p()
                     pb.commit()
+                else:
+                    p_chunk = sp.masked_exp2_p(
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 if s0s1_seq is not None:
                     seq.commit()
                 if not p_in_smem:
@@ -2473,14 +2480,19 @@ def create_softmax_task(
                     sp.release()
                 if s0s1_seq is not None:
                     seq.wait()
-                p_chunk = sp.masked_exp2_p(
-                    row_max=row_max,
-                    scale_softmax_log2=scale_softmax_log2,
-                )
                 if p_in_smem:
+                    p_chunk = sp.masked_exp2_p_smem(
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                     pb.acquire()
                     sp.store_p()
                     pb.commit()
+                else:
+                    p_chunk = sp.masked_exp2_p(
+                        row_max=row_max,
+                        scale_softmax_log2=scale_softmax_log2,
+                    )
                 if s0s1_seq is not None:
                     seq.release()
                 if not p_in_smem:

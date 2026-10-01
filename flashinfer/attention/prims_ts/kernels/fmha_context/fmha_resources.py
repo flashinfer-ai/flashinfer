@@ -4031,11 +4031,12 @@ class TmemSPResource(MemoryResource):
         )
         return self._reduce_row_max(s_data, row_max)
 
-    @consumer_work
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY)
     @cute.jit
     def store_p(self, stage_info: StageInfo) -> None:
         """Store the P row from exp2_p into SMEM after the P-tile acquire; the
-        proxy fence orders the stores before the UMMA reads them."""
+        proxy fence orders the stores before the UMMA reads them. Auxiliary work
+        because the S stage is already released and P goes to the SMEM tile."""
         self._store_p_row_smem(stage_info, _tmem_sp_pwords.pop(id(self)))
         prims.fence_proxy(
             kind=prims.Proxy.ASYNC_SHARED,
@@ -4052,6 +4053,20 @@ class TmemSPResource(MemoryResource):
         scale_softmax_log2: SoftmaxScalar,
     ) -> SoftmaxRowSumContribution:
         """Apply exp2 using the runtime scale cached before the K/V loop."""
+        return self._exp2_p_store(
+            self._stage_col_offset(stage_info), row_max, scale_softmax_log2
+        )
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=p_chunk)
+    @cute.jit
+    def exp2_p_smem(
+        self,
+        stage_info: StageInfo,
+        *,
+        row_max: SoftmaxScalar,
+        scale_softmax_log2: SoftmaxScalar,
+    ) -> SoftmaxRowSumContribution:
+        """exp2_p with P in SMEM, run on the loaded S after the stage release."""
         return self._exp2_p_store(
             self._stage_col_offset(stage_info), row_max, scale_softmax_log2
         )
@@ -4262,6 +4277,20 @@ class TmemSPResource(MemoryResource):
         scale_softmax_log2: SoftmaxScalar,
     ) -> SoftmaxRowSumContribution:
         """Tail stage: apply exp2 using the cached runtime softmax scale."""
+        return self._exp2_p_store(
+            self._stage_col_offset(stage_info), row_max, scale_softmax_log2
+        )
+
+    @consumer_work(work_attrs=WorkAttr.AUXILIARY, returns=p_chunk)
+    @cute.jit
+    def masked_exp2_p_smem(
+        self,
+        stage_info: StageInfo,
+        *,
+        row_max: SoftmaxScalar,
+        scale_softmax_log2: SoftmaxScalar,
+    ) -> SoftmaxRowSumContribution:
+        """masked_exp2_p with P in SMEM, after the stage release."""
         return self._exp2_p_store(
             self._stage_col_offset(stage_info), row_max, scale_softmax_log2
         )
