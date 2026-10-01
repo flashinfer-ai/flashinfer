@@ -126,6 +126,20 @@ def parse_sampling_args(line, parser):
         help="Top-K value for top-k sampling.",
     )
     parser.add_argument(
+        "--per_row_top_k",
+        action="store_true",
+        default=False,
+        help="Pass top_k as a per-row tensor (filled with --top_k) instead of a scalar. "
+        "Used by top_k_top_p_sampling_from_probs/logits.",
+    )
+    parser.add_argument(
+        "--max_top_k",
+        type=int,
+        required=False,
+        default=None,
+        help="max_top_k bound passed to top_k_top_p_sampling_from_probs/logits.",
+    )
+    parser.add_argument(
         "--top_p",
         type=float,
         required=False,
@@ -755,6 +769,7 @@ def testTopKTopPSamplingFromProbs(args):
     vocab_size = args.vocab_size
     top_k = args.top_k
     top_p = args.top_p
+    max_top_k = args.max_top_k
     filter_apply_order = args.filter_apply_order
     # Use explicit seed/offset to enable CUDA graph compatibility
     seed = args.random_seed
@@ -766,6 +781,9 @@ def testTopKTopPSamplingFromProbs(args):
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
+
+    if args.per_row_top_k:
+        top_k = torch.full((batch_size,), top_k, dtype=torch.int32, device=device)
 
     ## Prepare input tensors
     pre_norm_prob = torch.rand(batch_size, vocab_size, device=device)
@@ -787,6 +805,7 @@ def testTopKTopPSamplingFromProbs(args):
                 filter_apply_order=filter_apply_order,
                 seed=seed,
                 offset=offset,
+                max_top_k=max_top_k,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -828,9 +847,11 @@ def testTopKTopPSamplingFromProbs(args):
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["vocab_size"] = vocab_size
-                cur_res["top_k"] = top_k
+                cur_res["top_k"] = args.top_k
                 cur_res["top_p"] = top_p
                 cur_res["filter_apply_order"] = filter_apply_order
+                cur_res["per_row_top_k"] = args.per_row_top_k
+                cur_res["max_top_k"] = max_top_k
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
@@ -869,6 +890,7 @@ def testTopKTopPSamplingFromLogits(args):
     vocab_size = args.vocab_size
     top_k = args.top_k
     top_p = args.top_p
+    max_top_k = args.max_top_k
     filter_apply_order = args.filter_apply_order
     # Use explicit seed/offset to enable CUDA graph compatibility
     seed = args.random_seed
@@ -880,6 +902,9 @@ def testTopKTopPSamplingFromLogits(args):
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
+
+    if args.per_row_top_k:
+        top_k = torch.full((batch_size,), top_k, dtype=torch.int32, device=device)
 
     input_dtype = dtype_str_to_torch_dtype(args.input_dtype)
 
@@ -902,6 +927,7 @@ def testTopKTopPSamplingFromLogits(args):
                 filter_apply_order=filter_apply_order,
                 seed=seed,
                 offset=offset,
+                max_top_k=max_top_k,
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
@@ -943,9 +969,11 @@ def testTopKTopPSamplingFromLogits(args):
                 cur_res["tflops"] = tflops
                 cur_res["tb_per_sec"] = tb_per_sec
                 cur_res["vocab_size"] = vocab_size
-                cur_res["top_k"] = top_k
+                cur_res["top_k"] = args.top_k
                 cur_res["top_p"] = top_p
                 cur_res["filter_apply_order"] = filter_apply_order
+                cur_res["per_row_top_k"] = args.per_row_top_k
+                cur_res["max_top_k"] = max_top_k
                 cur_res["backend"] = backend
                 cur_res["case_tag"] = args.case_tag
                 res.append(cur_res)
