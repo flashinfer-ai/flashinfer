@@ -351,15 +351,6 @@ def get_cake_moe_allreduce_module(device_index: int):
     return load(device_index)
 
 
-def register_cake_moe_allreduce_workspace_pointers(
-    workspace_tensor: torch.Tensor, workspace_pointers: List[int]
-) -> None:
-    """Retain the host-known pointer table behind an all-reduce workspace tensor."""
-    from ..jit.cake_trtllm_moe_allreduce_union import register_workspace_pointers
-
-    register_workspace_pointers(workspace_tensor, workspace_pointers)
-
-
 def _cake_moe_allreduce_union_applies(
     *,
     world_size: int,
@@ -631,11 +622,6 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     workspace_tensor = torch.tensor(
         workspace, dtype=torch.int64, device=torch.device("cuda")
     )
-    # The SM100/SM103 Cake MoE all-reduce union route (world sizes 2, 4 and 8) binds
-    # the control and per-rank payload addresses of this table as raw pointers; keep the
-    # host-known values so no launch ever reads the table back from the device.
-    register_cake_moe_allreduce_workspace_pointers(workspace_tensor, workspace)
-
     if use_symm_dev_mem:
         torch.cuda.synchronize()
         comm_backend.barrier()  # must sync after create_workspace
