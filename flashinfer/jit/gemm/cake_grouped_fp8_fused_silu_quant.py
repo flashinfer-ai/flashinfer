@@ -22,15 +22,221 @@ from .. import env as jit_env
 from ..core import JitSpec, gen_jit_spec, sm100a_nvcc_flags
 
 MODULES: dict[str, dict[str, Any]] = {
-    "cake_grouped_fp8_fused_silu_quant_0979ff47de2f0a213b53": {
+    "cake_grouped_fp8_fused_silu_quant_56971d378e3a91c5133b": {
+        "arch": "sm_100a",
+        "route": "fused_cg2_ab7_pairsched_solotail_kg4",
+        "stage": "pair",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_56971d378e3a91c5133b",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_56971d378e3a91c5133b_sm_100a",
+        "sources": [
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_56971d378e3a91c5133b_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_56971d378e3a91c5133b_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            [
+                "tma_buffer",
+                "A",
+            ],
+            [
+                "tma_buffer",
+                "B",
+            ],
+            [
+                "buffer",
+                "out_q",
+            ],
+            [
+                "buffer",
+                "out_s",
+            ],
+            [
+                "buffer",
+                "a_scale",
+            ],
+            [
+                "buffer",
+                "b_scale",
+            ],
+            [
+                "buffer",
+                "m_indices",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "N",
+            ],
+            [
+                "parameter",
+                "K",
+            ],
+            [
+                "parameter",
+                "G",
+            ],
+            [
+                "workspace",
+                "tma_descriptor_workspace",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "tma_workspace_bytes": 256,
+        "pdl": False,
+        "closure_sha256": "d6d1a4cf4fe99dd04c24c04110c0ac0f9fd33864c913f05fd9cbf6b84358dace",
+    },
+    "cake_grouped_fp8_fused_silu_quant_584484a22d5c9ae40cc0": {
+        "arch": "sm_100a",
+        "route": "fused_cg2_ab7_pairsched_solotail_kg4",
+        "stage": "tail",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_584484a22d5c9ae40cc0",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_584484a22d5c9ae40cc0_sm_100a",
+        "sources": [
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_584484a22d5c9ae40cc0_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_584484a22d5c9ae40cc0_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            [
+                "tma_buffer",
+                "A",
+            ],
+            [
+                "tma_buffer",
+                "B",
+            ],
+            [
+                "buffer",
+                "out_q",
+            ],
+            [
+                "buffer",
+                "out_s",
+            ],
+            [
+                "buffer",
+                "a_scale",
+            ],
+            [
+                "buffer",
+                "b_scale",
+            ],
+            [
+                "buffer",
+                "m_indices",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "N",
+            ],
+            [
+                "parameter",
+                "K",
+            ],
+            [
+                "parameter",
+                "G",
+            ],
+            [
+                "workspace",
+                "tma_descriptor_workspace",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "tma_workspace_bytes": 256,
+        "pdl": True,
+        "closure_sha256": "0eb04abe7fac19c00ab7a4b9a16c04d1a507cd8876c739863ff28541b8a16179",
+    },
+    "cake_grouped_fp8_fused_silu_quant_933b2c891934f1c3b281": {
+        "arch": "sm_100a",
+        "route": "gemm_then_silu_mul_group_quant_fp8_wide",
+        "stage": "main",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_933b2c891934f1c3b281",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_933b2c891934f1c3b281_sm_100a",
+        "sources": [
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_933b2c891934f1c3b281_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_933b2c891934f1c3b281_binding.cu",
+        ],
+        "compile_flags": [],
+        "ffi_entry": "run",
+        "arg_plan": [
+            [
+                "buffer",
+                "y",
+            ],
+            [
+                "buffer",
+                "out_q",
+            ],
+            [
+                "buffer",
+                "out_s",
+            ],
+            [
+                "parameter",
+                "M",
+            ],
+            [
+                "parameter",
+                "H",
+            ],
+            [
+                "grid",
+                "grid_x",
+            ],
+            [
+                "grid",
+                "grid_y",
+            ],
+            [
+                "grid",
+                "grid_z",
+            ],
+        ],
+        "tma_workspace_bytes": 0,
+        "pdl": False,
+        "closure_sha256": "d51996ed0c704912c8211b16635e0e681d1b372a8854637be70278b0f2dec0ce",
+    },
+    "cake_grouped_fp8_fused_silu_quant_b3d86b40d8a1d300dbed": {
         "arch": "sm_100a",
         "route": "fused_cg2_ab7_mixedsched_lpt_kg4",
         "stage": "main",
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_0979ff47de2f0a213b53",
-        "cache_name": "cake_grouped_fp8_fused_silu_quant_0979ff47de2f0a213b53_sm_100a",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_b3d86b40d8a1d300dbed",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_b3d86b40d8a1d300dbed_sm_100a",
         "sources": [
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_0979ff47de2f0a213b53_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_0979ff47de2f0a213b53_binding.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_b3d86b40d8a1d300dbed_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_b3d86b40d8a1d300dbed_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -102,17 +308,17 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "tma_workspace_bytes": 384,
         "pdl": False,
-        "closure_sha256": "d09234a0e4fa59fdd2448998f18a9415df636169a489adddaded25b2346fa09b",
+        "closure_sha256": "e8da52a9397a71fe21084dc2f104818eb49d203456394599f79f64c0ee63eb68",
     },
-    "cake_grouped_fp8_fused_silu_quant_83a61feba610b0fc82e6": {
+    "cake_grouped_fp8_fused_silu_quant_daa1f1cbe7d2b1ee1482": {
         "arch": "sm_100a",
         "route": "gemm_then_silu_mul_group_quant_fp8",
         "stage": "main",
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_83a61feba610b0fc82e6",
-        "cache_name": "cake_grouped_fp8_fused_silu_quant_83a61feba610b0fc82e6_sm_100a",
+        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_daa1f1cbe7d2b1ee1482",
+        "cache_name": "cake_grouped_fp8_fused_silu_quant_daa1f1cbe7d2b1ee1482_sm_100a",
         "sources": [
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_83a61feba610b0fc82e6_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_83a61feba610b0fc82e6_binding.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_daa1f1cbe7d2b1ee1482_kernel.cu",
+            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_daa1f1cbe7d2b1ee1482_binding.cu",
         ],
         "compile_flags": [],
         "ffi_entry": "run",
@@ -152,213 +358,7 @@ MODULES: dict[str, dict[str, Any]] = {
         ],
         "tma_workspace_bytes": 0,
         "pdl": False,
-        "closure_sha256": "6be1f67696ceecb891b734103e926f02c2c18f49449df0fab7088b19399558fa",
-    },
-    "cake_grouped_fp8_fused_silu_quant_96b1c66b030aa5102196": {
-        "arch": "sm_100a",
-        "route": "fused_cg2_ab7_pairsched_solotail_kg4",
-        "stage": "pair",
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_96b1c66b030aa5102196",
-        "cache_name": "cake_grouped_fp8_fused_silu_quant_96b1c66b030aa5102196_sm_100a",
-        "sources": [
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_96b1c66b030aa5102196_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_96b1c66b030aa5102196_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            [
-                "tma_buffer",
-                "A",
-            ],
-            [
-                "tma_buffer",
-                "B",
-            ],
-            [
-                "buffer",
-                "out_q",
-            ],
-            [
-                "buffer",
-                "out_s",
-            ],
-            [
-                "buffer",
-                "a_scale",
-            ],
-            [
-                "buffer",
-                "b_scale",
-            ],
-            [
-                "buffer",
-                "m_indices",
-            ],
-            [
-                "parameter",
-                "M",
-            ],
-            [
-                "parameter",
-                "N",
-            ],
-            [
-                "parameter",
-                "K",
-            ],
-            [
-                "parameter",
-                "G",
-            ],
-            [
-                "workspace",
-                "tma_descriptor_workspace",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "tma_workspace_bytes": 256,
-        "pdl": False,
-        "closure_sha256": "f31036da65b828dc0ee8f5e7eaa281054610bbe6eec2665ee22d5e9bb6eec22e",
-    },
-    "cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405": {
-        "arch": "sm_100a",
-        "route": "gemm_then_silu_mul_group_quant_fp8_wide",
-        "stage": "main",
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405",
-        "cache_name": "cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405_sm_100a",
-        "sources": [
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_e23c4e332758f7f5f405_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            [
-                "buffer",
-                "y",
-            ],
-            [
-                "buffer",
-                "out_q",
-            ],
-            [
-                "buffer",
-                "out_s",
-            ],
-            [
-                "parameter",
-                "M",
-            ],
-            [
-                "parameter",
-                "H",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "tma_workspace_bytes": 0,
-        "pdl": False,
-        "closure_sha256": "e4abf5b231526af2adb292b7f7fd499aab210063f816b72146b8c9e4b59bddfe",
-    },
-    "cake_grouped_fp8_fused_silu_quant_ee44e6d5f77cb4105519": {
-        "arch": "sm_100a",
-        "route": "fused_cg2_ab7_pairsched_solotail_kg4",
-        "stage": "tail",
-        "kernel": "kernel_cake_grouped_fp8_fused_silu_quant_ee44e6d5f77cb4105519",
-        "cache_name": "cake_grouped_fp8_fused_silu_quant_ee44e6d5f77cb4105519_sm_100a",
-        "sources": [
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_ee44e6d5f77cb4105519_kernel.cu",
-            "cake_grouped_fp8_fused_silu_quant/sm_100a/cake_grouped_fp8_fused_silu_quant_ee44e6d5f77cb4105519_binding.cu",
-        ],
-        "compile_flags": [],
-        "ffi_entry": "run",
-        "arg_plan": [
-            [
-                "tma_buffer",
-                "A",
-            ],
-            [
-                "tma_buffer",
-                "B",
-            ],
-            [
-                "buffer",
-                "out_q",
-            ],
-            [
-                "buffer",
-                "out_s",
-            ],
-            [
-                "buffer",
-                "a_scale",
-            ],
-            [
-                "buffer",
-                "b_scale",
-            ],
-            [
-                "buffer",
-                "m_indices",
-            ],
-            [
-                "parameter",
-                "M",
-            ],
-            [
-                "parameter",
-                "N",
-            ],
-            [
-                "parameter",
-                "K",
-            ],
-            [
-                "parameter",
-                "G",
-            ],
-            [
-                "workspace",
-                "tma_descriptor_workspace",
-            ],
-            [
-                "grid",
-                "grid_x",
-            ],
-            [
-                "grid",
-                "grid_y",
-            ],
-            [
-                "grid",
-                "grid_z",
-            ],
-        ],
-        "tma_workspace_bytes": 256,
-        "pdl": True,
-        "closure_sha256": "bc5c0c19f99380b8fa9a75a1a6607a7c1e46b379279f562f328347236c2e1da9",
+        "closure_sha256": "f039658adb6391ba79a4983473cdcc99df1c7908d329cefd0fc23125785b262f",
     },
 }
 

@@ -29,6 +29,7 @@ import torch
 
 from ..api_logging import flashinfer_api
 from ..autotuner import AutoTuner
+from ..quantization.nvfp4_quantization_utils import _UNSET
 from ..utils import get_compute_capability
 from .api import (
     BackendOptions,
@@ -58,6 +59,7 @@ from .api import (
     MoEActivationPack,
     MoEConfig,
     MoEWeightPack,
+    PrimsTsConfig,
     SM12xFp8Config,
     SM12xMxfp8Mxfp4Config,
     TrtllmBf16Config,
@@ -90,6 +92,7 @@ from .runners import (
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    PrimsTsRunner,
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
     TrtllmBf16RoutedRunner,
@@ -124,6 +127,7 @@ _RunnerT = Union[
     CuTileNvfp4Bf16Runner,
     CuTileNvfp4Runner,
     CuteDslRunner,
+    PrimsTsRunner,
     SM12xFp8Runner,
     SM12xMxfp8Mxfp4Runner,
     TrtllmFp4RoutedRunner,
@@ -158,6 +162,7 @@ _BACKEND_RUNNERS: Dict[type, Type[_RunnerT]] = {
     CuTileNvfp4Bf16Config: CuTileNvfp4Bf16Runner,
     CuTileNvfp4Config: CuTileNvfp4Runner,
     CuteDslConfig: CuteDslRunner,
+    PrimsTsConfig: PrimsTsRunner,
     SM12xFp8Config: SM12xFp8Runner,
     SM12xMxfp8Mxfp4Config: SM12xMxfp8Mxfp4Runner,
     TrtllmFp4Config: TrtllmFp4RoutedRunner,
@@ -219,6 +224,9 @@ class MoELayer:
 
         # Build one runner per compatible backend
         self.runners: List[_RunnerT] = []
+        # check_support() raises a precise reason; keep it instead of letting
+        # the filter swallow it, or every rejection reads "no usable backend".
+        rejected: List[str] = []
         for backend_cfg in config.backend:
             if not backend_cfg.supported(arch):
                 continue
@@ -238,7 +246,8 @@ class MoELayer:
                 )
                 runner = runner_cls(runner_config, device=self.device)
                 runner.check_support()
-            except (NotImplementedError, ValueError, RuntimeError):
+            except (NotImplementedError, ValueError, RuntimeError) as exc:
+                rejected.append(f"{runner_cls.__name__}: {exc}")
                 continue
             runner.build()
             self.runners.append(runner)
@@ -284,11 +293,32 @@ class MoELayer:
                 f"activation={config.quant.activation.name}, "
                 f"output={config.quant.output.name}."
             )
+            # Name the runners that implement an explicit recipe; the filter
+            # loop swallowed their _check_support() reasons.
+            if config.quant.nvfp4_4over6 is not _UNSET:
+                supporting = ", ".join(
+                    r.__name__
+                    for r in _BACKEND_RUNNERS.values()
+                    if r.supports_nvfp4_4over6
+                )
+                hint += (
+                    f" Note nvfp4_4over6={config.quant.nvfp4_4over6!r}: an "
+                    f"explicit NVFP4 4over6 setting is implemented only by "
+                    f"[{supporting}]; other backends read the "
+                    f"FLASHINFER_NVFP4_4OVER6* environment variables, which "
+                    f"leaving the field unset restores."
+                )
+            # Per-runner reasons last: they are the ground truth.
+            reasons = ""
+            if rejected:
+                reasons = " Backends rejected this configuration: " + "; ".join(
+                    rejected
+                )
             raise RuntimeError(
                 f"MoELayer: none of the configured backends "
                 f"{[type(c).__name__ for c in config.backend]} are usable on "
                 f"arch sm{arch} for this configuration. Registered unified "
-                f"runners: [{mvp}].{hint}"
+                f"runners: [{mvp}].{hint}{reasons}"
             )
 
         # Cross-backend winner cache, keyed by (num_tokens tuning bucket,

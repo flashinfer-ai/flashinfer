@@ -55,7 +55,7 @@ def test_auto_warning_recommends_an_architecture_supported_backend(
 
     with pytest.warns(UserWarning, match=WARN_TAG) as caught:
         _BatchMLAPagedAttentionAutoBackend._maybe_warn_blackwell_auto_fallback(
-            torch.device("cuda"), "fa2"
+            torch.device("cuda")
         )
 
     message = str(caught[0].message)
