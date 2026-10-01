@@ -6,6 +6,8 @@ Tests for the CUDA checkpointing_ssu kernel.
 Validates against the Triton replay_selective_state_update reference.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -22,6 +24,8 @@ from flashinfer.mamba.checkpointing_ssu import (
     _make_tactics,
     allocate_checkpointing_ssu_scratch,
     checkpointing_ssu,
+    prepare_checkpointing_ssu_runtime,
+    prepare_checkpointing_ssu_runtime_kernel,
 )
 from flashinfer.utils import is_cvt_rs_supported
 
@@ -494,7 +498,7 @@ def test_checkpointing_ssu_heads_per_group(impl):
     )
 
 
-def test_two_kernel_matches_monolithic(tmp_path, request):
+def test_two_kernel_matches_monolithic(tmp_path, request, monkeypatch):
     """The two-kernel path (caller passes cb_scaled/cumAdt_vec/cb_old scratch)
     must match the monolithic kernel (no scratch) bit-for-bit on out, state, and
     the mutated caches.  Covers a nowrite case (k=0) and a write case (k=T)."""
@@ -504,6 +508,13 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
     max_window = 8  # > T so a prev_k>0 NO-WRITE case exists (k=2 below)
     batch = 2
     cache_size = batch + 15  # Exercise cache capacity > active batch during tuning.
+    state_index_storage = torch.tensor(
+        [[1, -1], [3, -1]], device=device, dtype=torch.int32
+    )
+    strided_state_indices = state_index_storage[:, 0]
+    contiguous_state_indices = strided_state_indices.clone()
+    assert not strided_state_indices.is_contiguous()
+    assert strided_state_indices.stride(0) == 2
     # old_* caches are (cache, max_window, ...).  must_checkpoint = prev_k + T >
     # max_window, so the k-loop below hits: k=0 nowrite(prev_k=0), k=2
     # nowrite(prev_k>0 — exercises the dt-ring tail scan), k=T=6 write.
@@ -529,19 +540,26 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
     x_cache, B_cache, dt_cache, ring_start = _make_ring_caches(
         cache_size, nheads, ngroups, head_dim, d_state, max_window, T, dtype, device
     )
-    for slot in range(batch):
+    for seq, slot in enumerate(contiguous_state_indices.tolist()):
         _seed_ring(
             x_cache,
             B_cache,
             dt_cache,
             ring_start,
             slot,
-            x1[slot],
-            B1[slot],
-            dt1_proc[slot],
+            x1[seq],
+            B1[seq],
+            dt1_proc[seq],
         )
 
-    def _run(k, *, algorithm=None, enable_pdl=False):
+    def _run(
+        k,
+        *,
+        algorithm=None,
+        enable_pdl=False,
+        state_batch_indices=strided_state_indices,
+        prepared=None,
+    ):
         torch.manual_seed(k + 100)
         x2 = torch.randn(batch, T, nheads, head_dim, device=device, dtype=dtype)
         dt2 = repeat(
@@ -554,6 +572,41 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
         st = state0.clone()
         out = torch.zeros(batch, T, nheads, head_dim, device=device, dtype=dtype)
         xc, bc, dtc = x_cache.clone(), B_cache.clone(), dt_cache.clone()
+        if prepared is not None:
+            kernel, policies = prepared
+            two_kernel, d_split, heads_per_cta, stages, ctas_per_sm = policies[batch]
+            scratch = allocate_checkpointing_ssu_scratch(
+                batch, nheads, T, max_window, dtype, device
+            )
+            kernel(
+                st,
+                x2,
+                dt2,
+                A,
+                B2,
+                C2,
+                out,
+                xc,
+                bc,
+                dtc,
+                ring_start.clone(),
+                torch.full((cache_size,), k, device=device, dtype=torch.int32),
+                D,
+                None,
+                dt_bias,
+                True,
+                state_batch_indices,
+                -1,
+                None,
+                None,
+                d_split,
+                None,
+                *(scratch if two_kernel else (None, None, None)),
+                heads_per_cta,
+                stages,
+                ctas_per_sm,
+            )
+            return out, st, xc, bc, dtc
         kw = {}
         if algorithm is not None:
             kw.update(_two_kernel_scratch(batch, nheads, T, max_window, dtype, device))
@@ -574,6 +627,7 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
             D=D,
             dt_bias=dt_bias,
             dt_softplus=True,
+            state_batch_indices=state_batch_indices,
             enable_pdl=enable_pdl,
             **kw,
         )
@@ -581,7 +635,12 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
 
     names = ("out", "state", "x_cache", "B_cache", "dt_cache")
     for k in (0, 2, T):  # k=0 nowrite(prev_k=0), k=2 nowrite(prev_k>0), k=T write
-        ref = _run(k)
+        ref = _run(k, state_batch_indices=contiguous_state_indices)
+        strided_monolithic = _run(k)
+        for name, r, t in zip(names, ref, strided_monolithic, strict=True):
+            torch.testing.assert_close(
+                t, r, rtol=0, atol=0, msg=f"{name} strided monolithic mismatch at k={k}"
+            )
         test = _run(k, algorithm="two-kernel")
         for name, r, t in zip(names, ref, test, strict=True):
             torch.testing.assert_close(
@@ -622,6 +681,38 @@ def test_two_kernel_matches_monolithic(tmp_path, request):
     tuner.clear_cache()
     with autotune(False, cache=str(cache_path)):
         cached = _run(2, algorithm="auto")
+        original_choose_one = tuner.choose_one
+        resolved_tactics = []
+
+        def record_choice(*args, **kwargs):
+            result = original_choose_one(*args, **kwargs)
+            resolved_tactics.append(result[1])
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr(tuner, "choose_one", record_choice)
+            prepared = prepare_checkpointing_ssu_runtime(
+                dtype,
+                dtype,
+                dtype,
+                dtype,
+                torch.float32,
+                torch.int32,
+                None,
+                head_dim,
+                d_state,
+                T,
+                max_window,
+                nheads // ngroups,
+                ngroups,
+                batch,
+                device,
+                False,
+            )
+        assert resolved_tactics and all(tactic != -1 for tactic in resolved_tactics)
+        raw = _run(2, prepared=prepared)
+        for raw_tensor, cached_tensor in zip(raw, cached, strict=True):
+            torch.testing.assert_close(raw_tensor, cached_tensor, rtol=0, atol=0)
     cached_configs = {
         file_key: tactic
         for file_key, (runner_name, tactic) in tuner._file_configs.items()
@@ -770,10 +861,180 @@ def test_autotune_device_tuning_signature(monkeypatch):
 
     module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
-    monkeypatch.setattr(module, "_sm_count", lambda device: 132)
+    monkeypatch.setattr(module, "_sm_count", lambda device: 148)
 
     assert _device_tuning_signature(torch.device("cpu")) == ("cpu",)
     assert _device_tuning_signature(torch.device("cuda", 0)) == ("cuda", 9, 0, 132)
+
+
+def test_prepare_runtime_kernel_resolves_exact_jit_specialization(monkeypatch):
+    import importlib
+
+    module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
+    kernel = object()
+    calls = []
+
+    def fake_get_module(*args):
+        calls.append(args)
+        return SimpleNamespace(checkpointing_ssu=kernel)
+
+    monkeypatch.setattr(module, "_get_module", fake_get_module)
+    resolved = prepare_checkpointing_ssu_runtime_kernel(
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        4,
+        16,
+        16,
+        2,
+        5,
+        False,
+    )
+
+    assert resolved is kernel
+    assert calls == [
+        (
+            torch.float16,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.float32,
+            torch.float32,
+            torch.int32,
+            None,
+            64,
+            128,
+            4,
+            16,
+            16,
+            2,
+            5,
+            False,
+        )
+    ]
+
+
+@pytest.mark.parametrize("max_batch_size", [33, 64])
+def test_prepare_runtime_binds_cached_tactics_by_serving_bucket(
+    monkeypatch, max_batch_size
+):
+    import importlib
+
+    module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
+    kernel = object()
+    calls = []
+    tactics = {
+        1: (0, 0, 0, 2),
+        2: (0, 0, 0, 2),
+        4: (0, 0, 0, 2),
+        8: (0, 0, 0, 1),
+        16: (0, 0, 0, 1),
+        32: (0, 0, 0, 1),
+        64: (1, 14, 16, 1),
+    }
+
+    class FakeTuner:
+        is_tuning_mode = False
+
+        def choose_one(self, op, runners, config, inputs):
+            del config
+            assert op == "checkpointing_ssu"
+            calls.append(inputs[1].size(0))
+            batch = inputs[1].size(0)
+            return runners[0], tactics.get(batch, tactics[64])
+
+    monkeypatch.setattr(
+        module, "prepare_checkpointing_ssu_runtime_kernel", lambda *args: kernel
+    )
+    monkeypatch.setattr(module.AutoTuner, "get", staticmethod(FakeTuner))
+    resolved_kernel, policies = prepare_checkpointing_ssu_runtime(
+        torch.float16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.bfloat16,
+        torch.float32,
+        torch.int32,
+        None,
+        64,
+        128,
+        4,
+        16,
+        16,
+        2,
+        max_batch_size,
+        torch.device("cpu"),
+        True,
+        5,
+        False,
+    )
+
+    assert resolved_kernel is kernel
+    assert calls == [1, 2, 4, 8, 16, 32, max_batch_size]
+    assert len(policies) == max_batch_size + 1
+    assert policies[3] == (False, 2, 0, 0, 0)
+    assert policies[31] == (False, 1, 0, 0, 0)
+    assert policies[33] == (True, 1, 16, 1, 14)
+
+
+@pytest.mark.parametrize("state_dtype", [torch.float16, torch.float32])
+def test_prepare_runtime_fallback_and_invalid_context(monkeypatch, state_dtype):
+    import importlib
+
+    module = importlib.import_module("flashinfer.mamba.checkpointing_ssu")
+    monkeypatch.setattr(module, "_sm_count", lambda device: 148)
+
+    class FakeTuner:
+        is_tuning_mode = False
+        tactic = -1
+
+        def choose_one(self, op, runners, config, inputs):
+            return runners[0], self.tactic
+
+    tuner = FakeTuner()
+    monkeypatch.setattr(module.AutoTuner, "get", staticmethod(lambda: tuner))
+    kwargs = dict(
+        state_dtype=state_dtype,
+        input_dtype=torch.bfloat16,
+        dt_dtype=torch.bfloat16,
+        weight_dtype=torch.bfloat16,
+        matrixA_dtype=torch.float32,
+        stateIndex_dtype=torch.int32,
+        state_scale_dtype=None,
+        dim=64,
+        dstate=128,
+        npredicted=4,
+        max_window=16,
+        heads_per_group=16,
+        num_groups=1,
+        max_batch_size=33,
+        device=torch.device("cpu"),
+        use_rand_seed=False,
+        philox_rounds=0,
+        enable_pdl=False,
+    )
+    policies = module._resolve_checkpointing_ssu_runtime_policies(**kwargs)
+    assert policies[0] == policies[1]
+    assert policies[1] == (False, 2 if state_dtype == torch.float32 else 1, 0, 0, 0)
+    assert policies[9] == (False, 2 if state_dtype == torch.float32 else 1, 0, 0, 0)
+    assert policies[10] == (True, 1, 0, 0, 0)
+    assert policies[33] == (True, 1, 0, 0, 0)
+
+    with pytest.raises(ValueError, match="max_batch_size must be positive"):
+        module._resolve_checkpointing_ssu_runtime_policies(
+            **{**kwargs, "max_batch_size": 0}
+        )
+    tuner.is_tuning_mode = True
+    with pytest.raises(RuntimeError, match="after autotuning"):
+        module._resolve_checkpointing_ssu_runtime_policies(**kwargs)
+    tuner.is_tuning_mode = False
+    tuner.tactic = (1, 2)
+    with pytest.raises(ValueError, match="Unknown checkpointing SSU tactic"):
+        module._resolve_checkpointing_ssu_runtime_policies(**kwargs)
 
 
 def test_autotune_max_batch_populates_dynamic_buckets():
@@ -2332,7 +2593,9 @@ def test_checkpointing_ssu_int8_rn_parity(
 
     if paged_cache:
         cache_size = 4
-        state_batch_indices = torch.tensor([1, 3], device=device, dtype=torch.int32)
+        state_batch_indices = torch.tensor(
+            [1, -1, 3, -1], device=device, dtype=torch.int32
+        )[::2]
     else:
         cache_size = batch
         state_batch_indices = None
@@ -2380,7 +2643,7 @@ def test_checkpointing_ssu_int8_rn_parity(
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_batch_indices=cache_idx_for_capture,
+        state_batch_indices=cache_idx_for_capture.contiguous(),
         intermediate_states_buffer=states_buffer_f32,
         cache_steps=T,
         out=out1,
