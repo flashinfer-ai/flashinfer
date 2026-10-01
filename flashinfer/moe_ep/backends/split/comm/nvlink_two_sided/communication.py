@@ -9,6 +9,7 @@ depends on the number of channels, not on the token count.
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
 from .....core.comm.communication import (
@@ -56,10 +57,16 @@ class NVLinkTwoSidedAlltoAll(MoEEpCommunication):
                 f"got {params.num_experts}"
             )
         MnnvlMemory.initialize()
-        self._workspace = MnnvlMoe.get_moe_workspaces(mapping, mnnvl_config)
-        self._prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-            mapping, mnnvl_config
-        )
+        # MnnvlMoe is deprecated in favor of this class, which still builds on
+        # it; its users, not this backend's, should see the warning.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", "MnnvlMoe is deprecated", DeprecationWarning
+            )
+            self._workspace = MnnvlMoe.get_moe_workspaces(mapping, mnnvl_config)
+            self._prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
+                mapping, mnnvl_config
+            )
         self._state: Optional[dict[str, Any]] = None
 
     @classmethod

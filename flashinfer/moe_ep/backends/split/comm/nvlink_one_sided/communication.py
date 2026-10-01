@@ -9,6 +9,7 @@ workspace grows with ``ep_size * max_tokens_per_rank``.
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, ClassVar, Optional
 
 from .....core.comm.communication import (
@@ -80,17 +81,23 @@ class NVLinkOneSidedAlltoAll(MoEEpCommunication):
             backend=self.alltoall_backend,
         )
 
-        self._alltoall: Optional[MoeAlltoAll] = MoeAlltoAll(
-            mapping,
-            max_num_tokens=params.max_tokens_per_rank,
-            top_k=params.top_k,
-            num_experts=params.num_experts,
-            workspace_size_per_rank=workspace_size_per_rank,
-            mnnvl_config=mnnvl_config,
-            eplb_stats_num_experts=self.config.eplb_stats_num_experts,
-            enable_rank_mask=self.config.enable_rank_mask,
-            backend=self.alltoall_backend,
-        )
+        # MoeAlltoAll is deprecated in favor of this class, which still builds
+        # on it; its users, not this backend's, should see the warning.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore", "MoeAlltoAll is deprecated", DeprecationWarning
+            )
+            self._alltoall: Optional[MoeAlltoAll] = MoeAlltoAll(
+                mapping,
+                max_num_tokens=params.max_tokens_per_rank,
+                top_k=params.top_k,
+                num_experts=params.num_experts,
+                workspace_size_per_rank=workspace_size_per_rank,
+                mnnvl_config=mnnvl_config,
+                eplb_stats_num_experts=self.config.eplb_stats_num_experts,
+                enable_rank_mask=self.config.enable_rank_mask,
+                backend=self.alltoall_backend,
+            )
         self._tokens_per_rank: Optional[int] = None
         self._combine_buffer: "torch.Tensor | None" = None
 

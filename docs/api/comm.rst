@@ -554,9 +554,11 @@ MNNVL A2A (Throughput Backend)
 -------------------------------
 
 These are the kernel-level primitives of the NVLink one-sided MoE all-to-all.
-The ``nvlink_one_sided`` backend of :class:`flashinfer.moe_ep.MoEEpCommunication`
-builds on them and exposes the same dispatch/combine interface as the other
-expert-parallel communication backends.
+``MoeAlltoAll`` is deprecated in favor of
+:class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll` (and
+:class:`flashinfer.moe_ep.NVLinkOneSidedCakeAlltoAll` for ``backend="cake"``),
+which expose the dispatch/combine interface shared by all expert-parallel
+communication backends; its implementation will move into those classes.
 
 .. currentmodule:: flashinfer.comm
 
