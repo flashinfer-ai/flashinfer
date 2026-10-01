@@ -172,6 +172,8 @@ def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():
     offer them while the kernel-N extent (n, or m when A and B are swapped)
     is at most 32."""
     _skip_if_unsupported("cute-dsl")
+    if get_compute_capability(torch.device("cuda"))[0] == 12:
+        pytest.skip("Tests the tactics of the SM100-family tcgen05 kernels")
     for m, n in ((128, 128), (128, 64), (64, 128)):
         narrow = [t for t in _mxfp8_cute_dsl_tactics(m, n) if t[0][1] < 64]
         assert narrow == [], (m, n, narrow)

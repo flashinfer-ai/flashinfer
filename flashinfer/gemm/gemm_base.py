@@ -6009,8 +6009,10 @@ def _check_mm_mxfp8_problem_size(
             f"K dimension mismatch in mm_mxfp8. got {a.shape[1]=}, {b.shape[0]=}"
         )
 
-    # The output may contain NaN/Inf if the dimensions are too small
-    min_n = 128
+    # The output may contain NaN/Inf if the dimensions are too small. The SM12x
+    # cute-dsl kernels have no minimum N.
+    sm12x_cute_dsl = backend == "cute-dsl" and is_sm12x_supported(a.device)
+    min_n = 1 if sm12x_cute_dsl else 128
     min_k = 128
     if b.shape[1] < min_n or a.shape[1] < min_k:
         raise ValueError(
@@ -6164,17 +6166,30 @@ def _trtllm_gemm_mxfp8_requirement(
     return True
 
 
-@supported_compute_capability([100, 103, 107])
+@supported_compute_capability([100, 103, 107, 120, 121])
 def _cute_dsl_gemm_mxfp8_requirement(
-    a: torch.Tensor,  # unused
-    b: torch.Tensor,  # unused
+    a: torch.Tensor,
+    b: torch.Tensor,
     a_descale: torch.Tensor,
     b_descale: torch.Tensor,
-    out: Optional[torch.Tensor] = None,  # unused
-    out_dtype: torch.dtype = torch.bfloat16,  # unused
-    use_8x4_sf_layout: bool = True,  # unused
-    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",  # unused
+    out: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+    use_8x4_sf_layout: bool = True,
+    backend: Literal["cutlass", "cute-dsl", "auto"] = "auto",
 ):
+    if is_sm12x_supported(a.device):
+        from .kernels.sm12x_mxfp8.runner import check_requirement
+
+        try:
+            _check_cute_dsl_availability()
+            _check_cute_dsl_arch(a.device)
+            return check_requirement(
+                a, b, a_descale, b_descale, out, out_dtype, use_8x4_sf_layout
+            )
+        except ValueError:
+            if backend != "cute-dsl":
+                return False
+            raise
     # CuTe DSL MXFP8 path currently expects swizzled 1D block scales
     # in F8_128x4 layout for both A and B.
     if a_descale.ndim != 1 or b_descale.ndim != 1:
@@ -6385,6 +6400,11 @@ def _cute_dsl_gemm_mxfp8_runner(
     enable_pdl: bool,
     out_dtype: torch.dtype,
 ):
+    if sm_major == 12:
+        from .kernels.sm12x_mxfp8.runner import get_runner
+
+        return get_runner()
+
     import cutlass
 
     from .kernels.dense_blockscaled_gemm_sm100 import (
@@ -6835,7 +6855,8 @@ def mm_mxfp8(
 
     out: Optional[torch.Tensor]
         Out tensor, shape (m, n), bf16 or fp16. If provided, the result is written
-        into it (supported by the CUTLASS, cuDNN, b12x, and cutedsl_low_latency backends).
+        into it (supported by the CUTLASS, cuDNN, b12x, cutedsl_low_latency, and SM12x
+        cute-dsl backends).
         Defaults to ``None``.
 
     out_dtype: torch.dtype
@@ -6854,7 +6875,12 @@ def mm_mxfp8(
           small-M decode tiles. It requires CUDA 13+, nvidia-cutlass-dsl >=
           4.6.0, 1D swizzled 128x4 scales, and K divisible by 128.
         - The ``"cute-dsl"`` backend currently requires swizzled 1D scales
-          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``).
+          (``mxfp8_quantize(..., is_sf_swizzled_layout=True)``). On
+          SM120/SM121 it requires CUDA 13+, ``K % 32 == 0``, a row-major ``a``,
+          a column-major ``b`` (a contiguous [N, K] weight transposed),
+          16-byte aligned tensors and BF16 or FP16 output; any N >= 1 is
+          accepted. It selects among GEMV, stream-K, persistent and ping-pong
+          kernels by M, N and K, or by the autotuner when tuning is enabled.
         - The ``"cutedsl_low_latency"`` backend requires SM100/SM103, ``M <= 8``,
           ``K % 128 == 0``, and swizzled 1D scales in the 128x4 layout.
         - The ``"trtllm"`` requires b to be quantized with 128x4 swizzle layout and shuffled.
@@ -6947,11 +6973,12 @@ def mm_mxfp8(
 
     tuner = AutoTuner.get()
 
-    tuning_config = (
-        _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
-        if backends in (["cute-dsl"], ["cutedsl_low_latency"])
-        else _MM_MXFP8_TUNING_CONFIG
-    )
+    if backends == ["cute-dsl"] and major == 12:
+        tuning_config = _MM_MXFP8_SM12X_CUTE_DSL_TUNING_CONFIG
+    elif backends in (["cute-dsl"], ["cutedsl_low_latency"]):
+        tuning_config = _MM_MXFP8_CUTE_DSL_TUNING_CONFIG
+    else:
+        tuning_config = _MM_MXFP8_TUNING_CONFIG
 
     inputs = [
         a,
@@ -8914,6 +8941,17 @@ _MM_MXFP8_CUTE_DSL_TUNING_CONFIG = replace(
     _MM_MXFP8_TUNING_CONFIG,
     use_cuda_graph=True,
     use_cold_l2_cache=True,
+)
+
+# The SM12x cute-dsl candidates include kernels of a few microseconds, which a
+# CUDA-event window around one graph replay cannot rank. Time them by CUPTI
+# kernel span instead, and keep the runner's feature default (listed first)
+# unless a candidate is clearly faster.
+_MM_MXFP8_SM12X_CUTE_DSL_TUNING_CONFIG = replace(
+    _MM_MXFP8_CUTE_DSL_TUNING_CONFIG,
+    timer="cupti",
+    profiling_repeat=30,
+    first_tactic_margin=0.03,
 )
 
 
