@@ -63,12 +63,12 @@ def _make_inputs(
     rank=32,
     num_slices=1,
     x_dtype=None,
+    top_k=2,
 ):
     torch.manual_seed(42)
     device = "cuda"
     num_experts = 128
     num_loras = 2
-    top_k = 2
     num_pairs = num_tokens * top_k
     # Scales keep the shrink (~0.5) and the output (~1) at O(1) so the
     # 1e-2 tolerances are meaningful: an all-zero result must fail. The
@@ -340,16 +340,128 @@ def test_cake_plan_reports_backend_used():
     assert plan.schedule_id is not None
 
 
+# (hidden, rank, tokens, dtype, arbitrary routes, top_k): runtime-hidden
+# generic bundles. Tokens <= 8 take the 64-lane expand, more the 128-lane one;
+# <= 32 pairs take the decode shrink (PPB=4), more the prefill shrink (PPB=1).
+_GENERIC_CASES = [
+    (3072, 16, 8, torch.bfloat16, False, 2),
+    (3072, 8, 40, torch.float16, False, 2),
+    (3072, 64, 4, torch.bfloat16, True, 2),
+    (2048, 32, 32, torch.float16, False, 2),
+    (736, 32, 16, torch.bfloat16, False, 2),
+    (1344, 32, 512, torch.bfloat16, False, 2),
+    (2880, 32, 1, torch.float16, False, 2),
+    (2112, 64, 300, torch.bfloat16, True, 2),
+    (1472, 8, 64, torch.float16, True, 2),
+    (4096, 32, 8, torch.bfloat16, True, 4),
+    (1856, 16, 96, torch.float16, True, 8),
+]
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "rank", "num_tokens", "dtype", "arbitrary_routes", "top_k"),
+    _GENERIC_CASES,
+    ids=[
+        f"h{h}_r{r}_t{t}_{str(d).split('.')[-1]}{'_arb' if a else ''}_k{k}"
+        for h, r, t, d, a, k in _GENERIC_CASES
+    ],
+)
+def test_generic_variant_matches_reference_and_replays_bitwise(
+    hidden_size, rank, num_tokens, dtype, arbitrary_routes, top_k
+):
+    _require_cake_arch()
+    inputs = _make_inputs(
+        hidden_size,
+        num_tokens,
+        dtype,
+        rank=rank,
+        arbitrary_routes=arbitrary_routes,
+        top_k=top_k,
+    )
+    expected = _reference(inputs)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        plan = prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
+    assert isinstance(plan, BGMVMoECakePlan)
+    assert plan.backend_used == "cake"
+    assert plan.variant == "generic"
+    first = plan.run().clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
+    for _ in range(3):
+        replay = plan.run().clone()
+        torch.cuda.synchronize()
+        assert torch.equal(replay, first)
+    # Replays consume current tensor contents through the same pointers.
+    inputs[0].mul_(0.5)
+    torch.testing.assert_close(plan.run(), _reference(inputs), atol=1e-2, rtol=1e-2)
+    plan.close()
+
+
+@pytest.mark.parametrize("hidden_size", [2688, 3072])
+def test_specialized_variant_is_preferred_at_rank_32(hidden_size):
+    _require_cake_arch()
+    plan = prepare_bgmv_moe(
+        *_make_inputs(hidden_size, 4, torch.bfloat16), backend="cake"
+    )
+    assert plan.variant == "specialized"
+    plan.close()
+    plan = prepare_bgmv_moe(
+        *_make_inputs(hidden_size, 4, torch.bfloat16, rank=16), backend="cake"
+    )
+    assert plan.variant == "generic"
+    plan.close()
+
+
+def test_generic_variant_outer_graph_capture_and_padding():
+    _require_cake_arch()
+    inputs = list(_make_inputs(1344, 8, torch.bfloat16, rank=16))
+    device = inputs[0].device
+    inputs[3] = torch.cat(
+        [inputs[3], torch.tensor([-1, 8], dtype=torch.int64, device=device)]
+    )
+    inputs[4] = torch.cat([inputs[4], torch.zeros(2, dtype=torch.int64, device=device)])
+    inputs[6] = torch.cat(
+        [inputs[6], torch.zeros(2, dtype=torch.float32, device=device)]
+    )
+    inputs = tuple(inputs)
+    expected = _reference(inputs)
+    plan = prepare_bgmv_moe(*inputs, backend="cake")
+    assert plan.variant == "generic"
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = plan.run()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+    plan.close()
+
+
 _FALLBACK_CASES = [
     (
+        "slices_fp16",
+        dict(hidden_size=3072, num_tokens=4, dtype=torch.float16, num_slices=2),
+        "exactly one LoRA slice",
+    ),
+    (
+        "slices_bf16_generic_shape",
+        dict(hidden_size=2048, num_tokens=40, dtype=torch.bfloat16, num_slices=2),
+        "exactly one LoRA slice",
+    ),
+]
+
+# Inputs no generated program serves; fallback=False must reject them with the
+# listed reason. (The portable kernels do not compile these shapes either.)
+_UNSUPPORTED_CASES = [
+    (
         "rank",
-        dict(hidden_size=3072, num_tokens=8, dtype=torch.bfloat16, rank=16),
-        "rank 32",
+        dict(hidden_size=3072, num_tokens=8, dtype=torch.bfloat16, rank=12),
+        "rank in",
     ),
     (
         "hidden",
-        dict(hidden_size=2048, num_tokens=8, dtype=torch.bfloat16),
-        "hidden_size must be 2688 or 3072",
+        dict(hidden_size=2052, num_tokens=8, dtype=torch.bfloat16),
+        "positive multiple of 8",
     ),
     (
         "slices",
@@ -398,7 +510,9 @@ def test_fallback_plan_matches_reference(name, case, message):
 
 
 @pytest.mark.parametrize(
-    ("name", "case", "message"), _FALLBACK_CASES, ids=[c[0] for c in _FALLBACK_CASES]
+    ("name", "case", "message"),
+    _UNSUPPORTED_CASES,
+    ids=[c[0] for c in _UNSUPPORTED_CASES],
 )
 def test_strict_mode_raises_for_unsupported_inputs(name, case, message):
     # The listed reasons are only reached on a device with a generated program;
@@ -430,7 +544,7 @@ def test_fallback_warning_is_emitted_once_per_reason():
 
     bgmv_moe_module = sys.modules["flashinfer.fused_moe.bgmv_moe"]
     bgmv_moe_module._fallback_reasons_warned.clear()
-    inputs = _make_inputs(2048, 4, torch.bfloat16)
+    inputs = _make_inputs(2048, 4, torch.bfloat16, num_slices=2)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         prepare_bgmv_moe(*inputs, backend="cake")
@@ -441,7 +555,7 @@ def test_fallback_warning_is_emitted_once_per_reason():
 
 def test_fallback_plan_outer_graph_capture_and_stream_check():
     _require_cuda()
-    inputs = _make_inputs(2048, 32, torch.float16, arbitrary_routes=True)
+    inputs = _make_inputs(2048, 32, torch.float16, arbitrary_routes=True, num_slices=2)
     expected = _reference(inputs)
     plan = prepare_bgmv_moe(*inputs, backend="cake")
     assert isinstance(plan, BGMVMoEPortablePlan)

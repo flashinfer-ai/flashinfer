@@ -50,6 +50,19 @@ CAKE_BGMV_MOE_SCHEDULE_IDS: dict[CakeBGMVMoESchedule, int] = {
     "token_owned_dual_col": 2,
 }
 
+# Generic-shape bundles: one compile-time LoRA rank per module, any hidden size
+# that is a positive multiple of 8 at run time (the shrink kernels stream
+# 1024-wide tiles with a masked tail). The specialized hidden 2688/3072 x rank
+# 32 bodies above stay preferred when they apply.
+CakeBGMVMoEVariant = Literal["specialized", "generic"]
+CakeBGMVMoEGenericSchedule = Literal["token_owned_t64", "token_owned_t128"]
+CAKE_BGMV_MOE_GENERIC_RANKS = (8, 16, 32, 64)
+CAKE_BGMV_MOE_GENERIC_HIDDEN_MULTIPLE = 8
+CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS: dict[CakeBGMVMoEGenericSchedule, int] = {
+    "token_owned_t64": 0,
+    "token_owned_t128": 1,
+}
+
 
 class CakeBGMVMoEArchTarget(NamedTuple):
     arch: CakeBGMVMoEArch
@@ -76,6 +89,14 @@ class CakeBGMVMoEMetadata(NamedTuple):
     token_t64_symbol: str
     token_symbol: str
     token_dual_col_symbol: str
+
+
+class CakeBGMVMoEGenericMetadata(NamedTuple):
+    body: str
+    shrink_decode_symbol: str
+    shrink_prefill_symbol: str
+    expand_t64_symbol: str
+    expand_t128_symbol: str
 
 
 def cake_bgmv_moe_arch_for_capability(
@@ -135,6 +156,80 @@ def _metadata(hidden_size: int, dtype: CakeBGMVMoEDType) -> CakeBGMVMoEMetadata:
             f"kernel_flashinfer_bgmv_moe_expand_token_dual_col_{tag}_h{hidden_size}_r32"
         ),
     )
+
+
+def _check_generic_rank(rank: int) -> None:
+    if rank not in CAKE_BGMV_MOE_GENERIC_RANKS:
+        raise ValueError(
+            "Cake BGMV MoE generic rank must be one of "
+            f"{CAKE_BGMV_MOE_GENERIC_RANKS}, got {rank}"
+        )
+
+
+def cake_bgmv_moe_variant(hidden_size: int, rank: int) -> Optional[CakeBGMVMoEVariant]:
+    """Return which generated Cake bundle serves ``(hidden_size, rank)``.
+
+    ``"specialized"`` for the measured hidden 2688/3072 x rank 32 bodies,
+    ``"generic"`` for any other hidden size that is a positive multiple of 8
+    at rank 8, 16, 32 or 64, and ``None`` when no generated program applies.
+    """
+
+    hidden_size = int(hidden_size)
+    rank = int(rank)
+    if hidden_size in CAKE_BGMV_MOE_HIDDEN_SIZES and rank == 32:
+        return "specialized"
+    if (
+        rank in CAKE_BGMV_MOE_GENERIC_RANKS
+        and hidden_size > 0
+        and hidden_size % CAKE_BGMV_MOE_GENERIC_HIDDEN_MULTIPLE == 0
+    ):
+        return "generic"
+    return None
+
+
+def _generic_metadata(rank: int, dtype: CakeBGMVMoEDType) -> CakeBGMVMoEGenericMetadata:
+    _check_generic_rank(rank)
+    tag = _dtype_tag(dtype)
+    return CakeBGMVMoEGenericMetadata(
+        body=f"cake_bgmv_moe_generic_{tag}_r{rank}.cu",
+        shrink_decode_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p4_s3"
+        ),
+        shrink_prefill_symbol=(
+            f"kernel_flashinfer_bgmv_moe_shrink_generic_{tag}_r{rank}_p1_s2"
+        ),
+        expand_t64_symbol=(
+            f"kernel_flashinfer_bgmv_moe_expand_generic_token_t64_{tag}_r{rank}"
+        ),
+        expand_t128_symbol=(
+            f"kernel_flashinfer_bgmv_moe_expand_generic_token_t128_{tag}_r{rank}"
+        ),
+    )
+
+
+def select_cake_bgmv_moe_generic_schedule(
+    hidden_size: int,
+    num_tokens: int,
+    arch: CakeBGMVMoEArch = "sm100a",
+) -> CakeBGMVMoEGenericSchedule:
+    """Return the expand schedule for the generic-shape bundle.
+
+    The 64-lane token-owned expand wins at decode batch sizes (few tokens,
+    more CTAs per token keep the SMs busy); the 128-lane variant wins once
+    the grid is wide enough on its own. Both are deterministic.
+    """
+
+    if cake_bgmv_moe_variant(hidden_size, CAKE_BGMV_MOE_GENERIC_RANKS[0]) is None:
+        raise ValueError(
+            "Cake BGMV MoE generic hidden_size must be a positive multiple of "
+            f"{CAKE_BGMV_MOE_GENERIC_HIDDEN_MULTIPLE}, got {hidden_size}"
+        )
+    _check_arch(arch)
+    if num_tokens <= 0:
+        raise ValueError(f"num_tokens must be positive, got {num_tokens}")
+    if num_tokens <= 8:
+        return "token_owned_t64"
+    return "token_owned_t128"
 
 
 def select_cake_bgmv_moe_schedule(
@@ -233,6 +328,101 @@ def _binding_source(
 """
 
 
+def get_cake_bgmv_moe_generic_uri(
+    rank: int,
+    dtype: CakeBGMVMoEDType,
+    arch: CakeBGMVMoEArch = "sm100a",
+) -> str:
+    _check_generic_rank(rank)
+    _check_arch(arch)
+    tag = _dtype_tag(dtype)
+    return f"cake_bgmv_moe_generic_{tag}_r{rank}_{arch}"
+
+
+def _generic_binding_source(
+    metadata: CakeBGMVMoEGenericMetadata, rank: int, target: CakeBGMVMoEArchTarget
+) -> str:
+    input_dtype = "dl_bfloat16" if "_bf16_" in metadata.body else "dl_float16"
+    major, minor = target.capability
+    return f"""\
+/*
+ * Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+ * Licensed under the Apache License, Version 2.0.
+ */
+
+#define CAKE_BGMV_MOE_BODY_FILE \"{metadata.body}\"
+#define CAKE_BGMV_MOE_RANK {rank}
+#define CAKE_BGMV_MOE_INPUT_DTYPE {input_dtype}
+#define CAKE_BGMV_MOE_CC_MAJOR {major}
+#define CAKE_BGMV_MOE_CC_MINOR {minor}
+#define CAKE_BGMV_MOE_SHRINK_DECODE {metadata.shrink_decode_symbol}
+#define CAKE_BGMV_MOE_SHRINK_PREFILL {metadata.shrink_prefill_symbol}
+#define CAKE_BGMV_MOE_EXPAND_T64 {metadata.expand_t64_symbol}
+#define CAKE_BGMV_MOE_EXPAND_T128 {metadata.expand_t128_symbol}
+
+#include \"cake_bgmv_moe_generic_binding.cuh\"
+"""
+
+
+@functools.cache
+def gen_cake_bgmv_moe_generic_module(
+    rank: int,
+    dtype: CakeBGMVMoEDType,
+    arch: CakeBGMVMoEArch = "sm100a",
+) -> JitSpec:
+    metadata = _generic_metadata(rank, dtype)
+    target = _check_arch(arch)
+    csrc_dir = _get_csrc_dir()
+    include_dir = _get_include_dir()
+    body = csrc_dir / metadata.body
+    binding_header = csrc_dir / "cake_bgmv_moe_generic_binding.cuh"
+    if not body.is_file():
+        raise FileNotFoundError(
+            f"generated Cake BGMV MoE generic body not found: {body}"
+        )
+    if not binding_header.is_file():
+        raise FileNotFoundError(
+            f"Cake BGMV MoE generic binding header not found: {binding_header}"
+        )
+
+    uri = get_cake_bgmv_moe_generic_uri(rank, dtype, arch)
+    binding = jit_env.FLASHINFER_GEN_SRC_DIR / uri / "cake_bgmv_moe_generic_binding.cu"
+    write_if_different(binding, _generic_binding_source(metadata, rank, target))
+    spec = gen_jit_spec(
+        name=uri,
+        sources=[binding],
+        extra_cuda_cflags=[*target.nvcc_flags, "-use_fast_math"],
+        extra_include_paths=[csrc_dir, csrc_dir.parent, include_dir],
+    )
+    logger.info("Generated Cake BGMV MoE generic JIT spec: %s", spec.name)
+    return spec
+
+
+@functools.cache
+def load_cake_bgmv_moe_generic_module(
+    rank: int,
+    dtype: CakeBGMVMoEDType,
+    arch: CakeBGMVMoEArch = "sm100a",
+):
+    module = gen_cake_bgmv_moe_generic_module(rank, dtype, arch).build_and_load()
+    module.configure()
+    logger.info(
+        "Loaded Cake BGMV MoE generic module for rank=%d, dtype=%s, arch=%s",
+        rank,
+        dtype,
+        arch,
+    )
+    return module
+
+
+def get_cake_bgmv_moe_generic_module(
+    rank: int,
+    dtype: CakeBGMVMoEDType,
+    arch: CakeBGMVMoEArch = "sm100a",
+):
+    return load_cake_bgmv_moe_generic_module(rank, dtype, arch)
+
+
 @functools.cache
 def gen_cake_bgmv_moe_module(
     hidden_size: int,
@@ -294,17 +484,29 @@ __all__ = [
     "CAKE_BGMV_MOE_ARCHES",
     "CAKE_BGMV_MOE_ARCH_TARGETS",
     "CAKE_BGMV_MOE_DTYPES",
+    "CAKE_BGMV_MOE_GENERIC_HIDDEN_MULTIPLE",
+    "CAKE_BGMV_MOE_GENERIC_RANKS",
+    "CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS",
     "CAKE_BGMV_MOE_HIDDEN_SIZES",
     "CAKE_BGMV_MOE_SCHEDULE_IDS",
     "CakeBGMVMoEArch",
     "CakeBGMVMoEArchTarget",
     "CakeBGMVMoEDType",
+    "CakeBGMVMoEGenericMetadata",
+    "CakeBGMVMoEGenericSchedule",
     "CakeBGMVMoEMetadata",
     "CakeBGMVMoESchedule",
+    "CakeBGMVMoEVariant",
     "cake_bgmv_moe_arch_for_capability",
+    "cake_bgmv_moe_variant",
+    "gen_cake_bgmv_moe_generic_module",
     "gen_cake_bgmv_moe_module",
+    "get_cake_bgmv_moe_generic_module",
+    "get_cake_bgmv_moe_generic_uri",
     "get_cake_bgmv_moe_module",
     "get_cake_bgmv_moe_uri",
+    "load_cake_bgmv_moe_generic_module",
     "load_cake_bgmv_moe_module",
+    "select_cake_bgmv_moe_generic_schedule",
     "select_cake_bgmv_moe_schedule",
 ]

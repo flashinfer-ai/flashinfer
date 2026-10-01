@@ -121,7 +121,9 @@ from .jit.bgmv_moe import (
 )
 from .jit.cake_bgmv_moe import (
     CAKE_BGMV_MOE_DTYPES,
+    CAKE_BGMV_MOE_GENERIC_RANKS,
     CAKE_BGMV_MOE_HIDDEN_SIZES,
+    gen_cake_bgmv_moe_generic_module,
     gen_cake_bgmv_moe_module,
 )
 from .jit.monomoe import gen_monomoe_module
@@ -818,6 +820,11 @@ def gen_all_modules(
                 jit_specs.extend(
                     gen_cake_bgmv_moe_module(hidden_size, dtype, cake_bgmv_arch)
                     for hidden_size in CAKE_BGMV_MOE_HIDDEN_SIZES
+                    for dtype in CAKE_BGMV_MOE_DTYPES
+                )
+                jit_specs.extend(
+                    gen_cake_bgmv_moe_generic_module(rank, dtype, cake_bgmv_arch)
+                    for rank in CAKE_BGMV_MOE_GENERIC_RANKS
                     for dtype in CAKE_BGMV_MOE_DTYPES
                 )
         if sm_capabilities.get("sm100a_exact", False):

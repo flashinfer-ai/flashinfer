@@ -216,9 +216,8 @@ def _cake_dtype_name(dtype: torch.dtype) -> Literal["bfloat16", "float16"]:
 
 
 BGMVMoEBackendUsed = Literal["cake", "portable"]
+CakeBGMVMoEVariant = Literal["specialized", "generic"]
 
-_CAKE_SUPPORTED_HIDDEN_SIZES = (2688, 3072)
-_CAKE_SUPPORTED_RANK = 32
 _CAKE_UNSUPPORTED_DEVICE_MESSAGE = (
     "Cake BGMV MoE requires an exact SM90, SM100 or SM103 CUDA device; "
     "got capability={capability}"
@@ -322,7 +321,9 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
     """Pointer-stable SM90/SM100/SM103 Cake BGMV MoE shrink+expand execution plan.
 
     Runs the generated Cake programs (one owner per output token, no output
-    atomics, bitwise-reproducible replays). ``backend_used`` is ``"cake"``.
+    atomics, bitwise-reproducible replays). ``backend_used`` is ``"cake"``;
+    ``variant`` is ``"specialized"`` for the hidden 2688/3072 x rank 32 bodies
+    and ``"generic"`` for the runtime-hidden rank 8/16/32/64 bundles.
     """
 
     backend_used: BGMVMoEBackendUsed = "cake"
@@ -341,8 +342,10 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         lora_indices: torch.Tensor,
         topk_weights: torch.Tensor,
         schedule_id: int,
+        variant: CakeBGMVMoEVariant = "specialized",
     ) -> None:
         self._module = module
+        self.variant: CakeBGMVMoEVariant = variant
         self.lora_a = lora_a
         self.lora_b = lora_b
         self.sorted_token_ids = sorted_token_ids
@@ -503,16 +506,28 @@ def _cake_unsupported_reason(
 ) -> Optional[str]:
     """Return why the generated Cake programs cannot serve these inputs, or ``None``."""
 
+    from ..jit.cake_bgmv_moe import (
+        CAKE_BGMV_MOE_GENERIC_HIDDEN_MULTIPLE,
+        CAKE_BGMV_MOE_GENERIC_RANKS,
+        cake_bgmv_moe_variant,
+    )
+
     if arch is None:
         return _CAKE_UNSUPPORTED_DEVICE_MESSAGE.format(capability=capability)
     if num_slices != 1:
         return (
             f"Cake BGMV MoE currently requires exactly one LoRA slice, got {num_slices}"
         )
-    if hidden_size not in _CAKE_SUPPORTED_HIDDEN_SIZES:
-        return f"Cake BGMV MoE hidden_size must be 2688 or 3072, got {hidden_size}"
-    if rank != _CAKE_SUPPORTED_RANK:
-        return f"Cake BGMV MoE requires LoRA rank {_CAKE_SUPPORTED_RANK}, got {rank}"
+    if rank not in CAKE_BGMV_MOE_GENERIC_RANKS:
+        return (
+            "Cake BGMV MoE requires LoRA rank in "
+            f"{CAKE_BGMV_MOE_GENERIC_RANKS}, got {rank}"
+        )
+    if cake_bgmv_moe_variant(hidden_size, rank) is None:
+        return (
+            "Cake BGMV MoE hidden_size must be a positive multiple of "
+            f"{CAKE_BGMV_MOE_GENERIC_HIDDEN_MULTIPLE}, got {hidden_size}"
+        )
     if feat_outs != [hidden_size]:
         return (
             "Cake BGMV MoE requires LoRA-B feat_out == hidden_size, "
@@ -551,15 +566,18 @@ def prepare_bgmv_moe(
 ) -> BGMVMoEPlan:
     """Prepare a graph-replayable BGMV MoE shrink+expand pipeline.
 
-    The generated Cake path currently supports one LoRA slice, rank 32, hidden
-    sizes 2688 or 3072, BF16/FP16 inputs, and exact SM90 (H100/H200), SM100
-    (B200/GB200) or SM103 (B300/GB300) devices; each target runs its own
-    cubin. Routing may be arbitrary; each output has one owner that accumulates
+    The generated Cake path supports one LoRA slice, LoRA rank 8, 16, 32 or
+    64, any hidden size that is a positive multiple of 8 (LoRA-B feat_out equal
+    to it), BF16/FP16 inputs, and exact SM90 (H100/H200), SM100 (B200/GB200) or
+    SM103 (B300/GB300) devices; each target runs its own cubin. Hidden sizes
+    2688 and 3072 at rank 32 use the specialized measured bodies
+    (``plan.variant == "specialized"``); everything else uses the runtime-hidden
+    generic bundles (``plan.variant == "generic"``). Routing may be arbitrary; each output has one owner that accumulates
     routes in fixed input order, so identical prepared replays are bitwise
     reproducible. The contiguous top-k=2 layout takes the optimized fast path.
 
     Inputs outside that support set (other device capabilities, ranks, hidden
-    sizes, multiple slices) are served by a
+    sizes that are not multiples of 8, multiple slices) are served by a
     :class:`BGMVMoEPortablePlan` running the portable ``bgmv_moe_shrink`` +
     ``bgmv_moe_expand`` kernels when ``fallback=True`` (default); one
     ``RuntimeWarning`` is emitted per distinct reason per process. With
@@ -748,15 +766,30 @@ def prepare_bgmv_moe(
         )
 
     from ..jit.cake_bgmv_moe import (
+        CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS,
         CAKE_BGMV_MOE_SCHEDULE_IDS,
+        cake_bgmv_moe_variant,
+        get_cake_bgmv_moe_generic_module,
         get_cake_bgmv_moe_module,
+        select_cake_bgmv_moe_generic_schedule,
         select_cake_bgmv_moe_schedule,
     )
 
     assert arch is not None
     dtype_name = _cake_dtype_name(x.dtype)
-    schedule = select_cake_bgmv_moe_schedule(hidden_size, num_tokens, arch)
-    module = get_cake_bgmv_moe_module(hidden_size, dtype_name, arch)
+    variant = cake_bgmv_moe_variant(hidden_size, rank)
+    assert variant is not None
+    schedule_id: int
+    if variant == "specialized":
+        schedule = select_cake_bgmv_moe_schedule(hidden_size, num_tokens, arch)
+        schedule_id = CAKE_BGMV_MOE_SCHEDULE_IDS[schedule]
+        module = get_cake_bgmv_moe_module(hidden_size, dtype_name, arch)
+    else:
+        generic_schedule = select_cake_bgmv_moe_generic_schedule(
+            hidden_size, num_tokens, arch
+        )
+        schedule_id = CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS[generic_schedule]
+        module = get_cake_bgmv_moe_generic_module(rank, dtype_name, arch)
     return BGMVMoECakePlan(
         module,
         y_accum=y_accum,
@@ -768,7 +801,8 @@ def prepare_bgmv_moe(
         expert_ids=expert_ids,
         lora_indices=lora_indices,
         topk_weights=topk_weights,
-        schedule_id=CAKE_BGMV_MOE_SCHEDULE_IDS[schedule],
+        schedule_id=schedule_id,
+        variant=variant,
     )
 
 
