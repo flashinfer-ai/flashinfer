@@ -152,6 +152,7 @@ def _run(
     backend="reference",
     scale=None,
     compact_rows=None,
+    fuse_dw_cast=None,
 ):
     """One forward + backward through the autograd entry points; ``backend="cake"`` goes
     through the public module.  Returns ``loss`` / ``logp`` / ``dX`` / ``dW`` and the leaves."""
@@ -180,6 +181,7 @@ def _run(
                 grad_weight_dtype=grad_weight_dtype,
                 backend=backend,
                 compact_rows=compact_rows,
+                fuse_dw_cast=fuse_dw_cast,
             )
             if train_x or train_w:
                 (loss if scale is None else loss * scale).backward()
@@ -191,6 +193,7 @@ def _run(
                 chunk_size=C,
                 backend=backend,
                 compact_rows=compact_rows,
+                fuse_dw_cast=fuse_dw_cast,
             )
             loss = (logp.detach() * inp.dlogp)[inp.valid].sum()
             if train_x or train_w:
@@ -270,7 +273,9 @@ def test_public_api_is_marked_experimental():
 def test_registry_records_are_well_formed():
     assert cake_jit.STAGES == (
         "gemm_logits",
+        "gemm_logits_g16",
         "gemm_logits_nostats",
+        "gemm_logits_nostats_g16",
         "row_finalize",
         "loss_reduce",
         "row_grad",
@@ -278,9 +283,35 @@ def test_registry_records_are_well_formed():
         "gemm_dx_s2",
         "gemm_dx_s3",
         "gemm_dx_s4",
+        "gemm_dx_tn256",
+        "gemm_dx_s2_tn256",
+        "gemm_dx_s3_tn256",
+        "gemm_dx_s4_tn256",
+        "gemm_dx_st3",
+        "gemm_dx_s2_st3",
+        "gemm_dx_s3_st3",
+        "gemm_dx_s4_st3",
         "gemm_dw_acc",
+        "gemm_dw_acc_g16",
+        "gemm_dw_acc_g32",
+        "gemm_dw_acc_gn12",
+        "gemm_dw_cast_bf16",
+        "gemm_dw_cast_bf16_g16",
+        "gemm_dw_cast_bf16_g32",
+        "gemm_dw_cast_f32",
+        "gemm_dw_cast_f32_g16",
+        "gemm_dw_cast_f32_g32",
+        "gemm_dw_cast_f32_gn12",
         "scale_cast_bf16",
         "scale_cast_f32",
+    )
+    assert (
+        tuple(s for s in cake_jit.STAGES if cake_backend.base_stage(s) == s)
+        == cake_jit.BASE_STAGES
+    )
+    assert (
+        tuple(s for s in cake_jit.STAGES if s.startswith("gemm_"))
+        == cake_jit.GEMM_STAGES
     )
     assert set(STAGE_TENSORS) == set(cake_jit.STAGES)
     assert set(CONTRACT_ALIASES.values()) <= set().union(*_STAGE_VALUES.values())
@@ -289,7 +320,12 @@ def test_registry_records_are_well_formed():
         assert record["arch"] in SUPPORTED_COMPUTE_CAPABILITIES.values()
         assert record_abi(record) in SUPPORTED_ABIS
         assert len(record["closure_sha256"]) == 64
-        assert cake_jit.select_module(record["arch"]) == name
+        assert (
+            cake_jit.select_module(record["arch"], *cake_jit.record_geometry(record))
+            == name
+        )
+        if name == cake_jit.PRIMARY_RECORD.format(arch=record["arch"]):
+            assert cake_jit.select_module(record["arch"]) == name
         geometry = Geometry.from_record(record)
         assert (
             geometry.hidden is None or geometry.hidden % geometry.hidden_multiple == 0
@@ -355,7 +391,8 @@ def test_plan_chunks_examples():
 
 
 def test_stages_for_entry():
-    full = stages_for_entry("loss")
+    unfused = dict(fuse_dw_cast=False)
+    full = stages_for_entry("loss", **unfused)
     assert full == (
         "gemm_logits",
         "row_finalize",
@@ -366,29 +403,29 @@ def test_stages_for_entry():
         "scale_cast_bf16",
     )
     assert list(full) == [s for s in cake_jit.STAGES if s in full]  # launch order
-    frozen_x = stages_for_entry("loss", need_dx=False)
+    frozen_x = stages_for_entry("loss", need_dx=False, **unfused)
     assert (
         "gemm_dx" not in frozen_x
         and "gemm_dw_acc" in frozen_x
         and "scale_cast_bf16" in frozen_x
     )
-    frozen_w = stages_for_entry("loss", need_dw=False)
+    frozen_w = stages_for_entry("loss", need_dw=False, **unfused)
     assert (
         "gemm_dw_acc" not in frozen_w
         and "gemm_dx" in frozen_w
         and "scale_cast_f32" not in frozen_w
     )
     frozen_w32 = stages_for_entry(
-        "loss", need_dw=False, grad_weight_dtype=torch.float32
+        "loss", need_dw=False, grad_weight_dtype=torch.float32, **unfused
     )
     assert "scale_cast_f32" not in frozen_w32  # the FP32 cast belongs to dW only
-    neither = stages_for_entry("loss", need_dx=False, need_dw=False)
+    neither = stages_for_entry("loss", need_dx=False, need_dw=False, **unfused)
     assert neither == ("gemm_logits", "row_finalize", "loss_reduce")
-    fp32 = stages_for_entry("loss", grad_weight_dtype=torch.float32)
+    fp32 = stages_for_entry("loss", grad_weight_dtype=torch.float32, **unfused)
     assert (
         "scale_cast_f32" in fp32 and "scale_cast_bf16" in fp32
     )  # dW in FP32, dX in BF16
-    logprob = stages_for_entry("logprob")
+    logprob = stages_for_entry("logprob", **unfused)
     assert "gemm_logits_nostats" in logprob and "loss_reduce" not in logprob
     assert logprob == (
         "gemm_logits",
@@ -400,12 +437,55 @@ def test_stages_for_entry():
         "scale_cast_bf16",
     )
     assert "scale_cast_f32" not in stages_for_entry(
-        "logprob", grad_weight_dtype=torch.float32
+        "logprob", grad_weight_dtype=torch.float32, **unfused
     )  # dW is BF16 there
-    assert stages_for_entry("logprob", need_dx=False, need_dw=False) == (
+    assert stages_for_entry("logprob", need_dx=False, need_dw=False, **unfused) == (
         "gemm_logits",
         "gemm_logits_nostats",
         "row_finalize",
+    )
+    # the fused weight-gradient cast: the last chunk's GEMM replaces the flat dW cast (dX keeps its cast),
+    # the accumulator GEMM stays for the chunks before it and is absent from a one-chunk plan
+    fused = stages_for_entry("loss", fuse_dw_cast=True)
+    assert fused == (
+        "gemm_logits",
+        "row_finalize",
+        "loss_reduce",
+        "row_grad",
+        "gemm_dx",
+        "gemm_dw_acc",
+        "gemm_dw_cast_bf16",
+        "scale_cast_bf16",
+    )
+    assert stages_for_entry("loss", fuse_dw_cast=True, num_chunks=2) == fused
+    one = stages_for_entry("loss", fuse_dw_cast=True, num_chunks=1)
+    assert "gemm_dw_acc" not in one and "gemm_dw_cast_bf16" in one
+    fused32 = stages_for_entry(
+        "loss", grad_weight_dtype=torch.float32, fuse_dw_cast=True
+    )
+    assert (
+        "gemm_dw_cast_f32" in fused32
+        and "gemm_dw_cast_bf16" not in fused32
+        and "scale_cast_f32" not in fused32
+        and "scale_cast_bf16" in fused32
+    )
+    assert stages_for_entry("logprob", fuse_dw_cast=True)[-3:] == (
+        "gemm_dw_acc",
+        "gemm_dw_cast_bf16",
+        "scale_cast_bf16",
+    )
+    frozen_w_fused = stages_for_entry("loss", need_dw=False, fuse_dw_cast=True)
+    assert frozen_w_fused == frozen_w  # no weight gradient, no fused stage
+    assert stages_for_entry("loss", need_dx=False, fuse_dw_cast=True, num_chunks=1) == (
+        "gemm_logits",
+        "row_finalize",
+        "loss_reduce",
+        "row_grad",
+        "gemm_dw_cast_bf16",
+    )
+    # the default form follows the environment knob
+    assert stages_for_entry("loss") == stages_for_entry(
+        "loss", fuse_dw_cast=cake_backend.fuse_dw_cast_default()
     )
     with pytest.raises(ValueError):
         stages_for_entry("other")
@@ -825,7 +905,12 @@ def test_geometry_cluster_ctas():
     assert (
         g.cluster_ctas_of("gemm_dx") == 4
         and g.cluster_ctas_of("gemm_dx_s3") == 4
+        and g.cluster_ctas_of("gemm_dx_s3_tn256") == 4
         and g.cluster_ctas_of("gemm_dw_acc") == 2
+        and g.cluster_ctas_of("gemm_dw_acc_g32") == 2
+        and g.cluster_ctas_of("gemm_dw_acc_g16") == 2
+        and g.cluster_ctas_of("gemm_logits_g16") == 2
+        and g.cluster_ctas_of("gemm_dw_cast_f32_g32") == 2
     )
     assert (
         g.cluster_ctas_of("row_grad") is None
@@ -839,6 +924,892 @@ def test_geometry_cluster_ctas():
     ) == (2, 2, 2)
     with pytest.raises(ValueError):
         Geometry.from_record({"geometry": {"dx_cluster_ctas": 0}})
+
+
+# --------------------------------------------------------------------------- per-chunk instance variants
+
+
+def test_stage_variant_grammar():
+    bases = cake_jit.BASE_STAGES
+    assert len(bases) == 11 and set(bases) <= set(cake_jit.STAGES)
+    for stage in cake_jit.STAGES:
+        base, knobs = cake_backend.parse_stage(stage)
+        assert base in bases and cake_backend.stage_variant(base, **knobs) == stage
+        assert set(knobs) == {
+            "k_slices",
+            "tile_n",
+            "group_m",
+            "epi_store",
+            "stages",
+            "group_n",
+        }
+    assert (
+        cake_backend.stage_variant("gemm_dx", k_slices=3, tile_n=256)
+        == "gemm_dx_s3_tn256"
+    )
+    assert cake_backend.stage_variant("gemm_dx", k_slices=1, tile_n=512) == "gemm_dx"
+    # the 3-deep ring of the 512-wide dX tile, the 2-D blocked weight-gradient raster
+    assert (
+        cake_backend.stage_variant("gemm_dx", k_slices=3, stages=3) == "gemm_dx_s3_st3"
+    )
+    assert cake_backend.stage_variant("gemm_dx", stages=3, tile_n=512) == "gemm_dx_st3"
+    assert (
+        cake_backend.stage_variant("gemm_dx", stages=4) == "gemm_dx"
+    )  # the table depth
+    assert cake_backend.stage_variant("gemm_dw_acc", group_n=12) == "gemm_dw_acc_gn12"
+    assert cake_backend.stage_variant("gemm_dw_acc", group_n=0) == "gemm_dw_acc"
+    assert (
+        cake_backend.stage_variant("gemm_dw_cast_f32", group_n=12)
+        == "gemm_dw_cast_f32_gn12"
+    )
+    assert cake_backend.parse_stage("gemm_dx_s2_st3") == (
+        "gemm_dx",
+        {
+            "k_slices": 2,
+            "tile_n": None,
+            "group_m": None,
+            "epi_store": None,
+            "stages": 3,
+            "group_n": None,
+        },
+    )
+    assert cake_backend.parse_stage("gemm_dw_cast_f32_gn12")[1]["group_n"] == 12
+    for bad in (
+        dict(base="gemm_dx", tile_n=256, stages=3),  # the narrow tile keeps its depth
+        dict(base="gemm_dx", stages=5),
+        dict(base="gemm_dw_acc", stages=3),
+        dict(
+            base="gemm_dw_cast_bf16", group_n=12
+        ),  # the bf16 cast keeps the 1-D raster
+        dict(base="gemm_dw_acc", group_n=8),
+        dict(base="gemm_logits", group_n=12),
+    ):
+        with pytest.raises(ValueError):
+            cake_backend.stage_variant(**bad)
+    for bad_name in ("gemm_dw_cast_bf16_gn12", "gemm_dx_tn256_st3", "gemm_dx_gn12"):
+        with pytest.raises(ValueError):
+            cake_backend.parse_stage(bad_name)
+    assert (
+        cake_backend.stage_variant("gemm_dw_acc", group_m=32, epi_store="tma")
+        == "gemm_dw_acc_g32_tma"
+    )
+    assert (
+        cake_backend.stage_variant("gemm_dw_acc", group_m=16, epi_store="tma")
+        == "gemm_dw_acc_g16_tma"
+    )  # grammar only: no rule selects an epilogue form and no record registers a _tma stage
+    assert cake_backend.stage_variant("gemm_dw_acc", group_m=16) == "gemm_dw_acc_g16"
+    assert (
+        cake_backend.stage_variant("gemm_dw_cast_bf16", group_m=16)
+        == "gemm_dw_cast_bf16_g16"
+    )
+    assert cake_backend.parse_stage("gemm_dw_cast_f32_g16") == (
+        "gemm_dw_cast_f32",
+        dict(
+            k_slices=1,
+            tile_n=None,
+            group_m=16,
+            epi_store=None,
+            stages=None,
+            group_n=None,
+        ),
+    )
+    assert cake_backend.stage_variant("gemm_dw_acc", epi_store="redsm") == "gemm_dw_acc"
+    assert (
+        cake_backend.stage_variant("gemm_dw_cast_f32", group_m=32)
+        == "gemm_dw_cast_f32_g32"
+    )
+    assert (
+        cake_backend.stage_variant("gemm_logits_nostats", group_m=16)
+        == "gemm_logits_nostats_g16"
+    )
+    assert (
+        cake_backend.dx_stage(2) == "gemm_dx_s2"
+        and cake_backend.dx_stage(1, 256) == "gemm_dx_tn256"
+    )
+    assert cake_backend.dx_stage(4, 512) == "gemm_dx_s4"
+    for bad in (
+        dict(base="row_grad", group_m=16),
+        dict(base="gemm_logits", k_slices=2),
+        dict(base="gemm_dx", tile_n=128),
+        dict(base="gemm_dx", k_slices=5),
+        dict(base="gemm_dw_cast_bf16", epi_store="tma"),
+        dict(base="gemm_logits", epi_store="tma"),
+        dict(base="gemm_dw_acc", epi_store="cast_bf16"),
+        dict(base="other"),
+    ):
+        with pytest.raises(ValueError):
+            cake_backend.stage_variant(bad.pop("base"), **bad)
+    for bad in (
+        "gemm_dx_g16",
+        "gemm_logits_s2",
+        "gemm_dw_acc_tma_g32",
+        "gemm_dx_tn128",
+        "row_grad_g16",
+        "scale_cast",
+        "gemm_dw_cast_bf16_tma",
+    ):
+        with pytest.raises(ValueError):
+            cake_backend.parse_stage(bad)
+    with pytest.raises(ValueError):
+        cake_backend.base_stage("gemm_dx_s9")
+
+
+def test_instance_rules_mirror_the_launchers():
+    assert (cake_backend.RASTER_RULE_MIN_HIDDEN, cake_backend.RASTER_RULE_MIN_ROWS) == (
+        7168,
+        2049,
+    )
+    assert cake_backend.RASTER_WIDE_GROUPS == {"sm_100a": (16, 32), "sm_103a": (16, 32)}
+    assert cake_backend.DW_LONG_CHUNK_GROUP_M == 16
+    assert cake_backend.DW_LONG_CHUNK_GROUPS == {"sm_100a": 16, "sm_103a": 16}
+    assert cake_backend.DW_LONG_CHUNK_MIN_ROWS == 4097
+    assert not hasattr(
+        cake_backend, "dw_epilogue_variant"
+    )  # no epilogue rule: the SM103 TMA reduce-add above 4096 rows was retired
+    assert (cake_backend.DX_TILE_WIDE, cake_backend.DX_TILE_NARROW) == (512, 256)
+    assert cake_backend.DX_LONG_CHUNK_STAGES == {"sm_100a": 3, "sm_103a": 3}
+    assert cake_backend.DX_WIDE_TILE_STAGES == 4
+    assert cake_backend.DW_BLOCK_GROUPS == {"sm_100a": 12, "sm_103a": 12}
+    assert (cake_backend.DW_BLOCK_MIN_ROWS, cake_backend.DW_BLOCK_MAX_ROWS) == (
+        2049,
+        4096,
+    )
+    assert cake_backend.DW_BLOCK_BASES == ("gemm_dw_acc", "gemm_dw_cast_f32")
+    # the dX tile rule's wave-efficiency floor: SM100 only, one-slice launches below H 7168 (T 65031 / 32463 tails at
+    # chunk 4096: 15 row pairs x 12 = 180 wide items on 74 SM pairs = 2.43 waves, 81 % < 83 % -> the 256-wide form)
+    assert cake_backend.DX_WIDE_MIN_EFF == {"sm_100a": 0.83}
+    g_glm = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    g_wide = Geometry.from_record({"geometry": {"hidden": 7168, "vocab": 129280}})
+    assert cake_backend.dx_tile_rule(3591, 6144, 148, 1, g_glm, "sm_100a") == 256
+    assert cake_backend.dx_tile_rule(3663, 6144, 148, 1, g_glm, "sm_100a") == 256
+    assert cake_backend.dx_tile_rule(2049, 6144, 148, 1, g_glm, "sm_100a") == 256
+    # the floor's bands at chunk 4096 (one slice): 2049-2304 (73 %) and 3585-3840 (81 %) take the 256-wide form, 5121-5376
+    # (85 %) and 6657-6912 (88 %) keep the wide tile; SM103 has no floor
+    for rows, tile in ((2200, 256), (3700, 256), (3791, 256), (5200, 512), (6800, 512)):
+        assert cake_backend.dx_tile_rule(rows, 6144, 148, 1, g_glm, "sm_100a") == tile
+        assert cake_backend.dx_tile_rule(rows, 6144, 148, 1, g_glm, "sm_103a") == 512
+    assert (
+        cake_backend.dx_tile_rule(3591, 6144, 148, 2, g_glm, "sm_100a") == 512
+    )  # two slices: 360 items / 5 waves = 97 %
+    assert (
+        cake_backend.dx_tile_rule(3591, 6144, 148, 1, g_glm, "sm_103a") == 512
+    )  # no floor on SM103
+    assert cake_backend.dx_tile_rule(3591, 6144, 148, 1, g_glm, None) == 512
+    assert (
+        cake_backend.dx_tile_rule(3591, 7168, 148, 1, g_wide, "sm_100a") == 512
+    )  # the floor is GLM-class only
+    assert (
+        cake_backend.dx_tile_rule(1, 6144, 148, 1, g_glm, "sm_103a") == 256
+    )  # the wave-fill rule is unchanged on both architectures
+    for arch in ("sm_100a", "sm_103a"):
+        # the dX ring rule: the 512-wide tile at the default geometry's long chunks, both architectures
+        assert cake_backend.dx_stages_variant(4097, 6144, None, arch) == 3
+        assert cake_backend.dx_stages_variant(8192, 6144, 512, arch) == 3
+        assert cake_backend.dx_stages_variant(4096, 6144, None, arch) is None
+        assert cake_backend.dx_stages_variant(8192, 6144, 256, arch) is None
+        assert cake_backend.dx_stages_variant(8192, 7168, None, arch) is None
+    assert cake_backend.dx_stages_variant(8192, 6144, None, None) is None
+    # the dW block rule: both architectures, the C 4096 chunk and its tails of the default geometry
+    for arch in ("sm_100a", "sm_103a"):
+        assert cake_backend.dw_block_variant(4096, 6144, arch) == 12
+        assert cake_backend.dw_block_variant(3943, 6144, arch) == 12
+        assert cake_backend.dw_block_variant(2049, 6144, arch) == 12
+        assert cake_backend.dw_block_variant(2048, 6144, arch) is None
+        assert cake_backend.dw_block_variant(4097, 6144, arch) is None
+        assert cake_backend.dw_block_variant(4096, 7168, arch) is None
+        assert cake_backend._dw_block_group(arch, 6144) == 12
+        assert (
+            cake_backend._dw_block_group(arch, 6912) is None
+        )  # 27 column tiles: the block would not tile them
+    assert cake_backend.dw_block_variant(4096, 6144, None) is None
+    for arch in ("sm_100a", "sm_103a"):
+        assert (
+            cake_backend.raster_variant(6144, 4096, arch) is None
+        )  # the default geometry up to 4096 rows: never
+        assert cake_backend.raster_variant(6144, 1, arch) is None
+        assert (
+            cake_backend.raster_variant(7168, 2048, arch) is None
+        )  # one row short of the rule
+        assert cake_backend.raster_variant(7168, 2049, arch) == (16, 32)
+        assert cake_backend.raster_variant(8192, 4096, arch) == (16, 32)
+        assert cake_backend.raster_variant(8192, 8192, arch) == (
+            16,
+            32,
+        )  # the wide rule owns H >= 7168 at every length
+    # the default geometry's long chunks (more than 4096 rows): the weight-gradient raster only, both architectures
+    for rows in (4097, 8039, 8117, 8192, 16231, 65536):
+        for arch in ("sm_100a", "sm_103a"):
+            assert cake_backend.raster_variant(6144, rows, arch) == (None, 16)
+            assert cake_backend.raster_variant(6912, rows, arch) == (
+                None,
+                16,
+            )  # every H below 7168
+    for arch in ("sm_100a", "sm_103a"):
+        assert (
+            cake_backend.raster_variant(6144, 4096, arch) is None
+        )  # one row short of the long-chunk rule
+        assert cake_backend.raster_variant(6912, 4096, arch) is None
+    assert cake_backend.raster_variant(8192, 4096, None) is None
+    assert cake_backend.raster_variant(8192, 4096, "sm_90a") is None
+    assert cake_backend.raster_variant(6144, 8192, "sm_90a") is None
+    assert cake_backend._dw_raster_groups("sm_103a", 6144) == (None, 16)
+    assert cake_backend._dw_raster_groups("sm_100a", 6144) == (None, 16)
+    assert cake_backend._dw_raster_groups("sm_103a", 7168) == (None, 32)
+    assert cake_backend._dw_raster_groups("sm_103a", None) == (
+        None,
+    ) and cake_backend._dw_raster_groups(None, 6144) == (None,)
+    g = Geometry.from_record(None)
+    rule = cake_backend.dx_tile_rule
+    assert (
+        rule(4096, 6144, 148, 1, g) == 512
+    )  # 16 row pairs x 12 = 192 wide items >= 74 SM pairs
+    assert rule(4096, 6144, 148, 4, g) == 512
+    assert rule(3943, 6144, 148, 1, g) == 512 and rule(1895, 6144, 148, 1, g) == 512
+    assert rule(128, 6144, 148, 3, g) == 256  # 1 x 12 x 3 = 36 items < 74
+    assert rule(1, 6144, 148, 4, g) == 256  # 48 < 74
+    assert rule(1, 8192, 160, 4, g) == 256  # 1 x 16 x 4 = 64 < 80
+    assert rule(1024, 8192, 160, 1, g) == 256  # 4 x 16 = 64 < 80
+    assert rule(2048, 8192, 160, 1, g) == 512  # 8 x 16 = 128 >= 80
+    assert rule(4096, 7168, 148, 1, g) == 512  # 7168 = 14 x 512
+    assert rule(4096, 6400, 148, 1, g) == 256  # H % 512 != 0
+    assert rule(4096, 6144, 1, 1, g) == 512  # one SM: the wide tile always fills
+
+
+def _problem(T, H, V, C, objective="ce", entry="loss", dtype=torch.bfloat16):
+    return cake_backend.Problem(
+        num_rows=T,
+        hidden=H,
+        vocab=V,
+        chunk=C,
+        ld_x=H,
+        x_copy=False,
+        objective=objective,
+        loss_div=1.0 if objective == "ce" else None,
+        grad_weight_dtype=dtype,
+        entry=entry,
+    )
+
+
+def test_make_plan_selects_the_rule_variants_per_chunk():
+    g = Geometry.from_record({"geometry": {"hidden": 7168, "vocab": 129280}})
+    plan = cake_backend.make_plan(
+        _problem(16231, 7168, 129280, 4096),
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        arch="sm_100a",
+    )
+    assert plan.chunks == ((0, 4096), (4096, 4096), (8192, 4096), (12288, 3943))
+    for i, (_, rows_c) in enumerate(plan.chunks):
+        v = plan.variants_of(i)
+        assert (v.logits_group_m, v.dw_group_m, v.dw_epi_store) == (16, 32, None)
+        assert plan.logits_stage(i) == "gemm_logits_g16"
+        assert plan.logits_stage(i, stats=False) == "gemm_logits_nostats_g16"
+        k = recommended_k_slices(rows_c, 7168, 148, 4, g, 74)
+        tile = cake_backend.dx_tile_rule(rows_c, 7168, 148, k, g)
+        assert plan.dx_slices_of(i) == k
+        assert plan.dx_stage_of(i) == cake_backend.stage_variant(
+            "gemm_dx", k_slices=k, tile_n=tile
+        )
+    assert all(plan.dw_acc_stage(i) == "gemm_dw_acc_g32" for i in range(3))
+    assert plan.dw_cast_stage == "gemm_dw_cast_bf16_g32"
+    assert "gemm_logits" not in plan.stages and "gemm_dw_acc" not in plan.stages
+    assert {
+        "gemm_logits_g16",
+        "gemm_dw_acc_g32",
+        "gemm_dw_cast_bf16_g32",
+        "row_finalize",
+        "loss_reduce",
+        "row_grad",
+        "scale_cast_bf16",
+    } <= set(plan.stages)
+    assert list(plan.stages) == [s for s in cake_jit.STAGES if s in plan.stages]
+    first = [
+        k[0]
+        for k in cake_backend.forward_keys(plan)
+        if k[1] == 0 and k[0].startswith("gemm")
+    ]
+    assert first == ["gemm_logits_g16", plan.dx_stage_of(0), "gemm_dw_acc_g32"]
+    assert cake_backend.cast_keys(plan)[-1] == ("gemm_dw_cast_bf16_g32", 3)
+    logprob = cake_backend.make_plan(
+        _problem(16231, 7168, 129280, 4096, entry="logprob"),
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        arch="sm_100a",
+    )
+    recompute = [
+        k[0]
+        for k in cake_backend.recompute_keys(logprob)
+        if k[1] == 3 and k[0].startswith("gemm")
+    ]
+    assert recompute == [
+        "gemm_logits_nostats_g16",
+        logprob.dx_stage_of(3),
+        "gemm_dw_cast_bf16_g32",
+    ]
+    # the default geometry: the blocked weight-gradient raster at the 4096-row chunk, the default raster elsewhere; a
+    # one-row tail takes the K-sliced narrow dX tile
+    g0 = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    tail = cake_backend.make_plan(
+        _problem(4097, 6144, 154880, 4096),
+        need_dx=True,
+        need_dw=True,
+        geometry=g0,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        arch="sm_100a",
+    )
+    assert tail.chunks == ((0, 4096), (4096, 1))
+    assert (
+        tail.logits_stage(1) == "gemm_logits"
+        and tail.dw_acc_stage(0) == "gemm_dw_acc_gn12"
+    )
+    assert tail.dw_cast_stage == "gemm_dw_cast_bf16"
+    assert (
+        tail.dx_slices_of(0) == 4 and tail.dx_stage_of(0) == "gemm_dx_s4"
+    )  # 16 x 12 x 4 = 768 wide items
+    assert (
+        tail.dx_slices_of(1) == 3 and tail.dx_stage_of(1) == "gemm_dx_s3_tn256"
+    )  # 1 x 12 x 3 = 36 < 74 pairs
+    assert tail.stages == (
+        "gemm_logits",
+        "row_finalize",
+        "loss_reduce",
+        "row_grad",
+        "gemm_dx_s4",
+        "gemm_dx_s3_tn256",
+        "gemm_dw_acc_gn12",
+        "gemm_dw_cast_bf16",
+        "scale_cast_bf16",
+    )
+    # SM103 at a wide geometry: the wide weight-gradient raster of the accumulate (no epilogue rule)
+    big = cake_backend.make_plan(
+        _problem(16384, 7168, 129280, 8192),
+        need_dx=False,
+        need_dw=True,
+        geometry=g,
+        num_sms=160,
+        arch="sm_103a",
+    )
+    assert big.chunks == ((0, 8192), (8192, 8192))
+    assert (
+        big.dw_acc_stage(0) == "gemm_dw_acc_g32"
+        and big.dw_cast_stage == "scale_cast_bf16"
+    )
+    # the default geometry's long chunks (more than 4096 rows): the taller weight-gradient raster (group_m 16) in the
+    # accumulate and in the fused cast; the one-row tail and chunks of up to 4096 rows keep the defaults
+    long_chunks = cake_backend.make_plan(
+        _problem(8193, 6144, 154880, 8192),
+        need_dx=False,
+        need_dw=True,
+        geometry=g0,
+        num_sms=160,
+        arch="sm_103a",
+    )
+    assert long_chunks.chunks == ((0, 8192), (8192, 1))
+    assert (
+        long_chunks.dw_acc_stage(0) == "gemm_dw_acc_g16"
+        and long_chunks.dw_acc_stage(1) == "gemm_dw_acc"
+    )
+    assert (
+        long_chunks.logits_stage(0) == "gemm_logits"
+    )  # the logits raster has no long-chunk rule
+    assert (
+        long_chunks.variants_of(0).dw_group_m,
+        long_chunks.variants_of(0).dw_epi_store,
+    ) == (16, None)
+    assert (
+        cake_backend.make_plan(
+            _problem(8192, 6144, 154880, 4096),
+            need_dx=False,
+            need_dw=True,
+            geometry=g0,
+            num_sms=160,
+            arch="sm_103a",
+        ).dw_acc_stage(1)
+        == "gemm_dw_acc_gn12"
+    )  # SM103 at the C 4096 chunk: the 2-D blocked raster
+    assert (
+        cake_backend.make_plan(
+            _problem(8192, 6144, 154880, 4096),
+            need_dx=False,
+            need_dw=True,
+            geometry=g0,
+            num_sms=148,
+            arch="sm_100a",
+        ).dw_acc_stage(1)
+        == "gemm_dw_acc_gn12"
+    )  # SM100 as well: the 2-D blocked raster at the C 4096 chunk
+    assert (
+        cake_backend.make_plan(
+            _problem(8193, 6144, 154880, 8192),
+            need_dx=False,
+            need_dw=True,
+            geometry=g0,
+            num_sms=148,
+            arch="sm_100a",
+        ).dw_acc_stage(0)
+        == "gemm_dw_acc_g16"
+    )  # SM100 too: the long-chunk rule is the same on both architectures
+    one = cake_backend.make_plan(
+        _problem(8192, 6144, 154880, 8192),
+        need_dx=False,
+        need_dw=True,
+        geometry=g0,
+        num_sms=160,
+        fuse_dw_cast=True,
+        arch="sm_103a",
+    )
+    assert one.stages == (
+        "gemm_logits",
+        "row_finalize",
+        "loss_reduce",
+        "row_grad",
+        "gemm_dw_cast_bf16_g16",
+    )
+    assert one.dw_cast_stage == "gemm_dw_cast_bf16_g16"
+    deferred_tail = cake_backend.make_plan(
+        _problem(16231, 6144, 154880, 8192),
+        need_dx=False,
+        need_dw=True,
+        geometry=g0,
+        num_sms=160,
+        fuse_dw_cast=True,
+        arch="sm_103a",
+    )
+    assert deferred_tail.chunks == ((0, 8192), (8192, 8039))
+    assert (
+        deferred_tail.dw_acc_stage(0) == "gemm_dw_acc_g16"
+        and deferred_tail.dw_cast_stage == "gemm_dw_cast_bf16_g16"
+    )
+    assert (
+        cake_backend.make_plan(
+            _problem(8192, 6144, 154880, 8192),
+            need_dx=False,
+            need_dw=True,
+            geometry=g0,
+            num_sms=148,
+            fuse_dw_cast=True,
+            arch="sm_100a",
+        ).dw_cast_stage
+        == "gemm_dw_cast_bf16_g16"
+    )  # one chunk of 8192 rows: the long-chunk raster in the fused cast on SM100 as well
+    # the default geometry's long chunks with dX: the 3-deep operand ring of the 512-wide tile, both architectures
+    for arch, sms, resident in (("sm_103a", 160, 80), ("sm_100a", 148, 74)):
+        ring = cake_backend.make_plan(
+            _problem(16231, 6144, 154880, 8192),
+            need_dx=True,
+            need_dw=True,
+            geometry=g0,
+            dx_max_slices=4,
+            num_sms=sms,
+            dx_resident=resident,
+            fuse_dw_cast=True,
+            arch=arch,
+        )
+        assert ring.chunks == ((0, 8192), (8192, 8039))
+        for i, (_, rows_c) in enumerate(ring.chunks):
+            k = recommended_k_slices(rows_c, 6144, sms, 4, g0, resident)
+            tile = cake_backend.dx_tile_rule(rows_c, 6144, sms, k, g0, arch)
+            assert ring.dx_stage_of(i) == cake_backend.stage_variant(
+                "gemm_dx", k_slices=k, tile_n=tile, stages=3 if tile == 512 else None
+            )
+            if tile == 512:
+                assert ring.dx_stage_of(i).endswith("_st3")
+                assert ring.variants_of(i).dx_stages == 3
+            else:  # the tile rule's wave-efficiency floor (SM100): the 256-wide form keeps its ring depth
+                assert ring.dx_stage_of(i).endswith("_tn256")
+                assert ring.variants_of(i).dx_stages is None
+            assert (
+                ring.variants_of(i).dw_group_n is None
+            )  # above 4096 rows: the raster rule, not the block
+        assert ring.dw_acc_stage(0) == "gemm_dw_acc_g16"
+        pinned_ring = cake_backend.make_plan(
+            _problem(16231, 6144, 154880, 8192),
+            gemm_tuning={"dx": {"stages": 4}},
+            need_dx=True,
+            need_dw=True,
+            geometry=g0,
+            dx_max_slices=4,
+            num_sms=sms,
+            dx_resident=resident,
+            fuse_dw_cast=True,
+            arch=arch,
+        )
+        assert all(not s.endswith("_st3") for s in pinned_ring.stages)
+    # the default geometry's C 4096 chunks on both architectures: the blocked weight-gradient raster in the accumulate
+    # and in the fp32 fused cast; the bf16 cast keeps the 1-D raster; a pinned ``group_n`` (0 or null) keeps the default
+    for dtype, cast in (
+        (torch.float32, "gemm_dw_cast_f32_gn12"),
+        (torch.bfloat16, "gemm_dw_cast_bf16"),
+    ):
+        for arch, sms, resident in (("sm_100a", 148, 74), ("sm_103a", 160, 80)):
+            blocked = cake_backend.make_plan(
+                _problem(16231, 6144, 154880, 4096, dtype=dtype),
+                need_dx=True,
+                need_dw=True,
+                geometry=g0,
+                dx_max_slices=4,
+                num_sms=sms,
+                dx_resident=resident,
+                fuse_dw_cast=True,
+                arch=arch,
+            )
+            assert blocked.chunks == (
+                (0, 4096),
+                (4096, 4096),
+                (8192, 4096),
+                (12288, 3943),
+            )
+            assert all(blocked.dw_acc_stage(i) == "gemm_dw_acc_gn12" for i in range(4))
+            assert all(blocked.variants_of(i).dw_group_n == 12 for i in range(4))
+            assert all(
+                not s.endswith("_st3") for s in blocked.stages
+            )  # up to 4096 rows: the table ring
+            assert blocked.dw_cast_stage == cast
+    # the T 65031 tail (3591 rows) at chunk 4096: one slice on both architectures; SM100 takes the 256-wide cluster form
+    # (the wave-efficiency floor), SM103 keeps the wide tile; a pinned tile_n=512 wins
+    for arch, sms, resident, tail_stage in (
+        ("sm_100a", 148, 74, "gemm_dx_tn256"),
+        ("sm_103a", 160, 80, "gemm_dx"),
+    ):
+        tail_plan = cake_backend.make_plan(
+            _problem(65031, 6144, 154880, 4096),
+            need_dx=True,
+            need_dw=True,
+            geometry=g0,
+            dx_max_slices=4,
+            num_sms=sms,
+            dx_resident=resident,
+            fuse_dw_cast=True,
+            arch=arch,
+        )
+        assert tail_plan.chunks[-1] == (61440, 3591)
+        last = tail_plan.num_chunks - 1
+        if tail_plan.dx_slices_of(last) == 1:
+            assert tail_plan.dx_stage_of(last) == tail_stage
+        else:  # the slice rule took more than one slice here: no floor, the wide tile
+            assert not tail_plan.dx_stage_of(last).endswith("_tn256")
+        pinned_tail = cake_backend.make_plan(
+            _problem(65031, 6144, 154880, 4096),
+            gemm_tuning={"dx": {"tile_n": 512}},
+            need_dx=True,
+            need_dw=True,
+            geometry=g0,
+            dx_max_slices=4,
+            num_sms=sms,
+            dx_resident=resident,
+            fuse_dw_cast=True,
+            arch=arch,
+        )
+        assert not pinned_tail.dx_stage_of(last).endswith("_tn256")
+    for pin in ({"dw": {"group_n": 0}}, {"dw": {"group_n": None}}):
+        unblocked = cake_backend.make_plan(
+            _problem(16231, 6144, 154880, 4096, dtype=torch.float32),
+            gemm_tuning=pin,
+            need_dx=False,
+            need_dw=True,
+            geometry=g0,
+            num_sms=160,
+            fuse_dw_cast=True,
+            arch="sm_103a",
+        )
+        assert unblocked.dw_acc_stage(0) == "gemm_dw_acc"
+        assert unblocked.dw_cast_stage == "gemm_dw_cast_f32"
+    # the reference path (no architecture) plans the base stages
+    ref = cake_backend.make_plan(
+        _problem(16231, 7168, 129280, 4096),
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        num_sms=148,
+    )
+    assert ref.variants == () and set(ref.stages) <= set(cake_jit.BASE_STAGES)
+
+
+def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
+    g = Geometry.from_record({"geometry": {"hidden": 7168, "vocab": 129280}})
+    kw = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        arch="sm_100a",
+    )
+    problem = _problem(16231, 7168, 129280, 4096)
+    pinned = cake_backend.make_plan(
+        problem,
+        gemm_tuning={
+            "logits": {"group_m": None},
+            "dw": {"group_m": None},
+            "dx": {"tile_n": 256, "k_slices": 2},
+        },
+        **kw,
+    )
+    assert (
+        pinned.logits_stage(0) == "gemm_logits"
+        and pinned.dw_acc_stage(0) == "gemm_dw_acc"
+    )
+    assert pinned.dw_cast_stage == "gemm_dw_cast_bf16"
+    assert all(pinned.dx_stage_of(i) == "gemm_dx_s2_tn256" for i in range(4))
+    partial = cake_backend.make_plan(problem, gemm_tuning={"dx": {"k_slices": 2}}, **kw)
+    assert (
+        partial.logits_stage(0) == "gemm_logits_g16"
+    )  # the rules still decide the knobs not named
+    assert partial.dw_acc_stage(0) == "gemm_dw_acc_g32"
+    assert all(
+        s.startswith("gemm_dx_s2") for s in partial.stages if s.startswith("gemm_dx")
+    )
+    # the default geometry's long chunks: a pinned knob keeps the other rule's output
+    g0 = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    long_kw = dict(
+        need_dx=False,
+        need_dw=True,
+        geometry=g0,
+        num_sms=160,
+        fuse_dw_cast=True,
+        arch="sm_103a",
+    )
+    long_problem = _problem(8193, 6144, 154880, 8192)
+    assert (
+        cake_backend.make_plan(
+            long_problem, gemm_tuning={"dw": {"group_m": None}}, **long_kw
+        ).dw_acc_stage(0)
+        == "gemm_dw_acc"
+    )
+    assert (
+        cake_backend.make_plan(
+            long_problem, gemm_tuning={"dw": {"epi_store": None}}, **long_kw
+        ).dw_acc_stage(0)
+        == "gemm_dw_acc_g16"
+    )
+    assert (
+        cake_backend.make_plan(
+            long_problem, gemm_tuning={"dw": {"group_m": None}}, **long_kw
+        ).dw_cast_stage
+        == "gemm_dw_cast_bf16"
+    )
+    assert (
+        cake_backend.make_plan(
+            long_problem, gemm_tuning={"dw": {"group_m": 32}}, **long_kw
+        ).dw_acc_stage(0)
+        == "gemm_dw_acc_g32"
+    )
+    wide = cake_backend.make_plan(problem, gemm_tuning={"dx": {"tile_n": 512}}, **kw)
+    assert all(not s.endswith("_tn256") for s in wide.stages)
+    with pytest.raises(ValueError, match="k_slices"):
+        cake_backend.make_plan(problem, gemm_tuning={"dx": {"k_slices": 5}}, **kw)
+    for bad in (
+        {"gemm_logits": {"group_m": 16}},
+        {"dx": {"group_m": 16}},
+        {"dw": "tma"},
+        ["dx"],
+    ):
+        with pytest.raises(ValueError):
+            cake_backend._resolve_gemm_tuning(bad)
+    assert cake_backend._resolve_gemm_tuning({"logits": {"group_m": "16"}}) == {
+        "logits": {"group_m": 16}
+    }
+    assert cake_backend._resolve_gemm_tuning(
+        {"dw": {"epi_store": "tma", "group_m": None}}
+    ) == {"dw": {"epi_store": "tma", "group_m": None}}
+
+
+def test_gemm_tuning_default_env(monkeypatch):
+    monkeypatch.delenv(cake_backend.GEMM_TUNING_ENV, raising=False)
+    assert (
+        cake_backend.gemm_tuning_default() == {}
+        and cake_backend._resolve_gemm_tuning(None) == {}
+    )
+    monkeypatch.setenv(
+        cake_backend.GEMM_TUNING_ENV,
+        '{"logits": {"group_m": 16}, "dx": {"tile_n": 256}}',
+    )
+    assert cake_backend.gemm_tuning_default() == {
+        "logits": {"group_m": 16},
+        "dx": {"tile_n": 256},
+    }
+    monkeypatch.setenv(cake_backend.GEMM_TUNING_ENV, "not json")
+    with pytest.raises(ValueError, match="JSON"):
+        cake_backend.gemm_tuning_default()
+    monkeypatch.setenv(cake_backend.GEMM_TUNING_ENV, '{"dx": {"tile_n": 256}}')
+    kw = _valid_call(T=8)
+    X, W, labels = kw["X"], kw["W"], kw["labels"]
+    common = dict(
+        objective="ce",
+        loss_div=1.0,
+        infer_logp=None,
+        loss_weights=None,
+        chunk_size=4096,
+        need_dx=True,
+        need_dw=True,
+        grad_weight_dtype=torch.bfloat16,
+        entry="loss",
+    )
+    env_key = forward_binding_key(
+        X, W, labels, **common
+    )  # the environment's knobs are part of the binding
+    assert env_key == forward_binding_key(
+        X, W, labels, gemm_tuning={"dx": {"tile_n": 256}}, **common
+    )
+    assert env_key != forward_binding_key(X, W, labels, gemm_tuning={}, **common)
+    # the reference path with an explicit knob plans the pinned variant; the reference engine runs its base stage
+    inp = _host_inputs(37)
+    common = dict(
+        objective="ce", loss_div=inp.loss_div, backend="reference", chunk_size=16
+    )
+    narrow = prepare_lm_head_loss(
+        inp.X, inp.W, inp.labels, gemm_tuning={"dx": {"tile_n": 256}}, **common
+    )
+    assert "gemm_dx_tn256" in narrow.stages and "gemm_dx" not in narrow.stages
+    plain = prepare_lm_head_loss(inp.X, inp.W, inp.labels, gemm_tuning={}, **common)
+    assert "gemm_dx" in plain.stages and plain.plan.variants == ()
+    narrow.step(torch.tensor(2.0))
+    plain.step(torch.tensor(2.0))
+    assert torch.equal(narrow.dx_out, plain.dx_out) and torch.equal(
+        narrow.loss, plain.loss
+    )
+    with pytest.raises(ValueError, match="plans"):
+        stage_values("gemm_dx", narrow.tensors, narrow.plan, 0)
+
+
+def test_select_module_by_geometry(monkeypatch):
+    def rec(arch, H, V):
+        return {
+            "arch": arch,
+            "abi": ABI_CONTRACT,
+            "geometry": {"hidden": H, "vocab": V},
+            "stages": [],
+        }
+
+    monkeypatch.setattr(
+        cake_jit,
+        "MODULES",
+        {
+            "cake_lm_head_loss_sm_100a": rec("sm_100a", 6144, 154880),
+            "cake_lm_head_loss_sm_100a_h7168_v129280": rec("sm_100a", 7168, 129280),
+            "cake_lm_head_loss_sm_103a_h8192_v128256": rec("sm_103a", 8192, 128256),
+        },
+    )
+    assert (
+        cake_jit.select_module("sm_100a") == "cake_lm_head_loss_sm_100a"
+    )  # the default-geometry record
+    assert (
+        cake_jit.select_module("sm_100a", 6144, 154880) == "cake_lm_head_loss_sm_100a"
+    )
+    assert (
+        cake_jit.select_module("sm_100a", 7168, 129280)
+        == "cake_lm_head_loss_sm_100a_h7168_v129280"
+    )
+    assert (
+        cake_jit.select_module("sm_103a") == "cake_lm_head_loss_sm_103a_h8192_v128256"
+    )  # the sole record
+    assert (
+        cake_jit.select_module("sm_103a", hidden=8192)
+        == "cake_lm_head_loss_sm_103a_h8192_v128256"
+    )
+    with pytest.raises(ValueError, match="specialized"):
+        cake_jit.select_module("sm_100a", 8192, 128256)
+    with pytest.raises(ValueError, match="specialized"):
+        cake_jit.select_module("sm_103a", 6144, 154880)
+    with pytest.raises(NotImplementedError):
+        cake_jit.select_module("sm_90a")
+    monkeypatch.setattr(
+        cake_jit,
+        "MODULES",
+        {"a": rec("sm_100a", 6144, 154880), "b": rec("sm_100a", 7168, 129280)},
+    )
+    with pytest.raises(NotImplementedError, match="default-geometry"):
+        cake_jit.select_module("sm_100a")
+    assert cake_jit.select_module("sm_100a", 7168, 129280) == "b"
+    monkeypatch.setattr(
+        cake_jit,
+        "MODULES",
+        {"a": rec("sm_100a", None, None), "b": rec("sm_100a", 7168, 129280)},
+    )
+    with pytest.raises(NotImplementedError, match="more than one"):
+        cake_jit.select_module(
+            "sm_100a", 7168, 129280
+        )  # an unpinned record accepts every geometry
+    assert cake_jit.record_geometry(rec("sm_100a", None, 4)) == (None, 4)
+
+
+def test_reachable_variants_complete_the_rule_closure():
+    bases = (
+        set(stages_for_entry("loss"))
+        | set(stages_for_entry("loss", grad_weight_dtype=torch.float32))
+        | set(stages_for_entry("logprob"))
+    )
+    glm = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    wide = Geometry.from_record({"geometry": {"hidden": 7168, "vocab": 129280}})
+    rv = cake_backend.reachable_variants
+    dx_all = {
+        "gemm_dx",
+        "gemm_dx_s2",
+        "gemm_dx_s3",
+        "gemm_dx_s4",
+        "gemm_dx_tn256",
+        "gemm_dx_s2_tn256",
+        "gemm_dx_s3_tn256",
+        "gemm_dx_s4_tn256",
+    }
+    glm_dw = {
+        "gemm_dw_acc",
+        "gemm_dw_acc_g16",
+        "gemm_dw_cast_bf16_g16",
+        "gemm_dw_cast_f32_g16",
+    }
+    glm_dx_st3 = {"gemm_dx_st3", "gemm_dx_s2_st3", "gemm_dx_s3_st3", "gemm_dx_s4_st3"}
+    glm_dw_gn12 = {"gemm_dw_acc_gn12", "gemm_dw_cast_f32_gn12"}
+    assert rv(bases, "sm_100a", glm, 4) == dx_all | glm_dx_st3 | glm_dw | glm_dw_gn12
+    # the default geometry: the long-chunk raster of the weight-gradient GEMMs, the dX ring rule and the 2-D blocked
+    # weight-gradient raster on both architectures (no epilogue rule)
+    assert rv(bases, "sm_103a", glm, 4) == rv(bases, "sm_100a", glm, 4)
+    assert rv(bases, "sm_100a", wide, 4) - rv(bases, "sm_100a", glm, 4) == {
+        "gemm_logits_g16",
+        "gemm_logits_nostats_g16",
+        "gemm_dw_acc_g32",
+        "gemm_dw_cast_bf16_g32",
+        "gemm_dw_cast_f32_g32",
+    }
+    assert rv(bases, "sm_103a", wide, 4) == rv(bases, "sm_100a", wide, 4)
+    assert (
+        rv(bases, "sm_100a", glm, 2)
+        == {
+            "gemm_dx",
+            "gemm_dx_s2",
+            "gemm_dx_tn256",
+            "gemm_dx_s2_tn256",
+            "gemm_dx_st3",
+            "gemm_dx_s2_st3",
+        }
+        | glm_dw
+        | glm_dw_gn12
+    )
+    assert rv({"row_grad", "scale_cast_bf16"}, "sm_103a", wide, 4) == set()
+    # every name of STAGES is a base stage or a variant some record can reach
+    assert set(cake_jit.STAGES) == set(cake_jit.BASE_STAGES) | rv(
+        bases, "sm_103a", wide, 4
+    ) | rv(bases, "sm_100a", wide, 4) | rv(bases, "sm_103a", glm, 4)
+    assert len(cake_jit.STAGES) == 32
+    unpinned = Geometry.from_record(None)
+    assert rv(bases, "sm_100a", unpinned, 4) == dx_all | {
+        "gemm_dw_acc"
+    }  # no pinned H: no raster variants required
 
 
 def test_cluster_resident_rule():
@@ -897,10 +1868,11 @@ def test_stage_values_names():
         loss_div=inp.loss_div,
         chunk_size=C,
         backend="reference",
+        fuse_dw_cast=False,
     )
     plan, t = runner.plan, runner.tensors
     assert plan.chunks == ((0, 16), (16, 16), (32, 5)) and plan.chunks[-1][1] == T % C
-    assert runner.stages == stages_for_entry("loss")
+    assert runner.stages == stages_for_entry("loss", fuse_dw_cast=False)
     assert runner.forward_order[:2] == (("gemm_logits", 0), ("row_finalize", 0))
     assert runner.backward_order == (
         ("scale_cast_bf16", "dx"),
@@ -986,9 +1958,17 @@ def test_stage_values_names():
         stage_values("not_a_stage", t, plan, 0)
     # the log-probability entry reads the caller's [T] dlogp at d[row0 + r]
     lp = prepare_lm_head_loss(
-        inp.X, inp.W, inp.labels, chunk_size=C, entry="logprob", backend="reference"
+        inp.X,
+        inp.W,
+        inp.labels,
+        chunk_size=C,
+        entry="logprob",
+        backend="reference",
+        fuse_dw_cast=False,
     )
-    assert lp.stages == stages_for_entry("logprob") and lp.dlogp is lp.tensors["d_in"]
+    assert lp.stages == stages_for_entry("logprob", fuse_dw_cast=False) and (
+        lp.dlogp is lp.tensors["d_in"]
+    )
     assert lp.forward_order == tuple(
         k for i in range(3) for k in (("gemm_logits", i), ("row_finalize", i))
     )
@@ -1181,10 +2161,17 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_and_options():
         dict(need_dw=False),
         dict(grad_weight_dtype=torch.float32),
         dict(entry="logprob"),
+        dict(fuse_dw_cast=True),
+        dict(gemm_tuning={"logits": {"group_m": 16}}),
     ):
         assert base != forward_binding_key(X, W, labels, **dict(common, **option)), (
             option
         )
+    assert forward_binding_key(
+        X, W, labels, gemm_tuning={"dx": {"tile_n": 256}}, **common
+    ) != forward_binding_key(
+        X, W, labels, gemm_tuning={"dx": {"tile_n": 512}}, **common
+    )
     infer, weights = torch.zeros(8), torch.zeros(8)
     policy = dict(
         common,
@@ -1217,6 +2204,28 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_and_options():
     )
     assert bwd != logprob_backward_binding_key(
         X, W, labels, lse, dlogp, chunk_size=2048, need_dx=True, need_dw=True
+    )
+    assert bwd != logprob_backward_binding_key(
+        X,
+        W,
+        labels,
+        lse,
+        dlogp,
+        chunk_size=4096,
+        need_dx=True,
+        need_dw=True,
+        fuse_dw_cast=True,
+    )
+    assert bwd != logprob_backward_binding_key(
+        X,
+        W,
+        labels,
+        lse,
+        dlogp,
+        chunk_size=4096,
+        need_dx=True,
+        need_dw=True,
+        gemm_tuning={"dw": {"group_m": 32}},
     )
     # the compacted row count is a label-dependent fact of the plan
     assert base != forward_binding_key(X, W, labels, valid_rows=4, **common)
@@ -1496,6 +2505,7 @@ def test_grad_weight_dtype_fp32():
         need_dw=True,
         grad_weight_dtype=torch.float32,
         backend="reference",
+        fuse_dw_cast=False,
     )
     dX, dW32 = cake_backend.backward_loss(
         fr.dx_acc,
@@ -1527,8 +2537,39 @@ def test_grad_weight_dtype_fp32():
     assert rel_l2(dW32, oracle["dW"]) <= rel_l2(bf16["dW"], oracle["dW"])
     assert fr.memory["outputs"]["dW"] == 2 * inp.V * inp.H * 2
     assert (
-        stages_for_entry("loss", grad_weight_dtype=torch.float32)[-1]
+        stages_for_entry("loss", grad_weight_dtype=torch.float32, fuse_dw_cast=False)[
+            -1
+        ]
         == "scale_cast_f32"
+    )
+    assert "gemm_dw_cast_f32" in stages_for_entry(
+        "loss", grad_weight_dtype=torch.float32, fuse_dw_cast=True
+    )
+    # the fused form of the same pair: one compacted chunk -> no FP32 accumulator at all, the backward's
+    # GEMM epilogue writes the FP32 dW directly; bitwise the unfused result
+    fused = cake_backend.forward_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        objective="ce",
+        loss_div=inp.loss_div,
+        chunk_size=64,
+        need_dx=True,
+        need_dw=True,
+        grad_weight_dtype=torch.float32,
+        backend="reference",
+        fuse_dw_cast=True,
+    )
+    assert fused.dw_acc is None and fused.dz_last is not None and fused.x_src is inp.X
+    assert fused.x_last is None and torch.equal(
+        fused.x_idx, fr.row_index
+    )  # compacted: one chunk = every valid row
+    assert "dW_acc" not in fused.memory["accumulators"] and fused.memory["fuse_dw_cast"]
+    dXf, dW32f = fused.backward(None, grad_weight_dtype=torch.float32)
+    assert (
+        torch.equal(dW32f, dW32)
+        and torch.equal(dXf, dX)
+        and dW32f.dtype == torch.float32
     )
 
 
@@ -1593,6 +2634,7 @@ def test_upstream_scale_is_applied_once():
         loss_div=inp.loss_div,
         chunk_size=64,
         backend="reference",
+        fuse_dw_cast=False,
     )
     T_v = int(inp.valid.sum())  # the compacted loop: 62 of the 65 rows, one chunk
     assert (
@@ -1913,6 +2955,315 @@ def test_compact_rows_default_env(monkeypatch):
     assert cake_backend.compact_rows_default() is True
 
 
+def test_fuse_dw_cast_default_env(monkeypatch):
+    monkeypatch.delenv(cake_backend.FUSE_DW_CAST_ENV, raising=False)
+    assert cake_backend.fuse_dw_cast_default() is True
+    monkeypatch.setenv(cake_backend.FUSE_DW_CAST_ENV, "0")
+    assert cake_backend.fuse_dw_cast_default() is False
+    assert cake_backend._resolve_fuse(None) is False and cake_backend._resolve_fuse(
+        True
+    )
+    assert "gemm_dw_cast_bf16" not in stages_for_entry("loss")
+    monkeypatch.setenv(cake_backend.FUSE_DW_CAST_ENV, "1")
+    assert cake_backend.fuse_dw_cast_default() is True
+    assert cake_backend._resolve_fuse(False) is False
+    assert "gemm_dw_cast_bf16" in stages_for_entry("loss")
+
+
+def test_memory_report_fused_dw_cast():
+    V, H, C = DEFAULT_V, DEFAULT_H, 4096
+    four = memory_report(16231, H, V, C, fuse_dw_cast=True)
+    assert four["fuse_dw_cast"] and four["accumulators"]["dW_acc"] == V * H * 4
+    assert (
+        four["saved_dz_bytes"] == (16231 - 3 * 4096) * V * 2
+    )  # the last chunk's dz rows stay alive
+    one = memory_report(4096, H, V, C, fuse_dw_cast=True)
+    assert "dW_acc" not in one["accumulators"] and one["saved_dz_bytes"] == 4096 * V * 2
+    assert "dW_acc" in memory_report(4096, H, V, C, fuse_dw_cast=False)["accumulators"]
+    plain = memory_report(16231, H, V, C, fuse_dw_cast=False)
+    assert not plain["fuse_dw_cast"] and plain["saved_dz_bytes"] == 0
+    frozen = memory_report(16231, H, V, C, need_dw=False, fuse_dw_cast=True)
+    assert not frozen["fuse_dw_cast"] and frozen["saved_dz_bytes"] == 0
+    assert memory_report(0, H, V, C, fuse_dw_cast=True)["saved_dz_bytes"] == 0
+    compact = memory_report(4097, H, V, C, valid_rows=3892, fuse_dw_cast=True)
+    assert (
+        compact["saved_dz_bytes"] == 3892 * V * 2
+        and "dW_acc" not in compact["accumulators"]
+    )
+    assert (
+        memory_report(16231, H, V, C)["fuse_dw_cast"]
+        is cake_backend.fuse_dw_cast_default()
+    )
+
+
+def test_fused_dw_cast_plan_and_stage_values():
+    inp = _host_inputs(37)
+    C = 16
+    common = dict(objective="ce", loss_div=inp.loss_div, backend="reference")
+    fused = prepare_lm_head_loss(
+        inp.X, inp.W, inp.labels, chunk_size=C, fuse_dw_cast=True, **common
+    )
+    plain = prepare_lm_head_loss(
+        inp.X, inp.W, inp.labels, chunk_size=C, fuse_dw_cast=False, **common
+    )
+    plan, t = fused.plan, fused.tensors
+    assert plan.fuse_dw_cast and plan.dw_deferred and plan.dw_acc_needed
+    assert plan.last_chunk == (32, 5) and plan.dw_cast_stage == "gemm_dw_cast_bf16"
+    assert not plain.plan.dw_deferred and plain.plan.dw_cast_stage == "scale_cast_bf16"
+    assert fused.stages == stages_for_entry("loss", fuse_dw_cast=True, num_chunks=3)
+    # the forward accumulates the chunks before the last one; the backward runs the last chunk's fused GEMM
+    assert ("gemm_dw_acc", 1) in fused.forward_order and (
+        "gemm_dw_acc",
+        2,
+    ) not in fused.forward_order
+    assert ("gemm_dw_acc", 2) in plain.forward_order
+    assert fused.backward_order == (("scale_cast_bf16", "dx"), ("gemm_dw_cast_bf16", 2))
+    v = stage_values("gemm_dw_cast_bf16", t, plan, 2)
+    assert v["A"].data_ptr() == t["logits"].data_ptr() and tuple(v["A"].shape) == (
+        5,
+        V_HOST,
+    )
+    assert v["B"].data_ptr() == inp.X[32].data_ptr() and tuple(v["B"].shape) == (
+        5,
+        H_HOST,
+    )
+    assert (
+        v["C"] is t["dw_out"]
+        and v["WS"] is t["dw_acc"]
+        and v["STATS_OUT"] is t["grad_scale"]
+    )
+    assert (v["M"], v["k_iters"], v["first_chunk"], v["last_chunk"]) == (
+        V_HOST,
+        1,
+        0,
+        1,
+    )
+    with pytest.raises(ValueError, match="last chunk"):
+        stage_values("gemm_dw_cast_bf16", t, plan, 0)
+    with pytest.raises(ValueError, match="casts its weight gradient"):
+        stage_values("gemm_dw_cast_f32", t, plan, 2)
+    with pytest.raises(ValueError, match="fuse_dw_cast"):
+        stage_values("gemm_dw_cast_bf16", plain.tensors, plain.plan, 2)
+    # the same FP32 operations in the same order: bitwise outputs; the accumulator holds the first chunks
+    fused.step(torch.tensor(3.0))
+    plain.step(torch.tensor(3.0))
+    assert torch.equal(fused.loss, plain.loss) and torch.equal(
+        fused.dx_out, plain.dx_out
+    )
+    assert (
+        torch.equal(fused.dw_out, plain.dw_out) and fused.dw_out.dtype == torch.bfloat16
+    )
+    assert torch.equal(
+        t["dw_acc"] + cake_backend._mm_fp32(v["A"].t(), v["B"]), plain.tensors["dw_acc"]
+    )
+    # one chunk: no FP32 [V, H] accumulator exists, the GEMM stores cast(g * tile)
+    one = prepare_lm_head_loss(
+        inp.X, inp.W, inp.labels, chunk_size=64, fuse_dw_cast=True, **common
+    )
+    assert one.plan.dw_deferred and not one.plan.dw_acc_needed and one.dw_acc is None
+    assert "dw_acc" not in one.tensors and "gemm_dw_acc" not in one.stages
+    assert one.stages == stages_for_entry("loss", fuse_dw_cast=True, num_chunks=1)
+    assert (
+        "dW_acc" not in one.memory["accumulators"]
+        and one.memory["saved_dz_bytes"] == 37 * V_HOST * 2
+    )
+    v1 = stage_values("gemm_dw_cast_bf16", one.tensors, one.plan, 0)
+    assert v1["WS"] is one.tensors["f32_dummy"] and v1["first_chunk"] == 1
+    one_plain = prepare_lm_head_loss(
+        inp.X, inp.W, inp.labels, chunk_size=64, fuse_dw_cast=False, **common
+    )
+    one.step()
+    one_plain.step()
+    assert torch.equal(one.dw_out, one_plain.dw_out) and torch.equal(
+        one.loss, one_plain.loss
+    )
+    # compacted FP32 dW: the last chunk's X rows are gathered again before the fused GEMM
+    cf = prepare_lm_head_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        chunk_size=C,
+        compact_rows=True,
+        grad_weight_dtype=torch.float32,
+        fuse_dw_cast=True,
+        **common,
+    )
+    last = cf.plan.num_chunks - 1
+    assert (
+        cf.plan.dw_cast_stage == "gemm_dw_cast_f32"
+        and cf.tensors["dw_out"].dtype == torch.float32
+    )
+    assert cf.backward_order == (
+        ("scale_cast_bf16", "dx"),
+        ("gather_rows", last),
+        ("gemm_dw_cast_f32", last),
+    )
+    vc = stage_values("gemm_dw_cast_f32", cf.tensors, cf.plan, last)
+    assert (
+        vc["B"].data_ptr() == cf.tensors["x_c"].data_ptr()
+        and vc["C"].dtype == torch.float32
+    )
+    cp = prepare_lm_head_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        chunk_size=C,
+        compact_rows=True,
+        grad_weight_dtype=torch.float32,
+        fuse_dw_cast=False,
+        **common,
+    )
+    cf.step(torch.tensor(0.5))
+    cp.step(torch.tensor(0.5))
+    assert torch.equal(cf.dw_out, cp.dw_out) and torch.equal(cf.dx_out, cp.dx_out)
+    # the log-probability entry runs the fused GEMM inside the recompute (its scale is the constant 1)
+    lp = prepare_lm_head_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        chunk_size=C,
+        entry="logprob",
+        backend="reference",
+        fuse_dw_cast=True,
+    )
+    assert ("gemm_dw_cast_bf16", 2) in lp.backward_order
+    assert ("gemm_dw_acc", 2) not in lp.backward_order and (
+        "gemm_dw_acc",
+        1,
+    ) in lp.backward_order
+    assert lp.backward_order[-1] == ("scale_cast_bf16", "dx")
+    assert (
+        stage_values("gemm_dw_cast_bf16", lp.tensors, lp.plan, 2)["STATS_OUT"]
+        is lp.tensors["unit_scale"]
+    )
+    lpp = prepare_lm_head_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        chunk_size=C,
+        entry="logprob",
+        backend="reference",
+        fuse_dw_cast=False,
+    )
+    lp.dlogp.copy_(inp.dlogp)
+    lpp.dlogp.copy_(inp.dlogp)
+    lp.step()
+    lpp.step()
+    assert torch.equal(lp.dw_out, lpp.dw_out) and torch.equal(lp.dx_out, lpp.dx_out)
+
+
+def test_fused_dw_cast_autograd_is_bitwise():
+    # the autograd entries hand out dW in W's dtype (bf16; an FP32 weight gradient is served by the explicit pair, below)
+    for objective in ("ce", "policy"):
+        inp = _host_inputs(37, objective)
+        for scale in (None, 3.0):
+            plain = _run(inp, 16, scale=scale, fuse_dw_cast=False)
+            fused = _run(inp, 16, scale=scale, fuse_dw_cast=True)
+            for key in ("loss", "logp", "dX", "dW"):
+                assert torch.equal(plain[key], fused[key]), (objective, scale, key)
+            assert fused["dW"].dtype == torch.bfloat16
+        plain = _run(inp, 16, entry="logprob", fuse_dw_cast=False)
+        fused = _run(inp, 16, entry="logprob", fuse_dw_cast=True)
+        for key in ("logp", "dX", "dW"):
+            assert torch.equal(plain[key], fused[key]), (objective, key)
+    # the deferred chunk's operands are saved through the autograd context: an in-place write to X between
+    # the forward and the backward raises PyTorch's saved-tensor version error instead of a stale dW (X is a
+    # fresh leaf: a view of a no_grad-created base would raise autograd's view-base message instead)
+    inp = _host_inputs(37)
+    for compact in (False, True):
+        X = inp.X.detach().clone().requires_grad_(True)
+        W = inp.W.detach().clone().requires_grad_(True)
+        loss = cake_backend.chunked_lm_head_loss(
+            X,
+            W,
+            inp.labels,
+            objective="ce",
+            loss_div=inp.loss_div,
+            chunk_size=16,
+            backend="reference",
+            compact_rows=compact,
+            fuse_dw_cast=True,
+        )
+        with torch.no_grad():
+            X.add_(1.0)
+        with pytest.raises(
+            RuntimeError, match="modified by an inplace operation|modified inplace"
+        ):
+            loss.backward()
+    # the explicit pair carries the operands; ForwardResult.backward passes them along
+    fr = cake_backend.forward_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        objective="ce",
+        loss_div=inp.loss_div,
+        chunk_size=16,
+        backend="reference",
+        compact_rows=False,
+        fuse_dw_cast=True,
+    )
+    assert (
+        fr.x_src is None
+        and fr.x_idx is None
+        and fr.x_last.data_ptr() == inp.X[32].data_ptr()
+    )
+    assert tuple(fr.dz_last.shape) == (5, V_HOST) and fr.dz_last.dtype == torch.bfloat16
+    pr = cake_backend.forward_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        objective="ce",
+        loss_div=inp.loss_div,
+        chunk_size=16,
+        backend="reference",
+        compact_rows=False,
+        fuse_dw_cast=False,
+    )
+    assert pr.dz_last is None and pr.x_last is None
+    for grad, dtype in ((None, torch.bfloat16), (torch.tensor(2.5), torch.float32)):
+        dxf, dwf = fr.backward(grad, grad_weight_dtype=dtype)
+        dxp, dwp = pr.backward(grad, grad_weight_dtype=dtype)
+        assert torch.equal(dxf, dxp) and torch.equal(dwf, dwp) and dwf.dtype == dtype
+    with pytest.raises(ValueError, match="x_last"):
+        cake_backend.backward_loss(
+            fr.dx_acc, fr.dw_acc, None, backend="reference", dz_last=fr.dz_last
+        )
+    # dw_cast alone: the fused GEMM as an eager primitive (reference arithmetic)
+    out = cake_backend.dw_cast(
+        fr.dz_last, fr.x_last, fr.dw_acc, None, torch.float32, backend="reference"
+    )
+    assert torch.equal(
+        out, fr.dw_acc + cake_backend._mm_fp32(fr.dz_last.t(), fr.x_last)
+    )
+    with pytest.raises(ValueError, match="dz_last"):
+        cake_backend.dw_cast(
+            fr.dz_last.float(),
+            fr.x_last,
+            fr.dw_acc,
+            None,
+            torch.bfloat16,
+            backend="reference",
+        )
+    with pytest.raises(ValueError, match="x_rows"):
+        cake_backend.dw_cast(
+            fr.dz_last,
+            fr.x_last[:2],
+            fr.dw_acc,
+            None,
+            torch.bfloat16,
+            backend="reference",
+        )
+    with pytest.raises(ValueError, match="dw_acc"):
+        cake_backend.dw_cast(
+            fr.dz_last,
+            fr.x_last,
+            fr.dw_acc[:1],
+            None,
+            torch.bfloat16,
+            backend="reference",
+        )
+
+
 def test_memory_report_compaction():
     V, H, C, T, T_v = DEFAULT_V, DEFAULT_H, 4096, 4097, 3892
     align = lambda n: (n + WORKSPACE_ALIGN - 1) // WORKSPACE_ALIGN * WORKSPACE_ALIGN
@@ -2087,6 +3438,7 @@ def test_compacted_runner_binds_the_valid_rows():
         chunk_size=C,
         backend="reference",
         compact_rows=True,
+        fuse_dw_cast=False,
     )
     plan, t = runner.plan, runner.tensors
     assert (
@@ -2097,7 +3449,7 @@ def test_compacted_runner_binds_the_valid_rows():
     )
     assert plan.chunks == plan_chunks(T_v, C) and runner.problem.num_rows == T
     assert runner.stages == stages_for_entry(
-        "loss"
+        "loss", fuse_dw_cast=False
     )  # the host gathers are not stages of the program
     # the row operands are gathered once per step, the chunk's X rows before each chunk
     assert runner.forward_order[:3] == (
@@ -2406,6 +3758,7 @@ def test_device_grad_weight_dtype_fp32(glm_weight):
         need_dw=True,
         grad_weight_dtype=torch.float32,
         backend="cake",
+        fuse_dw_cast=False,
     )
     dX, dW32 = cake_backend.backward_loss(
         fr.dx_acc,
@@ -2426,6 +3779,24 @@ def test_device_grad_weight_dtype_fp32(glm_weight):
     assert torch.equal(dW32.to(torch.bfloat16), bf16["dW"]) and torch.equal(
         dW32, fr.dw_acc
     )
+    # the fused form: one compacted chunk, no FP32 accumulator, the GEMM epilogue writes the FP32 dW (bitwise)
+    fused = cake_backend.forward_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        objective="ce",
+        loss_div=inp.loss_div,
+        chunk_size=4096,
+        need_dx=True,
+        need_dw=True,
+        grad_weight_dtype=torch.float32,
+        backend="cake",
+        fuse_dw_cast=True,
+    )
+    assert fused.dw_acc is None and fused.dz_last is not None
+    _, dW32f = fused.backward(None, grad_weight_dtype=torch.float32)
+    torch.cuda.synchronize()
+    assert torch.equal(dW32f, dW32)
     result = dict(loss=fr.loss, logp=fr.logp, dX=dX, dW=dW32)
     _check_dtypes(result, inp, grad_weight_dtype=torch.float32)
     _check_against_references(
@@ -2486,9 +3857,11 @@ def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
                 inp.X, inp.W, inp.labels, backend="cake", **kw
             )
         torch.cuda.synchronize()
-        for name in ("loss", "logp", "dx_acc", "dw_acc"):
+        for name in ("loss", "logp", "dx_acc", "dw_acc", "dz_last", "x_idx"):
             a, b, c = getattr(first, name), getattr(second, name), getattr(fresh, name)
-            assert torch.equal(a, b) and torch.equal(b, c), name
+            assert _same(a, b) and _same(b, c), (
+                name
+            )  # dw_acc is None for a one-chunk fused plan
         assert (
             second.loss.data_ptr() != first.loss.data_ptr()
         )  # outputs are fresh allocations
@@ -2503,6 +3876,7 @@ def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
             grad_weight_dtype=torch.bfloat16,
             entry="loss",
             valid_rows=int(inp.valid.sum()),
+            fuse_dw_cast=cake_backend.fuse_dw_cast_default(),
             **kw,
         )
         binding = cache.peek(key)
@@ -2762,3 +4136,103 @@ def test_device_memory_rule(glm_weight):
     runner.step()
     torch.cuda.synchronize()
     assert torch.cuda.max_memory_allocated() - base == 0
+
+
+def test_device_fused_dw_cast_is_bitwise(glm_weight):
+    _require_program(entry="loss")
+    _require_program(entry="logprob")
+    inp = _device_inputs(4097, W=glm_weight)
+    g3 = torch.tensor(3.0, device=inp.X.device)
+    for C in (
+        4096,
+        2048,
+    ):  # one compacted chunk (no FP32 accumulator at all) / two chunks
+        plain = _run(inp, C, backend="cake", fuse_dw_cast=False)
+        fused = _run(inp, C, backend="cake", fuse_dw_cast=True)
+        for key in ("loss", "logp", "dX", "dW"):
+            assert torch.equal(plain[key], fused[key]), (C, key)
+        kw = dict(
+            objective="ce",
+            loss_div=inp.loss_div,
+            chunk_size=C,
+            grad_weight_dtype=torch.float32,
+            backend="cake",
+        )
+        fr = cake_backend.forward_loss(
+            inp.X, inp.W, inp.labels, fuse_dw_cast=True, **kw
+        )
+        pr = cake_backend.forward_loss(
+            inp.X, inp.W, inp.labels, fuse_dw_cast=False, **kw
+        )
+        assert (fr.dw_acc is None) == (
+            fr.memory["num_chunks"] == 1
+        ) and fr.dz_last is not None
+        assert (
+            fr.x_src is inp.X and fr.x_last is None
+        )  # compacted: the chunk's rows are gathered in the backward
+        assert fr.memory["saved_dz_bytes"] == fr.dz_last.numel() * 2
+        if (
+            fr.dw_acc is not None
+        ):  # the accumulator holds the chunks before the last one
+            assert not torch.equal(fr.dw_acc, pr.dw_acc)
+        _, dw32 = fr.backward(g3, grad_weight_dtype=torch.float32)
+        _, dw32p = pr.backward(g3, grad_weight_dtype=torch.float32)
+        torch.cuda.synchronize()
+        assert torch.equal(dw32, dw32p) and dw32.dtype == torch.float32
+        assert torch.equal(
+            dw32.to(torch.bfloat16), _run(inp, C, backend="cake", scale=3.0)["dW"]
+        )
+    plain = _run(inp, 2048, entry="logprob", backend="cake", fuse_dw_cast=False)
+    fused = _run(inp, 2048, entry="logprob", backend="cake", fuse_dw_cast=True)
+    for key in ("logp", "dX", "dW"):
+        assert torch.equal(plain[key], fused[key]), key
+    # the prepared runner: the deferred chunk's dz stays in the workspace between forward() and backward()
+    workspace = torch.empty(
+        cake_backend.lm_head_loss_workspace_size(
+            inp.T, inp.V, 2048, inp.X.device, compact_rows=True
+        ),
+        dtype=torch.uint8,
+        device=inp.X.device,
+    )
+    # the compacted size bounds every valid-row count: a tail chunk of any length may take more K slices (more FP32
+    # slabs) than the full-T chunks, so a runner over a few valid rows must fit the same buffer
+    sparse_labels = torch.full_like(inp.labels, IGNORE_INDEX)
+    for keep in (1, 3, 129, 2047, 2049, min(inp.T, 3591)):
+        sparse_labels[:keep] = inp.labels[:keep].clamp(min=0)  # valid rows only
+        cake_backend.prepare_lm_head_loss(
+            inp.X,
+            inp.W,
+            sparse_labels,
+            objective="ce",
+            loss_div=inp.loss_div,
+            chunk_size=2048,
+            workspace_buffer=workspace,
+            backend="cake",
+            compact_rows=True,
+            fuse_dw_cast=True,
+        )
+    runner = cake_backend.prepare_lm_head_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        objective="ce",
+        loss_div=inp.loss_div,
+        chunk_size=2048,
+        workspace_buffer=workspace,
+        backend="cake",
+        compact_rows=True,
+        fuse_dw_cast=True,
+    )
+    assert (
+        runner.plan.dw_deferred
+        and runner.plan.num_chunks == 2
+        and runner.backward_order
+        == (
+            ("scale_cast_bf16", "dx"),
+            ("gather_rows", 1),
+            ("gemm_dw_cast_bf16", 1),
+        )
+    )
+    runner.step(g3)
+    torch.cuda.synchronize()
+    assert torch.equal(runner.dw_out, _run(inp, 2048, backend="cake", scale=3.0)["dW"])
