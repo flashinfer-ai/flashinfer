@@ -2340,7 +2340,9 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             dsv4_output_scale = _allocate_dsv4_rope_quant_output_scale(
                 num_tokens, num_heads, query.device
             )
-    elif out is None:
+    elif out is None and backend != "cake":
+        # backend='cake' allocates in run_cake_dsv4 once the route is known
+        # (route-dependent output base phase, see cake_dsv4._OUT_PHASE_BY_ROUTE).
         out = torch.empty(expected_out_shape, dtype=torch.bfloat16, device=query.device)
 
     check_shape_dtype_device(
@@ -2399,6 +2401,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
             cum_seq_lens_q=cum_seq_lens_q,
             seq_lens=seq_lens,
             backend="cake",
+            out_shape=tuple(expected_out_shape),
         )
 
     primary_kv_cache = compressed_kv_cache
