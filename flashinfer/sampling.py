@@ -1694,9 +1694,10 @@ def top_k_top_p_sampling_from_logits(
         incremented based on the number of random values consumed by the operation.
     max_top_k: Optional[int]
         Upper bound on the entries of a ``top_k`` tensor, letting it take the
-        ``"top_k_first"`` fast path. Not checked (that would need a host sync): rows
-        above it, including ``top_k >= vocab_size``, are sampled as if
-        ``top_k == max_top_k``. Default is ``None``.
+        ``"top_k_first"`` fast path; its cost grows with the bound, so keep it tight.
+        Not checked (that would need a host sync): rows above it, including
+        ``top_k >= vocab_size``, are sampled as if ``top_k == max_top_k``.
+        Default is ``None``.
 
     Returns
     -------
@@ -1864,9 +1865,10 @@ def top_k_top_p_sampling_from_probs(
         after the renormalization step.  Defaults to ``False``.
     max_top_k: Optional[int]
         Upper bound on the entries of a ``top_k`` tensor, letting it take the
-        ``"top_k_first"`` fast path. Not checked (that would need a host sync): rows
-        above it, including ``top_k >= vocab_size``, are sampled as if
-        ``top_k == max_top_k``. Default is ``None``.
+        ``"top_k_first"`` fast path; its cost grows with the bound, so keep it tight.
+        Not checked (that would need a host sync): rows above it, including
+        ``top_k >= vocab_size``, are sampled as if ``top_k == max_top_k``.
+        Default is ``None``.
 
     Returns
     -------
