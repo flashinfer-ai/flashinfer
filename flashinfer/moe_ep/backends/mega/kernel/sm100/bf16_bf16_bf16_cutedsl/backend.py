@@ -62,7 +62,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             bootstrap.world_size,
             intermediate_size=self._kernel_config.intermediate_size,
             top_k=self._kernel_config.top_k,
-            # The drop's own shim bound (kernel_src/cutedsl_megamoe/shim/
+            # The drop's own shim bound (kernel_src/sm100/cutedsl_megamoe/shim/
             # bf16.py): hidden % 32, intermediate % 64 — not the deep_gemm
             # SF-word 128 default. 32 covers hidden here; the stricter
             # intermediate bound is enforced below.
@@ -97,7 +97,9 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         )
 
     def _allocate_workspace(self, fleet_params: FleetParams) -> Any:
-        from ......kernel_src.cutedsl_megamoe import get_symm_buffer_for_bf16_mega_moe
+        from ......kernel_src.sm100.cutedsl_megamoe import (
+            get_symm_buffer_for_bf16_mega_moe,
+        )
 
         config = self._kernel_config
         return get_symm_buffer_for_bf16_mega_moe(
@@ -134,7 +136,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         self, t: "MoEEpTensors", workspace: Any, *, quantize_input: bool
     ) -> None:
         del quantize_input
-        from ......kernel_src.cutedsl_megamoe import note_staged_tokens
+        from ......kernel_src.sm100.cutedsl_megamoe import note_staged_tokens
 
         stage_mega_moe_inputs(
             t.hidden_states,
@@ -153,7 +155,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         *,
         output: torch.Tensor | None,
     ) -> torch.Tensor:
-        from ......kernel_src.cutedsl_megamoe import bf16_mega_moe, staged_tokens
+        from ......kernel_src.sm100.cutedsl_megamoe import bf16_mega_moe, staged_tokens
 
         if output is not None:
             num_tokens = output.shape[0]
@@ -172,7 +174,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
             num_tokens = staged
 
         if self._autotune_pending:
-            from ......kernel_src.cutedsl_megamoe import autotune_bf16_mega_moe
+            from ......kernel_src.sm100.cutedsl_megamoe import autotune_bf16_mega_moe
 
             autotune_bf16_mega_moe(
                 output,
@@ -226,7 +228,7 @@ class Bf16CutedslMegaKernelBackend(MegaKernelBackend):
         import sys
 
         quant_stage = sys.modules.get(
-            "flashinfer.moe_ep.kernel_src.cutedsl_megamoe.shim.quant_stage"
+            "flashinfer.moe_ep.kernel_src.sm100.cutedsl_megamoe.shim.quant_stage"
         )
         topk_idx = getattr(workspace, "topk_idx", None)
         if quant_stage is not None and topk_idx is not None:

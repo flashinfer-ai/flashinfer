@@ -28,13 +28,14 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, Int32
 
-from flashinfer.utils import device_support_pdl
+from flashinfer.utils import device_support_pdl, get_compute_capability
 
 from .mla_decode_fp16 import BlackwellMultiHeadLatentAttentionForwardFP16
 from .mla_decode_fp8 import BlackwellMultiHeadLatentAttentionForwardFP8
-from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout
+from .mla_helpers import MAX_SPLITS, ceil_div, compute_q_tile_layout, LOG2_E
 from flashinfer.cute_dsl.utils import (
     _as_cute_dsl_workspace_i8,
+    cute_dsl_compile_arch,
     get_max_active_clusters,
     get_num_sm,
     torch_to_cutlass_dtype,
@@ -209,6 +210,7 @@ def _check_can_implement(
 
 @functools.cache
 def _get_compiled_mla_kernel(
+    arch: str,
     torch_dtype: torch.dtype,
     torch_out_dtype: torch.dtype,
     page_size: int,
@@ -233,7 +235,7 @@ def _get_compiled_mla_kernel(
     Returns a callable that accepts (q_latent, q_rope, c_latent, c_rope,
     page_table, o, lse, workspace, split_kv_scalar, cache_seqs,
     cum_seq_lens_q, causal_seqlens_kv_global, cp_rank_scalar,
-    block_split_kvs, softmax_scale_scalar, output_scale_scalar).
+    block_split_kvs, softmax_scale_scalar, output_scale_scalar, lse_scale_scalar).
 
     All scalar arguments must be pre-wrapped as Int32/Float32.
     """
@@ -274,6 +276,7 @@ def _get_compiled_mla_kernel(
         reducer_max_splits=reducer_max_splits,
         enable_dcp=enable_dcp,
         cp_world=cp_world,
+        arch=arch,
     )
 
     # All dimensions as sym_int — this matches the original kernel's use of
@@ -441,8 +444,9 @@ def _get_compiled_mla_kernel(
         block_split_kvs_fake,
         Float32(1.0),  # softmax_scale placeholder
         Float32(1.0),  # output_scale placeholder
+        Float32(1.0),  # lse_scale placeholder
         stream_fake,
-        options="--enable-tvm-ffi --opt-level 2",
+        options=f"--enable-tvm-ffi --opt-level 2 --gpu-arch {arch}",
     )
 
     return compiled_kernel
@@ -466,6 +470,7 @@ def cute_dsl_mla_decode(
     enable_pdl: Optional[bool] = None,
     lse: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    lse_scale: float = 1 / LOG2_E,
     cum_seq_lens_q: Optional[torch.Tensor] = None,
     max_q_len: Optional[int] = None,
     enable_dcp: bool = False,
@@ -539,6 +544,12 @@ def cute_dsl_mla_decode(
         Whether to return LSE values.  When True, the function returns
         ``(out, lse)`` (the ``lse`` tensor returned is in whatever shape
         the caller supplied).
+    lse_scale : float, default=1 / LOG2_E
+        Multiplier applied to the LSE at the store. This kernel computes LSE in
+        base 2, so the default ``1 / LOG2_E`` returns natural-log values and
+        ``1.0`` returns base-2. Set from ``return_lse_base`` by
+        ``flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla``. Has no effect
+        when ``return_lse`` is False.
     cum_seq_lens_q : Optional[torch.Tensor]
         Device-resident int32 cumulative query lengths with shape
         ``[B + 1]``. When provided, selects compact variable-Q input and
@@ -823,6 +834,7 @@ def cute_dsl_mla_decode(
     # Note: when is_workspace_size_zero is True, workspace_bytes is None and it will launch one kernel without workspace.
     # Otherwise, workspace_bytes is not None and it will launch two kernels.
     compiled_kernel = _get_compiled_mla_kernel(
+        arch=cute_dsl_compile_arch(*get_compute_capability(query.device)),
         torch_dtype=q_dtype,
         torch_out_dtype=o_dtype,
         page_size=page_size,
@@ -861,6 +873,7 @@ def cute_dsl_mla_decode(
         block_split_kvs,
         Float32(softmax_scale),
         Float32(output_scale),
+        Float32(lse_scale),
     )
 
     if return_lse:

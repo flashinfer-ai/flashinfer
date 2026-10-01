@@ -260,6 +260,79 @@ __global__ void moe_bgmv_shrink_sliced_kernel(
 }
 
 // ============================================================
+// MoE BGMV Shrink Direct Kernel (decode fast-path)
+//
+// One CTA per (pair, rank, slice): block of NTHREADS strides the full feat_in
+// contraction with 128-bit vectorized loads (vec_t), then a warp+block reduction
+// writes the single output element. Fuses the contraction with scale+cast and
+// uses no shared-memory staging / async pipeline.
+//
+// Rationale: in the decode regime (num_pairs small), the pipelined sliced kernel
+// launches only ceil(num_pairs/PPB)*ceil(feat_out/RANK_TILE) blocks -> a few SMs
+// active, launch-starved. Mapping one block per output element raises resident
+// blocks ~feat_out-fold and removes the smem-staging overhead, which dominates
+// when there is no inter-pair reuse to amortize it. Dtype/accumulation preserved
+// (fp32 accumulate, out_T cast). Prefill keeps the pipelined kernel unchanged.
+// ============================================================
+template <int feat_in, int feat_out, int NTHREADS, size_t vec_size, typename in_T, typename out_T,
+          typename W_T>
+__global__ void moe_bgmv_shrink_direct_kernel(
+    out_T* __restrict__ Y, const in_T* __restrict__ X, W_T** __restrict__ w_ptr,
+    const int64_t* __restrict__ sorted_token_ids, const int64_t* __restrict__ expert_ids,
+    const int64_t* __restrict__ lora_indices, int64_t num_pairs, int64_t num_experts,
+    int64_t num_tokens, int64_t lora_stride, float scale) {
+  const int slice_id = blockIdx.z;
+  const int pair = blockIdx.x;
+  const int r = blockIdx.y;  // rank index in [0, feat_out)
+  const int tid = threadIdx.x;
+
+  const int64_t token_idx = sorted_token_ids[pair];
+  bool valid = (token_idx >= 0 && token_idx < num_tokens);
+  int64_t lid = -1, eid = 0;
+  if (valid) {
+    lid = lora_indices[token_idx];
+    valid = (lid >= 0);
+    if (valid) eid = expert_ids[pair];
+  }
+  if (!valid) return;  // leave the (pre-zeroed / accumulated) output element untouched
+
+  const W_T* Wrow = w_ptr[slice_id * num_experts + eid] + lid * lora_stride + (int64_t)r * feat_in;
+  const in_T* Xrow = X + token_idx * (int64_t)feat_in;
+
+  constexpr int NVEC = feat_in / vec_size;
+  float acc = 0.f;
+  vec_t<in_T, vec_size> xv;
+  vec_t<W_T, vec_size> wv;
+  for (int i = tid; i < NVEC; i += NTHREADS) {
+    xv.load(Xrow + i * vec_size);
+    wv.load(Wrow + i * vec_size);
+#pragma unroll
+    for (int j = 0; j < (int)vec_size; ++j) acc += float(xv[j]) * float(wv[j]);
+  }
+  // scalar tail — only emitted when feat_in is not a multiple of vec_size. All compiled
+  // `wide` values are multiples of 8 (== vec_size), so this is dropped at compile time and
+  // the hot loop above is purely 128-bit vectorized (verified in SASS / ncu sectors-per-req).
+  if constexpr (feat_in % vec_size != 0) {
+    for (int i = NVEC * vec_size + tid; i < feat_in; i += NTHREADS)
+      acc += float(Xrow[i]) * float(Wrow[i]);
+  }
+
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1) acc += __shfl_down_sync(0xffffffffu, acc, off);
+  static_assert(NTHREADS % 32 == 0, "moe_bgmv_shrink_direct_kernel requires full warps");
+  __shared__ float warp_sum[NTHREADS / 32];
+  if ((tid & 31) == 0) warp_sum[tid >> 5] = acc;
+  __syncthreads();
+  if (tid == 0) {
+    float s = 0.f;
+#pragma unroll
+    for (int i = 0; i < NTHREADS / 32; ++i) s += warp_sum[i];
+    Y[slice_id * num_pairs * feat_out + (int64_t)pair * feat_out + r] +=
+        static_cast<out_T>(s * scale);
+  }
+}
+
+// ============================================================
 // MoE BGMV Expand Sliced Kernel
 // ============================================================
 // FINALIZE=true: combine a token's experts (output row = token, *topk_w, atomicAdd).
@@ -336,6 +409,25 @@ void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
   const bool extended = (sm_major >= 9);
   const bool decode = (num_pairs <= MoeShrinkKernelConfig::decode_threshold);
 
+  // Decode fast-path: one block per (pair, rank, slice) with vectorized contraction.
+  // All compiled `wide` (feat_in) values are multiples of 8, so 128-bit loads apply.
+  // Gated on `extended` (sm_90+): the fast-path is only measured/tuned on Hopper+, and the
+  // baseline decode tuning is likewise gated on `extended`. On sm_80 and below we keep the
+  // proven pipelined sliced kernel rather than silently rerouting an unbenchmarked path.
+  // FC2 LoRA supplies one input per pair (PER_PAIR_INPUT=true); the direct kernel reads one
+  // input per token, so that mode must keep the pipelined kernel below.
+  if (extended && decode) {
+    constexpr int FUSED_NT = 128;
+    constexpr size_t FUSED_VEC = 8;
+    if constexpr (!PER_PAIR_INPUT && feat_in % FUSED_VEC == 0) {
+      dim3 gfused((int)num_pairs, feat_out, (int)num_slices);
+      moe_bgmv_shrink_direct_kernel<feat_in, feat_out, FUSED_NT, FUSED_VEC, in_T, out_T, W_T>
+          <<<gfused, FUSED_NT, 0, stream>>>(Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices,
+                                            num_pairs, num_experts, num_tokens, lora_stride, scale);
+      return;
+    }
+  }
+
   const int ppb = (extended && decode) ? MoeShrinkKernelConfig::pairs_per_block_decode
                                        : MoeShrinkKernelConfig::pairs_per_block_prefill;
   const int nstg = (extended && decode) ? MoeShrinkKernelConfig::num_stages_extended
@@ -382,6 +474,87 @@ void moe_bgmv_shrink_sliced(out_T* __restrict__ Y, const in_T* __restrict__ X,
 }
 
 // ============================================================
+// MoE BGMV Expand Kernel: coalesced 128-bit W loads.
+//
+// Each thread loads a contiguous 128-bit (uint4 = 8xbf16) chunk of W per pass, so a warp reads
+// fully-coalesced; PASSES independent loads overlap memory latency. Partial dot products are
+// reduced across the FEAT_IN/8 lanes of a column group, then atomic-added (one add per output
+// column per pair). fp32 accumulate; no shared-memory W staging.
+// ============================================================
+// __launch_bounds__(BLK, 4): min 4 blocks/SM (not 8). At BLK=256, requiring 8 blocks/SM caps the
+// compiler at 32 regs/thread (256*8 = 2048 = max threads/SM), which spills to local memory at
+// FEAT_IN=64 (uint4 raw[PASSES] alone is 32 regs) — measured 84 B spill and ~1.5x slower. This
+// kernel is bandwidth-bound, so 4 blocks/SM (64 regs) is ample occupancy and spill-free.
+template <int FEAT_IN, int FEAT_OUT, int BLK, int COLS_PER_BLOCK, typename in_T, typename W_T>
+__global__ void __launch_bounds__(BLK, 4) moe_bgmv_expand_opt_kernel(
+    float* __restrict__ Y, const in_T* __restrict__ X, W_T** __restrict__ w_ptr,
+    const int64_t* __restrict__ sorted_token_ids, const int64_t* __restrict__ expert_ids,
+    const int64_t* __restrict__ lora_indices, const float* __restrict__ topk_weights,
+    const int64_t* __restrict__ slice_start_loc, int64_t num_pairs, int64_t num_experts,
+    int64_t total_feat_out, int64_t num_tokens, int64_t lora_stride, float scale) {
+  constexpr int KVEC = 8;  // 8 bf16 = 128-bit
+  static_assert(sizeof(W_T) == 2, "moe_bgmv_expand_opt_kernel requires 16-bit weights");
+  constexpr int KGROUPS = FEAT_IN / KVEC;  // K-slices per column (rank/8)
+  constexpr int PASSES = COLS_PER_BLOCK / (BLK / KGROUPS);
+  // Shape invariants the reduction layout relies on (dispatcher only advertises FEAT_IN % 8 == 0).
+  // A future rank whose KGROUPS is not a power of two, or that does not tile BLK / COLS_PER_BLOCK
+  // evenly, would silently mis-reduce columns; fail fast at compile time instead.
+  static_assert(FEAT_IN % KVEC == 0, "moe_bgmv_expand_opt_kernel requires FEAT_IN % 8 == 0");
+  static_assert((KGROUPS & (KGROUPS - 1)) == 0,
+                "moe_bgmv_expand_opt_kernel requires power-of-two KGROUPS");
+  static_assert(BLK % KGROUPS == 0,
+                "moe_bgmv_expand_opt_kernel requires BLK to be divisible by KGROUPS");
+  static_assert(COLS_PER_BLOCK % (BLK / KGROUPS) == 0,
+                "moe_bgmv_expand_opt_kernel requires an integral number of passes");
+  const int pair_idx = blockIdx.x;
+  const int64_t token_idx = sorted_token_ids[pair_idx];
+  if (token_idx < 0 || token_idx >= num_tokens) return;
+  const int64_t lora_id = lora_indices[token_idx];
+  if (lora_id < 0) return;
+  const int slice_id = blockIdx.z;
+  const int64_t expert_id = expert_ids[pair_idx];
+  const float topk_w = topk_weights[pair_idx];
+  const int64_t col_offset = slice_start_loc[slice_id];
+  const W_T* __restrict__ W = w_ptr[slice_id * num_experts + expert_id] + lora_id * lora_stride;
+
+  const int tid = threadIdx.x;
+  __shared__ float Xs[FEAT_IN];
+  if (tid < FEAT_IN)
+    Xs[tid] = float(X[slice_id * num_pairs * FEAT_IN + pair_idx * FEAT_IN + tid]) * scale;
+  __syncthreads();
+
+  const int sub = tid % KGROUPS;             // which 8-wide K slice
+  const int base_col = tid / KGROUPS;        // column within group
+  const int cols_per_group = BLK / KGROUPS;  // = 64 for BLK256/KGROUPS4
+  const int col_base = blockIdx.y * COLS_PER_BLOCK;
+
+  float xs[KVEC];
+#pragma unroll
+  for (int j = 0; j < KVEC; ++j) xs[j] = Xs[sub * KVEC + j];
+
+  uint4 raw[PASSES];
+#pragma unroll
+  for (int i = 0; i < PASSES; ++i) {
+    const int col = col_base + base_col + i * cols_per_group;
+    raw[i] = (col < FEAT_OUT)
+                 ? *reinterpret_cast<const uint4*>(W + (int64_t)col * FEAT_IN + sub * KVEC)
+                 : uint4{0, 0, 0, 0};
+  }
+#pragma unroll
+  for (int i = 0; i < PASSES; ++i) {
+    const W_T* b = reinterpret_cast<const W_T*>(&raw[i]);
+    float p = 0.f;
+#pragma unroll
+    for (int j = 0; j < KVEC; ++j) p += float(b[j]) * xs[j];
+#pragma unroll
+    for (int off = KGROUPS / 2; off > 0; off >>= 1) p += __shfl_xor_sync(0xffffffffu, p, off);
+    if (sub == 0) {
+      const int col = col_base + base_col + i * cols_per_group;
+      if (col < FEAT_OUT) atomicAdd(Y + token_idx * total_feat_out + col_offset + col, p * topk_w);
+    }
+  }
+}
+
 // Host-side dispatch: Expand
 // ============================================================
 
@@ -395,6 +568,25 @@ void moe_bgmv_expand_sliced(float* __restrict__ Y, const in_T* __restrict__ X,
                             int64_t total_feat_out, int32_t current_feat_out, int64_t num_tokens,
                             int64_t lora_stride, float scale) {
   const cudaStream_t stream = BGMV_MOE_GET_STREAM();  // current CUDA stream
+
+  // Optimized path: coalesced 128-bit (uint4 = 8xbf16) W loads. Requires feat_in % 8 == 0 (all
+  // compiled ranks 8/16/32/64). Faster across shapes and token counts except feat_in == 64 at
+  // small batch (num_pairs < 256), where its shuffle-reduction overhead is not amortized; that
+  // corner keeps the original tiled kernel below. The optimized kernel atomically accumulates
+  // weighted results per token, so FC1 LoRA's unweighted per-pair store (FINALIZE=false) must
+  // also use the original kernel.
+  if constexpr (FINALIZE && feat_in % 8 == 0) {
+    if ((feat_in <= 32) || (num_pairs >= 256)) {
+      constexpr int E_BLK = 256;
+      constexpr int E_COLS = 256;
+      dim3 g((int)num_pairs, (feat_out + E_COLS - 1) / E_COLS, (int)num_slices);
+      moe_bgmv_expand_opt_kernel<feat_in, feat_out, E_BLK, E_COLS, in_T, W_T>
+          <<<g, E_BLK, 0, stream>>>(Y, X, w_ptr, sorted_token_ids, expert_ids, lora_indices,
+                                    topk_weights, slice_start_loc, num_pairs, num_experts,
+                                    total_feat_out, num_tokens, lora_stride, scale);
+      return;
+    }
+  }
 
   constexpr size_t vec_size = MoeExpandKernelConfig::vec_size;
   constexpr int tz = MoeExpandKernelConfig::tz;

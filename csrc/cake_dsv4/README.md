@@ -79,8 +79,95 @@ synccheck passed all 94 cases with zero errors; racecheck passed all 94 cases
 with zero hazards, errors, or warnings. The public routing and descriptor
 suite passed 101 tests.
 
-Public routing and descriptor-storage tests:
+Public routing, binding, workspace and metadata tests (CPU) plus the GPU
+hardening suite:
 
 ```bash
 pytest tests/mla/test_cake_dsv4.py -q
+pytest tests/mla/test_cake_dsv4_hardening.py -q   # needs an SM100/SM103 GPU
 ```
+
+## Hardened host contract (flashinfer#4671)
+
+The Python host in `flashinfer/mla/cake_dsv4.py` follows the shared
+sparse-metadata ABI of the regenerated kernels and makes no device allocation
+on the call path.
+
+### Metadata
+
+Every variant receives the same eight kernel parameters, bound by name through
+the registration `arg_plan` (`flashinfer/jit/cake_dsv4.py`): `swa_indices`,
+`compressed_indices`, `sparse_topk_lens`, `swa_index_stride`,
+`compressed_index_stride`, `sparse_topk_lens_offset`, `sparse_topk`,
+`num_query_tokens`. Combined column `c` of row `t` is
+`swa_indices[t * swa_index_stride + c]` for `c < 128` and
+`compressed_indices[t * compressed_index_stride + c - 128]` otherwise; the
+active length is `clamp(sparse_topk_lens[t] + sparse_topk_lens_offset, 0,
+sparse_topk)`. The kernels never read a metadata slot outside
+`t < num_query_tokens`, `c < sparse_topk`, and every unread staged slot is `-1`.
+
+`trtllm_batch_decode_sparse_mla_dsv4(..., backend="cake")` accepts either
+form without copying (int32 tables with unit column stride; row strides are
+free):
+
+| Form | Arguments | Host resolution |
+| --- | --- | --- |
+| Combined | `sparse_indices [T, sparse_topk]`, `sparse_topk_lens [T]` (counts the 128 SWA slots) | compressed view = column offset 128 of the same storage, both strides `= sparse_topk` |
+| Separate | `sparse_indices [T, 128]` (SWA), `extra_sparse_indices [T, topk_c]`, `extra_sparse_topk_lens [T]` (compressed slots only) | offset `+= 128`; each table keeps its own row stride |
+| Separate, combined lengths | as above with `sparse_topk_lens` instead of `extra_sparse_topk_lens` | offset unchanged |
+
+`sparse_topk_lens_offset: int = 0` is added on top in every form.
+`num_query_tokens = T` is the metadata row count; `query` / `out` may carry
+more rows (dense `[B, Q, H, 512]` with `T <= B * Q`, ragged `[sum_q, H, 512]`
+with `T <= sum_q`). Rows `>= T` are neither read nor written. Every grid and
+workspace view derives from `T`. Batch-derived routes (`*_source_exact`,
+`bf16_h64_guard_q_tma_batch_r25`, `fp8_h128_prefill_source_persistent`,
+`fp8_h128_prefill_source_persistent_uniform`, `fp8_h64_prefill_source_persistent_m64`)
+walk `cum_seq_lens_q`, so the metadata must cover every token those prefix
+sums address.
+
+### Workspace
+
+One caller-owned `workspace_buffer` (contiguous, 128-byte aligned) is carved
+deterministically:
+
+```
+[0,      1024)             TMA descriptor slab — the generated bindings encode fresh
+                           descriptors and upload them here on every launch
+[1024,   1024 + 256 KiB)   split-merge counters, uint32[65536]
+[P,      P + O_bytes)      partial_O  BF16 [T * H * S * 512]      P = 1024 + 256 KiB
+[P + O_bytes, ...)         partial_lse FP32 [T * H * S]
+```
+
+```python
+from flashinfer.mla import get_cake_dsv4_workspace_bytes, cake_dsv4_workspace_reset
+
+num_bytes = get_cake_dsv4_workspace_bytes(num_query_tokens, num_heads, sparse_topk, dtype)
+# S = num_splits if given else max(ceil(sparse_topk / 128), 5)   (upper bound over routes)
+# bytes = 1024 + 262144 + align128(T * H * S * 512 * 2) + align128(T * H * S * 4)
+workspace = torch.empty(num_bytes, dtype=torch.uint8, device="cuda")
+cake_dsv4_workspace_reset(workspace)   # zero the counter region once
+```
+
+Counters must be zero at first use and the kernels leave them zero after every
+launch, so there is no per-call host state and CUDA graph replays are
+self-contained. The first eager call with a workspace tensor also zeroes the
+counters; if that first use happens during graph capture the host raises and
+asks for `cake_dsv4_workspace_reset` or an eager warm-up instead. The only
+allocation on the call path is the output when `out=None`; with `out` provided,
+eager calls and graph replays leave `torch.cuda.memory_allocated()` unchanged.
+The per-call padded index copy and the host-side split-merge generation counter
+(`completion_base`) of the previous host are gone.
+
+### Bindings
+
+`_launch_variant` builds a name -> value map and walks the variant's `arg_plan`
+(`tma_buffer` / `buffer` -> tensors, `parameter` -> ints, `workspace` -> the
+descriptor slab, `grid` -> launch grid). TMA sources alias onto `Q`,
+`SWA_cache`, `compressed_KV_cache`; `num_q_heads` / `num_split` alias onto
+`num_heads` / `num_splits`. Compiled programs bind their `tensor_keys`,
+`workspace_keys`, `scalar_names` the same way. Bindings that still declare the
+pre-hardening combined `sparse_indices` accept only a combined table with
+offset 0; `completion_base` is rejected. The CPU tests check that every
+registered name is bindable, so a regenerated registration with a new name
+fails fast on the host side.

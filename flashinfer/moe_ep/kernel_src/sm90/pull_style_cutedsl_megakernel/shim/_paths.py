@@ -10,7 +10,7 @@ import as top-level modules without a separate editable install.
 
 The SM90 drop is a fork of the SM100 kernel repo, so both trees expose the
 SAME top-level module names (``common``, ``src``, ``moe_nvfp4_swapab``).  Only
-one of ``kernel_src/cutedsl_megamoe`` and this tree can be active per process;
+one of ``kernel_src/sm100/cutedsl_megamoe`` and this tree can be active per process;
 ``bootstrap_paths`` raises if the sibling tree's modules are already imported.
 That is fine in practice — a process runs on either Hopper or Blackwell, never
 both.

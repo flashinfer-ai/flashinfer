@@ -446,6 +446,12 @@ class _HeterogeneousAOTModule:
     def __getitem__(self, key: Any) -> Any:
         return self._get_dispatched_attribute(lambda module: module[key])
 
+    def _resolve_for_current_device(self) -> Any:
+        """Resolve an AOT copy or build the fallback before a captured call."""
+        return self._select_attribute(
+            lambda module: module, self._loaded_modules, (), {}
+        )
+
 
 @dataclasses.dataclass
 class JitSpecNvcc(JitSpec):
@@ -464,6 +470,7 @@ class JitSpecNvcc(JitSpec):
     # so that the on-disk build is keyed on the artifact as well as on the
     # module name.
     artifact_version: Optional[str] = None
+    extra_cuda_cflags_by_source: Optional[Mapping[Path, List[str]]] = None
 
     @property
     def build_dir(self) -> Path:
@@ -541,6 +548,7 @@ class JitSpecNvcc(JitSpec):
             needs_device_linking=self.needs_device_linking,
             embedded_cubins=embedded_cubins,
             build_dir=self.build_dir,
+            extra_cuda_cflags_by_source=self.extra_cuda_cflags_by_source,
         )
         write_if_different(ninja_path, content)
 
@@ -661,6 +669,12 @@ class JitSpecNvcc(JitSpec):
         ]
         cflags_expanded = expand_flags(cflags, common_cflags_expanded)
         cuda_cflags_expanded = expand_flags(cuda_cflags, common_cflags_expanded)
+        cuda_cflags_by_source = {
+            Path(source).resolve(): expand_flags(
+                build_cuda_cflags(common_cflags, flags), common_cflags_expanded
+            )
+            for source, flags in (self.extra_cuda_cflags_by_source or {}).items()
+        }
 
         # Get compilers
         cxx = os.environ.get("CXX", "c++")
@@ -676,7 +690,9 @@ class JitSpecNvcc(JitSpec):
 
             if is_cuda:
                 compiler = nvcc
-                flags = cuda_cflags_expanded
+                flags = cuda_cflags_by_source.get(
+                    source.resolve(), cuda_cflags_expanded
+                )
                 object_suffix = ".cuda.o"
             else:
                 compiler = cxx
@@ -714,7 +730,16 @@ def gen_jit_spec(
     embedded_cubin_factory: Optional[Callable[[Path], Mapping[str, Path]]] = None,
     use_fast_math: bool = True,
     artifact_version: Optional[str] = None,
+    extra_cuda_cflags_by_source: Optional[Mapping[Union[str, Path], List[str]]] = None,
 ) -> JitSpec:
+    """Create a CUDA build specification.
+
+    For named CUDA sources, ``extra_cuda_cflags_by_source`` replaces the shared
+    ``extra_cuda_cflags`` and opts out of the default ``-use_fast_math``. Other
+    build defaults still apply; request fast math explicitly when required.
+    Sources absent from the mapping retain the shared flags and defaults,
+    including the module-wide ``use_fast_math`` setting.
+    """
     check_cuda_arch()
     # Use FLASHINFER_JIT_DEBUG if set, otherwise use FLASHINFER_JIT_VERBOSE (for backward compatibility)
     debug_env = os.environ.get("FLASHINFER_JIT_DEBUG")
@@ -768,6 +793,26 @@ def gen_jit_spec(
 
     if extra_cflags is not None:
         cflags += extra_cflags
+    cuda_cflags_by_source = None
+    if extra_cuda_cflags_by_source is not None:
+        cuda_sources = {
+            Path(source).resolve() for source in sources if Path(source).suffix == ".cu"
+        }
+        cuda_cflags_by_source = {}
+        for raw_source, source_flags in extra_cuda_cflags_by_source.items():
+            source = Path(raw_source).resolve()
+            if source not in cuda_sources:
+                raise ValueError(
+                    f"CUDA flags refer to a source outside this JIT spec: {source}"
+                )
+            source_defaults = [
+                flag
+                for flag in cuda_cflags
+                if flag != "-use_fast_math" and not flag.startswith("-std=")
+            ]
+            if not any(flag.startswith("-std=") for flag in source_flags):
+                source_defaults.insert(0, "-std=c++17")
+            cuda_cflags_by_source[source] = source_defaults + list(source_flags)
     if extra_cuda_cflags is not None:
         cuda_cflags += extra_cuda_cflags
 
@@ -786,6 +831,7 @@ def gen_jit_spec(
         post_load_adapter=post_load_adapter,
         embedded_cubin_factory=embedded_cubin_factory,
         artifact_version=artifact_version,
+        extra_cuda_cflags_by_source=cuda_cflags_by_source,
     )
 
     # Register the spec in the global registry
@@ -828,4 +874,14 @@ def build_jit_specs(
     with FileLock(tmpdir / "flashinfer_jit.lock", thread_local=False):
         ninja_path = tmpdir / "flashinfer_jit.ninja"
         write_if_different(ninja_path, "\n".join(lines))
-        run_ninja(jit_env.FLASHINFER_JIT_DIR, ninja_path, verbose)
+        prebuild_max_jobs = os.environ.get("FLASHINFER_JIT_PREBUILD_MAX_JOBS")
+        run_ninja(
+            jit_env.FLASHINFER_JIT_DIR,
+            ninja_path,
+            verbose,
+            max_jobs=(
+                int(prebuild_max_jobs)
+                if prebuild_max_jobs is not None and prebuild_max_jobs.isdigit()
+                else None
+            ),
+        )

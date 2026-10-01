@@ -4,6 +4,7 @@
 
 #include "../../arch/matrix_memory.cuh"
 #include "../../arch/mma_sm120.cuh"
+#include "../../common/lse.cuh"
 #include "../../compute/packed_to_bf16.cuh"
 #include "../../execution/attention_params.cuh"
 #include "../../model/dsv41_layout.cuh"
@@ -265,7 +266,8 @@ __global__ void __launch_bounds__(Dsv41Bf16Resources::BLOCK_THREADS, 1)
             __floats2bfloat162_rn(acc[v][h * 2] * norm, acc[v][h * 2 + 1] * norm);
       }
       if (warp == 0 && tid == 0)
-        params.out_lse[(size_t)t * params.out_lse_stride_elems + head] = lse;
+        params.out_lse[(size_t)t * params.out_lse_stride_elems + head] =
+            scale_output_lse(lse, params.lse_scale);
     }
   }
 }

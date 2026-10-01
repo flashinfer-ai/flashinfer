@@ -55,6 +55,7 @@ def test_fused_module_keeps_the_public_python_contract():
             "enable_rank_mask",
             "active_rank_mask",
             "backend",
+            "recv_view_cache",
         ),
         "moe_a2a_combine": (
             "payload",
@@ -106,6 +107,7 @@ def test_fused_module_keeps_the_public_python_contract():
             "enable_rank_mask": False,
             "active_rank_mask": None,
             "backend": "trtllm",
+            "recv_view_cache": None,
         },
         "moe_a2a_combine": {
             "payload_in_workspace": False,
@@ -477,6 +479,9 @@ def test_aot_registers_each_exact_mnnvl_moe_target(monkeypatch):
     monkeypatch.setattr(jit_comm, "gen_comm_alltoall_module", lambda: spec("comm"))
     monkeypatch.setattr(jit_comm, "gen_vllm_comm_module", lambda: spec("vllm"))
     monkeypatch.setattr(jit_comm, "gen_pcie_ipc_comm_module", lambda: spec("pcie"))
+    monkeypatch.setattr(
+        jit_comm, "gen_pcie_ipc_ag_rs_module", lambda: spec("pcie_ag_rs")
+    )
     monkeypatch.setattr(
         jit_comm,
         "gen_moe_alltoall_module",

@@ -1,12 +1,12 @@
 {
-  "admitted_architecture_rows": 3504,
-  "architecture_row_count": 3558,
+  "admitted_architecture_rows": 3544,
+  "architecture_row_count": 3598,
   "architectures": [
     "sm_100a",
     "sm_103a"
   ],
   "binary_artifacts": false,
-  "contract_row_count": 1779,
+  "contract_row_count": 1799,
   "contract_rows": [
     {
       "contract": "prefill_focus",
@@ -31975,6 +31975,366 @@
       "domain": "decode",
       "label": "b64_t4_update_cache",
       "line": 4
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b1",
+      "line": 18
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b2",
+      "line": 19
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b3",
+      "line": 20
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b4",
+      "line": 21
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b5",
+      "line": 22
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b6",
+      "line": 23
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b7",
+      "line": 24
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b8",
+      "line": 25
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t8.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t8.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t8_b1",
+      "line": 26
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp1_verify_t7_b1",
+      "line": 27
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b1_contiguous",
+      "line": 1671
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b2_contiguous",
+      "line": 1672
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b3_contiguous",
+      "line": 1673
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b4_contiguous",
+      "line": 1674
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b5_contiguous",
+      "line": 1675
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b6_contiguous",
+      "line": 1676
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b7_contiguous",
+      "line": 1677
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t7_b8_contiguous",
+      "line": 1678
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t8.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t8.tile16_fullwarp",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp2_verify_t8_b1_contiguous",
+      "line": 1679
+    },
+    {
+      "contract": "decode_bf16_serving",
+      "dispatch": {
+        "sm_100a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db"
+        },
+        "sm_103a": {
+          "route_id": "flashinfer.gdn_decode.indexed_bf16_verify_t7.wide32",
+          "status": "optimized",
+          "variant": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db"
+        }
+      },
+      "domain": "decode",
+      "label": "bf16_sglang_qwen_tp1_verify_t7_b1_contiguous",
+      "line": 1680
     }
   ],
   "cuda_headers": [
@@ -32021,12 +32381,12 @@
   },
   "schema": "flashinfer-cake-gdn-decode-standalone-export-v1",
   "scope": {
-    "decode": "frozen FP32-state T=1 and promoted MTP plus exact BF16 indexed T1/T2/T3/T4 serving rows",
+    "decode": "frozen FP32-state T=1 and promoted MTP plus exact BF16 indexed T1/T2/T3/T4 serving rows and the Qwen3.5 TP2 T7/T8 verify rows",
     "explicit_backend_policy": "one listed GDN non-CP variant or fail closed; no external fallback",
     "prefill": "frozen general prefill contract"
   },
   "source_only": true,
-  "variant_count": 104,
+  "variant_count": 108,
   "variants": [
     {
       "abi": [
@@ -55343,6 +55703,936 @@
       },
       "threads": 384,
       "tma_abi": "grid_constant"
+    },
+    {
+      "abi": [
+        {
+          "name": "q",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "k",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "v",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "A_log",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "a",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "dt_bias",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "b",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "out",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "intermediate_state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "initial_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "output_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state_size_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "state_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        }
+      ],
+      "architectures": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_gdn_decode_pretranspose_t4_bf16state_tile16",
+      "domain": "decode",
+      "dynamic_smem_bytes": 8832,
+      "host_binding": {
+        "arg_plan": [
+          [
+            "buffer",
+            "q"
+          ],
+          [
+            "buffer",
+            "k"
+          ],
+          [
+            "buffer",
+            "v"
+          ],
+          [
+            "buffer",
+            "state"
+          ],
+          [
+            "buffer",
+            "A_log"
+          ],
+          [
+            "buffer",
+            "a"
+          ],
+          [
+            "buffer",
+            "dt_bias"
+          ],
+          [
+            "buffer",
+            "b"
+          ],
+          [
+            "buffer",
+            "out"
+          ],
+          [
+            "buffer",
+            "intermediate_state"
+          ],
+          [
+            "buffer",
+            "initial_state_indices"
+          ],
+          [
+            "buffer",
+            "output_state_indices"
+          ],
+          [
+            "grid",
+            "grid_x"
+          ],
+          [
+            "grid",
+            "grid_y"
+          ],
+          [
+            "grid",
+            "grid_z"
+          ]
+        ],
+        "entry": "run_decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7",
+        "module_ident": "gdn_decode_pretranspose_t4_bf16state_tile16_0751d92fac",
+        "path": "host/cake_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7.cc",
+        "sha256": "cec468ea7607584bf814bee9b4b2150e359ba7ae9a1371cccdbd1ead303e6b6e",
+        "size_bytes": 21374
+      },
+      "name": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7.sm_103a.cu",
+          "sha256": "a7bf18419e97a8b473e9b3dd4b07a4e90a42b37ecee33c4bbfc3789f646de5d5",
+          "size_bytes": 32008
+        },
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_16e0085ad1e7.sm_100a.cu",
+          "sha256": "c2a6ac22a2f18f187cca1dbf9fcdf48329e1bc8a3dbfb48d30039612dd690a7b",
+          "size_bytes": 32105
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t4_bf16state_tile16",
+      "source_symbol": "gdn_decode_pretranspose_t4_bf16state_tile16",
+      "specializations": {
+        "H": 8,
+        "HV": 16,
+        "INTERMEDIATE_BATCH_STRIDE": 1835008,
+        "INTERMEDIATE_TOKEN_STRIDE": 262144,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "T_STEPS": 7
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "abi": [
+        {
+          "name": "q",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "k",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "v",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "A_log",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "a",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "dt_bias",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "b",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "out",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "intermediate_state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "initial_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "output_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state_size_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "state_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        }
+      ],
+      "architectures": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_gdn_decode_pretranspose_t4_bf16state_tile16",
+      "domain": "decode",
+      "dynamic_smem_bytes": 8832,
+      "host_binding": {
+        "arg_plan": [
+          [
+            "buffer",
+            "q"
+          ],
+          [
+            "buffer",
+            "k"
+          ],
+          [
+            "buffer",
+            "v"
+          ],
+          [
+            "buffer",
+            "state"
+          ],
+          [
+            "buffer",
+            "A_log"
+          ],
+          [
+            "buffer",
+            "a"
+          ],
+          [
+            "buffer",
+            "dt_bias"
+          ],
+          [
+            "buffer",
+            "b"
+          ],
+          [
+            "buffer",
+            "out"
+          ],
+          [
+            "buffer",
+            "intermediate_state"
+          ],
+          [
+            "buffer",
+            "initial_state_indices"
+          ],
+          [
+            "buffer",
+            "output_state_indices"
+          ],
+          [
+            "grid",
+            "grid_x"
+          ],
+          [
+            "grid",
+            "grid_y"
+          ],
+          [
+            "grid",
+            "grid_z"
+          ]
+        ],
+        "entry": "run_decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110",
+        "module_ident": "gdn_decode_pretranspose_t4_bf16state_tile16_706ed7b2e4",
+        "path": "host/cake_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110.cc",
+        "sha256": "fc4d5bd6aadd9b245ed605936081b41a07978ecd3c291565dc8f43f11c8e567f",
+        "size_bytes": 21374
+      },
+      "name": "decode_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110.sm_100a.cu",
+          "sha256": "22509d015d4963b7ec7fac9eba92a4759c113ffb452390a1bb26015714acd187",
+          "size_bytes": 32105
+        },
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_t4_bf16state_tile16_740c5a9f9110.sm_103a.cu",
+          "sha256": "99e672794f03a308af03b2c9dd718702fd9ca19137258b939e6f0fb4ee496f5d",
+          "size_bytes": 32008
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_t4_bf16state_tile16",
+      "source_symbol": "gdn_decode_pretranspose_t4_bf16state_tile16",
+      "specializations": {
+        "H": 8,
+        "HV": 16,
+        "INTERMEDIATE_BATCH_STRIDE": 2097152,
+        "INTERMEDIATE_TOKEN_STRIDE": 262144,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "T_STEPS": 8
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "abi": [
+        {
+          "name": "q",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "k",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "v",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "A_log",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "a",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "dt_bias",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "b",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "out",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "intermediate_state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "initial_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "output_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state_size_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "state_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        }
+      ],
+      "architectures": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "domain": "decode",
+      "dynamic_smem_bytes": 12416,
+      "host_binding": {
+        "arg_plan": [
+          [
+            "buffer",
+            "q"
+          ],
+          [
+            "buffer",
+            "k"
+          ],
+          [
+            "buffer",
+            "v"
+          ],
+          [
+            "buffer",
+            "state"
+          ],
+          [
+            "buffer",
+            "A_log"
+          ],
+          [
+            "buffer",
+            "a"
+          ],
+          [
+            "buffer",
+            "dt_bias"
+          ],
+          [
+            "buffer",
+            "b"
+          ],
+          [
+            "buffer",
+            "out"
+          ],
+          [
+            "buffer",
+            "intermediate_state"
+          ],
+          [
+            "buffer",
+            "initial_state_indices"
+          ],
+          [
+            "buffer",
+            "output_state_indices"
+          ],
+          [
+            "grid",
+            "grid_x"
+          ],
+          [
+            "grid",
+            "grid_y"
+          ],
+          [
+            "grid",
+            "grid_z"
+          ]
+        ],
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_2aa5b703bc",
+        "path": "host/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32.cc",
+        "sha256": "dd11827ce426ae68f70b29183e1193963bb5852d8ffa6c5897a39f3304ee1b57",
+        "size_bytes": 21399
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32.sm_103a.cu",
+          "sha256": "0538753f971d3a52393f99cb90cdebbe9e58277f09b0599b16482fcab78726bf",
+          "size_bytes": 47563
+        },
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_b9744cda5f32.sm_100a.cu",
+          "sha256": "6d8cd40b09d2093854bd0a15f76c933b34136fa934260ec73ff7c57a58bc0ad1",
+          "size_bytes": 47660
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "source_symbol": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 8,
+        "HV": 16,
+        "INTERMEDIATE_BATCH_STRIDE": 1835008,
+        "INTERMEDIATE_TOKEN_STRIDE": 262144,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 7,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
+    },
+    {
+      "abi": [
+        {
+          "name": "q",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "k",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "v",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "A_log",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "a",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "dt_bias",
+          "type": "PtrType(elem_ty=float32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "b",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "out",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "intermediate_state",
+          "type": "PtrType(elem_ty=bfloat16, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "initial_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "output_state_indices",
+          "type": "PtrType(elem_ty=int32, const=False, volatile=False, space=gmem)"
+        },
+        {
+          "name": "state_size_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "state_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "q_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "k_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "a_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "b_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p0",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p1",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        },
+        {
+          "name": "v_stride_p2",
+          "type": "ffi.std.PrimTy(dtype=int64)"
+        }
+      ],
+      "architectures": [
+        "sm_100a",
+        "sm_103a"
+      ],
+      "compile_options": [
+        "--use_fast_math"
+      ],
+      "cuda_symbol": "kernel_gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "domain": "decode",
+      "dynamic_smem_bytes": 12416,
+      "host_binding": {
+        "arg_plan": [
+          [
+            "buffer",
+            "q"
+          ],
+          [
+            "buffer",
+            "k"
+          ],
+          [
+            "buffer",
+            "v"
+          ],
+          [
+            "buffer",
+            "state"
+          ],
+          [
+            "buffer",
+            "A_log"
+          ],
+          [
+            "buffer",
+            "a"
+          ],
+          [
+            "buffer",
+            "dt_bias"
+          ],
+          [
+            "buffer",
+            "b"
+          ],
+          [
+            "buffer",
+            "out"
+          ],
+          [
+            "buffer",
+            "intermediate_state"
+          ],
+          [
+            "buffer",
+            "initial_state_indices"
+          ],
+          [
+            "buffer",
+            "output_state_indices"
+          ],
+          [
+            "grid",
+            "grid_x"
+          ],
+          [
+            "grid",
+            "grid_y"
+          ],
+          [
+            "grid",
+            "grid_z"
+          ]
+        ],
+        "entry": "run_decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db",
+        "module_ident": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e28325f9bd",
+        "path": "host/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db.cc",
+        "sha256": "cde4e34c7a48953c881dadacf0f87094a378403f9677e0120c3525523b726822",
+        "size_bytes": 21402
+      },
+      "name": "decode_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db",
+      "outputs": [
+        {
+          "architectures": [
+            "sm_103a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db.sm_103a.cu",
+          "sha256": "01388d1805065f5728d91ad3d6df2877564e7cc2552998bdd6db1fd018bbf836",
+          "size_bytes": 47564
+        },
+        {
+          "architectures": [
+            "sm_100a"
+          ],
+          "path": "cuda/cake_gdn_decode_pretranspose_mtp_t4_bf16state_wide128_e533c12242db.sm_100a.cu",
+          "sha256": "2970688e16f482047d6cd266275ef64fb9afbf413ae1c7ef777ad80a59d7c334",
+          "size_bytes": 47661
+        }
+      ],
+      "source_schedule": "flashinfer.cake_gdn.generated.decode:gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "source_symbol": "gdn_decode_pretranspose_mtp_t4_bf16state_wide128",
+      "specializations": {
+        "CACHE_INTERMEDIATE_STATES": 1,
+        "H": 16,
+        "HV": 32,
+        "INTERMEDIATE_BATCH_STRIDE": 3670016,
+        "INTERMEDIATE_TOKEN_STRIDE": 524288,
+        "SCALE": 0.08838834764831845,
+        "STRIDED_INPUTS": 1,
+        "TILE_V_WIDE": 32,
+        "T_STEPS": 7,
+        "UPDATE_STATE": 0
+      },
+      "threads": 128,
+      "tma_abi": "pointer"
     }
   ]
 }

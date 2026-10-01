@@ -511,6 +511,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
             _validate_head_dim,
             _validate_head_geometry,
             _validate_positive_int,
+            _validate_runtime_device,
         )
 
         batch_size = _validate_positive_int(batch_size, "batch_size")
@@ -541,6 +542,7 @@ class QTokenKvBlockSparsePagedTSWrapper:
         if o_data_type is None:
             o_data_type = q_data_type
         planned_device, device_index = _resolve_cuda_device(device)
+        _validate_runtime_device(planned_device)
         if not isinstance(workspace_buffer, torch.Tensor):
             raise TypeError("workspace_buffer must be a torch.Tensor")
         if workspace_buffer.device != planned_device:
@@ -1040,6 +1042,7 @@ def _get_prims_ts_q_token_kv_block_sparse_workspace_layout(
         max_seq_len,
         group_size,
         q_dtype,
+        kv_dtype,
         kv_dtype,
         out_dtype,
         "HND",
