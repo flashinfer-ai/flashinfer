@@ -23,10 +23,11 @@ def artifact_root(dtype: str) -> Path:
     return _safe_child(Path(__file__).resolve().parent / "artifacts", dtype)
 
 
-def _validate_abi(raw: dict[str, Any], op: str) -> bool:
+def _validate_abi(raw: dict[str, Any], op: str, versions=("v1",)) -> bool:
+    """Check the launch ABI against the versions the caller's runtime implements."""
     swap = raw.get("tactic", {}).get("swap_ab", False)
-    expected = f"cudnn_frost_{op}{'_swap_ab' if swap else ''}_v1"
-    if not isinstance(swap, bool) or raw.get("abi") != expected:
+    expected = {f"cudnn_frost_{op}{'_swap_ab' if swap else ''}_{v}" for v in versions}
+    if not isinstance(swap, bool) or raw.get("abi") not in expected:
         raise RuntimeError(
             f"unsupported or inconsistent cuDNN Frost ABI: {raw.get('id')}"
         )

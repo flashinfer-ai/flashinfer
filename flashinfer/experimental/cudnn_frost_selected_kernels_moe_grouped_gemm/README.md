@@ -67,9 +67,10 @@ out  = silu(gate) * up * scale
 ```
 
 `grouped_tokens` must already be materialized in contiguous group order.
-`first_token_offset[g]` is the first row of group `g`; the last group ends at
-`S`, and group `g` uses expert `g % E`. Routing, permutation, GEMM2, and final
-scatter are outside this API.
+`first_token_offset` holds `G+1` nondecreasing group boundaries starting at
+zero: group `g` spans rows `[offset[g], offset[g+1])` and uses expert `g % E`.
+Rows past the final boundary (at most `S`) belong to no group; their output is
+unspecified. Routing, permutation, GEMM2, and final scatter are outside this API.
 
 An independent FC2 grouped-GEMM PoC and a full `CudnnFrostBf16MoeRunner` are also
 implemented. The old cuDNN Frost-FC1/CUTLASS-FC2 hybrid integration has been removed
@@ -800,14 +801,15 @@ SM100. The template addresses tokens by coordinate on one global TMA descriptor
 and stores through STG, so it patches no tensormap: the workspace is one
 128-byte scheduler-counter slot. There is no swap-AB orientation, CTA pair,
 cluster or TMA-store variant. Its families sit next to the SM100 ones as
-`*_bf16_sm120_normal_stg.py`; manifest and shortlist records carry
-`arch: sm_120a`.
+`cudnn_frost_sm120_*_bf16_normal_stg.py`, and its artifact ids start with
+`sm120_`; manifest and shortlist records carry `arch: sm_120a`.
 
-The exported host zeroes the scheduler counter with a one-thread kernel before
-its PDL main launch, as the SM100 MoE hosts do; earlier SM120 producers relied
-on the in-process cuDNN Frost launcher for that reset, which the FlashInfer
-adapter does not run. The artifacts record this producer change in
-`producer_revision`.
+The sources are exported from cuDNN Frontend `c132d859`. Its SM120 host zeroes
+the scheduler counter with a one-thread kernel before the PDL main launch, as
+the SM100 MoE hosts do; earlier SM120 producers relied on the in-process cuDNN
+Frost launcher for that reset, which the FlashInfer adapter does not run. Its
+scheduler takes `G+1` explicit group boundaries (launch ABI `v2`, see
+[Artifact metadata](#artifact-metadata)).
 
 Admission, token-count shortlists, the native routing/finalize adapter and the
 MoELayer integration are shared with SM107a; the adapter is compiled with the
@@ -899,8 +901,9 @@ choosing between plans within a few percent of each other under it.
 grouped_intermediate[S,I] @ down_weight[expert,H,I].T -> grouped_output[S,H]
 ```
 
-All data tensors are contiguous BF16. Offsets are int32[E], one group per
-local expert, with an implicit final end at S. Empty/uneven expert groups
+All data tensors are contiguous BF16. Offsets are int32[E+1] group boundaries,
+one group per local expert; output rows past the final boundary are
+unspecified. Empty/uneven expert groups
 are supported. This stage does not apply routing weights or finalize/scatter.
 Preparation validates offsets and compiles or reloads the native TVM-FFI function outside
 CUDA Graph capture. `PreparedFc2.run()` resets the caller-owned descriptor /
@@ -908,13 +911,13 @@ scheduler workspace and invokes that Function, without importing cuDNN Frost or
 compiling kernels during execution. Tensor metadata is prepared once; tensor contents may
 change between calls. Use distinct workspaces/plans for concurrent streams.
 
-The FC2 configurations target SM107a with dynamic S and are shared across
-activations. FC2's N is the **hidden size**, whereas FC1's N is the intermediate
-size. FC2 does not apply an activation; its configurations are selected
-independently from FC1.
+The FC2 configurations target SM107a or SM120a with dynamic S and are shared
+across activations. FC2's N is the **hidden size**, whereas FC1's N is the
+intermediate size. FC2 does not apply an activation; its configurations are
+selected independently from FC1.
 
-The FC2 records use `op=grouped_gemm2` and ABI `cudnn_frost_grouped_gemm2_v1`;
-the manifest lists their Python source paths and digests. FC1 discovery ignores
+The FC2 records use `op=grouped_gemm2` and ABI `cudnn_frost_grouped_gemm2_v1`
+or `_v2`; the manifest lists their Python source paths and digests. FC1 discovery ignores
 these records, retaining its separate candidate pool.
 
 Example build-box export (repeat with the other tile/store modes and shape):
@@ -931,11 +934,13 @@ python -m flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.
 The exporter renders and compiles the candidate with the chosen cuDNN Frost revision,
 then freezes `generated_path` and its device helpers into standalone Python.
 Device function bodies are retained; cuDNN Frost imports and its secondary compiled
-cache are removed. Sources use a `cudnn_frost_` prefix and configuration-based
-artifact names, preserving the operation, architecture, geometry, tile and
-store mode in the filename,
-including `swapAB` for swapped configurations. `select` verifies source hashes
-and refuses to replace different bytes.
+cache are removed, as are inlined helper definitions the kernel never reaches
+(shared Frost helper modules also carry other pipelines' wrappers, such as
+SM100 `tcgen05` for an SM120 kernel). Kernel names lead with the target
+architecture: a family is `cudnn_frost_<arch>_<op>_<dtype>_<orientation>_<store>.py`
+and a default artifact id starts `<arch>_<op>_` (e.g. `sm120_grouped_gemm2_...`),
+followed by the geometry, tile and store mode, including `swapAB` for swapped
+configurations. `select` verifies source hashes and refuses to replace different bytes.
 
 `tests/experimental/test_cudnn_frost_selected_kernels.py` focuses on the complete
 **cuDNN Frost FC1 + SwiGLU -> cuDNN Frost FC2 -> finalize** path: every compound tactic on
@@ -1035,6 +1040,15 @@ Each schema-v2 manifest record contains a `source.path`/`source.sha256` pair,
 optional `source.parameters` for a shared template, and exact `E/N/K/group-count`, architecture, workspace size,
 cuDNN Frost revision, template, tile, CTA group, scheduler, and SHA-256. `S` remains
 dynamic because the generated cuDNN Frost host kernel receives it at launch.
+
+The record's `abi` (`cudnn_frost_<op>[_quantized][_swap_ab]_v<N>`) versions the
+launch contract. `v2` sources take `first_token_offset` as `G+1` explicit group
+boundaries, the only form current cuDNN Frost accepts; `v1` sources took `G`
+starts and ended the last group at `S`. Every BF16 launch passes boundaries:
+`v1` sources read only the starts, which is equivalent while the final boundary
+is `S`, as on every MoE runner path. The block-scale runtimes still pass `G`
+starts and load `v1` sources only, so a re-exported block-scale source is
+rejected until they pass boundaries too.
 
 The package source directory is read-only at runtime. Generating or replacing
 source artifacts is an offline operation. Instantiated sources are atomically

@@ -34,6 +34,11 @@ from ..runtime import (
 
 _artifact_cache_version = 0
 
+# Every BF16 launch passes first_token_offset as G+1 explicit boundaries (v2).
+# v1 sources (SM107, until re-exported) read only the G starts and end the last
+# group at S; rows past the final boundary are unspecified for both versions.
+_ABI_VERSIONS = ("v1", "v2")
+
 
 @dataclass(frozen=True)
 class CudnnFrostGroupedGemm1Kernel:
@@ -98,7 +103,7 @@ def _read_root(root: Path) -> list[CudnnFrostGroupedGemm1Kernel]:
         activation = contract_activation(raw.get("contract", {}))
         if activation not in ACTIVATIONS or op != f"grouped_gemm1_{activation}":
             raise RuntimeError(f"Invalid FC1 activation contract: {artifact_id}")
-        _validate_abi(raw, op)
+        _validate_abi(raw, op, _ABI_VERSIONS)
         source_path, actual = _read_source(root, raw)
         workspace_bytes = int(raw.get("workspace_bytes", -1))
         if workspace_bytes < 0 or workspace_bytes % 128:
@@ -176,9 +181,11 @@ def _validate_common(
         raise ValueError(f"token K={k} does not match weight K={weight_k}")
     if first_token_offset.ndim != 1 or first_token_offset.dtype != torch.int32:
         raise ValueError("first_token_offset must be a one-dimensional int32 tensor")
-    groups = int(first_token_offset.numel())
-    if groups == 0:
-        raise ValueError("first_token_offset must contain at least one group")
+    groups = int(first_token_offset.numel()) - 1
+    if groups < 1:
+        raise ValueError(
+            "first_token_offset must contain G+1 group boundaries, with G >= 1"
+        )
     if scale.dtype != torch.float32 or scale.numel() != 1:
         raise ValueError("scale must contain one float32 value")
     if out is not None and (tuple(out.shape) != (s, n) or out.dtype != torch.bfloat16):
@@ -297,7 +304,7 @@ def _launch(
         s if kernel.swap_ab else n,
         k,
         e,
-        int(first_token_offset.numel()),
+        int(first_token_offset.numel()) - 1,
         *(int(stride) for operand in operands for stride in operand.stride()),
         *map(int, output.stride()),
     )

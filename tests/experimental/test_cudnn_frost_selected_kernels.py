@@ -680,6 +680,14 @@ def test_bf16_artifact_architecture_and_swap_abi_isolation(monkeypatch):
                 {"id": "bad", "abi": abi, "tactic": {"swap_ab": swap}},
                 "grouped_gemm2",
             )
+    # v2 sources take G+1 explicit group boundaries. BF16 launches pass them to
+    # every source; block-scale runtimes still pass G starts and must refuse v2.
+    explicit = {"id": "v2", "abi": "cudnn_frost_grouped_gemm2_v2", "tactic": {}}
+    assert (
+        runtime._validate_abi(explicit, "grouped_gemm2", runtime._ABI_VERSIONS) is False
+    )
+    with pytest.raises(RuntimeError, match="ABI"):
+        runtime._validate_abi(explicit, "grouped_gemm2")
 
 
 def test_bf16_source_distribution_has_no_binary_or_cudnn_frost_dependency():
@@ -759,7 +767,23 @@ def test_bf16_sm120_sources_roundtrip_without_cudnn(monkeypatch):
         entry = record["source"]
         template = (root / entry["path"]).read_text()
         families.setdefault(record["op"], set()).add(entry["path"])
-        assert entry["path"].endswith("_bf16_sm120_normal_stg.py")
+        # Kernel names lead with the architecture.
+        assert record["id"].startswith(f"sm120_{record['op']}_")
+        assert entry["path"] == (
+            f"sources/cudnn_frost_sm120_{record['op']}_bf16_normal_stg.py"
+        )
+        # Explicit G+1 group boundaries: no final endpoint inferred from S.
+        assert record["abi"] == f"cudnn_frost_{record['op']}_v2"
+        assert "first_token_arr[my_group + 1]" in template
+        assert "gemm_s" not in template
+        # Unreached helpers (e.g. SM100 tcgen05 wrappers) are not frozen in.
+        assert not any(
+            isinstance(node, ast.FunctionDef)
+            and node.name.startswith("tcgen05")
+            or isinstance(node, ast.Attribute)
+            and node.attr.startswith("tcgen05")
+            for node in ast.walk(ast.parse(template))
+        )
         assert "# @@FROST_TMA_STORE@@" not in template
         tactic = record["tactic"]
         assert tactic["template"] == "sm120_moe_grouped_matmul_fwd.py"
@@ -793,6 +817,81 @@ def test_bf16_sm120_sources_roundtrip_without_cudnn(monkeypatch):
         "grouped_gemm2",
     }
     assert all(len(paths) == 1 for paths in families.values())
+
+
+def test_frost_export_names_architecture_first_and_prunes_unreached_helpers():
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.export import (
+        _reachable_definitions,
+        arch_tag,
+    )
+
+    assert (arch_tag("sm_107a"), arch_tag("sm_120a")) == ("sm107", "sm120")
+    with pytest.raises(ValueError, match="architecture"):
+        arch_tag("sm120")
+    source = "\n".join(
+        (
+            "def used(x):\n    return nested(x)",
+            "def nested(x):\n    return x",
+            "def unused(x):\n    return orphan(x)",
+            "def orphan(x):\n    return x",
+            "alias = used",
+            "def kernel():\n    return alias(1)",
+        )
+    )
+    optional = {"used", "nested", "unused", "orphan"}
+    assert _reachable_definitions(source, optional) == {"used", "nested"}
+    gate = torch.empty(1, 3, 4, dtype=torch.bfloat16)
+    args = (torch.empty(2, 4, dtype=torch.bfloat16), gate, gate)
+    scale = torch.ones(1)
+    # G+1 boundaries: one boundary alone describes no group.
+    with pytest.raises(ValueError, match="G\\+1"):
+        runtime._validate_common(*args, torch.zeros(1, dtype=torch.int32), scale, None)
+    assert runtime._validate_common(
+        *args, torch.tensor([0, 2], dtype=torch.int32), scale, None
+    ) == (2, 3, 4, 1, 1)
+
+
+@bf16_gpu
+def test_bf16_explicit_group_boundaries_leave_trailing_rows(monkeypatch):
+    """The final boundary may end before S; repeated launches need no reset."""
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        fc2,
+    )
+
+    if not _sm120():
+        pytest.skip("v1 SM107 sources end the last group at S")
+    monkeypatch.setitem(sys.modules, "cudnn", None)
+    torch.manual_seed(7)
+    device = torch.device("cuda", torch.cuda.current_device())
+    sizes = [64, 0, 200, 128, 100, 12, 196, 68]
+    bounds = [sum(sizes[:g]) for g in range(len(sizes) + 1)]
+    rows = bounds[-1] + 37  # routed capacity beyond every group
+    x = torch.randn(rows, 256, dtype=torch.bfloat16, device=device)
+    w = torch.randn(8, 128, 256, dtype=torch.bfloat16, device=device) * 0.1
+    offsets = torch.tensor(bounds, dtype=torch.int32, device=device)
+    expected = torch.cat(
+        [
+            x[a:b].float() @ w[g].float().T
+            for g, (a, b) in enumerate(zip(bounds[:-1], bounds[1:], strict=True))
+        ]
+    )
+    kernels = fc2.matching_kernels(rows, 128, 256, 8, device)
+    assert kernels
+    for kernel in kernels:
+        out = torch.full((rows, 128), float("nan"), dtype=torch.bfloat16, device=device)
+        workspace = torch.full(
+            (kernel.workspace_bytes,), 0x7F, dtype=torch.uint8, device=device
+        )
+        plan = fc2.PreparedFc2(kernel, x, w, offsets, out, workspace)
+        for _ in range(2):
+            # Bypass PreparedFc2.run()'s reset: the frozen host zeroes its counter.
+            plan._launch(*plan._args, fc2._current_custream(device))
+            error = (out[: bounds[-1]].float() - expected).norm() / expected.norm()
+            assert error.item() < 0.01, (kernel.artifact_id, error.item())
+        assert torch.isnan(out[bounds[-1] :]).all(), kernel.artifact_id
 
 
 @pytest.fixture
@@ -3196,7 +3295,7 @@ def test_bf16_grouped_api_preserves_explicit_tactic(explicit, gate, monkeypatch)
         torch.empty(2, 4, dtype=torch.bfloat16),
         torch.empty(1, 3, 4, dtype=torch.bfloat16),
         torch.empty(1, 3, 4, dtype=torch.bfloat16),
-        torch.zeros(1, dtype=torch.int32),
+        torch.tensor([0, 2], dtype=torch.int32),  # G+1 group boundaries
         torch.ones(1),
         torch.empty(0, dtype=torch.uint8),
         out=output,

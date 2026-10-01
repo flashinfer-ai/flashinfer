@@ -16,8 +16,21 @@ from typing import Any
 from .activations import ACTIVATIONS, is_gated
 
 
+# Launch-ABI version of new exports. v2 passes first_token_offset as G+1
+# explicit group boundaries; v1 sources inferred the final endpoint from S.
+ABI_VERSION = "v2"
+
+
 def _slug(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value)
+
+
+def arch_tag(arch: str) -> str:
+    """Name prefix of an export target, e.g. ``sm_120a`` -> ``sm120``."""
+    match = re.fullmatch(r"sm_(\d+)[af]?", arch)
+    if match is None:
+        raise ValueError(f"unsupported export architecture {arch!r}")
+    return f"sm{match[1]}"
 
 
 def _sha256(path: Path) -> str:
@@ -104,15 +117,20 @@ def _build_graph(
         )
         return graph.mul(a=tensor, b=alpha, name=f"apply_{name}")
 
-    token = dequantize(token, "token_scale", token=True)
-    gate = dequantize(gate, "gate_weight_scale")
-    if op == "grouped_gemm2":
-        offsets = graph.tensor(
+    def boundaries():
+        # G+1 explicit boundaries: group g spans [offset[g], offset[g+1]).
+        # cuDNN Frost no longer infers the final endpoint from the token count.
+        return graph.tensor(
             name="first_token_offset",
-            dim=[groups, 1, 1],
+            dim=[groups + 1, 1, 1],
             stride=[1, 1, 1],
             data_type=cudnn.data_type.INT32,
         )
+
+    token = dequantize(token, "token_scale", token=True)
+    gate = dequantize(gate, "gate_weight_scale")
+    if op == "grouped_gemm2":
+        offsets = boundaries()
         output = graph.moe_grouped_matmul(
             token,
             gate,
@@ -134,12 +152,7 @@ def _build_graph(
         data_type=weight_type,
     )
     up = dequantize(up, "up_weight_scale")
-    offsets = graph.tensor(
-        name="first_token_offset",
-        dim=[groups, 1, 1],
-        stride=[1, 1, 1],
-        data_type=cudnn.data_type.INT32,
-    )
+    offsets = boundaries()
     scale = graph.tensor(
         name="scale",
         dim=[1, 1, 1],
@@ -248,19 +261,55 @@ def _build_graph(
     return graph
 
 
+_DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _reachable_definitions(source: str, optional: set[str]) -> set[str]:
+    """Names in ``optional`` that the rest of the module reaches, transitively."""
+
+    def names(node):
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+    pending: dict[str, list[ast.stmt]] = {}
+    reached: set[str] = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, _DEFINITIONS) and node.name in optional:
+            pending.setdefault(node.name, []).append(node)
+        else:
+            reached |= names(node)
+    frontier = reached & set(pending)
+    while frontier:
+        reached |= set().union(
+            *(names(n) for name in frontier for n in pending.pop(name))
+        )
+        frontier = reached & set(pending)
+    return reached & optional
+
+
 def _standalone_source(path: Path) -> str:
     """Freeze generated code and its helpers; leave only CUDA/CuTe dependencies.
 
     Keep device function bodies byte-faithful. Only imports and the ordinary
     Python compile() call are rewritten. FlashInfer owns the persistent cache.
+    Inlined helper definitions the kernel never reaches are dropped: shared
+    Frost helper modules also carry other pipelines' wrappers (e.g. SM100
+    tcgen05 for an SM120 kernel), whose APIs admission would otherwise require.
     """
     inlined: set[str] = set()
+    helpers: set[str] = set()
+    keep: set[str] | None = None
 
     def freeze(source: str, *, helper: bool = False) -> str:
         lines = source.splitlines(keepends=True)
         edits = []
         tree = ast.parse(source)
         for node in tree.body:
+            if helper and isinstance(node, _DEFINITIONS):
+                helpers.add(node.name)
+                if keep is not None and node.name not in keep:
+                    start = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+                    edits.append((start - 1, node.end_lineno, ""))
+                continue
             if not isinstance(node, ast.ImportFrom):
                 continue
             if helper and node.module == "__future__":
@@ -314,7 +363,11 @@ def _standalone_source(path: Path) -> str:
                     ]
         return "".join(lines)
 
-    source = freeze(path.read_text())
+    text = path.read_text()
+    own = {node.name for node in ast.parse(text).body if isinstance(node, _DEFINITIONS)}
+    keep = _reachable_definitions(freeze(text), helpers - own)
+    inlined.clear()
+    source = freeze(text)
     for node in ast.walk(ast.parse(source)):
         modules = []
         if isinstance(node, ast.ImportFrom):
@@ -505,22 +558,21 @@ def _export_compiled(args, compiled, config, arch):
         )
     template = _select_template(compiled.chain, config, args.cta_group, args.scheduler)
     prefix = op if dtype == "bf16" else f"block_scale_{op}"
+    # Kernel names lead with the target architecture (sm107_..., sm120_...):
+    # every architecture's families share one dtype directory.
+    target = arch_tag(arch)
     artifact_id = args.id or _slug(
-        f"{prefix}_{arch}_e{args.experts}_n{args.n}_k{args.k}_"
+        f"{target}_{prefix}_e{args.experts}_n{args.n}_k{args.k}_"
         f"g{args.groups}_{config.name}_{args.cta_group}cta_{args.scheduler}_"
         f"{actual_store_mode}{'_quantized' if quantize_output else ''}"
     )
     output_dir = args.output_dir.resolve()
-    # Families of other pipelines (SM120's warp-MMA template) share a dtype
-    # directory with the SM100 ones, so their file names name the pipeline.
-    pipeline = getattr(config, "pipeline", "sm100")
-    pipeline_tag = "" if pipeline == "sm100" else f"_{pipeline}"
     source = _export_source(
         Path(compiled.generated_path),
         output_dir,
         artifact_id,
         replace=args.replace,
-        template_family=f"{op}{'_quantized' if quantize_output else ''}_{dtype}{pipeline_tag}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
+        template_family=f"{target}_{op}{'_quantized' if quantize_output else ''}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
         swap_ab=swap_ab,
     )
     tma_slots: frozenset[int] = getattr(compiled, "tma_slots", frozenset())
@@ -556,7 +608,7 @@ def _export_compiled(args, compiled, config, arch):
         "id": artifact_id,
         "op": prefix,
         "arch": arch,
-        "abi": f"cudnn_frost_{prefix}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}_v1",
+        "abi": f"cudnn_frost_{prefix}{'_quantized' if quantize_output else ''}{'_swap_ab' if swap_ab else ''}_{ABI_VERSION}",
         "source": source,
         "workspace_bytes": int(compiled.workspace_bytes),
         "launch": {"tail": launch_tail},

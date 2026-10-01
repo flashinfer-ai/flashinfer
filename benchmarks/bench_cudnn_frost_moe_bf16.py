@@ -662,7 +662,7 @@ def export(args, file):
             for index, (name, cta, mode) in enumerate(pool):
                 if index % args.num_shards != args.shard_index:
                     continue
-                identity = f"{op}_sm{major}{minor}_e{e}_n{n}_k{k}_{name}_{mode}_{revision[:12]}"
+                identity = f"sm{major}{minor}_{op}_e{e}_n{n}_k{k}_{name}_{mode}_{revision[:12]}"
                 if identity in existing or identity in failed or args.catalog_only:
                     continue
                 opts = argparse.Namespace(
@@ -875,8 +875,9 @@ def sweep(args, file):
             order = ids.flatten().argsort()
             grouped = x[order // topk].contiguous()
             counts = torch.bincount(ids.flatten().long(), minlength=e)
-            offsets = (counts.cumsum(0) - counts).int()
-            offsets_cpu = offsets.tolist() + [rows]
+            # G+1 explicit group boundaries, ending at the routed row count.
+            offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0))).int()
+            offsets_cpu = offsets.tolist()
             emit(file, dict(kind="inputs", **case, offsets=offsets_cpu))
             mid = torch.empty(rows, i, device=device, dtype=torch.bfloat16)
             down = torch.empty(rows, h, device=device, dtype=torch.bfloat16)

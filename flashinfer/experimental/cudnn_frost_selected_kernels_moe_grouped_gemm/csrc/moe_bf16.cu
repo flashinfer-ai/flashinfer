@@ -38,6 +38,7 @@ __global__ void prefix(const int32_t* counts, int32_t* offsets, int32_t* cursors
     offsets[e] = cursors[e] = start;
     start += counts[e];
   }
+  offsets[experts] = start;  // G+1 explicit boundaries end at the routed row count.
   scale[0] = 1.f;
   scale[1] = 4.f;
   scale[2] = 25.f;
@@ -65,6 +66,7 @@ __global__ void gather(const __nv_bfloat16* x, const int32_t* ids, int32_t* curs
 
 // Small batches prepare group metadata and materialize rows in one launch.
 // Each CTA computes a stable destination, independently of CTA scheduling.
+// CTA r <= experts also writes boundary r; CTA `experts` counts every row.
 __global__ void route_small(const __nv_bfloat16* x, const int32_t* ids, int32_t* offsets,
                             int32_t* mapping, __nv_bfloat16* grouped, float* scale, int rows,
                             int hidden, int topk, int experts) {
@@ -94,7 +96,7 @@ __global__ void route_small(const __nv_bfloat16* x, const int32_t* ids, int32_t*
   if (threadIdx.x == 0) {
     destination = partial[0][0] + partial[0][1] + partial[0][2] + partial[0][3];
     if (active) mapping[r] = destination;
-    if (r < experts) offsets[r] = partial[1][0] + partial[1][1] + partial[1][2] + partial[1][3];
+    if (r <= experts) offsets[r] = partial[1][0] + partial[1][1] + partial[1][2] + partial[1][3];
     if (r == 0) {
       scale[0] = 1.f;
       scale[1] = 4.f;
@@ -204,7 +206,7 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
     // FC1 has finished consuming grouped tokens before FC2 writes its output.
     y_pos_ = x_pos_;
     counts_pos_ = reserve(fma_ ? 0 : e_ * 4);
-    offsets_pos_ = reserve(fma_ ? 0 : e_ * 4);
+    offsets_pos_ = reserve(fma_ ? 0 : (e_ + 1) * 4);
     cursors_pos_ = reserve(fma_ ? 0 : e_ * 4);
     mapping_pos_ = reserve(fma_ ? 0 : s_ * 4);
     scale_pos_ = reserve(fma_ ? 0 : 3 * sizeof(float));
@@ -257,7 +259,7 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
     auto scratch = reinterpret_cast<int64_t*>(base + scratch_pos_);
     auto expert_ids = static_cast<int32_t*>(ids.data_ptr());
     if (s_ <= 512 && e_ <= 256) {
-      route_small<<<std::max(s_, e_), 128, 0, stream>>>(
+      route_small<<<std::max(s_, e_ + 1), 128, 0, stream>>>(
           static_cast<const __nv_bfloat16*>(x.data_ptr()), expert_ids, offsets, mapping, gx, scale,
           s_, h_, k_, e_);
     } else {
@@ -275,7 +277,7 @@ class CudnnFrostMoePlan final : public tvm::ffi::ModuleObj {
     int64_t xstride[]{h_, 1, s_ * h_}, mstride[]{i_, 1, s_ * i_};
     int64_t w1shape[]{i_, h_, e_}, w1stride[]{h_, 1, (gated_ ? 2 : 1) * i_ * h_};
     int64_t w2shape[]{h_, i_, e_}, w2stride[]{i_, 1, h_ * i_};
-    int64_t eshape[]{e_}, dshape[]{int64_t(scratch1_ / 8)}, unit[]{1};
+    int64_t eshape[]{e_ + 1}, dshape[]{int64_t(scratch1_ / 8)}, unit[]{1};
     int64_t scale_shape[]{1, 1, 1}, scale_stride[]{1, 1, 1};
     DLTensor tx{gx, device_, 3, dl_bfloat16, xshape, xstride, 0};
     DLTensor tm{mid, device_, 3, dl_bfloat16, mshape, mstride, 0};
