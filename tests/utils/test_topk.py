@@ -3838,6 +3838,97 @@ def test_cub_transform_workspace_paths(transform_mode, d, k):
             run(tiny)
 
 
+def _prepared(algo, set_topk_algo, rows=8, width=4096, k=256, **kw):
+    """A transform prepared on ``algo`` (auto+deterministic is radix), its
+    inputs with two rows shorter than ``k``, and the caller's buffers."""
+    set_topk_algo(algo)
+    p = flashinfer.PreparedTopKRaggedTransform(
+        num_rows=rows,
+        max_len=width,
+        k=k,
+        dtype=torch.float32,
+        device="cuda",
+        deterministic=algo == "auto",
+        **kw,
+    )
+    if algo != "auto" and p.backend != algo:
+        pytest.skip(f"this device resolves to {p.backend}")
+    g = torch.Generator("cuda").manual_seed(0)
+    lengths = torch.randint(1, width + 1, (rows,), device="cuda", generator=g).int()
+    lengths[:2] = torch.tensor([3, 0])
+    offsets = torch.randint(0, 1 << 20, (rows,), device="cuda", generator=g).int()
+    args = (torch.randn(rows, width, device="cuda", generator=g), offsets, lengths)
+    bufs = dict(
+        out=torch.empty(rows, k, dtype=torch.int32, device="cuda"),
+        workspace=torch.zeros(p.workspace_size(), dtype=torch.uint8, device="cuda"),
+    )
+    if kw.get("use_row_starts"):
+        span = torch.rand(rows, device="cuda", generator=g) * (width - lengths + 1)
+        bufs["row_starts"] = span.int()
+    return p, args, bufs
+
+
+@pytest.mark.parametrize("row_starts", [False, True])
+@pytest.mark.parametrize("width", [4096, 128])  # 128 < k: the rest of a row is -1
+@pytest.mark.parametrize("algo", ["auto", "cub"])
+def test_prepared_topk_matches_the_per_call_transform(
+    algo, width, row_starts, set_topk_algo
+):
+    p, args, bufs = _prepared(
+        algo, set_topk_algo, width=width, use_row_starts=row_starts
+    )
+    got = p.run(*args, **bufs).sort(-1).values
+    rs = bufs.get("row_starts")
+    want = flashinfer.top_k_ragged_transform(*args, p.k, p.deterministic, row_starts=rs)
+    assert torch.equal(got, want.sort(-1).values)
+    if p.backend == "cub":  # the descriptor query sizes what the tensor one does
+        size = p._module.cub_topk_ragged_transform_workspace_size
+        assert p.workspace_size() == size(args[0], args[2], p.k, 0, row_starts)
+
+
+@pytest.mark.parametrize("algo", ["auto", "cub"])
+def test_prepared_topk_allocates_nothing_and_replays(algo, set_topk_algo):
+    p, (scores, *rest), bufs = _prepared(algo, set_topk_algo, dsa_graph_safe=True)
+    p.run(scores, *rest, **bufs)
+    torch.cuda.reset_peak_memory_stats()
+    before = torch.cuda.memory_allocated()
+    p.workspace_size(), p.run(scores, *rest, **bufs)
+    assert torch.cuda.max_memory_allocated() == before  # not even a temporary
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        p.run(scores, *rest, **bufs)
+    scores.copy_(torch.randn_like(scores))
+    graph.replay()
+    replayed = bufs["out"].sort(-1).values
+    assert torch.equal(replayed, p.run(scores, *rest, **bufs).sort(-1).values)
+
+
+def test_prepared_topk_refuses_what_it_was_not_prepared_for(set_topk_algo):
+    p, (s, o, n), b = _prepared("auto", set_topk_algo)
+    ws, out = b["workspace"], b["out"]
+    pad = torch.zeros(ws.numel() + 16, dtype=torch.uint8, device="cuda")
+    for args, kw, match in [
+        ((s, o, n), dict(out=out, workspace=ws[:-1]), "workspace needs"),
+        ((s, o, n), dict(out=out, workspace=pad[1:]), "aligned"),
+        ((s, o, n), dict(out=out[:, :-1], workspace=ws), "out must have shape"),
+        ((s[:-1], o, n), b, "input must have shape"),
+        ((s.half(), o, n), b, "input must be"),
+        ((s, o, n), dict(b, row_starts=o), "row_starts"),
+    ]:
+        with pytest.raises(ValueError, match=match):
+            p.run(*args, **kw)
+
+
+def test_prepared_topk_refuses_the_clusters_backend(monkeypatch):
+    """Clusters allocates its own output, so it cannot be prepared."""
+    target = "flashinfer.topk.resolve_ragged_transform_backend"
+    monkeypatch.setattr(target, lambda **_: "clusters")
+    with pytest.raises(NotImplementedError, match="clusters"):
+        flashinfer.PreparedTopKRaggedTransform(
+            num_rows=8, max_len=4096, k=256, dtype=torch.float32, device="cuda"
+        )
+
+
 if __name__ == "__main__":
     # Basic tests
     test_top_k(4, 32000, 256, torch.float32, flashinfer.TopKTieBreak.NONE)
