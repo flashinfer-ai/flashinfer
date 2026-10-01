@@ -33,6 +33,9 @@ _LAYOUT = "trtllm_shuffled_nvfp4_group16"
 _STATE_ATTR = "_flashinfer_cake_situ_workspace"
 _N32_CLAIM8_ARCHES = ("sm_100a", "sm_103a")
 _M256_C12_ARCHES = ("sm_100a",)
+_N8_W2A_M16_ARCHES = ("sm_103a",)
+_N8_W2A_M16_TOKENS = (16,)
+_N8_W2A_M16_FC2_GRID_N_SM_FACTOR = 2  # N8W2aM16 (inc17, RULING R113): the W2a FC2 runs two CTAs per SM -> workfeed pool 2 * SM // 28 rows (280 CTAs on 148 SMs) for the routed M16 rows
 
 
 def _tile_n(num_tokens):
@@ -259,6 +262,9 @@ def cake_fused_moe_prepare_workspace(
         mid_work5fd = arch in ("sm_100a", "sm_103a") and num_tokens in (2048, 4096)
         n32_claim8 = arch in _N32_CLAIM8_ARCHES and num_tokens in (512, 1024)
         m256_c12 = arch in _M256_C12_ARCHES and num_tokens == 256
+        n8_w2a_m16 = (
+            arch in _N8_W2A_M16_ARCHES and num_tokens in _N8_W2A_M16_TOKENS
+        )  # N8W2aM16 (inc17, R113)
         tile_n, total_pairs, max_tiles = _geometry(num_tokens, arch)
         fc2_device_workfeed = num_tokens in (8, 16) or m64_claim8 or n32_claim8
         fc2_grid_n = max_tiles
@@ -273,6 +279,11 @@ def cake_fused_moe_prepare_workspace(
                 fc2_grid_n = min(
                     max_tiles, 6
                 )  # N16Claim8M256Pool6 (F7) + MidPool6 (inc5): 168 FC2 CTAs on the 148-SM B200 for the sm_100a claim8 rows M32/M64/M128/M256; B300Pool6 (inc7): 168 FC2 CTAs on the 148-SM B300 for the sm_103a claim8 rows M32/M64/M128/M256
+            if n8_w2a_m16:
+                fc2_grid_n = min(
+                    max_tiles,
+                    max(1, _N8_W2A_M16_FC2_GRID_N_SM_FACTOR * sm_count // (_H // 128)),
+                )  # N8W2aM16 (inc17-w2a-m16, RULING R113): the W2a FC2 (NUM_STAGES 4, __launch_bounds__(512, 2)) is resident twice per SM -> 10 rows / 280 FC2 CTAs on the 148-SM B200 / B300 for the M16 rows (production 5 / 140); host launch parameter of the routed rows only, fed to the fused router (fc2_pool_ctas) and the FC2 grid
         feature_finalize = num_tokens in (1, 8, 16) or m64_claim8
         program_key = cake_situ_sequence(
             arch,
@@ -283,6 +294,7 @@ def cake_fused_moe_prepare_workspace(
             mid_work5fd,
             n32_claim8,
             m256_c12,
+            n8_w2a_m16,
         )
         module = get_cake_situ_module(program_key)
         state["shapes"][num_tokens] = {
@@ -297,6 +309,7 @@ def cake_fused_moe_prepare_workspace(
             "mid_work5fd": mid_work5fd,
             "n32_claim8": n32_claim8,
             "m256_c12": m256_c12,
+            "n8_w2a_m16": n8_w2a_m16,
             "fc2_device_workfeed": fc2_device_workfeed,
             "fc2_grid_n": fc2_grid_n,
             "fc2_pool_ctas": (_H // 128) * fc2_grid_n,

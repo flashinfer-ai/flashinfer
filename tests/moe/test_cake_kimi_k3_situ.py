@@ -300,6 +300,11 @@ def test_cake_situ_output_workspace_and_external_graph(
         )
         is workspace
     )
+    # The 16-token SM103 route runs the two-CTA-per-SM FC2 program; every other row keeps its route.
+    prepared_shape = workspace._flashinfer_cake_situ_workspace["shapes"][num_tokens]
+    assert prepared_shape["n8_w2a_m16"] is (
+        num_tokens == 16 and torch.cuda.get_device_capability(device) == (10, 3)
+    )
 
     expected = _trtllm_reference(x, ids, route_weights, prepared)
     # Ensure an all-zero output could not satisfy the FP4 absolute tolerance.
