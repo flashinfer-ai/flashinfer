@@ -143,7 +143,7 @@ L2_HINTS = (
     "evict_last",
 )  # TMA load L2 eviction policy  [Cake L622]
 EPI_MODES = ("reg", "tma")  # [Cake L626]
-BLOCK_N_CHOICES = (128, 256)
+BLOCK_N_CHOICES = (128, 192, 256)
 CTA_ROWS_CHOICES = (128, 256)
 
 # ---------------------------------------------------------------------------
@@ -242,7 +242,11 @@ def _ceil_div(a: int, b: int) -> int:
 
 
 def epi_mode(
-    out_f32: bool, out_t: bool, K: Optional[int] = None, epi: Optional[str] = None
+    out_f32: bool,
+    out_t: bool,
+    K: Optional[int] = None,
+    epi: Optional[str] = None,
+    block_n: int = 256,
 ) -> str:
     """Epilogue of an instance: transposed output -> scalar register stores (``"reg"``);
     row-major fp32 -> per-warp TMA stores (``"tma"``; the float4 register-store path is an
@@ -259,7 +263,10 @@ def epi_mode(
         return "reg"
     if out_f32:
         return "tma"
-    return "tma" if (K is not None and K <= K_TMA_BF16) else "reg"
+    # bf16 chunks are 64 columns: a 96-column (BLOCK_N = 192) warp slice has no whole-chunk TMA-store path
+    return (
+        "tma" if (K is not None and K <= K_TMA_BF16 and (block_n // 2) % 64 == 0) else "reg"
+    )
 
 
 def epi_slots(
@@ -290,6 +297,14 @@ def epi_slots(
 def staging_bytes(slots: int) -> int:
     # [Cake ``staging_bytes`` L662-L663]
     return EPI_WARPS * slots * SLOT_BYTES
+
+
+def b_stage_bytes(b_mn: bool, block_n: int) -> int:
+    """Bytes of one B stage per CTA: K-major = ``BLOCK_N / 2`` 128-byte rows; MN-major = whole
+    64-column panels (BLOCK_N = 192 loads two panels per stage, the MMA reads 1.5 of them).
+    [Cake ``b_stage_bytes``]"""
+    n_half = block_n // 2
+    return (-(-n_half // 64)) * PANEL_BYTES if b_mn else n_half * BLOCK_K * 2
 
 
 def default_stages(slots: int, cta_rows: int = 128, block_n: int = 256) -> int:
@@ -366,15 +381,20 @@ def instance_key(
         raise ValueError(f"cta_rows must be one of {CTA_ROWS_CHOICES}, got {cta_rows}")
     box_rows = 0 if box_rows is None else int(box_rows)
     box_rows_of(a_mn, b_mn, block_n, box_rows or None, cta_rows)
-    epi = epi_mode(out_f32, out_t, None, epi)
+    if block_n not in BLOCK_N_CHOICES:
+        raise ValueError(f"BLOCK_N must be one of {BLOCK_N_CHOICES}, got {block_n}")
+    epi = epi_mode(out_f32, out_t, None, epi, block_n)
+    if epi == "tma" and (block_n // 2) % (32 if out_f32 else 64):
+        raise ValueError(
+            f"the TMA-store epilogue needs whole 128-byte column chunks per warp; BLOCK_N={block_n} "
+            f"{'fp32' if out_f32 else 'bf16'} output needs epi='reg'"
+        )
     slots = epi_slots(epi, out_f32, block_n, None, slots)
     stages = default_stages(slots, cta_rows, block_n) if stages is None else int(stages)
     diag = tuple(sorted(set(diag)))
     if diag:
         raise ValueError(f"diagnostic instances are not exported: {diag}")
-    if block_n not in BLOCK_N_CHOICES:
-        raise ValueError(f"BLOCK_N must be one of {BLOCK_N_CHOICES}, got {block_n}")
-    stage_bytes = cta_rows * BLOCK_K * 2 + (block_n // 2) * BLOCK_K * 2
+    stage_bytes = cta_rows * BLOCK_K * 2 + b_stage_bytes(b_mn, block_n)
     if (
         stages < 2
         or stages * stage_bytes + staging_bytes(slots) + WORK_STAGES * 16
@@ -463,96 +483,84 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
 # count never keys a rule (M = None for forward / input gradients, K = None for weight gradients).
 # Byte-identical to Cake ``ROW_RULES``.
 ROW_RULES: dict[tuple, dict] = {
-    ("sm_100a", False, False, False, False, False, 576, 6144, None): {"block_n": 128},
-    ("sm_100a", False, False, False, False, False, 2048, 6144, None): {"group_m": 8},
-    ("sm_100a", False, False, False, False, False, 6144, 12288, None): {
-        "cta_rows": 256
-    },
-    ("sm_100a", False, False, False, False, False, 6144, 16384, None): {
-        "cta_rows": 256,
-        "group_m": 8,
-    },
-    ("sm_100a", False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
-    ("sm_100a", False, True, False, False, False, 6144, 32, None): {"cta_rows": 256},
-    ("sm_100a", False, True, False, False, False, 6144, 128, None): {"cta_rows": 256},
-    ("sm_100a", False, True, False, False, False, 6144, 576, None): {
-        "group_m": 8,
-        "stages": 6,
-    },
-    ("sm_100a", False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
-    ("sm_100a", False, True, False, False, False, 6144, 12288, None): {
-        "cta_rows": 256,
-        "group_m": 8,
-    },
-    ("sm_100a", False, True, True, False, False, 2048, 4096, None): {
-        "group_m": 8,
-        "epi": "reg",
-        "f32_v8": True,
-    },
-    ("sm_100a", False, True, True, False, False, 2048, 6144, None): {
-        "group_m": 8,
-        "epi": "reg",
-        "f32_v8": True,
-    },
-    ("sm_100a", False, True, True, False, False, 2048, 16384, None): {
-        "group_m": 8,
-        "epi": "reg",
-        "f32_v8": True,
-    },
-    ("sm_100a", False, True, True, False, False, 6144, 32, None): {"block_n": 128},
-    ("sm_100a", False, True, True, False, False, 6144, 128, None): {"block_n": 128},
-    ("sm_100a", False, True, True, False, False, 6144, 2048, None): {
-        "group_m": 8,
-        "epi": "reg",
-        "f32_v8": True,
-    },
-    ("sm_100a", False, True, True, False, False, 6144, 12288, None): {
-        "epi": "reg",
-        "f32_v8": True,
-    },
-    ("sm_100a", False, True, True, False, False, 16384, 6144, None): {
-        "epi": "reg",
-        "f32_v8": True,
-    },
-    ("sm_100a", True, True, False, False, False, 2048, None, 4096): {"cta_rows": 256},
-    ("sm_100a", True, True, False, False, False, 2048, None, 6144): {"group_m": 4},
-    ("sm_100a", True, True, False, False, False, 6144, None, 12288): {
-        "cta_rows": 256,
-        "group_m": 8,
-    },
-    ("sm_100a", True, True, False, False, False, 12288, None, 6144): {
-        "cta_rows": 256,
-        "group_m": 8,
-    },
-    ("sm_100a", True, True, False, False, False, 16384, None, 6144): {
-        "cta_rows": 256,
-        "group_m": 8,
-    },
-    ("sm_100a", True, True, False, True, False, 32, None, 6144): {"block_n": 128},
-    ("sm_100a", True, True, False, True, False, 128, None, 6144): {"block_n": 128},
-    ("sm_100a", True, True, False, True, True, 192, None, 512): {"cta_rows": 256},
-    ("sm_100a", True, True, False, True, True, 256, None, 512): {"cta_rows": 256},
-    ("sm_100a", True, True, True, False, False, 2048, None, 4096): {"cta_rows": 256},
-    ("sm_100a", True, True, True, False, False, 2048, None, 6144): {
-        "group_m": 8,
-        "epi": "reg",
-        "f32_v8": True,
-    },
-    ("sm_100a", True, True, True, False, False, 2048, None, 16384): {
-        "group_m": 8,
-        "epi": "reg",
-        "f32_v8": True,
-    },
-    ("sm_100a", True, True, True, False, False, 6144, None, 2048): {
-        "group_m": 32,
-        "epi": "reg",
-        "f32_v8": True,
-    },
-    ("sm_100a", True, True, True, False, False, 6144, None, 12288): {"cta_rows": 256},
-    ("sm_100a", True, True, True, False, False, 12288, None, 6144): {"cta_rows": 256},
-    ("sm_100a", True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256},
-    ("sm_100a", True, True, True, True, False, 32, None, 6144): {"block_n": 128},
-    ("sm_100a", True, True, True, True, False, 128, None, 6144): {"block_n": 128},
+    ('sm_100a', False, False, False, False, False, 576, 6144, None): {"hints": ('evict_first', 'evict_last'), "stages": 8},
+    ('sm_100a', False, False, False, False, False, 2048, 6144, None): {"group_m": 8},
+    ('sm_100a', False, False, False, False, False, 6144, 12288, None): {"cta_rows": 256},
+    ('sm_100a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256, "group_m": 8},
+    ('sm_100a', False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
+    ('sm_100a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
+    ('sm_100a', False, False, False, False, True, 256, 512, None): {"promo": 'l2_256b'},
+    ('sm_100a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 256},
+    ('sm_100a', False, True, False, False, False, 6144, 128, None): {"cta_rows": 256},
+    ('sm_100a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "stages": 6},
+    ('sm_100a', False, True, False, False, False, 6144, 2048, None): {"group_m": 8},
+    ('sm_100a', False, True, False, False, False, 6144, 12288, None): {"cta_rows": 256, "group_m": 8},
+    ('sm_100a', False, True, False, False, True, 512, 256, None): {"cta_rows": 256},
+    ('sm_100a', False, True, True, False, False, 2048, 4096, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_100a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_100a', False, True, True, False, False, 2048, 16384, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_100a', False, True, True, False, False, 6144, 32, None): {"block_n": 128},
+    ('sm_100a', False, True, True, False, False, 6144, 128, None): {"block_n": 128},
+    ('sm_100a', False, True, True, False, False, 6144, 2048, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_100a', False, True, True, False, False, 6144, 12288, None): {"epi": 'reg', "f32_v8": True},
+    ('sm_100a', False, True, True, False, False, 16384, 6144, None): {"epi": 'reg', "f32_v8": True},
+    ('sm_100a', True, True, False, False, False, 2048, None, 4096): {"cta_rows": 256},
+    ('sm_100a', True, True, False, False, False, 2048, None, 6144): {"group_m": 4},
+    ('sm_100a', True, True, False, False, False, 6144, None, 12288): {"cta_rows": 256, "group_m": 8},
+    ('sm_100a', True, True, False, False, False, 12288, None, 6144): {"cta_rows": 256, "group_m": 8},
+    ('sm_100a', True, True, False, False, False, 16384, None, 6144): {"cta_rows": 256, "group_m": 8},
+    ('sm_100a', True, True, False, True, False, 32, None, 6144): {"block_n": 128},
+    ('sm_100a', True, True, False, True, False, 128, None, 6144): {"block_n": 128},
+    ('sm_100a', True, True, False, True, False, 576, None, 6144): {"hints": ('evict_first', 'evict_first')},
+    ('sm_100a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256},
+    ('sm_100a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256},
+    ('sm_100a', True, True, True, False, False, 2048, None, 4096): {"cta_rows": 256},
+    ('sm_100a', True, True, True, False, False, 2048, None, 6144): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_100a', True, True, True, False, False, 2048, None, 16384): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_100a', True, True, True, False, False, 6144, None, 2048): {"group_m": 32, "epi": 'reg', "f32_v8": True},
+    ('sm_100a', True, True, True, False, False, 6144, None, 12288): {"cta_rows": 256},
+    ('sm_100a', True, True, True, False, False, 12288, None, 6144): {"cta_rows": 256},
+    ('sm_100a', True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256},
+    ('sm_100a', True, True, True, True, False, 32, None, 6144): {"block_n": 128},
+    ('sm_100a', True, True, True, True, False, 128, None, 6144): {"block_n": 128},
+    ('sm_100a', True, True, True, True, False, 576, None, 6144): {"hints": ('evict_first', 'evict_first')},
+    ('sm_107a', False, False, False, False, False, 576, 6144, None): {"cta_rows": 256, "hints": ('evict_first', 'none'), "stages": 5},
+    ('sm_107a', False, False, False, False, False, 16384, 2048, None): {"group_m": 32},
+    ('sm_107a', False, False, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
+    ('sm_107a', False, False, False, False, True, 256, 512, None): {"promo": 'l2_256b'},
+    ('sm_107a', False, False, False, False, True, 512, 256, None): {"promo": 'l2_256b'},
+    ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 256},
+    ('sm_107a', False, True, False, False, False, 6144, 128, None): {"cta_rows": 256},
+    ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8},
+    ('sm_107a', False, True, False, False, False, 12288, 6144, None): {"hints": ('none', 'evict_first')},
+    ('sm_107a', False, True, False, False, False, 16384, 6144, None): {"cta_rows": 256, "group_m": 8},
+    ('sm_107a', False, True, False, False, True, 192, 512, None): {"promo": 'l2_256b'},
+    ('sm_107a', False, True, False, False, True, 256, 512, None): {"promo": 'l2_256b'},
+    ('sm_107a', False, True, False, False, True, 512, 256, None): {"promo": 'l2_256b'},
+    ('sm_107a', False, True, True, False, False, 2048, 4096, None): {"epi": 'reg', "f32_v8": True},
+    ('sm_107a', False, True, True, False, False, 2048, 6144, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_107a', False, True, True, False, False, 2048, 16384, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_107a', False, True, True, False, False, 6144, 32, None): {"block_n": 128},
+    ('sm_107a', False, True, True, False, False, 6144, 128, None): {"block_n": 128},
+    ('sm_107a', False, True, True, False, False, 6144, 2048, None): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_107a', False, True, True, False, False, 6144, 12288, None): {"cta_rows": 256},
+    ('sm_107a', False, True, True, False, False, 12288, 6144, None): {"cta_rows": 256},
+    ('sm_107a', False, True, True, False, False, 16384, 6144, None): {"cta_rows": 256},
+    ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 128},
+    ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128},
+    ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128},
+    ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
+    ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first')},
+    ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first')},
+    ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 128},
+    ('sm_107a', True, True, True, False, False, 2048, None, 6144): {"cta_rows": 256},
+    ('sm_107a', True, True, True, False, False, 2048, None, 16384): {"group_m": 8, "epi": 'reg', "f32_v8": True},
+    ('sm_107a', True, True, True, False, False, 6144, None, 2048): {"cta_rows": 256},
+    ('sm_107a', True, True, True, False, False, 6144, None, 12288): {"epi": 'reg', "f32_v8": True},
+    ('sm_107a', True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256},
+    ('sm_107a', True, True, True, True, False, 32, None, 6144): {"block_n": 128},
+    ('sm_107a', True, True, True, True, False, 128, None, 6144): {"block_n": 128},
+    ('sm_107a', True, True, True, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
 }
 
 
@@ -582,9 +590,12 @@ def row_rule(
 
 
 def default_block_n(N: int, b_mn: bool) -> int:
-    """256 columns per CTA pair unless the whole output fits a 128-column tile.
-    [Cake ``default_block_n`` L839-L841]"""
-    return 128 if N <= 128 else 256
+    """256 columns per CTA pair unless the whole output fits a 128-column tile; 192 when N is a
+    multiple of 192 but not of 256 (N = 576: three exact 192-column tiles instead of
+    256 + 256 + 64; N = 192: one exact tile).  [Cake ``default_block_n``]"""
+    if N <= 128:
+        return 128
+    return 192 if (N % 192 == 0 and N % 256 != 0) else 256
 
 
 def default_pf(M: int, N: int, K: int) -> int:
@@ -964,7 +975,7 @@ def plan_dense_projection_gemm(
             f"dense_projection_gemm: {tail_tiles} stream-K tail tiles exceed the {SK_DUMMY_BASE // 16} slice-counter budget"
         )
     out_f32 = out.dtype == torch.float32
-    mode = epi_mode(out_f32, transposed_out, K, epi)
+    mode = epi_mode(out_f32, transposed_out, K, epi, block_n)
     nslots = epi_slots(mode, out_f32, block_n, K, slots)
     if pf is None:
         pf = rule.get("pf", default_pf(M, N, K))
@@ -1399,13 +1410,24 @@ def wgrad_views(
     G: torch.Tensor, X: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor, bool]:
     """``(A, B, transposed_out)`` of the weight gradient ``G[T, N].T @ X[T, K] -> dW[N, K]``:
-    fewer than 256 output rows run the swapped GEMM ``X.T @ G`` with the transposed store
-    (the result lands directly in ``[N, K]``), otherwise ``G.T @ X``.
-    [Cake ``projection_wgrad`` L1118-L1134]"""
-    N = int(G.shape[1])
-    if N < 256:
+    when ``wgrad_swapped`` the swapped GEMM ``X.T @ G`` runs with the transposed store (the
+    result lands directly in ``[N, K]``), otherwise ``G.T @ X``.
+    [Cake ``projection_wgrad`` / ``wgrad_swapped``]"""
+    N, K = int(G.shape[1]), int(X.shape[1])
+    if wgrad_swapped(N, K):
         return X.t(), G, True
     return G.t(), X, False
+
+
+def wgrad_swapped(N: int, K: int) -> bool:
+    """Orientation of the weight gradient: swapped when its padded tile work is smaller than the
+    direct route's (256-row tiles padded from N rows and ``default_block_n`` column tiles over K,
+    against 256-row tiles over K and column tiles padded from N): N < 256 and N = 576 swap.
+    [Cake ``wgrad_swapped``]"""
+    bk, bn = default_block_n(K, True), default_block_n(N, True)
+    direct = _ceil_div(N, 256) * 256 * _ceil_div(K, bk) * bk
+    swapped = _ceil_div(K, 256) * 256 * _ceil_div(N, bn) * bn
+    return swapped < direct
 
 
 def prepare_projection_wgrad(
