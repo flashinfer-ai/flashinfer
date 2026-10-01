@@ -675,10 +675,13 @@ class FmhaConfig:
 
         Causal work uses this order for load balancing. Dense GQA uses it to
         keep Q-head groups that share the same K/V head adjacent. Dense MHA
-        has no cross-head K/V reuse and retains its sequence-local order.
+        has no cross-head K/V reuse and retains its sequence-local order. So
+        does the two-CTA form under GQA, whose clusters must pair adjacent Q
+        tiles of one head to share one K/V head.
         """
         return (
             (self.is_causal or self.h_r > 1)
+            and not self.two_cta_umma
             and not self.single_qkv_instance
             and self.q_dtype is not None
             and self.k_dtype is not None

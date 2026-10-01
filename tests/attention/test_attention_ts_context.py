@@ -5402,23 +5402,29 @@ def test_attention_ts_context_mla_prefill(
 
 
 @pytest.mark.parametrize("pv_dtype", (torch.bfloat16, _FP8), ids=("pv-bf16", "pv-fp8"))
+@pytest.mark.parametrize(
+    "num_qo_heads,num_kv_heads", ((2, 2), (4, 2), (3, 1)), ids=("mha", "gqa2", "gqa3")
+)
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
-def test_attention_ts_context_two_cta_matches_single_cta(monkeypatch, pv_dtype):
+def test_attention_ts_context_two_cta_matches_single_cta(
+    monkeypatch, pv_dtype, num_qo_heads, num_kv_heads
+):
     """The paired kernel reproduces the single-CTA kernel and the reference.
 
     8200 tokens give 33 query tiles of 256 rows per (batch, head): the odd count
     exercises the even-grid padding of the cluster launch, and the 8-row remainder
-    exercises the partial last tile under two-CTA. The device default is
-    overridden both ways so the kernel is exercised on SM100 as well as SM103,
-    where it is the default.
+    exercises the partial last tile under two-CTA. The GQA cases check that both
+    CTAs of a cluster stage the K/V head of the Q head they share. The device
+    default is overridden both ways so the kernel is exercised on SM100 as well
+    as SM103, where it is the default.
     """
 
     case = _make_context_case(
         q_lengths=(8200, 8200),
         k_lengths=(8200, 8200),
-        num_qo_heads=2,
-        num_kv_heads=2,
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
         qkv_dtype=torch.bfloat16,
         packed=False,
         mask_type="dense",

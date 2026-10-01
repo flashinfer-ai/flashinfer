@@ -2783,7 +2783,6 @@ class FmhaTs:
             or has_variable_window
             or head_paired
             or use_paged_kv
-            or h_r != 1
             or d != 128
             or d_v not in (None, 128)
             or in_qk_dtype.width != 16
