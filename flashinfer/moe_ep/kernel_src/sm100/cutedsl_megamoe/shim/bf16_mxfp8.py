@@ -408,7 +408,6 @@ class MegaMoEBf16Mxfp8Frontend:
             and not self.config.in_kernel_fc2_reduce
         ):
             inputs.num_valid_tokens.fill_(n)
-            mega.local_workspace.zero_()
         mega.compiled(**mega.launch_kwargs)
         if sync and not torch.cuda.is_current_stream_capturing():
             torch.cuda.synchronize()
@@ -425,8 +424,6 @@ class MegaMoEBf16Mxfp8Frontend:
         kwargs = self._runtime_kwargs(inputs, mega)
         if self.config.in_kernel_fc2_reduce:
             return lambda: (inputs.output_activation.zero_(), mega.compiled(**kwargs))
-        if self.config.use_persistent_finalize_kernel:
-            return lambda: (mega.local_workspace.zero_(), mega.compiled(**kwargs))
         return lambda: mega.compiled(**kwargs)
 
 

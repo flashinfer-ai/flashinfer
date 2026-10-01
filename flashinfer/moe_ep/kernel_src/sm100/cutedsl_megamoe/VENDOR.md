@@ -27,10 +27,9 @@ replace, what to audit) lives in `SKILL.md`.
 
 Compared with the reference upstream branch, the tracked differences are:
 
-- **Persistent top-k reduction:** `src/moe_nvfp4_swapab/topk_reduce.py`
-  carries the newer one-cursor fixed-grid scheduler from
-  `89e339be770daa35b2faaa29d8c6a13606330845`. It is integrated behind
-  `topk_reduce_persistent` in
+- **Persistent top-k reduction:** upstream MR !63 commit
+  `4d51560753607a5b33ada5eb2ae913b0023dae3b` carries the one-cursor
+  fixed-grid scheduler. It is integrated behind `topk_reduce_persistent` in
   `src/moe_nvfp4_swapab/megamoe_kernel.py` and
   `src/moe_mxfp8_glu/megamoe_kernel_mxfp8.py`, and
   `src/moe_mxfp8_bf16_glu/megamoe_kernel_mxfp8_bf16.py`; all integrations

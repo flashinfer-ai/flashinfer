@@ -44,7 +44,7 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as cutlass_utils
 from cutlass.cute.typing import AddressSpace
-from cutlass.cutlass_dsl import Int64
+from cutlass.cutlass_dsl import Int32, Int64
 
 from common.host_utils import get_cutedsl_target_arch
 from .kernel_fc12 import Sm100SwapABSwigluFp4Fc12Kernel
@@ -1096,6 +1096,11 @@ class Sm100MegaMoEKernel(Sm100SwapABSwigluFp4Fc12Kernel):
             ),
             stream=make_fake_stream(),       # explicit stream arg -> caller keeps launch control
         )
+        if self.topk_reduce_persistent:
+            # The persistent reduce reads its token count from device memory, so
+            # the AOT ABI carries the int32[1] operand (alignment 4, static shape,
+            # as the shim passes it); static-reduce builds omit it.
+            fake["num_valid_tokens"] = fake_tensor(Int32, (1,), (0,), set(), 4)
 
         compiled = cute.compile[cute.EnableTVMFFI(True)](self, **fake)
         if out_path is None:

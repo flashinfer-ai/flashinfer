@@ -30,6 +30,8 @@ import cutlass.utils as cutlass_utils
 from cutlass.cutlass_dsl import Float32, Int32, T
 from cutlass._mlir.dialects import llvm
 
+from cutlass.cute.typing import AddressSpace
+
 from common.megamoe_constants import Nvfp4E2M1RcpLimit
 from src.token_comm import CombineFormat
 
