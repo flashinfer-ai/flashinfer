@@ -220,6 +220,12 @@ void Run(TensorView active_expert_tokens, TensorView expert_scales, TensorView t
   config.attrs = attrs;
   config.numAttrs = n;
   status = cudaLaunchKernelExC(&config, reinterpret_cast<const void*>(CAKE_UNION_KERNEL), kargs);
+  if (status != cudaSuccess) {
+    // A rejected launch (for example a cooperative grid larger than the co-resident
+    // capacity) is not sticky; clear it so the caller's next CUDA call does not
+    // report this launch's error.
+    (void)cudaGetLastError();
+  }
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "Cake MoE all-reduce union launch failed: " << cudaGetErrorString(status);
 }
