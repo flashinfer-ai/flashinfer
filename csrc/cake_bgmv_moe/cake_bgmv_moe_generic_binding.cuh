@@ -248,14 +248,14 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
     const dim3 grid(num_tokens, (hidden + 63) / 64, 1);
     CAKE_BGMV_MOE_EXPAND_T64<<<grid, 64, kExpandT64SmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset, hidden, route_ptr, kRouteLookup,
-        kRouteReset);
+        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup, kRouteReset,
+        hidden);
   } else {
     const dim3 grid(num_tokens, (hidden + 127) / 128, 1);
     CAKE_BGMV_MOE_EXPAND_T128<<<grid, 128, kExpandT128SmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset, hidden, route_ptr, kRouteLookup,
-        kRouteReset);
+        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup, kRouteReset,
+        hidden);
   }
   CheckCuda(cudaGetLastError(), "Cake BGMV MoE generic expand launch");
 }
