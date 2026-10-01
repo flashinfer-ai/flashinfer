@@ -798,7 +798,8 @@ def offset_gather_kv_indices(
     *,
     causal: bool = False,
     out: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
+    return_topk_length: bool = False,
+):
     """Turn per-document key indices into global key rows.
 
     ``gather_kv_indices [T, topk]`` holds, for query row ``t`` of document
@@ -812,12 +813,21 @@ def offset_gather_kv_indices(
     the rule is the one of the Cake facade (``globalize_topk_indices``).  The
     default ``causal=False`` is the plain offsetting of the first release: the
     index row is taken as is and only ``-1`` / out-of-range slots are dropped.
-    The result
-    addresses the packed ``kv_*`` tensors; invalid slots become ``-1``.  A
-    zero-length query segment contributes no rows.  Runs on device without a
-    host synchronization, in int32 throughout (the ``[T, topk]`` temporaries
-    are the dominant cost of the varlen entry: int64 copies of the index row
-    tripled its traffic).
+    The result addresses the packed ``kv_*`` tensors; invalid slots become
+    ``-1``.  A zero-length query segment contributes no rows.
+
+    This glue counts in the step time of the varlen entry and is launch-bound
+    (a ``[T, topk]`` pass is 5-10 us of GPU time against ~10 us of dispatch),
+    so it runs with as few launches as the rule allows: a handful of ``[T]``
+    int32 ops for the per-row document data, then two compares into one bool
+    mask (``0 <= idx`` and ``idx <= bound`` -- the bound is the row's own key
+    position with ``causal``, itself ``< seqlen_k``, and ``seqlen_k - 1``
+    otherwise) and one ``where`` over ``idx + key_base``.  With
+    ``return_topk_length=True`` the per-row ``topk_length`` (last valid slot
+    + 1; bitwise what :func:`derive_topk_length` computes from the result) is
+    derived from the same mask with one ``where`` and one ``amax`` and the
+    function returns ``(indices, topk_length)``.  Runs on device without a
+    host synchronization, in int32 throughout.
     """
     if gather_kv_indices.ndim != 2 or gather_kv_indices.dtype != torch.int32:
         raise ValueError("gather_kv_indices must be an int32 [T, topk] tensor")
@@ -828,35 +838,30 @@ def offset_gather_kv_indices(
         raise ValueError(
             "cu_seqlens_q and cu_seqlens_k must describe the same documents"
         )
-    total_q = int(gather_kv_indices.shape[0])
-    num_docs = int(cu_seqlens_q.numel()) - 1
+    total_q, topk = (int(d) for d in gather_kv_indices.shape)
     device = gather_kv_indices.device
     # per-row document data: [T]-sized, int32 like cu_seqlens (key rows and positions fit int32)
-    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
-    doc_of_row = torch.repeat_interleave(
-        torch.arange(num_docs, device=device),
-        seqlens_q.to(torch.int64),
-        output_size=total_q,
-    )
-    key_base = cu_seqlens_k[:-1][doc_of_row][:, None]
-    key_len = (cu_seqlens_k[1:] - cu_seqlens_k[:-1])[doc_of_row][:, None]
-    local = gather_kv_indices
-    # [T, topk] passes: three int32 compares into one bool mask, one int32 add, one masked fill
-    valid = local >= 0
-    valid &= local < key_len
+    rows = torch.arange(total_q, device=device, dtype=torch.int32)
+    doc_of_row = torch.searchsorted(cu_seqlens_q, rows, right=True) - 1
+    key_base = cu_seqlens_k[:-1][doc_of_row]
     if causal:
-        # Own key position of row t: (seqlen_k[d] - seqlen_q[d]) + (t - cu_seqlens_q[d]).
-        own_position = (key_len[:, 0] - seqlens_q[doc_of_row]) + (
-            torch.arange(total_q, device=device, dtype=torch.int32)
-            - cu_seqlens_q[:-1][doc_of_row]
-        )
-        valid &= local <= own_position[:, None]
-    result = local + key_base  # invalid slots hold arbitrary sums until the fill below
-    result.masked_fill_(~valid, -1)
+        # Own key position of row t: (seqlen_k[d] - seqlen_q[d]) + (t - cu_seqlens_q[d])
+        # == (cu_seqlens_k[d + 1] - cu_seqlens_q[d + 1]) + t - key_base.
+        bound = (cu_seqlens_k[1:] - cu_seqlens_q[1:])[doc_of_row] + rows - key_base
+    else:
+        bound = (cu_seqlens_k[1:] - cu_seqlens_k[:-1])[doc_of_row] - 1
+    local = gather_kv_indices
+    # [T, topk] passes: two int32 compares into one bool mask, one add, one where
+    valid = local >= 0
+    valid &= local <= bound[:, None]
     if out is None:
+        result = torch.where(valid, local + key_base[:, None], -1)
+    else:
+        result = torch.where(valid, local + key_base[:, None], -1, out=out)
+    if not return_topk_length:
         return result
-    out.copy_(result)
-    return out
+    topk_length = torch.where(valid, _slot_positions(topk, device), 0).amax(dim=-1)
+    return result, topk_length
 
 
 _SLOT_POSITIONS: dict[tuple, torch.Tensor] = {}
@@ -2507,16 +2512,27 @@ def dsa_sparse_attention_varlen(
     offsetting also drops selected keys after the query's own position
     ``(seqlen_k - seqlen_q) + local_q`` (:func:`offset_gather_kv_indices`); the
     default ``causal=False`` keeps the index rows as is (the behaviour of the
-    first release).
+    first release).  Without an explicit ``topk_length`` the per-row lengths
+    come out of the same glue pass (no separate derivation).
     ``max_seqlen_q/k`` are accepted for signature parity and not used on the
     host.  ``dkv_acc`` / ``dkv_dst_map`` as in :func:`dsa_sparse_attention`.
     The segment count ``len(cu_seqlens_k) - 1`` (host metadata, no device
     sync) is passed on as ``num_segments``: with more than one segment the
     backward plans the single-pass stage unless ``key_passes`` overrides."""
     del max_seqlen_q, max_seqlen_k
-    indices = offset_gather_kv_indices(
-        gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal=causal
-    )
+    if topk_length is None:
+        # one glue pass: global rows and the per-row lengths from the same validity mask
+        indices, topk_length = offset_gather_kv_indices(
+            gather_kv_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            causal=causal,
+            return_topk_length=True,
+        )
+    else:
+        indices = offset_gather_kv_indices(
+            gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal=causal
+        )
     return dsa_sparse_attention(
         q_latent,
         q_rope,

@@ -2193,6 +2193,32 @@ def test_offset_gather_kv_indices_causal_tail_of_prefix():
     out = torch.empty_like(local)
     assert offset_gather_kv_indices(local, cu_q, cu_k, causal=True, out=out) is out
     assert torch.equal(out, strict)
+    # the fused per-row lengths (varlen entry default) equal the derivation on the result, bitwise
+    strict2, lengths = offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=True, return_topk_length=True
+    )
+    assert torch.equal(strict2, strict)
+    assert lengths.dtype == torch.int32 and lengths.tolist() == [3, 3, 4, 3, 3, 1, 4, 0, 5]
+    assert torch.equal(lengths, derive_topk_length(strict, 18))
+    loose2, loose_len = offset_gather_kv_indices(
+        local, cu_q, cu_k, causal=False, return_topk_length=True
+    )
+    assert torch.equal(loose2, loose) and torch.equal(
+        loose_len, derive_topk_length(loose, 18)
+    )
+    # more queries than keys: own positions -1, 0, 1 -> the first row is fully masked under the causal rule
+    cu_q2 = torch.tensor([0, 3], dtype=torch.int32)
+    cu_k2 = torch.tensor([0, 2], dtype=torch.int32)
+    local2 = torch.tensor([[0, 1], [0, 1], [1, 0]], dtype=torch.int32)
+    strict3, len3 = offset_gather_kv_indices(
+        local2, cu_q2, cu_k2, causal=True, return_topk_length=True
+    )
+    assert strict3.tolist() == [[-1, -1], [0, -1], [1, 0]] and len3.tolist() == [0, 1, 2]
+    assert offset_gather_kv_indices(local2, cu_q2, cu_k2, causal=False).tolist() == [
+        [0, 1],
+        [0, 1],
+        [1, 0],
+    ]
 
 
 def _trainer_host_inputs(total_q=8, total_k=16, topk=5):
