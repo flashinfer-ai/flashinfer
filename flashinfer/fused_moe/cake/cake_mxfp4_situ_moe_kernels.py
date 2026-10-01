@@ -334,6 +334,11 @@ def _load_form(**form: Any) -> Kernel:
     return load(str(find_form(**form)["route"]["stage"]))
 
 
+def find_kernel(**form: Any) -> Kernel:
+    """The kernel whose ``route.form`` carries every given field (``kind`` plus the trace-time constants)."""
+    return _load_form(**form)
+
+
 def select_gemm1(n_tile: int, kbps: int) -> Kernel:
     """The swap-AB GEMM1 SiTU form the plan selected."""
     return _load_form(kind="gemm1_swapab", n_tile=int(n_tile), kbps=int(kbps))
@@ -385,6 +390,7 @@ __all__ = [
     "cake_revision",
     "compile_all",
     "find_form",
+    "find_kernel",
     "is_available",
     "load",
     "manifest",

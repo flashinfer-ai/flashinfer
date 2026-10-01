@@ -171,6 +171,10 @@ not on a contract row).
      - gemm2_dense
      - cake, cake_cute
      - ``e2e_registry``
+   * - ``gemm2_dense_finalize_n256_rg``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``e2e_registry``
    * - ``gemm1_dense_situ_m128_n256``
      - gemm1_dense
      - cake, cake_cute
@@ -295,7 +299,15 @@ not on a contract row).
      - routing
      - cake, cake_cute
      - ``plan_gate``
+   * - ``routing_separate_bf16_c2_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
    * - ``routing_separate_bf16_c3``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_bf16_c3_split``
      - routing
      - cake, cake_cute
      - ``plan_gate``
@@ -303,7 +315,15 @@ not on a contract row).
      - routing
      - cake, cake_cute
      - ``plan_gate``
+   * - ``routing_separate_bf16_c4_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
    * - ``routing_separate_bf16_c5``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_bf16_c5_split``
      - routing
      - cake, cake_cute
      - ``plan_gate``
@@ -311,7 +331,15 @@ not on a contract row).
      - routing
      - cake, cake_cute
      - ``plan_gate``
+   * - ``routing_separate_bf16_c6_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
    * - ``routing_separate_bf16_c7``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_bf16_c7_split``
      - routing
      - cake, cake_cute
      - ``plan_gate``
@@ -319,9 +347,45 @@ not on a contract row).
      - routing
      - cake, cake_cute
      - ``plan_gate``
+   * - ``routing_separate_bf16_c8_split``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
    * - ``routing_separate_bf16_c8_l16384``
      - routing
      - cake, cake_cute
+     - ``plan_gate``
+   * - ``routing_separate_bf16_c8_split_l16384``
+     - routing
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``route_preprocess_separate_bf16``
+     - route_preprocess
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``finalize_top16_split``
+     - finalize
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm1_dense_situ_m128_n256_nopdl``
+     - gemm1_dense
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm2_dense_finalize_n192_nopdl``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``gemm2_dense_finalize_n256_c12_nopdl``
+     - gemm2_dense
+     - cake, cake_cute
+     - ``plan_gate``
+   * - ``moe_sort_coop_t896_bounded_nopdl``
+     - moe_sort_coop
+     - cake
+     - ``plan_gate``
+   * - ``moe_sort_init_t896_nopdl``
+     - moe_sort_init
+     - cake
      - ``plan_gate``
 
 Forms this family has but a backend does not build are declared in that

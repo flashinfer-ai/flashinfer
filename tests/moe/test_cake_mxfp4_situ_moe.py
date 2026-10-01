@@ -61,6 +61,24 @@ def _runner(layout, **overrides):
     )
 
 
+def _split_rows_execute_plain_chain():
+    """The plan runs the plain chain on the split two-stage rows while its ``SPLIT_CHAIN_EXECUTABLE`` is off."""
+    return not getattr(plan, "SPLIT_CHAIN_EXECUTABLE", True)
+
+
+def _executed_chain(decision):
+    """The chain ``plan()`` runs on a supported decision (``None`` = refused by the executable-path guard): the
+    plain chain on a split two-stage row while the plan's ``SPLIT_CHAIN_EXECUTABLE`` is off, otherwise the row's
+    own path when it is in ``EXECUTABLE_PATHS`` (mirrors the manifest's ``executed_chains``)."""
+    if not decision.supported:
+        return None
+    if decision.path == "split_two_stage" and _split_rows_execute_plain_chain():
+        return "plain"
+    if decision.path in plan.EXECUTABLE_PATHS:
+        return decision.path
+    return None
+
+
 def _checkout_root():
     return Path(kernels.__file__).resolve().parents[3]
 
@@ -124,6 +142,28 @@ def test_unsupported_forms_are_declared_not_faked():
         assert kernels.load("moe_sort_coop_t896_bounded").block[0] == 896
 
 
+def test_sibling_backend_forms_are_declared_consistently():
+    """Mixed backend per kernel: every form this package's backend does not build names the sibling package
+    that serves it (the same generated module, pinned to the same Cake revision); nothing is re-implemented."""
+    contract = kernels.manifest()["contract"]
+    sibling = contract["sibling_package"]
+    assert sibling["module"] == plan.SIBLING_MODULE
+    assert sibling["key"] != BACKEND
+    forms = contract["sibling_backend_forms"]
+    assert set(forms) == set(kernels.unsupported_forms())
+    for stage, record in forms.items():
+        assert record["package"] == sibling["key"]
+        assert record["module"] == sibling["module"]
+        assert record["reason"] == kernels.unsupported_forms()[stage]
+    if importlib.util.find_spec(SIBLING_MODULE) is not None:
+        other = importlib.import_module(f"{SIBLING_MODULE}.cake_mxfp4_situ_moe_kernels")
+        assert other.cake_revision() == kernels.cake_revision()
+        for stage in forms:
+            assert other.record(stage)["route"]["stage"] == stage
+            if BACKEND == "cake_cute":
+                assert plan.build_launch_module(BACKEND, stage).stage == stage
+
+
 # --- decision table (hand-written plan facts) ----------------------------------------
 
 
@@ -169,20 +209,6 @@ def test_decision_table_pins_the_hand_written_plan(
     "layout, T, path, launches",
     [
         (
-            EP8,
-            1025,
-            "dense",
-            (
-                "route_preprocess",
-                "moe_sort_init",
-                "moe_sort_coop",
-                "gemm1_dense",
-                "gemm2_dense_finalize",
-            ),
-        ),
-        (EP8, 2048, "dense", None),
-        (EP8, 4096, "dense", None),
-        (
             TP8,
             17,
             "two_stage",
@@ -198,40 +224,66 @@ def test_decision_table_pins_the_hand_written_plan(
     ],
 )
 def test_decision_served_rows_outside_the_executable_chain(layout, T, path, launches):
-    """Rows the decision table serves with a traced form per launch but whose chain the shipped executable does
-    not run: ``decide`` reports them, the manifest lists the forms each package carries, ``plan`` refuses them."""
+    """Rows the decision table serves with a traced form per launch: ``decide`` reports them, the manifest lists
+    the forms each package carries (natively, through the sibling package, or not at all), and ``plan`` refuses
+    the rows whose chain no shipped executable runs (``EXECUTABLE_PATHS``)."""
     runner = _runner(layout)
     decision = runner.decide(T)
     assert decision.supported and decision.path == path and not decision.missing_forms
-    assert path not in plan.EXECUTABLE_PATHS
     if launches is not None:
         assert decision.launches == launches
     assert all(launch.traced for launch in decision.launch_plan)
     contract = kernels.manifest()["contract"]
     # The plan names a launch by the module's stage (its registered IR name) or by its registry id.
-    carried_forms = set(contract["forms"])
-    carried_forms |= {
+    native_forms = set(contract["forms"])
+    native_forms |= {
         form["registry"] for form in contract["forms"].values() if form.get("registry")
     }
-    lacking = sorted(
-        launch.form
-        for launch in decision.launch_plan
-        if launch.form not in carried_forms
-    )
+    sibling_forms = set(contract["sibling_backend_forms"])
+    chain = _executed_chain(decision)
+    if chain == "plain" and path != "plain":
+        # The plain chain runs on this row: its launch forms are the swap-AB closure, not the traced split plan.
+        launch_forms = {
+            kernels.select_gemm1(decision.gemm1.n_tile, decision.gemm1.kbps).stage,
+            kernels.select_gemm2(
+                decision.gemm2.n_tile, decision.gemm2.kbps, decision.gemm2.m_group
+            ).stage,
+        }
+    else:
+        # The plain chain's fused routing launch resolves through the RoutingConfig closure (never a stage name).
+        launch_forms = {
+            launch.form
+            for launch in decision.launch_plan
+            if launch.form != "kimi_k3_mxfp4_situ_routing"
+        }
+    lacking = sorted(launch_forms - native_forms - sibling_forms)
+    mixed = sorted(launch_forms & sibling_forms)
     prefix = f"{'ep8_r3' if layout is EP8 else 'tp8_r0'}_t{T:05d}_"
-    for label in (
+    labels = [
         label for label in contract["decision_served_rows"] if label.startswith(prefix)
-    ):
+    ]
+    for label in labels:  # empty when the contract has no canonical row at this T
         assert contract["decision_served_rows"][label] == path
         if lacking:
             assert contract["uncarried_rows"][BACKEND][label] == lacking
+        elif mixed:
+            assert contract["carried_rows_mixed_backend"][BACKEND][label] == mixed
         else:
             assert label in contract["carried_rows"][BACKEND]
+        assert (label in contract["executable_rows"]) == (chain is not None)
+        if chain is not None:
+            assert contract["executed_chains"][label] == chain
+    if chain is not None:
+        pytest.skip(
+            f"the {path} row executes the {chain} chain at this revision (GPU chain tests cover it)"
+        )
 
 
 @pytest.mark.parametrize(
     "layout, T, needle",
     [
+        (EP8, 8192, "dense dual-tile chain not executable"),
+        (EP8, 16384, "dense dual-tile chain not executable"),
         (TP8, 1025, "hybrid form"),
         (TP8, 2048, "hybrid form"),
         (TP8, 8192, "mixed192"),
@@ -242,12 +294,60 @@ def test_refused_rows_carry_the_hand_written_reason(layout, T, needle):
     decision = runner.decide(T)
     assert not decision.supported
     assert needle in decision.reason
-    # The refused row still carries the hand-written launch plan; the launches without a traced form name
-    # the missing IR form (never substituted), and ``plan`` refuses with the same reason.
+    # The refused row still carries the hand-written launch plan.  Either a launch has no traced form and names
+    # the missing IR form (never substituted), or every launch is traced and the chain itself is named missing
+    # (the dense dual-tile alternates and the dense two-stage finalize: traced, not enqueued by the Cake runner);
+    # ``plan`` refuses with the reason.
     assert decision.path != "plain" and decision.launches and decision.missing_forms
     untraced = [launch for launch in decision.launch_plan if not launch.traced]
-    assert untraced and all(launch.missing for launch in untraced)
+    assert all(launch.missing for launch in untraced)
+    if not untraced:
+        assert decision.path == "dense" and decision.dense is not None
+        assert decision.dense.dual is not None or decision.dense.two_stage
+        assert decision.missing_forms == (plan.DENSE_DUAL_CHAIN_MISSING,)
+        assert plan.DENSE_CHAIN_EXECUTABLE is True
     assert "missing IR forms" in decision.reason
+
+
+@pytest.mark.parametrize("enable_pdl", [False, True])
+def test_dense_chain_kernels_are_rendered_for_both_launch_attributes(enable_pdl):
+    """The dense chain launches with the wrapper's ``enable_pdl`` (the plain chain is always PDL-on): the K6 pair
+    (own module per attribute, ``cfg.pdl`` is trace-time) and the dense GEMMs (attribute baked into the module)
+    resolve for either setting, natively or through the sibling package."""
+    runner = _runner(EP8, enable_pdl=enable_pdl)
+    decision = runner.decide(2048)
+    assert (
+        decision.supported and decision.path == "dense" and decision.pdl is enable_pdl
+    )
+    cfg = plan.dense_launch_config(runner.policy, decision)
+    sort = cfg["sort"]
+    assert sort.pdl is enable_pdl
+    contract = kernels.manifest()["contract"]
+    served = set(contract["forms"]) | set(contract["sibling_backend_forms"])
+    for name in (plan.init_form_name(sort), plan.coop_form_name(sort)):
+        assert plan._k6_stage(name, sort.pdl) in served, name
+    tile_m, n1, zero_fill, secondary, row_group = cfg["gemm1"]
+    gemm1 = kernels.find_form(
+        kind="gemm1_dense",
+        tile_m=tile_m,
+        n_tile=n1,
+        zero_fill=zero_fill,
+        zero_fill_secondary=secondary,
+        row_group_list=row_group,
+        use_pdl=enable_pdl,
+    )
+    n2, cluster_n = cfg["gemm2"]
+    gemm2 = kernels.find_form(
+        kind="gemm2_dense",
+        n_tile=n2,
+        cta_group=1,
+        cluster_n=cluster_n,
+        row_group=False,
+        use_pdl=enable_pdl,
+    )
+    for item in (gemm1, gemm2):
+        assert bool(item["launch"]["use_pdl"]) is enable_pdl
+        assert item["route"]["stage"].endswith("_nopdl") is (not enable_pdl)
 
 
 def test_layouts_resolve():
@@ -277,31 +377,58 @@ def test_wrapper_refuses_the_other_backend():
 
 
 def _served_decisions():
-    """The decisions of the executable chain over the sweep (``EXECUTABLE_PATHS`` rows)."""
+    """The decisions the plain chain executes over the sweep (``_executed_chain(decision) == "plain"``)."""
     for layout in (EP8, TP8):
         runner = _runner(layout)
         for T in range(1, runner.swapab_max_tokens + 1):
             decision = runner.decide(T)
-            if decision.supported and decision.path in plan.EXECUTABLE_PATHS:
+            if _executed_chain(decision) == "plain":
                 yield runner, decision
 
 
 def test_manifest_row_coverage_is_consistent():
     contract = kernels.manifest()["contract"]
-    assert contract["executable_paths"] == list(plan.EXECUTABLE_PATHS) == ["plain"]
+    assert contract["executable_paths"] == list(plan.EXECUTABLE_PATHS)
+    assert "plain" in plan.EXECUTABLE_PATHS
     served = contract["decision_served_rows"]
-    carried, uncarried = (
+    carried, mixed, uncarried = (
         contract["carried_rows"][BACKEND],
+        contract["carried_rows_mixed_backend"][BACKEND],
         contract["uncarried_rows"][BACKEND],
     )
-    assert set(carried) | set(uncarried) == set(served) and not set(carried) & set(
-        uncarried
+    groups = (set(carried), set(mixed), set(uncarried))
+    assert set().union(*groups) == set(served)
+    assert sum(len(group) for group in groups) == len(served)  # pairwise disjoint
+    # An executable row is never uncarried: every launch of a chain this package runs has a generated module
+    # (its own or, mixed backend per kernel, the sibling package's).
+    assert not set(contract["executable_rows"]) & set(uncarried)
+    chains = contract["executed_chains"]
+    assert set(chains) == set(contract["executable_rows"])
+    assert (
+        contract["split_rows_execute_plain_chain"] == _split_rows_execute_plain_chain()
     )
-    assert set(contract["executable_rows"]) <= set(carried)
-    assert all(served[label] == "plain" for label in contract["executable_rows"])
+    for label, chain in chains.items():
+        assert chain in plan.EXECUTABLE_PATHS
+        assert served[label] == chain or (
+            served[label] == "split_two_stage"
+            and chain == "plain"
+            and contract["split_rows_execute_plain_chain"]
+        )
     stages = set(contract["forms"])
     for label, forms in uncarried.items():
-        assert served[label] != "plain" and forms and not set(forms) & stages
+        assert label not in chains and forms
+        assert not set(forms) & (stages | set(contract["sibling_backend_forms"]))
+    for forms in mixed.values():
+        assert forms and set(forms) <= set(contract["sibling_backend_forms"])
+        assert set(forms) <= set(contract["unsupported_forms"])
+    # The registry-complete selection: a registry form no served row launches is exported all the same (or, for
+    # this backend, declared unsupported), never silently dropped.
+    assert contract["selection_policy"] == "registry_complete_plus_plan_gated"
+    unlaunched = set(contract["unlaunched_registry_forms"])
+    assert unlaunched and unlaunched <= stages | set(contract["unsupported_forms"])
+    assert all(
+        not contract["forms"][stage]["plan_selected"] for stage in unlaunched & stages
+    )
 
 
 def test_every_plan_selection_resolves_to_a_module():
@@ -800,6 +927,17 @@ ROWS = {
 }
 GATE_ROWS = ["ep8_1", "ep8_16", "ep8_16_empty", "ep8_128", "ep8_512", "tp8_16"]
 CLASS_ROWS = ["ep8_1", "ep8_16", "ep8_128", "ep8_512", "ep8_512_skew"]
+# Canonical rows of the hand-written paths beyond the plain chain (``decide`` serves them; the chain runs them
+# only when its path is in ``EXECUTABLE_PATHS`` at the pinned revision, otherwise ``plan`` refuses by name):
+# EP8 rank 3 dense rows (T 2048 / 4096: the single-tile dense chain), TP8 rank 0 split_two_stage rows
+# (T 128 / 512: the split two-stage chain, or the plain chain while ``SPLIT_CHAIN_EXECUTABLE`` is off); same
+# contract seeds.
+PATH_ROWS = {
+    "ep8_2048": (EP8, 2048, "uniform_cycle", 120481),
+    "ep8_4096_skew": (EP8, 4096, "hotset_skew", 140962),
+    "tp8_128": (TP8, 128, "uniform_cycle", 201281),
+    "tp8_512_skew": (TP8, 512, "hotset_skew", 205122),
+}
 
 
 def _run_row(module, row):
@@ -882,9 +1020,91 @@ def test_chain_runs_deterministically_and_replays_under_graph_capture(
     if bool((local_count <= 1).all()):
         # Only the deterministic path was exercised: the verdict must be bit identity.
         assert torch.equal(out, first)
+    assert p.decision.path == "plain"
     assert plan.kernel_stages(p)[1].startswith(
         "gemm1_swapab_situ_n"
     ) and plan.kernel_stages(p)[2].startswith("gemm2_swapab_finalize_n")
+
+
+def _path_row(row):
+    """``(layout, T, decision, chain)`` of a ``PATH_ROWS`` row; skips when no shipped chain runs it."""
+    layout, T = PATH_ROWS[row][0], PATH_ROWS[row][1]
+    decision = _runner(layout).decide(T)
+    if not decision.supported:
+        pytest.skip(f"{row}: refused by the decision table ({decision.reason[:80]})")
+    chain = _executed_chain(decision)
+    if chain is None:
+        pytest.skip(
+            f"{row}: the {decision.path} chain is not executable at this revision"
+        )
+    return layout, T, decision, chain
+
+
+@gpu
+@pytest.mark.parametrize("row", sorted(PATH_ROWS))
+def test_executable_path_rows_match_the_gate_oracle(row, record_property):
+    """The chains beyond the plain one (dense / two-stage / split), on the contract's rows and criterion; the
+    executed chain's stages are recorded.  Same gate, same class, no tolerance change."""
+    layout, T, decision, chain = _path_row(row)
+    inputs, p, out = _run_row(pkg, PATH_ROWS[row])
+    assert p.decision.path == decision.path
+    stages = plan.kernel_stages(p)
+    record_property(f"{row}_decision_path", decision.path)
+    record_property(f"{row}_executed_chain", chain)
+    record_property(f"{row}_stages", ",".join(stages))
+    if chain == "plain":
+        assert len(stages) == 3 and stages[1].startswith("gemm1_swapab_situ_n")
+        assert stages[2].startswith("gemm2_swapab_finalize_n")
+    elif chain == "dense":
+        assert len(stages) == 5 and stages[0].startswith("route_preprocess_")
+        assert stages[1].startswith("moe_sort_init_t") and stages[2].startswith(
+            "moe_sort_coop_t"
+        )
+        assert stages[3].startswith("gemm1_dense_situ_m")
+        assert stages[-1].startswith("gemm2_dense_finalize_n")
+        assert p.executed_chain["chain"] == "dense"
+    elif chain == "split_two_stage":
+        # Hand-written enqueue order: split routing, wide row-group GEMM1 / finalize GEMM2, narrow swap-AB SiTU
+        # GEMM1 / partial GEMM2, finalize rows (accumulate).
+        assert len(stages) == 6 and stages[0].startswith("routing_")
+        assert stages[1].startswith("gemm1_dense_situ_m") and stages[1].endswith(
+            "_rowgroup"
+        )
+        assert stages[2].startswith("gemm2_dense_finalize_n") and stages[2].endswith(
+            "_rg"
+        )
+        assert stages[3].startswith("gemm1_swapab_situ_n")
+        assert stages[4].startswith("gemm2_swapab_partial_n")
+        assert stages[5].startswith("finalize_top") and stages[5].endswith("_split")
+        assert p.executed_chain["chain"] == "split_two_stage"
+    else:
+        raise AssertionError(f"unexpected executed chain {chain!r}")
+    ref, ref_abs = _gate_oracle(inputs, layout)
+    assert out.abs().sum() > 0
+    _assert_gate_class(out, ref, f"{BACKEND}_{row}", record_property)
+    # Correlation with the oracle (a cleared or uncorrelated buffer passes the FP4-class atol at this output scale).
+    expected = ref.to(torch.bfloat16).double()
+    cosine = torch.nn.functional.cosine_similarity(
+        out.double().reshape(1, -1), expected.reshape(1, -1)
+    ).item()
+    relative_l2 = (
+        (out.double() - expected).norm() / expected.norm().clamp_min(1e-30)
+    ).item()
+    record_property(f"{row}_cosine", cosine)
+    record_property(f"{row}_relative_l2", relative_l2)
+    assert cosine > 0.99 and relative_l2 < 0.1, (row, cosine, relative_l2)
+    first = out.clone()
+    p.run()
+    torch.cuda.synchronize()
+    _assert_same_accumulation_class(
+        out,
+        first,
+        ref,
+        ref_abs,
+        _local_counts(inputs, layout),
+        f"{row}_run2_vs_run1",
+        record_property,
+    )
 
 
 @gpu
