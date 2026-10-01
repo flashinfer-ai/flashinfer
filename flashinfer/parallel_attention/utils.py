@@ -167,12 +167,11 @@ def ring_varlen_config(seq_lens_q, seq_lens_kv, ring_group):
     split along the sequence dimension across ring ranks. Each rank holds a
     chunk of every sequence, so ``cu_seqlens`` are stored as a 2-D tensor of
     shape ``[ring_size, num_seqs + 1]`` — one row per rank — because each
-    rank's chunk has different per-sequence lengths (the last rank gets the
-    remainder after padding).
+    rank's chunk can have different per-sequence lengths.
 
-    Sequences are padded to be divisible by ``ring_size`` so that the first
-    ``ring_size - 1`` ranks each get ``ceil(seq_len / ring_size)`` tokens per
-    sequence, and the last rank gets the remainder.
+    Each rank gets up to ``ceil(seq_len / ring_size)`` tokens per sequence,
+    matching ``split_varlen_input``. Ranks beyond a sequence's end have zero
+    length; padding in the local tensor is not included in ``cu_seqlens``.
 
     Args:
         seq_lens_q: Per-sequence query lengths, e.g. ``[1021, 1024, 1027]``.
@@ -236,16 +235,14 @@ def ring_varlen_config(seq_lens_q, seq_lens_kv, ring_group):
     cu_seqlens_kv_all_ranks = []
 
     for i in range(world_size):
-        if i == world_size - 1:
-            seq_len_q_cur_rank = padded_seq_len_q_cur_rank - (
-                padded_seq_lens_q - seq_lens_q
-            )
-            seq_len_kv_cur_rank = padded_seq_len_kv_cur_rank - (
-                padded_seq_lens_kv - seq_lens_kv
-            )
-        else:
-            seq_len_q_cur_rank = padded_seq_len_q_cur_rank
-            seq_len_kv_cur_rank = padded_seq_len_kv_cur_rank
+        seq_len_q_cur_rank = torch.minimum(
+            padded_seq_len_q_cur_rank,
+            (seq_lens_q - i * padded_seq_len_q_cur_rank).clamp(min=0),
+        )
+        seq_len_kv_cur_rank = torch.minimum(
+            padded_seq_len_kv_cur_rank,
+            (seq_lens_kv - i * padded_seq_len_kv_cur_rank).clamp(min=0),
+        )
 
         cu_seqlens_q = (
             torch.cat(
