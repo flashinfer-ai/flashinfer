@@ -125,6 +125,7 @@ _Stage1CostRow: TypeAlias = tuple[
     float,
     float,
     float,
+    float,
 ]
 # Round 6 (CAKE-776) re-fitted the k <= 64 stream constants of the 148 and 212 tables on policy-aware sweeps
 # (coarse-sample twins at k <= 64; B200 / GB300 / R200, k = 50) under two constraints -- no k > 64 pick changes and no
@@ -138,7 +139,7 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
     #  stream_wide_wave_us, stream_wide_two_launch_us, notail_two_launch_us, chain_over_tail_us,
     #  stream_wide_large_k_us, resident_two_launch_us, fused_tail_cluster_us, fused_tail_wide_cluster_us,
     #  stream_large_k_chunk_us, stream_large_k_chunk32_us, fused_tail_stream_us, stream_large_k_cluster_cta_us,
-    #  stream_wide_short_row_large_k_us, spec_sample_wide_us, stream_wide_ragged_large_k_us)
+    #  stream_wide_short_row_large_k_us, stream_wide_ragged_large_k_us)
     # stream_chunk32_us: per-chunk cost of the ept-32 streaming variants (0 = not ranked by this table);
     # stream_cluster_us: fixed cost of a clustered streaming wave (cluster barrier + DSM exchange latency);
     # stream_wide_wave_us: fixed cost per ept-32 streaming wave (its prologue / register footprint; H100 only);
@@ -157,11 +158,6 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
     # stage-2/3 kernel (round 7: no capability fuses a resident): the stage-2/3 launch queued behind a resident
     # grid costs more than behind a streaming grid (GB300 k = 1000, V = 32768: the (4, 16) resident chain
     # 19.3-22.7 us vs the cluster-1 streams 18.5-21.4 while the resident's own kernel is the faster one).
-    # spec_sample_wide_us: subtracted per streaming wave of the ept-32 form when the host takes its speculative-
-    # sample twin (_spec_sample_flag, round 7 lever SP) on a launch that is not the whole-CTA-tail single kernel:
-    # the strided histogram of the preloaded chunk replaces the separate sampled read (B200 / GB300 k = 50 vs the
-    # `_cs` build: one chunk 0.82-0.87 us, two chunks on cluster 8 0.99-1.00, 16 chunks 0.95-0.96).  The ept-16
-    # streams take their twin on every launch, so a uniform term does not reorder them.
     # stream_wide_ragged_large_k_us: per streaming wave of the ept-32 form at large top-k when its last 512 x 32
     # chunk is less than _RAGGED_CHUNK_FILL full (V = 151936: 4.64 chunks on cluster 2, 2.32 on cluster 4, 1.16 on
     # cluster 8).  Round-7 e2e graph-replay sweeps (k = 1000): at V = 151936 the ept-32 stream loses to the ept-16
@@ -175,7 +171,7 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
     148: (
         2.0,
         0.15,
-        4.0,
+        3.6,
         0.25,
         0.0,
         1.0,
@@ -195,7 +191,6 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         0.0,
         0.2,
         1.0,
-        0.4,
         2.0,
     ),
     132: (
@@ -222,7 +217,6 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         0.0,
         0.0,
         0.0,
-        0.0,
     ),
     212: (
         1.5,
@@ -244,7 +238,6 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         0.0,
         0.0,
         0.05,
-        0.0,
         0.0,
         0.0,
         0.0,
@@ -755,7 +748,6 @@ def _choose_stage1_resolved(
         fused_tail_stream,
         stream_large_k_cluster_cta,
         stream_wide_short_row_large_k,
-        spec_sample_wide,
         stream_wide_ragged_large_k,
     ) = _stage1_cost(int(sm_count))
     large_k = (
@@ -839,22 +831,10 @@ def _choose_stage1_resolved(
                     if large_k > 0.0 and ce[1] > 16 and _ragged_last_chunk(vocab, ce[0], ce[1])
                     else 0.0
                 )
-                - spec_sample_saving(ce)
             )
             + launch_cost(ce[0])
             + (stream_two_launch_cost(ce))
         )
-
-    def spec_sample_saving(ce: tuple[int, int]) -> float:
-        # the ept-16 streams take their twin on every launch (uniform term, no reordering); the ept-32 form's
-        # saving applies when the host takes the twin and the launch is not the whole-CTA-tail single kernel
-        if not spec_sample_wide or ce[1] <= 16:
-            return 0.0
-        if large_k > 0.0 and not takes_two_kernels(ce, True):
-            return 0.0
-        if _spec_sample_flag(ce[0], ce[1], True, vocab, top_k_max, batch, None):
-            return spec_sample_wide
-        return 0.0
 
     def stream_two_launch_cost(ce: tuple[int, int]) -> float:
         if not takes_two_kernels(ce, True):

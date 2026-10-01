@@ -556,10 +556,10 @@ def test_per_request_tensors_and_routes():
     # and R200 (212)); every pick is the measured-best variant of its cell or within the noted regret (< 3 %).
     # 148-SM table (round-6 re-fit, CAKE-776): worst regret 2.8 % against the measured-best variant of each cell
     for (pb, pv, pk), want in {
-        (1, 32768, 50): (2, 32, True),  # round-7 refit (lever h), was (4, 16, False)
-        (4, 32768, 50): (2, 32, True),  # round-7 refit (lever h), was (4, 16, False)
-        (8, 32768, 50): (2, 32, True),  # round-7 refit (lever h), was (4, 16, False)
-        (16, 32768, 50): (2, 32, True),  # round-7 refit (lever h), was (1, 32, True)
+        (1, 32768, 50): (1, 32, True),  # round-7 refit (lever h), was (4, 16, False)
+        (4, 32768, 50): (1, 32, True),  # round-7 refit (lever h), was (4, 16, False)
+        (8, 32768, 50): (1, 32, True),  # round-7 refit (lever h), was (4, 16, False)
+        (16, 32768, 50): (1, 32, True),
         (32, 32768, 50): (1, 32, True),
         (64, 32768, 50): (1, 32, True),
         (128, 32768, 50): (1, 32, True),
