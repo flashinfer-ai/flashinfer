@@ -281,14 +281,17 @@ def _close(got, want):
 
 
 @pytest.mark.parametrize(
-    "fmt,rows",
-    [("dense", 16), ("dense", 3), ("fp8", 16), ("nvfp4", 16)]
-    + [("nvfp4-interleaved", 16)],
+    "fmt,rows,null_page",
+    [("dense", 16, 0), ("dense", 3, 0), ("fp8", 16, 0), ("nvfp4", 16, 0)]
+    + [("nvfp4-interleaved", 16, 0), ("dense", 16, 1)],
 )
-def test_attention_matches_oracle(fmt, rows):
+def test_attention_matches_oracle(fmt, rows, null_page):
     b = _batch(rows, 1 if rows < 4 else 2, seed=rows)
+    if null_page:  # page 0 is the caller's padding: no request maps it, and it is NaN
+        b.table += 1
+        b.k, b.v = (torch.cat([t[:1] * float("nan"), t]) for t in (b.k, b.v))
     kw, decoded = _cache(fmt, b)
-    att = _attention(fmt)
+    att = _attention(fmt, slots=SLOTS + null_page * PAGE)
     out = _run(att, b, **kw)
     _close(out, _attend_ref(b, *decoded))
     _exact([_run(att, b, **kw)], [out])  # deterministic

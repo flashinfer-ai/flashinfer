@@ -81,6 +81,25 @@ inline cudaError_t choose_wide(uint32_t wide_blocks, bool* wide) {
   return cudaSuccess;
 }
 
+// Where a live row's invalid entries point. The attention reads every entry before
+// the mask is applied, and a masked entry still multiplies its V row by a zero
+// probability, so what the slot holds has to be finite. Slot 0 is not that: it is
+// wherever the caller keeps padding -- vLLM's null block -- and a NaN left there comes
+// out of P @ V as 0 * NaN. The request's first token is a slot the request has written
+// by the time its attention runs, so a live row's invalid entries read that instead.
+// A row without a request is fully masked and its output is not kept; it stays on 0.
+template <typename IdType>
+__device__ __forceinline__ uint32_t first_token_slot(const IdType* row_table, uint32_t table_width,
+                                                     uint32_t page_size, uint32_t num_slots) {
+  if (row_table == nullptr || table_width == 0) return 0;
+  const IdType page = row_table[0];
+  if (page < IdType(0) || static_cast<uint64_t>(page) >= static_cast<uint64_t>(num_slots)) {
+    return 0;
+  }
+  const uint64_t slot = static_cast<uint64_t>(page) * page_size;
+  return slot < static_cast<uint64_t>(num_slots) ? static_cast<uint32_t>(slot) : 0u;
+}
+
 }  // namespace sparse_route
 
 /*!
@@ -226,8 +245,9 @@ __global__ void __launch_bounds__(THREADS)
  *
  * A route entry is valid when it names a real token: inside the request, on a
  * logical page the block table covers, on a page the table actually maps, and in a
- * slot the cache holds. Invalid entries route to slot 0 with their mask bit clear,
- * because an out-of-range slot would be read before the mask is applied.
+ * slot the cache holds. Invalid entries keep their mask bit clear and route to the
+ * request's first token, because they are read before the mask is applied (see
+ * sparse_route::first_token_slot).
  *
  * The logical route is written out as well: a speculative decoder reuses the
  * selection across its steps, so it outlives the physical route derived from it.
@@ -302,6 +322,8 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
     const IdType* row_blocks = block_indices + row * stride_blocks_row;
     const IdType* row_table =
         request_valid ? block_table + safe_request * stride_table_row : nullptr;
+    const uint32_t fallback_slot =
+        sparse_route::first_token_slot(row_table, table_width, page_size, num_slots);
     IdType* row_logical = out_logical + row * stride_logical_row;
     IdType* row_route = out_route + row * output_width;
     uint8_t* row_mask = out_mask + row * mask_bytes_per_row;
@@ -345,7 +367,7 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
       }
 
       // Logical token -> physical slot, folding every bound into the same validity.
-      uint32_t slot = 0;
+      uint32_t slot = fallback_slot;
       if (valid) {
         const uint32_t logical_page = static_cast<uint32_t>(token) / page_size;
         if (logical_page < table_width && row_table != nullptr) {
@@ -405,8 +427,9 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
  *
  * An entry is valid when it names a real token: non-negative, on a logical page the
  * block table covers, on a page the table maps, and in a slot the cache holds.
- * Invalid entries route to slot 0 with their mask bit clear, because an
- * out-of-range slot would be read before the mask is applied.
+ * Invalid entries keep their mask bit clear and route to the request's first token,
+ * because they are read before the mask is applied (see
+ * sparse_route::first_token_slot).
  */
 template <uint32_t TILE, uint32_t THREADS, typename IdType>
 __global__ void __launch_bounds__(THREADS)
@@ -439,6 +462,8 @@ __global__ void __launch_bounds__(THREADS)
     const IdType* row_logical = row_live ? logical + row * stride_logical_row : nullptr;
     IdType* row_route = out_route + row * width;
     uint8_t* row_mask = out_mask + row * mask_bytes_per_row;
+    const uint32_t fallback_slot = sparse_route::first_token_slot(
+        row_table, table_width, static_cast<uint32_t>(page_size), num_slots);
 
     const uint32_t lane = threadIdx.x & 31u;
 
@@ -447,7 +472,7 @@ __global__ void __launch_bounds__(THREADS)
       const uint32_t col = tile_base + threadIdx.x + i * THREADS;
       const bool in_row = col < width;
 
-      uint32_t slot = 0;
+      uint32_t slot = fallback_slot;
       bool valid = false;
       if (in_row && row_table != nullptr && row_logical != nullptr) {
         const IdType token_raw = row_logical[col];

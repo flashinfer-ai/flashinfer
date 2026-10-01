@@ -230,8 +230,11 @@ def qsa_route_from_blocks(
 
     An entry is valid when it names a real token: inside the request, on a logical
     page the block table covers, on a page the table maps, and in a slot the cache
-    holds. Invalid entries route to slot 0 with their mask bit clear -- an
-    out-of-range slot would be read before the mask applies.
+    holds. Invalid entries keep their mask bit clear and route to the request's first
+    token: they are read before the mask applies, and a masked entry still meets its V
+    row with a zero weight, so the slot has to hold finite values. Slot 0 is the
+    caller's padding and need not; a row without a request is fully masked and stays
+    on it.
 
     The logical route is written out as well, for callers that reuse a selection
     across steps after the physical route derived from it has been consumed.
@@ -349,9 +352,9 @@ def qsa_route_from_logical(
 
     An entry is valid when it names a real token: non-negative, on a logical page the
     block table covers, on a page the table maps, and in a slot the cache holds.
-    Invalid entries route to slot 0 with their mask bit clear, since an out-of-range
-    slot would be read before the mask applies. Route rows at or past ``valid_rows``
-    are padding and come out fully masked.
+    Invalid entries keep their mask bit clear and route to the request's first token,
+    for the reason :func:`qsa_route_from_blocks` gives. Route rows at or past
+    ``valid_rows`` are padding and come out fully masked, on slot 0.
 
     Parameters
     ----------

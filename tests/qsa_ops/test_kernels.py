@@ -451,6 +451,9 @@ def _slot_ref(logical, t2r, table, page, slots, valid):
     tab, reqs = table.tolist(), t2r.tolist()
     for row, toks in enumerate(logical.tolist()[:valid]):
         r = reqs[row]
+        first = tab[r][0] if 0 <= r < len(tab) and tab[r] else -1
+        if first >= 0 and first * page < slots:  # invalid entries read the first token
+            route[row] = first * page
         for col, t in enumerate(toks if 0 <= r < len(tab) else ()):
             mapped = tab[r][t // page] if t >= 0 and t // page < len(tab[r]) else -1
             if mapped >= 0 and mapped * page + t % page < slots:
@@ -481,7 +484,7 @@ def _rcase(rows, topk, cr, page=16, seq=512, nreq=4, valid=None, fill=None, t2r=
     rand = lambda hi, *shape: torch.randint(0, hi, shape, device=DEV, generator=g)
     pages = -(-seq // page)
     table = torch.randperm(pages * nreq, device=DEV, generator=g).view(nreq, pages)
-    table[:, ::7] = -1  # unmapped pages
+    table[:, 1::7] = -1  # unmapped pages; the first stays mapped for invalid entries
     if fill is not None:
         table.fill_(fill)
     t2r = torch.tensor(t2r, device=DEV) if t2r else rand(nreq, rows)
