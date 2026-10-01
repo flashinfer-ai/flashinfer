@@ -355,6 +355,40 @@ def dcp_balanced_n_rows(kind: str, q_len: int) -> int:
     return 32 if rows_per_tile * _DCP_BALANCED_GROUP[kind] <= 32 else 64
 
 
+def dcp_balanced_program(
+    kind: str, *, batch_size: int, num_kv_heads: int, sm_count: int
+) -> Optional[int]:
+    """The traced program a balanced family's launch runs, or ``None`` for a one-program family.
+
+    The E4M3 head_dim-128 family ships its program with and without the
+    idle-CTA eight-slice fold of split tiles.  That fold needs chunk tickets
+    plus eight reduce tickets per split tile within the grid (one persistent
+    CTA per multiprocessor), and every (request, KV head) pair is at least one
+    chunk ticket, so a launch with ``batch_size * num_kv_heads >= sm_count``
+    can never take it and runs the program without that fold body (identical
+    plan and fold order).  Mirrors the manifest's ``program_variants`` rule from
+    host metadata only.
+    """
+
+    _check_dcp_balanced_kind(kind)
+    from .jit.cake_dcp import dcp_balanced_program_variants
+
+    variants = dcp_balanced_program_variants(_DCP_BALANCED_FAMILY[kind])
+    if variants is None:
+        return None
+    if variants.get("items_lower_bound") != "batch_size * num_kv_heads":
+        raise RuntimeError(
+            f"unsupported balanced DCP program rule for {kind}: "
+            f"{variants.get('items_lower_bound')!r}"
+        )
+    if int(sm_count) <= 0:
+        raise ValueError(f"sm_count must be positive, got {sm_count}")
+    if int(batch_size) <= 0 or int(num_kv_heads) <= 0:
+        raise ValueError("batch_size and num_kv_heads must be positive")
+    below_grid = int(batch_size) * int(num_kv_heads) < int(sm_count)
+    return int(variants["below_grid"] if below_grid else variants["at_or_above_grid"])
+
+
 def dcp_balanced_items_bound(
     *, batch_size: int, num_kv_heads: int, max_local_seq_len: int
 ) -> int:
@@ -596,6 +630,9 @@ def _run_dcp_spec_balanced(
         _DCP_BALANCED_FAMILY[kind],
         target,
         dcp_balanced_n_rows(kind, q_len_per_req),
+        dcp_balanced_program(
+            kind, batch_size=batch_size, num_kv_heads=num_kv_heads, sm_count=sm_count
+        ),
     )
     if kind == "bf16_p16":
         if float(bmm2_scale) != 1.0:
@@ -1120,6 +1157,7 @@ __all__ = [
     "DcpBalancedBand",
     "dcp_balanced_band",
     "dcp_balanced_n_rows",
+    "dcp_balanced_program",
     "dcp_balanced_route",
     "dcp_static_shape",
     "get_dcp_spec_balanced_counter_bytes",
