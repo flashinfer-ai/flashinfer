@@ -540,7 +540,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
-            "pf": 1,
+            "pf": 0,
         },
         "192,2,64": {
             "route": "decode",
@@ -1140,7 +1140,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
-            "pf": 1,
+            "pf": 0,
         },
         "192,2,64": {
             "route": "decode",
