@@ -543,6 +543,7 @@ class PreparedFp4Linear:
         mma_k: int = 64,
         tile_k: int = 256,
         tmem_overlap: bool = False,
+        config: Optional[PrimsTsGemmConfig] = None,
     ) -> None:
         device = _validate_cuda_tensors(
             weight_packed,
@@ -582,7 +583,7 @@ class PreparedFp4Linear:
             is_neox=is_neox,
             qkv_scale=qkv_scale,
         )
-        self.config = PrimsTsGemmConfig(
+        self.config = config or PrimsTsGemmConfig(
             arch,
             "nvfp4_e2m1",
             output_format,
@@ -595,6 +596,17 @@ class PreparedFp4Linear:
             tmem_overlap=tmem_overlap,
             has_qkv_scale=qkv_scale is not None,
         )
+        if (
+            self.config.arch != arch
+            or self.config.operand_format != "nvfp4_e2m1"
+            or self.config.output_format != output_format
+            or self.config.epilogue != epilogue
+            or self.config.has_bias != (bias is not None)
+            or self.config.head_dim != head_dim
+            or self.config.is_neox != is_neox
+            or self.config.has_qkv_scale != (qkv_scale is not None)
+        ):
+            raise ValueError("config does not match the prepared NVFP4 projection")
         self.device = device
         self.n = n
         self.k = k
@@ -605,7 +617,9 @@ class PreparedFp4Linear:
         # Defaults stay unpinned so a later autotune pass can replace them.
         # __init__ still loads this config: callers inspect the module, and
         # an untuned launch uses the same kernel via tactic -1.
-        self._pinned = mma_k != 64 or tile_k != 256 or tmem_overlap
+        self._pinned = (
+            config is not None or mma_k != 64 or tile_k != 256 or tmem_overlap
+        )
         self._module = _load_kernel(self.config)
         self._max_active_clusters = _max_active_clusters(
             self.config, self._module, device
@@ -815,6 +829,7 @@ def prepare_fp4_linear(
     mma_k: int = 64,
     tile_k: int = 256,
     tmem_overlap: bool = False,
+    config: Optional[PrimsTsGemmConfig] = None,
 ) -> PreparedFp4Linear:
     """Prepare a fixed packed-NVFP4 linear projection.
 
@@ -837,6 +852,7 @@ def prepare_fp4_linear(
         mma_k=mma_k,
         tile_k=tile_k,
         tmem_overlap=tmem_overlap,
+        config=config,
     )
 
 
@@ -851,6 +867,7 @@ def prepare_fp4_linear_swiglu(
     output_quant_scale=None,
     mma_k: int = 64,
     tile_k: int = 256,
+    config: Optional[PrimsTsGemmConfig] = None,
 ) -> PreparedFp4Linear:
     """Prepare a fixed packed-NVFP4 linear+SwiGLU projection."""
     return PreparedFp4Linear(
@@ -864,6 +881,7 @@ def prepare_fp4_linear_swiglu(
         bias=bias,
         mma_k=mma_k,
         tile_k=tile_k,
+        config=config,
     )
 
 

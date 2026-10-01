@@ -21,9 +21,9 @@ from .config import PrimsTsGemmConfig
 _DEFAULT_AB_STAGES = 6
 _FUSED_QKNORM_AB_STAGES = 4
 _NVFP4_AB_STAGES = 5
-_STAGE_CHOICES = (3, 4, 5, 6)
-_CLUSTERS = ((2, 1), (2, 2), (4, 4))
-MAX_PROFILED_TACTICS = 1024
+_STAGE_CHOICES = (5, 6)
+_CLUSTERS = ((2, 2), (4, 4))
+MAX_PROFILED_TACTICS = 32
 
 # cluster_m, cluster_n, tile_n, tile_k, tmem_overlap, ab_stages, mma_k, use_clc, epilogue_warps
 Tactic = tuple[int, int, int, int, bool, int, int, bool, int]
@@ -148,10 +148,8 @@ def tactic_is_legal(
     return stages in stage_candidates(derived)
 
 
-def _tile_ns(operand_format: str) -> tuple[int, ...]:
-    if operand_format == "nvfp4_e2m1":
-        return (128, 256)
-    return (32, 64, 128, 256)
+def _tile_ns() -> tuple[int, ...]:
+    return (256,)
 
 
 def _mma_ks(arch: int, operand_format: str) -> tuple[int, ...]:
@@ -162,13 +160,11 @@ def _mma_ks(arch: int, operand_format: str) -> tuple[int, ...]:
 
 def _tile_ks(operand_format: str, mma_k: int) -> tuple[int, ...]:
     if operand_format == "nvfp4_e2m1":
-        return (256,) if mma_k == 96 else (256, 512)
-    return (128, 256)
+        return (256,)
+    return (128,)
 
 
-def _warps(epilogue: str) -> tuple[int, ...]:
-    if epilogue == "linear":
-        return (4, 8)
+def _warps() -> tuple[int, ...]:
     return (8,)
 
 
@@ -232,7 +228,7 @@ def _neighbors(
     for cluster_m, cluster_n in _CLUSTERS:
         if (cluster_m, cluster_n) != (base[0], base[1]):
             yield _replace(base, cluster_m=cluster_m, cluster_n=cluster_n)
-    for tile_n in _tile_ns(operand_format):
+    for tile_n in _tile_ns():
         if tile_n != base[2]:
             yield _with_derived_stages(
                 operand_format, epilogue, _replace(base, tile_n=tile_n, overlap=False)
@@ -257,7 +253,7 @@ def _neighbors(
         if stages != base[5]:
             yield _replace(base, stages=stages)
     yield _replace(base, use_clc=not base[7])
-    for warps in _warps(epilogue):
+    for warps in _warps():
         if warps != base[8]:
             yield _replace(base, warps=warps, overlap=False)
     if epilogue == "linear":
@@ -270,15 +266,16 @@ def _product(
     epilogue: str,
 ) -> Iterator[Tactic]:
     for cluster_m, cluster_n in _CLUSTERS:
-        for tile_n in _tile_ns(operand_format):
+        for tile_n in _tile_ns():
             for mma_k in _mma_ks(arch, operand_format):
                 for tile_k in _tile_ks(operand_format, mma_k):
                     derived = derived_ab_stages(
                         operand_format, epilogue, mma_k, tile_n, tile_k
                     )
                     for stages in stage_candidates(derived):
-                        for use_clc in (True, False):
-                            for warps in _warps(epilogue):
+                        #for use_clc in (True, False):
+                        for use_clc in (True,):
+                            for warps in _warps():
                                 for overlap in (False, True):
                                     yield (
                                         cluster_m,
