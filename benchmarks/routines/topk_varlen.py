@@ -6,8 +6,10 @@
 picks the top-K KV positions per request under variable per-request sequence
 lengths — NOT a vocabulary-sampling op. It therefore lives in its own routine
 module (mirroring ``flashinfer/topk_varlen/topk_varlen.py``) rather than under
-``routines/sampling.py``, and its backends are radix / gvr / radix_cutlass
-(there is no generic "cuda" backend here).
+``routines/sampling.py``, and its backends are radix / gvr / gvr_2 /
+radix_cutlass, the primitives family (radix_primitives / walkfirst_primitives /
+cutlass_primitives) and the vendored sglang kernel (there is no generic "cuda"
+backend here).
 
 Entry points (the unified-benchmark convention):
   * ``parse_topk_varlen_args(line, parser)`` — routine-specific CLI args.
@@ -34,7 +36,16 @@ from .flashinfer_benchmark_utils import (
 # ``flashinfer.top_k_varlen.is_backend_supported(backend, cc)`` (the single
 # source of truth), mirroring how the GEMM routines rely on their support
 # checkers (e.g. mm_fp4 / bmm_fp8) instead of a compute-capability table.
-_TOP_K_VARLEN_BACKENDS = ("radix", "gvr", "gvr_2", "radix_cutlass")
+_TOP_K_VARLEN_BACKENDS = (
+    "radix",
+    "gvr",
+    "gvr_2",
+    "radix_cutlass",
+    "radix_primitives",
+    "walkfirst_primitives",
+    "cutlass_primitives",
+    "sglang",
+)
 
 
 def parse_topk_varlen_args(line, parser):
@@ -50,7 +61,17 @@ def parse_topk_varlen_args(line, parser):
             "Backends to benchmark. Default: every backend supported on the "
             "current GPU (resolved via top_k_varlen's @backend_requirement "
             "support checks). 'radix' = CuTe DSL multi-CTA (Blackwell), 'gvr' = "
-            "GVR LB (Blackwell), 'radix_cutlass' = masked CUTLASS radix (any GPU)."
+            "GVR LB (Blackwell), 'radix_cutlass' = masked CUTLASS radix (any GPU). "
+            "'radix_primitives' = coarse-histogram CuTe DSL primitives kernel "
+            "(Ampere+, any top_k). "
+            "'walkfirst_primitives' = gvr_2-architecture walk-first ladder "
+            "(Ampere+, top_k <= 2048, max_seq_len % 4 for float32 / % 8 for the "
+            "16-bit dtypes). "
+            "'cutlass_primitives' = vendored cutlass-primitives library "
+            "(Ampere+, any top_k). "
+            "'sglang' = vendored SGLang DeepSeek-V4 kernel (Ampere+, float32 "
+            "only, top_k <= 2048, max_seq_len % 4; approximate on tie overflows). "
+            "is_backend_supported filtering applies to every name."
         ),
     )
     parser.add_argument(
@@ -96,7 +117,9 @@ def run_topk_varlen_test(args):
 
 
 def testTopKVarlen(args):
-    """Benchmark top_k_varlen with its runners: 'radix', 'radix_cutlass', 'gvr', 'gvr_2'.
+    """Benchmark top_k_varlen with its runners: 'radix', 'radix_cutlass', 'gvr',
+    'gvr_2', 'radix_primitives', 'walkfirst_primitives', 'cutlass_primitives',
+    'sglang'.
 
     Runners
     -------
@@ -110,6 +133,20 @@ def testTopKVarlen(args):
     gvr_2          — self-sampling GVR V2 (TRT-LLM PR #17821 port); passes the
                      same ``pre_idx``. Blackwell (sm_100/103) + fp32 logits +
                      top_k in {512, 1024, 2048} only; skipped otherwise.
+    radix_primitives     — coarse-histogram CuTe DSL primitives kernel;
+                     ``pre_idx=None``. Ampere+, fp32/fp16/bf16, any top_k.
+    walkfirst_primitives — gvr_2-architecture walk-first ladder; ``pre_idx=None``.
+                     Ampere+, fp32/fp16/bf16, top_k <= 2048, max_seq_len % 4
+                     (fp32) or % 8 (16-bit); skipped otherwise.
+    cutlass_primitives   — vendored cutlass-primitives library (its own router);
+                     ``pre_idx=None``. Ampere+, fp32/fp16/bf16, any top_k.
+    sglang         — vendored SGLang DeepSeek-V4 kernel; ``pre_idx=None``.
+                     Ampere+, fp32 only, top_k <= 2048, max_seq_len % 4;
+                     skipped otherwise. Approximate on tie overflows (irrelevant
+                     for the tie-free randn logits used here).
+
+    Every name still goes through ``top_k_varlen.is_backend_supported`` for the
+    current compute capability before it is run.
 
     Reference check compares the *set* of selected indices against ``torch.topk``
     applied to logits masked to ``seq_lens``.
@@ -160,6 +197,27 @@ def testTopKVarlen(args):
             "[WARNING] gvr_2 requires float32 logits, top_k in {512, 1024, "
             "2048} and max_seq_len % 4 == 0. Skipping."
         )
+    # sglang and walkfirst_primitives pass their CC check on any Ampere+ GPU
+    # but bound top_k at 2048 and read rows as 16-byte vectors (sglang: fp32
+    # only, so N % 4; walkfirst: N % 4 for fp32, N % 8 for the 16-bit dtypes)
+    # — same up-front drop as gvr_2.
+    if "sglang" in backends and (
+        args.input_dtype != "float32" or top_k > 2048 or max_seq_len % 4 != 0
+    ):
+        backends.remove("sglang")
+        print(
+            "[WARNING] sglang requires float32 logits, top_k <= 2048 and "
+            "max_seq_len % 4 == 0. Skipping."
+        )
+    walkfirst_vec = 4 if args.input_dtype == "float32" else 8
+    if "walkfirst_primitives" in backends and (
+        top_k > 2048 or max_seq_len % walkfirst_vec != 0
+    ):
+        backends.remove("walkfirst_primitives")
+        print(
+            "[WARNING] walkfirst_primitives requires top_k <= 2048 and "
+            f"max_seq_len % {walkfirst_vec} == 0 for {args.input_dtype}. Skipping."
+        )
     if len(backends) == 0:
         print("[ERROR] No backends to test. Exiting.")
         return res
@@ -197,6 +255,16 @@ def testTopKVarlen(args):
         elif backend == "gvr_2":
             return flashinfer.top_k_varlen(
                 logits, seq_lens, top_k, pre_idx=pre_idx, backend="gvr_2"
+            )
+        elif backend in (
+            "radix_primitives",
+            "walkfirst_primitives",
+            "cutlass_primitives",
+            "sglang",
+        ):
+            # hint-free kernels (Ampere+); no pre_idx needed.
+            return flashinfer.top_k_varlen(
+                logits, seq_lens, top_k, pre_idx=None, backend=backend
             )
         else:
             raise ValueError(f"Unsupported backend: {backend}")
