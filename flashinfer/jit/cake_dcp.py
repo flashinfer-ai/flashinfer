@@ -536,9 +536,10 @@ def load_dcp_spec_fp8_d256_module(
 # On-device load-balanced DCP families (CAKE-685 round 3)
 # ---------------------------------------------------------------------------
 #
-# Each family ships one shape-independent program for both architectures
-# (``cuda/dcp_spec/<family>/kernel.cu``; the shared-base prologue is switched
-# by ``__CUDA_ARCH__``).  Its 32- and 64-row packed instances are the
+# Each family ships shape-independent programs for both architectures
+# (``cuda/dcp_spec/<family>/kernel.cu``, or one ``kernel_<key><value>.cu`` per
+# program of a family with ``program_variants``; the shared-base prologue is
+# switched by ``__CUDA_ARCH__``).  Its 32- and 64-row packed instances are the
 # manifest members' ``defines`` (``-DN_ROWS=32`` / ``64``), selected by the
 # packed-row tile the request's speculative rows need; batch, heads, lengths,
 # rank and world are runtime kernel arguments.

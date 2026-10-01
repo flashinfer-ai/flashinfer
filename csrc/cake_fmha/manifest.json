@@ -515,15 +515,16 @@
                   "N_ROWS": 32
                 },
                 "selector": {
+                  "eight_slice_fold": 0,
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283",
-                  "sm_103a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283"
+                  "sm_100a": "f3a99809b7eba162d1c40c754fb26d039f8d4b491e86515e83ad0f3b7916943b",
+                  "sm_103a": "f3a99809b7eba162d1c40c754fb26d039f8d4b491e86515e83ad0f3b7916943b"
                 },
                 "sources": {
-                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
-                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu"
                 }
               },
               {
@@ -531,15 +532,50 @@
                   "N_ROWS": 64
                 },
                 "selector": {
+                  "eight_slice_fold": 0,
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283",
-                  "sm_103a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283"
+                  "sm_100a": "f3a99809b7eba162d1c40c754fb26d039f8d4b491e86515e83ad0f3b7916943b",
+                  "sm_103a": "f3a99809b7eba162d1c40c754fb26d039f8d4b491e86515e83ad0f3b7916943b"
                 },
                 "sources": {
-                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
-                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu"
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu"
+                }
+              },
+              {
+                "defines": {
+                  "N_ROWS": 32
+                },
+                "selector": {
+                  "eight_slice_fold": 1,
+                  "n_rows": 32
+                },
+                "sha256": {
+                  "sm_100a": "2756a535bb800c9499ff8c29097ec9b0b7ac07c4460afafe3f3149c7ae2cc297",
+                  "sm_103a": "2756a535bb800c9499ff8c29097ec9b0b7ac07c4460afafe3f3149c7ae2cc297"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu"
+                }
+              },
+              {
+                "defines": {
+                  "N_ROWS": 64
+                },
+                "selector": {
+                  "eight_slice_fold": 1,
+                  "n_rows": 64
+                },
+                "sha256": {
+                  "sm_100a": "2756a535bb800c9499ff8c29097ec9b0b7ac07c4460afafe3f3149c7ae2cc297",
+                  "sm_103a": "2756a535bb800c9499ff8c29097ec9b0b7ac07c4460afafe3f3149c7ae2cc297"
+                },
+                "sources": {
+                  "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu",
+                  "sm_103a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu"
                 }
               }
             ],
@@ -1214,8 +1250,8 @@
             }
           }
         },
-        "source_package_file_count": 43,
-        "source_package_sha256": "196ebdbbd3e631f6c741f636a8ab50b7b5702e7a84b7ce0abf812c70d435c747",
+        "source_package_file_count": 44,
+        "source_package_sha256": "1de45992aca34b30f823570b2f7d3916cf5956870261e8fd12116be87d2fc64b",
         "balanced_routes": {
           "dcp_spec_bf16_balanced": {
             "arguments": {
@@ -1455,6 +1491,22 @@
                 8
               ],
               "v_scale": "per_tensor_folded_into_output"
+            },
+            "program_variants": {
+              "at_or_above_grid": 0,
+              "below_grid": 1,
+              "bodies": {
+                "0": "cake_fmha_dcp_spec_bf16_fp8_balanced_eight_slice_fold0.cu",
+                "1": "cake_fmha_dcp_spec_bf16_fp8_balanced_eight_slice_fold1.cu"
+              },
+              "default": 1,
+              "items_lower_bound": "batch_size * num_kv_heads",
+              "key": "eight_slice_fold",
+              "rule": "eight_slice_fold = below_grid when batch_size * num_kv_heads < grid (sm_count: one persistent CTA per multiprocessor), else at_or_above_grid: the idle-CTA eight-slice fold needs chunk tickets + 8 reduce tickets per split tile <= grid and every (request, KV head) is at least one chunk ticket; the program without it has the same plan and fold order",
+              "values": [
+                0,
+                1
+              ]
             },
             "public_name": "cake_fmha_dcp_spec_bf16_fp8_balanced",
             "public_symbol": "kernel_cake_fmha_dcp_spec_bf16_fp8_balanced",
@@ -2010,9 +2062,13 @@
       "bytes": 127094,
       "sha256": "07240d76baaf7adea6ca1929fe354d32a16d9369470c0071ae6d3ad917fafb91"
     },
-    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu": {
-      "bytes": 252856,
-      "sha256": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283"
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold0.cu": {
+      "bytes": 298551,
+      "sha256": "f3a99809b7eba162d1c40c754fb26d039f8d4b491e86515e83ad0f3b7916943b"
+    },
+    "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel_eight_slice_fold1.cu": {
+      "bytes": 299336,
+      "sha256": "2756a535bb800c9499ff8c29097ec9b0b7ac07c4460afafe3f3149c7ae2cc297"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu": {
       "bytes": 365643,
