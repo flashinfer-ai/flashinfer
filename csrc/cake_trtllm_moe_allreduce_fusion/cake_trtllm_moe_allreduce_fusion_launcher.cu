@@ -32,9 +32,6 @@
 #ifndef CAKE_MOE_AR_SM103_T1
 #error "CAKE_MOE_AR_SM103_T1 must be defined (1 for sm_103a, 0 otherwise)"
 #endif
-#ifndef CAKE_MOE_AR_SM100_WS8_MID
-#error "CAKE_MOE_AR_SM100_WS8_MID must be defined (1 for sm_100a, 0 otherwise)"
-#endif
 
 // Every kernel of the bundle has the same 18-parameter signature up to the
 // 16-bit element type.
@@ -62,11 +59,6 @@ CAKE_MOE_AR_DECLARE_KERNEL(kernel_cake_trtllm_moe_reduction_bfloat16_ws2_o0110_s
 CAKE_MOE_AR_DECLARE_KERNEL(kernel_cake_trtllm_moe_reduction_bfloat16_ws4_o0110_sm103_t1,
                            __nv_bfloat16)
 CAKE_MOE_AR_DECLARE_KERNEL(kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110_sm103_t1,
-                           __nv_bfloat16)
-#endif
-#if CAKE_MOE_AR_SM100_WS8_MID
-CAKE_MOE_AR_DECLARE_KERNEL(kernel_cake_trtllm_moe_reduction_float16_ws8_o0110_sm100_ws8_mid, __half)
-CAKE_MOE_AR_DECLARE_KERNEL(kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110_sm100_ws8_mid,
                            __nv_bfloat16)
 #endif
 
@@ -105,25 +97,10 @@ const void* const kSm103T1Kernels[2][3] = {
 };
 #endif
 
-#if CAKE_MOE_AR_SM100_WS8_MID
-// SM100, eight ranks, 64 or 128 tokens: specialised schedule.
-const void* const kSm100Ws8MidKernels[2] = {
-    reinterpret_cast<const void*>(kernel_cake_trtllm_moe_reduction_float16_ws8_o0110_sm100_ws8_mid),
-    reinterpret_cast<const void*>(
-        kernel_cake_trtllm_moe_reduction_bfloat16_ws8_o0110_sm100_ws8_mid),
-};
-#endif
-
-const void* SelectKernel(int32_t dtype_index, int32_t world_index, int64_t world_size,
-                         int64_t token_num) {
+const void* SelectKernel(int32_t dtype_index, int32_t world_index, int64_t token_num) {
 #if CAKE_MOE_AR_SM103_T1
   if (token_num == 1) {
     return kSm103T1Kernels[dtype_index][world_index];
-  }
-#endif
-#if CAKE_MOE_AR_SM100_WS8_MID
-  if (world_size == 8 && (token_num == 64 || token_num == 128)) {
-    return kSm100Ws8MidKernels[dtype_index];
   }
 #endif
   return kGenericKernels[dtype_index][world_index];
@@ -238,7 +215,7 @@ void RunReduction(int64_t world_size, int64_t world_rank, int64_t token_num, int
   config.attrs = attrs;
   config.numAttrs = num_attrs;
 
-  const void* kernel = SelectKernel(dtype_index, world_index, world_size, token_num);
+  const void* kernel = SelectKernel(dtype_index, world_index, token_num);
   cudaError_t status = cudaLaunchKernelExC(&config, kernel, args);
   TVM_FFI_CHECK(status == cudaSuccess, RuntimeError)
       << "Cake MoE all-reduce fusion kernel launch failed: " << cudaGetErrorString(status);

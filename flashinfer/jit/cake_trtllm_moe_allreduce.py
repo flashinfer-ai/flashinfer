@@ -23,21 +23,11 @@ _ARCH_BY_CAPABILITY = {
     (10, 3): "sm_103a",
 }
 
-# The kernel source holds the generic kernels plus two architecture-specific
-# groups (``_sm103_t1`` for one token on SM103, ``_sm100_ws8_mid`` for eight
-# ranks at 64/128 tokens on SM100). Each architecture compiles only the group
-# its launcher can select.
+# The kernel source holds the generic kernels plus the SM103 single-token
+# group (``_sm103_t1``); only the SM103 module compiles that group.
 _ARCH_CUDA_CFLAGS = {
-    "sm_100a": [
-        *sm100a_nvcc_flags,
-        "-DCAKE_MOE_AR_SM103_T1=0",
-        "-DCAKE_MOE_AR_SM100_WS8_MID=1",
-    ],
-    "sm_103a": [
-        *sm103a_nvcc_flags,
-        "-DCAKE_MOE_AR_SM103_T1=1",
-        "-DCAKE_MOE_AR_SM100_WS8_MID=0",
-    ],
+    "sm_100a": [*sm100a_nvcc_flags, "-DCAKE_MOE_AR_SM103_T1=0"],
+    "sm_103a": [*sm103a_nvcc_flags, "-DCAKE_MOE_AR_SM103_T1=1"],
 }
 
 

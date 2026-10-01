@@ -358,8 +358,8 @@ def _reduction_worker(
             ).to(dtype)
 
             # Without the all-reduce output the call stays on the isolated source
-            # bundle: 64 tokens cover its generic (and SM100 eight-rank) kernels,
-            # one token its SM103 single-token kernels.
+            # bundle: 64 tokens cover its generic kernels, one token its SM103
+            # single-token kernels.
             emit_allreduce_options = (
                 (True, False)
                 if (token_num, active_experts)
