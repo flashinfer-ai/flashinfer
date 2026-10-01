@@ -378,7 +378,10 @@ def test_decode_config_round3_fused_rows(arch):
     assert cfg.total_work == 256
     # Round 6 (lever P): the row prefetches its weight tiles four stages ahead into L2 (``_pf4``; 1.02x on both GPUs).
     assert cfg.pf == 4
-    assert cfg.kernel_key == "decode:t64_p2_fused_r3_q4_pf4"
+    # Round 6 continuation 7 (lever PI-W): during the last ``pf`` stages of a work item the load warp also prefetches the
+    # NEXT item's first W / SFW tiles into L2 (``_pi2``; 2 work items per CTA on this row).
+    assert cfg.pfi == 2
+    assert cfg.kernel_key == "decode:t64_p2_fused_r3_q4_pf4_pi2"
     # 16-token tiles cannot keep eight 4-lane groups busy per stage: the table's 4 lanes widen to 8, coupled staging.
     # Round 5: the 24-tile M = 256 row moves to a 4-CTA cluster split-K route (each CTA owns a quarter of K, FP32 partials
     # are exchanged through distributed shared memory in one round); the small dedicated inbox is used (no aliasing).
