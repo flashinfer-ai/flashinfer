@@ -64,8 +64,8 @@ constexpr int32_t kShrinkDecodeSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DEC
 constexpr int32_t kShrinkPrefillSmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL;
 constexpr int32_t kExpandT64SmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64;
 constexpr int32_t kExpandT128SmemBytes = CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128;
-static_assert(kShrinkDecodeSmemBytes == 221696, "decode shrink smem layout changed");
-static_assert(kShrinkPrefillSmemBytes == 36992, "prefill shrink smem layout changed");
+static_assert(kShrinkDecodeSmemBytes == 221824, "decode shrink smem layout changed");
+static_assert(kShrinkPrefillSmemBytes == 37120, "prefill shrink smem layout changed");
 static_assert(kRank % kRankTile == 0, "rank must be a multiple of the 8-row shrink tile");
 // Token->pair route index published by the shrink kernels and consumed by the
 // expand kernels for arbitrary pair order (u32 words): a 4-word header (launch
@@ -75,6 +75,13 @@ static_assert(kRank % kRankTile == 0, "rank must be a multiple of the 8-row shri
 constexpr int32_t kRouteIndexMaxRoutes = 16;
 constexpr int32_t kRouteIndexHeaderWords = 4;
 constexpr int32_t kRouteIndexWordsPerToken = 3 + kRouteIndexMaxRoutes;
+// Hidden-split shrink workspace appended to the route index (see
+// flashinfer/jit/cake_bgmv_moe.py): FP32 partials [split][pair][64] as raw
+// 32-bit words, then one arrival counter per (pair block, rank block).
+constexpr int32_t kShrinkSplitMax = 8;
+constexpr int32_t kShrinkSplitMaxPairs = 128;
+constexpr int32_t kShrinkSplitPartialWords = kShrinkSplitMax * kShrinkSplitMaxPairs * 64;
+constexpr int32_t kShrinkSplitCounterWords = kShrinkSplitMaxPairs * (64 / kRankTile);
 
 enum class Schedule : int32_t {
   kTokenOwnedT64 = 0,
@@ -129,7 +136,8 @@ inline void CheckCompact(const TensorView& tensor, const char* name) {
 void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lora_a,
          TensorView lora_b, TensorView sorted_token_ids, TensorView expert_ids,
          TensorView lora_indices, TensorView topk_weights, TensorView route_index,
-         int64_t schedule_value, int64_t cuda_stream) {
+         int64_t schedule_value, int64_t shrink_decode, int64_t shrink_splits,
+         int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(x);
   const int32_t device_id = x.device().device_id;
@@ -203,11 +211,14 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CheckCompact(lora_indices, "lora_indices");
   CheckCompact(topk_weights, "topk_weights");
   CheckCompact(route_index, "route_index");
-  TVM_FFI_ICHECK(route_index.ndim() == 1 &&
-                 route_index.size(0) >= kRouteIndexHeaderWords + static_cast<int64_t>(num_tokens) *
-                                                                     kRouteIndexWordsPerToken)
+  const int64_t route_words =
+      kRouteIndexHeaderWords + static_cast<int64_t>(num_tokens) * kRouteIndexWordsPerToken;
+  TVM_FFI_ICHECK(route_index.ndim() == 1 && route_index.size(0) >= route_words +
+                                                                       kShrinkSplitPartialWords +
+                                                                       kShrinkSplitCounterWords)
       << "route_index must hold at least " << kRouteIndexHeaderWords << " + num_tokens * "
-      << kRouteIndexWordsPerToken << " int32 words";
+      << kRouteIndexWordsPerToken << " + " << (kShrinkSplitPartialWords + kShrinkSplitCounterWords)
+      << " int32 words";
 
   TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kTokenOwnedT64) &&
                  schedule_value <= static_cast<int64_t>(Schedule::kTokenOwned))
@@ -229,19 +240,33 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   constexpr int32_t kRouteAdvance = 1;
 
   const int32_t num_tiles = (hidden + kShrinkTileElements - 1) / kShrinkTileElements;
+  TVM_FFI_ICHECK(shrink_splits >= 1 && shrink_splits <= kShrinkSplitMax &&
+                 shrink_splits <= num_tiles)
+      << "shrink_splits must be in [1, min(" << kShrinkSplitMax << ", num_tiles=" << num_tiles
+      << ")], got " << shrink_splits;
+  TVM_FFI_ICHECK(shrink_splits == 1 || num_pairs <= kShrinkSplitMaxPairs)
+      << "hidden-split shrink supports at most " << kShrinkSplitMaxPairs << " pairs, got "
+      << num_pairs;
+  TVM_FFI_ICHECK(shrink_decode == 0 || num_pairs <= 32)
+      << "the decode shrink kernel supports at most 32 pairs, got " << num_pairs;
+  const int32_t splits = static_cast<int32_t>(shrink_splits);
+  auto* split_partials = reinterpret_cast<float*>(route_ptr + route_words);
+  auto* split_counters = route_ptr + route_words + kShrinkSplitPartialWords;
   const dim3 shrink_block(kShrinkThreads, 1, 1);
-  if (num_pairs <= 32) {
+  if (shrink_decode != 0) {
     const dim3 shrink_grid(
         (num_pairs + kShrinkDecodePairsPerBlock - 1) / kShrinkDecodePairsPerBlock,
-        kRank / kRankTile, 1);
+        kRank / kRankTile, splits);
     CAKE_BGMV_MOE_SHRINK_DECODE<<<shrink_grid, shrink_block, kShrinkDecodeSmemBytes, stream>>>(
         shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
-        num_tokens, route_ptr, kRouteBuild, hidden, num_tiles);
+        num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
+        splits);
   } else {
-    const dim3 shrink_grid(num_pairs, kRank / kRankTile, 1);
+    const dim3 shrink_grid(num_pairs, kRank / kRankTile, splits);
     CAKE_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes, stream>>>(
         shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
-        num_tokens, route_ptr, kRouteBuild, hidden, num_tiles);
+        num_tokens, route_ptr, kRouteBuild, hidden, num_tiles, split_partials, split_counters,
+        splits);
   }
   CheckCuda(cudaGetLastError(), "Cake BGMV MoE generic shrink launch");
 

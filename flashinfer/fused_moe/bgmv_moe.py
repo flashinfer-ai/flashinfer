@@ -343,9 +343,13 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         topk_weights: torch.Tensor,
         schedule_id: int,
         variant: CakeBGMVMoEVariant = "specialized",
+        shrink_launch: Optional[Tuple[int, int]] = None,
     ) -> None:
         self._module = module
         self.variant: CakeBGMVMoEVariant = variant
+        # Generic variant only: (decode kernel flag, hidden splits) chosen at
+        # prepare time by ``select_cake_bgmv_moe_generic_shrink``.
+        self.shrink_launch: Optional[Tuple[int, int]] = shrink_launch
         self.lora_a = lora_a
         self.lora_b = lora_b
         self.sorted_token_ids = sorted_token_ids
@@ -356,9 +360,11 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         from ..jit.cake_bgmv_moe import cake_bgmv_moe_route_index_numel
 
         # Token->pair route index: published by the shrink kernels and read by
-        # the expand kernels (arbitrary pair order in O(1) per CTA). Pointer-
-        # stable and zero-initialized once; counts are monotonic with
-        # launch-parity bases, so graph replays never need a memset node.
+        # the expand kernels (arbitrary pair order in O(1) per CTA), followed by
+        # the generic shrink's hidden-split partials and arrival counters.
+        # Pointer-stable and zero-initialized once; counts are monotonic with
+        # launch-parity bases and the split counters are reset by their last
+        # arrival, so graph replays never need a memset node.
         self.route_index = torch.zeros(
             cake_bgmv_moe_route_index_numel(int(x.shape[0])),
             dtype=torch.int32,
@@ -383,7 +389,7 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         )
 
     def _launch(self) -> None:
-        self._module.run(
+        args = [
             self.y_accum,
             self.shrink_out,
             self.x,
@@ -395,8 +401,12 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
             self.topk_weights,
             self.route_index,
             self.schedule_id,
-            int(torch.cuda.current_stream(self.x.device).cuda_stream),
-        )
+        ]
+        if self.variant == "generic":
+            assert self.shrink_launch is not None
+            args.extend(self.shrink_launch)
+        args.append(int(torch.cuda.current_stream(self.x.device).cuda_stream))
+        self._module.run(*args)
 
 
 class BGMVMoEPortablePlan(_BGMVMoEGraphPlan):
@@ -593,7 +603,10 @@ def prepare_bgmv_moe(
     kernels read in O(1) per CTA (``plan.route_index``, 16 slots per token;
     tokens routed to more pairs take an exact serial scan). Pairs already in
     their contiguous position are implicit, so a contiguous launch publishes
-    nothing.
+    nothing. At small pair counts the generic shrink also splits the hidden
+    dimension over extra CTAs (``plan.shrink_launch``) and the last CTA of each
+    output tile reduces the FP32 partials in split order, so the result stays
+    deterministic and the workspace is never reset.
 
     Inputs outside that support set (other device capabilities, ranks, hidden
     sizes that are not multiples of 8, multiple slices) are served by a
@@ -791,6 +804,7 @@ def prepare_bgmv_moe(
         get_cake_bgmv_moe_generic_module,
         get_cake_bgmv_moe_module,
         select_cake_bgmv_moe_generic_schedule,
+        select_cake_bgmv_moe_generic_shrink,
         select_cake_bgmv_moe_schedule,
     )
 
@@ -799,6 +813,7 @@ def prepare_bgmv_moe(
     variant = cake_bgmv_moe_variant(hidden_size, rank)
     assert variant is not None
     schedule_id: int
+    shrink_launch: Optional[Tuple[int, int]] = None
     if variant == "specialized":
         schedule = select_cake_bgmv_moe_schedule(hidden_size, num_tokens, arch)
         schedule_id = CAKE_BGMV_MOE_SCHEDULE_IDS[schedule]
@@ -808,6 +823,9 @@ def prepare_bgmv_moe(
             hidden_size, num_tokens, arch
         )
         schedule_id = CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS[generic_schedule]
+        shrink_launch = select_cake_bgmv_moe_generic_shrink(
+            int(sorted_token_ids.shape[0]), rank, hidden_size
+        )
         module = get_cake_bgmv_moe_generic_module(rank, dtype_name, arch)
     return BGMVMoECakePlan(
         module,
@@ -822,6 +840,7 @@ def prepare_bgmv_moe(
         topk_weights=topk_weights,
         schedule_id=schedule_id,
         variant=variant,
+        shrink_launch=shrink_launch,
     )
 
 

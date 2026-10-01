@@ -112,7 +112,9 @@ SM103 devices the generated Cake programs serve one LoRA slice with rank 8, 16,
 ``plan.variant == "generic"``); the output has one owner per token, so replays
 are bitwise reproducible. Arbitrary pair order (for example expert-sorted
 dispatch) is served through a token->pair route index that the shrink kernels
-publish and the expand kernels read in O(1) per CTA. Other inputs fall back to the portable
+publish and the expand kernels read in O(1) per CTA; the generic shrink splits the hidden
+dimension over extra CTAs at small pair counts and reduces the partials in a fixed order.
+Other inputs fall back to the portable
 ``bgmv_moe_shrink`` / ``bgmv_moe_expand`` kernels (``plan.backend_used ==
 "portable"``) unless ``fallback=False`` is passed.
 

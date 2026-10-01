@@ -261,8 +261,8 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
     for symbol in metadata[1:]:
         assert symbol in body
     for macro in (
-        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE 221696",
-        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL 36992",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE 221824",
+        "CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL 37120",
         "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64 ",
         "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128 ",
     ):
@@ -331,8 +331,15 @@ def test_route_index_workspace_sizing():
     assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES == 16
     assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_HEADER_WORDS == 4
     assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN == 19
-    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(1) == 4 + 19
-    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(4096) == 4 + 4096 * 19
+    split_words = 8 * 128 * 64 + 128 * 8
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SHRINK_SPLIT_MAX == 8
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS == 128
+    assert cake_bgmv_moe.cake_bgmv_moe_route_index_words(1) == 4 + 19
+    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(1) == 4 + 19 + split_words
+    assert (
+        cake_bgmv_moe.cake_bgmv_moe_route_index_numel(4096)
+        == 4 + 4096 * 19 + split_words
+    )
     for hidden in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES:
         body = (
             cake_bgmv_moe._get_csrc_dir() / f"cake_bgmv_moe_bf16_h{hidden}.cu"
@@ -340,3 +347,33 @@ def test_route_index_workspace_sizing():
         assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_T64 " in body
         assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_TOKEN " in body
         assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_DUAL " in body
+
+
+@pytest.mark.parametrize(
+    ("num_pairs", "rank", "hidden_size", "expected"),
+    [
+        # 16 tokens x top-k 2 at hidden 7168: decode grid 8 x 4 over 7 tiles -> 4 splits
+        (32, 32, 7168, (1, 4)),
+        # rank 8 at 32 pairs: decode grid too small -> 1-pair kernel, 7 splits
+        (32, 8, 7168, (0, 7)),
+        # 4 tokens at hidden 5888: 1-pair kernel, all 6 tiles split
+        (8, 32, 5888, (0, 6)),
+        # hidden 736 has one tile: no split possible
+        (8, 64, 736, (0, 1)),
+        # wide prefill grids never split
+        (8192, 32, 3072, (0, 1)),
+        (256, 64, 4096, (0, 1)),
+    ],
+)
+def test_generic_shrink_launch_selection(num_pairs, rank, hidden_size, expected):
+    assert (
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(num_pairs, rank, hidden_size)
+        == expected
+    )
+
+
+def test_generic_shrink_launch_selection_rejects_bad_inputs():
+    with pytest.raises(ValueError):
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(0, 32, 3072)
+    with pytest.raises(ValueError):
+        cake_bgmv_moe.select_cake_bgmv_moe_generic_shrink(8, 24, 3072)

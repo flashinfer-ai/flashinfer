@@ -69,12 +69,78 @@ CAKE_BGMV_MOE_ROUTE_INDEX_HEADER_WORDS = 4
 CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN = 3 + CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES
 
 
-def cake_bgmv_moe_route_index_numel(num_tokens: int) -> int:
-    """int32 elements of the route-index workspace for ``num_tokens``."""
+# Hidden-split shrink workspace appended to the route index: FP32 partials
+# ``[split][pair][64]`` (sized for rank 64, stored as raw 32-bit words) and one
+# arrival counter per (pair block, rank block). The generic shrink kernels
+# split the hidden tiles over grid z when the pair x rank-block grid is small;
+# the last arrival reduces the partials in split order (deterministic) and
+# resets its counter, so the zeroed workspace is never memset again.
+CAKE_BGMV_MOE_SHRINK_RANK_TILE = 8
+CAKE_BGMV_MOE_SHRINK_TILE = 1024
+CAKE_BGMV_MOE_SHRINK_SPLIT_MAX = 8
+CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS = 128
+CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS = 256
+CAKE_BGMV_MOE_SHRINK_SPLIT_PARTIAL_WORDS = (
+    CAKE_BGMV_MOE_SHRINK_SPLIT_MAX * CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS * 64
+)
+CAKE_BGMV_MOE_SHRINK_SPLIT_COUNTER_WORDS = CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS * (
+    64 // CAKE_BGMV_MOE_SHRINK_RANK_TILE
+)
+
+
+def cake_bgmv_moe_route_index_words(num_tokens: int) -> int:
+    """int32 words of the route index proper (header + per-token entries)."""
 
     return CAKE_BGMV_MOE_ROUTE_INDEX_HEADER_WORDS + (
         int(num_tokens) * CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN
     )
+
+
+def cake_bgmv_moe_route_index_numel(num_tokens: int) -> int:
+    """int32 elements of the plan workspace (route index + hidden-split region)."""
+
+    return (
+        cake_bgmv_moe_route_index_words(num_tokens)
+        + CAKE_BGMV_MOE_SHRINK_SPLIT_PARTIAL_WORDS
+        + CAKE_BGMV_MOE_SHRINK_SPLIT_COUNTER_WORDS
+    )
+
+
+def select_cake_bgmv_moe_generic_shrink(
+    num_pairs: int, rank: int, hidden_size: int
+) -> Tuple[int, int]:
+    """(decode kernel flag, hidden splits) for the generic shrink launch.
+
+    Mirrors the Cake generator's ``select_generic_shrink_launch``: the decode
+    kernel (4 pairs per CTA) is used for at most 32 pairs when its pair x
+    rank-block grid, split over the hidden tiles, still fills half of
+    ``CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS``; otherwise the 1-pair kernel.
+    Splits raise the CTA count toward the target for small pair counts,
+    bounded by the tile count and ``CAKE_BGMV_MOE_SHRINK_SPLIT_MAX``.
+    """
+
+    if num_pairs <= 0:
+        raise ValueError(f"num_pairs must be positive, got {num_pairs}")
+    if rank not in CAKE_BGMV_MOE_GENERIC_RANKS:
+        raise ValueError(
+            f"rank must be one of {CAKE_BGMV_MOE_GENERIC_RANKS}, got {rank}"
+        )
+    tiles = (hidden_size + CAKE_BGMV_MOE_SHRINK_TILE - 1) // CAKE_BGMV_MOE_SHRINK_TILE
+    rank_blocks = rank // CAKE_BGMV_MOE_SHRINK_RANK_TILE
+    max_splits = (
+        min(tiles, CAKE_BGMV_MOE_SHRINK_SPLIT_MAX)
+        if num_pairs <= CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS
+        else 1
+    )
+    decode_ctas = ((num_pairs + 3) // 4) * rank_blocks
+    decode = (
+        num_pairs <= 32
+        and decode_ctas * max_splits >= CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS // 2
+    )
+    ctas = decode_ctas if decode else num_pairs * rank_blocks
+    target = CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS
+    splits = min(max_splits, max(1, (target + ctas - 1) // ctas))
+    return int(decode), splits
 
 
 CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS: dict[CakeBGMVMoEGenericSchedule, int] = {
@@ -511,6 +577,8 @@ __all__ = [
     "CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES",
     "CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN",
     "CAKE_BGMV_MOE_SCHEDULE_IDS",
+    "CAKE_BGMV_MOE_SHRINK_SPLIT_MAX",
+    "CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS",
     "CakeBGMVMoEArch",
     "CakeBGMVMoEArchTarget",
     "CakeBGMVMoEDType",
@@ -521,6 +589,7 @@ __all__ = [
     "CakeBGMVMoEVariant",
     "cake_bgmv_moe_arch_for_capability",
     "cake_bgmv_moe_route_index_numel",
+    "cake_bgmv_moe_route_index_words",
     "cake_bgmv_moe_variant",
     "gen_cake_bgmv_moe_generic_module",
     "gen_cake_bgmv_moe_module",
@@ -528,6 +597,7 @@ __all__ = [
     "get_cake_bgmv_moe_generic_uri",
     "get_cake_bgmv_moe_module",
     "get_cake_bgmv_moe_uri",
+    "select_cake_bgmv_moe_generic_shrink",
     "load_cake_bgmv_moe_generic_module",
     "load_cake_bgmv_moe_module",
     "select_cake_bgmv_moe_generic_schedule",
