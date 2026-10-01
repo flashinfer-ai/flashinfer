@@ -815,7 +815,9 @@ def offset_gather_kv_indices(
     The result
     addresses the packed ``kv_*`` tensors; invalid slots become ``-1``.  A
     zero-length query segment contributes no rows.  Runs on device without a
-    host synchronization.
+    host synchronization, in int32 throughout (the ``[T, topk]`` temporaries
+    are the dominant cost of the varlen entry: int64 copies of the index row
+    tripled its traffic).
     """
     if gather_kv_indices.ndim != 2 or gather_kv_indices.dtype != torch.int32:
         raise ValueError("gather_kv_indices must be an int32 [T, topk] tensor")
@@ -829,26 +831,28 @@ def offset_gather_kv_indices(
     total_q = int(gather_kv_indices.shape[0])
     num_docs = int(cu_seqlens_q.numel()) - 1
     device = gather_kv_indices.device
-    seqlens_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).to(torch.int64)
+    # per-row document data: [T]-sized, int32 like cu_seqlens (key rows and positions fit int32)
+    seqlens_q = cu_seqlens_q[1:] - cu_seqlens_q[:-1]
     doc_of_row = torch.repeat_interleave(
-        torch.arange(num_docs, device=device), seqlens_q, output_size=total_q
+        torch.arange(num_docs, device=device),
+        seqlens_q.to(torch.int64),
+        output_size=total_q,
     )
-    key_base = cu_seqlens_k[:-1].to(torch.int64)[doc_of_row][:, None]
-    key_len = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).to(torch.int64)[doc_of_row][
-        :, None
-    ]
-    local = gather_kv_indices.to(torch.int64)
-    valid = (local >= 0) & (local < key_len)
+    key_base = cu_seqlens_k[:-1][doc_of_row][:, None]
+    key_len = (cu_seqlens_k[1:] - cu_seqlens_k[:-1])[doc_of_row][:, None]
+    local = gather_kv_indices
+    # [T, topk] passes: three int32 compares into one bool mask, one int32 add, one masked fill
+    valid = local >= 0
+    valid &= local < key_len
     if causal:
         # Own key position of row t: (seqlen_k[d] - seqlen_q[d]) + (t - cu_seqlens_q[d]).
-        query_base = cu_seqlens_q[:-1].to(torch.int64)[doc_of_row]
         own_position = (key_len[:, 0] - seqlens_q[doc_of_row]) + (
-            torch.arange(total_q, device=device, dtype=torch.int64) - query_base
+            torch.arange(total_q, device=device, dtype=torch.int32)
+            - cu_seqlens_q[:-1][doc_of_row]
         )
         valid &= local <= own_position[:, None]
-    result = torch.where(valid, local + key_base, torch.full_like(local, -1)).to(
-        torch.int32
-    )
+    result = local + key_base  # invalid slots hold arbitrary sums until the fill below
+    result.masked_fill_(~valid, -1)
     if out is None:
         return result
     out.copy_(result)
