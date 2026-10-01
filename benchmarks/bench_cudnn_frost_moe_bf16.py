@@ -662,7 +662,7 @@ def export(args, file):
             for index, (name, cta, mode) in enumerate(pool):
                 if index % args.num_shards != args.shard_index:
                     continue
-                identity = f"sm{major}{minor}_{op}_e{e}_n{n}_k{k}_{name}_{mode}_{revision[:12]}"
+                identity = f"sm{major}{minor}_cudnn_frost_{op}_e{e}_n{n}_k{k}_{name}_{mode}_{revision[:12]}"
                 if identity in existing or identity in failed or args.catalog_only:
                     continue
                 opts = argparse.Namespace(

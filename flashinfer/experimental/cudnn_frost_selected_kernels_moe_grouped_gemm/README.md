@@ -801,8 +801,8 @@ SM100. The template addresses tokens by coordinate on one global TMA descriptor
 and stores through STG, so it patches no tensormap: the workspace is one
 128-byte scheduler-counter slot. There is no swap-AB orientation, CTA pair,
 cluster or TMA-store variant. Its families sit next to the SM100 ones as
-`cudnn_frost_sm120_*_bf16_normal_stg.py`, and its artifact ids start with
-`sm120_`; manifest and shortlist records carry `arch: sm_120a`.
+`sm120_cudnn_frost_*_bf16_normal_stg.py`, and its artifact ids start with
+`sm120_cudnn_frost_`; manifest and shortlist records carry `arch: sm_120a`.
 
 The sources are exported from cuDNN Frontend `c132d859`. Its SM120 host zeroes
 the scheduler counter with a one-thread kernel before the PDL main launch, as
@@ -937,10 +937,11 @@ Device function bodies are retained; cuDNN Frost imports and its secondary compi
 cache are removed, as are inlined helper definitions the kernel never reaches
 (shared Frost helper modules also carry other pipelines' wrappers, such as
 SM100 `tcgen05` for an SM120 kernel). Kernel names lead with the target
-architecture: a family is `cudnn_frost_<arch>_<op>_<dtype>_<orientation>_<store>.py`
-and a default artifact id starts `<arch>_<op>_` (e.g. `sm120_grouped_gemm2_...`),
-followed by the geometry, tile and store mode, including `swapAB` for swapped
-configurations. `select` verifies source hashes and refuses to replace different bytes.
+architecture: a family is `<arch>_cudnn_frost_<op>_<dtype>_<orientation>_<store>.py`
+and a default artifact id starts `<arch>_cudnn_frost_<op>_` (e.g.
+`sm120_cudnn_frost_grouped_gemm2_...`), followed by the geometry, tile and
+store mode, including `swapAB` for swapped configurations. `select` verifies
+source hashes and refuses to replace different bytes.
 
 `tests/experimental/test_cudnn_frost_selected_kernels.py` focuses on the complete
 **cuDNN Frost FC1 + SwiGLU -> cuDNN Frost FC2 -> finalize** path: every compound tactic on

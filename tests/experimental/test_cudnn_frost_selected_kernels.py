@@ -767,10 +767,10 @@ def test_bf16_sm120_sources_roundtrip_without_cudnn(monkeypatch):
         entry = record["source"]
         template = (root / entry["path"]).read_text()
         families.setdefault(record["op"], set()).add(entry["path"])
-        # Kernel names lead with the architecture.
-        assert record["id"].startswith(f"sm120_{record['op']}_")
+        # Kernel names are sm120_cudnn_frost_<op>...
+        assert record["id"].startswith(f"sm120_cudnn_frost_{record['op']}_")
         assert entry["path"] == (
-            f"sources/cudnn_frost_sm120_{record['op']}_bf16_normal_stg.py"
+            f"sources/sm120_cudnn_frost_{record['op']}_bf16_normal_stg.py"
         )
         # Explicit G+1 group boundaries: no final endpoint inferred from S.
         assert record["abi"] == f"cudnn_frost_{record['op']}_v2"

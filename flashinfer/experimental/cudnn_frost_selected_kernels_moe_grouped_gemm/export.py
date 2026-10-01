@@ -26,7 +26,7 @@ def _slug(value: str) -> str:
 
 
 def arch_tag(arch: str) -> str:
-    """Name prefix of an export target, e.g. ``sm_120a`` -> ``sm120``."""
+    """Leading name component of an export target, e.g. ``sm_120a`` -> ``sm120``."""
     match = re.fullmatch(r"sm_(\d+)[af]?", arch)
     if match is None:
         raise ValueError(f"unsupported export architecture {arch!r}")
@@ -408,7 +408,7 @@ def _export_source(
     # One maintained implementation per family. A producer upgrade replaces the
     # family explicitly; it must not silently add another historical template.
     name = _slug(artifact_id if template_family is None else template_family)
-    if not name.startswith("cudnn_frost_"):
+    if "cudnn_frost_" not in name:
         name = f"cudnn_frost_{name}"
     path = output_dir / "sources" / f"{name}.py"
     record: dict[str, Any] = {
@@ -558,11 +558,11 @@ def _export_compiled(args, compiled, config, arch):
         )
     template = _select_template(compiled.chain, config, args.cta_group, args.scheduler)
     prefix = op if dtype == "bf16" else f"block_scale_{op}"
-    # Kernel names lead with the target architecture (sm107_..., sm120_...):
-    # every architecture's families share one dtype directory.
-    target = arch_tag(arch)
+    # Kernel names are <arch>_cudnn_frost_<op>...: every architecture's
+    # families share one dtype directory.
+    producer = f"{arch_tag(arch)}_cudnn_frost"
     artifact_id = args.id or _slug(
-        f"{target}_{prefix}_e{args.experts}_n{args.n}_k{args.k}_"
+        f"{producer}_{prefix}_e{args.experts}_n{args.n}_k{args.k}_"
         f"g{args.groups}_{config.name}_{args.cta_group}cta_{args.scheduler}_"
         f"{actual_store_mode}{'_quantized' if quantize_output else ''}"
     )
@@ -572,7 +572,7 @@ def _export_compiled(args, compiled, config, arch):
         output_dir,
         artifact_id,
         replace=args.replace,
-        template_family=f"{target}_{op}{'_quantized' if quantize_output else ''}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
+        template_family=f"{producer}_{op}{'_quantized' if quantize_output else ''}_{dtype}_{'swap_ab' if swap_ab else 'normal'}_{actual_store_mode}",
         swap_ab=swap_ab,
     )
     tma_slots: frozenset[int] = getattr(compiled, "tma_slots", frozenset())
