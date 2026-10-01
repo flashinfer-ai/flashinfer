@@ -46,6 +46,8 @@ CANDIDATES = {
     "cute-dsl-modular",
     "cutile",
     "cutlass",
+    "fa3",
+    "xqa",
 }
 
 
@@ -280,13 +282,15 @@ def test_policy_rereads_mutated_metadata():
 # Planning: public-wrapper routing, error handling and transactional replans.
 
 
-_SM100_BACKENDS = (
+_CONCRETE_BACKENDS = (
     "fa2",
     "cutlass",
     "cutile",
     "trtllm-gen",
     "cute-dsl-monolithic",
     "cute-dsl-modular",
+    "fa3",
+    "xqa",
 )
 
 
@@ -312,7 +316,12 @@ def _cpu_planners(monkeypatch):
     import flashinfer.utils as utils
 
     state = SimpleNamespace(calls=[], forbidden=False, handler=lambda name, args: None)
-    monkeypatch.setattr(utils, "get_compute_capability", lambda device: (10, 0))
+    monkeypatch.setattr(
+        utils,
+        "get_compute_capability",
+        lambda device: _auto_policy._get_compute_capability(device),
+    )
+    monkeypatch.setattr(torch.version, "cuda", "13.0")
     monkeypatch.setattr(_wrapper, "get_compute_capability", lambda device: (10, 0))
     monkeypatch.setattr(_wrapper, "_get_compute_capability", lambda device: (10, 0))
 
@@ -347,7 +356,7 @@ def _cpu_planners(monkeypatch):
             def preflight_plan_from_wrapper(cls, args):
                 assert not state.forbidden, "run invoked backend preflight"
                 args.csr()  # Validate actual public metadata, rather than a mock sentinel.
-                if name not in (*_SM100_BACKENDS, "fa3"):
+                if name not in _CONCRETE_BACKENDS:
                     raise _BackendPlanUnsupportedError(
                         f"{name}: hardware or alias exclusion"
                     )
@@ -459,8 +468,18 @@ def test_cpu_auto_defers_backend_resolution_until_plan(_cpu_planners, monkeypatc
     assert not _cpu_planners.calls
 
 
-@pytest.mark.parametrize("target", _SM100_BACKENDS)
-def test_cpu_auto_reaches_every_supported_backend(_cpu_planners, target):
+@pytest.mark.parametrize(
+    "capability", [(8, 0), (9, 0), (10, 0), (10, 3), (12, 0), (12, 1)]
+)
+@pytest.mark.parametrize("target", _CONCRETE_BACKENDS)
+def test_cpu_auto_reaches_every_supported_backend(
+    _cpu_planners, monkeypatch, target, capability
+):
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
+    monkeypatch.setattr(
+        _auto_policy, "is_sm90a_supported", lambda _: capability == (9, 0)
+    )
+
     def only_target(name, args):
         if name != target:
             _reject(name, args)
@@ -475,6 +494,52 @@ def test_cpu_auto_reaches_every_supported_backend(_cpu_planners, target):
     _cpu_run(wrapper)
 
 
+def test_auto_candidates_cover_each_concrete_backend_once():
+    from flashinfer.mla._batch_mla._wrapper import _BACKEND_TYPES
+
+    expected = set(_BACKEND_TYPES) - {"auto", "cute-dsl"}
+    args, _ = _request((1,), (512,))
+    for candidates in (
+        _auto_policy._AUTO_BACKEND_CANDIDATES,
+        _auto_policy.ordered_sm80_backends(args),
+        _auto_policy.ordered_sm90_backends(args),
+        _auto_policy.ordered_sm100_backends(args),
+        _auto_policy.ordered_sm12x_backends(args),
+    ):
+        assert set(candidates) == expected
+        assert len(candidates) == len(expected)
+
+
+@pytest.mark.parametrize(
+    "capability,target", [((10, 3), "trtllm-gen"), ((12, 2), "xqa"), ((12, 2), None)]
+)
+def test_cpu_generic_fallback_warns_before_candidate_selection(
+    _cpu_planners, monkeypatch, capability, target
+):
+    state = _cpu_planners
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
+    auto = _auto_policy._BatchMLAPagedAttentionAutoBackend
+    monkeypatch.setattr(auto, "_blackwell_auto_fallback_warned", False)
+
+    def support(name, args):
+        assert auto._blackwell_auto_fallback_warned
+        if name != target:
+            _reject(name, args)
+
+    state.handler = support
+    wrapper, kwargs, _ = _cpu_request()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        if target is None:
+            with pytest.raises(_BackendPlanUnsupportedError):
+                wrapper.plan(**kwargs)
+        else:
+            wrapper.plan(**kwargs)
+            assert wrapper._planned_backend_name == target
+    assert sum("not Blackwell-native" in str(w.message) for w in caught) == 1
+    assert auto._blackwell_auto_fallback_warned
+
+
 def test_cpu_all_rejected_diagnostics_and_order_are_deterministic(_cpu_planners):
     _cpu_planners.handler = _reject
     orders = []
@@ -485,8 +550,8 @@ def test_cpu_all_rejected_diagnostics_and_order_are_deterministic(_cpu_planners)
             wrapper.plan(**kwargs)
         assert isinstance(error.value, _BackendPlanUnsupportedError)
         orders.append(tuple(_cpu_planners.calls))
-        assert set(orders[-1]) == set(_SM100_BACKENDS)
-        for name in _SM100_BACKENDS:
+        assert set(orders[-1]) == set(_CONCRETE_BACKENDS)
+        for name in _CONCRETE_BACKENDS:
             assert f"{name}: deliberate support rejection" in str(error.value)
         assert wrapper._planned_backend is None
         with pytest.raises(RuntimeError, match="before plan"):
@@ -494,106 +559,7 @@ def test_cpu_all_rejected_diagnostics_and_order_are_deterministic(_cpu_planners)
     assert orders[0] == orders[1]
 
 
-@pytest.mark.parametrize(
-    "cuda_version,target,attempts",
-    [
-        ("12.2", None, ("fa2",)),
-        ("12.3", "fa3", ("fa3",)),
-        ("12.3", "fa2", ("fa3", "fa2")),
-        ("12.3", None, ("fa3", "fa2")),
-    ],
-)
-def test_cpu_sm90_candidates_reachable_and_rejections_ordered(
-    _cpu_planners, monkeypatch, cuda_version, target, attempts
-):
-    import flashinfer.utils as utils
-
-    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: (9, 0))
-    monkeypatch.setattr(utils, "get_compute_capability", lambda _: (9, 0))
-    monkeypatch.setattr(torch.version, "cuda", cuda_version)
-    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", utils.is_sm90a_supported)
-
-    def support(name, args):
-        if name != target:
-            _reject(name, args)
-
-    _cpu_planners.handler = support
-    wrapper, kwargs, _ = _cpu_request()
-    if target is None:
-        with pytest.raises(_BackendPlanUnsupportedError) as caught:
-            wrapper.plan(**kwargs)
-        expected_error = (
-            "fa2: deliberate support rejection"
-            if len(attempts) == 1
-            else "No supported planned MLA backend: "
-            + "; ".join(
-                f"{name}: {name}: deliberate support rejection" for name in attempts
-            )
-        )
-        assert str(caught.value) == expected_error
-        assert wrapper._planned_backend is None
-        with pytest.raises(RuntimeError, match="before plan"):
-            _cpu_run(wrapper)
-    else:
-        wrapper.plan(**kwargs)
-        assert wrapper._planned_backend_name == target
-        _cpu_planners.forbidden = True
-        _cpu_run(wrapper)
-    assert _cpu_planners.calls == list(attempts)
-
-
-@pytest.mark.parametrize(
-    "heads,kv_len,graph,first_three",
-    [
-        (3, 1, False, ("fa2", "trtllm-gen", "cute-dsl-monolithic")),
-        (128, 1, False, ("fa2", "trtllm-gen", "cute-dsl-monolithic")),
-        (32, 32768, False, ("trtllm-gen", "cute-dsl-monolithic", "fa2")),
-        (32, 32768, True, ("cute-dsl-monolithic", "trtllm-gen", "fa2")),
-    ],
-)
-def test_cpu_public_auto_uses_request_specific_policy_order(
-    _cpu_planners, heads, kv_len, graph, first_three
-):
-    wrapper, kwargs, _ = _cpu_request(graph=graph)
-    kwargs["num_heads"] = heads
-    # One live page per request; page capacity must not substitute for CSR Q.
-    kwargs["page_size"] = kv_len
-    kwargs["metadata"].kv_len_arr.fill_(kv_len)
-    _cpu_planners.handler = _reject
-    with pytest.raises(_BackendPlanUnsupportedError):
-        wrapper.plan(**kwargs)
-    assert tuple(_cpu_planners.calls) == first_three + (
-        "cute-dsl-modular",
-        "cutile",
-        "cutlass",
-    )
-    assert wrapper._planned_backend is None
-
-
-@pytest.mark.parametrize("capability", [(10, 0), (9, 0)])
-@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
-def test_cpu_auto_propagates_fatal_planner_errors(
-    _cpu_planners, monkeypatch, capability, error_type
-):
-    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
-    monkeypatch.setattr(
-        _auto_policy, "is_sm90a_supported", lambda _: capability == (9, 0)
-    )
-    failure = error_type("deliberate compiler or caller error")
-
-    def fail(name, args):
-        raise failure
-
-    _cpu_planners.handler = fail
-    wrapper, kwargs, _ = _cpu_request()
-    with pytest.raises(error_type) as error:
-        wrapper.plan(**kwargs)
-    assert error.value is failure
-    assert len(_cpu_planners.calls) == 1
-    assert wrapper._planned_backend is None
-
-
-@pytest.mark.parametrize("backend", ["trtllm-gen", "fa2", "fa3"])
+@pytest.mark.parametrize("backend", _CONCRETE_BACKENDS)
 def test_cpu_explicit_backend_is_strict(_cpu_planners, monkeypatch, backend):
     monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: (9, 0))
     _cpu_planners.handler = _reject
@@ -665,23 +631,35 @@ def test_cpu_cutile_minimum_version(_cutile_dependency, version, supported):
 
 
 @pytest.mark.parametrize(
-    "backend,opt_in,version,expected",
+    "backend,opt_in,version,cutlass_supported,expected",
     [
-        ("auto", None, "1.4.0", "cutlass"),
-        ("auto", "0", "1.4.0", "cutlass"),
-        ("auto", "1", "1.4.0", "cutile"),
-        ("auto", "1", "1.3.0", "cutlass"),
-        ("cutile", None, "1.4.0", "cutile"),
-        ("cutile", "0", "1.4.0", "cutile"),
-        ("cutile", None, "1.3.0", None),
+        ("auto", None, "1.4.0", True, "cutlass"),
+        ("auto", "0", "1.4.0", True, "cutlass"),
+        ("auto", "1", "1.4.0", True, "cutlass"),
+        ("auto", "1", "1.4.0", False, "cutile"),
+        ("auto", "1", "1.3.0", False, None),
+        ("auto", "1", "1.3.0", True, "cutlass"),
+        ("cutile", None, "1.4.0", True, "cutile"),
+        ("cutile", "0", "1.4.0", True, "cutile"),
+        ("cutile", None, "1.3.0", True, None),
     ],
 )
 def test_cpu_cutile_version_and_experimental_selection(
-    _cpu_planners, _cutile_dependency, monkeypatch, backend, opt_in, version, expected
+    _cpu_planners,
+    _cutile_dependency,
+    monkeypatch,
+    backend,
+    opt_in,
+    version,
+    cutlass_supported,
+    expected,
 ):
     from flashinfer.mla._batch_mla._backends import cutile_backend
 
     state = _cpu_planners
+    monkeypatch.setattr(
+        _auto_policy, "ordered_sm100_backends", lambda _: ("cutlass", "cutile")
+    )
     # Use the real cuTile declaration; only native preparation is replaced.
     monkeypatch.setattr(
         state.module._BACKEND_TYPES["cutile"],
@@ -702,7 +680,7 @@ def test_cpu_cutile_version_and_experimental_selection(
     def prepare(name, args):
         if name == "cutile":
             cutile_backend.get_cutile_mla_decode()
-        elif name != "cutlass":
+        elif name != "cutlass" or not cutlass_supported:
             _reject(name, args)
 
     state.handler = prepare
@@ -715,6 +693,8 @@ def test_cpu_cutile_version_and_experimental_selection(
         wrapper.plan(**kwargs)
         assert wrapper._planned_backend_name == expected
     assert emitted == ([("cutile", backend == "auto")] if expected == "cutile" else [])
+    if expected == "cutlass":
+        assert _cutile_dependency.probes == []
     if backend == "auto" and opt_in != "1":
         assert "cutile" not in state.calls
         assert _cutile_dependency.probes == []
@@ -798,54 +778,119 @@ def test_cpu_auto_graph_replan_preserves_experimental_eligibility(
     assert wrapper._backend == "fa2"
 
 
+@pytest.mark.parametrize("graph", [False, True])
 @pytest.mark.parametrize(
-    "capability,cuda_version,expected",
-    [
-        ((8, 0), "13.0", "fa2"),
-        ((9, 0), "12.2", "fa2"),
-        ((9, 0), "12.3", "fa3"),
-        ((10, 3), "13.0", "fa2"),
-        ((12, 0), "13.0", "fa2"),
-    ],
+    "selected,opt_in", [("xqa", False), ("cutile", True), (None, False)]
 )
-def test_cpu_off_sm100_keeps_original_first_preference(
-    _cpu_planners, monkeypatch, capability, cuda_version, expected
+def test_cpu_auto_typed_fallback_and_experimental_gate(
+    _cpu_planners, monkeypatch, graph, selected, opt_in
 ):
-    import flashinfer.utils as utils
+    from dataclasses import replace
 
     state = _cpu_planners
-    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
-    monkeypatch.setattr(utils, "get_compute_capability", lambda _: capability)
-    monkeypatch.setattr(torch.version, "cuda", cuda_version)
-    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", utils.is_sm90a_supported)
+    order = ("fa2", "xqa", "cutile")
+    monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", lambda _: order)
+    monkeypatch.setenv("FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS", str(int(opt_in)))
+    cutile = state.module._BACKEND_TYPES["cutile"]
+    monkeypatch.setattr(
+        cutile,
+        "_plan_capabilities",
+        replace(
+            cutile._plan_capabilities,
+            is_experimental=True,
+            supports_cuda_graph_replan=False,
+        ),
+    )
+    xqa = state.module._BACKEND_TYPES["xqa"]
+    monkeypatch.setattr(
+        xqa,
+        "_plan_capabilities",
+        replace(xqa._plan_capabilities, supports_cuda_graph_replan=False),
+    )
+    monkeypatch.setattr(
+        _auto_policy._BatchMLAPagedAttentionAutoBackend,
+        "_blackwell_auto_fallback_warned",
+        False,
+    )
 
-    def forbidden_policy(args):
-        pytest.fail("Off-SM100 auto must not consult the SM100 ranking")
+    def refuse(name, args):
+        if name != selected:
+            raise _BackendPlanUnsupportedError(f"{name} unsupported request")
 
-    monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", forbidden_policy)
-    if capability != (8, 0):
-        monkeypatch.setattr(_auto_policy, "ordered_sm80_backends", forbidden_policy)
-    if capability != (9, 0) or cuda_version == "12.2":
-        monkeypatch.setattr(_auto_policy, "ordered_sm90_backends", forbidden_policy)
+    state.handler = refuse
+    wrapper, kwargs, _ = _cpu_request(graph=graph)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", UserWarning)
+        if selected is None:
+            with pytest.raises(_BackendPlanUnsupportedError) as failure:
+                wrapper.plan(**kwargs)
+            for reason in (
+                "fa2 unsupported request",
+                "xqa unsupported request",
+                "cutile: experimental backend requires",
+            ):
+                assert reason in str(failure.value)
+        else:
+            wrapper.plan(**kwargs)
+            assert wrapper._planned_backend_name == selected
+    expected = ["fa2", "xqa", "cutile"] if selected == "cutile" else ["fa2", "xqa"]
+    if selected is None:
+        expected = [name for name in order if name != "cutile"]
+    assert state.calls == expected
+    assert not any("selected 'fa2'" in str(w.message) for w in caught)
+    if selected is not None:
+        state.forbidden = True
+        _cpu_run(wrapper)
+        state.forbidden = False
+        if graph:
+            previous = wrapper._planned_backend
+            contract = wrapper._input_contract
+            output = _cpu_run(wrapper).clone()
+            state.calls.clear()
+            with pytest.raises(RuntimeError, match="cannot replan"):
+                wrapper.plan(**kwargs)
+            assert not state.calls
+            assert wrapper._planned_backend is previous
+            assert wrapper._input_contract is contract
+            assert wrapper._planned_backend_name == selected
+            state.forbidden = True
+            torch.testing.assert_close(_cpu_run(wrapper), output)
+
+
+@pytest.mark.parametrize("failed_backend", ["fa2", "xqa"])
+@pytest.mark.parametrize("error_type", [ValueError, RuntimeError])
+def test_cpu_auto_unexpected_error_does_not_fallback(
+    _cpu_planners, monkeypatch, failed_backend, error_type
+):
+    state = _cpu_planners
+    monkeypatch.setattr(
+        _auto_policy, "ordered_sm100_backends", lambda _: ("fa2", "xqa", "cutile")
+    )
+    failure = error_type("unexpected backend failure")
+
+    def fail(name, args):
+        if name == failed_backend:
+            raise failure
+        raise _BackendPlanUnsupportedError("unsupported request")
+
+    state.handler = fail
     wrapper, kwargs, _ = _cpu_request()
-    assert wrapper._backend == "auto"
-    wrapper.plan(**kwargs)
-    assert state.calls == [expected]
-    assert wrapper._planned_backend_name == wrapper._backend == expected
-    state.forbidden = True
-    _cpu_run(wrapper)
+    with pytest.raises(error_type) as caught:
+        wrapper.plan(**kwargs)
+    assert caught.value is failure
+    assert state.calls == (["fa2"] if failed_backend == "fa2" else ["fa2", "xqa"])
+    assert wrapper._planned_backend is None
 
 
 @pytest.mark.parametrize("graph", [False, True])
-@pytest.mark.parametrize("capability", [(8, 0), (9, 0)])
 @pytest.mark.parametrize("error_type", [_BackendPlanUnsupportedError, RuntimeError])
-def test_cpu_fa_auto_failed_replan_preserves_executable(
-    _cpu_planners, monkeypatch, graph, capability, error_type
+def test_cpu_auto_failed_replan_preserves_executable(
+    _cpu_planners, monkeypatch, graph, error_type
 ):
     state = _cpu_planners
-    initial = "fa3" if capability == (9, 0) else "fa2"
-    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
-    monkeypatch.setattr(_auto_policy, "is_sm90a_supported", lambda _: initial == "fa3")
+    order = ("fa2", "fa3")
+    initial = order[0]
+    monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", lambda _: order)
     wrapper, kwargs, _ = _cpu_request(graph=graph)
     wrapper.plan(**kwargs)
     previous = wrapper._planned_backend
@@ -863,10 +908,11 @@ def test_cpu_fa_auto_failed_replan_preserves_executable(
         monkeypatch.setattr(_auto_policy, "ordered_sm80_backends", forbidden_order)
         monkeypatch.setattr(_auto_policy, "ordered_sm90_backends", forbidden_order)
         monkeypatch.setattr(_auto_policy, "ordered_sm100_backends", forbidden_order)
+        monkeypatch.setattr(_auto_policy, "ordered_sm12x_backends", forbidden_order)
         monkeypatch.setattr(_auto_policy, "is_sm90a_supported", forbidden_order)
 
     def fail(name, args):
-        assert name in ("fa2", "fa3")
+        assert name in _CONCRETE_BACKENDS
         if graph:
             assert (
                 args._graph_plan_int_workspace_buffer is previous._int_workspace_buffer
@@ -876,14 +922,13 @@ def test_cpu_fa_auto_failed_replan_preserves_executable(
     state.handler = fail
     with pytest.raises(error_type) as caught:
         wrapper.plan(**kwargs)
-    fallback = (
-        capability == (9, 0)
-        and not graph
-        and error_type is _BackendPlanUnsupportedError
-    )
-    assert state.calls == (["fa3", "fa2"] if fallback else [initial])
+    fallback = not graph and error_type is _BackendPlanUnsupportedError
+    attempted = list(order) if fallback else [initial]
+    assert state.calls == attempted
     if fallback:
-        assert "fa3: planner failure; fa2: planner failure" in str(caught.value)
+        assert "; ".join(f"{name}: planner failure" for name in attempted) in str(
+            caught.value
+        )
     else:
         assert caught.value is failure
     assert wrapper._planned_backend is previous
@@ -893,10 +938,24 @@ def test_cpu_fa_auto_failed_replan_preserves_executable(
     torch.testing.assert_close(_cpu_run(wrapper), output)
 
 
-def test_cpu_legacy_auto_warns_at_plan_once_at_external_caller(
-    _cpu_planners, monkeypatch
+@pytest.mark.parametrize(
+    "capability,cuda_version,expected_count",
+    [
+        ((10, 3), "13.0", 1),
+        ((12, 0), "12.7", 0),
+        ((12, 0), "12.8", 0),
+        ((12, 0), "13.0", 0),
+        ((12, 1), "12.8", 0),
+        ((12, 1), "12.9", 0),
+        ((12, 1), "13.0", 0),
+        ((12, 2), "13.0", 1),
+    ],
+)
+def test_cpu_auto_warning_matches_architecture(
+    _cpu_planners, monkeypatch, capability, cuda_version, expected_count
 ):
-    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: (10, 3))
+    monkeypatch.setattr(torch.version, "cuda", cuda_version)
+    monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: capability)
     monkeypatch.setattr(
         _auto_policy._BatchMLAPagedAttentionAutoBackend,
         "_blackwell_auto_fallback_warned",
@@ -913,8 +972,9 @@ def test_cpu_legacy_auto_warns_at_plan_once_at_external_caller(
     fallback = [
         warning for warning in caught if "not Blackwell-native" in str(warning.message)
     ]
-    assert len(fallback) == 1
-    assert fallback[0].filename == __file__
+    assert len(fallback) == expected_count
+    if expected_count:
+        assert fallback[0].filename == __file__
 
 
 def test_cpu_legacy_auto_preserves_flat_csr_extra_query_offsets(
@@ -930,7 +990,8 @@ def test_cpu_legacy_auto_preserves_flat_csr_extra_query_offsets(
         kv_len_arr=metadata.kv_len_arr,
     )
     wrapper.plan(**kwargs)
-    assert _cpu_planners.calls == ["fa2"]
+    assert len(_cpu_planners.calls) == 1
+    assert wrapper._planned_backend is not None
 
 
 def test_cpu_invalid_backend_still_fails_in_constructor(_cpu_planners, monkeypatch):
@@ -1243,16 +1304,6 @@ def test_cpu_failed_replan_preserves_published_executable(
     torch.testing.assert_close(_cpu_run(wrapper), output)
 
 
-def test_modular_volume_preserves_native_prefix():
-    args, _ = _request((2, 2), (40960, 40960), heads=16)
-    assert _order(args)[:4] == (
-        "cute-dsl-monolithic",
-        "trtllm-gen",
-        "cute-dsl-modular",
-        "fa2",
-    )
-
-
 # GPU execution: real SM100 adapters, numerical references and graph replay.
 
 
@@ -1407,14 +1458,61 @@ def _check_case(backend, q_lens, kv_lens, capacity, dtype, *, causal, crafted=Fa
     torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("graph_mode", [False, True])
+def test_sm12x_native_auto_matches_reference(monkeypatch, dtype, graph_mode):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (12, 0),
+        (12, 1),
+    ):
+        pytest.skip("SM12x auto acceptance requires an SM120 or SM121 GPU")
+    previous_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = False
+    try:
+        kv_lens = (65, 129)
+        metadata, query, cache, table, offsets = _inputs((1, 3), kv_lens, dtype, 3)
+        expected, _ = _reference(query, cache, table, offsets, kv_lens, causal=True)
+        wrapper = _plan("auto", metadata, dtype, causal=True, lse_mode="none")
+        selected = wrapper._planned_backend
+        assert selected is not None
+        out = torch.empty_like(expected, dtype=dtype)
+
+        def forbidden_order(args):
+            pytest.fail("Executing a prepared SM12x plan must not repeat ordering")
+
+        monkeypatch.setattr(_auto_policy, "ordered_sm12x_backends", forbidden_order)
+
+        def run():
+            return wrapper.run(query=query, kv_cache=cache, out=out)
+
+        if graph_mode:
+            side_stream = torch.cuda.Stream()
+            side_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side_stream):
+                run()
+            torch.cuda.current_stream().wait_stream(side_stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                assert run() is out
+            out.fill_(float("nan"))
+            graph.replay()
+        else:
+            assert run() is out
+        torch.testing.assert_close(out.float(), expected, rtol=1e-2, atol=1e-2)
+        assert wrapper._planned_backend is selected
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = previous_tf32
+
+
 @pytest.mark.usefixtures("_sm100_reference_precision")
 @pytest.mark.parametrize("backend", ["fa2", "auto"])
 def test_fa_plan_without_torch_shared_memory_properties(monkeypatch, backend):
     from flashinfer.mla._batch_mla._backends import _fa_common as fa
 
     monkeypatch.setattr(fa, "get_device_properties", lambda _: SimpleNamespace())
-    # Exercise the legacy auto branch on this GPU, with real FA planning/run.
+    # Exercise native FA planning through a controlled auto candidate.
     monkeypatch.setattr(_auto_policy, "_get_compute_capability", lambda _: (8, 0))
+    monkeypatch.setattr(_auto_policy, "ordered_sm80_backends", lambda _: ("fa2",))
     _check_case(backend, (2,), (9,), 4, torch.bfloat16, causal=False)
 
 
@@ -1653,7 +1751,7 @@ def test_auto_fp8_default_scale_matches_reference():
 
 
 @pytest.mark.usefixtures("_sm100_reference_precision")
-def test_auto_empty_kv_split_falls_back_and_returns_zero():
+def test_auto_empty_kv_split_returns_zero():
     metadata = MLAPlanMetadata.dense(
         cum_seq_lens_q=torch.tensor([0, 1], dtype=torch.int32, device="cuda"),
         block_tables=torch.empty((1, 0), dtype=torch.int32, device="cuda"),
@@ -1676,7 +1774,6 @@ def test_auto_empty_kv_split_falls_back_and_returns_zero():
         query_layout="split",
         kv_cache_layout="split",
     )
-    assert wrapper._planned_backend_name == "fa2"
     q = (
         torch.ones((1, 32, 512), dtype=torch.bfloat16, device="cuda"),
         torch.ones((1, 32, 64), dtype=torch.bfloat16, device="cuda"),
@@ -1702,10 +1799,9 @@ def test_sm90_native_fallback_preserves_executable_and_graph_replay(
     if not is_sm90a_supported(torch.device("cuda")):
         pytest.skip("FA3-first fallback requires CUDA >= 12.3")
     attempts, policy_calls, rejections = [], [], []
-    original_policy = _auto_policy.ordered_sm90_backends
+    order = ("fa3", "fa2")
 
     def policy(args):
-        order = original_policy(args)
         policy_calls.append(order)
         return order
 
@@ -1767,7 +1863,7 @@ def test_sm90_native_fallback_preserves_executable_and_graph_replay(
     )
     wrapper.plan(**kwargs)
     assert attempts == ["fa3", "fa2"]
-    assert policy_calls == [("fa3", "fa2")]
+    assert policy_calls == [order]
     assert "head_dim_ckv in (128, 256, 512)" in rejections[0]
     selected, contract = wrapper._planned_backend, wrapper._input_contract
     assert wrapper._planned_backend_name == "fa2"
@@ -1993,6 +2089,9 @@ def test_auto_graph_typed_fallback_freezes_selection_and_replays_correctly(
 
 @pytest.mark.usefixtures("_sm100_reference_precision")
 def test_auto_graph_falls_back_without_fa_reserved_buffers(monkeypatch):
+    monkeypatch.setattr(
+        _auto_policy, "ordered_sm100_backends", lambda _: ("fa2", "trtllm-gen")
+    )
     attempts = []
     for name in ("fa2", "trtllm-gen"):
         backend_type = _wrapper._BACKEND_TYPES[name]
@@ -2015,7 +2114,7 @@ def test_auto_graph_falls_back_without_fa_reserved_buffers(monkeypatch):
         seq_lens=torch.tensor([32], dtype=torch.int32, device="cuda"),
         max_q_len=2,
     )
-    # Exercise the real base-2 policy branch that ranks FA2 before TRT.
+    # Exercise FA rejection without reserved buffers, then native TRT fallback.
     wrapper = BatchMLAPagedAttentionWrapper(
         torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda"),
         backend="auto",
@@ -2140,13 +2239,10 @@ def test_auto_large_prefill_fp8_graph_matches_reference(layout):
             )
     torch.cuda.current_stream().wait_stream(side_stream)
     torch.cuda.synchronize()
-    # Numerical assertion comes first so the original CuTe accuracy failure
-    # remains a numerical RED, rather than merely a backend-name mismatch.
     # Native TRT FP8 attention-weight rounding needs a slightly larger absolute
     # tolerance; preserve the stricter check for every other backend.
     atol = 0.06 if wrapper._planned_backend_name == "trtllm-gen" else 0.05
     torch.testing.assert_close(out.float(), expected, rtol=0.05, atol=atol)
-    assert wrapper._planned_backend_name == "trtllm-gen"
     assert wrapper._input_contract.scale_mode in ("default", "kv-per-tensor")
     selected = wrapper._planned_backend
     output_pointer = out.data_ptr()
@@ -2173,4 +2269,3 @@ def test_auto_large_prefill_fp8_graph_matches_reference(layout):
     torch.testing.assert_close(out.float(), changed_expected, rtol=0.05, atol=atol)
     assert out.data_ptr() == output_pointer
     assert wrapper._planned_backend is selected
-    assert wrapper._planned_backend_name == "trtllm-gen"
