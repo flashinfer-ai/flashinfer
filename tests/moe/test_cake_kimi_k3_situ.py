@@ -76,11 +76,9 @@ def _stage_kernel_source(program_key, stage):
             r"kernel_(cake_kimi_k3_nvfp4_situ_routed_moe_[0-9a-f]{20})", block[1]
         )
     )
-    assert len(names) == 1, (program_key, stage, names)
+    (name,) = names
     (kernel,) = (
-        source
-        for source in record["sources"]
-        if source.endswith(f"/{names.pop()}_kernel.cu")
+        source for source in record["sources"] if source.endswith(f"/{name}_kernel.cu")
     )
     return _source_path(kernel).read_text()
 
@@ -170,6 +168,18 @@ def test_cake_situ_small_row_routes_declare_fused_quant_route(arch, num_tokens):
     # programs on both architectures and of no other small-row program.
     program_key = ROUTES[(arch, _small_row_selector(arch, num_tokens))]
     assert _declares_fused_quant_route(program_key) is (num_tokens in (8, 16))
+
+
+def test_cake_situ_two_cta_fc2_route_is_sixteen_tokens_on_sm103_only():
+    # Only 16 tokens on SM103 reach the two-CTA-per-SM FC2 route: SM100 has no
+    # such route and 8 tokens on SM103 keep the fused-router route.
+    two_cta = ROUTES[("sm_103a", "n8_w2a_m16")]
+    assert ("sm_100a", "n8_w2a_m16") not in ROUTES
+    assert _small_row_selector("sm_100a", 16) == "n8_feature"
+    assert ROUTES[("sm_100a", "n8_feature")] != two_cta
+    assert _small_row_selector("sm_103a", 8) == "n8_feature"
+    assert ROUTES[("sm_103a", "n8_feature")] != two_cta
+    assert two_cta not in (ROUTES[("sm_103a", 8)], ROUTES[("sm_103a", 16)])
 
 
 @pytest.fixture(scope="module")
@@ -402,6 +412,7 @@ def test_cake_situ_output_workspace_and_external_graph(
     assert prepared_shape["n8_w2a_m16"] is (selector == "n8_w2a_m16")
     if selector is not None:
         assert prepared_shape["program_key"] == ROUTES[(arch, selector)]
+    assert prepared_shape["fused_quant_route"] is (num_tokens in (8, 16))
     assert _declares_fused_quant_route(prepared_shape["program_key"]) is (
         num_tokens in (8, 16)
     )
@@ -436,8 +447,10 @@ def test_cake_situ_output_workspace_and_external_graph(
     graph.replay()
     torch.testing.assert_close(output, expected, atol=1.0, rtol=0.1)
 
-    # Retain every input address while changing values and expert load balance.
-    # Replay must consume these values, not stale routing or hidden states.
+    # Retain every input address while changing values and expert load balance:
+    # every token now routes to the same 16 experts (the other 880 receive no
+    # token), the maximally skewed pattern. Replay must consume these values,
+    # not stale routing or hidden states.
     x.mul_(-0.75)
     ids.copy_(slots[None, :].expand_as(ids))
     route_weights.copy_(route_weights.flip(-1))

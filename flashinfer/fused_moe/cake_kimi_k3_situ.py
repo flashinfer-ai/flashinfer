@@ -36,7 +36,11 @@ _M256_C12_ARCHES = ("sm_100a",)
 # The 16-token SM103 route runs an FC2 program built for two resident CTAs per
 # SM (four pipeline stages, __launch_bounds__(512, 2)), so its device-workfeed
 # pool holds 2 * SM // (_H // 128) rows: 280 CTAs on a 148-SM part instead of
-# the 140 of the single-CTA FC2 program.
+# the 140 of the single-CTA FC2 program. The pool size only sets how many CTAs
+# share the work: the router seeds the workfeed counter with the pool size and
+# every CTA claims its next tile through an atomic increment, exiting once the
+# counter passes the tile count, so a CTA that is not co-resident starts later
+# and takes whatever remains; no CTA waits for another.
 _N8_W2A_M16_ARCHES = ("sm_103a",)
 _N8_W2A_M16_TOKENS = (16,)
 _N8_W2A_M16_FC2_GRID_N_SM_FACTOR = 2
@@ -275,9 +279,7 @@ def cake_fused_moe_prepare_workspace(
                 workspace_buffer.device
             ).multi_processor_count
             fc2_grid_n = min(max_tiles, max(1, sm_count // (_H // 128)))
-            if (num_tokens in (32, 64, 128, 256) and arch == "sm_100a") or (
-                num_tokens in (32, 64, 128, 256) and arch == "sm_103a"
-            ):
+            if m64_claim8:
                 # The 32- to 256-token routes measured best with a six-row
                 # pool: 6 * 28 = 168 FC2 CTAs on the 148-SM B200 and B300.
                 fc2_grid_n = min(max_tiles, 6)
@@ -294,15 +296,21 @@ def cake_fused_moe_prepare_workspace(
         program_key = cake_situ_sequence(
             arch,
             tile_n,
-            num_tokens == 1,
-            feature_finalize,
-            m64_claim8,
-            mid_work5fd,
-            n32_claim8,
-            m256_c12,
-            n8_w2a_m16,
+            single_token=num_tokens == 1,
+            feature_finalize=feature_finalize,
+            m64_claim8=m64_claim8,
+            mid_work5fd=mid_work5fd,
+            n32_claim8=n32_claim8,
+            m256_c12=m256_c12,
+            n8_w2a_m16=n8_w2a_m16,
         )
         module = get_cake_situ_module(program_key)
+        # The fused quantization + router programs declare the stage in their
+        # argument plan; resolve that once here rather than on every call.
+        fused_quant_route = any(
+            name == "quant_route.s2b_num_tokens"
+            for _, name in PROGRAMS[program_key]["arg_plan"]
+        )
         state["shapes"][num_tokens] = {
             "views": views,
             "tile_n": tile_n,
@@ -316,6 +324,7 @@ def cake_fused_moe_prepare_workspace(
             "n32_claim8": n32_claim8,
             "m256_c12": m256_c12,
             "n8_w2a_m16": n8_w2a_m16,
+            "fused_quant_route": fused_quant_route,
             "fc2_device_workfeed": fc2_device_workfeed,
             "fc2_grid_n": fc2_grid_n,
             "fc2_pool_ctas": (_H // 128) * fc2_grid_n,
@@ -649,14 +658,11 @@ def _cake_situ_stage_bindings(options, prepared):
             ),
         }
     )
-    # Programs whose argument plan declares the fused quantization + router
-    # stage run one launch of grid (num_tokens + 1, 1, 1): block 0 routes and
-    # blocks 1..num_tokens quantize. The separate "quant" and "fused_router"
-    # entries stay in `stages` but are not referenced by that argument plan.
-    if "fused_router" in stages and any(
-        name == "quant_route.s2b_num_tokens"
-        for _, name in PROGRAMS[prepared["program_key"]]["arg_plan"]
-    ):
+    # The fused quantization + router programs run one launch of grid
+    # (num_tokens + 1, 1, 1): block 0 routes and blocks 1..num_tokens quantize.
+    # The separate "quant" and "fused_router" entries stay in `stages` but are
+    # not referenced by their argument plan.
+    if prepared["fused_quant_route"]:
         stages["quant_route"] = dict(
             stages["fused_router"],
             grid=(num_tokens + 1, 1, 1),
