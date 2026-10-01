@@ -536,7 +536,8 @@ def test_cpu_generic_fallback_warns_before_candidate_selection(
         else:
             wrapper.plan(**kwargs)
             assert wrapper._planned_backend_name == target
-    assert sum("not Blackwell-native" in str(w.message) for w in caught) == 1
+    assert not any("selected" in str(w.message) for w in caught)
+    assert sum("no Blackwell-native policy" in str(w.message) for w in caught) == 1
     assert auto._blackwell_auto_fallback_warned
 
 
@@ -837,7 +838,7 @@ def test_cpu_auto_typed_fallback_and_experimental_gate(
     if selected is None:
         expected = [name for name in order if name != "cutile"]
     assert state.calls == expected
-    assert not any("selected 'fa2'" in str(w.message) for w in caught)
+    assert not any("no Blackwell-native policy" in str(w.message) for w in caught)
     if selected is not None:
         state.forbidden = True
         _cpu_run(wrapper)
@@ -970,7 +971,9 @@ def test_cpu_auto_warning_matches_architecture(
         other, other_kwargs, _ = _cpu_request()
         other.plan(**other_kwargs)
     fallback = [
-        warning for warning in caught if "not Blackwell-native" in str(warning.message)
+        warning
+        for warning in caught
+        if "no Blackwell-native policy" in str(warning.message)
     ]
     assert len(fallback) == expected_count
     if expected_count:

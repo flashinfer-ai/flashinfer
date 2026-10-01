@@ -52,13 +52,12 @@ class _BatchMLAPagedAttentionAutoBackend:
             )
         else:
             in_wrapper_alternative = (
-                "backend='cutlass' is the closest in-wrapper alternative but may be "
-                "slower than this fallback for decode shapes."
+                "backend='cutlass' is another in-wrapper alternative."
             )
         _warn_from_external_caller(
-            f"BatchMLAPagedAttentionWrapper: backend='auto' selected "
-            f"'fa2' on SM{major}{minor}, which is not Blackwell-native "
-            f"and gives poor MLA decode performance. For decode, use "
+            f"BatchMLAPagedAttentionWrapper: backend='auto' has no Blackwell-native "
+            f"policy for SM{major}{minor}; trying the default backend order. "
+            f"For decode, consider "
             f"flashinfer.mla.trtllm_batch_decode_with_kv_cache_mla "
             f"(Blackwell-native trtllm-gen); {in_wrapper_alternative}",
             UserWarning,
