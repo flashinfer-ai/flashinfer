@@ -270,13 +270,11 @@ def cake_fused_moe_prepare_workspace(
                 workspace_buffer.device
             ).multi_processor_count
             fc2_grid_n = min(max_tiles, max(1, sm_count // (_H // 128)))
-            if (num_tokens in (32, 64, 128, 256) and arch == "sm_100a") or (
-                num_tokens in (32, 64, 128, 256) and arch == "sm_103a"
-            ):
-                fc2_grid_n = min(
-                    max_tiles, 6
-                )  # N16Claim8M256Pool6 (F7) + MidPool6 (inc5): 168 FC2 CTAs on the 148-SM B200 for the sm_100a claim8 rows M32/M64/M128/M256; B300Pool6 (inc7): 168 FC2 CTAs on the 148-SM B300 for the sm_103a claim8 rows M32/M64/M128/M256
-            if n32_claim8:
+            if m64_claim8:
+                # The 32- to 256-token routes measured best with a six-row
+                # pool: 6 * 28 = 168 FC2 CTAs on the 148-SM B200 and B300.
+                fc2_grid_n = min(max_tiles, 6)
+            elif n32_claim8:
                 # The 512- and 1024-token routes measured best with a seven-row
                 # pool: 7 * 28 = 196 FC2 CTAs on the 148-SM B200 and B300.
                 fc2_grid_n = min(max_tiles, 7)
