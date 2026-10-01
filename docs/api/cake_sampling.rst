@@ -27,17 +27,21 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    ``fused_tail``); the ``(8, 48)`` resident, a large-k pick, is built without it.  For
    ``64 < top_k_max <= 1024`` (``fused_block_tail_kcap``) the same stage can run on the whole first
    CTA of the cluster (512 threads, two slab entries each; launch flag bit 3) on a separate build of
-   the variant (manifest entries with ``fused_block_tail``, symbol suffix ``_bt``).  The frozen
-   bundle ships no such build and no compute capability selects the form: on the shipped kernels it
-   lost to the two-launch chain on every architecture except four H100 cells (round 5, unit 6),
-   while compiling it into the default build had cost every ``top_k <= 64`` launch 4-19 % on
-   H100 / GB300 / R200.  The mechanism stays for a build that wins.  When built, the
-   whole-CTA form is again bitwise identical to the
+   the variant (manifest entries with ``fused_block_tail``, symbol suffix ``_bt``).  Round 7 ships
+   that build for every variant built with the one-warp tail (19 twins): the round-5 twin had run
+   the tail twice through a duplicate block in the stream template (removed in round 7).  The host
+   selects it only for a cluster-8 streaming variant with ``top_k_max > 768`` on a one-wave grid, on
+   B200 and GB300 (compute capabilities 10.0 / 10.3).  Measured under CUDA-graph replay (the eager
+   span of the two-launch chain includes the host gap between its launches, which made the twin
+   look 10-50 % faster everywhere): the in-CTA tail loses to the chain on every resident (B200
+   1.20-1.54x, GB300 1.40-1.84x of the chain's time) and on every stream at k <= 750 (1.0-1.26x at
+   k = 200, 1.04-1.15x at k = 500, 0.94-1.05x at k = 750); the cluster-8 streams at k = 1000 win on
+   both (B200 0.89-0.94, GB300 0.89-0.97).  H100 and R200 keep the chain (no graph-replay A/B
+   recorded for them in round 7).
+   Compiling the tail into the default build had cost every ``top_k <= 64`` launch 4-19 % on H100 /
+   GB300 / R200, so it stays a separate build.  The whole-CTA form is bitwise identical to the
    two-launch form; rows of such a launch whose k is at most 64 take the one-warp tail.  A
-   multi-wave grid keeps the two launches (its first CTA would run one tail per wave), and
-   every architecture keeps them in round 5 (the register-resident cells of B300 / GB300 run 6-9 %
-   slower with the in-kernel tail, and the integrated build lost 5-32 % to the chain on R200, B200
-   and most H100 cells).  In the two-launch form the dispatcher also decides where the dependent kernel lands: stage 1 signals
+   multi-wave grid keeps the two launches (its first CTA would run one tail per wave).  In the two-launch form the dispatcher also decides where the dependent kernel lands: stage 1 signals
    ``griddepcontrol.launch_dependents`` before its first pass only when the batch fits on the
    SMs its last wave leaves free (one stage-1 CTA per SM), so the stage-2/3 CTAs are never
    packed onto the few SMs free mid-flight; larger batches let the dependent launch as stage 1
@@ -45,8 +49,8 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    (compute capability 10.x); on Hopper it signals after its filter pass, once the whole row
    has been read, where the round-3 kernels did.  All three decisions travel in the stage-1
    ``launch_flags`` argument (bit 0 one-warp tail, bit 1 early trigger, bit 2 stream pre-pass
-   point, bit 3 whole-CTA tail, bit 4 coarse sample, bit 5 row-span filter arm) and none changes
-   any output.  Bit 4 selects a
+   point, bit 3 whole-CTA tail, bit 4 coarse sample, bit 5 row-span filter arm, bit 6 speculative
+   sample) and none changes any output.  Bit 4 selects a
    streaming variant's coarse-sample build (manifest entries with ``coarse_sample``, symbol suffix
    ``_cs``): its sampled first pass reads one 64-byte block per 512 bytes of the row (1/8) instead of
    one per 256 (1/4), with the lower-bucket margin, the sampled-mass cap and the filter-arm density
@@ -62,7 +66,28 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    cluster-8 row at k ~ 1000 never took the arm); both arms build identical candidate segments.  The
    host sets it for cluster >= 8 streams whose largest top-k exceeds ``fused_tail_kcap`` on Hopper,
    B200 and GB300 (round 6, lever FD5: the V = 262144 cluster-8 k = 1000 cells run 2-5 % faster);
-   a cluster-1 row that takes the arm can lose 5 % and Rubin measures neutral, so nothing else.
+   a cluster-1 row that takes the arm can lose 5 % and Rubin measures neutral, so nothing else.  Bit 6 selects a streaming variant's speculative-sample build (manifest entries with
+   ``spec_sample``, symbol suffix ``_sp``): there is no separate sampled read; every warp loads its
+   first register chunk (and the second where the row has one), histograms a strided subset of those
+   registers as the sample (1/8 of the row for a largest top-k at most ``fused_tail_kcap``, 1/2
+   above), keeps the chunk for the filter pass, which continues from the next chunk, and scales the
+   lower-bucket margin and the sampled-mass cap to the realised rate, so again every output is
+   bit-identical to the default build.  The host sets it for every ept-16 stream and for ept-32
+   streams whose rows are one register chunk per CTA, two chunks on a cluster of 8, or at least 16
+   chunks (round 7, lever SP: ept-16 streams 2-13 % faster at 1-16 chunks, the cluster-8 ept-32
+   stream 13-18 % at one chunk and 0-6 % at two, the cluster-1 ept-32 stream at 16 chunks 2-15 %);
+   ept-32 streams at 2-10 chunks per CTA on clusters 1-4 measured 0-6 % slower with it and keep
+   their round-6 build, on B200 so does a two-chunk row whose second chunk is at least half full (the
+   cluster-8 stream at V = 262144: 0.2-2.4 % slower with it at k <= 64, while V = 151936 keeps the twin
+   and GB300 keeps it on both), and a cluster-8 stream above ``fused_tail_kcap`` (the two-launch chain, 1/2-rate
+   sample) keeps it on every architecture (GB300 V = 262144 measured 11-17 % slower eager and 3-7 % slower
+   under graph replay with the speculative build).  That is the B200 / GB300 rule; on Hopper and Rubin the same chunk rule
+   applies only on a cluster of at most 4 CTAs whose grid has at least 64 CTAs, for a largest top-k
+   at most ``fused_tail_kcap`` only to rows of at least 5 chunks per CTA, and on the two-launch
+   chain with at least 128 CTAs for rows of 16 or more chunks: the round-7 H100 / R200 matrices
+   measure the cluster-8 streams 1-8 % slower with the build, the 4-chunk rows at k <= 64 1-2 %
+   slower than their coarse-sample build, and those wide streams 2-20 % faster.  Bits 4 and 6 are
+   exclusive.
 
 The stage-2/3 kernel exists in three static forms that differ only in instruction selection,
 never in output: the base form (f64 top-p cut / sample tests, max-min bitonic exchange), a form
@@ -135,9 +160,9 @@ last, on all four GPUs, so the two-launch path charges that per-launch cost to t
 keeps the ept-16 stream there.
 
 A launch whose largest top-k is above 64 has two regimes and the same table ranks the variants in
-both: the *fused* regime (H100 / B200 / R200: a one-wave candidate finishes in one kernel with the
-whole-CTA tail, a multi-wave or tail-less candidate pays the stage-2/3 kernel) and the *two-launch*
-regime (B300 / GB300, or ``two_launch=True``).  ``choose_stage1(..., two_launch=)`` selects it (None
+both: the *fused* regime (B200 / GB300 in round 7: a one-wave cluster-8 stream above k = 768 finishes
+in one kernel with the whole-CTA tail, every other candidate pays the stage-2/3 kernel) and the
+*two-launch* regime (H100 / R200, or ``two_launch=True``).  ``choose_stage1(..., two_launch=)`` selects it (None
 = the device's policy).  The k > 64 constants were re-fitted in round 5 on same-run per-variant
 sweeps of the chain and of the fused form (32 ``(V, B)`` cells per architecture, k = 1000): the
 per-bucket list path of the streams costs per chunk rather than per wave (``stream_large_k_chunk_us``
@@ -163,6 +188,34 @@ the (8,16) to the (8,32) stream (2.5-4.3 % faster), worst regret 4.5 -> 2.8 %; 2
 ``stream_chunk32_us`` 0.15, ``stream_cluster_us`` 0.25, ``stream_cluster_cta_us`` 0.05,
 ``stream_large_k_chunk32_us`` 0.05 move V = 128256 / 151936 B <= 16 to the (4,32) stream (2.3-3.7 % faster), worst
 4.1 -> 1.7 %; 132 is unchanged.  The kernels and the frozen bundle are untouched by this change.
+
+Correctness contract
+--------------------
+
+Since round 7 the route is held to a tolerance-level contract instead of bit-identity with the previous bundle
+(the kernels may change bits; the precision level and the selection exactness may not):
+
+* **Top-k set**: equal to the float64 sorted reference for every row and shape, including the tie rule (ties on the
+  key are broken by the lower index: the 64-bit ``(key, ~index)`` composite is a total order, so every exact
+  selection yields the same set and the same slab order).
+* **Top-p cut**: equal to the float64 reference, except when the exact cumulative mass lies within ``eps = 1e-6``
+  of ``top_p`` times the top-k mass, where the cut may differ by one element (``tests/utils/test_cake_sampling.py``
+  places rows on that boundary and checks both sides).
+* **Sample**: always inside the exact support (the kept prefix); run-to-run deterministic for identical inputs,
+  ``philox_seed`` and ``philox_offset`` (CUDA-graph replay, concurrent streams and repeated invocation included);
+  multi-seed next-token histograms within the 99 % binomial band of the exact distribution per row class; sglang
+  GSM8K accuracy within ``top_k_first``'s seed spread with zero out-of-support tokens.
+* **Renormalized slab** (``renorm_out``): fp32 with ``rtol 1e-6``, ``atol 1e-7`` against the float64 reference.
+  Keys stay exact fp32 bit patterns; every accumulation is at least fp32 (no bf16 / fp16 anywhere); no tolerance is
+  loosened to admit a kernel change.
+* A stage-1 build that does not intend to change numerics (every round-7 twin: the speculative-sample ``_sp``, the
+  coarse-sample ``_cs`` and the whole-CTA-tail ``_bt`` builds) is additionally gated on bit-identity with the default
+  build on every tested row.  A change that moves bits must document exactly which rows can differ (ties, the eps
+  boundary) and why; no round-7 kernel does.
+* The exact fallbacks stay kernel-side: a candidate list that overflows the gather capacity takes the three-pass
+  cluster path, a row with fewer than k candidates is kept whole, and vocabularies above 2^21 (and compute
+  capabilities 12.x) take the reference ``top_k_first`` route.  The sm_120 / sm_121 route semantics and the host API
+  are unchanged.
 
 Measured performance
 --------------------
@@ -226,148 +279,148 @@ processes (27.97 / 28.06 vs 28.00 / 28.10 µs and 27.42 / 27.49 vs 27.39 / 27.42
      - k = 1000, CUDA graph
    * - 32768
      - 1
-     - 45.5 → 10.2 (4.46x)
-     - 45.8 → 14.8 (3.09x)
-     - 43.7 → 21.0 (2.08x)
-     - 45.4 → 26.0 (1.75x)
+     - 46.3 → 10.2 (4.54x)
+     - 46.2 → 14.7 (3.14x)
+     - 45.5 → 20.9 (2.18x)
+     - 47.6 → 26.3 (1.81x)
    * - 32768
      - 8
-     - 50.4 → 10.8 (4.67x)
-     - 50.2 → 15.4 (3.26x)
-     - 49.7 → 21.7 (2.29x)
-     - 56.6 → 26.8 (2.11x)
+     - 50.1 → 10.8 (4.64x)
+     - 49.8 → 15.1 (3.30x)
+     - 49.4 → 21.8 (2.27x)
+     - 56.6 → 27.1 (2.09x)
    * - 32768
      - 16
-     - 52.3 → 11.5 (4.55x)
-     - 53.0 → 15.9 (3.33x)
-     - 50.4 → 22.4 (2.25x)
-     - 58.1 → 27.2 (2.14x)
+     - 52.7 → 11.5 (4.58x)
+     - 53.1 → 15.8 (3.36x)
+     - 52.4 → 22.3 (2.35x)
+     - 54.5 → 27.6 (1.97x)
    * - 32768
      - 32
-     - 53.6 → 11.8 (4.54x)
-     - 54.9 → 17.7 (3.10x)
-     - 52.8 → 22.5 (2.35x)
-     - 54.0 → 29.3 (1.84x)
+     - 54.5 → 11.7 (4.66x)
+     - 55.0 → 17.7 (3.11x)
+     - 55.2 → 22.5 (2.45x)
+     - 55.9 → 29.7 (1.88x)
    * - 32768
      - 64
-     - 55.2 → 13.0 (4.25x)
-     - 55.7 → 21.3 (2.62x)
-     - 57.7 → 23.6 (2.44x)
-     - 56.3 → 33.8 (1.67x)
+     - 55.7 → 13.0 (4.28x)
+     - 56.3 → 19.3 (2.92x)
+     - 58.7 → 23.6 (2.49x)
+     - 60.6 → 30.9 (1.96x)
    * - 32768
      - 128
-     - 57.1 → 16.5 (3.46x)
-     - 58.0 → 24.4 (2.38x)
-     - 72.5 → 27.1 (2.68x)
-     - 69.1 → 36.8 (1.88x)
+     - 58.0 → 16.5 (3.52x)
+     - 58.7 → 23.6 (2.49x)
+     - 66.5 → 27.1 (2.45x)
+     - 71.6 → 35.6 (2.01x)
    * - 128256
      - 1
-     - 112.1 → 12.7 (8.83x)
-     - 66.6 → 19.1 (3.49x)
-     - 81.4 → 23.7 (3.43x)
-     - 76.4 → 32.7 (2.34x)
+     - 112.9 → 12.7 (8.89x)
+     - 65.9 → 19.9 (3.31x)
+     - 82.2 → 23.7 (3.47x)
+     - 80.9 → 31.8 (2.54x)
    * - 128256
      - 8
-     - 113.1 → 14.5 (7.80x)
-     - 81.1 → 20.5 (3.96x)
-     - 86.8 → 25.6 (3.39x)
-     - 91.2 → 32.9 (2.77x)
+     - 113.5 → 14.5 (7.83x)
+     - 81.0 → 20.5 (3.95x)
+     - 86.5 → 25.6 (3.38x)
+     - 93.2 → 33.1 (2.82x)
    * - 128256
      - 16
-     - 113.6 → 16.0 (7.10x)
-     - 92.2 → 25.0 (3.69x)
-     - 87.8 → 27.1 (3.24x)
-     - 106.0 → 37.0 (2.86x)
+     - 113.2 → 15.9 (7.12x)
+     - 92.7 → 22.1 (4.19x)
+     - 90.1 → 27.1 (3.32x)
+     - 101.2 → 35.4 (2.86x)
    * - 128256
      - 32
-     - 115.5 → 19.7 (5.86x)
-     - 106.1 → 30.6 (3.47x)
-     - 92.4 → 31.1 (2.97x)
-     - 121.8 → 42.2 (2.89x)
+     - 116.8 → 18.7 (6.25x)
+     - 106.8 → 29.7 (3.60x)
+     - 92.6 → 29.9 (3.10x)
+     - 127.6 → 41.6 (3.07x)
    * - 128256
      - 64
-     - 115.9 → 26.8 (4.32x)
-     - 167.3 → 36.9 (4.53x)
-     - 104.0 → 38.3 (2.72x)
-     - 171.4 → 49.5 (3.46x)
+     - 117.5 → 25.7 (4.57x)
+     - 168.6 → 34.9 (4.83x)
+     - 101.3 → 37.1 (2.73x)
+     - 185.1 → 47.9 (3.86x)
    * - 128256
      - 128
-     - 116.4 → 42.0 (2.77x)
-     - 236.2 → 53.4 (4.42x)
-     - 121.2 → 53.1 (2.28x)
-     - 241.9 → 65.3 (3.70x)
+     - 117.3 → 42.0 (2.79x)
+     - 236.3 → 46.7 (5.06x)
+     - 123.2 → 53.1 (2.32x)
+     - 261.8 → 59.0 (4.44x)
    * - 151936
      - 1
-     - 113.1 → 13.3 (8.50x)
-     - 75.4 → 19.8 (3.81x)
-     - 87.3 → 24.7 (3.53x)
-     - 84.9 → 33.0 (2.57x)
+     - 113.6 → 13.3 (8.54x)
+     - 74.1 → 21.0 (3.53x)
+     - 86.6 → 24.6 (3.52x)
+     - 90.8 → 33.4 (2.72x)
    * - 151936
      - 8
-     - 114.1 → 14.9 (7.66x)
-     - 91.6 → 21.6 (4.24x)
-     - 92.2 → 26.4 (3.49x)
-     - 101.0 → 34.3 (2.94x)
+     - 113.7 → 14.9 (7.63x)
+     - 91.7 → 22.0 (4.17x)
+     - 91.7 → 26.3 (3.49x)
+     - 128.6 → 34.6 (3.72x)
    * - 151936
      - 16
-     - 114.0 → 17.1 (6.67x)
-     - 106.5 → 28.7 (3.71x)
-     - 92.7 → 28.7 (3.23x)
-     - 120.6 → 41.5 (2.91x)
+     - 114.1 → 16.5 (6.92x)
+     - 104.6 → 23.1 (4.53x)
+     - 94.7 → 27.9 (3.39x)
+     - 105.9 → 36.7 (2.89x)
    * - 151936
      - 32
-     - 113.9 → 22.5 (5.06x)
-     - 123.7 → 34.8 (3.55x)
-     - 96.9 → 34.0 (2.85x)
-     - 139.7 → 47.5 (2.94x)
+     - 114.9 → 21.0 (5.47x)
+     - 123.3 → 27.8 (4.44x)
+     - 99.6 → 32.2 (3.09x)
+     - 141.4 → 40.5 (3.49x)
    * - 151936
      - 64
-     - 116.7 → 30.9 (3.78x)
-     - 195.1 → 42.2 (4.62x)
-     - 116.7 → 42.4 (2.75x)
-     - 221.0 → 56.2 (3.93x)
+     - 118.4 → 28.9 (4.10x)
+     - 195.6 → 34.9 (5.60x)
+     - 113.6 → 40.6 (2.80x)
+     - 212.8 → 48.9 (4.35x)
    * - 151936
      - 128
-     - 156.1 → 46.9 (3.33x)
-     - 279.0 → 59.5 (4.69x)
-     - 172.5 → 58.3 (2.96x)
-     - 309.3 → 72.2 (4.28x)
+     - 155.2 → 42.8 (3.63x)
+     - 278.7 → 52.3 (5.33x)
+     - 174.2 → 54.3 (3.21x)
+     - 292.9 → 66.0 (4.44x)
    * - 262144
      - 1
-     - 113.3 → 13.9 (8.15x)
-     - 91.6 → 20.9 (4.38x)
-     - 88.0 → 25.5 (3.45x)
-     - 101.0 → 33.9 (2.98x)
+     - 113.9 → 13.9 (8.19x)
+     - 92.4 → 22.5 (4.11x)
+     - 88.3 → 25.3 (3.49x)
+     - 111.0 → 34.0 (3.26x)
    * - 262144
      - 8
-     - 114.0 → 16.5 (6.91x)
-     - 121.7 → 23.0 (5.29x)
-     - 93.3 → 28.4 (3.29x)
-     - 188.3 → 36.0 (5.23x)
+     - 115.3 → 16.5 (6.99x)
+     - 121.4 → 23.3 (5.21x)
+     - 92.9 → 28.2 (3.29x)
+     - 132.9 → 37.1 (3.58x)
    * - 262144
      - 16
-     - 114.4 → 20.8 (5.50x)
-     - 147.1 → 27.7 (5.31x)
-     - 96.4 → 32.6 (2.96x)
-     - 136.0 → 40.2 (3.38x)
+     - 114.7 → 19.8 (5.79x)
+     - 149.6 → 26.6 (5.62x)
+     - 98.4 → 31.5 (3.12x)
+     - 142.5 → 40.8 (3.49x)
    * - 262144
      - 32
-     - 127.6 → 28.2 (4.52x)
-     - 233.5 → 39.6 (5.90x)
-     - 144.1 → 40.8 (3.53x)
-     - 240.0 → 52.3 (4.59x)
+     - 126.0 → 28.0 (4.50x)
+     - 231.5 → 39.6 (5.85x)
+     - 146.3 → 40.4 (3.62x)
+     - 237.7 → 53.0 (4.48x)
    * - 262144
      - 64
-     - 134.8 → 44.3 (3.04x)
-     - 318.7 → 54.2 (5.88x)
-     - 153.3 → 56.4 (2.72x)
-     - 313.1 → 67.4 (4.65x)
+     - 133.6 → 44.2 (3.02x)
+     - 315.9 → 51.9 (6.09x)
+     - 149.5 → 56.4 (2.65x)
+     - 332.7 → 65.5 (5.08x)
    * - 262144
      - 128
-     - 157.4 → 69.2 (2.27x)
-     - 470.9 → 84.1 (5.60x)
-     - 173.5 → 81.0 (2.14x)
-     - 475.0 → 96.7 (4.91x)
+     - 156.7 → 64.5 (2.43x)
+     - 471.2 → 71.5 (6.59x)
+     - 175.2 → 75.8 (2.31x)
+     - 510.1 → 85.2 (5.99x)
 
 .. list-table:: B200 (sm_100a, 148 SMs), CUPTI median µs, top_k_first → cake_sampling
    :header-rows: 1
@@ -381,148 +434,148 @@ processes (27.97 / 28.06 vs 28.00 / 28.10 µs and 27.42 / 27.49 vs 27.39 / 27.42
      - k = 1000, CUDA graph
    * - 32768
      - 1
-     - 43.2 → 10.7 (4.04x)
-     - 42.1 → 14.5 (2.90x)
-     - 43.2 → 20.3 (2.13x)
-     - 40.7 → 25.0 (1.63x)
+     - 41.8 → 10.3 (4.06x)
+     - 43.1 → 14.4 (2.99x)
+     - 45.5 → 19.4 (2.35x)
+     - 49.8 → 24.9 (2.00x)
    * - 32768
      - 8
-     - 47.6 → 10.9 (4.37x)
-     - 46.2 → 14.6 (3.16x)
-     - 55.9 → 21.1 (2.65x)
-     - 62.2 → 26.3 (2.37x)
+     - 45.6 → 10.3 (4.43x)
+     - 47.3 → 14.8 (3.20x)
+     - 46.8 → 19.9 (2.35x)
+     - 47.3 → 26.2 (1.81x)
    * - 32768
      - 16
-     - 50.5 → 10.4 (4.86x)
-     - 49.2 → 15.1 (3.26x)
-     - 53.7 → 20.0 (2.69x)
-     - 47.2 → 26.4 (1.79x)
+     - 48.8 → 10.4 (4.69x)
+     - 50.5 → 15.1 (3.34x)
+     - 56.0 → 19.8 (2.83x)
+     - 54.3 → 26.5 (2.05x)
    * - 32768
      - 32
-     - 51.8 → 10.8 (4.80x)
-     - 51.4 → 15.8 (3.25x)
-     - 51.8 → 20.2 (2.56x)
-     - 50.5 → 27.3 (1.85x)
+     - 50.8 → 10.7 (4.75x)
+     - 52.2 → 15.7 (3.32x)
+     - 53.2 → 20.2 (2.63x)
+     - 55.4 → 27.3 (2.03x)
    * - 32768
      - 64
-     - 53.3 → 11.2 (4.76x)
-     - 52.7 → 18.2 (2.90x)
-     - 52.3 → 21.2 (2.47x)
-     - 57.3 → 29.9 (1.92x)
+     - 51.9 → 11.2 (4.63x)
+     - 53.5 → 17.1 (3.13x)
+     - 54.2 → 21.2 (2.56x)
+     - 61.3 → 28.7 (2.14x)
    * - 32768
      - 128
-     - 54.5 → 12.6 (4.33x)
-     - 53.3 → 20.3 (2.63x)
-     - 56.5 → 22.1 (2.56x)
-     - 55.6 → 32.9 (1.69x)
+     - 53.1 → 12.4 (4.28x)
+     - 55.1 → 18.5 (2.98x)
+     - 58.0 → 22.0 (2.64x)
+     - 60.3 → 30.5 (1.98x)
    * - 128256
      - 1
-     - 103.7 → 12.2 (8.50x)
-     - 62.3 → 17.2 (3.62x)
-     - 83.2 → 21.9 (3.80x)
-     - 59.4 → 28.1 (2.11x)
+     - 100.8 → 11.9 (8.47x)
+     - 65.0 → 17.3 (3.76x)
+     - 85.4 → 21.5 (3.97x)
+     - 70.7 → 28.1 (2.52x)
    * - 128256
      - 8
-     - 103.7 → 13.0 (7.98x)
-     - 81.3 → 18.0 (4.52x)
-     - 81.9 → 23.3 (3.52x)
-     - 85.9 → 29.8 (2.88x)
+     - 102.4 → 12.5 (8.19x)
+     - 80.9 → 18.2 (4.45x)
+     - 84.2 → 22.7 (3.71x)
+     - 88.8 → 29.9 (2.97x)
    * - 128256
      - 16
-     - 103.6 → 13.5 (7.67x)
-     - 90.6 → 22.7 (3.99x)
-     - 84.6 → 24.0 (3.52x)
-     - 107.5 → 34.0 (3.16x)
+     - 101.7 → 13.5 (7.53x)
+     - 91.3 → 20.6 (4.43x)
+     - 84.7 → 23.7 (3.57x)
+     - 102.5 → 31.5 (3.25x)
    * - 128256
      - 32
-     - 107.6 → 15.0 (7.17x)
-     - 99.6 → 24.1 (4.13x)
-     - 86.7 → 25.2 (3.44x)
-     - 128.9 → 35.9 (3.59x)
+     - 104.8 → 14.9 (7.03x)
+     - 100.0 → 21.3 (4.69x)
+     - 87.3 → 25.4 (3.44x)
+     - 121.9 → 33.1 (3.68x)
    * - 128256
      - 64
-     - 107.5 → 17.8 (6.04x)
-     - 143.7 → 29.1 (4.94x)
-     - 90.6 → 28.3 (3.20x)
-     - 185.9 → 41.5 (4.48x)
+     - 105.1 → 17.7 (5.94x)
+     - 143.2 → 29.1 (4.92x)
+     - 88.4 → 28.3 (3.12x)
+     - 147.9 → 41.5 (3.56x)
    * - 128256
      - 128
-     - 108.0 → 22.8 (4.74x)
-     - 193.4 → 36.0 (5.37x)
-     - 97.3 → 32.9 (2.96x)
-     - 201.8 → 47.4 (4.26x)
+     - 105.6 → 22.8 (4.63x)
+     - 193.2 → 36.1 (5.35x)
+     - 95.0 → 33.1 (2.87x)
+     - 204.1 → 47.5 (4.30x)
    * - 151936
      - 1
-     - 104.1 → 12.8 (8.13x)
-     - 69.6 → 19.8 (3.52x)
-     - 83.7 → 23.6 (3.55x)
-     - 64.5 → 30.0 (2.15x)
+     - 102.7 → 13.3 (7.72x)
+     - 73.1 → 18.7 (3.91x)
+     - 86.8 → 23.0 (3.77x)
+     - 77.2 → 28.8 (2.68x)
    * - 151936
      - 8
-     - 105.2 → 13.7 (7.68x)
-     - 91.4 → 20.7 (4.42x)
-     - 89.2 → 24.3 (3.67x)
-     - 133.9 → 32.1 (4.17x)
+     - 103.3 → 13.7 (7.54x)
+     - 92.4 → 19.5 (4.74x)
+     - 92.1 → 24.0 (3.84x)
+     - 119.3 → 30.4 (3.92x)
    * - 151936
      - 16
-     - 105.2 → 14.7 (7.16x)
-     - 101.8 → 22.5 (4.52x)
-     - 90.9 → 25.4 (3.58x)
-     - 104.3 → 34.5 (3.02x)
+     - 103.2 → 14.7 (7.02x)
+     - 104.3 → 21.6 (4.83x)
+     - 91.0 → 25.4 (3.58x)
+     - 116.1 → 33.4 (3.48x)
    * - 151936
      - 32
-     - 105.6 → 16.3 (6.48x)
-     - 113.3 → 23.6 (4.80x)
-     - 92.2 → 27.2 (3.39x)
-     - 141.2 → 35.7 (3.96x)
+     - 103.1 → 16.4 (6.29x)
+     - 113.9 → 22.5 (5.06x)
+     - 93.1 → 27.3 (3.41x)
+     - 119.8 → 34.7 (3.45x)
    * - 151936
      - 64
-     - 109.0 → 19.8 (5.51x)
-     - 164.3 → 34.2 (4.80x)
-     - 99.1 → 30.7 (3.23x)
-     - 182.8 → 46.3 (3.95x)
+     - 106.4 → 19.6 (5.43x)
+     - 164.8 → 28.1 (5.86x)
+     - 97.0 → 30.6 (3.17x)
+     - 169.9 → 41.1 (4.13x)
    * - 151936
      - 128
-     - 109.0 → 25.8 (4.22x)
-     - 222.5 → 42.2 (5.27x)
-     - 106.8 → 36.3 (2.94x)
-     - 271.1 → 56.3 (4.82x)
+     - 106.6 → 25.8 (4.13x)
+     - 222.2 → 42.2 (5.27x)
+     - 104.5 → 36.1 (2.89x)
+     - 233.1 → 57.0 (4.09x)
    * - 262144
      - 1
-     - 105.0 → 12.8 (8.20x)
-     - 86.7 → 21.2 (4.09x)
-     - 89.6 → 23.6 (3.80x)
-     - 72.6 → 31.9 (2.28x)
+     - 102.8 → 13.2 (7.79x)
+     - 94.1 → 20.7 (4.55x)
+     - 91.6 → 23.5 (3.90x)
+     - 142.9 → 30.7 (4.65x)
    * - 262144
      - 8
-     - 106.8 → 14.3 (7.47x)
-     - 123.0 → 21.9 (5.62x)
-     - 90.6 → 25.2 (3.60x)
-     - 184.8 → 33.7 (5.48x)
+     - 104.3 → 14.1 (7.40x)
+     - 119.1 → 21.1 (5.64x)
+     - 90.9 → 25.0 (3.64x)
+     - 131.6 → 31.9 (4.13x)
    * - 262144
      - 16
-     - 106.6 → 16.0 (6.66x)
-     - 140.8 → 23.4 (6.02x)
-     - 93.1 → 27.0 (3.45x)
-     - 177.2 → 35.4 (5.01x)
+     - 105.1 → 15.9 (6.61x)
+     - 143.1 → 23.3 (6.14x)
+     - 90.1 → 26.8 (3.36x)
+     - 163.3 → 35.3 (4.63x)
    * - 262144
      - 32
      - 114.6 → 18.6 (6.16x)
-     - 200.3 → 25.3 (7.92x)
-     - 132.6 → 29.6 (4.48x)
-     - 204.4 → 38.9 (5.25x)
+     - 197.4 → 25.2 (7.83x)
+     - 130.6 → 29.3 (4.46x)
+     - 281.7 → 38.1 (7.39x)
    * - 262144
      - 64
-     - 109.9 → 24.8 (4.43x)
-     - 262.8 → 34.3 (7.66x)
-     - 125.7 → 36.0 (3.49x)
-     - 290.8 → 47.7 (6.10x)
+     - 107.6 → 24.8 (4.34x)
+     - 265.0 → 34.2 (7.75x)
+     - 120.2 → 36.1 (3.33x)
+     - 272.6 → 46.8 (5.82x)
    * - 262144
      - 128
-     - 123.6 → 41.3 (2.99x)
-     - 375.7 → 52.6 (7.14x)
-     - 146.3 → 50.8 (2.88x)
-     - 361.2 → 64.7 (5.58x)
+     - 123.7 → 39.9 (3.10x)
+     - 376.1 → 50.9 (7.39x)
+     - 143.9 → 49.7 (2.90x)
+     - 381.2 → 63.1 (6.04x)
 
 .. list-table:: GB300 (sm_103a, 152 SMs), CUPTI median µs, top_k_first → cake_sampling
    :header-rows: 1
@@ -536,148 +589,148 @@ processes (27.97 / 28.06 vs 28.00 / 28.10 µs and 27.42 / 27.49 vs 27.39 / 27.42
      - k = 1000, CUDA graph
    * - 32768
      - 1
-     - 68.1 → 10.7 (6.36x)
-     - 67.6 → 20.5 (3.30x)
-     - 42.2 → 23.1 (1.83x)
-     - 47.4 → 27.8 (1.71x)
+     - 68.6 → 10.4 (6.60x)
+     - 69.5 → 19.9 (3.49x)
+     - 42.1 → 22.0 (1.91x)
+     - 41.8 → 27.3 (1.53x)
    * - 32768
      - 8
-     - 70.5 → 11.1 (6.35x)
-     - 71.5 → 19.9 (3.59x)
-     - 50.6 → 22.6 (2.24x)
-     - 56.4 → 26.7 (2.11x)
+     - 72.0 → 10.4 (6.92x)
+     - 73.3 → 19.4 (3.78x)
+     - 46.5 → 21.4 (2.17x)
+     - 51.6 → 27.2 (1.90x)
    * - 32768
      - 16
-     - 72.7 → 10.6 (6.86x)
-     - 73.6 → 20.0 (3.68x)
-     - 54.4 → 22.5 (2.42x)
-     - 50.7 → 27.4 (1.85x)
+     - 75.5 → 10.6 (7.12x)
+     - 74.8 → 19.8 (3.78x)
+     - 59.4 → 22.0 (2.70x)
+     - 55.5 → 27.3 (2.03x)
    * - 32768
      - 32
-     - 74.1 → 10.8 (6.86x)
-     - 75.4 → 19.9 (3.79x)
-     - 51.8 → 22.4 (2.31x)
-     - 55.5 → 29.2 (1.90x)
+     - 75.5 → 10.8 (6.99x)
+     - 76.1 → 19.1 (3.98x)
+     - 47.5 → 22.3 (2.13x)
+     - 54.5 → 29.3 (1.86x)
    * - 32768
      - 64
-     - 76.3 → 11.5 (6.63x)
-     - 77.0 → 19.9 (3.87x)
-     - 55.2 → 23.0 (2.40x)
-     - 56.7 → 31.9 (1.78x)
+     - 78.3 → 11.5 (6.81x)
+     - 78.5 → 19.6 (4.01x)
+     - 58.3 → 22.9 (2.55x)
+     - 52.2 → 30.8 (1.69x)
    * - 32768
      - 128
-     - 77.6 → 12.5 (6.21x)
-     - 78.1 → 20.0 (3.90x)
-     - 56.7 → 24.4 (2.32x)
-     - 62.2 → 33.2 (1.87x)
+     - 79.9 → 12.5 (6.39x)
+     - 79.5 → 19.2 (4.14x)
+     - 56.3 → 24.3 (2.32x)
+     - 56.7 → 30.8 (1.84x)
    * - 128256
      - 1
-     - 175.2 → 12.2 (14.36x)
-     - 82.2 → 19.7 (4.17x)
-     - 76.7 → 24.2 (3.17x)
-     - 79.2 → 30.5 (2.60x)
+     - 178.8 → 11.6 (15.41x)
+     - 84.2 → 19.1 (4.41x)
+     - 76.7 → 23.6 (3.25x)
+     - 64.5 → 29.9 (2.16x)
    * - 128256
      - 8
-     - 178.2 → 13.2 (13.50x)
-     - 98.7 → 20.5 (4.81x)
-     - 81.0 → 25.4 (3.19x)
-     - 87.9 → 30.5 (2.88x)
+     - 182.4 → 12.5 (14.59x)
+     - 104.2 → 21.4 (4.87x)
+     - 85.7 → 24.7 (3.47x)
+     - 87.0 → 30.5 (2.85x)
    * - 128256
      - 16
-     - 174.4 → 13.9 (12.55x)
-     - 105.1 → 23.0 (4.57x)
-     - 84.5 → 26.5 (3.19x)
-     - 86.7 → 36.6 (2.37x)
+     - 179.0 → 13.9 (12.88x)
+     - 109.8 → 20.9 (5.25x)
+     - 85.5 → 26.5 (3.23x)
+     - 91.3 → 34.3 (2.66x)
    * - 128256
      - 32
-     - 179.2 → 15.2 (11.79x)
-     - 113.4 → 23.7 (4.78x)
-     - 86.8 → 27.6 (3.14x)
-     - 105.8 → 38.1 (2.78x)
+     - 182.0 → 15.2 (11.97x)
+     - 114.7 → 21.1 (5.44x)
+     - 89.4 → 27.6 (3.24x)
+     - 97.8 → 35.6 (2.75x)
    * - 128256
      - 64
-     - 181.0 → 17.6 (10.28x)
-     - 136.7 → 29.1 (4.70x)
-     - 89.2 → 29.9 (2.98x)
-     - 167.0 → 44.3 (3.77x)
+     - 183.6 → 17.6 (10.43x)
+     - 137.7 → 29.1 (4.73x)
+     - 89.8 → 29.7 (3.02x)
+     - 133.0 → 43.5 (3.06x)
    * - 128256
      - 128
-     - 184.4 → 22.5 (8.20x)
-     - 184.7 → 35.5 (5.20x)
-     - 93.9 → 34.5 (2.72x)
-     - 197.4 → 49.1 (4.02x)
+     - 186.4 → 22.5 (8.28x)
+     - 184.4 → 35.4 (5.21x)
+     - 93.9 → 34.2 (2.75x)
+     - 196.5 → 49.3 (3.99x)
    * - 151936
      - 1
-     - 180.1 → 12.8 (14.07x)
-     - 87.1 → 20.8 (4.19x)
-     - 79.9 → 25.7 (3.11x)
-     - 87.7 → 33.5 (2.62x)
+     - 184.7 → 12.5 (14.78x)
+     - 88.5 → 20.2 (4.38x)
+     - 79.9 → 24.9 (3.21x)
+     - 82.9 → 32.2 (2.57x)
    * - 151936
      - 8
-     - 178.8 → 13.9 (12.86x)
-     - 105.2 → 20.7 (5.08x)
-     - 84.9 → 26.5 (3.20x)
-     - 116.0 → 34.3 (3.38x)
+     - 182.9 → 13.6 (13.45x)
+     - 108.8 → 21.0 (5.18x)
+     - 90.3 → 26.1 (3.46x)
+     - 102.7 → 33.1 (3.10x)
    * - 151936
      - 16
-     - 179.6 → 14.9 (12.05x)
-     - 115.5 → 22.3 (5.18x)
-     - 90.0 → 27.6 (3.26x)
-     - 123.3 → 35.6 (3.46x)
+     - 179.6 → 14.8 (12.14x)
+     - 117.2 → 22.2 (5.28x)
+     - 91.7 → 27.5 (3.33x)
+     - 120.8 → 35.3 (3.42x)
    * - 151936
      - 32
-     - 178.1 → 16.3 (10.93x)
-     - 123.4 → 22.9 (5.39x)
-     - 90.8 → 29.0 (3.13x)
-     - 129.2 → 37.1 (3.48x)
+     - 179.8 → 16.4 (10.96x)
+     - 122.8 → 21.9 (5.61x)
+     - 93.5 → 28.8 (3.25x)
+     - 112.0 → 36.7 (3.05x)
    * - 151936
      - 64
-     - 181.3 → 19.6 (9.25x)
+     - 184.3 → 19.6 (9.40x)
      - 157.0 → 27.0 (5.81x)
-     - 92.2 → 31.8 (2.90x)
-     - 173.9 → 41.3 (4.21x)
+     - 94.4 → 31.6 (2.99x)
+     - 184.0 → 40.9 (4.50x)
    * - 151936
      - 128
-     - 185.0 → 25.8 (7.17x)
-     - 213.2 → 37.2 (5.73x)
-     - 102.2 → 38.6 (2.65x)
-     - 217.5 → 50.7 (4.29x)
+     - 186.0 → 25.8 (7.21x)
+     - 213.8 → 37.0 (5.78x)
+     - 103.6 → 38.2 (2.71x)
+     - 222.0 → 50.8 (4.37x)
    * - 262144
      - 1
-     - 177.6 → 13.1 (13.56x)
-     - 103.4 → 20.4 (5.07x)
-     - 83.2 → 26.1 (3.19x)
-     - 112.1 → 34.6 (3.24x)
+     - 181.0 → 12.7 (14.25x)
+     - 105.1 → 21.4 (4.91x)
+     - 88.0 → 25.4 (3.46x)
+     - 78.0 → 36.0 (2.17x)
    * - 262144
      - 8
-     - 178.2 → 14.4 (12.37x)
-     - 135.1 → 21.1 (6.40x)
-     - 83.9 → 27.1 (3.10x)
-     - 159.6 → 34.4 (4.64x)
+     - 183.6 → 14.2 (12.93x)
+     - 138.3 → 21.8 (6.34x)
+     - 89.5 → 27.1 (3.30x)
+     - 123.6 → 35.9 (3.44x)
    * - 262144
      - 16
-     - 180.3 → 16.1 (11.20x)
-     - 152.6 → 22.9 (6.66x)
-     - 90.6 → 28.9 (3.13x)
-     - 164.5 → 36.8 (4.47x)
+     - 181.7 → 15.9 (11.43x)
+     - 151.8 → 22.9 (6.63x)
+     - 92.0 → 28.8 (3.19x)
+     - 161.1 → 37.1 (4.34x)
    * - 262144
      - 32
-     - 174.5 → 18.5 (9.43x)
-     - 188.9 → 24.7 (7.65x)
-     - 131.6 → 31.1 (4.23x)
-     - 211.1 → 38.8 (5.44x)
+     - 182.6 → 18.3 (9.98x)
+     - 189.8 → 24.4 (7.78x)
+     - 135.3 → 31.2 (4.34x)
+     - 223.4 → 38.8 (5.76x)
    * - 262144
      - 64
-     - 182.9 → 25.2 (7.26x)
-     - 254.7 → 33.3 (7.65x)
-     - 120.8 → 37.8 (3.20x)
-     - 266.9 → 46.9 (5.69x)
+     - 187.4 → 25.2 (7.44x)
+     - 255.2 → 33.1 (7.71x)
+     - 122.6 → 37.8 (3.24x)
+     - 258.1 → 48.1 (5.37x)
    * - 262144
      - 128
-     - 180.5 → 38.3 (4.71x)
-     - 360.7 → 56.9 (6.34x)
-     - 144.6 → 51.4 (2.81x)
-     - 373.6 → 70.3 (5.31x)
+     - 186.3 → 36.3 (5.13x)
+     - 365.6 → 48.0 (7.62x)
+     - 146.0 → 49.1 (2.97x)
+     - 369.1 → 63.2 (5.84x)
 
 .. list-table:: VR200 R200 (sm_107a, 212 SMs), CUPTI median µs, top_k_first → cake_sampling
    :header-rows: 1
@@ -691,148 +744,148 @@ processes (27.97 / 28.06 vs 28.00 / 28.10 µs and 27.42 / 27.49 vs 27.39 / 27.42
      - k = 1000, CUDA graph
    * - 32768
      - 1
-     - 29.9 → 9.1 (3.29x)
+     - 29.8 → 9.1 (3.27x)
      - 30.1 → 12.5 (2.41x)
-     - 39.0 → 16.6 (2.35x)
-     - 33.7 → 21.3 (1.58x)
+     - 38.2 → 18.3 (2.09x)
+     - 36.6 → 22.7 (1.61x)
    * - 32768
      - 8
-     - 33.7 → 9.9 (3.40x)
-     - 33.4 → 13.5 (2.47x)
-     - 37.8 → 17.5 (2.16x)
-     - 37.7 → 22.6 (1.67x)
+     - 33.1 → 10.0 (3.31x)
+     - 33.6 → 13.7 (2.45x)
+     - 39.6 → 19.3 (2.05x)
+     - 44.0 → 24.5 (1.80x)
    * - 32768
      - 16
-     - 35.6 → 10.5 (3.39x)
-     - 35.6 → 13.6 (2.62x)
-     - 43.7 → 18.1 (2.41x)
-     - 38.9 → 22.7 (1.71x)
+     - 35.3 → 10.6 (3.33x)
+     - 35.2 → 13.8 (2.55x)
+     - 42.8 → 19.7 (2.17x)
+     - 40.6 → 24.4 (1.66x)
    * - 32768
      - 32
-     - 37.3 → 11.0 (3.39x)
-     - 37.3 → 13.8 (2.70x)
-     - 42.2 → 18.3 (2.31x)
-     - 43.3 → 22.7 (1.91x)
+     - 36.3 → 11.0 (3.30x)
+     - 36.9 → 13.9 (2.65x)
+     - 42.5 → 20.0 (2.12x)
+     - 44.7 → 24.4 (1.83x)
    * - 32768
      - 64
-     - 38.5 → 10.8 (3.56x)
-     - 38.6 → 15.8 (2.44x)
-     - 46.3 → 18.3 (2.53x)
-     - 44.2 → 24.4 (1.81x)
+     - 37.7 → 10.9 (3.46x)
+     - 38.3 → 15.9 (2.41x)
+     - 46.3 → 19.8 (2.34x)
+     - 43.8 → 26.1 (1.68x)
    * - 32768
      - 128
-     - 39.3 → 11.4 (3.45x)
-     - 39.8 → 17.2 (2.31x)
-     - 52.2 → 18.4 (2.84x)
-     - 52.4 → 26.8 (1.96x)
+     - 38.9 → 11.4 (3.41x)
+     - 39.2 → 16.3 (2.40x)
+     - 45.4 → 20.0 (2.27x)
+     - 50.8 → 27.7 (1.83x)
    * - 128256
      - 1
-     - 70.6 → 11.1 (6.36x)
-     - 56.1 → 14.6 (3.84x)
-     - 70.0 → 18.6 (3.76x)
-     - 58.6 → 24.1 (2.43x)
+     - 78.9 → 11.2 (7.04x)
+     - 55.4 → 14.7 (3.77x)
+     - 72.9 → 20.5 (3.56x)
+     - 64.9 → 25.6 (2.54x)
    * - 128256
      - 8
-     - 71.6 → 11.8 (6.07x)
-     - 68.1 → 16.1 (4.23x)
-     - 74.4 → 19.6 (3.80x)
-     - 74.6 → 24.9 (3.00x)
+     - 81.6 → 11.9 (6.86x)
+     - 67.6 → 16.2 (4.17x)
+     - 77.2 → 21.2 (3.64x)
+     - 73.5 → 26.4 (2.78x)
    * - 128256
      - 16
-     - 71.3 → 12.9 (5.53x)
-     - 75.3 → 16.6 (4.54x)
-     - 72.7 → 20.5 (3.55x)
-     - 75.2 → 26.0 (2.89x)
+     - 80.0 → 13.0 (6.15x)
+     - 75.9 → 16.9 (4.49x)
+     - 73.8 → 22.3 (3.31x)
+     - 92.8 → 27.4 (3.39x)
    * - 128256
      - 32
-     - 73.4 → 13.5 (5.44x)
-     - 84.6 → 20.7 (4.09x)
-     - 76.6 → 21.0 (3.65x)
-     - 89.6 → 30.2 (2.97x)
+     - 84.8 → 13.5 (6.28x)
+     - 83.3 → 18.5 (4.50x)
+     - 79.8 → 22.7 (3.52x)
+     - 85.2 → 29.3 (2.91x)
    * - 128256
      - 64
-     - 73.3 → 15.5 (4.73x)
-     - 92.3 → 24.9 (3.71x)
-     - 78.9 → 23.1 (3.42x)
-     - 91.0 → 34.4 (2.65x)
+     - 84.3 → 15.5 (5.44x)
+     - 93.0 → 24.4 (3.81x)
+     - 81.6 → 24.6 (3.32x)
+     - 96.1 → 35.6 (2.70x)
    * - 128256
      - 128
-     - 73.2 → 19.2 (3.81x)
-     - 138.0 → 30.7 (4.50x)
-     - 79.0 → 26.6 (2.97x)
-     - 144.6 → 41.4 (3.49x)
+     - 84.5 → 19.2 (4.40x)
+     - 139.9 → 30.0 (4.66x)
+     - 81.8 → 28.1 (2.91x)
+     - 148.8 → 42.3 (3.52x)
    * - 151936
      - 1
-     - 70.7 → 12.0 (5.89x)
-     - 62.7 → 16.9 (3.71x)
-     - 69.8 → 19.4 (3.60x)
-     - 84.5 → 26.2 (3.23x)
+     - 81.4 → 12.1 (6.73x)
+     - 63.0 → 17.1 (3.68x)
+     - 72.9 → 21.1 (3.45x)
+     - 72.4 → 27.3 (2.65x)
    * - 151936
      - 8
-     - 70.4 → 12.8 (5.50x)
-     - 77.1 → 17.8 (4.33x)
-     - 77.2 → 20.4 (3.78x)
-     - 100.2 → 26.9 (3.72x)
+     - 80.4 → 13.0 (6.18x)
+     - 76.9 → 18.0 (4.27x)
+     - 80.1 → 22.1 (3.62x)
+     - 83.1 → 28.2 (2.95x)
    * - 151936
      - 16
-     - 70.8 → 13.9 (5.09x)
-     - 87.0 → 18.2 (4.78x)
-     - 78.6 → 21.3 (3.69x)
-     - 119.2 → 27.7 (4.30x)
+     - 82.1 → 14.1 (5.82x)
+     - 86.2 → 18.4 (4.68x)
+     - 79.5 → 23.0 (3.46x)
+     - 87.7 → 29.2 (3.00x)
    * - 151936
      - 32
-     - 70.8 → 14.6 (4.85x)
-     - 97.0 → 20.3 (4.78x)
-     - 81.7 → 22.4 (3.65x)
-     - 105.5 → 29.3 (3.60x)
+     - 82.9 → 14.6 (5.68x)
+     - 96.3 → 19.4 (4.96x)
+     - 84.8 → 24.0 (3.53x)
+     - 111.5 → 29.8 (3.74x)
    * - 151936
      - 64
-     - 73.1 → 17.1 (4.27x)
-     - 106.5 → 27.4 (3.89x)
-     - 81.5 → 24.7 (3.30x)
-     - 113.5 → 37.5 (3.03x)
+     - 84.8 → 17.0 (4.99x)
+     - 107.0 → 22.5 (4.76x)
+     - 84.5 → 26.1 (3.24x)
+     - 132.2 → 32.8 (4.03x)
    * - 151936
      - 128
-     - 74.0 → 22.4 (3.30x)
-     - 159.8 → 35.4 (4.51x)
-     - 88.8 → 29.7 (2.99x)
-     - 174.7 → 46.5 (3.76x)
+     - 86.0 → 22.2 (3.87x)
+     - 162.5 → 36.2 (4.49x)
+     - 92.5 → 30.9 (2.99x)
+     - 168.4 → 48.0 (3.51x)
    * - 262144
      - 1
-     - 70.4 → 12.1 (5.82x)
-     - 77.5 → 18.0 (4.31x)
-     - 74.8 → 19.7 (3.80x)
-     - 74.9 → 28.0 (2.68x)
+     - 81.1 → 12.1 (6.70x)
+     - 78.0 → 18.6 (4.19x)
+     - 77.9 → 21.3 (3.66x)
+     - 87.9 → 29.8 (2.95x)
    * - 262144
      - 8
-     - 70.8 → 13.2 (5.36x)
-     - 103.9 → 19.1 (5.44x)
-     - 78.5 → 20.6 (3.81x)
-     - 109.9 → 28.8 (3.82x)
+     - 80.4 → 13.3 (6.05x)
+     - 102.6 → 19.4 (5.29x)
+     - 81.5 → 22.4 (3.64x)
+     - 136.2 → 30.2 (4.51x)
    * - 262144
      - 16
-     - 70.8 → 14.1 (5.02x)
-     - 117.9 → 20.2 (5.84x)
-     - 78.2 → 21.3 (3.67x)
-     - 163.2 → 29.5 (5.53x)
+     - 82.3 → 14.1 (5.84x)
+     - 118.0 → 20.3 (5.81x)
+     - 79.3 → 23.0 (3.45x)
+     - 157.6 → 30.8 (5.12x)
    * - 262144
      - 32
-     - 71.0 → 15.9 (4.47x)
-     - 133.4 → 23.8 (5.61x)
-     - 81.7 → 23.5 (3.48x)
-     - 122.5 → 33.5 (3.66x)
+     - 80.2 → 15.8 (5.08x)
+     - 133.6 → 21.1 (6.33x)
+     - 84.3 → 25.3 (3.33x)
+     - 150.2 → 32.3 (4.65x)
    * - 262144
      - 64
-     - 87.2 → 20.9 (4.17x)
-     - 194.1 → 28.0 (6.93x)
-     - 109.6 → 28.6 (3.83x)
-     - 176.1 → 37.4 (4.71x)
+     - 88.6 → 20.6 (4.30x)
+     - 196.8 → 28.1 (7.00x)
+     - 113.3 → 29.5 (3.84x)
+     - 209.5 → 38.8 (5.40x)
    * - 262144
      - 128
-     - 106.0 → 30.5 (3.48x)
-     - 295.3 → 40.7 (7.26x)
-     - 123.1 → 37.8 (3.26x)
-     - 301.3 → 49.9 (6.04x)
+     - 107.6 → 27.5 (3.91x)
+     - 296.2 → 38.0 (7.79x)
+     - 127.4 → 36.5 (3.49x)
+     - 300.6 → 47.9 (6.28x)
 
 .. currentmodule:: flashinfer.cake_sampling
 
