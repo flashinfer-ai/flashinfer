@@ -231,6 +231,7 @@ from .alphamoe_nvfp4_sm100 import (  # noqa: F401
 from .bgmv_moe import (  # noqa: F401
     BGMVMoEBlackwellPlan as BGMVMoEBlackwellPlan,
     BGMVMoECakePlan as BGMVMoECakePlan,
+    BGMVMoEPortablePlan as BGMVMoEPortablePlan,
     bgmv_moe as bgmv_moe,
     bgmv_moe_shrink as bgmv_moe_shrink,
     bgmv_moe_expand as bgmv_moe_expand,
@@ -457,6 +458,7 @@ __all__ = [
     "bgmv_moe",
     "BGMVMoEBlackwellPlan",
     "BGMVMoECakePlan",
+    "BGMVMoEPortablePlan",
     "bgmv_moe_shrink",
     "bgmv_moe_expand",
     "bgmv_moe_gemm1_lora_delta",
