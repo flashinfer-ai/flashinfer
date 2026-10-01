@@ -19,14 +19,14 @@
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
 
-#define CAKE_MOE_FINALIZE_KERNEL(T, NAME)                                                        \
-  extern "C" __global__ void NAME(                                                               \
-      T* __restrict__ allreduce_in, int* __restrict__ inverse_indices,                           \
-      T* __restrict__ expert_scales, T* __restrict__ shared_expert_output,                       \
-      T* __restrict__ residual, T* __restrict__ norm_weight, T* __restrict__ residual_out,       \
-      T* __restrict__ norm_out, T* __restrict__ quant_out, T* __restrict__ scale_out,            \
-      long long* __restrict__ workspace_tensor, int world_rank, int tokens, int top_k,           \
-      int has_shared_expert, float routed_scaling_factor, float epsilon, float weight_bias,      \
+#define CAKE_MOE_FINALIZE_KERNEL(T, NAME)                                                   \
+  extern "C" __global__ void NAME(                                                          \
+      T* __restrict__ allreduce_in, int* __restrict__ inverse_indices,                      \
+      T* __restrict__ expert_scales, T* __restrict__ shared_expert_output,                  \
+      T* __restrict__ residual, T* __restrict__ norm_weight, T* __restrict__ residual_out,  \
+      T* __restrict__ norm_out, T* __restrict__ quant_out, T* __restrict__ scale_out,       \
+      long long* __restrict__ workspace_tensor, int world_rank, int tokens, int top_k,      \
+      int has_shared_expert, float routed_scaling_factor, float epsilon, float weight_bias, \
       float scale_factor);
 
 CAKE_MOE_FINALIZE_KERNEL(__half, kernel_cake_trtllm_moe_finalize_float16_ws2_o110)
@@ -114,9 +114,9 @@ void cake_moe_finalize_allreduce_fusion(
       << "Cake MoE finalize weight_bias must be 0.0 or 1.0, got " << weight_bias;
 
   CHECK_INPUT(allreduce_in);
-  TVM_FFI_CHECK(allreduce_in.ndim() == 2 && allreduce_in.size(1) == kHiddenDim &&
-                    allreduce_in.size(0) > 0,
-                ValueError)
+  TVM_FFI_CHECK(
+      allreduce_in.ndim() == 2 && allreduce_in.size(1) == kHiddenDim && allreduce_in.size(0) > 0,
+      ValueError)
       << "allreduce_in must have shape [num_permuted_rows, " << kHiddenDim << "]";
   int dtype_index = 0;
   switch (encode_dlpack_dtype(allreduce_in.dtype())) {
@@ -133,9 +133,9 @@ void cake_moe_finalize_allreduce_fusion(
   CHECK_INPUT(residual_in);
   CHECK_DEVICE(residual_in, allreduce_in);
   CHECK_SAME_DTYPE(residual_in, allreduce_in);
-  TVM_FFI_CHECK(residual_in.ndim() == 2 && residual_in.size(1) == kHiddenDim &&
-                    residual_in.size(0) > 0,
-                ValueError)
+  TVM_FFI_CHECK(
+      residual_in.ndim() == 2 && residual_in.size(1) == kHiddenDim && residual_in.size(0) > 0,
+      ValueError)
       << "residual_in must have shape [token_num, " << kHiddenDim << "] with token_num > 0";
   const int64_t tokens = residual_in.size(0);
 
@@ -147,11 +147,10 @@ void cake_moe_finalize_allreduce_fusion(
 
   CHECK_INPUT_AND_TYPE(expanded_idx_to_permuted_idx, dl_int32);
   CHECK_DEVICE(expanded_idx_to_permuted_idx, allreduce_in);
-  TVM_FFI_CHECK(expanded_idx_to_permuted_idx.ndim() == 2 &&
-                    expanded_idx_to_permuted_idx.size(0) == tokens &&
-                    (expanded_idx_to_permuted_idx.size(1) == 4 ||
-                     expanded_idx_to_permuted_idx.size(1) == 8),
-                ValueError)
+  TVM_FFI_CHECK(
+      expanded_idx_to_permuted_idx.ndim() == 2 && expanded_idx_to_permuted_idx.size(0) == tokens &&
+          (expanded_idx_to_permuted_idx.size(1) == 4 || expanded_idx_to_permuted_idx.size(1) == 8),
+      ValueError)
       << "expanded_idx_to_permuted_idx must have shape [token_num, top_k] with top_k 4 or 8";
   const int64_t top_k = expanded_idx_to_permuted_idx.size(1);
 
@@ -196,8 +195,8 @@ void cake_moe_finalize_allreduce_fusion(
 
   const DLDevice device = allreduce_in.device();
   ffi::CUDADeviceGuard device_guard(device.device_id);
-  const int64_t clusters = std::min<int64_t>(sm_count(device.device_id), tokens * kClusterSize) /
-                           kClusterSize;
+  const int64_t clusters =
+      std::min<int64_t>(sm_count(device.device_id), tokens * kClusterSize) / kClusterSize;
   TVM_FFI_CHECK(clusters > 0, RuntimeError)
       << "Cake MoE finalize requires one complete four-CTA cluster";
 
@@ -221,25 +220,12 @@ void cake_moe_finalize_allreduce_fusion(
   float v_epsilon = static_cast<float>(eps);
   float v_weight_bias = static_cast<float>(weight_bias);
   float v_scale_factor = 1.0f;
-  void* args[] = {&p_allreduce_in,
-                  &p_inverse_indices,
-                  &p_expert_scales,
-                  &p_shared_expert_output,
-                  &p_residual,
-                  &p_norm_weight,
-                  &p_residual_out,
-                  &p_norm_out,
-                  &p_quant_out,
-                  &p_scale_out,
-                  &p_workspace,
-                  &v_world_rank,
-                  &v_tokens,
-                  &v_top_k,
-                  &v_has_shared_expert,
-                  &v_routed_scaling_factor,
-                  &v_epsilon,
-                  &v_weight_bias,
-                  &v_scale_factor};
+  void* args[] = {
+      &p_allreduce_in, &p_inverse_indices, &p_expert_scales,     &p_shared_expert_output,
+      &p_residual,     &p_norm_weight,     &p_residual_out,      &p_norm_out,
+      &p_quant_out,    &p_scale_out,       &p_workspace,         &v_world_rank,
+      &v_tokens,       &v_top_k,           &v_has_shared_expert, &v_routed_scaling_factor,
+      &v_epsilon,      &v_weight_bias,     &v_scale_factor};
 
   cudaLaunchAttribute attrs[2]{};
   unsigned num_attrs = 0;
