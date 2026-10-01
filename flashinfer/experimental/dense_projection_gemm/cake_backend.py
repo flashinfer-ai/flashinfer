@@ -113,7 +113,9 @@ SUPPORTED_COMPUTE_CAPABILITIES = {
 
 BLOCK_M = 128  # A rows per MMA instruction per CTA (256 per CTA pair)  [Cake L48]
 BLOCK_K = 64  # K elements per stage (128-byte swizzle rows)  [Cake L54]
-PANEL_BYTES = BLOCK_K * 128  # one MN-major B panel: 64 K rows x 128 B = 8192  [Cake L56]
+PANEL_BYTES = (
+    BLOCK_K * 128
+)  # one MN-major B panel: 64 K rows x 128 B = 8192  [Cake L56]
 CTA_GROUP = 2  # CTAs per cluster / MMA pair  [Cake L55]
 EPI_WARPS = 8  # [Cake L63]
 WORK_STAGES = 4  # cluster-launch-control work-ring depth  [Cake L64]
@@ -266,7 +268,9 @@ def epi_mode(
         return "tma"
     # bf16 chunks are 64 columns: a 96-column (BLOCK_N = 192) warp slice has no whole-chunk TMA-store path
     return (
-        "tma" if (K is not None and K <= K_TMA_BF16 and (block_n // 2) % 64 == 0) else "reg"
+        "tma"
+        if (K is not None and K <= K_TMA_BF16 and (block_n // 2) % 64 == 0)
+        else "reg"
     )
 
 
@@ -479,6 +483,7 @@ def swap_small_m(L: int, M: int, N: int, transposed_out: bool) -> bool:
     return L > 1 and not transposed_out and M <= 256 and N >= 2 * M
 
 
+# fmt: off
 # Per-architecture, per-row knob overrides measured in Cake round 2, keyed by the static row identity
 # (arch, A MN-major, B MN-major, fp32 output, transposed output, batched, N, K, M); the ragged token
 # count never keys a rule (M = None for forward / input gradients, K = None for weight gradients).
@@ -563,6 +568,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, True, True, False, 128, None, 6144): {"block_n": 128},
     ('sm_107a', True, True, True, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
 }
+# fmt: on
 
 
 def row_rule(
@@ -884,7 +890,7 @@ def plan_dense_projection_gemm(
     the plan is redone without the swap and / or without the rule (``plan.swap_fallback`` /
     ``plan.rule_fallback``) so the call still runs; the result is identical, only the tile walk differs.
     ``_fallback=False`` returns the pure mirror (unit tests of the planner)."""
-    _caller_knobs = dict(
+    _caller_knobs: dict[str, Any] = dict(
         transposed_out=transposed_out,
         sk=sk,
         block_n=block_n,
@@ -941,10 +947,14 @@ def plan_dense_projection_gemm(
     rule_dropped = (
         {}
         if _use_rules
-        else row_rule(arch, a_mn, b_mn, out.dtype == torch.float32, transposed_out, L > 1, N, K, M)
+        else row_rule(
+            arch, a_mn, b_mn, out.dtype == torch.float32, transposed_out, L > 1, N, K, M
+        )
     )
     rule = (
-        row_rule(arch, a_mn, b_mn, out.dtype == torch.float32, transposed_out, L > 1, N, K, M)
+        row_rule(
+            arch, a_mn, b_mn, out.dtype == torch.float32, transposed_out, L > 1, N, K, M
+        )
         if _use_rules
         else {}
     )
@@ -1065,9 +1075,9 @@ def plan_dense_projection_gemm(
                 return candidate
         # last resort: the nearest registered knob variant of the same layout / output kind (every knob set
         # computes the same GEMM; only the tile walk and the store path differ)
-        for allow_swap in ((True, False) if swapped else (False,)):
+        for allow_swap in (True, False) if swapped else (False,):
             for knobs in _FALLBACK_KNOB_VARIANTS:
-                merged = dict(_caller_knobs)
+                merged: dict[str, Any] = dict(_caller_knobs)
                 for name, value in knobs.items():
                     if merged.get(name) is None:
                         merged[name] = value
@@ -1088,7 +1098,10 @@ def plan_dense_projection_gemm(
                 except ValueError:
                     continue  # a knob the row cannot take (e.g. epi="tma" with a transposed store)
                 if candidate[0].template in KERNELS.get(arch, {}):
-                    return (dataclasses.replace(candidate[0], knob_fallback=True), *candidate[1:])
+                    return (
+                        dataclasses.replace(candidate[0], knob_fallback=True),
+                        *candidate[1:],
+                    )
     return plan, a_desc, b_desc, O3
 
 

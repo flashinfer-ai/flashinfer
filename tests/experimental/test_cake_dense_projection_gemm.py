@@ -146,6 +146,7 @@ SM_COUNTS = (148, 212)
 # GENERATED from the Cake kernel host (adapter _plan_k1 with the mirrored sm_100a rule table) by the Cake
 # workspace tool stage/r2/gen_fi_test_tables.py; the exported set is cake_jit.KERNELS of the delivered tree. Do not hand-edit.
 # Table values are a template, or {(T, sm_count): template} when the plan depends on T / the device.
+# fmt: off
 # --- BEGIN GENERATED TABLES ---
 L2_BYTES = 132120576
 EXPECTED_TEMPLATES = {
@@ -460,6 +461,7 @@ EXPORTED_TEMPLATES = frozenset(
     }
 )
 # --- END GENERATED TABLES ---
+# fmt: on
 
 
 def _expected(table, key, T, sm_count):
@@ -490,7 +492,9 @@ def _rule_of(plan, sm_count):
 
 def _registered(arch):
     """The K1 templates that are generated programs of ``arch`` in this tree (the export registers per architecture)."""
-    return frozenset(t for t in cake_jit.KERNELS.get(arch, {}) if t.startswith("dense_proj_gemm_"))
+    return frozenset(
+        t for t in cake_jit.KERNELS.get(arch, {}) if t.startswith("dense_proj_gemm_")
+    )
 
 
 def _assert_mirrors_cake(plan, cake_template, where, arch):
@@ -499,10 +503,15 @@ def _assert_mirrors_cake(plan, cake_template, where, arch):
     the contract's T, or a default tail-T instance no contract row of this architecture produced -- all of which
     the Cake host JIT-compiles) the FlashInfer planner must have fallen back onto a generated program."""
     registered = _registered(arch)
-    assert registered <= EXPORTED_TEMPLATES, (arch, sorted(registered - EXPORTED_TEMPLATES))
+    assert registered <= EXPORTED_TEMPLATES, (
+        arch,
+        sorted(registered - EXPORTED_TEMPLATES),
+    )
     if cake_template in registered:
         assert plan.template == cake_template, (*where, plan.template)
-        assert not (plan.swap_fallback or plan.rule_fallback or plan.knob_fallback), where
+        assert not (plan.swap_fallback or plan.rule_fallback or plan.knob_fallback), (
+            where
+        )
     else:
         assert plan.swap_fallback or plan.rule_fallback or plan.knob_fallback, (
             *where,
@@ -942,7 +951,8 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
         v["B"],
         v["out"],
         sm_count=148,
-        l2_bytes=L2_BYTES, _fallback=False,
+        l2_bytes=L2_BYTES,
+        _fallback=False,
         transposed_out=v["transposed"],
     )
     assert (plan.pair_tiles, plan.k_blocks) == (24, 16)
@@ -960,7 +970,8 @@ def test_planner_defaults_to_auto_stream_k_and_guards_the_slice_counters():
         v["B"],
         v["out"],
         sm_count=148,
-        l2_bytes=L2_BYTES, _fallback=False,
+        l2_bytes=L2_BYTES,
+        _fallback=False,
         transposed_out=v["transposed"],
         sk=False,
     )
@@ -1107,7 +1118,8 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 mirrored = not plan.knob_fallback
                 assert not mirrored or plan.cta_rows == rule.get("cta_rows", 128)
                 assert not mirrored or (
-                    plan.pf == rule.get("pf", 0) and plan.promo == rule.get("promo", "none")
+                    plan.pf == rule.get("pf", 0)
+                    and plan.promo == rule.get("promo", "none")
                 )
                 assert not mirrored or plan.group_m == rule.get(
                     "group_m",
@@ -1128,9 +1140,14 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 if "stages" not in rule and plan.cta_rows == 128:
                     assert (
                         plan.stages
-                        == {(256, 0): 7, (256, 1): 6, (192, 0): 7, (192, 1): 6, (128, 0): 9, (128, 1): 8}[
-                            (plan.block_n, plan.slots)
-                        ]
+                        == {
+                            (256, 0): 7,
+                            (256, 1): 6,
+                            (192, 0): 7,
+                            (192, 1): 6,
+                            (128, 0): 9,
+                            (128, 1): 8,
+                        }[(plan.block_n, plan.slots)]
                     )
                 assert plan.l2_bytes == L2_BYTES
                 assert plan.wave_working_set_bytes == wave_working_set(
@@ -1207,7 +1224,9 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         and not plan.a_mn
                         and plan.b_mn
                     )
-                elif wgrad_swapped(N, K):  # work-minimising swap (round 3): X.T @ G with the transposed store
+                elif wgrad_swapped(
+                    N, K
+                ):  # work-minimising swap (round 3): X.T @ G with the transposed store
                     assert (plan.M, plan.N, plan.K) == (K, N, T) and plan.transposed_out
                 else:
                     assert (
@@ -1288,7 +1307,9 @@ def test_mla_rows_plan_as_batched_views(T, sm_count):
         "sm_100a",
     )
     assert plan.block_n == default_block_n(192, False) == 192
-    assert plan.template.startswith("dense_proj_gemm_kk_n192") and not plan.template.endswith("_tma1")
+    assert plan.template.startswith(
+        "dense_proj_gemm_kk_n192"
+    ) and not plan.template.endswith("_tma1")
 
 
 def test_operand_view_classification_and_rejections():
@@ -1379,7 +1400,9 @@ def test_wgrad_swap_rule():
     assert not wgrad_swapped(256, 6144)  # a tie keeps the direct route
     A, B, transposed = wgrad_views(G, X)
     assert not transposed and A.shape == (256, 100) and B is X
-    assert not wgrad_swapped(6144, 2048) and not wgrad_swapped(32, 64)  # large N; a 32 x 64 tie
+    assert not wgrad_swapped(6144, 2048) and not wgrad_swapped(
+        32, 64
+    )  # large N; a 32 x 64 tie
 
 
 def test_batched_small_m_swap_and_row_rules():
@@ -1393,10 +1416,17 @@ def test_batched_small_m_swap_and_row_rules():
     assert swap_small_m(H, M, N, False) and not swap_small_m(1, M, N, False)
     assert not swap_small_m(H, 512, 192, False) and not swap_small_m(H, M, N, True)
     plan, a_desc, b_desc, out3 = plan_dense_projection_gemm(
-        Q.permute(1, 2, 0), dL.permute(1, 0, 2), out, sm_count=148, l2_bytes=L2_BYTES, _fallback=False
+        Q.permute(1, 2, 0),
+        dL.permute(1, 0, 2),
+        out,
+        sm_count=148,
+        l2_bytes=L2_BYTES,
+        _fallback=False,
     )
     assert (plan.L, plan.M, plan.N, plan.K) == (H, N, M, T)
-    assert plan.a_mn and plan.b_mn and plan.transposed_out and plan.block_n == 192  # N' = 192: one exact tile
+    assert (
+        plan.a_mn and plan.b_mn and plan.transposed_out and plan.block_n == 192
+    )  # N' = 192: one exact tile
     assert plan.template.startswith(
         "dense_proj_gemm_nn_n192"
     ) and plan.template.endswith("_t")
@@ -1427,7 +1457,8 @@ def test_batched_small_m_swap_and_row_rules():
             dL.permute(1, 0, 2),
             out,
             sm_count=148,
-            l2_bytes=L2_BYTES, _fallback=False,
+            l2_bytes=L2_BYTES,
+            _fallback=False,
             arch="sm_100a",
         )
         assert (
@@ -1441,7 +1472,8 @@ def test_batched_small_m_swap_and_row_rules():
             dL.permute(1, 0, 2),
             out,
             sm_count=148,
-            l2_bytes=L2_BYTES, _fallback=False,
+            l2_bytes=L2_BYTES,
+            _fallback=False,
             arch="sm_100a",
             cta_rows=128,
         )
