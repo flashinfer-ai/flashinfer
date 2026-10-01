@@ -139,9 +139,82 @@ ROWS["doc_16231"] = ([16231], [16231])  # one document at the recorded token cou
 ROWS["doc_4095"] = ([4095], [4095])  # tile / chunk boundary
 ROWS["doc_4097"] = ([4097], [4097])
 
+
+# GB200 trainer-trace rows (round 2 of issue #5675): the recorded dK/dV destination buffers have FEWER rows than the
+# KV buffer (268,757 key rows into 260,611 fp32 rows for batch a, 267,520 into 259,412 for batch b -- 3.03 % of the key
+# rows share a destination), and the backward runs in 4096-query chunks over the whole packed key row.
+GLM_DST_ROWS = {"glm_a": (GLM_A[1], 260611), "glm_b": (GLM_B[1], 259412)}
+
+
+def dst_map_rows(seq_k, dst_rows):
+    """Destination row of every key row (Python ints, ``sum(seq_k)`` long) of the overlap map that reproduces a recorded
+    destination-row count: segment ``i > 0`` aliases its first ``d_i`` key rows onto the previous segment's last ``d_i``
+    destination rows (``sum d_i = sum(seq_k) - dst_rows``, split over segments ``1..N-1`` in proportion to their key
+    counts, largest remainder), fresh rows follow in natural order."""
+    seq_k = [int(x) for x in seq_k]
+    S, dups = sum(seq_k), sum(seq_k) - int(dst_rows)
+    if dups < 0 or (dups and len(seq_k) < 2):
+        raise ValueError(
+            f"dst_map_rows: {dst_rows} destination rows for {S} key rows in {len(seq_k)} segment(s)"
+        )
+    weight = sum(seq_k[1:])
+    raw = [dups * lk / weight for lk in seq_k[1:]] if weight else []
+    d = [0] + [int(x) for x in raw]
+    for i in sorted(
+        range(1, len(seq_k)), key=lambda i: raw[i - 1] - int(raw[i - 1]), reverse=True
+    )[: dups - sum(d)]:
+        d[i] += 1
+    for i in range(1, len(seq_k)):
+        if d[i] > min(seq_k[i], seq_k[i - 1]):
+            raise ValueError(
+                f"dst_map_rows: segment {i} would alias {d[i]} rows, more than min({seq_k[i]}, {seq_k[i - 1]})"
+            )
+    out, next_row = [], 0
+    for lk, di in zip(seq_k, d, strict=True):
+        out.extend(range(next_row - di, next_row))  # aliased onto the previous segment's last di rows
+        out.extend(range(next_row, next_row + lk - di))
+        next_row += lk - di
+    assert next_row == int(dst_rows) and len(out) == S
+    return out
+
+
+def bwd_chunk(seq_q, seq_k, q0, q1):
+    """Segment lists ``(seq_q, seq_k)`` of one backward chunk of a packed batch: the chunk's queries ``[q0, q1)`` of the
+    packed query row over the FULL key row (the recorded trainer runs the backward of a 16k-query batch in 4096-query
+    chunks).  Documents outside the chunk keep their key rows as 0-query segments; a document the chunk splits becomes
+    ``(n, keys up to its last own key)`` + ``(0, the rest)``."""
+    seq_q, seq_k = [int(x) for x in seq_q], [int(x) for x in seq_k]
+    out_q, out_k, cu = [], [], 0
+    for lq, lk in zip(seq_q, seq_k, strict=True):
+        lo, hi = max(q0, cu), min(q1, cu + lq)  # the chunk's queries of this document (packed positions)
+        n = max(0, hi - lo)
+        if n == 0:
+            out_q.append(0)
+            out_k.append(lk)
+        else:
+            own_last = (lk - lq) + (hi - cu)  # keys up to the last own key of the chunk's queries
+            out_q.append(n)
+            out_k.append(own_last)
+            if own_last < lk:
+                out_q.append(0)
+                out_k.append(lk - own_last)
+        cu += lq
+    if sum(out_q) != q1 - q0 or sum(out_k) != sum(seq_k):
+        raise ValueError(f"bwd_chunk: queries [{q0}, {q1}) do not fit the batch ({sum(seq_q)} queries)")
+    return out_q, out_k
+
+
+ROWS["packed_glm_a_dstmap"] = GLM_A  # the recorded batch a with its dK/dV destination map (ROW_LAYOUTS)
+ROWS["packed_glm_b_dstmap"] = GLM_B
+ROWS["packed_glm_a_s704_dstmap"] = GLM_A
+ROWS["packed_glm_b_s704_dstmap"] = GLM_B
+ROWS["chunk_4096x268757"] = bwd_chunk(*GLM_A, 0, 4096)  # the recorded 4096-query backward chunks
+ROWS["chunk_3943x268757"] = bwd_chunk(*GLM_A, 12288, 16231)
+ROWS["chunk_3884x267520"] = bwd_chunk(*GLM_B, 12288, 16172)
+
 Q_LAYOUTS = ("packed576", "pre256")
 KV_STRIDES = (D_QK, 704)
-DST_MAPS = ("none", "identity", "perm")
+DST_MAPS = ("none", "identity", "perm", "glm_a", "glm_b")
 DEFAULT_LAYOUT = dict(
     q_layout="packed576", kv_stride=D_QK, dkv_acc=False, dkv_dst_map="none"
 )
@@ -157,6 +230,13 @@ ROW_LAYOUTS = {
     "doc_16231": TRAINER_LAYOUT,
     "doc_4095": TRAINER_LAYOUT,
     "doc_4097": TRAINER_LAYOUT,
+    "packed_glm_a_dstmap": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
+    "packed_glm_b_dstmap": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_b"},
+    "packed_glm_a_s704_dstmap": {**TRAINER_LAYOUT, "kv_stride": 704, "dkv_dst_map": "glm_a"},
+    "packed_glm_b_s704_dstmap": {**TRAINER_LAYOUT, "kv_stride": 704, "dkv_dst_map": "glm_b"},
+    "chunk_4096x268757": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
+    "chunk_3943x268757": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
+    "chunk_3884x267520": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_b"},
 }
 # --preset: one GLM-5.2 row in the trainer layout
 PRESETS = {
@@ -256,6 +336,7 @@ class Layout:
             "none",
         )
         self.total_q, self.total_k = inp.total_q, inp.total_k
+        self.dkv_rows = inp.total_k  # rows of dkv_acc (fewer than the key rows with a recorded map)
         device = inp.q_latent.device
         self.q_latent, self.q_rope = inp.q_latent, inp.q_rope
         self.kv_latent, self.k_rope = inp.kv_latent, inp.k_rope
@@ -288,6 +369,16 @@ class Layout:
             ndup = min(8, inp.total_k // 2)
             perm[1 : 2 * ndup : 2] = perm[0 : 2 * ndup : 2]
             self.dst_map = perm.to(torch.int32).contiguous()
+        elif dkv_dst_map in GLM_DST_ROWS:
+            seq_k, rows = GLM_DST_ROWS[dkv_dst_map]
+            if sum(seq_k) != inp.total_k:
+                raise ValueError(
+                    f"dkv_dst_map {dkv_dst_map!r} is defined for {sum(seq_k)} key rows, this row has {inp.total_k}"
+                )
+            self.dst_map = torch.tensor(
+                dst_map_rows(seq_k, rows), dtype=torch.int32, device=device
+            )
+            self.dkv_rows = rows
 
     def describe(self):
         return dict(
@@ -307,7 +398,7 @@ class Layout:
         step), so it counts in the step time and in the peak memory of every arm.
         """
         return torch.zeros(
-            self.total_k, D_QK, dtype=torch.float32, device=self.q_latent.device
+            self.dkv_rows, D_QK, dtype=torch.float32, device=self.q_latent.device
         )
 
     def accumulate(self, dkv_acc, dkv_latent, dk_rope):
@@ -332,7 +423,9 @@ class Layout:
         idx = self.dst_map.long()
         for key in ("dkv_latent", "dk_rope"):
             t = ref[key]
-            ref[key] = torch.zeros_like(t).index_add_(0, idx, t)
+            ref[key] = torch.zeros(
+                (self.dkv_rows,) + tuple(t.shape[1:]), dtype=t.dtype, device=t.device
+            ).index_add_(0, idx, t)
         return ref
 
 
@@ -789,7 +882,7 @@ def measure_accuracy(arm, inp, layout):
         )
         if layout.dst_map is not None and "dkv_acc" in grads:
             hit = torch.zeros(
-                layout.total_k, dtype=torch.bool, device=layout.dst_map.device
+                layout.dkv_rows, dtype=torch.bool, device=layout.dst_map.device
             )
             hit[layout.dst_map.long()] = True
             record["dst_rows_unused"] = int((~hit).sum().item())
@@ -1123,8 +1216,10 @@ def main():
         "--dkv-dst-map",
         choices=DST_MAPS,
         default=None,
-        help="destination-row map of dkv_acc: identity (explicit arange) or perm (a "
-        "permutation with duplicated destinations); needs --dkv-acc",
+        help="destination-row map of dkv_acc: identity (explicit arange), perm (a "
+        "permutation with duplicated destinations) or glm_a / glm_b (the recorded "
+        "trainer maps: 268,757 / 267,520 key rows onto 260,611 / 259,412 fp32 rows; "
+        "only for the rows of that batch); needs --dkv-acc",
     )
     parser.add_argument("--arms", default="cake,flashmla_cudnn,fa4")
     parser.add_argument("--steps", type=int, default=20)
