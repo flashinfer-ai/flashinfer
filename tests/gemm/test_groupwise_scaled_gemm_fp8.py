@@ -93,25 +93,18 @@ def test_fp8_groupwise_gemm(
     scale_major_mode,
     backend,
 ):
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if not gemm_fp8_nt_groupwise.is_backend_supported(backend, cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise backend {backend} does not support SM{cc}")
     if backend == "trtllm":
-        if compute_capability[0] != 10:
-            pytest.skip(
-                "gemm_fp8_nt_groupwise is only supported on SM100, SM103, SM107 in trtllm backend."
-            )
         if scale_major_mode != "MN":
             pytest.skip("trtllm only supports MN scale_major_mode")
         if k < 256:
             pytest.skip("k < 256")
-    if backend == "cutlass" and compute_capability[0] not in [10, 11, 12]:
-        pytest.skip(
-            "gemm_fp8_nt_groupwise with cutlass backend is only supported on SM100/103/107, SM110, and SM120/121 GPUs."
-        )
     if backend == "cutile":
-        if compute_capability[0] not in [10, 11, 12]:
-            pytest.skip(
-                "gemm_fp8_nt_groupwise with cuTile backend is only supported on SM100+ GPUs."
-            )
         if scale_major_mode != "K":
             pytest.skip(
                 "gemm_fp8_nt_groupwise with cuTile backend currently supports scale_major_mode='K' only."

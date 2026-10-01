@@ -1,0 +1,460 @@
+{
+ "arg_plan": [
+  [
+   "buffer",
+   "q"
+  ],
+  [
+   "tma_buffer",
+   "q_tma"
+  ],
+  [
+   "buffer",
+   "k"
+  ],
+  [
+   "tma_buffer",
+   "k_tma"
+  ],
+  [
+   "buffer",
+   "v"
+  ],
+  [
+   "tma_buffer",
+   "v_tma"
+  ],
+  [
+   "buffer",
+   "g"
+  ],
+  [
+   "tma_buffer",
+   "g_tma"
+  ],
+  [
+   "buffer",
+   "beta"
+  ],
+  [
+   "tma_buffer",
+   "beta_tma"
+  ],
+  [
+   "buffer",
+   "A_log"
+  ],
+  [
+   "buffer",
+   "dt_bias"
+  ],
+  [
+   "buffer",
+   "piece_table"
+  ],
+  [
+   "buffer",
+   "cta_table"
+  ],
+  [
+   "buffer",
+   "initial_state"
+  ],
+  [
+   "buffer",
+   "out"
+  ],
+  [
+   "tma_buffer",
+   "out_tma"
+  ],
+  [
+   "buffer",
+   "final_state"
+  ],
+  [
+   "parameter",
+   "num_heads"
+  ],
+  [
+   "parameter",
+   "scale"
+  ],
+  [
+   "parameter",
+   "lower_bound"
+  ],
+  [
+   "parameter",
+   "failure_addr"
+  ],
+  [
+   "parameter",
+   "generation"
+  ],
+  [
+   "parameter",
+   "detect_threshold_log2"
+  ],
+  [
+   "parameter",
+   "handoff_flags_addr"
+  ],
+  [
+   "tma_table",
+   "tma_table"
+  ],
+  [
+   "parameter",
+   "tma_upload"
+  ],
+  [
+   "grid",
+   "grid_x"
+  ],
+  [
+   "grid",
+   "grid_y"
+  ],
+  [
+   "grid",
+   "grid_z"
+  ]
+ ],
+ "entry": "run",
+ "kernel_name": "kernel_kda_fwd_stream_m128",
+ "module_ident": "kda_fwd_stream_m128_84e701abc9",
+ "schedule": "exact_stream_m128sf_j96_b96_s0_full",
+ "grid": [
+  96,
+  1,
+  1
+ ],
+ "bindings": {
+  "q": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "q_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "k": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "k_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "v": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "v_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "g": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "g_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "beta": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96
+   ]
+  },
+  "beta_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96
+   ]
+  },
+  "A_log": {
+   "dtype": "torch.float32",
+   "shape": [
+    96
+   ]
+  },
+  "dt_bias": {
+   "dtype": "torch.float32",
+   "shape": [
+    96,
+    128
+   ]
+  },
+  "initial_state": {
+   "dtype": "torch.float32",
+   "shape": [
+    1,
+    96,
+    128,
+    128
+   ]
+  },
+  "out": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "out_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "final_state": {
+   "dtype": "torch.float32",
+   "shape": [
+    1,
+    96,
+    128,
+    128
+   ]
+  },
+  "num_heads": {
+   "type": "int",
+   "value": 96
+  },
+  "scale": {
+   "type": "float",
+   "value": 0.08838834764831843
+  },
+  "lower_bound": {
+   "type": "float",
+   "value": -5.0
+  },
+  "piece_table": {
+   "dtype": "torch.int32",
+   "shape": [
+    96,
+    8
+   ]
+  },
+  "cta_table": {
+   "dtype": "torch.int32",
+   "shape": [
+    288
+   ]
+  },
+  "failure_addr": {
+   "type": "int",
+   "value": 19800159944704
+  },
+  "generation": {
+   "type": "int",
+   "value": 0
+  },
+  "detect_threshold_log2": {
+   "type": "float",
+   "value": -50.0
+  },
+  "handoff_flags_addr": {
+   "type": "int",
+   "value": 0
+  }
+ },
+ "fallback_bindings": {
+  "q": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "q_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "k": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "k_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "v": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "v_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "g": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "g_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "beta": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96
+   ]
+  },
+  "beta_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96
+   ]
+  },
+  "A_log": {
+   "dtype": "torch.float32",
+   "shape": [
+    96
+   ]
+  },
+  "dt_bias": {
+   "dtype": "torch.float32",
+   "shape": [
+    96,
+    128
+   ]
+  },
+  "cu_seqlens": {
+   "dtype": "torch.int64",
+   "shape": [
+    2
+   ]
+  },
+  "seq_order": {
+   "dtype": "torch.int32",
+   "shape": [
+    1
+   ]
+  },
+  "initial_state": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    1,
+    96,
+    128,
+    128
+   ]
+  },
+  "out": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "out_tma": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    8192,
+    96,
+    128
+   ]
+  },
+  "final_state": {
+   "dtype": "torch.bfloat16",
+   "shape": [
+    1,
+    96,
+    128,
+    128
+   ]
+  },
+  "num_heads": {
+   "type": "int",
+   "value": 96
+  },
+  "use_initial_state": {
+   "type": "int",
+   "value": 1
+  },
+  "store_final_state": {
+   "type": "int",
+   "value": 1
+  },
+  "scale": {
+   "type": "float",
+   "value": 0.08838834764831843
+  },
+  "lower_bound": {
+   "type": "float",
+   "value": -5.0
+  }
+ }
+}
