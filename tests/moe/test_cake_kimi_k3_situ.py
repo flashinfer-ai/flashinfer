@@ -468,6 +468,27 @@ def _submit_large_route(num_tokens, routing, device, prepared, workspace):
     return x, ids, route_weights, output, options
 
 
+def _fc1_scales_by_row(views, max_tiles):
+    # FC1 stores its output scale factors in the tile layout FC2 loads: per
+    # tile and per 64 elements of the intermediate size one 512-byte block
+    # whose word (row % 32, row // 32) holds the row's four scale bytes.
+    blocks = views["intermediate_scales"].view(max_tiles, INTERMEDIATE // 64, 32, 4, 4)
+    return blocks.permute(0, 3, 2, 1, 4).reshape(max_tiles * 128, INTERMEDIATE // 16)
+
+
+def _per_pair_scratch(views, max_tiles):
+    # The routing scatter assigns each (token, expert-slot) pair a row inside
+    # its expert's tiles; that position is not deterministic from call to
+    # call, so the per-row scratch is compared in pair order through
+    # token_to_permuted (the map finalization uses), never by row index.
+    permuted = views["token_to_permuted"].long()
+    return {
+        "intermediate_packed": views["intermediate_packed"][permuted].clone(),
+        "intermediate_scales": _fc1_scales_by_row(views, max_tiles)[permuted].clone(),
+        "expert_output": views["expert_output"][permuted].clone(),
+    }
+
+
 def _launch_program(program_key, args):
     module = get_cake_situ_module(program_key)
     entry = getattr(module, PROGRAMS[program_key]["ffi_entry"])
@@ -495,11 +516,11 @@ def test_cake_situ_m16384_pre_shuffled_route_matches_previous_fc1_program(
     cake_situ_workspace,
 ):
     # The 16384-token route runs the scale-factor writer and the FC1 program
-    # that loads the pre-shuffled images. Its FC1 outputs (and therefore the
-    # complete call) must be bitwise identical to the previous FC1 program,
-    # which gathers and shuffles the scale factors itself. That program is
-    # still shipped as the tile-N128 sequence, so it runs here on the same
-    # workspace, inputs and stage bindings.
+    # that loads the pre-shuffled images. Its FC1 outputs (per routed pair),
+    # the FC2 outputs and the complete call must be bitwise identical to the
+    # previous FC1 program, which gathers and shuffles the scale factors
+    # itself. That program is still shipped as the tile-N128 sequence, so it
+    # runs here on the same workspace, inputs and stage bindings.
     num_tokens = 16384
     device, weights, workspace = (
         cake_situ_device,
@@ -524,11 +545,11 @@ def test_cake_situ_m16384_pre_shuffled_route_matches_previous_fc1_program(
     assert not any(name.startswith("sfb_shuffle.") for name in previous_names)
 
     views = _cake_situ_workspace_views(workspace, num_tokens)
-    fc1_outputs = ("intermediate_packed", "intermediate_scales")
-    pre_shuffled = {name: views[name].clone() for name in fc1_outputs}
-    pre_shuffled["expert_output"] = views["expert_output"].clone()
+    total_tiles = int(views["total_tiles"].item())
+    assert 0 < total_tiles < prepared["max_tiles"]
+    pre_shuffled = _per_pair_scratch(views, prepared["max_tiles"])
     pre_shuffled_output = output.clone()
-    for name in fc1_outputs:
+    for name in ("intermediate_packed", "intermediate_scales"):
         views[name].zero_()
     views["expert_output"].fill_(float("nan"))
     output.fill_(float("nan"))
@@ -536,8 +557,9 @@ def test_cake_situ_m16384_pre_shuffled_route_matches_previous_fc1_program(
     stages = _cake_situ_stage_bindings(options, prepared)
     _launch_program(previous_key, _cake_situ_flat_args(stages, previous_key))
     torch.cuda.synchronize(device)
-    for name, tensor in pre_shuffled.items():
-        assert torch.equal(views[name], tensor), name
+    assert int(views["total_tiles"].item()) == total_tiles
+    for name, tensor in _per_pair_scratch(views, prepared["max_tiles"]).items():
+        assert torch.equal(tensor, pre_shuffled[name]), name
     assert torch.equal(output, pre_shuffled_output)
 
 
