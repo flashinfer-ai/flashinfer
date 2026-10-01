@@ -351,15 +351,6 @@ def get_cake_moe_allreduce_module(device_index: int):
     return load(device_index)
 
 
-def register_cake_moe_allreduce_workspace_pointers(
-    workspace_tensor: torch.Tensor, workspace_pointers: List[int]
-) -> None:
-    """Retain the host-known pointer table behind an all-reduce workspace tensor."""
-    from ..jit.cake_trtllm_moe_allreduce_union import register_workspace_pointers
-
-    register_workspace_pointers(workspace_tensor, workspace_pointers)
-
-
 def _cake_moe_allreduce_union_applies(
     *,
     world_size: int,
@@ -631,11 +622,6 @@ def trtllm_create_ipc_workspace_for_all_reduce_fusion(
     workspace_tensor = torch.tensor(
         workspace, dtype=torch.int64, device=torch.device("cuda")
     )
-    # The SM100/SM103 Cake MoE all-reduce union route (world sizes 2, 4 and 8) binds
-    # the control and per-rank payload addresses of this table as raw pointers; keep the
-    # host-known values so no launch ever reads the table back from the device.
-    register_cake_moe_allreduce_workspace_pointers(workspace_tensor, workspace)
-
     if use_symm_dev_mem:
         torch.cuda.synchronize()
         comm_backend.barrier()  # must sync after create_workspace
@@ -1277,8 +1263,10 @@ def trtllm_moe_finalize_allreduce_fusion(
     - expanded_idx_to_permuted_idx: the expanded index to permuted index tensor. [token_num, top_k]
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - residual_out: the residual output tensor. [token_num, hidden_dim]
-    - quant_out: the quant output tensor. [token_num // 4, hidden_dim], fp16/bf16 -> fp4
-    - scale_out: the scale output tensor. [token_num // SF_VEC_SIZE, hidden_dim], fp16/bf16 -> fp4
+    - quant_out: the packed FP4 output buffer, token_num * hidden_dim // 2 bytes
+      (any element type; the Cake backend checks the byte size).
+    - scale_out: the E4M3 scale output buffer in SWIZZLED_128x4 layout,
+      round_up(token_num, 128) * round_up(hidden_dim // 16, 4) bytes.
     - workspace_ptrs: the workspace pointers.
     - launch_with_pdl: whether to launch with pdl.
     - world_rank: the rank of the current process.
@@ -1314,7 +1302,6 @@ def trtllm_moe_finalize_allreduce_fusion(
         from ..jit.cake_moe_finalize_comm import run_cake_moe_finalize
 
         run_cake_moe_finalize(
-            backend="cake",
             allreduce_in=allreduce_in,
             residual_in=residual_in,
             norm_weight=norm_weight,
