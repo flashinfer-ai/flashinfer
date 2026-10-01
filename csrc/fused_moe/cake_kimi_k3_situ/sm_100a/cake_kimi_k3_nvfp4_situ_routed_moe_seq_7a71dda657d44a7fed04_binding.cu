@@ -32,13 +32,13 @@
 #include <vector>
 
 extern "C" __global__ void kernel_cake_kimi_k3_nvfp4_situ_routed_moe_92ed1deb1d0aa6e28892(__nv_bfloat16* __restrict__ x, float* __restrict__ qx, uint8_t* __restrict__ packed, uint8_t* __restrict__ scales, int M);
-extern "C" __global__ void kernel_cake_kimi_k3_nvfp4_situ_routed_moe_3097d2db1a7718f39cab(int* __restrict__ topk_ids, int* __restrict__ expert_counts, int* __restrict__ expert_tile_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ route_map, int* __restrict__ token_to_permuted, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ total_tiles, int total_pairs, int num_experts, int max_tiles, int top_k, int tile_n, int* __restrict__ fc2_work_counter, int fc2_pool_ctas);
+extern "C" __global__ void kernel_cake_kimi_k3_nvfp4_situ_routed_moe_91e741e16955d57e9c7c(int* __restrict__ topk_ids, int* __restrict__ expert_counts, int* __restrict__ expert_tile_offsets, int* __restrict__ expert_scatter_offsets, int* __restrict__ route_map, int* __restrict__ token_to_permuted, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ total_tiles, int total_pairs, int num_experts, int max_tiles, int top_k, int tile_n, int* __restrict__ fc2_work_counter, int fc2_pool_ctas);
 extern "C" __global__ void kernel_cake_kimi_k3_nvfp4_situ_routed_moe_93e2350178fff1f9c9ac(const __grid_constant__ CUtensorMap A, uint8_t* __restrict__ B, const __grid_constant__ CUtensorMap SFA, uint8_t* __restrict__ SFB, const __grid_constant__ CUtensorMap C, uint8_t* __restrict__ SFC, int* __restrict__ route_map, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ total_tiles, float* __restrict__ scale_c, float* __restrict__ scale_gate, float* __restrict__ clamp_limit, float* __restrict__ act_alpha, float* __restrict__ act_beta, int M_out, int K, int grid_m, int grid_n, int K_tiles);
 extern "C" __global__ void kernel_cake_kimi_k3_nvfp4_situ_routed_moe_33aa68fb31dbfec22b5e(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, const __grid_constant__ CUtensorMap C_tma, __nv_bfloat16* __restrict__ C, float* __restrict__ scale_c, int* __restrict__ tile_expert, int* __restrict__ tile_mn_limit, int* __restrict__ num_non_exiting_ctas, int* __restrict__ work_counter, int M, int K, int grid_m, int grid_n, int K_tiles);
 extern "C" __global__ void kernel_cake_kimi_k3_nvfp4_situ_routed_moe_920a885b92d4dbd32aaf(__nv_bfloat16* __restrict__ expert_output, __nv_bfloat16* __restrict__ route_weights, int* __restrict__ token_to_permuted, __nv_bfloat16* __restrict__ out, int M);
 
 
-namespace cake_host_shim_6295ec83d7439c1e {
+namespace cake_host_shim_2e256897826b369b {
 
 using tvm::ffi::Optional;
 using tvm::ffi::TensorView;
@@ -331,6 +331,9 @@ inline void Prepare(PreparedLaunch& prepared, TensorView arg_topk_ids, TensorVie
   TVM_FFI_CHECK(grid_x > 0 && grid_y > 0 && grid_z > 0, ValueError)
       << "launch grid dimensions must be positive, got (" << grid_x << ", " << grid_y
       << ", " << grid_z << ")";
+  TVM_FFI_CHECK(grid_x % 8 == 0 && grid_y % 1 == 0 && grid_z % 1 == 0, ValueError)
+      << "launch grid (" << grid_x << ", " << grid_y << ", " << grid_z
+      << ") must be divisible by cluster dims (8, 1, 1)";
 
   prepared.retained.clear();
   prepared.retained.reserve(10);
@@ -387,15 +390,27 @@ inline void Submit(PreparedLaunch& prepared, cudaStream_t stream) {
   dim3 block = prepared.block;
   void** kargs = prepared.kargs;
 
+  cudaLaunchAttribute attrs[2]{};
+  int n = 0;
+  attrs[n].id = cudaLaunchAttributeClusterDimension;
+  attrs[n].val.clusterDim.x = 8u;
+  attrs[n].val.clusterDim.y = 1u;
+  attrs[n].val.clusterDim.z = 1u;
+  ++n;
+  attrs[n].id = cudaLaunchAttributeClusterSchedulingPolicyPreference;
+  attrs[n].val.clusterSchedulingPolicyPreference = cudaClusterSchedulingPolicySpread;
+  ++n;
   cudaLaunchConfig_t config{};
   config.gridDim = grid;
   config.blockDim = block;
-  config.dynamicSmemBytes = 12416u;
+  config.dynamicSmemBytes = 16512u;
   config.stream = stream;
+  config.attrs = attrs;
+  config.numAttrs = n;
   cudaError_t launch_status = cudaLaunchKernelExC(
-      &config, reinterpret_cast<const void*>(kernel_cake_kimi_k3_nvfp4_situ_routed_moe_3097d2db1a7718f39cab), kargs);
+      &config, reinterpret_cast<const void*>(kernel_cake_kimi_k3_nvfp4_situ_routed_moe_91e741e16955d57e9c7c), kargs);
   TVM_FFI_CHECK(launch_status == cudaSuccess, RuntimeError)
-      << "cudaLaunchKernelExC for kernel_cake_kimi_k3_nvfp4_situ_routed_moe_3097d2db1a7718f39cab failed: "
+      << "cudaLaunchKernelExC for kernel_cake_kimi_k3_nvfp4_situ_routed_moe_91e741e16955d57e9c7c failed: "
       << cudaGetErrorString(launch_status);
 
 }
@@ -1373,14 +1388,14 @@ void RunPacked(const tvm::ffi::AnyView* args, int32_t num_args) {
   stage_finalize::Submit(prepared_finalize, stream);
 }
 
-}  // namespace cake_host_shim_6295ec83d7439c1e
+}  // namespace cake_host_shim_2e256897826b369b
 
 extern "C" {
 TVM_FFI_DLL_EXPORT int __tvm_ffi_run(
     void* self, const TVMFFIAny* args, int32_t num_args, TVMFFIAny* result) {
   TVM_FFI_SAFE_CALL_BEGIN();
   (void)self;
-  cake_host_shim_6295ec83d7439c1e::RunPacked(
+  cake_host_shim_2e256897826b369b::RunPacked(
       reinterpret_cast<const tvm::ffi::AnyView*>(args), num_args);
   tvm::ffi::TypeTraits<std::nullptr_t>::CopyToAnyView(nullptr, result);
   TVM_FFI_SAFE_CALL_END();

@@ -252,6 +252,34 @@ def test_cake_situ_two_cta_fc2_route_is_sixteen_tokens_only(arch):
     assert two_cta not in (ROUTES[(arch, 8)], ROUTES[(arch, 16)])
 
 
+def test_cake_situ_n32_route_uses_the_cluster_router():
+    # GPU-free: the 512/1024-token sequence of each architecture lists exactly one
+    # routing kernel source, and it declares the eight-CTA cluster the runtime launches.
+    from flashinfer.fused_moe.cake_kimi_k3_situ import _ROUTE_MC_CLUSTER
+    from flashinfer.jit.cake_kimi_k3_situ import (
+        PROGRAMS,
+        ROUTES,
+        _source_path,
+        cake_situ_sequence,
+    )
+
+    for arch in ("sm_100a", "sm_103a"):
+        key = cake_situ_sequence(arch, 32, False, False, n32_claim8=True)
+        assert key == ROUTES[(arch, "n32_claim8")]
+        kernels = [
+            source
+            for source in PROGRAMS[key]["sources"]
+            if source.endswith("_kernel.cu")
+        ]
+        clustered = [
+            source
+            for source in kernels
+            if f"__cluster_dims__({_ROUTE_MC_CLUSTER},1,1)"
+            in _source_path(source).read_text()
+        ]
+        assert len(clustered) == 1, (arch, kernels)
+
+
 @pytest.fixture(scope="module")
 def cake_situ_device():
     if not torch.cuda.is_available():
@@ -501,6 +529,12 @@ def test_cake_situ_output_workspace_and_external_graph(
             prepared_shape["fc2_pool_ctas"]
             == (HIDDEN // 128) * prepared_shape["fc2_grid_n"]
         )
+    # The 512- and 1024-token routes run the routing kernel as one eight-CTA
+    # cluster over a seven-row FC2 pool; every other row keeps its route.
+    assert prepared_shape["n32_claim8"] is (num_tokens in (512, 1024))
+    if prepared_shape["n32_claim8"]:
+        assert prepared_shape["fc2_grid_n"] == 7
+        assert prepared_shape["fc2_pool_ctas"] == 196
 
     expected = _trtllm_reference(x, ids, route_weights, prepared)
     # Ensure an all-zero output could not satisfy the FP4 absolute tolerance.

@@ -32,6 +32,9 @@ _H, _I, _E, _TOP_K = 3584, 384, 896, 16
 _LAYOUT = "trtllm_shuffled_nvfp4_group16"
 _STATE_ATTR = "_flashinfer_cake_situ_workspace"
 _N32_CLAIM8_ARCHES = ("sm_100a", "sm_103a")
+# The 512- and 1024-token routes launch the routing kernel as one thread-block
+# cluster of this many CTAs (the kernel declares the matching cluster size).
+_ROUTE_MC_CLUSTER = 8
 _M256_C12_ARCHES = ("sm_100a",)
 _LARGE_C7_ARCHES = ("sm_103a", "sm_100a")
 _LARGE_C7_TOKENS = (16384,)
@@ -317,6 +320,10 @@ def cake_fused_moe_prepare_workspace(
                     max_tiles,
                     max(1, _N8_W2A_M16_FC2_GRID_N_SM_FACTOR * sm_count // (_H // 128)),
                 )
+            if n32_claim8:
+                # The 512- and 1024-token routes measured best with a seven-row
+                # pool: 7 * 28 = 196 FC2 CTAs on the 148-SM B200 and B300.
+                fc2_grid_n = min(max_tiles, 7)
         feature_finalize = num_tokens in (1, 8, 16) or m64_claim8
         program_key = cake_situ_sequence(
             arch,
@@ -503,7 +510,11 @@ def _cake_situ_stage_bindings(options, prepared):
                 M=num_tokens,
             ),
             "fused_router": dict(
-                grid=(1, 1, 1),
+                # One cluster of _ROUTE_MC_CLUSTER CTAs for the 512- and
+                # 1024-token routes; every other route keeps the single CTA.
+                grid=(
+                    (_ROUTE_MC_CLUSTER, 1, 1) if prepared["n32_claim8"] else (1, 1, 1)
+                ),
                 topk_ids=flat_ids,
                 **{
                     name: views[name]
