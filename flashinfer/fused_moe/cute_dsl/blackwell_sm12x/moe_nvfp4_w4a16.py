@@ -169,7 +169,10 @@ def k_route(
                 e, live = _live_expert(gIds[s], E)
                 p = cute.arch.atomic_add(cnt.iterator + e, cutlass.Int32(1))
                 gStok[p] = s // TOPK
-                gSwt[p] = gWts[s] * live
+                wsel = cutlass.Float32(0.0)
+                if live != cutlass.Float32(0.0):
+                    wsel = gWts[s]
+                gSwt[p] = wsel
     else:
         z = cute.make_rmem_tensor(cute.make_layout(4), cutlass.Float32)
         for q in cutlass.range_constexpr(4):
@@ -755,7 +758,9 @@ def k_gemm2(
                         # a zero weight (dead slot) is skipped, not multiplied:
                         # its accumulator may be inf, and inf * 0 is NaN
                         if cutlass.const_expr(NOROUTE):
-                            w = gWts[by] * live
+                            w = cutlass.Float32(0.0)
+                            if live != cutlass.Float32(0.0):
+                                w = gWts[by]
                             if w != cutlass.Float32(0.0):
                                 cute.arch.atomic_add(
                                     gOF.iterator + ((by // TOPK) * H + n),
@@ -1196,7 +1201,10 @@ def k_fused(
         for si in cutlass.range_constexpr(len(sfl2)):
             acc2[0] = acc2[0] + cute.arch.shuffle_sync_bfly(acc2[0], sfl2[si])
         if kh2 == 0:
-            w2s = gWts[(tok, ksl)] * live2
+            # select, not multiply: a non-finite weight on a dead slot would give NaN
+            w2s = cutlass.Float32(0.0)
+            if live2 != cutlass.Float32(0.0):
+                w2s = gWts[(tok, ksl)]
             if n < H:
                 if w2s != cutlass.Float32(0.0):
                     cute.arch.atomic_add(

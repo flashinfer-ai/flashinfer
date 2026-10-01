@@ -2452,11 +2452,12 @@ def _sm12x_nvfp4_bf16_is_supported() -> bool:
     if not torch.cuda.is_available() or torch.version.cuda is None:
         return False
     from flashinfer.cute_dsl import is_cute_dsl_available
+    from flashinfer.jit.cpp_ext import get_cuda_version
 
     major, minor = torch.cuda.get_device_capability()
     return (
         SM12xNvfp4Bf16Config.supported(major * 10 + minor)
-        and int(torch.version.cuda.split(".")[0]) >= 13
+        and get_cuda_version().major >= 13
         and is_cute_dsl_available()
     )
 
@@ -2721,7 +2722,8 @@ def test_sm12x_nvfp4_bf16_ignores_out_of_range_expert_ids(num_tokens):
 @pytest.mark.parametrize("num_tokens", (1, 16, 128))
 def test_sm12x_nvfp4_bf16_dead_slots_stay_finite_on_overflowing_fallback(num_tokens):
     # Dead slots run expert 0 under a zero weight. With expert 0 overflowing the
-    # FP16 activation, multiplying its inf partial by zero would write NaN.
+    # FP16 activation, multiplying its inf partial by zero would write NaN; so
+    # would a non-finite router weight left on a dead slot.
     activation = ReLU2()
     num_experts, top_k = 64, 4
     view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
@@ -2751,6 +2753,8 @@ def test_sm12x_nvfp4_bf16_dead_slots_stay_finite_on_overflowing_fallback(num_tok
     num_valid = num_tokens // 2
     act.topk_ids[num_valid:] = -1
     act.topk_ids[:num_valid, -1] = num_experts
+    act.topk_weights[num_valid:] = float("nan")
+    act.topk_weights[:num_valid, -1] = float("inf")
 
     actual = layer(act, weights)
     torch.cuda.synchronize()
