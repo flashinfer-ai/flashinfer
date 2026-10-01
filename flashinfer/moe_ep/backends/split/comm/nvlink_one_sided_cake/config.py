@@ -9,7 +9,7 @@ from ..nvlink_one_sided.config import NVLinkOneSidedConfig
 
 @dataclass
 class NVLinkOneSidedCakeConfig(NVLinkOneSidedConfig):
-    """Options of :class:`NVLinkOneSidedCakeAlltoAll`; see
+    """Options of :class:`CakeAlltoAll`; see
     :class:`NVLinkOneSidedConfig` for the fields.
 
     Pass to ``create_communication(..., backend=NVLinkOneSidedCakeConfig(...))``

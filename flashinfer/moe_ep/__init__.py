@@ -205,6 +205,7 @@ from .weights import (
 __all__ = [
     "AlgoKnob",
     "BootstrapConfig",
+    "CakeAlltoAll",
     "CakeMxfp8MegaMoeEp16",
     "CakeMxfp8MegaMoeEp16Weights",
     "preprocess_cake_mxfp8_megamoe_ep16_weights",
@@ -265,7 +266,6 @@ __all__ = [
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "NCCLEPConfig",
     "NVLinkOneSidedAlltoAll",
-    "NVLinkOneSidedCakeAlltoAll",
     "NVLinkOneSidedCakeConfig",
     "NVLinkOneSidedConfig",
     "NVLinkTwoSidedAlltoAll",
@@ -446,7 +446,7 @@ from .backends.split.comm.nvlink_one_sided.communication import (  # noqa: E402
     NVLinkOneSidedAlltoAll,
 )
 from .backends.split.comm.nvlink_one_sided_cake.communication import (  # noqa: E402
-    NVLinkOneSidedCakeAlltoAll,
+    CakeAlltoAll,
 )
 from .backends.split.comm.nvlink_two_sided.communication import (  # noqa: E402
     NVLinkTwoSidedAlltoAll,

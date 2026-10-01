@@ -23,7 +23,7 @@ _CAKE_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 
 
 @register_communication("nvlink_one_sided_cake")
-class NVLinkOneSidedCakeAlltoAll(NVLinkOneSidedAlltoAll):
+class CakeAlltoAll(NVLinkOneSidedAlltoAll):
     """:class:`NVLinkOneSidedAlltoAll` running the generated Cake kernels."""
 
     alltoall_backend = "cake"

@@ -910,7 +910,7 @@ def moe_a2a_get_workspace_size_per_rank(
 
 @deprecated(
     "MoeAlltoAll is deprecated; use flashinfer.moe_ep.NVLinkOneSidedAlltoAll "
-    "(NVLinkOneSidedCakeAlltoAll for backend='cake'). Its implementation will "
+    "(CakeAlltoAll for backend='cake'). Its implementation will "
     "move into those classes."
 )
 class MoeAlltoAll:
@@ -919,7 +919,7 @@ class MoeAlltoAll:
 
     .. deprecated::
         Use :class:`flashinfer.moe_ep.NVLinkOneSidedAlltoAll`
-        (:class:`flashinfer.moe_ep.NVLinkOneSidedCakeAlltoAll` for
+        (:class:`flashinfer.moe_ep.CakeAlltoAll` for
         ``backend="cake"``). The implementation of this class will move into
         them; they will no longer wrap it.
 

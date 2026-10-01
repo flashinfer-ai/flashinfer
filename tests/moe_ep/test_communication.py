@@ -31,7 +31,7 @@ from flashinfer.moe_ep import (
     NCCLEPConfig,
     NcclEpCommunication,
     NVLinkOneSidedAlltoAll,
-    NVLinkOneSidedCakeAlltoAll,
+    CakeAlltoAll,
     NVLinkOneSidedCakeConfig,
     NVLinkOneSidedConfig,
     NVLinkTwoSidedAlltoAll,
@@ -464,7 +464,7 @@ def fake_one_sided(monkeypatch):
             None,
         ),
     )
-    for cls in (NVLinkOneSidedAlltoAll, NVLinkOneSidedCakeAlltoAll):
+    for cls in (NVLinkOneSidedAlltoAll, CakeAlltoAll):
         monkeypatch.setattr(cls, "is_platform_supported", classmethod(lambda cls: True))
 
 
@@ -487,7 +487,7 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
         _params(),
         NVLinkOneSidedCakeConfig(use_low_precision_combine=True),
     )
-    assert isinstance(comm, NVLinkOneSidedCakeAlltoAll)
+    assert isinstance(comm, CakeAlltoAll)
     a2a = _FakeMoeAlltoAll.instances[-1]
     assert a2a.kwargs["backend"] == "cake"
     assert a2a.kwargs["max_num_tokens"] == 3
@@ -537,9 +537,9 @@ def test_cake_needs_compute_capability_10_0_or_10_3(monkeypatch) -> None:
         NVLinkOneSidedAlltoAll, "is_platform_supported", classmethod(lambda cls: True)
     )
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (9, 0))
-    assert not NVLinkOneSidedCakeAlltoAll.is_platform_supported()
+    assert not CakeAlltoAll.is_platform_supported()
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *a: (10, 3))
-    assert NVLinkOneSidedCakeAlltoAll.is_platform_supported()
+    assert CakeAlltoAll.is_platform_supported()
 
 
 def test_nvlink_two_sided_marks_padding_rows_invalid(monkeypatch) -> None:
