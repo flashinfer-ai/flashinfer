@@ -25,6 +25,7 @@ Top-K Selection
   top_k_varlen
   top_k_page_table_transform
   top_k_ragged_transform
+  PreparedTopKRaggedTransform
 
 .. autofunction:: top_k
 
