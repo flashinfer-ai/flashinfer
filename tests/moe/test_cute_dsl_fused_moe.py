@@ -139,6 +139,14 @@ def is_sm107():
     return props.major == 10 and props.minor == 7
 
 
+def is_sm110():
+    """Check for Jetson Thor (SM110), which runs the W4A16 kernels only."""
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(0)
+    return props.major == 11 and props.minor == 0
+
+
 # feat_sm107 tests below still reference the older ``is_sm10x`` spelling.
 is_sm10x = is_sm100_family
 
@@ -152,6 +160,10 @@ sm100_required = pytest.mark.skipif(
     reason="Requires CuteDSL MoE target SM100, SM103 or SM107",
 )
 sm10x_required = sm100_required
+w4a16_required = pytest.mark.skipif(
+    not (is_sm100_family() or is_sm110()),
+    reason="Requires CuteDSL W4A16 MoE target SM100, SM103, SM107 or SM110",
+)
 
 mxfp8_required = pytest.mark.skipif(
     not (
@@ -842,6 +854,11 @@ class TestAutotuneReplayMemsetContract:
             "_require_cute_dsl_arch_for",
             lambda *_args, **_kwargs: None,
         )
+        # Likewise SM110's quant-mode guard, which refuses W4A4 on a Thor
+        # (TestSm110QuantModes covers that refusal).
+        monkeypatch.setattr(
+            fused_moe, "_check_sm110_quant_mode", lambda *_args, **_kwargs: None
+        )
 
         tensors = {
             "x": torch.empty((2, 8), dtype=torch.uint8),
@@ -1330,12 +1347,64 @@ class TestAutotunerBucketConfig:
 
 
 # =============================================================================
+# Test Class: SM110 (Jetson Thor) runs W4A16 only
+# =============================================================================
+
+
+@cute_dsl_available
+@pytest.mark.skipif(not is_sm110(), reason="Requires SM110")
+class TestSm110QuantModes:
+    pytestmark = _requires_dsl_arch
+
+    def test_w4a16_is_supported_on_sm110(self):
+        from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
+
+        assert cute_dsl_fused_moe.is_compute_capability_supported(110)
+        assert CuteDslMoEWrapper.__init__.is_compute_capability_supported(110)
+
+    @pytest.mark.parametrize("quant_mode", ["w4a4", "w4a8"])
+    def test_block_scaled_modes_are_refused_on_sm110(self, quant_mode: str):
+        from flashinfer import CuteDslMoEWrapper, cute_dsl_fused_moe
+
+        with pytest.raises(ValueError, match="not supported on SM110"):
+            CuteDslMoEWrapper(
+                num_experts=8,
+                top_k=2,
+                hidden_size=256,
+                intermediate_size=512,
+                quant_mode=quant_mode,
+            )
+        # The mode is refused before any input is read: placeholders suffice.
+        x = torch.zeros((4, 128), dtype=torch.uint8, device="cuda")
+        ids = torch.zeros((4, 2), dtype=torch.int32, device="cuda")
+        scales = torch.ones((4, 2), dtype=torch.float32, device="cuda")
+        alpha = torch.ones((8,), dtype=torch.float32, device="cuda")
+        with pytest.raises(ValueError, match="not supported on SM110"):
+            cute_dsl_fused_moe(
+                x,
+                None,
+                ids,
+                scales,
+                x,
+                x,
+                alpha,
+                None,
+                x,
+                x,
+                alpha,
+                num_experts=8,
+                top_k=2,
+                quant_mode=quant_mode,
+            )
+
+
+# =============================================================================
 # Test Class: W4A16-specific contracts
 # =============================================================================
 
 
 @cute_dsl_available
-@sm100_required
+@w4a16_required
 class TestCuteDslMoeW4A16:
     pytestmark = _requires_dsl_arch
 
