@@ -1799,9 +1799,22 @@ def _kv_ring_smem_budget_bytes(
         page_offset_stages * page_table_window_entries * cutlass.Int32.width // 8
     )
 
+    # The TS allocator bump-allocates each data block at its own alignment
+    # (largest first), so a buffer-aligned block costs its size rounded up to
+    # cfg.buffer_align_bytes; the 4-32 byte records follow, then barriers.
+    align = cfg.buffer_align_bytes
+    smem_p_bytes = 0
+    if cfg.p_in_smem:
+        p_block_bytes = cfg.smem_p_bytes
+        if cfg.vc_attention:
+            # Row-sum operand and K-scale table live behind each P tile.
+            p_block_bytes += cfg.vc_rowsum_tile_bytes + cfg.vc_kscale_table_bytes
+        smem_p_bytes = (
+            (p_block_bytes + align - 1) // align * align * cfg.num_qkv_instances
+        )
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
     if is_clc_dynamic:
-        control_bytes += cutlass.Int128.width // 8
+        control_bytes = (control_bytes + 15) // 16 * 16 + cutlass.Int128.width // 8
     fixed_barrier_stages = sum(
         _context_pipeline_stage_counts(
             cfg,
@@ -1809,12 +1822,17 @@ def _kv_ring_smem_budget_bytes(
             is_clc_dynamic=is_clc_dynamic,
         ).values()
     )
+    if cfg.vc_attention:
+        # The tile-mean ring is sized with the K/V ring (one operand and
+        # barrier per stage); the callers charge it per stage.
+        fixed_barrier_stages -= cfg.vc_mean_stages
     fixed_smem_bytes = (
-        q_tile_bytes * cfg.q_stage
-        + o_stage_bytes * cfg.num_qkv_instances
-        + stats_bytes
-        + page_offsets_bytes
-        + control_bytes
+        (q_tile_bytes * cfg.q_stage + align - 1) // align * align
+        + (o_stage_bytes + align - 1) // align * align * cfg.num_qkv_instances
+        + smem_p_bytes
+        + (stats_bytes + 15) // 16 * 16
+        + (page_offsets_bytes + 15) // 16 * 16
+        + (control_bytes + 7) // 8 * 8
         + fixed_barrier_stages * _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
     return utils.get_smem_capacity_in_bytes("sm_100") - fixed_smem_bytes
@@ -1840,10 +1858,17 @@ def _infer_single_instance_kv_stages(
         page_table_window_entries=page_table_window_entries,
     )
     kv_dtype_width = max(cfg.k_dtype.width, cfg.v_dtype.width)
+    kv_head_dim = (
+        cfg.head_dim_per_stage_kv if cfg.stage_kv_by_head_dim else cfg.qk_mma_tiler[2]
+    )
     kv_stage_bytes = (
-        cfg.qk_mma_tiler[1] * cfg.head_dim_per_stage_kv * kv_dtype_width // 8
+        cfg.qk_mma_tiler[1] // cfg.cta_group_size * kv_head_dim * kv_dtype_width // 8
     )
     kv_stage_footprint_bytes = kv_stage_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
+    if cfg.vc_attention:
+        kv_stage_footprint_bytes += (
+            cfg.vc_mean_tile_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
+        )
     memory_fit_stages = kv_budget_bytes // kv_stage_footprint_bytes
     cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
     if require_cadence and memory_fit_stages < cadence_stages:
@@ -1861,6 +1886,17 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
     cfg.kv_stage_k = cfg.kv_stage
     cfg.kv_stage_v = cfg.kv_stage
     if not cfg.split_kv_pipelines:
+        # Same-width K and V share one ring: deepen it to what the SMEM budget
+        # allows after every other buffer, as FA4 does.
+        n_stages = max(
+            cfg.kv_stage,
+            _infer_single_instance_kv_stages(
+                cfg, is_clc_dynamic=is_clc_dynamic, require_cadence=False
+            ),
+        )
+        cfg.kv_stage = n_stages
+        cfg.kv_stage_k = n_stages
+        cfg.kv_stage_v = n_stages
         return
     # Mixed dtypes require separate K and V rings. Size each ring from one
     # cadence up to cfg.kv_stage against the shared SMEM budget.
@@ -1877,12 +1913,12 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
         kv_rows_per_cta * kv_head_dim * cfg.v_dtype.width // 8
         + _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
+    if cfg.vc_attention:
+        v_stage_footprint += cfg.vc_mean_tile_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
     # K and V share the same head_dim and head_dim_per_stage_kv, so their
     # minimum ring depths (num_head_dim_stages) are equal and both rings are sized identically.
     cadence = cfg.num_head_dim_stages_k
-    n_stages = min(
-        cfg.kv_stage, budget_bytes // (k_stage_footprint + v_stage_footprint)
-    )
+    n_stages = budget_bytes // (k_stage_footprint + v_stage_footprint)
     if n_stages < cadence:
         raise ValueError(
             f"split K/V staging requires at least {cadence} stages per ring "
@@ -1893,7 +1929,9 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
     cfg.kv_stage_v = n_stages
 
 
-def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
+def _configure_pipeline_stages(
+    cfg: FmhaConfig, *, is_clc_dynamic: bool, is_persistent: bool
+) -> None:
     """Set topology- and capacity-derived context pipeline stage counts."""
     cfg.q_stage = cfg.num_qkv_instances
     # Stages using Two-CTA method are half-tiles, where the peer CTA holds the
@@ -1903,6 +1941,9 @@ def _configure_pipeline_stages(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None
     cfg.stage_scoped_tmem_stats = cfg.has_tmem_p_pipeline
     cfg.mma_softmax_stage = 2 if cfg.has_tmem_p_pipeline else 1
     cfg.softmax_corr_stage = 2 if cfg.stage_scoped_tmem_stats else 1
+    # The early-sum policy decides the P-prefix barriers, so settle it before
+    # the K/V ring is sized against the remaining SMEM.
+    _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
     # A single Q instance always reuses one physical O accumulator. Allow only
     # one outstanding PV result so correction finishes before the next PV.
     # StatsDone protects statistics, and is released before O correction;
@@ -2805,7 +2846,9 @@ class FmhaTs:
         if head_paired:
             _configure_head_paired_tilers(cfg, mma_tiler_mn=mma_tiler_mn, d=d)
             _configure_head_dim_staging(cfg)
-            _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
+            _configure_pipeline_stages(
+                cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
+            )
             if cfg.single_qkv_instance:
                 _configure_single_instance_tmem_layout(cfg)
                 _configure_single_instance_warp_layout(cfg)
@@ -2827,7 +2870,6 @@ class FmhaTs:
                 window_size_left=window_size_left,
                 has_variable_window=has_variable_window,
             )
-            _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
             return
 
         # MMA tiler: (M, N, K) = (128, 128, 128)
@@ -2836,7 +2878,9 @@ class FmhaTs:
         cfg.pv_mma_tiler = (mma_tiler[0], d_v, mma_tiler[1])
         cfg.epi_tile = cfg.pv_mma_tiler[:2]
         _configure_head_dim_staging(cfg)
-        _configure_pipeline_stages(cfg, is_clc_dynamic=is_clc_dynamic)
+        _configure_pipeline_stages(
+            cfg, is_clc_dynamic=is_clc_dynamic, is_persistent=is_persistent
+        )
         if cfg.single_qkv_instance:
             _configure_single_instance_tmem_layout(cfg)
             _configure_single_instance_warp_layout(cfg)
@@ -2913,7 +2957,6 @@ class FmhaTs:
             window_size_left=window_size_left,
             has_variable_window=has_variable_window,
         )
-        _configure_early_tile_sum_policy(cfg, is_persistent=is_persistent)
 
     # ---------------------------------------------------------------------------
     # Host entry point

@@ -278,6 +278,10 @@ class FmhaConfig:
     # Pipeline stages
     q_stage: int = 2
     kv_stage: int = 3
+    # VC-Attention is not on this branch; the shared K/V ring sizing reads the flag.
+    vc_attention: bool = False
+    # P stays in TMEM on this branch; the shared K/V ring sizing reads the flag.
+    p_in_smem: bool = False
     # One TMA pipeline has one expected-transaction byte count per stage, so K
     # and V share a ring of kv_stage stages only while their dtype widths
     # match. Mixed widths set split_kv_pipelines and size one ring per side.
