@@ -1268,16 +1268,28 @@ def main():
         parser.error(f"unknown arms {unknown}; choose from {sorted(ARMS)}")
     if args.rows is None:
         args.rows = PRESETS[args.preset]["rows"] if args.preset else list(ROWS)
-    # every layout the run will build (one per perf row, plus the accuracy layout) must carry dkv_acc when a
-    # destination map is set -- Layout() raises otherwise, which would abort the run after the first rows
-    planned = [(row, resolve_layout(row, args)) for row in args.rows]
+    # every layout the run will build (one per perf row, plus the accuracy cases) must carry dkv_acc when a
+    # destination map is set, and a recorded glm_* map must match the key-row count of the inputs it is applied
+    # to -- Layout() raises otherwise, which would abort the run after rows (or the whole perf run) have been timed
+    planned = [(row, resolve_layout(row, args), sum(ROWS[row][1])) for row in args.rows]
     if args.accuracy:
-        planned.append(("accuracy", resolve_layout(None, args)))
-    for name, layout in planned:
-        if layout.get("dkv_dst_map", "none") != "none" and not layout.get("dkv_acc"):
+        accuracy_layout = resolve_layout(None, args)
+        planned += [
+            (f"accuracy case {case!r}", accuracy_layout, sum(spec["seq_k"]))
+            for case, spec in ACCURACY_CASES.items()
+        ]
+    for name, layout, total_k in planned:
+        dst_map = layout.get("dkv_dst_map", "none")
+        if dst_map != "none" and not layout.get("dkv_acc"):
             parser.error(
                 f"--dkv-dst-map needs dkv_acc, but the layout of {name!r} resolves without it "
                 "(add --dkv-acc or pick rows / a preset that enable it)"
+            )
+        if dst_map in GLM_DST_ROWS and sum(GLM_DST_ROWS[dst_map][0]) != total_k:
+            parser.error(
+                f"--dkv-dst-map {dst_map} is recorded for {sum(GLM_DST_ROWS[dst_map][0])} key rows, "
+                f"but {name} has {total_k} (the glm_* maps fit only the rows of their batch; "
+                "the accuracy cases use 4096-key inputs)"
             )
     device = torch.device(args.device)
     if device.index is None:  # torch >= 2.13 requires an index here
