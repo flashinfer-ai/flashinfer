@@ -395,10 +395,28 @@ def test_decode_config_round6_rules(arch):
     cfg = decode_config(65, 50, 28, arch, SM_COUNT)
     assert (cfg.tok, cfg.m_tiles, cfg.mc, cfg.pf) == (128, 1, 1, 0)
     assert cfg.kernel_key == "decode:t128_p3"
-    # Lever P alone on the M = 64 bucket of the same family (two stages ahead).
+    # Lever M64 (round-6 continuation 6): the 48- / 50-tile M = 64 buckets take the 32-token tile with the 5-stage ring,
+    # the 16-row epilogue chunk and W prefetch two stages ahead (96 / 100 CTAs instead of 48 / 50; bit-exact with the
+    # 64-token route).
     cfg = decode_config(64, 50, 28, arch, SM_COUNT)
-    assert (cfg.tok, cfg.mc, cfg.pf) == (64, 1, 2)
-    assert cfg.kernel_key == "decode:t64_p4_pf2"
+    assert (cfg.tok, cfg.stages, cfg.module_stages, cfg.epi_chunk, cfg.mc, cfg.pf) == (
+        32,
+        5,
+        5,
+        16,
+        1,
+        2,
+    )
+    assert cfg.m_tiles == 2 and cfg.tiles == 100
+    assert cfg.kernel_key == "decode:t32_p5_c16_pf2"
+    cfg = decode_config(64, 48, 28, arch, SM_COUNT)
+    assert (cfg.tok, cfg.stages, cfg.epi_chunk, cfg.pf) == (
+        32,
+        5,
+        16,
+        2,
+    ) and cfg.tiles == 96
+    assert cfg.kernel_key == "decode:t32_p5_c16_pf2"
     # Lever D: the 12-tile M = 256 rows pin a 5-stage ring with 16-row epilogue flushes.
     cfg = decode_config(256, 12, 28, arch, SM_COUNT)
     assert (cfg.tok, cfg.stages, cfg.module_stages, cfg.epi_chunk) == (32, 5, 5, 16)
