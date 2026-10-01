@@ -693,6 +693,34 @@ def test_rank_tactics_returns_top_k_and_caches_winner(monkeypatch):
     assert tactic == 1
 
 
+def test_rank_tactics_records_winner_policy(monkeypatch):
+    """A ranked winner must carry the policy it was measured under, so
+    save_configs cannot persist a stale policy from an earlier choose_one."""
+    tuner = reset_autotuner()
+    runner = DummyRunner(valid_tactics=(0, 1))
+    inputs = [torch.empty((16, 32), dtype=torch.float32)]
+    hot = TuningConfig()
+    cold = TuningConfig(use_cold_l2_cache=True)
+
+    monkeypatch.setattr(
+        AutoTuner,
+        "_profile_single_kernel",
+        lambda self, runner_obj, prof_inputs, tactic, tuning_config=None, **kw: (
+            float(tactic)
+        ),
+    )
+    with autotune(tune_mode=True):
+        tuner.rank_tactics("dummy_rank", [runner], cold, inputs, k=2)
+    (key,) = tuner.profiling_cache
+    assert tuner._profiling_cache_policies[key] == tuner._profiling_policy(cold)
+
+    # Re-rank the same key under hot L2: the stale cold label must be replaced.
+    tuner._ranked_tactics_cache.clear()
+    with autotune(tune_mode=True):
+        tuner.rank_tactics("dummy_rank", [runner], hot, inputs, k=2)
+    assert tuner._profiling_cache_policies[key] == tuner._profiling_policy(hot)
+
+
 def test_rank_tactics_rebuilds_shortlist_from_winner_only_cache(monkeypatch):
     tuner = reset_autotuner()
     runner = DummyRunner(valid_tactics=(0, 1, 2))
