@@ -1585,7 +1585,7 @@ def _top_k_first_fast_path(
     values = values.float()
     if not isinstance(top_k, int):
         # Clamp so every row keeps at least one candidate.
-        row_k = top_k.clamp(1, select_k).unsqueeze(-1)
+        row_k = top_k.int().clamp(1, select_k).unsqueeze(-1)
         cols = torch.arange(select_k, device=x.device)
         values = values.masked_fill(
             cols >= row_k, float("-inf") if from_logits else 0.0
