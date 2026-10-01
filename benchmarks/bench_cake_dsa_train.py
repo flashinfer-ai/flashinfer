@@ -171,7 +171,9 @@ def dst_map_rows(seq_k, dst_rows):
             )
     out, next_row = [], 0
     for lk, di in zip(seq_k, d, strict=True):
-        out.extend(range(next_row - di, next_row))  # aliased onto the previous segment's last di rows
+        out.extend(
+            range(next_row - di, next_row)
+        )  # aliased onto the previous segment's last di rows
         out.extend(range(next_row, next_row + lk - di))
         next_row += lk - di
     assert next_row == int(dst_rows) and len(out) == S
@@ -186,13 +188,18 @@ def bwd_chunk(seq_q, seq_k, q0, q1):
     seq_q, seq_k = [int(x) for x in seq_q], [int(x) for x in seq_k]
     out_q, out_k, cu = [], [], 0
     for lq, lk in zip(seq_q, seq_k, strict=True):
-        lo, hi = max(q0, cu), min(q1, cu + lq)  # the chunk's queries of this document (packed positions)
+        lo, hi = (
+            max(q0, cu),
+            min(q1, cu + lq),
+        )  # the chunk's queries of this document (packed positions)
         n = max(0, hi - lo)
         if n == 0:
             out_q.append(0)
             out_k.append(lk)
         else:
-            own_last = (lk - lq) + (hi - cu)  # keys up to the last own key of the chunk's queries
+            own_last = (lk - lq) + (
+                hi - cu
+            )  # keys up to the last own key of the chunk's queries
             out_q.append(n)
             out_k.append(own_last)
             if own_last < lk:
@@ -200,15 +207,21 @@ def bwd_chunk(seq_q, seq_k, q0, q1):
                 out_k.append(lk - own_last)
         cu += lq
     if sum(out_q) != q1 - q0 or sum(out_k) != sum(seq_k):
-        raise ValueError(f"bwd_chunk: queries [{q0}, {q1}) do not fit the batch ({sum(seq_q)} queries)")
+        raise ValueError(
+            f"bwd_chunk: queries [{q0}, {q1}) do not fit the batch ({sum(seq_q)} queries)"
+        )
     return out_q, out_k
 
 
-ROWS["packed_glm_a_dstmap"] = GLM_A  # the recorded batch a with its dK/dV destination map (ROW_LAYOUTS)
+ROWS["packed_glm_a_dstmap"] = (
+    GLM_A  # the recorded batch a with its dK/dV destination map (ROW_LAYOUTS)
+)
 ROWS["packed_glm_b_dstmap"] = GLM_B
 ROWS["packed_glm_a_s704_dstmap"] = GLM_A
 ROWS["packed_glm_b_s704_dstmap"] = GLM_B
-ROWS["chunk_4096x268757"] = bwd_chunk(*GLM_A, 0, 4096)  # the recorded 4096-query backward chunks
+ROWS["chunk_4096x268757"] = bwd_chunk(
+    *GLM_A, 0, 4096
+)  # the recorded 4096-query backward chunks
 ROWS["chunk_3943x268757"] = bwd_chunk(*GLM_A, 12288, 16231)
 ROWS["chunk_3884x267520"] = bwd_chunk(*GLM_B, 12288, 16172)
 
@@ -232,8 +245,16 @@ ROW_LAYOUTS = {
     "doc_4097": TRAINER_LAYOUT,
     "packed_glm_a_dstmap": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
     "packed_glm_b_dstmap": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_b"},
-    "packed_glm_a_s704_dstmap": {**TRAINER_LAYOUT, "kv_stride": 704, "dkv_dst_map": "glm_a"},
-    "packed_glm_b_s704_dstmap": {**TRAINER_LAYOUT, "kv_stride": 704, "dkv_dst_map": "glm_b"},
+    "packed_glm_a_s704_dstmap": {
+        **TRAINER_LAYOUT,
+        "kv_stride": 704,
+        "dkv_dst_map": "glm_a",
+    },
+    "packed_glm_b_s704_dstmap": {
+        **TRAINER_LAYOUT,
+        "kv_stride": 704,
+        "dkv_dst_map": "glm_b",
+    },
     "chunk_4096x268757": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
     "chunk_3943x268757": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_a"},
     "chunk_3884x267520": {**TRAINER_LAYOUT, "dkv_dst_map": "glm_b"},
@@ -336,7 +357,9 @@ class Layout:
             "none",
         )
         self.total_q, self.total_k = inp.total_q, inp.total_k
-        self.dkv_rows = inp.total_k  # rows of dkv_acc (fewer than the key rows with a recorded map)
+        self.dkv_rows = (
+            inp.total_k
+        )  # rows of dkv_acc (fewer than the key rows with a recorded map)
         device = inp.q_latent.device
         self.q_latent, self.q_rope = inp.q_latent, inp.q_rope
         self.kv_latent, self.k_rope = inp.kv_latent, inp.k_rope
