@@ -478,6 +478,7 @@ TAIL_GEMM_KWARGS = (
     "A2",
     "B2",
     "out",
+    "out_map",
     "ws",
     "counters",
     "M",
@@ -625,15 +626,23 @@ TAIL_N128_TP = 8
 TAIL_N128_T = 512
 TAIL_N128_BLOCK_N = 128
 TAIL_N128_STAGES = 9
+# Round-10 lever L1c (Cake ``tail_gemm_config_for`` ``FINAL_TS`` rule): every 256-wide tail GEMM instance stages the
+# CTA's final item (its last stream-K segment) through one TMA store per epilogue warp out of the drained TMA ring
+# instead of the direct pointer stores -- a separate kernel instance (key suffix ``t1``) with the same accumulator
+# values and the same round-to-nearest bf16 conversion, so ``out`` is bit-identical; every earlier item of a CTA keeps
+# the direct stores.  The instance takes the bf16 tensor map of ``out`` as one extra argument (``out_map``, bound by
+# value from the same tensor as the ``out`` pointer).  The 128-wide TP8 T=512 instance keeps the direct stores (one
+# 64-column pass per warp: the slab's fixed cost exceeds the exposed store it replaces).
+TAIL_FINAL_TS = True
 
 
-def tail_gemm_config(M: int, tp: int) -> tuple[int, int]:
-    """``(num_stages, block_n)`` of the production prefill tail GEMM instance for ``M`` tokens at ``tp``."""
+def tail_gemm_config(M: int, tp: int) -> tuple[int, int, bool]:
+    """``(num_stages, block_n, final_ts)`` of the production prefill tail GEMM instance for ``M`` tokens at ``tp``."""
     if int(tp) == TAIL_RING6_TP and int(M) <= TAIL_RING6_MAX_T:
-        return TAIL_RING6_STAGES, BLOCK_N
+        return TAIL_RING6_STAGES, BLOCK_N, TAIL_FINAL_TS
     if int(tp) == TAIL_N128_TP and int(M) == TAIL_N128_T:
-        return TAIL_N128_STAGES, TAIL_N128_BLOCK_N
-    return TAIL_NUM_STAGES, BLOCK_N
+        return TAIL_N128_STAGES, TAIL_N128_BLOCK_N, False
+    return TAIL_NUM_STAGES, BLOCK_N, TAIL_FINAL_TS
 
 
 def tail_gemm_num_stages(M: int, tp: int) -> int:
@@ -644,20 +653,27 @@ def tail_gemm_block_n(M: int, tp: int) -> int:
     return tail_gemm_config(M, tp)[1]
 
 
+def tail_gemm_final_ts(M: int, tp: int) -> bool:
+    return tail_gemm_config(M, tp)[2]
+
+
 def tail_gemm_kernel_key(
     tp: int,
     weights_evict_first: bool,
     fused_norm: bool = False,
     num_stages: int = TAIL_NUM_STAGES,
     block_n: int = BLOCK_N,
+    final_ts: bool = False,
 ) -> str:
-    """``tail_gemm:tp<tp>e<evict>f<fused>[s<stages>][n<block_n>]``; the ring-depth and tile-width suffixes appear
-    only for a non-default instance."""
+    """``tail_gemm:tp<tp>e<evict>f<fused>[s<stages>][n<block_n>][t1]``; the ring-depth, tile-width and final-item
+    staged-store suffixes appear only for a non-default instance."""
     key = f"tail_gemm:tp{int(tp)}e{1 if weights_evict_first else 0}f{1 if fused_norm else 0}"
     if int(num_stages) != TAIL_NUM_STAGES:
         key += f"s{int(num_stages)}"
     if int(block_n) != BLOCK_N:
         key += f"n{int(block_n)}"
+    if final_ts:
+        key += "t1"
     return key
 
 
@@ -754,7 +770,7 @@ def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, An
     i_local = i_local_for_tp(tp)
     norm_grid = (M + NORM_ROWS_PER_CTA - 1) // NORM_ROWS_PER_CTA
     m_tiles = m_tiles_for(M)
-    num_stages, block_n = tail_gemm_config(M, tp)
+    num_stages, block_n, final_ts = tail_gemm_config(M, tp)
     n_tiles = HIDDEN // block_n
     cluster_tiles = (m_tiles // CTA_GROUP) * n_tiles
     num_k = (k_up + i_local) // BLOCK_K
@@ -776,6 +792,7 @@ def prefill_tail_plan(M: int, tp: int, sm_count: int = SM_COUNT) -> dict[str, An
         fused_norm=bool(use_fused_norm(M, gemm_grid, sm_count, i_local // BLOCK_K)),
         num_stages=num_stages,
         block_n=block_n,
+        final_ts=bool(final_ts),
         n_tiles=n_tiles,
         **sk,
     )
@@ -815,6 +832,7 @@ def route_kernel_keys(
             plan["fused_norm"],
             plan["num_stages"],
             plan["block_n"],
+            plan["final_ts"],
         )
         if plan["fused_norm"]:
             return (gemm,)
@@ -1286,13 +1304,18 @@ def prepare_kimi_k3_latent_moe_tail(
                 plan["fused_norm"],
                 plan["num_stages"],
                 plan["block_n"],
+                plan["final_ts"],
             )
+            # ``out_map``: the bf16 tensor map of ``out`` for the final-item staged TMA store (``t1`` instances bind it
+            # by value from the same tensor as the ``out`` pointer; the argument plan of the 128-wide instance does not
+            # list it and ``_bind`` passes only what the generated program declares).
             gemm_kwargs = dict(
                 A1=y_workspace,
                 B1=up_weight,
                 A2=shared_act,
                 B2=shared_down_weight,
                 out=out,
+                out_map=out,
                 ws=ws,
                 counters=counters,
                 M=T,
@@ -1413,6 +1436,8 @@ __all__ = [
     "required_kernel_keys",
     "route_kernel_keys",
     "split_plan",
+    "tail_gemm_config",
+    "tail_gemm_final_ts",
     "tail_gemm_kernel_key",
     "use_fused_norm",
     "fused_norm_fits",
