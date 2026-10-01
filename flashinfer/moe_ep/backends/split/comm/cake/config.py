@@ -8,12 +8,12 @@ from ..nvlink_one_sided.config import NVLinkOneSidedConfig
 
 
 @dataclass
-class NVLinkOneSidedCakeConfig(NVLinkOneSidedConfig):
+class CakeAlltoAllConfig(NVLinkOneSidedConfig):
     """Options of :class:`CakeAlltoAll`; see
     :class:`NVLinkOneSidedConfig` for the fields.
 
-    Pass to ``create_communication(..., backend=NVLinkOneSidedCakeConfig(...))``
-    or ``MoEEpLayer(..., backend=SplitConfig(comm=NVLinkOneSidedCakeConfig()))``.
+    Pass to ``create_communication(..., backend=CakeAlltoAllConfig(...))``
+    or ``MoEEpLayer(..., backend=SplitConfig(comm=CakeAlltoAllConfig()))``.
     """
 
-    backend_name: str = "nvlink_one_sided_cake"
+    backend_name: str = "cake"

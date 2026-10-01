@@ -1,8 +1,8 @@
 """Execution modes: split (dispatch/kernel/combine) and mega (fused kernel)."""
 
 from ..backends.split.comm import (
+    CakeAlltoAllConfig,
     NCCLEPConfig,
-    NVLinkOneSidedCakeConfig,
     NVLinkOneSidedConfig,
     NVLinkTwoSidedConfig,
     NcclEpConfig,
@@ -16,6 +16,7 @@ from .mega_layer import MoEEpMegaLayer, MoEEpMegaWorkspace
 from .split_layer import MoEEpSplitGraphState, MoEEpSplitLayer
 
 __all__ = [
+    "CakeAlltoAllConfig",
     "FusedMoeKernelConfig",
     "IdentityConfig",
     "MegaConfig",
@@ -24,7 +25,6 @@ __all__ = [
     "MoEEpSplitGraphState",
     "MoEEpSplitLayer",
     "NCCLEPConfig",
-    "NVLinkOneSidedCakeConfig",
     "NVLinkOneSidedConfig",
     "NVLinkTwoSidedConfig",
     "NcclEpConfig",

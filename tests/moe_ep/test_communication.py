@@ -16,6 +16,8 @@ import torch
 from flashinfer.fused_moe import QuantFormat
 from flashinfer.moe_ep import (
     BootstrapConfig,
+    CakeAlltoAll,
+    CakeAlltoAllConfig,
     CombineOutput,
     DispatchOutput,
     EpAlgorithm,
@@ -31,8 +33,6 @@ from flashinfer.moe_ep import (
     NCCLEPConfig,
     NcclEpCommunication,
     NVLinkOneSidedAlltoAll,
-    CakeAlltoAll,
-    NVLinkOneSidedCakeConfig,
     NVLinkOneSidedConfig,
     NVLinkTwoSidedAlltoAll,
     SplitConfig,
@@ -151,12 +151,12 @@ class TestRegistry:
         for name in (
             "nccl_ep",
             "nvlink_one_sided",
-            "nvlink_one_sided_cake",
+            "cake",
             "nvlink_two_sided",
         ):
             assert is_communication_backend(name)
         assert is_communication_backend(NVLinkOneSidedConfig())
-        assert is_communication_backend(NVLinkOneSidedCakeConfig())
+        assert is_communication_backend(CakeAlltoAllConfig())
         assert not is_communication_backend("nixl_ep")
         assert not is_communication_backend(object())
 
@@ -485,7 +485,7 @@ def test_nvlink_one_sided_payload_plumbing(fake_one_sided) -> None:
     comm = create_communication(
         BootstrapConfig(world_size=2, rank=0),
         _params(),
-        NVLinkOneSidedCakeConfig(use_low_precision_combine=True),
+        CakeAlltoAllConfig(use_low_precision_combine=True),
     )
     assert isinstance(comm, CakeAlltoAll)
     a2a = _FakeMoeAlltoAll.instances[-1]

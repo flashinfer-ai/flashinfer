@@ -85,7 +85,7 @@ through `SplitConfig(comm=...)`. They differ in object model, not in role:
 | Backend | Config | Interface | Transport |
 |---|---|---|---|
 | `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back (`flashinfer.comm.MoeAlltoAll`, TRT-LLM kernels) |
-| `nvlink_one_sided_cake` | `NVLinkOneSidedCakeConfig` | `MoEEpCommunication` | `nvlink_one_sided` running the generated Cake kernels (`MoeAlltoAll` with `backend="cake"`); SM100/SM103 only |
+| `cake` | `CakeAlltoAllConfig` | `MoEEpCommunication` | `nvlink_one_sided` running the generated Cake kernels (`MoeAlltoAll` with `backend="cake"`); SM100/SM103 only |
 | `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`flashinfer.comm.MnnvlMoe`); `num_experts % 4 == 0` |
 | `nccl_ep` | `NcclEpConfig` | Fleet/Handle (also adapted to `MoEEpCommunication`, LL `RANK_MAJOR`) | see below |
 | `nixl_ep` | `NvepConfig` | Fleet/Handle | see below |
@@ -372,7 +372,7 @@ classDiagram
 | Kind | Name | Config |
 |------|------|--------|
 | Comm | `nvlink_one_sided` | `NVLinkOneSidedConfig` |
-| Comm | `nvlink_one_sided_cake` | `NVLinkOneSidedCakeConfig` |
+| Comm | `cake` | `CakeAlltoAllConfig` |
 | Comm | `nvlink_two_sided` | `NVLinkTwoSidedConfig` |
 | Comm | `nccl_ep` | `NcclEpConfig` (`NCCLEPConfig` alias) |
 | Comm | `nixl_ep` | `NvepConfig` (needs `tcp_store`) |

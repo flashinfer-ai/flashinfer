@@ -90,7 +90,7 @@ def _backend_configs(args: argparse.Namespace) -> Dict[str, Callable[[], Any]]:
     """Benchmarkable backends: name -> factory of its MoEEpCommunication config."""
     from flashinfer.moe_ep import (
         NCCLEPConfig,
-        NVLinkOneSidedCakeConfig,
+        CakeAlltoAllConfig,
         NVLinkOneSidedConfig,
         NVLinkTwoSidedConfig,
     )
@@ -100,9 +100,7 @@ def _backend_configs(args: argparse.Namespace) -> Dict[str, Callable[[], Any]]:
         "nvlink_one_sided": lambda: NVLinkOneSidedConfig(
             use_low_precision_combine=low_precision
         ),
-        "nvlink_one_sided_cake": lambda: NVLinkOneSidedCakeConfig(
-            use_low_precision_combine=low_precision
-        ),
+        "cake": lambda: CakeAlltoAllConfig(use_low_precision_combine=low_precision),
         "nvlink_two_sided": NVLinkTwoSidedConfig,
         "nccl_ep": NCCLEPConfig,
     }
@@ -702,7 +700,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         choices=[
             "nvlink_one_sided",
-            "nvlink_one_sided_cake",
+            "cake",
             "nvlink_two_sided",
             "nccl_ep",
         ],

@@ -18,7 +18,7 @@ from datetime import timedelta
 import pytest
 
 _PG_TIMEOUT = timedelta(minutes=60)
-_BACKENDS = ["nvlink_one_sided", "nvlink_one_sided_cake", "nvlink_two_sided", "nccl_ep"]
+_BACKENDS = ["nvlink_one_sided", "cake", "nvlink_two_sided", "nccl_ep"]
 
 
 def _init_dist():
@@ -38,8 +38,8 @@ def _init_dist():
 
 def _backend_config(name):
     from flashinfer.moe_ep import (
+        CakeAlltoAllConfig,
         NCCLEPConfig,
-        NVLinkOneSidedCakeConfig,
         NVLinkOneSidedConfig,
         NVLinkTwoSidedConfig,
         available_communication_backends,
@@ -49,7 +49,7 @@ def _backend_config(name):
         pytest.skip(f"{name} is not available on this machine")
     return {
         "nvlink_one_sided": NVLinkOneSidedConfig,
-        "nvlink_one_sided_cake": NVLinkOneSidedCakeConfig,
+        "cake": CakeAlltoAllConfig,
         "nvlink_two_sided": NVLinkTwoSidedConfig,
         "nccl_ep": NCCLEPConfig,
     }[name]()
@@ -207,7 +207,7 @@ def test_split_layer_identity_round_trip_over_nvlink_one_sided():
 
 
 @pytest.mark.gpu_2
-@pytest.mark.parametrize("backend", [b for b in _BACKENDS if b.startswith("nvlink")])
+@pytest.mark.parametrize("backend", [b for b in _BACKENDS if b != "nccl_ep"])
 def test_split_layer_cuda_graph_replays_new_inputs(backend):
     """A captured MoEEpSplitLayer forward serves inputs rewritten in place."""
     import torch

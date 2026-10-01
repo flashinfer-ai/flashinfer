@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional
 
 from .....core.comm.communication import MoEEpCommParams, register_communication
 from ..nvlink_one_sided.communication import NVLinkOneSidedAlltoAll
-from .config import NVLinkOneSidedCakeConfig
+from .config import CakeAlltoAllConfig
 
 if TYPE_CHECKING:
     from .....config import BootstrapConfig
@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 _CAKE_COMPUTE_CAPABILITIES = ((10, 0), (10, 3))
 
 
-@register_communication("nvlink_one_sided_cake")
+@register_communication("cake")
 class CakeAlltoAll(NVLinkOneSidedAlltoAll):
     """:class:`NVLinkOneSidedAlltoAll` running the generated Cake kernels."""
 
@@ -32,10 +32,10 @@ class CakeAlltoAll(NVLinkOneSidedAlltoAll):
         self,
         bootstrap: "BootstrapConfig",
         params: MoEEpCommParams,
-        config: Optional[NVLinkOneSidedCakeConfig] = None,
+        config: Optional[CakeAlltoAllConfig] = None,
     ) -> None:
         super().__init__(
-            bootstrap, params, NVLinkOneSidedCakeConfig() if config is None else config
+            bootstrap, params, CakeAlltoAllConfig() if config is None else config
         )
 
     @classmethod

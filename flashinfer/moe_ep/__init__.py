@@ -176,6 +176,7 @@ from .core.validation import (
 )
 from .layer import MoEEpLayer
 from .modes import (
+    CakeAlltoAllConfig,
     FusedMoeKernelConfig,
     IdentityConfig,
     MegaConfig,
@@ -184,7 +185,6 @@ from .modes import (
     MoEEpSplitGraphState,
     MoEEpSplitLayer,
     NCCLEPConfig,
-    NVLinkOneSidedCakeConfig,
     NVLinkOneSidedConfig,
     NVLinkTwoSidedConfig,
     NcclEpConfig,
@@ -206,6 +206,7 @@ __all__ = [
     "AlgoKnob",
     "BootstrapConfig",
     "CakeAlltoAll",
+    "CakeAlltoAllConfig",
     "CakeMxfp8MegaMoeEp16",
     "CakeMxfp8MegaMoeEp16Weights",
     "preprocess_cake_mxfp8_megamoe_ep16_weights",
@@ -266,7 +267,6 @@ __all__ = [
     "Sm100_Mxfp8_Mxfp8_Bf16_Cutedsl_MegaMoeConfig",
     "NCCLEPConfig",
     "NVLinkOneSidedAlltoAll",
-    "NVLinkOneSidedCakeConfig",
     "NVLinkOneSidedConfig",
     "NVLinkTwoSidedAlltoAll",
     "NVLinkTwoSidedConfig",
@@ -445,7 +445,7 @@ from .backends.split.comm.nccl_ep.communication import (  # noqa: E402
 from .backends.split.comm.nvlink_one_sided.communication import (  # noqa: E402
     NVLinkOneSidedAlltoAll,
 )
-from .backends.split.comm.nvlink_one_sided_cake.communication import (  # noqa: E402
+from .backends.split.comm.cake.communication import (  # noqa: E402
     CakeAlltoAll,
 )
 from .backends.split.comm.nvlink_two_sided.communication import (  # noqa: E402

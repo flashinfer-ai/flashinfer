@@ -1,8 +1,8 @@
 """Split-path backends: comm transport + inner kernels."""
 
 from .comm import (
+    CakeAlltoAllConfig,
     NCCLEPConfig,
-    NVLinkOneSidedCakeConfig,
     NVLinkOneSidedConfig,
     NVLinkTwoSidedConfig,
     NcclEpConfig,
@@ -11,8 +11,8 @@ from .comm import (
 from . import kernel
 
 __all__ = [
+    "CakeAlltoAllConfig",
     "NCCLEPConfig",
-    "NVLinkOneSidedCakeConfig",
     "NVLinkOneSidedConfig",
     "NVLinkTwoSidedConfig",
     "NcclEpConfig",
