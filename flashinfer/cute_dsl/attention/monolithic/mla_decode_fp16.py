@@ -3248,7 +3248,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # if warps in N is 2, reduce row_max across warps (0, 1) and (2, 3)
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_max_new
-            self.softmax_exchange_sync_bar.wait()
+            self.softmax_exchange_sync_bar.arrive_and_wait()
             row_max_new = cute.arch.fmax(
                 row_max_new,
                 common_params.smem_exchange[
@@ -3658,7 +3658,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         # exchange row_sum between warps (0, 1) and (2, 3)
         if cutlass.const_expr(self.warps_in_n == 2):
             common_params.smem_exchange[tidx] = row_sum
-            self.epilogue_exchange_sync_bar.wait()
+            self.epilogue_exchange_sync_bar.arrive_and_wait()
             # (64, 2)
             row_sum = (
                 row_sum
