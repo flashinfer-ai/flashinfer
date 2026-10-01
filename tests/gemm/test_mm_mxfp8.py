@@ -153,6 +153,36 @@ def _prepare_mxfp8_tensors(
     return input_mxfp8, weight_mxfp8, input_scale, weight_scale
 
 
+def _mxfp8_cute_dsl_tactics(m, n, k=128):
+    """Tactics the cute-dsl runner offers for (m, n, k); compiles no kernel."""
+    device = torch.device("cuda")
+    a = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=device)
+    b = torch.empty((n, k), dtype=torch.float8_e4m3fn, device=device).T
+    a_sf = torch.empty((max(m, 128) * k // 32,), dtype=torch.uint8, device=device)
+    b_sf = torch.empty((max(n, 128) * k // 32,), dtype=torch.uint8, device=device)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=device)
+    major, minor = get_compute_capability(device)
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(major, minor, True, torch.bfloat16)
+    return runner.get_valid_tactics([a, b, a_sf, b_sf, torch.bfloat16, out, None], None)
+
+
+def test_mm_mxfp8_cute_dsl_narrow_tiles_only_within_32_tokens():
+    """Narrow N tiles (< 64) address the 128-wide SFB tile through a shifted
+    TMEM column; an odd shift faults in tcgen05.mma, so the runner must only
+    offer them while the kernel-N extent (n, or m when A and B are swapped)
+    is at most 32."""
+    _skip_if_unsupported("cute-dsl")
+    for m, n in ((128, 128), (128, 64), (64, 128)):
+        narrow = [t for t in _mxfp8_cute_dsl_tactics(m, n) if t[0][1] < 64]
+        assert narrow == [], (m, n, narrow)
+    # kernel-N = n = 32: narrow tiles only without the A/B swap
+    narrow = [t for t in _mxfp8_cute_dsl_tactics(128, 32) if t[0][1] < 64]
+    assert narrow and all(not t[2] for t in narrow), narrow
+    # kernel-N = m = 32: narrow tiles only with the A/B swap
+    narrow = [t for t in _mxfp8_cute_dsl_tactics(32, 128) if t[0][1] < 64]
+    assert narrow and all(t[2] for t in narrow), narrow
+
+
 @pytest.mark.parametrize("m", [128, 256, 512, 1024])
 @pytest.mark.parametrize("n", [128, 256, 512, 1024])
 @pytest.mark.parametrize("k", [128, 256, 512, 1024, 2048, 2560, 3200])

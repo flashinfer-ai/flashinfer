@@ -1239,6 +1239,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
                     # by one column per 32 tokens and start the S2T copy's smem
                     # source at the remaining token row (16 B per row of the
                     # 32x4 SF block) so the sub-tile's first token lands in lane 0.
+                    # can_implement limits narrow tiles to a kernel-N extent of
+                    # 32, so the column shift below is always 0 in practice: an
+                    # odd column shift makes tcgen05.mma fault (misaligned
+                    # address), the 64-wide tile above shifts by two columns.
                     tok_off = (
                         mma_tile_coord_mnl[1] % self.sfb_sub_tiles_per_tile
                     ) * self.cta_tile_shape_mnk[1]
@@ -1937,6 +1941,16 @@ class Sm100BlockScaledPersistentDenseGemmKernel(_Sm100BlockScaledGemmCommon):
         ):
             can_implement = False
 
-        if mma_tiler_mn[1] < 64 and cluster_shape_mn[1] > 1:
+        # Narrow N tiles (8/16/32) read their tokens' scale factors out of the
+        # 128-wide SFB tile through the sub-tile addressing in the mainloop:
+        # the S2T copy's smem source moves by whole token rows inside the
+        # first 32-token group and the MMA's SFB TMEM address moves by one
+        # column per 32 tokens. tcgen05.mma faults with a misaligned address
+        # when that column shift is odd (offsets 1 and 3 fault; the 64-wide
+        # tile's two-column shift is fine), so every sub-tile has to stay in
+        # the first 32-token group: the kernel-N extent is limited to 32 and
+        # the SFB tile is never multicast. Wider N takes the 64-wide or
+        # 128-wide tiles.
+        if mma_tiler_mn[1] < 64 and (n > 32 or cluster_shape_mn[1] > 1):
             can_implement = False
         return can_implement
