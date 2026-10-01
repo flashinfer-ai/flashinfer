@@ -74,6 +74,7 @@ from .utils import (
     _get_cache_alibi_slopes_buf,
     _get_trtllm_gen_multi_ctas_kv_counter_buffer,
     _resolve_trtllm_gen_multi_ctas_kv_counter_buffer,
+    get_trtllm_gen_multi_ctas_kv_counter_bytes,
     _get_range_buf,
     _unpack_paged_kv_cache,
     canonicalize_torch_dtype,
@@ -4064,13 +4065,16 @@ def trtllm_batch_decode_with_kv_cache(
             )
             return (out, lse) if return_lse else out
 
-        multi_ctas_kv_counter_buffer = _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
-            multi_ctas_kv_counter_buffer,
-            batch_size,
-            num_qo_heads,
-            sm_count,
-            query.device,
-        )
+        if backend != "cake" or multi_ctas_kv_counter_buffer is not None:
+            multi_ctas_kv_counter_buffer = (
+                _resolve_trtllm_gen_multi_ctas_kv_counter_buffer(
+                    multi_ctas_kv_counter_buffer,
+                    batch_size,
+                    num_qo_heads,
+                    sm_count,
+                    query.device,
+                )
+            )
 
         if backend == "cake":
             from .cake_fmha import (
@@ -4110,6 +4114,7 @@ def trtllm_batch_decode_with_kv_cache(
                 ),
                 enable_block_sparse_attention=enable_block_sparse_attention,
                 lse=lse,
+                multi_ctas_kv_counter_buffer=multi_ctas_kv_counter_buffer,
             )
             cake_module, optimized_loaded = _resolve_cake_fmha_decode_module(
                 query.device, cake_route
@@ -4121,6 +4126,27 @@ def trtllm_batch_decode_with_kv_cache(
                     bmm1_scale = float(bmm1_scale.item()) / log2e
                 if isinstance(bmm2_scale, torch.Tensor):
                     bmm2_scale = float(bmm2_scale.item())
+            if multi_ctas_kv_counter_buffer is None:
+                # Same per-call contract as backend="trtllm-gen": a fresh
+                # zero-initialized buffer when the caller passes none. The
+                # Cake on-device load-balanced route keeps its self-resetting
+                # split-KV counters here too, so size it for the larger of the
+                # two contracts, and allocate it last: the zero-fill is the
+                # first GPU activity of the call, and every host step between
+                # it and the launch would otherwise sit on the stream. Callers
+                # in steady state pass their own buffer or capture a graph.
+                from .cake_fmha import cake_fmha_balanced_counter_bytes
+
+                multi_ctas_kv_counter_buffer = torch.zeros(
+                    max(
+                        get_trtllm_gen_multi_ctas_kv_counter_bytes(
+                            batch_size, num_qo_heads, sm_count
+                        ),
+                        cake_fmha_balanced_counter_bytes(sm_count),
+                    ),
+                    dtype=torch.uint8,
+                    device=query.device,
+                )
             run_func = cake_module.cake_paged_attention_decode
 
         run_args = [
