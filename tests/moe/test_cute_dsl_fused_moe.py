@@ -4491,7 +4491,10 @@ if __name__ == "__main__":
 @cute_dsl_available
 @pytest.mark.parametrize("localized", [False, True])
 @pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
-def test_moe_core_preserves_fc2_output_dtype(monkeypatch, localized, output_dtype):
+@pytest.mark.parametrize("entrypoint", ["core", "functional"])
+def test_moe_core_preserves_fc2_output_dtype(
+    monkeypatch, localized, output_dtype, entrypoint
+):
     import importlib
     from contextlib import nullcontext
     from types import SimpleNamespace
@@ -4536,7 +4539,28 @@ def test_moe_core_preserves_fc2_output_dtype(monkeypatch, localized, output_dtyp
     shard = dict(
         w1_weight=packed, w1_weight_sf=scale, w2_weight=packed, w2_weight_sf=scale
     )
-    result = module._moe_core_impl(
+    from flashinfer.fused_moe.cute_dsl.tuner import DEFAULT_RUBIN_MOE_TACTIC
+
+    monkeypatch.setattr(module, "_require_cute_dsl_arch_for", lambda *a, **kw: None)
+    if entrypoint == "core":
+        forward = module._moe_core_impl
+        kwargs = dict(
+            use_async_memset=False,
+            gemm1_mma_tiler=(128, 128, 128),
+            gemm1_mma_inst_shape=(128, 128, 64),
+            sm_count=8,
+        )
+    else:
+        impl = module._cute_dsl_fused_moe_impl
+
+        def without_async_memset(**kwargs):
+            kwargs["use_async_memset"] = False
+            return impl(**kwargs)
+
+        monkeypatch.setattr(module, "_cute_dsl_fused_moe_impl", without_async_memset)
+        forward = module.cute_dsl_fused_moe
+        kwargs = dict(tactic=DEFAULT_RUBIN_MOE_TACTIC, localized_sm_count=8)
+    result = forward(
         x=torch.empty((1, 64), dtype=torch.uint8),
         x_sf=scale,
         token_selected_experts=indices[:1, None],
@@ -4552,12 +4576,54 @@ def test_moe_core_preserves_fc2_output_dtype(monkeypatch, localized, output_dtyp
         top_k=1,
         num_local_experts=1,
         output_dtype=output_dtype,
-        use_async_memset=False,
-        gemm1_mma_tiler=(128, 128, 128),
-        gemm1_mma_inst_shape=(128, 128, 64),
         localized_weights=[shard, shard] if localized else None,
         localized_streams=[object(), object()] if localized else None,
-        sm_count=8,
+        **kwargs,
     )
+    assert result.shape == (1, 256 if localized else 128)
     assert result.dtype == output_dtype
     assert len(calls) == (2 if localized else 1)
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("missing_module", [False, True])
+def test_localized_moe_reports_missing_green_context_api(monkeypatch, missing_module):
+    import importlib
+    import sys
+    from types import SimpleNamespace
+
+    module = importlib.import_module("flashinfer.fused_moe.cute_dsl.fused_moe")
+    monkeypatch.setitem(
+        sys.modules,
+        "torch.cuda.green_contexts",
+        None if missing_module else SimpleNamespace(),
+    )
+
+    def unexpected_routing(**kwargs):
+        pytest.fail("missing green-context API must fail before routing")
+
+    monkeypatch.setattr(module, "moe_sort", unexpected_routing)
+    packed = torch.empty((1, 128, 64), dtype=torch.uint8)
+    scale = torch.ones(1)
+    with pytest.raises(
+        RuntimeError, match="PyTorch build providing.*execute_in_green_contexts"
+    ):
+        module._moe_core_impl(
+            x=torch.empty((1, 64), dtype=torch.uint8),
+            x_sf=scale,
+            token_selected_experts=torch.zeros((1, 1), dtype=torch.int32),
+            token_final_scales=scale,
+            w1_weight=packed,
+            w1_weight_sf=scale,
+            w1_alpha=scale,
+            fc2_input_scale=scale,
+            w2_weight=packed,
+            w2_weight_sf=scale,
+            w2_alpha=scale,
+            num_experts=1,
+            top_k=1,
+            num_local_experts=1,
+            localized_weights=[{"w2_weight": packed}] * 2,
+            localized_streams=[object(), object()],
+            sm_count=8,
+        )

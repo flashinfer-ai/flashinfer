@@ -129,6 +129,21 @@ def _canonicalize_quant_mode(quant_mode: str) -> str:
     return quant_mode
 
 
+def _moe_hidden_size(w2_weight: torch.Tensor, localized_weights: Optional[list]) -> int:
+    if localized_weights is None:
+        return w2_weight.size(1)
+    if len(localized_weights) != 2:
+        raise ValueError(
+            "locality-domain localization requires exactly two weight shards"
+        )
+    widths = [shard["w2_weight"].size(1) for shard in localized_weights]
+    if widths[0] <= 0 or widths[0] != widths[1]:
+        raise ValueError(
+            f"localized FC2 shards must have equal positive widths, got {widths}"
+        )
+    return sum(widths)
+
+
 def _get_cuda_graph_resources() -> Dict[str, Any]:
     """Get or create pre-allocated CUDA events and streams.
 
@@ -266,6 +281,13 @@ def _moe_core_impl(
         w2_weight: GEMM2 weights (down projection).
         w2_weight_sf: Scale factors for w2_weight.
         w2_alpha: Per-expert global scale for GEMM2.
+        localized_weights: Two domain-ordered dictionaries containing w1_weight,
+            w1_weight_sf, w2_weight, and w2_weight_sf. Split both GEMMs along
+            output rows, preserving FC1 gate/up pairs, and allocate each shard
+            in its domain's memory pool. See cute_dsl_fused_moe for layouts and
+            the full-weight argument contract.
+        localized_streams: Green-context streams in the same order as the shards.
+        localized_memset_stream: Optional stream for output zeroing.
         num_experts: Total number of experts.
         top_k: Number of experts per token.
         num_local_experts: Number of local experts (for EP).
@@ -336,7 +358,7 @@ def _moe_core_impl(
         )
 
     num_tokens = token_selected_experts.size(0)
-    hidden_size = w2_weight.size(1)
+    hidden_size = _moe_hidden_size(w2_weight, localized_weights)
     use_per_token_activation = per_token_scale is not None
 
     # locality-domain localization. Reject the paths the fan-out does not implement rather
@@ -374,6 +396,14 @@ def _moe_core_impl(
                 "locality-domain localization requires use_fused_finalize=True; the "
                 "deterministic path's moe_unpermute reduction is not split-aware."
             )
+        try:
+            from torch.cuda.green_contexts import execute_in_green_contexts
+        except ImportError as exc:
+            raise RuntimeError(
+                "Localized MoE requires a PyTorch build providing "
+                "torch.cuda.green_contexts.execute_in_green_contexts. "
+                "See https://github.com/pytorch/pytorch/pull/199128 for API availability."
+            ) from exc
         # The generic async-memset path cannot be composed with the localized
         # fork/join. The localized path orders its optional memset stream
         # explicitly below.
@@ -442,8 +472,6 @@ def _moe_core_impl(
                 "locality-domain localization is Rubin (SM107) only; pass gemm1_mma_tiler / "
                 "gemm1_mma_inst_shape."
             )
-        from torch.cuda.green_contexts import execute_in_green_contexts
-
         # Allocate once: both domains fill disjoint columns of this buffer.
         permuted_m = permuted_idx_to_expanded_idx.shape[0]
         sf_vec_size = 16  # NVFP4
@@ -1459,8 +1487,33 @@ def cute_dsl_fused_moe(
     localized_weights : Optional[list]
         Per-locality-domain W4A4 weight-shard dictionaries. Supplying these
         enables localized execution; exactly two equal-width shards are required.
+        Entry ``i`` contains ``w1_weight``, ``w1_weight_sf``, ``w2_weight``,
+        and ``w2_weight_sf`` for ``localized_streams[i]``. Allocate all four
+        tensors in the corresponding locality-domain memory pool, for example
+        inside ``torch.cuda.use_mem_pool(domain_pool)``; slicing an allocation
+        from another pool does not relocate its storage.
+
+        For gated W4A4 with E local experts, hidden size H, and intermediate
+        size I, packed uint8 full weights have shapes ``[E, 2*I, H/2]`` (FC1)
+        and ``[E, H, I/2]`` (FC2). Split dimension 1 into two contiguous halves:
+        each domain receives ``[E, I, H/2]`` and ``[E, H/2, I/2]``. Keep each
+        interleaved 64-row up/gate pair together in FC1. Split the corresponding
+        unswizzled scale rows identically, then swizzle each shard independently
+        into the CuTe MMA scale layout. FC2 retains the full reduction dimension;
+        its shards produce disjoint hidden-output columns.
+
+        Continue passing the original full-width ``w1_weight``, ``w2_weight``,
+        and their ``*_sf`` tensors to the regular arguments; do not pass ``None``
+        or shard tensors there. With ``localized_allow_nonlocalized=False``,
+        these supply tensor metadata to the tuner; GEMMs read only the shards.
+        With ``True``, retain their valid contents because autotuning may run
+        and select the full-width path. ``w1_alpha``, ``w2_alpha``, and
+        ``fc2_input_scale`` remain shared across domains.
     localized_streams : Optional[list]
         One long-lived green-context CUDA stream for each locality domain.
+        Requires a PyTorch build with
+        ``torch.cuda.green_contexts.execute_in_green_contexts`` (see PyTorch
+        PR #199128); builds without this API cannot run the localized path.
     localized_sm_count : Optional[int]
         Number of SMs available to each locality-domain stream, used to size
         the persistent kernel grid.
@@ -1495,7 +1548,7 @@ def cute_dsl_fused_moe(
         num_local_experts = num_experts
 
     num_tokens = token_selected_experts.size(0)
-    hidden_size = w2_weight.size(1)
+    hidden_size = _moe_hidden_size(w2_weight, localized_weights)
 
     if moe_output is None:
         moe_output = torch.empty(
