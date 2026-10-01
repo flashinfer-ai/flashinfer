@@ -14,6 +14,8 @@
 
 """Public SiTU backend correctness and caller-owned graph/workspace behavior."""
 
+import re
+
 import pytest
 import torch
 import tvm_ffi
@@ -29,6 +31,7 @@ from flashinfer.fused_moe import (
     trtllm_fp4_block_scale_routed_moe,
 )
 from flashinfer.fused_moe.cake_kimi_k3_situ import (
+    _N8_W2A_M16_FC2_GRID_N_SM_FACTOR,
     _cake_situ_flat_args,
     _cake_situ_stage_bindings,
     _cake_situ_workspace_views,
@@ -36,13 +39,73 @@ from flashinfer.fused_moe.cake_kimi_k3_situ import (
     _prepared,
     _workspace_layout,
 )
-from flashinfer.jit.cake_kimi_k3_situ import PROGRAMS, ROUTES, get_cake_situ_module
+from flashinfer.jit.cake_kimi_k3_situ import (
+    PROGRAMS,
+    ROUTES,
+    _source_path,
+    get_cake_situ_module,
+)
 from flashinfer.tllm_enums import ActivationType, RoutingMethodType
 from flashinfer.utils import device_support_pdl
 
 
 HIDDEN, INTERMEDIATE, EXPERTS, TOP_K = 3584, 384, 896, 16
 NVFP4_QUANT = QuantConfig(weight=QuantFormat.NVFP4, activation=QuantFormat.NVFP4)
+ARCH_BY_CAPABILITY = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
+
+
+def _small_row_selector(arch, num_tokens):
+    # Route selectors of the small token counts: the two-CTA-per-SM FC2 route
+    # for 16 tokens on SM103, the single-token route for 1 token and the fused
+    # quantization + router route for 8 tokens (and 16 tokens on SM100).
+    if num_tokens == 16 and arch == "sm_103a":
+        return "n8_w2a_m16"
+    if num_tokens == 1:
+        return "m1"
+    if num_tokens in (8, 16):
+        return "n8_feature"
+    return None
+
+
+def _declares_fused_quant_route(program_key):
+    return any(
+        name == "quant_route.s2b_num_tokens"
+        for _, name in PROGRAMS[program_key]["arg_plan"]
+    )
+
+
+def _stage_kernel_source(program_key, stage):
+    # A prepared launch sequence binds one generated kernel per stage inside a
+    # `namespace stage_<name> { ... }` block of its binding translation unit.
+    record = PROGRAMS[program_key]
+    binding = _source_path(record["sources"][-1]).read_text()
+    block = re.search(
+        rf"namespace stage_{stage} \{{(.*?)\}}  // namespace stage_{stage}",
+        binding,
+        re.S,
+    )
+    assert block is not None, (program_key, stage)
+    names = set(
+        re.findall(
+            r"kernel_(cake_kimi_k3_nvfp4_situ_routed_moe_[0-9a-f]{20})", block[1]
+        )
+    )
+    assert len(names) == 1, (program_key, stage, names)
+    (kernel,) = (
+        source
+        for source in record["sources"]
+        if source.endswith(f"/{names.pop()}_kernel.cu")
+    )
+    return _source_path(kernel).read_text()
+
+
+def _fc2_launch_footprint(arch, selector):
+    source = _stage_kernel_source(ROUTES[(arch, selector)], "fc2")
+    threads, min_blocks = map(
+        int, re.search(r"__launch_bounds__\((\d+),\s*(\d+)\)", source).groups()
+    )
+    smem_bytes = int(re.search(r"#define SMEM_TOTAL (\d+)", source).group(1))
+    return threads, min_blocks, smem_bytes
 
 
 def _workspace_size(**overrides):
@@ -104,6 +167,39 @@ def test_cake_situ_workspace_layout_adds_pre_shuffled_scale_factors():
     assert nbytes >= offset + size
     assert "sfb_shuffled" not in _workspace_layout(8192)[0]
     assert "sfb_shuffled" not in _workspace_layout(2048)[0]
+
+
+# SM100 and SM103 shared memory per SM and the per-CTA reservation (CUDA C
+# Programming Guide, compute capability 10.x), and the register file per SM.
+SMEM_PER_SM_BYTES = 228 * 1024
+SMEM_RESERVED_PER_CTA_BYTES = 1024
+REGISTERS_PER_SM = 65536
+
+
+def test_cake_situ_two_cta_fc2_program_fits_two_ctas_per_sm():
+    # The 16-token SM103 route sizes its FC2 device-workfeed pool as
+    # _N8_W2A_M16_FC2_GRID_N_SM_FACTOR CTAs per SM. That is only correct if the
+    # generated FC2 program really fits that many CTAs per SM, so pin the
+    # program's launch bounds and shared-memory footprint to the host factor.
+    threads, min_blocks, smem_bytes = _fc2_launch_footprint("sm_103a", "n8_w2a_m16")
+    assert (threads, min_blocks) == (512, _N8_W2A_M16_FC2_GRID_N_SM_FACTOR)
+    assert min_blocks * (smem_bytes + SMEM_RESERVED_PER_CTA_BYTES) <= SMEM_PER_SM_BYTES
+    # __launch_bounds__(512, 2) caps ptxas at this many registers per thread.
+    assert REGISTERS_PER_SM // (threads * min_blocks) >= 64
+    # The single-CTA FC2 program of the other small routes does not fit twice.
+    for arch, selector in (("sm_103a", "n8_feature"), ("sm_100a", "n8_feature")):
+        threads, min_blocks, smem_bytes = _fc2_launch_footprint(arch, selector)
+        assert (threads, min_blocks) == (512, 1)
+        assert 2 * (smem_bytes + SMEM_RESERVED_PER_CTA_BYTES) > SMEM_PER_SM_BYTES
+
+
+@pytest.mark.parametrize("arch", ["sm_100a", "sm_103a"])
+@pytest.mark.parametrize("num_tokens", [1, 8, 16], ids=["m1", "m8", "m16"])
+def test_cake_situ_small_row_routes_declare_fused_quant_route(arch, num_tokens):
+    # The fused quantization + router stage is part of the 8- and 16-token
+    # programs on both architectures and of no other small-row program.
+    program_key = ROUTES[(arch, _small_row_selector(arch, num_tokens))]
+    assert _declares_fused_quant_route(program_key) is (num_tokens in (8, 16))
 
 
 @pytest.fixture(scope="module")
@@ -331,11 +427,29 @@ def test_cake_situ_output_workspace_and_external_graph(
         )
         is workspace
     )
-    # The 16-token SM103 route runs the two-CTA-per-SM FC2 program; every other row keeps its route.
+    # The prepared shape must select the expected route: the two-CTA-per-SM
+    # FC2 route for 16 tokens on SM103, the single-token and fused-router
+    # routes for the other small counts, and the fused quantization + router
+    # stage exactly for 8 and 16 tokens on both architectures.
+    arch = ARCH_BY_CAPABILITY[torch.cuda.get_device_capability(device)]
     prepared_shape = workspace._flashinfer_cake_situ_workspace["shapes"][num_tokens]
-    assert prepared_shape["n8_w2a_m16"] is (
-        num_tokens == 16 and torch.cuda.get_device_capability(device) == (10, 3)
+    selector = _small_row_selector(arch, num_tokens)
+    assert prepared_shape["n8_w2a_m16"] is (selector == "n8_w2a_m16")
+    if selector is not None:
+        assert prepared_shape["program_key"] == ROUTES[(arch, selector)]
+    assert _declares_fused_quant_route(prepared_shape["program_key"]) is (
+        num_tokens in (8, 16)
     )
+    if prepared_shape["n8_w2a_m16"]:
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        assert prepared_shape["fc2_grid_n"] == min(
+            prepared_shape["max_tiles"],
+            _N8_W2A_M16_FC2_GRID_N_SM_FACTOR * sm_count // (HIDDEN // 128),
+        )
+        assert (
+            prepared_shape["fc2_pool_ctas"]
+            == (HIDDEN // 128) * prepared_shape["fc2_grid_n"]
+        )
 
     expected = _trtllm_reference(x, ids, route_weights, prepared)
     # Ensure an all-zero output could not satisfy the FP4 absolute tolerance.
