@@ -1572,12 +1572,16 @@ def test_public_entry_derives_row_lengths_and_matches_full_rows():
     inp = make_inputs([200, 96, 300], [200, 96, 4096], seed=SEED + 752, topk=256)
     S = inp.kv_latent.shape[0]
     derived = derive_topk_length(inp.idx_global, S)
-    assert torch.equal(derived, inp.topk_length)  # the generator's rows are valid-first: last valid + 1 == count
+    assert torch.equal(
+        derived, inp.topk_length
+    )  # the generator's rows are valid-first: last valid + 1 == count
     assert int(derived.max()) <= 256 and int((derived < 256).sum()) > 0
     args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
     leaves_a = [t.detach().clone().requires_grad_() for t in args]
     leaves_b = [t.detach().clone().requires_grad_() for t in args]
-    full = torch.full((inp.q_latent.shape[0],), 256, dtype=torch.int32, device=inp.q_latent.device)
+    full = torch.full(
+        (inp.q_latent.shape[0],), 256, dtype=torch.int32, device=inp.q_latent.device
+    )
     with _quiet_experimental():
         out_a, lse_a = dsa_sparse_attention(*leaves_a, inp.idx_global, return_lse=True)
         out_b, lse_b = dsa_sparse_attention(
@@ -1588,10 +1592,13 @@ def test_public_entry_derives_row_lengths_and_matches_full_rows():
     torch.cuda.synchronize()
     assert torch.equal(out_a.detach(), out_b.detach()) and torch.equal(lse_a, lse_b)
     assert torch.equal(grads_a[0], grads_b[0]) and torch.equal(grads_a[1], grads_b[1])
-    assert max(rel_l2(grads_a[2], grads_b[2]), rel_l2(grads_a[3], grads_b[3])) < 1e-4
+    # dkv: fp32 atomics summed in a different key-block order round to bf16 differently on a few elements
+    # (the cross-path spread used throughout this file); both paths must also meet the reference gates
+    assert max(rel_l2(grads_a[2], grads_b[2]), rel_l2(grads_a[3], grads_b[3])) < 1e-3
     ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
     _check_forward(inp, out_a, lse_a, ref)
     _check_backward(grads_a, ref)
+    _check_backward(grads_b, ref)
 
 
 def test_varlen_multi_segment_row_plans_single_pass():
@@ -2198,7 +2205,8 @@ def test_offset_gather_kv_indices_causal_tail_of_prefix():
         local, cu_q, cu_k, causal=True, return_topk_length=True
     )
     assert torch.equal(strict2, strict)
-    assert lengths.dtype == torch.int32 and lengths.tolist() == [3, 3, 4, 3, 3, 1, 4, 0, 5]
+    expected_lengths = [3, 3, 4, 3, 3, 1, 4, 0, 5]  # last valid slot + 1 per strict row
+    assert lengths.dtype == torch.int32 and lengths.tolist() == expected_lengths
     assert torch.equal(lengths, derive_topk_length(strict, 18))
     loose2, loose_len = offset_gather_kv_indices(
         local, cu_q, cu_k, causal=False, return_topk_length=True
@@ -2213,7 +2221,11 @@ def test_offset_gather_kv_indices_causal_tail_of_prefix():
     strict3, len3 = offset_gather_kv_indices(
         local2, cu_q2, cu_k2, causal=True, return_topk_length=True
     )
-    assert strict3.tolist() == [[-1, -1], [0, -1], [1, 0]] and len3.tolist() == [0, 1, 2]
+    assert strict3.tolist() == [[-1, -1], [0, -1], [1, 0]] and len3.tolist() == [
+        0,
+        1,
+        2,
+    ]
     assert offset_gather_kv_indices(local2, cu_q2, cu_k2, causal=False).tolist() == [
         [0, 1],
         [0, 1],

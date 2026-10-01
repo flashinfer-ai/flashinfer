@@ -857,7 +857,10 @@ def offset_gather_kv_indices(
     if out is None:
         result = torch.where(valid, local + key_base[:, None], -1)
     else:
-        result = torch.where(valid, local + key_base[:, None], -1, out=out)
+        # the out= overload takes tensors only
+        result = torch.where(
+            valid, local + key_base[:, None], local.new_full((), -1), out=out
+        )
     if not return_topk_length:
         return result
     topk_length = torch.where(valid, _slot_positions(topk, device), 0).amax(dim=-1)
