@@ -590,7 +590,11 @@ def test_per_request_tensors_and_routes():
         (8, 32768, 1000, False): (4, 16, False),
         (16, 32768, 1000, False): (4, 16, False),
         (32, 32768, 1000, False): (4, 16, False),
-        (64, 32768, 1000, False): (2, 16, True),  # round-7 refit (lever h), was (2, 32, False)
+        (64, 32768, 1000, False): (
+            2,
+            16,
+            True,
+        ),  # round-7 refit (lever h), was (2, 32, False)
         (128, 32768, 1000, False): (1, 16, True),
         (1, 128256, 1000, False): (8, 32, False),
         (4, 128256, 1000, False): (8, 32, False),
@@ -606,7 +610,11 @@ def test_per_request_tensors_and_routes():
         (1, 151936, 1000, False): (8, 16, True),
         (8, 151936, 1000, False): (8, 16, True),
         (16, 151936, 1000, False): (4, 16, True),
-        (64, 151936, 1000, False): (2, 16, True),  # round-7 refit (lever h), was (2, 32, True)  # +2.8 % vs best (2, 16, 1) (33.25 vs 32.35 us)
+        (64, 151936, 1000, False): (
+            2,
+            16,
+            True,
+        ),  # round-7 refit (lever h), was (2, 32, True)  # +2.8 % vs best (2, 16, 1) (33.25 vs 32.35 us)
         (128, 151936, 1000, False): (1, 32, True),
         (1, 262144, 1000, False): (8, 16, True),
         (4, 262144, 1000, False): (8, 16, True),
@@ -630,7 +638,11 @@ def test_per_request_tensors_and_routes():
         (8, 32768, 1000, True): (4, 16, False),
         (16, 32768, 1000, True): (4, 16, False),
         (32, 32768, 1000, True): (4, 16, False),
-        (64, 32768, 1000, True): (2, 16, True),  # round-7 refit (lever h), was (2, 32, False)
+        (64, 32768, 1000, True): (
+            2,
+            16,
+            True,
+        ),  # round-7 refit (lever h), was (2, 32, False)
         (128, 32768, 1000, True): (1, 16, True),
         (1, 128256, 1000, True): (8, 32, False),
         (4, 128256, 1000, True): (8, 32, False),
@@ -646,7 +658,11 @@ def test_per_request_tensors_and_routes():
         (1, 151936, 1000, True): (8, 16, True),
         (8, 151936, 1000, True): (8, 16, True),
         (16, 151936, 1000, True): (4, 16, True),
-        (64, 151936, 1000, True): (2, 16, True),  # round-7 refit (lever h), was (2, 32, True)
+        (64, 151936, 1000, True): (
+            2,
+            16,
+            True,
+        ),  # round-7 refit (lever h), was (2, 32, True)
         (128, 151936, 1000, True): (1, 32, True),
         (1, 262144, 1000, True): (8, 16, True),
         (4, 262144, 1000, True): (8, 16, True),
@@ -1472,8 +1488,7 @@ def test_coarse_sample_build_matches_default_build():
     defaults = {
         (v["cluster"], v["ept"], bool(v["stream"])): v
         for v in man["stage1"]
-        if not v["fused_block_tail"] and not v["coarse_sample"]
-        and not v["spec_sample"]
+        if not v["fused_block_tail"] and not v["coarse_sample"] and not v["spec_sample"]
     }
     streams = [(c, e) for (c, e, st) in defaults if st]
     assert [(v["cluster"], v["ept"]) for v in coarse] == streams
@@ -1660,14 +1675,31 @@ def test_spec_sample_build_matches_default_build():
     assert cs._spec_sample_flag(4, 16, True, 32768) == cs._FLAG_SPEC_SAMPLE
     assert cs._spec_sample_flag(2, 16, True, 32768) == cs._FLAG_SPEC_SAMPLE
     assert cs._spec_sample_flag(1, 16, True, 131072) == cs._FLAG_SPEC_SAMPLE
-    assert cs._spec_sample_flag(8, 32, True, 128256) == cs._FLAG_SPEC_SAMPLE  # one chunk
-    assert cs._spec_sample_flag(1, 32, True, 262144) == cs._FLAG_SPEC_SAMPLE  # 16 chunks
-    assert cs._spec_sample_flag(8, 32, True, 262144) == cs._FLAG_SPEC_SAMPLE  # two chunks on cluster 8
+    assert (
+        cs._spec_sample_flag(8, 32, True, 128256) == cs._FLAG_SPEC_SAMPLE
+    )  # one chunk
+    assert (
+        cs._spec_sample_flag(1, 32, True, 262144) == cs._FLAG_SPEC_SAMPLE
+    )  # 16 chunks
+    assert (
+        cs._spec_sample_flag(8, 32, True, 262144) == cs._FLAG_SPEC_SAMPLE
+    )  # two chunks on cluster 8
     # B200: a two-chunk row whose second chunk is at least half full keeps the coarse build; GB300 keeps the twin
-    assert cs._spec_sample_flag(8, 32, True, 262144, 10, 1, (10, 0)) == 0  # second chunk full
-    assert cs._spec_sample_flag(8, 32, True, 151936, 10, 1, (10, 0)) == cs._FLAG_SPEC_SAMPLE  # second chunk 16 % full
-    assert cs._spec_sample_flag(8, 32, True, 262144, 10, 1, (10, 3)) == cs._FLAG_SPEC_SAMPLE
-    assert cs._sample_build_flag(8, 32, True, 10, 262144, 1, (10, 0)) == cs._FLAG_COARSE_SAMPLE
+    assert (
+        cs._spec_sample_flag(8, 32, True, 262144, 10, 1, (10, 0)) == 0
+    )  # second chunk full
+    assert (
+        cs._spec_sample_flag(8, 32, True, 151936, 10, 1, (10, 0))
+        == cs._FLAG_SPEC_SAMPLE
+    )  # second chunk 16 % full
+    assert (
+        cs._spec_sample_flag(8, 32, True, 262144, 10, 1, (10, 3))
+        == cs._FLAG_SPEC_SAMPLE
+    )
+    assert (
+        cs._sample_build_flag(8, 32, True, 10, 262144, 1, (10, 0))
+        == cs._FLAG_COARSE_SAMPLE
+    )
     assert cs._spec_sample_flag(4, 32, True, 262144) == 0  # 4 chunks
     assert cs._spec_sample_flag(1, 32, True, 151936) == 0  # 10 chunks
     assert cs._spec_sample_flag(1, 32, True, 32768) == 0  # 2 chunks
@@ -1676,40 +1708,94 @@ def test_spec_sample_build_matches_default_build():
     # Hopper / Rubin: cluster <= 4 with >= 64 CTAs; k <= 64 only for rows of >= 5 chunks per CTA (512 x ept x cluster
     # entries each); the chain needs >= 128 CTAs for rows of >= 16 chunks
     for cap in ((9, 0), (10, 7)):
-        assert cs._spec_sample_flag(4, 16, True, 128256, 1000, 16, cap) == cs._FLAG_SPEC_SAMPLE  # 64 CTAs, 4 chunks
-        assert cs._spec_sample_flag(2, 16, True, 151936, 1000, 32, cap) == cs._FLAG_SPEC_SAMPLE  # 64 CTAs, 10 chunks
-        assert cs._spec_sample_flag(1, 16, True, 32768, 1000, 64, cap) == cs._FLAG_SPEC_SAMPLE  # 64 CTAs, 4 chunks
-        assert cs._spec_sample_flag(2, 16, True, 262144, 1000, 64, cap) == cs._FLAG_SPEC_SAMPLE  # 128 CTAs, 16 chunks
-        assert cs._spec_sample_flag(1, 32, True, 262144, 1000, 128, cap) == cs._FLAG_SPEC_SAMPLE  # 16 chunks, 128 CTAs
-        assert cs._spec_sample_flag(2, 16, True, 151936, 10, 32, cap) == cs._FLAG_SPEC_SAMPLE  # k <= 64: 10 chunks
-        assert cs._spec_sample_flag(4, 16, True, 151936, kcap, 16, cap) == cs._FLAG_SPEC_SAMPLE  # k <= 64: 5 chunks
-        assert cs._spec_sample_flag(1, 32, True, 262144, 10, 128, cap) == cs._FLAG_SPEC_SAMPLE  # k <= 64: 16 chunks
+        assert (
+            cs._spec_sample_flag(4, 16, True, 128256, 1000, 16, cap)
+            == cs._FLAG_SPEC_SAMPLE
+        )  # 64 CTAs, 4 chunks
+        assert (
+            cs._spec_sample_flag(2, 16, True, 151936, 1000, 32, cap)
+            == cs._FLAG_SPEC_SAMPLE
+        )  # 64 CTAs, 10 chunks
+        assert (
+            cs._spec_sample_flag(1, 16, True, 32768, 1000, 64, cap)
+            == cs._FLAG_SPEC_SAMPLE
+        )  # 64 CTAs, 4 chunks
+        assert (
+            cs._spec_sample_flag(2, 16, True, 262144, 1000, 64, cap)
+            == cs._FLAG_SPEC_SAMPLE
+        )  # 128 CTAs, 16 chunks
+        assert (
+            cs._spec_sample_flag(1, 32, True, 262144, 1000, 128, cap)
+            == cs._FLAG_SPEC_SAMPLE
+        )  # 16 chunks, 128 CTAs
+        assert (
+            cs._spec_sample_flag(2, 16, True, 151936, 10, 32, cap)
+            == cs._FLAG_SPEC_SAMPLE
+        )  # k <= 64: 10 chunks
+        assert (
+            cs._spec_sample_flag(4, 16, True, 151936, kcap, 16, cap)
+            == cs._FLAG_SPEC_SAMPLE
+        )  # k <= 64: 5 chunks
+        assert (
+            cs._spec_sample_flag(1, 32, True, 262144, 10, 128, cap)
+            == cs._FLAG_SPEC_SAMPLE
+        )  # k <= 64: 16 chunks
         assert cs._spec_sample_flag(8, 16, True, 262144, 1000, 8, cap) == 0  # cluster 8
         assert cs._spec_sample_flag(8, 16, True, 151936, 10, 1, cap) == 0
-        assert cs._spec_sample_flag(1, 16, True, 32768, 10, 64, cap) == 0  # k <= 64: 4 chunks keep the coarse build
-        assert cs._spec_sample_flag(4, 16, True, 128256, kcap, 16, cap) == 0  # k <= 64: 4 chunks
+        assert (
+            cs._spec_sample_flag(1, 16, True, 32768, 10, 64, cap) == 0
+        )  # k <= 64: 4 chunks keep the coarse build
+        assert (
+            cs._spec_sample_flag(4, 16, True, 128256, kcap, 16, cap) == 0
+        )  # k <= 64: 4 chunks
         assert cs._spec_sample_flag(1, 16, True, 32768, 1000, 32, cap) == 0  # 32 CTAs
-        assert cs._spec_sample_flag(2, 16, True, 262144, 1000, 32, cap) == 0  # 64 CTAs of 16 chunks
+        assert (
+            cs._spec_sample_flag(2, 16, True, 262144, 1000, 32, cap) == 0
+        )  # 64 CTAs of 16 chunks
         assert cs._spec_sample_flag(8, 32, True, 262144, 10, 1, cap) == 0
         with pytest.raises(ValueError):
             cs._spec_sample_flag(4, 16, True, 128256, 1000, None, cap)
-    for cap in ((10, 0), (10, 3)):  # B200 / GB300: every ept-16 stream, whatever the batch / top-k ...
-        assert cs._spec_sample_flag(8, 16, True, 262144, 10, 1, cap) == cs._FLAG_SPEC_SAMPLE
-        assert cs._spec_sample_flag(1, 16, True, 32768, 10, 1, cap) == cs._FLAG_SPEC_SAMPLE
-        assert cs._spec_sample_flag(4, 16, True, 262144, 1000, 1, cap) == cs._FLAG_SPEC_SAMPLE
+    for cap in (
+        (10, 0),
+        (10, 3),
+    ):  # B200 / GB300: every ept-16 stream, whatever the batch / top-k ...
+        assert (
+            cs._spec_sample_flag(8, 16, True, 262144, 10, 1, cap)
+            == cs._FLAG_SPEC_SAMPLE
+        )
+        assert (
+            cs._spec_sample_flag(1, 16, True, 32768, 10, 1, cap) == cs._FLAG_SPEC_SAMPLE
+        )
+        assert (
+            cs._spec_sample_flag(4, 16, True, 262144, 1000, 1, cap)
+            == cs._FLAG_SPEC_SAMPLE
+        )
         # ... except a cluster-8 chain (top-k above the fused tail), on every capability
         assert cs._spec_sample_flag(8, 16, True, 262144, 1000, 1, cap) == 0
         assert cs._spec_sample_flag(8, 32, True, 128256, 1000, 1, cap) == 0
-    assert cs._spec_sample_flag(8, 16, True, 262144, 1000) == 0  # capability unknown: the chain rule still holds
-    assert cs._sample_build_flag(8, 16, True, 10, 151936, 1, (9, 0)) == cs._FLAG_COARSE_SAMPLE
-    assert cs._sample_build_flag(1, 16, True, 10, 32768, 64, (9, 0)) == cs._FLAG_COARSE_SAMPLE
-    assert cs._sample_build_flag(2, 16, True, 10, 151936, 32, (10, 7)) == cs._FLAG_SPEC_SAMPLE
+    assert (
+        cs._spec_sample_flag(8, 16, True, 262144, 1000) == 0
+    )  # capability unknown: the chain rule still holds
+    assert (
+        cs._sample_build_flag(8, 16, True, 10, 151936, 1, (9, 0))
+        == cs._FLAG_COARSE_SAMPLE
+    )
+    assert (
+        cs._sample_build_flag(1, 16, True, 10, 32768, 64, (9, 0))
+        == cs._FLAG_COARSE_SAMPLE
+    )
+    assert (
+        cs._sample_build_flag(2, 16, True, 10, 151936, 32, (10, 7))
+        == cs._FLAG_SPEC_SAMPLE
+    )
     assert cs._sample_build_flag(8, 16, True, 1000, 151936, 1, (10, 7)) == 0
     assert cs._sample_build_flag(1, 32, True, kcap, 262144) == cs._FLAG_SPEC_SAMPLE
     assert cs._sample_build_flag(1, 32, True, kcap, 151936) == cs._FLAG_COARSE_SAMPLE
     assert cs._sample_build_flag(1, 32, True, kcap + 1, 151936) == 0
     assert cs._sample_build_flag(2, 32, True, kcap, 262144) == cs._FLAG_COARSE_SAMPLE
-    assert cs._sample_build_flag(8, 32, True, 1000, 128256) == 0  # cluster-8 chain: default build
+    assert (
+        cs._sample_build_flag(8, 32, True, 1000, 128256) == 0
+    )  # cluster-8 chain: default build
     assert cs._sample_build_flag(8, 32, True, 1000, 262144) == 0
     assert cs._sample_build_flag(8, 32, True, kcap, 262144) == cs._FLAG_SPEC_SAMPLE
     assert cs._sample_build_flag(4, 16, False, 10, 32768) == 0
@@ -1798,7 +1884,12 @@ def test_spec_sample_build_matches_default_build():
     for flags, c, e, st in (
         (cs._FLAG_SPEC_SAMPLE, 4, 16, 0),
         (cs._FLAG_SPEC_SAMPLE | 8, streams[0][0], streams[0][1], 1),
-        (cs._FLAG_SPEC_SAMPLE | cs._FLAG_COARSE_SAMPLE, streams[0][0], streams[0][1], 1),
+        (
+            cs._FLAG_SPEC_SAMPLE | cs._FLAG_COARSE_SAMPLE,
+            streams[0][0],
+            streams[0][1],
+            1,
+        ),
     ):
         with pytest.raises(Exception, match="launch_flags bit"):
             module.radix_topk(
@@ -1825,14 +1916,28 @@ def test_spec_sample_build_matches_default_build():
             )
     # the pipeline route: the speculative build exactly where the policy says, else the coarse one at k <= 64
     cap = cs._device_capability(0)
-    for vocab, batch, k in ((262144, 64, 50), (262144, 64, 1000), (32768, 4, 50), (262144, 1, 1000)):
+    for vocab, batch, k in (
+        (262144, 64, 50),
+        (262144, 64, 1000),
+        (32768, 4, 50),
+        (262144, 1, 1000),
+    ):
         c, e, st = cs.choose_stage1(batch, vocab, top_k_max=k)
         chunks = -(-vocab // (512 * e * c))
-        want_spec = bool(st) and (e < 32 or chunks == 1 or (chunks == 2 and c >= 8) or chunks >= 16)
-        want_spec = want_spec and not (k > kcap and c > 4)  # a cluster-8 chain keeps the default build everywhere
-        if cap not in cs._SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES:  # Hopper / Rubin: wide cluster <= 4 grids only
-            want_spec = want_spec and c <= 4 and batch * c >= 64 and (
-                chunks >= 5 if k <= kcap else (chunks < 16 or batch * c >= 128)
+        want_spec = bool(st) and (
+            e < 32 or chunks == 1 or (chunks == 2 and c >= 8) or chunks >= 16
+        )
+        want_spec = want_spec and not (
+            k > kcap and c > 4
+        )  # a cluster-8 chain keeps the default build everywhere
+        if (
+            cap not in cs._SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES
+        ):  # Hopper / Rubin: wide cluster <= 4 grids only
+            want_spec = (
+                want_spec
+                and c <= 4
+                and batch * c >= 64
+                and (chunks >= 5 if k <= kcap else (chunks < 16 or batch * c >= 128))
             )
         want = (
             cs._FLAG_SPEC_SAMPLE
@@ -2016,7 +2121,11 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     streams_ok = _device_streams()
     # the fused-vs-chain identity check needs a `_bt` build to launch; round 5 ships none (see the policy asserts below)
     fused_cells = 0
-    for vocab, batch in ((151936, 2), (262144, 4), (262144, 8), (32768, 5), (128256, 3)) if twins else ():
+    for vocab, batch in (
+        ((151936, 2), (262144, 4), (262144, 8), (32768, 5), (128256, 3))
+        if twins
+        else ()
+    ):
         if vocab > 196608 and not streams_ok:
             continue
         probs = _probs(batch, vocab, seed=748 + vocab % 97)
@@ -2031,13 +2140,22 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
         k_row[-1] = 32
         p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
         c, e, st = cs.choose_stage1(batch, vocab, top_k_max=kcap, two_launch=False)
-        if not cs._fuse_block_tail(batch, c, e, bool(st), sm, kcap, False, vocab, cs._device_capability(0)):
+        if not cs._fuse_block_tail(
+            batch, c, e, bool(st), sm, kcap, False, vocab, cs._device_capability(0)
+        ):
             # round 7: only a cluster-8 stream above k = 768 on a one-wave grid takes the twin (GB300: V <= 196608)
             bound = cs._BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY.get(cs._device_capability(0))
-            assert not (st and c >= 8 and batch * c <= sm and (bound is None or vocab <= bound)), (vocab, batch, c, e, st)
+            assert not (
+                st and c >= 8 and batch * c <= sm and (bound is None or vocab <= bound)
+            ), (vocab, batch, c, e, st)
             continue
         fused_cells += 1
-        for k, p in ((kcap, 0.9), (1000, 0.5), (cs._BLOCK_TAIL_MIN_K + 1, 1e-6), (k_row, p_row)):
+        for k, p in (
+            (kcap, 0.9),
+            (1000, 0.5),
+            (cs._BLOCK_TAIL_MIN_K + 1, 1e-6),
+            (k_row, p_row),
+        ):
             with monkeypatch.context() as m:
                 m.setattr(cs, "_fuse_block_tail", lambda *a, **kw: False)
                 two, _ = _run_and_check(probs, k, p, 0x748, 3)
@@ -2063,7 +2181,9 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
                 )
             del kk
     if twins and fused_device and streams_ok:
-        assert fused_cells >= 1, "no cell of this device's dispatch took the whole-CTA tail"
+        assert fused_cells >= 1, (
+            "no cell of this device's dispatch took the whole-CTA tail"
+        )
     # the rule (round 7, lever (b), CUDA-graph replay): a cluster-8 stream with top_k_max > 768 on a one-wave grid;
     # residents, smaller clusters, k <= 768, multi-wave grids, the tail-less (8, 48), a top-k above the slab and a
     # two-launch device never fuse

@@ -423,8 +423,12 @@ def _fuse_block_tail(
         return False
     if capability is not None:
         if vocab is None:
-            raise ValueError("the whole-CTA tail policy of this capability needs the vocabulary")
-        bound = _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY.get(tuple(int(x) for x in capability))
+            raise ValueError(
+                "the whole-CTA tail policy of this capability needs the vocabulary"
+            )
+        bound = _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY.get(
+            (int(capability[0]), int(capability[1]))
+        )
         if bound is not None and int(vocab) > bound:
             return False
     wave_ctas = _wave_ctas(int(sm_count))
@@ -463,7 +467,9 @@ _SPEC_SAMPLE_WIDE_MIN_CHUNKS = 16
 # (round 7, V = 262144 on the cluster-8 stream: `_sp` kernel +2.1 % in two interleaved profiler passes, +0.2..+0.8 %
 # in the interleaved CUPTI harness, +0.8 / +2.4 % in two idle-node matrices at k = 10 / 50), while the 16 %-full
 # second chunk of V = 151936 stays neutral-to-faster there and GB300 keeps the win on both.
-_SPEC_SAMPLE_WIDE_TWO_CHUNK_MAX_FILL_BY_CAPABILITY: dict[tuple[int, int], float] = {(10, 0): 0.5}
+_SPEC_SAMPLE_WIDE_TWO_CHUNK_MAX_FILL_BY_CAPABILITY: dict[tuple[int, int], float] = {
+    (10, 0): 0.5
+}
 # Capabilities whose every eligible stream launch takes the speculative-sample build (B200 / GB300: the paired stage-1
 # A/B and the round-7 FlashInfer matrices).  Elsewhere (Hopper, Rubin: round-7 matrices only) the build is taken on
 # clusters up to _SPEC_SAMPLE_NARROW_MAX_CLUSTER with at least _SPEC_SAMPLE_NARROW_MIN_CTAS CTAs: on a small-top-k launch
@@ -474,7 +480,9 @@ _SPEC_SAMPLE_WIDE_TWO_CHUNK_MAX_FILL_BY_CAPABILITY: dict[tuple[int, int], float]
 # rows at k <= 64 1-2 % against the coarse build, the 32-CTA grid and the 16-chunk rows on 64 CTAs 1-3 %.  On every
 # capability a cluster-8 stream above fused_tail_kcap (the 1/2-rate sample, two-launch chain) keeps the default build:
 # GB300 V = 262144 B = 1-8 measured +11..+17 % eager / +3..+7 % graph with it (round-7 matrix r7m7_gb300).
-_SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
+_SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES: frozenset[tuple[int, int]] = frozenset(
+    {(10, 0), (10, 3)}
+)
 _SPEC_SAMPLE_CHAIN_MAX_CLUSTER = 4
 _SPEC_SAMPLE_NARROW_MAX_CLUSTER = 4
 _SPEC_SAMPLE_NARROW_MIN_CTAS = 64
@@ -555,11 +563,21 @@ def _spec_sample_flag(
     if not stream:
         return 0
     chunks = math.ceil(int(vocab) / (_THREADS * int(ept) * int(cluster)))
-    if top_k_max is not None and int(top_k_max) > _fused_tail_kcap() and int(cluster) > _SPEC_SAMPLE_CHAIN_MAX_CLUSTER:
+    if (
+        top_k_max is not None
+        and int(top_k_max) > _fused_tail_kcap()
+        and int(cluster) > _SPEC_SAMPLE_CHAIN_MAX_CLUSTER
+    ):
         return 0
-    if capability is not None and tuple(int(x) for x in capability) not in _SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES:
+    if (
+        capability is not None
+        and tuple(int(x) for x in capability)
+        not in _SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES
+    ):
         if batch is None:
-            raise ValueError("the speculative-sample policy of this capability needs the batch")
+            raise ValueError(
+                "the speculative-sample policy of this capability needs the batch"
+            )
         if int(cluster) > _SPEC_SAMPLE_NARROW_MAX_CLUSTER:
             return 0
         ctas = int(batch) * int(cluster)
@@ -568,7 +586,10 @@ def _spec_sample_flag(
         if top_k_max is None or int(top_k_max) <= _fused_tail_kcap():
             if chunks < _SPEC_SAMPLE_NARROW_FUSED_MIN_CHUNKS:
                 return 0
-        elif chunks >= _SPEC_SAMPLE_NARROW_DEEP_CHUNKS and ctas < _SPEC_SAMPLE_NARROW_DEEP_MIN_CTAS:
+        elif (
+            chunks >= _SPEC_SAMPLE_NARROW_DEEP_CHUNKS
+            and ctas < _SPEC_SAMPLE_NARROW_DEEP_MIN_CTAS
+        ):
             return 0
     if int(ept) < _SPEC_SAMPLE_WIDE_EPT:
         return _FLAG_SPEC_SAMPLE if _stage1_has_spec_sample(cluster, ept, True) else 0
@@ -578,9 +599,14 @@ def _spec_sample_flag(
         max_fill = (
             None
             if capability is None
-            else _SPEC_SAMPLE_WIDE_TWO_CHUNK_MAX_FILL_BY_CAPABILITY.get(tuple(int(x) for x in capability))
+            else _SPEC_SAMPLE_WIDE_TWO_CHUNK_MAX_FILL_BY_CAPABILITY.get(
+                (int(capability[0]), int(capability[1]))
+            )
         )
-        if max_fill is not None and int(vocab) / (_THREADS * int(ept) * int(cluster)) - 1.0 >= max_fill:
+        if (
+            max_fill is not None
+            and int(vocab) / (_THREADS * int(ept) * int(cluster)) - 1.0 >= max_fill
+        ):
             return 0
     elif chunks != 1 and chunks < _SPEC_SAMPLE_WIDE_MIN_CHUNKS:
         return 0
@@ -843,7 +869,9 @@ def _choose_stage1_resolved(
                 )
                 + (
                     stream_wide_ragged_large_k
-                    if large_k > 0.0 and ce[1] > 16 and _ragged_last_chunk(vocab, ce[0], ce[1])
+                    if large_k > 0.0
+                    and ce[1] > 16
+                    and _ragged_last_chunk(vocab, ce[0], ce[1])
                     else 0.0
                 )
             )

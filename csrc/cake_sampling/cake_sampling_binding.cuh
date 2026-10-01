@@ -127,7 +127,8 @@ struct Stage1Variant {
   int32_t fused_tail;        // 1: built with the fused stage-2/3 tail (accepts launch_flags bit 0)
   int32_t fused_block_tail;  // 1: built with the whole-CTA tail (accepts launch_flags bit 3)
   int32_t coarse_sample;  // 1: the coarse-sample build (1/8 sampled first pass; launch_flags bit 4)
-  int32_t spec_sample;  // 1: the speculative-sample build (first chunk is the sample; launch_flags bit 6)
+  int32_t spec_sample;  // 1: the speculative-sample build (first chunk is the sample; launch_flags
+                        // bit 6)
 };
 
 struct Stage23Variant {
