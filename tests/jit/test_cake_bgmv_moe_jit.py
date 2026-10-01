@@ -136,13 +136,18 @@ def test_arch_modules_do_not_share_a_uri():
 
 def test_binding_preserves_graph_and_tensor_contracts():
     binding = (cake_bgmv_moe._get_csrc_dir() / "cake_bgmv_moe_binding.cuh").read_text()
+    assert "TensorView route_index" in binding
+    assert "kExpandT64SmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_T64" in binding
+    assert "kExpandDualSmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_DUAL" in binding
     assert "CheckCompiledArch" in binding
     assert "CheckExactSM100" not in binding
     assert (
         "major == CAKE_BGMV_MOE_CC_MAJOR && minor == CAKE_BGMV_MOE_CC_MINOR" in binding
     )
-    assert "kShrinkDecodeSmemBytes = 221696" in binding
-    assert "kShrinkPrefillSmemBytes = 36992" in binding
+    assert "kShrinkDecodeSmemBytes = CAKE_BGMV_MOE_SMEM_SHRINK_DECODE" in binding
+    assert "kShrinkPrefillSmemBytes = CAKE_BGMV_MOE_SMEM_SHRINK_PREFILL" in binding
+    assert "static_assert(kShrinkDecodeSmemBytes == 221696" in binding
+    assert "static_assert(kShrinkPrefillSmemBytes == 36992" in binding
     assert "cudaDevAttrMaxSharedMemoryPerBlockOptin" in binding
     assert "cudaFuncAttributeMaxDynamicSharedMemorySize" in binding
     assert "cudaMemsetAsync" not in binding
@@ -160,7 +165,10 @@ def test_binding_preserves_graph_and_tensor_contracts():
             ).read_text()
             smem_totals = re.findall(r"#define SMEM_TOTAL (\d+)", body)
             assert smem_totals[:2] == ["221696", "36992"]
-            assert "atomicAdd(" not in body
+            # The shrink kernels publish the token->pair route index; the expand
+            # kernels keep one owner per output (no output atomics).
+            assert body.count("atomicAdd(") == 2
+            assert "atomicAdd(&reinterpret_cast<float" not in body
             assert "expand_pair_owned" not in body
 
 
@@ -259,7 +267,10 @@ def test_generic_jit_spec_binds_generated_source_per_arch(
         "CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128 ",
     ):
         assert macro in body
-    assert "atomicAdd(" not in body
+    # Route-index publication in both shrink kernels; the expand keeps one
+    # owner per output (no output atomics).
+    assert body.count("atomicAdd(") == 2
+    assert "atomicAdd(&reinterpret_cast<float" not in body
     binding = spec.sources[0].read_text()
     assert f'#define CAKE_BGMV_MOE_BODY_FILE "{metadata.body}"' in binding
     assert f"#define CAKE_BGMV_MOE_RANK {rank}" in binding
@@ -309,5 +320,22 @@ def test_generic_binding_preserves_graph_and_tensor_contracts():
     assert "CAKE_BGMV_MOE_SHRINK_PREFILL<<<" in binding
     assert "CAKE_BGMV_MOE_EXPAND_T64<<<" in binding
     assert "CAKE_BGMV_MOE_EXPAND_T128<<<" in binding
+    assert "TensorView route_index" in binding
+    assert "CHECK_INPUT_TYPE(route_index, dl_int32)" in binding
+    assert "kRouteIndexWordsPerToken = 2 + kRouteIndexMaxRoutes" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run" in binding
+
+
+def test_route_index_workspace_sizing():
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES == 16
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN == 18
+    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(1) == 18
+    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(4096) == 4096 * 18
+    for hidden in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES:
+        body = (
+            cake_bgmv_moe._get_csrc_dir() / f"cake_bgmv_moe_bf16_h{hidden}.cu"
+        ).read_text()
+        assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_T64 " in body
+        assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_TOKEN " in body
+        assert "#define CAKE_BGMV_MOE_SMEM_EXPAND_DUAL " in body

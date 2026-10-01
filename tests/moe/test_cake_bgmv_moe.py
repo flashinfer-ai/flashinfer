@@ -64,6 +64,7 @@ def _make_inputs(
     num_slices=1,
     x_dtype=None,
     top_k=2,
+    expert_sorted=False,
 ):
     torch.manual_seed(42)
     device = "cuda"
@@ -120,6 +121,13 @@ def _make_inputs(
             .transpose(0, 1)
             .reshape(-1)
         )
+        sorted_token_ids = sorted_token_ids[order].contiguous()
+        expert_ids = expert_ids[order].contiguous()
+        topk_weights = topk_weights[order].contiguous()
+    if expert_sorted:
+        # MoE dispatch order: pairs grouped by expert, so each token's routes
+        # are spread over the whole pair list.
+        order = torch.argsort(expert_ids, stable=True)
         sorted_token_ids = sorted_token_ids[order].contiguous()
         expert_ids = expert_ids[order].contiguous()
         topk_weights = topk_weights[order].contiguous()
@@ -355,7 +363,50 @@ _GENERIC_CASES = [
     (1472, 8, 64, torch.float16, True, 2),
     (4096, 32, 8, torch.bfloat16, True, 4),
     (1856, 16, 96, torch.float16, True, 8),
+    # top-k above the 16-slot route index: exact serial-scan fallback
+    (2048, 8, 24, torch.bfloat16, True, 20),
 ]
+
+
+# (hidden, tokens, dtype, top_k): expert-sorted pair order (MoE dispatch layout)
+# through both variants' route index; the specialized rows are the S4 shapes.
+_EXPERT_SORTED_CASES = [
+    (3072, 4, torch.bfloat16, 2),
+    (3072, 1024, torch.bfloat16, 2),
+    (2688, 1024, torch.float16, 2),
+    (3072, 4096, torch.bfloat16, 2),
+    (2048, 512, torch.float16, 2),
+    (1344, 64, torch.bfloat16, 4),
+]
+
+
+@pytest.mark.parametrize(
+    ("hidden_size", "num_tokens", "dtype", "top_k"),
+    _EXPERT_SORTED_CASES,
+    ids=[
+        f"h{h}_t{t}_{str(d).split('.')[-1]}_k{k}" for h, t, d, k in _EXPERT_SORTED_CASES
+    ],
+)
+def test_expert_sorted_routes_match_reference_and_replay_bitwise(
+    hidden_size, num_tokens, dtype, top_k
+):
+    inputs = _make_inputs(
+        hidden_size, num_tokens, dtype, top_k=top_k, expert_sorted=True
+    )
+    expected = _reference(inputs)
+    plan = prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
+    assert isinstance(plan, BGMVMoECakePlan)
+    assert plan.variant == ("specialized" if hidden_size in (2688, 3072) else "generic")
+    first = plan.run().clone()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
+    for _ in range(3):
+        replay = plan.run().clone()
+        torch.cuda.synchronize()
+        assert torch.equal(replay, first)
+    # The kernels rearm the route index between launches.
+    assert int(plan.route_index[: 2 * num_tokens].abs().max()) == 0
+    plan.close()
 
 
 @pytest.mark.parametrize(

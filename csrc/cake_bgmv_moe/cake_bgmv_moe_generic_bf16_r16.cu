@@ -15,7 +15,7 @@
  */
 // Generated source for FlashInfer.
 // Bundle: Cake BGMV MoE generic-shape shrink and deterministic expand, bf16 rank 16.
-// Target: sm_90a, sm_100a, sm_103a (cp.async, shuffles, votes, FMA only); compile flags: none.
+// Target: sm_90a, sm_100a, sm_103a (cp.async, shuffles, atomics, FMA only); compile flags: none.
 // Generated file; do not edit manually.
 typedef signed char int8_t;
 typedef unsigned char uint8_t;
@@ -66,7 +66,8 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
     uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
     uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices, int num_pairs,
-    int num_experts, int num_tokens, int hidden, int num_tiles) {
+    int num_experts, int num_tokens, unsigned int* __restrict__ route_index_raw, int route_build,
+    int hidden, int num_tiles) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -119,29 +120,50 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
       }
     }
   }
+  if (route_build != 0) {
+    if (blockIdx.y == 0) {
+      if (tid == 0) {
+#pragma unroll
+        for (int pp_1 = 0; pp_1 < 4; pp_1++) {
+          if (valid[pp_1] != 0) {
+            int route_token = (int)tokens[pp_1];
+            unsigned int _atomic_old_0 =
+                atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[route_token], 1);
+            unsigned int route_slot = _atomic_old_0;
+            if (route_slot < 16) {
+              *(reinterpret_cast<unsigned int*>(
+                    reinterpret_cast<unsigned int*>(route_index_raw) +
+                    (2 * num_tokens + route_token * 16 + (int)route_slot)) +
+                (0)) = (unsigned int)(pair_block * 4 + pp_1);
+            }
+          }
+        }
+      }
+    }
+  }
 #pragma unroll
   for (int tile = 0; tile < 3; tile++) {
     if (tile < num_tiles) {
       int k_base = tile * 1024 + tid * 8;
 #pragma unroll
-      for (int pp_1 = 0; pp_1 < 4; pp_1++) {
-        if (valid[pp_1] != 0) {
+      for (int pp_2 = 0; pp_2 < 4; pp_2++) {
+        if (valid[pp_2] != 0) {
           if (k_base < hidden) {
             asm volatile(
                 "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                    x_smem_addr + (unsigned int)((tile * 4 * 1024 + pp_1 * 1024 + tid * 8) * 2)),
+                    x_smem_addr + (unsigned int)((tile * 4 * 1024 + pp_2 * 1024 + tid * 8) * 2)),
                 "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                    (tokens[pp_1] * (long long)hidden + (long long)k_base)));
+                    (tokens[pp_2] * (long long)hidden + (long long)k_base)));
 #pragma unroll
             for (int rr = 0; rr < 8; rr++) {
               int rank_row = rank_base + rr;
               long long weight_index =
-                  ((loras[pp_1] * (long long)num_experts + experts[pp_1]) * 16 +
+                  ((loras[pp_2] * (long long)num_experts + experts[pp_2]) * 16 +
                    (long long)rank_row) *
                       (long long)hidden +
                   (long long)k_base;
               asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                               w_smem_addr + (unsigned int)((tile * 4 * 8 * 1024 + pp_1 * 8 * 1024 +
+                               w_smem_addr + (unsigned int)((tile * 4 * 8 * 1024 + pp_2 * 8 * 1024 +
                                                              rr * 1024 + tid * 8) *
                                                             2)),
                            "l"(reinterpret_cast<const __nv_bfloat16*>(lora_a_raw) + weight_index));
@@ -164,9 +186,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
     int stage = tile_1 % 3;
     int k_base_1 = tile_1 * 1024 + tid * 8;
 #pragma unroll
-    for (int pp_2 = 0; pp_2 < 4; pp_2++) {
-      int x_thread_base = stage * 4 * 1024 + pp_2 * 1024 + tid * 8;
-      if (valid[pp_2] != 0) {
+    for (int pp_3 = 0; pp_3 < 4; pp_3++) {
+      int x_thread_base = stage * 4 * 1024 + pp_3 * 1024 + tid * 8;
+      if (valid[pp_3] != 0) {
         if (k_base_1 < hidden) {
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[0])),
@@ -191,9 +213,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
 #pragma unroll
       for (int rr_1 = 0; rr_1 < 8; rr_1++) {
         float partial = 0.0f;
-        if (valid[pp_2] != 0) {
+        if (valid[pp_3] != 0) {
           if (k_base_1 < hidden) {
-            int w_thread_base = stage * 4 * 8 * 1024 + pp_2 * 8 * 1024 + rr_1 * 1024 + tid * 8;
+            int w_thread_base = stage * 4 * 8 * 1024 + pp_3 * 8 * 1024 + rr_1 * 1024 + tid * 8;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                          : "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[0])),
                            "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[(0) + 1])),
@@ -225,7 +247,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
           _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
         partial = _warp_reduce_0;
         if (lane == 0) {
-          warp_partials[(pp_2 * 8 + rr_1) * 4 + warp] = partial;
+          warp_partials[(pp_3 * 8 + rr_1) * 4 + warp] = partial;
         }
       }
     }
@@ -246,25 +268,25 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
     if (refill_tile < num_tiles) {
       int refill_k = refill_tile * 1024 + tid * 8;
 #pragma unroll
-      for (int pp_3 = 0; pp_3 < 4; pp_3++) {
-        if (valid[pp_3] != 0) {
+      for (int pp_4 = 0; pp_4 < 4; pp_4++) {
+        if (valid[pp_4] != 0) {
           if (refill_k < hidden) {
             asm volatile(
                 "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                    x_smem_addr + (unsigned int)((stage * 4 * 1024 + pp_3 * 1024 + tid * 8) * 2)),
+                    x_smem_addr + (unsigned int)((stage * 4 * 1024 + pp_4 * 1024 + tid * 8) * 2)),
                 "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                    (tokens[pp_3] * (long long)hidden + (long long)refill_k)));
+                    (tokens[pp_4] * (long long)hidden + (long long)refill_k)));
 #pragma unroll
             for (int rr_2 = 0; rr_2 < 8; rr_2++) {
               int rank_row_1 = rank_base + rr_2;
               long long weight_index_1 =
-                  ((loras[pp_3] * (long long)num_experts + experts[pp_3]) * 16 +
+                  ((loras[pp_4] * (long long)num_experts + experts[pp_4]) * 16 +
                    (long long)rank_row_1) *
                       (long long)hidden +
                   (long long)refill_k;
               asm volatile(
                   "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                      w_smem_addr + (unsigned int)((stage * 4 * 8 * 1024 + pp_3 * 8 * 1024 +
+                      w_smem_addr + (unsigned int)((stage * 4 * 8 * 1024 + pp_4 * 8 * 1024 +
                                                     rr_2 * 1024 + tid * 8) *
                                                    2)),
                   "l"(reinterpret_cast<const __nv_bfloat16*>(lora_a_raw) + weight_index_1));
@@ -325,7 +347,8 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
     uint16_t* __restrict__ shrink_out_raw, uint16_t* __restrict__ x_raw,
     uint16_t* __restrict__ lora_a_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices, int num_pairs,
-    int num_experts, int num_tokens, int hidden, int num_tiles) {
+    int num_experts, int num_tokens, unsigned int* __restrict__ route_index_raw, int route_build,
+    int hidden, int num_tiles) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -378,29 +401,50 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
       }
     }
   }
+  if (route_build != 0) {
+    if (blockIdx.y == 0) {
+      if (tid == 0) {
+#pragma unroll
+        for (int pp_1 = 0; pp_1 < 1; pp_1++) {
+          if (valid[pp_1] != 0) {
+            int route_token = (int)tokens[pp_1];
+            unsigned int _atomic_old_0 =
+                atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[route_token], 1);
+            unsigned int route_slot = _atomic_old_0;
+            if (route_slot < 16) {
+              *(reinterpret_cast<unsigned int*>(
+                    reinterpret_cast<unsigned int*>(route_index_raw) +
+                    (2 * num_tokens + route_token * 16 + (int)route_slot)) +
+                (0)) = (unsigned int)(pair_block + pp_1);
+            }
+          }
+        }
+      }
+    }
+  }
 #pragma unroll
   for (int tile = 0; tile < 2; tile++) {
     if (tile < num_tiles) {
       int k_base = tile * 1024 + tid * 8;
 #pragma unroll
-      for (int pp_1 = 0; pp_1 < 1; pp_1++) {
-        if (valid[pp_1] != 0) {
+      for (int pp_2 = 0; pp_2 < 1; pp_2++) {
+        if (valid[pp_2] != 0) {
           if (k_base < hidden) {
             asm volatile(
                 "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                    x_smem_addr + (unsigned int)((tile * 1024 + pp_1 * 1024 + tid * 8) * 2)),
+                    x_smem_addr + (unsigned int)((tile * 1024 + pp_2 * 1024 + tid * 8) * 2)),
                 "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                    (tokens[pp_1] * (long long)hidden + (long long)k_base)));
+                    (tokens[pp_2] * (long long)hidden + (long long)k_base)));
 #pragma unroll
             for (int rr = 0; rr < 8; rr++) {
               int rank_row = rank_base + rr;
               long long weight_index =
-                  ((loras[pp_1] * (long long)num_experts + experts[pp_1]) * 16 +
+                  ((loras[pp_2] * (long long)num_experts + experts[pp_2]) * 16 +
                    (long long)rank_row) *
                       (long long)hidden +
                   (long long)k_base;
               asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                               w_smem_addr + (unsigned int)((tile * 8 * 1024 + pp_1 * 8 * 1024 +
+                               w_smem_addr + (unsigned int)((tile * 8 * 1024 + pp_2 * 8 * 1024 +
                                                              rr * 1024 + tid * 8) *
                                                             2)),
                            "l"(reinterpret_cast<const __nv_bfloat16*>(lora_a_raw) + weight_index));
@@ -423,9 +467,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
     int stage = tile_1 % 2;
     int k_base_1 = tile_1 * 1024 + tid * 8;
 #pragma unroll
-    for (int pp_2 = 0; pp_2 < 1; pp_2++) {
-      int x_thread_base = stage * 1024 + pp_2 * 1024 + tid * 8;
-      if (valid[pp_2] != 0) {
+    for (int pp_3 = 0; pp_3 < 1; pp_3++) {
+      int x_thread_base = stage * 1024 + pp_3 * 1024 + tid * 8;
+      if (valid[pp_3] != 0) {
         if (k_base_1 < hidden) {
           asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                        : "=r"(*reinterpret_cast<uint32_t*>(&x_carriers[0])),
@@ -450,9 +494,9 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
 #pragma unroll
       for (int rr_1 = 0; rr_1 < 8; rr_1++) {
         float partial = 0.0f;
-        if (valid[pp_2] != 0) {
+        if (valid[pp_3] != 0) {
           if (k_base_1 < hidden) {
-            int w_thread_base = stage * 8 * 1024 + pp_2 * 8 * 1024 + rr_1 * 1024 + tid * 8;
+            int w_thread_base = stage * 8 * 1024 + pp_3 * 8 * 1024 + rr_1 * 1024 + tid * 8;
             asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
                          : "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[0])),
                            "=r"(*reinterpret_cast<uint32_t*>(&w_carriers[(0) + 1])),
@@ -484,7 +528,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
           _warp_reduce_0 += __shfl_xor_sync(0xFFFFFFFF, _warp_reduce_0, offset);
         partial = _warp_reduce_0;
         if (lane == 0) {
-          warp_partials[(pp_2 * 8 + rr_1) * 4 + warp] = partial;
+          warp_partials[(pp_3 * 8 + rr_1) * 4 + warp] = partial;
         }
       }
     }
@@ -505,26 +549,26 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
     if (refill_tile < num_tiles) {
       int refill_k = refill_tile * 1024 + tid * 8;
 #pragma unroll
-      for (int pp_3 = 0; pp_3 < 1; pp_3++) {
-        if (valid[pp_3] != 0) {
+      for (int pp_4 = 0; pp_4 < 1; pp_4++) {
+        if (valid[pp_4] != 0) {
           if (refill_k < hidden) {
             asm volatile(
                 "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                    x_smem_addr + (unsigned int)((stage * 1024 + pp_3 * 1024 + tid * 8) * 2)),
+                    x_smem_addr + (unsigned int)((stage * 1024 + pp_4 * 1024 + tid * 8) * 2)),
                 "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                    (tokens[pp_3] * (long long)hidden + (long long)refill_k)));
+                    (tokens[pp_4] * (long long)hidden + (long long)refill_k)));
 #pragma unroll
             for (int rr_2 = 0; rr_2 < 8; rr_2++) {
               int rank_row_1 = rank_base + rr_2;
               long long weight_index_1 =
-                  ((loras[pp_3] * (long long)num_experts + experts[pp_3]) * 16 +
+                  ((loras[pp_4] * (long long)num_experts + experts[pp_4]) * 16 +
                    (long long)rank_row_1) *
                       (long long)hidden +
                   (long long)refill_k;
               asm volatile(
                   "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
                       w_smem_addr +
-                      (unsigned int)((stage * 8 * 1024 + pp_3 * 8 * 1024 + rr_2 * 1024 + tid * 8) *
+                      (unsigned int)((stage * 8 * 1024 + pp_4 * 8 * 1024 + rr_2 * 1024 + tid * 8) *
                                      2)),
                   "l"(reinterpret_cast<const __nv_bfloat16*>(lora_a_raw) + weight_index_1));
             }
@@ -572,13 +616,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
 #define SMEM_ROUTE_LIST_OFF 64
 #define SMEM_ROUTE_LIST_STAGE_BYTES 64
 #define SMEM_ROUTE_LIST_STRIDE 64
-#define SMEM_WARP_COUNTS_OFF 128
-#define SMEM_WARP_COUNTS_STAGE_BYTES 8
-#define SMEM_WARP_COUNTS_STRIDE 8
-#define SMEM_COUNTERS_OFF 136
-#define SMEM_COUNTERS_STAGE_BYTES 8
-#define SMEM_COUNTERS_STRIDE 8
-#define SMEM_TOTAL 256
+#define SMEM_TOTAL 128
 #define THREADS 64
 
 extern "C" {
@@ -589,7 +627,8 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
     float* __restrict__ topk_weights, int num_pairs, int num_experts, int num_tokens,
-    int output_stride, int output_offset, int hidden) {
+    int output_stride, int output_offset, unsigned int* __restrict__ route_index_raw,
+    int route_lookup, int route_reset, int hidden) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -611,10 +650,6 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
   const int shrink_stage_addr = smem + 0;
   int* route_list = reinterpret_cast<int*>(smem_raw + 64);
   const int route_list_addr = smem + 64;
-  int* warp_counts = reinterpret_cast<int*>(smem_raw + 128);
-  const int warp_counts_addr = smem + 128;
-  int* counters = reinterpret_cast<int*>(smem_raw + 136);
-  const int counters_addr = smem + 136;
 
   // === Task calls (dependency order) ===
   int token = blockIdx.x;
@@ -716,63 +751,39 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
           }
         }
       } else {
-        if (tid == 0) {
-          counters[0] = 0;
-          counters[1] = 0;
-        }
-        __syncthreads();
-        unsigned int lane_bits = ((unsigned int)1 << (unsigned int)lane) - 1;
+        int route_count = num_pairs;
+        int use_index = 0;
+        if (route_lookup != 0) {
+          int indexed_count = (int)route_index_raw[token];
+          if (indexed_count <= 16) {
+            use_index = 1;
+            route_count = indexed_count;
+            int table_base = 2 * num_tokens + token * 16;
+            if (indexed_count > tid) {
+              int own_pair = (int)route_index_raw[table_base + tid];
+              int own_order = 0;
 #pragma unroll 1
-        for (int chunk_base = 0; chunk_base < num_pairs; chunk_base += 64) {
-          int scan_pair = chunk_base + tid;
-          int match = 0;
-          if (scan_pair < num_pairs) {
-            if (sorted_token_ids[scan_pair] == (long long)token) {
-              match = 1;
+              for (int probe = 0; probe < indexed_count; probe++) {
+                if (own_pair > (int)route_index_raw[table_base + probe]) {
+                  own_order += 1;
+                }
+              }
+              route_list[own_order] = own_pair;
             }
+            __syncthreads();
           }
-          unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, match != 0);
-          int _popc_0 = __popc(_vote_0 & lane_bits);
-          int lane_rank = _popc_0;
-          if (lane == 0) {
-            int _popc_1 = __popc(_vote_0);
-            warp_counts[warp] = _popc_1;
-          }
-          __syncthreads();
-          int slot = counters[0];
-#pragma unroll
-          for (int source_warp = 0; source_warp < 2; source_warp++) {
-            if (source_warp < warp) {
-              slot += warp_counts[source_warp];
-            }
-          }
-          slot += lane_rank;
-          if (match != 0) {
-            if (slot < 16) {
-              route_list[slot] = scan_pair;
-            }
-          }
-          __syncthreads();
-          if (tid == 0) {
-            int chunk_total = counters[0];
-#pragma unroll
-            for (int source_warp_1 = 0; source_warp_1 < 2; source_warp_1++) {
-              chunk_total += warp_counts[source_warp_1];
-            }
-            counters[0] = chunk_total;
-            if (chunk_total > 16) {
-              counters[1] = 1;
-            }
-          }
-          __syncthreads();
         }
-        int route_count = counters[0];
-        int overflow = counters[1];
         if (output_col < hidden) {
-          if (overflow == 0) {
 #pragma unroll 1
-            for (int route_index = 0; route_index < route_count; route_index++) {
-              int pair_1 = route_list[route_index];
+          for (int route_step = 0; route_step < route_count; route_step++) {
+            int pair_1 = route_step;
+            int route_match = 1;
+            if (use_index != 0) {
+              pair_1 = route_list[route_step];
+            } else if (sorted_token_ids[route_step] != (long long)token) {
+              route_match = 0;
+            }
+            if (route_match != 0) {
               long long expert_1 = expert_ids[pair_1];
               float route_partial_1 = 0.0f;
 #pragma unroll
@@ -838,82 +849,32 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
               float _fma_3 = __fmaf_rn(route_partial_1, topk_weights[pair_1], total);
               total = _fma_3;
             }
-          } else {
-#pragma unroll 1
-            for (int pair_2 = 0; pair_2 < num_pairs; pair_2++) {
-              if (sorted_token_ids[pair_2] == (long long)token) {
-                long long expert_2 = expert_ids[pair_2];
-                float route_partial_2 = 0.0f;
-#pragma unroll
-                for (int rank_block_2 = 0; rank_block_2 < 2; rank_block_2++) {
-                  int rank_col_2 = rank_block_2 * 8;
-                  float _vec_load_3[8];
-                  {
-                    const uint4* _vptr_3 = reinterpret_cast<const uint4*>(
-                        reinterpret_cast<const __nv_bfloat16*>(shrink_raw) +
-                        (pair_2 * 16 + rank_col_2) + 0);
-                    uint4 _vld_3[1];
-#pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                      _vld_3[_blk] = _vptr_3[_blk];
-                      uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
-#pragma unroll
-                      for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[0]),
-                              "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_3[_pair]));
-                      }
-                    }
-                  }
-                  long long weight_index_2 =
-                      ((lora_id * (long long)num_experts + expert_2) * (long long)hidden +
-                       (long long)output_col) *
-                          16 +
-                      (long long)rank_col_2;
-                  float _vec_load_4[8];
-                  {
-                    const uint4* _vptr_4 = reinterpret_cast<const uint4*>(
-                        reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index_2 + 0);
-                    uint4 _vld_4[1];
-#pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                      _vld_4[_blk] = _vptr_4[_blk];
-                      uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
-#pragma unroll
-                      for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[0]),
-                              "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_4[_pair]));
-                      }
-                    }
-                  }
-#pragma unroll
-                  for (int element_2 = 0; element_2 < 8; element_2++) {
-                    float _fma_4 =
-                        __fmaf_rn(_vec_load_3[element_2], _vec_load_4[element_2], route_partial_2);
-                    route_partial_2 = _fma_4;
-                  }
-                }
-                float _fma_5 = __fmaf_rn(route_partial_2, topk_weights[pair_2], total);
-                total = _fma_5;
-              }
-            }
           }
         }
       }
       if (output_col < hidden) {
         *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
           (0)) = total;
+      }
+      if (route_reset != 0) {
+        __syncthreads();
+        if (tid == 0) {
+          unsigned int _atomic_old_0;
+          asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                       : "=r"(_atomic_old_0)
+                       : "l"(&reinterpret_cast<unsigned int*>(route_index_raw)[num_tokens + token]),
+                         "r"(static_cast<uint32_t>(1))
+                       : "memory");
+          unsigned int finished = _atomic_old_0;
+          if (finished + 1 == (unsigned int)gridDim.y) {
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) +
+                                              token) +
+              (0)) = (unsigned int)0;
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) +
+                                              (num_tokens + token)) +
+              (0)) = (unsigned int)0;
+          }
+        }
       }
     } else if (output_col < hidden) {
       *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
@@ -926,9 +887,6 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
 
 #undef BLACKWELL_INF
 #undef NUM_MAIN_STAGES
-#undef SMEM_COUNTERS_OFF
-#undef SMEM_COUNTERS_STAGE_BYTES
-#undef SMEM_COUNTERS_STRIDE
 #undef SMEM_ROUTE_LIST_OFF
 #undef SMEM_ROUTE_LIST_STAGE_BYTES
 #undef SMEM_ROUTE_LIST_STRIDE
@@ -936,9 +894,6 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
 #undef SMEM_SHRINK_STAGE_STAGE_BYTES
 #undef SMEM_SHRINK_STAGE_STRIDE
 #undef SMEM_TOTAL
-#undef SMEM_WARP_COUNTS_OFF
-#undef SMEM_WARP_COUNTS_STAGE_BYTES
-#undef SMEM_WARP_COUNTS_STRIDE
 #undef THREADS
 
 #define BLACKWELL_INF CUDART_INF_F
@@ -949,13 +904,7 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
 #define SMEM_ROUTE_LIST_OFF 64
 #define SMEM_ROUTE_LIST_STAGE_BYTES 64
 #define SMEM_ROUTE_LIST_STRIDE 64
-#define SMEM_WARP_COUNTS_OFF 128
-#define SMEM_WARP_COUNTS_STAGE_BYTES 16
-#define SMEM_WARP_COUNTS_STRIDE 16
-#define SMEM_COUNTERS_OFF 144
-#define SMEM_COUNTERS_STAGE_BYTES 8
-#define SMEM_COUNTERS_STRIDE 8
-#define SMEM_TOTAL 256
+#define SMEM_TOTAL 128
 #define THREADS 128
 
 extern "C" {
@@ -966,7 +915,8 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
     uint16_t* __restrict__ lora_b_raw, long long* __restrict__ sorted_token_ids,
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
     float* __restrict__ topk_weights, int num_pairs, int num_experts, int num_tokens,
-    int output_stride, int output_offset, int hidden) {
+    int output_stride, int output_offset, unsigned int* __restrict__ route_index_raw,
+    int route_lookup, int route_reset, int hidden) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -988,10 +938,6 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
   const int shrink_stage_addr = smem + 0;
   int* route_list = reinterpret_cast<int*>(smem_raw + 64);
   const int route_list_addr = smem + 64;
-  int* warp_counts = reinterpret_cast<int*>(smem_raw + 128);
-  const int warp_counts_addr = smem + 128;
-  int* counters = reinterpret_cast<int*>(smem_raw + 144);
-  const int counters_addr = smem + 144;
 
   // === Task calls (dependency order) ===
   int token = blockIdx.x;
@@ -1093,63 +1039,39 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
           }
         }
       } else {
-        if (tid == 0) {
-          counters[0] = 0;
-          counters[1] = 0;
-        }
-        __syncthreads();
-        unsigned int lane_bits = ((unsigned int)1 << (unsigned int)lane) - 1;
+        int route_count = num_pairs;
+        int use_index = 0;
+        if (route_lookup != 0) {
+          int indexed_count = (int)route_index_raw[token];
+          if (indexed_count <= 16) {
+            use_index = 1;
+            route_count = indexed_count;
+            int table_base = 2 * num_tokens + token * 16;
+            if (indexed_count > tid) {
+              int own_pair = (int)route_index_raw[table_base + tid];
+              int own_order = 0;
 #pragma unroll 1
-        for (int chunk_base = 0; chunk_base < num_pairs; chunk_base += 128) {
-          int scan_pair = chunk_base + tid;
-          int match = 0;
-          if (scan_pair < num_pairs) {
-            if (sorted_token_ids[scan_pair] == (long long)token) {
-              match = 1;
+              for (int probe = 0; probe < indexed_count; probe++) {
+                if (own_pair > (int)route_index_raw[table_base + probe]) {
+                  own_order += 1;
+                }
+              }
+              route_list[own_order] = own_pair;
             }
+            __syncthreads();
           }
-          unsigned int _vote_0 = __ballot_sync(0xFFFFFFFF, match != 0);
-          int _popc_0 = __popc(_vote_0 & lane_bits);
-          int lane_rank = _popc_0;
-          if (lane == 0) {
-            int _popc_1 = __popc(_vote_0);
-            warp_counts[warp] = _popc_1;
-          }
-          __syncthreads();
-          int slot = counters[0];
-#pragma unroll
-          for (int source_warp = 0; source_warp < 4; source_warp++) {
-            if (source_warp < warp) {
-              slot += warp_counts[source_warp];
-            }
-          }
-          slot += lane_rank;
-          if (match != 0) {
-            if (slot < 16) {
-              route_list[slot] = scan_pair;
-            }
-          }
-          __syncthreads();
-          if (tid == 0) {
-            int chunk_total = counters[0];
-#pragma unroll
-            for (int source_warp_1 = 0; source_warp_1 < 4; source_warp_1++) {
-              chunk_total += warp_counts[source_warp_1];
-            }
-            counters[0] = chunk_total;
-            if (chunk_total > 16) {
-              counters[1] = 1;
-            }
-          }
-          __syncthreads();
         }
-        int route_count = counters[0];
-        int overflow = counters[1];
         if (output_col < hidden) {
-          if (overflow == 0) {
 #pragma unroll 1
-            for (int route_index = 0; route_index < route_count; route_index++) {
-              int pair_1 = route_list[route_index];
+          for (int route_step = 0; route_step < route_count; route_step++) {
+            int pair_1 = route_step;
+            int route_match = 1;
+            if (use_index != 0) {
+              pair_1 = route_list[route_step];
+            } else if (sorted_token_ids[route_step] != (long long)token) {
+              route_match = 0;
+            }
+            if (route_match != 0) {
               long long expert_1 = expert_ids[pair_1];
               float route_partial_1 = 0.0f;
 #pragma unroll
@@ -1215,82 +1137,32 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
               float _fma_3 = __fmaf_rn(route_partial_1, topk_weights[pair_1], total);
               total = _fma_3;
             }
-          } else {
-#pragma unroll 1
-            for (int pair_2 = 0; pair_2 < num_pairs; pair_2++) {
-              if (sorted_token_ids[pair_2] == (long long)token) {
-                long long expert_2 = expert_ids[pair_2];
-                float route_partial_2 = 0.0f;
-#pragma unroll
-                for (int rank_block_2 = 0; rank_block_2 < 2; rank_block_2++) {
-                  int rank_col_2 = rank_block_2 * 8;
-                  float _vec_load_3[8];
-                  {
-                    const uint4* _vptr_3 = reinterpret_cast<const uint4*>(
-                        reinterpret_cast<const __nv_bfloat16*>(shrink_raw) +
-                        (pair_2 * 16 + rank_col_2) + 0);
-                    uint4 _vld_3[1];
-#pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                      _vld_3[_blk] = _vptr_3[_blk];
-                      uint32_t* _vpairs_3 = reinterpret_cast<uint32_t*>(&_vld_3[_blk]);
-#pragma unroll
-                      for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[0]),
-                              "=f"((&_vec_load_3[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_3[_pair]));
-                      }
-                    }
-                  }
-                  long long weight_index_2 =
-                      ((lora_id * (long long)num_experts + expert_2) * (long long)hidden +
-                       (long long)output_col) *
-                          16 +
-                      (long long)rank_col_2;
-                  float _vec_load_4[8];
-                  {
-                    const uint4* _vptr_4 = reinterpret_cast<const uint4*>(
-                        reinterpret_cast<const __nv_bfloat16*>(lora_b_raw) + weight_index_2 + 0);
-                    uint4 _vld_4[1];
-#pragma unroll
-                    for (int _blk = 0; _blk < 1; _blk++) {
-                      _vld_4[_blk] = _vptr_4[_blk];
-                      uint32_t* _vpairs_4 = reinterpret_cast<uint32_t*>(&_vld_4[_blk]);
-#pragma unroll
-                      for (int _pair = 0; _pair < 4; _pair++) {
-                        asm volatile(
-                            "{\n\t"
-                            "shl.b32 %0, %2, 16;\n\t"
-                            "and.b32 %1, %2, 0xffff0000;\n\t"
-                            "}\n"
-                            : "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[0]),
-                              "=f"((&_vec_load_4[0 + _blk * 8 + _pair * 2])[1])
-                            : "r"(_vpairs_4[_pair]));
-                      }
-                    }
-                  }
-#pragma unroll
-                  for (int element_2 = 0; element_2 < 8; element_2++) {
-                    float _fma_4 =
-                        __fmaf_rn(_vec_load_3[element_2], _vec_load_4[element_2], route_partial_2);
-                    route_partial_2 = _fma_4;
-                  }
-                }
-                float _fma_5 = __fmaf_rn(route_partial_2, topk_weights[pair_2], total);
-                total = _fma_5;
-              }
-            }
           }
         }
       }
       if (output_col < hidden) {
         *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
           (0)) = total;
+      }
+      if (route_reset != 0) {
+        __syncthreads();
+        if (tid == 0) {
+          unsigned int _atomic_old_0;
+          asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
+                       : "=r"(_atomic_old_0)
+                       : "l"(&reinterpret_cast<unsigned int*>(route_index_raw)[num_tokens + token]),
+                         "r"(static_cast<uint32_t>(1))
+                       : "memory");
+          unsigned int finished = _atomic_old_0;
+          if (finished + 1 == (unsigned int)gridDim.y) {
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) +
+                                              token) +
+              (0)) = (unsigned int)0;
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) +
+                                              (num_tokens + token)) +
+              (0)) = (unsigned int)0;
+          }
+        }
       }
     } else if (output_col < hidden) {
       *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
@@ -1303,9 +1175,6 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
 
 #undef BLACKWELL_INF
 #undef NUM_MAIN_STAGES
-#undef SMEM_COUNTERS_OFF
-#undef SMEM_COUNTERS_STAGE_BYTES
-#undef SMEM_COUNTERS_STRIDE
 #undef SMEM_ROUTE_LIST_OFF
 #undef SMEM_ROUTE_LIST_STAGE_BYTES
 #undef SMEM_ROUTE_LIST_STRIDE
@@ -1313,13 +1182,10 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
 #undef SMEM_SHRINK_STAGE_STAGE_BYTES
 #undef SMEM_SHRINK_STAGE_STRIDE
 #undef SMEM_TOTAL
-#undef SMEM_WARP_COUNTS_OFF
-#undef SMEM_WARP_COUNTS_STAGE_BYTES
-#undef SMEM_WARP_COUNTS_STRIDE
 #undef THREADS
 
 // Dynamic shared memory per launch, in bytes.
 #define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_DECODE 221696
 #define CAKE_BGMV_MOE_GENERIC_SMEM_SHRINK_PREFILL 36992
-#define CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64 256
-#define CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128 256
+#define CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T64 128
+#define CAKE_BGMV_MOE_GENERIC_SMEM_EXPAND_T128 128

@@ -84,9 +84,22 @@ constexpr int32_t kHidden = CAKE_BGMV_MOE_HIDDEN;
 constexpr int32_t kRank = 32;
 constexpr int32_t kShrinkThreads = 128;
 constexpr int32_t kShrinkDecodePairsPerBlock = 4;
-constexpr int32_t kShrinkDecodeSmemBytes = 221696;
-constexpr int32_t kShrinkPrefillSmemBytes = 36992;
-constexpr int32_t kExpandSmemBytes = 128;
+// Dynamic shared memory per launch; the generated body records the values its
+// kernels were scheduled with (x/weight cp.async rings plus FP32 partials for
+// the shrink kernels, routed activations plus the route list for expand).
+constexpr int32_t kShrinkDecodeSmemBytes = CAKE_BGMV_MOE_SMEM_SHRINK_DECODE;
+constexpr int32_t kShrinkPrefillSmemBytes = CAKE_BGMV_MOE_SMEM_SHRINK_PREFILL;
+constexpr int32_t kExpandT64SmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_T64;
+constexpr int32_t kExpandTokenSmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_TOKEN;
+constexpr int32_t kExpandDualSmemBytes = CAKE_BGMV_MOE_SMEM_EXPAND_DUAL;
+static_assert(kShrinkDecodeSmemBytes == 221696, "decode shrink smem layout changed");
+static_assert(kShrinkPrefillSmemBytes == 36992, "prefill shrink smem layout changed");
+// Token->pair route index published by the shrink kernels and consumed by the
+// expand kernels for arbitrary pair order: per token one route count, one
+// completion counter and kRouteIndexMaxRoutes pair slots (int32). The plan
+// allocates it zeroed; the last expand CTA of each token rearms its entry.
+constexpr int32_t kRouteIndexMaxRoutes = 16;
+constexpr int32_t kRouteIndexWordsPerToken = 2 + kRouteIndexMaxRoutes;
 
 enum class Schedule : int32_t {
   kTokenOwnedT64 = 0,
@@ -140,8 +153,8 @@ inline void CheckCompact(const TensorView& tensor, const char* name) {
 
 void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lora_a,
          TensorView lora_b, TensorView sorted_token_ids, TensorView expert_ids,
-         TensorView lora_indices, TensorView topk_weights, int64_t schedule_value,
-         int64_t cuda_stream) {
+         TensorView lora_indices, TensorView topk_weights, TensorView route_index,
+         int64_t schedule_value, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(x);
   const int32_t device_id = x.device().device_id;
@@ -156,6 +169,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CHECK_CUDA(expert_ids);
   CHECK_CUDA(lora_indices);
   CHECK_CUDA(topk_weights);
+  CHECK_CUDA(route_index);
   CHECK_DEVICE(x, y_accum);
   CHECK_DEVICE(x, shrink_out);
   CHECK_DEVICE(x, lora_a);
@@ -164,6 +178,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CHECK_DEVICE(x, expert_ids);
   CHECK_DEVICE(x, lora_indices);
   CHECK_DEVICE(x, topk_weights);
+  CHECK_DEVICE(x, route_index);
 
   CHECK_INPUT_TYPE(x, CAKE_BGMV_MOE_INPUT_DTYPE);
   CHECK_INPUT_TYPE(shrink_out, CAKE_BGMV_MOE_INPUT_DTYPE);
@@ -174,6 +189,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CHECK_INPUT_TYPE(sorted_token_ids, dl_int64);
   CHECK_INPUT_TYPE(expert_ids, dl_int64);
   CHECK_INPUT_TYPE(lora_indices, dl_int64);
+  CHECK_INPUT_TYPE(route_index, dl_int32);
 
   TVM_FFI_ICHECK(x.ndim() == 2 && x.size(0) > 0 && x.size(1) == kHidden)
       << "x must have shape [num_tokens, " << kHidden << "]";
@@ -210,6 +226,11 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CheckCompact(expert_ids, "expert_ids");
   CheckCompact(lora_indices, "lora_indices");
   CheckCompact(topk_weights, "topk_weights");
+  CheckCompact(route_index, "route_index");
+  TVM_FFI_ICHECK(route_index.ndim() == 1 &&
+                 route_index.size(0) >= static_cast<int64_t>(num_tokens) * kRouteIndexWordsPerToken)
+      << "route_index must hold at least num_tokens * " << kRouteIndexWordsPerToken
+      << " int32 words";
 
   TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kTokenOwnedT64) &&
                  schedule_value <= static_cast<int64_t>(Schedule::kTokenOwnedDualCol))
@@ -225,6 +246,10 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   auto* expert_ptr = static_cast<long long*>(expert_ids.data_ptr());
   auto* lora_ptr = static_cast<long long*>(lora_indices.data_ptr());
   auto* weight_ptr = static_cast<float*>(topk_weights.data_ptr());
+  auto* route_ptr = static_cast<unsigned int*>(route_index.data_ptr());
+  constexpr int32_t kRouteBuild = 1;
+  constexpr int32_t kRouteLookup = 1;
+  constexpr int32_t kRouteReset = 1;
 
   const dim3 shrink_block(kShrinkThreads, 1, 1);
   if (num_pairs <= 32) {
@@ -232,12 +257,12 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
         (num_pairs + kShrinkDecodePairsPerBlock - 1) / kShrinkDecodePairsPerBlock, kRank / 8, 1);
     CAKE_BGMV_MOE_SHRINK_DECODE<<<shrink_grid, shrink_block, kShrinkDecodeSmemBytes, stream>>>(
         shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
-        num_tokens);
+        num_tokens, route_ptr, kRouteBuild);
   } else {
     const dim3 shrink_grid(num_pairs, kRank / 8, 1);
     CAKE_BGMV_MOE_SHRINK_PREFILL<<<shrink_grid, shrink_block, kShrinkPrefillSmemBytes, stream>>>(
         shrink_ptr, x_ptr, a_ptr, token_ptr, expert_ptr, lora_ptr, num_pairs, num_experts,
-        num_tokens);
+        num_tokens, route_ptr, kRouteBuild);
   }
   CheckCuda(cudaGetLastError(), "Cake BGMV MoE shrink launch");
 
@@ -245,19 +270,22 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   const int32_t output_offset = 0;
   if (schedule == Schedule::kTokenOwnedT64) {
     const dim3 grid(num_tokens, (kHidden + 63) / 64, 1);
-    CAKE_BGMV_MOE_EXPAND_TOKEN_T64<<<grid, 64, kExpandSmemBytes, stream>>>(
+    CAKE_BGMV_MOE_EXPAND_TOKEN_T64<<<grid, 64, kExpandT64SmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset);
+        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup,
+        kRouteReset);
   } else if (schedule == Schedule::kTokenOwned) {
     const dim3 grid(num_tokens, (kHidden + 127) / 128, 1);
-    CAKE_BGMV_MOE_EXPAND_TOKEN<<<grid, 128, kExpandSmemBytes, stream>>>(
+    CAKE_BGMV_MOE_EXPAND_TOKEN<<<grid, 128, kExpandTokenSmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset);
+        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup,
+        kRouteReset);
   } else {
     const dim3 grid(num_tokens, (kHidden + 255) / 256, 1);
-    CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL<<<grid, 128, kExpandSmemBytes, stream>>>(
+    CAKE_BGMV_MOE_EXPAND_TOKEN_DUAL<<<grid, 128, kExpandDualSmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset);
+        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup,
+        kRouteReset);
   }
   CheckCuda(cudaGetLastError(), "Cake BGMV MoE expand launch");
 }

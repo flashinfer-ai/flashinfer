@@ -353,6 +353,17 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         self.lora_indices = lora_indices
         self.topk_weights = topk_weights
         self.schedule_id: Optional[int] = schedule_id
+        from ..jit.cake_bgmv_moe import cake_bgmv_moe_route_index_numel
+
+        # Token->pair route index: published by the shrink kernels, consumed and
+        # rearmed by the expand kernels (arbitrary pair order in O(1) per CTA).
+        # Pointer-stable and zero-initialized once; the kernels keep it zeroed
+        # between launches, so graph replays never need a memset node.
+        self.route_index = torch.zeros(
+            cake_bgmv_moe_route_index_numel(int(x.shape[0])),
+            dtype=torch.int32,
+            device=x.device,
+        )
         super().__init__(
             y_accum=y_accum,
             shrink_out=shrink_out,
@@ -367,6 +378,7 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
                 expert_ids,
                 lora_indices,
                 topk_weights,
+                self.route_index,
             ),
         )
 
@@ -381,6 +393,7 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
             self.expert_ids,
             self.lora_indices,
             self.topk_weights,
+            self.route_index,
             self.schedule_id,
             int(torch.cuda.current_stream(self.x.device).cuda_stream),
         )
@@ -574,7 +587,11 @@ def prepare_bgmv_moe(
     (``plan.variant == "specialized"``); everything else uses the runtime-hidden
     generic bundles (``plan.variant == "generic"``). Routing may be arbitrary; each output has one owner that accumulates
     routes in fixed input order, so identical prepared replays are bitwise
-    reproducible. The contiguous top-k=2 layout takes the optimized fast path.
+    reproducible. The contiguous top-k=2 layout takes the optimized fast path;
+    any other pair order (for example expert-sorted dispatch) is served through
+    a token->pair route index that the shrink kernels publish and the expand
+    kernels read in O(1) per CTA (``plan.route_index``, 16 slots per token;
+    tokens routed to more pairs take an exact serial scan).
 
     Inputs outside that support set (other device capabilities, ranks, hidden
     sizes that are not multiples of 8, multiple slices) are served by a
