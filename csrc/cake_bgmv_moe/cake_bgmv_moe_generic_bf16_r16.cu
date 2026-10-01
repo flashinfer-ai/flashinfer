@@ -153,13 +153,14 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
     }
     asm volatile("cp.async.commit_group;");
   }
-  int route_parity = 0;
+  unsigned int route_launch = 0;
   unsigned int route_old[4];
-  unsigned int route_base[4];
+  unsigned int route_base_even[4];
+  unsigned int route_base_odd[4];
   if (route_build != 0) {
     if (blockIdx.y == 0) {
       if (tid == 0) {
-        route_parity = (int)(route_index_raw[0] & 1);
+        route_launch = route_index_raw[0];
 #pragma unroll
         for (int pp_2 = 0; pp_2 < 4; pp_2++) {
           if (valid[pp_2] != 0) {
@@ -167,8 +168,8 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
             unsigned int _atomic_old_0 =
                 atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[4 + route_token], 1);
             route_old[pp_2] = _atomic_old_0;
-            route_base[pp_2] =
-                route_index_raw[4 + num_tokens + route_parity * num_tokens + route_token];
+            route_base_even[pp_2] = route_index_raw[4 + num_tokens + route_token];
+            route_base_odd[pp_2] = route_index_raw[4 + 2 * num_tokens + route_token];
           }
         }
       }
@@ -312,6 +313,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
   if (route_build != 0) {
     if (blockIdx.y == 0) {
       if (tid == 0) {
+        int route_parity = (int)(route_launch & 1);
         if (blockIdx.x == 0) {
           *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) + 1) +
             (0)) = (unsigned int)route_parity;
@@ -320,7 +322,11 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
         for (int pp_5 = 0; pp_5 < 4; pp_5++) {
           if (valid[pp_5] != 0) {
             int publish_token = (int)tokens[pp_5];
-            unsigned int route_slot = route_old[pp_5] - route_base[pp_5];
+            unsigned int route_base = route_base_even[pp_5];
+            if (route_parity != 0) {
+              route_base = route_base_odd[pp_5];
+            }
+            unsigned int route_slot = route_old[pp_5] - route_base;
             if (route_slot < 16) {
               *(reinterpret_cast<unsigned int*>(
                     reinterpret_cast<unsigned int*>(route_index_raw) +
@@ -457,13 +463,14 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
     }
     asm volatile("cp.async.commit_group;");
   }
-  int route_parity = 0;
+  unsigned int route_launch = 0;
   unsigned int route_old[1];
-  unsigned int route_base[1];
+  unsigned int route_base_even[1];
+  unsigned int route_base_odd[1];
   if (route_build != 0) {
     if (blockIdx.y == 0) {
       if (tid == 0) {
-        route_parity = (int)(route_index_raw[0] & 1);
+        route_launch = route_index_raw[0];
 #pragma unroll
         for (int pp_2 = 0; pp_2 < 1; pp_2++) {
           if (valid[pp_2] != 0) {
@@ -471,8 +478,8 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
             unsigned int _atomic_old_0 =
                 atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[4 + route_token], 1);
             route_old[pp_2] = _atomic_old_0;
-            route_base[pp_2] =
-                route_index_raw[4 + num_tokens + route_parity * num_tokens + route_token];
+            route_base_even[pp_2] = route_index_raw[4 + num_tokens + route_token];
+            route_base_odd[pp_2] = route_index_raw[4 + 2 * num_tokens + route_token];
           }
         }
       }
@@ -616,6 +623,7 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
   if (route_build != 0) {
     if (blockIdx.y == 0) {
       if (tid == 0) {
+        int route_parity = (int)(route_launch & 1);
         if (blockIdx.x == 0) {
           *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) + 1) +
             (0)) = (unsigned int)route_parity;
@@ -624,7 +632,11 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
         for (int pp_5 = 0; pp_5 < 1; pp_5++) {
           if (valid[pp_5] != 0) {
             int publish_token = (int)tokens[pp_5];
-            unsigned int route_slot = route_old[pp_5] - route_base[pp_5];
+            unsigned int route_base = route_base_even[pp_5];
+            if (route_parity != 0) {
+              route_base = route_base_odd[pp_5];
+            }
+            unsigned int route_slot = route_old[pp_5] - route_base;
             if (route_slot < 16) {
               *(reinterpret_cast<unsigned int*>(
                     reinterpret_cast<unsigned int*>(route_index_raw) +
