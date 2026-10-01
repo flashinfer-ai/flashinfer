@@ -13,6 +13,9 @@ mapping and can miss the tuned tactic.
 ``--all-tactics`` also times every other tactic the search tried. A tactic
 that fails to launch is reported as failed and does not stop the rest.
 
+``--epilogue qkv_qknorm_rope`` runs the fused QK-norm and RoPE epilogue.
+That kernel accepts only head_dim 128, so N must be divisible by 384.
+
 Run from the repository root: python -m benchmarks.bench_prims_ts_gemm
 """
 
@@ -26,8 +29,10 @@ from flashinfer.autotuner import AutoTuner, autotune
 from flashinfer.gemm import (
     fp4_linear,
     fp4_linear_swiglu,
+    fp4_qkv_qknorm_rope,
     fp8_linear,
     fp8_linear_swiglu,
+    fp8_qkv_qknorm_rope,
 )
 from flashinfer.prims_ts.gemm.runner import (
     GemmIdentity,
@@ -40,21 +45,74 @@ from flashinfer.prims_ts.gemm.tactics import legal_tactics
 from flashinfer.testing import bench_gpu_time
 from flashinfer.utils import get_compute_capability
 
+# The fused QKV kernel accepts only head_dim 128 and is_neox=False.
+_QKV_HEAD_DIM = 128
+
 
 def _format_tactic(tactic) -> str:
     if tactic == -1:
         return "fallback"
-    cluster_m, cluster_n, tile_n, tile_k, overlap, stages, mma_k, use_clc, warps = (
-        tactic
-    )
+    (
+        cluster_m,
+        cluster_n,
+        tile_n,
+        tile_k,
+        overlap,
+        stages,
+        mma_k,
+        use_clc,
+        warps,
+        use_tma_store,
+    ) = tactic
     return (
         f"cluster=({cluster_m},{cluster_n},1) tile_n={tile_n} tile_k={tile_k} "
         f"overlap={overlap} stages={stages} mma_k={mma_k} clc={use_clc} "
-        f"epi_warps={warps}"
+        f"epi_warps={warps} tma_store={int(use_tma_store)}"
     )
 
 
-def _call(dtype: str, epilogue: str, a, weight, a_scale, weight_scale, out):
+def _rope(m: int, q_norm, k_norm, num_heads: int):
+    half = _QKV_HEAD_DIM // 2
+    angles = torch.randn((m, half), device="cuda")
+    cos_sin = torch.cat((angles.cos(), angles.sin()), dim=-1).contiguous()
+    positions = torch.arange(m, device="cuda", dtype=torch.int64)
+    return q_norm, k_norm, cos_sin, positions, num_heads
+
+
+def _call(dtype: str, epilogue: str, a, weight, a_scale, weight_scale, out, rope=None):
+    if epilogue == "qkv_qknorm_rope":
+        q_norm, k_norm, cos_sin, positions, num_heads = rope
+        common = dict(
+            num_q_heads=num_heads,
+            num_kv_heads=num_heads,
+            head_dim=_QKV_HEAD_DIM,
+            out=out,
+        )
+        if dtype == "fp8":
+            return fp8_qkv_qknorm_rope(
+                a,
+                weight,
+                a_scale,
+                weight_scale,
+                q_norm,
+                k_norm,
+                cos_sin,
+                positions,
+                **common,
+            )
+        return fp4_qkv_qknorm_rope(
+            a,
+            a_scale,
+            1.0,
+            weight,
+            weight_scale,
+            1.0,
+            q_norm,
+            k_norm,
+            cos_sin,
+            positions,
+            **common,
+        )
     if dtype == "fp8":
         fn = fp8_linear_swiglu if epilogue == "swiglu" else fp8_linear
         return fn(a, weight, a_scale, weight_scale, out=out)
@@ -63,7 +121,15 @@ def _call(dtype: str, epilogue: str, a, weight, a_scale, weight_scale, out):
 
 
 def _selected_tactic(
-    op_name: str, dtype: str, epilogue: str, a, weight, a_scale, weight_scale, out
+    op_name: str,
+    dtype: str,
+    epilogue: str,
+    a,
+    weight,
+    a_scale,
+    weight_scale,
+    out,
+    rope=None,
 ):
     """Return the tactic ``choose_one`` selects for these tensors.
 
@@ -82,7 +148,7 @@ def _selected_tactic(
 
     tuner.choose_one = _choose_one
     try:
-        _call(dtype, epilogue, a, weight, a_scale, weight_scale, out)
+        _call(dtype, epilogue, a, weight, a_scale, weight_scale, out, rope)
     finally:
         tuner.choose_one = choose_one
     return recorded[-1] if recorded else -1
@@ -103,12 +169,32 @@ def _clear_cuda_error() -> None:
         torch.cuda.cudart().cudaGetLastError()
 
 
-def _runner_inputs(dtype: str, a, weight, out, a_scale, weight_scale):
+def _runner_inputs(dtype: str, a, weight, out, a_scale, weight_scale, rope=None):
     # Order matches PrimsTsGemmRunner.forward: a, weight, output, bias,
     # fp8 scales, q/k norm, cos_sin, positions, nvfp4 sfa/sfb, then the
     # unused fused outputs.
+    q_norm = k_norm = cos_sin = positions = None
+    if rope is not None:
+        q_norm, k_norm, cos_sin, positions, _num_heads = rope
     if dtype == "fp8":
-        return [a, weight, out, None, a_scale, weight_scale, *([None] * 10)]
+        return [
+            a,
+            weight,
+            out,
+            None,
+            a_scale,
+            weight_scale,
+            q_norm,
+            k_norm,
+            cos_sin,
+            positions,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ]
     return [
         a,
         weight,
@@ -116,10 +202,10 @@ def _runner_inputs(dtype: str, a, weight, out, a_scale, weight_scale):
         None,
         None,
         None,
-        None,
-        None,
-        None,
-        None,
+        q_norm,
+        k_norm,
+        cos_sin,
+        positions,
         a_scale,
         weight_scale,
         None,
@@ -161,7 +247,11 @@ def _print_tactic(median_ms, m: int, n: int, k: int, tactic, tuned: bool) -> Non
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("fp8", "fp4"), default="fp4")
-    parser.add_argument("--epilogue", choices=("linear", "swiglu"), default="linear")
+    parser.add_argument(
+        "--epilogue",
+        choices=("linear", "swiglu", "qkv_qknorm_rope"),
+        default="linear",
+    )
     parser.add_argument(
         "--m",
         type=int,
@@ -199,6 +289,12 @@ def main() -> None:
         raise ValueError("tuning buckets must be positive")
     if args.epilogue == "swiglu" and args.n % 2:
         raise ValueError("SwiGLU requires even N")
+    num_heads = None
+    if args.epilogue == "qkv_qknorm_rope":
+        group = 3 * _QKV_HEAD_DIM
+        if args.n % group:
+            raise ValueError(f"QKV N must be divisible by {group}, got {args.n}")
+        num_heads = args.n // group
     if args.dtype == "fp4" and args.k % 256:
         raise ValueError("NVFP4 requires K divisible by 256")
     if args.dtype == "fp8" and args.k % 128:
@@ -227,6 +323,11 @@ def main() -> None:
         )
         operand = "nvfp4_e2m1"
 
+    q_norm = k_norm = None
+    if num_heads is not None:
+        q_norm = torch.rand((_QKV_HEAD_DIM,), device="cuda", dtype=torch.bfloat16)
+        k_norm = torch.rand((_QKV_HEAD_DIM,), device="cuda", dtype=torch.bfloat16)
+
     def problem(m: int):
         out = torch.empty((m, logical_n), device="cuda", dtype=torch.bfloat16)
         if args.dtype == "fp8":
@@ -243,7 +344,10 @@ def main() -> None:
                 device="cuda",
                 dtype=torch.uint8,
             )
-        return a, a_scale, out
+        rope = None
+        if num_heads is not None:
+            rope = _rope(m, q_norm, k_norm, num_heads)
+        return a, a_scale, out, rope
 
     op_name = dense_gemm_op_name(operand, args.epilogue)
     bucket_desc = (
@@ -251,33 +355,36 @@ def main() -> None:
         if buckets is None
         else ",".join(str(bucket) for bucket in sorted(set(buckets))) + " (round up)"
     )
+    heads = "" if num_heads is None else f" heads={num_heads}"
     print(
         f"GPU={torch.cuda.get_device_name()} SM{major}{minor} "
         f"dtype={args.dtype} epilogue={args.epilogue} "
-        f"N={args.n} K={args.k} buckets={bucket_desc}",
+        f"N={args.n} K={args.k}{heads} buckets={bucket_desc}",
         flush=True,
     )
 
     tune_m = max(args.m)
-    a, a_scale, out = problem(tune_m)
+    a, a_scale, out, rope = problem(tune_m)
     with autotune(True, **context):
-        _call(args.dtype, args.epilogue, a, weight, a_scale, weight_scale, out)
+        _call(args.dtype, args.epilogue, a, weight, a_scale, weight_scale, out, rope)
 
     runner = None
     tactics = None
     if args.all_tactics:
         arch = major * 10 + minor
+        head_dim = _QKV_HEAD_DIM if num_heads is not None else None
+        is_neox = False if num_heads is not None else None
         runner = PrimsTsGemmRunner(
             op_name,
             GemmIdentity(
-                arch, operand, "bf16", args.epilogue, False, None, None, False
+                arch, operand, "bf16", args.epilogue, False, head_dim, is_neox, False
             ),
         )
         tactics = legal_tactics(arch, operand, "bf16", args.epilogue)
 
     with autotune(False, **context):
         for m in args.m:
-            a, a_scale, out = problem(m)
+            a, a_scale, out, rope = problem(m)
             selected = _selected_tactic(
                 op_name,
                 args.dtype,
@@ -287,13 +394,21 @@ def main() -> None:
                 a_scale,
                 weight_scale,
                 out,
+                rope,
             )
             bucket = _bucket_for(args.epilogue, m)
             if not args.all_tactics:
 
-                def run(a=a, a_scale=a_scale, out=out):
+                def run(a=a, a_scale=a_scale, out=out, rope=rope):
                     _call(
-                        args.dtype, args.epilogue, a, weight, a_scale, weight_scale, out
+                        args.dtype,
+                        args.epilogue,
+                        a,
+                        weight,
+                        a_scale,
+                        weight_scale,
+                        out,
+                        rope,
                     )
 
                 samples = bench_gpu_time(
@@ -313,7 +428,9 @@ def main() -> None:
 
             lookup = " lookup=fallback" if selected == -1 else ""
             print(f"M={m} bucket={bucket}{lookup}", flush=True)
-            inputs = _runner_inputs(args.dtype, a, weight, out, a_scale, weight_scale)
+            inputs = _runner_inputs(
+                args.dtype, a, weight, out, a_scale, weight_scale, rope
+            )
             timed = [
                 (
                     _time_tactic(

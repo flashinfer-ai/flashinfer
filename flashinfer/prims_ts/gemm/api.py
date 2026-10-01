@@ -40,6 +40,9 @@ _COMPILE_LOCK = threading.Lock()
 _SCALAR_CACHE: dict[tuple[str, int | None, float], torch.Tensor] = {}
 _SCALED_OUTPUT_FACTOR_CACHE: dict[tuple[str, int | None, int, float], torch.Tensor] = {}
 _MAX_ACTIVE_CLUSTERS: dict[tuple[str, int | None, int], int] = {}
+# Warmup copy of the unit scale returned during CUDA graph capture. Kernel
+# launches keep using _SCALAR_CACHE, so a caller cannot retarget those reads.
+_CAPTURE_UNIT_SCALE: dict[tuple[str, int | None], torch.Tensor] = {}
 
 _FP8 = torch.float8_e4m3fn
 _SUPPORTED_ARCHES = {100, 103, 107}
@@ -91,12 +94,36 @@ def _output_format(out_dtype: torch.dtype) -> str:
 
 
 def _scalar(device: torch.device, value: float) -> torch.Tensor:
+    """Return a cached kernel constant. Callers must not receive this tensor."""
     key = (device.type, device.index, float(value))
     result = _SCALAR_CACHE.get(key)
     if result is None:
         result = torch.tensor([value], device=device, dtype=torch.float32)
         _SCALAR_CACHE[key] = result
     return result
+
+
+def _caller_unit_scale(device: torch.device) -> torch.Tensor:
+    """Return a unit encode scale that does not alias a kernel constant.
+
+    Eager calls each get a new tensor. Graph capture cannot allocate, so it
+    returns a tensor created by an earlier eager call on the same device.
+    """
+    key = (device.type, device.index)
+    if torch.cuda.is_current_stream_capturing():
+        cached = _CAPTURE_UNIT_SCALE.get(key)
+        if cached is None:
+            raise RuntimeError(
+                "default output scale was first requested during CUDA graph "
+                "capture. Run one eager FP8 or NVFP4 call on this device "
+                "first, or pass output_quant_scale."
+            )
+        return cached
+    if key not in _CAPTURE_UNIT_SCALE:
+        _CAPTURE_UNIT_SCALE[key] = torch.tensor(
+            [1.0], device=device, dtype=torch.float32
+        )
+    return torch.tensor([1.0], device=device, dtype=torch.float32)
 
 
 def _scaled_output_factor(scale: torch.Tensor, factor: float) -> torch.Tensor:
@@ -160,8 +187,9 @@ def _output(
 
     allocated_scale = output_quant_scale is None
     if output_quant_scale is None:
-        # A unit encode scale is always correct and is graph-capture friendly.
-        # Applications may provide a calibrated scalar to improve precision.
+        # The kernel reads this cached constant. The public return path hands
+        # back a different tensor, so mutating the returned scale cannot
+        # change later launches.
         output_quant_scale = _scalar(device, 1.0)
     if output_quant_scale.device != device or output_quant_scale.dtype != torch.float32:
         raise ValueError(
@@ -201,7 +229,7 @@ def _load_kernel(config: PrimsTsGemmConfig) -> ModuleType:
         module.use_gated_activation = config.epilogue == "swiglu"
         module.use_fused_qknorm_rope = config.epilogue == "qkv_qknorm_rope"
         module.use_block_major_k = False
-        module.use_tma_store = False
+        module.use_tma_store = config.use_tma_store
         if config.tmem_overlap and (
             config.operand_format != "nvfp4_e2m1"
             or config.output_format != "bf16"
@@ -380,6 +408,7 @@ def _compile(
                 f"f4mk{config.nvfp4_mma_k}",
                 f"epiw{field(config.epilogue_warps)}",
                 f"overlap{int(config.tmem_overlap)}",
+                f"tma{int(config.use_tma_store)}",
                 f"abs{module.ab_stages}",
                 f"cluster{field(config.cluster_shape)}",
                 config.scheduler,
@@ -638,8 +667,10 @@ class PreparedFp4Linear:
         self._scale_gate_tensor = None
         if output_format == "nvfp4_e2m1":
             self._return_quant_scale = output_quant_scale is None
+            # A private tensor, not the process-wide scalar cache. Writing it
+            # changes only this projection.
             self.output_quant_scale = (
-                _scalar(device, 1.0)
+                torch.tensor([1.0], device=device, dtype=torch.float32)
                 if output_quant_scale is None
                 else output_quant_scale
             )
@@ -1053,7 +1084,9 @@ def _fp8(
             qkv_scale=qkv_scale,
             **identity,
         )
-    return (c, qscale) if allocated_scale else c
+    if allocated_scale:
+        return c, _caller_unit_scale(device)
+    return c
 
 
 def _fp4(
@@ -1169,6 +1202,8 @@ def _fp4(
         scale_gate=scale_gate,
         qkv_scale=qkv_scale,
     )
+    if allocated_scale:
+        qscale = _caller_unit_scale(device)
     if fmt == "nvfp4_e2m1":
         result = (c, sf_c, qscale) if allocated_scale else (c, sf_c)
         return result
@@ -1190,7 +1225,34 @@ def fp8_linear(
     output_quant_scale=None,
     out=None,
 ):
-    """FP8 [M,K] times [N,K] with per-token and per-channel FP32 scales."""
+    """FP8 ``[M, K]`` times ``[N, K]`` with per-token and per-channel scales.
+
+    Supported on SM100, SM103, and SM107. There is no global scale.
+
+    Args:
+        a: ``[M, K]`` ``torch.float8_e4m3fn`` activation. ``K`` must be a
+            multiple of 128.
+        weight: ``[N, K]`` ``torch.float8_e4m3fn`` weight.
+        a_scale: ``[M]`` float32 per-token scale.
+        weight_scale: ``[N]`` float32 per-channel scale.
+        bias: Optional ``[N]`` bfloat16 bias.
+        qkv_scale: Optional ``[3]`` float32 scale applied per Q, K, and V
+            group when ``N`` is split into three equal groups.
+        config: Optional :class:`PrimsTsGemmConfig` matching this call.
+            ``None`` selects the autotuned tactic.
+        out_dtype: ``torch.bfloat16`` or ``torch.float8_e4m3fn``. Defaults
+            to bfloat16.
+        output_quant_scale: Optional ``[1]`` float32 encode scale for FP8
+            output. A supplied tensor is read on every call. When omitted,
+            the kernel uses ``1`` and the returned scale is a separate
+            tensor; writing it does not change later calls.
+        out: Optional preallocated output. BF16 shape is ``[M, N]``. FP8
+            shape is ``[M, N]``.
+
+    Returns:
+        The output tensor. When ``out_dtype`` is FP8 and
+        ``output_quant_scale`` is omitted, returns ``(output, scale)``.
+    """
     return _fp8(
         a,
         weight,
@@ -1221,7 +1283,33 @@ def fp8_linear_swiglu(
     output_quant_scale=None,
     out=None,
 ):
-    """FP8 fused SwiGLU. Weight, scale, and bias rows are adjacent gate/activation pairs."""
+    """FP8 fused linear and SwiGLU with per-token and per-channel scales.
+
+    Weight, scale, and bias rows are adjacent gate and activation pairs.
+    The logical output width is ``N / 2``. Supported on SM100, SM103, and
+    SM107.
+
+    Args:
+        a: ``[M, K]`` ``torch.float8_e4m3fn`` activation. ``K`` must be a
+            multiple of 128.
+        weight: ``[N, K]`` ``torch.float8_e4m3fn`` weight. ``N`` must be even.
+        a_scale: ``[M]`` float32 per-token scale.
+        weight_scale: ``[N]`` float32 per-channel scale.
+        bias: Optional ``[N]`` bfloat16 bias.
+        config: Optional :class:`PrimsTsGemmConfig` matching this call.
+            ``None`` selects the autotuned tactic.
+        out_dtype: ``torch.bfloat16`` or ``torch.float8_e4m3fn``. Defaults
+            to bfloat16.
+        output_quant_scale: Optional ``[1]`` float32 encode scale for FP8
+            output. A supplied tensor is read on every call. When omitted,
+            the kernel uses ``1`` and the returned scale is a separate
+            tensor; writing it does not change later calls.
+        out: Optional preallocated output of shape ``[M, N / 2]``.
+
+    Returns:
+        The output tensor. When ``out_dtype`` is FP8 and
+        ``output_quant_scale`` is omitted, returns ``(output, scale)``.
+    """
     return _fp8(
         a,
         weight,
@@ -1259,6 +1347,47 @@ def fp8_qkv_qknorm_rope(
     output_quant_scale=None,
     out=None,
 ):
+    """FP8 QKV projection with QK RMSNorm and RoPE.
+
+    ``positions[i]`` selects the row of ``cos_sin`` used for token ``i``.
+    Values outside ``[0, M)`` use row 0. Supported on SM100, SM103, and
+    SM107. ``num_q_heads`` must equal ``num_kv_heads``, ``head_dim`` must
+    be 128, and ``is_neox`` must be false.
+
+    Args:
+        a: ``[M, K]`` ``torch.float8_e4m3fn`` activation. ``K`` must be a
+            multiple of 128.
+        qkv_weight: ``[N, K]`` ``torch.float8_e4m3fn`` weight packed as
+            three equal Q, K, and V groups. ``N`` is
+            ``3 * num_q_heads * head_dim``.
+        a_scale: ``[M]`` float32 per-token scale.
+        qkv_weight_scale: ``[N]`` float32 per-channel scale.
+        q_norm_weight: ``[head_dim]`` bfloat16 RMSNorm weight for Q.
+        k_norm_weight: ``[head_dim]`` bfloat16 RMSNorm weight for K.
+        cos_sin: ``[M, head_dim]`` float32 table. The first half of each
+            row is cosine and the second half is sine.
+        positions: ``[M]`` int64 indices into ``cos_sin``.
+        num_q_heads: Number of query heads. Must equal ``num_kv_heads``.
+        num_kv_heads: Number of key and value heads.
+        head_dim: Head size. Only 128 is supported.
+        is_neox: RoPE layout. Only false, the interleaved-pair layout, is
+            supported.
+        qkv_scale: Optional ``[3]`` float32 scale for the Q, K, and V
+            groups.
+        config: Optional :class:`PrimsTsGemmConfig` matching this call.
+            ``None`` selects the autotuned tactic.
+        out_dtype: ``torch.bfloat16`` or ``torch.float8_e4m3fn``. Defaults
+            to bfloat16.
+        output_quant_scale: Optional ``[1]`` float32 encode scale for FP8
+            output. A supplied tensor is read on every call. When omitted,
+            the kernel uses ``1`` and the returned scale is a separate
+            tensor; writing it does not change later calls.
+        out: Optional preallocated output of shape ``[M, N]``.
+
+    Returns:
+        The output tensor. When ``out_dtype`` is FP8 and
+        ``output_quant_scale`` is omitted, returns ``(output, scale)``.
+    """
     if num_q_heads != num_kv_heads:
         raise ValueError(
             "the copied QKV specialization requires num_q_heads == num_kv_heads"
@@ -1302,7 +1431,33 @@ def fp4_linear(
     output_quant_scale=None,
     out=None,
 ):
-    """Packed NVFP4 [M,K] times [N,K]. Block scales are contiguous 1D 128x4 E4M3 buffers."""
+    """Packed NVFP4 ``[M, K]`` times ``[N, K]``.
+
+    Block scales are contiguous 1D 128x4 FP8-E4M3 buffers. Global scales are
+    host floats. Supported on SM100, SM103, and SM107. Logical ``K`` must
+    be a multiple of 256.
+
+    Args:
+        a_packed: ``[M, K / 2]`` uint8 activation, two FP4 values per byte.
+        a_block_scale: 128x4 block scales for ``a_packed``.
+        a_global_scale: Host float multiplied into the activation scale.
+        weight_packed: ``[N, K / 2]`` uint8 weight.
+        weight_block_scale: 128x4 block scales for ``weight_packed``.
+        weight_global_scale: Host float multiplied into the weight scale.
+        bias: Optional ``[N]`` bfloat16 bias.
+        out_dtype: ``torch.bfloat16`` or ``torch.float8_e4m3fn``. Defaults
+            to bfloat16. NVFP4 output is only available from
+            :func:`fp4_linear_swiglu`.
+        output_quant_scale: Optional ``[1]`` float32 encode scale for FP8
+            output. A supplied tensor is read on every call. When omitted,
+            the kernel uses ``1`` and the returned scale is a separate
+            tensor; writing it does not change later calls.
+        out: Optional preallocated output of shape ``[M, N]``.
+
+    Returns:
+        The output tensor. When ``out_dtype`` is FP8 and
+        ``output_quant_scale`` is omitted, returns ``(output, scale)``.
+    """
     return _fp4(
         a_packed,
         a_block_scale,
@@ -1334,7 +1489,36 @@ def fp4_linear_swiglu(
     output_quant_scale=None,
     out=None,
 ):
-    """Packed NVFP4 fused SwiGLU. Block scales are contiguous 1D 128x4 E4M3 buffers."""
+    """Packed NVFP4 fused linear and SwiGLU.
+
+    Block scales are contiguous 1D 128x4 FP8-E4M3 buffers. Weight rows are
+    adjacent gate and activation pairs, and the logical output width is
+    ``N / 2``. Supported on SM100, SM103, and SM107.
+
+    Args:
+        a_packed: ``[M, K / 2]`` uint8 activation, two FP4 values per byte.
+        a_block_scale: 128x4 block scales for ``a_packed``.
+        a_global_scale: Host float multiplied into the activation scale.
+        weight_packed: ``[N, K / 2]`` uint8 weight. ``N`` must be even.
+        weight_block_scale: 128x4 block scales for ``weight_packed``.
+        weight_global_scale: Host float multiplied into the weight scale.
+        bias: Optional ``[N]`` bfloat16 bias.
+        out_dtype: ``torch.bfloat16``, ``torch.float8_e4m3fn``, or
+            ``torch.uint8`` for packed NVFP4 output. Defaults to bfloat16.
+            NVFP4 output requires logical ``N / 2`` to be a multiple of 16.
+        output_quant_scale: Optional ``[1]`` float32 encode scale for FP8
+            or NVFP4 output. A supplied tensor is read on every call. When
+            omitted, the kernel uses ``1`` and the returned scale is a
+            separate tensor; writing it does not change later calls.
+        out: Optional preallocated output. BF16 and FP8 shape is
+            ``[M, N / 2]``. Packed NVFP4 shape is ``[M, N / 4]``.
+
+    Returns:
+        The output tensor. FP8 output with no ``output_quant_scale``
+        returns ``(output, scale)``. NVFP4 output returns
+        ``(output, block_scale)``, or ``(output, block_scale, scale)``
+        when ``output_quant_scale`` is omitted.
+    """
     return _fp4(
         a_packed,
         a_block_scale,
@@ -1374,7 +1558,42 @@ def fp4_qkv_qknorm_rope(
     output_quant_scale=None,
     out=None,
 ):
-    """Packed NVFP4 QKV with RMSNorm and RoPE. Block scales are contiguous 1D 128x4 E4M3 buffers."""
+    """Packed NVFP4 QKV projection with QK RMSNorm and RoPE.
+
+    ``positions[i]`` selects the row of ``cos_sin`` used for token ``i``.
+    Values outside ``[0, M)`` use row 0. Supported on SM100, SM103, and
+    SM107. ``num_q_heads`` must equal ``num_kv_heads``, ``head_dim`` must
+    be 128, and ``is_neox`` must be false. Output is bfloat16.
+
+    Args:
+        a_packed: ``[M, K / 2]`` uint8 activation, two FP4 values per byte.
+        a_block_scale: 128x4 block scales for ``a_packed``.
+        a_global_scale: Host float multiplied into the activation scale.
+        qkv_weight_packed: ``[N, K / 2]`` uint8 weight packed as three
+            equal Q, K, and V groups. ``N`` is
+            ``3 * num_q_heads * head_dim``.
+        qkv_weight_block_scale: 128x4 block scales for ``qkv_weight_packed``.
+        qkv_weight_global_scale: Host float multiplied into the weight scale.
+        q_norm_weight: ``[head_dim]`` bfloat16 RMSNorm weight for Q.
+        k_norm_weight: ``[head_dim]`` bfloat16 RMSNorm weight for K.
+        cos_sin: ``[M, head_dim]`` float32 table. The first half of each
+            row is cosine and the second half is sine.
+        positions: ``[M]`` int64 indices into ``cos_sin``.
+        num_q_heads: Number of query heads. Must equal ``num_kv_heads``.
+        num_kv_heads: Number of key and value heads.
+        head_dim: Head size. Only 128 is supported.
+        is_neox: RoPE layout. Only false, the interleaved-pair layout, is
+            supported.
+        qkv_scale: Optional ``[3]`` float32 scale for the Q, K, and V
+            groups.
+        out_dtype: Output dtype. Only ``torch.bfloat16`` is supported.
+        output_quant_scale: Not used. Quantized output is not supported
+            for this epilogue.
+        out: Optional preallocated ``[M, N]`` bfloat16 output.
+
+    Returns:
+        The ``[M, N]`` bfloat16 output tensor.
+    """
     if num_q_heads != num_kv_heads:
         raise ValueError(
             "the copied QKV specialization requires num_q_heads == num_kv_heads"

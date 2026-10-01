@@ -1904,9 +1904,14 @@ class GmemDResource(MemoryResource):
         safe_row = row
         if row >= num_rows:
             safe_row = cutlass.Int32(0)
-        self.position_reg = (
-            self.positions.iterator.raw_ptr() + cutlass.Int64(safe_row)
-        ).load()
+        position = (self.positions.iterator.raw_ptr() + cutlass.Int64(safe_row)).load()
+        # cos_sin has one row per token. An index outside [0, M) would form
+        # an address past that table; row 0 is a defined result.
+        if position < cutlass.Int64(0):
+            position = cutlass.Int64(0)
+        if position >= cutlass.Int64(num_rows):
+            position = cutlass.Int64(0)
+        self.position_reg = position
 
     @cute.jit
     def _silu(self, x: cutlass.Float32) -> cutlass.Float32:

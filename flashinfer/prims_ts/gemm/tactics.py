@@ -7,7 +7,7 @@
 
 Each tactic is one compiled module. The profiled list is capped so a single
 M bucket does not compile the full product of cluster, tile, stages, CLC,
-and epilogue warps.
+epilogue warps, and TMA store.
 """
 
 from __future__ import annotations
@@ -23,10 +23,11 @@ _FUSED_QKNORM_AB_STAGES = 4
 _NVFP4_AB_STAGES = 5
 _STAGE_CHOICES = (5, 6)
 _CLUSTERS = ((2, 2), (4, 4))
-MAX_PROFILED_TACTICS = 32
+MAX_PROFILED_TACTICS = 1024
 
-# cluster_m, cluster_n, tile_n, tile_k, tmem_overlap, ab_stages, mma_k, use_clc, epilogue_warps
-Tactic = tuple[int, int, int, int, bool, int, int, bool, int]
+# cluster_m, cluster_n, tile_n, tile_k, tmem_overlap, ab_stages, mma_k,
+# use_clc, epilogue_warps, use_tma_store
+Tactic = tuple[int, int, int, int, bool, int, int, bool, int, bool]
 
 
 def derived_ab_stages(
@@ -100,6 +101,7 @@ def default_tactic(
         mma_k,
         True,
         _derived_warps(epilogue, overlap),
+        False,
     )
 
 
@@ -110,14 +112,31 @@ def tactic_is_legal(
     epilogue: str,
     tactic: Tactic,
 ) -> bool:
-    cluster_m, cluster_n, tile_n, tile_k, overlap, stages, mma_k, use_clc, warps = (
-        tactic
-    )
+    (
+        cluster_m,
+        cluster_n,
+        tile_n,
+        tile_k,
+        overlap,
+        stages,
+        mma_k,
+        use_clc,
+        warps,
+        use_tma_store,
+    ) = tactic
     if cluster_m not in (2, 4) or cluster_n not in (1, 2, 4):
         return False
-    if not isinstance(use_clc, bool) or not isinstance(overlap, bool):
+    if (
+        not isinstance(use_clc, bool)
+        or not isinstance(overlap, bool)
+        or not isinstance(use_tma_store, bool)
+    ):
         return False
-    if warps not in (4, 8) or stages not in _STAGE_CHOICES or mma_k not in (64, 96):
+    # FP4 output stores are packed and direct. TMEM overlap cannot share the
+    # accumulator with a TMA output buffer.
+    if use_tma_store and (output_format == "nvfp4_e2m1" or overlap):
+        return False
+    if warps not in (4, 8) or mma_k not in (64, 96):
         return False
     if epilogue != "linear" and warps != 8:
         return False
@@ -144,6 +163,8 @@ def tactic_is_legal(
         and warps == 8
     ):
         return False
+    # QKV's derived depth is 4, which is outside _STAGE_CHOICES. The candidate
+    # list is the limit; an earlier membership test would drop that epilogue.
     derived = derived_ab_stages(operand_format, epilogue, mma_k, tile_n, tile_k)
     return stages in stage_candidates(derived)
 
@@ -165,13 +186,22 @@ def _tile_ks(operand_format: str, mma_k: int) -> tuple[int, ...]:
 
 
 def _warps() -> tuple[int, ...]:
-    return (8,)
+    return (4, 8)
 
 
 def _replace(tactic: Tactic, **updates: object) -> Tactic:
-    cluster_m, cluster_n, tile_n, tile_k, overlap, stages, mma_k, use_clc, warps = (
-        tactic
-    )
+    (
+        cluster_m,
+        cluster_n,
+        tile_n,
+        tile_k,
+        overlap,
+        stages,
+        mma_k,
+        use_clc,
+        warps,
+        use_tma_store,
+    ) = tactic
     values = {
         "cluster_m": cluster_m,
         "cluster_n": cluster_n,
@@ -182,6 +212,7 @@ def _replace(tactic: Tactic, **updates: object) -> Tactic:
         "mma_k": mma_k,
         "use_clc": use_clc,
         "warps": warps,
+        "use_tma_store": use_tma_store,
     }
     values.update(updates)
     return (
@@ -194,6 +225,7 @@ def _replace(tactic: Tactic, **updates: object) -> Tactic:
         int(values["mma_k"]),
         bool(values["use_clc"]),
         int(values["warps"]),
+        bool(values["use_tma_store"]),
     )
 
 
@@ -202,9 +234,18 @@ def _with_derived_stages(
     epilogue: str,
     tactic: Tactic,
 ) -> Tactic:
-    cluster_m, cluster_n, tile_n, tile_k, overlap, _stages, mma_k, use_clc, warps = (
-        tactic
-    )
+    (
+        cluster_m,
+        cluster_n,
+        tile_n,
+        tile_k,
+        overlap,
+        _stages,
+        mma_k,
+        use_clc,
+        warps,
+        use_tma_store,
+    ) = tactic
     stages = derived_ab_stages(operand_format, epilogue, mma_k, tile_n, tile_k)
     return (
         cluster_m,
@@ -216,6 +257,7 @@ def _with_derived_stages(
         mma_k,
         use_clc,
         warps,
+        use_tma_store,
     )
 
 
@@ -257,7 +299,10 @@ def _neighbors(
         if warps != base[8]:
             yield _replace(base, warps=warps, overlap=False)
     if epilogue == "linear":
-        yield _replace(base, overlap=True, warps=8, tile_n=256, tile_k=base[3])
+        yield _replace(
+            base, overlap=True, warps=8, tile_n=256, tile_k=base[3], use_tma_store=False
+        )
+    yield _replace(base, use_tma_store=not base[9], overlap=False)
 
 
 def _product(
@@ -277,17 +322,19 @@ def _product(
                         for use_clc in (True,):
                             for warps in _warps():
                                 for overlap in (False, True):
-                                    yield (
-                                        cluster_m,
-                                        cluster_n,
-                                        tile_n,
-                                        tile_k,
-                                        overlap,
-                                        stages,
-                                        mma_k,
-                                        use_clc,
-                                        warps,
-                                    )
+                                    for use_tma_store in (False, True):
+                                        yield (
+                                            cluster_m,
+                                            cluster_n,
+                                            tile_n,
+                                            tile_k,
+                                            overlap,
+                                            stages,
+                                            mma_k,
+                                            use_clc,
+                                            warps,
+                                            use_tma_store,
+                                        )
 
 
 def legal_tactics(
@@ -330,9 +377,18 @@ def config_from_tactic(
     tactic: Tactic,
 ) -> PrimsTsGemmConfig:
     """Build a config. Default warp and stage counts stay ``None``."""
-    cluster_m, cluster_n, tile_n, tile_k, overlap, stages, mma_k, use_clc, warps = (
-        tactic
-    )
+    (
+        cluster_m,
+        cluster_n,
+        tile_n,
+        tile_k,
+        overlap,
+        stages,
+        mma_k,
+        use_clc,
+        warps,
+        use_tma_store,
+    ) = tactic
     derived_stages = derived_ab_stages(operand_format, epilogue, mma_k, tile_n, tile_k)
     derived_warps = _derived_warps(epilogue, overlap)
     return PrimsTsGemmConfig(
@@ -352,6 +408,7 @@ def config_from_tactic(
         epilogue_warps=None if warps == derived_warps else warps,
         tmem_overlap=overlap,
         ab_stages=None if stages == derived_stages else stages,
+        use_tma_store=use_tma_store,
     )
 
 
