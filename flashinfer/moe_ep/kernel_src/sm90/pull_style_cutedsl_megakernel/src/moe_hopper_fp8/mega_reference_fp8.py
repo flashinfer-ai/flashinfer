@@ -75,8 +75,15 @@ def compute_megamoe_reference_fp8(
     fc1_weight_block_scale: Optional[torch.Tensor] = None,
     fc2_activation_block_scale: Optional[torch.Tensor] = None,
     fc2_weight_block_scale: Optional[torch.Tensor] = None,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    return_fc1_gateup: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
     """Return ``(num_ranks, num_tokens_per_rank, num_topk, hidden)`` combine reference.
+
+    ``return_fc1_gateup=True`` (the ``generate_c`` reference) appends a dict
+    ``{global_expert: (R, intermediate_gateup) bf16}`` of the dequantized
+    pre-SwiGLU fc1 gate+up activations in the kernel's interleaved column
+    order to the returned tuple (last element).  Only experts that received
+    at least one token are present.
 
     ``ref_compute_graph='deepgemm'`` follows ``fp8_accum_mode``: 1xacc uses
     full-K fast accumulation, while 2xacc promotes once per ``mma_tiler_k``.
@@ -157,6 +164,7 @@ def compute_megamoe_reference_fp8(
             gate_up_clamp=gate_up_clamp,
             ref_compute_graph=ref_compute_graph,
             return_fc2_activation_block_scale=return_fc2_activation_dequant_scale,
+            return_fc1_gateup=return_fc1_gateup,
         )
 
     return _compute_megamoe_reference_fp8_per_tensor(
@@ -176,6 +184,7 @@ def compute_megamoe_reference_fp8(
         fc2_output_dtype=fc2_output_dtype,
         gate_up_clamp=gate_up_clamp,
         return_fc2_activation_dequant_scale=return_fc2_activation_dequant_scale,
+        return_fc1_gateup=return_fc1_gateup,
     )
 
 
@@ -197,7 +206,8 @@ def _compute_megamoe_reference_fp8_per_tensor(
     fc2_output_dtype: torch.dtype,
     gate_up_clamp: Optional[float],
     return_fc2_activation_dequant_scale: bool,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    return_fc1_gateup: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
     """FP8 per-tensor reference path."""
     num_ranks, num_tokens_per_rank, num_topk = input_topk_idx.shape
     num_experts_per_rank = fc1_weight.shape[1]
@@ -234,6 +244,7 @@ def _compute_megamoe_reference_fp8_per_tensor(
         * fc1_activation_dequant_scale[0]
     ).reshape(num_ranks, num_tokens_per_rank, hidden)
 
+    fc1_gateup_per_expert = {} if return_fc1_gateup else None
     combine_ref = torch.zeros(
         (num_ranks, num_tokens_per_rank, num_topk, hidden),
         dtype=fc2_output_dtype,
@@ -280,6 +291,8 @@ def _compute_megamoe_reference_fp8_per_tensor(
                     )
                     fc1_output_fp32 = gathered_act @ fc1_weight_fp32
 
+                if return_fc1_gateup:
+                    fc1_gateup_per_expert[global_expert] = fc1_output_fp32.to(torch.bfloat16)
                 _M, _N = fc1_output_fp32.shape
                 _n_pairs = _N // (2 * Fp8GateUpInterleave)
                 _reshaped = fc1_output_fp32.view(
@@ -353,6 +366,8 @@ def _compute_megamoe_reference_fp8_per_tensor(
 
             # SwiGLU fold: gate/up interleaved at Fp8GateUpInterleave (=8)
             # granularity, matching the kernel's PostSwigluHalf interleave.
+            if return_fc1_gateup:
+                fc1_gateup_per_expert[global_expert] = fc1_output_fp32.to(torch.bfloat16)
             _M, _N = fc1_output_fp32.shape
             _n_pairs = _N // (2 * Fp8GateUpInterleave)
             _reshaped = fc1_output_fp32.view(
@@ -403,6 +418,10 @@ def _compute_megamoe_reference_fp8_per_tensor(
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
 
+    if return_fc1_gateup:
+        if return_fc2_activation_dequant_scale:
+            return combine_ref, fc2_activation_dequant_scale, fc1_gateup_per_expert
+        return combine_ref, fc1_gateup_per_expert
     if return_fc2_activation_dequant_scale:
         return combine_ref, fc2_activation_dequant_scale
     return combine_ref
@@ -439,7 +458,8 @@ def _compute_megamoe_reference_fp8_blockwise(
     gate_up_clamp: Optional[float],
     ref_compute_graph: Literal["transformers", "deepgemm"],
     return_fc2_activation_block_scale: bool,
-) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    return_fc1_gateup: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
     """DeepGEMM-style block-scale reference.
 
     The FC2 activation block scale is naturally aligned with routed
@@ -525,6 +545,7 @@ def _compute_megamoe_reference_fp8_blockwise(
         )
         fc2_activation_scale_is_provided = False
 
+    fc1_gateup_per_expert = {} if return_fc1_gateup else None
     combine_ref = torch.zeros(
         (num_ranks, num_tokens_per_rank, num_topk, hidden),
         dtype=fc2_output_dtype,
@@ -560,6 +581,8 @@ def _compute_megamoe_reference_fp8_blockwise(
                 b_scale_block_k=Fp8WeightScaleBlockK,
             )
 
+            if return_fc1_gateup:
+                fc1_gateup_per_expert[global_expert] = fc1_output_fp32.to(torch.bfloat16)
             _M, _N = fc1_output_fp32.shape
             _n_pairs = _N // (2 * Fp8GateUpInterleave)
             _reshaped = fc1_output_fp32.view(
@@ -618,6 +641,10 @@ def _compute_megamoe_reference_fp8_blockwise(
     finally:
         torch.backends.cuda.matmul.allow_tf32 = old_allow_tf32
 
+    if return_fc1_gateup:
+        if return_fc2_activation_block_scale:
+            return combine_ref, fc2_activation_block_scale_ref, fc1_gateup_per_expert
+        return combine_ref, fc1_gateup_per_expert
     if return_fc2_activation_block_scale:
         return combine_ref, fc2_activation_block_scale_ref
     return combine_ref

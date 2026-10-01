@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import importlib
+import re
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -184,7 +185,7 @@ def test_cake_targets_share_sources_but_have_distinct_build_identities():
     sm100_variants = cake_jit.get_cake_fused_kda_decode_variants()
     sm103_variants = cake_jit.get_cake_fused_kda_decode_variants("sm103a")
     assert sm100_variants == cake_jit.get_cake_fused_kda_decode_variants("sm100a")
-    assert len(sm100_variants) == len(sm103_variants) == 46
+    assert len(sm100_variants) == len(sm103_variants) == 52
     for sm100, sm103 in zip(sm100_variants, sm103_variants, strict=True):
         assert replace(sm100, target="sm103a") == sm103
         assert cake_jit.get_cake_fused_kda_decode_variant(sm103.name, "sm103a") == sm103
@@ -296,6 +297,354 @@ def test_new_positive_routes_preserve_wide_offsets_and_runtime_config(target):
     assert variant.name == "high_work_positive_f32"
 
 
+def _select_h8_route(
+    target,
+    rows,
+    *,
+    state_dtype="float32",
+    state_indices_mode="positive_unique",
+    lower_bound=-5.0,
+    norm_eps=1e-5,
+    wide=False,
+):
+    heads = 8
+    hidden = heads * 128
+    element_bytes = 2 if state_dtype == "bfloat16" else 4
+    conv_stride = 9 * hidden + heads * 128 * 128 * element_bytes // 2
+    state_stride = 9 * hidden * 2 // element_bytes + heads * 128 * 128
+    slots = (2**31 // state_stride + 2) if wide else rows + 1
+    return cake_jit.select_cake_fused_kda_decode_variant(
+        target=target,
+        num_heads=heads,
+        num_rows=rows,
+        num_slots=slots,
+        state_dtype=state_dtype,
+        state_indices_mode=state_indices_mode,
+        lower_bound=lower_bound,
+        norm_eps=norm_eps,
+        x_row_stride=3 * hidden + 17,
+        conv_slot_stride=conv_stride,
+        beta_row_stride=heads + 1,
+        state_slot_stride=state_stride,
+        output_gate_row_stride=hidden + 7,
+    )
+
+
+# H=8 route bands mirror the Cake launcher (B200_SM_COUNT = 148): one wide512
+# wave ends at rows 18, the staged compact band spans 38..55 for nullable FP32
+# and 19..63 for BF16, high-work starts at rows 148 for nullable slots, and the
+# measured positive-FP32 schedule runs the two-CTA cluster split while one
+# B200 wave holds every CTA pair (<= 9), the 128-register wide512 instance
+# while one CTA per SM still covers the grid (10..18), and then alternates
+# wide512 (19..37, 56..76) with high-work (38..55, >= 77).
+_H8_ROUTES = (
+    ("float32", "positive_unique", 1, "cluster2_wide_positive_f32"),
+    ("float32", "positive_unique", 9, "cluster2_wide_positive_f32"),
+    ("float32", "positive_unique", 10, "wide512_regcap128_positive_f32"),
+    ("float32", "positive_unique", 18, "wide512_regcap128_positive_f32"),
+    ("float32", "positive_unique", 19, "wide512_positive_f32"),
+    ("float32", "positive_unique", 37, "wide512_positive_f32"),
+    ("float32", "positive_unique", 38, "high_work_positive_f32"),
+    ("float32", "positive_unique", 55, "high_work_positive_f32"),
+    ("float32", "positive_unique", 56, "wide512_positive_f32"),
+    ("float32", "positive_unique", 63, "wide512_positive_f32"),
+    ("float32", "positive_unique", 64, "wide512_positive_f32"),
+    ("float32", "positive_unique", 76, "wide512_positive_f32"),
+    ("float32", "positive_unique", 77, "high_work_positive_f32"),
+    ("float32", "positive_unique", 148, "high_work_positive_f32"),
+    ("float32", "positive_unique", 4096, "high_work_positive_f32"),
+    ("float32", "unique_or_null", 1, "wide512_f32"),
+    ("float32", "unique_or_null", 18, "wide512_f32"),
+    ("float32", "unique_or_null", 19, "direct_f32"),
+    ("float32", "unique_or_null", 37, "direct_f32"),
+    ("float32", "unique_or_null", 38, "compact_async_f32"),
+    ("float32", "unique_or_null", 55, "compact_async_f32"),
+    ("float32", "unique_or_null", 56, "direct_f32"),
+    ("float32", "unique_or_null", 63, "direct_f32"),
+    ("float32", "unique_or_null", 64, "direct_f32"),
+    ("float32", "unique_or_null", 76, "direct_f32"),
+    ("float32", "unique_or_null", 77, "direct_f32"),
+    ("float32", "unique_or_null", 147, "direct_f32"),
+    ("float32", "unique_or_null", 148, "high_work_f32"),
+    ("float32", "unique_or_null", 4096, "high_work_f32"),
+    ("float32", "repeated_positive", 1, "repeated_safe_f32"),
+    ("float32", "repeated_positive", 64, "repeated_safe_f32"),
+    ("float32", "repeated_positive", 4096, "repeated_safe_f32"),
+    ("bfloat16", "positive_unique", 1, "wide512_bf16"),
+    ("bfloat16", "positive_unique", 18, "wide512_bf16"),
+    ("bfloat16", "positive_unique", 19, "compact_async_bf16"),
+    ("bfloat16", "positive_unique", 37, "compact_async_bf16"),
+    ("bfloat16", "positive_unique", 38, "compact_async_bf16"),
+    ("bfloat16", "positive_unique", 55, "compact_async_bf16"),
+    ("bfloat16", "positive_unique", 56, "compact_async_bf16"),
+    ("bfloat16", "positive_unique", 63, "compact_async_bf16"),
+    ("bfloat16", "positive_unique", 64, "stream_bf16"),
+    ("bfloat16", "positive_unique", 65, "stream_bf16"),
+    ("bfloat16", "positive_unique", 147, "stream_bf16"),
+    ("bfloat16", "positive_unique", 148, "stream_bf16"),
+    ("bfloat16", "positive_unique", 4096, "stream_bf16"),
+    ("bfloat16", "unique_or_null", 1, "wide512_bf16"),
+    ("bfloat16", "unique_or_null", 18, "wide512_bf16"),
+    ("bfloat16", "unique_or_null", 19, "compact_async_bf16"),
+    ("bfloat16", "unique_or_null", 63, "compact_async_bf16"),
+    ("bfloat16", "unique_or_null", 64, "direct_bf16"),
+    ("bfloat16", "unique_or_null", 147, "direct_bf16"),
+    ("bfloat16", "unique_or_null", 148, "high_work_bf16"),
+    ("bfloat16", "unique_or_null", 4096, "high_work_bf16"),
+    ("bfloat16", "repeated_positive", 1, "repeated_safe_bf16"),
+    ("bfloat16", "repeated_positive", 64, "repeated_safe_bf16"),
+    ("bfloat16", "repeated_positive", 4096, "repeated_safe_bf16"),
+)
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    ("state_dtype", "state_indices_mode", "rows", "expected"),
+    [pytest.param(*case, id=f"{case[0]}-{case[1]}-n{case[2]}") for case in _H8_ROUTES],
+)
+def test_h8_routes_follow_cake_bands(
+    target, state_dtype, state_indices_mode, rows, expected
+):
+    variant = _select_h8_route(
+        target, rows, state_dtype=state_dtype, state_indices_mode=state_indices_mode
+    )
+    assert variant is not None
+    assert variant.name == expected
+    assert variant.target == target
+    assert variant.state_dtype == state_dtype
+    assert variant.slot_offset_bits == 32
+    assert any(
+        8 in rule.heads and state_indices_mode in rule.state_indices_modes
+        for rule in variant.eligibility
+    )
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_h8_routes_preserve_wide_offsets_and_runtime_config(target):
+    for state_dtype, state_indices_mode, rows, expected in _H8_ROUTES:
+        variant = _select_h8_route(
+            target,
+            rows,
+            state_dtype=state_dtype,
+            state_indices_mode=state_indices_mode,
+            wide=True,
+        )
+        assert variant is not None
+        assert variant.name == f"{expected}_wide_slot_offsets"
+        assert variant.slot_offset_bits == 64
+    # H=8 has no constant-folded evaluator layouts: the softplus gate and an
+    # arbitrary epsilon keep the same physical routes.
+    for rows, expected in (
+        (37, "wide512_positive_f32"),
+        (100, "high_work_positive_f32"),
+    ):
+        variant = _select_h8_route(target, rows, lower_bound=None, norm_eps=3e-4)
+        assert variant.name == expected
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+def test_h8_never_selects_other_heads_specialisations(target):
+    excluded = {
+        "compact_async_positive_f32",
+        "direct_positive_f32",
+        "wide512_vector4_positive_f32",
+        "pr_eval_h32_f32",
+        "compact_async_pr_eval_h96_f32",
+        "high_work_positive_h96_f32",
+        "high_work_positive_h96_pr_strides_f32",
+    }
+    for variant in cake_jit.get_cake_fused_kda_decode_variants(target):
+        if variant.name.removesuffix("_wide_slot_offsets") in excluded or (
+            "pr_eval" in variant.name
+        ):
+            assert all(8 not in rule.heads for rule in variant.eligibility), (
+                variant.name
+            )
+
+
+def test_unsupported_head_counts_are_rejected():
+    for heads in (1, 4, 16, 64, 128):
+        with pytest.raises(ValueError, match="head count"):
+            cake_jit.select_cake_fused_kda_decode_variant(
+                target="sm100a",
+                num_heads=heads,
+                num_rows=4,
+                num_slots=5,
+                state_dtype="float32",
+                state_indices_mode="positive_unique",
+                lower_bound=-5.0,
+                norm_eps=1e-5,
+                x_row_stride=3 * heads * 128,
+                conv_slot_stride=9 * heads * 128,
+                beta_row_stride=heads,
+                state_slot_stride=heads * 128 * 128,
+                output_gate_row_stride=heads * 128,
+            )
+
+
+def test_registered_sources_match_their_launch_contract():
+    # Every checked-in Cake source is a checksum-attested artifact; make sure
+    # the registry's launch record and ABI kind describe the frozen kernel.
+    for variant in cake_jit.get_cake_fused_kda_decode_variants():
+        text = variant.body_path.read_text(encoding="utf-8")
+        # Exporter revisions differ in how many nested linkage blocks wrap the
+        # kernel; every opened block must be closed.
+        assert text.count('extern "C" {') >= 1, variant.name
+        assert text.count('extern "C" {') == text.count('} // extern "C"'), variant.name
+        launch_bounds = re.findall(r"__launch_bounds__\(([^)]*)\)", text)
+        assert len(launch_bounds) == 1, variant.name
+        assert int(launch_bounds[0].split(",")[0]) == variant.threads, variant.name
+        assert re.findall(r"#define SMEM_TOTAL (\d+)", text) == [
+            str(variant.dynamic_smem_bytes)
+        ], variant.name
+        assert re.findall(r"#define THREADS (\d+)", text) == [str(variant.threads)], (
+            variant.name
+        )
+        signature = re.search(
+            r"__global__[^\n]*\n" + re.escape(variant.kernel_symbol) + r"\(([^)]*)\)",
+            text,
+        )
+        assert signature is not None, variant.name
+        parameters = [item.split() for item in signature.group(1).split(",")]
+        expected = cake_jit.CAKE_FUSED_KDA_DECODE_ABIS[variant.abi_kind]
+        assert [item[-1] for item in parameters] == [name for _, name, _ in expected]
+        state_type = "__nv_bfloat16*" if variant.state_dtype == "bfloat16" else "float*"
+        assert parameters[8][0] == state_type, variant.name
+        declaration = cake_jit._kernel_declaration(variant)
+        assert declaration.startswith(
+            f'extern "C" __global__ void {variant.kernel_symbol}('
+        )
+        declared = [
+            item.strip().rstrip(");").split()[-1]
+            for item in declaration.split("(", 1)[1].split(",")
+        ]
+        assert declared == [name for _, name, _ in expected], variant.name
+        has_rows = int(("parameter", "rows", "int32") in expected)
+        binding = cake_jit._render_binding(variant)
+        assert (
+            f"#define FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS {has_rows}" in binding
+        )
+        assert (
+            "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID "
+            f"{int(variant.abi_kind == 'persistent_rows')}"
+        ) in binding
+        assert (
+            f"#define FLASHINFER_CAKE_FUSED_KDA_DECODE_THREADS {variant.threads}"
+            in binding
+        )
+        assert (
+            "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_SMEM_BYTES "
+            f"{variant.dynamic_smem_bytes}"
+        ) in binding
+        assert (
+            f"#define FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X {variant.cluster_x}"
+            in binding
+        )
+        # A clustered source declares its compile-time geometry; every other
+        # frozen kernel is a plain single-CTA launch.
+        cluster_dims = re.findall(r"__cluster_dims__\((\d+),\s*(\d+),\s*(\d+)\)", text)
+        if variant.cluster_x == 1:
+            assert cluster_dims == [], variant.name
+        else:
+            assert cluster_dims == [(str(variant.cluster_x), "1", "1")], variant.name
+            assert variant.abi_kind == "standard", variant.name
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    "name",
+    ("cluster2_wide_positive_f32", "cluster2_wide_positive_f32_wide_slot_offsets"),
+)
+def test_cluster_variants_render_the_cluster_launch_binding(target, name):
+    variant = cake_jit.get_cake_fused_kda_decode_variant(name, target)
+    assert variant.cluster_x == 2
+    assert variant.threads == 512
+    assert variant.state_dtype == "float32"
+    assert variant.abi_kind == "standard"
+    binding = cake_jit._render_binding(variant)
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_CLUSTER_X 2" in binding
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS 0" in binding
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID 0" in binding
+    # The cluster geometry is part of the build identity: the same source with
+    # a different launch shape must not share a JIT URI.
+    payload = cake_jit._variant_build_identity_payload(variant)
+    assert payload["cluster_x"] == 2
+    rule = variant.eligibility[0]
+    assert rule.heads == (8,)
+    assert rule.minimum_rows == 1
+    assert rule.maximum_rows == cake_jit._H8_CLUSTER2_MAX_ROWS
+    assert rule.state_indices_modes == ("positive_unique",)
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize(
+    "name",
+    (
+        "wide512_regcap128_positive_f32",
+        "wide512_regcap128_positive_f32_wide_slot_offsets",
+    ),
+)
+def test_regcap128_variants_cover_the_one_cta_per_sm_band(target, name):
+    variant = cake_jit.get_cake_fused_kda_decode_variant(name, target)
+    assert variant.cluster_x == 1
+    assert variant.threads == 512
+    assert variant.state_dtype == "float32"
+    assert variant.abi_kind == "standard"
+    rule = variant.eligibility[0]
+    assert rule.heads == (8,)
+    assert rule.minimum_rows == cake_jit._H8_CLUSTER2_MAX_ROWS + 1
+    assert rule.maximum_rows == cake_jit._H8_WIDE512_REGCAP128_MAX_ROWS
+    assert rule.state_indices_modes == ("positive_unique",)
+    # The instance differs from wide512_positive_f32 only by its launch bounds.
+    text = variant.body_path.read_text(encoding="utf-8")
+    assert "__launch_bounds__(512, 1)" in text
+    sibling = cake_jit.get_cake_fused_kda_decode_variant(
+        name.replace("wide512_regcap128_positive_f32", "wide512_positive_f32"), target
+    )
+    assert "__launch_bounds__(512, 2)" in sibling.body_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("target", ("sm100a", "sm103a"))
+@pytest.mark.parametrize("name", ("stream_bf16", "stream_bf16_wide_slot_offsets"))
+def test_persistent_stream_variants_render_the_persistent_grid_binding(target, name):
+    variant = cake_jit.get_cake_fused_kda_decode_variant(name, target)
+    assert variant.abi_kind == "persistent_rows"
+    assert variant.state_dtype == "bfloat16"
+    assert variant.threads == 256
+    assert variant.dynamic_smem_bytes == 70272
+    assert variant.extra_cuda_cflags == ("--use_fast_math",)
+    assert variant.slot_offset_bits == (
+        64 if name.endswith("_wide_slot_offsets") else 32
+    )
+    assert variant.kernel_symbol == f"kernel_cake_fused_kda_decode_{name}"
+    assert [
+        (rule.heads, rule.minimum_rows, rule.maximum_rows, rule.state_indices_modes)
+        for rule in variant.eligibility
+    ] == [((8,), 64, None, ("positive_unique",))]
+    declaration = cake_jit._kernel_declaration(variant)
+    assert "int H,\n    int rows,\n    int use_lower_bound" in declaration
+    binding = cake_jit._render_binding(variant)
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_HAS_ROWS 1" in binding
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID 1" in binding
+    assert "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_STATE_IS_BFLOAT16 1" in binding
+    # Every other ABI kind keeps the per-(head, row) or per-row launch.
+    for other in cake_jit.get_cake_fused_kda_decode_variants(target):
+        if other.abi_kind != "persistent_rows":
+            assert (
+                "#define FLASHINFER_CAKE_FUSED_KDA_DECODE_PERSISTENT_GRID 0"
+                in cake_jit._render_binding(other)
+            )
+
+
+def test_persistent_rows_abi_extends_the_standard_argument_plan():
+    standard = cake_jit.CAKE_FUSED_KDA_DECODE_ABIS["standard"]
+    persistent = cake_jit.CAKE_FUSED_KDA_DECODE_ABIS["persistent_rows"]
+    assert persistent == cake_jit.CAKE_FUSED_KDA_DECODE_ABIS["repeated_safe"]
+    assert persistent[:18] == standard[:18]
+    assert persistent[18] == ("parameter", "rows", "int32")
+    assert persistent[19:] == standard[18:]
+
+
 @pytest.mark.parametrize(("target", "minor"), (("sm100a", 0), ("sm103a", 3)))
 @pytest.mark.parametrize(
     ("name", "min_blocks"),
@@ -303,6 +652,8 @@ def test_new_positive_routes_preserve_wide_offsets_and_runtime_config(target):
         ("wide512_f32_wide_slot_offsets", False),
         ("compact_async_f32_wide_slot_offsets", True),
         ("compact_async_pr_eval_h96_f32_wide_slot_offsets", True),
+        ("stream_bf16", False),
+        ("stream_bf16_wide_slot_offsets", False),
     ),
 )
 def test_cake_jit_spec_uses_exact_target_flags(
@@ -425,7 +776,7 @@ def _patch_validated_run(monkeypatch, cake_variant):
     monkeypatch.setattr(
         fused,
         "_get_compiled_kernel",
-        lambda *args: lambda *kernel_args: fallback_calls.append(kernel_args),
+        lambda *args, **kwargs: lambda *kernel_args: fallback_calls.append(kernel_args),
     )
     return cake_calls, fallback_calls
 

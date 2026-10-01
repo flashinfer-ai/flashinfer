@@ -20,7 +20,9 @@ from flashinfer.fused_moe.api import (
     TrtllmFp4Config,
 )
 from flashinfer.fused_moe.layer import MoELayer
+from flashinfer.fused_moe.prepare import _resolve_cute_dsl_intermediate_scales
 from flashinfer.fused_moe.runners import _fold_trtllm_nvfp4_activation_scale
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 
 from .utils import check_accuracy
 
@@ -229,3 +231,72 @@ def test_activation_global_scale_is_reshaped_before_folding():
     output1, output1_gate = _fold_trtllm_nvfp4_activation_scale(act, view)
     torch.testing.assert_close(output1, torch.full((3,), 0.5))
     torch.testing.assert_close(output1_gate, torch.full((3,), 0.5))
+
+
+@pytest.mark.parametrize(
+    "calibrated,recipe,expected_calibrated,expected_input",
+    [
+        (None, None, 1.0, 1.0),
+        (torch.tensor([[2.0]]), None, 2.0, 2.0),
+        (None, NVFP44Over6Config(e4m3_max=256), 1.0, 1.0 / (6 * 256)),
+        (None, NVFP44Over6Config(e4m3_max=448), 1.0, 1.0 / (6 * 448)),
+    ],
+)
+def test_cute_dsl_intermediate_scale_preserves_calibration_and_recipe(
+    calibrated, recipe, expected_calibrated, expected_input
+):
+    weights = torch.empty(1, dtype=torch.bfloat16)
+    dequant_scale, input_scale = _resolve_cute_dsl_intermediate_scales(
+        weights, calibrated, recipe
+    )
+    assert dequant_scale.shape == input_scale.shape == (1,)
+    assert dequant_scale.dtype == input_scale.dtype == torch.float32
+    torch.testing.assert_close(dequant_scale, torch.full((1,), expected_calibrated))
+    torch.testing.assert_close(input_scale, torch.full((1,), expected_input))
+
+
+@pytest.mark.parametrize("e4m3_max", [256, 448])
+def test_cute_dsl_intermediate_scale_rejects_conflicting_recipe(e4m3_max):
+    with pytest.raises(ValueError, match="cannot be combined"):
+        _resolve_cute_dsl_intermediate_scales(
+            torch.empty(1, dtype=torch.bfloat16),
+            torch.ones(1),
+            NVFP44Over6Config(e4m3_max=e4m3_max),
+        )
+
+
+@pytest.mark.parametrize(
+    "recipe",
+    [None, NVFP44Over6Config(e4m3_max=256), NVFP44Over6Config(e4m3_max=448)],
+)
+def test_cute_dsl_prepare_weights_forwards_scales_and_recipe(monkeypatch, recipe):
+    from flashinfer.fused_moe import prepare
+
+    captured = {}
+    expected = {}
+
+    def capture_weights(*args, **kwargs):
+        captured.update(kwargs)
+        return expected
+
+    # Spy only on the API handoff; scale arithmetic is tested above without mocks.
+    monkeypatch.setattr(prepare, "prepare_cute_dsl_weights", capture_weights)
+    gemm1 = torch.tensor([2.0, 3.0])
+    gemm2 = torch.tensor([5.0, 7.0])
+    intermediate = torch.tensor([11.0]) if recipe is None else None
+    result = CuteDslConfig.prepare_weights(
+        torch.empty(2, 128, 64, dtype=torch.bfloat16),
+        torch.empty(2, 64, 64, dtype=torch.bfloat16),
+        num_local_experts=2,
+        hidden_size=64,
+        intermediate_size=64,
+        gemm1_scales_global=gemm1,
+        gemm2_scales_global=gemm2,
+        intermediate_scale_global=intermediate,
+        nvfp4_4over6=recipe,
+    )
+    assert result is expected
+    assert captured["gemm1_scales_global"] is gemm1
+    assert captured["gemm2_scales_global"] is gemm2
+    assert captured["intermediate_scale_global"] is intermediate
+    assert captured["nvfp4_4over6"] is recipe

@@ -262,6 +262,25 @@ def validate_ll_hidden_size(params: FleetParams, backend: str) -> None:
     )
 
 
+def is_bf16_mxfp8_cutedsl_supported() -> bool:
+    """BF16xMXFP8 CuTeDSL mega kernels require the CUDA 13 toolkit."""
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    return get_cuda_version().major >= 13
+
+
+def validate_bf16_mxfp8_cutedsl_cuda() -> None:
+    """Reject BF16xMXFP8 CuTeDSL mega kernels on pre-CUDA-13 toolchains."""
+    from flashinfer.jit.cpp_ext import get_cuda_version
+
+    if is_bf16_mxfp8_cutedsl_supported():
+        return
+    raise MoEEpConfigError(
+        "sm100_bf16_mxfp8_bf16_cutedsl requires CUDA 13+; "
+        f"current CUDA version is {get_cuda_version()}."
+    )
+
+
 def validate_mega_arch() -> None:
     import torch
 
@@ -290,6 +309,26 @@ def validate_mega_arch_sm90() -> None:
         raise MoEEpArchError(
             f"sm90_fp8_fp8_bf16_pull_cutedsl mega kernel requires sm_90 (Hopper); host has "
             f"sm_{cc[0]}{cc[1]}"
+        )
+
+
+def validate_mega_arch_sm107() -> None:
+    """Arch gate for the SM107 (Rubin) mega kernels.
+
+    The Rubin block-scaled CuTeDSL mega kernels target sm_107a exactly (they
+    need ``cutlass.utils.rubin_helpers`` codegen and compile with
+    ``CUTE_DSL_ARCH=sm_107a``); Blackwell hosts use the sm_100 tree's kernels
+    instead.
+    """
+    import torch
+
+    if not torch.cuda.is_available():
+        return
+    cc = _device_capability()
+    if cc != (10, 7):
+        raise MoEEpArchError(
+            f"the SM107 block-scaled mega kernels require sm_107 "
+            f"(Rubin); host has sm_{cc[0]}{cc[1]}"
         )
 
 

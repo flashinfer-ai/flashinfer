@@ -266,10 +266,23 @@ def _get_compiled_gather_kernel(
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    situ_beta: Optional[float] = None,
-    situ_linear_beta: Optional[float] = None,
+    situ_beta: Optional[Union[float, torch.Tensor]] = None,
+    situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
     gated: bool = True,
     use_a_per_token_scale: bool = False,
+    runtime_situ_beta_ptr=None,
+    runtime_situ_linear_beta_ptr=None,
+    row_group_ptr=None,
+    situ_beta_stride: int = 0,
+    situ_linear_beta_stride: int = 0,
+    weight_l2_hint: Optional[int] = None,
+    pdl_trigger_early: bool = False,
+    zero_fill_words_ptr=None,
+    zero_fill_num_words: int = 0,
+    zero_fill_counters_ptr=None,
+    zero_fill_other_tiles_ptr=None,
+    zero_fill_secondary: bool = False,
+    cluster_split_k: bool = False,
 ):
     """Get or compile the gather grouped GEMM with FC1 activation fusion.
 
@@ -293,6 +306,11 @@ def _get_compiled_gather_kernel(
     )
 
     is_rubin = mma_tiler is not None and mma_inst_shape is not None
+    runtime_situ = isinstance(situ_beta, torch.Tensor)
+    if is_rubin and runtime_situ:
+        raise NotImplementedError(
+            "Runtime SiTU parameters require the Blackwell kernel"
+        )
 
     cache_key = (
         "sm107" if is_rubin else "sm100",
@@ -314,13 +332,25 @@ def _get_compiled_gather_kernel(
         swiglu_alpha,
         swiglu_beta,
         swiglu_limit,
-        situ_beta,
-        situ_linear_beta,
+        "runtime" if runtime_situ else situ_beta,
+        ("runtime" if situ_linear_beta is not None else None)
+        if runtime_situ
+        else situ_linear_beta,
         gated,
         use_a_per_token_scale,
+        weight_l2_hint,
+        row_group_ptr is not None,
+        pdl_trigger_early,
+        zero_fill_words_ptr is not None,
+        zero_fill_secondary,
+        cluster_split_k,
     )
 
     if cache_key not in _gather_kernel_cache:
+        if is_rubin and cluster_split_k:
+            raise NotImplementedError(
+                "cluster_split_k is not supported by the Rubin (SM107) kernel"
+            )
         if is_rubin:
             # The Rubin (SM107) kernel currently only implements the gated
             # (SwiGLU) activation path with the default SwiGLU constants.
@@ -371,10 +401,22 @@ def _get_compiled_gather_kernel(
                 swiglu_alpha=swiglu_alpha,
                 swiglu_beta=swiglu_beta,
                 swiglu_limit=swiglu_limit,
-                situ_beta=situ_beta,
-                situ_linear_beta=situ_linear_beta,
+                situ_beta=None if runtime_situ else situ_beta,
+                situ_linear_beta=None if runtime_situ else situ_linear_beta,
                 gated=gated,
                 use_a_per_token_scale=use_a_per_token_scale,
+                runtime_situ=runtime_situ,
+                runtime_situ_linear_beta=runtime_situ and situ_linear_beta is not None,
+                weight_l2_hint=weight_l2_hint,
+                pdl_trigger_early=pdl_trigger_early,
+                zero_fill=zero_fill_words_ptr is not None,
+                zero_fill_secondary=zero_fill_secondary,
+                cluster_split_k=cluster_split_k,
+                # Clusters of two that are co-resident: the split needs one
+                # wave (each cluster owns at most one tile).
+                cluster_split_max_tiles=(
+                    get_max_active_clusters(2) if cluster_split_k else 0
+                ),
             )
         wrapper_fn = gemm.wrapper
 
@@ -413,6 +455,21 @@ def _get_compiled_gather_kernel(
             scaling_vector_size=sf_vec_size,
             max_active_clusters=max_active_clusters,
             stream=stream,
+            **(
+                {
+                    "situ_beta_ptr": runtime_situ_beta_ptr,
+                    "situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
+                    "situ_beta_stride": situ_beta_stride,
+                    "situ_linear_beta_stride": situ_linear_beta_stride,
+                    "tile_idx_to_row_group_ptr": row_group_ptr,
+                    "zero_fill_words_ptr": zero_fill_words_ptr,
+                    "zero_fill_num_words": zero_fill_num_words,
+                    "zero_fill_counters_ptr": zero_fill_counters_ptr,
+                    "zero_fill_other_tiles_ptr": zero_fill_other_tiles_ptr,
+                }
+                if not is_rubin
+                else {}
+            ),
         )
 
         _gather_kernel_cache[cache_key] = compiled_gemm
@@ -452,12 +509,21 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     mma_inst_shape: Optional[Tuple[int, int, int]] = None,
     enable_pdl: bool = True,
     activation_type: Union[int, ActivationType] = ActivationType.Swiglu.value,
+    weight_l2_hint: Optional[int] = None,
+    pdl_trigger_early: bool = False,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    situ_beta: Optional[float] = None,
-    situ_linear_beta: Optional[float] = None,
+    situ_beta: Optional[Union[float, torch.Tensor]] = None,
+    situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
     gated: bool = True,
+    tile_idx_to_row_group: Optional[torch.Tensor] = None,
+    zero_fill_output: Optional[torch.Tensor] = None,
+    zero_fill_counters: Optional[torch.Tensor] = None,
+    zero_fill_other_tiles: Optional[torch.Tensor] = None,
+    zero_fill_secondary: bool = False,
+    cluster_split_k: bool = False,
+    _prepared_launches: Optional[Dict[str, Any]] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Blockscaled contiguous gather grouped GEMM with fused FC1 activation.
 
@@ -486,6 +552,12 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
             token_id = token_idx * topk + k_idx. Invalid rows have -1.
             Used by cp.async to gather from A tensor.
         num_non_exiting_tiles: Number of valid tiles, shape (1,), int32
+        tile_idx_to_row_group: Optional int32 work list, shape (num_tiles,):
+            scheduler slot ``i`` processes the ``tile_size``-row block
+            ``tile_idx_to_row_group[i]`` of the permuted rows (its expert and
+            row limit come from that block's entries) and
+            ``num_non_exiting_tiles`` counts the list entries. Lets a caller
+            run only a subset of the sort groups through this kernel.
         out: Optional output tensor, shape (permuted_m, intermediate_size). Created if None.
              For FP4 output, shape is (permuted_m, intermediate_size//2) uint8.
         out_scale: Optional output scale factor tensor for block-scaled
@@ -520,9 +592,16 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         swiglu_alpha: SwiGLU sigmoid multiplier.
         swiglu_beta: SwiGLU up-projection bias.
         swiglu_limit: SwiGLU clamp limit.
-        situ_beta: When set with ActivationType.Swiglu, use the SiTU gate
-            ``beta * tanh(gate / beta) * sigmoid(gate)``.
-        situ_linear_beta: Optional SiTU tanh clamp for the up branch.
+        situ_beta: SiTU gate parameter for ``ActivationType.Situ`` (or the
+            legacy SwiGLU variant): ``beta * tanh(gate / beta) * sigmoid(gate)``.
+            A contiguous CUDA float32 tensor containing one value or one per
+            local expert supplies runtime parameters without specialization on
+            their values. Values must be positive and finite. Python floats
+            retain the existing scalar specialization behavior.
+        situ_linear_beta: Optional SiTU tanh clamp for the up branch. When
+            situ_beta is a tensor this must also be a CUDA float32 tensor
+            containing one value or one per local expert, or None to leave
+            the up branch unchanged.
         gated: Whether to run the gated SwiGLU path. If False, run non-gated
             ReLU2.
 
@@ -791,6 +870,31 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         norm_const_ptr = None
 
     alpha_ptr = make_ptr(cutlass.Float32, alpha.data_ptr(), cute.AddressSpace.gmem)
+    runtime_situ_beta_ptr = None
+    runtime_situ_linear_beta_ptr = None
+    situ_beta_stride = 0
+    situ_linear_beta_stride = 0
+    if isinstance(situ_beta, torch.Tensor):
+        # validate_cute_dsl_moe_situ_config() already requires a tensor
+        # situ_beta to pair with a tensor (or absent) situ_linear_beta.
+        runtime_situ_tensors = [("situ_beta", situ_beta)]
+        if isinstance(situ_linear_beta, torch.Tensor):
+            runtime_situ_tensors.append(("situ_linear_beta", situ_linear_beta))
+        for name, value in runtime_situ_tensors:
+            if value.device != a.device or value.numel() not in (1, num_experts):
+                raise ValueError(
+                    f"{name} must be on the input device and contain one or "
+                    "num_local_experts values"
+                )
+        runtime_situ_beta_ptr = make_ptr(
+            cutlass.Float32, situ_beta.data_ptr(), cute.AddressSpace.gmem
+        )
+        situ_beta_stride = int(situ_beta.numel() != 1)
+        if isinstance(situ_linear_beta, torch.Tensor):
+            runtime_situ_linear_beta_ptr = make_ptr(
+                cutlass.Float32, situ_linear_beta.data_ptr(), cute.AddressSpace.gmem
+            )
+            situ_linear_beta_stride = int(situ_linear_beta.numel() != 1)
     if use_a_per_token_scale:
         a_per_token_scale_ptr = make_ptr(
             cutlass.Float32,
@@ -811,6 +915,78 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     num_tiles_ptr = make_ptr(
         cutlass.Int32, num_non_exiting_tiles.data_ptr(), cute.AddressSpace.gmem
     )
+    row_group_ptr = None
+    if tile_idx_to_row_group is not None:
+        if is_rubin:
+            raise NotImplementedError(
+                "tile_idx_to_row_group is not supported by the Rubin (SM107) "
+                "gather grouped GEMM kernel"
+            )
+        if (
+            tile_idx_to_row_group.dtype != torch.int32
+            or tile_idx_to_row_group.device != a.device
+            or not tile_idx_to_row_group.is_contiguous()
+            or tile_idx_to_row_group.shape[0] < permuted_m // tile_size
+        ):
+            raise ValueError(
+                "tile_idx_to_row_group must be contiguous int32 on the input "
+                f"device with at least {permuted_m // tile_size} entries"
+            )
+        row_group_ptr = make_ptr(
+            cutlass.Int32, tile_idx_to_row_group.data_ptr(), cute.AddressSpace.gmem
+        )
+    # Optional zero-fill of a 16-bit token output by the epilogue warps (the
+    # dense chain's fused finalize reduce-adds into it): the output, an int32
+    # (claim, done) counter pair zeroed once by the caller, and the tile count
+    # of the other tile variant (this launch's own count when there is none).
+    zero_fill_words_ptr = zero_fill_counters_ptr = zero_fill_other_tiles_ptr = None
+    zero_fill_num_words = 0
+    if zero_fill_output is not None:
+        if is_rubin:
+            raise NotImplementedError(
+                "zero_fill_output is not supported by the Rubin (SM107) gather "
+                "grouped GEMM kernel"
+            )
+        if (
+            zero_fill_output.dtype not in (torch.bfloat16, torch.float16)
+            or zero_fill_output.dim() != 2
+            or not zero_fill_output.is_contiguous()
+            or zero_fill_output.device != a.device
+            or zero_fill_output.shape[1] % 8
+            or zero_fill_output.data_ptr() % 16
+            or zero_fill_output.numel() // 2 >= 2**31
+        ):
+            raise ValueError(
+                "zero_fill_output must be a contiguous 16-bit 2-D tensor on the "
+                "input device with 16-byte aligned rows"
+            )
+        if (
+            zero_fill_counters is None
+            or zero_fill_counters.dtype != torch.int32
+            or zero_fill_counters.numel() < 2
+            or zero_fill_counters.device != a.device
+            or zero_fill_other_tiles is None
+            or zero_fill_other_tiles.dtype != torch.int32
+            or zero_fill_other_tiles.numel() < 1
+            or zero_fill_other_tiles.device != a.device
+        ):
+            raise ValueError(
+                "zero_fill_output needs int32 zero_fill_counters (2 entries) and "
+                "zero_fill_other_tiles (1 entry) on the input device"
+            )
+        zero_fill_words_ptr = make_ptr(
+            cutlass.Uint32,
+            zero_fill_output.data_ptr(),
+            cute.AddressSpace.gmem,
+            assumed_align=16,
+        )
+        zero_fill_num_words = zero_fill_output.numel() // 2
+        zero_fill_counters_ptr = make_ptr(
+            cutlass.Int32, zero_fill_counters.data_ptr(), cute.AddressSpace.gmem
+        )
+        zero_fill_other_tiles_ptr = make_ptr(
+            cutlass.Int32, zero_fill_other_tiles.data_ptr(), cute.AddressSpace.gmem
+        )
 
     # Get CUDA stream
     torch_stream = torch.cuda.current_stream()
@@ -862,6 +1038,19 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         situ_linear_beta=situ_linear_beta,
         gated=gated,
         use_a_per_token_scale=use_a_per_token_scale,
+        weight_l2_hint=weight_l2_hint,
+        pdl_trigger_early=pdl_trigger_early,
+        runtime_situ_beta_ptr=runtime_situ_beta_ptr,
+        runtime_situ_linear_beta_ptr=runtime_situ_linear_beta_ptr,
+        situ_beta_stride=situ_beta_stride,
+        situ_linear_beta_stride=situ_linear_beta_stride,
+        row_group_ptr=row_group_ptr,
+        zero_fill_words_ptr=zero_fill_words_ptr,
+        zero_fill_num_words=zero_fill_num_words,
+        zero_fill_counters_ptr=zero_fill_counters_ptr,
+        zero_fill_other_tiles_ptr=zero_fill_other_tiles_ptr,
+        zero_fill_secondary=zero_fill_secondary,
+        cluster_split_k=cluster_split_k,
     )
 
     # Execute kernel with runtime parameters.
@@ -872,7 +1061,7 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
     # (a_ptr, b_ptr, a_sf_ptr, b_sf_ptr, c_ptr, c_sf_ptr, alpha_ptr,
     #  tile_idx_ptr, mn_limit_ptr, token_id_ptr, num_tiles_ptr, global_sf_ptr,
     #  [a_per_token_scale_ptr], orig_m, m, n, k, l, stream)
-    compiled_gemm(
+    launch_args = (
         a_ptr,
         b_ptr,
         a_sf_ptr,
@@ -891,8 +1080,25 @@ def blockscaled_contiguous_gather_grouped_gemm_act_fusion(
         n,
         k,
         num_experts,
-        stream=stream,
     )
+    launch_kwargs = (
+        {
+            "situ_beta_ptr": runtime_situ_beta_ptr,
+            "situ_linear_beta_ptr": runtime_situ_linear_beta_ptr,
+            "situ_beta_stride": situ_beta_stride,
+            "situ_linear_beta_stride": situ_linear_beta_stride,
+            "tile_idx_to_row_group_ptr": row_group_ptr,
+            "zero_fill_words_ptr": zero_fill_words_ptr,
+            "zero_fill_num_words": zero_fill_num_words,
+            "zero_fill_counters_ptr": zero_fill_counters_ptr,
+            "zero_fill_other_tiles_ptr": zero_fill_other_tiles_ptr,
+        }
+        if not is_rubin
+        else {}
+    )
+    if _prepared_launches is not None:
+        _prepared_launches["gather"] = (compiled_gemm, launch_args, launch_kwargs)
+    compiled_gemm(*launch_args, stream=stream, **launch_kwargs)
 
     return out, out_scale if generate_sfc else None
 
