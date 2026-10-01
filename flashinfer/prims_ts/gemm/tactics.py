@@ -273,7 +273,7 @@ def _product(
                         operand_format, epilogue, mma_k, tile_n, tile_k
                     )
                     for stages in stage_candidates(derived):
-                        #for use_clc in (True, False):
+                        # for use_clc in (True, False):
                         for use_clc in (True,):
                             for warps in _warps():
                                 for overlap in (False, True):
