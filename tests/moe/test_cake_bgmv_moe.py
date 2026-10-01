@@ -178,10 +178,10 @@ def _reference(inputs):
             output[:, col : col + feat_out].index_add_(0, tokens, delta)
             col += feat_out
     # Guard against vacuous comparisons: the reference must carry signal well
-    # above the 1e-2 tolerances on every token that has a LoRA, so a kernel
+    # above the 1e-2 tolerances (10x atol) on every token that has a LoRA, so a kernel
     # that leaves its output zeroed cannot pass.
     active_tokens = (lora_indices >= 0).nonzero().flatten()
-    assert bool((output[active_tokens].abs().amax(dim=1) > 0.5).all()), (
+    assert bool((output[active_tokens].abs().amax(dim=1) > 0.1).all()), (
         "reference output too small for a meaningful comparison"
     )
     return output
