@@ -357,9 +357,13 @@ def _reduction_worker(
                 * rms_gamma.float()
             ).to(dtype)
 
+            # Without the all-reduce output the call stays on the isolated source
+            # bundle: 64 tokens cover its generic kernels, one token its SM103
+            # single-token kernels.
             emit_allreduce_options = (
                 (True, False)
-                if (token_num, active_experts) == (64, ACTIVE_EXPERTS)
+                if (token_num, active_experts)
+                in ((1, ACTIVE_EXPERTS), (64, ACTIVE_EXPERTS))
                 else (True,)
             )
             for emit_allreduce in emit_allreduce_options:
