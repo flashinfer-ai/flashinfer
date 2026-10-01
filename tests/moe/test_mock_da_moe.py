@@ -17,6 +17,38 @@ from tests.moe.mock_da_moe import (
 )
 
 
+def test_capture_rebinding_requires_a_prepared_layer_abi_key(monkeypatch) -> None:
+    """New graph-pool pointers reuse prepared resources, never an unwarmed layer key."""
+    runner = MockDAMoERunner(num_experts=8)
+    warm = runner.moe_runner.allocate_inputs(8, 16, 2)
+    spread = torch.arange(16, device="cuda", dtype=torch.int32).remainder(8).view(8, 2)
+    runner.publish_plan([spread, torch.zeros_like(spread)], [0, 1])
+    runner.prepare(warm)
+    dispatcher = runner.dispatcher
+    dispatcher.prepare(warm.as_list(), capture_binding_key=("prepared-layer",))
+    captured = runner.moe_runner.allocate_inputs(8, 16, 2)
+    rejected = runner.moe_runner.allocate_inputs(8, 16, 2)
+    attempts = []
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+
+    def attempt(bindings, key):
+        return dispatcher.dispatch(
+            bindings,
+            capture_binding_key=key,
+            run_fallback=lambda: "fallback",
+            run_body=lambda body: "body",
+            capture_switch=lambda *args: attempts.append(args),
+        )
+
+    assert attempt(captured.as_list(), ("prepared-layer",)) == "fallback"
+    assert len(attempts) == 1
+    assert dispatcher.prepared_binding_count == 2
+    assert attempt(rejected.as_list(), ("unprepared-layer",)) == "fallback"
+    assert len(attempts) == 1
+    assert dispatcher.prepared_binding_count == 2
+    assert dispatcher.prepared_workspace_lane_count == 1
+
+
 def _expert_ids_with_active_experts(
     shape: torch.Size, active_experts: int
 ) -> torch.Tensor:

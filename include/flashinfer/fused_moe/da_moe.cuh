@@ -200,11 +200,12 @@ inline cudaError_t GetGraphEdgeCount(cudaGraph_t graph, size_t* edge_count) {
 
 /** Read the concrete predecessor nodes attached to one CUDA Graph node. */
 inline cudaError_t GetGraphNodeDependenciesView(cudaGraphNode_t node, cudaGraphNode_t* dependencies,
+                                                cudaGraphEdgeData* edge_data,
                                                 size_t* num_dependencies) {
 #if CUDART_VERSION >= 13000
-  return cudaGraphNodeGetDependencies(node, dependencies, nullptr, num_dependencies);
+  return cudaGraphNodeGetDependencies(node, dependencies, edge_data, num_dependencies);
 #else
-  return cudaGraphNodeGetDependencies(node, dependencies, num_dependencies);
+  return cudaGraphNodeGetDependencies_v2(node, dependencies, edge_data, num_dependencies);
 #endif
 }
 
@@ -212,7 +213,7 @@ inline cudaError_t GetGraphNodeDependenciesView(cudaGraphNode_t node, cudaGraphN
 inline cudaError_t GetGraphNodeDependencies(cudaGraphNode_t node,
                                             std::vector<cudaGraphNode_t>* dependencies) {
   size_t num_dependencies = 0;
-  cudaError_t status = GetGraphNodeDependenciesView(node, nullptr, &num_dependencies);
+  cudaError_t status = GetGraphNodeDependenciesView(node, nullptr, nullptr, &num_dependencies);
   if (status != cudaSuccess) {
     return status;
   }
@@ -220,7 +221,15 @@ inline cudaError_t GetGraphNodeDependencies(cudaGraphNode_t node,
   if (num_dependencies == 0) {
     return cudaSuccess;
   }
-  return GetGraphNodeDependenciesView(node, dependencies->data(), &num_dependencies);
+  // PDL edges require metadata; omitting it makes CUDA reject a lossy query.
+  std::vector<cudaGraphEdgeData> edge_data(num_dependencies);
+  status =
+      GetGraphNodeDependenciesView(node, dependencies->data(), edge_data.data(), &num_dependencies);
+  if (status != cudaSuccess) {
+    return status;
+  }
+  dependencies->resize(num_dependencies);
+  return cudaSuccess;
 }
 
 /** Return whether two dependency lists contain the same concrete graph nodes. */
@@ -279,6 +288,8 @@ inline cudaError_t ValidateWorkspaceLaneSequence(const ActiveCaptureContext& con
 
   // Any current frontier node transitively descending from the previous conditional establishes
   // the happens-before path inherited by both sibling roots of the next invocation.
+  // Conditional nodes have only full-completion outgoing edges. Later kernel-to-kernel PDL
+  // edges can overlap those kernels, but cannot let them start before this conditional finishes.
   for (cudaGraphNode_t dependency : context.dependencies) {
     bool depends_on = false;
     cudaError_t status = GraphNodeDependsOn(dependency, previous_conditional_node, &depends_on);
@@ -292,6 +303,26 @@ inline cudaError_t ValidateWorkspaceLaneSequence(const ActiveCaptureContext& con
   }
   *is_serialized = false;
   return cudaSuccess;
+}
+
+/** Identify one newly launched root even when CUDA retains older frontier nodes. */
+inline cudaError_t GetNewCaptureFrontierNode(const ActiveCaptureContext& before,
+                                             const ActiveCaptureContext& after,
+                                             cudaGraphNode_t* node) {
+  *node = nullptr;
+  if (before.capture_id != after.capture_id || before.graph != after.graph) {
+    return cudaErrorInvalidValue;
+  }
+  for (cudaGraphNode_t dependency : after.dependencies) {
+    if (std::find(before.dependencies.begin(), before.dependencies.end(), dependency) ==
+        before.dependencies.end()) {
+      if (*node != nullptr) {
+        return cudaErrorInvalidValue;
+      }
+      *node = dependency;
+    }
+  }
+  return *node == nullptr ? cudaErrorInvalidValue : cudaSuccess;
 }
 
 /** Snapshot the active stream capture graph and its current dependency frontier. */
