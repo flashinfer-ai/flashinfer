@@ -195,6 +195,12 @@ from .jit.moe_utils import gen_moe_utils_module
 from .jit.hash_topk import gen_hash_topk_module
 from .jit.tllm_utils import gen_trtllm_utils_module
 from .jit.topk import gen_topk_module
+from .jit.qsa_ops import (
+    gen_qsa_output_gate_module,
+    gen_qsa_pre_indexer_module,
+    gen_qsa_route_module,
+    gen_qsa_scores_module,
+)
 from .jit.cake_sampling import gen_cake_sampling_module
 from .jit.xqa import gen_xqa_module, gen_xqa_module_mla
 
@@ -959,6 +965,21 @@ def gen_all_modules(
         jit_specs.append(gen_pcie_ipc_ag_rs_module())
 
     if add_misc:
+        # QSA's scorer, route and output gate are one contract, and a build that
+        # carried some of them would report a capability it cannot serve. The
+        # scorer needs m16n8k16, which every SM8-or-newer target has, so the set
+        # is gated on the target list: has_sm80 is only set when an 8.x target is
+        # in the build, and an SM90-only or SM12x-only build needs these as well.
+        from .jit.core import current_compilation_context
+
+        if any(
+            major >= 8 for major, _ in current_compilation_context.TARGET_CUDA_ARCHS
+        ):
+            jit_specs += [
+                gen_qsa_output_gate_module(),
+                gen_qsa_route_module(),
+                gen_qsa_scores_module(),
+            ]
         jit_specs += [
             gen_api_log_stats_module(),
             gen_cascade_module(),
@@ -968,6 +989,10 @@ def gen_all_modules(
             gen_quantization_module(),
             gen_rope_module(),
             gen_sampling_module(),
+            # No architecture condition: the QSA pre-indexer uses no SM8-only
+            # instruction, and the bf16 and e4m3 conversions it needs have
+            # software paths below SM80 and SM89.
+            gen_qsa_pre_indexer_module(),
             gen_topk_module(),
         ]
         if has_sm100 or has_sm103:

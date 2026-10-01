@@ -239,6 +239,7 @@ from .cake_minimax_h3 import MiniMaxH3QkvQuantizePack as MiniMaxH3QkvQuantizePac
 from .mla import BatchMLAPagedAttentionWrapper as BatchMLAPagedAttentionWrapper
 from . import mhc as mhc
 from . import msa_ops as msa_ops
+from . import qsa_ops as qsa_ops
 from .norm import fused_add_rmsnorm as fused_add_rmsnorm
 from .norm import fused_add_rmsnorm_quant as fused_add_rmsnorm_quant
 from .norm import (

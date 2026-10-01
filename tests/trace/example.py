@@ -108,6 +108,14 @@ prims_ts_paged_block_sparse_combined_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_tuple_h8_kv8_d128_qb64_kb64_ps64.json
 prims_ts_paged_block_sparse_wrapper_combined_h8_kv8_d128_ps64.json
 prims_ts_paged_block_sparse_wrapper_tuple_h8_kv8_d128_ps64.json
+qsa_attention_h4_d128_w35.json
+qsa_expand_block_route_k8.json
+qsa_output_gate_h4_d128.json
+qsa_paged_scores_h4_d128_ps16.json
+qsa_pre_indexer_h4_d128_ring8_ps4.json
+qsa_route_from_blocks_k8.json
+qsa_route_from_logical.json
+qsa_selection_h4_d128_ps16_w35.json
 quantize_nvfp4_smooth_N3072.json
 rmsnorm_h4096.json
 rmsnorm_h7168.json
@@ -132,6 +140,7 @@ top_k_top_p_sampling calls top_p_sampling internally.
 FP4 MoE files are only generated on Blackwell (SM100+) GPUs with fp4_quantize available.
 GDN prefill files require SM90+ (Hopper) GPU.
 MSA (msa_*) files require SM120/SM121 (consumer Blackwell) GPUs.
+QSA (qsa_*) files require SM80 or newer.
 dsv41_fp4_quantize_*_sparse_mla_cache_*.json are only generated on SM120/SM121 GPUs.
 trtllm_batch_decode_block_sparse_h16_kv2_d128_ps16.json requires SM100/SM103 GPUs.
 trtllm_gen_routing_e256_k8_t8.json requires SM100/SM103/SM120/SM121 GPUs.
@@ -2865,4 +2874,68 @@ with contextlib.suppress(Exception):
             _fp4_in["block_tables"],
             _fp4_in["seq_lens"],
             _fp4_in["max_seq_len"],
+        )
+
+# ── Qwen4Exp quantized sparse attention (QSA) (SM80+) ────────────────────────
+# One QSA step, selection then gated paged attention, traces the scorer, the
+# route expansion, the slot route and the gate along with both runs; the
+# pre-indexer and the fused route are called on their own.
+with contextlib.suppress(Exception):
+    import flashinfer.qsa_ops as _qsa
+
+    _qi = dict(dtype=torch.int32, device=device)
+    _qbf = dict(dtype=torch.bfloat16, device=device)
+    _qcfg = _qsa.QSAConfig(
+        4, 1, 128, 8, *[torch.bfloat16] * 3, "dense", 64, 4, 32, 4, 128
+    )
+    _qneed = _qsa.QSA.workspace_requirements(_qcfg, device=device)
+    _qws = [torch.zeros(n, dtype=torch.uint8, device=device) for n in _qneed[:2]]
+    _qrt = _qsa.QSA(_qcfg, _qws[0])
+    _qrt.bind_transient_workspace(_qws[1])
+    _qrt.plan_cache(256, 16)
+    _qtab, _qt2r = torch.arange(16, **_qi).view(1, 16), torch.zeros(8, **_qi)
+    _qpos, _qlens = _qt2r + 255, _qt2r[:1] + 256
+    _qq, _qroute = torch.randn(8, 4, 128, **_qbf), torch.empty(8, 35, **_qi)
+    _qkc, _qk, _qv = torch.randn(3, 16, 16, 1, 128, **_qbf)
+    _qrt.run_selection(
+        _qq, _qkc[:, :, 0], _qtab, _qt2r, _qpos, _qlens, out_route=_qroute
+    )
+    _qrt.run_attention(
+        _qq,
+        _qk,
+        _qv,
+        route=_qroute,
+        block_table=_qtab,
+        token_to_request=_qt2r,
+        output_gate=torch.randn(8, 512, **_qbf),
+    )
+
+    with contextlib.suppress(Exception):
+        _qout = [torch.empty(8, 35, **_qi) for _ in range(2)]
+        _qmask = torch.empty(40, dtype=torch.uint8, device=device)
+        _qblocks = torch.zeros(8, 8, **_qi)
+        _qsa.qsa_route_from_blocks(
+            _qblocks, _qpos, _qlens, _qt2r, _qtab, *_qout, _qmask, 4, 16, 256
+        )
+
+    with contextlib.suppress(Exception):
+        _qp = torch.arange(16, device=device)
+        _qsa.qsa_pre_indexer(
+            torch.randn(16, 512, **_qbf),
+            torch.randn(16, 128, **_qbf),
+            _qp,
+            torch.randn(512, 64, **_qbf),
+            torch.zeros(128, **_qbf),
+            torch.zeros(128, **_qbf),
+            1e-6,
+            torch.empty(16, 4, 128, **_qbf),
+            torch.zeros(1, 8, 1, 128, **_qbf),
+            _qp % 8,
+            torch.zeros(1, 1, **_qi),
+            torch.tensor([0, 16], **_qi),
+            _qp,
+            torch.zeros(2, 4, 1, 128, **_qbf),
+            _qp // 4,
+            torch.tensor([[0, g] for g in range(4)], **_qi),
+            4,
         )
