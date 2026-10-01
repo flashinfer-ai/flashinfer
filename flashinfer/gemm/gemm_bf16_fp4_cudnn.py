@@ -376,6 +376,7 @@ _BF16_FP4_TUNING_CONFIG = TuningConfig(
 
 def _cudnn_bf16_fp4_runner(tuning_config):
     """Build a ``CudnnBf16Fp4Runner`` bound to the active tuning config."""
+    # Keep the mapper out of instance attributes, which determine the runner hash.
     m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
         tuning_config, spec_idx=0
     )
@@ -383,8 +384,6 @@ def _cudnn_bf16_fp4_runner(tuning_config):
     class CudnnBf16Fp4Runner(TunableRunner):
         def __init__(self):
             super().__init__()
-            # Not stored on self: __hash__ covers instance attributes, and a runner built
-            # after a tuning_buckets override must hash like the one tuned under it.
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:

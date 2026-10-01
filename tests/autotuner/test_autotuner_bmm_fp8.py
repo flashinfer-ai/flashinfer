@@ -212,16 +212,8 @@ def test_autotuner_gemm_cross_bucket_m(backend):
 
 
 @pytest.mark.parametrize("backend", ["cudnn", "cublas"])
-def test_autotuner_gemm_tuned_under_bucket_override_is_reused_after_it(backend):
-    """Tune under ``autotune(tuning_buckets=...)``, then look up without the override.
-
-    Frameworks tune inside a ``tuning_buckets`` override and serve outside it. The
-    effective bucket mapper is a new object under an override, so a runner that
-    stored it as an instance attribute hashed differently after tuning: its
-    in-process winner was never found again and the op fell back to tactic -1.
-    The override buckets here equal the default power-of-two buckets, so the
-    profile keys match and only runner identity is under test.
-    """
+def test_autotuner_gemm_cache_hit_after_bucket_override(backend):
+    """A fresh runner must find the config tuned inside a bucket override."""
     compute_capability = get_compute_capability(torch.device(device="cuda"))
     cc = compute_capability[0] * 10 + compute_capability[1]
     if not bmm_fp8.is_compute_capability_supported(cc):
@@ -240,10 +232,10 @@ def test_autotuner_gemm_tuned_under_bucket_override_is_reused_after_it(backend):
     mat2 = torch.randn([b, n, k], device="cuda", dtype=torch.bfloat16).transpose(-2, -1)
     b8, b_s = to_float8(mat2, dtype=input_dtype)
 
+    # Match the default buckets to isolate changes in runner identity.
     with autotune(tune_mode=True, tuning_buckets=(1, 2, 4, 8, 16, 32, 64)):
         res = bmm_fp8(a8, b8, a_s, b_s, res_dtype, backend=backend)
 
-    # Outside the override, as a serving framework runs: build the runner anew.
     runner = (
         _cudnn_gemm_fp8_runner()
         if backend == "cudnn"

@@ -5028,6 +5028,8 @@ def _cudnn_gemm_fp8(
 
 
 def _cudnn_gemm_fp8_runner():
+    # Keep the mapper in the closure so bucket overrides don't change the
+    # runner's hash, which includes its instance attributes.
     m_bucket_mapper = AutoTuner.get().get_effective_map_to_tuning_buckets(
         _FP8_GEMM_SM100_TUNING_CONFIG, spec_idx=0
     )
@@ -5035,8 +5037,6 @@ def _cudnn_gemm_fp8_runner():
     class CudnnFp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            # Not stored on self: __hash__ covers instance attributes, and a runner built
-            # after a tuning_buckets override must hash like the one tuned under it.
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -5523,8 +5523,6 @@ def _cudnn_gemm_bf16_runner(
             is_b_k_major: Optional[bool],
         ):
             super().__init__()
-            # Not stored on self: __hash__ covers instance attributes, and a runner built
-            # after a tuning_buckets override must hash like the one tuned under it.
             # Default to k-major (the convention torch.rand-synthesized
             # profile tensors use) when caller didn't specify.
             self._is_a_k_major = True if is_a_k_major is None else is_a_k_major
@@ -6630,8 +6628,6 @@ def _cudnn_mm_mxfp8_runner():
     class CudnnMmMxfp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            # Not stored on self: __hash__ covers instance attributes, and a runner built
-            # after a tuning_buckets override must hash like the one tuned under it.
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
@@ -7049,8 +7045,6 @@ def _cudnn_gemm_fp4_runner(tuning_config):
     class CudnnFp4GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            # Not stored on self: __hash__ covers instance attributes, and a runner built
-            # after a tuning_buckets override must hash like the one tuned under it.
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def _get_override_graph(
@@ -7064,15 +7058,8 @@ def _cudnn_gemm_fp4_runner(tuning_config):
             k = real_a_shape[2]
             n = real_b_shape[2]
 
-            # cache_m must match the AutoTuner cache key so the runtime
-            # graph is the SAME graph the autotuner profiled tactics on.
-            # ``m_bucket_mapper`` is the *currently effective*
-            # ``map_to_tuning_buckets`` (with any
-            # ``autotune(tuning_buckets=..., round_up=...)`` override
-            # applied).  Sharing the mapper keeps cache_m and the tactic
-            # cache key in lockstep -- otherwise a tactic profiled on
-            # graph ``cache_m=A`` is silently applied to graph ``cache_m=B``
-            # at runtime, which has a different plan-index meaning.
+            # Match the autotuner's bucket mapping so tactic indices refer to
+            # the graph they were profiled on.
             cache_m = m_bucket_mapper(actual_m)
 
             graph = build_cudnn_gemm_fp4_graph_override_shape(
@@ -11609,8 +11596,6 @@ def _cudnn_gemm_mxfp8_runner():
     class CudnnMxfp8GemmRunner(TunableRunner):
         def __init__(self):
             super().__init__()
-            # Not stored on self: __hash__ covers instance attributes, and a runner built
-            # after a tuning_buckets override must hash like the one tuned under it.
             self._use_override_shape = _is_cudnn_override_shape_available()
 
         def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
