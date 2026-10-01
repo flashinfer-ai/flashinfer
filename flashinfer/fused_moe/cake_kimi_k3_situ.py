@@ -311,7 +311,7 @@ def cake_fused_moe_prepare_workspace(
                     fc2_grid_n = min(
                         max_tiles, 12
                     )  # inc23 (N16 claim8 FC2 2 CTAs/SM, s2b2 v39 program): 336 FC2 CTAs on the 148-SM B300 for the sm_103a claim8 rows M32/M64/M128/M256; inc24: the same twelve rows = 336 FC2 CTAs on the 148-SM B200 for the sm_100a claim8 rows M32/M64/M128/M256 (2 CTAs/SM x 148 + 40)
-            if n8_w2a_m16:
+            elif n8_w2a_m16:
                 # Two resident CTAs per SM: the pool has
                 # _N8_W2A_M16_FC2_GRID_N_SM_FACTOR * SM // (_H // 128) rows
                 # (10 rows, 280 CTAs, on 148 SMs). It sizes the FC2 grid and is
@@ -320,7 +320,7 @@ def cake_fused_moe_prepare_workspace(
                     max_tiles,
                     max(1, _N8_W2A_M16_FC2_GRID_N_SM_FACTOR * sm_count // (_H // 128)),
                 )
-            if n32_claim8:
+            elif n32_claim8:
                 # The 512- and 1024-token routes measured best with a seven-row
                 # pool: 7 * 28 = 196 FC2 CTAs on the 148-SM B200 and B300.
                 fc2_grid_n = min(max_tiles, 7)
