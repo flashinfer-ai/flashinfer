@@ -986,7 +986,6 @@ QKV_TMA_ONLY_RAW_POINTERS = {
     "compiled_tf32_fused_n32": ("q", "k", "v"),
     "compiled_tf32_fused": ("q", "k"),
     "compiled_small_bh_m128": ("v",),
-    "compiled_bf16_small_bh_m128": ("v",),
 }
 
 
