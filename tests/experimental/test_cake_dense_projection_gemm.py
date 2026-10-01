@@ -52,6 +52,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     split_fp32_to_bf16x3_,
     stream_k_plan,
     wave_working_set,
+    wgrad_swapped,
     wgrad_views,
 )
 
@@ -1127,7 +1128,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 if "stages" not in rule and plan.cta_rows == 128:
                     assert (
                         plan.stages
-                        == {(256, 0): 7, (256, 1): 6, (128, 0): 9, (128, 1): 8}[
+                        == {(256, 0): 7, (256, 1): 6, (192, 0): 7, (192, 1): 6, (128, 0): 9, (128, 1): 8}[
                             (plan.block_n, plan.slots)
                         ]
                     )
@@ -1206,7 +1207,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         and not plan.a_mn
                         and plan.b_mn
                     )
-                elif N < 256:  # swapped: X.T @ G with the transposed store
+                elif wgrad_swapped(N, K):  # work-minimising swap (round 3): X.T @ G with the transposed store
                     assert (plan.M, plan.N, plan.K) == (K, N, T) and plan.transposed_out
                 else:
                     assert (
@@ -1278,16 +1279,16 @@ def test_mla_rows_plan_as_batched_views(T, sm_count):
     )
     assert (out3.stride(0), out3.stride(1), out3.stride(2)) == (256, 64 * 256, 1)
     # A = d_out [H, T, 512] K-major, B = the in_out weight transposed ([H, 512, 192], k contiguous) K-major;
-    # K = D_out = 512 <= 1024: TMA-store epilogue
+    # N = 192: BLOCK_N = 192 (one exact tile); the 96-column CTA halves cannot use the 64-column TMA-store chunks,
+    # so the row runs the register epilogue (round 3; K = 512 <= 1024 would otherwise pick the TMA-store epilogue)
     _assert_mirrors_cake(
         plan,
         _expected(MLA_TEMPLATES, ("qabs", "dgrad"), 33, 148),
         ("qabs", "dgrad", 33, 148),
         "sm_100a",
     )
-    assert plan.template.startswith(
-        "dense_proj_gemm_kk_n256"
-    ) and plan.template.endswith("_tma1")
+    assert plan.block_n == default_block_n(192, False) == 192
+    assert plan.template.startswith("dense_proj_gemm_kk_n192") and not plan.template.endswith("_tma1")
 
 
 def test_operand_view_classification_and_rejections():
@@ -1363,13 +1364,22 @@ def test_operand_view_classification_and_rejections():
 
 
 def test_wgrad_swap_rule():
+    # work-minimising orientation (round 3): the swapped GEMM X.T @ G with the transposed store runs when its padded
+    # tile work is smaller - the small-N rows (N = 32, K = 6144) and the 576-wide kv_a row; equal work keeps G.T @ X
+    X = torch.empty(100, 6144, dtype=torch.bfloat16)
     G = torch.empty(100, 32, dtype=torch.bfloat16)
-    X = torch.empty(100, 64, dtype=torch.bfloat16)
+    assert wgrad_swapped(32, 6144)
     A, B, transposed = wgrad_views(G, X)
-    assert transposed and A.shape == (64, 100) and B is G
+    assert transposed and A.shape == (6144, 100) and B is G
+    G = torch.empty(100, 576, dtype=torch.bfloat16)
+    assert wgrad_swapped(576, 6144)  # 3 x 192 columns over K instead of 256 + 256 + 64
+    A, B, transposed = wgrad_views(G, X)
+    assert transposed and A.shape == (6144, 100) and B is G
     G = torch.empty(100, 256, dtype=torch.bfloat16)
+    assert not wgrad_swapped(256, 6144)  # a tie keeps the direct route
     A, B, transposed = wgrad_views(G, X)
     assert not transposed and A.shape == (256, 100) and B is X
+    assert not wgrad_swapped(6144, 2048) and not wgrad_swapped(32, 64)  # large N; a 32 x 64 tie
 
 
 def test_batched_small_m_swap_and_row_rules():
@@ -1386,9 +1396,9 @@ def test_batched_small_m_swap_and_row_rules():
         Q.permute(1, 2, 0), dL.permute(1, 0, 2), out, sm_count=148, l2_bytes=L2_BYTES, _fallback=False
     )
     assert (plan.L, plan.M, plan.N, plan.K) == (H, N, M, T)
-    assert plan.a_mn and plan.b_mn and plan.transposed_out and plan.block_n == 256
+    assert plan.a_mn and plan.b_mn and plan.transposed_out and plan.block_n == 192  # N' = 192: one exact tile
     assert plan.template.startswith(
-        "dense_proj_gemm_nn_n256"
+        "dense_proj_gemm_nn_n192"
     ) and plan.template.endswith("_t")
     assert tuple(out3.shape) == (H, M, N)
     # the rule table: exact (N, K, M) first, then the ragged-M (N, K, None) key, then the ragged-K (N, None, M) key
