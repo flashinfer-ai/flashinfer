@@ -140,8 +140,8 @@
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e",
-                  "sm_103a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e"
+                  "sm_100a": "4594a6b434501f5b302eb070e569c94571119896e5a358150995407573668c8a",
+                  "sm_103a": "4594a6b434501f5b302eb070e569c94571119896e5a358150995407573668c8a"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu",
@@ -156,8 +156,8 @@
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e",
-                  "sm_103a": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e"
+                  "sm_100a": "4594a6b434501f5b302eb070e569c94571119896e5a358150995407573668c8a",
+                  "sm_103a": "4594a6b434501f5b302eb070e569c94571119896e5a358150995407573668c8a"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu",
@@ -670,8 +670,8 @@
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669",
-                  "sm_103a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669"
+                  "sm_100a": "4a1cb49935521660b7edfc9baa3cff363b87111621f23babcf51ef4d9c3454d6",
+                  "sm_103a": "4a1cb49935521660b7edfc9baa3cff363b87111621f23babcf51ef4d9c3454d6"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
@@ -686,8 +686,8 @@
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669",
-                  "sm_103a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669"
+                  "sm_100a": "4a1cb49935521660b7edfc9baa3cff363b87111621f23babcf51ef4d9c3454d6",
+                  "sm_103a": "4a1cb49935521660b7edfc9baa3cff363b87111621f23babcf51ef4d9c3454d6"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
@@ -1215,7 +1215,7 @@
           }
         },
         "source_package_file_count": 43,
-        "source_package_sha256": "f56e955b148f35811e30f9d04151170f6989dda502882b62726c5975a2fff409",
+        "source_package_sha256": "196ebdbbd3e631f6c741f636a8ab50b7b5702e7a84b7ce0abf812c70d435c747",
         "balanced_routes": {
           "dcp_spec_bf16_balanced": {
             "arguments": {
@@ -1657,7 +1657,7 @@
                 "elements": 4,
                 "initial_state": "zero; every launch leaves it zero"
               },
-              "reduce_slices_max": 8,
+              "reduce_slices_max": 16,
               "tile_counters": {
                 "counters_per_tile": 4,
                 "dtype": "uint32",
@@ -1975,8 +1975,8 @@
       "sha256": "03cfc35e253a91a9675d2e3da75d60b15be3f04ca97465c9c656183c3a943ba7"
     },
     "cuda/dcp_spec/dcp_spec_bf16_balanced/kernel.cu": {
-      "bytes": 219427,
-      "sha256": "359063c1573a6124de1a07a85b77b5f379b57878f88a71b60c3c2611284ea41e"
+      "bytes": 228143,
+      "sha256": "4594a6b434501f5b302eb070e569c94571119896e5a358150995407573668c8a"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8/num_split1_retain_kv_l20.cu": {
       "bytes": 116857,
@@ -2015,8 +2015,8 @@
       "sha256": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu": {
-      "bytes": 291398,
-      "sha256": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669"
+      "bytes": 365643,
+      "sha256": "4a1cb49935521660b7edfc9baa3cff363b87111621f23babcf51ef4d9c3454d6"
     },
     "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l20.cu": {
       "bytes": 95503,
