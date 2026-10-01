@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 
 from flashinfer.experimental.sm110_xqa import jit
+from flashinfer.experimental.sm110_xqa.backend import _TREE_FAMILIES
 
 PACKAGE = Path(jit.__file__).resolve().parent
 LEDGER = PACKAGE.parents[2] / "benchmarks" / "sm110_xqa_shapes.json"
@@ -46,6 +47,30 @@ def test_generated_programs_declare_bindable_argument_plans():
         assert ("parameter", "head_group_size") in plan, name
         if record["ratios"] is not None:
             assert record["ratios"] == [2, 4, 8, 16], name
+
+
+# grid.x of the host's tree launch, per family; the programs' clusters are recorded in
+# jit.MODULES: (1, 1, 1) register families, (2, 2, 1) / (2, 1, 1) tmem, (4, 1, 1) pair.
+TREE_GRID_WIDTH = {"register_mma": 1, "register_mma_split": 1, "tmem": 2, "pair": 4}
+
+
+def test_tree_family_grid_width_is_the_program_cluster_width():
+    # backend.prepare launches a tree program on grid.x = ctas_per_tile * tiles_per_row;
+    # that extent must be exactly the cluster width of every program serving the family,
+    # or clusters would repeat (or miss) output tiles.
+    assert set(_TREE_FAMILIES) == set(TREE_GRID_WIDTH)
+    for family, (suffix, _rows, ctas_per_tile, tiles_per_row) in _TREE_FAMILIES.items():
+        grid_x = ctas_per_tile * tiles_per_row
+        assert grid_x == TREE_GRID_WIDTH[family], family
+        programs = {
+            program
+            for key, program in jit.ROUTES.items()
+            if key.split("__")[0].endswith(suffix)
+        }
+        assert programs, family
+        for program in sorted(programs):
+            cluster = jit.MODULES[program]["cluster"]
+            assert grid_x == cluster[0], (family, program, cluster)
 
 
 def test_frozen_sources_match_their_recorded_hash():

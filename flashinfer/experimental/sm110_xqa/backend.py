@@ -15,15 +15,18 @@ from .jit import FROZEN, MODULES, ROUTES, load_sm110_xqa_module, require_sm110
 
 TREE_KERNELS = ("tcgen05", "register_mma", "register_mma_split", "tmem", "pair")
 SELECTABLE_KERNELS = TREE_KERNELS + ("register_mma_auto", "auto")
-# D512 tree families: route suffix, Q-tile rows per CTA, grid.x CTAs per Q tile (the
-# 512 output columns over each CTA's output tile) and Q tiles per thread-block cluster.
-# The register families cover all 512 columns per CTA; tmem / pair split them over two
-# 256-column halves; pair clusters the two Q tiles of a KV head.
+# D512 tree families: route suffix, Q-tile rows per CTA, CTAs per Q tile (the 512
+# output columns over each CTA's output tile) and Q tiles per grid.y row. The launch
+# grid is (CTAs per Q tile x Q tiles per row, Hkv x Q tiles / Q tiles per row, B), and
+# its x extent is one thread-block cluster of the program (jit.MODULES[...]["cluster"]).
+# The register families cover all 512 columns per CTA (grid.x 1); tmem / pair split
+# them over two 256-column halves (grid.x 2 per Q tile); pair puts the two Q tiles of a
+# KV head side by side in one (4, 1, 1) cluster (grid.x 4, half the grid.y rows).
 _TREE_FAMILIES = {
     "register_mma": ("_mma", 32, 1, 1),
     "register_mma_split": ("_mma_split", 32, 1, 1),
     "tmem": ("_tmem", 128, 2, 1),
-    "pair": ("_pair", 128, 4, 2),
+    "pair": ("_pair", 128, 2, 2),
 }
 # Argument kinds of a generated program's plan the host knows how to bind.
 _PLAN_KINDS = {
