@@ -44,6 +44,7 @@ from flashinfer.experimental.dense_projection_gemm.cake_backend import (
     plan_router_fp32_gemm,
     ROW_RULES,
     row_rule,
+    sk_parts_plan,
     swap_small_m,
     prepare_dense_projection_gemm,
     prepare_projection_wgrad,
@@ -1481,6 +1482,122 @@ def test_batched_small_m_swap_and_row_rules():
     finally:
         ROW_RULES.clear()
         ROW_RULES.update(saved)
+
+
+@pytest.mark.parametrize("pairs", [74, 106])  # 148 SMs (B200) / 212 SMs (R200)
+def test_sk_parts_rule(pairs):
+    # Cake round 4 (L20): a measured ``sk_parts = p`` row rule splits every tail tile p ways when the units
+    # fit the CTA pairs and keep SK_MIN_ITERS K steps each; otherwise the row keeps the ``auto`` policy.
+    assert sk_parts_plan(24, 254, pairs, 3) == (True, 72)
+    assert sk_parts_plan(24, 254, pairs, 2) == (True, 48)
+    assert stream_k_plan(24, 254, pairs, *sk_parts_plan(24, 254, pairs, 3)) == (
+        0,
+        24,
+        72,
+        85,
+    )
+    assert sk_parts_plan(72, 254, pairs, 2) == (
+        "auto",
+        None,
+    )  # 2 * 72 units do not fit either pair count
+    assert sk_parts_plan(24, 3 * SK_MIN_ITERS - 1, pairs, 3) == (
+        "auto",
+        None,
+    )  # too few K steps per unit
+    assert sk_parts_plan(24, 254, pairs, 1) == ("auto", None)
+    assert sk_parts_plan(pairs, 254, pairs, 2) == (
+        "auto",
+        None,
+    )  # a full wave has no tail
+    if pairs == 106:
+        # indexer_q wgrad on R200: 128-wide tiles -> 256 pair tiles (tail 44, p = 2 -> 88 units);
+        # 256-wide tiles -> 128 pair tiles (tail 22, p = 3 -> 66 units)
+        assert sk_parts_plan(256, 254, pairs, 2) == (True, 88)
+        assert stream_k_plan(256, 254, pairs, True, 88) == (212, 44, 88, 127)
+        assert sk_parts_plan(128, 254, pairs, 3) == (True, 66)
+        assert stream_k_plan(128, 254, pairs, True, 66) == (106, 22, 66, 85)
+    else:
+        # on B200 the 128-tile row's tail of 54 admits no split: the rule falls back to auto (whole tiles)
+        assert sk_parts_plan(128, 254, pairs, 3) == ("auto", None)
+    # the sm_107a rules adopted in round 4 ...
+    assert ROW_RULES[
+        ("sm_107a", True, True, False, False, False, 2048, None, 4096)
+    ] == {
+        "block_n": 128,
+        "sk_parts": 2,
+    }
+    assert ROW_RULES[("sm_107a", True, True, True, False, False, 2048, None, 4096)] == {
+        "sk_parts": 3
+    }
+    for f32 in (False, True):
+        for n in (32, 128):
+            assert ROW_RULES[
+                ("sm_107a", True, True, f32, True, False, n, None, 6144)
+            ] == {
+                "block_n": 128,
+                "sk_parts": 3,
+            }
+    # ... and their plans through the planner (CPU views; the launch grid is num_full + sk_units pairs)
+    if pairs == 106:
+        T = 16231
+        for row, dt, want in (
+            ("indexer_q", "f32", (256, 106, 22, 66, 85)),
+            ("indexer_q", "bf16", (128, 212, 44, 88, 127)),
+            ("indexer_hw", "bf16", (128, 0, 24, 72, 85)),
+            ("indexer_k", "f32", (128, 0, 24, 72, 85)),
+        ):
+            v = _views("proj", row, "wgrad", dt, T)
+            plan = plan_dense_projection_gemm(
+                v["A"],
+                v["B"],
+                v["out"],
+                sm_count=212,
+                l2_bytes=L2_BYTES,
+                transposed_out=v.get("transposed", False),
+                arch="sm_107a",
+                _fallback=False,
+            )[0]
+            assert (
+                plan.block_n,
+                plan.num_full,
+                plan.tail_tiles,
+                plan.sk_units,
+                plan.iters_per_unit,
+            ) == want, (row, dt)
+            assert plan.num_cluster_tiles == want[1] + want[3]
+        # an explicit caller split wins over the rule, and sm_100a keeps its own (ruleless) plan
+        v = _views("proj", "indexer_hw", "wgrad", "bf16", T)
+        pinned = plan_dense_projection_gemm(
+            v["A"],
+            v["B"],
+            v["out"],
+            sm_count=212,
+            l2_bytes=L2_BYTES,
+            transposed_out=v["transposed"],
+            arch="sm_107a",
+            _fallback=False,
+            sk=True,
+            sk_max_units=48,
+        )[0]
+        assert (pinned.tail_tiles, pinned.sk_units, pinned.iters_per_unit) == (
+            24,
+            48,
+            127,
+        )
+        other = plan_dense_projection_gemm(
+            v["A"],
+            v["B"],
+            v["out"],
+            sm_count=148,
+            l2_bytes=L2_BYTES,
+            transposed_out=v["transposed"],
+            arch="sm_100a",
+            _fallback=False,
+        )[0]
+        assert (other.tail_tiles, other.sk_units) == (
+            12,
+            24,
+        )  # 256-row tiles, auto two-way split
 
 
 def test_f32_v8_symbol_only_on_the_fp32_register_epilogue():

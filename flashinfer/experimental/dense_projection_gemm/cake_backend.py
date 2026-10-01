@@ -86,7 +86,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Optional, Tuple, Union
 
 import torch
 import tvm_ffi
@@ -552,20 +552,20 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 6144, 12288, None): {"cta_rows": 256},
     ('sm_107a', False, True, True, False, False, 12288, 6144, None): {"cta_rows": 256},
     ('sm_107a', False, True, True, False, False, 16384, 6144, None): {"cta_rows": 256},
-    ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 128},
-    ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128},
-    ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128},
+    ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 128, "sk_parts": 2},
+    ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "sk_parts": 3},
+    ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "sk_parts": 3},
     ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
     ('sm_107a', True, True, False, True, True, 192, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first')},
     ('sm_107a', True, True, False, True, True, 256, None, 512): {"cta_rows": 256, "hints": ('evict_first', 'evict_first')},
-    ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"block_n": 128},
+    ('sm_107a', True, True, True, False, False, 2048, None, 4096): {"sk_parts": 3},
     ('sm_107a', True, True, True, False, False, 2048, None, 6144): {"cta_rows": 256},
     ('sm_107a', True, True, True, False, False, 2048, None, 16384): {"group_m": 8, "epi": 'reg', "f32_v8": True},
     ('sm_107a', True, True, True, False, False, 6144, None, 2048): {"cta_rows": 256},
     ('sm_107a', True, True, True, False, False, 6144, None, 12288): {"epi": 'reg', "f32_v8": True},
     ('sm_107a', True, True, True, False, False, 16384, None, 6144): {"cta_rows": 256},
-    ('sm_107a', True, True, True, True, False, 32, None, 6144): {"block_n": 128},
-    ('sm_107a', True, True, True, True, False, 128, None, 6144): {"block_n": 128},
+    ('sm_107a', True, True, True, True, False, 32, None, 6144): {"block_n": 128, "sk_parts": 3},
+    ('sm_107a', True, True, True, True, False, 128, None, 6144): {"block_n": 128, "sk_parts": 3},
     ('sm_107a', True, True, True, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
 }
 # fmt: on
@@ -674,6 +674,24 @@ def default_cta_rows(M: int, N: int, K: int) -> int:
     """Output rows per CTA (128 = double-buffered TMEM tiles; 256 is selected per row by
     measurement).  [Cake ``default_cta_rows`` L892-L895]"""
     return 128
+
+
+def sk_parts_plan(
+    pair_tiles: int, k_blocks: int, pairs: int, parts: int
+) -> Tuple[Union[bool, str], Optional[int]]:
+    """``(sk, sk_max_units)`` for a measured ``sk_parts`` row rule: the tail tiles (the whole
+    problem when it is one partial wave) are split ``parts`` ways when ``parts * tail`` units
+    fit the CTA pairs and every unit keeps at least ``SK_MIN_ITERS`` K steps; otherwise the row
+    keeps the ``auto`` policy.  [Cake ``sk_parts_plan``]"""
+    tail = pair_tiles % pairs if pair_tiles > pairs else pair_tiles
+    if (
+        parts < 2
+        or tail == 0
+        or parts * tail > pairs
+        or k_blocks < parts * SK_MIN_ITERS
+    ):
+        return "auto", None
+    return True, parts * tail
 
 
 def stream_k_plan(
@@ -978,6 +996,11 @@ def plan_dense_projection_gemm(
     k_blocks = _ceil_div(K, BLOCK_K)
     pair_tiles = L * (m_tiles // CTA_GROUP) * n_tiles
     pairs = sm_pairs(sm_count)
+    if sk == "auto" and sk_max_units is None and "sk_parts" in rule:
+        # Measured per-row p-way split of the tail wave (Cake round 4, L20).  [Cake L1159-L1163]
+        sk, sk_max_units = sk_parts_plan(
+            pair_tiles, k_blocks, pairs, int(rule["sk_parts"])
+        )
     num_full, tail_tiles, sk_units, iters_per_unit = stream_k_plan(
         pair_tiles, k_blocks, pairs, sk, sk_max_units
     )
