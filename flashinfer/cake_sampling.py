@@ -348,15 +348,15 @@ def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
     return False
 
 
-# Compute capabilities whose launches with _STAGE1_LARGE_K < max top-k <= fused_block_tail_kcap run the whole-CTA
-# tail inside the stage-1 kernel (launch_flags bit 3) instead of the stage-2/3 kernel.  Both forms give the same
-# outputs; the choice is timing only.  Measured chain -> fused ratios at k = 1000 (cold L2, chain = sum of both
-# kernels' spans) on the integrated build: R200 (10, 7) 1.05-1.32 (0.96-0.99 only at V = 32768 B <= 8), B200 (10, 0)
-# 1.19 on V = 151936 B = 4, H100 (9, 0) 1.07-1.13 at V = 32768 / 128256 B <= 16 against the chain's own 0.77-0.92,
-# winning only V = 151936 B <= 8 (0.87); GB300 (10, 3) resident cells 1.06-1.09.  No capability fuses k > 64 and the
-# frozen bundle ships no whole-CTA-tail build; the mechanism (bit 3, manifest fused_block_tail) is kept for a build
-# that does.
-_BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset()
+# Capabilities whose host may run the whole-CTA tail (launch_flags bit 3; round 7, lever (b)).  Under CUDA-graph replay
+# (the eager span of the two-launch chain includes the host gap between its launches and is not the measure) the in-CTA
+# tail loses to the chain on every resident (B200 1.20-1.54, GB300 1.40-1.84) and on every stream at k <= 750; the
+# cluster-8 streams at k = 1000 win on both (B200 0.89-0.94, GB300 0.89-0.97), so ``_fuse_block_tail`` takes the twin
+# only for a cluster-8 stream with top_k_max > _BLOCK_TAIL_MIN_K on a one-wave grid.  H100 / R200 keep the chain (no
+# graph-replay A/B recorded for them in round 7).
+_BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
+_BLOCK_TAIL_MIN_CLUSTER = 8
+_BLOCK_TAIL_MIN_K = 768
 
 
 def _block_tail_for_capability(capability: tuple[int, int]) -> bool:
@@ -378,15 +378,18 @@ def _fuse_block_tail(
     two_launch: bool,
 ) -> bool:
     """Whether a launch of ``batch`` rows on the variant runs the whole-CTA tail (launch_flags bit 3): the
-    largest top-k lies in (_STAGE1_LARGE_K, fused_block_tail_kcap], the variant carries the tail, the device
-    policy is on (``two_launch`` false) and the stage-1 grid is a single wave.  Rank 0 of every cluster runs the
-    tail after its row, so a multi-wave grid would serialize one tail per wave (R200 k = 1000: cluster-8 grids of
-    4-6 waves run 1.3-1.6x slower than the chain) while the chain's stage-2/3 kernel costs one launch for all
-    rows; one-wave grids gain 4-16 % on every measured cell of B200 / H100 / R200.  Rows of such a launch with
+    largest top-k lies in (_BLOCK_TAIL_MIN_K, fused_block_tail_kcap], the variant is a stream on a cluster of at
+    least _BLOCK_TAIL_MIN_CLUSTER CTAs and carries the tail, the device policy is on (``two_launch`` false) and the
+    stage-1 grid is a single wave.  Rank 0 of every cluster runs the tail after its row, so a multi-wave grid would
+    serialize one tail per wave while the chain's stage-2/3 kernel costs one launch for all rows; under CUDA-graph
+    replay the in-CTA tail also loses to the chain on every resident and on every stream at k <= 750 (round 7), and
+    wins 3-11 % only for the cluster-8 streams at k = 1000 on B200 / GB300.  Rows of such a launch with
     k <= CAKE_SAMPLING_FUSED_TAIL_KCAP take the two-warp tail inside the kernel (bit 3 enables it for them too)."""
     if two_launch or top_k_max is None:
         return False
-    if not (_STAGE1_LARGE_K < top_k_max <= _fused_block_tail_kcap()):
+    if not (_BLOCK_TAIL_MIN_K < top_k_max <= _fused_block_tail_kcap()):
+        return False
+    if not (stream and int(cluster) >= _BLOCK_TAIL_MIN_CLUSTER):
         return False
     if not _stage1_has_fused_block_tail(cluster, ept, stream):
         return False
@@ -417,6 +420,10 @@ _FLAG_COARSE_SAMPLE = 16
 _FLAG_ROW_SPAN_DIET = 32
 _ROW_SPAN_DIET_MIN_CLUSTER = 8
 _ROW_SPAN_DIET_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
+_FLAG_SPEC_SAMPLE = 64
+_SPEC_SAMPLE_WIDE_EPT = 32
+_SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER = 8
+_SPEC_SAMPLE_WIDE_MIN_CHUNKS = 16
 
 
 @functools.cache
@@ -443,6 +450,53 @@ def _coarse_sample_flag(cluster: int, ept: int, stream: bool, top_k_max: int) ->
     if not stream or int(top_k_max) > _fused_tail_kcap():
         return 0
     return _FLAG_COARSE_SAMPLE if _stage1_has_coarse_sample(cluster, ept, True) else 0
+
+
+@functools.cache
+def _stage1_has_spec_sample(cluster: int, ept: int, stream: bool) -> bool:
+    """Whether the frozen variant ships a speculative-sample build (a manifest entry with ``spec_sample``): the kernel
+    taken by launch_flags bit 6, whose first register chunk doubles as the sample (every streaming variant; residents
+    take no sample).  The exact passes are the same and every output is bit-identical."""
+    found = False
+    for v in load_manifest()["stage1"]:
+        if (v["cluster"], v["ept"], bool(v["stream"])) == (cluster, ept, stream):
+            found = True
+            if v["spec_sample"]:
+                return True
+    if not found:
+        raise ValueError(f"no frozen stage-1 variant ({cluster}, {ept}, {stream})")
+    return False
+
+
+def _spec_sample_flag(cluster: int, ept: int, stream: bool, vocab: int) -> int:
+    """Stage-1 ``launch_flags`` bit that selects the speculative-sample build: every ept-16 streaming launch, and an
+    ept-32 (``_SPEC_SAMPLE_WIDE_EPT``) streaming launch whose row is one register chunk per CTA, two chunks on a cluster
+    of at least ``_SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER`` CTAs, or at least ``_SPEC_SAMPLE_WIDE_MIN_CHUNKS`` chunks.  There
+    the strided histogram of the chunk already in registers is cheaper than the separate sampled read it replaces
+    (round 7, lever SP: ept-16 streams 2-13 % faster at 1-16 chunks, the cluster-8 ept-32 stream at one chunk 13-18 %
+    and at two chunks 0-6 %, the cluster-1 ept-32 stream at 16 chunks 2-15 %); ept-32 streams at 2-10 chunks per CTA on
+    clusters 1-4 measured 0-6 % slower with it and keep their round-6 build."""
+    if not stream:
+        return 0
+    if int(ept) < _SPEC_SAMPLE_WIDE_EPT:
+        return _FLAG_SPEC_SAMPLE if _stage1_has_spec_sample(cluster, ept, True) else 0
+    chunks = math.ceil(int(vocab) / (_THREADS * int(ept) * int(cluster)))
+    if chunks == 2:
+        if int(cluster) < _SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER:
+            return 0
+    elif chunks != 1 and chunks < _SPEC_SAMPLE_WIDE_MIN_CHUNKS:
+        return 0
+    return _FLAG_SPEC_SAMPLE if _stage1_has_spec_sample(cluster, ept, True) else 0
+
+
+def _sample_build_flag(
+    cluster: int, ept: int, stream: bool, top_k_max: int, vocab: int
+) -> int:
+    """The stage-1 sample-build selection for one launch: bit 6 (speculative sample) where its policy applies,
+    otherwise bit 4 (coarse sample) where that policy applies, otherwise the default build.  The two twins are
+    exclusive."""
+    spec = _spec_sample_flag(cluster, ept, stream, vocab)
+    return spec if spec else _coarse_sample_flag(cluster, ept, stream, top_k_max)
 
 
 @functools.cache
@@ -898,8 +952,8 @@ def top_k_top_p_sampling_from_probs(
     # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
     # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
     if fused:
-        launch_flags = _FLAG_FUSE_TAIL | _coarse_sample_flag(
-            cluster, ept, bool(stream_variant), kmax
+        launch_flags = _FLAG_FUSE_TAIL | _sample_build_flag(
+            cluster, ept, bool(stream_variant), kmax, vocab
         )
     elif fused_block:
         launch_flags = _FLAG_FUSE_BLOCK_TAIL
@@ -912,6 +966,7 @@ def top_k_top_p_sampling_from_probs(
             launch_flags |= _row_span_diet_flag(
                 cluster, True, kmax, probs.device.index or 0
             )
+            launch_flags |= _spec_sample_flag(cluster, ept, True, vocab)
     module.radix_topk(
         probs,
         k_arr,
@@ -1045,9 +1100,9 @@ def top_k_probs_to_slab(
         0,
         0,
         0,
-        # no fused tail, no PDL dependent follows; the coarse-sample build for a small top-k on a stream,
-        # the row-span filter arm for a large one on a cluster-8 stream
-        _coarse_sample_flag(cluster, ept, bool(stream_variant), kmax)
+        # no fused tail, no PDL dependent follows; the speculative- or coarse-sample build on a stream,
+        # the row-span filter arm for a large top-k on a cluster-8 stream
+        _sample_build_flag(cluster, ept, bool(stream_variant), kmax, vocab)
         | _row_span_diet_flag(
             cluster, bool(stream_variant), kmax, probs.device.index or 0
         ),

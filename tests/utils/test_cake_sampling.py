@@ -1333,6 +1333,7 @@ def test_adv_vocab_not_multiple_of_chunk(vocab):
         if 512 * v["cluster"] * v["ept"] >= vocab
         and not v["fused_block_tail"]
         and not v["coarse_sample"]
+        and not v["spec_sample"]
     ][:4]
     first = None
     for v in variants:
@@ -1395,6 +1396,7 @@ def test_adv_bitwise_across_launch_graph_and_every_variant():
         if 512 * v["cluster"] * v["ept"] >= vocab
         and not v["fused_block_tail"]
         and not v["coarse_sample"]
+        and not v["spec_sample"]
     ]
     s23 = sorted(
         {
@@ -1475,6 +1477,7 @@ def test_coarse_sample_build_matches_default_build():
         (v["cluster"], v["ept"], bool(v["stream"])): v
         for v in man["stage1"]
         if not v["fused_block_tail"] and not v["coarse_sample"]
+        and not v["spec_sample"]
     }
     streams = [(c, e) for (c, e, st) in defaults if st]
     assert [(v["cluster"], v["ept"]) for v in coarse] == streams
@@ -1622,6 +1625,191 @@ def test_coarse_sample_build_matches_default_build():
         )
 
 
+def test_spec_sample_build_matches_default_build():
+    """Every streaming variant ships a speculative-sample twin (`_sp`, launch_flags bit 6): its first register chunk
+    doubles as the sample (no separate sampled read), the exact passes and fallbacks are the same, and the slab /
+    samples / renorm are bitwise identical to the default build on adversarial rows for every k regime.  The bit is
+    rejected on register-resident variants and together with bits 3 / 4; the host sets it for every ept-16 stream and
+    for ept-32 streams at one chunk, two chunks on a cluster of 8, or at least 16 register chunks per CTA, and never
+    together with bit 4."""
+    _require_supported_device()
+    import flashinfer.cake_sampling as cs
+
+    man = load_manifest()
+    spec = [v for v in man["stage1"] if v["spec_sample"]]
+    defaults = {
+        (v["cluster"], v["ept"], bool(v["stream"])): v
+        for v in man["stage1"]
+        if not v["fused_block_tail"] and not v["coarse_sample"] and not v["spec_sample"]
+    }
+    streams = [(c, e) for (c, e, st) in defaults if st]
+    assert [(v["cluster"], v["ept"]) for v in spec] == streams
+    assert all(
+        v["stream"]
+        and v["fused_tail"]
+        and not v["fused_block_tail"]
+        and not v["coarse_sample"]
+        and v["symbol"].endswith("s_sp")
+        for v in spec
+    )
+    assert all(
+        not v["symbol"].endswith("_sp") for v in man["stage1"] if not v["spec_sample"]
+    )
+    assert all(cs._stage1_has_spec_sample(c, e, True) for c, e in streams)
+    assert not any(
+        cs._stage1_has_spec_sample(c, e, False) for (c, e, st) in defaults if not st
+    )
+    kcap = int(man["fused_tail_kcap"])
+    # policy: every ept-16 stream; ept-32 streams at one or >= 16 register chunks per CTA; exclusive with bit 4
+    assert cs._spec_sample_flag(4, 16, True, 32768) == cs._FLAG_SPEC_SAMPLE
+    assert cs._spec_sample_flag(2, 16, True, 32768) == cs._FLAG_SPEC_SAMPLE
+    assert cs._spec_sample_flag(1, 16, True, 131072) == cs._FLAG_SPEC_SAMPLE
+    assert cs._spec_sample_flag(8, 32, True, 128256) == cs._FLAG_SPEC_SAMPLE  # one chunk
+    assert cs._spec_sample_flag(1, 32, True, 262144) == cs._FLAG_SPEC_SAMPLE  # 16 chunks
+    assert cs._spec_sample_flag(8, 32, True, 262144) == cs._FLAG_SPEC_SAMPLE  # two chunks on cluster 8
+    assert cs._spec_sample_flag(4, 32, True, 262144) == 0  # 4 chunks
+    assert cs._spec_sample_flag(1, 32, True, 151936) == 0  # 10 chunks
+    assert cs._spec_sample_flag(1, 32, True, 32768) == 0  # 2 chunks
+    assert cs._spec_sample_flag(2, 32, True, 262144) == 0  # 8 chunks
+    assert cs._spec_sample_flag(4, 16, False, 32768) == 0
+    assert cs._sample_build_flag(1, 32, True, kcap, 262144) == cs._FLAG_SPEC_SAMPLE
+    assert cs._sample_build_flag(1, 32, True, kcap, 151936) == cs._FLAG_COARSE_SAMPLE
+    assert cs._sample_build_flag(1, 32, True, kcap + 1, 151936) == 0
+    assert cs._sample_build_flag(2, 32, True, kcap, 262144) == cs._FLAG_COARSE_SAMPLE
+    assert cs._sample_build_flag(8, 32, True, 1000, 128256) == cs._FLAG_SPEC_SAMPLE
+    assert cs._sample_build_flag(8, 32, True, 1000, 262144) == cs._FLAG_SPEC_SAMPLE
+    assert cs._sample_build_flag(8, 32, True, kcap, 262144) == cs._FLAG_SPEC_SAMPLE
+    assert cs._sample_build_flag(4, 16, False, 10, 32768) == 0
+    if not _device_streams():
+        pytest.skip(
+            "165 KB streaming variants exceed this device's shared-memory opt-in"
+        )
+    for vocab, batch in ((32768, 5), (128256, 3), (151937, 2), (262144, 2)):
+        probs = _probs(batch, vocab, seed=784 + vocab % 89)
+        pn = probs.cpu().numpy()
+        pn[0, (np.arange(1500) * 11) % vocab] = np.float32(
+            2**-12
+        )  # ties across the k cut
+        pn[1, [3, 5000]] = np.inf
+        pn[-1, : vocab // 2] = 0.0  # a half-zero row (a huge low bucket)
+        probs.copy_(torch.tensor(pn, device="cuda"))
+        k_row = torch.tensor(
+            [max(1, (64 * (i + 1)) // batch) for i in range(batch)],
+            device="cuda",
+            dtype=torch.int32,
+        )
+        for c, e in streams:
+            s1 = (c, e, True)
+            for k, p in ((10, 0.9), (64, 0.5), (k_row, 1e-6), (1000, 0.9), (200, 1.0)):
+                base = _run(probs, k, p, 0x784, 5, variant=(s1, (256, 4)), flags=0)
+                spec_run = _run(
+                    probs,
+                    k,
+                    p,
+                    0x784,
+                    5,
+                    variant=(s1, (256, 4)),
+                    flags=cs._FLAG_SPEC_SAMPLE,
+                )
+                assert np.array_equal(base.count, spec_run.count), (
+                    vocab,
+                    c,
+                    e,
+                    k if isinstance(k, int) else "row",
+                )
+                for r in range(batch):
+                    kr = int(base.count[r])
+                    assert np.array_equal(base.idx[r, :kr], spec_run.idx[r, :kr]), (
+                        vocab,
+                        c,
+                        e,
+                        r,
+                    )
+                    assert np.array_equal(
+                        base.vals[r, :kr].view(np.uint32),
+                        spec_run.vals[r, :kr].view(np.uint32),
+                    )
+                # the fused two-warp tail on both builds: samples and renorm bitwise equal
+                if isinstance(k, int) and k <= kcap:
+                    base_f = _run(
+                        probs, k, p, 0x784, 5, variant=(s1, (256, 4)), flags=1
+                    )
+                    spec_f = _run(
+                        probs,
+                        k,
+                        p,
+                        0x784,
+                        5,
+                        variant=(s1, (256, 4)),
+                        flags=1 | cs._FLAG_SPEC_SAMPLE,
+                    )
+                    _check(base_f, pn, k, p, 0x784, 5)
+                    assert np.array_equal(base_f.samples, spec_f.samples), (
+                        vocab,
+                        c,
+                        e,
+                        k,
+                    )
+                    for r in range(batch):
+                        kr = int(base_f.count[r])
+                        assert np.array_equal(
+                            base_f.renorm[r, :kr].view(np.uint32),
+                            spec_f.renorm[r, :kr].view(np.uint32),
+                        )
+    # bit 6 on a register-resident variant and together with bit 3 or bit 4 is rejected
+    module = load_cake_sampling_module()
+    probs2 = _probs(2, 32768, seed=5)
+    vals, idxs, cnt = _ws(2)
+    out2 = torch.empty(2, device="cuda", dtype=torch.int32)
+    stream = torch.cuda.current_stream().cuda_stream
+    for flags, c, e, st in (
+        (cs._FLAG_SPEC_SAMPLE, 4, 16, 0),
+        (cs._FLAG_SPEC_SAMPLE | 8, streams[0][0], streams[0][1], 1),
+        (cs._FLAG_SPEC_SAMPLE | cs._FLAG_COARSE_SAMPLE, streams[0][0], streams[0][1], 1),
+    ):
+        with pytest.raises(Exception, match="launch_flags bit"):
+            module.radix_topk(
+                probs2,
+                cnt,
+                50,
+                1,
+                vals,
+                idxs,
+                cnt,
+                c,
+                e,
+                st,
+                probs2,
+                0.9,
+                1,
+                out2,
+                vals,
+                1,
+                0,
+                0,
+                flags,
+                stream,
+            )
+    # the pipeline route: the speculative build exactly where the policy says, else the coarse one at k <= 64
+    for vocab, batch, k in ((262144, 64, 50), (262144, 64, 1000), (32768, 4, 50), (262144, 1, 1000)):
+        c, e, st = cs.choose_stage1(batch, vocab, top_k_max=k)
+        chunks = -(-vocab // (512 * e * c))
+        want_spec = bool(st) and (e < 32 or chunks == 1 or (chunks == 2 and c >= 8) or chunks >= 16)
+        want = (
+            cs._FLAG_SPEC_SAMPLE
+            if want_spec
+            else (cs._FLAG_COARSE_SAMPLE if (st and k <= kcap) else 0)
+        )
+        assert cs._sample_build_flag(c, e, bool(st), k, vocab) == want, (
+            vocab,
+            batch,
+            k,
+            c,
+            e,
+            st,
+        )
+
+
 def test_row_span_diet_flag_matches_default_build():
     """Launch flag bit 5 (the streaming variants' row-span filter-arm switch, lever FD5) changes which filter arm a
     row takes, never its candidate segments: slab and count (and samples / renorm with the fused tail) are bitwise
@@ -1636,7 +1824,10 @@ def test_row_span_diet_flag_matches_default_build():
         {
             (v["cluster"], v["ept"])
             for v in man["stage1"]
-            if v["stream"] and not v["fused_block_tail"] and not v["coarse_sample"]
+            if v["stream"]
+            and not v["fused_block_tail"]
+            and not v["coarse_sample"]
+            and not v["spec_sample"]
         }
     )
     kcap = int(man["fused_tail_kcap"])
@@ -1768,7 +1959,9 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     # The whole-CTA tail is a separate build (`_bt` twin) of every variant with the two-warp tail; the default
     # build (taken by every launch without bit 3) never carries it.
     defaults = [
-        v for v in man["stage1"] if not v["fused_block_tail"] and not v["coarse_sample"]
+        v
+        for v in man["stage1"]
+        if not v["fused_block_tail"] and not v["coarse_sample"] and not v["spec_sample"]
     ]
     twins = [v for v in man["stage1"] if v["fused_block_tail"]]
     default_keys = {(v["cluster"], v["ept"], v["stream"]) for v in defaults}
@@ -1783,7 +1976,8 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
     fused_device = cs._block_tail_enabled(0)
     streams_ok = _device_streams()
     # the fused-vs-chain identity check needs a `_bt` build to launch; round 5 ships none (see the policy asserts below)
-    for vocab, batch in ((32768, 5), (128256, 3), (262144, 2)) if twins else ():
+    fused_cells = 0
+    for vocab, batch in ((151936, 2), (262144, 4), (262144, 8), (32768, 5), (128256, 3)) if twins else ():
         if vocab > 196608 and not streams_ok:
             continue
         probs = _probs(batch, vocab, seed=748 + vocab % 97)
@@ -1797,16 +1991,13 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
         k_row[0] = kcap
         k_row[-1] = 32
         p_row = torch.linspace(0.3, 1.0, batch, device="cuda", dtype=torch.float32)
-        c, e, st = cs.choose_stage1(batch, vocab, top_k_max=kcap)
-        if fused_device:
-            assert cs._fuse_block_tail(batch, c, e, bool(st), sm, kcap, False), (
-                vocab,
-                batch,
-                c,
-                e,
-                st,
-            )
-        for k, p in ((kcap, 0.9), (65, 0.5), (200, 1e-6), (k_row, p_row)):
+        c, e, st = cs.choose_stage1(batch, vocab, top_k_max=kcap, two_launch=False)
+        if not cs._fuse_block_tail(batch, c, e, bool(st), sm, kcap, False):
+            # round 7: only a cluster-8 stream above k = 768 on a one-wave grid takes the twin
+            assert not (st and c >= 8 and batch * c <= sm), (vocab, batch, c, e, st)
+            continue
+        fused_cells += 1
+        for k, p in ((kcap, 0.9), (1000, 0.5), (cs._BLOCK_TAIL_MIN_K + 1, 1e-6), (k_row, p_row)):
             with monkeypatch.context() as m:
                 m.setattr(cs, "_fuse_block_tail", lambda *a, **kw: False)
                 two, _ = _run_and_check(probs, k, p, 0x748, 3)
@@ -1831,23 +2022,35 @@ def test_block_tail_matches_two_launch_form(monkeypatch):
                     fused.renorm[r, :kr].view(np.uint32),
                 )
             del kk
-    # the one-wave rule and the tail-less (8, 48) never fuse; a small top-k or one above the slab is not a
-    # block-tail launch
+    if twins and fused_device and streams_ok:
+        assert fused_cells >= 1, "no cell of this device's dispatch took the whole-CTA tail"
+    # the rule (round 7, lever (b), CUDA-graph replay): a cluster-8 stream with top_k_max > 768 on a one-wave grid;
+    # residents, smaller clusters, k <= 768, multi-wave grids, the tail-less (8, 48), a top-k above the slab and a
+    # two-launch device never fuse
+    assert cs._fuse_block_tail(4, 8, 16, True, 148, 1000, False)
+    assert cs._fuse_block_tail(8, 8, 32, True, 148, kcap, False)
+    assert not cs._fuse_block_tail(4, 8, 16, True, 148, cs._BLOCK_TAIL_MIN_K, False)
+    assert not cs._fuse_block_tail(4, 8, 16, True, 148, 500, False)
+    assert not cs._fuse_block_tail(1, 8, 32, False, 148, 1000, False)
+    assert not cs._fuse_block_tail(16, 4, 16, True, 148, 1000, False)
+    assert not cs._fuse_block_tail(1, 4, 16, False, 148, 1000, False)
     assert not cs._fuse_block_tail(1024, 8, 16, True, 148, 1000, False)
     assert not cs._fuse_block_tail(1, 8, 48, False, 148, 1000, False)
-    assert not cs._fuse_block_tail(1, 4, 16, False, 148, 64, False)
-    assert not cs._fuse_block_tail(1, 4, 16, False, 148, kcap + 1, False)
-    assert not cs._fuse_block_tail(1, 4, 16, False, 148, 1000, True)
-    # round 5 ships no whole-CTA-tail build: no capability fuses k > 64 and no variant reports a `_bt` twin
-    assert not any(v["fused_block_tail"] for v in man["stage1"])
-    assert not cs._fuse_block_tail(1, 4, 16, False, 148, 1000, False)
+    assert not cs._fuse_block_tail(4, 8, 16, True, 148, 64, False)
+    assert not cs._fuse_block_tail(4, 8, 16, True, 148, kcap + 1, False)
+    assert not cs._fuse_block_tail(4, 8, 16, True, 148, 1000, True)
+    # round 7 ships the `_bt` twin of every variant built with the two-warp tail (lever (b)); B200 and GB300 run it
+    # for the cluster-8 streams at k > 768, the other capabilities keep the chain until their graph-replay A/B is recorded
+    assert [(v["cluster"], v["ept"], bool(v["stream"])) for v in twins] == [
+        (v["cluster"], v["ept"], bool(v["stream"])) for v in defaults if v["fused_tail"]
+    ]
     assert {
         cc: cs._block_tail_for_capability(cc)
         for cc in ((9, 0), (10, 0), (10, 3), (10, 7), (12, 0))
     } == {
         (9, 0): False,
-        (10, 0): False,
-        (10, 3): False,
+        (10, 0): True,
+        (10, 3): True,
         (10, 7): False,
         (12, 0): False,
     }
@@ -1906,6 +2109,7 @@ def test_fused_tail_matches_two_launch_form():
             for v in man["stage1"]
             if not v["fused_block_tail"]
             and not v["coarse_sample"]
+            and not v["spec_sample"]
             and (
                 (v.get("stream", 0) and streams_ok)
                 or (not v.get("stream", 0) and 512 * v["cluster"] * v["ept"] >= vocab)
@@ -1980,7 +2184,7 @@ def test_early_trigger_flag_and_bitwise_outputs():
     for k, p in ((1000, 0.9), (200, 0.5)):
         base = _run_and_check(probs, k, p, 0xEA51, 4)[0]
         for v in man["stage1"]:
-            if v["fused_block_tail"] or v["coarse_sample"]:
+            if v["fused_block_tail"] or v["coarse_sample"] or v["spec_sample"]:
                 continue  # the `_bt` / `_cs` twins are the same variant (bits 3 / 4; their own tests exercise them)
             if v.get("stream", 0) and not streams_ok:
                 continue  # 165 KB streaming variants exceed the 12.x opt-in

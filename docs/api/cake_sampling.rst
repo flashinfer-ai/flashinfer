@@ -27,17 +27,21 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    ``fused_tail``); the ``(8, 48)`` resident, a large-k pick, is built without it.  For
    ``64 < top_k_max <= 1024`` (``fused_block_tail_kcap``) the same stage can run on the whole first
    CTA of the cluster (512 threads, two slab entries each; launch flag bit 3) on a separate build of
-   the variant (manifest entries with ``fused_block_tail``, symbol suffix ``_bt``).  The frozen
-   bundle ships no such build and no compute capability selects the form: on the shipped kernels it
-   lost to the two-launch chain on every architecture except four H100 cells (round 5, unit 6),
-   while compiling it into the default build had cost every ``top_k <= 64`` launch 4-19 % on
-   H100 / GB300 / R200.  The mechanism stays for a build that wins.  When built, the
-   whole-CTA form is again bitwise identical to the
+   the variant (manifest entries with ``fused_block_tail``, symbol suffix ``_bt``).  Round 7 ships
+   that build for every variant built with the one-warp tail (19 twins): the round-5 twin had run
+   the tail twice through a duplicate block in the stream template (removed in round 7).  The host
+   selects it only for a cluster-8 streaming variant with ``top_k_max > 768`` on a one-wave grid, on
+   B200 and GB300 (compute capabilities 10.0 / 10.3).  Measured under CUDA-graph replay (the eager
+   span of the two-launch chain includes the host gap between its launches, which made the twin
+   look 10-50 % faster everywhere): the in-CTA tail loses to the chain on every resident (B200
+   1.20-1.54x, GB300 1.40-1.84x of the chain's time) and on every stream at k <= 750 (1.0-1.26x at
+   k = 200, 1.04-1.15x at k = 500, 0.94-1.05x at k = 750); the cluster-8 streams at k = 1000 win on
+   both (B200 0.89-0.94, GB300 0.89-0.97).  H100 and R200 keep the chain (no graph-replay A/B
+   recorded for them in round 7).
+   Compiling the tail into the default build had cost every ``top_k <= 64`` launch 4-19 % on H100 /
+   GB300 / R200, so it stays a separate build.  The whole-CTA form is bitwise identical to the
    two-launch form; rows of such a launch whose k is at most 64 take the one-warp tail.  A
-   multi-wave grid keeps the two launches (its first CTA would run one tail per wave), and
-   every architecture keeps them in round 5 (the register-resident cells of B300 / GB300 run 6-9 %
-   slower with the in-kernel tail, and the integrated build lost 5-32 % to the chain on R200, B200
-   and most H100 cells).  In the two-launch form the dispatcher also decides where the dependent kernel lands: stage 1 signals
+   multi-wave grid keeps the two launches (its first CTA would run one tail per wave).  In the two-launch form the dispatcher also decides where the dependent kernel lands: stage 1 signals
    ``griddepcontrol.launch_dependents`` before its first pass only when the batch fits on the
    SMs its last wave leaves free (one stage-1 CTA per SM), so the stage-2/3 CTAs are never
    packed onto the few SMs free mid-flight; larger batches let the dependent launch as stage 1
@@ -45,8 +49,8 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    (compute capability 10.x); on Hopper it signals after its filter pass, once the whole row
    has been read, where the round-3 kernels did.  All three decisions travel in the stage-1
    ``launch_flags`` argument (bit 0 one-warp tail, bit 1 early trigger, bit 2 stream pre-pass
-   point, bit 3 whole-CTA tail, bit 4 coarse sample, bit 5 row-span filter arm) and none changes
-   any output.  Bit 4 selects a
+   point, bit 3 whole-CTA tail, bit 4 coarse sample, bit 5 row-span filter arm, bit 6 speculative
+   sample) and none changes any output.  Bit 4 selects a
    streaming variant's coarse-sample build (manifest entries with ``coarse_sample``, symbol suffix
    ``_cs``): its sampled first pass reads one 64-byte block per 512 bytes of the row (1/8) instead of
    one per 256 (1/4), with the lower-bucket margin, the sampled-mass cap and the filter-arm density
@@ -62,7 +66,18 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    cluster-8 row at k ~ 1000 never took the arm); both arms build identical candidate segments.  The
    host sets it for cluster >= 8 streams whose largest top-k exceeds ``fused_tail_kcap`` on Hopper,
    B200 and GB300 (round 6, lever FD5: the V = 262144 cluster-8 k = 1000 cells run 2-5 % faster);
-   a cluster-1 row that takes the arm can lose 5 % and Rubin measures neutral, so nothing else.
+   a cluster-1 row that takes the arm can lose 5 % and Rubin measures neutral, so nothing else.  Bit 6 selects a streaming variant's speculative-sample build (manifest entries with
+   ``spec_sample``, symbol suffix ``_sp``): there is no separate sampled read; every warp loads its
+   first register chunk (and the second where the row has one), histograms a strided subset of those
+   registers as the sample (1/8 of the row for a largest top-k at most ``fused_tail_kcap``, 1/2
+   above), keeps the chunk for the filter pass, which continues from the next chunk, and scales the
+   lower-bucket margin and the sampled-mass cap to the realised rate, so again every output is
+   bit-identical to the default build.  The host sets it for every ept-16 stream and for ept-32
+   streams whose rows are one register chunk per CTA, two chunks on a cluster of 8, or at least 16
+   chunks (round 7, lever SP: ept-16 streams 2-13 % faster at 1-16 chunks, the cluster-8 ept-32
+   stream 13-18 % at one chunk and 0-6 % at two, the cluster-1 ept-32 stream at 16 chunks 2-15 %);
+   ept-32 streams at 2-10 chunks per CTA on clusters 1-4 measured 0-6 % slower with it and keep
+   their round-6 build.  Bits 4 and 6 are exclusive.
 
 The stage-2/3 kernel exists in three static forms that differ only in instruction selection,
 never in output: the base form (f64 top-p cut / sample tests, max-min bitonic exchange), a form
@@ -135,9 +150,9 @@ last, on all four GPUs, so the two-launch path charges that per-launch cost to t
 keeps the ept-16 stream there.
 
 A launch whose largest top-k is above 64 has two regimes and the same table ranks the variants in
-both: the *fused* regime (H100 / B200 / R200: a one-wave candidate finishes in one kernel with the
-whole-CTA tail, a multi-wave or tail-less candidate pays the stage-2/3 kernel) and the *two-launch*
-regime (B300 / GB300, or ``two_launch=True``).  ``choose_stage1(..., two_launch=)`` selects it (None
+both: the *fused* regime (B200 / GB300 in round 7: a one-wave cluster-8 stream above k = 768 finishes
+in one kernel with the whole-CTA tail, every other candidate pays the stage-2/3 kernel) and the
+*two-launch* regime (H100 / R200, or ``two_launch=True``).  ``choose_stage1(..., two_launch=)`` selects it (None
 = the device's policy).  The k > 64 constants were re-fitted in round 5 on same-run per-variant
 sweeps of the chain and of the fused form (32 ``(V, B)`` cells per architecture, k = 1000): the
 per-bucket list path of the streams costs per chunk rather than per wave (``stream_large_k_chunk_us``
