@@ -3065,6 +3065,24 @@ def test_sm12x_nvfp4_rejects_non_default_swiglu():
 
 
 @sm12x_nvfp4_bf16_required
+def test_sm12x_nvfp4_rejects_relu2_narrower_than_one_n_tile():
+    # Unfused ReLU2 GEMM1 tiles N in 128 columns; a narrower I has no valid tile.
+    from flashinfer.fused_moe.cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (
+        _check_shape,
+    )
+
+    with pytest.raises(ValueError, match="ReLU2"):
+        _check_shape(256, 64, 64)
+    _check_shape(256, 64, 128)  # fused SwiGLU GEMM1 tiles I in 64 columns
+    config = _sm12x_nvfp4_config(
+        ReLU2(), num_experts=4, top_k=2, intermediate_size=64, max_num_tokens=8
+    )
+    runner = SM12xNvfp4Runner(config, torch.device("cuda"))
+    with pytest.raises(NotImplementedError, match="ReLU2"):
+        runner._check_support()
+
+
+@sm12x_nvfp4_bf16_required
 @pytest.mark.parametrize("activation", (SwiGLU(), ReLU2()))
 def test_sm12x_nvfp4_reads_the_shared_cutile_view(activation):
     view, make_activations, reference = _make_sm12x_nvfp4_case(

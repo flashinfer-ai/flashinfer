@@ -8140,6 +8140,10 @@ class SM12xNvfp4Runner(SM12xNvfp4Bf16Runner):
             raise NotImplementedError(
                 f"SM12x NVFP4 requires intermediate_size % 64 == 0, got {inter}."
             )
+        if not self.config.activation.is_gated and inter < 128:
+            raise NotImplementedError(
+                f"SM12x NVFP4 ReLU2 requires intermediate_size >= 128, got {inter}."
+            )
 
     def _build(self) -> None:
         from .cute_dsl.blackwell_sm12x.moe_nvfp4_w4a4 import (

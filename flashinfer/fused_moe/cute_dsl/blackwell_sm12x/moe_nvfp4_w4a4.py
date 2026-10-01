@@ -1155,6 +1155,11 @@ def _check_shape(H: int, I: int, N13: int) -> None:
         )
     if N13 not in (I, 2 * I):
         raise ValueError(f"w13 must have I or 2*I rows, got {N13} for I={I}.")
+    if N13 == I and I < BN:
+        # unfused GEMM1 clamps its last N tile to NCOL - BN, negative below BN
+        raise ValueError(
+            f"SM12x W4A4 ReLU2 MoE needs intermediate_size >= {BN}, got {I}."
+        )
 
 
 def _entry(T, H, I, N13, E, TOPK, dev):
