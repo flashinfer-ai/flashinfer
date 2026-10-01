@@ -506,8 +506,15 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         and (n + 63) // 64 <= TWO_CTA_SINGLE_TILE_MAX_W_TILES
     ):
         # One 128-token tile over a few 64-wide weight tiles: the 2-CTA pair loads the
-        # real token rows once (no grouped raster, no CLC on these short rows).
-        return {**tactic, "two_cta": True, "a_hint": None, "b_hint": "evict_first"}
+        # real token rows once (no grouped raster, no CLC on these short rows), as a
+        # half-M pair (64 token rows per CTA, cta_group::2 M = 128).
+        return {
+            **tactic,
+            "two_cta": True,
+            "a_hint": None,
+            "b_hint": "evict_first",
+            "half_m": True,
+        }
     if (
         m <= BLOCK_M
         and tile_m == BLOCK_M
@@ -543,7 +550,35 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
     tok_tiles = (m + tile_m - 1) // tile_m
     if tok_tiles <= 2:
         tactic["a_hint"], tactic["b_hint"] = None, "evict_first"
+    if _half_m_pair_rows(m, n, tile_n, sm_count, tactic):
+        tactic["half_m"] = True
     return tactic
+
+
+def _half_m_pair_rows(
+    m: int, n: int, tile_n: int, sm_count: int, tactic: dict[str, Any]
+) -> bool:
+    """The 64-wide 2-CTA tiles of the narrow-N rows run as half-M pairs (64 token rows per
+    CTA) while the half-M grid fits 1.5 waves of pairs (1.3 waves measured faster alone and
+    in the quantize + GEMM chain, 1.6 waves faster alone but slower in the chain, 2.2 waves
+    slower); the half-M program has no CLC or grouped-raster variant."""
+    if (
+        tile_n != 64
+        or not tactic.get("two_cta")
+        or tactic.get("sched") == "clc"
+        or tactic.get("raster_group")
+    ):
+        return False
+    w_tiles = (n + 63) // 64
+    pairs = max(1, sm_count // 2)
+    return (
+        w_tiles <= TWO_CTA_SINGLE_TILE_MAX_W_TILES
+        and ((m + 63) // 64) * w_tiles <= pairs + pairs // 2
+    )
+
+
+def sched_is_clc(tactic: dict[str, Any]) -> bool:
+    return str(tactic.get("sched", "static")) == "clc"
 
 
 def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
@@ -553,6 +588,8 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append("k512")
     if tactic.get("two_cta"):
         parts.append("2cta")
+    if tactic.get("half_m"):
+        parts.append("hm")
     if int(tactic.get("split_k", 1)) > 1:
         parts.append(f"sk{int(tactic['split_k'])}")
     parts.append("f16" if out_f16 else "bf16")
@@ -665,7 +702,17 @@ def gemm_plan(
         raise ValueError("the cluster A-multicast is a 1-CTA m-orientation tactic")
     if amc > 1 and m > BLOCK_M:
         raise ValueError("the cluster A-multicast tactic serves one 128-token tile")
-    tok_tile = tile_n if alpha_n else (2 * BLOCK_M if two_cta else BLOCK_M)
+    half_m = bool(tactic.get("half_m", False))
+    if half_m and (not two_cta or sched_is_clc(tactic) or tactic.get("raster_group")):
+        raise ValueError(
+            "half_m is a 2-CTA program knob without CLC scheduler or grouped raster"
+        )
+    # 2-CTA pairs cover 256 token rows (128 per CTA), half-M pairs 128 (64 per CTA).
+    tok_tile = (
+        tile_n
+        if alpha_n
+        else ((BLOCK_M if half_m else 2 * BLOCK_M) if two_cta else BLOCK_M)
+    )
     w_tile = BLOCK_M if alpha_n else tile_n
     tok_tiles = (m + tok_tile - 1) // tok_tile
     w_tiles = (n + w_tile - 1) // w_tile
@@ -1094,6 +1141,10 @@ def prepare_mm_fp4_per_token(
         num_tiles=plan.num_tiles,
         grid=(plan.grid, 1, 1),
     )
+    if plan.tactic.get("two_cta"):
+        # The 2-CTA programs also take the flat u8 scale tensors: the half-M pair gathers
+        # the words of its 64-row halves from them with register-path cp.async.
+        kwargs["SFA_RAW"], kwargs["SFB_RAW"] = a_flat, b_flat
     with torch.cuda.device(_device_index(device)):
         launch = _bind(kernel_module_name(arch, plan.kernel_key), kwargs)
     return NVFP4PerTokenGemmRunner(plan, out, (launch,))
