@@ -17,3 +17,11 @@ The TIRx KDA kernels are adapted from NVlabs/kda (260927-kda-for-kda),
 Copyright (c) 2026 KDA Team, under the MIT License (licenses/LICENSE.kda-for-kda).
 The split kernel also retains its original Apache-2.0 TIRx-author attribution.
 Source: https://github.com/NVlabs/kda/tree/260927-kda-for-kda
+
+The top_k_varlen "sglang" backend bundles the DeepSeek-V4 top-k kernel of SGLang
+(https://github.com/sgl-project/sglang, commit 7f27bf4708), Copyright SGLang Team,
+under the Apache License 2.0 (licenses/LICENSE.sglang.txt); see csrc/sglang_dsv4/VENDORED.md.
+
+The top_k_varlen "cutlass_primitives" backend bundles the cutlass-primitives CuTe-DSL
+library under the Apache License 2.0 (flashinfer/topk_varlen/cutlass_primitives/LICENSE);
+see flashinfer/topk_varlen/cutlass_primitives/VENDORED.md.
