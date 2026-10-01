@@ -7900,6 +7900,7 @@ class SM12xNvfp4Bf16Runner(MoERunner):
         if self.device.type == "cuda" and self.device.index is None:
             self.device = torch.device("cuda", torch.cuda.current_device())
         self.tuning_config = TuningConfig()
+        self._workspaces: dict[int, list[torch.Tensor]] = {}
 
     def _check_activation_parameters(self) -> None:
         activation = self.config.activation
@@ -7928,9 +7929,36 @@ class SM12xNvfp4Bf16Runner(MoERunner):
             )
 
     def _build(self) -> None:
-        from .cute_dsl.blackwell_sm12x.moe_nvfp4_w4a16 import run_moe_w4a16
+        from .cute_dsl.blackwell_sm12x.moe_nvfp4_w4a16 import (
+            allocate_workspace,
+            run_moe_w4a16,
+        )
 
         self._run = run_moe_w4a16
+        self._allocate_workspace = allocate_workspace
+
+    def _workspace(self, capacity: int, hidden_size: int) -> list[torch.Tensor]:
+        # One per token bucket and runner: layers never share scratch, and the
+        # persistent kernel's completion counters stay private to this layer.
+        workspace = self._workspaces.get(capacity)
+        if workspace is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"{type(self).__name__} workspace for token bucket {capacity} "
+                    "must be allocated before CUDA Graph capture; warm this bucket "
+                    "first."
+                )
+            workspace = self._allocate_workspace(
+                num_tokens=capacity,
+                hidden_size=hidden_size,
+                intermediate_size=self.config.experts.intermediate_size,
+                num_experts=self.config.routing.num_experts,
+                top_k=self.config.routing.top_k,
+                is_gated=self.config.activation.is_gated,
+                device=self.device,
+            )
+            self._workspaces[capacity] = workspace
+        return workspace
 
     def get_valid_tactics(self, inputs: List[torch.Tensor], profile: Any) -> List[Any]:
         self._require_built()
@@ -8060,7 +8088,8 @@ class SM12xNvfp4Bf16Runner(MoERunner):
         if tactic != -1:
             raise ValueError(f"{type(self).__name__} supports only tactic -1.")
         out, x, ids, topk_weights, w1, s1, g1, w2, s2, g2 = inputs
-        self._run(x, ids, topk_weights, w1, s1, g1, w2, s2, g2, out)
+        workspace = self._workspace(x.shape[0], x.shape[1])
+        self._run(x, ids, topk_weights, w1, s1, g1, w2, s2, g2, out, workspace)
         return out[: getattr(inputs, "num_tokens", out.shape[0])]
 
 

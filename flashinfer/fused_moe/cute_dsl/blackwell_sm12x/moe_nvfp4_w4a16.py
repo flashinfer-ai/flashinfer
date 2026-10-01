@@ -27,6 +27,7 @@ Two execution paths, chosen by the host from the number of routed slots:
 """
 
 import math
+from typing import Optional
 
 import cuda.bindings.driver as cuda
 import cutlass
@@ -751,16 +752,22 @@ def k_gemm2(
             if n < H:
                 for m in cutlass.range_constexpr(BM):
                     if cutlass.Int32(m) < mc:
+                        # a zero weight (dead slot) is skipped, not multiplied:
+                        # its accumulator may be inf, and inf * 0 is NaN
                         if cutlass.const_expr(NOROUTE):
-                            cute.arch.atomic_add(
-                                gOF.iterator + ((by // TOPK) * H + n),
-                                acc[m] * gs * (gWts[by] * live),
-                            )
+                            w = gWts[by] * live
+                            if w != cutlass.Float32(0.0):
+                                cute.arch.atomic_add(
+                                    gOF.iterator + ((by // TOPK) * H + n),
+                                    acc[m] * gs * w,
+                                )
                         else:
-                            cute.arch.atomic_add(
-                                gOF.iterator + (gStok[m0 + m] * H + n),
-                                acc[m] * gs * gSwt[m0 + m],
-                            )
+                            w = gSwt[m0 + m]
+                            if w != cutlass.Float32(0.0):
+                                cute.arch.atomic_add(
+                                    gOF.iterator + (gStok[m0 + m] * H + n),
+                                    acc[m] * gs * w,
+                                )
 
 
 @cute.kernel
@@ -1189,11 +1196,13 @@ def k_fused(
         for si in cutlass.range_constexpr(len(sfl2)):
             acc2[0] = acc2[0] + cute.arch.shuffle_sync_bfly(acc2[0], sfl2[si])
         if kh2 == 0:
+            w2s = gWts[(tok, ksl)] * live2
             if n < H:
-                cute.arch.atomic_add(
-                    gOF.iterator + (tok * cutlass.Int32(H) + n),
-                    acc2[0] * gs2 * (gWts[(tok, ksl)] * live2),
-                )
+                if w2s != cutlass.Float32(0.0):
+                    cute.arch.atomic_add(
+                        gOF.iterator + (tok * cutlass.Int32(H) + n),
+                        acc2[0] * gs2 * w2s,
+                    )
         cute.arch.barrier()
         if tid == 0:
             old = cute.arch.atomic_add(
@@ -1618,11 +1627,12 @@ def _planA(H, N13, I, S):
     return bestc[1], bestc[2]
 
 
+# Plans and compiled kernels only: scratch belongs to the caller (see
+# ``allocate_workspace``) so layers and concurrent streams never share it.
 _COMPILED: dict = {}
-_SCRATCH: dict = {}
 
 
-def _persistent_plan(T, H, I, N13, TOPK, S, dev, w13_sf, w2_sf):
+def _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2):
     """Plan for the single persistent kernel (one routed slot per expert tile)."""
     tiles = _planA(H, N13, I, S)
     if tiles is None:
@@ -1642,12 +1652,12 @@ def _persistent_plan(T, H, I, N13, TOPK, S, dev, w13_sf, w2_sf):
         H=H,
         I=I,
         N13=N13,
-        E=w13_sf.shape[0],
+        E=sf13[0],
         SWIGLU=N13 == 2 * I,
-        CP13=w13_sf.shape[2],
-        NSF13=w13_sf.shape[1] * w13_sf.shape[2],
-        CP2=w2_sf.shape[2],
-        NSF2=w2_sf.shape[1] * w2_sf.shape[2],
+        CP13=sf13[2],
+        NSF13=sf13[1] * sf13[2],
+        CP2=sf2[2],
+        NSF2=sf2[1] * sf2[2],
         KT1=KT1,
         KTP1=KTP1,
         TPR1=TPR1,
@@ -1672,12 +1682,12 @@ def _persistent_plan(T, H, I, N13, TOPK, S, dev, w13_sf, w2_sf):
         MBPM=max(1, 65536 // (REGCAP * (TN1 * TPR1))),
         # Evict-first weight loads protect the reused lines, but forfeit the L2
         # reuse of slots that share an expert; keep them while sharing is rare.
-        STREAM=bool(w13_sf.shape[0] >= S * 4),
+        STREAM=bool(sf13[0] >= S * 4),
     )
     return consts, OOF + T * H, 4 + S + T
 
 
-def _tiled_plan(T, H, I, N13, E, TOPK, S, BM, w13_sf, w2_sf):
+def _tiled_plan(T, H, I, N13, E, TOPK, S, BM, sf13, sf2):
     """Plan for the separate routing, GEMM, activation and finalize launches."""
     nblk = min(min(E, S) + (S // BM if BM > 1 else 0), S)
     noroute = BM == 1
@@ -1697,10 +1707,10 @@ def _tiled_plan(T, H, I, N13, E, TOPK, S, BM, w13_sf, w2_sf):
         BM=BM,
         SWIGLU=N13 == 2 * I,
         N13=N13,
-        CP13=w13_sf.shape[2],
-        CP2=w2_sf.shape[2],
-        NSF13=w13_sf.shape[1] * w13_sf.shape[2],
-        NSF2=w2_sf.shape[1] * w2_sf.shape[2],
+        CP13=sf13[2],
+        CP2=sf2[2],
+        NSF13=sf13[1] * sf13[2],
+        NSF2=sf2[1] * sf2[2],
         KT1=KT1,
         KTP1=KT1 + (KT1 // 32) * 8,
         TPR1=TPR1,
@@ -1727,6 +1737,63 @@ def _tiled_plan(T, H, I, N13, E, TOPK, S, BM, w13_sf, w2_sf):
     return consts, OOF + T * H + S, S + 3 * BMAX + 1
 
 
+def _scale_shape(E: int, rows: int, k: int) -> tuple[int, int, int]:
+    return (E, (rows + 127) // 128 * 128, ((k // 16) + 3) // 4 * 4)
+
+
+def _entry(T, H, I, N13, E, TOPK, dev):
+    sf13 = _scale_shape(E, N13, H)
+    sf2 = _scale_shape(E, H, I)
+    key = (dev, T, H, I, N13, E, TOPK)
+    entry = _COMPILED.get(key)
+    if entry is None:
+        S = T * TOPK
+        BM = _pick_bm(S, E)
+        plan = (
+            _persistent_plan(T, H, I, N13, TOPK, S, dev, sf13, sf2) if BM == 1 else None
+        )
+        persistent = plan is not None
+        if not persistent:
+            plan = _tiled_plan(T, H, I, N13, E, TOPK, S, BM, sf13, sf2)
+        consts, fp32_elems, int32_elems = plan
+        sizes = (fp32_elems, int32_elems, max(1, S * I))
+        entry = [persistent, consts, sizes, None]
+        _COMPILED[key] = entry
+    return entry
+
+
+def allocate_workspace(
+    num_tokens: int,
+    hidden_size: int,
+    intermediate_size: int,
+    num_experts: int,
+    top_k: int,
+    is_gated: bool,
+    device: torch.device,
+) -> list[torch.Tensor]:
+    """Scratch for one ``run_moe_w4a16`` token count.
+
+    A workspace must not be used by two launches that can run concurrently.
+    It is zero-initialized once: the persistent kernel restores its counters
+    and FP32 combine slice to zero on exit.
+    """
+    N13 = intermediate_size * (2 if is_gated else 1)
+    _, _, sizes, _ = _entry(
+        num_tokens,
+        hidden_size,
+        intermediate_size,
+        N13,
+        num_experts,
+        top_k,
+        torch.device(device),
+    )
+    return [
+        torch.zeros(sizes[0], dtype=torch.float32, device=device),
+        torch.zeros(sizes[1], dtype=torch.int32, device=device),
+        torch.empty(sizes[2], dtype=torch.bfloat16, device=device),
+    ]
+
+
 @torch.no_grad()
 def run_moe_w4a16(
     hidden_states: torch.Tensor,
@@ -1739,6 +1806,7 @@ def run_moe_w4a16(
     w2_sf: torch.Tensor,
     w2_gs: torch.Tensor,
     out: torch.Tensor,
+    workspace: Optional[list[torch.Tensor]] = None,
 ) -> torch.Tensor:
     """Routed-expert W4A16 MoE forward into ``out``.
 
@@ -1753,6 +1821,8 @@ def run_moe_w4a16(
         w13_gs: FP32 ``[E]`` global scales.
         w2, w2_sf, w2_gs: the same for the ``[E, H, I/2]`` down projection.
         out: BF16 ``[T, H]`` output.
+        workspace: from ``allocate_workspace`` for this token count; a fresh
+            one is allocated when omitted.
 
     Kernels are specialized and cached per token count and weight geometry;
     the first call for a new shape compiles and must not run under CUDA graph
@@ -1762,36 +1832,22 @@ def run_moe_w4a16(
     E, N13, _ = w13.shape
     I = w2.shape[2] * 2
     TOPK = topk_ids.shape[1]
-    S = T * TOPK
     dev = hidden_states.device
-    key = (dev, T, H, I, N13, E, TOPK, w13_sf.shape[1:], w2_sf.shape[1:])
-
-    entry = _COMPILED.get(key)
-    if entry is None:
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError(
-                "SM12x W4A16 MoE must be compiled for this shape before graph capture."
-            )
-        BM = _pick_bm(S, E)
-        plan = (
-            _persistent_plan(T, H, I, N13, TOPK, S, dev, w13_sf, w2_sf)
-            if BM == 1
-            else None
+    if _scale_shape(E, N13, H) != tuple(w13_sf.shape) or _scale_shape(E, H, I) != tuple(
+        w2_sf.shape
+    ):
+        raise ValueError("w13_sf / w2_sf must be [E, pad128(rows), pad4(K/16)].")
+    entry = _entry(T, H, I, N13, E, TOPK, dev)
+    persistent, consts, sizes, compiled = entry
+    if compiled is None and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "SM12x W4A16 MoE must be compiled for this shape before graph capture."
         )
-        persistent = plan is not None
-        if not persistent:
-            plan = _tiled_plan(T, H, I, N13, E, TOPK, S, BM, w13_sf, w2_sf)
-        consts, fp32_elems, int32_elems = plan
-        # Zero-initialized: the persistent kernel restores counters and the FP32
-        # combine slice to zero on exit, so only the first call needs a clear.
-        scratch = [
-            torch.zeros(fp32_elems, dtype=torch.float32, device=dev),
-            torch.zeros(int32_elems, dtype=torch.int32, device=dev),
-            torch.empty(max(1, S * I), dtype=torch.bfloat16, device=dev),
-        ]
-        entry = [persistent, consts, scratch, None]
-        _COMPILED[key] = entry
-    persistent, consts, scratch, compiled = entry
+    if workspace is None:
+        workspace = allocate_workspace(T, H, I, E, TOPK, N13 == 2 * I, dev)
+    elif tuple(t.numel() for t in workspace) != sizes:
+        raise ValueError("workspace was allocated for a different shape.")
+    scratch = workspace
 
     w13_sf_u8 = w13_sf.view(torch.uint8)
     w2_sf_u8 = w2_sf.view(torch.uint8)

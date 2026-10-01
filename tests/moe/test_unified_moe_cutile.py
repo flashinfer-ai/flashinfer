@@ -2716,6 +2716,111 @@ def test_sm12x_nvfp4_bf16_ignores_out_of_range_expert_ids(num_tokens):
 
 
 @sm12x_nvfp4_bf16_required
+@pytest.mark.parametrize("num_tokens", (1, 16, 128))
+def test_sm12x_nvfp4_bf16_dead_slots_stay_finite_on_overflowing_fallback(num_tokens):
+    # Dead slots run expert 0 under a zero weight. With expert 0 overflowing the
+    # FP16 activation, multiplying its inf partial by zero would write NaN.
+    activation = ReLU2()
+    num_experts, top_k = 64, 4
+    view, make_activations, reference = _make_sm12x_nvfp4_bf16_case(
+        activation,
+        num_tokens=num_tokens,
+        hidden_size=2048,
+        intermediate_size=768,
+        num_experts=num_experts,
+        top_k=top_k,
+    )
+    view["w1_global_scale"][0] = 1.0e4
+    weights = MoEWeightPack()
+    weights.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+    layer = MoELayer(
+        _sm12x_nvfp4_bf16_config(
+            activation,
+            num_experts=num_experts,
+            top_k=top_k,
+            intermediate_size=768,
+            max_num_tokens=num_tokens,
+        ),
+        torch.device("cuda"),
+    )
+    act = make_activations(0)
+    logits = torch.rand(num_tokens, num_experts - 1, device="cuda")
+    act.topk_ids.copy_(torch.topk(logits, top_k, dim=-1).indices.to(torch.int32) + 1)
+    num_valid = num_tokens // 2
+    act.topk_ids[num_valid:] = -1
+    act.topk_ids[:num_valid, -1] = num_experts
+
+    actual = layer(act, weights)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    assert torch.count_nonzero(actual[num_valid:]) == 0
+    if num_valid:
+        ids = act.topk_ids[:num_valid].clone()
+        ids[:, -1] = 1
+        topk_weights = act.topk_weights[:num_valid].clone()
+        topk_weights[:, -1] = 0
+        expected = reference(
+            MoEActivationPack(act.hidden_states_q[:num_valid], None, ids, topk_weights)
+        )
+        _assert_moe_close(actual[:num_valid], expected)
+
+
+@sm12x_nvfp4_bf16_required
+def test_sm12x_nvfp4_bf16_layers_do_not_share_scratch():
+    # Two layers of the same geometry interleaved on two streams must not race
+    # on routing lists or persistent-kernel counters.
+    activation = SwiGLU()
+    num_experts, top_k, num_tokens = 128, 8, 4
+    cases = [
+        _make_sm12x_nvfp4_bf16_case(
+            activation,
+            num_tokens=num_tokens,
+            hidden_size=2048,
+            intermediate_size=768,
+            num_experts=num_experts,
+            top_k=top_k,
+            seed=seed,
+        )
+        for seed in (0, 1)
+    ]
+    layers, packs = [], []
+    for view, _, _ in cases:
+        pack = MoEWeightPack()
+        pack.prepare_for(SM12xNvfp4Bf16Runner.backend_key, view)
+        packs.append(pack)
+        layers.append(
+            MoELayer(
+                _sm12x_nvfp4_bf16_config(
+                    activation,
+                    num_experts=num_experts,
+                    top_k=top_k,
+                    intermediate_size=768,
+                    max_num_tokens=num_tokens,
+                ),
+                torch.device("cuda"),
+            )
+        )
+    acts = [make(step) for step, (_, make, _) in enumerate(cases)]
+    for layer, act, pack in zip(layers, acts, packs, strict=True):
+        layer(act, pack)
+    torch.cuda.synchronize()
+
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    outs: list[list[torch.Tensor]] = [[], []]
+    for _ in range(20):
+        for i, stream in enumerate(streams):
+            with torch.cuda.stream(stream):
+                outs[i].append(layers[i](acts[i], packs[i]).clone())
+    torch.cuda.synchronize()
+
+    for i, (_, _, reference) in enumerate(cases):
+        expected = reference(acts[i])
+        for actual in outs[i]:
+            _assert_moe_close(actual, expected)
+
+
+@sm12x_nvfp4_bf16_required
 @pytest.mark.parametrize(
     "num_tokens,hidden_size,intermediate_size,num_experts,top_k,activation",
     (
