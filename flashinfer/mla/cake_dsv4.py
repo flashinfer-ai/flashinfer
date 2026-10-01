@@ -961,6 +961,80 @@ def _route(
 
 
 # --------------------------------------------------------------------------- #
+# Output placement                                                            #
+# --------------------------------------------------------------------------- #
+_OUT_PHASE_PERIOD = 4096
+
+# Output placement: on the routes below the kernel time is a 4 KiB-periodic
+# function of the output buffer's base address (bits 0..11 only; bits >= 12 do
+# nothing).  ``base % 4096 == 0`` -- what a fresh >= 2 MiB caching-allocator
+# block gives, i.e. the default ``torch.empty`` for these outputs -- is the SLOW
+# phase; ``0x800`` is the fast one.  Pinned-phase paired measurements (cold-L2
+# CUPTI, both arm orders) on the exported programs, us at phase 0 ->
+# phase 0x800, B200 / GB300:
+#   bf16_h128_prefill_v42 (every bf16 H128 persistent row, striped and snake):
+#     hardening-000035 40.13 -> 36.96 / 35.74 -> 33.25, hardening-000023 17.98 ->
+#     16.70 / 16.58 -> 15.42, hardening-000029 26.78 -> 24.77 / 24.16 -> 22.94,
+#     prefill-style-000088 90.66 -> 88.10 / 74.88 -> 72.48, prefill-style-000092
+#     94.56 -> 92.26 / 78.21 -> 76.10 (-2.3 .. -8 %).
+#   fp8_lowhead_prefill, 64 heads, SWA-128 table (the single-CTA K1 body):
+#     decode-000006 7.07 -> 6.72 / 6.75 -> 6.43, decode-000009 7.07 -> 6.72 /
+#     6.66 -> 6.30, hardening-000020 7.84 -> 7.49 / 7.55 -> 7.20 (-4.5 .. -5.3 %);
+#     32 heads move +-0.1 us with a process-dependent sign and 8 / 16 heads do
+#     not move, so they keep the allocator default.
+# The kernels are untouched: the same program writes the same bits to the same
+# (token, head, column) positions; only the buffer's base address is chosen.
+# Applies to ``out=None`` only -- a caller-provided ``out`` is used as is, and a
+# 2 MiB-aligned caller buffer sits in the slow phase.
+_OUT_PHASE_BY_ROUTE: dict[str, int] = {
+    "bf16_h128_prefill_v42": 0x800,
+    "fp8_lowhead_prefill": 0x800,
+    # 134-row public-API pass, allocator default -> 0x800, both arm orders:
+    #   bf16_h64_prefill (086/087/090/091) -0.70..-1.50 us GB300,
+    #   fp8_h64_source_exact -1.09..-1.18 us GB300, fp8_lowhead_h64 (008/011) -0.34 us GB300.
+    "bf16_h64_prefill": 0x800,
+    "fp8_h64_source_exact": 0x800,
+    "fp8_lowhead_h64": 0x800,
+    #   bf16_h128_topk128x: hardening-000025 / -000031 -0.74 / -0.70 us GB300, the
+    #   other rows of the route flat (|d| <= 0.03 us).
+    "bf16_h128_topk128x": 0x800,
+}
+
+
+def cake_dsv4_out_phase(
+    route: str, *, num_heads: int, sparse_topk: int
+) -> Optional[int]:
+    """Preferred ``out.data_ptr() % 4096`` for ``route`` (None = allocator default)."""
+    phase = _OUT_PHASE_BY_ROUTE.get(route)
+    if phase is None:
+        return None
+    if route == "fp8_lowhead_prefill" and not (num_heads == 64 and sparse_topk == 128):
+        return None
+    return phase
+
+
+def allocate_cake_dsv4_output(
+    shape: tuple[int, ...], device: torch.device, *, phase: Optional[int]
+) -> torch.Tensor:
+    """bf16 output of ``shape``; with ``phase`` the view's ``data_ptr() % 4096 == phase``
+    (one extra 4 KiB page is allocated), with None a plain ``torch.empty``."""
+    if phase is None:
+        return torch.empty(shape, dtype=torch.bfloat16, device=device)
+    if phase % 2 or not 0 <= phase < _OUT_PHASE_PERIOD:
+        raise ValueError(
+            f"output phase must be an even byte offset below {_OUT_PHASE_PERIOD}, got {phase}"
+        )
+    numel = 1
+    for dim in shape:
+        numel *= int(dim)
+    raw = torch.empty(
+        numel + _OUT_PHASE_PERIOD // 2, dtype=torch.bfloat16, device=device
+    )
+    start = ((phase - raw.data_ptr()) % _OUT_PHASE_PERIOD) // 2
+    return raw[start : start + numel].view(shape)
+
+
+# --------------------------------------------------------------------------- #
 # Launch orchestration                                                        #
 # --------------------------------------------------------------------------- #
 
@@ -1120,7 +1194,7 @@ def run_cake_dsv4(
     workspace_buffer: torch.Tensor,
     sparse_indices: torch.Tensor,
     sparse_topk_lens: Optional[torch.Tensor],
-    out: torch.Tensor,
+    out: Optional[torch.Tensor],
     bmm1_scale: Union[float, torch.Tensor],
     bmm2_scale: Union[float, torch.Tensor],
     sinks: Optional[torch.Tensor],
@@ -1131,12 +1205,18 @@ def run_cake_dsv4(
     extra_sparse_indices: Optional[torch.Tensor] = None,
     extra_sparse_topk_lens: Optional[torch.Tensor] = None,
     sparse_topk_lens_offset: int = 0,
+    out_shape: Optional[tuple[int, ...]] = None,
 ) -> torch.Tensor:
     """Launch the CAKE DSv4 route for flattened ``query [rows, num_heads, 512]``.
 
+    ``out=None`` allocates the output here, after the route is known, so the
+    routes in ``_OUT_PHASE_BY_ROUTE`` get their measured-fast base phase;
+    ``out_shape`` (default ``[rows, num_heads, 512]``) is the shape to allocate.
+
     ``query`` / ``out`` may have more rows than the metadata; only the first
-    ``num_query_tokens`` (metadata rows) are read and written. No device memory
-    is allocated here; see the module docstring for the workspace contract.
+    ``num_query_tokens`` (metadata rows) are read and written. Apart from the
+    ``out=None`` output no device memory is allocated here; see the module
+    docstring for the workspace contract.
     """
     if backend != "cake":
         raise ValueError(f"expected backend='cake', got {backend!r}")
@@ -1172,20 +1252,22 @@ def run_cake_dsv4(
     num_query_tokens = meta.num_query_tokens
     sparse_topk = meta.sparse_topk
 
-    if out.dtype != torch.bfloat16:
-        raise ValueError(f"out must be bfloat16, got {out.dtype}")
-    if out.device != device:
-        raise ValueError(f"out must be on {device}, got {out.device}")
-    if not out.is_contiguous():
-        raise ValueError("out must be contiguous; backend='cake' makes no host copy")
-    row_elems = num_heads * _HEAD_DIM
-    if out.numel() % row_elems or out.numel() < num_query_tokens * row_elems:
-        raise ValueError(
-            f"out must hold at least {num_query_tokens} rows of [{num_heads}, {_HEAD_DIM}], "
-            f"got {tuple(out.shape)}"
-        )
+    if out is not None:
+        if out.dtype != torch.bfloat16:
+            raise ValueError(f"out must be bfloat16, got {out.dtype}")
+        if out.device != device:
+            raise ValueError(f"out must be on {device}, got {out.device}")
+        if not out.is_contiguous():
+            raise ValueError(
+                "out must be contiguous; backend='cake' makes no host copy"
+            )
+        row_elems = num_heads * _HEAD_DIM
+        if out.numel() % row_elems or out.numel() < num_query_tokens * row_elems:
+            raise ValueError(
+                f"out must hold at least {num_query_tokens} rows of [{num_heads}, {_HEAD_DIM}], "
+                f"got {tuple(out.shape)}"
+            )
     query_rows = query[:num_query_tokens]
-    out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
 
     swa = _dense_rows(swa_kv_cache, "swa_kv_cache", query.dtype)
     compressed = _dense_rows(compressed_kv_cache, "compressed_kv_cache", query.dtype)
@@ -1222,6 +1304,22 @@ def run_cake_dsv4(
         compressed_page_size=compressed_kv_cache.shape[-2],
         num_query_tokens=meta.num_query_tokens,
     )
+
+    if out is None:
+        out = allocate_cake_dsv4_output(
+            tuple(out_shape)
+            if out_shape is not None
+            else (query_capacity, num_heads, _HEAD_DIM),
+            device,
+            phase=cake_dsv4_out_phase(
+                route, num_heads=num_heads, sparse_topk=sparse_topk
+            ),
+        )
+        if out.numel() < num_query_tokens * num_heads * _HEAD_DIM:
+            raise ValueError(
+                f"out_shape {tuple(out.shape)} holds fewer than {num_query_tokens} rows"
+            )
+    out_rows = out.view(-1, num_heads, _HEAD_DIM)[:num_query_tokens]
 
     if cum_seq_lens_q is None and route in _RAGGED_ONLY_ROUTES:
         # Dense query on a ragged-only producer: every request is max_q_len long.
