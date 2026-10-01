@@ -985,6 +985,8 @@ QKV_TMA_ONLY_RAW_POINTERS = {
     "compiled_tf32_bt16_chain_m64_fp32_state": ("v",),
     "compiled_tf32_fused_n32": ("q", "k", "v"),
     "compiled_tf32_fused": ("q", "k"),
+    "compiled_small_bh_m128": ("v",),
+    "compiled_bf16_small_bh_m128": ("v",),
 }
 
 
@@ -4268,6 +4270,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 "gate_lower_bound": float(lower_bound),
                 "beta_token_stride": beta_flat.stride(0),
             }
+            chain_carriers = self._qkv_carrier_names.get(id(self.module), ())
             self.args = {
                 "ws_qd": bt16_qd,
                 "ws_qd_tma": bt16_qd,
@@ -4279,7 +4282,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 "ws_qk_tma": bt16_qk,
                 "ws_diag": bt16_diag,
                 "ws_diag_tma": bt16_diag,
-                "v": v_flat,
+                "v": _qkv_raw_pointer_arg(v_flat, "v", chain_carriers),
                 "v_tma": v,
                 "cu_seqlens": cu_seqlens,
                 "cu_chunks": bt16_cu_chunks,
