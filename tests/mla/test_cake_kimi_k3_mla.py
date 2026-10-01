@@ -3,8 +3,7 @@
 Covers the three call families against an FP32 reference: low-head paged decode (q_len = 1),
 packed variable-Q / MTP (cum_seq_lens_q) and incremental prefill on the paged FP8 cache (prefix
 reuse, ragged KV), plus CUDA-Graph replay with a changed page table, row-strided query / cache
-views on the row-tile routes (rejected on the wide route), the route selection and the split
-planners.
+views on a row-tile route and on the wide route, the route selection and the split planners.
 """
 
 import math
@@ -354,8 +353,8 @@ def test_row_strided_query_and_kv_views_match_contiguous():
             max_q_len=max(case["q_lens"]),
             max_seq_len=int(case["block_tables"].shape[1]) * PAGE,
         )
-        # Row-strided views are a row-tile feature: only the row-tile programs' TMA descriptors
-        # carry the row stride (36 rows, longest KV 5000 -> main_rt48).
+        # This case runs a row tile (36 rows, longest KV 5000 -> main_rt48); the wide route is
+        # covered by test_wide_route_row_strided_views_match_contiguous.
         assert attention.route_metadata["route"] == "swapped"
         assert attention.rt == 48
         attention.launch()
@@ -397,7 +396,7 @@ def test_row_strided_query_and_kv_views_match_contiguous():
         )
 
 
-def test_wide_route_rejects_padded_rows():
+def test_wide_route_row_strided_views_match_contiguous():
     _skip_unless_sm100_family()
     from flashinfer.mla.cake_kimi_k3_mla import (
         KimiK3MlaFp8PagedAttention,
@@ -406,15 +405,40 @@ def test_wide_route_rejects_padded_rows():
     )
 
     device = torch.device("cuda")
-    # 96 heads, longest KV 8192 -> the two-CTA wide route, whose programs address query and KV
-    # through dense descriptors: a padded row view is rejected before any launch.
+    # 96 heads, longest KV 8192 -> the two-CTA wide route; its TMA descriptors carry the row
+    # stride like the row-tile programs, so padded query / cache rows are addressed in place.
     case = _make_case(1, [1], [8192], 96, seed=645302, device=device)
     assert use_wide_route(96, 8192)
     total_q, num_heads = case["query"].shape[:2]
     workspace = torch.zeros(
         workspace_bytes(total_q * num_heads, 256), dtype=torch.uint8, device=device
     )
-    out = torch.empty((total_q, num_heads, LATENT), dtype=torch.bfloat16, device=device)
+
+    def run(query, kv_cache):
+        out = torch.full(
+            (total_q, num_heads, LATENT),
+            float("nan"),
+            dtype=torch.bfloat16,
+            device=device,
+        )
+        attention = KimiK3MlaFp8PagedAttention(
+            query=query,
+            kv_cache=kv_cache,
+            block_tables=case["block_tables"],
+            seq_lens=case["seq_lens"],
+            out=out,
+            workspace_buffer=workspace,
+            bmm1_scale=case["bmm1_scale"],
+            cum_seq_lens_q=case["q_indptr"],
+            max_q_len=max(case["q_lens"]),
+            max_seq_len=int(case["block_tables"].shape[1]) * PAGE,
+        )
+        assert attention.route_metadata["route"] == "wide"
+        attention.launch()
+        torch.cuda.synchronize()
+        return out
+
+    dense = run(case["query"], case["kv_cache"])
     wide_q = torch.zeros(
         (total_q, num_heads, QK_DIM + 64), dtype=torch.float8_e4m3fn, device=device
     )
@@ -424,25 +448,15 @@ def test_wide_route_rejects_padded_rows():
         (pages, PAGE, QK_DIM + 64), dtype=torch.float8_e4m3fn, device=device
     )
     wide_kv[..., :QK_DIM] = case["kv_cache"]
-    for query, kv_cache, name in (
-        (wide_q[..., :QK_DIM], case["kv_cache"], "query"),
-        (case["query"], wide_kv[..., :QK_DIM], "kv_cache"),
+    assert wide_q[..., :QK_DIM].stride(-2) == QK_DIM + 64
+    assert wide_kv[..., :QK_DIM].stride(-2) == QK_DIM + 64
+    for query, kv_cache in (
+        (wide_q[..., :QK_DIM], case["kv_cache"]),
+        (case["query"], wide_kv[..., :QK_DIM]),
+        (wide_q[..., :QK_DIM], wide_kv[..., :QK_DIM]),
     ):
-        with pytest.raises(
-            ValueError, match=f"{name} rows must be dense .* on the wide route"
-        ):
-            KimiK3MlaFp8PagedAttention(
-                query=query,
-                kv_cache=kv_cache,
-                block_tables=case["block_tables"],
-                seq_lens=case["seq_lens"],
-                out=out,
-                workspace_buffer=workspace,
-                bmm1_scale=case["bmm1_scale"],
-                cum_seq_lens_q=case["q_indptr"],
-                max_q_len=max(case["q_lens"]),
-                max_seq_len=int(case["block_tables"].shape[1]) * PAGE,
-            )
+        assert torch.equal(run(query, kv_cache), dense)
+    _check(dense, _reference(case), atol=1e-2, rtol=1e-2)
 
 
 def test_plan_is_shared_across_calls_of_one_shape():

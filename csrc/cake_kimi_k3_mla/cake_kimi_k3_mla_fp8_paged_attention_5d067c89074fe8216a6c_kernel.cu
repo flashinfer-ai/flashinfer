@@ -84,16 +84,16 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SMEM_EPI_STRIDE 16384
 #define SMEM_TOTAL 232448
 #define THREADS 384
-#define SM103_SCORE_LD_RED_MAX 0
-#define SM100_SCORE_TREE_MAX 1
-#define SM100_ROW_SUM_CHAINS 1
+#define SM103_SCORE_LD_RED_MAX 1
+#define SM100_SCORE_TREE_MAX 0
+#define SM100_ROW_SUM_CHAINS 0
 #define SM100_DEFER_ROW_SUM 0
-#define SM100_CORRECTION_BATCH 1
+#define SM100_CORRECTION_BATCH 0
 #define SM100_F16X2_EXP 0
 #define SM100_EXP2_EMU25 0
 #define SM100_EXP2_EMU44 0
 #define SM100_EXP2_EMU62 0
-#define SM100_DROP_PROXY_FENCES 1
+#define SM100_DROP_PROXY_FENCES 0
 #define SM100_EXP2_EMU31 0
 #define SM100_EXP2_EMU41 0
 #define SM100_PACKED_MATH 0
@@ -153,13 +153,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
 __device__ __forceinline__ void mbarrier_wait_cluster_hint(
         int mbar_addr, int phase, uint32_t suspend_time_hint) {
     asm volatile(
@@ -326,7 +319,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(384, 1) __cluster_dims__(2,1,1) void
-kernel_cake_kimi_k3_mla_fp8_paged_attention_5e6f67c2c89c6eb24061(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k, const __grid_constant__ CUtensorMap tmap_qr, const __grid_constant__ CUtensorMap tmap_kr, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int* __restrict__ page_table, float softmax_scale_log2, float bmm2_scale, int num_heads, int num_split, int max_pages_per_seq, int m_tiles, int n_full_items)
+kernel_cake_kimi_k3_mla_fp8_paged_attention_5d067c89074fe8216a6c(const __grid_constant__ CUtensorMap tmap_q, const __grid_constant__ CUtensorMap tmap_k, const __grid_constant__ CUtensorMap tmap_qr, const __grid_constant__ CUtensorMap tmap_kr, const __grid_constant__ CUtensorMap tmap_v, __nv_bfloat16* __restrict__ partial_O, float* __restrict__ partial_max, float* __restrict__ partial_sum, __nv_bfloat16* __restrict__ O, int* __restrict__ seq_lens, int* __restrict__ cum_seq_lens_q, int* __restrict__ page_table, float softmax_scale_log2, float bmm2_scale, int num_heads, int num_split, int max_pages_per_seq, int m_tiles, int n_full_items)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -583,270 +576,305 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_5e6f67c2c89c6eb24061(const __grid_co
                 if (pad_warp != 0) {
                     mbarrier_wait(s_full_addr, s_wait_phase);
                 } else {
-                    uint32_t _mbar_token_1 = mbarrier_test_wait(s_full_addr, s_wait_phase);
-                    mbarrier_wait_token(s_full_addr, s_wait_phase, _mbar_token_1);
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-                    asm volatile(
-                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                        : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31])
-                        : "r"(s_base));
-                    asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    asm volatile(
-                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                        : "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63])
-                        : "r"(s_base + 32));
-                    asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    if (local_tail < 64) {
-                        uint32_t _slice_lo_mask_2;
-                        {
-                            int _lim_0 = local_tail;
-                            if (_lim_0 <= 0) { _slice_lo_mask_2 = 0u; }
-                            else if (_lim_0 >= 32) { _slice_lo_mask_2 = 0xFFFFFFFFu; }
-                            else {
-                                asm volatile("{"
-                                    ".reg .u32 t;\n\t"
-                                    "shl.b32 t, 1, %1;\n\t"
-                                    "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_2) : "r"(_lim_0));
+                    uint32_t _mbar_token_0 = mbarrier_test_wait(s_full_addr, s_wait_phase);
+                    int _vote_0 = __any_sync(0xFFFFFFFF, local_tail < 64);
+                    int tail_any = _vote_0;
+                    float lmax_a = -CAKE_INF;
+                    float lmax_b = -CAKE_INF;
+                    if (tail_any != 0) {
+                        mbarrier_wait_token(s_full_addr, s_wait_phase, _mbar_token_0);
+                        asm volatile("tcgen05.fence::after_thread_sync;");
+                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+                        #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
+                        #endif
+                        asm volatile(
+                            "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
+                            : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31]), "=f"(lmax_a)
+                            : "r"(s_base));
+                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+                        #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
+                        #endif
+                        asm volatile(
+                            "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
+                            : "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63]), "=f"(lmax_b)
+                            : "r"(s_base + 32));
+                        asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        float _max_0 = max_noftz(lmax_a, lmax_b);
+                        local_max = _max_0;
+                        if (local_tail < 64) {
+                            uint32_t _slice_lo_mask_0;
+                            {
+                                int _lim_0 = local_tail;
+                                if (_lim_0 <= 0) { _slice_lo_mask_0 = 0u; }
+                                else if (_lim_0 >= 32) { _slice_lo_mask_0 = 0xFFFFFFFFu; }
+                                else {
+                                    asm volatile("{"
+                                        ".reg .u32 t;\n\t"
+                                        "shl.b32 t, 1, %1;\n\t"
+                                        "add.u32 %0, t, -1;\n\t"
+                                        "}" : "=r"(_slice_lo_mask_0) : "r"(_lim_0));
+                                }
                             }
-                        }
-                        if (!(_slice_lo_mask_2 & (1u << 0))) sv[0] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 1))) sv[1] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 2))) sv[2] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 3))) sv[3] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 4))) sv[4] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 5))) sv[5] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 6))) sv[6] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 7))) sv[7] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 8))) sv[8] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 9))) sv[9] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 10))) sv[10] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 11))) sv[11] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 12))) sv[12] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 13))) sv[13] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 14))) sv[14] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 15))) sv[15] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 16))) sv[16] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 17))) sv[17] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 18))) sv[18] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 19))) sv[19] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 20))) sv[20] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 21))) sv[21] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 22))) sv[22] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 23))) sv[23] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 24))) sv[24] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 25))) sv[25] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 26))) sv[26] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 27))) sv[27] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 28))) sv[28] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 29))) sv[29] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 30))) sv[30] = -CAKE_INF;
-                        if (!(_slice_lo_mask_2 & (1u << 31))) sv[31] = -CAKE_INF;
-                        uint32_t _slice_lo_mask_3;
-                        {
-                            int _lim_1 = local_tail - 32;
-                            if (_lim_1 <= 0) { _slice_lo_mask_3 = 0u; }
-                            else if (_lim_1 >= 32) { _slice_lo_mask_3 = 0xFFFFFFFFu; }
-                            else {
-                                asm volatile("{"
-                                    ".reg .u32 t;\n\t"
-                                    "shl.b32 t, 1, %1;\n\t"
-                                    "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_3) : "r"(_lim_1));
+                            if (!(_slice_lo_mask_0 & (1u << 0))) sv[0] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 1))) sv[1] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 2))) sv[2] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 3))) sv[3] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 4))) sv[4] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 5))) sv[5] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 6))) sv[6] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 7))) sv[7] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 8))) sv[8] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 9))) sv[9] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 10))) sv[10] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 11))) sv[11] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 12))) sv[12] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 13))) sv[13] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 14))) sv[14] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 15))) sv[15] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 16))) sv[16] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 17))) sv[17] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 18))) sv[18] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 19))) sv[19] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 20))) sv[20] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 21))) sv[21] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 22))) sv[22] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 23))) sv[23] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 24))) sv[24] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 25))) sv[25] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 26))) sv[26] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 27))) sv[27] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 28))) sv[28] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 29))) sv[29] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 30))) sv[30] = -CAKE_INF;
+                            if (!(_slice_lo_mask_0 & (1u << 31))) sv[31] = -CAKE_INF;
+                            uint32_t _slice_lo_mask_1;
+                            {
+                                int _lim_1 = local_tail - 32;
+                                if (_lim_1 <= 0) { _slice_lo_mask_1 = 0u; }
+                                else if (_lim_1 >= 32) { _slice_lo_mask_1 = 0xFFFFFFFFu; }
+                                else {
+                                    asm volatile("{"
+                                        ".reg .u32 t;\n\t"
+                                        "shl.b32 t, 1, %1;\n\t"
+                                        "add.u32 %0, t, -1;\n\t"
+                                        "}" : "=r"(_slice_lo_mask_1) : "r"(_lim_1));
+                                }
                             }
+                            if (!(_slice_lo_mask_1 & (1u << 0))) sv[32] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 1))) sv[33] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 2))) sv[34] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 3))) sv[35] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 4))) sv[36] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 5))) sv[37] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 6))) sv[38] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 7))) sv[39] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 8))) sv[40] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 9))) sv[41] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 10))) sv[42] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 11))) sv[43] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 12))) sv[44] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 13))) sv[45] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 14))) sv[46] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 15))) sv[47] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 16))) sv[48] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 17))) sv[49] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 18))) sv[50] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 19))) sv[51] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 20))) sv[52] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 21))) sv[53] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 22))) sv[54] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 23))) sv[55] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 24))) sv[56] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 25))) sv[57] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 26))) sv[58] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 27))) sv[59] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 28))) sv[60] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 29))) sv[61] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 30))) sv[62] = -CAKE_INF;
+                            if (!(_slice_lo_mask_1 & (1u << 31))) sv[63] = -CAKE_INF;
+                            float _max3_0;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_0) : "f"(sv[0]), "f"(sv[1]), "f"(sv[2]));
+                            float _max3_1;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_1) : "f"(sv[3]), "f"(sv[4]), "f"(sv[5]));
+                            float _max3_2;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_2) : "f"(sv[6]), "f"(sv[7]), "f"(sv[8]));
+                            float _max3_3;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_3) : "f"(sv[9]), "f"(sv[10]), "f"(sv[11]));
+                            float _max3_4;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_4) : "f"(sv[12]), "f"(sv[13]), "f"(sv[14]));
+                            float _max3_5;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_5) : "f"(sv[15]), "f"(sv[16]), "f"(sv[17]));
+                            float _max3_6;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_6) : "f"(sv[18]), "f"(sv[19]), "f"(sv[20]));
+                            float _max3_7;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_7) : "f"(sv[21]), "f"(sv[22]), "f"(sv[23]));
+                            float _max3_8;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_8) : "f"(sv[24]), "f"(sv[25]), "f"(sv[26]));
+                            float _max3_9;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_9) : "f"(sv[27]), "f"(sv[28]), "f"(sv[29]));
+                            float _max3_10;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_10) : "f"(sv[30]), "f"(sv[31]), "f"(sv[32]));
+                            float _max3_11;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_11) : "f"(sv[33]), "f"(sv[34]), "f"(sv[35]));
+                            float _max3_12;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_12) : "f"(sv[36]), "f"(sv[37]), "f"(sv[38]));
+                            float _max3_13;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_13) : "f"(sv[39]), "f"(sv[40]), "f"(sv[41]));
+                            float _max3_14;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_14) : "f"(sv[42]), "f"(sv[43]), "f"(sv[44]));
+                            float _max3_15;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_15) : "f"(sv[45]), "f"(sv[46]), "f"(sv[47]));
+                            float _max3_16;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_16) : "f"(sv[48]), "f"(sv[49]), "f"(sv[50]));
+                            float _max3_17;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_17) : "f"(sv[51]), "f"(sv[52]), "f"(sv[53]));
+                            float _max3_18;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_18) : "f"(sv[54]), "f"(sv[55]), "f"(sv[56]));
+                            float _max3_19;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_19) : "f"(sv[57]), "f"(sv[58]), "f"(sv[59]));
+                            float _max3_20;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_20) : "f"(sv[60]), "f"(sv[61]), "f"(sv[62]));
+                            float _max3_21;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_21) : "f"(_max3_0), "f"(_max3_1), "f"(_max3_2));
+                            float _max3_22;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_22) : "f"(_max3_3), "f"(_max3_4), "f"(_max3_5));
+                            float _max3_23;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_23) : "f"(_max3_6), "f"(_max3_7), "f"(_max3_8));
+                            float _max3_24;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_24) : "f"(_max3_9), "f"(_max3_10), "f"(_max3_11));
+                            float _max3_25;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_25) : "f"(_max3_12), "f"(_max3_13), "f"(_max3_14));
+                            float _max3_26;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_26) : "f"(_max3_15), "f"(_max3_16), "f"(_max3_17));
+                            float _max3_27;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_27) : "f"(_max3_18), "f"(_max3_19), "f"(_max3_20));
+                            float _max3_28;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_28) : "f"(_max3_21), "f"(_max3_22), "f"(_max3_23));
+                            float _max3_29;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_29) : "f"(_max3_24), "f"(_max3_25), "f"(_max3_26));
+                            float _max_1 = max_noftz(_max3_27, sv[63]);
+                            float _max3_30;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_30) : "f"(_max3_28), "f"(_max3_29), "f"(_max_1));
+                            local_max = _max3_30;
                         }
-                        if (!(_slice_lo_mask_3 & (1u << 0))) sv[32] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 1))) sv[33] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 2))) sv[34] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 3))) sv[35] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 4))) sv[36] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 5))) sv[37] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 6))) sv[38] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 7))) sv[39] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 8))) sv[40] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 9))) sv[41] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 10))) sv[42] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 11))) sv[43] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 12))) sv[44] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 13))) sv[45] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 14))) sv[46] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 15))) sv[47] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 16))) sv[48] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 17))) sv[49] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 18))) sv[50] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 19))) sv[51] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 20))) sv[52] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 21))) sv[53] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 22))) sv[54] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 23))) sv[55] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 24))) sv[56] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 25))) sv[57] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 26))) sv[58] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 27))) sv[59] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 28))) sv[60] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 29))) sv[61] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 30))) sv[62] = -CAKE_INF;
-                        if (!(_slice_lo_mask_3 & (1u << 31))) sv[63] = -CAKE_INF;
+                    } else {
+                        mbarrier_wait_token(s_full_addr, s_wait_phase, _mbar_token_0);
+                        asm volatile("tcgen05.fence::after_thread_sync;");
+                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+                        #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
+                        #endif
+                        asm volatile(
+                            "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
+                            : "=f"(sv[0]), "=f"(sv[1]), "=f"(sv[2]), "=f"(sv[3]), "=f"(sv[4]), "=f"(sv[5]), "=f"(sv[6]), "=f"(sv[7]), "=f"(sv[8]), "=f"(sv[9]), "=f"(sv[10]), "=f"(sv[11]), "=f"(sv[12]), "=f"(sv[13]), "=f"(sv[14]), "=f"(sv[15]), "=f"(sv[16]), "=f"(sv[17]), "=f"(sv[18]), "=f"(sv[19]), "=f"(sv[20]), "=f"(sv[21]), "=f"(sv[22]), "=f"(sv[23]), "=f"(sv[24]), "=f"(sv[25]), "=f"(sv[26]), "=f"(sv[27]), "=f"(sv[28]), "=f"(sv[29]), "=f"(sv[30]), "=f"(sv[31]), "=f"(lmax_a)
+                            : "r"(s_base));
+                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+                        #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
+                        #endif
+                        asm volatile(
+                            "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
+                            : "=f"(sv[32]), "=f"(sv[33]), "=f"(sv[34]), "=f"(sv[35]), "=f"(sv[36]), "=f"(sv[37]), "=f"(sv[38]), "=f"(sv[39]), "=f"(sv[40]), "=f"(sv[41]), "=f"(sv[42]), "=f"(sv[43]), "=f"(sv[44]), "=f"(sv[45]), "=f"(sv[46]), "=f"(sv[47]), "=f"(sv[48]), "=f"(sv[49]), "=f"(sv[50]), "=f"(sv[51]), "=f"(sv[52]), "=f"(sv[53]), "=f"(sv[54]), "=f"(sv[55]), "=f"(sv[56]), "=f"(sv[57]), "=f"(sv[58]), "=f"(sv[59]), "=f"(sv[60]), "=f"(sv[61]), "=f"(sv[62]), "=f"(sv[63]), "=f"(lmax_b)
+                            : "r"(s_base + 32));
+                        asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        float _max_2 = max_noftz(lmax_a, lmax_b);
+                        local_max = _max_2;
                     }
-                    float _max3_31;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_31) : "f"(sv[0]), "f"(sv[1]), "f"(sv[2]));
-                    float _max3_32;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_32) : "f"(sv[3]), "f"(sv[4]), "f"(sv[5]));
-                    float _max3_33;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_33) : "f"(sv[6]), "f"(sv[7]), "f"(sv[8]));
-                    float _max3_34;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_34) : "f"(sv[9]), "f"(sv[10]), "f"(sv[11]));
-                    float _max3_35;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_35) : "f"(sv[12]), "f"(sv[13]), "f"(sv[14]));
-                    float _max3_36;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_36) : "f"(sv[15]), "f"(sv[16]), "f"(sv[17]));
-                    float _max3_37;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_37) : "f"(sv[18]), "f"(sv[19]), "f"(sv[20]));
-                    float _max3_38;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_38) : "f"(sv[21]), "f"(sv[22]), "f"(sv[23]));
-                    float _max3_39;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_39) : "f"(sv[24]), "f"(sv[25]), "f"(sv[26]));
-                    float _max3_40;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_40) : "f"(sv[27]), "f"(sv[28]), "f"(sv[29]));
-                    float _max3_41;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_41) : "f"(sv[30]), "f"(sv[31]), "f"(sv[32]));
-                    float _max3_42;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_42) : "f"(sv[33]), "f"(sv[34]), "f"(sv[35]));
-                    float _max3_43;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_43) : "f"(sv[36]), "f"(sv[37]), "f"(sv[38]));
-                    float _max3_44;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_44) : "f"(sv[39]), "f"(sv[40]), "f"(sv[41]));
-                    float _max3_45;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_45) : "f"(sv[42]), "f"(sv[43]), "f"(sv[44]));
-                    float _max3_46;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_46) : "f"(sv[45]), "f"(sv[46]), "f"(sv[47]));
-                    float _max3_47;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_47) : "f"(sv[48]), "f"(sv[49]), "f"(sv[50]));
-                    float _max3_48;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_48) : "f"(sv[51]), "f"(sv[52]), "f"(sv[53]));
-                    float _max3_49;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_49) : "f"(sv[54]), "f"(sv[55]), "f"(sv[56]));
-                    float _max3_50;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_50) : "f"(sv[57]), "f"(sv[58]), "f"(sv[59]));
-                    float _max3_51;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_51) : "f"(sv[60]), "f"(sv[61]), "f"(sv[62]));
-                    float _max3_52;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_52) : "f"(_max3_31), "f"(_max3_32), "f"(_max3_33));
-                    float _max3_53;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_53) : "f"(_max3_34), "f"(_max3_35), "f"(_max3_36));
-                    float _max3_54;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_54) : "f"(_max3_37), "f"(_max3_38), "f"(_max3_39));
-                    float _max3_55;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_55) : "f"(_max3_40), "f"(_max3_41), "f"(_max3_42));
-                    float _max3_56;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_56) : "f"(_max3_43), "f"(_max3_44), "f"(_max3_45));
-                    float _max3_57;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_57) : "f"(_max3_46), "f"(_max3_47), "f"(_max3_48));
-                    float _max3_58;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_58) : "f"(_max3_49), "f"(_max3_50), "f"(_max3_51));
-                    float _max3_59;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_59) : "f"(_max3_52), "f"(_max3_53), "f"(_max3_54));
-                    float _max3_60;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_60) : "f"(_max3_55), "f"(_max3_56), "f"(_max3_57));
-                    float _max_3 = max_noftz(_max3_58, sv[63]);
-                    float _max3_61;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_61) : "f"(_max3_59), "f"(_max3_60), "f"(_max_3));
-                    local_max = _max3_61;
                 }
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 __syncwarp();
@@ -1728,270 +1756,305 @@ kernel_cake_kimi_k3_mla_fp8_paged_attention_5e6f67c2c89c6eb24061(const __grid_co
                 if (pad_warp_1 != 0) {
                     mbarrier_wait(s_full_addr + 8, s_wait_phase_1);
                 } else {
-                    uint32_t _mbar_token_3 = mbarrier_test_wait(s_full_addr + 8, s_wait_phase_1);
-                    mbarrier_wait_token(s_full_addr + 8, s_wait_phase_1, _mbar_token_3);
-                    asm volatile("tcgen05.fence::after_thread_sync;");
-                    asm volatile(
-                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                        : "=f"(sv_1[0]), "=f"(sv_1[1]), "=f"(sv_1[2]), "=f"(sv_1[3]), "=f"(sv_1[4]), "=f"(sv_1[5]), "=f"(sv_1[6]), "=f"(sv_1[7]), "=f"(sv_1[8]), "=f"(sv_1[9]), "=f"(sv_1[10]), "=f"(sv_1[11]), "=f"(sv_1[12]), "=f"(sv_1[13]), "=f"(sv_1[14]), "=f"(sv_1[15]), "=f"(sv_1[16]), "=f"(sv_1[17]), "=f"(sv_1[18]), "=f"(sv_1[19]), "=f"(sv_1[20]), "=f"(sv_1[21]), "=f"(sv_1[22]), "=f"(sv_1[23]), "=f"(sv_1[24]), "=f"(sv_1[25]), "=f"(sv_1[26]), "=f"(sv_1[27]), "=f"(sv_1[28]), "=f"(sv_1[29]), "=f"(sv_1[30]), "=f"(sv_1[31])
-                        : "r"(s_base_1));
-                    asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    asm volatile(
-                        "tcgen05.ld.sync.aligned.32x32b.x32.b32"
-                        " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, [%32];"
-                        : "=f"(sv_1[32]), "=f"(sv_1[33]), "=f"(sv_1[34]), "=f"(sv_1[35]), "=f"(sv_1[36]), "=f"(sv_1[37]), "=f"(sv_1[38]), "=f"(sv_1[39]), "=f"(sv_1[40]), "=f"(sv_1[41]), "=f"(sv_1[42]), "=f"(sv_1[43]), "=f"(sv_1[44]), "=f"(sv_1[45]), "=f"(sv_1[46]), "=f"(sv_1[47]), "=f"(sv_1[48]), "=f"(sv_1[49]), "=f"(sv_1[50]), "=f"(sv_1[51]), "=f"(sv_1[52]), "=f"(sv_1[53]), "=f"(sv_1[54]), "=f"(sv_1[55]), "=f"(sv_1[56]), "=f"(sv_1[57]), "=f"(sv_1[58]), "=f"(sv_1[59]), "=f"(sv_1[60]), "=f"(sv_1[61]), "=f"(sv_1[62]), "=f"(sv_1[63])
-                        : "r"(s_base_1 + 32));
-                    asm volatile("tcgen05.wait::ld.sync.aligned;");
-                    if (local_tail_1 < 64) {
-                        uint32_t _slice_lo_mask_8;
-                        {
-                            int _lim_0 = local_tail_1;
-                            if (_lim_0 <= 0) { _slice_lo_mask_8 = 0u; }
-                            else if (_lim_0 >= 32) { _slice_lo_mask_8 = 0xFFFFFFFFu; }
-                            else {
-                                asm volatile("{"
-                                    ".reg .u32 t;\n\t"
-                                    "shl.b32 t, 1, %1;\n\t"
-                                    "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_8) : "r"(_lim_0));
+                    uint32_t _mbar_token_2 = mbarrier_test_wait(s_full_addr + 8, s_wait_phase_1);
+                    int _vote_3 = __any_sync(0xFFFFFFFF, local_tail_1 < 64);
+                    int tail_any_1 = _vote_3;
+                    float lmax_a_1 = -CAKE_INF;
+                    float lmax_b_1 = -CAKE_INF;
+                    if (tail_any_1 != 0) {
+                        mbarrier_wait_token(s_full_addr + 8, s_wait_phase_1, _mbar_token_2);
+                        asm volatile("tcgen05.fence::after_thread_sync;");
+                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+                        #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
+                        #endif
+                        asm volatile(
+                            "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
+                            : "=f"(sv_1[0]), "=f"(sv_1[1]), "=f"(sv_1[2]), "=f"(sv_1[3]), "=f"(sv_1[4]), "=f"(sv_1[5]), "=f"(sv_1[6]), "=f"(sv_1[7]), "=f"(sv_1[8]), "=f"(sv_1[9]), "=f"(sv_1[10]), "=f"(sv_1[11]), "=f"(sv_1[12]), "=f"(sv_1[13]), "=f"(sv_1[14]), "=f"(sv_1[15]), "=f"(sv_1[16]), "=f"(sv_1[17]), "=f"(sv_1[18]), "=f"(sv_1[19]), "=f"(sv_1[20]), "=f"(sv_1[21]), "=f"(sv_1[22]), "=f"(sv_1[23]), "=f"(sv_1[24]), "=f"(sv_1[25]), "=f"(sv_1[26]), "=f"(sv_1[27]), "=f"(sv_1[28]), "=f"(sv_1[29]), "=f"(sv_1[30]), "=f"(sv_1[31]), "=f"(lmax_a_1)
+                            : "r"(s_base_1));
+                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+                        #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
+                        #endif
+                        asm volatile(
+                            "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
+                            : "=f"(sv_1[32]), "=f"(sv_1[33]), "=f"(sv_1[34]), "=f"(sv_1[35]), "=f"(sv_1[36]), "=f"(sv_1[37]), "=f"(sv_1[38]), "=f"(sv_1[39]), "=f"(sv_1[40]), "=f"(sv_1[41]), "=f"(sv_1[42]), "=f"(sv_1[43]), "=f"(sv_1[44]), "=f"(sv_1[45]), "=f"(sv_1[46]), "=f"(sv_1[47]), "=f"(sv_1[48]), "=f"(sv_1[49]), "=f"(sv_1[50]), "=f"(sv_1[51]), "=f"(sv_1[52]), "=f"(sv_1[53]), "=f"(sv_1[54]), "=f"(sv_1[55]), "=f"(sv_1[56]), "=f"(sv_1[57]), "=f"(sv_1[58]), "=f"(sv_1[59]), "=f"(sv_1[60]), "=f"(sv_1[61]), "=f"(sv_1[62]), "=f"(sv_1[63]), "=f"(lmax_b_1)
+                            : "r"(s_base_1 + 32));
+                        asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        float _max_7 = max_noftz(lmax_a_1, lmax_b_1);
+                        local_max_1 = _max_7;
+                        if (local_tail_1 < 64) {
+                            uint32_t _slice_lo_mask_6;
+                            {
+                                int _lim_0 = local_tail_1;
+                                if (_lim_0 <= 0) { _slice_lo_mask_6 = 0u; }
+                                else if (_lim_0 >= 32) { _slice_lo_mask_6 = 0xFFFFFFFFu; }
+                                else {
+                                    asm volatile("{"
+                                        ".reg .u32 t;\n\t"
+                                        "shl.b32 t, 1, %1;\n\t"
+                                        "add.u32 %0, t, -1;\n\t"
+                                        "}" : "=r"(_slice_lo_mask_6) : "r"(_lim_0));
+                                }
                             }
-                        }
-                        if (!(_slice_lo_mask_8 & (1u << 0))) sv_1[0] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 1))) sv_1[1] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 2))) sv_1[2] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 3))) sv_1[3] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 4))) sv_1[4] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 5))) sv_1[5] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 6))) sv_1[6] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 7))) sv_1[7] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 8))) sv_1[8] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 9))) sv_1[9] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 10))) sv_1[10] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 11))) sv_1[11] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 12))) sv_1[12] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 13))) sv_1[13] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 14))) sv_1[14] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 15))) sv_1[15] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 16))) sv_1[16] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 17))) sv_1[17] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 18))) sv_1[18] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 19))) sv_1[19] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 20))) sv_1[20] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 21))) sv_1[21] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 22))) sv_1[22] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 23))) sv_1[23] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 24))) sv_1[24] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 25))) sv_1[25] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 26))) sv_1[26] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 27))) sv_1[27] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 28))) sv_1[28] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 29))) sv_1[29] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 30))) sv_1[30] = -CAKE_INF;
-                        if (!(_slice_lo_mask_8 & (1u << 31))) sv_1[31] = -CAKE_INF;
-                        uint32_t _slice_lo_mask_9;
-                        {
-                            int _lim_1 = local_tail_1 - 32;
-                            if (_lim_1 <= 0) { _slice_lo_mask_9 = 0u; }
-                            else if (_lim_1 >= 32) { _slice_lo_mask_9 = 0xFFFFFFFFu; }
-                            else {
-                                asm volatile("{"
-                                    ".reg .u32 t;\n\t"
-                                    "shl.b32 t, 1, %1;\n\t"
-                                    "add.u32 %0, t, -1;\n\t"
-                                    "}" : "=r"(_slice_lo_mask_9) : "r"(_lim_1));
+                            if (!(_slice_lo_mask_6 & (1u << 0))) sv_1[0] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 1))) sv_1[1] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 2))) sv_1[2] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 3))) sv_1[3] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 4))) sv_1[4] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 5))) sv_1[5] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 6))) sv_1[6] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 7))) sv_1[7] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 8))) sv_1[8] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 9))) sv_1[9] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 10))) sv_1[10] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 11))) sv_1[11] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 12))) sv_1[12] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 13))) sv_1[13] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 14))) sv_1[14] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 15))) sv_1[15] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 16))) sv_1[16] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 17))) sv_1[17] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 18))) sv_1[18] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 19))) sv_1[19] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 20))) sv_1[20] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 21))) sv_1[21] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 22))) sv_1[22] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 23))) sv_1[23] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 24))) sv_1[24] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 25))) sv_1[25] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 26))) sv_1[26] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 27))) sv_1[27] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 28))) sv_1[28] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 29))) sv_1[29] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 30))) sv_1[30] = -CAKE_INF;
+                            if (!(_slice_lo_mask_6 & (1u << 31))) sv_1[31] = -CAKE_INF;
+                            uint32_t _slice_lo_mask_7;
+                            {
+                                int _lim_1 = local_tail_1 - 32;
+                                if (_lim_1 <= 0) { _slice_lo_mask_7 = 0u; }
+                                else if (_lim_1 >= 32) { _slice_lo_mask_7 = 0xFFFFFFFFu; }
+                                else {
+                                    asm volatile("{"
+                                        ".reg .u32 t;\n\t"
+                                        "shl.b32 t, 1, %1;\n\t"
+                                        "add.u32 %0, t, -1;\n\t"
+                                        "}" : "=r"(_slice_lo_mask_7) : "r"(_lim_1));
+                                }
                             }
+                            if (!(_slice_lo_mask_7 & (1u << 0))) sv_1[32] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 1))) sv_1[33] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 2))) sv_1[34] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 3))) sv_1[35] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 4))) sv_1[36] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 5))) sv_1[37] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 6))) sv_1[38] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 7))) sv_1[39] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 8))) sv_1[40] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 9))) sv_1[41] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 10))) sv_1[42] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 11))) sv_1[43] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 12))) sv_1[44] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 13))) sv_1[45] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 14))) sv_1[46] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 15))) sv_1[47] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 16))) sv_1[48] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 17))) sv_1[49] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 18))) sv_1[50] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 19))) sv_1[51] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 20))) sv_1[52] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 21))) sv_1[53] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 22))) sv_1[54] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 23))) sv_1[55] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 24))) sv_1[56] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 25))) sv_1[57] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 26))) sv_1[58] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 27))) sv_1[59] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 28))) sv_1[60] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 29))) sv_1[61] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 30))) sv_1[62] = -CAKE_INF;
+                            if (!(_slice_lo_mask_7 & (1u << 31))) sv_1[63] = -CAKE_INF;
+                            float _max3_63;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_63) : "f"(sv_1[0]), "f"(sv_1[1]), "f"(sv_1[2]));
+                            float _max3_64;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_64) : "f"(sv_1[3]), "f"(sv_1[4]), "f"(sv_1[5]));
+                            float _max3_65;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_65) : "f"(sv_1[6]), "f"(sv_1[7]), "f"(sv_1[8]));
+                            float _max3_66;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_66) : "f"(sv_1[9]), "f"(sv_1[10]), "f"(sv_1[11]));
+                            float _max3_67;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_67) : "f"(sv_1[12]), "f"(sv_1[13]), "f"(sv_1[14]));
+                            float _max3_68;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_68) : "f"(sv_1[15]), "f"(sv_1[16]), "f"(sv_1[17]));
+                            float _max3_69;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_69) : "f"(sv_1[18]), "f"(sv_1[19]), "f"(sv_1[20]));
+                            float _max3_70;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_70) : "f"(sv_1[21]), "f"(sv_1[22]), "f"(sv_1[23]));
+                            float _max3_71;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_71) : "f"(sv_1[24]), "f"(sv_1[25]), "f"(sv_1[26]));
+                            float _max3_72;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_72) : "f"(sv_1[27]), "f"(sv_1[28]), "f"(sv_1[29]));
+                            float _max3_73;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_73) : "f"(sv_1[30]), "f"(sv_1[31]), "f"(sv_1[32]));
+                            float _max3_74;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_74) : "f"(sv_1[33]), "f"(sv_1[34]), "f"(sv_1[35]));
+                            float _max3_75;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_75) : "f"(sv_1[36]), "f"(sv_1[37]), "f"(sv_1[38]));
+                            float _max3_76;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_76) : "f"(sv_1[39]), "f"(sv_1[40]), "f"(sv_1[41]));
+                            float _max3_77;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_77) : "f"(sv_1[42]), "f"(sv_1[43]), "f"(sv_1[44]));
+                            float _max3_78;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_78) : "f"(sv_1[45]), "f"(sv_1[46]), "f"(sv_1[47]));
+                            float _max3_79;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_79) : "f"(sv_1[48]), "f"(sv_1[49]), "f"(sv_1[50]));
+                            float _max3_80;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_80) : "f"(sv_1[51]), "f"(sv_1[52]), "f"(sv_1[53]));
+                            float _max3_81;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_81) : "f"(sv_1[54]), "f"(sv_1[55]), "f"(sv_1[56]));
+                            float _max3_82;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_82) : "f"(sv_1[57]), "f"(sv_1[58]), "f"(sv_1[59]));
+                            float _max3_83;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_83) : "f"(sv_1[60]), "f"(sv_1[61]), "f"(sv_1[62]));
+                            float _max3_84;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_84) : "f"(_max3_63), "f"(_max3_64), "f"(_max3_65));
+                            float _max3_85;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_85) : "f"(_max3_66), "f"(_max3_67), "f"(_max3_68));
+                            float _max3_86;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_86) : "f"(_max3_69), "f"(_max3_70), "f"(_max3_71));
+                            float _max3_87;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_87) : "f"(_max3_72), "f"(_max3_73), "f"(_max3_74));
+                            float _max3_88;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_88) : "f"(_max3_75), "f"(_max3_76), "f"(_max3_77));
+                            float _max3_89;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_89) : "f"(_max3_78), "f"(_max3_79), "f"(_max3_80));
+                            float _max3_90;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_90) : "f"(_max3_81), "f"(_max3_82), "f"(_max3_83));
+                            float _max3_91;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_91) : "f"(_max3_84), "f"(_max3_85), "f"(_max3_86));
+                            float _max3_92;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_92) : "f"(_max3_87), "f"(_max3_88), "f"(_max3_89));
+                            float _max_8 = max_noftz(_max3_90, sv_1[63]);
+                            float _max3_93;
+                            #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
+                            #error "Max3 requires PTX three-input max.f32 support on sm_100+"
+                            #endif
+                            asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_93) : "f"(_max3_91), "f"(_max3_92), "f"(_max_8));
+                            local_max_1 = _max3_93;
                         }
-                        if (!(_slice_lo_mask_9 & (1u << 0))) sv_1[32] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 1))) sv_1[33] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 2))) sv_1[34] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 3))) sv_1[35] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 4))) sv_1[36] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 5))) sv_1[37] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 6))) sv_1[38] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 7))) sv_1[39] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 8))) sv_1[40] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 9))) sv_1[41] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 10))) sv_1[42] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 11))) sv_1[43] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 12))) sv_1[44] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 13))) sv_1[45] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 14))) sv_1[46] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 15))) sv_1[47] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 16))) sv_1[48] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 17))) sv_1[49] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 18))) sv_1[50] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 19))) sv_1[51] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 20))) sv_1[52] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 21))) sv_1[53] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 22))) sv_1[54] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 23))) sv_1[55] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 24))) sv_1[56] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 25))) sv_1[57] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 26))) sv_1[58] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 27))) sv_1[59] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 28))) sv_1[60] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 29))) sv_1[61] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 30))) sv_1[62] = -CAKE_INF;
-                        if (!(_slice_lo_mask_9 & (1u << 31))) sv_1[63] = -CAKE_INF;
+                    } else {
+                        mbarrier_wait_token(s_full_addr + 8, s_wait_phase_1, _mbar_token_2);
+                        asm volatile("tcgen05.fence::after_thread_sync;");
+                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+                        #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
+                        #endif
+                        asm volatile(
+                            "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
+                            : "=f"(sv_1[0]), "=f"(sv_1[1]), "=f"(sv_1[2]), "=f"(sv_1[3]), "=f"(sv_1[4]), "=f"(sv_1[5]), "=f"(sv_1[6]), "=f"(sv_1[7]), "=f"(sv_1[8]), "=f"(sv_1[9]), "=f"(sv_1[10]), "=f"(sv_1[11]), "=f"(sv_1[12]), "=f"(sv_1[13]), "=f"(sv_1[14]), "=f"(sv_1[15]), "=f"(sv_1[16]), "=f"(sv_1[17]), "=f"(sv_1[18]), "=f"(sv_1[19]), "=f"(sv_1[20]), "=f"(sv_1[21]), "=f"(sv_1[22]), "=f"(sv_1[23]), "=f"(sv_1[24]), "=f"(sv_1[25]), "=f"(sv_1[26]), "=f"(sv_1[27]), "=f"(sv_1[28]), "=f"(sv_1[29]), "=f"(sv_1[30]), "=f"(sv_1[31]), "=f"(lmax_a_1)
+                            : "r"(s_base_1));
+                        #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)
+                        #error "TmemLoadRed requires tcgen05.ld.red support (sm_103/sm_101-sm_110 family), not sm_100"
+                        #endif
+                        asm volatile(
+                            "tcgen05.ld.red.sync.aligned.32x32b.x32.max.f32"
+                            " {%0, %1, %2, %3, %4, %5, %6, %7, %8, %9, %10, %11, %12, %13, %14, %15, %16, %17, %18, %19, %20, %21, %22, %23, %24, %25, %26, %27, %28, %29, %30, %31}, %32, [%33];"
+                            : "=f"(sv_1[32]), "=f"(sv_1[33]), "=f"(sv_1[34]), "=f"(sv_1[35]), "=f"(sv_1[36]), "=f"(sv_1[37]), "=f"(sv_1[38]), "=f"(sv_1[39]), "=f"(sv_1[40]), "=f"(sv_1[41]), "=f"(sv_1[42]), "=f"(sv_1[43]), "=f"(sv_1[44]), "=f"(sv_1[45]), "=f"(sv_1[46]), "=f"(sv_1[47]), "=f"(sv_1[48]), "=f"(sv_1[49]), "=f"(sv_1[50]), "=f"(sv_1[51]), "=f"(sv_1[52]), "=f"(sv_1[53]), "=f"(sv_1[54]), "=f"(sv_1[55]), "=f"(sv_1[56]), "=f"(sv_1[57]), "=f"(sv_1[58]), "=f"(sv_1[59]), "=f"(sv_1[60]), "=f"(sv_1[61]), "=f"(sv_1[62]), "=f"(sv_1[63]), "=f"(lmax_b_1)
+                            : "r"(s_base_1 + 32));
+                        asm volatile("tcgen05.wait::ld.sync.aligned;");
+                        float _max_9 = max_noftz(lmax_a_1, lmax_b_1);
+                        local_max_1 = _max_9;
                     }
-                    float _max3_94;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_94) : "f"(sv_1[0]), "f"(sv_1[1]), "f"(sv_1[2]));
-                    float _max3_95;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_95) : "f"(sv_1[3]), "f"(sv_1[4]), "f"(sv_1[5]));
-                    float _max3_96;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_96) : "f"(sv_1[6]), "f"(sv_1[7]), "f"(sv_1[8]));
-                    float _max3_97;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_97) : "f"(sv_1[9]), "f"(sv_1[10]), "f"(sv_1[11]));
-                    float _max3_98;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_98) : "f"(sv_1[12]), "f"(sv_1[13]), "f"(sv_1[14]));
-                    float _max3_99;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_99) : "f"(sv_1[15]), "f"(sv_1[16]), "f"(sv_1[17]));
-                    float _max3_100;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_100) : "f"(sv_1[18]), "f"(sv_1[19]), "f"(sv_1[20]));
-                    float _max3_101;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_101) : "f"(sv_1[21]), "f"(sv_1[22]), "f"(sv_1[23]));
-                    float _max3_102;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_102) : "f"(sv_1[24]), "f"(sv_1[25]), "f"(sv_1[26]));
-                    float _max3_103;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_103) : "f"(sv_1[27]), "f"(sv_1[28]), "f"(sv_1[29]));
-                    float _max3_104;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_104) : "f"(sv_1[30]), "f"(sv_1[31]), "f"(sv_1[32]));
-                    float _max3_105;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_105) : "f"(sv_1[33]), "f"(sv_1[34]), "f"(sv_1[35]));
-                    float _max3_106;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_106) : "f"(sv_1[36]), "f"(sv_1[37]), "f"(sv_1[38]));
-                    float _max3_107;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_107) : "f"(sv_1[39]), "f"(sv_1[40]), "f"(sv_1[41]));
-                    float _max3_108;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_108) : "f"(sv_1[42]), "f"(sv_1[43]), "f"(sv_1[44]));
-                    float _max3_109;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_109) : "f"(sv_1[45]), "f"(sv_1[46]), "f"(sv_1[47]));
-                    float _max3_110;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_110) : "f"(sv_1[48]), "f"(sv_1[49]), "f"(sv_1[50]));
-                    float _max3_111;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_111) : "f"(sv_1[51]), "f"(sv_1[52]), "f"(sv_1[53]));
-                    float _max3_112;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_112) : "f"(sv_1[54]), "f"(sv_1[55]), "f"(sv_1[56]));
-                    float _max3_113;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_113) : "f"(sv_1[57]), "f"(sv_1[58]), "f"(sv_1[59]));
-                    float _max3_114;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_114) : "f"(sv_1[60]), "f"(sv_1[61]), "f"(sv_1[62]));
-                    float _max3_115;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_115) : "f"(_max3_94), "f"(_max3_95), "f"(_max3_96));
-                    float _max3_116;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_116) : "f"(_max3_97), "f"(_max3_98), "f"(_max3_99));
-                    float _max3_117;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_117) : "f"(_max3_100), "f"(_max3_101), "f"(_max3_102));
-                    float _max3_118;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_118) : "f"(_max3_103), "f"(_max3_104), "f"(_max3_105));
-                    float _max3_119;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_119) : "f"(_max3_106), "f"(_max3_107), "f"(_max3_108));
-                    float _max3_120;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_120) : "f"(_max3_109), "f"(_max3_110), "f"(_max3_111));
-                    float _max3_121;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_121) : "f"(_max3_112), "f"(_max3_113), "f"(_max3_114));
-                    float _max3_122;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_122) : "f"(_max3_115), "f"(_max3_116), "f"(_max3_117));
-                    float _max3_123;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_123) : "f"(_max3_118), "f"(_max3_119), "f"(_max3_120));
-                    float _max_10 = max_noftz(_max3_121, sv_1[63]);
-                    float _max3_124;
-                    #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ < 1000)
-                    #error "Max3 requires PTX three-input max.f32 support on sm_100+"
-                    #endif
-                    asm volatile("max.f32 %0, %1, %2, %3;" : "=f"(_max3_124) : "f"(_max3_122), "f"(_max3_123), "f"(_max_10));
-                    local_max_1 = _max3_124;
                 }
                 asm volatile("tcgen05.wait::ld.sync.aligned;" ::: "memory");
                 __syncwarp();

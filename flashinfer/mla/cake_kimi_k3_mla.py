@@ -17,13 +17,11 @@ split count, grids, reducer) depends only on the batch shape, the longest KV and
 SM count, so it is computed once per distinct shape (:func:`plan_attention`) and reused;
 device facts are read once per device.
 
-On the row-tile routes, query and KV views may be row-strided: every row of ``query`` and
-every token row of ``kv_cache`` must be 576 contiguous FP8 elements, and rows must be equally
-spaced (a 16-byte multiple); the row-tile programs' TMA descriptors carry that row stride.  The
-two-CTA wide kernel addresses ``query`` and ``kv_cache`` through dense descriptors, so the wide
-route requires dense rows (576 bytes apart) and rejects a padded view before any launch.
-``out`` rows are dense (512 BF16 elements apart); ``block_tables``, ``seq_lens`` and
-``cum_seq_lens_q`` are contiguous int32.
+Query and KV views may be row-strided on every route: every row of ``query`` and every token
+row of ``kv_cache`` must be 576 contiguous FP8 elements, and rows must be equally spaced (a
+16-byte multiple); the TMA descriptors of the row-tile programs and of the two-CTA wide kernel
+carry that row stride.  ``out`` rows are dense (512 BF16 elements apart); ``block_tables``,
+``seq_lens`` and ``cum_seq_lens_q`` are contiguous int32.
 """
 
 from __future__ import annotations
@@ -401,7 +399,7 @@ def _rows_view(t: torch.Tensor, inner: int, row_bytes: int, name: str) -> torch.
 
 
 def _fp8_rows(t: torch.Tensor, name: str) -> torch.Tensor:
-    """Byte view ``[rows, 576]`` of an FP8 query or paged cache; rows may be strided (row-tile routes)."""
+    """Byte view ``[rows, 576]`` of an FP8 query or paged cache; rows may be strided."""
     return _rows_view(t, QK_DIM, 1, name).view(torch.uint8)
 
 
@@ -440,10 +438,9 @@ class KimiK3MlaFp8PagedAttention:
     """Prepared launcher: validation and binding at construction, no allocation at ``launch``.
 
     Args mirror ``trtllm_batch_decode_with_kv_cache_mla``: ``query`` FP8 ``[B, q_len, H, 576]``
-    or ``[total_q, H, 576]`` with ``cum_seq_lens_q`` (rows may be strided on the row-tile
-    routes, see the module docstring); ``kv_cache`` FP8 ``[pages, 64, 576]`` or
-    ``[pages, 1, 64, 576]`` (token rows may be strided on the row-tile routes; the wide route
-    needs dense rows); ``block_tables`` int32 ``[B, width]``; ``seq_lens`` int32 ``[B]``; ``out`` BF16
+    or ``[total_q, H, 576]`` with ``cum_seq_lens_q`` (rows may be strided, see the module
+    docstring); ``kv_cache`` FP8 ``[pages, 64, 576]`` or ``[pages, 1, 64, 576]`` (token rows may
+    be strided); ``block_tables`` int32 ``[B, width]``; ``seq_lens`` int32 ``[B]``; ``out`` BF16
     ``query.shape[:-1] + (512,)`` with dense rows; ``workspace_buffer`` a CUDA byte buffer of at
     least ``workspace_bytes(rows_max, num_split)`` bytes.
     """
@@ -524,18 +521,6 @@ class KimiK3MlaFp8PagedAttention:
             num_split=None if num_split is None else int(num_split),
         )
         plan = self.plan
-        if plan.wide:
-            # The two-CTA wide kernel (main_wide) addresses query and KV through dense TMA
-            # descriptors (row pitch = 576 bytes); only the row-tile programs carry a row stride.
-            for name, rows in (("query", q_rows), ("kv_cache", kv_rows)):
-                if rows.stride(0) != QK_DIM:
-                    raise ValueError(
-                        f"{name} rows must be dense ({QK_DIM} bytes apart) on the wide route: "
-                        f"the two-CTA wide kernel (more than {WIDE_MIN_ROWS} rows per request with "
-                        f"a longest KV of at least {WIDE_MIN_KV} tokens) does not address a row "
-                        f"stride; got {rows.stride(0)} bytes. Pass dense rows or a shape that "
-                        "runs a row tile."
-                    )
         self.rt = plan.rt
         self.num_split = plan.num_split
         self.rows_max = plan.rows_max

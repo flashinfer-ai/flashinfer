@@ -7,12 +7,12 @@ backend="cake")`): Kimi-K3 multi-head latent attention over an FP8 (E4M3) paged 
 One source per program, compiled for the architecture the device runs; a kernel whose two
 architecture lowerings do not fold keeps one program per architecture:
 
-* `main_rt16` -> `cake_kimi_k3_mla_fp8_paged_attention_f2ed3823ac88848234c4` (sm_100a, sm_103a)
-* `main_rt32` -> `cake_kimi_k3_mla_fp8_paged_attention_f6f8a85d05a12ec611f2` (sm_100a, sm_103a)
-* `main_rt48` -> `cake_kimi_k3_mla_fp8_paged_attention_3ca2519f90933160bbcb` (sm_100a, sm_103a)
-* `main_rt64` -> `cake_kimi_k3_mla_fp8_paged_attention_abc850f024ed156e98ca` (sm_100a, sm_103a)
-* `main_rt96` -> `cake_kimi_k3_mla_fp8_paged_attention_a1945d8ab3d522beb089` (sm_100a, sm_103a)
-* `main_wide` -> `cake_kimi_k3_mla_fp8_paged_attention_5e6f67c2c89c6eb24061` (sm_100a), `cake_kimi_k3_mla_fp8_paged_attention_e1bdfbc717f1844c99a8` (sm_103a)
+* `main_rt16` -> `cake_kimi_k3_mla_fp8_paged_attention_0671389304e63170bbbc` (sm_100a, sm_103a)
+* `main_rt32` -> `cake_kimi_k3_mla_fp8_paged_attention_a8000b087206eb1c3fe9` (sm_100a, sm_103a)
+* `main_rt48` -> `cake_kimi_k3_mla_fp8_paged_attention_e6e3f7bd92aa583f4cc1` (sm_100a, sm_103a)
+* `main_rt64` -> `cake_kimi_k3_mla_fp8_paged_attention_def8106415e373567c7e` (sm_100a, sm_103a)
+* `main_rt96` -> `cake_kimi_k3_mla_fp8_paged_attention_4333f9691fff77af1b1f` (sm_100a, sm_103a)
+* `main_wide` -> `cake_kimi_k3_mla_fp8_paged_attention_2b9895b6bdfdcc6ff476` (sm_100a), `cake_kimi_k3_mla_fp8_paged_attention_5d067c89074fe8216a6c` (sm_103a)
 * `reduce_cta` -> `cake_kimi_k3_mla_fp8_paged_attention_037deeabf96bd0d2d769` (sm_100a, sm_103a)
 * `reduce_w1` -> `cake_kimi_k3_mla_fp8_paged_attention_977c0b337b3f4232a99f` (sm_100a, sm_103a)
 * `reduce_w2` -> `cake_kimi_k3_mla_fp8_paged_attention_b1c5eb5cb28aa248c2a9` (sm_100a, sm_103a)
