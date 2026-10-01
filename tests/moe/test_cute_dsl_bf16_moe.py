@@ -53,13 +53,13 @@ def test_sm90_moe_autotune_profile_contract():
     ).tuning_config
 
     assert config.value_aware_input_indices == (1, 2)
-    assert config.profile_arena_input_indices == (0, 1, 2, 5)
+    assert config.profile_replica_input_indices == (0, 1, 2, 5)
     assert config.use_cuda_graph
 
 
 @cute_dsl_available
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
-def test_sm90_moe_autotune_uses_dynamic_profile_arena(monkeypatch):
+def test_sm90_moe_autotune_uses_dynamic_profile_replicas(monkeypatch):
     """Large shared weights must not collapse cold-L2 profiling to one batch."""
     from flashinfer.autotuner import AutoTuner
     from flashinfer.fused_moe.cute_dsl.sm90_fused_moe import _moe_core_impl
@@ -68,7 +68,6 @@ def test_sm90_moe_autotune_uses_dynamic_profile_arena(monkeypatch):
     )
 
     tuner = AutoTuner(warmup=0, repeat=4)
-    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: 1024)
     config = CuteDslFusedMoESm90Runner(
         forward_impl=_moe_core_impl,
         num_experts=4,
@@ -83,17 +82,26 @@ def test_sm90_moe_autotune_uses_dynamic_profile_arena(monkeypatch):
         torch.empty(4096, dtype=torch.uint8, device="cuda"),
         torch.empty((4, 8), dtype=torch.float32, device="cuda"),
     ]
+    replica_bytes = sum(
+        inputs[input_index].nbytes
+        for input_index in config.profile_replica_input_indices
+    )
+    emulated_l2_bytes = replica_bytes * (tuner.repeat - 1) // 2
+    monkeypatch.setattr(tuner, "_get_l2_cache_size_in_bytes", lambda: emulated_l2_bytes)
 
-    batches = tuner._prepare_input_tensors_with_batches(inputs, config)
+    _, batches = tuner._prepare_input_tensors_with_batches(inputs, config)
 
     assert len(batches) == tuner.repeat
     for input_index in (0, 1, 2, 5):
-        assert len({batch[input_index].data_ptr() for batch in batches}) == tuner.repeat
-    for batch in batches:
-        assert torch.equal(batch[1], inputs[1])
-        assert torch.equal(batch[2], inputs[2])
-        assert batch[3] is inputs[3]
-        assert batch[4] is inputs[4]
+        assert (
+            len({batch_inputs[input_index].data_ptr() for batch_inputs, _ in batches})
+            == tuner.repeat
+        )
+    for batch_inputs, _ in batches:
+        assert torch.equal(batch_inputs[1], inputs[1])
+        assert torch.equal(batch_inputs[2], inputs[2])
+        assert batch_inputs[3] is inputs[3]
+        assert batch_inputs[4] is inputs[4]
 
 
 @cute_dsl_available

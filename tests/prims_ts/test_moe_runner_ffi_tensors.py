@@ -15,6 +15,7 @@
 import ast
 import inspect
 
+import pytest
 import torch
 import tvm_ffi
 
@@ -26,12 +27,50 @@ from flashinfer.prims_ts.moe.tensor_adapter import _get_expert_scale_ones
 from flashinfer.prims_ts.moe.runner import (
     PrimsTsBf16MoERunner,
     PrimsTsMxfp4Mxfp8MoERunner,
+    _decode_routing_outputs,
     _moe_topk_ids_init_for_routing,
+    _pad_mxfp8_linear_scale_for_prims,
     _routed_token_capacity,
     _select_expert_weights,
     _staged_routing_io,
     _torch_views_of_ffi_tensors,
 )
+
+
+def test_mxfp8_padding_honors_explicit_output_for_already_padded_input():
+    source = torch.arange(32, dtype=torch.uint8).view(2, 16)
+    output = torch.empty_like(source)
+
+    actual = _pad_mxfp8_linear_scale_for_prims(
+        source, num_tokens=2, hidden_size=512, output=output
+    )
+
+    assert actual is output
+    assert actual.data_ptr() != source.data_ptr()
+    torch.testing.assert_close(actual, source)
+
+    source.add_(1)
+    _pad_mxfp8_linear_scale_for_prims(
+        source, num_tokens=2, hidden_size=512, output=output
+    )
+    torch.testing.assert_close(output, source)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
+def test_mxfp8_padding_replay_refreshes_caller_owned_output():
+    source = torch.arange(32, device="cuda", dtype=torch.uint8).view(2, 16)
+    output = torch.empty_like(source)
+    graph = torch.cuda.CUDAGraph()
+
+    with torch.cuda.graph(graph):
+        _pad_mxfp8_linear_scale_for_prims(
+            source, num_tokens=2, hidden_size=512, output=output
+        )
+
+    source.add_(1)
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, source)
 
 
 def test_cache_key_extras_are_invariant_to_synthesized_placeholders():
@@ -293,3 +332,61 @@ def test_select_expert_weights_ignores_1d_autotune_placeholder():
         {"routing_input_mode": RoutingInputMode.PackedPrecomputed},
     )
     assert picked is routed
+
+
+@pytest.mark.parametrize("mode", tuple(RoutingInputMode))
+@pytest.mark.parametrize("ffi_outputs", (False, True))
+def test_decode_routing_outputs_honors_explicit_mode(mode, ffi_outputs):
+    """DA decoding must not infer unpacked routing from autotune placeholders."""
+    caller_weights = torch.full((4, 2), 3.0, dtype=torch.bfloat16)
+    inputs = _routing_inputs(
+        ids=torch.zeros(4, 2, dtype=torch.int32), weights=caller_weights
+    )
+    routed_weights = torch.ones_like(caller_weights)
+    workspace = torch.arange(4, dtype=torch.int32)
+    routing_out = [routed_weights, workspace, None]
+    if ffi_outputs:
+        routing_out = [
+            tvm_ffi.from_dlpack(t) if t is not None else None for t in routing_out
+        ]
+    expected_weights = (
+        caller_weights
+        if mode == RoutingInputMode.UnpackedPrecomputed
+        else routed_weights
+    )
+
+    for _ in range(2):
+        weights, decoded_workspace, optional = _decode_routing_outputs(
+            inputs, routing_out, {"routing_input_mode": mode}
+        )
+        assert weights.data_ptr() == expected_weights.data_ptr()
+        torch.testing.assert_close(weights, expected_weights)
+        if mode == RoutingInputMode.UnpackedPrecomputed:
+            assert weights is caller_weights
+        assert decoded_workspace.data_ptr() == workspace.data_ptr()
+        assert optional is None
+        expected_weights.add_(1)
+
+
+@pytest.mark.parametrize(
+    "ids_shape,weights_shape,use_caller_weights",
+    [
+        (None, None, False),
+        ((0,), (0,), False),
+        ((4, 2), (0,), False),
+        ((4, 2), (4,), False),
+        ((4, 2), (4, 2), True),
+    ],
+)
+def test_decode_routing_outputs_without_explicit_mode(
+    ids_shape, weights_shape, use_caller_weights
+):
+    """BF16/direct callers retain tensor-rank inference without a mode kwarg."""
+    ids = None if ids_shape is None else torch.zeros(ids_shape, dtype=torch.int32)
+    caller_weights = None if weights_shape is None else torch.ones(weights_shape)
+    inputs = _routing_inputs(ids=ids, weights=caller_weights)
+    routed_weights = torch.full((4, 2), 2.0)
+
+    (weights,) = _decode_routing_outputs(inputs, [routed_weights])
+
+    assert weights is (caller_weights if use_caller_weights else routed_weights)

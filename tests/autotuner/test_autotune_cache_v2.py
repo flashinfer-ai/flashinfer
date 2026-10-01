@@ -397,6 +397,11 @@ def test_measure_policy_overrides_profiling_config(cache_root, monkeypatch):
     _install_fake_profile(
         monkeypatch, times={0: 3.0, 1: 1.0, 2: 2.0}, record_configs=seen2
     )
+    # Keep the synthetic working set traversable within the configured repeat count. Physical
+    # device L2 capacity is independent of the measurement-policy override tested here.
+    monkeypatch.setattr(
+        AutoTuner, "_get_l2_cache_size_in_bytes", lambda _self, *_args: 1024
+    )
     with autotune_v2(
         persistent_cache=False, measurement_policy=MeasurementPolicy(cold_l2=True)
     ):

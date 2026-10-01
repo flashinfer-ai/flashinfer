@@ -490,7 +490,7 @@ __device__ __forceinline__ void DASortCountsWarpBitonicDescending(int* counts, i
   __syncthreads();
 }
 
-/** Sort a two-item-per-thread count vector in descending order with CUB radix sort. */
+/** Sort a bounded items-per-thread count vector in descending order with CUB radix sort. */
 template <int ItemsPerThread>
 __device__ __forceinline__ void DASortCountsCubDescending(int* counts, int num_experts,
                                                           int64_t count_upper_bound) {
@@ -673,9 +673,11 @@ __device__ __forceinline__ void DAFinishSelection(int* counts, float* similariti
     } else if (sort_length <= kDASelectorBlockThreads) {
       DASortCountsRegisterBitonicDescending(counts, sort_length);
     } else {
-      static_assert(MaxExperts <= 2 * kDASelectorBlockThreads,
-                    "DA selector supports at most two radix-sort items per thread");
-      DASortCountsCubDescending<2>(counts, num_experts, assignment_numel);
+      constexpr int kItemsPerThread =
+          (MaxExperts + kDASelectorBlockThreads - 1) / kDASelectorBlockThreads;
+      static_assert(kItemsPerThread <= 4,
+                    "DA selector supports at most four radix-sort items per thread");
+      DASortCountsCubDescending<kItemsPerThread>(counts, num_experts, assignment_numel);
     }
   }
 
@@ -701,12 +703,13 @@ __device__ __forceinline__ void DAFinishSelection(int* counts, float* similariti
 template <int MaxExperts, int MaxExemplars, bool PackedRoutingEntries = false,
           typename RoutingEntry = int32_t>
 __global__ void DASelectorKernel(const RoutingEntry* routing_entries, int64_t assignment_numel,
-                                 int num_experts, const float* exemplar_spectra,
+                                 int num_experts, int local_expert_offset, int num_local_experts,
+                                 const float* exemplar_spectra,
                                  const int32_t* exemplar_body_indices, int num_selector_exemplars,
                                  cudaGraphConditionalHandle conditional_handle,
                                  int32_t* selected_body) {
-  static_assert(MaxExperts <= 2 * kDASelectorBlockThreads,
-                "DA selector supports at most two expert bins per thread");
+  static_assert(MaxExperts <= 4 * kDASelectorBlockThreads,
+                "DA selector supports at most four expert bins per thread");
   static_assert(MaxExperts < USHRT_MAX,
                 "DA selector expert and sentinel bins must fit in unsigned short");
   static_assert(MaxExemplars <= kDASelectorBlockThreads / 32,
@@ -745,8 +748,9 @@ __global__ void DASelectorKernel(const RoutingEntry* routing_entries, int64_t as
           expert >>= 16;
         }
       }
-      items[item] =
-          static_cast<unsigned short>(expert >= 0 && expert < num_experts ? expert : MaxExperts);
+      const bool is_local =
+          expert >= local_expert_offset && expert < local_expert_offset + num_local_experts;
+      items[item] = static_cast<unsigned short>(is_local ? expert : MaxExperts);
     }
     BlockHistogram(histogram_storage).Composite(items, histogram);
     __syncthreads();
