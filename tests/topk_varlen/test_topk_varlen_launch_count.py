@@ -6,12 +6,15 @@ doubling the 3.3 us kernel; ``radix_cutlass`` pays three such ops today.
 
 Eager launches map one-to-one onto graph nodes, so the count is taken with
 torch.profiler over one eager call after two warm-ups (JIT, cached buffers).
-The counting runs in a fresh interpreter: torch.profiler records no CUDA
-activities in a process where an earlier CPU-only profiler session already
-ran (test_radix_filter.py has one), which turned every case here into a
-false "0 launches" whenever the directory ran as one pytest process while
-the file passed alone.  One child process counts every supported backend;
-each case reads its entry.
+The counting runs in fresh interpreters, one per backend: torch.profiler
+records no CUDA activities in a process where an earlier CPU-only profiler
+session already ran (test_radix_filter.py has one), and a process that opens
+many CUDA profiler sessions in a row can lose the later ones' events (a B200
+CI runner recorded the probe and five backends, then nothing for the last two
+in the same process).  Two sessions per process -- the probe and the backend
+-- keep both away.  An empty record can never be a code path (every backend
+launches at least its kernel), so it is reported as a profiler artifact and
+skipped; more launches than documented remain a failure.
 """
 
 import json
@@ -82,6 +85,9 @@ for backend in sys.argv[1:]:
 print("LAUNCHES " + json.dumps(result))
 """
 
+# the parent's own markers for records that say nothing about launch counts
+_PROFILER_UNAVAILABLE = "ProfilerUnavailable"
+
 
 def _supported_backends():
     from flashinfer.utils import get_compute_capability
@@ -101,17 +107,11 @@ def _supported_backends():
     return supported
 
 
-@pytest.fixture(scope="module")
-def launches():
-    """{backend: [activity names] or {"error", "msg"}} from one fresh
-    interpreter importing this same flashinfer tree."""
-    if not torch.cuda.is_available():
-        pytest.skip("no CUDA")
-    env = dict(os.environ)
-    tree = os.path.dirname(os.path.dirname(os.path.abspath(flashinfer.__file__)))
-    env["PYTHONPATH"] = tree + os.pathsep + env.get("PYTHONPATH", "")
+def _count_in_fresh_interpreter(backend, env):
+    """{backend: [names] | {"error", "msg"}} measured in a child that imports
+    this same flashinfer tree and opens exactly two profiler sessions."""
     proc = subprocess.run(
-        [sys.executable, "-c", _COUNT_SCRIPT, *_supported_backends()],
+        [sys.executable, "-c", _COUNT_SCRIPT, backend],
         capture_output=True,
         text=True,
         timeout=1800,
@@ -119,13 +119,34 @@ def launches():
     )
     lines = [ln for ln in proc.stdout.splitlines() if ln.startswith("LAUNCHES ")]
     assert proc.returncode == 0 and lines, (
-        f"launch-count child failed (rc={proc.returncode}):\n{proc.stderr[-2000:]}"
+        f"launch-count child for {backend} failed (rc={proc.returncode}):\n"
+        f"{proc.stderr[-2000:]}"
     )
     result = json.loads(lines[-1][len("LAUNCHES ") :])
-    assert result["__probe__"], (
-        "torch.profiler recorded no CUDA activity for a plain kernel"
-    )
-    return result
+    if not result["__probe__"]:
+        # The probe is a plain torch.add: when even that records nothing,
+        # CUPTI activity tracing is unavailable on this runner (profiling
+        # restricted to administrators, or no CUPTI for this toolkit).  Seen
+        # on a GB300 CI node with the cu129 toolkit while its cu130/cu134
+        # siblings and every B200 job recorded normally.
+        return {
+            "error": _PROFILER_UNAVAILABLE,
+            "msg": "torch.profiler recorded no CUDA activity for a plain kernel "
+            "in a fresh interpreter (CUPTI unavailable or profiling restricted)",
+        }
+    return result[backend]
+
+
+@pytest.fixture(scope="module")
+def launches():
+    """{backend: [activity names] or {"error", "msg"}}, one fresh interpreter
+    per supported backend."""
+    if not torch.cuda.is_available():
+        pytest.skip("no CUDA")
+    env = dict(os.environ)
+    tree = os.path.dirname(os.path.dirname(os.path.abspath(flashinfer.__file__)))
+    env["PYTHONPATH"] = tree + os.pathsep + env.get("PYTHONPATH", "")
+    return {b: _count_in_fresh_interpreter(b, env) for b in _supported_backends()}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="no CUDA")
@@ -136,15 +157,23 @@ def test_one_call_one_launch(backend, launches):
     found = launches[backend]
     if isinstance(found, dict):
         # _supported_backends() already dropped what the device cannot run, so
-        # the only legitimate refusal left is the DSL missing at call time
-        # (BackendSupportedError) or the checker's problem-size ValueError;
-        # anything else (a sticky CUDA error, a binding ICHECK) is a failure
-        # of this guard rail, not a skip.
-        if found["error"] == "BackendSupportedError" or (
+        # the only legitimate refusals left are the DSL missing at call time
+        # (BackendSupportedError), the checker's problem-size ValueError and a
+        # runner without a working profiler; anything else (a sticky CUDA
+        # error, a binding ICHECK) is a failure of this guard rail, not a skip.
+        if found["error"] in ("BackendSupportedError", _PROFILER_UNAVAILABLE) or (
             "Problem size is not supported" in found["msg"]
         ):
             pytest.skip(f"{backend}: {found['error']}: {found['msg']}")
         pytest.fail(f"{backend}: {found['error']}: {found['msg']}")
+    if not found:
+        # every backend launches at least its kernel, so an empty record means
+        # the profiler dropped this session's events, not that the call
+        # launched nothing
+        pytest.skip(
+            f"{backend}: the profiler recorded no device activity for the call "
+            "(CUPTI dropped the session's events); zero launches is not a code path"
+        )
     assert len(found) == EXPECTED[backend], (
         f"{backend}: {len(found)} device launches per call, expected "
         f"{EXPECTED[backend]}: {found}"
