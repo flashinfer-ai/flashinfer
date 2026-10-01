@@ -1307,8 +1307,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             int my_s_base = taddr + (unsigned int)(s_warp * 32 << 16);
             int rows_live = ((s_warp * 16 < N_ROWS) ? 1 : 0);
             int row_j = my_row / 8;
-            int _min_1 = ((row_j) < (q_len - 1) ? (row_j) : (q_len - 1));
-            int vis_j = _min_1;
+            int _min_7 = ((row_j) < (q_len - 1) ? (row_j) : (q_len - 1));
+            int vis_j = _min_7;
             unsigned int sm_stage = 0;
             unsigned int sm_phase = 0;
             unsigned int xm_slot_s = 0;
@@ -1333,6 +1333,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             unsigned int counter_idx = work_token_words[base + 9];
             unsigned int chunk = work_token_words[base + 10];
             unsigned int phase = work_token_words[base + 11];
+            unsigned int spec_hit = work_token_words[base + 12];
+            unsigned int spec_nblocks = work_token_words[base + 13];
             mbarrier_arrive(work_empty_addr + (work_stage_s) * 8);
             work_stage_s += 1;
             if (work_stage_s == 4) { work_stage_s = 0; _phase_work_full ^= 1; }
@@ -1388,8 +1390,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                                 n_vis = 0;
                             }
                             if (n_vis < 32) {
-                                int _max_13 = ((n_vis) > (0) ? (n_vis) : (0));
-                                int n_lo = _max_13;
+                                int _max_17 = ((n_vis) > (0) ? (n_vis) : (0));
+                                int n_lo = _max_17;
                                 uint32_t _slice_lo_mask_0;
                                 {
                                     int _lim_0 = n_lo;
@@ -1456,8 +1458,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                             float sv_max = row_max_reduce(_reg_reduce_max2_1);
                             lmax = sv_max;
                             float _shfl_xor_2 = __shfl_xor_sync(0xFFFFFFFF, lmax, 16);
-                            float _max_14 = max_noftz(lmax, _shfl_xor_2);
-                            lmax = _max_14;
+                            float _max_18 = max_noftz(lmax, _shfl_xor_2);
+                            lmax = _max_18;
                             if (half == 0) {
                                 smem_xmax[xm_off_s + my_row] = lmax;
                             }
@@ -1466,8 +1468,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                         }
                         asm volatile("barrier.sync 8, 256;" ::: "memory");
                         if (rows_live != 0) {
-                            float _max_15 = max_noftz(lmax, smem_xmax[xm_off_s + 64 + my_row]);
-                            lmax = _max_15;
+                            float _max_19 = max_noftz(lmax, smem_xmax[xm_off_s + 64 + my_row]);
+                            lmax = _max_19;
                             if (lmax > row_max + thr_raw) {
                                 new_max = lmax;
                                 if (row_max > -CAKE_INF) {
@@ -1712,86 +1714,122 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                         int stats_row_r = slot_tile_base_s * 128 + r_row;
                         int f_r = 32 >> block_end_s;
                         int d0_r = block_begin_s * (4 * f_r) + (128 + sm_tid) % 4 * f_r;
+                        {
+                            d0_r = block_begin_s * (4 * f_r) + (128 + sm_tid) % 4 * 16;
+                        }
                         int o_row_r = slot_tile_base_s * 8192 + r_row * HEAD_DIM + d0_r;
                         int j_r = r_row / 8;
                         int h_r = r_row % 8;
                         int q_head_r = kv_head_s * 8 + h_r;
                         int o_idx_r = ((batch_s * q_len + j_r) * num_q_heads + q_head_r) * HEAD_DIM + d0_r;
-                        int n_groups_r = 8 >> block_end_s;
                         int store_lse_r = 0;
                         if ((128 + sm_tid) % 4 == 0 && block_begin_s == 0) {
                             store_lse_r = 1;
                         }
                         int lse_idx_r = (batch_s * q_len + j_r) * num_q_heads + q_head_r;
-                        float acc_f[4];
-                        float out4[4];
-                        int n_pad_r = (n_chunks_s + 7) / 8 * 8;
-                        #pragma unroll 1
-                        for (int g_r = 0; g_r < n_groups_r; g_r++) {
-                            acc_f[0] = 0.0f;
-                            acc_f[1] = 0.0f;
-                            acc_f[2] = 0.0f;
-                            acc_f[3] = 0.0f;
-                            float m_f = -1e+30f;
-                            float l_f = 0.0f;
-                            int o_col_r = o_row_r + g_r * 4;
-                            #pragma unroll 8
-                            for (int c_m = 0; c_m < n_pad_r; c_m++) {
-                                int c_c = c_m;
-                                if (n_chunks_s <= c_m) {
-                                    c_c = n_chunks_s - 1;
-                                }
-                                float m_k = partial_stats[stats_row_r + c_c * stats_stride_r];
-                                float l_k = partial_stats[stats_row_r + 64 + c_c * stats_stride_r];
-                                if (n_chunks_s <= c_m) {
-                                    m_k = -1e+30f;
-                                    l_k = 0.0f;
-                                }
-                                float _max_16 = max_noftz(m_f, m_k);
-                                float m_new = _max_16;
-                                float _exp2_1 = approx_exp2((m_f - m_new) * softmax_scale_log2);
-                                float a_k = _exp2_1;
-                                float _exp2_2 = approx_exp2((m_k - m_new) * softmax_scale_log2);
-                                float b_k = _exp2_2;
-                                float _fma_0 = __fmaf_rn(l_k, b_k, l_f * a_k);
-                                l_f = _fma_0;
-                                float _vec_load_0[4];
-                                {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(partial_o + (o_col_r + c_c * o_stride_r) + 0);
-                                    _vec_load_0[0 + 0] = _v4.x;
-                                    _vec_load_0[0 + 1] = _v4.y;
-                                    _vec_load_0[0 + 2] = _v4.z;
-                                    _vec_load_0[0 + 3] = _v4.w;
-                                }
-                                #pragma unroll
-                                for (int k = 0; k < 4; k++) {
-                                    float _fma_1 = __fmaf_rn(_vec_load_0[k], b_k, acc_f[k] * a_k);
-                                    acc_f[k] = _fma_1;
-                                }
-                                m_f = m_new;
-                            }
-                            float _rcp_12 = approx_rcp(l_f);
-                            float inv_f = ((l_f > 0.0f) ? _rcp_12 * output_scale : 0.0f);
-                            #pragma unroll
-                            for (int k4 = 0; k4 < 4; k4++) {
-                                out4[k4] = acc_f[k4] * inv_f;
-                            }
-                            {
-                                uint2 _pk2;
-                                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                                _pk[0] = __floats2bfloat162_rn(out4[0 + 0], out4[0 + 1]);
-                                _pk[1] = __floats2bfloat162_rn(out4[0 + 2], out4[0 + 3]);
-                                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_r + g_r * 4)))[0]) = _pk2;
-                            }
-                            if (store_lse_r != 0) {
-                                if (g_r == 0) {
-                                    float lse_r = -CAKE_INF;
-                                    if (l_f > 0.0f) {
-                                        float _log2_0;
-                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(l_f));
-                                        lse_r = m_f * softmax_scale_log2 + _log2_0 - 0.8073549f;
+                        {
+                            int _max_20 = ((f_r / 16) > (1) ? (f_r / 16) : (1));
+                            int n_span_r = _max_20;
+                            int _min_8 = ((f_r / 4) < (4) ? (f_r / 4) : (4));
+                            int active_r = _min_8;
+                            if (active_r > (128 + sm_tid) % 4) {
+                                #pragma unroll 1
+                                for (int w_r = 0; w_r < n_span_r; w_r++) {
+                                    int store_lse_w = ((w_r == 0) ? store_lse_r : 0);
+                                    float acc_w[16];
+                                    acc_w[0] = 0.0f;
+                                    acc_w[1] = 0.0f;
+                                    acc_w[2] = 0.0f;
+                                    acc_w[3] = 0.0f;
+                                    acc_w[4] = 0.0f;
+                                    acc_w[5] = 0.0f;
+                                    acc_w[6] = 0.0f;
+                                    acc_w[7] = 0.0f;
+                                    acc_w[8] = 0.0f;
+                                    acc_w[9] = 0.0f;
+                                    acc_w[10] = 0.0f;
+                                    acc_w[11] = 0.0f;
+                                    acc_w[12] = 0.0f;
+                                    acc_w[13] = 0.0f;
+                                    acc_w[14] = 0.0f;
+                                    acc_w[15] = 0.0f;
+                                    float m_w = -1e+30f;
+                                    float l_w = 0.0f;
+                                    int n_pad_w = (n_chunks_s + 3) / 4 * 4;
+                                    #pragma unroll 1
+                                    for (int c_b = 0; c_b < n_pad_w; c_b += 4) {
+                                        float m_b[4];
+                                        float l_b[4];
+                                        float o_b[64];
+                                        #pragma unroll
+                                        for (int cb = 0; cb < 4; cb++) {
+                                            int c_c = c_b + cb;
+                                            if (c_c >= n_chunks_s) {
+                                                c_c = n_chunks_s - 1;
+                                            }
+                                            m_b[cb] = partial_stats[stats_row_r + c_c * stats_stride_r];
+                                            l_b[cb] = partial_stats[stats_row_r + 64 + c_c * stats_stride_r];
+                                            #pragma unroll
+                                            for (int g = 0; g < 4; g++) {
+                                                {
+                                                    float4 _v4 = *reinterpret_cast<const float4*>(partial_o + o_row_r + w_r * 64 + g * 4 + c_c * o_stride_r);
+                                                    o_b[cb * 16 + g * 4 + 0] = _v4.x;
+                                                    o_b[cb * 16 + g * 4 + 1] = _v4.y;
+                                                    o_b[cb * 16 + g * 4 + 2] = _v4.z;
+                                                    o_b[cb * 16 + g * 4 + 3] = _v4.w;
+                                                }
+                                            }
+                                        }
+                                        #pragma unroll
+                                        for (int cb2 = 0; cb2 < 4; cb2++) {
+                                            float m_k = m_b[cb2];
+                                            float l_k = l_b[cb2];
+                                            if (n_chunks_s <= c_b + cb2) {
+                                                m_k = -1e+30f;
+                                                l_k = 0.0f;
+                                            }
+                                            float _max_21 = max_noftz(m_w, m_k);
+                                            float m_new = _max_21;
+                                            float _exp2_1 = approx_exp2((m_w - m_new) * softmax_scale_log2);
+                                            float a_k = _exp2_1;
+                                            float _exp2_2 = approx_exp2((m_k - m_new) * softmax_scale_log2);
+                                            float b_k = _exp2_2;
+                                            float _fma_0 = __fmaf_rn(l_k, b_k, l_w * a_k);
+                                            l_w = _fma_0;
+                                            #pragma unroll
+                                            for (int k2 = 0; k2 < 16; k2++) {
+                                                float _fma_1 = __fmaf_rn(o_b[cb2 * 16 + k2], b_k, acc_w[k2] * a_k);
+                                                acc_w[k2] = _fma_1;
+                                            }
+                                            m_w = m_new;
+                                        }
                                     }
-                                    *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r) + (0)) = lse_r;
+                                    float _rcp_12 = approx_rcp(l_w);
+                                    float inv_w = ((l_w > 0.0f) ? _rcp_12 * output_scale : 0.0f);
+                                    float out_w[4];
+                                    #pragma unroll
+                                    for (int g3 = 0; g3 < 4; g3++) {
+                                        #pragma unroll
+                                        for (int k3 = 0; k3 < 4; k3++) {
+                                            out_w[k3] = acc_w[g3 * 4 + k3] * inv_w;
+                                        }
+                                        {
+                                            uint2 _pk2;
+                                            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                                            _pk[0] = __floats2bfloat162_rn(out_w[0 + 0], out_w[0 + 1]);
+                                            _pk[1] = __floats2bfloat162_rn(out_w[0 + 2], out_w[0 + 3]);
+                                            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_r + w_r * 64 + g3 * 4)))[0]) = _pk2;
+                                        }
+                                    }
+                                    if (store_lse_w != 0) {
+                                        float lse_w = -CAKE_INF;
+                                        if (l_w > 0.0f) {
+                                            float _log2_0;
+                                            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_0) : "f"(l_w));
+                                            lse_w = m_w * softmax_scale_log2 + _log2_0 - 0.8073549f;
+                                        }
+                                        *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r) + (0)) = lse_w;
+                                    }
                                 }
                             }
                         }
@@ -1811,6 +1849,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 unsigned int counter_idx_10 = work_token_words[base_0 + 9];
                 unsigned int chunk_11 = work_token_words[base_0 + 10];
                 unsigned int phase_12 = work_token_words[base_0 + 11];
+                unsigned int spec_hit_13 = work_token_words[base_0 + 12];
+                unsigned int spec_nblocks_14 = work_token_words[base_0 + 13];
                 mbarrier_arrive(work_empty_addr + (work_stage_s) * 8);
                 work_stage_s += 1;
                 if (work_stage_s == 4) { work_stage_s = 0; _phase_work_full ^= 1; }
@@ -1842,10 +1882,10 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             int tok_base_c = half_c * 64 + 32;
             int rows_live_c = ((warp_in_wg_c * 16 < N_ROWS) ? 1 : 0);
             int row_j_c = my_row_c / 8;
-            int _min_2 = ((row_j_c) < (q_len - 1) ? (row_j_c) : (q_len - 1));
-            int vis_j_c = _min_2;
-            float _rcp_13 = approx_rcp(softmax_scale_log2);
-            float thr_raw_c = 8.0f * _rcp_13;
+            int _min_9 = ((row_j_c) < (q_len - 1) ? (row_j_c) : (q_len - 1));
+            int vis_j_c = _min_9;
+            float _rcp_14 = approx_rcp(softmax_scale_log2);
+            float thr_raw_c = 8.0f * _rcp_14;
             float p_scale_log2_c = 0.8073549f;
             int live_rows = q_len * 8;
             unsigned int sm_stage_c = 0;
@@ -1904,6 +1944,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             unsigned int counter_idx_1 = work_token_words[base_1 + 9];
             unsigned int chunk_1 = work_token_words[base_1 + 10];
             unsigned int phase_1 = work_token_words[base_1 + 11];
+            unsigned int spec_hit_1 = work_token_words[base_1 + 12];
+            unsigned int spec_nblocks_1 = work_token_words[base_1 + 13];
             mbarrier_arrive(work_empty_addr + (work_stage_c) * 8);
             work_stage_c += 1;
             if (work_stage_c == 4) { work_stage_c = 0; _phase_work_full_1 ^= 1; }
@@ -1960,8 +2002,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                                 n_vis_c = 0;
                             }
                             if (n_vis_c < 32) {
-                                int _max_17 = ((n_vis_c) > (0) ? (n_vis_c) : (0));
-                                int n_lo_c = _max_17;
+                                int _max_23 = ((n_vis_c) > (0) ? (n_vis_c) : (0));
+                                int n_lo_c = _max_23;
                                 uint32_t _slice_lo_mask_1;
                                 {
                                     int _lim_0 = n_lo_c;
@@ -2028,21 +2070,21 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                             float sv_c_max = row_max_reduce(_reg_reduce_max2_1);
                             lmax_c = sv_c_max;
                             float _shfl_xor_4 = __shfl_xor_sync(0xFFFFFFFF, lmax_c, 16);
-                            float _max_18 = max_noftz(lmax_c, _shfl_xor_4);
-                            lmax_c = _max_18;
+                            float _max_24 = max_noftz(lmax_c, _shfl_xor_4);
+                            lmax_c = _max_24;
                             if (half_c == 0) {
                                 smem_xmax[xm_off_c + 64 + my_row_c] = lmax_c;
                             }
                         }
                         asm volatile("barrier.sync 8, 256;" ::: "memory");
                         if (rows_live_c != 0) {
-                            float _max_19 = max_noftz(lmax_c, smem_xmax[xm_off_c + my_row_c]);
-                            lmax_c = _max_19;
+                            float _max_25 = max_noftz(lmax_c, smem_xmax[xm_off_c + my_row_c]);
+                            lmax_c = _max_25;
                             if (lmax_c > row_max_c + thr_raw_c) {
                                 new_max_c = lmax_c;
                                 if (row_max_c > -CAKE_INF) {
-                                    float _exp2_3 = approx_exp2(softmax_scale_log2 * (row_max_c - new_max_c));
-                                    acc_scale_c = _exp2_3;
+                                    float _exp2_5 = approx_exp2(softmax_scale_log2 * (row_max_c - new_max_c));
+                                    acc_scale_c = _exp2_5;
                                 }
                             }
                         }
@@ -2339,8 +2381,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                         if (my_row_c < N_ROWS) {
                             row_sum_c = smem_sum[st_off + my_row_c];
                         }
-                        float _rcp_14 = approx_rcp(row_sum_c);
-                        float inv_c = ((row_sum_c > 0.0f) ? _rcp_14 : 0.0f);
+                        float _rcp_15 = approx_rcp(row_sum_c);
+                        float inv_c = ((row_sum_c > 0.0f) ? _rcp_15 : 0.0f);
                         if (row_sum_c <= 0.0f) {
                             #pragma unroll
                             for (int z_c = 0; z_c < 64; z_c++) {
@@ -2376,9 +2418,9 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                             if (half_c == 0) {
                                 float lse_c = -CAKE_INF;
                                 if (row_sum_c > 0.0f) {
-                                    float _log2_1;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_1) : "f"(row_sum_c));
-                                    lse_c = smem_max[st_off + my_row_c] * softmax_scale_log2 + _log2_1 - p_scale_log2_c;
+                                    float _log2_2;
+                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(row_sum_c));
+                                    lse_c = smem_max[st_off + my_row_c] * softmax_scale_log2 + _log2_2 - p_scale_log2_c;
                                 }
                                 *(reinterpret_cast<float*>(LSE_ptr + ((batch_c * q_len + j_c) * num_q_heads + q_head_c)) + (0)) = lse_c;
                             }
@@ -2426,22 +2468,26 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                                 float l_o = partial_stats[other_slot * 128 + 64 + my_row_c];
                                 float m_s = smem_max[st_off + my_row_c];
                                 float l_s = smem_sum[st_off + my_row_c];
-                                float _max_20 = max_noftz(m_s, m_o);
-                                float m_row_i = _max_20;
-                                float _exp2_4 = approx_exp2((m_s - m_row_i) * softmax_scale_log2);
-                                float w_s = _exp2_4;
-                                float _exp2_5 = approx_exp2((m_o - m_row_i) * softmax_scale_log2);
-                                float w_o = _exp2_5;
-                                float _fma_2 = __fmaf_rn(w_s, l_s, w_o * l_o);
-                                float den_i = _fma_2;
-                                float _rcp_15 = approx_rcp(den_i);
-                                float inv_i = ((den_i > 0.0f) ? _rcp_15 * output_scale : 0.0f);
+                                float _max_26 = max_noftz(m_s, m_o);
+                                float m_row_i = _max_26;
+                                float _exp2_6 = approx_exp2((m_s - m_row_i) * softmax_scale_log2);
+                                float w_s = _exp2_6;
+                                float _exp2_7 = approx_exp2((m_o - m_row_i) * softmax_scale_log2);
+                                float w_o = _exp2_7;
+                                float _fma_4 = __fmaf_rn(w_s, l_s, w_o * l_o);
+                                float den_i = _fma_4;
+                                if (chunk_c != 0) {
+                                    float _fma_5 = __fmaf_rn(w_o, l_o, w_s * l_s);
+                                    den_i = _fma_5;
+                                }
+                                float _rcp_16 = approx_rcp(den_i);
+                                float inv_i = ((den_i > 0.0f) ? _rcp_16 * output_scale : 0.0f);
                                 w_s_c = w_s * inv_i;
                                 w_o_c = w_o * inv_i;
                                 if (den_i > 0.0f) {
-                                    float _log2_2;
-                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_2) : "f"(den_i));
-                                    lse_i = m_row_i * softmax_scale_log2 + _log2_2 - p_scale_log2_c;
+                                    float _log2_3;
+                                    asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_3) : "f"(den_i));
+                                    lse_i = m_row_i * softmax_scale_log2 + _log2_3 - p_scale_log2_c;
                                 }
                             }
                             int oth_base = other_slot * 8192 + my_row_c * HEAD_DIM + half_c * 64;
@@ -2458,8 +2504,12 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                                     }
                                     #pragma unroll
                                     for (int c = 0; c < 4; c++) {
-                                        float _fma_3 = __fmaf_rn(_tmem_load_1[c0 + c], w_s_c, _vec_load_1[c] * w_o_c);
-                                        _tmem_load_1[c0 + c] = _fma_3;
+                                        {
+                                            float _fma_6 = __fmaf_rn(_tmem_load_1[c0 + c], w_s_c, _vec_load_1[c] * w_o_c);
+                                            float _fma_7 = __fmaf_rn(_vec_load_1[c], w_o_c, _tmem_load_1[c0 + c] * w_s_c);
+                                            float o_det_d1 = ((chunk_c == 0) ? _fma_6 : _fma_7);
+                                            _tmem_load_1[c0 + c] = o_det_d1;
+                                        }
                                     }
                                 }
                                 int j_c_1 = my_row_c / 8;
@@ -2542,86 +2592,122 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                         int stats_row_r_1 = slot_tile_base_c * 128 + r_row_1;
                         int f_r_1 = 32 >> block_end_c;
                         int d0_r_1 = block_begin_c * (4 * f_r_1) + wg_tid_c % 4 * f_r_1;
+                        {
+                            d0_r_1 = block_begin_c * (4 * f_r_1) + wg_tid_c % 4 * 16;
+                        }
                         int o_row_r_1 = slot_tile_base_c * 8192 + r_row_1 * HEAD_DIM + d0_r_1;
                         int j_r_1 = r_row_1 / 8;
                         int h_r_1 = r_row_1 % 8;
                         int q_head_r_1 = kv_head_c * 8 + h_r_1;
                         int o_idx_r_1 = ((batch_c * q_len + j_r_1) * num_q_heads + q_head_r_1) * HEAD_DIM + d0_r_1;
-                        int n_groups_r_1 = 8 >> block_end_c;
                         int store_lse_r_1 = 0;
                         if (wg_tid_c % 4 == 0 && block_begin_c == 0) {
                             store_lse_r_1 = 1;
                         }
                         int lse_idx_r_1 = (batch_c * q_len + j_r_1) * num_q_heads + q_head_r_1;
-                        float acc_f_1[4];
-                        float out4_1[4];
-                        int n_pad_r_1 = (n_chunks_c + 7) / 8 * 8;
-                        #pragma unroll 1
-                        for (int g_r_1 = 0; g_r_1 < n_groups_r_1; g_r_1++) {
-                            acc_f_1[0] = 0.0f;
-                            acc_f_1[1] = 0.0f;
-                            acc_f_1[2] = 0.0f;
-                            acc_f_1[3] = 0.0f;
-                            float m_f_1 = -1e+30f;
-                            float l_f_1 = 0.0f;
-                            int o_col_r_1 = o_row_r_1 + g_r_1 * 4;
-                            #pragma unroll 8
-                            for (int c_m_1 = 0; c_m_1 < n_pad_r_1; c_m_1++) {
-                                int c_c_1 = c_m_1;
-                                if (n_chunks_c <= c_m_1) {
-                                    c_c_1 = n_chunks_c - 1;
-                                }
-                                float m_k_1 = partial_stats[stats_row_r_1 + c_c_1 * stats_stride_r_1];
-                                float l_k_1 = partial_stats[stats_row_r_1 + 64 + c_c_1 * stats_stride_r_1];
-                                if (n_chunks_c <= c_m_1) {
-                                    m_k_1 = -1e+30f;
-                                    l_k_1 = 0.0f;
-                                }
-                                float _max_21 = max_noftz(m_f_1, m_k_1);
-                                float m_new_1 = _max_21;
-                                float _exp2_6 = approx_exp2((m_f_1 - m_new_1) * softmax_scale_log2);
-                                float a_k_1 = _exp2_6;
-                                float _exp2_7 = approx_exp2((m_k_1 - m_new_1) * softmax_scale_log2);
-                                float b_k_1 = _exp2_7;
-                                float _fma_4 = __fmaf_rn(l_k_1, b_k_1, l_f_1 * a_k_1);
-                                l_f_1 = _fma_4;
-                                float _vec_load_2[4];
-                                {
-                                    float4 _v4 = *reinterpret_cast<const float4*>(partial_o + (o_col_r_1 + c_c_1 * o_stride_r_1) + 0);
-                                    _vec_load_2[0 + 0] = _v4.x;
-                                    _vec_load_2[0 + 1] = _v4.y;
-                                    _vec_load_2[0 + 2] = _v4.z;
-                                    _vec_load_2[0 + 3] = _v4.w;
-                                }
-                                #pragma unroll
-                                for (int k_1 = 0; k_1 < 4; k_1++) {
-                                    float _fma_5 = __fmaf_rn(_vec_load_2[k_1], b_k_1, acc_f_1[k_1] * a_k_1);
-                                    acc_f_1[k_1] = _fma_5;
-                                }
-                                m_f_1 = m_new_1;
-                            }
-                            float _rcp_16 = approx_rcp(l_f_1);
-                            float inv_f_1 = ((l_f_1 > 0.0f) ? _rcp_16 * output_scale : 0.0f);
-                            #pragma unroll
-                            for (int k4_1 = 0; k4_1 < 4; k4_1++) {
-                                out4_1[k4_1] = acc_f_1[k4_1] * inv_f_1;
-                            }
-                            {
-                                uint2 _pk2;
-                                __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
-                                _pk[0] = __floats2bfloat162_rn(out4_1[0 + 0], out4_1[0 + 1]);
-                                _pk[1] = __floats2bfloat162_rn(out4_1[0 + 2], out4_1[0 + 3]);
-                                *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_r_1 + g_r_1 * 4)))[0]) = _pk2;
-                            }
-                            if (store_lse_r_1 != 0) {
-                                if (g_r_1 == 0) {
-                                    float lse_r_1 = -CAKE_INF;
-                                    if (l_f_1 > 0.0f) {
-                                        float _log2_3;
-                                        asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_3) : "f"(l_f_1));
-                                        lse_r_1 = m_f_1 * softmax_scale_log2 + _log2_3 - 0.8073549f;
+                        {
+                            int _max_27 = ((f_r_1 / 16) > (1) ? (f_r_1 / 16) : (1));
+                            int n_span_r_1 = _max_27;
+                            int _min_10 = ((f_r_1 / 4) < (4) ? (f_r_1 / 4) : (4));
+                            int active_r_1 = _min_10;
+                            if (active_r_1 > wg_tid_c % 4) {
+                                #pragma unroll 1
+                                for (int w_r_1 = 0; w_r_1 < n_span_r_1; w_r_1++) {
+                                    int store_lse_w_1 = ((w_r_1 == 0) ? store_lse_r_1 : 0);
+                                    float acc_w_1[16];
+                                    acc_w_1[0] = 0.0f;
+                                    acc_w_1[1] = 0.0f;
+                                    acc_w_1[2] = 0.0f;
+                                    acc_w_1[3] = 0.0f;
+                                    acc_w_1[4] = 0.0f;
+                                    acc_w_1[5] = 0.0f;
+                                    acc_w_1[6] = 0.0f;
+                                    acc_w_1[7] = 0.0f;
+                                    acc_w_1[8] = 0.0f;
+                                    acc_w_1[9] = 0.0f;
+                                    acc_w_1[10] = 0.0f;
+                                    acc_w_1[11] = 0.0f;
+                                    acc_w_1[12] = 0.0f;
+                                    acc_w_1[13] = 0.0f;
+                                    acc_w_1[14] = 0.0f;
+                                    acc_w_1[15] = 0.0f;
+                                    float m_w_1 = -1e+30f;
+                                    float l_w_1 = 0.0f;
+                                    int n_pad_w_1 = (n_chunks_c + 3) / 4 * 4;
+                                    #pragma unroll 1
+                                    for (int c_b_1 = 0; c_b_1 < n_pad_w_1; c_b_1 += 4) {
+                                        float m_b_1[4];
+                                        float l_b_1[4];
+                                        float o_b_1[64];
+                                        #pragma unroll
+                                        for (int cb_1 = 0; cb_1 < 4; cb_1++) {
+                                            int c_c_1 = c_b_1 + cb_1;
+                                            if (c_c_1 >= n_chunks_c) {
+                                                c_c_1 = n_chunks_c - 1;
+                                            }
+                                            m_b_1[cb_1] = partial_stats[stats_row_r_1 + c_c_1 * stats_stride_r_1];
+                                            l_b_1[cb_1] = partial_stats[stats_row_r_1 + 64 + c_c_1 * stats_stride_r_1];
+                                            #pragma unroll
+                                            for (int g_1 = 0; g_1 < 4; g_1++) {
+                                                {
+                                                    float4 _v4 = *reinterpret_cast<const float4*>(partial_o + o_row_r_1 + w_r_1 * 64 + g_1 * 4 + c_c_1 * o_stride_r_1);
+                                                    o_b_1[cb_1 * 16 + g_1 * 4 + 0] = _v4.x;
+                                                    o_b_1[cb_1 * 16 + g_1 * 4 + 1] = _v4.y;
+                                                    o_b_1[cb_1 * 16 + g_1 * 4 + 2] = _v4.z;
+                                                    o_b_1[cb_1 * 16 + g_1 * 4 + 3] = _v4.w;
+                                                }
+                                            }
+                                        }
+                                        #pragma unroll
+                                        for (int cb2_1 = 0; cb2_1 < 4; cb2_1++) {
+                                            float m_k_1 = m_b_1[cb2_1];
+                                            float l_k_1 = l_b_1[cb2_1];
+                                            if (n_chunks_c <= c_b_1 + cb2_1) {
+                                                m_k_1 = -1e+30f;
+                                                l_k_1 = 0.0f;
+                                            }
+                                            float _max_28 = max_noftz(m_w_1, m_k_1);
+                                            float m_new_1 = _max_28;
+                                            float _exp2_8 = approx_exp2((m_w_1 - m_new_1) * softmax_scale_log2);
+                                            float a_k_1 = _exp2_8;
+                                            float _exp2_9 = approx_exp2((m_k_1 - m_new_1) * softmax_scale_log2);
+                                            float b_k_1 = _exp2_9;
+                                            float _fma_9 = __fmaf_rn(l_k_1, b_k_1, l_w_1 * a_k_1);
+                                            l_w_1 = _fma_9;
+                                            #pragma unroll
+                                            for (int k2_1 = 0; k2_1 < 16; k2_1++) {
+                                                float _fma_10 = __fmaf_rn(o_b_1[cb2_1 * 16 + k2_1], b_k_1, acc_w_1[k2_1] * a_k_1);
+                                                acc_w_1[k2_1] = _fma_10;
+                                            }
+                                            m_w_1 = m_new_1;
+                                        }
                                     }
-                                    *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r_1) + (0)) = lse_r_1;
+                                    float _rcp_17 = approx_rcp(l_w_1);
+                                    float inv_w_1 = ((l_w_1 > 0.0f) ? _rcp_17 * output_scale : 0.0f);
+                                    float out_w_1[4];
+                                    #pragma unroll
+                                    for (int g3_1 = 0; g3_1 < 4; g3_1++) {
+                                        #pragma unroll
+                                        for (int k3_1 = 0; k3_1 < 4; k3_1++) {
+                                            out_w_1[k3_1] = acc_w_1[g3_1 * 4 + k3_1] * inv_w_1;
+                                        }
+                                        {
+                                            uint2 _pk2;
+                                            __nv_bfloat162* _pk = reinterpret_cast<__nv_bfloat162*>(&_pk2);
+                                            _pk[0] = __floats2bfloat162_rn(out_w_1[0 + 0], out_w_1[0 + 1]);
+                                            _pk[1] = __floats2bfloat162_rn(out_w_1[0 + 2], out_w_1[0 + 3]);
+                                            *reinterpret_cast<uint2*>(&((__nv_bfloat16*)(O_ptr + (o_idx_r_1 + w_r_1 * 64 + g3_1 * 4)))[0]) = _pk2;
+                                        }
+                                    }
+                                    if (store_lse_w_1 != 0) {
+                                        float lse_w_1 = -CAKE_INF;
+                                        if (l_w_1 > 0.0f) {
+                                            float _log2_4;
+                                            asm volatile("lg2.approx.ftz.f32 %0, %1;" : "=f"(_log2_4) : "f"(l_w_1));
+                                            lse_w_1 = m_w_1 * softmax_scale_log2 + _log2_4 - 0.8073549f;
+                                        }
+                                        *(reinterpret_cast<float*>(LSE_ptr + lse_idx_r_1) + (0)) = lse_w_1;
+                                    }
                                 }
                             }
                         }
@@ -2644,6 +2730,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 unsigned int counter_idx_10_1 = work_token_words[base_0_1 + 9];
                 unsigned int chunk_11_1 = work_token_words[base_0_1 + 10];
                 unsigned int phase_12_1 = work_token_words[base_0_1 + 11];
+                unsigned int spec_hit_13_1 = work_token_words[base_0_1 + 12];
+                unsigned int spec_nblocks_14_1 = work_token_words[base_0_1 + 13];
                 mbarrier_arrive(work_empty_addr + (work_stage_c) * 8);
                 work_stage_c += 1;
                 if (work_stage_c == 4) { work_stage_c = 0; _phase_work_full_1 ^= 1; }
@@ -2695,6 +2783,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             unsigned int counter_idx_2 = work_token_words[base_2 + 9];
             unsigned int chunk_2 = work_token_words[base_2 + 10];
             unsigned int phase_2 = work_token_words[base_2 + 11];
+            unsigned int spec_hit_2 = work_token_words[base_2 + 12];
+            unsigned int spec_nblocks_2 = work_token_words[base_2 + 13];
             mbarrier_arrive(work_empty_addr + (work_stage_m) * 8);
             work_stage_m += 1;
             if (work_stage_m == 4) { work_stage_m = 0; _phase_work_full_2 ^= 1; }
@@ -2918,6 +3008,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 unsigned int counter_idx_10_2 = work_token_words[base_0_2 + 9];
                 unsigned int chunk_11_2 = work_token_words[base_0_2 + 10];
                 unsigned int phase_12_2 = work_token_words[base_0_2 + 11];
+                unsigned int spec_hit_13_2 = work_token_words[base_0_2 + 12];
+                unsigned int spec_nblocks_14_2 = work_token_words[base_0_2 + 13];
                 mbarrier_arrive(work_empty_addr + (work_stage_m) * 8);
                 work_stage_m += 1;
                 if (work_stage_m == 4) { work_stage_m = 0; _phase_work_full_2 ^= 1; }
@@ -2959,6 +3051,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             unsigned int counter_idx_3 = work_token_words[base_3 + 9];
             unsigned int chunk_3 = work_token_words[base_3 + 10];
             unsigned int phase_3 = work_token_words[base_3 + 11];
+            unsigned int spec_hit_3 = work_token_words[base_3 + 12];
+            unsigned int spec_nblocks_3 = work_token_words[base_3 + 13];
             mbarrier_arrive(work_empty_addr + (work_stage_p) * 8);
             work_stage_p += 1;
             if (work_stage_p == 4) { work_stage_p = 0; _phase_work_full_3 ^= 1; }
@@ -2969,6 +3063,7 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             int block_begin_p = (int)block_begin_3;
             int block_end_p = (int)block_end_3;
             int seqlen_kv_p = (int)seqlen_3;
+            int spec_hit_p = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_p = 0; _tile_iter_p < max_items; _tile_iter_p++) {
                 if (valid_p == 0) {
@@ -2976,232 +3071,238 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 }
                 if (kind_p == 0) {
                     int cta_n_blocks_p = block_end_p - block_begin_p;
-                    int _max_12 = (((seqlen_kv_p + PAGE_SIZE - 1) / PAGE_SIZE - 1) > (0) ? ((seqlen_kv_p + PAGE_SIZE - 1) / PAGE_SIZE - 1) : (0));
-                    int max_pg_p = _max_12;
+                    int _max_15 = (((seqlen_kv_p + PAGE_SIZE - 1) / PAGE_SIZE - 1) > (0) ? ((seqlen_kv_p + PAGE_SIZE - 1) / PAGE_SIZE - 1) : (0));
+                    int max_pg_p = _max_15;
                     int pt_base_p = batch_idx_p * max_pages_per_seq;
-                    mbarrier_wait(q_raw_full_addr + (qr_cons_stage) * 8, qr_cons_phase);
-                    mbarrier_wait(q_empty_addr + (q_prod_stage) * 8, q_prod_phase);
-                    int q_hi_base_s = smem_q_hi_addr + q_prod_stage * 8192;
-                    int q_lo_base_s = smem_q_lo_addr + q_prod_stage * 8192;
-                    int live_rows_q = q_len * 8;
-                    unsigned int q_words_s[8];
-                    float q_f32_s[16];
-                    float q_res_s[16];
-                    unsigned int q_packed_s[4];
-                    unsigned int q_packed_lo_s[4];
-                    #pragma unroll
-                    for (int qc_i = 0; qc_i < 16; qc_i++) {
-                        int q_chunk_s = qc_i * 32 + lane;
-                        int q_row_s = q_chunk_s / 8;
-                        int q_col16_s = q_chunk_s % 8;
-                        if (q_row_s < live_rows_q) {
-                            int q_kg_s = q_col16_s / 4;
-                            int q_c16a_s = q_col16_s % 4 * 2;
-                            int q_key_bf_s = ((smem_qbf_addr + qr_cons_stage * 16384) / 128 + (unsigned int)q_row_s) % 8;
-                            int q_src_row_s = smem_qbf_addr + qr_cons_stage * 16384 + (unsigned int)(q_kg_s * 8192) + (unsigned int)(q_row_s * 128);
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(0) + 3]))
-                                : "r"(q_src_row_s + (q_c16a_s ^ q_key_bf_s) * 16));
-                            asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
-                                : "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(4) + 3]))
-                                : "r"(q_src_row_s + (q_c16a_s + 1 ^ q_key_bf_s) * 16));
-                            #pragma unroll
-                            for (int qw_s = 0; qw_s < 8; qw_s++) {
-                                unsigned int q_w_s = q_words_s[qw_s];
-                                unsigned int q_wbits_d = q_w_s << 16;
-                                float q_lo_d = 0.0f;
-                                float q_lo_t_d = 0.0f;
-                                float q_hi_d = 0.0f;
-                                float q_hi_t_d = 0.0f;
-                                q_lo_d = reinterpret_cast<float*>(&q_wbits_d)[0];
-                                q_wbits_d = (q_w_s & 65520) << 16;
-                                q_lo_t_d = reinterpret_cast<float*>(&q_wbits_d)[0];
-                                q_wbits_d = q_w_s >> 16 << 16;
-                                q_hi_d = reinterpret_cast<float*>(&q_wbits_d)[0];
-                                q_wbits_d = (q_w_s >> 16 & 65520) << 16;
-                                q_hi_t_d = reinterpret_cast<float*>(&q_wbits_d)[0];
-                                q_f32_s[2 * qw_s] = q_lo_t_d;
-                                q_res_s[2 * qw_s] = q_lo_d - q_lo_t_d;
-                                q_f32_s[2 * qw_s + 1] = q_hi_t_d;
-                                q_res_s[2 * qw_s + 1] = q_hi_d - q_hi_t_d;
-                            }
-                        } else {
-                            #pragma unroll
-                            for (int qz_s = 0; qz_s < 16; qz_s++) {
-                                q_f32_s[qz_s] = 0.0f;
-                                q_res_s[qz_s] = 0.0f;
-                            }
-                        }
-                        {
-                            uint32_t _packed;
-                            asm volatile("{\n\t"
-                                ".reg .b16 _lo;\n\t"
-                                ".reg .b16 _hi;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                                "mov.b32 %0, {_lo, _hi};\n\t"
-                                "}"
-                                : "=r"(_packed) : "f"(q_f32_s[0]), "f"(q_f32_s[1]),
-                                                   "f"(q_f32_s[2]), "f"(q_f32_s[3]));
-                            q_packed_s[0] = _packed;
-                        }
-                        {
-                            uint32_t _packed;
-                            asm volatile("{\n\t"
-                                ".reg .b16 _lo;\n\t"
-                                ".reg .b16 _hi;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                                "mov.b32 %0, {_lo, _hi};\n\t"
-                                "}"
-                                : "=r"(_packed) : "f"(q_f32_s[4]), "f"(q_f32_s[5]),
-                                                   "f"(q_f32_s[6]), "f"(q_f32_s[7]));
-                            q_packed_s[1] = _packed;
-                        }
-                        {
-                            uint32_t _packed;
-                            asm volatile("{\n\t"
-                                ".reg .b16 _lo;\n\t"
-                                ".reg .b16 _hi;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                                "mov.b32 %0, {_lo, _hi};\n\t"
-                                "}"
-                                : "=r"(_packed) : "f"(q_f32_s[8]), "f"(q_f32_s[9]),
-                                                   "f"(q_f32_s[10]), "f"(q_f32_s[11]));
-                            q_packed_s[2] = _packed;
-                        }
-                        {
-                            uint32_t _packed;
-                            asm volatile("{\n\t"
-                                ".reg .b16 _lo;\n\t"
-                                ".reg .b16 _hi;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                                "mov.b32 %0, {_lo, _hi};\n\t"
-                                "}"
-                                : "=r"(_packed) : "f"(q_f32_s[12]), "f"(q_f32_s[13]),
-                                                   "f"(q_f32_s[14]), "f"(q_f32_s[15]));
-                            q_packed_s[3] = _packed;
-                        }
-                        {
-                            uint32_t _packed;
-                            asm volatile("{\n\t"
-                                ".reg .b16 _lo;\n\t"
-                                ".reg .b16 _hi;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                                "mov.b32 %0, {_lo, _hi};\n\t"
-                                "}"
-                                : "=r"(_packed) : "f"(q_res_s[0]), "f"(q_res_s[1]),
-                                                   "f"(q_res_s[2]), "f"(q_res_s[3]));
-                            q_packed_lo_s[0] = _packed;
-                        }
-                        {
-                            uint32_t _packed;
-                            asm volatile("{\n\t"
-                                ".reg .b16 _lo;\n\t"
-                                ".reg .b16 _hi;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                                "mov.b32 %0, {_lo, _hi};\n\t"
-                                "}"
-                                : "=r"(_packed) : "f"(q_res_s[4]), "f"(q_res_s[5]),
-                                                   "f"(q_res_s[6]), "f"(q_res_s[7]));
-                            q_packed_lo_s[1] = _packed;
-                        }
-                        {
-                            uint32_t _packed;
-                            asm volatile("{\n\t"
-                                ".reg .b16 _lo;\n\t"
-                                ".reg .b16 _hi;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                                "mov.b32 %0, {_lo, _hi};\n\t"
-                                "}"
-                                : "=r"(_packed) : "f"(q_res_s[8]), "f"(q_res_s[9]),
-                                                   "f"(q_res_s[10]), "f"(q_res_s[11]));
-                            q_packed_lo_s[2] = _packed;
-                        }
-                        {
-                            uint32_t _packed;
-                            asm volatile("{\n\t"
-                                ".reg .b16 _lo;\n\t"
-                                ".reg .b16 _hi;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
-                                "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
-                                "mov.b32 %0, {_lo, _hi};\n\t"
-                                "}"
-                                : "=r"(_packed) : "f"(q_res_s[12]), "f"(q_res_s[13]),
-                                                   "f"(q_res_s[14]), "f"(q_res_s[15]));
-                            q_packed_lo_s[3] = _packed;
-                        }
-                        int q_key_hi_s = (q_hi_base_s / 128 + q_row_s) % 8;
-                        int q_key_lo_s = (q_lo_base_s / 128 + q_row_s) % 8;
-                        int q_hi_addr_s = q_hi_base_s + q_row_s * 128 + (q_col16_s ^ q_key_hi_s) * 16;
-                        int q_lo_addr_s = q_lo_base_s + q_row_s * 128 + (q_col16_s ^ q_key_lo_s) * 16;
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_hi_addr_s), "r"((q_packed_s[0])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_hi_addr_s + 4), "r"((q_packed_s[1])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_hi_addr_s + 8), "r"((q_packed_s[2])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_hi_addr_s + 12), "r"((q_packed_s[3])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_lo_addr_s), "r"((q_packed_lo_s[0])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_lo_addr_s + 4), "r"((q_packed_lo_s[1])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_lo_addr_s + 8), "r"((q_packed_lo_s[2])));
-                        asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_lo_addr_s + 12), "r"((q_packed_lo_s[3])));
-                    }
-                    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-                    __syncwarp();
-                    if (lane == 0) {
-                        mbarrier_arrive(q_raw_empty_addr + (qr_cons_stage) * 8);
-                        mbarrier_arrive(q_full_addr + (q_prod_stage) * 8);
-                    }
-                    qr_cons_phase ^= 1;
-                    q_prod_stage += 1;
-                    if (q_prod_stage == 2) { q_prod_stage = 0; q_prod_phase ^= 1; }
                     #pragma unroll 1
                     for (int ni0_p = 0; ni0_p < cta_n_blocks_p; ni0_p += 4) {
-                        int g_cnt_p = cta_n_blocks_p - ni0_p;
-                        if (g_cnt_p > 4) {
-                            g_cnt_p = 4;
-                        }
-                        int n_block_p = block_begin_p + cta_n_blocks_p - 1 - (ni0_p + pg_blk_p);
-                        int page_idx_p = n_block_p * 2 + pg_lane_p;
-                        if (page_idx_p > max_pg_p) {
-                            page_idx_p = max_pg_p;
-                        }
-                        int page_id_p = 0;
-                        if (pg_blk_p < g_cnt_p) {
-                            if (pg_lane_p < 2) {
-                                page_id_p = page_table[pt_base_p + page_idx_p];
+                        int skip_g_p = 0;
+                        if (skip_g_p == 0) {
+                            int g_cnt_p = cta_n_blocks_p - ni0_p;
+                            if (g_cnt_p > 4) {
+                                g_cnt_p = 4;
                             }
-                        }
-                        #pragma unroll
-                        for (int gc_p = 0; gc_p < 4; gc_p++) {
-                            if (g_cnt_p > gc_p) {
-                                int st_u_p = page_prod_stage + (unsigned int)gc_p;
-                                int st_p = ((st_u_p >= 6) ? st_u_p - 6 : st_u_p);
-                                int ph_p = ((st_u_p >= 6) ? page_prod_phase ^ 1 : page_prod_phase);
-                                mbarrier_wait(page_offsets_empty_addr + (st_p) * 8, ph_p);
-                                if (pg_blk_p == gc_p) {
-                                    smem_page_offsets[st_p * 8 + pg_lane_p] = page_id_p;
-                                }
-                                __syncwarp();
-                                if (elect_sync()) {
-                                    mbarrier_arrive(page_offsets_full_addr + (st_p) * 8);
+                            int n_block_p = block_begin_p + cta_n_blocks_p - 1 - (ni0_p + pg_blk_p);
+                            int page_idx_p = n_block_p * 2 + pg_lane_p;
+                            if (page_idx_p > max_pg_p) {
+                                page_idx_p = max_pg_p;
+                            }
+                            int page_id_p = 0;
+                            if (pg_blk_p < g_cnt_p) {
+                                if (pg_lane_p < 2) {
+                                    page_id_p = page_table[pt_base_p + page_idx_p];
                                 }
                             }
-                        }
-                        #pragma unroll
-                        for (int gv_p = 0; gv_p < 4; gv_p++) {
-                            if (g_cnt_p > gv_p) {
-                                page_prod_stage += 1;
-                                if (page_prod_stage == 6) { page_prod_stage = 0; page_prod_phase ^= 1; }
+                            #pragma unroll
+                            for (int gc_p = 0; gc_p < 4; gc_p++) {
+                                if (g_cnt_p > gc_p) {
+                                    int st_u_p = page_prod_stage + (unsigned int)gc_p;
+                                    int st_p = ((st_u_p >= 6) ? st_u_p - 6 : st_u_p);
+                                    int ph_p = ((st_u_p >= 6) ? page_prod_phase ^ 1 : page_prod_phase);
+                                    mbarrier_wait(page_offsets_empty_addr + (st_p) * 8, ph_p);
+                                    if (pg_blk_p == gc_p) {
+                                        smem_page_offsets[st_p * 8 + pg_lane_p] = page_id_p;
+                                    }
+                                    __syncwarp();
+                                    if (elect_sync()) {
+                                        mbarrier_arrive(page_offsets_full_addr + (st_p) * 8);
+                                    }
+                                }
+                            }
+                            #pragma unroll
+                            for (int gv_p = 0; gv_p < 4; gv_p++) {
+                                if (g_cnt_p > gv_p) {
+                                    page_prod_stage += 1;
+                                    if (page_prod_stage == 6) { page_prod_stage = 0; page_prod_phase ^= 1; }
+                                }
+                            }
+                            if (lane == 0) {
                             }
                         }
-                        if (lane == 0) {
+                        if (ni0_p == 0) {
+                            mbarrier_wait(q_raw_full_addr + (qr_cons_stage) * 8, qr_cons_phase);
+                            mbarrier_wait(q_empty_addr + (q_prod_stage) * 8, q_prod_phase);
+                            int q_hi_base_s = smem_q_hi_addr + q_prod_stage * 8192;
+                            int q_lo_base_s = smem_q_lo_addr + q_prod_stage * 8192;
+                            int live_rows_q = q_len * 8;
+                            unsigned int q_words_s[8];
+                            float q_f32_s[16];
+                            float q_res_s[16];
+                            unsigned int q_packed_s[4];
+                            unsigned int q_packed_lo_s[4];
+                            #pragma unroll
+                            for (int qc_i = 0; qc_i < 16; qc_i++) {
+                                int q_chunk_s = qc_i * 32 + lane;
+                                int q_row_s = q_chunk_s / 8;
+                                int q_col16_s = q_chunk_s % 8;
+                                if (q_row_s < live_rows_q) {
+                                    int q_kg_s = q_col16_s / 4;
+                                    int q_c16a_s = q_col16_s % 4 * 2;
+                                    int q_key_bf_s = ((smem_qbf_addr + qr_cons_stage * 16384) / 128 + (unsigned int)q_row_s) % 8;
+                                    int q_src_row_s = smem_qbf_addr + qr_cons_stage * 16384 + (unsigned int)(q_kg_s * 8192) + (unsigned int)(q_row_s * 128);
+                                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                        : "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[0])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(0) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(0) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(0) + 3]))
+                                        : "r"(q_src_row_s + (q_c16a_s ^ q_key_bf_s) * 16));
+                                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];"
+                                        : "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[4])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(4) + 1])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(4) + 2])), "=r"(*reinterpret_cast<uint32_t*>(&q_words_s[(4) + 3]))
+                                        : "r"(q_src_row_s + (q_c16a_s + 1 ^ q_key_bf_s) * 16));
+                                    #pragma unroll
+                                    for (int qw_s = 0; qw_s < 8; qw_s++) {
+                                        unsigned int q_w_s = q_words_s[qw_s];
+                                        unsigned int q_wbits_d = q_w_s << 16;
+                                        float q_lo_d = 0.0f;
+                                        float q_lo_t_d = 0.0f;
+                                        float q_hi_d = 0.0f;
+                                        float q_hi_t_d = 0.0f;
+                                        q_lo_d = reinterpret_cast<float*>(&q_wbits_d)[0];
+                                        q_wbits_d = (q_w_s & 65520) << 16;
+                                        q_lo_t_d = reinterpret_cast<float*>(&q_wbits_d)[0];
+                                        q_wbits_d = q_w_s >> 16 << 16;
+                                        q_hi_d = reinterpret_cast<float*>(&q_wbits_d)[0];
+                                        q_wbits_d = (q_w_s >> 16 & 65520) << 16;
+                                        q_hi_t_d = reinterpret_cast<float*>(&q_wbits_d)[0];
+                                        q_f32_s[2 * qw_s] = q_lo_t_d;
+                                        q_res_s[2 * qw_s] = q_lo_d - q_lo_t_d;
+                                        q_f32_s[2 * qw_s + 1] = q_hi_t_d;
+                                        q_res_s[2 * qw_s + 1] = q_hi_d - q_hi_t_d;
+                                    }
+                                } else {
+                                    #pragma unroll
+                                    for (int qz_s = 0; qz_s < 16; qz_s++) {
+                                        q_f32_s[qz_s] = 0.0f;
+                                        q_res_s[qz_s] = 0.0f;
+                                    }
+                                }
+                                {
+                                    uint32_t _packed;
+                                    asm volatile("{\n\t"
+                                        ".reg .b16 _lo;\n\t"
+                                        ".reg .b16 _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}"
+                                        : "=r"(_packed) : "f"(q_f32_s[0]), "f"(q_f32_s[1]),
+                                                           "f"(q_f32_s[2]), "f"(q_f32_s[3]));
+                                    q_packed_s[0] = _packed;
+                                }
+                                {
+                                    uint32_t _packed;
+                                    asm volatile("{\n\t"
+                                        ".reg .b16 _lo;\n\t"
+                                        ".reg .b16 _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}"
+                                        : "=r"(_packed) : "f"(q_f32_s[4]), "f"(q_f32_s[5]),
+                                                           "f"(q_f32_s[6]), "f"(q_f32_s[7]));
+                                    q_packed_s[1] = _packed;
+                                }
+                                {
+                                    uint32_t _packed;
+                                    asm volatile("{\n\t"
+                                        ".reg .b16 _lo;\n\t"
+                                        ".reg .b16 _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}"
+                                        : "=r"(_packed) : "f"(q_f32_s[8]), "f"(q_f32_s[9]),
+                                                           "f"(q_f32_s[10]), "f"(q_f32_s[11]));
+                                    q_packed_s[2] = _packed;
+                                }
+                                {
+                                    uint32_t _packed;
+                                    asm volatile("{\n\t"
+                                        ".reg .b16 _lo;\n\t"
+                                        ".reg .b16 _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}"
+                                        : "=r"(_packed) : "f"(q_f32_s[12]), "f"(q_f32_s[13]),
+                                                           "f"(q_f32_s[14]), "f"(q_f32_s[15]));
+                                    q_packed_s[3] = _packed;
+                                }
+                                {
+                                    uint32_t _packed;
+                                    asm volatile("{\n\t"
+                                        ".reg .b16 _lo;\n\t"
+                                        ".reg .b16 _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}"
+                                        : "=r"(_packed) : "f"(q_res_s[0]), "f"(q_res_s[1]),
+                                                           "f"(q_res_s[2]), "f"(q_res_s[3]));
+                                    q_packed_lo_s[0] = _packed;
+                                }
+                                {
+                                    uint32_t _packed;
+                                    asm volatile("{\n\t"
+                                        ".reg .b16 _lo;\n\t"
+                                        ".reg .b16 _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}"
+                                        : "=r"(_packed) : "f"(q_res_s[4]), "f"(q_res_s[5]),
+                                                           "f"(q_res_s[6]), "f"(q_res_s[7]));
+                                    q_packed_lo_s[1] = _packed;
+                                }
+                                {
+                                    uint32_t _packed;
+                                    asm volatile("{\n\t"
+                                        ".reg .b16 _lo;\n\t"
+                                        ".reg .b16 _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}"
+                                        : "=r"(_packed) : "f"(q_res_s[8]), "f"(q_res_s[9]),
+                                                           "f"(q_res_s[10]), "f"(q_res_s[11]));
+                                    q_packed_lo_s[2] = _packed;
+                                }
+                                {
+                                    uint32_t _packed;
+                                    asm volatile("{\n\t"
+                                        ".reg .b16 _lo;\n\t"
+                                        ".reg .b16 _hi;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _lo, %2, %1;\n\t"
+                                        "cvt.rn.satfinite.e4m3x2.f32 _hi, %4, %3;\n\t"
+                                        "mov.b32 %0, {_lo, _hi};\n\t"
+                                        "}"
+                                        : "=r"(_packed) : "f"(q_res_s[12]), "f"(q_res_s[13]),
+                                                           "f"(q_res_s[14]), "f"(q_res_s[15]));
+                                    q_packed_lo_s[3] = _packed;
+                                }
+                                int q_key_hi_s = (q_hi_base_s / 128 + q_row_s) % 8;
+                                int q_key_lo_s = (q_lo_base_s / 128 + q_row_s) % 8;
+                                int q_hi_addr_s = q_hi_base_s + q_row_s * 128 + (q_col16_s ^ q_key_hi_s) * 16;
+                                int q_lo_addr_s = q_lo_base_s + q_row_s * 128 + (q_col16_s ^ q_key_lo_s) * 16;
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_hi_addr_s), "r"((q_packed_s[0])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_hi_addr_s + 4), "r"((q_packed_s[1])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_hi_addr_s + 8), "r"((q_packed_s[2])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_hi_addr_s + 12), "r"((q_packed_s[3])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_lo_addr_s), "r"((q_packed_lo_s[0])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_lo_addr_s + 4), "r"((q_packed_lo_s[1])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_lo_addr_s + 8), "r"((q_packed_lo_s[2])));
+                                asm volatile("st.shared.b32 [%0], %1;" :: "r"(q_lo_addr_s + 12), "r"((q_packed_lo_s[3])));
+                            }
+                            asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
+                            __syncwarp();
+                            if (lane == 0) {
+                                mbarrier_arrive(q_raw_empty_addr + (qr_cons_stage) * 8);
+                                mbarrier_arrive(q_full_addr + (q_prod_stage) * 8);
+                            }
+                            qr_cons_phase ^= 1;
+                            q_prod_stage += 1;
+                            if (q_prod_stage == 2) { q_prod_stage = 0; q_prod_phase ^= 1; }
                         }
                     }
                 }
+                spec_hit_p = 0;
                 mbarrier_wait(work_full_addr + (work_stage_p) * 8, _phase_work_full_3);
                 unsigned int base_0_3 = work_stage_p * 16;
                 unsigned int valid_1_3 = work_token_words[base_0_3];
@@ -3216,6 +3317,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 unsigned int counter_idx_10_3 = work_token_words[base_0_3 + 9];
                 unsigned int chunk_11_3 = work_token_words[base_0_3 + 10];
                 unsigned int phase_12_3 = work_token_words[base_0_3 + 11];
+                unsigned int spec_hit_13_3 = work_token_words[base_0_3 + 12];
+                unsigned int spec_nblocks_14_3 = work_token_words[base_0_3 + 13];
                 mbarrier_arrive(work_empty_addr + (work_stage_p) * 8);
                 work_stage_p += 1;
                 if (work_stage_p == 4) { work_stage_p = 0; _phase_work_full_3 ^= 1; }
@@ -3734,6 +3837,10 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 unsigned int token_base = work_stage_sched * 16;
                 unsigned int valid_tok = ((ticket < total_items) ? 1 : 0);
                 int counter_idx_r = 0;
+                int tok_batch_s = -1;
+                int tok_head_s = -1;
+                int tok_bb_s = -1;
+                int tok_be_s = -1;
                 if (valid_tok != 0) {
                     if (ticket >= chunk_items) {
                         unsigned int r_red = ticket - chunk_items;
@@ -4055,6 +4162,10 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                             slot_tile_base_4 = ((int)si_before + sel_excl_si) * items_per_chunk + kv_head_sel;
                             counter_idx_4 = ((int)st_before + sel_excl_st) * items_per_chunk + kv_head_sel;
                         }
+                        tok_batch_s = sel_batch;
+                        tok_head_s = kv_head_sel;
+                        tok_bb_s = block_begin_4;
+                        tok_be_s = block_end_4;
                         if (lane_0 == 0) {
                             work_token_words[token_base + 1] = 0;
                             work_token_words[token_base + 2] = (unsigned int)sel_batch;
@@ -4070,7 +4181,11 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                         }
                     }
                 }
+                int spec_hit_s = 0;
+                int spec_nb_s = 0;
                 if (lane_0 == 0) {
+                    work_token_words[token_base + 12] = (unsigned int)spec_hit_s;
+                    work_token_words[token_base + 13] = (unsigned int)spec_nb_s;
                     work_token_words[token_base] = valid_tok;
                     mbarrier_arrive(work_full_addr + (work_stage_sched) * 8);
                     if (valid_tok != 0) {
@@ -4123,6 +4238,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             unsigned int v_prod_stage = 0;
             unsigned int v_prod_phase = 1;
             unsigned int work_stage_l = 0;
+            int spec_nb_l = 0;
+            int spec_npre_l = 0;
             unsigned int _phase_work_full_4 = 0;
             mbarrier_wait(work_full_addr + (work_stage_l) * 8, _phase_work_full_4);
             unsigned int base_4 = work_stage_l * 16;
@@ -4138,6 +4255,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             unsigned int counter_idx_5 = work_token_words[base_4 + 9];
             unsigned int chunk_4 = work_token_words[base_4 + 10];
             unsigned int phase_4 = work_token_words[base_4 + 11];
+            unsigned int spec_hit_4 = work_token_words[base_4 + 12];
+            unsigned int spec_nblocks_4 = work_token_words[base_4 + 13];
             mbarrier_arrive(work_empty_addr + (work_stage_l) * 8);
             work_stage_l += 1;
             if (work_stage_l == 4) { work_stage_l = 0; _phase_work_full_4 ^= 1; }
@@ -4147,6 +4266,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
             int kv_head_idx = (int)kv_head_5;
             int block_begin_l = (int)block_begin_6;
             int block_end_l = (int)block_end_5;
+            int skip_q_l = 0;
+            int ni_start_l = 0;
             #pragma unroll 1
             for (unsigned int _tile_iter_l = 0; _tile_iter_l < max_items; _tile_iter_l++) {
                 if (valid_l == 0) {
@@ -4160,18 +4281,20 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 if (kind_l == 0) {
                     int cta_n_blocks = block_end_l - block_begin_l;
                     int n_pre = ((cta_n_blocks < 3) ? cta_n_blocks : 3);
-                    int gate_block = cta_n_blocks - 1 - 2;
+                    int gate_block = cta_n_blocks - 1 - 8;
                     if (gate_block < 0) {
                         gate_block = 0;
                     }
                     if (elect_sync()) {
-                        mbarrier_wait(q_raw_empty_addr + (qr_prod_stage) * 8, qr_prod_phase);
-                        if (_tile_iter_l == 0) {
+                        if (skip_q_l == 0) {
+                            mbarrier_wait(q_raw_empty_addr + (qr_prod_stage) * 8, qr_prod_phase);
+                            if (_tile_iter_l == 0) {
+                            }
+                            mbarrier_arrive_expect_tx(q_raw_full_addr + (qr_prod_stage) * 8, 64 * HEAD_DIM * 2);
+                            tma_4d_gmem2smem(smem_qbf_addr + qr_prod_stage * 16384, Q, 0, kv_head_idx * 8, batch_idx_l * q_len, 0, q_raw_full_addr + (qr_prod_stage) * 8);
                         }
-                        mbarrier_arrive_expect_tx(q_raw_full_addr + (qr_prod_stage) * 8, 64 * HEAD_DIM * 2);
-                        tma_4d_gmem2smem(smem_qbf_addr + qr_prod_stage * 16384, Q, 0, kv_head_idx * 8, batch_idx_l * q_len, 0, q_raw_full_addr + (qr_prod_stage) * 8);
                         #pragma unroll 1
-                        for (int ni = 0; ni < n_pre; ni++) {
+                        for (int ni = ni_start_l; ni < n_pre; ni++) {
                             int pre_stage_u = page_cons_stage + (unsigned int)ni;
                             int pre_stage = ((pre_stage_u >= 6) ? pre_stage_u - 6 : pre_stage_u);
                             int pre_phase = ((pre_stage_u >= 6) ? page_cons_phase ^ 1 : page_cons_phase);
@@ -4265,7 +4388,11 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                             }
                         }
                     }
-                    qr_prod_phase ^= 1;
+                    if (skip_q_l == 0) {
+                        qr_prod_phase ^= 1;
+                    }
+                    skip_q_l = 0;
+                    ni_start_l = 0;
                     if (lane == 0) {
                         if (_tile_iter_l == 0) {
                         }
@@ -4285,6 +4412,8 @@ kernel_cake_fmha_dcp_spec_bf16_fp8_balanced(CakeFmhaTensorMap const* Q, CakeFmha
                 unsigned int counter_idx_10_4 = work_token_words[base_0_4 + 9];
                 unsigned int chunk_11_4 = work_token_words[base_0_4 + 10];
                 unsigned int phase_12_4 = work_token_words[base_0_4 + 11];
+                unsigned int spec_hit_13_4 = work_token_words[base_0_4 + 12];
+                unsigned int spec_nblocks_14_4 = work_token_words[base_0_4 + 13];
                 mbarrier_arrive(work_empty_addr + (work_stage_l) * 8);
                 work_stage_l += 1;
                 if (work_stage_l == 4) { work_stage_l = 0; _phase_work_full_4 ^= 1; }

@@ -518,8 +518,8 @@
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "52025e3183116725bdb106ef89061c66d6f537649b928c258b76f02ba6461bec",
-                  "sm_103a": "52025e3183116725bdb106ef89061c66d6f537649b928c258b76f02ba6461bec"
+                  "sm_100a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283",
+                  "sm_103a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
@@ -534,8 +534,8 @@
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "52025e3183116725bdb106ef89061c66d6f537649b928c258b76f02ba6461bec",
-                  "sm_103a": "52025e3183116725bdb106ef89061c66d6f537649b928c258b76f02ba6461bec"
+                  "sm_100a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283",
+                  "sm_103a": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu",
@@ -670,8 +670,8 @@
                   "n_rows": 32
                 },
                 "sha256": {
-                  "sm_100a": "8a187794175bcf37d60388e93bf0e9addcfb1ffea949163b953d7a25f02a9287",
-                  "sm_103a": "8a187794175bcf37d60388e93bf0e9addcfb1ffea949163b953d7a25f02a9287"
+                  "sm_100a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669",
+                  "sm_103a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
@@ -686,8 +686,8 @@
                   "n_rows": 64
                 },
                 "sha256": {
-                  "sm_100a": "8a187794175bcf37d60388e93bf0e9addcfb1ffea949163b953d7a25f02a9287",
-                  "sm_103a": "8a187794175bcf37d60388e93bf0e9addcfb1ffea949163b953d7a25f02a9287"
+                  "sm_100a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669",
+                  "sm_103a": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669"
                 },
                 "sources": {
                   "sm_100a": "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu",
@@ -1215,7 +1215,7 @@
           }
         },
         "source_package_file_count": 43,
-        "source_package_sha256": "8e811d5b34e079979b6905360a654c6c15018dafb2bbbf45f71521b875949d00",
+        "source_package_sha256": "f56e955b148f35811e30f9d04151170f6989dda502882b62726c5975a2fff409",
         "balanced_routes": {
           "dcp_spec_bf16_balanced": {
             "arguments": {
@@ -2011,12 +2011,12 @@
       "sha256": "07240d76baaf7adea6ca1929fe354d32a16d9369470c0071ae6d3ad917fafb91"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8_balanced/kernel.cu": {
-      "bytes": 242333,
-      "sha256": "52025e3183116725bdb106ef89061c66d6f537649b928c258b76f02ba6461bec"
+      "bytes": 252856,
+      "sha256": "d9ee8e9155ed7f77af76af632b56955cc598e3e39e16b55547c09e20b32bd283"
     },
     "cuda/dcp_spec/dcp_spec_bf16_fp8_d256_balanced/kernel.cu": {
-      "bytes": 284793,
-      "sha256": "8a187794175bcf37d60388e93bf0e9addcfb1ffea949163b953d7a25f02a9287"
+      "bytes": 291398,
+      "sha256": "666f0a64449a0032d25f6e2fa45280bab7193dcd49fb86e251b7bb17ecbb9669"
     },
     "cuda/dcp_spec/dcp_spec_bf16_v1/retain_kv_l20.cu": {
       "bytes": 95503,
@@ -2127,20 +2127,20 @@
       "sha256": "36c8b398e47c98fdc71241f83bb25a16c3abe1756f47dc7507a6ebff4a2f4417"
     },
     "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu": {
-      "bytes": 212456,
-      "sha256": "33ce36a3213025b48bd4bbea4f38f1e5f3d1cd91b24dae053fd2690dcf3b8c1f"
+      "bytes": 213603,
+      "sha256": "bef34534d95f33acdacc596076bd82a382fa58864ec7d8c7481d15a55f2ca479"
     },
     "cuda/decode_balanced_bf16_mtp_n32/sm_103a/default.cu": {
-      "bytes": 212359,
-      "sha256": "4da1555e64631b8ebb0524426b058868d7f7c14af4301735e28c39af214a68fd"
+      "bytes": 213506,
+      "sha256": "d65e96e33221dbc9e009833f5318d6f9518e2b1d1462ce960f3a58fc1963352f"
     },
     "cuda/decode_balanced_bf16_mtp_n64/sm_100a/default.cu": {
-      "bytes": 212456,
-      "sha256": "41d9f89e8eb5af3e3b402d2e083910a8b2f3ba0b6365c11c80a259b24f533f8d"
+      "bytes": 213603,
+      "sha256": "67167bb896487d5fe5b5d3b26c63641703c86c9e345ed1fb11b70833e55e3b1b"
     },
     "cuda/decode_balanced_bf16_mtp_n64/sm_103a/default.cu": {
-      "bytes": 212359,
-      "sha256": "3e5ef81359f72a050a03ed655f97dcac0972aa7c8531b60015260773ea3e637a"
+      "bytes": 213506,
+      "sha256": "ff9094db2f1a98ae71d4cb2ed79f1eb6f9bbb5e766bbd8a329b1b0550844043b"
     },
     "cuda/decode_balanced_bf16q/sm_100a/default.cu": {
       "bytes": 208598,
@@ -2159,20 +2159,20 @@
       "sha256": "c79368c30561771a7d903494665d3292f36b5efb9d2d86b9a282560f5c81a530"
     },
     "cuda/decode_balanced_fp16_mtp_n32/sm_100a/default.cu": {
-      "bytes": 212263,
-      "sha256": "7e90cd3f11360193c2c6de5c55d6b4614ba7fe690ddeecd03e565b747edc7567"
+      "bytes": 213410,
+      "sha256": "e13c4cc39a0c7cf7ada2e4341f354ed4c911631fb35a2e8515ba1add7fb31ddd"
     },
     "cuda/decode_balanced_fp16_mtp_n32/sm_103a/default.cu": {
-      "bytes": 212166,
-      "sha256": "41a4cde51aa80595bce4627c483f88424736eb2d5f3819eca44f3abc038650ea"
+      "bytes": 213313,
+      "sha256": "9ffc8cf331897bd1e25af7360c444b32f82f2bc1faad588a6fc2b089ecd56e39"
     },
     "cuda/decode_balanced_fp16_mtp_n64/sm_100a/default.cu": {
-      "bytes": 212263,
-      "sha256": "a2e2a4d46d832808f7c0cd1048a5a332a3c2d58dc15a20e830f31d2181c201f0"
+      "bytes": 213410,
+      "sha256": "3e257cd11039156a638bc50414cf4e95ac47d8a9b0bbce43921e00efc7bdd376"
     },
     "cuda/decode_balanced_fp16_mtp_n64/sm_103a/default.cu": {
-      "bytes": 212166,
-      "sha256": "ecba1df2c63fe13fc724880fbec682a0ce6e668b53947516f75f01390c12ddee"
+      "bytes": 213313,
+      "sha256": "bf4dab764e3e87195f0d5df30f0498f2f1e5f59a20b3b6285e7c14819f8def49"
     },
     "cuda/decode_balanced_fp16q/sm_100a/default.cu": {
       "bytes": 209297,
@@ -4545,8 +4545,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "33ce36a3213025b48bd4bbea4f38f1e5f3d1cd91b24dae053fd2690dcf3b8c1f",
-            "sm_103a": "4da1555e64631b8ebb0524426b058868d7f7c14af4301735e28c39af214a68fd"
+            "sm_100a": "bef34534d95f33acdacc596076bd82a382fa58864ec7d8c7481d15a55f2ca479",
+            "sm_103a": "d65e96e33221dbc9e009833f5318d6f9518e2b1d1462ce960f3a58fc1963352f"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu",
@@ -4654,8 +4654,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "41d9f89e8eb5af3e3b402d2e083910a8b2f3ba0b6365c11c80a259b24f533f8d",
-            "sm_103a": "3e5ef81359f72a050a03ed655f97dcac0972aa7c8531b60015260773ea3e637a"
+            "sm_100a": "67167bb896487d5fe5b5d3b26c63641703c86c9e345ed1fb11b70833e55e3b1b",
+            "sm_103a": "ff9094db2f1a98ae71d4cb2ed79f1eb6f9bbb5e766bbd8a329b1b0550844043b"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_bf16_mtp_n64/sm_100a/default.cu",
@@ -4996,8 +4996,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "7e90cd3f11360193c2c6de5c55d6b4614ba7fe690ddeecd03e565b747edc7567",
-            "sm_103a": "41a4cde51aa80595bce4627c483f88424736eb2d5f3819eca44f3abc038650ea"
+            "sm_100a": "e13c4cc39a0c7cf7ada2e4341f354ed4c911631fb35a2e8515ba1add7fb31ddd",
+            "sm_103a": "9ffc8cf331897bd1e25af7360c444b32f82f2bc1faad588a6fc2b089ecd56e39"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_fp16_mtp_n32/sm_100a/default.cu",
@@ -5105,8 +5105,8 @@
         {
           "selector": {},
           "sha256": {
-            "sm_100a": "a2e2a4d46d832808f7c0cd1048a5a332a3c2d58dc15a20e830f31d2181c201f0",
-            "sm_103a": "ecba1df2c63fe13fc724880fbec682a0ce6e668b53947516f75f01390c12ddee"
+            "sm_100a": "3e257cd11039156a638bc50414cf4e95ac47d8a9b0bbce43921e00efc7bdd376",
+            "sm_103a": "bf4dab764e3e87195f0d5df30f0498f2f1e5f59a20b3b6285e7c14819f8def49"
           },
           "sources": {
             "sm_100a": "cuda/decode_balanced_fp16_mtp_n64/sm_100a/default.cu",
