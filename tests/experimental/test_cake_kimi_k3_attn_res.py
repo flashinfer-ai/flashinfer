@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import re
+
 import pytest
 import torch
 
@@ -159,7 +161,9 @@ def test_plan_route_policy(arch, M, K, pdl, kind, schedule_id, grid_x):
     assert plan.schedule_id == schedule_id
     assert plan.grid_x == grid_x
     assert plan.use_pdl is pdl
-    assert plan.kernel_key.endswith(f"pdl{int(pdl)}")
+    # PDL is a launch argument of every generated program, not a program axis.
+    assert "pdl" not in plan.kernel_key
+    assert f".pdl{int(pdl)}." in plan.route_id
     assert plan.route_id.startswith(schedule_id + ".")
 
 
@@ -194,8 +198,11 @@ def test_native_ports_require_148_sms():
 def test_persistent_key_is_the_complete_flag_tuple():
     a = plan_route("sm_103a", SM_COUNT, 1, 1, True)
     b = plan_route("sm_103a", SM_COUNT, 1, 1, False)
-    assert a.kernel_key != b.kernel_key
-    assert a.kernel_key.split("_f")[1].split("_pdl")[0].__len__() == 13
+    for plan in (a, b):
+        assert plan.kind == "persistent"
+        assert re.fullmatch(r"persistent:k1_nc\d_d\d_f[01]{15}", plan.kernel_key)
+    # The PDL mode only changes the launch argument and the route id.
+    assert a.route_id != b.route_id
 
 
 @pytest.mark.parametrize("arch", ARCHES)
@@ -225,7 +232,7 @@ def test_registered_keys_cover_the_measured_grid_when_programs_exist(arch):
                 )
     for record in MODULES.values():
         assert record["tma_workspace_bytes"] == 0
-        assert record["arch"] in ARCHES
+        assert record["arches"] and set(record["arches"]) <= set(ARCHES)
 
 
 # ---------------------------------------------------------------------------
