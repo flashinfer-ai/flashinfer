@@ -42,3 +42,5 @@ class PrimsTsGemmConfig:
     ab_stages: Optional[int] = None
     # False keeps the direct epilogue store. FP4 output has no TMA store path.
     use_tma_store: bool = False
+    # Store Q, K, V as three contiguous [M, N/3] sections.
+    separate_qkv_output: bool = False
