@@ -357,10 +357,23 @@ def _stage1_has_fused_block_tail(cluster: int, ept: int, stream: bool) -> bool:
 _BLOCK_TAIL_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
 _BLOCK_TAIL_MIN_CLUSTER = 8
 _BLOCK_TAIL_MIN_K = 768
+# Largest row the whole-CTA tail serves per capability (None: any).  GB300 round-7 matrices: the cluster-8 streams at
+# V = 151936 run 3-11 % faster fused, at V = 262144 3-7 % slower eager (a cold-L2 stage 1 is hidden by the chain's
+# host-bound launch gap there) and even under graph replay, so GB300 keeps the chain above this vocabulary.
+_BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY: dict[tuple[int, int], Optional[int]] = {
+    (10, 0): None,
+    (10, 3): 196608,
+}
 
 
 def _block_tail_for_capability(capability: tuple[int, int]) -> bool:
     return (int(capability[0]), int(capability[1])) in _BLOCK_TAIL_CAPABILITIES
+
+
+@functools.cache
+def _device_capability(device_index: int) -> tuple[int, int]:
+    cc = torch.cuda.get_device_capability(device_index)
+    return int(cc[0]), int(cc[1])
 
 
 @functools.cache
@@ -376,6 +389,8 @@ def _fuse_block_tail(
     sm_count: int,
     top_k_max: Optional[int],
     two_launch: bool,
+    vocab: Optional[int] = None,
+    capability: Optional[tuple[int, int]] = None,
 ) -> bool:
     """Whether a launch of ``batch`` rows on the variant runs the whole-CTA tail (launch_flags bit 3): the
     largest top-k lies in (_BLOCK_TAIL_MIN_K, fused_block_tail_kcap], the variant is a stream on a cluster of at
@@ -393,6 +408,12 @@ def _fuse_block_tail(
         return False
     if not _stage1_has_fused_block_tail(cluster, ept, stream):
         return False
+    if capability is not None:
+        if vocab is None:
+            raise ValueError("the whole-CTA tail policy of this capability needs the vocabulary")
+        bound = _BLOCK_TAIL_MAX_VOCAB_BY_CAPABILITY.get(tuple(int(x) for x in capability))
+        if bound is not None and int(vocab) > bound:
+            return False
     wave_ctas = _wave_ctas(int(sm_count))
     return batch * cluster <= wave_ctas[cluster]
 
@@ -424,6 +445,20 @@ _FLAG_SPEC_SAMPLE = 64
 _SPEC_SAMPLE_WIDE_EPT = 32
 _SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER = 8
 _SPEC_SAMPLE_WIDE_MIN_CHUNKS = 16
+# Capabilities whose every eligible stream launch takes the speculative-sample build (B200 / GB300: the paired stage-1
+# A/B and the round-7 FlashInfer matrices).  Elsewhere (Hopper, Rubin: round-7 matrices only) the build is taken on
+# clusters up to _SPEC_SAMPLE_NARROW_MAX_CLUSTER with at least _SPEC_SAMPLE_NARROW_MIN_CTAS CTAs: on a small-top-k launch
+# (one kernel; the alternative is the coarse-sample build) only for rows of at least _SPEC_SAMPLE_NARROW_FUSED_MIN_CHUNKS
+# chunks per CTA, on the two-launch chain for any row, where a row of _SPEC_SAMPLE_NARROW_DEEP_CHUNKS or more chunks
+# needs _SPEC_SAMPLE_NARROW_DEEP_MIN_CTAS CTAs.  The saving is the sampled read, which only a wide, bandwidth-bound grid
+# pays for: the cluster-8 streams there lose 3-8 % with it (H100 / R200 k = 1000, V >= 151936, B <= 16), the 4-chunk
+# rows at k <= 64 1-2 % against the coarse build, the 32-CTA grid and the 16-chunk rows on 64 CTAs 1-3 %.
+_SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
+_SPEC_SAMPLE_NARROW_MAX_CLUSTER = 4
+_SPEC_SAMPLE_NARROW_MIN_CTAS = 64
+_SPEC_SAMPLE_NARROW_FUSED_MIN_CHUNKS = 5
+_SPEC_SAMPLE_NARROW_DEEP_CHUNKS = 16
+_SPEC_SAMPLE_NARROW_DEEP_MIN_CTAS = 128
 
 
 @functools.cache
@@ -468,19 +503,47 @@ def _stage1_has_spec_sample(cluster: int, ept: int, stream: bool) -> bool:
     return False
 
 
-def _spec_sample_flag(cluster: int, ept: int, stream: bool, vocab: int) -> int:
-    """Stage-1 ``launch_flags`` bit that selects the speculative-sample build: every ept-16 streaming launch, and an
-    ept-32 (``_SPEC_SAMPLE_WIDE_EPT``) streaming launch whose row is one register chunk per CTA, two chunks on a cluster
-    of at least ``_SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER`` CTAs, or at least ``_SPEC_SAMPLE_WIDE_MIN_CHUNKS`` chunks.  There
-    the strided histogram of the chunk already in registers is cheaper than the separate sampled read it replaces
-    (round 7, lever SP: ept-16 streams 2-13 % faster at 1-16 chunks, the cluster-8 ept-32 stream at one chunk 13-18 %
-    and at two chunks 0-6 %, the cluster-1 ept-32 stream at 16 chunks 2-15 %); ept-32 streams at 2-10 chunks per CTA on
-    clusters 1-4 measured 0-6 % slower with it and keep their round-6 build."""
+def _spec_sample_flag(
+    cluster: int,
+    ept: int,
+    stream: bool,
+    vocab: int,
+    top_k_max: Optional[int] = None,
+    batch: Optional[int] = None,
+    capability: Optional[tuple[int, int]] = None,
+) -> int:
+    """Stage-1 ``launch_flags`` bit that selects the speculative-sample build.  On B200 / GB300
+    (``_SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES``; ``capability`` None): every ept-16 streaming launch, and an ept-32
+    (``_SPEC_SAMPLE_WIDE_EPT``) streaming launch whose row is one register chunk per CTA, two chunks on a cluster of at
+    least ``_SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER`` CTAs, or at least ``_SPEC_SAMPLE_WIDE_MIN_CHUNKS`` chunks.  There the
+    strided histogram of the chunk already in registers is cheaper than the separate sampled read it replaces (round 7,
+    lever SP: ept-16 streams 2-13 % faster at 1-16 chunks, the cluster-8 ept-32 stream at one chunk 13-18 % and at two
+    chunks 0-6 %, the cluster-1 ept-32 stream at 16 chunks 2-15 %); ept-32 streams at 2-10 chunks per CTA on clusters
+    1-4 measured 0-6 % slower with it and keep their round-6 build.  On any other capability the same chunk rule applies
+    only on a cluster of at most ``_SPEC_SAMPLE_NARROW_MAX_CLUSTER`` CTAs whose grid has at least
+    ``_SPEC_SAMPLE_NARROW_MIN_CTAS`` CTAs, for a small-top-k launch (at most ``fused_tail_kcap``) only to rows of at
+    least ``_SPEC_SAMPLE_NARROW_FUSED_MIN_CHUNKS`` chunks per CTA, and on the two-launch chain with
+    ``_SPEC_SAMPLE_NARROW_DEEP_MIN_CTAS`` CTAs for rows of ``_SPEC_SAMPLE_NARROW_DEEP_CHUNKS`` or more chunks: the
+    round-7 H100 / R200 matrices show the cluster-8 streams 1-8 % slower with the build, the 4-chunk rows at k <= 64
+    1-2 % slower than their coarse-sample build, and the wide cluster <= 4 streams 2-20 % faster."""
     if not stream:
         return 0
+    chunks = math.ceil(int(vocab) / (_THREADS * int(ept) * int(cluster)))
+    if capability is not None and tuple(int(x) for x in capability) not in _SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES:
+        if batch is None:
+            raise ValueError("the speculative-sample policy of this capability needs the batch")
+        if int(cluster) > _SPEC_SAMPLE_NARROW_MAX_CLUSTER:
+            return 0
+        ctas = int(batch) * int(cluster)
+        if ctas < _SPEC_SAMPLE_NARROW_MIN_CTAS:
+            return 0
+        if top_k_max is None or int(top_k_max) <= _fused_tail_kcap():
+            if chunks < _SPEC_SAMPLE_NARROW_FUSED_MIN_CHUNKS:
+                return 0
+        elif chunks >= _SPEC_SAMPLE_NARROW_DEEP_CHUNKS and ctas < _SPEC_SAMPLE_NARROW_DEEP_MIN_CTAS:
+            return 0
     if int(ept) < _SPEC_SAMPLE_WIDE_EPT:
         return _FLAG_SPEC_SAMPLE if _stage1_has_spec_sample(cluster, ept, True) else 0
-    chunks = math.ceil(int(vocab) / (_THREADS * int(ept) * int(cluster)))
     if chunks == 2:
         if int(cluster) < _SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER:
             return 0
@@ -490,12 +553,18 @@ def _spec_sample_flag(cluster: int, ept: int, stream: bool, vocab: int) -> int:
 
 
 def _sample_build_flag(
-    cluster: int, ept: int, stream: bool, top_k_max: int, vocab: int
+    cluster: int,
+    ept: int,
+    stream: bool,
+    top_k_max: int,
+    vocab: int,
+    batch: Optional[int] = None,
+    capability: Optional[tuple[int, int]] = None,
 ) -> int:
     """The stage-1 sample-build selection for one launch: bit 6 (speculative sample) where its policy applies,
     otherwise bit 4 (coarse sample) where that policy applies, otherwise the default build.  The two twins are
     exclusive."""
-    spec = _spec_sample_flag(cluster, ept, stream, vocab)
+    spec = _spec_sample_flag(cluster, ept, stream, vocab, top_k_max, batch, capability)
     return spec if spec else _coarse_sample_flag(cluster, ept, stream, top_k_max)
 
 
@@ -948,12 +1017,20 @@ def top_k_top_p_sampling_from_probs(
         _sm_count(probs.device.index or 0),
         kmax,
         not _block_tail_enabled(probs.device.index or 0),
+        vocab,
+        _device_capability(probs.device.index or 0),
     )
     # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
     # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
     if fused:
         launch_flags = _FLAG_FUSE_TAIL | _sample_build_flag(
-            cluster, ept, bool(stream_variant), kmax, vocab
+            cluster,
+            ept,
+            bool(stream_variant),
+            kmax,
+            vocab,
+            batch,
+            _device_capability(probs.device.index or 0),
         )
     elif fused_block:
         launch_flags = _FLAG_FUSE_BLOCK_TAIL
@@ -966,7 +1043,15 @@ def top_k_top_p_sampling_from_probs(
             launch_flags |= _row_span_diet_flag(
                 cluster, True, kmax, probs.device.index or 0
             )
-            launch_flags |= _spec_sample_flag(cluster, ept, True, vocab)
+            launch_flags |= _spec_sample_flag(
+                cluster,
+                ept,
+                True,
+                vocab,
+                kmax,
+                batch,
+                _device_capability(probs.device.index or 0),
+            )
     module.radix_topk(
         probs,
         k_arr,
@@ -1102,7 +1187,15 @@ def top_k_probs_to_slab(
         0,
         # no fused tail, no PDL dependent follows; the speculative- or coarse-sample build on a stream,
         # the row-span filter arm for a large top-k on a cluster-8 stream
-        _sample_build_flag(cluster, ept, bool(stream_variant), kmax, vocab)
+        _sample_build_flag(
+            cluster,
+            ept,
+            bool(stream_variant),
+            kmax,
+            vocab,
+            batch,
+            _device_capability(probs.device.index or 0),
+        )
         | _row_span_diet_flag(
             cluster, bool(stream_variant), kmax, probs.device.index or 0
         ),

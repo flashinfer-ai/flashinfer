@@ -77,7 +77,13 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    chunks (round 7, lever SP: ept-16 streams 2-13 % faster at 1-16 chunks, the cluster-8 ept-32
    stream 13-18 % at one chunk and 0-6 % at two, the cluster-1 ept-32 stream at 16 chunks 2-15 %);
    ept-32 streams at 2-10 chunks per CTA on clusters 1-4 measured 0-6 % slower with it and keep
-   their round-6 build.  Bits 4 and 6 are exclusive.
+   their round-6 build.  That is the B200 / GB300 rule; on Hopper and Rubin the same chunk rule
+   applies only on a cluster of at most 4 CTAs whose grid has at least 64 CTAs, for a largest top-k
+   at most ``fused_tail_kcap`` only to rows of at least 5 chunks per CTA, and on the two-launch
+   chain with at least 128 CTAs for rows of 16 or more chunks: the round-7 H100 / R200 matrices
+   measure the cluster-8 streams 1-8 % slower with the build, the 4-chunk rows at k <= 64 1-2 %
+   slower than their coarse-sample build, and those wide streams 2-20 % faster.  Bits 4 and 6 are
+   exclusive.
 
 The stage-2/3 kernel exists in three static forms that differ only in instruction selection,
 never in output: the base form (f64 top-p cut / sample tests, max-min bitonic exchange), a form
@@ -178,6 +184,34 @@ the (8,16) to the (8,32) stream (2.5-4.3 % faster), worst regret 4.5 -> 2.8 %; 2
 ``stream_chunk32_us`` 0.15, ``stream_cluster_us`` 0.25, ``stream_cluster_cta_us`` 0.05,
 ``stream_large_k_chunk32_us`` 0.05 move V = 128256 / 151936 B <= 16 to the (4,32) stream (2.3-3.7 % faster), worst
 4.1 -> 1.7 %; 132 is unchanged.  The kernels and the frozen bundle are untouched by this change.
+
+Correctness contract
+--------------------
+
+Since round 7 the route is held to a tolerance-level contract instead of bit-identity with the previous bundle
+(the kernels may change bits; the precision level and the selection exactness may not):
+
+* **Top-k set**: equal to the float64 sorted reference for every row and shape, including the tie rule (ties on the
+  key are broken by the lower index: the 64-bit ``(key, ~index)`` composite is a total order, so every exact
+  selection yields the same set and the same slab order).
+* **Top-p cut**: equal to the float64 reference, except when the exact cumulative mass lies within ``eps = 1e-6``
+  of ``top_p`` times the top-k mass, where the cut may differ by one element (``tests/utils/test_cake_sampling.py``
+  places rows on that boundary and checks both sides).
+* **Sample**: always inside the exact support (the kept prefix); run-to-run deterministic for identical inputs,
+  ``philox_seed`` and ``philox_offset`` (CUDA-graph replay, concurrent streams and repeated invocation included);
+  multi-seed next-token histograms within the 99 % binomial band of the exact distribution per row class; sglang
+  GSM8K accuracy within ``top_k_first``'s seed spread with zero out-of-support tokens.
+* **Renormalized slab** (``renorm_out``): fp32 with ``rtol 1e-6``, ``atol 1e-7`` against the float64 reference.
+  Keys stay exact fp32 bit patterns; every accumulation is at least fp32 (no bf16 / fp16 anywhere); no tolerance is
+  loosened to admit a kernel change.
+* A stage-1 build that does not intend to change numerics (every round-7 twin: the speculative-sample ``_sp``, the
+  coarse-sample ``_cs`` and the whole-CTA-tail ``_bt`` builds) is additionally gated on bit-identity with the default
+  build on every tested row.  A change that moves bits must document exactly which rows can differ (ties, the eps
+  boundary) and why; no round-7 kernel does.
+* The exact fallbacks stay kernel-side: a candidate list that overflows the gather capacity takes the three-pass
+  cluster path, a row with fewer than k candidates is kept whole, and vocabularies above 2^21 (and compute
+  capabilities 12.x) take the reference ``top_k_first`` route.  The sm_120 / sm_121 route semantics and the host API
+  are unchanged.
 
 Measured performance
 --------------------
