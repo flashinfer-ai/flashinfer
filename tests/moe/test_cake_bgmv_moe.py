@@ -395,6 +395,7 @@ _EXPERT_SORTED_CASES = [
 def test_expert_sorted_routes_match_reference_and_replay_bitwise(
     hidden_size, num_tokens, dtype, top_k
 ):
+    _require_cake_arch()
     inputs = _make_inputs(
         hidden_size, num_tokens, dtype, top_k=top_k, expert_sorted=True
     )
