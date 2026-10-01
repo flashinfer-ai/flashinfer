@@ -28,6 +28,7 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
+#include <utility>
 
 #define CAKE_INF CUDART_INF_F
 #define NUM_MAIN_STAGES 1
@@ -56,6 +57,14 @@ __device__ inline unsigned int laneId()
     return id;
 }
 } // namespace cake_trtllm_moe_finalize
+template <typename F, size_t... _i> __device__ __forceinline__ void poll_expand(F&& f, std::index_sequence<_i...>) {
+    (f(std::integral_constant<int, static_cast<int>(_i)>{}), ...);
+}
+
+template <typename W, size_t... _i> __device__ __forceinline__ bool poll_any_0(const W* _sysv_poll_group_0, std::index_sequence<_i...>) {
+    return (... || ((((_sysv_poll_group_0[_i] >> 0) & 0xffffu) == 0x8000u) || (((_sysv_poll_group_0[_i] >> 16) & 0xffffu) == 0x8000u)));
+}
+
 
 namespace cake_trtllm_moe_finalize {
 template <typename T> struct dtype_traits;
@@ -335,18 +344,12 @@ __device__ __forceinline__ void finalize_body(T* __restrict__ allreduce_in, int*
     #pragma unroll 1
     for (int token_1 = token_begin; token_1 < token_end; token_1 += token_stride) {
         uint32_t _sysv_poll_group_0[4 * WS];
-        bool pending;
         do {
-            #pragma unroll
-            for (int p = 0; p < WS; p++) {
+            poll_expand([&](auto _pc) {
+                constexpr int p = decltype(_pc)::value;
                 asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];" : "=r"(_sysv_poll_group_0[4 * p]), "=r"(_sysv_poll_group_0[(4 * p + 1)]), "=r"(_sysv_poll_group_0[(4 * p + 2)]), "=r"(_sysv_poll_group_0[(4 * p + 3)]) : "l"(peer[p] + (p * total_access * 8 + access_2 * 8)) : "memory");
-            }
-            pending = false;
-            #pragma unroll
-            for (int w = 0; w < 4 * WS; w++) {
-                pending |= (((_sysv_poll_group_0[w] >> 0) & 0xffffu) == 0x8000u) | (((_sysv_poll_group_0[w] >> 16) & 0xffffu) == 0x8000u);
-            }
-        } while (pending);
+            }, std::make_index_sequence<WS>{});
+        } while (poll_any_0(_sysv_poll_group_0, std::make_index_sequence<4 * WS>{}));
         float _sysv_poll_group_0_f32[8];
         #pragma unroll
         for (int _pair = 0; _pair < 4; _pair++) {
