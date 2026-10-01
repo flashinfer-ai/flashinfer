@@ -66,6 +66,7 @@ def test_selector_rejects_unsupported_shapes():
         ((9, 0), "sm90a"),
         ((10, 0), "sm100a"),
         ((10, 3), "sm103a"),
+        ((10, 7), "sm107a"),
         ((8, 0), None),
         ((10, 1), None),
         ((12, 0), None),
@@ -82,6 +83,7 @@ def test_arch_for_capability(capability, expected):
         ("sm90a", (9, "0a"), "-gencode=arch=compute_90a,code=sm_90a", (9, 0)),
         ("sm100a", (10, "0a"), "-gencode=arch=compute_100a,code=sm_100a", (10, 0)),
         ("sm103a", (10, "3a"), "-gencode=arch=compute_103a,code=sm_103a", (10, 3)),
+        ("sm107a", (10, "7a"), "-gencode=arch=compute_107a,code=sm_107a", (10, 7)),
     ],
 )
 @pytest.mark.parametrize("hidden_size", cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES)

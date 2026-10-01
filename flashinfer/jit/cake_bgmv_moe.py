@@ -28,11 +28,12 @@ from .core import (
     sm90a_nvcc_flags,
     sm100a_nvcc_flags,
     sm103a_nvcc_flags,
+    sm107a_nvcc_flags,
 )
 from .utils import write_if_different
 
 CakeBGMVMoEDType = Literal["bfloat16", "float16"]
-CakeBGMVMoEArch = Literal["sm90a", "sm100a", "sm103a"]
+CakeBGMVMoEArch = Literal["sm90a", "sm100a", "sm103a", "sm107a"]
 CakeBGMVMoESchedule = Literal[
     "token_owned_t64",
     "token_owned",
@@ -58,13 +59,14 @@ class CakeBGMVMoEArchTarget(NamedTuple):
 
 
 # The generated programs use cp.async, warp shuffles and FMA only, so one
-# source body serves Hopper and both Blackwell data-center targets; each
-# target gets its own cubin and module so the binding can fail closed on a
-# mismatched device.
+# source body serves Hopper, both Blackwell data-center targets and Rubin;
+# each target gets its own cubin and module so the binding can fail closed on
+# a mismatched device.
 CAKE_BGMV_MOE_ARCH_TARGETS: dict[CakeBGMVMoEArch, CakeBGMVMoEArchTarget] = {
     "sm90a": CakeBGMVMoEArchTarget("sm90a", (9, 0), tuple(sm90a_nvcc_flags)),
     "sm100a": CakeBGMVMoEArchTarget("sm100a", (10, 0), tuple(sm100a_nvcc_flags)),
     "sm103a": CakeBGMVMoEArchTarget("sm103a", (10, 3), tuple(sm103a_nvcc_flags)),
+    "sm107a": CakeBGMVMoEArchTarget("sm107a", (10, 7), tuple(sm107a_nvcc_flags)),
 }
 CAKE_BGMV_MOE_ARCHES: tuple[CakeBGMVMoEArch, ...] = tuple(CAKE_BGMV_MOE_ARCH_TARGETS)
 
