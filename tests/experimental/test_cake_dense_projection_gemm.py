@@ -342,9 +342,9 @@ EXPECTED_TEMPLATES = {
     },
     ('indexer_q', 'wgrad', 'f32'): {
         (1001, 148): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
-        (1001, 212): 'dense_proj_gemm_nn_n128_f32_tma1',
+        (1001, 212): 'dense_proj_gemm_nn_n256_f32_tma1',
         (2049, 148): 'dense_proj_gemm_nn_n256_m256_f32_tma1',
-        (2049, 212): 'dense_proj_gemm_nn_n128_f32_tma1',
+        (2049, 212): 'dense_proj_gemm_nn_n256_f32_tma1',
     },
     ('indexer_k', 'fwd', 'bf16'): 'dense_proj_gemm_kk_n128',
     ('indexer_k', 'dgrad', 'bf16'): 'dense_proj_gemm_kn_n256_m256_tma1',
@@ -1175,8 +1175,38 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     if not (plan.a_mn and plan.b_mn) and plan.n_tiles > 1:
                         assert plan.hints == ("none", "none")
                 assert (plan.n_tiles == 1) == (plan.N <= 256)
-                # stream-K "auto": a two-part K-aligned split of a single partial wave, else whole tiles
-                if plan.sk_units:
+                # stream-K: a measured ``sk_parts`` rule (round 4, L20) splits every tail tile p ways when the
+                # p * tail units fit the CTA pairs with SK_MIN_ITERS K steps each; otherwise "auto" = a two-part
+                # K-aligned split of a single partial wave, else whole tiles
+                parts = rule.get("sk_parts")
+                sk_rule = (
+                    sk_parts_plan(plan.pair_tiles, plan.k_blocks, plan.sm_pairs, parts)
+                    if parts
+                    else ("auto", None)
+                )
+                if sk_rule[0] is True:
+                    tail = (
+                        plan.pair_tiles % plan.sm_pairs
+                        if plan.pair_tiles > plan.sm_pairs
+                        else plan.pair_tiles
+                    )
+                    assert 0 < parts * tail <= plan.sm_pairs
+                    assert plan.k_blocks >= parts * SK_MIN_ITERS
+                    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (
+                        plan.pair_tiles - tail,
+                        tail,
+                        parts * tail,
+                    )
+                    assert plan.iters_per_unit == -(-plan.k_blocks // parts)
+                    assert (
+                        plan.num_full,
+                        plan.tail_tiles,
+                        plan.sk_units,
+                        plan.iters_per_unit,
+                    ) == stream_k_plan(
+                        plan.pair_tiles, plan.k_blocks, plan.sm_pairs, *sk_rule
+                    )
+                elif plan.sk_units:
                     assert (
                         plan.pair_tiles <= plan.sm_pairs
                         and 2 * plan.tail_tiles <= plan.sm_pairs
@@ -1188,6 +1218,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         2 * plan.pair_tiles,
                     )
                     assert plan.iters_per_unit == -(-plan.k_blocks // 2)
+                if plan.sk_units:
                     assert (
                         plan.ws_f32_elems
                         == (plan.sk_units + plan.tail_tiles)
@@ -1594,10 +1625,14 @@ def test_sk_parts_rule(pairs):
             arch="sm_100a",
             _fallback=False,
         )[0]
-        assert (other.tail_tiles, other.sk_units) == (
-            12,
-            24,
-        )  # 256-row tiles, auto two-way split
+        assert (
+            (other.pair_tiles, other.tail_tiles, other.sk_units)
+            == (
+                24,
+                24,
+                48,
+            )
+        )  # sm_100a has no sk_parts rule: its 128-wide tiles keep the auto two-way split
 
 
 def test_f32_v8_symbol_only_on_the_fp32_register_epilogue():
