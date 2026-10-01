@@ -278,10 +278,6 @@ class FmhaConfig:
     # Pipeline stages
     q_stage: int = 2
     kv_stage: int = 3
-    # VC-Attention is not on this branch; the shared K/V ring sizing reads the flag.
-    vc_attention: bool = False
-    # P stays in TMEM on this branch; the shared K/V ring sizing reads the flag.
-    p_in_smem: bool = False
     # One TMA pipeline has one expected-transaction byte count per stage, so K
     # and V share a ring of kv_stage stages only while their dtype widths
     # match. Mixed widths set split_kv_pipelines and size one ring per side.
@@ -3230,21 +3226,32 @@ class TmemSPResource(MemoryResource):
         stage_col_offset: TmemAddr,
         row_max: SoftmaxScalar,
         scale_softmax_log2: SoftmaxScalar,
+        chunk_lo: cutlass.Constexpr[int] = 0,
+        chunk_hi: cutlass.Constexpr[int | None] = None,
+        sum_in: Float32 | None = None,
     ) -> SoftmaxRowSumContribution:
-        """Apply exp2 softmax P, fold the PV P scale, and store P to TMEM."""
+        """Apply exp2 softmax P, fold the PV P scale, and store P to TMEM.
+
+        ``chunk_lo``/``chunk_hi`` select the key chunks to process; the whole
+        tile by default. A partial range fences its stores and returns
+        ``sum_in`` plus its row sum, for the two-half publish.
+        """
         tmem_p_addr = self.tmem_p_addr_cached + stage_col_offset
         tmem_shape = "32x32b"
         tmem_x = self.cfg.tmem_x_load_s
         num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
+        if cutlass.const_expr(chunk_hi is None):
+            chunk_hi = num_chunks
+        partial = chunk_lo > 0 or chunk_hi < num_chunks
         p_packing_ratio = self.cfg.qk_acc_dtype.width // self.cfg.v_dtype.width
         scale = scale_softmax_log2
-        if cutlass.const_expr(self.cfg.uses_d256_fp8_softmax_cadence):
+        if cutlass.const_expr(not partial and self.cfg.uses_d256_fp8_softmax_cadence):
             return self._exp2_p_store_d256_fp8_cadence(
                 tmem_p_addr,
                 row_max,
                 scale,
             )
-        if cutlass.const_expr(self.cfg.uses_d128_fp8_softmax_cadence):
+        if cutlass.const_expr(not partial and self.cfg.uses_d128_fp8_softmax_cadence):
             return self._exp2_p_store_d128_fp8_cadence(
                 tmem_p_addr,
                 row_max,
@@ -3258,14 +3265,18 @@ class TmemSPResource(MemoryResource):
         )
         p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
         minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
-        s_data = _tmem_sp_sdata.pop(id(self))
-        if cutlass.const_expr(self.enable_early_tile_sum):
+        if cutlass.const_expr(chunk_hi < num_chunks):
+            # A later range reads the same S data.
+            s_data = _tmem_sp_sdata[id(self)]
+        else:
+            s_data = _tmem_sp_sdata.pop(id(self))
+        if cutlass.const_expr(self.enable_early_tile_sum or partial):
             # Keep four independent scalar dependency chains while expressing
             # them as two packed float2 values.  The explicit packed primitive
             # lowers to FADD2 for D128 instead of two scalar FADDs per pair.
             local_sum_pair_0 = (Float32(0.0), Float32(0.0))
             local_sum_pair_1 = (Float32(0.0), Float32(0.0))
-        for chunk_idx in cutlass.range_constexpr(num_chunks):
+        for chunk_idx in cutlass.range_constexpr(chunk_lo, chunk_hi):
             p_vals = ()
             for elem_idx in cutlass.range_constexpr(0, tmem_x, 2):
                 fma_pair = cute.arch.fma_packed_f32x2(
@@ -3285,7 +3296,7 @@ class TmemSPResource(MemoryResource):
                 else:
                     p0 = cute.math.exp2(fma_pair[0], fastmath=True)
                     p1 = cute.math.exp2(fma_pair[1], fastmath=True)
-                if cutlass.const_expr(self.enable_early_tile_sum):
+                if cutlass.const_expr(self.enable_early_tile_sum or partial):
                     pair_idx = chunk_idx * (tmem_x // 2) + elem_idx // 2
                     if cutlass.const_expr(pair_idx % 2 == 0):
                         local_sum_pair_0 = cute.arch.add_packed_f32x2(
@@ -3309,13 +3320,24 @@ class TmemSPResource(MemoryResource):
             not self.cfg.single_qkv_instance
             and self.cfg.v_dtype == cutlass.Float8E4M3FN
         )
-        for pair_idx in cutlass.range_constexpr(num_chunks // p_packing_ratio):
+        # One word holds four fp8 P values, so a pair of chunks is tmem_x words
+        # and a chunk range inside a pair is a word sub-range of its store.
+        for pair_idx in cutlass.range_constexpr(
+            chunk_lo // p_packing_ratio,
+            (chunk_hi + p_packing_ratio - 1) // p_packing_ratio,
+        ):
+            word_lo = max(chunk_lo - pair_idx * p_packing_ratio, 0) * tmem_x // 4
+            word_hi = (
+                min(chunk_hi - pair_idx * p_packing_ratio, p_packing_ratio)
+                * tmem_x
+                // 4
+            )
             if cutlass.const_expr(use_fused_d128_fp8x4_pack):
                 # Match the handwritten D128 pack: merge both FP8x2
                 # conversions in one side-effecting block so ptxas can retain
                 # the 32-bit word without a PRMT between temporary vectors.
                 packed_words: tuple[Any, ...] = ()
-                for word_idx in cutlass.range_constexpr(tmem_x):
+                for word_idx in cutlass.range_constexpr(word_lo, word_hi):
                     flat_idx = word_idx * 4
                     chunk_idx = pair_idx * p_packing_ratio + flat_idx // tmem_x
                     elem_idx = flat_idx % tmem_x
@@ -3339,10 +3361,12 @@ class TmemSPResource(MemoryResource):
                 store_fragment = p_data_f32[0:tmem_x]
             prims.tcgen05_st(
                 tmem_shape,
-                prims.make_tmem_ptr(tmem_p_addr + pair_idx * tmem_x, cutlass.Int8),
+                prims.make_tmem_ptr(
+                    tmem_p_addr + pair_idx * tmem_x + word_lo, cutlass.Int8
+                ),
                 store_fragment,
             )
-        if cutlass.const_expr(self.enable_early_tile_sum):
+        if cutlass.const_expr(self.enable_early_tile_sum or partial):
             local_sum_pair = cute.arch.add_packed_f32x2(
                 local_sum_pair_0,
                 local_sum_pair_1,
@@ -3350,6 +3374,10 @@ class TmemSPResource(MemoryResource):
                 ftz=False,
             )
             tile_sum = local_sum_pair[0] + local_sum_pair[1]
+        if cutlass.const_expr(partial):
+            # Make this range's P visible before the barrier arrive that follows.
+            cute.arch.fence_view_async_tmem_store()
+            return sum_in + tile_sum
         if cutlass.const_expr(
             self.enable_early_tile_sum or self.cfg.has_tmem_p_pipeline
         ):
@@ -3927,11 +3955,11 @@ class TmemSPResource(MemoryResource):
     ) -> Float32:
         """First half of exp2_p: keys [0, N/2). Stores those P columns and
         fences so the MMA can start PV on them. Returns their row sum."""
-        return self._exp2_p_store_half(
+        return self._exp2_p_store(
             self._stage_col_offset(stage_info),
             row_max,
             scale_softmax_log2,
-            half=0,
+            chunk_hi=self.cfg.qk_mma_tiler[1] // self.cfg.tmem_x_load_s // 2,
             sum_in=Float32(0.0),
         )
 
@@ -3946,126 +3974,13 @@ class TmemSPResource(MemoryResource):
         p_lo: Float32,
     ) -> Float32:
         """Second half of exp2_p: keys [N/2, N). Returns the full tile sum."""
-        return self._exp2_p_store_half(
+        return self._exp2_p_store(
             self._stage_col_offset(stage_info),
             row_max,
             scale_softmax_log2,
-            half=1,
+            chunk_lo=self.cfg.qk_mma_tiler[1] // self.cfg.tmem_x_load_s // 2,
             sum_in=p_lo,
         )
-
-    @cute.jit
-    def _exp2_p_store_half(
-        self,
-        stage_col_offset: TmemAddr,
-        row_max: SoftmaxScalar,
-        scale_softmax_log2: SoftmaxScalar,
-        half: cutlass.Constexpr[int],
-        sum_in: Float32,
-    ) -> Float32:
-        """exp2, P pack (bf16 or fp8) and TMEM store for one half of the key tile.
-
-        Only the paired dense early-tile-sum path uses this (see
-        FmhaConfig.pv_half_overlap). Chunk math matches _exp2_p_store.
-        """
-        tmem_p_addr = self.tmem_p_addr_cached + stage_col_offset
-        tmem_shape = "32x32b"
-        tmem_x = self.cfg.tmem_x_load_s
-        num_chunks = self.cfg.qk_mma_tiler[1] // tmem_x
-        p_packing_ratio = self.cfg.qk_acc_dtype.width // self.cfg.v_dtype.width
-        # Each half covers the same keys regardless of V dtype: chunks
-        # [0, N/2) then [N/2, N). Only the TMEM footprint of P differs.
-        if cutlass.const_expr(half == 0):
-            chunk_lo, chunk_hi = 0, num_chunks // 2
-            s_data = _tmem_sp_sdata[id(self)]
-        else:
-            chunk_lo, chunk_hi = num_chunks // 2, num_chunks
-            s_data = _tmem_sp_sdata.pop(id(self))
-        p_data_f32 = cutlass.Array(self.cfg.qk_acc_dtype, tmem_x, alignment=16)
-        p_data_packed = cutlass.Array(
-            p_data_f32.data_ptr(),
-            shape=(tmem_x * p_packing_ratio,),
-            dtype=self.cfg.v_dtype,
-        )
-        scale = scale_softmax_log2
-        p_scale_log2 = Float32(self.cfg.pv_p_scale_log2)
-        minus_row_max_scale = (Float32(0.0) - row_max) * scale + p_scale_log2
-        local_sum_pair_0 = (Float32(0.0), Float32(0.0))
-        local_sum_pair_1 = (Float32(0.0), Float32(0.0))
-        for chunk_idx in cutlass.range_constexpr(chunk_lo, chunk_hi):
-            p_vals = ()
-            for elem_idx in cutlass.range_constexpr(0, tmem_x, 2):
-                fma_pair = cute.arch.fma_packed_f32x2(
-                    (
-                        s_data[chunk_idx][elem_idx],
-                        s_data[chunk_idx][elem_idx + 1],
-                    ),
-                    (scale, scale),
-                    (minus_row_max_scale, minus_row_max_scale),
-                    rnd="rn",
-                    ftz=False,
-                )
-                if cutlass.const_expr(
-                    elem_idx // 2 >= tmem_x // 2 - self.cfg.exp2_fma_pairs
-                ):
-                    p0, p1 = _exp2_fma_packed(fma_pair[0], fma_pair[1])
-                else:
-                    p0 = cute.math.exp2(fma_pair[0], fastmath=True)
-                    p1 = cute.math.exp2(fma_pair[1], fastmath=True)
-                pair_idx = chunk_idx * (tmem_x // 2) + elem_idx // 2
-                if cutlass.const_expr(pair_idx % 2 == 0):
-                    local_sum_pair_0 = cute.arch.add_packed_f32x2(
-                        local_sum_pair_0, (p0, p1), rnd="rn", ftz=False
-                    )
-                else:
-                    local_sum_pair_1 = cute.arch.add_packed_f32x2(
-                        local_sum_pair_1, (p0, p1), rnd="rn", ftz=False
-                    )
-                p_vals += (p0, p1)
-            s_data[chunk_idx] = cutlass.Vector.from_elements(
-                p_vals, self.cfg.qk_acc_dtype
-            )
-        if cutlass.const_expr(self.cfg.v_dtype.width == 8):
-            # fp8 V: the full tile packs into one 32-column store, so one half
-            # is 16 columns. Same fused fp8x4 pack as _exp2_p_store.
-            words_per_half = tmem_x // 2
-            packed_words: tuple[Any, ...] = ()
-            for word_idx in cutlass.range_constexpr(words_per_half):
-                flat_idx = (half * words_per_half + word_idx) * 4
-                chunk_idx = flat_idx // tmem_x
-                elem_idx = flat_idx % tmem_x
-                packed_words += (
-                    _pack_float4_to_fp8_e4m3(
-                        s_data[chunk_idx][elem_idx],
-                        s_data[chunk_idx][elem_idx + 1],
-                        s_data[chunk_idx][elem_idx + 2],
-                        s_data[chunk_idx][elem_idx + 3],
-                    ),
-                )
-            prims.tcgen05_st(
-                tmem_shape,
-                prims.make_tmem_ptr(tmem_p_addr + half * words_per_half, cutlass.Int8),
-                cutlass.Vector.from_elements(packed_words, Int32),
-            )
-        else:
-            # bf16 V: two chunks pack into one 32-column store per half.
-            pair_idx = half
-            for slice_idx in cutlass.range_constexpr(p_packing_ratio):
-                chunk_idx = pair_idx * p_packing_ratio + slice_idx
-                p_data_packed[slice_idx * tmem_x : tmem_x] = s_data[chunk_idx].to(
-                    self.cfg.v_dtype
-                )
-            prims.tcgen05_st(
-                tmem_shape,
-                prims.make_tmem_ptr(tmem_p_addr + pair_idx * tmem_x, cutlass.Int8),
-                p_data_f32[0:tmem_x],
-            )
-        local_sum_pair = cute.arch.add_packed_f32x2(
-            local_sum_pair_0, local_sum_pair_1, rnd="rn", ftz=False
-        )
-        # Make this half's P visible before the barrier arrive that follows.
-        cute.arch.fence_view_async_tmem_store()
-        return sum_in + local_sum_pair[0] + local_sum_pair[1]
 
     @consumer_work(returns=(old_row_max, row_max))
     @cute.jit
