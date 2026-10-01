@@ -962,6 +962,48 @@ def _ffi_raw_pointer_carrier(tensor):
     return carrier
 
 
+# Bodies that reach an operand only through its TMA descriptor never
+# dereference the raw pointer argument of the same name.  The generated FFI
+# shim still applies the contiguous-by-default host contract to that pointer,
+# so a strided packed-row q / k / v view travels through the one-element
+# carrier above (the ``beta`` precedent) while the TMA view carries the token
+# pitch.  Every other body reads the pitch from the TensorView itself (a hidden
+# int64 argument expanded by the shim) and needs the strided view.  Mirrors
+# the source runtime's table of the same name.
+QKV_TMA_ONLY_RAW_POINTERS = {
+    "compiled_bf16_bt16_prepare": ("q", "k"),
+    "compiled_bf16_bt16_prepare_beta_tma": ("q", "k"),
+    "compiled_tf32_bt16_prepare": ("q", "k"),
+    "compiled_tf32_bt16_prepare_beta_tma": ("q", "k"),
+    "compiled_bf16_bt16_chain_m64": ("v",),
+    "compiled_bf16_bt16_chain_m64_s7": ("v",),
+    "compiled_bf16_bt16_chain_m64_s9": ("v",),
+    "compiled_fp32_bt16_chain_m64": ("v",),
+    "compiled_tf32_bt16_chain_m64": ("v",),
+    "compiled_tf32_bt16_chain_m64_compact_output": ("v",),
+    "compiled_tf32_bt16_chain_m64_split_prediction": ("v",),
+    "compiled_tf32_bt16_chain_m64_fp32_state": ("v",),
+    "compiled_tf32_fused_n32": ("q", "k", "v"),
+    "compiled_tf32_fused": ("q", "k"),
+}
+
+
+def _qkv_raw_pointer_names(factory):
+    """Raw q / k / v arguments the body never dereferences (TMA-only reads)."""
+    name = getattr(factory, "__name__", None)
+    if name is None:
+        # functools.partial(_factory, "<name>") wraps the generated module.
+        name = getattr(factory, "args", ("",))[0]
+    return QKV_TMA_ONLY_RAW_POINTERS.get(name, ())
+
+
+def _qkv_raw_pointer_arg(tensor, name, carrier_names):
+    """Bind a raw q / k / v pointer: the strided view, or its carrier."""
+    if name in carrier_names:
+        return _ffi_raw_pointer_carrier(tensor)
+    return tensor
+
+
 def _should_use_independent_dvsplit(
     *,
     gpu_arch: str,
@@ -2407,6 +2449,16 @@ class FlashKDABlackwellBF16FusedLaunch:
     _n16_short_four_stage = False
     _active_beta_f32 = False
 
+    def _build_body(self, factory, *args, **kwargs):
+        """Build one body and record which raw q / k / v pointers it never reads."""
+        module = self._build_kda_module(factory, *args, **kwargs)
+        self._qkv_carrier_names[id(module)] = _qkv_raw_pointer_names(factory)
+        return module
+
+    @staticmethod
+    def _build_kda_module(factory, *args, **kwargs):
+        return _build_kda_module(factory, *args, **kwargs)
+
     def __init__(
         self,
         q,
@@ -2457,6 +2509,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (not self._affine_main_indexed_initial_bf16),
         )
         self.compute_dtype = compute_dtype
+        self._qkv_carrier_names = {}
         _require_tensor(out, name="out", dtype=torch.bfloat16, ndim=4)
         # q / k / v may be strided views of a packed qkv row (token pitch >
         # num_heads * HEAD_DIM) as long as each token's [num_heads, HEAD_DIM]
@@ -3512,16 +3565,16 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
         if use_bt16_prepare_chain and compute_dtype == "tf32":
             self.prepare_module = (
-                _build_kda_module(
+                self._build_body(
                     partial(_factory, "compiled_tf32_bt16_prepare_beta_tma")
                 )
                 if use_bt16_beta_tma
-                else _build_kda_module(
+                else self._build_body(
                     partial(_factory, "compiled_tf32_bt16_prepare"),
                     active_beta_f32=self._active_beta_f32,
                 )
             )
-            self.module = _build_kda_module(
+            self.module = self._build_body(
                 partial(_factory, "compiled_tf32_bt16_chain_m64_fp32_state"),
                 compact_output=use_bt16_s7_chain,
                 split_prediction=use_bt16_s9_chain,
@@ -3537,17 +3590,17 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
         elif use_bt16_prepare_chain:
             self.prepare_module = (
-                _build_kda_module(
+                self._build_body(
                     partial(_factory, "compiled_bf16_bt16_prepare_beta_tma")
                 )
                 if use_bt16_beta_tma
-                else _build_kda_module(
+                else self._build_body(
                     partial(_factory, "compiled_bf16_bt16_prepare"),
                     active_beta_f32=self._active_beta_f32,
                 )
             )
             self.module = (
-                _build_kda_module(
+                self._build_body(
                     partial(_factory, "compiled_fp32_bt16_chain_m64"),
                     stage_count=7
                     if use_bt16_s7_chain
@@ -3558,17 +3611,17 @@ class FlashKDABlackwellBF16FusedLaunch:
                     write_checkpoints=bool(checkpoint_every_n_tokens),
                 )
                 if self._state_dtype_is_fp32
-                else _build_kda_module(
+                else self._build_body(
                     partial(_factory, "compiled_bf16_bt16_chain_m64_s7"),
                     write_checkpoints=bool(checkpoint_every_n_tokens),
                 )
                 if use_bt16_s7_chain
-                else _build_kda_module(
+                else self._build_body(
                     partial(_factory, "compiled_bf16_bt16_chain_m64_s9"),
                     write_checkpoints=bool(checkpoint_every_n_tokens),
                 )
                 if use_bt16_s9_chain
-                else _build_kda_module(
+                else self._build_body(
                     partial(_factory, "compiled_bf16_bt16_chain_m64"),
                     write_checkpoints=bool(checkpoint_every_n_tokens),
                 )
@@ -3602,7 +3655,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 raise ValueError(
                     "checkpoint accumulation requires FP32 checkpoint rows"
                 )
-            self.module = _build_kda_module(
+            self.module = self._build_body(
                 partial(_factory, "compiled_bf16_fused_m128"),
                 BF16_N16_M128_CHUNK if use_direct_m128_n16 else BF16_M128_CHUNK,
                 serving_native_abi=serving_native_abi,
@@ -3666,7 +3719,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             n32_value_rows = (
                 64 if 2 * SMALL_BH_GROUP_SIZE * total_tasks <= sm_count else 128
             )
-            self.module = _build_kda_module(
+            self.module = self._build_body(
                 partial(_factory, "compiled_tf32_fused_n32"),
                 owner_helpers=7,
                 unbounded_softplus=unbounded_softplus,
@@ -3681,7 +3734,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             if unbounded_softplus:
                 self.schedule += "_unbounded_softplus"
         elif use_small_bh_owner_helper:
-            self.module = _build_kda_module(
+            self.module = self._build_body(
                 partial(_factory, "compiled_small_bh_m128"),
                 state_dtype_is_fp32=self._state_dtype_is_fp32,
                 serving_native_abi=serving_native_abi,
@@ -3732,7 +3785,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                     and (state_checkpoints is not None)
                     and (state_checkpoints.data_ptr() % 16 == 0)
                 )
-                self.module = _build_kda_module(
+                self.module = self._build_body(
                     partial(_factory, "compiled_tf32_fused_n32"),
                     state_dtype_is_fp32=self._state_dtype_is_fp32,
                     active_beta_f32=self._active_beta_f32,
@@ -3763,7 +3816,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 if self._pdl_wait_initial_state_f32 or self._pdl_publish_final_state:
                     self.schedule += "_pdl"
             else:
-                self.module = _build_kda_module(
+                self.module = self._build_body(
                     partial(_factory, "compiled_tf32_fused"),
                     value_rows=128 if use_tf32_direct_m128 else 64,
                     state_dtype_is_fp32=self._state_dtype_is_fp32,
@@ -3779,7 +3832,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                     else "fused_tf32_m64_local_factors_s3"
                 )
         elif use_independent_dvsplit:
-            self.module = _build_kda_module(
+            self.module = self._build_body(
                 partial(_factory, "compiled_bf16_fused_m64"),
                 state_dtype_is_fp32=self._state_dtype_is_fp32,
                 active_beta_f32=self._active_beta_f32,
@@ -3792,7 +3845,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 else "fused_m64_independent_dvsplit"
             )
         elif use_source_vtile_m128:
-            self.module = _build_kda_module(
+            self.module = self._build_body(
                 partial(_factory, "compiled_bf16_fused_m128_vtile"),
                 full_chunks=full_n32_chunks,
                 num_heads=num_heads,
@@ -3816,7 +3869,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 else "fused_vtile_m128"
             )
         elif use_scalar_chunk_lpt_m128:
-            self.module = _build_kda_module(
+            self.module = self._build_body(
                 partial(_factory, "compiled_scalar_chunk_lpt_m128"),
                 num_heads=num_heads,
                 use_initial_state=initial_state is not None,
@@ -3833,7 +3886,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
         elif use_persistent_m128:
             if use_tf32_persistent_m128:
-                self.module = _build_kda_module(
+                self.module = self._build_body(
                     partial(_factory, "compiled_tf32_fused_n32"),
                     state_dtype_is_fp32=self._state_dtype_is_fp32,
                     write_checkpoints=bool(checkpoint_every_n_tokens),
@@ -3842,7 +3895,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                     piece_tasks=use_piece_persistent_m128,
                 )
             else:
-                self.module = _build_kda_module(
+                self.module = self._build_body(
                     partial(_factory, "compiled_bf16_persistent_m128"),
                     piece_tasks=use_piece_persistent_m128,
                     state_dtype_is_fp32=self._state_dtype_is_fp32,
@@ -4009,12 +4062,13 @@ class FlashKDABlackwellBF16FusedLaunch:
         if n32_value_rows == 64:
             self.grid = (2 * self.grid[0], 1, 1)
         self.prepare_grid = (bt16_prepare_total_ctas, 1, 1)
+        qkv_carriers = self._qkv_carrier_names.get(id(self.module), ())
         self.args = {
-            "q": q_flat,
+            "q": _qkv_raw_pointer_arg(q_flat, "q", qkv_carriers),
             "q_tma": q_flat,
-            "k": k_flat,
+            "k": _qkv_raw_pointer_arg(k_flat, "k", qkv_carriers),
             "k_tma": k_flat,
-            "v": v_flat,
+            "v": _qkv_raw_pointer_arg(v_flat, "v", qkv_carriers),
             "v_tma": v_flat,
             "g": g_pointer,
             "g_tma": g_flat,
@@ -4183,10 +4237,11 @@ class FlashKDABlackwellBF16FusedLaunch:
             )
         self.prepare_args: dict[str, Any] = {}
         if use_bt16_prepare_chain:
+            prepare_carriers = self._qkv_carrier_names.get(id(self.prepare_module), ())
             self.prepare_args = {
-                "q": q_flat,
+                "q": _qkv_raw_pointer_arg(q_flat, "q", prepare_carriers),
                 "q_tma": q,
-                "k": k_flat,
+                "k": _qkv_raw_pointer_arg(k_flat, "k", prepare_carriers),
                 "k_tma": k,
                 "raw_gate": g_pointer,
                 "raw_gate_tma": g_flat,
@@ -4258,10 +4313,11 @@ class FlashKDABlackwellBF16FusedLaunch:
             or use_tf32_persistent_m128
             or use_tf32_owner_helper
         ) and compute_dtype == "tf32":
+            qkv_carriers = self._qkv_carrier_names.get(id(self.module), ())
             self.args = {
-                "q": q_flat,
+                "q": _qkv_raw_pointer_arg(q_flat, "q", qkv_carriers),
                 "q_tma": q,
-                "k": k_flat,
+                "k": _qkv_raw_pointer_arg(k_flat, "k", qkv_carriers),
                 "k_tma": k,
                 "raw_gate": g_pointer,
                 "raw_gate_tma": g_flat,
@@ -4274,7 +4330,7 @@ class FlashKDABlackwellBF16FusedLaunch:
                 "dt_bias": dt_bias,
                 "cu_seqlens": cu_seqlens,
                 "seq_order": seq_order,
-                "v": v_flat,
+                "v": _qkv_raw_pointer_arg(v_flat, "v", qkv_carriers),
                 "out": out_flat,
                 "initial_state": initial_state_pointer,
                 "final_state": final_state_pointer,
