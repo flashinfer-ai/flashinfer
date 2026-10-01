@@ -195,6 +195,21 @@ def test_variant_routing(hidden_size, rank, expected):
     assert cake_bgmv_moe.cake_bgmv_moe_variant(hidden_size, rank) == expected
 
 
+@pytest.mark.parametrize(
+    ("hidden_size", "num_tokens", "expected"),
+    [
+        (3072, 1, "specialized"),
+        (3072, 2048, "specialized"),
+        (2688, 2049, "generic"),
+        (3072, 4096, "generic"),
+        (2048, 4096, "generic"),
+    ],
+)
+def test_variant_routing_by_token_count(hidden_size, num_tokens, expected):
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS == 2048
+    assert cake_bgmv_moe.cake_bgmv_moe_variant(hidden_size, 32, num_tokens) == expected
+
+
 @pytest.mark.parametrize("arch", cake_bgmv_moe.CAKE_BGMV_MOE_ARCHES)
 @pytest.mark.parametrize(
     ("hidden_size", "num_tokens", "expected"),

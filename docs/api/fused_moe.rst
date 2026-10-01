@@ -107,7 +107,7 @@ top of a Mixture-of-Experts layer (shrink + expand).
 :func:`prepare_bgmv_moe` returns a graph-replayable plan. On SM90, SM100 and
 SM103 devices the generated Cake programs serve one LoRA slice with rank 8, 16,
 32 or 64 and any hidden size that is a positive multiple of 8 (hidden 2688 and
-3072 at rank 32 use the specialized measured bodies, ``plan.variant ==
+3072 at rank 32 use the specialized measured bodies at up to 2048 tokens, ``plan.variant ==
 "specialized"``; everything else the runtime-hidden generic bundles,
 ``plan.variant == "generic"``); the output has one owner per token, so replays
 are bitwise reproducible. Arbitrary pair order (for example expert-sorted

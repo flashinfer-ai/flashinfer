@@ -245,18 +245,35 @@ def _check_generic_rank(rank: int) -> None:
         )
 
 
-def cake_bgmv_moe_variant(hidden_size: int, rank: int) -> Optional[CakeBGMVMoEVariant]:
+# Above this many tokens the generic rank-32 bundle (rank-split expand,
+# register-accumulated shrink) beats the specialized hidden 2688/3072 bodies
+# (GB300 shrink+expand, contiguous: 220 vs 227 us at 2048 tokens, 388 vs 449
+# us at 4096; expert-sorted 437 vs 495 us at 4096; the specialized bodies
+# lead by ~13% at 1024 tokens).
+CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS = 2048
+
+
+def cake_bgmv_moe_variant(
+    hidden_size: int, rank: int, num_tokens: Optional[int] = None
+) -> Optional[CakeBGMVMoEVariant]:
     """Return which generated Cake bundle serves ``(hidden_size, rank)``.
 
-    ``"specialized"`` for the measured hidden 2688/3072 x rank 32 bodies,
-    ``"generic"`` for any other hidden size that is a positive multiple of 8
-    at rank 8, 16, 32 or 64, and ``None`` when no generated program applies.
+    ``"specialized"`` for the measured hidden 2688/3072 x rank 32 bodies at up
+    to ``CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS`` tokens (``num_tokens=None``
+    means "any token count"), ``"generic"`` for any other hidden size that is
+    a positive multiple of 8 at rank 8, 16, 32 or 64, and ``None`` when no
+    generated program applies.
     """
 
     hidden_size = int(hidden_size)
     rank = int(rank)
     if hidden_size in CAKE_BGMV_MOE_HIDDEN_SIZES and rank == 32:
-        return "specialized"
+        if (
+            num_tokens is None
+            or int(num_tokens) <= CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS
+        ):
+            return "specialized"
+        return "generic"
     if (
         rank in CAKE_BGMV_MOE_GENERIC_RANKS
         and hidden_size > 0
@@ -572,6 +589,7 @@ __all__ = [
     "CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN",
     "CAKE_BGMV_MOE_SCHEDULE_IDS",
     "CAKE_BGMV_MOE_SHRINK_SPLIT_MAX",
+    "CAKE_BGMV_MOE_SPECIALIZED_MAX_TOKENS",
     "CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS",
     "CakeBGMVMoEArch",
     "CakeBGMVMoEArchTarget",

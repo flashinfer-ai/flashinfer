@@ -401,7 +401,11 @@ def test_expert_sorted_routes_match_reference_and_replay_bitwise(
     expected = _reference(inputs)
     plan = prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
     assert isinstance(plan, BGMVMoECakePlan)
-    assert plan.variant == ("specialized" if hidden_size in (2688, 3072) else "generic")
+    assert plan.variant == (
+        "specialized"
+        if hidden_size in (2688, 3072) and num_tokens <= 2048
+        else "generic"
+    )
     first = plan.run().clone()
     torch.cuda.synchronize()
     torch.testing.assert_close(first, expected, atol=1e-2, rtol=1e-2)
