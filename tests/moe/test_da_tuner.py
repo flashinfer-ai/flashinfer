@@ -12,7 +12,10 @@ import torch
 
 from flashinfer.autotuner import autotune
 from flashinfer.fused_moe.da_moe import DAPlanMode, _local_load_spectrum
-from flashinfer.fused_moe.da_runtime import run_dist_aware_tactic
+from flashinfer.fused_moe.da_runtime import (
+    make_da_capture_binding_key,
+    run_dist_aware_tactic,
+)
 from flashinfer.fused_moe.da_tuner import (
     get_workload,
     moe_workload,
@@ -26,6 +29,22 @@ from flashinfer.fused_moe.da_tuner import (
 )
 from flashinfer.fused_moe.tactic_search import FactorizedTactic
 from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs, RoutingInputMode
+
+
+def test_capture_binding_key_rebinds_only_matching_layer_and_tensor_layout() -> None:
+    """Graph-pool pointers may change, but weights and the prepared ABI must match."""
+    weights = {"gemm1_weights": torch.empty(4, 8), "gemm2_weights": torch.empty(8, 4)}
+    warm = (torch.empty(4, 8), torch.empty(4, 2, dtype=torch.int32))
+    captured = tuple(torch.empty_like(value) for value in warm)
+    key = make_da_capture_binding_key(warm, weights)
+    assert key == make_da_capture_binding_key(captured, weights)
+    other_layer = {name: value.clone() for name, value in weights.items()}
+    assert key != make_da_capture_binding_key(captured, other_layer)
+    assert key != make_da_capture_binding_key((captured[0].t(), captured[1]), weights)
+    assert key != make_da_capture_binding_key(
+        (captured[0].double(), captured[1]), weights
+    )
+    assert make_da_capture_binding_key(captured, {}) is None
 
 
 def test_workload_hints_resolve_against_moe_geometry() -> None:

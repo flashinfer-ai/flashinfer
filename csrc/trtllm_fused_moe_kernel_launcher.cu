@@ -6429,7 +6429,6 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
       &is_workspace_lane_serialized));
   TVM_FFI_ICHECK(is_workspace_lane_serialized)
       << "DA workspace lane is not ordered after its previous invocation.";
-
   // Dispatch the fused preamble first, then rewind the capture frontier to create a sibling root.
   auto const routing_metadata =
       routingMetadataFromFfi(flat_routing_metadata, tile_tokens_dims.size());
@@ -6504,11 +6503,13 @@ Array<int64_t> trtllm_moe_begin_da_switch_capture(
                                         switch_dependencies.data(), switch_dependencies.size(),
                                         &conditional_params));
 
-  DASwitchCaptureState state{original.capture_id,
-                             conditional_node,
-                             after_parallel_work.dependencies.back(),
-                             after_selector.dependencies.back(),
-                             {}};
+  cudaGraphNode_t parallel_work_node = nullptr;
+  cudaGraphNode_t selector_node = nullptr;
+  CHECK_CUDA_ERROR(
+      da_moe::GetNewCaptureFrontierNode(original, after_parallel_work, &parallel_work_node));
+  CHECK_CUDA_ERROR(da_moe::GetNewCaptureFrontierNode(original, after_selector, &selector_node));
+  DASwitchCaptureState state{
+      original.capture_id, conditional_node, parallel_work_node, selector_node, {}};
   state.body_graphs.reserve(num_bodies);
   for (int64_t body_index = 0; body_index < num_bodies; ++body_index) {
     state.body_graphs.push_back(conditional_params.conditional.phGraph_out[body_index]);

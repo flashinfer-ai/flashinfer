@@ -318,6 +318,27 @@ def collect_da_moe_bindings(
     return tuple(bindings)
 
 
+def make_da_capture_binding_key(
+    bindings: Sequence[torch.Tensor], runner_kwargs: Mapping[str, Any]
+) -> tuple[Any, ...] | None:
+    """Identify a warmed layer and tensor ABI independently of graph-pool activations."""
+    if not all(
+        isinstance(runner_kwargs.get(name), torch.Tensor)
+        for name in ("gemm1_weights", "gemm2_weights")
+    ):
+        return None
+    parameters = tuple(
+        (name, value.data_ptr())
+        for name, value in sorted(runner_kwargs.items())
+        if isinstance(value, torch.Tensor)
+    )
+    layouts = tuple(
+        (tuple(value.shape), tuple(value.stride()), value.dtype, value.device)
+        for value in bindings
+    )
+    return parameters, layouts
+
+
 def run_dist_aware_tactic(
     *,
     backend: DaMoeBackend | str,
@@ -418,6 +439,7 @@ def run_dist_aware_tactic(
         if index not in inactive_binding_indices
     ]
     bindings = collect_da_moe_bindings(binding_inputs, runner_kwargs)
+    capture_binding_key = make_da_capture_binding_key(bindings, runner_kwargs)
     # Generic AutoTuner context owns profiling. Ordinary calls restore published state and never
     # tune implicitly.
     if tuner.is_tuning_mode:
@@ -494,6 +516,7 @@ def run_dist_aware_tactic(
         run_fallback=lambda: run_fixed_tactic(baseline_tactic),
         run_body=lambda body: run_fixed_tactic([body.tile_n, body.tactic]),
         capture_switch=capture_switch,
+        capture_binding_key=capture_binding_key,
     )
 
 
@@ -991,6 +1014,9 @@ class DaMoeOperationState:
             )
             self.dispatcher.prepare(
                 bindings,
+                capture_binding_key=make_da_capture_binding_key(
+                    bindings, runner_kwargs
+                ),
                 resource_factory=lambda published: runtime.prepare(
                     published,
                     inputs,
@@ -1027,6 +1053,7 @@ class DaMoeOperationState:
         run_fallback: Callable[[], _ResultT],
         run_body: Callable[[Any], _ResultT],
         capture_switch: Callable[[DAPlan, Any, int, int], Any],
+        capture_binding_key: tuple[Any, ...] | None = None,
     ) -> _ResultT:
         """Use the host-selected eager body or delegate CUDA Graph capture policy."""
         if (
@@ -1039,6 +1066,7 @@ class DaMoeOperationState:
             run_fallback=run_fallback,
             run_body=run_body,
             capture_switch=capture_switch,
+            capture_binding_key=capture_binding_key,
         )
 
     def record_topology(self, topology: Any) -> None:

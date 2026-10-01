@@ -361,6 +361,7 @@ class DAMoEDispatcher:
         self._plan: DAPlan | None = None
         # Lightweight pointer signatures and capture diagnostics for warmed public bindings.
         self._bindings: OrderedDict[tuple[int, ...], DABindingRecord] = OrderedDict()
+        self._prepared_binding_keys: set[tuple[Any, ...]] = set()
         # Graph-stable workspaces indexed by immutable concurrent replay lane identifier.
         self._workspace_lanes: OrderedDict[int, DAWorkspaceLane] = OrderedDict()
         # Most recently prepared or captured lane used by diagnostics.
@@ -560,6 +561,7 @@ class DAMoEDispatcher:
         self._generation = next_generation
         self._plan = plan
         self._bindings.clear()
+        self._prepared_binding_keys.clear()
         self._workspace_lanes.clear()
         self._latest_workspace_lane_id = None
         self._pending_capture_generation = None
@@ -572,6 +574,7 @@ class DAMoEDispatcher:
         self._generation += 1
         self._plan = None
         self._bindings.clear()
+        self._prepared_binding_keys.clear()
         self._workspace_lanes.clear()
         self._latest_workspace_lane_id = None
         self._pending_capture_generation = None
@@ -581,6 +584,7 @@ class DAMoEDispatcher:
         self,
         bindings: Sequence[torch.Tensor],
         resource_factory: Callable[[DAPlan], Any] | None = None,
+        capture_binding_key: tuple[Any, ...] | None = None,
     ) -> Any | None:
         """Register a binding and ensure one idle workspace lane during warmup."""
         # Fallback and singleton plans deliberately own no DA replay resources because their
@@ -603,6 +607,8 @@ class DAMoEDispatcher:
         self._bindings.move_to_end(signature)
         lane = self._find_idle_workspace_lane()
         if lane is not None:
+            if capture_binding_key is not None:
+                self._prepared_binding_keys.add(capture_binding_key)
             self._latest_workspace_lane_id = lane.lane_id
             return lane.workspace
 
@@ -649,6 +655,8 @@ class DAMoEDispatcher:
         )
         self._next_workspace_lane_id += 1
         self._workspace_lanes[lane.lane_id] = lane
+        if capture_binding_key is not None:
+            self._prepared_binding_keys.add(capture_binding_key)
         self._latest_workspace_lane_id = lane.lane_id
         return workspace
 
@@ -685,6 +693,7 @@ class DAMoEDispatcher:
         run_fallback: Callable[[], _ResultT],
         run_body: Callable[[DABody], _ResultT],
         capture_switch: Callable[[DAPlan, Any, int, int], DACaptureOutcome | None],
+        capture_binding_key: tuple[Any, ...] | None = None,
     ) -> _ResultT:
         """Choose ordinary, fixed-body, or SWITCH capture without eager DA dispatch."""
         # Eager execution never injects or replays a hidden graph; it follows the caller's
@@ -700,10 +709,15 @@ class DAMoEDispatcher:
         if plan.mode is DAPlanMode.DA_SINGLE_BODY:
             return run_body(plan.bodies[0])
 
-        # SWITCH capture admits only warmed public bindings. Workspace selection is independent of
+        # Graph-pool activations can change addresses after warmup. Rebind only a prepared
+        # layer/ABI key; this registers host metadata and never allocates replay resources.
+        # Workspace selection is independent of
         # pointer identity so serial same-domain layers share one lane in the outer graph.
         signature = tensor_binding_signature(bindings)
         binding = self._bindings.get(signature)
+        if binding is None and capture_binding_key in self._prepared_binding_keys:
+            binding = DABindingRecord(signature)
+            self._bindings[signature] = binding
         if binding is None:
             return run_fallback()
         lane = self._pending_workspace_lane()
