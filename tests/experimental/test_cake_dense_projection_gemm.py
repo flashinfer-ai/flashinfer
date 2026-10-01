@@ -1192,12 +1192,6 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                     )
                     assert 0 < parts * tail <= plan.sm_pairs
                     assert plan.k_blocks >= parts * SK_MIN_ITERS
-                    assert (plan.num_full, plan.tail_tiles, plan.sk_units) == (
-                        plan.pair_tiles - tail,
-                        tail,
-                        parts * tail,
-                    )
-                    assert plan.iters_per_unit == -(-plan.k_blocks // parts)
                     assert (
                         plan.num_full,
                         plan.tail_tiles,
@@ -1205,6 +1199,18 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         plan.iters_per_unit,
                     ) == stream_k_plan(
                         plan.pair_tiles, plan.k_blocks, plan.sm_pairs, *sk_rule
+                    )
+                    # p * tail linearised units of ceil(k_blocks / p) K steps; when p does not divide k_blocks
+                    # the unit count is re-derived from that step count and lands below p * tail (the kernel's
+                    # two-segment units absorb the drift)
+                    assert (plan.num_full, plan.tail_tiles) == (
+                        plan.pair_tiles - tail,
+                        tail,
+                    )
+                    assert plan.iters_per_unit == -(-plan.k_blocks // parts)
+                    assert tail < plan.sk_units <= parts * tail
+                    assert plan.sk_units == -(
+                        -(tail * plan.k_blocks) // plan.iters_per_unit
                     )
                 elif plan.sk_units:
                     assert (
