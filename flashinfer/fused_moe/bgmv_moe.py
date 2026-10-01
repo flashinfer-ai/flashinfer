@@ -591,7 +591,9 @@ def prepare_bgmv_moe(
     any other pair order (for example expert-sorted dispatch) is served through
     a token->pair route index that the shrink kernels publish and the expand
     kernels read in O(1) per CTA (``plan.route_index``, 16 slots per token;
-    tokens routed to more pairs take an exact serial scan).
+    tokens routed to more pairs take an exact serial scan). Pairs already in
+    their contiguous position are implicit, so a contiguous launch publishes
+    nothing.
 
     Inputs outside that support set (other device capabilities, ranks, hidden
     sizes that are not multiples of 8, multiple slices) are served by a
