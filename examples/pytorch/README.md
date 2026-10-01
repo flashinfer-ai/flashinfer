@@ -16,6 +16,37 @@ by different examples:
 | `FlashInferFP32LayerNorm` | FP32 LayerNorm helper |
 | `FlashInferFeedForward` | FFN helper using FlashInfer-capable linear layers |
 
+## Standalone Kernel Examples
+
+`alphamoe_nvfp4_aligned_moe.py` demonstrates the SM100/SM103 fused AlphaMoE
+NVFP4 up → SwiGLU → down API with linear per-16 E4M3 scales, an externally
+aligned routing plan, and a caller-owned BF16 accumulator:
+
+```bash
+python examples/pytorch/alphamoe_nvfp4_aligned_moe.py
+```
+
+The example keeps its original raw-scale inputs. Models that reuse fixed weights
+can prepare optional scale panels once after loading the final device-local
+weight layout:
+
+```python
+from flashinfer.fused_moe import prepare_nvfp4_w1_scales, prepare_nvfp4_w2_scales
+
+prepared_scales = {
+    "w1_scale_prepared": prepare_nvfp4_w1_scales(gemm1_weights_scale),
+    "w2_scale_prepared": prepare_nvfp4_w2_scales(gemm2_weights_scale),
+}
+# Retain the raw scales and append **prepared_scales to the existing aligned
+# or routed call. Reuse the same panels until those weights are replaced.
+```
+
+Preparation belongs before warmup or graph capture. The optional panels do not
+change the caller-owned output semantics: aligned calls return `None`, routed
+calls return `out`, and both add contributions to its existing contents. Compute
+may use several launches and scratch buffers; it does not promise an entirely
+on-chip intermediate.
+
 ## FlashInfer API and Backend Selection
 
 Backend selection is exposed through model config fields, command-line options,

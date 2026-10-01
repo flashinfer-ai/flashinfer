@@ -242,6 +242,25 @@ process (the SM90/SM100 kernel trees are mutually exclusive per process):
 `bash tests/moe_ep/run_tests.sh oracle_sm90` (1 GPU) and
 `bash tests/moe_ep/run_tests.sh mega_sm90` (4 GPUs).
 
+### SM107 (Rubin) mega tests
+
+The Rubin suites cover NVFP4 and MXFP8 E4M3/E5M2 on compute capability 10.7.
+Use the strict runner to collect per-rank results and fail on skips, OOMs,
+empty selections, or timeouts:
+
+```bash
+export CUTE_DSL_ARCH=sm_107a
+python tests/moe_ep/qualify_sm107.py --suite all --world-size 4 \
+  --output-dir "${FI_RESULTS:?}/sm107-ep4"
+```
+
+For individual suites, use `bash tests/moe_ep/run_tests.sh oracle_sm107`
+(single GPU) or `NPROC_MULTIRANK=4 bash tests/moe_ep/run_tests.sh mega_sm107`.
+The distributed target also accepts 2 or 8 ranks. See the
+[validation guide](moe_ep_sm107_qualification.md).
+
+### Hopper performance benchmark
+
 The perf microbenchmark reproduces the kernel drop's Hopper P03 multirank
 token sweep (`moe_hopper_fp8/run_token_sweep_benchmark.py`, DSV4 geometry:
 topk 6, 384 experts EP4, hidden 7168, intermediate 3072 post-SwiGLU, tokens
@@ -507,6 +526,9 @@ vendored per architecture under `flashinfer/moe_ep/kernel_src/<arch>/`:
   JIT-compiled; vendored from flashinfer PR #4069, see its VENDOR.md)
 - `kernel_src/sm120/swapab_cutedsl_megakernel/` — Blackwell-consumer
   (sm_120/sm_121) swap-AB MXFP8 (another fork snapshot of the same repo)
+- `kernel_src/sm107/next_cutedsl_megamoe/` — Rubin SM107, the kernel repo's `next/`
+  block-scaled inference export; generic inference is integrated, with
+  GenPhase included for future integration (see its `VENDOR.md`)
 
 Each tree exposes its kernels through its own package public API (e.g. the
 sm100 tree's `mxfp8_mega_moe`, `get_symm_buffer_for_mxfp8_mega_moe`). The

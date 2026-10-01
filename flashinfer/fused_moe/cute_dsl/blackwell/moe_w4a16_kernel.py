@@ -441,6 +441,33 @@ class Sm100W4A16GroupedGemmKernel:
         )
 
     @cute.jit
+    def _trace_transform_push(
+        self, name: cutlass.Constexpr, k_tile: cutlass.Int32
+    ) -> None:
+        """Let callers optionally trace a transform stage."""
+        pass
+
+    @cute.jit
+    def _trace_transform_pop(self) -> None:
+        """Close an optional caller-owned transform range."""
+        pass
+
+    @cute.jit
+    def _finish_transform_stage(
+        self,
+        a_load2trans_pipeline: pipeline.PipelineTmaAsync,
+        trans2mma_pipeline: pipeline.PipelineAsyncUmma,
+        cur_a_load2trans_consumer_state: pipeline.PipelineState,
+        trans2mma_producer_state: pipeline.PipelineState,
+    ) -> None:
+        if cutlass.const_expr(self.transform_a_source == tcgen05.OperandSource.TMEM):
+            cute.arch.fence_view_async_tmem_store()
+        else:
+            cute.arch.fence_proxy("async.shared", space="cta")
+        a_load2trans_pipeline.consumer_release(cur_a_load2trans_consumer_state)
+        trans2mma_pipeline.producer_commit(trans2mma_producer_state)
+
+    @cute.jit
     def _transform_tile(
         self,
         a_load2trans_pipeline: pipeline.PipelineTmaAsync,
@@ -473,10 +500,12 @@ class Sm100W4A16GroupedGemmKernel:
             )
 
         for _k_tile in cutlass.range(0, k_tile_cnt, 1, unroll=1):
+            self._trace_transform_push("transform_wait_raw_tma_ready", _k_tile)
             a_load2trans_pipeline.consumer_wait(
                 a_load2trans_consumer_state,
                 peek_load2trans_full_status,
             )
+            self._trace_transform_pop()
             a_stage_coord = (None,) * (cute.rank(tAsA_input) - 1) + (
                 a_load2trans_consumer_state.index,
             )
@@ -487,10 +516,13 @@ class Sm100W4A16GroupedGemmKernel:
                 1,
                 cute.rank(tAsA_input_slice),
             )
+            self._trace_transform_push("transform_wait_tmem_slot_free", _k_tile)
             trans2mma_pipeline.producer_acquire(
                 trans2mma_producer_state,
                 peek_trans2mma_empty_status,
             )
+            self._trace_transform_pop()
+            self._trace_transform_push("transform_load_decode_nvfp4", _k_tile)
             scale_stage_coord = (None,) * (cute.rank(tSsS_trans) - 1) + (
                 a_load2trans_consumer_state.index,
             )
@@ -530,7 +562,9 @@ class Sm100W4A16GroupedGemmKernel:
                     scale_fragment,
                 )
                 tArA_transform_store[(None, idx)].store(tensor_transformed)
+            self._trace_transform_pop()
 
+            self._trace_transform_push("transform_store_commit_bf16", _k_tile)
             a_transform_stage_coord = (None,) * (cute.rank(tAsA_transform) - 1) + (
                 trans2mma_producer_state.index,
             )
@@ -539,14 +573,13 @@ class Sm100W4A16GroupedGemmKernel:
                 tAsA_transform[a_transform_stage_coord],
                 dst_copy_a,
             )
-            if cutlass.const_expr(
-                self.transform_a_source == tcgen05.OperandSource.TMEM
-            ):
-                cute.arch.fence_view_async_tmem_store()
-            else:
-                cute.arch.fence_proxy("async.shared", space="cta")
-            a_load2trans_pipeline.consumer_release(cur_a_load2trans_consumer_state)
-            trans2mma_pipeline.producer_commit(trans2mma_producer_state)
+            self._finish_transform_stage(
+                a_load2trans_pipeline,
+                trans2mma_pipeline,
+                cur_a_load2trans_consumer_state,
+                trans2mma_producer_state,
+            )
+            self._trace_transform_pop()
             trans2mma_producer_state.advance()
             if trans2mma_producer_state.count < k_tile_cnt:
                 peek_trans2mma_empty_status = trans2mma_pipeline.producer_try_acquire(

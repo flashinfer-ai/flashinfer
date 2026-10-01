@@ -155,6 +155,7 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         reducer_max_splits: int = MAX_SPLITS,
         enable_dcp: bool = False,
         cp_world: int = 1,
+        arch: str = "sm_100a",
     ):
         """Initializes the configuration for a Blackwell Multi-Head Latent Attention (MLA) kernel.
 
@@ -202,8 +203,11 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         :param cp_world: Number of cyclic context-parallel shards. This is a
             compile-time parameter when DCP is enabled.
         :type cp_world: int
+        :param arch: Resolved launch architecture; defaults to family-safe staging.
+        :type arch: str
         """
 
+        self.arch = arch
         self.latent_dim = 512
         self.rope_dim = 64
         self.acc_dtype = acc_dtype
@@ -330,7 +334,9 @@ class BlackwellMultiHeadLatentAttentionForwardFP16:
         """
 
         self.load_q_stage = 1
-        self.load_kv_stage = 15 if self.seq_len_q == 1 else 7
+        # SM107's larger shared memory budget permits another K128 KV stage.
+        sm107 = self.arch in ("sm_107", "sm_107a")
+        self.load_kv_stage = 15 if self.seq_len_q == 1 else (8 if sm107 else 7)
         self.mma_s_stage = 2
         self.p_mma_stage = 2
         self.p_cor_stage = 2

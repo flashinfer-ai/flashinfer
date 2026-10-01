@@ -17,12 +17,18 @@
 // TVM-FFI binding for the frozen radix top-k / sparse top-p sampling bundle.
 //
 // The JIT module (flashinfer/jit/cake_sampling.py) generates a small .cu that defines:
-//   CAKE_SAMPLING_BODY_FILE     "generated/cake_sampling_kernels.cu" (one source for every device)
-//   CAKE_SAMPLING_TARGET_MAJOR / CAKE_SAMPLING_TARGET_MINOR   compute capability this module is
-//                                                            built for (one module per capability)
+//   CAKE_SAMPLING_BODY_FILE     "generated/cake_sampling_kernels.cu" (one translation unit for
+//                               every device; it includes the generated/
+//                               cake_sampling_kernels_part<N>.cuh body files the manifest lists)
+//   CAKE_SAMPLING_MIN_MAJOR / CAKE_SAMPLING_MIN_MINOR   oldest compute capability the frozen body
+//                                                      supports (manifest min_compute_capability)
 //   CAKE_SAMPLING_SLAB          slab row stride (entries per row of the top-k slab)
-//   CAKE_SAMPLING_STAGE1_TABLE(X)  X(symbol, cluster, ept, stream, threads, smem_bytes) ...
-//   CAKE_SAMPLING_STAGE23_TABLE(X) X(symbol, threads, items, smem_bytes) ...
+//   CAKE_SAMPLING_FUSED_TAIL_KCAP largest top-k whose stage 2/3 runs inside the stage-1 kernel (two
+//   warps) CAKE_SAMPLING_FUSED_BLOCK_TAIL_KCAP largest top-k the whole-CTA stage-2/3 tail serves
+//   (the slab row) CAKE_SAMPLING_STAGE1_TABLE(X)  X(symbol, cluster, ept, stream, threads,
+//   smem_bytes, fused_tail,
+//                                    fused_block_tail) ...
+//   CAKE_SAMPLING_STAGE23_TABLE(X) X(symbol, threads, items, variant_flags, smem_bytes) ...
 // and then includes this header.  Every table entry is taken verbatim from manifest.json.
 #ifndef CAKE_SAMPLING_BODY_FILE
 #error "CAKE_SAMPLING_BODY_FILE must name the frozen generated body"
@@ -33,8 +39,17 @@
 #ifndef CAKE_SAMPLING_STAGE23_TABLE
 #error "CAKE_SAMPLING_STAGE23_TABLE must list the frozen stage-2/3 variants"
 #endif
+#ifndef CAKE_SAMPLING_FUSED_TAIL_KCAP
+#error "CAKE_SAMPLING_FUSED_TAIL_KCAP must give the fused stage-2/3 top-k capacity"
+#endif
+#ifndef CAKE_SAMPLING_FUSED_BLOCK_TAIL_KCAP
+#error "CAKE_SAMPLING_FUSED_BLOCK_TAIL_KCAP must give the whole-CTA tail top-k capacity"
+#endif
 #ifndef CAKE_SAMPLING_SLAB
 #error "CAKE_SAMPLING_SLAB must give the slab row stride"
+#endif
+#if !defined(CAKE_SAMPLING_MIN_MAJOR) || !defined(CAKE_SAMPLING_MIN_MINOR)
+#error "CAKE_SAMPLING_MIN_MAJOR / CAKE_SAMPLING_MIN_MINOR must give the oldest supported capability"
 #endif
 // The frozen body is a self-contained CUDA translation-unit fragment.  Keep its fixed-width
 // types intact: the generated vector-load code refers to them by name.
@@ -45,6 +60,9 @@
 
 #include <cstdint>
 #include <limits>
+#include <mutex>
+#include <set>
+#include <utility>
 
 #include "tvm_ffi_utils.h"
 
@@ -52,6 +70,18 @@ namespace flashinfer {
 namespace cake_sampling {
 
 constexpr int64_t kSlab = CAKE_SAMPLING_SLAB;
+constexpr int64_t kFusedTailKCap = CAKE_SAMPLING_FUSED_TAIL_KCAP;
+constexpr int64_t kFusedBlockTailKCap = CAKE_SAMPLING_FUSED_BLOCK_TAIL_KCAP;
+static_assert(kFusedBlockTailKCap == kSlab, "the whole-CTA tail must cover the slab row");
+// Stage-1 launch_flags bits (see RadixTopK): fused stage-2/3 tail (two warps), early PDL trigger,
+// stream pre-pass trigger point, whole-CTA stage-2/3 tail.
+constexpr int64_t kFlagFuseTail = 1;
+constexpr int64_t kFlagEarlyTrigger = 2;
+constexpr int64_t kFlagStreamPrepass = 4;
+constexpr int64_t kFlagFuseBlockTail = 8;
+constexpr int64_t kFlagCoarseSample =
+    16;  // host-side build selection; never forwarded to the kernel
+constexpr int64_t kFlagRowSpanDiet = 32;  // streaming variants: row-span filter-arm density switch
 constexpr int32_t kTopKScalar = 1;
 constexpr int32_t kTopKPerRow = 2;
 constexpr int32_t kTopPScalar = 1;
@@ -61,17 +91,28 @@ inline void CheckCuda(cudaError_t status, const char* operation) {
   TVM_FFI_ICHECK(status == cudaSuccess) << operation << " failed: " << cudaGetErrorString(status);
 }
 
-inline void CheckTarget(int32_t device_id) {
+// The module is one fatbin holding a cubin per target architecture selected by FlashInfer's
+// CompilationContext (FLASHINFER_CUDA_ARCH_LIST, else the visible devices).  A device below the
+// frozen body's minimum capability, or one whose architecture is not among the compiled targets
+// (no cubin in the fatbin), is rejected here with a message naming the fix instead of failing
+// later inside cudaFuncSetAttribute / cudaLaunchKernelExC.
+inline void CheckTarget(int32_t device_id, const void* probe_kernel) {
   int major = 0;
   int minor = 0;
   CheckCuda(cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device_id),
             "cudaDeviceGetAttribute(major)");
   CheckCuda(cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device_id),
             "cudaDeviceGetAttribute(minor)");
-  TVM_FFI_ICHECK(major == CAKE_SAMPLING_TARGET_MAJOR && minor == CAKE_SAMPLING_TARGET_MINOR)
-      << "the frozen radix sampling kernels were compiled for compute capability "
-      << CAKE_SAMPLING_TARGET_MAJOR << "." << CAKE_SAMPLING_TARGET_MINOR << ", got " << major << "."
-      << minor;
+  TVM_FFI_ICHECK(major > CAKE_SAMPLING_MIN_MAJOR ||
+                 (major == CAKE_SAMPLING_MIN_MAJOR && minor >= CAKE_SAMPLING_MIN_MINOR))
+      << "the frozen radix sampling kernels need compute capability " << CAKE_SAMPLING_MIN_MAJOR
+      << "." << CAKE_SAMPLING_MIN_MINOR << " or newer, got " << major << "." << minor;
+  cudaFuncAttributes attributes;
+  const cudaError_t status = cudaFuncGetAttributes(&attributes, probe_kernel);
+  TVM_FFI_ICHECK(status == cudaSuccess)
+      << "the frozen radix sampling module has no kernel image for compute capability " << major
+      << "." << minor << " (" << cudaGetErrorString(status)
+      << "); rebuild with this architecture in FLASHINFER_CUDA_ARCH_LIST";
 }
 
 struct Stage1Variant {
@@ -81,32 +122,54 @@ struct Stage1Variant {
   int32_t stream;  // 1: streaming variant (any vocab, runtime chunk count); 0: register-resident
   int32_t threads;
   int32_t smem_bytes;
+  int32_t fused_tail;        // 1: built with the fused stage-2/3 tail (accepts launch_flags bit 0)
+  int32_t fused_block_tail;  // 1: built with the whole-CTA tail (accepts launch_flags bit 3)
+  int32_t coarse_sample;  // 1: the coarse-sample build (1/8 sampled first pass; launch_flags bit 4)
 };
 
 struct Stage23Variant {
   const void* kernel;
   int32_t threads;
   int32_t items;
+  int32_t variant_flags;  // static per-architecture form (manifest variant_flags; 0 = base form)
   int32_t smem_bytes;
 };
 
-#define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem) \
-  {reinterpret_cast<const void*>(&symbol), cluster, ept, stream, threads, smem},
-#define CAKE_SAMPLING_STAGE23_ENTRY(symbol, threads, items, smem) \
-  {reinterpret_cast<const void*>(&symbol), threads, items, smem},
+#define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem, fused, \
+                                   fused_block, wide)                                  \
+  {reinterpret_cast<const void*>(&symbol),                                             \
+   cluster,                                                                            \
+   ept,                                                                                \
+   stream,                                                                             \
+   threads,                                                                            \
+   smem,                                                                               \
+   fused,                                                                              \
+   fused_block,                                                                        \
+   wide},
+#define CAKE_SAMPLING_STAGE23_ENTRY(symbol, threads, items, variant_flags, smem) \
+  {reinterpret_cast<const void*>(&symbol), threads, items, variant_flags, smem},
 
-inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept, int32_t stream) {
+// Each variant ships a default build (fused_block_tail = 0, coarse_sample = 0: two-warp tail only,
+// 1/4 sampled first pass) and, when it carries the two-warp tail, a whole-CTA-tail twin
+// (fused_block_tail = 1) taken only by launch_flags bit 3 -- the extra code slowed every k <= 64
+// launch of a single build on sm_103a / sm_107a.  Streaming variants also ship a coarse-sample twin
+// (coarse_sample = 1: the first pass reads 1/8 of the row) taken only by launch_flags bit 4 -- a
+// runtime rate switch cost the k > 64 launches 1-2 %.
+inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept, int32_t stream,
+                                       int32_t block_tail, int32_t wide) {
   static const Stage1Variant kTable[] = {CAKE_SAMPLING_STAGE1_TABLE(CAKE_SAMPLING_STAGE1_ENTRY)};
   for (const Stage1Variant& v : kTable) {
-    if (v.cluster == cluster && v.ept == ept && v.stream == stream) return &v;
+    if (v.cluster == cluster && v.ept == ept && v.stream == stream &&
+        v.fused_block_tail == block_tail && v.coarse_sample == wide)
+      return &v;
   }
   return nullptr;
 }
 
-inline const Stage23Variant* FindStage23(int32_t threads, int32_t items) {
+inline const Stage23Variant* FindStage23(int32_t threads, int32_t items, int32_t variant_flags) {
   static const Stage23Variant kTable[] = {CAKE_SAMPLING_STAGE23_TABLE(CAKE_SAMPLING_STAGE23_ENTRY)};
   for (const Stage23Variant& v : kTable) {
-    if (v.threads == threads && v.items == items) return &v;
+    if (v.threads == threads && v.items == items && v.variant_flags == variant_flags) return &v;
   }
   return nullptr;
 }
@@ -116,6 +179,35 @@ inline void EnsureSmemAttribute(const void* kernel, int32_t smem_bytes) {
     CheckCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes),
               "cudaFuncSetAttribute(MaxDynamicSharedMemorySize)");
   }
+}
+
+// Clusters of more than 8 CTAs are a non-portable cluster size: the kernel's compile-time
+//   __cluster_dims__ is only honoured once the function opts in.
+inline void EnsureClusterAttribute(const void* kernel, int32_t cluster) {
+  if (cluster > 8) {
+    CheckCuda(cudaFuncSetAttribute(kernel, cudaFuncAttributeNonPortableClusterSizeAllowed, 1),
+              "cudaFuncSetAttribute(NonPortableClusterSizeAllowed)");
+  }
+}
+
+// One-time per (device, kernel) preparation: target check, dynamic shared memory opt-in and the
+//   non-portable cluster opt-in.  Function attributes persist for the process, and the runtime
+//   queries behind them (cudaDeviceGetAttribute x2, cudaFuncGetAttributes, cudaFuncSetAttribute)
+//   cost several microseconds each on Grace hosts -- for the stage-2/3 launch they sat between the
+//   two launches of the eager path, delaying the second kernel.
+inline void PrepareKernel(int32_t device_id, const void* kernel, int32_t smem_bytes,
+                          int32_t cluster) {
+  static std::mutex mutex;
+  static std::set<std::pair<int32_t, const void*>> prepared;
+  {
+    std::lock_guard<std::mutex> lock(mutex);
+    if (prepared.count({device_id, kernel}) != 0) return;
+  }
+  CheckTarget(device_id, kernel);
+  EnsureSmemAttribute(kernel, smem_bytes);
+  EnsureClusterAttribute(kernel, cluster);
+  std::lock_guard<std::mutex> lock(mutex);
+  prepared.insert({device_id, kernel});
 }
 
 inline void CheckSlab(const TensorView& vals, const TensorView& idx, const TensorView& count,
@@ -142,14 +234,49 @@ inline void CheckSlab(const TensorView& vals, const TensorView& idx, const Tenso
 //   topk_arr   int32 [batch] (only read when topk_kind == kTopKPerRow; pass any int32 CUDA tensor
 //   otherwise) cluster/ept/stream_variant select the frozen variant; a register-resident variant
 //   (stream_variant == 0) needs cluster * ept * threads >= vocab, a streaming one covers any vocab.
+//   launch_flags bit 0 (fused tail): every row whose k <= CAKE_SAMPLING_FUSED_TAIL_KCAP runs stage
+//   2/3 (top-p, sample, sorted write-back, renorm; same semantics and outputs as SparseTopPSample)
+//   inside this kernel, so the host must not launch SparseTopPSample afterwards; the stage-2/3
+//   arguments (topp_arr / topp_scalar / topp_kind / out_samples / out_renorm / seed / offset /
+//   emit_renorm) are only read then.  Rows with k above the fused capacity are left to
+//   SparseTopPSample, so the host sets bit 0 only when the largest top-k of the batch fits. Without
+//   it pass any valid CUDA tensors for the stage-2/3 tensors (they are never dereferenced).
+//   launch_flags bit 1 (early PDL trigger): the kernel signals griddepcontrol.launch_dependents
+//   early (a register-resident variant once its row is in registers, a streaming variant at the
+//   point bit 2 selects), so a programmatic-dependent SparseTopPSample launch is resident (spinning
+//   in its griddepcontrol.wait) when stage 1 ends.  Its CTAs are placed on the SMs free at that
+//   moment and keep that placement, so the host sets bit 1 only when the batch fits next to the
+//   last stage-1 wave (see cake_sampling.py); otherwise the trigger happens at CTA exit.
+//   launch_flags bit 2 (stream pre-pass trigger): with bit 1, a streaming variant triggers before
+//   its first pass instead of after its filter pass (Blackwell / Rubin win 0.5-1 us there, Hopper
+//   loses 1.4-1.9 us, so the host sets it for compute capability >= 10).  Residents ignore it.
+//   launch_flags bit 3 (whole-CTA tail): on a variant built with it (manifest fused_block_tail),
+//   every row whose k <= CAKE_SAMPLING_FUSED_BLOCK_TAIL_KCAP runs stage 2/3 inside this kernel
+//   (rows with k <= CAKE_SAMPLING_FUSED_TAIL_KCAP on the two-warp tail, larger rows on rank 0's
+//   whole CTA), with the same outputs as SparseTopPSample; exclusive with bit 0, and the host sets
+//   it only when the largest top-k fits and the stage-1 grid is a single wave (see
+//   cake_sampling.py).
+//   launch_flags bit 4 (coarse sample): selects a streaming variant's coarse-sample build (manifest
+//   coarse_sample), whose sampled first pass reads 1/8 of the row instead of 1/4; the exact passes
+//   are the same and every output is bit-identical.  The host sets it for launches whose largest
+//   top-k fits the two-warp tail (rows at the gather capacity lose with the coarser estimate); the
+//   kernel itself never sees the bit.
+//   launch_flags bit 5 (row-span filter arm): a streaming variant's filter pass picks its
+//   float-threshold arm from the expected candidate density of the whole row (cluster-wide sampled
+//   mass vs the cluster's span) instead of one CTA's span; both arms build identical candidate
+//   segments, so every output is bit-identical.  The host sets it for cluster >= 8 streams whose
+//   largest top-k exceeds the two-warp tail on compute capability 9.0 / 10.0 / 10.3 (round 6, lever
+//   FD5: those k ~ 1000 cells run 2-5 % faster; cluster-1 rows can lose with the arm, Rubin is
+//   neutral).  Rejected on register-resident variants.  Other bits are ignored.
 void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64_t topk_kind,
                TensorView out_vals, TensorView out_idx, TensorView out_count, int64_t cluster,
-               int64_t ept, int64_t stream_variant, int64_t cuda_stream) {
+               int64_t ept, int64_t stream_variant, TensorView topp_arr, double topp_scalar,
+               int64_t topp_kind, TensorView out_samples, TensorView out_renorm, int64_t seed,
+               int64_t offset, int64_t emit_renorm, int64_t launch_flags, int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(probs);
   const int32_t device_id = probs.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckTarget(device_id);
   CHECK_INPUT_TYPE(probs, dl_float32);
   TVM_FFI_ICHECK(probs.ndim() == 2) << "probs must have shape [batch, vocab]";
   TVM_FFI_ICHECK(probs.stride(1) == 1 && probs.stride(0) == probs.size(1))
@@ -173,15 +300,75 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
         << "top_k must be in [1, " << kSlab << "]";
   }
   TVM_FFI_ICHECK(stream_variant == 0 || stream_variant == 1) << "stream_variant must be 0 or 1";
-  const Stage1Variant* v = FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
-                                      static_cast<int32_t>(stream_variant));
-  TVM_FFI_ICHECK(v != nullptr) << "no frozen stage-1 variant for cluster=" << cluster
-                               << " ept=" << ept << " stream=" << stream_variant;
+  TVM_FFI_ICHECK(launch_flags >= 0) << "launch_flags must be non-negative";
+  const int32_t want_block_tail = (launch_flags & kFlagFuseBlockTail) != 0 ? 1 : 0;
+  const int32_t want_coarse = (launch_flags & kFlagCoarseSample) != 0 ? 1 : 0;
+  TVM_FFI_ICHECK(!(want_coarse && stream_variant == 0))
+      << "the coarse-sample build (launch_flags bit 4) exists for streaming variants only";
+  TVM_FFI_ICHECK(!(want_coarse && want_block_tail))
+      << "launch_flags bits 3 and 4 (whole-CTA tail and coarse sample) are exclusive";
+  TVM_FFI_ICHECK(!((launch_flags & kFlagRowSpanDiet) != 0 && stream_variant == 0))
+      << "the row-span filter arm (launch_flags bit 5) exists for streaming variants only";
+  const Stage1Variant* v =
+      FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
+                 static_cast<int32_t>(stream_variant), want_block_tail, want_coarse);
+  TVM_FFI_ICHECK(v != nullptr)
+      << "no frozen stage-1 variant for cluster=" << cluster << " ept=" << ept
+      << " stream=" << stream_variant
+      << (want_block_tail ? " with the whole-CTA tail build (launch_flags bit 3)" : "")
+      << (want_coarse ? " with the coarse-sample build (launch_flags bit 4)" : "");
+  PrepareKernel(device_id, v->kernel, v->smem_bytes, v->cluster);
   TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept
       << " does not cover vocab=" << vocab;
+  CHECK_CUDA(topp_arr);
+  CHECK_CUDA(out_samples);
+  CHECK_CUDA(out_renorm);
+  TVM_FFI_ICHECK(launch_flags >= 0) << "launch_flags must be non-negative";
+  const bool fuse_warp_tail = (launch_flags & kFlagFuseTail) != 0;
+  const bool fuse_block_tail = (launch_flags & kFlagFuseBlockTail) != 0;
+  TVM_FFI_ICHECK(!(fuse_warp_tail && fuse_block_tail))
+      << "launch_flags bits 0 and 3 (two-warp and whole-CTA tails) are exclusive";
+  const bool fuse_tail = fuse_warp_tail || fuse_block_tail;
+  if (fuse_warp_tail) {
+    TVM_FFI_ICHECK(v->fused_tail == 1)
+        << "stage-1 variant cluster=" << cluster << " ept=" << ept << " stream=" << stream_variant
+        << " is built without the fused tail (manifest fused_tail = false)";
+    TVM_FFI_ICHECK(topk_kind == kTopKPerRow || topk_scalar <= kFusedTailKCap)
+        << "the fused tail (launch_flags bit 0) needs top_k <= " << kFusedTailKCap;
+  }
+  if (fuse_block_tail) {
+    TVM_FFI_ICHECK(v->fused_block_tail == 1)
+        << "stage-1 variant cluster=" << cluster << " ept=" << ept << " stream=" << stream_variant
+        << " is built without the whole-CTA tail (manifest fused_block_tail = false)";
+    TVM_FFI_ICHECK(topk_kind == kTopKPerRow || topk_scalar <= kFusedBlockTailKCap)
+        << "the whole-CTA tail (launch_flags bit 3) needs top_k <= " << kFusedBlockTailKCap;
+  }
+  if (fuse_tail) {
+    CHECK_INPUT_TYPE(topp_arr, dl_float32);
+    TVM_FFI_ICHECK(topp_kind == kTopPScalar || topp_kind == kTopPPerRow) << "invalid topp_kind";
+    if (topp_kind == kTopPPerRow) {
+      CHECK_DEVICE(probs, topp_arr);
+      TVM_FFI_ICHECK(topp_arr.ndim() == 1 && topp_arr.size(0) >= batch)
+          << "topp_arr must have shape [batch]";
+    } else {
+      TVM_FFI_ICHECK(topp_scalar > 0.0 && topp_scalar <= 1.0) << "top_p must be in (0, 1]";
+    }
+    CHECK_INPUT_TYPE(out_samples, dl_int32);
+    CHECK_DEVICE(probs, out_samples);
+    CHECK_CONTIGUOUS(out_samples);
+    TVM_FFI_ICHECK(out_samples.ndim() == 1 && out_samples.size(0) >= batch)
+        << "out_samples must have shape [>= batch]";
+    CHECK_INPUT_TYPE(out_renorm, dl_float32);
+    if (emit_renorm != 0) {
+      CHECK_DEVICE(probs, out_renorm);
+      CHECK_CONTIGUOUS(out_renorm);
+      TVM_FFI_ICHECK(out_renorm.ndim() == 2 && out_renorm.size(0) >= batch &&
+                     out_renorm.size(1) == kSlab)
+          << "out_renorm must have shape [>= batch, " << kSlab << "]";
+    }
+  }
   if (batch == 0) return;
-  EnsureSmemAttribute(v->kernel, v->smem_bytes);
 
   float* probs_ptr = static_cast<float*>(probs.data_ptr());
   int* topk_ptr = static_cast<int*>(topk_arr.data_ptr());
@@ -191,8 +378,25 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
   int vocab_i = static_cast<int>(vocab);
   int topk_i = static_cast<int>(topk_scalar);
   int kind_i = static_cast<int>(topk_kind);
-  void* args[] = {&probs_ptr, &topk_ptr, &vals_ptr, &idx_ptr,
-                  &count_ptr, &vocab_i,  &topk_i,   &kind_i};
+  float* topp_ptr = static_cast<float*>(topp_arr.data_ptr());
+  int* samples_ptr = static_cast<int*>(out_samples.data_ptr());
+  float* renorm_ptr = static_cast<float*>(out_renorm.data_ptr());
+  float topp_f = static_cast<float>(topp_scalar);
+  int pkind_i = static_cast<int>(topp_kind);
+  const uint64_t seed_u = static_cast<uint64_t>(seed);
+  const uint64_t offset_u = static_cast<uint64_t>(offset);
+  unsigned int seed_lo = static_cast<unsigned int>(seed_u & 0xFFFFFFFFu);
+  unsigned int seed_hi = static_cast<unsigned int>(seed_u >> 32);
+  unsigned int offset_lo = static_cast<unsigned int>(offset_u & 0xFFFFFFFFu);
+  unsigned int offset_hi = static_cast<unsigned int>(offset_u >> 32);
+  int renorm_i = emit_renorm != 0 ? 1 : 0;
+  int flags_i =
+      static_cast<int>(launch_flags & (kFlagFuseTail | kFlagEarlyTrigger | kFlagStreamPrepass |
+                                       kFlagFuseBlockTail | kFlagRowSpanDiet));
+  // Argument order = the frozen kernel signature (see the generated source).
+  void* args[] = {&probs_ptr, &topk_ptr,  &vals_ptr,    &idx_ptr,    &count_ptr, &vocab_i, &topk_i,
+                  &kind_i,    &topp_ptr,  &samples_ptr, &renorm_ptr, &topp_f,    &pkind_i, &seed_lo,
+                  &seed_hi,   &offset_lo, &offset_hi,   &renorm_i,   &flags_i};
 
   cudaLaunchConfig_t config = {};
   config.gridDim = dim3(static_cast<uint32_t>(batch * v->cluster), 1, 1);
@@ -212,12 +416,12 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
 void SparseTopPSample(TensorView vals, TensorView idx, TensorView count, TensorView topp_arr,
                       double topp_scalar, int64_t topp_kind, TensorView out_samples,
                       TensorView out_renorm, int64_t seed, int64_t offset, int64_t emit_renorm,
-                      int64_t threads, int64_t items, int64_t enable_pdl, int64_t cuda_stream) {
+                      int64_t threads, int64_t items, int64_t variant_flags, int64_t enable_pdl,
+                      int64_t cuda_stream) {
   TVM_FFI_ICHECK(cuda_stream >= 0) << "cuda_stream must be a non-negative stream handle";
   CHECK_CUDA(out_samples);
   const int32_t device_id = out_samples.device().device_id;
   ffi::CUDADeviceGuard device_guard(device_id);
-  CheckTarget(device_id);
   CHECK_INPUT_TYPE(out_samples, dl_int32);
   TVM_FFI_ICHECK(out_samples.ndim() == 1) << "out_samples must have shape [batch]";
   CHECK_CONTIGUOUS(out_samples);
@@ -245,11 +449,13 @@ void SparseTopPSample(TensorView vals, TensorView idx, TensorView count, TensorV
                    out_renorm.size(1) == kSlab)
         << "out_renorm must have shape [>= batch, " << kSlab << "]";
   }
-  const Stage23Variant* v = FindStage23(static_cast<int32_t>(threads), static_cast<int32_t>(items));
+  TVM_FFI_ICHECK(variant_flags >= 0 && variant_flags <= 0x7FFFFFFF) << "variant_flags out of range";
+  const Stage23Variant* v = FindStage23(static_cast<int32_t>(threads), static_cast<int32_t>(items),
+                                        static_cast<int32_t>(variant_flags));
   TVM_FFI_ICHECK(v != nullptr) << "no frozen stage-2/3 variant for threads=" << threads
-                               << " items=" << items;
+                               << " items=" << items << " variant_flags=" << variant_flags;
+  PrepareKernel(device_id, v->kernel, v->smem_bytes, 1);
   if (batch == 0) return;
-  EnsureSmemAttribute(v->kernel, v->smem_bytes);
 
   float* vals_ptr = static_cast<float*>(vals.data_ptr());
   int* idx_ptr = static_cast<int*>(idx.data_ptr());

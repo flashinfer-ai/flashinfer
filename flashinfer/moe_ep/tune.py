@@ -1,45 +1,24 @@
-"""Offline knob tuner for the cutedsl mega-MoE path (CLI shim).
+"""Offline tuning for CuTe DSL MegaMoE backends.
 
-This module is only the command-line frontend: it parses arguments and
-dispatches to the tuner that lives NEXT TO the backend being tuned
-(``backends/mega/kernel/sm100/nvfp4_nvfp4_bf16_cutedsl/tuner.py`` for
-``--dtype nvfp4``, ``.../mxfp8_mxfp8_bf16_cutedsl/tuner.py`` for the mxfp8
-kinds, ``.../bf16_bf16_bf16_cutedsl/tuner.py`` for ``bf16`` and
-``.../bf16_mxfp8_bf16_cutedsl/tuner.py`` for the mixed kinds).  Shared sweep
-machinery lives in ``backends/mega/kernel/tuning.py``.
+``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The
+``sm90_fp8_*`` dtypes select the Hopper tuner. BF16 and mixed BF16/MXFP8
+are supported by the SM100 tuner only.
 
-The sweep runs the collective autotune OUTSIDE any serving engine and
-persists the winners in the knob cache (see
-``kernel_src/sm100/cutedsl_megamoe/shim/knob_cache.py``). After tuning, an engine
-that constructs the mega layer with ``knobs=None`` (the default) resolves the
-recorded winner with a pure dict lookup — no compiles, no collectives, no
-timing on the hot path.
+Match the deployment's GPU, EP world size, geometry, and token capacity::
 
-Run with the SAME EP world size, GPU model, and geometry as production.
-Multi-rank (matches a 4-GPU EP deployment)::
-
-    torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \\
-        --dtype nvfp4 --hidden 7168 --intermediate 2048 \\
+    torchrun --nproc_per_node=4 -m flashinfer.moe_ep.tune \
+        --dtype nvfp4 --hidden 7168 --intermediate 2048 \
         --num-experts 256 --topk 8 --max-tokens 8 512 2048
 
-Single-rank (no torchrun)::
-
-    MEGA_NO_DIST=1 python -m flashinfer.moe_ep.tune --dtype nvfp4 ...
-
-``--intermediate`` is the model's post-SwiGLU width (the
-``*MegaMoeConfig.intermediate_size`` convention); the shim-level conversion
-(NVFP4 sessions size fc1 as ``2 * intermediate``) is applied internally, so
-recorded cache keys match engine-time lookups exactly.
-
-Nondeterministic candidates (``in_kernel_fc2_reduce``) are EXCLUDED by
-default; pass ``--allow-nondeterministic`` to sweep them (a recorded ikr
-winner makes the engine's output accumulation order nondeterministic).  The
-engine still must opt into ``enable_in_kernel_fc2_reduce=True``.
+``--intermediate`` is the post-SwiGLU width. Use ``MEGA_NO_DIST=1`` for
+single-rank tuning. Atomic reduction candidates require
+``--allow-nondeterministic`` and an engine configuration that enables IKR.
 """
 
 from __future__ import annotations
 
 import argparse
+import importlib
 import sys
 from typing import List, Optional
 
@@ -68,6 +47,13 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=("per_tensor", "blockwise"),
         default="per_tensor",
         help="FP8 scale ABI (sm90_fp8_* dtypes only)",
+    )
+    parser.add_argument(
+        "--arch",
+        choices=("auto", "sm90", "sm100", "sm107"),
+        default="auto",
+        help="backend family; auto selects sm107 on Rubin, sm100 otherwise; "
+        "sm90_fp8_* dtypes select sm90",
     )
     parser.add_argument("--hidden", type=int, required=True)
     parser.add_argument(
@@ -146,35 +132,50 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_arch(arch: str) -> str:
+    if arch != "auto":
+        return arch
+    import torch
+
+    if torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 7):
+        return "sm107"
+    return "sm100"
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     args = _parse_args(argv)
     if args.combine_dtype != "bf16" and args.dtype != "nvfp4":
         print("--combine-dtype is only wired for --dtype nvfp4", file=sys.stderr)
         return 2
 
-    if args.dtype == "nvfp4":
-        from .backends.mega.kernel.sm100.nvfp4_nvfp4_bf16_cutedsl.tuner import (
-            run_tuning,
-        )
-    elif args.dtype.startswith("sm90_fp8"):
-        from .backends.mega.kernel.sm90.fp8_fp8_bf16_pull_cutedsl.tuner import (
-            run_tuning as run_sm90_tuning,
-        )
-
-        return run_sm90_tuning(args)
-    elif args.dtype == "bf16":
-        from .backends.mega.kernel.sm100.bf16_bf16_bf16_cutedsl.tuner import (
-            run_tuning,
-        )
-    elif args.dtype.startswith("bf16_mxfp8"):
-        from .backends.mega.kernel.sm100.bf16_mxfp8_bf16_cutedsl.tuner import (
-            run_tuning,
-        )
+    if args.dtype.startswith("sm90_fp8"):
+        if args.arch not in ("auto", "sm90"):
+            print("sm90_fp8_* dtypes require --arch auto or sm90", file=sys.stderr)
+            return 2
+        family = "sm90"
+        backend = "fp8_fp8_bf16_pull_cutedsl"
     else:
-        from .backends.mega.kernel.sm100.mxfp8_mxfp8_bf16_cutedsl.tuner import (
-            run_tuning,
-        )
-    return run_tuning(args)
+        family = _resolve_arch(args.arch)
+        if family == "sm90" or (family == "sm107" and args.dtype.startswith("bf16")):
+            print(f"--dtype {args.dtype} is unsupported on {family}", file=sys.stderr)
+            return 2
+        if args.dtype == "nvfp4":
+            backend = "nvfp4_nvfp4_bf16_cutedsl"
+        elif args.dtype == "bf16":
+            backend = "bf16_bf16_bf16_cutedsl"
+        elif args.dtype.startswith("bf16_mxfp8"):
+            backend = "bf16_mxfp8_bf16_cutedsl"
+        else:
+            backend = "mxfp8_mxfp8_bf16_cutedsl"
+
+    if family == "sm107" and args.combine_dtype != "bf16":
+        print("SM107 supports --combine-dtype bf16 only", file=sys.stderr)
+        return 2
+
+    tuner = importlib.import_module(
+        f".backends.mega.kernel.{family}.{backend}.tuner", __package__
+    )
+    return tuner.run_tuning(args)
 
 
 if __name__ == "__main__":

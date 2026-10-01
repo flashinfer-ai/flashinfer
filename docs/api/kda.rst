@@ -18,11 +18,12 @@ entry point for every phase. The public ``recurrent_kda`` classifies the call
 and serves decode and speculative decode through the same shared decode
 dispatcher that :ref:`apikda_decode` uses, while dispatching eligible ordinary
 multi-token prefill to the optimized backend described in
-:ref:`apikda_prefill`. Which
-prefill backend that is depends on the device: SM100a and SM103a use the frozen
-FlashKDA-compatible kernels, SM120a uses a CuTe-DSL backend of its own. The two
-architecture sets are disjoint, so the public signature and every call outside
-the eligible prefill subset are unaffected either way.
+:ref:`apikda_prefill`. The automatic prefill selection depends on the device
+and workload: eligible SM100a and SM103a calls with small logical
+batch-times-head count use the bundled small-BH CuTe-DSL kernel; other calls
+follow the standard SM100-family CuTe-DSL/Cake policy. SM120a uses a CuTe-DSL
+backend of its own. These prefill routes leave decode and speculative-decode
+dispatch unchanged.
 
 .. currentmodule:: flashinfer.kda
 
@@ -30,6 +31,77 @@ the eligible prefill subset are unaffected either way.
     :toctree: ../generated
 
     recurrent_kda
+
+Static PTX prefill on B300
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``flashinfer.recurrent_kda(..., backend="ptx")`` explicitly selects four
+retained PTX programs from `NVlabs/kda (260927-kda-for-kda)
+<https://github.com/NVlabs/kda/tree/ea37ebaff74c88a2545751dcb8ea8ef6c6251b67/ptx>`_.
+The programs target SM103a (B300) and use persistent recurrence scheduling
+with exact FP32 state handoff between pieces. The default backend selection
+is unchanged.
+
+Install ``nvidia-cuda-nvcc>=13.2`` and ``apache-tvm-ffi>=0.1.12`` in addition
+to FlashInfer's regular dependencies. The retained PTX uses ISA 9.2. It is
+assembled once with ptxas >= 13.2 and embedded as a cubin, allowing execution
+with a CUDA 13 driver that cannot JIT PTX 9.2 directly. A C++17 host compiler
+and CUDA driver headers (provided by Triton) are needed for the FFI shims.
+``FLASHINFER_KDA_PTXAS`` selects the assembler;
+``FLASHINFER_KDA_PTX_CACHE_DIR`` overrides the default FlashInfer JIT cubin
+cache directory. No build output is written into the installed package. This backend is
+JIT-only and is unavailable with ``FLASHINFER_DISABLE_JIT=1`` in a fresh
+process.
+
+Supported inputs are contiguous CUDA BF16 ``q/k/v/g [1, T, H, 128]`` with
+``T >= 32`` and ``H`` equal to 64 or 96, BF16 beta logits ``[1, T, H]``, FP32
+``A_log [H]`` and ``dt_bias [H, 128]`` (or flattened). All tensors must share
+a device. Q/K L2 normalization, the gate
+``-5 * sigmoid(exp(A_log) * (g + dt_bias))``, and beta sigmoid are fused.
+The normalization denominator is ``sqrt(sum(x*x) + 1e-6)``.
+
+Use either one fixed sequence or strictly increasing int32/int64 packed
+``cu_seqlens [N+1]`` starting at zero and ending at ``T``. Each sequence must
+have 1 through 16384 tokens. State is FP32 V-first ``[N, H, 128, 128]``;
+when provided, it is updated in place even if ``output_final_state=False``.
+Omitted initial state means zero initialization. Output is BF16. The retained
+MMA kernels require finite initial state with absolute values <= 4096;
+callers must preserve this value constraint when changing graph inputs.
+Unsupported hardware, shapes, gate modes, strided inputs, indexed state
+pools, speculative decode and checkpoints are rejected explicitly.
+
+Planning reads packed offsets and validates the state range on the host.
+For CUDA Graph capture, warm an explicit ``RecurrentKDAPrefillWorkspace``
+with the exact tensors, preallocate ``output``, and capture on the same
+stream. Retain the workspace for the graph lifetime. Packed offsets must
+remain unchanged during capture/replay; activations and state values may
+change within the documented contract. A captured workspace cannot be
+replanned or used for another capture. Separate workspaces isolate streams.
+
+.. code-block:: python
+
+    workspace = flashinfer.RecurrentKDAPrefillWorkspace(device=q.device)
+    out = torch.empty_like(v)
+    # Warm this call before capturing it on the same CUDA stream.
+    out, state = flashinfer.recurrent_kda(
+        q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias,
+        initial_state=state, output_final_state=True,
+        use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True,
+        beta_is_logit=True, lower_bound=-5.0, cu_seqlens=cu_seqlens,
+        output=out, prefill_workspace=workspace, backend="ptx",
+    )
+
+The reproducible INT21 benchmark compares the complete captured public call
+with raw MoonshotAI/FlashKDA, including final-state writeback. Both use evolving
+FP32 state, reset before each trial. Timing is cold-L2 CUPTI GPU activity;
+planning, allocation, compilation and capture are excluded. The JSON report
+includes per-shape latencies, correctness, trial medians and baseline identity.
+
+.. code-block:: bash
+
+    python benchmarks/bench_recurrent_kda_ptx.py \
+        --flash-kda-source-dir /path/to/FlashKDA --output ptx-results.json
+    pytest tests/kda/test_recurrent_kda_ptx.py
 
 .. _apikda_decode:
 
@@ -51,6 +123,16 @@ Key-Driven Attention (KDA) decode API. The CuTe-DSL kernel lives under
 The public ``recurrent_kda`` API supports standard decode with one token per
 sequence (``T=1``) and packed speculative decode with two or more tokens per
 sequence (``T>=2``).
+
+``fused_kda_decode`` combines width-four causal convolution, one KDA update,
+and gated RMSNorm for ``T=1``. ``packed_fused_kda_decode`` extends the same
+pipeline to packed ragged speculative decode, retaining one recurrent
+checkpoint per token and an extended rolling convolution window. Its optional
+``t1_state_indices`` argument is a T=1-only fast path containing caller-resolved
+per-row cache slots. T>1 always uses the ``state_indices[N, T]``,
+``query_start_loc``, and ``num_accepted_tokens`` metadata with the multitoken
+kernel; passing ``t1_state_indices`` for T>1 is rejected. No T>1 kernel
+behavior or performance is changed by this optimization.
 
 Pass ``backend="cake"`` to select the exported Cake backend. On SM100-family
 SM100a (B200/GB200) and SM103a (B300/GB300) devices, its D128 ``T=1..6``
@@ -167,6 +249,7 @@ small ``B * HV * T``. Requires SM90+ for the WY path and ``K = V = 128``;
     :toctree: ../generated
 
     fused_kda_decode
+    packed_fused_kda_decode
     packed_kda_decode
     recurrent_kda
 
@@ -549,3 +632,87 @@ ceiling is, and above it every call rebuilds its plan — about 7.3 ms against a
 should rotate fewer buffer sets, or call
 ``flashinfer.kda_kernels.sm120_prefill.clear_kda_prefill_sm120_caches()``,
 which releases all of it.
+
+Persistent CuTe DSL prefill with FP32 state
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``recurrent_kda(..., backend="cute-dsl-persistent")`` selects the persistent
+M128/BT32 kernel adapted from
+`humanfia/kda-for-kda-release <https://github.com/humanfia/kda-for-kda-release>`_.
+It fuses Q/K L2 normalization, the bounded K3 gate, beta sigmoid, preparation,
+triangular solves and recurrence. A continuous five-stage preparation pipeline
+is shared across each CTA's sequence/head chains. Recurrent state and
+inter-CTA state handoffs use FP32; tensor-core operands and output use BF16.
+Values, states and outputs up to about ``2**69`` in magnitude stay finite:
+the BF16 state operand is stored scaled by ``2**-57`` so that the anchored
+decay factors cannot overflow the FP32 accumulators.
+
+The work schedule is derived per call from a cost model, independent of
+specific sequence lengths or SM counts. Whole (sequence, head) chains are
+packed longest-processing-time first onto at most one CTA per SM. When
+cutting chains lowers the modelled makespan by at least 5%, the scheduler
+either cuts short heads off the longest chains or wraps chains across CTAs.
+Every cut piece hands FP32 state from a producer that leads its CTA to a
+consumer that ends another one, so no producer waits on a consumer. A
+sequence's partial last chunk is loaded as a full tile and masked.
+The gate-prefix table remains FP32 on all routes. FP32 state storage does not
+make the arithmetic an FP32-only recurrence: tensor-core operands, residual
+updates and beta carriers are rounded to BF16. In particular, near-unit decay
+can retain operand-rounding error across many chunks. The INT21 benchmark
+uses the source contract: relative L2 error at most 3%, with each element's
+error bounded by the larger of 0.5 times reference RMS and 5% of its magnitude.
+Short-sequence tests additionally compare with an independent FP64 recurrence.
+
+This backend is explicitly selected and requires SM100 or SM103 with
+``nvidia-cutlass-dsl>=4.7.0``. Its supported contract is:
+
+* contiguous, 16-byte-aligned BF16 Q/K/V/G ``[B,T,H,128]`` and beta
+  ``[B,T,H]``, with ``T > 1``, positive H divisible by eight and
+  ``B*T*H*128 < 2**31``;
+* contiguous FP32 ``A_log[H]`` and ``dt_bias[H*128]`` or ``dt_bias[H,128]``;
+* ``use_qk_l2norm_in_kernel=True``, ``use_gate_in_kernel=True``,
+  ``beta_is_logit=True`` and ``-5 <= lower_bound < 0``;
+* optional contiguous, 32-byte-aligned FP32 state ``[N,H,128,128]`` in
+  value-first order, with ``N*H*128*128 < 2**31``, updated in place even when
+  ``output_final_state=False``;
+* fixed batches or packed ``B=1`` sequences with contiguous CUDA int32/int64
+  ``cu_seqlens[N+1]``. Offsets start at zero, end at the total token count,
+  and are strictly increasing; empty sequences are rejected;
+* an optional contiguous BF16 output buffer, disjoint from every input.
+
+State pools/indices, checkpoints, external sequence ordering, unbounded gates,
+GQA, speculative decode and frozen-state mode are outside this backend's
+contract. Calls requesting them raise an error. Other backend choices retain
+their existing behavior.
+
+For CUDA Graphs, supply a ``RecurrentKDAPrefillWorkspace`` and preallocated
+output. Warm the exact tensors on the capture stream, then synchronize before
+capture. One workspace belongs to one captured call; it cannot subsequently be
+used by Python eager calls or another capture. The workspace and buffers must
+outlive the graph. Q/K/V/G, beta, gate parameters and state contents may change
+between replays, but sequence offsets and scalar arguments must stay fixed.
+Handoff flags are cleared on the launch stream before every invocation, so
+captured replays can be interleaved with independent eager calls.
+Launches use no thread-block clusters. Split schedules rely on the full
+persistent grid being resident. Serialize independent split-grid invocations; overlapping
+them on separate CUDA streams is not supported.
+
+In eager mode, offset values are read on the host to prepare the schedule;
+this also detects edits made under ``torch.inference_mode``. Only the most
+recent schedule is retained per stream or explicit workspace. A returned
+final state with no supplied initial state is caller-owned in implicit eager
+mode and workspace-owned when using an explicit workspace.
+
+The six INT21 workloads use 8192 total tokens, H96/H64 and D128: one sequence,
+eight 1024-token sequences, or lengths ``[1300,547,2048,963,271,3063]``. The
+benchmark checks both output and state against FLA and compares the captured
+public call with a source-identified MoonshotAI/FlashKDA build using cold-L2
+CUPTI GPU timings::
+
+    python benchmarks/bench_recurrent_kda_persistent.py \
+        --flash-kda-source-dir /path/to/FlashKDA --output results.json
+
+Install ``fla-core==0.5.2`` and ``cupti-python`` to run the benchmark. Both
+arms update state in place, resetting it outside each timing trial. JSON
+results include absolute latencies, every trial median, the baseline revision
+and extension digest, software versions and the six-shape geometric mean.

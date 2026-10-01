@@ -39,9 +39,15 @@ def main():
     ap.add_argument(
         "--cupti", action="store_true", help="CUPTI kernel time (cupti-python >= 13)"
     )
+    ap.add_argument(
+        "--skip-joint",
+        action="store_true",
+        help="skip the joint rejection-sampler arm (very slow for small k at large V)",
+    )
     args = ap.parse_args()
     print(
-        f"{'V':>7} {'B':>4} {'route':>22} {'top_k_first':>12} {'joint':>10} {'cake':>10} {'speedup':>8}"
+        f"{'V':>7} {'B':>4} {'route':>22} {'top_k_first':>12} {'joint':>10} {'cake':>10} {'speedup':>8}",
+        flush=True,
     )
     for vocab in (int(v) for v in args.vocabs.split(",")):
         for batch in (int(b) for b in args.batches.split(",")):
@@ -57,11 +63,15 @@ def main():
                 ),
                 **kw,
             )
-            t_joint = bench_gpu_time(
-                lambda: fs.top_k_top_p_sampling_from_probs(
-                    probs, k, p, filter_apply_order="joint"
-                ),
-                **kw,
+            t_joint = (
+                [float("nan")]
+                if args.skip_joint
+                else bench_gpu_time(
+                    lambda: fs.top_k_top_p_sampling_from_probs(
+                        probs, k, p, filter_apply_order="joint"
+                    ),
+                    **kw,
+                )
             )
             t_cake = bench_gpu_time(
                 lambda: top_k_top_p_sampling_from_probs(probs, k, p), **kw
@@ -69,7 +79,8 @@ def main():
             med = lambda t: 1000.0 * sorted(t)[len(t) // 2]
             route = cake_sampling_route(probs, k)
             print(
-                f"{vocab:>7} {batch:>4} {route:>22} {med(t_first):>10.1f}us {med(t_joint):>8.1f}us {med(t_cake):>8.1f}us {med(t_first) / med(t_cake):>7.2f}x"
+                f"{vocab:>7} {batch:>4} {route:>22} {med(t_first):>10.1f}us {med(t_joint):>8.1f}us {med(t_cake):>8.1f}us {med(t_first) / med(t_cake):>7.2f}x",
+                flush=True,
             )
 
 
