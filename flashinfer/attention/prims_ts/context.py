@@ -1604,8 +1604,8 @@ def _resolve_paged_plan_geometry(
 
 
 def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
-    """Dense contiguous MHA at D=128 with bf16 QK runs the two-CTA UMMA form, which
-    pairs Q tiles through the grid."""
+    """Dense contiguous MHA or GQA at D=128 with bf16 QK runs the two-CTA UMMA
+    form, which pairs adjacent Q tiles of one head through the grid."""
     return (
         _default_two_cta_umma(geometry.device_index)
         and geometry.head_dim == 128
@@ -1613,7 +1613,6 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
         and geometry.mask_type == "dense"
         and not geometry.packed
         and not geometry.head_paired
-        and geometry.num_qo_heads == geometry.num_kv_heads
         and torch.finfo(geometry.qk_dtype).bits == 16
         and torch.finfo(geometry.pv_dtype).bits in (8, 16)
     )
