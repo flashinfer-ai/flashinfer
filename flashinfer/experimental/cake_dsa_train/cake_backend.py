@@ -859,6 +859,40 @@ def offset_gather_kv_indices(
     return out
 
 
+_SLOT_POSITIONS: dict[tuple, torch.Tensor] = {}
+
+
+def _slot_positions(topk: int, device: torch.device) -> torch.Tensor:
+    """Cached ``[1 .. topk]`` int32 on ``device`` (constant per problem)."""
+    key = (int(topk), str(device))
+    pos = _SLOT_POSITIONS.get(key)
+    if pos is None:
+        pos = torch.arange(1, int(topk) + 1, device=device, dtype=torch.int32)
+        _SLOT_POSITIONS[key] = pos
+    return pos
+
+
+def derive_topk_length(indices: torch.Tensor, num_kv: int) -> torch.Tensor:
+    """``[T]`` int32: position of the last valid slot + 1 per row (0 for a fully masked row).
+
+    The public entries' default when the caller passes no ``topk_length``: a slot
+    is valid iff ``0 <= idx < num_kv`` (``idx == clamp(idx, 0, num_kv - 1)`` for
+    int32 ``idx``), every slot past the last valid one is invalid, so the kernels
+    may skip the trailing invalid key blocks while the masking semantics -- and
+    the results -- stay those of the full row.  Four small launches (clamp, eq,
+    where, amax) on device, no host synchronization.
+    """
+    if indices.ndim != 2 or indices.dtype != torch.int32:
+        raise ValueError("indices must be an int32 [T, topk] tensor")
+    T, topk = indices.shape
+    S = int(num_kv)
+    if S < 1:
+        return torch.zeros((T,), dtype=torch.int32, device=indices.device)
+    pos = _slot_positions(topk, indices.device)
+    valid = indices == indices.clamp(0, S - 1)
+    return torch.where(valid, pos, 0).amax(dim=-1)
+
+
 # ---------------------------------------------------------------------------
 # Launch binding
 # ---------------------------------------------------------------------------
@@ -2422,9 +2456,15 @@ def dsa_sparse_attention(
     is the packed segment count of the key row (``len(cu_seqlens_k) - 1`` for
     a packed batch; :func:`dsa_sparse_attention_varlen` passes it): the
     backward's whole-row key-range passes apply to one-segment rows only.
+    Without ``topk_length`` the per-row lengths are derived once per step
+    (:func:`derive_topk_length`: last valid slot + 1, counted in the forward
+    time, saved for the backward) so the kernels skip the trailing invalid
+    key blocks of short rows; the results are those of the full row.
     """
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
+    if topk_length is None and q_latent.shape[0] > 0:
+        topk_length = derive_topk_length(indices, int(kv_latent.shape[0]))
     out, lse = DSASparseAttentionFunction.apply(
         q_latent,
         q_rope,

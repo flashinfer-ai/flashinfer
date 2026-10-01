@@ -52,6 +52,7 @@ from flashinfer.experimental.cake_dsa_train.cake_backend import (
     key_pass_dq_mode,
     key_pass_ranges,
     offset_gather_kv_indices,
+    derive_topk_length,
     plan_key_passes,
     prepare_dsa_train,
     record_abi,
@@ -1560,6 +1561,37 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
     _check_backward(single, ref, canonical=True)
     assert rel_l2(grads[0], single[0]) < 1e-3 and rel_l2(grads[1], single[1]) < 1e-3
     assert max(rel_l2(grads[2], single[2]), rel_l2(grads[3], single[3])) < 1e-2
+
+
+def test_public_entry_derives_row_lengths_and_matches_full_rows():
+    """Without ``topk_length`` the public entry derives the per-row length (last valid slot + 1) and the kernels skip
+    the trailing invalid blocks: on documents shorter than top-k (most slots ``-1``) the forward / backward equal the
+    explicit full-length call bitwise (out, lse, dq) and within the FP32 reduction spread (dkv), and match the
+    reference."""
+    _require_program(backward=True)
+    inp = make_inputs([200, 96, 300], [200, 96, 4096], seed=SEED + 752, topk=256)
+    S = inp.kv_latent.shape[0]
+    derived = derive_topk_length(inp.idx_global, S)
+    assert torch.equal(derived, inp.topk_length)  # the generator's rows are valid-first: last valid + 1 == count
+    assert int(derived.max()) <= 256 and int((derived < 256).sum()) > 0
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    leaves_a = [t.detach().clone().requires_grad_() for t in args]
+    leaves_b = [t.detach().clone().requires_grad_() for t in args]
+    full = torch.full((inp.q_latent.shape[0],), 256, dtype=torch.int32, device=inp.q_latent.device)
+    with _quiet_experimental():
+        out_a, lse_a = dsa_sparse_attention(*leaves_a, inp.idx_global, return_lse=True)
+        out_b, lse_b = dsa_sparse_attention(
+            *leaves_b, inp.idx_global, topk_length=full, return_lse=True
+        )
+    grads_a = torch.autograd.grad(out_a, leaves_a, inp.dout)
+    grads_b = torch.autograd.grad(out_b, leaves_b, inp.dout)
+    torch.cuda.synchronize()
+    assert torch.equal(out_a.detach(), out_b.detach()) and torch.equal(lse_a, lse_b)
+    assert torch.equal(grads_a[0], grads_b[0]) and torch.equal(grads_a[1], grads_b[1])
+    assert max(rel_l2(grads_a[2], grads_b[2]), rel_l2(grads_a[3], grads_b[3])) < 1e-4
+    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
+    _check_forward(inp, out_a, lse_a, ref)
+    _check_backward(grads_a, ref)
 
 
 def test_varlen_multi_segment_row_plans_single_pass():
