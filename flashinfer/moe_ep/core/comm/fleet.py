@@ -2,8 +2,10 @@
 
 The Fleet/Handle pair mirrors those libraries' own object model: a long-lived
 group that owns the transport buffers, and a per-step handle carrying one
-dispatch's routing state. The MoE-level interface built on top of it is
-:class:`~flashinfer.moe_ep.core.comm.communication.MoEEpCommunication`.
+dispatch's routing state. It is one of the two peer kinds of split-path comm
+backend; the other,
+:class:`~flashinfer.moe_ep.core.comm.communication.MoEEpCommunication`, is a
+self-contained dispatch/combine object used by the NVLink backends.
 
 Backends register themselves in :data:`_BACKEND_REGISTRY` at import time
 (see :mod:`flashinfer.moe_ep.backends.split.comm.nccl_ep` and

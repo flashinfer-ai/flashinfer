@@ -1,9 +1,9 @@
 """Expert-parallel communication abstractions.
 
-:class:`MoEEpCommunication` is the MoE-level dispatch/combine interface every
-communication backend implements. :class:`Fleet` / :class:`Handle` are the
-transport-level API of the NCCL-EP and NIXL-EP backends, whose
-group/per-step-handle structure mirrors those libraries.
+Split-path comm backends implement one of two peer interfaces:
+:class:`MoEEpCommunication`, a self-contained dispatch/combine object (the
+NVLink backends), or :class:`Fleet` / :class:`Handle`, the group /
+per-step-handle API of the NCCL-EP and NIXL-EP backends.
 """
 
 from .communication import (

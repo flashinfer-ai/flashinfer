@@ -56,10 +56,13 @@ backend packs them); the kernel backend computes on this rank's expert shard.
 
 #### Comm backends (dispatch/combine transports)
 
-Communication has two levels:
+Comm backends come in two peer kinds, and `MoEEpSplitLayer` accepts either
+through `SplitConfig(comm=...)`. They differ in object model, not in role:
 
-- **`MoEEpCommunication`** (`core/comm/communication.py`) is the MoE-level
-  interface every backend implements: `dispatch(hidden_states, topk_ids,
+- **`MoEEpCommunication`** (`core/comm/communication.py`) is a self-contained
+  dispatch/combine object: one long-lived instance per EP group owns its
+  workspace, and per-step routing state lives in that workspace. The NVLink
+  backends implement it. `dispatch(hidden_states, topk_ids,
   topk_weights, ...)` returns `ep_size * tokens_per_rank` receive rows with
   their GLOBAL top-k routing (rows without a token carry
   `MoEEpCommParams.invalid_expert_id`); the expert computation weights and
@@ -71,20 +74,20 @@ Communication has two levels:
   are dispatched in (unquantized `dtype` rows when unset); backends that
   reserve buffers per dispatched byte, such as `nvlink_one_sided`, size them
   from it.
-- **`Fleet` / `Handle`** (`core/comm/fleet.py`, `handle.py`) is the
-  transport-level API of the NCCL-EP and NIXL-EP backends. It mirrors those
-  libraries' group / per-step-handle model and exposes their full surface
-  (EXPERT_MAJOR and HT layouts, split send/receive staging, persistent handles
-  for CUDA graphs, fault-tolerance masks). `NcclEpCommunication` wraps it for
-  the rank-major contract; `MoEEpSplitLayer` drives `nccl_ep` / `nixl_ep`
-  through it directly.
+- **`Fleet` / `Handle`** (`core/comm/fleet.py`, `handle.py`) is the native API
+  of the NCCL-EP and NIXL-EP backends. It mirrors those libraries' group /
+  per-step-handle model and exposes their full surface (EXPERT_MAJOR and HT
+  layouts, split send/receive staging, persistent handles for CUDA graphs,
+  fault-tolerance masks). `MoEEpSplitLayer` drives `nccl_ep` / `nixl_ep`
+  through it. `NcclEpCommunication` additionally adapts it to the
+  `MoEEpCommunication` contract for LL RANK_MAJOR (not CUDA-graph capturable).
 
-| Backend | Config | Level | Transport |
+| Backend | Config | Interface | Transport |
 |---|---|---|---|
 | `nvlink_one_sided` | `NVLinkOneSidedConfig` | `MoEEpCommunication` | MNNVL symmetric memory; dispatch puts tokens into peers' receive buffers, combine gets results back (`flashinfer.comm.MoeAlltoAll`, TRT-LLM kernels) |
 | `nvlink_one_sided_cake` | `NVLinkOneSidedCakeConfig` | `MoEEpCommunication` | `nvlink_one_sided` running the generated Cake kernels (`MoeAlltoAll` with `backend="cake"`); SM100/SM103 only |
 | `nvlink_two_sided` | `NVLinkTwoSidedConfig` | `MoEEpCommunication` | MNNVL FIFO channels, all-to-all-v (`flashinfer.comm.MnnvlMoe`); `num_experts % 4 == 0` |
-| `nccl_ep` | `NcclEpConfig` | `MoEEpCommunication` (LL `RANK_MAJOR`) and Fleet/Handle | see below |
+| `nccl_ep` | `NcclEpConfig` | Fleet/Handle (also adapted to `MoEEpCommunication`, LL `RANK_MAJOR`) | see below |
 | `nixl_ep` | `NvepConfig` | Fleet/Handle | see below |
 
 Fleet transports:

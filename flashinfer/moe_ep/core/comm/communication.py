@@ -1,12 +1,21 @@
-"""MoEEpCommunication — MoE-level expert-parallel token exchange.
+"""MoEEpCommunication — self-contained expert-parallel dispatch/combine.
 
-A communication backend moves routed tokens to the ranks that own their
-experts (``dispatch``) and brings the expert outputs back to the ranks the
-tokens came from (``combine``). It is the level a MoE layer programs against;
-how a backend moves the bytes (symmetric-memory kernels, an NCCL-EP
-``Fleet``/``Handle`` pair, ...) is an implementation detail beneath it.
+Split-path comm backends come in two peer kinds, and ``MoEEpSplitLayer``
+accepts either through ``SplitConfig(comm=...)``:
 
-Every backend implements the same rank-major contract:
+* :class:`MoEEpCommunication` (this module): one long-lived object per EP
+  group that owns its workspace and exposes ``dispatch``/``combine``
+  directly; per-step routing state lives in that workspace. The NVLink
+  backends (one-sided, Cake, two-sided) implement it.
+* :class:`~flashinfer.moe_ep.core.comm.fleet.Fleet` /
+  :class:`~flashinfer.moe_ep.core.comm.handle.Handle`: the native API of the
+  NCCL-EP and NIXL-EP backends, mirroring their group / per-step-handle
+  model.
+
+A ``MoEEpCommunication`` backend moves routed tokens to the ranks that own
+their experts (``dispatch``) and brings the expert outputs back to the ranks
+the tokens came from (``combine``). Every backend implements the same
+rank-major contract:
 
 * ``dispatch`` returns ``ep_size * tokens_per_rank`` receive rows. Each token
   arrives at most once per rank, in one row, together with its full top-k
@@ -142,7 +151,9 @@ class MoEEpDispatchResult:
 
 
 class MoEEpCommunication(ABC):
-    """Abstract MoE expert-parallel dispatch/combine.
+    """Self-contained MoE expert-parallel dispatch/combine backend.
+
+    The peer of the Fleet/Handle transports; see the module docstring.
 
     One instance serves one EP group and one in-flight dispatch/combine pair
     at a time: every :meth:`dispatch` must be followed by exactly one
