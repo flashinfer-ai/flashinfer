@@ -382,7 +382,12 @@ def test_fallback_plan_matches_reference(name, case, message):
     assert isinstance(plan, BGMVMoEPortablePlan)
     assert plan.backend_used == "portable"
     assert plan.schedule_id is None
-    assert message in plan.fallback_reason
+    # The device check runs before the shape checks, so on a device without a
+    # generated program (e.g. SM120, SM107) the reason names the capability.
+    if torch.cuda.get_device_capability() in _SUPPORTED_CAPABILITIES:
+        assert message in plan.fallback_reason
+    else:
+        assert "exact SM90, SM100 or SM103" in plan.fallback_reason
     fallback_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
     assert all("portable" in str(w.message) for w in fallback_warnings)
     out = plan.run()
@@ -396,7 +401,9 @@ def test_fallback_plan_matches_reference(name, case, message):
     ("name", "case", "message"), _FALLBACK_CASES, ids=[c[0] for c in _FALLBACK_CASES]
 )
 def test_strict_mode_raises_for_unsupported_inputs(name, case, message):
-    _require_cuda()
+    # The listed reasons are only reached on a device with a generated program;
+    # test_fallback_on_unsupported_capability covers the device rejection.
+    _require_cake_arch()
     inputs = _fallback_inputs(case)
     with pytest.raises(ValueError, match=message):
         prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
