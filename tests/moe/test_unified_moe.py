@@ -531,7 +531,7 @@ class TestBackendOptions:
         assert TrtllmBf16Config.supported(100)
         assert TrtllmBf16Config.supported(103)
         assert TrtllmFp4Config.supported(107)
-        assert not TrtllmFp8BlockConfig.supported(107)
+        assert TrtllmFp8BlockConfig.supported(107)
         assert TrtllmBf16Config.supported(107)
         assert not TrtllmBf16Config.supported(110)
         assert not TrtllmBf16Config.supported(120)
@@ -540,7 +540,7 @@ class TestBackendOptions:
         assert not TrtllmFp8BlockConfig.supported(120)
         assert TrtllmFp8PerTensorConfig.supported(100)
         assert TrtllmFp8PerTensorConfig.supported(103)
-        assert not TrtllmFp8PerTensorConfig.supported(107)
+        assert TrtllmFp8PerTensorConfig.supported(107)
         assert not TrtllmFp8PerTensorConfig.supported(90)
         assert not TrtllmFp8PerTensorConfig.supported(120)
 
@@ -1638,7 +1638,7 @@ class TestMoERunnerSupport:
     )
     @pytest.mark.parametrize(
         ("compute_capability", "supported"),
-        [((10, 0), True), ((10, 3), True), ((10, 7), False)],
+        [((10, 0), True), ((10, 3), True), ((10, 7), True)],
     )
     def test_fp8_runner_arch_support(
         self, monkeypatch, runner_type, variant, compute_capability, supported
