@@ -1125,10 +1125,14 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 )
                 assert a_desc.stride(2) == 1 and b_desc.stride(2) == 1
                 # the knob defaults of the launcher (stage depth by tile shape, raster group, working-set-gated
-                # hints) unless the row's measured rule (ROW_RULES, round 2) pins a knob
-                assert plan.cta_rows == rule.get("cta_rows", 128)
-                assert plan.pf == rule.get("pf", 0) and plan.promo == rule.get("promo", "none")
-                assert plan.group_m == rule.get(
+                # hints) unless the row's measured rule (ROW_RULES, round 2) pins a knob; a plan that landed on the
+                # nearest generated knob variant (knob_fallback) carries that variant's knobs instead
+                mirrored = not plan.knob_fallback
+                assert not mirrored or plan.cta_rows == rule.get("cta_rows", 128)
+                assert not mirrored or (
+                    plan.pf == rule.get("pf", 0) and plan.promo == rule.get("promo", "none")
+                )
+                assert not mirrored or plan.group_m == rule.get(
                     "group_m",
                     default_group_m(
                         plan.a_mn,
@@ -1155,7 +1159,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                 assert plan.wave_working_set_bytes == wave_working_set(
                     plan.m_tiles, plan.n_tiles, plan.K, plan.group_m, plan.sm_pairs
                 )
-                assert plan.hints == tuple(
+                assert not mirrored or plan.hints == tuple(
                     rule.get(
                         "hints",
                         default_hints(
@@ -1170,7 +1174,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         ),
                     )
                 )
-                if "hints" not in rule:
+                if mirrored and "hints" not in rule:
                     if plan.wave_working_set_bytes <= L2_BYTES:
                         assert plan.hints == ("none", "none")
                     if not (plan.a_mn and plan.b_mn) and plan.n_tiles > 1:
@@ -1234,7 +1238,7 @@ def test_projection_rows_plan_like_the_cake_launcher(sm_count, T):
                         and plan.a_mn
                         and plan.b_mn
                     )
-                assert plan.block_n == rule.get(
+                assert not mirrored or plan.block_n == rule.get(
                     "block_n", default_block_n(plan.N, plan.b_mn)
                 )
 
@@ -1268,7 +1272,8 @@ def test_mla_rows_plan_as_batched_views(T, sm_count):
             # the swapped plans (weight gradients; the tiny-T forward / input gradient) store transposed
             assert plan.transposed_out == plan.template.endswith("_t")
             rule = _rule_of(plan, sm_count)
-            assert plan.hints == tuple(
+            mirrored = not plan.knob_fallback
+            assert not mirrored or plan.hints == tuple(
                 rule.get(
                     "hints",
                     default_hints(
@@ -1283,7 +1288,7 @@ def test_mla_rows_plan_as_batched_views(T, sm_count):
                     ),
                 )
             )
-            assert plan.group_m == rule.get(
+            assert not mirrored or plan.group_m == rule.get(
                 "group_m",
                 default_group_m(
                     plan.a_mn, plan.b_mn, plan.m_tiles, plan.pair_tiles, plan.sm_pairs

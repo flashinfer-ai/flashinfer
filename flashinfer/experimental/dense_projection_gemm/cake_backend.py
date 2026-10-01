@@ -918,13 +918,19 @@ def plan_dense_projection_gemm(
             "dense_projection_gemm: out needs unit inner stride, 16-byte aligned rows / batches "
             f"and base; strides {tuple(O3.stride())}"
         )
-    swapped = _allow_swap and swap_small_m(L, M, N, transposed_out)
+    swap_eligible = swap_small_m(L, M, N, transposed_out)
+    swapped = _allow_swap and swap_eligible
     if swapped:
         A3, B3 = B3.transpose(1, 2), A3.transpose(1, 2)
         M, N = N, M
         transposed_out = True
     a_mn, a_desc = operand_view(A3, "A", k_axis=2)
     b_mn, b_desc = operand_view(B3, "B", k_axis=1)
+    rule_dropped = (
+        {}
+        if _use_rules
+        else row_rule(arch, a_mn, b_mn, out.dtype == torch.float32, transposed_out, L > 1, N, K, M)
+    )
     rule = (
         row_rule(arch, a_mn, b_mn, out.dtype == torch.float32, transposed_out, L > 1, N, K, M)
         if _use_rules
@@ -1022,8 +1028,8 @@ def plan_dense_projection_gemm(
         sk_units=sk_units,
         iters_per_unit=iters_per_unit,
         template=instance_symbol(key),
-        swap_fallback=not _allow_swap,
-        rule_fallback=not _use_rules,
+        swap_fallback=swap_eligible and not _allow_swap,
+        rule_fallback=bool(rule_dropped),
     )
     if _fallback and plan.template not in KERNELS.get(arch, {}):
         # nearest registered plan: drop the swap first (keeps the measured rule), then the rule, then both
