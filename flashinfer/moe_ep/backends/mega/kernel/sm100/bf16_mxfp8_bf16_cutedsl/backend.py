@@ -118,6 +118,7 @@ class Bf16Mxfp8CutedslMegaKernelBackend(MegaKernelBackend):
             kind=config.kind,
             gate_up_clamp=_clamp(config),
             enable_in_kernel_fc2_reduce=config.enable_in_kernel_fc2_reduce,
+            use_persistent_finalize_kernel=config.use_persistent_finalize_kernel,
             knobs=config.knobs if isinstance(config.knobs, dict) else None,
         )
 

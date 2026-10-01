@@ -205,7 +205,11 @@ def test_cache_keeps_reduction_and_weighting_policy_separate(tmp_path, monkeypat
     assert lookup_knobs(**key) is None
     assert lookup_knobs(**key, allow_nondeterministic=True) == knobs
     assert (
-        lookup_knobs(**key, allow_nondeterministic=True, apply_topk_at_fc1=False)
+        lookup_knobs(
+            **key,
+            allow_nondeterministic=True,
+            apply_routing_weights_before_fc2=False,
+        )
         is None
     )
     data = json.loads(path.read_text())
@@ -297,7 +301,9 @@ def test_no_dist_rejects_multirank(monkeypatch):
 
 
 def test_ikr_requires_early_weighting():
-    with pytest.raises(ValueError, match="apply_topk_at_fc1"):
+    with pytest.raises(ValueError, match="apply_routing_weights_before_fc2"):
         dataclasses.replace(
-            _config(), reduce_topk_in_kernel=True, apply_topk_at_fc1=False
+            _config(),
+            reduce_topk_in_kernel=True,
+            apply_routing_weights_before_fc2=False,
         )

@@ -545,7 +545,8 @@ plumbed through `get_symm_buffer_for_mega_moe` and the backend configs
   large terms nearly cancel the agreement is bounded by the bf16 ULP of the
   largest TERM — validate with a row-scaled band (tests'
   `_assert_ikr_close`: K x 2^-8 x safety 8 x row max), never a flat
-  atol/rtol.  Requires `apply_topk_in_fc1=True` + bf16 combine wire.
+  atol/rtol. Requires `apply_routing_weights_before_fc2=True` + bf16 combine
+  wire.
 - `combine_dtype` — quantized cross-rank combine wire (`"mxfp8"` =
   `32e4m3xe8m0`, 2x less NVLink combine traffic; `"nvfp4"` = `16e2m1xbf16`,
   4x less).  Numerics tradeoff (wire-quantizes the per-topk fc2 outputs);

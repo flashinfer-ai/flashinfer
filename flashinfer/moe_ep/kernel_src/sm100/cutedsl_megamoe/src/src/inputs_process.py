@@ -174,7 +174,7 @@ class DataPreprocess:
                 activation_sf,
                 topk_idx_output,
                 topk_weights_output,
-            ).launch(grid=grid, block=block, stream=cuda_stream)
+            ).launch(grid=grid, block=block, stream=cuda_stream, min_blocks_per_mp=1)
             return
 
         # nvfp4: online derives the per-tensor scale in-band (zero -> amax ->
@@ -184,7 +184,7 @@ class DataPreprocess:
         if cutlass.const_expr(online_norm_const is not None):
             self._init_online_scale_impl(online_norm_const).launch(grid=[1, 1, 1], block=[1, 1, 1], stream=cuda_stream)
             self.nvfp4_amax_impl(activation_bf16, token_padding_info, online_norm_const).launch(
-                grid=grid, block=[self._amax_threads_per_cta, 1, 1], stream=cuda_stream
+                grid=grid, block=[self._amax_threads_per_cta, 1, 1], stream=cuda_stream, min_blocks_per_mp=1
             )
             norm_const = online_norm_const
         else:
@@ -200,7 +200,7 @@ class DataPreprocess:
             topk_idx_output,
             topk_weights_output,
             norm_const,
-        ).launch(grid=grid, block=block, stream=cuda_stream)
+        ).launch(grid=grid, block=block, stream=cuda_stream, min_blocks_per_mp=1)
 
     # -- shared device helpers ------------------------------------------------
 
@@ -433,14 +433,17 @@ class DataPreprocess:
         hidden: cutlass.Constexpr[int] = self.hidden
         load_vec: cutlass.Constexpr[int] = 8  # 8 bf16 = 16 B per cp.async
         quant_vec: cutlass.Constexpr[int] = 16  # one coalesced 16 B fp8 store per lane
-        load_rounds_per_quant_round: cutlass.Constexpr[int] = quant_vec // load_vec
+        quant_subrounds_per_stage: cutlass.Constexpr[int] = 2
+        load_rounds_per_stage: cutlass.Constexpr[int] = quant_subrounds_per_stage * quant_vec // load_vec
         num_chunks: cutlass.Constexpr[int] = hidden // load_vec
         num_quant_chunks: cutlass.Constexpr[int] = hidden // quant_vec
         chunks_per_thread: cutlass.Constexpr[int] = (num_chunks + threads - 1) // threads
-        quant_chunks_per_thread: cutlass.Constexpr[int] = (num_quant_chunks + threads - 1) // threads
-        num_groups: cutlass.Constexpr[int] = (
-            chunks_per_thread + load_rounds_per_quant_round - 1
-        ) // load_rounds_per_quant_round
+        full_quant_rounds: cutlass.Constexpr[int] = num_quant_chunks // threads
+        tail_quant_chunks: cutlass.Constexpr[int] = num_quant_chunks % threads
+        num_stages: cutlass.Constexpr[int] = (num_quant_chunks + quant_subrounds_per_stage * threads - 1) // (
+            quant_subrounds_per_stage * threads
+        )
+        num_groups: cutlass.Constexpr[int] = (chunks_per_thread + load_rounds_per_stage - 1) // load_rounds_per_stage
         token_idx = cute.arch.block_idx()[0]
         tid = cute.arch.thread_idx()[0]
 
@@ -456,51 +459,89 @@ class DataPreprocess:
         g2s_atom = cute.make_copy_atom(
             cute.nvgpu.cpasync.CopyG2SOp(), cutlass.BFloat16, num_bits_per_copy=load_vec * 16
         )
-        # At most two load rounds provide one 16-element vector to every lane.
-        # Commit them as one group so group j feeds quant round j.
+        # Preserve the original 32-element-per-thread batch: each group feeds
+        # two 16-element quant subrounds.
         for i in cutlass.range_constexpr(chunks_per_thread):
             c = tid + Int32(i * threads)
             if c < Int32(num_chunks):
                 cute.copy(g2s_atom, self._mark_alignment(g_chunks[(None,), (c,)], 16), s_chunks[(None,), (c,)])
-            if cutlass.const_expr((i + 1) % load_rounds_per_quant_round == 0 or i == chunks_per_thread - 1):
+            if cutlass.const_expr((i + 1) % load_rounds_per_stage == 0 or i == chunks_per_thread - 1):
                 cute.arch.cp_async_commit_group()
 
         s_quant_chunk = cute.zipped_divide(smem_row, (quant_vec,))
         q_quant_chunk = cute.zipped_divide(activation_quant[token_idx, None], (quant_vec,))
         lds_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), cutlass.BFloat16, num_bits_per_copy=128)
         store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.quant_dtype, num_bits_per_copy=128)
-        for j in cutlass.range_constexpr(quant_chunks_per_thread):
+        # A stage waits once, then consumes two adjacent 16-element subrounds.
+        # Compile-time subround selection keeps every complete subround
+        # straight-line; only the final partial subround is predicated.
+        for stage in cutlass.range_constexpr(num_stages):
             cute.arch.cp_async_commit_group()
             cute.arch.cp_async_wait_group(num_groups)
             cute.arch.sync_threads()
-            quant_chunk_idx = tid + Int32(j * threads)
-            values = cute.make_rmem_tensor((quant_vec,), Float32)
-            local_absmax = Float32(0.0)
-            if quant_chunk_idx < Int32(num_quant_chunks):
-                quant_chunk_bf16 = cute.make_rmem_tensor((quant_vec,), cutlass.BFloat16)
-                cute.copy(lds_atom, s_quant_chunk[(None,), (quant_chunk_idx,)], quant_chunk_bf16)
-                values.store(quant_chunk_bf16.load().to(Float32))
-                for i in cutlass.range_constexpr(quant_vec):
-                    local_absmax = cute.arch.fmax(local_absmax, cute.arch.fmax(values[i], -values[i]))
 
-            paired_absmax = Float32(cute.arch.shuffle_sync_bfly(local_absmax, offset=1))
-            block_absmax = cute.arch.fmax(local_absmax, paired_absmax)
-            if quant_chunk_idx < Int32(num_quant_chunks):
-                # Per-32 E8M0 (power-of-2) scale, rounded up (cvt.rp) so the block
-                # never overflows the fp8 range; rcp is exact for a power of two.
-                scale_f32 = Float32(cvt_f32_to_f8_to_f32(block_absmax * data_rcp_limit, cutlass.Float8E8M0FNU))
-                sf_e8m0 = scale_f32.to(cutlass.Float8E8M0FNU)
-                acc_scale = cute.arch.fmin(cute.arch.rcp_approx(scale_f32), fp32_max)
+            for subround in cutlass.range_constexpr(quant_subrounds_per_stage):
+                quant_round = stage * quant_subrounds_per_stage + subround
+                quant_chunk_idx = tid + Int32(quant_round * threads)
 
-                scaled = cute.make_rmem_tensor((quant_vec,), Float32)
-                for i in cutlass.range_constexpr(quant_vec):
-                    scaled[i] = values[i] * acc_scale
-                data = cute.make_rmem_tensor((quant_vec,), self.quant_dtype)
-                data.store(scaled.load().to(self.quant_dtype))
+                if cutlass.const_expr(quant_round < full_quant_rounds):
+                    quant_chunk_bf16 = cute.make_rmem_tensor((quant_vec,), cutlass.BFloat16)
+                    cute.copy(lds_atom, s_quant_chunk[(None,), (quant_chunk_idx,)], quant_chunk_bf16)
+                    values = cute.make_rmem_tensor((quant_vec,), Float32)
+                    values.store(quant_chunk_bf16.load().to(Float32))
 
-                cute.copy(store_atom, data, self._mark_alignment(q_quant_chunk[(None,), (quant_chunk_idx,)], quant_vec))
-                if quant_chunk_idx % Int32(2) == Int32(0):
+                    local_absmax = Float32(0.0)
+                    for i in cutlass.range_constexpr(quant_vec):
+                        local_absmax = cute.arch.fmax(local_absmax, cute.arch.fmax(values[i], -values[i]))
+                    paired_absmax = Float32(cute.arch.shuffle_sync_bfly(local_absmax, offset=1))
+                    block_absmax = cute.arch.fmax(local_absmax, paired_absmax)
+
+                    # Per-32 E8M0 (power-of-2) scale, rounded up (cvt.rp) so the
+                    # block never overflows fp8; rcp is exact for a power of two.
+                    scale_f32 = Float32(cvt_f32_to_f8_to_f32(block_absmax * data_rcp_limit, cutlass.Float8E8M0FNU))
+                    sf_e8m0 = scale_f32.to(cutlass.Float8E8M0FNU)
+                    acc_scale = cute.arch.fmin(cute.arch.rcp_approx(scale_f32), fp32_max)
+
+                    scaled = cute.make_rmem_tensor((quant_vec,), Float32)
+                    for i in cutlass.range_constexpr(quant_vec):
+                        scaled[i] = values[i] * acc_scale
+                    data = cute.make_rmem_tensor((quant_vec,), self.quant_dtype)
+                    data.store(scaled.load().to(self.quant_dtype))
+
+                    cute.copy(
+                        store_atom, data, self._mark_alignment(q_quant_chunk[(None,), (quant_chunk_idx,)], quant_vec)
+                    )
                     activation_sf[token_idx, (0, quant_chunk_idx // Int32(2))] = sf_e8m0
+
+                elif cutlass.const_expr(quant_round == full_quant_rounds and tail_quant_chunks != 0):
+                    values = cute.make_rmem_tensor((quant_vec,), Float32)
+                    local_absmax = Float32(0.0)
+                    if tid < Int32(tail_quant_chunks):
+                        quant_chunk_bf16 = cute.make_rmem_tensor((quant_vec,), cutlass.BFloat16)
+                        cute.copy(lds_atom, s_quant_chunk[(None,), (quant_chunk_idx,)], quant_chunk_bf16)
+                        values.store(quant_chunk_bf16.load().to(Float32))
+                        for i in cutlass.range_constexpr(quant_vec):
+                            local_absmax = cute.arch.fmax(local_absmax, cute.arch.fmax(values[i], -values[i]))
+
+                    paired_absmax = Float32(cute.arch.shuffle_sync_bfly(local_absmax, offset=1))
+                    block_absmax = cute.arch.fmax(local_absmax, paired_absmax)
+                    if tid < Int32(tail_quant_chunks):
+                        scale_f32 = Float32(cvt_f32_to_f8_to_f32(block_absmax * data_rcp_limit, cutlass.Float8E8M0FNU))
+                        sf_e8m0 = scale_f32.to(cutlass.Float8E8M0FNU)
+                        acc_scale = cute.arch.fmin(cute.arch.rcp_approx(scale_f32), fp32_max)
+
+                        scaled = cute.make_rmem_tensor((quant_vec,), Float32)
+                        for i in cutlass.range_constexpr(quant_vec):
+                            scaled[i] = values[i] * acc_scale
+                        data = cute.make_rmem_tensor((quant_vec,), self.quant_dtype)
+                        data.store(scaled.load().to(self.quant_dtype))
+
+                        cute.copy(
+                            store_atom,
+                            data,
+                            self._mark_alignment(q_quant_chunk[(None,), (quant_chunk_idx,)], quant_vec),
+                        )
+                        activation_sf[token_idx, (0, quant_chunk_idx // Int32(2))] = sf_e8m0
 
         self._repack_routing(
             token_idx, tid, topk_idx, topk_weights, token_padding_info, topk_idx_output, topk_weights_output
@@ -565,8 +606,9 @@ def _run_case(quant_type: str, mode: str, num_tokens: int, hidden: int, topk: in
         norm_const_used = 2.0
         offline_norm_const = cutlass.Float32(norm_const_used)
 
-    # import nvtx
-    # with nvtx.annotate("cute_dsl_prof"):
+    # with torch.profiler.profile(
+    #     activities=[torch.profiler.ProfilerActivity.CPU, torch.profiler.ProfilerActivity.CUDA]
+    # ) as profiler:
     dp(
         to_cute(x),
         to_cute(topk_idx_in, 4),
@@ -581,6 +623,8 @@ def _run_case(quant_type: str, mode: str, num_tokens: int, hidden: int, topk: in
         offline_norm_const=offline_norm_const,
     )
     torch.cuda.synchronize()
+
+    # print(profiler.key_averages().table(sort_by="self_cuda_time_total", row_limit=10))
 
     ok = True
 

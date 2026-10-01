@@ -154,7 +154,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
                 topk=k.top_k,
                 max_tokens=fleet_params.max_tokens_per_rank,
                 allow_nondeterministic=k.in_kernel_fc2_reduce,
-                apply_topk_at_fc1=k.apply_topk_in_fc1,
+                apply_routing_weights_before_fc2=(k.apply_routing_weights_before_fc2),
             )
             if self.ep_rank == 0:
                 print(
@@ -275,7 +275,7 @@ class Sm107Mxfp8BlockScaledMegaKernelBackend(MegaKernelBackend):
             _resolve_gate_up_clamp(k),
             k.in_kernel_fc2_reduce,
             k.token_back_mode,
-            k.apply_topk_in_fc1,
+            k.apply_routing_weights_before_fc2,
             k.schedule_policy,
             k.work_id_mode,
             k.fc2_use_bulk,

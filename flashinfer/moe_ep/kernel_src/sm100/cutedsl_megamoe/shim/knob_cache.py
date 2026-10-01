@@ -19,10 +19,11 @@ File location: ``FLASHINFER_MOE_EP_KNOB_CACHE`` (a path, or ``0``/``off`` to
 disable the cache entirely), default
 ``~/.cache/flashinfer/moe_ep_knob_cache.json``.  Format::
 
-    {"version": 1,
+    {"version": 2,
      "entries": [{"device": "NVIDIA GB200", "dtype": "nvfp4",
                   "world_size": 4, "hidden": 7168, "intermediate": 2048,
                   "num_experts": 256, "topk": 8, "combine_dtype": "bf16",
+                  "apply_routing_weights_before_fc2": true,
                   "max_tokens": 2048, "knobs": {...},
                   "p50_us": 585.0, "source": "autotune",
                   "tuned_at": "2026-07-16T12:00:00"}, ...]}
@@ -47,7 +48,7 @@ import tempfile
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _KEY_FIELDS = (
     "device",
     "dtype",
@@ -143,7 +144,7 @@ def lookup_knobs(
     max_tokens: int,
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
-    apply_topk_in_fc1: bool = False,
+    apply_routing_weights_before_fc2: bool = False,
     device: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss.
@@ -167,7 +168,8 @@ def lookup_knobs(
         e
         for e in _load_entries(path)
         if all(e.get(f) == key[f] for f in _KEY_FIELDS)
-        and e.get("apply_topk_in_fc1") == apply_topk_in_fc1
+        and e.get("apply_routing_weights_before_fc2")
+        == apply_routing_weights_before_fc2
         and isinstance(e.get("knobs"), dict)
         and isinstance(e.get("max_tokens"), int)
         and (enable_in_kernel_fc2_reduce or not _entry_needs_ikr(e))
@@ -200,7 +202,7 @@ def record_knobs(
     topk: int,
     max_tokens: int,
     combine_dtype: str = "bf16",
-    apply_topk_in_fc1: bool = False,
+    apply_routing_weights_before_fc2: bool = False,
     device: Optional[str] = None,
     p50_us: Optional[float] = None,
     source: str = "autotune",
@@ -230,7 +232,7 @@ def record_knobs(
         topk=topk,
         combine_dtype=combine_dtype,
         max_tokens=max_tokens,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         knobs=_knobs_to_json(knobs),
         p50_us=p50_us,
         source=source,
@@ -244,7 +246,8 @@ def record_knobs(
             if not (
                 all(e.get(f) == entry[f] for f in _KEY_FIELDS)
                 and e.get("max_tokens") == max_tokens
-                and e.get("apply_topk_in_fc1") == apply_topk_in_fc1
+                and e.get("apply_routing_weights_before_fc2")
+                == apply_routing_weights_before_fc2
                 and _entry_needs_ikr(e) == _entry_needs_ikr(entry)
             )
         ]
@@ -282,7 +285,7 @@ def resolve_knobs(
     max_tokens: int,
     combine_dtype: str = "bf16",
     enable_in_kernel_fc2_reduce: bool = False,
-    apply_topk_in_fc1: bool = False,
+    apply_routing_weights_before_fc2: bool = False,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else built-in heuristic.
 
@@ -308,7 +311,7 @@ def resolve_knobs(
         max_tokens=max_tokens,
         combine_dtype=combine_dtype,
         enable_in_kernel_fc2_reduce=enable_in_kernel_fc2_reduce,
-        apply_topk_in_fc1=apply_topk_in_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
     )
     if cached is not None:
         return cached, "cache"

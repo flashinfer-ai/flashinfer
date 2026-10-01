@@ -37,7 +37,7 @@ def make_workspace_config(
             world_size=world_size,
             quant_kind=quant_kind,
             gate_up_clamp=gate_up_clamp,
-            apply_topk_at_fc1=k.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=k.apply_routing_weights_before_fc2,
             max_sm_count=k.max_sm_count,
             **tuning,
         )

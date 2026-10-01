@@ -25,11 +25,11 @@ import tempfile
 import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
-_CACHE_VERSION = 1
+_CACHE_VERSION = 2
 _KEY_FIELDS = (
     "backend_revision",
     "allow_nondeterministic",
-    "apply_topk_at_fc1",
+    "apply_routing_weights_before_fc2",
     "device",
     "dtype",
     "world_size",
@@ -117,7 +117,7 @@ def lookup_knobs(
     combine_dtype: str = "bf16",
     device: Optional[str] = None,
     allow_nondeterministic: bool = False,
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """Return the cached knob dict for this session key, or ``None`` on miss."""
     path = _cache_path()
@@ -126,7 +126,7 @@ def lookup_knobs(
     key = dict(
         backend_revision="sm107-block-scaled-1667b47a-v3",
         allow_nondeterministic=allow_nondeterministic,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -171,7 +171,7 @@ def record_knobs(
     p50_us: Optional[float] = None,
     source: str = "autotune",
     allow_nondeterministic: bool = False,
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
 ) -> Optional[str]:
     """Upsert one tuned entry (exact key incl. ``max_tokens``); atomic write.
 
@@ -188,7 +188,7 @@ def record_knobs(
     entry = dict(
         backend_revision="sm107-block-scaled-1667b47a-v3",
         allow_nondeterministic=allow_nondeterministic,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
         device=_device_key(device),
         dtype=dtype,
         world_size=world_size,
@@ -274,7 +274,7 @@ def resolve_knobs(
     max_tokens: int,
     combine_dtype: str = "bf16",
     allow_nondeterministic: bool = False,
-    apply_topk_at_fc1: bool = True,
+    apply_routing_weights_before_fc2: bool = True,
 ) -> Tuple[Dict[str, Any], str]:
     """Pure-lookup knob resolution: cache hit, else the built-in heuristic.
 
@@ -290,7 +290,7 @@ def resolve_knobs(
         max_tokens=max_tokens,
         combine_dtype=combine_dtype,
         allow_nondeterministic=allow_nondeterministic,
-        apply_topk_at_fc1=apply_topk_at_fc1,
+        apply_routing_weights_before_fc2=apply_routing_weights_before_fc2,
     )
     if cached is not None:
         return cached, "cache"

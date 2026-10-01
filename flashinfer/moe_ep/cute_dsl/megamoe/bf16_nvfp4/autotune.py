@@ -228,7 +228,7 @@ def autotune_bf16_nvfp4_mega_moe(
             topk=cfg.num_topk,
             max_tokens=cfg.num_tokens_per_rank,
             combine_dtype="bf16",
-            apply_topk_in_fc1=cfg.apply_topk_in_fc1,
+            apply_routing_weights_before_fc2=(cfg.apply_routing_weights_before_fc2),
             p50_us=p50_s * 1e6,
             source="autotune_graph_events",
         )
