@@ -1314,7 +1314,6 @@ def trtllm_moe_finalize_allreduce_fusion(
         from ..jit.cake_moe_finalize_comm import run_cake_moe_finalize
 
         run_cake_moe_finalize(
-            backend="cake",
             allreduce_in=allreduce_in,
             residual_in=residual_in,
             norm_weight=norm_weight,
