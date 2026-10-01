@@ -434,6 +434,7 @@ def test_localized_runner_injects_localized_execution_resources():
     assert captured["sm_count"] == 100
 
 
+@cute_dsl_available
 def test_adaptive_localization_executes_autotuner_selected_runner(monkeypatch):
     import importlib
 
@@ -4514,3 +4515,78 @@ class TestOddTileCountBoundsContract:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@cute_dsl_available
+@pytest.mark.parametrize("localized", [False, True])
+@pytest.mark.parametrize("output_dtype", [torch.float16, torch.bfloat16])
+def test_moe_core_preserves_fc2_output_dtype(monkeypatch, localized, output_dtype):
+    import importlib
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    import sys
+
+    module = importlib.import_module("flashinfer.fused_moe.cute_dsl.fused_moe")
+    packed = torch.empty((1, 128, 64), dtype=torch.uint8)
+    scale = torch.ones(1)
+    indices = torch.zeros(128, dtype=torch.int32)
+    monkeypatch.setattr(module, "moe_sort", lambda **kw: (indices,) * 6)
+    monkeypatch.setattr(module, "moe_output_memset_inplace", lambda out: out.zero_())
+    monkeypatch.setattr(
+        module,
+        "blockscaled_contiguous_gather_grouped_gemm_act_fusion",
+        lambda **kw: (packed, scale),
+    )
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda: None)
+    monkeypatch.setattr(torch.cuda, "stream", lambda stream: nullcontext())
+
+    def execute(streams, fn):
+        for i in range(len(streams)):
+            fn(i, None)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "torch.cuda.green_contexts",
+        SimpleNamespace(
+            execute_in_green_contexts=execute,
+        ),
+    )
+    calls = []
+
+    def finalize(**kwargs):
+        expected = "float16" if output_dtype == torch.float16 else "bfloat16"
+        assert kwargs["out_dtype"] == expected
+        assert kwargs["out"].dtype == output_dtype
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        module, "blockscaled_contiguous_grouped_gemm_finalize_fusion", finalize
+    )
+    shard = dict(
+        w1_weight=packed, w1_weight_sf=scale, w2_weight=packed, w2_weight_sf=scale
+    )
+    result = module._moe_core_impl(
+        x=torch.empty((1, 64), dtype=torch.uint8),
+        x_sf=scale,
+        token_selected_experts=indices[:1, None],
+        token_final_scales=scale,
+        w1_weight=packed,
+        w1_weight_sf=scale,
+        w1_alpha=scale,
+        fc2_input_scale=scale,
+        w2_weight=packed,
+        w2_weight_sf=scale,
+        w2_alpha=scale,
+        num_experts=1,
+        top_k=1,
+        num_local_experts=1,
+        output_dtype=output_dtype,
+        use_async_memset=False,
+        gemm1_mma_tiler=(128, 128, 128),
+        gemm1_mma_inst_shape=(128, 128, 64),
+        localized_weights=[shard, shard] if localized else None,
+        localized_streams=[object(), object()] if localized else None,
+        sm_count=8,
+    )
+    assert result.dtype == output_dtype
+    assert len(calls) == (2 if localized else 1)
