@@ -5,8 +5,11 @@ https://www.apache.org/licenses/LICENSE-2.0
 """
 
 from __future__ import annotations
+
 from functools import partial
-from flashinfer.jit.cake_kda_tf32 import _factory, device_arch as detect_gpu_arch
+
+from flashinfer.jit.cake_kda_tf32 import _factory
+from flashinfer.jit.cake_kda_tf32 import device_arch as detect_gpu_arch
 
 "Canonical semantic and ABI compile axes shared by KDA schedules."
 from enum import Enum
@@ -1507,8 +1510,9 @@ def _upload_int_batch(device, host_lists: dict[str, list[int]], dtype):
     capturable.  The pinned source stays alive through PyTorch's caching host
     allocator until the copy completes.
     """
-    import torch
     from array import array
+
+    import torch
 
     names = list(host_lists)
     lengths = [len(host_lists[name]) for name in names]
@@ -2510,7 +2514,7 @@ class FlashKDABlackwellBF16FusedLaunch:
             and (not self._affine_main_indexed_initial_bf16),
         )
         self.compute_dtype = compute_dtype
-        self._qkv_carrier_names = {}
+        self._qkv_carrier_names: dict[int, tuple[str, ...]] = {}
         _require_tensor(out, name="out", dtype=torch.bfloat16, ndim=4)
         # q / k / v may be strided views of a packed qkv row (token pitch >
         # num_heads * HEAD_DIM) as long as each token's [num_heads, HEAD_DIM]
