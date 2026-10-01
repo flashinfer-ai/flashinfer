@@ -355,10 +355,10 @@ class BGMVMoECakePlan(_BGMVMoEGraphPlan):
         self.schedule_id: Optional[int] = schedule_id
         from ..jit.cake_bgmv_moe import cake_bgmv_moe_route_index_numel
 
-        # Token->pair route index: published by the shrink kernels, consumed and
-        # rearmed by the expand kernels (arbitrary pair order in O(1) per CTA).
-        # Pointer-stable and zero-initialized once; the kernels keep it zeroed
-        # between launches, so graph replays never need a memset node.
+        # Token->pair route index: published by the shrink kernels and read by
+        # the expand kernels (arbitrary pair order in O(1) per CTA). Pointer-
+        # stable and zero-initialized once; counts are monotonic with
+        # launch-parity bases, so graph replays never need a memset node.
         self.route_index = torch.zeros(
             cake_bgmv_moe_route_index_numel(int(x.shape[0])),
             dtype=torch.int32,

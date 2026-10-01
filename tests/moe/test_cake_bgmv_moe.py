@@ -404,8 +404,10 @@ def test_expert_sorted_routes_match_reference_and_replay_bitwise(
         replay = plan.run().clone()
         torch.cuda.synchronize()
         assert torch.equal(replay, first)
-    # The kernels rearm the route index between launches.
-    assert int(plan.route_index[: 2 * num_tokens].abs().max()) == 0
+    # Launch counter advanced once per run (first run + 3 replays); the
+    # parity recorded for the last shrink is (launches - 1) & 1.
+    assert int(plan.route_index[0]) == 4
+    assert int(plan.route_index[1]) == 1
     plan.close()
 
 

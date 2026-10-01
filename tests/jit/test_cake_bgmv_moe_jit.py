@@ -322,16 +322,17 @@ def test_generic_binding_preserves_graph_and_tensor_contracts():
     assert "CAKE_BGMV_MOE_EXPAND_T128<<<" in binding
     assert "TensorView route_index" in binding
     assert "CHECK_INPUT_TYPE(route_index, dl_int32)" in binding
-    assert "kRouteIndexWordsPerToken = 2 + kRouteIndexMaxRoutes" in binding
+    assert "kRouteIndexWordsPerToken = 3 + kRouteIndexMaxRoutes" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(configure" in binding
     assert "TVM_FFI_DLL_EXPORT_TYPED_FUNC(run" in binding
 
 
 def test_route_index_workspace_sizing():
     assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES == 16
-    assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN == 18
-    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(1) == 18
-    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(4096) == 4096 * 18
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_HEADER_WORDS == 4
+    assert cake_bgmv_moe.CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN == 19
+    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(1) == 4 + 19
+    assert cake_bgmv_moe.cake_bgmv_moe_route_index_numel(4096) == 4 + 4096 * 19
     for hidden in cake_bgmv_moe.CAKE_BGMV_MOE_HIDDEN_SIZES:
         body = (
             cake_bgmv_moe._get_csrc_dir() / f"cake_bgmv_moe_bf16_h{hidden}.cu"

@@ -61,15 +61,20 @@ CAKE_BGMV_MOE_GENERIC_HIDDEN_MULTIPLE = 8
 # Token->pair route index shared by both variants: the shrink kernels publish
 # every routed pair under its token, the expand kernels read a token's routes
 # in O(1) for arbitrary pair order (tokens with more routes take the exact
-# serial scan) and rearm the entry, so the plan allocates it zeroed once.
+# serial scan). Counts are monotonic with launch-parity bases, so the plan
+# allocates the workspace zeroed once and the kernels never reset it: a
+# 4-word header plus, per token, one count, two bases and 16 pair slots.
 CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES = 16
-CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN = 2 + CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES
+CAKE_BGMV_MOE_ROUTE_INDEX_HEADER_WORDS = 4
+CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN = 3 + CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES
 
 
 def cake_bgmv_moe_route_index_numel(num_tokens: int) -> int:
     """int32 elements of the route-index workspace for ``num_tokens``."""
 
-    return int(num_tokens) * CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN
+    return CAKE_BGMV_MOE_ROUTE_INDEX_HEADER_WORDS + (
+        int(num_tokens) * CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN
+    )
 
 
 CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS: dict[CakeBGMVMoEGenericSchedule, int] = {
@@ -502,6 +507,7 @@ __all__ = [
     "CAKE_BGMV_MOE_GENERIC_RANKS",
     "CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS",
     "CAKE_BGMV_MOE_HIDDEN_SIZES",
+    "CAKE_BGMV_MOE_ROUTE_INDEX_HEADER_WORDS",
     "CAKE_BGMV_MOE_ROUTE_INDEX_MAX_ROUTES",
     "CAKE_BGMV_MOE_ROUTE_INDEX_WORDS_PER_TOKEN",
     "CAKE_BGMV_MOE_SCHEDULE_IDS",

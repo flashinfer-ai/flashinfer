@@ -120,50 +120,29 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
       }
     }
   }
-  if (route_build != 0) {
-    if (blockIdx.y == 0) {
-      if (tid == 0) {
-#pragma unroll
-        for (int pp_1 = 0; pp_1 < 4; pp_1++) {
-          if (valid[pp_1] != 0) {
-            int route_token = (int)tokens[pp_1];
-            unsigned int _atomic_old_0 =
-                atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[route_token], 1);
-            unsigned int route_slot = _atomic_old_0;
-            if (route_slot < 16) {
-              *(reinterpret_cast<unsigned int*>(
-                    reinterpret_cast<unsigned int*>(route_index_raw) +
-                    (2 * num_tokens + route_token * 16 + (int)route_slot)) +
-                (0)) = (unsigned int)(pair_block * 4 + pp_1);
-            }
-          }
-        }
-      }
-    }
-  }
 #pragma unroll
   for (int tile = 0; tile < 3; tile++) {
     if (tile < num_tiles) {
       int k_base = tile * 1024 + tid * 8;
 #pragma unroll
-      for (int pp_2 = 0; pp_2 < 4; pp_2++) {
-        if (valid[pp_2] != 0) {
+      for (int pp_1 = 0; pp_1 < 4; pp_1++) {
+        if (valid[pp_1] != 0) {
           if (k_base < hidden) {
             asm volatile(
                 "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                    x_smem_addr + (unsigned int)((tile * 4 * 1024 + pp_2 * 1024 + tid * 8) * 2)),
+                    x_smem_addr + (unsigned int)((tile * 4 * 1024 + pp_1 * 1024 + tid * 8) * 2)),
                 "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                    (tokens[pp_2] * (long long)hidden + (long long)k_base)));
+                    (tokens[pp_1] * (long long)hidden + (long long)k_base)));
 #pragma unroll
             for (int rr = 0; rr < 8; rr++) {
               int rank_row = rank_base + rr;
               long long weight_index =
-                  ((loras[pp_2] * (long long)num_experts + experts[pp_2]) * 64 +
+                  ((loras[pp_1] * (long long)num_experts + experts[pp_1]) * 64 +
                    (long long)rank_row) *
                       (long long)hidden +
                   (long long)k_base;
               asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                               w_smem_addr + (unsigned int)((tile * 4 * 8 * 1024 + pp_2 * 8 * 1024 +
+                               w_smem_addr + (unsigned int)((tile * 4 * 8 * 1024 + pp_1 * 8 * 1024 +
                                                              rr * 1024 + tid * 8) *
                                                             2)),
                            "l"(reinterpret_cast<const __nv_bfloat16*>(lora_a_raw) + weight_index));
@@ -173,6 +152,35 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
       }
     }
     asm volatile("cp.async.commit_group;");
+  }
+  if (route_build != 0) {
+    if (blockIdx.y == 0) {
+      if (tid == 0) {
+        int route_parity = (int)(route_index_raw[0] & 1);
+        if (blockIdx.x == 0) {
+          *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) + 1) +
+            (0)) = (unsigned int)route_parity;
+        }
+#pragma unroll
+        for (int pp_2 = 0; pp_2 < 4; pp_2++) {
+          if (valid[pp_2] != 0) {
+            int route_token = (int)tokens[pp_2];
+            unsigned int route_base =
+                route_index_raw[4 + num_tokens + route_parity * num_tokens + route_token];
+            unsigned int _atomic_old_0 =
+                atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[4 + route_token], 1);
+            unsigned int route_old = _atomic_old_0;
+            unsigned int route_slot = route_old - route_base;
+            if (route_slot < 16) {
+              *(reinterpret_cast<unsigned int*>(
+                    reinterpret_cast<unsigned int*>(route_index_raw) +
+                    (4 + 3 * num_tokens + route_token * 16 + (int)route_slot)) +
+                (0)) = (unsigned int)(pair_block * 4 + pp_2);
+            }
+          }
+        }
+      }
+    }
   }
   float owned_accum = 0.0f;
   unsigned int x_carriers[4];
@@ -401,50 +409,29 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
       }
     }
   }
-  if (route_build != 0) {
-    if (blockIdx.y == 0) {
-      if (tid == 0) {
-#pragma unroll
-        for (int pp_1 = 0; pp_1 < 1; pp_1++) {
-          if (valid[pp_1] != 0) {
-            int route_token = (int)tokens[pp_1];
-            unsigned int _atomic_old_0 =
-                atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[route_token], 1);
-            unsigned int route_slot = _atomic_old_0;
-            if (route_slot < 16) {
-              *(reinterpret_cast<unsigned int*>(
-                    reinterpret_cast<unsigned int*>(route_index_raw) +
-                    (2 * num_tokens + route_token * 16 + (int)route_slot)) +
-                (0)) = (unsigned int)(pair_block + pp_1);
-            }
-          }
-        }
-      }
-    }
-  }
 #pragma unroll
   for (int tile = 0; tile < 2; tile++) {
     if (tile < num_tiles) {
       int k_base = tile * 1024 + tid * 8;
 #pragma unroll
-      for (int pp_2 = 0; pp_2 < 1; pp_2++) {
-        if (valid[pp_2] != 0) {
+      for (int pp_1 = 0; pp_1 < 1; pp_1++) {
+        if (valid[pp_1] != 0) {
           if (k_base < hidden) {
             asm volatile(
                 "cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                    x_smem_addr + (unsigned int)((tile * 1024 + pp_2 * 1024 + tid * 8) * 2)),
+                    x_smem_addr + (unsigned int)((tile * 1024 + pp_1 * 1024 + tid * 8) * 2)),
                 "l"(reinterpret_cast<const __nv_bfloat16*>(x_raw) +
-                    (tokens[pp_2] * (long long)hidden + (long long)k_base)));
+                    (tokens[pp_1] * (long long)hidden + (long long)k_base)));
 #pragma unroll
             for (int rr = 0; rr < 8; rr++) {
               int rank_row = rank_base + rr;
               long long weight_index =
-                  ((loras[pp_2] * (long long)num_experts + experts[pp_2]) * 64 +
+                  ((loras[pp_1] * (long long)num_experts + experts[pp_1]) * 64 +
                    (long long)rank_row) *
                       (long long)hidden +
                   (long long)k_base;
               asm volatile("cp.async.cg.shared::cta.global [%0], [%1], 16;" ::"r"(
-                               w_smem_addr + (unsigned int)((tile * 8 * 1024 + pp_2 * 8 * 1024 +
+                               w_smem_addr + (unsigned int)((tile * 8 * 1024 + pp_1 * 8 * 1024 +
                                                              rr * 1024 + tid * 8) *
                                                             2)),
                            "l"(reinterpret_cast<const __nv_bfloat16*>(lora_a_raw) + weight_index));
@@ -454,6 +441,35 @@ __global__ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_shrink_gene
       }
     }
     asm volatile("cp.async.commit_group;");
+  }
+  if (route_build != 0) {
+    if (blockIdx.y == 0) {
+      if (tid == 0) {
+        int route_parity = (int)(route_index_raw[0] & 1);
+        if (blockIdx.x == 0) {
+          *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) + 1) +
+            (0)) = (unsigned int)route_parity;
+        }
+#pragma unroll
+        for (int pp_2 = 0; pp_2 < 1; pp_2++) {
+          if (valid[pp_2] != 0) {
+            int route_token = (int)tokens[pp_2];
+            unsigned int route_base =
+                route_index_raw[4 + num_tokens + route_parity * num_tokens + route_token];
+            unsigned int _atomic_old_0 =
+                atomicAdd(&reinterpret_cast<unsigned int*>(route_index_raw)[4 + route_token], 1);
+            unsigned int route_old = _atomic_old_0;
+            unsigned int route_slot = route_old - route_base;
+            if (route_slot < 16) {
+              *(reinterpret_cast<unsigned int*>(
+                    reinterpret_cast<unsigned int*>(route_index_raw) +
+                    (4 + 3 * num_tokens + route_token * 16 + (int)route_slot)) +
+                (0)) = (unsigned int)(pair_block + pp_2);
+            }
+          }
+        }
+      }
+    }
   }
   float owned_accum = 0.0f;
   unsigned int x_carriers[4];
@@ -628,7 +644,7 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
     float* __restrict__ topk_weights, int num_pairs, int num_experts, int num_tokens,
     int output_stride, int output_offset, unsigned int* __restrict__ route_index_raw,
-    int route_lookup, int route_reset, int hidden) {
+    int route_lookup, int route_advance, int hidden) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -657,6 +673,21 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
   unsigned int activation_carriers[4];
   float activation_values[8];
   if (token < num_tokens) {
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          int advance_parity = (int)route_index_raw[1];
+          *(reinterpret_cast<unsigned int*>(
+                reinterpret_cast<unsigned int*>(route_index_raw) +
+                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
+            (0)) = route_index_raw[4 + token];
+          if (token == 0) {
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
+              (0)) = route_index_raw[0] + 1;
+          }
+        }
+      }
+    }
     long long lora_id = lora_indices[token];
     if (lora_id >= 0) {
       int pair_base = token * 2;
@@ -754,11 +785,14 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
         int route_count = num_pairs;
         int use_index = 0;
         if (route_lookup != 0) {
-          int indexed_count = (int)route_index_raw[token];
+          int indexed_parity = (int)route_index_raw[1];
+          int indexed_count =
+              (int)(route_index_raw[4 + token] -
+                    route_index_raw[4 + num_tokens + indexed_parity * num_tokens + token]);
           if (indexed_count <= 16) {
             use_index = 1;
             route_count = indexed_count;
-            int table_base = 2 * num_tokens + token * 16;
+            int table_base = 4 + 3 * num_tokens + token * 16;
             if (indexed_count > tid) {
               int own_pair = (int)route_index_raw[table_base + tid];
               int own_order = 0;
@@ -855,26 +889,6 @@ __launch_bounds__(64, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t6
       if (output_col < hidden) {
         *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
           (0)) = total;
-      }
-      if (route_reset != 0) {
-        __syncthreads();
-        if (tid == 0) {
-          unsigned int _atomic_old_0;
-          asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                       : "=r"(_atomic_old_0)
-                       : "l"(&reinterpret_cast<unsigned int*>(route_index_raw)[num_tokens + token]),
-                         "r"(static_cast<uint32_t>(1))
-                       : "memory");
-          unsigned int finished = _atomic_old_0;
-          if (finished + 1 == (unsigned int)gridDim.y) {
-            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) +
-                                              token) +
-              (0)) = (unsigned int)0;
-            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) +
-                                              (num_tokens + token)) +
-              (0)) = (unsigned int)0;
-          }
-        }
       }
     } else if (output_col < hidden) {
       *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
@@ -916,7 +930,7 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
     long long* __restrict__ expert_ids, long long* __restrict__ lora_indices,
     float* __restrict__ topk_weights, int num_pairs, int num_experts, int num_tokens,
     int output_stride, int output_offset, unsigned int* __restrict__ route_index_raw,
-    int route_lookup, int route_reset, int hidden) {
+    int route_lookup, int route_advance, int hidden) {
   const int tid = threadIdx.x;
   const int warp = make_warp_uniform(tid / 32);
   const int lane = tid % 32;
@@ -945,6 +959,21 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
   unsigned int activation_carriers[4];
   float activation_values[8];
   if (token < num_tokens) {
+    if (route_advance != 0) {
+      if (blockIdx.y == 0) {
+        if (tid == 0) {
+          int advance_parity = (int)route_index_raw[1];
+          *(reinterpret_cast<unsigned int*>(
+                reinterpret_cast<unsigned int*>(route_index_raw) +
+                (4 + num_tokens + (1 - advance_parity) * num_tokens + token)) +
+            (0)) = route_index_raw[4 + token];
+          if (token == 0) {
+            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw)) +
+              (0)) = route_index_raw[0] + 1;
+          }
+        }
+      }
+    }
     long long lora_id = lora_indices[token];
     if (lora_id >= 0) {
       int pair_base = token * 2;
@@ -1042,11 +1071,14 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
         int route_count = num_pairs;
         int use_index = 0;
         if (route_lookup != 0) {
-          int indexed_count = (int)route_index_raw[token];
+          int indexed_parity = (int)route_index_raw[1];
+          int indexed_count =
+              (int)(route_index_raw[4 + token] -
+                    route_index_raw[4 + num_tokens + indexed_parity * num_tokens + token]);
           if (indexed_count <= 16) {
             use_index = 1;
             route_count = indexed_count;
-            int table_base = 2 * num_tokens + token * 16;
+            int table_base = 4 + 3 * num_tokens + token * 16;
             if (indexed_count > tid) {
               int own_pair = (int)route_index_raw[table_base + tid];
               int own_order = 0;
@@ -1143,26 +1175,6 @@ __launch_bounds__(128, 1) void kernel_flashinfer_bgmv_moe_expand_generic_token_t
       if (output_col < hidden) {
         *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +
           (0)) = total;
-      }
-      if (route_reset != 0) {
-        __syncthreads();
-        if (tid == 0) {
-          unsigned int _atomic_old_0;
-          asm volatile("atom.acq_rel.gpu.global.add.u32 %0, [%1], %2;"
-                       : "=r"(_atomic_old_0)
-                       : "l"(&reinterpret_cast<unsigned int*>(route_index_raw)[num_tokens + token]),
-                         "r"(static_cast<uint32_t>(1))
-                       : "memory");
-          unsigned int finished = _atomic_old_0;
-          if (finished + 1 == (unsigned int)gridDim.y) {
-            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) +
-                                              token) +
-              (0)) = (unsigned int)0;
-            *(reinterpret_cast<unsigned int*>(reinterpret_cast<unsigned int*>(route_index_raw) +
-                                              (num_tokens + token)) +
-              (0)) = (unsigned int)0;
-          }
-        }
       }
     } else if (output_col < hidden) {
       *(reinterpret_cast<float*>(y_accum + (token * output_stride + output_offset + output_col)) +

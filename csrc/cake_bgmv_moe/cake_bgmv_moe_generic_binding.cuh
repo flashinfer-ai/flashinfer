@@ -68,11 +68,13 @@ static_assert(kShrinkDecodeSmemBytes == 221696, "decode shrink smem layout chang
 static_assert(kShrinkPrefillSmemBytes == 36992, "prefill shrink smem layout changed");
 static_assert(kRank % kRankTile == 0, "rank must be a multiple of the 8-row shrink tile");
 // Token->pair route index published by the shrink kernels and consumed by the
-// expand kernels for arbitrary pair order: per token one route count, one
-// completion counter and kRouteIndexMaxRoutes pair slots (int32). The plan
-// allocates it zeroed; the last expand CTA of each token rearms its entry.
+// expand kernels for arbitrary pair order (u32 words): a 4-word header (launch
+// counter, parity used by the current shrink), per token a monotonic route
+// count, two launch-parity base counts and kRouteIndexMaxRoutes pair slots.
+// The plan allocates it zeroed once; the kernels never reset it.
 constexpr int32_t kRouteIndexMaxRoutes = 16;
-constexpr int32_t kRouteIndexWordsPerToken = 2 + kRouteIndexMaxRoutes;
+constexpr int32_t kRouteIndexHeaderWords = 4;
+constexpr int32_t kRouteIndexWordsPerToken = 3 + kRouteIndexMaxRoutes;
 
 enum class Schedule : int32_t {
   kTokenOwnedT64 = 0,
@@ -202,9 +204,10 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   CheckCompact(topk_weights, "topk_weights");
   CheckCompact(route_index, "route_index");
   TVM_FFI_ICHECK(route_index.ndim() == 1 &&
-                 route_index.size(0) >= static_cast<int64_t>(num_tokens) * kRouteIndexWordsPerToken)
-      << "route_index must hold at least num_tokens * " << kRouteIndexWordsPerToken
-      << " int32 words";
+                 route_index.size(0) >= kRouteIndexHeaderWords + static_cast<int64_t>(num_tokens) *
+                                                                     kRouteIndexWordsPerToken)
+      << "route_index must hold at least " << kRouteIndexHeaderWords << " + num_tokens * "
+      << kRouteIndexWordsPerToken << " int32 words";
 
   TVM_FFI_ICHECK(schedule_value >= static_cast<int64_t>(Schedule::kTokenOwnedT64) &&
                  schedule_value <= static_cast<int64_t>(Schedule::kTokenOwned))
@@ -223,7 +226,7 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
   auto* route_ptr = static_cast<unsigned int*>(route_index.data_ptr());
   constexpr int32_t kRouteBuild = 1;
   constexpr int32_t kRouteLookup = 1;
-  constexpr int32_t kRouteReset = 1;
+  constexpr int32_t kRouteAdvance = 1;
 
   const int32_t num_tiles = (hidden + kShrinkTileElements - 1) / kShrinkTileElements;
   const dim3 shrink_block(kShrinkThreads, 1, 1);
@@ -248,14 +251,14 @@ void Run(TensorView y_accum, TensorView shrink_out, TensorView x, TensorView lor
     const dim3 grid(num_tokens, (hidden + 63) / 64, 1);
     CAKE_BGMV_MOE_EXPAND_T64<<<grid, 64, kExpandT64SmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup, kRouteReset,
-        hidden);
+        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup,
+        kRouteAdvance, hidden);
   } else {
     const dim3 grid(num_tokens, (hidden + 127) / 128, 1);
     CAKE_BGMV_MOE_EXPAND_T128<<<grid, 128, kExpandT128SmemBytes, stream>>>(
         y_ptr, shrink_ptr, b_ptr, token_ptr, expert_ptr, lora_ptr, weight_ptr, num_pairs,
-        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup, kRouteReset,
-        hidden);
+        num_experts, num_tokens, output_stride, output_offset, route_ptr, kRouteLookup,
+        kRouteAdvance, hidden);
   }
   CheckCuda(cudaGetLastError(), "Cake BGMV MoE generic expand launch");
 }
