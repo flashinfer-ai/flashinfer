@@ -70,26 +70,44 @@ def _stage_kernel_source(program_key, stage):
         binding,
         re.S,
     )
-    assert block is not None, (program_key, stage)
+    assert block is not None, (
+        f"{program_key}: the sequence binding no longer has a "
+        f"`namespace stage_{stage} {{ ... }}  // namespace stage_{stage}` block"
+    )
     names = set(
         re.findall(
             r"kernel_(cake_kimi_k3_nvfp4_situ_routed_moe_[0-9a-f]{20})", block[1]
         )
     )
-    (name,) = names
-    (kernel,) = (
-        source for source in record["sources"] if source.endswith(f"/{name}_kernel.cu")
+    assert len(names) == 1, (
+        f"{program_key}: stage {stage} should launch exactly one "
+        f"`kernel_cake_kimi_k3_nvfp4_situ_routed_moe_<20 hex>` symbol, found {names}"
     )
-    return _source_path(kernel).read_text()
+    (name,) = names
+    kernels = [
+        source for source in record["sources"] if source.endswith(f"/{name}_kernel.cu")
+    ]
+    assert len(kernels) == 1, (
+        f"{program_key}: expected one `{name}_kernel.cu` among the record's sources, "
+        f"found {kernels}"
+    )
+    return _source_path(kernels[0]).read_text()
 
 
 def _fc2_launch_footprint(arch, selector):
-    source = _stage_kernel_source(ROUTES[(arch, selector)], "fc2")
-    threads, min_blocks = map(
-        int, re.search(r"__launch_bounds__\((\d+),\s*(\d+)\)", source).groups()
+    program_key = ROUTES[(arch, selector)]
+    source = _stage_kernel_source(program_key, "fc2")
+    bounds = re.search(r"__launch_bounds__\((\d+),\s*(\d+)\)", source)
+    assert bounds is not None, (
+        f"{program_key}: the FC2 kernel no longer declares "
+        "`__launch_bounds__(<threads>, <min blocks>)`"
     )
-    smem_bytes = int(re.search(r"#define SMEM_TOTAL (\d+)", source).group(1))
-    return threads, min_blocks, smem_bytes
+    smem = re.search(r"#define SMEM_TOTAL (\d+)", source)
+    assert smem is not None, (
+        f"{program_key}: the FC2 kernel no longer defines `SMEM_TOTAL`"
+    )
+    threads, min_blocks = map(int, bounds.groups())
+    return threads, min_blocks, int(smem.group(1))
 
 
 def _workspace_size(**overrides):
@@ -139,6 +157,8 @@ def test_cake_situ_workspace_size_holds_every_smaller_shape():
 
 # SM100 and SM103 shared memory per SM and the per-CTA reservation (CUDA C
 # Programming Guide, compute capability 10.x), and the register file per SM.
+# These are the values of the two architectures this backend supports; revisit
+# them if another SM is ever added to `cake_fused_moe_prepare_workspace`.
 SMEM_PER_SM_BYTES = 228 * 1024
 SMEM_RESERVED_PER_CTA_BYTES = 1024
 REGISTERS_PER_SM = 65536
@@ -168,6 +188,22 @@ def test_cake_situ_small_row_routes_declare_fused_quant_route(arch, num_tokens):
     # programs on both architectures and of no other small-row program.
     program_key = ROUTES[(arch, _small_row_selector(arch, num_tokens))]
     assert _declares_fused_quant_route(program_key) is (num_tokens in (8, 16))
+
+
+def test_cake_situ_program_records_are_consistent():
+    # Every program record names its generated sources, which must be present,
+    # and its JIT cache name is derived from the record's closure hash.
+    for program_key, record in PROGRAMS.items():
+        name = program_key.split(":")[1]
+        assert record["cache_name"] == (
+            f"cake_situ_{record['arch']}_{name}_{record['closure_sha256'][:16]}"
+        ), program_key
+        assert len(record["closure_sha256"]) == 64, program_key
+        for source in record["sources"]:
+            assert f"/{record['arch']}/" in source, (program_key, source)
+            assert _source_path(source).is_file(), (program_key, source)
+    for (arch, _selector), program_key in ROUTES.items():
+        assert PROGRAMS[program_key]["arch"] == arch, (arch, program_key)
 
 
 def test_cake_situ_two_cta_fc2_route_is_sixteen_tokens_on_sm103_only():
