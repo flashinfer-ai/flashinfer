@@ -42,7 +42,9 @@ def _fake_workspace() -> TRTLLMAllReduceFusionWorkspace:
     return workspace
 
 
-def test_cake_backend_routes_to_the_cake_loader(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_cake_backend_routes_to_the_cake_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(
         cake_moe_finalize_comm, "run_cake_moe_finalize", lambda **kw: calls.append(kw)
@@ -75,7 +77,9 @@ def test_unknown_backend_fails_before_loading_a_module(
         lambda: pytest.fail("invalid backend loaded the TRT-LLM module"),
     )
     with pytest.raises(ValueError, match="backend must be"):
-        trtllm_ar.trtllm_moe_finalize_allreduce_fusion(**_arguments(), backend="unknown")
+        trtllm_ar.trtllm_moe_finalize_allreduce_fusion(
+            **_arguments(), backend="unknown"
+        )
 
 
 @pytest.mark.parametrize(
@@ -119,7 +123,9 @@ def test_unified_selector_is_not_forwarded_to_other_patterns(
 ) -> None:
     calls: list[dict[str, object]] = []
     monkeypatch.setattr(
-        allreduce_module, "trtllm_allreduce_fusion", lambda **kwargs: calls.append(kwargs)
+        allreduce_module,
+        "trtllm_allreduce_fusion",
+        lambda **kwargs: calls.append(kwargs),
     )
     input = torch.empty((1, 16), dtype=torch.float16)
     output = torch.empty_like(input)

@@ -116,7 +116,9 @@ def _make_case(
     local = (local.float() * (routed_scaling_factor or 1.0)).to(dtype)
     if shared_expert_output is not None:
         local = (local.float() + shared_expert_output.float()).to(dtype)
-    residual_ref = (_rank_order_sum(local, group).float() + residual_in.float()).to(dtype)
+    residual_ref = (_rank_order_sum(local, group).float() + residual_in.float()).to(
+        dtype
+    )
     residual_f32 = residual_ref.float()
     norm_ref = (
         residual_f32
@@ -128,7 +130,9 @@ def _make_case(
     norm_out = torch.empty_like(residual_in)
     quant_out = scale_out = None
     if output_profile == "111":
-        quant_out = torch.zeros(residual_in.numel() // 2, dtype=torch.uint8, device=device)
+        quant_out = torch.zeros(
+            residual_in.numel() // 2, dtype=torch.uint8, device=device
+        )
         padded_rows = ((token_num + 127) // 128) * 128
         padded_columns = ((HIDDEN_SIZE // 16 + 3) // 4) * 4
         scale_out = torch.zeros(
@@ -198,7 +202,9 @@ def _measure(
     dist.all_gather_object(gathered, local_samples, group=group)
     per_rank = [list(rank_samples or []) for rank_samples in gathered]
     if any(len(rank_samples) != repeat_iters for rank_samples in per_rank):
-        raise RuntimeError(f"per-rank CUPTI sample counts differ: {list(map(len, per_rank))}")
+        raise RuntimeError(
+            f"per-rank CUPTI sample counts differ: {list(map(len, per_rank))}"
+        )
     rank_max = [max(iteration) for iteration in zip(*per_rank, strict=True)]
     dist.barrier(group=group)
     call()
@@ -214,14 +220,23 @@ def _measure(
 
 
 def _comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    keys = ("dtype", "token_num", "top_k", "launch_with_pdl", "output_profile", "shared_expert")
+    keys = (
+        "dtype",
+        "token_num",
+        "top_k",
+        "launch_with_pdl",
+        "output_profile",
+        "shared_expert",
+    )
     grouped: dict[tuple[Any, ...], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         grouped[tuple(row[k] for k in keys)].append(row)
     result = []
     for key, group_rows in grouped.items():
         legs = {
-            backend: [r["rank_max_median_ms"] for r in group_rows if r["backend"] == backend]
+            backend: [
+                r["rank_max_median_ms"] for r in group_rows if r["backend"] == backend
+            ]
             for backend in ("trtllm", "cake")
         }
         if not legs["trtllm"] or not legs["cake"]:
@@ -242,12 +257,20 @@ def _comparisons(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dtypes", nargs="+", choices=sorted(_DTYPES), default=["float16", "bfloat16"])
+    parser.add_argument(
+        "--dtypes", nargs="+", choices=sorted(_DTYPES), default=["float16", "bfloat16"]
+    )
     parser.add_argument("--tokens", nargs="+", type=int, default=[1, 16, 128, 2048])
     parser.add_argument("--top-k", nargs="+", type=int, choices=[4, 8], default=[4, 8])
-    parser.add_argument("--pdl", nargs="+", choices=sorted(_BOOL), default=["false", "true"])
-    parser.add_argument("--output-profiles", nargs="+", choices=["110", "111"], default=["110", "111"])
-    parser.add_argument("--shared-expert", nargs="+", choices=sorted(_BOOL), default=["false", "true"])
+    parser.add_argument(
+        "--pdl", nargs="+", choices=sorted(_BOOL), default=["false", "true"]
+    )
+    parser.add_argument(
+        "--output-profiles", nargs="+", choices=["110", "111"], default=["110", "111"]
+    )
+    parser.add_argument(
+        "--shared-expert", nargs="+", choices=sorted(_BOOL), default=["false", "true"]
+    )
     parser.add_argument(
         "--backends",
         nargs="+",
@@ -280,7 +303,9 @@ def main() -> int:
     arch = cake_finalize.target_arch(local_rank)
     for dtype_name in args.dtypes:
         for token_num in args.tokens:
-            lamport_bytes = token_num * HIDDEN_SIZE * _DTYPES[dtype_name].itemsize * world_size
+            lamport_bytes = (
+                token_num * HIDDEN_SIZE * _DTYPES[dtype_name].itemsize * world_size
+            )
             if lamport_bytes > MAX_COMM_SIZE:
                 raise SystemExit(
                     f"tokens={token_num} {dtype_name} TP{world_size} needs {lamport_bytes} "
@@ -313,8 +338,14 @@ def main() -> int:
         leg_index = 0
         for dtype_name, token_num, top_k, launch_with_pdl, profile, use_shared in cases:
             for backend in args.backends:
-                handles, workspace_ptrs = comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
-                    local_rank, world_size, max(args.tokens), HIDDEN_SIZE, group=group
+                handles, workspace_ptrs = (
+                    comm.trtllm_create_ipc_workspace_for_all_reduce_fusion(
+                        local_rank,
+                        world_size,
+                        max(args.tokens),
+                        HIDDEN_SIZE,
+                        group=group,
+                    )
                 )
                 try:
                     call, validate = _make_case(
@@ -360,7 +391,9 @@ def main() -> int:
                     )
                 finally:
                     dist.barrier(group=group)
-                    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(handles, group=group)
+                    comm.trtllm_destroy_ipc_workspace_for_all_reduce_fusion(
+                        handles, group=group
+                    )
                 leg_index += 1
         dist.barrier(group=group)
         if rank == 0:
@@ -386,8 +419,8 @@ def main() -> int:
                 print(
                     f"{row['dtype']:>8} tokens={row['token_num']:<5} top_k={row['top_k']} "
                     f"pdl={int(row['launch_with_pdl'])} o{row['output_profile']} "
-                    f"shared={int(row['shared_expert'])}: trtllm {row['trtllm_median_ms']*1e3:8.2f} us  "
-                    f"cake {row['cake_median_ms']*1e3:8.2f} us  x{row['speedup']:.3f}"
+                    f"shared={int(row['shared_expert'])}: trtllm {row['trtllm_median_ms'] * 1e3:8.2f} us  "
+                    f"cake {row['cake_median_ms'] * 1e3:8.2f} us  x{row['speedup']:.3f}"
                 )
     finally:
         if dist.is_initialized():

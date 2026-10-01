@@ -1277,8 +1277,10 @@ def trtllm_moe_finalize_allreduce_fusion(
     - expanded_idx_to_permuted_idx: the expanded index to permuted index tensor. [token_num, top_k]
     - norm_out: the norm output tensor. [token_num, hidden_dim]
     - residual_out: the residual output tensor. [token_num, hidden_dim]
-    - quant_out: the quant output tensor. [token_num // 4, hidden_dim], fp16/bf16 -> fp4
-    - scale_out: the scale output tensor. [token_num // SF_VEC_SIZE, hidden_dim], fp16/bf16 -> fp4
+    - quant_out: the packed FP4 output buffer, token_num * hidden_dim // 2 bytes
+      (any element type; the Cake backend checks the byte size).
+    - scale_out: the E4M3 scale output buffer in SWIZZLED_128x4 layout,
+      round_up(token_num, 128) * round_up(hidden_dim // 16, 4) bytes.
     - workspace_ptrs: the workspace pointers.
     - launch_with_pdl: whether to launch with pdl.
     - world_rank: the rank of the current process.

@@ -118,7 +118,7 @@ void cake_moe_finalize_allreduce_fusion(
                     allreduce_in.size(0) > 0,
                 ValueError)
       << "allreduce_in must have shape [num_permuted_rows, " << kHiddenDim << "]";
-  int dtype_index;
+  int dtype_index = 0;
   switch (encode_dlpack_dtype(allreduce_in.dtype())) {
     case float16_code:
       dtype_index = 0;
