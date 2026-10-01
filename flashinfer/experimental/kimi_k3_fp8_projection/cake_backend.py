@@ -525,6 +525,7 @@ class DecodeConfig:
     mc: int = 1  # round 6 (lever M): m tiles of one N tile per cluster sharing the W stage through TMA multicast (table key ``mc``; 1 = off)
     pfx: int = 0  # round 6 next loop (lever PX): BF16 token-tile L2 prefetch distance in stages (table key ``pfx``; fused, non-resident rows only; 0 = off)
     tstore: bool = False  # round 6 (lever E1): the split-1 epilogue stores BF16 through TMA (table key ``tstore``; the launch still needs a 16-byte-aligned output view)
+    pfi: int = 0  # round 6 continuation 7 (lever PI-W): cross-item L2 prefetch of the next work item's first W/SFW stages by the load warp (table key ``pfi``; multi-item rows with pf > 0; 0 = off)
 
     @property
     def tok_rows(self) -> int:
@@ -554,6 +555,7 @@ class DecodeConfig:
             and self.tstore
             and self.split == 1
             and self.csplit == 1,
+            pfi=self.pfi,
         )
 
 
@@ -704,6 +706,9 @@ def decode_config(
     # ``pfx`` stages ahead of its TMA load (its DRAM access then precedes the weight burst instead of queueing behind
     # it); fused, non-resident rows only (host mirror of the Cake ``decode_config`` rule).
     pfx = int(entry.get("pfx", 0)) if (fused and not resident) else 0
+    # Table key ``pfi`` (round 6 continuation 7, lever PI-W): during the last ``pf`` stages of a work item the load warp
+    # also prefetches the NEXT item's first W/SFW tiles into L2 (host mirror of the Cake ``decode_config`` rule: pf > 0).
+    pfi = int(entry.get("pfi", 0)) if pf > 0 else 0
     cs_alias = (
         csplit > 1
         and grid == total_work
@@ -739,6 +744,7 @@ def decode_config(
         pf=pf,
         mc=mc,
         pfx=pfx,
+        pfi=pfi,
         cs_alias=cs_alias,
     )
 

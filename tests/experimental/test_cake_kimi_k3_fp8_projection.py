@@ -284,6 +284,8 @@ def test_decode_config_rules(arch):
         assert cfg.pfx == (
             int(entry.get("pfx", 0)) if (cfg.fused and not cfg.resident) else 0
         )
+        # Round-6 continuation 7 (lever PI-W): the next-item W/SFW L2 prefetch rides on the weight prefetch (pf > 0 rows only).
+        assert cfg.pfi == (int(entry.get("pfi", 0)) if cfg.pf > 0 else 0)
         if cfg.mc > 1:
             assert cfg.split == 1 and cfg.csplit == 1 and not cfg.resident
             assert cfg.m_tiles % cfg.mc == 0 and cfg.total_work == cfg.tiles // cfg.mc
@@ -327,7 +329,8 @@ def test_decode_config_rules(arch):
         assert (f"_mc{cfg.mc}" in cfg.kernel_key) == (cfg.mc > 1)
         assert (f"_pf{cfg.pf}" in cfg.kernel_key) == (cfg.pf > 0)
         assert (f"_px{cfg.pfx}" in cfg.kernel_key) == (cfg.pfx > 0)
-        core_key = re.sub(r"(_mc\d+)?(_pf\d+)?(_px\d+)?$", "", cfg.kernel_key)
+        assert (f"_pi{cfg.pfi}" in cfg.kernel_key) == (cfg.pfi > 0)
+        core_key = re.sub(r"(_mc\d+)?(_pf\d+)?(_px\d+)?(_pi\d+)?$", "", cfg.kernel_key)
         # Round-3 fused knobs: a decoupled ring only for fused, non-resident rows; narrow units divide evenly.
         if entry.get("xb_stages"):
             assert (

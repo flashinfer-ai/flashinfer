@@ -80,6 +80,7 @@ def decode_kernel_key(
     mc: int = 1,
     tstore: bool = False,
     pfx: int = 0,
+    pfi: int = 0,
 ) -> str:
     key = f"decode:t{int(tok)}_p{int(stages)}"
     if fused:
@@ -104,6 +105,8 @@ def decode_kernel_key(
         key += f"_px{int(pfx)}"  # round 6 next loop (lever PX): the BF16 token tile prefetched into L2 pfx stages ahead of its TMA load
     if tstore:
         key += "_tso"  # round 6 (lever E1): the split-1 epilogue stores BF16 through TMA (16-byte-aligned output views)
+    if int(pfi) > 0:
+        key += f"_pi{int(pfi)}"  # round 6 continuation 7 (lever PI-W): the load warp prefetches the next work item's first W/SFW tiles into L2 (needs pf > 0)
     return key
 
 
