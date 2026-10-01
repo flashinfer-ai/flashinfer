@@ -365,7 +365,7 @@ _GENERIC_CASES = [
     (1856, 16, 96, torch.float16, True, 8),
     # top-k above the 16-slot route index: exact serial-scan fallback
     (2048, 8, 24, torch.bfloat16, True, 20),
-    # hidden-split shrink: decode kernel x 4 splits, 1-pair kernel x 7 / 6 splits
+    # hidden-split shrink: decode kernel x 7 / 4 splits, 1-pair kernel x 7 / 6 splits
     (7168, 64, 16, torch.float16, False, 2),
     (7168, 8, 4, torch.bfloat16, True, 2),
     (5888, 32, 4, torch.bfloat16, False, 2),

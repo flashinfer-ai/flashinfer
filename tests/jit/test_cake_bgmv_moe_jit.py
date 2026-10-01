@@ -352,8 +352,8 @@ def test_route_index_workspace_sizing():
 @pytest.mark.parametrize(
     ("num_pairs", "rank", "hidden_size", "expected"),
     [
-        # 16 tokens x top-k 2 at hidden 7168: decode grid 8 x 4 over 7 tiles -> 4 splits
-        (32, 32, 7168, (1, 4)),
+        # 16 tokens x top-k 2 at hidden 7168: decode grid 8 x 4 (32 CTAs) x all 7 tiles
+        (32, 32, 7168, (1, 7)),
         # rank 8 at 32 pairs: decode grid too small -> 1-pair kernel, 7 splits
         (32, 8, 7168, (0, 7)),
         # 4 tokens at hidden 5888: 1-pair kernel, all 6 tiles split
