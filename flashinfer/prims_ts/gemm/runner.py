@@ -187,6 +187,9 @@ class PrimsTsGemmRunner(TunableRunner):
             identity.head_dim,
             identity.is_neox,
             identity.has_qkv_scale,
+            # Tactic tuples gained use_tma_store. Keep this so a winner saved
+            # before that field is not replayed.
+            "tma_store",
         )
 
     def precompile_tactics(self, inputs, tactics, profile, **kwargs) -> bool:

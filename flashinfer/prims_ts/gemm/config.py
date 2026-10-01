@@ -40,3 +40,5 @@ class PrimsTsGemmConfig:
     tmem_overlap: bool = False
     # None retains the derived pipeline depth (6 FP8, 5 NVFP4, 4 QKV).
     ab_stages: Optional[int] = None
+    # False keeps the direct epilogue store. FP4 output has no TMA store path.
+    use_tma_store: bool = False
