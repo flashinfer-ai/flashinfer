@@ -2709,7 +2709,7 @@ def test_checkpointing_ssu_int8_rn_parity(
         D=D,
         dt_bias=dt_bias,
         dt_softplus=True,
-        state_batch_indices=(state_batch_indices if paged_cache else None),
+        state_batch_indices=(state_batch_indices.contiguous() if paged_cache else None),
         out=ref_out,
     )
 
