@@ -458,6 +458,12 @@ _FLAG_SPEC_SAMPLE = 64
 _SPEC_SAMPLE_WIDE_EPT = 32
 _SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER = 8
 _SPEC_SAMPLE_WIDE_MIN_CHUNKS = 16
+# A two-chunk ept-32 stream whose second chunk is at least this full keeps the coarse-sample build on the listed
+# capability: on B200 the strided histogram of a full second chunk costs more than the sampled read it replaces
+# (round 7, V = 262144 on the cluster-8 stream: `_sp` kernel +2.1 % in two interleaved profiler passes, +0.2..+0.8 %
+# in the interleaved CUPTI harness, +0.8 / +2.4 % in two idle-node matrices at k = 10 / 50), while the 16 %-full
+# second chunk of V = 151936 stays neutral-to-faster there and GB300 keeps the win on both.
+_SPEC_SAMPLE_WIDE_TWO_CHUNK_MAX_FILL_BY_CAPABILITY: dict[tuple[int, int], float] = {(10, 0): 0.5}
 # Capabilities whose every eligible stream launch takes the speculative-sample build (B200 / GB300: the paired stage-1
 # A/B and the round-7 FlashInfer matrices).  Elsewhere (Hopper, Rubin: round-7 matrices only) the build is taken on
 # clusters up to _SPEC_SAMPLE_NARROW_MAX_CLUSTER with at least _SPEC_SAMPLE_NARROW_MIN_CTAS CTAs: on a small-top-k launch
@@ -535,7 +541,9 @@ def _spec_sample_flag(
     strided histogram of the chunk already in registers is cheaper than the separate sampled read it replaces (round 7,
     lever SP: ept-16 streams 2-13 % faster at 1-16 chunks, the cluster-8 ept-32 stream at one chunk 13-18 % and at two
     chunks 0-6 %, the cluster-1 ept-32 stream at 16 chunks 2-15 %); ept-32 streams at 2-10 chunks per CTA on clusters
-    1-4 measured 0-6 % slower with it and keep their round-6 build.  A cluster-8 stream above ``fused_tail_kcap`` never
+    1-4 measured 0-6 % slower with it and keep their round-6 build, and on a capability listed in
+    ``_SPEC_SAMPLE_WIDE_TWO_CHUNK_MAX_FILL_BY_CAPABILITY`` so does a two-chunk row whose second chunk is at least that
+    full (B200 V = 262144 on the cluster-8 stream: 0.2-2.4 % slower with it; V = 151936 keeps the twin).  A cluster-8 stream above ``fused_tail_kcap`` never
     takes it on any capability (the 1/2-rate register histogram on the two-launch chain: GB300 V = 262144 +11..+17 %
     eager, +3..+7 % graph; H100 / R200 +3..+8 %).  On any other capability the same chunk rule applies
     only on a cluster of at most ``_SPEC_SAMPLE_NARROW_MAX_CLUSTER`` CTAs whose grid has at least
@@ -566,6 +574,13 @@ def _spec_sample_flag(
         return _FLAG_SPEC_SAMPLE if _stage1_has_spec_sample(cluster, ept, True) else 0
     if chunks == 2:
         if int(cluster) < _SPEC_SAMPLE_WIDE_TWO_CHUNK_CLUSTER:
+            return 0
+        max_fill = (
+            None
+            if capability is None
+            else _SPEC_SAMPLE_WIDE_TWO_CHUNK_MAX_FILL_BY_CAPABILITY.get(tuple(int(x) for x in capability))
+        )
+        if max_fill is not None and int(vocab) / (_THREADS * int(ept) * int(cluster)) - 1.0 >= max_fill:
             return 0
     elif chunks != 1 and chunks < _SPEC_SAMPLE_WIDE_MIN_CHUNKS:
         return 0

@@ -77,7 +77,9 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    chunks (round 7, lever SP: ept-16 streams 2-13 % faster at 1-16 chunks, the cluster-8 ept-32
    stream 13-18 % at one chunk and 0-6 % at two, the cluster-1 ept-32 stream at 16 chunks 2-15 %);
    ept-32 streams at 2-10 chunks per CTA on clusters 1-4 measured 0-6 % slower with it and keep
-   their round-6 build, and a cluster-8 stream above ``fused_tail_kcap`` (the two-launch chain, 1/2-rate
+   their round-6 build, on B200 so does a two-chunk row whose second chunk is at least half full (the
+   cluster-8 stream at V = 262144: 0.2-2.4 % slower with it at k <= 64, while V = 151936 keeps the twin
+   and GB300 keeps it on both), and a cluster-8 stream above ``fused_tail_kcap`` (the two-launch chain, 1/2-rate
    sample) keeps it on every architecture (GB300 V = 262144 measured 11-17 % slower eager and 3-7 % slower
    under graph replay with the speculative build).  That is the B200 / GB300 rule; on Hopper and Rubin the same chunk rule
    applies only on a cluster of at most 4 CTAs whose grid has at least 64 CTAs, for a largest top-k

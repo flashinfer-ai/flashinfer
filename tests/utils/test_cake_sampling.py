@@ -1663,6 +1663,11 @@ def test_spec_sample_build_matches_default_build():
     assert cs._spec_sample_flag(8, 32, True, 128256) == cs._FLAG_SPEC_SAMPLE  # one chunk
     assert cs._spec_sample_flag(1, 32, True, 262144) == cs._FLAG_SPEC_SAMPLE  # 16 chunks
     assert cs._spec_sample_flag(8, 32, True, 262144) == cs._FLAG_SPEC_SAMPLE  # two chunks on cluster 8
+    # B200: a two-chunk row whose second chunk is at least half full keeps the coarse build; GB300 keeps the twin
+    assert cs._spec_sample_flag(8, 32, True, 262144, 10, 1, (10, 0)) == 0  # second chunk full
+    assert cs._spec_sample_flag(8, 32, True, 151936, 10, 1, (10, 0)) == cs._FLAG_SPEC_SAMPLE  # second chunk 16 % full
+    assert cs._spec_sample_flag(8, 32, True, 262144, 10, 1, (10, 3)) == cs._FLAG_SPEC_SAMPLE
+    assert cs._sample_build_flag(8, 32, True, 10, 262144, 1, (10, 0)) == cs._FLAG_COARSE_SAMPLE
     assert cs._spec_sample_flag(4, 32, True, 262144) == 0  # 4 chunks
     assert cs._spec_sample_flag(1, 32, True, 151936) == 0  # 10 chunks
     assert cs._spec_sample_flag(1, 32, True, 32768) == 0  # 2 chunks
