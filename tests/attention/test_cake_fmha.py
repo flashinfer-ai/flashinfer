@@ -92,9 +92,10 @@ def test_cake_fmha_manifest_is_authenticated_and_complete() -> None:
     # instances (two arch bodies + one launch binding each) and the seven
     # round-2 balanced components (fp8, bf16q, fp16q, bf16 hd64, bf16 hd256
     # p16/p32/p64: two arch programs + one launch binding each), plus the
-    # round-3 balanced DCP speculative-decode families (three launch bindings
-    # and one program each, instantiated by -DN_ROWS for both architectures).
-    assert len(manifest["artifacts"]) == 206
+    # round-3 balanced DCP speculative-decode families (three launch bindings;
+    # one program each, instantiated by -DN_ROWS for both architectures, except
+    # the E4M3 head_dim 128 family, which ships two host-selected programs).
+    assert len(manifest["artifacts"]) == 207
     dcp_addon = manifest["add_ons"]["cake_fmha_dcp_spec"]
     assert dcp_addon["installed"] is True
     assert dcp_addon["selection_key"] == "causal_seqlens_kv_global"
