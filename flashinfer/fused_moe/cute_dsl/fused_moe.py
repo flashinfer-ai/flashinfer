@@ -50,7 +50,7 @@ Example (Wrapper API with CUDA Graph):
     >>> g.replay()
 """
 
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple
 
 import warnings
 import weakref
@@ -272,31 +272,8 @@ def _moe_core_impl(
     tile_size: int = 128,
     gemm1_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm1_cluster_shape_mn: Tuple[int, int] = (1, 1),
-    # Blackwell single-CTA GEMM1 tile only: (1, 1, 2) clusters split each
-    # tile's K over two CTAs while the valid tiles fit half the CTAs.
-    gemm1_cluster_split_k: bool = False,
     gemm2_mma_tiler_mn: Tuple[int, int] = (128, 128),
     gemm2_cluster_shape_mn: Tuple[int, int] = (1, 1),
-    # Dual-tile routing (Blackwell, off when dual_tile_size == 0): the routing
-    # pads each routing to tile_size or dual_tile_size at run time and both GEMMs
-    # are launched once per tile variant; the variant the routing did not choose
-    # reads a zero tile count and exits. ``moe_sort_buffers`` must carry the
-    # ``out_alt_*`` and ``out_base_active_num_non_exiting_tiles`` buffers.
-    dual_tile_size: int = 0,
-    dual_gemm1_mma_tiler_mn: Tuple[int, int] = (256, 256),
-    dual_gemm1_cluster_shape_mn: Tuple[int, int] = (2, 1),
-    dual_gemm2_mma_tiler_mn: Tuple[int, int] = (256, 256),
-    dual_gemm2_cluster_shape_mn: Tuple[int, int] = (2, 1),
-    dual_tile_threshold_permille: int = 0,
-    # GEMM2 tile raster order (Blackwell finalize kernel): M-fastest keeps the
-    # fused finalize's reduce target slab (one N tile of every token row)
-    # L2-resident; N-fastest (default) reuses each A tile across N tiles.
-    gemm2_raster_along_m: Union[bool, str] = False,
-    gemm2_swizzle_size: int = 1,
-    # Launch the alternate-tile GEMMs as programmatic dependents of the base
-    # ones (PDL): their launch overlaps the base kernel's tail, so the variant
-    # the routing did not choose costs about a launch gap instead of ~3 us.
-    dual_alt_pdl: bool = True,
     # Tactic parameters (Rubin — when set, use SM107 kernel)
     gemm1_mma_tiler: Optional[Tuple[int, int, int]] = None,
     gemm1_mma_inst_shape: Optional[Tuple[int, int, int]] = None,
@@ -316,21 +293,13 @@ def _moe_core_impl(
     output_dtype: torch.dtype = torch.bfloat16,
     use_async_memset: bool = True,
     use_fused_finalize: bool = True,
-    gemm2_partial_out: Optional[torch.Tensor] = None,
-    skip_unpermute: bool = False,
-    weight_l2_hint: Optional[int] = None,
     enable_pdl: bool = True,
     activation_type: int = ActivationType.Swiglu.value,
     swiglu_alpha: float = DEFAULT_SWIGLU_ALPHA,
     swiglu_beta: float = DEFAULT_SWIGLU_BETA,
     swiglu_limit: float = DEFAULT_SWIGLU_LIMIT,
-    situ_beta: Optional[Union[float, torch.Tensor]] = None,
-    situ_linear_beta: Optional[Union[float, torch.Tensor]] = None,
-    # int32 (claim, done) counters, zeroed once: the gather GEMM1's epilogue
-    # warps zero-fill ``moe_output`` for the fused finalize (no memset launch).
-    zero_fill_counters: Optional[torch.Tensor] = None,
-    _prepared_launches: Optional[Dict[str, Any]] = None,
-    _enable_decode_specialization: bool = False,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
     nvfp4_4over6: Optional[NVFP44Over6Config] = _UNSET,
 ) -> torch.Tensor:
     """Core MoE implementation shared by functional and wrapper APIs.
@@ -418,8 +387,10 @@ def _moe_core_impl(
         raise ValueError("per_token_scale is not supported when quant_mode='w4a8'")
     if is_mxfp8 and output_dtype is not torch.bfloat16:
         raise ValueError("quant_mode='w4a8' supports only torch.bfloat16 output")
-    # W4A8 supports both finalize forms: the atomic epilogue and the
-    # expanded-row GEMM2 output reduced by ``moe_unpermute``.
+    if is_mxfp8 and not use_fused_finalize:
+        raise ValueError("quant_mode='w4a8' requires use_fused_finalize=True")
+    if is_mxfp8 and (situ_beta is not None or situ_linear_beta is not None):
+        raise ValueError("SiTU is not supported when quant_mode='w4a8'")
     validate_cute_dsl_moe_situ_config(activation, situ_beta, situ_linear_beta)
     if is_mxfp8:
         validate_w4a8_inputs(
@@ -479,20 +450,7 @@ def _moe_core_impl(
         )
 
     # Step 1: Sort tokens by expert
-    moe_sort_kwargs = dict(moe_sort_buffers or {})
-    if dual_tile_size:
-        if is_rubin:
-            raise NotImplementedError("dual-tile routing is a Blackwell path")
-        for name in (
-            "out_alt_tile_idx_to_expert_idx",
-            "out_alt_tile_idx_to_mn_limit",
-            "out_alt_num_non_exiting_tiles",
-            "out_base_active_num_non_exiting_tiles",
-        ):
-            if name not in moe_sort_kwargs:
-                raise ValueError(f"dual-tile routing needs moe_sort_buffers[{name!r}]")
-        moe_sort_kwargs["tile_tokens_dim_alt"] = dual_tile_size
-        moe_sort_kwargs["dual_tile_threshold_permille"] = dual_tile_threshold_permille
+    moe_sort_kwargs = moe_sort_buffers or {}
     (
         tile_idx_to_expert_idx,
         tile_idx_to_mn_limit,
@@ -509,7 +467,6 @@ def _moe_core_impl(
         num_local_experts=num_local_experts,
         tile_tokens_dim=tile_size,
         enable_pdl=enable_pdl,
-        _prepared_launches=_prepared_launches,
         **moe_sort_kwargs,
     )
 
@@ -519,17 +476,6 @@ def _moe_core_impl(
         moe_output.record_stream(aux_stream)
 
     # Step 2: GEMM1 + activation
-    gemm1_zero_fill = (
-        zero_fill_counters is not None and use_fused_finalize and moe_output is not None
-    )
-    base_num_tiles = (
-        moe_sort_kwargs["out_base_active_num_non_exiting_tiles"]
-        if dual_tile_size
-        else num_non_exiting_tiles
-    )
-    alt_num_tiles = (
-        moe_sort_kwargs["out_alt_num_non_exiting_tiles"] if dual_tile_size else None
-    )
     a_dtype = "float8_e4m3fn" if is_mxfp8 else "float4_e2m1fn"
     sf_dtype = "float8_e8m0fnu" if is_mxfp8 else "float8_e4m3fn"
     sf_vec_size = 32 if is_mxfp8 else 16
@@ -551,11 +497,7 @@ def _moe_core_impl(
             tile_idx_to_expert_idx=tile_idx_to_expert_idx,
             tile_idx_to_mn_limit=tile_idx_to_mn_limit,
             token_id_mapping=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=(
-                moe_sort_kwargs["out_base_active_num_non_exiting_tiles"]
-                if dual_tile_size
-                else num_non_exiting_tiles
-            ),
+            num_non_exiting_tiles=num_non_exiting_tiles,
             out=gemm1_out,
             out_scale=None if use_per_token_activation else gemm1_out_scale,
             global_scale=(
@@ -573,80 +515,18 @@ def _moe_core_impl(
             topk=top_k,
             mma_tiler_mn=gemm1_mma_tiler_mn,
             cluster_shape_mn=gemm1_cluster_shape_mn,
-            cluster_split_k=gemm1_cluster_split_k,
             mma_tiler=gemm1_mma_tiler,
             mma_inst_shape=gemm1_mma_inst_shape,
             enable_pdl=enable_pdl,
             activation_type=activation.value,
-            weight_l2_hint=weight_l2_hint,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             gated=gated,
-            zero_fill_output=moe_output if gemm1_zero_fill else None,
-            zero_fill_counters=zero_fill_counters if gemm1_zero_fill else None,
-            zero_fill_other_tiles=(
-                (alt_num_tiles if dual_tile_size else base_num_tiles)
-                if gemm1_zero_fill
-                else None
-            ),
-            _prepared_launches=_prepared_launches,
         )
     )
-    if dual_tile_size:
-        # Alternate-tile GEMM1 over the same permuted rows and output buffers;
-        # it runs only when the routing chose the alternate tile.
-        alt_launches: Optional[Dict[str, Any]] = (
-            {} if _prepared_launches is not None else None
-        )
-        blockscaled_contiguous_gather_grouped_gemm_act_fusion(
-            a=x,
-            b=w1_weight,
-            a_scale=x_sf,
-            b_scale=w1_weight_sf,
-            alpha=w1_alpha,
-            tile_idx_to_expert_idx=moe_sort_kwargs["out_alt_tile_idx_to_expert_idx"],
-            tile_idx_to_mn_limit=moe_sort_kwargs["out_alt_tile_idx_to_mn_limit"],
-            token_id_mapping=permuted_idx_to_expanded_idx,
-            num_non_exiting_tiles=moe_sort_kwargs["out_alt_num_non_exiting_tiles"],
-            out=gemm1_out,
-            out_scale=None if use_per_token_activation else gemm1_out_scale,
-            global_scale=(
-                fc2_input_scale
-                if not is_mxfp8 and not use_per_token_activation
-                else None
-            ),
-            a_per_token_scale=per_token_scale,
-            c_dtype=c_dtype,
-            a_dtype=a_dtype,
-            b_dtype="float4_e2m1fn",
-            sf_dtype=sf_dtype,
-            sf_vec_size=sf_vec_size,
-            quantize_output=not use_per_token_activation,
-            topk=top_k,
-            mma_tiler_mn=dual_gemm1_mma_tiler_mn,
-            cluster_shape_mn=dual_gemm1_cluster_shape_mn,
-            mma_tiler=None,
-            mma_inst_shape=None,
-            enable_pdl=enable_pdl or dual_alt_pdl,
-            activation_type=activation.value,
-            weight_l2_hint=weight_l2_hint,
-            swiglu_alpha=swiglu_alpha,
-            swiglu_beta=swiglu_beta,
-            swiglu_limit=swiglu_limit,
-            situ_beta=situ_beta,
-            situ_linear_beta=situ_linear_beta,
-            gated=gated,
-            zero_fill_output=moe_output if gemm1_zero_fill else None,
-            zero_fill_counters=zero_fill_counters if gemm1_zero_fill else None,
-            zero_fill_other_tiles=base_num_tiles if gemm1_zero_fill else None,
-            zero_fill_secondary=True,
-            _prepared_launches=alt_launches,
-        )
-        if _prepared_launches is not None:
-            _prepared_launches["gather_alt"] = alt_launches["gather"]
     if use_per_token_activation:
         intermediate, intermediate_sf, intermediate_per_token_scale = (
             nvfp4_quantize_per_token_cute_dsl(
@@ -668,28 +548,15 @@ def _moe_core_impl(
     # Atomic finalize requires a zeroed token output. Deterministic finalize
     # writes each route to a unique expanded row.
     if use_fused_finalize:
-        if gemm1_zero_fill:
-            pass  # GEMM1's epilogue warps zero-filled the output.
-        elif use_async_memset:
+        if use_async_memset:
             with torch.cuda.stream(aux_stream):
                 main_event.wait()
-                moe_output_memset_inplace(
-                    moe_output, _prepared_launches=_prepared_launches
-                )
+                moe_output_memset_inplace(moe_output)
                 memset_event.record()
             memset_event.wait()
         else:
-            moe_output_memset_inplace(moe_output, _prepared_launches=_prepared_launches)
+            moe_output_memset_inplace(moe_output)
         gemm2_output = moe_output
-    elif gemm2_partial_out is not None:
-        # Caller-owned expanded-row buffer (workspace) for the two-stage
-        # finalize; rows are (token, slot) indexed.
-        if gemm2_partial_out.shape[0] < num_tokens * top_k or (
-            gemm2_partial_out.shape[1] != hidden_size
-            or gemm2_partial_out.dtype != output_dtype
-        ):
-            raise ValueError("gemm2_partial_out must be [>= T * top_k, H] output rows")
-        gemm2_output = gemm2_partial_out[: num_tokens * top_k]
     else:
         gemm2_output = torch.empty(
             (num_tokens * top_k, hidden_size),
@@ -705,11 +572,7 @@ def _moe_core_impl(
         b_scale=w2_weight_sf,
         alpha=w2_alpha,
         tile_idx_to_expert_idx=tile_idx_to_expert_idx,
-        num_non_exiting_tiles=(
-            moe_sort_kwargs["out_base_active_num_non_exiting_tiles"]
-            if dual_tile_size
-            else num_non_exiting_tiles
-        ),
+        num_non_exiting_tiles=num_non_exiting_tiles,
         tile_idx_to_mn_limit=tile_idx_to_mn_limit,
         permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
         token_final_scales=token_final_scales,
@@ -726,57 +589,11 @@ def _moe_core_impl(
         cluster_shape_mn=gemm2_cluster_shape_mn,
         enable_pdl=enable_pdl,
         use_fused_finalize=use_fused_finalize,
-        weight_l2_hint=weight_l2_hint,
-        raster_along_m=gemm2_raster_along_m,
-        swizzle_size=gemm2_swizzle_size,
-        _prepared_launches=_prepared_launches,
-        _enable_narrow_a=_enable_decode_specialization,
     )
-    if dual_tile_size:
-        # Alternate-tile GEMM2 (same output, same permuted rows); runs only when
-        # the routing chose the alternate tile.
-        alt_launches = {} if _prepared_launches is not None else None
-        blockscaled_contiguous_grouped_gemm_finalize_fusion(
-            a=intermediate,
-            b=w2_weight,
-            a_scale=intermediate_sf,
-            b_scale=w2_weight_sf,
-            alpha=w2_alpha,
-            tile_idx_to_expert_idx=moe_sort_kwargs["out_alt_tile_idx_to_expert_idx"],
-            num_non_exiting_tiles=moe_sort_kwargs["out_alt_num_non_exiting_tiles"],
-            tile_idx_to_mn_limit=moe_sort_kwargs["out_alt_tile_idx_to_mn_limit"],
-            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
-            token_final_scales=token_final_scales,
-            out=gemm2_output,
-            a_per_token_scale=intermediate_per_token_scale,
-            a_dtype=a_dtype,
-            b_dtype="float4_e2m1fn",
-            sf_dtype=sf_dtype,
-            sf_vec_size=sf_vec_size,
-            out_dtype="bfloat16",
-            mma_tiler_mn=dual_gemm2_mma_tiler_mn,
-            mma_tiler=None,
-            mma_inst_shape=None,
-            cluster_shape_mn=dual_gemm2_cluster_shape_mn,
-            enable_pdl=enable_pdl or dual_alt_pdl,
-            use_fused_finalize=use_fused_finalize,
-            weight_l2_hint=weight_l2_hint,
-            raster_along_m=gemm2_raster_along_m,
-            swizzle_size=gemm2_swizzle_size,
-            _prepared_launches=alt_launches,
-            _enable_narrow_a=False,
-        )
-        if _prepared_launches is not None:
-            _prepared_launches["finalize_alt"] = alt_launches["finalize"]
 
     # Step 4: Deterministic routing-weight reduction
-    if not use_fused_finalize and skip_unpermute:
-        # The caller reduces the expanded rows itself (see
-        # ``mxfp4_finalize.plan_finalize_rows(expanded_rows=True)``).
-        if _prepared_launches is not None:
-            _prepared_launches["gemm2_partial"] = gemm2_output
-    elif not use_fused_finalize:
-        unpermute_kwargs = dict(
+    if not use_fused_finalize:
+        moe_unpermute(
             permuted_input=gemm2_output,
             output=moe_output,
             expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
@@ -786,11 +603,6 @@ def _moe_core_impl(
             input_is_expanded=True,
             enable_pdl=enable_pdl,
         )
-        moe_unpermute(**unpermute_kwargs)
-        if _prepared_launches is not None:
-            # Fixed-address replay of the reduction (the expanded-row buffer
-            # is retained through the kwargs).
-            _prepared_launches["unpermute"] = (moe_unpermute, unpermute_kwargs)
 
     return moe_output[:num_tokens]
 
