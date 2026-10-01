@@ -256,6 +256,12 @@ def test_key_pass_policy_rule():
         (4096, 45512): 2,
     }
     assert {k: policy.passes(k[0], k[1], 2048) for k in expected} == expected
+    # a packed multi-segment key row plans one pass: whole-row ranges do not match segment-confined index rows
+    assert policy.passes(4096, 65536, 2048, num_segments=1) == 2
+    assert policy.passes(4096, 65536, 2048, num_segments=2) == 1
+    assert policy.passes(4096, 268757, 2048, num_segments=9) == 1
+    with pytest.raises(ValueError, match="num_segments"):
+        policy.passes(4096, 65536, 2048, num_segments=0)
     assert key_pass_ranges(65536, 2) == ((0, 32768), (32768, 65536))
     assert key_pass_ranges(131072, 3) == ((0, 43691), (43691, 87382), (87382, 131072))
     assert key_pass_ranges(10, 1) == ((0, 10),)
@@ -278,6 +284,14 @@ def test_plan_key_passes_override_and_policy():
     # no registered policy, or no pass stages: the single-pass stage
     assert plan_key_passes({}, _ALL_STAGES, 4096, 65536, 2048) == 1
     assert plan_key_passes(record, _SINGLE_PASS_STAGES, 4096, 65536, 2048) == 1
+    # a packed multi-segment row: one pass by policy, an explicit override still counts
+    assert plan_key_passes(record, _ALL_STAGES, 4096, 65536, 2048, num_segments=2) == 1
+    assert (
+        plan_key_passes(
+            record, _ALL_STAGES, 4096, 65536, 2048, key_passes=2, num_segments=2
+        )
+        == 2
+    )
     # explicit override
     assert plan_key_passes(record, _ALL_STAGES, 4096, 65536, 2048, key_passes=1) == 1
     assert plan_key_passes(record, _ALL_STAGES, 4096, 4096, 2048, key_passes=5) == 5
@@ -1546,6 +1560,59 @@ def test_backward_whole_row_policy_two_passes_through_public_entry():
     _check_backward(single, ref, canonical=True)
     assert rel_l2(grads[0], single[0]) < 1e-3 and rel_l2(grads[1], single[1]) < 1e-3
     assert max(rel_l2(grads[2], single[2]), rel_l2(grads[3], single[3])) < 1e-2
+
+
+def test_varlen_multi_segment_row_plans_single_pass():
+    """A packed two-segment key row whose total length triggers the whole-row formula (2 x 23,000 keys >
+    45,511) plans the single-pass stage through the varlen entry (``num_segments = len(cu_seqlens_k) - 1``:
+    whole-row ranges do not match segment-confined index rows), while the flat call on the same global
+    indices plans two whole-row passes; the forward is untouched, both backwards agree (dq differs in the
+    FP32 summation order only) and match the FP64 reference."""
+    record, stages = _require_key_pass_program()
+    device = torch.device("cuda")
+    assert plan_key_passes(record, stages, 256, 46000, 128) == 2
+    assert plan_key_passes(record, stages, 256, 46000, 128, num_segments=2) == 1
+    assert dsa_train_workspace_size(
+        256, 46000, 128, device, num_segments=2
+    ) == dsa_train_workspace_size(256, 46000, 128, device, key_passes=1)
+    inp = make_inputs([128, 128], [23000, 23000], seed=SEED + 751, topk=128)
+    args = (inp.q_latent, inp.q_rope, inp.kv_latent, inp.k_rope)
+    leaves = [t.detach().clone().requires_grad_() for t in args]
+    flat_leaves = [t.detach().clone().requires_grad_() for t in args]
+    with _cache(True) as cache:
+        cache.clear()
+        with _quiet_experimental():
+            out_v, lse_v = dsa_sparse_attention_varlen(
+                *leaves,
+                inp.idx_local,
+                inp.cu_seqlens_q,
+                inp.cu_seqlens_k,
+                inp.max_seqlen_q,
+                inp.max_seqlen_k,
+                return_lse=True,
+            )
+        grads_v = torch.autograd.grad(out_v, leaves, inp.dout)
+        torch.cuda.synchronize()
+        remembered = [b for b in cache._bindings.values() if b.backward_order]
+        assert [b.key_passes for b in remembered] == [1]
+        assert not any(isinstance(k, tuple) for k in remembered[0].backward_order)
+        with _quiet_experimental():
+            out_f, lse_f = dsa_sparse_attention(
+                *flat_leaves, inp.idx_global, return_lse=True
+            )
+        grads_f = torch.autograd.grad(out_f, flat_leaves, inp.dout)
+        torch.cuda.synchronize()
+        # the segment count is part of the binding key: the flat call binds anew and plans the two passes
+        assert sorted(
+            b.key_passes for b in cache._bindings.values() if b.backward_order
+        ) == [1, 2]
+    assert torch.equal(out_v.detach(), out_f.detach()) and torch.equal(lse_v, lse_f)
+    for a, b in zip(grads_v, grads_f, strict=True):
+        assert rel_l2(a, b) < 1e-3
+    ref = reference_fp64(*args, inp.idx_global, dout=inp.dout)
+    _check_forward(inp, out_v, lse_v, ref)
+    _check_backward(grads_v, ref)
+    _check_backward(grads_f, ref)
 
 
 def _indices_view_inside_storage(indices: torch.Tensor, offset: int) -> torch.Tensor:

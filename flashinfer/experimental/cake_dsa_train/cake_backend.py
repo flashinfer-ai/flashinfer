@@ -194,7 +194,15 @@ DKV_ACC_LAYOUTS = ("natural", "permuted")
 # (num_queries <= the token chunk the workspace budget allows); otherwise the
 # single-pass stage.  Passes run over the whole row only (grid = num_queries
 # per pass; no token chunking), so the workspace grows by num_queries *
-# (147,456 + 4 * topk + 4) bytes.
+# (147,456 + 4 * topk + 4) bytes.  The passes split the whole key row
+# ``[0, S)`` into equal ranges, which matches an index row whose keys spread
+# over the whole row (one document); in a packed multi-segment row every
+# token's keys lie inside its own segment, so whole-row ranges leave most
+# passes empty for most tokens while the per-pass fixed cost (Q/dO reload,
+# FP32 dQ partial round trip, compaction) is still paid.  The policy therefore
+# applies to one-segment rows only: ``num_segments > 1`` (the varlen entry
+# passes ``len(cu_seqlens_k) - 1``, host metadata, no device sync) plans one
+# pass unless ``key_passes`` overrides.
 KEY_PASS_STAGES = ("bwd_compact", "bwd_main_pass")
 DQ_PARTIAL_BYTES_PER_TOKEN = (
     NUM_HEADS * D_QK * 4
@@ -242,7 +250,15 @@ class KeyPassPolicy:
         m = self.token_chunk_multiple
         return max(m, (self.workspace_budget_bytes // per_token) // m * m)
 
-    def passes(self, num_queries: int, num_kv: int, topk: int) -> int:
+    def passes(
+        self, num_queries: int, num_kv: int, topk: int, *, num_segments: int = 1
+    ) -> int:
+        """Passes of a binding: the formula when the key row is one segment, the
+        whole row is one launch and the formula gives more than one; else 1."""
+        if int(num_segments) < 1:
+            raise ValueError(f"num_segments must be >= 1, got {num_segments}")
+        if int(num_segments) > 1:
+            return 1
         formula = self.formula_passes(num_kv)
         if formula == 1:
             return 1
@@ -256,12 +272,17 @@ def plan_key_passes(
     num_kv: int,
     topk: int,
     key_passes: Optional[int] = None,
+    *,
+    num_segments: int = 1,
 ) -> int:
     """Number of key-range passes of one backward binding.
 
     ``key_passes`` overrides the record's policy (1 = the single-pass stage);
     a program without the pass stages serves one pass only, and a record
     without a ``key_pass_policy`` never takes the pass path by default.
+    ``num_segments`` is the packed segment count of the key row (see the
+    comment above ``KEY_PASS_STAGES``): the policy plans one pass for more
+    than one segment.
     """
     multi_pass = all(stage in stages for stage in KEY_PASS_STAGES)
     if key_passes is not None:
@@ -285,7 +306,7 @@ def plan_key_passes(
     policy = KeyPassPolicy.from_record(record)
     if policy is None:
         return 1
-    return policy.passes(num_queries, num_kv, topk)
+    return policy.passes(num_queries, num_kv, topk, num_segments=num_segments)
 
 
 def key_pass_ranges(num_kv: int, passes: int) -> tuple[tuple[int, int], ...]:
@@ -719,15 +740,25 @@ def dsa_train_workspace_size(
     *,
     backward: bool = True,
     key_passes: Optional[int] = None,
+    num_segments: int = 1,
 ) -> int:
     """Workspace bytes :func:`prepare_dsa_train` needs for ``(T, S, topk)`` on ``device``.
 
-    ``key_passes`` as in :func:`prepare_dsa_train` (``None`` = the record's policy).
+    ``key_passes`` / ``num_segments`` as in :func:`prepare_dsa_train`
+    (``None`` = the record's policy; the packed segment count of the key row).
     """
     name, record = record_for(device)
     stages = registered_stages(name)
     passes = (
-        plan_key_passes(record, stages, num_queries, num_kv, topk, key_passes)
+        plan_key_passes(
+            record,
+            stages,
+            num_queries,
+            num_kv,
+            topk,
+            key_passes,
+            num_segments=num_segments,
+        )
         if backward
         else 1
     )
@@ -1257,6 +1288,7 @@ def prepare_dsa_train(
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
     backend: str = "cake",
+    num_segments: int = 1,
 ) -> DSATrainRunner:
     """Validate one binding and prepare its launches.
 
@@ -1352,7 +1384,15 @@ def prepare_dsa_train(
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
     passes = (
-        plan_key_passes(record, stages, num_queries, num_kv, topk, key_passes)
+        plan_key_passes(
+            record,
+            stages,
+            num_queries,
+            num_kv,
+            topk,
+            key_passes,
+            num_segments=num_segments,
+        )
         if backward
         else 1
     )
@@ -1671,12 +1711,13 @@ def backward_binding_key(
     key_passes: Optional[int] = None,
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    num_segments: int = 1,
 ) -> tuple:
     """Cache key of a backward binding: the forward key's inputs plus the saved
     forward outputs, ``dout``, the ``dkv_fp32`` option, the ``key_passes``
-    override (``None`` = policy) and the packed accumulator / destination map
+    override (``None`` = policy), the packed accumulator / destination map
     (``None`` when absent; their row stride and presence are baked into the
-    cast's launch)."""
+    cast's launch) and the segment count the pass policy saw."""
     return (
         "bwd",
         _meta(q_latent),
@@ -1694,6 +1735,7 @@ def backward_binding_key(
         None if key_passes is None else int(key_passes),
         None if dkv_acc is None else _meta(dkv_acc),
         None if dkv_dst_map is None else _meta(dkv_dst_map),
+        int(num_segments),
     )
 
 
@@ -2130,6 +2172,7 @@ def backward(
     key_passes: Optional[int] = None,
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    num_segments: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward pass from the saved forward outputs: ``(dq_latent, dq_rope, dkv_latent, dk_rope)``.
 
@@ -2137,7 +2180,10 @@ def backward(
     ``dkv_fp32=True`` the dK/dV gradients are natural-layout FP32 tensors
     (fresh per call, never the kernels' internal accumulators).  ``key_passes``
     overrides the key-range-pass policy of the main stage (``None`` = the
-    registered policy; see :func:`plan_key_passes`).  A call without query
+    registered policy; see :func:`plan_key_passes`); ``num_segments`` is the
+    packed segment count of the key row the policy plans with (the varlen
+    entry passes ``len(cu_seqlens_k) - 1``; more than one segment plans one
+    pass).  A call without query
     rows returns empty ``dq`` and zero ``dkv`` gradients without binding or
     launching.  ``dkv_acc`` (FP32 ``[S_dst, >= 576]``) receives the dK/dV
     gradients in place instead -- latent columns ``0:512``, rope ``512:576`` of
@@ -2198,6 +2244,7 @@ def backward(
             key_passes,
             dkv_acc,
             dkv_dst_map,
+            num_segments,
         )
         binding = cache.lookup(key)
         if binding is not None:
@@ -2237,6 +2284,7 @@ def backward(
         key_passes=key_passes,
         dkv_acc=dkv_acc,
         dkv_dst_map=dkv_dst_map,
+        num_segments=num_segments,
     )
     result = runner.backward()
     if key is not None and runner.abi == ABI_CONTRACT:
@@ -2264,6 +2312,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         key_passes=None,
         dkv_acc=None,
         dkv_dst_map=None,
+        num_segments=1,
     ):
         out, lse, o_lo = forward(
             q_latent,
@@ -2279,6 +2328,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
         )  # no zero-filled grad for an unused lse; dout is None when out is unused
         ctx.softmax_scale = softmax_scale
         ctx.key_passes = key_passes
+        ctx.num_segments = int(num_segments)
         ctx.has_topk_length = topk_length is not None
         # The packed accumulator is mutated in place by the backward (+=), so it is kept on ctx rather than saved: a
         # saved tensor's version check would reject that mutation when the graph is retained for another backward.
@@ -2298,7 +2348,7 @@ class DSASparseAttentionFunction(torch.autograd.Function):
                 "gradients through lse are not supported; only out is differentiable"
             )
         if dout is None:  # out unused downstream
-            return (None,) * 10
+            return (None,) * 11
         q_latent, q_rope, kv_latent, k_rope, indices, out, lse, o_lo, topk_length = (
             ctx.saved_tensors
         )
@@ -2321,13 +2371,15 @@ class DSASparseAttentionFunction(torch.autograd.Function):
             key_passes=ctx.key_passes,
             dkv_acc=ctx.dkv_acc,
             dkv_dst_map=ctx.dkv_dst_map,
+            num_segments=ctx.num_segments,
         )
-        # dkv_latent / dk_rope are None when the gradients went into dkv_acc; no gradient for the six other inputs
+        # dkv_latent / dk_rope are None when the gradients went into dkv_acc; no gradient for the seven other inputs
         return (
             dq_latent,
             dq_rope,
             dkv_latent,
             dk_rope,
+            None,
             None,
             None,
             None,
@@ -2350,6 +2402,7 @@ def dsa_sparse_attention(
     key_passes: Optional[int] = None,
     dkv_acc: Optional[torch.Tensor] = None,
     dkv_dst_map: Optional[torch.Tensor] = None,
+    num_segments: int = 1,
 ):
     """Differentiable sparse attention over global key indices (see the module docstring).
 
@@ -2361,7 +2414,10 @@ def dsa_sparse_attention(
     FP32 ``[S_dst, >= 576]`` accumulated in place: latent columns ``0:512``,
     rope ``512:576``) and ``dkv_dst_map`` (int32 ``[S]`` destination row per
     key row, default identity) are handed to the backward; with ``dkv_acc``
-    the ``kv_latent`` / ``k_rope`` gradients are ``None``.
+    the ``kv_latent`` / ``k_rope`` gradients are ``None``.  ``num_segments``
+    is the packed segment count of the key row (``len(cu_seqlens_k) - 1`` for
+    a packed batch; :func:`dsa_sparse_attention_varlen` passes it): the
+    backward's whole-row key-range passes apply to one-segment rows only.
     """
     if softmax_scale is None:
         softmax_scale = default_softmax_scale()
@@ -2376,6 +2432,7 @@ def dsa_sparse_attention(
         key_passes,
         dkv_acc,
         dkv_dst_map,
+        int(num_segments),
     )
     return (out, lse) if return_lse else out
 
@@ -2408,7 +2465,10 @@ def dsa_sparse_attention_varlen(
     default ``causal=False`` keeps the index rows as is (the behaviour of the
     first release).
     ``max_seqlen_q/k`` are accepted for signature parity and not used on the
-    host.  ``dkv_acc`` / ``dkv_dst_map`` as in :func:`dsa_sparse_attention`."""
+    host.  ``dkv_acc`` / ``dkv_dst_map`` as in :func:`dsa_sparse_attention`.
+    The segment count ``len(cu_seqlens_k) - 1`` (host metadata, no device
+    sync) is passed on as ``num_segments``: with more than one segment the
+    backward plans the single-pass stage unless ``key_passes`` overrides."""
     del max_seqlen_q, max_seqlen_k
     indices = offset_gather_kv_indices(
         gather_kv_indices, cu_seqlens_q, cu_seqlens_k, causal=causal
@@ -2425,4 +2485,5 @@ def dsa_sparse_attention_varlen(
         key_passes=key_passes,
         dkv_acc=dkv_acc,
         dkv_dst_map=dkv_dst_map,
+        num_segments=int(cu_seqlens_k.numel()) - 1,
     )
