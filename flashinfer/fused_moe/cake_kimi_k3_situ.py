@@ -35,6 +35,16 @@ _N32_CLAIM8_ARCHES = ("sm_100a", "sm_103a")
 _M256_C12_ARCHES = ("sm_100a",)
 _LARGE_C7_ARCHES = ("sm_103a", "sm_100a")
 _LARGE_C7_TOKENS = (16384,)
+# Pre-shuffled FC1 scale factors (the ``large_c7`` route). The tile-N128 FC1
+# consumes K in steps of 512 elements. For every (N-tile, K-step) the
+# scale-factor writer emits the 4096-byte shared-memory image FC1 expects
+# (128 rows x 32 bytes; one byte per 16-element group) into ``sfb_shuffled``,
+# and FC1 loads each image with a single TMA copy. The FC1 TMA view addresses
+# an image as eight 512-byte blocks (one per 64 elements of K) of 2 x 256 bytes.
+_FC1_K_STEP = 512
+_FC1_K_TILES = _H // _FC1_K_STEP
+_SFB_IMAGE_BYTES = 128 * (_FC1_K_STEP // 16)
+_SFB_IMAGE_BLOCKS = _SFB_IMAGE_BYTES // 512
 
 
 def _tile_n(num_tokens):
@@ -62,6 +72,10 @@ def _geometry(num_tokens, arch=None):
     occupied = min(_E, total_pairs)
     max_tiles = occupied + (total_pairs - occupied) // tile_n
     return tile_n, total_pairs, max_tiles
+
+
+def _sfb_shuffled_bytes(max_tiles):
+    return max_tiles * _FC1_K_TILES * _SFB_IMAGE_BYTES
 
 
 def _workspace_layout(num_tokens, arch=None):
@@ -92,7 +106,9 @@ def _workspace_layout(num_tokens, arch=None):
     ):
         fields += (("fc2_work_counter", torch.int32, (1,), 4),)
     if num_tokens in _LARGE_C7_TOKENS and arch in (None, *_LARGE_C7_ARCHES):
-        fields += (("sfb_shuffled", torch.uint8, (max_tiles * (_H // 512) * 4096,), 1),)
+        # One image per (N-tile, K-step). For 16384 tokens (2937 tiles) this
+        # adds 2937 * 7 * 4096 = 84,209,664 bytes (80.3 MiB) to the layout.
+        fields += (("sfb_shuffled", torch.uint8, (_sfb_shuffled_bytes(max_tiles),), 1),)
     layout, offset = {}, 0
     for name, dtype, shape, element_bytes in fields:
         offset = (offset + 127) // 128 * 128
@@ -282,13 +298,13 @@ def cake_fused_moe_prepare_workspace(
         program_key = cake_situ_sequence(
             arch,
             tile_n,
-            num_tokens == 1,
-            feature_finalize,
-            m64_claim8,
-            mid_work5fd,
-            n32_claim8,
-            m256_c12,
-            large_c7,
+            single_token=num_tokens == 1,
+            feature_finalize=feature_finalize,
+            m64_claim8=m64_claim8,
+            mid_work5fd=mid_work5fd,
+            n32_claim8=n32_claim8,
+            m256_c12=m256_c12,
+            large_c7=large_c7,
         )
         module = get_cake_situ_module(program_key)
         state["shapes"][num_tokens] = {
@@ -568,7 +584,7 @@ def _cake_situ_stage_bindings(options, prepared):
             },
             SFBS=views["sfb_shuffled"],
             K=_H,
-            K_tiles=_H // 512,
+            K_tiles=_FC1_K_TILES,
             grid_n=max_tiles,
         )
     stages.update(
@@ -599,9 +615,13 @@ def _cake_situ_stage_bindings(options, prepared):
                 K=_H,
                 grid_m=_I // 64,
                 grid_n=max_tiles,
-                K_tiles=_H // 512,
+                K_tiles=_FC1_K_TILES,
                 **(
-                    {"SFBS": views["sfb_shuffled"].view(max_tiles, _H // 64, 2, 256)}
+                    {
+                        "SFBS": views["sfb_shuffled"].view(
+                            max_tiles, _FC1_K_TILES * _SFB_IMAGE_BLOCKS, 2, 256
+                        )
+                    }
                     if prepared["large_c7"]
                     else {}
                 ),
