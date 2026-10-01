@@ -85,7 +85,7 @@ __device__ __forceinline__ int make_warp_uniform(int x) {
 #define SMEM_SMEM_EPI_STAGE_BYTES 16384
 #define SMEM_SMEM_EPI_STRIDE 16384
 #define SMEM_TOTAL 218112
-#define THREADS 480
+#define THREADS 736
 
 #include <math_constants.h>
 
@@ -1008,8 +1008,8 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 
 extern "C" {
 
-__global__ __launch_bounds__(480) void
-kernel_cake_kimi_k3_fp8_projection_9dd051331c574b165d2b(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
+__global__ __launch_bounds__(736) void
+kernel_cake_kimi_k3_fp8_projection_e8a65fa9f195ea02e376(const __grid_constant__ CUtensorMap W, const __grid_constant__ CUtensorMap X, const __grid_constant__ CUtensorMap SFW, const __grid_constant__ CUtensorMap SFX, __nv_bfloat16* __restrict__ out, float* __restrict__ partials, unsigned int* __restrict__ counters, int M, int n_tiles, int n_valid, int ldo, int num_k_iters, int sf_k_tiles, int split, int tok_per_cta, int total_work, int store_vec, __nv_bfloat16* __restrict__ x, int K, const __grid_constant__ CUtensorMap XB)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -1059,9 +1059,9 @@ kernel_cake_kimi_k3_fp8_projection_9dd051331c574b165d2b(const __grid_constant__ 
         uint32_t leader = elect_sync();
         if (leader) {
             // --- pipeline 'tma_pipe' ---
-            // tma_full: 2 barriers, init_count=9
-            mbarrier_init(smem + 0, 9);
-            mbarrier_init(smem + 8, 9);
+            // tma_full: 2 barriers, init_count=17
+            mbarrier_init(smem + 0, 17);
+            mbarrier_init(smem + 8, 17);
             // mma_done: 2 barriers, init_count=1
             mbarrier_init(smem + 16, 1);
             mbarrier_init(smem + 24, 1);
@@ -1070,10 +1070,10 @@ kernel_cake_kimi_k3_fp8_projection_9dd051331c574b165d2b(const __grid_constant__ 
             mbarrier_init(smem + 32, 1);
             mbarrier_init(smem + 40, 1);
             mbarrier_init(smem + 48, 1);
-            // xb_empty: 3 barriers, init_count=8
-            mbarrier_init(smem + 56, 8);
-            mbarrier_init(smem + 64, 8);
-            mbarrier_init(smem + 72, 8);
+            // xb_empty: 3 barriers, init_count=16
+            mbarrier_init(smem + 56, 16);
+            mbarrier_init(smem + 64, 16);
+            mbarrier_init(smem + 72, 16);
             // --- pipeline 'mainloop_pipe' ---
             // mainloop_done: 1 barriers, init_count=1
             mbarrier_init(smem + 80, 1);
@@ -1579,7 +1579,7 @@ kernel_cake_kimi_k3_fp8_projection_9dd051331c574b165d2b(const __grid_constant__ 
         }
     }
     // ---- Role: quant ----
-    if (warp >= 6 && warp <= 13) {
+    if (warp >= 6 && warp <= 21) {
         { // quant_main
             int w0_q = bid;
             int ws_q = num_bids;
@@ -1614,8 +1614,8 @@ kernel_cake_kimi_k3_fp8_projection_9dd051331c574b165d2b(const __grid_constant__ 
                     const int sub = lane_q - grp * 4;
                     const int stag = (grp & 1) * 4;
                     #pragma unroll
-                    for (int itn = 0; itn < 2; itn++) {
-                        int unit_n = (itn * 8 + qwarp) * 8 + grp;
+                    for (int itn = 0; itn < 1; itn++) {
+                        int unit_n = (itn * 16 + qwarp) * 8 + grp;
                         int tok_n = unit_n >> 1;
                         int kb_n = unit_n & 1;
                         int tok_gn = tok0_q + tok_n;
@@ -1759,7 +1759,7 @@ kernel_cake_kimi_k3_fp8_projection_9dd051331c574b165d2b(const __grid_constant__ 
         }
     }
     // ---- Role: xload ----
-    if (warp == 14) {
+    if (warp == 22) {
         { // xload_main
             unsigned int _phase_xb_empty = 1;
             if (elect_sync()) {

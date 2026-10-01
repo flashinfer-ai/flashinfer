@@ -286,6 +286,15 @@ def test_decode_config_rules(arch):
         )
         # Round-6 continuation 7 (lever PI-W): the next-item W/SFW L2 prefetch rides on the weight prefetch (pf > 0 rows only).
         assert cfg.pfi == (int(entry.get("pfi", 0)) if cfg.pf > 0 else 0)
+        # Round-6 continuation 8 (lever QW16): the quantizing-warp count is a table key of fused rows (8 = default).
+        assert cfg.qwarps == (
+            int(entry.get("qwarps", cb.DEC_QUANT_WARPS))
+            if cfg.fused
+            else cb.DEC_QUANT_WARPS
+        )
+        assert (f"_w{cfg.qwarps}" in cfg.kernel_key) == (
+            cfg.fused and cfg.qwarps != cb.DEC_QUANT_WARPS
+        )
         if cfg.mc > 1:
             assert cfg.split == 1 and cfg.csplit == 1 and not cfg.resident
             assert cfg.m_tiles % cfg.mc == 0 and cfg.total_work == cfg.tiles // cfg.mc
@@ -342,7 +351,7 @@ def test_decode_config_rules(arch):
         else:
             assert cfg.xb_stages == 0 and not re.search(r"_r\d", cfg.kernel_key)
         assert cfg.qlanes in (4, 8, 16)
-        assert (2 * cfg.tok) % (cb.DEC_QUANT_WARPS * (32 // cfg.qlanes)) == 0
+        assert (2 * cfg.tok) % (cfg.qwarps * (32 // cfg.qlanes)) == 0
         if not (cfg.fused and not cfg.resident) or "qlanes" not in entry:
             assert cfg.qlanes == 16 and "_q" not in core_key
         else:
@@ -372,7 +381,10 @@ def test_decode_config_round3_fused_rows(arch):
     # Round 6 continuation 7 (lever PI-W): during the last ``pf`` stages of a work item the load warp also prefetches the
     # NEXT item's first W / SFW tiles into L2 (``_pi2``; 2 work items per CTA on this row).
     assert cfg.pfi == 2
-    assert cfg.kernel_key == "decode:t64_p2_fused_r3_q4_pf4_pi2"
+    # Round 6 continuation 8 (lever QW16): 16 quantizing warps convert the 64-token BF16 tile of each stage (``_w16``, right
+    # after ``_fused``): the same narrow (token, 128-K block) units split over twice the warps, bit-exact by construction.
+    assert cfg.qwarps == 16
+    assert cfg.kernel_key == "decode:t64_p2_fused_w16_r3_q4_pf4_pi2"
     # 16-token tiles cannot keep eight 4-lane groups busy per stage: the table's 4 lanes widen to 8, coupled staging.
     # Round 5: the 24-tile M = 256 row moves to a 4-CTA cluster split-K route (each CTA owns a quarter of K, FP32 partials
     # are exchanged through distributed shared memory in one round); the small dedicated inbox is used (no aliasing).
