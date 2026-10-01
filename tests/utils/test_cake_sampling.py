@@ -556,10 +556,10 @@ def test_per_request_tensors_and_routes():
     # and R200 (212)); every pick is the measured-best variant of its cell or within the noted regret (< 3 %).
     # 148-SM table (round-6 re-fit, CAKE-776): worst regret 2.8 % against the measured-best variant of each cell
     for (pb, pv, pk), want in {
-        (1, 32768, 50): (4, 16, False),
-        (4, 32768, 50): (4, 16, False),
-        (8, 32768, 50): (4, 16, False),
-        (16, 32768, 50): (1, 32, True),
+        (1, 32768, 50): (2, 32, True),  # round-7 refit (lever h), was (4, 16, False)
+        (4, 32768, 50): (2, 32, True),  # round-7 refit (lever h), was (4, 16, False)
+        (8, 32768, 50): (2, 32, True),  # round-7 refit (lever h), was (4, 16, False)
+        (16, 32768, 50): (2, 32, True),  # round-7 refit (lever h), was (1, 32, True)
         (32, 32768, 50): (1, 32, True),
         (64, 32768, 50): (1, 32, True),
         (128, 32768, 50): (1, 32, True),
@@ -590,7 +590,7 @@ def test_per_request_tensors_and_routes():
         (8, 32768, 1000, False): (4, 16, False),
         (16, 32768, 1000, False): (4, 16, False),
         (32, 32768, 1000, False): (4, 16, False),
-        (64, 32768, 1000, False): (2, 32, False),
+        (64, 32768, 1000, False): (2, 16, True),  # round-7 refit (lever h), was (2, 32, False)
         (128, 32768, 1000, False): (1, 16, True),
         (1, 128256, 1000, False): (8, 32, False),
         (4, 128256, 1000, False): (8, 32, False),
@@ -606,11 +606,7 @@ def test_per_request_tensors_and_routes():
         (1, 151936, 1000, False): (8, 16, True),
         (8, 151936, 1000, False): (8, 16, True),
         (16, 151936, 1000, False): (4, 16, True),
-        (64, 151936, 1000, False): (
-            2,
-            32,
-            True,
-        ),  # +2.8 % vs best (2, 16, 1) (33.25 vs 32.35 us)
+        (64, 151936, 1000, False): (2, 16, True),  # round-7 refit (lever h), was (2, 32, True)  # +2.8 % vs best (2, 16, 1) (33.25 vs 32.35 us)
         (128, 151936, 1000, False): (1, 32, True),
         (1, 262144, 1000, False): (8, 16, True),
         (4, 262144, 1000, False): (8, 16, True),
@@ -634,7 +630,7 @@ def test_per_request_tensors_and_routes():
         (8, 32768, 1000, True): (4, 16, False),
         (16, 32768, 1000, True): (4, 16, False),
         (32, 32768, 1000, True): (4, 16, False),
-        (64, 32768, 1000, True): (2, 32, False),
+        (64, 32768, 1000, True): (2, 16, True),  # round-7 refit (lever h), was (2, 32, False)
         (128, 32768, 1000, True): (1, 16, True),
         (1, 128256, 1000, True): (8, 32, False),
         (4, 128256, 1000, True): (8, 32, False),
@@ -650,7 +646,7 @@ def test_per_request_tensors_and_routes():
         (1, 151936, 1000, True): (8, 16, True),
         (8, 151936, 1000, True): (8, 16, True),
         (16, 151936, 1000, True): (4, 16, True),
-        (64, 151936, 1000, True): (2, 32, True),
+        (64, 151936, 1000, True): (2, 16, True),  # round-7 refit (lever h), was (2, 32, True)
         (128, 151936, 1000, True): (1, 32, True),
         (1, 262144, 1000, True): (8, 16, True),
         (4, 262144, 1000, True): (8, 16, True),
@@ -1692,9 +1688,14 @@ def test_spec_sample_build_matches_default_build():
         assert cs._spec_sample_flag(8, 32, True, 262144, 10, 1, cap) == 0
         with pytest.raises(ValueError):
             cs._spec_sample_flag(4, 16, True, 128256, 1000, None, cap)
-    for cap in ((10, 0), (10, 3)):  # B200 / GB300: every ept-16 stream, whatever the batch / top-k
-        assert cs._spec_sample_flag(8, 16, True, 262144, 1000, 1, cap) == cs._FLAG_SPEC_SAMPLE
+    for cap in ((10, 0), (10, 3)):  # B200 / GB300: every ept-16 stream, whatever the batch / top-k ...
+        assert cs._spec_sample_flag(8, 16, True, 262144, 10, 1, cap) == cs._FLAG_SPEC_SAMPLE
         assert cs._spec_sample_flag(1, 16, True, 32768, 10, 1, cap) == cs._FLAG_SPEC_SAMPLE
+        assert cs._spec_sample_flag(4, 16, True, 262144, 1000, 1, cap) == cs._FLAG_SPEC_SAMPLE
+        # ... except a cluster-8 chain (top-k above the fused tail), on every capability
+        assert cs._spec_sample_flag(8, 16, True, 262144, 1000, 1, cap) == 0
+        assert cs._spec_sample_flag(8, 32, True, 128256, 1000, 1, cap) == 0
+    assert cs._spec_sample_flag(8, 16, True, 262144, 1000) == 0  # capability unknown: the chain rule still holds
     assert cs._sample_build_flag(8, 16, True, 10, 151936, 1, (9, 0)) == cs._FLAG_COARSE_SAMPLE
     assert cs._sample_build_flag(1, 16, True, 10, 32768, 64, (9, 0)) == cs._FLAG_COARSE_SAMPLE
     assert cs._sample_build_flag(2, 16, True, 10, 151936, 32, (10, 7)) == cs._FLAG_SPEC_SAMPLE
@@ -1703,8 +1704,8 @@ def test_spec_sample_build_matches_default_build():
     assert cs._sample_build_flag(1, 32, True, kcap, 151936) == cs._FLAG_COARSE_SAMPLE
     assert cs._sample_build_flag(1, 32, True, kcap + 1, 151936) == 0
     assert cs._sample_build_flag(2, 32, True, kcap, 262144) == cs._FLAG_COARSE_SAMPLE
-    assert cs._sample_build_flag(8, 32, True, 1000, 128256) == cs._FLAG_SPEC_SAMPLE
-    assert cs._sample_build_flag(8, 32, True, 1000, 262144) == cs._FLAG_SPEC_SAMPLE
+    assert cs._sample_build_flag(8, 32, True, 1000, 128256) == 0  # cluster-8 chain: default build
+    assert cs._sample_build_flag(8, 32, True, 1000, 262144) == 0
     assert cs._sample_build_flag(8, 32, True, kcap, 262144) == cs._FLAG_SPEC_SAMPLE
     assert cs._sample_build_flag(4, 16, False, 10, 32768) == 0
     if not _device_streams():
@@ -1823,6 +1824,7 @@ def test_spec_sample_build_matches_default_build():
         c, e, st = cs.choose_stage1(batch, vocab, top_k_max=k)
         chunks = -(-vocab // (512 * e * c))
         want_spec = bool(st) and (e < 32 or chunks == 1 or (chunks == 2 and c >= 8) or chunks >= 16)
+        want_spec = want_spec and not (k > kcap and c > 4)  # a cluster-8 chain keeps the default build everywhere
         if cap not in cs._SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES:  # Hopper / Rubin: wide cluster <= 4 grids only
             want_spec = want_spec and c <= 4 and batch * c >= 64 and (
                 chunks >= 5 if k <= kcap else (chunks < 16 or batch * c >= 128)

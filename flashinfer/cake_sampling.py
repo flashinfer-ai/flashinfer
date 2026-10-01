@@ -138,7 +138,7 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
     #  stream_wide_wave_us, stream_wide_two_launch_us, notail_two_launch_us, chain_over_tail_us,
     #  stream_wide_large_k_us, resident_two_launch_us, fused_tail_cluster_us, fused_tail_wide_cluster_us,
     #  stream_large_k_chunk_us, stream_large_k_chunk32_us, fused_tail_stream_us, stream_large_k_cluster_cta_us,
-    #  stream_wide_short_row_large_k_us)
+    #  stream_wide_short_row_large_k_us, spec_sample_wide_us, stream_wide_ragged_large_k_us)
     # stream_chunk32_us: per-chunk cost of the ept-32 streaming variants (0 = not ranked by this table);
     # stream_cluster_us: fixed cost of a clustered streaming wave (cluster barrier + DSM exchange latency);
     # stream_wide_wave_us: fixed cost per ept-32 streaming wave (its prologue / register footprint; H100 only);
@@ -153,9 +153,21 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
     # chain_over_tail_us (a multi-wave grid: the stage-2/3 kernel over the in-kernel tail of its one-wave peers).
     # stream_wide_large_k_us: per streaming wave of the ept-32 form at large top-k (both regimes): its per-bucket
     # list path and, fused, its in-kernel tail cost more than the ept-16 form's.
-    # resident_two_launch_us: charged to a register-resident candidate at large top-k on a device that keeps the
-    # two-launch chain (GB300): the stage-2/3 launch queued behind a resident grid costs more than behind a
-    # streaming grid; 0 on the devices that fuse the whole-CTA tail.
+    # resident_two_launch_us: charged to a register-resident candidate at large top-k whenever it takes the
+    # stage-2/3 kernel (round 7: no capability fuses a resident): the stage-2/3 launch queued behind a resident
+    # grid costs more than behind a streaming grid (GB300 k = 1000, V = 32768: the (4, 16) resident chain
+    # 19.3-22.7 us vs the cluster-1 streams 18.5-21.4 while the resident's own kernel is the faster one).
+    # spec_sample_wide_us: subtracted per streaming wave of the ept-32 form when the host takes its speculative-
+    # sample twin (_spec_sample_flag, round 7 lever SP) on a launch that is not the whole-CTA-tail single kernel:
+    # the strided histogram of the preloaded chunk replaces the separate sampled read (B200 / GB300 k = 50 vs the
+    # `_cs` build: one chunk 0.82-0.87 us, two chunks on cluster 8 0.99-1.00, 16 chunks 0.95-0.96).  The ept-16
+    # streams take their twin on every launch, so a uniform term does not reorder them.
+    # stream_wide_ragged_large_k_us: per streaming wave of the ept-32 form at large top-k when its last 512 x 32
+    # chunk is less than _RAGGED_CHUNK_FILL full (V = 151936: 4.64 chunks on cluster 2, 2.32 on cluster 4, 1.16 on
+    # cluster 8).  Round-7 e2e graph-replay sweeps (k = 1000): at V = 151936 the ept-32 stream loses to the ept-16
+    # form on every cluster on B200, GB300 and R200 (cluster 2 B = 64: 34.4 vs 28.4 us B200, 33.3 vs 27.5 GB300,
+    # 28.0 vs 22.7 R200) although stage 1 alone measures equal, while at V = 128256 / 262144 (chunks within 10 % of
+    # full) the ept-32 form keeps its lead; the term keeps the dispatcher off those cells.
     # fused_tail_cluster_us: per CTA beyond the first of the cluster when the candidate fuses the whole-CTA tail
     # (rank 0 sorts after the cluster barrier while its peers idle; the gathered list grows with the cluster);
     # fused_tail_wide_cluster_us: the same per-CTA term for the ept-32 streaming form only, whose fused tail grows
@@ -175,7 +187,7 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         8.0,
         0.0,
         0.0,
-        0.0,
+        0.25,
         0.0,
         0.0,
         0.35,
@@ -183,6 +195,8 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         0.0,
         0.2,
         1.0,
+        0.4,
+        2.0,
     ),
     132: (
         2.0,
@@ -204,6 +218,8 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         0.0,
         0.0,
         0.2,
+        0.0,
+        0.0,
         0.0,
         0.0,
         0.0,
@@ -231,9 +247,13 @@ _STAGE1_COST_BY_SM_COUNT: dict[int, _Stage1CostRow] = {
         0.0,
         0.0,
         0.0,
+        0.0,
+        0.0,
     ),
 }
 _STREAM_WIDE_TWO_LAUNCH_CHUNKS = 3
+# Fill of the last per-CTA 512 x 32 chunk below which an ept-32 stream pays stream_wide_ragged_large_k_us.
+_RAGGED_CHUNK_FILL = 0.75
 
 _WORKSPACES: dict[
     tuple[int, int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor]
@@ -452,8 +472,11 @@ _SPEC_SAMPLE_WIDE_MIN_CHUNKS = 16
 # chunks per CTA, on the two-launch chain for any row, where a row of _SPEC_SAMPLE_NARROW_DEEP_CHUNKS or more chunks
 # needs _SPEC_SAMPLE_NARROW_DEEP_MIN_CTAS CTAs.  The saving is the sampled read, which only a wide, bandwidth-bound grid
 # pays for: the cluster-8 streams there lose 3-8 % with it (H100 / R200 k = 1000, V >= 151936, B <= 16), the 4-chunk
-# rows at k <= 64 1-2 % against the coarse build, the 32-CTA grid and the 16-chunk rows on 64 CTAs 1-3 %.
+# rows at k <= 64 1-2 % against the coarse build, the 32-CTA grid and the 16-chunk rows on 64 CTAs 1-3 %.  On every
+# capability a cluster-8 stream above fused_tail_kcap (the 1/2-rate sample, two-launch chain) keeps the default build:
+# GB300 V = 262144 B = 1-8 measured +11..+17 % eager / +3..+7 % graph with it (round-7 matrix r7m7_gb300).
 _SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES: frozenset[tuple[int, int]] = frozenset({(10, 0), (10, 3)})
+_SPEC_SAMPLE_CHAIN_MAX_CLUSTER = 4
 _SPEC_SAMPLE_NARROW_MAX_CLUSTER = 4
 _SPEC_SAMPLE_NARROW_MIN_CTAS = 64
 _SPEC_SAMPLE_NARROW_FUSED_MIN_CHUNKS = 5
@@ -519,7 +542,9 @@ def _spec_sample_flag(
     strided histogram of the chunk already in registers is cheaper than the separate sampled read it replaces (round 7,
     lever SP: ept-16 streams 2-13 % faster at 1-16 chunks, the cluster-8 ept-32 stream at one chunk 13-18 % and at two
     chunks 0-6 %, the cluster-1 ept-32 stream at 16 chunks 2-15 %); ept-32 streams at 2-10 chunks per CTA on clusters
-    1-4 measured 0-6 % slower with it and keep their round-6 build.  On any other capability the same chunk rule applies
+    1-4 measured 0-6 % slower with it and keep their round-6 build.  A cluster-8 stream above ``fused_tail_kcap`` never
+    takes it on any capability (the 1/2-rate register histogram on the two-launch chain: GB300 V = 262144 +11..+17 %
+    eager, +3..+7 % graph; H100 / R200 +3..+8 %).  On any other capability the same chunk rule applies
     only on a cluster of at most ``_SPEC_SAMPLE_NARROW_MAX_CLUSTER`` CTAs whose grid has at least
     ``_SPEC_SAMPLE_NARROW_MIN_CTAS`` CTAs, for a small-top-k launch (at most ``fused_tail_kcap``) only to rows of at
     least ``_SPEC_SAMPLE_NARROW_FUSED_MIN_CHUNKS`` chunks per CTA, and on the two-launch chain with
@@ -529,6 +554,8 @@ def _spec_sample_flag(
     if not stream:
         return 0
     chunks = math.ceil(int(vocab) / (_THREADS * int(ept) * int(cluster)))
+    if top_k_max is not None and int(top_k_max) > _fused_tail_kcap() and int(cluster) > _SPEC_SAMPLE_CHAIN_MAX_CLUSTER:
+        return 0
     if capability is not None and tuple(int(x) for x in capability) not in _SPEC_SAMPLE_ALL_STREAMS_CAPABILITIES:
         if batch is None:
             raise ValueError("the speculative-sample policy of this capability needs the batch")
@@ -647,6 +674,10 @@ def choose_stage1(
     two_launch: Optional[bool] = None,
 ) -> tuple[int, int, bool]:
     """``(cluster, ept, stream)`` for ``batch`` rows of ``vocab`` entries (largest top-k ``top_k_max``).
+    The device-dependent defaults are resolved here and the ranking itself is memoised per resolved argument
+    tuple (``_choose_stage1_resolved``): the served route asks twice per call and the round-7 fused-tail terms
+    doubled the ranking's cost (B200 host: 102 -> 162 us per call), which a host-bound two-launch chain pays
+    inside its launch gap.
 
     Register-resident candidates: fewest waves, then a register chunk of at least 16 entries,
     then the larger cluster.  That resident choice is compared with every streaming variant
@@ -669,6 +700,37 @@ def choose_stage1(
         )
     if smem_limit is None and torch.cuda.is_available():
         smem_limit = _smem_optin(torch.cuda.current_device())
+    if two_launch is None:
+        two_launch = _launch_is_two_kernels(top_k_max)
+    return _choose_stage1_resolved(
+        int(batch),
+        int(vocab),
+        int(sm_count),
+        None if smem_limit is None else int(smem_limit),
+        None if top_k_max is None else int(top_k_max),
+        bool(two_launch),
+    )
+
+
+def _ragged_last_chunk(vocab: int, cluster: int, ept: int) -> bool:
+    """True when the last per-CTA ``512 x ept`` chunk of a ``vocab`` row on ``cluster`` CTAs is less than
+    ``_RAGGED_CHUNK_FILL`` full (and not exactly full)."""
+    exact = vocab / (cluster * _THREADS * ept)
+    frac = exact - math.floor(exact)
+    return frac > 0.0 and frac < _RAGGED_CHUNK_FILL
+
+
+@functools.lru_cache(maxsize=8192)
+def _choose_stage1_resolved(
+    batch: int,
+    vocab: int,
+    sm_count: int,
+    smem_limit: Optional[int],
+    top_k_max: Optional[int],
+    two_launch: bool,
+) -> tuple[int, int, bool]:
+    """The ranking behind ``choose_stage1`` for fully resolved arguments (pure in its arguments and the frozen
+    manifest, hence memoised)."""
     wave_ctas = _wave_ctas(int(sm_count))
     (
         resident_base,
@@ -693,6 +755,8 @@ def choose_stage1(
         fused_tail_stream,
         stream_large_k_cluster_cta,
         stream_wide_short_row_large_k,
+        spec_sample_wide,
+        stream_wide_ragged_large_k,
     ) = _stage1_cost(int(sm_count))
     large_k = (
         stream_large_k if top_k_max is not None and top_k_max > _STAGE1_LARGE_K else 0.0
@@ -770,10 +834,27 @@ def choose_stage1(
                     and chunks <= _STREAM_WIDE_TWO_LAUNCH_CHUNKS
                     else 0.0
                 )
+                + (
+                    stream_wide_ragged_large_k
+                    if large_k > 0.0 and ce[1] > 16 and _ragged_last_chunk(vocab, ce[0], ce[1])
+                    else 0.0
+                )
+                - spec_sample_saving(ce)
             )
             + launch_cost(ce[0])
             + (stream_two_launch_cost(ce))
         )
+
+    def spec_sample_saving(ce: tuple[int, int]) -> float:
+        # the ept-16 streams take their twin on every launch (uniform term, no reordering); the ept-32 form's
+        # saving applies when the host takes the twin and the launch is not the whole-CTA-tail single kernel
+        if not spec_sample_wide or ce[1] <= 16:
+            return 0.0
+        if large_k > 0.0 and not takes_two_kernels(ce, True):
+            return 0.0
+        if _spec_sample_flag(ce[0], ce[1], True, vocab, top_k_max, batch, None):
+            return spec_sample_wide
+        return 0.0
 
     def stream_two_launch_cost(ce: tuple[int, int]) -> float:
         if not takes_two_kernels(ce, True):
@@ -800,10 +881,11 @@ def choose_stage1(
         if large_k > 0.0 and not takes_two_kernels(resident, False):
             extra = fused_tail_cluster * (resident[0] - 1)
         if takes_two_kernels(resident, False):
-            if regime_two_launch:
-                extra = resident_two_launch
-            else:
-                extra = (
+            # the stage-2/3 kernel behind a resident grid (no capability fuses a resident); on a device that fuses
+            # streams the chain additionally pays the tail-vs-chain terms against its one-launch peers
+            extra = resident_two_launch
+            if not regime_two_launch:
+                extra += (
                     chain_over_tail
                     if _stage1_has_fused_tail(resident[0], resident[1], False)
                     else notail_two_launch
