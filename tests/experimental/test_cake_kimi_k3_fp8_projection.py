@@ -284,6 +284,8 @@ def test_decode_config_rules(arch):
         assert cfg.pfx == (
             int(entry.get("pfx", 0)) if (cfg.fused and not cfg.resident) else 0
         )
+        # Round-6 continuation 7 (lever PI-W): the next-item W/SFW L2 prefetch rides on the weight prefetch (pf > 0 rows only).
+        assert cfg.pfi == (int(entry.get("pfi", 0)) if cfg.pf > 0 else 0)
         if cfg.mc > 1:
             assert cfg.split == 1 and cfg.csplit == 1 and not cfg.resident
             assert cfg.m_tiles % cfg.mc == 0 and cfg.total_work == cfg.tiles // cfg.mc
@@ -327,7 +329,8 @@ def test_decode_config_rules(arch):
         assert (f"_mc{cfg.mc}" in cfg.kernel_key) == (cfg.mc > 1)
         assert (f"_pf{cfg.pf}" in cfg.kernel_key) == (cfg.pf > 0)
         assert (f"_px{cfg.pfx}" in cfg.kernel_key) == (cfg.pfx > 0)
-        core_key = re.sub(r"(_mc\d+)?(_pf\d+)?(_px\d+)?$", "", cfg.kernel_key)
+        assert (f"_pi{cfg.pfi}" in cfg.kernel_key) == (cfg.pfi > 0)
+        core_key = re.sub(r"(_mc\d+)?(_pf\d+)?(_px\d+)?(_pi\d+)?$", "", cfg.kernel_key)
         # Round-3 fused knobs: a decoupled ring only for fused, non-resident rows; narrow units divide evenly.
         if entry.get("xb_stages"):
             assert (
@@ -366,7 +369,10 @@ def test_decode_config_round3_fused_rows(arch):
     assert cfg.total_work == 256
     # Round 6 (lever P): the row prefetches its weight tiles four stages ahead into L2 (``_pf4``; 1.02x on both GPUs).
     assert cfg.pf == 4
-    assert cfg.kernel_key == "decode:t64_p2_fused_r3_q4_pf4"
+    # Round 6 continuation 7 (lever PI-W): during the last ``pf`` stages of a work item the load warp also prefetches the
+    # NEXT item's first W / SFW tiles into L2 (``_pi2``; 2 work items per CTA on this row).
+    assert cfg.pfi == 2
+    assert cfg.kernel_key == "decode:t64_p2_fused_r3_q4_pf4_pi2"
     # 16-token tiles cannot keep eight 4-lane groups busy per stage: the table's 4 lanes widen to 8, coupled staging.
     # Round 5: the 24-tile M = 256 row moves to a 4-CTA cluster split-K route (each CTA owns a quarter of K, FP32 partials
     # are exchanged through distributed shared memory in one round); the small dedicated inbox is used (no aliasing).

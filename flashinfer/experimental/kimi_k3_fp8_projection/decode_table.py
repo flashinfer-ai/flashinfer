@@ -540,6 +540,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pf": 0,
         },
         "192,2,64": {
             "route": "decode",
@@ -566,6 +567,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pf": 1,
         },
         "384,28,64": {
             "route": "decode",
@@ -592,6 +594,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pf": 1,
         },
         "386,28,64": {
             "route": "decode",
@@ -624,6 +627,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "xb_stages": "auto",
             "qlanes": 4,
             "pf": 4,
+            "pfi": 2,
         },
         "5,28,4096": {"route": "gemm", "gemm_bn": 192},
         "5,28,16384": {"route": "gemm", "gemm_bn": 192},
@@ -1136,6 +1140,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pf": 0,
         },
         "192,2,64": {
             "route": "decode",
@@ -1162,6 +1167,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pf": 1,
         },
         "384,28,64": {
             "route": "decode",
@@ -1188,6 +1194,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "fused": True,
             "persist": True,
             "resident": False,
+            "pf": 1,
         },
         "386,28,64": {
             "route": "decode",
@@ -1220,6 +1227,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
             "xb_stages": "auto",
             "qlanes": 4,
             "pf": 4,
+            "pfi": 2,
         },
         "5,28,4096": {"route": "gemm", "gemm_bn": 192},
         "5,28,16384": {"route": "gemm", "gemm_bn": 192},
