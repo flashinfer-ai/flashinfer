@@ -7058,8 +7058,15 @@ def _cudnn_gemm_fp4_runner(tuning_config):
             k = real_a_shape[2]
             n = real_b_shape[2]
 
-            # Match the autotuner's bucket mapping so tactic indices refer to
-            # the graph they were profiled on.
+            # cache_m must match the AutoTuner cache key so the runtime
+            # graph is the SAME graph the autotuner profiled tactics on.
+            # ``m_bucket_mapper`` is the *currently effective*
+            # ``map_to_tuning_buckets`` (with any
+            # ``autotune(tuning_buckets=..., round_up=...)`` override
+            # applied).  Sharing the mapper keeps cache_m and the tactic
+            # cache key in lockstep -- otherwise a tactic profiled on
+            # graph ``cache_m=A`` is silently applied to graph ``cache_m=B``
+            # at runtime, which has a different plan-index meaning.
             cache_m = m_bucket_mapper(actual_m)
 
             graph = build_cudnn_gemm_fp4_graph_override_shape(
