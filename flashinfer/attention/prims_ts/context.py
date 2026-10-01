@@ -260,6 +260,7 @@ class _PagedContextCompileSpec:
 
 def _make_context_kernel(
     *,
+    device_index: int,
     input_qk_dtype,
     input_pv_dtype,
     output_dtype,
@@ -327,6 +328,7 @@ def _make_context_kernel(
         causal_single_kv_tile=(causal_single_kv_tile and not use_paged_kv),
         **paged_kwargs,
     )
+    fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
     return fmha
 
 
@@ -1486,6 +1488,7 @@ def _make_context_scheduler_probe(
         torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     }
     probe = _make_context_kernel(
+        device_index=geometry.device_index,
         input_qk_dtype=dtype_map[geometry.qk_dtype],
         input_pv_dtype=dtype_map[geometry.pv_dtype],
         output_dtype=dtype_map[geometry.output_dtype],
@@ -1614,7 +1617,6 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
         and not geometry.packed
         and not geometry.head_paired
         and torch.finfo(geometry.qk_dtype).bits == 16
-        and torch.finfo(geometry.pv_dtype).bits in (8, 16)
     )
 
 
@@ -1781,6 +1783,7 @@ def _get_compiled_context(
     with torch.cuda.device(device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
     fmha = _make_context_kernel(
+        device_index=device_index,
         input_qk_dtype=input_qk_dtype,
         input_pv_dtype=input_pv_dtype,
         output_dtype=output_dtype,
@@ -1812,7 +1815,6 @@ def _get_compiled_context(
     fmha.cfg.packed_dense_k_mask = packed_dense_k_mask
     if mask_type != "causal" and not packed:
         fmha.cfg.fixed_dense_k_tail = max_seq_len_k % fmha.cfg.kv_tile_n
-    fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
 
     @cute.jit
     def tensor_adapter(
@@ -1996,6 +1998,7 @@ def _get_compiled_paged_context(
     with torch.cuda.device(device_index):
         max_active_clusters = int(utils.HardwareInfo().get_max_active_clusters(1))
     fmha = _make_context_kernel(
+        device_index=device_index,
         input_qk_dtype=input_qk_dtype,
         input_pv_dtype=input_pv_dtype,
         output_dtype=output_dtype,
@@ -2026,7 +2029,6 @@ def _get_compiled_paged_context(
         )
     _validate_query_work_tile_span(fmha.cfg)
     fmha.cfg.packed_dense_k_mask = packed_dense_k_mask
-    fmha.cfg.exp2_fma_pairs = _default_exp2_fma_pairs(device_index, fmha.cfg)
 
     @cute.jit
     def tensor_adapter(

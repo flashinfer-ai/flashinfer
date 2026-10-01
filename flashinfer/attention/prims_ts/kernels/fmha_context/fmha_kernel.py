@@ -1803,15 +1803,6 @@ def _kv_ring_smem_budget_bytes(
     # (largest first), so a buffer-aligned block costs its size rounded up to
     # cfg.buffer_align_bytes; the 4-32 byte records follow, then barriers.
     align = cfg.buffer_align_bytes
-    smem_p_bytes = 0
-    if cfg.p_in_smem:
-        p_block_bytes = cfg.smem_p_bytes
-        if cfg.vc_attention:
-            # Row-sum operand and K-scale table live behind each P tile.
-            p_block_bytes += cfg.vc_rowsum_tile_bytes + cfg.vc_kscale_table_bytes
-        smem_p_bytes = (
-            (p_block_bytes + align - 1) // align * align * cfg.num_qkv_instances
-        )
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
     if is_clc_dynamic:
         control_bytes = (control_bytes + 15) // 16 * 16 + cutlass.Int128.width // 8
@@ -1822,14 +1813,9 @@ def _kv_ring_smem_budget_bytes(
             is_clc_dynamic=is_clc_dynamic,
         ).values()
     )
-    if cfg.vc_attention:
-        # The tile-mean ring is sized with the K/V ring (one operand and
-        # barrier per stage); the callers charge it per stage.
-        fixed_barrier_stages -= cfg.vc_mean_stages
     fixed_smem_bytes = (
         (q_tile_bytes * cfg.q_stage + align - 1) // align * align
         + (o_stage_bytes + align - 1) // align * align * cfg.num_qkv_instances
-        + smem_p_bytes
         + (stats_bytes + 15) // 16 * 16
         + (page_offsets_bytes + 15) // 16 * 16
         + (control_bytes + 7) // 8 * 8
@@ -1865,10 +1851,6 @@ def _infer_single_instance_kv_stages(
         cfg.qk_mma_tiler[1] // cfg.cta_group_size * kv_head_dim * kv_dtype_width // 8
     )
     kv_stage_footprint_bytes = kv_stage_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
-    if cfg.vc_attention:
-        kv_stage_footprint_bytes += (
-            cfg.vc_mean_tile_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
-        )
     memory_fit_stages = kv_budget_bytes // kv_stage_footprint_bytes
     cadence_stages = cfg.num_head_dim_stages_k + cfg.num_head_dim_stages_v
     if require_cadence and memory_fit_stages < cadence_stages:
@@ -1913,8 +1895,6 @@ def _configure_kv_ring_depths(cfg: FmhaConfig, *, is_clc_dynamic: bool) -> None:
         kv_rows_per_cta * kv_head_dim * cfg.v_dtype.width // 8
         + _PIPELINE_BARRIER_BYTES_PER_STAGE
     )
-    if cfg.vc_attention:
-        v_stage_footprint += cfg.vc_mean_tile_bytes + _PIPELINE_BARRIER_BYTES_PER_STAGE
     # K and V share the same head_dim and head_dim_per_stage_kv, so their
     # minimum ring depths (num_head_dim_stages) are equal and both rings are sized identically.
     cadence = cfg.num_head_dim_stages_k
@@ -2668,8 +2648,6 @@ class FmhaTs:
         into the TMEM S load on the non-masked path (default: False). The
         context runner enables this by default on SM103 (B300) and SM107
         (Rubin).
-    exp2_fma_pairs : int, optional
-        exp2 pairs per 16-pair softmax chunk computed on the FMA pipe.
     two_cta_umma : bool, optional
         Issue the QK and PV UMMAs in ``cta_group::2`` across a 2-CTA cluster, each
         CTA staging half of every K/V tile. Dense contiguous query-paired D128 with
@@ -2706,7 +2684,6 @@ class FmhaTs:
         h_r: int = 1,
         enable_skip_correction: bool = True,
         uses_ldtm_stat: bool = False,
-        exp2_fma_pairs: int = 0,
         two_cta_umma: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
@@ -2827,7 +2804,6 @@ class FmhaTs:
         if enable_skip_correction and v_dtype.width == 16:
             cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
-        cfg.exp2_fma_pairs = exp2_fma_pairs
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
 
