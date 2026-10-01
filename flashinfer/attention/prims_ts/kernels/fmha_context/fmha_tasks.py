@@ -1415,24 +1415,10 @@ def create_mma_task(
                 return sv.v_desc()
 
             if p_in_smem:
-                # P in SMEM.
-                #
-                # When P is written back into the TMEM S stage, QK(i+1) cannot start
-                # until PV(i) has read P. PV(i) in turn waits for the end of
-                # softmax(i). Every tile therefore runs as a serial chain. With P in
-                # its own SMEM tile, softmax releases the S stage right after
-                # loading S and QK(i+1) overlaps exp2(i).
-                #
-                # The MMA issues QK0(i+1), PV0(i), QK1(i+1), PV1(i). Each QK
-                # acquires its SP slot here. Each PV follows its own QK, which
-                # returns the P tile to that group before its next store. The tail
-                # drains no SP slot because no PV acquires one.
-                #
-                # Softmax computes exp2 before acquiring the P tile, which keeps
-                # exp2 from waiting on the previous PV. Correction releases each
-                # stats slot right after reading it. Holding it through the peer
-                # group's O correction would serialize the groups through PV
-                # completion.
+                # With P in SMEM, softmax releases the S stage right after loading
+                # S, so QK(i+1) overlaps exp2(i). The MMA issues QK0(i+1), PV0(i),
+                # QK1(i+1), PV1(i). Each QK acquires its SP slot here and each PV
+                # waits on its group's P tile instead. The tail drains no SP slot.
                 with domain_loop(loop_start, loop_end, loop_step):
                     sp0.acquire()
                     k_descriptors = qk_mma_stages(sk, sp0, desc_q0_base, FmhaStage.Loop)
@@ -2316,7 +2302,10 @@ def create_softmax_task(
                     seq.wait()
                 # FP8 returns the pacing token before P work. Its SP release
                 # still follows every P store's completion.
-                if tmem_sp.cfg.uses_d128_fp8_softmax_cadence:
+                early_token = tmem_sp.cfg.uses_d128_fp8_softmax_cadence or (
+                    p_in_smem and tmem_sp.cfg.fp8_psmem_early_token
+                )
+                if early_token:
                     if index == 0:
                         seq.commit()
                     else:
@@ -2327,7 +2316,7 @@ def create_softmax_task(
                     row_max=row_max,
                     scale_softmax_log2=scale_softmax_log2,
                 )
-                if s0s1_seq is None or tmem_sp.cfg.uses_d128_fp8_softmax_cadence:
+                if s0s1_seq is None or early_token:
                     pass
                 elif index == 0:
                     seq.commit()

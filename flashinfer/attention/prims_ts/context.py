@@ -275,6 +275,7 @@ def _make_context_kernel(
     causal_single_kv_tile: bool,
     scheduler: _ContextScheduler,
     uses_ldtm_stat: bool,
+    fp8_psmem_early_token: bool = False,
     two_cta_umma: bool = False,
     page_size: int | None = None,
     max_kv_len: int | None = None,
@@ -308,6 +309,7 @@ def _make_context_kernel(
         d=head_dim,
         d_v=head_dim_vo,
         is_persistent=is_persistent,
+        fp8_psmem_early_token=fp8_psmem_early_token,
         two_cta_umma=two_cta_umma,
         is_causal=mask_type == "causal",
         has_variable_window=mask_type == "variable_window",
@@ -509,18 +511,25 @@ def _dsl_supports_ldtm_stat() -> bool:
 
 
 def _default_exp2_fma_pairs(device_index: int, cfg) -> int:
-    """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100 with 16-bit V.
+    """FMA-pipe exp2 pairs per 16-pair softmax chunk on SM100.
 
     Measured on B200. The paired D128 dense path is MUFU bound and takes 4.
-    Single-QKV dense takes 2. Causal is issue bound and takes 0. Callers can
-    set cfg.exp2_fma_pairs to any value on any path."""
+    Single-QKV dense takes 2. Causal is issue bound and takes 0. The fp8
+    P-in-SMEM path takes 3 and other fp8 paths take 0."""
     if torch.cuda.get_device_capability(device_index) != (10, 0):
         return 0
-    if cfg.v_dtype.width != 16 or cfg.is_causal:
+    if cfg.is_causal:
         return 0
+    if cfg.v_dtype.width == 8:
+        return 3 if cfg.p_in_smem else 0
     if cfg.pv_half_overlap:
         return 4
     return 2 if cfg.single_qkv_instance else 0
+
+
+def _default_fp8_psmem_early_token(device_index: int) -> bool:
+    """Release the S0/S1 token early on the fp8 SMEM-P path, on for SM103."""
+    return torch.cuda.get_device_capability(device_index) == (10, 3)
 
 
 def _default_two_cta_umma(device_index: int) -> bool:
@@ -1806,6 +1815,7 @@ def _get_compiled_context(
         scheduler=scheduler,
         two_cta_umma=two_cta_umma,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
     )
     fmha.cfg.has_varlen = packed
     fmha.cfg.has_uniform_varlen = uniform_packed_lengths
@@ -2020,6 +2030,7 @@ def _get_compiled_paged_context(
         causal_single_kv_tile=False,
         scheduler=scheduler,
         uses_ldtm_stat=_default_uses_ldtm_stat(device_index),
+        fp8_psmem_early_token=_default_fp8_psmem_early_token(device_index),
         page_size=page_size,
         max_kv_len=max_kv_len,
     )

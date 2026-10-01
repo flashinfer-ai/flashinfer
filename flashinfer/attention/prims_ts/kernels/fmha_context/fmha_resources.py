@@ -182,8 +182,6 @@ def _pack_float4_to_fp8_e4m3(
     )
 
 
-
-
 @cute.jit
 def _f32_bits(x: Float32) -> Int32:
     return cutlass.Vector.from_elements((x,), Float32).bitcast(Int32)[0]
@@ -275,6 +273,10 @@ class FmhaConfig:
     # Pipeline stages
     q_stage: int = 2
     kv_stage: int = 3
+    # Hand the S0/S1 pacing token back before the exp2/P work on the fp8 P-in-SMEM path
+    # (as the TMEM-P fp8 cadence does), so the peer softmax group starts its row max
+    # while this group computes P.
+    fp8_psmem_early_token: bool = False
     # One TMA pipeline has one expected-transaction byte count per stage, so K
     # and V share a ring of kv_stage stages only while their dtype widths
     # match. Mixed widths set split_kv_pipelines and size one ring per side.
@@ -514,8 +516,8 @@ class FmhaConfig:
 
     @property
     def pv_half_overlap(self) -> bool:
-        """Paired dense D128 (bf16 or fp8 V) publishes P in two 64-key halves
-        so the MMA can start PV on the first half while softmax finishes it."""
+        """Publish P in two 64-key halves so PV can start on the first half.
+        Not used when P is staged in SMEM."""
         return (
             not self.single_qkv_instance
             and self.enable_early_tile_sum
@@ -538,7 +540,8 @@ class FmhaConfig:
 
     @property
     def uses_d128_fp8_softmax_cadence(self) -> bool:
-        """Return whether paired D128 FP8 uses interleaved softmax retirement."""
+        """Paired D128 fp8 with P in TMEM retires softmax interleaved. Only the
+        shapes that do not stage P in SMEM take this path."""
         return (
             not self.single_qkv_instance
             and not self.p_in_smem
@@ -4981,7 +4984,12 @@ class TmemOResource(MemoryResource):
         The task domain pads partial final CTAs so this slot is always outside
         peer0's causal reach.
         """
-        if cutlass.const_expr(section == FmhaStage.Head):
+        if cutlass.const_expr(self.cfg.p_in_smem):
+            # PV0(i), PV1(i) every iteration and in the tail, so inst_idx is the group.
+            writes_o0 = inst_idx == 0
+            first_o0_write = False
+            first_o1_write_maybe = False
+        elif cutlass.const_expr(section == FmhaStage.Head):
             writes_o0 = True
             first_o0_write = True
             first_o1_write_maybe = False
@@ -4993,11 +5001,6 @@ class TmemOResource(MemoryResource):
             writes_o0 = False
             first_o0_write = False
             first_o1_write_maybe = True
-        if cutlass.const_expr(self.cfg.p_in_smem):
-            # PV0(i), PV1(i) every iteration and in the tail: inst_idx is the group.
-            writes_o0 = inst_idx == 0
-            first_o0_write = False
-            first_o1_write_maybe = False
 
         # In causal mode, check if O0 MMA should skip peer 0's invalid last tile:
         # the last loop iteration, or the tail when P in SMEM moves PV0 there.

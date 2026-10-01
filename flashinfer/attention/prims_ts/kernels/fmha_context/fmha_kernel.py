@@ -1847,6 +1847,11 @@ def _kv_ring_smem_budget_bytes(
     # (largest first), so a buffer-aligned block costs its size rounded up to
     # cfg.buffer_align_bytes; the 4-32 byte records follow, then barriers.
     align = cfg.buffer_align_bytes
+    smem_p_bytes = 0
+    if cfg.p_in_smem:
+        smem_p_bytes = (
+            (cfg.smem_p_bytes + align - 1) // align * align * cfg.num_qkv_instances
+        )
     control_bytes = (2 * cutlass.Int32.width + cutlass.Int64.width) // 8
     if is_clc_dynamic:
         control_bytes = (control_bytes + 15) // 16 * 16 + cutlass.Int128.width // 8
@@ -1857,7 +1862,6 @@ def _kv_ring_smem_budget_bytes(
             is_clc_dynamic=is_clc_dynamic,
         ).values()
     )
-    smem_p_bytes = cfg.smem_p_bytes * cfg.num_qkv_instances if cfg.p_in_smem else 0
     fixed_smem_bytes = (
         (q_tile_bytes * cfg.q_stage + align - 1) // align * align
         + (o_stage_bytes + align - 1) // align * align * cfg.num_qkv_instances
@@ -2754,6 +2758,7 @@ class FmhaTs:
         h_r: int = 1,
         enable_skip_correction: bool = True,
         uses_ldtm_stat: bool = False,
+        fp8_psmem_early_token: bool = False,
         two_cta_umma: bool = False,
         use_paged_kv: bool = False,
         num_tokens_per_page: int = 32,
@@ -2874,6 +2879,7 @@ class FmhaTs:
         if enable_skip_correction:
             cfg.corr_skip_threshold_log2 = _CORR_SKIP_THRESHOLD_LOG2
         cfg.uses_ldtm_stat = uses_ldtm_stat
+        cfg.fp8_psmem_early_token = fp8_psmem_early_token
         cfg.qk_acc_dtype = qk_acc_dtype or cutlass.Float32
         cfg.pv_acc_dtype = pv_acc_dtype or cutlass.Float32
 
