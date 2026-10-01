@@ -1224,14 +1224,6 @@ def top_p_sampling_from_probs(
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
         after the renormalization step.  Defaults to ``False``.
-    max_top_k: Optional[int]
-        Optional upper bound on every entry of a ``top_k`` tensor; ignored when ``top_k``
-        is a scalar. With ``filter_apply_order="top_k_first"``, a small bound lets a
-        per-row ``top_k`` tensor use the top-k-first fast path (select ``max_top_k``
-        candidates, then top-p over them) instead of filtering the full vocabulary.
-        The bound is not checked, to avoid a device-to-host sync: rows whose ``top_k``
-        exceeds it, including rows that disable top-k with ``top_k >= vocab_size``,
-        may be sampled as if ``top_k == max_top_k``. Default is ``None`` (no bound).
 
     Returns
     -------
@@ -1578,9 +1570,8 @@ def _top_k_first_fast_path(
     reduce to the same ``probs_k`` and stay sample-aligned. This is distribution-equivalent
     to the masked full-vocab path (validated TV ~0.01) but far cheaper at small batch.
 
-    For a per-row ``top_k`` tensor, selects ``max_top_k`` entries and then masks each row
-    past its own k. Because the selection is sorted, the first k columns of a row are
-    exactly its top-k.
+    A ``top_k`` tensor selects ``max_top_k`` sorted entries, so masking each row past
+    its own k leaves exactly its top-k.
     """
     # Local import avoids a module-level cycle between sampling and topk.
     from .topk import top_k as _radix_top_k
@@ -1593,9 +1584,8 @@ def _top_k_first_fast_path(
     )
     values = values.float()
     if not isinstance(top_k, int):
-        # Rows with k outside [1, max_top_k] are clamped so they always keep at least
-        # one candidate and never index past the selected columns.
-        row_k = top_k.to(device=x.device).clamp(1, select_k).unsqueeze(-1)
+        # Clamp so every row keeps at least one candidate.
+        row_k = top_k.clamp(1, select_k).unsqueeze(-1)
         cols = torch.arange(select_k, device=x.device)
         values = values.masked_fill(
             cols >= row_k, float("-inf") if from_logits else 0.0
@@ -1703,13 +1693,10 @@ def top_k_top_p_sampling_from_logits(
         their values between calls to ensure different random samples. The offset should be
         incremented based on the number of random values consumed by the operation.
     max_top_k: Optional[int]
-        Optional upper bound on every entry of a ``top_k`` tensor; ignored when ``top_k``
-        is a scalar. With ``filter_apply_order="top_k_first"``, a small bound lets a
-        per-row ``top_k`` tensor use the top-k-first fast path (select ``max_top_k``
-        candidates, then top-p over them) instead of filtering the full vocabulary.
-        The bound is not checked, to avoid a device-to-host sync: rows whose ``top_k``
-        exceeds it, including rows that disable top-k with ``top_k >= vocab_size``,
-        may be sampled as if ``top_k == max_top_k``. Default is ``None`` (no bound).
+        Upper bound on the entries of a ``top_k`` tensor, letting it take the
+        ``"top_k_first"`` fast path. Not checked (that would need a host sync): rows
+        above it, including ``top_k >= vocab_size``, are sampled as if
+        ``top_k == max_top_k``. Default is ``None``.
 
     Returns
     -------
@@ -1875,6 +1862,11 @@ def top_k_top_p_sampling_from_probs(
         When ``True``, the kernel returns an additional boolean mask
         indicating which rows had a valid (non-degenerate) distribution
         after the renormalization step.  Defaults to ``False``.
+    max_top_k: Optional[int]
+        Upper bound on the entries of a ``top_k`` tensor, letting it take the
+        ``"top_k_first"`` fast path. Not checked (that would need a host sync): rows
+        above it, including ``top_k >= vocab_size``, are sampled as if
+        ``top_k == max_top_k``. Default is ``None``.
 
     Returns
     -------
