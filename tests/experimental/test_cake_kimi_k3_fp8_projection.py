@@ -281,7 +281,9 @@ def test_decode_config_rules(arch):
         # Round 6 (lever M): at the bucket's M every N tile's m tiles fill whole clusters; one cluster item per N tile.
         assert cfg.mc == int(entry.get("mc", 1)) and cfg.pf == int(entry.get("pf", 0))
         # Round-6 next loop (lever PX): the BF16 token-tile L2 prefetch applies to fused, non-resident rows only.
-        assert cfg.pfx == (int(entry.get("pfx", 0)) if (cfg.fused and not cfg.resident) else 0)
+        assert cfg.pfx == (
+            int(entry.get("pfx", 0)) if (cfg.fused and not cfg.resident) else 0
+        )
         if cfg.mc > 1:
             assert cfg.split == 1 and cfg.csplit == 1 and not cfg.resident
             assert cfg.m_tiles % cfg.mc == 0 and cfg.total_work == cfg.tiles // cfg.mc
@@ -393,10 +395,28 @@ def test_decode_config_round6_rules(arch):
     cfg = decode_config(65, 50, 28, arch, SM_COUNT)
     assert (cfg.tok, cfg.m_tiles, cfg.mc, cfg.pf) == (128, 1, 1, 0)
     assert cfg.kernel_key == "decode:t128_p3"
-    # Lever P alone on the M = 64 bucket of the same family (two stages ahead).
+    # Lever M64 (round-6 continuation 6): the 48- / 50-tile M = 64 buckets take the 32-token tile with the 5-stage ring,
+    # the 16-row epilogue chunk and W prefetch two stages ahead (96 / 100 CTAs instead of 48 / 50; bit-exact with the
+    # 64-token route).
     cfg = decode_config(64, 50, 28, arch, SM_COUNT)
-    assert (cfg.tok, cfg.mc, cfg.pf) == (64, 1, 2)
-    assert cfg.kernel_key == "decode:t64_p4_pf2"
+    assert (cfg.tok, cfg.stages, cfg.module_stages, cfg.epi_chunk, cfg.mc, cfg.pf) == (
+        32,
+        5,
+        5,
+        16,
+        1,
+        2,
+    )
+    assert cfg.m_tiles == 2 and cfg.tiles == 100
+    assert cfg.kernel_key == "decode:t32_p5_c16_pf2"
+    cfg = decode_config(64, 48, 28, arch, SM_COUNT)
+    assert (cfg.tok, cfg.stages, cfg.epi_chunk, cfg.pf) == (
+        32,
+        5,
+        16,
+        2,
+    ) and cfg.tiles == 96
+    assert cfg.kernel_key == "decode:t32_p5_c16_pf2"
     # Lever D: the 12-tile M = 256 rows pin a 5-stage ring with 16-row epilogue flushes.
     cfg = decode_config(256, 12, 28, arch, SM_COUNT)
     assert (cfg.tok, cfg.stages, cfg.module_stages, cfg.epi_chunk) == (32, 5, 5, 16)
@@ -433,11 +453,20 @@ def test_decode_config_round6_continuation_rules(arch):
             continue
         n_tiles128, num_k_iters, bucket = (int(v) for v in key.split(","))
         cfg = decode_config(bucket, n_tiles128, num_k_iters, arch, SM_COUNT)
-        assert cfg.fused and not cfg.resident and cfg.pfx == 1 and cfg.kernel_key.endswith("_px1")
+        assert (
+            cfg.fused
+            and not cfg.resident
+            and cfg.pfx == 1
+            and cfg.kernel_key.endswith("_px1")
+        )
         n_pfx += 1
     assert n_pfx == 8
-    assert decode_config(8, 24, 2, arch, SM_COUNT).kernel_key.endswith("_px1")  # tp8 kv_b M = 8: 1.076-1.083x B200 / 1.034-1.042x B300
-    assert not decode_config(1, 24, 2, arch, SM_COUNT).kernel_key.endswith("_px1")  # tp8 kv_b M = 1 keeps the plain instance (B300-only win)
+    assert decode_config(8, 24, 2, arch, SM_COUNT).kernel_key.endswith(
+        "_px1"
+    )  # tp8 kv_b M = 8: 1.076-1.083x B200 / 1.034-1.042x B300
+    assert not decode_config(1, 24, 2, arch, SM_COUNT).kernel_key.endswith(
+        "_px1"
+    )  # tp8 kv_b M = 1 keeps the plain instance (B300-only win)
     cfg = decode_config(
         256, 56, 6, arch, SM_COUNT
     )  # tp8 o_proj M = 256: 1.07x on both GPUs
@@ -463,7 +492,10 @@ def test_decode_config_round6_continuation_rules(arch):
         assert f"_cs{c}" in cfg.kernel_key and not cfg.tstore
         # the small-inbox exchange of a 7..16-wide cluster gives up one t16 stage (2C - 1 inbox lines next to the ring)
         assert cfg.module_stages == (3 if c >= 7 else 4), cfg
-        assert cfg.kernel_key == f"decode:t16_p{cfg.module_stages}_fused_cs{c}"
+        # round-6 next loop (lever PX): the M = 8 buckets of this family carry the `_px1` suffix
+        assert cfg.kernel_key == f"decode:t16_p{cfg.module_stages}_fused_cs{c}" + (
+            f"_px{cfg.pfx}" if cfg.pfx else ""
+        )
     assert (
         cb.decode_cluster_capacity(arch, 14) == 7
         and cb.decode_cluster_capacity(arch, 9) == 15
