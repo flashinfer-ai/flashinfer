@@ -79,7 +79,7 @@ CAKE_BGMV_MOE_SHRINK_RANK_TILE = 8
 CAKE_BGMV_MOE_SHRINK_TILE = 1024
 CAKE_BGMV_MOE_SHRINK_SPLIT_MAX = 8
 CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS = 128
-CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS = 256
+CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS = 128
 CAKE_BGMV_MOE_SHRINK_SPLIT_PARTIAL_WORDS = (
     CAKE_BGMV_MOE_SHRINK_SPLIT_MAX * CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS * 64
 )
@@ -111,12 +111,12 @@ def select_cake_bgmv_moe_generic_shrink(
 ) -> Tuple[int, int]:
     """(decode kernel flag, hidden splits) for the generic shrink launch.
 
-    Mirrors the Cake generator's ``select_generic_shrink_launch``: the decode
-    kernel (4 pairs per CTA) is used for at most 32 pairs when its pair x
-    rank-block grid, split over the hidden tiles, still fills half of
-    ``CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS``; otherwise the 1-pair kernel.
-    Splits raise the CTA count toward the target for small pair counts,
-    bounded by the tile count and ``CAKE_BGMV_MOE_SHRINK_SPLIT_MAX``.
+    Mirrors the Cake generator's ``select_generic_shrink_launch``: the 1-pair
+    kernel beat the 4-pair decode kernel on every measured small-pair row once
+    the partials moved to registers, so the decode flag is always 0.  Hidden
+    splits are added only while the pair x rank-block grid is below
+    ``CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS`` CTAs, bounded by the tile count
+    and ``CAKE_BGMV_MOE_SHRINK_SPLIT_MAX``.
     """
 
     if num_pairs <= 0:
@@ -126,21 +126,15 @@ def select_cake_bgmv_moe_generic_shrink(
             f"rank must be one of {CAKE_BGMV_MOE_GENERIC_RANKS}, got {rank}"
         )
     tiles = (hidden_size + CAKE_BGMV_MOE_SHRINK_TILE - 1) // CAKE_BGMV_MOE_SHRINK_TILE
-    rank_blocks = rank // CAKE_BGMV_MOE_SHRINK_RANK_TILE
+    ctas = num_pairs * (rank // CAKE_BGMV_MOE_SHRINK_RANK_TILE)
     max_splits = (
         min(tiles, CAKE_BGMV_MOE_SHRINK_SPLIT_MAX)
         if num_pairs <= CAKE_BGMV_MOE_SHRINK_SPLIT_MAX_PAIRS
         else 1
     )
-    decode_ctas = ((num_pairs + 3) // 4) * rank_blocks
-    decode = (
-        num_pairs <= 32
-        and decode_ctas * max_splits >= CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS // 2
-    )
-    ctas = decode_ctas if decode else num_pairs * rank_blocks
     target = CAKE_BGMV_MOE_SHRINK_SPLIT_TARGET_CTAS
     splits = min(max_splits, max(1, (target + ctas - 1) // ctas))
-    return int(decode), splits
+    return 0, splits
 
 
 CAKE_BGMV_MOE_GENERIC_SCHEDULE_IDS: dict[CakeBGMVMoEGenericSchedule, int] = {
