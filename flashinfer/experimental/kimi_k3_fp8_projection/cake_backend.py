@@ -526,6 +526,7 @@ class DecodeConfig:
     pfx: int = 0  # round 6 next loop (lever PX): BF16 token-tile L2 prefetch distance in stages (table key ``pfx``; fused, non-resident rows only; 0 = off)
     tstore: bool = False  # round 6 (lever E1): the split-1 epilogue stores BF16 through TMA (table key ``tstore``; the launch still needs a 16-byte-aligned output view)
     pfi: int = 0  # round 6 continuation 7 (lever PI-W): cross-item L2 prefetch of the next work item's first W/SFW stages by the load warp (table key ``pfi``; multi-item rows with pf > 0; 0 = off)
+    qwarps: int = DEC_QUANT_WARPS  # round 6 continuation 8 (lever QW16): quantizing warps of the fused instance (table key ``qwarps``; 8 = the round-3 default, 16 on the fused 16384 rows)
 
     @property
     def tok_rows(self) -> int:
@@ -556,6 +557,7 @@ class DecodeConfig:
             and self.split == 1
             and self.csplit == 1,
             pfi=self.pfi,
+            qwarps=self.qwarps,
         )
 
 
@@ -693,7 +695,10 @@ def decode_config(
     # Narrow quantization units (table key ``qlanes`` 4 / 8): every lane group must own a unit each stage, so the
     # width is doubled until the units divide evenly over the quantizing warps.
     qlanes = int(entry.get("qlanes", 16)) if fused and not resident else 16
-    while qlanes < 16 and (2 * tok) % (DEC_QUANT_WARPS * (32 // qlanes)):
+    # Table key ``qwarps`` (round 6 continuation 8, lever QW16): quantizing warps of the fused instance (host mirror of the Cake
+    # ``decode_config`` rule: fused rows only; the narrow-unit rule below divides by the row's warp count).
+    qwarps = int(entry.get("qwarps", DEC_QUANT_WARPS)) if fused else DEC_QUANT_WARPS
+    while qlanes < 16 and (2 * tok) % (qwarps * (32 // qlanes)):
         qlanes *= 2
     # Table key ``tstore`` (round 6, lever E1): the split-1 epilogue stores BF16 through TMA; the instance has no TMA path
     # for the split-K / cluster reductions.
@@ -745,6 +750,7 @@ def decode_config(
         mc=mc,
         pfx=pfx,
         pfi=pfi,
+        qwarps=qwarps,
         cs_alias=cs_alias,
     )
 

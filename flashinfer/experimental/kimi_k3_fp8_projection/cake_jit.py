@@ -81,10 +81,13 @@ def decode_kernel_key(
     tstore: bool = False,
     pfx: int = 0,
     pfi: int = 0,
+    qwarps: int = 8,
 ) -> str:
     key = f"decode:t{int(tok)}_p{int(stages)}"
     if fused:
         key += "_fused"
+        if int(qwarps) != 8:
+            key += f"_w{int(qwarps)}"  # round 6 continuation 8 (lever QW16): quantizing warps of the fused instance (table key ``qwarps``; 8 = default)
     if resident:
         key += "_res"
     if xb_stages:
