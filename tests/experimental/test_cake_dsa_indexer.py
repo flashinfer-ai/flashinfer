@@ -405,7 +405,11 @@ def _fake_record(arg_plan):
         "abi": ABI_CONTRACT,
         "stages": ["scan", "finalize_small"],
         "gate_policy": dict(
-            zip(GATE_POLICY_FIELDS, (4, 8, 4, 128, 128, 32, 32, 250, 2048), strict=True)
+            zip(
+                GATE_POLICY_FIELDS,
+                (4, 8, 4, 128, 128, 32, 512, 32, 250, 2048),
+                strict=True,
+            )
         ),
         "numerics": {"zero_sign_policy": "positive_accumulator"},
         "scan": {

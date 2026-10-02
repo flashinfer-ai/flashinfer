@@ -821,12 +821,12 @@ def prepare_dsa_indexer_topk(
         max_seqlen_k,
     )
     device = q.device
-    for name, t in (
+    for name, tensor in (
         ("workspace_buffer", workspace_buffer),
         ("indices", indices),
         ("scores", scores),
     ):
-        if t is not None and (not t.is_cuda or t.device != device):
+        if tensor is not None and (not tensor.is_cuda or tensor.device != device):
             raise ValueError(f"{name} must be on {device}")
     _check_output(indices, "indices", (num_queries, int(top_k)), torch.int32, device)
     _check_output(scores, "scores", (num_queries, int(top_k)), torch.float32, device)
