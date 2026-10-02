@@ -171,3 +171,45 @@ pre-hardening combined `sparse_indices` accept only a combined table with
 offset 0; `completion_base` is rejected. The CPU tests check that every
 registered name is bindable, so a regenerated registration with a new name
 fails fast on the host side.
+
+## SM120 / SM121: DeepSeek-V4 NVFP4 sparse-MLA decode
+
+`sm_120a/` holds the Cake-generated SM120 (GB202: RTX 5090, RTX PRO 6000
+Blackwell) DeepSeek-V4 NVFP4 sparse-MLA decode family: one translation unit per
+query head count (8, 16, 32, 48, 64, 80, 96, 112, 128) with the single-cache
+decode, dual-cache decode and split-merge kernels (head counts divisible by 32
+also carry two-tile variants that process 32 heads per CTA over one shared
+candidate gather), the TVM-FFI binding
+`cake_sparse_mla_dsv4_nvfp4_binding.cu`, and
+`cake_sparse_mla_dsv4_nvfp4_manifest.json` (provenance, geometry constants
+and the source list the JIT spec compiles). Regenerate the whole directory
+from the Cake kernel schedules with one command; do not edit the generated
+files.
+
+Select it through the existing SM120 entry points:
+
+```python
+from flashinfer.mla import SparseMLASm120Wrapper, trtllm_batch_decode_sparse_mla_dsv4
+
+out = trtllm_batch_decode_sparse_mla_dsv4(
+    query=q, swa_kv_cache=nvfp4_cache, workspace_buffer=workspace,
+    sparse_indices=indices, swa_topk_lens=lengths, bmm1_scale=sm_scale,
+    backend="cake", kv_cache_format="nvfp4",
+)
+runner = SparseMLASm120Wrapper(kv_cache_format="nvfp4", backend="cake")
+```
+
+The route accepts the packed NVFP4 cache (`page_size * 352` data bytes followed
+by `page_size * 32` scale bytes per page) as `[P, page, 384]`, HND or NHD views
+with any positive page size and a 16-byte multiple page stride (padded pools),
+an optional second cache (`compressed_kv_cache` / `extra_kv_cache`, any page
+size), per-token lengths, `-1` masking, attention sinks and `lse_scale`.
+Split-K scratch (`mid_out` / `mid_lse`) is caller-owned or carved from the
+public `workspace_buffer`; size it with
+`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes`. The Python
+planners `cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles` (1 or 2 head tiles
+per CTA) and `cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits` (split count and
+chunks per CTA, at most 16 chunks of 64 candidates per CTA, so more than 1024
+candidates always split) mirror the generating kernel module's launcher;
+`head_tiles` / `num_splits` on the low-level decode entry override them.
+`backend="auto"` keeps the hand-written SM120 kernels.
