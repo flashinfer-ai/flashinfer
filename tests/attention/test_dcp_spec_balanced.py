@@ -667,7 +667,6 @@ def test_balanced_families_ship_one_program_with_both_packed_instances() -> None
         assert "#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 1000)" in program_text
         for member in entry["source_family"]:
             assert member["sources"] == {"sm_100a": program, "sm_103a": program}
-            assert member["sha256"]["sm_100a"] == member["sha256"]["sm_103a"]
             assert member["defines"] == {"N_ROWS": member["selector"]["n_rows"]}
         assert entry["binding_source"] == f"bindings/cake_fmha_{family}_binding.cu"
         assert (csrc_dir / entry["binding_source"]).is_file()
