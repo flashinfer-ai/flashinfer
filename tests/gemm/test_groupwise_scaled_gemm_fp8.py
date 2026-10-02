@@ -1022,9 +1022,12 @@ def test_gemm_fp8_nt_groupwise_cutile_out_dtypes(m, n, k, out_dtype):
     fp32 store, but matching the function-level contract avoids divergence
     from the other backends.
     """
-    compute_capability = get_compute_capability(torch.device(device="cuda"))
-    if compute_capability[0] not in [10, 11, 12]:
-        pytest.skip("cuTile fp8 backend requires SM100+ GPUs.")
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if not gemm_fp8_nt_groupwise.is_backend_supported("cutile", cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise backend cutile does not support SM{cc}")
     if not is_cuda_tile_available():
         pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
 
@@ -1062,9 +1065,12 @@ def test_gemm_fp8_nt_groupwise_cutile_out_dtypes(m, n, k, out_dtype):
 
 def test_gemm_fp8_nt_groupwise_cutile_rejects_mn_scale_major():
     """The v1 cuTile fp8 path only supports K-major scales; MN-major must raise."""
-    compute_capability = get_compute_capability(torch.device("cuda"))
-    if compute_capability[0] not in [10, 11, 12]:
-        pytest.skip("cuTile fp8 backend requires SM100+ GPUs.")
+    if not torch.cuda.is_available():
+        pytest.skip("gemm_fp8_nt_groupwise requires CUDA")
+    major, minor = get_compute_capability(torch.device("cuda"))
+    cc = major * 10 + minor
+    if not gemm_fp8_nt_groupwise.is_backend_supported("cutile", cc):
+        pytest.skip(f"gemm_fp8_nt_groupwise backend cutile does not support SM{cc}")
     if not is_cuda_tile_available():
         pytest.skip("cuda-tile / tileiras compiler not available in this environment.")
 

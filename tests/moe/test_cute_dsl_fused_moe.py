@@ -253,7 +253,7 @@ def test_w4a4_and_w4a8_use_distinct_tuner_cache_keys():
             ActivationType.GegluTanh,
             1.0,
             None,
-            r"require ActivationType\.Situ or Swiglu",
+            "require ActivationType.Swiglu",
         ),
     ],
 )
