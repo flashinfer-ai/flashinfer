@@ -44,4 +44,4 @@ export LOCAL_WORLD_SIZE="${SLURM_NTASKS_PER_NODE:-8}"
 export EP_INIT_METHOD="file://${EP_SYNC:?set EP_SYNC to a shared rendezvous path}"
 
 cd /host/flashinfer
-exec python benchmarks/bench_ep_matrix.py "$@"
+exec python benchmarks/moe_ep/core/comm/bench_ep_matrix.py "$@"

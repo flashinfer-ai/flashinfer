@@ -1,7 +1,7 @@
 """Benchmark the fused BF16 CuTeDSL MegaMoE backend on Blackwell.
 
 Launch one process per EP rank, for example:
-``torchrun --nproc_per_node=4 benchmarks/bench_bf16_cutedsl_megamoe.py``.
+``torchrun --nproc_per_node=4 benchmarks/moe_ep/backends/mega/kernel/sm100/bench_bf16_cutedsl_megamoe.py``.
 """
 
 from __future__ import annotations

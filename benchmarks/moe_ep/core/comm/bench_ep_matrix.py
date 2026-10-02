@@ -20,7 +20,7 @@ Times/bytes are averaged across ranks (all_reduce SUM / world), like ep_bench.
 
 Launch (per fabric env; matches scripts/run_matrix.sh COMMON args):
     NCCL_GIN_TYPE=3 [NCCL_MNNVL_ENABLE=1] torchrun --nnodes=N --nproc_per_node=8 ... \\
-      benchmarks/bench_ep_matrix.py --algorithm ll --layout em --tokens 128 \\
+      benchmarks/moe_ep/core/comm/bench_ep_matrix.py --algorithm ll --layout em --tokens 128 \\
       --hidden 7168 --top-k 8 --experts 256 --warmup 20 --iters 100
 """
 
