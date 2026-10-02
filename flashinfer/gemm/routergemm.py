@@ -45,13 +45,19 @@ def _router_gemm_shape_checks(
     if out.dim() != 2:
         raise ValueError("out must be a 2D tensor")
 
-    # Stride checks (check these before dimension checks to give better error messages)
-    if mat_a.stride(1) != 1:
-        raise ValueError("mat_a must be row-major")
-    if out.stride(1) != 1:
-        raise ValueError("out must be row-major")
-    if mat_b.stride(0) != 1:
-        raise ValueError("mat_b must be column-major")
+    # Stride checks (check these before dimension checks to give better error messages).
+    # The kernels address mat_a[m * K + k], mat_b[e * K + k] and out[m * N + e], so every
+    # operand must be dense: a padded view would silently produce wrong results.
+    if mat_a.stride(1) != 1 or (
+        mat_a.shape[0] > 1 and mat_a.stride(0) != mat_a.shape[1]
+    ):
+        raise ValueError("mat_a must be a dense row-major tensor")
+    if out.stride(1) != 1 or (out.shape[0] > 1 and out.stride(0) != out.shape[1]):
+        raise ValueError("out must be a dense row-major tensor")
+    if mat_b.stride(0) != 1 or (
+        mat_b.shape[1] > 1 and mat_b.stride(1) != mat_b.shape[0]
+    ):
+        raise ValueError("mat_b must be a dense column-major tensor")
 
     if mat_a.shape[1] != mat_b.shape[0]:
         raise ValueError("mat_a.shape[1] must be equal to mat_b.shape[0]")

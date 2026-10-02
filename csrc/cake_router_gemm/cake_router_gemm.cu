@@ -110,6 +110,19 @@ void run(TensorView mat_a, TensorView mat_b, TensorView out, bool launch_with_pd
   TVM_FFI_CHECK(out.size(0) == num_tokens && out.size(1) == num_experts, ValueError)
       << "out must have shape [" << num_tokens << ", " << num_experts << "], got [" << out.size(0)
       << ", " << out.size(1) << "]";
+  // The kernel addresses mat_a[m * hidden_dim + k], mat_b[e * hidden_dim + k] and
+  // out[m * num_experts + e]: every operand must be dense, not a padded view.
+  TVM_FFI_CHECK(mat_a.stride(1) == 1 && (num_tokens == 1 || mat_a.stride(0) == hidden_dim),
+                ValueError)
+      << "mat_a must be a dense row-major [num_tokens, hidden_dim] tensor, got strides ("
+      << mat_a.stride(0) << ", " << mat_a.stride(1) << ")";
+  TVM_FFI_CHECK(mat_b.stride(0) == 1 && (num_experts == 1 || mat_b.stride(1) == hidden_dim),
+                ValueError)
+      << "mat_b must be a dense column-major [hidden_dim, num_experts] tensor, got strides ("
+      << mat_b.stride(0) << ", " << mat_b.stride(1) << ")";
+  TVM_FFI_CHECK(out.stride(1) == 1 && (num_tokens == 1 || out.stride(0) == num_experts), ValueError)
+      << "out must be a dense row-major [num_tokens, num_experts] tensor, got strides ("
+      << out.stride(0) << ", " << out.stride(1) << ")";
 
   ffi::CUDADeviceGuard device_guard(mat_a.device().device_id);
   const cudaStream_t stream = get_stream(mat_a.device());
