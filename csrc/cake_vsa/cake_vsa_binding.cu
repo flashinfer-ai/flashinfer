@@ -85,7 +85,7 @@ constexpr CUtensorMapDataType kIoTmaDtype = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
 #endif
 constexpr int kIoBytes = 2;
 
-inline void CheckInput(const TensorView& t, DLDataType dtype, const char* name) {
+inline void check_input(const TensorView& t, DLDataType dtype, const char* name) {
   check_cuda_tensor(t, name);
   check_dtype(t, dtype, name);
   check_contiguous(t, name);
@@ -112,7 +112,7 @@ inline int64_t HostExtent(int64_t a, int64_t b, int64_t c = 1) {
   return extent;
 }
 
-inline void CheckExtent(const TensorView& t, int64_t extent, const char* name) {
+inline void check_extent(const TensorView& t, int64_t extent, const char* name) {
   TVM_FFI_CHECK(t.numel() >= extent, ValueError)
       << name << " requires at least " << extent << " elements, got " << t.numel();
 }
@@ -265,7 +265,7 @@ inline void Launch(const TensorView& q, void** kargs, int64_t grid_x, int64_t gr
 #error "CAKE_VSA_Q_BOX_ROWS and CAKE_VSA_Q_BOX_SPLIT must describe the Q TMA box"
 #endif
 
-inline void CheckHeadDim(const TensorView& t, const char* name) {
+inline void check_head_dim(const TensorView& t, const char* name) {
 #ifdef CAKE_VSA_HEAD_DIM
   TVM_FFI_CHECK(t.ndim() == 3, ValueError) << name << " must have rank 3, got " << t.ndim();
   TVM_FFI_CHECK(t.size(-1) == CAKE_VSA_HEAD_DIM, ValueError)
@@ -287,16 +287,16 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView out, TensorView ls
          int64_t num_q_heads, int64_t num_kv_heads, double softmax_scale_log2,
          double lse_temperature_scale, int64_t return_softmax_lse, int64_t return_temperature_lse,
          int64_t grid_x, int64_t grid_y, int64_t grid_z) {
-  CheckInput(q, kIoDtype, "q");
-  CheckInput(k, kIoDtype, "k");
-  CheckInput(v, kIoDtype, "v");
-  CheckInput(out, kIoDtype, "out");
-  CheckInput(lse, dl_float32, "lse");
-  CheckInput(temperature_lse, dl_float32, "temperature_lse");
+  check_input(q, kIoDtype, "q");
+  check_input(k, kIoDtype, "k");
+  check_input(v, kIoDtype, "v");
+  check_input(out, kIoDtype, "out");
+  check_input(lse, dl_float32, "lse");
+  check_input(temperature_lse, dl_float32, "temperature_lse");
 #ifdef CAKE_VSA_BSR_INDICES
-  CheckInput(mask, dl_int32, "bsr_indices");
+  check_input(mask, dl_int32, "bsr_indices");
 #else
-  CheckInput(mask, dl_uint8, "block_mask");
+  check_input(mask, dl_uint8, "block_mask");
 #endif
   CheckI32(mb, "mb");
   CheckI32(nb, "nb");
@@ -313,24 +313,24 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView out, TensorView ls
   for (const TensorView* t : {&k, &v, &out, &lse, &temperature_lse, &mask}) {
     check_same_device(*t, q, "tensor argument", "q");
   }
-  CheckHeadDim(q, "q");
-  CheckHeadDim(k, "k");
-  CheckHeadDim(v, "v");
-  CheckExtent(out, HostExtent(CAKE_VSA_OUT_ROW_ELEMS, num_q_heads, mb), "out");
+  check_head_dim(q, "q");
+  check_head_dim(k, "k");
+  check_head_dim(v, "v");
+  check_extent(out, HostExtent(CAKE_VSA_OUT_ROW_ELEMS, num_q_heads, mb), "out");
   if (return_softmax_lse != 0) {
-    CheckExtent(lse, HostExtent(128, num_q_heads, mb), "lse");
+    check_extent(lse, HostExtent(128, num_q_heads, mb), "lse");
   }
   if (return_temperature_lse != 0) {
-    CheckExtent(temperature_lse, HostExtent(128, num_q_heads, mb), "temperature_lse");
+    check_extent(temperature_lse, HostExtent(128, num_q_heads, mb), "temperature_lse");
   }
 #ifdef CAKE_VSA_BSR_INDICES
-  CheckExtent(mask, HostExtent(mb, selected_blocks), "bsr_indices");
+  check_extent(mask, HostExtent(mb, selected_blocks), "bsr_indices");
   TVM_FFI_CHECK(selected_blocks == 6, ValueError)
       << "selected_blocks must equal 6, got " << selected_blocks;
   TVM_FFI_CHECK(total_tiles == HostExtent(mb, num_q_heads), ValueError)
       << "total_tiles must equal " << HostExtent(mb, num_q_heads) << ", got " << total_tiles;
 #else
-  CheckExtent(mask, HostExtent(num_q_heads, mb, nb), "block_mask");
+  check_extent(mask, HostExtent(num_q_heads, mb, nb), "block_mask");
 #endif
 
   const DLDevice dev = q.device();
@@ -343,7 +343,7 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView out, TensorView ls
 #elif CAKE_VSA_Q_LAYOUT == 1
   CUtensorMap p_q = EncodeDense3D(q, "q");
 #else
-  CheckExtent(q, HostExtent(CAKE_VSA_OUT_ROW_ELEMS, num_q_heads, mb), "q");
+  check_extent(q, HostExtent(CAKE_VSA_OUT_ROW_ELEMS, num_q_heads, mb), "q");
   void* p_q = q.data_ptr();
 #endif
 #if CAKE_VSA_KV_LAYOUT == 0
@@ -406,14 +406,14 @@ void Run(TensorView q, TensorView k, TensorView v, TensorView out, TensorView ls
          int64_t max_kv_blocks, int64_t sequence_q, int64_t query_blocks, int64_t total_tiles,
          int64_t tiles_per_cta, int64_t num_heads, double softmax_scale_log2, int64_t return_lse,
          int64_t grid_x, int64_t grid_y, int64_t grid_z) {
-  CheckInput(q, kIoDtype, "q");
-  CheckInput(k, kIoDtype, "k");
-  CheckInput(v, kIoDtype, "v");
-  CheckInput(out, kIoDtype, "out");
-  CheckInput(lse, dl_float32, "lse");
-  CheckInput(q2k_indices, dl_int32, "q2k_indices");
-  CheckInput(q2k_num, dl_int32, "q2k_num");
-  CheckInput(kv_block_lens, dl_int32, "kv_block_lens");
+  check_input(q, kIoDtype, "q");
+  check_input(k, kIoDtype, "k");
+  check_input(v, kIoDtype, "v");
+  check_input(out, kIoDtype, "out");
+  check_input(lse, dl_float32, "lse");
+  check_input(q2k_indices, dl_int32, "q2k_indices");
+  check_input(q2k_num, dl_int32, "q2k_num");
+  check_input(kv_block_lens, dl_int32, "kv_block_lens");
   CheckI32(max_kv_blocks, "max_kv_blocks");
   CheckI32(sequence_q, "sequence_q");
   CheckI32(query_blocks, "query_blocks");
@@ -466,20 +466,20 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView v, TensorVie
          double k_global_scale, double v_global_scale, double lse_temperature_scale,
          int64_t return_softmax_lse, int64_t return_temperature_lse, int64_t grid_x,
          int64_t grid_y, int64_t grid_z) {
-  CheckInput(q, kIoDtype, "q");
-  CheckInput(k, kIoDtype, "k");
-  CheckInput(k_scale, dl_uint8, "k_scale");
-  CheckInput(v, kIoDtype, "v");
-  CheckInput(v_scale, dl_uint8, "v_scale");
-  CheckInput(out, kIoDtype, "out");
-  CheckInput(lse, dl_float32, "lse");
-  CheckInput(temperature_lse, dl_float32, "temperature_lse");
-  CheckInput(q2k_indices, dl_int32, "q2k_indices");
-  CheckInput(cu_seqlens_q, dl_int32, "cu_seqlens_q");
-  CheckInput(cu_seqlens_k, dl_int32, "cu_seqlens_k");
-  CheckInput(q_offsets, dl_int32, "q_offsets");
-  CheckInput(kv_lens, dl_int32, "kv_lens");
-  CheckInput(page_table, dl_int32, "page_table");
+  check_input(q, kIoDtype, "q");
+  check_input(k, kIoDtype, "k");
+  check_input(k_scale, dl_uint8, "k_scale");
+  check_input(v, kIoDtype, "v");
+  check_input(v_scale, dl_uint8, "v_scale");
+  check_input(out, kIoDtype, "out");
+  check_input(lse, dl_float32, "lse");
+  check_input(temperature_lse, dl_float32, "temperature_lse");
+  check_input(q2k_indices, dl_int32, "q2k_indices");
+  check_input(cu_seqlens_q, dl_int32, "cu_seqlens_q");
+  check_input(cu_seqlens_k, dl_int32, "cu_seqlens_k");
+  check_input(q_offsets, dl_int32, "q_offsets");
+  check_input(kv_lens, dl_int32, "kv_lens");
+  check_input(page_table, dl_int32, "page_table");
   CheckI32(total_q, "total_q");
   CheckI32(num_q_heads, "num_q_heads");
   CheckI32(num_kv_heads, "num_kv_heads");

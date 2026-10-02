@@ -132,7 +132,9 @@ def test_every_profile_has_one_exact_arch_jit_spec(monkeypatch, arch):
 
 def test_profile_launch_records_match_their_device_sources():
     for profile, record in cake_vsa_jit.PROFILES.items():
-        source = cake_vsa_jit.device_source(profile).read_text(encoding="utf-8")
+        path = cake_vsa_jit.device_source(profile)
+        assert path.name == record.source == f"cake_vsa_{profile}.cu"
+        source = path.read_text(encoding="utf-8")
 
         assert re.search(rf"\b{re.escape(record.kernel)}\s*\(", source), profile
         smem = re.search(r"^#define SMEM_TOTAL (\d+)$", source, re.MULTILINE)

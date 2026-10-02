@@ -58,6 +58,7 @@ CAPABILITY_TO_ARCH: dict[tuple[int, int], str] = {
 class Profile:
     """Launch record of one kernel profile (one device source)."""
 
+    source: str
     kernel: str
     threads: int
     smem_bytes: int
@@ -75,24 +76,28 @@ _BLOCK_MASK_D128 = (
 
 PROFILES: dict[str, Profile] = {
     "blk128_compact": Profile(
+        source="cake_vsa_blk128_compact.cu",
         kernel="kernel_flashinfer_blackwell_vsa_blk128_seed_sm100",
         threads=512,
         smem_bytes=134784,
         defines=_BLOCK_MASK_D128,
     ),
     "blk128_fp16_compact": Profile(
+        source="cake_vsa_blk128_fp16_compact.cu",
         kernel="kernel_flashinfer_blackwell_vsa_blk128_fp16_compact_sm100",
         threads=512,
         smem_bytes=134784,
         defines=(*_BLOCK_MASK_D128, "CAKE_VSA_FP16=1"),
     ),
     "longseq": Profile(
+        source="cake_vsa_longseq.cu",
         kernel="kernel_flashinfer_blackwell_vsa_longseq_warp_specialized_sm100",
         threads=512,
         smem_bytes=201344,
         defines=(*_BLOCK_MASK_D128, "CAKE_VSA_SELECTED_BLOCKS=1"),
     ),
     "ultrasparse_bsr": Profile(
+        source="cake_vsa_ultrasparse_bsr.cu",
         kernel="kernel_flashinfer_blackwell_vsa_ultrasparse_bsr_sm100",
         threads=512,
         smem_bytes=135424,
@@ -108,6 +113,7 @@ PROFILES: dict[str, Profile] = {
         ),
     ),
     "gqa_mask": Profile(
+        source="cake_vsa_gqa_mask.cu",
         kernel="kernel_flashinfer_blackwell_vsa_gqa_mask_seed_sm100",
         threads=512,
         smem_bytes=134784,
@@ -119,6 +125,7 @@ PROFILES: dict[str, Profile] = {
         ),
     ),
     "head64_native": Profile(
+        source="cake_vsa_head64_native.cu",
         kernel="kernel_flashinfer_blackwell_vsa_head64_native_sm100",
         threads=384,
         smem_bytes=108928,
@@ -133,6 +140,7 @@ PROFILES: dict[str, Profile] = {
         ),
     ),
     "head96_native": Profile(
+        source="cake_vsa_head96_native.cu",
         kernel="kernel_flashinfer_blackwell_vsa_head96_native_sm100",
         threads=384,
         smem_bytes=182656,
@@ -145,18 +153,21 @@ PROFILES: dict[str, Profile] = {
         ),
     ),
     "blk64_persistent": Profile(
+        source="cake_vsa_blk64_persistent.cu",
         kernel="kernel_flashinfer_vsa_blk64_persistent_m64_sm100",
         threads=512,
         smem_bytes=183296,
         defines=("CAKE_VSA_ABI=2", "CAKE_VSA_OUT_BOX_COLS=64"),
     ),
     "blk64_persistent_ws_m64n256": Profile(
+        source="cake_vsa_blk64_persistent_ws_m64n256.cu",
         kernel="kernel_flashinfer_vsa_blk64_persistent_per_head_m64n256_ws_sm100",
         threads=512,
         smem_bytes=232448,
         defines=("CAKE_VSA_ABI=2", "CAKE_VSA_OUT_BOX_COLS=32"),
     ),
     "fp16_direct": Profile(
+        source="cake_vsa_fp16_direct.cu",
         kernel="kernel_minimax_sparse_prefill_union_sm100",
         threads=512,
         smem_bytes=201728,
@@ -208,8 +219,7 @@ def _check_arch(arch: str) -> list[str]:
 
 def device_source(profile: str) -> Path:
     """Device source of ``profile`` (one file for every supported arch)."""
-    _check_profile(profile)
-    return get_csrc_dir() / f"cake_vsa_{profile}.cu"
+    return get_csrc_dir() / _check_profile(profile).source
 
 
 def arch_for_capability(capability: tuple[int, int]) -> str:
