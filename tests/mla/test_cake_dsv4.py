@@ -2178,11 +2178,15 @@ class _RecordingLauncher:
         (16, 260, "bf16_h128_topk128x_split4_sm100", 4),
         (12, 388, "bf16_h128_topk128x_split4_sm100", 4),
         (16, 388, "bf16_h128_topk128x_split4_sm100", 4),
-        # CAKE-624 W12: above the token bound one row-first owner per token.
-        (17, 260, "bf16_h128_topk128x_row_first", 1),
-        (32, 260, "bf16_h128_topk128x_row_first", 1),  # hardening-000025
+        # CAKE-624 W12: above the token bound one row-first owner per token;
+        # CAKE-772 W121: up to 37 tokens the row-first owner runs in the
+        # V-half split form (two clusters per token, identical bits).
+        (17, 260, "bf16_h128_topk128x_row_first_vsplit", 1),
+        (32, 260, "bf16_h128_topk128x_row_first_vsplit", 1),  # hardening-000025
+        (37, 260, "bf16_h128_topk128x_row_first_vsplit", 1),
+        (38, 260, "bf16_h128_topk128x_row_first", 1),
         (64, 260, "bf16_h128_topk128x_row_first", 1),  # hardening-000031
-        (32, 388, "bf16_h128_topk128x_row_first", 1),
+        (32, 388, "bf16_h128_topk128x_row_first_vsplit", 1),
         (64, 388, "bf16_h128_topk128x_row_first", 1),
         (12, 640, "bf16_h128_topk128x", 1),
         (64, 512, "bf16_h128_topk128x", 1),

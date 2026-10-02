@@ -74,6 +74,10 @@ _BF16_H128_PREFILL_MIN_TOKENS = 64
 # only up to this many query tokens; wider grids lose to trtllm-gen (CAKE-624 W12).
 # Mirrors the Cake seed's BF16_TOPK128X_SPLIT_MAX_TOKENS.
 _BF16_TOPK128X_SPLIT_MAX_TOKENS = 16
+# CAKE-772 W121 (round 13): mirrors the Cake seed's BF16_ROW_FIRST_V_HALF_SPLIT_MAX_TOKENS.
+# Row-first rows with at most this many tokens run the V-half split program (two
+# 2-CTA clusters per token = 4 CTAs per token, one wave on 148+ SMs).
+_BF16_ROW_FIRST_V_HALF_SPLIT_MAX_TOKENS = 37
 _BF16_H64_COMPRESSED_PREFILL_TOKENS = 24
 _BF16_H64_PREFILL_MAX_SPARSE_WIDTH = 640
 _PRIMED_ATTR = "_cake_dsv4_counters_primed"
@@ -1466,7 +1470,18 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
             and 256 < topk <= 388
             and T > _BF16_TOPK128X_SPLIT_MAX_TOKENS
         ):
-            program_variant = "bf16_h128_topk128x_row_first"
+            # CAKE-772 W121 (round 13): while four CTAs per token still fit one
+            # wave, each token runs two 2-CTA clusters that gather the full K
+            # tiles and only their 256-column V half (same MMA operands and
+            # order per element -> identical bits; -1.1 us / -8 % on the
+            # 32-token row on both targets).  The exported program's host
+            # contract derives grid = total_work_items * 4; total_work_items
+            # keeps meaning query tokens.  Mirrors the Cake seed rule
+            # bf16_topk128x_uses_row_first_vsplit.
+            if T <= _BF16_ROW_FIRST_V_HALF_SPLIT_MAX_TOKENS:
+                program_variant = "bf16_h128_topk128x_row_first_vsplit"
+            else:
+                program_variant = "bf16_h128_topk128x_row_first"
         elif route == "bf16_h128_topk128x" and 256 < topk <= 388:
             # Three live KV tiles run the four-owner program with a fully
             # masked fourth tile: the split4 owner kernel is 12.3-13.0 us for
