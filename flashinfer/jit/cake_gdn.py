@@ -354,7 +354,7 @@ def _variant_for(
     return matches[0]
 
 
-@functools.cache
+@functools.lru_cache(maxsize=4096)
 def select_cake_gdn_prefill_variant(
     *,
     arch: CakeGDNArch,
@@ -527,7 +527,7 @@ def select_cake_gdn_prefill_variant(
     )
 
 
-@functools.cache
+@functools.lru_cache(maxsize=1024)
 def select_cake_gdn_decode_variant(
     *,
     arch: CakeGDNArch,
