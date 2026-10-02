@@ -1063,6 +1063,8 @@ def test_instance_rules_mirror_the_launchers():
     assert cake_backend.DW_LONG_CHUNK_GROUP_M == 16
     assert cake_backend.DW_LONG_CHUNK_GROUPS == {"sm_100a": 16, "sm_103a": 16}
     assert cake_backend.DW_LONG_CHUNK_MIN_ROWS == 4097
+    assert cake_backend.LOGITS_LONG_RASTER_GROUPS == {"sm_100a": 16, "sm_103a": 16}
+    assert cake_backend.LOGITS_LONG_RASTER_MIN_ROWS == 3841  # 30 row tiles of 128 + 1
     assert not hasattr(
         cake_backend, "dw_epilogue_variant"
     )  # no epilogue rule: the SM103 TMA reduce-add above 4096 rows was retired
@@ -1123,10 +1125,18 @@ def test_instance_rules_mirror_the_launchers():
         )  # 27 column tiles: the block would not tile them
     assert cake_backend.dw_block_variant(4096, 6144, None) is None
     for arch in ("sm_100a", "sm_103a"):
-        assert (
-            cake_backend.raster_variant(6144, 4096, arch) is None
-        )  # the default geometry up to 4096 rows: never
-        assert cake_backend.raster_variant(6144, 1, arch) is None
+        for rows in (3841, 3884, 3943, 4021, 4096):
+            assert (
+                cake_backend.raster_variant(6144, rows, arch)
+                == (
+                    16,
+                    None,
+                )
+            )  # the default geometry at 31+ row tiles up to 4096 rows: the logits raster alone
+        for rows in (1, 1895, 2048, 3591, 3791, 3840):
+            assert (
+                cake_backend.raster_variant(6144, rows, arch) is None
+            )  # up to 30 row tiles: the default rasters
         assert (
             cake_backend.raster_variant(7168, 2048, arch) is None
         )  # one row short of the rule
@@ -1136,19 +1146,24 @@ def test_instance_rules_mirror_the_launchers():
             16,
             32,
         )  # the wide rule owns H >= 7168 at every length
-    # the default geometry's long chunks (more than 4096 rows): the weight-gradient raster only, both architectures
+    # the default geometry's long chunks (more than 4096 rows): both rasters, both architectures
     for rows in (4097, 8039, 8117, 8192, 16231, 65536):
         for arch in ("sm_100a", "sm_103a"):
-            assert cake_backend.raster_variant(6144, rows, arch) == (None, 16)
+            assert cake_backend.raster_variant(6144, rows, arch) == (16, 16)
             assert cake_backend.raster_variant(6912, rows, arch) == (
-                None,
+                16,
                 16,
             )  # every H below 7168
     for arch in ("sm_100a", "sm_103a"):
         assert (
-            cake_backend.raster_variant(6144, 4096, arch) is None
-        )  # one row short of the long-chunk rule
-        assert cake_backend.raster_variant(6912, 4096, arch) is None
+            cake_backend.raster_variant(6144, 4096, arch)
+            == (
+                16,
+                None,
+            )
+        )  # one row short of the long-chunk weight-gradient rule: the logits raster alone
+        assert cake_backend.raster_variant(6912, 4096, arch) == (16, None)
+        assert cake_backend.raster_variant(6912, 3840, arch) is None
     assert cake_backend.raster_variant(8192, 4096, None) is None
     assert cake_backend.raster_variant(8192, 4096, "sm_90a") is None
     assert cake_backend.raster_variant(6144, 8192, "sm_90a") is None
@@ -1272,7 +1287,8 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
     )
     assert tail.chunks == ((0, 4096), (4096, 1))
     assert (
-        tail.logits_stage(1) == "gemm_logits"
+        tail.logits_stage(0) == "gemm_logits_g16"  # 32 row tiles: the logits raster
+        and tail.logits_stage(1) == "gemm_logits"
         and tail.dw_acc_stage(0) == "gemm_dw_acc_gn12"
     )
     assert tail.dw_cast_stage == "gemm_dw_cast_bf16"
@@ -1284,6 +1300,7 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
     )  # 1 x 12 x 3 = 36 < 74 pairs
     assert tail.stages == (
         "gemm_logits",
+        "gemm_logits_g16",
         "row_finalize",
         "loss_reduce",
         "row_grad",
@@ -1323,8 +1340,9 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
         and long_chunks.dw_acc_stage(1) == "gemm_dw_acc"
     )
     assert (
-        long_chunks.logits_stage(0) == "gemm_logits"
-    )  # the logits raster has no long-chunk rule
+        long_chunks.logits_stage(0) == "gemm_logits_g16"
+        and long_chunks.logits_stage(1) == "gemm_logits"
+    )  # the 8192-row chunk takes the logits raster (64 row tiles), the 1-row tail the default
     assert (
         long_chunks.variants_of(0).dw_group_m,
         long_chunks.variants_of(0).dw_epi_store,
@@ -1372,7 +1390,7 @@ def test_make_plan_selects_the_rule_variants_per_chunk():
         arch="sm_103a",
     )
     assert one.stages == (
-        "gemm_logits",
+        "gemm_logits_g16",
         "row_finalize",
         "loss_reduce",
         "row_grad",
@@ -1789,17 +1807,25 @@ def test_reachable_variants_complete_the_rule_closure():
     }
     glm_dx_st3 = {"gemm_dx_st3", "gemm_dx_s2_st3", "gemm_dx_s3_st3", "gemm_dx_s4_st3"}
     glm_dw_gn12 = {"gemm_dw_acc_gn12", "gemm_dw_cast_f32_gn12"}
-    assert rv(bases, "sm_100a", glm, 4) == dx_all | glm_dx_st3 | glm_dw | glm_dw_gn12
+    glm_logits = {
+        "gemm_logits_g16",
+        "gemm_logits_nostats_g16",
+    }  # the 31-row-tile logits raster
+    assert (
+        rv(bases, "sm_100a", glm, 4)
+        == dx_all | glm_dx_st3 | glm_dw | glm_dw_gn12 | glm_logits
+    )
     # the default geometry: the long-chunk raster of the weight-gradient GEMMs, the dX ring rule and the 2-D blocked
     # weight-gradient raster on both architectures (no epilogue rule)
     assert rv(bases, "sm_103a", glm, 4) == rv(bases, "sm_100a", glm, 4)
     assert rv(bases, "sm_100a", wide, 4) - rv(bases, "sm_100a", glm, 4) == {
-        "gemm_logits_g16",
-        "gemm_logits_nostats_g16",
         "gemm_dw_acc_g32",
         "gemm_dw_cast_bf16_g32",
         "gemm_dw_cast_f32_g32",
     }
+    assert glm_logits <= rv(
+        bases, "sm_100a", wide, 4
+    )  # the same logits raster forms on both geometry classes
     assert rv(bases, "sm_103a", wide, 4) == rv(bases, "sm_100a", wide, 4)
     assert (
         rv(bases, "sm_100a", glm, 2)
@@ -1813,6 +1839,7 @@ def test_reachable_variants_complete_the_rule_closure():
         }
         | glm_dw
         | glm_dw_gn12
+        | glm_logits
     )
     assert rv({"row_grad", "scale_cast_bf16"}, "sm_103a", wide, 4) == set()
     # every name of STAGES is a base stage or a variant some record can reach

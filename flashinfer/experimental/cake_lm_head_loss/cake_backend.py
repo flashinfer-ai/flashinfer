@@ -229,10 +229,12 @@ K_SLICE_PENALTY = 0.01  # wave-efficiency score penalty per extra slab (the kern
 # shape itself, so a record built for a geometry carries exactly the variants its rules can reach:
 # * raster height (``_g<group_m>``): at H >= RASTER_RULE_MIN_HIDDEN a chunk of >= RASTER_RULE_MIN_ROWS rows runs the
 #   logits GEMM with the shorter grouped raster and the weight-gradient GEMMs (accumulate and fused cast) with the
-#   taller one (RASTER_WIDE_GROUPS per architecture); below that H, a chunk of >= DW_LONG_CHUNK_MIN_ROWS rows runs the
-#   weight-gradient GEMMs with the long-chunk raster (DW_LONG_CHUNK_GROUP_M, ``_g16``: the same height on every
-#   supported architecture); every other chunk -- the default geometry's chunks of up to 4096 rows, short tail chunks --
-#   keeps the default raster.  Bitwise: the raster changes the tile order only.
+#   taller one (RASTER_WIDE_GROUPS per architecture); below that H, a chunk of >= LOGITS_LONG_RASTER_MIN_ROWS rows (31
+#   row tiles of 128) runs the logits GEMM with the shorter raster (LOGITS_LONG_RASTER_GROUPS per architecture, ``_g16``)
+#   and a chunk of >= DW_LONG_CHUNK_MIN_ROWS rows runs the weight-gradient GEMMs with the long-chunk raster
+#   (DW_LONG_CHUNK_GROUP_M, ``_g16``: the same height on every supported architecture); every other chunk -- the
+#   default geometry's chunks of up to 30 row tiles, short tail chunks -- keeps the default raster.  Bitwise: the raster
+#   changes the tile order only.
 # * dX tile (``_tn256``): the 512-column pair tile unless H % 512 != 0 or the launch's wide work items would not fill
 #   the device's SM pairs (:func:`dx_tile_rule`, evaluated after the K-slice count), or -- on an architecture listed in
 #   DX_WIDE_MIN_EFF -- a one-slice launch below RASTER_RULE_MIN_HIDDEN whose wide items fill the SM pairs' waves below that
@@ -260,6 +262,13 @@ DW_LONG_CHUNK_GROUPS = {
     "sm_103a": DW_LONG_CHUNK_GROUP_M,
 }  # the same height on every supported architecture (the kernel source keeps a per-architecture table; the export mirrors it)
 DW_LONG_CHUNK_MIN_ROWS = 4097
+LOGITS_LONG_RASTER_GROUPS = {
+    "sm_100a": 16,
+    "sm_103a": 16,
+}  # logits group_m of the GLM-class chunks of >= LOGITS_LONG_RASTER_MIN_ROWS rows below RASTER_RULE_MIN_HIDDEN, per architecture
+LOGITS_LONG_RASTER_MIN_ROWS = (
+    3841  # 30 row tiles of 128 + 1: the first chunk size with 31 row tiles
+)
 DX_LONG_CHUNK_STAGES = {
     "sm_100a": 3,
     "sm_103a": 3,
@@ -388,7 +397,9 @@ def raster_variant(
     """``(logits group_m, weight-gradient group_m)`` the raster rules select for a chunk -- ``None`` in a slot = that
     GEMM's default raster, ``None`` altogether = the default raster for both.  At ``H >= RASTER_RULE_MIN_HIDDEN`` a chunk
     of ``>= RASTER_RULE_MIN_ROWS`` rows takes ``RASTER_WIDE_GROUPS[arch]``; below that ``H`` a chunk of
-    ``>= DW_LONG_CHUNK_MIN_ROWS`` rows takes ``(None, DW_LONG_CHUNK_GROUP_M)`` on every supported architecture."""
+    ``>= LOGITS_LONG_RASTER_MIN_ROWS`` rows takes the logits height ``LOGITS_LONG_RASTER_GROUPS[arch]`` and a chunk of
+    ``>= DW_LONG_CHUNK_MIN_ROWS`` rows the weight-gradient height ``DW_LONG_CHUNK_GROUP_M``, on every supported
+    architecture."""
     if arch is None:
         return None
     if int(hidden) >= RASTER_RULE_MIN_HIDDEN:
@@ -396,10 +407,15 @@ def raster_variant(
         if groups is None or int(rows_c) < RASTER_RULE_MIN_ROWS:
             return None
         return groups
+    logits_group = LOGITS_LONG_RASTER_GROUPS.get(arch)
+    if logits_group is None or int(rows_c) < LOGITS_LONG_RASTER_MIN_ROWS:
+        logits_group = None
     dw_group = DW_LONG_CHUNK_GROUPS.get(arch)
     if dw_group is None or int(rows_c) < DW_LONG_CHUNK_MIN_ROWS:
+        dw_group = None
+    if logits_group is None and dw_group is None:
         return None
-    return (None, dw_group)
+    return (logits_group, dw_group)
 
 
 def _dw_raster_groups(
@@ -606,15 +622,19 @@ def reachable_variants(bases, arch: str, geometry: "Geometry", dx_max: int) -> s
         and int(geometry.hidden) >= RASTER_RULE_MIN_HIDDEN
         and arch in RASTER_WIDE_GROUPS
     )
-    g_logits = RASTER_WIDE_GROUPS.get(arch, (None, None))[0]
     dw_groups = _dw_raster_groups(arch, geometry.hidden)
     glm = geometry.hidden is not None and int(geometry.hidden) < RASTER_RULE_MIN_HIDDEN
+    g_logits = (
+        RASTER_WIDE_GROUPS.get(arch, (None, None))[0]
+        if wide
+        else (LOGITS_LONG_RASTER_GROUPS.get(arch) if glm else None)
+    )
     st_long = DX_LONG_CHUNK_STAGES.get(arch) if glm else None
     gn = _dw_block_group(arch, geometry.hidden)
     out: set[str] = set()
     for base in bases:
         if base in ("gemm_logits", "gemm_logits_nostats"):
-            if wide:
+            if g_logits is not None:
                 out.add(stage_variant(base, group_m=g_logits))
         elif base == "gemm_dx":
             for k in range(1, int(dx_max) + 1):

@@ -187,11 +187,14 @@ apply -- the host selects by rule output, never by shape
 * `_g<group_m>`: the grouped-raster height of the logits GEMMs (`_g16`) and
   of the weight-gradient GEMMs (`_g32`, accumulate and fused cast) at
   `H >= 7168` for chunks of more than 2048 rows (`cake_backend.raster_variant`,
-  `RASTER_WIDE_GROUPS` per architecture), and of the weight-gradient GEMMs
-  alone (`_g16`) below that `H` for chunks of more than 4096 rows on both
-  architectures (`DW_LONG_CHUNK_GROUP_M` / `DW_LONG_CHUNK_MIN_ROWS`); every
-  other chunk -- the default geometry's chunks of up to 4096 rows, short tail
-  chunks -- keeps the default raster.  Bitwise: only the tile order changes;
+  `RASTER_WIDE_GROUPS` per architecture); below that `H`, of the logits GEMMs
+  (`_g16`) for chunks of at least 3841 rows (31 row tiles of 128:
+  `LOGITS_LONG_RASTER_GROUPS` / `LOGITS_LONG_RASTER_MIN_ROWS`) and of the
+  weight-gradient GEMMs (`_g16`) for chunks of more than 4096 rows, both on
+  both architectures (`DW_LONG_CHUNK_GROUP_M` / `DW_LONG_CHUNK_MIN_ROWS`);
+  every other chunk -- the default geometry's chunks of up to 30 row tiles,
+  short tail chunks -- keeps the default raster.  Bitwise: only the tile order
+  changes;
 * `_st3`: the 3-deep operand ring of the 512-wide `dX` tile below `H` 7168 for
   chunks of more than 4096 rows on both architectures
   (`cake_backend.dx_stages_variant`, `DX_LONG_CHUNK_STAGES`); the 256-wide
