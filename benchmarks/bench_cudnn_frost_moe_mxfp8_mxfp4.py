@@ -146,7 +146,7 @@ def routing_offsets(tokens, experts, top_k, routing):
         logits[: tokens // 2, 0] += 2
     ids = logits.topk(top_k, dim=-1).indices
     counts = torch.bincount(ids.flatten(), minlength=experts)
-    offsets = (counts.cumsum(0) - counts).to(torch.int32)
+    offsets = torch.cat((counts.new_zeros(1), counts.cumsum(0))).to(torch.int32)
     return offsets, counts.tolist()
 
 
