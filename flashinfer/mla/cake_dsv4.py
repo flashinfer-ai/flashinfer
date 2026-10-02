@@ -566,6 +566,12 @@ _TMA_SOURCE_ALIASES: Mapping[str, str] = {
     # The FP8 persistent bodies (round 5) store O through a TMA descriptor over
     # the same [tokens, heads, 512] rows the plain ``O`` pointer argument sees.
     "tmap_o": "O",
+    # The bf16 H64 guard program (round 14, W129 A'-h4) binds its ``O`` parameter
+    # itself as a 3-D tensor map (box 64 x 16 x 1 over [tokens, heads, 512]; head
+    # rows >= num_heads are clipped by the map), so the registration carries
+    # ("tma_buffer", "O"): the same output rows, encoded by the grid_constant
+    # binding -- no descriptor workspace and no host copy.
+    "O": "O",
 }
 _SCALAR_ALIASES: Mapping[str, str] = {
     "num_q_heads": "num_heads",
