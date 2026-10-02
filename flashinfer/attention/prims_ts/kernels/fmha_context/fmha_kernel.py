@@ -693,6 +693,7 @@ def build_context_task_manager(
     list[MemoryResource],
     SmemAllocation,
     SmemAllocation,
+    SmemAllocation,
     WorkQueue | None,
     SmemAllocation | None,
 ]:
@@ -750,7 +751,7 @@ def build_context_task_manager(
     -------
     tuple
         ``(TaskManager, tmem_resources, tmem_ptr_alloc, dealloc_mbar_alloc,
-        work_queue, clc_response_alloc)``.
+        peer_dealloc_mbar_alloc, work_queue, clc_response_alloc)``.
     """
     if cfg.use_paged_kv:
         if cfg.num_tokens_per_page not in _SUPPORTED_CONTEXT_PAGE_SIZES:
@@ -1649,6 +1650,9 @@ def build_context_task_manager(
     dealloc_mbar_alloc = smem_allocator.add(
         SmemAllocation("tmem_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
     )
+    peer_dealloc_mbar_alloc = smem_allocator.add(
+        SmemAllocation("tmem_peer_dealloc_mbar", dtype=cutlass.Int64, alignment=8)
+    )
     clc_response_alloc: SmemAllocation | None = None
     if is_clc_dynamic and clc_response_ptr is None:
         # Keep the CLC response inside the unified TS allocation. The kernel
@@ -1743,6 +1747,7 @@ def build_context_task_manager(
         tmem_resources,
         tmem_ptr_alloc,
         dealloc_mbar_alloc,
+        peer_dealloc_mbar_alloc,
         work_queue,
         clc_response_alloc,
     )
@@ -2572,6 +2577,7 @@ def build_fmha_task_manager(
     list[MemoryResource],
     SmemAllocation,
     SmemAllocation,
+    SmemAllocation,
     WorkQueue | None,
     SmemAllocation | None,
 ]:
@@ -2836,12 +2842,12 @@ class FmhaTs:
             or head_paired
             or use_paged_kv
             or d != 128
-            or d_v not in (None, 128)
-            or in_qk_dtype.width not in (8, 16)
+            or d_v != 128
+            or q_dtype.width not in (8, 16)
         ):
             raise ValueError(
                 "two-CTA UMMA requires the non-persistent dense contiguous "
-                "query-paired D128 context kernel with bf16 or E4M3 QK"
+                "query-paired D128 context kernel with 16-bit or E4M3 QK"
             )
         cfg.two_cta_umma = two_cta_umma
         if two_cta_umma:
@@ -3427,6 +3433,7 @@ class FmhaTs:
             tmem_resources,
             tmem_ptr_alloc,
             dealloc_mbar_alloc,
+            peer_dealloc_mbar_alloc,
             work_queue,
             clc_response_alloc,
         ) = build_fmha_task_manager(
@@ -3487,19 +3494,20 @@ class FmhaTs:
         smem_allocator = task_manager.smem_allocator
         tmem_ptr_i32 = smem_allocator.get(tmem_ptr_alloc)
         tmem_dealloc_mbar = smem_allocator.get(dealloc_mbar_alloc)
+        tmem_peer_dealloc_mbar = smem_allocator.get(peer_dealloc_mbar_alloc)
 
-        # 5. Initialize tmem dealloc barrier
+        # 5. Initialize tmem dealloc barriers. The local barrier counts this
+        # CTA's consumers. The peer MMA warp arrives on the second barrier.
         num_tmem_consumer_threads = cute.arch.WARP_SIZE * (
             len(cfg.softmax0_warp_ids)
             + len(cfg.softmax1_warp_ids)
             + len(cfg.correction_warp_ids)
         )
-        if cutlass.const_expr(cfg.two_cta_umma):
-            # The peer's MMA warp also arrives once before the paired TMEM is freed.
-            num_tmem_consumer_threads = num_tmem_consumer_threads + 1
         if warp_idx == cfg.empty_warp_id:
             if prims.elect_sync():
                 prims.mbarrier_init(tmem_dealloc_mbar, num_tmem_consumer_threads)
+                if cutlass.const_expr(cfg.two_cta_umma):
+                    prims.mbarrier_init(tmem_peer_dealloc_mbar, 1)
 
         # Fence barrier inits from setup_resources_and_tasks() — pipeline
         # barriers need fencing before first use.
@@ -3558,13 +3566,19 @@ class FmhaTs:
             prims.mbarrier_arrive(tmem_dealloc_mbar)
 
         if warp_idx == cfg.mma_warp_id:
-            if cutlass.const_expr(cfg.two_cta_umma):
-                # Signal the peer before either CTA frees the pair's TMEM.
-                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-                if prims.elect_sync():
-                    prims.mbarrier_arrive(prims.mapa(tmem_dealloc_mbar, cta_rank ^ 1))
             while not prims.mbarrier_try_wait_parity(tmem_dealloc_mbar, 0):
                 pass
+            if cutlass.const_expr(cfg.two_cta_umma):
+                # Wait for the peer after the local consumers are done so the
+                # paired TMEM and the leader-side barriers stay live until both
+                # CTAs have finished reading O and arriving on them.
+                cta_rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+                if prims.elect_sync():
+                    prims.mbarrier_arrive(
+                        prims.mapa(tmem_peer_dealloc_mbar, cta_rank ^ 1)
+                    )
+                while not prims.mbarrier_try_wait_parity(tmem_peer_dealloc_mbar, 0):
+                    pass
             tmem_alloc_cols = Int32(cfg.tmem_alloc_cols)
             tmem_ptr = prims.make_tmem_ptr(tmem_ptr_i32.load(), cutlass.Int8)
             prims.tcgen05_dealloc(tmem_ptr, tmem_alloc_cols, group=tmem_cta_group)
