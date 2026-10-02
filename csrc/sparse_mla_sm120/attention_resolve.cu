@@ -62,8 +62,17 @@ void decode_resources(ExecutionPlan& p) {
   }
 }
 
+/// Set launch resources for the plan's model, implementation and numeric route.
 template <ModelType MT>
 void prefill_resources(ExecutionPlan& p) {
+  if constexpr (MT == ModelType::GLM53_NOPE) {
+    if (p.numeric == NumericRoute::QkBF16PvFP8) {
+      using Resources = Fp8PrefillResources<MT, QkComputeMode::BF16, void>;
+      p.block_threads = Resources::BLOCK_THREADS;
+      p.shared_bytes = Resources::SHARED_BYTES;
+      return;
+    }
+  }
   if constexpr (MT == ModelType::DSV4) {
     p.block_threads = BLOCK_THREADS;
     p.shared_bytes = p.numeric == NumericRoute::QkBF16PvFP8
@@ -93,6 +102,8 @@ void prefill_resources(ExecutionPlan& p) {
   }
 }
 
+/// Validate metadata and resolve launch/workspace requirements within device limits.
+/// RequireQkBF16PvFP8 rejects unsupported geometry rather than falling back to FP8 QK.
 ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute requested,
                                 int requested_cpb, DeviceCaps caps) {
   TVM_FFI_ICHECK(m.model >= 0 && m.model <= 5 && m.tokens > 0 && m.heads > 0 &&
@@ -131,6 +142,11 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
                  m.topk >= DecodeTileCfg<ModelType::DOTS3_SWA>::WINDOW)
       << "sparse-MLA DOTS3 requires topk >= 513";
   TVM_FFI_ICHECK(requested != NumericRoute::NVFP4) << "wrong module for NVFP4";
+  const bool require_bf16_qk = requested == NumericRoute::RequireQkBF16PvFP8;
+  TVM_FFI_ICHECK(!require_bf16_qk ||
+                 (mt == ModelType::GLM53_NOPE && m.heads == 16 && m.page_size == 64 &&
+                  (m.topk == 2112 || m.topk == 2176) && !dual && m.variant == 1))
+      << "bf16_qk requires GLM53 NoPE, H=16, PBS=64, topk=2112/2176, single-cache SG";
   TVM_FFI_ICHECK(
       requested != NumericRoute::FullBF16 ||
       (mt == ModelType::DSV4_1 && ((m.variant == 0 && m.tokens <= 64) || m.variant == 1)))
@@ -139,7 +155,9 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
   p.metadata = m;
   p.alignment = 16;
   p.specialized_topk = 0;
-  p.numeric = requested == NumericRoute::FullBF16 ? requested : NumericRoute::FP8;
+  p.numeric = require_bf16_qk                       ? NumericRoute::QkBF16PvFP8
+              : requested == NumericRoute::FullBF16 ? requested
+                                                    : NumericRoute::FP8;
   if (m.variant == 0) {
     const int tile = mt == ModelType::DOTS3_SWA ? DecodeTileCfg<ModelType::DOTS3_SWA>::BI
                                                 : DecodeTileCfg<ModelType::DSV4>::BI;
@@ -234,15 +252,18 @@ ExecutionPlan resolve_attention(const AttentionMetadata& m, NumericRoute request
   return p;
 }
 
+/// Validate FFI capability arguments and return the resolved plan as a descriptor.
 ffi::Module resolve_descriptor(ffi::Array<int64_t> values, int64_t numeric, int64_t cpb,
                                int64_t sm_count, int64_t max_shared) {
   const auto m = unpack_metadata(values, 0);
-  TVM_FFI_ICHECK(numeric >= 0 && numeric <= 2 && cpb >= 0 && cpb <= INT_MAX && sm_count > 0 &&
-                 sm_count <= INT_MAX && max_shared > 0)
+  TVM_FFI_ICHECK(
+      ((numeric >= 0 && numeric <= 2) || numeric == int64_t(NumericRoute::RequireQkBF16PvFP8)) &&
+      cpb >= 0 && cpb <= INT_MAX && sm_count > 0 && sm_count <= INT_MAX && max_shared > 0)
       << "invalid resolver capabilities/route";
   return pack_plan(resolve_attention(m, static_cast<NumericRoute>(numeric), cpb,
                                      {int(sm_count), size_t(max_shared)}));
 }
+/// Enumerate variants for canonical layout metadata without a device shared-memory cap.
 ffi::Array<int64_t> candidates(int64_t model, int64_t heads, int64_t topk, int64_t page, bool dual,
                                int64_t extra_page, ffi::String precision) {
   ffi::Array<int64_t> result;
@@ -250,11 +271,16 @@ ffi::Array<int64_t> candidates(int64_t model, int64_t heads, int64_t topk, int64
       topk < 1 || topk > INT_MAX - 128 || page < 1 || page > INT_MAX || extra_page < 0 ||
       extra_page > INT_MAX)
     return result;
-  if (precision != "default" && model != int(ModelType::DSV4_1)) return result;
+  if (precision == "bf16_qk") {
+    if (model != int(ModelType::GLM53_NOPE)) return result;
+  } else if (precision != "default" && model != int(ModelType::DSV4_1)) {
+    return result;
+  }
   const auto format = cache_format_info(static_cast<ModelType>(model));
-  const auto numeric = precision == "bf16"  ? NumericRoute::FullBF16
-                       : precision == "fp8" ? NumericRoute::FP8
-                                            : NumericRoute::QkBF16PvFP8;
+  const auto numeric = precision == "bf16_qk" ? NumericRoute::RequireQkBF16PvFP8
+                       : precision == "bf16"  ? NumericRoute::FullBF16
+                       : precision == "fp8"   ? NumericRoute::FP8
+                                              : NumericRoute::QkBF16PvFP8;
   AttentionMetadata m{int(model),
                       1,
                       int(heads),
@@ -286,10 +312,12 @@ ffi::Array<int64_t> candidates(int64_t model, int64_t heads, int64_t topk, int64
   return result;
 }
 
+/// Map legal variants to chunk capacities using actual metadata and device limits.
 ffi::Map<int64_t, int64_t> metadata_candidates(ffi::Array<int64_t> values, int64_t numeric,
                                                int64_t sm_count, int64_t max_shared) {
-  TVM_FFI_ICHECK(numeric >= 0 && numeric <= 2 && sm_count > 0 && sm_count <= INT_MAX &&
-                 max_shared > 0)
+  TVM_FFI_ICHECK(
+      ((numeric >= 0 && numeric <= 2) || numeric == int64_t(NumericRoute::RequireQkBF16PvFP8)) &&
+      sm_count > 0 && sm_count <= INT_MAX && max_shared > 0)
       << "invalid candidate capabilities/route";
   auto m = unpack_metadata(values, 0);
   ffi::Map<int64_t, int64_t> result;

@@ -364,6 +364,11 @@ def wrapper_run(
     return_lse=False,
     lse_scale=1.0,
 ):
+    """Prepare or reuse a wrapper call, write output and optionally return LSE.
+
+    Shapes must be warmed up before graph capture; captured calls reuse the
+    prepared descriptor and scratch buffers. Strict BF16-QK rejects T=0.
+    """
     from ._execution import resolve_model_type as _resolve_model_type
 
     is_dsv4_nvfp4 = wrapper._kv_cache_format == "nvfp4"
@@ -381,6 +386,8 @@ def wrapper_run(
     if q.ndim != 3:
         raise ValueError("q must be [T,H,D] or [T,1,H,D]")
     t, h, _ = q.shape
+    if wrapper._compute_precision == "bf16_qk" and t == 0:
+        raise ValueError("bf16_qk requires T>0")
     if q.device != wrapper._device:
         raise ValueError("tensors must be on the Wrapper device")
     if (wrapper._max_num_tokens is not None and t > wrapper._max_num_tokens) or (
