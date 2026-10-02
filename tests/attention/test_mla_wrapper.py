@@ -2144,8 +2144,10 @@ def _skip_if_planned_backend_runtime_is_unavailable(backend):
             pytest.skip("xqa planned MLA requires a supported SM12x/CUDA configuration")
         return
 
-    if capability not in ((10, 0), (10, 3)):
-        pytest.skip(f"{backend} planned MLA requires SM100/SM103, got {capability}")
+    if capability not in ((10, 0), (10, 3), (10, 7)):
+        pytest.skip(
+            f"{backend} planned MLA requires SM100/SM103/SM107, got {capability}"
+        )
     if backend == "cutile":
         pytest.importorskip("cuda.tile.compilation")
         from flashinfer.cutile.cutile_common import is_cuda_tile_available
@@ -2734,8 +2736,11 @@ def test_cute_dsl_alias_does_not_hide_planning_errors(monkeypatch, error_type, m
 
 @pytest.fixture
 def cutile_sm100():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 0):
-        pytest.skip("prepared cuTile acceptance requires SM100")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in (
+        (10, 0),
+        (10, 7),
+    ):
+        pytest.skip("prepared cuTile acceptance requires SM100/SM107")
     pytest.importorskip("cuda.tile.compilation")
     from flashinfer.cutile.cutile_common import is_cuda_tile_available
 
@@ -2819,7 +2824,7 @@ def _cutile_reference(query, cache, lengths, table, scale=None):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("heads", [64, 128])
+@pytest.mark.parametrize("heads", [64, 128, 192])
 @pytest.mark.parametrize("page", [1, 2])
 def test_cutile_small_page_large_batch_numerics(cutile_sm100, dtype, heads, page):
     """Small key tiles must remain correct with the large-batch launch policy."""
@@ -3217,7 +3222,7 @@ def test_cutile_rejects_unsupported_head_counts(num_heads):
         _validate_cutile_num_heads(num_heads)
 
 
-@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (12, 0), (12, 1)])
+@pytest.mark.parametrize("capability", [(10, 0), (10, 3), (10, 7), (12, 0), (12, 1)])
 def test_cutile_plan_accepts_supported_blackwell_architectures(monkeypatch, capability):
     from flashinfer.mla import BatchMLAPagedAttentionWrapper
     from flashinfer.mla._batch_mla._backends import cutile_backend

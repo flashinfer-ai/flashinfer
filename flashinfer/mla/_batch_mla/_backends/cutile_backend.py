@@ -23,7 +23,9 @@ from ._capabilities import (
 )
 
 
-_CUTILE_SUPPORTED_COMPUTE_CAPABILITIES = frozenset({(10, 0), (10, 3), (12, 0), (12, 1)})
+_CUTILE_SUPPORTED_COMPUTE_CAPABILITIES = frozenset(
+    {(10, 0), (10, 3), (10, 7), (12, 0), (12, 1)}
+)
 
 
 def _tensor_byte_span(tensor: torch.Tensor) -> tuple[int, int]:
@@ -332,7 +334,7 @@ class _BatchMLAPagedAttentionCutileBackend:
         if (major, minor) not in _CUTILE_SUPPORTED_COMPUTE_CAPABILITIES:
             raise _BackendPlanUnsupportedError(
                 "cutile backend supports only the validated Blackwell targets "
-                f"SM100, SM103, SM120, and SM121, got SM{major}{minor}."
+                f"SM100, SM103, SM107, SM120, and SM121, got SM{major}{minor}."
             )
 
         batch_size = cum_seq_lens_q.numel() - 1
