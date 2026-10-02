@@ -200,6 +200,9 @@ def _launch_ptx_kda(
     # Packed offsets are read back from the device only when this cu_seqlens
     # tensor (same storage, retained by the workspace entry) may have changed:
     # a version bump, or an inference tensor, which has no version counter.
+    # Every PyTorch in-place write bumps the counter; a writer that bypasses
+    # PyTorch (a raw data_ptr write) must call
+    # torch.autograd.graph.increment_version(cu_seqlens) before the next call.
     cu_key = (_tensor_signature(cu_seqlens), cu_version)
     signature = (
         tuple(map(_tensor_signature, tensors)),
