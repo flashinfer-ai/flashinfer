@@ -3087,9 +3087,12 @@ class BatchPrefillWithPagedKVCacheWrapper:
             # Without an explicit maximum, KV lengths were already staged
             # above to compute _max_kv_len. With one, still update the captured
             # buffer on every plan; the bound does not replace actual lengths.
+            # Supplied lengths are copied straight from their own device into
+            # the wrapper-owned buffers (stream-ordered, cast on copy); reading
+            # them back to the host would block plan() on all queued GPU work.
             if max_sequence_kv is not None:
-                kv_host = (
-                    seq_lens.cpu().flatten()
+                kv_lengths = (
+                    seq_lens.flatten()
                     if seq_lens is not None
                     else get_seq_lens(
                         paged_kv_indptr.to("cpu"),
@@ -3102,7 +3105,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
                         batch_size, dtype=torch.int32, device=self.device
                     )
                 self._kv_lens_buffer[:batch_size].copy_(
-                    kv_host, non_blocking=non_blocking
+                    kv_lengths, non_blocking=non_blocking
                 )
             self._seq_lens_kv = self._kv_lens_buffer[:batch_size].view(
                 batch_size, 1, 1, 1
@@ -3114,13 +3117,13 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 self._cudnn_q_lens_buffer = torch.empty(
                     batch_size, dtype=torch.int32, device=self.device
                 )
-            q_host = (
-                seq_lens_q.cpu().flatten()
+            q_lengths = (
+                seq_lens_q.flatten()
                 if seq_lens_q is not None
                 else qo_indptr_host[1:] - qo_indptr_host[:-1]
             )
             self._cudnn_q_lens_buffer[:batch_size].copy_(
-                q_host, non_blocking=non_blocking
+                q_lengths, non_blocking=non_blocking
             )
             self._seq_lens_q = self._cudnn_q_lens_buffer[:batch_size].view(
                 batch_size, 1, 1, 1

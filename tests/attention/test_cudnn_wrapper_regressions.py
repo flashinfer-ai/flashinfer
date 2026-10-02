@@ -398,6 +398,83 @@ def test_decode_capture_replan_keeps_metadata_alive():
 
 
 @pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
+@pytest.mark.parametrize("length_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("length_shape", [(-1,), (-1, 1, 1, 1)])
+def test_paged_prefill_plan_stages_device_lengths_without_sync(
+    length_dtype, length_shape
+):
+    # Explicit device lengths with host-known bounds must be staged into the
+    # wrapper-owned buffers on the device: a host readback would block plan()
+    # until all queued GPU work drains (v0.7.1rc1 regression from #5350).
+    q, k, v, qo, ip, ix, last = _paged_inputs()
+    last = last + 4
+    w = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
+        torch.empty(128 << 20, device=q.device, dtype=torch.uint8),
+        "NHD",
+        backend="cudnn",
+    )
+    table = torch.tensor([[3, 0, 4], [2, 1, 0]], device=q.device, dtype=torch.int32)
+
+    def device_lengths(last):
+        kv = (ip[1:] - ip[:-1] - 1) * k.shape[1] + last
+        return tuple(
+            x.to(q.device, length_dtype).view(length_shape)
+            for x in (kv, qo[1:] - qo[:-1])
+        )
+
+    def plan(last, kv_lens, q_lens):
+        w.plan(
+            qo,
+            ip,
+            ix,
+            last,
+            8,
+            2,
+            128,
+            16,
+            causal=True,
+            q_data_type=q.dtype,
+            seq_lens=kv_lens,
+            seq_lens_q=q_lens,
+            block_tables=table,
+            max_token_per_sequence=3,
+            max_sequence_kv=48,
+        )
+
+    def check(last):
+        ref, _ = _reference(q, k, v, qo, ip, ix, last, causal=True, scale=128**-0.5)
+        out = w.run(q, (k, v))
+        torch.testing.assert_close(out.float(), ref, atol=0.015, rtol=0.015)
+
+    plan(last, *device_lengths(last))
+    check(last)
+    kv_ptr, q_ptr = w._seq_lens_kv.data_ptr(), w._seq_lens_q.data_ptr()
+
+    last = last - 2
+    kv_lens, q_lens = device_lengths(last)
+    torch.cuda.synchronize()
+    # Keep the stream busy: a plan() that waits on the device returns only
+    # after this event completes.
+    torch.cuda._sleep(1 << 30)
+    busy = torch.cuda.Event()
+    busy.record()
+    previous_sync_mode = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        plan(last, kv_lens, q_lens)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous_sync_mode)
+    assert not busy.query(), "plan() waited for queued GPU work"
+    # The wrapper keeps its own copies: clobbering the caller's tensors after
+    # plan() (stream-ordered) must not change the planned lengths.
+    assert (w._seq_lens_kv.data_ptr(), w._seq_lens_q.data_ptr()) == (kv_ptr, q_ptr)
+    kv_lens.zero_()
+    q_lens.zero_()
+    del kv_lens, q_lens
+    check(last)
+
+
+@pytest.mark.skipif(not prefill.CUDNN_AVAILABLE, reason="requires cuDNN graph support")
 def test_paged_single_token_gqa_rejects_incomplete_lse():
     q, k, v, _, ip, ix, last = _paged_inputs()
     q = q[:2]
