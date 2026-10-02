@@ -81,7 +81,10 @@ KERNELS: dict[str, str] = {
 
 _TARGET_FLAGS = {"sm100a": sm100a_nvcc_flags, "sm103a": sm103a_nvcc_flags}
 _TARGET_ARCH = {"sm100a": "sm_100a", "sm103a": "sm_103a"}
-_INPUT_NAMES = {torch.bfloat16: "bfloat16", torch.float16: "float16"}
+_INPUT_NAMES: dict[torch.dtype, CakeGroupedMXFP8Input] = {
+    torch.bfloat16: "bfloat16",
+    torch.float16: "float16",
+}
 _QUANT_BLOCK = 32
 _SCALE_TILE = 128
 _THREADS = 128
