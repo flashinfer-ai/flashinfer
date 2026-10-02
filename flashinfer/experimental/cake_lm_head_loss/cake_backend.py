@@ -1435,14 +1435,17 @@ def make_plan(
     rows = problem.num_rows if valid_rows is None else int(valid_rows)
     chunks = plan_chunks(rows, problem.chunk)
     tuning = gemm_tuning or {}
-    explicit_k = tuning.get("dx", {}).get("k_slices")
+    dx_tuning = tuning.get("dx", {})
     slices: tuple[int, ...] = ()
-    if need_dx and explicit_k is not None:
-        if not 1 <= int(explicit_k) <= int(dx_max_slices):
+    if need_dx and "k_slices" in dx_tuning:
+        # an explicit knob wins over the slice rule: a value pins that slice count, ``None`` pins the default form
+        # (one slice, the base ``gemm_dx`` stage) -- the same ``None`` semantics as every other pinned knob
+        explicit_k = 1 if dx_tuning["k_slices"] is None else int(dx_tuning["k_slices"])
+        if not 1 <= explicit_k <= int(dx_max_slices):
             raise ValueError(
                 f"gemm_tuning dx k_slices={explicit_k}: the registered program serves 1 .. {int(dx_max_slices)} dX slices"
             )
-        slices = tuple(int(explicit_k) for _ in chunks)
+        slices = tuple(explicit_k for _ in chunks)
     elif need_dx and int(dx_max_slices) > 1:
         slices = tuple(
             recommended_k_slices(

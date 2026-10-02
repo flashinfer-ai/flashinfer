@@ -1574,6 +1574,20 @@ def test_make_plan_explicit_gemm_tuning_wins_over_the_rules():
     assert all(
         s.startswith("gemm_dx_s2") for s in partial.stages if s.startswith("gemm_dx")
     )
+    # a present ``null`` pins the default form -- one dX slice, the base ``gemm_dx`` stage -- like every other
+    # pinned knob; an absent knob keeps the slice rule
+    one = cake_backend.make_plan(problem, gemm_tuning={"dx": {"k_slices": None}}, **kw)
+    ruled = cake_backend.make_plan(problem, gemm_tuning={"dx": {}}, **kw)
+    unpinned = cake_backend.make_plan(problem, **kw)
+    assert len(one.chunks) == 4
+    for i, (_, rows_c) in enumerate(one.chunks):
+        assert one.dx_slices_of(i) == 1
+        assert one.dx_stage_of(i) == cake_backend.stage_variant(
+            "gemm_dx",
+            k_slices=1,
+            tile_n=cake_backend.dx_tile_rule(rows_c, 7168, 148, 1, g, "sm_100a"),
+        )
+        assert ruled.dx_slices_of(i) == unpinned.dx_slices_of(i)
     # the default geometry's long chunks: a pinned knob keeps the other rule's output
     g0 = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
     long_kw = dict(
