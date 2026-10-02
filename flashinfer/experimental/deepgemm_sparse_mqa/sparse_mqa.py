@@ -4,8 +4,9 @@ Generated programs serve every architecture: per KV layout a runtime metadata
 kernel (SM count, sparse capacity, split width, block size and page size are
 runtime arguments) and an exact-geometry metadata kernel for the production
 geometry (``LIMITS["exact_capacity"]`` sparse blocks of ``LIMITS["sparse_block_kv"]``
-tokens, ``LIMITS["page_kv"]``-token pages; the format's split width is compiled in
-and selected by the ``blocks_per_split`` argument), plus the block-scaled logits
+tokens, ``LIMITS["page_kv"]``-token pages) on the exported device SM counts
+(``LIMITS["exact_num_sms"]``; the SM count is compiled in and selected by the
+``num_sms`` argument), plus the block-scaled logits
 kernel (one per format and layout).  ``MODULES`` registers each program once
 with the architectures it compiles for; ``ROUTES`` maps a logical kernel key
 (``metadata_route_key``, ``logits:<fmt>:<layout>``) to its program; ``LIMITS``
@@ -23,7 +24,7 @@ import tvm_ffi
 # Populated verbatim by the generated-program export; do not edit by hand.
 MODULES: dict[str, dict[str, Any]] = {}
 ROUTES: dict[str, str] = {}
-LIMITS: dict[str, int] = {}
+LIMITS: dict[str, Any] = {}
 
 _ARCHES = {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
@@ -151,13 +152,15 @@ def metadata_workspace_words(queries, capacity, *, fmt, sparse_block_kv, paged):
     return words
 
 
-def metadata_route_key(*, paged, capacity, sparse_block_kv, page_kv, use_unaligned_ks=False):
+def metadata_route_key(*, paged, capacity, sparse_block_kv, page_kv, num_sms, use_unaligned_ks=False):
     """``ROUTES`` key of the metadata program for one geometry: the exact-geometry program at the exported
     production geometry (capacity ``LIMITS["exact_capacity"]``, ``LIMITS["sparse_block_kv"]``-token blocks and,
-    for paged rows, ``LIMITS["page_kv"]``-token pages), the runtime program otherwise."""
+    for paged rows, ``LIMITS["page_kv"]``-token pages) on a device with one of the exported SM counts
+    (``LIMITS["exact_num_sms"]``), the runtime program otherwise."""
     layout = "paged" if paged else "contiguous"
     exact = (
         not use_unaligned_ks
+        and num_sms in LIMITS["exact_num_sms"]
         and capacity == LIMITS["exact_capacity"]
         and sparse_block_kv == LIMITS["sparse_block_kv"]
         and (not paged or page_kv == LIMITS["page_kv"])
@@ -281,6 +284,7 @@ class SparseMetadataPlan:
                 capacity=capacity,
                 sparse_block_kv=sparse_block_kv,
                 page_kv=page_kv,
+                num_sms=self.num_sms,
                 use_unaligned_ks=use_unaligned_ks,
             )
         ]

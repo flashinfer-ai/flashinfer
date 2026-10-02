@@ -155,10 +155,11 @@ def test_sparse_logits_analytical(fmt, paged, capacity):
     assert torch.equal(output, analytical_expected(case, False))
     assert not bool(torch.count_nonzero(metadata.workspace[[0, 32, 64]]))
     key = _runtime.metadata_route_key(
-        paged=paged, capacity=capacity, sparse_block_kv=8, page_kv=64
+        paged=paged, capacity=capacity, sparse_block_kv=8, page_kv=64, num_sms=metadata.num_sms
     )
-    # The production geometry (capacity 2048, 8-token blocks, 64-token pages) runs the exact-geometry program,
-    # every other capacity the runtime program of the layout.
+    # The production geometry (capacity 2048, 8-token blocks, 64-token pages) on an exported SM count runs the
+    # exact-geometry program, every other capacity the runtime program of the layout.
+    assert metadata.num_sms in _runtime.LIMITS["exact_num_sms"]
     assert key.endswith(":exact") == (capacity == _runtime.LIMITS["exact_capacity"])
     assert plan.programs["metadata"] == _runtime.ROUTES[key]
 
@@ -347,12 +348,17 @@ def test_sparse_metadata_runtime_geometry(fmt, paged, capacity, block, page):
     case = geometry_case(fmt, paged, capacity=capacity, block=block, page=page)
     plan = prepare_sparse_mqa_metadata(case["sparse"], **case["kwargs"])
     key = _runtime.metadata_route_key(
-        paged=paged, capacity=capacity, sparse_block_kv=block, page_kv=page
+        paged=paged, capacity=capacity, sparse_block_kv=block, page_kv=page, num_sms=plan.num_sms
     )
     exact = (capacity, block) == (_runtime.LIMITS["exact_capacity"], 8) and (
         not paged or page == 64
     )
     assert key.endswith(":exact") == exact
+    # A device SM count the exact program was not compiled for falls back to the runtime program.
+    foreign_sms = max(_runtime.LIMITS["exact_num_sms"]) + 1
+    assert not _runtime.metadata_route_key(
+        paged=paged, capacity=capacity, sparse_block_kv=block, page_kv=page, num_sms=foreign_sms
+    ).endswith(":exact")
     assert plan.program == _runtime.ROUTES[key]
     plan.run()
     torch.cuda.synchronize()
