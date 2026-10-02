@@ -109,6 +109,15 @@ from .moe_utils import (
     quantize_and_pack_nvfp4,
 )
 
+# Position of token_selected_experts in the dispatch payload list built by
+# _create_moe_inputs: [hidden_states, token_selected_experts, token_final_scales, ...].
+EXPERT_ID_PAYLOAD_INDEX = 1
+# Received token slots that carry no token for this rank (padding beyond each
+# source rank's valid count) get this expert id after dispatch, so the routed MoE
+# drops them instead of computing them as local expert 0 on rank 0. Matches the
+# MoE-EP communication layer default and the TensorRT-LLM / SGLang / vLLM callers.
+INVALID_TOKEN_EXPERT_ID = -1
+
 # Number of distinct LoRA adapter IDs when --use_lora is enabled.
 # Matches issue #3109's "up to 8 concurrent adapter IDs" target.
 NUM_LORA_ADAPTERS = 8
@@ -560,7 +569,8 @@ def _create_moe_inputs(
         hidden_states = hidden_states_original
 
     # Build payload list for dispatch
-    # Base payloads: hidden states, expert IDs, routing weights
+    # Base payloads: hidden states, expert IDs, routing weights.
+    # Expert IDs must stay at EXPERT_ID_PAYLOAD_INDEX (sanitized after dispatch).
     input_payloads = [hidden_states, token_selected_experts, token_final_scales]
 
     # For post-quant communication: include block scale factors so experts can dequantize
@@ -894,6 +904,8 @@ def _validate_moe_a2a(
         token_selected_experts,
         input_payloads,
         runtime_max_tokens_per_rank,
+        invalid_token_expert_id=INVALID_TOKEN_EXPERT_ID,
+        expert_id_payload_index=EXPERT_ID_PAYLOAD_INDEX,
     )
 
     # Tuck away comm and rank for the print_ordered function
@@ -1279,6 +1291,8 @@ def test_moe_a2a_dispatch_combine(args):
                 sel_experts,
                 list(payloads),
                 runtime_max_tokens_per_rank,
+                invalid_token_expert_id=INVALID_TOKEN_EXPERT_ID,
+                expert_id_payload_index=EXPERT_ID_PAYLOAD_INDEX,
             )
 
         # Expert processing in benchmark runs either no-op or real MoE kernel depending on --real_math flag
