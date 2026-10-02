@@ -1044,12 +1044,12 @@ class KDAPiecesLaunch:
             stream_args["failure_addr"] = self._failure_host.data_ptr()
             stream_args["generation"] = 0
             stream_args["detect_threshold_log2"] = DETECT_THRESHOLD_LOG2
-            if not use_fixed_h64_m64:
-                stream_args["handoff_flags_addr"] = (
-                    self._handoff_flags.data_ptr()
-                    if self._handoff_flags is not None
-                    else 0
-                )
+            # Shared argument plan; programs without handoff flags ignore it.
+            stream_args["handoff_flags_addr"] = (
+                self._handoff_flags.data_ptr()
+                if self._handoff_flags is not None
+                else 0
+            )
         # Upload the TMA descriptor tables while planning, outside any capture.
         for module, stream_args in (
             (self._module, self._args),
