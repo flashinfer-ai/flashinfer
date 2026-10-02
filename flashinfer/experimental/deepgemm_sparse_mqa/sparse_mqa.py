@@ -491,7 +491,9 @@ def metadata_workspace_words(queries, capacity, *, fmt, sparse_block_kv, paged):
     return words
 
 
-def metadata_route_key(*, paged, capacity, sparse_block_kv, page_kv, num_sms, use_unaligned_ks=False):
+def metadata_route_key(
+    *, paged, capacity, sparse_block_kv, page_kv, num_sms, use_unaligned_ks=False
+):
     """``ROUTES`` key of the metadata program for one geometry: the exact-geometry program at the exported
     production geometry (capacity ``LIMITS["exact_capacity"]``, ``LIMITS["sparse_block_kv"]``-token blocks and,
     for paged rows, ``LIMITS["page_kv"]``-token pages) compiled for this device's SM count
