@@ -230,6 +230,8 @@ PageAttention for MLA
     nvfp4_quantize_append_sparse_mla_cache
     dsv41_fp4_quantize_pack_sparse_mla_cache
     dsv41_fp4_quantize_append_sparse_mla_cache
+    dsv41_fp8_quantize_pack_sparse_mla_cache
+    dsv41_fp8_quantize_append_sparse_mla_cache
     convert_compressed_page_aligned_sparse_indices_to_hca_metadata
     DSV4HCAMetadata
     xqa_batch_decode_with_kv_cache_mla

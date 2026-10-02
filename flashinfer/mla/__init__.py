@@ -14,7 +14,6 @@
 
 from ._core import *  # noqa: F401,F403
 
-
 _PRIMS_TS_LAZY_EXPORTS = frozenset(
     {
         "get_prims_ts_batch_mla_decode_workspace_size",
@@ -30,6 +29,8 @@ _SPARSE_MLA_SM120_LAZY_EXPORTS = frozenset(
         "supported_sparse_mla_sm120_configs",
         "dsv41_fp4_quantize_append_sparse_mla_cache",
         "dsv41_fp4_quantize_pack_sparse_mla_cache",
+        "dsv41_fp8_quantize_append_sparse_mla_cache",
+        "dsv41_fp8_quantize_pack_sparse_mla_cache",
     }
 )
 
@@ -53,6 +54,18 @@ _CAKE_SPARSE_MLA_SM120_NVFP4_LAZY_EXPORTS = frozenset(
         "cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes",
         "cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel",
         "cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads",
+    }
+)
+
+_CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS = frozenset(
+    {
+        "cake_sparse_mla_sm120_dsv41_mixed_decode",
+        "cake_sparse_mla_sm120_dsv41_mixed_format_info",
+        "cake_sparse_mla_sm120_dsv41_mixed_num_chunks",
+        "cake_sparse_mla_sm120_dsv41_mixed_plan_head_tiles",
+        "cake_sparse_mla_sm120_dsv41_mixed_plan_splits",
+        "cake_sparse_mla_sm120_dsv41_mixed_scratch_bytes",
+        "cake_sparse_mla_sm120_dsv41_mixed_supported_heads",
     }
 )
 
@@ -100,6 +113,12 @@ def __getattr__(name: str):
         value = getattr(_cake_dsv4_nvfp4, name)
         globals()[name] = value
         return value
+    if name in _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS:
+        from ._sparse_mla_sm120 import cake_dsv41_mixed
+
+        value = getattr(cake_dsv41_mixed, name)
+        globals()[name] = value
+        return value
     if name in _CAKE_DSV4_LAZY_EXPORTS:
         from . import cake_dsv4
 
@@ -123,6 +142,7 @@ def __dir__():
         | _SPARSE_MLA_SM120_LAZY_EXPORTS
         | _SPARSE_MLA_NVFP4_SM120_LAZY_EXPORTS
         | _CAKE_SPARSE_MLA_SM120_NVFP4_LAZY_EXPORTS
+        | _CAKE_SPARSE_MLA_SM120_DSV41_MIXED_LAZY_EXPORTS
         | _CAKE_DSV4_LAZY_EXPORTS
         | _CAKE_KIMI_K3_MLA_LAZY_EXPORTS
     )
