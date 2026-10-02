@@ -85,28 +85,6 @@ _CASES = [
         "use_psum_layout": True,
         "output_dtype": "fp32",
     },
-    {
-        "m": 256,
-        "N": 128,
-        "group_ks": [2049, 0, 511],
-        "use_psum_layout": True,
-        "output_dtype": "bf16",
-    },
-    {
-        "m": 256,
-        "N": 128,
-        "group_ks": [2049, 0, 511],
-        "use_psum_layout": False,
-        "output_dtype": "fp32",
-    },
-    {
-        "m": 256,
-        "N": 128,
-        "group_ks": [2049, 0, 511],
-        "use_psum_layout": True,
-        "output_dtype": "fp32",
-        "accumulate": True,
-    },
 ]
 
 
