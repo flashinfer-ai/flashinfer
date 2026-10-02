@@ -39,11 +39,17 @@ passed as one `[2 * 6144/TP, 7168]` concatenation) + `RowParallel`
 The host planner (`cake_backend.decode_front_plan`, `decode_tail_plan`,
 `prefill_front_plan`, `front_split_plan`, `prefill_tail_plan`, `split_plan`) is the Cake planner re-implemented; every
 plan names its physical kernel through a logical key registered in
-`cake_jit.KERNELS[arch]`.  The plans were frozen for 148-SM devices (B200 /
-B300); `prepare_*` refuses other SM counts.  Nothing is planned per launch
-and nothing is allocated at launch (per-device scratch buffers are created at
-preparation), so a prepared runner (or a CUDA Graph capturing it) replays for
-new values written into the bound buffers.
+`cake_jit.KERNELS` (one program per key, compiled for both SM100a and SM103a
+from the same source; `cake_jit.SPECIALIZATIONS` adds the compile-line
+constants of keys that share a program, e.g. the TP1 / TP8 front and tail
+GEMMs).  Every token count from 1 to 16384, both tensor-parallel degrees and
+any number of routed partials resolve to a registered program.  The decode
+grids and stream-K plans are compiled for 148-SM devices (B200 / B300);
+`prepare_*` raises `NotImplementedError` for other SM counts.  Plans are
+memoised per shape, nothing is planned per launch and nothing is allocated at
+launch (per-device scratch buffers are created at preparation), so a prepared
+runner (or a CUDA Graph capturing it) replays for new values written into the
+bound buffers.
 
 ```python
 import torch
