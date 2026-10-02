@@ -11,7 +11,9 @@ def main():
         "--family", choices=("source", "v3", "grouped-l2"), default="source"
     )
     parser.add_argument("--precision", choices=("fp4", "fp8"), default="fp4")
-    parser.add_argument("--tokens", type=int, default=16, help="catalogued model token count")
+    parser.add_argument(
+        "--tokens", type=int, default=16, help="catalogued model token count"
+    )
     args = parser.parse_args()
     if args.family == "grouped-l2":
         if args.precision != "fp4":

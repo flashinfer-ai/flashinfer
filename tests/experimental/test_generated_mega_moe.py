@@ -121,9 +121,7 @@ def check_source_metadata(plan, inputs):
     views = plan.views
     experts = inputs["num_experts"]
     count = (
-        torch.bincount(inputs["topk_idx"].reshape(-1), minlength=experts)
-        .cpu()
-        .tolist()
+        torch.bincount(inputs["topk_idx"].reshape(-1), minlength=experts).cpu().tolist()
     )
     metadata = views["token_src_metadata"].reshape(-1, 3).cpu().long()
     block = plan.config.block_m
@@ -140,9 +138,7 @@ def check_source_metadata(plan, inputs):
     assert len(seen) == inputs["topk_idx"].numel()
     # These arrays are explicitly cleaned by the kernel, not by plan.run().
     for name in ("expert_send_count", "expert_recv_count", "expert_recv_count_sum"):
-        assert (
-            torch.count_nonzero(views[name][:experts].view(torch.int64)).item() == 0
-        )
+        assert torch.count_nonzero(views[name][:experts].view(torch.int64)).item() == 0
     peer = views["peer_grid_idx"].view(torch.int64)[0].item()
     ready = views["combine_ready_grid_idx"].view(torch.int64)[0].item()
     assert peer == ready and peer > 0
