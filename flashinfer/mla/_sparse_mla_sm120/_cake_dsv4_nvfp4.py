@@ -61,6 +61,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 
+from ...api_logging import flashinfer_api
 from ...jit.cake_sparse_mla_sm120_dsv4_nvfp4 import (
     cake_sparse_mla_sm120_dsv4_nvfp4_manifest,
     gen_cake_sparse_mla_sm120_dsv4_nvfp4_module,
@@ -126,6 +127,7 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk: int, extra_topk: int = 0) 
     return (int(topk) + _CHUNK - 1) // _CHUNK + (int(extra_topk) + _CHUNK - 1) // _CHUNK
 
 
+@flashinfer_api
 def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
     *,
     num_tokens: int,
@@ -186,6 +188,7 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
     return 2 if chunks >= 16 and ctas >= third else 1
 
 
+@flashinfer_api
 def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
     *,
     num_tokens: int,
@@ -322,6 +325,7 @@ def _resolve_plan(
     return ht, -(-chunks // cpb), cpb
 
 
+@flashinfer_api
 def cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes(
     num_tokens: int, num_heads: int, topk: int, extra_topk: int = 0
 ) -> int:
@@ -343,7 +347,7 @@ def _num_sms(device: torch.device) -> int:
 # route's split planner is wave-quantised by the SM count, so the thresholds on which the two
 # SKUs disagree are keyed by ``num_sms >= large_sms``.  Mirrors the kernel module's
 # ``plan_prefill``; the parity test in ``tests/attention`` compares the two over the grid.
-_PREFILL_POLICY = {
+_PREFILL_POLICY: Dict[str, int] = {
     # Head counts >= this follow the wide-head rules (four 16-head tiles per CTA available for H % 64 == 0).
     "wide_heads": 64,
     # Devices with at least this many SMs take the ``*_large_sms`` thresholds (RTX PRO 6000: 188), the others the
@@ -365,13 +369,15 @@ _PREFILL_POLICY = {
     # candidate count and on both SKUs (at T=128 four tiles win on every wide A/B row except the PRO 6000 H128
     # K512 band below; H64 K512 four tiles 17 % faster; from T=512 four tiles win by 7-35 % everywhere).
     "wide_two_tile_tokens": 96,
-    # Large die only, at least this many heads and a candidate count in ``two_tile_k512_band`` (half-open): two
+    # Large die only, at least this many heads and a candidate count in [``two_tile_k512_band_lo``,
+    # ``two_tile_k512_band_hi``): two
     # tiles through this token count (PRO 6000: two tiles 1.6-4.0 % faster at T=128 in three paired rounds; above
     # k=512 the evidence is mixed within +-3.4 % so the four-tile default stays; the RTX 5090 prefers four tiles
     # by 12-16 % at every candidate count).
     "wide_two_tile_tokens_h128_k512_large_sms": 128,
     "two_tile_h128_heads": 128,
-    "two_tile_k512_band": (512, 640),
+    "two_tile_k512_band_lo": 512,
+    "two_tile_k512_band_hi": 640,
 }
 
 
@@ -388,6 +394,7 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(
     return tuple(tiles.get(int(num_heads), ()))
 
 
+@flashinfer_api
 def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
     *,
     num_tokens: int,
@@ -424,7 +431,8 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
     if num_heads >= policy["wide_heads"]:
         two_tile_tokens = policy["wide_two_tile_tokens"]
         candidates = int(topk) + int(extra_topk)
-        band_lo, band_hi = policy["two_tile_k512_band"]
+        band_lo = policy["two_tile_k512_band_lo"]
+        band_hi = policy["two_tile_k512_band_hi"]
         if (
             num_sms >= policy["large_sms"]
             and num_heads >= policy["two_tile_h128_heads"]
@@ -440,6 +448,7 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
     return head_tiles
 
 
+@flashinfer_api
 def cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel(
     *,
     num_tokens: int,
@@ -778,6 +787,7 @@ def _prepare_inputs(
 
 
 @supported_compute_capability([120, 121])
+@flashinfer_api
 def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
@@ -888,6 +898,7 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
 
 
 @supported_compute_capability([120, 121])
+@flashinfer_api
 def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
     q: torch.Tensor,
     kv_cache: torch.Tensor,
