@@ -19,7 +19,7 @@ limitations under the License.
 # catalog reader, one architecture / SM-count route lookup and one JIT loader.
 # Family modules keep their own route keys, plans and launch logic.
 
-from .catalog import (
+from .cake_catalog import (
     ARCHES,
     Catalog,
     UnsupportedDevice,
