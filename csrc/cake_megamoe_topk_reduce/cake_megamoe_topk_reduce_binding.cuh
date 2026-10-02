@@ -20,8 +20,10 @@
 // by every supported architecture; each module compiles it with its own
 // -gencode.  Keep its fixed-width types intact: rewriting names such as
 // uint32_t here would make the generated vector-load code refer to undefined
-// aliases.
+// aliases.  The include stays ahead of the toolkit headers.
+// clang-format off
 #include "cake_megamoe_topk_reduce_kernels.cu"
+// clang-format on
 
 #include <cuda.h>
 #include <cuda_bf16.h>
@@ -66,8 +68,7 @@ inline void CheckNoOverlap(const TensorView& lhs, const char* lhs_name, const Te
   const auto lhs_range = TensorByteRange(lhs, lhs_name);
   const auto rhs_range = TensorByteRange(rhs, rhs_name);
   TVM_FFI_ICHECK(lhs_range.first >= rhs_range.second || rhs_range.first >= lhs_range.second)
-      << lhs_name << " must not overlap " << rhs_name
-      << ": the kernel uses __restrict__ pointers";
+      << lhs_name << " must not overlap " << rhs_name << ": the kernel uses __restrict__ pointers";
 }
 
 // partials: [capacity, 6, 4096] BF16, out: [capacity, 4096] BF16.  The kernel
