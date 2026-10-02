@@ -425,7 +425,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_dense_projection_gemm_97718770c57ce907a834(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* OUT32, CakeTensorMap const* OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
+kernel_cake_dense_projection_gemm_2ba77ff264b144a4c96d(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* OUT32, CakeTensorMap const* OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -620,18 +620,16 @@ kernel_cake_dense_projection_gemm_97718770c57ce907a834(CakeTensorMap const* A, C
                             mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
                             int k0 = (kbeg + iter_k) * 64;
                             #pragma unroll
-                            for (int p = 0; p < 2; p++) {
-                                #pragma unroll
-                                for (int kh = 0; kh < 1; kh++) {
-                                    tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 24576 + (unsigned int)(p * 8192 + kh * 8192), A, off_m + 64 * p, k0 + 64 * kh, head, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                                }
+                            for (int r = 0; r < 1; r++) {
+                                asm volatile(
+                                    "cp.async.bulk.tensor.3d.shared::cluster.global.mbarrier::complete_tx::bytes.cta_group::2.L2::cache_hint"
+                                    " [%0], [%1, {%2, %3, %4}], [%5], %6;"
+                                    :: "r"(smem_a_addr + load_stage * 24576 + (unsigned int)(r * 16384)), "l"(A), "r"(k0), "r"(off_m + 128 * r), "r"(head),
+                                       "r"(((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF)), "l"(0x12F0000000000000ULL) : "memory");
                             }
                             #pragma unroll
-                            for (int p_1 = 0; p_1 < 1; p_1++) {
-                                #pragma unroll
-                                for (int kh_1 = 0; kh_1 < 1; kh_1++) {
-                                    tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 24576 + (unsigned int)(p_1 * 8192 + kh_1 * 8192), B, b_col + 64 * p_1, k0 + 64 * kh_1, head, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                                }
+                            for (int r_1 = 0; r_1 < 1; r_1++) {
+                                tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 24576 + (unsigned int)(r_1 * 8192), B, k0, b_col + 64 * r_1, head, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                             }
                             asm volatile(
                                 "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
@@ -726,8 +724,8 @@ kernel_cake_dense_projection_gemm_97718770c57ce907a834(CakeTensorMap const* A, C
                             mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int init_flag = ((iter_k_1 == 0) ? 1 : 0);
-                            int _mma_a_lo_0 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 1536;
-                            int _mma_b_lo_0 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 1536;
+                            int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 1536;
+                            int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 1536;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -739,24 +737,24 @@ kernel_cake_dense_projection_gemm_97718770c57ce907a834(CakeTensorMap const* A, C
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 270632080;\n\t"
+                    "mov.b32 id, 270533776;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                    "add.u32 alo, alo, 128;\n\t"
-                    "add.u32 blo, blo, 128;\n\t"
+                    "add.u32 alo, alo, 2;\n\t"
+                    "add.u32 blo, blo, 2;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"

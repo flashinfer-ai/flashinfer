@@ -425,7 +425,7 @@ __device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
 extern "C" {
 
 __global__ __launch_bounds__(320) __cluster_dims__(2,1,1) void
-kernel_cake_dense_projection_gemm_f847a7b3c1ed5634e631(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* OUT32, CakeTensorMap const* OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
+kernel_cake_dense_projection_gemm_c097f26a5042b49242b0(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* OUT32, CakeTensorMap const* OUT16, __nv_bfloat16* __restrict__ out, float* __restrict__ out32, float* __restrict__ ws, unsigned int* __restrict__ counters, int M, int N, int m_tiles, int n_tiles, int k_iters, int ldo, int out_l, int num_cluster_tiles, int num_l, int num_full, int iters_per_unit, int sk_iters)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -601,13 +601,13 @@ kernel_cake_dense_projection_gemm_f847a7b3c1ed5634e631(CakeTensorMap const* A, C
                         int kend = ((u_0 < 0) ? k_iters : kend_t);
                         int tail_t = ((u_0 < 0) ? -1 : t);
                         int tiles_per_l = m_tiles * n_tiles;
-                        int tiles_per_group = 16 * n_tiles;
+                        int tiles_per_group = 4 * n_tiles;
                         int head = tile_bid / tiles_per_l;
                         int rem = tile_bid - head * tiles_per_l;
                         int group = rem / tiles_per_group;
-                        int first_m = group * 16;
+                        int first_m = group * 4;
                         int remaining = m_tiles - first_m;
-                        int group_size = ((remaining >= 16) ? 16 : remaining);
+                        int group_size = ((remaining >= 4) ? 4 : remaining);
                         int local = rem % tiles_per_group;
                         int bid_m = first_m + local % group_size;
                         int bid_n = local / group_size;
@@ -620,12 +620,18 @@ kernel_cake_dense_projection_gemm_f847a7b3c1ed5634e631(CakeTensorMap const* A, C
                             mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
                             int k0 = (kbeg + iter_k) * 64;
                             #pragma unroll
-                            for (int r = 0; r < 1; r++) {
-                                tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 24576 + (unsigned int)(r * 16384), A, k0, off_m + 128 * r, head, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                            for (int p = 0; p < 2; p++) {
+                                #pragma unroll
+                                for (int kh = 0; kh < 1; kh++) {
+                                    tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 24576 + (unsigned int)(p * 8192 + kh * 8192), A, off_m + 64 * p, k0 + 64 * kh, head, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                }
                             }
                             #pragma unroll
-                            for (int r_1 = 0; r_1 < 1; r_1++) {
-                                tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 24576 + (unsigned int)(r_1 * 8192), B, k0, b_col + 64 * r_1, head, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                            for (int p_1 = 0; p_1 < 1; p_1++) {
+                                #pragma unroll
+                                for (int kh_1 = 0; kh_1 < 1; kh_1++) {
+                                    tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 24576 + (unsigned int)(p_1 * 8192 + kh_1 * 8192), B, b_col + 64 * p_1, k0 + 64 * kh_1, head, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                                }
                             }
                             asm volatile(
                                 "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
@@ -720,8 +726,8 @@ kernel_cake_dense_projection_gemm_f847a7b3c1ed5634e631(CakeTensorMap const* A, C
                             mbarrier_wait(tma_full_addr + (mma_tma_stage) * 8, _phase_tma_full);
                             asm volatile("tcgen05.fence::after_thread_sync;");
                             int init_flag = ((iter_k_1 == 0) ? 1 : 0);
-                            int _mma_a_lo_0 = (((smem_a_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 1536;
-                            int _mma_b_lo_0 = (((smem_b_addr) >> 4) & 0x3FFF) + (mma_tma_stage) * 1536;
+                            int _mma_a_lo_0 = ((((smem_a_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 1536;
+                            int _mma_b_lo_0 = ((((smem_b_addr) >> 4) & 0x3FFF) | 0x2000000) + (mma_tma_stage) * 1536;
                             asm volatile(
                     "{\n\t"
                     ".reg .pred leader, p0, p1;\n\t"
@@ -733,24 +739,24 @@ kernel_cake_dense_projection_gemm_f847a7b3c1ed5634e631(CakeTensorMap const* A, C
                     "mov.b32 m0, 0; mov.b32 m1, 0; mov.b32 m2, 0; mov.b32 m3, 0;\n\tmov.b32 m4, 0; mov.b32 m5, 0; mov.b32 m6, 0; mov.b32 m7, 0;\n\t"
                     "mov.b32 adhi, 0x40004040;\n\t"
                     "mov.b32 bdhi, 0x40004040;\n\t"
-                    "mov.b32 id, 270533776;\n\t"
+                    "mov.b32 id, 270632080;\n\t"
                     "mov.b32 alo, %0;\n\t"
                     "mov.b32 blo, %1;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p0;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
-                    "add.u32 alo, alo, 2;\n\t"
-                    "add.u32 blo, blo, 2;\n\t"
+                    "add.u32 alo, alo, 128;\n\t"
+                    "add.u32 blo, blo, 128;\n\t"
                     "mov.b64 da, {alo, adhi};\n\t"
                     "mov.b64 db, {blo, bdhi};\n\t"
                     "@leader tcgen05.mma.cta_group::2.kind::f16 [%2], da, db, id, {m0, m1, m2, m3, m4, m5, m6, m7}, p1;\n\t"
@@ -847,13 +853,13 @@ kernel_cake_dense_projection_gemm_f847a7b3c1ed5634e631(CakeTensorMap const* A, C
                     int kend_2 = ((u_0_2 < 0) ? k_iters : kend_t_2);
                     int tail_t_2 = ((u_0_2 < 0) ? -1 : t_2);
                     int tiles_per_l_1 = m_tiles * n_tiles;
-                    int tiles_per_group_1 = 16 * n_tiles;
+                    int tiles_per_group_1 = 4 * n_tiles;
                     int head_1 = tile_bid_2 / tiles_per_l_1;
                     int rem_1 = tile_bid_2 - head_1 * tiles_per_l_1;
                     int group_1 = rem_1 / tiles_per_group_1;
-                    int first_m_1 = group_1 * 16;
+                    int first_m_1 = group_1 * 4;
                     int remaining_1 = m_tiles - first_m_1;
-                    int group_size_1 = ((remaining_1 >= 16) ? 16 : remaining_1);
+                    int group_size_1 = ((remaining_1 >= 4) ? 4 : remaining_1);
                     int local_1 = rem_1 % tiles_per_group_1;
                     int bid_m_1 = first_m_1 + local_1 % group_size_1;
                     int bid_n_1 = local_1 / group_size_1;
