@@ -307,6 +307,44 @@ def test_mm_mxfp8_cute_dsl_low_m(m, k):
     )
 
 
+def test_mm_mxfp8_cute_dsl_stale_split_k_tactic_falls_back():
+    """A low-M cached tactic must not fail when reused for a larger M."""
+    _skip_if_unsupported("cute-dsl")
+
+    m, n, k = 64, 256, 2048
+    input = torch.randn([m, k], device="cuda", dtype=torch.bfloat16)
+    weight = torch.randn([n, k], device="cuda", dtype=torch.bfloat16)
+    input_mxfp8, weight_mxfp8, input_scale, weight_scale = _prepare_mxfp8_tensors(
+        input,
+        weight,
+        SfLayout.layout_128x4,
+        SfLayout.layout_128x4,
+        "cute-dsl",
+    )
+    out = torch.empty([m, n], device="cuda", dtype=torch.bfloat16)
+    workspace = torch.empty(1, device="cuda", dtype=torch.uint8)
+
+    major, minor = get_compute_capability(torch.device("cuda"))
+    runner = gemm_base._cute_dsl_gemm_mxfp8_runner(  # pyright: ignore[reportPrivateUsage]
+        major, minor, True, torch.bfloat16
+    )
+    runner(
+        [
+            input_mxfp8,
+            weight_mxfp8.T,
+            input_scale,
+            weight_scale,
+            torch.bfloat16,
+            out,
+            workspace,
+        ],
+        # Valid for M=32, but not for the runtime M=64 above.
+        tactic=((128, 32), (1, 1), True, False, 2),
+    )
+
+    _assert_cosine_similarity(torch.mm(input, weight.T), out)
+
+
 def test_mm_mxfp8_invalid_input_dtype():
     _skip_if_unsupported()
     m, n, k = 128, 128, 128
