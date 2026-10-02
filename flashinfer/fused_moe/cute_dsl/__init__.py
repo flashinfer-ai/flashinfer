@@ -22,14 +22,6 @@ if is_cute_dsl_available():
         B12xMoEWrapper,
         b12x_fused_moe,
     )
-    from .mxfp4 import (
-        CuteDslMxfp4MoEWrapper,
-        Mxfp4MoEParallelLayout,
-        Mxfp4MoEPlan,
-        Mxfp4MoERankLayout,
-        mxfp4_moe_capability,
-        resolve_mxfp4_moe_layout,
-    )
 
     from .blackwell_sm12x import (
         W4A16PackedWeights,
@@ -69,12 +61,6 @@ if is_cute_dsl_available():
         "cute_dsl_fused_moe_bf16",
         "cute_dsl_fused_moe_mxfp8_mxfp4",
         "cute_dsl_fused_moe_nvfp4",
-        "CuteDslMxfp4MoEWrapper",
-        "Mxfp4MoEParallelLayout",
-        "Mxfp4MoEPlan",
-        "Mxfp4MoERankLayout",
-        "mxfp4_moe_capability",
-        "resolve_mxfp4_moe_layout",
         "cute_dsl_sm12x_moe_gemm_fp8",
         "cute_dsl_sm12x_moe_gemm_mxfp8_mxfp4",
         "cute_dsl_sm12x_fc1_act_fp8",

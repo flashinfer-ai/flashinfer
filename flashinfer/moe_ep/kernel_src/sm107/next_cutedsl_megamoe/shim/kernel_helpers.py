@@ -1,25 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-"""Torch-side helpers for the SM107 block-scaled mega kernel (quant, SF swizzle,
-reference).
+"""Torch quantization, weight layouts, and numerical reference for SM107 MegaMoE.
 
-The ``next/`` drop's own quant/swizzle helpers live in its *test harness*
-(``tester/``), which is not vendored, so the torch-side equivalents live here
-in the shim.  Semantics mirror the harness:
+The upstream quantization and layout helpers live in ``tester/``, outside
+the vendored kernel export. These helpers supply the corresponding operations:
 
-- MXFP8 block-32 quantization uses a round-toward-+inf (``cvt.rp.satfinite``)
-  E8M0 block scale, so quantized data never overflows fp8.  The harness routes
-  the rounding + reciprocal through instruction-faithful device ops; the torch
-  emulation here differs by at most 1 ulp of the fp32 reciprocal, which is why
-  the shim reference is compared with tolerance bands, never bitwise.
-- NVFP4 block-16 quantization uses an FP8-E4M3 block scale of
-  ``absmax / 6 * norm_const`` and rescales by ``norm_const / round_trip(scale)``
-  (the kernel epilogue's ``nvfp4_quant_impl``); the torch emulation uses exact
-  fp32 division instead of ``rcp.approx.ftz`` and a distance-min E2M1 encoder
-  instead of ``cvt.rn.satfinite.e2m1x2`` — again a tolerance-band, not bitwise,
-  match.  All transcendental-free (torch's jiterator/NVRTC rejects sm_107).
-- The weight scale-factor plane is the 32x4x4 atom swizzle (``to_blocked``),
-  flattened per expert — identical layout math to the harness/SM100 helpers.
+- MXFP8 uses per-32 E8M0 block scales rounded up to powers of two.
+- NVFP4 uses per-16 E4M3 block scales from ``absmax / 6 * norm_const`` and
+  scales data by ``norm_const / round_trip(scale)`` before FP4 encoding.
+- Weight scales use the 32x4x4 atom swizzle, flattened per expert.
+
+The reference uses Torch division and activation functions. The kernel uses
+approximate device operations, and GEMM accumulation, intermediate
+requantization, and expert-output reduction can also round differently.
+Output checks use relative L2 tolerances; layout-only checks compare bytes.
 """
 
 from __future__ import annotations
@@ -61,14 +55,10 @@ def round_up(a: int, b: int) -> int:
 
 
 def _ceil_log2_exponent(x: torch.Tensor) -> torch.Tensor:
-    """``ceil(log2(x))`` as int32, via exact fp32 bit decomposition.
+    """Return ``ceil(log2(x))``, clamped to FP32 normal exponents.
 
-    Pure integer/bit ops only: transcendentals like ``torch.exp2``/``log2``
-    (and potentially ``frexp``) route through torch's jiterator (NVRTC), whose
-    bundled compiler rejects ``sm_107``. For a positive normal fp32,
-    ``ceil(log2(x)) = unbiased_exponent + (mantissa_bits != 0)``. Zero /
-    non-finite inputs map to the smallest usable exponent (the data block is
-    all-zero in that case anyway).
+    Bit decomposition avoids transcendental rounding at power-of-two
+    boundaries. Non-finite inputs and values below ``2**-126`` map to ``-126``.
     """
     finite = torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
     bits = finite.clamp_min(2.0**-126).view(torch.int32)
@@ -89,8 +79,8 @@ def quantize_mxfp8_block32(
 
     Returns ``(data, scale)`` where ``data`` has ``tensor``'s shape in
     ``data_dtype`` and ``scale`` is E8M0 (viewed as ``float8_e8m0fnu``) with
-    the trailing dim divided by 32. The scale rounds toward +inf
-    (``cvt.rp.satfinite`` semantics), so data never overflows fp8.
+    the trailing dim divided by 32. For finite FP32 values, rounding the scale
+    up to a power of two keeps the largest magnitude within the data range.
     """
     if tensor.shape[-1] % Mxfp8BlockSize != 0:
         raise ValueError(
@@ -114,6 +104,7 @@ def pack_f32_to_fp4(fp32: torch.Tensor) -> torch.Tensor:
     decodes). Distance-min against the 8-value magnitude table; exact
     midpoints resolve to the EVEN code, matching the instruction's
     round-to-nearest-even (e.g. 0.75 -> 1.0, 1.25 -> 1.0, 2.5 -> 2.0).
+    NaNs and signed zeros map to positive zero.
     """
     if fp32.shape[-1] % 2 != 0:
         raise ValueError(f"FP4 pack needs an even trailing dim, got {fp32.shape[-1]}.")
@@ -149,7 +140,7 @@ def unpack_fp4_to_f32(packed: torch.Tensor) -> torch.Tensor:
 
 
 def quantize_nvfp4_block16(
-    tensor: torch.Tensor, norm_const: float = 1.0
+    tensor: torch.Tensor, norm_const: float | torch.Tensor = 1.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """NVFP4-quantize along the trailing dim with per-16 FP8-E4M3 block scales.
 
@@ -172,19 +163,24 @@ def quantize_nvfp4_block16(
     scale_fp8 = scale_f32.to(torch.float8_e4m3fn)
     scale_rt = scale_fp8.to(torch.float32)
     acc_scale = torch.where(
-        scale_rt > 0, float(norm_const) / scale_rt.clamp_min(2.0**-126), 0.0
+        scale_rt > 0, norm_const / scale_rt.clamp_min(2.0**-126), 0.0
     )
     scaled = (blocked * acc_scale.unsqueeze(-1)).reshape(fp32.shape)
     return pack_f32_to_fp4(scaled), scale_fp8
 
 
 def e8m0_to_f32(scale: torch.Tensor) -> torch.Tensor:
-    """E8M0 (or uint8-viewed) scale plane -> fp32 powers of two (bit-exact)."""
-    return (scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+    """Decode typed E8M0 scales or raw E8M0 bytes as FP32."""
+    codes = scale.view(torch.uint8).to(torch.int32)
+    bits = codes << 23
+    # E8M0 code 0 encodes 2**-127; code 255 encodes NaN.
+    bits = torch.where(codes == 0, 0x00400000, bits)
+    bits = torch.where(codes == 255, 0x7FC00000, bits)
+    return bits.view(torch.float32)
 
 
 def scale_to_f32(scale: torch.Tensor) -> torch.Tensor:
-    """Any SF plane (E8M0 or E4M3, possibly uint8-viewed) -> fp32."""
+    """Decode typed E4M3 or E8M0 scales; raw uint8 bytes mean E8M0."""
     if scale.dtype == torch.float8_e4m3fn:
         return scale.to(torch.float32)
     return e8m0_to_f32(scale)
@@ -334,6 +330,83 @@ def preprocess_block_scaled_weights(
     return transform(w13, gate_up=True), transform(w2, gate_up=False)
 
 
+def preprocess_prequantized_block_scaled_weights(
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    w13_scale: torch.Tensor,
+    w2_scale: torch.Tensor,
+    *,
+    quant_kind: str,
+    hidden_size: int,
+    intermediate_size: int,
+) -> Tuple[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor]]:
+    """Convert canonical packed weights and raw block scales without requantizing.
+
+    FC1 contains all gate rows followed by all up rows. Both data and scales
+    undergo the same 16-row interleave before scales are padded and swizzled.
+    NVFP4 data may use uint8 storage; scale tensors must carry their FP8 dtype
+    so that the scale encoding is explicit.
+    """
+    allowed_data: Tuple[torch.dtype, ...]
+    if quant_kind == "nvfp4":
+        data_dtype = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
+        sf_dtype, sf_vec, packing = torch.float8_e4m3fn, Nvfp4BlockSize, 2
+        allowed_data = (data_dtype, torch.uint8)
+    elif quant_kind in ("mxfp8_e4m3", "mxfp8_e5m2"):
+        data_dtype = (
+            torch.float8_e4m3fn if quant_kind == "mxfp8_e4m3" else torch.float8_e5m2
+        )
+        sf_dtype, sf_vec, packing = torch.float8_e8m0fnu, Mxfp8BlockSize, 1
+        allowed_data = (data_dtype,)
+    else:
+        raise ValueError(f"unsupported quant_kind {quant_kind!r}.")
+    if w13.ndim != 3 or w2.ndim != 3:
+        raise ValueError("prequantized w13 and w2 must both be 3D tensors.")
+    experts = w13.shape[0]
+    if experts <= 0 or hidden_size <= 0 or intermediate_size <= 0:
+        raise ValueError("expert count, hidden, and intermediate must be positive.")
+    if hidden_size % (4 * sf_vec) or intermediate_size % (2 * sf_vec):
+        raise ValueError(
+            "weight dimensions do not satisfy the SM107 scale-vector alignment."
+        )
+    legs = (
+        ("w13", w13, w13_scale, 2 * intermediate_size, hidden_size),
+        ("w2", w2, w2_scale, hidden_size, intermediate_size),
+    )
+    for name, weight, scale, rows, cols in legs:
+        if tuple(weight.shape) != (experts, rows, cols // packing):
+            raise ValueError(
+                f"{name} must have shape {(experts, rows, cols // packing)}."
+            )
+        if tuple(scale.shape) != (experts, rows, cols // sf_vec):
+            raise ValueError(
+                f"{name}_scale must have shape {(experts, rows, cols // sf_vec)}."
+            )
+        if weight.dtype not in allowed_data or scale.dtype != sf_dtype:
+            raise ValueError(
+                f"{name} requires {allowed_data} data and {sf_dtype} block scales."
+            )
+        if weight.device != w13.device or scale.device != w13.device:
+            raise ValueError("all prequantized weights and scales must share a device.")
+
+    def transform(weight, scale, *, gate_up):
+        data = weight.view(torch.uint8)
+        sf = scale.view(torch.uint8)
+        if gate_up:
+            data = interleave_gate_up_16(data, intermediate_size=intermediate_size)
+            sf = interleave_gate_up_16(sf, intermediate_size=intermediate_size)
+        swizzled = torch.stack([to_blocked(s) for s in sf])
+        data = data.contiguous()
+        # A contiguous slice can retain an unaligned checkpoint-storage offset.
+        if data.data_ptr() % 16:
+            data = data.clone()
+        return data.view(data_dtype).permute(0, 2, 1), swizzled.view(sf_dtype)
+
+    return transform(w13, w13_scale, gate_up=True), transform(
+        w2, w2_scale, gate_up=False
+    )
+
+
 def concatenate_block_scaled_weights(
     parts: Sequence[Tuple[torch.Tensor, torch.Tensor]],
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -381,11 +454,11 @@ def _dequant_weight_k_major(
 
 
 def _quantize_fc2_wire(
-    quant_kind: str, act: torch.Tensor
+    quant_kind: str, act: torch.Tensor, norm_const: float | torch.Tensor = 1.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Emulate the in-kernel FC1->FC2 wire quantization for one expert."""
     if quant_kind == "nvfp4":
-        return quantize_nvfp4_block16(act)
+        return quantize_nvfp4_block16(act, norm_const)
     data_dtype = (
         torch.float8_e5m2 if quant_kind == "mxfp8_e5m2" else torch.float8_e4m3fn
     )
@@ -409,13 +482,18 @@ def compute_megamoe_reference_sm107_block_scaled(
     num_tokens: Optional[int] = None,
     weight_scales_are_swizzled: bool = False,
     return_fp32: bool = False,
+    situ_beta: Optional[float] = None,
+    situ_linear_beta: Optional[float] = None,
+    fc1_alpha: Optional[torch.Tensor] = None,
+    fc2_alpha: Optional[torch.Tensor] = None,
+    fc1_norm_const: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Pure-torch single-rank oracle for the SM107 block-scaled inference kernel.
 
-    Consumes the SAME staged quantized payloads + RAW (unswizzled) scale planes
-    the kernel sees, so the only divergence from the device kernel is fp32 GEMM
-    accumulation order and the in-kernel FC2-input requantization (approximate
-    reciprocal / E2M1 tie rounding) — compare with tolerance bands.
+    Evaluates MoE math from staged quantized inputs and transformed weights.
+    It shares quantization helpers with preprocessing. Activation evaluation,
+    GEMM accumulation, intermediate requantization, and expert-output reduction
+    can round differently from the kernel; compare outputs with tolerances.
 
     Weight tensors are K-MAJOR PHYSICAL layout (what the transforms build
     before the logical transpose view): ``fc1_weight_k_major
@@ -423,6 +501,8 @@ def compute_megamoe_reference_sm107_block_scaled(
     ``(E, 2I, hidden/vec)``; ``fc2_weight_k_major (E, hidden, I[packed])`` with
     raw SF ``(E, hidden, I/vec)``.
     """
+    if (situ_beta is None) != (situ_linear_beta is None):
+        raise ValueError("SiTU requires both beta parameters.")
     device = topk_idx.device
     tokens = x_data.shape[0] if num_tokens is None else num_tokens
     num_local_experts, fc1_out, _ = fc1_weight_k_major.shape
@@ -446,16 +526,24 @@ def compute_megamoe_reference_sm107_block_scaled(
             sf2 = from_blocked(sf2, hidden, intermediate // vec)
         w1 = _dequant_weight_k_major(quant_kind, fc1_weight_k_major[local_e], sf1)
         fc1 = x[src_t] @ w1.transpose(0, 1)  # (v, 2I): (pair, {gate,up}, 16)
+        if fc1_alpha is not None:
+            fc1 = fc1 * fc1_alpha[local_e]
         pairs = fc1.view(-1, intermediate // GateUpInterleave, 2, GateUpInterleave)
         gate, up = pairs[:, :, 0, :], pairs[:, :, 1, :]
         if gate_up_clamp is not None:
             gate = gate.clamp(max=gate_up_clamp)
             up = up.clamp(min=-gate_up_clamp, max=gate_up_clamp)
-        act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
+        if situ_beta is not None:
+            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+            act = (up * gate).reshape(-1, intermediate)
+        else:
+            act = (up * (gate * torch.sigmoid(gate))).reshape(-1, intermediate)
         if apply_topk_at_fc1:
             act = act * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         # In-kernel FC2-input requantization (the FC1->FC2 wire format).
-        act_q, act_sf = _quantize_fc2_wire(quant_kind, act)
+        norm_const = 1.0 if fc1_norm_const is None else fc1_norm_const[local_e]
+        act_q, act_sf = _quantize_fc2_wire(quant_kind, act, norm_const)
         vec = Nvfp4BlockSize if quant_kind == "nvfp4" else Mxfp8BlockSize
         if quant_kind == "nvfp4":
             act = unpack_fp4_to_f32(act_q)
@@ -463,7 +551,10 @@ def compute_megamoe_reference_sm107_block_scaled(
             act = act_q.to(torch.float32)
         act = act * scale_to_f32(act_sf).repeat_interleave(vec, dim=1)
         w2 = _dequant_weight_k_major(quant_kind, fc2_weight_k_major[local_e], sf2)
-        term = (act @ w2.transpose(0, 1)).to(torch.bfloat16).to(torch.float32)
+        term = act @ w2.transpose(0, 1)
+        if fc2_alpha is not None:
+            term = term * fc2_alpha[local_e]
+        term = term.to(torch.bfloat16).to(torch.float32)
         if not apply_topk_at_fc1:
             term = term * topk_weights[src_t, src_k].to(torch.float32).unsqueeze(-1)
         output.index_add_(0, src_t, term)
@@ -483,6 +574,7 @@ __all__ = [
     "interleave_gate_up_16",
     "pack_f32_to_fp4",
     "preprocess_block_scaled_weights",
+    "preprocess_prequantized_block_scaled_weights",
     "quantize_mxfp8_block32",
     "quantize_nvfp4_block16",
     "round_up",

@@ -2,12 +2,16 @@
 # SPDX-License-Identifier: MIT
 # See LICENSE.kda-for-kda.txt for the full license.
 
-"""Load retained PTX kernels through generated CUDA host shims.
+"""Load retained PTX kernels through one shared CUDA host shim.
 
 The retained PTX is ``.version 9.2`` / ``.target sm_103a``. Drivers older than
 CUDA 13.2 cannot JIT it, so each file is assembled once with ptxas >= 13.2 and
 the cubin is embedded instead. The cubins are cached in ``FLASHINFER_KDA_PTX_CACHE_DIR``
 (default: the FlashInfer JIT cache); ``FLASHINFER_KDA_PTXAS`` selects a specific ptxas.
+
+``csrc/kda/ptx/programs.json`` holds the one argument plan shared by the four
+programs and the per-program launch parameters; ``csrc/kda/ptx/shim.cc`` is
+compiled once per program with those parameters prepended as ``#define`` lines.
 """
 
 from __future__ import annotations
@@ -112,6 +116,27 @@ def _cubin(name: str) -> bytes:
 
 
 @cache
+def _program_table() -> dict:
+    return json.loads((SHIMS / "programs.json").read_text())
+
+
+def _shim_source(program: dict) -> str:
+    """Prepend one program's launch parameters to the shared shim source."""
+
+    defines = {
+        "MODULE_IDENT": program["module_ident"],
+        "KERNEL_NAME": json.dumps(program["kernel"]),
+        "DYNAMIC_SMEM_BYTES": program["dynamic_smem_bytes"],
+        "V_BOX_ROWS": program["v_box_rows"],
+        "OUT_BOX_DEPTH": program["out_box_depth"],
+        "HANDOFF_FLAGS": int(program["handoff_flags"]),
+        "CLUSTER_X": program["cluster_x"],
+    }
+    lines = [f"#define KDA_PTX_{key} {value}" for key, value in defines.items()]
+    return "\n".join(lines) + "\n" + (SHIMS / "shim.cc").read_text()
+
+
+@cache
 def _load(name: str):
     from tvm_ffi import cpp
     from ...jit.core import MissingJITCacheError
@@ -120,18 +145,18 @@ def _load(name: str):
         raise MissingJITCacheError(
             "The PTX KDA backend needs JIT enabled to load its embedded-cubin shims"
         )
-    metadata = json.loads((SHIMS / f"{name}.json").read_text())
-    source = (SHIMS / f"{name}.cc").read_text()
+    table = _program_table()
+    program = table["programs"][name]
     module = cpp.load_inline(
-        f"flashinfer_ptx_{metadata['module_ident']}",
-        cpp_sources=source,
-        embed_cubin={metadata["module_ident"]: _cubin(name)},
+        f"flashinfer_ptx_{program['module_ident']}",
+        cpp_sources=_shim_source(program),
+        embed_cubin={program["module_ident"]: _cubin(name)},
         extra_include_paths=[_cuda_include()],
         extra_ldflags=["-lcuda"],
     )
-    keys = [key for kind, key in metadata["arg_plan"] if kind != "grid"]
-    tma_keys = [key for kind, key in metadata["arg_plan"] if kind == "tma_buffer"]
-    return module[metadata["entry"]], keys, tma_keys
+    keys = [key for kind, key in table["arg_plan"] if kind != "grid"]
+    tma_keys = [key for kind, key in table["arg_plan"] if kind == "tma_buffer"]
+    return module[table["entry"]], keys, tma_keys
 
 
 class StaticPTXModule:
@@ -145,6 +170,7 @@ class StaticPTXModule:
 
     def __init__(self, name: str):
         self.name = name
+        self.cluster_x = _program_table()["programs"][name]["cluster_x"]
         self._tma_key = None
         self._tma_table = None
 
@@ -166,8 +192,8 @@ class StaticPTXModule:
         upload = {**bindings, "tma_table": table, "tma_upload": 1}
         with tvm_ffi.use_torch_stream():
             # An upload call launches nothing; the grid only has to pass the
-            # shims' checks (cluster-2 kernels need an even grid).
-            entry(*[upload[k] for k in keys], 2, 1, 1)
+            # shim's checks (cluster kernels need a grid multiple of the cluster).
+            entry(*[upload[k] for k in keys], self.cluster_x, 1, 1)
         self._tma_key, self._tma_table = key, table
 
     def launch(self, *, grid, **bindings):
@@ -177,16 +203,21 @@ class StaticPTXModule:
         self.bind(bindings)
         bindings["tma_table"] = self._tma_table
         bindings["tma_upload"] = 0
-        if self.name == "varlen_mixed_h64" and grid[0] % 2:
+        remainder = grid[0] % self.cluster_x
+        if remainder:
+            # Pad the grid to whole clusters with empty CTA rows.
+            padding = self.cluster_x - remainder
             bindings["cta_table"] = torch.cat(
                 (
                     bindings["cta_table"],
                     torch.zeros(
-                        3, dtype=torch.int32, device=bindings["cta_table"].device
+                        3 * padding,
+                        dtype=torch.int32,
+                        device=bindings["cta_table"].device,
                     ),
                 )
             )
-            grid = (grid[0] + 1, grid[1], grid[2])
+            grid = (grid[0] + padding, grid[1], grid[2])
         missing = set(keys) - set(bindings)
         if missing:
             raise ValueError(f"missing PTX launch bindings: {sorted(missing)}")
