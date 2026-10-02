@@ -644,8 +644,10 @@ def test_bf16_artifact_architecture_and_swap_abi_isolation(monkeypatch):
     # Swapping changes the native signature: a flag alone cannot reinterpret
     # an old normal object, nor can a swapped object omit its orientation.
     for abi, swap in (
-        ("cudnn_frost_grouped_gemm2_v1", True),
-        ("cudnn_frost_grouped_gemm2_swap_ab_v1", False),
+        ("cudnn_frost_grouped_gemm2_v1", False),
+        ("cudnn_frost_grouped_gemm2_swap_ab_v1", True),
+        ("cudnn_frost_grouped_gemm2_v2", True),
+        ("cudnn_frost_grouped_gemm2_swap_ab_v2", False),
     ):
         with pytest.raises(RuntimeError, match="ABI"):
             runtime._validate_abi(
@@ -683,6 +685,75 @@ def test_bf16_source_distribution_has_no_binary_or_cudnn_frost_dependency():
             )
         ]
         assert options == [f"--enable-tvm-ffi --gpu-arch {record['arch']}"]
+
+
+@supported_gpu
+@pytest.mark.parametrize("stage", ["fc1", "fc2"])
+@pytest.mark.parametrize("swap", [False, True])
+@pytest.mark.parametrize("store", ["stg", "tma"])
+def test_bf16_explicit_final_boundary_and_graph(stage, swap, store):
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16 import (
+        runtime,
+    )
+    from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.bf16.fc2 import (
+        PreparedFc2,
+    )
+
+    torch.manual_seed(23)
+    s, h, i, e = 259, 128, 256, 8
+    first, second = bf16_moe._kernels(s, h, i, e, torch.device("cuda"))
+    kernels = [
+        kernel
+        for kernel in (first if stage == "fc1" else second)
+        if kernel.swap_ab == swap and kernel.tactic_metadata["store_mode"] == store
+    ]
+    if not kernels:
+        pytest.skip("this orientation/store is not in the packaged shortlist")
+    n, k = (i, h) if stage == "fc1" else (h, i)
+    x = torch.randn(s, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    gate = torch.randn(e, n, k, device="cuda", dtype=torch.bfloat16) * 0.1
+    up = torch.randn_like(gate) * 0.1
+    offsets = torch.tensor(
+        [0, 0, 1, 128, 128, 130, 130, 130, 193], device="cuda", dtype=torch.int32
+    )
+    scale = torch.ones(1, device="cuda")
+    out = torch.full((s, n), -7.0, device="cuda", dtype=torch.bfloat16)
+    for kernel in kernels:
+        workspace = torch.empty(
+            kernel.workspace_bytes, device="cuda", dtype=torch.uint8
+        )
+        if stage == "fc1":
+            assert kernel in runtime.matching_kernels(x, gate, up, offsets, scale, out)
+
+            def run():
+                runtime._launch(kernel, x, gate, up, offsets, scale, out, workspace)
+
+        else:
+            run = PreparedFc2(kernel, x, gate, offsets, out, workspace).run
+        run()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            run()
+        for boundaries in (
+            [0, 0, 1, 128, 128, 130, 130, 130, 193],
+            [0, 2, 2, 2, 31, 193, 193, 193, 193],
+            [0] * 9,
+        ):
+            offsets.copy_(torch.tensor(boundaries, device="cuda", dtype=torch.int32))
+            expected = torch.full_like(out, -7)
+            for expert, (begin, end) in enumerate(
+                zip(boundaries[:-1], boundaries[1:], strict=True)
+            ):
+                value = x[begin:end].float() @ gate[expert].float().T
+                if stage == "fc1":
+                    value = torch.nn.functional.silu(value) * (
+                        x[begin:end].float() @ up[expert].float().T
+                    )
+                expected[begin:end] = value.bfloat16()
+            out.fill_(-7)
+            graph.replay()
+            torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-4)
+            assert torch.all(out[boundaries[-1] :] == -7)
 
 
 def test_bf16_source_manifest_rejects_tampering_and_legacy_objects(tmp_path):
@@ -1325,11 +1396,13 @@ def test_mxfp8_scale_layout_uneven_empty_groups_and_experts():
 def _assert_block_scale_layout(runtime):
     rows, cols = 259, 8
     scales = (torch.arange(rows * cols) % 253).to(torch.uint8).reshape(rows, cols)
-    offsets = torch.tensor([0, 0, 1, 128, 128, 130, 259, 259], dtype=torch.int32)
+    offsets = torch.tensor([0, 0, 1, 128, 128, 130, 259, 259, 259], dtype=torch.int32)
     packed = runtime.pack_token_scales(scales, offsets).view(torch.uint8)
-    assert packed.numel() == runtime.segmented_scale_rows(rows, offsets.numel()) * cols
+    assert (
+        packed.numel() == runtime.segmented_scale_rows(rows, offsets.numel() - 1) * cols
+    )
     base = 0
-    starts = offsets.tolist() + [rows]
+    starts = offsets.tolist()
     for begin, end in zip(starts, starts[1:], strict=False):
         for row in range(end - begin):
             for col in range(cols):
@@ -1348,6 +1421,119 @@ def _assert_block_scale_layout(runtime):
                     packed_weight[expert, _block_scale_sf_address(row, col, cols)]
                     == weight[expert, row, col]
                 )
+
+
+@pytest.mark.parametrize("runtime", [mxfp8, nvfp4, mxfp8_mxfp4])
+@pytest.mark.parametrize("boundaries", [[0, 1, 129], [0, 129, 129], [0, 0, 0]])
+def test_block_scale_explicit_final_boundary(runtime, boundaries):
+    # The backing token buffer has spare capacity which belongs to no group.
+    scales = torch.arange(259 * 4).remainder(253).to(torch.uint8).reshape(259, 4)
+    offsets = torch.tensor(boundaries, dtype=torch.int32)
+    packed = runtime.pack_token_scales(scales, offsets).view(torch.uint8)
+    expected = torch.zeros_like(packed)
+    base = 0
+    for begin, end in zip(boundaries[:-1], boundaries[1:], strict=True):
+        for row in range(end - begin):
+            for col in range(4):
+                expected[base + _block_scale_sf_address(row, col, 4)] = scales[
+                    begin + row, col
+                ]
+        base += ((end - begin + 127) // 128) * 128 * 4
+    torch.testing.assert_close(packed, expected)
+    # Updating unused capacity cannot change the packed groups.
+    scales[boundaries[-1] :] = 255
+    torch.testing.assert_close(
+        runtime.pack_token_scales(scales, offsets).view(torch.uint8), expected
+    )
+
+
+@pytest.mark.parametrize("runtime", [mxfp8, nvfp4, mxfp8_mxfp4])
+@pytest.mark.parametrize("boundaries", [[], [0]])
+def test_block_scale_requires_start_and_end_boundaries(runtime, boundaries):
+    with pytest.raises(ValueError, match="G\\+1"):
+        runtime.pack_token_scales(
+            torch.ones(10, 4, dtype=torch.uint8),
+            torch.tensor(boundaries, dtype=torch.int32),
+        )
+
+
+@supported_gpu
+@pytest.mark.parametrize("runtime", [mxfp8, nvfp4, mxfp8_mxfp4])
+@pytest.mark.parametrize("groups", [32, 40, 64])
+@pytest.mark.parametrize("swap", [False, True])
+def test_block_scale_final_boundary_across_scheduler_warps(runtime, groups, swap):
+    # Exercise the scheduler's initial warp, subsequent warp, and exact-warp
+    # boundary with G > E. Only the final group has tokens.
+    s, k, n, e = 259, 128, 128, 8
+    kernel = next(
+        kernel
+        for kernel in runtime.discover()
+        if not kernel.fc1 and kernel.swap_ab == swap
+    )
+    nv = runtime is nvfp4
+    mixed = runtime is mxfp8_mxfp4
+    x = torch.full(
+        (s, k // (2 if nv else 1)),
+        0x22 if nv else 1,
+        dtype=torch.uint8 if nv else torch.float8_e4m3fn,
+        device="cuda",
+    )
+    weight = torch.full(
+        (e, n, k // (2 if nv or mixed else 1)),
+        0x22 if nv or mixed else 1,
+        dtype=torch.uint8 if nv or mixed else torch.float8_e4m3fn,
+        device="cuda",
+    )
+    block = 16 if nv else 32
+    sf_dtype = torch.float8_e4m3fn if nv else torch.uint8
+    x_sf = torch.full((s, k // block), 1 if nv else 127, dtype=sf_dtype, device="cuda")
+    w_sf = torch.full(
+        (e, n, k // block), 1 if nv else 127, dtype=sf_dtype, device="cuda"
+    )
+    offsets = torch.zeros(groups + 1, device="cuda", dtype=torch.int32)
+    offsets[-1] = 193
+    packed_sf = runtime.pack_token_scales(x_sf, offsets)
+    out = torch.full((s, n), -7, dtype=torch.bfloat16, device="cuda")
+    plan_type = (
+        runtime.PreparedNvfp4GroupedGemm
+        if nv
+        else (
+            runtime.PreparedMxfp8Mxfp4GroupedGemm
+            if mixed
+            else runtime.PreparedMxfp8GroupedGemm
+        )
+    )
+    kwargs = (
+        {
+            "gemm_scales": (
+                torch.arange(1, groups + 1, device="cuda", dtype=torch.float32),
+            )
+        }
+        if nv
+        else {}
+    )
+    plan = plan_type(
+        kernel,
+        x,
+        (weight,),
+        offsets,
+        packed_sf,
+        (runtime.pack_weight_scales(w_sf),),
+        out,
+        **kwargs,
+    )
+    plan()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        plan()
+    for end in (193, 129, 0):
+        offsets[-1] = end
+        packed_sf.copy_(runtime.pack_token_scales(x_sf, offsets))
+        out.fill_(-7)
+        graph.replay()
+        expected = torch.full_like(out, -7)
+        expected[:end] = k * (groups if nv else 1)
+        torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 def test_mxfp8_segmented_scale_capacity_covers_routing_partitions():
@@ -1429,7 +1615,7 @@ def _assert_block_scale_launch_abi(runtime, *, packed, block, packed_weights=Non
             runtime.segmented_scale_rows(s, e) * (k // block), dtype=torch.uint8
         )
         b_sf = tuple(torch.empty(e, n * k // block, dtype=torch.uint8) for _ in w)
-        offsets = torch.zeros(e, dtype=torch.int32)
+        offsets = torch.zeros(e + 1, dtype=torch.int32)
         out = torch.empty(s, n, dtype=torch.bfloat16)
         workspace = torch.empty(kernel.workspace_bytes, dtype=torch.uint8)
         scale = torch.ones(1, 1, 1)
@@ -1469,6 +1655,8 @@ def _assert_block_scale_launch_abi(runtime, *, packed, block, packed_weights=Non
             name: arg.data_ptr() for name, arg in zip(names[1:], args[1:], strict=False)
         }
         tensors = dict(zip(names[1:-1], args[1:], strict=True))
+        assert args[0][3:5] == (e, e)
+        assert tensors["first_token_offset"].shape == (e + 1,)
         token_arg = tensors["b_0" if kernel.swap_ab else "a_0"]
         weight_arg = tensors["a_0" if kernel.swap_ab else "b_0"]
         assert token_arg.shape == (s, k // (2 if packed else 1), 1)
@@ -1551,7 +1739,7 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
         for _ in w
     )
     offsets = torch.tensor(
-        [0, 0, 1, 128, 128, 130, 259, 259], dtype=torch.int32, device="cuda"
+        [0, 0, 1, 128, 128, 130, 259, 259, 259], dtype=torch.int32, device="cuda"
     )
     out = torch.empty(s, n, dtype=torch.bfloat16, device="cuda")
     packed_a = runtime.pack_token_scales(a_sf, offsets)
@@ -1581,8 +1769,8 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
             * sf.view(torch.float8_e8m0fnu).double().repeat_interleave(32, -1)
             for v, sf in zip(w, b_sf, strict=False)
         ]
-        expected = torch.empty(s, n, device="cuda")
-        starts = offsets.tolist() + [s]
+        expected = torch.full((s, n), -7.0, device="cuda")
+        starts = offsets.tolist()
         for expert, (begin, end) in enumerate(zip(starts, starts[1:], strict=False)):
             values = xd[begin:end].double() @ wd[0][expert].double().T
             if kernel.gated:
@@ -1611,7 +1799,9 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
         plan()
     x.copy_((torch.randn(s, k, device="cuda") * 0.1).to(x.dtype))
     offsets.copy_(
-        torch.tensor([0, 2, 2, 2, 31, 259, 259, 259], device="cuda", dtype=torch.int32)
+        torch.tensor(
+            [0, 2, 2, 2, 31, 259, 259, 259, 259], device="cuda", dtype=torch.int32
+        )
     )
     packed_a.copy_(runtime.pack_token_scales(a_sf, offsets))
     if mixed:
@@ -1622,6 +1812,20 @@ def _assert_mxfp8_grouped_kernel_and_graph(runtime, kernel, monkeypatch, mixed=F
     out.fill_(float("nan"))
     graph.replay()
     torch.testing.assert_close(out, reference(), rtol=2e-2, atol=2e-4)
+
+    # The final offset is device data, not the static token-buffer capacity.
+    # Cover a nonempty last expert, an empty last expert, and no active rows.
+    for boundaries in (
+        [0, 0, 1, 128, 128, 130, 130, 130, 193],
+        [0, 2, 2, 2, 31, 193, 193, 193, 193],
+        [0] * 9,
+    ):
+        offsets.copy_(torch.tensor(boundaries, device="cuda", dtype=torch.int32))
+        packed_a.copy_(runtime.pack_token_scales(a_sf, offsets))
+        out.fill_(-7)
+        graph.replay()
+        torch.testing.assert_close(out, reference(), rtol=2e-2, atol=2e-4)
+        assert torch.all(out[boundaries[-1] :] == -7)
 
 
 def _block_scale_linear_scales(packed, rows, cols):
@@ -2138,7 +2342,7 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
         for _ in w
     )
     offsets = torch.tensor(
-        [0, 0, 1, 128, 128, 130, 259, 259], dtype=torch.int32, device="cuda"
+        [0, 0, 1, 128, 128, 130, 259, 259, 259], dtype=torch.int32, device="cuda"
     )
     alphas = tuple(
         torch.linspace(0.25 + j, 2.0 + j, e, device="cuda") for j in range(len(w))
@@ -2161,8 +2365,8 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
     def reference():
         xd = _nvfp4_dequant(x, a_sf)
         wd = [_nvfp4_dequant(v, sf) for v, sf in zip(w, b_sf, strict=True)]
-        expected = torch.empty(s, n, device="cuda", dtype=torch.float32)
-        starts = offsets.tolist() + [s]
+        expected = torch.full((s, n), -7.0, device="cuda", dtype=torch.float32)
+        starts = offsets.tolist()
         for expert, (begin, end) in enumerate(zip(starts, starts[1:], strict=False)):
             values = (xd[begin:end] @ wd[0][expert].T).float() * alphas[0][expert]
             if kernel.gated:
@@ -2185,7 +2389,9 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
         plan()
     x.bitwise_xor_(0x88)
     offsets.copy_(
-        torch.tensor([0, 2, 2, 2, 31, 259, 259, 259], device="cuda", dtype=torch.int32)
+        torch.tensor(
+            [0, 2, 2, 2, 31, 259, 259, 259, 259], device="cuda", dtype=torch.int32
+        )
     )
     packed_a.copy_(nvfp4.pack_token_scales(a_sf, offsets))
     for j, alpha in enumerate(alphas):
@@ -2195,6 +2401,20 @@ def test_nvfp4_grouped_kernel_extremes_alpha_and_graph(
     out.fill_(float("nan"))
     graph.replay()
     torch.testing.assert_close(out, reference(), rtol=2e-2, atol=2e-4)
+
+    # The final offset is device data, not the static token-buffer capacity.
+    # Cover a nonempty last expert, an empty last expert, and no active rows.
+    for boundaries in (
+        [0, 0, 1, 128, 128, 130, 130, 130, 193],
+        [0, 2, 2, 2, 31, 193, 193, 193, 193],
+        [0] * 9,
+    ):
+        offsets.copy_(torch.tensor(boundaries, device="cuda", dtype=torch.int32))
+        packed_a.copy_(nvfp4.pack_token_scales(a_sf, offsets))
+        out.fill_(-7)
+        graph.replay()
+        torch.testing.assert_close(out, reference(), rtol=2e-2, atol=2e-4)
+        assert torch.all(out[boundaries[-1] :] == -7)
 
 
 def _nvfp4_moe_reference(act, weights, activation, swizzled=False):
@@ -2471,7 +2691,7 @@ def test_mxfp8_fused_quantization_preserves_bf16_intermediate(
         logical_sf = []
         for stage in (baseline, actual):
             unpacked = torch.empty(rows, columns, device="cuda", dtype=torch.uint8)
-            starts = stage["offsets"].tolist() + [rows]
+            starts = stage["offsets"].tolist()
             sf_start = 0
             for begin, end in zip(starts, starts[1:], strict=False):
                 row = torch.arange(end - begin, device="cuda")[:, None]
@@ -2589,7 +2809,7 @@ def test_nvfp4_fused_quantization_preserves_bf16_intermediate(
         logical_sf = []
         for stage in (baseline, actual):
             unpacked = torch.empty(rows, columns, device="cuda", dtype=torch.uint8)
-            starts = stage["offsets"].tolist() + [rows]
+            starts = stage["offsets"].tolist()
             sf_start = 0
             for begin, end in zip(starts, starts[1:], strict=False):
                 row = torch.arange(end - begin, device="cuda")[:, None]
