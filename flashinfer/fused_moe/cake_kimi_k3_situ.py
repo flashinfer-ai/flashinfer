@@ -33,7 +33,7 @@ _LAYOUT = "trtllm_shuffled_nvfp4_group16"
 _STATE_ATTR = "_flashinfer_cake_situ_workspace"
 _N32_CLAIM8_ARCHES = ("sm_100a", "sm_103a")
 _M256_C12_ARCHES = ("sm_100a",)
-# The 16-token SM103 route runs an FC2 program built for two resident CTAs per
+# The 16-token SM103 and SM100 routes run an FC2 program built for two resident CTAs per
 # SM (four pipeline stages, __launch_bounds__(512, 2)), so its device-workfeed
 # pool holds 2 * SM // (_H // 128) rows: 280 CTAs on a 148-SM part instead of
 # the 140 of the single-CTA FC2 program. The pool size only sets how many CTAs
@@ -41,7 +41,7 @@ _M256_C12_ARCHES = ("sm_100a",)
 # every CTA claims its next tile through an atomic increment, exiting once the
 # counter passes the tile count, so a CTA that is not co-resident starts later
 # and takes whatever remains; no CTA waits for another.
-_N8_W2A_M16_ARCHES = ("sm_103a",)
+_N8_W2A_M16_ARCHES = ("sm_103a", "sm_100a")
 _N8_W2A_M16_TOKENS = (16,)
 _N8_W2A_M16_FC2_GRID_N_SM_FACTOR = 2
 
