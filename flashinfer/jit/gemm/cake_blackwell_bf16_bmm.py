@@ -9,7 +9,6 @@ from ..core import JitSpec, gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
 
 BlackwellBf16BmmTarget = Literal["sm100a", "sm103a"]
 _FLAGS = {"sm100a": sm100a_nvcc_flags, "sm103a": sm103a_nvcc_flags}
-_MINOR = {"sm100a": 0, "sm103a": 3}
 
 # One source set serves both exact targets: the generated kernels carry no
 # architecture-specific text, so each target compiles the same translation
@@ -69,9 +68,7 @@ def gen_blackwell_bf16_bmm_module(target: BlackwellBf16BmmTarget) -> JitSpec:
     return gen_jit_spec(
         name,
         [source_dir / _BINDING] + [source_dir / p for p in _KERNELS],
-        extra_cuda_cflags=_FLAGS[target]
-        + ["--use_fast_math"]
-        + [f"-DFLASHINFER_BLACKWELL_BF16_BMM_TARGET_MINOR={_MINOR[target]}"],
+        extra_cuda_cflags=_FLAGS[target] + ["--use_fast_math"],
         extra_include_paths=[source_root, source_dir, include_root],
     )
 
