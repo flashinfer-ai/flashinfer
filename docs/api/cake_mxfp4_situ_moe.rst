@@ -72,12 +72,18 @@ canonical rank-local ``w1`` ``[L, 2 * I_shard, H/2]`` (up rows then gate rows)
 with ``w1_scale`` ``[L, 2 * I_shard, H/32]`` and ``w2`` ``[L, H, I_shard/2]``
 with ``w2_scale`` ``[L, H, I_shard/32]`` (``uint8``).
 
-Rows the plan refuses (``decision.supported`` is ``False``) name the hand-written
-selection that is not built by this chain: the dense grouped-GEMM path above
-``swapab_max_tokens``, the wide 192-row form, the mixed and split forms,
-the two-stage finalize (MoE-TP rows above 16 tokens) and the generic
-``moe_sort`` routing above the fused-routing cap.  ``plan`` raises
-``NotImplementedError`` with that reason.
+``plan`` refuses two classes of rows, both with ``NotImplementedError``.
+``decision.supported`` is ``False`` only when the hand-written selection needs
+an IR form this chain has not traced (the wide 192-row ``mixed192`` form, MoE-TP
+rows of 8192 tokens and above); ``decision.reason`` names the missing form.
+Every other row reports ``decision.supported`` as ``True``, but ``plan`` also
+refuses a row whose ``decision.path`` is not in ``EXECUTABLE_PATHS`` (the
+``two_stage`` finalize on MoE-TP rows of 17 to 127 tokens is traced but not
+enqueued by this chain).  Callers that need a hard answer before ``plan``
+check ``decision.path in EXECUTABLE_PATHS`` as well as ``decision.supported``.
+The dense grouped-GEMM path above ``swapab_max_tokens``, the split two-stage
+path and the hybrid path run through their own executable chains (see
+``executed_chains`` in the manifest).
 
 Generated kernels
 -----------------
