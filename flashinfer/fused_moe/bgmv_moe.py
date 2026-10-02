@@ -215,7 +215,7 @@ def _cake_dtype_name(dtype: torch.dtype) -> Literal["bfloat16", "float16"]:
 
 
 class BGMVMoECakePlan:
-    """Pointer-stable SM90/SM100/SM103 Cake BGMV MoE shrink+expand execution plan.
+    """Pointer-stable SM90/SM100/SM103/SM107 Cake BGMV MoE shrink+expand execution plan.
 
     The plan owns caller-visible FP32 accumulation and shrink workspaces. Its
     first eager ``run`` captures the exact launch sequence into a CUDA Graph;
@@ -371,12 +371,12 @@ def prepare_bgmv_moe(
     shrink_out: Optional[torch.Tensor] = None,
     y_accum: Optional[torch.Tensor] = None,
 ) -> BGMVMoECakePlan:
-    """Prepare the generated Cake SM90/SM100/SM103 BGMV MoE pipeline for graph replay.
+    """Prepare the generated Cake SM90/SM100/SM103/SM107 BGMV MoE pipeline for graph replay.
 
     This optimized path currently supports one LoRA slice, rank 32, hidden
     sizes 2688 or 3072, BF16/FP16 inputs, and exact SM90 (H100/H200), SM100
-    (B200/GB200) or SM103 (B300/GB300) devices; each target runs its own
-    cubin. Routing may
+    (B200/GB200), SM103 (B300/GB300) or SM107 (Rubin) devices; each target
+    runs its own cubin. Routing may
     be arbitrary; each output has one owner that accumulates routes in fixed
     input order, so identical prepared replays are bitwise reproducible. The
     contiguous top-k=2 layout takes the optimized fast path.
@@ -419,7 +419,7 @@ def prepare_bgmv_moe(
     )
     if arch is None:
         raise ValueError(
-            "Cake BGMV MoE requires an exact SM90, SM100 or SM103 CUDA device; "
+            "Cake BGMV MoE requires an exact SM90, SM100, SM103 or SM107 CUDA device; "
             f"got capability={capability}"
         )
     if len(lora_a_weights) != 1 or len(lora_b_weights) != 1:
@@ -512,7 +512,10 @@ def prepare_bgmv_moe(
     )
 
     schedule = select_cake_bgmv_moe_schedule(hidden_size, num_tokens, arch)
-    module = get_cake_bgmv_moe_module(hidden_size, dtype_name, arch)
+    # Configure() reads the CUDA current device, so load the module under
+    # x.device in case the caller's current device differs from it.
+    with torch.cuda.device(x.device):
+        module = get_cake_bgmv_moe_module(hidden_size, dtype_name, arch)
     return BGMVMoECakePlan(
         module,
         y_accum=y_accum,

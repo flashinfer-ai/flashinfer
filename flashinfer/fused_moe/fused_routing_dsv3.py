@@ -30,7 +30,7 @@ def _is_cake_dsv3_fused_routing_supported(
 ) -> bool:
     """Return whether the call is inside Cake's executable NoAuxTc contract."""
 
-    if capability not in ((10, 0), (10, 3)):
+    if capability not in ((10, 0), (10, 3), (10, 7)):
         return False
     if score_dtype not in _CAKE_DTYPES or bias_dtype not in _CAKE_DTYPES:
         return False
@@ -63,7 +63,7 @@ def _check_default_dsv3_fused_routing_backend_supported(**_kwargs) -> bool:
     return True
 
 
-@supported_compute_capability([100, 103])
+@supported_compute_capability([100, 103, 107])
 def _check_cake_dsv3_fused_routing_backend_supported(
     scores: torch.Tensor,
     bias: torch.Tensor,
@@ -319,9 +319,9 @@ def fused_topk_deepseek(
     Notes
     -----
     The kernel uses ``float32`` internally for numerical precision regardless
-    of the input dtype.  Supported on Ada (SM89), Hopper (SM90), and
-    Blackwell (SM100/SM103/SM120/SM121).  In the underlying CUDA kernel name
-    ``NoAuxTc``, the ``NoAux`` prefix indicates the absence of auxiliary
+    of the input dtype.  Supported on Ada (SM89), Hopper (SM90), Blackwell
+    (SM100/SM103/SM120/SM121) and Rubin (SM107).  In the underlying CUDA
+    kernel name ``NoAuxTc``, the ``NoAux`` prefix indicates the absence of auxiliary
     load-balancing losses and the ``Tc`` suffix indicates Tensor-Core
     utilization.
     """

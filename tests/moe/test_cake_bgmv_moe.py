@@ -31,14 +31,16 @@ _FP16_SHAPES = [
 ]
 
 
-_SUPPORTED_CAPABILITIES = ((9, 0), (10, 0), (10, 3))
+_SUPPORTED_CAPABILITIES = ((9, 0), (10, 0), (10, 3), (10, 7))
 
 
 def _require_cake_arch():
     if not torch.cuda.is_available():
         pytest.skip("CUDA is unavailable")
     if torch.cuda.get_device_capability() not in _SUPPORTED_CAPABILITIES:
-        pytest.skip("generated Cake BGMV MoE tests require exact SM90, SM100 or SM103")
+        pytest.skip(
+            "generated Cake BGMV MoE tests require exact SM90, SM100, SM103 or SM107"
+        )
 
 
 def _make_inputs(hidden_size, num_tokens, dtype, *, arbitrary_routes=False):
@@ -239,7 +241,9 @@ def test_cpu_input_reports_device_requirement():
     x = torch.empty((1, 2688), dtype=torch.bfloat16)
     empty_i64 = torch.empty((1,), dtype=torch.int64)
     empty_f32 = torch.empty((1,), dtype=torch.float32)
-    with pytest.raises(ValueError, match="exact SM90, SM100 or SM103 CUDA device"):
+    with pytest.raises(
+        ValueError, match="exact SM90, SM100, SM103 or SM107 CUDA device"
+    ):
         prepare_bgmv_moe(
             x,
             [],
