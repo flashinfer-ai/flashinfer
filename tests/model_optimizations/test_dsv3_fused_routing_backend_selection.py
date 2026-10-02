@@ -5,6 +5,8 @@ import torch
 
 import flashinfer.fused_moe.fused_routing_dsv3 as fused_routing
 from flashinfer.fused_moe.fused_routing_dsv3 import (
+    _check_cake_dsv3_fused_routing_backend_supported,
+    _device_capability,
     _is_cake_dsv3_fused_routing_supported,
 )
 
@@ -121,3 +123,24 @@ def test_fused_topk_deepseek_backend_capability_metadata():
     assert not fused_routing.fused_topk_deepseek.is_backend_supported("cake", 90)
     assert fused_routing.fused_topk_deepseek.is_backend_supported("cake", 100)
     assert fused_routing.fused_topk_deepseek.is_backend_supported("cake", 103)
+
+
+def test_cake_backend_check_queries_device_capability_once(monkeypatch):
+    calls = []
+
+    def fake_get_device_capability(device):
+        calls.append(device)
+        return (10, 0)
+
+    monkeypatch.setattr(torch.cuda, "get_device_capability", fake_get_device_capability)
+    _device_capability.cache_clear()
+    try:
+        scores = torch.empty((1, 256), dtype=torch.bfloat16)
+        bias = torch.empty((256,), dtype=torch.bfloat16)
+        for _ in range(3):
+            assert _check_cake_dsv3_fused_routing_backend_supported(
+                scores, bias, n_group=8, topk_group=4, topk=8
+            )
+    finally:
+        _device_capability.cache_clear()
+    assert calls == [scores.get_device()]
