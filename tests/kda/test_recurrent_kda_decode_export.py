@@ -259,6 +259,7 @@ def _patch_cpu_selector_environment(monkeypatch, *, sm_count=148, cc=(10, 0)):
         "get_device_properties",
         lambda device: SimpleNamespace(multi_processor_count=sm_count),
     )
+    recurrent_module._device_multi_processor_count.cache_clear()
 
 
 @pytest.mark.parametrize(
