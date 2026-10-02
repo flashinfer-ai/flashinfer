@@ -134,7 +134,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             False,
             260,
             2,
-            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="w14-h64-w260-128tok",
         ),
         pytest.param(
@@ -1036,7 +1036,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             False,
             640,
             64,
-            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="h64-w640-192tok",
         ),
         pytest.param(
@@ -1047,7 +1047,7 @@ def _canonical_query_tokens(batch_size: int, max_q_len: int, ragged: bool) -> in
             False,
             388,
             2,
-            "fp8_h64_prefill_source_persistent_m64",
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
             id="h64-w388-192tok",
         ),
         # Off-contract low-head width beyond three sparse tiles keeps the
@@ -2289,14 +2289,14 @@ def test_bf16_h128_prefill_launches_the_snake_program_for_tail_majority_rows(
             128,
             2,
             260,
-            "fp8_h64_prefill_source_persistent_m64",
-        ),  # hardening-000022 (W14)
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        ),  # hardening-000022 (W14; W111 multi-tile program)
         (
             512,
             2,
             260,
-            "fp8_h64_prefill_source_persistent_m64",
-        ),  # hardening-000034 (W14)
+            "fp8_h64_prefill_source_persistent_m64_multi_tile",
+        ),  # hardening-000034 (W14; W111 multi-tile program)
         (
             64,
             None,
@@ -2336,3 +2336,41 @@ def test_fp8_h64_rows_follow_the_persistent_body_rule(
             )
             == expected
         )
+
+
+@pytest.mark.parametrize("num_query_tokens", [128, 256, 512])
+@pytest.mark.parametrize(
+    "sparse_topk,page_size,expected",
+    [
+        # CAKE-772 W111: the M64 body is two exported programs selected by the
+        # item width -- the box-K-gather program for single-tile items (the SWA
+        # tile is the whole item: hardening-000026 / 000032), the program
+        # without the box block for every wider item (hardening-000022 /
+        # 000028 / 000034 / 000038).  Same ABI, same bits.
+        (128, None, "fp8_h64_prefill_source_persistent_m64"),
+        (260, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (388, 2, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (640, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+        (1152, 64, "fp8_h64_prefill_source_persistent_m64_multi_tile"),
+    ],
+)
+def test_fp8_h64_m64_program_is_selected_by_the_item_width(
+    num_query_tokens, sparse_topk, page_size, expected
+):
+    for arch in ("sm_100a", "sm_103a"):
+        assert (
+            _route(
+                arch=arch,
+                dtype=torch.float8_e4m3fn,
+                num_heads=64,
+                batch_size=8,
+                max_q_len=8,
+                ragged=True,
+                sparse_topk=sparse_topk,
+                compressed_page_size=page_size,
+                num_query_tokens=num_query_tokens,
+            )
+            == expected
+        )
+    # Both M64 programs are ragged-only persistent routes with one CTA per token.
+    assert expected in cake._RAGGED_ONLY_ROUTES
