@@ -1,4 +1,4 @@
-"""Apples-to-apples benchmarks for unified CUTLASS, cuTile, b12x and SM12x MoE runners."""
+"""Unified MoE comparisons with shared inputs and explicitly labeled BF16 proxies."""
 
 from __future__ import annotations
 
@@ -19,11 +19,14 @@ from flashinfer.fused_moe import (
     B12xNvfp4Config,
     B12xW4A16Config,
     CutlassBf16Config,
+    CutlassFp8BlockConfig,
     CutlassFp8PerTensorConfig,
     CutlassMxfp8Mxfp4Config,
     CutlassNvfp4Config,
     CutlassW4A16Config,
     CuTileBf16Config,
+    CuTileDeepSeekFp8Bf16Config,
+    CuTileDeepSeekFp8Config,
     CuTileFp8PerTensorBf16Config,
     CuTileFp8PerTensorConfig,
     CuTileMxfp4Bf16Config,
@@ -56,6 +59,7 @@ from flashinfer.fused_moe import (
     SwiGLUStep,
 )
 from flashinfer.fused_moe.prepare import (
+    _deepseek_fp8_quantize_weights,
     _quantize_mxfp4_linear,
     _swizzle_cutile_fp4_scales,
 )
@@ -94,6 +98,11 @@ _BACKEND_CONFIGS = {
     ("mxfp8_w8a16", "cutile"): CuTileMxfp8Bf16Config,
     ("mxfp4_w4a8", "cutile"): CuTileMxfp4Mxfp8Config,
     ("mxfp4_w4a8", "cutlass"): CutlassMxfp8Mxfp4Config,
+    ("deepseek_fp8", "cutile"): CuTileDeepSeekFp8Config,
+    ("deepseek_fp8", "cutlass"): CutlassFp8BlockConfig,
+    ("deepseek_fp8_w8a16", "cutile"): CuTileDeepSeekFp8Bf16Config,
+    ("deepseek_fp8", "cutlass_bf16_proxy"): CutlassBf16Config,
+    ("deepseek_fp8_w8a16", "cutlass_bf16_proxy"): CutlassBf16Config,
 }
 
 _ACTIVATIONS = {
@@ -117,7 +126,7 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
     parser.add_argument(
         "--backends",
         nargs="+",
-        choices=("cutlass", "cutile", "b12x", "sm12x"),
+        choices=("cutlass", "cutile", "b12x", "sm12x", "cutlass_bf16_proxy"),
         default=["cutlass", "cutile"],
         help="Unified MoE backends to benchmark with the same inputs.",
     )
@@ -140,6 +149,12 @@ def parse_unified_moe_args(line, parser: argparse.ArgumentParser):
         action="store_true",
         default=False,
         help="Autotune each backend independently before measuring it.",
+    )
+    parser.add_argument(
+        "--cache-bf16-weights",
+        "--cache_bf16_weights",
+        action="store_true",
+        help="Cache unscaled BF16 weights for cuTile DeepSeek W8A16 before timing.",
     )
     args = parser.parse_args(line)
     args.backends = list(dict.fromkeys(args.backends))
@@ -290,6 +305,7 @@ def _prepare_weight_view(
     activation,
     args,
     device: torch.device,
+    checkpoint=None,
 ):
     common = {
         "num_local_experts": args.num_experts,
@@ -298,6 +314,31 @@ def _prepare_weight_view(
         "activation": activation,
         "device": device,
     }
+    if quant_variant.startswith("deepseek_fp8"):
+        q1, s1, q2, s2 = checkpoint
+        if config_type is CutlassFp8BlockConfig:
+            return {
+                "fc1_expert_weights": q1,
+                "fc2_expert_weights": q2,
+                "fc1_block_scale": s1,
+                "fc2_block_scale": s2,
+            }
+        if backend == "cutlass_bf16_proxy":
+            return config_type.prepare_weights(
+                _dequantize_deepseek_weights(q1, s1).bfloat16(),
+                _dequantize_deepseek_weights(q2, s2).bfloat16(),
+                **common,
+            )
+        return config_type.prepare_weights(
+            q1,
+            s1,
+            q2,
+            s2,
+            cache_bf16_weights=(
+                args.cache_bf16_weights and quant_variant == "deepseek_fp8_w8a16"
+            ),
+            **common,
+        )
     if quant_variant == "bf16" or backend == "cutlass":
         return config_type.prepare_weights(w1, w2, **common)
 
@@ -355,11 +396,25 @@ def _prepare_weight_view(
     return config_type.prepare_weights(w1_q, w1_scale, w2_q, w2_scale, **common)
 
 
+def _dequantize_deepseek_weights(q, scale):
+    return q.float() * scale.repeat_interleave(128, 1).repeat_interleave(128, 2)
+
+
+def _reference_deepseek_activations(x):
+    blocks = x.float().reshape(x.shape[0], -1, 128)
+    scale = (blocks.abs().amax(-1, keepdim=True) / 448).clamp_min(1e-12)
+    q = (blocks / scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+    return (q.float() * scale).reshape_as(x)
+
+
 def _reference_moe(
     activations: MoEActivationPack,
     w1: torch.Tensor,
     w2: torch.Tensor,
     activation,
+    *,
+    activation_fp8=False,
+    round_expert_output=False,
 ) -> torch.Tensor:
     hidden_states = activations.hidden_states_q
     topk_ids = activations.topk_ids
@@ -367,15 +422,22 @@ def _reference_moe(
     assert topk_ids is not None and topk_weights is not None
     intermediate_size = w2.shape[2]
     result = torch.zeros_like(hidden_states, dtype=torch.float32)
+    x = (
+        _reference_deepseek_activations(hidden_states)
+        if activation_fp8
+        else hidden_states.float()
+    )
     for expert in range(w1.shape[0]):
         token_ids, slots = torch.where(topk_ids == expert)
         if token_ids.numel() == 0:
             continue
-        gemm1 = (hidden_states[token_ids].float() @ w1[expert].float().T).to(
-            torch.bfloat16
-        )
+        gemm1 = (x[token_ids] @ w1[expert].float().T).to(torch.bfloat16)
         intermediate = _reference_activation(gemm1, activation, intermediate_size)
+        if activation_fp8:
+            intermediate = _reference_deepseek_activations(intermediate)
         expert_output = intermediate.float() @ w2[expert].float().T
+        if round_expert_output:
+            expert_output = expert_output.bfloat16().float()
         result.index_add_(
             0,
             token_ids,
@@ -442,7 +504,9 @@ def _reference_activation(
     return result.to(torch.bfloat16)
 
 
-def _config_for_backend(args, activation, backend_config) -> MoEConfig:
+def _config_for_backend(
+    args, activation, backend_config, *, quant_variant=None
+) -> MoEConfig:
     weight_format, activation_format = {
         "bf16": (QuantFormat.BF16, QuantFormat.BF16),
         "nvfp4": (QuantFormat.NVFP4, QuantFormat.NVFP4),
@@ -454,7 +518,9 @@ def _config_for_backend(args, activation, backend_config) -> MoEConfig:
         "mxfp8": (QuantFormat.MXFP8, QuantFormat.MXFP8),
         "mxfp8_w8a16": (QuantFormat.MXFP8, QuantFormat.BF16),
         "mxfp4_w4a8": (QuantFormat.MXFP4, QuantFormat.MXFP8),
-    }[args.quant_variant]
+        "deepseek_fp8": (QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),
+        "deepseek_fp8_w8a16": (QuantFormat.DeepSeekFp8, QuantFormat.BF16),
+    }[args.quant_variant if quant_variant is None else quant_variant]
     return MoEConfig(
         routing=RoutingConfig(num_experts=args.num_experts, top_k=args.top_k),
         quant=QuantConfig(weight=weight_format, activation=activation_format),
@@ -544,10 +610,32 @@ def run_unified_moe_test(args):
             f"{args.activation_type.name}"
         ) from None
 
+    deepseek = args.quant_variant.startswith("deepseek_fp8")
+    if deepseek and (args.hidden_size % 128 or args.intermediate_size % 128):
+        print(
+            "[INFO] DeepSeek block-FP8: N/A; hidden/intermediate sizes require K128 alignment."
+        )
+        return []
     activations, w1, w2 = _canonical_inputs(args, activation, device)
-    reference = (
-        _reference_moe(activations, w1, w2, activation) if args.refcheck else None
-    )
+    checkpoint = None
+    reference = None
+    if deepseek:
+        q1, s1 = _deepseek_fp8_quantize_weights(w1)
+        q2, s2 = _deepseek_fp8_quantize_weights(w2)
+        checkpoint = q1, s1, q2, s2
+        if args.refcheck:
+            reference_w1 = _dequantize_deepseek_weights(q1, s1)
+            reference_w2 = _dequantize_deepseek_weights(q2, s2)
+            reference = _reference_moe(
+                activations,
+                reference_w1,
+                reference_w2,
+                activation,
+                activation_fp8=args.quant_variant == "deepseek_fp8",
+                round_expert_output=True,
+            )
+    elif args.refcheck:
+        reference = _reference_moe(activations, w1, w2, activation)
     major, minor = get_compute_capability(device)
     arch = major * 10 + minor
     assert activations.topk_ids is not None
@@ -558,19 +646,22 @@ def run_unified_moe_test(args):
         config_type = _BACKEND_CONFIGS.get((args.quant_variant, backend))
         if config_type is None:
             print(
-                f"[INFO] {backend} has no {args.quant_variant} unified MoE "
-                "comparison backend; skipping."
+                f"[INFO] {backend}: N/A for {args.quant_variant}; "
+                "no matching unified MoE backend."
             )
             continue
         if not config_type.supported(arch):
-            print(
-                f"[INFO] {backend} does not support {args.quant_variant} "
-                f"unified MoE on SM{arch}; skipping."
-            )
+            print(f"[INFO] {backend}: N/A for {args.quant_variant} on SM{arch}.")
             continue
 
         backend_config = config_type()
-        config = _config_for_backend(args, activation, backend_config)
+        proxy = backend == "cutlass_bf16_proxy"
+        config = _config_for_backend(
+            args,
+            activation,
+            backend_config,
+            quant_variant="bf16" if proxy else args.quant_variant,
+        )
         try:
             backend_activations = activations
             if config_type is CutlassNvfp4Config:
@@ -598,6 +689,7 @@ def run_unified_moe_test(args):
                 activation,
                 args,
                 device,
+                checkpoint=checkpoint,
             )
             weights = MoEWeightPack()
             weights.prepare_for(runner.backend_key, view)
@@ -624,6 +716,11 @@ def run_unified_moe_test(args):
             continue
 
         tactic = _choose_tactic(args, runner, inputs)
+        cache_bytes = sum(
+            value.numel() * value.element_size()
+            for name, value in view.items()
+            if name.endswith("_bf16")
+        )
         prequantized_median: float | str = ""
         prequantized_std: float | str = ""
         if input_quantizer is not None:
@@ -641,12 +738,29 @@ def run_unified_moe_test(args):
         backend_label = f"{backend}_autotune" if args.autotune else backend
 
         refcheck_passed: bool | str = ""
-        if reference is not None:
-            # Quantized modes are compared with the original BF16 weights, so
-            # their tolerance includes the expected FP4 weight error.
-            rtol, atol = (3e-2, 5e-1) if args.quant_variant == "bf16" else (0.25, 1.0)
+        backend_reference = reference
+        if proxy and args.refcheck:
+            backend_reference = _reference_moe(
+                activations,
+                reference_w1.bfloat16(),
+                reference_w2.bfloat16(),
+                activation,
+            )
+        if backend_reference is not None:
+            # DeepSeek uses dequantized checkpoints and BF16 stage boundaries;
+            # FP4 modes retain the canonical BF16 reference weights.
+            if deepseek and not proxy:
+                rtol, atol = 0.04, 0.04
+            else:
+                rtol, atol = (
+                    (3e-2, 5e-1)
+                    if args.quant_variant == "bf16" or proxy
+                    else (0.25, 1.0)
+                )
             try:
-                torch.testing.assert_close(output, reference, rtol=rtol, atol=atol)
+                torch.testing.assert_close(
+                    output, backend_reference, rtol=rtol, atol=atol
+                )
                 refcheck_passed = True
             except AssertionError:
                 refcheck_passed = False
@@ -670,7 +784,17 @@ def run_unified_moe_test(args):
         )
         if args.quant_variant.startswith(("fp8", "mxfp8")):
             weight_format = "mxfp8" if args.quant_variant.startswith("mxfp8") else "fp8"
-        weight_dtype = torch.uint8 if weight_format else torch.bfloat16
+        if deepseek:
+            weight_format = (
+                None
+                if proxy
+                else ("bf16_block_scale" if cache_bytes else "fp8_block_scale")
+            )
+        weight_dtype = (
+            torch.bfloat16
+            if weight_format in (None, "bf16_block_scale")
+            else torch.uint8
+        )
         tb_per_sec = calculate_moe_kernel_bandwidth(
             args.num_tokens,
             args.hidden_size,
@@ -699,7 +823,7 @@ def run_unified_moe_test(args):
             tflops=tflops,
             tb_per_sec=tb_per_sec,
             backend=backend_label,
-            resolved_backend=backend,
+            resolved_backend="cutlass" if proxy else backend,
             num_tokens=args.num_tokens,
             hidden_size=args.hidden_size,
             intermediate_size=args.intermediate_size,
@@ -717,6 +841,9 @@ def run_unified_moe_test(args):
             cold_l2_cache=True,
             prequantized_median_time=prequantized_median,
             prequantized_std_time=prequantized_std,
+            comparison_kind="bf16_proxy" if proxy else "same_format",
+            cache_bf16_weights=bool(cache_bytes),
+            weight_cache_bytes=cache_bytes,
         )
         results.append(current)
 

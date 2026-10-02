@@ -113,7 +113,8 @@ A test case is generally invoked as `python3 flashinfer_benchmark.py --routine <
 The unified MoE comparison runs the selected backends from the same routing, activation,
 and weight inputs. Supported cuTile quantization modes are `bf16`, `nvfp4`,
 `nvfp4_w4a16`, `mxfp4`, `mxfp4_w4a16`, `fp8`, `fp8_w8a16`, `mxfp8`,
-`mxfp8_w8a16`, and `mxfp4_w4a8`. `fp8` uses per-tensor E4M3 scaling;
+`mxfp8_w8a16`, `mxfp4_w4a8`, `deepseek_fp8`, and `deepseek_fp8_w8a16`.
+`fp8` uses per-tensor E4M3 scaling;
 `mxfp8` uses E8M0 block scales. The W8A16 modes retain BF16 activations;
 `mxfp4_w4a8` uses MXFP4 weights with MXFP8 activations. A8 modes include
 BF16-to-FP8 quantization before both GEMMs in the timed region. This example uses the
@@ -139,6 +140,30 @@ intermediate sizes divisible by 128; unsupported shapes are skipped.
 On SM120/SM121, `--backends b12x cutile` also compares NVFP4 W4A4 (`nvfp4`)
 and W4A16 (`nvfp4_w4a16`). The b12x runner exposes a single heuristic tactic;
 `--autotune` does not expand its search space. MXFP4 is not supported by b12x.
+
+DeepSeek modes share one E4M3 checkpoint with FP32 128x128 block scales.
+`deepseek_fp8` quantizes both GEMM inputs per 1x128 block;
+`deepseek_fp8_w8a16` keeps BF16 activations. Both use BF16 stage outputs.
+The same-format CUTLASS block-FP8 backend supports SM90; cuTile currently
+supports SM103. Unsupported comparisons print `N/A`.
+`cutlass_bf16_proxy` explicitly benchmarks CUTLASS BF16 with weights
+dequantized from that same checkpoint and rounded to BF16 before timing.
+Its CSV `comparison_kind` is `bf16_proxy`; its latency is a different-format
+reference and must not be reported as a direct FP8 speedup.
+
+From the repository root:
+
+```bash
+python3 benchmarks/flashinfer_benchmark.py --routine unified_moe --backends cutile cutlass cutlass_bf16_proxy --quant-variant deepseek_fp8 --num_tokens 8192 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --dry_run_iters 10 --num_iters 20 --refcheck
+python3 benchmarks/flashinfer_benchmark.py --routine unified_moe --backends cutile cutlass_bf16_proxy --quant-variant deepseek_fp8_w8a16 --num_tokens 8192 --hidden_size 7168 --intermediate_size 2048 --num_experts 256 --top_k 8 --activation-type Swiglu --input_dtype bfloat16 --autotune --dry_run_iters 10 --num_iters 20 --refcheck
+```
+
+`--cache-bf16-weights` enables the optional unscaled BF16 weight cache for
+cuTile DeepSeek W8A16. It preserves FP32 block scales, prepares the cache
+outside timing, and records its additional storage in `weight_cache_bytes`.
+The DeepSeek reference uses dequantized checkpoint weights, per-row FP8
+activation quantization for A8, and BF16 stage boundaries, with
+`rtol=atol=0.04`. The BF16 proxy uses its own rounded-weight reference.
 
 Representative Qwen3.6 and Nemotron cases are in `samples/sample_testlist.txt`.
 

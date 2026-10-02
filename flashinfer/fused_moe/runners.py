@@ -3342,7 +3342,7 @@ class CuTileBf16Runner(MoERunner):
                 num_experts=self.config.routing.num_experts,
                 top_k=self.config.routing.top_k,
                 is_gated=self.config.activation.is_gated,
-                block_sizes=self._block_sizes,
+                block_sizes=self._workspace_block_sizes(),
                 device=self.device,
                 **self._workspace_kwargs(capacity * self.config.routing.top_k),
             )
@@ -3358,6 +3358,9 @@ class CuTileBf16Runner(MoERunner):
 
     def _workspace_kwargs(self, max_num_assignments: int) -> dict[str, Any]:
         return {"sorted_io": self._use_sorted_io(max_num_assignments)}
+
+    def _workspace_block_sizes(self) -> tuple[int, ...]:
+        return self._block_sizes
 
     def _validate_inputs(self, act: MoEActivationPack) -> tuple[torch.Tensor, int, int]:
         self._require_built()
@@ -3463,8 +3466,7 @@ class CuTileBf16Runner(MoERunner):
         del inputs
         return (
             "cutile_bf16_stage",
-            self._device_arch,
-            self._num_sms,
+            *self._cache_key_extras(),
             stage,
             block_size,
             int(self.config.activation.type),
@@ -3769,6 +3771,158 @@ class _CuTileFp8StageRunner(TunableRunner):
                 block_size=self.fallback[1],
             ),
         )
+
+
+class CuTileDeepSeekFp8Runner(CuTileBf16Runner):
+    """Shared routing and stage tuning for 128x128 FP32-scaled FP8 weights."""
+
+    backend_key = "cutile_deepseek_fp8"
+    supported_quant_variants = ((QuantFormat.DeepSeekFp8, QuantFormat.DeepSeekFp8),)
+    _supported_archs = (103,)
+    _activation_fp8 = True
+    _precision_name = "DeepSeek FP8"
+    _block_sizes: ClassVar[tuple[int, ...]] = (32, 64, 128)
+
+    def _build(self) -> None:
+        from .cutile import deepseek_fp8
+
+        self._kernel_module = deepseek_fp8
+
+    def _workspace_kwargs(self, max_num_assignments: int) -> dict[str, Any]:
+        return {
+            "activation_fp8": self._activation_fp8,
+            "scale_transposed": self._activation_fp8 and max_num_assignments >= 128,
+        }
+
+    def _workspace_block_sizes(self) -> tuple[int, ...]:
+        assignments = (
+            self.config.execution.tune_max_num_tokens * self.config.routing.top_k
+        )
+        max_block = self._factorized_block_sizes(assignments)[0]
+        return tuple(block for block in self._block_sizes if block <= max_block)
+
+    def _factorized_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
+        if (
+            self._activation_fp8
+            and num_assignments >= 128 * self.config.routing.num_experts
+        ):
+            return (128,)
+        if (
+            self._activation_fp8
+            and num_assignments >= 64 * self.config.routing.num_experts
+        ):
+            return (64,)
+        return (32,)
+
+    def _stage_tactics(
+        self, inputs: List[torch.Tensor], *, stage: int, block_size: int
+    ) -> List[Any]:
+        configs = [(128, 128, 1), (64, 128, 2), (128, 128, 2)]
+        if self._activation_fp8:
+            configs.insert(1, (64, 128, 1))
+        return configs
+
+    def _fallback_tactic(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[int, int, int, int, int, int, int]:
+        block = self._factorized_block_sizes(inputs[2].numel())[0]
+        gemm1 = self._stage_tactics(inputs, stage=1, block_size=block)[0]
+        gemm2 = self._stage_tactics(inputs, stage=2, block_size=block)[0]
+        return (block, *gemm1, *gemm2)
+
+    def _cache_key_extras(self) -> tuple:
+        return super()._cache_key_extras() + ("deepseek_sharded_weights_v8",)
+
+    def get_cache_key_extras(self, inputs: List[torch.Tensor]) -> tuple:
+        return super().get_cache_key_extras(inputs) + (
+            str(inputs[4].dtype),
+            str(inputs[6].dtype),
+        )
+
+    def _stage_cache_key(
+        self, inputs: List[torch.Tensor], *, stage: int, block_size: int
+    ) -> tuple[Any, ...]:
+        return super()._stage_cache_key(inputs, stage=stage, block_size=block_size) + (
+            str(inputs[4 if stage == 1 else 6].dtype),
+        )
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor], _profile: Any) -> List[Any]:
+        return self._factorized_tactics(inputs)
+
+    def pack_inputs(
+        self, act: MoEActivationPack, weights: MoEWeightPack
+    ) -> List[torch.Tensor]:
+        x, tokens, hidden = self._validate_inputs(act)
+        view = weights.get_view(self.backend_key)
+        w1 = view["w1"] if self._activation_fp8 else view.get("w1_bf16", view["w1"])
+        w2 = view["w2"] if self._activation_fp8 else view.get("w2_bf16", view["w2"])
+        inter = self.config.experts.intermediate_size
+        experts = self.config.routing.num_experts
+        n1 = inter * (2 if self.config.activation.is_gated else 1)
+        if hidden % 128 or inter % 128:
+            raise ValueError("DeepSeek FP8 dimensions must be multiples of 128.")
+        for name, n, k in (("w1", n1, hidden), ("w2", hidden, inter)):
+            if view[name].shape != (experts, n, k) or view[f"{name}_scale"].shape != (
+                experts,
+                n // 128,
+                k // 128,
+            ):
+                raise ValueError(
+                    "DeepSeek FP8 prepared weight geometry differs from the layer."
+                )
+        self._configure_tuning(tokens, hidden)
+        return [
+            x.new_empty((tokens, hidden)),
+            x,
+            act.topk_ids,
+            act.topk_weights,
+            w1,
+            view["w1_scale"],
+            w2,
+            view["w2_scale"],
+        ]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: Any = -1,
+        do_preparation: bool = False,
+        **kwargs: Any,
+    ) -> torch.Tensor:
+        if tactic == -1:
+            tactic = self._fallback_tactic(inputs)
+        block, n1, k1, occ1, n2, k2, occ2 = tactic
+        self._ensure_workspace(inputs[1].shape[0], inputs[1].shape[1])
+        return self._kernel_module.run_moe(
+            *inputs[1:],
+            inputs[0],
+            self._workspace,
+            activation=self.config.activation,
+            activation_fp8=self._activation_fp8,
+            block_size=block,
+            gemm1_config=self._kernel_module.GemmConfig(n1, k1, occ1),
+            gemm2_config=self._kernel_module.GemmConfig(n2, k2, occ2),
+        )
+
+
+class CuTileDeepSeekFp8Bf16Runner(CuTileDeepSeekFp8Runner):
+    supported_quant_variants = ((QuantFormat.DeepSeekFp8, QuantFormat.BF16),)
+    _activation_fp8 = False
+    _block_sizes = (32, 128)
+
+    def _factorized_block_sizes(self, num_assignments: int) -> tuple[int, ...]:
+        return (
+            (128,)
+            if num_assignments >= 128 * self.config.routing.num_experts
+            else (32,)
+        )
+
+    def _fallback_tactic(
+        self, inputs: List[torch.Tensor]
+    ) -> tuple[int, int, int, int, int, int, int]:
+        block = self._factorized_block_sizes(inputs[2].numel())[0]
+        occupancy = 2 if block == 128 else 1
+        return (block, 128, 128, occupancy, 128, 128, occupancy)
 
 
 class _CuTileFp8Runner(CuTileBf16Runner):

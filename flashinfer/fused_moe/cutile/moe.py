@@ -130,6 +130,7 @@ def allocate_workspace(
     allocate_activation_output: bool = True,
     allocate_gemm1_output: bool | None = None,
     gemm1_output_rows: int | None = None,
+    gemm2_output_rows: int | None = None,
     sorted_io: bool = False,
 ) -> Workspace:
     """Allocate graph-stable buffers for one exact token shape and tactic set.
@@ -152,6 +153,8 @@ def allocate_workspace(
     if allocate_gemm1_output and gemm1_output_rows < num_assignments:
         raise ValueError("gemm1_output_rows must cover every routed assignment.")
     activation_output_rows = max_em if sorted_io else num_assignments
+    if gemm2_output_rows is None:
+        gemm2_output_rows = num_assignments
     max_blocks = max(
         (_max_permuted_rows(num_assignments, num_experts, block_size) + block_size - 1)
         // block_size
@@ -192,11 +195,13 @@ def allocate_workspace(
             dtype=bf16,
             device=device,
         ),
-        gemm2_out=torch.empty(num_assignments, hidden_size, dtype=bf16, device=device),
+        gemm2_out=torch.empty(
+            gemm2_output_rows, hidden_size, dtype=bf16, device=device
+        ),
     )
 
 
-def _lane_ids(topk_ids, numel, chunk_size):
+def _lane_ids(topk_ids, numel, chunk_size, num_experts):
     chunk_id = ct.bid(0)
     offsets = ct.arange(chunk_size, dtype=ct.int32)
     assignment = chunk_id * chunk_size + offsets
@@ -206,6 +211,7 @@ def _lane_ids(topk_ids, numel, chunk_size):
         (ct.minimum(assignment, numel - 1),),
         padding_value=0,
     )
+    valid = valid & (ids >= 0) & (ids < num_experts)
     ids = ct.where(valid, ids, ct.full((chunk_size,), -1, dtype=ct.int32))
     return chunk_id, assignment, valid, ids
 
@@ -216,10 +222,13 @@ def _permute_chunk_rank(
     RANKS,
     HIST,
     numel,
+    num_experts,
     EPOW2: ConstInt,
     CHUNK_SIZE: ConstInt,
 ):
-    chunk_id, assignment, valid, ids = _lane_ids(TOPK_IDS, numel, CHUNK_SIZE)
+    chunk_id, assignment, valid, ids = _lane_ids(
+        TOPK_IDS, numel, CHUNK_SIZE, num_experts
+    )
     expert_offsets = ct.arange(EPOW2, dtype=ct.int32)
     one_hot = ct.astype(
         ct.reshape(ids, (CHUNK_SIZE, 1)) == ct.reshape(expert_offsets, (1, EPOW2)),
@@ -227,11 +236,33 @@ def _permute_chunk_rank(
     )
     inclusive = ct.cumsum(one_hot, axis=0)
     rank = ct.sum(inclusive * one_hot, axis=1) - 1
-    ct.scatter(RANKS, (assignment,), rank, mask=valid)
+    ct.scatter(RANKS, (assignment,), rank, mask=assignment < numel)
     ct.scatter(
         HIST,
         (chunk_id * EPOW2 + expert_offsets,),
         ct.sum(one_hot, axis=0),
+    )
+
+
+@ct.kernel
+def _permute_scan_experts(
+    HIST,
+    BASE,
+    TOTALS,
+    num_chunks,
+    EPOW2: ConstInt,
+    NCP: ConstInt,
+):
+    expert = ct.bid(0)
+    rows = ct.arange(NCP, dtype=ct.int32)
+    indices = rows * EPOW2 + expert
+    counts = ct.gather(HIST, (indices,), mask=rows < num_chunks, padding_value=0)
+    inclusive = ct.cumsum(counts, axis=0)
+    ct.scatter(BASE, (indices,), inclusive - counts, mask=rows < num_chunks)
+    ct.scatter(
+        TOTALS,
+        (ct.full((1,), expert, dtype=ct.int32),),
+        ct.reshape(ct.sum(counts), (1,)),
     )
 
 
@@ -371,46 +402,42 @@ def _permute_scatter(
     TOPK_IDS,
     RANKS,
     BASE,
+    PAD_OFFSETS,
     SORTED_SLOTS,
+    BLOCK_EXPERT,
     numel,
+    num_experts,
     EPOW2: ConstInt,
     CHUNK_SIZE: ConstInt,
+    BLOCK_SIZE: ConstInt,
+    INVERSE_RANKS: ConstBool,
+    ADD_EXPERT_OFFSET: ConstBool,
 ):
-    chunk_id, assignment, valid, ids = _lane_ids(TOPK_IDS, numel, CHUNK_SIZE)
-    rank = ct.gather(RANKS, (ct.minimum(assignment, numel - 1),), padding_value=0)
+    chunk_id, assignment, valid, ids = _lane_ids(
+        TOPK_IDS, numel, CHUNK_SIZE, num_experts
+    )
+    rank = ct.gather(RANKS, (assignment,), padding_value=0)
     base = ct.gather(
         BASE,
         (chunk_id * EPOW2 + ct.maximum(ids, 0),),
         padding_value=0,
     )
-    ct.scatter(SORTED_SLOTS, (base + rank,), assignment, mask=valid)
-
-
-@ct.kernel
-def _permute_block_expert(
-    PAD_OFFSETS,
-    BLOCK_EXPERT,
-    BLOCK_SIZE: ConstInt,
-):
-    expert = ct.bid(0)
-    start = ct.gather(
-        PAD_OFFSETS,
-        ct.full((1,), expert, dtype=ct.int32),
-        padding_value=0,
-    )
-    end = ct.gather(
-        PAD_OFFSETS,
-        ct.full((1,), expert + 1, dtype=ct.int32),
-        padding_value=0,
-    )
-    first_block = (start // BLOCK_SIZE).item()
-    num_blocks = ((end - start) // BLOCK_SIZE).item()
-    for index in range(num_blocks):
-        ct.scatter(
-            BLOCK_EXPERT,
-            ct.full((1,), first_block + index, dtype=ct.int32),
-            ct.full((1,), expert, dtype=ct.int32),
+    position = base + rank
+    if ADD_EXPERT_OFFSET:
+        position = position + ct.gather(
+            PAD_OFFSETS, (ct.maximum(ids, 0),), padding_value=0
         )
+    if INVERSE_RANKS:
+        ct.scatter(
+            RANKS, (assignment,), ct.where(valid, position, -1), mask=assignment < numel
+        )
+    ct.scatter(SORTED_SLOTS, (position,), assignment, mask=valid)
+    ct.scatter(
+        BLOCK_EXPERT,
+        (position // BLOCK_SIZE,),
+        ids,
+        mask=valid & (position % BLOCK_SIZE == 0),
+    )
 
 
 @ct.kernel
@@ -419,6 +446,7 @@ def _permute_small(
     SORTED_SLOTS,
     BLOCK_EXPERT,
     NUM_POST_PAD,
+    RANKS,
     numel,
     em,
     num_blocks,
@@ -427,10 +455,12 @@ def _permute_small(
     CHUNK_SIZE: ConstInt,
     NBPOW2: ConstInt,
     BLOCK_SIZE: ConstInt,
+    INVERSE_RANKS: ConstBool,
 ):
     offsets = ct.arange(CHUNK_SIZE, dtype=ct.int32)
     valid = offsets < numel
     ids = ct.gather(TOPK_IDS, (ct.minimum(offsets, numel - 1),), padding_value=0)
+    valid = valid & (ids >= 0) & (ids < E)
     ids = ct.where(valid, ids, ct.full((CHUNK_SIZE,), -1, dtype=ct.int32))
     same = ct.astype(
         ct.reshape(ids, (CHUNK_SIZE, 1)) == ct.reshape(ids, (1, CHUNK_SIZE)),
@@ -470,6 +500,13 @@ def _permute_small(
             mask=slot_offsets < em,
         )
     ct.scatter(SORTED_SLOTS, (position_base + rank,), offsets, mask=valid)
+    if INVERSE_RANKS:
+        ct.scatter(
+            RANKS,
+            (offsets,),
+            ct.where(valid, position_base + rank, -1),
+            mask=offsets < numel,
+        )
     block_offsets = ct.arange(NBPOW2, dtype=ct.int32)
     ct.scatter(
         BLOCK_EXPERT,
@@ -692,10 +729,12 @@ def _combine_impl(
     Y,
     ROUTING_WEIGHTS,
     OUT,
+    IDS,
     top_k,
     H: ConstInt,
     TILE_H: ConstInt,
     USE_INT64: ConstBool,
+    SORTED_ROWS: ConstBool = False,
 ):
     token_i32 = ct.bid(0)
     h_tile = ct.bid(1)
@@ -708,6 +747,17 @@ def _combine_impl(
         h_offsets = ct.astype(h_offsets_i32, ct.int64)
     accumulator = ct.zeros((TILE_H,), dtype=ct.float32)
     for expert_slot in range(top_k):
+        slot = token_i32 * top_k + expert_slot
+        row = token * top_k + expert_slot
+        if SORTED_ROWS:
+            row = ct.gather(
+                IDS, (ct.full((1,), slot, ct.int32),), padding_value=-1
+            ).item()
+            is_local = row >= 0
+            if USE_INT64:
+                row = ct.astype(row, ct.int64)
+        else:
+            is_local = True
         weight = ct.gather(
             ROUTING_WEIGHTS,
             (ct.full((1,), token_i32 * top_k + expert_slot, dtype=ct.int32),),
@@ -715,10 +765,18 @@ def _combine_impl(
         ).item()
         values = ct.gather(
             Y,
-            ((token * top_k + expert_slot) * H + ct.minimum(h_offsets, H - 1),),
+            (
+                ct.where(
+                    is_local,
+                    row * H + ct.minimum(h_offsets, H - 1),
+                    Y.shape[0],
+                ),
+            ),
             padding_value=0,
         )
-        accumulator = accumulator + ct.astype(values, ct.float32) * weight
+        accumulator = accumulator + ct.astype(values, ct.float32) * ct.where(
+            is_local, weight, 0.0
+        )
     ct.scatter(
         OUT,
         (token * H + h_offsets,),
@@ -736,7 +794,7 @@ def _combine(
     H: ConstInt,
     TILE_H: ConstInt,
 ):
-    _combine_impl(Y, ROUTING_WEIGHTS, OUT, top_k, H, TILE_H, False)
+    _combine_impl(Y, ROUTING_WEIGHTS, OUT, ROUTING_WEIGHTS, top_k, H, TILE_H, False)
 
 
 @ct.kernel
@@ -748,7 +806,7 @@ def _combine_i64(
     H: ConstInt,
     TILE_H: ConstInt,
 ):
-    _combine_impl(Y, ROUTING_WEIGHTS, OUT, top_k, H, TILE_H, True)
+    _combine_impl(Y, ROUTING_WEIGHTS, OUT, ROUTING_WEIGHTS, top_k, H, TILE_H, True)
 
 
 def _combine_tile_h(num_tokens: int, hidden_size: int) -> int:
@@ -767,6 +825,7 @@ def _permute(
     num_experts: int,
     block_size: int,
     workspace: Workspace,
+    inverse_ranks: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     num_assignments = topk_ids.numel()
     em = _max_permuted_rows(num_assignments, num_experts, block_size)
@@ -784,6 +843,7 @@ def _permute(
                 sorted_slots,
                 block_expert,
                 workspace.num_post_pad,
+                workspace.ranks,
                 num_assignments,
                 em,
                 num_blocks,
@@ -792,6 +852,7 @@ def _permute(
                 max(8, next_positive_power_of_2(num_assignments)),
                 next_positive_power_of_2(num_blocks),
                 block_size,
+                inverse_ranks,
             ),
         )
         return sorted_slots, block_expert, workspace.num_post_pad
@@ -800,14 +861,12 @@ def _permute(
     num_chunks = max(1, (num_assignments + chunk_size - 1) // chunk_size)
     chunks_per_slab = max(1, min(ncp, _PERMUTE_TILE_CAP // epow2))
     num_slabs = ncp // chunks_per_slab
-    hist_size = (num_chunks if num_slabs <= 2 else ncp) * epow2
-    hist = workspace.hist[:hist_size]
+    hist = workspace.hist[: num_chunks * epow2]
     base = workspace.base[: ncp * epow2]
     pad_off = workspace.pad_off[: num_experts + 1]
     stream = torch.cuda.current_stream(topk_ids.device)
     sorted_slots.fill_(num_assignments)
     if num_slabs > 2:
-        hist.zero_()
         block_expert.zero_()
     ct.launch(
         stream,
@@ -818,6 +877,7 @@ def _permute(
             workspace.ranks[:num_assignments],
             hist,
             num_assignments,
+            num_experts,
             epow2,
             chunk_size,
         ),
@@ -840,6 +900,28 @@ def _permute(
                 num_slabs,
                 block_size,
                 next_positive_power_of_2(num_blocks),
+            ),
+        )
+    elif ncp <= _PERMUTE_TILE_CAP:
+        totals = workspace.slab_tot[:epow2]
+        ct.launch(
+            stream,
+            (epow2,),
+            _permute_scan_experts,
+            (hist, base, totals, num_chunks, epow2, ncp),
+        )
+        ct.launch(
+            stream,
+            (1,),
+            _permute_scan_combine,
+            (
+                totals,
+                pad_off,
+                workspace.num_post_pad,
+                num_experts,
+                epow2,
+                1,
+                block_size,
             ),
         )
     else:
@@ -878,17 +960,17 @@ def _permute(
             topk_ids.reshape(-1),
             workspace.ranks[:num_assignments],
             base,
+            pad_off,
             sorted_slots,
+            block_expert,
             num_assignments,
+            num_experts,
             epow2,
             chunk_size,
+            block_size,
+            inverse_ranks,
+            num_slabs > 2 and ncp <= _PERMUTE_TILE_CAP,
         ),
-    )
-    ct.launch(
-        stream,
-        (num_experts,),
-        _permute_block_expert,
-        (pad_off, block_expert, block_size),
     )
     return sorted_slots, block_expert, workspace.num_post_pad
 

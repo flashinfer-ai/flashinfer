@@ -28,6 +28,123 @@ def _is_large_m(total_m, Q):
     return is_large_m
 
 
+@ct.function
+def _block_scaled_matmul_acc(
+    a,
+    b,
+    a_scale,
+    b_scale,
+    expert,
+    m_tile,
+    n_tile,
+    k_tiles,
+    BLOCK_M: ct.Constant[int],
+    BLOCK_N: ct.Constant[int],
+    BLOCK_K: ct.Constant[int],
+    HAS_A_SCALE: ct.Constant[bool],
+    SWAP_AB: ct.Constant[bool],
+    BF16_ACTIVATION: ct.Constant[bool],
+    COMBINE_SCALES: ct.Constant[bool],
+    LOAD_LATENCY: ct.Constant[int] = 3,
+    SCALE_LATENCY: ct.Constant[int] = 4,
+):
+    """Accumulate a contiguous tile with FP32 scales per K block."""
+    acc = ct.zeros((BLOCK_M, BLOCK_N), dtype=ct.float32)
+    for k in range(k_tiles):
+        lhs = ct.load(
+            a,
+            (m_tile, k),
+            (BLOCK_M, BLOCK_K),
+            padding_mode=ct.PaddingMode.ZERO,
+            latency=LOAD_LATENCY,
+        )
+        rhs = ct.reshape(
+            ct.load(
+                b,
+                (expert, n_tile, k),
+                (1, BLOCK_N, BLOCK_K),
+                padding_mode=ct.PaddingMode.ZERO,
+                latency=LOAD_LATENCY,
+            ),
+            (BLOCK_N, BLOCK_K),
+        )
+        if BF16_ACTIVATION:
+            rhs = ct.astype(rhs, ct.bfloat16)
+        if SWAP_AB:
+            partial = ct.transpose(
+                ct.mma(rhs, ct.transpose(lhs), ct.zeros((BLOCK_N, BLOCK_M), ct.float32))
+            )
+        else:
+            partial = ct.mma(
+                lhs, ct.transpose(rhs), ct.zeros((BLOCK_M, BLOCK_N), ct.float32)
+            )
+        if HAS_A_SCALE:
+            scale_a = ct.load(
+                a_scale,
+                (m_tile, k),
+                (BLOCK_M, 1),
+                padding_mode=ct.PaddingMode.ZERO,
+                latency=SCALE_LATENCY,
+            )
+            if not COMBINE_SCALES:
+                partial = partial * scale_a
+        scale_b = ct.reshape(
+            ct.load(
+                b_scale,
+                (expert, n_tile * BLOCK_N // BLOCK_K, k),
+                (1, 1, 1),
+                padding_mode=ct.PaddingMode.ZERO,
+                latency=SCALE_LATENCY,
+            ),
+            (1, 1),
+        )
+        if COMBINE_SCALES and HAS_A_SCALE:
+            acc = acc + partial * (scale_a * scale_b)
+        else:
+            acc = acc + partial * scale_b
+    return acc
+
+
+@ct.function
+def _block_scaled_matmul_tile(
+    a,
+    b,
+    a_scale,
+    b_scale,
+    c,
+    expert,
+    m_tile,
+    n_tile,
+    k_tiles,
+    BLOCK_M: ct.Constant[int],
+    BLOCK_N: ct.Constant[int],
+    BLOCK_K: ct.Constant[int],
+    HAS_A_SCALE: ct.Constant[bool],
+    SWAP_AB: ct.Constant[bool],
+    BF16_ACTIVATION: ct.Constant[bool],
+    COMBINE_SCALES: ct.Constant[bool],
+):
+    """Compute and store a contiguous block-scaled output tile."""
+    acc = _block_scaled_matmul_acc(
+        a,
+        b,
+        a_scale,
+        b_scale,
+        expert,
+        m_tile,
+        n_tile,
+        k_tiles,
+        BLOCK_M,
+        BLOCK_N,
+        BLOCK_K,
+        HAS_A_SCALE,
+        SWAP_AB,
+        BF16_ACTIVATION,
+        COMBINE_SCALES,
+    )
+    ct.store(c, (m_tile, n_tile), ct.astype(acc, c.dtype))
+
+
 @ct.kernel
 def _ragged_block_scaled_bmm_kernel(
     a,  # Input matrix A [total_m, K] FP8
@@ -107,88 +224,24 @@ def _ragged_block_scaled_bmm_kernel(
             # path for slice has a bug that IMAs on runtime-computed offsets.
             m_tile_start = m_start // BLOCK_M
 
-            # Initialize accumulator
-            acc = ct.full((BLOCK_M, BLOCK_N), 0.0, dtype=ct.float32)
-
-            # N tile offset (element-level) for b_scale calculation
-            n_offset = pid_n * BLOCK_N
-            offs_bsn = n_offset // BLOCK_K
-
-            # Zero accumulator for per-K MMA (reused each iteration)
-            mma_zeros = ct.full((BLOCK_M, BLOCK_N), 0.0, dtype=ct.float32)
-
-            # K-loop for matrix multiplication
-            for k in range(num_k_tiles):
-                k_offset = k * BLOCK_K
-
-                # Load A block using TMA (direct global index, no slice)
-                a_block = ct.load(
-                    a,
-                    index=(m_tile_start + pid_m, k),
-                    shape=(BLOCK_M, BLOCK_K),
-                    padding_mode=ct.PaddingMode.ZERO,
-                )
-
-                # Load B block - B is [Q, N, K], we need [BLOCK_N, BLOCK_K]
-                b_block_3d = ct.load(
-                    b,
-                    index=(pid_q, n_offset // BLOCK_N, k_offset // BLOCK_K),
-                    shape=(1, BLOCK_N, BLOCK_K),
-                    order=(0, 1, 2),
-                    padding_mode=ct.PaddingMode.ZERO,
-                )
-                # Reshape to [BLOCK_N, BLOCK_K] then transpose to get [BLOCK_K, BLOCK_N]
-                b_block_nk = ct.reshape(b_block_3d, (BLOCK_N, BLOCK_K))
-                b_block = ct.permute(b_block_nk, (1, 0))  # [BLOCK_K, BLOCK_N]
-
-                # Matrix multiplication: A [BLOCK_M, BLOCK_K] @ B [BLOCK_K, BLOCK_N] = C [BLOCK_M, BLOCK_N]
-                c_mma = ct.mma(a_block, b_block, acc=mma_zeros)
-
-                # Load and apply scales
-                if HAS_A_SCALE == 1:
-                    # Load a_scale for this block using TMA (direct global index)
-                    a_scale_block = ct.load(
-                        a_scale,
-                        index=(m_tile_start + pid_m, k),
-                        shape=(BLOCK_M, 1),
-                        padding_mode=ct.PaddingMode.ZERO,
-                    )
-
-                    # Load b_scale - scalar at [pid_q, offs_bsn, k]
-                    b_scale_block = ct.load(
-                        b_scale,
-                        index=(pid_q, offs_bsn, k),
-                        shape=(1, 1, 1),
-                        order=(0, 1, 2),
-                        padding_mode=ct.PaddingMode.ZERO,
-                    )
-                    b_scale_val = ct.reshape(b_scale_block, (1, 1))
-
-                    # Combined scale: a_scale [BLOCK_M, 1] * b_scale [1, 1] = [BLOCK_M, 1]
-                    scale_combined = a_scale_block * ct.broadcast_to(
-                        b_scale_val, (BLOCK_M, 1)
-                    )
-                    scale_ab = ct.broadcast_to(scale_combined, (BLOCK_M, BLOCK_N))
-                else:
-                    # Only b_scale
-                    b_scale_block = ct.load(
-                        b_scale,
-                        index=(pid_q, offs_bsn, k),
-                        shape=(1, 1, 1),
-                        order=(0, 1, 2),
-                        padding_mode=ct.PaddingMode.ZERO,
-                    )
-                    b_scale_val = ct.reshape(b_scale_block, (1, 1))
-                    scale_ab = ct.broadcast_to(b_scale_val, (BLOCK_M, BLOCK_N))
-
-                # Apply scale and accumulate
-                acc = acc + c_mma * scale_ab
-
-            # Convert to output dtype
-            c_block = ct.astype(acc, c.dtype)
-
-            # Store to output C using TMA (direct global index, no slice)
-            ct.store(c, index=(m_tile_start + pid_m, pid_n), tile=c_block)
+            _block_scaled_matmul_tile(
+                a,
+                b,
+                a_scale,
+                b_scale,
+                c,
+                pid_q,
+                m_tile_start + pid_m,
+                pid_n,
+                ct.astype(num_k_tiles, ct.int32),
+                BLOCK_M,
+                BLOCK_N,
+                BLOCK_K,
+                HAS_A_SCALE == 1,
+                False,
+                False,
+                True,
+            )
 
             tile_idx += num_programs
         last_problem_end += num_tiles_q

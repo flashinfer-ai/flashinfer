@@ -34,6 +34,7 @@ from .indexing import needs_int64_indexing
 
 ConstFloat: TypeAlias = ct.Constant[float]
 ConstInt: TypeAlias = ct.Constant[int]
+ConstBool: TypeAlias = ct.Constant[bool]
 
 _SWIGLU = int(ActivationType.Swiglu)
 _SWIGLU_STEP = int(ActivationType.SwigluStep)
@@ -174,6 +175,13 @@ def _validate_activation(activation: ActivationConfig) -> ActivationConfig:
 
 
 @ct.function
+def _row_tile_is_live(VALID_ROWS, HAS_LIMIT: ConstBool, ROWS_PER_TILE: ConstInt):
+    if HAS_LIMIT:
+        return ct.bid(0) * ROWS_PER_TILE < ct.load(VALID_ROWS, (0,), (1,)).item()
+    return True
+
+
+@ct.function
 def _gated_activation_impl(
     X,
     OUT,
@@ -217,10 +225,13 @@ def _gated_activation(
     I: ConstInt,
     TILE_I: ConstInt,
     NUM_TILES: ConstInt,
+    VALID_ROWS,
+    HAS_LIMIT: ConstBool,
 ):
-    _gated_activation_impl(
-        X, OUT, activation_type, param1, param2, param3, I, TILE_I, NUM_TILES
-    )
+    if _row_tile_is_live(VALID_ROWS, HAS_LIMIT, 1):
+        _gated_activation_impl(
+            X, OUT, activation_type, param1, param2, param3, I, TILE_I, NUM_TILES
+        )
 
 
 @ct.kernel
@@ -234,10 +245,13 @@ def _gated_activation_i64(
     I: ConstInt,
     TILE_I: ConstInt,
     NUM_TILES: ConstInt,
+    VALID_ROWS,
+    HAS_LIMIT: ConstBool,
 ):
-    _gated_activation_impl(
-        X, OUT, activation_type, param1, param2, param3, I, TILE_I, NUM_TILES
-    )
+    if _row_tile_is_live(VALID_ROWS, HAS_LIMIT, 1):
+        _gated_activation_impl(
+            X, OUT, activation_type, param1, param2, param3, I, TILE_I, NUM_TILES
+        )
 
 
 @ct.function
@@ -280,10 +294,13 @@ def _ungated_activation(
     I: ConstInt,
     TILE_I: ConstInt,
     NUM_TILES: ConstInt,
+    VALID_ROWS,
+    HAS_LIMIT: ConstBool,
 ):
-    _ungated_activation_impl(
-        X, OUT, activation_type, param1, param2, param3, I, TILE_I, NUM_TILES
-    )
+    if _row_tile_is_live(VALID_ROWS, HAS_LIMIT, 1):
+        _ungated_activation_impl(
+            X, OUT, activation_type, param1, param2, param3, I, TILE_I, NUM_TILES
+        )
 
 
 @ct.kernel
@@ -297,16 +314,21 @@ def _ungated_activation_i64(
     I: ConstInt,
     TILE_I: ConstInt,
     NUM_TILES: ConstInt,
+    VALID_ROWS,
+    HAS_LIMIT: ConstBool,
 ):
-    _ungated_activation_impl(
-        X, OUT, activation_type, param1, param2, param3, I, TILE_I, NUM_TILES
-    )
+    if _row_tile_is_live(VALID_ROWS, HAS_LIMIT, 1):
+        _ungated_activation_impl(
+            X, OUT, activation_type, param1, param2, param3, I, TILE_I, NUM_TILES
+        )
 
 
 def launch_activation(
     x: torch.Tensor,
     output: torch.Tensor,
     activation: ActivationConfig,
+    *,
+    valid_rows: torch.Tensor | None = None,
 ) -> None:
     """Launch a gated or plain MoE activation into caller-owned storage."""
     activation = _validate_activation(activation)
@@ -341,6 +363,8 @@ def launch_activation(
             intermediate_size,
             tile_i,
             num_tiles,
+            output if valid_rows is None else valid_rows,
+            valid_rows is not None,
         ),
     )
 

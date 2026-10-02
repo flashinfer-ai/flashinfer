@@ -76,6 +76,9 @@ output_column_dict = {
         "cold_l2_cache",
         "prequantized_median_time",
         "prequantized_std_time",
+        "comparison_kind",
+        "cache_bf16_weights",
+        "weight_cache_bytes",
         # CUTLASS fused MoE specific
         "cutlass_variant",
         "quantized_input",
