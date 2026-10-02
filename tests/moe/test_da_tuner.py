@@ -440,7 +440,7 @@ def test_full_op_measurement_pair_does_not_publish_partial_results():
 def test_singleton_guard_requires_each_matched_exemplar(
     candidate_times, baseline_times, margin, admitted
 ):
-    compiler = DAPlanCompiler(num_experts=4, margin=margin)
+    compiler = DAPlanCompiler(num_experts=4, margin=margin, guard_enabled=True)
     tactic = FactorizedTactic((16, 4), tile_n=16, fc1=0, fc2=0)
     selections = tuple(
         replace(
@@ -471,7 +471,9 @@ def test_singleton_guard_requires_each_matched_exemplar(
 
 
 def test_singleton_pruning_preserves_preferred_distribution_eager_winner():
-    compiler = DAPlanCompiler(num_experts=4, control_overhead_us=12.0)
+    compiler = DAPlanCompiler(
+        num_experts=4, control_overhead_us=12.0, guard_enabled=True
+    )
     uniform_tactic = FactorizedTactic((16, 4), tile_n=16, fc1=0, fc2=0)
     preferred_tactic = FactorizedTactic((32, 11), tile_n=32, fc1=1, fc2=1)
     original = (
@@ -518,19 +520,44 @@ def test_singleton_collapses_equivalent_selector_exemplars():
     assert compiled.exemplar_body_indices == (0,)
 
 
-def test_switch_rejects_equivalent_selector_exemplars():
-    compiler = DAPlanCompiler(num_experts=4, guard_enabled=False)
+@pytest.mark.parametrize("guard_enabled", [False, True])
+def test_switch_falls_back_for_conflicting_equivalent_selector_exemplars(guard_enabled):
+    compiler = DAPlanCompiler(num_experts=4, guard_enabled=guard_enabled)
     first_tactic = FactorizedTactic((16, 4), tile_n=16, fc1=0, fc2=0)
     second_tactic = FactorizedTactic((32, 7), tile_n=32, fc1=1, fc2=1)
 
-    with pytest.raises(ValueError, match="selector exemplars must remain unique"):
-        compiler.compile(
-            (
-                _selection("uniform", [[0, 0], [1, 1]], first_tactic),
-                _selection("ddist:4", [[2, 2], [3, 3]], second_tactic),
-            ),
-            baseline_tactic=(64, 0),
-        )
+    compiled = compiler.compile(
+        (
+            _selection("uniform", [[0, 0], [1, 1]], first_tactic),
+            _selection("ddist:4", [[2, 2], [3, 3]], second_tactic),
+        ),
+        baseline_tactic=(64, 0),
+    )
+    assert compiled.candidate_policy is DAPlanMode.DA_SWITCH
+    assert compiled.policy is DAPlanMode.DA_FALLBACK
+    assert compiled.baseline_tactic == (64, 0)
+    assert (
+        compiled.guard_reason == "equivalent selector spectra choose different bodies"
+    )
+    assert len(compiled.selections) == 1
+
+
+def test_switch_collapses_equivalent_exemplars_with_the_same_body():
+    compiler = DAPlanCompiler(num_experts=4, guard_enabled=False)
+    first = FactorizedTactic((16, 4), tile_n=16, fc1=0, fc2=0)
+    second = FactorizedTactic((32, 7), tile_n=32, fc1=1, fc2=1)
+    compiled = compiler.compile(
+        (
+            _selection("uniform", [[0, 0], [1, 1]], first),
+            _selection("ddist:2", [[2, 2], [3, 3]], first),
+            _selection("ddist:4", [[0, 0], [0, 1]], second),
+        ),
+        baseline_tactic=(64, 0),
+    )
+    assert compiled.policy is DAPlanMode.DA_SWITCH
+    assert compiled.bodies == (first, second)
+    assert compiled.exemplar_body_indices == (0, 1)
+    assert len(compiled.selections) == 2
 
 
 def test_nonlocal_assignment_changes_do_not_change_local_spectrum():

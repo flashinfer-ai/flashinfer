@@ -651,7 +651,7 @@ class DAPlanCompiler:
         num_experts: int,
         local_expert_offset: int = 0,
         num_local_experts: int | None = None,
-        guard_enabled: bool = True,
+        guard_enabled: bool = False,
         margin: float = 0.0,
         control_overhead_us: float = 12.0,
     ) -> None:
@@ -699,9 +699,8 @@ class DAPlanCompiler:
         if baseline_tactic is None:
             raise ValueError("A DA plan requires an ordinary baseline tactic")
 
-        # Deduplicate exact complete tactics before requiring selector identity. A singleton plan
-        # never runs the selector, so equivalent spectra can safely share one uploaded row. A
-        # multi-body plan must keep every selector spectrum distinct to avoid ambiguous dispatch.
+        # Equivalent spectra can share one selector row when they select the same body.
+        # Conflicting body choices cannot be distinguished by the runtime selector.
         bodies: list[FactorizedTactic] = []
         body_indices: list[int] = []
         for selection in selections:
@@ -718,17 +717,21 @@ class DAPlanCompiler:
         )
         published_selections: list[DAProfileSelection] = []
         published_body_indices: list[int] = []
-        exemplar_fingerprints: set[bytes] = set()
+        exemplar_bodies: dict[bytes, int] = {}
+        ambiguous_selector = False
         for selection, body_index in zip(selections, body_indices, strict=True):
             fingerprint = self._selector_spectrum_fingerprint(selection)
-            if fingerprint in exemplar_fingerprints:
-                if candidate_policy is DAPlanMode.DA_SWITCH:
-                    raise ValueError("DA selector exemplars must remain unique")
+            if fingerprint in exemplar_bodies:
+                ambiguous_selector |= exemplar_bodies[fingerprint] != body_index
                 continue
-            exemplar_fingerprints.add(fingerprint)
+            exemplar_bodies[fingerprint] = body_index
             published_selections.append(selection)
             published_body_indices.append(body_index)
-        admitted, reason = self._guard_admits(candidate_policy, selections)
+        admitted, reason = (
+            (False, "equivalent selector spectra choose different bodies")
+            if ambiguous_selector
+            else self._guard_admits(candidate_policy, selections)
+        )
         policy = candidate_policy if admitted else DAPlanMode.DA_FALLBACK
         eager_tactic, eager_distribution = self._select_eager_tactic(
             selections if eager_selections is None else eager_selections

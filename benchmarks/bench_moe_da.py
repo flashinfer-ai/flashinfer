@@ -1,5 +1,27 @@
 #!/usr/bin/env python3
-"""Benchmark matched ordinary and distribution-aware MoE graphs by backend."""
+"""Compare weighted MoE layer-distribution mixtures using matched NoDA/DA graphs.
+
+DA need not win every layer: the target is lower total MoE time across a
+representative mix of layer distributions. Report sum(weight * NoDA latency) /
+sum(weight * DA latency), never an average of per-distribution speedups. These
+synthetic single-rank measurements exclude communication and other model work.
+
+DA and its per-exemplar baseline guard are experimental and off by default.
+This benchmark explicitly compares DA off/on and honors FLASHINFER_DA_BASELINE_GUARD.
+Repeat --mixture to compare layer-frequency mixtures, for example
+--mixture 'ddist:1.1=20,ddist:2=30,ddist:4=50'. Weights are normalized and do not
+change the --distributions tuning catalog, which must contain every component.
+Use --skip-autotune with the same --cache for independent replay. --json-out
+retains component timings and capture/selection evidence; --mixture-out records
+weighted absolute latencies and speedups; --table-out saves dtype/token tables.
+
+Use the routed expert's actual activation, including clamp and offset parameters:
+DSV4-Pro uses --activation swiglu --swiglu-alpha 1 --swiglu-beta 0 --swiglu-limit 10;
+MiniMax-M3 uses --activation swiglu --swiglu-alpha 1.702 --swiglu-beta 1 --swiglu-limit 7;
+Nemotron 3 Ultra uses --activation relu2. These are synthetic routed-body comparisons,
+not checkpoint or full-model benchmarks. Expert parallelism is num_experts/local_num_experts;
+communication, shared experts, and latent projections are outside the measured region.
+"""
 
 from __future__ import annotations
 
@@ -7,10 +29,10 @@ import argparse
 import contextlib
 import csv
 import gc
+import hashlib
 import json
 import math
 import os
-import sys
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
@@ -21,9 +43,12 @@ import torch
 
 from flashinfer import reorder_rows_for_gated_act_gemm, shuffle_matrix_a
 from flashinfer.autotuner import autotune
+from flashinfer.fused_moe.da_config import DaMoeConfig
 from flashinfer.fused_moe import (
     QuantConfig,
     QuantFormat,
+    ReLU2,
+    SwiGLU,
     TrtllmBf16Config,
     TrtllmFp4Config,
     TrtllmFp8BlockConfig,
@@ -54,6 +79,7 @@ from flashinfer.fused_moe.backends.prims_ts.fp8_op import (
     prims_ts_fp8_per_tensor_scale_moe,
 )
 from flashinfer.tllm_enums import (
+    ActivationType,
     DtypeTrtllmGen,
     Fp8QuantizationType,
     RoutingMethodType,
@@ -84,6 +110,176 @@ PRECISION_ALIASES = {
 
 
 @dataclass(frozen=True)
+class DistributionMixture:
+    """Relative layer frequencies, normalized independently of tuning profiles."""
+
+    weights: tuple[tuple[str, float], ...]
+
+    @property
+    def name(self) -> str:
+        return ", ".join(f"{100 * weight:g}% {name}" for name, weight in self.weights)
+
+
+def _parse_mixture(value: str) -> DistributionMixture:
+    """Parse distribution=weight pairs; accept frequencies or percentages as weights."""
+    weights = {}
+    try:
+        for item in value.split(","):
+            distribution, weight_text = item.rsplit("=", 1)
+            name = DADistribution.parse(distribution).name
+            weight = float(weight_text)
+            if name in weights:
+                raise ValueError(f"duplicate distribution {name}")
+            if not math.isfinite(weight) or weight <= 0:
+                raise ValueError("mixture weights must be positive and finite")
+            weights[name] = weight
+        total = math.fsum(weights.values())
+        if not math.isfinite(total):
+            raise ValueError("mixture total must be finite")
+    except (ValueError, OverflowError) as error:
+        raise argparse.ArgumentTypeError(
+            f"invalid mixture {value!r}: {error}; use ddist:1.1=20,ddist:2=30,ddist:4=50"
+        ) from error
+    return DistributionMixture(
+        tuple((name, weight / total) for name, weight in weights.items())
+    )
+
+
+_MIXTURE_GROUP_FIELDS = (
+    "backend",
+    "precision",
+    "num_tokens",
+    "num_experts",
+    "local_num_experts",
+    "local_expert_offset",
+    "top_k",
+    "hidden_size",
+    "intermediate_size",
+    "activation",
+    "swiglu_alpha",
+    "swiglu_beta",
+    "swiglu_limit",
+    "execution_mode",
+    "timing_protocol",
+    "routing_input_mode",
+    "baseline_guard_enabled",
+)
+
+
+def _summarize_mixtures(
+    rows: list[dict[str, object]], mixtures: tuple[DistributionMixture, ...]
+) -> list[dict[str, object]]:
+    """Divide weighted latency sums, never average individual speedup ratios."""
+    groups = {}
+    for row in rows:
+        key = tuple(row[field] for field in _MIXTURE_GROUP_FIELDS)
+        group = groups.setdefault(key, {})
+        distribution = row["distribution"]
+        if distribution in group:
+            raise ValueError(f"duplicate benchmark row for {distribution}")
+        group[distribution] = row
+    summaries = []
+    for key, group in groups.items():
+        for mixture in mixtures:
+            missing = {name for name, _ in mixture.weights} - group.keys()
+            if missing:
+                raise ValueError(f"mixture is missing distributions: {sorted(missing)}")
+            selected = [group[name] for name, _ in mixture.weights]
+            for row in selected:
+                if row["status"] != "pass" or not row["finite"]:
+                    raise ValueError("cannot summarize failed numerical checks")
+                if any(
+                    not math.isfinite(row[f]) or row[f] <= 0
+                    for f in ("noda_ms", "da_ms")
+                ):
+                    raise ValueError("mixture latencies must be positive and finite")
+            noda_ms = math.fsum(
+                weight * group[name]["noda_ms"] for name, weight in mixture.weights
+            )
+            da_ms = math.fsum(
+                weight * group[name]["da_ms"] for name, weight in mixture.weights
+            )
+            summaries.append(
+                {
+                    **dict(zip(_MIXTURE_GROUP_FIELDS, key, strict=True)),
+                    "mixture": mixture.name,
+                    "distribution_weights": dict(mixture.weights),
+                    "noda_ms": noda_ms,
+                    "da_ms": da_ms,
+                    "speedup_da_over_noda": noda_ms / da_ms,
+                    "capture_policies": sorted(
+                        {row["capture_policy"] for row in selected}
+                    ),
+                    "selected_bodies": {
+                        name: group[name]["selected_body"]
+                        for name, _ in mixture.weights
+                    },
+                    "max_abs_difference": max(
+                        row["max_abs_difference"] for row in selected
+                    ),
+                    "status": "pass",
+                }
+            )
+    return summaries
+
+
+def _mixture_tables(rows: list[dict[str, object]]) -> str:
+    """Render one dtype-by-token speedup matrix per mixture and geometry."""
+    tables = {}
+    geometry_fields = tuple(
+        f
+        for f in _MIXTURE_GROUP_FIELDS
+        if f not in ("precision", "num_tokens", "routing_input_mode")
+    )
+    for row in rows:
+        key = (
+            row["mixture"],
+            tuple(row["distribution_weights"].items()),
+            *(row[f] for f in geometry_fields),
+        )
+        tables.setdefault(key, []).append(row)
+    lines = [
+        "Speedup = weighted NoDA time / weighted DA time; >1 favors DA.",
+        "Synthetic MoE layer-frequency estimate; excludes communication and other model work.",
+        "",
+    ]
+    for (name, *_), group in tables.items():
+        first = group[0]
+        tokens = list(dict.fromkeys(row["num_tokens"] for row in group))
+        precisions = list(dict.fromkeys(row["precision"] for row in group))
+        lookup = {(row["precision"], row["num_tokens"]): row for row in group}
+        if len(lookup) != len(group):
+            raise ValueError("duplicate dtype/token cells in mixture table")
+        lines += [
+            f"### {name}",
+            "",
+            f"{first['backend']}; E={first['num_experts']}, localE={first['local_num_experts']}, "
+            f"K={first['top_k']}, H={first['hidden_size']}, I={first['intermediate_size']}; "
+            f"activation={first['activation']}; "
+            + (
+                f"alpha={first['swiglu_alpha']}, beta={first['swiglu_beta']}, "
+                f"limit={first['swiglu_limit']}; "
+                if first["activation"] == "swiglu"
+                else ""
+            )
+            + f"baseline guard={'on' if first['baseline_guard_enabled'] else 'off'}.",
+            "",
+            "| Dtype | " + " | ".join(map(str, tokens)) + " |",
+            "|---|" + "---:|" * len(tokens),
+        ]
+        for precision in precisions:
+            cells = [
+                f"{lookup[precision, token]['speedup_da_over_noda']:.4f}x"
+                if (precision, token) in lookup
+                else "-"
+                for token in tokens
+            ]
+            lines.append(f"| {precision} | " + " | ".join(cells) + " |")
+        lines.append("")
+    return "\n".join(lines)
+
+
+@dataclass(frozen=True)
 class BenchmarkShape:
     """Static model geometry shared by matched NoDA and DA runs."""
 
@@ -107,6 +303,11 @@ class BenchmarkShape:
     topk_group: int
     # Largest token bucket admitted during tuning.
     tune_max_num_tokens: int
+    # SwiGLU uses two FC1 projections; ReLU2 uses one non-gated projection.
+    activation: str = "swiglu"
+    swiglu_alpha: float = SwiGLU().alpha
+    swiglu_beta: float = SwiGLU().beta
+    swiglu_limit: float = SwiGLU().limit
 
 
 @dataclass
@@ -179,7 +380,7 @@ def _canonical_inputs(shape: BenchmarkShape) -> tuple[torch.Tensor, ...]:
     w1 = (
         torch.randn(
             shape.local_num_experts,
-            2 * shape.intermediate_size,
+            (2 if shape.activation == "swiglu" else 1) * shape.intermediate_size,
             shape.hidden_size,
             device=device,
         )
@@ -224,6 +425,21 @@ def _prepare_precision(
             "FromLogits benchmarking currently targets NVFP4 and FP8 per-tensor"
         )
     # All precision families share one deterministic logical problem and stable output tensor.
+    activation = (
+        SwiGLU(shape.swiglu_alpha, shape.swiglu_beta, shape.swiglu_limit)
+        if shape.activation == "swiglu"
+        else ReLU2()
+    )
+    if (
+        name == "fp8_per_tensor"
+        and isinstance(activation, SwiGLU)
+        and activation != SwiGLU()
+    ):
+        raise ValueError(
+            "FP8 per-tensor benchmarking does not support custom SwiGLU parameters"
+        )
+    if name == "mxint4" and not isinstance(activation, SwiGLU):
+        raise ValueError("MXINT4 benchmarking requires SwiGLU")
     hidden, w1, w2, ids, routing_weights = _canonical_inputs(shape)
     output = torch.empty(
         shape.num_tokens,
@@ -243,7 +459,30 @@ def _prepare_precision(
         routing_method_type=RoutingMethodType.Renormalize.value,
         output=output,
         tune_max_num_tokens=shape.tune_max_num_tokens,
+        activation_type=(
+            ActivationType.Swiglu.value
+            if shape.activation == "swiglu"
+            else ActivationType.Relu2.value
+        ),
     )
+    if isinstance(activation, SwiGLU) and activation != SwiGLU():
+        # Scalar model semantics become graph-stable per-expert ABI tensors.
+        # FP4 preparation uses unit output scales, so no parameter rescaling is needed.
+        common.update(
+            {
+                name: torch.full(
+                    (shape.local_num_experts,),
+                    value,
+                    device=hidden.device,
+                    dtype=torch.float32,
+                )
+                for name, value in (
+                    ("gemm1_alpha", activation.alpha),
+                    ("gemm1_beta", activation.beta),
+                    ("gemm1_clamp_limit", activation.limit),
+                )
+            }
+        )
     # Quantize once outside timing, then bind a closure to the exact user-facing dtype ABI.
     if name in ("nvfp4", "mxfp4", "w4a16"):
         variant = {
@@ -265,8 +504,14 @@ def _prepare_precision(
             num_local_experts=shape.local_num_experts,
             hidden_size=shape.hidden_size,
             intermediate_size=shape.intermediate_size,
+            activation=activation,
             device=hidden.device,
         )
+        common.setdefault(
+            "gemm1_alpha", None if backend == "prims_ts" else view.get("gemm1_alpha")
+        )
+        common.setdefault("gemm1_beta", None)
+        common.setdefault("gemm1_clamp_limit", None)
 
         routing_logits = (
             torch.empty(
@@ -288,11 +533,6 @@ def _prepare_precision(
                 gemm1_weights=view["gemm1_weights"],
                 gemm1_weights_scale=view["gemm1_weights_scale"],
                 gemm1_bias=None,
-                gemm1_alpha=(
-                    None if backend == "prims_ts" else view.get("gemm1_alpha")
-                ),
-                gemm1_beta=None,
-                gemm1_clamp_limit=None,
                 gemm2_weights=view["gemm2_weights"],
                 gemm2_weights_scale=view["gemm2_weights_scale"],
                 gemm2_bias=None,
@@ -338,7 +578,11 @@ def _prepare_precision(
             gemm1_weights = torch.stack(
                 [
                     shuffle_matrix_a(
-                        reorder_rows_for_gated_act_gemm(weight).view(torch.uint8),
+                        (
+                            reorder_rows_for_gated_act_gemm(weight)
+                            if shape.activation == "swiglu"
+                            else weight
+                        ).view(torch.uint8),
                         128,
                     ).view(torch.bfloat16)
                     for weight in w1
@@ -361,6 +605,7 @@ def _prepare_precision(
                 num_local_experts=shape.local_num_experts,
                 hidden_size=shape.hidden_size,
                 intermediate_size=shape.intermediate_size,
+                activation=activation,
                 device=hidden.device,
             )
 
@@ -394,6 +639,7 @@ def _prepare_precision(
             num_local_experts=shape.local_num_experts,
             hidden_size=shape.hidden_size,
             intermediate_size=shape.intermediate_size,
+            activation=activation,
             device=hidden.device,
         )
 
@@ -458,6 +704,7 @@ def _prepare_precision(
             num_local_experts=shape.local_num_experts,
             hidden_size=shape.hidden_size,
             intermediate_size=shape.intermediate_size,
+            activation=activation,
             device=hidden.device,
         )
         fp8_type = (
@@ -510,12 +757,16 @@ def _prepare_precision(
             return result[0] if isinstance(result, list) else result
 
     elif name == "mxint4":
+        common.pop("activation_type")  # This ABI supports only SwiGLU.
+        for parameter in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit"):
+            common.setdefault(parameter, None)
         view = TrtllmMxInt4Config.prepare_weights(
             w1,
             w2,
             num_local_experts=shape.local_num_experts,
             hidden_size=shape.hidden_size,
             intermediate_size=shape.intermediate_size,
+            activation=activation,
             device=hidden.device,
         )
 
@@ -526,9 +777,6 @@ def _prepare_precision(
                 hidden_states=hidden,
                 gemm1_weights=view["gemm1_weights"],
                 gemm1_weights_scale=view["gemm1_weights_scale"],
-                gemm1_alpha=None,
-                gemm1_beta=None,
-                gemm1_clamp_limit=None,
                 gemm2_weights=view["gemm2_weights"],
                 gemm2_weights_scale=view["gemm2_weights_scale"],
                 **common,
@@ -558,31 +806,64 @@ def _realization(
     """Generate one deterministic global-expert routing realization."""
     # Normalize the distribution spelling before constructing persistent realization identity.
     parsed = DADistribution.parse(distribution)
-    realized = factory.get_or_create(
-        RoutingRealizationKey(
-            device=torch.device("cuda"),
-            num_tokens=shape.num_tokens,
-            distribution=parsed.name,
-            sample_index=0,
-            local_expert_offset=shape.local_expert_offset,
-            num_experts=shape.num_experts,
-            num_local_experts=shape.local_num_experts,
-            top_k=shape.top_k,
-            routing_rule_fingerprint="benchmark:renormalize",
-            routed_scaling_factor=1.0,
+    # Tuning consumes random numbers; isolate replay routes so fresh and cache-only
+    # processes stage identical inputs without changing the tuner's RNG stream.
+    with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
+        torch.cuda.manual_seed(20260810)
+        realized = factory.get_or_create(
+            RoutingRealizationKey(
+                device=torch.device("cuda"),
+                num_tokens=shape.num_tokens,
+                distribution=parsed.name,
+                sample_index=0,
+                local_expert_offset=shape.local_expert_offset,
+                num_experts=shape.num_experts,
+                num_local_experts=shape.local_num_experts,
+                top_k=shape.top_k,
+                routing_rule_fingerprint="benchmark:renormalize",
+                routed_scaling_factor=1.0,
+            )
         )
-    )
     # Return the canonical mutable pair staged into both matched public graphs.
     return realized.expert_ids, realized.routing_weights
 
 
-def _capture(invoke: Callable[[], torch.Tensor]) -> torch.cuda.CUDAGraph:
+class _TimedGraph(torch.cuda.CUDAGraph):
+    def __init__(self):
+        super().__init__()
+        # External events become replayed graph nodes. Host scheduling delays
+        # around graph.replay() must not enter the measured GPU interval.
+        self.start = torch.cuda.Event(enable_timing=True, external=True)
+        self.end = torch.cuda.Event(enable_timing=True, external=True)
+
+
+def _check_output(actual: torch.Tensor, expected: torch.Tensor) -> float:
+    """Reject nonfinite, localized, and norm-relative errors before reporting time."""
+    if not bool(torch.isfinite(actual).all() & torch.isfinite(expected).all()):
+        raise AssertionError("benchmark outputs must be finite")
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+    difference = torch.linalg.vector_norm(actual.float() - expected.float()).item()
+    reference = torch.linalg.vector_norm(expected.float()).item()
+    relative_l2 = (
+        difference / reference if reference else (0.0 if not difference else math.inf)
+    )
+    # Small output magnitudes can hide missing computation under absolute tolerance.
+    if relative_l2 > 3e-2:
+        raise AssertionError(
+            f"benchmark relative L2 error {relative_l2:.6g} exceeds 0.03"
+        )
+    return relative_l2
+
+
+def _capture(invoke: Callable[[], torch.Tensor]) -> _TimedGraph:
     """Capture one already-warmed public invocation into an outer CUDA graph."""
     invoke()
     torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
+    graph = _TimedGraph()
     with torch.cuda.graph(graph):
+        graph.start.record()
         invoke()
+        graph.end.record()
     return graph
 
 
@@ -599,8 +880,8 @@ def _cold_l2_buffers() -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _time_graphs_counterbalanced(
-    no_da_graph: torch.cuda.CUDAGraph,
-    da_graph: torch.cuda.CUDAGraph,
+    no_da_graph: _TimedGraph,
+    da_graph: _TimedGraph,
     flush_buffers: tuple[torch.Tensor, torch.Tensor],
     warmup: int,
     iterations: int,
@@ -621,8 +902,6 @@ def _time_graphs_counterbalanced(
     torch.cuda.synchronize()
     no_da_elapsed = 0.0
     da_elapsed = 0.0
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
     # ABBA ordering gives each graph every measurement position and eviction buffer equally often.
     for iteration in range(iterations):
         ordered_graphs = (
@@ -633,11 +912,9 @@ def _time_graphs_counterbalanced(
         for position, (label, graph) in enumerate(ordered_graphs):
             flush_buffers[(2 * iteration + position) % 2].zero_()
             torch.cuda.synchronize()
-            start.record()
             graph.replay()
-            end.record()
-            end.synchronize()
-            elapsed = start.elapsed_time(end)
+            graph.end.synchronize()
+            elapsed = graph.start.elapsed_time(graph.end)
             if label == "noda":
                 no_da_elapsed += elapsed
             else:
@@ -753,7 +1030,9 @@ def _benchmark_precision(
             prepared.invoke()
         torch.cuda.synchronize()
         no_da_autotune_ms = (time.perf_counter() - no_da_autotune_start) * 1e3
-        no_da_graph = _capture(prepared.invoke)
+        # Keep non-default token buckets active through cache lookup during capture.
+        with autotune(False, tuning_buckets=buckets):
+            no_da_graph = _capture(prepared.invoke)
 
     da_graph = None
     leases = ()
@@ -777,10 +1056,14 @@ def _benchmark_precision(
                 prepared.invoke()
             torch.cuda.synchronize()
             da_autotune_ms = (time.perf_counter() - da_autotune_start) * 1e3
-            prepared.invoke()
-            torch.cuda.synchronize()
-            da_graph = _capture(prepared.invoke)
+            with autotune(False, tuning_buckets=buckets):
+                prepared.invoke()
+                torch.cuda.synchronize()
+                da_graph = _capture(prepared.invoke)
             leases = da_moe_acquire_graph_leases(da_graph)
+            baseline_guard_enabled = (
+                DaMoeConfig.from_environment().baseline_guard_enabled
+            )
 
         # Validate capture policy and graph-lease ownership before collecting performance rows.
         captured_diagnostic = _matching_diagnostic(
@@ -825,11 +1108,15 @@ def _benchmark_precision(
                 no_da_graph.replay()
                 torch.cuda.synchronize()
             no_da_output = prepared.output.clone()
+            no_da_graph.replay()
+            _check_output(prepared.output, no_da_output)
             with torch.cuda.nvtx.range(f"DA_REPLAY_{precision}_{distribution}"):
                 da_graph.replay()
                 torch.cuda.synchronize()
             da_output = prepared.output.clone()
-            torch.testing.assert_close(da_output, no_da_output, rtol=3e-2, atol=3e-2)
+            da_graph.replay()
+            _check_output(prepared.output, da_output)
+            relative_l2 = _check_output(da_output, no_da_output)
             no_da_ms, da_ms = _time_graphs_counterbalanced(
                 no_da_graph,
                 da_graph,
@@ -838,6 +1125,8 @@ def _benchmark_precision(
                 iterations,
             )
             diagnostic = _matching_diagnostic(precision, shape, distributions, backend)
+            routing_hash = hashlib.sha256(ids.cpu().numpy().tobytes())
+            routing_hash.update(weights.view(torch.uint8).cpu().numpy().tobytes())
             topology = diagnostic.get("topology") or {}
             selected_body = diagnostic.get("selected_body")
             if diagnostic.get("policy") == "da_single_body":
@@ -849,12 +1138,25 @@ def _benchmark_precision(
                 "num_tokens": shape.num_tokens,
                 "num_experts": shape.num_experts,
                 "local_num_experts": shape.local_num_experts,
+                "local_expert_offset": shape.local_expert_offset,
                 "top_k": shape.top_k,
                 "hidden_size": shape.hidden_size,
                 "intermediate_size": shape.intermediate_size,
+                "activation": shape.activation,
+                "swiglu_alpha": shape.swiglu_alpha
+                if shape.activation == "swiglu"
+                else None,
+                "swiglu_beta": shape.swiglu_beta
+                if shape.activation == "swiglu"
+                else None,
+                "swiglu_limit": shape.swiglu_limit
+                if shape.activation == "swiglu"
+                else None,
                 "execution_mode": "graph",
-                "timing_protocol": "counterbalanced_cold_l2",
+                "timing_protocol": "counterbalanced_cold_l2_in_graph_events",
                 "routing_input_mode": routing_input_mode,
+                "baseline_guard_enabled": baseline_guard_enabled,
+                "routing_sha256": routing_hash.hexdigest(),
                 "noda_ms": no_da_ms,
                 "da_ms": da_ms,
                 "speedup_da_over_noda": no_da_ms / da_ms,
@@ -864,6 +1166,7 @@ def _benchmark_precision(
                 "max_abs_difference": float(
                     (da_output.float() - no_da_output.float()).abs().max()
                 ),
+                "relative_l2_difference": relative_l2,
                 "policy": diagnostic.get("policy"),
                 "capture_policy": capture_policy,
                 "capture_fallback_reason": capture_fallback_reason,
@@ -919,14 +1222,29 @@ def _parse_args() -> argparse.Namespace:
         "--distributions",
         type=_parse_csv,
         default=_parse_csv("uniform,ddist:1.1,ddist:1.5,ddist:2,ddist:3,ddist:4"),
+        help="Tuning and replay catalog; must contain every mixture component",
     )
-    parser.add_argument("--num-tokens", type=_parse_csv, default=("1024",))
+    parser.add_argument(
+        "--mixture",
+        action="append",
+        type=_parse_mixture,
+        help="Repeatable distribution=weight list. Defaults: 20/30/50 and 50/30/20 over ddist:1.1/2/4. Weights are normalized.",
+    )
+    parser.add_argument(
+        "--num-tokens",
+        type=_parse_csv,
+        default=_parse_csv("8,64,128,256,512,1024,4096,8192"),
+    )
     parser.add_argument("--num-experts", type=int, default=256)
     parser.add_argument("--local-num-experts", type=int, default=32)
     parser.add_argument("--local-expert-offset", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--hidden-size", type=int, default=7168)
     parser.add_argument("--intermediate-size", type=int, default=2048)
+    parser.add_argument("--activation", choices=("swiglu", "relu2"), default="swiglu")
+    parser.add_argument("--swiglu-alpha", type=float, default=SwiGLU().alpha)
+    parser.add_argument("--swiglu-beta", type=float, default=SwiGLU().beta)
+    parser.add_argument("--swiglu-limit", type=float, default=SwiGLU().limit)
     parser.add_argument("--n-group", type=int, default=8)
     parser.add_argument("--topk-group", type=int, default=4)
     parser.add_argument("--tune-max-num-tokens", type=int, default=8192)
@@ -941,21 +1259,26 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--execution-mode", choices=("graph",), default="graph")
     parser.add_argument("--cache", "--tuning-cache", "--bundle-output", dest="cache")
     parser.add_argument("--skip-autotune", "--cache-only", action="store_true")
-    parser.add_argument("--out", type=Path)
-    parser.add_argument("--json-out", type=Path)
+    parser.add_argument(
+        "--out",
+        type=Path,
+        help="Raw per-distribution CSV (stdout shows mixture tables)",
+    )
+    parser.add_argument("--json-out", type=Path, help="Raw per-distribution JSON")
+    parser.add_argument(
+        "--mixture-out", type=Path, help="Weighted latency and speedup rows as JSON"
+    )
+    parser.add_argument(
+        "--table-out", type=Path, help="Save the printed mixture tables as Markdown"
+    )
     return parser.parse_args()
 
 
-def _write_csv(path: Path | None, rows: list[dict[str, object]]) -> None:
-    """Write stable result columns to a file or standard output."""
+def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+    """Write raw per-distribution evidence separately from the mixture tables."""
     if not rows:
         return
     fieldnames = list(rows[0])
-    if path is None:
-        writer = csv.DictWriter(sys.stdout, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-        return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -983,6 +1306,34 @@ def main() -> int:
     precision_names = tuple(
         PRECISION_ALIASES.get(name, name) for name in requested_precision_names
     )
+    if len(set(precision_names)) != len(precision_names):
+        raise SystemExit(
+            "--precision must not contain duplicates or equivalent aliases"
+        )
+    mixtures = (
+        tuple(args.mixture)
+        if args.mixture
+        else (
+            _parse_mixture("ddist:1.1=20,ddist:2=30,ddist:4=50"),
+            _parse_mixture("ddist:1.1=50,ddist:2=30,ddist:4=20"),
+        )
+    )
+    try:
+        distributions = tuple(DADistribution.parse(d).name for d in args.distributions)
+        tokens = tuple(int(t) for t in args.num_tokens)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+    if len(set(distributions)) != len(distributions):
+        raise SystemExit("--distributions must not contain equivalent duplicates")
+    if len(set(tokens)) != len(tokens) or any(t <= 0 for t in tokens):
+        raise SystemExit("--num-tokens must contain distinct positive integers")
+    missing = {name for mixture in mixtures for name, _ in mixture.weights} - set(
+        distributions
+    )
+    if missing:
+        raise SystemExit(
+            f"mixture components missing from --distributions: {sorted(missing)}"
+        )
     if args.backend == "prims_ts" and "mxint4" in precision_names:
         raise SystemExit("PrimsTS does not yet provide an ordinary MXINT4 MoE body")
     if args.skip_autotune and not args.cache:
@@ -997,9 +1348,9 @@ def main() -> int:
         Path(args.cache).parent.mkdir(parents=True, exist_ok=True)
     # Execute token-major rows, releasing Python/CUDA allocator caches between precision families.
     rows: list[dict[str, object]] = []
-    for token_text in args.num_tokens:
+    for num_tokens in tokens:
         shape = BenchmarkShape(
-            num_tokens=int(token_text),
+            num_tokens=num_tokens,
             num_experts=args.num_experts,
             local_num_experts=args.local_num_experts,
             local_expert_offset=args.local_expert_offset,
@@ -1009,13 +1360,17 @@ def main() -> int:
             n_group=args.n_group,
             topk_group=args.topk_group,
             tune_max_num_tokens=args.tune_max_num_tokens,
+            activation=args.activation,
+            swiglu_alpha=args.swiglu_alpha,
+            swiglu_beta=args.swiglu_beta,
+            swiglu_limit=args.swiglu_limit,
         )
         for precision in precision_names:
             rows.extend(
                 _benchmark_precision(
                     precision,
                     shape,
-                    args.distributions,
+                    distributions,
                     args.cache,
                     not args.skip_autotune,
                     args.warmup,
@@ -1027,10 +1382,22 @@ def main() -> int:
             gc.collect()
             torch.cuda.empty_cache()
     # Persist CSV and optional JSON from the same in-memory row set to keep schemas identical.
-    _write_csv(args.out, rows)
+    if args.out:
+        _write_csv(args.out, rows)
     if args.json_out:
         args.json_out.parent.mkdir(parents=True, exist_ok=True)
         args.json_out.write_text(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+    summaries = _summarize_mixtures(rows, mixtures)
+    if args.mixture_out:
+        args.mixture_out.parent.mkdir(parents=True, exist_ok=True)
+        args.mixture_out.write_text(
+            json.dumps(summaries, indent=2, sort_keys=True) + "\n"
+        )
+    table = _mixture_tables(summaries)
+    print(table)
+    if args.table_out:
+        args.table_out.parent.mkdir(parents=True, exist_ok=True)
+        args.table_out.write_text(table + "\n")
     return 0
 
 

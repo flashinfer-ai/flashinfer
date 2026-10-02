@@ -105,7 +105,7 @@ def run_prims_ts_da(
 
     # Preserve ordinary dispatch when DA is disabled. When enabled, shared orchestration may use
     # the DA-preferred eager tactic for this token bucket but never chooses another backend.
-    config = get_enabled_da_moe_config(default_enabled=True)
+    config = get_enabled_da_moe_config()
     if config is None:
         return run_fixed_tactic(baseline_tactic)
 

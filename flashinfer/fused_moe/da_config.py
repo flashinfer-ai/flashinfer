@@ -17,9 +17,9 @@ _FALSE_VALUES = {"", "0", "false", "no", "off", "none"}
 _GUARD_PROFILE_ORDER = "abba"
 
 
-def is_da_moe_enabled(*, default: bool = False) -> bool:
-    """Return the DA switch, honoring a backend-specific default when unset."""
-    return _environment_bool("FLASHINFER_DIST_AWARE_AUTOTUNE", default)
+def is_da_moe_enabled() -> bool:
+    """Return whether experimental DA tuning and dispatch are explicitly enabled."""
+    return _environment_bool("FLASHINFER_DIST_AWARE_AUTOTUNE", False)
 
 
 def _environment_bool(name: str, default: bool) -> bool:
@@ -66,7 +66,7 @@ class DaMoeConfig:
     control_overhead_us: float
 
     @classmethod
-    def from_environment(cls, *, default_enabled: bool = False) -> DaMoeConfig:
+    def from_environment(cls) -> DaMoeConfig:
         """Resolve the preserved environment contract and validate it atomically."""
         # Parse the ordered realization catalog first because its total cardinality is a hard
         # selector-storage constraint, not a tuning-time fallback condition.
@@ -89,14 +89,14 @@ class DaMoeConfig:
         # Construct only after every dependent value is validated so callers never observe a
         # partially resolved environment configuration.
         return cls(
-            enabled=is_da_moe_enabled(default=default_enabled),
+            enabled=is_da_moe_enabled(),
             distributions=distributions,
             samples_per_distribution=samples,
             factorized_search=_environment_bool(
                 "FLASHINFER_DA_FACTORIZED_AUTOTUNE", True
             ),
             baseline_guard_enabled=_environment_bool(
-                "FLASHINFER_DA_BASELINE_GUARD", True
+                "FLASHINFER_DA_BASELINE_GUARD", False
             ),
             baseline_guard_margin=margin,
             control_overhead_us=_environment_nonnegative_float(
@@ -127,8 +127,8 @@ def is_trtllm_da_enabled() -> bool:
     return is_da_moe_enabled()
 
 
-def get_enabled_da_moe_config(*, default_enabled: bool = False) -> DaMoeConfig | None:
-    """Resolve DA configuration using the calling backend's default policy."""
-    if not is_da_moe_enabled(default=default_enabled):
+def get_enabled_da_moe_config() -> DaMoeConfig | None:
+    """Resolve DA configuration only after explicit opt-in, for either backend."""
+    if not is_da_moe_enabled():
         return None
-    return DaMoeConfig.from_environment(default_enabled=default_enabled)
+    return DaMoeConfig.from_environment()

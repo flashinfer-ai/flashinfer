@@ -1357,6 +1357,7 @@ def _required_json_moe_config_pair(
 ) -> PrimsTsGemmPair:
     pair = None
     if moe_config_index == -1:
+        last_error = None
         for candidate_tile_n in fallback_tile_ns or _fallback_tile_ns_for_label(
             dtype_label, tile_n
         ):
@@ -1369,7 +1370,21 @@ def _required_json_moe_config_pair(
                 **kwargs,
             )
             if pair is not None:
-                break
+                try:
+                    _ensure_pair_buildable(
+                        pair,
+                        dtype_label=dtype_label,
+                        num_tokens=num_tokens,
+                        top_k=top_k,
+                        num_experts=num_experts,
+                    )
+                except ValueError as exc:
+                    last_error = exc
+                    pair = None
+                    continue
+                return pair
+        if last_error is not None:
+            raise last_error
     else:
         pair = _make_json_moe_config_pair(
             tile_n=tile_n,

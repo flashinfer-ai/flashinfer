@@ -696,7 +696,15 @@ class _PrimsTsMoERunnerMixin(Generic[BodyWorkspaceT]):
         for raw_tactic in self.get_valid_tactics(inputs, None):  # type: ignore[arg-type]
             if raw_tactic == -1:
                 continue
-            pair = resolve_pair(raw_tactic)
+            try:
+                pair = resolve_pair(raw_tactic)
+            except ValueError as exc:
+                # Catalog rows can exceed resource limits for the requested epilogue
+                # (for example, non-gated ReLU2 uses more epilogue shared memory).
+                logger.debug(
+                    f"[Prims-TS MoE] Skipping unsupported tactic {raw_tactic}: {exc}"
+                )
+                continue
             identity = (int(pair.tile_n), int(pair.moe_config_index))
             tactics.append(
                 FactorizedTactic(

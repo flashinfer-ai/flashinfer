@@ -30,8 +30,9 @@ from flashinfer.prims_ts.moe.config_mapper import (
     map_trtllm_nvfp4_moe_tactic,
     valid_prims_ts_mxfp4_mxfp8_moe_tactics,
 )
-from flashinfer.prims_ts.moe import support
+from flashinfer.prims_ts.moe import config_mapper, support
 from flashinfer.prims_ts.moe.runner import (
+    _PrimsTsMoERunnerMixin,
     _filter_valid_moe_tactics,
     _routed_token_capacity,
 )
@@ -637,6 +638,76 @@ def test_runner_filter_drops_unbuildable_json_tactics():
     )
 
     assert filtered == [[8, valid_pair.moe_config_index]]
+
+
+def test_factorized_space_skips_unbuildable_candidates_before_choosing_anchor():
+    runner = SimpleNamespace(get_valid_tactics=lambda *_: [-1, [8, 0], [8, 1]])
+
+    def resolve(tactic):
+        if tactic == [8, 0]:
+            raise ValueError("SMEM usage exceeds hardware capacity")
+        return SimpleNamespace(
+            tile_n=8,
+            moe_config_index=1,
+            fc1=SimpleNamespace(prims_ts_gemm_config_index=10),
+            fc2=SimpleNamespace(prims_ts_gemm_config_index=20),
+        )
+
+    space = _PrimsTsMoERunnerMixin._factorized_tactic_space(runner, [], resolve)
+    assert space.tiles == (8,)
+    assert space.anchor(8).tactic == (8, 1)
+    assert space.resolve_public_tactic([8, 1]).fc1 == 10
+    runner.get_valid_tactics = lambda *_: [[8, 0]]
+    with pytest.raises(ValueError, match="cannot be empty"):
+        _PrimsTsMoERunnerMixin._factorized_tactic_space(runner, [], resolve)
+
+
+def test_default_tactic_checks_buildability_before_accepting_fallback_tile(monkeypatch):
+    checked = []
+
+    def make_pair(**kwargs):
+        return SimpleNamespace(tile_n=kwargs["tile_n"])
+
+    def ensure_pair(pair, **kwargs):
+        checked.append(pair.tile_n)
+        if pair.tile_n == 64:
+            raise ValueError("SMEM usage exceeds hardware capacity")
+
+    monkeypatch.setattr(config_mapper, "_make_default_json_moe_config_pair", make_pair)
+    monkeypatch.setattr(config_mapper, "_make_json_moe_config_pair", make_pair)
+    monkeypatch.setattr(config_mapper, "_ensure_pair_buildable", ensure_pair)
+    pair = config_mapper._required_json_moe_config_pair(
+        tile_n=64, moe_config_index=-1, dtype_label="BF16", fallback_tile_ns=(64, 32)
+    )
+    assert pair.tile_n == 32
+    assert checked == [64, 32]
+    # A concrete caller-selected tactic must never be replaced with another tile.
+    with pytest.raises(ValueError, match="SMEM usage"):
+        config_mapper._required_json_moe_config_pair(
+            tile_n=64, moe_config_index=0, dtype_label="BF16"
+        )
+    with pytest.raises(ValueError, match="SMEM usage"):
+        config_mapper._required_json_moe_config_pair(
+            tile_n=64, moe_config_index=-1, dtype_label="BF16", fallback_tile_ns=(64,)
+        )
+
+
+@pytest.mark.parametrize("num_tokens", [512, 8192])
+def test_relu2_default_tactic_is_buildable_for_nemotron_routed_geometry(num_tokens):
+    from flashinfer.prims_ts import is_prims_ts_device_supported
+
+    if not torch.cuda.is_available() or not is_prims_ts_device_supported(
+        torch.device("cuda")
+    ):
+        pytest.skip("PrimsTS supported device required")
+    pair = map_trtllm_bf16_moe_tactic(
+        -1,
+        activation_type=int(ActivationType.Relu2),
+        num_tokens=num_tokens,
+        top_k=22,
+        num_local_experts=128,
+    )
+    assert pair.moe_config_index >= 0
 
 
 def test_config_mapper_matches_default_tile_selection():

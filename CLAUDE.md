@@ -41,7 +41,7 @@ FlashInfer is a GPU kernel library for LLM serving that uses **JIT (Just-In-Time
 | Override MoE EP knob-cache path | `export FLASHINFER_MOE_EP_KNOB_CACHE=/path/to/knobs.json` |
 | Disable MoE EP fused staging kernel | `export FLASHINFER_MEGA_FUSED_STAGE=0` |
 | Enable MoE EP EXPERT_MAJOR padding-row exclusion (opt-in; shape-dependent) | `export FLASHINFER_MOE_EP_EXCLUDE_PADDING_ROWS=1` |
-| Control distribution-aware MoE autotune and kernel dispatch (PrimsTS defaults on; TRT-LLM defaults off) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=0` (disable) or `1` (enable) |
+| Enable experimental distribution-aware MoE tuning and dispatch (off by default for all backends) | `export FLASHINFER_DIST_AWARE_AUTOTUNE=1` |
 | Prims-TS debug checks / task-manager verify | `export FLASHINFER_PRIMS_TS_DEBUG_CHECKS=1` |
 | Override Prims-TS CuTe-DSL compile options | `export FLASHINFER_PRIMS_TS_COMPILE_OPTIONS="--opt-level 2"` |
 | Configure NVFP4 4over6 quantization (preferred over the env vars) | `nvfp4_quantize(..., nvfp4_4over6=NVFP44Over6Config(e4m3_max=256))` |
@@ -689,7 +689,7 @@ Used by `flashinfer.trace` / `fi_trace`.
 | `FLASHINFER_ALLOW_EXPERIMENTAL_AUTO_BACKENDS` | unset | `flashinfer/utils.py` (`backend_requirement`), `flashinfer/api_logging.py` | `1` lets `backend="auto"` (dispatch heuristics and autotuning) select backends marked `@experimental_backend` (see the "Experimental Code" section). Explicit use never needs it: calling an `@flashinfer_experimental_api` function or passing `backend="<experimental>"` always works and emits an `ExperimentalWarning` once. Without it, automatic selection considers only stable backends. |
 | `FLASHINFER_VALIDATE_INPUTS` | `0` | `flashinfer/mla/_core.py` (MLA wrapper) | Non-zero / non-empty value enables defensive input validation inside the MLA wrapper. Device-synchronizing checks are skipped during CUDA Graph capture. Adds host-side overhead; intended for debugging. |
 | `FLASHINFER_AUTOTUNER_LOAD_FROM_FILE` | `0` | `flashinfer/autotuner/autotuner.py` | `1` loads previously serialized autotune results from disk instead of re-running the search. |
-| `FLASHINFER_DIST_AWARE_AUTOTUNE` | backend-specific (PrimsTS on; TRT-LLM off) | `flashinfer/fused_moe/da_config.py` | Unset uses the backend default; `0` disables and `1` enables distribution-aware autotune and kernel dispatch for both backends. |
+| `FLASHINFER_DIST_AWARE_AUTOTUNE` | `0` | `flashinfer/fused_moe/da_config.py` | `1` opts into experimental distribution-aware autotune and dispatch for either backend. |
 | `FLASHINFER_DA_DISTRIBUTIONS` | built-in distribution catalog | `flashinfer/fused_moe/da_config.py` | Comma-separated training distributions used by the experimental TRT-LLM and PrimsTS distribution-aware MoE autotuner. |
 | `FLASHINFER_PRIMS_TS_DEBUG_CHECKS` | `0` | `flashinfer/prims_ts/batched_gemm/batched_gemm_kernel.py`, `batched_gemm_run.py`, `flashinfer/prims_ts/gemm/kernel.py` | `1`/`true`/`yes`/`on` enables exhaustive deadlock/race checks and TaskManager verification in Prims-TS batched GEMM and dense GEMM. Production JIT leaves both off. `tests/prims_ts` turns the variable on for `test_batched_gemm_*` and `test_gemm_*`. |
 | `FLASHINFER_PRIMS_TS_COMPILE_OPTIONS` | `--opt-level 2` | `flashinfer/prims_ts/utils.py`, `batched_gemm_run.py` | Extra CuTe-DSL / nvc compile options passed when building Prims-TS kernels. |
