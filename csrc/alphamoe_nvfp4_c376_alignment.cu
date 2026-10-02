@@ -18,9 +18,11 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <math_constants.h>
+#include "alphamoe_nvfp4_sm100_device_helpers.cuh"
 
 
 namespace nvfp4_qualified_c376_alignment {
+using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_route_alignment_parallel_map_init kernel_alpha_moe_route_alignment_parallel_map_init_nvfp4_qualified_c376_alignment
 __device__ __forceinline__ int make_warp_uniform(int x) {
     int result;

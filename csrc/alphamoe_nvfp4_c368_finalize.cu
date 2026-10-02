@@ -18,9 +18,11 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <math_constants.h>
+#include "alphamoe_nvfp4_sm100_device_helpers.cuh"
 
 
 namespace nvfp4_qualified_c368_finalize {
+using namespace alphamoe_nvfp4_device;
 #define kernel_alpha_moe_nvfp4_finalize_route_bf16_vector_seed_unit_scale_fma_packed_prefetch4 kernel_alpha_moe_nvfp4_finalize_route_bf16_vector_seed_unit_scale_fma_packed_prefetch4_nvfp4_qualified_c368_finalize
 __device__ __forceinline__ int make_warp_uniform(int x) {
     int result;
