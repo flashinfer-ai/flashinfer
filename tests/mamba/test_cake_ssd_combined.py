@@ -17,6 +17,7 @@ limitations under the License.
 import importlib
 import importlib.util
 import inspect
+import re
 from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -921,9 +922,14 @@ def test_source_public_cake_constructor_rejects_non_exported_arch_without_gpu(
     utils = importlib.import_module("flashinfer.utils")
     monkeypatch.setattr(utils, "get_compute_capability", lambda *_: (11, 0))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda *_: (11, 0))
-
-    with pytest.raises(ValueError, match="requires SM100 or SM103, got SM110"):
-        module.SSDCombined(128, 2, 64, 128, 1, backend="cake")
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 0)
+    cake_module = importlib.import_module("flashinfer.mamba.cake_ssd_combined")
+    cake_module._target_arch.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="requires SM100 or SM103, got SM110"):
+            module.SSDCombined(128, 2, 64, 128, 1, backend="cake")
+    finally:
+        cake_module._target_arch.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -1811,10 +1817,13 @@ def test_source_program_table_names_shipped_sources():
         for kernel in program.kernels:
             source = source_dir / module._DEVICE_DIR / kernel.source
             assert source.is_file(), source
-            assert f" {kernel.kernel}(" in source.read_text(encoding="utf-8")
+            assert re.search(
+                rf"\b{kernel.kernel}\(", source.read_text(encoding="utf-8")
+            )
             device_sources.add(source)
-        rendered = module._render_host_source(template, program)
+        rendered = module._render_host_source(template, name, program)
         placeholders = (
+            "CAKE_SSD_PROGRAM",
             "CAKE_SSD_PREPROCESS_MODULE",
             "CAKE_SSD_PREPROCESS_KERNEL",
             "CAKE_SSD_PREPROCESS_THREADS",
@@ -1828,6 +1837,7 @@ def test_source_program_table_names_shipped_sources():
         assert f"TVM_FFI_EMBED_CUBIN({program.preprocess.module});" in rendered
         assert f"TVM_FFI_EMBED_CUBIN({program.main.module});" in rendered
         assert f'"{program.main.kernel}"' in rendered
+        assert f"namespace cake_mamba_ssd_combined_host_{name} {{" in rendered
         assert f"stream, {program.main_smem_bytes}u)" in rendered
     # One shared source per physical kernel: ten device files, no architecture copies.
     assert len(device_sources) == 10
@@ -1880,6 +1890,7 @@ def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path)
     host = tmp_path / module._HOST_TEMPLATE
     host.parent.mkdir(parents=True)
     host.write_text(
+        "namespace host_CAKE_SSD_PROGRAM {}\n"
         "TVM_FFI_EMBED_CUBIN(CAKE_SSD_PREPROCESS_MODULE);\n"
         "TVM_FFI_EMBED_CUBIN(CAKE_SSD_MAIN_MODULE);\n"
         "CAKE_SSD_PREPROCESS_KERNEL CAKE_SSD_PREPROCESS_THREADS CAKE_SSD_MAIN_KERNEL "
@@ -1924,6 +1935,7 @@ def test_source_program_loader_builds_one_module_per_arch(monkeypatch, tmp_path)
     assert len(load_calls) == 1
     rendered = load_calls[0][1]["cpp_sources"]
     assert "CAKE_SSD_" not in rendered
+    assert "namespace host_prefix_bf16_varlen {}" in rendered
     assert f"TVM_FFI_EMBED_CUBIN({program.preprocess.module});" in rendered
     assert f"{program.preprocess.kernel} 32 {program.main.kernel} 4 149248" in rendered
     assert set(load_calls[0][1]["embed_cubin"]) == {

@@ -385,10 +385,16 @@ def _nvcc() -> Path:
     return Path(candidate).resolve()
 
 
-def _render_host_source(template: str, program: _Program) -> str:
-    """Substitute one program's table values into the shared launcher."""
+def _render_host_source(template: str, name: str, program: _Program) -> str:
+    """Substitute one program's table values into the shared launcher.
+
+    The program name becomes part of the launcher namespace so the inline
+    launch helpers (and their function-local static kernel handles) of one
+    loaded program library are never unified with another's.
+    """
 
     values = {
+        "CAKE_SSD_PROGRAM": name,
         "CAKE_SSD_PREPROCESS_MODULE": program.preprocess.module,
         "CAKE_SSD_PREPROCESS_KERNEL": program.preprocess.kernel,
         "CAKE_SSD_PREPROCESS_THREADS": str(program.preprocess.threads),
@@ -414,7 +420,7 @@ def _load_generated_program(name: str, arch: str):
     program = _PROGRAMS[name]
     source_dir = _source_dir()
     host_source = _render_host_source(
-        (source_dir / _HOST_TEMPLATE).read_text(encoding="utf-8"), program
+        (source_dir / _HOST_TEMPLATE).read_text(encoding="utf-8"), name, program
     )
     nvcc = _nvcc()
     digest = hashlib.sha256()
