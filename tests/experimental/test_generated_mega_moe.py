@@ -17,7 +17,7 @@ fixtures = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(fixtures)
 
 # Catalogued model geometry shared by both families.
-EXPERTS, TOP_K, HIDDEN, INTERMEDIATE = 384, 6, 5120, 2304
+EXPERTS, INTERMEDIATE = 384, 2304
 # The packed 384-expert weights, workspaces and the dequantized reference of the
 # routed experts need this much free device memory.
 MODEL_MEMORY_BYTES = 48 * 2**30
@@ -55,76 +55,13 @@ def output_of(plan, family):
     return plan.output if family == "source" else plan.outputs
 
 
-def shared_expert(seed):
-    """One FP8 shared expert at the model geometry (source family only)."""
-    generator = torch.Generator(device="cuda").manual_seed(seed + 1_000_003)
-    a, sa = fixtures.operand((1, 2 * INTERMEDIATE, HIDDEN), "fp8", generator)
-    b, sb = fixtures.operand((1, HIDDEN, INTERMEDIATE), "fp8", generator)
-    return a, sa, b, sb
+def make_model(family, precision, num_tokens=16, seed=0):
+    require_model_memory()
+    return fixtures.make_model(family, precision, num_tokens=num_tokens, seed=seed)
 
 
 def model_reference(inputs, x_scales, shared=None):
-    """Routed experts (only the selected ones are dequantized) plus the shared
-    expert, accumulated in FP32 and rounded to BF16 once, like the kernels."""
-    precision = inputs["routed_weight_dtype"]
-    x = fixtures.unpack(inputs["x_fp8_packed"], x_scales, "fp8")
-    width = inputs["intermediate"]
-    output = torch.zeros_like(x)
-    for index in inputs["topk_idx"].unique().tolist():
-        first = fixtures.unpack(
-            inputs[f"w1_{precision}"][index], inputs["w1_sf"][index], precision
-        )
-        second = fixtures.unpack(
-            inputs[f"w2_{precision}"][index], inputs["w2_sf"][index], precision
-        )
-        for slot in range(inputs["top_k"]):
-            selected = inputs["topk_idx"][:, slot] == index
-            if selected.any():
-                output[selected] += fixtures._expert(
-                    x[selected],
-                    first,
-                    second,
-                    inputs["topk_weights"][selected, slot],
-                    width,
-                )
-    if shared is not None:
-        output += fixtures._expert(
-            x,
-            fixtures.unpack(shared[0], shared[1], "fp8")[0],
-            fixtures.unpack(shared[2], shared[3], "fp8")[0],
-            torch.ones(x.shape[0], device=x.device),
-            width,
-        )
-    return output.bfloat16()
-
-
-def make_model(family, precision, num_tokens=16, seed=0):
-    """Prepared plan of ``family`` on the catalogued model route."""
-    require_model_memory()
-    inputs, xs = fixtures.model_inputs(precision, num_tokens=num_tokens, seed=seed)
-    shared = None
-    if family == "source":
-        from flashinfer.source_mega_moe import prepare_mega_moe
-
-        shared = shared_expert(seed)
-        plan = prepare_mega_moe(
-            inputs["x_fp8_packed"],
-            inputs["x_sf_packed"],
-            inputs["topk_idx"],
-            inputs["topk_weights"],
-            weights=fixtures.source_weights(inputs, shared),
-            num_experts=EXPERTS,
-            intermediate=INTERMEDIATE,
-            routed_weight_dtype=precision,
-            num_shared_experts=1,
-            activation_clamp=10.0,
-            fast_math=True,
-        )
-    else:
-        from flashinfer.mega_moe_v3 import prepare_pipeline
-
-        plan = prepare_pipeline(inputs)
-    return plan, inputs, xs, shared
+    return fixtures.model_reference(inputs, x_scales, shared)
 
 
 def graph_node_names(graph):
