@@ -41,7 +41,7 @@
 #include "cake_minimax_h3_mxfp8_norm_adaln_quantize_device.cu"
 #elif CAKE_MINIMAX_H3_MXFP8_STAGE == 2
 #if !defined(CAKE_MINIMAX_H3_MXFP8_P) || !defined(CAKE_MINIMAX_H3_MXFP8_HEADS_PER_DESTINATION) || \
-    !defined(CAKE_MINIMAX_H3_MXFP8_ROWS_PER_DESTINATION) ||                                     \
+    !defined(CAKE_MINIMAX_H3_MXFP8_ROWS_PER_DESTINATION) ||                                       \
     !defined(CAKE_MINIMAX_H3_MXFP8_SCALE_STRIDE)
 #error "stage 2 needs P, HEADS_PER_DESTINATION, ROWS_PER_DESTINATION and SCALE_STRIDE"
 #endif
@@ -163,11 +163,12 @@ void Run(TensorView x, TensorView x_norm_weight, TensorView adaln_scale, TensorV
   cudaStream_t stream = get_stream(x.device());
   kernel_cake_minimax_h3_mxfp8_norm_adaln_quantize<<<dim3(static_cast<uint32_t>(kGridX)),
                                                      dim3(kThreads), kDynamicSmemBytes, stream>>>(
-      static_cast<__nv_bfloat16*>(x.data_ptr()), static_cast<__nv_bfloat16*>(x_norm_weight.data_ptr()),
+      static_cast<__nv_bfloat16*>(x.data_ptr()),
+      static_cast<__nv_bfloat16*>(x_norm_weight.data_ptr()),
       static_cast<__nv_bfloat16*>(adaln_scale.data_ptr()),
-      static_cast<__nv_bfloat16*>(adaln_shift.data_ptr()), static_cast<int*>(adaln_index.data_ptr()),
-      static_cast<uint8_t*>(activation_q.data_ptr()), static_cast<uint8_t*>(activation_sf.data_ptr()),
-      static_cast<float>(eps));
+      static_cast<__nv_bfloat16*>(adaln_shift.data_ptr()),
+      static_cast<int*>(adaln_index.data_ptr()), static_cast<uint8_t*>(activation_q.data_ptr()),
+      static_cast<uint8_t*>(activation_sf.data_ptr()), static_cast<float>(eps));
   CheckLaunch(cudaGetLastError());
 }
 
@@ -223,14 +224,14 @@ void Run(TensorView qkv_bf16, TensorView q_norm_weight, TensorView k_norm_weight
 
   ffi::CUDADeviceGuard device_guard(qkv_bf16.device().device_id);
   cudaStream_t stream = get_stream(qkv_bf16.device());
-  kernel_cake_minimax_h3_mxfp8_qk_rope_destination_pack<<<dim3(static_cast<uint32_t>(kGridX)),
-                                                          dim3(kThreads), kDynamicSmemBytes,
-                                                          stream>>>(
+  kernel_cake_minimax_h3_mxfp8_qk_rope_destination_pack<<<
+      dim3(static_cast<uint32_t>(kGridX)), dim3(kThreads), kDynamicSmemBytes, stream>>>(
       static_cast<__nv_bfloat16*>(qkv_bf16.data_ptr()),
       static_cast<__nv_bfloat16*>(q_norm_weight.data_ptr()),
       static_cast<__nv_bfloat16*>(k_norm_weight.data_ptr()),
       static_cast<__nv_bfloat16*>(rope_cos_sin.data_ptr()), static_cast<uint8_t*>(out_q.data_ptr()),
-      static_cast<uint8_t*>(out_sf.data_ptr()), static_cast<__nv_bfloat16*>(debug_q_bf16.data_ptr()),
+      static_cast<uint8_t*>(out_sf.data_ptr()),
+      static_cast<__nv_bfloat16*>(debug_q_bf16.data_ptr()),
       static_cast<__nv_bfloat16*>(debug_k_bf16.data_ptr()), static_cast<int>(write_debug),
       static_cast<float>(eps));
   CheckLaunch(cudaGetLastError());
