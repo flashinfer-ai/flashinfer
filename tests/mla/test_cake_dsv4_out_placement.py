@@ -103,7 +103,9 @@ def _run_fp8_swa(monkeypatch, *, num_heads, out, out_shape=None):
             torch.float8_e4m3fn
         ),
         workspace_buffer=_aligned_u8(
-            cake.get_cake_dsv4_workspace_bytes(rows, num_heads, 128, torch.float8_e4m3fn)
+            cake.get_cake_dsv4_workspace_bytes(
+                rows, num_heads, 128, torch.float8_e4m3fn
+            )
         ),
         sparse_indices=table,
         sparse_topk_lens=lens,
