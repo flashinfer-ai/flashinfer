@@ -80,6 +80,8 @@ class TestSm107BlockScaledConfig:
         assert cfg.cluster_shape_mn is None
         assert cfg.fallback_cluster_shape_mn is None
         assert cfg.max_sm_count is None
+        assert cfg.activation == "swiglu"
+        assert cfg.situ_beta is None and cfg.situ_linear_beta is None
         # Tuner contract: the knobs field defaults to None (explicit fields
         # stand); "cache" / dict resolution happens at workspace allocation.
         assert cfg.knobs is None

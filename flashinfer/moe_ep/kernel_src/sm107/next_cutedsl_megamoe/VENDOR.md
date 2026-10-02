@@ -50,14 +50,16 @@ export manifest/log and file hashes with the integration evidence.
 
 The generic inference entry point is `RubinInferenceMegaMoE`
 (`BlockScaledSwapAbMegaMoeKernel`). FlashInfer's existing NVFP4 and MXFP8 E4M3/E5M2
-backends use this updated kernel with SwiGLU and BF16 combine/output, supporting
-separate and in-kernel reduction. Its shared helpers, schedulers, communication
-and workspace code are from the same pinned snapshot.
+backends expose SwiGLU and SiTU with BF16 combine/output, supporting separate
+and in-kernel reduction. They accept canonical prequantized weights; NVFP4
+also supports non-unit normalization and per-expert correction tensors.
+Shared helpers, schedulers, communication and workspace code come from the
+same pinned snapshot.
 
 `RubinInferenceGenphaseMegaMoE` (`BlockScaledSwapAbGenphaseMoeKernel`) is included
 in the vendored export for future integration. It is not yet selectable through
-the FlashInfer backend or benchmark. Upstream SiTU activation parameters are also
-not exposed by the current wrapper.
+the FlashInfer backend or benchmark. SiTU requires both beta parameters,
+matching the exported kernel.
 
 `+combine_nvfp4` and `+combine_mxfp8` remain future FlashInfer configuration,
 workspace/scale handling, correctness and measurement work. Their device paths
@@ -74,11 +76,13 @@ The shim checks capabilities and the target captured at import.
 
 The older `92dd334` payload passed integration correctness at FlashInfer revision
 `9a414e73c8f4246746b281f98db2217a515819cb`, including EP2/4/8. That evidence is for
-the older drop. This export passed native single-GPU (50 cases) and EP4
-(16 cases per rank) correctness at FlashInfer `5bd5aeef`. See the
-[qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
-EP2/EP8 on this export have not been validated. Tuning-cache entries use revision
-`sm107-block-scaled-1667b47a-v3`, so the previous drop's timings are not reused.
+the older drop. At FlashInfer `0f710df8`, this export passed 187 host/CUDA checks,
+72 single-GPU cases, and 34 distributed cases per rank at EP2, EP4, and EP8,
+with no skips. See the
+[qualification guide](../../../../../docs/design_docs/moe_ep_sm107_qualification.md)
+for coverage and the separate reference-decoder regression.
+Tuning-cache entries use revision `sm107-block-scaled-1667b47a-v4`, which includes
+activation, beta parameters, and clamp settings in the cache identity.
 
 ## Export transformations
 

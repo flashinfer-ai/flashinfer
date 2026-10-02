@@ -67,9 +67,12 @@ out  = silu(gate) * up * scale
 ```
 
 `grouped_tokens` must already be materialized in contiguous group order.
-`first_token_offset[g]` is the first row of group `g`; the last group ends at
-`S`, and group `g` uses expert `g % E`. Routing, permutation, GEMM2, and final
-scatter are outside this API.
+`first_token_offset` contains `G+1` nondecreasing int32 boundaries starting at
+zero. Group `g` spans `[first_token_offset[g], first_token_offset[g+1])` and uses
+expert `g % E`; `G` is a positive multiple of `E`. The final boundary may be
+smaller than buffer capacity `S`; rows beyond it are not processed. Artifact ABI
+`v2` requires this explicit final boundary and rejects the old `v1` manifests.
+Routing, permutation, GEMM2, and final scatter are outside this API.
 
 An independent FC2 grouped-GEMM PoC and a full `CudnnFrostBf16MoeRunner` are also
 implemented. The old cuDNN Frost-FC1/CUTLASS-FC2 hybrid integration has been removed
@@ -231,6 +234,11 @@ and select candidates on the deployment GPU: shared-memory, L2 and persistent
 grid budgets are part of the compiled specialization. Each dtype has its own
 manifest and shortlist under the same artifact layout.
 
+Source filenames include an architecture prefix, for example
+`sources/sm107_cudnn_frost_grouped_gemm1_swiglu_bf16_normal_stg.py`.
+Exports for another architecture use its own prefix, such as `sm120_`, so
+templates for different architectures can coexist in each dtype directory.
+
 All ten default activation contracts are included: gated `SwiGLU`, `GeGLU`,
 `GeGLUTanh`, `SwiGLUStep`, `SiTU`; non-gated `Identity`, `ReLU`, `ReLU2`,
 `GELU`, `SiLU`. SiTU binds gate/linear scales 4/25 in the generated auxiliary
@@ -272,13 +280,13 @@ from flashinfer.experimental.cudnn_frost_selected_kernels_moe_grouped_gemm.runti
     _arch_for, _dimension_matches,
 )
 
-# x: grouped E4M3 [S,K]; gate/up: E4M3 [E,N,K]; offsets: int32 [G].
+# x: grouped E4M3 [S,K]; gate/up: E4M3 [E,N,K]; offsets: int32 [G+1].
 # x_sf: logical E8M0 bytes [S,K/32]; gate_sf/up_sf: [E,N,K/32].
 # Choose an artifact matching the operation, architecture and shape contract.
 arch = _arch_for(x.device)
 geometry = dict(
     s=x.shape[0], n=gate.shape[1], k=x.shape[1],
-    experts=gate.shape[0], groups=offsets.numel(),
+    experts=gate.shape[0], groups=offsets.numel() - 1,
 )
 kernel = next(
     (k for k in mxfp8.discover()
@@ -656,8 +664,8 @@ instantiation changes the concrete source AST. The deployed process needs no
 cuDNN installation to instantiate a template.
 
 Both stages independently support normal and swap-AB artifacts. Swapped kernels
-use explicit `cudnn_frost_grouped_gemm1_swiglu_swap_ab_v1` and
-`cudnn_frost_grouped_gemm2_swap_ab_v1` ABIs, with matching `tactic.swap_ab` metadata.
+use explicit `cudnn_frost_grouped_gemm1_swiglu_swap_ab_v2` and
+`cudnn_frost_grouped_gemm2_swap_ab_v2` ABIs, with matching `tactic.swap_ab` metadata.
 The adapter exchanges operand order, M/N problem dimensions and output strides;
 the external [up, gate]/down weight layout and grouped workspace layout stay the
 same. Normal-ABI records without `swap_ab` remain valid. Contradictory ABI
@@ -796,9 +804,9 @@ selected for packaging.
 grouped_intermediate[S,I] @ down_weight[expert,H,I].T -> grouped_output[S,H]
 ```
 
-All data tensors are contiguous BF16. Offsets are int32[E], one group per
-local expert, with an implicit final end at S. Empty/uneven expert groups
-are supported. This stage does not apply routing weights or finalize/scatter.
+All data tensors are contiguous BF16. Offsets are int32[E+1], one group per
+local expert, with an explicit final boundary at or before S. Empty/uneven
+expert groups are supported. This stage does not apply routing weights or finalize/scatter.
 Preparation validates offsets and compiles or reloads the native TVM-FFI function outside
 CUDA Graph capture. `PreparedFc2.run()` resets the caller-owned descriptor /
 scheduler workspace and invokes that Function, without importing cuDNN Frost or
@@ -810,7 +818,7 @@ activations. FC2's N is the **hidden size**, whereas FC1's N is the intermediate
 size. FC2 does not apply an activation; its configurations are selected
 independently from FC1.
 
-The FC2 records use `op=grouped_gemm2` and ABI `cudnn_frost_grouped_gemm2_v1`;
+The FC2 records use `op=grouped_gemm2` and ABI `cudnn_frost_grouped_gemm2_v2`;
 the manifest lists their Python source paths and digests. FC1 discovery ignores
 these records, retaining its separate candidate pool.
 
