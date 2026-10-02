@@ -407,6 +407,7 @@ def test_cake_backend_routes_calls_without_allreduce_output_to_the_union(
 
 def test_scratch_allreduce_output_is_cached_per_device_and_dtype_and_grows() -> None:
     union._scratch_allreduce_outputs.clear()
+    union._retired_scratch_allreduce_outputs.clear()
     device = torch.device("cpu")
     try:
         first = union.scratch_allreduce_output(device, torch.float16, 4)
@@ -416,10 +417,20 @@ def test_scratch_allreduce_output_is_cached_per_device_and_dtype_and_grows() -> 
         smaller = union.scratch_allreduce_output(device, torch.float16, 2)
         assert smaller.data_ptr() == first.data_ptr()
         assert smaller.shape == (2, union.HIDDEN_DIM) and smaller.is_contiguous()
-        # A larger request grows the cached tensor once.
+        # A larger request grows the cached tensor once (to at least twice the
+        # previous capacity) and retires the replaced tensor instead of freeing it.
+        grown = union.scratch_allreduce_output(device, torch.float16, 5)
+        assert grown.shape == (5, union.HIDDEN_DIM)
+        assert grown.data_ptr() != first.data_ptr()
+        assert (
+            union._scratch_allreduce_outputs[("cpu", None, torch.float16)].shape[0] == 8
+        )
+        assert [t.data_ptr() for t in union._retired_scratch_allreduce_outputs] == [
+            first.data_ptr()
+        ]
         grown = union.scratch_allreduce_output(device, torch.float16, 8)
         assert grown.shape == (8, union.HIDDEN_DIM)
-        assert grown.data_ptr() != first.data_ptr()
+        assert len(union._retired_scratch_allreduce_outputs) == 1
         assert union.scratch_allreduce_output(device, torch.float16, 8).data_ptr() == (
             grown.data_ptr()
         )
@@ -432,6 +443,53 @@ def test_scratch_allreduce_output_is_cached_per_device_and_dtype_and_grows() -> 
         }
     finally:
         union._scratch_allreduce_outputs.clear()
+        union._retired_scratch_allreduce_outputs.clear()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU"
+)
+def test_scratch_allreduce_output_retains_addresses_recorded_by_captured_graphs() -> (
+    None
+):
+    union._scratch_allreduce_outputs.clear()
+    union._retired_scratch_allreduce_outputs.clear()
+    device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        warm = union.scratch_allreduce_output(device, torch.bfloat16, 4)
+        recorded = warm.data_ptr()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            # Large enough cache: the capture records the cached tensor's address.
+            captured = union.scratch_allreduce_output(device, torch.bfloat16, 2)
+            assert captured.data_ptr() == recorded
+            captured.fill_(1.0)
+            # Too small: the fresh tensor belongs to the graph's pool and is not cached.
+            private = union.scratch_allreduce_output(device, torch.bfloat16, 64)
+            assert private.data_ptr() != recorded
+        torch.cuda.current_stream().wait_stream(stream)
+        assert (
+            union._scratch_allreduce_outputs[
+                (device.type, device.index, torch.bfloat16)
+            ].data_ptr()
+            == recorded
+        )
+        # An eager call that grows the cache must keep the recorded storage alive.
+        grown = union.scratch_allreduce_output(device, torch.bfloat16, 16)
+        assert grown.data_ptr() != recorded
+        assert [t.data_ptr() for t in union._retired_scratch_allreduce_outputs] == [
+            recorded
+        ]
+        canary = torch.zeros((4, union.HIDDEN_DIM), dtype=torch.bfloat16, device=device)
+        assert canary.data_ptr() != recorded
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(canary).item() == 0
+    finally:
+        union._scratch_allreduce_outputs.clear()
+        union._retired_scratch_allreduce_outputs.clear()
 
 
 def test_workspace_creation_has_no_pointer_registry() -> None:
