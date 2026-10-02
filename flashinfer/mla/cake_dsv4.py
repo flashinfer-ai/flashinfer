@@ -23,10 +23,11 @@ Host contract (flashinfer#4671 hardening)
   ``query`` and ``out`` may carry more rows; rows ``>= T`` are neither read nor
   written. Grids and workspace views derive from ``T``, never from query rows.
 * **Argument binding.** Kernel arguments are bound *by name* through the
-  registration ``arg_plan`` (:func:`_launch_variant`), so regenerated bindings
+  registration ``arg_plan`` (:func:`_prepare_variant`), so regenerated bindings
   only need names from the host vocabulary (:func:`is_bindable_arg`). Every
-  route launches its variant kernels directly; two-stage routes launch the
-  producer and then the reducer with the host-computed grids.
+  route launches its variant kernels directly; two-stage routes bind the
+  producer and the reducer first and then launch both back to back, so no
+  host-side binding sits between the two kernels.
 * **Workspace.** One caller-owned ``workspace_buffer`` is carved
   deterministically (:func:`cake_dsv4_workspace_layout`)::
 
@@ -851,14 +852,34 @@ def _grid_values(grid: tuple[int, int, int]) -> dict[str, int]:
     return dict(zip(_GRID_NAMES, grid, strict=True))
 
 
-def _launch_variant(
+class _PreparedLaunch:
+    """A bound variant launch: the FFI call is the only work left to do."""
+
+    __slots__ = ("module", "bound")
+
+    def __init__(self, module, bound: list):
+        self.module = module
+        self.bound = bound
+
+    def __call__(self):
+        # Direct-source bindings use the target FFI current stream.
+        return self.module.run(*self.bound)
+
+
+def _prepare_variant(
     variant: str,
     *,
     arch: str,
     grid: tuple[int, int, int],
     values: Mapping[str, Any],
-):
-    """Bind the generated ABI by name through the registration ``arg_plan``."""
+) -> _PreparedLaunch:
+    """Bind the generated ABI by name through the registration ``arg_plan``.
+
+    Two-stage routes prepare the producer and the reducer before launching
+    either, so no Python-side binding sits between the two kernels. The caller
+    holds :data:`_descriptor_lock` from the first preparation through the last
+    launch of the call.
+    """
     from ..jit.cake_dsv4 import get_cake_dsv4_spec
 
     contract = get_cake_dsv4_spec(variant, arch=arch)
@@ -876,21 +897,29 @@ def _launch_variant(
         )
 
     tma_bytes = int(contract.get("tma_workspace_bytes", 0) or 0)
-    if not tma_bytes:
-        bound = [bind(kind, name) for kind, name in plan]
-        # Direct-source bindings use the target FFI current stream.
-        return _variant_module(variant, arch=arch).run(*bound)
-    sources = [(name, bind(kind, name)) for kind, name in plan if kind == "tma_buffer"]
-    device = sources[0][1].device if sources else torch.device("cpu")
-    capturing = _is_capturing(device)
-    # Pool bookkeeping, the binding's descriptor check / rewrite and the launch
-    # enqueue form one host-side critical section per process.
-    with _descriptor_lock:
+    storage = None
+    if tma_bytes:
+        sources = [
+            (name, bind(kind, name)) for kind, name in plan if kind == "tma_buffer"
+        ]
+        device = sources[0][1].device if sources else torch.device("cpu")
         storage = _descriptor_storage(
-            variant, arch, tma_bytes, sources, capturing=capturing
+            variant, arch, tma_bytes, sources, capturing=_is_capturing(device)
         )
-        bound = [bind(kind, name, storage) for kind, name in plan]
-        return _variant_module(variant, arch=arch).run(*bound)
+    bound = [bind(kind, name, storage) for kind, name in plan]
+    return _PreparedLaunch(_variant_module(variant, arch=arch), bound)
+
+
+def _launch_variant(
+    variant: str,
+    *,
+    arch: str,
+    grid: tuple[int, int, int],
+    values: Mapping[str, Any],
+):
+    """Prepare and launch one variant (single-launch convenience)."""
+    with _descriptor_lock:
+        return _prepare_variant(variant, arch=arch, grid=grid, values=values)()
 
 
 # --------------------------------------------------------------------------- #
@@ -1161,10 +1190,17 @@ class _Launcher:
         self.raw = raw
         self.values = values
 
-    def variant(self, name: str, *, grid: tuple[int, int, int], **overrides: Any):
-        return _launch_variant(
+    def variant(
+        self, name: str, *, grid: tuple[int, int, int], **overrides: Any
+    ) -> _PreparedLaunch:
+        return _prepare_variant(
             name, arch=self.arch, grid=grid, values={**self.values, **overrides}
         )
+
+    @staticmethod
+    def run(*launches: _PreparedLaunch) -> None:
+        for launch in launches:
+            launch()
 
     def partials(self, num_splits: int) -> dict[str, Any]:
         partial_o, partial_lse = _partial_views(
@@ -1184,10 +1220,10 @@ class _Launcher:
         _ensure_counters_zeroed(self.workspace, self.raw)
         return _counters(self.raw, merge_groups)
 
-    def reduce(self, reducer: str, **overrides: Any) -> None:
+    def reduce(self, reducer: str, **overrides: Any) -> _PreparedLaunch:
         tokens = self.values["num_query_tokens"]
         heads = self.values["num_heads"]
-        self.variant(reducer, grid=(tokens, heads, 1), **overrides)
+        return self.variant(reducer, grid=(tokens, heads, 1), **overrides)
 
 
 def _ceil_div(a: int, b: int) -> int:
@@ -1336,7 +1372,11 @@ def run_cake_dsv4(
         raw=raw,
         values=values,
     )
-    _dispatch_route(route, launcher)
+    # One host-side critical section per call: descriptor-pool bookkeeping,
+    # the bindings' descriptor checks and the launch enqueues (see
+    # _descriptor_storage).
+    with _descriptor_lock:
+        _dispatch_route(route, launcher)
     return out
 
 
@@ -1353,29 +1393,33 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         "bf16_h16_h32_swa128_v44",
     ):
         head_tiles = _ceil_div(H, 64) if route == "bf16_h128_swa128" else 1
-        L.variant(route, grid=(T * head_tiles * 4, 1, 1), num_head_tiles=head_tiles)
+        L.run(
+            L.variant(route, grid=(T * head_tiles * 4, 1, 1), num_head_tiles=head_tiles)
+        )
         return
 
     if route == "bf16_h8_h16_source_exact":
-        L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"]))
+        L.run(L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"])))
         return
 
     if route == "fp8_h8_h16_source_exact":
         # Same launch shape as the BF16 source-exact body (one CTA per
         # (query-within-sequence, value quarter, batch)); FP8 Q/KV pools.
-        L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"]))
+        L.run(L.variant(route, grid=(v["max_q_len"], (H // 8) * 4, v["batch_size"])))
         return
 
     if route == "bf16_h64_guard_q_tma_batch_r25":
-        L.variant(route, grid=(T, 2, 1))
+        L.run(L.variant(route, grid=(T, 2, 1)))
         return
 
     if route == "bf16_h64_compressed_q8_v38":
         num_splits = _ceil_div(topk, _TILE_KV)
         parts = L.partials(num_splits)
-        L.variant(route, grid=(T * num_splits * 2, 1, 1), **parts)
+        producer = L.variant(route, grid=(T * num_splits * 2, 1, 1), **parts)
         if num_splits > 1:
-            L.reduce("bf16_h64_compressed_reduce", **parts)
+            L.run(producer, L.reduce("bf16_h64_compressed_reduce", **parts))
+        else:
+            L.run(producer)
         return
 
     if route == "bf16_h32_topk128x_early_v47":
@@ -1383,17 +1427,19 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         head_tiles = _ceil_div(H, 8)
         parts = L.partials(num_splits)
         arrivals = L.counters(T * head_tiles)
-        L.variant(
-            route,
-            grid=(T * num_splits * head_tiles, 1, 1),
-            partition_arrivals=arrivals,
-            num_head_tiles=head_tiles,
-            **parts,
+        L.run(
+            L.variant(
+                route,
+                grid=(T * num_splits * head_tiles, 1, 1),
+                partition_arrivals=arrivals,
+                num_head_tiles=head_tiles,
+                **parts,
+            )
         )
         return
 
     if route == "bf16_h64_prefill":
-        L.variant(route, grid=(T, 1, 1), total_work_items=T)
+        L.run(L.variant(route, grid=(T, 1, 1), total_work_items=T))
         return
 
     if route in ("bf16_h128_topk128x", "bf16_h128_topk4x_v52", "bf16_h128_prefill_v42"):
@@ -1430,11 +1476,11 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
             producer = "bf16_h128_topk128x_split4_sm100"
         parts = L.partials(num_splits)
         if num_splits == 1:
-            L.variant(producer, grid=(grid_x, 1, 1), total_work_items=T, **parts)
+            L.run(L.variant(producer, grid=(grid_x, 1, 1), total_work_items=T, **parts))
             return
         # The split producers write their per-owner outputs through ``O``.
         work_items = T * num_splits
-        L.variant(
+        split = L.variant(
             producer,
             grid=(2 * work_items, 1, 1),
             total_work_items=work_items,
@@ -1446,18 +1492,23 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
             # the sm_103a body runs grid (tokens, heads / 4), the sm_100a
             # body grid (tokens, heads).
             reducer_heads = H // 4 if L.arch == "sm_103a" else H
-            L.variant("bf16_h128_split5_reduce", grid=(T, reducer_heads, 1), **parts)
+            reduce = L.variant(
+                "bf16_h128_split5_reduce", grid=(T, reducer_heads, 1), **parts
+            )
         else:
-            L.reduce("split_reduce", **parts)
+            reduce = L.reduce("split_reduce", **parts)
+        L.run(split, reduce)
         return
 
     if route == "fp8_h64_source_exact":
         head_tiles = _ceil_div(H, 64)
-        L.variant(
-            route,
-            grid=(v["max_q_len"], head_tiles, v["batch_size"]),
-            num_head_tiles=head_tiles,
-            total_work_items=v["max_q_len"] * head_tiles * v["batch_size"],
+        L.run(
+            L.variant(
+                route,
+                grid=(v["max_q_len"], head_tiles, v["batch_size"]),
+                num_head_tiles=head_tiles,
+                total_work_items=v["max_q_len"] * head_tiles * v["batch_size"],
+            )
         )
         return
 
@@ -1466,7 +1517,7 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         "fp8_h128_prefill_source_persistent_uniform",
     ):
         parts = L.partials(1)
-        L.variant(route, grid=(T * 2, 1, 1), total_work_items=T, **parts)
+        L.run(L.variant(route, grid=(T * 2, 1, 1), total_work_items=T, **parts))
         return
 
     if route == "fp8_h64_prefill_source_persistent_m64":
@@ -1474,7 +1525,7 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # FP8/H128 persistent body (num_heads runtime, -1 masking, padded rows,
         # caller-owned workspace), grid = tokens.
         parts = L.partials(1)
-        L.variant(route, grid=(T, 1, 1), total_work_items=T, **parts)
+        L.run(L.variant(route, grid=(T, 1, 1), total_work_items=T, **parts))
         return
 
     if route in (
@@ -1486,8 +1537,10 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
         # prefill producer runs one CTA per work item over two items per
         # token; the decode producers run one two-CTA cluster per token.
         work_items = 2 * T if route == "fp8_lowhead_prefill" else T
-        L.variant(
-            route, grid=(2 * T, 1, 1), total_work_items=work_items, **L.partials(1)
+        L.run(
+            L.variant(
+                route, grid=(2 * T, 1, 1), total_work_items=work_items, **L.partials(1)
+            )
         )
         return
 
