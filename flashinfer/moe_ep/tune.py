@@ -1,9 +1,9 @@
 """Offline tuning for CuTe DSL MegaMoE backends.
 
 ``--arch auto`` selects SM107 on Rubin and SM100 otherwise. The ``sm90_*``
-dtypes (``sm90_fp8_e4m3`` / ``sm90_fp8_e5m2`` / ``sm90_bf16``) select the
-Hopper tuner. ``bf16`` and mixed BF16/MXFP8 are SM100 tuner dtypes.
-MXFP4/MXFP8 is wired for SM107.
+dtypes (``sm90_fp8_e4m3`` / ``sm90_fp8_e5m2`` / ``sm90_bf16`` /
+``sm90_bf16_nvfp4``) select the Hopper tuner. ``bf16`` and mixed BF16/MXFP8
+are SM100 tuner dtypes. MXFP4/MXFP8 is wired for SM107.
 
 Match the deployment's GPU, EP world size, geometry, and token capacity::
 
@@ -39,6 +39,7 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
             "sm90_fp8_e4m3",
             "sm90_fp8_e5m2",
             "sm90_bf16",
+            "sm90_bf16_nvfp4",
             "bf16",
             "bf16_mxfp8_e4m3",
             "bf16_mxfp8_e5m2",
@@ -190,11 +191,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("sm90_* dtypes require --arch auto or sm90", file=sys.stderr)
             return 2
         family = "sm90"
-        if args.dtype == "sm90_bf16":
+        if args.dtype in ("sm90_bf16", "sm90_bf16_nvfp4"):
             if args.fp8_scale_mode != "per_tensor":
-                print("sm90_bf16 has no FP8 scale mode", file=sys.stderr)
+                print(f"{args.dtype} has no FP8 scale mode", file=sys.stderr)
                 return 2
-            backend = "bf16_bf16_bf16_pull_cutedsl"
+            backend = (
+                "bf16_nvfp4_bf16_pull_cutedsl"
+                if args.dtype == "sm90_bf16_nvfp4"
+                else "bf16_bf16_bf16_pull_cutedsl"
+            )
         else:
             backend = "fp8_fp8_bf16_pull_cutedsl"
     else:

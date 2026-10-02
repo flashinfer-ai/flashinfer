@@ -111,6 +111,11 @@ HEUR_CSV_FIELDS = (
 )
 
 
+def _heuristic_key(scale_mode: str) -> str:
+    """Heuristic-table row set: W4A16 sessions resolve on the BF16 rows."""
+    return "bf16" if scale_mode == "nvfp4" else scale_mode
+
+
 def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[str]:
     """The launch config the shim resolves for this point (heuristic mode)."""
     if operand_order != "heuristic":
@@ -122,7 +127,7 @@ def _heuristic_cols(scale_mode: str, operand_order: str, tokens: int) -> list[st
     bootstrap_paths()
     from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-    sel = select_heuristic_config(scale_mode, tokens)
+    sel = select_heuristic_config(_heuristic_key(scale_mode), tokens)
     c = sel.config
     return [
         str(int(c.swap_ab)),
@@ -152,10 +157,11 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--scale-mode",
-        choices=["per_tensor", "blockwise", "both", "bf16", "all"],
+        choices=["per_tensor", "blockwise", "both", "bf16", "nvfp4", "all"],
         default="both",
         help="FP8 scale ABI(s) to sweep (both = per_tensor + blockwise), "
-        "bf16 = the BF16-operand backend, all = all three",
+        "bf16 = the BF16-operand backend, nvfp4 = W4A16 (BF16 x NVFP4), "
+        "all = all four",
     )
     order = p.add_mutually_exclusive_group()
     order.add_argument(
@@ -475,6 +481,7 @@ def _make_transformed_weights(args, scale_mode: str, local_experts: int, rank, d
     from flashinfer.moe_ep import (
         preprocess_sm90_pull_bf16_mega_weights,
         preprocess_sm90_pull_fp8_mega_weights,
+        preprocess_sm90_pull_w4a16_mega_weights,
     )
     from flashinfer.moe_ep.weights import MoEWeightPack
 
@@ -498,7 +505,14 @@ def _make_transformed_weights(args, scale_mode: str, local_experts: int, rank, d
         device=device,
         generator=g,
     ) * (args.intermediate**-0.5)
-    if scale_mode == "bf16":
+    if scale_mode == "nvfp4":
+        # BF16 pack -> NVFP4 at preprocess (per-expert global scale).
+        transformed = preprocess_sm90_pull_w4a16_mega_weights(
+            MoEWeightPack(w13=w13, w2=w2),
+            intermediate_size=args.intermediate,
+            hidden_size=args.hidden,
+        )
+    elif scale_mode == "bf16":
         transformed = preprocess_sm90_pull_bf16_mega_weights(
             MoEWeightPack(w13=w13, w2=w2),
             intermediate_size=args.intermediate,
@@ -526,6 +540,7 @@ def _pingpong_tile_ok(c) -> bool:
 def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=None):
     from flashinfer.moe_ep import (
         Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig,
+        Sm90_Bf16_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig,
         Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
     )
 
@@ -554,7 +569,7 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
             bootstrap_paths()
             from moe_hopper_fp8.heuristic_config import select_heuristic_config
 
-            c = select_heuristic_config(scale_mode, tokens).config
+            c = select_heuristic_config(_heuristic_key(scale_mode), tokens).config
             swap_ab = c.swap_ab
             mma_tiler_mnk = tuple(c.mma_tiler_mnk)
             # Explicit geometry flips the shim into manual mode, which fills
@@ -603,8 +618,12 @@ def _megakernel_config(args, scale_mode: str, operand_order: str, tile, tokens=N
         if getattr(args, "cga", None):
             cm, cn = (int(v) for v in args.cga.split(","))
             cluster_shape_mnk = (cm, cn, 1)
-    if scale_mode == "bf16":
-        config_cls = Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig
+    if scale_mode in ("bf16", "nvfp4"):
+        config_cls = (
+            Sm90_Bf16_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig
+            if scale_mode == "nvfp4"
+            else Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig
+        )
         format_kwargs = {}
     else:
         config_cls = Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig
@@ -744,7 +763,7 @@ def _run_point(
         transformed = _make_transformed_weights(
             args, scale_mode, local_experts, rank, device
         )
-        sparse_data = args.use_sparse_data and scale_mode != "bf16"
+        sparse_data = args.use_sparse_data and scale_mode not in ("bf16", "nvfp4")
         if sparse_data:
             # Drop perf recipe for weights: positive-only random E4M3 bytes.
             for tw in (transformed[0][0], transformed[1][0]):
@@ -874,6 +893,8 @@ def _run_point(
 def _backend_name(scale_mode: str) -> str:
     if scale_mode == "bf16":
         return "sm90_bf16_bf16_bf16_pull_cutedsl"
+    if scale_mode == "nvfp4":
+        return "sm90_bf16_nvfp4_bf16_pull_cutedsl"
     return "sm90_fp8_fp8_bf16_pull_cutedsl"
 
 
@@ -881,8 +902,8 @@ def _ref_csv_name(scale_mode: str, operand_order: str, tile) -> str:
     if operand_order == "heuristic":
         # Per-point geometry follows the token bucket; no single drop CSV.
         return "heuristic(no-single-ref)"
-    if scale_mode == "bf16":
-        return "bf16(no-drop-ref)"
+    if scale_mode in ("bf16", "nvfp4"):
+        return f"{scale_mode}(no-drop-ref)"
     scale_tag = "pertensor" if scale_mode == "per_tensor" else "blockwise"
     order_tag = "swapab" if operand_order == "swap_ab" else "nonswapab"
     return (
@@ -996,7 +1017,7 @@ def main() -> int:
     tokens_list = [int(t) for t in args.tokens.split(",") if t]
     scale_modes = {
         "both": ("per_tensor", "blockwise"),
-        "all": ("per_tensor", "blockwise", "bf16"),
+        "all": ("per_tensor", "blockwise", "bf16", "nvfp4"),
     }.get(args.scale_mode, (args.scale_mode,))
     orders = (
         ("non_swap_ab", "swap_ab")

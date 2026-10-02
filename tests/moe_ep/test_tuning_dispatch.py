@@ -55,6 +55,8 @@ def dispatched(monkeypatch):
         ("sm90", "sm90_fp8_e5m2", "sm90.fp8_fp8_bf16_pull_cutedsl"),
         ("auto", "sm90_bf16", "sm90.bf16_bf16_bf16_pull_cutedsl"),
         ("sm90", "sm90_bf16", "sm90.bf16_bf16_bf16_pull_cutedsl"),
+        ("auto", "sm90_bf16_nvfp4", "sm90.bf16_nvfp4_bf16_pull_cutedsl"),
+        ("sm90", "sm90_bf16_nvfp4", "sm90.bf16_nvfp4_bf16_pull_cutedsl"),
     ],
 )
 def test_tuner_dispatch(arch, dtype, backend, dispatched):
@@ -73,6 +75,15 @@ def test_tuner_dispatch(arch, dtype, backend, dispatched):
         ["--arch", "sm90", "--dtype", "nvfp4"],
         ["--arch", "sm100", "--dtype", "sm90_bf16"],
         ["--arch", "sm90", "--dtype", "sm90_bf16", "--fp8-scale-mode", "blockwise"],
+        ["--arch", "sm100", "--dtype", "sm90_bf16_nvfp4"],
+        [
+            "--arch",
+            "sm90",
+            "--dtype",
+            "sm90_bf16_nvfp4",
+            "--fp8-scale-mode",
+            "blockwise",
+        ],
         ["--arch", "sm107", "--kernel-variant", "genphase", "--combine-dtype", "nvfp4"],
         ["--arch", "sm107", "--kernel-variant", "genphase", "--combine-dtype", "mxfp8"],
         ["--arch", "sm100", "--activation", "situ"],
