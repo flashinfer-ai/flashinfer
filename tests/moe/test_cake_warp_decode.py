@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import gc
-import hashlib
-import json
 import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, replace
@@ -96,125 +94,16 @@ class _Module:
             raise self.run_error
 
 
-def _write_inventory(path, payload):
-    program = {key: payload[key] for key in ("modules", "sequences", "routes", "files")}
-    payload["program_hash"] = hashlib.sha256(
-        (
-            json.dumps(program, sort_keys=True, separators=(",", ":"), allow_nan=False)
-            + "\n"
-        ).encode()
-    ).hexdigest()
-    path.write_text(json.dumps(payload), encoding="utf-8")
-
-
-def _inventory_fixture(tmp_path):
-    prefix = "csrc/fused_moe/warp_decode/"
-    device = prefix + "generated/sm_100a/fc1_kernel.cu"
-    binding = prefix + "generated/sm_100a/fc1_binding.cu"
-    sequence_binding = prefix + "generated/sm_100a/sequence_binding.cu"
-    source_paths = [
-        device,
-        binding,
-        sequence_binding,
-        prefix + "generated/cake_warp_decode_generated_manifest.cuh",
-        prefix + "cake_warp_decode_binding.cu",
-        prefix + "cake_warp_decode_contract.cuh",
-    ]
-    files = {}
-    for name in source_paths:
-        path = tmp_path / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("// source inventory witness: fc1_symbol\n", encoding="utf-8")
-        files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
-    payload = {
-        "schema": "flashinfer.warp_decode.inventory.v1",
-        "modules": [
-            {
-                "name": "fc1",
-                "role": "fc1",
-                "arch": "sm_100a",
-                "kernel_symbol": "fc1_symbol",
-                "ffi_entry": "fc1_run",
-                "compile_flags": [],
-                "device": device,
-                "binding": binding,
-            }
-        ],
-        "sequences": [
-            {
-                "name": "seq",
-                "role": "decode",
-                "arch": "sm_100a",
-                "ffi_entry": "sequence_run",
-                "binding": sequence_binding,
-                "devices": [device],
-                "modules": [{"name": "fc1", "role": "fc1"}],
-            }
-        ],
-        "routes": [
-            {
-                "shape": "T1",
-                "arch": "sm_100a",
-                "args": {"num_tokens": 1},
-                "stages": [
-                    {
-                        "name": "fc1",
-                        "template": "fc1_static",
-                        "module": {"name": "fc1", "role": "fc1"},
-                    }
-                ],
-                "sequence": {"name": "seq", "role": "decode"},
-            }
-        ],
-        "files": files,
-    }
-    csrc_dir = tmp_path / prefix
-    manifest = csrc_dir / "generated" / "cake_warp_decode_inventory.json"
-    _write_inventory(manifest, payload)
-    return csrc_dir, manifest, payload, tmp_path / device
-
-
-def test_jit_validates_compact_inventory_source_and_route_closure(tmp_path):
-    csrc_dir, _, _, device = _inventory_fixture(tmp_path)
-    assert cake_warp_decode_jit._load_exported_device_sources(csrc_dir, "sm100a") == (
-        [device],
-        False,
-        {device: []},
-    )
-    with pytest.raises(ValueError, match="no modules for exact target"):
-        cake_warp_decode_jit._load_exported_device_sources(csrc_dir, "sm103a")
-
-
-@pytest.mark.parametrize(
-    "failure",
-    [
-        "source_hash",
-        "program_hash",
-        "route_module",
-        "sequence_device",
-        "architecture",
-        "compile_flags",
-    ],
-)
-def test_jit_rejects_inconsistent_compact_inventory(tmp_path, failure):
-    csrc_dir, manifest, payload, device = _inventory_fixture(tmp_path)
-    if failure == "source_hash":
-        device.write_text("// changed source\n", encoding="utf-8")
-    elif failure == "program_hash":
-        payload["program_hash"] = "0" * 64
-        manifest.write_text(json.dumps(payload), encoding="utf-8")
-    else:
-        if failure == "route_module":
-            payload["routes"][0]["stages"][0]["module"]["name"] = "missing"
-        elif failure == "sequence_device":
-            payload["sequences"][0]["devices"] = []
-        elif failure == "compile_flags":
-            del payload["modules"][0]["compile_flags"]
-        else:
-            payload["modules"][0]["arch"] = "sm_103a"
-        _write_inventory(manifest, payload)
-    with pytest.raises(ValueError):
-        cake_warp_decode_jit._load_exported_device_sources(csrc_dir, "sm100a")
+@pytest.mark.parametrize("target", ["sm100a", "sm103a"])
+def test_jit_device_sources_resolve_and_share_common_kernels(target):
+    csrc_dir = cake_warp_decode_jit._get_cake_fused_moe_warp_decode_csrc_dir()
+    sources = cake_warp_decode_jit._device_sources(csrc_dir, target)
+    names = [source.name for source in sources]
+    assert sources and len(set(names)) == len(names)
+    assert set(cake_warp_decode_jit._COMMON_SOURCES) <= set(names)
+    assert set(cake_warp_decode_jit._NO_FAST_MATH_SOURCES) <= set(names)
+    with pytest.raises(FileNotFoundError, match="device sources not found"):
+        cake_warp_decode_jit._device_sources(csrc_dir / "missing", target)
 
 
 def test_jit_prefers_checkout_sources_when_editable_data_is_staged(
