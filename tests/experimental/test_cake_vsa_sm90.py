@@ -17,6 +17,7 @@ limitations under the License.
 """Cake SM90 VSA (``backend="cake"`` on Hopper): planning, numerics, lifetime, API."""
 
 
+import contextlib
 import warnings
 
 import pytest
@@ -314,10 +315,9 @@ def test_split_variants_are_the_shipped_ones():
     with one outlier selection; those masks now run the persistent kernel."""
     for counts in ([2], [3] * 8, [7] * 65 + [13], [7] * 64 + [25], [9] * 40):
         assert split_kmax(counts) in (4, 6)
-        try:
+        # no shipped variant fits one wave: small_route falls through
+        with contextlib.suppress(ValueError):
             assert split_kmax(counts, sms=132) in (4, 6)
-        except ValueError:
-            pass  # no shipped variant fits one wave: small_route falls through
     for kmax in (1, 3):
         with pytest.raises(ValueError, match="split-KV variant"):
             plan_small(_random_mask(1, 4, 8, 6, seed=3), kmax=kmax, split=True)
