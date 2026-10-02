@@ -177,7 +177,9 @@ fails fast on the host side.
 `sm_120a/` holds the Cake-generated SM120 (GB202: RTX 5090, RTX PRO 6000
 Blackwell) DeepSeek-V4 NVFP4 sparse-MLA decode family: one translation unit per
 query head count (8, 16, 32, 48, 64, 80, 96, 112, 128) with the single-cache
-decode, dual-cache decode and split-merge kernels, the TVM-FFI binding
+decode, dual-cache decode and split-merge kernels (head counts divisible by 32
+also carry two-tile variants that process 32 heads per CTA over one shared
+candidate gather), the TVM-FFI binding
 `cake_sparse_mla_dsv4_nvfp4_binding.cu`, and
 `cake_sparse_mla_dsv4_nvfp4_manifest.json` (provenance, geometry constants
 and the source list the JIT spec compiles). Regenerate the whole directory
@@ -204,5 +206,10 @@ an optional second cache (`compressed_kv_cache` / `extra_kv_cache`, any page
 size), per-token lengths, `-1` masking, attention sinks and `lse_scale`.
 Split-K scratch (`mid_out` / `mid_lse`) is caller-owned or carved from the
 public `workspace_buffer`; size it with
-`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes`. `backend="auto"`
-keeps the hand-written SM120 kernels.
+`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes`. The Python
+planners `cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles` (1 or 2 head tiles
+per CTA) and `cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits` (split count and
+chunks per CTA, at most 16 chunks of 64 candidates per CTA, so more than 1024
+candidates always split) mirror the generating kernel module's launcher;
+`head_tiles` / `num_splits` on the low-level decode entry override them.
+`backend="auto"` keeps the hand-written SM120 kernels.

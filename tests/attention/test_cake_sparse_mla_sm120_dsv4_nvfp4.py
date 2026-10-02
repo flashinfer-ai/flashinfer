@@ -19,7 +19,10 @@ NVFP4 operands at the SM120 NVFP4 tolerances (output atol=rtol=5e-2, LSE
 atol=rtol=2e-2).
 """
 
+import importlib
+import itertools
 import math
+import os
 
 import pytest
 import torch
@@ -31,6 +34,7 @@ from flashinfer.mla._sparse_mla_sm120._cake_dsv4_nvfp4 import (
     cake_sparse_mla_sm120_dsv4_nvfp4_decode,
     cake_sparse_mla_sm120_dsv4_nvfp4_format_info,
     cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks,
+    cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles,
     cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits,
     cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes,
     cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads,
@@ -46,6 +50,8 @@ from tests.attention.sparse_mla_test_utils import (
 
 _D = _D_NOPE + _D_ROPE
 _BYTES = 384
+# Dotted name of the generating kernel module (planner parity test); unset -> skipped.
+_KERNEL_MODULE_ENV = "CAKE_SPARSE_MLA_SM120_DSV4_KERNEL_MODULE"
 _OUT_TOL = dict(atol=5e-2, rtol=5e-2)
 _LSE_TOL = dict(atol=2e-2, rtol=2e-2)
 
@@ -53,6 +59,10 @@ _LSE_TOL = dict(atol=2e-2, rtol=2e-2)
 def _require_sm120() -> None:
     if not torch.cuda.is_available() or not is_sm12x_supported(torch.device("cuda")):
         pytest.skip("Cake SM120 NVFP4 sparse MLA requires SM12x")
+
+
+def _device_sms() -> int:
+    return torch.cuda.get_device_properties(torch.device("cuda")).multi_processor_count
 
 
 def _latent(num_pages: int, page_size: int) -> torch.Tensor:
@@ -151,6 +161,9 @@ def test_cake_format_info() -> None:
     assert info["runtime_page"] and info["runtime_extra_page"]
     assert set(info["heads"]) >= {8, 16, 32, 64, 128}
     assert cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads() == info["heads"]
+    # Two-tile (32 heads per CTA) instances exist exactly for the head counts divisible by 32.
+    assert set(info["two_tile_heads"]) == {h for h in info["heads"] if h % 32 == 0}
+    assert info["heads_per_block"] == 16 and info["max_chunks_per_block"] == 16
     assert cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(128) == 2
     assert cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(512, 512) == 16
     assert cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(130, 1) == 4
@@ -168,19 +181,108 @@ def test_cake_plan_splits_rules() -> None:
     assert plan(num_tokens=8, num_heads=8, topk=512, num_sms=188) == (4, 2)
     # Full grids run unsplit unless the doubled 16-chunk grid ends in a half-full wave.
     assert plan(num_tokens=128, num_heads=128, topk=512, num_sms=188) == (1, 8)
-    # Candidate lists beyond the 16-chunk index table always split.
+    # Candidate lists beyond the 16-chunk index table always split, even on a full grid,
+    # and a max_splits that cannot honour the table is an error rather than a silent cap.
     splits, cpb = plan(
         num_tokens=128, num_heads=128, topk=512, extra_topk=1024, num_sms=188
     )
-    assert cpb <= 16 and splits * cpb >= 24
+    assert cpb <= 16 and splits * cpb >= 24 and splits >= 2
+    with pytest.raises(ValueError, match="at most 16"):
+        plan(
+            num_tokens=128,
+            num_heads=128,
+            topk=512,
+            extra_topk=1024,
+            num_sms=188,
+            max_splits=1,
+        )
     assert plan(num_tokens=4, num_heads=128, topk=512, num_sms=188, max_splits=1) == (
         1,
         8,
+    )
+    # Two head tiles halve the grid, so the split planner sees half the CTAs.
+    assert plan(num_tokens=32, num_heads=128, topk=512, num_sms=188, head_tiles=2) == (
+        1,
+        8,
+    )
+    assert plan(num_tokens=8, num_heads=96, topk=512, num_sms=188, head_tiles=2) == (
+        4,
+        2,
     )
     assert (
         cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes(2, 128, 512)
         == 2 * 128 * 8 * 1028 + 2 * 128 * 4 + 48
     )
+
+
+def test_cake_plan_head_tiles_rules() -> None:
+    plan = cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles
+    # Head counts not divisible by 32 have no two-tile instance.
+    assert plan(num_tokens=128, num_heads=8, topk=512, num_sms=188) == 1
+    assert plan(num_tokens=128, num_heads=48, topk=512, num_sms=188) == 1
+    # A one-tile grid that fills a wave of SMs pairs tiles.
+    assert plan(num_tokens=32, num_heads=128, topk=512, num_sms=188) == 2
+    assert plan(num_tokens=32, num_heads=128, topk=512, num_sms=170) == 2
+    assert plan(num_tokens=8, num_heads=96, topk=512, num_sms=188) == 1
+    # Gather-bound rows in [SMs / 3, SMs / 2) with >= 8 chunks and <= 64 heads pair tiles.
+    assert plan(num_tokens=16, num_heads=64, topk=512, num_sms=188) == 2
+    assert plan(num_tokens=16, num_heads=64, topk=128, num_sms=188) == 1
+    assert plan(num_tokens=16, num_heads=64, topk=256, extra_topk=512, num_sms=188) == 2
+
+
+def test_cake_planner_parity_with_kernel_module() -> None:
+    """The Python planners mirror the generating kernel module exactly.
+
+    Set ``CAKE_SPARSE_MLA_SM120_DSV4_KERNEL_MODULE`` to the module's dotted name to run it.
+    """
+
+    name = os.environ.get(_KERNEL_MODULE_ENV)
+    if not name:
+        pytest.skip(f"{_KERNEL_MODULE_ENV} not set")
+    try:
+        mod = importlib.import_module(name)
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        pytest.skip(f"kernel module {name} unavailable: {exc}")
+    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+    assert info["heads_per_block"] == mod.HPB
+    assert info["max_chunks_per_block"] == mod.MAX_CPB
+    assert tuple(mod.SUPPORTED_HEAD_COUNTS) == info["heads"]
+    max_cpb = info["max_chunks_per_block"]
+    grid = itertools.product(
+        (1, 2, 4, 8, 16, 32, 64, 128),
+        info["heads"],
+        (64, 128, 256, 512, 1024),
+        (0, 128, 512),
+        (170, 188),
+    )
+    for num_tokens, num_heads, topk, extra_topk, num_sms in grid:
+        chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+        assert chunks == mod.max_chunks(topk, extra_topk)
+        kwargs = dict(
+            num_tokens=num_tokens,
+            num_heads=num_heads,
+            topk=topk,
+            extra_topk=extra_topk,
+            num_sms=num_sms,
+        )
+        tiles = cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(**kwargs)
+        assert tiles == mod.plan_head_tiles(**kwargs), kwargs
+        plan = cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
+            **kwargs, max_splits=16, head_tiles=tiles
+        )
+        assert plan == mod.plan_splits(**kwargs, max_splits=16, head_tiles=tiles), (
+            kwargs
+        )
+        splits, cpb = plan
+        assert cpb <= max_cpb and splits >= -(-chunks // max_cpb)
+        if chunks > max_cpb:
+            # > 1024 candidates: both sides refuse a max_splits below ceil(chunks / 16).
+            with pytest.raises(ValueError):
+                mod.plan_splits(**kwargs, max_splits=1, head_tiles=tiles)
+            with pytest.raises(ValueError):
+                cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
+                    **kwargs, max_splits=1, head_tiles=tiles
+                )
 
 
 @pytest.mark.parametrize("topk", [128, 512])
@@ -470,6 +572,150 @@ def test_cake_decode_head_count_48() -> None:
         torch.testing.assert_close(lse, reference_lse, **_LSE_TOL)
 
 
+def test_cake_decode_two_tile_h96() -> None:
+    """Three 32-head CTAs per token (two 16-head tiles each) against the reference."""
+
+    _require_sm120()
+    torch.manual_seed(20261008)
+    num_tokens, num_heads, topk, page_size = 8, 96, 512, 64
+    assert 96 in cake_sparse_mla_sm120_dsv4_nvfp4_format_info()["two_tile_heads"]
+    q = _query(num_tokens, num_heads)
+    cache = nvfp4_quantize_pack_sparse_mla_cache(_latent(16, page_size))
+    indices = torch.randint(
+        0, 16 * page_size, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    indices[1, 100:] = -1
+    attn_sink = torch.linspace(-0.5, 0.5, num_heads, dtype=torch.float32, device="cuda")
+    reference, reference_lse = _reference(
+        q, cache, indices, _D**-0.5, attn_sink=attn_sink
+    )
+    for num_splits in (None, 1, 4):
+        output, lse = _cake_nvfp4_sparse_mla_decode(
+            q,
+            cache,
+            indices,
+            _D**-0.5,
+            attn_sink=attn_sink,
+            num_splits=num_splits,
+            head_tiles=2,
+        )
+        torch.testing.assert_close(output, reference, **_OUT_TOL)
+        torch.testing.assert_close(lse, reference_lse, **_LSE_TOL)
+    with pytest.raises(ValueError, match="not valid"):
+        _cake_nvfp4_sparse_mla_decode(
+            _query(num_tokens, 48), cache, indices, _D**-0.5, head_tiles=2
+        )
+
+
+def test_cake_decode_two_tile_split_h128() -> None:
+    """A full-wave grid where the planner itself picks two tiles, with and without splits."""
+
+    _require_sm120()
+    torch.manual_seed(20261009)
+    num_tokens, num_heads, topk, page_size = 32, 128, 512, 64
+    assert (
+        cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
+            num_tokens=num_tokens, num_heads=num_heads, topk=topk, num_sms=_device_sms()
+        )
+        == 2
+    )
+    q = _query(num_tokens, num_heads)
+    cache = nvfp4_quantize_pack_sparse_mla_cache(_latent(32, page_size))
+    indices = torch.randint(
+        0, 32 * page_size, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    lengths = torch.randint(
+        1, topk + 1, (num_tokens,), dtype=torch.int32, device="cuda"
+    )
+    reference, reference_lse = _reference(
+        q, cache, indices, _D**-0.5, main_lengths=lengths
+    )
+    output = torch.empty_like(q)
+    out_lse = torch.empty(num_tokens, num_heads, dtype=torch.float32, device="cuda")
+    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk)
+    mid_out = torch.empty(
+        num_tokens, num_heads, chunks, _D, dtype=torch.bfloat16, device="cuda"
+    )
+    mid_lse = torch.empty(
+        num_tokens, num_heads, chunks, dtype=torch.float32, device="cuda"
+    )
+    for num_splits in (None, 2, 8):
+        plan = cake_sparse_mla_sm120_dsv4_nvfp4_decode(
+            q,
+            cache,
+            indices,
+            output,
+            out_lse,
+            _D**-0.5,
+            topk_length=lengths,
+            mid_out=mid_out,
+            mid_lse=mid_lse,
+            num_splits=num_splits,
+        )
+        assert plan["head_tiles"] == 2
+        assert plan["num_splits"] == (num_splits or 1)
+        assert plan["num_splits"] * plan["chunks_per_block"] >= chunks
+        torch.testing.assert_close(output, reference, **_OUT_TOL)
+        torch.testing.assert_close(out_lse, reference_lse, **_LSE_TOL)
+
+
+def test_cake_decode_long_candidate_list() -> None:
+    """More than 1024 candidates (24 chunks) exceed one CTA's index table and must split."""
+
+    _require_sm120()
+    torch.manual_seed(20261010)
+    num_tokens, num_heads, topk, extra_topk, page_size = 2, 16, 1024, 512, 64
+    q = _query(num_tokens, num_heads)
+    cache = nvfp4_quantize_pack_sparse_mla_cache(_latent(32, page_size))
+    extra_cache = nvfp4_quantize_pack_sparse_mla_cache(_latent(16, page_size))
+    indices = torch.randint(
+        0, 32 * page_size, (num_tokens, topk), dtype=torch.int32, device="cuda"
+    )
+    extra_indices = torch.randint(
+        0, 16 * page_size, (num_tokens, extra_topk), dtype=torch.int32, device="cuda"
+    )
+    reference, reference_lse = _reference(
+        q,
+        cache,
+        indices,
+        _D**-0.5,
+        extra_cache=extra_cache,
+        extra_indices=extra_indices,
+    )
+    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+    assert chunks == 24
+    splits, cpb = cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk=topk,
+        extra_topk=extra_topk,
+        num_sms=_device_sms(),
+    )
+    assert splits >= 2 and cpb <= 16
+    for num_splits in (None, 2, 24):
+        output, lse = _cake_nvfp4_sparse_mla_decode(
+            q,
+            cache,
+            indices,
+            _D**-0.5,
+            extra_kv_cache=extra_cache,
+            extra_indices=extra_indices,
+            num_splits=num_splits,
+        )
+        torch.testing.assert_close(output, reference, **_OUT_TOL)
+        torch.testing.assert_close(lse, reference_lse, **_LSE_TOL)
+    with pytest.raises(ValueError, match="at most"):
+        _cake_nvfp4_sparse_mla_decode(
+            q,
+            cache,
+            indices,
+            _D**-0.5,
+            extra_kv_cache=extra_cache,
+            extra_indices=extra_indices,
+            num_splits=1,
+        )
+
+
 def test_cake_decode_rejects_bad_inputs() -> None:
     _require_sm120()
     torch.manual_seed(20261007)
@@ -500,6 +746,10 @@ def test_cake_decode_rejects_bad_inputs() -> None:
         )
     with pytest.raises(ValueError, match="provided together"):
         _cake_nvfp4_sparse_mla_decode(q, cache, indices, 1.0, extra_kv_cache=cache)
+    with pytest.raises(ValueError, match="not valid"):
+        _cake_nvfp4_sparse_mla_decode(q, cache, indices, 1.0, head_tiles=2)
+    with pytest.raises(ValueError, match="not valid"):
+        _cake_nvfp4_sparse_mla_decode(_query(2, 64), cache, indices, 1.0, head_tiles=3)
 
 
 @pytest.mark.parametrize(

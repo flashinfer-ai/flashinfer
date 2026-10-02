@@ -80,6 +80,9 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_format_info() -> dict:
         "heads_per_block": int(manifest["heads_per_block"]),
         "max_chunks_per_block": int(manifest["max_chunks_per_block"]),
         "heads": tuple(int(h) for h in manifest["head_counts"]),
+        "two_tile_heads": tuple(
+            int(h) for h in manifest.get("two_tile_head_counts", ())
+        ),
         "runtime_page": True,
         "runtime_extra_page": True,
         "kernel_commit": manifest["kernel_commit"],
@@ -96,6 +99,41 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk: int, extra_topk: int = 0) 
     return (int(topk) + _CHUNK - 1) // _CHUNK + (int(extra_topk) + _CHUNK - 1) // _CHUNK
 
 
+def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+    extra_topk: int = 0,
+    num_sms: int,
+) -> int:
+    """Return the number of 16-head tiles per decode CTA (1 or 2).
+
+    Two tiles (32 heads per CTA sharing one candidate gather) win once the
+    one-tile grid fills at least one wave of SMs, or when it sits in
+    ``[SMs / 3, SMs / 2)`` with at least 8 chunks and at most 64 heads
+    (gather-bound rows where the split planner refills the halved grid without
+    a wave penalty); one tile otherwise.  Head counts not divisible by 32 have
+    no two-tile instance.
+    """
+
+    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+    hpb = info["heads_per_block"]
+    if int(num_heads) % (2 * hpb) != 0:
+        return 1
+    base_ctas = int(num_tokens) * (int(num_heads) // hpb)
+    if base_ctas >= int(num_sms):
+        return 2
+    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+    if (
+        chunks >= 8
+        and int(num_heads) <= 4 * hpb
+        and int(num_sms) // 3 <= base_ctas < int(num_sms) // 2
+    ):
+        return 2
+    return 1
+
+
 def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
     *,
     num_tokens: int,
@@ -104,10 +142,12 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
     extra_topk: int = 0,
     num_sms: int,
     max_splits: int = 16,
+    head_tiles: int = 1,
 ) -> Tuple[int, int]:
     """Return ``(num_splits, chunks_per_block)`` for one decode call.
 
-    Measured split rules (RTX PRO 6000 Blackwell / RTX 5090):
+    Measured split rules (RTX PRO 6000 Blackwell / RTX 5090), with the grid
+    counted in CTAs of ``16 * head_tiles`` heads:
 
     * two chunks never split: one CTA pipelining both chunks beats two CTAs
       plus a merge;
@@ -117,10 +157,10 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
       CTA);
     * once the unsplit grid fills the SMs, split in two only for 16-chunk work
       whose doubled grid ends in a wave at least half full;
-    * everything else runs unsplit.
-
-    The CTA index table holds at most ``max_chunks_per_block`` chunks, so
-    longer candidate lists always split.
+    * everything else runs unsplit;
+    * independently, ``chunks_per_block <= max_chunks_per_block`` always holds
+      (the CTA index table), so more than 1024 candidates force
+      ``num_splits >= ceil(chunks / 16)``; ``max_splits`` below that raises.
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
@@ -129,14 +169,21 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
     chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
     if chunks < 1:
         raise ValueError("topk must be at least 1")
-    head_blocks = (int(num_heads) + hpb - 1) // hpb
+    min_splits = -(-chunks // max_cpb)
+    if min_splits > max_splits:
+        raise ValueError(
+            f"{chunks} chunks need at least {min_splits} splits (at most {max_cpb} "
+            f"chunks per block), max_splits={max_splits}"
+        )
+    cta_heads = hpb * int(head_tiles)
+    head_blocks = (int(num_heads) + cta_heads - 1) // cta_heads
     base_ctas = int(num_tokens) * head_blocks
-    splits = 1
+    splits = min_splits
     if chunks > 2 and max_splits > 1:
         grid_cap = int(num_sms) * 4 // 5
         if base_ctas * 2 <= grid_cap:
             min_cpb = 1 if base_ctas == 1 else 2
-            want = 1
+            want = min_splits
             while (
                 want * 2 <= max_splits
                 and base_ctas * want * 2 <= grid_cap
@@ -144,17 +191,16 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
             ):
                 want *= 2
             splits = want
-        elif base_ctas >= num_sms and chunks >= 16:
+        elif base_ctas >= int(num_sms) and chunks >= 16:
             tail = (base_ctas * 2) % int(num_sms)
             if tail == 0 or tail * 2 >= int(num_sms):
-                splits = 2
-    splits = max(splits, -(-chunks // max_cpb))
+                splits = max(splits, 2)
     cpb = -(-chunks // splits)
     splits = -(-chunks // cpb)
     return splits, cpb
 
 
-def _resolve_splits(
+def _resolve_plan(
     *,
     num_tokens: int,
     num_heads: int,
@@ -163,27 +209,47 @@ def _resolve_splits(
     device: torch.device,
     num_splits: Optional[int],
     max_splits: int,
-) -> Tuple[int, int]:
-    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
-    if num_splits is None:
-        return cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
+    head_tiles: Optional[int],
+) -> Tuple[int, int, int]:
+    """Resolve ``(head_tiles, num_splits, chunks_per_block)`` like the kernel module's launcher."""
+
+    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+    num_sms = _num_sms(device)
+    ht = (
+        int(head_tiles)
+        if head_tiles is not None
+        else cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
             num_tokens=num_tokens,
             num_heads=num_heads,
             topk=topk,
             extra_topk=extra_topk,
-            num_sms=_num_sms(device),
-            max_splits=max_splits,
+            num_sms=num_sms,
         )
+    )
+    if ht not in (1, 2) or (ht == 2 and num_heads not in info["two_tile_heads"]):
+        raise ValueError(f"head_tiles={ht} is not valid for {num_heads} heads")
+    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+    if num_splits is None:
+        splits, cpb = cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
+            num_tokens=num_tokens,
+            num_heads=num_heads,
+            topk=topk,
+            extra_topk=extra_topk,
+            num_sms=num_sms,
+            max_splits=max_splits,
+            head_tiles=ht,
+        )
+        return ht, splits, cpb
     num_splits = int(num_splits)
     if num_splits < 1:
         raise ValueError(f"num_splits must be positive, got {num_splits}")
     cpb = -(-chunks // num_splits)
-    max_cpb = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()["max_chunks_per_block"]
+    max_cpb = info["max_chunks_per_block"]
     if cpb > max_cpb:
         raise ValueError(
-            f"num_splits={num_splits} leaves {cpb} chunks per block; the kernel holds at most {max_cpb}"
+            f"num_splits={num_splits} leaves {cpb} chunks per CTA; the index table holds at most {max_cpb}"
         )
-    return -(-chunks // cpb), cpb
+    return ht, -(-chunks // cpb), cpb
 
 
 def cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes(
@@ -306,6 +372,7 @@ def get_cake_sparse_mla_sm120_dsv4_nvfp4_module():
         extra_page_stride_bytes: int,
         num_splits: int,
         chunks_per_block: int,
+        head_tiles: int,
         sm_scale: float,
         lse_scale: float,
     ) -> None:
@@ -328,6 +395,7 @@ def get_cake_sparse_mla_sm120_dsv4_nvfp4_module():
             extra_page_stride_bytes,
             num_splits,
             chunks_per_block,
+            head_tiles,
             sm_scale,
             lse_scale,
         )
@@ -358,13 +426,16 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
     lse_scale: float = 1.0,
     num_splits: Optional[int] = None,
     max_splits: int = 16,
-) -> Tuple[int, int]:
+    head_tiles: Optional[int] = None,
+) -> Dict[str, int]:
     """Run the allocation-free Cake SM120 NVFP4 sparse-MLA decode.
 
-    Writes ``output`` and ``out_lse`` in place and returns the resolved
-    ``(num_splits, chunks_per_block)``.  ``mid_out`` / ``mid_lse`` are
-    required when the plan splits (``num_splits > 1``); size them with
-    ``cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks`` splits to cover every plan.
+    Writes ``output`` and ``out_lse`` in place and returns the resolved plan
+    ``{"head_tiles", "num_splits", "chunks_per_block"}``.  ``mid_out`` /
+    ``mid_lse`` are required when the plan splits (``num_splits > 1``); size
+    them with ``cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks`` splits to cover
+    every plan.  ``head_tiles`` (1 or 2, head counts divisible by 32) and
+    ``num_splits`` override the planners.
     """
 
     if q.ndim != 3 or q.shape[-1] != _D_QK:
@@ -424,7 +495,7 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
                 f"attn_sink must be a 1-D float32 tensor with at least {num_heads} entries"
             )
         attn_sink = attn_sink.contiguous()
-    splits, cpb = _resolve_splits(
+    ht, splits, cpb = _resolve_plan(
         num_tokens=num_tokens,
         num_heads=num_heads,
         topk=topk,
@@ -432,6 +503,7 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
         device=q.device,
         num_splits=num_splits,
         max_splits=max_splits,
+        head_tiles=head_tiles,
     )
     if splits > 1:
         if mid_out is None or mid_lse is None:
@@ -482,10 +554,11 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
         extra_page_stride,
         splits,
         cpb,
+        ht,
         float(sm_scale),
         float(lse_scale),
     )
-    return splits, cpb
+    return {"head_tiles": ht, "num_splits": splits, "chunks_per_block": cpb}
 
 
 @supported_compute_capability([120, 121])
@@ -502,6 +575,7 @@ def _cake_nvfp4_sparse_mla_decode(
     extra_topk_length: Optional[torch.Tensor] = None,
     lse_scale: float = 1.0,
     num_splits: Optional[int] = None,
+    head_tiles: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Allocating convenience entry (tests / benchmarks): returns ``(output, out_lse)``."""
 
@@ -535,6 +609,7 @@ def _cake_nvfp4_sparse_mla_decode(
         mid_lse=mid_lse,
         lse_scale=lse_scale,
         num_splits=num_splits,
+        head_tiles=head_tiles,
     )
     return output, out_lse
 
@@ -565,7 +640,7 @@ def functional_run(
         extra_indices = _normalize_indices(extra_indices, "extra_indices", num_tokens)
     topk = int(indices.shape[1])
     extra_topk = int(extra_indices.shape[1]) if extra_indices is not None else 0
-    splits, _ = _resolve_splits(
+    ht, splits, _ = _resolve_plan(
         num_tokens=num_tokens,
         num_heads=num_heads,
         topk=topk,
@@ -573,6 +648,7 @@ def functional_run(
         device=q.device,
         num_splits=None,
         max_splits=16,
+        head_tiles=None,
     )
     requirements = []
     if splits > 1:
@@ -613,6 +689,7 @@ def functional_run(
         mid_lse=mid_lse,
         lse_scale=lse_scale,
         num_splits=splits,
+        head_tiles=ht,
     )
     return result
 
@@ -672,7 +749,7 @@ def wrapper_run(
         extra_indices = _normalize_indices(extra_indices, "extra_indices", num_tokens)
     topk = int(indices.shape[1])
     extra_topk = int(extra_indices.shape[1]) if extra_indices is not None else 0
-    splits, _ = _resolve_splits(
+    ht, splits, _ = _resolve_plan(
         num_tokens=num_tokens,
         num_heads=num_heads,
         topk=topk,
@@ -680,6 +757,7 @@ def wrapper_run(
         device=q.device,
         num_splits=None,
         max_splits=16,
+        head_tiles=None,
     )
     if (mid_out is None) != (mid_lse is None):
         raise ValueError("mid_out and mid_lse must be provided together")
@@ -717,6 +795,7 @@ def wrapper_run(
         mid_lse=mid_lse,
         lse_scale=lse_scale,
         num_splits=splits,
+        head_tiles=ht,
     )
     return lse if return_lse else None
 
@@ -725,6 +804,7 @@ __all__ = [
     "cake_sparse_mla_sm120_dsv4_nvfp4_decode",
     "cake_sparse_mla_sm120_dsv4_nvfp4_format_info",
     "cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks",
+    "cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles",
     "cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits",
     "cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes",
     "cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads",
