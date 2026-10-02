@@ -80,6 +80,12 @@ _SWAPAB_TILE_N_CHOICES = (8, 16, 32, 64, 128)
 # scheduler grouping and TMA multicast.
 _SUPPORTED_CLUSTER_SHAPES_MN = ((1, 1), (2, 1), (1, 2), (2, 2))
 
+# W4A16 augmented weight tile mirrored from kernel_fp8_glu_fc12_swapab.py
+# (W4A16TileK / W4A16PairTileBytes): per row PAIR and 128-K tile, two rows of
+# [64 B packed E2M1 | 8 B E4M3 per-16 scales].
+W4A16_TILE_K = 128
+W4A16_PAIR_TILE_BYTES = 144
+
 # Token-back placement enum mirrored from megamoe_kernel_fp8.py.
 _TOKEN_BACK_MODES = ("epi_warps", "standalone_warps", "reuse_dispatch_warps")
 
@@ -210,6 +216,10 @@ class MegaMoEHopperFp8Config:
     # 1-CTA weight cluster: swap-AB cga (1, 2, 1) or non-swap cga (2, 1, 1).
     # Output-invariant; the heuristic table turns it on per bucket.
     tail_split_pairs: bool = False
+    # "nvfp4": W4A16 -- packed NVFP4 weights in the augmented row-pair byte
+    # layout (see W4A16_PAIR_TILE_BYTES), decoded into register-sourced BF16
+    # WGMMA.  Needs kind="bf16" and swap_ab.
+    weight_format: Literal["dense", "nvfp4"] = "dense"
     # deepgemm compute graph: routing weights folded into the SwiGLU output
     # before FC1-output quantization (the driver's ref_compute_graph switch).
     # False leaves the staged FC2 terms unweighted and applies scores in the
@@ -233,6 +243,24 @@ class MegaMoEHopperFp8Config:
             raise ValueError(
                 "fp8_accum_mode must be '1xacc' or '2xacc', "
                 f"got {self.fp8_accum_mode!r}."
+            )
+        if self.weight_format not in ("dense", "nvfp4"):
+            raise ValueError(
+                f"weight_format must be 'dense' or 'nvfp4', got {self.weight_format!r}."
+            )
+        if self.weight_format == "nvfp4" and (
+            self.kind != "bf16"
+            or not self.swap_ab
+            or self.mma_tiler_mnk[2] != W4A16_TILE_K
+            or self.hidden % W4A16_TILE_K
+            or self.intermediate % W4A16_TILE_K
+        ):
+            raise ValueError(
+                "weight_format='nvfp4' (W4A16) needs kind='bf16', swap_ab=True, "
+                f"mma_tiler K={W4A16_TILE_K} and hidden/intermediate multiples of "
+                f"{W4A16_TILE_K}; got kind={self.kind!r}, swap_ab={self.swap_ab}, "
+                f"mma_tiler_mnk={self.mma_tiler_mnk}, hidden={self.hidden}, "
+                f"intermediate={self.intermediate}."
             )
         if self.kind == "bf16" and (
             self.fp8_scale_mode != "per_tensor" or self.fp8_accum_mode != "1xacc"
@@ -684,6 +712,7 @@ class MegaMoEHopperFp8Frontend:
             c.apply_topk_in_fc1,
             self._gate_up_clamp,
             c.enable_iket,
+            c.weight_format,
         )
 
     @staticmethod
@@ -800,6 +829,7 @@ class MegaMoEHopperFp8Frontend:
             fold_producer_warps=c.fold_producer_warps,
             generate_c=c.generate_c,
             tail_split_pairs=c.tail_split_pairs,
+            weight_format=c.weight_format,
         )
 
         local_ws_bytes, shared_ws_bytes = kernel.get_workspace_sizes()
@@ -1047,9 +1077,45 @@ class MegaMoEHopperFp8Frontend:
                 f"fp8_scale_mode={c.fp8_scale_mode!r})."
             )
 
+        if c.weight_format == "nvfp4":
+            # Augmented row-pair bytes: (E, N/2, K/128 * 144) uint8, dense.
+            for name, tensor, w4a16_shape in (
+                (
+                    "fc1_weight",
+                    inputs.fc1_weight,
+                    (
+                        e,
+                        c.fc1_out // 2,
+                        c.hidden // W4A16_TILE_K * W4A16_PAIR_TILE_BYTES,
+                    ),
+                ),
+                (
+                    "fc2_weight",
+                    inputs.fc2_weight,
+                    (
+                        e,
+                        c.hidden // 2,
+                        c.intermediate // W4A16_TILE_K * W4A16_PAIR_TILE_BYTES,
+                    ),
+                ),
+            ):
+                _require_cuda(name, tensor)
+                if (
+                    tuple(tensor.shape) != w4a16_shape
+                    or tensor.dtype != torch.uint8
+                    or not tensor.is_contiguous()
+                ):
+                    raise ValueError(
+                        f"{name} must be a contiguous uint8 W4A16 tensor of shape "
+                        f"{w4a16_shape}, got {tuple(tensor.shape)} {tensor.dtype}."
+                    )
         weight_checks: Tuple[Tuple[str, torch.Tensor, Tuple[int, ...]], ...] = (
-            ("fc1_weight", inputs.fc1_weight, (e, c.hidden, c.fc1_out)),
-            ("fc2_weight", inputs.fc2_weight, (e, c.intermediate, c.hidden)),
+            ()
+            if c.weight_format == "nvfp4"
+            else (
+                ("fc1_weight", inputs.fc1_weight, (e, c.hidden, c.fc1_out)),
+                ("fc2_weight", inputs.fc2_weight, (e, c.intermediate, c.hidden)),
+            )
         )
         for name, tensor, shape in weight_checks:
             _require_cuda(name, tensor)
@@ -1384,6 +1450,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     tail_split_pairs: Optional[bool] = None,
     clc_bundle_size: Optional[int] = None,
     num_sched_stages: Optional[int] = None,
+    weight_format: Literal["dense", "nvfp4"] = "dense",
     flag_batch: int = 1,
     epi_flag_batch: Tuple[int, int] = (2, 4),
 ) -> MegaMoEHopperFp8SymmBuffer:
@@ -1430,8 +1497,13 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         value is not None
         for value in (swap_ab, pingpong, mma_tiler_mnk, cluster_shape_mnk)
     )
-    # BF16 sessions have their own heuristic rows (heuristic_config "bf16").
-    heuristic_mode = "bf16" if kind == "bf16" else fp8_scale_mode
+    # BF16 and W4A16 sessions have their own heuristic rows
+    # (heuristic_config "bf16" / "bf16_nvfp4"; the latter all swap-AB).
+    from moe_hopper_fp8.heuristic_config import heuristic_table_key
+
+    heuristic_mode = heuristic_table_key(kind, fp8_scale_mode, weight_format)
+    # W4A16 sessions keep their own knob-cache entries.
+    knob_dtype = "bf16_nvfp4" if weight_format == "nvfp4" else kind
     knob_overrides: Dict[str, Any] = {}
     if manual_geometry:
         if isinstance(knobs, dict) and knobs:
@@ -1476,8 +1548,9 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
             resolved = dict(knobs)
         else:
             resolved, _ = _resolve_cached_knobs(
-                dtype=kind,
+                dtype=knob_dtype,
                 fp8_scale_mode=fp8_scale_mode,
+                heuristic_mode=heuristic_mode,
                 world_size=world_size,
                 hidden=hidden,
                 intermediate=intermediate,
@@ -1531,6 +1604,7 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         kind=kind,
         fp8_scale_mode=fp8_scale_mode,
         fp8_accum_mode=fp8_accum_mode,
+        weight_format=weight_format,
         swap_ab=swap_ab,
         pingpong=pingpong,
         mma_tiler_mnk=mma_tiler_mnk,
@@ -1817,6 +1891,7 @@ def _create_dummy_weights(
     *,
     kind: HopperFp8Kind,
     fp8_scale_mode: str,
+    weight_format: str = "dense",
 ) -> Tuple[TransformedFp8Weights, TransformedFp8Weights]:
     """Random FP8 weights + per-mode scales for local smoke scripts.
 
@@ -1852,11 +1927,29 @@ def _create_dummy_weights(
             perf_positive_only=True,
         )
 
-    # fc1: logical (E, gate+up, hidden) permuted to (E, hidden, gate+up) with
-    # hidden stride-1 (K-major); fc2: logical (E, hidden, intermediate)
-    # permuted to (E, intermediate, hidden) with intermediate stride-1.
-    fc1_weight = _weight((num_local_experts, fc1_out, hidden)).permute(0, 2, 1)
-    fc2_weight = _weight((num_local_experts, hidden, intermediate)).permute(0, 2, 1)
+    def _w4a16_weight(rows: int, k: int) -> torch.Tensor:
+        # Augmented W4A16 bytes (timing only): random E2M1 payload, finite
+        # positive E4M3 block scales (0x08..0x3F, ~2^-6..1).
+        tile = torch.randint(
+            0,
+            256,
+            (num_local_experts, rows // 2, k // W4A16_TILE_K, W4A16_PAIR_TILE_BYTES),
+            device="cuda",
+            generator=generator,
+            dtype=torch.uint8,
+        )
+        tile[..., -16:] = tile[..., -16:] % 56 + 8
+        return tile.view(num_local_experts, rows // 2, -1)
+
+    if weight_format == "nvfp4":
+        fc1_weight = _w4a16_weight(fc1_out, hidden)
+        fc2_weight = _w4a16_weight(hidden, intermediate)
+    else:
+        # fc1: logical (E, gate+up, hidden) permuted to (E, hidden, gate+up)
+        # with hidden stride-1 (K-major); fc2: logical (E, hidden,
+        # intermediate) permuted to (E, intermediate, hidden).
+        fc1_weight = _weight((num_local_experts, fc1_out, hidden)).permute(0, 2, 1)
+        fc2_weight = _weight((num_local_experts, hidden, intermediate)).permute(0, 2, 1)
 
     if fp8_scale_mode == "blockwise":
         fc1_weight_sf = make_constant_block_scale(
@@ -1960,6 +2053,7 @@ def create_dummy_inputs(
     gate_up_clamp: Optional[float] = None,
     activation_clamp: Optional[float] = None,
     seed: int = 0,
+    weight_format: Literal["dense", "nvfp4"] = "dense",
 ) -> tuple[
     torch.Tensor,
     TransformedFp8Weights,
@@ -1996,8 +2090,10 @@ def create_dummy_inputs(
         world_size,
         kind=kind,
         fp8_scale_mode=fp8_scale_mode,
-        swap_ab=swap_ab,
+        # W4A16 is swap-AB only.
+        swap_ab=True if weight_format == "nvfp4" else swap_ab,
         gate_up_clamp=clamp,
+        weight_format=weight_format,
     )
 
     transformed_l1, transformed_l2 = _create_dummy_weights(
@@ -2007,6 +2103,7 @@ def create_dummy_inputs(
         gen,
         kind=kind,
         fp8_scale_mode=fp8_scale_mode,
+        weight_format=weight_format,
     )
 
     data_dtype = symm_buffer._frontend.config.torch_ab_dtype

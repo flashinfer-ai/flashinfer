@@ -149,6 +149,12 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
         generate_c: bool = False,
         # Tail-split pair tasks (see fc1_fc2_fuse_sched); needs a 2-CTA token cluster.
         tail_split_pairs: bool = False,
+        # FI local extension: "nvfp4" = W4A16 -- packed NVFP4 weights in the
+        # augmented row-pair layout (kernel_fp8_glu_fc12_swapab
+        # W4A16PairTileBytes), decoded into register-sourced BF16 WGMMA.
+        # Swap-AB, BF16 activations, per_tensor ABI (the per-expert weight
+        # dequant scale carries the NVFP4 global scale).
+        weight_format: str = "dense",
     ) -> None:
         # Folding TMA-A / TMA-B / scheduler into the idle dispatch slots is
         # only possible with a single active dispatch warp.  Without the
@@ -211,6 +217,24 @@ class Sm90MegaMoEFp8Kernel(Sm90SwigluFp8Fc12Kernel):
             generate_c=generate_c,
             tail_split_pairs=tail_split_pairs,
         )
+
+        if weight_format not in ("dense", "nvfp4"):
+            raise ValueError(
+                f"weight_format must be 'dense' or 'nvfp4', got {weight_format!r}."
+            )
+        if weight_format == "nvfp4":
+            if not getattr(self, "is_swap_ab", False):
+                raise ValueError(
+                    "weight_format='nvfp4' (W4A16) needs the swap-AB kernel: "
+                    "the weights are the register-sourced WGMMA A operand."
+                )
+            if ab_dtype is not cutlass.BFloat16 or mma_tiler_mnk[2] != 128:
+                raise ValueError(
+                    "weight_format='nvfp4' runs BFloat16 activations with "
+                    f"mma_tiler K=128; got ab_dtype={ab_dtype.__name__}, "
+                    f"mma_tiler_mnk={mma_tiler_mnk}."
+                )
+            self.w4a16 = True
 
         self.enable_token_comm = True
         self.fold_producer_warps = _fold

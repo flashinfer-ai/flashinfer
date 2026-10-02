@@ -1,11 +1,13 @@
 """CUDA graph capture/replay for the SM90 pull-style mega path (single rank).
 
 Hopper counterpart of ``test_mega_cuda_graph.py`` for
-``sm90_fp8_fp8_bf16_pull_cutedsl`` and ``sm90_bf16_bf16_bf16_pull_cutedsl``: after ``MoEEpMegaLayer.warmup()``,
+``sm90_fp8_fp8_bf16_pull_cutedsl``, ``sm90_bf16_bf16_bf16_pull_cutedsl`` and
+``sm90_bf16_nvfp4_bf16_pull_cutedsl``: after ``MoEEpMegaLayer.warmup()``,
 ``layer.forward`` captures into a ``torch.cuda.CUDAGraph`` and replays match
 eager forwards bit-exactly (the default separate-reduce path is
 deterministic), including replays over in-place-mutated inputs with masked
-(``-1``) routes, and per-size graphs interleaved with eager calls.
+(``-1``) routes (and, for W4A16, mutated runtime alphas), and per-size graphs
+interleaved with eager calls.
 
 Process isolation: imports the SM90 kernel tree, which is mutually exclusive
 with the SM100 tree per process -- excluded from run_tests.sh's ``unit``
@@ -49,8 +51,10 @@ def _single_rank_layer(
     """MoEEpMegaLayer on one rank (MEGA_NO_DIST) with bf16 staging.
 
     ``compute``: ``"per_tensor"`` / ``"blockwise"`` select the FP8 backend's
-    scale mode; ``"bf16"`` selects ``sm90_bf16_bf16_bf16_pull_cutedsl``.
-    ``weights``: checkpoint format, ``"bf16"`` or ``"mxfp8"`` (FP8 only).
+    scale mode; ``"bf16"`` selects ``sm90_bf16_bf16_bf16_pull_cutedsl`` and
+    ``"w4a16"`` ``sm90_bf16_nvfp4_bf16_pull_cutedsl`` (swap-AB only).
+    ``weights``: checkpoint format, ``"bf16"``, ``"mxfp8"`` (FP8 only) or
+    ``"nvfp4"`` (W4A16 only; per-expert alphas on the config).
     """
     import torch
 
@@ -61,6 +65,7 @@ def _single_rank_layer(
         MoEEpMegaLayer,
         MoEWeightPack,
         Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig,
+        Sm90_Bf16_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig,
         Sm90_Fp8_Fp8_Bf16_PullCutedsl_MegaMoeConfig,
     )
 
@@ -74,16 +79,39 @@ def _single_rank_layer(
     w2 = torch.randn(num_experts, hidden, intermediate, device="cuda", generator=g) * (
         intermediate**-0.5
     )
+    alphas = (None, None)
     if weights == "mxfp8":
         (w13, w13_scale), (w2, w2_scale) = (
             mxfp8_quantize_ref(w13),
             mxfp8_quantize_ref(w2),
         )
         pack = MoEWeightPack(w13=w13, w2=w2, w13_scale=w13_scale, w2_scale=w2_scale)
+    elif weights == "nvfp4":
+        from flashinfer.moe_ep.backends.mega.kernel.sm90.common.nvfp4 import (
+            quantize_nvfp4,
+        )
+
+        (p13, s13, a13), (p2, s2, a2) = quantize_nvfp4(w13), quantize_nvfp4(w2)
+        pack = MoEWeightPack(
+            w13=p13,
+            w2=p2,
+            w13_scale=s13.view(torch.float8_e4m3fn),
+            w2_scale=s2.view(torch.float8_e4m3fn),
+        )
+        alphas = (a13, a2)
     else:
         pack = MoEWeightPack(w13=w13.to(torch.bfloat16), w2=w2.to(torch.bfloat16))
 
-    if compute == "bf16":
+    if compute == "w4a16":
+        megakernel = Sm90_Bf16_Nvfp4_Bf16_PullCutedsl_MegaMoeConfig(
+            intermediate_size=intermediate,
+            top_k=topk,
+            swap_ab=swap_ab,
+            gate_up_clamp=10.0,
+            fc1_alpha=alphas[0],
+            fc2_alpha=alphas[1],
+        )
+    elif compute == "bf16":
         megakernel = Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig(
             intermediate_size=intermediate,
             top_k=topk,
@@ -147,6 +175,8 @@ _CONFIGS = [
     ("blockwise", True, "mxfp8"),
     ("bf16", False, "bf16"),
     ("bf16", True, "bf16"),
+    ("w4a16", True, "bf16"),
+    ("w4a16", True, "nvfp4"),
 ]
 
 
@@ -198,6 +228,49 @@ def test_sm90_pull_graph_capture_replay_matches_eager(
 
 
 @pytest.mark.arch_hopper
+def test_sm90_pull_w4a16_graph_tracks_runtime_alpha(monkeypatch):
+    """Runtime alphas are staged inside the graph: in-place updates apply on replay."""
+    import dataclasses
+
+    import torch
+
+    _require_sm90_tree()
+    monkeypatch.setenv("MEGA_NO_DIST", "1")
+    layer, problem = _single_rank_layer(compute="w4a16", swap_ab=True, weights="nvfp4")
+    graph = None
+    try:
+        layer.warmup()
+        num_experts = problem["num_experts"]
+        alpha1 = torch.full((num_experts,), 0.5, device="cuda")
+        alpha2 = torch.linspace(0.25, 2.0, num_experts, device="cuda")
+        t = dataclasses.replace(
+            _random_batch(problem, seed=21), fc1_alpha=alpha1, fc2_alpha=alpha2
+        )
+        y_eager = layer.forward(t).clone()
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            y_graph = layer.forward(t)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.equal(y_graph, y_eager)
+
+        alpha1.mul_(1.5)
+        alpha2.copy_(alpha2.flip(0))
+        graph.replay()
+        torch.cuda.synchronize()
+        y_replay = y_graph.clone()
+        assert not torch.equal(y_replay, y_eager)
+        y_eager2 = layer.forward(t)
+        torch.cuda.synchronize()
+        assert torch.equal(y_replay, y_eager2)
+    finally:
+        if graph is not None:
+            graph.reset()
+        layer.destroy()
+
+
+@pytest.mark.arch_hopper
 def test_sm90_pull_capture_without_warmup_raises(monkeypatch):
     """Lazy workspace alloc inside capture must fail loudly, not corrupt."""
     import torch
@@ -223,7 +296,13 @@ def test_sm90_pull_capture_without_warmup_raises(monkeypatch):
 
 @pytest.mark.arch_hopper
 @pytest.mark.parametrize(
-    "compute,weights", [("blockwise", "bf16"), ("blockwise", "mxfp8"), ("bf16", "bf16")]
+    "compute,weights",
+    [
+        ("blockwise", "bf16"),
+        ("blockwise", "mxfp8"),
+        ("bf16", "bf16"),
+        ("w4a16", "nvfp4"),
+    ],
 )
 def test_sm90_pull_multi_size_graphs_and_eager_interleave(
     monkeypatch, compute, weights

@@ -89,6 +89,12 @@ class Sm90SwigluFp8Fc12Kernel:
     # Interleave granularity for gate and up in SwiGLU / GeGlu
     GateUpInterleave: int = Fp8GateUpInterleave
 
+    # FI local extension: W4A16 -- packed NVFP4 weights decoded into the
+    # register-sourced WGMMA A operand (swap-AB only; see
+    # ``Sm90SwapABSwigluFp8Fc12Kernel._mma_w4a16_rs``).  Set by the MegaMoE
+    # ctor (``weight_format="nvfp4"``).
+    w4a16: bool = False
+
     def _set_iket_range_names(self) -> None:
         """Build compile-time IKET names for this kernel specialization."""
         variant = "swapab" if getattr(self, "is_swap_ab", False) else "nswap"
@@ -476,6 +482,12 @@ class Sm90SwigluFp8Fc12Kernel:
             self.acc_dtype,
             self.atom_layout_mnk,
             tiler_mn=(64, self.wgmma_tile_n),
+            # W4A16 decodes A into registers (RS WGMMA).
+            a_source=(
+                cute.nvgpu.warpgroup.OperandSource.RMEM
+                if self.w4a16
+                else cute.nvgpu.warpgroup.OperandSource.SMEM
+            ),
         )
 
     def _setup_attributes(self) -> None:
@@ -628,6 +640,17 @@ class Sm90SwigluFp8Fc12Kernel:
             + self._activation_sf_bytes_per_stage()
         ) * atom_thr_size
 
+    def _a_bytes_per_stage(self, mma_tiler_mnk, a_dtype) -> int:
+        """SMEM bytes of one A stage (overridden for the packed W4A16 tile)."""
+        return cute.size_in_bytes(
+            a_dtype,
+            sm90_utils.make_smem_layout_a(self.a_layout, mma_tiler_mnk, a_dtype, 1),
+        )
+
+    def _a_gmem_tiler(self):
+        """(M, K) tile of the A GEMM tensor that one TMA stage load covers."""
+        return cute.slice_(self.mma_tiler, (None, 0, None))
+
     def _mma_tile_k_atom(self) -> int:
         """Granularity of mma_tiler K.
 
@@ -676,15 +699,12 @@ class Sm90SwigluFp8Fc12Kernel:
         """
         num_acc_stage = 1
 
-        a_smem_layout_stage_one = sm90_utils.make_smem_layout_a(
-            self.a_layout, mma_tiler_mnk, a_dtype, 1,
-        )
         b_smem_layout_staged_one = sm90_utils.make_smem_layout_b(
             self.b_layout, mma_tiler_mnk, b_dtype, 1,
         )
 
         ab_bytes_per_stage = (
-            cute.size_in_bytes(a_dtype, a_smem_layout_stage_one)
+            self._a_bytes_per_stage(mma_tiler_mnk, a_dtype)
             + cute.size_in_bytes(b_dtype, b_smem_layout_staged_one)
             + self._activation_sf_bytes_per_stage()
             + self._weight_sf_bytes_per_stage()
@@ -1542,7 +1562,19 @@ class Sm90SwigluFp8Fc12Kernel:
 
             ab_consumer_state.reset_count()
 
-            if cutlass.const_expr(self.fp8_scale_mode == "per_tensor"):
+            if cutlass.const_expr(self.w4a16):
+                # tCrA carries the packed-A decode views (wgmma_warpgroup_init).
+                ab_consumer_state = self._mma_w4a16_rs(
+                    local_warp_idx=local_warp_idx,
+                    tiled_mma=tiled_mma,
+                    a_views=tCrA,
+                    tCrB=tCrB,
+                    accumulators=accumulators,
+                    ab_pipeline=ab_pipeline,
+                    ab_consumer_state=ab_consumer_state,
+                    k_tile_cnt=k_tile_cnt,
+                )
+            elif cutlass.const_expr(self.fp8_scale_mode == "per_tensor"):
                 if cutlass.const_expr(self.fp8_accum_mode == "1xacc"):
                     ab_consumer_state = self._mma_per_tensor_1xacc(
                         local_warp_idx=local_warp_idx,
@@ -1724,7 +1756,7 @@ class Sm90SwigluFp8Fc12Kernel:
     ):
         gA_mkl = cute.local_tile(
             real_a,
-            cute.slice_(self.mma_tiler, (None, 0, None)),
+            self._a_gmem_tiler(),
             (None, None, None),
         )
         tAsA, tAgA = cpasync.tma_partition(
@@ -1878,7 +1910,7 @@ class Sm90SwigluFp8Fc12Kernel:
     ):
         gA_mkl = cute.local_tile(
             real_a,
-            cute.slice_(self.mma_tiler, (None, 0, None)),
+            self._a_gmem_tiler(),
             (None, None, None),
         )
         tAsA, tAgA = cpasync.tma_partition(
@@ -1936,7 +1968,7 @@ class Sm90SwigluFp8Fc12Kernel:
     ):
         gA_mkl = cute.local_tile(
             real_a,
-            cute.slice_(self.mma_tiler, (None, 0, None)),
+            self._a_gmem_tiler(),
             (None, None, None),
         )
         tAsA, tAgA = cpasync.tma_partition(

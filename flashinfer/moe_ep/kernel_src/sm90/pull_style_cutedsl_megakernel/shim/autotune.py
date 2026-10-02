@@ -77,14 +77,17 @@ def hopper_fp8_candidates(
     *,
     fp8_scale_mode: str = "per_tensor",
     max_tokens: int = 0,
+    swap_ab_only: bool = False,
     k64: bool = False,
 ) -> List[Dict[str, Any]]:
     """Default candidate knob dicts: heuristic winner first, then every
     geometry that wins some bucket of the drop's sweep.  The heuristic
     winner leads so a tie keeps the established default.
 
-    ``k64`` (dense BF16 only) also sweeps every geometry with a K=64 tile,
-    which doubles the A/B pipeline depth."""
+    ``fp8_scale_mode`` is the heuristic-table key (``heuristic_table_key``);
+    ``swap_ab_only`` drops the native-layout geometries (W4A16); ``k64``
+    (dense BF16 only) also sweeps every geometry with a K=64 tile, which
+    doubles the A/B pipeline depth."""
     out: List[Dict[str, Any]] = []
     seen = set()
     # The BF16 table itself carries K=64 rows; accept them even without k64.
@@ -96,6 +99,8 @@ def hopper_fp8_candidates(
                 (k, tuple(v) if isinstance(v, tuple) else v) for k, v in knobs.items()
             )
         )
+        if swap_ab_only and not knobs.get("swap_ab", False):
+            return
         if key not in seen and is_valid(knobs, k_atom=k_atom):
             seen.add(key)
             out.append(knobs)
@@ -248,11 +253,16 @@ def autotune_hopper_fp8_mega_moe(
 
     cfg = symm_buffer._frontend.config
     if candidates is None:
+        from moe_hopper_fp8.heuristic_config import heuristic_table_key
+
+        # BF16 / W4A16 sessions start from their own heuristic rows.
         candidates = hopper_fp8_candidates(
-            # BF16 sessions start from their own heuristic rows.
-            fp8_scale_mode="bf16" if cfg.kind == "bf16" else cfg.fp8_scale_mode,
+            fp8_scale_mode=heuristic_table_key(
+                cfg.kind, cfg.fp8_scale_mode, cfg.weight_format
+            ),
             max_tokens=cfg.num_tokens_per_rank,
-            k64=cfg.kind == "bf16",
+            swap_ab_only=cfg.weight_format == "nvfp4",
+            k64=cfg.kind == "bf16" and cfg.weight_format == "dense",
         )
 
     def _record(winner: Dict[str, Any], p50_s: float) -> None:
@@ -263,7 +273,7 @@ def autotune_hopper_fp8_mega_moe(
 
             record_knobs(
                 winner,
-                dtype=cfg.kind,
+                dtype="bf16_nvfp4" if cfg.weight_format == "nvfp4" else cfg.kind,
                 fp8_scale_mode=cfg.fp8_scale_mode,
                 world_size=cfg.world_size,
                 hidden=cfg.hidden,

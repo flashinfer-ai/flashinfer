@@ -43,6 +43,30 @@ not picked them up):
   checks the drop's FP8 tables plus the FI `"bf16"` / `"bf16_nvfp4"` rows.
   Shim: kind `"bf16"` (K atom 64); tuner `is_valid(k_atom=)` and K=64
   candidates for dense BF16 sweeps.
+- W4A16 mainloop (2026-10-01, `sm90_bf16_nvfp4_bf16_pull_cutedsl`,
+  `weight_format="nvfp4"`; swap-AB, BF16 operands, K tile 128 only).
+  Packed NVFP4 weights arrive as one augmented byte tensor per leg: per row
+  pair and 128-K tile one 144-B TMA box (lane-permuted E2M1 payloads of both
+  rows, then both rows' 8 E4M3 scales; layout owner:
+  `backends/mega/kernel/sm90/common/nvfp4.py::augment_w4a16`).
+  `kernel_fp8_glu_fc12.py`: class attr `w4a16`, `_a_bytes_per_stage` /
+  `_a_gmem_tiler` hooks for the A TMA box and stage bytes, an
+  `OperandSource.RMEM` tiled MMA and a `run_wgmma_task_tile` dispatch to
+  `_mma_w4a16_rs`.  `kernel_fp8_glu_fc12_swapab.py`: Uint8 A smem layout
+  (pairs x 144 x stages), augmented global views / TMA atoms, logical K
+  extents for the k-tile counts and FC2 spin threshold
+  (`_a_logical_extents`), and the RS mainloop: per k-tile one 16-B LDS of
+  payload + scales per fragment row, per k16 block a bit-placement decode
+  (sign -> bit 15, exp:mantissa -> bits 8..6: E2M1 * 2^-126), a
+  `cvt.rn.f16x2.e4m3x2`-based scale conversion (scale * 2^119) and one
+  `mul.rn.bf16x2`, double-buffered A fragments with `wait_group(1)`.
+  `epilogue_fp8_swapab.py`: `weight_dequant_multiplier` (2^7, undoes the
+  decode bias) folded into the per-expert weight dequant scale, which also
+  carries the NVFP4 global scale (alpha).  `megamoe_kernel_fp8.py`: ctor
+  `weight_format`.  `heuristic_config.py`: `"bf16_nvfp4"` rows and
+  `heuristic_table_key`.  Shim: `weight_format` config/compile key, the
+  augmented-weight launch checks, knob dtype `"bf16_nvfp4"`, NVFP4 dummy
+  inputs for the tuner.
 - Masked-route reduce (2026-10-01): the separate-reduce `TopkReduce` summed
   every top-k slot, but a `-1` route is never dispatched, so its
   `(token, topk)` combine row kept a PREVIOUS launch's term (wrong output on

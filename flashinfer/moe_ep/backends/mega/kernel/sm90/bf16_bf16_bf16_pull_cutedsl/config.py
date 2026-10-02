@@ -59,6 +59,7 @@ class Sm90_Bf16_Bf16_Bf16_PullCutedsl_MegaMoeConfig:
     # Fixed by the format.  The kernel runs its per-tensor path with unit
     # dequant scales; the shared pull-style backend plumbing reads these.
     kind: ClassVar[str] = "bf16"
+    weight_format: ClassVar[str] = "dense"
     fp8_scale_mode: ClassVar[str] = "per_tensor"
     fp8_accum_mode: ClassVar[str] = "1xacc"
     fc1_activation_dequant_scale: ClassVar[float] = 1.0
