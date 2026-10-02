@@ -32,7 +32,7 @@
   "decode_threads": 320,
   "entry": "cake_sparse_mla_sm120_dsv4_nvfp4_decode",
   "family": "cake_sparse_mla_sm120_dsv4_nvfp4",
-  "generated_at": "2026-10-02T02:26:59Z",
+  "generated_at": "2026-10-02T03:00:25Z",
   "generator": "sm120-dsv4-nvfp4-sparse-mla-flashinfer-export",
   "head_counts": [
     8,
@@ -48,9 +48,9 @@
   "head_dim": 512,
   "header": "cake_sparse_mla_dsv4_nvfp4_kernels.h",
   "heads_per_block": 16,
-  "identity": "93fa7c84797f964fb85be635dc0155a0d78d8ff1e5fc1e414669833b5d879960",
+  "identity": "8dac14b4511fe7e3520ba132e0293dea60544902d41f5f84c5532696b5ec670d",
   "identity_scope": "sha256 over sorted (file name, file text without the provenance header)",
-  "kernel_commit": "7cbc4e8ed13b4660ab436bc5240e2e221fe0158b",
+  "kernel_commit": "391034f4eaae572e690eea6ad777ef9641d935b7",
   "kernel_tree_modified": false,
   "max_chunks_per_block": 16,
   "merge_params": [
@@ -87,7 +87,7 @@
     "cake_sparse_mla_dsv4_nvfp4_h80.cu",
     "cake_sparse_mla_dsv4_nvfp4_h96.cu"
   ],
-  "tree_commit": "7fb8ce1c32056e5bea71473e967665c683d4d985",
+  "tree_commit": "6410ec5df216c0287352c628511edf9344996a24",
   "two_tile_head_counts": [
     32,
     64,
