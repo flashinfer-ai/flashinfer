@@ -62,6 +62,9 @@ _D_QK = 512
 _D_V = 512
 _BYTES_PER_TOKEN = 384
 _CHUNK = 64
+# Below this SM count the planners follow the GB10 (SM121, 48 SMs) sweeps instead of the
+# GB202 (RTX PRO 6000 / RTX 5090, 188 / 170 SMs) ones.
+_SMALL_DIE_SMS = 64
 
 
 def _manifest() -> dict:
@@ -121,6 +124,15 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
       least 8 chunks; H >= 96 pairs only with at least 16 chunks at
       ``ctas >= SMs / 3``.
 
+    GB10 (SM121, 48 SMs; ``num_sms < 64``) differs only at a full wave with two
+    chunks: a two-chunk CTA gathers too little to pay for the doubled serial MMA
+    of two tiles once the one-tile grid is more than two waves (H = 64 and
+    H = 128 at 32 tokens: one tile 2-3 % faster), while up to two waves the
+    pair still folds the partial second wave into one resident wave (H = 128 at
+    8 tokens: 1.04-1.07x) and H = 32 always pairs because one CTA then covers
+    the token's whole head set (1.05-1.07x).  Rows with >= 4 chunks pair at a
+    full wave on both; the sub-wave rules are the same on both.
+
     Head counts not divisible by 32 have no two-tile instance.
     """
 
@@ -133,6 +145,13 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
     ctas = int(num_tokens) * (num_heads // hpb)
     chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
     if ctas >= num_sms:
+        if (
+            num_sms < _SMALL_DIE_SMS
+            and chunks <= 2
+            and num_heads > 2 * hpb
+            and ctas > 2 * num_sms
+        ):
+            return 1
         return 2
     third = num_sms // 3
     two_thirds = (2 * num_sms) // 3
@@ -155,8 +174,8 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
 ) -> Tuple[int, int]:
     """Return ``(num_splits, chunks_per_block)`` for one decode call.
 
-    Measured split rules (RTX PRO 6000 Blackwell / RTX 5090), with the grid
-    counted in CTAs of ``16 * head_tiles`` heads:
+    Measured split rules (RTX PRO 6000 Blackwell / RTX 5090; GB10 below), with
+    the grid counted in CTAs of ``16 * head_tiles`` heads:
 
     * two chunks never split: one CTA pipelining both chunks beats two CTAs
       plus a merge;
@@ -170,6 +189,19 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
     * independently, ``chunks_per_block <= max_chunks_per_block`` always holds
       (the CTA index table), so more than 1024 candidates force
       ``num_splits >= ceil(chunks / 16)``; ``max_splits`` below that raises.
+
+    GB10 (SM121, 48 SMs; ``num_sms < 64``): the LPDDR gather saturates with a
+    handful of CTAs, so "fill 80 % of the SMs" over-splits every small grid
+    there.  The same loop runs with tighter caps, measured on a 108-row sweep:
+
+    * the split grid stays within ``SMs / 3`` CTAs (16): one token with 128
+      heads (8 CTAs) is best at two splits, with <= 64 heads at four;
+    * the distinct gather streams ``tokens * splits`` stay within ``SMs / 6``
+      (8): eight distinct tokens never gain from a split (+10-28 %), only the
+      shared single-token gather does;
+    * at least two chunks per CTA also for a lone CTA (one chunk per CTA is
+      4-10 % slower than two);
+    * no wave-quantization split on a full grid (16-chunk rows are flat).
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
@@ -189,20 +221,25 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
     base_ctas = int(num_tokens) * head_blocks
     splits = min_splits
     if chunks > 2 and max_splits > 1:
-        grid_cap = int(num_sms) * 4 // 5
+        num_sms = int(num_sms)
+        small_die = num_sms < _SMALL_DIE_SMS
+        grid_cap = num_sms // 3 if small_die else num_sms * 4 // 5
+        # tokens * splits <= base_ctas * splits, so the stream cap is a no-op on GB202
+        stream_cap = num_sms // 6 if small_die else grid_cap
         if base_ctas * 2 <= grid_cap:
-            min_cpb = 1 if base_ctas == 1 else 2
+            min_cpb = 2 if small_die or base_ctas > 1 else 1
             want = min_splits
             while (
                 want * 2 <= max_splits
                 and base_ctas * want * 2 <= grid_cap
+                and int(num_tokens) * want * 2 <= stream_cap
                 and -(-chunks // (want * 2)) >= min_cpb
             ):
                 want *= 2
             splits = want
-        elif base_ctas >= int(num_sms) and chunks >= 16:
-            tail = (base_ctas * 2) % int(num_sms)
-            if tail == 0 or tail * 2 >= int(num_sms):
+        elif not small_die and base_ctas >= num_sms and chunks >= 16:
+            tail = (base_ctas * 2) % num_sms
+            if tail == 0 or tail * 2 >= num_sms:
                 splits = max(splits, 2)
     cpb = -(-chunks // splits)
     splits = -(-chunks // cpb)
