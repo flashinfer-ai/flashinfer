@@ -96,6 +96,8 @@ _STAGE_VALUES = {
     | set(COMMON_SCALARS)
     | {"num_vecs"}
     | (_GEMM_VALUES if stage.startswith("gemm") else set())
+    | ({"n_slabs"} if stage == "slab_sum" else set())
+    | ({"row_vecs", "num_rows"} if stage == "scale_cast_scatter_bf16" else set())
     for stage, tensors in STAGE_TENSORS.items()
 }
 
@@ -291,6 +293,7 @@ def test_registry_records_are_well_formed():
         "gemm_dx_s2_st3",
         "gemm_dx_s3_st3",
         "gemm_dx_s4_st3",
+        "slab_sum",
         "gemm_dw_acc",
         "gemm_dw_acc_g16",
         "gemm_dw_acc_g32",
@@ -304,6 +307,7 @@ def test_registry_records_are_well_formed():
         "gemm_dw_cast_f32_gn12",
         "scale_cast_bf16",
         "scale_cast_f32",
+        "scale_cast_scatter_bf16",
     )
     assert (
         tuple(s for s in cake_jit.STAGES if cake_backend.base_stage(s) == s)
@@ -487,6 +491,21 @@ def test_stages_for_entry():
     assert stages_for_entry("loss") == stages_for_entry(
         "loss", fuse_dw_cast=cake_backend.fuse_dw_cast_default()
     )
+    # dx_cast=False: the flat dX cast leaves (the caller finalizes dx_acc); the dW cast stays
+    uncast = stages_for_entry("logprob", dx_cast=False, need_dw=False, **unfused)
+    assert "scale_cast_bf16" not in uncast and "gemm_dx" in uncast
+    assert "scale_cast_bf16" in stages_for_entry(
+        "logprob", dx_cast=False, **unfused
+    )  # the unfused bf16 dW cast stays
+    assert "scale_cast_bf16" in stages_for_entry(
+        "loss", dx_cast=False, **unfused
+    )  # the unfused bf16 dW cast
+    assert "scale_cast_bf16" not in stages_for_entry(
+        "loss", dx_cast=False, fuse_dw_cast=True
+    )
+    assert "slab_sum" not in stages_for_entry(
+        "loss"
+    ) and "scale_cast_scatter_bf16" not in stages_for_entry("loss")
     with pytest.raises(ValueError):
         stages_for_entry("other")
 
@@ -931,7 +950,7 @@ def test_geometry_cluster_ctas():
 
 def test_stage_variant_grammar():
     bases = cake_jit.BASE_STAGES
-    assert len(bases) == 11 and set(bases) <= set(cake_jit.STAGES)
+    assert len(bases) == 13 and set(bases) <= set(cake_jit.STAGES)
     for stage in cake_jit.STAGES:
         base, knobs = cake_backend.parse_stage(stage)
         assert base in bases and cake_backend.stage_variant(base, **knobs) == stage
@@ -1846,7 +1865,7 @@ def test_reachable_variants_complete_the_rule_closure():
     assert set(cake_jit.STAGES) == set(cake_jit.BASE_STAGES) | rv(
         bases, "sm_103a", wide, 4
     ) | rv(bases, "sm_100a", wide, 4) | rv(bases, "sm_103a", glm, 4)
-    assert len(cake_jit.STAGES) == 32
+    assert len(cake_jit.STAGES) == 34
     unpinned = Geometry.from_record(None)
     assert rv(bases, "sm_100a", unpinned, 4) == dx_all | {
         "gemm_dw_acc"
@@ -3011,6 +3030,309 @@ def test_fuse_dw_cast_default_env(monkeypatch):
     assert "gemm_dw_cast_bf16" in stages_for_entry("loss")
 
 
+def test_dx_finalize_default_env(monkeypatch):
+    monkeypatch.delenv(cake_backend.DX_FINALIZE_ENV, raising=False)
+    assert cake_backend.dx_finalize_default() is True
+    assert cake_backend.DX_FINALIZE_STAGES == ("slab_sum", "scale_cast_scatter_bf16")
+    monkeypatch.setenv(cake_backend.DX_FINALIZE_ENV, "0")
+    assert cake_backend.dx_finalize_default() is False
+    assert cake_backend._resolve_dx_finalize(None) is False
+    assert cake_backend._resolve_dx_finalize(True) is True
+    monkeypatch.setenv(cake_backend.DX_FINALIZE_ENV, "1")
+    assert cake_backend.dx_finalize_default() is True
+    assert cake_backend._resolve_dx_finalize(False) is False
+
+
+def test_valid_rows_mask():
+    labels = torch.tensor([3, IGNORE_INDEX, 0, IGNORE_INDEX, 7])
+    idx, mask = cake_backend.valid_rows(labels, mask=True)
+    assert torch.equal(idx, torch.tensor([0, 2, 4])) and idx.dtype == torch.int64
+    assert torch.equal(mask, labels >= 0) and mask.dtype == torch.bool
+    plain_idx, plain_mask = cake_backend.valid_rows(labels)
+    assert torch.equal(plain_idx, idx) and plain_mask is None
+    assert torch.equal(cake_backend.valid_row_index(labels), idx)
+    assert cake_backend.valid_rows(labels.clamp(min=0), mask=True) == (None, None)
+    assert cake_backend.valid_rows(labels[:0], mask=True) == (None, None)
+    all_ignored = torch.full((4,), IGNORE_INDEX)
+    idx0, mask0 = cake_backend.valid_rows(all_ignored, mask=True)
+    assert idx0.numel() == 0 and mask0.shape == (4,) and not mask0.any()
+
+
+def test_scale_cast_scatter_reference_matches_scatter_rows():
+    gen = torch.Generator().manual_seed(SEED)
+    for T, frac in ((1, 0.0), (37, 0.3), (64, 1.0), (5, 0.5)):
+        valid = torch.rand(T, generator=gen) >= frac
+        if frac >= 1.0:
+            valid[:] = False
+        idx = valid.nonzero().squeeze(1)
+        scan = torch.cumsum(valid, 0, dtype=torch.int32)
+        acc = torch.randn(int(idx.numel()), H_HOST, generator=gen)
+        g = torch.tensor(0.75)
+        fused = cake_backend.scale_cast_scatter(
+            acc, g, idx, scan, T, backend="reference"
+        )
+        shipped = cake_backend.scatter_rows(
+            cake_backend.scale_cast(acc, g, torch.bfloat16, backend="reference"), idx, T
+        )
+        assert fused.dtype == torch.bfloat16 and tuple(fused.shape) == (T, H_HOST)
+        assert torch.equal(fused, shipped) and torch.all(fused[~valid] == 0)
+        # finalize_dx: every row valid -> the flat cast; the mask selects the one-pass form; no mask -> cast + scatter
+        if idx.numel() == T:
+            flat = cake_backend.finalize_dx(acc, g, None, None, T, backend="reference")
+            assert torch.equal(
+                flat,
+                cake_backend.scale_cast(acc, g, torch.bfloat16, backend="reference"),
+            )
+        else:
+            assert torch.equal(
+                cake_backend.finalize_dx(acc, g, idx, valid, T, backend="reference"),
+                shipped,
+            )
+            assert torch.equal(
+                cake_backend.finalize_dx(acc, g, idx, None, T, backend="reference"),
+                shipped,
+            )
+    assert tuple(
+        cake_backend.scale_cast_scatter(
+            torch.zeros(0, H_HOST),
+            None,
+            torch.zeros(0, dtype=torch.int64),
+            torch.zeros(0, dtype=torch.int32),
+            0,
+            backend="reference",
+        ).shape
+    ) == (0, H_HOST)
+    with pytest.raises(ValueError, match="scan"):
+        cake_backend.scale_cast_scatter(
+            torch.zeros(2, H_HOST),
+            None,
+            torch.tensor([0, 1]),
+            torch.ones(3, dtype=torch.int32),
+            2,
+            backend="reference",
+        )
+    with pytest.raises(ValueError, match="row_valid"):
+        cake_backend.finalize_dx(
+            torch.zeros(2, H_HOST),
+            None,
+            torch.tensor([0, 1]),
+            torch.ones(3, dtype=torch.bool),
+            2,
+            backend="reference",
+        )
+    with pytest.raises(ValueError, match="num_rows"):
+        cake_backend.finalize_dx(
+            torch.zeros(2, H_HOST),
+            None,
+            torch.tensor([0, 1]),
+            None,
+            None,
+            backend="reference",
+        )
+
+
+_DX_FINALIZE_CASES = [  # (objective, entry, ignored fraction): multi-chunk + tail, the all-ignored call, no ignored rows
+    ("ce", "loss", "five_percent"),
+    ("policy", "loss", "half"),
+    ("ce", "logprob", "five_percent"),
+    ("ce", "loss", "none"),
+    ("ce", "logprob", "none"),
+    ("ce", "loss", "all"),
+    ("ce", "logprob", "all"),
+    ("policy", "loss", "all_but_one"),
+]
+
+
+@pytest.mark.parametrize(
+    "objective, entry, frac",
+    _DX_FINALIZE_CASES,
+    ids=["_".join(c) for c in _DX_FINALIZE_CASES],
+)
+def test_dx_finalize_switch_is_bitwise_on_the_reference_backend(
+    objective, entry, frac, monkeypatch
+):
+    """The fused dX finalize off (``0``: cast + zero fill + ``index_copy_``) and on (one-pass scatter) through the
+    autograd entry points and the explicit pair, on the reference backend: ``loss`` / ``logp`` / ``dX`` / ``dW``
+    bitwise; the valid-row mask accompanies the compact index exactly when the rows are compacted and the switch is on;
+    the all-ignored call returns zeros without the mask being read."""
+    T, C = 37, 16
+    ignore = {
+        "none": 0.0,
+        "five_percent": 0.05,
+        "half": 0.5,
+        "all_but_one": (T - 1) / T,
+        "all": 1.0,
+    }[frac]
+    inp = _host_inputs(T, objective, ignore_frac=ignore)
+    n_valid = int(inp.valid.sum())
+    compacted = n_valid < T
+    out = {}
+    for env in ("0", "1"):
+        monkeypatch.setenv(cake_backend.DX_FINALIZE_ENV, env)
+        result = _run(inp, C, entry=entry, compact_rows=True)
+        _check_dtypes(result, inp)
+        assert torch.all(result["dX"][~inp.valid] == 0)
+        if entry == "loss":
+            fr = cake_backend.forward_loss(
+                inp.X,
+                inp.W,
+                inp.labels,
+                objective=objective,
+                loss_div=inp.loss_div if objective == "ce" else None,
+                infer_logp=inp.infer_logp,
+                loss_weights=inp.loss_weights,
+                chunk_size=C,
+                backend="reference",
+                compact_rows=True,
+            )
+            assert (fr.row_index is None) == (not compacted)
+            assert (fr.row_valid is not None) == (env == "1" and compacted)
+            if fr.row_valid is not None:
+                assert fr.row_valid.dtype == torch.bool and tuple(
+                    fr.row_valid.shape
+                ) == (T,)
+                assert int(fr.row_valid.sum()) == n_valid
+            assert fr.memory["dx_finalize"] is (env == "1")
+            g = torch.tensor(2.5)
+            dx, dw = fr.backward(
+                g, grad_weight_dtype=torch.float32, backend="reference"
+            )
+            frozen_dx, _ = cake_backend.backward_loss(
+                fr.dx_acc,
+                fr.dw_acc,
+                g,
+                grad_weight_dtype=torch.float32,
+                backend="reference",
+                row_index=fr.row_index,
+                num_rows=fr.num_rows,
+                dz_last=fr.dz_last,
+                x_last=fr.x_last,
+                x_src=fr.x_src,
+                x_idx=fr.x_idx,
+            )  # without the mask: the previous host path, the same bits
+            assert torch.equal(dx, frozen_dx) and dw.dtype == torch.float32
+            result["pair"] = (fr.loss, fr.logp, dx, dw)
+        out[env] = result
+    for key in ("loss", "logp", "dX", "dW"):
+        assert torch.equal(out["1"][key], out["0"][key]), key
+    if entry == "loss":
+        for a, b in zip(out["1"]["pair"], out["0"]["pair"], strict=True):
+            assert torch.equal(a, b)
+    if frac == "all":
+        assert torch.all(out["1"]["dX"] == 0) and torch.all(out["1"]["dW"] == 0)
+
+
+def test_dx_finalize_plan_keys():
+    """A plan with ``dx_finalize`` adds a sliced dX GEMM's slabs with the ``slab_sum`` kernel (one launch key in place
+    of the host ``dx_reduce`` step, registered in the plan's stages in launch order); ``dx_cast=False`` leaves the flat
+    dX cast out of the cast keys; the reference path never slices K, so it never plans the kernel."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    for finalize in (False, True):
+        plan = cake_backend.make_plan(
+            _problem(4097, 6144, 154880, 4096),
+            need_dx=True,
+            need_dw=True,
+            geometry=g,
+            dx_max_slices=4,
+            num_sms=148,
+            dx_resident=74,
+            fuse_dw_cast=True,
+            arch="sm_100a",
+            dx_finalize=finalize,
+        )
+        sliced = [i for i in range(plan.num_chunks) if plan.dx_slices_of(i) > 1]
+        assert sliced == [0, 1], (
+            "both chunks of the 4097-row tail plan take K slices (4 and 3)"
+        )
+        assert plan.dx_finalize is finalize and plan.dx_cast
+        keys = cake_backend.forward_keys(plan)
+        for i in range(plan.num_chunks):
+            k = plan.dx_slices_of(i)
+            reduce = ("slab_sum" if finalize else "dx_reduce", i)
+            dx = (plan.dx_stage_of(i), i)
+            if k > 1:
+                assert reduce in keys and keys.index(reduce) == keys.index(dx) + 1
+                assert ("dx_reduce" if finalize else "slab_sum", i) not in keys
+            else:
+                assert ("slab_sum", i) not in keys and ("dx_reduce", i) not in keys
+        assert ("slab_sum" in plan.stages) is finalize
+        assert list(plan.stages) == [s for s in cake_jit.STAGES if s in plan.stages]
+        assert ("scale_cast_bf16", "dx") in cake_backend.cast_keys(plan)
+    uncast = cake_backend.make_plan(
+        _problem(4097, 6144, 154880, 4096, entry="logprob"),
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        arch="sm_100a",
+        dx_finalize=True,
+        dx_cast=False,
+    )
+    assert ("scale_cast_bf16", "dx") not in cake_backend.cast_keys(uncast)
+    assert "scale_cast_bf16" not in uncast.stages and "slab_sum" in uncast.stages
+    # the reference runner: the switch is recorded, no slab (one K slice everywhere), dx_out follows dx_cast
+    inp = _host_inputs(37)
+    common = dict(
+        objective="ce", loss_div=inp.loss_div, chunk_size=16, backend="reference"
+    )
+    on = prepare_lm_head_loss(inp.X, inp.W, inp.labels, dx_finalize=True, **common)
+    off = prepare_lm_head_loss(inp.X, inp.W, inp.labels, dx_finalize=False, **common)
+    assert on.plan.dx_finalize and not off.plan.dx_finalize
+    assert "slab_sum" not in on.stages and on.stages == off.stages
+    assert ("scale_cast_bf16", "dx") in on.backward_order
+    on.step(torch.tensor(3.0))
+    off.step(torch.tensor(3.0))
+    assert torch.equal(on.dx_out, off.dx_out) and torch.equal(on.dw_out, off.dw_out)
+    lp = prepare_lm_head_loss(
+        inp.X,
+        inp.W,
+        inp.labels,
+        chunk_size=16,
+        entry="logprob",
+        backend="reference",
+        dx_cast=False,
+    )
+    assert (
+        "dx_out" not in lp.tensors
+        and lp.dx_out is None
+        and ("scale_cast_bf16", "dx") not in lp.backward_order
+    )
+    lp.forward()
+    lp.dlogp.copy_(inp.dlogp)
+    dx_acc, dw = lp.backward()
+    assert (
+        dx_acc is lp.dx_acc
+        and dx_acc.dtype == torch.float32
+        and dw.dtype == torch.bfloat16
+    )
+    with pytest.raises(ValueError, match="slab_sum"):
+        stage_values("slab_sum", on.tensors, on.plan, 0)
+    # S >= 2 on the host: the reference ``slab_sum`` over a 3-slice workspace is the ``dx_reduce`` add_ chain, bitwise
+    gen = torch.Generator().manual_seed(SEED)
+    rows_c, rows_ws = 37, 64
+    ws = torch.randn(2, rows_ws, H_HOST, generator=gen)
+    base = torch.randn(rows_c, H_HOST, generator=gen)
+    fused_acc, plain_acc = base.clone(), base.clone()
+    cake_backend.ReferenceEngine.slab_sum(
+        dict(
+            dx=fused_acc,
+            ws=ws,
+            ws_slab=rows_ws * H_HOST,
+            num_vecs=rows_c * H_HOST // 8,
+            n_slabs=2,
+        )
+    )
+    cake_backend.ReferenceEngine.dx_reduce(
+        dict(acc=plain_acc, ws=ws, rows_c=rows_c, k_slices=3)
+    )
+    assert torch.equal(fused_acc, plain_acc) and not torch.equal(fused_acc, base)
+    with pytest.raises(ValueError, match="finalize_dx"):
+        stage_values("scale_cast_scatter_bf16", on.tensors, on.plan, "dx")
+
+
 def test_memory_report_fused_dw_cast():
     V, H, C = DEFAULT_V, DEFAULT_H, 4096
     four = memory_report(16231, H, V, C, fuse_dw_cast=True)
@@ -3315,7 +3637,7 @@ def test_memory_report_compaction():
         and plain["gather_bytes"] == 0
         and "x_c" not in plain["temporary"]
     )
-    m = memory_report(T, H, V, C, valid_rows=T_v)
+    m = memory_report(T, H, V, C, valid_rows=T_v, dx_finalize=False)
     assert (
         m["compact_rows"]
         and m["valid_rows"] == T_v
@@ -3327,6 +3649,28 @@ def test_memory_report_compaction():
     assert (
         m["temporary"]["row_index"] == T_v * 8
         and m["temporary"]["dx_compact"] == T_v * H * 2
+    )
+    fused = memory_report(T, H, V, C, valid_rows=T_v, dx_finalize=True)
+    assert fused["dx_finalize"] and not m["dx_finalize"]
+    assert "dx_compact" not in fused["temporary"]
+    assert (
+        fused["temporary"]["row_valid"] == T and fused["temporary"]["row_scan"] == T * 4
+    )
+    assert (
+        fused["outputs"] == m["outputs"] and fused["accumulators"] == m["accumulators"]
+    )
+    assert (
+        memory_report(T, H, V, C, valid_rows=T_v)["dx_finalize"]
+        is cake_backend.dx_finalize_default()
+    )
+    assert (
+        "row_scan" not in memory_report(T, H, V, C, dx_finalize=True)["temporary"]
+    )  # uncompacted: no scatter
+    assert (
+        "row_scan"
+        not in memory_report(
+            T, H, V, C, valid_rows=T_v, need_dx=False, dx_finalize=True
+        )["temporary"]
     )
     assert (
         m["temporary"]["lse"] == T_v * 4 and m["temporary"]["logp"] == T_v * 4
@@ -3918,6 +4262,7 @@ def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
             entry="loss",
             valid_rows=int(inp.valid.sum()),
             fuse_dw_cast=cake_backend.fuse_dw_cast_default(),
+            dx_finalize=cake_backend.dx_finalize_default(),
             **kw,
         )
         binding = cache.peek(key)
@@ -4288,3 +4633,156 @@ def test_device_fused_dw_cast_is_bitwise(glm_weight):
     runner.step(g3)
     torch.cuda.synchronize()
     assert torch.equal(runner.dw_out, _run(inp, 2048, backend="cake", scale=3.0)["dW"])
+
+
+def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):
+    """The fused dX finalize on the generated program: switch ``0`` (host ``add_`` chain, cast, zero fill,
+    ``index_copy_``) and ``1`` (``slab_sum`` + ``scale_cast_scatter_bf16``) give bitwise the same ``loss`` / ``logp`` /
+    ``dX`` / ``dW`` on both entries, with and without ignored rows (S >= 2: the chunk loops slice their dX GEMMs; S = 1:
+    the switch is a no-op); the fused path binds the slab kernel for the sliced chunks and launches the scatter once per
+    compacted dX output; the previous path binds neither."""
+    _require_program(entry="loss")
+    _require_program(entry="logprob")
+    real_bind_all = cake_backend._bind_all
+    bound = []
+
+    def spy_bind_all(record, module_name, keys, values, device, geometry):
+        bound.extend(k[0] for k in keys)
+        return real_bind_all(record, module_name, keys, values, device, geometry)
+
+    monkeypatch.setattr(cake_backend, "_bind_all", spy_bind_all)
+    for ignore in (0.05, 0.0):
+        inp = make_inputs(
+            4097, seed=SEED + 49, device=CUDA, W=glm_weight, ignore_frac=ignore
+        )
+        compacted = int(inp.valid.sum()) < inp.T
+        # whether this device's plan slices some dX GEMM of the 4096-row chunk loop (the plan decides from the SM count)
+        probe = prepare_lm_head_loss(
+            inp.X,
+            inp.W,
+            inp.labels,
+            objective="ce",
+            loss_div=inp.loss_div,
+            chunk_size=4096,
+            backend="cake",
+            compact_rows=True,
+            dx_finalize=True,
+        )
+        expect_slabs = any(
+            probe.plan.dx_slices_of(i) > 1 for i in range(probe.plan.num_chunks)
+        )
+        del probe
+        out = {}
+        for env in ("0", "1"):
+            monkeypatch.setenv(cake_backend.DX_FINALIZE_ENV, env)
+            with _cache(False):
+                bound.clear()
+                res = {
+                    "loss": _run(inp, 4096, backend="cake", compact_rows=True),
+                    "logprob": _run(
+                        inp, 4096, entry="logprob", backend="cake", compact_rows=True
+                    ),
+                }
+                fr = cake_backend.forward_loss(
+                    inp.X,
+                    inp.W,
+                    inp.labels,
+                    objective="ce",
+                    loss_div=inp.loss_div,
+                    chunk_size=1000,
+                    backend="cake",
+                    compact_rows=True,
+                )
+                assert (fr.row_index is not None) == compacted
+                assert (fr.row_valid is not None) == (env == "1" and compacted)
+                dx, dw = fr.backward(
+                    torch.tensor(2.5, device=CUDA), grad_weight_dtype=torch.float32
+                )
+                res["pair"] = dict(dX=dx, dW=dw)
+                torch.cuda.synchronize()
+            slabs = bound.count("slab_sum")
+            scatters = bound.count("scale_cast_scatter_bf16")
+            if env == "0":
+                assert slabs == 0 and scatters == 0, bound
+            else:
+                assert "dx_reduce" not in bound
+                if expect_slabs:
+                    assert slabs > 0, bound
+                # one scatter per compacted dX output: entry (a) autograd, entry (b), the explicit pair
+                assert scatters == (3 if compacted else 0), bound
+            out[env] = res
+        for entry in ("loss", "logprob"):
+            for key in ("loss", "logp", "dX", "dW"):
+                assert torch.equal(out["1"][entry][key], out["0"][entry][key]), (
+                    ignore,
+                    entry,
+                    key,
+                )
+        for key in ("dX", "dW"):
+            assert torch.equal(out["1"]["pair"][key], out["0"]["pair"][key]), (
+                ignore,
+                key,
+            )
+        assert torch.all(out["1"]["loss"]["dX"][~inp.valid] == 0)
+    # the kernels against the torch forms: slab_sum over a prepared runner's workspace (the 4097-row loop: a one-row
+    # tail chunk, K-sliced on every supported device), the scatter eagerly
+    monkeypatch.setenv(cake_backend.DX_FINALIZE_ENV, "1")
+    inp = make_inputs(4097, seed=SEED + 50, device=CUDA, W=glm_weight, ignore_frac=0.0)
+    common = dict(
+        objective="ce", loss_div=inp.loss_div, chunk_size=4096, backend="cake"
+    )
+    runner = prepare_lm_head_loss(inp.X, inp.W, inp.labels, dx_finalize=True, **common)
+    plan = runner.plan
+    sliced = [i for i in range(plan.num_chunks) if plan.dx_slices_of(i) > 1]
+    assert sliced and all(("slab_sum", i) in runner.launches for i in sliced)
+    assert all(("dx_reduce", i) not in runner.values for i in range(plan.num_chunks))
+    assert "slab_sum" in runner.stages and plan.dx_finalize
+    runner.forward()
+    torch.cuda.synchronize()
+    cast_vec = plan.geometry.cast_vec
+    for i in sliced:
+        v = runner.values[("slab_sum", i)]
+        row0, rows_c = plan.chunks[i]
+        assert v["dx"].data_ptr() == runner.dx_acc[row0].data_ptr()
+        assert v["n_slabs"] == plan.dx_slices_of(i) - 1
+        assert v["ws_slab"] == runner.tensors["dx_ws"].stride(0)
+        assert v["num_vecs"] == rows_c * DEFAULT_H // cast_vec
+        # the registry's grid rule is the kernel's: one CTA per 2048 vectors, at most 65535
+        assert runner.launches[("slab_sum", i)].grid == (
+            max(1, min(-(-v["num_vecs"] // 2048), 65535)),
+            1,
+            1,
+        )
+    plain = prepare_lm_head_loss(inp.X, inp.W, inp.labels, dx_finalize=False, **common)
+    assert "slab_sum" not in plain.stages and all(
+        ("dx_reduce", i) in plain.values for i in sliced
+    )
+    plain.forward()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        runner.dx_acc, plain.dx_acc
+    )  # the kernel's fixed-order adds are the add_ chain's
+    gen = torch.Generator(device="cuda").manual_seed(SEED)
+    valid = make_inputs(
+        4097, seed=SEED + 51, device=CUDA, W=glm_weight, ignore_frac=0.3
+    ).valid
+    T = int(valid.numel())
+    idx = valid.nonzero().squeeze(1)
+    scan = torch.cumsum(valid, 0, dtype=torch.int32)
+    acc = torch.randn(int(idx.numel()), DEFAULT_H, device=CUDA, generator=gen)
+    g = torch.tensor(0.75, device=CUDA)
+    bound.clear()
+    fused = cake_backend.scale_cast_scatter(acc, g, idx, scan, T, backend="cake")
+    shipped = cake_backend.scatter_rows(
+        cake_backend.scale_cast(acc, g, torch.bfloat16, backend="cake"), idx, T
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(fused, shipped) and torch.all(fused[~valid] == 0)
+    assert torch.equal(
+        fused,
+        cake_backend.scale_cast_scatter(acc, g, idx, scan, T, backend="reference"),
+    )
+    assert bound == [
+        "scale_cast_scatter_bf16",
+        "scale_cast_bf16",
+    ]  # the eager scatter kernel, then the shipped flat cast

@@ -98,6 +98,24 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   and `ForwardResult.backward` / `backward_loss(..., dz_last=...)` finish
   `dW`; the prepared runner keeps that chunk's `dz` in the workspace between
   `forward()` and `backward()`.
+* Fused dX finalize (default on unless
+  `FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE=0`): a K-sliced `dX` GEMM's FP32
+  slabs are added into `dX_acc` by one fixed-order kernel (`slab_sum`: one RN
+  add per element per slab in ascending slab order -- the evaluation order of
+  the previous chain of in-place `add_` launches, with `dX_acc` read and
+  written once), and a compacted call writes its `[T, H]` BF16 `dX` in one pass
+  (`scale_cast_scatter_bf16`: `bf16(g * dX_acc[compact row])` on the valid
+  rows, exact zeros elsewhere, addressed through the inclusive int32 scan of
+  the valid-row mask -- one `cumsum` issued in the backward -- and validated
+  against the compact index) instead of the flat cast, the zero fill and the
+  `index_copy_` of the compact rows.  The forward keeps the bool valid-row mask
+  next to the row index (`ForwardResult.row_valid`); `backward_loss(...,
+  row_valid=...)` / `finalize_dx` select the one-pass form, the log-probability
+  backward finalizes its accumulator the same way, and every row valid stays
+  the single flat cast.  The same FP32 operations in the same order: `dX` is
+  bitwise the previous path's, and `0` restores that path.  The prepared runner
+  keeps its compact `dx_out` contract (`runner.scatter` restores `[T, H]`) and
+  gains the kernel slab reduction only.
 * Memory rule: no logits, probability or `dlogits` buffer ever spans more than
   `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
@@ -168,6 +186,15 @@ are gathered once per step):
   accumulators -- the single output cast of `dX` (and of `dW` without
   `fuse_dw_cast`) in the backward, with the upstream gradient `g` read from a
   device scalar.
+* `slab_sum`: after a K-sliced `gemm_dx_s<k>`, `dX_acc[rows] += slab_0 + ...
+  + slab_{k-2}` in one launch, one RN add per element per slab in ascending
+  slab order (the fused dX finalize; `dx_reduce`, the host's `add_` chain,
+  when it is off).
+* `scale_cast_scatter_bf16`: the dX output boundary of a compacted call with
+  the fused dX finalize -- `out[r] = bf16(g * acc[scan[r] - 1])` when
+  `row_index[scan[r] - 1] == r`, exact zeros otherwise, one CTA per output row
+  per iteration, every element written once (launched by `finalize_dx`, not
+  by the chunk loop).
 
 ### Instance variants
 

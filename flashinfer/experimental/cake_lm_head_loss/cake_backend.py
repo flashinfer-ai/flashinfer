@@ -66,6 +66,15 @@ Contract
   whenever the chunk's K-slice count agrees; the ``loss`` and ``dW``
   reductions run over different chunk boundaries, hence differ by FP32
   rounding.  All rows valid: the uncompacted path (no gather, no scatter).
+* Fused dX finalize (default on unless ``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE=0``):
+  the K-slice slabs of a sliced dX GEMM are added into ``dX_acc`` by one
+  fixed-order kernel (``slab_sum``) instead of the host's chain of in-place
+  ``add_`` launches, and a compacted call's dX output boundary writes the
+  ``[T, H]`` BF16 ``dX`` in one pass (``scale_cast_scatter_bf16``: ``bf16(g *
+  dX_acc[compact row])`` on the valid rows, exact zeros elsewhere, addressed by
+  the inclusive int32 scan of the valid-row mask) instead of the flat cast, the
+  zero fill and the ``index_copy_``.  The same FP32 operations in the same
+  order: ``dX`` is bitwise the previous path's (``0`` restores that path).
 * ``deterministic=True`` (the only mode this backend serves): fixed sequential
   chunk order, no atomics -- bitwise reproducible ``loss``, ``logp``, ``dX``
   and ``dW`` across runs.
@@ -189,6 +198,8 @@ STAGE_TENSORS = {
     "row_grad": ("z", "labels", "lse", "d"),
     "scale_cast_bf16": ("acc", "g", "out"),
     "scale_cast_f32": ("acc", "g", "out"),
+    "slab_sum": ("dx", "ws"),
+    "scale_cast_scatter_bf16": ("acc", "g", "scan", "idx_lo", "out"),
 }
 COMMON_TENSORS = ("workspace", "tma_descriptor_workspace")
 COMMON_SCALARS = (
@@ -221,6 +232,14 @@ DX_SLICE_STAGES = ("gemm_dx_s2", "gemm_dx_s3", "gemm_dx_s4")
 # operations in the same order as ``gemm_dw_acc`` followed by ``scale_cast_*``, so the weight gradient is bitwise
 # identical; the flat ``scale_cast`` pass over ``dW`` disappears.  Selected by ``fuse_dw_cast`` (default on).
 DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
+# Fused dX finalize (``dx_finalize``, default on): ``slab_sum`` adds the FP32 K-slice slabs of a sliced dX GEMM into
+# the chunk's rows of ``dX_acc`` in ascending slab order in one launch (one RN add per element per slab -- the
+# evaluation order of the host's ``add_`` chain, ``dX_acc`` read and written once instead of once per slab), and
+# ``scale_cast_scatter_bf16`` writes a compacted call's ``[T, H]`` BF16 ``dX`` in one pass: ``bf16(g * dX_acc[scan[r]
+# - 1])`` on a valid output row ``r`` (``scan`` = the inclusive int32 count of valid rows, so ``idx[scan[r] - 1] == r``
+# exactly on the valid rows), exact zeros elsewhere -- the flat ``scale_cast``, the zero fill and the ``index_copy_``
+# of the compact rows in one kernel that writes every output element once.  Bitwise the same ``dX``.
+DX_FINALIZE_STAGES = ("slab_sum", "scale_cast_scatter_bf16")
 K_SLICE_PENALTY = 0.01  # wave-efficiency score penalty per extra slab (the kernels' fitted per-slab cost share)
 
 # --------------------------------------------------------------------------- per-chunk instance rules
@@ -995,18 +1014,45 @@ def _resolve_fuse(fuse_dw_cast) -> bool:
     return fuse_dw_cast_default() if fuse_dw_cast is None else bool(fuse_dw_cast)
 
 
-def valid_row_index(labels: torch.Tensor) -> Optional[torch.Tensor]:
-    """``None`` when every row is valid (or ``T == 0``: the uncompacted path, no gather cost), else the ascending int64
-    index of the valid rows (``labels >= 0``; ``-100`` is the ignore index).  Rows with a negative label contribute
-    exactly zero to the loss, ``dX`` and ``dW``, so skipping them is exact.  One device synchronization (the count) plus
-    the ``nonzero`` synchronization when rows are ignored."""
+DX_FINALIZE_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE"  # "0" turns the fused dX finalize off (the before / after switch)
+
+
+def dx_finalize_default() -> bool:
+    """Default of ``dx_finalize``: the K-slice slabs of a sliced dX GEMM are added by the ``slab_sum`` kernel and a
+    compacted call's ``dX`` output is written by the ``scale_cast_scatter_bf16`` kernel (:data:`DX_FINALIZE_STAGES`)
+    unless ``$FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE`` is ``0`` (then the host adds the slabs with in-place ``add_``
+    launches and casts, zero-fills and ``index_copy_``-scatters the compact rows; bitwise the same ``dX``).  Read once
+    per forward; the backward follows the forward's choice through the saved valid-row mask."""
+    return os.environ.get(DX_FINALIZE_ENV, "1") != "0"
+
+
+def _resolve_dx_finalize(dx_finalize) -> bool:
+    return dx_finalize_default() if dx_finalize is None else bool(dx_finalize)
+
+
+def valid_rows(
+    labels: torch.Tensor, *, mask: bool = False
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """``(row_index, row_valid)``.  ``row_index`` is ``None`` when every row is valid (or ``T == 0``: the uncompacted
+    path, no gather cost), else the ascending int64 index of the valid rows (``labels >= 0``; ``-100`` is the ignore
+    index).  Rows with a negative label contribute exactly zero to the loss, ``dX`` and ``dW``, so skipping them is
+    exact.  One device synchronization (the count) plus the ``nonzero`` synchronization when rows are ignored.
+    ``mask=True`` (the fused dX finalize of a call that produces ``dX``) also returns the already materialized bool
+    valid-row mask ``labels >= 0`` (``[T]``; :func:`finalize_dx` turns it into the inclusive int32 scan behind the
+    backward's queued GEMMs, not here in the synchronization shadow of ``nonzero``); ``None`` whenever ``row_index``
+    is."""
     T = int(labels.numel())
     if T == 0:
-        return None
+        return None, None
     valid = labels >= 0
     if int(valid.sum().item()) == T:
-        return None
-    return valid.nonzero().squeeze(1)
+        return None, None
+    return valid.nonzero().squeeze(1), (valid if mask else None)
+
+
+def valid_row_index(labels: torch.Tensor) -> Optional[torch.Tensor]:
+    """The valid-row index of :func:`valid_rows` alone (``None`` when every row is valid)."""
+    return valid_rows(labels)[0]
 
 
 def scatter_rows(
@@ -1045,12 +1091,16 @@ def stages_for_entry(
     grad_weight_dtype=torch.bfloat16,
     fuse_dw_cast: Optional[bool] = None,
     num_chunks: Optional[int] = None,
+    dx_cast: bool = True,
 ) -> tuple[str, ...]:
     """Stages an entry point launches (``need_dx`` / ``need_dw`` drop the GEMMs of frozen inputs).
 
     ``fuse_dw_cast`` (default :func:`fuse_dw_cast_default`): the weight gradient's last chunk comes out of the fused
     GEMM ``gemm_dw_cast_bf16`` / ``gemm_dw_cast_f32`` instead of the flat ``scale_cast``; ``gemm_dw_acc`` then
     accumulates the chunks before it and is absent when ``num_chunks`` is given as 1 (unknown: kept).
+    ``dx_cast=False`` leaves the flat ``dX`` cast out: the caller finalizes ``dx_acc`` itself (the fused dX finalize of
+    a compacted log-probability backward scatters it in one pass, :func:`finalize_dx`).  The ``slab_sum`` kernel of a
+    K-sliced dX GEMM is a per-chunk instance like the ``_s<k>`` forms (:attr:`Plan.stages`), not listed here.
     """
     if entry not in ENTRIES:
         raise ValueError(f"entry must be one of {ENTRIES}")
@@ -1063,7 +1113,7 @@ def stages_for_entry(
     if need_dx or need_dw:
         stages.append("row_grad")
     if need_dx:
-        stages += ["gemm_dx", "scale_cast_bf16"]
+        stages += ["gemm_dx"] + (["scale_cast_bf16"] if dx_cast else [])
     if need_dw:
         if _resolve_fuse(fuse_dw_cast):
             if num_chunks is None or int(num_chunks) > 1:
@@ -1101,6 +1151,8 @@ def generated_program_available(
     needed |= reachable_variants(
         needed, arch, Geometry.from_record(record), dx_max_slices(stages)
     )
+    if dx_finalize_default():
+        needed |= set(DX_FINALIZE_STAGES)
     return all(stage in stages for stage in needed)
 
 
@@ -1317,6 +1369,8 @@ class Plan:
     variants: tuple[
         ChunkVariants, ...
     ] = ()  # per chunk: the GEMM instance knobs the rules resolved (empty = defaults)
+    dx_finalize: bool = False  # a K-sliced dX GEMM's slabs are added by the ``slab_sum`` kernel (else the host's ``add_`` chain)
+    dx_cast: bool = True  # the backward casts ``dx_acc`` into ``dx_out`` (False: the caller finalizes ``dx_acc``, :func:`finalize_dx`)
 
     def variants_of(self, index: int) -> ChunkVariants:
         return self.variants[index] if self.variants else ChunkVariants()
@@ -1396,8 +1450,13 @@ class Plan:
             grad_weight_dtype=self.problem.grad_weight_dtype,
             fuse_dw_cast=self.fuse_dw_cast,
             num_chunks=self.num_chunks,
+            dx_cast=self.dx_cast,
         )
         used = {s for s in base if s not in GEMM_STAGES}
+        if self.need_dx and self.dx_finalize and self.dx_ws_slabs:
+            used.add(
+                "slab_sum"
+            )  # some chunk slices its dX GEMM: its slabs are added by the kernel
         for index in range(self.num_chunks):
             if "gemm_logits" in base:
                 used.add(self.logits_stage(index))
@@ -1445,13 +1504,17 @@ def make_plan(
     fuse_dw_cast: bool = False,
     arch: Optional[str] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    dx_finalize: bool = False,
+    dx_cast: bool = True,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count
     (``dx_resident`` = the device's co-resident dX clusters, :func:`cluster_resident`); ``valid_rows`` (compaction)
     chunks that many rows instead of ``T``; ``fuse_dw_cast`` defers the last chunk's weight-gradient GEMM to the
     backward with the fused scale + cast epilogue.  ``arch`` (a registered program's architecture) applies the
     per-chunk instance rules (:func:`chunk_variants`; ``None`` = the reference path, base stages only) and
-    ``gemm_tuning`` pins knobs explicitly (already validated by the caller or :func:`_resolve_gemm_tuning`)."""
+    ``gemm_tuning`` pins knobs explicitly (already validated by the caller or :func:`_resolve_gemm_tuning`);
+    ``dx_finalize`` adds a sliced dX GEMM's slabs with the ``slab_sum`` kernel and ``dx_cast=False`` leaves ``dx_acc``
+    uncast for the caller (:func:`finalize_dx`)."""
     rows = problem.num_rows if valid_rows is None else int(valid_rows)
     chunks = plan_chunks(rows, problem.chunk)
     tuning = gemm_tuning or {}
@@ -1497,6 +1560,8 @@ def make_plan(
         None if valid_rows is None else int(valid_rows),
         bool(fuse_dw_cast),
         variants,
+        bool(dx_finalize),
+        bool(dx_cast),
     )
 
 
@@ -1605,6 +1670,7 @@ def memory_report(
     dx_ws_slabs: int = 0,
     valid_rows: Optional[int] = None,
     fuse_dw_cast: Optional[bool] = None,
+    dx_finalize: Optional[bool] = None,
 ) -> dict[str, Any]:
     """The reporting buckets of the memory rule (bytes).
 
@@ -1637,6 +1703,11 @@ def memory_report(
     its own from the first call on, so it is also the only storage the saved
     view keeps alive, while a prepared runner keeps it inside its workspace) --
     and a one-chunk call has no FP32 ``dW_acc`` at all.
+
+    ``dx_finalize`` (default :func:`dx_finalize_default`): a compacted call's
+    ``dX`` is written in one pass from the accumulator, so the compact BF16
+    ``dX`` rows disappear from the temporaries; the bool valid-row mask and its
+    int32 scan (``row_valid`` / ``row_scan``, ``[T]`` each) take their place.
     """
     compact = valid_rows is not None
     rows = (
@@ -1644,6 +1715,7 @@ def memory_report(
     )  # rows the chunk loop processes
     chunks = plan_chunks(rows, chunk)
     deferred = bool(need_dw and _resolve_fuse(fuse_dw_cast) and chunks)
+    fused_dx = bool(need_dx and _resolve_dx_finalize(dx_finalize))
     layout = workspace_layout(
         rows,
         vocab,
@@ -1671,7 +1743,14 @@ def memory_report(
         temporary["row_index"] = rows * 8  # int64 valid-row index
         if entry == "logprob":
             temporary["dlogp_compact"] = rows * 4
-        if need_dx:
+        if need_dx and fused_dx:
+            temporary["row_valid"] = int(
+                num_rows
+            )  # the bool valid-row mask the fused dX finalize scatters by
+            temporary["row_scan"] = (
+                int(num_rows) * 4
+            )  # its inclusive int32 scan (formed in the backward)
+        elif need_dx:
             temporary["dx_compact"] = (
                 rows * int(hidden) * 2
             )  # the cast compact rows, transient before the scatter into dX
@@ -1714,6 +1793,7 @@ def memory_report(
         gather_bytes=int(layout["x_c"][1]) if compact else 0,
         fuse_dw_cast=deferred,
         saved_dz_bytes=min(int(chunk), rows) * int(vocab) * 2 if deferred else 0,
+        dx_finalize=fused_dx,
     )
 
 
@@ -2006,6 +2086,16 @@ def _device_constants(index: int) -> dict[str, torch.Tensor]:
     }
 
 
+def _unit_scale(device: torch.device) -> torch.Tensor:
+    """The ``[1] = 1.0`` fp32 scale of a cast whose incoming gradient is ``None`` (the log-probability
+    entry's dX finalize): the per-device cached cell on CUDA -- a per-call ``torch.ones`` would be one
+    fill launch inside the backward -- and a fresh cell elsewhere (the reference backend on the host)."""
+    if device.type == "cuda":
+        index = torch.cuda.current_device() if device.index is None else device.index
+        return _device_constants(int(index))["unit_scale"]
+    return torch.ones((1,), dtype=torch.float32, device=device)
+
+
 def _ffi_stream_context(index: int):
     """tvm-ffi environment-stream context for torch's current stream on device ``index``."""
     import tvm_ffi
@@ -2090,6 +2180,10 @@ def stage_values(
             d_off=0,
         )
         return values
+    if stage == "scale_cast_scatter_bf16":
+        raise ValueError(
+            "scale_cast_scatter_bf16 is bound by finalize_dx at the dX output boundary, not by the chunk loop"
+        )
     if stage in ("scale_cast_bf16", "scale_cast_f32"):
         acc = t["dx_acc"] if index == "dx" else t["dw_acc"]
         out = t["dx_out"] if index == "dx" else t["dw_out"]
@@ -2169,6 +2263,21 @@ def stage_values(
             k_iters=1,
             first_chunk=1,
             ws_slab=int(ws.stride(0)) if k > 1 else 0,
+        )
+    elif stage == "slab_sum":
+        # the fused dX finalize's slab reduction of the K-sliced dX GEMM: one kernel over the chunk's rows of dX_acc
+        k = plan.dx_slices_of(index)
+        if not plan.dx_finalize or k <= 1:
+            raise ValueError(
+                f"slab_sum belongs to a K-sliced dX GEMM of a plan with dx_finalize (chunk {index}: {k} slice(s))"
+            )
+        ws = t["dx_ws"]
+        values.update(
+            dx=t["dx_acc"][row0:stop],
+            ws=ws,
+            ws_slab=int(ws.stride(0)),
+            num_vecs=int(rows_c * p.hidden // g.cast_vec),
+            n_slabs=int(k - 1),
         )
     elif (
         stage == "dx_reduce"
@@ -2281,11 +2390,13 @@ def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
 
 
 def _dx_keys(plan: Plan, index: int) -> list:
-    """The dX GEMM of chunk ``index`` (its K-sliced form plus the host slab reduction when the plan slices it)."""
+    """The dX GEMM of chunk ``index`` plus, when the plan slices it, the slab reduction: the ``slab_sum`` kernel of the
+    fused dX finalize or the host's ``add_`` chain (``dx_reduce``)."""
     k = plan.dx_slices_of(index)
-    return [(plan.dx_stage_of(index), index)] + (
-        [("dx_reduce", index)] if k > 1 else []
-    )
+    if k <= 1:
+        return [(plan.dx_stage_of(index), index)]
+    reduce = "slab_sum" if plan.dx_finalize else "dx_reduce"
+    return [(plan.dx_stage_of(index), index), (reduce, index)]
 
 
 def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
@@ -2314,7 +2425,7 @@ def cast_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     the plan defers its last chunk -- that chunk's fused GEMM (its ``X`` rows gathered again first when the rows are
     compacted; the log-probability backward runs it inside :func:`recompute_keys` instead)."""
     keys: list[tuple[str, Any]] = []
-    if plan.need_dx:
+    if plan.need_dx and plan.dx_cast:
         keys.append(("scale_cast_bf16", "dx"))
     if plan.need_dw:
         if not plan.dw_deferred:
@@ -2468,6 +2579,22 @@ class ReferenceEngine:
     @staticmethod
     def dx_reduce(values: dict[str, Any]) -> None:
         _dx_reduce(values)
+
+    @staticmethod
+    def slab_sum(values: dict[str, Any]) -> None:
+        # the fused dX finalize's slab reduction: the same fixed-order FP32 adds as ``dx_reduce``
+        dx, ws = values["dx"], values["ws"]
+        for slab in range(int(values["n_slabs"])):
+            dx.add_(ws[slab, : dx.shape[0]])
+
+    @staticmethod
+    def scale_cast_scatter_bf16(values: dict[str, Any]) -> None:
+        # ``out[idx] = bf16(g * acc)``, exact zeros elsewhere (``idx_lo`` is the int32 view of the int64 index)
+        idx = values["idx_lo"].view(torch.int64)
+        out = values["out"]
+        out.zero_()
+        if idx.numel():
+            out.index_copy_(0, idx, (values["acc"] * values["g"]).to(out.dtype))
 
     @staticmethod
     def gemm_dw_acc(values: dict[str, Any]) -> None:
@@ -2657,7 +2784,10 @@ class LmHeadLossRunner:
         else:
             t["grad_scale"].copy_(grad.reshape(1).to(torch.float32))
         self._run(self.backward_order)
-        return t.get("dx_out"), t.get("dw_out")
+        dx = (
+            t.get("dx_out") if self.plan.dx_cast else t.get("dx_acc")
+        )  # dx_cast=False: the caller finalizes the accumulator
+        return dx, t.get("dw_out")
 
     def step(self, grad: Optional[torch.Tensor] = None):
         self.forward()
@@ -2761,6 +2891,8 @@ def prepare_lm_head_loss(
     compact_rows=False,
     fuse_dw_cast: Optional[bool] = None,
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
+    dx_finalize: Optional[bool] = None,
+    dx_cast: bool = True,
 ) -> LmHeadLossRunner:
     """Validate one binding and prepare its launches.
 
@@ -2791,6 +2923,14 @@ def prepare_lm_head_loss(
     per-chunk rules of its architecture (:func:`chunk_variants`);
     ``gemm_tuning`` (default :func:`gemm_tuning_default`) pins knobs
     explicitly, e.g. ``{"logits": {"group_m": 16}}``.
+
+    ``dx_finalize`` (default :func:`dx_finalize_default`): a K-sliced dX GEMM's
+    slabs are added into ``dx_acc`` by the ``slab_sum`` kernel instead of the
+    host's ``add_`` chain (bitwise the same accumulator).  ``dx_cast=False``
+    leaves the flat ``dX`` cast out of ``backward()``, which then returns
+    ``dx_acc`` for the caller to finalize (:func:`finalize_dx`: the fused dX
+    finalize of a compacted :func:`backward_logprob`); ``dx_out`` is then
+    neither bound nor allocated.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -2886,6 +3026,8 @@ def prepare_lm_head_loss(
         fuse_dw_cast=_resolve_fuse(fuse_dw_cast) if need_dw else False,
         arch=record["arch"] if record is not None else None,
         gemm_tuning=tuning,
+        dx_finalize=bool(need_dx and _resolve_dx_finalize(dx_finalize)),
+        dx_cast=bool(dx_cast),
     )
     missing = [s for s in plan.stages if s not in stages]
     if missing:
@@ -2983,7 +3125,8 @@ def prepare_lm_head_loss(
             t["d_in"] = d_in
     if plan.need_dx:
         t["dx_acc"] = output(dx_acc, "dx_acc", (rows_loop, H), torch.float32)
-        t["dx_out"] = output(dx_out, "dx_out", (rows_loop, H), torch.bfloat16)
+        if plan.dx_cast:
+            t["dx_out"] = output(dx_out, "dx_out", (rows_loop, H), torch.bfloat16)
     if plan.need_dw:
         if plan.dw_acc_needed:
             t["dw_acc"] = output(dw_acc, "dw_acc", (V, H), torch.float32)
@@ -3034,6 +3177,7 @@ def prepare_lm_head_loss(
         dx_ws_slabs=plan.dx_ws_slabs,
         valid_rows=plan.valid_rows,
         fuse_dw_cast=plan.fuse_dw_cast,
+        dx_finalize=plan.dx_finalize,
     )
     if device.type == "cuda":
         device_index = int(
@@ -3109,12 +3253,14 @@ def forward_binding_key(
     valid_rows=None,
     fuse_dw_cast=False,
     gemm_tuning=None,
+    dx_finalize=False,
 ) -> tuple:
     """Cache key of a forward binding: ``(data_ptr, shape, stride, dtype)`` of every
     input plus every option that shapes the argument plans; ``valid_rows`` is the
     compacted row count (a label-dependent fact of the plan; ``None`` = uncompacted);
     ``fuse_dw_cast`` the resolved weight-gradient form; ``gemm_tuning`` the explicit
-    GEMM knobs (``None`` = the environment's, :func:`gemm_tuning_default`)."""
+    GEMM knobs (``None`` = the environment's, :func:`gemm_tuning_default`);
+    ``dx_finalize`` the resolved dX finalize form (the slab reduction's launches differ)."""
     return (
         "fwd",
         entry,
@@ -3132,6 +3278,7 @@ def forward_binding_key(
         None if valid_rows is None else int(valid_rows),
         bool(fuse_dw_cast),
         _tuning_key(_resolve_gemm_tuning(gemm_tuning)),
+        bool(dx_finalize),
     )
 
 
@@ -3148,6 +3295,7 @@ def logprob_backward_binding_key(
     valid_rows=None,
     fuse_dw_cast=False,
     gemm_tuning=None,
+    dx_finalize=False,
 ) -> tuple:
     return (
         "bwd",
@@ -3163,6 +3311,7 @@ def logprob_backward_binding_key(
         None if valid_rows is None else int(valid_rows),
         bool(fuse_dw_cast),
         _tuning_key(_resolve_gemm_tuning(gemm_tuning)),
+        bool(dx_finalize),
     )
 
 
@@ -3342,7 +3491,10 @@ class _Binding:
         self._scratch(t)
         if plan.need_dx:
             t["dx_acc"] = torch.empty((T, H), dtype=torch.float32, device=self.device)
-            t["dx_out"] = torch.empty((T, H), dtype=torch.bfloat16, device=self.device)
+            if plan.dx_cast:
+                t["dx_out"] = torch.empty(
+                    (T, H), dtype=torch.bfloat16, device=self.device
+                )
         if plan.need_dw:
             if plan.dw_acc_needed:
                 t["dw_acc"] = torch.empty(
@@ -3350,7 +3502,10 @@ class _Binding:
                 )
             t["dw_out"] = torch.empty((V, H), dtype=torch.bfloat16, device=self.device)
         self._launch(self.backward_order, t)
-        return t.get("dx_out"), t.get("dw_out")
+        dx = (
+            t.get("dx_out") if plan.dx_cast else t.get("dx_acc")
+        )  # dx_cast=False: the caller finalizes the accumulator
+        return dx, t.get("dw_out")
 
 
 def _deferred_operands(plan: Plan, t: dict[str, Any]) -> tuple:
@@ -3441,6 +3596,9 @@ class ForwardResult:
     row_index: Optional[torch.Tensor] = (
         None  # int64 [T_v] valid-row index when the chunk loop was compacted (None otherwise)
     )
+    # the bool [T] valid-row mask when the compacted forward ran with the fused dX finalize (None otherwise): the
+    # backward follows the forward's choice through it and forms the inclusive scan the scatter kernel reads
+    row_valid: Optional[torch.Tensor] = None
     num_rows: int = 0  # T, the caller's row count
     # Deferred weight gradient (``fuse_dw_cast``, loss entry): the last chunk's BF16 ``dz`` rows (a view of the chunk
     # buffer) and its ``X`` rows -- ``x_last`` (a view of ``X``) on the uncompacted path, ``x_src`` / ``x_idx`` (``X`` and
@@ -3469,6 +3627,7 @@ class ForwardResult:
             x_last=self.x_last,
             x_src=self.x_src,
             x_idx=self.x_idx,
+            row_valid=self.row_valid,
         )
 
 
@@ -3479,6 +3638,7 @@ def _empty_forward(
     need_dx: bool,
     need_dw: bool,
     row_index: Optional[torch.Tensor] = None,
+    row_valid: Optional[torch.Tensor] = None,
 ) -> ForwardResult:
     """Zeros without binding or launching: ``T == 0``, or every row ignored (``row_index`` empty)."""
     device = X.device
@@ -3510,6 +3670,7 @@ def _empty_forward(
             else None,
             memory=memory,
             row_index=row_index,
+            row_valid=row_valid,
             num_rows=T,
         )
     return ForwardResult(
@@ -3560,7 +3721,10 @@ def forward_loss(
     the last chunk's weight-gradient GEMM is deferred to :func:`backward_loss`
     (``dw_acc`` holds the chunks before it, ``None`` for a one-chunk call; the
     result carries that chunk's operands ``dz_last`` / ``x_last`` / ``x_src`` /
-    ``x_idx``).
+    ``x_idx``).  The fused dX finalize (:func:`dx_finalize_default`, read once
+    here) adds a sliced dX GEMM's slabs with the ``slab_sum`` kernel and, on a
+    compacted call, keeps the valid-row mask (``row_valid``) for
+    :func:`backward_loss`'s one-pass scatter of ``dX``.
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")
@@ -3580,12 +3744,24 @@ def forward_loss(
     T = problem.num_rows
     if T == 0:
         return _empty_forward(problem, X, need_dx=need_dx, need_dw=need_dw)
-    row_index = valid_row_index(labels) if _resolve_compact(compact_rows) else None
+    fused_dx = bool(
+        need_dx and dx_finalize_default()
+    )  # read once per call; the backward follows it through row_valid
+    row_index, row_valid = (
+        valid_rows(labels, mask=fused_dx)
+        if _resolve_compact(compact_rows)
+        else (None, None)
+    )
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _empty_forward(
-            problem, X, need_dx=need_dx, need_dw=need_dw, row_index=row_index
+            problem,
+            X,
+            need_dx=need_dx,
+            need_dw=need_dw,
+            row_index=row_index,
+            row_valid=row_valid,
         )
-    valid_rows = None if row_index is None else int(row_index.numel())
+    valid_count = None if row_index is None else int(row_index.numel())
     fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
     common = dict(
         objective=objective,
@@ -3605,8 +3781,9 @@ def forward_loss(
             W,
             labels,
             entry="loss",
-            valid_rows=valid_rows,
+            valid_rows=valid_count,
             fuse_dw_cast=fuse,
+            dx_finalize=fused_dx,
             **common,
         )
         binding = cache.lookup(key)
@@ -3623,6 +3800,7 @@ def forward_loss(
                 memory=binding.memory,
                 backend=backend,
                 row_index=row_index,
+                row_valid=row_valid,
                 num_rows=T,
                 dz_last=dz_last,
                 x_last=x_last,
@@ -3638,6 +3816,7 @@ def forward_loss(
         backend=backend,
         compact_rows=False if row_index is None else row_index,
         fuse_dw_cast=fuse,
+        dx_finalize=fused_dx,
         **common,
     )
     if backend == "cake":
@@ -3667,6 +3846,7 @@ def forward_loss(
         memory=memory,
         backend=backend,
         row_index=row_index,
+        row_valid=row_valid,
         num_rows=T,
         dz_last=dz_last,
         x_last=x_last,
@@ -3695,7 +3875,7 @@ def scale_cast(
     if acc.numel() == 0:
         return out
     g = (
-        torch.ones((1,), dtype=torch.float32, device=acc.device)
+        _unit_scale(acc.device)
         if grad is None
         else grad.detach().reshape(1).to(device=acc.device, dtype=torch.float32)
     )
@@ -3736,6 +3916,144 @@ def scale_cast(
             launch.prepare(*launch.arguments)
         launch()
     return out
+
+
+def scale_cast_scatter(
+    acc: torch.Tensor,
+    grad: Optional[torch.Tensor],
+    row_index: torch.Tensor,
+    scan: torch.Tensor,
+    num_rows: int,
+    *,
+    backend: str = "cake",
+) -> torch.Tensor:
+    """``scatter_rows(bf16(g * acc), row_index, num_rows)`` as ONE new BF16 ``[num_rows, H]`` tensor written in one
+    pass: ``bf16(g * acc[compact row])`` on the valid rows, exact zeros elsewhere.  ``acc`` is the compact FP32
+    ``[T_v, H]`` accumulator (never written), ``row_index`` its ascending int64 original rows, ``scan`` the inclusive
+    int32 count of valid rows (``cumsum(labels >= 0)``: ``scan[r] - 1`` is the compact row of a valid output row
+    ``r``, which the kernel validates through ``row_index[scan[r] - 1] == r``), ``g`` = ``grad`` (``None`` = 1).  The
+    same FP32 multiply and BF16 rounding as :func:`scale_cast`, so the valid rows are bitwise the flat cast's; every
+    output element is written exactly once.  ``T_v == 0`` (every row ignored) is one zero fill: the kernel reads a
+    candidate compact row for every output row and would have none."""
+    if acc.dtype != torch.float32 or acc.ndim != 2 or not acc.is_contiguous():
+        raise ValueError("the accumulator must be a contiguous FP32 [T_v, H] tensor")
+    T_v, H = (int(s) for s in acc.shape)
+    num_rows = int(num_rows)
+    if (
+        row_index.dtype != torch.int64
+        or tuple(row_index.shape) != (T_v,)
+        or not row_index.is_contiguous()
+        or row_index.device != acc.device
+    ):
+        raise ValueError(
+            f"row_index must be a contiguous int64 [{T_v}] tensor on the accumulator's device"
+        )
+    if (
+        scan.dtype != torch.int32
+        or tuple(scan.shape) != (num_rows,)
+        or not scan.is_contiguous()
+        or scan.device != acc.device
+    ):
+        raise ValueError(
+            f"scan must be a contiguous int32 [{num_rows}] tensor on the accumulator's device"
+        )
+    if T_v > num_rows:
+        raise ValueError(
+            f"the accumulator has more rows ({T_v}) than the output ({num_rows})"
+        )
+    out = torch.empty((num_rows, H), dtype=torch.bfloat16, device=acc.device)
+    if out.numel() == 0:
+        return out
+    if T_v == 0:
+        out.zero_()
+        return out
+    g = (
+        _unit_scale(acc.device)
+        if grad is None
+        else grad.detach().reshape(1).to(device=acc.device, dtype=torch.float32)
+    )
+    if backend == "reference":
+        out.zero_()
+        out.index_copy_(0, row_index, (acc * g).to(torch.bfloat16))
+        return out
+    module_name, record = record_for(acc.device)
+    record_abi(record)
+    geometry = Geometry.from_record(record)
+    stage = "scale_cast_scatter_bf16"
+    if stage not in record:
+        raise NotImplementedError(
+            f"the registered program {module_name!r} lacks the stage {stage!r}"
+        )
+    if H % geometry.cast_vec:
+        raise ValueError(
+            f"the scatter needs a row width of a multiple of {geometry.cast_vec} elements"
+        )
+    values: dict[str, Any] = {name: None for name in COMMON_TENSORS}
+    values.update({name: 0 for name in COMMON_SCALARS})
+    values.update(
+        acc=acc,
+        g=g,
+        scan=scan,
+        idx_lo=row_index.view(
+            torch.int32
+        ),  # the low int32 word of each int64 index (stride 2)
+        out=out,
+        row_vecs=int(H // geometry.cast_vec),
+        num_rows=num_rows,
+        loss_div=1.0,
+    )
+    launches = _bind_all(
+        record,
+        module_name,
+        ((stage, "eager"),),
+        {(stage, "eager"): values},
+        acc.device,
+        geometry,
+    )
+    launch = launches[(stage, "eager")]
+    index = (
+        acc.device.index
+        if acc.device.index is not None
+        else torch.cuda.current_device()
+    )
+    with _ffi_stream_context(int(index)):
+        if launch.prepare is not None:
+            launch.prepare(*launch.arguments)
+        launch()
+    return out
+
+
+def finalize_dx(
+    acc: torch.Tensor,
+    grad: Optional[torch.Tensor],
+    row_index: Optional[torch.Tensor],
+    row_valid: Optional[torch.Tensor],
+    num_rows: Optional[int],
+    *,
+    backend: str = "cake",
+) -> torch.Tensor:
+    """The dX output boundary: ``bf16(g * acc)`` restored to the caller's ``[num_rows, H]`` rows.  Every row valid
+    (``row_index`` None): :func:`scale_cast`, already one pass over every row.  Compacted rows with the forward's
+    valid-row mask (``row_valid``: the fused dX finalize): the inclusive int32 scan -- one ``cumsum``, issued here
+    behind the backward's queued GEMMs -- and one :func:`scale_cast_scatter` launch.  Compacted rows without the mask
+    (the forward ran with ``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE=0``): the flat cast, then :func:`scatter_rows`
+    (zero fill + ``index_copy_``).  All three produce the same bits."""
+    if row_index is None:
+        return scale_cast(acc, grad, torch.bfloat16, backend=backend)
+    if num_rows is None:
+        raise ValueError("finalize_dx needs num_rows (the caller's T) with row_index")
+    if row_valid is None:
+        return scatter_rows(
+            scale_cast(acc, grad, torch.bfloat16, backend=backend),
+            row_index,
+            int(num_rows),
+        )
+    if row_valid.dtype != torch.bool or tuple(row_valid.shape) != (int(num_rows),):
+        raise ValueError(f"row_valid must be the bool [{int(num_rows)}] valid-row mask")
+    scan = torch.cumsum(row_valid, 0, dtype=torch.int32)
+    return scale_cast_scatter(
+        acc, grad, row_index, scan, int(num_rows), backend=backend
+    )
 
 
 def dw_cast(
@@ -3783,7 +4101,7 @@ def dw_cast(
     if rows == 0:
         return out.zero_()
     g = (
-        torch.ones((1,), dtype=torch.float32, device=device)
+        _unit_scale(device)
         if grad is None
         else grad.detach().reshape(1).to(device=device, dtype=torch.float32)
     )
@@ -3859,6 +4177,7 @@ def backward_loss(
     x_last: Optional[torch.Tensor] = None,
     x_src: Optional[torch.Tensor] = None,
     x_idx: Optional[torch.Tensor] = None,
+    row_valid: Optional[torch.Tensor] = None,
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Backward of the loss entry from the saved accumulators: ``(dX, dW)`` = ``bf16(g * dX_acc)``,
     ``cast(g * dW_acc)``; the accumulators are read, never written (repeatable).  A compacted forward
@@ -3866,18 +4185,17 @@ def backward_loss(
     zero BF16 ``[T, H]``.  A deferred weight gradient (``fuse_dw_cast``; ``ForwardResult.dz_last`` with
     ``x_last`` or ``x_src`` / ``x_idx``): ``dW = cast(g * (dW_acc + dz_last^T @ X_last))`` through the fused
     GEMM (:func:`dw_cast`), ``dW_acc`` being the chunks before the last one or ``None``;
-    :meth:`ForwardResult.backward` passes everything."""
-    dx = (
-        None
-        if dx_acc is None
-        else scale_cast(dx_acc, grad, torch.bfloat16, backend=backend)
-    )
-    if dx is not None and row_index is not None:
-        if num_rows is None:
+    :meth:`ForwardResult.backward` passes everything.  ``row_valid`` (``ForwardResult.row_valid``, the
+    valid-row mask of a compacted forward that ran with the fused dX finalize) selects the one-pass
+    scale-cast-scatter of the compact rows (:func:`finalize_dx`); without it the compact rows are cast,
+    then scattered into a zero BF16 ``[T, H]``.  Both give the same bits."""
+    dx = None
+    if dx_acc is not None:
+        if row_index is not None and num_rows is None:
             raise ValueError(
                 "backward_loss needs num_rows (the caller's T) with row_index"
             )
-        dx = scatter_rows(dx, row_index, int(num_rows))
+        dx = finalize_dx(dx_acc, grad, row_index, row_valid, num_rows, backend=backend)
     if dz_last is not None:
         if x_last is None:
             if x_src is None or x_idx is None:
@@ -4020,8 +4338,11 @@ def backward_logprob(
     if not (need_dx or need_dw):
         return None, None
     T, H, V = problem.num_rows, problem.hidden, problem.vocab
-    row_index = (
-        valid_row_index(labels) if (T and _resolve_compact(compact_rows)) else None
+    fused_dx = bool(need_dx and dx_finalize_default())  # read once per call
+    row_index, row_valid = (
+        valid_rows(labels, mask=fused_dx)
+        if (T and _resolve_compact(compact_rows))
+        else (None, None)
     )
     rows = T if row_index is None else int(row_index.numel())
     if rows == 0:  # no rows, or every row ignored
@@ -4037,8 +4358,19 @@ def backward_logprob(
     dlogp = dlogp.detach().reshape(T).to(torch.float32).contiguous()
     cache = BINDING_CACHE
     key = None
-    valid_rows = None if row_index is None else rows
+    valid_count = None if row_index is None else rows
     fuse = bool(need_dw and _resolve_fuse(fuse_dw_cast))
+    # the fused dX finalize of a compacted backward: the runner leaves dx_acc uncast and finalize_dx writes the [T, H]
+    # dX in one pass (uncompacted: the in-loop flat cast is already one pass over every row)
+    dx_cast = not (fused_dx and row_index is not None)
+
+    def finish_dx(dx):
+        if dx is None:
+            return None
+        if dx_cast:
+            return scatter_rows(dx, row_index, T)
+        return finalize_dx(dx, None, row_index, row_valid, T, backend=backend)
+
     if backend == "cake" and cache.enabled:
         key = logprob_backward_binding_key(
             X,
@@ -4049,13 +4381,14 @@ def backward_logprob(
             chunk_size=chunk_size,
             need_dx=need_dx,
             need_dw=need_dw,
-            valid_rows=valid_rows,
+            valid_rows=valid_count,
             fuse_dw_cast=fuse,
+            dx_finalize=fused_dx,
         )
         binding = cache.lookup(key)
         if binding is not None:
             dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index)
-            return (None if dx is None else scatter_rows(dx, row_index, T)), dw
+            return finish_dx(dx), dw
     runner = prepare_lm_head_loss(
         X,
         W,
@@ -4070,11 +4403,13 @@ def backward_logprob(
         backend=backend,
         compact_rows=False if row_index is None else row_index,
         fuse_dw_cast=fuse,
+        dx_finalize=fused_dx,
+        dx_cast=dx_cast,
     )
     dx, dw = runner.backward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))
-    return (None if dx is None else scatter_rows(dx, row_index, T)), dw
+    return finish_dx(dx), dw
 
 
 # ---------------------------------------------------------------------------
@@ -4135,6 +4470,9 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
             result.row_index,
             int(X.shape[0]),
         )  # compacted: dx_acc holds the rows of row_index
+        ctx.row_valid = (
+            result.row_valid
+        )  # the fused dX finalize's valid-row mask (None otherwise)
         ctx.grad_weight_dtype = grad_weight_dtype
         ctx.backend = backend
         ctx.empty = X.shape[0] == 0 or (
@@ -4181,6 +4519,7 @@ class ChunkedLmHeadLossFunction(torch.autograd.Function):
             x_last=x_last,
             x_src=x_src,
             x_idx=x_idx,
+            row_valid=ctx.row_valid,
         )
         return (dx, dw) + none[2:]
 
@@ -4277,7 +4616,10 @@ def chunked_lm_head_loss(
     :func:`fuse_dw_cast_default`): the last chunk's weight-gradient GEMM runs in
     the backward with the upstream scale and the cast fused into its epilogue
     (bitwise the same ``dW``, one pass over ``dW`` fewer; a one-chunk call
-    keeps no FP32 ``dW`` accumulator).
+    keeps no FP32 ``dW`` accumulator).  The fused dX finalize
+    (``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE``, on unless ``0``) adds a
+    sliced dX GEMM's slabs with one kernel and writes a compacted call's
+    ``[T, H]`` ``dX`` in one pass (bitwise the same ``dX``).
     """
     if backend not in BACKENDS:
         raise ValueError(f"backend must be one of {BACKENDS}")

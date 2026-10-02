@@ -126,6 +126,13 @@ def chunked_lm_head_loss(
         saved-tensor version error).  ``None`` (default) reads
         ``FLASHINFER_CAKE_LM_HEAD_LOSS_FUSE_DW_CAST`` (on unless set to ``0``).
 
+    The fused dX finalize (``FLASHINFER_CAKE_LM_HEAD_LOSS_DX_FINALIZE``, on
+    unless set to ``0``) adds the K-slice slabs of a sliced ``dX`` GEMM with one
+    fixed-order kernel and, with ``compact_rows``, writes the ``[T, H]`` ``dX`` in
+    one pass (``bf16(g * dX_acc)`` on the valid rows, exact zeros elsewhere)
+    instead of casting, zero-filling and scattering the compact rows; the same
+    FP32 operations in the same order, so ``dX`` is bitwise the same.
+
     Returns
     -------
     loss : torch.Tensor
