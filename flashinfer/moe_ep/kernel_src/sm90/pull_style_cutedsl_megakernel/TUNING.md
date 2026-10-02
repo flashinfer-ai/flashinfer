@@ -31,8 +31,9 @@ config per point is the drop's token-bucket heuristic table
 (`moe_hopper_fp8/heuristic_config.py`, geometry derived from the kernel
 team's 2026-08-19 four-rank H200 sweep at the same vendored kernel
 sources, plus the locally added per-bucket `token_back_mode` column from
-the 2026-08-23 epi-vs-reuse sweep, and the kernel team's 2026-09-18/19
-tail-split / group_hint / token-back retunes — see the knob list below).
+the 2026-08-23 epi-vs-reuse sweep, the kernel team's 2026-09-18/19
+tail-split / group_hint / token-back retunes, and the 2026-09-22 per_tensor
+2048-32768 switch back to reuse_dispatch_warps — see the knob list below).
 Raw rows: `benchmark_data/20260919/20260919_064746_mega_sm90_heuristic_both.csv`
 (local archive, not committed).
 
@@ -64,7 +65,7 @@ now selects (`epi` = `epi_warps`, `reuse` = `reuse_dispatch_warps`; blank
 group hint = one wave of clusters).  All other knobs are at their config
 defaults — notably `active_dispatch_warps=1` (see "The knob surface").
 
-**per_tensor** — peak 1004 TFLOPS/rank:
+**per_tensor** — peak 1084 TFLOPS/rank:
 
 | tok/rank | heuristic config                   | token back | group hint | tail split | compute µs | TFLOPS | e2e µs   | e2e TFLOPS |
 |---------:|------------------------------------|:----------:|-----------:|:----------:|-----------:|-------:|---------:|-----------:|
@@ -76,11 +77,22 @@ defaults — notably `active_dispatch_warps=1` (see "The knob surface").
 |      256 | swap-AB M256N32 CGA2x1             |    epi     |        264 |            |     1653.5 |  122.7 |   1754.0 |      115.7 |
 |      512 | swap-AB M256N64 CGA1x1             |    epi     |        264 |            |     1685.6 |  240.8 |   1815.0 |      223.6 |
 |     1024 | swap-AB ping-pong M128N64 CGA1x2   |    epi     |        264 |    yes     |     1744.2 |  465.4 |   1845.4 |      439.9 |
-|     2048 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |        264 |    yes     |     2239.7 |  724.9 |   2355.4 |      689.3 |
-|     4096 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |        264 |    yes     |     3679.3 |  882.5 |   3870.3 |      839.0 |
-|     8192 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |        264 |    yes     |     6935.0 |  936.4 |   7201.6 |      901.7 |
-|    16384 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |            |    yes     |    13148.5 |  987.8 |  13648.2 |      951.6 |
-|    32768 | swap-AB ping-pong M128N128 CGA1x2  |    epi     |            |    yes     |    25877.2 | 1003.8 |  26978.5 |      962.8 |
+|     2048 | swap-AB ping-pong M128N128 CGA1x2  |   reuse    |        264 |    yes     |     2114.5 |  764.7 |   2235.1 |      725.5 |
+|     4096 | swap-AB ping-pong M128N128 CGA1x2  |   reuse    |        264 |    yes     |     3379.6 |  953.2 |   3586.0 |      903.9 |
+|     8192 | swap-AB ping-pong M128N128 CGA1x2  |   reuse    |        264 |    yes     |     6167.0 | 1024.8 |   6770.9 |      974.4 |
+|    16384 | swap-AB ping-pong M128N128 CGA1x2  |   reuse    |            |    yes     |    12282.5 | 1073.0 |  12726.1 |     1025.9 |
+|    32768 | swap-AB ping-pong M128N128 CGA1x2  |   reuse    |            |    yes     |    23980.6 | 1084.4 |  25147.2 |     1033.7 |
+
+per_tensor 2048-32768 rows: token-back switched to `reuse_dispatch_warps`
+and re-measured 2026-09-22 on a 1830 MHz locked 4x H200 node (heuristic
+mode, `benchmark_data/20260922/20260922_032656_mega_sm90_heuristic_per_tensor.csv`,
+local archive); the rest of the table is the 2026-09-19 session, so those
+five rows are cross-session.  The same-node two-round interleaved A/B
+(2026-09-22, no other GPU tenants) gave reuse_dispatch_warps over the
+previous epi_warps rows +4.5 / +4.1 / +3.9 / +5.0 / +5.1% e2e and
++4.6 / +7.1 / +6.4 / +4.4 / +5.5% compute (2048 / 4096 / 8192 / 16384 /
+32768), both rounds agreeing; the 2026-09-19 session had scored the two
+placements a tie there.
 
 **blockwise** — peak 852 TFLOPS/rank:
 
@@ -247,8 +259,10 @@ token-back modes — 38 candidates.
   sweep: epi_warps small/mid buckets, reuse_dispatch_warps at the
   GEMM-bound tail; the 2026-09-18 retune moved every per_tensor bucket
   and blockwise 1024-8192 back to epi_warps — with `group_hint` 264 the
-  epilogue-warp write-back wins or ties there — so reuse_dispatch_warps
-  remains only on blockwise >= 16384) and is a tuner candidate axis.  All six token_back x reduce combinations are
+  epilogue-warp write-back wins or ties there — leaving reuse_dispatch_warps
+  only on blockwise >= 16384; the 2026-09-22 two-round A/B on a 1830 MHz
+  locked node then put per_tensor 2048-32768 back on reuse_dispatch_warps,
+  +4-5% e2e over epi_warps on those five rows) and is a tuner candidate axis.  All six token_back x reduce combinations are
   kernel-supported; `epi_warps` / `reuse_dispatch_warps` /
   `standalone_warps` are all bit-validated by the `mega_sm90` multirank
   oracles.  `token_back_by_dispatch` remains as a legacy bool alias
@@ -465,9 +479,15 @@ token-back modes — 38 candidates.
   ping-pong kernel no longer spills with it on — the drop's 4-rank
   generate_c overhead fell from 17-22% to 0.7-2.4% at 2048-32768 and the
   earlier per_tensor 16384 training override was dropped again.
-- `dedup_dispatch`, `grouped_token_back`, `combine_format` — top-k dedup
-  on dispatch / combine and the quantized combine wire; see
-  `dedup_topk_design.md`.
+- Top-k dedup (`dedup_dispatch`, `grouped_token_back`, the quantized
+  `combine_format` wires) was removed on 2026-09-21.  Measured on 4x H200
+  (clock-locked, 2 interleaved rounds, 26 buckets) dispatch dedup was
+  e2e-neutral (both the sender-election and the receiver-only "rank cache"
+  variant within ±0.1%: dispatch is overlapped with the GEMMs) and combine
+  dedup lost 12% (walker-side reduce) to 27% (owner-side reduce in the FC2
+  epilogue warps) because the reduce sits on the critical path while the
+  NVLink bytes it saves are worth well under 0.5 ms even at 32768 tokens.
+  The combine wire is bf16 only.
 - `fp8_accum_mode`, `kind` (e4m3/e5m2), clamps.
 
 ## Sweep methodology + environment (reproduce recipe)

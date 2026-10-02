@@ -132,17 +132,23 @@ HEURISTIC_CONFIGS = {
         # 2048-32768 (2026-09-18, 4x H200, two interleaved rounds): swap-AB
         # ping-pong M128N128 cga(1,2,1) with tail-split pair tasks beats the
         # previous entries by 25/25/20% (2048/4096/8192, with group_hint 264)
-        # and 9/13% (16384/32768); epi_warps ties reuse_dispatch_warps there.
+        # and 9/13% (16384/32768).  Token-back re-measured 2026-09-22 (1830 MHz
+        # locked node, two interleaved rounds, both rounds agree):
+        # reuse_dispatch_warps beats epi_warps by +4.5/+4.1/+3.9/+5.0/+5.1% e2e
+        # (+4.6/+7.1/+6.4/+4.4/+5.5% compute) on these five rows.
         2048: _config(swap_ab=True, pingpong=True, tile=(128, 128, 128), cga=(1, 2, 1),
-                      group_hint=264, tail_split_pairs=True),
+                      group_hint=264, tail_split_pairs=True,
+                      token_back="reuse_dispatch_warps"),
         4096: _config(swap_ab=True, pingpong=True, tile=(128, 128, 128), cga=(1, 2, 1),
-                      group_hint=264, tail_split_pairs=True),
+                      group_hint=264, tail_split_pairs=True,
+                      token_back="reuse_dispatch_warps"),
         8192: _config(swap_ab=True, pingpong=True, tile=(128, 128, 128), cga=(1, 2, 1),
-                      group_hint=264, tail_split_pairs=True),
+                      group_hint=264, tail_split_pairs=True,
+                      token_back="reuse_dispatch_warps"),
         16384: _config(swap_ab=True, pingpong=True, tile=(128, 128, 128), cga=(1, 2, 1),
-                       tail_split_pairs=True),
+                       tail_split_pairs=True, token_back="reuse_dispatch_warps"),
         32768: _config(swap_ab=True, pingpong=True, tile=(128, 128, 128), cga=(1, 2, 1),
-                       tail_split_pairs=True),
+                       tail_split_pairs=True, token_back="reuse_dispatch_warps"),
     },
     # per_tensor 8 -> cooperative swap M256N16 and 64 -> basic swap M128N64
     # (2026-09-02, fold layout): each +3..+4% over the ping-pong twin the

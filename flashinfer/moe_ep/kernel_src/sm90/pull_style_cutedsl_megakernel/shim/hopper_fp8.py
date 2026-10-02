@@ -148,22 +148,6 @@ class MegaMoEHopperFp8Config:
     token_back_mode: Optional[
         Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
     ] = None
-    # Wire-level top-k dedup on dispatch: a token routed to several experts
-    # on the same remote rank crosses NVLink once; the duplicate pool rows
-    # are re-materialized locally from the carrier row.  Bit-exact with the
-    # non-dedup path (same payload bytes end up in every pool row).
-    dedup_dispatch: bool = False
-    # Combine dedup: all fc2 rows of one (src_rank, src_token) group are
-    # pre-reduced in fp32 on the expert rank and ONE row per contributing
-    # rank crosses the wire (inbox keyed by rank instead of topk slot).
-    # Requires token_back_mode="reuse_dispatch_warps" and
-    # apply_topk_in_fc1=True; COLLECTIVE (wire format) like dedup_dispatch.
-    grouped_token_back: bool = False
-    # Combine wire format: "bf16" (default), or the per-32 e8m0 quantized
-    # fp8 wires "32e4m3xe8m0" / "32e5m2xe8m0" (halved return bytes; the
-    # receiver dequantizes to fp32 before accumulating).  Quantized formats
-    # require grouped_token_back (the encoder lives in the group reduce).
-    combine_format: str = "bf16"
     # How many of the 4 dispatch warps do token-comm work at all (1/2/4):
     # prep, barrier, pull, and the reuse token-back.  The physical layout
     # stays at 4 (setmaxnreg is warpgroup-granular); warps beyond this count
@@ -286,33 +270,6 @@ class MegaMoEHopperFp8Config:
                 f"active_dispatch_warps must be 1, 2, or 4; got "
                 f"{self.active_dispatch_warps!r}."
             )
-        if self.combine_format not in ("bf16", "32e4m3xe8m0", "32e5m2xe8m0"):
-            raise ValueError(
-                "combine_format must be 'bf16', '32e4m3xe8m0', or "
-                f"'32e5m2xe8m0'; got {self.combine_format!r}."
-            )
-        if self.combine_format != "bf16" and not self.grouped_token_back:
-            raise ValueError(
-                "a quantized combine_format requires grouped_token_back=True "
-                "(the encoder lives in the grouped fc2 reduction)."
-            )
-        if self.grouped_token_back:
-            if self.resolved_token_back_mode != "reuse_dispatch_warps":
-                raise ValueError(
-                    "grouped_token_back requires "
-                    "token_back_mode='reuse_dispatch_warps', got "
-                    f"{self.resolved_token_back_mode!r}."
-                )
-            if self.in_kernel_fc2_reduce:
-                raise ValueError(
-                    "grouped_token_back and in_kernel_fc2_reduce both "
-                    "collapse the combine; enable only one."
-                )
-            if not self.apply_topk_in_fc1:
-                raise ValueError(
-                    "grouped_token_back requires apply_topk_in_fc1=True "
-                    "(the group pre-reduce is a plain sum)."
-                )
         if self.in_kernel_fc2_reduce and not self.apply_topk_in_fc1:
             # Kernel invariant: the Form B REDG path collapses topk before a
             # separate reducer could apply routing weights.
@@ -776,9 +733,6 @@ class MegaMoEHopperFp8Frontend:
             epi_flag_batch=c.epi_flag_batch,
             flag_batch=c.flag_batch,
             gate_up_clamp=self._gate_up_clamp,
-            dedup_dispatch=c.dedup_dispatch,
-            grouped_token_back=c.grouped_token_back,
-            combine_format=c.combine_format,
             active_dispatch_warps=c.active_dispatch_warps,
             compact_pull_buffer=c.compact_pull_buffer,
             fc1_store_offload=c.fc1_store_offload,
@@ -1353,9 +1307,6 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
     token_back_mode: Optional[
         Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
     ] = None,
-    dedup_dispatch: bool = False,
-    grouped_token_back: bool = False,
-    combine_format: str = "bf16",
     active_dispatch_warps: int = 1,
     compact_pull_buffer: bool = True,
     fc1_store_offload: bool = True,
@@ -1498,11 +1449,6 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
             knob_overrides.pop("group_hint", None)
         if tail_split_pairs is not None:
             knob_overrides.pop("tail_split_pairs", None)
-        # The combine wire (dedup + format) is a collective correctness
-        # setting the caller passes explicitly; a cached sweep entry must not
-        # silently switch it.
-        knob_overrides.pop("grouped_token_back", None)
-        knob_overrides.pop("combine_format", None)
 
     cfg = MegaMoEHopperFp8Config(
         rank=rank,
@@ -1523,9 +1469,6 @@ def get_symm_buffer_for_hopper_fp8_mega_moe(
         in_kernel_fc2_reduce=in_kernel_fc2_reduce,
         token_back_by_dispatch=token_back_by_dispatch,
         token_back_mode=token_back_mode,
-        dedup_dispatch=dedup_dispatch,
-        grouped_token_back=grouped_token_back,
-        combine_format=combine_format,
         active_dispatch_warps=active_dispatch_warps,
         compact_pull_buffer=compact_pull_buffer,
         fc1_store_offload=fc1_store_offload,
