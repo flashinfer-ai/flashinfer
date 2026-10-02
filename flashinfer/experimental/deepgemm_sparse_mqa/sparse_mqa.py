@@ -421,8 +421,13 @@ def program_spec(arch: str, name: str):
     )
 
 
+@functools.cache
 def load_program(arch: str, name: str):
-    """Compile ``name`` for the exact architecture of the attached device; returns ``(module, spec)``."""
+    """Compile ``name`` for the exact architecture of the attached device; returns ``(module, spec)``.
+
+    Cached per (architecture, program): ``build_and_load`` revisits the JIT cache on every call (tens of
+    milliseconds on a network file system), and a plan is built per request.
+    """
     spec = program_spec(arch, name)
     return spec.build_and_load(), spec
 
