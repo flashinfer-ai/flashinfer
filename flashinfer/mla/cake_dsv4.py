@@ -30,15 +30,23 @@ Host contract (flashinfer#4671 hardening)
 * **Workspace.** One caller-owned ``workspace_buffer`` is carved
   deterministically (:func:`cake_dsv4_workspace_layout`)::
 
-      [0,      1024)          TMA descriptor slab (bindings refresh it on every launch)
+      [0,      1024)          reserved (formerly the TMA descriptor slab; see below)
       [1024,   1024 + 256 KiB) split-merge counters, uint32[65536]; zero at first use,
                                the kernel leaves them zero after every launch
       [P,      P + O_bytes)    partial_O  bf16 [T * H * S * 512]  (P = 1024 + 256 KiB)
       [P + O_bytes, ...)       partial_lse f32 [T * H * S]
 
-  with every region 128-byte aligned. No call path allocates device memory:
-  callers zero the counter region once (:func:`cake_dsv4_workspace_reset`, or
-  the first eager call does it for that tensor) and the kernels self-reset.
+  with every region 128-byte aligned. Callers zero the counter region once
+  (:func:`cake_dsv4_workspace_reset`, or the first eager call does it for that
+  tensor) and the kernels self-reset.
+* **Descriptor storage.** The SM103 bindings that read their TMA descriptors
+  from device memory initialize that storage once, outside CUDA Graph capture,
+  and reject a different descriptor set for the same storage. The host
+  therefore retains one private 1 KiB tensor per descriptor set
+  (:func:`_descriptor_storage`): the first call for a new (variant, TMA source
+  geometry) allocates it, later calls and graph replays reuse it, and
+  successive calls through one workspace (the layers of a model) do not
+  collide. Nothing else allocates device memory.
 """
 
 from __future__ import annotations
@@ -46,7 +54,7 @@ from __future__ import annotations
 import functools
 import threading
 from dataclasses import dataclass
-from typing import Any, Literal, Mapping, Optional, Union
+from typing import Any, Literal, Mapping, Optional, Sequence, Union
 
 import torch
 
@@ -505,23 +513,48 @@ def _counters(raw: torch.Tensor, merge_groups: int) -> torch.Tensor:
     return raw[_COUNTER_OFFSET : _COUNTER_OFFSET + merge_groups * 4].view(torch.uint32)
 
 
-def _descriptor_workspace(raw: torch.Tensor, num_bytes: int) -> torch.Tensor:
-    """Descriptor slab at a fixed offset of the workspace.
+# One retained 1 KiB tensor per descriptor set, keyed by the TMA source
+# geometry (see the module docstring, "Descriptor storage").
+_DESCRIPTOR_STORAGE: dict[tuple, torch.Tensor] = {}
 
-    The generated bindings encode fresh TMA descriptors and upload them into this
-    slab on every launch (by-value kernel parameters, so CUDA graphs record the
-    upload), which makes the slab plain mutable scratch: its address is stable
-    per workspace and no separate per-layout storage is needed.
+
+def _descriptor_storage(
+    variant: str,
+    arch: str,
+    num_bytes: int,
+    sources: Sequence[tuple[str, torch.Tensor]],
+) -> torch.Tensor:
+    """Private descriptor storage for ``variant`` over these TMA source tensors.
+
+    A descriptor set is a pure function of each source tensor's pointer, shape,
+    strides and dtype, so that geometry is the key: the same tensors (or a
+    freed-and-reused allocation of the same geometry) map to the same storage,
+    whose bytes the binding already holds; a different KV cache or query view
+    gets its own storage instead of tripping the binding's immutability check.
     """
     if num_bytes > _DESCRIPTOR_SLAB_BYTES:
         raise ValueError(
             f"CAKE DSv4 variant needs {num_bytes} TMA descriptor bytes; the "
-            f"workspace slab holds {_DESCRIPTOR_SLAB_BYTES}"
+            f"descriptor storage holds {_DESCRIPTOR_SLAB_BYTES}"
         )
-    _require_workspace_bytes(raw, _PARTIAL_OFFSET)
-    return raw[
-        _DESCRIPTOR_SLAB_OFFSET : _DESCRIPTOR_SLAB_OFFSET + _DESCRIPTOR_SLAB_BYTES
-    ]
+    key = (
+        variant,
+        arch,
+        tuple(
+            (name, t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.dtype, t.device)
+            for name, t in sources
+        ),
+    )
+    storage = _DESCRIPTOR_STORAGE.get(key)
+    if storage is None:
+        device = sources[0][1].device if sources else torch.device("cpu")
+        backing = torch.empty(
+            _DESCRIPTOR_SLAB_BYTES + _ALIGN, dtype=torch.uint8, device=device
+        )
+        offset = (-backing.data_ptr()) % _ALIGN
+        storage = backing[offset : offset + _DESCRIPTOR_SLAB_BYTES]
+        _DESCRIPTOR_STORAGE[key] = storage
+    return storage
 
 
 def cake_dsv4_workspace_reset(workspace_buffer: torch.Tensor) -> None:
@@ -752,22 +785,33 @@ def _launch_variant(
     *,
     arch: str,
     grid: tuple[int, int, int],
-    workspace_raw: torch.Tensor,
     values: Mapping[str, Any],
 ):
     """Bind the generated ABI by name through the registration ``arg_plan``."""
     from ..jit.cake_dsv4 import get_cake_dsv4_spec
 
     contract = get_cake_dsv4_spec(variant, arch=arch)
-    tma_bytes = int(contract.get("tma_workspace_bytes", 0) or 0)
-    slab = _descriptor_workspace(workspace_raw, tma_bytes) if tma_bytes else None
+    plan = contract["arg_plan"]
     grid_values = _grid_values(grid)
-    bound = [
-        _bind_argument(
-            values, kind, name, variant=variant, grid=grid_values, descriptor_slab=slab
+
+    def bind(kind, name, storage=None):
+        return _bind_argument(
+            values,
+            kind,
+            name,
+            variant=variant,
+            grid=grid_values,
+            descriptor_slab=storage,
         )
-        for kind, name in contract["arg_plan"]
-    ]
+
+    tma_bytes = int(contract.get("tma_workspace_bytes", 0) or 0)
+    storage = None
+    if tma_bytes:
+        sources = [
+            (name, bind(kind, name)) for kind, name in plan if kind == "tma_buffer"
+        ]
+        storage = _descriptor_storage(variant, arch, tma_bytes, sources)
+    bound = [bind(kind, name, storage) for kind, name in plan]
     # Direct-source bindings use the target FFI current stream.
     return _variant_module(variant, arch=arch).run(*bound)
 
@@ -1042,11 +1086,7 @@ class _Launcher:
 
     def variant(self, name: str, *, grid: tuple[int, int, int], **overrides: Any):
         return _launch_variant(
-            name,
-            arch=self.arch,
-            grid=grid,
-            workspace_raw=self.raw,
-            values={**self.values, **overrides},
+            name, arch=self.arch, grid=grid, values={**self.values, **overrides}
         )
 
     def partials(self, num_splits: int) -> dict[str, Any]:

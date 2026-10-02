@@ -31,7 +31,7 @@ out = trtllm_batch_decode_sparse_mla_dsv4(
 | --- | --- |
 | `sm_100a/`, `sm_103a/` | one `*_kernel.cu` (device code) and one `*_binding.cu` (launcher) per variant and architecture |
 | `common/` | kernels whose source is identical on both architectures (`split_reduce`, `bf16_h64_compressed_reduce`) |
-| `cake_dsv4_host_shim.h` | the launcher helpers shared by every binding (device guard, tensor checks, SM103 descriptor-slab upload) |
+| `cake_dsv4_host_shim.h` | the launcher helpers shared by every binding (device guard, tensor checks, SM103 descriptor-storage initialization) |
 
 `flashinfer/jit/cake_dsv4.py` registers each variant per architecture: its
 sources, nvcc flags, an identity that names the JIT module, and the `arg_plan`
@@ -52,11 +52,16 @@ allocation.
   stride, free row stride.
 * Padded rows: `num_query_tokens = T` is the metadata row count; `query` / `out`
   may carry more rows, rows `>= T` are neither read nor written.
-* Workspace (contiguous, 128-byte aligned): `[0, 1024)` TMA descriptor slab,
+* Workspace (contiguous, 128-byte aligned): `[0, 1024)` reserved,
   `[1024, 1024 + 256 KiB)` split-merge counters (zero at first use, left zero by
   every launch), then `partial_O` (BF16) and `partial_lse` (FP32) sized by
   `get_cake_dsv4_workspace_bytes`. CUDA-graph replays are self-contained once the
   counters were zeroed eagerly.
+* SM103 descriptor storage: the bindings with `tma_workspace_bytes` read their TMA
+  descriptors from a device tensor they initialize once (outside graph capture)
+  and never re-initialize; the host keeps one private 1 KiB tensor per
+  (variant, TMA source geometry), so different KV caches through one workspace
+  each have their own storage.
 * Query / output / KV pools must be densely packed; the host makes no copies.
 
 ## Tests

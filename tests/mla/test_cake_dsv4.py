@@ -1412,9 +1412,7 @@ def test_launch_variant_binds_by_name_with_fake_arg_plan(monkeypatch):
         "num_heads": 64,
         **meta.kernel_kwargs(),
     }
-    cake._launch_variant(
-        "fake", arch="sm_103a", grid=(7, 2, 1), workspace_raw=raw, values=values
-    )
+    cake._launch_variant("fake", arch="sm_103a", grid=(7, 2, 1), values=values)
     (args,) = recorder.calls
     assert len(args) == len(_FAKE_PLAN)
     bound = dict(zip((name for _, name in _FAKE_PLAN), args, strict=True))
@@ -1433,10 +1431,24 @@ def test_launch_variant_binds_by_name_with_fake_arg_plan(monkeypatch):
     assert bound["num_q_heads"] == 64
     assert (bound["grid_x"], bound["grid_y"], bound["grid_z"]) == (7, 2, 1)
     slab = bound["tma_descriptor_workspace"]
-    assert slab.data_ptr() == raw.data_ptr()
     assert slab.numel() == cake._DESCRIPTOR_SLAB_BYTES
     assert slab.data_ptr() % 128 == 0
     assert all(isinstance(bound[n], int) for n in ("sparse_topk", "grid_x"))
+    # Descriptor storage follows the TMA source geometry: the same tensors reuse
+    # it, another KV cache of the same shape gets its own, and the storage is
+    # private (not carved from the caller's workspace).
+    assert not (raw.data_ptr() <= slab.data_ptr() < raw.data_ptr() + raw.numel())
+    cake._launch_variant("fake", arch="sm_103a", grid=(7, 2, 1), values=values)
+    assert recorder.calls[-1][11] is slab
+    other = torch.empty((32, 512), dtype=torch.bfloat16)
+    cake._launch_variant(
+        "fake",
+        arch="sm_103a",
+        grid=(7, 2, 1),
+        values={**values, "compressed_KV_cache": other},
+    )
+    assert recorder.calls[-1][11] is not slab
+    assert recorder.calls[-1][11].numel() == cake._DESCRIPTOR_SLAB_BYTES
 
 
 def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatch):
@@ -1473,7 +1485,6 @@ def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatc
         ],
     }
     recorder = _install_fake_variants(monkeypatch, plans, tma_bytes=4096)
-    raw = _aligned_u8(cake._PARTIAL_OFFSET)
     table, lens = _combined_metadata(2, 4)
     combined = resolve_cake_dsv4_sparse_metadata(table, lens, query_rows=2)
     separate = resolve_cake_dsv4_sparse_metadata(
@@ -1484,9 +1495,7 @@ def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatc
     )
 
     def launch(variant, **values):
-        cake._launch_variant(
-            variant, arch="sm_103a", grid=(1, 1, 1), workspace_raw=raw, values=values
-        )
+        cake._launch_variant(variant, arch="sm_103a", grid=(1, 1, 1), values=values)
 
     with pytest.raises(ValueError, match="retired argument 'completion_base'"):
         launch("retired", completion_base=0)
@@ -1511,11 +1520,7 @@ def test_launch_variant_reports_unknown_retired_and_unavailable_names(monkeypatc
         )
     with pytest.raises(ValueError, match="three positive ints"):
         cake._launch_variant(
-            "legacy",
-            arch="sm_103a",
-            grid=(0, 1, 1),
-            workspace_raw=raw,
-            values={"sparse_indices": table},
+            "legacy", arch="sm_103a", grid=(0, 1, 1), values={"sparse_indices": table}
         )
 
 
@@ -1625,8 +1630,14 @@ def test_run_cake_dsv4_binds_uniform_metadata_and_prefix_views(monkeypatch):
     # Grids derive from metadata rows, not query rows.
     assert (m["grid_x"], m["grid_y"], m["grid_z"]) == (rows * num_splits * 2, 1, 1)
     assert (r["grid_x"], r["grid_y"], r["grid_z"]) == (rows, 64, 1)
-    # Workspace carve at the documented offsets.
-    assert m["tma_descriptor_workspace"].data_ptr() == workspace.data_ptr()
+    # Private descriptor storage; partial buffers carved at the documented offsets.
+    slab = m["tma_descriptor_workspace"]
+    assert slab.numel() == cake._DESCRIPTOR_SLAB_BYTES and slab.data_ptr() % 128 == 0
+    assert not (
+        workspace.data_ptr()
+        <= slab.data_ptr()
+        < workspace.data_ptr() + workspace.numel()
+    )
     assert m["partial_O"].data_ptr() == workspace.data_ptr() + layout.partial_o[0]
     assert m["partial_O"].dtype == torch.bfloat16
     assert m["partial_O"].numel() == rows * 64 * num_splits * 512
