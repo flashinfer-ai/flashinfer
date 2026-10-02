@@ -106,8 +106,9 @@ void SparseMlaSm120DecodeDsv4(TensorView q, TensorView kv_cache, TensorView indi
   TVM_FFI_ICHECK(!extra_fp4 || mt == ModelType::DSV4_1)
       << "decode-dsv4 extra_fp4 requires a DSV4_1 main cache; got model_type="
       << static_cast<int>(mt);
-  TVM_FFI_ICHECK(!extra_fp4 || extra_kv_cache.has_value())
-      << "decode-dsv4 extra_fp4 requires extra_kv_cache";
+  // The flag describes the extra cache's row format; with no extra cache there
+  // is nothing to describe, matching inspect_metadata's normalization.
+  extra_fp4 = extra_fp4 && extra_kv_cache.has_value();
 
   // topk_length is optional for DOTS3_SWA: DecodeTileCfg<DOTS3_SWA>::WINDOW caps
   // the per-token candidate count inside the kernel, so omitting it costs
