@@ -21,6 +21,9 @@ import tvm_ffi
 
 from ..jit.cake_kimi_k3_situ import (
     PROGRAMS,
+    PROGRAM_FLAGS,
+    ROUTES,
+    cake_situ_selector,
     cake_situ_sequence,
     get_cake_situ_module,
 )
@@ -33,6 +36,20 @@ _LAYOUT = "trtllm_shuffled_nvfp4_group16"
 _STATE_ATTR = "_flashinfer_cake_situ_workspace"
 _N32_CLAIM8_ARCHES = ("sm_100a", "sm_103a")
 _M256_C12_ARCHES = ("sm_100a",)
+_LARGE_C7_TOKENS_BY_ARCH = {"sm_103a": (8192, 16384), "sm_100a": (8192, 16384)}
+_LARGE_C7_TOKENS = tuple(
+    sorted({t for ts in _LARGE_C7_TOKENS_BY_ARCH.values() for t in ts})
+)
+# Pre-shuffled FC1 scale factors (the ``large_c7`` route). The tile-N128 FC1
+# consumes K in steps of 512 elements. For every (N-tile, K-step) the
+# scale-factor writer emits the 4096-byte shared-memory image FC1 expects
+# (128 rows x 32 bytes; one byte per 16-element group) into ``sfb_shuffled``,
+# and FC1 loads each image with a single TMA copy. The FC1 TMA view addresses
+# an image as eight 512-byte blocks (one per 64 elements of K) of 2 x 256 bytes.
+_FC1_K_STEP = 512
+_FC1_K_TILES = _H // _FC1_K_STEP
+_SFB_IMAGE_BYTES = 128 * (_FC1_K_STEP // 16)
+_SFB_IMAGE_BLOCKS = _SFB_IMAGE_BYTES // 512
 
 
 def _tile_n(num_tokens):
@@ -62,6 +79,58 @@ def _geometry(num_tokens, arch=None):
     return tile_n, total_pairs, max_tiles
 
 
+def _large_c7(arch, num_tokens):
+    # The pre-shuffled scale-factor route; ``arch is None`` (the size query) covers
+    # every architecture's token counts.
+    return int(num_tokens) in (
+        _LARGE_C7_TOKENS if arch is None else _LARGE_C7_TOKENS_BY_ARCH.get(arch, ())
+    )
+
+
+def _sfb_shuffled_bytes(max_tiles):
+    return max_tiles * _FC1_K_TILES * _SFB_IMAGE_BYTES
+
+
+def _route_flags(arch, num_tokens):
+    """The static (device-free) route selection for ``(arch, num_tokens)``: the
+    program key and every selector flag the runtime binds. ``prepare_workspace``
+    checks its own selection against this and against the exporter's static
+    per-program facts; the tests re-derive the route table from it."""
+    m64_claim8 = arch in ("sm_100a", "sm_103a") and num_tokens in (32, 64, 128, 256)
+    mid_work5fd = arch in ("sm_100a", "sm_103a") and num_tokens in (2048, 4096)
+    n32_claim8 = arch in _N32_CLAIM8_ARCHES and num_tokens in (512, 1024)
+    m256_c12 = arch in _M256_C12_ARCHES and num_tokens == 256
+    large_c7 = _large_c7(arch, num_tokens)
+    tile_n = _geometry(num_tokens, arch)[0]
+    feature_finalize = num_tokens in (1, 8, 16) or m64_claim8
+    selector = cake_situ_selector(
+        arch,
+        tile_n,
+        num_tokens == 1,
+        feature_finalize,
+        m64_claim8,
+        mid_work5fd,
+        n32_claim8,
+        m256_c12,
+        large_c7,
+    )
+    program_key = ROUTES[(arch, selector)]
+    return {
+        "program_key": program_key,
+        "selector": selector,
+        "tile_n": tile_n,
+        "single_token": num_tokens == 1,
+        "feature_finalize": feature_finalize,
+        "m64_claim8": m64_claim8,
+        "mid_work5fd": mid_work5fd,
+        "n32_claim8": n32_claim8,
+        "m256_c12": m256_c12,
+        "large_c7": large_c7,
+        "fc2_device_workfeed": num_tokens in (8, 16) or m64_claim8 or n32_claim8,
+        "stages": PROGRAM_FLAGS[program_key]["stages"],
+    }
+
+
 def _workspace_layout(num_tokens, arch=None):
     tile_n, total_pairs, max_tiles = _geometry(num_tokens, arch)
     rows = max_tiles * tile_n
@@ -89,6 +158,10 @@ def _workspace_layout(num_tokens, arch=None):
         or (num_tokens in (512, 1024) and arch in (None, *_N32_CLAIM8_ARCHES))
     ):
         fields += (("fc2_work_counter", torch.int32, (1,), 4),)
+    if _large_c7(arch, num_tokens):
+        # One image per (N-tile, K-step). For 16384 tokens (2937 tiles) this
+        # adds 2937 * 7 * 4096 = 84,209,664 bytes (80.3 MiB) to the layout.
+        fields += (("sfb_shuffled", torch.uint8, (_sfb_shuffled_bytes(max_tiles),), 1),)
     layout, offset = {}, 0
     for name, dtype, shape, element_bytes in fields:
         offset = (offset + 127) // 128 * 128
@@ -164,11 +237,14 @@ def _cake_situ_workspace_size(options):
     max_tokens = options["max_num_tokens"]
     # ``_workspace_layout`` is not monotonic in ``num_tokens``: the token counts
     # that force tile-N16 (32 and 64) need more scratch rows than the tile-N8
-    # counts that follow them, so a maximum-size buffer must cover every forced
-    # count at or below ``max_num_tokens`` as well as ``max_num_tokens`` itself.
+    # counts that follow them, and the pre-shuffled scale-factor route carries
+    # ``sfb_shuffled`` (the 8192-token layout is larger than the ordinary layout
+    # up to 8647 tokens), so a maximum-size buffer must cover every forced and
+    # pre-shuffled count at or below ``max_num_tokens`` as well as
+    # ``max_num_tokens`` itself.
     return max(
         _workspace_layout(num_tokens)[1]
-        for num_tokens in (max_tokens, *_FORCED_TILE_N16_TOKENS)
+        for num_tokens in (max_tokens, *_FORCED_TILE_N16_TOKENS, *_LARGE_C7_TOKENS)
         if num_tokens <= max_tokens
     )
 
@@ -259,6 +335,7 @@ def cake_fused_moe_prepare_workspace(
         mid_work5fd = arch in ("sm_100a", "sm_103a") and num_tokens in (2048, 4096)
         n32_claim8 = arch in _N32_CLAIM8_ARCHES and num_tokens in (512, 1024)
         m256_c12 = arch in _M256_C12_ARCHES and num_tokens == 256
+        large_c7 = _large_c7(arch, num_tokens)
         tile_n, total_pairs, max_tiles = _geometry(num_tokens, arch)
         fc2_device_workfeed = num_tokens in (8, 16) or m64_claim8 or n32_claim8
         fc2_grid_n = max_tiles
@@ -283,7 +360,71 @@ def cake_fused_moe_prepare_workspace(
             mid_work5fd,
             n32_claim8,
             m256_c12,
+            large_c7,
         )
+        # The exporter emits static per-program facts next to the tables; the bound
+        # selection must agree with them and with the device-free static selection.
+        selector = cake_situ_selector(
+            arch,
+            tile_n,
+            num_tokens == 1,
+            feature_finalize,
+            m64_claim8,
+            mid_work5fd,
+            n32_claim8,
+            m256_c12,
+            large_c7,
+        )
+        flags = PROGRAM_FLAGS[program_key]
+        if selector not in flags["selectors"]:
+            # A program may be bound by several selectors; the bound one must be among them.
+            raise ValueError(
+                f"Cake SiTU program {program_key} is not bound by selector {selector!r} (exported selectors: {flags['selectors']})"
+            )
+        exported_tokens = {
+            t
+            for f in PROGRAM_FLAGS.values()
+            if f["arch"] == arch
+            for t in f["num_tokens"]
+        }
+        if flags["formal"] and num_tokens not in flags["num_tokens"]:
+            # A program exported for specific token counts must not be bound for another one.
+            raise ValueError(
+                f"Cake SiTU program {program_key} was not exported for num_tokens={num_tokens} (exported token counts: {flags['num_tokens']})"
+            )
+        if not flags["formal"] and num_tokens in exported_tokens:
+            # An exported token count must never fall onto a retained tile-size program.
+            raise ValueError(
+                f"Cake SiTU retained program {program_key} was bound for num_tokens={num_tokens}, an exported token count of {arch} (exported: {sorted(exported_tokens)})"
+            )
+        static = _route_flags(arch, num_tokens)
+        recomputed = {
+            "program_key": program_key,
+            "selector": selector,
+            "tile_n": tile_n,
+            "single_token": num_tokens == 1,
+            "feature_finalize": feature_finalize,
+            "m64_claim8": m64_claim8,
+            "mid_work5fd": mid_work5fd,
+            "n32_claim8": n32_claim8,
+            "m256_c12": m256_c12,
+            "large_c7": large_c7,
+            "fc2_device_workfeed": fc2_device_workfeed,
+            "stages": flags["stages"],
+        }
+        if static != recomputed or any(
+            flags[k] != recomputed[k]
+            for k in (
+                "tile_n",
+                "single_token",
+                "feature_finalize",
+                "fc2_device_workfeed",
+                "stages",
+            )
+        ):
+            raise ValueError(
+                f"Cake SiTU program {program_key}: static flags {flags} / {static} disagree with the runtime selection {recomputed}"
+            )
         module = get_cake_situ_module(program_key)
         state["shapes"][num_tokens] = {
             "views": views,
@@ -297,6 +438,7 @@ def cake_fused_moe_prepare_workspace(
             "mid_work5fd": mid_work5fd,
             "n32_claim8": n32_claim8,
             "m256_c12": m256_c12,
+            "large_c7": large_c7,
             "fc2_device_workfeed": fc2_device_workfeed,
             "fc2_grid_n": fc2_grid_n,
             "fc2_pool_ctas": (_H // 128) * fc2_grid_n,
@@ -551,6 +693,19 @@ def _cake_situ_stage_bindings(options, prepared):
                 tile_n_shift=tile_n.bit_length() - 1,
             ),
         }
+    if prepared["large_c7"]:
+        stages["sfb_shuffle"] = dict(
+            grid=(max_tiles, 1, 1),
+            SFB=views["x_scales"],
+            **{
+                name: views[name]
+                for name in ("route_map", "tile_mn_limit", "total_tiles")
+            },
+            SFBS=views["sfb_shuffled"],
+            K=_H,
+            K_tiles=_FC1_K_TILES,
+            grid_n=max_tiles,
+        )
     stages.update(
         {
             "fc1": dict(
@@ -579,7 +734,16 @@ def _cake_situ_stage_bindings(options, prepared):
                 K=_H,
                 grid_m=_I // 64,
                 grid_n=max_tiles,
-                K_tiles=_H // 512,
+                K_tiles=_FC1_K_TILES,
+                **(
+                    {
+                        "SFBS": views["sfb_shuffled"].view(
+                            max_tiles, _FC1_K_TILES * _SFB_IMAGE_BLOCKS, 2, 256
+                        )
+                    }
+                    if prepared["large_c7"]
+                    else {}
+                ),
             ),
             "fc2": dict(
                 grid=(_H // 128, prepared["fc2_grid_n"], 1),
