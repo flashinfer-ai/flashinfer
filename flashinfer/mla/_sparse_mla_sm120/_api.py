@@ -870,11 +870,17 @@ class _SparseMLAPagedAttentionRunner:
     backend : str
         ``"auto"`` / ``"sparse"`` run the hand-written SM120 kernels.
         ``"cake"`` (``kv_cache_format="nvfp4"`` only) runs the Cake SM120
-        NVFP4 sparse-MLA decode with its own split planner: any positive main
+        NVFP4 sparse-MLA kernels with their own planners: any positive main
         / extra page size (16-byte multiple page stride), 8, 16, 32, 48, 64,
         80, 96, 112 or 128 query heads, the ``run()`` contract below, and
         wrapper-owned grow-only split scratch (warm every shape before CUDA
-        graph capture).
+        graph capture).  For every token count
+        ``flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel``
+        picks between the split decode and the single-launch prefill kernel
+        (one CTA per token and 16 / 32 / 64-head block over all of its
+        candidates, no scratch) from the measured crossover of the two
+        sm_120a SKUs; ``prefill_impl`` is accepted for API parity and does
+        not change that choice.
 
     Example
     -------

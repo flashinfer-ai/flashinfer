@@ -12,13 +12,26 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Cake SM120 DeepSeek-V4 NVFP4 sparse-MLA decode (``backend="cake"`` on SM120/SM121).
+"""Cake SM120 DeepSeek-V4 NVFP4 sparse MLA (``backend="cake"`` on SM120/SM121): decode + prefill.
 
 The device code is generated from the Cake kernel schedules into
 ``csrc/cake_dsv4/sm_120a``; this module owns the host side: cache geometry
 (runtime page size and page stride for the 3-D / HND / NHD layouts, padded
-pools), the split planner, caller-owned split scratch, the public-API
-workspace carve and the ``SparseMLASm120Wrapper`` route.
+pools), the decode split / head-tile planners, the prefill planner (head
+tiles), the decode-vs-prefill crossover for ``num_tokens > 1``,
+caller-owned split scratch, the public-API workspace carve and the
+``SparseMLASm120Wrapper`` route.
+
+Two kernel families share one tensor contract:
+
+* **decode** (``cake_sparse_mla_sm120_dsv4_nvfp4_decode``): one CTA per
+  (token, 16- or 32-head block, split of 64-candidate chunks), split-K
+  partials merged by a second launch; any candidate count.
+* **prefill** (``cake_sparse_mla_sm120_dsv4_nvfp4_prefill``): one CTA per
+  (token, ``16 * head_tiles``-head block) over *all* of the token's chunks
+  (direct epilogue, no scratch, no merge), ``head_tiles`` in {1, 2, 4} (2 for
+  head counts divisible by 32, 4 for head counts divisible by 64); at most 16
+  chunks (``topk + extra_topk <= 1024`` slots) per token.
 
 Contract (shared with the SM120 NVFP4 ``"sparse"`` backend):
 
@@ -89,6 +102,17 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_format_info() -> dict:
         "runtime_page": True,
         "runtime_extra_page": True,
         "kernel_commit": manifest["kernel_commit"],
+        # Prefill family: head counts with an instance, the valid head-tile counts per head count and the
+        # per-token chunk limit of the single-CTA (no split) schedule.
+        "prefill_heads": tuple(int(h) for h in manifest.get("prefill_head_counts", ())),
+        "prefill_head_tiles": {
+            int(h): tuple(int(t) for t in tiles)
+            for h, tiles in manifest.get("prefill_head_tiles", {}).items()
+        },
+        "prefill_max_chunks": int(
+            manifest.get("prefill_max_chunks", manifest["max_chunks_per_block"])
+        ),
+        "prefill_kernel_commit": manifest.get("prefill_kernel_commit"),
     }
 
 
@@ -313,6 +337,165 @@ def _num_sms(device: torch.device) -> int:
     return int(torch.cuda.get_device_properties(device).multi_processor_count)
 
 
+# Decode-vs-prefill crossover and prefill planner thresholds for ``backend="cake"`` on the
+# sm_120a SKUs, measured by paired crossover sweeps of the generating kernel family (T 1..128,
+# page 64; RTX PRO 6000 Blackwell Server Edition 188 SMs and RTX 5090 170 SMs).  The decode
+# route's split planner is wave-quantised by the SM count, so the thresholds on which the two
+# SKUs disagree are keyed by ``num_sms >= large_sms``.  Mirrors the kernel module's
+# ``plan_prefill``; the parity test in ``tests/attention`` compares the two over the grid.
+_PREFILL_POLICY = {
+    # Head counts >= this follow the wide-head rules (four 16-head tiles per CTA available for H % 64 == 0).
+    "wide_heads": 64,
+    # Devices with at least this many SMs take the ``*_large_sms`` thresholds (RTX PRO 6000: 188), the others the
+    # ``*_small_sms`` ones (RTX 5090: 170).  Smaller dies (GB10 / SM121, 48 SMs) take the RTX 5090 thresholds
+    # unmeasured; the prefill family is compile-only there.
+    "large_sms": 180,
+    # Candidate counts (topk + extra_topk) >= this follow the ``*_many`` rules, smaller ones the ``*_few`` rules.
+    "many_candidates": 512,
+    # Wide heads: decode up to this many tokens (decode wins through T=8 at >= 512 candidates and through T=16 at
+    # fewer on both SKUs; the two-tile prefill wins at 16 by 4-6 % and from 24 on).
+    "wide_decode_tokens_many": 8,
+    "wide_decode_tokens_few": 16,
+    # Narrow heads (< wide_heads) with >= 512 candidates: decode up to this many tokens (PRO 6000: the one-tile
+    # prefill wins from T=16 by 5-10 %; RTX 5090: decode wins through T=32 by 2-9 %).  With fewer candidates the
+    # one-tile prefill wins at every token count on both SKUs.
+    "narrow_decode_tokens_many_large_sms": 8,
+    "narrow_decode_tokens_many_small_sms": 32,
+    # Wide heads (H % 32 == 0): two head tiles up to this token count, the largest tile count above it, at every
+    # candidate count and on both SKUs (at T=128 four tiles win on every wide A/B row except the PRO 6000 H128
+    # K512 band below; H64 K512 four tiles 17 % faster; from T=512 four tiles win by 7-35 % everywhere).
+    "wide_two_tile_tokens": 96,
+    # Large die only, at least this many heads and a candidate count in ``two_tile_k512_band`` (half-open): two
+    # tiles through this token count (PRO 6000: two tiles 1.6-4.0 % faster at T=128 in three paired rounds; above
+    # k=512 the evidence is mixed within +-3.4 % so the four-tile default stays; the RTX 5090 prefers four tiles
+    # by 12-16 % at every candidate count).
+    "wide_two_tile_tokens_h128_k512_large_sms": 128,
+    "two_tile_h128_heads": 128,
+    "two_tile_k512_band": (512, 640),
+}
+
+
+def cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(
+    num_heads: int,
+) -> Tuple[int, ...]:
+    """Head-tile counts (``16 * tiles`` heads per CTA) with a prefill instance for ``num_heads``.
+
+    Empty when the head count has no prefill instance (8 heads).  1 always, 2 for
+    head counts divisible by 32, 4 for head counts divisible by 64.
+    """
+
+    tiles = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()["prefill_head_tiles"]
+    return tuple(tiles.get(int(num_heads), ()))
+
+
+def cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+    extra_topk: int = 0,
+    num_sms: int,
+) -> int:
+    """Return ``head_tiles`` for one prefill call (measured crossover, see ``_PREFILL_POLICY``).
+
+    For ``num_heads >= 64`` with a two-tile instance (head count divisible by
+    32): two tiles (32 heads per CTA) up to the two-tile token limit, the
+    largest instance above it (4 tiles for head counts divisible by 64, 2 for
+    96 heads; 80 / 112 heads only have the one-tile instance).  The limit is 96
+    tokens at every candidate count on both SKUs, except 128 heads with 512 to
+    639 candidates on the large die (RTX PRO 6000), where it is 128 tokens.
+    Narrower head counts take their largest instance at every token count: two
+    tiles for 32 heads, one tile for 16 and 48 heads.
+    """
+
+    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+    tiles = cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(num_heads)
+    if not tiles:
+        raise ValueError(
+            f"Cake SM120 DSv4 NVFP4 sparse-MLA prefill supports {info['prefill_heads']} "
+            f"query heads, got {num_heads}"
+        )
+    num_tokens = int(num_tokens)
+    num_heads = int(num_heads)
+    num_sms = int(num_sms)
+    if num_sms <= 0:
+        raise ValueError(f"num_sms must be positive, got {num_sms}")
+    policy = _PREFILL_POLICY
+    if num_heads >= policy["wide_heads"]:
+        two_tile_tokens = policy["wide_two_tile_tokens"]
+        candidates = int(topk) + int(extra_topk)
+        band_lo, band_hi = policy["two_tile_k512_band"]
+        if (
+            num_sms >= policy["large_sms"]
+            and num_heads >= policy["two_tile_h128_heads"]
+            and band_lo <= candidates < band_hi
+        ):
+            two_tile_tokens = policy["wide_two_tile_tokens_h128_k512_large_sms"]
+        if num_tokens <= two_tile_tokens and 2 in tiles:
+            head_tiles = 2
+        else:
+            head_tiles = max(tiles)
+    else:
+        head_tiles = max(tiles)
+    return head_tiles
+
+
+def cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel(
+    *,
+    num_tokens: int,
+    num_heads: int,
+    topk: int,
+    extra_topk: int = 0,
+    num_sms: int,
+) -> str:
+    """``"decode"`` or ``"prefill"`` for one ``backend="cake"`` call (measured crossover).
+
+    Decode always serves head counts without a prefill instance (8 heads) and
+    candidate lists beyond the prefill's 16-chunk table (more than 1024
+    candidates); partial 64-wide chunks are served by the prefill's masked
+    tail.  Otherwise, with ``candidates = topk + extra_topk``:
+
+    * ``num_heads >= 64``: decode for ``num_tokens <= 8`` at 512 and more
+      candidates and for ``num_tokens <= 16`` below; prefill above;
+    * ``num_heads < 64``: at 512 and more candidates decode for
+      ``num_tokens <= 8`` on devices with >= 180 SMs (RTX PRO 6000) and for
+      ``num_tokens <= 32`` on smaller devices (RTX 5090); below 512 candidates
+      prefill at every token count.
+
+    ``num_sms`` keys the thresholds on which the two sm_120a SKUs disagree
+    (the decode split planner's wave structure follows the SM count).
+    """
+
+    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+    num_tokens = int(num_tokens)
+    num_heads = int(num_heads)
+    topk = int(topk)
+    extra_topk = int(extra_topk)
+    num_sms = int(num_sms)
+    if num_sms <= 0:
+        raise ValueError(f"num_sms must be positive, got {num_sms}")
+    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
+    if num_heads not in info["prefill_heads"] or chunks > info["prefill_max_chunks"]:
+        return "decode"
+    candidates = topk + extra_topk
+    policy = _PREFILL_POLICY
+    many = candidates >= policy["many_candidates"]
+    large = num_sms >= policy["large_sms"]
+    if num_heads >= policy["wide_heads"]:
+        decode_tokens = policy[
+            "wide_decode_tokens_many" if many else "wide_decode_tokens_few"
+        ]
+    elif many:
+        decode_tokens = policy[
+            "narrow_decode_tokens_many_large_sms"
+            if large
+            else "narrow_decode_tokens_many_small_sms"
+        ]
+    else:
+        decode_tokens = 0
+    return "decode" if num_tokens <= decode_tokens else "prefill"
+
+
 def _cache_geometry(cache: torch.Tensor, name: str) -> Tuple[torch.Tensor, int, int]:
     """Flatten a paged NVFP4 cache view to ``(flat uint8 storage span, page_size, page_stride_bytes)``."""
 
@@ -450,7 +633,148 @@ def get_cake_sparse_mla_sm120_dsv4_nvfp4_module():
     def _fake_decode(*_args, **_kwargs) -> None:
         return None
 
-    return SimpleNamespace(decode=_decode, raw_decode=entry)
+    prefill_entry = getattr(module, _manifest()["prefill_entry"])
+
+    @register_custom_op(
+        "flashinfer::cake_sparse_mla_sm120_dsv4_nvfp4_prefill",
+        mutates_args=("output", "out_lse"),
+    )
+    def _prefill(
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        extra_kv_cache: Optional[torch.Tensor],
+        extra_indices: Optional[torch.Tensor],
+        topk_length: Optional[torch.Tensor],
+        extra_topk_length: Optional[torch.Tensor],
+        attn_sink: Optional[torch.Tensor],
+        output: torch.Tensor,
+        out_lse: torch.Tensor,
+        page_size: int,
+        page_stride_bytes: int,
+        extra_page_size: int,
+        extra_page_stride_bytes: int,
+        head_tiles: int,
+        sm_scale: float,
+        lse_scale: float,
+    ) -> None:
+        prefill_entry(
+            q,
+            kv_cache,
+            indices,
+            extra_kv_cache,
+            extra_indices,
+            topk_length,
+            extra_topk_length,
+            attn_sink,
+            output,
+            out_lse,
+            page_size,
+            page_stride_bytes,
+            extra_page_size,
+            extra_page_stride_bytes,
+            head_tiles,
+            sm_scale,
+            lse_scale,
+        )
+
+    @register_fake_op("flashinfer::cake_sparse_mla_sm120_dsv4_nvfp4_prefill")
+    def _fake_prefill(*_args, **_kwargs) -> None:
+        return None
+
+    return SimpleNamespace(
+        decode=_decode, raw_decode=entry, prefill=_prefill, raw_prefill=prefill_entry
+    )
+
+
+def _prepare_inputs(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    output: torch.Tensor,
+    out_lse: torch.Tensor,
+    *,
+    topk_length: Optional[torch.Tensor],
+    attn_sink: Optional[torch.Tensor],
+    extra_kv_cache: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+) -> SimpleNamespace:
+    """Validate the tensors the decode and prefill entries share and resolve the flat cache views."""
+
+    if q.ndim != 3 or q.shape[-1] != _D_QK:
+        raise ValueError(f"q must be [T, H, {_D_QK}], got {tuple(q.shape)}")
+    if q.dtype != torch.bfloat16 or not q.is_cuda or not q.is_contiguous():
+        raise ValueError("q must be a contiguous CUDA bfloat16 tensor")
+    num_tokens, num_heads = int(q.shape[0]), int(q.shape[1])
+    heads = cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads()
+    if num_heads not in heads:
+        raise ValueError(
+            f"Cake SM120 DSv4 NVFP4 sparse MLA supports {heads} query heads, got {num_heads}"
+        )
+    if (
+        output.shape != q.shape
+        or output.dtype != torch.bfloat16
+        or not output.is_contiguous()
+    ):
+        raise ValueError(
+            f"output must be a contiguous bfloat16 tensor of shape {tuple(q.shape)}"
+        )
+    if (
+        out_lse.shape != (num_tokens, num_heads)
+        or out_lse.dtype != torch.float32
+        or not out_lse.is_contiguous()
+    ):
+        raise ValueError(
+            f"out_lse must be a contiguous float32 tensor of shape {(num_tokens, num_heads)}"
+        )
+    if (extra_kv_cache is None) != (extra_indices is None):
+        raise ValueError("extra_kv_cache and extra_indices must be provided together")
+    if extra_topk_length is not None and extra_indices is None:
+        raise ValueError("extra_topk_length requires extra_indices")
+    indices = _normalize_indices(indices, "indices", num_tokens)
+    kv_flat, page_size, page_stride = _cache_geometry(kv_cache, "kv_cache")
+    extra_flat = None
+    extra_page_size = 0
+    extra_page_stride = 0
+    extra_topk = 0
+    if extra_kv_cache is not None and extra_indices is not None:
+        extra_indices = _normalize_indices(extra_indices, "extra_indices", num_tokens)
+        extra_topk = int(extra_indices.shape[1])
+        extra_flat, extra_page_size, extra_page_stride = _cache_geometry(
+            extra_kv_cache, "extra_kv_cache"
+        )
+    else:
+        extra_indices = None
+    if attn_sink is not None:
+        if (
+            attn_sink.ndim != 1
+            or attn_sink.dtype != torch.float32
+            or attn_sink.shape[0] < num_heads
+        ):
+            raise ValueError(
+                f"attn_sink must be a 1-D float32 tensor with at least {num_heads} entries"
+            )
+        attn_sink = attn_sink.contiguous()
+    return SimpleNamespace(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        indices=indices,
+        topk=int(indices.shape[1]),
+        kv_flat=kv_flat,
+        page_size=page_size,
+        page_stride=page_stride,
+        extra_flat=extra_flat,
+        extra_indices=extra_indices,
+        extra_topk=extra_topk,
+        extra_page_size=extra_page_size,
+        extra_page_stride=extra_page_stride,
+        topk_length=_normalize_length(topk_length, "topk_length", num_tokens),
+        extra_topk_length=_normalize_length(
+            extra_topk_length, "extra_topk_length", num_tokens
+        ),
+        attn_sink=attn_sink,
+    )
 
 
 @supported_compute_capability([120, 121])
@@ -484,68 +808,24 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
     ``num_splits`` override the planners.
     """
 
-    if q.ndim != 3 or q.shape[-1] != _D_QK:
-        raise ValueError(f"q must be [T, H, {_D_QK}], got {tuple(q.shape)}")
-    if q.dtype != torch.bfloat16 or not q.is_cuda or not q.is_contiguous():
-        raise ValueError("q must be a contiguous CUDA bfloat16 tensor")
-    num_tokens, num_heads = int(q.shape[0]), int(q.shape[1])
-    heads = cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads()
-    if num_heads not in heads:
-        raise ValueError(
-            f"Cake SM120 DSv4 NVFP4 sparse MLA supports {heads} query heads, got {num_heads}"
-        )
-    if (
-        output.shape != q.shape
-        or output.dtype != torch.bfloat16
-        or not output.is_contiguous()
-    ):
-        raise ValueError(
-            f"output must be a contiguous bfloat16 tensor of shape {tuple(q.shape)}"
-        )
-    if (
-        out_lse.shape != (num_tokens, num_heads)
-        or out_lse.dtype != torch.float32
-        or not out_lse.is_contiguous()
-    ):
-        raise ValueError(
-            f"out_lse must be a contiguous float32 tensor of shape {(num_tokens, num_heads)}"
-        )
-    if (extra_kv_cache is None) != (extra_indices is None):
-        raise ValueError("extra_kv_cache and extra_indices must be provided together")
-    if extra_topk_length is not None and extra_indices is None:
-        raise ValueError("extra_topk_length requires extra_indices")
-    indices = _normalize_indices(indices, "indices", num_tokens)
-    topk = int(indices.shape[1])
-    kv_flat, page_size, page_stride = _cache_geometry(kv_cache, "kv_cache")
-    extra_flat = None
-    extra_page_size = 0
-    extra_page_stride = 0
-    extra_topk = 0
-    if extra_kv_cache is not None:
-        extra_indices = _normalize_indices(extra_indices, "extra_indices", num_tokens)
-        extra_topk = int(extra_indices.shape[1])
-        extra_flat, extra_page_size, extra_page_stride = _cache_geometry(
-            extra_kv_cache, "extra_kv_cache"
-        )
-    topk_length = _normalize_length(topk_length, "topk_length", num_tokens)
-    extra_topk_length = _normalize_length(
-        extra_topk_length, "extra_topk_length", num_tokens
+    p = _prepare_inputs(
+        q,
+        kv_cache,
+        indices,
+        output,
+        out_lse,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_kv_cache,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_topk_length,
     )
-    if attn_sink is not None:
-        if (
-            attn_sink.ndim != 1
-            or attn_sink.dtype != torch.float32
-            or attn_sink.shape[0] < num_heads
-        ):
-            raise ValueError(
-                f"attn_sink must be a 1-D float32 tensor with at least {num_heads} entries"
-            )
-        attn_sink = attn_sink.contiguous()
+    num_tokens, num_heads = p.num_tokens, p.num_heads
     ht, splits, cpb = _resolve_plan(
         num_tokens=num_tokens,
         num_heads=num_heads,
-        topk=topk,
-        extra_topk=extra_topk,
+        topk=p.topk,
+        extra_topk=p.extra_topk,
         device=q.device,
         num_splits=num_splits,
         max_splits=max_splits,
@@ -583,21 +863,21 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
         mid_lse = None
     get_cake_sparse_mla_sm120_dsv4_nvfp4_module().decode(
         q,
-        kv_flat,
-        indices,
-        extra_flat,
-        extra_indices if extra_flat is not None else None,
-        topk_length,
-        extra_topk_length,
-        attn_sink,
+        p.kv_flat,
+        p.indices,
+        p.extra_flat,
+        p.extra_indices,
+        p.topk_length,
+        p.extra_topk_length,
+        p.attn_sink,
         output,
         out_lse,
         mid_out,
         mid_lse,
-        page_size,
-        page_stride,
-        extra_page_size,
-        extra_page_stride,
+        p.page_size,
+        p.page_stride,
+        p.extra_page_size,
+        p.extra_page_stride,
         splits,
         cpb,
         ht,
@@ -605,6 +885,141 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_decode(
         float(lse_scale),
     )
     return {"head_tiles": ht, "num_splits": splits, "chunks_per_block": cpb}
+
+
+@supported_compute_capability([120, 121])
+def cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    output: torch.Tensor,
+    out_lse: torch.Tensor,
+    sm_scale: float,
+    *,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_kv_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    lse_scale: float = 1.0,
+    head_tiles: Optional[int] = None,
+) -> Dict[str, int]:
+    """Run the allocation-free Cake SM120 NVFP4 sparse-MLA prefill (one launch, no scratch).
+
+    Same tensor contract as :func:`cake_sparse_mla_sm120_dsv4_nvfp4_decode`
+    (``q`` ``[T, H, 512]`` BF16, HND / NHD / 3-D packed caches with runtime
+    page size and stride, ``[T, topk]`` int32 indices with ``-1`` masks,
+    optional lengths / sink / second cache, caller-owned ``output`` and
+    ``out_lse``), but one CTA runs every chunk of a token: the candidate list
+    is limited to 16 chunks (``topk + extra_topk <= 1024`` slots) and the
+    head count needs a prefill instance (16 .. 128, multiples of 16).  Writes
+    ``output`` and ``out_lse`` in place and returns the resolved plan
+    ``{"head_tiles", "num_ctas"}`` (one CTA per (token, head block) item);
+    ``head_tiles`` (see :func:`cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles`)
+    overrides :func:`cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill`.
+    """
+
+    p = _prepare_inputs(
+        q,
+        kv_cache,
+        indices,
+        output,
+        out_lse,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_kv_cache,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_topk_length,
+    )
+    info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
+    tiles = cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles(p.num_heads)
+    if not tiles:
+        raise ValueError(
+            f"Cake SM120 DSv4 NVFP4 sparse-MLA prefill supports {info['prefill_heads']} "
+            f"query heads, got {p.num_heads}"
+        )
+    chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(p.topk, p.extra_topk)
+    if chunks > info["prefill_max_chunks"]:
+        raise ValueError(
+            f"the prefill kernel holds at most {info['prefill_max_chunks']} chunks of "
+            f"{info['chunk_width']} candidates per token; topk {p.topk}"
+            + (f" + extra_topk {p.extra_topk}" if p.extra_topk else "")
+            + f" is {chunks} chunks (use the split decode)"
+        )
+    num_sms = _num_sms(q.device)
+    plan_tiles = cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill(
+        num_tokens=p.num_tokens,
+        num_heads=p.num_heads,
+        topk=p.topk,
+        extra_topk=p.extra_topk,
+        num_sms=num_sms,
+    )
+    ht = int(head_tiles) if head_tiles is not None else plan_tiles
+    if ht not in tiles:
+        raise ValueError(
+            f"head_tiles={ht} is not valid for the {p.num_heads}-head prefill (choices {tiles})"
+        )
+    items = p.num_tokens * (p.num_heads // (info["heads_per_block"] * ht))
+    get_cake_sparse_mla_sm120_dsv4_nvfp4_module().prefill(
+        q,
+        p.kv_flat,
+        p.indices,
+        p.extra_flat,
+        p.extra_indices,
+        p.topk_length,
+        p.extra_topk_length,
+        p.attn_sink,
+        output,
+        out_lse,
+        p.page_size,
+        p.page_stride,
+        p.extra_page_size,
+        p.extra_page_stride,
+        ht,
+        float(sm_scale),
+        float(lse_scale),
+    )
+    return {"head_tiles": ht, "num_ctas": items}
+
+
+@supported_compute_capability([120, 121])
+def _cake_nvfp4_sparse_mla_prefill(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    *,
+    topk_length: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_kv_cache: Optional[torch.Tensor] = None,
+    extra_indices: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+    lse_scale: float = 1.0,
+    head_tiles: Optional[int] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Allocating convenience entry (tests / benchmarks): returns ``(output, out_lse)``."""
+
+    if q.ndim != 3:
+        raise ValueError(f"q must be [T, H, {_D_QK}], got {tuple(q.shape)}")
+    num_tokens, num_heads = int(q.shape[0]), int(q.shape[1])
+    output = torch.empty_like(q)
+    out_lse = torch.empty((num_tokens, num_heads), dtype=torch.float32, device=q.device)
+    cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+        q,
+        kv_cache,
+        indices,
+        output,
+        out_lse,
+        sm_scale,
+        topk_length=topk_length,
+        attn_sink=attn_sink,
+        extra_kv_cache=extra_kv_cache,
+        extra_indices=extra_indices,
+        extra_topk_length=extra_topk_length,
+        lse_scale=lse_scale,
+        head_tiles=head_tiles,
+    )
+    return output, out_lse
 
 
 @supported_compute_capability([120, 121])
@@ -676,7 +1091,7 @@ def functional_run(
     lse: Optional[torch.Tensor] = None,
     lse_scale: float = 1.0,
 ) -> torch.Tensor:
-    """Public-API route: carve the split scratch (and the LSE when the caller passes none) from ``workspace``."""
+    """Public-API route: pick decode or prefill, carve the split scratch (and the LSE when the caller passes none) from ``workspace``."""
 
     from ._prepared import _workspace_tensor_view
 
@@ -686,6 +1101,42 @@ def functional_run(
         extra_indices = _normalize_indices(extra_indices, "extra_indices", num_tokens)
     topk = int(indices.shape[1])
     extra_topk = int(extra_indices.shape[1]) if extra_indices is not None else 0
+    kernel = cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk=topk,
+        extra_topk=extra_topk,
+        num_sms=_num_sms(q.device),
+    )
+    if kernel == "prefill":
+        if lse is None:
+            lse, _ = _workspace_tensor_view(
+                workspace,
+                byte_offset=0,
+                shape=(num_tokens, num_heads),
+                dtype=torch.float32,
+                alignment=16,
+            )
+            if lse is None:
+                raise ValueError(
+                    "attention workspace insufficient for the Cake prefill LSE: need at least "
+                    f"{num_tokens * num_heads * 4 + 16} bytes for {num_tokens} tokens x {num_heads} heads"
+                )
+        cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+            q,
+            cache,
+            indices,
+            output,
+            lse,
+            scale,
+            topk_length=lengths,
+            attn_sink=sink,
+            extra_kv_cache=extra,
+            extra_indices=extra_indices,
+            extra_topk_length=extra_lengths,
+            lse_scale=lse_scale,
+        )
+        return lse
     ht, splits, _ = _resolve_plan(
         num_tokens=num_tokens,
         num_heads=num_heads,
@@ -773,7 +1224,12 @@ def wrapper_run(
     return_lse: bool = False,
     lse_scale: float = 1.0,
 ) -> Optional[torch.Tensor]:
-    """``SparseMLASm120Wrapper.run`` for ``backend="cake"``: wrapper-owned grow-only scratch."""
+    """``SparseMLASm120Wrapper.run`` for ``backend="cake"``: decode / prefill crossover, wrapper-owned grow-only scratch.
+
+    ``prefill_impl`` keeps the SM120 NVFP4 contract (``None`` / ``"auto"`` /
+    ``"mg"`` accepted); the Cake route always selects its own kernel through
+    :func:`cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`.
+    """
 
     if q.ndim == 4 and q.shape[1] == 1:
         q = q.squeeze(1)
@@ -795,26 +1251,8 @@ def wrapper_run(
         extra_indices = _normalize_indices(extra_indices, "extra_indices", num_tokens)
     topk = int(indices.shape[1])
     extra_topk = int(extra_indices.shape[1]) if extra_indices is not None else 0
-    ht, splits, _ = _resolve_plan(
-        num_tokens=num_tokens,
-        num_heads=num_heads,
-        topk=topk,
-        extra_topk=extra_topk,
-        device=q.device,
-        num_splits=None,
-        max_splits=16,
-        head_tiles=None,
-    )
     if (mid_out is None) != (mid_lse is None):
         raise ValueError("mid_out and mid_lse must be provided together")
-    if splits > 1 and mid_out is None:
-        rows = num_tokens * num_heads * splits
-        mid_out = _arena(wrapper, "mid_out", rows * _D_V, torch.bfloat16, q.device)[
-            : rows * _D_V
-        ].view(num_tokens, num_heads, splits, _D_V)
-        mid_lse = _arena(wrapper, "mid_lse", rows, torch.float32, q.device)[:rows].view(
-            num_tokens, num_heads, splits
-        )
     if out_lse is None:
         lse = _arena(wrapper, "lse", num_tokens * num_heads, torch.float32, q.device)[
             : num_tokens * num_heads
@@ -825,6 +1263,47 @@ def wrapper_run(
             raise ValueError(
                 "out_lse must be a contiguous [num_tokens, num_heads] float32 buffer"
             )
+    kernel = cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk=topk,
+        extra_topk=extra_topk,
+        num_sms=_num_sms(q.device),
+    )
+    if kernel == "prefill":
+        cake_sparse_mla_sm120_dsv4_nvfp4_prefill(
+            q,
+            kv_cache,
+            indices,
+            output,
+            lse,
+            sm_scale,
+            topk_length=topk_length,
+            attn_sink=attn_sink,
+            extra_kv_cache=extra_kv_cache,
+            extra_indices=extra_indices,
+            extra_topk_length=extra_topk_length,
+            lse_scale=lse_scale,
+        )
+        return lse if return_lse else None
+    ht, splits, _ = _resolve_plan(
+        num_tokens=num_tokens,
+        num_heads=num_heads,
+        topk=topk,
+        extra_topk=extra_topk,
+        device=q.device,
+        num_splits=None,
+        max_splits=16,
+        head_tiles=None,
+    )
+    if splits > 1 and mid_out is None:
+        rows = num_tokens * num_heads * splits
+        mid_out = _arena(wrapper, "mid_out", rows * _D_V, torch.bfloat16, q.device)[
+            : rows * _D_V
+        ].view(num_tokens, num_heads, splits, _D_V)
+        mid_lse = _arena(wrapper, "mid_lse", rows, torch.float32, q.device)[:rows].view(
+            num_tokens, num_heads, splits
+        )
     cake_sparse_mla_sm120_dsv4_nvfp4_decode(
         q,
         kv_cache,
@@ -851,8 +1330,12 @@ __all__ = [
     "cake_sparse_mla_sm120_dsv4_nvfp4_format_info",
     "cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks",
     "cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles",
+    "cake_sparse_mla_sm120_dsv4_nvfp4_plan_prefill",
     "cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits",
+    "cake_sparse_mla_sm120_dsv4_nvfp4_prefill",
+    "cake_sparse_mla_sm120_dsv4_nvfp4_prefill_head_tiles",
     "cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes",
+    "cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel",
     "cake_sparse_mla_sm120_dsv4_nvfp4_supported_heads",
     "get_cake_sparse_mla_sm120_dsv4_nvfp4_module",
 ]

@@ -1860,7 +1860,7 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     query/KV tensors and produces BF16 output.
 
     With ``backend="cake"`` on SM120/SM121 and ``kv_cache_format="nvfp4"``,
-    this calls the Cake SM120 NVFP4 sparse-MLA decode kernels through the
+    this calls the Cake SM120 NVFP4 sparse-MLA kernels through the
     SM120 ``"sparse"`` call surface (``swa_topk_lens``, optional
     ``compressed_kv_cache`` + ``extra_sparse_indices`` /
     ``extra_sparse_topk_lens``, ``sinks``, HND / NHD / 3-D packed caches).
@@ -1869,6 +1869,11 @@ def trtllm_batch_decode_sparse_mla_dsv4(
     96, 112 and 128 query heads; ``workspace_buffer`` holds the split-K
     partials and the LSE (size it with
     :func:`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_scratch_bytes`).
+    Every call runs either the split decode kernel or the single-launch
+    prefill kernel (one CTA per token and head block over all of its
+    candidates, no split scratch) as chosen by
+    :func:`flashinfer.mla.cake_sparse_mla_sm120_dsv4_nvfp4_select_kernel`
+    from the measured crossover of the two sm_120a SKUs.
 
     With ``backend="cake"`` on SM100/SM103, this calls the source-level CAKE
     kernels (``flashinfer.mla.cake_dsv4``). The metadata may describe fewer
