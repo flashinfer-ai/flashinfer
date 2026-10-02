@@ -86,6 +86,8 @@ _INPUT_NAMES: dict[torch.dtype, CakeGroupedMXFP8Input] = {
     torch.float16: "float16",
 }
 _QUANT_BLOCK = 32
+# One block row per M and one grid slice per B: CUDA caps grid.y and grid.z at 65535.
+_MAX_GRID_YZ = 65535
 _SCALE_TILE = 128
 _THREADS = 128
 
@@ -245,6 +247,12 @@ def cake_grouped_mxfp8_quantize_launch(
     b, m, k = a.shape
     if b == 0 or m == 0:
         return
+    if k % _QUANT_BLOCK != 0:
+        raise ValueError(f"K must be divisible by {_QUANT_BLOCK}, got {k}")
+    if m > _MAX_GRID_YZ or b > _MAX_GRID_YZ:
+        raise ValueError(
+            f"B and M must not exceed the CUDA grid limit {_MAX_GRID_YZ}, got B={b}, M={m}"
+        )
     padded_k = quantized.shape[2]
     padded_m = scales.shape[1]
     blocks_per_row = padded_k // _QUANT_BLOCK
