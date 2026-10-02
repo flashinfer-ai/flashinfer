@@ -220,14 +220,27 @@ def test_cake_plan_head_tiles_rules() -> None:
     # Head counts not divisible by 32 have no two-tile instance.
     assert plan(num_tokens=128, num_heads=8, topk=512, num_sms=188) == 1
     assert plan(num_tokens=128, num_heads=48, topk=512, num_sms=188) == 1
-    # A one-tile grid that fills a wave of SMs pairs tiles.
+    # A one-tile grid that fills a wave of SMs pairs tiles for every head count.
     assert plan(num_tokens=32, num_heads=128, topk=512, num_sms=188) == 2
     assert plan(num_tokens=32, num_heads=128, topk=512, num_sms=170) == 2
-    assert plan(num_tokens=8, num_heads=96, topk=512, num_sms=188) == 1
-    # Gather-bound rows in [SMs / 3, SMs / 2) with >= 8 chunks and <= 64 heads pair tiles.
+    assert plan(num_tokens=64, num_heads=32, topk=128, num_sms=170) == 2
+    assert plan(num_tokens=32, num_heads=64, topk=128, num_sms=128) == 2
+    # H = 32: two thirds of the SMs at any chunk count, one third with >= 8 chunks.
+    assert plan(num_tokens=64, num_heads=32, topk=128, num_sms=188) == 2
+    assert plan(num_tokens=32, num_heads=32, topk=512, num_sms=188) == 2
+    assert plan(num_tokens=32, num_heads=32, topk=128, num_sms=188) == 1
+    assert plan(num_tokens=16, num_heads=32, topk=512, num_sms=188) == 1
+    # H = 64: only [SMs / 3, 2 SMs / 3) with >= 8 chunks.
     assert plan(num_tokens=16, num_heads=64, topk=512, num_sms=188) == 2
     assert plan(num_tokens=16, num_heads=64, topk=128, num_sms=188) == 1
-    assert plan(num_tokens=16, num_heads=64, topk=256, extra_topk=512, num_sms=188) == 2
+    assert plan(num_tokens=32, num_heads=64, topk=512, num_sms=188) == 1
+    assert plan(num_tokens=8, num_heads=64, topk=512, num_sms=188) == 1
+    # H >= 96: only >= 16 chunks at >= SMs / 3.
+    assert plan(num_tokens=8, num_heads=128, topk=512, extra_topk=512, num_sms=188) == 2
+    assert plan(num_tokens=8, num_heads=128, topk=512, num_sms=188) == 1
+    assert plan(num_tokens=8, num_heads=96, topk=512, num_sms=188) == 1
+    assert plan(num_tokens=16, num_heads=96, topk=1024, num_sms=188) == 2
+    assert plan(num_tokens=4, num_heads=128, topk=1024, num_sms=188) == 1
 
 
 def test_cake_planner_parity_with_kernel_module() -> None:

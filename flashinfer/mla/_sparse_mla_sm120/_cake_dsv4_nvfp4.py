@@ -109,29 +109,38 @@ def cake_sparse_mla_sm120_dsv4_nvfp4_plan_head_tiles(
 ) -> int:
     """Return the number of 16-head tiles per decode CTA (1 or 2).
 
-    Two tiles (32 heads per CTA sharing one candidate gather) win once the
-    one-tile grid fills at least one wave of SMs, or when it sits in
-    ``[SMs / 3, SMs / 2)`` with at least 8 chunks and at most 64 heads
-    (gather-bound rows where the split planner refills the halved grid without
-    a wave penalty); one tile otherwise.  Head counts not divisible by 32 have
-    no two-tile instance.
+    Two tiles (32 heads per CTA sharing one candidate gather) follow the
+    measured one-tile vs two-tile sweeps on RTX PRO 6000, with ``ctas`` the
+    one-tile grid ``num_tokens * num_heads / 16``:
+
+    * ``ctas >= SMs`` (a full wave or more): two tiles for every head count;
+    * below one wave the halved grid costs SM coverage and the split planner's
+      extra split costs a merge, so the shared gather has to pay for it:
+      H = 32 pairs at ``ctas >= 2/3 SMs``, or at ``ctas >= SMs / 3`` with at
+      least 8 chunks; H = 64 pairs only for ``SMs / 3 <= ctas < 2/3 SMs`` with at
+      least 8 chunks; H >= 96 pairs only with at least 16 chunks at
+      ``ctas >= SMs / 3``.
+
+    Head counts not divisible by 32 have no two-tile instance.
     """
 
     info = cake_sparse_mla_sm120_dsv4_nvfp4_format_info()
     hpb = info["heads_per_block"]
-    if int(num_heads) % (2 * hpb) != 0:
+    num_heads = int(num_heads)
+    num_sms = int(num_sms)
+    if num_heads % (2 * hpb) != 0:
         return 1
-    base_ctas = int(num_tokens) * (int(num_heads) // hpb)
-    if base_ctas >= int(num_sms):
-        return 2
+    ctas = int(num_tokens) * (num_heads // hpb)
     chunks = cake_sparse_mla_sm120_dsv4_nvfp4_num_chunks(topk, extra_topk)
-    if (
-        chunks >= 8
-        and int(num_heads) <= 4 * hpb
-        and int(num_sms) // 3 <= base_ctas < int(num_sms) // 2
-    ):
+    if ctas >= num_sms:
         return 2
-    return 1
+    third = num_sms // 3
+    two_thirds = (2 * num_sms) // 3
+    if num_heads == 2 * hpb:
+        return 2 if ctas >= two_thirds or (chunks >= 8 and ctas >= third) else 1
+    if num_heads == 4 * hpb:
+        return 2 if chunks >= 8 and third <= ctas < two_thirds else 1
+    return 2 if chunks >= 16 and ctas >= third else 1
 
 
 def cake_sparse_mla_sm120_dsv4_nvfp4_plan_splits(
