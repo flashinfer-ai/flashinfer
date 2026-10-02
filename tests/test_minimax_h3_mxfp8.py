@@ -346,8 +346,41 @@ def _reference_activation(inputs: dict) -> torch.Tensor:
     return activation
 
 
+def _bf16_ulp(magnitude: torch.Tensor) -> torch.Tensor:
+    return torch.exp2(torch.floor(torch.log2(magnitude.clamp_min(2.0**-126))) - 7.0)
+
+
+def _assert_within_round_points(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    magnitude: torch.Tensor,
+    *,
+    atol: float,
+    rtol: float,
+    what: str,
+) -> None:
+    """``|actual - expected| <= atol + rtol * |expected| + 2 * bf16_ulp(magnitude)``.
+
+    The kernel rounds the normalized Q/K values to BF16 before the rotation
+    (with an approximate ``rsqrt``), so each rotated output may differ from the
+    reference by one BF16 ulp of each of its two inputs; ``magnitude`` carries
+    ``|n * cos| + |partner * sin|`` for rotated elements and ``|expected|``
+    elsewhere.
+    """
+    difference = (actual.float() - expected.float()).abs()
+    bound = atol + rtol * expected.float().abs() + 2.0 * _bf16_ulp(magnitude)
+    excess = difference - bound
+    violations = int((excess > 0).sum().item())
+    worst = float(excess.max().item())
+    assert violations == 0, (
+        f"{what}: {violations} of {difference.numel()} elements exceed the round-point "
+        f"bound (worst excess {worst:.6g})"
+    )
+
+
 def _reference_qkv(qkv_bf16: torch.Tensor, inputs: dict) -> tuple[torch.Tensor, ...]:
-    """Stage-2 BF16 Q (normed + RoPE), K (normed + RoPE) and V from the GEMM output."""
+    """Stage-2 BF16 Q (normed + RoPE), K (normed + RoPE), V and the per-element
+    input magnitudes that bound their BF16 rounding (see ``_assert_within_round_points``)."""
     M = qkv_bf16.shape[0]
     grouped = qkv_bf16.view(M, _HEADS, _KINDS, _HEAD_DIM).float()
 
@@ -360,18 +393,24 @@ def _reference_qkv(qkv_bf16: torch.Tensor, inputs: dict) -> tuple[torch.Tensor, 
     cos = inputs["rope_cos_sin"][:, :half].float()[:, None, :]
     sin = inputs["rope_cos_sin"][:, half:].float()[:, None, :]
 
-    def rope(values: torch.Tensor) -> torch.Tensor:
+    def rope(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         first = values[..., :half]
         second = values[..., half:_ROPE_WIDTH]
         rotated = torch.cat(
             (first * cos - second * sin, second * cos + first * sin), dim=-1
         ).to(torch.bfloat16)
-        return torch.cat((rotated, values[..., _ROPE_WIDTH:].to(torch.bfloat16)), dim=-1)
+        tail = values[..., _ROPE_WIDTH:].to(torch.bfloat16)
+        pair = (first * cos).abs() + (second * sin).abs()
+        magnitude = torch.cat(
+            (pair, (second * cos).abs() + (first * sin).abs(), tail.float().abs()),
+            dim=-1,
+        )
+        return torch.cat((rotated, tail), dim=-1), magnitude
 
-    q = rope(normed(0, inputs["q_norm_weight"]))
-    k = rope(normed(1, inputs["k_norm_weight"]))
+    q, q_magnitude = rope(normed(0, inputs["q_norm_weight"]))
+    k, k_magnitude = rope(normed(1, inputs["k_norm_weight"]))
     v = grouped[:, :, 2].to(torch.bfloat16)
-    return q, k, v
+    return q, k, v, q_magnitude, k_magnitude
 
 
 def _assert_gemm_matches_dequantized_operands(
@@ -484,12 +523,21 @@ def test_numerical_reference_both_stages(M: int, P: int) -> None:
 
     # Stage 2: per-head Q/K RMSNorm + split-half NeoX RoPE, checked on the BF16
     # debug copies, then destination-major MXFP8 packing of Q, K and V.
-    expected_q, expected_k, expected_v = _reference_qkv(qkv_bf16, inputs)
-    torch.testing.assert_close(debug_q, expected_q, atol=1e-2, rtol=1e-2)
-    torch.testing.assert_close(debug_k, expected_k, atol=1e-2, rtol=1e-2)
+    expected_q, expected_k, expected_v, q_magnitude, k_magnitude = _reference_qkv(
+        qkv_bf16, inputs
+    )
+    _assert_within_round_points(
+        debug_q, expected_q, q_magnitude, atol=1e-2, rtol=1e-2, what="debug_q_bf16"
+    )
+    _assert_within_round_points(
+        debug_k, expected_k, k_magnitude, atol=1e-2, rtol=1e-2, what="debug_k_bf16"
+    )
     expected = torch.stack((expected_q, expected_k, expected_v), dim=2).float()
     expected = expected.view(M, P, heads_per_destination, _KINDS, _HEAD_DIM)
     expected = expected.permute(1, 0, 2, 3, 4)
+    magnitude = torch.stack((q_magnitude, k_magnitude, expected_v.float().abs()), dim=2)
+    magnitude = magnitude.view(M, P, heads_per_destination, _KINDS, _HEAD_DIM)
+    magnitude = magnitude.permute(1, 0, 2, 3, 4)
     for destination in range(P):
         codes = _unswizzle_sf(
             out_sf[destination], rows_per_destination, _HEAD_DIM // _SCALE_BLOCK
@@ -500,9 +548,11 @@ def test_numerical_reference_both_stages(M: int, P: int) -> None:
         )
         packed = out_q[destination]
         _assert_tight_block_scales(packed, codes)
-        torch.testing.assert_close(
+        _assert_within_round_points(
             _dequantize_blocks(packed, codes),
             expected[destination],
+            magnitude[destination],
             atol=1e-2,
             rtol=2.0**-4 + 2.0**-7,
+            what=f"out_q/out_sf destination {destination}",
         )
