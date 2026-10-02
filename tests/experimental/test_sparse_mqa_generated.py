@@ -160,7 +160,7 @@ def test_sparse_logits_analytical(fmt, paged, capacity):
     # The production geometry (capacity 2048, 8-token blocks, 64-token pages) on an exported SM count runs the
     # exact-geometry program, every other capacity the runtime program of the layout.
     assert metadata.num_sms in _runtime.LIMITS["exact_num_sms"]
-    assert key.endswith(":exact") == (capacity == _runtime.LIMITS["exact_capacity"])
+    assert (":exact:" in key) == (capacity == _runtime.LIMITS["exact_capacity"])
     assert plan.programs["metadata"] == _runtime.ROUTES[key]
 
 
@@ -353,12 +353,12 @@ def test_sparse_metadata_runtime_geometry(fmt, paged, capacity, block, page):
     exact = (capacity, block) == (_runtime.LIMITS["exact_capacity"], 8) and (
         not paged or page == 64
     )
-    assert key.endswith(":exact") == exact
+    assert (":exact:" in key) == exact
     # A device SM count the exact program was not compiled for falls back to the runtime program.
     foreign_sms = max(_runtime.LIMITS["exact_num_sms"]) + 1
     assert not _runtime.metadata_route_key(
         paged=paged, capacity=capacity, sparse_block_kv=block, page_kv=page, num_sms=foreign_sms
-    ).endswith(":exact")
+    ).count(":exact:")
     assert plan.program == _runtime.ROUTES[key]
     plan.run()
     torch.cuda.synchronize()

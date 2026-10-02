@@ -4,9 +4,9 @@ Generated programs serve every architecture: per KV layout a runtime metadata
 kernel (SM count, sparse capacity, split width, block size and page size are
 runtime arguments) and an exact-geometry metadata kernel for the production
 geometry (``LIMITS["exact_capacity"]`` sparse blocks of ``LIMITS["sparse_block_kv"]``
-tokens, ``LIMITS["page_kv"]``-token pages) on the exported device SM counts
-(``LIMITS["exact_num_sms"]``; the SM count is compiled in and selected by the
-``num_sms`` argument), plus the block-scaled logits
+tokens, ``LIMITS["page_kv"]``-token pages) compiled for one exported device SM
+count each (``LIMITS["exact_num_sms"]``; route key ``metadata:<layout>:exact:<sms>``),
+plus the block-scaled logits
 kernel (one per format and layout).  ``MODULES`` registers each program once
 with the architectures it compiles for; ``ROUTES`` maps a logical kernel key
 (``metadata_route_key``, ``logits:<fmt>:<layout>``) to its program; ``LIMITS``
@@ -155,7 +155,7 @@ def metadata_workspace_words(queries, capacity, *, fmt, sparse_block_kv, paged):
 def metadata_route_key(*, paged, capacity, sparse_block_kv, page_kv, num_sms, use_unaligned_ks=False):
     """``ROUTES`` key of the metadata program for one geometry: the exact-geometry program at the exported
     production geometry (capacity ``LIMITS["exact_capacity"]``, ``LIMITS["sparse_block_kv"]``-token blocks and,
-    for paged rows, ``LIMITS["page_kv"]``-token pages) on a device with one of the exported SM counts
+    for paged rows, ``LIMITS["page_kv"]``-token pages) compiled for this device's SM count
     (``LIMITS["exact_num_sms"]``), the runtime program otherwise."""
     layout = "paged" if paged else "contiguous"
     exact = (
@@ -165,7 +165,7 @@ def metadata_route_key(*, paged, capacity, sparse_block_kv, page_kv, num_sms, us
         and sparse_block_kv == LIMITS["sparse_block_kv"]
         and (not paged or page_kv == LIMITS["page_kv"])
     )
-    return f"metadata:{layout}" + (":exact" if exact else "")
+    return f"metadata:{layout}" + (f":exact:{num_sms}" if exact else "")
 
 
 def _arguments(record, bindings):
