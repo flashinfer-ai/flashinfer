@@ -15,8 +15,9 @@ generated-program export; do not edit them by hand.
 from __future__ import annotations
 
 import functools
+from typing import Any
 
-PROGRAMS = {
+PROGRAMS: dict[str, dict[str, Any]] = {
     "cake_deepgemm_fp4_gemm_40f53c88e86797021dc8": {
         "sources": [
             "experimental/deepgemm_fp4_gemm/cake_deepgemm_fp4_gemm_40f53c88e86797021dc8_kernel.cu",
@@ -658,7 +659,11 @@ def _fits(name: str, m: int, n: int, k: int) -> bool:
     grid_m, grid_n = _ceil_div(m, block_m), _ceil_div(n, block_n)
     if family == "swap_ab":
         return n >= 128 and grid_n % 2 == 0
-    return grid_m % 2 == 0 and n >= max(block_n // 2, store_n) and aligned_mn(n) >= _ceil_div(block_n, 128) * 128
+    return (
+        grid_m % 2 == 0
+        and n >= max(block_n // 2, store_n)
+        and aligned_mn(n) >= _ceil_div(block_n, 128) * 128
+    )
 
 
 def _rank(name: str, m: int, n: int, k: int, num_sms: int):
@@ -667,15 +672,24 @@ def _rank(name: str, m: int, n: int, k: int, num_sms: int):
     blocks = _ceil_div(m, block_m) * _ceil_div(n, block_n)
     waves = _ceil_div(blocks, num_sms)
     last = blocks % num_sms
-    return (waves, -(num_sms if last == 0 else last), block_m + block_n, block_m * block_n)
+    return (
+        waves,
+        -(num_sms if last == 0 else last),
+        block_m + block_n,
+        block_m * block_n,
+    )
 
 
 def select_route(m: int, n: int, k: int, *, num_sms: int) -> str:
     """Route name for one problem; ``NotImplementedError`` when no schedule can raster it."""
     if k <= 0 or k % BLOCK_K or m <= 0 or n <= 0:
-        raise NotImplementedError(f"native FP4 GEMM needs M, N > 0 and K a multiple of {BLOCK_K}; got M={m}, N={n}, K={k}")
+        raise NotImplementedError(
+            f"native FP4 GEMM needs M, N > 0 and K a multiple of {BLOCK_K}; got M={m}, N={n}, K={k}"
+        )
     family = "swap_ab" if m <= 128 else "normal"
-    candidates = [name for name, schedule in _SCHEDULES.items() if schedule[0] == family]
+    candidates = [
+        name for name, schedule in _SCHEDULES.items() if schedule[0] == family
+    ]
     if family == "normal" and _ceil_div(m, 128) % 2:
         candidates = ["swap_ab_bm48_bn128_s10"]
     fitting = [name for name in candidates if _fits(name, m, n, k)]
@@ -689,8 +703,15 @@ def select_route(m: int, n: int, k: int, *, num_sms: int) -> str:
 
 def route_geometry(name: str, m: int, n: int, k: int) -> dict[str, int]:
     _family, block_m, block_n, _stages, _store_n = _SCHEDULES[name]
-    return dict(grid_m=_ceil_div(m, block_m), grid_n=_ceil_div(n, block_n), K_tiles=k // BLOCK_K,
-                sfa_words=scale_words(k), sfa_mn=aligned_mn(m), sfb_words=scale_words(k), sfb_mn=aligned_mn(n))
+    return dict(
+        grid_m=_ceil_div(m, block_m),
+        grid_n=_ceil_div(n, block_n),
+        K_tiles=k // BLOCK_K,
+        sfa_words=scale_words(k),
+        sfa_mn=aligned_mn(m),
+        sfb_words=scale_words(k),
+        sfb_mn=aligned_mn(n),
+    )
 
 
 def route_stages(name: str) -> int:
@@ -750,12 +771,32 @@ class Fp4GemmPlan:
     Changing tensor addresses or layouts requires a new plan; contents may change.
     """
 
-    def __init__(self, a, b, a_scales, b_scales, *, m=None, alpha=1.0, out=None, num_stages=None,
-                 block_n=128, epilogue_store_n=32, descriptor_workspace=None):
+    def __init__(
+        self,
+        a,
+        b,
+        a_scales,
+        b_scales,
+        *,
+        m=None,
+        alpha=1.0,
+        out=None,
+        num_stages=None,
+        block_n=128,
+        epilogue_store_n=32,
+        descriptor_workspace=None,
+    ):
         import torch
 
-        if a.ndim != 2 or b.ndim != 2 or a.dtype not in (torch.int8, torch.uint8) or b.dtype not in (torch.int8, torch.uint8):
-            raise ValueError("A/B must be packed int8/uint8 matrices [rows, K/2] and [N, K/2]")
+        if (
+            a.ndim != 2
+            or b.ndim != 2
+            or a.dtype not in (torch.int8, torch.uint8)
+            or b.dtype not in (torch.int8, torch.uint8)
+        ):
+            raise ValueError(
+                "A/B must be packed int8/uint8 matrices [rows, K/2] and [N, K/2]"
+            )
         if a.device.type != "cuda":
             raise RuntimeError("Native FP4 GEMM requires CUDA tensors")
         n, k = b.shape[0], b.shape[1] * 2
@@ -765,7 +806,9 @@ class Fp4GemmPlan:
         if not 1 <= m <= a.shape[0]:
             raise ValueError(f"m must be in [1, {a.shape[0]}] (the rows of A), got {m}")
         if block_n != 128 or epilogue_store_n != 32:
-            raise NotImplementedError("the N tile and store width are selected per problem shape; pass the defaults")
+            raise NotImplementedError(
+                "the N tile and store width are selected per problem shape; pass the defaults"
+            )
         arch, num_sms = device_facts(a.device.index)
         self.route = select_route(m, n, k, num_sms=num_sms)
         if num_stages is not None and int(num_stages) != route_stages(self.route):
@@ -778,25 +821,46 @@ class Fp4GemmPlan:
             (a_scales, (geometry["sfa_words"], geometry["sfa_mn"]), "A scales"),
             (b_scales, (geometry["sfb_words"], geometry["sfb_mn"]), "B scales"),
         ):
-            if tensor.dtype not in (torch.int32, torch.uint32) or tuple(tensor.shape) != shape:
-                raise ValueError(f"{label} must be packed UE8M0 int32/uint32 words of shape {shape}, got {tuple(tensor.shape)}")
+            if (
+                tensor.dtype not in (torch.int32, torch.uint32)
+                or tuple(tensor.shape) != shape
+            ):
+                raise ValueError(
+                    f"{label} must be packed UE8M0 int32/uint32 words of shape {shape}, got {tuple(tensor.shape)}"
+                )
         if out is None:
             out = torch.empty((m, n), dtype=torch.bfloat16, device=a.device)
         if out.dtype != torch.bfloat16 or tuple(out.shape) != (m, n):
             raise ValueError(f"out must be BF16 of shape {(m, n)}")
         tensors = (a, b, a_scales, b_scales, out)
         if any(t.device != a.device or not t.is_contiguous() for t in tensors):
-            raise ValueError("Operands, packed scales and output must be contiguous on one CUDA device")
+            raise ValueError(
+                "Operands, packed scales and output must be contiguous on one CUDA device"
+            )
         self.grid = (num_sms, 1, 1)
         self.output = self.storage = out
         self.descriptor_workspace = descriptor_workspace
         bindings = dict(
-            A=a.view(torch.uint8), B=b.view(torch.uint8), SFA=a_scales.view(torch.uint32), SFB=b_scales.view(torch.uint32),
-            C_tma=out, M=m, N=n, K=k, grid_m=geometry["grid_m"], grid_n=geometry["grid_n"], K_tiles=geometry["K_tiles"],
-            alpha=float(alpha), grid_x=self.grid[0], grid_y=self.grid[1], grid_z=self.grid[2],
+            A=a.view(torch.uint8),
+            B=b.view(torch.uint8),
+            SFA=a_scales.view(torch.uint32),
+            SFB=b_scales.view(torch.uint32),
+            C_tma=out,
+            M=m,
+            N=n,
+            K=k,
+            grid_m=geometry["grid_m"],
+            grid_n=geometry["grid_n"],
+            K_tiles=geometry["K_tiles"],
+            alpha=float(alpha),
+            grid_x=self.grid[0],
+            grid_y=self.grid[1],
+            grid_z=self.grid[2],
         )
         self._entry = load_program(arch, self.program)
-        self._args = tuple(bindings[name] for _kind, name in PROGRAMS[self.program]["arg_plan"])
+        self._args = tuple(
+            bindings[name] for _kind, name in PROGRAMS[self.program]["arg_plan"]
+        )
         self._retained = tensors
 
     def run(self):

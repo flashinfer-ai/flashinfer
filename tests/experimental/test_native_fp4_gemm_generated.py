@@ -9,7 +9,9 @@ import torch
 from flashinfer.experimental.deepgemm_fp4_gemm import fp4_gemm as _runtime
 from flashinfer.fp4_gemm import prepare_fp4_gemm
 
-_SHIPPED = [(m, n, k) for m in (16, 128, 512, 4096) for n, k in ((4608, 5120), (5120, 2304))]
+_SHIPPED = [
+    (m, n, k) for m in (16, 128, 512, 4096) for n, k in ((4608, 5120), (5120, 2304))
+]
 _SHIPPED += [(256, 128, 2048), (256, 128, 256)]
 _HELD_OUT = [
     (1, 4608, 5120),
@@ -20,7 +22,24 @@ _HELD_OUT = [
     (2048, 1536, 1024),
     (4096, 7168, 4096),
 ]
-_FP4_LUT = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0)
+_FP4_LUT = (
+    0.0,
+    0.5,
+    1.0,
+    1.5,
+    2.0,
+    3.0,
+    4.0,
+    6.0,
+    -0.0,
+    -0.5,
+    -1.0,
+    -1.5,
+    -2.0,
+    -3.0,
+    -4.0,
+    -6.0,
+)
 
 
 def _device():
@@ -45,7 +64,13 @@ def _pack_ue8m0(sf):
     aligned_mn, aligned_words = -(-mn // 4) * 4, -(-words // 4) * 4
     bytes_ = torch.zeros(aligned_mn, aligned_words, dtype=torch.uint8, device=sf.device)
     bytes_[:mn, :words] = (sf.view(torch.int32) >> 23).to(torch.uint8)
-    return bytes_.view(-1).view(torch.int32).view(aligned_mn, aligned_words // 4).t().contiguous()
+    return (
+        bytes_.view(-1)
+        .view(torch.int32)
+        .view(aligned_mn, aligned_words // 4)
+        .t()
+        .contiguous()
+    )
 
 
 def _quantize_fp4(x):
@@ -75,7 +100,9 @@ def _case(m, n, k, device, seed, alpha):
 @pytest.mark.parametrize("alpha", (1.0, -0.75))
 def test_random_inputs_match_reference(m, n, k, alpha):
     device = _device()
-    a, b, sfa, sfb, expected = _case(m, n, k, device, seed=m * 7 + n * 3 + k, alpha=alpha)
+    a, b, sfa, sfb, expected = _case(
+        m, n, k, device, seed=m * 7 + n * 3 + k, alpha=alpha
+    )
     plan = prepare_fp4_gemm(a, b, sfa, sfb, m=m, alpha=alpha)
     assert tuple(plan.output.shape) == (m, n)
     out = plan.run()
@@ -93,9 +120,21 @@ def test_analytical_values_alpha_stream_replay(m, n, k):
     a = torch.full((m, k // 2), 0x22, dtype=torch.uint8, device=device)
     b = torch.full((n, k // 2), 0x22, dtype=torch.uint8, device=device)
     # Constant scale 1 has exponent 127 in every packed byte.
-    sfa = torch.full((geometry["sfa_words"], geometry["sfa_mn"]), 0x7F7F7F7F, dtype=torch.int32, device=device)
-    sfb = torch.full((geometry["sfb_words"], geometry["sfb_mn"]), 0x7F7F7F7F, dtype=torch.int32, device=device)
-    plan = prepare_fp4_gemm(a, b, sfa, sfb, m=m, alpha=alpha, num_stages=_runtime.route_stages(route))
+    sfa = torch.full(
+        (geometry["sfa_words"], geometry["sfa_mn"]),
+        0x7F7F7F7F,
+        dtype=torch.int32,
+        device=device,
+    )
+    sfb = torch.full(
+        (geometry["sfb_words"], geometry["sfb_mn"]),
+        0x7F7F7F7F,
+        dtype=torch.int32,
+        device=device,
+    )
+    plan = prepare_fp4_gemm(
+        a, b, sfa, sfb, m=m, alpha=alpha, num_stages=_runtime.route_stages(route)
+    )
     assert plan.route == route
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
