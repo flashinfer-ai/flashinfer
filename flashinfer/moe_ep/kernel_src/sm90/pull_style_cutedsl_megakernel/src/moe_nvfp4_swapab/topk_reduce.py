@@ -275,11 +275,16 @@ class TopkReduce:
         topk_score: Optional[cute.Tensor],  # (token, topk)
         stream: cuda.CUstream,
         slot_mask: Optional[cute.Tensor] = None,  # (token,) Int32 bitmask
+        slot_topk_idx: Optional[cute.Tensor] = None,  # (token, topk) expert ids
     ):
         # slot_mask: bit k set <=> slot k of this token carries a live term.
         # Used by the grouped (rank-indexed) combine, where a token only
         # receives one row per CONTRIBUTING rank and the other slots hold
         # stale bytes that must not be accumulated.
+        # slot_topk_idx (bf16 only; FI local extension): derive that mask from
+        # the routing instead -- slot k is live iff topk_idx[token, k] >= 0.
+        # A masked (-1) route is never dispatched, so its per-(token, topk)
+        # row keeps whatever an earlier launch left there.
         threads = self._threads
         total_workers = reduced_output.shape[0] * self.hidden_tiles
         grid = [(total_workers + threads - 1) // threads, 1, 1]
@@ -295,10 +300,16 @@ class TopkReduce:
             topk_score = cute.make_tensor(
                 topk_score.iterator,
                 cute.make_layout((topk_score.shape[0], self.num_topk), stride=topk_score.stride))
+        if cutlass.const_expr(slot_topk_idx is not None):
+            if cutlass.const_expr(slot_mask is not None):
+                raise ValueError("pass slot_mask or slot_topk_idx, not both.")
+            slot_topk_idx = cute.make_tensor(
+                slot_topk_idx.iterator,
+                cute.make_layout((slot_topk_idx.shape[0], self.num_topk), stride=slot_topk_idx.stride))
 
         if cutlass.const_expr(not self.combine_format.is_quantized):
             self._reduce_bf16(
-                combine_quant, topk_score, reduced_output, slot_mask,
+                combine_quant, topk_score, reduced_output, slot_mask, slot_topk_idx,
             ).launch(
                 grid=grid, block=block, stream=stream,
             )
@@ -321,6 +332,8 @@ class TopkReduce:
                 ),
             )
 
+        if cutlass.const_expr(slot_topk_idx is not None):
+            raise ValueError("slot_topk_idx is only implemented for the bf16 combine.")
         if cutlass.const_expr(self.combine_format.act_dtype in (cutlass.Float8E4M3FN, cutlass.Float8E5M2)):
             self._reduce_mxfp8(
                 combine_quant, sf, topk_score, reduced_output, slot_mask,
@@ -365,6 +378,7 @@ class TopkReduce:
         topk_score: Optional[cute.Tensor],
         reduced_output: cute.Tensor,
         slot_mask: Optional[cute.Tensor] = None,
+        slot_topk_idx: Optional[cute.Tensor] = None,
     ):
         threads = self._threads
         hidden_per_thread = self.hidden_per_thread
@@ -373,6 +387,7 @@ class TopkReduce:
         needs_guard = self.require_predicate
         prefetch = self.prefetch
         out_dtype = reduced_output.element_type
+        masked = slot_mask is not None or slot_topk_idx is not None
 
         worker_idx = cute.arch.block_idx()[0] * Int32(threads) + cute.arch.thread_idx()[0]
         token_idx = worker_idx // hidden_tiles
@@ -407,15 +422,23 @@ class TopkReduce:
                     score_reg[k] = score_dtype(1)
 
             mask_bits = Int32(-1)
-            if cutlass.const_expr(slot_mask is not None):
+            if cutlass.const_expr(masked):
                 # Masked slots hold stale bytes; start the accumulator at zero
                 # and skip their load + accumulate entirely.
-                mask_bits = Int32(slot_mask[token_idx])
+                if cutlass.const_expr(slot_mask is not None):
+                    mask_bits = Int32(slot_mask[token_idx])
+                else:
+                    # The routing row is one 8*topk-byte line shared by every
+                    # hidden-tile worker of this token (an L1 broadcast).
+                    mask_bits = Int32(0)
+                    for k in cutlass.range_constexpr(num_topk):
+                        if Int32(slot_topk_idx[token_idx, Int32(k)]) >= Int32(0):
+                            mask_bits = mask_bits | (Int32(1) << Int32(k))
                 for i in cutlass.range_constexpr(hidden_per_thread):
                     acc[i] = Float32(0.0)
 
             for k in cutlass.range_constexpr(0, num_topk, 1):
-                if cutlass.const_expr(slot_mask is not None):
+                if cutlass.const_expr(masked):
                     if ((mask_bits >> Int32(k)) & Int32(1)) == Int32(1):
                         term = cute.make_rmem_tensor(
                             (hidden_per_thread,), cutlass.BFloat16,
