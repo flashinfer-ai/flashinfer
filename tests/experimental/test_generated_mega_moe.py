@@ -97,12 +97,20 @@ def check_single_kernel_graph(names):
     assert len(names) == 1, names
 
 
-def check_v3_workspace(plan):
-    """After a self-cleaning run every per-launch workspace word is zero again
-    and each grid gate holds only its phase bit (bits 0..30 clear)."""
+def check_v3_workspace(plan, *, scratch_cleared=False):
+    """After a self-cleaning run every per-launch counter word is zero again
+    and each grid gate holds only its phase bit (bits 0..30 clear).
+
+    ``expert_scatter_offsets`` is a scratch table: every launch re-claims its
+    slots ``[0, expert_counts[e])`` before reading them, so the multi-token
+    kernels leave the previous launch's indices in place. Only the single-token
+    kernel zeroes it on exit; pass ``scratch_cleared=True`` for that route."""
     assert plan.self_cleaning
     bindings = plan.stages[0].bindings
-    for name in ("expert_counts", "expert_scatter_offsets", "l1_arrival"):
+    counters = ["expert_counts", "l1_arrival"]
+    if scratch_cleared:
+        counters.append("expert_scatter_offsets")
+    for name in counters:
         assert bindings[name].view(torch.int32).count_nonzero().item() == 0, name
     for name in ("histogram_done", "prefix_done", "dispatch_done", "l2_done"):
         word = bindings[name].view(torch.int32) & 0x7FFFFFFF
@@ -205,7 +213,7 @@ def test_v3_single_token_route_workspace_lifecycle():
         plan.run()
         torch.cuda.synchronize()
         torch.testing.assert_close(plan.outputs, expected, atol=1.0, rtol=0.1)
-        check_v3_workspace(plan)
+        check_v3_workspace(plan, scratch_cleared=True)
         if first is None:
             first = plan.outputs.clone()
         else:
@@ -220,7 +228,7 @@ def test_v3_single_token_route_workspace_lifecycle():
         graph.replay()
         torch.cuda.synchronize()
         torch.testing.assert_close(plan.outputs, first, atol=1.0, rtol=0.1)
-        check_v3_workspace(plan)
+        check_v3_workspace(plan, scratch_cleared=True)
 
 
 def test_source_update_inputs_reuses_workspace():
