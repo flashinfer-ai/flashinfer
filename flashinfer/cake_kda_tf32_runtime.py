@@ -1786,6 +1786,10 @@ def select_bf16_schedule_route(
         raise ValueError("sm_count and num_heads must be positive")
     if not sequence_lengths or any((length <= 0 for length in sequence_lengths)):
         raise ValueError("sequence_lengths must contain positive lengths")
+    if gpu_arch not in _COMPUTE_CAPABILITY:
+        raise ValueError(
+            f"gpu_arch must be one of {sorted(_COMPUTE_CAPABILITY)}, got {gpu_arch!r}"
+        )
     num_seqs = len(sequence_lengths)
     uniform_sequences = len(set(sequence_lengths)) == 1
     total_tasks = num_seqs * num_heads
