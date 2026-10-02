@@ -22,8 +22,8 @@ not multiples of 4, identical rows, per-request tensors, bitwise replay across l
 CUDA graphs / every frozen kernel variant, and parity with ``top_k_first`` sampling.
 """
 
-import itertools
 import functools
+import itertools
 import math
 from dataclasses import dataclass
 
@@ -31,10 +31,12 @@ import numpy as np
 import pytest
 import torch
 
+import flashinfer.compilation_context as compilation_context
+import flashinfer.jit.cake_sampling as cake_sampling_jit
 from flashinfer.cake_sampling import (
     _early_trigger_flag,
-    _stream_prepass_flag,
     _stage1_variants,
+    _stream_prepass_flag,
     cake_sampling_route,
     choose_stage1,
     choose_stage23,
@@ -42,8 +44,6 @@ from flashinfer.cake_sampling import (
     top_k_probs_to_slab,
     top_k_top_p_sampling_from_probs,
 )
-import flashinfer.compilation_context as compilation_context
-import flashinfer.jit.cake_sampling as cake_sampling_jit
 from flashinfer.jit.cake_sampling import (
     load_cake_sampling_module,
     load_manifest,
@@ -2499,37 +2499,38 @@ def test_adv_top_k_first_parity():
     assert torch.equal(g1.get_state(), g2.get_state())
 
 
-def test_manifest_seals_every_source_file():
-    """The root .cu includes the body parts the manifest lists; each file is size- and digest-sealed and under 5 MiB."""
-    import hashlib
+def test_manifest_names_the_source_parts():
+    """The root .cu includes exactly the body parts the manifest lists, in order; every frozen symbol is defined
+    once across them; every stage-2/3 row names the capabilities that dispatch it (one base form)."""
     import re
 
     man = load_manifest()
-    csrc = cake_sampling_jit._get_csrc_dir()
-    files = cake_sampling_jit._verified_source_files(csrc, man)
-    names = list(files)
+    gen = cake_sampling_jit._get_csrc_dir() / "generated"
+    names = man["source_files"]
     assert names[0] == "cake_sampling_kernels.cu" and len(names) >= 2
     assert names[1:] == [
         f"cake_sampling_kernels_part{i}.cuh" for i in range(1, len(names))
     ]
-    for entry in man["source_files"]:
-        data = files[entry["path"]]
-        assert len(data) == entry["bytes"] < 5 * 1024 * 1024
-        assert hashlib.sha256(data).hexdigest() == entry["sha256"]
-    assert hashlib.sha256(b"".join(files.values())).hexdigest() == man["source_sha256"]
-    root = files[names[0]].decode()
+    assert all((gen / n).is_file() for n in names)
+    root = (gen / names[0]).read_text()
     assert re.findall(r'^#include "([^"]+)"$', root, flags=re.MULTILINE) == names[1:]
-    body = b"".join(files[n] for n in names[1:])
+    body = b"".join((gen / n).read_bytes() for n in names[1:])
     for symbol in man["kernel_symbols"]:
         assert (
             len(re.findall(rb"(?<![A-Za-z0-9_])" + symbol.encode() + rb"\(", body)) == 1
         )
-    # a corrupted part is rejected before anything is compiled
-    bad = dict(man)
-    bad["source_files"] = [dict(e) for e in man["source_files"]]
-    bad["source_files"][-1]["sha256"] = "0" * 64
-    with pytest.raises(RuntimeError, match="source identity"):
-        cake_sampling_jit._verified_source_files(csrc, bad)
+    assert [v["symbol"] for v in man["stage1"]] + [
+        v["symbol"] for v in man["stage23"]
+    ] == man["kernel_symbols"]
+    table = cake_sampling_jit.stage23_flags_by_capability()
+    assert None in table
+    assert sum(v["capabilities"] is None for v in man["stage23"]) == len(
+        {(v["threads"], v["items"]) for v in man["stage23"]}
+    )
+    for cc in ((9, 0), (10, 0), (10, 3), (10, 7), (12, 0)):
+        assert table.get(cc, table[None]) in {
+            v["variant_flags"] for v in man["stage23"]
+        }
 
 
 def test_coarse_push_build_matches_default_build():

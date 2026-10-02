@@ -59,11 +59,9 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
-#include <mutex>
-#include <set>
-#include <utility>
 
 #include "tvm_ffi_utils.h"
 
@@ -183,11 +181,18 @@ struct Stage23Variant {
 // the two-level select reads them locally) are a second build of the default build of the
 // streaming variants with the two-level select, taken only by launch_flags bit 8 on a two-launch
 // chain -- it wins those chains on GB300 / H100 and loses them on B200.
+inline const Stage1Variant kStage1Table[] = {
+    CAKE_SAMPLING_STAGE1_TABLE(CAKE_SAMPLING_STAGE1_ENTRY)};
+inline const Stage23Variant kStage23Table[] = {
+    CAKE_SAMPLING_STAGE23_TABLE(CAKE_SAMPLING_STAGE23_ENTRY)};
+// Per table entry, one bit per device id: set once the kernel is prepared on that device.
+inline std::atomic<uint64_t> kStage1Prepared[sizeof(kStage1Table) / sizeof(Stage1Variant)]{};
+inline std::atomic<uint64_t> kStage23Prepared[sizeof(kStage23Table) / sizeof(Stage23Variant)]{};
+
 inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept, int32_t stream,
                                        int32_t block_tail, int32_t wide, int32_t spec, int32_t slab,
                                        int32_t push) {
-  static const Stage1Variant kTable[] = {CAKE_SAMPLING_STAGE1_TABLE(CAKE_SAMPLING_STAGE1_ENTRY)};
-  for (const Stage1Variant& v : kTable) {
+  for (const Stage1Variant& v : kStage1Table) {
     if (v.cluster == cluster && v.ept == ept && v.stream == stream &&
         v.fused_block_tail == block_tail && v.coarse_sample == wide && v.spec_sample == spec &&
         v.slab_tail == slab && v.coarse_push == push)
@@ -197,8 +202,7 @@ inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept, int32_t str
 }
 
 inline const Stage23Variant* FindStage23(int32_t threads, int32_t items, int32_t variant_flags) {
-  static const Stage23Variant kTable[] = {CAKE_SAMPLING_STAGE23_TABLE(CAKE_SAMPLING_STAGE23_ENTRY)};
-  for (const Stage23Variant& v : kTable) {
+  for (const Stage23Variant& v : kStage23Table) {
     if (v.threads == threads && v.items == items && v.variant_flags == variant_flags) return &v;
   }
   return nullptr;
@@ -224,20 +228,17 @@ inline void EnsureClusterAttribute(const void* kernel, int32_t cluster) {
 //   non-portable cluster opt-in.  Function attributes persist for the process, and the runtime
 //   queries behind them (cudaDeviceGetAttribute x2, cudaFuncGetAttributes, cudaFuncSetAttribute)
 //   cost several microseconds each on Grace hosts -- for the stage-2/3 launch they sat between the
-//   two launches of the eager path, delaying the second kernel.
-inline void PrepareKernel(int32_t device_id, const void* kernel, int32_t smem_bytes,
-                          int32_t cluster) {
-  static std::mutex mutex;
-  static std::set<std::pair<int32_t, const void*>> prepared;
-  {
-    std::lock_guard<std::mutex> lock(mutex);
-    if (prepared.count({device_id, kernel}) != 0) return;
-  }
+//   two launches of the eager path, delaying the second kernel.  ``prepared`` is the table entry's
+//   device bit set (one atomic load per launch; the attribute calls are idempotent, so two threads
+//   preparing the same kernel at once are harmless).  Device ids beyond 63 are prepared every time.
+inline void PrepareKernel(int32_t device_id, std::atomic<uint64_t>& prepared, const void* kernel,
+                          int32_t smem_bytes, int32_t cluster) {
+  const uint64_t bit = device_id < 64 ? (uint64_t{1} << device_id) : 0;
+  if (bit != 0 && (prepared.load(std::memory_order_acquire) & bit) != 0) return;
   CheckTarget(device_id, kernel);
   EnsureSmemAttribute(kernel, smem_bytes);
   EnsureClusterAttribute(kernel, cluster);
-  std::lock_guard<std::mutex> lock(mutex);
-  prepared.insert({device_id, kernel});
+  if (bit != 0) prepared.fetch_or(bit, std::memory_order_release);
 }
 
 inline void CheckSlab(const TensorView& vals, const TensorView& idx, const TensorView& count,
@@ -392,7 +393,7 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
       << (want_spec ? " with the speculative-sample build (launch_flags bit 6)" : "")
       << (want_slab ? " with the slab tail (launch_flags bit 7)" : "")
       << (want_push ? " with the pushed coarse sums (launch_flags bit 8)" : "");
-  PrepareKernel(device_id, v->kernel, v->smem_bytes, v->cluster);
+  PrepareKernel(device_id, kStage1Prepared[v - kStage1Table], v->kernel, v->smem_bytes, v->cluster);
   TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept
       << " does not cover vocab=" << vocab;
@@ -529,7 +530,7 @@ void SparseTopPSample(TensorView vals, TensorView idx, TensorView count, TensorV
                                         static_cast<int32_t>(variant_flags));
   TVM_FFI_ICHECK(v != nullptr) << "no frozen stage-2/3 variant for threads=" << threads
                                << " items=" << items << " variant_flags=" << variant_flags;
-  PrepareKernel(device_id, v->kernel, v->smem_bytes, 1);
+  PrepareKernel(device_id, kStage23Prepared[v - kStage23Table], v->kernel, v->smem_bytes, 1);
   if (batch == 0) return;
 
   float* vals_ptr = static_cast<float*>(vals.data_ptr());

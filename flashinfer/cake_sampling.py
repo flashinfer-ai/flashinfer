@@ -55,7 +55,7 @@ from __future__ import annotations
 
 import functools
 import math
-from typing import Optional, TypeAlias, Union
+from typing import NamedTuple, Optional, TypeAlias, Union
 
 import torch
 
@@ -63,6 +63,7 @@ from .api_logging import flashinfer_api
 from .jit.cake_sampling import (
     load_cake_sampling_module,
     load_manifest,
+    stage23_flags_by_capability,
     supported_capability,
 )
 from .sampling import get_seed_and_offset
@@ -253,8 +254,12 @@ _WORKSPACES: dict[
 ] = {}
 
 
+def _device_index(device: torch.device) -> int:
+    return torch.cuda.current_device() if device.index is None else int(device.index)
+
+
 def _capability(device: torch.device) -> Optional[tuple[int, int]]:
-    return supported_capability(torch.cuda.get_device_capability(device))
+    return supported_capability(_device_capability(_device_index(device)))
 
 
 def _stage1_variants(smem_limit: Optional[int] = None) -> list[tuple[int, int, bool]]:
@@ -287,23 +292,15 @@ def _stage23_variants() -> tuple[tuple[int, int], ...]:
 #                           +1..+3 % on B200 / H100 / R200 (the integer precompute chain adds latency).
 #   one_cmp_select (bit 1)  one 64-bit compare + select per bitonic exchange: B200 / H100 / B300 -16..-19 % of the
 #                           kernel (sort stage 4.0 -> 2.7 us), R200 +0..+2 %.
+# The capability -> form table is the manifest's (``capabilities`` of each stage-2/3 row; the frozen source compiles a
+# form only for the targets that dispatch it), read once per process.
 STAGE23_FEATURE_BITS = {"int_tests": 1, "one_cmp_select": 2}
-_STAGE23_FLAGS_BY_CAPABILITY = {
-    (9, 0): STAGE23_FEATURE_BITS["one_cmp_select"],
-    (10, 0): STAGE23_FEATURE_BITS["one_cmp_select"],
-    (10, 3): STAGE23_FEATURE_BITS["int_tests"] | STAGE23_FEATURE_BITS["one_cmp_select"],
-}
 
 
 @functools.cache
 def _stage23_variant_flags(device_index: int) -> int:
-    cc = tuple(torch.cuda.get_device_capability(device_index))
-    flags = _STAGE23_FLAGS_BY_CAPABILITY.get(cc, 0)
-    if flags not in {v["variant_flags"] for v in load_manifest()["stage23"]}:
-        raise RuntimeError(
-            f"frozen bundle lacks stage-2/3 variant_flags={flags} for compute capability {cc}"
-        )
-    return flags
+    table = stage23_flags_by_capability()
+    return table.get(_device_capability(device_index), table[None])
 
 
 def stage23_variant_flags(device: torch.device | int | None = None) -> int:
@@ -395,7 +392,7 @@ def _device_capability(device_index: int) -> tuple[int, int]:
 
 @functools.cache
 def _block_tail_enabled(device_index: int) -> bool:
-    return _block_tail_for_capability(torch.cuda.get_device_capability(device_index))
+    return _block_tail_for_capability(_device_capability(device_index))
 
 
 def _fuse_block_tail(
@@ -752,11 +749,9 @@ def _sample_build_flag(
 
 
 @functools.cache
+@functools.cache
 def _row_span_diet_capability(device_index: int) -> bool:
-    return (
-        tuple(torch.cuda.get_device_capability(device_index))
-        in _ROW_SPAN_DIET_CAPABILITIES
-    )
+    return _device_capability(device_index) in _ROW_SPAN_DIET_CAPABILITIES
 
 
 def _row_span_diet_flag(
@@ -793,10 +788,10 @@ def _stream_prepass_flag(device_index: int) -> int:
     one-wave large-k cells 0.5-1 us of dependent launch latency on Blackwell and Rubin but costs
     Hopper 1.4-1.9 us (the dependent's launch contends with the row read), so it is set for compute
     capability >= 10 only.  Ignored by the register-resident variants and without the early trigger."""
-    major, _minor = torch.cuda.get_device_capability(device_index)
-    return _FLAG_STREAM_PREPASS if major >= 10 else 0
+    return _FLAG_STREAM_PREPASS if _device_capability(device_index)[0] >= 10 else 0
 
 
+@functools.cache
 @functools.cache
 def _sm_count(device_index: int) -> int:
     return int(torch.cuda.get_device_properties(device_index).multi_processor_count)
@@ -1054,6 +1049,110 @@ def choose_stage23(top_k_max: int) -> tuple[int, int]:
     raise ValueError(f"top_k_max={top_k_max} exceeds the frozen stage-2/3 capacity")
 
 
+class _LaunchPlan(NamedTuple):
+    """Every dispatch decision of one pipeline call: the stage-1 variant, the stage-2/3 slab, the stage-1
+    ``launch_flags`` and whether stage 2/3 runs inside the stage-1 kernel (one launch)."""
+
+    cluster: int
+    ept: int
+    stream: bool
+    threads: int
+    items: int
+    launch_flags: int
+    one_launch: bool
+    stage23_flags: int
+
+
+@functools.lru_cache(maxsize=8192)
+def _launch_plan(
+    device_index: int, batch: int, vocab: int, top_k_max: int
+) -> _LaunchPlan:
+    """The dispatch of ``top_k_top_p_sampling_from_probs`` for ``batch`` rows of ``vocab`` entries with largest
+    top-k ``top_k_max`` on device ``device_index``: a pure function of these four values and the frozen bundle, so
+    it is computed once per distinct call shape (the route check and the launch share it).  Raises ``ValueError``
+    when no frozen stage-1 variant covers ``vocab``."""
+    sm_count = _sm_count(device_index)
+    capability = _device_capability(device_index)
+    two_launch = _launch_is_two_kernels(top_k_max, device_index)
+    cluster, ept, stream = _choose_stage1_resolved(
+        batch, vocab, sm_count, _smem_optin(device_index), top_k_max, two_launch
+    )
+    threads, items = choose_stage23(top_k_max)
+    # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch).
+    fused = top_k_max <= _fused_tail_kcap() and _stage1_has_fused_tail(
+        cluster, ept, stream
+    )
+    # Larger top-k up to the slab: the whole-CTA tail, on the capabilities where it beats the chain, for a
+    # one-wave stage-1 grid.
+    fused_block = not fused and _fuse_block_tail(
+        batch,
+        cluster,
+        ept,
+        stream,
+        sm_count,
+        top_k_max,
+        not _block_tail_enabled(device_index),
+        vocab,
+        capability,
+    )
+    if fused:
+        sample_flag = _sample_build_flag(
+            cluster, ept, stream, top_k_max, vocab, batch, capability
+        )
+        launch_flags = (
+            _FLAG_FUSE_TAIL
+            | sample_flag
+            | _slab_tail_flag(cluster, ept, stream, sample_flag, vocab, capability)
+        )
+    elif fused_block:
+        launch_flags = _FLAG_FUSE_BLOCK_TAIL
+    else:
+        # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
+        # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
+        launch_flags = _early_trigger_flag(batch, cluster, sm_count)
+        if stream:
+            launch_flags |= _stream_prepass_flag(device_index)
+            launch_flags |= _row_span_diet_flag(cluster, True, top_k_max, device_index)
+            launch_flags |= _spec_sample_flag(
+                cluster, ept, True, vocab, top_k_max, batch, capability
+            )
+            launch_flags |= _coarse_push_flag(
+                cluster, ept, True, launch_flags, capability
+            )
+    return _LaunchPlan(
+        cluster,
+        ept,
+        stream,
+        threads,
+        items,
+        launch_flags,
+        fused or fused_block,
+        _stage23_variant_flags(device_index),
+    )
+
+
+@functools.lru_cache(maxsize=8192)
+def _slab_plan(
+    device_index: int, batch: int, vocab: int, top_k_max: int
+) -> tuple[int, int, bool, int]:
+    """Stage-1 variant and ``launch_flags`` of :func:`top_k_probs_to_slab` (no tail, no PDL dependent): the
+    speculative- or coarse-sample build on a stream, the row-span filter arm for a large top-k on a cluster-8
+    stream."""
+    cluster, ept, stream = _choose_stage1_resolved(
+        batch,
+        vocab,
+        _sm_count(device_index),
+        _smem_optin(device_index),
+        top_k_max,
+        _launch_is_two_kernels(top_k_max, device_index),
+    )
+    capability = _device_capability(device_index)
+    flags = _sample_build_flag(
+        cluster, ept, stream, top_k_max, vocab, batch, capability
+    ) | _row_span_diet_flag(cluster, stream, top_k_max, device_index)
+    return cluster, ept, stream, flags
+
+
 def cake_sampling_route(
     probs: torch.Tensor,
     top_k: Optional[Union[int, torch.Tensor]],
@@ -1083,7 +1182,7 @@ def cake_sampling_route(
     if kmax > _slab():
         return "fallback:top_k_gt_slab"
     try:
-        choose_stage1(batch, vocab, top_k_max=kmax)
+        _launch_plan(_device_index(probs.device), int(batch), int(vocab), int(kmax))
     except ValueError:
         return "fallback:vocab_too_large"
     return "pipeline"
@@ -1205,8 +1304,7 @@ def top_k_top_p_sampling_from_probs(
         if isinstance(top_k, int)
         else (int(top_k_max) if top_k_max is not None else int(top_k.max().item()))
     )
-    cluster, ept, stream_variant = choose_stage1(batch, vocab, top_k_max=kmax)
-    threads, items = choose_stage23(kmax)
+    plan = _launch_plan(_device_index(probs.device), int(batch), int(vocab), int(kmax))
     slab = _slab()
     vals, idxs, cnt = (
         workspace if workspace is not None else _workspace(batch, slab, probs.device)
@@ -1230,70 +1328,6 @@ def top_k_top_p_sampling_from_probs(
     renorm = renorm_out if renorm_out is not None else vals
     module = load_cake_sampling_module()
     stream = torch.cuda.current_stream(device=probs.device).cuda_stream
-    # Small top-k: stage 2/3 runs inside the stage-1 kernel (same outputs, one launch).
-    fused = kmax <= _fused_tail_kcap() and _stage1_has_fused_tail(
-        cluster, ept, bool(stream_variant)
-    )
-    # Larger top-k up to the slab: the whole-CTA tail, on the capabilities where it beats the chain, for a
-    # one-wave stage-1 grid.
-    fused_block = not fused and _fuse_block_tail(
-        batch,
-        cluster,
-        ept,
-        bool(stream_variant),
-        _sm_count(probs.device.index or 0),
-        kmax,
-        not _block_tail_enabled(probs.device.index or 0),
-        vocab,
-        _device_capability(probs.device.index or 0),
-    )
-    # Two launches: stage 2/3 may start early only when its CTAs fit beside the last stage-1 wave; a
-    # streaming variant triggers before its first pass on Blackwell / Rubin, after its filter pass on Hopper.
-    if fused:
-        capability = _device_capability(probs.device.index or 0)
-        sample_flag = _sample_build_flag(
-            cluster,
-            ept,
-            bool(stream_variant),
-            kmax,
-            vocab,
-            batch,
-            capability,
-        )
-        launch_flags = (
-            _FLAG_FUSE_TAIL
-            | sample_flag
-            | _slab_tail_flag(
-                cluster, ept, bool(stream_variant), sample_flag, vocab, capability
-            )
-        )
-    elif fused_block:
-        launch_flags = _FLAG_FUSE_BLOCK_TAIL
-    else:
-        launch_flags = _early_trigger_flag(
-            batch, cluster, _sm_count(probs.device.index)
-        )
-        if stream_variant:
-            launch_flags |= _stream_prepass_flag(probs.device.index)
-            launch_flags |= _row_span_diet_flag(
-                cluster, True, kmax, probs.device.index or 0
-            )
-            launch_flags |= _spec_sample_flag(
-                cluster,
-                ept,
-                True,
-                vocab,
-                kmax,
-                batch,
-                _device_capability(probs.device.index or 0),
-            )
-            launch_flags |= _coarse_push_flag(
-                cluster,
-                ept,
-                True,
-                launch_flags,
-                _device_capability(probs.device.index or 0),
-            )
     stage1_args = (
         probs,
         k_arr,
@@ -1302,9 +1336,9 @@ def top_k_top_p_sampling_from_probs(
         vals,
         idxs,
         cnt,
-        cluster,
-        ept,
-        1 if stream_variant else 0,
+        plan.cluster,
+        plan.ept,
+        1 if plan.stream else 0,
         p_arr,
         p_scalar,
         p_kind,
@@ -1313,10 +1347,10 @@ def top_k_top_p_sampling_from_probs(
         int(philox_seed) & 0xFFFFFFFFFFFFFFFF,
         int(philox_offset) & 0xFFFFFFFFFFFFFFFF,
         1 if renorm_out is not None else 0,
-        launch_flags,
+        plan.launch_flags,
     )
     module.radix_topk(*stage1_args, stream)
-    if fused or fused_block:
+    if plan.one_launch:
         return out
     module.sparse_topp_sample(
         vals,
@@ -1330,9 +1364,9 @@ def top_k_top_p_sampling_from_probs(
         int(philox_seed) & 0xFFFFFFFFFFFFFFFF,
         int(philox_offset) & 0xFFFFFFFFFFFFFFFF,
         1 if renorm_out is not None else 0,
-        threads,
-        items,
-        stage23_variant_flags(probs.device),
+        plan.threads,
+        plan.items,
+        plan.stage23_flags,
         1 if enable_pdl else 0,
         stream,
     )
@@ -1387,7 +1421,9 @@ def top_k_probs_to_slab(
         if isinstance(top_k, int)
         else (int(top_k_max) if top_k_max is not None else int(top_k.max().item()))
     )
-    cluster, ept, stream_variant = choose_stage1(batch, vocab, top_k_max=kmax)
+    cluster, ept, stream_variant, launch_flags = _slab_plan(
+        _device_index(probs.device), int(batch), int(vocab), int(kmax)
+    )
     vals = (
         out_vals
         if out_vals is not None
@@ -1427,20 +1463,7 @@ def top_k_probs_to_slab(
         0,
         0,
         0,
-        # no fused tail, no PDL dependent follows; the speculative- or coarse-sample build on a stream,
-        # the row-span filter arm for a large top-k on a cluster-8 stream
-        _sample_build_flag(
-            cluster,
-            ept,
-            bool(stream_variant),
-            kmax,
-            vocab,
-            batch,
-            _device_capability(probs.device.index or 0),
-        )
-        | _row_span_diet_flag(
-            cluster, bool(stream_variant), kmax, probs.device.index or 0
-        ),
+        launch_flags,  # no fused tail, no PDL dependent follows (see _slab_plan)
         stream,
     )
     return vals, idxs, cnt
