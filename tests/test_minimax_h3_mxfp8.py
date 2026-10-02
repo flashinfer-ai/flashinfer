@@ -154,7 +154,9 @@ def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
         ),
         "q_norm_weight": torch.ones((_HEAD_DIM,), dtype=torch.bfloat16, device=device),
         "k_norm_weight": torch.ones((_HEAD_DIM,), dtype=torch.bfloat16, device=device),
-        "rope_cos_sin": torch.zeros((M, _ROPE_WIDTH), dtype=torch.bfloat16, device=device),
+        "rope_cos_sin": torch.zeros(
+            (M, _ROPE_WIDTH), dtype=torch.bfloat16, device=device
+        ),
         "out_q": torch.ones(
             (P, M, _HEADS // P, _KINDS, _HEAD_DIM),
             dtype=torch.float8_e4m3fn,
@@ -164,7 +166,9 @@ def _prepare_zero_smoke(adaln_index: int, M: int = 1, P: int = 8):
     }
     operation = MiniMaxH3Mxfp8PreAttention(
         **values,
-        activation_q=torch.empty((M, _HIDDEN), dtype=torch.float8_e4m3fn, device=device),
+        activation_q=torch.empty(
+            (M, _HIDDEN), dtype=torch.float8_e4m3fn, device=device
+        ),
         activation_sf=torch.empty(
             (activation_sf_len,), dtype=torch.uint8, device=device
         ),

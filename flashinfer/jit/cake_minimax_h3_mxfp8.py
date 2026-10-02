@@ -169,7 +169,8 @@ def _schedule_constants(M: int, P: int, stage: MiniMaxH3Mxfp8Stage) -> dict[str,
 
 def _binding_source(constants: dict[str, int]) -> str:
     defines = "".join(
-        f"#define CAKE_MINIMAX_H3_MXFP8_{name} {value}\n" for name, value in constants.items()
+        f"#define CAKE_MINIMAX_H3_MXFP8_{name} {value}\n"
+        for name, value in constants.items()
     )
     return (
         "/*\n"
