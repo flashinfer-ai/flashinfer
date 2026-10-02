@@ -98,6 +98,11 @@ _STAGE_VALUES = {
     | (_GEMM_VALUES if stage.startswith("gemm") else set())
     | ({"n_slabs"} if stage == "slab_sum" else set())
     | ({"row_vecs", "num_rows"} if stage == "scale_cast_scatter_bf16" else set())
+    | (
+        {"ld_x_words", "row_vecs", "num_rows"}
+        if stage == cake_backend.HIDDEN_COUNT_STAGE
+        else set()
+    )
     for stage, tensors in STAGE_TENSORS.items()
 }
 
@@ -274,10 +279,15 @@ def test_public_api_is_marked_experimental():
 
 def test_registry_records_are_well_formed():
     assert cake_jit.STAGES == (
+        "gather_rows_bf16",
         "gemm_logits",
         "gemm_logits_g16",
+        "gemm_logits_mcnt",
+        "gemm_logits_mcnt_g16",
         "gemm_logits_nostats",
         "gemm_logits_nostats_g16",
+        "gemm_logits_nostats_mcnt",
+        "gemm_logits_nostats_mcnt_g16",
         "row_finalize",
         "loss_reduce",
         "row_grad",
@@ -950,11 +960,12 @@ def test_geometry_cluster_ctas():
 
 def test_stage_variant_grammar():
     bases = cake_jit.BASE_STAGES
-    assert len(bases) == 13 and set(bases) <= set(cake_jit.STAGES)
+    assert len(bases) == 14 and set(bases) <= set(cake_jit.STAGES)
     for stage in cake_jit.STAGES:
         base, knobs = cake_backend.parse_stage(stage)
         assert base in bases and cake_backend.stage_variant(base, **knobs) == stage
         assert set(knobs) == {
+            "count",
             "k_slices",
             "tile_n",
             "group_m",
@@ -962,6 +973,25 @@ def test_stage_variant_grammar():
             "stages",
             "group_n",
         }
+    # the device-count form of the logits GEMMs (the hidden valid-row count's chunk 0), first in the suffix order
+    assert cake_backend.stage_variant("gemm_logits", count=True) == "gemm_logits_mcnt"
+    assert (
+        cake_backend.stage_variant("gemm_logits_nostats", count=True, group_m=16)
+        == "gemm_logits_nostats_mcnt_g16"
+    )
+    assert cake_backend.parse_stage("gemm_logits_mcnt_g16") == (
+        "gemm_logits",
+        {
+            "count": True,
+            "k_slices": 1,
+            "tile_n": None,
+            "group_m": 16,
+            "epi_store": None,
+            "stages": None,
+            "group_n": None,
+        },
+    )
+    assert cake_backend.base_stage("gemm_logits_nostats_mcnt") == "gemm_logits_nostats"
     assert (
         cake_backend.stage_variant("gemm_dx", k_slices=3, tile_n=256)
         == "gemm_dx_s3_tn256"
@@ -984,6 +1014,7 @@ def test_stage_variant_grammar():
     assert cake_backend.parse_stage("gemm_dx_s2_st3") == (
         "gemm_dx",
         {
+            "count": False,
             "k_slices": 2,
             "tile_n": None,
             "group_m": None,
@@ -1002,10 +1033,22 @@ def test_stage_variant_grammar():
         ),  # the bf16 cast keeps the 1-D raster
         dict(base="gemm_dw_acc", group_n=8),
         dict(base="gemm_logits", group_n=12),
+        dict(
+            base="gemm_dx", count=True
+        ),  # the device-count form exists for the logits GEMMs only
+        dict(base="gemm_dw_acc", count=True),
+        dict(base="row_finalize", count=True),
     ):
         with pytest.raises(ValueError):
             cake_backend.stage_variant(**bad)
-    for bad_name in ("gemm_dw_cast_bf16_gn12", "gemm_dx_tn256_st3", "gemm_dx_gn12"):
+    for bad_name in (
+        "gemm_dw_cast_bf16_gn12",
+        "gemm_dx_tn256_st3",
+        "gemm_dx_gn12",
+        "gemm_dx_mcnt",
+        "gemm_logits_g16_mcnt",  # the suffix order
+        "gemm_logits_mcnt_s2",
+    ):
         with pytest.raises(ValueError):
             cake_backend.parse_stage(bad_name)
     assert (
@@ -1024,6 +1067,7 @@ def test_stage_variant_grammar():
     assert cake_backend.parse_stage("gemm_dw_cast_f32_g16") == (
         "gemm_dw_cast_f32",
         dict(
+            count=False,
             k_slices=1,
             tile_n=None,
             group_m=16,
@@ -1829,6 +1873,11 @@ def test_reachable_variants_complete_the_rule_closure():
     glm_logits = {
         "gemm_logits_g16",
         "gemm_logits_nostats_g16",
+        # the device-count forms of the hidden valid-row count (the default raster and the rule's height)
+        "gemm_logits_mcnt",
+        "gemm_logits_nostats_mcnt",
+        "gemm_logits_mcnt_g16",
+        "gemm_logits_nostats_mcnt_g16",
     }  # the 31-row-tile logits raster
     assert (
         rv(bases, "sm_100a", glm, 4)
@@ -1865,11 +1914,17 @@ def test_reachable_variants_complete_the_rule_closure():
     assert set(cake_jit.STAGES) == set(cake_jit.BASE_STAGES) | rv(
         bases, "sm_103a", wide, 4
     ) | rv(bases, "sm_100a", wide, 4) | rv(bases, "sm_103a", glm, 4)
-    assert len(cake_jit.STAGES) == 34
+    assert len(cake_jit.STAGES) == 39
     unpinned = Geometry.from_record(None)
-    assert rv(bases, "sm_100a", unpinned, 4) == dx_all | {
-        "gemm_dw_acc"
-    }  # no pinned H: no raster variants required
+    assert (
+        rv(bases, "sm_100a", unpinned, 4)
+        == dx_all
+        | {
+            "gemm_dw_acc",
+            "gemm_logits_mcnt",
+            "gemm_logits_nostats_mcnt",
+        }
+    )  # no pinned H: no raster variants required; the device-count forms at the default raster
 
 
 def test_cluster_resident_rule():
@@ -2223,6 +2278,7 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_and_options():
         dict(entry="logprob"),
         dict(fuse_dw_cast=True),
         dict(gemm_tuning={"logits": {"group_m": 16}}),
+        dict(hidden_count=True),
     ):
         assert base != forward_binding_key(X, W, labels, **dict(common, **option)), (
             option
@@ -2261,6 +2317,17 @@ def test_binding_keys_cover_pointer_shape_stride_dtype_and_options():
     )
     assert bwd != logprob_backward_binding_key(
         X, W, labels, lse, dlogp, chunk_size=4096, need_dx=True, need_dw=False
+    )
+    assert bwd != logprob_backward_binding_key(
+        X,
+        W,
+        labels,
+        lse,
+        dlogp,
+        chunk_size=4096,
+        need_dx=True,
+        need_dw=True,
+        hidden_count=True,
     )
     assert bwd != logprob_backward_binding_key(
         X, W, labels, lse, dlogp, chunk_size=2048, need_dx=True, need_dw=True
@@ -3043,6 +3110,242 @@ def test_dx_finalize_default_env(monkeypatch):
     assert cake_backend._resolve_dx_finalize(False) is False
 
 
+def test_hidden_count_default_env(monkeypatch):
+    monkeypatch.delenv(cake_backend.HIDDEN_COUNT_ENV, raising=False)
+    assert cake_backend.hidden_count_default() is True
+    assert cake_backend.HIDDEN_COUNT_STAGE == "gather_rows_bf16"
+    assert cake_backend.HIDDEN_COUNT_STAGE in cake_jit.BASE_STAGES
+    assert cake_backend.HIDDEN_COUNT_STAGE in cake_jit.ROW_STAGES
+    assert STAGE_TENSORS[cake_backend.HIDDEN_COUNT_STAGE] == (
+        "x",
+        "idx_lo",
+        "count",
+        "out",
+    )
+    monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, "0")
+    assert cake_backend.hidden_count_default() is False
+    monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, "1")
+    assert cake_backend.hidden_count_default() is True
+
+
+def test_compaction_index_matches_nonzero():
+    """The device compaction (``labels >= 0`` -> inclusive int32 scan -> ``searchsorted``) gives the ascending valid rows
+    in the first ``count`` slots (``== nonzero``) and ``T`` in every slot after them, for some / no / every row ignored
+    and a one-row call; pre-allocated outputs and a longer cached constant give the same index."""
+    for labels in (
+        torch.tensor([3, IGNORE_INDEX, 0, IGNORE_INDEX, 7]),
+        torch.tensor([IGNORE_INDEX] * 4),
+        torch.tensor([1, 2, 3]),
+        torch.tensor([5]),
+        torch.tensor([IGNORE_INDEX]),
+        torch.tensor([IGNORE_INDEX, IGNORE_INDEX, 9]),
+    ):
+        T = labels.numel()
+        valid, pos, idx_full = cake_backend.compaction_index(labels)
+        assert torch.equal(valid, labels >= 0) and valid.dtype == torch.bool
+        assert pos.dtype == torch.int32 and torch.equal(
+            pos, torch.cumsum(labels >= 0, 0, dtype=torch.int32)
+        )
+        count = int(pos[-1])
+        assert idx_full.dtype == torch.int64 and tuple(idx_full.shape) == (T,)
+        assert torch.equal(idx_full[:count], (labels >= 0).nonzero().reshape(-1))
+        assert torch.all(idx_full[count:] == T)
+        outs = dict(
+            valid=torch.empty(T, dtype=torch.bool),
+            pos=torch.empty(T, dtype=torch.int32),
+            idx_full=torch.empty(T, dtype=torch.int64),
+        )
+        ar = torch.arange(1, T + 9, dtype=torch.int32)
+        v2, p2, i2 = cake_backend.compaction_index(labels, ar=ar, **outs)
+        assert v2 is outs["valid"] and p2 is outs["pos"] and i2 is outs["idx_full"]
+        assert (
+            torch.equal(v2, valid)
+            and torch.equal(p2, pos)
+            and torch.equal(i2, idx_full)
+        )
+
+
+def test_hidden_count_plan_keys():
+    """A plan of the hidden valid-row count skips chunk 0's host gather and logits GEMM (both ran in device-count form
+    before the count was known), records the device-count stage at the buffer extent ``min(C, T)`` and lists it with
+    the gather kernel in its stages; the log-probability backward does the same with the recompute form; the plan
+    needs the program's architecture."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+    common = dict(
+        need_dx=True,
+        need_dw=True,
+        geometry=g,
+        dx_max_slices=4,
+        num_sms=148,
+        dx_resident=74,
+        fuse_dw_cast=True,
+        dx_finalize=True,
+    )
+    problem = _problem(8700, 6144, 154880, 4096)
+    plain = cake_backend.make_plan(problem, valid_rows=8265, arch="sm_100a", **common)
+    hidden = cake_backend.make_plan(
+        problem, valid_rows=8265, arch="sm_100a", hidden_count=True, **common
+    )
+    assert not plain.hidden_count and hidden.hidden_count and hidden.hidden_stats
+    assert hidden.chunks == plain.chunks == ((0, 4096), (4096, 4096), (8192, 73))
+    # the buffer extent min(C, T) = 4096 rows takes the long logits raster: the device-count form at g16
+    assert hidden.hidden_logits_group_m == 16
+    assert hidden.hidden_logits_stage() == "gemm_logits_mcnt_g16"
+    keys, plain_keys = (
+        cake_backend.forward_keys(hidden),
+        cake_backend.forward_keys(plain),
+    )
+    assert plain_keys[:3] == (
+        ("gather_rows", 0),
+        ("gemm_logits_g16", 0),
+        ("row_finalize", 0),
+    )
+    assert keys == plain_keys[2:]  # chunk 0's gather and logits GEMM are already queued
+    assert ("gather_rows", 1) in keys and ("gemm_logits_g16", 1) in keys
+    assert set(hidden.stages) == set(plain.stages) | {
+        "gather_rows_bf16",
+        "gemm_logits_mcnt_g16",
+    }
+    assert list(hidden.stages) == [s for s in cake_jit.STAGES if s in hidden.stages]
+    assert cake_backend.cast_keys(hidden) == cake_backend.cast_keys(plain)
+    # the log-probability backward: the recompute GEMM without the statistics, chunk 0's already queued
+    lp = cake_backend.make_plan(
+        _problem(8700, 6144, 154880, 4096, entry="logprob"),
+        valid_rows=8265,
+        arch="sm_100a",
+        hidden_count=True,
+        hidden_stats=False,
+        **common,
+    )
+    rk = cake_backend.recompute_keys(lp)
+    prk = cake_backend.recompute_keys(replace(lp, hidden_count=False))
+    assert prk[:3] == (
+        ("gather_rows", "d_in"),
+        ("gather_rows", 0),
+        ("gemm_logits_nostats_g16", 0),
+    )
+    assert rk == prk[:1] + prk[3:]
+    assert lp.hidden_logits_stage() == "gemm_logits_nostats_mcnt_g16"
+    assert "gemm_logits_nostats_mcnt_g16" in lp.stages
+    # every row valid: the uncompacted plan with chunk 0's GEMM skipped; 1500 rows take the default raster
+    full = cake_backend.make_plan(
+        _problem(1500, 6144, 154880, 4096), arch="sm_100a", hidden_count=True, **common
+    )
+    assert not full.compact and full.hidden_logits_stage() == "gemm_logits_mcnt"
+    assert cake_backend.forward_keys(full)[0] == ("row_finalize", 0)
+    assert cake_backend.forward_keys(replace(full, hidden_count=False))[0] == (
+        "gemm_logits",
+        0,
+    )
+    with pytest.raises(ValueError, match="arch"):
+        cake_backend.make_plan(
+            _problem(1500, 6144, 154880, 4096), hidden_count=True, **common
+        )
+
+
+def test_hidden_count_eligibility_rules(monkeypatch):
+    """A compacted call runs the hidden valid-row count only with a registered program that carries the gather kernel
+    and the device-count form of chunk 0's logits GEMM at the buffer extent's raster, ``T > 0`` and an ``X`` the GEMM
+    reads in place (no contiguous copy, a 16-byte-aligned base)."""
+    name = "cake_lm_head_loss_fake"
+
+    def record(*stages):
+        rec = _fake_record(_ROW_GRAD_PLAN)
+        rec["stages"] = list(stages)
+        for stage in stages:
+            rec[stage] = rec["row_grad"]
+        return rec
+
+    elig = cake_backend.hidden_count_eligible
+    full = record(
+        "row_grad",
+        "gather_rows_bf16",
+        "gemm_logits_mcnt",
+        "gemm_logits_mcnt_g16",
+        "gemm_logits_nostats_mcnt",
+    )
+    monkeypatch.setitem(cake_jit.MODULES, name, full)
+    X = torch.empty(
+        4097, 6144, dtype=torch.bfloat16
+    )  # host tensor: the rule reads the pointer and the stride only
+    p = _problem(4097, 6144, 154880, 4096)
+    assert elig(
+        p, X, full, name, stats=True
+    )  # buffer extent 4096 rows: the g16 device-count form is registered
+    assert not elig(
+        p, X, full, name, stats=False
+    )  # the long-raster recompute form is missing
+    short = _problem(1500, 6144, 154880, 4096)
+    assert elig(
+        short, X[:1500], full, name, stats=False
+    )  # 1500 rows: the default raster
+    assert not elig(p, X, None, None, stats=True)  # no registered program
+    assert not elig(_problem(0, 6144, 154880, 4096), X[:0], full, name, stats=True)
+    assert not elig(
+        replace(p, x_copy=True), X, full, name, stats=True
+    )  # X needs a contiguous copy
+    n = 4097 * 6144
+    misaligned = torch.empty(n + 8, dtype=torch.bfloat16)[4 : 4 + n].view(4097, 6144)
+    assert misaligned.data_ptr() % 16 == 8
+    assert not elig(p, misaligned, full, name, stats=True)
+    aligned = torch.empty(n + 8, dtype=torch.bfloat16)[8 : 8 + n].view(4097, 6144)
+    assert aligned.data_ptr() % 16 == 0 and elig(p, aligned, full, name, stats=True)
+    without_gather = record("row_grad", "gemm_logits_mcnt", "gemm_logits_mcnt_g16")
+    monkeypatch.setitem(cake_jit.MODULES, name, without_gather)
+    assert not elig(p, X, without_gather, name, stats=True)
+    without_long = record("row_grad", "gather_rows_bf16", "gemm_logits_mcnt")
+    monkeypatch.setitem(cake_jit.MODULES, name, without_long)
+    assert not elig(p, X, without_long, name, stats=True)
+    assert elig(short, X[:1500], without_long, name, stats=True)
+
+
+_HIDDEN_COUNT_HOST_CASES = [  # (T, C, objective, entry, ignored fraction): three chunks + tail, T < C, T = C + 1, T = C
+    (37, 16, "ce", "loss", "five_percent"),
+    (37, 16, "policy", "loss", "half"),
+    (37, 16, "ce", "logprob", "five_percent"),
+    (37, 16, "ce", "loss", "all"),
+    (37, 16, "ce", "logprob", "none"),
+    (10, 16, "ce", "loss", "half"),
+    (17, 16, "ce", "logprob", "all_but_one"),
+    (16, 16, "policy", "loss", "none"),
+]
+
+
+@pytest.mark.parametrize(
+    "T, C, objective, entry, frac",
+    _HIDDEN_COUNT_HOST_CASES,
+    ids=[f"{t}_{c}_{o}_{e}_{f}" for t, c, o, e, f in _HIDDEN_COUNT_HOST_CASES],
+)
+def test_hidden_count_switch_is_inert_on_the_reference_backend(
+    T, C, objective, entry, frac, monkeypatch
+):
+    """The reference backend has no device-count kernels: the switch never consults the registry (``record_for`` is not
+    called) and ``loss`` / ``logp`` / ``dX`` / ``dW`` are bitwise the same with it on and off."""
+
+    def refuse(*args, **kwargs):
+        raise AssertionError(
+            "the reference backend must not consult the registry for the hidden valid-row count"
+        )
+
+    monkeypatch.setattr(cake_backend, "record_for", refuse)
+    ignore = {
+        "none": 0.0,
+        "five_percent": 0.05,
+        "half": 0.5,
+        "all_but_one": (T - 1) / T,
+        "all": 1.0,
+    }[frac]
+    inp = _host_inputs(T, objective, ignore_frac=ignore)
+    out = {}
+    for env in ("0", "1"):
+        monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, env)
+        out[env] = _run(inp, C, entry=entry, compact_rows=True)
+        _check_dtypes(out[env], inp)
+        assert torch.all(out[env]["dX"][~inp.valid] == 0)
+    for key in ("loss", "logp", "dX", "dW"):
+        assert torch.equal(out["1"][key], out["0"][key]), key
+
+
 def test_valid_rows_mask():
     labels = torch.tensor([3, IGNORE_INDEX, 0, IGNORE_INDEX, 7])
     idx, mask = cake_backend.valid_rows(labels, mask=True)
@@ -3763,7 +4066,29 @@ def test_memory_report_compaction():
         and plain["valid_rows"] == T
         and plain["gather_bytes"] == 0
         and "x_c" not in plain["temporary"]
+        and plain["hidden_count"] is False
     )
+    # the hidden valid-row count: the chunk buffers and the gather buffer exist at the buffer extent min(C, T) before the
+    # count is known -- on the compacted outcome and on the uncompacted one (which gathers chunk 0 all the same)
+    rows0 = min(C, T)
+    hidden = memory_report(T, H, V, C, valid_rows=T_v, hidden_count=True)
+    assert (
+        hidden["hidden_count"]
+        and hidden["compact_rows"]
+        and hidden["valid_rows"] == T_v
+    )
+    assert hidden["temporary"]["logits"] == rows0 * V * 2
+    assert hidden["gather_bytes"] == hidden["temporary"]["x_c"] == rows0 * H * 2
+    assert hidden["temporary_bytes"] == sum(hidden["temporary"].values())
+    assert (
+        hidden["outputs"] == plain["outputs"] and hidden["weights"] == plain["weights"]
+    )
+    full = memory_report(T, H, V, C, hidden_count=True)
+    assert full["hidden_count"] and not full["compact_rows"]
+    assert full["gather_bytes"] == full["temporary"]["x_c"] == rows0 * H * 2
+    assert full["temporary"]["logits"] == plain["temporary"]["logits"] == rows0 * V * 2
+    assert full["temporary_bytes"] == plain["temporary_bytes"] + rows0 * H * 2
+    assert memory_report(T, H, V, C, valid_rows=0, hidden_count=True)["num_chunks"] == 0
     m = memory_report(T, H, V, C, valid_rows=T_v, dx_finalize=False)
     assert (
         m["compact_rows"]
@@ -4390,12 +4715,14 @@ def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
             valid_rows=int(inp.valid.sum()),
             fuse_dw_cast=cake_backend.fuse_dw_cast_default(),
             dx_finalize=cake_backend.dx_finalize_default(),
+            hidden_count=cake_backend.hidden_count_default(),
             **kw,
         )
         binding = cache.peek(key)
         assert (
             binding is not None and binding.holds_no_tensor() and binding.plan.compact
         )
+        assert binding.plan.hidden_count is cake_backend.hidden_count_default()
         assert set(binding.owned) <= {"workspace", "tma_descriptor_workspace"}
         assert cache.owned_bytes == sum(
             t.numel() * t.element_size() for t in binding.owned.values()
@@ -4764,7 +5091,14 @@ def test_device_fused_dw_cast_is_bitwise(glm_weight):
         # the saved rows are a view of the chunk buffer, the storage that stays alive until the backward: the report
         # counts that buffer (not the rows), and the first call of a binding retains no more than the later ones
         saved = int(fr.memory["saved_dz_bytes"])
-        assert saved == min(C, int(fr.memory["valid_rows"])) * inp.V * 2
+        # the hidden valid-row count sizes the chunk buffer at min(C, T) before the count is known (the shipped path
+        # at min(C, valid rows))
+        buffer_rows = (
+            min(C, inp.T)
+            if fr.memory["hidden_count"]
+            else min(C, int(fr.memory["valid_rows"]))
+        )
+        assert saved == buffer_rows * inp.V * 2
         assert int(fr.dz_last.untyped_storage().nbytes()) == saved
         assert int(fr.dz_last.numel()) * 2 <= saved
         fr2 = cake_backend.forward_loss(
@@ -4991,3 +5325,216 @@ def test_device_dx_finalize_is_bitwise(glm_weight, monkeypatch):
         "scale_cast_scatter_bf16",
         "scale_cast_bf16",
     ]  # the eager scatter kernel, then the shipped flat cast
+
+
+def test_device_hidden_count_kernels_match_torch(glm_weight):
+    """Chunk 0's row gather and device-count logits GEMM against the torch gather and the shipped host-bound GEMM over
+    the same rows: the count arrives through the pinned cell, the gathered rows are ``X``'s valid rows in order (exact
+    zeros after the count), and the logits and row statistics of the counted rows are bitwise the host-bound form's."""
+    _require_program(entry="logprob")
+    name, record = cake_backend.record_for(CUDA, DEFAULT_H, DEFAULT_V)
+    for T, ignore in ((1500, 0.05), (1500, 0.0), (4097, 0.5), (300, 1.0)):
+        inp = make_inputs(
+            T, seed=SEED + 62 + T, device=CUDA, W=glm_weight, ignore_frac=ignore
+        )
+        problem = validate_lm_head_inputs(
+            inp.X, inp.W, inp.labels, chunk_size=4096, entry="logprob"
+        )
+        assert cake_backend.hidden_count_eligible(
+            problem, inp.X, record, name, stats=True
+        )
+        hc = cake_backend._hidden_count_begin(
+            problem,
+            inp.X,
+            inp.W,
+            inp.labels,
+            record=record,
+            module_name=name,
+            stats=True,
+        )
+        count = hc.finish()
+        n_valid = int(inp.valid.sum())
+        assert count == n_valid and hc.rows0 == min(4096, T) and hc.count == count
+        idx = inp.valid.nonzero().reshape(-1)
+        assert torch.equal(hc.valid, inp.valid)
+        assert torch.equal(hc.idx_full[:count], idx)
+        assert torch.all(hc.idx_full[count:] == T)
+        row_index = hc.row_index()
+        if count == T:
+            assert row_index is None
+        else:
+            assert torch.equal(row_index, idx)
+        n0 = min(count, hc.rows0)
+        assert torch.equal(hc.x_c[:n0], inp.X.index_select(0, idx[:n0]))
+        assert torch.all(hc.x_c[n0:] == 0)
+        if n0 == 0:
+            continue
+        # the shipped host-bound GEMM over the same rows (the log-probability forward keeps the logits intact)
+        runner = prepare_lm_head_loss(
+            inp.X,
+            inp.W,
+            inp.labels,
+            chunk_size=4096,
+            need_dx=False,
+            need_dw=False,
+            entry="logprob",
+            backend="cake",
+            compact_rows=False if count == T else idx[:n0],
+        )
+        assert runner.plan.num_chunks == 1 and runner.plan.chunks[0][1] == n0
+        runner.forward()
+        torch.cuda.synchronize()
+        assert torch.equal(hc.logits[:n0], runner.tensors["logits"][:n0])
+        assert torch.equal(hc.stats_buf[:n0], runner.tensors["stats"][:n0])
+        assert hc.stage == cake_backend.stage_variant(
+            "gemm_logits",
+            count=True,
+            group_m=cake_backend.parse_stage(runner.plan.logits_stage(0))[1]["group_m"]
+            if n0 == hc.rows0
+            else cake_backend.raster_variant(DEFAULT_H, hc.rows0, record["arch"])[0]
+            if cake_backend.raster_variant(DEFAULT_H, hc.rows0, record["arch"])
+            else None,
+        )
+
+
+def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
+    """The hidden valid-row count on the generated program: switch ``0`` (the count and the index on the host before
+    the first launch) and ``1`` (device compaction, chunk 0's gather kernel and device-count logits GEMM queued before
+    the count is read) give bitwise the same ``loss`` / ``logp`` / ``dX`` / ``dW`` on both entries over the three
+    outcomes (some rows ignored, none, all) and over one-, two- and three-chunk calls; with the switch on the count is
+    read only after both launches are queued and the host count is never taken; the remembered binding serves the
+    switch."""
+    _require_program(entry="loss")
+    _require_program(entry="logprob")
+    real_bind_all = cake_backend._bind_all
+    real_finish = cake_backend._HiddenCount.finish
+    real_stream = cake_backend._ffi_stream_context
+    real_valid_rows = cake_backend.valid_rows
+    log: list = []
+
+    def spy_bind_all(record, module_name, keys, values, device, geometry):
+        log.extend(("bind", k[0]) for k in keys)
+        return real_bind_all(record, module_name, keys, values, device, geometry)
+
+    def spy_stream(index):
+        log.append(("launch", ""))
+        return real_stream(index)
+
+    def spy_finish(self):
+        log.append(("finish", self.stage))
+        return real_finish(self)
+
+    def refuse_valid_rows(*args, **kwargs):
+        raise AssertionError("the hidden valid-row count must not count on the host")
+
+    monkeypatch.setattr(cake_backend, "_bind_all", spy_bind_all)
+    monkeypatch.setattr(cake_backend, "_ffi_stream_context", spy_stream)
+    monkeypatch.setattr(cake_backend._HiddenCount, "finish", spy_finish)
+    gather = cake_backend.HIDDEN_COUNT_STAGE
+    cases = [
+        (1500, "ce", 0.0),
+        (1500, "ce", 0.05),
+        (1500, "policy", 0.05),
+        (1500, "ce", (1500 - 1) / 1500),
+        (1500, "policy", 1.0),
+        (4097, "ce", 0.05),
+        (4097, "ce", 0.5),
+        (8700, "ce", 0.05),
+    ]
+    for T, objective, ignore in cases:
+        inp = make_inputs(
+            T,
+            objective=objective,
+            seed=SEED + 62 + T,
+            device=CUDA,
+            W=glm_weight,
+            ignore_frac=ignore,
+        )
+        n_valid = int(inp.valid.sum())
+        out = {}
+        for env in ("0", "1"):
+            monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, env)
+            monkeypatch.setattr(
+                cake_backend,
+                "valid_rows",
+                refuse_valid_rows if env == "1" else real_valid_rows,
+            )
+            with _cache(False):
+                log.clear()
+                res = {"loss": _run(inp, 4096, backend="cake", compact_rows=True)}
+                if objective == "ce":
+                    res["logprob"] = _run(
+                        inp, 4096, entry="logprob", backend="cake", compact_rows=True
+                    )
+                fr = cake_backend.forward_loss(
+                    inp.X,
+                    inp.W,
+                    inp.labels,
+                    objective=objective,
+                    loss_div=inp.loss_div if objective == "ce" else None,
+                    infer_logp=inp.infer_logp,
+                    loss_weights=inp.loss_weights,
+                    chunk_size=4096,
+                    backend="cake",
+                    compact_rows=True,
+                )
+                torch.cuda.synchronize()
+            binds = [s for kind, s in log if kind == "bind"]
+            counted = [
+                s
+                for s in binds
+                if s != gather
+                and s not in cake_backend.HOST_STAGES
+                and cake_backend.parse_stage(s)[1]["count"]
+            ]
+            assert (fr.row_index is None) == (n_valid == T)
+            if env == "0":
+                assert gather not in binds and not counted
+                assert not any(kind == "finish" for kind, _ in log)
+                assert fr.memory["hidden_count"] is False
+            else:
+                # the loss forward, the log-probability forward and its backward (ce), the explicit forward: each
+                # queues the gather and chunk 0's device-count GEMM, then reads the count
+                expect = 4 if objective == "ce" else 2
+                assert binds.count(gather) == expect, binds
+                assert len(counted) == expect, binds
+                finishes = [i for i, (kind, _) in enumerate(log) if kind == "finish"]
+                assert len(finishes) == expect
+                for i in finishes:
+                    j = max(k for k in range(i) if log[k] == ("bind", gather))
+                    assert any(log[k][0] == "launch" for k in range(j, i)), (
+                        "the count was read before the launches were queued"
+                    )
+                if n_valid:
+                    assert fr.memory["hidden_count"] is True
+                    assert fr.memory["gather_bytes"] == min(4096, T) * DEFAULT_H * 2
+                else:
+                    assert fr.memory["num_chunks"] == 0
+            if n_valid == 0:
+                assert torch.all(res["loss"]["dX"] == 0) and torch.all(
+                    res["loss"]["dW"] == 0
+                )
+            assert torch.all(res["loss"]["dX"][~inp.valid] == 0)
+            res["explicit"] = dict(
+                loss=fr.loss, logp=fr.logp, dX=fr.dx_acc, dW=fr.dw_acc
+            )
+            out[env] = res
+        for entry in out["1"]:
+            for key in ("loss", "logp", "dX", "dW"):
+                a, b = out["1"][entry].get(key), out["0"][entry].get(key)
+                assert _same(a, b), (T, objective, ignore, entry, key)
+    monkeypatch.setattr(cake_backend, "valid_rows", real_valid_rows)
+    # the remembered binding of the hidden-count path: a hit is bitwise the validating call
+    monkeypatch.setenv(cake_backend.HIDDEN_COUNT_ENV, "1")
+    inp = make_inputs(4097, seed=SEED + 63, device=CUDA, W=glm_weight, ignore_frac=0.05)
+    with _cache(True) as cache:
+        cache.clear()
+        first = _run(inp, 4096, backend="cake", compact_rows=True)
+        second = _run(inp, 4096, backend="cake", compact_rows=True)
+        assert cache.hits >= 1 and len(cache) >= 1
+        for key in ("loss", "logp", "dX", "dW"):
+            assert torch.equal(first[key], second[key]), key
+        lp1 = _run(inp, 4096, entry="logprob", backend="cake", compact_rows=True)
+        lp2 = _run(inp, 4096, entry="logprob", backend="cake", compact_rows=True)
+        for key in ("logp", "dX", "dW"):
+            assert torch.equal(lp1[key], lp2[key]), key

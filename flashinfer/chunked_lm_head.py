@@ -141,6 +141,14 @@ def chunked_lm_head_loss(
     the tail of the chunk's ``dX`` GEMM; the same kernels in the same order per
     kernel, so every output is bitwise the same.
 
+    The hidden valid-row count (``FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT``,
+    on unless set to ``0``) forms a compacted call's valid-row index on the
+    device and queues chunk 0's row gather and logits GEMM (its device-count
+    form, bounded by the count read from device memory) before the count
+    reaches the host through a pinned cell and a CUDA event, instead of
+    counting and indexing on the host before the first launch; the same
+    kernels per row, so every output is bitwise the same.
+
     Returns
     -------
     loss : torch.Tensor

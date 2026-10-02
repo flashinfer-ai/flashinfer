@@ -87,6 +87,25 @@ Contract
   ``dX`` / ``dW`` are bitwise the single-stream path's.  Two-chunk calls pay
   the join without an overlap gain and a one-chunk call defers its only
   accumulate to the backward, hence the ``auto`` rule (:func:`dw_side_stream`).
+* Hidden valid-row count (default on unless
+  ``FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT=0``; ``cake`` backend only): a
+  compacted call forms its valid-row index on the device (``labels >= 0`` ->
+  inclusive int32 ``cumsum`` -> ``searchsorted``), gathers chunk 0's rows of
+  ``X`` with the ``gather_rows_bf16`` kernel and runs chunk 0's logits GEMM in
+  its device-count form (``gemm_logits_mcnt`` / ``gemm_logits_nostats_mcnt``:
+  the stores bounded by the count read from device memory, the buffer extent
+  ``min(chunk_size, T)`` as ``M``) before the count reaches the host through a
+  pinned cell and a CUDA event -- the host waits for the three compaction
+  kernels and a 4-byte copy instead of a ``sum().item()`` and a ``nonzero``
+  before the first launch (:func:`_hidden_count_begin`).  Every row valid: the
+  uncompacted plan with chunk 0's GEMM already done (its ``X`` rows for the
+  weight gradient stay the input view); every row ignored: zeros without a
+  further launch; otherwise the compacted plan over the counted rows with
+  chunk 0's gather and GEMM skipped.  The same kernels per row, so ``loss`` /
+  ``logp`` / ``dX`` / ``dW`` are bitwise the shipped path's (``0`` restores
+  it).  Calls the device-count GEMM cannot serve -- an ``X`` that needs a
+  contiguous copy or whose base is not 16-byte aligned, a program without the
+  kernels -- take the shipped path.
 * ``deterministic=True`` (the only mode this backend serves): fixed sequential
   chunk order, no atomics -- bitwise reproducible ``loss``, ``logp``, ``dX``
   and ``dW`` across runs.
@@ -213,6 +232,7 @@ STAGE_TENSORS = {
     "scale_cast_f32": ("acc", "g", "out"),
     "slab_sum": ("dx", "ws"),
     "scale_cast_scatter_bf16": ("acc", "g", "scan", "idx_lo", "out"),
+    "gather_rows_bf16": ("x", "idx_lo", "count", "out"),
 }
 COMMON_TENSORS = ("workspace", "tma_descriptor_workspace")
 COMMON_SCALARS = (
@@ -253,6 +273,13 @@ DW_CAST_STAGES = ("gemm_dw_cast_bf16", "gemm_dw_cast_f32")
 # exactly on the valid rows), exact zeros elsewhere -- the flat ``scale_cast``, the zero fill and the ``index_copy_``
 # of the compact rows in one kernel that writes every output element once.  Bitwise the same ``dX``.
 DX_FINALIZE_STAGES = ("slab_sum", "scale_cast_scatter_bf16")
+# Hidden valid-row count (:func:`hidden_count_default`, default on): chunk 0's rows of ``X`` are gathered by the
+# ``gather_rows_bf16`` kernel -- ``out[r] = X[idx[r]]`` for ``r < min(count, num_rows)`` with the count read from device
+# memory, exact zeros after; ``x`` is the int32 alias of ``X``'s storage span (``ld_x_words`` = the row pitch in 4-byte words),
+# ``idx_lo`` the int64 compaction index viewed as int32 pairs, ``count`` the int32 cell -- and chunk 0's logits GEMM runs in
+# its device-count form (the ``_mcnt`` variants: ``WS`` is that cell and every store is bounded by ``min(WS[0], M)`` while
+# ``M`` / ``m_tiles`` / the raster rule are the buffer extent ``min(chunk, T)``), both before the count reaches the host.
+HIDDEN_COUNT_STAGE = "gather_rows_bf16"
 K_SLICE_PENALTY = 0.01  # wave-efficiency score penalty per extra slab (the kernels' fitted per-slab cost share)
 
 # --------------------------------------------------------------------------- per-chunk instance rules
@@ -335,7 +362,7 @@ _TUNING_KNOBS = {
 }
 _STAGE_RE = re.compile(
     r"(?P<base>" + "|".join(sorted(BASE_STAGES, key=len, reverse=True)) + r")"
-    r"(?:_s(?P<k>[2-9]))?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?:_g(?P<group>\d+))?(?:_gn(?P<group_n>\d+))?(?P<tma>_tma)?"
+    r"(?P<mcnt>_mcnt)?(?:_s(?P<k>[2-9]))?(?:_tn(?P<tile>\d+))?(?:_st(?P<stages>\d+))?(?:_g(?P<group>\d+))?(?:_gn(?P<group_n>\d+))?(?P<tma>_tma)?"
 )
 
 
@@ -348,14 +375,22 @@ def stage_variant(
     epi_store: Optional[str] = None,
     stages: Optional[int] = None,
     group_n: Optional[int] = None,
+    count: bool = False,
 ) -> str:
     """Stage name of one instance variant of ``base``: the rule outputs that select it, in the fixed suffix order
-    ``_s<k>``, ``_tn256``, ``_st<stages>``, ``_g<group_m>``, ``_gn<group_n>``, ``_tma``; a default output (one slice, the
-    wide tile, the table ring depth, no raster override, the 1-D raster, the default epilogue) adds nothing, so
-    ``stage_variant(base)`` is ``base`` itself."""
+    ``_mcnt``, ``_s<k>``, ``_tn256``, ``_st<stages>``, ``_g<group_m>``, ``_gn<group_n>``, ``_tma``; a default output (the
+    host-bound row count, one slice, the wide tile, the table ring depth, no raster override, the 1-D raster, the default
+    epilogue) adds nothing, so ``stage_variant(base)`` is ``base`` itself.  ``count``: the logits GEMM whose valid-row bound
+    is read from device memory (chunk 0 of the hidden valid-row count path)."""
     if base not in BASE_STAGES:
         raise ValueError(f"unknown base stage {base!r}")
     name = base
+    if count:
+        if base not in ("gemm_logits", "gemm_logits_nostats"):
+            raise ValueError(
+                f"{base}: the device-count form exists for the logits GEMMs only"
+            )
+        name += "_mcnt"
     if int(k_slices) > 1:
         if base != "gemm_dx" or not 1 <= int(k_slices) <= DX_K_SLICES_MAX:
             raise ValueError(
@@ -400,12 +435,13 @@ def stage_variant(
 
 
 def parse_stage(stage: str) -> tuple[str, dict[str, Any]]:
-    """``(base, {k_slices, tile_n, group_m, epi_store, stages, group_n})`` of a stage name (the inverse of
+    """``(base, {k_slices, tile_n, group_m, epi_store, stages, group_n, count})`` of a stage name (the inverse of
     :func:`stage_variant`)."""
     m = _STAGE_RE.fullmatch(stage)
     if m is None:
         raise ValueError(f"not a stage name of this backend: {stage!r}")
     knobs: dict[str, Any] = dict(
+        count=bool(m["mcnt"]),
         k_slices=int(m["k"]) if m["k"] else 1,
         tile_n=int(m["tile"]) if m["tile"] else None,
         group_m=int(m["group"]) if m["group"] else None,
@@ -668,6 +704,11 @@ def reachable_variants(bases, arch: str, geometry: "Geometry", dx_max: int) -> s
         if base in ("gemm_logits", "gemm_logits_nostats"):
             if g_logits is not None:
                 out.add(stage_variant(base, group_m=g_logits))
+            # the device-count forms of the hidden valid-row count path (chunk 0 at the buffer extent min(chunk, T): the
+            # default raster and the rule's height)
+            out.add(stage_variant(base, count=True))
+            if g_logits is not None:
+                out.add(stage_variant(base, count=True, group_m=g_logits))
         elif base == "gemm_dx":
             for k in range(1, int(dx_max) + 1):
                 for tile in (DX_TILE_WIDE, DX_TILE_NARROW):
@@ -1097,6 +1138,290 @@ def _dw_stream(index: int) -> tuple:
     return pair
 
 
+HIDDEN_COUNT_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT"  # "0" turns the hidden valid-row count off (the before / after switch)
+
+
+def hidden_count_default() -> bool:
+    """Default of the hidden valid-row count (``cake`` backend, compacted calls): the valid-row index is formed on the
+    device and chunk 0's row gather (:data:`HIDDEN_COUNT_STAGE`) and logits GEMM (its ``_mcnt`` variant, the stores
+    bounded by the count read from device memory) are launched before the count reaches the host through a pinned cell
+    and a CUDA event (:func:`_hidden_count_begin`) unless ``$FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT`` is ``0`` (then
+    :func:`valid_rows` counts and indexes on the host before the first launch; bitwise the same outputs).  Read once per
+    call."""
+    return os.environ.get(HIDDEN_COUNT_ENV, "1") != "0"
+
+
+def compaction_index(
+    labels: torch.Tensor,
+    *,
+    valid: Optional[torch.Tensor] = None,
+    pos: Optional[torch.Tensor] = None,
+    idx_full: Optional[torch.Tensor] = None,
+    ar: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The valid-row compaction on the device (no host synchronization): ``valid = labels >= 0``, ``pos`` = its
+    inclusive int32 scan and ``idx_full[k] = searchsorted(pos, k + 1)`` -- the ascending original row of the ``k``-th
+    valid row for ``k < count`` (``== valid.nonzero()``) and ``T`` for every slot after it, ``count = pos[T - 1]``.
+    Pre-allocated outputs (``valid`` bool ``[T]``, ``pos`` int32 ``[T]``, ``idx_full`` int64 ``[T]``) and the int32
+    constant ``ar = 1, 2, ..`` (``>= T`` entries; a cached prefix) keep the call at three kernels.  Returns
+    ``(valid, pos, idx_full)``."""
+    T = int(labels.numel())
+    if ar is None:
+        ar = torch.arange(1, T + 1, dtype=torch.int32, device=labels.device)
+    valid = torch.ge(labels, 0, out=valid) if valid is not None else labels >= 0
+    pos = (
+        torch.cumsum(valid, 0, dtype=torch.int32, out=pos)
+        if pos is not None
+        else torch.cumsum(valid, 0, dtype=torch.int32)
+    )
+    idx_full = (
+        torch.searchsorted(pos, ar[:T], out=idx_full)
+        if idx_full is not None
+        else torch.searchsorted(pos, ar[:T])
+    )
+    return valid, pos, idx_full
+
+
+_HIDDEN_COUNT_CELLS: dict[
+    int, tuple
+] = {}  # device index -> (pinned int32 [1] cell, event); one pair per device, reused by every call
+_HIDDEN_COUNT_ARANGE: dict[
+    int, torch.Tensor
+] = {}  # device index -> the growing int32 constant 1, 2, ... (no kernel per call)
+
+
+def _hidden_count_cell(index: int) -> tuple:
+    pair = _HIDDEN_COUNT_CELLS.get(index)
+    if pair is None:
+        pair = _HIDDEN_COUNT_CELLS[index] = (
+            torch.empty((1,), dtype=torch.int32, pin_memory=True),
+            torch.cuda.Event(),
+        )
+    return pair
+
+
+def _hidden_count_arange(index: int, T: int) -> torch.Tensor:
+    ar = _HIDDEN_COUNT_ARANGE.get(index)
+    if ar is None or ar.numel() < T:
+        cap = max(int(T), 2 * (0 if ar is None else int(ar.numel())))
+        ar = _HIDDEN_COUNT_ARANGE[index] = torch.arange(
+            1, cap + 1, dtype=torch.int32, device=torch.device("cuda", index)
+        )
+    return ar
+
+
+@dataclass
+class _HiddenCount:
+    """One call's hidden valid-row count prologue: chunk 0's buffers (written before the count is known), the
+    compaction outputs and the count once it was read back (:meth:`finish`)."""
+
+    rows0: int  # the buffer extent min(chunk, T): rows of the chunk-0 buffers, M of the device-count GEMM
+    stats: bool  # the logits GEMM form launched (True: with the row statistics)
+    stage: str  # the device-count logits stage launched
+    valid: torch.Tensor  # bool [T]
+    idx_full: torch.Tensor  # int64 [T]: the valid rows in order, then T
+    count_host: torch.Tensor  # the pinned int32 [1] cell the count is copied into
+    event: Any  # the CUDA event recorded behind that copy
+    logits: torch.Tensor = field(
+        repr=False
+    )  # bf16 [rows0, V]: chunk 0's z, rows < min(count, rows0) written
+    stats_buf: torch.Tensor = field(repr=False)  # fp32 [rows0, num_tiles, 2]
+    x_c: torch.Tensor = field(
+        repr=False
+    )  # bf16 [rows0, H]: chunk 0's gathered X rows, exact zeros after the count
+    count: Optional[int] = None
+
+    def finish(self) -> int:
+        """Wait for the count -- the compaction kernels and the 4-byte copy; chunk 0's GEMM is already queued -- and
+        read it (once)."""
+        if self.count is None:
+            self.event.synchronize()
+            self.count = int(self.count_host[0])
+        return self.count
+
+    @property
+    def num_rows(self) -> int:
+        return int(self.valid.numel())
+
+    def row_index(self) -> Optional[torch.Tensor]:
+        """The compact int64 row index: ``None`` when every row is valid, empty when every row is ignored."""
+        count = self.finish()
+        return None if count == self.num_rows else self.idx_full[:count]
+
+
+def hidden_count_eligible(
+    problem: "Problem",
+    X: torch.Tensor,
+    record: Optional[dict[str, Any]],
+    module_name: Optional[str],
+    *,
+    stats: bool,
+) -> bool:
+    """Whether a compacted call runs the hidden valid-row count: a registered program with the gather kernel and the
+    device-count form of chunk 0's logits GEMM (the raster rule at the buffer extent ``min(chunk, T)``), ``T > 0`` and
+    an ``X`` the GEMM reads in place -- a 16-byte row pitch (no contiguous copy) and a 16-byte-aligned base.  Every other
+    call takes the shipped :func:`valid_rows` path."""
+    if (
+        record is None
+        or module_name is None
+        or int(problem.num_rows) == 0
+        or problem.x_copy
+        or X.data_ptr() % 16
+    ):
+        return False
+    stages = registered_stages(module_name)
+    rows0 = min(int(problem.chunk), int(problem.num_rows))
+    raster = raster_variant(int(problem.hidden), rows0, record["arch"])
+    stage = stage_variant(
+        "gemm_logits" if stats else "gemm_logits_nostats",
+        count=True,
+        group_m=None if raster is None else raster[0],
+    )
+    return HIDDEN_COUNT_STAGE in stages and stage in stages
+
+
+def _hidden_count_begin(
+    problem: "Problem",
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    record: dict[str, Any],
+    module_name: str,
+    stats: bool,
+) -> _HiddenCount:
+    """Queue the device compaction, chunk 0's row gather and chunk 0's device-count logits GEMM of a compacted call
+    without the valid-row count on the host; the count is read back asynchronously (:meth:`_HiddenCount.finish`).
+
+    Order: (1) chunk 0's buffers at the buffer extent ``rows0 = min(chunk, T)`` -- the BF16 ``[rows0, V]`` logits
+    buffer, its row statistics and the BF16 ``[rows0, H]`` gather buffer -- and the compaction outputs; (2) the two
+    launches are bound (argument plans, grids: host work only, nothing enqueued yet); (3) ``labels >= 0`` -> ``cumsum``
+    -> ``searchsorted`` (:func:`compaction_index`), the count's ``copy_(non_blocking=True)`` into the pinned cell and
+    the event behind it; (4) the gather (rows ``< count`` of ``X`` in valid-row order, exact zeros after) and the GEMM
+    (``M`` / ``m_tiles`` / the raster rule at ``rows0``, the stores bounded by ``min(count, rows0)``) are launched.  The
+    caller resolves the plan on the count afterwards and skips chunk 0's gather and GEMM (:attr:`Plan.hidden_count`)."""
+    device = X.device
+    index = int(
+        device.index if device.index is not None else torch.cuda.current_device()
+    )
+    geometry = Geometry.from_record(record)
+    T, H, V, C = (
+        int(problem.num_rows),
+        int(problem.hidden),
+        int(problem.vocab),
+        int(problem.chunk),
+    )
+    rows0 = min(C, T)
+    num_tiles = -(-V // geometry.stats_tile)
+    logits = torch.empty((rows0, V), dtype=torch.bfloat16, device=device)
+    stats_buf = torch.empty((rows0, num_tiles, 2), dtype=torch.float32, device=device)
+    x_c = torch.empty((rows0, H), dtype=torch.bfloat16, device=device)
+    Xd, Wd = X.detach(), W.detach()
+    count_host, event = _hidden_count_cell(index)
+    ar = _hidden_count_arange(index, T)
+    valid = torch.empty((T,), dtype=torch.bool, device=device)
+    pos = torch.empty((T,), dtype=torch.int32, device=device)
+    idx_full = torch.empty((T,), dtype=torch.int64, device=device)
+    count_dev = pos[T - 1 : T]
+    ld = int(Xd.stride(0))
+    raster = raster_variant(H, rows0, record["arch"])
+    stage = stage_variant(
+        "gemm_logits" if stats else "gemm_logits_nostats",
+        count=True,
+        group_m=None if raster is None else raster[0],
+    )
+    common: dict[str, Any] = {name: None for name in COMMON_TENSORS}
+    common.update({name: 0 for name in COMMON_SCALARS})
+    common.update(
+        T=T, H=H, V=V, chunk=C, num_tiles=num_tiles, loss_div=1.0, rows_c=rows0
+    )
+    # the kernel addresses X by base pointer + ld_x_words: its storage span (padding columns included) as ONE contiguous
+    # int32 alias, so a padded-pitch X passes the launch shim's contiguity check without a copy
+    gather = dict(
+        common,
+        x=Xd.as_strided(((T - 1) * ld + H,), (1,)).view(torch.int32),
+        idx_lo=idx_full.view(torch.int32),
+        count=count_dev,
+        out=x_c.view(torch.int32),
+        ld_x_words=ld // 2,
+        row_vecs=H // geometry.cast_vec,
+        num_rows=rows0,
+    )
+    gemm = dict(
+        common,
+        A=x_c,
+        B=Wd,
+        C=logits,
+        STATS_OUT=stats_buf,
+        WS=count_dev,
+        M=rows0,
+        m_tiles=geometry.row_tiles(rows0, geometry.logits_cluster_ctas),
+        k_iters=1,
+        first_chunk=0,
+        ws_slab=0,
+    )
+    keys = ((HIDDEN_COUNT_STAGE, "hidden"), (stage, "hidden"))
+    launches = _bind_all(
+        record,
+        module_name,
+        keys,
+        {keys[0]: gather, keys[1]: gemm},
+        device,
+        geometry,
+    )
+    compaction_index(labels, valid=valid, pos=pos, idx_full=idx_full, ar=ar)
+    count_host.copy_(count_dev, non_blocking=True)
+    event.record()
+    with _ffi_stream_context(index):
+        for key in keys:
+            launch = launches[key]
+            if launch.prepare is not None:
+                launch.prepare(*launch.arguments)
+            launch()
+    return _HiddenCount(
+        rows0=rows0,
+        stats=stats,
+        stage=stage,
+        valid=valid,
+        idx_full=idx_full,
+        count_host=count_host,
+        event=event,
+        logits=logits,
+        stats_buf=stats_buf,
+        x_c=x_c,
+    )
+
+
+def _hidden_count_memory(
+    memory: dict[str, Any],
+    *,
+    num_rows: int,
+    hidden: int,
+    vocab: int,
+    chunk: int,
+    stats_tile: int,
+) -> dict[str, Any]:
+    """The memory report of a call on the hidden valid-row count path: the chunk buffers and the gather buffer exist
+    at the buffer extent ``min(chunk, T)`` BEFORE the count is known -- also when the outcome is the uncompacted plan,
+    which counts no gather buffer."""
+    rows0 = min(int(chunk), max(int(num_rows), 1))
+    tiles = -(-int(vocab) // int(stats_tile))
+    temporary = dict(memory["temporary"])
+    temporary["logits"] = rows0 * int(vocab) * 2
+    temporary["stats"] = rows0 * tiles * 2 * 4
+    temporary["x_c"] = rows0 * int(hidden) * 2
+    out = dict(
+        memory,
+        temporary=temporary,
+        temporary_bytes=sum(temporary.values()),
+        gather_bytes=temporary["x_c"],
+        hidden_count=True,
+    )
+    if memory.get("saved_dz_bytes"):
+        out["saved_dz_bytes"] = rows0 * int(vocab) * 2
+    return out
+
+
 def valid_rows(
     labels: torch.Tensor, *, mask: bool = False
 ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -1220,6 +1545,8 @@ def generated_program_available(
     )
     if dx_finalize_default():
         needed |= set(DX_FINALIZE_STAGES)
+    if hidden_count_default():
+        needed.add(HIDDEN_COUNT_STAGE)
     return all(stage in stages for stage in needed)
 
 
@@ -1438,9 +1765,23 @@ class Plan:
     ] = ()  # per chunk: the GEMM instance knobs the rules resolved (empty = defaults)
     dx_finalize: bool = False  # a K-sliced dX GEMM's slabs are added by the ``slab_sum`` kernel (else the host's ``add_`` chain)
     dx_cast: bool = True  # the backward casts ``dx_acc`` into ``dx_out`` (False: the caller finalizes ``dx_acc``, :func:`finalize_dx`)
+    # the hidden valid-row count (eager entry points): chunk 0's row gather and logits GEMM ran in device-count form before
+    # the count was known (:func:`_hidden_count_begin`), so the forward / recompute key sequences start at chunk 0's row
+    # kernels; ``hidden_logits_group_m`` is the raster rule's height at the buffer extent, ``hidden_stats`` the GEMM form
+    hidden_count: bool = False
+    hidden_logits_group_m: Optional[int] = None
+    hidden_stats: bool = True
 
     def variants_of(self, index: int) -> ChunkVariants:
         return self.variants[index] if self.variants else ChunkVariants()
+
+    def hidden_logits_stage(self) -> str:
+        """The device-count logits GEMM variant chunk 0 ran on the hidden valid-row count path."""
+        return stage_variant(
+            "gemm_logits" if self.hidden_stats else "gemm_logits_nostats",
+            count=True,
+            group_m=self.hidden_logits_group_m,
+        )
 
     def logits_stage(self, index: int, *, stats: bool = True) -> str:
         """The logits GEMM variant of chunk ``index`` (``stats=False``: the log-probability backward's recompute)."""
@@ -1537,6 +1878,9 @@ class Plan:
                 used.add(self.dw_acc_stage(index))
         if self.dw_deferred:
             used.add(self.dw_cast_stage)
+        if self.hidden_count:
+            used.add(HIDDEN_COUNT_STAGE)
+            used.add(self.hidden_logits_stage())
         return tuple(s for s in STAGES if s in used)
 
     @property
@@ -1573,6 +1917,8 @@ def make_plan(
     gemm_tuning: Optional[dict[str, dict[str, Any]]] = None,
     dx_finalize: bool = False,
     dx_cast: bool = True,
+    hidden_count: bool = False,
+    hidden_stats: bool = True,
 ) -> Plan:
     """The chunk schedule; ``dx_max_slices`` > 1 (K-sliced dX stages registered) picks each chunk's slice count
     (``dx_resident`` = the device's co-resident dX clusters, :func:`cluster_resident`); ``valid_rows`` (compaction)
@@ -1581,7 +1927,9 @@ def make_plan(
     per-chunk instance rules (:func:`chunk_variants`; ``None`` = the reference path, base stages only) and
     ``gemm_tuning`` pins knobs explicitly (already validated by the caller or :func:`_resolve_gemm_tuning`);
     ``dx_finalize`` adds a sliced dX GEMM's slabs with the ``slab_sum`` kernel and ``dx_cast=False`` leaves ``dx_acc``
-    uncast for the caller (:func:`finalize_dx`)."""
+    uncast for the caller (:func:`finalize_dx`).  ``hidden_count`` (the eager entry points' hidden valid-row count,
+    ``arch`` required): chunk 0's gather and logits GEMM already ran in device-count form (``hidden_stats``: with the
+    statistics) at the buffer extent ``min(chunk, T)``, whose raster-rule height the plan records."""
     rows = problem.num_rows if valid_rows is None else int(valid_rows)
     chunks = plan_chunks(rows, problem.chunk)
     tuning = gemm_tuning or {}
@@ -1617,6 +1965,16 @@ def make_plan(
             )
             for i, (_, rows_c) in enumerate(chunks)
         )
+    hidden_group: Optional[int] = None
+    if hidden_count:
+        if arch is None:
+            raise ValueError(
+                "the hidden valid-row count belongs to a registered program (arch required)"
+            )
+        raster = raster_variant(
+            problem.hidden, min(int(problem.chunk), int(problem.num_rows)), arch
+        )
+        hidden_group = None if raster is None else raster[0]
     return Plan(
         problem,
         chunks,
@@ -1629,6 +1987,9 @@ def make_plan(
         variants,
         bool(dx_finalize),
         bool(dx_cast),
+        bool(hidden_count),
+        hidden_group,
+        bool(hidden_stats),
     )
 
 
@@ -1738,6 +2099,7 @@ def memory_report(
     valid_rows: Optional[int] = None,
     fuse_dw_cast: Optional[bool] = None,
     dx_finalize: Optional[bool] = None,
+    hidden_count: bool = False,
 ) -> dict[str, Any]:
     """The reporting buckets of the memory rule (bytes).
 
@@ -1775,6 +2137,11 @@ def memory_report(
     ``dX`` is written in one pass from the accumulator, so the compact BF16
     ``dX`` rows disappear from the temporaries; the bool valid-row mask and its
     int32 scan (``row_valid`` / ``row_scan``, ``[T]`` each) take their place.
+
+    ``hidden_count`` (the eager entry points' hidden valid-row count): the chunk
+    buffers (``logits``, ``stats``) and the gather buffer ``x_c`` exist at the
+    buffer extent ``min(C, T)`` before the count is known -- also when the
+    outcome is the uncompacted plan -- and ``gather_bytes`` counts that buffer.
     """
     compact = valid_rows is not None
     rows = (
@@ -1843,6 +2210,36 @@ def memory_report(
     if entry == "logprob":
         accumulators["saved_lse"] = rows * 4
     weights = {"W": int(vocab) * int(hidden) * 2, "X": int(num_rows) * int(hidden) * 2}
+    if hidden_count:
+        return _hidden_count_memory(
+            dict(
+                temporary_bytes=sum(temporary.values()),
+                temporary=temporary,
+                outputs_bytes=sum(outputs.values()),
+                outputs=outputs,
+                accumulator_bytes=sum(accumulators.values()),
+                accumulators=accumulators,
+                weights_bytes=sum(weights.values()),
+                weights=weights,
+                vocab_rows_max=min(int(chunk), max(rows, 1)),
+                chunk=int(chunk),
+                num_chunks=len(chunks),
+                compact_rows=compact,
+                valid_rows=rows,
+                gather_bytes=int(layout["x_c"][1]) if compact else 0,
+                fuse_dw_cast=deferred,
+                saved_dz_bytes=min(int(chunk), rows) * int(vocab) * 2
+                if deferred
+                else 0,
+                dx_finalize=fused_dx,
+                hidden_count=False,
+            ),
+            num_rows=int(num_rows),
+            hidden=int(hidden),
+            vocab=int(vocab),
+            chunk=int(chunk),
+            stats_tile=int(stats_tile),
+        )
     return dict(
         temporary_bytes=sum(temporary.values()),
         temporary=temporary,
@@ -1861,6 +2258,7 @@ def memory_report(
         fuse_dw_cast=deferred,
         saved_dz_bytes=min(int(chunk), rows) * int(vocab) * 2 if deferred else 0,
         dx_finalize=fused_dx,
+        hidden_count=False,
     )
 
 
@@ -2507,9 +2905,13 @@ def forward_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     ):
         keys += [("gather_rows", "infer_logp"), ("gather_rows", "loss_weights")]
     for index in range(plan.num_chunks):
-        if plan.compact:
+        # the hidden valid-row count: chunk 0's rows were gathered and its logits GEMM queued before the count was known
+        queued = plan.hidden_count and index == 0
+        if plan.compact and not queued:
             keys.append(("gather_rows", index))
-        keys += [(plan.logits_stage(index), index), ("row_finalize", index)]
+        if not queued:
+            keys.append((plan.logits_stage(index), index))
+        keys.append(("row_finalize", index))
         if plan.problem.entry == "loss":
             keys.append(("loss_reduce", index))
             if plan.need_dx or plan.need_dw:
@@ -2539,9 +2941,14 @@ def recompute_keys(plan: Plan) -> tuple[tuple[str, Any], ...]:
     if plan.compact:
         keys.append(("gather_rows", "d_in"))
     for index in range(plan.num_chunks):
-        if plan.compact:
+        queued = (
+            plan.hidden_count and index == 0
+        )  # the hidden valid-row count: chunk 0's recompute is already queued
+        if plan.compact and not queued:
             keys.append(("gather_rows", index))
-        keys += [(plan.logits_stage(index, stats=False), index), ("row_grad", index)]
+        if not queued:
+            keys.append((plan.logits_stage(index, stats=False), index))
+        keys.append(("row_grad", index))
         if plan.need_dx:
             keys += _dx_keys(plan, index)
         if plan.need_dw:
@@ -3390,13 +3797,16 @@ def forward_binding_key(
     fuse_dw_cast=False,
     gemm_tuning=None,
     dx_finalize=False,
+    hidden_count=False,
 ) -> tuple:
     """Cache key of a forward binding: ``(data_ptr, shape, stride, dtype)`` of every
     input plus every option that shapes the argument plans; ``valid_rows`` is the
     compacted row count (a label-dependent fact of the plan; ``None`` = uncompacted);
     ``fuse_dw_cast`` the resolved weight-gradient form; ``gemm_tuning`` the explicit
     GEMM knobs (``None`` = the environment's, :func:`gemm_tuning_default`);
-    ``dx_finalize`` the resolved dX finalize form (the slab reduction's launches differ)."""
+    ``dx_finalize`` the resolved dX finalize form (the slab reduction's launches differ);
+    ``hidden_count`` whether chunk 0's gather and logits GEMM ran before the plan
+    (the remembered sequence starts at chunk 0's row kernels)."""
     return (
         "fwd",
         entry,
@@ -3415,6 +3825,7 @@ def forward_binding_key(
         bool(fuse_dw_cast),
         _tuning_key(_resolve_gemm_tuning(gemm_tuning)),
         bool(dx_finalize),
+        bool(hidden_count),
     )
 
 
@@ -3432,6 +3843,7 @@ def logprob_backward_binding_key(
     fuse_dw_cast=False,
     gemm_tuning=None,
     dx_finalize=False,
+    hidden_count=False,
 ) -> tuple:
     return (
         "bwd",
@@ -3448,6 +3860,7 @@ def logprob_backward_binding_key(
         bool(fuse_dw_cast),
         _tuning_key(_resolve_gemm_tuning(gemm_tuning)),
         bool(dx_finalize),
+        bool(hidden_count),
     )
 
 
@@ -3473,24 +3886,55 @@ class _Binding:
     memory: dict = field(default_factory=dict, repr=False)
 
     @classmethod
-    def from_runner(cls, runner: LmHeadLossRunner) -> "_Binding":
+    def from_runner(
+        cls, runner: LmHeadLossRunner, hidden: Optional[_HiddenCount] = None
+    ) -> "_Binding":
+        """``hidden`` (the eager entry points' hidden valid-row count): the runner was prepared on the counted rows
+        after chunk 0's gather and logits GEMM ran in device-count form; the remembered plan records that and its
+        launch sequences start at chunk 0's row kernels (the runner's chunk-0 gather / GEMM launches are dropped)."""
         if runner.backend != "cake":
             raise ValueError("only cake-backend runners are remembered")
         t = runner.tensors
         owned = {name: torch.empty_like(t[name]) for name in _OWNED_VALUES if name in t}
+        plan, memory = runner.plan, runner.memory
+        forward_order, backward_order = runner.forward_order, runner.backward_order
+        if hidden is not None:
+            p = plan.problem
+            plan = replace(
+                plan,
+                hidden_count=True,
+                hidden_logits_group_m=parse_stage(hidden.stage)[1]["group_m"],
+                hidden_stats=hidden.stats,
+            )
+            forward_order = forward_keys(plan)
+            backward_order = (
+                recompute_keys(plan) if p.entry == "logprob" else ()
+            ) + cast_keys(plan)
+            memory = _hidden_count_memory(
+                memory,
+                num_rows=p.num_rows,
+                hidden=p.hidden,
+                vocab=p.vocab,
+                chunk=p.chunk,
+                stats_tile=plan.geometry.stats_tile,
+            )
+        # the hidden-count path drops the runner's chunk-0 gather / GEMM launches (not in either sequence)
+        keep = None if hidden is None else set(forward_order) | set(backward_order)
         return cls(
-            plan=runner.plan,
+            plan=plan,
             device=t["X"].device,
             device_index=runner.device_index,
             launches={
-                key: launch.templated() for key, launch in runner.launches.items()
+                key: launch.templated()
+                for key, launch in runner.launches.items()
+                if keep is None or key in keep
             },
-            forward_order=runner.forward_order,
-            backward_order=runner.backward_order,
+            forward_order=forward_order,
+            backward_order=backward_order,
             owned=owned,
             owned_bytes=sum(v.numel() * v.element_size() for v in owned.values()),
             layout=runner.layout,
-            memory=runner.memory,
+            memory=memory,
         )
 
     def holds_no_tensor(self) -> bool:
@@ -3500,16 +3944,25 @@ class _Binding:
             for a in launch.arguments
         )
 
-    def _scratch(self, t: dict[str, Any]) -> None:
-        """Per-call temporaries from the caching allocator into ``t`` (the runner's regions, minus the owned ones)."""
+    def _scratch(
+        self, t: dict[str, Any], hidden: Optional[_HiddenCount] = None
+    ) -> None:
+        """Per-call temporaries from the caching allocator into ``t`` (the runner's regions, minus the owned ones);
+        with ``hidden`` the chunk buffers are the prologue's (chunk 0's logits / statistics / gathered rows already in
+        them, ``min(chunk, T)`` rows) -- the entry points check that a hidden-count plan gets its prologue."""
         p = self.plan.problem
         rows = self.layout["logits"][1] // (p.vocab * 2)
-        t["logits"] = torch.empty(
-            (rows, p.vocab), dtype=torch.bfloat16, device=self.device
-        )
-        t["stats"] = torch.empty(
-            (rows, self.plan.num_tiles, 2), dtype=torch.float32, device=self.device
-        )
+        if hidden is not None:
+            t["logits"], t["stats"] = hidden.logits, hidden.stats_buf
+        else:
+            t["logits"] = torch.empty(
+                (rows, p.vocab), dtype=torch.bfloat16, device=self.device
+            )
+            t["stats"] = torch.empty(
+                (rows, self.plan.num_tiles, 2),
+                dtype=torch.float32,
+                device=self.device,
+            )
         t["d"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
         t["term"] = torch.empty((rows,), dtype=torch.float32, device=self.device)
         t["loss_acc"] = torch.empty((1,), dtype=torch.float64, device=self.device)
@@ -3524,11 +3977,22 @@ class _Binding:
                 device=self.device,
             )
         if self.plan.compact:
-            t["x_c"] = torch.empty(
-                (rows, p.hidden), dtype=torch.bfloat16, device=self.device
+            t["x_c"] = (
+                hidden.x_c
+                if hidden is not None
+                else torch.empty(
+                    (rows, p.hidden), dtype=torch.bfloat16, device=self.device
+                )
             )
         for name, tensor in self.owned.items():
             t[name] = tensor
+
+    def _check_hidden(self, hidden: Optional[_HiddenCount]) -> None:
+        """A plan of the hidden valid-row count serves calls that ran the prologue, the shipped plan the others."""
+        if (hidden is not None) != self.plan.hidden_count:
+            raise ValueError(
+                "the remembered binding was planned for the other valid-row count path"
+            )
 
     def _compact(self, t: dict[str, Any], row_index: Optional[torch.Tensor]) -> None:
         """Check the call's valid-row index against the remembered plan and bind it."""
@@ -3558,20 +4022,23 @@ class _Binding:
 
         _run_keys(self.plan, self.device_index, keys, run_key)
 
-    def forward(self, X, W, labels, infer_logp, loss_weights, row_index=None):
+    def forward(
+        self, X, W, labels, infer_logp, loss_weights, row_index=None, hidden=None
+    ):
         p, plan = self.plan.problem, self.plan
         T, H, V = (
             plan.rows,
             p.hidden,
             p.vocab,
         )  # rows of the chunk loop (the valid rows when compacted)
+        self._check_hidden(hidden)
         t: dict[str, Any] = dict(
             X=_prepare_x(X, p, plan.compact),
             W=W,
             labels=_prepare_labels(labels, plan.geometry, row_index),
         )
         self._compact(t, row_index)
-        self._scratch(t)
+        self._scratch(t, hidden)
         t["lse"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         t["logp"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         if p.entry == "loss":
@@ -3608,9 +4075,10 @@ class _Binding:
             )
         return t["logp"], t["lse"]
 
-    def backward_logprob(self, X, W, labels, lse, dlogp, row_index=None):
+    def backward_logprob(self, X, W, labels, lse, dlogp, row_index=None, hidden=None):
         p, plan = self.plan.problem, self.plan
         T, H, V = plan.rows, p.hidden, p.vocab
+        self._check_hidden(hidden)
         t: dict[str, Any] = dict(
             X=_prepare_x(X, p, plan.compact),
             W=W,
@@ -3623,7 +4091,7 @@ class _Binding:
             t["d_in"] = torch.empty((T,), dtype=torch.float32, device=self.device)
         else:
             t["d_in"] = dlogp
-        self._scratch(t)
+        self._scratch(t, hidden)
         if plan.need_dx:
             t["dx_acc"] = torch.empty((T, H), dtype=torch.float32, device=self.device)
             if plan.dx_cast:
@@ -3822,6 +4290,28 @@ def _resolve_compact(compact_rows) -> bool:
     return compact_rows_default() if compact_rows is None else bool(compact_rows)
 
 
+def _hidden_count(
+    problem: Problem,
+    X: torch.Tensor,
+    W: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    backend: str,
+    compact: bool,
+    stats: bool,
+) -> Optional[_HiddenCount]:
+    """The hidden valid-row count prologue of a compacted ``cake`` call when the switch is on and the call is eligible
+    (:func:`hidden_count_eligible`); ``None`` = the shipped :func:`valid_rows` path."""
+    if not (compact and backend == "cake" and hidden_count_default()):
+        return None
+    module_name, record = record_for(X.device, problem.hidden, problem.vocab)
+    if not hidden_count_eligible(problem, X, record, module_name, stats=stats):
+        return None
+    return _hidden_count_begin(
+        problem, X, W, labels, record=record, module_name=module_name, stats=stats
+    )
+
+
 def forward_loss(
     X: torch.Tensor,
     W: torch.Tensor,
@@ -3882,11 +4372,18 @@ def forward_loss(
     fused_dx = bool(
         need_dx and dx_finalize_default()
     )  # read once per call; the backward follows it through row_valid
-    row_index, row_valid = (
-        valid_rows(labels, mask=fused_dx)
-        if _resolve_compact(compact_rows)
-        else (None, None)
+    compact = _resolve_compact(compact_rows)
+    hc = _hidden_count(
+        problem, X, W, labels, backend=backend, compact=compact, stats=True
     )
+    if hc is not None:
+        # the hidden valid-row count: chunk 0's gather and logits GEMM are queued; the count arrives through the pinned cell
+        row_index = hc.row_index()
+        row_valid = hc.valid if (row_index is not None and fused_dx) else None
+    else:
+        row_index, row_valid = (
+            valid_rows(labels, mask=fused_dx) if compact else (None, None)
+        )
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _empty_forward(
             problem,
@@ -3919,12 +4416,13 @@ def forward_loss(
             valid_rows=valid_count,
             fuse_dw_cast=fuse,
             dx_finalize=fused_dx,
+            hidden_count=hc is not None,
             **common,
         )
         binding = cache.lookup(key)
         if binding is not None:
             loss, logp, dx_acc, dw_acc, deferred = binding.forward(
-                X, W, labels, infer_logp, loss_weights, row_index
+                X, W, labels, infer_logp, loss_weights, row_index, hc
             )
             dz_last, x_last, x_src, x_idx = deferred
             return ForwardResult(
@@ -3959,12 +4457,12 @@ def forward_loss(
         # allocator, so the deferred ``dz`` rows keep the chunk buffer alive and nothing else -- a view into the
         # runner's single workspace allocation would pin the whole workspace until the backward.  The runner (and its
         # workspace) is dropped here; only the binding survives.
-        binding = _Binding.from_runner(runner)
+        binding = _Binding.from_runner(runner, hc)
         del runner
         if key is not None:
             cache.remember(key, binding)
         loss, logp, dx_acc, dw_acc, deferred = binding.forward(
-            X, W, labels, infer_logp, loss_weights, row_index
+            X, W, labels, infer_logp, loss_weights, row_index, hc
         )
         memory = binding.memory
     else:
@@ -4375,7 +4873,14 @@ def forward_logprob(
     T = problem.num_rows
     if T == 0:
         return _empty_forward(problem, X, need_dx=False, need_dw=False)
-    row_index = valid_row_index(labels) if _resolve_compact(compact_rows) else None
+    compact = _resolve_compact(compact_rows)
+    hc = _hidden_count(
+        problem, X, W, labels, backend=backend, compact=compact, stats=True
+    )
+    if hc is not None:
+        row_index = hc.row_index()
+    else:
+        row_index = valid_row_index(labels) if compact else None
     if row_index is not None and row_index.numel() == 0:  # every row ignored
         return _empty_forward(
             problem, X, need_dx=False, need_dw=False, row_index=row_index
@@ -4398,10 +4903,11 @@ def forward_logprob(
             grad_weight_dtype=torch.bfloat16,
             entry="logprob",
             valid_rows=valid_rows,
+            hidden_count=hc is not None,
         )
         binding = cache.lookup(key)
         if binding is not None:
-            logp, lse = binding.forward(X, W, labels, None, None, row_index)
+            logp, lse = binding.forward(X, W, labels, None, None, row_index, hc)
             return ForwardResult(
                 loss=None,
                 logp=scatter_rows(logp, row_index, T),
@@ -4423,14 +4929,25 @@ def forward_logprob(
         backend=backend,
         compact_rows=False if row_index is None else row_index,
     )
-    logp, lse = runner.forward()
-    if key is not None:
-        cache.remember(key, _Binding.from_runner(runner))
+    if hc is not None:
+        # the hidden valid-row count: chunk 0's logits already sit in the prologue's buffers, so the first call launches
+        # through the templated binding too (the runner's own workspace is never written)
+        binding = _Binding.from_runner(runner, hc)
+        del runner
+        if key is not None:
+            cache.remember(key, binding)
+        logp, lse = binding.forward(X, W, labels, None, None, row_index, hc)
+        memory = binding.memory
+    else:
+        logp, lse = runner.forward()
+        if key is not None:
+            cache.remember(key, _Binding.from_runner(runner))
+        memory = runner.memory
     return ForwardResult(
         loss=None,
         logp=scatter_rows(logp, row_index, T),
         lse=lse,
-        memory=runner.memory,
+        memory=memory,
         backend=backend,
         row_index=row_index,
         num_rows=T,
@@ -4474,11 +4991,18 @@ def backward_logprob(
         return None, None
     T, H, V = problem.num_rows, problem.hidden, problem.vocab
     fused_dx = bool(need_dx and dx_finalize_default())  # read once per call
-    row_index, row_valid = (
-        valid_rows(labels, mask=fused_dx)
-        if (T and _resolve_compact(compact_rows))
-        else (None, None)
+    compact = bool(T and _resolve_compact(compact_rows))
+    hc = _hidden_count(
+        problem, X, W, labels, backend=backend, compact=compact, stats=False
     )
+    if hc is not None:
+        # the hidden valid-row count: chunk 0's gather and its recompute GEMM (no statistics) are queued
+        row_index = hc.row_index()
+        row_valid = hc.valid if (row_index is not None and fused_dx) else None
+    else:
+        row_index, row_valid = (
+            valid_rows(labels, mask=fused_dx) if compact else (None, None)
+        )
     rows = T if row_index is None else int(row_index.numel())
     if rows == 0:  # no rows, or every row ignored
         return (
@@ -4519,10 +5043,11 @@ def backward_logprob(
             valid_rows=valid_count,
             fuse_dw_cast=fuse,
             dx_finalize=fused_dx,
+            hidden_count=hc is not None,
         )
         binding = cache.lookup(key)
         if binding is not None:
-            dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index)
+            dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index, hc)
             return finish_dx(dx), dw
     runner = prepare_lm_head_loss(
         X,
@@ -4541,6 +5066,13 @@ def backward_logprob(
         dx_finalize=fused_dx,
         dx_cast=dx_cast,
     )
+    if hc is not None:
+        binding = _Binding.from_runner(runner, hc)
+        del runner
+        if key is not None:
+            cache.remember(key, binding)
+        dx, dw = binding.backward_logprob(X, W, labels, lse, dlogp, row_index, hc)
+        return finish_dx(dx), dw
     dx, dw = runner.backward()
     if key is not None:
         cache.remember(key, _Binding.from_runner(runner))

@@ -128,6 +128,29 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   defers its only accumulate to the backward, hence the `auto` rule
   (`cake_backend.dw_side_stream`).  The prepared runner follows the same rule
   (a CUDA graph captured from it records the fork / join).
+* Hidden valid-row count (default on;
+  `FLASHINFER_CAKE_LM_HEAD_LOSS_HIDDEN_COUNT=0` restores the previous path):
+  a compacted call used to count its valid rows on the host (`sum().item()`)
+  and form their index (`nonzero`) before its first launch.  It now forms the
+  index on the device (`labels >= 0` -> an inclusive int32 `cumsum` ->
+  `searchsorted`), gathers chunk 0's rows of `X` with the `gather_rows_bf16`
+  kernel and runs chunk 0's logits GEMM in its device-count form
+  (`gemm_logits_mcnt` / `gemm_logits_nostats_mcnt`: the stores bounded by the
+  count read from device memory, the buffer extent `min(chunk_size, T)` as
+  `M`), and reads the count back through a pinned cell and a CUDA event only
+  after both are queued -- the host waits for the three compaction kernels and
+  a 4-byte copy instead of the count and the index.  Every row valid: the
+  uncompacted plan with chunk 0's GEMM already done (its `X` rows for the
+  weight gradient stay the input view); every row ignored: zeros without a
+  further launch; otherwise the compacted plan over the counted rows with
+  chunk 0's gather and GEMM skipped.  The same kernels per row, so `loss` /
+  `logp` / `dX` / `dW` are bitwise the previous path's.  Calls the
+  device-count GEMM cannot serve -- an `X` that needs a contiguous copy or
+  whose base is not 16-byte aligned, a program without the kernels -- take
+  the previous path; the prepared runner (`prepare_lm_head_loss`) is
+  unchanged.  The chunk buffers and the gather buffer exist at the buffer
+  extent before the count is known (`memory_report(..., hidden_count=True)`;
+  `cake_backend.hidden_count_eligible` / `_hidden_count_begin`).
 * Memory rule: no logits, probability or `dlogits` buffer ever spans more than
   `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,
@@ -161,7 +184,9 @@ any device (the host-layer tests use it); the public API accepts
 Per chunk of `rows_c <= chunk_size` rows the host launches, in this order
 (a compacted plan first gathers the chunk's valid rows of `X` into the `x_c`
 workspace buffer with a torch `index_select`, `gather_rows`; the row operands
-are gathered once per step):
+are gathered once per step; under the hidden valid-row count chunk 0's
+gather and logits GEMM ran before the count was known, see
+`gather_rows_bf16` below):
 
 * `gemm_logits`: `z_c = bf16(X_c @ W^T)` (2-CTA tensor-core GEMM, 128-row
   tiles, 256 vocabulary columns per accumulator) together with the
@@ -207,6 +232,16 @@ are gathered once per step):
   `row_index[scan[r] - 1] == r`, exact zeros otherwise, one CTA per output row
   per iteration, every element written once (launched by `finalize_dx`, not
   by the chunk loop).
+* `gather_rows_bf16`: chunk 0's row gather of the hidden valid-row count
+  (the eager entry points) -- `out[r] = X[idx[r]]` for `r < min(count,
+  num_rows)` with the count read from device memory, exact zeros after; one
+  CTA per row per iteration over 16-byte words, `X` addressed by its base
+  pointer and row pitch (no contiguous copy), the int64 index read as int32
+  pairs.  Launched before chunk 0's logits GEMM, which runs in its
+  device-count form (`gemm_logits_mcnt` / `gemm_logits_nostats_mcnt`: `M`,
+  `m_tiles` and the raster are the buffer extent `min(chunk_size, T)`, every
+  store and statistics write is bounded by `min(count, M)`; bitwise the
+  host-bound form per row).
 
 ### Instance variants
 
@@ -215,6 +250,13 @@ output of the per-chunk rules the production launchers of the kernel source
 apply -- the host selects by rule output, never by shape
 (`cake_backend.stage_variant` / `parse_stage`; suffixes in this order):
 
+* `_mcnt`: the device-count form of the logits GEMMs (`gemm_logits_mcnt`,
+  `gemm_logits_nostats_mcnt`, with `_g16` at the long raster) -- chunk 0 of
+  the hidden valid-row count, whose valid-row bound is read from device
+  memory while `M`, `m_tiles` and the raster rule are evaluated at the buffer
+  extent `min(chunk_size, T)` (`cake_backend.hidden_count_eligible`,
+  `Plan.hidden_logits_stage`); every record registers both heights.  Bitwise:
+  the same per-row arithmetic, rows at and beyond the count are not written;
 * `_s<k>`: the K-slice count of the dX GEMM (`recommended_k_slices`);
 * `_tn256`: the narrow dX tile, taken when `H % 512 != 0`, when the launch's
   512-wide work items would not fill the device's SM pairs, or -- on SM100
@@ -293,7 +335,7 @@ workspace; the logits GEMM's output descriptor covers the chunk's rows only.
 The registry holds one record per architecture (`sm_100a`, `sm_103a`) and
 geometry -- `cake_lm_head_loss_<arch>` pinned to hidden size 6144 and
 vocabulary 154880, `..._h7168_v129280` and `..._h8192_v128256` -- with the
-eleven base stages above plus the instance variants the record's rules can
+fourteen base stages above plus the instance variants the record's rules can
 reach (`abi = lm_head_loss_v1`), exported from the kernel snapshot named in
 the pull request.
 
