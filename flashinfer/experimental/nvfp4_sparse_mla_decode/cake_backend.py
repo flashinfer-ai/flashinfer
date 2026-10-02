@@ -80,8 +80,8 @@ assert set(SUPPORTED_COMPUTE_CAPABILITIES.values()) == set(ARCHES)
 THREADS = 448  # 8 math warps + 4 softmax warps + 2 loader warps
 STAGE_KEYS = 32  # keys per pipeline stage; keys_per_cta is a multiple of it
 MAX_KEYS_PER_CTA = 2048  # entries of the per-CTA shared-memory index table
-SMEM_BYTES = 192064  # dynamic shared memory, cluster size 1
-SMEM_BYTES_CLUSTER = 226624  # dynamic shared memory, cluster size > 1
+SMEM_BYTES = 192256  # dynamic shared memory of the generated program, cluster size 1 (pool + mbarriers)
+SMEM_BYTES_CLUSTER = 226816  # dynamic shared memory of the generated program, cluster size > 1
 # Split sizes the automatic plan considers, largest first; 1 is the fallback
 # when no split leaves every CTA a full stage.  7 is not a variant of the program.
 PLAN_CTAS = (8, 6, 5, 4, 3, 2)

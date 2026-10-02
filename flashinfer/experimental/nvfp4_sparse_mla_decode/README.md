@@ -154,7 +154,7 @@ in fp32 and P is f16; the acceptance run below confirms the tolerance of the tes
   in one wave (`cudaOccupancyMaxActiveClusters` of each module, queried once per device), otherwise 2 in several
   waves; 1 when no split leaves every CTA a full 32-key stage. `keys_per_cta = ceil(topk / C)` rounded up to a
   multiple of 32, at most 2048. A forced split that leaves a CTA without keys is rejected.
-- Dynamic shared memory 192,064 bytes (`C = 1`) or 226,624 bytes (`C > 1`): one CTA per SM.
+- Dynamic shared memory 192,256 bytes (`C = 1`) or 226,816 bytes (`C > 1`), the schedule's pool plus its mbarriers: one CTA per SM.
 - `cake_backend.prepare_nvfp4_sparse_mla_decode(...)` returns a runner that launches without allocation (CUDA
   Graph safe); `cake_backend.generated_program_available(device)` reports whether the program is registered in
   the checkout. The tests and the benchmark skip the arm otherwise.

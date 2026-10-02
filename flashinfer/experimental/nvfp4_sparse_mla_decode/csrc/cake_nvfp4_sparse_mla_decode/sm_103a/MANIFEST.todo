@@ -15,7 +15,7 @@
 #   out     bf16 [T, 16, 512]
 #   topk, keys_per_cta  int64; qk_scale (= bmm1_scale * log2 e), out_scale (= bmm2_scale)  double
 # launched with block (448, 1, 1), cluster (1, C, 1), dynamic shared memory
-# 192064 bytes (C = 1) or 226624 bytes (C > 1), non-cooperative, grid (T, C, 1).
+# 192256 bytes (C = 1) or 226816 bytes (C > 1), non-cooperative, grid (T, C, 1).
 #
 # registry key                                 C  expected files
 cake_nvfp4_sparse_mla_decode_c1_sm_103a   1  cake_nvfp4_sparse_mla_decode_<hash20>_kernel.cu  cake_nvfp4_sparse_mla_decode_<hash20>_binding.cu
