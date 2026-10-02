@@ -14,7 +14,7 @@
   "contract": {
     "arch": "sm_103a",
     "backend": "cake_cute",
-    "cake_revision": "51f777c462d446534d5caf98d4c3f16c3ba9d5ef",
+    "cake_revision": "05d77ebefb943c5cf39914ee6f6aed01a43bb86a",
     "carried_rows": {
       "cake": [
         "ep8_r3_t00001_uniform_cycle",
@@ -3480,10 +3480,10 @@
         "sha256": "95fcd43eb439091cda0b570f6e23c3192a13dfbc9acdfda51e1f1bd31a720337"
       },
       {
-        "bytes": 204606,
+        "bytes": 207766,
         "kind": "integration",
         "path": "flashinfer/fused_moe/cake_cute/cake_mxfp4_situ_moe_plan.py",
-        "sha256": "4924412ac2bc61eba7f6ebd0b52a1f31717065126886c2e5330ea1e015a24699"
+        "sha256": "a7665080db954e900bbe4bd8b1e223db33ee158bdc91e0435a435c847b351696"
       },
       {
         "bytes": 454,
@@ -3492,10 +3492,10 @@
         "sha256": "d6f4222142ed25eb12b0c557d85a02d33eaff68b81caef95deee0347fd5ceb49"
       },
       {
-        "bytes": 51637,
+        "bytes": 54901,
         "kind": "integration",
         "path": "tests/moe/test_cake_mxfp4_situ_moe_cute.py",
-        "sha256": "0b3bb6870745f5805c6bb87408ca962166ba3e057526fc93c4da59c38ffef92d"
+        "sha256": "33cc3904afe0a86372758dbe6417a91ea0bb91b51552a8a4d26e115d8371c47e"
       }
     ],
     "integration_status": "complete: kernel modules, host plan, kernel loader, tests and docs page rendered; plan parity and coverage checked",
@@ -3561,10 +3561,10 @@
     },
     "shared_files": [
       {
-        "bytes": 16831,
+        "bytes": 17858,
         "kind": "shared",
         "path": "docs/api/cake_mxfp4_situ_moe.rst",
-        "sha256": "120eb51347bc0a1fc92f631714b159272e3d17ebc6bff8cf95b7d36cff9f0f71"
+        "sha256": "912266cde71aefcf5992af9ee47a0a425b7bf6b52594859156df0cbdaf169e63"
       }
     ],
     "sibling_backend_forms": {
@@ -28160,7 +28160,7 @@
   ],
   "name": "cake_mxfp4_situ_moe_cute",
   "producer": "cake",
-  "producer_revision": "51f777c462d446534d5caf98d4c3f16c3ba9d5ef",
+  "producer_revision": "05d77ebefb943c5cf39914ee6f6aed01a43bb86a",
   "public_namespace": "cake",
   "schema": "cake.library_export.v5",
   "sequences": []

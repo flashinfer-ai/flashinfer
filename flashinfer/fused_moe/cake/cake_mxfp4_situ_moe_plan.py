@@ -381,7 +381,10 @@ MOE_SORT_CLUSTER_MAX_TOKENS = 1024          # routing_common.cu:98 ClusterKernel
 MOE_SORT_CONTIGUOUS_WINDOW_MIN_TOKENS = 65536   # mUseContiguousRouteWindows (kimi_k3_mxfp4_situ_moe_sort.CONTIGUOUS_WINDOW_MIN_TOKENS)
 
 
-CONTRACT_SM_COUNT = 148                     # B300 (sm_103a): the contract's device; the K6 grid / state selection take it explicitly
+CONTRACT_SM_COUNT = 148                     # B300 (sm_103a): the contract's device; the host-only policy / plan_config default
+
+
+SM_COUNT_SOURCES = ("device", "override", "contract")   # CakeMxfp4MoEWrapper.sm_count_source
 
 
 ROUTE_PREPROCESS_THREADS = 256              # mxfp4_routing.py:908 (_plan_route_preprocess default)
@@ -391,6 +394,38 @@ FINALIZE_ROWS_THREADS = 256                 # mxfp4_finalize.py:297 (plan_finali
 
 
 PARALLEL_MODES = ("single", "expert_parallel", "moe_tensor_parallel")
+
+
+def device_sm_count(device=None) -> int:
+    """The SM count the plan is decided for when no ``sm_count`` is given: the CUDA device's
+    ``multi_processor_count`` (``getMultiProcessorCount()`` of ``runPostTopKPipeline``, routing_common.cu:134;
+    the hand-written pipeline reads it once from the current device).  ``device`` = the current device by default."""
+    import torch
+
+    if device is None:
+        device = torch.cuda.current_device()
+    return int(torch.cuda.get_device_properties(device).multi_processor_count)
+
+
+def resolve_runner_sm_count(plan_sm_count: int, source: str, device_sms: int) -> int:
+    """The SM count a chain runner sizes every launch with (the K6 cooperative grid ``SMs - 8`` and its per-thread
+    state, the persistent GEMM grids ``min(tiles, SMs)``): the plan's own ``sm_count``, one count for decision and
+    launch like the hand-written wrapper's ``smCount``.  A device-resolved (or contract-default) plan must run on a
+    device with exactly that SM count; an explicit ``sm_count=`` override may differ from the device as long as the
+    cooperative ``moe_sort`` grid stays co-resident (``plan_sm_count - 8 <= device_sms``)."""
+    if source not in SM_COUNT_SOURCES:
+        raise ValueError(f"unknown sm_count source {source!r}; expected one of {SM_COUNT_SOURCES}")
+    if device_sms == plan_sm_count:
+        return int(plan_sm_count)
+    if source != "override":
+        raise RuntimeError(f"the plan was decided for {plan_sm_count} SMs (K6 tier state / grid); the device has "
+                           f"{device_sms}: construct CakeMxfp4MoEWrapper under torch.cuda.device(<device>) or pass "
+                           f"sm_count={device_sms}")
+    coop = plan_sm_count - MOE_SORT_RESERVED_SMS
+    if coop > device_sms:
+        raise RuntimeError(f"sm_count={plan_sm_count} override: the cooperative moe_sort grid of {coop} CTAs exceeds the "
+                           f"device's {device_sms} SMs (the grid must be co-resident)")
+    return int(plan_sm_count)
 
 
 def moe_sort_expert_tier(num_experts: int) -> int:
@@ -2277,13 +2312,19 @@ class ExecutedLaunch:
     grid: tuple[int, int, int]
 
 
-def executed_chain_record(chain: str, decision: PlanDecision, launches: tuple[ExecutedLaunch, ...]) -> dict[str, Any]:
+def _runner_sm_count(wrapper, device) -> int:
+    """``resolve_runner_sm_count`` of ``wrapper`` against the SM count of ``device`` (the plan's tensors' device)."""
+    return resolve_runner_sm_count(wrapper.policy.sm_count, wrapper.sm_count_source, device_sm_count(device))
+
+
+def executed_chain_record(chain: str, decision: PlanDecision, launches: tuple[ExecutedLaunch, ...],
+                          sm_count: int | None = None) -> dict[str, Any]:
     """The ``executed_chain`` label of one planned row: the chain the runner enqueued (``chain``), the chain the
     hand-written decision table selects (``decided_path``), the per-kernel backends, and whether they agree."""
     backends = sorted({l.backend for l in launches})
     return {"chain": chain, "decided_path": decision.path, "executes_decided_chain": chain == decision.path,
             "launches": [{"step": l.step, "form": l.form, "backend": l.backend, "grid": list(l.grid)} for l in launches],
-            "backends": backends, "mixed_backend": len(backends) > 1}
+            "backends": backends, "mixed_backend": len(backends) > 1, "sm_count": sm_count}
 
 
 def _route_operands(b: dict[str, Any], topk_ids, topk_weights) -> tuple[str, Any, tuple[int, int], Any, Any]:
@@ -2337,7 +2378,7 @@ class CakeSwapAbPlan:
         self._gemm2 = build_gemm2_module(self.backend, decision.gemm2)
         rt = _routing_module()
         gm = _gemm_module()
-        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.sm_count = sms = _runner_sm_count(wrapper, self.device)
         H, I, K, L = pol.hidden_size, pol.intermediate_shard, pol.top_k, pol.num_local_experts
         output_words = T * H // 2
         self._routing_grid = (rt.launch_grid(cfg, output_words), 1, 1)
@@ -2380,7 +2421,7 @@ class CakeSwapAbPlan:
 
     @property
     def executed_chain(self) -> dict[str, Any]:
-        return executed_chain_record("plain", self.decision, self.launches)
+        return executed_chain_record("plain", self.decision, self.launches, self.sm_count)
 
     def launch_sequence(self) -> tuple[tuple[str, tuple[int, int, int]], ...]:
         return (("routing_fused", self._routing_grid), ("gemm1_swapab_situ", self._gemm1_grid),
@@ -2428,9 +2469,7 @@ class CakeDensePlan:
         pol = wrapper.policy
         H, I, K, L = pol.hidden_size, pol.intermediate_shard, pol.top_k, pol.num_local_experts
         E, offset = pol.layout.num_experts, pol.layout.local_expert_offset
-        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
-        if sms != pol.sm_count:
-            raise RuntimeError(f"the plan was decided for {pol.sm_count} SMs (K6 tier state / grid); the device has {sms}")
+        self.sm_count = sms = _runner_sm_count(wrapper, self.device)
         cfg = dense_launch_config(pol, decision)
         self.mode, weights_src, w_strides, self.route_weights, self.route_ids = _route_operands(b, topk_ids, topk_weights)
         self.expanded_idx_to_permuted_idx = b["out_expanded_idx_to_permuted_idx"]
@@ -2528,7 +2567,7 @@ class CakeDensePlan:
 
     @property
     def executed_chain(self) -> dict[str, Any]:
-        return executed_chain_record("dense", self.decision, self.launches)
+        return executed_chain_record("dense", self.decision, self.launches, self.sm_count)
 
     @property
     def dual(self) -> bool:
@@ -2589,7 +2628,7 @@ class CakeSplitPlan:
         self.mode, weights_src, w_strides, self.route_weights, self.route_ids = _route_operands(b, topk_ids, topk_weights)
         self.expanded_idx_to_permuted_idx = b["out_expanded_idx_to_permuted_idx"]
         rt, gm, g1d, g2d, fin = _routing_module(), _gemm_module(), _gemm1_dense_module(), _gemm2_dense_module(), _finalize_module()
-        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
+        self.sm_count = sms = _runner_sm_count(wrapper, self.device)
         H, I, K, L = pol.hidden_size, pol.intermediate_shard, pol.top_k, pol.num_local_experts
         tiles, rows, wide_slots = decision.tiles, decision.rows, cfg["wide_slots"]
         self._unused = unused_launch_operands(self.device, group_capacity=tiles)
@@ -2657,7 +2696,7 @@ class CakeSplitPlan:
 
     @property
     def executed_chain(self) -> dict[str, Any]:
-        return executed_chain_record("split_two_stage", self.decision, self.launches)
+        return executed_chain_record("split_two_stage", self.decision, self.launches, self.sm_count)
 
     def launch_sequence(self) -> tuple[tuple[str, tuple[int, int, int]], ...]:
         return tuple((l.step, l.grid) for l in self.launches)
@@ -2707,9 +2746,7 @@ class CakeHybridPlan:
         pol = wrapper.policy
         H, I, K, L = pol.hidden_size, pol.intermediate_shard, pol.top_k, pol.num_local_experts
         E, offset = pol.layout.num_experts, pol.layout.local_expert_offset
-        sms = torch.cuda.get_device_properties(self.device).multi_processor_count
-        if sms != pol.sm_count:
-            raise RuntimeError(f"the plan was decided for {pol.sm_count} SMs (K6 tier state / grid); the device has {sms}")
+        self.sm_count = sms = _runner_sm_count(wrapper, self.device)
         cfg = hybrid_launch_config(pol, decision)
         self.mode, weights_src, w_strides, self.route_weights, self.route_ids = _route_operands(b, topk_ids, topk_weights)
         self.expanded_idx_to_permuted_idx = b["out_expanded_idx_to_permuted_idx"]
@@ -2788,7 +2825,7 @@ class CakeHybridPlan:
 
     @property
     def executed_chain(self) -> dict[str, Any]:
-        return executed_chain_record("hybrid", self.decision, self.launches)
+        return executed_chain_record("hybrid", self.decision, self.launches, self.sm_count)
 
     def launch_sequence(self) -> tuple[tuple[str, tuple[int, int, int]], ...]:
         return tuple((l.step, l.grid) for l in self.launches)
@@ -2821,10 +2858,26 @@ class CakeMxfp4MoEWrapper:
                  num_local_experts: int | None = None, local_expert_offset: int | None = None,
                  intermediate_shard: int | None = None, backend: str = PACKAGE_BACKEND, enable_pdl: bool = False,
                  swapab_n_tile: int = SWAP_ROW_TILE, swapab_max_tokens: int | None = None,
-                 swapab_tile_policy=None, sm_count: int = CONTRACT_SM_COUNT):
+                 swapab_tile_policy=None, sm_count: int | None = None):
         if backend != PACKAGE_BACKEND:
             raise ValueError(f"this package serves backend={PACKAGE_BACKEND!r}, got {backend!r}")
         self.backend = backend
+        # The SM count the plan is decided for (K6 cooperative grid ``SMs - 8``, its bounded / generic per-thread
+        # state, the persistent GEMM grids): the current CUDA device's, read once at construction like the
+        # hand-written ``runPostTopKPipeline`` (``static int const smCount = getMultiProcessorCount()``); an
+        # explicit ``sm_count`` is the caller's decision (a plan for another part, e.g. 152 SMs on a 148-SM device
+        # for validation: the runner then requires the cooperative grid to stay co-resident); without CUDA the
+        # host-only decision table uses the contract's 148 (``plan`` needs CUDA anyway).
+        if sm_count is None:
+            import torch
+
+            if torch.cuda.is_available():
+                sm_count, self.sm_count_source = device_sm_count(), "device"
+            else:
+                sm_count, self.sm_count_source = CONTRACT_SM_COUNT, "contract"
+        else:
+            self.sm_count_source = "override"
+        self.sm_count = int(sm_count)
         self.num_experts = int(num_experts)
         self.top_k = int(top_k)
         self.hidden_size = int(hidden_size)

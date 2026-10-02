@@ -39,6 +39,21 @@ hand-written ``CuteDslMxfp4MoEWrapper`` / ``Mxfp4MoESwapAbPlan`` decision for
 decision (``swapab_max_tokens``, tile policy, group rows, stage depths, weight
 grouping, fused-routing cap, PDL chain, workspace layout, launch sequence).
 
+The plan is decided per device: ``CakeMxfp4MoEWrapper`` reads the CUDA device's
+SM count once at construction (the current device; ``sm_count_source ==
+"device"``), exactly as the hand-written ``runPostTopKPipeline`` sizes its
+cooperative routing launch, and every SM-dependent choice follows from that one
+count -- the cooperative ``moe_sort`` grid (``SMs - 8`` CTAs: 140 on the 148-SM
+B300, 144 on the 152-SM GB300), its bounded / generic per-thread state
+(``T * top_k <= 4 * (SMs - 8) * 896``) and the persistent GEMM grids
+(``min(tiles, SMs)``).  ``plan()`` refuses a device whose SM count differs from
+the one the plan was decided for.  An explicit ``sm_count=`` is the caller's
+decision (a plan for another part; the runner then requires the cooperative grid
+to stay co-resident); without CUDA the host-only decision table uses the
+contract's 148.  The served rows' selections are the same on 148 and 152 SMs; the
+contract evidence (gate oracle, bitwise / BF16-class agreement, timings) was
+measured on the 148-SM B300.
+
 .. code-block:: python
 
     import torch

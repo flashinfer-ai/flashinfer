@@ -397,6 +397,54 @@ def test_wrapper_refuses_the_other_backend():
         )
 
 
+def test_plan_is_decided_for_the_device_sm_count():
+    """The plan decides the cooperative ``moe_sort`` grid (``SMs - 8``) and its per-thread state from the device's
+    SM count, read once at construction like the hand-written ``runPostTopKPipeline`` (B300 148 SMs, GB300 152);
+    without CUDA the host-only decision table uses the contract's 148.  An explicit ``sm_count=`` is the caller's
+    decision.  The served rows' selections do not depend on the count across the ``sm_103a`` parts."""
+    runner = _runner(EP8)
+    if torch.cuda.is_available():
+        sms = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        assert runner.sm_count_source == "device"
+        assert runner.sm_count == runner.policy.sm_count == sms
+    else:
+        assert runner.sm_count_source == "contract"
+        assert runner.sm_count == plan.CONTRACT_SM_COUNT == 148
+    forced = _runner(EP8, sm_count=152)
+    assert forced.sm_count_source == "override" and forced.policy.sm_count == 152
+    coop = forced.decide(2048).launch_plan[2]
+    assert coop.step == "moe_sort_coop" and "grid 144 x 896" in coop.hw
+    assert "152 SMs" in coop.hw
+    # The bounded NumTop16Experts state while T * 16 <= 4 * (SMs - 8) * 896.
+    assert plan.moe_sort_bounded_state(32256, TOP_K, 896, 152)
+    assert not plan.moe_sort_bounded_state(32257, TOP_K, 896, 152)
+    assert plan.moe_sort_max_tokens_coop(896, TOP_K, 152) == 516096
+    with pytest.raises(ValueError):
+        _runner(EP8, sm_count=8)
+    # Same decision (path, launches, forms) at 148 and 152 SMs on every served row of both layouts.
+    for layout in (EP8, TP8):
+        a, b = _runner(layout, sm_count=148), _runner(layout, sm_count=152)
+        for T in (1, 16, 17, 128, 512, 1024, 2048, 4096, 8192, 16384, 32768):
+            da, db = a.decide(T), b.decide(T)
+            assert (da.supported, da.path, da.launches) == (
+                db.supported,
+                db.path,
+                db.launches,
+            )
+            assert [l.form for l in da.launch_plan] == [l.form for l in db.launch_plan]
+            assert a.get_workspace_size(T) == b.get_workspace_size(T)
+    # The runner's consistency rule (pure): a device-resolved plan runs on its device only; an override may
+    # differ while the cooperative grid stays co-resident.
+    assert plan.resolve_runner_sm_count(148, "device", 148) == 148
+    assert plan.resolve_runner_sm_count(152, "override", 148) == 152
+    with pytest.raises(RuntimeError, match="decided for 148 SMs"):
+        plan.resolve_runner_sm_count(148, "device", 152)
+    with pytest.raises(RuntimeError, match="co-resident"):
+        plan.resolve_runner_sm_count(160, "override", 148)
+
+
 # --- coverage: every plan selection over the served geometry is in the package -------------
 
 
@@ -1160,6 +1208,15 @@ def test_executable_path_rows_match_the_gate_oracle(row, record_property):
         assert p.executed_chain["chain"] == "split_two_stage"
     else:
         raise AssertionError(f"unexpected executed chain {chain!r}")
+    # Every launch is sized by the device's SM count the plan was decided for: the cooperative moe_sort grid
+    # is ``SMs - 8`` CTAs (148-SM B300: 140, 152-SM GB300: 144).
+    sms = torch.cuda.get_device_properties(out.device).multi_processor_count
+    record = p.executed_chain
+    assert record["sm_count"] == p.sm_count == sms
+    for launch in record["launches"]:
+        if launch["step"] == "moe_sort_coop":
+            assert launch["grid"] == [sms - plan.RESERVED_SMS, 1, 1], launch
+    record_property(f"{row}_sm_count", sms)
     ref, ref_abs = _gate_oracle(inputs, layout)
     assert out.abs().sum() > 0
     _assert_gate_class(out, ref, f"{BACKEND}_{row}", record_property)
