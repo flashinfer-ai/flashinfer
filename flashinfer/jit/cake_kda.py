@@ -120,7 +120,11 @@ def get_cake_kda_affine_module_specs() -> tuple[CakeKDAAffineModuleSpec, ...]:
                     binding_path=_cake_kda_source(csrc_dir, binding),
                     sources=tuple(
                         _cake_kda_source(csrc_dir, name)
-                        for name in (body, role_header, *_CAKE_KDA_AFFINE_COMMON_HEADERS)
+                        for name in (
+                            body,
+                            role_header,
+                            *_CAKE_KDA_AFFINE_COMMON_HEADERS,
+                        )
                     ),
                 )
             )
