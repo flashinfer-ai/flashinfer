@@ -194,12 +194,21 @@ def test_prepared_host_path_selects_routes_without_device_synchronization(
 
 
 @_REQUIRES_CUDA
-@pytest.mark.parametrize("num_splits", [3, 10])
-def test_prepared_rejects_unsupported_b4_splits(monkeypatch, num_splits) -> None:
+@pytest.mark.parametrize(
+    ("num_splits", "message"),
+    [
+        (True, "num_splits must be None or an integer"),
+        (3, "num_splits must be None or an integer"),
+        (10, "shape does not select an exported split tile"),
+    ],
+)
+def test_prepared_rejects_unsupported_b4_splits(monkeypatch, num_splits, message):
+    """The base API's split validation and its messages are unchanged."""
+
     monkeypatch.setattr(prepared, "_check_exact_sm110a", lambda device: None)
     q, kv, lengths = _inputs(4, 256, [64, 127, 191, 256], 95902)
     inputs = {"Q": q, "KV": kv, "O": torch.empty_like(q), "sequence_lengths": lengths}
-    with pytest.raises(ValueError, match="exported split tile"):
+    with pytest.raises(ValueError, match=message):
         prepared.prepare_for_launch(inputs, num_splits=num_splits)
 
 
