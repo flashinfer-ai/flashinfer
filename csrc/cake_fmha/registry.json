@@ -875,17 +875,6 @@
         },
         {
           "selector": {
-            "ENABLE_SINK": 1,
-            "IS_CAUSAL": 0,
-            "RETURN_LSE": 1
-          },
-          "sources": {
-            "sm_100a": "cuda/context_fp8/enable_sink1_is_causal0_return_lse1.cu",
-            "sm_103a": "cuda/context_fp8/enable_sink1_is_causal0_return_lse1.cu"
-          }
-        },
-        {
-          "selector": {
             "ENABLE_SINK": 0,
             "IS_CAUSAL": 1,
             "RETURN_LSE": 0
@@ -915,17 +904,6 @@
           "sources": {
             "sm_100a": "cuda/context_fp8/enable_sink0_is_causal1_return_lse1.cu",
             "sm_103a": "cuda/context_fp8/enable_sink0_is_causal1_return_lse1.cu"
-          }
-        },
-        {
-          "selector": {
-            "ENABLE_SINK": 1,
-            "IS_CAUSAL": 1,
-            "RETURN_LSE": 1
-          },
-          "sources": {
-            "sm_100a": "cuda/context_fp8/enable_sink1_is_causal1_return_lse1.cu",
-            "sm_103a": "cuda/context_fp8/enable_sink1_is_causal1_return_lse1.cu"
           }
         }
       ],
@@ -1232,33 +1210,8 @@
         }
       ],
       "public_symbol": "kernel_cake_fmha_context_nvfp4",
-      "qmul4_implementations": {
-        "default": "portable_public_ptx",
-        "native": "cubin_patch_v1",
-        "native_source_family_members": 1,
-        "patch_module": "runtime/cake_fmha_qmul4.py",
-        "unpatched_native_load_allowed": false
-      },
       "source_family": [
         {
-          "native_qmul4": {
-            "expected_marker_counts": {
-              "sm_100a": {
-                "5": 12,
-                "6": 12
-              },
-              "sm_103a": {
-                "5": 12,
-                "6": 12
-              }
-            },
-            "patch_module": "runtime/cake_fmha_qmul4.py",
-            "protocol": "cubin_patch_v1",
-            "sources": {
-              "sm_100a": "cuda/context_nvfp4/native_qmul4/enable_sink0_is_causal1_return_lse0_static_one_tile1.cu",
-              "sm_103a": "cuda/context_nvfp4/native_qmul4/enable_sink0_is_causal1_return_lse0_static_one_tile1.cu"
-            }
-          },
           "selector": {
             "ENABLE_SINK": 0,
             "IS_CAUSAL": 1,
@@ -1375,8 +1328,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_bf16/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16/default.cu"
           }
         }
       ],
@@ -1484,8 +1437,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd256_p16/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd256_p16/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_bf16_hd256_p16/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_hd256_p16/default.cu"
           }
         }
       ],
@@ -1593,8 +1546,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd256_p32/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd256_p32/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_bf16_hd256_p32/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_hd256_p32/default.cu"
           }
         }
       ],
@@ -1702,8 +1655,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd256_p64/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd256_p64/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_bf16_hd256_p64/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_hd256_p64/default.cu"
           }
         }
       ],
@@ -1811,8 +1764,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_hd64/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_hd64/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_bf16_hd64/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_hd64/default.cu"
           }
         }
       ],
@@ -1915,8 +1868,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_mtp_n32/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_mtp_n32/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_bf16_mtp_n32/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_mtp_n32/default.cu"
           }
         }
       ],
@@ -2019,8 +1972,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16_mtp_n64/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16_mtp_n64/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_bf16_mtp_n64/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16_mtp_n64/default.cu"
           }
         }
       ],
@@ -2133,8 +2086,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_bf16q/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_bf16q/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_bf16q/default.cu",
+            "sm_103a": "cuda/decode_balanced_bf16q/default.cu"
           }
         }
       ],
@@ -2242,8 +2195,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_fp16/default.cu",
+            "sm_103a": "cuda/decode_balanced_fp16/default.cu"
           }
         }
       ],
@@ -2346,8 +2299,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16_mtp_n32/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16_mtp_n32/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_fp16_mtp_n32/default.cu",
+            "sm_103a": "cuda/decode_balanced_fp16_mtp_n32/default.cu"
           }
         }
       ],
@@ -2450,8 +2403,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16_mtp_n64/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16_mtp_n64/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_fp16_mtp_n64/default.cu",
+            "sm_103a": "cuda/decode_balanced_fp16_mtp_n64/default.cu"
           }
         }
       ],
@@ -2564,8 +2517,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp16q/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp16q/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_fp16q/default.cu",
+            "sm_103a": "cuda/decode_balanced_fp16q/default.cu"
           }
         }
       ],
@@ -2678,8 +2631,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_balanced_fp8/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_balanced_fp8/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_balanced_fp8/default.cu",
+            "sm_103a": "cuda/decode_balanced_fp8/default.cu"
           }
         }
       ],
@@ -3347,8 +3300,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p16/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p16/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p16/default.cu"
           }
         }
       ],
@@ -3473,8 +3426,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p32/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p32/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p32/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p32/default.cu"
           }
         }
       ],
@@ -3599,8 +3552,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p64/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p64/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n32_p64/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n32_p64/default.cu"
           }
         }
       ],
@@ -3725,8 +3678,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p16/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p16/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p16/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p16/default.cu"
           }
         }
       ],
@@ -3851,8 +3804,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p32/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p32/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p32/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p32/default.cu"
           }
         }
       ],
@@ -3977,8 +3930,8 @@
         {
           "selector": {},
           "sources": {
-            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p64/sm_100a/default.cu",
-            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p64/sm_103a/default.cu"
+            "sm_100a": "cuda/decode_native_bf16_hd256_smallm_n64_p64/default.cu",
+            "sm_103a": "cuda/decode_native_bf16_hd256_smallm_n64_p64/default.cu"
           }
         }
       ],
@@ -4651,15 +4604,6 @@
             "sm_100a": "cuda/decode_quant_bf16q/page_size32.cu",
             "sm_103a": "cuda/decode_quant_bf16q/page_size32.cu"
           }
-        },
-        {
-          "selector": {
-            "PAGE_SIZE": 64
-          },
-          "sources": {
-            "sm_100a": "cuda/decode_quant_bf16q/page_size64.cu",
-            "sm_103a": "cuda/decode_quant_bf16q/page_size64.cu"
-          }
         }
       ],
       "threads": 512
@@ -4783,16 +4727,6 @@
       "source_family": [
         {
           "selector": {
-            "FULL_BLOCKS": 0,
-            "PAGE_SIZE": 16
-          },
-          "sources": {
-            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks0_page_size16.cu",
-            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks0_page_size16.cu"
-          }
-        },
-        {
-          "selector": {
             "FULL_BLOCKS": 1,
             "PAGE_SIZE": 16
           },
@@ -4803,42 +4737,12 @@
         },
         {
           "selector": {
-            "FULL_BLOCKS": 0,
-            "PAGE_SIZE": 32
-          },
-          "sources": {
-            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks0_page_size32.cu",
-            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks0_page_size32.cu"
-          }
-        },
-        {
-          "selector": {
             "FULL_BLOCKS": 1,
             "PAGE_SIZE": 32
           },
           "sources": {
             "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size32.cu",
             "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size32.cu"
-          }
-        },
-        {
-          "selector": {
-            "FULL_BLOCKS": 0,
-            "PAGE_SIZE": 64
-          },
-          "sources": {
-            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks0_page_size64.cu",
-            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks0_page_size64.cu"
-          }
-        },
-        {
-          "selector": {
-            "FULL_BLOCKS": 1,
-            "PAGE_SIZE": 64
-          },
-          "sources": {
-            "sm_100a": "cuda/decode_quant_fp8/sm_100a/full_blocks1_page_size64.cu",
-            "sm_103a": "cuda/decode_quant_fp8/sm_103a/full_blocks1_page_size64.cu"
           }
         }
       ],
@@ -5019,39 +4923,8 @@
         }
       ],
       "public_symbol": "kernel_cake_fmha_decode_quant_nvfp4",
-      "qmul4_implementations": {
-        "default": "portable_public_ptx",
-        "native": "cubin_patch_v1",
-        "native_source_family_members": 3,
-        "patch_module": "runtime/cake_fmha_qmul4.py",
-        "unpatched_native_load_allowed": false
-      },
       "source_family": [
         {
-          "native_qmul4": {
-            "expected_marker_counts": {
-              "sm_100a": {
-                "0": 2,
-                "1": 2,
-                "2": 2,
-                "3": 2,
-                "4": 2
-              },
-              "sm_103a": {
-                "0": 2,
-                "1": 2,
-                "2": 2,
-                "3": 2,
-                "4": 2
-              }
-            },
-            "patch_module": "runtime/cake_fmha_qmul4.py",
-            "protocol": "cubin_patch_v1",
-            "sources": {
-              "sm_100a": "cuda/decode_quant_nvfp4/native_qmul4/page_size16.cu",
-              "sm_103a": "cuda/decode_quant_nvfp4/native_qmul4/page_size16.cu"
-            }
-          },
           "selector": {
             "PAGE_SIZE": 16
           },
@@ -5061,69 +4934,12 @@
           }
         },
         {
-          "native_qmul4": {
-            "expected_marker_counts": {
-              "sm_100a": {
-                "0": 2,
-                "1": 2,
-                "2": 2,
-                "3": 2,
-                "4": 2
-              },
-              "sm_103a": {
-                "0": 2,
-                "1": 2,
-                "2": 2,
-                "3": 2,
-                "4": 2
-              }
-            },
-            "patch_module": "runtime/cake_fmha_qmul4.py",
-            "protocol": "cubin_patch_v1",
-            "sources": {
-              "sm_100a": "cuda/decode_quant_nvfp4/native_qmul4/page_size32.cu",
-              "sm_103a": "cuda/decode_quant_nvfp4/native_qmul4/page_size32.cu"
-            }
-          },
           "selector": {
             "PAGE_SIZE": 32
           },
           "sources": {
             "sm_100a": "cuda/decode_quant_nvfp4/page_size32.cu",
             "sm_103a": "cuda/decode_quant_nvfp4/page_size32.cu"
-          }
-        },
-        {
-          "native_qmul4": {
-            "expected_marker_counts": {
-              "sm_100a": {
-                "0": 2,
-                "1": 2,
-                "2": 2,
-                "3": 2,
-                "4": 2
-              },
-              "sm_103a": {
-                "0": 2,
-                "1": 2,
-                "2": 2,
-                "3": 2,
-                "4": 2
-              }
-            },
-            "patch_module": "runtime/cake_fmha_qmul4.py",
-            "protocol": "cubin_patch_v1",
-            "sources": {
-              "sm_100a": "cuda/decode_quant_nvfp4/native_qmul4/page_size64.cu",
-              "sm_103a": "cuda/decode_quant_nvfp4/native_qmul4/page_size64.cu"
-            }
-          },
-          "selector": {
-            "PAGE_SIZE": 64
-          },
-          "sources": {
-            "sm_100a": "cuda/decode_quant_nvfp4/page_size64.cu",
-            "sm_103a": "cuda/decode_quant_nvfp4/page_size64.cu"
           }
         }
       ],
