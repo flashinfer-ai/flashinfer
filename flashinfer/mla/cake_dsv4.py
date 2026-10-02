@@ -79,6 +79,7 @@ from dataclasses import dataclass
 from typing import Any, Literal, Mapping, Optional, Sequence, Union
 
 import torch
+import tvm_ffi
 
 from ..utils import get_compute_capability
 
@@ -874,9 +875,43 @@ class _PreparedLaunch:
         self.module = module
         self.bound = bound
 
+    def import_tensors(self, imported: dict[int, tuple[torch.Tensor, Any]]) -> None:
+        """Import every CUDA tensor argument into the FFI once, before any launch.
+
+        Importing happens at call time otherwise, inside each FFI call, where
+        for the second launch of a two-stage route it sits between the two
+        kernels. ``imported`` is shared by the launches of one call so a tensor
+        both kernels take is imported once (keyed by id, which the stored
+        tensor keeps valid).
+        """
+        for i, arg in enumerate(self.bound):
+            if isinstance(arg, torch.Tensor) and arg.is_cuda:
+                entry = imported.get(id(arg))
+                if entry is None or entry[0] is not arg:
+                    entry = (arg, tvm_ffi.from_dlpack(arg))
+                    imported[id(arg)] = entry
+                self.bound[i] = entry[1]
+
     def __call__(self):
-        # Direct-source bindings use the target FFI current stream.
         return self.module.run(*self.bound)
+
+
+_ffi_devices: dict[int, Any] = {}
+
+
+def _ffi_stream_context(device: torch.device):
+    """FFI stream context for the current torch stream of ``device``.
+
+    Pre-imported tensors carry no stream, so the launch stream is set
+    explicitly (the torch tensors' own import would have recorded it).
+    """
+    stream = torch.cuda.current_stream(device)
+    index = stream.device.index
+    ffi_device = _ffi_devices.get(index)
+    if ffi_device is None:
+        ffi_device = tvm_ffi.device("cuda", index)
+        _ffi_devices[index] = ffi_device
+    return tvm_ffi.use_raw_stream(ffi_device, stream.cuda_stream)
 
 
 def _prepare_variant(
@@ -932,7 +967,9 @@ def _launch_variant(
 ):
     """Prepare and launch one variant (single-launch convenience)."""
     with _descriptor_lock:
-        return _prepare_variant(variant, arch=arch, grid=grid, values=values)()
+        return _Launcher.run(
+            _prepare_variant(variant, arch=arch, grid=grid, values=values)
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1211,9 +1248,21 @@ class _Launcher:
         )
 
     @staticmethod
-    def run(*launches: _PreparedLaunch) -> None:
+    def run(*launches: _PreparedLaunch):
+        """Import the CUDA tensors of every launch, then issue the FFI calls back to back."""
+        imported: dict[int, tuple[torch.Tensor, Any]] = {}
         for launch in launches:
-            launch()
+            launch.import_tensors(imported)
+        result = None
+        if not imported:  # no CUDA tensor argument (host-side tests)
+            for launch in launches:
+                result = launch()
+            return result
+        device = next(iter(imported.values()))[0].device
+        with _ffi_stream_context(device):
+            for launch in launches:
+                result = launch()
+        return result
 
     def partials(self, num_splits: int) -> dict[str, Any]:
         partial_o, partial_lse = _partial_views(

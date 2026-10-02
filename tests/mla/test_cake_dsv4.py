@@ -2146,7 +2146,11 @@ class _RecordingLauncher:
         self.calls: list[tuple[str, dict]] = []
 
     def variant(self, name, *, grid, **overrides):
-        self.calls.append((name, {"grid": grid, **overrides}))
+        return (name, {"grid": grid, **overrides})
+
+    def run(self, *launches):
+        # Launches are recorded in the order the dispatcher issues them.
+        self.calls.extend(launches)
 
     def partials(self, num_splits):
         return {
@@ -2161,7 +2165,7 @@ class _RecordingLauncher:
     def reduce(self, reducer, **overrides):
         tokens = self.values["num_query_tokens"]
         heads = self.values["num_heads"]
-        self.variant(reducer, grid=(tokens, heads, 1), **overrides)
+        return self.variant(reducer, grid=(tokens, heads, 1), **overrides)
 
 
 @pytest.mark.parametrize("arch", _ARCHES)
