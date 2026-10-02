@@ -22,12 +22,14 @@ namespace flashinfer::mamba::mtp {
 using namespace conversion;
 
 // Dispatch to the largest CTAS_PER_HEAD in the sequence where
-// (a) kDim / CTAS >= kMinRows (compile-time) and (b) ctas_per_head >= CTAS (runtime).
+// (a) CTAS divides kDim and kDim / CTAS is a multiple of kMinRows (compile-time) and
+// (b) ctas_per_head >= CTAS (runtime). Checking only kDim / CTAS >= kMinRows could
+// pick a split whose rows per CTA fail the kernel's static_asserts.
 // The sequence must be in descending order and end with 1 to guarantee a match.
 template <int kDim, int kMinRows, int CTAS, int... Rest, typename F>
 __host__ void dispatchCtasPerHead(int ctas_per_head, F&& launch,
                                   std::integer_sequence<int, CTAS, Rest...>) {
-  if constexpr (kDim / CTAS >= kMinRows) {
+  if constexpr (kDim % CTAS == 0 && (kDim / CTAS) % kMinRows == 0) {
     if (ctas_per_head >= CTAS) {
       launch.template operator()<CTAS>();
       return;
