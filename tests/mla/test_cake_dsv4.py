@@ -2161,7 +2161,12 @@ def test_bf16_h128_topk4x_launches_five_owners_and_the_split5_reducer(arch):
                 "O": parts["partial_O"],
             },
         ),
-        ("bf16_h128_split5_reduce", {"grid": (tokens, 128, 1), **parts}),
+        # The sm_103a split-5 reducer launches one CTA per four heads, the
+        # sm_100a one per head (their former family libraries' grids).
+        (
+            "bf16_h128_split5_reduce",
+            {"grid": (tokens, 32 if arch == "sm_103a" else 128, 1), **parts},
+        ),
     ]
 
 

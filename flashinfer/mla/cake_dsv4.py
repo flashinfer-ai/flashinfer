@@ -1323,9 +1323,15 @@ def _dispatch_route(route: str, L: _Launcher) -> None:
             total_work_items=work_items,
             **{**parts, "O": parts["partial_O"]},
         )
-        L.reduce(
-            "bf16_h128_split5_reduce" if num_splits == 5 else "split_reduce", **parts
-        )
+        if num_splits == 5:
+            # The two split-5 reducers are different kernels with different
+            # launch contracts (copied from their former family libraries):
+            # the sm_103a body runs grid (tokens, heads / 4), the sm_100a
+            # body grid (tokens, heads).
+            reducer_heads = H // 4 if L.arch == "sm_103a" else H
+            L.variant("bf16_h128_split5_reduce", grid=(T, reducer_heads, 1), **parts)
+        else:
+            L.reduce("split_reduce", **parts)
         return
 
     if route == "fp8_h64_source_exact":
