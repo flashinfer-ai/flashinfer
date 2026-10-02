@@ -46,6 +46,21 @@ Backend choices
                        ``"auto"`` admits it in the measured large-N regions
                        (see ``_top_k_varlen_heuristic``); a ``pre_idx`` is
                        accepted and ignored (the kernel takes no hint).
+``"radix_primitives"`` — coarse-histogram top-K written against the CuTe DSL
+                       *primitives* API (raw pointers + PTX wrappers, no layout
+                       algebra); sglang DeepSeek-V4 algorithm, one CTA per row.
+                       Ampere+ (sm_80+, incl. Rubin sm_107); explicit-only.
+``"walkfirst_primitives"`` — gvr_2-architecture walk-first ladder written
+                       against the primitives API, row-splitting at any k,
+                       exact fallback fused into the one launch; hint-free;
+                       fp32/fp16/bf16.  Ampere+; explicit-only (see the API
+                       docstring).
+``"cutlass_primitives"`` — the vendored cutlass-primitives library (its own
+                       router; register-resident, streaming and fallback
+                       kernels).  Ampere+; explicit-only.
+``"sglang"``         — vendored SGLang DeepSeek-V4 kernel (fp32, top_k <= 2048,
+                       N % 4 == 0; approximate on boundary bins with more than
+                       2048 ties); benchmark reference, explicit-only.
 ``"auto"``           — shape/dtype-aware ranking that tracks the measured
                        per-config winner (see ``_top_k_varlen_heuristic``):
                        gvr_2 for fp32, hinted or hint-free (one tiny
@@ -77,6 +92,8 @@ from ..utils import (
     BackendSupportedError,
     _get_cache_buf,
     backend_requirement,
+    device_support_pdl,
+    get_compute_capability,
     get_device_sm_count,
     get_shared_bytes_per_block_optin,
     supported_compute_capability,
@@ -98,6 +115,16 @@ _ALL_CCS = [75, 80, 86, 89, 90, 100, 103, 107, 110, 120, 121]
 # ``sm_107a`` natively. ``_cute_dsl_supports_arch`` below keeps a DSL that
 # predates the device from being selected.
 _BLACKWELL_PLUS_CCS = [100, 103, 107, 110, 120, 121]
+
+# Hopper-plus tiers; only used as the upper half of _AMPERE_PLUS_CCS below.
+_HOPPER_PLUS_CCS = [90, 100, 103, 107, 110, 120, 121]
+
+# radix_primitives / walk-first / cutlass_primitives / vendored sglang:
+# Ampere-plus.  The kernels' only SM90+ constructs (PDL / griddepcontrol, DSMEM
+# clusters) are compiled out or not selected below SM90; redux.sync and the
+# smem/gmem red/atom ops are SM80+.  Rubin (SM107) runs them as-is
+# (family-portable ops only).
+_AMPERE_PLUS_CCS = [80, 86, 89] + _HOPPER_PLUS_CCS
 
 # GVR is B200-class only (SM100/103/107). The non-LB (cluster_size=1) GVR
 # CuTe-DSL kernel fails to build on sm_120a: libNVVM rejects the generated
@@ -172,10 +199,15 @@ def _radix_cutlass_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    approx_ties=False,
+    page_table=None,
+    page_size=1,
 ):  # extra kwargs mirror the public signature; unused by the check
     """Radix masked-fallback: runs on all supported SM tiers, on contiguous
     logits (the CUDA launcher checks contiguity; gating here lets ``auto``
     pick a backend that handles strided views instead)."""
+    if page_table is not None:
+        return False  # no paged output here; see _PAGED_BACKENDS
     return logits.is_contiguous()
 
 
@@ -227,12 +259,17 @@ def _gvr_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    approx_ties=False,
+    page_table=None,
+    page_size=1,
 ):
     """Return True only when GVR can run on this exact configuration.
 
     Used by backend="auto" routing: returning False here causes the heuristic to
     fall back to radix or radix_cutlass rather than reaching GVR and crashing.
     """
+    if page_table is not None:
+        return False  # no paged output here; see _PAGED_BACKENDS
     if not (
         _cute_dsl_ready(logits.device)
         and pre_idx is not None
@@ -272,6 +309,9 @@ def _gvr2_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    approx_ties=False,
+    page_table=None,
+    page_size=1,
 ):
     """Return True only when the self-sampling GVR V2 port can run this config.
 
@@ -283,6 +323,8 @@ def _gvr2_top_k_varlen_check(
     sample, TRT-LLM #18410) when it is absent — or malformed, in which case the
     API body discards it with a RuntimeWarning first.
     """
+    if page_table is not None:
+        return False  # no paged output here; see _PAGED_BACKENDS
     if not _cute_dsl_ready(logits.device):
         return False
     # fp32 only: the upstream self-sampling kernels declare bf16/fp16 a
@@ -325,6 +367,9 @@ def _top_k_varlen_heuristic(
     backend: str = "auto",
     load_balance: bool = True,
     workspace=None,
+    approx_ties=False,
+    page_table=None,
+    page_size: int = 1,
 ):
     """Shape/dtype-aware ranking so auto tracks the measured per-config winner.
 
@@ -380,7 +425,12 @@ def _top_k_varlen_heuristic(
 
     The full signature must be spelled out (not **kwargs) so that the decorator can
     call this function with positional args on the skip_check=True path without
-    raising TypeError.  Mirrors the pattern used by _heuristic_func_mm_fp4.
+    raising TypeError.  Mirrors the pattern used by _heuristic_func_mm_fp4, so
+    every parameter of ``top_k_varlen`` must appear here (the decorator binds
+    the API defaults and forwards them all).  With ``page_table`` the ranking
+    is ``walkfirst_primitives`` then ``radix_primitives`` (the exact backends
+    with a fused paged kernel; ``sglang`` also serves paged output but is
+    approximate past 2048 boundary ties, so ``auto`` never picks it).
     Tolerates logits/seq_lens=None (hardware-independent unit tests) by
     falling back to a static order.
     """
@@ -390,6 +440,14 @@ def _top_k_varlen_heuristic(
         # so the API's own validation asserts fire (the heuristic must never
         # be the thing that rejects bad input).
         order = ["gvr_2", "gvr", "radix", "radix_cutlass"]
+        return [b for b in order if b in suitable_backends]
+
+    if page_table is not None:
+        # Fused paged output: walk-first, the decode default, ahead of
+        # radix_primitives (both exact; the approximate sglang kernel is left
+        # to explicit requests).  Without this an auto call with a page table
+        # had no candidate at all and raised instead of falling back.
+        order = ["walkfirst_primitives", "radix_primitives"]
         return [b for b in order if b in suitable_backends]
 
     fp32 = logits.dtype == torch.float32
@@ -459,12 +517,14 @@ if _CUTE_DSL_AVAILABLE:
     from .kernels.config import GvrTopKConfig, GvrTopKLBConfig
     from ..cute_dsl.utils import torch_to_cutlass_dtype
     from .kernels import (
+        CoarseHistTopKPrimitivesKernel,
         GvrTopKKernel,
         GvrTopKLBKernel,
         GvrTopKLBPrepareKernel,
         SinglePassMultiCTARadixTopKKernel,
     )
     from .kernels.radix_topk import STATE_SIZE as _RADIX_STATE_SIZE
+    from .kernels.radix_topk_primitives import mc_state_size as _prim_mc_state_size
 
 
 @functools.cache
@@ -494,6 +554,14 @@ def _radix_kernel_source_files() -> Tuple[str, ...]:
     from .kernels import radix_topk, block_scan
 
     return (__file__, radix_topk.__file__, block_scan.__file__)
+
+
+@functools.cache
+def _radix_primitives_kernel_source_files() -> Tuple[str, ...]:
+    # radix_topk_primitives.py is self-contained (no block_scan dependency).
+    from .kernels import radix_topk_primitives
+
+    return (__file__, radix_topk_primitives.__file__)
 
 
 @functools.cache
@@ -902,6 +970,157 @@ def _compile_radix(
     )
 
 
+def _prim_vec_elems(torch_dtype) -> int:
+    """Elements per 16B vector load in the primitives kernel."""
+    return 4 if torch_dtype == torch.float32 else 8
+
+
+def _prim_get_group_config(
+    N: int, torch_dtype, num_rows: int, num_sms: int
+) -> Tuple[int, int]:
+    """Return ``(ctas_per_group, chunk_elems)`` for the primitives backend.
+
+    Multi-CTA groups engage only where measured to beat single-CTA streaming
+    on B200: rows of at least 65536 elements AND enough spare SMs to split
+    each row into (near-)single-register-slot chunks (8192 elems bf16/fp16,
+    4096 fp32) -- one 16B vector per thread, read from gmem exactly once.
+    Probes showed the win comes from small chunks, not just more CTAs:
+    two-slot chunks pay enough register pressure that cpg=4 x 8K beats
+    cpg=2 x 16K by ~20%, and below N=65536 the group-barrier floor
+    (~4 gmem spin barriers) always loses to one CTA streaming the row.
+    """
+    ve = _prim_vec_elems(torch_dtype)
+    slot = 1024 * ve  # one register slot per thread
+    if N < 65536:
+        return 1, 0
+    want = math.ceil(N / slot)
+    ideal = num_sms // max(num_rows, 1)
+    # Long rows (>= 1 MB): a single CTA streams a 4 MB row at ~20 GB/s, so any
+    # one-wave split wins even below the 8-CTA gate measured for 64K rows
+    # (B200 fp32 1M b=64: 196 -> 118us at cpg=2, b=32: 192 -> 67us at cpg=4;
+    # Rubin 1M b=64: 178 -> 85us at cpg=3; 256K b=64: 44 -> 34us).
+    long_row = N * (4 if torch_dtype == torch.float32 else 2) >= (1 << 20)
+    if ideal < min(8, want) and not (long_row and ideal >= 2):
+        return 1, 0
+    ctas_per_group = min(ideal, want)
+    chunk = math.ceil(N / ctas_per_group)
+    chunk = ((chunk + ve - 1) // ve) * ve  # vector-aligned chunk starts
+    ctas_per_group = max(1, math.ceil(N / chunk))
+    if ctas_per_group == 1:
+        return 1, 0
+    return ctas_per_group, chunk
+
+
+@functools.cache
+def _compile_radix_primitives(
+    cute_dtype,
+    top_k,
+    next_n,
+    compress_ratio,
+    N,
+    return_output_values,
+    ctas_per_group=1,
+    chunk_elems=0,
+    num_sms=148,
+    min_blocks_per_mp=0,
+    approx_ties=False,
+    enable_pdl=True,
+    warp_agg=False,
+    reg_slots=2,
+    page_size=0,
+    cc=None,
+):
+    # N (vocab width) is static (matches _compile_radix's static-N convention);
+    # num_rows / sym_groups stay dynamic, so one compiled kernel serves every
+    # batch size at this specialization.  ctas_per_group == 1 is the
+    # one-block-per-row kernel (no scratch state at all); > 1 launches the
+    # multi-CTA group kernel, which needs the row_states scratch tensor.
+    # ``cc`` (the target device's capability) is part of the key only: the
+    # compiled image is arch-specific, and the caller sets the current device
+    # so the DSL compiles for it.
+    from ..jit.cute_dsl_core import build_and_load_cute_dsl_kernel
+
+    kernel = CoarseHistTopKPrimitivesKernel(
+        dtype=cute_dtype,
+        top_k=top_k,
+        next_n=next_n,
+        compress_ratio=compress_ratio,
+        return_values=return_output_values,
+        ctas_per_group=ctas_per_group,
+        chunk_elems=chunk_elems,
+        num_sms=num_sms,
+        min_blocks_per_mp=min_blocks_per_mp,
+        # fp32 collect classifies with two float compares against per-row
+        # bin-boundary values (~20 instructions once per row) instead of a
+        # per-element fp32->fp16 bin recompute; no effect for 16-bit dtypes.
+        boundary_cls=True,
+        approx_ties=approx_ties,
+        enable_pdl=enable_pdl,
+        warp_agg=warp_agg,
+        reg_slots=reg_slots,
+        page_size=page_size,
+        pt_pages=(-(-N // page_size) if page_size else 0),
+    )
+    sym_groups = cute.sym_int()  # number of requests (= num_rows // next_n)
+    sym_rows = sym_groups * next_n
+    max_num_groups = max(1, num_sms // ctas_per_group)
+    # page table: rows and pages both symbolic (the table may cover more pages
+    # than the width needs; unpaged launches pass a (1, 4) dummy)
+    sym_pt_rows = cute.sym_int()
+    sym_pages = cute.sym_int()
+
+    dtype_name = str(cute_dtype).split(".")[-1]
+    kernel_name = (
+        f"prim_{dtype_name}_topk{top_k}_nextn{next_n}_cr{compress_ratio}"
+        f"_N{N}_rv{int(return_output_values)}"
+        f"_cta{ctas_per_group}_chunk{chunk_elems}_sms{num_sms}"
+        f"_mb{min_blocks_per_mp}_bc1_ax{int(approx_ties)}_pdl{int(enable_pdl)}"
+        f"_wa{int(warp_agg)}{'' if reg_slots == 2 else f'_rs{reg_slots}'}"
+        f"{f'_ps{page_size}' if page_size else ''}"
+    )
+
+    def _compile_fn():
+        return cute.compile(
+            kernel,
+            cute.runtime.make_fake_compact_tensor(
+                cute_dtype, (sym_rows, N), stride_order=(1, 0), assumed_align=16
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (max_num_groups, kernel.state_size),
+                stride_order=(1, 0),
+            )
+            if ctas_per_group > 1
+            else None,
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_groups,), stride_order=(0,)
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            ),
+            cute.runtime.make_fake_compact_tensor(
+                cute_dtype, (sym_rows, top_k), stride_order=(1, 0), assumed_align=16
+            )
+            if return_output_values
+            else None,
+            cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (sym_pt_rows, sym_pages),
+                stride_order=(1, 0),
+                assumed_align=16,
+            ),
+            stream=cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+
+    return build_and_load_cute_dsl_kernel(
+        "radix_topk_primitives",
+        kernel_name,
+        _compile_fn,
+        extra_key_files=_radix_primitives_kernel_source_files(),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Internal: GVR backend implementation
 # ---------------------------------------------------------------------------
@@ -1197,7 +1416,7 @@ def _run_radix_cutlass(
     offsets = torch.zeros(num_rows, dtype=torch.int32, device=logits.device)
 
     row_states_buffer = _get_cache_buf(
-        f"radix_topk_row_states_{logits.device}",
+        f"radix_topk_row_states_{_scratch_tag(logits.device)}",
         1024 * 1024,
         logits.device,
         zero_init=True,
@@ -1249,10 +1468,15 @@ def _radix_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    approx_ties=False,
+    page_table=None,
+    page_size=1,
 ):
     """CuTe DSL multi-CTA radix: Blackwell-plus only, no pre_idx required.
     Overlapping row layouts (stride(0) < shape[1]) fail the kernel's stride
     contract, so they are gated here and ``auto`` falls through."""
+    if page_table is not None:
+        return False  # no paged output here; see _PAGED_BACKENDS
     if logits.dim() == 2 and logits.shape[0] > 1 and logits.stride(0) < logits.shape[1]:
         return False
     return _cute_dsl_ready(logits.device)
@@ -1321,7 +1545,7 @@ def _run_radix(
     nbytes = max_num_groups * _RADIX_STATE_SIZE * 4  # int32 → 4 bytes each
     row_states = (
         _get_cache_buf(
-            f"radix_row_states_{logits.device}",
+            f"radix_row_states_v2_{_scratch_tag(logits.device)}",  # _v2: + departure counter slot
             num_sms * _RADIX_STATE_SIZE * 4,  # worst case: ctas_per_group=1
             logits.device,
             zero_init=True,
@@ -1388,6 +1612,9 @@ def _radix_filter_top_k_varlen_check(
     backend="auto",
     load_balance=True,
     workspace=None,
+    approx_ties=False,
+    page_table=None,
+    page_size=1,
 ):
     """Return True only when the vendored DKG kernel covers this configuration.
 
@@ -1400,6 +1627,8 @@ def _radix_filter_top_k_varlen_check(
     input, so a hinted caller can use (or be routed by ``auto`` to) any
     hint-free backend.
     """
+    if page_table is not None:
+        return False  # no paged output here; see _PAGED_BACKENDS
     if not _cute_dsl_ready(logits.device):
         return False
     if not _radix_filter_kernel_dsl_ok():
@@ -1486,6 +1715,764 @@ def _run_radix_filter(
 
 
 # ---------------------------------------------------------------------------
+# Internal: vendored sglang DeepSeek-V4 kernel (benchmark reference backend)
+# ---------------------------------------------------------------------------
+
+
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _sglang_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+    page_table=None,
+    page_size=1,
+):
+    """Vendored sglang DSv4 ragged top-k: fp32 only, contiguous 16B-aligned
+    rows, runtime top_k <= 2048.  Paged output (``page_table``) is served,
+    fused into the one launch as upstream does it: indices only, no hints."""
+    if page_table is not None and (pre_idx is not None or return_values):
+        return False  # paged output: indices only (the raw columns are not kept)
+    # eligibility checks reject malformed input quietly (the API's own
+    # validation owns the error): a 1-D tensor has no shape[1], and a
+    # zero-width row has no vector to load (0 % 4 == 0 would pass below)
+    if not isinstance(logits, torch.Tensor) or logits.dim() != 2 or logits.shape[1] < 1:
+        return False
+    if logits.dtype != torch.float32:
+        return False
+    # the kernel reads rows with 16-byte vector loads from the raw pointer and
+    # the launcher takes every operand as-is (no per-call copies)
+    if not logits.is_contiguous() or (logits.data_ptr() & 15):
+        return False
+    if not (isinstance(seq_lens, torch.Tensor) and seq_lens.is_contiguous()):
+        return False
+    if logits.shape[1] % 4 != 0:
+        return False
+    return 0 < top_k <= 2048
+
+
+@functools.cache
+def _cached_sglang_dsv4_topk_module(capability: Tuple[int, int]):
+    from ..jit.topk import gen_sglang_dsv4_topk_module
+
+    return gen_sglang_dsv4_topk_module(capability).build_and_load()
+
+
+def _get_sglang_dsv4_topk_module(device=None):
+    """The vendored sglang module built for ``device``'s architecture (the
+    current device when ``None``): one single-arch image per capability."""
+    if device is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    return _cached_sglang_dsv4_topk_module(tuple(get_compute_capability(device)))
+
+
+def _run_sglang(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_output_values: bool,
+    out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Vendored sglang DSv4 kernel: one block per row, fp32 scores.
+
+    The FlashInfer launcher kernel derives each row's effective length
+    (``next_n`` / ``compress_ratio`` / clamp to ``[0, N]``) from the
+    request-level ``seq_lens`` on device, so with ``return_values=False``
+    this dispatcher issues no per-call device ops: the former host-side
+    ``//`` + ``clamp`` pair cost ~3.4 us per call as CUDA-graph nodes,
+    doubling the kernel's own ~3.3 us on decode rows (``return_values=True``
+    adds the value gather below, a handful of small device ops, as
+    ``radix_cutlass`` does).  Emitted indices are local column indices, -1
+    padded; with ``page_table`` (validated by the API) they are the physical
+    KV slots, mapped inside the launch by upstream's staged transform pass.
+    """
+    num_rows, _ = logits.shape
+    if num_rows == 0:
+        return out_indices, (out_values if return_output_values else None)
+
+    if page_table is not None:
+        pt_t, ps = page_table, page_size
+    else:  # unpaged: the launcher ignores the table when page_size == 0
+        pt_t = (
+            _get_cache_buf("topk_wf_pt_dummy", 16, logits.device, zero_init=True)[:16]
+            .view(torch.int32)
+            .view(1, 4)
+        )
+        ps = 0
+    _get_sglang_dsv4_topk_module(logits.device).sglang_dsv4_topk_varlen(
+        logits,
+        seq_lens,
+        out_indices,
+        next_n,
+        compress_ratio,
+        pt_t,
+        ps,
+        device_support_pdl(logits.device),
+    )
+
+    if return_output_values:
+        # Gather values at selected indices; -1 sentinel slots -> 0.
+        sentinel = out_indices < 0
+        gather_idx = out_indices.long().clamp_(min=0)
+        out_values.copy_(torch.gather(logits, 1, gather_idx))
+        out_values.masked_fill_(sentinel, 0)
+
+    return out_indices, (out_values if return_output_values else None)
+
+
+# ---------------------------------------------------------------------------
+# Internal: radix_primitives (CuTe DSL primitives API) backend implementation
+# ---------------------------------------------------------------------------
+
+
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _radix_primitives_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+    page_table=None,
+    page_size=1,
+):
+    """Coarse-histogram primitives kernel: Ampere+, no top_k bound, no
+    pre_idx required.  The kernel uses no Blackwell-specific features
+    (no clusters/TMA/tcgen05; redux.sync is SM80+, PDL is SM90+ and
+    compiled out below that); perf tuning constants were chosen on B200.
+    Paged output (``page_table``) is served by the single-CTA kernel, fused
+    into the one launch: indices only, any ``next_n`` / ``compress_ratio``."""
+    if page_table is not None and return_values:
+        return False  # paged output: indices only (the raw columns are not kept)
+    # malformed input is rejected quietly (the API's validation owns the
+    # error); the kernel takes compact operands as-is, so strided views and
+    # unsupported dtypes must fall through to a backend that copies
+    if not (
+        isinstance(logits, torch.Tensor)
+        and logits.dim() == 2
+        and logits.is_cuda
+        and logits.is_contiguous()
+        and logits.shape[1] >= 1
+        and logits.dtype in (torch.float32, torch.float16, torch.bfloat16)
+    ):
+        return False
+    if not (isinstance(seq_lens, torch.Tensor) and seq_lens.is_contiguous()):
+        return False
+    if page_table is not None:
+        # the paged single-CTA kernel stages top_k raw columns in shared memory
+        # on top of its histogram, tie stages and page-table cache: refuse what
+        # the device's opt-in shared memory cannot hold (99 KB parts at large k)
+        hist_bytes = 16384 if logits.dtype == torch.float32 else 32768
+        if (
+            hist_bytes + 16384 + 4 * top_k + 8192 + 2048
+            > get_shared_bytes_per_block_optin(logits.device)
+        ):
+            return False
+    # top_k <= 2048 resolves ties through the smem stage buffer; larger
+    # top_k adds a compile-time-gated direct-fill path (see _OP_EQFILL in
+    # the kernel), so there is no upper bound.
+    return _cute_dsl_ready(logits.device)
+
+
+def _run_radix_primitives(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_output_values: bool,
+    out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
+    approx_ties: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Coarse-histogram top-k (CuTe DSL primitives API): one block per row
+    (native varlen, no scratch, no inter-CTA sync), or multi-CTA groups for
+    long rows on small batches.  ``page_table`` (validated by the API)
+    selects the paged-output variant of the single-CTA kernel: every
+    selected column is emitted as its physical KV slot inside the one launch."""
+    cute_dtype = torch_to_cutlass_dtype(logits.dtype)
+    num_rows, N = logits.shape
+    if num_rows == 0:
+        # Empty batch: launching a grid of 0 blocks is a CUDA error.
+        return out_indices, (out_values if return_output_values else None)
+    num_sms = get_device_sm_count(logits.device)
+    ctas_per_group, chunk_elems = _prim_get_group_config(
+        N, logits.dtype, num_rows, num_sms
+    )
+    if page_table is not None or top_k > 2048:
+        # paged output lives in the single-CTA kernel (the multi-CTA group
+        # kernel has no paged epilogue); paged callers are decode steps whose
+        # rows are short, where one CTA per row is the right shape anyway.
+        # top_k > TIE_CAP (2048) likewise: the group kernel stages at most
+        # TIE_CAP strictly-greater hits per CTA (its invariant is gt < top_k
+        # <= TIE_CAP), while the single-CTA kernel has the EQFILL arms for
+        # big k.
+        ctas_per_group, chunk_elems = 1, 0
+
+    # seq_lens is passed through in raw token units: the kernel applies the
+    # next_n adjustment and compress_ratio division internally, exactly like
+    # the ``radix`` backend.
+    #
+    # Launch bounds and register-path capacity, one decision:
+    # - the one-block-per-row grid oversubscribes the SMs: min_blocks_per_mp=2
+    #   so two co-resident CTAs halve the tail wave (32 regs/thread fits two
+    #   1024-thread CTAs on SM100; the regime where sglang's
+    #   __launch_bounds__(1024, 2) was ahead) -- the register path keeps its
+    #   two-slot (8K fp32) shape there;
+    # - small batches: min_blocks_per_mp=1, i.e. __launch_bounds__(1024, 1),
+    #   so ptxas has the 64-register budget (left UNSET its heuristic squeezed
+    #   the exact kernel to 32 registers with a spill stack -- ncu 2026-09-29:
+    #   782 local loads per launch on 16 decode rows) and the register path
+    #   holds four vector slots: 16K fp32 rows stay in registers instead of the
+    #   streaming loop + scan collect, which cost 0.55 us of a 3.3 us decode
+    #   row against SGLang's TopKRegister<4> at that width;
+    # - multi-CTA groups: the kernel launches with its own bound (one CTA per
+    #   SM); four slots feed its solo arm (rows a single CTA resolves alone
+    #   inside a wide buffer), the chunk paths keep two.
+    if ctas_per_group == 1 and num_rows >= num_sms:
+        min_blocks, reg_slots = 2, 2
+    elif ctas_per_group == 1:
+        min_blocks, reg_slots = 1, 4
+    else:
+        min_blocks, reg_slots = 0, 4
+    # griddepcontrol (PDL) exists on SM90+ only; compile it out on Ampere.
+    cc = get_compute_capability(logits.device)
+    cc_major = cc[0]
+    enable_pdl = cc_major >= 9
+    # Ampere serializes same-address smem atomics: use the warp-aggregated
+    # walker there.  SM90+ measured FASTER with plain per-lane atomics.
+    warp_agg = cc_major == 8
+    if page_table is not None:
+        pt_t, ps = page_table, page_size
+    else:  # unpaged: the kernel never reads the table when page_size == 0
+        pt_t = (
+            _get_cache_buf("topk_wf_pt_dummy", 16, logits.device, zero_init=True)[:16]
+            .view(torch.int32)
+            .view(1, 4)
+        )
+        ps = 0
+    # The DSL compiles for the CURRENT device and the persistent cache tags
+    # artifacts by its architecture; both must agree with where the data
+    # lives on a multi-GPU host (the ``radix_filter`` dispatcher does the same).
+    with torch.cuda.device(logits.device):
+        compiled = _compile_radix_primitives(
+            cute_dtype,
+            top_k,
+            next_n,
+            compress_ratio,
+            N,
+            return_output_values,
+            ctas_per_group,
+            chunk_elems,
+            num_sms,
+            min_blocks,
+            approx_ties,
+            enable_pdl,
+            warp_agg,
+            reg_slots,
+            ps,
+            cc,
+        )
+
+        row_states = None
+        if ctas_per_group > 1:
+            # Per-group scratch: merged histogram + barrier/output counters +
+            # staged tie buffer.  zero_init on first allocation; the kernel
+            # self-resets everything it dirtied, so replays (and CUDA graphs)
+            # stay correct without re-zeroing.  Sized for the worst case
+            # (ctas_per_group=2 -> num_sms//2 groups) so the buffer never
+            # regrows.
+            #
+            # The cache key includes the state layout (fp32 has a smaller
+            # histogram, hence smaller per-group stride): the self-reset only
+            # guarantees zeros at the offsets of ITS layout, so sharing one
+            # buffer across layouts would let one dtype's (deliberately
+            # un-reset) stale tie buffer alias into the other's histogram.
+            is_f32 = logits.dtype == torch.float32
+            state_size = _prim_mc_state_size(is_f32)
+            max_num_groups = max(1, num_sms // ctas_per_group)
+            nbytes = max_num_groups * state_size * 4
+            row_states = (
+                _get_cache_buf(
+                    # _v2: layout grew by two tie-key-range slots; _v4: by the
+                    # departure counter.  A stale-layout buffer under an old
+                    # key must never be reused.
+                    f"radix_primitives_row_states_v4_{'f32' if is_f32 else 'f16'}_{_scratch_tag(logits.device)}",
+                    (num_sms // 2) * state_size * 4,
+                    logits.device,
+                    zero_init=True,
+                )[:nbytes]
+                .view(torch.int32)
+                .view(max_num_groups, state_size)
+            )
+
+        compiled(
+            logits,
+            row_states,
+            seq_lens,
+            out_indices,
+            out_values if return_output_values else None,
+            pt_t,
+        )
+    return out_indices, (out_values if return_output_values else None)
+
+
+# ---------------------------------------------------------------------------
+# Internal: scratch shared by the primitives selectors (walk-first)
+#
+# Outside the unpaged "auto" ranking (auto picks walk-first first for paged
+# output).  The walk-first kernel verifies on-device and reruns any missed row
+# through the exact fallback fused into the same launch, so results are always
+# exact and the calls are CUDA-graph capturable once warmed up.
+# ---------------------------------------------------------------------------
+
+
+def _scratch_tag(device) -> str:
+    """Suffix for MUTABLE scratch-buffer cache keys: device + current stream.
+
+    Scratch that a kernel mutates (arrival counters, tickets, slabs, status)
+    must not be shared between kernels that can run concurrently, i.e.
+    between streams.  Under CUDA-graph capture the current stream is the
+    capture stream, which the eager warm-up already used, so captured
+    graphs keep their buffers.  Read-only dummies stay stream-agnostic."""
+    return f"{device}_s{torch.cuda.current_stream(device).cuda_stream:x}"
+
+
+# Memoized (num_rows, device, stream) -> status view over the persistent cache
+# buffer.  Entries pin their own storage, so a later regrow for a bigger batch
+# never invalidates earlier views; a handful of live batch shapes costs a
+# handful of buffers.  Status holds 24 blocks of num_rows int32: block 0 is the
+# per-row status the kernel writes (0 = fast path, 1 = exact fallback, 2 =
+# flood refine; the tests' contract), the remaining blocks are written by
+# telemetry builds only (FLASHINFER_TOPK_PRIM_TELEMETRY=1).
+_prim_status_views: dict = {}
+
+
+def _prim_status(num_rows, device):
+    tag = _scratch_tag(device)
+    key = (num_rows, tag)
+    hit = _prim_status_views.get(key)
+    if hit is not None:
+        return hit
+    status = _get_cache_buf(f"topk_prim_status_{tag}", 24 * num_rows * 4, device)[
+        : 24 * num_rows * 4
+    ].view(torch.int32)[: 24 * num_rows]
+    _prim_status_views[key] = status
+    return status
+
+
+def _mc_splits_for(num_rows, N, device):
+    """Row-split factor for the walk-first kernel: fill the GPU when the
+    one-CTA-per-row grid would leave it idle (the occupancy regime where
+    gvr_2's row-splitting families win).
+
+    The split CTAs of a row coordinate within one wave (cluster shapes and
+    the gmem last-arriver path; see the one-wave guards in
+    _run_walkfirst_primitives), so the whole grid must be GUARANTEEDLY
+    co-resident, and the only cap guaranteed regardless of register pressure
+    is 1 CTA/SM (a 1024-thread CTA can never exceed 64 regs/thread, so 1/SM
+    always schedules; 2/SM would require <= 32 regs/thread, which the kernel
+    exceeds -- a 2x-SM budget DEADLOCKED an earlier spin-barrier kernel and
+    produced two waves plus wave skew here, both measured)."""
+    if N < 16384:
+        return 1
+    cap = get_device_sm_count(device)
+    per = cap // max(num_rows, 1)
+    for s in (16, 8, 4, 2):
+        if per >= s and (N // s) >= 4096:
+            return s
+    return 1
+
+
+# cluster shapes the walk-first dispatcher launches (DSMEM coordination)
+_CLUSTER_SHAPES = (2, 3, 4, 6)
+_cluster_caps: dict = {}  # device index -> {cluster_size: one-wave capacity}
+
+
+def _probe_cluster_caps(device_index: int) -> dict:
+    """{cluster_size: one-wave capacity in clusters} for every cluster shape
+    the dispatcher uses, for a 1-CTA/SM kernel (cuOccupancyMaxActiveClusters
+    via the DSL's HardwareInfo).  Cluster placement is GPC-granular, so
+    floor(SMs / S) overstates it: B200 (148 SMs) fits 45 clusters of 3, not
+    49, 33 of 4, not 37, 22 of 6, not 24; Rubin (208) 66 / 50 / 32 instead of
+    69 / 52 / 34.  Measured with the walk-first kernel: the first cluster past
+    the capacity runs as a second wave and doubles the wall time (B200 1M fp32
+    b=46 S3 69us vs 40us at b=45).  All shapes are probed together so one
+    eager call per device fills every entry a later CUDA-graph capture at
+    another batch size can need; costs one empty-kernel compile (~0.3s) per
+    shape per process.  The fallback if the query is unavailable is a 12.5%
+    haircut on floor(SMs / S), below every measured capacity."""
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    caps = {}
+    try:
+        from cutlass.utils import HardwareInfo
+
+        with torch.cuda.device(device_index):
+            torch.cuda.synchronize()  # the primary context must exist
+            hw = HardwareInfo(device_index)
+            for s in _CLUSTER_SHAPES:
+                caps[s] = int(hw.get_max_active_clusters(s))
+    except Exception:  # noqa: BLE001 -- occupancy query is best effort
+        caps = {s: (sms // s) * 7 // 8 for s in _CLUSTER_SHAPES}
+    return caps
+
+
+def _max_active_clusters(device_index: int, cluster_size: int) -> int:
+    """One-wave cluster capacity for ``cluster_size`` on ``device_index`` (see
+    _probe_cluster_caps).  Never probes under CUDA-graph capture, where the
+    probe's device synchronize would invalidate the capture: a device no eager
+    call has warmed gets the conservative estimate instead."""
+    caps = _cluster_caps.get(device_index)
+    if caps is None:
+        if torch.cuda.is_current_stream_capturing():
+            sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+            return (sms // cluster_size) * 7 // 8
+        caps = _probe_cluster_caps(device_index)
+        _cluster_caps[device_index] = caps
+    return caps[cluster_size]
+
+
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _walkfirst_primitives_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+    page_table=None,
+    page_size=1,
+):
+    """Walk-first (gvr_2-architecture) selector; fp32/fp16/bf16; the row
+    width must fill whole 16-byte vectors (N % 4 for fp32, N % 8 for the
+    16-bit dtypes).  Paged output (``page_table``) is served here, fused into
+    the one launch: hint-free, indices only, ``next_n == 1``."""
+    if page_table is not None and (pre_idx is not None or return_values):
+        return False  # paged output: hint-free, indices only (as gvr_2 in #5312)
+    # eligibility checks must reject malformed input quietly (the public
+    # API's asserts own the user-facing error): a 1-D tensor has no shape[1];
+    # the kernel takes compact operands as-is, so strided views fall through
+    if not (
+        isinstance(logits, torch.Tensor)
+        and logits.dim() == 2
+        and logits.is_cuda
+        and logits.is_contiguous()
+        and logits.shape[1] >= 1
+    ):
+        return False
+    if logits.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        return False
+    if not (isinstance(seq_lens, torch.Tensor) and seq_lens.is_contiguous()):
+        return False
+    if next_n != 1 or compress_ratio != 1 or return_values:
+        return False
+    ve = 4 if logits.dtype == torch.float32 else 8
+    if top_k > 2048 or logits.shape[1] % ve != 0:
+        return False
+    return _cute_dsl_ready(logits.device)
+
+
+# backends whose kernels emit physical KV slots through a page table inside
+# their one launch (the API's page_table argument)
+_PAGED_BACKENDS = ("walkfirst_primitives", "sglang", "radix_primitives")
+
+
+@supported_compute_capability(_AMPERE_PLUS_CCS)
+def _cutlass_primitives_top_k_varlen_check(
+    logits,
+    seq_lens,
+    top_k,
+    pre_idx=None,
+    compress_ratio=1,
+    next_n=1,
+    return_values=False,
+    out_indices=None,
+    out_values=None,
+    backend="auto",
+    load_balance=True,
+    workspace=None,
+    approx_ties=False,
+    page_table=None,
+    page_size=1,
+):
+    """The vendored cutlass_primitives library (one backend, its own router):
+    fp32/fp16/bf16, any ``top_k >= 1``, any 2-D layout (misaligned rows are
+    copied once into a padded arena), SM80+; ``next_n``, ``compress_ratio``
+    and ``return_values`` supported.  Hints are accepted and ignored."""
+    if page_table is not None:
+        return False  # no paged output here; see _PAGED_BACKENDS
+    if backend == "auto":
+        # never in the unpaged auto ranking and no paged kernel: skip the
+        # router (and the library import) the full check costs on every
+        # auto call
+        return False
+    if not (isinstance(logits, torch.Tensor) and logits.is_cuda):
+        return False
+    if not (isinstance(seq_lens, torch.Tensor) and seq_lens.is_contiguous()):
+        return False  # the kernels read the lengths as a compact vector
+    if not _cute_dsl_ready(logits.device):
+        return False
+    from .kernels.cutlass_primitives_backend import cutlass_primitives_supported
+
+    return cutlass_primitives_supported(
+        logits, top_k, next_n, compress_ratio, return_values
+    )
+
+
+def _run_cutlass_primitives(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    next_n: int,
+    compress_ratio: int,
+    return_values: bool,
+    out_indices: torch.Tensor,
+    out_values: Optional[torch.Tensor],
+    pre_idx: Optional[torch.Tensor] = None,
+    workspace: Optional[dict] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    from .kernels.cutlass_primitives_backend import run_cutlass_primitives
+
+    return run_cutlass_primitives(
+        logits,
+        seq_lens,
+        top_k,
+        next_n,
+        compress_ratio,
+        return_values,
+        out_indices,
+        out_values,
+        pre_idx,
+        workspace,
+    )
+
+
+def _run_walkfirst_primitives(
+    logits: torch.Tensor,
+    seq_lens: torch.Tensor,
+    top_k: int,
+    out_indices: torch.Tensor,
+    pre_idx: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+) -> Tuple[torch.Tensor, None]:
+    """``page_table`` (validated by the API: contiguous, 16-byte-aligned int32
+    ``(rows, max_pages)`` on the logits device covering each request's valid
+    length -- a narrower table clamps a row to its coverage -- ``page_size``
+    a power of two) selects the paged-output kernel variant: every selected
+    column is emitted as its physical KV slot inside the one launch (no
+    transform kernel, no host-side work per call)."""
+    from .kernels.walkfirst_topk_primitives import WF_ROW_INTS, get_walkfirst_kernel
+
+    num_rows, N = logits.shape
+    if num_rows == 0:
+        return out_indices, None
+    _cc = get_compute_capability(logits.device)  # cached per device
+    _sms = get_device_sm_count(logits.device)
+    # Zero-init slab of this backend's own row stride: the row survivor
+    # histogram lives in the slab tail (per-row width WF_ROW_INTS = 2*GCAP
+    # keys/idx + 256 hist ints) and self-resets, so it must never be shared
+    # with a kernel that leaves the slab dirty
+    n_slab = num_rows * WF_ROW_INTS
+    slab = (
+        _get_cache_buf(
+            f"topk_prim_wf_slab_{_scratch_tag(logits.device)}",
+            n_slab * 4,
+            logits.device,
+            zero_init=True,
+        )[: n_slab * 4]
+        .view(torch.int32)
+        .view(num_rows, WF_ROW_INTS)
+    )
+    status = _prim_status(num_rows, logits.device)
+    mc_state = _prim_mc_state(num_rows, logits.device)
+    # ONE true wave: this kernel runs 1 CTA/SM (register pressure), so
+    # _mc_splits_for caps the split budget at the SM count (a 2x-SM budget
+    # produced two waves and wave skew, measured: b=64 S=4 wall 19.9us vs
+    # better phase sums)
+    splits = _mc_splits_for(num_rows, N, logits.device)
+    if splits < 1:
+        splits = 1
+    # Widths up to 16K: one slice per row.  The policy above hands a 16K
+    # width S=4 at small batches, but every row that short takes the
+    # in-kernel short-row arm on slice 0 and the other three CTAs exit at
+    # once -- 48 idle cluster CTAs per 16-row decode step measured 0.07 us
+    # (3.50 -> 3.43 us on real decode traces, K=512; 1.74 -> 1.69 at K=2048,
+    # parity with SGLang's kernel).  Full 16K rows keep the S=1 walk.
+    if N <= 16384:
+        splits = 1
+    # Small-batch cluster preference (measured B200): the spin-safe policy
+    # picks S in {8, 16} at small batches, which lands on the gmem
+    # publish/arrival path (~2.5us of coordination).  When the device has
+    # clusters (SM90+) and the per-CTA slice at S=4 stays walk-cheap
+    # (N <= 128K), 4-CTA DSMEM coordination wins despite the longer
+    # slices: 64K b=8 k=2048 10.32 -> 8.28us, k=1024 8.89 -> 7.87.  At
+    # DSv4 scale the slice cost dominates and S=8 stays better (1M b=16:
+    # S=4 measured +3us), hence the N bound.
+    if splits >= 8 and N <= 131072 and _cc[0] >= 9:
+        # (cs=8 clusters were also tried for rows <= 15, gvr_2's own veto
+        # boundary: MEASURED WORSE -- 64K b=1 7.66 -> 8.28us, b=8 7.87 ->
+        # 8.89; merging 8 peer histograms over DSMEM costs more than the
+        # already-short slices save.  S=4 is the cluster ceiling.)
+        splits = 4
+    # A100 (sm80) >= 4 MB rows at S == 1: single-CTA rows stream at ~12
+    # GB/s per CTA vs ~20 GB/s for 2 MB rows (dtype-independent; torch's
+    # row reduction is unaffected), and splitting restores the per-CTA
+    # rate even with a second wave -- 1M fp32 b=64: S1 364us -> S4 249us,
+    # b=16 157 -> 74.  Not applied where the base policy already splits,
+    # at rows > 64 (b=96 S1 313 vs S2 330), or on SM90+/SM89 (85-88% of
+    # the measured DRAM roof at S == 1).
+    if (
+        splits == 1
+        and num_rows <= 64
+        and N * logits.element_size() >= (4 << 20)
+        and _cc == (8, 0)
+    ):
+        splits = 4
+    # Very small batches of >= 1M rows: 32-way split (gmem last-arriver path)
+    # when the grid still fits one wave.  The shared policy stops at 16;
+    # measured B200 hintless 1M b=1: S16 13.4us -> S32 11.5us (k=512), b=4
+    # 13.2 -> 11.4; at b=8 32 x 8 = 256 CTAs is two waves and S32 measured
+    # 17.7us, so the one-wave bound is essential.  No gain at 256K (8.68 vs
+    # 8.67) and a loss at 64K, hence the width bound.
+    if splits == 16 and N >= (1 << 20) and num_rows * 32 <= _sms:
+        splits = 32
+    # Long rows in grids that leave SMs idle under a power-of-two split: use
+    # the largest one-wave cluster shape in {2, 3, 4, 6} instead.  Measured
+    # on Rubin (208 SMs), fp32 hintless: 1M b=64 S2 -> S3 43.2 -> 38.2us
+    # (gvr_2 40.1), 1M b=32 S4 -> S6 24.4 -> 22.3us (22.3), 256K b=64 S2 ->
+    # S3 11.7 -> 10.9us (11.4).  Shape 6 only pays off from 4 MB (256K b=32
+    # S4 -> S6 8.6 -> 8.9us: the wider cluster epilogue outweighs the shorter
+    # slice), and below 1 MB every shape loses (64K b=64 S3 7.0 -> 7.6us),
+    # hence the two byte bounds.  On 148-SM parts the rule only changes grids
+    # where 3 CTAs per row fit one wave (b in 38..45).  "Fits one wave" is
+    # the driver's cluster occupancy, not floor(SMs / S): see
+    # _probe_cluster_caps.
+    _row_bytes = N * logits.element_size()
+    _dev_idx = logits.device.index if logits.device.index is not None else 0
+    _cluster_cc = _cc[0] >= 9
+    if splits in (2, 4) and _row_bytes >= (1 << 20) and num_rows >= 16 and _cluster_cc:
+        _shapes = (6, 4, 3, 2) if _row_bytes >= (4 << 20) else (4, 3, 2)
+        for _s in _shapes:
+            if num_rows <= _max_active_clusters(_dev_idx, _s):
+                if _s > splits:
+                    splits = _s
+                break
+    # One-wave guard for the cluster shapes: _mc_splits_for sizes the split
+    # by floor(SMs / S), which is too generous for S >= 3 (and S=4 on
+    # 148-SM parts: b in 34..37 would run 4-CTA clusters as two waves).
+    # Step down to the largest shape whose clusters all co-reside.
+    if _cluster_cc and splits in (2, 3, 4, 6):
+        for _s in (splits, 4, 3, 2):
+            if _s <= splits and num_rows <= _max_active_clusters(_dev_idx, _s):
+                splits = _s
+                break
+        else:
+            splits = 1
+    # (pre_idx is accepted for API uniformity and ignored: the kernel is
+    # hint-free -- with realistic previous-step hints the value gathers cost
+    # more than the tightened threshold saved, and a caller cannot know its
+    # hint is exact.)
+    # Block shape: 512 threads (2 CTAs/SM) when the batch is wider than the SM
+    # count, each row has one CTA, and rows are at most 512 KB (128K fp32).
+    # The 1024-thread CTA's full register file allows one CTA per SM, so 256
+    # rows on 148 SMs ran as two waves.  A 512-thread CTA solves a row ~20%
+    # slower on its own (b<=SMs: 1.1-1.6x worse, hence the width gate) but
+    # two co-resident per SM make the wide batch one wave.  Measured B200,
+    # ragged rows, 1024 -> 512 threads: 32K b=256 k=2048 20.6 -> 16.5us
+    # (gvr_2 16.8), 64K b=256 25.1 -> 21.6 (15.6), 128K b=256 36.7 -> 34.4
+    # (25.7); at 256K the two shapes tie and at 1M the smaller stage
+    # overflows, hence the byte gate.  Rubin (208 SMs) at 128K: b=256 flat,
+    # b=512 +6% (two waves either way), so rows of 256-512 KB take the shape
+    # only when the batch fits the doubled slot count.
+    _wf_nt = None
+    _row_kb = N * logits.element_size() >> 10
+    if (
+        splits == 1
+        and num_rows > _sms
+        and (_row_kb <= 256 or (_row_kb <= 512 and num_rows <= 2 * _sms))
+    ):
+        _wf_nt = 512
+    # paged output: the page table rides along as the launcher's last tensor;
+    # unpaged launches pass a cached (1, 4) dummy the kernel never reads
+    if page_table is not None:
+        pt_t, ps = page_table, page_size
+    else:
+        pt_t = (
+            _get_cache_buf("topk_wf_pt_dummy", 16, logits.device, zero_init=True)[:16]
+            .view(torch.int32)
+            .view(1, 4)
+        )
+        ps = 0
+    # the DSL compiles for the CURRENT device and the persistent cache tags
+    # artifacts by its architecture: both must agree with where the data lives
+    with torch.cuda.device(logits.device):
+        get_walkfirst_kernel(
+            top_k,
+            N,
+            splits,
+            dtype=logits.dtype,
+            nt=_wf_nt,
+            page_size=ps,
+            device=logits.device,
+        )(
+            logits,
+            seq_lens,
+            out_indices,
+            slab,
+            status[:num_rows],
+            mc_state,
+            pt_t,
+        )
+    return out_indices, None
+
+
+def _prim_mc_state(num_rows, device):
+    """(rows, 8) int32 counters for the multi-CTA walk-first kernel: zero-init
+    at first allocation, self-resetting after every call."""
+    return (
+        _get_cache_buf(
+            f"topk_prim_mc_state_{_scratch_tag(device)}",
+            num_rows * 8 * 4,
+            device,
+            zero_init=True,
+        )[: num_rows * 8 * 4]
+        .view(torch.int32)
+        .view(num_rows, 8)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Public API: top_k_varlen
 # ---------------------------------------------------------------------------
 
@@ -1497,6 +2484,12 @@ def _run_radix_filter(
         "gvr_2": _gvr2_top_k_varlen_check,
         "radix_cutlass": _radix_cutlass_top_k_varlen_check,
         "radix_filter": _radix_filter_top_k_varlen_check,
+        # primitives backends: outside the unpaged auto ranking; auto picks
+        # walkfirst_primitives then radix_primitives for paged output
+        "radix_primitives": _radix_primitives_top_k_varlen_check,
+        "sglang": _sglang_top_k_varlen_check,
+        "walkfirst_primitives": _walkfirst_primitives_top_k_varlen_check,
+        "cutlass_primitives": _cutlass_primitives_top_k_varlen_check,
     },
     heuristic_func=_top_k_varlen_heuristic,
 )
@@ -1512,10 +2505,22 @@ def top_k_varlen(
     out_indices: Optional[torch.Tensor] = None,
     out_values: Optional[torch.Tensor] = None,
     backend: Literal[
-        "radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"
+        "radix",
+        "gvr",
+        "gvr_2",
+        "radix_cutlass",
+        "radix_filter",
+        "radix_primitives",
+        "sglang",
+        "walkfirst_primitives",
+        "cutlass_primitives",
+        "auto",
     ] = "auto",
     load_balance: bool = True,
     workspace: Optional[dict] = None,
+    approx_ties: bool = False,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     r"""Top-K selection over batched decode-step logits.
 
@@ -1531,9 +2536,12 @@ def top_k_varlen(
     measured large-N regions, ``gvr`` for large hinted half-precision
     batches of mid-length rows, otherwise the CuTe DSL ``radix`` backend on
     Blackwell, with the ``radix_cutlass`` masked fallback in its fp32 big
-    corner and on every other GPU.  Force a specific backend with
-    ``backend="radix"``, ``"gvr"``, ``"gvr_2"``, ``"radix_filter"`` or
-    ``"radix_cutlass"``.
+    corner and on every other GPU.  With ``page_table`` (fused paged output)
+    ``auto`` picks ``walkfirst_primitives``, then ``radix_primitives``: the
+    backends with a paged kernel.  Force a specific backend with
+    ``backend="radix"``, ``"gvr"``, ``"gvr_2"``, ``"radix_filter"``,
+    ``"radix_cutlass"``, ``"radix_primitives"``, ``"walkfirst_primitives"``,
+    ``"cutlass_primitives"`` or ``"sglang"``.
 
     Parameters
     ----------
@@ -1602,7 +2610,7 @@ def top_k_varlen(
     out_values : torch.Tensor, optional
         Pre-allocated values buffer (same dtype as ``logits``, same layout
         rules as ``out_indices``). Only used when ``return_values=True``.
-    backend : {"radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "auto"}, optional
+    backend : {"radix", "gvr", "gvr_2", "radix_cutlass", "radix_filter", "radix_primitives", "sglang", "walkfirst_primitives", "cutlass_primitives", "auto"}, optional
         Backend to use.  Default ``"auto"``.
 
         ``"radix"``         — CuTe DSL single-pass multi-CTA radix top-K
@@ -1669,7 +2677,62 @@ def top_k_varlen(
                               are mostly far shorter than ``max_seq_len`` are
                               a known blind spot (auto cannot read
                               ``seq_lens`` without a sync); prefer
-                              ``backend="radix"`` there.
+                              ``backend="radix"`` there.  With ``page_table``
+                              auto ranks ``walkfirst_primitives`` then
+                              ``radix_primitives`` (the backends with a fused
+                              paged kernel).
+        ``"radix_primitives"`` — Coarse-histogram top-K written against the
+                              CuTe DSL primitives API (raw pointers + PTX
+                              wrappers, no layout algebra); one CTA per row,
+                              sglang DeepSeek-V4 algorithm (Ampere+ incl. Rubin,
+                              no top_k restriction, no ``pre_idx`` needed).
+                              Picked by ``auto`` for paged output only, after
+                              ``walkfirst_primitives``.
+
+        Primitives backends and the vendored SGLang kernel (Ampere+ incl.
+        Rubin; outside the unpaged ``"auto"`` ranking, so unpaged calls name
+        them explicitly, while ``auto`` ranks them for paged output).  A
+        ``walkfirst_primitives``
+        call is ONE kernel launch: the speculative selection and the exact
+        fallback (MSD radix-select for rows that miss on-device verification)
+        are fused into the same kernel, sync-free, so the calls are
+        CUDA-graph capturable once warmed up.  Its internal slab/status
+        scratch is keyed by (device, current stream), as
+        ``cutlass_primitives``' is, so concurrent streams never share a
+        buffer:
+
+        ``"walkfirst_primitives"`` — full gvr_2-architecture replication
+                              (fused walk-first ladder) with row-splitting
+                              at any k and the exact fallback; hintless;
+                              fp32 / fp16 / bf16; ``next_n ==
+                              compress_ratio == 1``, ``return_values=False``,
+                              ``top_k <= 2048``.  ``max_seq_len`` a multiple
+                              of 4 (fp32) or 8 (16-bit).  Paged output
+                              (``page_table``) is fused into the launch.
+        ``"sglang"``        — vendored SGLang DeepSeek-V4 top-k kernel (fp32,
+                              contiguous 16-byte-aligned rows, ``top_k <=
+                              2048``, ``max_seq_len % 4 == 0``; approximate
+                              when the rank-k coarse bin holds more than 2048
+                              candidates: that bin is then filled in arrival
+                              order).  Paged output is fused into the launch.
+                              Like upstream, on SM90+ the kernel prefetches
+                              ``seq_lens`` and the page-table row BEFORE its
+                              programmatic-dependent-launch wait, so the
+                              kernel immediately preceding the call in the
+                              stream must not write them (the logits may be
+                              produced by it).  The same kernel SGLang runs,
+                              for parity and API-overhead checks.
+        ``"cutlass_primitives"`` — the vendored cutlass-primitives library
+                              (``topk_varlen/cutlass_primitives/``, see its
+                              VENDORED.md): register-resident kernels for
+                              rows up to 16K, the streaming kernel with
+                              cluster or slab merges above, an exact
+                              fallback; its own router picks the kernel.
+                              fp32/fp16/bf16, any k, any 2-D layout,
+                              SM80+; ``next_n``, ``compress_ratio`` and
+                              ``return_values`` supported; hints ignored;
+                              optional caller-owned memory through
+                              ``workspace["cutlass_primitives_workspace"]``.
     load_balance : bool, optional
         Selects the GVR kernel path (ignored by the radix backend).  Default
         ``True``.
@@ -1703,6 +2766,32 @@ def top_k_varlen(
         = 20,973,568 bytes, zero-initialized before first use, 16-byte
         aligned) overrides the cached default slab.
 
+        For the ``"cutlass_primitives"`` backend the optional key
+        ``"cutlass_primitives_workspace"`` (a contiguous CUDA tensor of any
+        dtype and any content, 256-byte-aligned base, at least
+        ``flashinfer.topk_varlen.cutlass_primitives_workspace_bytes(logits, top_k)``
+        bytes; take the maximum over the batch sizes an engine runs) makes the
+        call allocation-free: the status words, the slab merge's buffers and
+        the padded copy of a misaligned input all come out of it.  Without
+        it the backend caches those buffers per (device, stream, shape), so
+        the default is already safe for concurrent streams; the caches live
+        for the process (one entry per batch shape and stream, slab entries
+        of a few MB for the longest rows) unless released with
+        ``flashinfer.topk_varlen.release_cutlass_primitives_resources(device)``.
+        The optional key
+        ``"cutlass_primitives_row_order"`` (a contiguous int32 permutation of
+        the row indices on the logits device) sets the order in which the
+        one-CTA-per-row streaming kernel's CTAs take rows; a wide ragged batch
+        launched with the longest rows paired against the shortest runs up to
+        17% faster on skewed length distributions (B200 64K x 256 k=2048,
+        U[k+1, N] lengths: 16.7 -> 13.9 us), and the result does not depend
+        on the order.  The order depends only on ``seq_lens``: compute it where
+        the step's metadata is built, before the logits exist, with
+        ``flashinfer.topk_varlen.cutlass_primitives_row_order(seq_lens, num_cols, next_n=, compress_ratio=, out=)``
+        (a few small launches, CUDA-graph safe, refreshes ``out`` in place),
+        or with ``torch.argsort(seq_lens, descending=True).int()`` for the
+        plain longest-first order.  Other kernels ignore the key.
+
         .. warning::
             Do **not** share the same workspace dict across concurrent CUDA
             streams — each stream must have its own workspace to avoid races
@@ -1734,14 +2823,62 @@ def top_k_varlen(
             ``flashinfer.topk_varlen.release_gvr2_resources(device)``, which
             synchronizes the device, drops them and returns the bytes freed;
             graphs captured against them must then be re-captured after a
-            fresh eager warm-up.
+            fresh eager warm-up.  For ``"cutlass_primitives"`` the default
+            caches are likewise keyed by stream and stream-ordered use needs
+            nothing; a CUDA graph captures the workspace it was given, so
+            replays of one graph must not overlap each other.
+
+    approx_ties : bool, optional
+        Permit approximate resolution of boundary ties.  Default ``False``
+        (exact).  When more than an internal tie capacity (2048) of
+        candidates share the coarse histogram bin containing the ``top_k``-th
+        element, an exact backend refines the tie group by exact value; with
+        ``approx_ties=True`` the ``"radix_primitives"`` backend instead fills
+        the remaining output slots with an arbitrary first-arrival subset of
+        that bin — the same semantics the ``"sglang"`` backend always has
+        (its fixed-capacity tie buffer truncates such groups).  Everything
+        strictly above the tie bin is still exact.  Only relevant for
+        adversarially low-entropy rows (thousands of near-identical logits at
+        the selection boundary); on typical logits results are identical to
+        exact mode.  Exact backends ignore this flag (an exact result always
+        satisfies the relaxed contract).
+
+    page_table : torch.Tensor, optional
+        Paged output (decode mode). ``int32`` CUDA tensor of shape
+        ``(num_rows // next_n, max_pages)``, one row per request, contiguous
+        and 16-byte aligned, with ``max_pages * page_size`` fitting int32
+        (physical slots are int32).  Every
+        selected column ``c`` of request ``q`` is returned as the physical KV
+        slot ``page_table[q, c // page_size] * page_size + c % page_size``
+        instead of the column itself (``-1`` padding unchanged), which is
+        what the sparse-attention kernel consumes (the SGLang DSA decode
+        contract, the same mapping as :func:`top_k_page_table_transform`).
+        The table must cover every request's VALID length (``max_pages *
+        page_size >= seq_len``); it may be narrower than the logits width,
+        which serving engines pad past the batch's longest row, and a row
+        that does exceed the covered pages is clamped to the covered prefix
+        (the kernels never read a page the table lacks).  Fused into the
+        kernel as a post-pass over the
+        ``top_k`` outputs (one page-table read per selected index, no extra
+        launch).  Served by ``walkfirst_primitives`` (``next_n == 1``),
+        ``sglang`` and ``radix_primitives`` (any ``next_n`` /
+        ``compress_ratio``; one table row per request); ``auto`` ranks
+        ``walkfirst_primitives`` then ``radix_primitives``.  Not combinable
+        with ``pre_idx`` or ``return_values`` (the raw indices are not kept).
+        Default ``None``.
+    page_size : int, optional
+        Columns per page-table entry for ``page_table``; a power of two up to
+        ``2**30``.  Ignored when ``page_table`` is ``None``.  Default ``1``.
 
     Returns
     -------
     (indices, values) : Tuple[torch.Tensor, Optional[torch.Tensor]]
         Always a 2-tuple. ``indices`` is ``int32[num_rows, top_k]``.
         ``values`` holds the selected logits (same dtype as ``logits``) when
-        ``return_values=True``, otherwise ``None``.
+        ``return_values=True``, otherwise ``None``; at ``-1`` (padding) slots
+        it holds backend-specific filler (``0`` for ``radix_cutlass``,
+        ``sglang`` and ``radix_primitives``, ``-inf`` for
+        ``cutlass_primitives``), never a selected logit.
 
     Raises
     ------
@@ -1805,6 +2942,10 @@ def top_k_varlen(
             "seq_lens must be a 1-D int32 CUDA tensor"
             + (f", got {seq_lens.dtype}" if isinstance(seq_lens, torch.Tensor) else "")
         )
+    if seq_lens.device != logits.device:
+        raise ValueError(
+            f"seq_lens must be on {logits.device} (the logits device), got {seq_lens.device}"
+        )
     # Grouped-row ABI, shared by every backend: row r belongs to sequence
     # r // next_n, so seq_lens must hold exactly one entry per group. Validated
     # here (not in the per-backend checkers) because a violation is a silent
@@ -1813,6 +2954,10 @@ def top_k_varlen(
     # asserts: this must hold under `python -O` too.
     if next_n < 1:
         raise ValueError(f"next_n must be >= 1, got {next_n}")
+    if top_k < 1:
+        raise ValueError(f"top_k must be >= 1, got {top_k}")
+    if compress_ratio < 1:
+        raise ValueError(f"compress_ratio must be >= 1, got {compress_ratio}")
     if logits.shape[0] != seq_lens.shape[0] * next_n:
         raise ValueError(
             f"logits has {logits.shape[0]} rows but seq_lens has "
@@ -1884,6 +3029,54 @@ def top_k_varlen(
             )
         return buf.view(num_rows, top_k)
 
+    if page_table is not None:
+        if not (
+            isinstance(page_table, torch.Tensor)
+            and page_table.is_cuda
+            and page_table.device == logits.device
+            and page_table.dim() == 2
+            and page_table.dtype == torch.int32
+            and page_table.is_contiguous()
+        ):
+            raise ValueError(
+                f"page_table must be a contiguous 2-D int32 CUDA tensor on {logits.device}"
+            )
+        if page_table.shape[0] * next_n != num_rows:
+            raise ValueError(
+                f"page_table has {page_table.shape[0]} rows, expected one per request "
+                f"({num_rows} rows / next_n={next_n} = {num_rows // next_n})"
+            )
+        if pre_idx is not None:
+            raise ValueError("page_table cannot be combined with pre_idx")
+        if return_values:
+            raise ValueError("page_table cannot be combined with return_values")
+        if (
+            isinstance(page_size, bool)
+            or not isinstance(page_size, int)
+            or page_size < 1
+            or page_size > (1 << 30)
+            or page_size & (page_size - 1)
+        ):
+            raise ValueError(
+                f"page_size must be a power of two in [1, 2**30], got {page_size!r}"
+            )
+        # The table need not span the logits width: a serving engine sizes it
+        # for the batch's longest row while the logits buffer is padded wider
+        # (SGLang: 129 pages of 64 under 8448 columns).  What the kernels need
+        # is coverage of each row's VALID length, and lengths live on the
+        # device; the kernels clamp a row to the pages the table covers, so a
+        # narrow table can only shorten a row, never read past the table.
+        if page_table.shape[1] < 1:
+            raise ValueError("page_table must have at least one page per request")
+        if page_table.data_ptr() & 15:
+            raise ValueError("page_table must be 16-byte aligned (not a shifted view)")
+        if page_table.shape[1] * page_size > (1 << 31) - 1:
+            # physical slots are int32, and the kernels clamp a row to the
+            # table's coverage in int32 arithmetic
+            raise ValueError(
+                "page_table.shape[1] * page_size must fit in int32 (physical slots "
+                f"are int32), got {page_table.shape[1]} * {page_size}"
+            )
     if out_indices is not None:
         out_indices = _check_out("out_indices", out_indices, torch.int32)
     if return_values and out_values is not None:
@@ -1910,6 +3103,22 @@ def top_k_varlen(
             (num_rows, top_k), dtype=logits.dtype, device=logits.device
         )
 
+    if page_table is not None and backend not in _PAGED_BACKENDS:
+        # reachable under skip_check=True only (the checkers refuse it)
+        raise BackendSupportedError(
+            f"backend={backend!r} does not support page_table (paged output); "
+            f"use one of {_PAGED_BACKENDS}"
+        )
+    if backend == "walkfirst_primitives" and (
+        next_n != 1 or compress_ratio != 1 or return_values
+    ):
+        # reachable under skip_check=True only (the checker refuses it): the
+        # kernel serves next_n == compress_ratio == 1, indices only, and the
+        # dispatcher does not forward those arguments
+        raise BackendSupportedError(
+            "backend='walkfirst_primitives' serves next_n == compress_ratio == 1 "
+            "and return_values=False only"
+        )
     if backend == "radix":
         out_i, out_v = _run_radix(
             logits,
@@ -1962,6 +3171,56 @@ def top_k_varlen(
             out_values,
             workspace=workspace,
         )
+    elif backend == "radix_primitives":
+        out_i, out_v = _run_radix_primitives(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+            approx_ties,
+            page_table=page_table,
+            page_size=page_size,
+        )
+    elif backend == "walkfirst_primitives":
+        out_i, out_v = _run_walkfirst_primitives(
+            logits,
+            seq_lens,
+            top_k,
+            out_indices,
+            pre_idx,
+            page_table=page_table,
+            page_size=page_size,
+        )
+    elif backend == "cutlass_primitives":
+        out_i, out_v = _run_cutlass_primitives(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+            pre_idx,
+            workspace,
+        )
+    elif backend == "sglang":
+        out_i, out_v = _run_sglang(
+            logits,
+            seq_lens,
+            top_k,
+            next_n,
+            compress_ratio,
+            return_values,
+            out_indices,
+            out_values,
+            page_table=page_table,
+            page_size=page_size,
+        )
     elif backend == "radix_cutlass":
         out_i, out_v = _run_radix_cutlass(
             logits,
@@ -1987,7 +3246,9 @@ def top_k_varlen(
     else:
         raise ValueError(
             f"Unknown backend: {backend!r}. "
-            f"Expected 'radix', 'gvr', 'gvr_2', 'radix_cutlass', or 'radix_filter'."
+            f"Expected 'radix', 'gvr', 'gvr_2', 'radix_cutlass', 'radix_filter', "
+            f"'radix_primitives', 'sglang', 'walkfirst_primitives' or "
+            f"'cutlass_primitives'."
         )
 
     return out_i, out_v

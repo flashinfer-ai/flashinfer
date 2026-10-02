@@ -56,7 +56,8 @@ _HIST_BUF_1 = _HIST_SIZE
 _HIST_BUF_2 = 2 * _HIST_SIZE
 _ARRIVAL_COUNTER = 3 * _HIST_SIZE  # 768
 _OUTPUT_COUNTER = 3 * _HIST_SIZE + 1  # 769
-STATE_SIZE = 3 * _HIST_SIZE + 2  # 770
+_DEPART_COUNTER = 3 * _HIST_SIZE + 2  # 770: peers past their last barrier
+STATE_SIZE = 3 * _HIST_SIZE + 3  # 771
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +311,14 @@ class SinglePassMultiCTARadixTopKKernel:
             fix_bytes = align_bytes - misalign
 
         prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
+        # A chunk shorter than the misaligned prefix (empty or a few elements
+        # past the row's valid length, on a row whose base is off the copy
+        # alignment) must load only what it has: otherwise `remaining` goes
+        # negative, aligned_size floors to -vec_size, the tail loop writes
+        # smem at negative offsets and the prologue loads elements beyond
+        # the valid length whose indices then leak into the output.
+        if prologue_elems > actual_chunk_size:
+            prologue_elems = actual_chunk_size
         remaining = actual_chunk_size - prologue_elems
         aligned_size = (remaining // vec_size) * vec_size
         left_size = remaining - aligned_size
@@ -1419,12 +1428,33 @@ class SinglePassMultiCTARadixTopKKernel:
 
         # End-of-kernel cleanup (FlashInfer-style): CTA 0 resets state so the
         # next kernel call can use torch.empty instead of torch.zeros.
+        #
+        # Departure handshake first.  The reset zeroes the arrival counter
+        # every peer spins on; a peer descheduled while still spinning on
+        # the final barrier (GPU time-slicing with another process) would
+        # otherwise see the counter reset underneath it and spin forever.
+        # Every peer announces that it is past its last barrier; CTA 0 waits
+        # for all of them before touching the state.  CTA 0 only waits for
+        # CTAs that have nothing left to wait for, so no cycle is possible.
         if cutlass.const_expr(ctas_per_group > 1):
-            if cta_in_group == 0:
+            depart_ptr = state_base_ptr + cutlass.Int32(_DEPART_COUNTER)
+            if cta_in_group != 0:
+                cute.arch.barrier()  # this CTA's state traffic is complete
+                if tidx == 0:
+                    red_release_gpu(depart_ptr, cutlass.Int32(1))
+            else:
+                if tidx == 0:
+                    while ld_acquire_gpu(depart_ptr) < cutlass.Int32(
+                        ctas_per_group - 1
+                    ):
+                        pass
+                cute.arch.barrier()
                 hist_total = cutlass.const_expr(3 * self.radix)
                 for i in range(tidx, hist_total, num_threads):
                     state_row[i] = cutlass.Int32(0)
+                cute.arch.barrier()
                 if tidx == 0:
+                    st_release_gpu(depart_ptr, cutlass.Int32(0))
                     st_release_gpu(
                         state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
                         cutlass.Int32(0),
