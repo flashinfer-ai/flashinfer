@@ -23,15 +23,21 @@ bound and the judgement of a result against the reference.  Shared by
 Nothing here knows how the kernels partition queries or keys.
 
 Scoring.  For every visible (query, key) pair the FP64 score is treated as
-exact and an independent FP32 scorer with a documented order is evaluated
-beside it.  With ``order="sequential"`` the dot product is accumulated with
-elementwise operations ``(((q0 k0 + q1 k1) + q2 k2) + ...)``: the products of
-two BF16 values are exact in FP32 and FP64, so each addition is the only
-rounding and the bits do not depend on how the operands were chunked.  Then
-``scaled = softmax_scale * logit`` (one rounding), ``relu(x) = x if x > 0 else
-+0.0``, ``term_h = w_h * relu_h`` (IEEE product; signed zeros preserved) and
-the head sum ``((term_0 + term_1) + term_2) + ...`` from the ``h = 0`` term
-(a sum of zeros is ``-0.0`` iff every term is ``-0.0``).  ``order="matmul"``
+exact and an independent FP32 scorer that follows the generated program's
+documented reduction model is evaluated beside it.  With
+``order="sequential"`` the dot product ``x_h`` is accumulated with elementwise
+operations ``(((q0 k0 + q1 k1) + q2 k2) + ...)``: the products of two BF16
+values are exact in FP32 and FP64, so each addition is the only rounding and
+the bits do not depend on how the operands were chunked.  The head reduction
+is the program's: ``r_h = fl(x_h + |x_h|)`` (exactly ``2 relu(x_h)``; ``+0.0``
+for every ``x_h <= 0`` including ``-0.0``), ``w'_h = fl(w_h * softmax_scale)``,
+four interleaved FMA chains ``c_m = fma(r_h, w'_h, c_m)`` over ``h = m, m + 4,
+..., m + 28`` starting from ``+0.0`` (the FMA is emulated as the exact FP64
+product-sum rounded once to FP32), then ``s = fl(fl(fl(c_0 + c_2) + fl(c_1 +
+c_3)) * 0.5)``.  Because every chain starts from ``+0.0`` and
+``fma(+0, w', +0) = +0`` for either sign of ``w'``, a row whose head terms are
+all zero scores ``+0.0``: ``-0.0`` cannot arise from this reduction (the
+program's ``zero_sign_policy = "positive_accumulator"``).  ``order="matmul"``
 uses ``torch.matmul`` (TF32 disabled for FP32) for the dot products: much
 faster, but its bits depend on the operand shapes, so it is used only for
 bound-based comparisons; ``order="auto"`` picks ``sequential`` up to
@@ -493,8 +499,9 @@ def _case_all_equal(device):
 def _case_signed_zeros(device):
     """Zero-score keys (six of every eight ids) with the selection boundary inside the zero group of every row.
 
-    Even rows use all-negative head weights (an IEEE sequential head sum of the signed-zero terms is ``-0.0``),
-    odd rows mixed-sign weights (``+0.0``).  Segment 0 rows see 49..64 keys, segment 1 rows 21..40; with
+    Even rows use all-negative head weights (an IEEE sequential head sum of their zero terms would be ``-0.0``;
+    the program's positive-accumulator reduction gives ``+0.0``, so the bit check tells the two models apart),
+    odd rows mixed-sign weights.  Segment 0 rows see 49..64 keys, segment 1 rows 21..40; with
     ``top_k = 12`` every mixed-weight row selects its <= 8 positive keys plus some but not all zeros, and every
     all-negative row selects 12 of >= 15 zeros, so the id-descending tie rule and the zero bits are exercised on
     every row.
@@ -737,13 +744,42 @@ def _logits(
     return torch.matmul(q, kt)
 
 
+def _fma_fp32(c: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """``fl32(c + a * b)``: the product of two FP32 values is exact in FP64 and the
+    FP64 sum is rounded once to FP32 (a double rounding differs from the fused
+    operation only when the FP64 sum lands on an FP32 halfway point; the
+    bit-exact cases are exactly representable and never do, the bound-based
+    checks absorb it)."""
+    return (c.to(torch.float64) + a.to(torch.float64) * b.to(torch.float64)).to(
+        torch.float32
+    )
+
+
+def _heads_program_model(relu2: torch.Tensor, w_scaled: torch.Tensor) -> torch.Tensor:
+    """The generated program's head reduction (module docstring): four interleaved
+    FMA chains over ``h = m, m + 4, ...`` from ``+0.0``, then
+    ``fl(fl(fl(c_0 + c_2) + fl(c_1 + c_3)) * 0.5)``.  ``relu2`` is ``[c, H, n]``
+    (``fl(x + |x|)``), ``w_scaled`` ``[c, H, 1]`` (``fl(w * scale)``), FP32."""
+    num_heads = relu2.shape[1]
+    chains = []
+    for m in range(4):
+        acc = torch.zeros_like(relu2.select(1, 0))  # +0.0
+        for h in range(m, num_heads, 4):
+            acc = _fma_fp32(acc, relu2.select(1, h), w_scaled.select(1, h))
+        chains.append(acc)
+    return ((chains[0] + chains[2]) + (chains[1] + chains[3])) * 0.5
+
+
 def _finish_scores(logits64, logits32, w_rows, scale: float):
     w64 = w_rows.to(torch.float64).unsqueeze(-1)
-    w32 = w_rows.unsqueeze(-1)
     s64 = _heads_sequential(w64 * _relu_plus_zero(logits64 * scale))
-    s32 = _heads_sequential(
-        w32 * _relu_plus_zero(logits32 * torch.tensor(scale, dtype=torch.float32))
-    )
+    relu2 = (
+        logits32 + logits32.abs()
+    )  # fl(x + |x|): +0.0 for x <= 0 (also -0.0), NaN for NaN and -inf
+    w_scaled = (
+        w_rows * torch.tensor(scale, dtype=torch.float32, device=w_rows.device)
+    ).unsqueeze(-1)
+    s32 = _heads_program_model(relu2, w_scaled)
     return s64, s32
 
 
@@ -885,7 +921,11 @@ class ReferenceSelection:
 
 
 def _ranking_key(scores: torch.Tensor) -> torch.Tensor:
-    """``-0.0 -> +0.0``; NaN ranks lowest (``-inf``); everything else by value."""
+    """``-0.0 -> +0.0``; NaN ranks lowest (``-inf``); everything else by value.
+
+    The NaN placement is the reference's own selection convention (finite inputs
+    are the contract's domain); it is not a guarantee of the generated program.
+    """
     return torch.nan_to_num(
         scores + 0.0, nan=float("-inf"), posinf=float("inf"), neginf=float("-inf")
     )
@@ -1151,12 +1191,17 @@ def judge(
     """Judge ``result = (indices, scores)`` against the reference under the near-tie rule (module docstring).
 
     ``bound``: ``None`` -> ``gamma_n * A`` per pair; a float -> uniform absolute bound.  ``exact_bits=True``
-    demands id equality and bitwise equality with the FP32 scorer (exactly representable problems); the scorer's
-    signed zeros are normalized to ``+0.0`` under ``zero_sign_policy="positive_accumulator"``.
+    demands id equality and bitwise equality with the FP32 scorer (exactly representable problems).  The scorer
+    follows the positive-accumulator reduction of the generated program (module docstring), so that is the only
+    ``zero_sign_policy`` it can judge bit-exactly; a program declaring another policy needs its own model.
     """
     if zero_sign_policy not in ZERO_SIGN_POLICIES:
         raise ValueError(
             f"zero_sign_policy must be one of {ZERO_SIGN_POLICIES}, got {zero_sign_policy!r}"
+        )
+    if zero_sign_policy != "positive_accumulator":
+        raise NotImplementedError(
+            f"the reference models the positive-accumulator reduction; no model for {zero_sign_policy!r}"
         )
     inputs, order = reference.inputs, reference.order
     indices, scores = result
@@ -1211,11 +1256,7 @@ def judge(
                 f"exact={float(s64[r, c]):.9g} fp32={float(s32[r, c]):.9g} bound={float(b[r, c]):.3g}"
             )
     if exact_bits:
-        expected32 = s32
-        if zero_sign_policy == "positive_accumulator":
-            expected32 = torch.where(
-                expected32 == 0, torch.zeros_like(expected32), expected32
-            )
+        expected32 = s32  # the program model never produces -0.0; zero bits are compared as computed
         got_bits = got_scores.contiguous().view(torch.int32)
         exp_bits = expected32.contiguous().view(torch.int32)
         mismatch = valid & (got_bits != exp_bits)

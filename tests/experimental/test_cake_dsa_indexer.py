@@ -488,12 +488,7 @@ def test_reference_matches_bruteforce(seed, top_k, ratio, offsets):
         for a, b in zip(row_got, row_exp, strict=True):
             assert a == b or abs(a - b) <= 1e-12 * max(1.0, abs(b)), (a, b)
     assert not ref.structure_failures(inputs, result.indices, result.scores)
-    assert ref.judge(
-        (result.indices, result.scores),
-        result,
-        exact_bits=True,
-        zero_sign_policy="ieee_sum",
-    ).passed
+    assert ref.judge((result.indices, result.scores), result, exact_bits=True).passed
 
 
 def test_reference_sequential_order_is_partition_invariant():
@@ -520,25 +515,29 @@ def test_exact_cases_match_closed_form(name):
             assert s64[t][c] == expected and s32[t][c] == expected, (name, t, c, j)
     if name == "signed_zeros":
         bits = result.scores.view(torch.int32)
-        zero = result.scores == 0
-        valid = result.indices >= 0
-        neg_zero = zero & valid & (bits != 0)
-        pos_zero = zero & valid & (bits == 0)
-        assert bool(neg_zero.any()) and bool(pos_zero.any()), (
-            "both zero signs must reach the selector boundary"
+        zero = (result.scores == 0) & (result.indices >= 0)
+        assert bool(zero.any(dim=1).all()), (
+            "zero-score keys must reach the selector boundary on every row"
         )
-        assert bool(
-            (neg_zero.any(dim=1) == (torch.arange(inputs.num_queries) % 2 == 0)).all()
-        )
+        # the program's positive-accumulator reduction yields +0.0 for every zero score; an IEEE sequential
+        # head sum would give -0.0 on the all-negative-weight (even) rows, so the bit check is discriminating
+        assert bool((bits[zero] == 0).all())
+        even = torch.arange(inputs.num_queries) % 2 == 0
+        assert bool(zero[even].any()) and bool(zero[~even].any())
+        with pytest.raises(NotImplementedError):
+            ref.judge(
+                (result.indices, result.scores),
+                result,
+                exact_bits=True,
+                zero_sign_policy="ieee_sum",
+            )
 
 
 def test_judge_rejects_a_clearly_better_lacking_key_and_bad_bits():
     inputs = ref.make_exact_case("distinct", "cpu")
     reference = ref.select_reference(inputs, order="sequential")
     ids, scores = reference.indices.clone(), reference.scores.clone()
-    assert ref.judge(
-        (ids, scores), reference, exact_bits=True, zero_sign_policy="ieee_sum"
-    ).passed
+    assert ref.judge((ids, scores), reference, exact_bits=True).passed
     # swap the weakest selected key of row 0 for an unselected, lower-scoring visible key
     row = 0
     n = int(reference.selected_count[row])
@@ -555,14 +554,14 @@ def test_judge_rejects_a_clearly_better_lacking_key_and_bad_bits():
         torch.where(ids[row] >= 0, ids[row], torch.full_like(ids[row], 2**31 - 1))
     )
     ids[row], scores[row] = ids[row][order], scores[row][order]
-    verdict = ref.judge((ids, scores), reference, zero_sign_policy="ieee_sum")
+    verdict = ref.judge((ids, scores), reference)
     assert not verdict.passed and any(
         "clearly better" in f for f in verdict.failures
     ), str(verdict)
     # a wrong score bit pattern on a correct id
     ids, scores = reference.indices.clone(), reference.scores.clone()
     scores[1, 0] = scores[1, 0] + 1.0
-    verdict = ref.judge((ids, scores), reference, zero_sign_policy="ieee_sum")
+    verdict = ref.judge((ids, scores), reference)
     assert not verdict.passed and any(
         "outside the bound" in f for f in verdict.failures
     ), str(verdict)
@@ -598,14 +597,12 @@ def test_signed_zero_bits_follow_the_documented_policy():
     zero = (scores == 0) & (indices >= 0)
     assert bool(zero.any())
     bits = scores.view(torch.int32)
-    if policy == "positive_accumulator":
-        assert bool((bits[zero] == 0).all()), (
-            "the FMA chains start from +0.0: every zero score is +0.0"
-        )
-    else:
-        assert torch.equal(bits[zero], reference.scores.view(torch.int32)[zero]), (
-            "IEEE signed zeros preserved"
-        )
+    if policy != "positive_accumulator":
+        pytest.fail(f"the reference has no model for zero-sign policy {policy!r}")
+    assert bool((bits[zero] == 0).all()), (
+        "the chains start from +0.0 with a fixed FMA order: every zero score is +0.0"
+    )
+    assert torch.equal(bits[zero], reference.scores.view(torch.int32)[zero])
 
 
 @pytest.mark.parametrize("name", list(ref.PACKED_GEOMETRIES))

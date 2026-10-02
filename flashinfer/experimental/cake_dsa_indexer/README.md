@@ -74,12 +74,15 @@ with `n = 2D + 4H + 4 = 388`, `gamma_n = n u / (1 - n u)`, `u = 2 ** -24` and
 `A = softmax_scale * sum_h |w_h| sum_d |q_hd k_jd|` (the bound the tests
 enforce against an independent FP64 / FP32 reference).
 
-**Signed zeros.**  The FMA chains start from `+0.0` and `fma(+0, w', +0) =
-+0` for either sign of `w'`, so a row whose head terms are all zero scores
-`+0.0`; a `-0.0` score cannot arise from this scheme (registry field
-`numerics["zero_sign_policy"] = "positive_accumulator"`).  Ranking treats
-`+0.0` and `-0.0` as equal, and the returned bits are always the computed ones:
-nothing is normalized after the fact.
+**Signed zeros.**  What the program computes: every chain accumulator is
+initialised to `+0.0` and the FMA order is fixed, and `fma(+0, w', +0) = +0`
+for either sign of `w'`, so a row whose head terms are all zero yields `+0.0`;
+a `-0.0` score cannot arise from this reduction (registry field
+`numerics["zero_sign_policy"] = "positive_accumulator"`).  Ordering rule:
+`+0.0` and `-0.0` compare equal, an equal-score tie goes to the larger key id,
+and the written score keeps the computed bits -- it is never canonicalised.
+The reference in `tests/test_helpers/cake_dsa_indexer_reference.py` follows
+the same reduction model, so the bit-exact test cases compare like with like.
 
 ## Visibility
 
@@ -114,13 +117,17 @@ all padding).
 
 ## Non-finite inputs
 
-Finite inputs and finite scores are the normal domain; `-inf` is reserved for
-padding.  Outside it, a NaN or infinite `q`, `k` or `w` entry yields NaN or
-`+-inf` scores for its pairs under IEEE rules (`x + |x|` of `-inf` is NaN);
-NaN scores rank below every other score (also below `-inf`), `+-inf` rank by
-value, and the computed bits are returned.  No loop bound or barrier depends
-on a score comparison, so the kernels cannot hang or read out of bounds for
-any bit pattern.
+Finite inputs and finite scores are the contract's domain; `-inf` is reserved
+for padding.  With NaN, infinite or FP32-overflowing inputs (NaN queries,
+`+-inf` keys, BF16-max values whose products overflow FP32 -- the verified
+case) the operator returns -- it must not hang -- with the output structure
+intact: shapes and dtypes, unique ids inside the row's visible prefix in
+ascending order, and the rows of finite segments of the same call meet the
+finite contract exactly.  The score values and the relative order of NaN and
+`+-inf` scores inside an affected row are not specified (the reference ranks
+NaN lowest for its own bookkeeping only).  The kernels' loop bounds and
+barriers do not depend on score comparisons, which is what lets any bit
+pattern terminate.
 
 ## Workspace and host behaviour
 
@@ -176,4 +183,7 @@ recorded token counts; tile-boundary neighbours; changing shapes; bitwise
 repeatability and partition-knob invariance; strided `k`; non-finite inputs;
 CUDA-graph capture; the workspace bound).  Benchmark:
 `benchmarks/bench_cake_dsa_indexer.py` (paired AB / BA / interleaved CUPTI
-spans of the complete operator against two torch + FlashInfer compositions).
+spans of the complete operator against two torch + FlashInfer compositions;
+both baseline arms are reconstructions of the training stack's chunked
+scoring / coarse top-k / rescoring path written for this benchmark, not the
+stack's own kernels, so their absolute numbers are speed references only).
