@@ -23,6 +23,9 @@ from .api_logging import flashinfer_api
 from .cake_fused_qk_rope_append import (  # noqa: F401  (re-exported Cake fused route)
     cake_fused_qk_rmsnorm_rope_append_paged_kv_cache,
 )
+from .cake_fused_qk_rope_fp8_append import (  # noqa: F401  (re-exported Cake fused FP8 route)
+    cake_fused_qk_rmsnorm_rope_quantize_fp8_append_paged_kv_cache,
+)
 from .trace.templates.rope import (
     apply_llama31_rope_inplace_trace,
     apply_llama31_rope_pos_ids_inplace_trace,
