@@ -546,7 +546,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, False, False, False, True, 256, 512, None): {"epi": 'reg', "quad_store": True, "promo": 'l2_256b'},
     ('sm_107a', False, False, False, False, True, 512, 256, None): {"promo": 'l2_256b'},
     ('sm_107a', False, True, False, False, False, 6144, 32, None): {"cta_rows": 256},
-    ('sm_107a', False, True, False, False, False, 6144, 128, None): {"cta_rows": 256},
+    ('sm_107a', False, True, False, False, False, 6144, 128, None): {"cta_rows": 256, "block_n": 128},
     ('sm_107a', False, True, False, False, False, 6144, 576, None): {"group_m": 8, "epi": 'reg', "quad_store": True},
     ('sm_107a', False, True, False, False, False, 12288, 6144, None): {"hints": ('none', 'evict_first')},
     ('sm_107a', False, True, False, False, False, 16384, 6144, None): {"cta_rows": 256, "group_m": 8},
@@ -562,7 +562,7 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', False, True, True, False, False, 6144, 12288, None): {"cta_rows": 256},
     ('sm_107a', False, True, True, False, False, 12288, 6144, None): {"cta_rows": 256},
     ('sm_107a', False, True, True, False, False, 16384, 6144, None): {"cta_rows": 256},
-    ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 128, "sk_parts": 2},
+    ('sm_107a', True, True, False, False, False, 2048, None, 4096): {"block_n": 128, "sk_parts": 2, "group_m": 4},
     ('sm_107a', True, True, False, True, False, 32, None, 6144): {"block_n": 128, "sk_parts": 3},
     ('sm_107a', True, True, False, True, False, 128, None, 6144): {"block_n": 128, "sk_parts": 3},
     ('sm_107a', True, True, False, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
@@ -577,6 +577,9 @@ ROW_RULES: dict[tuple, dict] = {
     ('sm_107a', True, True, True, True, False, 32, None, 6144): {"block_n": 128, "sk_parts": 3},
     ('sm_107a', True, True, True, True, False, 128, None, 6144): {"block_n": 128, "sk_parts": 3},
     ('sm_107a', True, True, True, True, False, 576, None, 6144): {"group_m": 8, "hints": ('evict_first', 'evict_first')},
+    ('sm_107a', False, False, False, False, False, 32, 6144, None): {"promo": 'l2_256b'},
+    ('sm_107a', False, True, True, False, False, 6144, 576, None): {"group_m": 8, "promo": 'l2_256b'},
+    ('sm_107a', False, False, False, False, False, 6144, 16384, None): {"cta_rows": 256},
 }
 # fmt: on
 
