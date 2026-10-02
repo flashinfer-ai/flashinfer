@@ -450,15 +450,14 @@ def _slot_ref(logical, t2r, table, page, slots, valid):
     mask = torch.zeros(len(logical) * nbytes, dtype=torch.uint8)
     tab, reqs = table.tolist(), t2r.tolist()
     for row, toks in enumerate(logical.tolist()[:valid]):
-        r = reqs[row]
-        first = tab[r][0] if 0 <= r < len(tab) and tab[r] else -1
-        if first >= 0 and first * page < slots:  # invalid entries read the first token
-            route[row] = first * page
+        r, ok = reqs[row], torch.zeros(len(toks), dtype=torch.bool)
         for col, t in enumerate(toks if 0 <= r < len(tab) else ()):
             mapped = tab[r][t // page] if t >= 0 and t // page < len(tab[r]) else -1
             if mapped >= 0 and mapped * page + t % page < slots:
-                route[row, col] = mapped * page + t % page
+                route[row, col], ok[col] = mapped * page + t % page, True
                 mask[row * nbytes + col // 8] |= 1 << col % 8
+        if ok.any():  # invalid entries read the row's first valid entry
+            route[row][~ok] = route[row][ok][0]
     return route.to(DEV), mask.to(DEV)
 
 
@@ -484,7 +483,7 @@ def _rcase(rows, topk, cr, page=16, seq=512, nreq=4, valid=None, fill=None, t2r=
     rand = lambda hi, *shape: torch.randint(0, hi, shape, device=DEV, generator=g)
     pages = -(-seq // page)
     table = torch.randperm(pages * nreq, device=DEV, generator=g).view(nreq, pages)
-    table[:, 1::7] = -1  # unmapped pages; the first stays mapped for invalid entries
+    table[:, ::7] = -1  # unmapped pages, the first among them
     if fill is not None:
         table.fill_(fill)
     t2r = torch.tensor(t2r, device=DEV) if t2r else rand(nreq, rows)
@@ -525,6 +524,8 @@ _ROUTE_CASES = {
     "block-ahead-of-query": lambda: _one([2, 0, 0, 0], 3, 512),
     "own-block": lambda: _one([2], 9, 512),
     "every-rank": lambda: _one([-1, -1, 0, 1], 7),
+    # The only valid entries are the tail, past every block's first pass, on page 1.
+    "tail-only": lambda: _one([-1] * 128, 6, 512, table=[[-1, 5, 1, 2, 3, 4, 6, 7]]),
     "pos-int32-max": lambda: _one([0, 1, 2, 3], I32, 512, dtype=I64),
     "len-int32-max": lambda: _one([0, 1, 2, 3], 31, I32, dtype=I64),
     "slot-wraps": lambda: _one([0] * 4, 7, 8, 1, [[2**16]], 2**16, 2**32 - 1, I64),

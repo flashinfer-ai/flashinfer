@@ -940,7 +940,9 @@ class QSAAttention:
             the caller's, because the caller is the one that laid the cache out.
         route : torch.Tensor
             Logical token route, ``[rows, route_width]`` int32, ``-1`` where a
-            position has no token. Indices only.
+            position has no token. Indices only. A row that names no token its
+            request's pages map has nothing to attend to, and its output is
+            undefined.
         block_table : torch.Tensor
             Logical page to physical page per request.
         token_to_request : torch.Tensor

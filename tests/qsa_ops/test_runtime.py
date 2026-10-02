@@ -263,7 +263,9 @@ def _attend_ref(b, k, v):
     k, v = (t.reshape(-1, KV, D)[:, 0].double() for t in (k, v))
     out = torch.zeros(len(b.q), QO, D, dtype=torch.float64, device=DEV)
     for row in range(len(b.q)):
-        toks = torch.tensor([t for t in b.route[row].tolist() if t >= 0], device=DEV)
+        mapped = b.table[b.t2r[row]].tolist()
+        toks = [t for t in b.route[row].tolist() if t >= 0 and mapped[t // PAGE] >= 0]
+        toks = torch.tensor(toks, device=DEV)
         if len(toks):
             slots = b.table[b.t2r[row], toks // PAGE] * PAGE + toks % PAGE
             w = torch.softmax(k[slots] @ b.q[row].double().T / D**0.5, 0)
@@ -282,19 +284,27 @@ def _close(got, want):
 
 @pytest.mark.parametrize(
     "fmt,rows,null_page",
-    [("dense", 16, 0), ("dense", 3, 0), ("fp8", 16, 0), ("nvfp4", 16, 0)]
-    + [("nvfp4-interleaved", 16, 0), ("dense", 16, 1)],
+    [("dense", 16, None), ("dense", 3, None), ("fp8", 16, None), ("nvfp4", 16, None)]
+    + [("nvfp4-interleaved", 16, None)]
+    + [("dense", n, first) for n in (16, 3) for first in ("mapped", "unmapped")],
 )
 def test_attention_matches_oracle(fmt, rows, null_page):
     b = _batch(rows, 1 if rows < 4 else 2, seed=rows)
     if null_page:  # page 0 is the caller's padding: no request maps it, and it is NaN
         b.table += 1
         b.k, b.v = (torch.cat([t[:1] * float("nan"), t]) for t in (b.k, b.v))
+        if null_page == "unmapped":  # nor is a request's first page any safer
+            b.table[:, 0] = -1
     kw, decoded = _cache(fmt, b)
-    att = _attention(fmt, slots=SLOTS + null_page * PAGE)
+    att = _attention(fmt, slots=SLOTS + bool(null_page) * PAGE)
     out = _run(att, b, **kw)
     _close(out, _attend_ref(b, *decoded))
     _exact([_run(att, b, **kw)], [out])  # deterministic
+    want, out = out, torch.empty_like(out)
+    graph = _capture(lambda: _run(att, b, **kw, out=out))
+    out.zero_()
+    graph.replay()
+    _exact([out], [want])  # and the same from a graph
     ungated = _run(att, b, **kw, output_gate=torch.full_like(b.gate, 40.0))
     gate = torch.sigmoid(b.gate.view(-1, QO, D).float())
     _exact([out], [(ungated.float() * gate).to(BF16)])  # the gate is one rounding

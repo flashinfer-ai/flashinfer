@@ -81,23 +81,75 @@ inline cudaError_t choose_wide(uint32_t wide_blocks, bool* wide) {
   return cudaSuccess;
 }
 
-// Where a live row's invalid entries point. The attention reads every entry before
-// the mask is applied, and a masked entry still multiplies its V row by a zero
+// A logical page and the entry inside it -> the physical slot, or false when the
+// table does not cover the page, does not map it, or maps it past the cache.
+//
+// The page id keeps its own width until it is bounded, and the slot is formed in
+// 64 bits: page * page_size overflows a uint32 long before either factor does, and
+// a wrapped product can land under num_slots.
+//
+// What bounds the page is the slot space, not an int32. A route of int64 can hold a
+// slot of 2^31 and the caller is allowed to ask for one, so capping the page at
+// INT32_MAX would mask a page it is entitled to.
+//
+// page < num_slots is necessary rather than sufficient -- the slot is at least the
+// page whenever a page holds anything -- so it turns no valid page away, and it is
+// what keeps the product inside 64 bits: both factors are under 2^32 by then. The
+// exact bound is the candidate.
+template <typename IdType>
+__device__ __forceinline__ bool page_slot(const IdType* row_table, uint32_t table_width,
+                                          uint32_t logical_page, uint32_t entry, uint32_t page_size,
+                                          uint32_t num_slots, uint32_t* slot) {
+  if (logical_page >= table_width) return false;
+  const IdType page = row_table[logical_page];
+  if (page < IdType(0) || static_cast<uint64_t>(page) >= static_cast<uint64_t>(num_slots)) {
+    return false;
+  }
+  const uint64_t candidate = static_cast<uint64_t>(page) * page_size + entry;
+  if (candidate >= static_cast<uint64_t>(num_slots)) return false;
+  *slot = static_cast<uint32_t>(candidate);
+  return true;
+}
+
+// Where a row's invalid entries point. The attention reads every entry before the
+// mask is applied, and a masked entry still multiplies its V row by a zero
 // probability, so what the slot holds has to be finite. Slot 0 is not that: it is
 // wherever the caller keeps padding -- vLLM's null block -- and a NaN left there comes
-// out of P @ V as 0 * NaN. The request's first token is a slot the request has written
-// by the time its attention runs, so a live row's invalid entries read that instead.
-// A row without a request is fully masked and its output is not kept; it stays on 0.
-template <typename IdType>
-__device__ __forceinline__ uint32_t first_token_slot(const IdType* row_table, uint32_t table_width,
-                                                     uint32_t page_size, uint32_t num_slots) {
-  if (row_table == nullptr || table_width == 0) return 0;
-  const IdType page = row_table[0];
-  if (page < IdType(0) || static_cast<uint64_t>(page) >= static_cast<uint64_t>(num_slots)) {
-    return 0;
+// out of P @ V as 0 * NaN. A valid entry names a token the caller has written, so the
+// invalid entries read the slot of the row's first valid entry instead. Nothing ties
+// that entry to a page: a table may leave its first pages unmapped and map later ones.
+//
+// resolve(col, &slot) says whether column col is valid and, when it is, its slot.
+// Every block of a row looks for the entry on its own, a block-wide pass at a time
+// from the front, and stops at the first pass that holds one. A row with no valid
+// entry has no finite slot to offer and stays on 0: it is fully masked, its output
+// is undefined, and the caller must not keep it.
+//
+// Every thread of the block calls this, the same number of times.
+template <uint32_t THREADS, typename Resolve>
+__device__ __forceinline__ uint32_t first_valid_slot(uint32_t width, const Resolve& resolve) {
+  __shared__ uint32_t first_col;
+  __shared__ uint32_t first_slot;
+  // The previous row's readers have to be done with first_slot before it is reset.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    first_col = 0xffffffffu;
+    first_slot = 0;
   }
-  const uint64_t slot = static_cast<uint64_t>(page) * page_size;
-  return slot < static_cast<uint64_t>(num_slots) ? static_cast<uint32_t>(slot) : 0u;
+  __syncthreads();
+  for (uint32_t base = 0; base < width; base += THREADS) {
+    const uint32_t col = base + threadIdx.x;
+    uint32_t slot = 0;
+    const bool valid = col < width && resolve(col, &slot);
+    if (__syncthreads_or(valid)) {
+      if (valid) atomicMin(&first_col, col);
+      __syncthreads();
+      if (col == first_col) first_slot = slot;
+      __syncthreads();
+      break;
+    }
+  }
+  return first_slot;
 }
 
 }  // namespace sparse_route
@@ -246,8 +298,9 @@ __global__ void __launch_bounds__(THREADS)
  * A route entry is valid when it names a real token: inside the request, on a
  * logical page the block table covers, on a page the table actually maps, and in a
  * slot the cache holds. Invalid entries keep their mask bit clear and route to the
- * request's first token, because they are read before the mask is applied (see
- * sparse_route::first_token_slot).
+ * row's first valid entry, because they are read before the mask is applied (see
+ * sparse_route::first_valid_slot). A row with no valid entry is fully masked on slot
+ * 0 and its output is undefined.
  *
  * The logical route is written out as well: a speculative decoder reuses the
  * selection across its steps, so it outlives the physical route derived from it.
@@ -322,11 +375,51 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
     const IdType* row_blocks = block_indices + row * stride_blocks_row;
     const IdType* row_table =
         request_valid ? block_table + safe_request * stride_table_row : nullptr;
-    const uint32_t fallback_slot =
-        sparse_route::first_token_slot(row_table, table_width, page_size, num_slots);
     IdType* row_logical = out_logical + row * stride_logical_row;
     IdType* row_route = out_route + row * output_width;
     uint8_t* row_mask = out_mask + row * mask_bytes_per_row;
+
+    // The logical token a column of the row names, or -1.
+    const auto column_token = [&](uint32_t col) -> int32_t {
+      const int32_t column = static_cast<int32_t>(col);
+      int32_t token;
+      bool valid;
+      if (column < expanded_count) {
+        const int32_t rank = column / static_cast<int32_t>(COMPRESS_RATIO);
+        const int32_t offset = column - rank * static_cast<int32_t>(COMPRESS_RATIO);
+        // Same whole-block rule as the standalone expansion above, decided
+        // before the multiply for the same reason.
+        const IdType block_raw = row_blocks[rank * blocks_stride];
+        valid = block_raw >= IdType(0) && block_raw <= kInt32Max &&
+                block_raw < static_cast<IdType>(past_blocks);
+        token =
+            valid ? static_cast<int32_t>(block_raw) * static_cast<int32_t>(COMPRESS_RATIO) + offset
+                  : -1;
+      } else {
+        const int32_t tail_offset = column - expanded_count;
+        token = tail_start + tail_offset;
+        valid = tail_offset < tail_count && tail_offset < static_cast<int32_t>(COMPRESS_RATIO) - 1;
+      }
+      // Same causal bound as the standalone expansion above: a selected block
+      // the query has not reached would expand into tokens it cannot see, and
+      // the sequence length alone does not stop them.
+      valid = valid && token >= 0 && token <= query_position && token < sequence_length;
+      return valid ? token : -1;
+    };
+    // Logical token -> physical slot, folding every bound into the same validity.
+    const auto token_slot = [&](int32_t token, uint32_t* slot) -> bool {
+      return token >= 0 && row_table != nullptr &&
+             sparse_route::page_slot(
+                 row_table, table_width, static_cast<uint32_t>(token) / page_size,
+                 static_cast<uint32_t>(token) % page_size, page_size, num_slots, slot);
+    };
+    // Uniform across the block: a row without a request has nothing to look for.
+    const uint32_t fallback_slot = row_table == nullptr
+                                       ? 0u
+                                       : sparse_route::first_valid_slot<THREADS>(
+                                             output_width, [&](uint32_t col, uint32_t* slot) {
+                                               return token_slot(column_token(col), slot);
+                                             });
 
     // A warp always covers 32 consecutive columns, so its ballot is exactly the four
     // mask bytes that cover them and no two warps write the same byte.
@@ -338,69 +431,12 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
       const bool in_row = col < output_width;
 
       int32_t token = -1;
-      bool valid = false;
       if (in_row) {
-        const int32_t column = static_cast<int32_t>(col);
-        if (column < expanded_count) {
-          const int32_t rank = column / static_cast<int32_t>(COMPRESS_RATIO);
-          const int32_t offset = column - rank * static_cast<int32_t>(COMPRESS_RATIO);
-          // Same whole-block rule as the standalone expansion above, decided
-          // before the multiply for the same reason.
-          const IdType block_raw = row_blocks[rank * blocks_stride];
-          valid = block_raw >= IdType(0) && block_raw <= kInt32Max &&
-                  block_raw < static_cast<IdType>(past_blocks);
-          token = valid ? static_cast<int32_t>(block_raw) * static_cast<int32_t>(COMPRESS_RATIO) +
-                              offset
-                        : -1;
-        } else {
-          const int32_t tail_offset = column - expanded_count;
-          token = tail_start + tail_offset;
-          valid =
-              tail_offset < tail_count && tail_offset < static_cast<int32_t>(COMPRESS_RATIO) - 1;
-        }
-        // Same causal bound as the standalone expansion above: a selected block
-        // the query has not reached would expand into tokens it cannot see, and
-        // the sequence length alone does not stop them.
-        valid = valid && token >= 0 && token <= query_position && token < sequence_length;
-        if (!valid) token = -1;
+        token = column_token(col);
         row_logical[col] = static_cast<IdType>(token);
       }
-
-      // Logical token -> physical slot, folding every bound into the same validity.
       uint32_t slot = fallback_slot;
-      if (valid) {
-        const uint32_t logical_page = static_cast<uint32_t>(token) / page_size;
-        if (logical_page < table_width && row_table != nullptr) {
-          // The page id keeps its own width until it is bounded, and the slot is
-          // formed in 64 bits: page * page_size overflows a uint32 long before
-          // either factor does, and a wrapped product can land under num_slots.
-          //
-          // What bounds the page is the slot space, not an int32. A route of
-          // int64 can hold a slot of 2^31 and the caller is allowed to ask for
-          // one, so capping the page at INT32_MAX would mask a page it is
-          // entitled to.
-          //
-          // page < num_slots is necessary rather than sufficient -- the slot is
-          // at least the page whenever a page holds anything -- so it turns no
-          // valid page away, and it is what keeps the product inside 64 bits:
-          // both factors are under 2^32 by then. The exact bound is still the
-          // candidate below.
-          const IdType page = row_table[logical_page];
-          if (page >= IdType(0) && static_cast<uint64_t>(page) < static_cast<uint64_t>(num_slots)) {
-            const uint64_t candidate =
-                static_cast<uint64_t>(page) * page_size + static_cast<uint32_t>(token) % page_size;
-            if (candidate < static_cast<uint64_t>(num_slots)) {
-              slot = static_cast<uint32_t>(candidate);
-            } else {
-              valid = false;
-            }
-          } else {
-            valid = false;
-          }
-        } else {
-          valid = false;
-        }
-      }
+      const bool valid = token_slot(token, &slot);
       if (in_row) row_route[col] = static_cast<IdType>(slot);
 
       const uint32_t bits = __ballot_sync(0xffffffffu, valid && in_row);
@@ -427,9 +463,10 @@ __global__ void __launch_bounds__(THREADS) QSARouteFromBlocksKernel(
  *
  * An entry is valid when it names a real token: non-negative, on a logical page the
  * block table covers, on a page the table maps, and in a slot the cache holds.
- * Invalid entries keep their mask bit clear and route to the request's first token,
+ * Invalid entries keep their mask bit clear and route to the row's first valid entry,
  * because they are read before the mask is applied (see
- * sparse_route::first_token_slot).
+ * sparse_route::first_valid_slot). A row with no valid entry is fully masked on slot
+ * 0 and its output is undefined.
  */
 template <uint32_t TILE, uint32_t THREADS, typename IdType>
 __global__ void __launch_bounds__(THREADS)
@@ -462,8 +499,21 @@ __global__ void __launch_bounds__(THREADS)
     const IdType* row_logical = row_live ? logical + row * stride_logical_row : nullptr;
     IdType* row_route = out_route + row * width;
     uint8_t* row_mask = out_mask + row * mask_bytes_per_row;
-    const uint32_t fallback_slot = sparse_route::first_token_slot(
-        row_table, table_width, static_cast<uint32_t>(page_size), num_slots);
+    const bool row_mapped = row_table != nullptr && row_logical != nullptr;
+
+    // A column of a mapped row -> its physical slot.
+    const auto column_slot = [&](uint32_t col, uint32_t* slot) -> bool {
+      const IdType token_raw = row_logical[col];
+      if (token_raw < IdType(0) || token_raw > kInt32Max) return false;
+      uint32_t logical_page, entry;
+      page_size.divmod(static_cast<uint32_t>(token_raw), logical_page, entry);
+      return sparse_route::page_slot(row_table, table_width, logical_page, entry,
+                                     static_cast<uint32_t>(page_size), num_slots, slot);
+    };
+    // Uniform across the block: padding and a row without a request have nothing to
+    // look for.
+    const uint32_t fallback_slot =
+        row_mapped ? sparse_route::first_valid_slot<THREADS>(width, column_slot) : 0u;
 
     const uint32_t lane = threadIdx.x & 31u;
 
@@ -473,29 +523,7 @@ __global__ void __launch_bounds__(THREADS)
       const bool in_row = col < width;
 
       uint32_t slot = fallback_slot;
-      bool valid = false;
-      if (in_row && row_table != nullptr && row_logical != nullptr) {
-        const IdType token_raw = row_logical[col];
-        if (token_raw >= IdType(0) && token_raw <= kInt32Max) {
-          const int32_t token = static_cast<int32_t>(token_raw);
-          uint32_t logical_page, entry;
-          page_size.divmod(static_cast<uint32_t>(token), logical_page, entry);
-          if (logical_page < table_width) {
-            // Bounded by the slot space rather than by an int32, for the same
-            // reason as the fused kernel above.
-            const IdType page = row_table[logical_page];
-            if (page >= IdType(0) &&
-                static_cast<uint64_t>(page) < static_cast<uint64_t>(num_slots)) {
-              const uint64_t candidate =
-                  static_cast<uint64_t>(page) * static_cast<uint32_t>(page_size) + entry;
-              if (candidate < static_cast<uint64_t>(num_slots)) {
-                slot = static_cast<uint32_t>(candidate);
-                valid = true;
-              }
-            }
-          }
-        }
-      }
+      const bool valid = in_row && row_mapped && column_slot(col, &slot);
       if (in_row) row_route[col] = static_cast<IdType>(slot);
 
       const uint32_t bits = __ballot_sync(0xffffffffu, valid);
