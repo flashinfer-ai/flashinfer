@@ -90,9 +90,113 @@ class Route(NamedTuple):
     cooperative: bool
 
 
-KERNELS: dict[str, Kernel] = {}
+KERNELS: dict[str, Kernel] = {
+    "ws2_bf16_wide_mlp": Kernel("bfloat16", 2, 224, 4),
+    "ws2_bf16_wide_mlp_cta1": Kernel("bfloat16", 2, 896, 1),
+    "ws2_bf16_pipe2_u4": Kernel("bfloat16", 2, 224, 4),
+    "ws2_bf16_pipe2_u4_b5": Kernel("bfloat16", 2, 224, 4),
+    "ws2_f16_pipe2_u4_b5": Kernel("float16", 2, 224, 4),
+    "ws2_f16_wide_mlp": Kernel("float16", 2, 224, 4),
+    "ws4_bf16_clrfirst": Kernel("bfloat16", 4, 224, 4),
+    "ws4_bf16_generic": Kernel("bfloat16", 4, 224, 4),
+    "ws4_bf16_wide_mlp_t1_e8_serial_clear_cta1": Kernel("bfloat16", 4, 896, 1),
+    "ws4_bf16_pipe2_u4_b5": Kernel("bfloat16", 4, 224, 4),
+    "ws4_bf16_wide_mlp": Kernel("bfloat16", 4, 224, 4),
+    "ws4_f16_pipe2_u4_b5": Kernel("float16", 4, 224, 4),
+    "ws4_f16_wide_mlp": Kernel("float16", 4, 224, 4),
+    "ws8_bf16_generic": Kernel("bfloat16", 8, 224, 4),
+    "ws8_bf16_pipe1_u4_b5": Kernel("bfloat16", 8, 224, 4),
+    "ws8_bf16_sm100_ws8_mid": Kernel("bfloat16", 8, 224, 4),
+    "ws8_f16_generic": Kernel("float16", 8, 224, 4),
+    "ws8_f16_pipe1_u4_b5": Kernel("float16", 8, 224, 4),
+}
 
-ROUTES: dict[tuple[str, int, str, bool, str], Route] = {}
+ROUTES: dict[tuple[str, int, str, bool, str], Route] = {
+    ("sm_100a", 2, "bfloat16", False, "wide_mlp"): Route(
+        "ws2_bf16_wide_mlp", 4, None, False
+    ),
+    ("sm_100a", 2, "bfloat16", False, "wide_mlp_cta1"): Route(
+        "ws2_bf16_wide_mlp_cta1", 1, None, False
+    ),
+    ("sm_100a", 2, "bfloat16", True, "pipe2_u4"): Route(
+        "ws2_bf16_pipe2_u4", 4, None, False
+    ),
+    ("sm_100a", 2, "bfloat16", True, "pipe2_u4_b5"): Route(
+        "ws2_bf16_pipe2_u4_b5", 5, 175, False
+    ),
+    ("sm_100a", 2, "bfloat16", True, "wide_mlp"): Route(
+        "ws2_bf16_wide_mlp", 4, None, False
+    ),
+    ("sm_100a", 2, "float16", False, "pipe2_u4_b5"): Route(
+        "ws2_f16_pipe2_u4_b5", 5, 175, False
+    ),
+    ("sm_100a", 2, "float16", False, "wide_mlp"): Route(
+        "ws2_f16_wide_mlp", 4, None, False
+    ),
+    ("sm_100a", 2, "float16", True, "pipe2_u4_b5"): Route(
+        "ws2_f16_pipe2_u4_b5", 5, 175, False
+    ),
+    ("sm_100a", 2, "float16", True, "wide_mlp"): Route(
+        "ws2_f16_wide_mlp", 4, None, False
+    ),
+    ("sm_100a", 4, "bfloat16", False, "clrfirst"): Route(
+        "ws4_bf16_clrfirst", 4, None, False
+    ),
+    ("sm_100a", 4, "bfloat16", False, "generic"): Route(
+        "ws4_bf16_generic", 4, None, False
+    ),
+    ("sm_100a", 4, "bfloat16", False, "wide_mlp_t1_e8_serial_clear_cta1"): Route(
+        "ws4_bf16_wide_mlp_t1_e8_serial_clear_cta1", 1, None, False
+    ),
+    ("sm_100a", 4, "bfloat16", True, "generic"): Route(
+        "ws4_bf16_generic", 4, None, False
+    ),
+    ("sm_100a", 4, "bfloat16", True, "pipe2_u4_b5"): Route(
+        "ws4_bf16_pipe2_u4_b5", 5, 175, False
+    ),
+    ("sm_100a", 4, "bfloat16", True, "wide_mlp"): Route(
+        "ws4_bf16_wide_mlp", 3, None, False
+    ),
+    ("sm_100a", 4, "float16", False, "pipe2_u4_b5"): Route(
+        "ws4_f16_pipe2_u4_b5", 5, 175, False
+    ),
+    ("sm_100a", 4, "float16", False, "wide_mlp"): Route(
+        "ws4_f16_wide_mlp", 4, None, False
+    ),
+    ("sm_100a", 4, "float16", False, "wide_mlp_t64_e12_resident"): Route(
+        "ws4_f16_wide_mlp", 1, None, True
+    ),
+    ("sm_100a", 4, "float16", True, "pipe2_u4_b5"): Route(
+        "ws4_f16_pipe2_u4_b5", 5, 175, False
+    ),
+    ("sm_100a", 4, "float16", True, "wide_mlp"): Route(
+        "ws4_f16_wide_mlp", 4, None, False
+    ),
+    ("sm_100a", 8, "bfloat16", False, "generic"): Route(
+        "ws8_bf16_generic", 4, None, False
+    ),
+    ("sm_100a", 8, "bfloat16", True, "generic"): Route(
+        "ws8_bf16_generic", 4, None, False
+    ),
+    ("sm_100a", 8, "bfloat16", True, "pipe1_u4_b5"): Route(
+        "ws8_bf16_pipe1_u4_b5", 5, 175, False
+    ),
+    ("sm_100a", 8, "bfloat16", True, "sm100_ws8_mid"): Route(
+        "ws8_bf16_sm100_ws8_mid", 4, None, False
+    ),
+    ("sm_100a", 8, "float16", False, "generic"): Route(
+        "ws8_f16_generic", 4, None, False
+    ),
+    ("sm_100a", 8, "float16", False, "pipe1_u4_b5"): Route(
+        "ws8_f16_pipe1_u4_b5", 5, 175, False
+    ),
+    ("sm_100a", 8, "float16", True, "generic"): Route(
+        "ws8_f16_generic", 4, None, False
+    ),
+    ("sm_100a", 8, "float16", True, "pipe1_u4_b5"): Route(
+        "ws8_f16_pipe1_u4_b5", 5, 175, False
+    ),
+}
 
 # (arch, world_size, dtype, launch_with_pdl, num_experts) ->
 #     ((token_lo, token_hi, specialization), ...)
@@ -102,11 +206,39 @@ ROUTES: dict[tuple[str, int, str, bool, str], Route] = {}
 # correct and at least 2 % faster than the class program over.
 _SPECIALIZATION_RULES: dict[
     tuple[str, int, str, bool, int], tuple[tuple[int, int, str], ...]
-] = {}
+] = {
+    ("sm_100a", 2, "bfloat16", False, 8): ((1, 32, "wide_mlp_cta1"),),
+    ("sm_100a", 2, "bfloat16", True, 12): (
+        (192, 384, "pipe2_u4"),
+        (1536, 2048, "pipe2_u4_b5"),
+    ),
+    ("sm_100a", 2, "float16", False, 8): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_100a", 2, "float16", True, 16): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_100a", 4, "bfloat16", False, 8): (
+        (1, 32, "wide_mlp_t1_e8_serial_clear_cta1"),
+    ),
+    ("sm_100a", 4, "bfloat16", False, 16): ((96, 192, "clrfirst"),),
+    ("sm_100a", 4, "bfloat16", True, 8): ((32, 96, "wide_mlp"),),
+    ("sm_100a", 4, "bfloat16", True, 12): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_100a", 4, "float16", False, 8): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_100a", 4, "float16", False, 12): ((32, 96, "wide_mlp_t64_e12_resident"),),
+    ("sm_100a", 4, "float16", True, 16): ((1536, 2048, "pipe2_u4_b5"),),
+    ("sm_100a", 8, "bfloat16", True, 8): ((32, 96, "sm100_ws8_mid"),),
+    ("sm_100a", 8, "bfloat16", True, 12): ((1536, 2048, "pipe1_u4_b5"),),
+    ("sm_100a", 8, "float16", False, 8): ((1536, 2048, "pipe1_u4_b5"),),
+    ("sm_100a", 8, "float16", True, 16): ((1536, 2048, "pipe1_u4_b5"),),
+}
 
 # (arch, world_size, dtype, launch_with_pdl) classes whose program is the
 # ``wide_mlp`` schedule for every token count outside the rules' ranges.
-_WIDE_MLP_CLASSES: tuple[tuple[str, int, str, bool], ...] = ()
+_WIDE_MLP_CLASSES: tuple[tuple[str, int, str, bool], ...] = (
+    ("sm_100a", 2, "bfloat16", False),
+    ("sm_100a", 2, "bfloat16", True),
+    ("sm_100a", 2, "float16", False),
+    ("sm_100a", 2, "float16", True),
+    ("sm_100a", 4, "float16", False),
+    ("sm_100a", 4, "float16", True),
+)
 
 _EXPORTED_SCOPES: frozenset[tuple[str, int]] = frozenset(
     (key[0], key[1]) for key in ROUTES
@@ -167,13 +299,52 @@ def route_applies(*, world_size: int, device_capability: Sequence[int]) -> bool:
     """Whether the union has programs for this (architecture, world size).
 
     The union owns exactly the (architecture, world size) scopes it has routes
-    for, with or without the all-reduce output: ``moe_allreduce_out`` is a
-    runtime-optional output of every union kernel, so the caller's output
-    selection does not narrow the scope.
+    for, with or without the all-reduce output: a call without
+    ``moe_allreduce_out`` runs the same kernels against a loader-owned scratch
+    tensor, so the caller's output selection does not narrow the scope.
     """
 
     arch = arch_for_capability(device_capability)
     return arch is not None and (arch, int(world_size)) in _EXPORTED_SCOPES
+
+
+_scratch_allreduce_outputs: dict[
+    tuple[str, Optional[int], torch.dtype], torch.Tensor
+] = {}
+# Scratch tensors replaced by a larger one, kept alive for the process lifetime:
+# a CUDA graph captured while the cached scratch was large enough recorded that
+# tensor's address, so its storage must never return to the allocator.
+_retired_scratch_allreduce_outputs: list[torch.Tensor] = []
+
+
+def scratch_allreduce_output(
+    device: torch.device, dtype: torch.dtype, token_num: int
+) -> torch.Tensor:
+    """A ``[token_num, HIDDEN_DIM]`` sink for calls without ``moe_allreduce_out``.
+
+    Every union kernel stores the all-reduce output; a caller that does not want
+    it gets a loader-owned scratch tensor instead, cached per device and dtype,
+    so steady-state calls allocate nothing. When a larger ``token_num`` arrives
+    the cache grows to at least twice its previous capacity and the replaced
+    tensor is retired, not freed: a CUDA graph captured while the cached scratch
+    was large enough replays against that tensor's address, so its storage must
+    stay owned by the loader for the process lifetime. Doubling bounds the total
+    retired memory by the live capacity. A tensor allocated while a CUDA graph
+    is being captured belongs to the graph's memory pool and is returned without
+    being cached.
+    """
+
+    key = (device.type, device.index, dtype)
+    cached = _scratch_allreduce_outputs.get(key)
+    if cached is None or cached.shape[0] < token_num:
+        capacity = token_num if cached is None else max(token_num, 2 * cached.shape[0])
+        fresh = torch.empty((capacity, HIDDEN_DIM), dtype=dtype, device=device)
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            return fresh[:token_num]
+        if cached is not None:
+            _retired_scratch_allreduce_outputs.append(cached)
+        _scratch_allreduce_outputs[key] = cached = fresh
+    return cached[:token_num]
 
 
 def route_for(
@@ -347,8 +518,9 @@ def run_cake_moe_allreduce_union(
 ) -> None:
     """Select and launch one union kernel for the caller's validated tensors.
 
-    ``moe_allreduce_out`` may be ``None``: the launcher then clears the kernel's
-    runtime ``emit_moe_allreduce_out`` flag and no all-reduce output is stored.
+    ``moe_allreduce_out`` may be ``None``: the kernels always store the
+    all-reduce output, so the call then writes into a loader-owned scratch
+    tensor (``scratch_allreduce_output``).
     ``scale_factor`` belongs to the public API's quant path; the union kernels
     emit no quant output and take no scale factor.
     """
@@ -401,6 +573,12 @@ def run_cake_moe_allreduce_union(
         kernel.cluster,
         route.max_persistent_clusters,
     )
+    if moe_allreduce_out is None:
+        moe_allreduce_out = scratch_allreduce_output(
+            moe_reduction_active_experts_token_input.device,
+            moe_reduction_active_experts_token_input.dtype,
+            int(token_num),
+        )
     load(name, arch).run(
         moe_reduction_active_experts_token_input,
         moe_reduction_scale_input,
@@ -443,6 +621,7 @@ __all__ = [
     "route_for",
     "route_kernel",
     "run_cake_moe_allreduce_union",
+    "scratch_allreduce_output",
     "select_specialization",
     "spec",
 ]

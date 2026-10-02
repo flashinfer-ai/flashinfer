@@ -182,6 +182,58 @@ def test_exported_architectures_are_sm100_and_sm103() -> None:
         # token count per class outside its rules, and the reviewed token counts
         # of the S7 exact-shape decisions (kept rows at their specialization,
         # dropped rows at their class program).
+        ("sm_100a", 2, "bfloat16", False, 1, 8, "wide_mlp_cta1"),
+        ("sm_100a", 2, "bfloat16", False, 32, 8, "wide_mlp_cta1"),
+        ("sm_100a", 2, "bfloat16", False, 512, 8, "wide_mlp"),
+        ("sm_100a", 2, "bfloat16", True, 192, 12, "pipe2_u4"),
+        ("sm_100a", 2, "bfloat16", True, 256, 12, "pipe2_u4"),
+        ("sm_100a", 2, "bfloat16", True, 384, 12, "pipe2_u4"),
+        ("sm_100a", 2, "bfloat16", True, 512, 8, "wide_mlp"),
+        ("sm_100a", 2, "bfloat16", True, 1536, 12, "pipe2_u4_b5"),
+        ("sm_100a", 2, "bfloat16", True, 2048, 12, "pipe2_u4_b5"),
+        ("sm_100a", 2, "float16", False, 512, 8, "wide_mlp"),
+        ("sm_100a", 2, "float16", False, 1536, 8, "pipe2_u4_b5"),
+        ("sm_100a", 2, "float16", False, 2048, 8, "pipe2_u4_b5"),
+        ("sm_100a", 2, "float16", True, 512, 8, "wide_mlp"),
+        ("sm_100a", 2, "float16", True, 1536, 16, "pipe2_u4_b5"),
+        ("sm_100a", 2, "float16", True, 2048, 16, "pipe2_u4_b5"),
+        ("sm_100a", 4, "bfloat16", False, 1, 8, "wide_mlp_t1_e8_serial_clear_cta1"),
+        ("sm_100a", 4, "bfloat16", False, 32, 8, "wide_mlp_t1_e8_serial_clear_cta1"),
+        ("sm_100a", 4, "bfloat16", False, 96, 16, "clrfirst"),
+        ("sm_100a", 4, "bfloat16", False, 128, 16, "clrfirst"),
+        ("sm_100a", 4, "bfloat16", False, 192, 16, "clrfirst"),
+        ("sm_100a", 4, "bfloat16", False, 512, 8, "generic"),
+        ("sm_100a", 4, "bfloat16", True, 32, 8, "wide_mlp"),
+        ("sm_100a", 4, "bfloat16", True, 64, 8, "wide_mlp"),
+        ("sm_100a", 4, "bfloat16", True, 96, 8, "wide_mlp"),
+        ("sm_100a", 4, "bfloat16", True, 512, 8, "generic"),
+        ("sm_100a", 4, "bfloat16", True, 1536, 12, "pipe2_u4_b5"),
+        ("sm_100a", 4, "bfloat16", True, 2048, 12, "pipe2_u4_b5"),
+        ("sm_100a", 4, "float16", False, 32, 12, "wide_mlp_t64_e12_resident"),
+        ("sm_100a", 4, "float16", False, 64, 12, "wide_mlp_t64_e12_resident"),
+        ("sm_100a", 4, "float16", False, 96, 12, "wide_mlp_t64_e12_resident"),
+        ("sm_100a", 4, "float16", False, 512, 8, "wide_mlp"),
+        ("sm_100a", 4, "float16", False, 1536, 8, "pipe2_u4_b5"),
+        ("sm_100a", 4, "float16", False, 2048, 8, "pipe2_u4_b5"),
+        ("sm_100a", 4, "float16", True, 128, 16, "wide_mlp"),
+        ("sm_100a", 4, "float16", True, 512, 8, "wide_mlp"),
+        ("sm_100a", 4, "float16", True, 1536, 16, "pipe2_u4_b5"),
+        ("sm_100a", 4, "float16", True, 2048, 16, "pipe2_u4_b5"),
+        ("sm_100a", 8, "bfloat16", False, 128, 16, "generic"),
+        ("sm_100a", 8, "bfloat16", True, 32, 8, "sm100_ws8_mid"),
+        ("sm_100a", 8, "bfloat16", True, 64, 8, "sm100_ws8_mid"),
+        ("sm_100a", 8, "bfloat16", True, 96, 8, "sm100_ws8_mid"),
+        ("sm_100a", 8, "bfloat16", True, 512, 8, "generic"),
+        ("sm_100a", 8, "bfloat16", True, 1536, 12, "pipe1_u4_b5"),
+        ("sm_100a", 8, "bfloat16", True, 2048, 12, "pipe1_u4_b5"),
+        ("sm_100a", 8, "float16", False, 64, 12, "generic"),
+        ("sm_100a", 8, "float16", False, 512, 8, "generic"),
+        ("sm_100a", 8, "float16", False, 1536, 8, "pipe1_u4_b5"),
+        ("sm_100a", 8, "float16", False, 2048, 8, "pipe1_u4_b5"),
+        ("sm_100a", 8, "float16", True, 128, 16, "generic"),
+        ("sm_100a", 8, "float16", True, 512, 8, "generic"),
+        ("sm_100a", 8, "float16", True, 1536, 16, "pipe1_u4_b5"),
+        ("sm_100a", 8, "float16", True, 2048, 16, "pipe1_u4_b5"),
     ],
 )
 def test_select_specialization_rules(
@@ -345,9 +397,9 @@ def test_run_rejects_unexported_world_sizes_before_touching_the_device() -> None
 def test_run_passes_an_absent_allreduce_output_to_the_launcher(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``moe_allreduce_out=None`` reaches the launcher as a tvm-ffi ``Optional`` (the kernel's
-    runtime ``emit_moe_allreduce_out`` flag is then cleared); the public ``scale_factor`` is not a
-    launcher argument (the union kernels emit no quant output)."""
+    """``moe_allreduce_out=None`` reaches the launcher as the loader-owned scratch tensor (every
+    union kernel stores the all-reduce output); the public ``scale_factor`` is not a launcher
+    argument (the union kernels emit no quant output)."""
 
     (arch, world_size, dtype_name, pdl, _spec), route = sorted(union.ROUTES.items())[0]
     dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16}[dtype_name]
@@ -397,7 +449,12 @@ def test_run_passes_an_absent_allreduce_output_to_the_launcher(
 
     assert len(runs) == 2
     absent, present = runs
-    assert absent[5] is None and present[5] is allreduce_out
+    assert present[5] is allreduce_out
+    scratch = union.scratch_allreduce_output(activation.device, dtype, tokens)
+    assert absent[5].data_ptr() == scratch.data_ptr() and absent[5].shape == (
+        tokens,
+        union.HIDDEN_DIM,
+    )
     assert absent[6] is arguments["residual_out"] and absent[7] is arguments["norm_out"]
     assert absent[8] is arguments["workspace_ptrs"]
     assert len(absent) == 17 and 1.0 not in absent[9:]
@@ -479,8 +536,8 @@ def test_cake_backend_routes_sm100_sm103_with_allreduce_output_to_the_union(
 def test_cake_backend_routes_calls_without_allreduce_output_to_the_union(
     monkeypatch: pytest.MonkeyPatch, world_size: int, capability: tuple[int, int]
 ) -> None:
-    # A call without ``moe_allreduce_out`` runs the same union kernels with the
-    # all-reduce store disabled at launch; no scratch tensor is involved.
+    # A call without ``moe_allreduce_out`` runs the same union kernels; the
+    # loader substitutes its scratch tensor inside ``run_cake_moe_allreduce_union``.
     union_calls = _isolate_backends(monkeypatch, capability)
     arguments = _arguments(world_size, emit_allreduce=False)
 
@@ -492,7 +549,94 @@ def test_cake_backend_routes_calls_without_allreduce_output_to_the_union(
     assert call["moe_allreduce_out"] is None
     assert call["residual_out"] is arguments["residual_out"]
     assert call["norm_out"] is arguments["norm_out"]
-    assert not hasattr(union, "scratch_allreduce_output")
+    assert callable(union.scratch_allreduce_output)
+
+
+def test_scratch_allreduce_output_is_cached_per_device_and_dtype_and_grows() -> None:
+    union._scratch_allreduce_outputs.clear()
+    union._retired_scratch_allreduce_outputs.clear()
+    device = torch.device("cpu")
+    try:
+        first = union.scratch_allreduce_output(device, torch.float16, 4)
+        assert first.shape == (4, union.HIDDEN_DIM)
+        assert first.dtype == torch.float16 and first.is_contiguous()
+        # A smaller request is a view of the same allocation.
+        smaller = union.scratch_allreduce_output(device, torch.float16, 2)
+        assert smaller.data_ptr() == first.data_ptr()
+        assert smaller.shape == (2, union.HIDDEN_DIM) and smaller.is_contiguous()
+        # A larger request grows the cached tensor once (to at least twice the
+        # previous capacity) and retires the replaced tensor instead of freeing it.
+        grown = union.scratch_allreduce_output(device, torch.float16, 5)
+        assert grown.shape == (5, union.HIDDEN_DIM)
+        assert grown.data_ptr() != first.data_ptr()
+        assert (
+            union._scratch_allreduce_outputs[("cpu", None, torch.float16)].shape[0] == 8
+        )
+        assert [t.data_ptr() for t in union._retired_scratch_allreduce_outputs] == [
+            first.data_ptr()
+        ]
+        grown = union.scratch_allreduce_output(device, torch.float16, 8)
+        assert grown.shape == (8, union.HIDDEN_DIM)
+        assert len(union._retired_scratch_allreduce_outputs) == 1
+        assert union.scratch_allreduce_output(device, torch.float16, 8).data_ptr() == (
+            grown.data_ptr()
+        )
+        # Each dtype keeps its own scratch.
+        other = union.scratch_allreduce_output(device, torch.bfloat16, 8)
+        assert other.dtype == torch.bfloat16 and other.data_ptr() != grown.data_ptr()
+        assert set(union._scratch_allreduce_outputs) == {
+            ("cpu", None, torch.float16),
+            ("cpu", None, torch.bfloat16),
+        }
+    finally:
+        union._scratch_allreduce_outputs.clear()
+        union._retired_scratch_allreduce_outputs.clear()
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA graph capture needs a GPU"
+)
+def test_scratch_allreduce_output_retains_addresses_recorded_by_captured_graphs() -> (
+    None
+):
+    union._scratch_allreduce_outputs.clear()
+    union._retired_scratch_allreduce_outputs.clear()
+    device = torch.device("cuda", torch.cuda.current_device())
+    try:
+        warm = union.scratch_allreduce_output(device, torch.bfloat16, 4)
+        recorded = warm.data_ptr()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(stream), torch.cuda.graph(graph, stream=stream):
+            # Large enough cache: the capture records the cached tensor's address.
+            captured = union.scratch_allreduce_output(device, torch.bfloat16, 2)
+            assert captured.data_ptr() == recorded
+            captured.fill_(1.0)
+            # Too small: the fresh tensor belongs to the graph's pool and is not cached.
+            private = union.scratch_allreduce_output(device, torch.bfloat16, 64)
+            assert private.data_ptr() != recorded
+        torch.cuda.current_stream().wait_stream(stream)
+        assert (
+            union._scratch_allreduce_outputs[
+                (device.type, device.index, torch.bfloat16)
+            ].data_ptr()
+            == recorded
+        )
+        # An eager call that grows the cache must keep the recorded storage alive.
+        grown = union.scratch_allreduce_output(device, torch.bfloat16, 16)
+        assert grown.data_ptr() != recorded
+        assert [t.data_ptr() for t in union._retired_scratch_allreduce_outputs] == [
+            recorded
+        ]
+        canary = torch.zeros((4, union.HIDDEN_DIM), dtype=torch.bfloat16, device=device)
+        assert canary.data_ptr() != recorded
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.count_nonzero(canary).item() == 0
+    finally:
+        union._scratch_allreduce_outputs.clear()
+        union._retired_scratch_allreduce_outputs.clear()
 
 
 def test_workspace_creation_has_no_pointer_registry() -> None:
