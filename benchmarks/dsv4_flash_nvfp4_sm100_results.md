@@ -1,3 +1,112 @@
+# B200 routed NVFP4 decode: twelve-warp FC2 full32 results
+
+The current public candidate beats the named FlashInfer baseline at every integer T=1..32 and all 192 capture comparisons, with **1.024376430585× geometric-mean speedup**. The minimum is **1.006363903484× at T14**. The equivalent source implementation measures **1.024490735084×**, minimum **1.006266404635× at T14**. Hardware-limit evidence and broader promotion remain incomplete.
+
+The target is NVIDIA B200 (sm_100a), H=4096, I=2048, 256 routed experts, top-k=6 and clamped SwiGLU limit 10.0. The kernel includes FC1 gate/up, exact clamped activation, FC2 and routing-weighted finalization; the shared expert is outside its scope. Checkpoint FP4 conversion, NVFP4 weight/activation representations, block scales and BF16 output retain the established ABI and rounding contract.
+
+This change compacts an unused physical FC2 warp, reducing the block from 416 to 384 threads while preserving useful roles, logical PDL dependencies, barriers, work-ring arrivals, MMA, scaling and quantization. It applies only to T12,14,15,17,18,19,22,24,26,27,28,31,32; the other 19 routes and 12 generated kernels are unchanged.
+
+## Current synthetic-bank cohort
+
+The public/source/baseline arms consume identical cached physical NVFP4 weights, activations, routes and scales with equivalent clamped-SwiGLU parameters. Timing uses `loom.bench.bench_gpu_time`, CUPTI and cold L2 across complete-call CUDA graph replay, including planner, projections, activation/quantization and finalization. Each reported time is the equal-weight geometric mean of six balanced capture medians; speedup is FlashInfer/candidate. There is no best-capture selection. The six fixed captures describe variation, not independent randomized trials or a confidence interval. All times are microseconds.
+
+| T | Source µs | Public µs | FlashInfer µs | Source speedup | Public speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 24.901284 | 24.970491 | 29.245450 | 1.174455491× | 1.171200407× |
+| 2 | 41.103885 | 41.034588 | 44.469101 | 1.081870990× | 1.083697988× |
+| 3 | 56.399634 | 56.260895 | 60.378235 | 1.070543039× | 1.073182986× |
+| 4 | 68.137968 | 68.009617 | 72.393664 | 1.062457047× | 1.064462162× |
+| 5 | 80.026313 | 79.999626 | 83.151366 | 1.039050313× | 1.039396934× |
+| 6 | 91.796810 | 91.775102 | 93.951008 | 1.023467023× | 1.023709112× |
+| 7 | 99.754599 | 99.936131 | 102.234704 | 1.024862066× | 1.023000423× |
+| 8 | 108.778759 | 108.640304 | 110.308810 | 1.014065720× | 1.015358079× |
+| 9 | 120.496315 | 120.384135 | 121.927762 | 1.011879584× | 1.012822505× |
+| 10 | 126.944152 | 127.034818 | 127.872444 | 1.007312602× | 1.006593670× |
+| 11 | 136.031137 | 135.924301 | 137.087208 | 1.007763457× | 1.008555551× |
+| 12 | 145.972984 | 145.844641 | 147.023640 | 1.007197607× | 1.008083938× |
+| 13 | 155.161467 | 155.065479 | 156.852085 | 1.010895868× | 1.011521628× |
+| 14 | 161.732984 | 161.717315 | 162.746468 | 1.006266405× | 1.006363903× |
+| 15 | 167.263606 | 167.259104 | 168.576064 | 1.007846648× | 1.007873774× |
+| 16 | 176.890612 | 176.965643 | 178.234876 | 1.007599409× | 1.007172202× |
+| 17 | 182.571122 | 182.496311 | 185.589630 | 1.016533326× | 1.016950036× |
+| 18 | 186.602824 | 186.634619 | 189.930611 | 1.017833529× | 1.017660136× |
+| 19 | 195.076813 | 194.697991 | 197.978245 | 1.014873280× | 1.016847910× |
+| 20 | 202.712815 | 202.504648 | 205.667454 | 1.014575494× | 1.015618434× |
+| 21 | 210.297825 | 210.388488 | 213.415371 | 1.014824435× | 1.014387114× |
+| 22 | 221.603801 | 221.785487 | 224.937070 | 1.015041566× | 1.014210050× |
+| 23 | 222.187161 | 221.984998 | 226.757731 | 1.020570811× | 1.021500247× |
+| 24 | 233.899291 | 234.229649 | 237.901771 | 1.017111977× | 1.015677440× |
+| 25 | 241.584801 | 241.728612 | 245.216508 | 1.015032847× | 1.014428975× |
+| 26 | 246.885976 | 247.547083 | 251.232444 | 1.017605163× | 1.014887517× |
+| 27 | 255.971827 | 256.681291 | 259.374713 | 1.013293985× | 1.010493254× |
+| 28 | 263.630980 | 264.308641 | 267.519079 | 1.014748265× | 1.012146551× |
+| 29 | 271.912483 | 271.928623 | 275.347218 | 1.012631767× | 1.012571661× |
+| 30 | 281.597076 | 281.716820 | 284.469124 | 1.010199138× | 1.009769754× |
+| 31 | 281.200140 | 281.546588 | 284.741192 | 1.012592640× | 1.011346627× |
+| 32 | 286.016492 | 286.072732 | 289.989887 | 1.013892186× | 1.013692863× |
+
+
+All 32 strict BF16 correctness shapes pass at atol=rtol=0.01 with stricter checks preserved, along with 576 timing postchecks,7 API/graph cases and8 dynamic-route cases. Both arms win 32/32 shape and 192/192 capture comparisons against FlashInfer. Source/public differences remain mixed: public is faster in 87 captures,8 tie and source is faster in 97. The source column is the same candidate's source implementation, not the previously selected schedule. Shape-level differences are visible above. Current and older full32 cohorts do not establish a controlled causal improvement attributable to this change.
+
+Successful cohort physical turnaround was 3093.474566s. Successful wrapper-worker durations sum to 5561.045760s and validation-worker durations to 5514.159343s; parallel worker sums are not elapsed time. Prior failed orchestration attempts remain separate.
+
+## Baseline, inputs and validation limits
+
+The baseline is `flashinfer.fused_moe.trtllm_fp4_block_scale_routed_moe`, using the stock API's observed default-tactic fallback. A T1 pre-capture warning reflects a non-tuning cache miss: tactic −1 maps to backend default-selection sentinels [-1, -1]. This does not identify concrete FC1/FC2 tactics or establish an explicitly tuned optimum. The same prepared baseline closure is captured; warning logging lies outside measured timing.
+
+The current cohort uses a fixed synthetic physical bank with supplied activations/routes. It is not a new actual-checkpoint qualification or native full-model/router/shared-expert execution. The earlier checkpoint-weight cohort used all 256 stored layer-0 experts and supplied activations/routes, reaching public 1.023640533547× with 32 shape / 192 capture wins. Its T1–4 exact per-capture baseline-binary association remains incomplete. Natural timing inputs activated no clamps; its separate stress case exercised793 up and379 gate clamps. Earlier primary and singleton cohorts below remain independent evidence, including their source-control regressions.
+
+Affected source CPU tests 111 and public CPU contracts 112 passed. The separate current-source literal GPU e2e command passed one test with zero failures/errors/skips, all 32 strict rows and 8 route cases, with all 13 loaded binary/ABI identities matched. Its physical turnaround was 521.298456s and worker duration 405.829490s. The separate literal registered benchmark is now independently qualified below. Its evidence is distinct from the synthetic export cohort.
+
+Separate synccheck and racecheck checks were each **SKIPPED: sanitizer timeout after 20 seconds**, with no reported errors. Timeout is not pass. Hardware-limit evidence and broader promotion remain incomplete; serialized Nsight Compute measurements do not prove a normal-PDL hardware ceiling.
+
+## Separate current-source registered cohort
+
+The literal registered benchmark independently passes all 32 shapes and all 192 capture comparisons against the same named FlashInfer baseline: **1.025457383583× geometric-mean speedup**. Minimum T16: **1.006571425137×**, with source 179.380997µs and FlashInfer 180.559785µs. This is a fresh source-only synthetic seed5184 cohort, not a new public-export or checkpoint-weight measurement. Do not pool its timings with the public/source/baseline cohort above or infer a causal gain across cohorts.
+
+The original strict BF16 atol=rtol=0.01, all 32 eager/graph checks, eight route cases and 384 timing postchecks pass. Independent reduction verifies all 384 raw capture medians (3,271,495 samples), CUPTI backend without fallback, cold L2, equal six-capture geometric-mean aggregation, 13 loaded binary/ABI identities and the actual baseline library. Timing arms share identical physical tensor objects; recorded small-input hashes and weight metadata accompany the deterministic source/seed recipe. This audit does not claim whole-weight hashing. Clamp stress records 46,622 up and 23,223 gate clamps.
+
+Physical turnaround: 3478.628871s; wrapper worker: 3336.854336s; evaluator: 3306.177978s. All times below are microseconds.
+
+| T | Registered source µs | FlashInfer µs | Speedup |
+| ---: | ---: | ---: | ---: |
+| 1 | 24.922609 | 29.311853 | 1.176114930× |
+| 2 | 41.290565 | 44.815369 | 1.085365855× |
+| 3 | 56.703482 | 60.682246 | 1.070167892× |
+| 4 | 67.834476 | 72.527902 | 1.069189387× |
+| 5 | 79.434639 | 83.338183 | 1.049141574× |
+| 6 | 91.130469 | 94.138635 | 1.033009438× |
+| 7 | 100.506293 | 103.647837 | 1.031257182× |
+| 8 | 110.010490 | 111.834345 | 1.016578923× |
+| 9 | 121.866321 | 123.492968 | 1.013347796× |
+| 10 | 128.693116 | 129.658440 | 1.007500982× |
+| 11 | 135.754636 | 137.402409 | 1.012137879× |
+| 12 | 146.074134 | 147.124685 | 1.007191902× |
+| 13 | 155.205153 | 157.125284 | 1.012371567× |
+| 14 | 161.636818 | 163.098483 | 1.009042894× |
+| 15 | 169.375659 | 170.852511 | 1.008719390× |
+| 16 | 179.380997 | 180.559785 | 1.006571425× |
+| 17 | 184.938304 | 188.314020 | 1.018253198× |
+| 18 | 188.933155 | 192.372904 | 1.018206171× |
+| 19 | 194.938484 | 198.159486 | 1.016523174× |
+| 20 | 203.199812 | 205.863729 | 1.013109839× |
+| 21 | 210.442302 | 213.503803 | 1.014547934× |
+| 22 | 222.346151 | 225.145804 | 1.012591418× |
+| 23 | 224.748571 | 229.018145 | 1.018997114× |
+| 24 | 237.786156 | 240.511339 | 1.011460646× |
+| 25 | 245.316807 | 248.362053 | 1.012413525× |
+| 26 | 250.639307 | 254.084760 | 1.013746658× |
+| 27 | 256.687662 | 259.924910 | 1.012611622× |
+| 28 | 264.026482 | 267.508935 | 1.013189785× |
+| 29 | 272.260995 | 275.237065 | 1.010930947× |
+| 30 | 281.647657 | 284.655046 | 1.010677841× |
+| 31 | 285.231652 | 288.633999 | 1.011928366× |
+| 32 | 289.972990 | 293.983333 | 1.013830060× |
+
+## Earlier cohorts — separate historical evidence
+
+The following prior report is retained verbatim. Its headings, present-tense statements, source identities, timings and limitations apply to those earlier cohorts, not the current twelve-warp candidate.
+
 # B200 routed NVFP4 decode: singleton FC2 full32 results
 
 Every T=1..32 passed strict BF16 checks (atol=rtol=0.01). Public and source control singleton implementations beat the named FlashInfer baseline at all 32 shapes and all 192 captures. Public geometric-mean speedup: **1.022889482173x**; source control: **1.023026241466x**. The minimum public speedup is **1.005775565624x at T14**.
