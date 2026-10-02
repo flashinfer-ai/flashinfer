@@ -21,9 +21,11 @@ onwards (output rel L2 above 60, non-finite values on many real calls) while
 synthetic ``randn`` gates never triggered it.  This test reproduces the trained
 statistics synthetically (per-head decay rate ``exp(A_log)`` near 1, deep
 negative ``dt_bias`` so most gates sit in ``(-0.5, 0]``, wide beta logits up to
-sigmoid ~0.99, nonzero initial state) and checks both the ``recurrent_kda``
-facade (BF16 state pool) and the prepared BF16 export (FP32 state pool) against
-an FP64 token-by-token recurrence.  Non-finite output is a hard failure.
+sigmoid ~0.99, nonzero initial state) and checks the ``recurrent_kda`` facade
+(BF16 state pool), the generated FP32-indexed portfolio behind the same facade
+(257-slot FP32 state pool) and the prepared BF16 export (FP32 state pool)
+against an FP64 token-by-token recurrence.  Non-finite output is a hard
+failure.
 """
 
 import math
@@ -372,3 +374,129 @@ def test_prepared_bf16_export_long_bounded_rows_keep_fp32_state_carrier(
     assert str(call.schedule) == "fused_m64_independent_dvsplit_fp32_state", str(
         call.schedule
     )
+
+
+# The FP32-indexed generated portfolio (``flashkda_generated_indexed_*``) is a
+# separate set of fused-M128 / persistent-M128 bodies behind
+# ``recurrent_kda(backend="cake")`` with a 257-slot FP32 state pool.  It had the
+# same stale inverse composition as the facade bodies above.  Its dispatcher
+# replays exact frozen rows only (sequence lengths, heads, SM count and the
+# state-slot content), so each case names its frozen state slots as an
+# arithmetic progression mod 257.  On SM100 the rows reach all 12 sm100a
+# bodies that compose the block inverse (``direct_m128``, ``direct_m128_n16``,
+# the persistent routes and every M128 stage of ``affine_split_m128``);
+# ``h6_t64_control`` runs a body without the composition.  Known issues that
+# are not the stale composition, tracked as xfail:
+# - the BT16 prepare/chain route (``bt16_prepare_chain_m64``, both targets) is
+#   non-finite under these statistics;
+# - on SM103 the H96 ``direct_m128`` body with the tensor-core state decay
+#   (``bf16_fused_m128_610103ee26``) stays wrong after the repack, and the
+#   ``source599_vtile_m128`` bodies drift past 1e-2 on long rows.
+_SM103_STATE_DECAY_BODY = (
+    "SM103 H96 direct_m128 state-decay body is wrong under trained-gate "
+    "statistics after the repack (separate fix)"
+)
+_SM103_VTILE_DRIFT = (
+    "SM103 source599_vtile_m128 body drifts past 1e-2 on long rows under "
+    "trained-gate statistics (separate fix)"
+)
+INDEXED_CASES = [
+    # (lengths, heads, packed, first state slot, slot stride, SM103 xfail)
+    pytest.param((64,), 12, False, 91, 0, None, id="h12_t64"),
+    pytest.param((63,), 12, False, 74, 0, None, id="h12_t63_n16"),
+    pytest.param((512,) * 32, 12, True, 6, 177, None, id="h12_32x512"),
+    pytest.param((1024,) * 8, 6, True, 76, 155, None, id="h6_8x1024"),
+    pytest.param((512,), 96, False, 142, 0, _SM103_STATE_DECAY_BODY, id="h96_t512"),
+    pytest.param((128,) * 8, 96, True, 193, 199, None, id="h96_8x128"),
+    pytest.param((1024,) * 8, 96, True, 227, 203, _SM103_VTILE_DRIFT, id="h96_8x1024"),
+    pytest.param((8192,), 6, False, 8, 0, None, id="h6_t8192_affine"),
+    pytest.param((16384,), 12, False, 229, 0, None, id="h12_t16384_affine"),
+    pytest.param((64,), 6, False, 144, 0, None, id="h6_t64_control"),
+    pytest.param(
+        (512,),
+        12,
+        False,
+        195,
+        0,
+        None,
+        id="h12_t512_bt16",
+        marks=pytest.mark.xfail(
+            strict=True,
+            reason="BT16 prepare/chain route is non-finite under trained-gate "
+            "statistics (separate fix)",
+        ),
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("lengths", "heads", "packed", "first_slot", "slot_stride", "sm103_issue"),
+    INDEXED_CASES,
+)
+def test_indexed_fp32_state_matches_fp64_recurrence(
+    request, lengths, heads, packed, first_slot, slot_stride, sm103_issue
+):
+    from flashinfer.jit import flash_kda_indexed
+
+    if sm103_issue is not None and torch.cuda.get_device_capability() == (10, 3):
+        request.applymarker(pytest.mark.xfail(reason=sm103_issue, strict=False))
+    if torch.cuda.get_device_properties(0).multi_processor_count != 148:
+        pytest.skip("the frozen indexed rows were exported for 148-SM parts")
+    inp = trained_gate_inputs(lengths=lengths, heads=heads, seed=4420 + heads)
+    expected_out, expected_final = fp64_reference(inp)
+    n = len(lengths)
+    capacity = flash_kda_indexed._EXPECTED_STATE_POOL_CAPACITY
+    pool = torch.zeros(
+        (capacity, heads, HEAD_DIM, HEAD_DIM), device="cuda", dtype=torch.float32
+    )
+    indices = torch.tensor(
+        [(first_slot + slot_stride * i) % capacity for i in range(n)],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    pool[indices.long()] = inp["state"]
+    before = pool.clone()
+    cu = (
+        torch.tensor(inp["offsets"], device="cuda", dtype=torch.int64)
+        if packed
+        else None
+    )
+    common = dict(
+        q=inp["q"],
+        k=inp["k"],
+        v=inp["v"],
+        g=inp["g"],
+        beta=inp["beta"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        initial_state=pool,
+        use_qk_l2norm_in_kernel=True,
+        use_gate_in_kernel=True,
+        lower_bound=LOWER_BOUND,
+        cu_seqlens=cu,
+        ssm_state_indices=indices,
+        beta_is_logit=True,
+    )
+    assert flash_kda_indexed.flash_kda_indexed_prefill_is_eligible(
+        **common,
+        num_spec_tokens=None,
+        num_accepted_tokens=None,
+        output=None,
+        initial_state_source=None,
+        initial_state_indices=None,
+        seq_order=None,
+        prefill_workspace=None,
+        state_checkpoints=None,
+        checkpoint_cu_starts=None,
+        checkpoint_every_n_tokens=0,
+    )
+    out, final_state = recurrent_kda(
+        **common, scale=None, output_final_state=True, backend="cake"
+    )
+    torch.cuda.synchronize()
+    assert final_state is pool
+    _check("output", out, expected_out)
+    _check("final_state", pool[indices.long()], expected_final)
+    unselected = torch.ones(capacity, dtype=torch.bool, device="cuda")
+    unselected[indices.long()] = False
+    assert torch.equal(pool[unselected], before[unselected])
