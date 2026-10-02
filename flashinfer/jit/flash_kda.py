@@ -423,14 +423,14 @@ def get_flash_kda_generated_module_for_selector(
         raise ValueError(
             "generated FlashKDA runtime selector has an unsupported schema"
         )
-    identity = tuple(
-        selector_key[name]
-        for name in ("arch", "route", "route_role", "abi_family", "state_mode")
-    )
-    if not all(isinstance(item, str) and item for item in identity):
-        raise ValueError(
-            "generated FlashKDA runtime selector has an empty identity field"
-        )
+    identity: list[str] = []
+    for name in ("arch", "route", "route_role", "abi_family", "state_mode"):
+        value = selector_key[name]
+        if not isinstance(value, str) or not value:
+            raise ValueError(
+                "generated FlashKDA runtime selector has an empty identity field"
+            )
+        identity.append(value)
     arch, route, route_role, abi_family, state_mode = identity
     key = _selector_key(
         arch=arch,
