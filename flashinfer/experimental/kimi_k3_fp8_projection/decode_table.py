@@ -634,8 +634,8 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         },
         "5,28,4096": {"route": "gemm", "gemm_bn": 192},
         "5,28,16384": {"route": "gemm", "gemm_bn": 192},
-        "12,28,4096": {"route": "gemm", "gemm_sk": 1},
-        "56,48,4096": {"route": "gemm", "gemm_sk": 1},
+        "12,28,4096": {"route": "gemm", "gemm_sk": 1, "gemm_sk_ksplit": 16},
+        "56,48,4096": {"route": "gemm", "gemm_sk": 1, "gemm_sk_ksplit": 28},
     },
     "sm_103a": {
         "1,28,1": {
@@ -1239,7 +1239,7 @@ DECODE_TABLE: dict[str, dict[str, dict[str, Any]]] = {
         },
         "5,28,4096": {"route": "gemm", "gemm_bn": 192},
         "5,28,16384": {"route": "gemm", "gemm_bn": 192},
-        "12,28,4096": {"route": "gemm", "gemm_sk": 1},
-        "56,48,4096": {"route": "gemm", "gemm_sk": 1},
+        "12,28,4096": {"route": "gemm", "gemm_sk": 1, "gemm_sk_ksplit": 16},
+        "56,48,4096": {"route": "gemm", "gemm_sk": 1, "gemm_sk_ksplit": 28},
     },
 }

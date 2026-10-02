@@ -840,6 +840,15 @@ def gemm_stream_k(M: int, n_tiles128: int, num_k_iters: int, arch: str) -> bool:
     )
 
 
+def gemm_stream_k_ksplit(M: int, n_tiles128: int, num_k_iters: int, arch: str) -> int:
+    """Round 6 continuation 13 (lever SKO-ksplit): the table row's head-chunk length of the ordered stream-K split
+    (key ``gemm_sk_ksplit``), or 0 for the default ceil(K / 2)."""
+    entry = decode_table_entry(M, n_tiles128, num_k_iters, arch)
+    if entry is None or entry.get("route") != "gemm":
+        return 0
+    return int(entry.get("gemm_sk_ksplit", 0))
+
+
 def gemm_stream_k_plan(
     M: int,
     n_tiles128: int,
@@ -864,10 +873,17 @@ def gemm_stream_k_plan(
     rem = tiles - full * pairs
     if full < 1 or rem == 0 or rem > pairs - rem:
         return None
+    # Round 6 continuation 13 (lever SKO-ksplit): the table row may ask for a head-heavy split (key ``gemm_sk_ksplit``
+    # = head K iterations; 0 / absent = ceil(K / 2)); both chunks keep at least two K iterations, as in the Cake host.
+    ksplit = (
+        gemm_stream_k_ksplit(M, n_tiles128, num_k_iters, arch)
+        or (int(num_k_iters) + 1) // 2
+    )
+    ksplit = min(max(ksplit, 2), int(num_k_iters) - 2)
     return StreamKPlan(
         pairs,
         rem,
-        (int(num_k_iters) + 1) // 2,
+        ksplit,
         full * pairs,
         full * pairs * CTA_GROUP,
     )
