@@ -47,39 +47,55 @@ _PREFIX = "cake_sage_block_sparse_attention"
 _COMPILE_FLAGS = ("--use_fast_math",)
 
 # (HAS_BLOCK_NUMS, BLOCK_SIZES_MODE, FULL_K64_TILES, UNIFORM_NONEMPTY,
-#  CONTIGUOUS_BLOCK_INDICES) -> SM120 kernel source id. The five flags are folded
-# into the generated kernel body; every reachable combination has one entry.
+#  CONTIGUOUS_BLOCK_INDICES) -> SM120 kernel source under sm_120a/. The five flags
+# are folded into the generated kernel body; every reachable combination has one
+# entry, and the kernel symbol is ``kernel_<source stem without _kernel>``.
 SM120_MODULES: dict[tuple[int, int, int, int, int], str] = {
-    (0, 0, 0, 0, 0): "c214204e0e4b13466e20",
-    (0, 0, 0, 0, 1): "0f9c7da2c88932b636d1",
-    (0, 0, 0, 1, 0): "5e1d9bd7d208ae70cfc3",
-    (0, 0, 0, 1, 1): "883c6c3450cc823b2d9b",
-    (0, 0, 1, 0, 0): "ac8c0628f84e77fb565d",
-    (0, 0, 1, 0, 1): "33204ab76367b6d9b25f",
-    (0, 0, 1, 1, 0): "0a00c8bb89c685b0c222",
-    (0, 0, 1, 1, 1): "2adb38e9fb64cab29bf4",
-    (0, 1, 0, 0, 0): "70d9ca316721813db07f",
-    (0, 1, 0, 0, 1): "4379d118d88e49a36ec3",
-    (0, 1, 0, 1, 0): "08683144a7b6c64433ad",
-    (0, 1, 0, 1, 1): "aa9589fa9d54f340e6b1",
-    (0, 2, 0, 0, 0): "6a1fcc34a68d31545b23",
-    (0, 2, 0, 0, 1): "59d2437f3af320cc32c8",
-    (0, 2, 0, 1, 0): "3e61674cc1a4b6793646",
-    (0, 2, 0, 1, 1): "8b24fd2b689f1ead23c9",
-    (0, 3, 0, 0, 0): "82751a008faeeeb37778",
-    (0, 3, 0, 0, 1): "184ad19669dcb84b24ff",
-    (0, 3, 0, 1, 0): "a17d0e6f30423c654a19",
-    (0, 3, 0, 1, 1): "813b7e41eaabcd64b34d",
-    (1, 0, 0, 0, 0): "386f636f65fcfae07807",
-    (1, 0, 1, 0, 0): "2069e62b1e24fb1be284",
-    (1, 1, 0, 0, 0): "bd48d91a04a229511902",
-    (1, 2, 0, 0, 0): "073e7b711576560b267c",
-    (1, 3, 0, 0, 0): "f9e50348d20ed28e5654",
+    (0, 0, 0, 0, 0): "cake_sage_block_sparse_attention_c214204e0e4b13466e20_kernel.cu",
+    (0, 0, 0, 0, 1): "cake_sage_block_sparse_attention_0f9c7da2c88932b636d1_kernel.cu",
+    (0, 0, 0, 1, 0): "cake_sage_block_sparse_attention_5e1d9bd7d208ae70cfc3_kernel.cu",
+    (0, 0, 0, 1, 1): "cake_sage_block_sparse_attention_883c6c3450cc823b2d9b_kernel.cu",
+    (0, 0, 1, 0, 0): "cake_sage_block_sparse_attention_ac8c0628f84e77fb565d_kernel.cu",
+    (0, 0, 1, 0, 1): "cake_sage_block_sparse_attention_33204ab76367b6d9b25f_kernel.cu",
+    (0, 0, 1, 1, 0): "cake_sage_block_sparse_attention_0a00c8bb89c685b0c222_kernel.cu",
+    (0, 0, 1, 1, 1): "cake_sage_block_sparse_attention_2adb38e9fb64cab29bf4_kernel.cu",
+    (0, 1, 0, 0, 0): "cake_sage_block_sparse_attention_70d9ca316721813db07f_kernel.cu",
+    (0, 1, 0, 0, 1): "cake_sage_block_sparse_attention_4379d118d88e49a36ec3_kernel.cu",
+    (0, 1, 0, 1, 0): "cake_sage_block_sparse_attention_08683144a7b6c64433ad_kernel.cu",
+    (0, 1, 0, 1, 1): "cake_sage_block_sparse_attention_aa9589fa9d54f340e6b1_kernel.cu",
+    (0, 2, 0, 0, 0): "cake_sage_block_sparse_attention_6a1fcc34a68d31545b23_kernel.cu",
+    (0, 2, 0, 0, 1): "cake_sage_block_sparse_attention_59d2437f3af320cc32c8_kernel.cu",
+    (0, 2, 0, 1, 0): "cake_sage_block_sparse_attention_3e61674cc1a4b6793646_kernel.cu",
+    (0, 2, 0, 1, 1): "cake_sage_block_sparse_attention_8b24fd2b689f1ead23c9_kernel.cu",
+    (0, 3, 0, 0, 0): "cake_sage_block_sparse_attention_82751a008faeeeb37778_kernel.cu",
+    (0, 3, 0, 0, 1): "cake_sage_block_sparse_attention_184ad19669dcb84b24ff_kernel.cu",
+    (0, 3, 0, 1, 0): "cake_sage_block_sparse_attention_a17d0e6f30423c654a19_kernel.cu",
+    (0, 3, 0, 1, 1): "cake_sage_block_sparse_attention_813b7e41eaabcd64b34d_kernel.cu",
+    (1, 0, 0, 0, 0): "cake_sage_block_sparse_attention_386f636f65fcfae07807_kernel.cu",
+    (1, 0, 1, 0, 0): "cake_sage_block_sparse_attention_2069e62b1e24fb1be284_kernel.cu",
+    (1, 1, 0, 0, 0): "cake_sage_block_sparse_attention_bd48d91a04a229511902_kernel.cu",
+    (1, 2, 0, 0, 0): "cake_sage_block_sparse_attention_073e7b711576560b267c_kernel.cu",
+    (1, 3, 0, 0, 0): "cake_sage_block_sparse_attention_f9e50348d20ed28e5654_kernel.cu",
 }
 _SM120_BINDING = "cake_sage_block_sparse_attention_binding.cu"
 
 SM100_ARCHES = ("sm_100a", "sm_103a")
 SM100_STAGES = ("attention", "quantize_qk_vamax", "quantize_v")
+# stage -> (kernel source, launcher source) under sm_100a/, shared by both arches.
+_SM100_SOURCES = {
+    "attention": (
+        "cake_sage_block_sparse_attention_attention_kernel.cu",
+        "cake_sage_block_sparse_attention_attention_binding.cu",
+    ),
+    "quantize_qk_vamax": (
+        "cake_sage_block_sparse_attention_quantize_qk_vamax_kernel.cu",
+        "cake_sage_block_sparse_attention_quantize_qk_vamax_binding.cu",
+    ),
+    "quantize_v": (
+        "cake_sage_block_sparse_attention_quantize_v_kernel.cu",
+        "cake_sage_block_sparse_attention_quantize_v_binding.cu",
+    ),
+}
 _SM100_ARCH_FLAGS = {"sm_100a": sm100a_nvcc_flags, "sm_103a": sm103a_nvcc_flags}
 # Module ids per (arch, stage): the JIT spec names (and hence the build cache
 # directories) are unchanged from the per-architecture delivery they replace.
@@ -143,17 +159,18 @@ def gen_cake_sage_block_sparse_attention_module(
         int(uniform_nonempty),
         int(contiguous_block_indices),
     )
-    module_id = SM120_MODULES.get(key)
-    if module_id is None:
+    source = SM120_MODULES.get(key)
+    if source is None:
         raise RuntimeError(
             f"no generated SM120 Sage block-sparse attention module for specialization {key}"
         )
+    name = source.removesuffix("_kernel.cu")
     root = _get_csrc_dir() / "sm_120a"
     return _spec(
-        f"{_PREFIX}_{module_id}",
-        [root / f"{_PREFIX}_{module_id}_kernel.cu", root / _SM120_BINDING],
+        name,
+        [root / source, root / _SM120_BINDING],
         sm120a_nvcc_flags,
-        [f"-DCAKE_SAGE_SM120_KERNEL=kernel_{_PREFIX}_{module_id}"],
+        [f"-DCAKE_SAGE_SM120_KERNEL=kernel_{name}"],
     )
 
 
@@ -188,7 +205,7 @@ def gen_cake_sage_sm100_module(arch: str, stage: str) -> JitSpec:
     root = _get_csrc_dir() / "sm_100a"
     return _spec(
         f"{_PREFIX}_{_SM100_MODULE_IDS[(arch, stage)]}_{arch}",
-        [root / f"{_PREFIX}_{stage}_kernel.cu", root / f"{_PREFIX}_{stage}_binding.cu"],
+        [root / name for name in _SM100_SOURCES[stage]],
         _SM100_ARCH_FLAGS[arch],
         [],
     )
