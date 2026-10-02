@@ -108,13 +108,28 @@ def _ceildiv(a: int, b: int) -> int:
     return (a + b - 1) // b
 
 
-def metadata_size_bytes(queries, capacity, *, fmt, sparse_block_kv, paged, num_sms):
-    """Size the packed split/schedule ABI, including its maximum extent."""
+def _log2_exact(name: str, value: int) -> int:
+    """log2 of a power of two; the kernel splits tokens and pages with shifts."""
+    if value < 1 or value & (value - 1):
+        raise ValueError(f"{name} must be a power of two, got {value}")
+    return value.bit_length() - 1
+
+
+def metadata_max_splits(queries, capacity, *, fmt, sparse_block_kv, paged):
+    """Upper bound of the logits splits one metadata buffer can carry."""
     nb = blocks_per_split(fmt, sparse_block_kv)
-    splits = (
+    return (
         queries * _ceildiv(capacity, nb)
         if paged
         else _ceildiv(queries, 2) * _ceildiv(2 * capacity, nb)
+    )
+
+
+def metadata_size_bytes(queries, capacity, *, fmt, sparse_block_kv, paged, num_sms):
+    """Size the packed split/schedule ABI, including its maximum extent."""
+    nb = blocks_per_split(fmt, sparse_block_kv)
+    splits = metadata_max_splits(
+        queries, capacity, fmt=fmt, sparse_block_kv=sparse_block_kv, paged=paged
     )
     return 16 + splits * (16 + nb * 8) + _ceildiv(splits, num_sms) * num_sms * 16
 
@@ -158,7 +173,7 @@ class SparseMetadataPlan:
     Contiguous inputs pass ``starts``/``ends`` int32 ``[Q]`` and ``num_kv_tokens``;
     paged inputs pass ``context_lens``/``request_indices`` int32 ``[Q]`` and a
     per-query ``block_table`` int32 ``[Q, pages]``.  ``sparse_block_kv`` is 8 or 16
-    and ``page_kv`` any multiple of it.  The packed metadata is uint8 of
+    and ``page_kv`` a power-of-two multiple of it.  The packed metadata is uint8 of
     ``metadata_size_bytes()``; the caller-provided int32 workspace of
     ``metadata_workspace_words()`` entries must initially be zero, and the kernel
     restores its three counters after every submission.  Split allocation order is
@@ -202,6 +217,9 @@ class SparseMetadataPlan:
             raise ValueError(
                 "paged sparse MQA requires aligned blocks dividing the page"
             )
+        blocks_per_page = max(1, page_kv // sparse_block_kv)
+        block_shift = _log2_exact("sparse_block_kv", sparse_block_kv)
+        page_shift = _log2_exact("blocks per page", blocks_per_page)
         vectors = (context_lens, request_indices) if paged else (starts, ends)
         if any(
             t is None or t.dtype != torch.int32 or tuple(t.shape) != (queries,)
@@ -220,6 +238,13 @@ class SparseMetadataPlan:
             raise ValueError("contiguous metadata requires positive num_kv_tokens")
         device = sparse_indices.device
         self.arch, self.num_sms = device_facts(device.index)
+        max_splits = metadata_max_splits(
+            queries, capacity, fmt=fmt, sparse_block_kv=sparse_block_kv, paged=paged
+        )
+        if (max_splits + 1) * self.num_sms > 0x7FFF_FFFF:
+            raise ValueError(
+                f"metadata schedule of {max_splits} splits over {self.num_sms} SMs exceeds the 32-bit split range"
+            )
         self.config = dict(
             fmt=fmt,
             paged=paged,
@@ -270,7 +295,6 @@ class SparseMetadataPlan:
         _check_tensors(self._retained, device)
         placeholder = sparse_indices.view(torch.uint32)
         ctas = min(queries if paged else (queries + 1) // 2, self.num_sms * 4)
-        blocks_per_page = max(1, page_kv // sparse_block_kv)
         self.bindings = dict(
             Starts=starts.view(torch.uint32) if starts is not None else placeholder,
             Ends=ends.view(torch.uint32) if ends is not None else placeholder,
@@ -285,12 +309,14 @@ class SparseMetadataPlan:
             block_table_stride=block_table.stride(0) if paged else 0,
             num_ctas=ctas,
             num_sms=self.num_sms,
+            sms_divmod=fast_divmod(self.num_sms),
             num_max_sparse_blocks=capacity,
             blocks_per_split=nb,
             split_divmod=fast_divmod(nb),
             sparse_block_kv=sparse_block_kv,
+            block_shift=block_shift,
             blocks_per_page=blocks_per_page,
-            page_divmod=fast_divmod(blocks_per_page),
+            page_shift=page_shift,
             grid_x=ctas,
             grid_y=1,
             grid_z=1,

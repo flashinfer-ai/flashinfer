@@ -354,6 +354,14 @@ def test_sparse_metadata_runtime_geometry(fmt, paged, capacity, block, page):
     assert not bool(torch.count_nonzero(plan.workspace[[0, 32, 64]]))
 
 
+def test_sparse_metadata_rejects_non_power_of_two_page():
+    """Pages hold a power-of-two number of blocks: the kernel splits pages with shifts."""
+    _skip_unless_exported()
+    case = geometry_case("mxfp4", True, capacity=256, block=8, page=64)
+    with pytest.raises(ValueError, match="power of two"):
+        prepare_sparse_mqa_metadata(case["sparse"], **dict(case["kwargs"], page_kv=24))
+
+
 def test_sparse_logits_rejects_unexported_geometry():
     _skip_unless_exported()
     case = analytical_case("mxfp4", True, capacity=128, page=32)
