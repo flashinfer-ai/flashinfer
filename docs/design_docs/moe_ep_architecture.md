@@ -238,7 +238,7 @@ moe_ep/
   backends/split/kernel/{identity,fused_moe}
   backends/mega/kernel/sm100/{bf16_bf16_bf16_cutedsl,bf16_mxfp8_bf16_cutedsl,nvfp4_nvfp4_bf16_cutedsl,mxfp8_mxfp8_bf16_cutedsl,fp8_fp4_bf16_deepgemm}
   backends/mega/kernel/sm90/{fp8_fp8_bf16_pull_cutedsl,fp8_fp8_bf16_push_cuda}
-  backends/mega/kernel/sm107/{mxfp8_mxfp8_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl}
+  backends/mega/kernel/sm107/{mxfp8_mxfp8_bf16_cutedsl, mxfp8_mxfp4_bf16_cutedsl, nvfp4_nvfp4_bf16_cutedsl}
   kernel_src/sm100/cutedsl_megamoe/  ← Blackwell CuTeDSL kernel src (kernel team) + FI shim
     src/                       ← VERBATIM kernel team drop (common, moe_bf16_glu, moe_nvfp4_swapab, moe_mxfp8_glu, src)
     __init__.py                ← public API consumed by the sm100 cutedsl backends

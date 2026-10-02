@@ -11,8 +11,9 @@ contract:
   FC2 + combine compute entry, with SwiGLU or SiTU
 
 The kernel is generic over the drop's ``QuantKind``; this shim wires up the
-``nvfp4`` and ``mxfp8_e4m3`` / ``mxfp8_e5m2`` kinds (``mxfp4`` /
-``mxfp4_mxfp8`` need a w4 weight-transform path and are not exposed yet).
+``nvfp4``, ``mxfp8_e4m3``, ``mxfp8_e5m2``, and ``mxfp4_mxfp8`` kinds.
+The mixed kind uses packed FP4 weights and E4M3 activations, both with
+E8M0 scales per 32 values.
 
 All ``sources`` / ``cutlass`` imports are function-local so importing this
 module stays CPU-safe (the package ``__init__`` re-exports from here).
@@ -35,7 +36,7 @@ from . import comm
 from .dependencies import require_sm107_dsl
 from .kernel_helpers import Mxfp8BlockSize, Nvfp4BlockSize, swizzled_flat_sf_size
 
-Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2"]
+Sm107QuantKind = Literal["nvfp4", "mxfp8_e4m3", "mxfp8_e5m2", "mxfp4_mxfp8"]
 Sm107TokenBackMode = Literal["epi_warps", "standalone_warps", "reuse_dispatch_warps"]
 Sm107WorkIdMode = Literal["grid_stride", "atomic_counter"]
 Sm107ScheduleMode = Literal["grouped", "phase_interleave"]
@@ -47,6 +48,7 @@ _KIND_TABLE: dict = {
     "nvfp4": (None, torch.float8_e4m3fn, Nvfp4BlockSize, 128),
     "mxfp8_e4m3": (torch.float8_e4m3fn, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
     "mxfp8_e5m2": (torch.float8_e5m2, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
+    "mxfp4_mxfp8": (torch.float8_e4m3fn, torch.float8_e8m0fnu, Mxfp8BlockSize, 64),
 }
 
 TransformedBlockScaledWeights = Tuple[torch.Tensor, torch.Tensor]
@@ -205,6 +207,8 @@ class Sm107BlockScaledMoeConfig:
                 f"{max(2 * vec, 32)} (gate/up interleave + SF blocks) for "
                 f"{self.quant_kind}."
             )
+        if self.quant_kind == "mxfp4_mxfp8" and self.intermediate % 128:
+            raise ValueError("mxfp4_mxfp8 intermediate must be a multiple of 128.")
         tiler = self.resolved_mma_tiler_mnk
         instruction_k = self.instruction_k
         if len(tiler) != 3:
@@ -367,6 +371,12 @@ class Sm107BlockScaledMoeConfig:
     def torch_act_data_dtype(self) -> torch.dtype:
         dtype = _KIND_TABLE[self.quant_kind][0]
         return _fp4_storage_dtype() if dtype is None else dtype
+
+    @property
+    def torch_weight_data_dtype(self) -> torch.dtype:
+        if self.quant_kind in ("nvfp4", "mxfp4_mxfp8"):
+            return _fp4_storage_dtype()
+        return self.torch_act_data_dtype
 
     @property
     def torch_act_sf_dtype(self) -> torch.dtype:
@@ -760,7 +770,7 @@ def _expected_weight_shapes(
     experts = cfg.experts_per_rank
     fc1_out = 2 * cfg.intermediate
     vec = cfg.sf_vec_size
-    if cfg.quant_kind == "nvfp4":
+    if cfg.quant_kind in ("nvfp4", "mxfp4_mxfp8"):
         fc1_shape = (experts, cfg.hidden // 2, fc1_out)
         fc2_shape = (experts, cfg.intermediate // 2, cfg.hidden)
     else:
@@ -797,11 +807,11 @@ def _validate_weight_leg(
             f"{expected_sf_numel * expected_weight_shape[0]}."
         )
     if (
-        weight.dtype != cfg.torch_act_data_dtype
+        weight.dtype != cfg.torch_weight_data_dtype
         or scale.dtype != cfg.torch_act_sf_dtype
     ):
         raise ValueError(
-            f"{name} requires {cfg.torch_act_data_dtype} weights and {cfg.torch_act_sf_dtype} scales."
+            f"{name} requires {cfg.torch_weight_data_dtype} weights and {cfg.torch_act_sf_dtype} scales."
         )
     if not weight.permute(0, 2, 1).is_contiguous() or not scale.is_contiguous():
         raise ValueError(

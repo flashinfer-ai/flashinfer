@@ -8,12 +8,17 @@ Historical `92dd334` knob profiles are candidate settings for this newer
 kernel, not new measurements; tuning caches from that drop are invalidated.
 
 Qualify correctness first using the [Rubin runbook](../../../../../docs/design_docs/moe_ep_sm107_qualification.md).
-All three formats (NVFP4, MXFP8 E4M3, MXFP8 E5M2) require native SM107 and
+NVFP4, MXFP8 E4M3/E5M2, and MXFP4/MXFP8 require native SM107 and
 a compatible CuTe DSL build. Export `CUTE_DSL_ARCH=sm_107a` before Python
 starts. Record the compiler stack and absolute latency with each result.
 
 Single-GPU and EP4 correctness passed at FlashInfer `5bd5aeef`: 50 single-GPU
 cases and 16 EP4 cases per rank.
+
+Use `--dtype mxfp4_mxfp8 --arch sm107` for mixed-format offline tuning, or
+`--quant-kind mxfp4_mxfp8` in the benchmark below. The mixed format shares
+MXFP8 activation staging and uses packed E2M1 weights with block-32 E8M0
+scales. Its tuning cache entries are separate from the MXFP8-weight entries.
 
 ## What the benchmark measures
 

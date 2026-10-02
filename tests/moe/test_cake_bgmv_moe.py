@@ -14,10 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 """
 
+import math
+
 import pytest
 import torch
 
-from flashinfer.fused_moe.bgmv_moe import prepare_bgmv_moe
+import warnings
+
+from flashinfer.fused_moe.bgmv_moe import (
+    BGMVMoECakePlan,
+    BGMVMoEPortablePlan,
+    prepare_bgmv_moe,
+)
 
 
 _PERF_SHAPES = [
@@ -41,16 +49,33 @@ def _require_cake_arch():
         pytest.skip("generated Cake BGMV MoE tests require exact SM90, SM100 or SM103")
 
 
-def _make_inputs(hidden_size, num_tokens, dtype, *, arbitrary_routes=False):
+def _require_cuda():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is unavailable")
+
+
+def _make_inputs(
+    hidden_size,
+    num_tokens,
+    dtype,
+    *,
+    arbitrary_routes=False,
+    rank=32,
+    num_slices=1,
+    x_dtype=None,
+):
     torch.manual_seed(42)
     device = "cuda"
-    rank = 32
     num_experts = 128
     num_loras = 2
     top_k = 2
     num_pairs = num_tokens * top_k
-    x = torch.randn(num_tokens, hidden_size, dtype=dtype, device=device) * 0.1
-    lora_a = (
+    # Scales keep the shrink (~0.5) and the output (~1) at O(1) so the
+    # 1e-2 tolerances are meaningful: an all-zero result must fail. The
+    # previous 0.1 / 0.01 / 0.01 scales produced outputs below 1e-2.
+    x = torch.randn(num_tokens, hidden_size, dtype=x_dtype or dtype, device=device)
+    weight_scale = 0.5 / math.sqrt(hidden_size)
+    lora_a_weights = [
         torch.randn(
             num_loras,
             num_experts,
@@ -59,9 +84,10 @@ def _make_inputs(hidden_size, num_tokens, dtype, *, arbitrary_routes=False):
             dtype=dtype,
             device=device,
         )
-        * 0.01
-    )
-    lora_b = (
+        * weight_scale
+        for _ in range(num_slices)
+    ]
+    lora_b_weights = [
         torch.randn(
             num_loras,
             num_experts,
@@ -70,8 +96,9 @@ def _make_inputs(hidden_size, num_tokens, dtype, *, arbitrary_routes=False):
             dtype=dtype,
             device=device,
         )
-        * 0.01
-    )
+        * (2.0 / math.sqrt(rank))
+        for _ in range(num_slices)
+    ]
     sorted_token_ids = torch.arange(
         num_tokens, dtype=torch.int64, device=device
     ).repeat_interleave(top_k)
@@ -98,8 +125,8 @@ def _make_inputs(hidden_size, num_tokens, dtype, *, arbitrary_routes=False):
         topk_weights = topk_weights[order].contiguous()
     return (
         x,
-        [lora_a],
-        [lora_b],
+        lora_a_weights,
+        lora_b_weights,
         sorted_token_ids,
         expert_ids,
         lora_indices,
@@ -119,10 +146,11 @@ def _reference(inputs):
         topk_weights,
         _num_experts,
     ) = inputs
-    lora_a = lora_a_weights[0]
-    lora_b = lora_b_weights[0]
-    num_tokens, hidden_size = x.shape
-    output = torch.zeros(num_tokens, hidden_size, dtype=torch.float32, device=x.device)
+    num_tokens = x.shape[0]
+    feat_outs = [int(w.shape[2]) for w in lora_b_weights]
+    output = torch.zeros(
+        num_tokens, sum(feat_outs), dtype=torch.float32, device=x.device
+    )
     valid = (sorted_token_ids >= 0) & (sorted_token_ids < num_tokens)
     valid_pairs = torch.nonzero(valid, as_tuple=False).flatten()
     for start in range(0, valid_pairs.numel(), 64):
@@ -136,12 +164,26 @@ def _reference(inputs):
         tokens = tokens[active]
         loras = loras[active]
         experts = expert_ids[pair_ids]
-        a = lora_a[loras, experts].float()
-        shrink = torch.bmm(x[tokens].float().unsqueeze(1), a.transpose(1, 2)).squeeze(1)
-        b = lora_b[loras, experts].float()
-        delta = torch.bmm(b, shrink.unsqueeze(2)).squeeze(2)
-        delta *= topk_weights[pair_ids].unsqueeze(1)
-        output.index_add_(0, tokens, delta)
+        col = 0
+        for lora_a, lora_b, feat_out in zip(
+            lora_a_weights, lora_b_weights, feat_outs, strict=True
+        ):
+            a = lora_a[loras, experts].float()
+            shrink = torch.bmm(
+                x[tokens].float().unsqueeze(1), a.transpose(1, 2)
+            ).squeeze(1)
+            b = lora_b[loras, experts].float()
+            delta = torch.bmm(b, shrink.unsqueeze(2)).squeeze(2)
+            delta *= topk_weights[pair_ids].unsqueeze(1)
+            output[:, col : col + feat_out].index_add_(0, tokens, delta)
+            col += feat_out
+    # Guard against vacuous comparisons: the reference must carry signal well
+    # above the 1e-2 tolerances on every token that has a LoRA, so a kernel
+    # that leaves its output zeroed cannot pass.
+    active_tokens = (lora_indices >= 0).nonzero().flatten()
+    assert bool((output[active_tokens].abs().amax(dim=1) > 0.5).all()), (
+        "reference output too small for a meaningful comparison"
+    )
     return output
 
 
@@ -288,3 +330,148 @@ def test_unknown_backend_rejected():
         prepare_bgmv_moe(
             x, [], [], empty_i64, empty_i64, empty_i64, empty_f32, 1, backend="cuda"
         )
+
+
+def test_cake_plan_reports_backend_used():
+    _require_cake_arch()
+    plan = prepare_bgmv_moe(*_make_inputs(2688, 4, torch.bfloat16), backend="cake")
+    assert isinstance(plan, BGMVMoECakePlan)
+    assert plan.backend_used == "cake"
+    assert plan.schedule_id is not None
+
+
+_FALLBACK_CASES = [
+    (
+        "rank",
+        dict(hidden_size=3072, num_tokens=8, dtype=torch.bfloat16, rank=16),
+        "rank 32",
+    ),
+    (
+        "hidden",
+        dict(hidden_size=2048, num_tokens=8, dtype=torch.bfloat16),
+        "hidden_size must be 2688 or 3072",
+    ),
+    (
+        "slices",
+        dict(hidden_size=3072, num_tokens=4, dtype=torch.float16, num_slices=2),
+        "exactly one LoRA slice",
+    ),
+]
+
+
+def _fallback_inputs(case):
+    kwargs = dict(case)
+    return _make_inputs(
+        kwargs.pop("hidden_size"),
+        kwargs.pop("num_tokens"),
+        kwargs.pop("dtype"),
+        **kwargs,
+    )
+
+
+@pytest.mark.parametrize(
+    ("name", "case", "message"), _FALLBACK_CASES, ids=[c[0] for c in _FALLBACK_CASES]
+)
+def test_fallback_plan_matches_reference(name, case, message):
+    _require_cuda()
+    inputs = _fallback_inputs(case)
+    expected = _reference(inputs)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        plan = prepare_bgmv_moe(*inputs, backend="cake")
+    assert isinstance(plan, BGMVMoEPortablePlan)
+    assert plan.backend_used == "portable"
+    assert plan.schedule_id is None
+    # The device check runs before the shape checks, so on a device without a
+    # generated program (e.g. SM120, SM107) the reason names the capability.
+    if torch.cuda.get_device_capability() in _SUPPORTED_CAPABILITIES:
+        assert message in plan.fallback_reason
+    else:
+        assert "exact SM90, SM100 or SM103" in plan.fallback_reason
+    fallback_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert all("portable" in str(w.message) for w in fallback_warnings)
+    out = plan.run()
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+    # Replay path (graph captured on the first eager run).
+    torch.testing.assert_close(plan.run(), expected, atol=1e-2, rtol=1e-2)
+    plan.close()
+
+
+@pytest.mark.parametrize(
+    ("name", "case", "message"), _FALLBACK_CASES, ids=[c[0] for c in _FALLBACK_CASES]
+)
+def test_strict_mode_raises_for_unsupported_inputs(name, case, message):
+    # The listed reasons are only reached on a device with a generated program;
+    # test_fallback_on_unsupported_capability covers the device rejection.
+    _require_cake_arch()
+    inputs = _fallback_inputs(case)
+    with pytest.raises(ValueError, match=message):
+        prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
+
+
+def test_fallback_on_unsupported_capability(monkeypatch):
+    _require_cuda()
+    monkeypatch.setattr(
+        torch.cuda, "get_device_capability", lambda *args, **kwargs: (8, 0)
+    )
+    inputs = _make_inputs(3072, 4, torch.bfloat16)
+    expected = _reference(inputs)
+    plan = prepare_bgmv_moe(*inputs, backend="cake")
+    assert isinstance(plan, BGMVMoEPortablePlan)
+    assert "capability=(8, 0)" in plan.fallback_reason
+    torch.testing.assert_close(plan.run(), expected, atol=1e-2, rtol=1e-2)
+    with pytest.raises(ValueError, match="exact SM90, SM100 or SM103"):
+        prepare_bgmv_moe(*inputs, backend="cake", fallback=False)
+
+
+def test_fallback_warning_is_emitted_once_per_reason():
+    _require_cuda()
+    import sys
+
+    bgmv_moe_module = sys.modules["flashinfer.fused_moe.bgmv_moe"]
+    bgmv_moe_module._fallback_reasons_warned.clear()
+    inputs = _make_inputs(2048, 4, torch.bfloat16)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        prepare_bgmv_moe(*inputs, backend="cake")
+        prepare_bgmv_moe(*inputs, backend="cake")
+    fallback_warnings = [w for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert len(fallback_warnings) == 1
+
+
+def test_fallback_plan_outer_graph_capture_and_stream_check():
+    _require_cuda()
+    inputs = _make_inputs(2048, 32, torch.float16, arbitrary_routes=True)
+    expected = _reference(inputs)
+    plan = prepare_bgmv_moe(*inputs, backend="cake")
+    assert isinstance(plan, BGMVMoEPortablePlan)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.stream(stream):
+        plan.run()
+        with torch.cuda.graph(graph, stream=stream):
+            out = plan.run()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, expected, atol=1e-2, rtol=1e-2)
+    with torch.cuda.stream(stream):
+        torch.testing.assert_close(plan.run(), expected, atol=1e-2, rtol=1e-2)
+    with pytest.raises(RuntimeError, match="original CUDA stream"):
+        plan.run()
+    plan.close()
+
+
+def test_invalid_inputs_raise_even_with_fallback():
+    _require_cuda()
+    inputs = list(_make_inputs(2048, 4, torch.bfloat16, x_dtype=torch.float32))
+    with pytest.raises(ValueError, match="share one dtype"):
+        prepare_bgmv_moe(*inputs, backend="cake")
+    inputs = list(_make_inputs(2048, 4, torch.bfloat16))
+    inputs[4][0] = 128
+    with pytest.raises(ValueError, match="expert_ids values"):
+        prepare_bgmv_moe(*inputs, backend="cake")
+    inputs = list(_make_inputs(2048, 4, torch.bfloat16, num_slices=2))
+    inputs[2][1] = inputs[2][1][:, :, : inputs[2][1].shape[2] // 2].contiguous()
+    with pytest.raises(ValueError, match="same feat_out"):
+        prepare_bgmv_moe(*inputs, backend="cake")
