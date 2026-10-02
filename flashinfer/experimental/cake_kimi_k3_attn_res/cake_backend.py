@@ -162,12 +162,44 @@ _NATIVE_ROUTES = (
     ),
 )
 _NATIVE_K8_SM100_PDL_ONLY_M = frozenset({16})
+# Small-M direct kernel: one token per 256-thread CTA, every source register-resident,
+# selected ahead of every other dense program for M <= max_m (per architecture and K).
+_SMALL_M_DIRECT_MAX_M = {
+    "sm_100a": {0: 16, 1: 16, 2: 16, 3: 16, 4: 16, 5: 16, 6: 16, 7: 16, 8: 16},
+    "sm_103a": {0: 16, 1: 16, 2: 16, 3: 16, 4: 16, 5: 16, 6: 16, 7: 16, 8: 16},
+}
+# Cluster split of the small-M kernel: K -> ((max_m, cluster), ...) bands in ascending max_m; the
+# first band with max_m >= M gives the CTAs per token (2 or 4). K absent or M above the last band
+# -> one CTA per token.
+_SMALL_M_CLUSTER: dict[str, dict[int, tuple[tuple[int, int], ...]]] = {
+    "sm_100a": {
+        4: ((4, 4), (16, 2)),
+        5: ((4, 4), (16, 2)),
+        6: ((4, 4), (16, 2)),
+        7: ((4, 4), (16, 2)),
+        8: ((16, 4),),
+    },
+    "sm_103a": {
+        4: ((16, 2),),
+        5: ((16, 2),),
+        6: ((16, 2),),
+        7: ((16, 2),),
+        8: ((16, 2),),
+    },
+}
+
+
+def _small_m_cluster(arch: str, M: int, K: int) -> int:
+    for max_m, cluster in _SMALL_M_CLUSTER[arch].get(K, ()):
+        if max_m >= M:
+            return int(cluster)
+    return 1
 
 
 class RoutePlan(NamedTuple):
     """The generated program one call launches and its launch geometry."""
 
-    kind: str  # "direct" | "native" | "k0_tma" | "persistent"
+    kind: str  # "direct" | "small_m" | "native" | "k0_tma" | "persistent"
     kernel_key: str
     grid_x: int
     threads: int
@@ -313,6 +345,32 @@ def plan_route(
     num_sms = int(num_sms)
     if num_sms <= 0:
         raise ValueError(f"invalid persistent launch geometry M={M}, num_sms={num_sms}")
+    max_m = _SMALL_M_DIRECT_MAX_M[arch].get(K)
+    if max_m is not None and max_m >= M:
+        cluster = _small_m_cluster(arch, M, K)
+        threads = DIRECT_THREADS // cluster
+        if cluster == 1:
+            schedule_id = "small_m_direct_cta256_regres_fp32x2"
+            grid_policy = "one_token_per_cta"
+            kernel_key = f"small_m_direct:k{K}"
+        else:
+            schedule_id = f"small_m_cluster{cluster}_cta{threads}_regres_fp32x2"
+            grid_policy = f"one_token_per_cluster{cluster}"
+            kernel_key = f"small_m_cluster{cluster}:k{K}"
+        route_id = (
+            f"{schedule_id}.{arch}.none_k{K}.k{K}.delta1.write0.norm1."
+            f"pdl{int(use_pdl)}.{grid_policy}"
+        )
+        return RoutePlan(
+            "small_m",
+            kernel_key,
+            M * cluster,
+            threads,
+            schedule_id,
+            route_id,
+            arch,
+            use_pdl,
+        )
     native = _native_route(arch, num_sms, M, K, use_pdl)
     if native is not None:
         name, _release = native
