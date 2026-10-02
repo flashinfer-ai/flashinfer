@@ -867,6 +867,14 @@ class _SparseMLAPagedAttentionRunner:
         during capture and pin scratch as described above; LSE is contiguous.
     device : Optional[torch.device]
         Allocation target. Defaults to the current CUDA device.
+    backend : str
+        ``"auto"`` / ``"sparse"`` run the hand-written SM120 kernels.
+        ``"cake"`` (``kv_cache_format="nvfp4"`` only) runs the Cake SM120
+        NVFP4 sparse-MLA decode with its own split planner: any positive main
+        / extra page size (16-byte multiple page stride), 8, 16, 32, 48, 64,
+        80, 96, 112 or 128 query heads, the ``run()`` contract below, and
+        wrapper-owned grow-only split scratch (warm every shape before CUDA
+        graph capture).
 
     Example
     -------
@@ -886,7 +894,18 @@ class _SparseMLAPagedAttentionRunner:
         extra_kv_fp4: bool = False,
         compute_precision: str = "default",
         device: Optional[torch.device] = None,
+        backend: str = "auto",
     ) -> None:
+        if backend not in ("auto", "sparse", "cake"):
+            raise ValueError(
+                f"backend must be 'auto', 'sparse', or 'cake', got {backend!r}"
+            )
+        if backend == "cake" and kv_cache_format != "nvfp4":
+            raise ValueError(
+                "backend='cake' serves the DSV4 NVFP4 cache only; pass "
+                "kv_cache_format='nvfp4'"
+            )
+        self._backend = backend
         if (max_num_tokens is None) != (max_num_heads is None):
             raise ValueError(
                 "max_num_tokens and max_num_heads must be provided together"
@@ -1006,6 +1025,28 @@ class _SparseMLAPagedAttentionRunner:
         ``[num_tokens, topk]`` or ``[num_tokens, 1, topk]``; the singleton
         query axis is normalized before planning and launch.
         """
+        if self._backend == "cake":
+            from ._cake_dsv4_nvfp4 import wrapper_run as cake_wrapper_run
+
+            return cake_wrapper_run(
+                self,
+                q,
+                kv_cache,
+                indices,
+                output,
+                sm_scale,
+                topk_length=topk_length,
+                attn_sink=attn_sink,
+                extra_kv_cache=extra_kv_cache,
+                extra_indices=extra_indices,
+                extra_topk_length=extra_topk_length,
+                out_lse=out_lse,
+                mid_out=mid_out,
+                mid_lse=mid_lse,
+                prefill_impl=prefill_impl,
+                return_lse=return_lse,
+                lse_scale=lse_scale,
+            )
         from ._prepared import wrapper_run
 
         return wrapper_run(

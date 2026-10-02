@@ -175,6 +175,9 @@ from .jit.mla import (
     gen_mla_module,
     gen_sparse_mla_sm120_module,
 )
+from .jit.cake_sparse_mla_sm120_dsv4_nvfp4 import (
+    gen_cake_sparse_mla_sm120_dsv4_nvfp4_module,
+)
 from .jit.api_log_stats import gen_api_log_stats_module
 from .jit.norm import gen_norm_module
 from .jit.rmsnorm_silu import (
@@ -1125,6 +1128,8 @@ def gen_all_modules(
     # Sparse-MLA paged attention for SM120 family (DSv4 + DSv3.2 / GLM5.1).
     if has_sm120 or has_sm121:
         jit_specs.append(gen_sparse_mla_sm120_module())
+        # Cake DSv4 NVFP4 sparse-MLA decode (backend="cake" on SM120/SM121).
+        jit_specs.append(gen_cake_sparse_mla_sm120_dsv4_nvfp4_module())
 
     # Add cuDNN FMHA module
     jit_specs.append(gen_cudnn_fmha_module())
