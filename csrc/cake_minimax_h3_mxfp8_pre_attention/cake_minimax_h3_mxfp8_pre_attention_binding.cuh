@@ -29,7 +29,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <initializer_list>
 
 #include "tvm_ffi_utils.h"
 
@@ -67,9 +66,11 @@ constexpr int64_t kAdalnRows = 9;
 constexpr int64_t kScaleBlock = 32;
 constexpr int64_t kScaleTileRows = 128;
 constexpr uint32_t kThreads = THREADS;
+constexpr int64_t kPaddedM = (kM + kScaleTileRows - 1) / kScaleTileRows * kScaleTileRows;
 #if CAKE_MINIMAX_H3_MXFP8_STAGE == 1
 constexpr uint32_t kDynamicSmemBytes = SMEM_TOTAL;
 constexpr int64_t kGridX = kM;
+constexpr int64_t kActivationScaleBytes = kPaddedM * (kHidden / kScaleBlock);
 #else
 constexpr int64_t kP = P;
 constexpr int64_t kHeadsPerDestination = HEADS_PER_DESTINATION;
@@ -111,20 +112,11 @@ static_assert(kM > 0, "M must be positive");
 #undef SMEM_SMEM_PARTIAL_STAGE_BYTES
 #undef SMEM_SMEM_PARTIAL_STRIDE
 
+// Exact extent check on top of the target's CHECK_DIM.
+#define CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(t, axis, expected) \
+  TVM_FFI_ICHECK_EQ(t.size(axis), expected) << #t " dim " #axis " must be " << expected;
+
 namespace flashinfer::cake_minimax_h3_mxfp8_pre_attention {
-
-inline int64_t RoundUp(int64_t value, int64_t alignment) {
-  return (value + alignment - 1) / alignment * alignment;
-}
-
-inline void CheckShape(const TensorView& t, const char* name, std::initializer_list<int64_t> dims) {
-  TVM_FFI_ICHECK_EQ(t.ndim(), static_cast<int>(dims.size())) << name << " has the wrong rank";
-  int axis = 0;
-  for (int64_t dim : dims) {
-    TVM_FFI_ICHECK_EQ(t.size(axis), dim) << name << " dim " << axis << " must be " << dim;
-    ++axis;
-  }
-}
 
 inline void CheckLaunch(cudaError_t status) {
   TVM_FFI_ICHECK(status == cudaSuccess)
@@ -148,14 +140,24 @@ void Run(TensorView x, TensorView x_norm_weight, TensorView adaln_scale, TensorV
   CHECK_DEVICE(x, adaln_index);
   CHECK_DEVICE(x, activation_q);
   CHECK_DEVICE(x, activation_sf);
-  CheckShape(x, "x", {kM, kHidden});
-  CheckShape(x_norm_weight, "x_norm_weight", {kHidden});
-  CheckShape(adaln_scale, "adaln_scale", {kAdalnRows, kHidden});
-  CheckShape(adaln_shift, "adaln_shift", {kAdalnRows, kHidden});
-  CheckShape(adaln_index, "adaln_index", {kM});
-  CheckShape(activation_q, "activation_q", {kM, kHidden});
-  CheckShape(activation_sf, "activation_sf",
-             {RoundUp(kM, kScaleTileRows) * (kHidden / kScaleBlock)});
+  CHECK_DIM(2, x);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(x, 0, kM);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(x, 1, kHidden);
+  CHECK_DIM(1, x_norm_weight);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(x_norm_weight, 0, kHidden);
+  CHECK_DIM(2, adaln_scale);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(adaln_scale, 0, kAdalnRows);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(adaln_scale, 1, kHidden);
+  CHECK_DIM(2, adaln_shift);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(adaln_shift, 0, kAdalnRows);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(adaln_shift, 1, kHidden);
+  CHECK_DIM(1, adaln_index);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(adaln_index, 0, kM);
+  CHECK_DIM(2, activation_q);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(activation_q, 0, kM);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(activation_q, 1, kHidden);
+  CHECK_DIM(1, activation_sf);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(activation_sf, 0, kActivationScaleBytes);
 
   ffi::CUDADeviceGuard device_guard(x.device().device_id);
   cudaStream_t stream = get_stream(x.device());
@@ -189,15 +191,34 @@ void Run(TensorView qkv_bf16, TensorView q_norm_weight, TensorView k_norm_weight
   CHECK_DEVICE(qkv_bf16, out_sf);
   CHECK_DEVICE(qkv_bf16, debug_q_bf16);
   CHECK_DEVICE(qkv_bf16, debug_k_bf16);
-  CheckShape(qkv_bf16, "qkv_bf16", {kM, kHeads * kKinds * kHeadDim});
-  CheckShape(q_norm_weight, "q_norm_weight", {kHeadDim});
-  CheckShape(k_norm_weight, "k_norm_weight", {kHeadDim});
-  CheckShape(rope_cos_sin, "rope_cos_sin", {kM, kRopeWidth});
-  CheckShape(out_q, "out_q", {kP, kM, kHeadsPerDestination, kKinds, kHeadDim});
-  CheckShape(out_sf, "out_sf", {kP, kScaleStride});
+  CHECK_DIM(2, qkv_bf16);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(qkv_bf16, 0, kM);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(qkv_bf16, 1, kHeads * kKinds * kHeadDim);
+  CHECK_DIM(1, q_norm_weight);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(q_norm_weight, 0, kHeadDim);
+  CHECK_DIM(1, k_norm_weight);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(k_norm_weight, 0, kHeadDim);
+  CHECK_DIM(2, rope_cos_sin);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(rope_cos_sin, 0, kM);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(rope_cos_sin, 1, kRopeWidth);
+  CHECK_DIM(5, out_q);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(out_q, 0, kP);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(out_q, 1, kM);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(out_q, 2, kHeadsPerDestination);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(out_q, 3, kKinds);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(out_q, 4, kHeadDim);
+  CHECK_DIM(2, out_sf);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(out_sf, 0, kP);
+  CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(out_sf, 1, kScaleStride);
   if (write_debug != 0) {
-    CheckShape(debug_q_bf16, "debug_q_bf16", {kM, kHeads, kHeadDim});
-    CheckShape(debug_k_bf16, "debug_k_bf16", {kM, kHeads, kHeadDim});
+    CHECK_DIM(3, debug_q_bf16);
+    CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(debug_q_bf16, 0, kM);
+    CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(debug_q_bf16, 1, kHeads);
+    CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(debug_q_bf16, 2, kHeadDim);
+    CHECK_DIM(3, debug_k_bf16);
+    CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(debug_k_bf16, 0, kM);
+    CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(debug_k_bf16, 1, kHeads);
+    CAKE_MINIMAX_H3_MXFP8_CHECK_SIZE(debug_k_bf16, 2, kHeadDim);
   }
 
   ffi::CUDADeviceGuard device_guard(qkv_bf16.device().device_id);
