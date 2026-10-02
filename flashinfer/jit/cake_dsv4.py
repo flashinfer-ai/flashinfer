@@ -1448,19 +1448,16 @@ _ARCH_REGISTRATIONS = {
                 },
                 "sources": ["cake_dsv4_family_15addb3d7039f00c50a6_binding.cu"],
             },
-            "cake_dsv4_family_230a43b4843035b59a4c": {
+            "cake_dsv4_family_2857689ab3feed7f4dba": {
                 "arch": "sm_103a",
                 "compile_flags": ["-std=c++17"],
-                "dependencies": ["bf16_h128_topk128x_row_first_vsplit"],
+                "dependencies": ["bf16_h128_topk128x_row_first"],
                 "entry": "run",
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "36a8b41cf6b64311fa9eef2a29fd6c2e960726cfa1cb473717b1009c9a926d02",
+                "identity": "e6952a41f602f29957c38a3db00499629d810aa26dc5cf8f285537219c69d8f1",
                 "route_entry": "route_of",
                 "routes": [
-                    {
-                        "index": 0,
-                        "stage_variants": ["bf16_h128_topk128x_row_first_vsplit"],
-                    }
+                    {"index": 0, "stage_variants": ["bf16_h128_topk128x_row_first"]}
                 ],
                 "signature": {
                     "scalar_dtypes": {
@@ -1512,7 +1509,7 @@ _ARCH_REGISTRATIONS = {
                     "workspace_dtypes": {},
                     "workspace_keys": [],
                 },
-                "sources": ["cake_dsv4_family_230a43b4843035b59a4c_binding.cu"],
+                "sources": ["cake_dsv4_family_2857689ab3feed7f4dba_binding.cu"],
             },
             "cake_dsv4_family_76c74dc40358020c868d": {
                 "arch": "sm_103a",
@@ -1727,16 +1724,19 @@ _ARCH_REGISTRATIONS = {
                 },
                 "sources": ["cake_dsv4_family_ae0788c48888fb87243c_binding.cu"],
             },
-            "cake_dsv4_family_f1bce8de410de6d9c75a": {
+            "cake_dsv4_family_c23229161091bf4f9f1b": {
                 "arch": "sm_103a",
                 "compile_flags": ["-std=c++17"],
-                "dependencies": ["bf16_h128_topk128x_row_first"],
+                "dependencies": ["bf16_h128_topk128x_row_first_vsplit"],
                 "entry": "run",
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "8c41f7dc6eaee234bb67714fc1b15024cae1319eb2c135bf759be2b0b3fb576d",
+                "identity": "383ba273302153c1ba0587cfd13f3fe0ad8537f77275e352df580cc0b6e377b2",
                 "route_entry": "route_of",
                 "routes": [
-                    {"index": 0, "stage_variants": ["bf16_h128_topk128x_row_first"]}
+                    {
+                        "index": 0,
+                        "stage_variants": ["bf16_h128_topk128x_row_first_vsplit"],
+                    }
                 ],
                 "signature": {
                     "scalar_dtypes": {
@@ -1788,7 +1788,7 @@ _ARCH_REGISTRATIONS = {
                     "workspace_dtypes": {},
                     "workspace_keys": [],
                 },
-                "sources": ["cake_dsv4_family_f1bce8de410de6d9c75a_binding.cu"],
+                "sources": ["cake_dsv4_family_c23229161091bf4f9f1b_binding.cu"],
             },
         },
         "variants": {
@@ -1932,10 +1932,10 @@ _ARCH_REGISTRATIONS = {
                 "compile_flags": ["--use_fast_math"],
                 "entry": "run",
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "cfb705012cec25493c4f354aa8bac82a47a3a7c935acd7d072261c265c1ae78d",
+                "identity": "6bf1e5d0bb86975a3aafbf14909103f08452a66782d3d1a5c167eba090ccbead",
                 "sources": [
-                    "cake_dsv4_858429d04d7100337a7c_kernel.cu",
-                    "cake_dsv4_858429d04d7100337a7c_binding.cu",
+                    "cake_dsv4_20afd767e4720f7ebfec_kernel.cu",
+                    "cake_dsv4_20afd767e4720f7ebfec_binding.cu",
                 ],
                 "tma_workspace_bytes": 0,
             },
@@ -1970,10 +1970,10 @@ _ARCH_REGISTRATIONS = {
                 "compile_flags": ["--use_fast_math"],
                 "entry": "run",
                 "host_linkage_flags": ["--device-entity-has-hidden-visibility=false"],
-                "identity": "7d9ffcddbb772c38e62de578a5aae4fe5eb11f6c2e9aca96def0f0b416e26766",
+                "identity": "34e06b413f240aa7d60ebb4e6671f92430959e0789357b9069147d1a4b12623c",
                 "sources": [
-                    "cake_dsv4_9149cab3a8f8806e6d80_kernel.cu",
-                    "cake_dsv4_9149cab3a8f8806e6d80_binding.cu",
+                    "cake_dsv4_3302ac33acb21ed7e3a5_kernel.cu",
+                    "cake_dsv4_3302ac33acb21ed7e3a5_binding.cu",
                 ],
                 "tma_workspace_bytes": 0,
             },
@@ -2186,7 +2186,7 @@ _ARCH_REGISTRATIONS = {
                     ["tma_buffer", "tmap_q"],
                     ["tma_buffer", "tmap_swa_kv"],
                     ["tma_buffer", "tmap_compressed_kv"],
-                    ["buffer", "O"],
+                    ["tma_buffer", "O"],
                     ["buffer", "swa_indices"],
                     ["buffer", "compressed_indices"],
                     ["buffer", "sparse_topk_lens"],
@@ -2211,10 +2211,10 @@ _ARCH_REGISTRATIONS = {
                 "compile_flags": ["--use_fast_math"],
                 "entry": "run",
                 "host_linkage_flags": [],
-                "identity": "f9fcacac27fc67bbd40665f0e9b9a37c72bdd32aeb51d303448f3fbab7ec35e1",
+                "identity": "da4ba4b4bf31ac66afbbf04576964c98717f1a5b8200885f7edef0a3a8e61f3f",
                 "sources": [
-                    "cake_dsv4_7d0ecb3f2602743efa08_kernel.cu",
-                    "cake_dsv4_7d0ecb3f2602743efa08_binding.cu",
+                    "cake_dsv4_d7a812a6d7672c8aab6c_kernel.cu",
+                    "cake_dsv4_d7a812a6d7672c8aab6c_binding.cu",
                 ],
                 "tma_workspace_bytes": 0,
             },
@@ -2391,10 +2391,10 @@ _ARCH_REGISTRATIONS = {
                 ],
                 "entry": "run",
                 "host_linkage_flags": [],
-                "identity": "8679fe5885a50ec416c812628b8fab691d9da966e28d593fc08c2a06a451ee84",
+                "identity": "1919b2c2047df17ff47b9d9c547e77621630cc5751be6858559a6ff1b202cbe5",
                 "sources": [
-                    "cake_dsv4_ebe2f64a65918ee37ee8_kernel.cu",
-                    "cake_dsv4_ebe2f64a65918ee37ee8_binding.cu",
+                    "cake_dsv4_c2f869a7bdb2767ce756_kernel.cu",
+                    "cake_dsv4_c2f869a7bdb2767ce756_binding.cu",
                 ],
                 "tma_workspace_bytes": 0,
             },
@@ -2432,10 +2432,10 @@ _ARCH_REGISTRATIONS = {
                 "compile_flags": ["--use_fast_math"],
                 "entry": "run",
                 "host_linkage_flags": [],
-                "identity": "15f88e23518a758c381912b11bfcb96b09969dfddd8656d5b7cc1f84b10041ff",
+                "identity": "2699288ea93b100ef7cadc5694da7551330aed7ae5e5788a9e7b4d9c44398c4f",
                 "sources": [
-                    "cake_dsv4_2b9a8ce4749e5e2e06f8_kernel.cu",
-                    "cake_dsv4_2b9a8ce4749e5e2e06f8_binding.cu",
+                    "cake_dsv4_32a6c30d69da49836606_kernel.cu",
+                    "cake_dsv4_32a6c30d69da49836606_binding.cu",
                 ],
                 "tma_workspace_bytes": 0,
             },
