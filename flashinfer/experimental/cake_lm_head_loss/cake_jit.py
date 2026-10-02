@@ -22,6 +22,7 @@ from typing import Any, Optional
 
 from ...jit import env as jit_env
 from ...jit.core import gen_jit_spec, sm100a_nvcc_flags, sm103a_nvcc_flags
+from ...jit.cpp_ext import get_cuda_version
 
 # Explicit target-owned registration of the generated chunked LM-head + loss
 # programs.  One record per architecture.  A record carries ``arch``, the host
@@ -5950,6 +5951,43 @@ ARCH_NVCC_FLAGS = {
 }
 
 
+def toolchain_workaround_flags(arch: str) -> list[str]:
+    """Extra nvcc flags that work around a toolchain-specific code-generation problem.
+
+    CUDA 13.0's ptxas mis-schedules the sm_103a 2-CTA TMA producer loops of these programs at -O3 (and -O2, which emits
+    the same code): with a short K loop (<= 16 iterations, i.e. ``chunk_size <= 1024`` for the dW accumulate GEMM) the
+    second B-operand ``cp.async.bulk.tensor ... .cta_group::2`` of a stage is rejected by the TMA unit with
+    ``cudaErrorIllegalInstruction`` although every operand is legal.  ptxas -O1 (and -O0) code is correct, and so is the
+    code of every other toolchain (12.9, 13.3, 13.4); -O1 is therefore applied to the sm_103a programs on CUDA 13.0 only.
+    """
+    if arch != "sm_103a":
+        return []
+    version = get_cuda_version()
+    if (version.major, version.minor) == (13, 0):
+        return ["-Xptxas", "-O1"]
+    return []
+
+
+def toolchain_runs_hidden_count(arch: str) -> bool:
+    """Does the hidden valid-row count (``cake_backend.hidden_count_eligible``) run on ``arch`` with the nvcc this
+    checkout invokes?
+
+    On CUDA 13.0 the sm_103a programs are built at ptxas -O1 (:func:`toolchain_workaround_flags`).  That code completes
+    the focused dW accumulate calls and the test file's shipped call schedule, but with the hidden count's schedule --
+    the compaction index, chunk 0's row gather and device-count logits GEMM queued before the count is read back -- the
+    test file still reaches a ``cudaErrorIllegalInstruction`` from the cluster launch of the dW accumulate GEMM at its
+    shortest K schedule (the one-row tail chunk of a two-chunk call), in every run; with the host count it passes, as
+    does the -O0 code with the hidden count.  So on CUDA 13.0 the sm_103a calls take the host-count path (the same
+    kernels per row, so bitwise the same outputs; the count and the index are formed on the host before the first
+    launch).  Every other architecture / toolchain pair runs the hidden count.  A mitigation of the ptxas 13.0 fault as
+    observed, not a root-cause fix.
+    """
+    if arch != "sm_103a":
+        return True
+    version = get_cuda_version()
+    return (version.major, version.minor) != (13, 0)
+
+
 def toolchain_supports(arch: str) -> bool:
     """Can the nvcc this checkout invokes emit ``arch``?  (SM100 / SM103 only.)"""
     return arch in ARCH_NVCC_FLAGS
@@ -6054,6 +6092,7 @@ def gen_cake_lm_head_loss_module(name: str, stage: str):
         extra_cuda_cflags=[
             *ARCH_NVCC_FLAGS[record["arch"]],
             *physical["compile_flags"],
+            *toolchain_workaround_flags(record["arch"]),
         ],
         extra_ldflags=["-lcuda"],
         extra_include_paths=[root, *[p.parent for p in sources], *_header_dirs()],

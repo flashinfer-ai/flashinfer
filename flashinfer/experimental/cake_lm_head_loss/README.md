@@ -146,8 +146,9 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   chunk 0's gather and GEMM skipped.  The same kernels per row, so `loss` /
   `logp` / `dX` / `dW` are bitwise the previous path's.  Calls the
   device-count GEMM cannot serve -- an `X` that needs a contiguous copy or
-  whose base is not 16-byte aligned, a program without the kernels -- take
-  the previous path; the prepared runner (`prepare_lm_head_loss`) is
+  whose base is not 16-byte aligned, a program without the kernels -- and
+  every `sm_103a` call on CUDA 13.0 (the toolchain note below) take the
+  previous path; the prepared runner (`prepare_lm_head_loss`) is
   unchanged.  The chunk buffers and the gather buffer exist at the buffer
   extent before the count is known (`memory_report(..., hidden_count=True)`;
   `cake_backend.hidden_count_eligible` / `_hidden_count_begin`).
@@ -343,3 +344,21 @@ Tests: `tests/experimental/test_cake_lm_head_loss.py` (the host-layer tests
 run on any device through the reference path; the device tests skip without a
 registered program or a compute capability 10.0 / 10.3 device).  Benchmark:
 `benchmarks/bench_cake_lm_head_loss.py`.
+
+Toolchain note: on CUDA 13.0 (nvcc 13.0.x) the `sm_103a` programs are built
+with `-Xptxas -O1` (`cake_jit.toolchain_workaround_flags`).  That toolchain's
+ptxas mis-schedules their 2-CTA TMA producer loops at -O3 (and -O2, which
+emits the same code): with a short K loop (`chunk_size <= 1024`) the dW
+accumulate GEMM's second B-operand TMA load is rejected by the TMA unit with
+`cudaErrorIllegalInstruction` although every operand is legal; the -O1 code and
+the code of CUDA 12.9, 13.3 and 13.4 are correct.  With the -O1 code the hidden
+valid-row count's schedule (the compaction index, chunk 0's row gather and
+device-count logits GEMM queued before the count is read back) still reaches a
+`cudaErrorIllegalInstruction` from the dW accumulate GEMM at its shortest K
+schedule (the one-row tail chunk of a two-chunk call) in every run of the test
+file, while the host-count path passes (as does the -O0 code with the hidden
+count); so on CUDA 13.0 the `sm_103a` calls also take the host-count path
+(`cake_jit.toolchain_runs_hidden_count`; the same kernels per row, bitwise the
+same outputs).  Every other architecture / toolchain pair builds at the default
+optimization level and runs the hidden count.  Both are mitigations of the
+observed ptxas 13.0 fault, not a root-cause fix.

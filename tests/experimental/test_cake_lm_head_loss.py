@@ -122,6 +122,16 @@ def _require_program(*, entry: str = "loss"):
         )
 
 
+def _require_hidden_count():
+    """Skip when the hidden valid-row count does not run on this device with the nvcc this checkout invokes
+    (``cake_jit.toolchain_runs_hidden_count``: sm_103a on nvcc 13.0.x takes the host-count path)."""
+    arch = cake_backend.arch_for(torch.device("cuda"))
+    if not cake_jit.toolchain_runs_hidden_count(arch):
+        pytest.skip(
+            f"the hidden valid-row count does not run on {arch} with nvcc {cake_jit.get_cuda_version()}"
+        )
+
+
 @contextlib.contextmanager
 def _quiet_experimental():
     # The experimental banner fires once per process; the API's opt-in is
@@ -1782,6 +1792,37 @@ def test_gemm_tuning_default_env(monkeypatch):
         stage_values("gemm_dx", narrow.tensors, narrow.plan, 0)
 
 
+def test_toolchain_workaround_flags(monkeypatch):
+    """The CUDA 13.0 ptxas workaround (``-Xptxas -O1``) applies to the sm_103a programs on nvcc 13.0.x only."""
+    from packaging.version import Version
+
+    for version, expected in (
+        ("13.0", ["-Xptxas", "-O1"]),
+        ("12.9", []),
+        ("13.1", []),
+        ("13.4", []),
+    ):
+        monkeypatch.setattr(cake_jit, "get_cuda_version", lambda v=version: Version(v))
+        assert cake_jit.toolchain_workaround_flags("sm_103a") == expected, version
+        assert cake_jit.toolchain_workaround_flags("sm_100a") == [], version
+
+
+def test_toolchain_runs_hidden_count(monkeypatch):
+    """On nvcc 13.0.x the sm_103a calls take the host-count path; every other architecture / toolchain pair runs the
+    hidden valid-row count."""
+    from packaging.version import Version
+
+    for version, sm_103a in (
+        ("13.0", False),
+        ("12.9", True),
+        ("13.1", True),
+        ("13.4", True),
+    ):
+        monkeypatch.setattr(cake_jit, "get_cuda_version", lambda v=version: Version(v))
+        assert cake_jit.toolchain_runs_hidden_count("sm_103a") is sm_103a, version
+        assert cake_jit.toolchain_runs_hidden_count("sm_100a") is True, version
+
+
 def test_select_module_by_geometry(monkeypatch):
     def rec(arch, H, V):
         return {
@@ -3245,8 +3286,12 @@ def test_hidden_count_plan_keys():
 
 def test_hidden_count_eligibility_rules(monkeypatch):
     """A compacted call runs the hidden valid-row count only with a registered program that carries the gather kernel
-    and the device-count form of chunk 0's logits GEMM at the buffer extent's raster, ``T > 0`` and an ``X`` the GEMM
-    reads in place (no contiguous copy, a 16-byte-aligned base)."""
+    and the device-count form of chunk 0's logits GEMM at the buffer extent's raster, ``T > 0``, an ``X`` the GEMM
+    reads in place (no contiguous copy, a 16-byte-aligned base) and a toolchain whose sm_103a code runs it (not nvcc
+    13.0.x)."""
+    from packaging.version import Version
+
+    monkeypatch.setattr(cake_jit, "get_cuda_version", lambda: Version("13.4"))
     name = "cake_lm_head_loss_fake"
 
     def record(*stages):
@@ -3297,6 +3342,15 @@ def test_hidden_count_eligibility_rules(monkeypatch):
     monkeypatch.setitem(cake_jit.MODULES, name, without_long)
     assert not elig(p, X, without_long, name, stats=True)
     assert elig(short, X[:1500], without_long, name, stats=True)
+    sm_103a = dict(full, arch="sm_103a")
+    monkeypatch.setitem(cake_jit.MODULES, name, sm_103a)
+    assert elig(short, X[:1500], sm_103a, name, stats=True)  # the same rules on sm_103a
+    monkeypatch.setattr(cake_jit, "get_cuda_version", lambda: Version("13.0"))
+    assert not elig(
+        short, X[:1500], sm_103a, name, stats=True
+    )  # nvcc 13.0.x: the sm_103a calls take the host-count path
+    monkeypatch.setitem(cake_jit.MODULES, name, full)
+    assert elig(short, X[:1500], full, name, stats=True)  # sm_100a is not affected
 
 
 _HIDDEN_COUNT_HOST_CASES = [  # (T, C, objective, entry, ignored fraction): three chunks + tail, T < C, T = C + 1, T = C
@@ -4678,6 +4732,10 @@ def test_device_binding_scratch_binds_constant_cells(glm_weight):
 def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
     _require_program(entry="loss")
     inp = _device_inputs(4097, W=glm_weight)
+    hidden = (
+        cake_backend.hidden_count_default()
+        and cake_jit.toolchain_runs_hidden_count(cake_backend.arch_for(inp.X.device))
+    )  # the effective switch of this eligible call (sm_103a on nvcc 13.0.x takes the host-count path)
     kw = dict(objective="ce", loss_div=inp.loss_div, chunk_size=4096)
     with _cache(True) as cache:
         cache.clear()
@@ -4715,14 +4773,14 @@ def test_device_binding_cache_hits_are_bitwise_and_pin_nothing(glm_weight):
             valid_rows=int(inp.valid.sum()),
             fuse_dw_cast=cake_backend.fuse_dw_cast_default(),
             dx_finalize=cake_backend.dx_finalize_default(),
-            hidden_count=cake_backend.hidden_count_default(),
+            hidden_count=hidden,
             **kw,
         )
         binding = cache.peek(key)
         assert (
             binding is not None and binding.holds_no_tensor() and binding.plan.compact
         )
-        assert binding.plan.hidden_count is cake_backend.hidden_count_default()
+        assert binding.plan.hidden_count is hidden
         assert set(binding.owned) <= {"workspace", "tma_descriptor_workspace"}
         assert cache.owned_bytes == sum(
             t.numel() * t.element_size() for t in binding.owned.values()
@@ -5332,6 +5390,7 @@ def test_device_hidden_count_kernels_match_torch(glm_weight):
     the same rows: the count arrives through the pinned cell, the gathered rows are ``X``'s valid rows in order (exact
     zeros after the count), and the logits and row statistics of the counted rows are bitwise the host-bound form's."""
     _require_program(entry="logprob")
+    _require_hidden_count()
     name, record = cake_backend.record_for(CUDA, DEFAULT_H, DEFAULT_V)
     for T, ignore in ((1500, 0.05), (1500, 0.0), (4097, 0.5), (300, 1.0)):
         inp = make_inputs(
@@ -5406,6 +5465,7 @@ def test_device_hidden_count_switch_is_bitwise(glm_weight, monkeypatch):
     switch."""
     _require_program(entry="loss")
     _require_program(entry="logprob")
+    _require_hidden_count()
     real_bind_all = cake_backend._bind_all
     real_finish = cake_backend._HiddenCount.finish
     real_stream = cake_backend._ffi_stream_context

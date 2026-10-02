@@ -154,6 +154,7 @@ from .cake_jit import (
     load_cake_lm_head_loss_module,
     registered_stages,
     select_module,
+    toolchain_runs_hidden_count,
 )
 
 IGNORE_INDEX = -100
@@ -1258,9 +1259,11 @@ def hidden_count_eligible(
     stats: bool,
 ) -> bool:
     """Whether a compacted call runs the hidden valid-row count: a registered program with the gather kernel and the
-    device-count form of chunk 0's logits GEMM (the raster rule at the buffer extent ``min(chunk, T)``), ``T > 0`` and
-    an ``X`` the GEMM reads in place -- a 16-byte row pitch (no contiguous copy) and a 16-byte-aligned base.  Every other
-    call takes the shipped :func:`valid_rows` path."""
+    device-count form of chunk 0's logits GEMM (the raster rule at the buffer extent ``min(chunk, T)``), ``T > 0``,
+    an ``X`` the GEMM reads in place -- a 16-byte row pitch (no contiguous copy) and a 16-byte-aligned base -- and a
+    toolchain whose code for the record's architecture runs the hidden count's schedule
+    (:func:`cake_jit.toolchain_runs_hidden_count`: not nvcc 13.0.x for sm_103a).  Every other call takes the shipped
+    :func:`valid_rows` path."""
     if (
         record is None
         or module_name is None
@@ -1268,6 +1271,8 @@ def hidden_count_eligible(
         or problem.x_copy
         or X.data_ptr() % 16
     ):
+        return False
+    if not toolchain_runs_hidden_count(record["arch"]):
         return False
     stages = registered_stages(module_name)
     rows0 = min(int(problem.chunk), int(problem.num_rows))
@@ -1545,7 +1550,7 @@ def generated_program_available(
     )
     if dx_finalize_default():
         needed |= set(DX_FINALIZE_STAGES)
-    if hidden_count_default():
+    if hidden_count_default() and toolchain_runs_hidden_count(arch):
         needed.add(HIDDEN_COUNT_STAGE)
     return all(stage in stages for stage in needed)
 
