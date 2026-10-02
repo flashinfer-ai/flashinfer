@@ -4450,6 +4450,21 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                 bitorder="little",
             )
 
+        if (
+            self.is_cuda_graph_enabled
+            and self._requested_backend == "cutlass"
+            and self._cutlass_graph_planned
+        ):
+            # Reject before updating cached plan state or registered buffers
+            # so the original plan remains usable after a refused re-plan.
+            raise ValueError(
+                "the cutlass backend allocates fresh plan buffers on every "
+                "plan() call, so re-planning in CUDA-graph mode would leave "
+                "a captured graph pointing at the previous ones; plan once "
+                "before capture, or use backend='auto' or an explicit "
+                "'cudnn'/'fa2' if you need to re-plan"
+            )
+
         # NOTE(Zihao): only required if qo_indptr/paged_kv_indptr are device tensors
         qo_indptr_host = qo_indptr.to("cpu")
         kv_indptr_host = kv_indptr.to("cpu")
@@ -4474,16 +4489,6 @@ class BatchPrefillWithRaggedKVCacheWrapper:
                     " mismatches the batch size set during initialization {}.".format(
                         batch_size, self._fixed_batch_size
                     )
-                )
-            if self._requested_backend == "cutlass" and self._cutlass_graph_planned:
-                # Checked before the indptr copies below so a refused re-plan
-                # leaves the captured buffers untouched.
-                raise ValueError(
-                    "the cutlass backend allocates fresh plan buffers on every "
-                    "plan() call, so re-planning in CUDA-graph mode would leave "
-                    "a captured graph pointing at the previous ones; plan once "
-                    "before capture, or use backend='auto' or an explicit "
-                    "'cudnn'/'fa2' if you need to re-plan"
                 )
             self._qo_indptr_buf.copy_(qo_indptr, non_blocking=non_blocking)
             self._kv_indptr_buf.copy_(kv_indptr, non_blocking=non_blocking)

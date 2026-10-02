@@ -665,11 +665,12 @@ def test_explicit_cutlass_plan_once_then_capture_under_cuda_graph():
 
 
 @requires_cutlass_arch
-def test_explicit_cutlass_refuses_replan_under_cuda_graph():
+@pytest.mark.parametrize("new_qo_offsets", [(0, 256, 1024), (0, 256, 768)])
+def test_explicit_cutlass_refuses_replan_under_cuda_graph(new_qo_offsets):
     """Re-planning would strand a captured graph on the previous plan buffers.
 
-    The refusal comes before plan() touches the registered indptr buffers, so
-    a graph captured against the first plan stays consistent.
+    The refusal preserves the original plan's cached state and registered
+    indptr buffers, including when the rejected query total differs.
     """
     dev = torch.device("cuda")
     batch, s_q, s_kv = 2, 512, 512
@@ -683,11 +684,19 @@ def test_explicit_cutlass_refuses_replan_under_cuda_graph():
     wrapper.plan(qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
     plan_info = wrapper._plan_info
 
-    new_qo_indptr = torch.tensor([0, 256, 1024], dtype=torch.int32, device=dev)
+    q = torch.randn(batch * s_q, 32, 128, dtype=DTYPE, device=dev)
+    k = torch.randn(batch * s_kv, 32, 128, dtype=DTYPE, device=dev)
+    v = torch.randn_like(k)
+    out_before = wrapper.run(q, k, v)
+
+    new_qo_indptr = torch.tensor(new_qo_offsets, dtype=torch.int32, device=dev)
     with pytest.raises(ValueError, match="re-planning in CUDA-graph mode"):
         wrapper.plan(new_qo_indptr, kv_indptr, 32, 32, 128, **plan_kwargs)
     assert torch.equal(wrapper._qo_indptr_buf, qo_indptr)
+    assert torch.equal(wrapper._kv_indptr_buf, kv_indptr)
     assert wrapper._plan_info is plan_info
+    assert wrapper._qo_indptr_last == batch * s_q
+    torch.testing.assert_close(wrapper.run(q, k, v), out_before, rtol=0, atol=0)
 
 
 # ---------------------------------------------------------------------------
