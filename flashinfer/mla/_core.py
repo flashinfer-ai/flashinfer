@@ -1253,7 +1253,7 @@ def _resolve_dsv4_sparse_mla_backend(
             "backend must be one of 'auto', 'trtllm-gen', 'cute-dsl', "
             f"'sparse', or 'cake', got {requested_backend!r}"
         )
-    if requested_backend in ("trtllm-gen", "cute-dsl") and not is_sm100_family:
+    if requested_backend == "trtllm-gen" and not is_sm100_family:
         raise ValueError(
             f"backend={requested_backend!r} requires SM100/SM103/SM107, got SM{cc[0]}{cc[1]}"
         )

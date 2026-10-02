@@ -875,13 +875,13 @@ def _assert_close(out: torch.Tensor, ref: torch.Tensor, dtype: torch.dtype) -> N
         torch.testing.assert_close(out.float(), ref.float(), rtol=2e-2, atol=8e-4)
 
 
-def _skip_unless_sm100_or_sm103() -> None:
+def _skip_unless_sm100_or_sm103_or_sm107() -> None:
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required for TRTLLM-GEN sparse MLA tests")
     compute_capability = get_compute_capability(torch.device("cuda"))
     if compute_capability not in ((10, 0), (10, 3), (10, 7)):
         pytest.skip(
-            "TRTLLM-GEN DeepSeek V4 sparse MLA requires SM100/SM103, "
+            "TRTLLM-GEN DeepSeek V4 sparse MLA requires SM100/SM103/SM107, "
             f"got SM{compute_capability[0]}{compute_capability[1]}"
         )
 
@@ -980,7 +980,7 @@ def test_trtllm_gen_sparse_mla_rejects_aliasing_remap_buffer(
 @pytest.mark.parametrize("p", TESTCASES, ids=lambda p: p.id)
 @torch.inference_mode()
 def test_trtllm_gen_sparse_mla_dsv4(p: TestParam) -> None:
-    _skip_unless_sm100_or_sm103()
+    _skip_unless_sm100_or_sm103_or_sm107()
     testcase = generate_testcase_for_decode(p)
     out_ans = run_flashinfer_decode(p, testcase)
     out_ref, _ = ref_sparse_attn_decode(p, testcase)
@@ -1000,7 +1000,7 @@ def test_trtllm_gen_sparse_mla_dsv4_strided_pages(
     dtype: torch.dtype,
     sparse_indices_are_storage_offsets: bool,
 ) -> None:
-    _skip_unless_sm100_or_sm103()
+    _skip_unless_sm100_or_sm103_or_sm107()
     p = RawTestParamForDecode(
         b=2,
         h_q=64,
@@ -1044,7 +1044,7 @@ def test_trtllm_gen_sparse_mla_dsv4_strided_pages(
 
 @torch.inference_mode()
 def test_trtllm_gen_sparse_mla_dsv4_strided_pages_cuda_graph(monkeypatch) -> None:
-    _skip_unless_sm100_or_sm103()
+    _skip_unless_sm100_or_sm103_or_sm107()
     monkeypatch.setenv("FLASHINFER_VALIDATE_INPUTS", "1")
     p = RawTestParamForDecode(
         b=2,
@@ -1300,7 +1300,7 @@ def test_trtllm_gen_dsv4_rope_quant_correctness(batch_size, q_len, topk, is_varl
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     if get_compute_capability(torch.device("cuda")) not in ((10, 0), (10, 3), (10, 7)):
-        pytest.skip("TRTLLM-GEN DSv4 RopeQuant requires SM100/SM103")
+        pytest.skip("TRTLLM-GEN DSv4 RopeQuant requires SM100/SM103/SM107")
 
     torch.manual_seed(7)
     device = torch.device("cuda")
