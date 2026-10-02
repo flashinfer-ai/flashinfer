@@ -552,6 +552,17 @@ def default_tactic(m: int, n: int, k: int, sm_count: int) -> dict[str, Any]:
         tactic["a_hint"], tactic["b_hint"] = None, "evict_first"
     if _half_m_pair_rows(m, n, tile_n, sm_count, tactic):
         tactic["half_m"] = True
+    if (
+        tactic.get("two_cta")
+        and not tactic.get("half_m")
+        and tactic.get("sched", "static") == "static"
+    ):
+        # Stream-K tail of the static 2-CTA schedule: the partial last wave's tiles are cut
+        # into equal K slices over consecutive pairs (``stream_k_tail``); ``gemm_plan`` keeps
+        # the knob only where at least SK_MIN_SLICES fit (B200 16384x7168 / 18432x7168
+        # M=2048 1.089 / 1.098, 8192x28672 M=257 / 512 1.017 / 1.023 vs the plain program;
+        # the GB300 perf rows have no shareable tail and run the plain program).
+        tactic["stream_k"] = True
     return tactic
 
 
@@ -592,6 +603,10 @@ def gemm_kernel_key(tactic: dict[str, Any], out_f16: bool) -> str:
         parts.append("hm")
     if tactic.get("stream_k"):
         # The slice count is baked into the program; ``gemm_plan`` resolves it into the tactic.
+        if "sk_split" not in tactic:
+            raise ValueError(
+                "stream_k tactic without a resolved sk_split: build the key from gemm_plan(...).tactic"
+            )
         parts.append(f"skt{int(tactic['sk_split'])}")
     if int(tactic.get("split_k", 1)) > 1:
         parts.append(f"sk{int(tactic['split_k'])}")
@@ -681,24 +696,32 @@ class GemmPlan:
 # default).  The slice count actually used is bounded by the free pairs per tail tile, the
 # tile's output subtiles and its K tiles, and is baked into the program (``skt{S}``).
 SK_MAX_SPLIT = 8
+# Fewest slices worth running: two slices keep half a tile plus the exchange on the critical
+# path (1.005-1.008 where measured); three or more measured 1.017-1.098 on B200.
+SK_MIN_SLICES = 3
 EPI_TILE_N = 32
 
 
 def stream_k_tail(
-    num_tiles: int, pairs: int, k_tiles: int, split: int = SK_MAX_SPLIT, max_slices: int = 6
+    num_tiles: int,
+    pairs: int,
+    k_tiles: int,
+    split: int = SK_MAX_SPLIT,
+    max_slices: int = 6,
+    min_slices: int = SK_MIN_SLICES,
 ) -> tuple[int, int, int]:
     """``(tail_tiles, slices, pairs_used)`` of the stream-K tail of a static 2-CTA grid (the
     Cake ``stream_k_tail``): the partial last wave's ``R = num_tiles % pairs`` tiles are each
     cut into ``slices = min(split, pairs // R, max_slices, k_tiles)`` equal K slices held by
-    ``R * slices`` pairs.  ``slices < 2`` means the tail is not run: ``(0, 0, 0)`` without a
-    partial last wave, ``(R, 1, 0)`` when the pairs cannot share it."""
+    ``R * slices`` pairs.  ``pairs_used == 0`` means the tail is not run: ``(0, 0, 0)`` without
+    a partial last wave, ``(R, 1, 0)`` when fewer than ``min_slices`` fit."""
     if split < 1:
         raise ValueError(f"sk_split must be positive, got {split}")
     if num_tiles <= pairs or num_tiles % pairs == 0:
         return 0, 0, 0
     tail = num_tiles % pairs
     slices = min(split, pairs // tail, max_slices, k_tiles)
-    if slices < 2:
+    if slices < max(2, min_slices):
         return tail, 1, 0
     return tail, slices, tail * slices
 
@@ -792,7 +815,7 @@ def gemm_plan(
             int(tactic.get("sk_split", SK_MAX_SPLIT)),
             int(tactic["tile_n"]) // EPI_TILE_N,
         )
-        if sk_slices < 2:
+        if sk_pairs == 0:
             # No partial last wave, or one the pairs cannot share: the plain static program.
             tactic.pop("stream_k", None)
             tactic.pop("sk_split", None)
