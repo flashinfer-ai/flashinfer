@@ -454,21 +454,50 @@ def select_specialization(
     return SPECIALIZATION_GENERIC
 
 
-def route_applies(
-    *, world_size: int, device_capability: Sequence[int], emit_moe_allreduce: bool
-) -> bool:
-    """Whether the union owns this Cake MoE all-reduce call.
-
-    The union owns exactly the (architecture, world size) scopes it has routes
-    for; every other configuration keeps FlashInfer's legacy isolated bundle.
-    """
+def route_applies(*, world_size: int, device_capability: Sequence[int]) -> bool:
+    """Whether the union has programs for this (architecture, world size)."""
 
     arch = arch_for_capability(device_capability)
-    return (
-        arch is not None
-        and bool(emit_moe_allreduce)
-        and (arch, int(world_size)) in _EXPORTED_SCOPES
-    )
+    return arch is not None and (arch, int(world_size)) in _EXPORTED_SCOPES
+
+
+_scratch_allreduce_outputs: dict[
+    tuple[str, Optional[int], torch.dtype], torch.Tensor
+] = {}
+# Scratch tensors replaced by a larger one, kept alive for the process lifetime:
+# a CUDA graph captured while the cached scratch was large enough recorded that
+# tensor's address, so its storage must never return to the allocator.
+_retired_scratch_allreduce_outputs: list[torch.Tensor] = []
+
+
+def scratch_allreduce_output(
+    device: torch.device, dtype: torch.dtype, token_num: int
+) -> torch.Tensor:
+    """A ``[token_num, HIDDEN_DIM]`` sink for calls without ``moe_allreduce_out``.
+
+    Every union kernel stores the all-reduce output; a caller that does not want
+    it gets a loader-owned scratch tensor instead, cached per device and dtype,
+    so steady-state calls allocate nothing. When a larger ``token_num`` arrives
+    the cache grows to at least twice its previous capacity and the replaced
+    tensor is retired, not freed: a CUDA graph captured while the cached scratch
+    was large enough replays against that tensor's address, so its storage must
+    stay owned by the loader for the process lifetime. Doubling bounds the total
+    retired memory by the live capacity. A tensor allocated while a CUDA graph
+    is being captured belongs to the graph's memory pool and is returned without
+    being cached.
+    """
+
+    key = (device.type, device.index, dtype)
+    cached = _scratch_allreduce_outputs.get(key)
+    if cached is None or cached.shape[0] < token_num:
+        capacity = token_num if cached is None else max(token_num, 2 * cached.shape[0])
+        fresh = torch.empty((capacity, HIDDEN_DIM), dtype=dtype, device=device)
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            return fresh[:token_num]
+        if cached is not None:
+            _retired_scratch_allreduce_outputs.append(cached)
+        _scratch_allreduce_outputs[key] = cached = fresh
+    return cached[:token_num]
 
 
 def route_for(
@@ -653,8 +682,6 @@ def run_cake_moe_allreduce_union(
         raise ValueError(
             f"the Cake MoE all-reduce union requires hidden_dim={HIDDEN_DIM}"
         )
-    if moe_allreduce_out is None:
-        raise ValueError("the Cake MoE all-reduce union emits moe_allreduce_out")
     dtype_name = _DTYPE_NAME.get(moe_reduction_active_experts_token_input.dtype)
     if dtype_name is None:
         raise ValueError(
@@ -683,6 +710,12 @@ def run_cake_moe_allreduce_union(
     )
     name = route_kernel(route, int(world_rank), world_size)
     kernel = KERNELS[name]
+    if moe_allreduce_out is None:
+        moe_allreduce_out = scratch_allreduce_output(
+            moe_reduction_active_experts_token_input.device,
+            moe_reduction_active_experts_token_input.dtype,
+            int(token_num),
+        )
     grid_x = launch_grid_x(
         int(token_num),
         route.cooperative,
@@ -733,6 +766,7 @@ __all__ = [
     "route_for",
     "route_kernel",
     "run_cake_moe_allreduce_union",
+    "scratch_allreduce_output",
     "select_specialization",
     "spec",
 ]

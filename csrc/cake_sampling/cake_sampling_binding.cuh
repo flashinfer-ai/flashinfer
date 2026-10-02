@@ -27,7 +27,7 @@
 //   warps) CAKE_SAMPLING_FUSED_BLOCK_TAIL_KCAP largest top-k the whole-CTA stage-2/3 tail serves
 //   (the slab row) CAKE_SAMPLING_STAGE1_TABLE(X)  X(symbol, cluster, ept, stream, threads,
 //   smem_bytes, fused_tail,
-//                                    fused_block_tail) ...
+//                                    fused_block_tail, coarse_sample, spec_sample) ...
 //   CAKE_SAMPLING_STAGE23_TABLE(X) X(symbol, threads, items, variant_flags, smem_bytes) ...
 // and then includes this header.  Every table entry is taken verbatim from manifest.json.
 #ifndef CAKE_SAMPLING_BODY_FILE
@@ -82,6 +82,8 @@ constexpr int64_t kFlagFuseBlockTail = 8;
 constexpr int64_t kFlagCoarseSample =
     16;  // host-side build selection; never forwarded to the kernel
 constexpr int64_t kFlagRowSpanDiet = 32;  // streaming variants: row-span filter-arm density switch
+constexpr int64_t kFlagSpecSample =
+    64;  // host-side build selection (speculative sample); never forwarded to the kernel
 constexpr int32_t kTopKScalar = 1;
 constexpr int32_t kTopKPerRow = 2;
 constexpr int32_t kTopPScalar = 1;
@@ -125,6 +127,8 @@ struct Stage1Variant {
   int32_t fused_tail;        // 1: built with the fused stage-2/3 tail (accepts launch_flags bit 0)
   int32_t fused_block_tail;  // 1: built with the whole-CTA tail (accepts launch_flags bit 3)
   int32_t coarse_sample;  // 1: the coarse-sample build (1/8 sampled first pass; launch_flags bit 4)
+  int32_t spec_sample;  // 1: the speculative-sample build (first chunk is the sample; launch_flags
+                        // bit 6)
 };
 
 struct Stage23Variant {
@@ -136,7 +140,7 @@ struct Stage23Variant {
 };
 
 #define CAKE_SAMPLING_STAGE1_ENTRY(symbol, cluster, ept, stream, threads, smem, fused, \
-                                   fused_block, wide)                                  \
+                                   fused_block, wide, spec)                            \
   {reinterpret_cast<const void*>(&symbol),                                             \
    cluster,                                                                            \
    ept,                                                                                \
@@ -145,7 +149,8 @@ struct Stage23Variant {
    smem,                                                                               \
    fused,                                                                              \
    fused_block,                                                                        \
-   wide},
+   wide,                                                                               \
+   spec},
 #define CAKE_SAMPLING_STAGE23_ENTRY(symbol, threads, items, variant_flags, smem) \
   {reinterpret_cast<const void*>(&symbol), threads, items, variant_flags, smem},
 
@@ -154,13 +159,15 @@ struct Stage23Variant {
 // (fused_block_tail = 1) taken only by launch_flags bit 3 -- the extra code slowed every k <= 64
 // launch of a single build on sm_103a / sm_107a.  Streaming variants also ship a coarse-sample twin
 // (coarse_sample = 1: the first pass reads 1/8 of the row) taken only by launch_flags bit 4 -- a
-// runtime rate switch cost the k > 64 launches 1-2 %.
+// runtime rate switch cost the k > 64 launches 1-2 % -- and a speculative-sample twin
+// (spec_sample = 1: the first register chunk doubles as the sample) taken only by launch_flags
+// bit 6.  The three twins are exclusive.
 inline const Stage1Variant* FindStage1(int32_t cluster, int32_t ept, int32_t stream,
-                                       int32_t block_tail, int32_t wide) {
+                                       int32_t block_tail, int32_t wide, int32_t spec) {
   static const Stage1Variant kTable[] = {CAKE_SAMPLING_STAGE1_TABLE(CAKE_SAMPLING_STAGE1_ENTRY)};
   for (const Stage1Variant& v : kTable) {
     if (v.cluster == cluster && v.ept == ept && v.stream == stream &&
-        v.fused_block_tail == block_tail && v.coarse_sample == wide)
+        v.fused_block_tail == block_tail && v.coarse_sample == wide && v.spec_sample == spec)
       return &v;
   }
   return nullptr;
@@ -267,7 +274,15 @@ inline void CheckSlab(const TensorView& vals, const TensorView& idx, const Tenso
 //   segments, so every output is bit-identical.  The host sets it for cluster >= 8 streams whose
 //   largest top-k exceeds the two-warp tail on compute capability 9.0 / 10.0 / 10.3 (round 6, lever
 //   FD5: those k ~ 1000 cells run 2-5 % faster; cluster-1 rows can lose with the arm, Rubin is
-//   neutral).  Rejected on register-resident variants.  Other bits are ignored.
+//   neutral).  Rejected on register-resident variants.
+//   launch_flags bit 6 (speculative sample): selects a streaming variant's speculative-sample build
+//   (manifest spec_sample): no separate sampled read; every warp loads its first register chunk
+//   (and the second where the row has one), histograms a strided subset of those registers as the
+//   sample, keeps the chunk for the filter pass and scales the lower-bucket margin and the
+//   sampled-mass cap to the realised rate; the exact passes and the fallbacks are unchanged, so
+//   every output is bit-identical.  The host sets it for streams on a cluster of at least 4 CTAs
+//   or rows of at least 16 register chunks per CTA (round 7, lever SP); exclusive with bits 3 and
+//   4; the kernel itself never sees the bit.  Other bits are ignored.
 void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64_t topk_kind,
                TensorView out_vals, TensorView out_idx, TensorView out_count, int64_t cluster,
                int64_t ept, int64_t stream_variant, TensorView topp_arr, double topp_scalar,
@@ -309,14 +324,20 @@ void RadixTopK(TensorView probs, TensorView topk_arr, int64_t topk_scalar, int64
       << "launch_flags bits 3 and 4 (whole-CTA tail and coarse sample) are exclusive";
   TVM_FFI_ICHECK(!((launch_flags & kFlagRowSpanDiet) != 0 && stream_variant == 0))
       << "the row-span filter arm (launch_flags bit 5) exists for streaming variants only";
+  const int32_t want_spec = (launch_flags & kFlagSpecSample) != 0 ? 1 : 0;
+  TVM_FFI_ICHECK(!(want_spec && stream_variant == 0))
+      << "the speculative-sample build (launch_flags bit 6) exists for streaming variants only";
+  TVM_FFI_ICHECK(!(want_spec && (want_block_tail || want_coarse)))
+      << "launch_flags bit 6 (speculative sample) is exclusive with bits 3 and 4";
   const Stage1Variant* v =
       FindStage1(static_cast<int32_t>(cluster), static_cast<int32_t>(ept),
-                 static_cast<int32_t>(stream_variant), want_block_tail, want_coarse);
+                 static_cast<int32_t>(stream_variant), want_block_tail, want_coarse, want_spec);
   TVM_FFI_ICHECK(v != nullptr)
       << "no frozen stage-1 variant for cluster=" << cluster << " ept=" << ept
       << " stream=" << stream_variant
       << (want_block_tail ? " with the whole-CTA tail build (launch_flags bit 3)" : "")
-      << (want_coarse ? " with the coarse-sample build (launch_flags bit 4)" : "");
+      << (want_coarse ? " with the coarse-sample build (launch_flags bit 4)" : "")
+      << (want_spec ? " with the speculative-sample build (launch_flags bit 6)" : "");
   PrepareKernel(device_id, v->kernel, v->smem_bytes, v->cluster);
   TVM_FFI_ICHECK(v->stream == 1 || static_cast<int64_t>(v->cluster) * v->ept * v->threads >= vocab)
       << "stage-1 variant cluster=" << cluster << " ept=" << ept

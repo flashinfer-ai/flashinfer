@@ -66339,7 +66339,6 @@ kernel_cake_radix_topk_c1_e16s(float* __restrict__ probs, int* __restrict__ topk
     }
     if (fuse_on != 0) {
         __syncthreads();
-        __syncthreads();
         if (fuse_block != 0) {
             if (rank == 0) {
                 float p_rowb = ((topp_kind == 2) ? topp_arr[row] : topp_scalar);
@@ -73894,7 +73893,6 @@ kernel_cake_radix_topk_c2_e16s(float* __restrict__ probs, int* __restrict__ topk
     if (fuse_on != 0) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-        __syncthreads();
         if (fuse_block != 0) {
             if (rank == 0) {
                 float p_rowb = ((topp_kind == 2) ? topp_arr[row] : topp_scalar);
@@ -81763,7 +81761,6 @@ kernel_cake_radix_topk_c4_e16s(float* __restrict__ probs, int* __restrict__ topk
     if (fuse_on != 0) {
         asm volatile("barrier.cluster.arrive.release.aligned;" ::: "memory");
         asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-        __syncthreads();
         if (fuse_block != 0) {
             if (rank == 0) {
                 float p_rowb = ((topp_kind == 2) ? topp_arr[row] : topp_scalar);
