@@ -1615,8 +1615,8 @@ def _resolve_paged_plan_geometry(
 
 
 def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
-    """Dense contiguous MHA or GQA at D=128 with bf16 QK runs the two-CTA UMMA
-    form, which pairs adjacent Q tiles of one head through the grid.
+    """Dense contiguous MHA or GQA at D=128 with bf16 or E4M3 QK runs the two-CTA
+    UMMA form, which pairs adjacent Q tiles of one head through the grid.
     The two-CTA launch is non-persistent with heads on grid Y and batch on
     grid Z. CUDA limits grid Y and Z to 65,535; oversized geometries keep the
     persistent flattened grid so every otherwise-valid int32 plan stays
@@ -1628,7 +1628,7 @@ def _two_cta_umma_geometry_eligible(geometry: _ContextPlanGeometry) -> bool:
         and geometry.mask_type == "dense"
         and not geometry.packed
         and not geometry.head_paired
-        and torch.finfo(geometry.qk_dtype).bits == 16
+        and torch.finfo(geometry.qk_dtype).bits in (8, 16)
         and not (
             geometry.batch_size > _CUDA_GRID_YZ_MAX
             or geometry.num_qo_heads > _CUDA_GRID_YZ_MAX

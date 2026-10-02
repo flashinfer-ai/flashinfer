@@ -2725,7 +2725,7 @@ class FmhaTs:
     two_cta_umma : bool, optional
         Issue the QK and PV UMMAs in ``cta_group::2`` across a 2-CTA cluster, each
         CTA staging half of every K/V tile. Dense contiguous query-paired D128 with
-        bf16 QK only, launched non-persistently.
+        bf16 or E4M3 QK, launched non-persistently.
     use_paged_kv : bool, optional
         Read K/V from a physical page pool through a fixed block table.
     num_tokens_per_page : int, optional
@@ -2837,11 +2837,11 @@ class FmhaTs:
             or use_paged_kv
             or d != 128
             or d_v not in (None, 128)
-            or in_qk_dtype.width != 16
+            or in_qk_dtype.width not in (8, 16)
         ):
             raise ValueError(
                 "two-CTA UMMA requires the non-persistent dense contiguous "
-                "query-paired D128 context kernel with bf16 QK"
+                "query-paired D128 context kernel with bf16 or E4M3 QK"
             )
         cfg.two_cta_umma = two_cta_umma
         if two_cta_umma:

@@ -5401,14 +5401,18 @@ def test_attention_ts_context_mla_prefill(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("pv_dtype", (torch.bfloat16, _FP8), ids=("pv-bf16", "pv-fp8"))
+@pytest.mark.parametrize(
+    "qk_dtype,pv_dtype",
+    ((torch.bfloat16, torch.bfloat16), (torch.bfloat16, _FP8), (_FP8, _FP8)),
+    ids=("pv-bf16", "pv-fp8", "qkv-fp8"),
+)
 @pytest.mark.parametrize(
     "num_qo_heads,num_kv_heads", ((2, 2), (4, 2), (3, 1)), ids=("mha", "gqa2", "gqa3")
 )
 @pytest.mark.arch_blackwell
 @_REQUIRES_CONTEXT_GPU
 def test_attention_ts_context_two_cta_matches_single_cta(
-    monkeypatch, pv_dtype, num_qo_heads, num_kv_heads
+    monkeypatch, qk_dtype, pv_dtype, num_qo_heads, num_kv_heads
 ):
     """The paired kernel reproduces the single-CTA kernel and the reference.
 
@@ -5425,14 +5429,14 @@ def test_attention_ts_context_two_cta_matches_single_cta(
         k_lengths=(8200, 8200),
         num_qo_heads=num_qo_heads,
         num_kv_heads=num_kv_heads,
-        qkv_dtype=torch.bfloat16,
+        qkv_dtype=qk_dtype,
         packed=False,
         mask_type="dense",
         output_dtype=torch.bfloat16,
         output_scale=1.0,
         seed=2026092201,
     )
-    if pv_dtype is _FP8:
+    if pv_dtype is _FP8 and case.v.dtype is not _FP8:
         case = replace(case, v=case.v.to(_FP8))
 
     monkeypatch.setattr(
