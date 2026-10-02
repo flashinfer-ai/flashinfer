@@ -1196,6 +1196,11 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
                   "Stochastic rounding (PHILOX_ROUNDS > 0) only supports fp16 state");
   }
   auto [sm_major, sm_minor] = GetCudaComputeCapability();
+#ifdef FLASHINFER_MAMBA_ENABLE_SM90
+  // The horizontal kernel gives each row 2 lanes of its (DIM / 64) * 4 consumer warps, so it
+  // covers exactly DIM rows only when DIM is a multiple of 64.
+  constexpr bool kHorizontalSupportsDim = DIM % 64 == 0;
+#endif
 
   // Common alignment checks for all kernels
   check_ptr_alignment_input_vars<input_t>(params);
@@ -1217,8 +1222,9 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
         algo = SSUAlgorithm::kSimple;
       else if (sm_major < 10)
         algo = SSUAlgorithm::kVertical;
-      else if (scaleState)
-        // Horizontal kernel cannot do 2-pass quantization, so always use vertical
+      else if (scaleState || !kHorizontalSupportsDim)
+        // Horizontal kernel cannot do 2-pass quantization and needs DIM divisible by 64,
+        // so use vertical
         algo = SSUAlgorithm::kVertical;
       else
         // On Blackwell+: vertical is slightly faster for fp32 state,
@@ -1301,6 +1307,8 @@ void invokeSelectiveStateUpdate(SelectiveStateUpdateParams& params, SSUAlgorithm
         !scaleState,
         "Horizontal kernel does not support scaled state (int16). "
         "Cannot do 2-pass quantization because dstate tiles are discarded after processing.");
+    FLASHINFER_CHECK(kHorizontalSupportsDim,
+                     "Horizontal kernel requires dim divisible by 64, got dim=", DIM);
     constexpr auto numConsumers = (DIM / 64) * 4;
     constexpr auto numProducers = 1;
     constexpr auto numWarps = numProducers + numConsumers;

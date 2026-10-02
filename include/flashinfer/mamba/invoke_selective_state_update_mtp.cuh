@@ -62,11 +62,17 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
   if (algorithm == SSUAlgorithm::kAsyncHorizontal) {
     algorithm = SSUAlgorithm::kSimple;
   }
+#ifdef FLASHINFER_MAMBA_ENABLE_SM100
+  // TMA_STATE_ROWS: rows of DIM per TMA transaction in the horizontal kernel. Must be a
+  // multiple of ROWS_PER_PASS. Larger values = fewer barrier syncs but more smem per stage.
+  constexpr int TMA_STATE_ROWS = 2 * horiz::ROWS_PER_PASS;
+#endif
   // ── Auto algorithm selection ──────────────────────────────────────────────
   if (algorithm == SSUAlgorithm::kAuto) {
 #ifdef FLASHINFER_MAMBA_ENABLE_SM100
-    // Horizontal/vertical kernels don't support scaleState or varlen
-    if (scaleState || params.cu_seqlens)
+    // Horizontal/vertical kernels don't support scaleState or varlen, and horizontal needs
+    // DIM divisible by TMA_STATE_ROWS
+    if (scaleState || params.cu_seqlens || DIM % TMA_STATE_ROWS != 0)
       algorithm = SSUAlgorithm::kSimple;
     else
       algorithm = (params.batch >= 32) ? SSUAlgorithm::kHorizontal : SSUAlgorithm::kSimple;
@@ -172,74 +178,76 @@ void invokeSelectiveStateUpdateMTP(SelectiveStateMTPParams& params, SSUAlgorithm
                      ") must be divisible by ngroups (", params.ngroups,
                      ") for horizontal algorithm");
     constexpr int NUM_IN_STAGES = 2;
-    // TMA_STATE_ROWS: rows of DIM per TMA transaction. Must be a multiple of ROWS_PER_PASS.
-    // Larger values = fewer barrier syncs but more smem per pipeline stage.
-    constexpr int TMA_STATE_ROWS = 2 * horiz::ROWS_PER_PASS;
     FLASHINFER_CHECK(DIM % TMA_STATE_ROWS == 0, "Horizontal kernel requires DIM divisible by ",
                      TMA_STATE_ROWS, " (TMA_STATE_ROWS = 2 * ROWS_PER_PASS), got DIM=", DIM);
     FLASHINFER_CHECK(!scaleState, "horizontal algorithm does not support scaled (quantized) state");
     FLASHINFER_CHECK(params.cu_seqlens == nullptr,
                      "horizontal algorithm does not support varlen (cu_seqlens)");
 
-    dispatchRatio(
-        params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
-          constexpr int HEADS_PER_CTA = 1;
-          static_assert(HEADS_PER_GROUP % HEADS_PER_CTA == 0);
+    // The kernel static_asserts DIM % TMA_STATE_ROWS == 0, so only instantiate it then.
+    if constexpr (DIM % TMA_STATE_ROWS == 0) {
+      dispatchRatio(
+          params, std::integer_sequence<int, 1, 2, 4, 8, 16, 32, 64>{}, [&]<int HEADS_PER_GROUP>() {
+            constexpr int HEADS_PER_CTA = 1;
+            static_assert(HEADS_PER_GROUP % HEADS_PER_CTA == 0);
 
-          using sram_t = GroupStorageHorizontal<input_t, state_t, NTOKENS_MTP, DIM, DSTATE,
-                                                NUM_IN_STAGES, TMA_STATE_ROWS, HEADS_PER_CTA>;
-          constexpr size_t smem_size = sizeof(sram_t);
+            using sram_t = GroupStorageHorizontal<input_t, state_t, NTOKENS_MTP, DIM, DSTATE,
+                                                  NUM_IN_STAGES, TMA_STATE_ROWS, HEADS_PER_CTA>;
+            constexpr size_t smem_size = sizeof(sram_t);
 
-          auto func = selective_state_update_kernel_horizontal_mtp<
-              input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
-              HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_IN_STAGES, TMA_STATE_ROWS, HEADS_PER_CTA>;
+            auto func = selective_state_update_kernel_horizontal_mtp<
+                input_t, weight_t, matrixA_t, state_t, stateIndex_t, NTOKENS_MTP, DIM, DSTATE,
+                HEADS_PER_GROUP, PHILOX_ROUNDS, NUM_IN_STAGES, TMA_STATE_ROWS, HEADS_PER_CTA>;
 
-          FLASHINFER_CHECK(params.nheads % HEADS_PER_CTA == 0, "nheads (", params.nheads,
-                           ") must be divisible by HEADS_PER_CTA (", HEADS_PER_CTA,
-                           ") for horizontal algorithm");
+            FLASHINFER_CHECK(params.nheads % HEADS_PER_CTA == 0, "nheads (", params.nheads,
+                             ") must be divisible by HEADS_PER_CTA (", HEADS_PER_CTA,
+                             ") for horizontal algorithm");
 
-          dim3 grid(params.batch, params.nheads / HEADS_PER_CTA);
-          dim3 block(warpSize, horiz::NUM_WARPS);
+            dim3 grid(params.batch, params.nheads / HEADS_PER_CTA);
+            dim3 block(warpSize, horiz::NUM_WARPS);
 
-          // TMA state descriptor: single wide tile of DSTATE_PAD columns.
-          // DSTATE_PAD is DSTATE rounded up to 128 bytes (32 banks), eliminating
-          // bank conflicts. OOB padding is handled in registers, not smem.
-          constexpr int DSTATE_PAD = sram_t::DSTATE_PAD;
-          auto state_tensor = tma::buildNdDescriptor(
-              typeid(state_t),
-              /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
-              /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
-              /*tiles*/ {DSTATE_PAD, TMA_STATE_ROWS, 1, 1}, params.state);
+            // TMA state descriptor: single wide tile of DSTATE_PAD columns.
+            // DSTATE_PAD is DSTATE rounded up to 128 bytes (32 banks), eliminating
+            // bank conflicts. OOB padding is handled in registers, not smem.
+            constexpr int DSTATE_PAD = sram_t::DSTATE_PAD;
+            auto state_tensor = tma::buildNdDescriptor(
+                typeid(state_t),
+                /*shapes*/ {DSTATE, DIM, params.nheads, params.state_cache_size},
+                /*strides*/ {1, DSTATE, DSTATE * DIM, params.state_stride_batch},
+                /*tiles*/ {DSTATE_PAD, TMA_STATE_ROWS, 1, 1}, params.state);
 
-          // B/C: tile by DSTATE_PAD to match padded smem layout.
-          auto B_tensor = tma::buildNdDescriptor(
-              typeid(input_t),
-              {(uint64_t)DSTATE, (uint64_t)params.ngroups, (uint64_t)params.ntokens_mtp,
-               (uint64_t)params.batch},
-              {1, (uint64_t)DSTATE, (uint64_t)params.B_stride_mtp, (uint64_t)params.B_stride_batch},
-              {DSTATE_PAD, 1, NTOKENS_MTP, 1}, params.B);
+            // B/C: tile by DSTATE_PAD to match padded smem layout.
+            auto B_tensor =
+                tma::buildNdDescriptor(typeid(input_t),
+                                       {(uint64_t)DSTATE, (uint64_t)params.ngroups,
+                                        (uint64_t)params.ntokens_mtp, (uint64_t)params.batch},
+                                       {1, (uint64_t)DSTATE, (uint64_t)params.B_stride_mtp,
+                                        (uint64_t)params.B_stride_batch},
+                                       {DSTATE_PAD, 1, NTOKENS_MTP, 1}, params.B);
 
-          auto C_tensor = tma::buildNdDescriptor(
-              typeid(input_t),
-              {(uint64_t)DSTATE, (uint64_t)params.ngroups, (uint64_t)params.ntokens_mtp,
-               (uint64_t)params.batch},
-              {1, (uint64_t)DSTATE, (uint64_t)params.C_stride_mtp, (uint64_t)params.C_stride_batch},
-              {DSTATE_PAD, 1, NTOKENS_MTP, 1}, params.C);
+            auto C_tensor =
+                tma::buildNdDescriptor(typeid(input_t),
+                                       {(uint64_t)DSTATE, (uint64_t)params.ngroups,
+                                        (uint64_t)params.ntokens_mtp, (uint64_t)params.batch},
+                                       {1, (uint64_t)DSTATE, (uint64_t)params.C_stride_mtp,
+                                        (uint64_t)params.C_stride_batch},
+                                       {DSTATE_PAD, 1, NTOKENS_MTP, 1}, params.C);
 
-          auto x_tensor = tma::buildNdDescriptor(
-              typeid(input_t),
-              /*shapes*/
-              {(uint64_t)DIM, (uint64_t)params.nheads, (uint64_t)params.ntokens_mtp,
-               (uint64_t)params.batch},
-              /*strides*/
-              {1, (uint64_t)DIM, (uint64_t)params.x_stride_mtp, (uint64_t)params.x_stride_batch},
-              /*tiles*/ {DIM, 1, NTOKENS_MTP, 1}, params.x);
+            auto x_tensor = tma::buildNdDescriptor(
+                typeid(input_t),
+                /*shapes*/
+                {(uint64_t)DIM, (uint64_t)params.nheads, (uint64_t)params.ntokens_mtp,
+                 (uint64_t)params.batch},
+                /*strides*/
+                {1, (uint64_t)DIM, (uint64_t)params.x_stride_mtp, (uint64_t)params.x_stride_batch},
+                /*tiles*/ {DIM, 1, NTOKENS_MTP, 1}, params.x);
 
-          FLASHINFER_CUDA_CHECK(
-              cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-          func<<<grid, block, smem_size, stream>>>(params, state_tensor, B_tensor, C_tensor,
-                                                   x_tensor);
-        });
+            FLASHINFER_CUDA_CHECK(
+                cudaFuncSetAttribute(func, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+            func<<<grid, block, smem_size, stream>>>(params, state_tensor, B_tensor, C_tensor,
+                                                     x_tensor);
+          });
+    }
     return;
   }
 #else

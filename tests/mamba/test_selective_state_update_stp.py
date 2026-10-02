@@ -18,6 +18,12 @@ def _get_algorithms():
     return algos
 
 
+def _skip_unsupported_dim(algorithm, dim):
+    """Skip head dims that the horizontal kernel does not support."""
+    if algorithm == "horizontal" and dim % 64 != 0:
+        pytest.skip(f"horizontal kernel requires dim divisible by 64, got {dim}")
+
+
 # Base combination: batch=64, nheads=64, dim=64, dstate=128, state_dtype=bf16,
 #                   weight_dtype=f32, use_out_tensor=True
 # Each additional row varies exactly one parameter from the base.
@@ -185,6 +191,7 @@ class TestSelectiveStateUpdate:
         algorithm,
     ):
         """Test that kernel output matches reference within tolerance."""
+        _skip_unsupported_dim(algorithm, dim)
         inputs = self.make_inputs(batch, nheads, dim, dstate, state_dtype, weight_dtype)
         y_ref, state_ref = self.make_reference_output(inputs)
 

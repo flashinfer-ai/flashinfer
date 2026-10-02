@@ -45,6 +45,13 @@ _BASE_PARAMS = (
 # fmt: on
 
 
+def _skip_unsupported_dim(algorithm, dim):
+    """Skip head dims that the vertical and horizontal MTP kernels do not support."""
+    # Vertical needs dim divisible by warpSize (32); horizontal by TMA_STATE_ROWS (32).
+    if algorithm in ("vertical", "horizontal") and dim % 32 != 0:
+        pytest.skip(f"{algorithm} kernel requires dim divisible by 32, got {dim}")
+
+
 class TestSelectiveStateUpdateMTP:
     """Test class for multi-token selective state update kernels."""
 
@@ -205,6 +212,7 @@ class TestSelectiveStateUpdateMTP:
         use_out_tensor,
     ):
         """Test that kernel output matches reference within tolerance."""
+        _skip_unsupported_dim(self._algo, dim)
         inputs = self.make_inputs(
             batch, nheads, dim, dstate, cache_steps, state_dtype, weight_dtype
         )
