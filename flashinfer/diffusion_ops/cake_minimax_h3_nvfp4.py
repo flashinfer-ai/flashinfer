@@ -166,7 +166,14 @@ def repack_minimax_h3_qkv_weight_scales_for_fused_gemm(
 
 
 class PreparedMiniMaxH3Nvfp4PreAttention:
-    """Exact-shape prepared operation with caller-owned storage."""
+    """Exact-shape prepared operation with caller-owned storage.
+
+    The generated stages take their TMA tensor maps by value, encoded once
+    at preparation; there is no descriptor workspace.  The
+    ``norm_descriptor_workspace`` / ``gemm_descriptor_workspace`` keyword
+    arguments of :func:`prepare_minimax_h3_nvfp4_pre_attention` are kept for
+    API stability and must be ``None``.
+    """
 
     def __init__(
         self,
@@ -238,6 +245,15 @@ def prepare_minimax_h3_nvfp4_pre_attention(
     debug_adaln_bf16: Optional[torch.Tensor] = None,
     eps: float = _EPS,
 ) -> PreparedMiniMaxH3Nvfp4PreAttention:
+    """Validate the caller-owned tensors once and bind both stage launches.
+
+    ``norm_descriptor_workspace`` and ``gemm_descriptor_workspace`` must be
+    ``None``: the generated stages pass their tensor maps by value, so no
+    caller-provided descriptor workspace exists.  The keyword arguments are
+    kept for API stability; a non-``None`` value raises :class:`ValueError`.
+    The ``debug_*`` tensors are optional BF16 intermediates (AdaLN output,
+    post-norm Q / K) written only when all three are supplied.
+    """
     if not isinstance(P, int) or isinstance(P, bool) or P not in _SUPPORTED_PARTITIONS:
         raise ValueError(f"P must be one of {_SUPPORTED_PARTITIONS}")
     if float(eps) != _EPS:
