@@ -43,10 +43,9 @@ belongs to the caller).  ``prefix`` (and ``blocks`` when a snapshot is written)
 are mutated in place on every launch, as in the model.
 """
 
+import functools
 from dataclasses import dataclass, field
 from typing import Any, Callable, NamedTuple, Optional
-
-import functools
 
 import torch
 import tvm_ffi
@@ -104,7 +103,9 @@ _SM103_K1_NC2_M = frozenset({256})
 _SM103_K5_NC4_DEPTH_M = {4096: 3}
 # Cells (M, K) that run three sources per chunk with a depth-3 pipeline.
 _NC3_D3_CELLS = {
-    "sm_100a": frozenset({(2048, 4), (4096, 4), (8192, 4), (16384, 4), (4096, 3), (4096, 5)}),
+    "sm_100a": frozenset(
+        {(2048, 4), (4096, 4), (8192, 4), (16384, 4), (4096, 3), (4096, 5)}
+    ),
     "sm_103a": frozenset({(1024, 4), (2048, 4), (4096, 4)}),
 }
 # sm_100a dense cells that hold the consumed-stage release through the output stats.
@@ -151,7 +152,10 @@ _NATIVE_ROUTES = (
     ),
     (
         "k8",
-        {"sm_100a": frozenset({1, 2, 4, 8, 32, 256}), "sm_103a": frozenset({1, 8, 256})},
+        {
+            "sm_100a": frozenset({1, 2, 4, 8, 32, 256}),
+            "sm_103a": frozenset({1, 8, 256}),
+        },
         8,
         (False, True),
         "native_all_reader_nofence_before_wait_st",
