@@ -116,6 +116,18 @@ logp = chunked_lm_head_logprob(X, W, labels, chunk_size=4096)   # differentiable
   bitwise the previous path's, and `0` restores that path.  The prepared runner
   keeps its compact `dx_out` contract (`runner.scatter` restores `[T, H]`) and
   gains the kernel slab reduction only.
+* dW side stream (`FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM`: `auto` (default) =
+  calls of three or more chunks, `1` = every multi-chunk call, `0` = never):
+  each chunk's weight-gradient accumulate GEMM is launched on a per-device side
+  stream forked after the chunk's `row_grad` (`dz` ready) and joined before the
+  next chunk reuses the chunk buffer and before the call returns, so its CTAs
+  fill the tail wave of the chunk's `dX` GEMM instead of queueing behind it.
+  Kernels, buffers, launch order per kernel and numerics are unchanged: `loss`,
+  `logp`, `dX` and `dW` are bitwise the single-stream path's.  Two-chunk calls
+  pay the cross-stream join without an overlap gain and a one-chunk call
+  defers its only accumulate to the backward, hence the `auto` rule
+  (`cake_backend.dw_side_stream`).  The prepared runner follows the same rule
+  (a CUDA graph captured from it records the fork / join).
 * Memory rule: no logits, probability or `dlogits` buffer ever spans more than
   `chunk_size` tokens; a batch smaller than `chunk_size` is one chunk, a tail
   `T % chunk_size` is neither dropped nor padded, and `T == 0` returns loss 0,

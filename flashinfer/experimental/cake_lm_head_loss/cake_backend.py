@@ -75,6 +75,18 @@ Contract
   the inclusive int32 scan of the valid-row mask) instead of the flat cast, the
   zero fill and the ``index_copy_``.  The same FP32 operations in the same
   order: ``dX`` is bitwise the previous path's (``0`` restores that path).
+* dW side stream (``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM``: ``auto`` (default)
+  = calls of three or more chunks, ``1`` = every multi-chunk call, ``0`` =
+  never): each chunk's weight-gradient accumulate GEMM is launched on a
+  per-device side stream forked after the chunk's ``row_grad`` (``dz`` ready)
+  and joined before the next chunk reuses the chunk buffer and before the call
+  returns, so its CTAs fill the tail wave of the chunk's dX GEMM instead of
+  queueing behind it.  Kernels, buffers, launch order per kernel and numerics
+  are unchanged (the dX GEMM writes the dX rows / slabs, the accumulate reads
+  the same ``dz`` and read-modify-writes ``dW_acc``): ``loss`` / ``logp`` /
+  ``dX`` / ``dW`` are bitwise the single-stream path's.  Two-chunk calls pay
+  the join without an overlap gain and a one-chunk call defers its only
+  accumulate to the backward, hence the ``auto`` rule (:func:`dw_side_stream`).
 * ``deterministic=True`` (the only mode this backend serves): fixed sequential
   chunk order, no atomics -- bitwise reproducible ``loss``, ``logp``, ``dX``
   and ``dW`` across runs.
@@ -103,6 +115,7 @@ launching anything.
 from __future__ import annotations
 
 import ast
+import contextlib
 import functools
 import json
 import math
@@ -1028,6 +1041,60 @@ def dx_finalize_default() -> bool:
 
 def _resolve_dx_finalize(dx_finalize) -> bool:
     return dx_finalize_default() if dx_finalize is None else bool(dx_finalize)
+
+
+DW_STREAM_ENV = "FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM"  # "0" never, "1" every multi-chunk call, "auto" (default)
+DW_STREAM_MIN_CHUNKS = 3  # the side stream pays one cross-stream join per chunk and overlaps only the chunks before a deferred last one
+_DW_STREAMS: dict[
+    int, tuple
+] = {}  # device index -> (side stream, fork event); not a tensor, outside every workspace / binding
+
+
+def dw_stream_mode() -> str:
+    """``$FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM`` as ``"0"`` (never), ``"1"`` (every multi-chunk call) or ``"auto"``
+    (the default: calls of at least :data:`DW_STREAM_MIN_CHUNKS` chunks, :func:`dw_side_stream`)."""
+    value = os.environ.get(DW_STREAM_ENV, "auto").strip().lower()
+    if value in ("0", "false", "off", "no"):
+        return "0"
+    if value in ("1", "true", "on", "yes"):
+        return "1"
+    return "auto"
+
+
+def dw_side_stream(num_chunks: int) -> bool:
+    """Whether a call of ``num_chunks`` chunks launches each chunk's weight-gradient accumulate GEMM on the per-device
+    side stream: forked right after the chunk's ``row_grad`` (``dz`` is ready; the accumulate depends on it alone, not
+    on the dX GEMM launched next) and joined before the next chunk touches the chunk buffer and before the call returns,
+    so the accumulate's CTAs fill the tail wave of the chunk's dX GEMM instead of queueing behind it (GLM-class 4096-row
+    chunks: 768 dX work items on 76 CTA pairs = 11 waves at 0.919 fill).  Measured on the same device in one process
+    (ratio of the step's GPU span to the single-stream step): four-chunk calls 0.991 / 0.995 cross-entropy / policy
+    (SM103) and 0.998 / 0.995 (SM100), eight-chunk 2048-row calls 0.996 / 0.993; two-chunk calls pay the join without an
+    overlap gain (0.999 / 1.002) and a one-chunk call defers its only accumulate to the backward -- hence the ``auto``
+    rule of :data:`DW_STREAM_MIN_CHUNKS` chunks.  Kernels, buffers, launch order per kernel and numerics are unchanged
+    (the dX GEMM writes the dX rows / slabs, the accumulate reads the same ``dz`` and read-modify-writes ``dW_acc``;
+    each kernel keeps its own order): only the launch stream differs, so every output is bitwise the single-stream
+    path's.  The per-device stream and fork event are shared by the calls on that device (one call at a time per
+    device, as the generated launches themselves)."""
+    n = int(num_chunks)
+    if n <= 1:
+        return False
+    mode = dw_stream_mode()
+    if mode == "0":
+        return False
+    if mode == "1":
+        return True
+    return n >= DW_STREAM_MIN_CHUNKS
+
+
+def _dw_stream(index: int) -> tuple:
+    """``(side stream, fork event)`` of device ``index`` (created on first use; never part of a binding or a workspace)."""
+    pair = _DW_STREAMS.get(index)
+    if pair is None:
+        pair = _DW_STREAMS[index] = (
+            torch.cuda.Stream(device=index),
+            torch.cuda.Event(),
+        )
+    return pair
 
 
 def valid_rows(
@@ -2112,6 +2179,73 @@ def _ffi_stream_context(index: int):
     return tvm_ffi.use_raw_stream(device, raw)
 
 
+def side_stream_schedule(plan: Plan, keys: tuple) -> Optional[tuple]:
+    """Side-stream placement of :func:`dw_side_stream` over a launch-key sequence: ``None`` when the plan has no ``dW``,
+    too few chunks for the rule, or the sequence has no per-chunk accumulate (the loss entry's cast keys); else the
+    positions ``(joins, forks, sides)`` -- the first key of every chunk after the first and the first key after the last
+    chunk's keys (the caller's stream waits for the side stream: the chunk buffer is about to be reused / read), each
+    chunk's ``row_grad`` key (the fork event is recorded after it) and the per-chunk ``dW`` accumulate keys (launched
+    on the side stream after it waited for the fork).  A deferred last chunk's cast GEMM and the flat casts stay on
+    the caller's stream; the sequence always ends with a join."""
+    if not (plan.need_dw and dw_side_stream(plan.num_chunks)):
+        return None
+    chunk_keys = [
+        (pos, stage, index)
+        for pos, (stage, index) in enumerate(keys)
+        if isinstance(index, int) and not isinstance(index, bool)
+    ]
+    sides = frozenset(
+        pos for pos, stage, index in chunk_keys if stage == plan.dw_acc_stage(index)
+    )
+    if not sides:
+        return None
+    joins, forks, seen = set(), set(), set()
+    for pos, stage, index in chunk_keys:
+        if index not in seen:
+            seen.add(index)
+            if index > 0:
+                joins.add(pos)
+        if stage == "row_grad":
+            forks.add(pos)
+    after = chunk_keys[-1][0] + 1
+    if after < len(keys):
+        joins.add(after)
+    return frozenset(joins), frozenset(forks), sides
+
+
+def _run_keys(
+    plan: Plan, device_index: int, keys: tuple, run_key: Callable[[Any], None]
+) -> None:
+    """Run the launch keys in order on the caller's stream; with the placement of :func:`side_stream_schedule` the
+    per-chunk ``dW`` accumulates go to the side stream.  The generated launches take tvm-ffi's environment stream, so a
+    side launch enters its own stream context and the caller's context is re-entered afterwards (no nesting)."""
+    schedule = side_stream_schedule(plan, keys)
+    if schedule is None:
+        with _ffi_stream_context(device_index):
+            for key in keys:
+                run_key(key)
+        return
+    joins, forks, sides = schedule
+    side, fork = _dw_stream(device_index)
+    main = torch.cuda.current_stream(device_index)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(_ffi_stream_context(device_index))
+        for pos, key in enumerate(keys):
+            if pos in joins:
+                main.wait_stream(side)
+            if pos in sides:
+                stack.close()
+                side.wait_event(fork)
+                with torch.cuda.stream(side), _ffi_stream_context(device_index):
+                    run_key(key)
+                stack.enter_context(_ffi_stream_context(device_index))
+                continue
+            run_key(key)
+            if pos in forks:
+                fork.record(main)
+    main.wait_stream(side)
+
+
 # ---------------------------------------------------------------------------
 # Host values of the stages
 # ---------------------------------------------------------------------------
@@ -2739,13 +2873,15 @@ class LmHeadLossRunner:
     def _run(self, keys: tuple) -> None:
         if self.backend == "cake":
             self.prepare_tma()
-            with _ffi_stream_context(self.device_index):
-                for key in keys:
-                    host = HOST_STAGES.get(key[0])
-                    if host is not None:
-                        host(self.values[key])
-                    else:
-                        self.launches[key]()
+
+            def run_key(key) -> None:
+                host = HOST_STAGES.get(key[0])
+                if host is not None:
+                    host(self.values[key])
+                else:
+                    self.launches[key]()
+
+            _run_keys(self.plan, self.device_index, keys, run_key)
         else:
             for key in keys:
                 host = HOST_STAGES.get(key[0])
@@ -3407,21 +3543,20 @@ class _Binding:
             t["row_index"] = row_index
 
     def _launch(self, keys: tuple, t: dict[str, Any]) -> None:
-        with _ffi_stream_context(self.device_index):
-            for key in keys:
-                host = HOST_STAGES.get(key[0])
-                if host is not None:
-                    host(stage_values(key[0], t, self.plan, key[1]))
-                    continue
-                launch = self.launches[key]
-                arguments = launch.arguments_for(
-                    stage_values(key[0], t, self.plan, key[1])
-                )
-                if (
-                    launch.prepare is not None
-                ):  # descriptors of a pointer-ABI stage see the fresh tensors
-                    launch.prepare(*arguments)
-                launch.entry(*arguments)
+        def run_key(key) -> None:
+            host = HOST_STAGES.get(key[0])
+            if host is not None:
+                host(stage_values(key[0], t, self.plan, key[1]))
+                return
+            launch = self.launches[key]
+            arguments = launch.arguments_for(stage_values(key[0], t, self.plan, key[1]))
+            if (
+                launch.prepare is not None
+            ):  # descriptors of a pointer-ABI stage see the fresh tensors
+                launch.prepare(*arguments)
+            launch.entry(*arguments)
+
+        _run_keys(self.plan, self.device_index, keys, run_key)
 
     def forward(self, X, W, labels, infer_logp, loss_weights, row_index=None):
         p, plan = self.plan.problem, self.plan

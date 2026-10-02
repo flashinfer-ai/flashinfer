@@ -133,6 +133,14 @@ def chunked_lm_head_loss(
     instead of casting, zero-filling and scattering the compact rows; the same
     FP32 operations in the same order, so ``dX`` is bitwise the same.
 
+    The dW side stream (``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM``: ``auto``
+    (default) for calls of three or more chunks, ``1`` for every multi-chunk
+    call, ``0`` never) launches each chunk's weight-gradient accumulate GEMM on
+    a per-device side stream, forked after the chunk's row gradients and joined
+    before the chunk buffer is reused and before the call returns, so it overlaps
+    the tail of the chunk's ``dX`` GEMM; the same kernels in the same order per
+    kernel, so every output is bitwise the same.
+
     Returns
     -------
     loss : torch.Tensor

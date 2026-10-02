@@ -3333,6 +3333,133 @@ def test_dx_finalize_plan_keys():
         stage_values("scale_cast_scatter_bf16", on.tensors, on.plan, "dx")
 
 
+def test_dw_stream_default_env(monkeypatch):
+    """The dW side-stream knob: unset / ``auto`` = calls of :data:`DW_STREAM_MIN_CHUNKS` (three) or more chunks,
+    ``1`` = every multi-chunk call, ``0`` = never; a one-chunk call never (its only accumulate is deferred to the
+    backward)."""
+    assert cake_backend.DW_STREAM_MIN_CHUNKS == 3
+    monkeypatch.delenv(cake_backend.DW_STREAM_ENV, raising=False)
+    assert cake_backend.dw_stream_mode() == "auto"
+    assert [cake_backend.dw_side_stream(n) for n in (0, 1, 2, 3, 4, 8)] == [
+        False,
+        False,
+        False,
+        True,
+        True,
+        True,
+    ]
+    for value in ("0", "false", "off", "no", " OFF "):
+        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, value)
+        assert cake_backend.dw_stream_mode() == "0"
+        assert not any(cake_backend.dw_side_stream(n) for n in (1, 2, 3, 8))
+    for value in ("1", "true", "on", "yes", " On "):
+        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, value)
+        assert cake_backend.dw_stream_mode() == "1"
+        assert [cake_backend.dw_side_stream(n) for n in (1, 2, 3)] == [
+            False,
+            True,
+            True,
+        ]
+    for value in ("auto", "AUTO", "", "anything-else"):
+        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, value)
+        assert cake_backend.dw_stream_mode() == "auto"
+        assert [cake_backend.dw_side_stream(n) for n in (2, 3)] == [False, True]
+
+
+def test_dw_stream_schedule_keys(monkeypatch):
+    """The side-stream placement over the launch keys: joins at the first key of every chunk after the first and
+    before the keys that follow the chunk loop, forks at each chunk's ``row_grad``, sides at the per-chunk
+    accumulates only -- a deferred last chunk's cast GEMM and the flat casts stay on the caller's stream; ``None``
+    for the loss entry's cast keys, for a plan without ``dW`` and whenever the rule says no.  The reference runner
+    takes no part (host operators on one stream)."""
+    g = Geometry.from_record({"geometry": {"hidden": 6144, "vocab": 154880}})
+
+    def plan_for(T, *, entry="loss", fuse=True, need_dw=True):
+        return cake_backend.make_plan(
+            _problem(T, 6144, 154880, 4096, entry=entry),
+            need_dx=True,
+            need_dw=need_dw,
+            geometry=g,
+            dx_max_slices=4,
+            num_sms=148,
+            dx_resident=74,
+            fuse_dw_cast=fuse,
+            arch="sm_100a",
+            dx_finalize=True,
+        )
+
+    def first_keys(keys):
+        first = {}
+        for pos, (_, index) in enumerate(keys):
+            if isinstance(index, int):
+                first.setdefault(index, pos)
+        return first
+
+    monkeypatch.delenv(cake_backend.DW_STREAM_ENV, raising=False)
+    three = plan_for(
+        10000
+    )  # chunks (0, 4096), (4096, 4096), (8192, 1808); the last deferred
+    assert three.num_chunks == 3 and three.dw_deferred
+    fwd = cake_backend.forward_keys(three)
+    joins, forks, sides = cake_backend.side_stream_schedule(three, fwd)
+    first = first_keys(fwd)
+    assert joins == frozenset({first[1], first[2]})
+    assert forks == frozenset(p for p, (s, _) in enumerate(fwd) if s == "row_grad")
+    assert len(forks) == 3
+    assert sides == frozenset(
+        p for p, (s, i) in enumerate(fwd) if i in (0, 1) and s == three.dw_acc_stage(i)
+    )
+    assert len(sides) == 2 and all(p > min(forks) for p in sides)
+    assert (three.dw_cast_stage, 2) in cake_backend.cast_keys(three)
+    assert (
+        cake_backend.side_stream_schedule(three, cake_backend.cast_keys(three)) is None
+    )
+    unfused = plan_for(10000, fuse=False)
+    fwd_u = cake_backend.forward_keys(unfused)
+    joins_u, _, sides_u = cake_backend.side_stream_schedule(unfused, fwd_u)
+    assert len(sides_u) == 3 and max(sides_u) == len(fwd_u) - 1
+    assert joins_u == frozenset(first_keys(fwd_u)[i] for i in (1, 2))
+    lp = plan_for(10000, entry="logprob")
+    bwd = cake_backend.recompute_keys(lp) + cake_backend.cast_keys(lp)
+    joins_l, forks_l, sides_l = cake_backend.side_stream_schedule(lp, bwd)
+    last_chunk_key = max(p for p, (_, i) in enumerate(bwd) if isinstance(i, int))
+    assert len(sides_l) == 2 and len(forks_l) == 3
+    assert last_chunk_key + 1 < len(bwd) and last_chunk_key + 1 in joins_l
+    assert bwd[last_chunk_key] == (lp.dw_cast_stage, 2)
+    assert first_keys(bwd)[2] in joins_l and first_keys(bwd)[2] < last_chunk_key
+    no_dw = plan_for(10000, need_dw=False)
+    assert (
+        cake_backend.side_stream_schedule(no_dw, cake_backend.forward_keys(no_dw))
+        is None
+    )
+    two = plan_for(4097)
+    assert two.num_chunks == 2
+    assert (
+        cake_backend.side_stream_schedule(two, cake_backend.forward_keys(two)) is None
+    )
+    monkeypatch.setenv(cake_backend.DW_STREAM_ENV, "1")
+    _, forks_2, sides_2 = cake_backend.side_stream_schedule(
+        two, cake_backend.forward_keys(two)
+    )
+    assert len(sides_2) == 1 and len(forks_2) == 2
+    monkeypatch.setenv(cake_backend.DW_STREAM_ENV, "0")
+    assert cake_backend.side_stream_schedule(three, fwd) is None
+    inp = _host_inputs(37)
+    common = dict(
+        objective="ce", loss_div=inp.loss_div, chunk_size=16, backend="reference"
+    )
+    results = []
+    for value in ("0", "1"):
+        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, value)
+        runner = prepare_lm_head_loss(inp.X, inp.W, inp.labels, **common)
+        runner.step(torch.tensor(3.0))
+        results.append(
+            (runner.loss.clone(), runner.dx_out.clone(), runner.dw_out.clone())
+        )
+    for a, b in zip(results[0], results[1], strict=True):
+        assert torch.equal(a, b)
+
+
 def test_memory_report_fused_dw_cast():
     V, H, C = DEFAULT_V, DEFAULT_H, 4096
     four = memory_report(16231, H, V, C, fuse_dw_cast=True)
@@ -4399,6 +4526,84 @@ def test_device_compaction_parity(glm_weight):
         lp_c["dX"][~inp.valid] == 0
     )
     assert rel_l2(lp_c["dW"].float(), lp_p["dW"].float()) <= GATE_TINY["dW_rel_l2"]
+
+
+def test_device_dw_stream_switch_is_bitwise(glm_weight, monkeypatch):
+    """The dW side stream (``FLASHINFER_CAKE_LM_HEAD_LOSS_DW_STREAM``) off, forced on and at the ``auto`` rule,
+    through the autograd entry points and a prepared runner: ``loss`` / ``logp`` / ``dX`` / ``dW`` bitwise for both
+    entries (only the launch stream of the per-chunk accumulate differs); the launches of a call with the side stream
+    enter exactly two streams, those of a single-stream call one; the remembered binding serves every mode."""
+    _require_program(entry="loss")
+    streams: list[int] = []
+    real = cake_backend._ffi_stream_context
+
+    def spy(index):
+        streams.append(torch.cuda.current_stream(index).cuda_stream)
+        return real(index)
+
+    monkeypatch.setattr(cake_backend, "_ffi_stream_context", spy)
+    two = _device_inputs(
+        5000, "policy", W=glm_weight
+    )  # 4750 valid rows = two compact chunks: auto = off
+    three = _device_inputs(
+        8700, W=glm_weight
+    )  # 8265 valid rows = three chunks: auto = on
+    assert int(two.valid.sum()) == 4750 and int(three.valid.sum()) == 8265
+    out = {}
+    for name, inp, env, expect in (
+        ("two_off", two, "0", 1),
+        ("two_on", two, "1", 2),
+        ("two_auto", two, "auto", 1),
+        ("three_off", three, "0", 1),
+        ("three_auto", three, "auto", 2),
+    ):
+        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, env)
+        streams.clear()
+        res = _run(inp, 4096, backend="cake", compact_rows=True)
+        assert len(set(streams)) == expect, (name, len(set(streams)))
+        streams.clear()
+        lp = _run(inp, 4096, entry="logprob", backend="cake", compact_rows=True)
+        assert len(set(streams)) == expect, (name, "logprob", len(set(streams)))
+        _check_dtypes(res, inp)
+        out[name] = (res, lp)
+    for on, off in (
+        ("two_on", "two_off"),
+        ("two_auto", "two_off"),
+        ("three_auto", "three_off"),
+    ):
+        for which in (0, 1):
+            for key in ("loss", "logp", "dX", "dW"):
+                assert torch.equal(out[on][which][key], out[off][which][key]), (
+                    on,
+                    which,
+                    key,
+                )
+    kw = dict(
+        objective="ce",
+        loss_div=three.loss_div,
+        chunk_size=4096,
+        backend="cake",
+        compact_rows=True,
+    )
+    runner = prepare_lm_head_loss(three.X, three.W, three.labels, **kw)
+    assert runner.plan.num_chunks == 3
+    steps = {}
+    for env, expect in (("0", 1), ("auto", 2), ("1", 2)):
+        monkeypatch.setenv(cake_backend.DW_STREAM_ENV, env)
+        streams.clear()
+        runner.step()
+        torch.cuda.synchronize()
+        assert len(set(streams)) == expect, ("runner", env, len(set(streams)))
+        steps[env] = (
+            runner.loss.clone(),
+            runner.logp.clone(),
+            runner.dx_out.clone(),
+            runner.dw_out.clone(),
+        )
+    for env in ("auto", "1"):
+        for a, b in zip(steps[env], steps["0"], strict=True):
+            assert torch.equal(a, b)
+    assert torch.equal(runner.scatter(steps["auto"][2]), out["three_off"][0]["dX"])
 
 
 _FRESH_PROCESS_SCRIPT = """
