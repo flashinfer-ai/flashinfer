@@ -2655,7 +2655,7 @@ def test_attention_ts_context_d128_paged_clc_task_graph_is_safe(
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        _, _, _, _, work_queue, clc_response_alloc = build_fmha_task_manager(
+        _, _, _, _, _, work_queue, clc_response_alloc = build_fmha_task_manager(
             cfg,
             tile_sched_params=None,
             tma_q_desc=None,
@@ -2713,24 +2713,26 @@ def test_attention_ts_context_d256_live_paged_clc_uses_distinct_auxiliary_warps(
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        task_manager, _, _, _, work_queue, clc_response_alloc = build_fmha_task_manager(
-            cfg,
-            tile_sched_params=None,
-            tma_q_desc=None,
-            tma_k_desc=None,
-            tma_v_desc=None,
-            tma_o_desc=None,
-            cum_seqlen_q=None,
-            cum_seqlen_k=None,
-            num_kv_tiles=2,
-            q_offset=128,
-            g_block_tables=None,
-            block_table_row_stride=0,
-            g_seq_lens_kv=None,
-            max_seq_len_kv=256,
-            is_persistent=True,
-            is_clc_dynamic=True,
-            exhaustive_deadlock_race_check=True,
+        task_manager, _, _, _, _, work_queue, clc_response_alloc = (
+            build_fmha_task_manager(
+                cfg,
+                tile_sched_params=None,
+                tma_q_desc=None,
+                tma_k_desc=None,
+                tma_v_desc=None,
+                tma_o_desc=None,
+                cum_seqlen_q=None,
+                cum_seqlen_k=None,
+                num_kv_tiles=2,
+                q_offset=128,
+                g_block_tables=None,
+                block_table_row_stride=0,
+                g_seq_lens_kv=None,
+                max_seq_len_kv=256,
+                is_persistent=True,
+                is_clc_dynamic=True,
+                exhaustive_deadlock_race_check=True,
+            )
         )
 
     tasks = {task.name: task for task in task_manager.tasks}
@@ -2798,24 +2800,26 @@ def test_attention_ts_context_d256_uniform_paged_static_scheduler_is_safe(
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        task_manager, _, _, _, work_queue, clc_response_alloc = build_fmha_task_manager(
-            cfg,
-            tile_sched_params=None,
-            tma_q_desc=None,
-            tma_k_desc=None,
-            tma_v_desc=None,
-            tma_o_desc=None,
-            cum_seqlen_q=None,
-            cum_seqlen_k=None,
-            num_kv_tiles=2,
-            q_offset=128 if has_q_offset else 0,
-            g_block_tables=None,
-            block_table_row_stride=0,
-            g_seq_lens_kv=None,
-            max_seq_len_kv=256,
-            is_persistent=True,
-            is_clc_dynamic=False,
-            exhaustive_deadlock_race_check=True,
+        task_manager, _, _, _, _, work_queue, clc_response_alloc = (
+            build_fmha_task_manager(
+                cfg,
+                tile_sched_params=None,
+                tma_q_desc=None,
+                tma_k_desc=None,
+                tma_v_desc=None,
+                tma_o_desc=None,
+                cum_seqlen_q=None,
+                cum_seqlen_k=None,
+                num_kv_tiles=2,
+                q_offset=128 if has_q_offset else 0,
+                g_block_tables=None,
+                block_table_row_stride=0,
+                g_seq_lens_kv=None,
+                max_seq_len_kv=256,
+                is_persistent=True,
+                is_clc_dynamic=False,
+                exhaustive_deadlock_race_check=True,
+            )
         )
 
     tasks = {task.name: task for task in task_manager.tasks}
