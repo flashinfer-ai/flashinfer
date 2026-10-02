@@ -1420,10 +1420,14 @@
             "dispatch_band": {
               "band": {
                 "chunk_tokens": 256,
-                "long_tile_blocks": 24,
+                "long_tile_blocks": 18,
+                "long_tile_blocks_by_arch": {
+                  "sm_100a": 18,
+                  "sm_103a": 17
+                },
                 "min_items": 160,
                 "two_wave_min_items": {
-                  "sm_100a": 384,
+                  "sm_100a": 160,
                   "sm_103a": 160
                 },
                 "two_wave_min_items_default": 160
@@ -1436,7 +1440,7 @@
                 "q_heads_per_kv_head": 8,
                 "q_tiles": 1
               },
-              "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items and (waves >= 3 or items >= two_wave_min_items[arch]))",
+              "decision": "blocks_per_cta >= long_tile_blocks_by_arch.get(arch, long_tile_blocks) or (waves >= 2 and items >= min_items and (waves >= 3 or items >= two_wave_min_items.get(arch, two_wave_min_items_default)))",
               "family": "dcp_spec_bf16_fp8_balanced",
               "incumbent_family": "dcp_spec_bf16_fp8",
               "incumbent_shape": {
@@ -1586,7 +1590,13 @@
               "band": {
                 "chunk_tokens": 256,
                 "long_tile_blocks": 96,
-                "min_items": 160
+                "min_items": 160,
+                "one_wave_long_tile_blocks": 22,
+                "one_wave_long_tile_blocks_by_arch": {
+                  "sm_100a": 22,
+                  "sm_103a": 22
+                },
+                "one_wave_min_q_len": 3
               },
               "contract": {
                 "head_dim": 256,
@@ -1597,7 +1607,7 @@
                 "q_heads_per_kv_head": 16,
                 "q_tiles": "ceil(q_len / q_box_rows)"
               },
-              "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items)",
+              "decision": "blocks_per_cta >= long_tile_blocks or (waves >= 2 and items >= min_items) or (waves < 2 and q_len >= one_wave_min_q_len and blocks_per_cta >= one_wave_long_tile_blocks_by_arch.get(arch, one_wave_long_tile_blocks))",
               "family": "dcp_spec_bf16_fp8_d256_balanced",
               "incumbent_family": "cake_fmha_dcp_spec_bf16_fp8_d256 (static split family, carried downstream in csrc/dcp)",
               "incumbent_shape": {
