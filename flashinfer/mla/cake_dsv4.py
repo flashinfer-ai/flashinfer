@@ -41,20 +41,33 @@ Host contract (flashinfer#4671 hardening)
   (:func:`cake_dsv4_workspace_reset`, or the first eager call does it for that
   tensor) and the kernels self-reset.
 * **Descriptor storage.** The SM103 bindings that read their TMA descriptors
-  from device memory take a private, host-retained 1 KiB tensor per launch and
-  write the descriptors of the call into it when they differ from what it
-  holds, in stream order and never inside CUDA Graph capture. The host keeps a
-  bounded pool of such tensors per (variant, device)
-  (:func:`_descriptor_storage`, :data:`_DESCRIPTOR_POOL_CAPACITY` for eager
-  launches): a call whose TMA source geometry (pointer, shape, strides, dtype
-  of ``Q`` and the KV caches) was seen recently reuses its storage without a
-  write, a new geometry takes a free or the least recently used storage, and a
-  geometry launched under graph capture keeps its storage for the process
-  lifetime so replays read what they captured. A capture that reaches a
-  geometry not launched eagerly before raises. Successive calls through one
-  workspace (the layers of a model) therefore do not collide, and a stream of
-  fresh query tensors does not grow memory without bound. Nothing else
-  allocates device memory.
+  from device memory (``tma_workspace_bytes`` in their registration; the SM100
+  twins pass descriptors by value and use none of this) take a private,
+  host-retained 1 KiB tensor per launch and write the descriptors of the call
+  into it when they differ from what it holds, in stream order and never
+  inside CUDA Graph capture. The host keeps a pool of such tensors per
+  (variant, device) (:func:`_descriptor_storage`) keyed by the *descriptor
+  set* = the TMA source geometry (pointer, shape, strides, dtype of ``Q`` and
+  the KV caches). Rules:
+
+  1. A set launched eagerly becomes a *live* entry; at most
+     :data:`_DESCRIPTOR_POOL_CAPACITY` live entries exist per pool, and a new
+     set beyond that takes the least recently used live entry's storage (the
+     binding rewrites it before the launch). A live hit does no device write.
+  2. A set launched under graph capture must be live at that moment (prepare
+     it with one eager call on the same tensors); it then becomes a *captured*
+     entry, which is never evicted or reassigned for the process lifetime
+     because its graph may replay at any time. Eviction applies to live
+     entries only.
+  3. A set that is not live when a capture reaches it raises before any
+     allocation or binding call.
+  4. One lock covers the pool bookkeeping, the bindings' descriptor checks
+     and the launch enqueues of a call; a launch on another stream than the
+     storage's last reader waits for that stream first.
+
+  Successive calls through one workspace (the layers of a model) therefore do
+  not collide, and a stream of fresh query tensors does not grow memory
+  without bound. Nothing else allocates device memory.
 """
 
 from __future__ import annotations
