@@ -188,6 +188,12 @@ def _validate(
                 "the Cake backend requires exact K=8192 and an N supported by "
                 f"world_size={world_size}: {list(allowed)}"
             )
+    # The kernels index the gathered [world_size * M, N] output with 32-bit
+    # arithmetic; reject outputs that reach the signed 32-bit element limit.
+    if world_size * rows * n >= 2**31:
+        raise ValueError(
+            "world_size * inp.shape[0] * w.shape[1] must be below 2**31 elements"
+        )
     if str(symm_mem.get_backend(inp.device)).upper() != "NVSHMEM":
         raise ValueError(
             "the Cake backend requires the NVSHMEM symmetric-memory backend"
