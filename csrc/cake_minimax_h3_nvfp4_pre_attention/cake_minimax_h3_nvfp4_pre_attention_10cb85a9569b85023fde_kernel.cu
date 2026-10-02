@@ -26,12 +26,9 @@ typedef unsigned long      uint64_t;
 static_assert(sizeof(uint64_t) == 8, "Cake requires an LP64 CUDA host ABI");
 typedef signed int         int32_t;
 typedef short int          int16_t;
-struct __align__(128) CakeTensorMap { uint64_t opaque[16]; };
 struct __align__(64) CakeTensorMap64 { uint64_t opaque[16]; };
 static_assert(sizeof(CakeTensorMap64) == 128, "64-aligned tensor-map ABI size");
 static_assert(alignof(CakeTensorMap64) == 64, "64-aligned tensor-map ABI alignment");
-template <int N>
-struct __align__(128) CakeTensorMapPack { CakeTensorMap maps[N]; };
 
 #if defined(__CUDACC_RTC__)
 typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
@@ -40,7 +37,6 @@ typedef struct __align__(128) { uint64_t opaque[16]; } CUtensorMap;
 #endif
 
 static_assert(sizeof(CUtensorMap) == 128, "CUtensorMap CUDA ABI must be 128 bytes");
-static_assert(alignof(CakeTensorMap) >= alignof(CUtensorMap), "CakeTensorMap alignment must cover the CUtensorMap CUDA ABI");
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 
@@ -195,52 +191,6 @@ __device__ __forceinline__ void mbarrier_init(int mbar_addr, int count) {
         :: "r"(mbar_addr), "r"(count) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_init_generic(void* mbar_addr, int count) {
-    asm volatile("mbarrier.init.b64 [%0], %1;"
-        :: "l"(mbar_addr), "r"(count));
-}
-
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_plain(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64 P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
-
-__device__ __forceinline__ uint32_t mbarrier_try_wait_cluster(int mbar_addr, int phase) {
-    uint32_t token;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%1], %2;\n\t"
-        "selp.u32 %0, 1, 0, P1;\n\t"
-        "}\n"
-        : "=r"(token)
-        : "r"(mbar_addr), "r"(phase) : "memory");
-    return token;
-}
 
 
 // CTA-local pipelines have short, resident producer/consumer edges.  Omitting
@@ -260,88 +210,6 @@ __device__ __forceinline__ void mbarrier_wait(int mbar_addr, int phase) {
         :: "r"(mbar_addr), "r"(phase) : "memory");
 }
 
-// Source-faithful relaxed CTA wait used only by a typed protocol that does
-// not attach the PTX acquire qualifier, such as FA4's interior P-ready edge.
-__device__ __forceinline__ void mbarrier_wait_relaxed(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, 10000000;\n\t"
-        "@P1 bra.uni DONE_RELAXED;\n\t"
-        "bra.uni LAB_WAIT_RELAXED;\n\t"
-        "DONE_RELAXED:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-// Exact source ports may request the PTX suspendTimeHint operand explicitly.
-// The hint is expressed in nanoseconds and is kept separate from the canonical
-// no-hint CTA helper so unrelated schedules retain their existing retry path.
-__device__ __forceinline__ void mbarrier_wait_suspend(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_SUSPEND:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra.uni DONE_SUSPEND;\n\t"
-        "bra.uni LAB_WAIT_SUSPEND;\n\t"
-        "DONE_SUSPEND:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_cluster(int mbar_addr, int phase) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_CLUSTER:\n\t"
-        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64"
-        " P1, [%0], %1;\n\t"
-        "@P1 bra.uni DONE_CLUSTER;\n\t"
-        "bra.uni LAB_WAIT_CLUSTER;\n\t"
-        "DONE_CLUSTER:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase) : "memory");
-}
-
-__device__ __forceinline__ void mbarrier_wait_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        ".reg .u32 WAIT_ADDR;\n\t"
-        "mov.u32 WAIT_ADDR, %0;\n\t"
-        "LAB_WAIT_HINT:\n\t"
-        "mbarrier.try_wait.parity.acquire.cta.shared::cta.b64"
-        " P1, [WAIT_ADDR], %1, %2;\n\t"
-        "@P1 bra.uni DONE_HINT;\n\t"
-        "bra.uni LAB_WAIT_HINT;\n\t"
-        "DONE_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
-}
-
-// Exact unqualified CTA wait used by source schedules whose PTX intentionally
-// omits the acquire qualifier while retaining a typed suspendTimeHint operand.
-__device__ __forceinline__ void mbarrier_wait_relaxed_hint(
-        int mbar_addr, int phase, uint32_t suspend_time_hint) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred P1;\n\t"
-        "LAB_WAIT_RELAXED_HINT:\n\t"
-        "mbarrier.try_wait.parity.shared::cta.b64"
-        " P1, [%0], %1, %2;\n\t"
-        "@P1 bra DONE_RELAXED_HINT;\n\t"
-        "bra LAB_WAIT_RELAXED_HINT;\n\t"
-        "DONE_RELAXED_HINT:\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint));
-}
-
 __device__ __forceinline__ void mbarrier_wait_cluster_hint(
         int mbar_addr, int phase, uint32_t suspend_time_hint) {
     asm volatile(
@@ -357,54 +225,6 @@ __device__ __forceinline__ void mbarrier_wait_cluster_hint(
         :: "r"(mbar_addr), "r"(phase), "r"(suspend_time_hint) : "memory");
 }
 
-__device__ __forceinline__ void mbarrier_wait_token(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_suspend(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_suspend(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster(int mbar_addr, int phase, uint32_t token) {
-    if (token == 0) {
-        mbarrier_wait_cluster(mbar_addr, phase);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-__device__ __forceinline__ void mbarrier_wait_token_cluster_hint(
-        int mbar_addr, int phase, uint32_t token, uint32_t suspend_time_hint) {
-    if (token == 0) {
-        mbarrier_wait_cluster_hint(mbar_addr, phase, suspend_time_hint);
-    }
-}
-
-
-__device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs_cta2(
-    int taddr, uint64_t a_desc, uint64_t b_desc, uint32_t i_desc,
-    int sfa_taddr, int sfb_taddr, int enable_input_d) {
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %6, 0;\n\t"
-        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X"
-        " [%0], %1, %2, %3, [%4], [%5], p;\n\t"
-        "}\n"
-        :: "r"(taddr), "l"(a_desc), "l"(b_desc),
-           "r"(i_desc), "r"(sfa_taddr), "r"(sfb_taddr),
-           "r"(enable_input_d));
-}
 
 
 __device__ __forceinline__ void tcgen05_mma_mxf4nvf4_bs_block16_k96_cta2(
@@ -433,13 +253,6 @@ union MmaSmemDesc {
     uint32_t u32[2];
 };
 
-__device__ __forceinline__ void incr_smem_desc_lo(uint64_t& smem_desc, uint32_t offset) {
-    MmaSmemDesc tmp;
-    tmp.u64 = smem_desc;
-    tmp.u32[0] += offset;
-    smem_desc = tmp.u64;
-}
-
 
 __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
     asm volatile(
@@ -453,37 +266,6 @@ __device__ __forceinline__ void elect_commit_cg2_multicast(int mbar_addr, uint16
 }
 
 
-__device__ __forceinline__ void mbarrier_arrive(int mbar_addr) {
-    asm volatile(
-        "mbarrier.arrive.release.cta.shared::cta.b64 _, [%0];"
-        :: "r"(mbar_addr) : "memory");
-}
-
-
-__device__ __forceinline__ void mbarrier_arrive_expect_tx(int mbar_addr, uint32_t bytes) {
-    asm volatile(
-        "mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 _, [%0], %1;"
-        :: "r"(mbar_addr), "r"(bytes) : "memory");
-}
-
-
-__device__ __forceinline__ uint32_t smem_addr(const void* ptr) {
-    uint32_t addr;
-    asm("{\n\t"
-        ".reg .u64 u64addr;\n\t"
-        "cvta.to.shared.u64 u64addr, %1;\n\t"
-        "cvt.u32.u64 %0, u64addr;\n\t"
-        "}\n" : "=r"(addr) : "l"(ptr));
-    return addr;
-}
-
-
-__device__ __forceinline__ uint32_t mapa_to_rank(uint32_t local_addr, uint32_t rank) {
-    uint32_t remote;
-    asm volatile("mapa.shared::cluster.u32 %0, %1, %2;"
-        : "=r"(remote) : "r"(local_addr), "r"(rank));
-    return remote;
-}
 
 
 __device__ __forceinline__ float approx_rcp(float x) {
@@ -500,49 +282,10 @@ __device__ __forceinline__ float max_noftz(float a, float b) {
 }
 
 
-__device__ __forceinline__ float warp_reduce_max(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val = max_noftz(val, __shfl_xor_sync(0xFFFFFFFF, val, offset));
-    return val;
-}
 
 
-__device__ __forceinline__ float warp_reduce_sum(float val) {
-    #pragma unroll
-    for (int offset = 16; offset > 0; offset >>= 1)
-        val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
-    return val;
-}
 
 
-__device__ __forceinline__ float row_max_reduce(float2 acc) {
-    return max_noftz(acc.x, acc.y);
-}
-
-
-__device__ __forceinline__ void row_max_x32_accum(const float* sv, float2& acc) {
-    #pragma unroll
-    for (int j = 0; j < 16; j++) {
-        if (j % 2 == 0)
-            acc.x = max_noftz(acc.x, max_noftz(sv[j*2], sv[j*2+1]));
-        else
-            acc.y = max_noftz(acc.y, max_noftz(sv[j*2], sv[j*2+1]));
-    }
-}
-
-
-__device__ __forceinline__ void fence_async_shared() {
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-}
-
-
-__device__ __forceinline__ uint64_t make_sf_cp_desc_sbo128(int addr) {
-    const int SBO = 128;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL);
-}
 
 
 __device__ __forceinline__ uint64_t make_sf_cp_desc_lo_sbo128(int lo) {
@@ -561,14 +304,6 @@ __device__ __forceinline__ void tcgen05_cp_32x128b_warpx4_cta2(
 }
 
 
-__device__ __forceinline__ uint64_t make_smem_desc(int addr) {
-    const int SBO = 1024;
-    return desc_encode(addr)
-         | (desc_encode(SBO) << 32ULL)
-         | (1ULL << 46ULL)
-         | (2ULL << 61ULL);
-}
-
 
 __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
     int dst, const void *tmap_ptr, int x, int y, int z, int mbar_addr) {
@@ -581,16 +316,6 @@ __device__ __forceinline__ void tma_3d_gmem2smem_cta2(
 }
 
 
-__device__ __forceinline__ void tma_4d_gmem2smem(
-    int dst, const void *tmap_ptr, int x, int y, int z, int w, int mbar_addr) {
-    asm volatile(
-        "cp.async.bulk.tensor.4d.shared::cta.global"
-        ".mbarrier::complete_tx::bytes"
-        " [%0], [%1, {%2, %3, %4, %5}], [%6];"
-        :: "r"(dst), "l"(tmap_ptr), "r"(x), "r"(y), "r"(z), "r"(w),
-           "r"(mbar_addr) : "memory");
-}
-
 
 __device__ __forceinline__ void tma_store_4d(
     const void *tmap, int x, int y, int z, int w, unsigned smem_addr) {
@@ -600,17 +325,6 @@ __device__ __forceinline__ void tma_store_4d(
         :: "l"(tmap), "r"(x), "r"(y), "r"(z), "r"(w), "r"(smem_addr) : "memory");
 }
 
-
-__device__ __forceinline__ void tcgen05_commit_cg2_multicast(int mbar_addr, uint16_t cta_mask) {
-    asm volatile(
-        "{\n\t"
-        ".reg .b16 lo, hi;\n\t"
-        "mov.b32 {lo, hi}, %1;\n\t"
-        "tcgen05.commit.cta_group::2.mbarrier::arrive::one"
-        ".shared::cluster.multicast::cluster.b64 [%0], lo;\n\t"
-        "}\n"
-        :: "r"(mbar_addr), "r"((uint32_t)cta_mask) : "memory");
-}
 
 
 __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
@@ -625,11 +339,6 @@ __device__ __forceinline__ void tmem_ld_x16(float* dst, int tmem_addr) {
         : "r"(tmem_addr));
 }
 
-
-__device__ __forceinline__ void tmem_ld_x16_wait(float* dst, int addr) {
-    tmem_ld_x16(dst, addr);
-    asm volatile("tcgen05.wait::ld.sync.aligned;");
-}
 
 
 __device__ __forceinline__ unsigned int __as_u32(float v) {
@@ -650,7 +359,7 @@ __device__ __forceinline__ unsigned int __as_u32(int v) {
 extern "C" {
 
 __global__ __launch_bounds__(640, 1) __cluster_dims__(2,1,1) void
-kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap const* A, CakeTensorMap const* B, CakeTensorMap const* SFA, CakeTensorMap const* SFB, float* __restrict__ alpha, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, float* __restrict__ out_global_scale, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, CakeTensorMap const* OUTQ, unsigned int* __restrict__ qkv_words, unsigned int* __restrict__ debug_q_words, unsigned int* __restrict__ debug_k_words, int write_debug, float eps, int M, int m_tiles, int HEADS_PER_DESTINATION, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
+kernel_cake_minimax_h3_nvfp4_pre_attention_10cb85a9569b85023fde(const __grid_constant__ CUtensorMap A, const __grid_constant__ CUtensorMap B, const __grid_constant__ CUtensorMap SFA, const __grid_constant__ CUtensorMap SFB, float* __restrict__ alpha, __nv_bfloat16* __restrict__ q_norm_weight, __nv_bfloat16* __restrict__ k_norm_weight, __nv_bfloat16* __restrict__ rope_cos_sin, float* __restrict__ out_global_scale, uint8_t* __restrict__ out_q, uint8_t* __restrict__ out_sf, const __grid_constant__ CUtensorMap OUTQ, unsigned int* __restrict__ qkv_words, unsigned int* __restrict__ debug_q_words, unsigned int* __restrict__ debug_k_words, int write_debug, float eps, int M, int m_tiles, int HEADS_PER_DESTINATION, int ROWS_PER_DESTINATION, int SCALE_STRIDE)
 {
     const int tid = threadIdx.x;
     const int warp = make_warp_uniform(tid / 32);
@@ -658,7 +367,12 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
 
     extern __shared__ __align__(1024) char smem_raw[];
     int smem;
+#if __CUDA_ARCH__ == 1000
+    asm volatile("{ .reg .u64 smem_ptr; cvta.to.shared.u64 smem_ptr, %1; cvt.u32.u64 %0, smem_ptr; }" : "=r"(smem) : "l"(smem_raw));
+    smem = make_warp_uniform(smem);
+#else
     smem = (int)(unsigned long long)__cvta_generic_to_shared(smem_raw);
+#endif
 
     const int mbar_base = smem;
     #define tma_full_addr (mbar_base + 0)
@@ -676,15 +390,6 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
 
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
-    if (tid == 0) {
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(A)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(B)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(SFA)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(SFB)) : "memory");
-        asm volatile("fence.proxy.tensormap::generic.acquire.sys [%0], 128;" :: "l"((uint64_t)(OUTQ)) : "memory");
-    }
-    __syncthreads();
-
 
     // Kernel setup ops
     uint8_t* smem_a = reinterpret_cast<uint8_t*>(smem_raw + 1024);
@@ -873,11 +578,11 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         #pragma unroll 1
                         for (int iter_k = 0; iter_k < NUM_K_ITERS; iter_k++) {
                             mbarrier_wait(mma_done_addr + (load_stage) * 8, _phase_mma_done);
-                            tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 38912, A, 0, off_m, iter_k, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                            tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 38912, B, 0, weight_row_base + off_n, iter_k, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                            tma_3d_gmem2smem_cta2(smem_a_addr + load_stage * 38912, (&A), 0, off_m, iter_k, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                            tma_3d_gmem2smem_cta2(smem_b_addr + load_stage * 38912, (&B), 0, weight_row_base + off_n, iter_k, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                             int k_set_base = iter_k * 4;
-                            tma_3d_gmem2smem_cta2(smem_sfa_all_addr + load_stage * 38912, SFA, 0, 0, sfa_tile_row + k_set_base, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
-                            tma_3d_gmem2smem_cta2(smem_sfb_all_addr + load_stage * 38912, SFB, 0, 0, sfb_tile_row + k_set_base, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                            tma_3d_gmem2smem_cta2(smem_sfa_all_addr + load_stage * 38912, (&SFA), 0, 0, sfa_tile_row + k_set_base, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
+                            tma_3d_gmem2smem_cta2(smem_sfb_all_addr + load_stage * 38912, (&SFB), 0, 0, sfb_tile_row + k_set_base, ((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF));
                             asm volatile(
                                 "mbarrier.arrive.expect_tx.release.cta.shared::cluster.b64 _, [%0], %1;"
                                 :: "r"((tma_full_addr + (load_stage) * 8) & 0xFEFFFFFF), "r"((uint32_t)(38912)) : "memory");
@@ -1267,7 +972,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                             #pragma unroll
                             for (int j_4 = 0; j_4 < 4; j_4++) {
                                 float v_lo = __uint_as_float(words[i * 8 + j_4] << 16);
-                                float v_hi = __uint_as_float(words[i * 8 + j_4] & 4294901760);
+                                float v_hi = __uint_as_float(words[i * 8 + j_4] & 4294901760u);
                                 float _fma_0 = __fmaf_rn(v_lo, v_lo, sum_lo);
                                 sum_lo = _fma_0;
                                 float _fma_1 = __fmaf_rn(v_hi, v_hi, sum_lo);
@@ -1277,7 +982,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                             #pragma unroll
                             for (int j_5 = 4; j_5 < 8; j_5++) {
                                 float v_lo2 = __uint_as_float(words[i * 8 + j_5] << 16);
-                                float v_hi2 = __uint_as_float(words[i * 8 + j_5] & 4294901760);
+                                float v_hi2 = __uint_as_float(words[i * 8 + j_5] & 4294901760u);
                                 float _fma_2 = __fmaf_rn(v_lo2, v_lo2, sum_hi);
                                 sum_hi = _fma_2;
                                 float _fma_3 = __fmaf_rn(v_hi2, v_hi2, sum_hi);
@@ -1328,10 +1033,10 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         }
                         #pragma unroll
                         for (int j_6 = 0; j_6 < 8; j_6++) {
-                            float2 _f2_1 = make_float2(__uint_as_float(words[j_6] << 16), __uint_as_float(words[j_6] & 4294901760));
+                            float2 _f2_1 = make_float2(__uint_as_float(words[j_6] << 16), __uint_as_float(words[j_6] & 4294901760u));
                             float2 _mul_f32x2_0;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_0) : "l"(*(const unsigned long long*)&_f2_1), "l"(*(const unsigned long long*)&_f2_0));
-                            float2 _f2_2 = make_float2(__uint_as_float(loaded_w[j_6] << 16), __uint_as_float(loaded_w[j_6] & 4294901760));
+                            float2 _f2_2 = make_float2(__uint_as_float(loaded_w[j_6] << 16), __uint_as_float(loaded_w[j_6] & 4294901760u));
                             float2 _mul_f32x2_1;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_1) : "l"(*(const unsigned long long*)&_mul_f32x2_0), "l"(*(const unsigned long long*)&_f2_2));
                             __nv_bfloat162 _bf16x2_4 = __float22bfloat162_rn(make_float2(_mul_f32x2_1.x, _mul_f32x2_1.y));
@@ -1351,10 +1056,10 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         }
                         #pragma unroll
                         for (int j_7 = 0; j_7 < 8; j_7++) {
-                            float2 _f2_3 = make_float2(__uint_as_float(words[8 + j_7] << 16), __uint_as_float(words[8 + j_7] & 4294901760));
+                            float2 _f2_3 = make_float2(__uint_as_float(words[8 + j_7] << 16), __uint_as_float(words[8 + j_7] & 4294901760u));
                             float2 _mul_f32x2_2;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_2) : "l"(*(const unsigned long long*)&_f2_3), "l"(*(const unsigned long long*)&_f2_0));
-                            float2 _f2_4 = make_float2(__uint_as_float(loaded_w_0[j_7] << 16), __uint_as_float(loaded_w_0[j_7] & 4294901760));
+                            float2 _f2_4 = make_float2(__uint_as_float(loaded_w_0[j_7] << 16), __uint_as_float(loaded_w_0[j_7] & 4294901760u));
                             float2 _mul_f32x2_3;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_3) : "l"(*(const unsigned long long*)&_mul_f32x2_2), "l"(*(const unsigned long long*)&_f2_4));
                             __nv_bfloat162 _bf16x2_5 = __float22bfloat162_rn(make_float2(_mul_f32x2_3.x, _mul_f32x2_3.y));
@@ -1374,10 +1079,10 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         }
                         #pragma unroll
                         for (int j_8 = 0; j_8 < 8; j_8++) {
-                            float2 _f2_5 = make_float2(__uint_as_float(words[16 + j_8] << 16), __uint_as_float(words[16 + j_8] & 4294901760));
+                            float2 _f2_5 = make_float2(__uint_as_float(words[16 + j_8] << 16), __uint_as_float(words[16 + j_8] & 4294901760u));
                             float2 _mul_f32x2_4;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_4) : "l"(*(const unsigned long long*)&_f2_5), "l"(*(const unsigned long long*)&_f2_0));
-                            float2 _f2_6 = make_float2(__uint_as_float(loaded_w_1[j_8] << 16), __uint_as_float(loaded_w_1[j_8] & 4294901760));
+                            float2 _f2_6 = make_float2(__uint_as_float(loaded_w_1[j_8] << 16), __uint_as_float(loaded_w_1[j_8] & 4294901760u));
                             float2 _mul_f32x2_5;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_5) : "l"(*(const unsigned long long*)&_mul_f32x2_4), "l"(*(const unsigned long long*)&_f2_6));
                             __nv_bfloat162 _bf16x2_6 = __float22bfloat162_rn(make_float2(_mul_f32x2_5.x, _mul_f32x2_5.y));
@@ -1397,10 +1102,10 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         }
                         #pragma unroll
                         for (int j_9 = 0; j_9 < 8; j_9++) {
-                            float2 _f2_7 = make_float2(__uint_as_float(words[24 + j_9] << 16), __uint_as_float(words[24 + j_9] & 4294901760));
+                            float2 _f2_7 = make_float2(__uint_as_float(words[24 + j_9] << 16), __uint_as_float(words[24 + j_9] & 4294901760u));
                             float2 _mul_f32x2_6;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_6) : "l"(*(const unsigned long long*)&_f2_7), "l"(*(const unsigned long long*)&_f2_0));
-                            float2 _f2_8 = make_float2(__uint_as_float(loaded_w_2[j_9] << 16), __uint_as_float(loaded_w_2[j_9] & 4294901760));
+                            float2 _f2_8 = make_float2(__uint_as_float(loaded_w_2[j_9] << 16), __uint_as_float(loaded_w_2[j_9] & 4294901760u));
                             float2 _mul_f32x2_7;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_7) : "l"(*(const unsigned long long*)&_mul_f32x2_6), "l"(*(const unsigned long long*)&_f2_8));
                             __nv_bfloat162 _bf16x2_7 = __float22bfloat162_rn(make_float2(_mul_f32x2_7.x, _mul_f32x2_7.y));
@@ -1433,13 +1138,13 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         for (int j_10 = 0; j_10 < 8; j_10++) {
                             unsigned int n_lo_word = normalized[j_10];
                             unsigned int n_hi_word = ((col_set_rt == 0) ? normalized[16 + j_10] : normalized[8 + j_10]);
-                            float2 _f2_9 = make_float2(__uint_as_float(loaded_cos[j_10] << 16), __uint_as_float(loaded_cos[j_10] & 4294901760));
-                            float2 _f2_10 = make_float2(__uint_as_float(loaded_sin[j_10] << 16 ^ 2147483648), __uint_as_float(loaded_sin[j_10] & 4294901760 ^ 2147483648));
-                            float2 _f2_11 = make_float2(__uint_as_float(loaded_sin[j_10] << 16), __uint_as_float(loaded_sin[j_10] & 4294901760));
-                            float2 _f2_12 = make_float2(__uint_as_float(n_hi_word << 16), __uint_as_float(n_hi_word & 4294901760));
+                            float2 _f2_9 = make_float2(__uint_as_float(loaded_cos[j_10] << 16), __uint_as_float(loaded_cos[j_10] & 4294901760u));
+                            float2 _f2_10 = make_float2(__uint_as_float(loaded_sin[j_10] << 16 ^ 2147483648u), __uint_as_float(loaded_sin[j_10] & 4294901760u ^ 2147483648u));
+                            float2 _f2_11 = make_float2(__uint_as_float(loaded_sin[j_10] << 16), __uint_as_float(loaded_sin[j_10] & 4294901760u));
+                            float2 _f2_12 = make_float2(__uint_as_float(n_hi_word << 16), __uint_as_float(n_hi_word & 4294901760u));
                             float2 _mul_f32x2_8;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_8) : "l"(*(const unsigned long long*)&_f2_12), "l"(*(const unsigned long long*)&_f2_10));
-                            float2 _f2_13 = make_float2(__uint_as_float(n_lo_word << 16), __uint_as_float(n_lo_word & 4294901760));
+                            float2 _f2_13 = make_float2(__uint_as_float(n_lo_word << 16), __uint_as_float(n_lo_word & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -1450,10 +1155,10 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                                 float2 _packed_f32x2_6_2 = _mul_f32x2_8;
                                 asm volatile("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(reinterpret_cast<uint64_t&>(_packed_fma_f32x2_0)) : "l"(reinterpret_cast<const uint64_t&>(_packed_f32x2_6_0)), "l"(reinterpret_cast<const uint64_t&>(_packed_f32x2_6_1)), "l"(reinterpret_cast<const uint64_t&>(_packed_f32x2_6_2)));
                             }
-                            float2 _f2_14 = make_float2(__uint_as_float(n_lo_word << 16), __uint_as_float(n_lo_word & 4294901760));
+                            float2 _f2_14 = make_float2(__uint_as_float(n_lo_word << 16), __uint_as_float(n_lo_word & 4294901760u));
                             float2 _mul_f32x2_9;
                             asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_9) : "l"(*(const unsigned long long*)&_f2_14), "l"(*(const unsigned long long*)&_f2_11));
-                            float2 _f2_15 = make_float2(__uint_as_float(n_hi_word << 16), __uint_as_float(n_hi_word & 4294901760));
+                            float2 _f2_15 = make_float2(__uint_as_float(n_hi_word << 16), __uint_as_float(n_hi_word & 4294901760u));
                             #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                             #error "Packed FP32x2 arithmetic requires SM100 or newer"
                             #endif
@@ -1497,13 +1202,13 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                             for (int j_11 = 0; j_11 < 8; j_11++) {
                                 unsigned int n_lo_word_1 = normalized[8 + j_11];
                                 unsigned int n_hi_word_1 = normalized[24 + j_11];
-                                float2 _f2_16 = make_float2(__uint_as_float(loaded_cos_3[j_11] << 16), __uint_as_float(loaded_cos_3[j_11] & 4294901760));
-                                float2 _f2_17 = make_float2(__uint_as_float(loaded_sin_4[j_11] << 16 ^ 2147483648), __uint_as_float(loaded_sin_4[j_11] & 4294901760 ^ 2147483648));
-                                float2 _f2_18 = make_float2(__uint_as_float(loaded_sin_4[j_11] << 16), __uint_as_float(loaded_sin_4[j_11] & 4294901760));
-                                float2 _f2_19 = make_float2(__uint_as_float(n_hi_word_1 << 16), __uint_as_float(n_hi_word_1 & 4294901760));
+                                float2 _f2_16 = make_float2(__uint_as_float(loaded_cos_3[j_11] << 16), __uint_as_float(loaded_cos_3[j_11] & 4294901760u));
+                                float2 _f2_17 = make_float2(__uint_as_float(loaded_sin_4[j_11] << 16 ^ 2147483648u), __uint_as_float(loaded_sin_4[j_11] & 4294901760u ^ 2147483648u));
+                                float2 _f2_18 = make_float2(__uint_as_float(loaded_sin_4[j_11] << 16), __uint_as_float(loaded_sin_4[j_11] & 4294901760u));
+                                float2 _f2_19 = make_float2(__uint_as_float(n_hi_word_1 << 16), __uint_as_float(n_hi_word_1 & 4294901760u));
                                 float2 _mul_f32x2_10;
                                 asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_10) : "l"(*(const unsigned long long*)&_f2_19), "l"(*(const unsigned long long*)&_f2_17));
-                                float2 _f2_20 = make_float2(__uint_as_float(n_lo_word_1 << 16), __uint_as_float(n_lo_word_1 & 4294901760));
+                                float2 _f2_20 = make_float2(__uint_as_float(n_lo_word_1 << 16), __uint_as_float(n_lo_word_1 & 4294901760u));
                                 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                                 #error "Packed FP32x2 arithmetic requires SM100 or newer"
                                 #endif
@@ -1514,10 +1219,10 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                                     float2 _packed_f32x2_10_2 = _mul_f32x2_10;
                                     asm volatile("fma.rn.ftz.f32x2 %0, %1, %2, %3;" : "=l"(reinterpret_cast<uint64_t&>(_packed_fma_f32x2_2)) : "l"(reinterpret_cast<const uint64_t&>(_packed_f32x2_10_0)), "l"(reinterpret_cast<const uint64_t&>(_packed_f32x2_10_1)), "l"(reinterpret_cast<const uint64_t&>(_packed_f32x2_10_2)));
                                 }
-                                float2 _f2_21 = make_float2(__uint_as_float(n_lo_word_1 << 16), __uint_as_float(n_lo_word_1 & 4294901760));
+                                float2 _f2_21 = make_float2(__uint_as_float(n_lo_word_1 << 16), __uint_as_float(n_lo_word_1 & 4294901760u));
                                 float2 _mul_f32x2_11;
                                 asm("mul.rn.ftz.f32x2 %0, %1, %2;" : "=l"(*(unsigned long long*)&_mul_f32x2_11) : "l"(*(const unsigned long long*)&_f2_21), "l"(*(const unsigned long long*)&_f2_18));
-                                float2 _f2_22 = make_float2(__uint_as_float(n_hi_word_1 << 16), __uint_as_float(n_hi_word_1 & 4294901760));
+                                float2 _f2_22 = make_float2(__uint_as_float(n_hi_word_1 << 16), __uint_as_float(n_hi_word_1 & 4294901760u));
                                 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
                                 #error "Packed FP32x2 arithmetic requires SM100 or newer"
                                 #endif
@@ -1597,7 +1302,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         #pragma unroll
                         for (int j_16 = 0; j_16 < 8; j_16++) {
                             values[2 * j_16] = __uint_as_float(normalized[j_16] << 16);
-                            values[2 * j_16 + 1] = __uint_as_float(normalized[j_16] & 4294901760);
+                            values[2 * j_16 + 1] = __uint_as_float(normalized[j_16] & 4294901760u);
                         }
                         #pragma unroll
                         for (int j_17 = 0; j_17 < 16; j_17++) {
@@ -1675,7 +1380,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         #pragma unroll
                         for (int j_19 = 0; j_19 < 8; j_19++) {
                             values_5[2 * j_19] = __uint_as_float(normalized[8 + j_19] << 16);
-                            values_5[2 * j_19 + 1] = __uint_as_float(normalized[8 + j_19] & 4294901760);
+                            values_5[2 * j_19 + 1] = __uint_as_float(normalized[8 + j_19] & 4294901760u);
                         }
                         #pragma unroll
                         for (int j_20 = 0; j_20 < 16; j_20++) {
@@ -1753,7 +1458,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         #pragma unroll
                         for (int j_22 = 0; j_22 < 8; j_22++) {
                             values_13[2 * j_22] = __uint_as_float(normalized[16 + j_22] << 16);
-                            values_13[2 * j_22 + 1] = __uint_as_float(normalized[16 + j_22] & 4294901760);
+                            values_13[2 * j_22 + 1] = __uint_as_float(normalized[16 + j_22] & 4294901760u);
                         }
                         #pragma unroll
                         for (int j_23 = 0; j_23 < 16; j_23++) {
@@ -1831,7 +1536,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         #pragma unroll
                         for (int j_25 = 0; j_25 < 8; j_25++) {
                             values_21[2 * j_25] = __uint_as_float(normalized[24 + j_25] << 16);
-                            values_21[2 * j_25 + 1] = __uint_as_float(normalized[24 + j_25] & 4294901760);
+                            values_21[2 * j_25 + 1] = __uint_as_float(normalized[24 + j_25] & 4294901760u);
                         }
                         #pragma unroll
                         for (int j_26 = 0; j_26 < 16; j_26++) {
@@ -1953,7 +1658,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         #pragma unroll
                         for (int j_28 = 0; j_28 < 8; j_28++) {
                             values_1[2 * j_28] = __uint_as_float(words[j_28] << 16);
-                            values_1[2 * j_28 + 1] = __uint_as_float(words[j_28] & 4294901760);
+                            values_1[2 * j_28 + 1] = __uint_as_float(words[j_28] & 4294901760u);
                         }
                         #pragma unroll
                         for (int j_29 = 0; j_29 < 16; j_29++) {
@@ -2031,7 +1736,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         #pragma unroll
                         for (int j_31 = 0; j_31 < 8; j_31++) {
                             values_0[2 * j_31] = __uint_as_float(words[8 + j_31] << 16);
-                            values_0[2 * j_31 + 1] = __uint_as_float(words[8 + j_31] & 4294901760);
+                            values_0[2 * j_31 + 1] = __uint_as_float(words[8 + j_31] & 4294901760u);
                         }
                         #pragma unroll
                         for (int j_32 = 0; j_32 < 16; j_32++) {
@@ -2109,7 +1814,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         #pragma unroll
                         for (int j_34 = 0; j_34 < 8; j_34++) {
                             values_8[2 * j_34] = __uint_as_float(words[16 + j_34] << 16);
-                            values_8[2 * j_34 + 1] = __uint_as_float(words[16 + j_34] & 4294901760);
+                            values_8[2 * j_34 + 1] = __uint_as_float(words[16 + j_34] & 4294901760u);
                         }
                         #pragma unroll
                         for (int j_35 = 0; j_35 < 16; j_35++) {
@@ -2187,7 +1892,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                         #pragma unroll
                         for (int j_37 = 0; j_37 < 8; j_37++) {
                             values_16[2 * j_37] = __uint_as_float(words[24 + j_37] << 16);
-                            values_16[2 * j_37 + 1] = __uint_as_float(words[24 + j_37] & 4294901760);
+                            values_16[2 * j_37 + 1] = __uint_as_float(words[24 + j_37] & 4294901760u);
                         }
                         #pragma unroll
                         for (int j_38 = 0; j_38 < 16; j_38++) {
@@ -2305,7 +2010,7 @@ kernel_cake_minimax_h3_nvfp4_pre_attention_77d2620edef9a31c9f1f(CakeTensorMap co
                     if (col_set_rt == 0) {
                         if (epi_warp == 0) {
                             if (elect_sync()) {
-                                tma_store_4d(OUTQ, 0, head_kind_local, off_m_1, destination, epi_staging_addr + staging_buf * 8192);
+                                tma_store_4d((&OUTQ), 0, head_kind_local, off_m_1, destination, epi_staging_addr + staging_buf * 8192);
                                 asm volatile("cp.async.bulk.commit_group;");
                             }
                         }
