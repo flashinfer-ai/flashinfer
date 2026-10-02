@@ -31,13 +31,14 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    that build for every variant built with the one-warp tail (19 twins): the round-5 twin had run
    the tail twice through a duplicate block in the stream template (removed in round 7).  The host
    selects it only for a cluster-8 streaming variant with ``top_k_max > 768`` on a one-wave grid, on
-   B200 and GB300 (compute capabilities 10.0 / 10.3).  Measured under CUDA-graph replay (the eager
+   H100, B200 and GB300 (compute capabilities 9.0 / 10.0 / 10.3).  Measured under CUDA-graph replay (the eager
    span of the two-launch chain includes the host gap between its launches, which made the twin
    look 10-50 % faster everywhere): the in-CTA tail loses to the chain on every resident (B200
    1.20-1.54x, GB300 1.40-1.84x of the chain's time) and on every stream at k <= 750 (1.0-1.26x at
    k = 200, 1.04-1.15x at k = 500, 0.94-1.05x at k = 750); the cluster-8 streams at k = 1000 win on
-   both (B200 0.89-0.94, GB300 0.89-0.97).  H100 and R200 keep the chain (no graph-replay A/B
-   recorded for them in round 7).
+   both (B200 0.89-0.94, GB300 0.89-0.97).  Round 8 measured H100 the same way: the twin runs
+   0.93-0.97 of the chain at V = 151936 and 0.96-0.99 at V = 262144 (B = 1-8, k = 800 / 1000), so
+   H100 joins; R200 keeps the chain (no graph-replay A/B recorded for it).
    Compiling the tail into the default build had cost every ``top_k <= 64`` launch 4-19 % on H100 /
    GB300 / R200, so it stays a separate build.  The whole-CTA form is bitwise identical to the
    two-launch form; rows of such a launch whose k is at most 64 take the one-warp tail.  A
@@ -50,7 +51,7 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    has been read, where the round-3 kernels did.  All three decisions travel in the stage-1
    ``launch_flags`` argument (bit 0 one-warp tail, bit 1 early trigger, bit 2 stream pre-pass
    point, bit 3 whole-CTA tail, bit 4 coarse sample, bit 5 row-span filter arm, bit 6 speculative
-   sample) and none changes any output.  Bit 4 selects a
+   sample, bit 7 slab tail, bit 8 pushed coarse sums) and none changes any output.  Bit 4 selects a
    streaming variant's coarse-sample build (manifest entries with ``coarse_sample``, symbol suffix
    ``_cs``): its sampled first pass reads one 64-byte block per 512 bytes of the row (1/8) instead of
    one per 256 (1/4), with the lower-bucket margin, the sampled-mass cap and the filter-arm density
@@ -87,7 +88,30 @@ compile targets that have not been run on hardware.  It fuses the three stages o
    chain with at least 128 CTAs for rows of 16 or more chunks: the round-7 H100 / R200 matrices
    measure the cluster-8 streams 1-8 % slower with the build, the 4-chunk rows at k <= 64 1-2 %
    slower than their coarse-sample build, and those wide streams 2-20 % faster.  Bits 4 and 6 are
-   exclusive.
+   exclusive.  Bit 7 (round 8, lever L-B) selects, together with bit 0 and bit 4 or 6, the slab-tail
+   form of a streaming variant's coarse- or speculative-sample build (manifest entries with
+   ``slab_tail``, symbol suffix ``_cs_lb`` / ``_sp_lb``): the selected (key, index) pairs of a fused
+   launch are pushed into rank 0's shared-memory slab with distributed-shared-memory stores and the
+   two-warp tail reads them there instead of re-reading the global slab row, so the slab row,
+   samples, renorm and count are bit-identical.  The default and whole-CTA-tail builds never carry
+   it, so the k > 64 chains run binaries without the slab code (compiled in, it moved them by
+   1-14 %).  The host sets bit 7 on compute capability 10.0 / 10.3 for rows of at most 5 register
+   chunks per CTA, where the fused cells run 1-7 % faster with it in paired perturbed-process A/Bs
+   (medians over four fresh processes) and in both orders of the round-8 matrices; Hopper measured
+   its single-row cluster-8 cells 2-5 % slower and keeps the plain sample builds, and the long
+   cluster-1 / cluster-2 rows (8-16 chunks per CTA: B = 64-128 at V >= 128256) measured 0-2 % slower
+   with it on B200 / GB300 and keep them too.  Bit 8
+   (round 8, lever L-G(d)) selects, on a two-launch chain without bits 0, 3, 4, 6 and 7, the
+   pushed-coarse-sums form of a streaming variant's default build (manifest entries with
+   ``coarse_push``, symbol suffix ``_lg``; the variants whose cluster runs the two-level select):
+   each CTA stores its 128 coarse histogram sums into every CTA's shared memory as it builds them,
+   so the cluster-wide lower-bucket select reads its peers' sums locally instead of over
+   distributed shared memory inside the select loop; every output is bit-identical.  The host sets
+   bit 8 on compute capability 9.0 / 10.3 for the ept-32 build, where the two-chunk cluster-8
+   k = 1000 chains run 0.6-1.5 % faster with it (medians over four perturbed processes); B200
+   measured them 0.9-1.7 % slower and keeps the plain default build, which also serves every fused
+   launch, and the four-chunk ept-16 cluster-8 chains (V = 262144, B <= 8) measured 1.4-5.6 % slower
+   with it on GB300 and keep it as well.
 
 The stage-2/3 kernel exists in three static forms that differ only in instruction selection,
 never in output: the base form (f64 top-p cut / sample tests, max-min bitonic exchange), a form
@@ -209,9 +233,10 @@ Since round 7 the route is held to a tolerance-level contract instead of bit-ide
   Keys stay exact fp32 bit patterns; every accumulation is at least fp32 (no bf16 / fp16 anywhere); no tolerance is
   loosened to admit a kernel change.
 * A stage-1 build that does not intend to change numerics (every round-7 twin: the speculative-sample ``_sp``, the
-  coarse-sample ``_cs`` and the whole-CTA-tail ``_bt`` builds) is additionally gated on bit-identity with the default
-  build on every tested row.  A change that moves bits must document exactly which rows can differ (ties, the eps
-  boundary) and why; no round-7 kernel does.
+  coarse-sample ``_cs`` and the whole-CTA-tail ``_bt`` builds; the round-8 slab-tail twins ``_cs_lb`` and
+  ``_sp_lb``) is additionally gated on bit-identity with the default build on every tested row.  A change that
+  moves bits must document exactly which rows can differ (ties, the eps boundary) and why; no round-7 or round-8
+  kernel does.
 * The exact fallbacks stay kernel-side: a candidate list that overflows the gather capacity takes the three-pass
   cluster path, a row with fewer than k candidates is kept whole, and vocabularies above 2^21 (and compute
   capabilities 12.x) take the reference ``top_k_first`` route.  The sm_120 / sm_121 route semantics and the host API
