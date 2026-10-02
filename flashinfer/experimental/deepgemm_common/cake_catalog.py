@@ -129,8 +129,22 @@ class Catalog:
         self._require_arch(arch)
         if self.merged:
             routes = self._data["routes"]
-            # Either keyed by architecture or shared by every architecture.
-            return routes.get(arch, routes)
+            # Detect the arch-keyed form explicitly (every top-level key names
+            # one of the exported architectures) rather than keying off
+            # whether ``arch`` happens to be present: a keyed table missing
+            # one of its own catalogued architectures is a malformed catalog,
+            # not license to hand back the outer {arch: routes} mapping as if
+            # it were itself a route table (its keys would then be read as
+            # route keys by ``route()``/``supported_num_sms``).
+            if routes and set(routes) <= set(ARCHES.values()):
+                if arch not in routes:
+                    raise ValueError(
+                        f"{self.label} catalog lists {arch} as exported but its "
+                        "arch-keyed routes carry no entry for it"
+                    )
+                return routes[arch]
+            # Otherwise shared verbatim by every architecture.
+            return routes
         return self._data["arches"][arch]["routes"]
 
     def route(self, arch: str, key: str, *, options: Any = None) -> Mapping[str, Any]:

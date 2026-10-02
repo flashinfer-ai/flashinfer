@@ -67,6 +67,42 @@ def _merged_catalog():
     }
 
 
+def _merged_catalog_missing_arch_routes():
+    """Merged catalog where a program exports sm_100a but the arch-keyed
+    routes table carries no sm_100a entry at all (malformed catalog)."""
+    return {
+        "schema": "unit.merged.v1",
+        "programs": {
+            "k_shared": {
+                "sources": ["csrc/x/shared.cu"],
+                "compile_flags": [],
+                "arches": ["sm_100a", "sm_103a"],
+            },
+        },
+        "routes": {
+            "sm_103a": {"a:sm152": {"program": "k_shared"}},
+        },
+    }
+
+
+def _merged_catalog_shared_routes():
+    """Merged catalog whose routes are one flat table shared by every arch
+    (not keyed by architecture at all)."""
+    return {
+        "schema": "unit.merged.v2",
+        "programs": {
+            "k_shared": {
+                "sources": ["csrc/x/shared.cu"],
+                "compile_flags": [],
+                "arches": ["sm_100a", "sm_103a"],
+            },
+        },
+        "routes": {
+            "a:sm148": {"program": "k_shared"},
+        },
+    }
+
+
 def test_arches_cover_only_the_exported_capabilities():
     assert ARCHES == {(10, 0): "sm_100a", (10, 3): "sm_103a"}
 
@@ -103,6 +139,31 @@ def test_key_encoded_sm_count_needs_an_explicit_reader():
     catalog = Catalog(_merged_catalog(), label="Unit")
     with pytest.raises(ValueError, match="carries no SM count"):
         catalog.supported_num_sms("sm_100a")
+
+
+def test_merged_layout_keyed_routes_missing_an_arch_raises():
+    # sm_100a is exported (a program lists it in "arches"), but the
+    # arch-keyed routes table has no sm_100a key at all: this must raise
+    # rather than silently hand back the outer {arch: routes} mapping as if
+    # it were itself a route table keyed by route key.
+    catalog = Catalog(_merged_catalog_missing_arch_routes(), label="Unit")
+    assert catalog.arches == ("sm_100a", "sm_103a")
+    with pytest.raises(
+        ValueError,
+        match="lists sm_100a as exported but its arch-keyed routes carry no entry",
+    ):
+        catalog.routes("sm_100a")
+    # The present arch still resolves to its own, correctly-scoped routes.
+    assert catalog.routes("sm_103a") == {"a:sm152": {"program": "k_shared"}}
+
+
+def test_merged_layout_shared_routes_are_returned_verbatim_for_every_arch():
+    # Top-level route keys that are not architecture names mean every
+    # architecture shares the same flat route table.
+    catalog = Catalog(_merged_catalog_shared_routes(), label="Unit")
+    shared = {"a:sm148": {"program": "k_shared"}}
+    assert catalog.routes("sm_100a") == shared
+    assert catalog.routes("sm_103a") == shared
 
 
 def test_missing_route_raises_unsupported_device_naming_the_options():
