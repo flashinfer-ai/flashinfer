@@ -73,6 +73,11 @@ TVM_FFI_EMBED_CUBIN(cake_vsa_kernel);
 
 namespace flashinfer {
 namespace cake_vsa {
+// Internal linkage for everything below: this file is compiled once per (profile, arch) into
+// separate modules. A static kernel handle inside an inline function would be an STB_GNU_UNIQUE
+// symbol that the dynamic loader unifies across modules, making a later-loaded profile launch
+// the first module's kernel.
+namespace {
 
 using tvm::ffi::TensorView;
 
@@ -567,6 +572,7 @@ void Run(TensorView q, TensorView k, TensorView k_scale, TensorView v, TensorVie
 #error "CAKE_VSA_ABI must be 1, 2 or 3"
 #endif
 
+}  // namespace
 }  // namespace cake_vsa
 }  // namespace flashinfer
 
